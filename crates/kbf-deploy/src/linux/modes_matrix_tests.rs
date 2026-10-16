@@ -247,16 +247,8 @@ fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
             file(0o600, 990, ""),
             &[Mode::Storage, Mode::Daemon, Mode::AllInOne],
         ),
-        (
-            "credential",
-            file(0o640, 990, ""),
-            &[Mode::Storage],
-        ),
-        (
-            "credential",
-            file(0o600, 1000, ""),
-            &[Mode::Storage],
-        ),
+        ("credential", file(0o640, 990, ""), &[Mode::Storage]),
+        ("credential", file(0o600, 1000, ""), &[Mode::Storage]),
     ];
     let mut wrong = Vec::new();
     for (rule, key, fails) in cases {

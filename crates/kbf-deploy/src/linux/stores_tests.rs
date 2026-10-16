@@ -87,7 +87,6 @@ fn a_storage_unit_names_its_stores_listener_and_tls_and_its_key() {
     assert_eq!(storage(&storage_unit(&file, ""), key), Vec::<String>::new());
 }
 
-
 /// Catches a variable not found in either of systemd's spellings, an unclosed brace
 /// or a bare `$` read as a name, and a name read past its last letter.
 #[test]
