@@ -51,7 +51,9 @@ mod tests {
     /// Catches a variable of the prefix left in (`AWS_SESSION_TOKEN` and
     /// `AWS_SHARED_CREDENTIALS_FILE` name a key as surely as the pair does), a match
     /// anywhere but the start, and a variable of another name removed (the runtime
-    /// needs `XDG_RUNTIME_DIR`, `HOME` and `PATH`).
+    /// needs `XDG_RUNTIME_DIR`, `HOME` and `PATH`). The web-identity and container
+    /// credential variables catch a list of known names in place of the prefix: the
+    /// SDKs read more of them than any list here would keep up with.
     #[test]
     fn only_the_prefix_s_variables_are_removed() {
         let names = [
@@ -59,6 +61,8 @@ mod tests {
             "AWS_SECRET_ACCESS_KEY",
             "AWS_SESSION_TOKEN",
             "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN",
             "XDG_RUNTIME_DIR",
             "MY_AWS_NOTE",
             "aws_lower",
@@ -73,9 +77,11 @@ mod tests {
         removed.sort();
         let want = [
             "AWS_ACCESS_KEY_ID",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN",
             "AWS_SECRET_ACCESS_KEY",
             "AWS_SESSION_TOKEN",
             "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
         ]
         .map(|name| (name.to_owned(), None));
         assert_eq!(removed, want);
