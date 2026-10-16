@@ -1,0 +1,25 @@
+[package]
+name = "kbf-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The one binary: `kbf <mode>` over the libraries of kbf-node and kbf-all-in-one
+# (docs/design/cluster.md, sections 1 and 5.1). Like kbf-all-in-one it links both the
+# server and the node library (the version stamp is kbf-server's), so it is listed in
+# `JOINERS` in crates/kbf-it/tests/layering.rs.
+[[bin]]
+name = "kbf"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+kbf-all-in-one.workspace = true
+kbf-node.workspace = true
+kbf-server.workspace = true
+
+[lints]
+workspace = true

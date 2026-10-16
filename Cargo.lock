@@ -1313,10 +1313,12 @@ dependencies = [
  "kbf-daemon",
  "kbf-driver-container",
  "kbf-front",
+ "kbf-meta",
  "kbf-node",
  "kbf-proto",
  "kbf-segments",
  "kbf-server",
+ "kbf-storage",
  "kbf-testkit",
  "kbf-threads",
  "kbf-transfer",
@@ -1393,6 +1395,16 @@ dependencies = [
  "kbf-types",
  "tokio",
  "tonic",
+]
+
+[[package]]
+name = "kbf-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "kbf-all-in-one",
+ "kbf-node",
+ "kbf-server",
 ]
 
 [[package]]
@@ -1531,6 +1543,7 @@ dependencies = [
  "kbf-proto",
  "kbf-sched",
  "kbf-segments",
+ "kbf-storage",
  "kbf-store",
  "kbf-tier",
  "kbf-types",
@@ -1842,6 +1855,7 @@ dependencies = [
  "kbf-sched",
  "kbf-segments",
  "kbf-sim",
+ "kbf-storage",
  "kbf-store",
  "kbf-threads",
  "kbf-tier",
@@ -1900,6 +1914,19 @@ dependencies = [
  "rusqlite",
  "rustix",
  "thiserror",
+]
+
+[[package]]
+name = "kbf-storage"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "kbf-meta",
+ "kbf-proto",
+ "kbf-types",
+ "thiserror",
+ "tonic",
 ]
 
 [[package]]
@@ -4244,9 +4271,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.0.1"
+version = "9.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e49ade69c4434c55dd651d36fe05f38e0578db948b773cbc01c48c4b5e560692"
+checksum = "c2d98561b612a84ae525331a7a094429ef8a5772514ed507ff6db5f54badc971"
 dependencies = [
  "crc32fast",
  "flate2",
