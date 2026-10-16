@@ -209,7 +209,7 @@ fn bind_api(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), S
 fn flow_control(server: Server, max_streams: u32) -> Server {
     let windows = flow_windows(max_streams);
     server
-        .max_concurrent_streams(Some(max_streams))
+        .max_concurrent_streams(Some(windows.streams))
         .initial_stream_window_size(Some(windows.stream))
         .initial_connection_window_size(Some(windows.connection))
 }

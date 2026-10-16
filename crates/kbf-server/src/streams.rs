@@ -20,6 +20,10 @@ pub const MAX_STREAMS: u32 = MAX_WINDOW / 65_536;
 /// The flow-control windows of one connection to a listener.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlowWindows {
+    /// The streams the connection may have open: the limit given, clamped to 1 and
+    /// [`MAX_STREAMS`]. The listener's `max_concurrent_streams` is this, so the limit and
+    /// the windows cannot disagree.
+    pub streams: u32,
     /// The window of each stream.
     pub stream: u32,
     /// The window of the connection.
@@ -42,6 +46,7 @@ pub fn flow_windows(max_streams: u32) -> FlowWindows {
     let streams = max_streams.clamp(1, MAX_STREAMS);
     let stream = STREAM_WINDOW_BYTES.min(MAX_WINDOW / streams);
     FlowWindows {
+        streams,
         stream,
         connection: streams * stream,
     }
@@ -131,12 +136,28 @@ mod tests {
         assert_eq!(
             flow_windows(200),
             FlowWindows {
+                streams: 200,
                 stream: 1 << 20,
                 connection: 200 << 20
             }
         );
         assert_eq!(flow_windows(2047).stream, 1 << 20);
         assert!(flow_windows(2048).stream < 1 << 20);
+    }
+
+    /// Catches: a limit outside 1..=`MAX_STREAMS` (a `Listeners` built in code, not
+    /// from the flags) reaching the transport unclamped while the windows are clamped, so
+    /// the connection window no longer holds every stream's window. Mutant: `streams`
+    /// holding the raw limit.
+    #[test]
+    fn a_limit_out_of_range_is_clamped_with_its_windows() {
+        let none = flow_windows(0);
+        assert_eq!(none.streams, 1);
+        let many = flow_windows(u32::MAX);
+        assert_eq!(many.streams, MAX_STREAMS);
+        for w in [none, many] {
+            assert!(u64::from(w.connection) >= u64::from(w.streams) * u64::from(w.stream));
+        }
     }
 
     /// Catches: a default other than 10000 for the REAPI listener or 200 for the

@@ -127,7 +127,8 @@ linger nor holds up small writes. It is still held in memory until verified
   is a first setting (to be tuned later); a lower limit shrinks this bound
   in proportion. A `Write`'s first message (which names the
   blob) is decoded the same way, and a `Write` waiting for admission leaves up to its
-  stream's flow-control window, 1 MiB (`STREAM_WINDOW_BYTES`), received and unread.
+  stream's flow-control window, received and unread: 1 MiB (`STREAM_WINDOW_BYTES`) on the
+  worker listener, about 209 KiB (214,748 B) on the REAPI listener.
 - **Flow control.** A `Write` waiting for admission is not read, so its stream's
   window stays full of unread data, and that data counts against the connection's
   window until the server reads it. The admitted `Write`s on the connection, which must
@@ -147,10 +148,12 @@ linger nor holds up small writes. It is still held in memory until verified
   does not hold window, and 10000 streams of 17 MiB messages is about 166 GiB on a
   REAPI connection, as stated there. With the windows left at the transport's defaults the
   same deadlock happens with 48 Writes waiting. The admission tests go red both ways:
-  that, and a connection window fixed at 200 MiB beside 10000 streams (300 Writes
-  waiting).
+  that, and a connection window fixed at 200 MiB beside 10000 streams, which starves
+  at about 977 waiting Writes (200 MiB / 214,748 B); the test waits 1500. Nothing caps
+  the number of connections, so these per-connection bounds multiply by the number of
+  connections a client opens.
   The cost is throughput on one REAPI stream: a stream moves at most its window per
-  round trip, 209 KiB, so about 200 MB/s at 1 ms and 20 MB/s at 10 ms; many streams
+  round trip, 209 KiB, so about 200 MB/s at 1 ms, 20 MB/s at 10 ms and 5-10 MB/s at 20-40 ms; many streams
   at once fill the connection as before, and the worker listener (the daemons' path) is
   unchanged. The measurement that would move this is a large blob from one buck2
   stream at a real round trip; it has not been run.
