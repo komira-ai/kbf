@@ -12,6 +12,8 @@ After=network-online.target @MINIO_UNIT@
 User=@KBF_USER@
 Slice=kbf.slice
 # The daemon half manages its own cgroup: supervisor/ for itself, actions/ for builds.
+# Delegate=yes delegates cpuset with cpu, memory and pids: --lease-placement=numa-node
+# pins each lease to one NUMA node with it (check-units rule `delegate`).
 Delegate=yes
 # kbf-server's and the daemon's reservations today.
 MemoryMin=@SERVER_MEMORY_MIN@

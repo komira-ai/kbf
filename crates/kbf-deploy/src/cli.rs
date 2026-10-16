@@ -6,7 +6,7 @@
 //! kbf-deploy minio nodeport --kubectl PATH --kubeconfig PATH [--context NAME]
 //!                           --namespace NS --service NAME --node-port N [--remove] [--apply]
 //! kbf-deploy linux render-units --config FILE --out DIR [--kbf-uid UID] [--mode MODE]
-//! kbf-deploy linux check-units --config FILE --dir DIR [--installable] [--mode MODE]
+//! kbf-deploy linux check-units --config FILE --dir DIR [--installable] [--mode MODE [--kbf-bin PATH]]
 //! kbf-deploy linux install-units --config FILE [--bin-dir DIR] [--restart-minio] [--apply]
 //! kbf-deploy linux install-units --config FILE --uninstall [--apply]
 //! kbf-deploy linux image-pull --config FILE [--image REF]... [--platform OS/ARCH] [--apply]
@@ -215,6 +215,10 @@ enum Linux {
         /// Check the unit of this mode of the one kbf binary instead.
         #[arg(long, value_enum)]
         mode: Option<linux::Mode>,
+        /// The kbf that parses a built mode's flags (`kbf check-args`); without it the
+        /// unit's own ExecStart= binary, and the parse is skipped when that is not there.
+        #[arg(long, requires = "mode")]
+        kbf_bin: Option<PathBuf>,
     },
     /// Install the binaries and units, and start kbf-server and kbf-daemon (as root).
     InstallUnits {
@@ -566,13 +570,17 @@ fn linux_kit<E: Exec>(
             dir,
             installable,
             mode,
+            kbf_bin,
         } => match mode {
             None => linux::check_units(&config, &dir, installable),
-            Some(mode) => linux::check_mode_unit(&config, &dir, mode, installable),
+            Some(mode) => {
+                linux::check_mode_unit(exec, &config, &dir, mode, installable, kbf_bin.as_deref())
+            }
         }
         .map(|report| {
             let code = u8::from(!report.failures.is_empty());
             let mut lines: Vec<String> = report.failures.iter().map(ToString::to_string).collect();
+            lines.extend(report.notes);
             lines.push(report.summary);
             (lines, code)
         }),
