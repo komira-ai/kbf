@@ -86,9 +86,11 @@ pub trait Storage: Send + Sync {
     /// time, whatever the blob's size, handing over the last bytes only once the whole
     /// blob has checked.
     ///
-    /// The errors are in the answer, before the first chunk, where the code is still
-    /// open to the caller. An `offset` past the end is decided from the digest's size
-    /// alone, before the store is asked.
+    /// The errors that are known by the first chunk (the first window is read before the
+    /// answer, so a blob that is gone, or a one-window blob that is damaged, is among them)
+    /// are in the answer, before it, where the code is still open to the caller. An
+    /// `offset` past the end is decided from the digest's size alone, before the store is
+    /// asked.
     ///
     /// # Errors
     /// [`StorageError::OutOfRange`] if `offset` is past the end of the blob;

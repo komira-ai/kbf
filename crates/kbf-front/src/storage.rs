@@ -51,7 +51,8 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
     /// a window at a time (at most [`crate::READ_WINDOW_BYTES`] in memory, whatever the
     /// blob's size), the last window handed over only once the whole blob checked against
     /// its digest, so a stream that ends cleanly delivered a verified blob and a damaged
-    /// one ends in an error. The windows are cut to chunks of at most
+    /// one ends in an error (the first window is read before the answer, so a blob
+    /// that fails there is the call's error). The windows are cut to chunks of at most
     /// [`READ_CHUNK_BYTES`], zero-copy.
     fn read_range<'a>(
         &'a self,
@@ -72,7 +73,17 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
                 digest.size_bytes.min(offset.saturating_add(limit))
             };
             let read = self.cache.read_windows(digest, offset, end).await?;
-            Ok(chunks(read))
+            let mut chunks = chunks(read);
+            // The first window is read before the answer, so a blob that is gone or
+            // damaged (found by its first window, or by the whole of a one-window blob) is
+            // the call's error, where its gRPC code is still open.
+            match chunks.next().await {
+                Some(Err(e)) => Err(e),
+                Some(Ok(first)) => Ok(futures::stream::once(async move { Ok(first) })
+                    .chain(chunks)
+                    .boxed()),
+                None => Ok(chunks),
+            }
         })
     }
 
