@@ -6,11 +6,12 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use common::{open_manual, scratch};
 use kbf_state::sqlite::{Options, SqliteError, SqliteStore, restore};
-use kbf_state::{Clock, Cond, Event, Revision, Store, SystemClock, Txn, Version};
+use kbf_state::{Clock, Cond, Event, Revision, Store, StoreTime, SystemClock, Txn, Version};
 use rusqlite::Connection;
 
 fn put(store: &SqliteStore, key: &str, value: &str) {
@@ -479,4 +480,108 @@ fn restore_refuses_a_damaged_backup() {
     }
     std::fs::write(&backup, bytes).expect("damage");
     restore(&backup, &dir.join("state.db")).expect_err("a damaged backup");
+}
+
+// Catches a writer that dies and leaves callers waiting for an answer that never comes, or a
+// store that cannot be dropped after its writer has died.
+#[test]
+fn a_stopped_writer_fails_calls_instead_of_hanging() {
+    /// A clock that panics, in the writer thread, once armed.
+    struct Trap(AtomicBool);
+    impl Clock for Trap {
+        fn now(&self) -> StoreTime {
+            assert!(
+                !self.0.load(Ordering::SeqCst),
+                "the clock was armed to fail"
+            );
+            StoreTime::ZERO
+        }
+    }
+
+    let dir = scratch("writer-stops");
+    let trap = Arc::new(Trap(AtomicBool::new(false)));
+    let clock: Arc<dyn Clock> = trap.clone();
+    let store = SqliteStore::open(&dir.join("state.db"), clock, Options::default()).expect("open");
+    put(&store, "k", "v");
+    trap.0.store(true, Ordering::SeqCst);
+    for _ in 0..2 {
+        let error = store
+            .txn(Txn::new().put("a", "1", Cond::Any))
+            .expect_err("the writer is gone");
+        assert!(
+            error.to_string().contains("writer has stopped"),
+            "got {error}"
+        );
+    }
+    drop(store);
+}
+
+// Catches a delete that spends a revision or writes a feed row for a key that was not there,
+// and a check that is not held to its condition.
+#[test]
+fn deletes_and_checks_follow_their_preconditions() {
+    let dir = scratch("delete-check");
+    let (store, _) = open_manual(&dir, Options::default());
+    put(&store, "k", "v");
+    let version = store.get("k").expect("get").expect("k").version;
+
+    let absent = store
+        .txn(Txn::new().delete("missing", Cond::Any))
+        .expect("reachable")
+        .expect("deleting nothing commits");
+    assert_eq!(
+        absent.revision,
+        Revision(1),
+        "it wrote no row, so it reports the head"
+    );
+    assert_eq!(
+        store
+            .changes(Revision::ZERO, 10)
+            .expect("changes")
+            .rows
+            .len(),
+        1
+    );
+
+    store
+        .txn(
+            Txn::new()
+                .check("k", Cond::Version(version))
+                .put("held", "1", Cond::Absent),
+        )
+        .expect("reachable")
+        .expect("the check holds");
+    let refused = store
+        .txn(
+            Txn::new()
+                .check("k", Cond::Absent)
+                .put("never", "1", Cond::Any),
+        )
+        .expect("reachable")
+        .expect_err("k exists");
+    assert_eq!((refused.index, refused.key.as_str()), (0, "k"));
+    assert!(!has(&store, "never"), "a failed check writes nothing");
+
+    store
+        .txn(Txn::new().delete("k", Cond::Version(version)))
+        .expect("reachable")
+        .expect("the version is current");
+    assert!(!has(&store, "k"));
+    let feed = store.changes(Revision::ZERO, 10).expect("changes").rows;
+    assert_eq!(
+        feed.last().map(|row| (&row.event, row.key.as_str())),
+        Some((&Event::Delete, "k"))
+    );
+}
+
+// Catches a store whose Debug output hides which file it is.
+#[test]
+fn a_store_describes_itself() {
+    let dir = scratch("debug");
+    let (store, _) = open_manual(&dir, Options::default());
+    let text = format!("{store:?}");
+    assert!(
+        text.contains("SqliteStore") && text.contains("state.db"),
+        "got {text}"
+    );
 }

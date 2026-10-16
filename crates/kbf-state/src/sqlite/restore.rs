@@ -39,22 +39,36 @@ fn restore_into(backup: &Path, dest: &Path) -> Result<u64, SqliteError> {
     refuse_network_filesystem(dest, &filesystem_type)?;
     let _lock = take_lock(dest)?;
     let staging = beside(dest, ".restoring");
-    let staged = stage(backup, dest, &staging);
-    if staged.is_err() {
+    let restored = stage(backup, dest, &staging).and_then(|epoch| {
+        install(&staging, dest)?;
+        Ok(epoch)
+    });
+    if restored.is_err() {
         // Best effort: a failed restore leaves no staging copy behind.
         let _ = fs::remove_file(&staging);
     }
-    let epoch = staged?;
-    for suffix in ["-wal", "-shm"] {
-        match fs::remove_file(beside(dest, suffix)) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
-            _ => {}
-        }
+    restored
+}
+
+/// An absent file is as good as a removed one.
+pub(super) fn ignore_not_found(error: io::Error) -> io::Result<()> {
+    if error.kind() == io::ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(error)
     }
-    fs::rename(&staging, dest)?;
+}
+
+/// Moves the staged file over `dest`, after the journal of the file it replaces is gone
+/// (a journal left beside a different file would be replayed into it).
+fn install(staging: &Path, dest: &Path) -> Result<(), SqliteError> {
+    for suffix in ["-wal", "-shm"] {
+        fs::remove_file(beside(dest, suffix)).or_else(ignore_not_found)?;
+    }
+    fs::rename(staging, dest)?;
     let dir = dest.parent().filter(|dir| !dir.as_os_str().is_empty());
     fs::File::open(dir.unwrap_or(Path::new(".")))?.sync_all()?;
-    Ok(epoch)
+    Ok(())
 }
 
 /// Copies `backup` to `staging`, checks it, stamps its epoch and folds its journal in,

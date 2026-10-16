@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::guard::{filesystem_type, lock_path, network_filesystem};
+use super::restore::ignore_not_found;
 use super::{Options, SqliteError, SqliteStore};
 use crate::{Clock, StoreError, SystemClock};
 
@@ -145,5 +146,17 @@ fn a_connection_that_cannot_keep_a_wal_is_refused() {
     assert!(
         matches!(refused, SqliteError::NotAStateStore(_)),
         "got {refused}"
+    );
+}
+
+// Catches a restore that treats a failed removal of the old journal as "already gone": the
+// journal would be replayed into the restored file.
+#[test]
+fn only_a_missing_file_counts_as_removed() {
+    assert!(ignore_not_found(io::Error::from(io::ErrorKind::NotFound)).is_ok());
+    let refused = ignore_not_found(io::Error::from(io::ErrorKind::PermissionDenied));
+    assert_eq!(
+        refused.expect_err("denied").kind(),
+        io::ErrorKind::PermissionDenied
     );
 }

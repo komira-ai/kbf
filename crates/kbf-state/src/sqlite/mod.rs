@@ -89,8 +89,8 @@ pub struct SqliteStore {
     path: PathBuf,
     clock: Arc<dyn Clock>,
     epoch: u64,
-    /// Taken (`None`) at drop so the writer sees its queue close.
-    requests: Option<SyncSender<Request>>,
+    /// Replaced at drop by a sender with no receiver, so the writer sees its queue close.
+    requests: SyncSender<Request>,
     writer: Option<JoinHandle<()>>,
     reader: Mutex<Connection>,
     shared: Arc<Shared>,
@@ -165,7 +165,7 @@ impl SqliteStore {
             path: path.to_owned(),
             clock,
             epoch,
-            requests: Some(requests),
+            requests,
             writer: Some(handle),
             reader: Mutex::new(reader),
             shared,
@@ -211,18 +211,18 @@ impl SqliteStore {
             queued: Instant::now(),
             reply,
         };
-        let gone = || StoreError::Failed("the state store's writer has stopped".to_owned());
-        self.requests
-            .as_ref()
-            .ok_or_else(gone)?
-            .send(request)
-            .map_err(|_| gone())?;
-        answer.recv().map_err(|_| gone())?
+        self.requests.send(request).map_err(gone)?;
+        answer.recv().map_err(gone)?
     }
 
     fn reader(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.reader.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// The answer to a call the writer cannot take or will never answer: it has stopped.
+fn gone<E>(_: E) -> StoreError {
+    StoreError::Failed("the state store's writer has stopped".to_owned())
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -237,11 +237,10 @@ impl std::fmt::Debug for SqliteStore {
 impl Drop for SqliteStore {
     fn drop(&mut self) {
         // Closing the queue ends the writer after the requests already in it.
-        self.requests = None;
-        if let Some(writer) = self.writer.take() {
-            // A writer that panicked has nothing more to say to us.
-            let _ = writer.join();
-        }
+        let (closed, _) = mpsc::sync_channel(1);
+        drop(std::mem::replace(&mut self.requests, closed));
+        // A writer that panicked has nothing more to say to us.
+        let _ = self.writer.take().map(JoinHandle::join);
     }
 }
 

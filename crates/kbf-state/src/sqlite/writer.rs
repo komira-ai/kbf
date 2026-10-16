@@ -7,7 +7,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, OptionalExtension, Statement, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, Statement, TransactionBehavior, params};
 
 use super::schema::{KIND_DELETE, KIND_EXPIRE, KIND_PUT};
 use super::{CommitMetrics, Options};
@@ -54,8 +54,18 @@ pub(super) struct Writer {
     pub(super) head: u64,
 }
 
-fn int(value: u64) -> i64 {
+pub(super) fn to_sql(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// The key of a row `reap` removed.
+fn key_of(row: &Row<'_>) -> rusqlite::Result<String> {
+    row.get(0)
+}
+
+/// The version and expiry of a `kv` row.
+fn version_of(row: &Row<'_>) -> rusqlite::Result<(i64, Option<i64>)> {
+    Ok((row.get(0)?, row.get(1)?))
 }
 
 pub(super) fn uint(value: i64) -> u64 {
@@ -217,16 +227,14 @@ impl<'c> Applier<'c> {
         value: Option<&[u8]>,
     ) -> rusqlite::Result<()> {
         self.feed
-            .execute(params![int(revision), key, kind, value])?;
+            .execute(params![to_sql(revision), key, kind, value])?;
         Ok(())
     }
 
     /// Removes the keys the clock has expired, with an `Expire` row each; how many.
     fn reap(&mut self) -> rusqlite::Result<usize> {
-        let mut keys = self
-            .expire
-            .query_map([to_nanos(self.now)], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<String>>>()?;
+        let due = self.expire.query_map([to_nanos(self.now)], key_of)?;
+        let mut keys = due.collect::<rusqlite::Result<Vec<String>>>()?;
         keys.sort();
         for key in &keys {
             let revision = self.revision();
@@ -238,12 +246,7 @@ impl<'c> Applier<'c> {
     /// The version of `key` if it is live.
     fn live_version(&mut self, key: &str) -> rusqlite::Result<Option<Version>> {
         let now = to_nanos(self.now);
-        let row = self
-            .get
-            .query_row([key], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
-            })
-            .optional()?;
+        let row = self.get.query_row([key], version_of).optional()?;
         Ok(row
             .filter(|(_, expires)| expires.is_none_or(|at| at > now))
             .map(|(version, _)| Version(uint(version))))
@@ -281,7 +284,7 @@ impl<'c> Applier<'c> {
                     let revision = self.revision();
                     let expires = ttl.map(|ttl| to_nanos(self.now.saturating_add(ttl)));
                     self.put
-                        .execute(params![key, value, int(revision), expires])?;
+                        .execute(params![key, value, to_sql(revision), expires])?;
                     self.append(revision, key, KIND_PUT, Some(value.as_slice()))?;
                     wrote = Some(revision);
                 }
@@ -311,7 +314,7 @@ impl<'c> Applier<'c> {
         if !self.wrote {
             return Ok(None);
         }
-        self.set_head.execute([int(self.head)])?;
+        self.set_head.execute([to_sql(self.head)])?;
         Ok(Some(self.head))
     }
 }
