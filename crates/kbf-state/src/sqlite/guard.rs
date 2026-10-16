@@ -108,7 +108,12 @@ impl StoreLock {
     /// [`SqliteError::NetworkFs`] on a network filesystem; otherwise the failing call.
     pub fn take(db: &Path) -> Result<StoreLock, SqliteError> {
         refuse_network_filesystem(db, &filesystem_type)?;
-        let file = take_lock(db)?;
+        // MUTANT M1: the lock file opened, never locked.
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_path(db))?;
         Ok(StoreLock {
             db: db.to_owned(),
             _file: file,

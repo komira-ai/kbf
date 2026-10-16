@@ -302,7 +302,8 @@ pub fn restore(
     out: &mut dyn Write,
 ) -> Result<(), StateFileError> {
     let s = sqlite::check_backup(src).map_err(StateFileError::Source)?;
-    let lock = hold(db, apply)?;
+    // MUTANT M7: a dry run restores too.
+    let lock = hold(db, apply || true)?;
     let plan = plan(db, stamp)?;
     let _ = writeln!(
         out,
@@ -397,7 +398,8 @@ fn execute(lock: &StoreLock, src: &Path, plan: &Plan) -> Result<u64, StateFileEr
     let (uid, gid) = (plan.owner.uid, plan.owner.gid);
     chown(&lock_file, Some(uid), Some(gid)).map_err(io_at("chown", &lock_file))?;
     if let Some(keep) = &plan.keep {
-        copy_new(db, keep, plan)?;
+        // MUTANT M5: the current file is not kept.
+        let _ = db;
         if plan.wal {
             copy_new(&beside(db, "-wal"), &beside(keep, "-wal"), plan)?;
         }
