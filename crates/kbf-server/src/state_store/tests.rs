@@ -150,6 +150,13 @@ fn a_sqlite_value_that_cannot_be_opened_names_the_path() {
         refused.to_string().contains(&dir.display().to_string()),
         "{refused}"
     );
+    // A directory that cannot be made (its parent is a file) is the path's fault too.
+    let file = dir.join("a-file");
+    std::fs::write(&file, "x").expect("write");
+    let under = StateStoreUri::Sqlite(file.join("deeper").join("state.db"));
+    let refused = under.open(None).err().expect("no directory");
+    assert!(matches!(refused, StateError::Open(_)), "{refused:?}");
+    assert!(refused.to_string().contains("a-file"), "{refused}");
     let _ = std::fs::remove_dir_all(&dir);
     let mut lock = dir.into_os_string();
     lock.push(".lock");
@@ -315,4 +322,13 @@ async fn a_wrapped_stores_calls_run_off_the_runtime() {
         .expect("changes");
     store.reap_expired().expect("reap");
     let _ = (store.commit_stats(), store.now());
+}
+
+/// Catches: a store call that panicked on its thread swallowed (the caller would get a
+/// default or hang) instead of panicking in the caller with the same message.
+#[test]
+fn a_panic_in_an_off_runtime_call_reaches_the_caller() {
+    let panicked = std::panic::catch_unwind(|| off_runtime(|| -> u8 { panic!("the call failed") }));
+    let payload = panicked.expect_err("the panic is resumed");
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"the call failed"));
 }
