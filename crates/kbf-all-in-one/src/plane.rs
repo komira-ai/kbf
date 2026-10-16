@@ -155,6 +155,12 @@ fn parse(digest: &Digest) -> Option<kbf_types::Digest> {
 
 /// Sends each item of `stream` down `chunks`, one at a time, until it ends or the
 /// reader goes away.
+///
+/// TODO(#745, re-cut #780): the plane and the cache never hold a blob whole, but the
+/// storage side does not stream yet: `CacheStorage::read_range` still reads the blob
+/// whole inside storage before this pump sees its first chunk. The no-whole-blob
+/// guarantee for all-in-one storage reads arrives with #745 and #780 re-cut on it;
+/// add its test then.
 async fn pump(mut stream: ReadStream, chunks: Sender<Result<Bytes, StorageError>>) {
     while let Some(chunk) = stream.next().await {
         if chunks.send(chunk).await.is_err() {
