@@ -31,6 +31,21 @@ const BOTH: &[&str] = &[
 /// What `kbf storage` needs to parse: nothing (its stores are checked at start).
 const STORAGE: &[&str] = &["kbf", names::STORAGE];
 
+/// What `kbf storage-and-daemon` needs to parse: the daemon's required flags.
+const CONVERGED: &[&str] = &[
+    "kbf",
+    names::STORAGE_AND_DAEMON,
+    "--driver=container",
+    "--server=https://127.0.0.1:8981",
+    "--ca-cert=ca.pem",
+    "--cert=node.pem",
+    "--key=node.key",
+    "--node-id=node-1",
+];
+
+/// What `kbf frontend` needs to parse: the storage node it reaches.
+const FRONTEND: &[&str] = &["kbf", names::FRONTEND, "--storage=http://127.0.0.1:8982"];
+
 fn with(base: &[&str], extra: &[&str]) -> Vec<String> {
     base.iter().chain(extra).map(|s| (*s).to_owned()).collect()
 }
@@ -43,8 +58,7 @@ fn error(argv: Vec<String>) -> String {
     refusal(argv).to_string()
 }
 
-/// Catches a mode wired to the wrong flags or entry, an unbuilt mode that parses as a
-/// built one, or a clap command that does not build (a name held twice panics in
+/// Catches a mode wired to the wrong flags or entry, or a clap command that does not build (a name held twice panics in
 /// `debug_assert`).
 #[test]
 fn each_mode_parses_its_flags() {
@@ -58,17 +72,21 @@ fn each_mode_parses_its_flags() {
     let storage = parse_from(with(STORAGE, &["--storage-listen=127.0.0.1:9982"])).expect("storage");
     assert!(matches!(&storage, Invocation::Storage(flags)
         if flags.listen.to_string() == "127.0.0.1:9982" && flags.tls.is_none()));
-    for mode in ["frontend", "storage-and-daemon"] {
-        let inv = parse_from(["kbf", mode, "--any-flag=1", "positional"]).expect(mode);
-        assert!(
-            matches!(&inv, Invocation::NotBuilt { mode: m } if *m == mode),
-            "{inv:?}"
-        );
-    }
+    let frontend = parse_from(with(FRONTEND, &["--listen=127.0.0.1:9980"])).expect("frontend");
+    assert!(matches!(&frontend, Invocation::Frontend(flags)
+        if flags.server.listen.to_string() == "127.0.0.1:9980" && flags.tls.is_none()));
+    let converged = with(
+        CONVERGED,
+        &["--storage-listen=127.0.0.1:9982", "--cpu-threads=3"],
+    );
+    let converged = parse_from(converged).expect("storage-and-daemon");
+    assert!(matches!(&converged, Invocation::StorageAndDaemon(flags)
+        if flags.storage.listen.to_string() == "127.0.0.1:9982"
+            && format!("{:?}", flags.daemon).contains("cpu_threads: Some(3)")));
 }
 
 /// Catches a table that is not exactly the five modes with the mapping the design
-/// gives (daemon and all-in-one run today's entries, the rest are not built), a duplicate mode, or a clap command that lists other modes than the
+/// gives (every mode runs its own entry), a duplicate mode, or a clap command that lists other modes than the
 /// table.
 #[test]
 fn the_table_has_exactly_five_modes_and_their_entries() {
@@ -76,10 +94,10 @@ fn the_table_has_exactly_five_modes_and_their_entries() {
     assert_eq!(
         table,
         [
-            ("frontend", Entry::NotBuilt),
+            ("frontend", Entry::Frontend),
             ("storage", Entry::Storage),
             ("daemon", Entry::Daemon),
-            ("storage-and-daemon", Entry::NotBuilt),
+            ("storage-and-daemon", Entry::StorageAndDaemon),
             ("all-in-one", Entry::AllInOne),
         ]
     );
@@ -143,7 +161,12 @@ fn each_mode_refuses_the_flags_of_another() {
     let daemon = longs(&kbf_node::Cli::command());
     let both = longs(&kbf_all_in_one::cli::command());
     let storage = longs(&kbf_server::storage_node::command());
-    let others: BTreeSet<String> = both.union(&storage).cloned().collect();
+    let frontend = longs(&kbf_server::frontend::command());
+    let others: BTreeSet<String> = [&both, &storage, &frontend]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect();
     let derived: Vec<&str> = others.difference(&daemon).map(String::as_str).collect();
     assert_eq!(refused_by(names::DAEMON), derived.as_slice());
     assert!(derived.contains(&"cold-store") && derived.contains(&"listen"));
@@ -151,28 +174,39 @@ fn each_mode_refuses_the_flags_of_another() {
         derived.contains(&"storage-listen"),
         "the storage node's own flags are refused"
     );
+    assert!(derived.contains(&"storage-ca"), "the frontend's own too");
     assert!(daemon.is_subset(&both), "the union takes every daemon flag");
     // The storage node's own flags are not all-in-one's, so it refuses them; it takes
     // none of the daemon's flags that it lacks.
+    let refused = |mode: &str| refused_by(mode).iter().copied().collect::<BTreeSet<_>>();
+    let minus = |sets: &[&BTreeSet<String>], mine: &BTreeSet<String>| -> BTreeSet<&'static str> {
+        sets.iter()
+            .flat_map(|set| set.difference(mine))
+            .map(|flag| &*Box::leak(flag.clone().into_boxed_str()))
+            .collect()
+    };
     assert_eq!(
-        refused_by(names::ALL_IN_ONE),
-        storage
-            .difference(&both)
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .as_slice()
+        refused(names::ALL_IN_ONE),
+        minus(&[&storage, &frontend], &both)
     );
-    let from_daemon: BTreeSet<&str> = daemon.difference(&storage).map(String::as_str).collect();
     assert_eq!(
-        refused_by(names::STORAGE)
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>(),
-        from_daemon
+        refused(names::STORAGE),
+        minus(&[&daemon, &frontend], &storage)
     );
-    for mode in [names::FRONTEND, "no-such-mode"] {
-        assert!(refused_by(mode).is_empty(), "{mode}");
+    assert_eq!(
+        refused(names::FRONTEND),
+        minus(&[&daemon, &storage], &frontend)
+    );
+    for flag in ["storage-listen", "storage-tls-cert", "driver", "cas"] {
+        assert!(refused(names::FRONTEND).contains(flag), "{flag}");
     }
+    for flag in ["storage-client-cert", "storage-client-key", "storage-ca"] {
+        assert!(derived.contains(&flag), "{flag}");
+        assert!(refused(names::STORAGE).contains(flag), "{flag}");
+        assert!(refused(names::ALL_IN_ONE).contains(flag), "{flag}");
+        assert!(!refused(names::FRONTEND).contains(flag), "{flag}");
+    }
+    assert!(refused_by("no-such-mode").is_empty());
     for flag in derived {
         for given in [format!("--{flag}"), format!("--{flag}=x")] {
             let err = refusal(with(DAEMON, &[given.as_str()]));
@@ -204,6 +238,13 @@ fn only_the_scheduling_modes_take_a_state_store() {
     let default = parse_from(with(BOTH, &[])).expect("all-in-one");
     assert!(matches!(&default, Invocation::AllInOne(flags)
         if matches!(flags.server.state_store, Some(kbf_server::StateStoreUri::Sqlite(_)))));
+    let front = parse_from(with(
+        FRONTEND,
+        &["--state-store=sqlite:///var/lib/kbf/state.db"],
+    ))
+    .expect("frontend");
+    assert!(matches!(&front, Invocation::Frontend(flags)
+        if flags.server.state_store == Some(kbf_server::StateStoreUri::Sqlite(path.clone()))));
     let file = error(with(BOTH, &["--state-store=file:///var/lib/kbf"]));
     assert!(file.contains("only sqlite:///"), "{file}");
     let daemon = refusal(with(DAEMON, &["--state-store=sqlite:///x.db"]));
@@ -497,25 +538,13 @@ fn a_refusal_comes_before_a_missing_required_flag() {
     );
 }
 
-/// Catches an unbuilt mode that runs something, exits other than 2, prints more than
-/// one line, or does not name the mode.
-#[test]
-fn an_unbuilt_mode_exits_2_with_one_line() {
-    assert_eq!(
-        names::not_built_line("frontend"),
-        "kbf frontend: mode not built yet"
-    );
-    let inv = Invocation::NotBuilt { mode: "frontend" };
-    assert_eq!(run(&inv), ExitCode::from(2));
-}
-
 fn check(argv: &[&str]) -> Result<(), String> {
     let args: Vec<std::ffi::OsString> = argv.iter().map(Into::into).collect();
     check_args(&args).map_err(|e| e.to_string())
 }
 
 /// Catches `check_args` reading the wrong words (the program's name or `check-args`
-/// itself as the mode), passing a mode not built yet or `--help`, and refusing a built
+/// itself as the mode), passing `--help`, and refusing a built
 /// mode's own command line. The binary's exit codes are tests/binary.rs's.
 #[test]
 fn check_args_parses_the_words_after_check_args() {
@@ -525,6 +554,17 @@ fn check_args_parses_the_words_after_check_args() {
     let mut both = vec!["kbf", CHECK_ARGS];
     both.extend(&BOTH[1..]);
     assert_eq!(check(&both), Ok(()));
+    assert_eq!(
+        check(&[
+            "kbf",
+            CHECK_ARGS,
+            names::FRONTEND,
+            "--storage=http://127.0.0.1:1"
+        ]),
+        Ok(())
+    );
+    let e = check(&["kbf", CHECK_ARGS, names::FRONTEND]).expect_err("refused");
+    assert!(e.contains("--storage"), "{e}");
     daemon.push("--bogus-flag");
     let e = check(&daemon).expect_err("refused");
     assert!(e.contains("unexpected argument '--bogus-flag'"), "{e}");
@@ -537,11 +577,11 @@ fn check_args_parses_the_words_after_check_args() {
         ]),
         Ok(())
     );
+    let mut converged = vec!["kbf", CHECK_ARGS];
+    converged.extend(&CONVERGED[1..]);
+    assert_eq!(check(&converged), Ok(()));
     let e = check(&["kbf", CHECK_ARGS, names::STORAGE_AND_DAEMON]).expect_err("refused");
-    assert!(
-        e.contains("kbf storage-and-daemon: mode not built yet"),
-        "{e}"
-    );
+    assert!(e.contains("required arguments were not provided"), "{e}");
     for word in ["--help", "--version"] {
         let e = check(&["kbf", CHECK_ARGS, word]).expect_err("refused");
         assert!(e.contains("the mode would not start"), "{word}: {e}");
@@ -613,6 +653,60 @@ fn a_storage_node_has_no_state_store_flag() {
             "{flag}"
         );
     }
+}
+
+/// Catches a frontend that opens a store or takes a storage node's listener: its own
+/// flags and the scheduling ones parse, every store, write and segment flag is refused
+/// naming `kbf frontend`, and a storage node's listener flags are refused as another
+/// mode's (exit 2, clap's conflict kind).
+#[test]
+fn a_frontend_has_no_store_and_none_of_a_storage_nodes_listener() {
+    for flag in [
+        "--cold-store=file:///x",
+        "--hot-store=file:///x",
+        "--meta-dir=/x",
+        "--write-linger=5",
+        "--segment-upload-idle-secs=5",
+    ] {
+        let err = refusal(with(FRONTEND, &[flag]));
+        let name = flag.split('=').next().unwrap_or(flag);
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "{flag}");
+        assert_eq!(err.exit_code(), 2, "{flag}");
+        assert!(
+            err.to_string()
+                .contains(&format!("kbf frontend refuses {name}: ")),
+            "{err}"
+        );
+    }
+    for flag in [
+        "--storage-listen=127.0.0.1:1",
+        "--storage-tls-cert=c",
+        "--driver=container",
+    ] {
+        let err = refusal(with(FRONTEND, &[flag]));
+        let name = flag.split('=').next().unwrap_or(flag);
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "{flag}");
+        assert!(
+            err.to_string()
+                .contains(&format!("kbf frontend refuses {name}: ")),
+            "{err}"
+        );
+    }
+    let tls = with(
+        &[
+            "kbf",
+            names::FRONTEND,
+            "--storage=https://storage.example:8982",
+        ],
+        &[
+            "--storage-client-cert=/c",
+            "--storage-client-key=/k",
+            "--storage-ca=/a",
+        ],
+    );
+    let parsed = parse_from(tls).expect("frontend with TLS");
+    assert!(matches!(&parsed, Invocation::Frontend(flags)
+        if flags.tls.as_ref().is_some_and(|t| t.iter().map(|p| p.display().to_string()).eq(["/c", "/k", "/a"]))));
 }
 
 fn os(words: &[&str]) -> Vec<std::ffi::OsString> {
