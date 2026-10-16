@@ -519,18 +519,15 @@ impl Store for PostgresStore {
             });
         };
         let shape = RangeShape {
-            lower: Edge::of(&span.lower),
+            lower_included: span.lower.included,
             upper: Edge::of(&span.upper),
             reverse: scan.direction == Direction::Reverse,
         };
         let over = self.over();
         let take = i64::try_from(scan.limit.get().saturating_add(1)).unwrap_or(i64::MAX);
-        let (lower, upper) = span.bounds();
-        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&over, &take];
-        for bound in [&lower, &upper] {
-            if let Bound::Included(key) | Bound::Excluded(key) = bound {
-                params.push(key);
-            }
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&over, &take, &span.lower.key];
+        if let Bound::Included(key) | Bound::Excluded(key) = &span.upper {
+            params.push(key);
         }
         let rows = self.read(|s| s.client.query(&s.st.ranges[shape.index()], &params))?;
         let rows = rows

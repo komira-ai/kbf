@@ -87,9 +87,10 @@ pub(super) fn scan_prefix(
 }
 
 /// C8 on one statement, so the page is read from one WAL snapshot. The statement is
-/// bounded on both sides by the request's span (its bounds clipped to the prefix) and
-/// walks the primary key in the scan's direction; expired rows are skipped in the loop,
-/// which reads up to one live row past the limit to learn whether a resume token is due.
+/// bounded by the request's span (its bounds clipped to the prefix; below always, above
+/// unless the prefix has no successor) and walks the primary key in the scan's
+/// direction; expired rows are skipped in the loop, which reads up to one live row past
+/// the limit to learn whether a resume token is due.
 pub(super) fn scan_range(
     conn: &Connection,
     scan: ScanRange<'_>,
@@ -101,22 +102,22 @@ pub(super) fn scan_range(
             resume: None,
         });
     };
-    let mut clauses = Vec::new();
-    let mut params: Vec<&str> = Vec::new();
-    for (bound, included, excluded) in [(&span.lower, ">=", ">"), (&span.upper, "<=", "<")] {
-        let (op, key) = match bound {
-            Bound::Included(key) => (included, key),
-            Bound::Excluded(key) => (excluded, key),
-            Bound::Unbounded => continue,
-        };
+    let lower_op = if span.lower.included { ">=" } else { ">" };
+    let mut clauses = vec![format!("key {lower_op} ?1")];
+    let mut params: Vec<&str> = vec![&span.lower.key];
+    let upper = match &span.upper {
+        Bound::Included(key) => Some(("<=", key)),
+        Bound::Excluded(key) => Some(("<", key)),
+        Bound::Unbounded => None,
+    };
+    if let Some((op, key)) = upper {
         params.push(key);
-        clauses.push(format!("key {op} ?{}", params.len()));
+        clauses.push(format!("key {op} ?2"));
     }
     let order = match scan.direction {
         Direction::Forward => "ASC",
         Direction::Reverse => "DESC",
     };
-    // The span's lower bound is never unbounded, so there is always one clause.
     let sql = format!(
         "SELECT key, value, version, expires_at FROM kv WHERE {} ORDER BY key {order}",
         clauses.join(" AND ")

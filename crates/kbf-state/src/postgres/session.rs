@@ -28,8 +28,8 @@ pub(super) struct Statements {
     /// `$1` prefix, `$2` clock override: `key, value, version, expires_us`, in key order.
     pub scan: Statement,
     /// C8, one statement per [`RangeShape`] at [`RangeShape::index`]: `$1` clock override,
-    /// `$2` limit, then the key of each bounded side, lower first: `key, value, version,
-    /// expires_us` of the live keys in the span, in the shape's direction.
+    /// `$2` limit, `$3` the lower key, `$4` the upper key when that side is bounded: `key,
+    /// value, version, expires_us` of the live keys in the span, in the shape's direction.
     pub ranges: Vec<Statement>,
     /// `$1` clock override: the store's time.
     pub now: Statement,
@@ -122,7 +122,8 @@ impl Statements {
     }
 }
 
-/// How one side of a C8 span is bounded.
+/// How the upper side of a C8 span is bounded. (The lower side is always a key, so it
+/// is only included or excluded: [`RangeShape::lower_included`].)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Edge {
     Included,
@@ -142,27 +143,28 @@ impl Edge {
     }
 }
 
-/// The shape of a C8 statement: how each side of the span is bounded and which way the
-/// scan walks. Each shape has its own prepared statement, so the planner sees plain
-/// range conditions on the primary key and walks its index from the right end.
+/// The shape of a C8 statement: whether the span's lower key is included, how its upper
+/// side is bounded, and which way the scan walks. Each shape has its own prepared
+/// statement, so the planner sees plain range conditions on the primary key and walks
+/// its index from the right end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RangeShape {
-    pub lower: Edge,
+    pub lower_included: bool,
     pub upper: Edge,
     pub reverse: bool,
 }
 
 impl RangeShape {
-    const ALL: [RangeShape; 18] = {
+    const ALL: [RangeShape; 12] = {
         let mut all = [RangeShape {
-            lower: Edge::Open,
+            lower_included: true,
             upper: Edge::Open,
             reverse: false,
-        }; 18];
+        }; 12];
         let mut i = 0;
-        while i < 18 {
+        while i < 12 {
             all[i] = RangeShape {
-                lower: Edge::ALL[i / 6],
+                lower_included: i / 6 == 0,
                 upper: Edge::ALL[i / 2 % 3],
                 reverse: i % 2 == 1,
             };
@@ -174,25 +176,27 @@ impl RangeShape {
     /// Where this shape's statement sits in [`Statements::ranges`]: the inverse of the
     /// order of [`RangeShape::ALL`].
     pub(super) fn index(self) -> usize {
-        let edge = |edge: Edge| match edge {
+        let upper = match self.upper {
             Edge::Included => 0,
             Edge::Excluded => 1,
             Edge::Open => 2,
         };
-        edge(self.lower) * 6 + edge(self.upper) * 2 + usize::from(self.reverse)
+        usize::from(!self.lower_included) * 6 + upper * 2 + usize::from(self.reverse)
     }
 
     fn sql(self, now: &str) -> String {
-        let mut conditions = vec![format!("(expires_us IS NULL OR expires_us > {now})")];
-        let mut param = 2;
-        for (edge, included, excluded) in [(self.lower, ">=", ">"), (self.upper, "<=", "<")] {
-            let op = match edge {
-                Edge::Included => included,
-                Edge::Excluded => excluded,
-                Edge::Open => continue,
-            };
-            param += 1;
-            conditions.push(format!("key {op} ${param}"));
+        let lower = if self.lower_included { ">=" } else { ">" };
+        let mut conditions = vec![
+            format!("(expires_us IS NULL OR expires_us > {now})"),
+            format!("key {lower} $3"),
+        ];
+        let upper = match self.upper {
+            Edge::Included => Some("<="),
+            Edge::Excluded => Some("<"),
+            Edge::Open => None,
+        };
+        if let Some(op) = upper {
+            conditions.push(format!("key {op} $4"));
         }
         let order = if self.reverse { "DESC" } else { "ASC" };
         format!(
@@ -374,6 +378,21 @@ impl Drop for Pooled<'_> {
     fn drop(&mut self) {
         if let Some(session) = self.session.take() {
             self.pool.give_back(session);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RangeShape;
+
+    // Catches an index that does not invert the order of the prepared statements, which
+    // would run a scan on another shape's statement (wrong bounds or direction), and a
+    // repeated shape that would leave one shape with no statement.
+    #[test]
+    fn each_shape_indexes_its_own_statement() {
+        for (place, shape) in RangeShape::ALL.iter().enumerate() {
+            assert_eq!(shape.index(), place, "{shape:?}");
         }
     }
 }

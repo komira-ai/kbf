@@ -90,59 +90,65 @@ pub trait Store: Send + Sync {
     }
 }
 
-/// The keys a C8 request may return: its bounds clipped to its prefix. The lower bound
-/// is never unbounded (every key under the prefix is at or after it); the upper is
-/// unbounded only when no string follows every key under the prefix.
+/// The keys a C8 request may return: its bounds clipped to its prefix. The lower edge is
+/// always a key, since every key under the prefix is at or after the prefix itself; the
+/// upper is unbounded only when no string follows every key under the prefix.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Span {
-    pub lower: Bound<String>,
+    pub lower: Lower,
     pub upper: Bound<String>,
+}
+
+/// The lower edge of a [`Span`]: a key, and whether the key itself is in the span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Lower {
+    pub key: String,
+    pub included: bool,
 }
 
 impl Span {
     /// The span of `scan`, or `None` when no key can lie in it.
     pub(crate) fn of(scan: &ScanRange<'_>) -> Option<Span> {
-        let lower = tighter(Bound::Included(scan.prefix), scan.lower, Ordering::Greater);
-        let ceiling = successor(scan.prefix);
-        let upper = match ceiling.as_deref() {
-            Some(ceiling) => tighter(Bound::Excluded(ceiling), scan.upper, Ordering::Less),
-            None => scan.upper,
+        let (low, included) = tighter((scan.prefix, true), scan.lower, Ordering::Greater);
+        let upper = match successor(scan.prefix) {
+            Some(ceiling) => match tighter((&ceiling, false), scan.upper, Ordering::Less) {
+                (high, true) => Bound::Included(high.to_owned()),
+                (high, false) => Bound::Excluded(high.to_owned()),
+            },
+            None => scan.upper.map(str::to_owned),
         };
-        let empty = match (lower, upper) {
-            (Bound::Included(low), Bound::Included(high)) => low > high,
-            (
-                Bound::Included(low) | Bound::Excluded(low),
-                Bound::Included(high) | Bound::Excluded(high),
-            ) => low >= high,
-            _ => false,
+        let empty = match &upper {
+            Bound::Included(high) if included => low > high.as_str(),
+            Bound::Included(high) | Bound::Excluded(high) => low >= high.as_str(),
+            Bound::Unbounded => false,
         };
         (!empty).then(|| Span {
-            lower: lower.map(str::to_owned),
-            upper: upper.map(str::to_owned),
+            lower: Lower {
+                key: low.to_owned(),
+                included,
+            },
+            upper,
         })
     }
 
     /// The span as borrowed bounds, the form `BTreeMap::range` takes.
     pub(crate) fn bounds(&self) -> (Bound<&str>, Bound<&str>) {
-        (
-            self.lower.as_ref().map(String::as_str),
-            self.upper.as_ref().map(String::as_str),
-        )
+        let lower = if self.lower.included {
+            Bound::Included(self.lower.key.as_str())
+        } else {
+            Bound::Excluded(self.lower.key.as_str())
+        };
+        (lower, self.upper.as_ref().map(String::as_str))
     }
 }
 
-/// Of two bounds on the same side, the one that admits fewer keys: the key further in
-/// the `inward` direction, and at a tie the excluded one. `base` is never unbounded.
-fn tighter<'a>(base: Bound<&'a str>, other: Bound<&'a str>, inward: Ordering) -> Bound<&'a str> {
-    let key = |bound: Bound<&'a str>| match bound {
-        Bound::Included(key) | Bound::Excluded(key) => Some(key),
-        Bound::Unbounded => None,
-    };
-    match (key(base), key(other)) {
-        (Some(mine), Some(theirs)) if theirs.cmp(mine) == inward => other,
-        (Some(mine), Some(theirs)) if theirs == mine && matches!(other, Bound::Excluded(_)) => {
-            other
-        }
+/// Of an edge that is a key, `(key, included)`, and a request's bound on the same side,
+/// the one that admits fewer keys: the key further in the `inward` direction, and at a
+/// tie the excluded one.
+fn tighter<'a>(base: (&'a str, bool), other: Bound<&'a str>, inward: Ordering) -> (&'a str, bool) {
+    match other {
+        Bound::Included(theirs) if theirs.cmp(base.0) == inward => (theirs, true),
+        Bound::Excluded(theirs) if theirs.cmp(base.0) != inward.reverse() => (theirs, false),
         _ => base,
     }
 }
