@@ -77,6 +77,7 @@ impl SqliteStore {
         todo!("av2-03: SqliteStore::open")
     }
 
+    #[allow(dead_code)]
     fn open_checked(
         _path: &Path,
         _clock: Arc<dyn Clock>,
