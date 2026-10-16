@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use crate::clock::ManualClock;
+use crate::clock::{Clock, ManualClock};
 use crate::store::Store;
 use crate::types::{Change, Commit, Cond, Conflict, Event, Revision, Txn, Version, Versioned};
 use crate::{GROUP_COMMIT_WINDOW, TARGET_WRITES_PER_SECOND};
