@@ -2019,10 +2019,13 @@ name = "kbf-storage"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "crc32c",
  "futures",
+ "kbf-map",
  "kbf-meta",
  "kbf-proto",
  "kbf-segments",
+ "kbf-store",
  "kbf-types",
  "rcgen",
  "thiserror",

@@ -26,6 +26,7 @@
 //! authorization (`kbf-auth`). `crates/kbf-it/tests/layering.rs` checks it.
 
 pub mod local_cache;
+pub mod repair;
 pub mod service;
 
 use std::sync::Arc;
