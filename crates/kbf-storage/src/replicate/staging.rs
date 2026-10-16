@@ -38,14 +38,11 @@ impl Staging {
         if self.tx.send(chunk).await.is_ok() {
             return Ok(());
         }
-        match (&mut self.worker).await {
-            Ok(Err(why)) => Err(why),
-            // The writer returns early only for an error, or a panic.
-            other => Err(StorageError::Internal(format!(
-                "the blob writer ended early: {:?}",
-                other.map(|written| written.map(|_| ()))
-            ))),
-        }
+        // The writer returns early only for an error, or a panic.
+        Err(match (&mut self.worker).await {
+            Ok(Err(why)) => why,
+            Ok(Ok(_)) | Err(_) => StorageError::Internal("the blob writer ended early".into()),
+        })
     }
 
     /// Ends the blob and waits for the writer: the bytes are checked against the digest
