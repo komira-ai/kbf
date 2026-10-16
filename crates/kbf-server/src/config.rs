@@ -347,7 +347,7 @@ pub struct Args {
     /// default 33 MiB, under the default 2 GiB). Not covered: each HTTP/2
     /// stream's message as tonic decodes it, before the handler runs, up to 17 MiB per
     /// stream (about 3.4 GiB for 200 streams), times the streams one connection may open
-    /// (`--reapi-max-streams`, `--worker-max-streams`).
+    /// (each listener's `-max-streams` flag).
     #[arg(
         long,
         default_value_t = kbf_front::WriteConfig::DEFAULT.bytes_in_flight,
