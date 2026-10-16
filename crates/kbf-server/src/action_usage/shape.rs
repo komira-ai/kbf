@@ -390,10 +390,11 @@ fn target_of(owner: Owner, form: Form, rest: &[&str], names: &Names) -> Option<T
     if names.starts.first().copied().unwrap_or(false) {
         return None;
     }
+    // No name starts at the cell, so every name has a segment before it.
     let spans = names.spans();
     // A dynamic action's `__action__<k>__`, right after its target's name: no name.
     let dynamic = |&(start, end): &Span| {
-        start == end && start > 0 && names.ends[start - 1] && rest[start].starts_with("__action__")
+        start == end && names.ends[start - 1] && rest[start].starts_with("__action__")
     };
     // The hash buck2 puts right after the name, past a dynamic action's key (a target's).
     let hashed = |&(_, end): &Span| {
@@ -419,12 +420,12 @@ fn target_of(owner: Owner, form: Form, rest: &[&str], names: &Names) -> Option<T
         // The name has the output under it.
         (Owner::Target, Form::Configuration) => spans
             .iter()
-            .filter(|s| s.0 > 0 && s.1 + 1 < rest.len() && !dynamic(s))
+            .filter(|s| s.1 + 1 < rest.len() && !dynamic(s))
             .copied()
             .collect(),
         (Owner::Target, Form::Content) | (Owner::Bxl, _) => spans
             .iter()
-            .filter(|s| s.0 > 0 && !dynamic(s) && hashed(s))
+            .filter(|s| !dynamic(s) && hashed(s))
             .copied()
             .collect(),
     };
@@ -530,16 +531,17 @@ impl Names {
         names
     }
 
-    /// Each name's first and last segment, in path order.
+    /// Each name's first and last segment, in path order (a name's end always
+    /// follows its start, with no other start between).
     fn spans(&self) -> Vec<Span> {
         let mut spans = Vec::new();
-        let mut open = None;
+        let mut first = 0;
         for (i, (&start, &end)) in self.starts.iter().zip(&self.ends).enumerate() {
             if start {
-                open = Some(i);
+                first = i;
             }
-            if end && let Some(start) = open.take() {
-                spans.push((start, i));
+            if end {
+                spans.push((first, i));
             }
         }
         spans

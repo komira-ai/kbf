@@ -939,4 +939,15 @@ fn an_anonymous_content_mode_target_outside_the_root_names_none() {
         label(TargetKind::Anon, "cell//:x"),
         "the root package in the configuration form"
     );
+    for path in [
+        format!("buck-out/v2/art-anon/cell/{CFG}/__x__/o"),
+        format!("buck-out/v2/art-anon/cell/{CFG}src//__x__/o"),
+        format!("buck-out/v2/art-anon/cell/{CFG}src/x/__x__/o"),
+    ] {
+        assert_eq!(
+            target_of_paths(&["cc"], &[&path]),
+            None,
+            "no attributes hash before the name: {path}"
+        );
+    }
 }
