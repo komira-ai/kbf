@@ -791,7 +791,8 @@ mod tests {
             ..CommandRendering::default()
         };
         c.bound();
-        assert!(c.truncated && c.argv.is_empty());
+        assert!(c.truncated);
+        assert!(c.argv.is_empty());
         let mut fits = CommandRendering {
             argv: vec!["x".repeat(4 * 1024)],
             ..CommandRendering::default()
