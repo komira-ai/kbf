@@ -1,12 +1,13 @@
-//! Nothing a daemon sends or receives can carry a cold-store endpoint, bucket or key.
+//! No message a daemon sends or receives names a cold store or its credential.
 //!
 //! A daemon-only node holds no cold-store credential and reaches bytes only through
 //! storage (docs/design/architecture-v2.md, section 9). The flags keep the credential
 //! off its command line (kbf-cli's tests) and the layering keeps the object-store client
-//! out of its binary (kbf-it's tests/layering.rs); this file keeps it off the wire: no
-//! message of a service the daemon calls, and no message of the storage map that
-//! `Welcome` and the map pushes carry, has a field or a type named for a cold store or its
-//! credential, at any depth.
+//! out of its binary (kbf-it's tests/layering.rs); this file keeps it off the wire's
+//! schema: no message of a service the daemon calls, and no message of the storage map
+//! (which `Welcome` and `MapUpdate` are to carry), has a field or a type named for a cold
+//! store or its credential, at any depth. It reads names, not values: a cold-store URI
+//! put in a field with a generic name (`string config`) is review's to refuse.
 //!
 //! The protos are compiled here as `build.rs` compiles them, and the walk starts from the
 //! services' own method types, so an RPC added to the worker or segments service is
@@ -30,7 +31,7 @@ use prost_types::{DescriptorProto, FileDescriptorSet};
 const DAEMON_SERVICES: &[&str] = &[".kbf.worker.v1.Worker", ".kbf.worker.v1.Segments"];
 
 /// Messages a daemon receives outside those services' method types: the storage map,
-/// which `Welcome` and the map pushes carry (docs/design/architecture-v2.md, section 6).
+/// which `Welcome` and `MapUpdate` are to carry (docs/design/architecture-v2.md, section 6).
 const DAEMON_MESSAGES: &[&str] = &[".kbf.map.v1.Map"];
 
 /// Words no field or message name on the daemon's wire may hold, compared in lower case
