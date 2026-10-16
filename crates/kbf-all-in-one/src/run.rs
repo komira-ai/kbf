@@ -78,7 +78,7 @@ fn serve(flags: &Flags) -> Result<(), Failed> {
     let sizes = kbf_server::sizes_on(&flags.server, Topology::detect());
     sizes.log();
     let tokio = sizes.runtime().map_err(Failed::server)?;
-    let started = tokio.block_on(kbf_server::start(&flags.server, kbf_server::interrupted));
+    let started = tokio.block_on(kbf_server::start_interruptible(&flags.server));
     let server = started.map_err(Failed::server)?;
     println!("{}", server.start_line());
     let plane = Arc::new(LocalDataPlane::new(server.local(), tokio.handle().clone()));

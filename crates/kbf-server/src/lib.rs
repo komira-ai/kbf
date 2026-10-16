@@ -22,6 +22,8 @@
 //!   the REAPI policy names `invocations.getAuthorizer` (or `--invocations-open` is
 //!   given); and `GET /v1/blobs/{digest}`, a CAS blob's bytes for a browser
 //!   ([`http_blobs`]), off unless the policy also names `blobs.getAuthorizer`.
+//! - A drain of the frontend ([`drain`]) that a stop signal or `POST /v1/frontend/drain`
+//!   begins, a second signal escalates, and `kbf cluster` calls through [`api_client`].
 //! - Rollouts ([`rollout`]): the record's store (in memory for now) and the driver that
 //!   cordons, drains and hands drained nodes their update, as far as `updating`.
 //! - The MDM gate ([`mdm`]): the server's verbs at `kbf-mdm-gate` (inventory, enforce
@@ -53,10 +55,12 @@
 
 pub mod action_usage;
 pub mod api;
+pub mod api_client;
 pub mod blobs;
 #[cfg(test)]
 mod build_commit;
 pub mod config;
+pub mod drain;
 pub mod farm;
 mod fault;
 pub mod fleet;
@@ -87,6 +91,7 @@ pub mod worker;
 pub mod write_tier;
 
 pub use config::{Args, ConfigError, Role, SERVER, s3_store};
+pub use drain::{Drain, DrainStatus};
 pub use farm::{EpochPolicy, Farm, SESSION_RENEWAL, StateError};
 pub use health::Readiness;
 pub use identity::{DenyList, DenyListError, Peers};
@@ -98,7 +103,7 @@ pub use serve::{
     bind_server, bind_server_with_api, bind_server_with_policy, bind_server_with_state,
     bind_storage,
 };
-pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start};
+pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_interruptible};
 pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};
 pub use worker::WorkerService;
 

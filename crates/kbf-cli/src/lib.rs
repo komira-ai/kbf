@@ -13,6 +13,10 @@
 //! - `kbf frontend`, `kbf storage-and-daemon`: not built yet. Each exits 2 with one line
 //!   naming the mode.
 //!
+//! And one word that is not a mode: `kbf cluster status|drain|undrain` ([`cluster`]), a
+//! client of the frontend's operator API that starts nothing. Like `check-args` it is
+//! outside [`names::MODES`]; `kbf --help` ends with a line naming it.
+//!
 //! A mode refuses the flags that belong to another mode ([`refused_by`]): the set is
 //! derived from each mode's own flag set, nothing is listed by hand, so a flag added to
 //! one mode is refused by the others with no edit here.
@@ -29,6 +33,7 @@
 //!
 //! The `kbf-server`, `kbf-daemon` and `kbf-all-in-one` binaries are unchanged.
 
+pub mod cluster;
 pub mod names;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,7 +42,7 @@ use std::sync::OnceLock;
 
 use clap::builder::Resettable;
 use clap::error::ErrorKind;
-use clap::{Arg, ArgMatches, Command, CommandFactory as _, FromArgMatches as _};
+use clap::{Arg, ArgMatches, Args as _, Command, CommandFactory as _, FromArgMatches as _};
 use names::{Entry, MODES};
 
 /// A parsed command line. The flags are boxed: the variants differ a lot in size.
@@ -153,7 +158,37 @@ pub fn command() -> Command {
     for mode in MODES {
         cmd = cmd.subcommand(mode_command(mode.name, mode.entry));
     }
-    cmd
+    cmd.after_help(format!(
+        "Not a mode: `kbf {CLUSTER} status|drain|undrain` calls a frontend's operator API \
+         (`kbf {CLUSTER} --help`)."
+    ))
+}
+
+/// The word after `kbf` that calls the operator API ([`cluster`]) instead of starting a
+/// mode. Like [`CHECK_ARGS`] it is not in [`names::MODES`], so the mode list stays exact.
+pub const CLUSTER: &str = "cluster";
+
+/// `kbf cluster ...`'s command line.
+#[must_use]
+pub fn cluster_command() -> Command {
+    let cmd = Command::new(CLUSTER)
+        .bin_name(format!("kbf {CLUSTER}"))
+        .about("Drain, undrain and show the cluster through the frontend's operator API.")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .disable_help_subcommand(true);
+    cluster::Cluster::augment_args(cmd)
+}
+
+/// Parses `kbf cluster ...`; `args` is the whole command line, its first word the
+/// program's name and its second [`CLUSTER`].
+///
+/// # Errors
+/// What `clap` refuses.
+pub fn parse_cluster(args: &[std::ffi::OsString]) -> Result<cluster::Cluster, clap::Error> {
+    let argv = args.iter().take(1).chain(args.iter().skip(2));
+    let matches = cluster_command().try_get_matches_from(argv)?;
+    cluster::Cluster::from_arg_matches(&matches)
 }
 
 /// Parses a command line (its first word is the program's name).
@@ -279,7 +314,8 @@ pub fn check_args(args: &[std::ffi::OsString]) -> Result<(), clap::Error> {
 
 /// The `kbf` binary: the daemon's helper re-execs first (a keeper or a `__chown-dirs`
 /// run of this binary never reads the command line as `kbf`'s), then the command line,
-/// then [`check_args`] for `kbf check-args ...` or else [`run`]. A command line that
+/// then [`check_args`] for `kbf check-args ...`, [`cluster::run`] for `kbf cluster ...`
+/// or else [`run`]. A command line that
 /// does not parse exits 2 (0 for `--help` and `--version`).
 #[must_use]
 pub fn main() -> ExitCode {
@@ -294,6 +330,12 @@ pub fn main() -> ExitCode {
                 let _ = e.print();
                 ExitCode::from(2)
             }
+        };
+    }
+    if args.get(1).is_some_and(|word| word == CLUSTER) {
+        return match parse_cluster(&args) {
+            Ok(cluster) => cluster::run(&cluster),
+            Err(e) => e.exit(),
         };
     }
     match parse_from(args) {

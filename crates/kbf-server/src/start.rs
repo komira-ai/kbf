@@ -14,7 +14,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kbf_front::Cache;
@@ -27,6 +27,7 @@ use kbf_store::StdFs;
 use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
 
+use crate::drain::Drain;
 use crate::local::LocalStore;
 use crate::startup_pass::StartPass;
 use crate::stores::{COLD_FILE_FLOOR, FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
@@ -40,6 +41,9 @@ pub fn sizes_on(args: &Args, topology: Topology) -> kbf_threads::Sizes {
     args.threads.resolve(topology)
 }
 
+/// A future that completes on the second stop signal.
+type Escalation = Pin<Box<dyn Future<Output = ()> + Send>>;
+
 /// A started server: bound, its write tier attached and its flusher (and any start-up
 /// pass) running, not yet serving. [`ServerHandle::serve`] serves until the shutdown
 /// future given to [`start`] completes; dropping the handle first stops the flusher and
@@ -52,6 +56,12 @@ pub struct ServerHandle {
     /// Where the operator API listener is, if there is one.
     pub api: Option<SocketAddr>,
     local: LocalStore,
+    drain: Arc<Drain>,
+    /// Completes on the second stop signal ([`start_interruptible`]); [`serve`] then
+    /// calls [`Drain::close`].
+    ///
+    /// [`serve`]: ServerHandle::serve
+    escalation: Option<Escalation>,
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
@@ -73,20 +83,62 @@ impl ServerHandle {
         self.local.clone()
     }
 
+    /// The frontend's drain ([`Drain`]): `POST /v1/frontend/drain` begins it, and the
+    /// shutdown future given to [`start`] does. [`Drain::close`] ends the open streams
+    /// now.
+    #[must_use]
+    pub fn drain(&self) -> Arc<Drain> {
+        Arc::clone(&self.drain)
+    }
+
     /// Serves every listener until the shutdown future ends and its connections close
-    /// or `--shutdown-timeout-secs` runs out.
+    /// or `--shutdown-timeout-secs` runs out. A handle from [`start_interruptible`]
+    /// also ends the open streams, and so the drain, at a second stop signal.
     ///
     /// # Errors
     /// A listener fails while serving.
     pub async fn serve(self) -> Result<(), ServeError> {
+        let drain = self.drain();
         let Self {
             serving,
+            escalation,
             _flusher,
             _pass,
             ..
         } = self;
+        let _escalation = escalation.map(|second| {
+            AbortOnDrop(tokio::spawn(async move {
+                second.await;
+                tracing::warn!("a second stop signal: ending the open streams now");
+                drain.close();
+            }))
+        });
         serving.await
     }
+}
+
+/// [`start`] with the binary's stop signals: SIGINT or SIGTERM stops the server
+/// ([`interrupted`]), and a second one ends the drain that stop began
+/// ([`ServerHandle::serve`] closes the open streams: they end UNAVAILABLE and the
+/// server stops within a short grace). Both handlers are installed before anything is
+/// bound.
+///
+/// # Errors
+/// As [`start`].
+pub async fn start_interruptible(args: &Args) -> Result<ServerHandle, Box<dyn Error>> {
+    let slot: Arc<Mutex<Option<Escalation>>> = Arc::new(Mutex::new(None));
+    let installing = Arc::clone(&slot);
+    let mut handle = start(args, move || {
+        // The first signal's handler before the second's, in one call: a signal between
+        // the two stops the server, and the second signal is then a third.
+        let first = interrupted()?;
+        let second: Escalation = Box::pin(second_interrupt()?);
+        *installing.lock().unwrap_or_else(PoisonError::into_inner) = Some(second);
+        Ok(first)
+    })
+    .await?;
+    handle.escalation = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+    Ok(handle)
 }
 
 /// Builds the object store and the metadata log the flags name, binds the listeners
@@ -242,6 +294,8 @@ where
         worker: bound.worker,
         api: bound.api,
         local,
+        drain: bound.drain,
+        escalation: None,
         start_line: start_line(
             bound.reapi,
             bound.worker,
@@ -323,6 +377,40 @@ pub fn interrupted() -> io::Result<impl Future<Output = ()> + Send + 'static> {
         tokio::select! {
             _ = sigint.recv() => {}
             _ = sigterm.recv() => {}
+        }
+    })
+}
+
+/// Installs the SIGINT and SIGTERM handlers now and returns a future that completes on
+/// the second signal of either kind (a second SIGTERM, SIGINT, or one of each), which
+/// [`start_interruptible`] hands to [`ServerHandle::serve`] to end the drain a first
+/// signal began. Two signals that arrive before the future is first polled count as one.
+///
+/// # Errors
+/// The handler cannot be installed.
+#[cfg(unix)]
+fn second_interrupt() -> io::Result<impl Future<Output = ()> + Send + 'static> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    Ok(async move {
+        for _ in 0..2 {
+            tokio::select! {
+                _ = sigint.recv() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+    })
+}
+
+/// Returns a future that completes on the second Ctrl-C. Elsewhere than Unix the
+/// handler is installed when the future is first polled.
+#[cfg(not(unix))]
+#[expect(clippy::unnecessary_wraps, reason = "the same signature as on Unix")]
+fn second_interrupt() -> io::Result<impl Future<Output = ()> + Send + 'static> {
+    Ok(async {
+        for _ in 0..2 {
+            let _ = tokio::signal::ctrl_c().await;
         }
     })
 }

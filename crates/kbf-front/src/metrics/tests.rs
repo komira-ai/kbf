@@ -211,6 +211,8 @@ fn every_family_is_printed_once_with_its_type() {
             "kbf_execute_requests_total counter",
             "kbf_execute_errors_total counter",
             "kbf_execute_in_flight gauge",
+            "kbf_front_open_executions gauge",
+            "kbf_front_executes_started_total counter",
             "kbf_execute_queued gauge",
             "kbf_execute_prepare_seconds histogram",
             "kbf_execute_dispatch_seconds histogram",
