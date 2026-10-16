@@ -407,6 +407,7 @@ async fn an_entry_or_snapshot_this_version_cannot_read_refuses_the_open() {
     let snapshot = Snapshot {
         base: held.entries.last().expect("entries").id,
         state: Vec::new(),
+        membership: None,
     };
     store.write_snapshot(&snapshot).expect("a snapshot");
     drop(store);

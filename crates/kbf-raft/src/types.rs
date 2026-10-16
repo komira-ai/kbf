@@ -74,6 +74,10 @@ pub enum Payload {
     Blank,
     /// A command for the replicated state machine, opaque to Raft.
     Command(Vec<u8>),
+    /// The group's membership from this entry on (see [`Change`](crate::Change)). A
+    /// server uses the latest membership in its log, committed or not; the state
+    /// machine skips the entry.
+    Membership(Membership),
 }
 
 /// What a server must hold durably about elections: the latest term it has seen and
@@ -91,8 +95,8 @@ pub struct HardState {
 /// log and apply it but never vote, campaign or count towards a quorum.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Membership {
-    voters: BTreeSet<ServerId>,
-    learners: BTreeSet<ServerId>,
+    pub(crate) voters: BTreeSet<ServerId>,
+    pub(crate) learners: BTreeSet<ServerId>,
 }
 
 impl Membership {

@@ -187,6 +187,7 @@ mod tests {
         let snapshot = Snapshot {
             base: LogId::new(Term(1), LogIndex(2)),
             state: b"s".to_vec(),
+            membership: None,
         };
         m.write_snapshot(&snapshot).unwrap();
         m.crash(0);

@@ -26,6 +26,7 @@ fn snap(index: u64) -> Snapshot {
     Snapshot {
         base: LogId::new(Term(1), LogIndex(index)),
         state: format!("state through {index}").into_bytes(),
+        membership: None,
     }
 }
 

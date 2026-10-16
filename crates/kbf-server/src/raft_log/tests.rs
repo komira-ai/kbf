@@ -39,6 +39,7 @@ fn the_machine_refuses_to_restore_a_snapshot() {
     let snapshot = Snapshot {
         base: LogId::default(),
         state: Vec::new(),
+        membership: None,
     };
     let refused = machine().restore(&snapshot);
     assert!(refused.is_err());

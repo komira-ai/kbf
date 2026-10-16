@@ -33,6 +33,7 @@
 
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
+mod change;
 mod host;
 mod log;
 mod mem;
@@ -40,6 +41,7 @@ mod message;
 mod raft;
 mod types;
 
+pub use change::{Change, ChangeError};
 pub use host::{Host, HostError, Machine, OpenError, Snapshot, Storage, Stored, Transport};
 pub use mem::MemStorage;
 

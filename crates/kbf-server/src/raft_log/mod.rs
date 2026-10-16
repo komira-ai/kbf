@@ -59,6 +59,7 @@
 //! never compacted, and a directory holding a snapshot is refused), more than one
 //! voter, and the scheduler's state, which stays in memory.
 
+mod join;
 mod machine;
 mod recorded;
 
@@ -87,6 +88,7 @@ use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
+pub use self::join::{JoinAnswer, JoinError, JoinRequest};
 use self::machine::MetaMachine;
 pub use self::machine::NoSnapshots;
 pub use self::recorded::{RECORD, RECORD_TMP};
@@ -434,6 +436,23 @@ impl<F: Fs> RaftMetaLog<F> {
     #[must_use]
     pub fn machine_version(&self) -> MachineVersion {
         self.shared.lock().machine().version()
+    }
+
+    /// Adds the node `request` names to the log's cell as a learner, if it expects this
+    /// cluster (see [`JoinRequest`]).
+    ///
+    /// # Errors
+    ///
+    /// Every join is refused for now.
+    pub fn join(&self, request: &JoinRequest) -> Result<JoinAnswer, JoinError> {
+        let _ = request;
+        Err(JoinError::Refused("not built yet".to_owned()))
+    }
+
+    /// The log's Raft membership: its voters and learners.
+    #[must_use]
+    pub fn membership(&self) -> Membership {
+        self.shared.lock().core().membership().clone()
     }
 
     /// How many servers vote in the log's cell: its Raft membership's voters. One

@@ -6,8 +6,8 @@ use thiserror::Error;
 
 use crate::log::Log;
 use crate::{
-    AppendOutcome, Config, ConfigError, Effect, Entry, HardState, LogId, LogIndex, Membership,
-    Message, MessageKind, Payload, ServerId, Term,
+    AppendOutcome, Change, ChangeError, Config, ConfigError, Effect, Entry, HardState, LogId,
+    LogIndex, Membership, Message, MessageKind, Payload, ServerId, Term,
 };
 
 /// What a server is doing in its current term.
@@ -356,6 +356,25 @@ impl Raft {
             index,
             effects: self.take_effects(),
         })
+    }
+
+    /// Proposes `change` to the membership, if this server leads (see
+    /// [`Change`]).
+    ///
+    /// # Errors
+    ///
+    /// Every change is refused for now.
+    pub fn change_membership(&mut self, change: Change) -> Result<Proposed, ChangeError> {
+        let _ = change;
+        Err(ChangeError::NotLeader(NotLeader {
+            leader: self.leader,
+        }))
+    }
+
+    /// The membership as of the snapshot base: what a snapshot taken now must hold.
+    #[must_use]
+    pub fn snapshot_membership(&self) -> &Membership {
+        &self.config.membership
     }
 
     fn take_effects(&mut self) -> Vec<Effect> {

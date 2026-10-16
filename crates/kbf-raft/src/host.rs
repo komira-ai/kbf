@@ -16,8 +16,8 @@
 //! memory may already be ahead of its disk.
 
 use crate::{
-    CompactError, Config, ConfigError, Effect, Entry, HardState, LogId, LogIndex, Message,
-    NotLeader, Raft, ServerId,
+    Change, ChangeError, CompactError, Config, ConfigError, Effect, Entry, HardState, LogId,
+    LogIndex, Membership, Message, NotLeader, Raft, ServerId,
 };
 
 use thiserror::Error;
@@ -30,6 +30,9 @@ pub struct Snapshot {
     pub base: LogId,
     /// The state machine's bytes.
     pub state: Vec<u8>,
+    /// The group's membership as of `base`, which the entries the snapshot folds in
+    /// may have changed. `None`: the membership the server is opened with.
+    pub membership: Option<Membership>,
 }
 
 /// What a [`Storage`] holds for one server: the vote, the newest snapshot, and the
@@ -157,6 +160,9 @@ pub enum HostError<E> {
     /// The core refused a compaction.
     #[error(transparent)]
     Compact(CompactError),
+    /// The core refused a membership change.
+    #[error(transparent)]
+    Change(ChangeError),
 }
 
 /// One server: a core, its storage, its transport and its state machine.
@@ -314,6 +320,22 @@ impl<S: Storage, T: Transport, M: Machine> Host<S, T, M> {
         Ok(proposed.index)
     }
 
+    /// Proposes a membership change if this server leads, and returns the index of
+    /// its entry (see [`Raft::change_membership`]).
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::Change`], [`HostError::Storage`] or [`HostError::Stopped`].
+    pub fn change_membership(&mut self, change: Change) -> Result<LogIndex, HostError<S::Error>> {
+        self.running()?;
+        let proposed = self
+            .core
+            .change_membership(change)
+            .map_err(HostError::Change)?;
+        self.carry_out(proposed.effects)?;
+        Ok(proposed.index)
+    }
+
     /// Snapshots the state machine as of the last applied entry, writes the snapshot
     /// and compacts the log through that entry. Returns the new snapshot base; with
     /// nothing applied since the last snapshot, returns the current one and writes
@@ -332,7 +354,12 @@ impl<S: Storage, T: Transport, M: Machine> Host<S, T, M> {
         let state = self.machine.snapshot();
         // Every input ends synced, so no write is pending here.
         let base = self.core.compact(through).map_err(HostError::Compact)?;
-        let snapshot = Snapshot { base, state };
+        let membership = Some(self.core.snapshot_membership().clone());
+        let snapshot = Snapshot {
+            base,
+            state,
+            membership,
+        };
         self.stop_on_error(|s| s.write_snapshot(&snapshot))?;
         Ok(base)
     }

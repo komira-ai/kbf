@@ -295,6 +295,7 @@ fn encode(entries: &[Entry]) -> Vec<u8> {
                 out.extend((c.len() as u64).to_le_bytes());
                 out.extend(c);
             }
+            Payload::Membership(_) => unreachable!("the simulation changes no membership"),
         }
     }
     out

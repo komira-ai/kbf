@@ -443,6 +443,7 @@ fn open_refuses_what_it_cannot_restore() {
     let snapshot = Snapshot {
         base: LogId::new(Term(1), LogIndex(1)),
         state: vec![1, 2, 3],
+        membership: None,
     };
     garbled.mem.write_snapshot(&snapshot).unwrap();
     let (net, machine) = parts();

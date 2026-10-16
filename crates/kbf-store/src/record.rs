@@ -68,7 +68,7 @@ pub fn any_record(bytes: &[u8]) -> bool {
 /// The payload of `entry`.
 pub fn encode_entry(entry: &Entry) -> Vec<u8> {
     let data: &[u8] = match &entry.payload {
-        Payload::Blank => &[],
+        Payload::Blank | Payload::Membership(_) => &[],
         Payload::Command(c) => c,
     };
     let mut out = Vec::with_capacity(ENTRY_FIXED + data.len());
@@ -77,6 +77,7 @@ pub fn encode_entry(entry: &Entry) -> Vec<u8> {
     out.push(match entry.payload {
         Payload::Blank => 0,
         Payload::Command(_) => 1,
+        Payload::Membership(_) => 2,
     });
     out.extend_from_slice(data);
     out
@@ -93,6 +94,7 @@ pub fn decode_entry(payload: &[u8]) -> Result<Entry, &'static str> {
         0 if data.is_empty() => Payload::Blank,
         0 => return Err("blank entry with bytes"),
         1 => Payload::Command(data.to_vec()),
+        2 => return Err("membership entries are not stored yet"),
         _ => return Err("unknown entry kind"),
     };
     Ok(Entry { id, payload })
@@ -160,7 +162,11 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, (usize, &'static str)> 
     if state.len() as u64 != u64_at(head, 16) {
         return Err((off, "snapshot state length does not match its header"));
     }
-    Ok(Snapshot { base, state })
+    Ok(Snapshot {
+        base,
+        state,
+        membership: None,
+    })
 }
 
 fn u64_at(bytes: &[u8], at: usize) -> u64 {
@@ -171,6 +177,8 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use kbf_raft::Membership;
+
     use super::*;
 
     fn entry(index: u64, term: u64, payload: Payload) -> Entry {
@@ -211,6 +219,39 @@ mod tests {
         assert_eq!(decode_hard(&encode_hard(none)).unwrap(), none);
     }
 
+    /// Catches: a membership entry or a snapshot's membership that is not stored (a
+    /// restart would forget every membership change), stored in another layout than
+    /// the golden bytes pin, or decoded though malformed.
+    #[test]
+    fn memberships_round_trip_in_entries_and_snapshots() {
+        let m = Membership::new([ServerId(1), ServerId(2)], [ServerId(3)]).unwrap();
+        let e = entry(5, 2, Payload::Membership(m.clone()));
+        let bytes = encode_entry(&e);
+        assert_eq!(
+            hex(&bytes),
+            "050000000000000002000000000000000202000000010000000000000002000000\
+             00000000010000000300000000000000"
+        );
+        assert_eq!(decode_entry(&bytes), Ok(e));
+        for cut in [17, 19, 25, 33, 39, 45] {
+            assert!(decode_entry(&bytes[..cut]).is_err(), "cut at {cut}");
+        }
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(decode_entry(&longer).is_err(), "a trailing byte");
+        let no_voters = Payload::Membership(Membership::new([ServerId(1)], []).unwrap());
+        let mut none = encode_entry(&entry(1, 1, no_voters));
+        none[17] = 0;
+        assert!(decode_entry(&none).is_err(), "no voters");
+
+        let snapshot = Snapshot {
+            base: LogId::new(Term(2), LogIndex(5)),
+            state: vec![0xCD],
+            membership: Some(m),
+        };
+        assert_eq!(decode_snapshot(&encode_snapshot(&snapshot)), Ok(snapshot));
+    }
+
     /// Catches: a record accepted with a bad CRC, a damaged length, a short body or a
     /// length over the cap, and payloads that decode though malformed (fail-stop needs
     /// every one refused).
@@ -238,7 +279,7 @@ mod tests {
         assert!(decode_entry(&blank[..16]).is_err());
         blank.push(9);
         assert_eq!(decode_entry(&blank), Err("blank entry with bytes"));
-        blank[16] = 2;
+        blank[16] = 3;
         assert_eq!(decode_entry(&blank), Err("unknown entry kind"));
         assert!(decode_hard(&[0; 8]).is_err());
         assert!(decode_hard(&[0; 9].map(|_| 1)).is_err());
@@ -255,6 +296,7 @@ mod tests {
         let small = Snapshot {
             base: LogId::new(Term(3), LogIndex(2)),
             state: vec![0xCD],
+            membership: None,
         };
         assert_eq!(
             hex(&encode_snapshot(&small)),
@@ -276,6 +318,7 @@ mod tests {
         let big = Snapshot {
             base: LogId::new(Term(1), LogIndex(9)),
             state,
+            membership: None,
         };
         let bytes = encode_snapshot(&big);
         let chunk = HEADER + SNAPSHOT_CHUNK;
