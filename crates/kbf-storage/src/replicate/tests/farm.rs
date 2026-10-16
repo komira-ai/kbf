@@ -257,6 +257,11 @@ impl Farm {
         RemoteStorage::new(self.channel(node), generation)
     }
 
+    /// The way a storage node dials its peers: as a node of role `storage`.
+    pub(crate) fn peers(&self) -> Peers {
+        Peers::tls(self.pki.node("storage").1)
+    }
+
     /// A channel to node `node` as a frontend (the role that writes).
     pub(crate) fn channel(&self, node: usize) -> Channel {
         self.pki

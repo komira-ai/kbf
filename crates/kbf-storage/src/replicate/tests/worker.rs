@@ -22,6 +22,7 @@ fn config() -> RepairConfig {
     RepairConfig {
         interval: Duration::from_millis(50),
         concurrency: 2,
+        ..RepairConfig::default()
     }
 }
 
@@ -386,7 +387,7 @@ async fn a_restarted_primary_repairs_what_it_owed() {
     assert_eq!(repairs.open_records().len(), 1);
     let chain = Arc::new(Chain::new(
         Arc::clone(&farm.nodes[0].held) as Arc<dyn MapSource>,
-        Peers::plain(),
+        farm.peers(),
         Arc::clone(&repairs),
         ChainConfig::default(),
     ));
@@ -457,6 +458,7 @@ fn the_default_pace_is_a_few_blobs_every_few_seconds() {
     let pace = RepairConfig::default();
     assert_eq!(pace.concurrency, 4);
     assert_eq!(pace.interval, Duration::from_secs(5));
+    assert_eq!(pace.probe, Duration::from_secs(10));
 }
 
 /// Catches a worker that never runs on its own, or that does not tell the frontend what is
@@ -529,4 +531,189 @@ async fn an_owner_killed_mid_build_is_repaired_when_it_returns() {
             "node {node} still owes"
         );
     }
+}
+
+/// Catches a debt settled as "evicted" while its write is still committing: the replica is
+/// cut, the primary's commit is held, so the debt is journalled (the write is not yet
+/// answered) and the blob is not yet present here. A pass in that window reads NotFound, and
+/// must leave the debt owed; once the commit is released the write is answered, the blob is
+/// present with one copy, the debt is still owed, and the next pass (the replica back) makes
+/// the second copy. Mutant: NotFound settles whatever is in flight.
+#[tokio::test]
+async fn a_debt_is_not_settled_while_its_write_is_committing() {
+    let farm = Farm::start(2, ChainConfig::default()).await;
+    let map = farm.map(1, 2, &[]);
+    let bytes = farm.blob(&map, 0, 1, 4096, 20);
+    let digest = sha(&bytes);
+    farm.nodes[1].switch.cut();
+    farm.nodes[0].mem.knobs.hold_commits();
+    let write = tokio::spawn({
+        let client = farm.client(0, 1);
+        async move { client.put(Bytes::from(bytes)).await }
+    });
+    // The debt is journalled before the commit: wait for it, the commit is held.
+    within(async {
+        while owed_digests(&farm, 0).is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(!held(&farm, 0, &digest), "the commit is held");
+    // The replica is back, so the pass gets as far as reading the blob here.
+    farm.nodes[1].switch.restore();
+    let repairs = worker(&farm, 0);
+    assert_eq!(
+        repairs.pass().await,
+        Pass {
+            settled: 0,
+            waiting: 1
+        }
+    );
+    assert_eq!(owed_digests(&farm, 0), [digest], "settled mid-commit");
+
+    farm.nodes[0].mem.knobs.release_commits();
+    assert_eq!(
+        within(write).await.expect("joined").expect("answered"),
+        digest
+    );
+    assert!(held(&farm, 0, &digest) && !held(&farm, 1, &digest));
+    assert_eq!(owed_digests(&farm, 0), [digest]);
+    assert_eq!(
+        repairs.pass().await,
+        Pass {
+            settled: 1,
+            waiting: 0
+        }
+    );
+    assert!(held(&farm, 1, &digest));
+}
+
+/// Catches a debt kept for a blob this node never came to hold: the replica is cut and the
+/// primary's commit fails, so the write fails after its debt was journalled. The blob is
+/// not here and not in flight any more, so the next pass drops the debt (there is nothing
+/// to copy) and sends nothing.
+#[tokio::test]
+async fn a_write_whose_commit_fails_leaves_no_debt() {
+    let farm = Farm::start(2, ChainConfig::default()).await;
+    let map = farm.map(1, 2, &[]);
+    let bytes = farm.blob(&map, 0, 1, 4096, 21);
+    let digest = sha(&bytes);
+    farm.nodes[1].switch.cut();
+    *farm.nodes[0].mem.knobs.fault.lock().expect("lock") = StreamFault::CommitFails;
+    let answer = within(farm.client(0, 1).put(Bytes::from(bytes))).await;
+    assert!(
+        matches!(answer, Err(StorageError::Internal(_))),
+        "{answer:?}"
+    );
+    assert!(!held(&farm, 0, &digest));
+    assert_eq!(
+        owed_digests(&farm, 0),
+        [digest],
+        "journalled before the commit"
+    );
+    farm.nodes[1].switch.restore();
+    assert_eq!(
+        worker(&farm, 0).pass().await,
+        Pass {
+            settled: 1,
+            waiting: 0
+        }
+    );
+    assert!(owed_digests(&farm, 0).is_empty());
+    assert!(settled_told(&farm, 0, &digest).await);
+    assert!(!held(&farm, 1, &digest));
+    assert_eq!(farm.nodes[1].mem.knobs.begun.load(Ordering::SeqCst), 0);
+}
+
+/// Catches a pass that waits for ever on an owner that is up and does not answer: the
+/// owner's `FindMissing` hangs, so the pass ends at the probe bound with the debt owed, and
+/// a pass over the owner answering again settles it. (A hang deadline, not a speed.)
+/// Mutant: the question asked without the bound.
+#[tokio::test]
+async fn an_owner_that_does_not_answer_is_waited_for_not_hung_on() {
+    let farm = Farm::start(2, ChainConfig::default()).await;
+    let (_, digest) = owed_blob(&farm, 4096, 22).await;
+    farm.nodes[1].switch.restore();
+    farm.nodes[1]
+        .mem
+        .knobs
+        .hang_find_missing
+        .store(true, Ordering::SeqCst);
+    let repairs = RepairWorker::new(
+        Arc::clone(&farm.nodes[0].mem) as Arc<dyn Storage>,
+        Arc::clone(&farm.nodes[0].chain),
+        Arc::clone(&farm.nodes[0].repairs),
+        RepairConfig {
+            probe: Duration::from_millis(300),
+            ..config()
+        },
+    );
+    let pass = within(repairs.pass()).await;
+    assert_eq!(
+        pass,
+        Pass {
+            settled: 0,
+            waiting: 1
+        }
+    );
+    assert!(farm.nodes[1].mem.knobs.asked.load(Ordering::SeqCst) >= 1);
+    assert_eq!(owed_digests(&farm, 0), [digest]);
+    farm.nodes[1]
+        .mem
+        .knobs
+        .hang_find_missing
+        .store(false, Ordering::SeqCst);
+    let pass = within(repairs.pass()).await;
+    assert_eq!(
+        pass,
+        Pass {
+            settled: 1,
+            waiting: 0
+        }
+    );
+    assert!(held(&farm, 1, &digest));
+}
+
+/// Catches a worker that cannot be stopped while a pass is stuck: the owner's `FindMissing`
+/// hangs and the probe bound is an hour, so only the stop can end `run`, and it does.
+/// Mutant: `stop` polled only between passes.
+#[tokio::test]
+async fn run_stops_in_the_middle_of_a_stuck_pass() {
+    let farm = Farm::start(2, ChainConfig::default()).await;
+    let (_, digest) = owed_blob(&farm, 4096, 23).await;
+    farm.nodes[1].switch.restore();
+    farm.nodes[1]
+        .mem
+        .knobs
+        .hang_find_missing
+        .store(true, Ordering::SeqCst);
+    let repairs = Arc::new(RepairWorker::new(
+        Arc::clone(&farm.nodes[0].mem) as Arc<dyn Storage>,
+        Arc::clone(&farm.nodes[0].chain),
+        Arc::clone(&farm.nodes[0].repairs),
+        RepairConfig {
+            probe: Duration::from_secs(3600),
+            ..config()
+        },
+    ));
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn({
+        let repairs = Arc::clone(&repairs);
+        async move {
+            repairs
+                .run(async {
+                    let _ = stopped.await;
+                })
+                .await;
+        }
+    });
+    within(async {
+        while farm.nodes[1].mem.knobs.asked.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let _ = stop.send(());
+    within(running).await.expect("run returns");
+    assert_eq!(owed_digests(&farm, 0), [digest]);
 }

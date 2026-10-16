@@ -282,8 +282,9 @@ impl ByteStream for Declines {
     }
 }
 
-/// What a write of three bytes to a replica that answers `code` came to: `Ok(None)` if the
-/// replica holds a copy, `Ok(Some(_))` if it was lost (owed), `Err` if it refused.
+/// What a write of 2000 KiB to a replica that answers `code` at once came to: `Ok(None)` if
+/// the replica holds a copy, `Ok(Some(_))` if it was lost (owed), `Err` if it refused. The
+/// messages are more than the leg queues, so the answer is met while sending.
 async fn replica_answering(code: tonic::Code) -> Result<Option<StorageError>, StorageError> {
     let routes = tonic::service::Routes::new(ByteStreamServer::new(Declines(code)));
     let channel = connect(serve_routes(routes, None).await).await;
@@ -291,11 +292,14 @@ async fn replica_answering(code: tonic::Code) -> Result<Option<StorageError>, St
         channel,
         1,
         MemberId(1),
-        3,
+        2000 * 1024,
         Duration::from_secs(30),
         Duration::from_secs(30),
     );
-    leg.send(message(true, b"abc", true)).await?;
+    for i in 0..2000 {
+        leg.send(message(i == 0, &[1; 1024], i == 1999)).await?;
+        tokio::task::yield_now().await;
+    }
     leg.finish().await
 }
 

@@ -13,7 +13,7 @@ use super::leg::{Leg, ReplicaLeg};
 use super::peers::Peers;
 use super::{MapSource, View, check};
 use crate::StorageError;
-use crate::repair::{RepairRecord, Repairs};
+use crate::repair::{Pending, RepairRecord, Repairs};
 
 /// The most owners the chain serves: a primary and one replica.
 const MAX_REPLICATION: usize = 2;
@@ -109,15 +109,22 @@ impl Chain {
         self.peers.channel(addr)
     }
 
-    /// A copy of a blob to `owner`, sent by this node whether or not it owns the blob.
+    /// A copy of a blob of `size` bytes to `owner`, sent by this node whether or not it owns
+    /// the blob.
     ///
     /// # Errors
     /// [`StorageError::Internal`] if `owner` has no address a channel can be made to.
-    pub(crate) fn open_copy(&self, view: &View, owner: &Member) -> Result<Leg, StorageError> {
+    pub(crate) fn open_copy(
+        &self,
+        view: &View,
+        owner: &Member,
+        size: u64,
+    ) -> Result<Leg, StorageError> {
         Ok(Leg::open(
             self.peers.channel(&owner.addr)?,
             view.map.generation(),
             view.me,
+            size,
             self.config.stall,
             self.config.commit,
         ))
@@ -262,7 +269,9 @@ impl Chain {
 
     /// The one place a write is answered with one copy: the copy owed to `replica` is
     /// recorded, durably, before this returns. A caller that does not wait for it, or
-    /// goes on when it fails, would answer a write whose second copy nobody owes.
+    /// goes on when it fails, would answer a write whose second copy nobody owes. The
+    /// [`Pending`] returned is held until the blob is committed here (or the write ends
+    /// without it): the repair worker leaves a debt alone while it is.
     ///
     /// # Errors
     /// [`StorageError::Unavailable`] if the record could not be made durable: the write is
@@ -273,7 +282,7 @@ impl Chain {
         replica: &Member,
         digest: &Digest,
         why: &StorageError,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Pending, StorageError> {
         tracing::warn!(%digest, replica = %replica.id, %why, "answering with one copy and a repair owed");
         self.repairs
             .owe(RepairRecord {

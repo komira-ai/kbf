@@ -84,6 +84,10 @@ impl Mem {
 impl Storage for Mem {
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
         Box::pin(async move {
+            self.knobs.asked.fetch_add(1, Ordering::SeqCst);
+            if self.knobs.hang_find_missing.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             self.failing()?;
             let blobs = self.blobs.lock().expect("lock");
             Ok(digests
@@ -251,6 +255,10 @@ pub(crate) struct Knobs {
     /// Commits wait for a permit: take them all to hold commits, add them back to release.
     pub commit_gate: tokio::sync::Semaphore,
     pub fault: Mutex<StreamFault>,
+    /// `find_missing` calls that have arrived, answered or not.
+    pub asked: AtomicUsize,
+    /// `find_missing` never answers while this is true: a node that is up and not answering.
+    pub hang_find_missing: AtomicBool,
 }
 
 impl Default for Knobs {
@@ -264,6 +272,8 @@ impl Default for Knobs {
             hold: (Mutex::new(false), Condvar::new()),
             commit_gate: tokio::sync::Semaphore::new(tokio::sync::Semaphore::MAX_PERMITS),
             fault: Mutex::new(StreamFault::None),
+            asked: AtomicUsize::new(0),
+            hang_find_missing: AtomicBool::new(false),
         }
     }
 }

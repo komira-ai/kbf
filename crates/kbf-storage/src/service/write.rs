@@ -82,15 +82,20 @@ impl StorageService {
         // The semaphore is never closed.
         let _room = self.write_room.acquire_many(room).await.ok();
         let (staged, lost) = receive(digest, put, first, &mut rest, leg).await?;
+        let mut owing = None;
         if let (Some(chain), Some(view)) = (&self.chain, view) {
             chain.confirm(view, &digest, leg_from, &plan)?;
             // The only way past a lost replica: the copy owed is on the disk before the
-            // blob is present here, so a blob present here is replicated or owed.
+            // blob is present here, so a blob present here is replicated or owed. Until the
+            // commit is over the debt is for a blob that may not be here yet, which the
+            // repair worker must not mistake for an evicted one.
             if let (Plan::Primary { replica }, Some(why)) = (&plan, lost) {
-                chain.degrade(view, replica, &digest, &why).await?;
+                owing = Some(chain.degrade(view, replica, &digest, &why).await?);
             }
         }
-        staged.commit().await?;
+        let committed = staged.commit().await;
+        drop(owing);
+        committed?;
         Ok(())
     }
 

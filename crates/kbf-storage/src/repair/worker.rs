@@ -18,7 +18,14 @@
 //! next pass: the worker never gives up on a blob, and never concludes from an error that a
 //! copy exists. The one debt it drops without a copy is one whose blob this node no longer
 //! holds (its store evicted it): there is nothing left to copy, and the loss is the cache's
-//! to account for.
+//! to account for. A debt is journalled before the blob is committed here, so a debt whose
+//! write is still committing ([`super::Pending`]) is left alone, and a debt is dropped for
+//! an absent blob only if no write began owing since the pass started
+//! ([`Repairs::settle_evicted`]); otherwise a write answered with one copy and no debt would
+//! be possible.
+//!
+//! An owner that is up and does not answer is waited for like one that is down: the question
+//! "do you hold it" is bounded by [`RepairConfig::probe`], and `run` stops mid-pass.
 //!
 //! **Bounded work.** At most [`RepairConfig::concurrency`] blobs are repaired at once, one
 //! pass after another, [`RepairConfig::interval`] apart; a copy streams like a write
@@ -31,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt as _;
-use kbf_map::{Member, MemberState};
+use kbf_map::{Member, MemberId, MemberState};
 use kbf_proto::google::bytestream::WriteRequest;
 use kbf_types::Digest;
 
@@ -47,6 +54,10 @@ pub struct RepairConfig {
     pub interval: Duration,
     /// The most blobs repaired at once.
     pub concurrency: usize,
+    /// How long an owner may take to say whether it holds a blob. An owner that is up and
+    /// does not answer is a debt waiting, not a pass that never ends. (A copy is bounded
+    /// like a write: [`crate::replicate::ChainConfig`].)
+    pub probe: Duration,
 }
 
 impl Default for RepairConfig {
@@ -54,6 +65,7 @@ impl Default for RepairConfig {
         Self {
             interval: Duration::from_secs(5),
             concurrency: 4,
+            probe: Duration::from_secs(10),
         }
     }
 }
@@ -75,6 +87,14 @@ enum Waiting {
     Local(StorageError),
     /// An owner could not be reached or refused the copy.
     Owner(StorageError),
+}
+
+/// An owner that is up and did not say whether it holds a blob.
+#[derive(Debug, thiserror::Error)]
+#[error("member {owner} did not say whether it holds the blob within {after:?}")]
+struct NoAnswer {
+    owner: MemberId,
+    after: Duration,
 }
 
 /// Settles what a node owes.
@@ -116,7 +136,13 @@ impl RepairWorker {
             tokio::select! {
                 () = &mut stop => return,
                 _ = ticks.tick() => {
-                    self.pass().await;
+                    // A pass is dropped where it stands when `stop` resolves: what it had
+                    // begun is abandoned (a copy half sent is dropped uncommitted by its
+                    // owner), and the debts stay owed.
+                    tokio::select! {
+                        () = &mut stop => return,
+                        _ = self.pass() => {}
+                    }
                 }
             }
         }
@@ -139,17 +165,29 @@ impl RepairWorker {
 
     /// Repairs one debt; whether it is settled.
     async fn repair(&self, record: RepairRecord) -> bool {
+        // Read before the store is: a write that begins owing after this is not one this
+        // pass can tell from an eviction.
+        let begun = self.repairs.begun();
         match self.copy_to_owners(&record.digest).await {
-            Ok(()) => {}
+            Ok(()) => self.repairs.settle(&record.digest).await.is_ok(),
             Err(Waiting::Local(StorageError::NotFound(_))) => {
-                tracing::warn!(digest = %record.digest, "a blob owed to another owner is no longer held here");
+                // Not held here and no write is on its way to holding it: evicted. Nothing
+                // is left to copy, and the loss is the cache's to account for.
+                let dropped = self
+                    .repairs
+                    .settle_evicted(&record.digest, begun)
+                    .await
+                    .unwrap_or(false);
+                if dropped {
+                    tracing::warn!(digest = %record.digest, "a blob owed to another owner is no longer held here");
+                }
+                dropped
             }
             Err(waiting) => {
                 log(&record, &waiting);
-                return false;
+                false
             }
         }
-        self.repairs.settle(&record.digest).await.is_ok()
     }
 
     /// Makes every owner of `digest` but this node hold it.
@@ -176,15 +214,24 @@ impl RepairWorker {
         let channel = self.chain.peer(&owner.addr).map_err(Waiting::Owner)?;
         let generation = view.map.generation();
         let remote = RemoteStorage::new(channel, generation);
-        if remote
-            .find_missing(&[*digest])
+        let digests = [*digest];
+        let asked = remote.find_missing(&digests);
+        let missing = tokio::time::timeout(self.config.probe, asked)
             .await
-            .map_err(Waiting::Owner)?
-            .is_empty()
-        {
+            .map_err(|_| {
+                Waiting::Owner(StorageError::Unavailable(Arc::new(NoAnswer {
+                    owner: owner.id,
+                    after: self.config.probe,
+                })))
+            })?
+            .map_err(Waiting::Owner)?;
+        if missing.is_empty() {
             return Ok(());
         }
-        let leg = self.chain.open_copy(view, owner).map_err(Waiting::Owner)?;
+        let leg = self
+            .chain
+            .open_copy(view, owner, digest.size_bytes)
+            .map_err(Waiting::Owner)?;
         self.send(leg, digest).await
     }
 
@@ -226,7 +273,7 @@ impl RepairWorker {
                 break;
             }
         }
-        leg.finish(digest.size_bytes).await.map_err(Waiting::Owner)
+        leg.finish().await.map_err(Waiting::Owner)
     }
 }
 

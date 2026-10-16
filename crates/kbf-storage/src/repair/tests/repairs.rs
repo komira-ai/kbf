@@ -105,7 +105,7 @@ async fn a_panic_in_the_journal_fails_the_call_and_loses_no_debt() {
         armed: Arc::clone(&armed),
     };
     let repairs = Repairs::open(fs, Options::default(), Arc::new(NoLedger)).expect("open");
-    repairs.owe(record(1)).await.expect("owed");
+    drop(repairs.owe(record(1)).await.expect("owed"));
     armed.store(true, Ordering::SeqCst);
     let answer = repairs.owe(record(2)).await;
     assert!(
@@ -120,6 +120,12 @@ async fn a_panic_in_the_journal_fails_the_call_and_loses_no_debt() {
         "{answer:?}"
     );
     assert_eq!(repairs.open_records(), [record(1)]);
+    let answer = repairs.settle_evicted(&digest(1), repairs.begun()).await;
+    assert!(
+        matches!(answer, Err(StorageError::Internal(_))),
+        "{answer:?}"
+    );
+    assert_eq!(repairs.open_records(), [record(1)]);
 }
 
 /// Catches a ledger that tells no one being asked for something: both of its reports return
@@ -128,4 +134,113 @@ async fn a_panic_in_the_journal_fails_the_call_and_loses_no_debt() {
 async fn the_ledger_that_tells_no_one_returns_at_once() {
     NoLedger.owed(&record(1)).await;
     NoLedger.settled(&digest(1)).await;
+}
+
+/// Catches a debt dropped for an absent blob while a write of it is committing, or one that
+/// began owing after the worker looked: `settle_evicted` leaves the debt while a write of the
+/// digest is in flight (however many: two writes of the same blob, one finished), and when
+/// any write began owing since `begun` was read; with neither, it settles and the journal
+/// forgets it. Mutants: the in-flight test removed; the `begun` comparison removed; the
+/// count of a digest's writes dropped to zero by the first.
+#[tokio::test]
+async fn an_evicted_debt_is_dropped_only_when_no_write_is_in_its_window() {
+    let repairs =
+        Repairs::open(FaultFs::new(), Options::default(), Arc::new(NoLedger)).expect("open");
+    let first = repairs.owe(record(1)).await.expect("owed");
+    let second = repairs.owe(record(1)).await.expect("owed again");
+    assert!(repairs.is_in_flight(&digest(1)));
+    let begun = repairs.begun();
+    assert!(
+        !repairs
+            .settle_evicted(&digest(1), begun)
+            .await
+            .expect("asked")
+    );
+    drop(first);
+    assert!(
+        repairs.is_in_flight(&digest(1)),
+        "the second write is still committing"
+    );
+    assert!(
+        !repairs
+            .settle_evicted(&digest(1), begun)
+            .await
+            .expect("asked")
+    );
+    assert_eq!(repairs.open_records(), [record(1)]);
+    drop(second);
+    assert!(!repairs.is_in_flight(&digest(1)));
+
+    // A write of another blob began owing after `begun` was read: not now, but later.
+    let other = repairs.owe(record(2)).await.expect("owed");
+    drop(other);
+    assert!(
+        !repairs
+            .settle_evicted(&digest(1), begun)
+            .await
+            .expect("asked")
+    );
+    let begun = repairs.begun();
+    assert!(
+        repairs
+            .settle_evicted(&digest(1), begun)
+            .await
+            .expect("asked")
+    );
+    assert_eq!(repairs.open_records(), [record(2)]);
+}
+
+/// Catches a write that fails to journal its debt leaving its blob marked in flight for ever
+/// (the worker would never look at the debt again): the journal fails, the call fails, and
+/// the digest is not in flight.
+#[tokio::test]
+async fn a_debt_that_could_not_be_journalled_is_not_in_flight() {
+    let fs = FaultFs::new();
+    let repairs = Repairs::open(fs.clone(), Options::default(), Arc::new(NoLedger)).expect("open");
+    fs.fail_at(fs.ops(), kbf_store::Fault::Error);
+    let answer = repairs.owe(record(1)).await;
+    assert!(
+        matches!(answer, Err(StorageError::Unavailable(_))),
+        "{answer:?}"
+    );
+    assert!(!repairs.is_in_flight(&digest(1)));
+}
+
+/// Catches an abandoned write (its task aborted between the debt and the commit) leaving its
+/// blob in flight: the `Pending` it held is dropped with it, so the worker may look at the
+/// debt again.
+#[tokio::test]
+async fn an_abandoned_write_is_no_longer_in_flight() {
+    let repairs = Arc::new(
+        Repairs::open(FaultFs::new(), Options::default(), Arc::new(NoLedger)).expect("open"),
+    );
+    let write = tokio::spawn({
+        let repairs = Arc::clone(&repairs);
+        async move {
+            let _pending = repairs.owe(record(3)).await.expect("owed");
+            std::future::pending::<()>().await;
+        }
+    });
+    while !repairs.is_in_flight(&digest(3)) {
+        tokio::task::yield_now().await;
+    }
+    write.abort();
+    assert!(write.await.expect_err("aborted").is_cancelled());
+    assert!(!repairs.is_in_flight(&digest(3)));
+}
+
+/// Catches an evicted debt reported dropped when the journal could not write it: the call
+/// fails UNAVAILABLE and the debt is still owed.
+#[tokio::test]
+async fn an_evicted_debt_whose_settling_cannot_be_written_stays_owed() {
+    let fs = FaultFs::new();
+    let repairs = Repairs::open(fs.clone(), Options::default(), Arc::new(NoLedger)).expect("open");
+    drop(repairs.owe(record(1)).await.expect("owed"));
+    fs.fail_at(fs.ops(), kbf_store::Fault::Error);
+    let answer = repairs.settle_evicted(&digest(1), repairs.begun()).await;
+    assert!(
+        matches!(answer, Err(StorageError::Unavailable(_))),
+        "{answer:?}"
+    );
+    assert_eq!(repairs.open_records(), [record(1)]);
 }

@@ -16,6 +16,7 @@ mod ledger;
 mod tests;
 mod worker;
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 pub use journal::{JOURNAL, JOURNAL_TMP, Journal, JournalError, Options};
@@ -63,14 +64,70 @@ where
     }
 }
 
+/// The writes whose debt is journalled and whose blob is not yet committed here.
+#[derive(Debug, Default)]
+struct InFlight {
+    /// How many writes of each blob are between [`Repairs::owe`] and the end of their
+    /// commit.
+    digests: BTreeMap<Digest, usize>,
+    /// How many writes have ever begun owing: a worker that saw this unchanged since before
+    /// it read the store knows no write began owing meanwhile.
+    begun: u64,
+}
+
+fn in_flight(state: &Mutex<InFlight>) -> MutexGuard<'_, InFlight> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A write that owes a copy and has not yet committed its blob here ([`Repairs::owe`]).
+/// While it exists the blob may be absent from this node's store without having been
+/// evicted, so [`RepairWorker`] neither repairs nor drops its debt. Dropped when the
+/// commit has finished or the write has been abandoned.
+#[derive(Debug)]
+#[must_use = "dropping it says the write is over"]
+pub struct Pending {
+    state: Arc<Mutex<InFlight>>,
+    digest: Digest,
+}
+
+impl Pending {
+    fn begin(state: &Arc<Mutex<InFlight>>, digest: Digest) -> Self {
+        let mut flight = in_flight(state);
+        *flight.digests.entry(digest).or_default() += 1;
+        flight.begun += 1;
+        Self {
+            state: Arc::clone(state),
+            digest,
+        }
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        let mut flight = in_flight(&self.state);
+        match flight.digests.get_mut(&self.digest) {
+            Some(count) if *count > 1 => *count -= 1,
+            _ => {
+                flight.digests.remove(&self.digest);
+            }
+        }
+    }
+}
+
 /// The copies this node owes: the journal on its disk, and the seam through which a
 /// frontend is told ([`RepairLedger`]).
 ///
 /// **The rule this exists for.** A write is answered with one copy only after
 /// [`Repairs::owe`] has returned: the record is on the disk. The frontend is told after
 /// that, and never waited for.
+///
+/// **The window.** The record is journalled before the blob is committed here (so a blob
+/// present here is replicated or owed), which makes a record for a blob that is absent for
+/// a moment. The [`Pending`] that [`Repairs::owe`] returns marks it: a debt is dropped for
+/// an absent blob ([`Repairs::settle_evicted`]) only when no write is in that window.
 pub struct Repairs {
     debts: Arc<Mutex<Box<dyn Debts>>>,
+    in_flight: Arc<Mutex<InFlight>>,
     ledger: Arc<dyn RepairLedger>,
 }
 
@@ -91,6 +148,7 @@ impl Repairs {
         let journal = Journal::open(fs, options)?;
         Ok(Self {
             debts: Arc::new(Mutex::new(Box::new(journal))),
+            in_flight: Arc::default(),
             ledger,
         })
     }
@@ -100,13 +158,16 @@ impl Repairs {
     }
 
     /// Records `record` as owed. It is durable when this returns; the ledger is told
-    /// afterwards, off to the side.
+    /// afterwards, off to the side. The write is marked in flight from before the record
+    /// can be seen, until the [`Pending`] returned is dropped: the caller holds it through
+    /// the commit of the blob.
     ///
     /// # Errors
     /// [`StorageError::Unavailable`] if the journal could not make it durable (or has
     /// stopped after an earlier failure): nothing is owed, and the caller must not answer
     /// the write with one copy.
-    pub async fn owe(&self, record: RepairRecord) -> Result<(), StorageError> {
+    pub async fn owe(&self, record: RepairRecord) -> Result<Pending, StorageError> {
+        let pending = Pending::begin(&self.in_flight, record.digest);
         let debts = Arc::clone(&self.debts);
         tokio::task::spawn_blocking(move || Self::lock(&debts).owed(record))
             .await
@@ -114,7 +175,56 @@ impl Repairs {
             .map_err(|e| StorageError::Unavailable(Arc::new(e)))?;
         let ledger = Arc::clone(&self.ledger);
         tokio::spawn(async move { ledger.owed(&record).await });
-        Ok(())
+        Ok(pending)
+    }
+
+    /// How many writes have begun owing, to be given back to
+    /// [`Repairs::settle_evicted`].
+    pub(crate) fn begun(&self) -> u64 {
+        in_flight(&self.in_flight).begun
+    }
+
+    /// Whether a write of `digest` has journalled its debt and not finished committing.
+    #[cfg(test)]
+    pub(crate) fn is_in_flight(&self, digest: &Digest) -> bool {
+        in_flight(&self.in_flight).digests.contains_key(digest)
+    }
+
+    /// Records that `digest` is no longer owed because the store no longer holds it, unless
+    /// a write of it is between its debt and its commit, or any write began owing since
+    /// `begun` was read (before the store was): then the blob may simply not be committed
+    /// yet, and the debt stays. Whether it was settled.
+    ///
+    /// # Errors
+    /// [`StorageError::Unavailable`] if the journal could not write it (the debt stays).
+    pub(crate) async fn settle_evicted(
+        &self,
+        digest: &Digest,
+        begun: u64,
+    ) -> Result<bool, StorageError> {
+        let debts = Arc::clone(&self.debts);
+        let flight = Arc::clone(&self.in_flight);
+        let settled = *digest;
+        let dropped = tokio::task::spawn_blocking(move || {
+            // The journal's lock first: a write that begins owing after the check below
+            // appends its record after this one is written.
+            let mut debts = Self::lock(&debts);
+            {
+                let flight = in_flight(&flight);
+                if flight.begun != begun || flight.digests.contains_key(&settled) {
+                    return Ok(false);
+                }
+            }
+            debts.done(&settled).map(|()| true)
+        })
+        .await
+        .map_err(|e| StorageError::Internal(format!("the repair journal: {e}")))?
+        .map_err(|e| StorageError::Unavailable(Arc::new(e)))?;
+        if dropped {
+            let ledger = Arc::clone(&self.ledger);
+            tokio::spawn(async move { ledger.settled(&settled).await });
+        }
+        Ok(dropped)
     }
 
     /// Records that `digest` is no longer owed: every owner holds it. Not synced (a debt that
