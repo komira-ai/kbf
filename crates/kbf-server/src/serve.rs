@@ -201,6 +201,21 @@ fn bind_api(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), S
     bound.map_err(|source| ServeError::Bind { addr, source })
 }
 
+/// The worker listener's TLS and the way its peers are told apart. Not generic, so
+/// both arms are one set of lines whatever the cache types (a per-instantiation copy
+/// that misses one arm would count as missed lines).
+fn worker_peers(server: Server, tls: Option<WorkerTls>) -> Result<(Server, Peers), ServeError> {
+    Ok(match tls {
+        Some(tls) => (
+            server.tls_config(tls.server)?,
+            Peers::Certified {
+                deny_list: tls.deny_list,
+            },
+        ),
+        None => (server, Peers::Unauthenticated),
+    })
+}
+
 /// `server` with the HTTP/2 limits both listeners state rather than leave to the
 /// transport's defaults: they bound what is held outside `--write-bytes-in-flight`, and
 /// the connection window is what lets a Write admitted after others finish at all
@@ -410,15 +425,8 @@ where
         reapi_server = reapi_server.tls_config(tls)?;
     }
     let mut worker_server = flow_control(Server::builder());
-    let peers = match listeners.worker_tls {
-        Some(tls) => {
-            worker_server = worker_server.tls_config(tls.server)?;
-            Peers::Certified {
-                deny_list: tls.deny_list,
-            }
-        }
-        None => Peers::Unauthenticated,
-    };
+    let peers;
+    (worker_server, peers) = worker_peers(worker_server, listeners.worker_tls)?;
     let worker_blobs = ByteStreamServer::new(WorkerBlobs::new(
         ByteStreamService::new(Arc::clone(&cache)),
         peers.clone(),
