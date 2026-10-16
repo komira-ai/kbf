@@ -205,12 +205,19 @@ pub fn run(
     paused: &dyn Fn() -> bool,
     out: &mut dyn Write,
 ) -> Result<Outcome, RolloutError> {
-    // The red commit: a rollout that does nothing and reports it is done. The tests
-    // below fail on what it never did.
-    let _ = (tx, limits, paused, out);
-    Ok(Outcome::Done {
-        hosts: plan.hosts().len(),
-    })
+    if paused() {
+        return Ok(Outcome::Paused { done: 0 });
+    }
+    let mut driver = Driver {
+        plan,
+        tx,
+        limits,
+        out,
+    };
+    driver.lock()?;
+    let outcome = driver.rollout(paused);
+    driver.unlock();
+    Ok(outcome)
 }
 
 impl Driver<'_> {

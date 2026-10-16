@@ -16,7 +16,6 @@
 //! - [`cli`]: `kbf-deploy rollout`.
 
 pub mod cli;
-#[allow(dead_code)]
 pub mod engine;
 pub mod inventory;
 pub mod plan;
