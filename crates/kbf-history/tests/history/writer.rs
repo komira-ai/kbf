@@ -3,12 +3,16 @@
 
 use std::sync::atomic::Ordering;
 
-use kbf_history::records::{InvocationHeader, RunOutcome, RunRecord};
+use kbf_history::container;
+use kbf_history::records::{
+    ChunkSummary, HitHow, HitRecord, InvocationHeader, RunOutcome, RunRecord, SECTION_HIT,
+    SECTION_RUN, Timestamps, chunk_key,
+};
 use kbf_history::run_id::BLOCK_SIZE;
 use kbf_history::{Day, Event, InvRef, Limits, PendingLimits, StreamId};
 use prost::Message;
 
-use crate::support::{Index, Life, Objects, T, all, run_record};
+use crate::support::{Index, Life, Objects, T, all, digest, failed_section, run_record};
 
 const ICHUNK: &str = "ui/ichunk/";
 const STREAM: &str = "ui/stream/";
@@ -466,8 +470,25 @@ fn a_writer_past_its_buffer_bound_drops_the_oldest_and_counts_the_hole() {
         life.run(&old, T + t, "main", RunOutcome::Ok);
         life.step(T + t);
     }
-    assert!(life.writer.drops().buffer > 0);
+    let shed = life.writer.drops().buffer;
+    assert!(shed > 0);
     assert!(life.writer.unwritten_chunks() < 10);
+    // Back up: what survived is the newest runs, and the header counts the rest.
+    life.objects.counts().fail_puts.store(0, Ordering::SeqCst);
+    life.close(&old);
+    life.drain(T + 10, 10);
+    let got = futures::executor::block_on(life.reader().invocation(&old.key, &all))
+        .unwrap()
+        .unwrap();
+    let times: Vec<u64> = got.runs.iter().map(|r| r.time_ms).collect();
+    let kept = 10 - shed;
+    assert_eq!(
+        times,
+        (T + shed..T + 10).collect::<Vec<_>>(),
+        "the oldest went"
+    );
+    assert_eq!(times.len() as u64, kept);
+    assert_eq!(got.header.dropped, shed);
 }
 
 #[test]
@@ -682,4 +703,110 @@ fn a_hits_only_chunk_is_restored_without_a_stream_row() {
     assert_eq!(life.index.keys(ICHUNK).len(), 1);
     assert!(life.index.keys(STREAM).is_empty());
     assert_eq!(header(&life, &inv).hits, 1);
+}
+
+#[test]
+fn a_kept_chunk_restored_after_a_newer_header_leaves_the_header_alone() {
+    // Catches: a restored header row written over the live one (`Cond::Any` where the
+    // restore needs `Absent`). The header in a kept chunk's footer was taken when the
+    // chunk was cut, so it counts fewer runs and chunks and may say open; written over
+    // the header a later chunk applied, it moves the invocation backwards and a closed
+    // build reads incomplete.
+    let mut life = Life::fresh(Limits::default());
+    life.step(T); // reserve a stream block, so the planted failure hits the rows
+    let inv = InvRef::named("b1");
+    life.run(&inv, T + 1, "main", RunOutcome::Ok);
+    life.step(T + 1);
+    life.index.fail_txns.store(1, Ordering::SeqCst);
+    life.step(T + 120_001); // the first chunk is cut by age; its rows fail
+    assert_eq!(life.writer.kept_objects(), 1);
+    life.run(&inv, T + 120_002, "main", RunOutcome::Ok);
+    life.close(&inv);
+    // The second chunk's rows apply; with nothing pending the first chunk is read back.
+    life.step(T + 120_002);
+    assert_eq!(life.writer.kept_objects(), 0);
+    life.drain(T + 120_003, 10);
+    assert_eq!(
+        life.index.keys(ICHUNK).len(),
+        2,
+        "the kept chunk's row came back"
+    );
+    let h = header(&life, &inv);
+    assert_eq!((h.runs, h.chunks), (2, 2));
+    assert_eq!(h.state(), kbf_history::records::InvState::Closed);
+    let got = futures::executor::block_on(life.reader().invocation(&inv.key, &all))
+        .unwrap()
+        .unwrap();
+    assert!(
+        got.complete,
+        "a closed build with every record reads complete"
+    );
+    assert_eq!(got.runs.len(), 2);
+}
+
+#[test]
+fn a_chunk_footer_carries_its_digest_table_and_slowest_runs() {
+    // Catches: a chunk written without its digest table (the `/actions/{digest}` hit
+    // lookup would find nothing), a table that names failed-run sections or is not
+    // sorted by (prefix, key), and slowest lists left out of the summary or swapped.
+    let mut life = Life::fresh(Limits::default());
+    let inv = InvRef::named("b1");
+    // Slower to execute, faster on the wall clock.
+    let a = life.run(&inv, T, "main", RunOutcome::Ok);
+    // Faster to execute, slower on the wall clock, and failed (with a section).
+    let id = life.minter.mint(&inv.key, T + 1).id;
+    let mut b = run_record("main", RunOutcome::Failed, T + 1);
+    b.timestamps = Some(Timestamps {
+        queued_us: 0,
+        execution_start_us: 10,
+        execution_completed_us: 110,
+        worker_completed_us: 10_000,
+        ..Timestamps::default()
+    });
+    b.set_run_id(id);
+    assert!(life.queue.offer(Event::Run {
+        inv: inv.clone(),
+        record: Box::new(b.clone()),
+        failed: Some(failed_section("main")),
+    }));
+    // A hit whose digest sorts before the runs', though its record comes after them.
+    assert!(life.queue.offer(Event::Hit {
+        inv: inv.clone(),
+        record: HitRecord {
+            time_ms: T + 2,
+            instance: "main".into(),
+            action: Some(digest(0)),
+            how: HitHow::CacheHit.into(),
+            row: 0,
+        },
+    }));
+    life.close(&inv);
+    life.step(T + 2);
+    let object = life.objects.get(&chunks(&life.objects).remove(0));
+    let (_, footer) = container::footer_of(&object).unwrap();
+    let summary = ChunkSummary::decode(footer.summary.as_slice()).unwrap();
+    let digests: Vec<(u64, Vec<u8>)> = summary
+        .digests
+        .iter()
+        .map(|d| (d.prefix, d.key.clone()))
+        .collect();
+    let p1 = digest(1).prefix16();
+    assert_eq!(
+        digests,
+        [
+            (0, chunk_key(SECTION_HIT, 0).to_vec()),
+            (p1, chunk_key(SECTION_RUN, a.seq).to_vec()),
+            (p1, chunk_key(SECTION_RUN, b.seq).to_vec()),
+        ],
+        "runs and hits with an action, none for the failed section, sorted"
+    );
+    let ids = |list: &[kbf_history::records::Slow]| -> Vec<Vec<u8>> {
+        list.iter().map(|s| s.run_id.clone()).collect()
+    };
+    let (ia, ib) = (
+        a.run_id().to_bytes().to_vec(),
+        b.run_id().to_bytes().to_vec(),
+    );
+    assert_eq!(ids(&summary.slowest_execution), [ia.clone(), ib.clone()]);
+    assert_eq!(ids(&summary.slowest_wall), [ib, ia]);
 }
