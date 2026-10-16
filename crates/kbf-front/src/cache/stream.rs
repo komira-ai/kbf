@@ -124,18 +124,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// creates the block's file): call it off the async runtime.
     #[must_use]
     pub fn stream(self: &Arc<Self>, size: u64) -> Option<RecordStream<M, O>> {
-        let staging = self.writer.tier.get()?;
-        (1..=MAX_BLOB_BYTES).contains(&size).then_some(())?;
-        let reserved = TierRange::reserve(staging, size);
-        let range = reserved.inspect_err(|e| staging.counters.direct(e)).ok()?;
-        Some(RecordStream {
-            cache: Arc::clone(self),
-            open: Open {
-                range,
-                written: 0,
-                crc: Crc32c::new(),
-            },
-        })
+        let cache = Arc::clone(self);
+        Open::start(self.writer.tier.get(), size).map(|open| RecordStream { cache, open })
     }
 }
 
@@ -164,6 +154,21 @@ struct Open {
 }
 
 impl Open {
+    /// A stream onto `staging`'s tier for `size` bytes; `None` without a tier, for a
+    /// size of 0 or over [`MAX_BLOB_BYTES`], or when the tier does not take it (counted
+    /// as a write the tier did not take).
+    fn start(staging: Option<&Arc<Staging>>, size: u64) -> Option<Self> {
+        let staging = staging?;
+        (1..=MAX_BLOB_BYTES).contains(&size).then_some(())?;
+        let reserved = TierRange::reserve(staging, size);
+        let range = reserved.inspect_err(|e| staging.counters.direct(e)).ok()?;
+        Some(Self {
+            range,
+            written: 0,
+            crc: Crc32c::new(),
+        })
+    }
+
     fn append(&mut self, chunk: &[u8]) -> Result<(), CacheError> {
         self.range.write(self.written, chunk)?;
         self.crc.update(chunk);

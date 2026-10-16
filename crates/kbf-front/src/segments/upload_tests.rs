@@ -263,3 +263,75 @@ fn a_busy_record_is_not_claimed_again() {
         .check(&declared)
         .expect("one hash over both ranges");
 }
+
+/// A cache over a memory log and store with an in-memory write tier attached, as a
+/// server with a hot store has.
+async fn tiered() -> std::sync::Arc<crate::Cache<crate::MemoryMetaLog, kbf_objstore::MemoryStore>> {
+    let cache = crate::Cache::open(
+        crate::MemoryMetaLog::new(kbf_meta::Retention::default()),
+        kbf_objstore::MemoryStore::new(kbf_objstore::Capabilities::default()),
+        kbf_objstore::KeyPrefix::default(),
+    )
+    .await
+    .expect("open");
+    let (cache, _) = cache
+        .attach_tier(
+            kbf_store::FaultFs::new(),
+            kbf_tier::TierOptions::new(1 << 30),
+            kbf_meta::ServerId::new(1),
+            None,
+        )
+        .await
+        .expect("a tier");
+    std::sync::Arc::new(cache)
+}
+
+/// Catches a segment on a write tier held here, or a range whose write failed taken
+/// for received (the commit would stage bytes that are not on the tier): its records
+/// are not kept in the buffer; while a range is being written the commit is not ready;
+/// a range whose write failed is forgotten, so it is missing until sent again; once
+/// every range is written the segment is built as its range on the tier, unverified,
+/// with nothing in its body.
+#[tokio::test]
+async fn a_segment_on_the_tier_is_written_there_and_built_as_its_range() {
+    let cache = tiered().await;
+    let (declared, records) = segment(3, 50);
+    let range = cache
+        .reserve_range(declared.records_len)
+        .await
+        .expect("a range");
+    let mut received = Receiving::new(&declared, true, Some(range));
+    assert!(format!("{received:?}").contains("TierRange"));
+    let half = records.len() / 2;
+    let (put, claimed) = received.put(&declared, 0, &records[..half]).expect("put");
+    assert_eq!((put, claimed), (Put::Written, Vec::new()));
+    let (range, writes) = received.tier().expect("on the tier");
+    assert!(received.not_ready().is_some(), "a write is running");
+    writes.done(0, false);
+    received.forget_failed();
+    assert!(received.first_missing(&declared).is_some(), "forgotten");
+    for (from, to) in [(0, half), (half, records.len())] {
+        let (put, _) = received
+            .put(&declared, from as u64, &records[from..to])
+            .expect("put");
+        assert_eq!(put, Put::Written);
+        range
+            .write(from as u64, &records[from..to])
+            .expect("written");
+        writes.done(from as u64, true);
+    }
+    drop(range);
+    assert!(received.not_ready().is_none());
+    assert!(received.first_missing(&declared).is_none());
+    let built = received.check(&declared).expect("built");
+    assert!(built.body.is_empty());
+    assert!(!built.verified);
+    assert_eq!(built.entries.len(), 3);
+    let staged = built.staged.expect("its range on the tier");
+    let blobs = built.entries.iter().map(|e| (e.digest, e.offset)).collect();
+    cache.stage_range(staged, blobs).await.expect("staged");
+    for entry in &built.entries {
+        let bytes = cache.read_blob(&entry.digest).await.expect("read");
+        assert_eq!(kbf_segments::sha256(&bytes), entry.digest);
+    }
+}
