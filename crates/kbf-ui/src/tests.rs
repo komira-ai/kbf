@@ -78,11 +78,12 @@ pub(crate) fn action_digest() -> String {
 pub(crate) fn invocation(id: &str) -> Value {
     json!({
         "id": id, "url": null, "tool": "buck2", "tool_version": "2026.10.01",
-        "correlated_invocations_id": null, "instances": ["main"],
+        "correlated_invocations_id": null, "instances": ["main", "edge"],
         "first_seen": "2026-10-11T09:00:00.000000Z", "last_seen": "2026-10-11T09:01:00.000000Z",
         "state": "idle", "complete": true, "rows_capped": false, "actions": 2,
-        "counts": {"execute": 2, "cache_hit_execute": 0, "joined": 0, "ran": 2, "failed": 1,
-            "ac_hit": 0, "ac_miss": 2, "blobs_asked": 3, "blobs_missing": 1,
+        // Every counter its own value, so a value under another's label shows.
+        "counts": {"execute": 4, "cache_hit_execute": 5, "joined": 3, "ran": 2, "failed": 1,
+            "ac_hit": 6, "ac_miss": 7, "blobs_asked": 8, "blobs_missing": 9,
             "bytes_uploaded": 2048, "bytes_downloaded": 10},
         "collisions": [],
         "links": {"actions": format!("/v1/invocations/{id}/actions")},
@@ -103,6 +104,26 @@ pub(crate) fn row(action: &str, target: &str, outcome: &Value) -> Value {
         "outcome": outcome, "result": null, "command": digest('c', 90),
         "href": format!("/v1/invocations/{ID}/actions/{action}"),
     })
+}
+
+/// A row that ran twice: requeued out of memory on `n3`, then failed on `n4`.
+pub(crate) fn retried() -> Value {
+    let mut r = row(
+        &digest('7', 20),
+        "//app:retried",
+        &json!({"failed": {"code": 2, "message": "exit status 1"}}),
+    );
+    r["attempts"] = json!([
+        {"lease": "3.2", "worker": "n3",
+         "queued": "2026-10-11T09:00:05.000000Z", "granted": "2026-10-11T09:00:06.000000Z",
+         "started": "2026-10-11T09:00:07.000000Z", "ended": "2026-10-11T09:00:08.000000Z",
+         "end": {"requeue": "out_of_memory", "reason": "raised"}},
+        {"lease": "3.3", "worker": "n4",
+         "queued": "2026-10-11T09:00:08.000000Z", "granted": "2026-10-11T09:00:09.000000Z",
+         "started": "2026-10-11T09:00:10.000000Z", "ended": "2026-10-11T09:00:11.000000Z",
+         "end": {"failure": "exit"}},
+    ]);
+    r
 }
 
 /// The answer of `/actions/{digest}` with `stderr` as its stderr object.
@@ -144,7 +165,7 @@ pub(crate) fn stderr_blob() -> Value {
         "href": format!("/v1/blobs/{d}?instance=main&name=stderr&inline=text")})
 }
 
-/// A read API holding build `ID` with one page of two rows and a second page, and its
+/// A read API holding build `ID` with one page of three rows and a second page, and its
 /// failed action with a stderr blob.
 pub(crate) fn farm() -> Fake {
     let base = format!("/v1/invocations/{ID}");
@@ -163,7 +184,7 @@ pub(crate) fn farm() -> Fake {
         .json(&base, &invocation(ID))
         .json(
             &format!("{base}/actions"),
-            &json!({"actions": [ok, failed], "next_page": format!("{base}/actions?page_size=2&page_token=t%2B1"),
+            &json!({"actions": [ok, failed, retried()], "next_page": format!("{base}/actions?page_size=2&page_token=t%2B1"),
                 "next_page_token": "t+1"}),
         )
         .json(&format!("{base}/actions?page_token=t%2B1"), &json!({"actions": []}))

@@ -37,7 +37,9 @@ fn builds_without_an_id_shows_the_form_and_reads_nothing() {
 }
 
 /// Catches: the summary not shown, not linked to the Build page, or the id not kept
-/// in the form.
+/// in the form; a field or counter shown under another's name (mutants: the
+/// uploaded and downloaded values swapped, first and last seen swapped), since every
+/// one has its own value in the fixture and is checked with its name.
 #[test]
 fn builds_with_an_id_shows_its_summary() {
     let fake = farm();
@@ -48,9 +50,33 @@ fn builds_with_an_id_shows_its_summary() {
         "{html}"
     );
     assert!(html.contains("value=\"build-1\""), "{html}");
-    assert!(html.contains("<dd>idle, complete</dd>"), "{html}");
-    assert!(html.contains("<dd>buck2 2026.10.01</dd>"), "{html}");
-    assert!(html.contains("<span class=\"n\">2.0 KiB</span>"), "{html}");
+    for (name, value) in [
+        ("State", "idle, complete"),
+        ("Tool", "buck2 2026.10.01"),
+        ("Instances", "main, edge"),
+        ("First seen", "2026-10-11T09:00:00.000000Z"),
+        ("Last seen", "2026-10-11T09:01:00.000000Z"),
+        ("Actions", "2"),
+    ] {
+        let pair = format!("<dt>{name}</dt><dd>{value}</dd>");
+        assert!(html.contains(&pair), "{pair}: {html}");
+    }
+    for (value, label) in [
+        ("2", "ran"),
+        ("1", "failed"),
+        ("3", "joined"),
+        ("4", "execute"),
+        ("5", "cache hit execute"),
+        ("6", "AC hit"),
+        ("7", "AC miss"),
+        ("2.0 KiB", "uploaded"),
+        ("10 B", "downloaded"),
+    ] {
+        let cell = format!(
+            "<li><span class=\"n\">{value}</span><span class=\"label\">{label}</span></li>"
+        );
+        assert!(html.contains(&cell), "{cell}: {html}");
+    }
     assert!(
         html.contains(
             "<link rel=\"alternate\" type=\"application/json\" href=\"/v1/invocations/build-1\">"
@@ -82,7 +108,9 @@ fn builds_with_an_unknown_id_or_no_api_says_so() {
 }
 
 /// Catches: rows not shown or not linked to their Action page, the next-page link
-/// missing or not carrying the token, the token not passed to the API.
+/// missing or not carrying the token, the token not passed to the API; a row's
+/// first attempt shown as its last, or its attempt count wrong (mutant:
+/// `attempts.first()` for `attempts.last()`), seen on a row requeued once.
 #[test]
 fn build_shows_its_actions_and_pages_through_them() {
     let fake = farm();
@@ -104,6 +132,11 @@ fn build_shows_its_actions_and_pages_through_them() {
         html.contains("<td>failed: exit (exit 1) on n4</td>"),
         "{html}"
     );
+    assert!(
+        html.contains("<td>ran</td><td>2</td><td>failed: exit on n4</td><td>main</td>"),
+        "{html}"
+    );
+    assert!(!html.contains("on n3"), "{html}");
     assert!(
         html.contains("<a href=\"/ui/builds/build-1?page_token=t%2B1\">Next page</a>"),
         "{html}"
@@ -139,9 +172,10 @@ fn build_answers_the_api_status_or_502() {
     assert!(html.contains("a document this page cannot read"), "{html}");
 }
 
-/// Catches: the action's fields, attempts, usage, outputs or logs not shown, an
-/// output the store no longer holds still linked, a log the store no longer holds
-/// read.
+/// Catches: the action's fields, attempts, usage, outputs or logs not shown, or a
+/// field or attempt cell shown under another's name (mutant: CPU user showing the
+/// system time), an output the store no longer holds still linked, a log the store
+/// no longer holds read.
 #[test]
 fn action_shows_its_answer_and_its_logs() {
     let fake = farm();
@@ -152,13 +186,28 @@ fn action_shows_its_answer_and_its_logs() {
         html.contains("<a href=\"/ui/builds/build-1\">build-1</a>"),
         "{html}"
     );
-    assert!(html.contains("<dd>4.00 s</dd>"), "wall: {html}");
-    assert!(html.contains("<dd>3.0 GiB</dd>"), "peak memory: {html}");
+    let (this, command) = (action_digest(), digest('c', 90));
+    for (name, value) in [
+        ("Action", this.as_str()),
+        ("Instance", "main"),
+        ("How", "ran"),
+        ("Command", command.as_str()),
+        ("Wall", "4.00 s"),
+        ("CPU user", "1.50 s"),
+        ("CPU system", "2.5 ms"),
+        ("Peak memory", "3.0 GiB"),
+    ] {
+        let pair = format!("<dt>{name}</dt><dd>{value}</dd>");
+        assert!(html.contains(&pair), "{pair}: {html}");
+    }
     assert!(
-        html.contains(&format!("<dd>{}</dd>", digest('c', 90))),
+        html.contains(
+            "<tr><td>3.1</td><td>n4</td><td>2026-10-11T09:00:01.000000Z</td>\
+             <td>2026-10-11T09:00:03.000000Z</td><td>2026-10-11T09:00:04.000000Z</td>\
+             <td>failed: exit (exit 1)</td></tr>"
+        ),
         "{html}"
     );
-    assert!(html.contains("<td>3.1</td><td>n4</td>"), "{html}");
     let lib = format!(
         "/v1/blobs/{}?instance=main&amp;name=lib.o",
         digest('d', 300)
