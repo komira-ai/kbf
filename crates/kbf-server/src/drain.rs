@@ -78,15 +78,14 @@ impl Drain {
         }
         self.readiness.stop();
         self.closer.drain();
-        let goaway = self
+        // Taken once: the `began` swap above lets one call this far. The listener is gone
+        // only if the server already stopped, and the send then has no one to tell.
+        let _ = self
             .goaway
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(goaway) = goaway {
-            // The listener is gone only if the server already stopped.
-            let _ = goaway.send(());
-        }
+            .take()
+            .map(|goaway| goaway.send(()));
         true
     }
 
@@ -148,7 +147,10 @@ mod tests {
     #[test]
     fn begin_does_all_of_a_drain_and_says_it_began() {
         let (drain, closing, readiness, mut goaway) = drain();
-        assert!(!drain.is_draining() && !closing.draining() && !readiness.is_stopping());
+        assert!(!drain.is_draining());
+        assert!(!closing.draining());
+        assert!(!readiness.is_stopping());
+        assert_eq!(format!("{drain:?}"), "Drain { draining: false, .. }");
         assert!(goaway.try_recv().is_err(), "GOAWAY before the drain");
         assert!(drain.begin(), "the first call begins it");
         assert!(drain.is_draining());
@@ -165,7 +167,8 @@ mod tests {
         assert!(drain.begin());
         assert_eq!(goaway.try_recv(), Ok(()));
         assert!(!drain.begin(), "a drain already begun began again");
-        assert!(drain.is_draining() && closing.draining());
+        assert!(drain.is_draining());
+        assert!(closing.draining());
         // The receiver was consumed by the first GOAWAY; a second send would have
         // nowhere to go, and must not panic.
         assert!(!drain.begin());
@@ -184,7 +187,9 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(60), drain.closed())
             .await
             .expect("closed once closed");
-        assert!(drain.is_draining() && closing.draining() && readiness.is_stopping());
+        assert!(drain.is_draining());
+        assert!(closing.draining());
+        assert!(readiness.is_stopping());
         drain.close();
     }
 }

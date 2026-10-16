@@ -192,6 +192,76 @@ fn parse_reply(raw: &[u8]) -> Result<Reply, &'static str> {
 mod tests {
     use super::*;
 
+    use std::net::TcpListener;
+
+    /// A server that answers one connection with `raw` and closes it.
+    fn answering(raw: &'static [u8]) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("a call");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(raw);
+        });
+        addr
+    }
+
+    /// Catches an answer this client cannot read becoming a reply, or an error that
+    /// does not name the server and what is wrong with it; and a server nothing listens
+    /// at becoming anything but an error naming it.
+    #[test]
+    fn a_call_names_the_server_that_failed_it() {
+        let garbage = answering(b"not http at all");
+        let err = OperatorClient::new(garbage, None)
+            .get("/")
+            .expect_err("garbage");
+        assert!(matches!(err, ClientError::Malformed { .. }), "{err:?}");
+        assert!(err.to_string().starts_with(&garbage.to_string()), "{err}");
+
+        let gone = {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr")
+        };
+        let err = OperatorClient::new(gone, None)
+            .get("/")
+            .expect_err("nothing there");
+        assert!(matches!(err, ClientError::Io { .. }), "{err:?}");
+        assert!(err.to_string().starts_with(&gone.to_string()), "{err}");
+    }
+
+    /// Catches a token file read with its newline (the bearer would never match), an
+    /// empty or missing one accepted, and an error that does not name the file.
+    #[test]
+    fn a_token_is_the_trimmed_content_of_its_file() {
+        let dir = std::env::temp_dir().join(format!("kbf-api-client-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a directory");
+        let file = |name: &str, content: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, content).expect("write");
+            path
+        };
+        let good = file("good", "  abc123\n");
+        assert_eq!(
+            OperatorClient::read_token(&good).expect("a token"),
+            "abc123"
+        );
+        for (name, content) in [("empty", ""), ("blank", " \n")] {
+            let path = file(name, content);
+            let err = OperatorClient::read_token(&path).expect_err(name);
+            assert!(
+                err.to_string().contains(&path.display().to_string()),
+                "{err}"
+            );
+        }
+        let missing = dir.join("missing");
+        let err = OperatorClient::read_token(&missing).expect_err("missing");
+        assert!(
+            err.to_string().contains(&missing.display().to_string()),
+            "{err}"
+        );
+    }
+
     fn reply(raw: &str) -> Result<Reply, &'static str> {
         parse_reply(raw.as_bytes())
     }
@@ -212,6 +282,9 @@ mod tests {
         let refused =
             reply("HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}").expect("401");
         assert_eq!((refused.status, refused.is_success()), (401, false));
+        let odd = reply("HTTP/1.1 200 OK\r\nnot a header line\r\nContent-Length: 2\r\n\r\nok")
+            .expect("odd");
+        assert_eq!(odd.body, "ok", "a line that is no header is skipped");
         let to_end = reply("HTTP/1.0 200 OK\r\n\r\nrest").expect("no length");
         assert_eq!(to_end.body, "rest");
     }

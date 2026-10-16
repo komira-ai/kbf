@@ -570,10 +570,9 @@ where
                 served.map_err(ServeError::from)
             }
             served = worker_serve => served.map_err(ServeError::from),
-            served = &mut api_serve => {
-                // Finished on its own: there is nothing left to answer.
-                return served.map_err(ServeError::Api);
-            }
+            // Finished on its own: there is nothing left to answer, so it is not waited
+            // for again below (`reapi_done` stays false).
+            served = &mut api_serve => served.map_err(ServeError::Api),
             () = ticking => Ok(()),
             // One timer for every open stream's progress operation.
             () = ticker.run() => Ok(()),

@@ -301,3 +301,25 @@ fn an_execute_is_recorded_however_its_stream_ends() {
     assert_eq!(metrics.queued_seconds.count(), 1);
     assert_eq!(metrics.total.count(), 3);
 }
+
+/// Catches `streaming` raising `open_executions` once per call rather than once per
+/// guard (a stream that asked twice would leave the gauge raised for ever after its one
+/// lowering), and a guard that never streamed lowering it.
+#[test]
+fn open_executions_is_raised_once_per_guard_and_only_by_a_streaming_one() {
+    let metrics = Arc::new(ExecuteMetrics::default());
+    let mut streamed = metrics.execute();
+    let plain = metrics.wait();
+    assert_eq!(metrics.open_executions.get(), 0, "not before streaming()");
+    streamed.streaming();
+    streamed.streaming();
+    assert_eq!(metrics.open_executions.get(), 1);
+    drop(plain);
+    assert_eq!(
+        metrics.open_executions.get(),
+        1,
+        "a guard that never streamed"
+    );
+    drop(streamed);
+    assert_eq!(metrics.open_executions.get(), 0);
+}
