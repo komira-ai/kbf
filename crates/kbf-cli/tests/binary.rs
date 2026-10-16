@@ -270,3 +270,17 @@ fn check_args_exits_2_with_the_refusal_a_start_gets() {
         assert!(out.is_empty(), "{argv:?}: {out}");
     }
 }
+
+/// Catches `check-args` shown to an operator as if it were a mode or a flag: neither
+/// `kbf --help` nor `kbf -h` names it anywhere (it is for `kbf-deploy`, and its
+/// absence from the help is what keeps the five-mode list exact).
+#[test]
+fn help_does_not_name_check_args() {
+    for flag in ["--help", "-h"] {
+        let (code, out, err) = run(&[flag]);
+        assert_eq!(code, Some(0), "{flag}: {err}");
+        assert!(out.contains("Commands:"), "{flag}: {out}");
+        assert!(!out.contains(kbf_cli::CHECK_ARGS), "{flag}: {out}");
+        assert!(!err.contains(kbf_cli::CHECK_ARGS), "{flag}: {err}");
+    }
+}

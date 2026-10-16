@@ -12,7 +12,8 @@
 //!   `FAIL <rule>: <reason>` line per broken rule.
 //! - With `--mode MODE`, both verbs work on one mode of the one `kbf` binary instead
 //!   ([`modes`]): `render-units` writes `kbf.slice` and `kbf-<mode>.service`, and
-//!   `check-units` checks `kbf-<mode>.service` against [`modes`]' rules. For a built
+//!   `check-units` checks the two, each with its drop-ins (`<name>.d/*.conf`), against
+//!   [`modes`]' rules (docs/deploy/kbf-modes.md). For a built
 //!   mode it also runs `<kbf> check-args <mode> <flags...>` (`--kbf-bin PATH`, or the
 //!   unit's own binary when it is installed; a `SKIP parse:` line when it is not).
 //!
@@ -42,6 +43,8 @@
 
 pub mod check;
 pub mod config;
+pub mod cpuset;
+pub mod credential;
 pub mod host;
 pub mod images;
 pub mod install;
@@ -136,9 +139,10 @@ pub fn render_mode_unit(
     ))
 }
 
-/// `check-units --mode`: check `kbf-<mode>.service` in `dir` against the settings in
-/// `config`, a built mode's flags with `kbf_bin` or the unit's own kbf as `exec` runs
-/// it ([`modes::check_on_host`]).
+/// `check-units --mode`: check `kbf-<mode>.service` and `kbf.slice` in `dir`, each
+/// with its drop-ins (`<name>.d/*.conf`), against the settings in `config`, on the host
+/// `exec` reads: a built mode's flags with `kbf_bin` or the unit's own kbf
+/// ([`modes::check_on_host`]).
 pub fn check_mode_unit<E: kbf_host::exec::Exec>(
     exec: &E,
     config: &Path,
@@ -148,17 +152,51 @@ pub fn check_mode_unit<E: kbf_host::exec::Exec>(
     kbf_bin: Option<&Path>,
 ) -> Result<Report, Refusal> {
     let c = LinuxConfig::load(config)?;
-    let name = mode.unit_name();
-    let path = dir.join(&name);
-    let text = std::fs::read_to_string(&path).map_err(|source| CheckError::Read {
-        path: path.display().to_string(),
-        source,
-    })?;
+    let unit = read_unit(dir, &mode.unit_name())?;
+    let slice = read_unit(dir, render::SLICE)?;
     let bin = kbf_bin
         .map(|p| kbf_host::path::HostPath::new(&p.to_string_lossy()))
         .transpose()?;
-    modes::check_on_host(exec, &c, mode, &text, installable, bin.as_ref()).map_err(|e| match e {
-        modes::ParseError::Unit(source) => CheckError::Unit { name, source }.into(),
-        e @ modes::ParseError::Run { .. } => Refusal::Parse(e),
+    modes::check_on_host(exec, &c, mode, &unit, &slice, installable, bin.as_ref()).map_err(|e| {
+        match e {
+            modes::ParseError::Unit { name, source } => CheckError::Unit { name, source }.into(),
+            e @ modes::ParseError::Run { .. } => Refusal::Parse(e),
+        }
     })
+}
+
+/// The unit `name` in `dir` and its drop-ins: every `*.conf` file in `<name>.d/`, by
+/// file name (the order systemd applies them), named `<name>.d/<file>`.
+fn read_unit(dir: &Path, name: &str) -> Result<modes::UnitText, CheckError> {
+    let read = |path: PathBuf| {
+        std::fs::read_to_string(&path).map_err(|source| CheckError::Read {
+            path: path.display().to_string(),
+            source,
+        })
+    };
+    let mut unit = modes::UnitText::new(name, read(dir.join(name))?);
+    let drop_ins = dir.join(format!("{name}.d"));
+    let unreadable = |source| CheckError::Read {
+        path: drop_ins.display().to_string(),
+        source,
+    };
+    let entries = match std::fs::read_dir(&drop_ins) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(unit),
+        Err(e) => return Err(unreadable(e)),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let file = entry.map_err(unreadable)?.file_name();
+        let file = file.to_string_lossy().into_owned();
+        if file.ends_with(".conf") {
+            files.push(file);
+        }
+    }
+    files.sort();
+    for file in files {
+        let text = read(drop_ins.join(&file))?;
+        unit = unit.with_drop_in(format!("{name}.d/{file}"), text);
+    }
+    Ok(unit)
 }
