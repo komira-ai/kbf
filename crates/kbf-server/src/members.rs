@@ -581,7 +581,9 @@ impl MapFeed for MemberMap {
             .latest
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        latest.clone().unwrap_or_else(|| Arc::clone(&self.seed))
+        // `map_feed` published the seed, so `latest` is set; the seed is the answer if it
+        // were not. An `Arc` clone is cheap, so no closure holds a line no test reaches.
+        latest.clone().unwrap_or(Arc::clone(&self.seed))
     }
 
     fn changes(&self) -> watch::Receiver<u64> {

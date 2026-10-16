@@ -3,6 +3,7 @@
 
 use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -267,6 +268,19 @@ fn keepalive(server: Server, timing: StreamTiming) -> Server {
 const STATE_IN_MEMORY: &str = "the scheduler's state is in memory: no cordon, drain, lease or \
     operation of an earlier server process is restored, and the server keeps no rollout record";
 
+/// Expires members while the server runs. Never completes; with no state store there
+/// are none, and it waits forever. A function of its own and not generic, so the tests
+/// measure one copy of these lines and not the best of the server's instantiations.
+///
+/// Builds the future and does not await it here: a function that awaits a future that
+/// never completes has a closing line no test can reach.
+fn sweeping(members: Option<Arc<Members>>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    match members {
+        Some(members) => Box::pin(crate::members_rpc::sweep(members)),
+        None => Box::pin(std::future::pending()),
+    }
+}
+
 /// Logs where the scheduler's state is, at every start. Not generic, unlike the binding
 /// that calls it, so every test binary's runs count toward the same function's coverage.
 fn log_state(durable: bool, term: u64, epoch: u64) {
@@ -527,12 +541,7 @@ where
             .add_optional_service(membership)
             .serve_with_incoming(worker_incoming);
         let api_serve = serve_api(api_listener.map(|(listener, _)| listener), api_routes);
-        let sweeping = async {
-            match members {
-                Some(members) => crate::members_rpc::sweep(members).await,
-                None => std::future::pending().await,
-            }
-        };
+        let sweeping = sweeping(members);
         let ticking = async {
             let mut tick = tokio::time::interval(listeners.tick);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
