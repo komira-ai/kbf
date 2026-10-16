@@ -2,9 +2,9 @@
 //!
 //! The same [`Cas`] a runtime uses against [`crate::Transfers`], but each blob goes to
 //! the storage nodes that own it (`kbf_route::Router`): reads from the owners in rank
-//! order (callers of one blob at once share one read), writes to the primary, FindMissing
-//! split by primary. A daemon holds a connection to a frontend for work, and to storage
-//! nodes for bytes.
+//! order (callers of one blob at once share one read), writes to the first owner that is
+//! not down, FindMissing split by primary. A daemon holds a connection to a frontend for
+//! work, and to storage nodes for bytes.
 //!
 //! What it keeps from the engine: at most `--transfer-in-flight` requests at once for the
 //! process, FindMissing in calls of at most `--transfer-find-missing-chunk` digests, a
