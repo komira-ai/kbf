@@ -140,6 +140,35 @@ async fn a_wanted_generation_is_asked_of_the_server() {
     );
 }
 
+/// Catches a daemon that asks again on every wake for a generation it has asked for on
+/// this stream (the server may answer with an older map, and a heartbeat every interval
+/// would be a request every interval): one request, then heartbeats. Mutant: `request`
+/// without the generation last asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wanted_generation_is_asked_once_on_a_stream() {
+    let (mut h, holder) = daemon("map-asked-once").await;
+    let mut peer = h.welcomed().await;
+    let _waiting = tokio::spawn({
+        let holder = Arc::clone(&holder);
+        async move { holder.reach(9).await.generation() }
+    });
+    assert_eq!(peer.map_request().await, 9);
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let (_, m) = peer
+            .expect(PROMPT, |m| {
+                matches!(m, Message::Heartbeat(_) | Message::MapRequest(_)).then(|| m.clone())
+            })
+            .await
+            .expect("a message");
+        seen.push(m);
+    }
+    assert!(
+        seen.iter().all(|m| matches!(m, Message::Heartbeat(_))),
+        "{seen:?}"
+    );
+}
+
 /// Catches a request for a generation the daemon already has (every `reach` that finds
 /// its map held would cost the server a round trip).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

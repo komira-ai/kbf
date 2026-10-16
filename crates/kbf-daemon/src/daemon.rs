@@ -617,13 +617,7 @@ impl Daemon {
         self.recheck();
         // Before any Result is resent or any Start of this stream is read.
         self.new_epoch(epoch);
-        if let Some(link) = self.map.as_mut() {
-            link.take(map);
-            // A generation the holder waited for before this stream.
-            if let Some(request) = link.request() {
-                send(&tx, daemon_message::Message::MapRequest(request));
-            }
-        }
+        self.new_map_stream(map);
         if self.contact.confirm(hello_sent) {
             self.emit(Event::ContactRestored);
         }
@@ -695,18 +689,34 @@ impl Daemon {
                         send(&tx, daemon_message::Message::Hello(self.hello()));
                     }
                 }
-                Wake::Pressure => {}
-                Wake::MapAsked => {
-                    if let Some(request) = self.map.as_mut().and_then(MapLink::request) {
-                        send(&tx, daemon_message::Message::MapRequest(request));
-                    }
-                }
+                // The request for a map is sent below, whatever woke the loop.
+                Wake::Pressure | Wake::MapAsked => {}
             }
+            self.ask_map(&tx);
             // Whatever woke the loop, leases may have started or ended.
             if self.take_pressure() {
                 tracing::info!(phase = self.phase().name(), "node phase changed");
                 send(&tx, daemon_message::Message::Hello(self.hello()));
             }
+        }
+    }
+
+    /// Takes the map a `Welcome` carried, the first of a new stream: the generation the
+    /// holder waits for is asked for again on this stream, by [`Self::ask_map`]. These are
+    /// methods rather than code in [`Self::session`] so that none of it is conditional
+    /// there (the session is compiled once for each test binary, and the coverage tool
+    /// counts the lines of the copy that covers most).
+    fn new_map_stream(&mut self, map: Option<wire::Map>) {
+        if let Some(link) = self.map.as_mut() {
+            link.new_stream();
+            link.take(map);
+        }
+    }
+
+    /// Sends the `MapRequest` for a generation the holder waits for, once on a stream.
+    fn ask_map(&mut self, tx: &UnboundedSender<DaemonMessage>) {
+        if let Some(request) = self.map.as_mut().and_then(MapLink::request) {
+            send(tx, daemon_message::Message::MapRequest(request));
         }
     }
 
