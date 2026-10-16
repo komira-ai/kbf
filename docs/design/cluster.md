@@ -1,6 +1,6 @@
 # One binary, three subcommands, two modes
 
-Status: design, nothing built. Revised again on 2026-10-15 for the owner's decisions on subcommands, discovery and staged routing. Labels: **[F]** fact checked against `main` while writing this revision, **[F#744]** carried from the first draft of this document and not re-checked, **[I]** inference, **[D]** owner decision (2026-10-15), **[V]** verify before building on it.
+Status: design, nothing built. Revised again on 2026-10-15 for the owner's decisions on subcommands, discovery and staged routing, and for the answers to the open questions (section 10). Labels: **[F]** fact checked against `main` while writing this revision, **[F#744]** carried from the first draft of this document and not re-checked, **[I]** inference, **[D]** owner decision (2026-10-15), **[V]** verify before building on it.
 
 This revision replaces the roles, data-path and leader-only-upload parts of the first draft. It does not modify `ha.md` (PR #303); section 11 says how the two relate.
 
@@ -18,7 +18,7 @@ This revision replaces the roles, data-path and leader-only-upload parts of the 
 - **[D]** The same interfaces serve both modes: daemon to server (data plane and control plane, each with an in-process and a remote implementation and one conformance suite), and server to server (Raft replication, leader discovery, peer blob fetch).
 - **[D]** Kept from the first draft: a leader-elected scheduler on a Raft log among the voters; clients are routed to the leader; unflushed hot blobs may be lost with a node; admission by CPUs with the memory ladder; flags, not environment variables; tests never depend on timing; no compatibility with earlier formats.
 - **[I]** Stages. Stage 1 elects one leader with a strictly increasing epoch; queue and leases stay leader-local, so a failover loses them (as a leader change already does, `scheduler.md`). Stage 2 replicates the scheduler (PR #303's `FarmMachine`).
-- **[I]** The voter count is mutable after bootstrap (`--voter-count` at bootstrap, `kbf cluster set-voters` afterwards). The owner said "small fixed cluster setting"; the mutable part and both names are my inference and open question 13.
+- **[I]** The voter count is mutable after bootstrap (`--voter-count` at bootstrap, `kbf cluster set-voters` afterwards). The owner said "small fixed cluster setting"; the mutable part and both names are my inference; the mutable count itself is decided (section 10, item 13).
 - **[I]** Membership changes are single-server changes through the Raft configuration (add a non-voting member, promote, remove), one at a time. Non-electable members are Raft learners from their first join; they receive the log but in v1 forward lookups and commits to the leader (section 5.3).
 - **[D]** Scaling note: one leader schedules everything. Splitting scheduling per pool or platform is future work and is not designed here.
 
@@ -367,23 +367,24 @@ Each PR's first test fails before the change. No test depends on wall time. **Ev
 12. **Drills.** Trusted: kill the leader under a real build; kill a holder under load. Isolated: S8, then the same kills.
 13. **Stage 2:** replicated scheduler from PR #303, trailer redirect, `Welcome` server list, leadership transfer, learner streaming if the lookup measurement justifies it, per-lease read authorization, locality hint, optional second-tier block replication.
 
-## 10. Open questions for the owner
+## 10. Questions decided by the owner
 
-1. **Control plane in-process only on the leader.** A follower's daemon must reach the scheduler remotely. Is "in-process while the node is the leader, remote otherwise" what you meant? Recommendation: yes; the alternative is a relay in every server half.
-2. **`TierDown` after how long, and by whom.** Is a leader-decided, committed `TierDown` (with `TierUp` on return, and `--hot-store-abandon` the only permanent marking) acceptable? Recommendation: yes; the alternative leaves dead holders' blobs `Present` and lets each read fail.
-3. **Actions under a separate uid** on trusted all-in-one nodes. Cheap on a Linux server, harder on a Mac. Recommendation: make it the deployment guidance, enforce only the environment scrub in code.
-4. **Per-lease read authorization** for daemons in isolated mode. Recommendation: ship result-write-by-lease now, read authorization in stage 2, and document the read-by-digest risk until then.
-5. **Which server nodes a daemon node uses for data.** Recommendation: the server nodes learned from the cluster in v1, the `Welcome` list later.
-6. **Learners.** Non-voting nodes forward lookups to the leader in v1. Non-voting members are Raft learners that receive the log, but still forward lookups. Acceptable until the measurement in PR 0 and PR 6 says otherwise?
-7. **Block replication** to a second tier before the acknowledgement: a stage 2 flag in both modes, or isolated mode only?
-8. The single-server pilot's log and unflushed hot blobs are abandoned. Acceptable?
-9. Stage 1 loses queued and running work on every failover, subject to PR 0. Acceptable as an interim?
-10. Is one Envoy on the client box enough while CI depends on it (two stateless Envoys behind the one DNS name later), and is client traffic through the leader's NIC acceptable meanwhile?
-11. Adopt the wiped-disk rule (rejoin as non-voting, promote after catch-up)? Is operator-driven recovery, never automatic, right when most voters die at once (`kbf cluster` recovery command)?
-12. Write side: verify-on-read first, acknowledge-after-flush for `UpdateActionResult` only if misses are frequent. Adopt?
+All fourteen questions of the earlier draft were answered on 2026-10-15; each answer is a **[D]** decision and none is open.
 
-13. **Voter count mutable or fixed.** I made `--voter-count` at bootstrap plus `kbf cluster set-voters` afterwards; you said a small fixed setting. Keep the mutable setting? Recommendation: keep it; otherwise changing 3 to 5 means a new cluster.
-14. **Join without an expected cluster id.** `--cluster-id` is required on a first join unless `--accept-any-cluster` is given. Acceptable friction? Recommendation: yes; the deploy tooling renders it.
+1. **[D]** The control plane is in-process only while the node is the leader and remote otherwise. The node's own blobs stay local either way.
+2. **[D]** The leader commits `TierDown` for a dead holder and `TierUp` when it returns. `--hot-store-abandon` is the only permanent marking.
+3. **[D]** Actions run under a separate uid on trusted all-in-one nodes.
+4. **[D]** Isolated mode: result writes are tied to a lease now; per-lease read authorization comes in stage 2.
+5. **[D]** Daemon-only nodes send data to the leader in v1; spreading it across servers comes later.
+6. **[D]** Non-voting members forward lookups to the leader in v1, until measured.
+7. **[D]** Second-tier block replication before the acknowledgement is a stage-2 option in both modes.
+8. **[D]** The single-server pilot's log and unflushed hot blobs are abandoned at the switch.
+9. **[D]** Stage 1 loses queued and running work on failover, as an interim.
+10. **[D]** One Envoy (with the kbf gateway) on the client box for now; two stateless ones behind the one DNS name later.
+11. **[D]** The wiped-disk rule (rejoin as non-voting, promote after catch-up) is adopted. Recovery when most voters die is operator-driven, never automatic.
+12. **[D]** Verify-on-read first; acknowledge-after-flush for `UpdateActionResult` only if misses turn out to be frequent.
+13. **[D]** The voter count is changeable after bootstrap (default 3).
+14. **[D]** `--cluster-id` is required on a first join unless `--accept-any-cluster` is given.
 
 ## 11. Relation to PR #303 (`ha.md`)
 
