@@ -260,6 +260,21 @@ fn a_file_that_cannot_be_opened_is_reported_once_and_tried_again_after_a_small_w
     assert_eq!(kept, want);
 }
 
+/// Catches: the plain `LogFile::open` (what the binary uses) losing its failure report:
+/// it reports to stderr, where journald keeps it, and the server goes on. A directory
+/// blocks the current file, so the open fails and the default reporter runs.
+#[test]
+fn the_default_open_reports_a_failure_and_does_not_panic() {
+    let dir = fresh_dir("blocked-default");
+    fs::create_dir_all(dir.join(FILE_NAME)).expect("blocker");
+    let log = LogFile::open(&dir, 1 << 30, 3);
+    write(&log, ["dropped".to_owned()]);
+    assert!(
+        dir.join(FILE_NAME).is_dir(),
+        "the blocker is left as it was"
+    );
+}
+
 /// Catches: a second failure while the file is already failing being reported again
 /// (stderr flooded while a disk stays broken). With one file kept, a retry removes the
 /// current file instead of renaming it; a directory there cannot be removed that way,
