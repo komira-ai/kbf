@@ -607,6 +607,11 @@ impl Core {
             cond,
             origin,
         };
+        self.enqueue(key, row);
+    }
+
+    /// Puts `row` in [`Pending`], or drops and counts it past its bounds.
+    fn enqueue(&mut self, key: String, row: Row) {
         if let Err(row) = self.pending.insert(key, row) {
             self.dropped_row(row);
         }
@@ -619,29 +624,39 @@ impl Core {
         }
     }
 
+    /// Sends at most [`Limits::txns_per_step`] index transactions, retries included.
     fn apply_pending(&mut self) {
-        for _ in 0..self.limits.txns_per_step {
+        let mut budget = self.limits.txns_per_step;
+        while budget > 0 {
             let batch = self
                 .pending
                 .take(self.limits.txn_rows, self.limits.txn_bytes);
             if batch.is_empty() {
                 return;
             }
-            self.apply(batch);
+            budget = self.apply(batch, budget);
         }
     }
 
-    /// Applies one batch of rows in one transaction. A pointer row that already exists
-    /// (a restored row, or a write retried after it landed) fails its `Absent` check;
-    /// it is there, so it leaves the batch and the rest is applied again. A failed
-    /// transaction drops its rows, each counted and its object kept.
-    fn apply(&mut self, mut batch: Vec<(String, Row)>) {
+    /// Applies one batch of rows, one transaction of `budget` per try, and returns the
+    /// budget left. A pointer row that already exists (a restored row, or a write
+    /// retried after it landed) fails its `Absent` check; it is there, so it leaves the
+    /// batch and the rest is tried again, or put back for the next step once the budget
+    /// is spent. A failed transaction drops its rows, each counted and its object kept.
+    fn apply(&mut self, mut batch: Vec<(String, Row)>, mut budget: usize) -> usize {
         while !batch.is_empty() {
+            if budget == 0 {
+                for (key, row) in batch {
+                    self.enqueue(key, row);
+                }
+                return 0;
+            }
+            budget -= 1;
             let txn = batch.iter().fold(Txn::new(), |t, (key, row)| {
                 t.put(key.clone(), row.value.clone(), row.cond)
             });
             match self.index.txn(txn) {
-                Ok(Ok(_)) => return,
+                Ok(Ok(_)) => return budget,
                 Ok(Err(conflict)) => {
                     batch.remove(conflict.index.min(batch.len() - 1));
                 }
@@ -650,10 +665,11 @@ impl Core {
                     for (_, row) in batch {
                         self.dropped_row(row);
                     }
-                    return;
+                    return budget;
                 }
             }
         }
+        budget
     }
 
     /// Restores the rows of a kept object from its footer (`read`). Returns whether to

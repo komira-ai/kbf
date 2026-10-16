@@ -870,3 +870,37 @@ fn an_invocation_forgotten_and_seen_again_by_the_same_writer_keeps_both_chunks()
         assert_eq!(got.map(|v| v.run).as_ref(), Some(r));
     }
 }
+
+#[test]
+fn index_transactions_retried_on_conflicts_count_against_the_step_bound() {
+    // Catches: a batch retried once per `Absent` conflict within one step, each retry
+    // another synced transaction. Restored rows that exist already are the common case
+    // (a write that landed but reported failure), so one step could send a transaction
+    // per row, far past the background lane's bound.
+    let mut life = Life::fresh(Limits::default());
+    life.step(T);
+    let inv = InvRef::named("b1");
+    life.run(&inv, T, "main", RunOutcome::Ok);
+    life.close(&inv);
+    life.index.lose_acks.store(1, Ordering::SeqCst);
+    life.step(T);
+    assert_eq!(life.writer.kept_objects(), 1);
+    life.step(T + 1); // the kept object's three rows, all present, are queued again
+    assert_eq!(life.writer.pending_rows(), 3);
+    let mut steps = 0;
+    while life.writer.pending_rows() > 0 {
+        let before = life.index.txns.load(Ordering::SeqCst);
+        life.step(T + 2);
+        let sent = life.index.txns.load(Ordering::SeqCst) - before;
+        assert!(sent <= 1, "{sent} transactions in one step");
+        steps += 1;
+        assert!(steps <= 5, "the conflicting rows never drained");
+    }
+    assert_eq!(steps, 3, "one conflicting row leaves the batch per step");
+    assert_eq!(life.index.keys(ICHUNK).len(), 1);
+    assert_eq!(
+        life.writer.drops().index,
+        3,
+        "only the failed write's rows counted"
+    );
+}
