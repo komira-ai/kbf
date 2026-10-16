@@ -24,8 +24,8 @@
 //! standard calls. A node with one member never reads it; [`RemoteStorage`] sends it.
 //!
 //! **Who may call** is [`Admission`]: the role in the caller's certificate against the
-//! endpoint's table. Roles are the part of this unit that is partly a seam; the module
-//! docs of [`admission`] say which.
+//! endpoint's table, the role read by `kbf-peer`; the module docs of [`admission`] say
+//! what is checked and what is planned.
 //!
 //! **Where PutStream plugs in.** `Write` buffers a blob whole, because no store hands
 //! out a [`crate::PutStream`] yet ([`Storage::stream`] is `None`). When one does, the

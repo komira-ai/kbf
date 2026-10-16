@@ -10,8 +10,11 @@ use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStor
 use kbf_proto::reapi::{ActionResult, FindMissingBlobsRequest};
 use kbf_proto::storage::action_store_client::ActionStoreClient;
 use kbf_proto::storage::{CommitRequest, GetRequest, PrepareRequest, Writer};
-use kbf_proto::worker::BeginRequest;
 use kbf_proto::worker::segments_client::SegmentsClient;
+use kbf_proto::worker::{
+    BeginRequest, CommitRequest as SegmentsCommitRequest, LocateRequest, PutRangeRequest,
+    ReadRangeRequest,
+};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, SanType,
@@ -156,8 +159,14 @@ impl Pki {
 
     /// A client of the server at `addr`, with a certificate for `role`.
     async fn client(&self, addr: std::net::SocketAddr, role: &str) -> Channel {
+        self.client_naming(addr, vec![uri(role)]).await
+    }
+
+    /// A client of the server at `addr`, with a certificate whose subjectAltNames are
+    /// `sans`.
+    async fn client_naming(&self, addr: std::net::SocketAddr, sans: Vec<SanType>) -> Channel {
         let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
-        params.subject_alt_names = vec![uri(role)];
+        params.subject_alt_names = sans;
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         let key = KeyPair::generate().expect("key");
         let cert = params.signed_by(&key, &self.ca).expect("sign");
@@ -175,7 +184,53 @@ impl Pki {
     }
 }
 
-/// One call to `endpoint`, as a client of the wire would make it.
+/// Every gRPC method the service admits, with the endpoint whose roles it takes: one
+/// row per method, so a check left out of one `Segments` handler is called too.
+const RPCS: [(&str, Endpoint); 12] = [
+    ("FindMissingBlobs", Endpoint::FindMissing),
+    ("Read", Endpoint::Read),
+    ("Write", Endpoint::Write),
+    ("QueryWriteStatus", Endpoint::QueryWriteStatus),
+    ("ActionStore.Get", Endpoint::ActionGet),
+    ("ActionStore.Prepare", Endpoint::ActionPrepare),
+    ("ActionStore.Commit", Endpoint::ActionCommit),
+    ("Segments.Begin", Endpoint::Segments),
+    ("Segments.PutRange", Endpoint::Segments),
+    ("Segments.Commit", Endpoint::Segments),
+    ("Segments.Locate", Endpoint::Segments),
+    ("Segments.ReadRange", Endpoint::Segments),
+];
+
+/// One call of the method `rpc` names (a row of [`RPCS`]), as a client of the wire would
+/// make it.
+async fn call_rpc(rpc: &str, channel: &Channel) -> Result<(), Status> {
+    let mut segments = SegmentsClient::new(channel.clone());
+    match rpc {
+        "Segments.PutRange" => segments
+            .put_range(PutRangeRequest::default())
+            .await
+            .map(drop),
+        "Segments.Commit" => segments
+            .commit(SegmentsCommitRequest::default())
+            .await
+            .map(drop),
+        "Segments.Locate" => segments.locate(LocateRequest::default()).await.map(drop),
+        "Segments.ReadRange" => segments
+            .read_range(ReadRangeRequest::default())
+            .await
+            .map(drop),
+        _ => {
+            let (_, endpoint) = RPCS
+                .into_iter()
+                .find(|(name, _)| *name == rpc)
+                .expect("a row of RPCS");
+            call(endpoint, channel).await
+        }
+    }
+}
+
+/// One call to `endpoint`, as a client of the wire would make it (`Segments.Begin` for
+/// the `Segments` endpoint).
 async fn call(endpoint: Endpoint, channel: &Channel) -> Result<(), Status> {
     let digest = super::wire::to_proto(&sha(b"x"));
     match endpoint {
@@ -238,13 +293,20 @@ async fn call(endpoint: Endpoint, channel: &Channel) -> Result<(), Status> {
     }
 }
 
-/// Catches an unexpected role admitted on any endpoint, over real mutual TLS (the
+/// Catches an unexpected role admitted on any method, over real mutual TLS (the
 /// certificate really is the transport's, not a test's stand-in): each of the three
-/// roles and one that is not a role calls every endpoint; a call is refused
-/// PERMISSION_DENIED exactly when the role is not the endpoint's, and otherwise gets as
-/// far as the store (any other answer, including the store's own errors).
+/// roles, one that is not a role, a certificate with no role (a node's DNS name only)
+/// and one with two calls every method of [`RPCS`]; a call is refused
+/// PERMISSION_DENIED exactly when the certificate does not name one role the endpoint
+/// takes, and
+/// otherwise gets as far as the store (any other answer, including the store's own
+/// errors). A refused `Segments` call never reaches the store's handler.
+///
+/// Mutants seen red: the check removed from `Segments.Commit` alone (frontend, storage,
+/// admin, no role and two roles all reach it); `contains` negated in
+/// `Admission::check_leaf`.
 #[tokio::test]
-async fn every_endpoint_refuses_an_unexpected_role_over_mutual_tls() {
+async fn every_method_refuses_an_unexpected_role_over_mutual_tls() {
     let pki = Pki::new();
     let mem = Arc::new(Mem::default());
     let storage: Arc<dyn Storage> = Arc::clone(&mem) as Arc<dyn Storage>;
@@ -253,13 +315,26 @@ async fn every_endpoint_refuses_an_unexpected_role_over_mutual_tls() {
     };
     let service = StorageService::new(storage, Admission::Certified, config);
     let addr = serve_routes(service.routes(), Some(pki.server())).await;
-    for role in ["frontend", "storage", "daemon", "admin"] {
-        let channel = pki.client(addr, role).await;
-        for endpoint in Endpoint::ALL {
-            let answer = call(endpoint, &channel).await;
+    let callers = [
+        ("frontend", vec![uri("frontend")]),
+        ("storage", vec![uri("storage")]),
+        ("daemon", vec![dns("node-1"), uri("daemon")]),
+        ("admin", vec![uri("admin")]),
+        ("no role", vec![dns("node-1")]),
+        ("two roles", vec![uri("frontend"), uri("daemon")]),
+    ];
+    for (who, sans) in callers {
+        let channel = pki.client_naming(addr, sans).await;
+        for (rpc, endpoint) in RPCS {
+            let forwarded = mem.segments.calls.lock().expect("lock").len();
+            let answer = call_rpc(rpc, &channel).await;
             let refused = matches!(&answer, Err(s) if s.code() == Code::PermissionDenied);
-            let allowed = expected(endpoint).contains(&role);
-            assert_eq!(refused, !allowed, "{role} on {endpoint:?}: {answer:?}");
+            let allowed = expected(endpoint).contains(&who);
+            assert_eq!(refused, !allowed, "{who} on {rpc}: {answer:?}");
+            if refused {
+                let now = mem.segments.calls.lock().expect("lock").len();
+                assert_eq!(now, forwarded, "{who} on {rpc} reached the store");
+            }
         }
     }
     // A client of the allowed role really reached the store.

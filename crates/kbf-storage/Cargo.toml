@@ -16,6 +16,9 @@ publish.workspace = true
 bytes.workspace = true
 futures.workspace = true
 kbf-meta.workspace = true
+# Reads the role out of a peer's certificate (service/admission.rs), the one reader the
+# worker listener uses too.
+kbf-peer.workspace = true
 kbf-proto.workspace = true
 kbf-segments.workspace = true
 kbf-types.workspace = true
@@ -23,9 +26,6 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tonic = { workspace = true, features = ["tls-ring"] }
 tracing.workspace = true
-# Reads the role out of a peer's certificate (service/admission.rs), as kbf-server reads
-# its daemons' node names.
-x509-parser.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true

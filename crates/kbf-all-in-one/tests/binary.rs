@@ -48,8 +48,8 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// A CA, the node's certificate (`node-1`, its one DNS name) and the server's
-/// (`localhost`), written into `dir`.
+/// A CA, the node's certificate (`node-1`, its one DNS name, and the daemon role the
+/// worker listener requires) and the server's (`localhost`), written into `dir`.
 fn pki(dir: &Path) {
     let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -57,10 +57,12 @@ fn pki(dir: &Path) {
     std::fs::write(dir.join("ca.pem"), ca.pem()).expect("write");
     for (name, dns) in [("node", "node-1"), ("server", "localhost")] {
         let key = KeyPair::generate().expect("key");
-        let cert = CertificateParams::new(vec![dns.to_owned()])
-            .expect("params")
-            .signed_by(&key, &ca)
-            .expect("sign");
+        let mut params = CertificateParams::new(vec![dns.to_owned()]).expect("params");
+        if name == "node" {
+            let role = "urn:kbf:role:daemon".try_into().expect("an IA5 name");
+            params.subject_alt_names.push(rcgen::SanType::URI(role));
+        }
+        let cert = params.signed_by(&key, &ca).expect("sign");
         std::fs::write(dir.join(format!("{name}.pem")), cert.pem()).expect("write");
         std::fs::write(dir.join(format!("{name}.key")), key.serialize_pem()).expect("write");
     }
