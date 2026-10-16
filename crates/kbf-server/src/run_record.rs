@@ -4,7 +4,7 @@
 //! limit, the cap. [`of`] reads the report before it is judged (the judging drops a
 //! killed run's result); [`killed`] adds the booking once the scheduler has taken it.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use kbf_invocation::{NumaBytes, ReapiTimes, Run, RunUsage, WallTime};
 use kbf_proto::reapi::ActionResult;
@@ -91,21 +91,17 @@ fn run_usage(u: &ResourceUsage) -> RunUsage {
     }
 }
 
-/// A protobuf timestamp on the wall clock; `None` for none, or one before the epoch
-/// or out of range.
+/// A protobuf timestamp on the wall clock, to the microsecond; `None` for none, or
+/// one before the epoch or past `u64` microseconds.
 fn wall(t: Option<Timestamp>) -> Option<WallTime> {
-    let since = SystemTime::try_from(t?)
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?;
-    Some(WallTime::from_unix_micros(
-        u64::try_from(since.as_micros()).ok()?,
-    ))
+    let t = t?;
+    let micros = i128::from(t.seconds) * 1_000_000 + i128::from(t.nanos) / 1_000;
+    u64::try_from(micros).ok().map(WallTime::from_unix_micros)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, UNIX_EPOCH};
 
     use kbf_proto::reapi::ExecutedActionMetadata;
     use kbf_proto::worker::{CgroupUsage, NumaNodeBytes};
@@ -254,5 +250,13 @@ mod tests {
         };
         assert_eq!(wall(Some(before)), None);
         assert_eq!(wall(None), None);
+        let micro = Timestamp {
+            seconds: 2,
+            nanos: 3_999,
+        };
+        assert_eq!(
+            wall(Some(micro)),
+            Some(WallTime::from_unix_micros(2_000_003))
+        );
     }
 }

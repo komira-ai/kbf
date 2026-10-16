@@ -333,19 +333,17 @@ impl Records {
                 lease,
                 run,
             } => {
-                let Some(op) = self.operations.get(&operation) else {
+                let held = self.operations.get(&operation);
+                let Some(i) = held.and_then(|op| op.attempts.iter().position(|a| a.lease == lease))
+                else {
                     return;
                 };
-                if !op.attempts.iter().any(|a| a.lease == lease) {
-                    return;
-                }
                 let fits = self.make_room(None, run_bytes(&run));
-                // Making room may have removed every record waiting on it.
+                // Making room may have removed every record waiting on it; it leaves
+                // the attempts of an operation it keeps as they were.
                 if let Some(op) = self.operations.get_mut(&operation) {
                     if fits {
-                        if let Some(a) = lease_of(&mut op.attempts, lease) {
-                            a.run = Some(run);
-                        }
+                        op.attempts[i].run = Some(run);
                         self.recount_operation(operation);
                     } else {
                         self.mark_incomplete_operation(operation);

@@ -317,11 +317,24 @@ async fn actions_sort_longest_first_and_page_on() {
     assert_eq!(listed(&rows).len(), 5, "unsorted, every row");
     assert_eq!(rows["actions"][4]["durations"], json!({"queue_ms": 0}));
 
+    let empty = server.ok(&format!("{base}?sort=input_fetch_ms")).await;
+    assert_eq!(listed(&empty), Vec::<String>::new(), "no row measured it");
+    assert!(empty.get("next_page").is_none(), "{empty}");
+
     let token = first["next_page_token"].as_str().expect("a token");
+    // The same token, its position past the record's rows.
+    let decoded = String::from_utf8(hex::decode(token).expect("hex")).expect("text");
+    let mut fields: Vec<&str> = decoded.split(':').collect();
+    fields[4] = "99";
+    let past = hex::encode(fields.join(":"));
     for bad in [
         format!("{base}?sort=fast"),
         format!("{base}?page_token={token}"),
         format!("{base}?sort=execution_ms&page_token={token}"),
+        format!("{base}?sort=wall_ms&page_token={past}"),
+        "/v1/invocations/t/artifacts?sort=wall_ms".to_owned(),
+        "/v1/invocations/t/logs?requeue_reason=silent".to_owned(),
+        "/v1/invocations/t/artifacts?memory_kill=none".to_owned(),
     ] {
         assert_eq!(server.get(&bad).await.code, 400, "{bad}");
     }

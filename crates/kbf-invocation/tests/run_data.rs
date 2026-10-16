@@ -245,6 +245,10 @@ fn a_row_derives_its_durations_and_its_memory_kills() {
         MemoryKill::NAMED.map(|(k, _)| k.name()),
         ["none", "own_limit", "node_pressure"]
     );
+    assert_eq!(
+        [TargetKind::Target, TargetKind::Anon, TargetKind::Bxl].map(TargetKind::name),
+        ["target", "anon", "bxl"]
+    );
     let empty = r.get(&key("a")).expect("a").rows()[0].clone();
     let mut none = empty;
     none.attempts.clear();
