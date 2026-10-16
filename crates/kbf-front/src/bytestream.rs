@@ -80,7 +80,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
     /// ([`Cache::read_windows`]): every byte of the blob is read and hashed, and the
     /// last window is sent only once the digest checked, so a blob of one window is
     /// checked whole before a byte is sent. A larger blob whose bytes fail the digest
-    /// ends its stream UNAVAILABLE in place of its last window.
+    /// ends its stream UNAVAILABLE in place of its last window. Each message is cut
+    /// from its window as the stream is polled, so an open Read holds one window and
+    /// one message.
     async fn read(
         &self,
         request: Request<ReadRequest>,
@@ -116,19 +118,20 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
         self.recorder.call(&metadata, &caller, &instance, &|| {
             CallKind::Downloaded(read.range_len())
         });
-        let windows = stream::unfold(read, |mut read| async move {
-            let window = read.next().await?;
-            Some((window, read))
-        });
-        let messages = windows.flat_map(|window| {
-            let messages: Vec<Result<ReadResponse, Status>> = match window {
-                Ok(bytes) => bytes
-                    .chunks(READ_CHUNK_BYTES)
-                    .map(|c| Ok(ReadResponse { data: c.to_vec() }))
-                    .collect(),
-                Err(e) => vec![Err(Status::from(e))],
+        // Each message is cut from the window when it is asked for: one Read holds its
+        // window and the message being sent, not every message of the window at once.
+        let messages = stream::unfold((read, Bytes::new()), |(mut read, mut window)| async move {
+            while window.is_empty() {
+                match read.next().await? {
+                    Ok(next) => window = next,
+                    Err(e) => return Some((Err(Status::from(e)), (read, Bytes::new()))),
+                }
+            }
+            let message = window.split_to(window.len().min(READ_CHUNK_BYTES));
+            let message = ReadResponse {
+                data: message.to_vec(),
             };
-            stream::iter(messages)
+            Some((Ok(message), (read, window)))
         });
         Ok(Response::new(Box::pin(messages)))
     }
