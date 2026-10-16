@@ -158,6 +158,30 @@ fn farm_flags(dir: &Path, port: u16) -> Vec<String> {
     ]
 }
 
+/// `PATH` with `bin`, where [`podman`] put the stand-in, first.
+fn image_path(bin: &Path) -> String {
+    format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+/// The binary as a one-node farm in `dir` ([`farm_flags`]) whose container driver runs
+/// the stand-in `podman` in `bin`, found through `path`.
+fn farm(dir: &Path, bin: &Path, path: &str) -> Command {
+    let mut command = Command::new(BIN);
+    command
+        .args(farm_flags(dir, free_port()))
+        .arg(format!("--id-files={}", id_files(dir).display()))
+        .args(cgroup_tree(bin))
+        .env("PATH", path)
+        // The stand-in finds its state beside the link it was run through, which the
+        // driver runs by the name `PATH` finds (argv0 `podman`): from here.
+        .current_dir(bin);
+    command
+}
+
 /// Kills the process when dropped, so a failed test leaves nothing running.
 struct Running(Child);
 
@@ -245,19 +269,7 @@ fn an_actions_outputs_go_through_the_in_process_plane() {
         "to stderr",
     ];
     let image = podman(&bin, &steps);
-    let path = format!(
-        "{}:{}",
-        bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let mut child = Command::new(BIN)
-        .args(farm_flags(&dir, free_port()))
-        .arg(format!("--id-files={}", id_files(&dir).display()))
-        .args(cgroup_tree(&bin))
-        .env("PATH", path)
-        // The stand-in finds its state beside the link it was run through, which the
-        // driver runs by the name `PATH` finds (argv0 `podman`): from here.
-        .current_dir(&bin)
+    let mut child = farm(&dir, &bin, &image_path(&bin))
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn");
@@ -386,3 +398,37 @@ fn a_start_either_half_refuses_says_which() {
     assert_eq!(code, Some(2), "{stderr}");
     assert!(stderr.contains("container driver only"), "{stderr}");
 }
+
+/// Catches the start-up pass not run over the all-in-one's `file://` cold store (the
+/// server half started without it, as `kbf_server::start` with the pass left out of its
+/// `file://` arm would): a single-voter farm is this binary's main use, and the pass is
+/// what deletes its orphans and forgets its lost objects. The binary must log the
+/// pass's last line once it serves.
+#[test]
+fn the_start_up_pass_runs_over_a_file_cold_store() {
+    let dir = scratch("pass");
+    pki(&dir);
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("mkdir");
+    podman(&bin, &["true"]);
+    let mut child = farm(&dir, &bin, &image_path(&bin))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let stderr = BufReader::new(child.stderr.take().expect("stderr"));
+    let _running = Running(child);
+    let (seen, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in stderr.lines().map_while(Result::ok) {
+            if line.contains(PASS_DONE) {
+                let _ = seen.send(line);
+            }
+        }
+    });
+    let line = lines.recv_timeout(PROMPT).expect("the pass's last line");
+    assert!(line.contains("orphans_deleted=0"), "{line}");
+}
+
+/// The start-up pass's last line (`kbf-server`'s `startup_pass`).
+const PASS_DONE: &str = "start-up pass over the cold store directory done";

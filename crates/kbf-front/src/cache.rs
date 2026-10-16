@@ -813,6 +813,7 @@ fn unexpected(applied: &Applied) -> CacheError {
 }
 
 mod batch;
+mod consistency;
 mod flush;
 mod tier;
 mod touches;
@@ -821,6 +822,9 @@ mod verify;
 mod write_group;
 
 pub use batch::BATCH_READS_IN_FLIGHT;
+pub use consistency::{
+    EVICT_BATCH, EvictReady, HeldObject, NEEDS_V3, PASS_OPENS_PER_SEC, PassReport,
+};
 pub use flush::{FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSHES_PER_ROUND, FlushRound};
 pub use tier::{TierStartError, TierStartup};
 pub use touches::TouchConfig;

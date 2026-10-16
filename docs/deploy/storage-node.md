@@ -281,17 +281,50 @@ kbf-server \
 - A write is synced, file and directory, before it is answered, so an answered upload
   survives a crash or a power cut. A crash part-way through a write leaves a file in
   `tmp/`, removed at the next start.
-- Nothing else is checked at start: reading every object would hold up each start of
-  a large directory. A blob whose file was lost, damaged or left empty is still
-  reported present by `FindMissingBlobs` until a read of it fails: that read answers
-  `UNAVAILABLE` and takes the blob out of the index, so the client uploads it again,
-  which heals it. Before an action-cache hit is served, the server checks that the
-  file of every object the hit needs is there and starts with its header; if one is
-  not, the hit is a miss (the action runs again) and its blobs leave the index.
-- No eviction: nothing deletes objects yet, from this directory or from a bucket, so
-  it grows with every blob written. A write that would leave the file system with
-  less than 1 GiB free is refused, and its upload answered `UNAVAILABLE`. Size the disk
-  for the cache you want to keep.
+- The start-up pass (a `file://` cold store only; an `s3://` one is not walked, and
+  a `file://` hot store is the write tier's block files, which the tier reads at its
+  own start): once the server serves (it never waits for the pass to bind or
+  to report ready), a background task checks the directory against the index. It
+  walks the 256 shards of `objects/` reading each file's header (its key, length and
+  modification time, never its bytes) at about 1000 files a second, or as fast as it
+  can while the disk is under the free-space floor, and then:
+  - keeps each file of an object the index names (staged on the write tier
+    included) or of this process's own writer epoch;
+  - deletes each file of an earlier epoch under this log's prefix that the index does
+    not name: an orphan, such as an upload that failed before its commit;
+  - keeps and counts a file under another prefix, and leaves a file without a header;
+  - then forgets each indexed object, not staged, that has no file: its blobs leave
+    the index, with every action-cache entry that needs one of them, so
+    `FindMissingBlobs` reports them and the client uploads them again. Forgetting
+    needs the Raft log at machine version 3, which a server binary older than this
+    one refuses. Before it forgets the first, a log whose cell has a single voter (a
+    single-host farm) is raised to it. A cell of more voters is never raised by the
+    pass: until the operator raises it, once every replica runs version 3, the pass
+    marks each such object missing instead (its blobs are reported missing and its
+    action-cache entries miss, but stay in the index) and logs
+    `evict/forget needs log V3: N objects held` once.
+  - The guard: it forgets nothing unless the walk found the file of at least one
+    indexed object. A directory with none is not the one the index was written over
+    (a disk that is not mounted: the server creates the directory empty), and the
+    pass logs an error instead of emptying the index.
+
+  It logs one line at the end: files read, kept, orphans deleted, foreign, without a
+  header, objects, blobs and entries forgotten, objects marked missing for want of
+  version 3, objects held back by the guard, the bytes held and how long it took. A
+  pass that fails is logged and runs again at the next start.
+- Until the pass reaches it, or for a file lost while the server runs, a blob whose
+  file was lost, damaged or left empty is still reported present by
+  `FindMissingBlobs` until a read of it fails: that read answers `UNAVAILABLE` and
+  marks its object unreachable, so the blob is reported missing and the client
+  uploads it again, which heals it. The pass reads headers only, so a damaged object
+  is found by a read. Before an action-cache hit is served, the server checks that
+  the file of every object the hit needs is there and starts with its header; if one
+  is not, the hit is a miss (the action runs again) and its blobs are reported
+  missing.
+- No eviction: only the start-up pass deletes objects (orphans), so the directory
+  grows with every blob the cache keeps (and a bucket with every blob written). A
+  write that would leave the file system with less than 1 GiB free is refused, and
+  its upload answered `UNAVAILABLE`. Size the disk for the cache you want to keep.
 
 With a fast disk in front, add `--hot-store=file:///fast/kbf` (uploads land there and
 are flushed to the cold store; the metadata log then lives in `/fast/kbf/meta`, and

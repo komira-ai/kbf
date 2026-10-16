@@ -1,6 +1,7 @@
 //! The server's assembly, as a library: [`start`] opens the store and metadata log the
-//! flags name, attaches the write tier and binds the listeners, and returns a
-//! [`ServerHandle`] that serves. The `kbf-server` binary is `start`, a print and
+//! flags name, attaches the write tier, starts the start-up pass over a `file://` cold
+//! store in the background (`crate::startup_pass`) and binds the listeners, and returns
+//! a [`ServerHandle`] that serves. The `kbf-server` binary is `start`, a print and
 //! `serve`; a process that runs the server beside the worker daemon calls the same
 //! function.
 //!
@@ -23,6 +24,7 @@ use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
 
 use crate::local::LocalStore;
+use crate::startup_pass::StartPass;
 use crate::stores::{COLD_FILE_MIN_FREE_BYTES, FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
 use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, bind_server_with_policy, s3_store};
@@ -32,9 +34,10 @@ pub fn sizes_on(args: &Args, topology: Topology) -> kbf_threads::Sizes {
     args.threads.resolve(topology)
 }
 
-/// A started server: bound, its write tier attached and its flusher running, not yet
-/// serving. [`ServerHandle::serve`] serves until the shutdown future given to [`start`]
-/// completes; dropping the handle first stops the flusher and releases the listeners.
+/// A started server: bound, its write tier attached and its flusher (and any start-up
+/// pass) running, not yet serving. [`ServerHandle::serve`] serves until the shutdown
+/// future given to [`start`] completes; dropping the handle first stops the flusher and
+/// the pass and releases the listeners.
 pub struct ServerHandle {
     /// Where the REAPI listener is.
     pub reapi: SocketAddr,
@@ -46,6 +49,7 @@ pub struct ServerHandle {
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
+    _pass: Option<AbortOnDrop>,
 }
 
 impl ServerHandle {
@@ -70,7 +74,10 @@ impl ServerHandle {
     /// A listener fails while serving.
     pub async fn serve(self) -> Result<(), ServeError> {
         let Self {
-            serving, _flusher, ..
+            serving,
+            _flusher,
+            _pass,
+            ..
         } = self;
         serving.await
     }
@@ -100,21 +107,32 @@ where
     match &stores.cold {
         StoreUri::File(dir) => {
             let store = FsStore::open(dir, COLD_FILE_MIN_FREE_BYTES)?;
-            over(args, &stores, store, FILE_PREFIX_ROOT, shutdown).await
+            let files = store.clone();
+            over(
+                args,
+                &stores,
+                (store, Some(files)),
+                FILE_PREFIX_ROOT,
+                shutdown,
+            )
+            .await
         }
         StoreUri::S3(uri) => {
             let store = s3_store(uri, |name| std::env::var(name).ok())?;
-            over(args, &stores, store, &uri.prefix, shutdown).await
+            over(args, &stores, (store, None), &uri.prefix, shutdown).await
         }
     }
 }
 
 /// Serves `store` under the Raft metadata log in `stores.meta_dir`, writing under the
-/// prefix it committed: `<prefix_root><log id>/` for a new log.
+/// prefix it committed: `<prefix_root><log id>/` for a new log. With `files`, the same
+/// store as a file store (a `file://` cold store), the start-up pass runs over it. A
+/// `file://` hot store gets none: it is the write tier's block files, not an object
+/// store, and the tier's own start-up reads them.
 async fn over<O, S, F>(
     args: &Args,
     stores: &Stores,
-    store: O,
+    (store, files): (O, Option<FsStore>),
     prefix_root: &str,
     shutdown: S,
 ) -> Result<ServerHandle, Box<dyn Error>>
@@ -125,7 +143,9 @@ where
 {
     let log = RaftMetaLog::open_dir(&stores.meta_dir, Retention::default(), prefix_root).await?;
     let (prefix, id) = (log.store_prefix(), log.log_id());
-    serve_with(args, stores.hot.as_ref(), log, store, prefix, id, shutdown).await
+    let pass = files.map(StartPass::over_raft);
+    let hot = stores.hot.as_ref();
+    assemble(args, hot, log, store, prefix, id, shutdown, pass).await
 }
 
 /// [`start`] over a metadata log and object store already open: where the flags'
@@ -149,6 +169,27 @@ where
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
+    assemble(args, hot, meta, store, prefix, log, shutdown, None).await
+}
+
+/// [`serve_with`], and `pass` spawned once the write tier is attached: it runs beside
+/// the server and is never awaited here.
+#[expect(clippy::too_many_arguments, reason = "serve_with's, and the pass")]
+pub(crate) async fn assemble<O, S, F>(
+    args: &Args,
+    hot: Option<&Hot>,
+    meta: RaftMetaLog<StdFs>,
+    store: O,
+    prefix: KeyPrefix,
+    log: FarmLogId,
+    shutdown: S,
+    pass: Option<StartPass<RaftMetaLog<StdFs>>>,
+) -> Result<ServerHandle, Box<dyn Error>>
+where
+    O: ObjectStore + 'static,
+    S: FnOnce() -> io::Result<F>,
+    F: Future<Output = ()> + Send + 'static,
+{
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
     let routes = Routes {
@@ -166,6 +207,7 @@ where
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
         AbortOnDrop(tokio::spawn(flusher))
     });
+    let _pass = pass.map(|pass| AbortOnDrop(crate::startup_pass::spawn(Arc::clone(&cache), pass)));
     let shutdown = shutdown()?;
     let api = args.api()?;
     let bound = bind_server_with_policy(cache, listeners, api, policy, shutdown)?;
@@ -185,10 +227,11 @@ where
         ),
         serving: Box::pin(bound.serving),
         _flusher,
+        _pass,
     })
 }
 
-/// Aborts a task when dropped: the flusher stops with the server.
+/// Aborts a task when dropped: the flusher and the start-up pass stop with the server.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -274,6 +317,35 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    /// Catches the public seam [`serve_with`] not assembling a server now that the
+    /// flags' path ([`start`], which also attaches the start-up pass) goes around it:
+    /// over a log and store its caller opened it binds, and its start line names the
+    /// log.
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_with_binds_over_a_store_the_caller_opened() {
+        let root =
+            std::env::temp_dir().join(format!("kbf-server-serve-with-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let args = Args::parse_from([
+            "kbf-server",
+            "--listen=127.0.0.1:0",
+            "--worker-listen=127.0.0.1:0",
+        ]);
+        let log = RaftMetaLog::open_dir(&root.join("raft"), Retention::default(), "kbf/")
+            .await
+            .expect("open the log");
+        let (prefix, id) = (log.store_prefix(), log.log_id());
+        let store = FsStore::open(&root.join("blobs"), 1).expect("open the store");
+        let pending = || Ok(std::future::pending::<()>());
+        let server = serve_with(&args, None, log, store, prefix, id, pending)
+            .await
+            .expect("assembled");
+        let line = server.start_line().to_owned();
+        assert!(line.ends_with(&format!(" log={id}")), "{line}");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// Catches the server sizing itself from anything but the CPU count: on the 44-core,
     /// 2-threads-per-core farm node it runs 88 async workers, 512 blocking threads

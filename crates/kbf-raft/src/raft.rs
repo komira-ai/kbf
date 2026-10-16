@@ -6,8 +6,8 @@ use thiserror::Error;
 
 use crate::log::Log;
 use crate::{
-    AppendOutcome, Config, ConfigError, Effect, Entry, HardState, LogId, LogIndex, Message,
-    MessageKind, Payload, ServerId, Term,
+    AppendOutcome, Config, ConfigError, Effect, Entry, HardState, LogId, LogIndex, Membership,
+    Message, MessageKind, Payload, ServerId, Term,
 };
 
 /// What a server is doing in its current term.
@@ -173,6 +173,12 @@ impl Raft {
     #[must_use]
     pub fn id(&self) -> ServerId {
         self.config.id
+    }
+
+    /// The voters and learners this server was opened with.
+    #[must_use]
+    pub fn membership(&self) -> &Membership {
+        &self.config.membership
     }
 
     /// The current role.
