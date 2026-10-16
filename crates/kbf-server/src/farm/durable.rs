@@ -281,16 +281,20 @@ impl Durable {
         )
     }
 
-    /// A lease given up: the operation holds nothing and is queued again. The lease
-    /// must still be the operation's, as the transaction reads it.
+    /// A lease given up: the operation holds nothing and is queued again. Repeatable:
+    /// the farm writes a give-up the store refused again until the store takes it, so
+    /// the lease row may be gone already, and the queue row may be there. An operation
+    /// that has finished has nothing to put back.
     pub(super) fn requeued(&self, requeue: &Requeue) -> Result<(), StateError> {
+        if self.store.get(&op_key(requeue.operation))?.is_none() {
+            return Ok(());
+        }
         let key = lease_key(requeue.lease);
-        let row = self.row(&key)?;
-        self.commit(Txn::new().delete(key, Cond::Version(row.version)).put(
-            queue_key(requeue.operation),
-            Vec::new(),
-            Cond::Absent,
-        ))
+        let mut txn = Txn::new();
+        if let Some(row) = self.store.get(&key)? {
+            txn = txn.delete(key, Cond::Version(row.version));
+        }
+        self.commit(txn.put(queue_key(requeue.operation), Vec::new(), Cond::Any))
     }
 
     /// A result accepted from `lease`: the operation is finished. Compare-and-set on

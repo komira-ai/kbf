@@ -206,6 +206,11 @@ struct State {
     /// The state store every change is written through before it is acknowledged, if
     /// the farm has one ([`Farm::with_state`]).
     durable: Option<Durable>,
+    /// Leases given up that the state store has not yet been told of, oldest first.
+    /// Until it has, it still holds the lease and no queue row for the operation, so
+    /// every one is written again before anything that follows it is
+    /// ([`State::log_requeues`]).
+    unsettled: Vec<Requeue>,
 }
 
 /// What a finished operation tells its callers, and the action-cache entry to write
@@ -257,6 +262,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 recorder: Recorder::off(),
                 recorded: BTreeMap::new(),
                 durable: None,
+                unsettled: Vec::new(),
             }),
         }
     }
@@ -923,9 +929,11 @@ impl State {
     /// feed. A requeue only names an operation the scheduler held when it was made;
     /// one dropped since is logged with an empty name, never looked up by index.
     fn log_requeues(&mut self) {
-        for requeue in self.sched.take_requeues() {
+        let given_up = self.sched.take_requeues();
+        self.unsettled.extend(given_up.iter().cloned());
+        self.settle_requeues();
+        for requeue in given_up {
             self.record_requeue(&requeue);
-            self.durably("a requeue", |d| d.requeued(&requeue));
             let Requeue {
                 operation,
                 lease,
@@ -942,6 +950,20 @@ impl State {
                 "lease given up; requeued"
             );
         }
+    }
+
+    /// Writes the given-up leases the state store has not taken, oldest first, and keeps
+    /// the ones it still refuses for the next feed. A grant needs the operation's queue
+    /// row, which only its requeue writes, so a requeue the store missed is made up
+    /// before the grant that follows it, or that grant is refused and the operation
+    /// never runs.
+    fn settle_requeues(&mut self) {
+        let pending = std::mem::take(&mut self.unsettled);
+        let refused: Vec<Requeue> = pending
+            .into_iter()
+            .filter(|requeue| !self.durably("a requeue", |d| d.requeued(requeue)))
+            .collect();
+        self.unsettled = refused;
     }
 
     /// Keeps the callers of `operation`, which has just finished, until the scheduler
