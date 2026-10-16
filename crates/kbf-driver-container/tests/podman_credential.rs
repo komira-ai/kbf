@@ -60,7 +60,7 @@ fn an_action_cannot_read_the_cold_store_key() {
     let key_file: String = KEY
         .map(|(name, value)| format!("{name}={value}\n"))
         .concat();
-    write(&etc.join("s3.env"), &key_file, 0o644);
+    write(&etc.join("s3.env"), &key_file, 0o600);
     write(&etc.join("control"), "readable by any id\n", 0o644);
     let given = etc.join("given");
     write(&given, "the container root's own\n", 0o600);
