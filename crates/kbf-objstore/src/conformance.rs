@@ -3,7 +3,7 @@
 //! [`run`] drives every check against one store under a scratch prefix and returns a
 //! [`Report`]; it never panics on a misbehaving store. It checks the base contract
 //! (round trip, ranged reads at the boundaries, a missing key, idempotent delete, list
-//! paging, a listing that starts after a key or covers the whole bucket, and the footer
+//! paging (also past S3's 1000-key page), a listing that starts after a key or covers the whole bucket, and the footer
 //! reads a rebuild makes) and every claim in [`Capabilities`]: a store claiming conditional writes must
 //! refuse an overwrite, a store claiming Object Lock must refuse deleting a retained
 //! object and keep it readable, and a store not claiming Object Lock must refuse a
@@ -18,7 +18,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use futures::TryStreamExt as _;
+use futures::{StreamExt as _, TryStreamExt as _, stream};
 use kbf_segments::{SegmentWriter, layout::footer_len};
 use kbf_types::Digest;
 
@@ -33,6 +33,10 @@ const LOCK_FOR: Duration = Duration::from_secs(3600);
 /// Objects the list check writes; with pages of [`LIST_PAGE`], the last page is short.
 const LIST_OBJECTS: usize = 7;
 const LIST_PAGE: u16 = 3;
+/// Objects the page-cap check writes: one past S3's largest page.
+const PAST_PAGE_CAP: usize = 1001;
+/// How many of those writes are in flight at once.
+const PAST_PAGE_CAP_PUTS: usize = 16;
 
 /// One check in the suite.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +55,9 @@ pub enum Check {
     /// A listing [`ListToken::after`] a key (present or not) starts at the next key
     /// under the prefix and pages on from there.
     ListStartAfter,
+    /// A listing of one key more than the largest page ([`PageSize::MAX`], S3's 1000)
+    /// in pages of that size returns every key once, in order (so over at least two pages).
+    ListPastPageCap,
     /// A listing under the empty prefix covers the whole bucket, in order, across pages
     /// (started after a key just before this run's own, so the check reads only those).
     ListEmptyPrefix,
@@ -147,6 +154,10 @@ pub async fn run<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Report {
     );
     record(Check::ListPagination, list_pagination(store, prefix).await);
     record(Check::ListStartAfter, list_start_after(store, prefix).await);
+    record(
+        Check::ListPastPageCap,
+        list_past_page_cap(store, prefix).await,
+    );
     record(
         Check::ListEmptyPrefix,
         list_empty_prefix(store, prefix).await,
@@ -390,6 +401,30 @@ async fn list_start_after<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Chec
             "listing {dir:?} after {from}: expected {:?}, got {got:?}",
             &all[3..]
         );
+    }
+    Ok(Outcome::Passed)
+}
+
+async fn list_past_page_cap<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
+    let dir = child(prefix, "many/")?;
+    let mut want = Vec::with_capacity(PAST_PAGE_CAP);
+    for i in 0..PAST_PAGE_CAP {
+        want.push(key(&dir, &format!("m{i:04}"))?);
+    }
+    let body = pattern(1, 5);
+    stream::iter(want.iter().map(|k| put(store, k, &body)))
+        .buffer_unordered(PAST_PAGE_CAP_PUTS)
+        .try_collect::<()>()
+        .await?;
+    let (got, pages) = list_from(store, &dir, None, PageSize::MAX.get(), usize::MAX).await?;
+    let got: Vec<ObjectKey> = got.into_iter().map(|o| o.key).collect();
+    if got != want {
+        let (first, last) = (got.first(), got.last());
+        return Err(format!(
+            "listing {PAST_PAGE_CAP} keys under {dir:?} in pages of {}: got {} keys in {pages} pages, first {first:?}, last {last:?}",
+            PageSize::MAX.get(),
+            got.len()
+        ));
     }
     Ok(Outcome::Passed)
 }
