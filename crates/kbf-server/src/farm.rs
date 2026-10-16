@@ -49,7 +49,8 @@ use kbf_proto::worker::{
 };
 use kbf_sched::fence::START_VALIDITY;
 use kbf_sched::{
-    Cordon, DaemonInstance, Event, FARM_RERUNS, Input, MemoryLadder, OpState, Requeue, Scheduler,
+    Cordon, DaemonInstance, Event, FARM_RERUNS, Input, LOSS_REQUEUES, MemoryLadder, OpState,
+    Requeue, Scheduler,
 };
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, Failure, FarmRun, FarmTime, LeaseGrant, LeaseId,
@@ -210,7 +211,11 @@ struct State {
     /// Until it has, it still holds the lease and no queue row for the operation, so
     /// every one is written again before anything that follows it is
     /// ([`State::log_requeues`]).
-    unsettled: Vec<Requeue>,
+    unsettled: Vec<(Requeue, Option<u32>)>,
+    /// The scheduler was told the state store is unavailable ([`State::watch_store`]).
+    store_down: bool,
+    /// When each node's session row in the state store was last written.
+    renewed: BTreeMap<WorkerId, FarmTime>,
 }
 
 /// What a finished operation tells its callers, and the action-cache entry to write
@@ -245,6 +250,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         let sched = Scheduler::new(term)
             .with_unservable_wait(unservable_wait)
             .with_finished_retention(finished_retention)
+            .with_loss_requeues(LOSS_REQUEUES)
             .recording_requeues();
         Self {
             cache,
@@ -263,6 +269,8 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 recorded: BTreeMap::new(),
                 durable: None,
                 unsettled: Vec::new(),
+                store_down: false,
+                renewed: BTreeMap::new(),
             }),
         }
     }
@@ -364,7 +372,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             let cause = "the daemon restarted, or two daemons hold this node's certificate";
             tracing::warn!(%worker, cause, "another daemon process registered as this node");
         }
-        state.record_session(worker, &instance, stopped, &reported);
+        state.record_session(now, worker, &instance, stopped, &reported);
         let event = Event::WorkerUp {
             worker: worker.clone(),
             instance,
@@ -869,6 +877,7 @@ impl State {
     /// effects in order. Returns the answers, for the caller to deliver once the lock
     /// is released.
     fn feed(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
+        self.watch_store(now);
         let mut effects: VecDeque<Effect> = self.sched.apply(Input::new(now, event)).into();
         effects.extend(self.sched.apply(Input::new(now, Event::Tick)));
         self.log_requeues();
@@ -930,8 +939,7 @@ impl State {
     /// one dropped since is logged with an empty name, never looked up by index.
     fn log_requeues(&mut self) {
         let given_up = self.sched.take_requeues();
-        self.unsettled.extend(given_up.iter().cloned());
-        self.settle_requeues();
+        self.settle_requeues(&given_up);
         for requeue in given_up {
             self.record_requeue(&requeue);
             let Requeue {
@@ -950,20 +958,6 @@ impl State {
                 "lease given up; requeued"
             );
         }
-    }
-
-    /// Writes the given-up leases the state store has not taken, oldest first, and keeps
-    /// the ones it still refuses for the next feed. A grant needs the operation's queue
-    /// row, which only its requeue writes, so a requeue the store missed is made up
-    /// before the grant that follows it, or that grant is refused and the operation
-    /// never runs.
-    fn settle_requeues(&mut self) {
-        let pending = std::mem::take(&mut self.unsettled);
-        let refused: Vec<Requeue> = pending
-            .into_iter()
-            .filter(|requeue| !self.durably("a requeue", |d| d.requeued(requeue)))
-            .collect();
-        self.unsettled = refused;
     }
 
     /// Keeps the callers of `operation`, which has just finished, until the scheduler

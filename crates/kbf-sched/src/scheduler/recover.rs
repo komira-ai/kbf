@@ -66,7 +66,7 @@ impl Scheduler {
                 request,
                 waiter,
                 lease,
-                losses: _,
+                losses,
             } = recovered;
             if request.joinable() {
                 self.in_flight.insert(request.key.clone(), id);
@@ -113,6 +113,7 @@ impl Scheduler {
                     farm_runs: Vec::new(),
                     avoid: std::collections::BTreeSet::new(),
                     not_started: 0,
+                    losses,
                 },
             );
         }

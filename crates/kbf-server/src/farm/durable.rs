@@ -12,7 +12,11 @@
 //!   operation holds the lease. A result is accepted only while it is there, which is the
 //!   compare-and-set on the operation's lease;
 //! - `session/<worker>`: what the scheduler knows of a daemon's newest session (its
-//!   instance, capacity and capabilities);
+//!   instance, capacity and capabilities). It expires unless renewed: one write per
+//!   session per [`SESSION_RENEWAL`], however many leases the daemon holds (a lease row
+//!   is written at the grant and at the end, never to renew it);
+//! - `loss/<operation>`: how many of the operation's leases were lost, while it is
+//!   unfinished and has lost any ([`kbf_sched::LOSS_REQUEUES`] refuses it);
 //! - `meta/epoch`, `meta/next_op`, `meta/next_seq`: the store incarnation and the first
 //!   operation id and lease sequence no earlier start used.
 //!
@@ -20,11 +24,13 @@
 //! `Committed` lease, a `WorkerUp`), so the strict codec the replicated log already runs
 //! decides what a row may hold.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_front::{MetaLog, Stage};
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
+use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{DaemonInstance, Recovered, RecoveredLease, Request, Requeue};
 use kbf_state::{Cond, Conflict, Store, StoreError, Txn, Versioned};
 use kbf_types::{
@@ -42,10 +48,10 @@ use crate::state_store::StateStore;
 /// How often a daemon session's row in the store is renewed while the daemon heartbeats:
 /// a third of the lease grace, so the row outlives two missed renewals. One write per
 /// session per interval, whatever the number of leases it holds.
-pub const SESSION_RENEWAL: Duration =
-    Duration::from_secs(kbf_sched::fence::LEASE_GRACE.as_secs() / 3);
+pub const SESSION_RENEWAL: Duration = Duration::from_secs(LEASE_GRACE.as_secs() / 3);
 
 const EPOCH: &str = "meta/epoch";
+const ALIVE: &str = "meta/alive";
 const NEXT_OP: &str = "meta/next_op";
 const NEXT_SEQ: &str = "meta/next_seq";
 
@@ -107,6 +113,8 @@ pub(super) struct StoredOperation {
     pub request: Request,
     /// The committed lease it holds.
     pub lease: Option<LeaseGrant>,
+    /// How many of its leases were lost.
+    pub losses: u32,
 }
 
 impl StoredOperation {
@@ -120,7 +128,7 @@ impl StoredOperation {
                 lease: grant.lease,
                 worker: grant.worker,
             }),
-            losses: 0,
+            losses: self.losses,
         }
     }
 }
@@ -128,6 +136,9 @@ impl StoredOperation {
 /// The scheduler's handle on its state store.
 pub(super) struct Durable {
     store: Arc<dyn Store>,
+    /// A write failed because the store could not be reached, and none has been taken
+    /// since ([`State::watch_store`] tells the scheduler).
+    pub(super) unreachable: AtomicBool,
 }
 
 impl std::fmt::Debug for Durable {
@@ -142,6 +153,10 @@ fn op_key(operation: OperationId) -> String {
 
 fn queue_key(operation: OperationId) -> String {
     format!("queue/{:016x}", operation.0)
+}
+
+fn loss_key(operation: OperationId) -> String {
+    format!("loss/{:016x}", operation.0)
 }
 
 fn lease_key(lease: LeaseId) -> String {
@@ -174,6 +189,12 @@ fn decode(key: &str, bytes: &[u8]) -> Result<FarmInput, StateError> {
     }
 }
 
+fn parse_operation(key: &str, prefix: &str) -> Result<OperationId, StateError> {
+    let id = u64::from_str_radix(&key[prefix.len()..], 16)
+        .map_err(|_| corrupt(key, "not an operation id"))?;
+    Ok(OperationId(id))
+}
+
 fn number(key: &str, row: &Versioned) -> Result<u64, StateError> {
     let bytes = <[u8; 8]>::try_from(row.value.as_slice())
         .map_err(|_| corrupt(key, "not an 8-byte number"))?;
@@ -198,7 +219,10 @@ impl Durable {
                 (number(EPOCH, row)? + 1, Some(Cond::Version(row.version)))
             }
         };
-        let durable = Self { store };
+        let durable = Self {
+            store,
+            unreachable: AtomicBool::new(false),
+        };
         if let Some(cond) = write {
             durable.commit(Txn::new().put(EPOCH, epoch.to_be_bytes(), cond))?;
         }
@@ -227,20 +251,25 @@ impl Durable {
             };
             leases.insert(grant.operation, grant);
         }
+        let mut losses = std::collections::BTreeMap::new();
+        for (key, row) in self.store.scan_prefix("loss/")? {
+            let operation = parse_operation(&key, "loss/")?;
+            let count = u32::try_from(number(&key, &row)?)
+                .map_err(|_| corrupt(&key, "not a loss count"))?;
+            losses.insert(operation, count);
+        }
         let mut operations = Vec::new();
         for (key, row) in self.store.scan_prefix("op/")? {
             let FarmInput::Submit(request) = decode(&key, &row.value)? else {
                 return Err(corrupt(&key, "not a request"));
             };
-            let operation = OperationId(
-                u64::from_str_radix(&key["op/".len()..], 16)
-                    .map_err(|_| corrupt(&key, "not an operation id"))?,
-            );
+            let operation = parse_operation(&key, "op/")?;
             let lease = leases.remove(&operation);
             operations.push(StoredOperation {
                 operation,
                 request,
                 lease,
+                losses: losses.remove(&operation).unwrap_or(0),
             });
         }
         Ok(Stored {
@@ -292,7 +321,14 @@ impl Durable {
     /// the farm writes a give-up the store refused again until the store takes it, so
     /// the lease row may be gone already, and the queue row may be there. An operation
     /// that has finished has nothing to put back.
-    pub(super) fn requeued(&self, requeue: &Requeue) -> Result<(), StateError> {
+    ///
+    /// `losses` is the operation's count of lost leases, to write down if the give-up is
+    /// one ([`kbf_sched::RequeueReason::is_loss`]).
+    pub(super) fn requeued(
+        &self,
+        requeue: &Requeue,
+        losses: Option<u32>,
+    ) -> Result<(), StateError> {
         if self.store.get(&op_key(requeue.operation))?.is_none() {
             return Ok(());
         }
@@ -300,6 +336,10 @@ impl Durable {
         let mut txn = Txn::new();
         if let Some(row) = self.store.get(&key)? {
             txn = txn.delete(key, Cond::Version(row.version));
+        }
+        if let Some(count) = losses {
+            let count = u64::from(count).to_be_bytes();
+            txn = txn.put(loss_key(requeue.operation), count, Cond::Any);
         }
         self.commit(txn.put(queue_key(requeue.operation), Vec::new(), Cond::Any))
     }
@@ -314,7 +354,8 @@ impl Durable {
             Txn::new()
                 .delete(key, Cond::Version(row.version))
                 .delete(op_key(operation), Cond::Any)
-                .delete(queue_key(operation), Cond::Any),
+                .delete(queue_key(operation), Cond::Any)
+                .delete(loss_key(operation), Cond::Any),
         )
     }
 
@@ -323,7 +364,8 @@ impl Durable {
         self.commit(
             Txn::new()
                 .delete(op_key(operation), Cond::Any)
-                .delete(queue_key(operation), Cond::Any),
+                .delete(queue_key(operation), Cond::Any)
+                .delete(loss_key(operation), Cond::Any),
         )
     }
 
@@ -358,7 +400,25 @@ impl Durable {
             caps: reported.caps.clone(),
         };
         let value = encode(up)?;
-        self.commit(Txn::new().put(format!("session/{worker}"), value, Cond::Any))
+        let key = format!("session/{worker}");
+        self.commit(Txn::new().put_ttl(key, value, LEASE_GRACE, Cond::Any))
+    }
+
+    /// Extends `worker`'s session row by the lease grace, from the store's clock. A
+    /// daemon with no row (its registration was not written, or the row expired) is left
+    /// for its next registration to write.
+    pub(super) fn renew(&self, worker: &WorkerId) -> Result<(), StateError> {
+        let key = format!("session/{worker}");
+        let Some(row) = self.store.get(&key)? else {
+            return Ok(());
+        };
+        let renewed = Txn::new().put_ttl(key, row.value, LEASE_GRACE, Cond::Version(row.version));
+        self.commit(renewed)
+    }
+
+    /// A write that tells whether the store takes writes again.
+    pub(super) fn ping(&self) -> Result<(), StateError> {
+        self.commit(Txn::new().put(ALIVE, Vec::new(), Cond::Any))
     }
 }
 
@@ -400,8 +460,74 @@ impl State {
             Ok(()) => true,
             Err(error) => {
                 tracing::error!(%error, "the state store did not take {what}");
+                // Only a store that cannot be reached is an outage: a write that lost a
+                // compare-and-set, or found its row gone, is the store working.
+                if matches!(error, StateError::Store(_)) {
+                    durable.unreachable.store(true, Ordering::SeqCst);
+                }
                 false
             }
+        }
+    }
+
+    /// Tells the scheduler when the state store went away and when it came back (see
+    /// [`kbf_sched::Scheduler::store_unavailable`]). A write that could not reach it
+    /// raises the flag; while it is raised each feed tries one write, and the first that
+    /// takes ends the outage. Called at the start of every feed, so no lease is judged
+    /// expired by a tick that comes before the farm knows the store is back.
+    pub(super) fn watch_store(&mut self, now: FarmTime) {
+        let Some(durable) = &self.durable else {
+            return;
+        };
+        if durable.unreachable.load(Ordering::SeqCst) && !self.store_down {
+            tracing::warn!("the state store is unavailable: no lease is given up or granted");
+            self.store_down = true;
+            self.sched.store_unavailable();
+        }
+        if self.store_down && durable.ping().is_ok() {
+            tracing::info!("the state store is back: expiry waits for the lease grace");
+            durable.unreachable.store(false, Ordering::SeqCst);
+            self.store_down = false;
+            self.sched.store_available(now);
+        }
+    }
+
+    /// Writes the leases the scheduler has just given up, after the ones the state store
+    /// has not taken, oldest first, and keeps the ones it still refuses for the next
+    /// feed. A grant needs the operation's queue row, which only its requeue writes, so
+    /// a requeue the store missed is made up before the grant that follows it, or that
+    /// grant is refused and the operation never runs.
+    pub(super) fn settle_requeues(&mut self, given_up: &[Requeue]) {
+        for requeue in given_up {
+            let losses = if requeue.reason.is_loss() {
+                self.sched.losses(requeue.operation)
+            } else {
+                None
+            };
+            self.unsettled.push((requeue.clone(), losses));
+        }
+        let pending = std::mem::take(&mut self.unsettled);
+        let refused: Vec<(Requeue, Option<u32>)> = pending
+            .into_iter()
+            .filter(|(requeue, losses)| {
+                !self.durably("a requeue", |d| d.requeued(requeue, *losses))
+            })
+            .collect();
+        self.unsettled = refused;
+    }
+
+    /// Renews `worker`'s session row if its last write is a renewal interval old: one
+    /// write per daemon session, never one per lease. Called for a heartbeat taken.
+    pub(super) fn renew_session(&mut self, now: FarmTime, worker: &WorkerId) {
+        if self.durable.is_none() {
+            return;
+        }
+        let due = self
+            .renewed
+            .get(worker)
+            .is_none_or(|at| now >= at.saturating_add(SESSION_RENEWAL));
+        if due && self.durably("a session renewal", |d| d.renew(worker)) {
+            self.renewed.insert(worker.clone(), now);
         }
     }
 
@@ -469,7 +595,8 @@ impl State {
     /// Writes the session row of a daemon that registered. Not generic, unlike
     /// `Farm::register`.
     pub(super) fn record_session(
-        &self,
+        &mut self,
+        now: FarmTime,
         worker: &WorkerId,
         instance: &DaemonInstance,
         predecessor_stopped: bool,
@@ -478,6 +605,7 @@ impl State {
         self.durably("a session", |d| {
             d.session(worker, instance, predecessor_stopped, reported)
         });
+        self.renewed.insert(worker.clone(), now);
     }
 }
 

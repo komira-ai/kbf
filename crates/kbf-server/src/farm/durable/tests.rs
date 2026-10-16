@@ -175,6 +175,7 @@ fn a_submitted_operation_is_loaded_queued() {
                 operation: OperationId(4),
                 request: request(1),
                 lease: None,
+                losses: 0,
             }],
         }
     );
@@ -239,7 +240,7 @@ fn a_stale_complete_is_rejected() {
     durable
         .persist(&[Effect::Start(start(4, 0))])
         .expect("first grant");
-    durable.requeued(&requeue(4, 0)).expect("given up");
+    durable.requeued(&requeue(4, 0), None).expect("given up");
     durable
         .persist(&[Effect::Start(start(4, 1))])
         .expect("second grant");
@@ -283,12 +284,12 @@ fn a_given_up_lease_requeues_its_operation_once() {
     durable
         .persist(&[Effect::Start(start(4, 0))])
         .expect("grant");
-    durable.requeued(&requeue(4, 0)).expect("given up");
+    durable.requeued(&requeue(4, 0), None).expect("given up");
     let stored = durable.load().expect("load");
     assert_eq!(stored.operations[0].lease, None);
     assert!(keys(&store).contains(&"queue/0000000000000004".to_owned()));
     durable
-        .requeued(&requeue(4, 0))
+        .requeued(&requeue(4, 0), None)
         .expect("again, nothing changes");
     let again = durable.load().expect("load");
     assert_eq!(again, stored);
@@ -300,7 +301,7 @@ fn a_given_up_lease_requeues_its_operation_once() {
         })])
         .expect("refused");
     durable
-        .requeued(&requeue(4, 0))
+        .requeued(&requeue(4, 0), None)
         .expect("a finished operation has nothing to put back");
     assert!(!keys(&store).iter().any(|k| k.starts_with("queue/")));
 }
@@ -340,6 +341,96 @@ fn a_refusal_removes_the_operation_and_other_effects_write_nothing() {
         .expect("refused");
     assert!(durable.load().expect("load").operations.is_empty());
     assert_eq!(keys(&store), ["meta/epoch", "meta/next_op"]);
+}
+
+/// Catches: a loss count that is not written with the give-up that made it (a restart
+/// forgets the losses and a poison action loops), one that a later give-up that is not a
+/// loss erases, and one that outlives its operation (a row nobody removes).
+#[test]
+fn a_loss_count_lives_with_its_operation() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .submitted(OperationId(4), &request(1))
+        .expect("submit");
+    durable
+        .persist(&[Effect::Start(start(4, 0))])
+        .expect("grant");
+    durable
+        .requeued(&requeue(4, 0), Some(2))
+        .expect("a lost lease");
+    assert_eq!(durable.load().expect("load").operations[0].losses, 2);
+    durable
+        .persist(&[Effect::Start(start(4, 1))])
+        .expect("grant");
+    durable
+        .requeued(&requeue(4, 1), None)
+        .expect("not a lost lease");
+    assert_eq!(durable.load().expect("load").operations[0].losses, 2);
+    durable
+        .persist(&[Effect::Start(start(4, 2))])
+        .expect("grant");
+    durable
+        .persist(&[Effect::Answer(answer(4, 2))])
+        .expect("finished");
+    assert!(!keys(&store).iter().any(|k| k.starts_with("loss/")));
+}
+
+/// Catches: a refused operation whose loss count stays (a row nobody removes).
+#[test]
+fn a_refusal_removes_the_loss_count() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .submitted(OperationId(4), &request(1))
+        .expect("submit");
+    durable
+        .persist(&[Effect::Start(start(4, 0))])
+        .expect("grant");
+    durable
+        .requeued(&requeue(4, 0), Some(3))
+        .expect("a lost lease");
+    let refusal = Refusal {
+        operation: OperationId(4),
+        waiters: Vec::new(),
+        reason: "lost".to_owned(),
+    };
+    durable
+        .persist(&[Effect::Refuse(refusal)])
+        .expect("refused");
+    assert!(!keys(&store).iter().any(|k| k.starts_with("loss/")));
+}
+
+/// Catches: a session row that never expires (a daemon that left would look live for
+/// ever), a renewal that does not extend it, one that writes a row for a daemon with
+/// none, and a probe write that does not reach the store.
+#[test]
+fn a_session_row_expires_unless_renewed() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")]).expect("caps");
+    let reported = Reported::serving(Resources::new(2_000, 1 << 30), caps);
+    let worker = WorkerId::new("node-a");
+    let before = store.commit_stats().txns;
+    durable.renew(&worker).expect("no row, nothing to renew");
+    assert_eq!(store.commit_stats().txns, before);
+
+    durable
+        .session(&worker, &DaemonInstance::new("daemon-1"), false, &reported)
+        .expect("session");
+    let first = store.get("session/node-a").expect("get").expect("a row");
+    assert!(first.expires_at.is_some());
+    durable.renew(&worker).expect("renewed");
+    let second = store.get("session/node-a").expect("get").expect("a row");
+    assert_eq!(second.value, first.value);
+    assert!(second.version > first.version);
+    assert!(second.expires_at > first.expires_at);
+
+    store.set_down(true);
+    assert!(matches!(durable.ping(), Err(StateError::Store(_))));
+    store.set_down(false);
+    durable.ping().expect("up again");
+    assert!(store.get("meta/alive").expect("get").is_some());
 }
 
 /// Catches: a registration that leaves no session row, or one a start could not read
@@ -395,7 +486,8 @@ fn an_unreadable_row_is_refused_naming_it() {
         inputs: vec![FarmInput::Tick, FarmInput::Tick],
     });
     let pair = kbf_log::encode(Format::V1, &pair).expect("encode");
-    let rows: [(&str, Vec<u8>, &str); 8] = [
+    let big = u64::MAX.to_be_bytes().to_vec();
+    let rows: [(&str, Vec<u8>, &str); 11] = [
         ("op/0000000000000001", vec![0xff, 0xff, 0xff], "malformed"),
         ("op/0000000000000001", lease.clone(), "not a request"),
         ("op/0000000000000001", other, "not a single scheduler input"),
@@ -406,6 +498,9 @@ fn an_unreadable_row_is_refused_naming_it() {
             submit,
             "not a lease grant",
         ),
+        ("loss/zz", vec![0; 8], "not an operation id"),
+        ("loss/0000000000000001", vec![1, 2], "not an 8-byte number"),
+        ("loss/0000000000000001", big, "not a loss count"),
         ("meta/next_op", vec![1, 2, 3], "not an 8-byte number"),
         ("meta/next_seq", vec![1, 2, 3], "not an 8-byte number"),
     ];

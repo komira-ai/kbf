@@ -72,7 +72,10 @@ impl RequeueReason {
     /// budgets of their own.
     #[must_use]
     pub const fn is_loss(&self) -> bool {
-        false
+        matches!(
+            self,
+            Self::Silent | Self::Replaced | Self::Reconnected | Self::Restarted
+        )
     }
 }
 

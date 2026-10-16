@@ -19,7 +19,13 @@ impl Scheduler {
     /// A lease whose `Start` was sent is charged to the operation's farm budget as a run
     /// lost to silence ([`Scheduler::unproven`]). Returns the result proposed for one
     /// past the budget, which ends the operation once committed.
+    ///
+    /// Gives up nothing while the state store is down or has not been back for the grace
+    /// ([`Scheduler::store_available`]).
     pub(super) fn expire(&mut self) -> Vec<Effect> {
+        if self.settling() {
+            return Vec::new();
+        }
         let now = self.now;
         let expired: Vec<(OperationId, LeaseId, WorkerId, RequeueReason)> = self
             .held
@@ -67,8 +73,12 @@ impl Scheduler {
     /// lease whose result was reported is kept: that result is on its way to the log.
     /// A lease lost to a restart, or replaced, is charged to the operation's farm budget
     /// ([`Scheduler::farm_fault`]). Returns the result proposed for one past it, which
-    /// ends the operation once committed.
+    /// ends the operation once committed. Gives up nothing while the state store is down or
+    /// has not been back for the grace ([`Scheduler::store_available`]).
     pub(super) fn reconcile(&mut self, worker: &WorkerId, running: &[LeaseId]) -> Vec<Effect> {
+        if self.settling() {
+            return Vec::new();
+        }
         let (session, process, handover_ends, stopped) = self
             .workers
             .get(worker)

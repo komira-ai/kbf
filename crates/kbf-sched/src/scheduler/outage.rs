@@ -1,18 +1,37 @@
-//! The state store's outage as the scheduler is told of it: expiry and placement wait
-//! while it is down, and expiry timers restart with a grace window when it returns.
+//! The state store's outage as the scheduler is told of it: nothing is given up or
+//! placed while it is down, and expiry timers restart with a grace window when it
+//! returns.
+//!
+//! The scheduler keeps its leases' deadlines in memory, judged by the farm's clock. An
+//! outage keeps the farm from hearing its workers (its writes wait on the store), so
+//! when the store returns every worker looks silent and every lease expired. Without the
+//! window the first tick would requeue all running work at once.
 
 use kbf_types::FarmTime;
 
 use super::Scheduler;
+use crate::fence::LEASE_GRACE;
 
 impl Scheduler {
     /// The state store refused a write: nothing is given up or placed until
     /// [`Scheduler::store_available`], because neither could be written down.
-    pub fn store_unavailable(&mut self) {}
+    pub const fn store_unavailable(&mut self) {
+        self.store_down = true;
+    }
 
     /// The state store took a write again at `now`. Every expiry timer restarts: for
-    /// [`crate::fence::LEASE_GRACE`] after `now` no lease is given up for silence or
-    /// for being left out of a heartbeat, so an outage that kept the scheduler from
-    /// hearing its workers does not requeue all running work at once.
-    pub fn store_available(&mut self, _now: FarmTime) {}
+    /// [`LEASE_GRACE`] after `now` no lease is given up for silence or for being left out
+    /// of a heartbeat, so an outage that kept the scheduler from hearing its workers does
+    /// not requeue all running work at once. A worker that is not heard from by then has
+    /// its leases given up as a silent worker's are.
+    pub fn store_available(&mut self, now: FarmTime) {
+        self.store_down = false;
+        self.grace_until = now.saturating_add(LEASE_GRACE);
+    }
+
+    /// Whether giving a lease up waits: the store is down, or has not been back for the
+    /// grace.
+    pub(super) fn settling(&self) -> bool {
+        self.store_down || self.now < self.grace_until
+    }
 }

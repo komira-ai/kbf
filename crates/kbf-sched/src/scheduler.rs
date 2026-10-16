@@ -82,6 +82,9 @@ struct Operation {
     avoid: BTreeSet<WorkerId>,
     /// Its leases given up as not started ([`memory::NOT_STARTED_RERUNS`]).
     not_started: u32,
+    /// Its leases lost ([`RequeueReason::is_loss`]), counted toward the cap
+    /// ([`Scheduler::with_loss_requeues`]).
+    losses: u32,
 }
 
 /// A queued operation no live worker can run: since when, why, and whether the wait
@@ -266,6 +269,14 @@ pub struct Scheduler {
     /// Workers a recovered scheduler holds leases for that have not registered yet, and
     /// until when they may take to ([`Scheduler::recover`]).
     awaited: BTreeMap<WorkerId, FarmTime>,
+    /// The state store refused a write and has not taken one since
+    /// ([`Scheduler::store_unavailable`]).
+    store_down: bool,
+    /// Until when no lease is given up, after the store returned
+    /// ([`Scheduler::store_available`]).
+    grace_until: FarmTime,
+    /// How many lost leases refuse an operation ([`Scheduler::with_loss_requeues`]).
+    loss_cap: u32,
 }
 
 impl Scheduler {
@@ -291,6 +302,9 @@ impl Scheduler {
             memory: Box::default(),
             ladder: MemoryLadder::default(),
             awaited: BTreeMap::new(),
+            store_down: false,
+            grace_until: FarmTime::default(),
+            loss_cap: u32::MAX,
         }
     }
 
@@ -397,6 +411,7 @@ impl Scheduler {
                 unservable: None,
                 farm_runs: Vec::new(),
                 not_started: 0,
+                losses: 0,
                 avoid: BTreeSet::new(),
             },
         );
@@ -436,6 +451,7 @@ impl Scheduler {
                 worker: worker.clone(),
                 reason,
             });
+        let lost = given_up.is_some() && reason.is_loss();
         if let Some(log) = &mut self.requeues {
             log.extend(given_up);
         }
@@ -444,6 +460,7 @@ impl Scheduler {
             .ops
             .get_mut(&id)
             .expect("held leases name live operations");
+        op.losses += u32::from(lost);
         op.state = OpState::Queued;
         self.queue.insert((Reverse(op.request.qos.clone()), id));
     }
@@ -469,6 +486,11 @@ impl Scheduler {
     /// refused once it has waited so for the unservable wait. Its refusal is committed
     /// first and leaves the queue at once, so nothing places it meanwhile.
     fn place(&mut self, effects: &mut Vec<Effect>) {
+        // A grant the store cannot take is useless, and a refusal as much.
+        if self.store_down {
+            return;
+        }
+        self.refuse_lost(effects);
         let now = self.now;
         let mut servable = Servable::new(&self.workers, &self.cordons, now);
         let mut placed = Vec::new();

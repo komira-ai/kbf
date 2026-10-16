@@ -141,11 +141,12 @@ impl Scheduler {
         })
     }
 
-    /// How many of `operation`'s leases were lost so far, if the scheduler holds it and
-    /// counts them ([`Scheduler::with_loss_requeues`]).
+    /// How many of `operation`'s leases were lost so far ([`RequeueReason::is_loss`]);
+    /// `None` once the scheduler no longer holds it.
+    ///
+    /// [`RequeueReason::is_loss`]: crate::RequeueReason::is_loss
     #[must_use]
     pub fn losses(&self, operation: OperationId) -> Option<u32> {
-        let _ = operation;
-        None
+        self.ops.get(&operation).map(|op| op.losses)
     }
 }
