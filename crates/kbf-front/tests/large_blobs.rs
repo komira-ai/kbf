@@ -25,14 +25,15 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use kbf_front::{
-    Cache, Connections, MAX_UNSTAGED_BLOB_BYTES, MemoryMetaLog, READ_CHUNK_BYTES, SegmentsConfig,
-    SegmentsService,
+    ByteStreamService, Cache, Connections, MAX_UNSTAGED_BLOB_BYTES, MemoryMetaLog,
+    READ_CHUNK_BYTES, SegmentsConfig, SegmentsService,
 };
 use kbf_meta::{Retention, ServerId};
 use kbf_objstore::s3::fake::FakeS3;
 use kbf_objstore::s3::{PART_BYTES, S3Store};
 use kbf_objstore::{Capabilities, KeyPrefix};
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
+use kbf_proto::google::bytestream::byte_stream_server::ByteStream as _;
 use kbf_proto::google::bytestream::{ReadRequest, WriteRequest};
 use kbf_proto::worker::segments_server::Segments as _;
 use kbf_proto::worker::{BeginRequest, UploadSegment};
@@ -671,4 +672,44 @@ async fn without_room_on_a_tier_an_output_over_16_mib_is_stored() {
         assert_eq!(bytestream_read(&mut client, &digest).await, (len, true));
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// The most bytes one ByteStream Read may hold live at once: one window
+/// (`READ_WINDOW_BYTES`, 8 MiB), one message (`READ_CHUNK_BYTES`, 1 MiB) and room for
+/// the rest. A window copied into its messages all at once (16 MiB) is past it.
+const ONE_READ_BOUND: usize = 12 << 20;
+
+/// Catches a ByteStream Read that cuts a whole window into its messages at once (a
+/// window and a copy of it, 16 MiB, per open Read): a Read of a 64 MiB blob from the
+/// tier, its messages taken one at a time from the service itself (no transport
+/// buffering), holds at most [`ONE_READ_BOUND`] at once, and its bytes come whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bytestream_read_holds_one_window_and_one_message() {
+    let _alone = ALONE.lock().await;
+    let s3 = FakeS3::start().await;
+    let dir = scratch("read-lazy");
+    let cache = cache(&s3, &dir, 1 << 30).await;
+    let len = 64 * MIB;
+    let digest = stage_zeros(&cache, len).await;
+    let service = ByteStreamService::new(Arc::clone(&cache));
+    let request = tonic::Request::new(ReadRequest {
+        resource_name: format!("main/blobs/{}/{}", digest.hash_hex(), digest.size_bytes),
+        read_offset: 0,
+        read_limit: 0,
+    });
+    let (got, peak) = peak_during(async {
+        let mut messages = service.read(request).await.expect("read").into_inner();
+        let mut got = 0u64;
+        while let Some(message) = messages.next().await {
+            let message = message.expect("a message");
+            assert!(message.data.len() <= READ_CHUNK_BYTES);
+            got += message.data.len() as u64;
+        }
+        got
+    })
+    .await;
+    println!("a {len}-byte ByteStream Read, message by message: {peak} bytes live at once");
+    assert_eq!(got, len);
+    assert!(peak < ONE_READ_BOUND, "{peak} bytes live at once");
+    let _ = std::fs::remove_dir_all(&dir);
 }
