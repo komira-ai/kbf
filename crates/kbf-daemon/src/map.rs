@@ -8,11 +8,14 @@
 //! frontend that sends such a map has a bug a farm of daemons should not each fail on.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use futures::future::BoxFuture;
 use kbf_map::Map;
 use kbf_mapsync::MapHolder;
 use kbf_proto::kbf::map::v1 as wire;
 use kbf_proto::worker::MapRequest;
+use kbf_route::{MapView, RefetchError};
 use tokio::sync::watch;
 
 /// The daemon's end of the map: where pushed maps go, and what the holder asks for.
@@ -60,4 +63,63 @@ impl MapLink {
 /// arm).
 pub(crate) async fn map_asked(link: Option<&mut MapLink>) -> Option<()> {
     link?.asked().await
+}
+
+/// How long a call that found itself behind waits for the frontend's answer to its
+/// `MapRequest`: a bound against a frontend that never answers, not a schedule.
+pub const REFETCH_WITHIN: Duration = Duration::from_secs(10);
+
+/// The daemon's map holder as the routing library's map source: the seam between the
+/// two `MapSource` traits (`kbf_mapsync`'s is the frontend's end, which holds a map and
+/// announces changes; `kbf_route`'s is a client's, which asks for the map to route by and
+/// for a newer one).
+///
+/// `current` is what the session pushed. `refetch` is [`MapHolder::reach`]: it records the
+/// generation as wanted, which the session turns into a `MapRequest`
+/// ([`MapLink::request`]), and waits for a map that new, so a push that was lost costs a
+/// round trip and no more.
+pub struct HeldMaps {
+    holder: Arc<MapHolder>,
+    within: Duration,
+}
+
+impl HeldMaps {
+    /// The holder's maps, a refetch waiting at most `within`.
+    #[must_use]
+    pub fn new(holder: Arc<MapHolder>, within: Duration) -> Self {
+        Self { holder, within }
+    }
+
+    /// `map` with the generation it replaced, if the holder still has it. The holder is
+    /// read twice and may move between the reads: a previous map that is not older than
+    /// `map` is the same map, and is left out.
+    fn view(&self, map: Arc<Map>) -> MapView {
+        let previous = self
+            .holder
+            .previous()
+            .filter(|previous| previous.generation() < map.generation());
+        MapView { map, previous }
+    }
+}
+
+impl kbf_route::MapSource for HeldMaps {
+    fn current(&self) -> Option<MapView> {
+        self.holder.current().map(|map| self.view(map))
+    }
+
+    fn refetch(&self, at_least: u64) -> BoxFuture<'_, Result<MapView, RefetchError>> {
+        Box::pin(async move {
+            let reached = tokio::time::timeout(self.within, self.holder.reach(at_least)).await;
+            match reached {
+                Ok(map) => Ok(self.view(map)),
+                Err(_) => Err(RefetchError {
+                    at_least,
+                    reason: format!(
+                        "the frontend sent no map of that generation within {:?}",
+                        self.within
+                    ),
+                }),
+            }
+        })
+    }
 }

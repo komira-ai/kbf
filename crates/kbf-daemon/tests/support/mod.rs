@@ -7,6 +7,7 @@
 
 pub mod cache_kit;
 pub mod memory;
+pub mod storage_node;
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;

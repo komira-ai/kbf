@@ -1456,6 +1456,7 @@ dependencies = [
 name = "kbf-daemon"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "crc32fast",
  "futures",
@@ -1465,8 +1466,10 @@ dependencies = [
  "kbf-front",
  "kbf-map",
  "kbf-mapsync",
+ "kbf-meta",
  "kbf-objstore",
  "kbf-proto",
+ "kbf-route",
  "kbf-server",
  "kbf-storage",
  "kbf-testkit",
