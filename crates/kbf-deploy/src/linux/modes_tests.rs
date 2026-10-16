@@ -170,8 +170,8 @@ fn each_planted_defect_turns_its_rule_red() {
         ),
         (
             Mode::Storage,
-            "/kbf storage\n",
-            "/kbf storage-and-daemon\n",
+            "/kbf storage \\\n",
+            "/kbf storage-and-daemon \\\n",
             "FAIL exec: kbf-storage.service starts '/usr/local/bin/kbf storage-and-daemon', want '/usr/local/bin/kbf storage ...'",
         ),
         (

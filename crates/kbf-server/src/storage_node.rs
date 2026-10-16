@@ -9,8 +9,9 @@
 //! the segment uploads: [`ALLOWED`] and the thread flags), and its own for where it
 //! listens: `--storage-listen`, and `--storage-tls-cert`, `--storage-tls-key` and
 //! `--storage-client-ca`, which together turn on mutual TLS and with it the check of the
-//! role in each caller's certificate. Without them the node serves plain text, for
-//! tests and trials on one machine; the start line warns about a listener off loopback.
+//! role in each caller's certificate. Without them the node serves plain text, which
+//! admits every call, so it is only for tests and trials on one machine: a plain-text
+//! listener off loopback (a wildcard address included) is a start the node refuses.
 //!
 //! Every other flag of `kbf-server` is refused by name ([`parse`]), computed from
 //! [`Args`]: a flag added there that is not listed in [`ALLOWED`] is refused here with
@@ -125,7 +126,10 @@ pub fn command() -> Command {
             .value_name("ADDR")
             .default_value("127.0.0.1:8982")
             .value_parser(clap::value_parser!(SocketAddr))
-            .help("Where the node serves gRPC (plain text unless the TLS flags are given)."),
+            .help(
+                "Where the node serves gRPC. Without the TLS flags it serves plain text, and \
+                 the address must be loopback.",
+            ),
     )
     .arg(path(
         TLS[0],
@@ -188,7 +192,9 @@ impl StorageFlags {
     ///
     /// # Errors
     /// A TLS file cannot be read; `--segment-upload-max-bytes` is over
-    /// `--write-bytes-in-flight`.
+    /// `--write-bytes-in-flight`; there is no TLS and `--storage-listen` is not a
+    /// loopback address ([`ConfigError::PlaintextStorageOffLoopback`]: plain text admits
+    /// every call, so it is for one machine only).
     pub fn listener(&self) -> Result<StorageListener, ConfigError> {
         self.server.segment_upload_fits_write_bound()?;
         let tls = match &self.tls {
@@ -200,7 +206,10 @@ impl StorageFlags {
                     ))
                     .client_ca_root(Certificate::from_pem(crate::config::read(ca)?)),
             ),
-            None => None,
+            None if crate::config::loopback_only(self.listen.ip()) => None,
+            None => {
+                return Err(ConfigError::PlaintextStorageOffLoopback { addr: self.listen });
+            }
         };
         Ok(StorageListener {
             listen: self.listen,
@@ -234,8 +243,7 @@ pub struct StorageHandle {
 
 impl StorageHandle {
     /// The line the node prints once it is bound:
-    /// `kbf-storage <version> storage=<addr> log=<id>`, and ` warning=plaintext-off-loopback`
-    /// when it serves plain text on an address that is not loopback.
+    /// `kbf-storage <version> storage=<addr> log=<id>`.
     #[must_use]
     pub fn start_line(&self) -> &str {
         &self.start_line
@@ -261,7 +269,8 @@ impl StorageHandle {
 /// the storage listener over the cache.
 ///
 /// # Errors
-/// A flag the node refuses, a store or log that cannot be opened, a listener that
+/// A flag the node refuses (the listener is checked first, before anything is opened:
+/// [`StorageFlags::listener`]), a store or log that cannot be opened, a listener that
 /// cannot be bound, a write tier that refuses to start, or a `shutdown` that fails.
 pub async fn start_storage<S, F>(
     flags: &StorageFlags,
@@ -271,6 +280,7 @@ where
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
+    let listener = flags.listener()?;
     let stores = flags.server.stores(&Statvfs)?;
     for line in stores.describe() {
         tracing::info!("{line}");
@@ -279,11 +289,27 @@ where
         StoreUri::File(dir) => {
             let store = open_cold_file(&flags.server, dir)?;
             let files = Some(store.clone());
-            over(flags, &stores, (store, files), FILE_PREFIX_ROOT, shutdown).await
+            over(
+                flags,
+                listener,
+                &stores,
+                (store, files),
+                FILE_PREFIX_ROOT,
+                shutdown,
+            )
+            .await
         }
         StoreUri::S3(uri) => {
             let store = s3_store(uri, |name| std::env::var(name).ok())?;
-            over(flags, &stores, (store, None), &uri.prefix, shutdown).await
+            over(
+                flags,
+                listener,
+                &stores,
+                (store, None),
+                &uri.prefix,
+                shutdown,
+            )
+            .await
         }
     }
 }
@@ -291,6 +317,7 @@ where
 /// [`start_storage`] over the object store the cold store's URI named.
 async fn over<O, S, F>(
     flags: &StorageFlags,
+    listener: StorageListener,
     stores: &Stores,
     (store, files): (O, Option<kbf_objstore::FsStore>),
     prefix_root: &str,
@@ -308,6 +335,7 @@ where
     let pass = files.map(|files| StartPass::over_raft(files, grace));
     assemble(
         flags,
+        listener,
         stores.hot.as_ref(),
         (meta, store, prefix, log),
         shutdown,
@@ -319,6 +347,7 @@ where
 /// The cache, its write tier, flusher and pass, and the listener over them.
 async fn assemble<O, S, F>(
     flags: &StorageFlags,
+    listener: StorageListener,
     hot: Option<&Hot>,
     (meta, store, prefix, log): (RaftMetaLog<StdFs>, O, KeyPrefix, FarmLogId),
     shutdown: S,
@@ -329,8 +358,6 @@ where
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
-    let listener = flags.listener()?;
-    let plain = listener.tls.is_none() && !crate::config::loopback_only(listener.listen.ip());
     let cache = Cache::open(meta, store, prefix)
         .await?
         .with_writes(flags.server.write_config());
@@ -343,15 +370,10 @@ where
     let _pass = pass.map(|pass| AbortOnDrop(crate::startup_pass::spawn(Arc::clone(&cache), pass)));
     let storage = Arc::new(CacheStorage::new(cache, flags.segments()));
     let bound = bind_storage(storage, listener, shutdown()?)?;
-    let warning = if plain {
-        " warning=plaintext-off-loopback"
-    } else {
-        ""
-    };
     Ok(StorageHandle {
         addr: bound.addr,
         start_line: format!(
-            "kbf-storage {SERVER_VERSION} storage={} log={log}{warning}",
+            "kbf-storage {SERVER_VERSION} storage={} log={log}",
             bound.addr
         ),
         serving: Box::pin(bound.serving),

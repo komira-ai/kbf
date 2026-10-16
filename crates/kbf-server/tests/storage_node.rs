@@ -44,9 +44,10 @@ fn never() -> std::io::Result<std::future::Pending<()>> {
 }
 
 /// Catches a start line that lacks what a supervisor reads (the version, the address it
-/// bound, the log id), or a plain-text listener off loopback that does not say so.
+/// bound, the log id), or one that carries a warning: a plain-text listener off loopback
+/// is refused now, so no start line has one.
 #[tokio::test]
-async fn the_start_line_names_the_address_and_warns_off_loopback() {
+async fn the_start_line_names_the_address_and_the_log() {
     let local = flags(&dir("line-local"), &[]).expect("flags");
     let node = start_storage(&local, never).await.expect("starts");
     let line = node.start_line().to_owned();
@@ -59,19 +60,45 @@ async fn the_start_line_names_the_address_and_warns_off_loopback() {
         line.starts_with(&want) && !line.contains("warning"),
         "{line}"
     );
-    drop(node);
-    let wide = flags(
-        &dir("line-wide"),
-        &["--storage-listen=0.0.0.0:0".to_owned()],
-    )
-    .expect("flags");
-    let node = start_storage(&wide, never).await.expect("starts");
-    assert!(
-        node.start_line()
-            .ends_with(" warning=plaintext-off-loopback"),
-        "{}",
-        node.start_line()
-    );
+}
+
+/// Catches a plain-text listener that is allowed off loopback (it admits Write and
+/// ActionCommit from anyone), and a refusal that comes late or is not one line: every
+/// address that is not loopback (a wildcard, IPv4 and IPv6, a LAN address, the IPv6
+/// forms) is refused by `listener()` and by `start_storage` before any store is opened
+/// (the meta directory is never created), with the address and the three flags in the
+/// message; and the same addresses start with the TLS flags, and loopback starts
+/// without them (IPv4, IPv6, and IPv4-mapped).
+#[tokio::test]
+async fn plain_text_is_for_loopback_only() {
+    let d = dir(&format!("plain-off-loopback-{}", std::process::id()));
+    for addr in ["0.0.0.0:0", "[::]:0", "192.0.2.10:0", "[2001:db8::1]:0"] {
+        let f = flags(&d, &[format!("--storage-listen={addr}")]).expect("parses");
+        let refused = f.listener().expect_err(addr);
+        let said = refused.to_string();
+        assert!(!said.contains('\n'), "{said}");
+        for want in [
+            addr,
+            "--storage-tls-cert",
+            "--storage-tls-key",
+            "--storage-client-ca",
+        ] {
+            assert!(said.contains(want), "{addr}: {said}");
+        }
+        let started = start_storage(&f, never).await;
+        assert_eq!(started.err().map(|e| e.to_string()), Some(said), "{addr}");
+    }
+    assert!(!d.join("meta").exists(), "a refused start opened a store");
+    for addr in ["127.0.0.1:0", "[::1]:0", "[::ffff:127.0.0.1]:0"] {
+        let f = flags(&d, &[format!("--storage-listen={addr}")]).expect("parses");
+        assert!(f.listener().is_ok(), "{addr}");
+    }
+    let pki = Pki::new(&d);
+    let mut tls = pki.server_flags();
+    tls.push("--storage-listen=0.0.0.0:0".to_owned());
+    let wide = flags(&d, &tls).expect("parses");
+    let listener = wide.listener().expect("TLS allows any address");
+    assert!(listener.tls.is_some());
 }
 
 /// Catches a node that serves past its shutdown future, or never starts serving.
