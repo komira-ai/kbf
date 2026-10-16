@@ -123,7 +123,10 @@ impl SqliteStore {
         options: Options,
         probe: &dyn Fn(&Path) -> io::Result<u32>,
     ) -> Result<SqliteStore, SqliteError> {
-        SqliteStore::start(path, clock, options, probe).map_err(|error| error.at(path))
+        match SqliteStore::start(path, clock, options, probe) {
+            Ok(store) => Ok(store),
+            Err(error) => Err(error.at(path)),
+        }
     }
 
     fn start(
@@ -207,10 +210,11 @@ impl SqliteStore {
             queued: Instant::now(),
             reply,
         };
-        let sent = self.requests.send(request).is_ok();
-        // The writer has stopped if it would not take the request or dropped it unanswered.
-        let answered = sent.then(|| answer.recv().ok()).flatten();
-        answered.ok_or_else(gone)?
+        // A writer that has stopped would not take the request, which is then dropped here
+        // with its reply sender, or drops it unanswered: either way the receive fails and
+        // the caller is told the writer has stopped.
+        let _ = self.requests.send(request);
+        answer.recv().ok().ok_or_else(gone)?
     }
 
     fn reader(&self) -> std::sync::MutexGuard<'_, Connection> {
