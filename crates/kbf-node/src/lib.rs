@@ -323,6 +323,14 @@ pub fn dispatch_helpers() -> Option<ExitCode> {
 
 /// The thread sizes the flags and this machine's CPUs give; fails on a reserve the
 /// machine cannot give.
+/// What the node offers the scheduler: `detected` lowered to what the leases may use.
+/// The report sent to the scheduler and the placer's whole-host figure both come from
+/// here, so a lease the scheduler books as the whole node is the one the placer leaves
+/// unpinned.
+fn offered(detected: NodeReport, capacity: Capacity) -> NodeReport {
+    detected.within(capacity)
+}
+
 fn sizes(cli: &Cli) -> Result<kbf_threads::Sizes, Error> {
     Ok(sizes_on(cli, kbf_threads::Topology::detect())?)
 }
@@ -588,9 +596,10 @@ fn node_over<C: Cas>(
     let leases = sizes(cli)?.lease_cpus() as u64;
     node.capacity.cpus = Some(node.capacity.cpus.map_or(leases, |cpus| cpus.min(leases)));
     // `Daemon::new` adds every runtime's driver.
-    let report = NodeReport::detect(&[])?
-        .with_entries(cli.daemon.label_entries())
-        .within(node.capacity);
+    let report = offered(
+        NodeReport::detect(&[])?.with_entries(cli.daemon.label_entries()),
+        node.capacity,
+    );
     // A node without the whole-machine runtime is always serving: a phase that never
     // changes.
     let phase = node
@@ -831,9 +840,7 @@ mod container {
             LeasePlacement::NumaNode => {
                 // The memory the scheduler books on this node (the report's `mem_gib`):
                 // a lease that asks for all of it is the whole host's and is not pinned.
-                let whole_host = kbf_daemon::NodeReport::detect(&[])?
-                    .within(capacity)
-                    .mem_bytes();
+                let whole_host = super::offered(NodeReport::detect(&[])?, capacity).mem_bytes();
                 kbf_driver_container::numa::start(&cli.numa_dir, mount, &parent, whole_host)?
             }
         };
@@ -953,6 +960,21 @@ mod tests {
             .expect("the first survey ends in time")
             .expect("the watch runs")
             .clone()
+    }
+
+    /// With the host's memory above the actions cgroup's cap, the placer's whole-host
+    /// figure is the capped memory the scheduler sees, not the host's.
+    #[test]
+    fn the_placers_whole_host_is_the_memory_the_scheduler_sees() {
+        let detected = || NodeReport::new([("mem_gib", "251"), ("cpus", "64")]);
+        let cap = Capacity {
+            cpus: None,
+            memory_bytes: Some(175 << 30),
+        };
+        let reported = offered(detected().with_entries([("zone", "a")]), cap);
+        let whole_host = offered(detected(), cap).mem_bytes();
+        assert_eq!(whole_host, Some(175 << 30));
+        assert_eq!(whole_host, reported.mem_bytes());
     }
 
     fn parse(extra: &[&str]) -> Result<Cli, clap::Error> {
