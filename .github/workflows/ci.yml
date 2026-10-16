@@ -292,8 +292,12 @@ jobs:
         env:
           LLVM_COV_FLAGS: -skip-functions
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --workspace --locked --branch --lcov --output-path target/coverage/lcov.info
+      # When every failure is coverage that improved, the step prints (and puts in the
+      # job summary) the `kbf-coverage tighten` command that downloads this run's
+      # `coverage` artifact and lowers coverage-baseline; --artifact must name the
+      # upload below.
       - name: Per-crate table and ratchet
-        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- --lcov target/coverage/lcov.info --root "$GITHUB_WORKSPACE" --baseline coverage-baseline --write-baseline target/coverage/coverage-baseline.measured --summary-file "$GITHUB_STEP_SUMMARY"
+        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- --lcov target/coverage/lcov.info --root "$GITHUB_WORKSPACE" --baseline coverage-baseline --write-baseline target/coverage/coverage-baseline.measured --summary-file "$GITHUB_STEP_SUMMARY" --run-id "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --artifact coverage
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
