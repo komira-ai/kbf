@@ -1863,6 +1863,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-route"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "kbf-map",
+ "kbf-meta",
+ "kbf-proto",
+ "kbf-segments",
+ "kbf-storage",
+ "kbf-types",
+ "rcgen",
+ "thiserror",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "kbf-sched"
 version = "0.1.0"
 dependencies = [
