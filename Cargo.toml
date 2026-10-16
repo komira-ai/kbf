@@ -182,6 +182,7 @@ kbf-objstore = { path = "crates/kbf-objstore" }
 kbf-outputs = { path = "crates/kbf-outputs" }
 kbf-proto = { path = "crates/kbf-proto" }
 kbf-raft = { path = "crates/kbf-raft" }
+kbf-route = { path = "crates/kbf-route" }
 kbf-sched = { path = "crates/kbf-sched" }
 kbf-segments = { path = "crates/kbf-segments" }
 kbf-server = { path = "crates/kbf-server" }
