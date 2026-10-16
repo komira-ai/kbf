@@ -128,6 +128,7 @@ table.rows th { color: var(--muted); font-weight: 500; }
 .pill.ok { background: var(--ok-bg); color: var(--ok-fg); }
 .pill.fail { background: var(--fail-bg); color: var(--fail-fg); }
 .pill.pending { background: var(--pending-bg); color: var(--pending-fg); }
+.pill.other { background: var(--pending-bg); color: var(--pending-fg); }
 
 .log pre {
   background: var(--surface);

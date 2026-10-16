@@ -65,6 +65,13 @@ pub(crate) fn escape(s: &str) -> String {
     out
 }
 
+/// Whether `c` is refused anywhere in a URL a page links to or reads: a backslash
+/// (a WHATWG URL client reads it as `/` in a path), whitespace or a control
+/// character (browsers strip or rewrite them before they parse a URL).
+pub(crate) fn refused_in_url(c: char) -> bool {
+    c == '\\' || c.is_whitespace() || c.is_control()
+}
+
 /// A URL a page may link to: root-relative (one leading `/`), so it names this
 /// server, never another host, and never a `javascript:` or `data:` URL.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,10 +84,7 @@ impl Href {
     /// before they parse a URL. `None` otherwise.
     pub(crate) fn root_relative(url: &str) -> Option<Self> {
         let rest = url.strip_prefix('/')?;
-        let foreign = rest.starts_with('/')
-            || url
-                .chars()
-                .any(|c| c == '\\' || c.is_whitespace() || c.is_control());
+        let foreign = rest.starts_with('/') || url.chars().any(refused_in_url);
         (!foreign).then(|| Self(url.to_owned()))
     }
 

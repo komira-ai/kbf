@@ -3,13 +3,14 @@
 //! Every page is a [`Page`]: its name and the read API routes it may read, as route
 //! patterns (`/v1/invocations/{id}/actions`). A page reads only through a
 //! [`Reader`] made for it, which refuses a URL that matches none of its routes (or
-//! holds a dot segment, which a URL client would resolve to another route) before
-//! anything is sent, and records every URL it was asked for, refused or not, so the
+//! holds a dot segment or a backslash, which a URL client would resolve to another
+//! route) before anything is sent, and records every URL it was asked for, refused or not, so the
 //! page can show them. The contract test (`tests.rs`) renders every page and checks
 //! both what each page asked for and what reached the source.
 
 use serde::de::DeserializeOwned;
 
+use crate::html::refused_in_url;
 use crate::{Fetched, Source};
 
 /// A page and the routes it may read.
@@ -18,7 +19,8 @@ pub(crate) struct Page {
     /// The page's name, as its `<title>` and navigation show it.
     pub(crate) name: &'static str,
     /// The read API routes the page may read, as patterns: a `{name}` segment
-    /// matches any one non-empty segment but `.` or `..` (in any spelling); the query
+    /// matches any one non-empty segment but `.` or `..` (in any spelling); a path
+    /// with a backslash, whitespace or a control character matches none; the query
     /// is not part of the match.
     pub(crate) reads: &'static [&'static str],
 }
@@ -33,7 +35,12 @@ impl Page {
 
 /// Whether `path` matches route `pattern` segment by segment. A dot segment never
 /// matches: a URL client resolves it, so the URL sent would not be the route matched.
+/// Nor does a path with a character [`refused_in_url`]: a client reads a backslash
+/// as `/`, so its segments are not the ones matched here.
 fn matches(pattern: &str, path: &str) -> bool {
+    if path.chars().any(refused_in_url) {
+        return false;
+    }
     let mut want = pattern.split('/');
     let mut got = path.split('/');
     loop {

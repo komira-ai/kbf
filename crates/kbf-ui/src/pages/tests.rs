@@ -107,6 +107,65 @@ fn builds_with_an_unknown_id_or_no_api_says_so() {
     assert!(html.contains("connection refused"), "{html}");
 }
 
+/// Catches: a `?id=` that decodes to `.` or `..` read as a build: written into
+/// `/v1/invocations/{id}` it is a dot segment, which the reader refuses, so the page
+/// answered `500` as a page bug (mutant: the dot check in `builds` dropped). It names
+/// no build: `404` with the lookup form, nothing read.
+#[test]
+fn builds_with_a_dot_id_names_no_build_and_reads_nothing() {
+    let fake = farm();
+    for path in ["/ui?id=..", "/ui?id=.", "/ui?id=%2E%2E"] {
+        let (status, html) = page(&fake, path);
+        assert_eq!(status, 404, "{path}: {html}");
+        assert!(!html.contains("problem bug"), "{path}: {html}");
+        assert!(
+            html.contains("<form method=\"get\" action=\"/ui\""),
+            "{path}: {html}"
+        );
+        assert!(html.contains("names no build"), "{path}: {html}");
+        assert!(
+            html.contains("Nothing: this page read no route."),
+            "{path}: {html}"
+        );
+    }
+    assert!(fake.seen().is_empty());
+}
+
+/// Catches: an outcome tag this page does not know (the server adds outcomes,
+/// `docs/design/ui-data.md` 6.1) failing the whole page as a malformed answer
+/// (mutant: the `Other` fallback dropped); a known tag with the wrong shape, or an
+/// outcome that is not one tag, rendered as a guess rather than refused.
+#[test]
+fn an_outcome_of_a_tag_the_page_does_not_know_is_shown_by_its_tag() {
+    let base = format!("/v1/invocations/{ID}");
+    let with_outcome = |outcome: serde_json::Value| {
+        Fake::default().json(&base, &invocation(ID)).json(
+            &format!("{base}/actions"),
+            &json!({"actions": [crate::tests::row(&digest('b', 10), "//app:x", &outcome)]}),
+        )
+    };
+    let (status, html) = page(
+        &with_outcome(json!({"lost": {}})),
+        &format!("/ui/builds/{ID}"),
+    );
+    assert_eq!(status, 200, "{html}");
+    assert!(
+        html.contains("<span class=\"pill other\">lost</span>"),
+        "{html}"
+    );
+    for malformed in [
+        json!({"ok": {}}),
+        json!({"ok": {"exit_code": 0}, "lost": {}}),
+        json!("lost"),
+    ] {
+        let (status, html) = page(
+            &with_outcome(malformed.clone()),
+            &format!("/ui/builds/{ID}"),
+        );
+        assert_eq!(status, 502, "{malformed}: {html}");
+    }
+}
+
 /// Catches: rows not shown or not linked to their Action page, the next-page link
 /// missing or not carrying the token, the token not passed to the API; a row's
 /// first attempt shown as its last, or its attempt count wrong (mutant:
@@ -342,6 +401,7 @@ fn outcomes_in_words() {
         (Some(Outcome::Ok { exit_code: 0 }), "ok", "ok"),
         (Some(Outcome::Ok { exit_code: 3 }), "exit 3", "fail"),
         (Some(Outcome::TimedOut {}), "timed out", "fail"),
+        (Some(Outcome::Other("lost".to_owned())), "lost", "other"),
         (
             Some(Outcome::Refused {
                 reason: "too big".to_owned(),

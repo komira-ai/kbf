@@ -269,8 +269,8 @@ fn every_answer_carries_the_csp_and_nosniff() {
 
 /// Catches: a page that answers the API's `401` without its `WWW-Authenticate`
 /// (RFC 9110 15.5.2 requires one), or its `429` or `503` without its `Retry-After`
-/// (mutants: the headers not passed on by the Builds page, or by a failed Build
-/// page); any other API header passed on (mutant: the allowlist check dropped); one
+/// (mutants: the headers not passed on by the Builds page, or by a failed Build or
+/// Action page); any other API header passed on (mutant: the allowlist check dropped); one
 /// passed on with a page whose status is not the API's (a log read that failed).
 #[test]
 fn a_page_with_the_apis_status_passes_on_the_headers_it_needs() {
@@ -282,17 +282,24 @@ fn a_page_with_the_apis_status_passes_on_the_headers_it_needs() {
         (503, ("Retry-After", "30"), "retry-after", "30"),
     ];
     for (status, header, name, value) in cases {
-        let fake = Fake::default().with_headers(
-            &base,
-            status,
-            &[
-                header,
-                ("set-cookie", "s=1"),
-                ("content-type", "application/json"),
-            ],
-            r#"{"error": "no"}"#,
-        );
-        for path in [format!("/ui?id={ID}"), format!("/ui/builds/{ID}")] {
+        let headers = [
+            header,
+            ("set-cookie", "s=1"),
+            ("content-type", "application/json"),
+        ];
+        let fake = Fake::default()
+            .with_headers(&base, status, &headers, r#"{"error": "no"}"#)
+            .with_headers(
+                &format!("{base}/actions/{}", action_digest()),
+                status,
+                &headers,
+                r#"{"error": "no"}"#,
+            );
+        for path in [
+            format!("/ui?id={ID}"),
+            format!("/ui/builds/{ID}"),
+            action_page(),
+        ] {
             let answer = render(&fake, &path);
             assert_eq!(answer.status(), status, "{path}");
             let headers = answer.headers();
@@ -451,7 +458,12 @@ fn no_page_declares_a_dot_segment() {
 /// as a page bug, and listed as text, not as a link.
 #[test]
 fn a_log_href_outside_the_declared_routes_is_not_read() {
-    for href in ["https://evil.example/x", "/v1/invocations/x/metrics"] {
+    // A WHATWG URL client reads `\\` in a path as `/`, so the last resolves to `/v1/x`.
+    for href in [
+        "https://evil.example/x",
+        "/v1/invocations/x/metrics",
+        "/v1/blobs/..\\x",
+    ] {
         let stderr = json!({"digest": digest('5', 10), "available": true, "href": href});
         let base = format!("/v1/invocations/{ID}/actions/{}", action_digest());
         let fake = Fake::default().json(&base, &action(&stderr));

@@ -106,13 +106,17 @@ pub(crate) fn not_found(path: &str) -> Answer {
 /// The Builds page: a form for a build's id and, with `?id=`, that build's summary.
 pub(crate) async fn builds<S: Source>(source: &S, query: &str) -> Answer {
     let id = query_value(query, "id").filter(|id| !id.is_empty());
+    // An id of `.` or `..` names no build: written into `/v1/invocations/{id}` it is a
+    // dot segment, which a URL client resolves to another route.
+    let dot = matches!(id.as_deref(), Some("." | ".."));
     let mut r = Reader::new(source, &BUILDS);
     let found = match &id {
-        Some(id) => Some(r.json::<Invocation>(&invocation_url(id)).await),
-        None => None,
+        Some(id) if !dot => Some(r.json::<Invocation>(&invocation_url(id)).await),
+        _ => None,
     };
     let (status, passed_on) = match &found {
         Some(Err(e)) => (e.status(), e.headers()),
+        _ if dot => (404, &[][..]),
         _ => (200, &[][..]),
     };
     let body = layout::page(BUILDS.name, PREFIX, r.asked(), |h| {
@@ -121,6 +125,11 @@ pub(crate) async fn builds<S: Source>(source: &S, query: &str) -> Answer {
         });
         lookup(h, id.as_deref().unwrap_or_default());
         match &found {
+            None if dot => {
+                h.el("p", &[attr("class", "problem")], |h| {
+                    h.text("A build id of . or .. names no build.");
+                });
+            }
             None => {
                 h.el("p", &[attr("class", "hint")], |h| {
                     h.text(
@@ -292,6 +301,7 @@ pub(crate) fn outcome(o: Option<&Outcome>) -> (String, &'static str) {
         }
         Some(Outcome::TimedOut {}) => ("timed out".to_owned(), "fail"),
         Some(Outcome::Refused { reason }) => (format!("refused: {reason}"), "fail"),
+        Some(Outcome::Other(tag)) => (tag.clone(), "other"),
     }
 }
 

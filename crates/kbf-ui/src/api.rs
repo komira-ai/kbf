@@ -5,7 +5,8 @@
 //! makes that read fail as malformed rather than render a guess. `kbf-server`'s
 //! `tests/ui_pages.rs` parses these from the real routes.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
+use serde_json::Value;
 
 /// `GET /v1/invocations/{id}`.
 #[derive(Debug, Deserialize)]
@@ -53,6 +54,7 @@ pub(crate) struct Row {
     pub(crate) mnemonic: Option<Text>,
     pub(crate) how: String,
     pub(crate) attempts: Vec<Attempt>,
+    #[serde(default, deserialize_with = "known_or_other")]
     pub(crate) outcome: Option<Outcome>,
 }
 
@@ -84,14 +86,57 @@ pub(crate) struct End {
     pub(crate) reason: Option<String>,
 }
 
-/// The action's outcome, as the client was answered.
+/// The action's outcome, as the client was answered: one tag, with its fields.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Outcome {
-    Ok { exit_code: i64 },
-    Failed { code: i64, message: String },
+    Ok {
+        exit_code: i64,
+    },
+    Failed {
+        code: i64,
+        message: String,
+    },
     TimedOut {},
-    Refused { reason: String },
+    Refused {
+        reason: String,
+    },
+    /// A tag this page does not know, by its tag: the server adds outcomes
+    /// (`docs/design/ui-data.md` 6.1), and a page shows a new one rather than fail.
+    #[serde(skip)]
+    Other(String),
+}
+
+/// The tags of [`Outcome`] this page reads; any other is [`Tag::Unknown`].
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Tag {
+    Ok,
+    Failed,
+    TimedOut,
+    Refused,
+    #[serde(other)]
+    Unknown,
+}
+
+/// An outcome: an object of one tag this page does not know is [`Outcome::Other`];
+/// anything else is read as [`Outcome`], so a known tag of another shape, or an
+/// outcome that is not one tag, is malformed.
+fn known_or_other<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Outcome>, D::Error> {
+    let Some(v) = Option::<Value>::deserialize(d)? else {
+        return Ok(None);
+    };
+    let tag = v
+        .as_object()
+        .filter(|m| m.len() == 1)
+        .and_then(|m| m.keys().next());
+    if let Some(tag) = tag {
+        let known = serde_json::from_value(Value::String(tag.clone())).unwrap_or(Tag::Unknown);
+        if matches!(known, Tag::Unknown) {
+            return Ok(Some(Outcome::Other(tag.clone())));
+        }
+    }
+    Outcome::deserialize(v).map(Some).map_err(de::Error::custom)
 }
 
 /// `GET /v1/invocations/{id}/actions/{digest}`: the row with its listing.
