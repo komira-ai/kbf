@@ -83,11 +83,8 @@ fn own_command(entry: Entry) -> Option<Command> {
         Entry::Daemon => Some(kbf_node::Cli::command()),
         Entry::AllInOne => Some(kbf_all_in_one::cli::command()),
         Entry::Storage => Some(kbf_server::storage_node::command()),
-        Entry::Daemon
-        | Entry::AllInOne
-        | Entry::Storage
-        | Entry::StorageAndDaemon
-        | Entry::Frontend => {
+        Entry::StorageAndDaemon => Some(kbf_all_in_one::storage_and_daemon::command()),
+        Entry::Frontend => Some(kbf_server::frontend::command()),
         Entry::NotBuilt => None,
     }
 }
@@ -140,8 +137,11 @@ fn reason(mode: &str, flag: &str) -> String {
 
 fn mode_command(name: &'static str, entry: Entry) -> Command {
     match entry {
-        Entry::Daemon | Entry::AllInOne | Entry::Storage | Entry::StorageAndDaemon => {
-        Entry::Daemon | Entry::AllInOne | Entry::Storage | Entry::Frontend => {
+        Entry::Daemon
+        | Entry::AllInOne
+        | Entry::Storage
+        | Entry::StorageAndDaemon
+        | Entry::Frontend => {
             let mut cmd = own_command(entry)
                 .expect("a mode with an entry point has a command line")
                 .name(name)
@@ -220,6 +220,7 @@ where
             Ok(Invocation::StorageAndDaemon(Box::new(
                 kbf_all_in_one::storage_and_daemon::parse(m)?,
             )))
+        }
         Entry::Frontend => {
             refuse_foreign_flags(mode.name, m)?;
             Ok(Invocation::Frontend(Box::new(kbf_server::frontend::parse(
