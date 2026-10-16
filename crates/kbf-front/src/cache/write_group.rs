@@ -37,6 +37,7 @@ use kbf_segments::{Footer, SegmentWriter, WriteError};
 use kbf_types::Digest;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
+use super::evict::Recency;
 use super::tier::Staging;
 use super::{Cache, CacheError, VerifiedBlob, refuse_oversized, unexpected};
 use crate::cpu::HashPool;
@@ -268,6 +269,8 @@ pub(super) struct Writer<M, O> {
     pub(super) next_seq: Arc<AtomicU64>,
     /// The local write tier, once [`Cache::attach_tier`] attached one.
     pub(super) tier: OnceLock<Staging>,
+    /// When each object was last used, once [`Cache::track_recency`] turned it on.
+    pub(super) recency: Recency,
 }
 
 impl<M, O> Writer<M, O> {
@@ -280,6 +283,7 @@ impl<M, O> Writer<M, O> {
             metrics: CacheMetrics::default(),
             next_seq: Arc::new(AtomicU64::new(1)),
             tier: OnceLock::new(),
+            recency: Recency::default(),
         }
     }
 
@@ -638,7 +642,10 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
             let put = self.objects.put_new(&key, body.clone(), None).await;
             self.metrics.segment_put.since(started);
             match put {
-                Ok(()) => return Ok((object, key)),
+                Ok(()) => {
+                    self.recency.written(object, body.len() as u64);
+                    return Ok((object, key));
+                }
                 Err(e) if attempt < attempts.get() && transient(&e) => {
                     tracing::warn!(%key, %e, attempt, "segment PUT failed; retrying");
                     tokio::time::sleep(backoff).await;

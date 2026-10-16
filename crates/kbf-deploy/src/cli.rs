@@ -33,6 +33,7 @@
 //!                                 [--s3-env-file FILE] [--apply]
 //! kbf-deploy pilot server-install --config FILE --uninstall [--apply]
 //! kbf-deploy pilot buckconfig --config FILE --worktree DIR [--remove] [--apply]
+//! kbf-deploy log (--log-dir DIR | --hot-store DIR) [--lines N]
 //! ```
 //!
 //! Bad flags exit 2 for every subcommand. The `minio` subcommands change a host: without
@@ -58,6 +59,10 @@
 //! subcommands do, and exit 0 done (or nothing to do), 1 a step failed or kbf-server
 //! never reported ready after its start, or 2 refused (`REFUSED: ...` on stderr)
 //! ([`crate::pilot`]).
+//! `log` only reads: it prints the last `--lines` (default 100) lines of a kbf-server's
+//! durable log, across `kbf-server.log` and its rotated files, oldest first, and exits 0,
+//! or 2 refused (`REFUSED: ...` on stderr: no such directory, or no log in it)
+//! ([`crate::log`]).
 //! `minio buckets` reads the MinIO admin key pair from `MINIO_ROOT_USER` and
 //! `MINIO_ROOT_PASSWORD` in the environment (secrets are never flags: argv is
 //! world-readable).
@@ -78,6 +83,7 @@ use kbf_types::ImageRef;
 use crate::envoy;
 use crate::https::Client;
 use crate::linux::{self, HostError, LinuxConfig, images, install, swap};
+use crate::log;
 use crate::mdm::dep::{Dep, Serial};
 use crate::mdm::erase::{self, EraseArgs, Made};
 use crate::mdm::fetch::Fetch;
@@ -125,6 +131,9 @@ enum Kit {
     /// one worktree at it.
     #[command(subcommand)]
     Pilot(pilot::cli::Pilot),
+    /// The last lines of a kbf-server's durable log, across its rotated files, oldest
+    /// first. Only reads.
+    Log(log::LogArgs),
 }
 
 #[derive(Subcommand)]
@@ -514,6 +523,7 @@ pub fn run<E: Exec>(
         Kit::Linux(l) => return linux_kit(l, exec, out, err),
         Kit::Mdm(m) => return mdm_kit(m, exec, out, err),
         Kit::Envoy(e) => return envoy_kit(e, exec, out, err),
+        Kit::Log(a) => return log::run(&a, out, err),
         Kit::Pilot(p) => {
             return pilot::cli::run(p, exec, env, out, err, &pilot::cli::sleep_a_second);
         }

@@ -1,6 +1,7 @@
 //! The server's assembly, as a library: [`start`] opens the store and metadata log the
-//! flags name, attaches the write tier and binds the listeners, and returns a
-//! [`ServerHandle`] that serves. The `kbf-server` binary is `start`, a print and
+//! flags name, attaches the write tier, starts the start-up pass over a `file://` cold
+//! store in the background (`crate::startup_pass`) and binds the listeners, and returns
+//! a [`ServerHandle`] that serves. The `kbf-server` binary is `start`, a print and
 //! `serve`; a process that runs the server beside the worker daemon calls the same
 //! function.
 //!
@@ -11,37 +12,42 @@ use std::error::Error;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use kbf_front::Cache;
 use kbf_log::FarmLogId;
 use kbf_meta::Retention;
-use kbf_objstore::{FsStore, ObjectStore};
+use kbf_objstore::{
+    Floor, FsStore, FsStoreError, KeyPrefix, ObjectStore, objects_source, statvfs_source,
+};
 use kbf_store::StdFs;
 use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
 
 use crate::local::LocalStore;
-use crate::serve::Daemons;
-use crate::stores::{COLD_FILE_MIN_FREE_BYTES, FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
 use crate::worker::LocalWorker;
+use crate::startup_pass::StartPass;
+use crate::stores::{COLD_FILE_FLOOR, FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
-use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, bind_server_for, s3_store};
+use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, bind_server_with_policy, s3_store};
 
 /// The server's thread sizes on a given machine shape: every CPU, then the overrides.
 pub fn sizes_on(args: &Args, topology: Topology) -> kbf_threads::Sizes {
     args.threads.resolve(topology)
 }
 
-/// A started server: bound, its write tier attached and its flusher running, not yet
-/// serving. [`ServerHandle::serve`] serves until the shutdown future given to [`start`]
-/// completes; dropping the handle first stops the flusher and releases the listeners.
+/// A started server: bound, its write tier attached and its flusher (and any start-up
+/// pass) running, not yet serving. [`ServerHandle::serve`] serves until the shutdown
+/// future given to [`start`] completes; dropping the handle first stops the flusher and
+/// the pass and releases the listeners.
 pub struct ServerHandle {
     /// Where the REAPI listener is.
     pub reapi: SocketAddr,
-    /// Where the worker listener is; `None` for [`Daemons::InProcess`].
-    pub worker: Option<SocketAddr>,
+    /// Where the worker listener is.
+    pub worker: SocketAddr,
     /// Where the operator API listener is, if there is one.
     pub api: Option<SocketAddr>,
     local: LocalStore,
@@ -49,6 +55,7 @@ pub struct ServerHandle {
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
+    _pass: Option<AbortOnDrop>,
 }
 
 impl ServerHandle {
@@ -67,7 +74,8 @@ impl ServerHandle {
     }
 
     /// The server's `kbf.worker.v1` service as calls in this process: what a daemon run
-    /// beside the server in one process opens its sessions through ([`LocalWorker`]).
+    /// beside the server in one process opens its sessions through ([`LocalWorker`]),
+    /// while remote daemons reach the worker listener.
     #[must_use]
     pub fn local_worker(&self) -> LocalWorker {
         self.local_worker.clone()
@@ -80,7 +88,10 @@ impl ServerHandle {
     /// A listener fails while serving.
     pub async fn serve(self) -> Result<(), ServeError> {
         let Self {
-            serving, _flusher, ..
+            serving,
+            _flusher,
+            _pass,
+            ..
         } = self;
         serving.await
     }
@@ -103,50 +114,53 @@ where
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
-    start_for(args, Daemons::Remote, shutdown).await
-}
-
-/// [`start`], for daemons that reach the server as `daemons` says: with
-/// [`Daemons::InProcess`] no worker listener is bound (`--worker-listen` and the
-/// `--worker-tls-*` flags are not read, and the start line says `worker=in-process`),
-/// and the server's daemon is the one that opens its sessions through
-/// [`ServerHandle::local_worker`].
-///
-/// # Errors
-/// As [`start`].
-pub async fn start_for<S, F>(
-    args: &Args,
-    daemons: Daemons,
-    shutdown: S,
-) -> Result<ServerHandle, Box<dyn Error>>
-where
-    S: FnOnce() -> io::Result<F>,
-    F: Future<Output = ()> + Send + 'static,
-{
     let stores = args.stores(&Statvfs)?;
     for line in stores.describe() {
         tracing::info!("{line}");
     }
     match &stores.cold {
         StoreUri::File(dir) => {
-            let store = FsStore::open(dir, COLD_FILE_MIN_FREE_BYTES)?;
-            over(args, &stores, store, FILE_PREFIX_ROOT, daemons, shutdown).await
+            let store = open_cold_file(args, dir)?;
+            let files = store.clone();
+            over(
+                args,
+                &stores,
+                (store, Some(files)),
+                FILE_PREFIX_ROOT,
+                shutdown,
+            )
+            .await
         }
         StoreUri::S3(uri) => {
             let store = s3_store(uri, |name| std::env::var(name).ok())?;
-            over(args, &stores, store, &uri.prefix, daemons, shutdown).await
+            over(args, &stores, (store, None), &uri.prefix, shutdown).await
         }
     }
 }
 
+/// A `file://` cold store: its floor [`COLD_FILE_FLOOR`], or for tests
+/// `--cold-store-floor-bytes`; its filesystem the real one, or for tests one of
+/// `--cold-store-size-bytes`.
+fn open_cold_file(args: &Args, dir: &Path) -> Result<FsStore, FsStoreError> {
+    let floor = args
+        .cold_store_floor_bytes
+        .map_or(COLD_FILE_FLOOR, Floor::Bytes);
+    let space = args
+        .cold_store_size_bytes
+        .map_or_else(statvfs_source, objects_source);
+    FsStore::open_with_space(dir, floor, space)
+}
+
 /// Serves `store` under the Raft metadata log in `stores.meta_dir`, writing under the
-/// prefix it committed: `<prefix_root><log id>/` for a new log.
+/// prefix it committed: `<prefix_root><log id>/` for a new log. With `files`, the same
+/// store as a file store (a `file://` cold store), the start-up pass runs over it. A
+/// `file://` hot store gets none: it is the write tier's block files, not an object
+/// store, and the tier's own start-up reads them.
 async fn over<O, S, F>(
     args: &Args,
     stores: &Stores,
-    store: O,
+    (store, files): (O, Option<FsStore>),
     prefix_root: &str,
-    daemons: Daemons,
     shutdown: S,
 ) -> Result<ServerHandle, Box<dyn Error>>
 where
@@ -155,13 +169,17 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let log = RaftMetaLog::open_dir(&stores.meta_dir, Retention::default(), prefix_root).await?;
-    serve_with(args, stores.hot.as_ref(), log, store, daemons, shutdown).await
+    let (prefix, id) = (log.store_prefix(), log.log_id());
+    let grace = Duration::from_millis(args.cold_store_evict_grace_ms);
+    let pass = files.map(|files| StartPass::over_raft(files, grace));
+    let hot = stores.hot.as_ref();
+    assemble(args, hot, log, store, prefix, id, shutdown, pass).await
 }
 
-/// [`start_for`] over a metadata log and object store already open: where the flags'
+/// [`start`] over a metadata log and object store already open: where the flags'
 /// store kinds end and the rest of the assembly (cache, write tier, flusher, listeners)
-/// begins. `hot` is the resolved hot store, if any. Objects are written under the
-/// prefix `meta` committed, and the start line names its id.
+/// begins. `hot` is the resolved hot store, if any; `prefix` is where objects are
+/// written and `log` the Raft log's id, for the start line.
 ///
 /// # Errors
 /// As [`start`], but for opening the store and log.
@@ -170,7 +188,8 @@ pub async fn serve_with<O, S, F>(
     hot: Option<&Hot>,
     meta: RaftMetaLog<StdFs>,
     store: O,
-    daemons: Daemons,
+    prefix: KeyPrefix,
+    log: FarmLogId,
     shutdown: S,
 ) -> Result<ServerHandle, Box<dyn Error>>
 where
@@ -178,7 +197,27 @@ where
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
-    let (prefix, log) = (meta.store_prefix(), meta.log_id());
+    assemble(args, hot, meta, store, prefix, log, shutdown, None).await
+}
+
+/// [`serve_with`], and `pass` spawned once the write tier is attached: it runs beside
+/// the server and is never awaited here.
+#[expect(clippy::too_many_arguments, reason = "serve_with's, and the pass")]
+pub(crate) async fn assemble<O, S, F>(
+    args: &Args,
+    hot: Option<&Hot>,
+    meta: RaftMetaLog<StdFs>,
+    store: O,
+    prefix: KeyPrefix,
+    log: FarmLogId,
+    shutdown: S,
+    pass: Option<StartPass<RaftMetaLog<StdFs>>>,
+) -> Result<ServerHandle, Box<dyn Error>>
+where
+    O: ObjectStore + 'static,
+    S: FnOnce() -> io::Result<F>,
+    F: Future<Output = ()> + Send + 'static,
+{
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
     let routes = Routes {
@@ -196,10 +235,11 @@ where
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
         AbortOnDrop(tokio::spawn(flusher))
     });
+    let _pass = pass.map(|pass| AbortOnDrop(crate::startup_pass::spawn(Arc::clone(&cache), pass)));
     let shutdown = shutdown()?;
     let api = args.api()?;
-    let bound = bind_server_for(cache, listeners, api, policy, daemons, shutdown)?;
-    let plain = plain_text(args, daemons);
+    let bound = bind_server_with_policy(cache, listeners, api, policy, shutdown)?;
+    let plain = args.plain_text_off_loopback();
     Ok(ServerHandle {
         reapi: bound.reapi,
         worker: bound.worker,
@@ -216,25 +256,11 @@ where
         ),
         serving: Box::pin(bound.serving),
         _flusher,
+        _pass,
     })
 }
 
-/// The listeners that serve plain text off loopback ([`Args::plain_text_off_loopback`]),
-/// of those `daemons` calls for.
-fn plain_text(args: &Args, daemons: Daemons) -> Vec<&'static str> {
-    match daemons {
-        Daemons::Remote => args.plain_text_off_loopback(),
-        Daemons::InProcess => without_worker(args.plain_text_off_loopback()),
-    }
-}
-
-/// `plain` less the worker listener, which a server whose daemons are in its process
-/// does not bind.
-fn without_worker(plain: Vec<&'static str>) -> Vec<&'static str> {
-    plain.into_iter().filter(|name| *name != "worker").collect()
-}
-
-/// Aborts a task when dropped: the flusher stops with the server.
+/// Aborts a task when dropped: the flusher and the start-up pass stop with the server.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -257,13 +283,13 @@ const fn on_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
 }
 
-/// The start line: the version, the addresses bound (`worker=in-process` when there is
-/// no worker listener; with the operator API's, whether it serves the build pages and
-/// `blobs`) and the Raft log's id, and one warning naming the listeners in `plain`
-/// (those serving plain text off loopback) when there are any.
+/// The start line: the version, the addresses bound (with the operator API's, whether
+/// it serves the build pages and `blobs`) and the Raft log's id, and one warning
+/// naming the listeners in `plain` (those serving plain text off loopback) when there
+/// are any.
 fn start_line(
     reapi: SocketAddr,
-    worker: Option<SocketAddr>,
+    worker: SocketAddr,
     api: Option<SocketAddr>,
     routes: Routes,
     log: Option<FarmLogId>,
@@ -279,7 +305,6 @@ fn start_line(
     } else {
         format!(" warning=plaintext-off-loopback:{}", plain.join(","))
     };
-    let worker = worker.map_or_else(|| "in-process".to_owned(), |a| a.to_string());
     format!("kbf-server {SERVER_VERSION} reapi={reapi} worker={worker}{api}{log}{warning}")
 }
 
@@ -322,12 +347,33 @@ mod tests {
 
     use super::*;
 
-    /// Catches a server whose daemons are in its process warning of a worker listener
-    /// it never binds, or dropping the REAPI listener's warning with it.
-    #[test]
-    fn without_a_worker_listener_only_reapi_is_warned_of() {
-        assert_eq!(without_worker(vec!["reapi", "worker"]), ["reapi"]);
-        assert_eq!(without_worker(vec!["worker"]), Vec::<&str>::new());
+    /// Catches the public seam [`serve_with`] not assembling a server now that the
+    /// flags' path ([`start`], which also attaches the start-up pass) goes around it:
+    /// over a log and store its caller opened it binds, and its start line names the
+    /// log.
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_with_binds_over_a_store_the_caller_opened() {
+        let root =
+            std::env::temp_dir().join(format!("kbf-server-serve-with-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let args = Args::parse_from([
+            "kbf-server",
+            "--listen=127.0.0.1:0",
+            "--worker-listen=127.0.0.1:0",
+        ]);
+        let log = RaftMetaLog::open_dir(&root.join("raft"), Retention::default(), "kbf/")
+            .await
+            .expect("open the log");
+        let (prefix, id) = (log.store_prefix(), log.log_id());
+        let store = FsStore::open(&root.join("blobs"), Floor::Bytes(1)).expect("open the store");
+        let pending = || Ok(std::future::pending::<()>());
+        let server = serve_with(&args, None, log, store, prefix, id, pending)
+            .await
+            .expect("assembled");
+        let line = server.start_line().to_owned();
+        assert!(line.ends_with(&format!(" log={id}")), "{line}");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Catches the server sizing itself from anything but the CPU count: on the 44-core,

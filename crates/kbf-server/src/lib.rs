@@ -28,6 +28,8 @@
 //!   and withdraw a macOS build, install an allowlisted profile; no erase), a client
 //!   over mutual TLS, and the polling of an update's DDM progress. Not yet called by
 //!   the rollout driver.
+//! - The durable log ([`log_file`]): a size-capped rotating file in `--log-dir` (by default
+//!   `log/` in the hot store's directory) that gets every event stderr gets.
 //! - The [`farm::Farm`] core: `kbf-sched` decides, the farm carries out its effects.
 //!   `Start` only after the grant commits; a result is accepted only from the node
 //!   holding the operation's current lease, and only an accepted result is written to
@@ -58,6 +60,7 @@ pub mod http_blobs;
 pub mod http_invocations;
 pub mod identity;
 mod local;
+pub mod log_file;
 pub mod machine;
 pub mod mdm;
 mod memory;
@@ -68,6 +71,7 @@ pub mod rollout;
 pub mod serve;
 pub mod stamp;
 mod start;
+mod startup_pass;
 pub mod stores;
 mod timeout;
 pub mod token;
@@ -82,10 +86,10 @@ pub use kbf_sched::MemoryLadder;
 pub use local::LocalStore;
 pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use serve::{
-    Api, Bound, Daemons, Listeners, ServeError, WorkerTls, bind_server, bind_server_for,
-    bind_server_with_api, bind_server_with_policy,
+    Api, Bound, Listeners, ServeError, WorkerTls, bind_server, bind_server_with_api,
+    bind_server_with_policy,
 };
-pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_for};
+pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start};
 pub use worker::{DaemonStream, LocalWorker, SessionStream, WorkerService};
 
 /// The commit the server was built from: 12 hex digits, or `unknown` when the build

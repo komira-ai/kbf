@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kbf_front::{Cache, MetaLog, MetaLogError, TierStartError, TierStartup};
+use kbf_front::{Cache, FlushRound, MetaLog, MetaLogError, TierStartError, TierStartup};
 use kbf_log::MachineVersion;
 use kbf_objstore::ObjectStore;
 use kbf_store::{Fs, StdFs};
@@ -86,8 +86,26 @@ pub async fn run_flusher<M: MetaLog, O: ObjectStore>(cache: Arc<Cache<M, O>>, ev
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        if let Err(error) = cache.flush_tier(Instant::now()).await {
-            tracing::warn!(%error, "write tier flusher round failed");
+        match cache.flush_tier(Instant::now()).await {
+            Ok(round) => report_round(&round),
+            Err(error) => tracing::warn!(%error, "write tier flusher round failed"),
         }
     }
+}
+
+/// Logs, as one WARN line, the objects a flusher round found that need an operator: a
+/// flush whose key holds another object (`conflicts`), and objects with a record that
+/// failed its digest (`corrupt`, with `dropped_blobs` such records). A round that only
+/// sealed and flushed logs nothing (that is every second of a busy server), and a
+/// flush that failed is logged where it fails, with its retry wait, by `kbf-front`.
+pub fn report_round(round: &FlushRound) {
+    if round.conflicts.len() + round.corrupt.len() == 0 {
+        return;
+    }
+    tracing::warn!(
+        conflicts = round.conflicts.len(),
+        corrupt = round.corrupt.len(),
+        dropped_blobs = round.dropped.len(),
+        "write tier flush found objects that conflict with the store or fail their digests"
+    );
 }

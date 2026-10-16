@@ -285,7 +285,10 @@ native-whole-machine`.
   one NUMA node: the lease cgroup gets that node's CPUs (`cpuset.cpus`) and memory node
   (`cpuset.mems`), and the container's cgroup inherits both. The node is the one with
   the least CPU booked by running leases, the lowest id on a tie; the lease's
-  `inputs phases:` line ends with `numa_node=N`. It enables `cpuset` in `actions/` and
+  `inputs phases:` line ends with `numa_node=N`. A lease that asks for all the memory the
+  node reports, or for more than any one node holds, is unpinned: it gets every CPU and
+  memory node the daemon may use, books no node, and its line ends `numa_node=all`. It
+  enables `cpuset` in `actions/` and
   its parent (the start fails, naming the fix, when the unit is not offered it) and
   runs as `none`, logged once, on a host with fewer than two NUMA nodes that hold CPUs.
   It changes neither admission nor `--reserve-cpus`, a quota that removes no CPU from a

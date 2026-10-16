@@ -29,13 +29,22 @@
 //! not hash what it returns: kbf checks every blob it reads against its digest, from
 //! any store. A listing opens every object file to read its key (`list` serves rebuild
 //! and the sweep only). Nothing reads the objects at open: on a large directory that
-//! would hold up every start, so a lost or damaged object is found when it is read, or
-//! by [`ObjectStore::may_hold`] before an action-cache hit is served.
+//! would hold up every start. [`FsStore::scan`] reads one shard's headers for the
+//! server's start-up pass, which runs in the background after the server serves (it
+//! deletes orphans and forgets index entries whose file is gone; `kbf-front`'s
+//! `Cache::consistency_pass`). Until it reaches an object, a lost or damaged one is
+//! found when it is read, or by [`ObjectStore::may_hold`] before an action-cache hit
+//! is served.
 //!
 //! A write is refused when the file system has less free space than the store's floor
-//! plus the object's length, so a full disk refuses uploads instead of failing part-way
-//! through them (and the Raft log, often on the same disk, keeps room). Nothing is ever
-//! evicted: the directory only grows.
+//! ([`Floor`]: by default `kbf_threads::disk::keep_free`, 5% of the file system and at
+//! least 1 GiB, the rule every farm directory that evicts to a floor keeps) plus
+//! the object's length, so a full disk refuses uploads instead of failing part-way
+//! through them (and the Raft log, often on the same disk, keeps room). The store
+//! deletes nothing on its own: a refusal wakes whoever waits on
+//! [`FsStore::refused_full`] (the server's evictor, `kbf-front`'s `Cache::evict_round`),
+//! which forgets the least recently used objects and deletes their files while the
+//! free space is under twice the floor ([`FsStore::room`]).
 //!
 //! No Object Lock. I/O runs on tokio's blocking pool, so every call needs a tokio
 //! runtime. An I/O failure is [`ObjectStoreError::Transport`], naming the operation
@@ -51,7 +60,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use bytes::Bytes;
+use kbf_threads::disk::{FreeSpace as _, Space, Statvfs, keep_free};
 use sha2::{Digest, Sha256};
+use tokio::sync::Notify;
 
 use crate::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectInfo, ObjectKey, ObjectStore,
@@ -87,16 +98,82 @@ pub enum FsStoreError {
     },
 }
 
+/// The free space a store's writes must leave on its file system.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Floor {
+    /// [`keep_free`] of the file system's size: 5%, at least 1 GiB.
+    KeepFree,
+    /// This many bytes.
+    Bytes(u64),
+}
+
+impl Floor {
+    /// The floor in bytes, on a file system of `total` bytes.
+    #[must_use]
+    pub fn bytes(self, total: u64) -> u64 {
+        match self {
+            Self::KeepFree => keep_free(total),
+            Self::Bytes(bytes) => bytes,
+        }
+    }
+}
+
+/// Where a store reads its file system's [`Space`] from, given its `objects/`
+/// directory: [`statvfs_source`], or a test's fake ([`FsStore::open_with_space`]).
+pub type SpaceSource = Arc<dyn Fn(&Path) -> io::Result<Space> + Send + Sync>;
+
+/// The real file systems: `statvfs` ([`Statvfs`]).
+#[must_use]
+pub fn statvfs_source() -> SpaceSource {
+    Arc::new(|objects: &Path| Statvfs.space(objects))
+}
+
+/// For tests of eviction only: a file system of `total` bytes that holds nothing but
+/// the store's object files (every file under `objects/` counts, header included).
+#[doc(hidden)]
+#[must_use]
+pub fn objects_source(total: u64) -> SpaceSource {
+    Arc::new(move |objects: &Path| {
+        let mut held = 0_u64;
+        for shard in entries(objects)? {
+            // A file deleted since the listing holds nothing.
+            held += entries(&shard)?
+                .iter()
+                .map(|f| fs::metadata(f).map_or(0, |m| m.len()))
+                .sum::<u64>();
+        }
+        Ok(Space {
+            total,
+            available: total.saturating_sub(held),
+        })
+    })
+}
+
+/// The store's free space against its floor ([`FsStore::room`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Room {
+    /// The bytes still free on the file system.
+    pub available: u64,
+    /// The floor in bytes: a write that would leave less free is refused.
+    pub floor: u64,
+}
+
 /// A bucket in a local directory (see the module docs). Conditional writes, no Object
-/// Lock.
+/// Lock. A clone is another handle on the same open store: the directory stays locked
+/// until the last handle is dropped.
+#[derive(Clone)]
 pub struct FsStore {
     inner: Arc<Inner>,
 }
 
 struct Inner {
     objects: PathBuf,
-    /// The free bytes a write must leave on the file system.
-    min_free: u64,
+    /// The free space a write must leave on the file system.
+    floor: Floor,
+    /// Where the file system's size and free space come from.
+    space: SpaceSource,
+    /// Woken each time a write is refused for want of room.
+    full: Notify,
     tmp: PathBuf,
     /// The name of the next temporary file.
     next: AtomicU64,
@@ -107,11 +184,25 @@ struct Inner {
 impl FsStore {
     /// Opens the store in `dir`, creating the directory and its layout if missing,
     /// locking it, and removing every file left in `tmp/`. A write is refused while the
-    /// file system would be left with less than `min_free` bytes free.
+    /// file system would be left with less than `floor` free.
     ///
     /// # Errors
     /// The directory cannot be created, locked or read, or a leftover cannot be removed.
-    pub fn open(dir: &Path, min_free: u64) -> Result<Self, FsStoreError> {
+    pub fn open(dir: &Path, floor: Floor) -> Result<Self, FsStoreError> {
+        Self::open_with_space(dir, floor, statvfs_source())
+    }
+
+    /// [`FsStore::open`], with the file system's size and free space read from `space`
+    /// instead of `statvfs`: for tests that need a file system of a given size.
+    ///
+    /// # Errors
+    /// As [`FsStore::open`].
+    #[doc(hidden)]
+    pub fn open_with_space(
+        dir: &Path,
+        floor: Floor,
+        space: SpaceSource,
+    ) -> Result<Self, FsStoreError> {
         fs::create_dir_all(dir).map_err(open_failed("create", dir))?;
         let lock_path = dir.join("LOCK");
         let lock = File::options()
@@ -140,12 +231,85 @@ impl FsStore {
         Ok(Self {
             inner: Arc::new(Inner {
                 objects,
-                min_free,
+                floor,
+                space,
+                full: Notify::new(),
                 tmp,
                 next: AtomicU64::new(0),
                 _lock: lock,
             }),
         })
+    }
+}
+
+/// One object file [`FsStore::scan`] read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Scanned {
+    /// The key its header names.
+    pub key: ObjectKey,
+    /// The object's length: the file's, less the header.
+    pub len: u64,
+    /// When the file was last modified (written, for a file this store wrote).
+    pub mtime: SystemTime,
+}
+
+/// What [`FsStore::scan`] found in one shard.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShardScan {
+    /// Every file with an object header, in no particular order.
+    pub objects: Vec<Scanned>,
+    /// Files without one (too short to hold a header, or not starting with one): no
+    /// key, so no object. A read of the key they were meant for answers `NotFound`.
+    pub unreadable: usize,
+}
+
+impl ShardScan {
+    /// How many files the scan opened.
+    #[must_use]
+    pub fn opened(&self) -> usize {
+        self.objects.len() + self.unreadable
+    }
+}
+
+impl FsStore {
+    /// How many shards ([`FsStore::scan`]) the objects are spread over: one per value
+    /// of a `u8`.
+    pub const SHARDS: usize = 256;
+
+    /// Reads the header of every object file in shard `shard` (`objects/<shard as two
+    /// hex digits>/`): its key, its length and its modification time. Opens every
+    /// file in the shard, reads no object's bytes.
+    ///
+    /// # Errors
+    /// The shard cannot be listed, or a file in it cannot be opened or read.
+    pub async fn scan(&self, shard: u8) -> Result<ShardScan, ObjectStoreError> {
+        let inner = Arc::clone(&self.inner);
+        blocking(move || inner.scan(shard)).await
+    }
+
+    /// Whether the file system has less free space than the store's floor: every write
+    /// is refused until room is made.
+    ///
+    /// # Errors
+    /// The file system cannot be asked (`statvfs`).
+    pub fn under_floor(&self) -> Result<bool, ObjectStoreError> {
+        let room = self.room()?;
+        Ok(room.available < room.floor)
+    }
+
+    /// The free space on the store's file system, and its floor in bytes.
+    ///
+    /// # Errors
+    /// The file system cannot be asked (`statvfs`).
+    pub fn room(&self) -> Result<Room, ObjectStoreError> {
+        self.inner.room()
+    }
+
+    /// Completes after a write is refused for want of room: at the next refusal, or
+    /// at once if one came since the last wait completed (one wake-up is kept for
+    /// a waiter that is not waiting yet).
+    pub async fn refused_full(&self) {
+        self.inner.full.notified().await;
     }
 }
 
@@ -173,17 +337,26 @@ impl Inner {
         sync_dir(&dir).map_err(failed("sync", &dir))
     }
 
-    /// Refuses a write of `len` bytes that would leave less than the floor free.
+    /// The bytes free to an unprivileged writer on the store's file system, and the
+    /// floor on it.
+    fn room(&self) -> Result<Room, ObjectStoreError> {
+        let space = (self.space)(&self.objects).map_err(failed("statvfs", &self.objects))?;
+        Ok(Room {
+            available: space.available,
+            floor: self.floor.bytes(space.total),
+        })
+    }
+
+    /// Refuses a write of `len` bytes that would leave less than the floor free, and
+    /// wakes [`FsStore::refused_full`].
     fn room_for(&self, len: u64) -> Result<(), ObjectStoreError> {
-        let stat = rustix::fs::statvfs(&self.objects)
-            .map_err(io::Error::from)
-            .map_err(failed("statvfs", &self.objects))?;
-        let free = stat.f_bavail.saturating_mul(stat.f_frsize);
-        if free < self.min_free.saturating_add(len) {
+        let Room { available, floor } = self.room()?;
+        if available < floor.saturating_add(len) {
+            self.full.notify_one();
             return Err(ObjectStoreError::Transport(Arc::new(Full {
                 dir: self.objects.clone(),
-                free,
-                floor: self.min_free,
+                free: available,
+                floor,
                 len,
             })));
         }
@@ -231,6 +404,22 @@ impl Inner {
         }
     }
 
+    fn scan(&self, shard: u8) -> Result<ShardScan, ObjectStoreError> {
+        let dir = self.objects.join(format!("{shard:02x}"));
+        let mut scan = ShardScan::default();
+        for path in entries(&dir).map_err(failed("list", &dir))? {
+            match Object::open(&path)? {
+                Some(object) => scan.objects.push(Scanned {
+                    key: object.key,
+                    len: object.size,
+                    mtime: object.mtime,
+                }),
+                None => scan.unreadable += 1,
+            }
+        }
+        Ok(scan)
+    }
+
     /// Reads the key of every object, keeps those under `prefix` after `after`, and
     /// returns the first `max` in key order.
     fn list(
@@ -273,6 +462,8 @@ struct Object {
     header: u64,
     /// The object's length.
     size: u64,
+    /// The file's modification time.
+    mtime: SystemTime,
 }
 
 impl Object {
@@ -286,7 +477,7 @@ impl Object {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             opened => opened.map_err(failed("open", path))?,
         };
-        let len = file.metadata().map_err(failed("stat", path))?.len();
+        let stat = file.metadata().map_err(failed("stat", path))?;
         let mut head = [0; MAX_HEADER];
         let read = file.read_at(&mut head, 0).map_err(failed("read", path))?;
         Ok(parse_header(&head[..read]).map(|(key, header)| Self {
@@ -294,7 +485,9 @@ impl Object {
             key,
             header,
             // The header was read from the file, so it is no longer than it.
-            size: len - header,
+            size: stat.len() - header,
+            // Linux and macOS keep a modification time on every file.
+            mtime: stat.modified().unwrap_or(SystemTime::UNIX_EPOCH),
         }))
     }
 }
@@ -348,7 +541,8 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 #[derive(Debug, thiserror::Error)]
 #[error(
     "{dir}: {free} bytes free, under the floor of {floor} bytes plus the {len} bytes of \
-     this write (no eviction: the directory only grows)"
+     this write (the least recently used objects are being evicted to make room; try \
+     again)"
 )]
 struct Full {
     dir: PathBuf,

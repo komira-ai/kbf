@@ -218,6 +218,17 @@ fn elect(host: &mut TestHost) {
 /// Catches: a host that sends a granted vote before syncing it (a crash after the
 /// send lets the voter grant a second vote in the term), and one that syncs once per
 /// write instead of once per run of writes.
+/// Catches a host that reports another membership than the one it was opened with
+/// (a caller counts its voters: kbf-server raises the log's machine version itself
+/// only when it is the only one).
+#[test]
+fn a_host_reports_the_membership_it_was_opened_with() {
+    let trace = Trace::default();
+    let host = open(config(S1, &[S1, S2, S3]), Disk::new(&trace));
+    let voters: Vec<ServerId> = host.core().membership().voters().collect();
+    assert_eq!(voters, [S1, S2, S3]);
+}
+
 #[test]
 fn a_vote_is_synced_before_it_is_sent() {
     let trace = Trace::default();

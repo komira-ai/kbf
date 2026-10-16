@@ -13,14 +13,16 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use kbf_proto::google::longrunning::operation;
+use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
 use kbf_proto::reapi::execution_client::ExecutionClient;
 use kbf_proto::reapi::platform::Property;
 use kbf_proto::reapi::{
     Action, ActionResult, Command as ReapiCommand, Digest, Directory, ExecuteRequest,
-    ExecuteResponse, Platform, Tree,
+    ExecuteResponse, FindMissingBlobsRequest, Platform, Tree,
 };
 use kbf_transfer::{Cas as _, TransferConfig, Transfers, fetch};
 use prost::Message as _;
+use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 use tonic::transport::{Channel, Endpoint};
 
 // The stand-in `podman` runs each action as `kbf-act` beside it: a link to this test
@@ -44,6 +46,24 @@ fn scratch(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch");
     dir
+}
+
+/// A CA, the node's certificate (`node-1`, its one DNS name) and the server's
+/// (`localhost`), written into `dir`.
+fn pki(dir: &Path) {
+    let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("key")).expect("CA");
+    std::fs::write(dir.join("ca.pem"), ca.pem()).expect("write");
+    for (name, dns) in [("node", "node-1"), ("server", "localhost")] {
+        let key = KeyPair::generate().expect("key");
+        let cert = CertificateParams::new(vec![dns.to_owned()])
+            .expect("params")
+            .signed_by(&key, &ca)
+            .expect("sign");
+        std::fs::write(dir.join(format!("{name}.pem")), cert.pem()).expect("write");
+        std::fs::write(dir.join(format!("{name}.key")), key.serialize_pem()).expect("write");
+    }
 }
 
 /// `--id-files`: a passwd naming this test's user `kbf`, with 65,536 subordinate ids.
@@ -105,16 +125,33 @@ fn cgroup_tree(bin: &Path) -> Vec<String> {
     ]
 }
 
-/// The flags of a one-node farm in `dir`: the REAPI listener on a free port, a cold
-/// store and a hot store (the write tier, holding the metadata log), and the daemon
-/// half's container driver. No certificate, key or server address: the halves talk by
-/// calls.
-fn farm_flags(dir: &Path) -> Vec<String> {
+/// A port nothing listens on now.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port()
+}
+
+/// The flags of a one-node farm in `dir`: the server's worker listener on `port` under
+/// mutual TLS, a cold store and a hot store (the write tier, holding the metadata log),
+/// and the daemon half's container driver dialling it.
+fn farm_flags(dir: &Path, port: u16) -> Vec<String> {
     let at = |name: &str| dir.join(name).display().to_string();
     vec![
         "--listen=127.0.0.1:0".to_owned(),
+        format!("--worker-listen=127.0.0.1:{port}"),
+        format!("--worker-tls-cert={}", at("server.pem")),
+        format!("--worker-tls-key={}", at("server.key")),
+        format!("--worker-client-ca={}", at("ca.pem")),
         format!("--cold-store=file://{}", at("cold")),
         format!("--hot-store=file://{}", at("hot")),
+        format!("--server=https://127.0.0.1:{port}"),
+        "--tls-server-name=localhost".to_owned(),
+        format!("--ca-cert={}", at("ca.pem")),
+        format!("--cert={}", at("node.pem")),
+        format!("--key={}", at("node.key")),
         "--node-id=node-1".to_owned(),
         "--reconnect-ms=50".to_owned(),
         "--driver=container".to_owned(),
@@ -122,19 +159,39 @@ fn farm_flags(dir: &Path) -> Vec<String> {
     ]
 }
 
-/// Kills the process when dropped, so a failed test leaves nothing running. Holds the
-/// read end of its stdout, so a line it writes later never meets a closed pipe.
-struct Running {
-    child: Child,
-    _stdout: Option<BufReader<std::process::ChildStdout>>,
+/// `PATH` with `bin`, where [`podman`] put the stand-in, first.
+fn image_path(bin: &Path) -> String {
+    format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
 }
+
+/// The binary with `flags` (a one-node farm in `dir`, [`farm_flags`]) whose container
+/// driver runs the stand-in `podman` in `bin`, found through `path`.
+fn farm(dir: &Path, bin: &Path, path: &str, flags: Vec<String>) -> Command {
+    let mut command = Command::new(BIN);
+    command
+        .args(flags)
+        .arg(format!("--id-files={}", id_files(dir).display()))
+        .args(cgroup_tree(bin))
+        .env("PATH", path)
+        // The stand-in finds its state beside the link it was run through, which the
+        // driver runs by the name `PATH` finds (argv0 `podman`): from here.
+        .current_dir(bin);
+    command
+}
+
+/// Kills the process when dropped, so a failed test leaves nothing running.
+struct Running(Child);
 
 impl Running {
     /// Waits for the process to end on its own, for at most [`PROMPT`].
     fn wait(mut self) -> std::process::ExitStatus {
         let deadline = std::time::Instant::now() + PROMPT;
         loop {
-            if let Some(status) = self.child.try_wait().expect("wait") {
+            if let Some(status) = self.0.try_wait().expect("wait") {
                 return status;
             }
             assert!(std::time::Instant::now() < deadline, "still running");
@@ -145,8 +202,8 @@ impl Running {
 
 impl Drop for Running {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -179,99 +236,6 @@ async fn execute(reapi: Channel, action: Digest) -> ActionResult {
     response.result.expect("a result")
 }
 
-/// Starts the binary on a one-node farm in `dir` whose stand-in `podman` runs `steps` as
-/// each action; returns it once it has printed its start line, with the REAPI address
-/// that line names and the image an action names.
-fn farm(dir: &Path, steps: &[&str]) -> (Running, SocketAddr, String) {
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).expect("mkdir");
-    let image = podman(&bin, steps);
-    let path = format!(
-        "{}:{}",
-        bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let mut child = Command::new(BIN)
-        .args(farm_flags(dir))
-        .arg(format!("--id-files={}", id_files(dir).display()))
-        .args(cgroup_tree(&bin))
-        .env("PATH", path)
-        // The stand-in finds its state beside the link it was run through, which the
-        // driver runs by the name `PATH` finds (argv0 `podman`): from here.
-        .current_dir(&bin)
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn");
-    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut line = String::new();
-    stdout.read_line(&mut line).expect("a start line");
-    let running = Running {
-        child,
-        _stdout: Some(stdout),
-    };
-    let reapi: SocketAddr = line
-        .trim_end()
-        .split(' ')
-        .find_map(|field| field.strip_prefix("reapi="))
-        .unwrap_or_else(|| panic!("no reapi= in {line:?}"))
-        .parse()
-        .expect("an address");
-    (running, reapi, image)
-}
-
-/// The TCP ports process `pid` listens on: each socket among its descriptors
-/// (`/proc/<pid>/fd`) that `/proc/<pid>/net/tcp` or `tcp6` lists in state LISTEN.
-fn listening_ports(pid: u32) -> std::collections::BTreeSet<u16> {
-    let mut sockets = std::collections::BTreeSet::new();
-    for fd in std::fs::read_dir(format!("/proc/{pid}/fd")).expect("list fds") {
-        let Ok(target) = std::fs::read_link(fd.expect("an fd").path()) else {
-            continue; // closed since it was listed
-        };
-        let target = target.to_string_lossy();
-        if let Some(inode) = target
-            .strip_prefix("socket:[")
-            .and_then(|t| t.strip_suffix(']'))
-        {
-            sockets.insert(inode.to_owned());
-        }
-    }
-    let mut ports = std::collections::BTreeSet::new();
-    for table in ["tcp", "tcp6"] {
-        let text = std::fs::read_to_string(format!("/proc/{pid}/net/{table}")).expect("read");
-        for row in text.lines().skip(1) {
-            let fields: Vec<&str> = row.split_whitespace().collect();
-            let (Some(local), Some(state), Some(inode)) =
-                (fields.get(1), fields.get(3), fields.get(9))
-            else {
-                continue;
-            };
-            // 0A is TCP_LISTEN.
-            if *state != "0A" || !sockets.contains(*inode) {
-                continue;
-            }
-            let port = local.rsplit(':').next().expect("a port");
-            ports.insert(u16::from_str_radix(port, 16).expect("a hex port"));
-        }
-    }
-    ports
-}
-
-/// Catches a worker listener bound by the binary (no remote daemon may reach an
-/// all-in-one process: its daemon half's control plane is calls into the server half),
-/// or any other listener but the REAPI one: once the start line is out, the process
-/// listens on exactly one TCP port, the one the line names as `reapi=`.
-#[test]
-fn the_binary_listens_on_the_reapi_port_alone() {
-    let dir = scratch("listeners");
-    let (running, reapi, _) = farm(&dir, &["echo", "unused"]);
-    let ports = listening_ports(running.child.id());
-    assert_eq!(
-        ports,
-        std::collections::BTreeSet::from([reapi.port()]),
-        "listening on {ports:?}; reapi={reapi}"
-    );
-}
-
 /// Catches the daemon half's outputs not reaching the server half's CAS, or reaching it
 /// other than through the in-process plane (the binary is given no `--cas`, so a daemon
 /// half wired to the transfer engine refuses to start), the helper re-execs not
@@ -283,6 +247,9 @@ fn the_binary_listens_on_the_reapi_port_alone() {
 #[test]
 fn an_actions_outputs_go_through_the_in_process_plane() {
     let dir = scratch("e2e");
+    pki(&dir);
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("mkdir");
     let steps = [
         "mkdir",
         "$UPPER/out/dir",
@@ -302,7 +269,21 @@ fn an_actions_outputs_go_through_the_in_process_plane() {
         "--stderr",
         "to stderr",
     ];
-    let (running, reapi, image) = farm(&dir, &steps);
+    let image = podman(&bin, &steps);
+    let flags = farm_flags(&dir, free_port());
+    let mut child = farm(&dir, &bin, &image_path(&bin), flags)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let running = Running(child);
+    let line = stdout.lines().next().expect("a start line").expect("read");
+    let reapi: SocketAddr = line
+        .split(' ')
+        .find_map(|field| field.strip_prefix("reapi="))
+        .unwrap_or_else(|| panic!("no reapi= in {line:?}"))
+        .parse()
+        .expect("an address");
 
     let tokio = tokio::runtime::Runtime::new().expect("runtime");
     tokio.block_on(async {
@@ -357,7 +338,7 @@ fn an_actions_outputs_go_through_the_in_process_plane() {
     // Its connections closed, so the server half's drain does not wait for them.
     drop(tokio);
 
-    let pid = rustix::process::Pid::from_child(&running.child);
+    let pid = rustix::process::Pid::from_child(&running.0);
     rustix::process::kill_process(pid, rustix::process::Signal::TERM).expect("SIGTERM");
     let status = running.wait();
     assert!(status.success(), "{status}");
@@ -383,29 +364,20 @@ fn the_binary_answers_as_a_keeper_before_it_reads_its_flags() {
 }
 
 /// Runs the binary with a one-node farm's flags in a fresh directory, `extra` taking the
-/// place of any it names again, and returns its exit status and stderr; fails if it is
-/// still running after [`PROMPT`].
+/// place of any it names again, and returns its exit status and stderr.
 fn refused(name: &str, extra: &[&str]) -> (Option<i32>, String) {
     let dir = scratch(name);
+    pki(&dir);
     let name = |flag: &str| flag.split('=').next().unwrap_or(flag).to_owned();
     let named: Vec<String> = extra.iter().map(|flag| name(flag)).collect();
-    let farm = farm_flags(&dir);
-    let stderr = dir.join("stderr");
-    let child = Command::new(BIN)
+    let farm = farm_flags(&dir, free_port());
+    let output = Command::new(BIN)
         .args(farm.iter().filter(|flag| !named.contains(&name(flag))))
         .args(extra)
-        .stdout(Stdio::null())
-        .stderr(std::fs::File::create(&stderr).expect("stderr file"))
-        .spawn()
+        .output()
         .expect("run");
-    // A start that is not refused serves until killed: it fails here, not by hanging.
-    let running = Running {
-        child,
-        _stdout: None,
-    };
-    let status = running.wait();
-    let stderr = std::fs::read_to_string(&stderr).expect("read stderr");
-    (status.code(), stderr)
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    (output.status.code(), stderr)
 }
 
 /// Catches a start either half refuses that exits 0 or as the other half would, or
@@ -429,38 +401,87 @@ fn a_start_either_half_refuses_says_which() {
     assert!(stderr.contains("container driver only"), "{stderr}");
 }
 
-/// Catches a node identity, a dial or a worker listener taken on the command line (the
-/// daemon half dials no server and presents no certificate; the process admits no
-/// remote daemon), or refused without saying which flag and why: each is a usage error,
-/// exit 2, before anything starts (no start line).
+/// Catches the start-up pass or the evictor not run over the all-in-one's `file://`
+/// cold store (mutants: `kbf_server::start`'s `file://` arm passes no pass; the
+/// evictor loop removed): a single-voter farm is this binary's main use, and the pass
+/// deletes its orphans and forgets its lost objects, the evictor keeps its disk from
+/// filling. Without a hot store (uploads go straight to the cold store), on a fake
+/// 16 MiB filesystem holding only the object files with a 4 MiB floor and no grace
+/// window (the server's hidden test flags, which this binary takes as `kbf-server`
+/// does), the pass logs its last line, twenty uploads of 1 MiB each all succeed, the
+/// evictor logs a round and the first blob is reported missing.
 #[test]
-fn node_identity_and_worker_listener_flags_are_refused() {
-    for (flag, says) in [
-        (
-            "--server=https://127.0.0.1:8981",
-            "--server: the daemon half opens its sessions",
-        ),
-        (
-            "--ca-cert=ca.pem",
-            "--ca-cert: the daemon half opens its sessions",
-        ),
-        ("--cert=node.pem", "presents no certificate"),
-        ("--key=node.key", "--key: the daemon half"),
-        ("--tls-server-name=localhost", "--tls-server-name: "),
-        (
-            "--worker-listen=127.0.0.1:8981",
-            "--worker-listen: kbf-all-in-one binds no worker listener",
-        ),
-        ("--worker-tls-cert=server.pem", "--worker-tls-cert: "),
-        ("--worker-tls-key=server.key", "--worker-tls-key: "),
-        ("--worker-client-ca=ca.pem", "--worker-client-ca: "),
-        (
-            "--worker-deny-list=deny.json",
-            "--worker-deny-list: kbf-all-in-one binds no worker listener",
-        ),
-    ] {
-        let (code, stderr) = refused("node-identity", &[flag]);
-        assert_eq!(code, Some(2), "{flag}: {stderr}");
-        assert!(stderr.contains(says), "{flag}: {stderr}");
-    }
+fn the_start_up_pass_and_the_evictor_run_over_a_file_cold_store() {
+    const MIB: usize = 1 << 20;
+    let dir = scratch("pass");
+    pki(&dir);
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("mkdir");
+    podman(&bin, &["true"]);
+    let mut flags: Vec<String> = farm_flags(&dir, free_port())
+        .into_iter()
+        .filter(|flag| !flag.starts_with("--hot-store="))
+        .collect();
+    flags.extend([
+        format!("--meta-dir={}", dir.join("meta").display()),
+        format!("--cold-store-size-bytes={}", 16 * MIB),
+        format!("--cold-store-floor-bytes={}", 4 * MIB),
+        "--cold-store-evict-grace-ms=0".to_owned(),
+    ]);
+    let mut child = farm(&dir, &bin, &image_path(&bin), flags)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let stderr = BufReader::new(child.stderr.take().expect("stderr"));
+    let _running = Running(child);
+    let (seen, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in stderr.lines().map_while(Result::ok) {
+            if line.contains(PASS_DONE) || line.contains(EVICTED) {
+                let _ = seen.send(line);
+            }
+        }
+    });
+    let line = stdout.lines().next().expect("a start line").expect("read");
+    let reapi = line
+        .split(' ')
+        .find_map(|field| field.strip_prefix("reapi="))
+        .unwrap_or_else(|| panic!("no reapi= in {line:?}"))
+        .to_owned();
+    let line = lines.recv_timeout(PROMPT).expect("the pass's last line");
+    assert!(line.contains(PASS_DONE), "{line}");
+
+    let tokio = tokio::runtime::Runtime::new().expect("runtime");
+    let (first, missing) = tokio.block_on(async {
+        let channel = Endpoint::from_shared(format!("http://{reapi}"))
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect");
+        let cas = Transfers::over(channel.clone(), TransferConfig::default());
+        let mut blobs = Vec::new();
+        for i in 0..20_u8 {
+            blobs.push(put(&cas, vec![i; MIB]).await);
+        }
+        let line = lines.recv_timeout(PROMPT).expect("an eviction round");
+        assert!(line.contains(EVICTED), "{line}");
+        let request = FindMissingBlobsRequest {
+            blob_digests: vec![blobs[0].clone()],
+            ..FindMissingBlobsRequest::default()
+        };
+        let answer = ContentAddressableStorageClient::new(channel)
+            .find_missing_blobs(request)
+            .await
+            .expect("FindMissingBlobs");
+        (blobs[0].clone(), answer.into_inner().missing_blob_digests)
+    });
+    assert_eq!(missing, [first], "the least recently used blob was kept");
 }
+
+/// The start-up pass's last line (`kbf-server`'s `startup_pass`).
+const PASS_DONE: &str = "start-up pass over the cold store directory done";
+
+/// What a round of eviction that evicted logs (`kbf-front`'s `Cache::evict_round`).
+const EVICTED: &str = "evicted the least recently used objects";

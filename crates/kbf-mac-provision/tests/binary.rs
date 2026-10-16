@@ -226,3 +226,21 @@ fn execute_runs_each_verb_with_its_exit_status() {
     let verb = parse(&["print", "--profile", path]);
     assert_eq!(execute(&verb, &mac).unwrap().1, 0);
 }
+
+/// Catches: the deprecation warning for `kbf_scratch` not reaching stderr (an operator
+/// would never learn the key is going away), or leaking onto stdout, or changing the
+/// verb's exit status.
+#[test]
+fn the_old_key_warns_on_stderr_only() {
+    let mac = FakeMac::fresh("bin-old-key");
+    let text = mac.profile_text().replace("kbf_data_dir=", "kbf_scratch=");
+    let path = mac.profile_file(&text);
+    let o = run(&["print", "--profile", path.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(
+        stderr(&o),
+        "kbf-mac-provision: warning: profile line 32: kbf_scratch is deprecated, use kbf_data_dir (treated as kbf_data_dir)\n"
+    );
+    assert!(!stdout(&o).contains("deprecated"));
+    assert!(stdout(&o).contains("kbf_data_dir=/Volumes/kbf/data"));
+}

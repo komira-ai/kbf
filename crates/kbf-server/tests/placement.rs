@@ -1,6 +1,6 @@
 //! Where an action ran and why it ran again, as the server tells it (issue #166): the
 //! node and the queue time in the result's `ExecutedActionMetadata`, each grant in the
-//! log at debug level, and each requeue at info with its operation, lease, node and
+//! log at info level, and each requeue at info with its operation, lease, node and
 //! reason.
 
 mod support;
@@ -113,7 +113,7 @@ async fn an_accepted_result_names_its_node_and_when_it_was_queued() {
 
 /// Catches: a lease given up without an info line naming its operation, lease, node
 /// and reason (a rerun could only be traced by the action printing its hostname); a
-/// grant not logged at debug level with its node; a requeued operation's
+/// grant not logged at info level with its node; a requeued operation's
 /// `queued_timestamp` reset to the requeue; and a result naming the node that lost
 /// the lease instead of the one that ran it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -163,7 +163,7 @@ async fn a_requeue_is_logged_and_the_result_names_the_node_that_ran_it() {
         ("requeue-b", current.lease_id),
     ] {
         let granted = lines_with(&[
-            "DEBUG",
+            "INFO",
             "lease granted",
             &operation,
             &lease_text(lease),

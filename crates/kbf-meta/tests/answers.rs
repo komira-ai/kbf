@@ -50,7 +50,9 @@ fn wrong_size_is_absent() {
 
 /// Catches: `FindMissingBlobs` that omits a digest (buck2 reads an omitted digest as
 /// present), drops a duplicate, reports a held-but-unreachable blob present (the client
-/// would then rely on bytes nobody can read), or touches what it reports missing.
+/// would then rely on bytes nobody can read), or touches what it reports missing; and
+/// one that names an object other than the present blob's as used (an evictor ranks by
+/// it).
 #[test]
 fn find_missing_lists_every_digest_not_present() {
     let mut m = meta();
@@ -64,6 +66,7 @@ fn find_missing_lists_every_digest_not_present() {
     assert_eq!(answer.missing, vec![absent, lost, absent]);
     assert_eq!(answer.touch.blobs, [present].into());
     assert!(answer.touch.actions.is_empty());
+    assert_eq!(answer.objects, [in_segment(1, 0).object].into());
 }
 
 /// Catches: an upload of a held-but-unreachable blob that keeps the dead location (the

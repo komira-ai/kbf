@@ -3,18 +3,17 @@
 
 use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::serve::ListenerExt;
+use futures::StreamExt as _;
 use futures::future::Either;
-use futures::{Stream, StreamExt as _};
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
     ByteStreamService, CONNECTION_WINDOW_BYTES, Cache, CasService, Connections,
     MAX_CONCURRENT_STREAMS, MAX_MESSAGE_BYTES, MetaLog, RECORDER_CHANNEL, Recorder,
-    RequestMetadataLayer, STREAM_WINDOW_BYTES, SegmentsConfig, SegmentsService, Tracked,
+    RequestMetadataLayer, STREAM_WINDOW_BYTES, SegmentsConfig, SegmentsService,
 };
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
@@ -23,7 +22,6 @@ use kbf_proto::reapi::content_addressable_storage_server::ContentAddressableStor
 use kbf_proto::worker::segments_server::SegmentsServer;
 use kbf_proto::worker::worker_server::WorkerServer;
 use kbf_sched::MemoryLadder;
-use tokio::net::TcpStream;
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, ServerTlsConfig};
@@ -125,12 +123,11 @@ pub enum ServeError {
 
 /// A server that is listening: the addresses it bound, and the future that serves
 /// until shutdown.
-pub struct Bound<F, W = SocketAddr> {
+pub struct Bound<F> {
     /// Where the REAPI listener is.
     pub reapi: SocketAddr,
-    /// Where the worker listener is: its address, or from [`bind_server_for`] an
-    /// `Option` of it, `None` for [`Daemons::InProcess`], which binds none.
-    pub worker: W,
+    /// Where the worker listener is.
+    pub worker: SocketAddr,
     /// Where the operator API listener is, if there is one.
     pub api: Option<SocketAddr>,
     /// What `GET /readyz` reads besides the store; the serving future marks it
@@ -142,18 +139,9 @@ pub struct Bound<F, W = SocketAddr> {
     /// The invocation records the serving future builds, which the build pages read
     /// ([`crate::http_invocations`]); tests feed it events.
     pub recorder: Recorder,
-    /// The worker service as calls in this process, for a daemon run in it.
+    /// The worker service as calls in this process, for a daemon run in it, beside the
+    /// worker listener's remote daemons.
     pub local: LocalWorker,
-}
-
-/// Where a server's daemons reach its `kbf.worker.v1` service.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Daemons {
-    /// Over the network, through the worker listener (`kbf-server`).
-    Remote,
-    /// In this process only, through [`LocalWorker`] (`kbf-all-in-one`): no worker
-    /// listener is bound, so no daemon elsewhere can reach the server.
-    InProcess,
 }
 
 /// Aborts its task when dropped.
@@ -307,79 +295,6 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    let listen = |addr| bind(addr).map(|(incoming, local)| (Some(incoming), local));
-    assemble(cache, listeners, api, policy, listen, shutdown)
-}
-
-/// [`bind_server_with_policy`], for daemons that reach the server as `daemons` says:
-/// with [`Daemons::InProcess`] the worker listener is not bound (`listeners.worker`
-/// and `listeners.worker_tls` are not read), and the server's daemon is the one that
-/// opens its sessions through [`Bound::local`]. Either way, that handle's sessions carry
-/// no certificate: they are admitted as on a plain-text worker listener, with no deny
-/// list.
-///
-/// # Errors
-/// As [`bind_server_with_policy`].
-pub fn bind_server_for<M, O>(
-    cache: Arc<Cache<M, O>>,
-    listeners: Listeners,
-    api: Option<Api>,
-    policy: Policy,
-    daemons: Daemons,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) -> Result<Bound<impl Future<Output = Result<(), ServeError>>, Option<SocketAddr>>, ServeError>
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
-    let listen = move |addr| listen_for(daemons, addr);
-    assemble(cache, listeners, api, policy, listen, shutdown)
-}
-
-/// The worker listener `daemons` calls for, bound at `addr`, and its address; none for
-/// [`Daemons::InProcess`].
-fn listen_for(
-    daemons: Daemons,
-    addr: SocketAddr,
-) -> Result<WorkerListen<Option<SocketAddr>>, ServeError> {
-    match daemons {
-        Daemons::Remote => bind(addr).map(|(incoming, local)| (Some(incoming), Some(local))),
-        Daemons::InProcess => Ok((None, None)),
-    }
-}
-
-/// The connections a worker listener accepts.
-type WorkerIncoming = Pin<Box<dyn Stream<Item = std::io::Result<Tracked<TcpStream>>> + Send>>;
-
-/// The connections `incoming` accepts, each tracked by `connections`; without a
-/// listener, a stream that never yields one, so the worker routes are never served.
-fn tracked(incoming: Option<TcpIncoming>, connections: Connections) -> WorkerIncoming {
-    match incoming {
-        Some(incoming) => {
-            Box::pin(incoming.map(move |accepted| accepted.map(|stream| connections.track(stream))))
-        }
-        None => Box::pin(futures::stream::pending()),
-    }
-}
-
-/// The worker listener [`assemble`] serves, if any, and what [`Bound::worker`] says of it.
-type WorkerListen<W> = (Option<TcpIncoming>, W);
-
-/// The server over `cache`, its worker listener bound by `listen` (given
-/// `listeners.worker`), or none when that returns no listener: then
-/// `listeners.worker_tls` is not read either.
-fn assemble<M, O, W>(
-    cache: Arc<Cache<M, O>>,
-    listeners: Listeners,
-    api: Option<Api>,
-    policy: Policy,
-    listen: impl FnOnce(SocketAddr) -> Result<WorkerListen<W>, ServeError>,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) -> Result<Bound<impl Future<Output = Result<(), ServeError>>, W>, ServeError>
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
     let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
     let default_memory = listeners.memory_ladder.first();
     let farm = Arc::new(
@@ -392,7 +307,7 @@ where
         .recording(recorder.clone()),
     );
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
-    let (worker_incoming, worker) = listen(listeners.worker)?;
+    let (worker_incoming, worker) = bind(listeners.worker)?;
     let probe_timeout = listeners.store_probe_timeout;
     let (api_listen, token) = api.map_or((None, None), |api| (Some(api.listen), api.token));
     let api_listener = api_listen.map(bind_api).transpose()?;
@@ -421,9 +336,7 @@ where
         reapi_server = reapi_server.tls_config(tls)?;
     }
     let mut worker_server = flow_control(Server::builder());
-    // Not read without a worker listener.
-    let worker_tls = listeners.worker_tls.filter(|_| worker_incoming.is_some());
-    let peers = match worker_tls {
+    let peers = match listeners.worker_tls {
         Some(tls) => {
             worker_server = worker_server.tls_config(tls.server)?;
             Peers::Certified {
@@ -448,13 +361,16 @@ where
     // connection that began it closes.
     let connections = Connections::new();
     let tracking = connections.clone();
-    let worker_incoming = tracked(worker_incoming, tracking);
+    let worker_incoming =
+        worker_incoming.map(move |accepted| accepted.map(|stream| tracking.track(stream)));
     let worker_segments = SegmentsServer::new(WorkerSegments::new(
         SegmentsService::new(Arc::clone(&cache), listeners.segments, connections),
         peers.clone(),
     ))
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    // Sessions opened in this process carry no certificate: admitted as on a
+    // plain-text listener, with no deny list.
     let local = LocalWorker::new(WorkerService::new(
         Arc::clone(&farm),
         Peers::Unauthenticated,
@@ -512,7 +428,6 @@ where
             .serve_with_incoming_shutdown(reapi_incoming, async {
                 let _ = draining.await;
             });
-        // Without a worker listener, never completes.
         let worker_serve = worker_server
             .add_service(worker_service)
             .add_service(worker_blobs)

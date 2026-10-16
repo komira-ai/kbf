@@ -332,3 +332,47 @@ fn evict_of_nothing_held_changes_nothing() {
     assert_eq!(evict(&mut m, &[object(9)]), Evicted::default());
     assert_eq!(m, before);
 }
+
+/// Catches the start-up pass's question "which objects does the index name?" answered
+/// wrongly: an object named only by a blob's old location kept after the blob healed
+/// elsewhere (mutant: names taken from the unreachable marks too), so the pass would
+/// keep an orphan; a staged object left out, so the pass would delete a file the
+/// flusher just wrote; or an object a blob still names left out.
+#[test]
+fn indexed_objects_names_current_locations_staged_included() {
+    let mut m = meta();
+    let tier = TierId::new(7);
+    let added = m.execute(
+        ANY_INDEX,
+        Command::AddTier {
+            server: ServerId::new(1),
+            tier,
+        },
+    );
+    assert_eq!(added, Applied::Tier(Ok(())));
+    let staged = m.execute(
+        ANY_INDEX,
+        Command::PutStaged {
+            tier,
+            objects: vec![StagedPut {
+                object: object(5),
+                end: 100,
+                seal: false,
+                blobs: vec![(digest(1), 0)],
+            }],
+        },
+    );
+    assert!(matches!(staged, Applied::Staged(Ok(_))), "{staged:?}");
+    put(&mut m, digest(2), in_segment(2, 0));
+    put(&mut m, digest(3), in_segment(2, 1));
+    put(&mut m, digest(4), in_segment(3, 0));
+    mark_missing(&mut m, 3);
+    // `digest(4)` heals into object 4: object 3 holds nothing any more.
+    assert!(matches!(
+        put(&mut m, digest(4), in_segment(4, 0)),
+        BlobWrite::Healed { .. }
+    ));
+
+    let want: std::collections::BTreeSet<ObjectId> = [object(2), object(4), object(5)].into();
+    assert_eq!(m.indexed_objects(), want);
+}

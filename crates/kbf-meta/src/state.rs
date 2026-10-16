@@ -437,14 +437,20 @@ impl MetaState {
     /// or present-and-touched; none is omitted.
     #[must_use]
     pub fn find_missing(&self, digests: &[Digest]) -> FindMissing {
-        let missing = digests
-            .iter()
-            .filter(|d| !matches!(self.blob(d), BlobAnswer::Present { .. }))
-            .copied()
-            .collect();
+        let mut missing = Vec::new();
+        let mut objects = BTreeSet::new();
+        for digest in digests {
+            match self.blob(digest) {
+                BlobAnswer::Present { location, .. } => {
+                    objects.insert(location.object);
+                }
+                BlobAnswer::Unavailable | BlobAnswer::Absent => missing.push(*digest),
+            }
+        }
         FindMissing {
             missing,
             touch: self.touch_for(digests),
+            objects,
         }
     }
 

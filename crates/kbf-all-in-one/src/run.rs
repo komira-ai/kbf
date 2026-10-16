@@ -67,16 +67,15 @@ impl fmt::Display for Failed {
     }
 }
 
-/// The server half on a runtime of its own, with no worker listener, then the daemon
-/// half over the in-process planes, data and control; returns once the server half has
-/// stopped and the daemon half after it.
+/// The server half on a runtime of its own, its worker listener serving remote daemons,
+/// then the daemon half over the in-process planes, data and control; returns once the
+/// server half has stopped and the daemon half after it.
 fn serve(flags: &Flags) -> Result<(), Failed> {
     let sizes = kbf_server::sizes_on(&flags.server, Topology::detect());
     sizes.log();
     let tokio = sizes.runtime().map_err(Failed::server)?;
-    let in_process = kbf_server::Daemons::InProcess;
-    let start = kbf_server::start_for(&flags.server, in_process, kbf_server::interrupted);
-    let server = tokio.block_on(start).map_err(Failed::server)?;
+    let started = tokio.block_on(kbf_server::start(&flags.server, kbf_server::interrupted));
+    let server = started.map_err(Failed::server)?;
     println!("{}", server.start_line());
     let plane = Arc::new(LocalDataPlane::new(server.local(), tokio.handle().clone()));
     let control = LocalControlPlane::new(server.local_worker(), tokio.handle().clone());

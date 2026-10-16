@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use kbf_meta::TierId;
-use kbf_objstore::KeyError;
+use kbf_objstore::{Floor, KeyError};
 use kbf_threads::disk::FreeSpace;
 use percent_encoding::percent_decode_str;
 
@@ -41,9 +41,12 @@ pub const DEFAULT_S3_PREFIX: &str = "kbf/";
 /// The key prefix root under a `file://` cold store: objects go under `kbf/<log id>/`.
 pub const FILE_PREFIX_ROOT: &str = "kbf/";
 
-/// The free bytes a `file://` cold store's filesystem must keep: a write that would
-/// leave less is refused (the upload is answered UNAVAILABLE), since nothing is evicted.
-pub const COLD_FILE_MIN_FREE_BYTES: u64 = 1 << 30;
+/// The free space a `file://` cold store's filesystem must keep: `kbf_threads::disk`'s
+/// `keep_free`, 5% of its size and at least 1 GiB, as for every directory that evicts
+/// to a floor. A write that would leave less is refused (the upload is answered
+/// UNAVAILABLE) and wakes the evictor, which forgets the least recently used objects
+/// and deletes their files while less than twice the floor is free.
+pub const COLD_FILE_FLOOR: Floor = Floor::KeepFree;
 
 /// The share of the hot store filesystem's free space (less the floor) its budget is.
 pub const HOT_STORE_SHARE_PERCENT: u64 = 80;
