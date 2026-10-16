@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use super::config::LinuxConfig;
+use super::config::{LOOPBACK_MINIO, LinuxConfig};
 use crate::template::{self, TemplateError, Value, Values};
 
 /// What `render-units` writes when `--kbf-uid` is not given: the kbf user's uid (the
@@ -116,7 +116,11 @@ pub(super) fn values(c: &LinuxConfig, kbf_uid: Option<u32>) -> Values {
         ("MINIO_UNIT", Value::Text(c.minio_unit.clone())),
         (
             "MINIO_S3_ENDPOINT",
-            Value::Text(c.minio_s3_endpoint.clone()),
+            Value::Text(
+                c.minio_s3_endpoint
+                    .clone()
+                    .unwrap_or_else(|| LOOPBACK_MINIO.to_owned()),
+            ),
         ),
         ("KBF_S3_BUCKET", Value::Text(c.s3_bucket.clone())),
         ("KBF_LISTEN_HOST", Value::Text(c.listen_host())),

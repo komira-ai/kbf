@@ -28,7 +28,9 @@ KBF_DAEMON_MEMORY_MIN_MIB=256
 # --- MinIO ---
 # The host's MinIO systemd unit, which the drop-in extends.
 MINIO_UNIT=minio.service
-# kbf-server's S3 endpoint: the host's own MinIO node.
+# The bucket's S3 endpoint. Left out, the converged units use the host's own MinIO
+# (http://127.0.0.1:9000); `render-units --mode storage` refuses without it, since a
+# storage node's MinIO need not be on the node.
 MINIO_S3_ENDPOINT=http://127.0.0.1:9000
 KBF_S3_BUCKET=kbf-cas
 

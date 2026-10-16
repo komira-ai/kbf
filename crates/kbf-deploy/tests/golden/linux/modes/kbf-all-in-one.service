@@ -55,6 +55,12 @@ ExecStart=/usr/local/bin/kbf all-in-one \
     --supervisor-memory-min-mib=256
 # TODO: the certificate flags of the new modes, which replace the worker
 # listener's, once `kbf all-in-one` has them.
+# kbf drains on SIGTERM: it refuses new builds and keeps every open Execute stream
+# until its action is done, with no deadline (--shutdown-timeout-secs 0). A stop that
+# ends sooner fails every build in flight, so systemd sends SIGTERM and never kills it
+# for taking long (check-units rule `stop`).
+KillSignal=SIGTERM
+TimeoutStopSec=infinity
 Restart=on-failure
 # Exit 2 is a command line kbf refused: a restart cannot fix it.
 RestartPreventExitStatus=2
