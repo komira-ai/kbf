@@ -169,6 +169,15 @@ pub struct Args {
     /// the blob route do, and they are off unless it names their authorizers.
     #[arg(long)]
     pub reapi_auth_policy: Option<PathBuf>,
+    /// Proxy mode (`docs/design/architecture-v2.md`, section 7): the URL of a storage
+    /// node (`kbf storage`), such as `http://127.0.0.1:8990`. The REAPI listener then
+    /// answers a client's CAS, ByteStream and action-cache calls from that node, passing
+    /// ByteStream through without holding a blob. The local stores are still opened:
+    /// Execution and the worker listener use them until the scheduler uses storage.
+    /// Plain text (`http://`) only; the node's mutual
+    /// TLS is not wired yet. Without it, the server answers those calls itself.
+    #[arg(long, value_name = "URL")]
+    pub storage: Option<String>,
     /// The `kbf.worker.v1` listener. Without mutual TLS (`--worker-tls-cert`,
     /// `--worker-tls-key`, `--worker-client-ca`) it serves plain text, on any address;
     /// off loopback the start line carries a warning.
@@ -432,6 +441,13 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    /// `--storage` is not a URL.
+    #[error("--storage {url:?}: {source}")]
+    Storage {
+        url: String,
+        #[source]
+        source: tonic::transport::Error,
+    },
     /// A segment upload could declare more than uploads may hold at once.
     #[error(
         "--segment-upload-max-bytes {cap} is over --write-bytes-in-flight {bound}: \
@@ -602,6 +618,24 @@ impl Args {
             policy.blobs_get.get_or_insert_with(allow);
         }
         Ok(policy)
+    }
+
+    /// The storage node `--storage` names, if given.
+    ///
+    /// # Errors
+    /// The URL is not one.
+    pub fn storage(&self) -> Result<Option<tonic::transport::Endpoint>, ConfigError> {
+        self.storage
+            .as_ref()
+            .map(|url| {
+                tonic::transport::Endpoint::from_shared(url.clone()).map_err(|source| {
+                    ConfigError::Storage {
+                        url: url.clone(),
+                        source,
+                    }
+                })
+            })
+            .transpose()
     }
 
     /// The operator API these flags describe, if `--api-listen` is given, with the

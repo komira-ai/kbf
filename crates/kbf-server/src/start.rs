@@ -34,7 +34,8 @@ use crate::startup_pass::StartPass;
 use crate::stores::{COLD_FILE_FLOOR, FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
 use crate::{
-    Args, RaftMetaLog, SERVER_VERSION, ServeError, StateStoreUri, bind_server_with_state, s3_store,
+    Args, RaftMetaLog, SERVER_VERSION, ServeError, StateStoreUri, bind_server_with_options,
+    s3_store,
 };
 
 /// The server's thread sizes on a given machine shape: every CPU, then the overrides.
@@ -239,7 +240,8 @@ where
     let _pass = pass.map(|pass| AbortOnDrop(crate::startup_pass::spawn(Arc::clone(&cache), pass)));
     let shutdown = shutdown()?;
     let api = args.api()?;
-    let bound = bind_server_with_state(cache, listeners, api, policy, state, shutdown)?;
+    let storage = args.storage()?;
+    let bound = bind_server_with_options(cache, listeners, api, policy, state, storage, shutdown)?;
     let plain = args.plain_text_off_loopback();
     Ok(ServerHandle {
         reapi: bound.reapi,

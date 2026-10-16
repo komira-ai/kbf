@@ -242,6 +242,21 @@ fn bind_api(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), S
     bound.map_err(|source| ServeError::Bind { addr, source })
 }
 
+/// The worker listener's TLS and the way its peers are told apart. Not generic, so
+/// both arms are one set of lines whatever the cache types (a per-instantiation copy
+/// that misses one arm would count as missed lines).
+fn worker_peers(server: Server, tls: Option<WorkerTls>) -> Result<(Server, Peers), ServeError> {
+    Ok(match tls {
+        Some(tls) => (
+            server.tls_config(tls.server)?,
+            Peers::Certified {
+                deny_list: tls.deny_list,
+            },
+        ),
+        None => (server, Peers::Unauthenticated),
+    })
+}
+
 /// `server` with the HTTP/2 limits a listener states rather than leaves to the
 /// transport's defaults: at most `max_streams` open streams per connection (each
 /// listener its own, [`StreamLimits`]), and the stream and connection windows
@@ -360,7 +375,7 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_state(cache, listeners, api, policy, None, shutdown)
+    bind_server_with_options(cache, listeners, api, policy, None, None, shutdown)
 }
 
 /// [`bind_server_with_policy`], with the scheduler's state kept in `state` if given
@@ -374,6 +389,49 @@ pub fn bind_server_with_state<M, O>(
     api: Option<Api>,
     policy: Policy,
     state: Option<StateStore>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
+    bind_server_with_options(cache, listeners, api, policy, state, None, shutdown)
+}
+
+/// [`bind_server_with_policy`], and with a `storage` node (`--storage`) the REAPI
+/// listener proxies the client's CAS, ByteStream and action-cache calls to it
+/// ([`kbf_front::Proxy`]) instead of answering them from `cache`.
+///
+/// # Errors
+/// As [`bind_server_with_policy`].
+pub fn bind_server_with_storage<M, O>(
+    cache: Arc<Cache<M, O>>,
+    listeners: Listeners,
+    api: Option<Api>,
+    policy: Policy,
+    storage: Option<tonic::transport::Endpoint>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
+    bind_server_with_options(cache, listeners, api, policy, None, storage, shutdown)
+}
+
+/// [`bind_server_with_policy`] with both of its options: the scheduler's state in
+/// `state` ([`bind_server_with_state`]) and the client's CAS, ByteStream and
+/// action-cache calls proxied to a `storage` node ([`bind_server_with_storage`]).
+///
+/// # Errors
+/// As [`bind_server_with_state`].
+pub fn bind_server_with_options<M, O>(
+    cache: Arc<Cache<M, O>>,
+    listeners: Listeners,
+    api: Option<Api>,
+    policy: Policy,
+    state: Option<StateStore>,
+    storage: Option<tonic::transport::Endpoint>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
 where
@@ -429,15 +487,8 @@ where
         flow_control(Server::builder(), listeners.streams.worker),
         listeners.timing,
     );
-    let peers = match listeners.worker_tls {
-        Some(tls) => {
-            worker_server = worker_server.tls_config(tls.server)?;
-            Peers::Certified {
-                deny_list: tls.deny_list,
-            }
-        }
-        None => Peers::Unauthenticated,
-    };
+    let peers;
+    (worker_server, peers) = worker_peers(worker_server, listeners.worker_tls)?;
     let worker_blobs = ByteStreamServer::new(WorkerBlobs::new(
         ByteStreamService::new(Arc::clone(&cache)),
         peers.clone(),
@@ -474,15 +525,26 @@ where
     let (ticker, progress) = kbf_front::progress(listeners.timing.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);
-    let reapi_routes = kbf_front::routes_recorded(
-        cache,
-        Arc::clone(&farm),
-        closing,
-        progress,
-        authorizers,
-        &recorder,
-        default_memory,
-    );
+    let reapi_routes = match storage {
+        Some(node) => kbf_front::routes_proxied(
+            &kbf_front::Proxy::to_endpoint(&node, Arc::clone(&authorizers)),
+            cache,
+            Arc::clone(&farm),
+            kbf_front::OpenStreams { closing, progress },
+            authorizers,
+            &recorder,
+            default_memory,
+        ),
+        None => kbf_front::routes_recorded(
+            cache,
+            Arc::clone(&farm),
+            closing,
+            progress,
+            authorizers,
+            &recorder,
+            default_memory,
+        ),
+    };
     let authenticate = AuthenticateLayer::new(policy.authenticator);
     // The layers wrap the REAPI routes (and the fallback for unknown paths) present
     // when they are applied; the health service, added after, is answered without

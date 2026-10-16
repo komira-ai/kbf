@@ -57,6 +57,10 @@ fn each_error_answers_its_code_and_message() {
             Code::Unavailable,
         ),
         (StorageError::Internal("torn".into()), Code::Internal),
+        (
+            StorageError::StaleMap { current: 7 },
+            Code::FailedPrecondition,
+        ),
     ];
     for (error, code) in cases {
         let message = error.to_string();
@@ -72,4 +76,18 @@ fn each_error_answers_its_code_and_message() {
 fn unavailable_says_what_the_backend_said() {
     let error = StorageError::Unavailable(Arc::new(Backend));
     assert_eq!(error.to_string(), "the disk is gone");
+}
+
+/// Catches a STALE_MAP answer that does not say which generation the node holds (the
+/// caller could not know how new a map to fetch), or that names it in a spelling other
+/// than the metadata entry every storage call already carries the caller's generation in.
+#[test]
+fn a_stale_map_status_carries_the_nodes_generation() {
+    let status = tonic::Status::from(StorageError::StaleMap { current: 7 });
+    let header = status
+        .metadata()
+        .get(crate::service::MAP_GENERATION_HEADER)
+        .expect("the generation entry");
+    assert_eq!(header.to_str().expect("ASCII"), "7");
+    assert!(status.message().starts_with("STALE_MAP"), "{status:?}");
 }
