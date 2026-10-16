@@ -27,6 +27,7 @@
 
 pub mod local_cache;
 pub mod repair;
+pub mod replicate;
 pub mod service;
 
 use std::sync::Arc;
@@ -209,6 +210,15 @@ pub enum StorageError {
         /// The offset asked for.
         offset: u64,
     },
+    /// A write by a caller whose storage map is not the one this node holds: it is
+    /// behind (an older generation, or none), and `current` is the generation to fetch
+    /// before trying again. FAILED_PRECONDITION, with `current` in the
+    /// `kbf-map-generation` trailer ([`crate::replicate`]).
+    #[error("stale map: this node holds generation {current}")]
+    StaleMap {
+        /// The generation this node holds.
+        current: u64,
+    },
     /// A malformed request or stored message, or a blob over the largest the store
     /// accepts.
     #[error("{0}")]
@@ -233,6 +243,14 @@ impl From<StorageError> for Status {
         let message = e.to_string();
         match e {
             StorageError::NotFound(_) => Self::not_found(message),
+            StorageError::StaleMap { current } => {
+                let mut status = Self::failed_precondition(message);
+                status.metadata_mut().insert(
+                    service::MAP_GENERATION_HEADER,
+                    tonic::metadata::MetadataValue::from(current),
+                );
+                status
+            }
             StorageError::OutOfRange { .. } => Self::out_of_range(message),
             StorageError::DigestMismatch { .. } | StorageError::Invalid(_) => {
                 Self::invalid_argument(message)

@@ -7,6 +7,7 @@
 
 mod fake;
 mod roles;
+mod stale_map;
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

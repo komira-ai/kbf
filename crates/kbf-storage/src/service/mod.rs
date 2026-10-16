@@ -21,7 +21,10 @@
 //!
 //! **The map generation** (section 6) rides on every call: a field of every
 //! `kbf.storage.v1` request, and the [`MAP_GENERATION_HEADER`] metadata entry on the
-//! standard calls. A node with one member never reads it; [`RemoteStorage`] sends it.
+//! standard calls. [`RemoteStorage`] sends it. A node with no map ignores it; one given a
+//! [`crate::replicate::MapSource`] ([`StorageService::with_map`]) refuses a `Write` from a
+//! caller whose generation is not the map's: STALE_MAP for one behind it, UNAVAILABLE for
+//! one ahead of it. The other calls do not read it yet.
 //!
 //! **Who may call** is [`Admission`]: the role in the caller's certificate against the
 //! endpoint's table. Roles are the part of this unit that is partly a seam; the module
@@ -37,6 +40,7 @@ mod admission;
 mod bytestream;
 mod cas;
 mod client;
+mod generation;
 mod segments;
 #[cfg(test)]
 mod tests;
@@ -51,7 +55,8 @@ use kbf_proto::worker::segments_server::{Segments, SegmentsServer};
 use tokio::sync::Semaphore;
 use tonic::service::Routes;
 
-use crate::Storage;
+use crate::replicate::{self, MapSource};
+use crate::{Storage, StorageError};
 
 pub use admission::{Admission, Endpoint, PeerRole, ROLE_URI_PREFIX, role_of};
 pub use client::RemoteStorage;
@@ -90,6 +95,7 @@ pub struct StorageService {
     storage: Arc<dyn Storage>,
     segments: Arc<dyn Segments>,
     admission: Admission,
+    map: Option<Arc<dyn MapSource>>,
     write_room: Semaphore,
     write_room_bytes: u32,
 }
@@ -102,8 +108,26 @@ impl StorageService {
             segments: storage.segments(),
             storage,
             admission,
+            map: None,
             write_room: Semaphore::new(config.write_bytes_in_flight as usize),
             write_room_bytes: config.write_bytes_in_flight,
+        }
+    }
+
+    /// The service judging writes by the map `map` holds ([`crate::replicate`]): a write
+    /// from a caller whose generation is not that map's is refused before a byte is read.
+    #[must_use]
+    pub fn with_map(mut self, map: Arc<dyn MapSource>) -> Self {
+        self.map = Some(map);
+        self
+    }
+
+    /// Whether a write routed by map generation `requested` may be served now: always,
+    /// for a node with no map.
+    fn check_map(&self, requested: u64) -> Result<(), StorageError> {
+        match self.map.as_ref().and_then(|source| source.current()) {
+            Some(map) => replicate::check_generation(&map, requested),
+            None => Ok(()),
         }
     }
 

@@ -113,6 +113,9 @@ impl RemoteStorage {
 /// store that is held but unreadable is UNAVAILABLE too, so it is `Unavailable` here
 /// where it was `Unreachable` there.
 pub(super) fn lift(status: &Status, at: Option<(Digest, u64)>) -> StorageError {
+    if let Some(current) = stale_generation(status) {
+        return StorageError::StaleMap { current };
+    }
     let message = status.message().to_owned();
     match (status.code(), at) {
         (Code::NotFound, Some((digest, _))) => StorageError::NotFound(digest),
@@ -125,6 +128,22 @@ pub(super) fn lift(status: &Status, at: Option<(Digest, u64)>) -> StorageError {
         }
         _ => StorageError::Unavailable(Arc::new(Remote(message))),
     }
+}
+
+/// The generation a STALE_MAP answer names: FAILED_PRECONDITION with a decimal
+/// `kbf-map-generation` trailer. A FAILED_PRECONDITION without one is another refusal
+/// (an action-cache write whose closure is not held).
+fn stale_generation(status: &Status) -> Option<u64> {
+    if status.code() != Code::FailedPrecondition {
+        return None;
+    }
+    status
+        .metadata()
+        .get(MAP_GENERATION_HEADER)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
 }
 
 /// [`lift`] for a call that is not about one blob.

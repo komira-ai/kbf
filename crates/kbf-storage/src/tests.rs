@@ -43,6 +43,10 @@ fn each_error_answers_its_code_and_message() {
             Code::OutOfRange,
         ),
         (StorageError::Invalid("bad".into()), Code::InvalidArgument),
+        (
+            StorageError::StaleMap { current: 7 },
+            Code::FailedPrecondition,
+        ),
         (ActionWriteError::NotDaemon.into(), Code::PermissionDenied),
         (ActionWriteError::Absent(a).into(), Code::FailedPrecondition),
         (ActionWriteError::Unreachable(a).into(), Code::Unavailable),
@@ -66,4 +70,16 @@ fn each_error_answers_its_code_and_message() {
 fn unavailable_says_what_the_backend_said() {
     let error = StorageError::Unavailable(Arc::new(Backend));
     assert_eq!(error.to_string(), "the disk is gone");
+}
+
+/// Catches a STALE_MAP answered without the generation to fetch: it rides in the
+/// `kbf-map-generation` trailer, which is what tells it from the FAILED_PRECONDITION of a
+/// refused action-cache write.
+#[test]
+fn stale_map_names_the_generation_in_a_trailer() {
+    let status = tonic::Status::from(StorageError::StaleMap { current: 7 });
+    let trailer = status.metadata().get("kbf-map-generation");
+    assert_eq!(trailer.map(|v| v.to_str().expect("ASCII")), Some("7"));
+    let refused = tonic::Status::from(StorageError::from(ActionWriteError::Absent(digest(1))));
+    assert!(refused.metadata().get("kbf-map-generation").is_none());
 }
