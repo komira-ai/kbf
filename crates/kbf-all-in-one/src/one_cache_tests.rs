@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::cli::{command, parse};
+use crate::cli::{Flags, command, parse};
 
 /// A directory under the test binary's (unit tests get no `CARGO_TARGET_TMPDIR`); not
 /// made: the check judges a path by its nearest existing directory.
@@ -48,7 +48,7 @@ fn a_hot_store_on_the_data_directorys_disk_is_one_cache() {
         format!("--hot-store=file://{}", dir.join("hot").display()),
         format!("--data-dir={}", dir.join("data").display()),
     ]);
-    let local = share(&mut flags).expect("one cache");
+    let local = share(&mut flags.server, &mut flags.daemon).expect("one cache");
     let server = flags
         .server
         .local_cache
@@ -68,7 +68,10 @@ fn no_hot_store_or_one_on_another_disk_keeps_two() {
         let mut extra = hot.clone();
         extra.push(format!("--data-dir={}", dir.display()));
         let mut flags = flags(&extra);
-        assert!(share(&mut flags).is_none(), "{hot:?}");
+        assert!(
+            share(&mut flags.server, &mut flags.daemon).is_none(),
+            "{hot:?}"
+        );
         assert!(flags.server.local_cache.is_none());
         assert!(!daemon_shares(&flags));
     }

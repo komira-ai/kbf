@@ -31,6 +31,18 @@ const BOTH: &[&str] = &[
 /// What `kbf storage` needs to parse: nothing (its stores are checked at start).
 const STORAGE: &[&str] = &["kbf", names::STORAGE];
 
+/// What `kbf storage-and-daemon` needs to parse: the daemon's required flags.
+const CONVERGED: &[&str] = &[
+    "kbf",
+    names::STORAGE_AND_DAEMON,
+    "--driver=container",
+    "--server=https://127.0.0.1:8981",
+    "--ca-cert=ca.pem",
+    "--cert=node.pem",
+    "--key=node.key",
+    "--node-id=node-1",
+];
+
 fn with(base: &[&str], extra: &[&str]) -> Vec<String> {
     base.iter().chain(extra).map(|s| (*s).to_owned()).collect()
 }
@@ -58,18 +70,24 @@ fn each_mode_parses_its_flags() {
     let storage = parse_from(with(STORAGE, &["--storage-listen=127.0.0.1:9982"])).expect("storage");
     assert!(matches!(&storage, Invocation::Storage(flags)
         if flags.listen.to_string() == "127.0.0.1:9982" && flags.tls.is_none()));
-    for mode in ["frontend", "storage-and-daemon"] {
-        let inv = parse_from(["kbf", mode, "--any-flag=1", "positional"]).expect(mode);
-        assert!(
-            matches!(&inv, Invocation::NotBuilt { mode: m } if *m == mode),
-            "{inv:?}"
-        );
-    }
+    let converged = with(
+        CONVERGED,
+        &["--storage-listen=127.0.0.1:9982", "--cpu-threads=3"],
+    );
+    let converged = parse_from(converged).expect("storage-and-daemon");
+    assert!(matches!(&converged, Invocation::StorageAndDaemon(flags)
+        if flags.storage.listen.to_string() == "127.0.0.1:9982"
+            && format!("{:?}", flags.daemon).contains("cpu_threads: Some(3)")));
+    let inv = parse_from(["kbf", "frontend", "--any-flag=1", "positional"]).expect("frontend");
+    assert!(
+        matches!(&inv, Invocation::NotBuilt { mode: "frontend" }),
+        "{inv:?}"
+    );
 }
 
 /// Catches a table that is not exactly the five modes with the mapping the design
-/// gives (daemon and all-in-one run today's entries, the rest are not built), a duplicate mode, or a clap command that lists other modes than the
-/// table.
+/// gives (frontend alone not built yet), a duplicate mode, or a clap command that lists
+/// other modes than the table.
 #[test]
 fn the_table_has_exactly_five_modes_and_their_entries() {
     let table: Vec<(&str, Entry)> = MODES.iter().map(|m| (m.name, m.entry)).collect();
@@ -79,7 +97,7 @@ fn the_table_has_exactly_five_modes_and_their_entries() {
             ("frontend", Entry::NotBuilt),
             ("storage", Entry::Storage),
             ("daemon", Entry::Daemon),
-            ("storage-and-daemon", Entry::NotBuilt),
+            ("storage-and-daemon", Entry::StorageAndDaemon),
             ("all-in-one", Entry::AllInOne),
         ]
     );
@@ -452,11 +470,13 @@ fn check_args_parses_the_words_after_check_args() {
         ]),
         Ok(())
     );
+    let mut converged = vec!["kbf", CHECK_ARGS];
+    converged.extend(&CONVERGED[1..]);
+    assert_eq!(check(&converged), Ok(()));
     let e = check(&["kbf", CHECK_ARGS, names::STORAGE_AND_DAEMON]).expect_err("refused");
-    assert!(
-        e.contains("kbf storage-and-daemon: mode not built yet"),
-        "{e}"
-    );
+    assert!(e.contains("required arguments were not provided"), "{e}");
+    let e = check(&["kbf", CHECK_ARGS, names::FRONTEND]).expect_err("refused");
+    assert!(e.contains("kbf frontend: mode not built yet"), "{e}");
     for word in ["--help", "--version"] {
         let e = check(&["kbf", CHECK_ARGS, word]).expect_err("refused");
         assert!(e.contains("the mode would not start"), "{word}: {e}");

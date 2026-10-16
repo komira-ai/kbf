@@ -262,7 +262,7 @@ where
 
 /// Reports local storage's `bytes` to the node's one cache, if the process has one.
 /// Not generic, so it is compiled once whatever the store.
-fn share_storage(local: Option<&Arc<LocalCache>>, bytes: HeldBytes) {
+pub(crate) fn share_storage(local: Option<&Arc<LocalCache>>, bytes: HeldBytes) {
     if let Some(local) = local {
         local.attach_storage(bytes);
     }
@@ -271,7 +271,9 @@ fn share_storage(local: Option<&Arc<LocalCache>>, bytes: HeldBytes) {
 /// What `cache`'s write tier holds on its disk now: its blocks, and any flushed copies
 /// it keeps; 0 without a tier or once the server is gone (a weak handle, as the input
 /// cache's side is: the one cache keeps neither half alive).
-fn tier_bytes<M: MetaLog, O: ObjectStore + 'static>(cache: Weak<Cache<M, O>>) -> HeldBytes {
+pub(crate) fn tier_bytes<M: MetaLog, O: ObjectStore + 'static>(
+    cache: Weak<Cache<M, O>>,
+) -> HeldBytes {
     Box::new(move || {
         cache
             .upgrade()

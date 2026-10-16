@@ -30,6 +30,14 @@
 //!   answers every digest missing, as the transfer engine's does.
 //!
 //! A server half that is gone (its runtime shut down) fails each call UNAVAILABLE.
+//!
+//! **Over any storage.** The plane knows the store only as [`kbf_storage::Storage`]
+//! (`LocalStore::over`), so it is the one adapter from the daemon's `Cas` to the
+//! storage boundary: `kbf all-in-one` gives it the server's cache, `kbf
+//! storage-and-daemon` the storage node's (`crate::storage_and_daemon`), and over a
+//! `kbf_storage::service::RemoteStorage` it reads and writes a storage node over gRPC
+//! with the same answers (tests/storage_plane.rs runs one suite over both). "The server
+//! half" above is whichever runtime the storage's calls run on.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -185,6 +193,10 @@ impl Cas for LocalDataPlane {
         Arc::clone(self)
     }
 
+    /// The whole blob, in memory: [`Cas`] makes this a `Vec`. The daemon calls it only
+    /// for what it decodes (the action, its command, the input tree's directories,
+    /// bounded by the message size); every input file is a [`Cas::read_to`], which
+    /// streams.
     async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
         let blob = label(digest);
         let Some(parsed) = parse(digest) else {

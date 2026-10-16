@@ -44,6 +44,8 @@
 //!   served alone over gRPC by `kbf_storage::service` (blobs through the standard
 //!   protocols, the action cache through `kbf.storage.v1`), each call admitted by the
 //!   role in the caller's certificate. No scheduler, REAPI or state store.
+//!   [`storage_half`] is the same start for `kbf storage-and-daemon`, keeping the storage
+//!   its listener serves for the daemon half in the same process.
 //!
 //! Not yet: the scheduler's state in the Raft log (the control log is in-process: a
 //! record commits as soon as it is appended, see [`farm`]), REAPI authentication other than the policies
@@ -79,6 +81,7 @@ pub mod stamp;
 mod start;
 mod startup_pass;
 pub mod state_store;
+pub mod storage_half;
 pub mod storage_node;
 pub mod stores;
 mod timeout;

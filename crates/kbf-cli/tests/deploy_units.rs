@@ -60,6 +60,24 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
                     ]
                 );
             }
+            Invocation::StorageAndDaemon(flags) => {
+                assert_eq!(mode, Mode::StorageAndDaemon);
+                // The storage half's certificate flags are read as the storage unit's
+                // are, and the daemon half's are its own.
+                let paths = flags
+                    .storage
+                    .tls
+                    .expect("the storage half turns on mutual TLS");
+                assert_eq!(
+                    paths.map(|p| p.display().to_string()),
+                    [
+                        "/etc/kbf/storage.pem",
+                        "/etc/kbf/storage.key",
+                        "/etc/kbf/ca.pem"
+                    ]
+                );
+                assert!(format!("{:?}", flags.daemon).contains("/etc/kbf/node.pem"));
+            }
             Invocation::NotBuilt { mode: m, .. } => {
                 assert_eq!(m, mode.name());
                 assert_eq!(argv.len(), 2, "kbf {mode} is not built: {argv:?}");

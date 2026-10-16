@@ -1,8 +1,7 @@
 # Rendered by `kbf-deploy linux render-units --mode storage-and-daemon`; installed as
 # /etc/systemd/system/kbf-storage-and-daemon.service (kbf
-# docs/design/architecture-v2.md, sections 1 and 11). `kbf storage-and-daemon` is not
-# built yet: it exits 2 at start, and `check-units --mode
-# storage-and-daemon` refuses any flag on its command line until kbf takes some.
+# docs/design/architecture-v2.md, sections 1 and 11). The daemon half reads and writes
+# the node's storage in-process; its control plane dials --server.
 [Unit]
 Description=kbf build farm storage node and node daemon
 Wants=network-online.target
@@ -23,9 +22,24 @@ CPUWeight=300
 Environment=XDG_RUNTIME_DIR=/run/user/1500
 # TODO: the cold store's key, readable by the storage half's uid and not by the
 # actions' (design section 9); no EnvironmentFile= until that split exists.
-ExecStart=/usr/local/bin/kbf storage-and-daemon
-# TODO: the mode's flags (the storage node's and the daemon's, --frontend,
-# --advertise-addr, the certificate flags), once `kbf storage-and-daemon` has them.
+ExecStart=/usr/local/bin/kbf storage-and-daemon \
+    --storage-tls-cert=/etc/kbf/storage.pem \
+    --storage-tls-key=/etc/kbf/storage.key \
+    --storage-client-ca=/etc/kbf/ca.pem \
+    --driver=container \
+    --server=https://storage-node.example.internal:8981 \
+    --ca-cert=/etc/kbf/ca.pem \
+    --cert=/etc/kbf/node.pem \
+    --key=/etc/kbf/node.key \
+    --node-id=storage-node-1 \
+    --data-dir=/var/lib/kbf \
+    --actions-memory-max-gib=200 \
+    --supervisor-memory-min-mib=256
+# The storage half's flags are the storage unit's (its three certificate flags; no
+# --cas: the daemon half reads the node's storage in-process), then the daemon unit's.
+# TODO: the rest of the storage half's flags, as the storage unit gets them
+# (--cold-store, --meta-dir, --hot-store on --data-dir's filesystem for the one cache,
+# --storage-listen), and --frontend and --advertise-addr with the map.
 Restart=on-failure
 # Exit 2 is a command line kbf refused (or a mode not built yet): a restart cannot fix it.
 RestartPreventExitStatus=2

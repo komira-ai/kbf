@@ -20,6 +20,9 @@
 //!
 //! Linux only, the container driver only: elsewhere [`main`] exits 2 saying so.
 //!
+//! The crate also holds `kbf storage-and-daemon` ([`storage_and_daemon`]): the same
+//! daemon half and the same plane, beside the storage node in place of the server.
+//!
 //! Not done yet (the README lists it): a durable scheduler state, without which a restart
 //! loses every lease; the in-process plane's admission; the `--reserve-cpus` split
 //! between the halves; the whole-process
@@ -33,6 +36,7 @@ mod one_cache;
 mod plane;
 #[cfg(target_os = "linux")]
 mod run;
+pub mod storage_and_daemon;
 
 pub use plane::LocalDataPlane;
 

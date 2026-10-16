@@ -1,7 +1,8 @@
-//! Whether the two halves keep one cache (`kbf_storage::local_cache`): the daemon's
-//! input cache and the server's hot store share a disk, so the input cache's directory
-//! and index are the node's only local copies of blobs, the hot store keeps no flushed
-//! copies beside them, and one budget and one fill count both.
+//! Whether the two halves keep one cache (`kbf_storage::local_cache`), in either mode
+//! (`kbf all-in-one`'s server half, `kbf storage-and-daemon`'s storage half): the
+//! daemon's input cache and that half's hot store share a disk, so the input cache's
+//! directory and index are the node's only local copies of blobs, the hot store keeps no
+//! flushed copies beside them, and one budget and one fill count both.
 //!
 //! Only when the hot store is a directory on the filesystem of `--data-dir`: with no hot
 //! store, local storage keeps nothing on this disk but the cold store (the durable store,
@@ -12,16 +13,16 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 use std::sync::Arc;
 
+use kbf_server::Args;
 use kbf_server::stores::StoreUri;
 use kbf_storage::local_cache::LocalCache;
 
-use crate::cli::Flags;
-
-/// Gives both halves of `flags` the one cache when the hot store shares the data
-/// directory's disk; the cache, or `None` (each half as without the other).
-pub(crate) fn share(flags: &mut Flags) -> Option<Arc<LocalCache>> {
-    let data = flags.daemon.data_dir();
-    let Some(StoreUri::File(hot)) = &flags.server.hot_store else {
+/// Gives both halves (`server`, the server or storage half's flags, and `daemon`) the
+/// one cache when the hot store shares the data directory's disk; the cache, or `None`
+/// (each half as without the other).
+pub(crate) fn share(server: &mut Args, daemon: &mut kbf_node::Cli) -> Option<Arc<LocalCache>> {
+    let data = daemon.data_dir();
+    let Some(StoreUri::File(hot)) = &server.hot_store else {
         tracing::info!("one cache: off (no hot store directory)");
         return None;
     };
@@ -31,8 +32,8 @@ pub(crate) fn share(flags: &mut Flags) -> Option<Arc<LocalCache>> {
         return None;
     }
     let local = Arc::new(LocalCache::new());
-    flags.server.local_cache = Some(Arc::clone(&local));
-    flags.daemon.share_cache(Arc::clone(&local));
+    server.local_cache = Some(Arc::clone(&local));
+    daemon.share_cache(Arc::clone(&local));
     let (hot, data) = (hot.display(), data.display());
     tracing::info!("one cache: {data}/cache, with the hot store {hot} on its filesystem");
     Some(local)
