@@ -158,6 +158,41 @@ async fn concurrent_writes_stay_under_the_bytes_in_flight() {
     }
 }
 
+/// 300 concurrent 2 MiB Writes over one connection to the REAPI listener, as
+/// `bind_server` sets it up (10000 streams allowed), against a 6 MiB bound: three are
+/// admitted at a time and 297 wait, each leaving a stream window's worth of its data
+/// unread. Every Write finishes. The deadline detects a hang, not a speed.
+///
+/// Catches: a connection window smaller than the streams the listener allows times
+/// the stream window. With a fixed 200 MiB window and 10000 streams, the unread data of
+/// more than 200 waiting Writes takes the whole window and the admitted ones never get
+/// their last message (the timeout fires). Mutants seen red: `CONNECTION_WINDOW_BYTES`
+/// as the REAPI listener's window again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn more_waiting_writes_than_a_fixed_window_holds_all_finish() {
+    const WAITING_BLOB: usize = 2 << 20;
+    const MANY: usize = 300;
+    const MANY_BOUND: u64 = 3 * WAITING_BLOB as u64;
+    let (_cache, channel) = serve(MANY_BOUND).await;
+    let mut calls = Vec::new();
+    for i in 0..MANY {
+        let (_, messages) = upload_sized(i, WAITING_BLOB);
+        let mut client = ByteStreamClient::new(channel.clone());
+        calls.push(tokio::spawn(async move {
+            client.write(stream::iter(messages)).await
+        }));
+    }
+    let all = async {
+        for call in calls {
+            let response = call.await.expect("join").expect("write").into_inner();
+            assert_eq!(response.committed_size, WAITING_BLOB as i64);
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(120), all)
+        .await
+        .expect("every Write finishes");
+}
+
 /// Catches: a bound that admits one Write at a time (a lock, not a byte budget), and a
 /// Write whose bytes stop counting before the whole blob has arrived. The overlap is
 /// made, not hoped for (kbf#691): two Writes each send all but their last message,
@@ -235,11 +270,16 @@ async fn serve(bytes_in_flight: u64) -> (Arc<Cache<MemoryMetaLog, TailStore>>, C
 /// Blob `i` (of [`BLOB`] bytes, its own) and the Write messages that upload it, one
 /// [`CHUNK`] each.
 fn upload(i: usize) -> (Digest, Vec<WriteRequest>) {
-    let mut data = vec![0u8; BLOB];
+    upload_sized(i, BLOB)
+}
+
+/// Blob `i` of `blob` bytes and the Write messages that upload it, one [`CHUNK`] each.
+fn upload_sized(i: usize, blob: usize) -> (Digest, Vec<WriteRequest>) {
+    let mut data = vec![0u8; blob];
     data[..8].copy_from_slice(&(i as u64).to_le_bytes());
     let digest = kbf_segments::sha256(&data);
-    let name = format!("uploads/u{i}/blobs/{}/{BLOB}", digest.hash_hex());
-    let last = BLOB / CHUNK - 1;
+    let name = format!("uploads/u{i}/blobs/{}/{blob}", digest.hash_hex());
+    let last = blob / CHUNK - 1;
     let messages = data
         .chunks(CHUNK)
         .enumerate()
