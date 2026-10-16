@@ -13,10 +13,14 @@
 //! does not match; without one each record is hashed as its ranges arrive. Nothing here
 //! skips a check the listener's path makes.
 //!
-//! One call has no remote counterpart: a record streamed onto the write tier as its
+//! Two calls have no remote counterpart. A record streamed onto the write tier as its
 //! bytes are read ([`LocalStore::stream`], over `kbf_front::RecordStream`), so a large
-//! output is never held in memory on its way into the cache. Its digest is trusted at
-//! the commit as a segment upload's is with a tier, and checked by the flusher.
+//! output is never held in memory on its way into the cache: its digest is trusted at
+//! the commit as a segment upload's is with a tier, and checked by the flusher. And,
+//! without a tier or when it has no room, a record streamed straight to the object
+//! store ([`LocalStore::put_streamed`]), hashed as it passes and checked against the
+//! digest named at its end before the store completes it, as a ByteStream `Write` of a
+//! large blob is.
 //!
 //! Not here yet: admission. The worker listener admits every remote call by the
 //! daemon's certificate and the deny list; a local call is admitted by nothing.
@@ -24,12 +28,14 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::StreamExt as _;
 use futures::future::BoxFuture;
+use futures::stream::BoxStream;
 use kbf_front::{
     BlobRead, Cache, CacheError, Connections, MetaLog, RecordStream, SegmentsConfig,
     SegmentsService, StreamedRecord, VerifiedBlob,
 };
-use kbf_objstore::ObjectStore;
+use kbf_objstore::{ObjectStore, ObjectStoreError};
 use kbf_proto::worker::segments_server::Segments;
 use kbf_types::Digest;
 
@@ -48,6 +54,12 @@ trait Blobs: Send + Sync {
     fn put(&self, bytes: Vec<u8>) -> Answer<'_, Digest>;
     fn segments(&self) -> Arc<dyn Segments>;
     fn stream(&self, size: u64) -> Option<LocalStream>;
+    fn put_streamed(
+        &self,
+        size: u64,
+        bytes: BoxStream<'static, std::io::Result<Bytes>>,
+        claim: BoxFuture<'static, Option<Digest>>,
+    ) -> Answer<'_, Option<Digest>>;
 }
 
 /// [`LocalStream`]'s calls over a cache of any metadata log and object store.
@@ -183,6 +195,18 @@ impl<M: MetaLog, O: ObjectStore + 'static> Blobs for Over<M, O> {
         Some(LocalStream(Box::new(stream)))
     }
 
+    fn put_streamed(
+        &self,
+        size: u64,
+        bytes: BoxStream<'static, std::io::Result<Bytes>>,
+        claim: BoxFuture<'static, Option<Digest>>,
+    ) -> Answer<'_, Option<Digest>> {
+        let body = bytes
+            .map(|piece| piece.map_err(|e| ObjectStoreError::Body(e.to_string())))
+            .boxed();
+        Box::pin(self.cache.store_streamed_claimed(size, body, claim))
+    }
+
     fn segments(&self) -> Arc<dyn Segments> {
         // Its own uploads and connections: no other caller can name its uploads, and
         // having no connection, an upload it leaves is dropped when idle.
@@ -251,6 +275,27 @@ impl LocalStore {
     #[must_use]
     pub fn stream(&self, size: u64) -> Option<LocalStream> {
         self.inner.stream(size)
+    }
+
+    /// Stores a blob of `size` bytes straight to the object store as `bytes` come (a
+    /// multipart upload on S3), holding a piece of it at a time, whatever its size: how
+    /// an output over `kbf_front::MAX_UNSTAGED_BLOB_BYTES` is stored when the write
+    /// tier is missing or has no room for it. `claim` names the blob's digest once its
+    /// bytes ended (the bytes must hash to it, or nothing is stored), or `None` to
+    /// withdraw it: the upload is aborted and this answers `None`. Answers the digest
+    /// once the blob is present. Admitted as a ByteStream `Write` streamed to the store
+    /// is.
+    ///
+    /// # Errors
+    /// [`CacheError::DigestMismatch`] if the bytes do not hash to the claimed digest;
+    /// a piece of `bytes` failed; the store or the metadata log failed.
+    pub async fn put_streamed(
+        &self,
+        size: u64,
+        bytes: BoxStream<'static, std::io::Result<Bytes>>,
+        claim: BoxFuture<'static, Option<Digest>>,
+    ) -> Result<Option<Digest>, CacheError> {
+        self.inner.put_streamed(size, bytes, claim).await
     }
 
     /// A `Segments` service of its own over the cache: the one a remote upload's calls

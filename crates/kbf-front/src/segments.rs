@@ -8,8 +8,11 @@
 //! - **Begin** checks every footer and refuses an upload over [`MAX_UPLOAD_RECORDS`].
 //!   With a write tier, each segment's records get a range of their own on it, written
 //!   as they arrive; a segment the tier has no room for (or every segment, without a
-//!   tier) is held in memory until the commit, and may not hold a record over
-//!   [`MAX_UNSTAGED_BLOB_BYTES`]. The bytes held in memory may not pass
+//!   tier) is held in memory until the commit. Such a segment may not hold a record
+//!   over [`MAX_UNSTAGED_BLOB_BYTES`]: `Begin` answers FAILED_PRECONDITION
+//!   ([`unstaged_refusal`](crate::unstaged_refusal)), and the client sends the
+//!   upload's records blob by blob through ByteStream, whose `Write` streams a large
+//!   blob to the store. No record is refused for its size. The bytes held in memory may not pass
 //!   `--segment-upload-max-bytes`, and are admitted by [`Cache::admit`]
 //!   (`--write-bytes-in-flight`, the bound ByteStream and batch uploads share), waiting
 //!   (never refusing) while it is spent. An upload whose records all go to the tier
@@ -408,13 +411,15 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
             };
             if range.is_none() {
                 // A record held in memory until the commit must be small: memory is
-                // bounded per file, and without the tier there is no other way in.
+                // bounded per file. A larger one, with no tier to write it to, is sent
+                // by ByteStream instead, which streams it to the store: the client
+                // falls back to that at this answer.
                 let large = d
                     .entries
                     .iter()
                     .find(|e| e.digest.size_bytes > MAX_UNSTAGED_BLOB_BYTES);
                 if let Some(large) = large {
-                    return Err(Status::resource_exhausted(unstaged_refusal(
+                    return Err(Status::failed_precondition(unstaged_refusal(
                         &large.digest.to_string(),
                     )));
                 }

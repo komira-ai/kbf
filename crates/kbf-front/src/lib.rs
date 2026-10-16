@@ -124,25 +124,28 @@ pub const MAX_MESSAGE_BYTES: usize = MAX_BATCH_TOTAL_BYTES + (1 << 20);
 /// served in windows of [`READ_WINDOW_BYTES`]. A digest's size is an `i64`, so no blob
 /// is over `i64::MAX` bytes; sizes are added as `u64`, saturating.
 ///
-/// The largest blob a daemon's data plane may store without a write tier to stream it
-/// onto: 16 MiB. A segment upload (the remote plane) or the in-process plane's store
-/// that would have to hold a larger record whole in memory until its commit, because
-/// the server has no hot store or the tier has no room for it, is refused
-/// ([`unstaged_refusal`], RESOURCE_EXHAUSTED) rather than buffered: memory stays bounded
-/// per file. 16 MiB is where the write group already writes a blob as a segment of its
-/// own (`--write-own-segment-bytes`), four PutRange messages, and well under the 32 MiB
-/// upload a daemon batches small files into, so small outputs keep the in-memory path
-/// unchanged. A ByteStream `Write` of a larger blob streams it to the store instead.
+/// The largest blob a daemon's data plane holds in memory on its way into the cache:
+/// 16 MiB. A larger one is never held whole: with a write tier that has room for it, it
+/// is written onto the tier as it arrives (a segment upload's range, the in-process
+/// plane's stream); without one, or when the tier is full, it is streamed to the object
+/// store as it arrives (a ByteStream `Write`, the in-process plane's
+/// `Cache::store_streamed_claimed`). A segment upload that would have to hold one in
+/// memory until its commit is answered FAILED_PRECONDITION at `Begin`
+/// ([`unstaged_refusal`]), and the daemon sends its records by ByteStream instead. No
+/// blob is refused for its size. 16 MiB is where the write group already writes a blob
+/// as a segment of its own (`--write-own-segment-bytes`), four PutRange messages, and
+/// well under the 32 MiB upload a daemon batches small files into, so small outputs
+/// keep the in-memory path unchanged.
 pub const MAX_UNSTAGED_BLOB_BYTES: u64 = 16 << 20;
 
-/// Why the blob `blob` (its digest), over [`MAX_UNSTAGED_BLOB_BYTES`], is refused: no
-/// write tier has room for it, and it is not held in memory instead.
+/// Why a segment upload holding the blob `blob` (its digest), over
+/// [`MAX_UNSTAGED_BLOB_BYTES`], is not taken: no write tier has room for it, and it is
+/// not held in memory instead. The blob itself is stored by a ByteStream `Write`.
 #[must_use]
 pub fn unstaged_refusal(blob: &str) -> String {
     format!(
         "{blob} is over {MAX_UNSTAGED_BLOB_BYTES} bytes and no write tier has room for it: \
-         a blob that large is stored by streaming it onto the hot store (--hot-store), or \
-         by a ByteStream Write, which streams it to the object store"
+         send it by a ByteStream Write, which streams it to the object store"
     )
 }
 

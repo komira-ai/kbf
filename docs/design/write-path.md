@@ -461,9 +461,16 @@ has answered, and a write that fails forgets its range so it can be sent again),
 upload holds in memory is the range being written. A segment the tier has no room for
 is held in memory as before, **only if every record is at most
 `MAX_UNSTAGED_BLOB_BYTES` (16 MiB)**: a larger record, without a tier or with a full
-one, is refused at `Begin` RESOURCE_EXHAUSTED ("no write tier has room ... or by a
-ByteStream Write, which streams it to the object store"), and the transfer engine does not send it blob by
-blob by ByteStream instead. The in-process plane refuses the same way. 16 MiB is where
+one, is answered at `Begin` FAILED_PRECONDITION ("no write tier has room for it: send it
+by a ByteStream Write"), and the transfer engine sends that upload's records blob by
+blob by ByteStream at once (no second attempt), whose `Write` of a blob over 16 MiB
+streams it to the store (section 3.2), whatever its size. The in-process plane does the
+same: a file over 16 MiB with no tier, or no room on it, streams straight to the store as
+the walk reads it (`LocalStore::put_streamed`, over `Cache::store_streamed_claimed`: a
+bounded queue of the walk's chunks, hashed as they pass, the digest claimed when the walk
+finishes the file and checked before the store completes the upload), and an upload its
+`Begin` sends back is stored record by record (`kbf_transfer::put_each`), a large one
+streamed the same way. No record is refused for its size on any plane. 16 MiB is where
 the write group already writes a blob as a segment of its own, and well under the
 32 MiB a daemon batches small files into, so small outputs keep the in-memory path.
 Every read of a blob is bounded too: ByteStream Read, the HTTP blob route and the
@@ -471,8 +478,9 @@ in-process plane's `read_to` read in windows of 8 MiB (`READ_WINDOW_BYTES`), and
 whole reads left are of blobs the server decodes (an `Action`, `Command`, `Directory`,
 `Tree` or `ActionResult`), at most 64 MiB (`MAX_DECODED_BLOB_BYTES`). `BatchReadBlobs`
 and `BatchUpdateBlobs` stay within REAPI's batch limit (16 MiB of blobs per call,
-`MAX_BATCH_TOTAL_BYTES`, refused above it). Without a tier, the remote and in-process
-planes still refuse a record over 16 MiB (above); a ByteStream `Write` takes it.
+`MAX_BATCH_TOTAL_BYTES`, refused above it). The one size ceiling left is S3's: 10,000
+parts of at most 5 GiB, about 48.8 TiB per object; `put_stream` refuses a larger object
+`Unsupported` before it sends a byte.
 
 ### 6.3 What an acknowledgement means now
 

@@ -75,11 +75,12 @@ pub struct Args {
     /// most `--hot-store-max-bytes`; at the budget, writes
     /// take the direct path to the cold store. Without it, uploads go straight to the
     /// cold store. A daemon's outputs (a segment upload, or the in-process plane) are
-    /// written through to it as they arrive, so a large one is never held in memory;
-    /// without it, or when it has no room, a daemon's blob over 16 MiB
-    /// (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) is refused RESOURCE_EXHAUSTED rather than
-    /// held whole (a ByteStream Write of any size streams to the cold store). The first start with a hot store raises the metadata log to machine
-    /// version 2, once; a binary that runs only version 1 no longer reads it.
+    /// written through to it as they arrive, so a large one is never held in memory.
+    /// Without it, or when it has no room, a daemon's blob over 16 MiB
+    /// (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) is streamed to the cold store as it
+    /// arrives (a ByteStream Write, or the in-process plane's own stream), never held
+    /// whole and never refused for its size. The first start with a hot store raises
+    /// the metadata log to machine version 2, once; a binary that runs only version 1 no longer reads it.
     /// The metadata log lives in `<dir>/meta`, unless `--meta-dir` says otherwise.
     #[arg(long, value_name = "URI")]
     pub hot_store: Option<StoreUri>,
@@ -277,7 +278,11 @@ pub struct Args {
     /// The most bytes, records and footers together, one segment upload on the worker
     /// listener may hold in memory (`docs/design/write-path.md`, section 4.2): the
     /// segments it declares that are not written to the hot store as they arrive (all
-    /// of them, without one). Those ranges are held until the upload commits, admitted
+    /// of them, without one). Not a limit on a blob's size: a segment held in memory
+    /// holds no record over 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`), and an upload
+    /// with a larger one and no room on the hot store is answered FAILED_PRECONDITION,
+    /// so the daemon sends its records by ByteStream, which streams a large blob to the
+    /// cold store. Those ranges are held until the upload commits, admitted
     /// under `--write-bytes-in-flight` with every other upload: a `Begin` waits while
     /// that is spent. At least 33 MiB (`kbf_front::MIN_SEGMENT_UPLOAD_BYTES`), a
     /// daemon's upload of small files with room to spare, and at most

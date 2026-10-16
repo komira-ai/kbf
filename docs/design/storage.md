@@ -369,7 +369,9 @@ normalisation between kbf and a store can turn one key into another.
   store with Object Lock, delete names the exact object version, so a retained object
   is refused rather than hidden behind a delete marker. `put_stream` of an object over
   16 MiB (`MULTIPART_THRESHOLD`) is a multipart upload, a part at a time (16 MiB parts,
-  or the least whole MiB that fits the object in 10,000 parts), aborted on any failure,
+  or the least whole MiB that fits the object in 10,000 parts, at most 5 GiB, so the
+  largest object is about 48.8 TiB; a larger one is refused `Unsupported` before a byte
+  is sent: the only size ceiling on any path), aborted on any failure,
   so no incomplete upload is left behind (a bucket lifecycle rule is the backstop for a
   crash). Not built yet: TLS endpoints.
 
