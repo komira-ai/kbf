@@ -12,7 +12,7 @@ use super::guard::{
 use super::read::changes_after_head;
 use super::restore::ignore_not_found;
 use super::{Options, SqliteError, SqliteStore};
-use crate::{Clock, Cond, Revision, StoreError, SystemClock, Txn};
+use crate::{Clock, Cond, Revision, Store, StoreError, SystemClock, Txn};
 
 fn clock() -> Arc<dyn Clock> {
     Arc::new(SystemClock::default())
