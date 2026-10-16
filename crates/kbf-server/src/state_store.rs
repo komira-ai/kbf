@@ -162,9 +162,9 @@ fn open_error(why: impl fmt::Display) -> StateError {
 fn open_sqlite(path: &Path) -> Result<Arc<dyn Store>, StateError> {
     use kbf_state::SystemClock;
     use kbf_state::sqlite::{Options, SqliteStore};
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| open_error(format!("{}: {e}", dir.display())))?;
-    }
+    // Only the root has no parent, and it exists: the open below then says what is wrong.
+    let dir = path.parent().unwrap_or(path);
+    std::fs::create_dir_all(dir).map_err(|e| open_error(format!("{}: {e}", dir.display())))?;
     let store = SqliteStore::open(path, Arc::new(SystemClock::default()), Options::default())
         .map_err(open_error)?;
     Ok(Arc::new(store))
