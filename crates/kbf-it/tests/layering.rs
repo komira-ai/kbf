@@ -27,7 +27,8 @@
 //!   removed, which would make that check pass vacuously;
 //! - a daemon crate (`DAEMON_ONLY`: `kbf-node`, the `kbf-daemon` binary's library, and
 //!   `kbf-daemon` beneath it) depending, directly or through another crate, on the object
-//!   store client or a crate that builds one (`COLD_STORE_CLIENT`). A daemon-only node
+//!   store client, a crate that holds one, or the HTTP client it is written over
+//!   (`COLD_STORE_CLIENT`). A daemon-only node
 //!   holds no cold-store credential and reaches bytes only through storage
 //!   (docs/design/architecture-v2.md, section 9), so its binary must not be able to
 //!   construct an object-store client at all; and a walk that cannot see the client
@@ -340,26 +341,23 @@ fn storage_reaches_no_frontend_crate() {
 const DAEMON_ONLY: &[&str] = &["kbf-node", "kbf-daemon"];
 
 /// What a daemon crate's normal dependencies must not reach: the object store client
-/// (`kbf-objstore`, which signs S3 requests), the crates that build one from a cold-store
-/// URI (`kbf-tier`, `kbf-front`, `kbf-server`), and the HTTP client an S3 client is
-/// written over.
-const COLD_STORE_CLIENT: &[&str] = &[
-    "kbf-objstore",
-    "kbf-tier",
-    "kbf-front",
-    "kbf-server",
-    "reqwest",
-];
+/// (`kbf-objstore`, which signs S3 requests), the crates that hold the cold store behind
+/// their cache and build it from a cold-store URI (`kbf-front`, `kbf-server`), and the
+/// HTTP client an S3 client is written over.
+const COLD_STORE_CLIENT: &[&str] = &["kbf-objstore", "kbf-front", "kbf-server", "reqwest"];
 
 #[test]
 fn a_daemon_cannot_build_a_cold_store_client() {
     let g = load_graph();
-    // The walk sees the client where it is linked: the server builds its cold store
-    // from it. Without this, a renamed client crate would pass the check below.
-    assert!(
-        g.members.contains_key("kbf-objstore"),
-        "kbf-objstore is a workspace member"
-    );
+    // Every name the check looks for is a package of the graph, and the walk sees the
+    // client where it is linked: the server builds its cold store from it. Without
+    // these, a renamed or misspelled crate would pass the check below.
+    for name in COLD_STORE_CLIENT {
+        assert!(
+            g.names.values().any(|n| n == *name),
+            "{name} is not a package of the workspace's graph"
+        );
+    }
     assert!(
         !reaches(&g, "kbf-server", &["kbf-objstore"]).is_empty(),
         "the server's closure must reach kbf-objstore, or this walk proves nothing"

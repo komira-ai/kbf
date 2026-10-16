@@ -157,7 +157,10 @@ fn the_daemon_wire_has_no_cold_store_field() {
         ".kbf.map.v1.Member",
         ".kbf.worker.v1.ReadRangeResponse",
     ] {
-        assert!(closure.contains(must), "{must} is not on the walk: {closure:?}");
+        assert!(
+            closure.contains(must),
+            "{must} is not on the walk: {closure:?}"
+        );
     }
     let all = messages(&set);
     let mut found = Vec::new();
@@ -202,7 +205,15 @@ fn the_cold_store_matcher_fires_on_each_spelling() {
     ] {
         assert!(cold_word(name).is_some(), "{name}");
     }
-    for name in ["addr", "zone", "weight", "epoch", "object", "denied", "action_digest"] {
+    for name in [
+        "addr",
+        "zone",
+        "weight",
+        "epoch",
+        "object",
+        "denied",
+        "action_digest",
+    ] {
         assert_eq!(cold_word(name), None, "{name}");
     }
 }
