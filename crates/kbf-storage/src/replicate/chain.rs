@@ -7,10 +7,11 @@ use std::time::Duration;
 use kbf_map::{Member, MemberId, MemberState};
 use kbf_types::Digest;
 
-use super::leg::Leg;
+use super::leg::ReplicaLeg;
 use super::peers::Peers;
 use super::{MapSource, View, check};
 use crate::StorageError;
+use crate::repair::{RepairRecord, Repairs};
 
 /// The most owners the chain serves: a primary and one replica.
 const MAX_REPLICATION: usize = 2;
@@ -64,21 +65,29 @@ struct NotRegistered;
 #[error("the replica {0} is down")]
 struct ReplicaDown(MemberId);
 
-/// R = 2 chain replication on one node: the map it judges by and the channels to its
-/// peers.
+/// R = 2 chain replication on one node: the map it judges by, the channels to its peers,
+/// and the journal of copies it owes.
 pub struct Chain {
     source: Arc<dyn MapSource>,
     peers: Peers,
+    repairs: Arc<Repairs>,
     config: ChainConfig,
 }
 
 impl Chain {
-    /// A chain judging by `source`'s map and calling peers through `peers`.
+    /// A chain judging by `source`'s map, calling peers through `peers`, and recording the
+    /// copies it could not make in `repairs`.
     #[must_use]
-    pub fn new(source: Arc<dyn MapSource>, peers: Peers, config: ChainConfig) -> Self {
+    pub fn new(
+        source: Arc<dyn MapSource>,
+        peers: Peers,
+        repairs: Arc<Repairs>,
+        config: ChainConfig,
+    ) -> Self {
         Self {
             source,
             peers,
+            repairs,
             config,
         }
     }
@@ -144,19 +153,27 @@ impl Chain {
             })));
         }
         let position = owners.iter().position(|owner| *owner == view.me);
+        let member = |id: MemberId| {
+            view.map
+                .member(id)
+                .cloned()
+                .ok_or(StorageError::Internal("an owner is not in the map".into()))
+        };
         match (leg_from, position, owners.as_slice()) {
             (Some(sender), Some(_), _) if sender != view.me => Ok(Plan::Local),
             (Some(sender), _, _) => Err(StorageError::Invalid(format!(
                 "{view_me} was sent a copy of {digest} by {sender}, and does not own it",
                 view_me = view.me
             ))),
-            (None, Some(0), [_, replica]) => {
-                let replica = view
-                    .map
-                    .member(*replica)
-                    .cloned()
-                    .ok_or(StorageError::Internal("an owner is not in the map".into()))?;
-                Ok(Plan::Primary { replica })
+            (None, Some(0), [_, replica]) => Ok(Plan::Primary {
+                replica: member(*replica)?,
+            }),
+            // The primary is down: the next owner takes its place for the write, and the
+            // primary is the copy owed.
+            (None, Some(1), [first, _]) if member(*first)?.state == MemberState::Down => {
+                Ok(Plan::Primary {
+                    replica: member(*first)?,
+                })
             }
             (None, Some(0), _) => Ok(Plan::Local),
             (None, _, _) => Err(StorageError::Invalid(format!(
@@ -192,22 +209,24 @@ impl Chain {
         }
     }
 
-    /// The call that carries a blob of `size` bytes to `replica`.
+    /// The call that carries a blob of `size` bytes to `replica`; for a replica the map says
+    /// is down, one that was never made (it is the copy owed at once).
     ///
     /// # Errors
-    /// [`StorageError::Unavailable`] if the map says `replica` is down;
-    /// [`StorageError::Internal`] if it has no address a channel can be made to.
+    /// [`StorageError::Internal`] if `replica` has no address a channel can be made to.
     pub(crate) fn open_leg(
         &self,
         view: &View,
         replica: &Member,
         size: u64,
-    ) -> Result<Leg, StorageError> {
+    ) -> Result<ReplicaLeg, StorageError> {
         if replica.state == MemberState::Down {
-            return Err(StorageError::Unavailable(Arc::new(ReplicaDown(replica.id))));
+            return Ok(ReplicaLeg::lost(StorageError::Unavailable(Arc::new(
+                ReplicaDown(replica.id),
+            ))));
         }
         let channel = self.peers.channel(&replica.addr)?;
-        Ok(Leg::open(
+        Ok(ReplicaLeg::open(
             channel,
             view.map.generation(),
             view.me,
@@ -215,5 +234,29 @@ impl Chain {
             self.config.stall,
             self.config.commit,
         ))
+    }
+
+    /// The one place a write is answered with one copy: the copy owed to `replica` is
+    /// recorded, durably, before this returns. A caller that does not wait for it, or
+    /// goes on when it fails, would answer a write whose second copy nobody owes.
+    ///
+    /// # Errors
+    /// [`StorageError::Unavailable`] if the record could not be made durable: the write is
+    /// not answered.
+    pub(crate) async fn degrade(
+        &self,
+        view: &View,
+        replica: &Member,
+        digest: &Digest,
+        why: &StorageError,
+    ) -> Result<(), StorageError> {
+        tracing::warn!(%digest, replica = %replica.id, %why, "answering with one copy and a repair owed");
+        self.repairs
+            .owe(RepairRecord {
+                digest: *digest,
+                replica: replica.id,
+                generation: view.map.generation(),
+            })
+            .await
     }
 }

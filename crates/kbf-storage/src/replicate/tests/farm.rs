@@ -7,13 +7,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use kbf_map::{Map, Member, MemberId, MemberState, Rule};
+use kbf_store::FaultFs;
 use kbf_types::Digest;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{AbortHandle, JoinHandle};
 use tonic::transport::Channel;
 
 use crate::Storage;
+use crate::repair::{Options, RepairLedger, RepairRecord, Repairs};
 use crate::replicate::{Chain, ChainConfig, MapSource, Peers};
 use crate::service::tests::fake::{Mem, patterned, serve_routes, sha};
 use crate::service::tests::roles::Pki;
@@ -105,12 +108,42 @@ impl MapSource for NodeMap {
     }
 }
 
+/// What the frontend would be told: every call, and whether `owed` stays pending.
+#[derive(Default)]
+pub(crate) struct TestLedger {
+    pub owed: Mutex<Vec<RepairRecord>>,
+    pub settled: Mutex<Vec<Digest>>,
+    /// `owed` records the call and then never returns.
+    pub block: AtomicBool,
+}
+
+impl RepairLedger for TestLedger {
+    fn owed<'a>(&'a self, record: &'a RepairRecord) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            self.owed.lock().expect("lock").push(*record);
+            if self.block.load(Ordering::SeqCst) {
+                futures::future::pending::<()>().await;
+            }
+        })
+    }
+
+    fn settled<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            self.settled.lock().expect("lock").push(*digest);
+        })
+    }
+}
+
 pub(crate) struct Node {
     pub id: MemberId,
     pub mem: Arc<Mem>,
     pub switch: Switch,
     pub held: Arc<NodeMap>,
     pub chain: Arc<Chain>,
+    /// The disk of the node's repair journal.
+    pub fs: FaultFs,
+    pub repairs: Arc<Repairs>,
+    pub ledger: Arc<TestLedger>,
 }
 
 /// Nodes numbered from 0; member ids are their numbers plus 1.
@@ -142,9 +175,20 @@ impl Farm {
             let id = MemberId(i as u64 + 1);
             let held = NodeMap::new(id);
             let (server, calls_as) = pki.node("storage");
+            let fs = FaultFs::new();
+            let ledger = Arc::new(TestLedger::default());
+            let repairs = Arc::new(
+                Repairs::open(
+                    fs.clone(),
+                    Options::default(),
+                    Arc::clone(&ledger) as Arc<dyn RepairLedger>,
+                )
+                .expect("a journal"),
+            );
             let chain = Arc::new(Chain::new(
                 Arc::clone(&held) as Arc<dyn MapSource>,
                 Peers::tls(calls_as),
+                Arc::clone(&repairs),
                 config,
             ));
             let storage: Arc<dyn Storage> = Arc::clone(&mem) as Arc<dyn Storage>;
@@ -165,6 +209,9 @@ impl Farm {
                 switch: Switch::start(served).await,
                 held,
                 chain,
+                fs,
+                repairs,
+                ledger,
             });
         }
         let farm = Self { nodes, pki };

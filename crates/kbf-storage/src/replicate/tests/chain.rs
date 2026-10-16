@@ -21,17 +21,17 @@ use crate::service::MAP_GENERATION_HEADER;
 use crate::service::tests::fake::{StreamFault, patterned, sha};
 use crate::{Storage, StorageError};
 
-const MIB: usize = 1 << 20;
+pub(super) const MIB: usize = 1 << 20;
 
 /// A write that should end, ended or hung: the deadline is for a defect that would wait for
 /// ever, not a speed.
-async fn within<T>(call: impl std::future::Future<Output = T>) -> T {
+pub(super) async fn within<T>(call: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(30), call)
         .await
         .expect("the write hung")
 }
 
-fn held(farm: &Farm, node: usize, digest: &Digest) -> bool {
+pub(super) fn held(farm: &Farm, node: usize, digest: &Digest) -> bool {
     farm.nodes[node]
         .mem
         .blobs
@@ -271,6 +271,10 @@ async fn a_primary_behind_its_replica_does_not_acknowledge_one_copy() {
     );
     assert!(!held(&farm, 0, &sha(&bytes)));
     assert!(!held(&farm, 1, &sha(&bytes)));
+    assert!(
+        farm.nodes[0].repairs.open_records().is_empty(),
+        "a refusal is not a copy owed"
+    );
 }
 
 /// Catches a write answered under a placement the map has left: the map turns (the replica
@@ -515,65 +519,6 @@ async fn a_replica_that_already_holds_a_large_blob_is_a_copy() {
     }
 }
 
-/// Catches a replica that is down being answered as if it held a copy: the replica
-/// unreachable (cut off), or named down by the map, fails the write UNAVAILABLE, and the
-/// primary does not hold the blob. (A later change acknowledges with a repair record.)
-#[tokio::test]
-async fn a_replica_that_is_down_fails_the_write() {
-    let farm = Farm::start(2, ChainConfig::default()).await;
-    let map = farm.map(1, 2, &[]);
-    let bytes = farm.blob(&map, 0, 1, 4096, 10);
-    farm.nodes[1].switch.cut();
-    let answer = farm.client(0, 1).put(Bytes::from(bytes.clone())).await;
-    assert!(
-        matches!(answer, Err(StorageError::Unavailable(_))),
-        "{answer:?}"
-    );
-    assert!(!held(&farm, 0, &sha(&bytes)));
-
-    farm.nodes[1].switch.restore();
-    let bytes = farm.blob(&map, 0, 1, 4096, 11);
-    farm.publish(&farm.map(2, 2, &[(1, MemberState::Down)]));
-    let answer = farm.client(0, 2).put(Bytes::from(bytes.clone())).await;
-    let Err(StorageError::Unavailable(why)) = answer else {
-        panic!("{answer:?}");
-    };
-    assert!(why.to_string().contains("is down"), "{why}");
-    assert!(!held(&farm, 0, &sha(&bytes)));
-    assert_eq!(farm.nodes[1].mem.knobs.chunks.load(Ordering::SeqCst), 0);
-}
-
-/// Catches a primary that waits for ever on a replica that accepts nothing, or commits
-/// nothing: held appends and held commits both end in UNAVAILABLE after the bounds, and the
-/// primary does not hold the blob.
-#[tokio::test]
-async fn a_replica_that_stops_answering_fails_the_write_after_its_bounds() {
-    let config = ChainConfig {
-        stall: Duration::from_millis(300),
-        commit: Duration::from_millis(300),
-    };
-    let farm = Farm::start(2, config).await;
-    let map = farm.map(1, 2, &[]);
-    let bytes = farm.blob(&map, 0, 1, 12 * MIB, 12);
-    farm.nodes[1].mem.knobs.hold_appends(true);
-    let answer = within(farm.client(0, 1).put(Bytes::from(bytes.clone()))).await;
-    let Err(StorageError::Unavailable(why)) = answer else {
-        panic!("{answer:?}");
-    };
-    assert!(why.to_string().contains("take a message"), "{why}");
-    assert!(!held(&farm, 0, &sha(&bytes)));
-    farm.nodes[1].mem.knobs.hold_appends(false);
-
-    let bytes = farm.blob(&map, 0, 1, MIB, 13);
-    farm.nodes[1].mem.knobs.hold_commits();
-    let answer = within(farm.client(0, 1).put(Bytes::from(bytes.clone()))).await;
-    let Err(StorageError::Unavailable(why)) = answer else {
-        panic!("{answer:?}");
-    };
-    assert!(why.to_string().contains("commit"), "{why}");
-    assert!(!held(&farm, 0, &sha(&bytes)));
-}
-
 /// Catches a primary whose own store failing is answered, or half-kept: every point at which
 /// the primary's streamed write can fail (an append, the end of the stream, the commit;
 /// an error or a panic; early in a long blob and in a short one) fails the write INTERNAL
@@ -756,10 +701,24 @@ async fn a_copy_sent_to_a_node_in_no_chain_is_refused() {
 /// over `Admission::Open`. Mutant: the check removed.
 #[test]
 fn a_chain_node_must_admit_callers_by_certificate() {
+    use crate::repair::Repairs;
     use crate::replicate::{Chain, Peers};
     use crate::service::tests::fake::{Held, Mem};
     use crate::service::{Admission, Config, StorageService};
-    let chain = |held| Arc::new(Chain::new(held, Peers::plain(), ChainConfig::default()));
+    let chain = |held| {
+        let repairs = Repairs::open(
+            kbf_store::FaultFs::new(),
+            crate::repair::Options::default(),
+            Arc::new(crate::repair::NoLedger),
+        )
+        .expect("a journal");
+        Arc::new(Chain::new(
+            held,
+            Peers::plain(),
+            Arc::new(repairs),
+            ChainConfig::default(),
+        ))
+    };
     let service = |admission| {
         let storage: Arc<dyn Storage> = Arc::new(Mem::default());
         StorageService::new(
