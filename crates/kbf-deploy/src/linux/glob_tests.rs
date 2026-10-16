@@ -290,6 +290,8 @@ fn paths_match_as_glibc_glob_lists_them() {
         // directory read honours. A last name with no wildcard and no `\` is lstat'ed
         // and kept even as a file; one with either is matched against the directory's
         // entries and a file skipped. An odd run of `\` before the `/` loses one.
+        // glibc 2.39 (glob(3) with no flags, CI's x86_64 and arm64 runners, a
+        // throwaway probe) listed exactly these.
         (r"/etc/kbf/s3.env/", true),
         (r"/etc/kbf/s3.env//", true),
         (r"/etc/*/s3.env/", true),
