@@ -1,5 +1,8 @@
 //! `ByteStream`: a ranged, streamed Read and a streamed Write over [`crate::Storage`].
 
+use std::sync::{Arc, Mutex, PoisonError};
+
+use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStream;
@@ -9,7 +12,7 @@ use kbf_proto::google::bytestream::{
 };
 use tonic::{Request, Response, Status, Streaming};
 
-use super::{Endpoint, MAX_BLOB_BYTES, StorageService, wire};
+use super::{Endpoint, STREAM_FROM_BYTES, StorageService, wire};
 use crate::StorageError;
 
 #[tonic::async_trait]
@@ -43,14 +46,17 @@ impl ByteStream for StorageService {
         Ok(Response::new(messages.boxed()))
     }
 
-    /// Receives a blob from offset 0, stores it with [`crate::Storage::put`], which
-    /// hashes it, and only then answers with its size. A blob already held is answered
-    /// at once, unread.
+    /// Receives a blob from offset 0 and stores it, hashed against the digest in the
+    /// resource name, answering with its size only once it is stored. A blob already held
+    /// is answered at once, unread. No blob is refused for its size.
     ///
-    /// The bytes are held whole until they are complete, never more than the digest in
-    /// the resource name declares (and never a blob over [`MAX_BLOB_BYTES`]), and room
-    /// for them is taken first ([`super::Config::write_bytes_in_flight`]). Order is not
-    /// checked message by message: the blob is checked against its digest as a whole.
+    /// A blob of at most [`STREAM_FROM_BYTES`] is held whole until it is complete, then
+    /// stored with [`crate::Storage::put`], which hashes it. A larger one is never held:
+    /// its messages go to [`crate::Storage::put_streamed`] as they arrive, which hashes
+    /// them on the way and stores nothing unless they hash to the digest. Room for what
+    /// is held (at most [`STREAM_FROM_BYTES`] of it) is taken first
+    /// ([`super::Config::write_bytes_in_flight`]). Order is not checked message by
+    /// message: the blob is checked against its digest as a whole.
     async fn write(
         &self,
         request: Request<Streaming<WriteRequest>>,
@@ -68,19 +74,26 @@ impl ByteStream for StorageService {
                 committed_size: i64::try_from(size).unwrap_or(i64::MAX),
             })
         };
-        if size > MAX_BLOB_BYTES {
-            return Err(Status::invalid_argument(format!(
-                "{digest} is larger than the largest blob this node accepts ({MAX_BLOB_BYTES} \
-                 bytes)"
-            )));
-        }
         if self.storage.find_missing(&[digest]).await?.is_empty() {
             return Ok(committed());
         }
+        let held = size.min(STREAM_FROM_BYTES);
         let room =
-            u32::try_from(size).map_or(self.write_room_bytes, |s| s.min(self.write_room_bytes));
+            u32::try_from(held).map_or(self.write_room_bytes, |s| s.min(self.write_room_bytes));
         // The semaphore is never closed.
         let _room = self.write_room.acquire_many(room).await.ok();
+        if size > STREAM_FROM_BYTES {
+            let fault = Arc::new(Mutex::new(None));
+            let body = pieces(stream, message, size, Arc::clone(&fault));
+            let claim = futures::future::ready(Some(digest)).boxed();
+            let stored = self.storage.put_streamed(size, body, claim).await;
+            // A fault of the sender's is INVALID_ARGUMENT, not the store's.
+            if let Some(status) = fault.lock().unwrap_or_else(PoisonError::into_inner).take() {
+                return Err(status);
+            }
+            stored?;
+            return Ok(committed());
+        }
         let mut received = Vec::with_capacity(usize::try_from(size).unwrap_or_default());
         loop {
             if (received.len() + message.data.len()) as u64 > size {
@@ -124,5 +137,91 @@ impl ByteStream for StorageService {
             committed_size,
             complete,
         }))
+    }
+}
+
+/// The bytes of a `Write` of a blob of `size` bytes, message by message as they arrive,
+/// starting with `first`: the stream [`crate::Storage::put_streamed`] takes. A message
+/// stream that is wrong (more bytes than `size`, fewer at `finish_write`, ended without
+/// it, or broken) fails the stream with the sender's fault noted in `fault`.
+fn pieces(
+    stream: Streaming<WriteRequest>,
+    first: WriteRequest,
+    size: u64,
+    fault: Arc<Mutex<Option<Status>>>,
+) -> BoxStream<'static, std::io::Result<Bytes>> {
+    futures::stream::unfold(
+        Incoming {
+            stream,
+            first: Some(first),
+            got: 0,
+            size,
+            done: false,
+            fault,
+        },
+        Incoming::step,
+    )
+    .boxed()
+}
+
+/// The state of [`pieces`].
+struct Incoming {
+    stream: Streaming<WriteRequest>,
+    first: Option<WriteRequest>,
+    got: u64,
+    size: u64,
+    done: bool,
+    fault: Arc<Mutex<Option<Status>>>,
+}
+
+impl Incoming {
+    /// The next message's bytes, or `None` after the last.
+    async fn step(mut self) -> Option<(std::io::Result<Bytes>, Self)> {
+        loop {
+            if self.done {
+                return None;
+            }
+            let message = match self.first.take() {
+                Some(message) => message,
+                None => match self.stream.message().await {
+                    Ok(Some(message)) => message,
+                    Ok(None) => {
+                        let status =
+                            Status::invalid_argument("write stream ended without finish_write");
+                        return Some(self.refuse(status));
+                    }
+                    Err(status) => return Some(self.refuse(status)),
+                },
+            };
+            self.got += message.data.len() as u64;
+            if self.got > self.size {
+                let status = Status::invalid_argument(format!(
+                    "more than the {} bytes the resource names",
+                    self.size
+                ));
+                return Some(self.refuse(status));
+            }
+            if message.finish_write {
+                self.done = true;
+                if self.got < self.size {
+                    let status = Status::invalid_argument(format!(
+                        "{} bytes, fewer than the {} the resource names",
+                        self.got, self.size
+                    ));
+                    return Some(self.refuse(status));
+                }
+            }
+            if !message.data.is_empty() {
+                return Some((Ok(Bytes::from(message.data)), self));
+            }
+        }
+    }
+
+    /// Ends the stream in an error, noting `status` as the sender's fault.
+    fn refuse(mut self, status: Status) -> (std::io::Result<Bytes>, Self) {
+        let error = std::io::Error::other(status.message().to_owned());
+        *self.fault.lock().unwrap_or_else(PoisonError::into_inner) = Some(status);
+        self.done = true;
+        (Err(error), self)
     }
 }

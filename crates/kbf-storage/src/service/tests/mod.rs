@@ -37,8 +37,8 @@ use tonic::{Code, Request, Status};
 
 use super::wire::{self, to_proto};
 use super::{
-    MAP_GENERATION_HEADER, MAX_BLOB_BYTES, MAX_FIND_MISSING_DIGESTS, MAX_MESSAGE_BYTES,
-    RemoteStorage,
+    MAP_GENERATION_HEADER, MAX_FIND_MISSING_DIGESTS, MAX_MESSAGE_BYTES, RemoteStorage,
+    STREAM_FROM_BYTES,
 };
 use crate::{READ_CHUNK_BYTES, Storage, StorageError};
 
@@ -432,7 +432,7 @@ async fn find_missing_answers_in_order_and_refuses_what_it_cannot() {
 }
 
 /// Catches a Write that accepts what it must not: no message, a name that is no upload,
-/// a blob over the largest, more bytes than the digest names, a stream that stops
+/// more bytes than the digest names, a stream that stops
 /// without `finish_write`, fewer bytes than named, other bytes than named (all
 /// INVALID_ARGUMENT, and nothing stored); and one that does not accept what it must: a
 /// correct write is acknowledged with the blob's size.
@@ -442,19 +442,10 @@ async fn a_write_is_checked_against_its_digest() {
     let blob = b"twelve bytes";
     let digest = sha(blob);
     let name = upload_name(&digest);
-    let too_big = Digest::new(
-        kbf_types::DigestFunction::Sha256,
-        [3; 32],
-        MAX_BLOB_BYTES + 1,
-    );
     let wrong = [b'x'; 12];
     let cases = [
         ("no message", Vec::new()),
         ("not an upload", write_of("blobs/x", &[(blob, true)])),
-        (
-            "over the largest",
-            write_of(&upload_name(&too_big), &[(b"", true)]),
-        ),
         (
             "more than named",
             write_of(&name, &[(blob, false), (b"!", true)]),
@@ -1090,9 +1081,98 @@ async fn an_updated_generation_is_in_the_action_store_field() {
 }
 
 /// Catches a limit that drifted from the front's (a test in kbf-server pins the front's
-/// to these): a full 16 MiB batch has to fit.
+/// to these): a full 16 MiB batch has to fit, and a blob is streamed from the same size.
 #[test]
 fn the_limits_hold_a_full_batch() {
     assert_eq!(MAX_MESSAGE_BYTES, (16 << 20) + (1 << 20));
-    assert_eq!(MAX_BLOB_BYTES, 1 << 30);
+    assert_eq!(STREAM_FROM_BYTES, 16 << 20);
+}
+
+/// `len` bytes of a blob as `Write` messages of at most 1 MiB, the last one finishing
+/// the write, with the first named `name`.
+fn blob_messages(name: &str, bytes: &[u8]) -> Vec<WriteRequest> {
+    let count = bytes.len().div_ceil(READ_CHUNK_BYTES);
+    (0..count)
+        .map(|i| WriteRequest {
+            resource_name: if i == 0 {
+                name.to_owned()
+            } else {
+                String::new()
+            },
+            write_offset: (i * READ_CHUNK_BYTES) as i64,
+            finish_write: i + 1 == count,
+            data: bytes[i * READ_CHUNK_BYTES..bytes.len().min((i + 1) * READ_CHUNK_BYTES)].to_vec(),
+        })
+        .collect()
+}
+
+/// Catches a Write of a blob past `STREAM_FROM_BYTES` that is gathered whole (the store's
+/// `put` called instead of `put_streamed`, or the blob held in one buffer), and one that
+/// is streamed but stored wrong: the blob is stored, byte for byte, by `put_streamed`
+/// alone, from pieces of at most one message; one `STREAM_FROM_BYTES` long is still
+/// gathered and put.
+#[tokio::test]
+async fn a_large_write_is_streamed_to_the_store() {
+    let (mem, _remote, channel) = pair().await;
+    let large = patterned(STREAM_FROM_BYTES as usize + 1);
+    let digest = sha(&large);
+    let answer = raw_write(&channel, blob_messages(&upload_name(&digest), &large))
+        .await
+        .expect("written");
+    assert_eq!(answer.committed_size, large.len() as i64);
+    assert_eq!(mem.streamed.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(mem.puts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(
+        mem.streamed_most_held
+            .load(std::sync::atomic::Ordering::SeqCst)
+            <= READ_CHUNK_BYTES
+    );
+    assert_eq!(
+        mem.blobs.lock().expect("lock")[&digest].as_ref(),
+        &large[..]
+    );
+    let edge = patterned(STREAM_FROM_BYTES as usize);
+    let edge_digest = sha(&edge);
+    raw_write(&channel, blob_messages(&upload_name(&edge_digest), &edge))
+        .await
+        .expect("written");
+    assert_eq!(mem.puts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(mem.streamed.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// Catches a streamed Write that stores what it must not or answers the wrong code: other
+/// bytes than the digest names, more or fewer bytes than it names, a stream that stops
+/// without `finish_write`, are all INVALID_ARGUMENT and store nothing; and a blob is not
+/// refused for its size (a digest naming 5 GiB gets as far as its bytes, which fall
+/// short).
+#[tokio::test]
+async fn a_streamed_write_is_checked_against_its_digest() {
+    let (mem, _remote, channel) = pair().await;
+    let large = patterned(STREAM_FROM_BYTES as usize + 1);
+    let digest = sha(&large);
+    let name = upload_name(&digest);
+    let mut wrong = large.clone();
+    wrong[7] ^= 1;
+    let mut more = large.clone();
+    more.push(1);
+    let mut no_finish = blob_messages(&name, &large);
+    no_finish.last_mut().expect("messages").finish_write = false;
+    let fewer = blob_messages(&name, &large[..large.len() - 1]);
+    let huge = Digest::new(kbf_types::DigestFunction::Sha256, [3; 32], 5 << 30);
+    let cases = [
+        ("other bytes", blob_messages(&name, &wrong)),
+        ("more than named", blob_messages(&name, &more)),
+        ("no finish", no_finish),
+        ("fewer than named", fewer),
+        (
+            "5 GiB named",
+            write_of(&upload_name(&huge), &[(b"short", true)]),
+        ),
+    ];
+    for (what, requests) in cases {
+        let status = raw_write(&channel, requests).await.expect_err(what);
+        assert_eq!(status.code(), Code::InvalidArgument, "{what}: {status}");
+        assert!(!status.message().contains("largest"), "{what}: {status}");
+    }
+    assert!(mem.blobs.lock().expect("lock").is_empty());
 }

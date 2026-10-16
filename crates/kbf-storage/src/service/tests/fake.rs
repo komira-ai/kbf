@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt as _;
+use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream};
 use kbf_meta::{ActionRecord, ActionWriteError, Closure, Role};
 use kbf_proto::google::bytestream::byte_stream_server::{ByteStream, ByteStreamServer};
@@ -62,6 +63,10 @@ pub(super) struct Mem {
     /// How long a put takes.
     pub put_takes: Mutex<Duration>,
     pub puts: AtomicUsize,
+    /// Blobs stored by `put_streamed`.
+    pub streamed: AtomicUsize,
+    /// The most bytes `put_streamed` held at once.
+    pub streamed_most_held: AtomicUsize,
     active: AtomicUsize,
     pub most_active: AtomicUsize,
     pub segments: Arc<Seen>,
@@ -155,6 +160,39 @@ impl Storage for Mem {
 
     fn stream(&self, _size: u64) -> Option<Box<dyn PutStream>> {
         None
+    }
+
+    /// Keeps only a hasher and a count of what it holds: the blob itself is stored
+    /// whole only so a test can read it back.
+    fn put_streamed(
+        &self,
+        size: u64,
+        mut bytes: BoxStream<'static, std::io::Result<Bytes>>,
+        claim: BoxFuture<'static, Option<Digest>>,
+    ) -> Answer<'_, Option<Digest>> {
+        Box::pin(async move {
+            self.failing()?;
+            let mut whole = Vec::new();
+            while let Some(piece) = bytes.next().await {
+                let piece = piece.map_err(|e| StorageError::Internal(e.to_string()))?;
+                self.streamed_most_held
+                    .fetch_max(piece.len(), Ordering::SeqCst);
+                whole.extend_from_slice(&piece);
+            }
+            let Some(claimed) = claim.await else {
+                return Ok(None);
+            };
+            let actual = sha(&whole);
+            if actual != claimed || whole.len() as u64 != size {
+                return Err(StorageError::DigestMismatch { claimed, actual });
+            }
+            self.streamed.fetch_add(1, Ordering::SeqCst);
+            self.blobs
+                .lock()
+                .expect("lock")
+                .insert(actual, whole.into());
+            Ok(Some(actual))
+        })
     }
 
     fn segments(&self) -> Arc<dyn Segments> {
