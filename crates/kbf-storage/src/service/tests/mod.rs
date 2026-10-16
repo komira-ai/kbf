@@ -6,8 +6,8 @@
 //! no [`RemoteStorage`] would is refused with the code the protocol names.
 
 mod every_call;
-mod fake;
-mod roles;
+pub(crate) mod fake;
+pub(crate) mod roles;
 mod stale_map;
 
 use std::sync::Arc;

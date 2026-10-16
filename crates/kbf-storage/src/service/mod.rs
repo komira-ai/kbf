@@ -22,7 +22,8 @@
 //! **The map generation** (section 6) rides on every call: a field of every
 //! `kbf.storage.v1` request, and the [`MAP_GENERATION_HEADER`] metadata entry on the
 //! standard calls. [`RemoteStorage`] sends it. A node given no map source ignores it; one given a
-//! [`crate::replicate::MapSource`] ([`StorageService::with_map`]) judges every call by it,
+//! [`crate::replicate::MapSource`] ([`StorageService::with_map`], or
+//! [`StorageService::with_chain`], which brings its own) judges every call by it,
 //! before the call reads anything: STALE_MAP (FAILED_PRECONDITION with the node's
 //! generation in the same entry) for a caller behind the node; for one ahead of it, the node
 //! fetches the map ([`crate::replicate::MapSource::refetch`]) and goes on, or answers
@@ -33,10 +34,12 @@
 //! endpoint's table. Roles are the part of this unit that is partly a seam; the module
 //! docs of [`admission`] say which.
 //!
-//! **Where PutStream plugs in.** `Write` buffers a blob whole, because no store hands
-//! out a [`crate::PutStream`] yet ([`Storage::stream`] is `None`). When one does, the
-//! handler appends each message to it instead, and [`Config::write_bytes_in_flight`] is
-//! needed no more.
+//! **How `Write` takes a blob in.** Where the store offers a [`crate::PutStream`]
+//! ([`Storage::stream`]), each message is appended to it as it arrives and the blob is
+//! never held whole; the primary of a chain streams it on to the replica too
+//! ([`crate::replicate`]). Where it does not (no store hands one out yet), a node that is
+//! in no chain holds the blob until it is complete, within
+//! [`Config::write_bytes_in_flight`].
 
 mod actions;
 mod admission;
@@ -46,8 +49,9 @@ mod client;
 mod generation;
 mod segments;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod wire;
+mod write;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,11 +63,12 @@ use kbf_proto::worker::segments_server::{Segments, SegmentsServer};
 use tokio::sync::Semaphore;
 use tonic::service::Routes;
 
-use crate::replicate::{self, MapSource};
+use crate::replicate::{self, Chain, MapSource};
 use crate::{Storage, StorageError};
 
 pub use admission::{Admission, Endpoint, PeerRole, ROLE_URI_PREFIX, role_of};
 pub use client::RemoteStorage;
+pub(crate) use client::lift;
 
 /// The metadata entry that carries the map generation on the standard calls.
 pub const MAP_GENERATION_HEADER: &str = "kbf-map-generation";
@@ -99,6 +104,7 @@ pub struct StorageService {
     storage: Arc<dyn Storage>,
     segments: Arc<dyn Segments>,
     admission: Admission,
+    chain: Option<Arc<Chain>>,
     map: Option<Arc<dyn MapSource>>,
     refetch_wait: Duration,
     write_room: Semaphore,
@@ -113,6 +119,7 @@ impl StorageService {
             segments: storage.segments(),
             storage,
             admission,
+            chain: None,
             map: None,
             refetch_wait: replicate::REFETCH_WAIT,
             write_room: Semaphore::new(config.write_bytes_in_flight as usize),
@@ -120,11 +127,21 @@ impl StorageService {
         }
     }
 
-    /// The service judging writes by the map `map` holds ([`crate::replicate`]): a write
-    /// from a caller whose generation is not that map's is refused before a byte is read.
+    /// The service judging every call by the map `map` holds ([`crate::replicate`]), with
+    /// no part in a chain (a node that serves reads, or a test).
     #[must_use]
     pub fn with_map(mut self, map: Arc<dyn MapSource>) -> Self {
         self.map = Some(map);
+        self
+    }
+
+    /// The service as a node of a chain ([`crate::replicate`]): it judges every call by the
+    /// chain's map and, as the primary of a blob, copies it to the replica before it
+    /// answers.
+    #[must_use]
+    pub fn with_chain(mut self, chain: Arc<Chain>) -> Self {
+        self.map = Some(chain.source());
+        self.chain = Some(chain);
         self
     }
 
@@ -140,7 +157,9 @@ impl StorageService {
     /// a node given no map source ([`replicate::check`]).
     async fn check_map(&self, requested: u64) -> Result<(), StorageError> {
         match &self.map {
-            Some(source) => replicate::check(&**source, requested, self.refetch_wait).await,
+            Some(source) => replicate::check(&**source, requested, self.refetch_wait)
+                .await
+                .map(drop),
             None => Ok(()),
         }
     }

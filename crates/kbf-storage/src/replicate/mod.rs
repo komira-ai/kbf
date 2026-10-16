@@ -28,19 +28,82 @@
 //! calls) before it reads a byte or looks at what the node holds, so no answer to a stale
 //! caller, not even "already stored", is given under a placement the node no longer
 //! holds.
+//!
+//! # The chain (R = 2)
+//!
+//! A write goes once to the **primary**, the first of [`kbf_map::Map::write_owners`]. Its
+//! `Write` handler passes each message on to the **replica**, the second, over the same
+//! ByteStream `Write` marked as a copy (the [`LEG_HEADER`] entry, admitted from the
+//! `storage` role only: `Endpoint::WriteLeg`). A node judges what it is given by its
+//! `Chain::plan`:
+//! - a client write to a node that is not the primary is INVALID_ARGUMENT, so is a copy
+//!   sent to a node that does not own the blob (or by a node to itself);
+//! - a map with more than two owners per blob is refused (INVALID_ARGUMENT), and one
+//!   with fewer write owners than its factor is UNAVAILABLE: neither is answered with
+//!   one copy.
+//!
+//! **Streamed, never held whole.** Where the store offers a [`crate::PutStream`], each
+//! message goes to it (through a thread of its own, hashing as it goes) and to the replica
+//! at once. At most a few messages are held, whatever the blob's size: queues of two in
+//! front of the store and the replica, and the one in hand. A primary whose store cannot
+//! stream refuses (FAILED_PRECONDITION) rather than hold the blob; a replica that cannot
+//! stream takes the copy the buffered way.
+//!
+//! **The order of commits.** The replica verifies the blob against its digest and makes it
+//! durable *before* the primary makes its own copy present, and the primary answers only
+//! after both. So a blob that is present on a primary has a copy on its replica, and a
+//! crash between the two leaves the blob absent on the primary: the writer's
+//! FindMissing says so and it writes again, and the replica, which holds it, answers at
+//! once. (A blob already present on the primary is answered without calling the replica
+//! for the same reason.)
+//!
+//! **Refusals are answers.** The replica's refusal (a stale map, a digest that does not
+//! match, a role that may not copy) is the writer's answer; so is a failure of the
+//! primary's own store. If the map turned while the blob was written, the primary checks
+//! the new map still places it as it did (STALE_MAP otherwise) before it commits.
+//! A replica that cannot be reached, or does not take a message within
+//! [`ChainConfig::stall`] or commit within [`ChainConfig::commit`], fails the write
+//! UNAVAILABLE.
+
+mod chain;
+mod leg;
+mod peers;
+mod staging;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use kbf_map::Map;
+use kbf_map::{Map, MemberId};
+
+pub(crate) use chain::Plan;
+pub use chain::{Chain, ChainConfig};
+pub use leg::LEG_HEADER;
+pub(crate) use leg::Leg;
+pub use peers::Peers;
+pub(crate) use staging::Staging;
 
 use crate::StorageError;
+
+/// The map a node holds and which member of it the node is, read together for one write.
+#[derive(Clone, Debug)]
+pub struct View {
+    /// The map the write is judged by.
+    pub map: Arc<Map>,
+    /// This node's member id.
+    pub me: MemberId,
+}
 
 /// The map a node holds now.
 pub trait MapSource: Send + Sync {
     /// The current map, or `None` before the node has learned one.
     fn current(&self) -> Option<Arc<Map>>;
+
+    /// This node's member id, assigned by the state store at registration: `None` before
+    /// the node has registered. Once known it does not change, so it is read apart from
+    /// the map. A node that does not know it can judge and serve reads, but cannot take
+    /// part in a chain (it cannot tell whether it is the primary).
+    fn me(&self) -> Option<MemberId>;
 
     /// The map of generation `at_least` or a newer one, fetched from a frontend, or
     /// `None` if the node cannot get one. Called when a caller routed by a generation the
@@ -77,8 +140,8 @@ struct NotYetSeen {
 }
 
 /// Whether a call routed by map generation `requested` may be served by the node `source`
-/// speaks for. A caller ahead of the node, or a node with no map yet, makes it fetch the
-/// map, waiting at most `wait`.
+/// speaks for, and the map it is judged by. A caller ahead of the node, or a node with no
+/// map yet, makes it fetch the map, waiting at most `wait`.
 ///
 /// # Errors
 /// [`StorageError::StaleMap`] if `requested` is older than the node's generation (0 is
@@ -88,21 +151,22 @@ pub(crate) async fn check(
     source: &dyn MapSource,
     requested: u64,
     wait: Duration,
-) -> Result<(), StorageError> {
+) -> Result<Arc<Map>, StorageError> {
     let held = source.current();
-    if let Some(map) = held.as_deref()
-        && requested <= map.generation()
-    {
-        return check_generation(map, requested);
-    }
-    let fetched = tokio::time::timeout(wait, source.refetch(requested))
-        .await
-        .ok()
-        .flatten();
-    match fetched.or(held) {
-        Some(map) => check_generation(&map, requested),
-        None => Err(StorageError::Unavailable(Arc::new(NoMap { requested }))),
-    }
+    let map = match held {
+        Some(map) if requested <= map.generation() => map,
+        held => {
+            let fetched = tokio::time::timeout(wait, source.refetch(requested))
+                .await
+                .ok()
+                .flatten();
+            fetched
+                .or(held)
+                .ok_or_else(|| StorageError::Unavailable(Arc::new(NoMap { requested })))?
+        }
+    };
+    check_generation(&map, requested)?;
+    Ok(map)
 }
 
 /// Whether a call routed by map generation `requested` may be served by a node holding
@@ -126,35 +190,4 @@ pub(crate) fn check_generation(map: &Map, requested: u64) -> Result<(), StorageE
 }
 
 #[cfg(test)]
-mod tests {
-    use kbf_map::{Map, Member, MemberId, MemberState, Rule};
-
-    use super::*;
-
-    /// Catches an off-by-one at the generation boundary, and 0 ("no map seen") treated as
-    /// current: behind is stale, equal is served, ahead is unavailable.
-    #[test]
-    fn behind_is_stale_equal_is_served_ahead_is_unavailable() {
-        let member = Member {
-            id: MemberId(1),
-            addr: "127.0.0.1:1".to_owned(),
-            zone: String::new(),
-            weight: 1,
-            state: MemberState::Active,
-        };
-        let map = Map::new(7, vec![member], Rule::Rendezvous, 1, 1, Vec::new()).expect("map");
-        for behind in [0, 1, 6] {
-            assert!(matches!(
-                check_generation(&map, behind),
-                Err(StorageError::StaleMap { current: 7 })
-            ));
-        }
-        assert!(check_generation(&map, 7).is_ok());
-        for ahead in [8, u64::MAX] {
-            assert!(matches!(
-                check_generation(&map, ahead),
-                Err(StorageError::Unavailable(_))
-            ));
-        }
-    }
-}
+mod tests;

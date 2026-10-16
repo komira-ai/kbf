@@ -57,6 +57,11 @@ pub enum Endpoint {
     Read,
     /// ByteStream `Write`.
     Write,
+    /// ByteStream `Write` of a copy another storage node sends (the `kbf-chain-leg`
+    /// entry): a primary to its replica, or a repair. Only a storage node makes one; a
+    /// call that names itself a copy and is from another role would be a write that is
+    /// never forwarded to a second owner.
+    WriteLeg,
     /// ByteStream `QueryWriteStatus`: whether a `Write` of the blob has landed, so it
     /// is the roles of the `Write` it asks about.
     QueryWriteStatus,
@@ -72,10 +77,11 @@ pub enum Endpoint {
 
 impl Endpoint {
     /// Every endpoint.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::FindMissing,
         Self::Read,
         Self::Write,
+        Self::WriteLeg,
         Self::QueryWriteStatus,
         Self::ActionGet,
         Self::ActionPrepare,
@@ -94,6 +100,7 @@ impl Endpoint {
             Self::FindMissing | Self::Read | Self::Write | Self::QueryWriteStatus => {
                 &[Frontend, Storage, Daemon]
             }
+            Self::WriteLeg => &[Storage],
             Self::ActionGet => &[Frontend],
             Self::ActionPrepare | Self::ActionCommit => &[Frontend, Daemon],
             Self::Segments => &[Daemon],

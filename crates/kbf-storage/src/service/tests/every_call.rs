@@ -48,6 +48,10 @@ impl MapSource for Frontend {
         self.held.current()
     }
 
+    fn me(&self) -> Option<kbf_map::MemberId> {
+        self.held.me()
+    }
+
     fn refetch(&self, at_least: u64) -> BoxFuture<'_, Option<Arc<Map>>> {
         self.asked.lock().expect("lock").push(at_least);
         if let Fetch::Arrives(generation) = self.fetch {
@@ -330,6 +334,10 @@ struct Hung(Arc<Held>);
 impl MapSource for Hung {
     fn current(&self) -> Option<Arc<Map>> {
         self.0.current()
+    }
+
+    fn me(&self) -> Option<kbf_map::MemberId> {
+        self.0.me()
     }
 
     fn refetch(&self, _: u64) -> BoxFuture<'_, Option<Arc<Map>>> {
