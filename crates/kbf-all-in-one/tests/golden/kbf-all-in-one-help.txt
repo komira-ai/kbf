@@ -329,30 +329,35 @@ Options:
           
           [default: 2147483648]
 
+      --lease-swap-kill-percent <LEASE_SWAP_KILL_PERCENT>
+          ...or this percentage of its booked memory, whichever is more. The kernel caps each lease's RAM at its booking x 1.5 + 512 MiB and lets it swap without limit; a lease is killed by this rule only while its own cap keeps being hit (its `memory.events` `max` grew since the last sample) and its swap rose since the last sample, and only swap that rose so counts, never swap that host pressure moved out of it
+          
+          [default: 25]
+
       --reapi-max-streams <REAPI_MAX_STREAMS>
           The most HTTP/2 streams one connection to the REAPI listener may have open. buck2 keeps one Execute stream open per outstanding action, idle until the action finishes, so this bounds how large a backlog one buck2 invocation can show the farm. The connection's flow-control window is this many streams' windows; above about 2000 streams each stream's window is smaller than 1 MiB so that the product stays under HTTP/2's largest window. At least 1, at most 32767
           
           [default: 10000]
+
+      --memory-pressure-pause-percent <MEMORY_PRESSURE_PAUSE_PERCENT>
+          The daemon takes no new lease while the node's memory stall time (the `some` line's `avg10` in `/proc/pressure/memory`, as a percentage) is above this and it runs a lease: it says so to the server, which places nothing on it until the stall falls, and the leases it runs go on. With no lease it serves whatever the stall, so it is never left idle for good. Off where the kernel reports no pressure stall information (macOS, a kernel built without it)
+          
+          [default: 10]
 
       --worker-max-streams <WORKER_MAX_STREAMS>
           The most HTTP/2 streams one connection to the worker listener may have open: a daemon's persistent session stream and its short transfer streams. At least 1, at most 32767
           
           [default: 200]
 
-      --lease-swap-kill-percent <LEASE_SWAP_KILL_PERCENT>
-          ...or this percentage of its booked memory, whichever is more. The kernel caps each lease's RAM at its booking x 1.5 + 512 MiB and lets it swap without limit; a lease is killed by this rule only while its own cap keeps being hit (its `memory.events` `max` grew since the last sample) and its swap rose since the last sample, and only swap that rose so counts, never swap that host pressure moved out of it
-          
-          [default: 25]
-
       --write-puts-in-flight <WRITE_PUTS_IN_FLIGHT>
           The most segment PUTs, each with its footer read-back, in flight at once. A segment sealed while all are busy waits; new blobs go to a new open segment
           
           [default: 4]
 
-      --memory-pressure-pause-percent <MEMORY_PRESSURE_PAUSE_PERCENT>
-          The daemon takes no new lease while the node's memory stall time (the `some` line's `avg10` in `/proc/pressure/memory`, as a percentage) is above this and it runs a lease: it says so to the server, which places nothing on it until the stall falls, and the leases it runs go on. With no lease it serves whatever the stall, so it is never left idle for good. Off where the kernel reports no pressure stall information (macOS, a kernel built without it)
+      --lease-swap-poll-ms <LEASE_SWAP_POLL_MS>
+          How often each lease's `max` events and swap are sampled, in milliseconds (container)
           
-          [default: 10]
+          [default: 1000]
 
       --store-put-attempts <STORE_PUT_ATTEMPTS>
           How many times a segment PUT is tried. Only a PUT that did not complete (connect, reset, timeout) or that the store answered 5xx is tried again, after 100 ms and then four times longer each time, under a new object key; if every attempt fails, the segment's blobs are answered UNAVAILABLE
@@ -364,30 +369,25 @@ Options:
           
           [default: 1048576]
 
-      --input-tree-cache-bytes <INPUT_TREE_CACHE_BYTES>
-          The most bytes of decoded Directories the input check keeps (each costs its digests, 40 bytes apiece, and 160 bytes)
-          
-          [default: 268435456]
-
-      --lease-swap-poll-ms <LEASE_SWAP_POLL_MS>
-          How often each lease's `max` events and swap are sampled, in milliseconds (container)
-          
-          [default: 1000]
-
-      --input-tree-reads-in-flight <INPUT_TREE_READS_IN_FLIGHT>
-          The most Directory blobs the input check reads from the store at once, across all Executes
-          
-          [default: 64]
-
       --memory-limit-percent <MEMORY_LIMIT_PERCENT>
           A lease's processes are killed past this percentage of its booked memory...
           
           [default: 150]
 
+      --input-tree-cache-bytes <INPUT_TREE_CACHE_BYTES>
+          The most bytes of decoded Directories the input check keeps (each costs its digests, 40 bytes apiece, and 160 bytes)
+          
+          [default: 268435456]
+
       --memory-headroom-mib <MEMORY_HEADROOM_MIB>
           ...plus this many MiB (native). A lease that booked nothing has no limit
           
           [default: 512]
+
+      --input-tree-reads-in-flight <INPUT_TREE_READS_IN_FLIGHT>
+          The most Directory blobs the input check reads from the store at once, across all Executes
+          
+          [default: 64]
 
       --memory-poll-ms <MEMORY_POLL_MS>
           How often a lease's memory is measured, in milliseconds (native)

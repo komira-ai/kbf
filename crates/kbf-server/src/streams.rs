@@ -188,7 +188,10 @@ mod tests {
         let one = Args::parse_from(["kbf-server", "--worker-max-streams=3"])
             .listeners()
             .expect("listeners");
-        assert_eq!(one.stream_limits.reapi, 10_000, "an unset flag keeps its default");
+        assert_eq!(
+            one.stream_limits.reapi, 10_000,
+            "an unset flag keeps its default"
+        );
         assert_eq!(one.stream_limits.worker, 3);
     }
 
