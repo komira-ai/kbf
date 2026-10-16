@@ -46,6 +46,21 @@ pub fn main() -> ExitCode {
     run::main()
 }
 
+/// The `kbf all-in-one` mode: [`main`] after the command line is parsed (the
+/// daemon's helper re-execs having been dispatched by the caller, first thing).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn run(flags: &cli::Flags) -> ExitCode {
+    run::run(flags)
+}
+
+/// The `kbf all-in-one` mode off Linux: it refuses to run.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn run(_flags: &cli::Flags) -> ExitCode {
+    main()
+}
+
 /// The `kbf-all-in-one` binary off Linux: it refuses to run.
 #[cfg(not(target_os = "linux"))]
 #[must_use]
