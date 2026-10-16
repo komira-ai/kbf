@@ -20,7 +20,11 @@
 //!   run both in one process, and any other crate that links both, or either one into
 //!   the other's side of the farm, makes the split meaningless;
 //! - a `main.rs` of those two that grows past `THIN_MAIN_LINES` code lines, which
-//!   means assembly that a combined binary could not reuse is back in a binary.
+//!   means assembly that a combined binary could not reuse is back in a binary;
+//! - the storage crate (`kbf-storage`) depending, directly or through another crate, on
+//!   a frontend crate (`STORAGE_MUST_NOT_REACH`: the scheduler and authorization), which
+//!   would make a storage process link the frontend; and the storage crate renamed or
+//!   removed, which would make that check pass vacuously.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -299,4 +303,25 @@ fn the_server_and_daemon_binaries_are_thin() {
              in the library, where a combined binary can call it"
         );
     }
+}
+
+/// What the storage crate's normal dependencies must not reach: the frontend's scheduler
+/// and authorization (docs/design/architecture-v2.md, section 3). A storage process
+/// stores; it neither schedules nor decides who may call.
+const STORAGE_MUST_NOT_REACH: &[&str] = &["kbf-sched", "kbf-auth"];
+
+#[test]
+fn storage_reaches_no_frontend_crate() {
+    let g = load_graph();
+    let (_, root) = g
+        .members
+        .get("kbf-storage")
+        .expect("kbf-storage is a workspace member");
+    assert!(root.is_some(), "kbf-storage must have a library target");
+    let violations = reaches(&g, "kbf-storage", STORAGE_MUST_NOT_REACH);
+    assert!(
+        violations.is_empty(),
+        "kbf-storage reaches a frontend crate:\n{}",
+        violations.join("\n")
+    );
 }

@@ -185,10 +185,44 @@ impl PageSize {
     }
 }
 
-/// Where the next [`ObjectStore::list`](crate::ObjectStore::list) page starts. Opaque:
-/// only the store that issued it can read it.
+/// Where the next [`ObjectStore::list`](crate::ObjectStore::list) page starts: a token a
+/// store issued with a page (opaque: only the store that issued it can read it), or
+/// [`ListToken::after`] a key, which every store reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ListToken(pub(crate) String);
+pub struct ListToken(pub(crate) Token);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Token {
+    /// An S3 continuation token.
+    Continue(String),
+    /// Start after this key (S3's `start-after`). The local stores issue these: their
+    /// next page starts after the last key of the page before.
+    After(ObjectKey),
+}
+
+impl ListToken {
+    /// A listing that starts after `key`: the first key it returns is the least key
+    /// under the prefix greater than `key`. `key` need not exist. A rebuild that
+    /// stopped part-way resumes from the last key it finished.
+    #[must_use]
+    pub fn after(key: &ObjectKey) -> Self {
+        Self(Token::After(key.clone()))
+    }
+
+    /// The key a local store's listing resumes after.
+    ///
+    /// # Errors
+    /// [`ObjectStoreError::Protocol`] for a continuation token, which only an S3 store
+    /// issues and only it can read.
+    pub(crate) fn local_after(&self) -> Result<&ObjectKey, ObjectStoreError> {
+        match &self.0 {
+            Token::After(key) => Ok(key),
+            Token::Continue(_) => Err(ObjectStoreError::Protocol(
+                "a continuation token from another store".into(),
+            )),
+        }
+    }
+}
 
 /// One object in a list page.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -24,8 +24,8 @@ pub enum Entry {
     /// The server and the daemon in one process: `kbf_all_in_one::run`, the flags of
     /// `kbf-all-in-one`.
     AllInOne,
-    /// Not built yet: the mode exits 2 saying which work-plan unit builds it.
-    NotBuilt(&'static str),
+    /// Not built yet: the mode exits 2 saying so.
+    NotBuilt,
 }
 
 /// A mode and what it runs.
@@ -39,13 +39,16 @@ pub struct Mode {
 
 /// Every mode, in help order: exactly five.
 pub const MODES: [Mode; 5] = [
+    // The three `NotBuilt` rows (frontend, storage, storage-and-daemon) accept and ignore
+    // every flag: they exit before parsing any. Each gets its real flag set when it is
+    // built.
     Mode {
         name: FRONTEND,
-        entry: Entry::NotBuilt("av2-07"),
+        entry: Entry::NotBuilt,
     },
     Mode {
         name: STORAGE,
-        entry: Entry::NotBuilt("av2-06"),
+        entry: Entry::NotBuilt,
     },
     Mode {
         name: DAEMON,
@@ -53,7 +56,7 @@ pub const MODES: [Mode; 5] = [
     },
     Mode {
         name: STORAGE_AND_DAEMON,
-        entry: Entry::NotBuilt("av2-06"),
+        entry: Entry::NotBuilt,
     },
     Mode {
         name: ALL_IN_ONE,
@@ -63,6 +66,6 @@ pub const MODES: [Mode; 5] = [
 
 /// The one line an unbuilt mode prints to stderr before it exits 2.
 #[must_use]
-pub fn not_built_line(mode: &str, unit: &str) -> String {
-    format!("kbf {mode}: mode not built yet (work-plan unit {unit})")
+pub fn not_built_line(mode: &str) -> String {
+    format!("kbf {mode}: mode not built yet")
 }

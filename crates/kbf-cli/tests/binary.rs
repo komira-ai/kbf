@@ -101,16 +101,16 @@ fn help_lists_the_five_modes_and_unknown_modes_exit_2() {
 
 /// Catches a mode that is not built running something, exiting other than 2, printing
 /// more than the one line, or printing on stdout: each exits 2 with one stderr line
-/// naming the mode and the unit, whatever flags it is given.
+/// naming the mode, whatever flags it is given.
 #[test]
 fn an_unbuilt_mode_exits_2_with_one_line() {
     for mode in names::MODES {
-        let names::Entry::NotBuilt(unit) = mode.entry else {
+        if mode.entry != names::Entry::NotBuilt {
             continue;
-        };
+        }
         let (code, out, err) = run(&[mode.name, "--any-flag=1", "positional"]);
         assert_eq!(code, Some(2), "{}: {err}", mode.name);
-        assert_eq!(err, format!("{}\n", names::not_built_line(mode.name, unit)));
+        assert_eq!(err, format!("{}\n", names::not_built_line(mode.name)));
         assert!(out.is_empty(), "{out}");
     }
 }
