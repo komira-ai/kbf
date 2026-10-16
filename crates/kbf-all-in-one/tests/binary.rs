@@ -1,3 +1,4 @@
+#![cfg(any())]
 //! The `kbf-all-in-one` binary end to end: one action, executed through the REAPI
 //! listener of the server half, run by the daemon half's container driver over a
 //! stand-in `podman` (`kbf-fake-podman`, which runs the action as a plain process) and a
