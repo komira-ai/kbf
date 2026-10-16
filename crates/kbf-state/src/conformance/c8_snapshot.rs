@@ -97,10 +97,13 @@ pub(super) fn c8_page_snapshot<B: Backend>(backend: &B) {
                         .map(|(_, row)| String::from_utf8_lossy(&row.value))
                         .collect::<Vec<_>>()
                 );
-                assert!(
-                    page.resume.is_none() || page.rows.len() == LIMIT,
-                    "C8 page snapshot: a page with a token is full while keys are only rewritten"
-                );
+                if page.resume.is_some() {
+                    assert_eq!(
+                        page.rows.len(),
+                        LIMIT,
+                        "C8 page snapshot: a page with a token is full while keys are only rewritten"
+                    );
+                }
             }
             let keys: Vec<&str> = pages.iter().flat_map(keys_of).collect();
             assert_eq!(
