@@ -231,4 +231,19 @@ fn the_mode_verbs_write_the_slice_and_one_unit_and_read_it_back() {
         matches!(e, Some(crate::linux::Refusal::Write { .. })),
         "{e:?}"
     );
+    // A directory where the mode's unit goes: the slice is written, the unit's write fails.
+    std::fs::create_dir_all(dir.join("taken/kbf-daemon.service")).expect("dir in the way");
+    let e = crate::linux::render_mode_unit(&cfg, &dir.join("taken"), None, Mode::Daemon).err();
+    assert!(
+        matches!(e, Some(crate::linux::Refusal::Write { .. })),
+        "{e:?}"
+    );
+    assert!(dir.join("taken/kbf.slice").is_file());
+    // No settings file: refused before anything is written or read.
+    let none = dir.join("nope");
+    let e = crate::linux::render_mode_unit(&none, &dir.join("unwritten"), None, Mode::Daemon).err();
+    assert!(matches!(e, Some(crate::linux::Refusal::Config(_))), "{e:?}");
+    assert!(!dir.join("unwritten").exists());
+    let e = crate::linux::check_mode_unit(&none, &out, Mode::AllInOne, true).err();
+    assert!(matches!(e, Some(crate::linux::Refusal::Config(_))), "{e:?}");
 }
