@@ -1301,10 +1301,12 @@ dependencies = [
  "kbf-daemon",
  "kbf-driver-container",
  "kbf-front",
+ "kbf-meta",
  "kbf-node",
  "kbf-proto",
  "kbf-segments",
  "kbf-server",
+ "kbf-storage",
  "kbf-testkit",
  "kbf-threads",
  "kbf-transfer",
@@ -1529,6 +1531,7 @@ dependencies = [
  "kbf-proto",
  "kbf-sched",
  "kbf-segments",
+ "kbf-storage",
  "kbf-store",
  "kbf-tier",
  "kbf-types",
@@ -1840,6 +1843,7 @@ dependencies = [
  "kbf-sched",
  "kbf-segments",
  "kbf-sim",
+ "kbf-storage",
  "kbf-store",
  "kbf-threads",
  "kbf-tier",
@@ -1889,6 +1893,19 @@ dependencies = [
  "kbf-tier",
  "kbf-types",
  "tokio",
+]
+
+[[package]]
+name = "kbf-storage"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "kbf-meta",
+ "kbf-proto",
+ "kbf-types",
+ "thiserror",
+ "tonic",
 ]
 
 [[package]]
