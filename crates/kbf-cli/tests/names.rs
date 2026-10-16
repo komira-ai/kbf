@@ -21,7 +21,7 @@ fn the_cli_has_exactly_the_tables_modes() {
     assert_eq!(constants.to_vec(), want);
 }
 
-/// Catches an unbuilt mode whose help does not name its unit, and a built mode that
+/// Catches an unbuilt mode whose help does not say "Not built yet", and a built mode that
 /// says it is not built.
 #[test]
 fn each_modes_help_says_whether_it_is_built() {
@@ -34,7 +34,7 @@ fn each_modes_help_says_whether_it_is_built() {
             .map(ToString::to_string)
             .unwrap_or_default();
         match mode.entry {
-            Entry::NotBuilt(unit) => assert!(about.contains(unit), "{}: {about}", mode.name),
+            Entry::NotBuilt => assert_eq!(about, "Not built yet", "{}", mode.name),
             _ => assert!(!about.contains("Not built"), "{}: {about}", mode.name),
         }
     }

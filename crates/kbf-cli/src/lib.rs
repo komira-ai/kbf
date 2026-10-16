@@ -7,7 +7,7 @@
 //!   runs them today. Takes exactly the flags `kbf-all-in-one` takes
 //!   ([`kbf_all_in_one::cli`]).
 //! - `kbf frontend`, `kbf storage`, `kbf storage-and-daemon`: not built yet. Each
-//!   exits 2 with one line naming the mode and the work-plan unit that builds it.
+//!   exits 2 with one line naming the mode.
 //!
 //! A mode refuses the flags that belong to another mode ([`refused_by`]): the set is
 //! derived from each mode's own flag set, nothing is listed by hand, so a flag added to
@@ -37,12 +37,10 @@ pub enum Invocation {
     Daemon(Box<kbf_node::Cli>),
     /// `kbf all-in-one`.
     AllInOne(Box<kbf_all_in_one::cli::Flags>),
-    /// A mode that is not built yet, and the work-plan unit that builds it.
+    /// A mode that is not built yet.
     NotBuilt {
         /// The mode.
         mode: &'static str,
-        /// The unit.
-        unit: &'static str,
     },
 }
 
@@ -57,7 +55,7 @@ fn own_command(entry: Entry) -> Option<Command> {
     match entry {
         Entry::Daemon => Some(kbf_node::Cli::command()),
         Entry::AllInOne => Some(kbf_all_in_one::cli::command()),
-        Entry::NotBuilt(_) => None,
+        Entry::NotBuilt => None,
     }
 }
 
@@ -120,15 +118,13 @@ fn mode_command(name: &'static str, entry: Entry) -> Command {
             }
             cmd
         }
-        Entry::NotBuilt(unit) => Command::new(name)
-            .about(format!("Not built yet (work-plan unit {unit})"))
-            .arg(
-                Arg::new("args")
-                    .num_args(0..)
-                    .allow_hyphen_values(true)
-                    .trailing_var_arg(true)
-                    .hide(true),
-            ),
+        Entry::NotBuilt => Command::new(name).about("Not built yet").arg(
+            Arg::new("args")
+                .num_args(0..)
+                .allow_hyphen_values(true)
+                .trailing_var_arg(true)
+                .hide(true),
+        ),
     }
 }
 
@@ -179,10 +175,7 @@ where
                 m,
             )?)))
         }
-        Entry::NotBuilt(unit) => Ok(Invocation::NotBuilt {
-            mode: mode.name,
-            unit,
-        }),
+        Entry::NotBuilt => Ok(Invocation::NotBuilt { mode: mode.name }),
     }
 }
 
@@ -222,8 +215,8 @@ pub fn run(invocation: &Invocation) -> ExitCode {
     match invocation {
         Invocation::Daemon(cli) => kbf_node::run(cli),
         Invocation::AllInOne(flags) => kbf_all_in_one::run(flags),
-        Invocation::NotBuilt { mode, unit } => {
-            eprintln!("{}", names::not_built_line(mode, unit));
+        Invocation::NotBuilt { mode } => {
+            eprintln!("{}", names::not_built_line(mode));
             ExitCode::from(2)
         }
     }
