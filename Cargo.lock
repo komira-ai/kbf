@@ -1409,6 +1409,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
+ "kbf-auth",
  "kbf-front",
  "kbf-map",
  "kbf-meta",
@@ -1579,6 +1580,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "futures",
+ "http-body",
  "kbf-auth",
  "kbf-caps",
  "kbf-invocation",

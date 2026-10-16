@@ -19,6 +19,7 @@ tokio = { workspace = true, features = ["fs", "io-util"] }
 
 [dev-dependencies]
 bytes.workspace = true
+kbf-auth.workspace = true
 kbf-front.workspace = true
 kbf-map.workspace = true
 kbf-meta.workspace = true
