@@ -307,7 +307,7 @@ fn hash_after_name(owner: Owner, segment: &str) -> bool {
 /// (`<cell><16 hex>`), if `segment` is one.
 fn unglue_content_hash(segment: &str) -> Option<&str> {
     let cut = segment.len().checked_sub(16).filter(|&cut| cut > 0)?;
-    let (cell, hash) = (segment.get(..cut)?, segment.get(cut..)?);
+    let (cell, hash) = segment.split_at_checked(cut)?;
     is_hex(hash).then_some(cell)
 }
 

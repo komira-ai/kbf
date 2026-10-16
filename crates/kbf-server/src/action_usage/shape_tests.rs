@@ -385,7 +385,8 @@ fn bxl_paths_drop_their_hashes() {
 /// content form, where buck2 glues the content hash to the cell; and a package
 /// directory named by hex digits, which is not the hash (the hash always sits
 /// between it and the name). Catches: the glued hash kept (the key moves with every
-/// content change), the cell cut with it, or a hex package directory dropped.
+/// content change), the cell cut with it, a cut that leaves an empty cell or falls
+/// inside a character, or a hex package directory dropped.
 #[test]
 fn an_anonymous_root_package_target_drops_its_glued_hash() {
     assert_eq!(
@@ -411,6 +412,16 @@ fn an_anonymous_root_package_target_drops_its_glued_hash() {
     assert_eq!(
         pat(&format!("buck-out/v2/art-anon/{}/__x__/o", &CONTENT[..15])),
         some(&format!("{}/__x__/o", &CONTENT[..15]), None)
+    );
+    // Sixteen hex digits and no cell before them: not cut to an empty segment.
+    assert_eq!(
+        pat(&format!("buck-out/v2/art-anon/{CONTENT}/__x__/o")),
+        some(&format!("{CONTENT}/__x__/o"), None)
+    );
+    // Sixteen bytes from the end inside a character: no hash there.
+    assert_eq!(
+        pat(&format!("buck-out/v2/art-anon/é{}/__x__/o", &CONTENT[..15])),
+        some(&format!("é{}/__x__/o", &CONTENT[..15]), None)
     );
 }
 
