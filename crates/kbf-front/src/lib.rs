@@ -72,13 +72,13 @@ pub use crate::action_cache::ActionCacheService;
 pub use crate::bytestream::ByteStreamService;
 pub use crate::cache::HIT_CHECKS_IN_FLIGHT;
 pub use crate::cache::{
-    Admitted, BATCH_READS_IN_FLIGHT, BlobRead, CONNECTION_WINDOW_BYTES, Cache, CacheError,
-    EVICT_BATCH, EVICT_EVERY, EVICT_GRACE, EvictReady, EvictRound, FLUSH_BACKOFF_FIRST,
-    FLUSH_BACKOFF_MAX, FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound, HeldObject,
-    MAX_ADMISSION_BYTES, MAX_CONCURRENT_STREAMS, MAX_DECODED_BLOB_BYTES, NEEDS_V3,
-    PASS_OPENS_PER_SEC, PUT_BACKOFF, PUT_BACKOFF_FACTOR, PassReport, READ_WINDOW_BYTES,
-    RecordStream, STREAM_WINDOW_BYTES, StreamedRecord, TierStartError, TierStartup, TouchConfig,
-    VerifiedBlob, WriteConfig,
+    Admitted, BATCH_READS_IN_FLIGHT, BlobRead, Cache, CacheError, DEFAULT_REAPI_STREAMS,
+    DEFAULT_WORKER_STREAMS, EVICT_BATCH, EVICT_EVERY, EVICT_GRACE, EvictReady, EvictRound,
+    FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound,
+    HeldObject, MAX_ADMISSION_BYTES, MAX_DECODED_BLOB_BYTES, NEEDS_V3, PASS_OPENS_PER_SEC,
+    PUT_BACKOFF, PUT_BACKOFF_FACTOR, PassReport, READ_WINDOW_BYTES, RecordStream,
+    STREAM_WINDOW_BYTES, StreamedRecord, TierStartError, TierStartup, TouchConfig, VerifiedBlob,
+    WriteConfig,
 };
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
@@ -107,8 +107,9 @@ pub use crate::segments::{
 /// The most blob data one `BatchUpdateBlobs` or `BatchReadBlobs` call may carry,
 /// advertised in the capabilities. Larger blobs go through ByteStream. A request is
 /// decoded whole before its handler runs, so one stream may hold up to
-/// [`MAX_MESSAGE_BYTES`] (17 MiB) of decode buffer: 200 concurrent streams bound the
-/// decode memory at about 3.4 GiB, which `--write-bytes-in-flight` does not cover
+/// [`MAX_MESSAGE_BYTES`] (17 MiB) of decode buffer: the decode memory is that times the
+/// streams a connection may open (`--reapi-max-streams`, `--worker-max-streams`), about
+/// 3.4 GiB for 200, which `--write-bytes-in-flight` does not cover
 /// (`docs/design/write-path.md`).
 pub const MAX_BATCH_TOTAL_BYTES: usize = 16 << 20;
 
