@@ -2,11 +2,10 @@
 //! errors a broken index or object gives.
 
 use kbf_history::container::{self, Header};
-use kbf_history::keys::rows;
 use kbf_history::records::{
     ChunkRecord, ChunkRow, ChunkSummary, RunOutcome, SECTION_RUN, StreamRow, chunk_key,
 };
-use kbf_history::{Day, Family, InvRef, Limits, ReadError, RunId, StreamId, WriterId};
+use kbf_history::{Day, Family, IndexRoot, InvRef, Limits, ReadError, RunId, StreamId, WriterId};
 use kbf_objstore::ObjectStoreError;
 use prost::Message;
 
@@ -177,7 +176,7 @@ fn broken_index_rows_are_errors() {
     let reader = life.reader();
     let stream_key = life
         .index
-        .keys(&rows::stream_prefix(id.day(), id.stream()))
+        .keys(&IndexRoot::default().stream_prefix(id.day(), id.stream()))
         .remove(0);
     let bad_inv = StreamRow {
         inv_key: "nope".into(),
@@ -189,11 +188,15 @@ fn broken_index_rows_are_errors() {
     life.index.put(&stream_key, vec![0xFF]);
     let err = futures::executor::block_on(reader.run(id, &all)).unwrap_err();
     assert!(matches!(err, ReadError::Row { .. }), "{err}");
-    let row_key = life.index.keys(&rows::ichunk_prefix(&inv.key)).remove(0);
+    let row_key = life
+        .index
+        .keys(&IndexRoot::default().ichunk_prefix(&inv.key))
+        .remove(0);
     life.index.put(&row_key, vec![0xFF]);
     let err = futures::executor::block_on(reader.invocation(&inv.key, &all)).unwrap_err();
     assert!(err.to_string().contains(&row_key), "{err}");
-    life.index.put(&rows::invid(&inv.key), vec![0xFF]);
+    life.index
+        .put(&IndexRoot::default().invid(&inv.key), vec![0xFF]);
     let err = futures::executor::block_on(reader.invocation(&inv.key, &all)).unwrap_err();
     assert!(matches!(err, ReadError::Row { .. }), "{err}");
     // The index itself failing is its own error.
@@ -233,15 +236,20 @@ fn plant(life: &Life, records: Vec<(Vec<u8>, Vec<u8>)>, row: ChunkRow) -> (InvRe
         ..row
     };
     let stream = StreamId(0x7F_0000);
-    life.index
-        .put(&rows::ichunk(&inv.key, writer, 0), row.encode_to_vec());
+    life.index.put(
+        &IndexRoot::default().ichunk(&inv.key, writer, 0),
+        row.encode_to_vec(),
+    );
     let s = StreamRow {
         inv_key: inv.key.as_str().into(),
         writer: writer.0,
     };
+    life.index.put(
+        &IndexRoot::default().stream(day, stream, T),
+        s.encode_to_vec(),
+    );
     life.index
-        .put(&rows::stream(day, stream, T), s.encode_to_vec());
-    life.index.put(&rows::invid(&inv.key), Vec::new());
+        .put(&IndexRoot::default().invid(&inv.key), Vec::new());
     (inv, RunId::new(T, stream, 0))
 }
 

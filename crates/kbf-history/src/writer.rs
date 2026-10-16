@@ -3,8 +3,8 @@
 //!
 //! The server owns the loop: it offers events to the [`EventQueue`] from the request
 //! path and calls [`Writer::step`] on a cadence of its choosing (twice a second keeps
-//! index writes at the background lane's two transactions a second). [`Writer::step`]
-//! calls the blocking [`Store`], so the server runs it where blocking is allowed.
+//! index writes at the background lane's two transactions a second). Index calls go
+//! through the [`HistoryIndex`]'s offload, so `step` may be awaited on a runtime worker.
 //!
 //! - **Chunks.** An invocation's records are gathered per writer and cut into a chunk at
 //!   [`Limits::chunk_bytes`] of raw records, when the invocation closes, when its oldest
@@ -37,11 +37,12 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use kbf_objstore::{ByteRange, ObjectKey, ObjectStore, ObjectStoreError};
-use kbf_state::{Cond, Store, Txn};
+use kbf_state::{Cond, Txn, Versioned};
 use prost::Message;
 
 use crate::container::{self, Encoded, Header};
-use crate::keys::{Day, Family, HistoryRoot, InvKey, WriterId, rows};
+use crate::index::HistoryIndex;
+use crate::keys::{Day, Family, HistoryRoot, InvKey, WriterId};
 use crate::pending::{Kept, KeptObject, Pending, PendingLimits, Row};
 use crate::queue::{Event, EventQueue, InvRef};
 use crate::records::{
@@ -182,10 +183,10 @@ pub struct Writer<O> {
     core: Core,
 }
 
-/// Everything of the writer but the object store: no I/O but the blocking index.
+/// Everything of the writer but the object store and index calls: no I/O.
 struct Core {
     root: HistoryRoot,
-    index: Arc<dyn Store>,
+    index: HistoryIndex,
     writer: WriterId,
     minter: Arc<Minter>,
     queue: Arc<EventQueue>,
@@ -212,7 +213,7 @@ impl<O: ObjectStore> Writer<O> {
     pub fn new(
         objects: O,
         root: HistoryRoot,
-        index: Arc<dyn Store>,
+        index: HistoryIndex,
         writer: WriterId,
         minter: Arc<Minter>,
         queue: Arc<EventQueue>,
@@ -244,7 +245,11 @@ impl<O: ObjectStore> Writer<O> {
     /// them, apply up to [`Limits::txns_per_step`] index transactions, and, once nothing
     /// is pending, read back kept objects to restore their rows.
     pub async fn step(&mut self, now_ms: u64) {
-        self.core.prepare(now_ms);
+        self.core.index_failed = false;
+        self.refill_streams().await;
+        self.core.take_events(now_ms);
+        self.read_headers().await;
+        self.core.cut_due(now_ms);
         let mut failed = VecDeque::new();
         while let Some(cut) = self.core.ready.pop_front() {
             let body = Bytes::from(cut.encoded.bytes.clone());
@@ -254,7 +259,7 @@ impl<O: ObjectStore> Writer<O> {
             }
         }
         self.core.ready = failed;
-        self.core.apply_pending();
+        self.apply_pending().await;
         for _ in 0..self.core.reinsert_budget() {
             let Some(object) = self.core.kept.pop() else {
                 break;
@@ -265,6 +270,79 @@ impl<O: ObjectStore> Writer<O> {
             }
         }
         self.core.prune(now_ms);
+    }
+
+    async fn refill_streams(&self) {
+        let core = &self.core;
+        if !core.minter.needs_block() {
+            return;
+        }
+        let txn = Txn::new().next(core.index.root().streams_counter());
+        if let Ok(Ok(commit)) = core.index.txn(txn).await {
+            // An empty counter list is a backend bug; block 0 is refused, so it is safe.
+            core.minter
+                .add_block(commit.counters.first().copied().unwrap_or(0));
+        }
+    }
+
+    /// Reads the stored headers of up to [`Limits::header_reads_per_step`] invocations
+    /// opened since. A failed read leaves the rest for the next step: the index is not
+    /// answering.
+    async fn read_headers(&mut self) {
+        for key in self.core.unread() {
+            let row = self.core.index.root().invid(&key);
+            let Ok(stored) = self.core.index.get(row).await else {
+                return;
+            };
+            self.core.header_read(&key, stored);
+        }
+    }
+
+    /// Sends at most [`Limits::txns_per_step`] index transactions, retries included.
+    async fn apply_pending(&mut self) {
+        let limits = self.core.limits;
+        let mut budget = limits.txns_per_step;
+        while budget > 0 {
+            let batch = self.core.pending.take(limits.txn_rows, limits.txn_bytes);
+            if batch.is_empty() {
+                return;
+            }
+            budget = self.apply(batch, budget).await;
+        }
+    }
+
+    /// Applies one batch of rows, one transaction of `budget` per try, and returns the
+    /// budget left. A pointer row that already exists (a restored row, or a write
+    /// retried after it landed) fails its `Absent` check; it is there, so it leaves the
+    /// batch and the rest is tried again, or put back for the next step once the budget
+    /// is spent. A failed transaction drops its rows, each counted and its object kept.
+    async fn apply(&mut self, mut batch: Vec<(String, Row)>, mut budget: usize) -> usize {
+        while !batch.is_empty() {
+            if budget == 0 {
+                for (key, row) in batch {
+                    self.core.enqueue(key, row);
+                }
+                return 0;
+            }
+            budget -= 1;
+            let txn = batch.iter().fold(Txn::new(), |t, (key, row)| {
+                t.put(key.clone(), row.value.clone(), row.cond)
+            });
+            match self.core.index.txn(txn).await {
+                Ok(Ok(_)) => return budget,
+                Ok(Err(conflict)) => {
+                    batch.remove(conflict.index.min(batch.len() - 1));
+                }
+                Err(_) => {
+                    self.core.index_failed = true;
+                    for (_, row) in batch {
+                        self.core.dropped_row(row);
+                    }
+                    return budget;
+                }
+            }
+        }
+        budget
     }
 
     /// Invocations the writer holds state for.
@@ -306,16 +384,12 @@ impl<O: ObjectStore> Writer<O> {
 }
 
 impl Core {
-    /// The part of a step before any object is written.
-    fn prepare(&mut self, now_ms: u64) {
-        self.index_failed = false;
-        self.refill_streams();
+    /// Takes the queued events into the invocations' chunks.
+    fn take_events(&mut self, now_ms: u64) {
         self.minter.forget_before(Day::from_ms(now_ms));
         for event in self.queue.drain() {
             self.ingest(event, now_ms);
         }
-        self.read_headers();
-        self.cut_due(now_ms);
     }
 
     /// Whether the writer may forget `inv`: nothing buffered or unwritten, its stored
@@ -325,7 +399,7 @@ impl Core {
         s.building.records() == 0
             && !s.unread
             && !self.ready.iter().any(|c| &c.inv == key)
-            && !self.pending.contains(&rows::invid(key))
+            && !self.pending.contains(&self.index.root().invid(key))
     }
 
     /// Forgets idle invocations that are closed or were last seen before yesterday
@@ -363,31 +437,29 @@ impl Core {
         true
     }
 
-    /// Reads the stored headers of up to [`Limits::header_reads_per_step`] invocations
-    /// opened since, merging each with what this writer added. A failed read leaves the
-    /// rest for the next step: the index is not answering.
-    fn read_headers(&mut self) {
-        let unread: Vec<InvKey> = self
-            .invs
+    /// The invocations whose stored header is to be read this step.
+    fn unread(&self) -> Vec<InvKey> {
+        self.invs
             .iter()
             .filter(|(_, s)| s.unread)
             .map(|(key, _)| key.clone())
             .take(self.limits.header_reads_per_step)
-            .collect();
-        for key in unread {
-            let Ok(stored) = self.index.get(&rows::invid(&key)) else {
-                return;
-            };
-            let stored = stored.and_then(|v| InvocationHeader::decode(v.value.as_slice()).ok());
-            let state = self.state(&key);
-            if let Some(stored) = stored {
-                state.header = merge(stored, &state.header);
-            }
-            state.unread = false;
-            if std::mem::take(&mut state.held) {
-                let value = state.header.encode_to_vec();
-                self.queue_row(rows::invid(&key), value, Cond::Any, None);
-            }
+            .collect()
+    }
+
+    /// Takes `inv`'s stored header row (none, or one that does not decode: a fresh
+    /// invocation) and merges it with what this writer added; a header row held back
+    /// meanwhile is queued now.
+    fn header_read(&mut self, inv: &InvKey, stored: Option<Versioned>) {
+        let stored = stored.and_then(|v| InvocationHeader::decode(v.value.as_slice()).ok());
+        let state = self.state(inv);
+        if let Some(stored) = stored {
+            state.header = merge(stored, &state.header);
+        }
+        state.unread = false;
+        if std::mem::take(&mut state.held) {
+            let value = state.header.encode_to_vec();
+            self.queue_row(self.index.root().invid(inv), value, Cond::Any, None);
         }
     }
 
@@ -399,7 +471,7 @@ impl Core {
             return;
         }
         let value = state.header.encode_to_vec();
-        self.queue_row(rows::invid(inv), value, Cond::Any, origin);
+        self.queue_row(self.index.root().invid(inv), value, Cond::Any, origin);
     }
 
     /// How many kept objects to read back this step: none while rows are pending or
@@ -409,17 +481,6 @@ impl Core {
             self.limits.reinserts_per_step
         } else {
             0
-        }
-    }
-
-    fn refill_streams(&mut self) {
-        if !self.minter.needs_block() {
-            return;
-        }
-        if let Ok(Ok(commit)) = self.index.txn(Txn::new().next(rows::STREAMS_COUNTER)) {
-            // An empty counter list is a backend bug; block 0 is refused, so it is safe.
-            self.minter
-                .add_block(commit.counters.first().copied().unwrap_or(0));
         }
     }
 
@@ -689,7 +750,10 @@ impl Core {
                 writer: writer.0,
             };
             let day = Day::from_number(cut.row.day);
-            let key = rows::stream(day, StreamId(cut.row.stream), cut.stream_first_ms);
+            let key = self
+                .index
+                .root()
+                .stream(day, StreamId(cut.row.stream), cut.stream_first_ms);
             self.queue_row(
                 key,
                 value.encode_to_vec(),
@@ -697,7 +761,7 @@ impl Core {
                 Some(origin.clone()),
             );
         }
-        let key = rows::ichunk(&cut.inv, writer, cut.seq);
+        let key = self.index.root().ichunk(&cut.inv, writer, cut.seq);
         self.queue_row(
             key,
             cut.row.encode_to_vec(),
@@ -731,54 +795,6 @@ impl Core {
         }
     }
 
-    /// Sends at most [`Limits::txns_per_step`] index transactions, retries included.
-    fn apply_pending(&mut self) {
-        let mut budget = self.limits.txns_per_step;
-        while budget > 0 {
-            let batch = self
-                .pending
-                .take(self.limits.txn_rows, self.limits.txn_bytes);
-            if batch.is_empty() {
-                return;
-            }
-            budget = self.apply(batch, budget);
-        }
-    }
-
-    /// Applies one batch of rows, one transaction of `budget` per try, and returns the
-    /// budget left. A pointer row that already exists (a restored row, or a write
-    /// retried after it landed) fails its `Absent` check; it is there, so it leaves the
-    /// batch and the rest is tried again, or put back for the next step once the budget
-    /// is spent. A failed transaction drops its rows, each counted and its object kept.
-    fn apply(&mut self, mut batch: Vec<(String, Row)>, mut budget: usize) -> usize {
-        while !batch.is_empty() {
-            if budget == 0 {
-                for (key, row) in batch {
-                    self.enqueue(key, row);
-                }
-                return 0;
-            }
-            budget -= 1;
-            let txn = batch.iter().fold(Txn::new(), |t, (key, row)| {
-                t.put(key.clone(), row.value.clone(), row.cond)
-            });
-            match self.index.txn(txn) {
-                Ok(Ok(_)) => return budget,
-                Ok(Err(conflict)) => {
-                    batch.remove(conflict.index.min(batch.len() - 1));
-                }
-                Err(_) => {
-                    self.index_failed = true;
-                    for (_, row) in batch {
-                        self.dropped_row(row);
-                    }
-                    return budget;
-                }
-            }
-        }
-        budget
-    }
-
     /// Restores the rows of a kept object from its footer (`read`). Returns whether to
     /// go on with the next kept object: a failed read keeps the object and stops for
     /// this step; a footer that does not decode is left to the weekly sweep.
@@ -804,22 +820,18 @@ impl Core {
         row.bytes = object.footer_offset + u64::from(object.footer_len);
         let writer = WriterId(summary.writer);
         // The chunk row first: with little room it is the row that matters most.
-        let key = rows::ichunk(&inv, writer, summary.seq);
+        let rows = self.index.root().clone();
+        let key = rows.ichunk(&inv, writer, summary.seq);
         self.queue_row(key, row.encode_to_vec(), Cond::Absent, Some(object.clone()));
         let header = summary.header.unwrap_or_default().encode_to_vec();
-        self.queue_row(
-            rows::invid(&inv),
-            header,
-            Cond::Absent,
-            Some(object.clone()),
-        );
+        self.queue_row(rows.invid(&inv), header, Cond::Absent, Some(object.clone()));
         if row.runs > 0 {
             let value = StreamRow {
                 inv_key: summary.inv_key,
                 writer: writer.0,
             };
             let day = Day::from_number(row.day);
-            let key = rows::stream(day, StreamId(row.stream), summary.stream_first_ms);
+            let key = rows.stream(day, StreamId(row.stream), summary.stream_first_ms);
             self.queue_row(key, value.encode_to_vec(), Cond::Absent, Some(object));
         }
         true

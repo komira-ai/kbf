@@ -2,6 +2,7 @@
 //! fake (and SQLite where it is cheap). One test binary, so every generic function is
 //! measured as one copy.
 
+mod index;
 mod reader;
 mod scoped;
 mod sqlite;

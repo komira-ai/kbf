@@ -9,19 +9,21 @@
 //!
 //! Every answer holds only records whose instance `allow` accepts.
 //!
+//! Index calls go through the [`HistoryIndex`]'s offload, so the reader's `async fn`s
+//! may be awaited on a runtime worker.
+//!
 //! TODO: read the index with a bounded range scan once the `kbf-state` trait has one
 //! (suite clause C8, added by a sibling change); until then both lookups use
 //! `scan_prefix`, which returns every row under the prefix.
 
-use std::sync::Arc;
-
 use bytes::Bytes;
 use kbf_objstore::{ByteRange, ObjectKey, ObjectStore, ObjectStoreError};
-use kbf_state::{Store, StoreError};
+use kbf_state::StoreError;
 use prost::Message;
 
 use crate::container::{self, BlockEntry, Footer, FormatError};
-use crate::keys::{Day, HistoryRoot, InvKey, WriterId, rows};
+use crate::index::HistoryIndex;
+use crate::keys::{Day, HistoryRoot, IndexRoot, InvKey, WriterId};
 use crate::records::{
     ChunkBody, ChunkRecord, ChunkRow, FailedRun, HitRecord, InvState, InvocationHeader, RunRecord,
     SECTION_FAILED, SECTION_RUN, StreamRow, chunk_key,
@@ -91,13 +93,13 @@ struct Located {
 pub struct Reader<O> {
     objects: Scoped<O>,
     root: HistoryRoot,
-    index: Arc<dyn Store>,
+    index: HistoryIndex,
 }
 
 impl<O: ObjectStore> Reader<O> {
     /// A reader of the objects under `root` in `objects`, through the rows in `index`.
     #[must_use]
-    pub fn new(objects: O, root: HistoryRoot, index: Arc<dyn Store>) -> Reader<O> {
+    pub fn new(objects: O, root: HistoryRoot, index: HistoryIndex) -> Reader<O> {
         Reader {
             objects: Scoped::history(objects, &root),
             root,
@@ -115,7 +117,7 @@ impl<O: ObjectStore> Reader<O> {
         id: RunId,
         allow: &dyn Fn(&str) -> bool,
     ) -> Result<Option<RunView>, ReadError> {
-        let Some(at) = locate(self.index.as_ref(), &self.root, id)? else {
+        let Some(at) = self.locate(id).await? else {
             return Ok(None);
         };
         let range = footer_range(&at.row)?;
@@ -149,19 +151,64 @@ impl<O: ObjectStore> Reader<O> {
         inv: &InvKey,
         allow: &dyn Fn(&str) -> bool,
     ) -> Result<Option<InvocationView>, ReadError> {
-        let key = rows::invid(inv);
-        let Some(row) = self.index.get(&key)? else {
+        let key = self.index.root().invid(inv);
+        let Some(row) = self.index.get(key.clone()).await? else {
             return Ok(None);
         };
         let header = decode_row::<InvocationHeader>(&key, &row.value)?;
         let mut view = start_view(header);
-        for (key, row) in chunk_rows(self.index.as_ref(), &rows::ichunk_prefix(inv))? {
+        let prefix = self.index.root().ichunk_prefix(inv);
+        for (key, row) in self.chunk_rows(prefix).await? {
             let object = chunk_object_key(&self.root, inv, &key, &row);
             let range = ByteRange::new(0, row.bytes).ok_or(FormatError::Truncated("chunk row"))?;
             let bytes = self.objects.get_range(&object, range).await?;
             add_records(&mut view, &bytes, allow)?;
         }
         Ok(Some(view))
+    }
+
+    /// Finds run `id`'s chunk through the index, or `None` when no row names it.
+    async fn locate(&self, id: RunId) -> Result<Option<Located>, ReadError> {
+        let rows = self.index.root();
+        let streams = self
+            .index
+            .scan_prefix(rows.stream_prefix(id.day(), id.stream()))
+            .await?;
+        // Rows sort by open time: the run's stream is the newest opened at or before it.
+        let found = streams
+            .iter()
+            .rev()
+            .find(|(k, _)| IndexRoot::stream_first_ms(k).is_some_and(|t| t <= id.time_ms()));
+        let Some((key, value)) = found else {
+            return Ok(None);
+        };
+        let stream = decode_row::<StreamRow>(key, &value.value)?;
+        let inv = InvKey::parse(&stream.inv_key).map_err(|e| ReadError::Row {
+            key: key.clone(),
+            message: e.to_string(),
+        })?;
+        let writer = WriterId(stream.writer);
+        let prefix = format!("{}{writer}/", rows.ichunk_prefix(&inv));
+        let chunk = self
+            .chunk_rows(prefix)
+            .await?
+            .into_iter()
+            .find(|(_, row)| row.holds(id.stream().0, id.seq()));
+        Ok(chunk.map(|(key, row)| Located {
+            key: chunk_object_key(&self.root, &inv, &key, &row),
+            inv,
+            row,
+        }))
+    }
+
+    /// The `ichunk` rows under `prefix`, decoded, in key order.
+    async fn chunk_rows(&self, prefix: String) -> Result<Vec<(String, ChunkRow)>, ReadError> {
+        self.index
+            .scan_prefix(prefix)
+            .await?
+            .into_iter()
+            .map(|(k, v)| decode_row::<ChunkRow>(&k, &v.value).map(|row| (k, row)))
+            .collect()
     }
 
     /// The records of the block of `footer` that holds `key`. A footer with no such
@@ -176,44 +223,6 @@ impl<O: ObjectStore> Reader<O> {
         let stored = self.objects.get_range(object, block_range(&entry)?).await?;
         decode_records(&entry, &stored)
     }
-}
-
-/// Finds run `id`'s chunk through the index, or `None` when no row names it.
-fn locate(index: &dyn Store, root: &HistoryRoot, id: RunId) -> Result<Option<Located>, ReadError> {
-    let day = id.day();
-    let streams = index.scan_prefix(&rows::stream_prefix(day, id.stream()))?;
-    // Rows sort by open time: the run's stream is the newest opened at or before it.
-    let found = streams
-        .iter()
-        .rev()
-        .find(|(k, _)| rows::stream_first_ms(k).is_some_and(|t| t <= id.time_ms()));
-    let Some((key, value)) = found else {
-        return Ok(None);
-    };
-    let stream = decode_row::<StreamRow>(key, &value.value)?;
-    let inv = InvKey::parse(&stream.inv_key).map_err(|e| ReadError::Row {
-        key: key.clone(),
-        message: e.to_string(),
-    })?;
-    let writer = WriterId(stream.writer);
-    let prefix = format!("{}{writer}/", rows::ichunk_prefix(&inv));
-    let chunk = chunk_rows(index, &prefix)?
-        .into_iter()
-        .find(|(_, row)| row.holds(id.stream().0, id.seq()));
-    Ok(chunk.map(|(key, row)| Located {
-        key: chunk_object_key(root, &inv, &key, &row),
-        inv,
-        row,
-    }))
-}
-
-/// The `ichunk` rows under `prefix`, decoded, in key order.
-fn chunk_rows(index: &dyn Store, prefix: &str) -> Result<Vec<(String, ChunkRow)>, ReadError> {
-    index
-        .scan_prefix(prefix)?
-        .into_iter()
-        .map(|(k, v)| decode_row::<ChunkRow>(&k, &v.value).map(|row| (k, row)))
-        .collect()
 }
 
 /// The object key an `ichunk` row names: the writer and sequence are in the row's key

@@ -11,6 +11,8 @@ use std::fmt;
 use kbf_objstore::{KeyError, KeyPrefix, ObjectKey};
 use sha2::{Digest as _, Sha256};
 
+use crate::run_id::StreamId;
+
 const MS_PER_DAY: u64 = 86_400_000;
 
 /// A UTC calendar day, as the number `yyyymmdd`.
@@ -268,48 +270,83 @@ impl HistoryRoot {
     }
 }
 
-/// The `ui/` index rows on the state store.
-pub mod rows {
-    use super::{Day, InvKey, WriterId};
-    use crate::run_id::StreamId;
+/// Where history's index rows live on the state store: `ui/` by default, or under a
+/// prefix of the deployment's choosing (`<prefix>ui/`), so a state store shared by
+/// several farms or tenants keeps each one's rows apart, as [`HistoryRoot`] does for
+/// objects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexRoot(String);
+
+impl Default for IndexRoot {
+    /// `ui/`.
+    fn default() -> IndexRoot {
+        IndexRoot("ui/".to_owned())
+    }
+}
+
+/// A prefix that cannot lead index rows.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0:?} is not an index prefix (empty, or ending in `/`)")]
+pub struct IndexPrefixError(String);
+
+impl IndexRoot {
+    /// `<prefix>ui/`.
+    ///
+    /// # Errors
+    /// [`IndexPrefixError`] when `prefix` is neither empty nor ends in `/`.
+    pub fn under(prefix: &str) -> Result<IndexRoot, IndexPrefixError> {
+        if !(prefix.is_empty() || prefix.ends_with('/')) {
+            return Err(IndexPrefixError(prefix.to_owned()));
+        }
+        Ok(IndexRoot(format!("{prefix}ui/")))
+    }
+
+    /// The root, ending in `ui/`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 
     /// The counter writers reserve blocks of stream ids from.
-    pub const STREAMS_COUNTER: &str = "ui/streams";
+    #[must_use]
+    pub fn streams_counter(&self) -> String {
+        format!("{}streams", self.0)
+    }
 
     /// The header row of an invocation.
     #[must_use]
-    pub fn invid(inv: &InvKey) -> String {
-        format!("ui/invid/{inv}")
+    pub fn invid(&self, inv: &InvKey) -> String {
+        format!("{}invid/{inv}", self.0)
     }
 
     /// The prefix of every chunk row of an invocation, in writer and sequence order.
     #[must_use]
-    pub fn ichunk_prefix(inv: &InvKey) -> String {
-        format!("ui/ichunk/{inv}/")
+    pub fn ichunk_prefix(&self, inv: &InvKey) -> String {
+        format!("{}ichunk/{inv}/", self.0)
     }
 
     /// The row of chunk `seq` of `inv` from `writer`.
     #[must_use]
-    pub fn ichunk(inv: &InvKey, writer: WriterId, seq: u32) -> String {
-        format!("ui/ichunk/{inv}/{writer}/{seq:08x}")
+    pub fn ichunk(&self, inv: &InvKey, writer: WriterId, seq: u32) -> String {
+        format!("{}ichunk/{inv}/{writer}/{seq:08x}", self.0)
     }
 
-    /// The prefix of every row of `stream` on `day`, in first-commit order.
+    /// The prefix of every row of `stream` on `day`, in open-time order.
     #[must_use]
-    pub fn stream_prefix(day: Day, stream: StreamId) -> String {
-        format!("ui/stream/{day}/{stream}/")
+    pub fn stream_prefix(&self, day: Day, stream: StreamId) -> String {
+        format!("{}stream/{day}/{stream}/", self.0)
     }
 
     /// The row of `stream` on `day` that opened at `first_ms` (its first id's time, which
-    /// no later id of the stream precedes). The time is
-    /// part of the key, so a fallback stream id reused after a restart gets a row of its
-    /// own and the newest row at or before a run's time is the run's stream.
+    /// no later id of the stream precedes). The time is part of the key, so a fallback
+    /// stream id reused after a restart gets a row of its own and the newest row at or
+    /// before a run's time is the run's stream.
     #[must_use]
-    pub fn stream(day: Day, stream: StreamId, first_ms: u64) -> String {
-        format!("ui/stream/{day}/{stream}/{first_ms:012x}")
+    pub fn stream(&self, day: Day, stream: StreamId, first_ms: u64) -> String {
+        format!("{}stream/{day}/{stream}/{first_ms:012x}", self.0)
     }
 
-    /// The first-commit time of a stream row's key, if it is one.
+    /// The open time of a stream row's key, if it is one.
     #[must_use]
     pub fn stream_first_ms(key: &str) -> Option<u64> {
         let hex = key.rsplit('/').next()?;
@@ -323,7 +360,6 @@ pub mod rows {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run_id::StreamId;
 
     #[test]
     fn days_are_utc_calendar_days() {
@@ -432,24 +468,51 @@ mod tests {
     fn row_keys_sort_in_the_order_reads_need() {
         // Catches: unpadded numbers, which would sort chunk 10 before chunk 9 and a
         // later stream row before an earlier one.
+        let rows = IndexRoot::default();
         let inv = InvKey::parse("0123456789abcdef").unwrap();
-        assert_eq!(rows::invid(&inv), "ui/invid/0123456789abcdef");
-        let c9 = rows::ichunk(&inv, WriterId(1), 9);
-        let c10 = rows::ichunk(&inv, WriterId(1), 10);
+        assert_eq!(rows.invid(&inv), "ui/invid/0123456789abcdef");
+        assert_eq!(rows.streams_counter(), "ui/streams");
+        let c9 = rows.ichunk(&inv, WriterId(1), 9);
+        let c10 = rows.ichunk(&inv, WriterId(1), 10);
         assert!(c9 < c10);
-        assert!(c9.starts_with(&rows::ichunk_prefix(&inv)));
+        assert!(c9.starts_with(&rows.ichunk_prefix(&inv)));
         let day = Day::from_number(20_261_016);
         let s = StreamId(0x80_0001);
-        let early = rows::stream(day, s, 9);
-        let late = rows::stream(day, s, 10);
+        let early = rows.stream(day, s, 9);
+        let late = rows.stream(day, s, 10);
         assert!(early < late);
-        assert!(late.starts_with(&rows::stream_prefix(day, s)));
+        assert!(late.starts_with(&rows.stream_prefix(day, s)));
         assert_eq!(late, "ui/stream/20261016/800001/00000000000a");
-        assert_eq!(rows::stream_first_ms(&late), Some(10));
-        assert_eq!(rows::stream_first_ms("ui/stream/x/800001/0a"), None);
+        assert_eq!(IndexRoot::stream_first_ms(&late), Some(10));
+        assert_eq!(IndexRoot::stream_first_ms("ui/stream/x/800001/0a"), None);
         assert_eq!(
-            rows::stream_first_ms("ui/stream/x/800001/zzzzzzzzzzzz"),
+            IndexRoot::stream_first_ms("ui/stream/x/800001/zzzzzzzzzzzz"),
             None
         );
+    }
+
+    #[test]
+    fn an_index_root_puts_every_row_under_its_prefix() {
+        // Catches: a row built from a hard-coded `ui/`, so two farms or tenants sharing
+        // one state store would write the same rows.
+        let rows = IndexRoot::under("tenant-a/").unwrap();
+        assert_eq!(rows.as_str(), "tenant-a/ui/");
+        let inv = InvKey::parse("0123456789abcdef").unwrap();
+        let day = Day::from_number(20_261_016);
+        let keys = [
+            rows.streams_counter(),
+            rows.invid(&inv),
+            rows.ichunk_prefix(&inv),
+            rows.ichunk(&inv, WriterId(1), 0),
+            rows.stream_prefix(day, StreamId(1)),
+            rows.stream(day, StreamId(1), 0),
+        ];
+        assert!(
+            keys.iter().all(|k| k.starts_with("tenant-a/ui/")),
+            "{keys:?}"
+        );
+        assert_eq!(IndexRoot::under("").unwrap(), IndexRoot::default());
+        let err = IndexRoot::under("tenant-a").unwrap_err();
+        assert!(err.to_string().contains("not an index prefix"), "{err}");
     }
 }

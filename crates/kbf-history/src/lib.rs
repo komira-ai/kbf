@@ -9,7 +9,9 @@
 //! - [`container`]: the one container format (header, zstd blocks of length-prefixed
 //!   protobuf records, footer with the block index and the family summary, trailer).
 //! - [`keys`]: UTC days, writer ids, invocation keys, retention [`Class`]es, object
-//!   [`Family`]s, object keys and `ui/` row keys.
+//!   [`Family`]s, object keys and, under an [`IndexRoot`], index row keys.
+//! - [`HistoryIndex`]: the state store under its [`IndexRoot`], every blocking call run
+//!   through an [`Offload`] (the server's blocking pool, or [`Inline`]).
 //! - [`records`]: run, hit and outcome records, tails, command renderings and the
 //!   failed-run section, each with its `instance`; the index row values.
 //! - [`run_id`]: time-ordered [`RunId`]s, stream blocks and the fallback range.
@@ -23,6 +25,7 @@
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 pub mod container;
+mod index;
 pub mod keys;
 mod pending;
 mod queue;
@@ -32,7 +35,8 @@ pub mod run_id;
 mod scoped;
 mod writer;
 
-pub use keys::{Class, Day, Family, HistoryRoot, InvKey, WriterId};
+pub use index::{HistoryIndex, Inline, Offload, Offloaded};
+pub use keys::{Class, Day, Family, HistoryRoot, IndexPrefixError, IndexRoot, InvKey, WriterId};
 pub use pending::PendingLimits;
 pub use queue::{Event, EventQueue, InvRef, QueueLimits};
 pub use reader::{InvocationView, ReadError, Reader, RunView};

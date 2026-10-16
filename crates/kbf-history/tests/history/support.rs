@@ -2,8 +2,9 @@
 //! fails on demand, an index wrapper that fails on demand, and a writer and reader over
 //! them.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::ThreadId;
 use std::time::SystemTime;
 
 use bytes::Bytes;
@@ -12,7 +13,8 @@ use kbf_history::records::{
     WireDigest,
 };
 use kbf_history::{
-    Event, EventQueue, HistoryRoot, InvRef, Limits, Minter, QueueLimits, Reader, Writer, WriterId,
+    Event, EventQueue, HistoryIndex, HistoryRoot, IndexRoot, Inline, InvRef, Limits, Minter,
+    Offload, Offloaded, QueueLimits, Reader, Writer, WriterId,
 };
 use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
@@ -189,6 +191,9 @@ pub struct Index {
     pub empty_counters: AtomicBool,
     pub txns: AtomicU64,
     pub gets: AtomicU64,
+    pub scans: AtomicU64,
+    /// A call on this thread panics: the thread that polls the writer and reader.
+    pub forbid: Mutex<Option<ThreadId>>,
 }
 
 impl Index {
@@ -202,6 +207,8 @@ impl Index {
             empty_counters: AtomicBool::new(false),
             txns: AtomicU64::new(0),
             gets: AtomicU64::new(0),
+            scans: AtomicU64::new(0),
+            forbid: Mutex::new(None),
         })
     }
 
@@ -230,12 +237,24 @@ impl Index {
     }
 }
 
+impl Index {
+    fn check_thread(&self) {
+        let here = std::thread::current().id();
+        assert_ne!(
+            *self.forbid.lock().unwrap(),
+            Some(here),
+            "a blocking index call ran on the polling thread"
+        );
+    }
+}
+
 fn failed(what: &str) -> StoreError {
     StoreError::Failed(format!("planted {what} failure"))
 }
 
 impl Store for Index {
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
+        self.check_thread();
         self.txns.fetch_add(batch.len() as u64, Ordering::SeqCst);
         let counts = batch
             .iter()
@@ -259,6 +278,7 @@ impl Store for Index {
     }
 
     fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {
+        self.check_thread();
         self.gets.fetch_add(1, Ordering::SeqCst);
         if self.fail_gets.load(Ordering::SeqCst) {
             return Err(failed("get"));
@@ -267,6 +287,8 @@ impl Store for Index {
     }
 
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
+        self.check_thread();
+        self.scans.fetch_add(1, Ordering::SeqCst);
         self.inner.scan_prefix(prefix)
     }
 
@@ -287,10 +309,43 @@ impl Store for Index {
     }
 }
 
+/// Runs each job on a thread of its own, as a server's blocking pool would, and counts
+/// them.
+#[derive(Default)]
+pub struct Threaded {
+    pub jobs: AtomicU64,
+}
+
+impl Offload for Threaded {
+    fn offload(&self, job: Box<dyn FnOnce() + Send>) -> Offloaded {
+        self.jobs.fetch_add(1, Ordering::SeqCst);
+        let (done, ran) = futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            job();
+            let _ = done.send(());
+        });
+        Box::pin(async move {
+            let _ = ran.await;
+        })
+    }
+}
+
+/// Never runs a job, as a blocking task cancelled before it started.
+pub struct Never;
+
+impl Offload for Never {
+    fn offload(&self, job: Box<dyn FnOnce() + Send>) -> Offloaded {
+        drop(job);
+        Box::pin(std::future::ready(()))
+    }
+}
+
 /// A frontend's history: one writer life over a shared object store and index.
 pub struct Life {
     pub objects: Objects,
     pub index: Arc<Index>,
+    pub index_root: IndexRoot,
+    pub offload: Arc<dyn Offload>,
     pub minter: Arc<Minter>,
     pub queue: Arc<EventQueue>,
     pub writer: Writer<Objects>,
@@ -303,16 +358,37 @@ pub fn root() -> HistoryRoot {
 
 impl Life {
     pub fn start(objects: &Objects, index: &Arc<Index>, writer: u64, limits: Limits) -> Life {
+        Life::start_with(
+            objects,
+            index,
+            writer,
+            limits,
+            IndexRoot::default(),
+            Arc::new(Inline),
+        )
+    }
+
+    pub fn start_with(
+        objects: &Objects,
+        index: &Arc<Index>,
+        writer: u64,
+        limits: Limits,
+        index_root: IndexRoot,
+        offload: Arc<dyn Offload>,
+    ) -> Life {
         let minter = Arc::new(Minter::new(0));
         let queue = Arc::new(EventQueue::new(QueueLimits::default()));
         let as_store: Arc<dyn Store> = index.clone();
+        let history = HistoryIndex::new(as_store, index_root.clone(), offload.clone());
         Life {
             objects: objects.clone(),
             index: index.clone(),
+            index_root,
+            offload,
             writer: Writer::new(
                 objects.clone(),
                 root(),
-                as_store,
+                history,
                 WriterId(writer),
                 minter.clone(),
                 queue.clone(),
@@ -328,9 +404,13 @@ impl Life {
         Life::start(&Objects::new(), &Index::fake(), 1, limits)
     }
 
-    pub fn reader(&self) -> Reader<Objects> {
+    pub fn history_index(&self) -> HistoryIndex {
         let as_store: Arc<dyn Store> = self.index.clone();
-        Reader::new(self.objects.clone(), root(), as_store)
+        HistoryIndex::new(as_store, self.index_root.clone(), self.offload.clone())
+    }
+
+    pub fn reader(&self) -> Reader<Objects> {
+        Reader::new(self.objects.clone(), root(), self.history_index())
     }
 
     pub fn step(&mut self, now_ms: u64) {
