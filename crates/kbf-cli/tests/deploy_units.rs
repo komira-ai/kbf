@@ -8,8 +8,10 @@ use kbf_cli::{Invocation, parse_from};
 use kbf_deploy::linux::modes::render;
 use kbf_deploy::linux::{LinuxConfig, Mode, check_mode_unit};
 use kbf_deploy::unit::UnitFile;
-use kbf_host::exec::HostExec;
-use kbf_host::path::Root;
+use kbf_host::exec::{Entry as HostEntry, Exec, HostExec, Meta};
+use kbf_host::path::{HostPath, Root};
+use kbf_host::step::{Cmd, HttpUrl, Step};
+use kbf_host::trust::Untrusted;
 
 const EXAMPLE: &str = include_str!("../../kbf-deploy/templates/linux/config.example");
 
@@ -76,6 +78,38 @@ fn scratch(name: &str) -> std::path::PathBuf {
     dir
 }
 
+/// The real host, but a command it runs keeps this test's `LLVM_PROFILE_FILE`:
+/// [`HostExec`] clears the environment, and an instrumented `kbf` would then write its
+/// profile into the working directory (the crate's), where the repo lints refuse it.
+struct Profiled(HostExec);
+
+impl Exec for Profiled {
+    fn euid(&self) -> u32 {
+        self.0.euid()
+    }
+    fn inspect(&self, path: &HostPath) -> std::io::Result<Option<HostEntry>> {
+        self.0.inspect(path)
+    }
+    fn stat(&self, path: &HostPath) -> std::io::Result<Option<Meta>> {
+        self.0.stat(path)
+    }
+    fn query(&self, cmd: &Cmd) -> std::io::Result<std::process::Output> {
+        match std::env::var("LLVM_PROFILE_FILE") {
+            Ok(file) => self.0.query(&cmd.clone().env("LLVM_PROFILE_FILE", file)),
+            Err(_) => self.0.query(cmd),
+        }
+    }
+    fn http_status(&self, url: &HttpUrl) -> std::io::Result<u16> {
+        self.0.http_status(url)
+    }
+    fn apply(&mut self, step: &Step) -> std::io::Result<()> {
+        self.0.apply(step)
+    }
+    fn check_binary(&self) -> Result<(), Untrusted> {
+        self.0.check_binary()
+    }
+}
+
 /// `check-units --mode` on the unit `text` of `mode`, with this build's kbf as
 /// `--kbf-bin`: the failure lines and the notes.
 fn check_units(name: &str, mode: Mode, text: &str) -> (Vec<String>, Vec<String>) {
@@ -83,7 +117,7 @@ fn check_units(name: &str, mode: Mode, text: &str) -> (Vec<String>, Vec<String>)
     let cfg = dir.join("config.local");
     std::fs::write(&cfg, EXAMPLE).expect("config");
     std::fs::write(dir.join(mode.unit_name()), text).expect("unit");
-    let exec = HostExec::new(Root::host());
+    let exec = Profiled(HostExec::new(Root::host()));
     let bin = std::path::Path::new(env!("CARGO_BIN_EXE_kbf"));
     let r = check_mode_unit(&exec, &cfg, &dir, mode, true, Some(bin)).expect("checks");
     (
