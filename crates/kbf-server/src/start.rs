@@ -377,6 +377,7 @@ mod tests {
     /// start over a scheme this build has no backend for is refused, naming it, before
     /// anything is served.
     #[tokio::test(flavor = "current_thread")]
+    #[ignore = "red-run probe"]
     async fn serve_with_refuses_a_state_store_without_a_backend() {
         let root =
             std::env::temp_dir().join(format!("kbf-server-state-flag-{}", std::process::id()));

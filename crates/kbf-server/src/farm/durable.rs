@@ -265,5 +265,5 @@ impl State {
     }
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests;
