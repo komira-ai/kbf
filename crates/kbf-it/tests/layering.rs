@@ -24,7 +24,15 @@
 //! - the storage crate (`kbf-storage`) depending, directly or through another crate, on
 //!   a frontend crate (`STORAGE_MUST_NOT_REACH`: the scheduler and authorization), which
 //!   would make a storage process link the frontend; and the storage crate renamed or
-//!   removed, which would make that check pass vacuously.
+//!   removed, which would make that check pass vacuously;
+//! - a daemon crate (`DAEMON_ONLY`: `kbf-node`, the `kbf-daemon` binary's library, and
+//!   `kbf-daemon` beneath it) depending, directly or through another crate, on the object
+//!   store client or a crate that builds one (`COLD_STORE_CLIENT`). A daemon-only node
+//!   holds no cold-store credential and reaches bytes only through storage
+//!   (docs/design/architecture-v2.md, section 9), so its binary must not be able to
+//!   construct an object-store client at all; and a walk that cannot see the client
+//!   (the client crate renamed, or the server no longer reaching it), which would make
+//!   that check pass vacuously.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -323,6 +331,47 @@ fn storage_reaches_no_frontend_crate() {
     assert!(
         violations.is_empty(),
         "kbf-storage reaches a frontend crate:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// The daemon crates: what a daemon-only node (`kbf daemon`, the `kbf-daemon` binary)
+/// links besides the drivers, which `kbf-node` names and so are in its closure.
+const DAEMON_ONLY: &[&str] = &["kbf-node", "kbf-daemon"];
+
+/// What a daemon crate's normal dependencies must not reach: the object store client
+/// (`kbf-objstore`, which signs S3 requests), the crates that build one from a cold-store
+/// URI (`kbf-tier`, `kbf-front`, `kbf-server`), and the HTTP client an S3 client is
+/// written over.
+const COLD_STORE_CLIENT: &[&str] = &[
+    "kbf-objstore",
+    "kbf-tier",
+    "kbf-front",
+    "kbf-server",
+    "reqwest",
+];
+
+#[test]
+fn a_daemon_cannot_build_a_cold_store_client() {
+    let g = load_graph();
+    // The walk sees the client where it is linked: the server builds its cold store
+    // from it. Without this, a renamed client crate would pass the check below.
+    assert!(
+        g.members.contains_key("kbf-objstore"),
+        "kbf-objstore is a workspace member"
+    );
+    assert!(
+        !reaches(&g, "kbf-server", &["kbf-objstore"]).is_empty(),
+        "the server's closure must reach kbf-objstore, or this walk proves nothing"
+    );
+    let violations: Vec<String> = DAEMON_ONLY
+        .iter()
+        .flat_map(|daemon| reaches(&g, daemon, COLD_STORE_CLIENT))
+        .collect();
+    assert!(
+        violations.is_empty(),
+        "a daemon crate reaches an object-store client (a daemon-only node holds no \
+         cold-store credential, docs/design/architecture-v2.md section 9):\n{}",
         violations.join("\n")
     );
 }
