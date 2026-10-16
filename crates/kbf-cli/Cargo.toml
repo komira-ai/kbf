@@ -31,6 +31,10 @@ kbf-node.workspace = true
 kbf-server.workspace = true
 # The stand-in `podman`'s (kbf-cli-fake-podman).
 rustix = { workspace = true, features = ["process"] }
+# The schema version of the SQLite state file, which `kbf --version --json` reports.
+kbf-state.workspace = true
+# The identity `kbf --version --json` prints (src/version.rs).
+serde_json.workspace = true
 
 [dev-dependencies]
 # The REAPI conformance suite, run against a `kbf storage` process (tests/storage_process.rs):
@@ -40,6 +44,9 @@ kbf-cas-conformance.workspace = true
 kbf-storage.workspace = true
 kbf-transfer.workspace = true
 kbf-types.workspace = true
+# The protocol the daemon half speaks, which `kbf --version --json` reports as the
+# server's (src/tests.rs pins them equal).
+kbf-daemon.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
 tonic.workspace = true
 # `kbf storage-and-daemon` running an action (tests/storage_and_daemon.rs): the image

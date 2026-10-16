@@ -1424,12 +1424,14 @@ dependencies = [
  "clap",
  "kbf-all-in-one",
  "kbf-cas-conformance",
+ "kbf-daemon",
  "kbf-deploy",
  "kbf-driver-container",
  "kbf-host",
  "kbf-node",
  "kbf-proto",
  "kbf-server",
+ "kbf-state",
  "kbf-storage",
  "kbf-testkit",
  "kbf-transfer",
@@ -1437,6 +1439,7 @@ dependencies = [
  "prost",
  "rcgen",
  "rustix",
+ "serde_json",
  "tokio",
  "tonic",
 ]
@@ -1709,6 +1712,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-map"
+version = "0.1.0"
+dependencies = [
+ "kbf-types",
+ "sha2 0.11.0",
+ "siphasher",
+ "thiserror",
+]
+
+[[package]]
 name = "kbf-mdm"
 version = "0.1.0"
 dependencies = [
@@ -1832,10 +1845,12 @@ name = "kbf-proto"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "kbf-map",
  "prost",
  "prost-types",
  "protox",
  "sha2 0.11.0",
+ "thiserror",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -1884,6 +1899,7 @@ dependencies = [
  "kbf-front",
  "kbf-invocation",
  "kbf-log",
+ "kbf-map",
  "kbf-mdm-api",
  "kbf-meta",
  "kbf-objstore",

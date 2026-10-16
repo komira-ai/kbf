@@ -8,8 +8,10 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+kbf-map.workspace = true
 prost.workspace = true
 prost-types.workspace = true
+thiserror.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
 
