@@ -1,5 +1,6 @@
 //! A farm for the chain tests: nodes that are real storage services over in-memory stores,
-//! each behind a switch the test can cut, holding maps the test publishes.
+//! serving mutual TLS under certificates of role `storage` (a chain admits no other), each
+//! behind a switch the test can cut, holding maps the test publishes.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +16,7 @@ use tonic::transport::Channel;
 use crate::Storage;
 use crate::replicate::{Chain, ChainConfig, MapSource, Peers};
 use crate::service::tests::fake::{Mem, patterned, serve_routes, sha};
+use crate::service::tests::roles::Pki;
 use crate::service::{Admission, Config, RemoteStorage, StorageService};
 
 /// A TCP forwarder in front of a node: `cut` closes every connection through it and
@@ -114,6 +116,7 @@ pub(crate) struct Node {
 /// Nodes numbered from 0; member ids are their numbers plus 1.
 pub(crate) struct Farm {
     pub nodes: Vec<Node>,
+    pki: Pki,
 }
 
 impl Drop for Farm {
@@ -131,28 +134,31 @@ impl Farm {
     /// `n` nodes whose stores stream, each holding the generation-1 map with all of them
     /// active and R = 2.
     pub(crate) async fn start(n: usize, config: ChainConfig) -> Self {
+        let pki = Pki::new();
         let mut nodes = Vec::new();
         for i in 0..n {
             let mem = Arc::new(Mem::default());
             mem.knobs.enabled.store(true, Ordering::SeqCst);
             let id = MemberId(i as u64 + 1);
             let held = NodeMap::new(id);
+            let (server, calls_as) = pki.node("storage");
             let chain = Arc::new(Chain::new(
                 Arc::clone(&held) as Arc<dyn MapSource>,
-                Peers::plain(),
+                Peers::tls(calls_as),
                 config,
             ));
             let storage: Arc<dyn Storage> = Arc::clone(&mem) as Arc<dyn Storage>;
             let service = StorageService::new(
                 storage,
-                Admission::Open,
+                Admission::Certified,
                 Config {
                     write_bytes_in_flight: 1 << 30,
                 },
             )
             .with_refetch_wait(Duration::from_secs(5))
-            .with_chain(Arc::clone(&chain));
-            let served = serve_routes(service.routes(), None).await;
+            .with_chain(Arc::clone(&chain))
+            .expect("a certified service");
+            let served = serve_routes(service.routes(), Some(server)).await;
             nodes.push(Node {
                 id,
                 mem,
@@ -161,7 +167,7 @@ impl Farm {
                 chain,
             });
         }
-        let farm = Self { nodes };
+        let farm = Self { nodes, pki };
         farm.publish(&farm.map(1, 2, &[]));
         farm
     }
@@ -204,10 +210,25 @@ impl Farm {
         RemoteStorage::new(self.channel(node), generation)
     }
 
+    /// A channel to node `node` as a frontend (the role that writes).
     pub(crate) fn channel(&self, node: usize) -> Channel {
-        Channel::from_shared(format!("http://{}", self.nodes[node].switch.addr))
-            .expect("endpoint")
-            .connect_lazy()
+        self.pki
+            .lazy_client(self.nodes[node].switch.addr, "frontend")
+    }
+
+    /// A channel to node `node` as another storage node (the role that sends a copy).
+    pub(crate) fn storage_channel(&self, node: usize) -> Channel {
+        self.pki
+            .lazy_client(self.nodes[node].switch.addr, "storage")
+    }
+
+    /// [`Farm::channel`], or [`Farm::storage_channel`] for a call that is a copy (`leg`).
+    pub(crate) fn channel_as(&self, node: usize, leg: Option<u64>) -> Channel {
+        if leg.is_some() {
+            self.storage_channel(node)
+        } else {
+            self.channel(node)
+        }
     }
 
     /// The number of the node that is `digest`'s primary under `map`.

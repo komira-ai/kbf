@@ -138,11 +138,20 @@ impl StorageService {
     /// The service as a node of a chain ([`crate::replicate`]): it judges every call by the
     /// chain's map and, as the primary of a blob, copies it to the replica before it
     /// answers.
-    #[must_use]
-    pub fn with_chain(mut self, chain: Arc<Chain>) -> Self {
+    ///
+    /// # Errors
+    /// [`StorageError::Invalid`] unless the service admits callers by their certificates
+    /// ([`Admission::Certified`]): the copy a primary sends its replica must be shown to come
+    /// from a storage node, or any caller could write a blob that is never copied.
+    pub fn with_chain(mut self, chain: Arc<Chain>) -> Result<Self, StorageError> {
+        if self.admission != Admission::Certified {
+            return Err(StorageError::Invalid(
+                "a node in a chain admits callers by certificate (Admission::Certified)".into(),
+            ));
+        }
         self.map = Some(chain.source());
         self.chain = Some(chain);
-        self
+        Ok(self)
     }
 
     /// How long a call routed by a map this node has not been told of waits for the node

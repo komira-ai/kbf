@@ -29,11 +29,12 @@ fn message(first: bool, data: &[u8], finish: bool) -> WriteRequest {
     }
 }
 
-fn leg(channel: tonic::transport::Channel) -> Leg {
+fn leg(channel: tonic::transport::Channel, size: u64) -> Leg {
     Leg::open(
         channel,
         1,
         MemberId(1),
+        size,
         Duration::from_secs(30),
         Duration::from_secs(30),
     )
@@ -44,9 +45,9 @@ fn leg(channel: tonic::transport::Channel) -> Leg {
 #[tokio::test]
 async fn an_acknowledgement_of_the_wrong_size_is_not_a_copy() {
     let (_odd, channel) = serve_odd().await;
-    let mut leg = leg(channel);
+    let mut leg = leg(channel, 3);
     leg.send(message(true, b"abc", true)).await.expect("sent");
-    let answer = leg.finish(3).await;
+    let answer = leg.finish().await;
     let Err(StorageError::Internal(why)) = answer else {
         panic!("{answer:?}");
     };
@@ -58,7 +59,7 @@ async fn an_acknowledgement_of_the_wrong_size_is_not_a_copy() {
 #[tokio::test]
 async fn a_replica_that_answers_early_ends_the_leg() {
     let (_odd, channel) = serve_odd().await;
-    let mut leg = leg(channel);
+    let mut leg = leg(channel, 2000 * 1024);
     let mut ended = None;
     for i in 0..2000 {
         if let Err(e) = leg.send(message(i == 0, &[1; 1024], false)).await {
@@ -79,10 +80,10 @@ async fn a_replica_that_answers_early_ends_the_leg() {
 async fn a_leg_to_nothing_is_unavailable() {
     let peers = Peers::plain();
     let channel = peers.channel("127.0.0.1:1").expect("a channel");
-    let mut leg = leg(channel);
+    let mut leg = leg(channel, 3);
     let sent = leg.send(message(true, b"abc", true)).await;
     let answer = match sent {
-        Ok(()) => leg.finish(3).await,
+        Ok(()) => leg.finish().await,
         Err(e) => Err(e),
     };
     assert!(
@@ -164,7 +165,7 @@ async fn a_dropped_leg_resets_its_call() {
     let ended = Arc::new(AtomicBool::new(false));
     let routes = tonic::service::Routes::new(ByteStreamServer::new(Stuck(Arc::clone(&ended))));
     let channel = connect(serve_routes(routes, None).await).await;
-    let mut leg = leg(channel);
+    let mut leg = leg(channel, 6);
     leg.send(message(true, b"abc", false)).await.expect("sent");
     for _ in 0..500 {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -179,4 +180,75 @@ async fn a_dropped_leg_resets_its_call() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("the replica's handler was not reset by the dropped leg");
+}
+
+/// A ByteStream that answers a write at once, unread, for the size it is given: a replica that holds
+/// the blob already.
+struct Holds(i64);
+
+#[tonic::async_trait]
+impl ByteStream for Holds {
+    type ReadStream = Boxed<ReadResponse>;
+
+    async fn read(
+        &self,
+        _: tonic::Request<ReadRequest>,
+    ) -> Result<tonic::Response<Self::ReadStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not asked"))
+    }
+
+    async fn write(
+        &self,
+        _: tonic::Request<tonic::Streaming<WriteRequest>>,
+    ) -> Result<tonic::Response<WriteResponse>, tonic::Status> {
+        Ok(tonic::Response::new(WriteResponse {
+            committed_size: self.0,
+        }))
+    }
+
+    async fn query_write_status(
+        &self,
+        _: tonic::Request<QueryWriteStatusRequest>,
+    ) -> Result<tonic::Response<QueryWriteStatusResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not asked"))
+    }
+}
+
+/// Catches a replica's early answer for the blob's whole size being an error: it holds the
+/// blob, so the leg is done, every message after it is dropped without error (far more than
+/// the queue holds are sent) and finishing it is a copy. Mutant: `ended` failing on any
+/// early answer.
+#[tokio::test]
+async fn an_early_answer_for_the_whole_blob_is_a_copy() {
+    let size = 2000 * 1024;
+    let routes = tonic::service::Routes::new(ByteStreamServer::new(Holds(size)));
+    let channel = connect(serve_routes(routes, None).await).await;
+    let mut leg = leg(channel, size as u64);
+    for i in 0..2000 {
+        leg.send(message(i == 0, &[1; 1024], false))
+            .await
+            .expect("sent or dropped");
+        tokio::task::yield_now().await;
+    }
+    leg.finish().await.expect("a copy");
+}
+
+/// Catches an early answer for another size than the blob's being taken for a copy.
+#[tokio::test]
+async fn an_early_answer_for_another_size_is_not_a_copy() {
+    let routes = tonic::service::Routes::new(ByteStreamServer::new(Holds(5)));
+    let channel = connect(serve_routes(routes, None).await).await;
+    let mut leg = leg(channel, 2000 * 1024);
+    let mut ended = None;
+    for i in 0..2000 {
+        if let Err(e) = leg.send(message(i == 0, &[1; 1024], false)).await {
+            ended = Some(e);
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let Some(StorageError::Internal(why)) = ended else {
+        panic!("{ended:?}");
+    };
+    assert!(why.contains("before the blob was complete"), "{why}");
 }

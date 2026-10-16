@@ -44,7 +44,8 @@ async fn pair(pki: &Pki, caller_role: &str) -> Pair {
                 write_bytes_in_flight: 1 << 30,
             },
         )
-        .with_chain(Arc::new(chain));
+        .with_chain(Arc::new(chain))
+        .expect("a certified service");
         addrs.push(serve_routes(service.routes(), Some(server)).await);
     }
     let members = addrs

@@ -48,17 +48,23 @@ impl Drop for Call {
 pub(crate) struct Leg {
     tx: mpsc::Sender<WriteRequest>,
     call: Call,
+    /// The blob's size: an answer for this many bytes is the replica's copy.
+    size: u64,
+    /// The replica answered, before the blob was complete, that it holds all of it
+    /// already: nothing more is sent.
+    held: bool,
     stall: Duration,
     commit: Duration,
 }
 
 impl Leg {
-    /// Starts the `Write` to `channel`, tagged with the map generation the sender
-    /// routed by and its own member id.
+    /// Starts the `Write` of a blob of `size` bytes to `channel`, tagged with the map
+    /// generation the sender routed by and its own member id.
     pub(crate) fn open(
         channel: Channel,
         generation: u64,
         sender: MemberId,
+        size: u64,
         stall: Duration,
         commit: Duration,
     ) -> Self {
@@ -77,20 +83,27 @@ impl Leg {
         Self {
             tx,
             call: Call(call),
+            size,
+            held: false,
             stall,
             commit,
         }
     }
 
-    /// Hands the next message to the call, waiting while the replica is behind.
+    /// Hands the next message to the call, waiting while the replica is behind. A replica
+    /// that has answered that it holds the whole blob already is sent nothing more.
     ///
     /// # Errors
-    /// Why the call ended, if it did (the replica refused or could not be reached);
-    /// [`StorageError::Unavailable`] if it took no message for the stall bound.
+    /// Why the call ended, if it did (the replica refused or could not be reached, or
+    /// answered for other than the blob's size); [`StorageError::Unavailable`] if it took
+    /// no message for the stall bound.
     pub(crate) async fn send(&mut self, message: WriteRequest) -> Result<(), StorageError> {
+        if self.held {
+            return Ok(());
+        }
         match tokio::time::timeout(self.stall, self.tx.send(message)).await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(self.ended().await),
+            Ok(Err(_)) => self.ended().await,
             Err(_) => Err(StorageError::Unavailable(Arc::new(Stalled {
                 what: "take a message",
                 after: self.stall,
@@ -105,14 +118,19 @@ impl Leg {
     /// Why the call failed; [`StorageError::Unavailable`] if the replica did not commit
     /// for the commit bound; [`StorageError::Internal`] if it acknowledged other than
     /// `size` bytes.
-    pub(crate) async fn finish(self, size: u64) -> Result<(), StorageError> {
+    pub(crate) async fn finish(self) -> Result<(), StorageError> {
         let Self {
             tx,
             mut call,
+            size,
+            held,
             commit,
             ..
         } = self;
         drop(tx);
+        if held {
+            return Ok(());
+        }
         let answer = tokio::time::timeout(commit, &mut call.0)
             .await
             .map_err(|_| {
@@ -134,14 +152,22 @@ impl Leg {
         }
     }
 
-    /// Why a call that ended before the blob was complete did.
-    async fn ended(&mut self) -> StorageError {
+    /// What a call that ended before the blob was complete means: nothing to fear if the
+    /// replica answered that it holds the whole blob (it had it already; the leg is done and
+    /// the sender goes on staging its own copy), otherwise why the call failed.
+    async fn ended(&mut self) -> Result<(), StorageError> {
         match (&mut self.call.0).await {
-            Ok(Err(status)) => lift(&status, None),
-            other => StorageError::Internal(format!(
+            Ok(Ok(response))
+                if u64::try_from(response.get_ref().committed_size) == Ok(self.size) =>
+            {
+                self.held = true;
+                Ok(())
+            }
+            Ok(Err(status)) => Err(lift(&status, None)),
+            other => Err(StorageError::Internal(format!(
                 "the replica answered before the blob was complete: {:?}",
-                other.map(|_| ())
-            )),
+                other.map(|r| r.map(|response| response.into_inner().committed_size))
+            ))),
         }
     }
 }

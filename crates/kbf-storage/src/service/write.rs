@@ -63,7 +63,7 @@ impl StorageService {
         let put = self.open_stream(size).await?;
         let (put, leg) = match (&plan, put, &self.chain, view) {
             (Plan::Primary { replica }, Some(put), Some(chain), Some(view)) => {
-                (Some(put), Some(chain.open_leg(view, replica)?))
+                (Some(put), Some(chain.open_leg(view, replica, size)?))
             }
             (Plan::Primary { .. }, None, _, _) => {
                 return Err(Status::failed_precondition(
@@ -186,7 +186,7 @@ async fn receive(
     }
     let (staged, replica) = tokio::join!(staging.finish(), async {
         match leg {
-            Some(leg) => leg.finish(digest.size_bytes).await,
+            Some(leg) => leg.finish().await,
             None => Ok(()),
         }
     });

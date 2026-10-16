@@ -122,7 +122,13 @@ fn a_certificate_must_name_exactly_one_known_role() {
         );
     }
     for endpoint in Endpoint::ALL {
-        assert!(Admission::Open.check_leaf(None, endpoint).is_ok());
+        let answer = Admission::Open.check_leaf(None, endpoint);
+        if endpoint == Endpoint::WriteLeg {
+            // No identity shows the caller is a storage node: a copy is never admitted.
+            assert_eq!(answer.expect_err("refused").code(), Code::Unauthenticated);
+        } else {
+            assert!(answer.is_ok(), "{endpoint:?}");
+        }
     }
 }
 
@@ -180,6 +186,15 @@ impl Pki {
 
     /// A client of the server at `addr`, with a certificate for `role`.
     pub(crate) async fn client(&self, addr: std::net::SocketAddr, role: &str) -> Channel {
+        self.endpoint(addr, role).connect().await.expect("connect")
+    }
+
+    /// [`Pki::client`] that connects when first used.
+    pub(crate) fn lazy_client(&self, addr: std::net::SocketAddr, role: &str) -> Channel {
+        self.endpoint(addr, role).connect_lazy()
+    }
+
+    fn endpoint(&self, addr: std::net::SocketAddr, role: &str) -> tonic::transport::Endpoint {
         let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
         params.subject_alt_names = vec![uri(role)];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
@@ -193,9 +208,6 @@ impl Pki {
             .expect("endpoint")
             .tls_config(tls)
             .expect("TLS")
-            .connect()
-            .await
-            .expect("connect")
     }
 }
 

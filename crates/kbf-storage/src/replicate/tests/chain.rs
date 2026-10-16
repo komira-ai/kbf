@@ -342,9 +342,9 @@ async fn a_write_is_served_only_where_the_map_places_it() {
     assert!(replica.contains("not the primary"), "{replica}");
     let third = invalid(raw(farm.channel(2), &digest, parts, 1, None).await);
     assert!(third.contains("not the primary"), "{third}");
-    let to_third = invalid(raw(farm.channel(2), &digest, parts, 1, Some(1)).await);
+    let to_third = invalid(raw(farm.storage_channel(2), &digest, parts, 1, Some(1)).await);
     assert!(to_third.contains("does not own it"), "{to_third}");
-    let to_self = invalid(raw(farm.channel(1), &digest, parts, 1, Some(2)).await);
+    let to_self = invalid(raw(farm.storage_channel(1), &digest, parts, 1, Some(2)).await);
     assert!(to_self.contains("does not own it"), "{to_self}");
     let garbled = {
         let mut request = Request::new(stream::iter(vec![WriteRequest::default()]));
@@ -360,7 +360,7 @@ async fn a_write_is_served_only_where_the_map_places_it() {
         assert!(!held(&farm, node, &digest));
     }
     // From the primary, to the replica that owns it: taken, and forwarded nowhere.
-    raw(farm.channel(1), &digest, parts, 1, Some(1))
+    raw(farm.storage_channel(1), &digest, parts, 1, Some(1))
         .await
         .expect("a copy");
     assert!(held(&farm, 1, &digest) && !held(&farm, 0, &digest) && !held(&farm, 2, &digest));
@@ -378,7 +378,14 @@ async fn bytes_that_are_not_the_digest_are_stored_nowhere() {
     let digest = sha(&bytes);
     let mut wrong = bytes.clone();
     wrong[10] ^= 1;
-    let to_replica = raw(farm.channel(1), &digest, &[(&wrong, true)], 1, Some(1)).await;
+    let to_replica = raw(
+        farm.storage_channel(1),
+        &digest,
+        &[(&wrong, true)],
+        1,
+        Some(1),
+    )
+    .await;
     assert_eq!(
         to_replica.expect_err("refused").code(),
         Code::InvalidArgument
@@ -414,7 +421,7 @@ async fn a_streamed_write_holds_to_its_declared_size() {
             &[(&bytes[..10], true)],
         ];
         for parts in cases {
-            let answer = raw(farm.channel(channel), &digest, parts, 1, leg).await;
+            let answer = raw(farm.channel_as(channel, leg), &digest, parts, 1, leg).await;
             assert_eq!(answer.expect_err("refused").code(), Code::InvalidArgument);
         }
     }
@@ -450,7 +457,7 @@ async fn a_writer_is_stopped_at_the_size_it_declared() {
                 .metadata_mut()
                 .insert(LEG_HEADER, MetadataValue::from(sender));
         }
-        let channel = farm.channel(node);
+        let channel = farm.channel_as(node, leg);
         let answer = within(ByteStreamClient::new(channel).write(request)).await;
         assert_eq!(answer.expect_err("refused").code(), Code::InvalidArgument);
     }
@@ -478,6 +485,34 @@ async fn a_blob_the_primary_holds_is_answered_without_the_replica() {
         farm.nodes[1].mem.knobs.chunks.load(Ordering::SeqCst),
         chunks
     );
+}
+
+/// Catches a replica that already holds a blob of several messages being treated as a
+/// protocol error (it answers on the first message, long before the blob is complete, and
+/// the write failed INTERNAL on every retry): the primary does not hold the 3 MiB blob, the
+/// replica does, and the write is answered; both then hold the same bytes. Mutant: the
+/// early answer of the blob's whole size reported as an error again.
+#[tokio::test]
+async fn a_replica_that_already_holds_a_large_blob_is_a_copy() {
+    let farm = Farm::start(2, ChainConfig::default()).await;
+    let map = farm.map(1, 2, &[]);
+    let bytes = farm.blob(&map, 0, 1, 3 * MIB + 17, 11);
+    let digest = sha(&bytes);
+    farm.nodes[1]
+        .mem
+        .blobs
+        .lock()
+        .expect("lock")
+        .insert(digest, Bytes::from(bytes.clone()));
+    assert!(!held(&farm, 0, &digest));
+    let stored = within(farm.client(0, 1).put(Bytes::from(bytes.clone())))
+        .await
+        .expect("a replica that holds the blob is a copy");
+    assert_eq!(stored, digest);
+    for node in 0..2 {
+        let blobs = farm.nodes[node].mem.blobs.lock().expect("lock");
+        assert_eq!(blobs.get(&digest).map(|b| b.to_vec()), Some(bytes.clone()));
+    }
 }
 
 /// Catches a replica that is down being answered as if it held a copy: the replica
@@ -678,6 +713,33 @@ async fn a_node_outside_a_chain_streams_when_its_store_can() {
     let other = sha(b"abc");
     let wrong = raw(channel.clone(), &other, &[(b"abd", true)], 0, None).await;
     assert_eq!(wrong.expect_err("refused").code(), Code::InvalidArgument);
+    // Plain text shows no storage caller: a copy is never admitted.
+    let copy = raw(channel, &other, &[(b"abc", true)], 0, Some(1)).await;
+    assert_eq!(copy.expect_err("refused").code(), Code::Unauthenticated);
+    assert!(!mem.blobs.lock().expect("lock").contains_key(&other));
+}
+
+/// Catches a certified node that is in no chain taking a copy another node sends: INTERNAL
+/// is wrong, and so is storing it (the sender would believe a second copy exists).
+#[tokio::test]
+async fn a_copy_sent_to_a_node_in_no_chain_is_refused() {
+    use crate::service::tests::fake::{Mem, serve_routes};
+    use crate::service::tests::roles::Pki;
+    use crate::service::{Admission, Config, StorageService};
+    let pki = Pki::new();
+    let mem = Arc::new(Mem::default());
+    let (server, _) = pki.node("storage");
+    let storage: Arc<dyn Storage> = Arc::clone(&mem) as Arc<dyn Storage>;
+    let service = StorageService::new(
+        storage,
+        Admission::Certified,
+        Config {
+            write_bytes_in_flight: 1 << 30,
+        },
+    );
+    let addr = serve_routes(service.routes(), Some(server)).await;
+    let channel = pki.client(addr, "storage").await;
+    let other = sha(b"abc");
     let copy = raw(channel, &other, &[(b"abc", true)], 0, Some(1)).await;
     let status = copy.expect_err("refused");
     assert_eq!(status.code(), Code::InvalidArgument);
@@ -687,6 +749,35 @@ async fn a_node_outside_a_chain_streams_when_its_store_can() {
         status.message()
     );
     assert!(!mem.blobs.lock().expect("lock").contains_key(&other));
+}
+
+/// Catches a chain node that admits callers without a certificate: its replica would take a
+/// copy from anyone who names itself a storage node, so the service refuses to be built
+/// over `Admission::Open`. Mutant: the check removed.
+#[test]
+fn a_chain_node_must_admit_callers_by_certificate() {
+    use crate::replicate::{Chain, Peers};
+    use crate::service::tests::fake::{Held, Mem};
+    use crate::service::{Admission, Config, StorageService};
+    let chain = |held| Arc::new(Chain::new(held, Peers::plain(), ChainConfig::default()));
+    let service = |admission| {
+        let storage: Arc<dyn Storage> = Arc::new(Mem::default());
+        StorageService::new(
+            storage,
+            admission,
+            Config {
+                write_bytes_in_flight: 1 << 20,
+            },
+        )
+    };
+    let held = || Held::none() as Arc<dyn crate::replicate::MapSource>;
+    let refused = service(Admission::Open).with_chain(chain(held()));
+    assert!(matches!(refused, Err(StorageError::Invalid(_))));
+    assert!(
+        service(Admission::Certified)
+            .with_chain(chain(held()))
+            .is_ok()
+    );
 }
 
 /// Catches a store whose blocking `stream` call fails being taken for one that has no

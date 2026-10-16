@@ -192,12 +192,17 @@ impl Chain {
         }
     }
 
-    /// The call that carries a blob to `replica`.
+    /// The call that carries a blob of `size` bytes to `replica`.
     ///
     /// # Errors
     /// [`StorageError::Unavailable`] if the map says `replica` is down;
     /// [`StorageError::Internal`] if it has no address a channel can be made to.
-    pub(crate) fn open_leg(&self, view: &View, replica: &Member) -> Result<Leg, StorageError> {
+    pub(crate) fn open_leg(
+        &self,
+        view: &View,
+        replica: &Member,
+        size: u64,
+    ) -> Result<Leg, StorageError> {
         if replica.state == MemberState::Down {
             return Err(StorageError::Unavailable(Arc::new(ReplicaDown(replica.id))));
         }
@@ -206,6 +211,7 @@ impl Chain {
             channel,
             view.map.generation(),
             view.me,
+            size,
             self.config.stall,
             self.config.commit,
         ))
