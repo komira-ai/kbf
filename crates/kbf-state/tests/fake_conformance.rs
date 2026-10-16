@@ -64,18 +64,18 @@ fn ungrouped_writes_fail_c7() {
     c7_group_commit(&FakeBackend::new(Flaw::Ungrouped));
 }
 
-// Catches a range scan that returns every key from its start, past its limit.
+// Catches a range scan that returns every key of its range, past its limit.
 #[test]
 #[should_panic(expected = "C8 limit")]
 fn a_scan_that_ignores_its_limit_fails_c8() {
     c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanIgnoresLimit));
 }
 
-// Catches a range scan that begins at the prefix whatever start key it is given.
+// Catches a range scan that begins at the prefix whatever lower bound it is given.
 #[test]
-#[should_panic(expected = "C8 start")]
-fn a_scan_that_ignores_its_start_key_fails_c8() {
-    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanIgnoresStart));
+#[should_panic(expected = "C8 lower")]
+fn a_scan_that_ignores_its_lower_bound_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanIgnoresLower));
 }
 
 // Catches a resume token that resumes at the last key of its page instead of after it,
@@ -91,6 +91,36 @@ fn a_scan_that_resumes_at_its_token_fails_c8() {
 #[should_panic(expected = "C8 prefix")]
 fn a_scan_past_its_prefix_fails_c8() {
     c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanPastPrefix));
+}
+
+// Catches a forward scan that runs on past its upper bound.
+#[test]
+#[should_panic(expected = "C8 upper: an included upper key is the last row")]
+fn a_scan_that_ignores_its_upper_bound_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanIgnoresUpper));
+}
+
+// Catches a forward scan that returns the key of an excluded upper bound.
+#[test]
+#[should_panic(expected = "C8 upper: an excluded upper key is not returned")]
+fn a_scan_that_includes_an_excluded_upper_key_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanIncludesExcludedUpper));
+}
+
+// Catches a reverse scan built as the forward page reversed: the first keys of the
+// range, not the last (`ORDER BY key LIMIT n` then reversing the rows).
+#[test]
+#[should_panic(expected = "C8 reverse: a reverse page holds the last keys")]
+fn a_reverse_scan_of_the_forward_page_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanReversesForwardPage));
+}
+
+// Catches a reverse scan whose token resumes at the last key of its page, so the key is
+// returned twice.
+#[test]
+#[should_panic(expected = "C8 reverse resume")]
+fn a_reverse_scan_that_resumes_at_its_token_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanReverseResumesAtToken));
 }
 
 // The two error types say what failed.

@@ -10,17 +10,16 @@
 //! the clause it breaks, which is what proves the clause can fail.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroUsize;
 use std::ops::Bound;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::clock::{Clock, ManualClock, StoreTime};
 use crate::conformance::{Backend, C1_RACERS, RACE_KEY};
-use crate::store::{Lower, Store, page_of};
+use crate::store::{Span, Store, page_of};
 use crate::types::{
-    Change, Changes, Commit, CommitStats, Cond, Conflict, Event, Op, Revision, ScanPage,
-    StoreError, Txn, Version, Versioned,
+    Change, Changes, Commit, CommitStats, Cond, Conflict, Direction, Event, Op, Revision, ScanPage,
+    ScanRange, StoreError, Txn, Version, Versioned,
 };
 
 /// How much store time one durable sync takes on the fake.
@@ -48,15 +47,25 @@ pub enum Flaw {
     AckBeforeSync,
     /// C7: every transaction pays its own sync, even inside a batch.
     Ungrouped,
-    /// C8: a range scan returns every key from its start, however small the limit.
+    /// C8: a range scan returns every key of its range, however small the limit.
     ScanIgnoresLimit,
-    /// C8: a range scan begins at the prefix whatever start bound it is given.
-    ScanIgnoresStart,
-    /// C8: an excluded start bound is treated as included, so resuming from a token
-    /// returns the last key of the previous page again.
+    /// C8: a range scan begins at the prefix whatever lower bound it is given.
+    ScanIgnoresLower,
+    /// C8: an excluded lower bound is treated as included, so resuming a forward scan
+    /// from a token returns the last key of the previous page again.
     ScanResumesAtToken,
-    /// C8: a range scan runs on past the last key under its prefix.
+    /// C8: a range scan is not clipped to its prefix, only to its bounds.
     ScanPastPrefix,
+    /// C8: a forward scan runs on past its upper bound to the end of the prefix.
+    ScanIgnoresUpper,
+    /// C8: a forward scan treats an excluded upper bound as included.
+    ScanIncludesExcludedUpper,
+    /// C8: a reverse scan reads the forward page from the lower bound and reverses it,
+    /// so it returns the first keys of the range, not the last.
+    ScanReversesForwardPage,
+    /// C8: a reverse scan treats an excluded upper bound as included, so resuming it
+    /// from a token returns the last key of the previous page again.
+    ScanReverseResumesAtToken,
 }
 
 #[derive(Clone)]
@@ -331,6 +340,38 @@ impl Fake {
         result
     }
 
+    /// `scan` with the bound defects of the scan flaws applied.
+    fn flawed<'a>(&self, scan: ScanRange<'a>) -> ScanRange<'a> {
+        let included = |bound: Bound<&'a str>| match bound {
+            Bound::Excluded(key) => Bound::Included(key),
+            other => other,
+        };
+        let forward = scan.direction == Direction::Forward;
+        match self.flaw {
+            Flaw::ScanIgnoresLower => ScanRange {
+                lower: Bound::Unbounded,
+                ..scan
+            },
+            Flaw::ScanResumesAtToken => ScanRange {
+                lower: included(scan.lower),
+                ..scan
+            },
+            Flaw::ScanIgnoresUpper if forward => ScanRange {
+                upper: Bound::Unbounded,
+                ..scan
+            },
+            Flaw::ScanIncludesExcludedUpper if forward => ScanRange {
+                upper: included(scan.upper),
+                ..scan
+            },
+            Flaw::ScanReverseResumesAtToken if !forward => ScanRange {
+                upper: included(scan.upper),
+                ..scan
+            },
+            _ => scan,
+        }
+    }
+
     fn clock_now(&self) -> StoreTime {
         if self.flaw == Flaw::CallerClockExpiry {
             self.frozen
@@ -412,42 +453,49 @@ impl Store for Fake {
             .collect())
     }
 
-    fn scan_range(
-        &self,
-        prefix: &str,
-        start: Bound<&str>,
-        limit: NonZeroUsize,
-    ) -> Result<ScanPage, StoreError> {
+    fn scan_range(&self, scan: ScanRange<'_>) -> Result<ScanPage, StoreError> {
         let now = self.clock_now();
-        let lower = match (self.flaw, Lower::of(prefix, start)) {
-            (Flaw::ScanIgnoresStart, _) => Bound::Included(prefix),
-            (Flaw::ScanResumesAtToken, Lower::After(key)) | (_, Lower::From(key)) => {
-                Bound::Included(key)
+        let reverse = scan.direction == Direction::Reverse;
+        // The forward page of the reverse flaw is the reverse request run forward.
+        let walk_reverse = reverse && self.flaw != Flaw::ScanReversesForwardPage;
+        let mut scan = self.flawed(scan);
+        if self.flaw == Flaw::ScanPastPrefix {
+            // Clipped below by the prefix, never above.
+            if scan.lower == Bound::Unbounded {
+                scan.lower = Bound::Included(scan.prefix);
             }
-            (_, Lower::After(key)) => Bound::Excluded(key),
+            scan.prefix = "";
+        }
+        let Some(span) = Span::of(&scan) else {
+            return Ok(ScanPage {
+                rows: Vec::new(),
+                resume: None,
+            });
         };
         let take = if self.flaw == Flaw::ScanIgnoresLimit {
             usize::MAX
         } else {
-            limit.get().saturating_add(1)
+            scan.limit.get().saturating_add(1)
         };
         let inner = lock(&self.inner);
-        let mut rows: Vec<(String, Versioned)> = Vec::new();
-        for (key, row) in inner.live.rows.range::<str, _>((lower, Bound::Unbounded)) {
-            if !key.starts_with(prefix) && self.flaw != Flaw::ScanPastPrefix {
-                break;
-            }
-            if rows.len() == take {
-                break;
-            }
-            if row.alive(now) {
-                rows.push((key.clone(), row.versioned()));
-            }
+        let range = inner.live.rows.range::<str, _>(span.bounds());
+        let walk: Box<dyn Iterator<Item = (&String, &Row)>> = if walk_reverse {
+            Box::new(range.rev())
+        } else {
+            Box::new(range)
+        };
+        let mut rows: Vec<(String, Versioned)> = walk
+            .filter(|(_, row)| row.alive(now))
+            .take(take)
+            .map(|(key, row)| (key.clone(), row.versioned()))
+            .collect();
+        if reverse && !walk_reverse {
+            rows.reverse();
         }
         if self.flaw == Flaw::ScanIgnoresLimit {
             return Ok(ScanPage { rows, resume: None });
         }
-        Ok(page_of(rows, limit))
+        Ok(page_of(rows, scan.limit))
     }
 
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {

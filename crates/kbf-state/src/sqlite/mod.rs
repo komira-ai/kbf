@@ -30,8 +30,6 @@ mod schema;
 mod writer;
 
 use std::io;
-use std::num::NonZeroUsize;
-use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, SyncSender};
@@ -48,7 +46,8 @@ use crate::GROUP_COMMIT_WINDOW;
 use crate::clock::{Clock, StoreTime};
 use crate::store::Store;
 use crate::types::{
-    Changes, Commit, CommitStats, Conflict, Revision, ScanPage, StoreError, Txn, Versioned,
+    Changes, Commit, CommitStats, Conflict, Revision, ScanPage, ScanRange, StoreError, Txn,
+    Versioned,
 };
 use writer::{Reply, Request, Shared, Writer};
 
@@ -259,13 +258,8 @@ impl Store for SqliteStore {
         read::scan_prefix(&self.reader(), prefix, self.clock.now())
     }
 
-    fn scan_range(
-        &self,
-        prefix: &str,
-        start: Bound<&str>,
-        limit: NonZeroUsize,
-    ) -> Result<ScanPage, StoreError> {
-        read::scan_range(&self.reader(), prefix, start, limit, self.clock.now())
+    fn scan_range(&self, scan: ScanRange<'_>) -> Result<ScanPage, StoreError> {
+        read::scan_range(&self.reader(), scan, self.clock.now())
     }
 
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {

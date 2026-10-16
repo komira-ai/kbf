@@ -1,6 +1,7 @@
 //! The values the state store trait speaks: versions, revisions, transactions, and the
 //! rows of the change feed.
 
+use std::num::NonZeroUsize;
 use std::ops::Bound;
 use std::time::Duration;
 
@@ -251,14 +252,87 @@ pub struct CommitStats {
     pub syncs: u64,
 }
 
-/// Where a paged range scan resumes (C8): after the last key of the page that returned
-/// it. It is a key, not a position in a snapshot, so it stays valid across commits and
-/// restarts; a caller may carry it in a URL ([`ResumeToken::key`], [`ResumeToken::after`]).
+/// Which way a C8 scan walks the key order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Direction {
+    /// Ascending key order, from the lower bound up.
+    #[default]
+    Forward,
+    /// Descending key order, from the upper bound down: newest first over keys that
+    /// embed an ascending time, or the last key at or before a bound with a limit of 1.
+    Reverse,
+}
+
+/// One page request of a C8 range scan: the live keys under `prefix` that lie within
+/// `lower` and `upper`, walked in `direction`, at most `limit` of them.
+///
+/// The bounds are positions in the key order whichever way the scan walks; a bound
+/// outside the prefix is clipped to it. [`ScanRange::resume`] turns a page's
+/// [`ResumeToken`] into the request for the next page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanRange<'a> {
+    /// Only keys that start with this are returned.
+    pub prefix: &'a str,
+    /// The smallest key the scan may return.
+    pub lower: Bound<&'a str>,
+    /// The largest key the scan may return.
+    pub upper: Bound<&'a str>,
+    /// The order the rows are walked and returned in.
+    pub direction: Direction,
+    /// The most rows one page holds.
+    pub limit: NonZeroUsize,
+}
+
+impl<'a> ScanRange<'a> {
+    /// A forward scan of every live key under `prefix`, `limit` rows a page.
+    #[must_use]
+    pub fn new(prefix: &'a str, limit: NonZeroUsize) -> ScanRange<'a> {
+        ScanRange {
+            prefix,
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+            direction: Direction::Forward,
+            limit,
+        }
+    }
+
+    /// The same scan in descending key order.
+    #[must_use]
+    pub fn reverse(self) -> ScanRange<'a> {
+        ScanRange {
+            direction: Direction::Reverse,
+            ..self
+        }
+    }
+
+    /// The request for the page after the one that returned `token`: the bound on the
+    /// side the scan walked from moves to just past the token's key (the lower bound of
+    /// a forward scan, the upper bound of a reverse one); the other bound stays.
+    #[must_use]
+    pub fn resume(self, token: &'a ResumeToken) -> ScanRange<'a> {
+        let past = Bound::Excluded(token.key());
+        match self.direction {
+            Direction::Forward => ScanRange {
+                lower: past,
+                ..self
+            },
+            Direction::Reverse => ScanRange {
+                upper: past,
+                ..self
+            },
+        }
+    }
+}
+
+/// Where a paged range scan resumes (C8): past the last key of the page that returned
+/// it, in the scan's direction ([`ScanRange::resume`]). It is a key, not a position in a
+/// snapshot, so it stays valid across commits and restarts; a caller may carry it in a
+/// URL ([`ResumeToken::key`], [`ResumeToken::after`]).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResumeToken(String);
 
 impl ResumeToken {
-    /// The token that resumes a scan after `key`.
+    /// The token that resumes a scan past `key`.
     #[must_use]
     pub fn after(key: impl Into<String>) -> ResumeToken {
         ResumeToken(key.into())
@@ -269,21 +343,14 @@ impl ResumeToken {
     pub fn key(&self) -> &str {
         &self.0
     }
-
-    /// The start bound to pass to [`crate::Store::scan_range`] for the next page: every
-    /// key after [`ResumeToken::key`], none at it.
-    #[must_use]
-    pub fn start(&self) -> Bound<&str> {
-        Bound::Excluded(&self.0)
-    }
 }
 
 /// A page of a bounded range scan (C8).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanPage {
-    /// Live keys under the prefix from the start bound on, in key order, at most the limit.
+    /// Live keys of the request's range, in its direction, at most its limit.
     pub rows: Vec<(String, Versioned)>,
-    /// Set when a live key under the prefix followed the last row when the page was read;
-    /// `None` when the page reached the end of the prefix.
+    /// Set when a live key of the range followed the last row, in the scan's direction,
+    /// when the page was read; `None` when the page reached the end of the range.
     pub resume: Option<ResumeToken>,
 }

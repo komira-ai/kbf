@@ -1,7 +1,6 @@
 //! The read side: queries on a connection of their own, which in WAL mode never wait
 //! for the writer and never see a transaction that has not committed.
 
-use std::num::NonZeroUsize;
 use std::ops::Bound;
 
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
@@ -9,8 +8,11 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehav
 use super::schema::{self, KIND_DELETE, KIND_PUT};
 use super::writer::{from_nanos, to_nanos, to_sql, uint};
 use crate::clock::StoreTime;
-use crate::store::{Lower, page_of};
-use crate::types::{Change, Changes, Event, Revision, ScanPage, StoreError, Version, Versioned};
+use crate::store::{Span, page_of};
+use crate::types::{
+    Change, Changes, Direction, Event, Revision, ScanPage, ScanRange, StoreError, Version,
+    Versioned,
+};
 
 fn versioned(value: Vec<u8>, version: i64, expires: Option<i64>) -> Versioned {
     Versioned {
@@ -84,43 +86,54 @@ pub(super) fn scan_prefix(
     Ok(found)
 }
 
-/// C8 on one statement, so the page is read from one WAL snapshot. Expired rows are
-/// skipped in the loop, which reads up to one live row past the limit to learn whether a
-/// resume token is due.
+/// C8 on one statement, so the page is read from one WAL snapshot. The statement is
+/// bounded on both sides by the request's span (its bounds clipped to the prefix) and
+/// walks the primary key in the scan's direction; expired rows are skipped in the loop,
+/// which reads up to one live row past the limit to learn whether a resume token is due.
 pub(super) fn scan_range(
     conn: &Connection,
-    prefix: &str,
-    start: Bound<&str>,
-    limit: NonZeroUsize,
+    scan: ScanRange<'_>,
     now: StoreTime,
 ) -> Result<ScanPage, StoreError> {
-    let (sql, from) = match Lower::of(prefix, start) {
-        Lower::From(key) => (
-            "SELECT key, value, version, expires_at FROM kv WHERE key >= ?1 ORDER BY key",
-            key,
-        ),
-        Lower::After(key) => (
-            "SELECT key, value, version, expires_at FROM kv WHERE key > ?1 ORDER BY key",
-            key,
-        ),
+    let Some(span) = Span::of(&scan) else {
+        return Ok(ScanPage {
+            rows: Vec::new(),
+            resume: None,
+        });
     };
-    let take = limit.get().saturating_add(1);
-    let mut statement = conn.prepare(sql)?;
-    let mut rows = statement.query([from])?;
+    let mut clauses = Vec::new();
+    let mut params: Vec<&str> = Vec::new();
+    for (bound, included, excluded) in [(&span.lower, ">=", ">"), (&span.upper, "<=", "<")] {
+        let (op, key) = match bound {
+            Bound::Included(key) => (included, key),
+            Bound::Excluded(key) => (excluded, key),
+            Bound::Unbounded => continue,
+        };
+        params.push(key);
+        clauses.push(format!("key {op} ?{}", params.len()));
+    }
+    let order = match scan.direction {
+        Direction::Forward => "ASC",
+        Direction::Reverse => "DESC",
+    };
+    // The span's lower bound is never unbounded, so there is always one clause.
+    let sql = format!(
+        "SELECT key, value, version, expires_at FROM kv WHERE {} ORDER BY key {order}",
+        clauses.join(" AND ")
+    );
+    let take = scan.limit.get().saturating_add(1);
+    let mut statement = conn.prepare(&sql)?;
+    let mut rows = statement.query(rusqlite::params_from_iter(params))?;
     let mut found = Vec::new();
     while found.len() < take
         && let Some(row) = rows.next()?
     {
-        let key: String = row.get(0)?;
-        if !key.starts_with(prefix) {
-            break;
-        }
         let expires: Option<i64> = row.get(3)?;
         if is_live(expires, now) {
-            found.push((key, versioned(row.get(1)?, row.get(2)?, expires)));
+            found.push((row.get(0)?, versioned(row.get(1)?, row.get(2)?, expires)));
         }
     }
-    Ok(page_of(found, limit))
+    Ok(page_of(found, scan.limit))
 }
 
 pub(super) fn changes(

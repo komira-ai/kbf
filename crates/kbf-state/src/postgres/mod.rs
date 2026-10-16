@@ -33,7 +33,6 @@ mod session;
 mod tx;
 
 use std::fmt;
-use std::num::NonZeroUsize;
 use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,16 +40,17 @@ use std::time::Duration;
 
 use postgres::config::SslMode;
 use postgres::error::SqlState;
+use postgres::types::ToSql;
 
 pub use backend::PostgresBackend;
-use session::{Pool, Session};
+use session::{Edge, Pool, RangeShape, Session};
 use tx::{Level, Row, Tx, micros};
 
 use crate::clock::{Clock, StoreTime};
-use crate::store::{Lower, Store, page_of};
+use crate::store::{Span, Store, page_of};
 use crate::{
-    Change, Changes, Commit, CommitStats, Conflict, Event, Revision, ScanPage, StoreError, Txn,
-    Version, Versioned,
+    Change, Changes, Commit, CommitStats, Conflict, Direction, Event, Revision, ScanPage,
+    ScanRange, StoreError, Txn, Version, Versioned,
 };
 
 /// The most times a batch is run again after a serialization failure.
@@ -509,27 +509,35 @@ impl Store for PostgresStore {
     }
 
     /// C8 in one statement, so the page is one snapshot of committed transactions. The
-    /// query asks for one row past the limit to learn whether a resume token is due.
-    fn scan_range(
-        &self,
-        prefix: &str,
-        start: Bound<&str>,
-        limit: NonZeroUsize,
-    ) -> Result<ScanPage, StoreError> {
+    /// statement for the span's shape asks for one row past the limit to learn whether a
+    /// resume token is due.
+    fn scan_range(&self, scan: ScanRange<'_>) -> Result<ScanPage, StoreError> {
+        let Some(span) = Span::of(&scan) else {
+            return Ok(ScanPage {
+                rows: Vec::new(),
+                resume: None,
+            });
+        };
+        let shape = RangeShape {
+            lower: Edge::of(&span.lower),
+            upper: Edge::of(&span.upper),
+            reverse: scan.direction == Direction::Reverse,
+        };
         let over = self.over();
-        let take = i64::try_from(limit.get().saturating_add(1)).unwrap_or(i64::MAX);
-        let rows = self.read(|s| {
-            let (statement, from) = match Lower::of(prefix, start) {
-                Lower::From(key) => (&s.st.scan_from, key),
-                Lower::After(key) => (&s.st.scan_after, key),
-            };
-            s.client.query(statement, &[&prefix, &over, &from, &take])
-        })?;
+        let take = i64::try_from(scan.limit.get().saturating_add(1)).unwrap_or(i64::MAX);
+        let (lower, upper) = span.bounds();
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&over, &take];
+        for bound in [&lower, &upper] {
+            if let Bound::Included(key) | Bound::Excluded(key) = bound {
+                params.push(key);
+            }
+        }
+        let rows = self.read(|s| s.client.query(&s.st.ranges[shape.index()], &params))?;
         let rows = rows
             .iter()
             .map(|row| (row.get(0), versioned(&Row::from_row(row, 1))))
             .collect();
-        Ok(page_of(rows, limit))
+        Ok(page_of(rows, scan.limit))
     }
 
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {

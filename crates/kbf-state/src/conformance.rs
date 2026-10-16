@@ -16,7 +16,8 @@ use std::time::Duration;
 use crate::clock::{Clock, ManualClock};
 use crate::store::Store;
 use crate::types::{
-    Change, Commit, Cond, Conflict, Event, ResumeToken, Revision, ScanPage, Txn, Version, Versioned,
+    Change, Commit, Cond, Conflict, Direction, Event, ResumeToken, Revision, ScanPage, ScanRange,
+    Txn, Version, Versioned,
 };
 use crate::{GROUP_COMMIT_WINDOW, TARGET_WRITES_PER_SECOND};
 
@@ -566,33 +567,64 @@ const C8_KEYS: [&str; 6] = ["c8/", "c8/a", "c8/b", "c8/c", "c8/d", "c8/\u{e9}"];
 /// after it.
 const C8_OUTSIDE: [&str; 4] = ["c8", "c8.z", "c80", "c8~"];
 
-fn scan_page<S: Store>(store: &S, start: Bound<&str>, limit: usize) -> ScanPage {
-    let limit = NonZeroUsize::new(limit).expect("C8 limits are positive");
-    store
-        .scan_range("c8/", start, limit)
-        .expect("the store is reachable")
+/// A forward scan of all of C8's prefix, `limit` rows a page.
+fn c8_scan(limit: usize) -> ScanRange<'static> {
+    ScanRange::new(
+        "c8/",
+        NonZeroUsize::new(limit).expect("C8 limits are positive"),
+    )
+}
+
+fn page<S: Store>(store: &S, scan: ScanRange<'_>) -> ScanPage {
+    store.scan_range(scan).expect("the store is reachable")
 }
 
 fn keys_of(page: &ScanPage) -> Vec<&str> {
     page.rows.iter().map(|(key, _)| key.as_str()).collect()
 }
 
-/// Every page of a scan of `c8/` with `limit`, from the start of the prefix to the end.
-fn scan_all<S: Store>(store: &S, limit: usize) -> Vec<ScanPage> {
-    let mut pages = vec![scan_page(store, Bound::Unbounded, limit)];
-    while let Some(token) = pages.last().and_then(|page| page.resume.clone()) {
+/// Every page of `scan`, following each page's token until a page has none.
+fn scan_all<S: Store>(store: &S, scan: ScanRange<'_>) -> Vec<ScanPage> {
+    let mut pages = vec![page(store, scan)];
+    while let Some(token) = pages.last().and_then(|last| last.resume.clone()) {
         assert!(
             pages.len() <= C8_KEYS.len() + C8_OUTSIDE.len() + 2,
             "C8 resume: the scan never ends; a token resumes at or before its own page"
         );
-        pages.push(scan_page(store, token.start(), limit));
+        pages.push(page(store, scan.resume(&token)));
     }
     pages
 }
 
-/// C8: a range scan under a prefix is bounded by its limit, ordered as C5's scan, begins
-/// at its start bound, and pages with a resume token that continues exactly after the
-/// last key, across concurrent commits.
+/// Paging `scan` with every limit from 1 to one past the prefix returns `expected`, each
+/// page full but the last.
+fn assert_pages<S: Store>(store: &S, scan: ScanRange<'_>, expected: &[&str], clause: &str) {
+    for limit in 1..=C8_KEYS.len() + 1 {
+        let limit = NonZeroUsize::new(limit).expect("positive");
+        let pages = scan_all(store, ScanRange { limit, ..scan });
+        let keys: Vec<&str> = pages.iter().flat_map(keys_of).collect();
+        assert_eq!(
+            keys, expected,
+            "{clause}: paging with limit {limit} returns each live key of the range once, in order, and nothing else"
+        );
+        assert!(
+            pages.iter().all(|page| page.rows.len() <= limit.get()),
+            "{clause}: a page holds at most the limit"
+        );
+        assert!(
+            pages
+                .iter()
+                .rev()
+                .skip(1)
+                .all(|page| page.rows.len() == limit.get()),
+            "{clause}: only the last page may be short (expired keys do not shorten one)"
+        );
+    }
+}
+
+/// C8: a range scan under a prefix is bounded by its limit, ordered as C5's scan or its
+/// reverse, lies within its lower and upper bounds clipped to the prefix, and pages with
+/// a resume token that continues exactly past the last key, across concurrent commits.
 pub fn c8_bounded_range_scan<B: Backend>(backend: &B) {
     let clock = Arc::new(ManualClock::default());
     let store = backend.open(Arc::clone(&clock));
@@ -605,8 +637,17 @@ pub fn c8_bounded_range_scan<B: Backend>(backend: &B) {
     run(&store, seed).expect("seed the C8 keys");
     clock.advance(Duration::from_secs(2));
 
-    // The limit.
-    let first = scan_page(&store, Bound::Unbounded, 2);
+    // Reverse runs before upper: the forward-only upper-bound flaws must reach C8 upper,
+    // and the reverse resume flaw must reach C8 reverse before C8 range sees it.
+    c8_forward(&store);
+    c8_reverse(&store);
+    c8_upper(&store);
+    c8_concurrent(&store);
+}
+
+/// C8 forward: the limit, the lower bound, the prefix and the token.
+fn c8_forward<S: Store>(store: &S) {
+    let first = page(store, c8_scan(2));
     assert_eq!(
         keys_of(&first),
         ["c8/", "c8/a"],
@@ -619,39 +660,38 @@ pub fn c8_bounded_range_scan<B: Backend>(backend: &B) {
     );
     assert_eq!(
         first.rows[1].1,
-        value(&store, "c8/a").expect("c8/a exists"),
+        value(store, "c8/a").expect("c8/a exists"),
         "C8 limit: a row carries the key's value, version and expiry"
     );
-    // The start bound.
-    let at = scan_page(&store, Bound::Included("c8/c"), 2);
+    let from = |lower, limit| ScanRange {
+        lower,
+        ..c8_scan(limit)
+    };
     assert_eq!(
-        keys_of(&at),
+        keys_of(&page(store, from(Bound::Included("c8/c"), 2))),
         ["c8/c", "c8/d"],
-        "C8 start: an included start key is the first row"
+        "C8 lower: an included lower key is the first row"
     );
-    let between = scan_page(&store, Bound::Included("c8/bz"), 1);
     assert_eq!(
-        keys_of(&between),
+        keys_of(&page(store, from(Bound::Included("c8/bz"), 1))),
         ["c8/c"],
-        "C8 start: a start key that is not stored begins at the next key"
+        "C8 lower: a lower key that is not stored begins at the next key"
     );
-    // The prefix: a start past it finds nothing.
-    // `c8~` is stored past the prefix; nothing is stored at or after `c9`, so that scan
-    // runs off the end of the store.
+    // The prefix: a lower bound past it finds nothing. `c8~` is stored past the prefix;
+    // nothing is stored at or after `c9`, so that scan runs off the end of the store.
     for beyond in ["c8~", "c9"] {
-        let past = scan_page(&store, Bound::Included(beyond), 4);
+        let past = page(store, from(Bound::Included(beyond), 4));
         assert_eq!(
             keys_of(&past),
             Vec::<&str>::new(),
-            "C8 prefix: a start past the prefix ({beyond}) gives an empty page"
+            "C8 prefix: a lower bound past the prefix ({beyond}) gives an empty page"
         );
         assert_eq!(
             past.resume, None,
-            "C8 prefix: a start past the prefix ({beyond}) gives a final page"
+            "C8 prefix: a lower bound past the prefix ({beyond}) gives a final page"
         );
     }
-    // A page as large as the prefix.
-    let whole = scan_page(&store, Bound::Unbounded, C8_KEYS.len());
+    let whole = page(store, c8_scan(C8_KEYS.len()));
     let listed: Vec<(String, Versioned)> = store.scan_prefix("c8/").expect("scan");
     assert_eq!(
         whole.rows, listed,
@@ -659,69 +699,167 @@ pub fn c8_bounded_range_scan<B: Backend>(backend: &B) {
     );
     assert_eq!(
         whole.resume, None,
-        "C8 resume: a page that reached the end of the prefix has no token"
+        "C8 resume: a page that reached the end of the range has no token"
     );
 
-    // The resume token.
-    let second = scan_page(&store, first.resume.as_ref().expect("a token").start(), 2);
+    let token = first.resume.as_ref().expect("a token");
     assert_eq!(
-        keys_of(&second),
+        keys_of(&page(store, c8_scan(2).resume(token))),
         ["c8/b", "c8/c"],
         "C8 resume: the token must resume exactly after the last key of the page"
     );
-
-    let after = scan_page(&store, Bound::Excluded("c8/c"), 1);
     assert_eq!(
-        keys_of(&after),
+        keys_of(&page(store, from(Bound::Excluded("c8/c"), 1))),
         ["c8/d"],
-        "C8 start: an excluded start key is not returned"
+        "C8 lower: an excluded lower key is not returned"
     );
     for before in [Bound::Included("c8"), Bound::Excluded("c8.z")] {
         assert_eq!(
-            keys_of(&scan_page(&store, before, 1)),
+            keys_of(&page(store, from(before, 1))),
             ["c8/"],
-            "C8 start: a start before the prefix begins at the prefix ({before:?})"
+            "C8 lower: a lower bound before the prefix begins at the prefix ({before:?})"
         );
     }
-
-    // The prefix: no page, however it starts, holds a key outside it.
-    let last = scan_page(&store, Bound::Excluded("c8/d"), 4);
     assert_eq!(
-        keys_of(&last),
+        keys_of(&page(store, from(Bound::Excluded("c8/d"), 4))),
         ["c8/\u{e9}"],
         "C8 prefix: the page ends with the prefix's last key in byte order"
     );
-    for limit in 1..=C8_KEYS.len() + 1 {
-        let pages = scan_all(&store, limit);
-        let keys: Vec<&str> = pages.iter().flat_map(keys_of).collect();
-        assert_eq!(
-            keys, C8_KEYS,
-            "C8 prefix: paging with limit {limit} returns each live key under the prefix once, in order, and nothing else"
-        );
-        assert!(
-            pages.iter().all(|page| page.rows.len() <= limit),
-            "C8 limit: a page holds at most the limit"
-        );
-        assert!(
-            pages
-                .iter()
-                .rev()
-                .skip(1)
-                .all(|page| page.rows.len() == limit),
-            "C8 limit: only the last page may be short (expired keys do not shorten one)"
-        );
-    }
+    assert_pages(store, c8_scan(1), &C8_KEYS, "C8 prefix");
+}
 
-    // Concurrent commits between pages: behind the token, ahead of it, a delete and an
-    // update ahead of it.
-    let first = scan_page(&store, Bound::Unbounded, 3);
+/// C8 upper: a forward scan stops at its upper bound, clipped to the prefix, and bounds
+/// that cross give an empty page.
+fn c8_upper<S: Store>(store: &S) {
+    let until = |upper, limit| ScanRange {
+        upper,
+        ..c8_scan(limit)
+    };
+    let included = page(store, until(Bound::Included("c8/b"), 8));
+    assert_eq!(
+        keys_of(&included),
+        ["c8/", "c8/a", "c8/b"],
+        "C8 upper: an included upper key is the last row"
+    );
+    assert_eq!(
+        included.resume, None,
+        "C8 upper: a page that reached the upper bound has no token"
+    );
+    assert_eq!(
+        keys_of(&page(store, until(Bound::Excluded("c8/b"), 8))),
+        ["c8/", "c8/a"],
+        "C8 upper: an excluded upper key is not returned"
+    );
+    assert_pages(
+        store,
+        until(Bound::Included("c8/b"), 1),
+        &C8_KEYS[..3],
+        "C8 upper",
+    );
+    assert_eq!(
+        keys_of(&page(store, until(Bound::Included("c9"), 8))),
+        C8_KEYS,
+        "C8 upper: an upper bound past the prefix stops at the prefix"
+    );
+    // Bounds that leave no key: before the prefix, crossed, and one key excluded.
+    let empty = [
+        (Bound::Unbounded, Bound::Included("c8.z")),
+        (Bound::Included("c8/d"), Bound::Included("c8/b")),
+        (Bound::Excluded("c8/b"), Bound::Excluded("c8/b")),
+        (Bound::Included("c8/b"), Bound::Excluded("c8/b")),
+        (Bound::Excluded("c8/b"), Bound::Included("c8/b")),
+    ];
+    for (lower, upper) in empty {
+        for direction in [Direction::Forward, Direction::Reverse] {
+            let none = page(
+                store,
+                ScanRange {
+                    lower,
+                    upper,
+                    direction,
+                    ..c8_scan(8)
+                },
+            );
+            assert_eq!(
+                (keys_of(&none), none.resume.as_ref()),
+                (Vec::<&str>::new(), None),
+                "C8 range: bounds {lower:?}..{upper:?} hold no key, so the page is empty and final"
+            );
+        }
+    }
+    let one = ScanRange {
+        lower: Bound::Included("c8/b"),
+        upper: Bound::Included("c8/b"),
+        ..c8_scan(8)
+    };
+    assert_eq!(
+        keys_of(&page(store, one)),
+        ["c8/b"],
+        "C8 range: equal included bounds hold their key"
+    );
+}
+
+/// C8 reverse: descending order from the upper bound, a token that resumes below the
+/// last key, and the lower bound and prefix as in a forward scan.
+fn c8_reverse<S: Store>(store: &S) {
+    let first = page(store, c8_scan(2).reverse());
+    assert_eq!(
+        keys_of(&first),
+        ["c8/\u{e9}", "c8/d"],
+        "C8 reverse: a reverse page holds the last keys of the range, descending"
+    );
+    let token = first
+        .resume
+        .as_ref()
+        .expect("C8 reverse: a full page has a token");
+    assert_eq!(
+        keys_of(&page(store, c8_scan(2).reverse().resume(token))),
+        ["c8/c", "c8/b"],
+        "C8 reverse resume: the token resumes just below the last key, and an expired key does not shorten the page"
+    );
+    let at_or_before = ScanRange {
+        upper: Bound::Included("c8/bz"),
+        ..c8_scan(1).reverse()
+    };
+    assert_eq!(
+        keys_of(&page(store, at_or_before)),
+        ["c8/b"],
+        "C8 reverse: limit 1 under an included upper bound is the last live key at or before it"
+    );
+    let down_to = ScanRange {
+        lower: Bound::Included("c8/c"),
+        ..c8_scan(8).reverse()
+    };
+    let stopped = page(store, down_to);
+    assert_eq!(
+        keys_of(&stopped),
+        ["c8/\u{e9}", "c8/d", "c8/c"],
+        "C8 reverse: a reverse scan stops at its lower bound"
+    );
+    assert_eq!(
+        stopped.resume, None,
+        "C8 reverse: a page that reached the lower bound has no token"
+    );
+    let descending: Vec<&str> = C8_KEYS.iter().rev().copied().collect();
+    assert_pages(
+        store,
+        c8_scan(1).reverse(),
+        &descending,
+        "C8 reverse paging",
+    );
+}
+
+/// C8 concurrent: commits between pages, behind the token, ahead of it, and a delete and
+/// an update ahead of it.
+fn c8_concurrent<S: Store>(store: &S) {
+    let first = page(store, c8_scan(3));
     assert_eq!(
         keys_of(&first),
         ["c8/", "c8/a", "c8/b"],
         "C8 limit: page of 3"
     );
     run(
-        &store,
+        store,
         Txn::new()
             .put("c8/aa", "behind", Cond::Absent)
             .put("c8/bz", "ahead", Cond::Absent)
@@ -729,14 +867,15 @@ pub fn c8_bounded_range_scan<B: Backend>(backend: &B) {
             .delete("c8/d", Cond::Any),
     )
     .expect("the concurrent commit applies");
-    let rest = scan_page(&store, first.resume.as_ref().expect("a token").start(), 8);
+    let token = first.resume.as_ref().expect("a token");
+    let rest = page(store, c8_scan(8).resume(token));
     assert_eq!(
         keys_of(&rest),
         ["c8/bz", "c8/c", "c8/\u{e9}"],
-        "C8 concurrent: the next page holds keys committed ahead of the token, not behind it, and not a deleted key"
+        "C8 concurrent keys: the next page holds keys committed ahead of the token, not behind it, and not a deleted key"
     );
     assert_eq!(
         rest.rows[1].1.value, b"updated",
-        "C8 concurrent: a page shows the value committed before it was read"
+        "C8 concurrent value: a page shows the value committed before it was read"
     );
 }
