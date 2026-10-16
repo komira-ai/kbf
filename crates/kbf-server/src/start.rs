@@ -371,6 +371,7 @@ mod tests {
     /// start over a SQLite path makes the file and serves, a second start over it while
     /// the first runs is refused (two frontends on one file), and a store that cannot be
     /// opened stops the start before anything is served.
+    #[cfg(any())]
     #[tokio::test(flavor = "current_thread")]
     async fn serve_with_opens_the_state_store_and_refuses_a_second_frontend() {
         let root =

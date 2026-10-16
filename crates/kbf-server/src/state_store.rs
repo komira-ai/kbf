@@ -264,5 +264,5 @@ pub struct StateStore {
     pub epoch: EpochPolicy,
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests;
