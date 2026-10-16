@@ -336,8 +336,10 @@ pub(crate) fn result_of(
 }
 
 /// Puts `usage` in the metadata of the result's `action_result` (made if the result has
-/// none): what a lease that ended without a result still counted. Only the server's
-/// reading of an OK result and of a timeout's partial result looks at that field.
+/// none): what a lease that ended without a result still counted. The server reads it
+/// from every report, failed ones included, for its `action usage:` line, before it
+/// judges the report (a made `action_result` is not a run's: its exit code is not
+/// one).
 fn carry_usage(result: &mut worker::Result, usage: &ResourceUsage) {
     let metadata = result
         .action_result

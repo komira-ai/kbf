@@ -11,6 +11,9 @@
 //! kbf-deploy linux install-units --config FILE --uninstall [--apply]
 //! kbf-deploy linux image-pull --config FILE [--image REF]... [--platform OS/ARCH] [--apply]
 //! kbf-deploy linux swap --config FILE [--kubelet-allows-swap] [--remove] [--apply]
+//! kbf-deploy linux meta-backup --meta-dir DIR [--hot-dir DIR] --out FILE [--metrics URL]
+//!                              [--unit NAME] [--ready-secs N] [--apply]
+//! kbf-deploy linux meta-verify --archive FILE --into DIR
 //! kbf-deploy mdm fetch --dir DIR [--only TOOL]... [--apply]
 //! kbf-deploy mdm install --config FILE --bin-dir DIR [--apply]
 //! kbf-deploy mdm install --config FILE --uninstall [--apply]
@@ -44,7 +47,9 @@
 //! `REFUSED: ...` on stderr). `linux install-units`, `image-pull` and `swap` change the
 //! host as root, plan by default as the `minio` subcommands do, and exit 0 done (or
 //! nothing to do), 1 a step or the check after an apply failed (`FAIL ...`), or 2
-//! refused (`REFUSED: ...` on stderr). `envoy render` only writes into the directory
+//! refused (`REFUSED: ...` on stderr). `linux meta-backup` and `meta-verify` exit 0
+//! done, 1 a failure after the stop (the unit restarted) or an archive that does not
+//! verify (`FAIL ...` on stderr), or 2 refused ([`crate::linux::meta`]). `envoy render` only writes into the directory
 //! it is given, and exits 0 done or 2 refused (`REFUSED: ...` on stderr); `envoy check`
 //! only reads, and exits 0 every check passed, 1 a check failed (`FAIL <check>: ...` on
 //! stdout) or 2 refused. `envoy apply` reads the cluster and has it validate the render in
@@ -82,7 +87,7 @@ use kbf_types::ImageRef;
 
 use crate::envoy;
 use crate::https::Client;
-use crate::linux::{self, HostError, LinuxConfig, images, install, swap};
+use crate::linux::{self, HostError, LinuxConfig, images, install, meta, swap};
 use crate::log;
 use crate::mdm::dep::{Dep, Serial};
 use crate::mdm::erase::{self, EraseArgs, Made};
@@ -244,6 +249,11 @@ enum Linux {
         #[arg(long)]
         apply: bool,
     },
+    /// Back up kbf-server's metadata log in a brief stop (as root): one tar file with
+    /// a sha256 manifest; prints the downtime.
+    MetaBackup(meta::cli::BackupArgs),
+    /// Extract a meta-backup archive into an empty directory and check every file.
+    MetaVerify(meta::cli::VerifyArgs),
     /// Make, activate and list the build swapfile (as root).
     Swap {
         /// The kit's settings, KEY=VALUE lines.
@@ -601,6 +611,10 @@ fn linux_kit<E: Exec>(
                 });
             return host_verb(done, err);
         }
+        Linux::MetaBackup(a) => {
+            return meta::cli::backup(a, exec, &meta::metrics::http_get, out, err);
+        }
+        Linux::MetaVerify(a) => return meta::cli::verify(&a, out, err),
         Linux::Swap {
             config,
             kubelet_allows_swap,
