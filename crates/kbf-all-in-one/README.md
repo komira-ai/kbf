@@ -46,11 +46,11 @@ server's own code:
   **streamed onto the write tier** (`LocalStore::stream`): each chunk is written to a
   block of its own as it arrives, then checked (length, CRC-32C), asked FindMissing,
   and committed as one `PutStaged`; the flusher checks its digest before the PUT. With
-  no hot store, or a full one, it is **streamed to the cold store**
-  (`LocalStore::put_streamed`), as a ByteStream `Write` of a large blob is: its chunks
-  pass through a queue of two (the walk waits when it is full), hashed as they go into
-  the store's write (a multipart upload on S3), and the store completes the object only
-  once they hash to the digest the walk names at the file's end. A file of at most
+  no hot store, or a full one, it is **streamed to the cold store** through the same
+  stream (`LocalStore::stream` answers a stream to the store): its chunks pass through
+  a queue of two (the walk waits when it is full), hashed as they go into the store's
+  write (a multipart upload on S3), and the store completes the object only once they
+  hash to the digest the plane claims at the commit. A file of at most
   16 MiB is kept in memory and put in a batch; a batch of 32 MiB (or 16,384 files) is
   stored as below while the walk goes on, at most four at once, and the rest when the
   walk ends, before the Directory messages and the Tree that name them. A file is

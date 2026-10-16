@@ -13,14 +13,14 @@
 //! does not match; without one each record is hashed as its ranges arrive. Nothing here
 //! skips a check the listener's path makes.
 //!
-//! Two calls have no remote counterpart. A record streamed onto the write tier as its
-//! bytes are read ([`LocalStore::stream`], over `kbf_front::RecordStream`), so a large
-//! output is never held in memory on its way into the cache: its digest is trusted at
-//! the commit as a segment upload's is with a tier, and checked by the flusher. And,
-//! without a tier or when it has no room, a record streamed straight to the object
-//! store ([`LocalStore::put_streamed`]), hashed as it passes and checked against the
-//! digest named at its end before the store completes it, as a ByteStream `Write` of a
-//! large blob is.
+//! Two calls have no remote counterpart. A record streamed as its bytes are read
+//! ([`LocalStore::stream`], over `kbf_front::RecordStream`), so a large output is never
+//! held in memory on its way into the cache: onto the write tier when it has room (its
+//! digest trusted at the commit as a segment upload's is with a tier, and checked by
+//! the flusher), else straight to the object store (hashed as it passes and checked
+//! against the digest claimed at the commit before the store completes it). And a blob
+//! of known digest streamed to the object store ([`LocalStore::put_streamed`]), as a
+//! ByteStream `Write` of a large blob with no room on a tier is.
 //!
 //! Not here yet: admission. The worker listener admits every remote call by the
 //! daemon's certificate and the deny list; a local call is admitted by nothing.
@@ -115,8 +115,8 @@ impl<M: MetaLog, O: ObjectStore + 'static> Streamed for StreamedRecord<M, O> {
     }
 }
 
-/// One record being streamed onto the server's write tier ([`LocalStore::stream`]).
-/// Dropped before it is committed, nothing is stored.
+/// One record being streamed onto the server's write tier, or to its object store
+/// ([`LocalStore::stream`]). Dropped before it is committed, nothing is stored.
 pub struct LocalStream(Box<dyn Streaming>);
 
 impl LocalStream {
@@ -139,7 +139,8 @@ impl LocalStream {
     }
 }
 
-/// A record whose bytes are on the write tier, checked, not yet committed.
+/// A record whose bytes are all written (on the write tier, or on their way to the
+/// store), checked, not yet committed.
 pub struct LocalStreamed(Box<dyn Streamed>);
 
 impl LocalStreamed {
@@ -268,9 +269,10 @@ impl LocalStore {
         self.inner.put(bytes).await
     }
 
-    /// A stream for one blob of `size` bytes onto the write tier, in a block of its own,
-    /// its bytes written as they are appended and never held here; `None` without a
-    /// write tier, when the tier has no room for it, or for a size of 0. Blocking: call
+    /// A stream for one blob of `size` bytes, its bytes written as they are appended
+    /// and never held whole: onto the write tier, in a block of its own, when it has
+    /// room for it; else straight to the object store (`kbf_front::Cache::stream`).
+    /// `None` only for a size of 0, or a cache made outside a runtime. Blocking: call
     /// it off the async runtime.
     #[must_use]
     pub fn stream(&self, size: u64) -> Option<LocalStream> {
