@@ -44,7 +44,7 @@ fn never() -> std::io::Result<std::future::Pending<()>> {
 }
 
 /// Catches a handle that is not the storage the listener serves (the daemon half would
-/// read and write another store than the farm reaches over gRPC), and a start line that
+/// read and write another store than other nodes reach over gRPC), and a start line that
 /// is not `kbf storage`'s: a blob put through the handle is read back over gRPC from the
 /// listener, and one written over gRPC is read through the handle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
