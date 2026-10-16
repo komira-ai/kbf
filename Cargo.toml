@@ -54,6 +54,9 @@ libc = "0.2.190"
 # xz for the tar.xz archives `cargo xtask fetch` unpacks; pure Rust, no C liblzma.
 lzma-rs = "0.3.0"
 hmac = "0.13.0"
+# The state store's Postgres backend (kbf-state, feature `postgres`): the blocking client,
+# no TLS (an `sslmode=require` URL is refused rather than downgraded).
+postgres = "0.19.10"
 # The MDM gate serves its mutual-TLS listener with hyper directly (axum's own `serve`
 # takes plain TCP only). Both are already in the tree through axum and tonic.
 hyper = { version = "1.12.0", default-features = false }
