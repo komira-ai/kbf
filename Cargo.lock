@@ -1882,6 +1882,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-storage"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "kbf-auth",
+ "kbf-meta",
+ "kbf-proto",
+ "kbf-types",
+ "thiserror",
+ "tonic",
+]
+
+[[package]]
 name = "kbf-store"
 version = "0.1.0"
 dependencies = [
