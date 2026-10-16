@@ -1,7 +1,7 @@
 //! The cache through the storage boundary: [`CacheStorage`] as an `Arc<dyn Storage>`.
 //! The data plane's checks run over it in `kbf-all-in-one` (`tests/storage_seam.rs`);
 //! these cover what they do not: the action cache, and that every error answers the
-//! gRPC code and message the cache's own error answers.
+//! gRPC code and message the cache's own error answers. Streamed puts: `tests/storage_stream.rs`.
 
 mod common;
 
@@ -107,13 +107,6 @@ async fn the_action_cache_answers_through_the_trait() {
         storage.action_result(&action).await.expect("get"),
         Some((stored, result))
     );
-}
-
-/// Catches the adapter offering a stream the cache cannot take: today a caller stores
-/// a blob whole.
-#[test]
-fn the_cache_offers_no_stream_yet() {
-    assert!(storage().stream(1).is_none());
 }
 
 /// Catches an error that answers a caller differently through the boundary than the
