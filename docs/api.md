@@ -471,7 +471,7 @@ given up for that reason (`silent`, `replaced`, `reconnected`, `not_started`,
 `infra`), whatever the action's end: an action killed for its own limit, run again and
 then OK is kept by `out_of_memory`. `?memory_kill=own_limit` (or `node_pressure`) keeps
 the rows with a lease killed that way; `none`, the rows with no lease killed for
-memory. `?sort=<phase>` lists the rows that measured that phase (`durations` above),
+memory, cache-hit rows (which have no leases) included. `?sort=<phase>` lists the rows that measured that phase (`durations` above),
 longest first, ties in row order; its pages resume after the last row listed. No row
 is listed twice; a row whose `queue_ms` grows past that point after it was passed (it
 was requeued and granted again) is not listed again, and a row that measures the

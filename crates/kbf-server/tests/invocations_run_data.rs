@@ -13,7 +13,8 @@ use kbf_invocation::{
 use kbf_sched::RequeueReason;
 use kbf_types::{Digest, Failure, OperationId};
 use pages::{
-    OPEN, Server, at, digest, ended, finished, granted, lease, queued, requeued, started, text,
+    OPEN, Server, at, digest, ended, finished, granted, hit, lease, listing, queued, requeued,
+    started, text,
 };
 use serde_json::{Value, json};
 
@@ -399,12 +400,14 @@ async fn a_sorted_page_finds_the_longest_rows_late_in_the_record() {
 /// Catches (ui-data 9, U1 red, and 6.2): `?requeue_reason=out_of_memory` missing an
 /// action whose kill was run again and ended OK, or keeping one requeued for another
 /// reason; `?memory_kill=` keeping the wrong rows (`none` keeping a killed row, a
-/// kind keeping another kind's); a `next_page` that drops the filter; and a value the
-/// route does not know answered anything but `400`.
+/// kind keeping another kind's, `none` dropping a cache-hit row, which has no lease); a
+/// `next_page` that drops the filter; and a value the route does not know answered
+/// anything but `400`.
 #[tokio::test]
 async fn filters_keep_rows_by_requeue_reason_and_memory_kill() {
     let server = Server::with(OPEN);
     let (oom, silent, busy, plain) = (digest(1), digest(2), digest(3), digest(4));
+    let hit_row = digest(5);
     let mut events = Vec::new();
     for (op, action, reason) in [
         (
@@ -437,6 +440,12 @@ async fn filters_keep_rows_by_requeue_reason_and_memory_kill() {
             at(4),
         ));
     }
+    events.push(hit(
+        "f",
+        at(5),
+        hit_row,
+        listing(digest(59), 0, &[], (None, None)),
+    ));
     server.feed(events).await;
     let base = "/v1/invocations/f/actions";
     for (query, want) in [
@@ -445,7 +454,7 @@ async fn filters_keep_rows_by_requeue_reason_and_memory_kill() {
         ("requeue_reason=infra", vec![]),
         ("memory_kill=own_limit", vec![oom]),
         ("memory_kill=node_pressure", vec![busy]),
-        ("memory_kill=none", vec![silent, plain]),
+        ("memory_kill=none", vec![silent, plain, hit_row]),
         ("memory_kill=own_limit&requeue_reason=silent", vec![]),
     ] {
         let page = server.ok(&format!("{base}?{query}")).await;
