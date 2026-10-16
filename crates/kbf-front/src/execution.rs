@@ -45,8 +45,8 @@
 //!
 //! When the drain runs out of time ([`Closer::close`]), every open Execute and
 //! WaitExecution stream that is not done ends UNAVAILABLE (a client that retries
-//! sees it; Buck2 fails the action); one opened after that ends UNAVAILABLE after its
-//! first operation. A WaitExecution on an operation kept finished is answered even
+//! sees it; Buck2 fails the action); a WaitExecution opened after that ends UNAVAILABLE
+//! after its first operation. A WaitExecution on an operation kept finished is answered even
 //! then: its first operation is the done one, and the stream ends there.
 //!
 //! What v0 sends to the scheduler: QoS `ci` for every call (the `x-kbf-qos` header is

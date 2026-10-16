@@ -326,8 +326,8 @@ async fn failures_and_abandoned_operations_end_the_stream() {
 
 /// Catches (issue #168): a server going away that leaves open Execute and
 /// WaitExecution streams to die with the connection (UNKNOWN on the client) instead of
-/// ending them UNAVAILABLE, which clients retry; a stream opened after the close that
-/// stays open; and a done operation already there lost to the close (each of eight
+/// ending them UNAVAILABLE, which clients retry; a WaitExecution opened after the close
+/// that stays open; an Execute after the close that is not refused; and a done operation already there lost to the close (each of eight
 /// streams must get its done operation, so a close noticed first fails all but once in
 /// 256 runs); and a WaitExecution after the close on an operation kept finished (issue
 /// #165) ended UNAVAILABLE or left open instead of answered.
@@ -388,7 +388,18 @@ async fn closing_ends_open_streams_unavailable() {
     assert!(done.done, "{done:?}");
     assert_eq!(next(&mut kept).await.expect("healthy"), None);
 
-    let mut late = start(&farm, &job.action).await.expect("Execute");
+    // An Execute after the close is refused at open (as in a drain). A WaitExecution
+    // on a running operation opens, sends its first operation and ends UNAVAILABLE.
+    let refused = start(&farm, &job.action).await.expect_err("Execute after");
+    assert_eq!(refused.code(), Code::Unavailable, "{refused:?}");
+    let mut late = farm
+        .exec()
+        .wait_execution(WaitExecutionRequest {
+            name: "operations/0".to_owned(),
+        })
+        .await
+        .expect("WaitExecution after the close")
+        .into_inner();
     next(&mut late).await.expect("healthy").expect("queued");
     let gone = next(&mut late).await.expect_err("opened after the close");
     assert_eq!(gone.code(), Code::Unavailable, "{gone:?}");
