@@ -28,6 +28,7 @@ impl Source for Api<'_> {
         Ok(Fetched {
             status: answer.code,
             body: answer.body,
+            headers: Vec::new(),
         })
     }
 }

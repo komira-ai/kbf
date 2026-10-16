@@ -23,10 +23,25 @@ pub(crate) struct Fake {
 
 impl Fake {
     /// `url` answers `status` with `body`.
-    pub(crate) fn with(mut self, url: &str, status: u16, body: impl Into<Vec<u8>>) -> Self {
+    pub(crate) fn with(self, url: &str, status: u16, body: impl Into<Vec<u8>>) -> Self {
+        self.with_headers(url, status, &[], body)
+    }
+
+    /// `url` answers `status` with `headers` and `body`.
+    pub(crate) fn with_headers(
+        mut self,
+        url: &str,
+        status: u16,
+        headers: &[(&str, &str)],
+        body: impl Into<Vec<u8>>,
+    ) -> Self {
         let fetched = Fetched {
             status,
             body: body.into(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
         };
         self.answers.insert(url.to_owned(), Ok(fetched));
         self
@@ -57,6 +72,7 @@ impl Source for Fake {
             Ok(Fetched {
                 status: 404,
                 body: br#"{"error": "no such route"}"#.to_vec(),
+                headers: Vec::new(),
             })
         });
         ready(answer.map_err(SourceError))
@@ -249,6 +265,58 @@ fn every_answer_carries_the_csp_and_nosniff() {
         );
         assert!(headers.contains_key("content-type"), "{path}");
     }
+}
+
+/// Catches: a page that answers the API's `401` without its `WWW-Authenticate`
+/// (RFC 9110 15.5.2 requires one), or its `429` or `503` without its `Retry-After`
+/// (mutants: the headers not passed on by the Builds page, or by a failed Build
+/// page); any other API header passed on (mutant: the allowlist check dropped); one
+/// passed on with a page whose status is not the API's (a log read that failed).
+#[test]
+fn a_page_with_the_apis_status_passes_on_the_headers_it_needs() {
+    let base = format!("/v1/invocations/{ID}");
+    let challenge = ("WWW-Authenticate", "Bearer realm=\"kbf\"");
+    let cases = [
+        (401, challenge, "www-authenticate", "Bearer realm=\"kbf\""),
+        (429, ("retry-after", "7"), "retry-after", "7"),
+        (503, ("Retry-After", "30"), "retry-after", "30"),
+    ];
+    for (status, header, name, value) in cases {
+        let fake = Fake::default().with_headers(
+            &base,
+            status,
+            &[
+                header,
+                ("set-cookie", "s=1"),
+                ("content-type", "application/json"),
+            ],
+            r#"{"error": "no"}"#,
+        );
+        for path in [format!("/ui?id={ID}"), format!("/ui/builds/{ID}")] {
+            let answer = render(&fake, &path);
+            assert_eq!(answer.status(), status, "{path}");
+            let headers = answer.headers();
+            assert!(headers.contains(&(name, value)), "{path}: {headers:?}");
+            assert_eq!(headers.len(), 4, "{path}: {headers:?}");
+            assert!(
+                headers.contains(&("content-type", "text/html; charset=utf-8")),
+                "{path}: {headers:?}"
+            );
+        }
+    }
+
+    // A log read that answered 429: the page is 200, so the header is not passed on.
+    let blob = "/v1/blobs/x";
+    let stderr = json!({"digest": digest('5', 10), "available": true, "href": blob});
+    let fake = Fake::default()
+        .json(
+            &format!("{base}/actions/{}", action_digest()),
+            &action(&stderr),
+        )
+        .with_headers(blob, 429, &[("retry-after", "7")], "{}");
+    let answer = render(&fake, &action_page());
+    assert_eq!(answer.status(), 200);
+    assert_eq!(answer.headers().len(), 3, "{:?}", answer.headers());
 }
 
 /// Catches (`docs/design/ui-data.md` 8, red test of U6): a stderr of

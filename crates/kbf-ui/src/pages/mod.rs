@@ -71,7 +71,7 @@ pub(crate) fn failed(
         });
         problem(h, e);
     });
-    Answer::html(e.status(), body)
+    Answer::html(e.status(), body).passing_on(e.headers())
 }
 
 /// A read's failure as a note on the page.
@@ -111,9 +111,9 @@ pub(crate) async fn builds<S: Source>(source: &S, query: &str) -> Answer {
         Some(id) => Some(r.json::<Invocation>(&invocation_url(id)).await),
         None => None,
     };
-    let status = match &found {
-        Some(Err(e)) => e.status(),
-        _ => 200,
+    let (status, passed_on) = match &found {
+        Some(Err(e)) => (e.status(), e.headers()),
+        _ => (200, &[][..]),
     };
     let body = layout::page(BUILDS.name, PREFIX, r.asked(), |h| {
         h.el("h1", &[], |h| {
@@ -142,7 +142,7 @@ pub(crate) async fn builds<S: Source>(source: &S, query: &str) -> Answer {
             Some(Err(e)) => problem(h, e),
         }
     });
-    Answer::html(status, body)
+    Answer::html(status, body).passing_on(passed_on)
 }
 
 /// The id form; `id` fills it in.

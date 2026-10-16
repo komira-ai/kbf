@@ -55,6 +55,10 @@ pub struct Fetched {
     pub status: u16,
     /// The body.
     pub body: Vec<u8>,
+    /// The answer's headers, any or all of them. A page that answers with the API's
+    /// own status passes on the ones that status depends on, `WWW-Authenticate` and
+    /// `Retry-After` (RFC 9110 11.6.1 and 10.2.3), and no others.
+    pub headers: Vec<(String, String)>,
 }
 
 /// The read API could not be asked.
@@ -76,6 +80,8 @@ pub struct Answer {
     status: u16,
     content_type: &'static str,
     body: Vec<u8>,
+    /// The read API's headers a page with its status passes on.
+    passed_on: Vec<(&'static str, String)>,
 }
 
 impl Answer {
@@ -86,7 +92,14 @@ impl Answer {
             status,
             content_type: Self::HTML,
             body: body.into_bytes(),
+            passed_on: Vec::new(),
         }
+    }
+
+    /// This answer with `headers` of the read API's answer added.
+    fn passing_on(mut self, headers: &[(&'static str, String)]) -> Self {
+        self.passed_on.extend_from_slice(headers);
+        self
     }
 
     /// The HTTP status.
@@ -95,15 +108,18 @@ impl Answer {
         self.status
     }
 
-    /// Every header of the answer: `Content-Type`, `Content-Security-Policy` and
-    /// `X-Content-Type-Options`.
+    /// Every header of the answer: `Content-Type`, `Content-Security-Policy`,
+    /// `X-Content-Type-Options`, and, on a page that answers with the read API's own
+    /// status, the API's `WWW-Authenticate` and `Retry-After` when it sent them.
     #[must_use]
-    pub const fn headers(&self) -> [(&'static str, &'static str); 3] {
-        [
+    pub fn headers(&self) -> Vec<(&'static str, &str)> {
+        let fixed = [
             ("content-type", self.content_type),
             ("content-security-policy", CONTENT_SECURITY_POLICY),
             ("x-content-type-options", "nosniff"),
-        ]
+        ];
+        let passed_on = self.passed_on.iter().map(|(k, v)| (*k, v.as_str()));
+        fixed.into_iter().chain(passed_on).collect()
     }
 
     /// The body.
@@ -123,6 +139,7 @@ pub async fn respond<S: Source + Sync>(source: &S, path: &str, query: &str) -> A
             status: 200,
             content_type: "text/css; charset=utf-8",
             body: CSS.as_bytes().to_vec(),
+            passed_on: Vec::new(),
         };
     }
     let rest = match path.strip_prefix(PREFIX) {

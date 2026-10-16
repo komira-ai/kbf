@@ -70,6 +70,8 @@ pub(crate) enum ReadError {
         url: String,
         status: u16,
         message: String,
+        /// The answer's headers that a page with its status passes on.
+        headers: Vec<(&'static str, String)>,
     },
     /// The answer is not the document the page expects.
     #[error("{url} answered a document this page cannot read: {why}")]
@@ -85,6 +87,15 @@ impl ReadError {
             Self::Status { status, .. } => *status,
             Self::Undeclared { .. } => 500,
             Self::Unreachable { .. } | Self::Malformed { .. } => 502,
+        }
+    }
+
+    /// The headers a page answering [`Self::status`] passes on: the API's
+    /// `WWW-Authenticate` and `Retry-After`, when it answered a status.
+    pub(crate) fn headers(&self) -> &[(&'static str, String)] {
+        match self {
+            Self::Status { headers, .. } => headers,
+            _ => &[],
         }
     }
 
@@ -149,14 +160,18 @@ impl<'a, S: Source> Reader<'a, S> {
                 url: url.to_owned(),
             });
         }
-        let Fetched { status, body } =
-            self.source
-                .get(url)
-                .await
-                .map_err(|e| ReadError::Unreachable {
-                    url: url.to_owned(),
-                    why: e.to_string(),
-                })?;
+        let Fetched {
+            status,
+            body,
+            headers,
+        } = self
+            .source
+            .get(url)
+            .await
+            .map_err(|e| ReadError::Unreachable {
+                url: url.to_owned(),
+                why: e.to_string(),
+            })?;
         if status == 200 {
             return Ok(body);
         }
@@ -164,8 +179,28 @@ impl<'a, S: Source> Reader<'a, S> {
             url: url.to_owned(),
             status,
             message: error_message(&body),
+            headers: passed_on(headers),
         })
     }
+}
+
+/// The API headers a page that answers with the API's status passes on, by the
+/// names a page answer gives them: the ones that status depends on (RFC 9110 15.5.2
+/// requires a `401` to carry `WWW-Authenticate`; `Retry-After` tells a client of a
+/// `429` or `503` when to ask again).
+const PASSED_ON: [&str; 2] = ["www-authenticate", "retry-after"];
+
+/// The headers of `headers` in [`PASSED_ON`], in their order.
+fn passed_on(headers: Vec<(String, String)>) -> Vec<(&'static str, String)> {
+    headers
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let name = PASSED_ON
+                .into_iter()
+                .find(|p| p.eq_ignore_ascii_case(&name))?;
+            Some((name, value))
+        })
+        .collect()
 }
 
 /// The `error` string of an API error body, with the `records_since` of a `no_record`
