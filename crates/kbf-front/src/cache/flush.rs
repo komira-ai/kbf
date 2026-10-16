@@ -138,10 +138,10 @@ impl<M: MetaLog, O: ObjectStore> Reading<M, O> {
         let piece = self.piece(start, len).await;
         // A piece that failed ends the body; the spans left are never read.
         self.done = piece.is_err();
-        if start + len == end {
+        // The front span, read just above, moves past the piece; once read, it goes.
+        self.spans[0].0 += len;
+        if self.spans[0].0 == end {
             self.spans.pop_front();
-        } else if let Some(front) = self.spans.front_mut() {
-            front.0 += len;
         }
         Some((piece, self))
     }
