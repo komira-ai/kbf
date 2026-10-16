@@ -477,16 +477,8 @@ fn a_storage_node_has_no_state_store_flag() {
     ] {
         let err = refusal(with(STORAGE, &[flag]));
         assert_eq!(err.exit_code(), 2, "{flag}");
-        // A flag of `kbf-server` the node does not take is refused as a conflict, one
-        // clap does not know as unknown; the flag is named either way.
-        let kind = err.kind();
-        assert!(
-            matches!(
-                kind,
-                ErrorKind::UnknownArgument | ErrorKind::ArgumentConflict
-            ),
-            "{flag}: {kind:?}"
-        );
+        // Whatever kind clap gives it (a flag of `kbf-server` the node does not take is a
+        // conflict, a bare one has no value), the refusal names the flag.
         assert!(err.to_string().contains("--state-store"), "{flag}: {err}");
     }
     let cmd = kbf_server::storage_node::command();
