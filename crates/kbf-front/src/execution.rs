@@ -89,7 +89,6 @@ use bytes::Bytes;
 use futures::{Stream, stream};
 use kbf_auth::{Authorizers, authorize};
 use kbf_caps::FromPlatformError;
-use kbf_objstore::ObjectStore;
 use kbf_proto::google::longrunning::{Operation, operation};
 use kbf_proto::google::rpc::{
     self, ErrorInfo, PreconditionFailure, precondition_failure::Violation,
@@ -100,6 +99,7 @@ use kbf_proto::reapi::{
     ExecutedActionMetadata, WaitExecutionRequest, execution_stage,
 };
 use kbf_sched::Request;
+use kbf_storage::StorageError;
 use kbf_types::{ActionKey, Digest, LeaseKind, Platform, Qos, Resources};
 use prost::Message;
 use prost_types::Any;
@@ -111,9 +111,8 @@ use tracing::Instrument as _;
 use kbf_auth::AuthenticationMetadata;
 use kbf_invocation::{CallKind, ExecuteAnswer};
 
-use crate::cache::{Cache, CacheError};
+use crate::backend::Backend;
 use crate::described::Described;
-use crate::meta_log::MetaLog;
 use crate::metrics::{CacheMetrics, OpenExecute};
 use crate::recorder::{ActionLabel, ExecuteCall, Recorder, listing};
 use crate::request_metadata::CallMetadata;
@@ -402,10 +401,11 @@ impl Drop for Presubmit<'_> {
     }
 }
 
-/// The `Execution` service over a [`Cache`] and a [`Dispatch`].
+/// The `Execution` service over a [`Backend`] (a cache, or a storage node) and a
+/// [`Dispatch`].
 #[derive(Debug)]
-pub struct ExecutionService<M, O, D> {
-    cache: Arc<Cache<M, O>>,
+pub struct ExecutionService<D> {
+    cache: Backend,
     dispatch: Arc<D>,
     closing: Closing,
     progress: Progress,
@@ -421,18 +421,18 @@ const EXECUTE: &str = "/build.bazel.remote.execution.v2.Execution/Execute";
 /// The gRPC path of WaitExecution, as calls are logged.
 const WAIT_EXECUTION: &str = "/build.bazel.remote.execution.v2.Execution/WaitExecution";
 
-impl<M, O, D> ExecutionService<M, O, D> {
-    /// The service over `cache` and `dispatch`, whose streams end when `closing` does,
-    /// each call authorized by `authorizers`.
+impl<D> ExecutionService<D> {
+    /// The service over `cache` (a cache or a [`Backend`]) and `dispatch`, whose
+    /// streams end when `closing` does, each call authorized by `authorizers`.
     #[must_use]
     pub fn with_authorizers(
-        cache: Arc<Cache<M, O>>,
+        cache: impl Into<Backend>,
         dispatch: Arc<D>,
         closing: Closing,
         authorizers: Arc<Authorizers>,
     ) -> Self {
         Self {
-            cache,
+            cache: cache.into(),
             dispatch,
             closing,
             progress: Progress::off(),
@@ -472,10 +472,8 @@ impl<M, O, D> ExecutionService<M, O, D> {
 pub type OperationStream = Pin<Box<dyn Stream<Item = Result<Operation, Status>> + Send>>;
 
 #[tonic::async_trait]
-impl<M, O, D> Execution for ExecutionService<M, O, D>
+impl<D> Execution for ExecutionService<D>
 where
-    M: MetaLog,
-    O: ObjectStore + 'static,
     D: Dispatch,
 {
     type ExecuteStream = OperationStream;
@@ -533,10 +531,8 @@ where
     }
 }
 
-impl<M, O, D> ExecutionService<M, O, D>
+impl<D> ExecutionService<D>
 where
-    M: MetaLog,
-    O: ObjectStore + 'static,
     D: Dispatch,
 {
     /// Execute, once authorized: an action-cache hit, or the operation's stream. `open`
@@ -609,11 +605,7 @@ where
     }
 }
 
-impl<M, O, D> ExecutionService<M, O, D>
-where
-    M: MetaLog,
-    O: ObjectStore,
-{
+impl<D> ExecutionService<D> {
     /// Reads the action and checks its inputs are all held; the scheduler's request,
     /// with no call to record yet, and the Command digest the action names.
     async fn submission(
@@ -683,7 +675,7 @@ where
     async fn read_input(&self, digest: &Digest) -> Result<Option<Bytes>, Status> {
         match self.cache.read_blob(digest).await {
             Ok(bytes) => Ok(Some(bytes)),
-            Err(CacheError::NotFound(_)) => Ok(None),
+            Err(StorageError::NotFound(_)) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
