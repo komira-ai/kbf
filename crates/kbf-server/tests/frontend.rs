@@ -1220,3 +1220,78 @@ async fn a_shutdown_that_cannot_be_made_is_a_refused_start() {
     .expect("refused");
     assert_eq!(refused.to_string(), "no signal handlers");
 }
+
+/// Catches a `kbf frontend` that lacks what `kbf-server` has for its drain: the operator
+/// endpoint (`GET`/`POST /v1/frontend/drain`, one shared `Drain`), its counts of open
+/// streams and queued operations, and `Drain::close` (the second stop signal's action).
+/// An Execute waits for a worker: the status reads one stream and one queued operation;
+/// a `POST` with the token drains (`/readyz` 503); a close ends the stream UNAVAILABLE
+/// and the serving future. Mutant: the frontend's API router given a
+/// drain that is not the one its serving future drains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let node = Node::start().await;
+    let url = format!("--storage=http://{}", node.addr);
+    let token = "kbf-test-token-0123456789abcdef0123456789";
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("front-token-{}", std::process::id()));
+    std::fs::write(&path, format!("{token}\n")).expect("write the token");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let token_flag = format!("--api-token-file={}", path.display());
+    let (_stop, stopped) = oneshot::channel::<()>();
+    let handle = start_frontend(&flags(&[&url, &token_flag]).expect("flags"), || {
+        Ok(async move {
+            let _ = stopped.await;
+        })
+    })
+    .expect("starts");
+    let (reapi, worker, api) = (handle.reapi, handle.worker, handle.api.expect("an API"));
+    let drain = handle.drain();
+    let served = tokio::spawn(handle.serve());
+    let client = Client::connect(reapi, worker).await;
+    let job = Job::new("drained on a frontend", &[]);
+    client.upload(&job.blobs()).await;
+    let mut ops = client.execute(&job.action).await;
+    ops.message().await.expect("healthy").expect("QUEUED");
+
+    let call = |token: Option<&'static str>, post: bool| async move {
+        tokio::task::spawn_blocking(move || {
+            let client = kbf_server::api_client::OperatorClient::new(api, token.map(str::to_owned));
+            let path = kbf_server::api::FRONTEND_DRAIN;
+            if post {
+                client.post(path, "")
+            } else {
+                client.get(path)
+            }
+            .expect("a reply")
+        })
+        .await
+        .expect("the call runs")
+    };
+    let status = call(None, false).await;
+    let want = serde_json::json!({"draining": false, "open_executions": 1, "queued_operations": 1});
+    assert_eq!(
+        serde_json::from_str::<Value>(&status.body).expect("JSON"),
+        want
+    );
+    assert_eq!(call(None, true).await.status, 401);
+    let begun = call(Some(token), true).await;
+    assert_eq!(begun.status, 200, "{begun:?}");
+    assert!(drain.is_draining());
+    assert_eq!(get(api, "/readyz").await.0, 503);
+
+    drain.close();
+    let ended = tokio::time::timeout(PROMPT, ops.message())
+        .await
+        .expect("the stream ends after a close")
+        .expect_err("with an error");
+    assert_eq!(ended.code(), tonic::Code::Unavailable, "{ended:?}");
+    drop(ops);
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(30), served)
+        .await
+        .expect("the frontend stops")
+        .unwrap()
+        .expect("served");
+}

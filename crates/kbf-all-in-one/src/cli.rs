@@ -72,22 +72,7 @@ pub struct Flags {
 /// A `--driver` other than `container`, `--cas`, or
 /// a relative `--data-dir` (which the state file would be put in).
 pub fn parse(matches: &ArgMatches) -> Result<Flags, clap::Error> {
-    let refuse = |message: String| command().error(ErrorKind::ArgumentConflict, message);
-    if matches.value_source("cas").is_some() {
-        return Err(refuse(
-            "--cas: the daemon half reads and writes blobs through calls into the server \
-             half of this process, not over the network"
-                .to_owned(),
-        ));
-    }
-    let mut drivers = matches.get_raw("drivers").into_iter().flatten();
-    if let Some(other) = drivers.find(|d| *d != "container") {
-        return Err(refuse(format!(
-            "--driver {}: kbf-all-in-one runs the container driver only; run kbf-daemon \
-             for the others",
-            other.to_string_lossy()
-        )));
-    }
+    refuse_remote_plane(matches, "kbf-all-in-one", "server", command)?;
     let daemon = kbf_node::Cli::from_arg_matches(matches)?;
     let mut server = kbf_server::Args::from_arg_matches(matches)?;
     if server.state_store.is_none() {
@@ -96,16 +81,44 @@ pub fn parse(matches: &ArgMatches) -> Result<Flags, clap::Error> {
             .cloned()
             .unwrap_or_else(|| PathBuf::from(kbf_node::DEFAULT_DATA_DIR));
         if !dir.is_absolute() {
-            return Err(refuse(format!(
+            let said = format!(
                 "--data-dir {}: must be absolute (the state file {STATE_FILE} goes in it)",
                 dir.display()
-            )));
+            );
+            return Err(command().error(ErrorKind::ArgumentConflict, said));
         }
         server.state_store = Some(kbf_server::StateStoreUri::Sqlite(dir.join(STATE_FILE)));
     }
     // The thread flags matched are the daemon's.
     server.threads = kbf_threads::PoolArgs::default();
     Ok(Flags { server, daemon })
+}
+
+/// Refuses, for a process whose daemon half reads and writes blobs through calls into
+/// its `half` (`server` or `storage`), `--cas` and any `--driver` but `container`, the
+/// error made by `name`'s command line `cmd`.
+pub(crate) fn refuse_remote_plane(
+    matches: &ArgMatches,
+    name: &str,
+    half: &str,
+    cmd: fn() -> Command,
+) -> Result<(), clap::Error> {
+    let refuse = |message: String| cmd().error(ErrorKind::ArgumentConflict, message);
+    if matches.value_source("cas").is_some() {
+        return Err(refuse(format!(
+            "--cas: the daemon half reads and writes blobs through calls into the {half} \
+             half of this process, not over the network"
+        )));
+    }
+    let mut drivers = matches.get_raw("drivers").into_iter().flatten();
+    if let Some(other) = drivers.find(|d| *d != "container") {
+        return Err(refuse(format!(
+            "--driver {}: {name} runs the container driver only; run kbf-daemon for the \
+             others",
+            other.to_string_lossy()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
