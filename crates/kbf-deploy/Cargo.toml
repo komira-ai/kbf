@@ -26,6 +26,8 @@ publish.workspace = true
 # base64 encodes the Basic auth of the MDM services' APIs.
 # `mdm erase-request` writes and checks the request with kbf-mdm's own parser and
 # signature check, and reads the security key's public half with ssh-key.
+# `host state-backup` and `host state-restore` work on the SQLite state store's file
+# through kbf-state's own backup, check, lock and restore; time stamps the kept file.
 
 [[bin]]
 name = "kbf-deploy"
@@ -39,6 +41,7 @@ hex.workspace = true
 httparse.workspace = true
 kbf-host.workspace = true
 kbf-mdm.workspace = true
+kbf-state.workspace = true
 kbf-types.workspace = true
 plist.workspace = true
 rustls.workspace = true
@@ -49,6 +52,7 @@ sha2.workspace = true
 ssh-key.workspace = true
 tar.workspace = true
 thiserror.workspace = true
+time.workspace = true
 x509-parser.workspace = true
 zip.workspace = true
 
@@ -59,6 +63,8 @@ kbf-mdm = { workspace = true, features = ["testkit"] }
 # The certificates of the HTTPS servers the `mdm` tests run.
 rcgen.workspace = true
 rustix = { workspace = true, features = ["process"] }
+# Databases a state restore must refuse: another application's, a damaged one.
+rusqlite.workspace = true
 
 [lints]
 workspace = true

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use super::SqliteError;
-use super::guard::{filesystem_type, refuse_network_filesystem, take_lock};
+use super::guard::StoreLock;
 use super::schema::{bump_epoch, configure, epoch, first_i64, first_string, require_state_store};
 
 /// `dest`'s name with `suffix` after it.
@@ -36,10 +36,39 @@ pub fn restore(backup: &Path, dest: &Path) -> Result<u64, SqliteError> {
 }
 
 fn restore_into(backup: &Path, dest: &Path) -> Result<u64, SqliteError> {
-    refuse_network_filesystem(dest, &filesystem_type)?;
-    let _lock = take_lock(dest)?;
+    let _lock = StoreLock::take(dest)?;
+    restore_with(backup, dest, &leave_as_copied)
+}
+
+/// The staged copy as `fs::copy` left it.
+fn leave_as_copied(_staging: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// [`restore`] under a lock the caller already holds, so that it can work on the file
+/// before the restore under the same lock (keep a copy of it). `prepare` is given the
+/// staged copy (`<file>.restoring`, checked, its epoch stamped, closed) just before it
+/// is renamed over the file, to give it its owner and mode; when it fails, nothing is
+/// replaced.
+///
+/// # Errors
+/// As [`restore`], less the lock's; and `prepare`'s.
+pub fn restore_locked(
+    lock: &StoreLock,
+    backup: &Path,
+    prepare: &dyn Fn(&Path) -> io::Result<()>,
+) -> Result<u64, SqliteError> {
+    restore_with(backup, lock.db(), prepare).map_err(|error| error.at(lock.db()))
+}
+
+fn restore_with(
+    backup: &Path,
+    dest: &Path,
+    prepare: &dyn Fn(&Path) -> io::Result<()>,
+) -> Result<u64, SqliteError> {
     let staging = beside(dest, ".restoring");
     let restored = stage(backup, dest, &staging).and_then(|epoch| {
+        prepare(&staging)?;
         install(&staging, dest)?;
         Ok(epoch)
     });

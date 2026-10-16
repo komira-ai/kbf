@@ -89,6 +89,75 @@ pub(super) fn take_lock(db: &Path) -> Result<File, SqliteError> {
     }
 }
 
+/// The lock a [`super::SqliteStore`] holds on its state file for as long as it is open,
+/// taken instead by a tool that works on the file while no store may have it (a
+/// restore). It is the same `flock` on the same `<file>.lock`, so a store cannot open
+/// the file while this is held, and this cannot be taken while a store is open.
+#[derive(Debug)]
+pub struct StoreLock {
+    db: PathBuf,
+    _file: File,
+}
+
+impl StoreLock {
+    /// Takes the lock of the state file `db`, creating the lock file if missing, after the
+    /// same network filesystem check a store makes.
+    ///
+    /// # Errors
+    /// [`SqliteError::Locked`] while a process (a store) holds it;
+    /// [`SqliteError::NetworkFs`] on a network filesystem; otherwise the failing call.
+    pub fn take(db: &Path) -> Result<StoreLock, SqliteError> {
+        refuse_network_filesystem(db, &filesystem_type)?;
+        let file = take_lock(db)?;
+        Ok(StoreLock {
+            db: db.to_owned(),
+            _file: file,
+        })
+    }
+
+    /// Whether a process holds the lock of the state file `db` now, found without
+    /// creating or changing anything: an absent lock file is a lock nobody holds (a store
+    /// creates it before it opens the file). The answer can be stale the moment it is
+    /// given, so only a plan uses it; a change takes the lock.
+    ///
+    /// # Errors
+    /// The lock file cannot be opened or the lock call failed.
+    pub fn is_held(db: &Path) -> Result<bool, SqliteError> {
+        let lock = lock_path(db);
+        match File::open(&lock) {
+            Ok(file) => held(db, lock, file.try_lock()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(SqliteError::Io(format!("{}: {error}", lock.display()))),
+        }
+    }
+
+    /// The state file this locks.
+    #[must_use]
+    pub fn db(&self) -> &Path {
+        &self.db
+    }
+
+    /// The lock file: the state file's name with `.lock` after it.
+    #[must_use]
+    pub fn lock_file(&self) -> PathBuf {
+        lock_path(&self.db)
+    }
+}
+
+/// What a probing `try_lock` says: taken (and released again as the file closes) means
+/// nobody holds it, `WouldBlock` that someone does; any other failure is an error.
+pub(super) fn held(
+    db: &Path,
+    lock: PathBuf,
+    attempt: Result<(), TryLockError>,
+) -> Result<bool, SqliteError> {
+    match attempt {
+        Ok(()) => Ok(false),
+        Err(TryLockError::WouldBlock) => Ok(true),
+        Err(error) => Err(lock_failed(db, lock, error)),
+    }
+}
+
 /// What a refused `try_lock` means: `Locked` when another descriptor holds the lock (the
 /// one case that means "another process is using this file"), and an I/O error for any
 /// other failure of the call, which says nothing about who holds the file.

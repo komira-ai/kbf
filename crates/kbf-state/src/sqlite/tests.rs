@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::guard::{
-    filesystem_type, lock_failed, lock_path, network_filesystem, refuse_network_filesystem,
+    filesystem_type, held, lock_failed, lock_path, network_filesystem, refuse_network_filesystem,
 };
 use super::read::changes_after_head;
 use super::restore::ignore_not_found;
@@ -138,6 +138,24 @@ fn a_lock_call_that_failed_is_not_a_held_lock() {
         "the text names the lock file: {failed}"
     );
 }
+// Catches a lock probe that takes a refused lock for a free one (a restore would plan to
+// run under a live store), or a failed lock call for either answer.
+#[test]
+fn a_probe_tells_a_held_lock_from_a_free_one_and_a_failure() {
+    let db = Path::new("/x/state.db");
+    assert!(!held(db, lock_path(db), Ok(())).expect("free"));
+    assert!(held(db, lock_path(db), Err(fs::TryLockError::WouldBlock)).expect("held"));
+    let failed = held(
+        db,
+        lock_path(db),
+        Err(fs::TryLockError::Error(io::Error::from(
+            io::ErrorKind::PermissionDenied,
+        ))),
+    )
+    .expect_err("failed");
+    assert!(matches!(failed, SqliteError::Io(_)), "got {failed}");
+}
+
 // Catches a probe that fails on a real directory, which would refuse every start.
 #[test]
 fn the_real_probe_reads_the_filesystem_of_a_directory() {
