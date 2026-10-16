@@ -292,6 +292,32 @@ impl MapSource for Hung {
     }
 }
 
+/// Catches a node that ignores the wait it was given (`with_refetch_wait`): a fetch that
+/// never comes, with an hour allowed, ends the call after that hour on a paused clock,
+/// and not at the default bound.
+#[tokio::test(start_paused = true)]
+async fn the_wait_for_a_fetch_is_the_one_the_service_was_given() {
+    let mem = Arc::new(Mem::default());
+    let storage: Arc<dyn Storage> = Arc::clone(&mem) as Arc<dyn Storage>;
+    let wait = std::time::Duration::from_secs(3600);
+    let service = StorageService::new(
+        storage,
+        Admission::Open,
+        Config {
+            write_bytes_in_flight: 1 << 30,
+        },
+    )
+    .with_map(Arc::new(Hung(Held::at(7))))
+    .with_refetch_wait(wait);
+    let channel = connect(serve_routes(service.routes(), None).await).await;
+    let started = tokio::time::Instant::now();
+    let answer = RemoteStorage::new(channel, 9)
+        .find_missing(&[sha(b"x")])
+        .await;
+    assert_eq!(went(answer), Went::Unavailable);
+    assert_eq!(started.elapsed(), wait);
+}
+
 /// Catches a node whose call waits for a fetch for ever (a frontend that never answers
 /// would hold every caller ahead of it): on a paused clock the wait ends when the bound
 /// passes, UNAVAILABLE, and not before.
