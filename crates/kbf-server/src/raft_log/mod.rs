@@ -59,7 +59,9 @@
 //!   time, committed in the log like any entry, so a restart reads it back. A learner
 //!   does not vote, so the log still has one voter: it commits alone and raises its
 //!   own machine version as before. Its membership is the latest membership entry in
-//!   the log, else the record's single voter.
+//!   the log, else the record's single voter. [`RaftMetaLog::drain`] and
+//!   [`RaftMetaLog::undrain`] commit a member's drain mark the same way (`kbf cluster
+//!   drain`, design PR #750); the voter policy reads it.
 //!
 //! Not yet: snapshots (the metadata state has no snapshot encoding, so the log is
 //! never compacted, and a directory holding a snapshot is refused); a transport, so a
@@ -485,20 +487,30 @@ impl<F: Fs> RaftMetaLog<F> {
     ///
     /// # Errors
     ///
-    /// Every drain is refused for now.
+    /// [`ChangeRefused`] for a node that is not a member, is drained already or is the
+    /// only voter, or a change the log could not commit.
     pub fn drain(&self, node: ServerId) -> Result<Membership, ChangeRefused> {
-        let _ = node;
-        Err(ChangeRefused("not built yet".to_owned()))
+        self.change_membership(Change::Drain(node))
     }
 
-    /// Clears `node`'s drain mark (`kbf cluster undrain`).
+    /// Clears `node`'s drain mark (`kbf cluster undrain`): it is an ordinary candidate
+    /// again. Returns the membership without the mark.
     ///
     /// # Errors
     ///
-    /// Every undrain is refused for now.
+    /// [`ChangeRefused`] for a node that is not drained, or a change the log could
+    /// not commit.
     pub fn undrain(&self, node: ServerId) -> Result<Membership, ChangeRefused> {
-        let _ = node;
-        Err(ChangeRefused("not built yet".to_owned()))
+        self.change_membership(Change::Undrain(node))
+    }
+
+    /// Commits `change` (a single voter commits it before this returns) and returns
+    /// the membership after it.
+    fn change_membership(&self, change: Change) -> Result<Membership, ChangeRefused> {
+        let mut host = self.shared.lock();
+        let changed = host.change_membership(change);
+        changed.map_err(|e| ChangeRefused(e.to_string()))?;
+        Ok(host.core().membership().clone())
     }
 
     /// The log's Raft membership: its voters and learners.

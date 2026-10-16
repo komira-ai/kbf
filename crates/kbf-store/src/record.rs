@@ -7,8 +7,9 @@
 //!
 //! An entry's payload is its index and term (`u64` each, little endian), a kind byte
 //! (0 blank, 1 command, 2 membership) and, for a command, its bytes, for a membership,
-//! the membership. A membership is the voters, then the learners, each as a count
-//! (`u32`, little endian) and the servers in order (`u64` each). The hard state's
+//! the membership. A membership is the voters, then the learners, then the drained
+//! members, each as a count (`u32`, little endian) and the servers in order (`u64`
+//! each). The hard state's
 //! payload is the term (`u64`), a vote byte (0 none, 1 some) and, with a vote, the
 //! server (`u64`).
 //!
@@ -113,7 +114,11 @@ pub fn decode_entry(payload: &[u8]) -> Result<Entry, &'static str> {
 /// The bytes of `m` (see the module docs).
 fn encode_membership(m: &Membership) -> Vec<u8> {
     let mut out = Vec::new();
-    for servers in [m.voters().collect::<Vec<_>>(), m.learners().collect()] {
+    for servers in [
+        m.voters().collect::<Vec<_>>(),
+        m.learners().collect(),
+        m.drained().collect(),
+    ] {
         // A membership's servers are far fewer than `u32::MAX`.
         out.extend_from_slice(&(servers.len() as u32).to_le_bytes());
         for ServerId(s) in servers {
@@ -128,11 +133,13 @@ fn decode_membership(bytes: &[u8]) -> Result<Membership, &'static str> {
     const MALFORMED: &str = "malformed membership";
     let (voters, rest) = servers(bytes).ok_or(MALFORMED)?;
     let (learners, rest) = servers(rest).ok_or(MALFORMED)?;
+    let (drained, rest) = servers(rest).ok_or(MALFORMED)?;
     if !rest.is_empty() {
         return Err(MALFORMED);
     }
     Membership::new(voters, learners)
-        .map_err(|_| "membership with no voter or a server in both roles")
+        .and_then(|m| m.with_drained(drained))
+        .map_err(|_| "membership with no voter, a server in both roles or a drained stranger")
 }
 
 /// The servers a count and ids at the start of `bytes` name, and the bytes after them.

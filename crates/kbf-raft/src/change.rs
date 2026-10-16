@@ -82,8 +82,10 @@ impl Membership {
     /// # Errors
     ///
     /// [`ChangeError::AlreadyMember`], [`ChangeError::NotALearner`],
-    /// [`ChangeError::NotAMember`] or [`ChangeError::LastVoter`] for a change that does
-    /// not apply to this membership.
+    /// [`ChangeError::NotAVoter`], [`ChangeError::NotAMember`],
+    /// [`ChangeError::AlreadyDrained`], [`ChangeError::NotDrained`] or
+    /// [`ChangeError::LastVoter`] (removing, demoting or draining the only voter) for a
+    /// change that does not apply to this membership.
     pub fn changed(&self, change: Change) -> Result<Self, ChangeError> {
         let mut next = self.clone();
         match change {
@@ -99,8 +101,34 @@ impl Membership {
                 }
                 next.voters.insert(id);
             }
-            Change::Demote(id) => return Err(ChangeError::NotAVoter(id)),
-            Change::Drain(id) | Change::Undrain(id) => return Err(ChangeError::NotAMember(id)),
+            Change::Demote(id) => {
+                if !self.is_voter(id) {
+                    return Err(ChangeError::NotAVoter(id));
+                }
+                if self.voters.len() == 1 {
+                    return Err(ChangeError::LastVoter(id));
+                }
+                next.voters.remove(&id);
+                next.learners.insert(id);
+            }
+            Change::Drain(id) => {
+                if !self.contains(id) {
+                    return Err(ChangeError::NotAMember(id));
+                }
+                if self.is_drained(id) {
+                    return Err(ChangeError::AlreadyDrained(id));
+                }
+                // Its vote could go nowhere.
+                if self.voters.len() == 1 && self.is_voter(id) {
+                    return Err(ChangeError::LastVoter(id));
+                }
+                next.drained.insert(id);
+            }
+            Change::Undrain(id) => {
+                if !next.drained.remove(&id) {
+                    return Err(ChangeError::NotDrained(id));
+                }
+            }
             Change::Remove(id) => {
                 if !self.contains(id) {
                     return Err(ChangeError::NotAMember(id));
@@ -110,6 +138,7 @@ impl Membership {
                 }
                 next.voters.remove(&id);
                 next.learners.remove(&id);
+                next.drained.remove(&id);
             }
         }
         Ok(next)

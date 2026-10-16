@@ -136,7 +136,8 @@ async fn a_drain_mark_is_committed_survives_a_restart_and_undrain_clears_it() {
     assert!(log.undrain(ServerId(7)).is_err(), "not drained");
     drop(log);
 
-    let log = open(&fs.restart()).await;
+    let fs = fs.restart();
+    let log = open(&fs).await;
     assert!(
         log.membership().is_drained(ServerId(2)),
         "the mark is in the log"

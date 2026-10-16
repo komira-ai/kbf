@@ -111,15 +111,16 @@ impl VoterPolicy {
         self.target
     }
 
-    /// The voter count to keep with `candidates` eligible candidates.
+    /// The voter count to keep with `candidates` eligible candidates: the largest odd
+    /// number not above the target or the candidates, and at least 1 (the leader).
     #[must_use]
     pub fn effective(&self, candidates: usize) -> usize {
-        let _ = candidates;
-        self.target
+        let n = candidates.min(self.target).max(1);
+        if n.is_multiple_of(2) { n - 1 } else { n }
     }
 
-    /// The most pressured voter that is not the leader and the calmest eligible learner,
-    /// with their pressures, for [`LoadHysteresis::observe`].
+    /// The most pressured voter that is not the leader and keeps its vote, and the
+    /// calmest eligible learner, with their pressures, for [`LoadHysteresis::observe`].
     #[must_use]
     pub fn load_pair(
         &self,
@@ -127,12 +128,31 @@ impl VoterPolicy {
         membership: &Membership,
         members: &[MemberState],
     ) -> Option<((ServerId, u32), (ServerId, u32))> {
-        let _ = (leader, membership, members);
-        None
+        let view = View::new(self, leader, membership, members);
+        let voter = view
+            .good_voters()
+            .filter(|s| s.id != leader)
+            .max_by_key(|s| (s.pressure, s.id))?;
+        let learner = view
+            .eligible_learners()
+            .min_by_key(|s| (s.pressure, s.lag, s.id))?;
+        Some(((voter.id, voter.pressure), (learner.id, learner.pressure)))
     }
 
     /// The next change towards the voter count, or `None` when the membership is where
-    /// it should be.
+    /// it should be. In order:
+    ///
+    /// 1. Fewer voters keeping their vote than the effective count: promote the best
+    ///    eligible learner (least lag, then calmest, then in a failure domain that holds
+    ///    no voter, then lowest id). A failing voter is replaced this way first.
+    /// 2. More voters than the effective count: a lost voter (unreachable, or not in
+    ///    `members`) is removed; a drained, unhealthy or lagging one is demoted; then
+    ///    the voter of `load`; then the most pressured other voter.
+    /// 3. Otherwise `load`, if its voter still votes and its candidate is an eligible
+    ///    learner: promote the candidate (step 2 then demotes the voter).
+    ///
+    /// The leader is never changed here: moving its vote needs a leadership transfer
+    /// first.
     #[must_use]
     pub fn next_change(
         &self,
@@ -141,8 +161,130 @@ impl VoterPolicy {
         members: &[MemberState],
         load: Option<LoadSwap>,
     ) -> Option<Change> {
-        let _ = (leader, membership, members, load);
-        None
+        let view = View::new(self, leader, membership, members);
+        let effective = self.effective(view.candidates());
+        let voters = membership.voters().count();
+        let failing: Vec<Change> = membership
+            .voters()
+            .filter_map(|v| view.failing(v))
+            .collect();
+        let good = voters - failing.len();
+        if good < effective
+            && let Some(best) = view.best_learner()
+        {
+            return Some(Change::Promote(best));
+        }
+        if voters > effective {
+            if let Some(&change) = failing.first() {
+                return Some(change);
+            }
+            let swapped = load.filter(|w| w.voter != leader && membership.is_voter(w.voter));
+            if let Some(swap) = swapped {
+                return Some(Change::Demote(swap.voter));
+            }
+            let surplus = view
+                .good_voters()
+                .filter(|s| s.id != leader)
+                .max_by_key(|s| (s.pressure, s.lag, s.id))?;
+            return Some(Change::Demote(surplus.id));
+        }
+        let swap = load.filter(|w| {
+            view.good_voters().any(|s| s.id == w.voter)
+                && view.eligible_learners().any(|s| s.id == w.candidate)
+        })?;
+        Some(Change::Promote(swap.candidate))
+    }
+}
+
+/// One call's view of the membership and the members' states.
+struct View<'a> {
+    policy: &'a VoterPolicy,
+    leader: ServerId,
+    membership: &'a Membership,
+    members: &'a [MemberState],
+}
+
+impl<'a> View<'a> {
+    fn new(
+        policy: &'a VoterPolicy,
+        leader: ServerId,
+        membership: &'a Membership,
+        members: &'a [MemberState],
+    ) -> Self {
+        Self {
+            policy,
+            leader,
+            membership,
+            members,
+        }
+    }
+
+    fn state(&self, id: ServerId) -> Option<&'a MemberState> {
+        self.members.iter().find(|m| m.id == id)
+    }
+
+    /// Not drained, reachable, healthy, and within the lag for the rounds.
+    fn eligible(&self, s: &MemberState) -> bool {
+        let t = self.policy.thresholds;
+        !self.membership.is_drained(s.id)
+            && s.reachable
+            && s.healthy
+            && s.lag <= t.promote_lag
+            && s.rounds_within >= t.promote_rounds
+    }
+
+    /// How many members are eligible.
+    fn candidates(&self) -> usize {
+        let m = self.membership;
+        m.voters()
+            .chain(m.learners())
+            .filter_map(|id| self.state(id))
+            .filter(|s| self.eligible(s))
+            .count()
+    }
+
+    /// The change that takes a failing voter's vote away, if it is failing: removal
+    /// for a lost one (unreachable, or with no state), demotion for a drained,
+    /// unhealthy or lagging one. The leader never fails here.
+    fn failing(&self, voter: ServerId) -> Option<Change> {
+        if voter == self.leader {
+            return None;
+        }
+        let Some(s) = self.state(voter).filter(|s| s.reachable) else {
+            return Some(Change::Remove(voter));
+        };
+        let lagging = s.rounds_beyond >= self.policy.thresholds.promote_rounds;
+        (self.membership.is_drained(voter) || !s.healthy || lagging)
+            .then_some(Change::Demote(voter))
+    }
+
+    /// The voters that keep their vote, with their states.
+    fn good_voters(&self) -> impl Iterator<Item = &'a MemberState> + '_ {
+        self.membership
+            .voters()
+            .filter(|&v| self.failing(v).is_none())
+            .filter_map(|v| self.state(v))
+    }
+
+    fn eligible_learners(&self) -> impl Iterator<Item = &'a MemberState> + '_ {
+        self.membership
+            .learners()
+            .filter_map(|id| self.state(id))
+            .filter(|s| self.eligible(s))
+    }
+
+    /// The learner to promote: least lag, then calmest, then in a failure domain that
+    /// holds no voter yet (an unknown domain is a domain of its own), then lowest id.
+    fn best_learner(&self) -> Option<ServerId> {
+        let voter_domains: Vec<u64> = self
+            .membership
+            .voters()
+            .filter_map(|v| self.state(v).and_then(|s| s.domain))
+            .collect();
+        let shared = |s: &MemberState| s.domain.is_some_and(|d| voter_domains.contains(&d));
+        self.eligible_learners()
+            .min_by_key(|s| (s.lag, s.pressure, shared(s), s.id))
+            .map(|s| s.id)
     }
 }
 
@@ -156,25 +298,57 @@ pub struct LoadHysteresis {
     margin: u32,
     dwell: u32,
     gap: u32,
+    /// The pair over the margin, and for how many consecutive rounds.
+    streak: Option<(LoadSwap, u32)>,
+    /// Rounds since the last load-driven change finished.
+    since: u32,
+    in_flight: bool,
 }
 
 impl LoadHysteresis {
     /// A band of `margin` held for `dwell` rounds, `gap` rounds apart.
     #[must_use]
     pub fn new(margin: u32, dwell: u32, gap: u32) -> Self {
-        Self { margin, dwell, gap }
+        Self {
+            margin,
+            dwell,
+            gap,
+            streak: None,
+            since: u32::MAX,
+            in_flight: false,
+        }
     }
 
     /// One round's reading: the voter and the candidate [`VoterPolicy::load_pair`]
-    /// named, with their pressures (or no pair). Returns the swap to make, if any.
+    /// named, with their pressures (or no pair). Returns the swap to make, if any; it
+    /// is then in flight until [`LoadHysteresis::finished`].
     pub fn observe(
         &mut self,
         pair: Option<((ServerId, u32), (ServerId, u32))>,
     ) -> Option<LoadSwap> {
-        let _ = pair;
-        None
+        self.since = self.since.saturating_add(1);
+        let over = pair.filter(|((_, v), (_, c))| *v >= c.saturating_add(self.margin));
+        let Some(((voter, _), (candidate, _))) = over else {
+            self.streak = None;
+            return None;
+        };
+        let swap = LoadSwap { voter, candidate };
+        let rounds = match self.streak {
+            Some((same, n)) if same == swap => n + 1,
+            _ => 1,
+        };
+        self.streak = Some((swap, rounds));
+        if self.in_flight || rounds < self.dwell || self.since <= self.gap {
+            return None;
+        }
+        self.in_flight = true;
+        self.streak = None;
+        Some(swap)
     }
 
     /// The swap in flight has committed (or was abandoned): the gap starts.
-    pub fn finished(&mut self) {}
+    pub fn finished(&mut self) {
+        self.in_flight = false;
+        self.since = 0;
+    }
 }

@@ -155,18 +155,24 @@ fn lag_and_health_decide_eligibility_at_the_thresholds() {
         promote_rounds: 3,
     };
     let policy = VoterPolicy::new(3, thresholds).expect("odd");
-    let base = Membership::new([s(1), s(2)], [s(3)]).expect("valid");
+    // Voter 2 is lost; learner 4 replaces it only if eligible. If not, two candidates
+    // remain, so the count falls to one voter, starting with the lost one.
+    let base = Membership::new([s(1), s(2), s(3)], [s(4)]).expect("valid");
     let with = |f: fn(&mut MemberState)| {
-        let mut members: Vec<MemberState> = (1..=3).map(ok).collect();
-        f(&mut members[2]);
+        let mut members: Vec<MemberState> = (1..=4).map(ok).collect();
+        members[1].reachable = false;
+        f(&mut members[3]);
         policy.next_change(LEADER, &base, &members, None)
     };
-    assert_eq!(with(|_| {}), Some(Change::Promote(s(3))));
-    assert_eq!(with(|c| c.lag = 100), Some(Change::Promote(s(3))));
-    assert_eq!(with(|c| c.lag = 101), None, "beyond the lag");
-    assert_eq!(with(|c| c.rounds_within = 2), None, "not for long enough");
-    assert_eq!(with(|c| c.healthy = false), None, "unhealthy");
-    assert_eq!(with(|c| c.reachable = false), None, "unreachable");
+    let promoted = Some(Change::Promote(s(4)));
+    let shrunk = Some(Change::Remove(s(2)));
+    assert_eq!(with(|_| {}), promoted);
+    assert_eq!(with(|c| c.lag = 100), promoted, "at the lag bound");
+    assert_eq!(with(|c| c.lag = 101), shrunk, "beyond the lag");
+    assert_eq!(with(|c| c.rounds_within = 2), shrunk, "not for long enough");
+    assert_eq!(with(|c| c.rounds_within = 3), promoted, "for the rounds");
+    assert_eq!(with(|c| c.healthy = false), shrunk, "unhealthy");
+    assert_eq!(with(|c| c.reachable = false), shrunk, "unreachable");
 
     // A voter beyond the lag for the rounds is replaced, then demoted; one that has
     // been behind for fewer rounds is kept.
