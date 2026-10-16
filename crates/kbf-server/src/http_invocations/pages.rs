@@ -557,8 +557,8 @@ impl Token {
         }
         if filtered != filter.text() {
             return Err(Bad::Invalid(
-                "this page token was made for another filter: send the outcome and how \
-                 of the first page"
+                "this page token was made for another filter: send the outcome, how, \
+                 requeue_reason, memory_kill and sort of the first page"
                     .to_owned(),
             ));
         }
