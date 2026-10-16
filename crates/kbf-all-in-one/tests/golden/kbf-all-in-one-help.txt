@@ -382,25 +382,25 @@ Options:
           
           [default: 512]
 
-      --member-ttl-secs <SECONDS>
-          How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
-          
-          [default: 15]
-
       --memory-poll-ms <MEMORY_POLL_MS>
           How often a lease's memory is measured, in milliseconds (native)
           
           [default: 250]
 
-      --member-dwell-secs <SECONDS>
-          How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners
+      --member-ttl-secs <SECONDS>
+          How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
           
-          [default: 300]
+          [default: 15]
 
       --xcode-apps <XCODE_APPS>
           The directory searched for `Xcode*.app` (native). Each Xcode whose own `xcodebuild` answers `-version`, `-license check` and `-checkFirstLaunchStatus`, and for which `xcrun --find clang` does (each within a minute, under the actions' sandbox), is ready: it is reported as an `xcode` entry, and an action that names its build runs with it as `DEVELOPER_DIR`. One that is not is listed in the node's status with why and the command that fixes it, and logged at WARN. The daemon says Hello without waiting for its first survey, which runs in the background: until it ends, each Xcode is listed as not surveyed yet and none is reported
           
           [default: /Applications]
+
+      --member-dwell-secs <SECONDS>
+          How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners
+          
+          [default: 300]
 
       --xcode-recheck-secs <XCODE_RECHECK_SECS>
           How often, in seconds, the Xcodes are asked again (native), so one fixed while the daemon runs becomes ready without a restart
