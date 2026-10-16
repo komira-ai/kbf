@@ -77,10 +77,10 @@ enum Rule {
 service Membership {
   // Joins, or joins again. The store assigns the member id and the boot counter; the same
   // instance_id gets the same id and a larger boot counter every time. The member starts
-  // as JOINING.
+  // as JOINING, or CATCHING_UP when the request says it is rebuilding its index.
   rpc Register(RegisterRequest) returns (RegisterResponse);
-  // Keeps the member's row alive. NOT_FOUND means the row expired (or never was): register
-  // again.
+  // Keeps the member's row alive, and carries the end of a rebuild (CATCHING_UP to
+  // ACTIVE). NOT_FOUND means the row expired (or never was): register again.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }
 
@@ -100,6 +100,9 @@ message RegisterRequest {
   string zone = 5;
   // The newest protocol version this node speaks; refused below the map's min_protocol.
   uint32 protocol = 6;
+  // The node is rebuilding its index: it enters the map as CATCHING_UP, not JOINING, and
+  // answers what it cannot find UNAVAILABLE until a heartbeat reports the rebuild done.
+  bool catching_up = 7;
 }
 
 message RegisterResponse {
@@ -114,6 +117,9 @@ message RegisterResponse {
 message HeartbeatRequest {
   uint64 member_id = 1;
   uint64 boot = 2;
+  // Whether the node is still rebuilding its index. A member that is CATCHING_UP becomes
+  // ACTIVE at the first heartbeat that says false; no other state is changed by it.
+  bool catching_up = 3;
 }
 
 message HeartbeatResponse {

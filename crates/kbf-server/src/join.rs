@@ -2,11 +2,16 @@
 //! frontend, then heartbeat at the interval it names, registering again when the frontend
 //! says the row lapsed, and backing off when it cannot be reached
 //! (`docs/design/architecture-v2.md`, section 6). The node never touches the state store.
+//!
+//! Every call says whether the node is still rebuilding its index ([`CatchUp`], the state
+//! its storage service reads): a node that registers while rebuilding enters the map as
+//! `CatchingUp`, and the first heartbeat after [`CatchUp::finish`] makes it `Active`.
 
 use std::time::Duration;
 
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
+use kbf_storage::service::CatchUp;
 use tonic::transport::Channel;
 use tonic::{Code, Status};
 
@@ -55,18 +60,28 @@ pub struct Joiner {
     client: MembershipClient<Channel>,
     identity: Identity,
     retry: Duration,
+    catch_up: CatchUp,
 }
 
 impl Joiner {
     /// A joiner that calls `channel` as `identity`, waiting `retry` after the first
-    /// failure.
+    /// failure, for a node whose index is whole.
     #[must_use]
     pub fn new(channel: Channel, identity: Identity, retry: Duration) -> Self {
         Self {
             client: MembershipClient::new(channel),
             identity,
             retry,
+            catch_up: CatchUp::caught_up(),
         }
+    }
+
+    /// The joiner of a node whose index may be being rebuilt: every call reports what
+    /// `catch_up` says at the time.
+    #[must_use]
+    pub fn with_catch_up(mut self, catch_up: CatchUp) -> Self {
+        self.catch_up = catch_up;
+        self
     }
 
     /// Registers once.
@@ -84,6 +99,7 @@ impl Joiner {
                 weight: who.weight,
                 zone: who.zone.clone(),
                 protocol: PROTOCOL,
+                catching_up: self.catch_up.is_catching_up(),
             })
             .await?
             .into_inner();
@@ -105,6 +121,7 @@ impl Joiner {
             .heartbeat(pb::HeartbeatRequest {
                 member_id: joined.member_id,
                 boot: joined.boot,
+                catching_up: self.catch_up.is_catching_up(),
             })
             .await?;
         Ok(answer.into_inner().map_generation)

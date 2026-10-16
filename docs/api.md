@@ -637,6 +637,26 @@ treated as `UNAVAILABLE`. `UNAVAILABLE` for a caller ahead of the node is the no
 lost push: the caller's map may be the right one, so the caller tries again, and the
 node's next push makes the call succeed.
 
+## `UNAVAILABLE` from a storage node that is catching up
+
+Also gRPC, not HTTP. A storage node that is rebuilding its index (it registered with
+`catching_up` set in `kbf.map.v1.RegisterRequest`, and is `CATCHING_UP` in the map) may
+hold a blob it has not indexed yet, so it never answers that something is missing:
+
+| call | while catching up |
+|---|---|
+| `ByteStream.Read` of a blob it does not find | `UNAVAILABLE`, not `NOT_FOUND` |
+| `FindMissingBlobs` with any digest it does not find | the whole call `UNAVAILABLE` (an answer naming fewer digests would say the rest are held) |
+| `ActionStore.Get` with no entry | `UNAVAILABLE`, not an empty answer |
+| `ActionStore.Prepare` or `Commit` refused for a closure blob it does not find | `UNAVAILABLE`, not the `ABSENT` refusal |
+
+Every other answer is the usual one: hits are served, writes are taken, and the other
+refusals stand. The message begins `catching up:`; it is words for a log and is never
+matched. A caller treats the node as an owner that could not say, and asks the next owner
+(a router answers `NOT_FOUND` only if every owner did). The node stops at the first
+heartbeat after its rebuild that sends `catching_up` false: the frontend makes it `ACTIVE`
+in the next map generation.
+
 ## Planned
 
 `/v1/software`, `/v1/rollouts` and the per-node update state of

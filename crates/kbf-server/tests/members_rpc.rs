@@ -59,6 +59,7 @@ fn request(i: u32) -> pb::RegisterRequest {
         weight: 1,
         zone: "a".to_owned(),
         protocol: PROTOCOL,
+        catching_up: false,
     }
 }
 
@@ -88,6 +89,7 @@ async fn register_answers_with_identity_interval_and_map() {
         .heartbeat(pb::HeartbeatRequest {
             member_id: 1,
             boot: 1,
+            catching_up: false,
         })
         .await
         .expect("beats")
@@ -127,6 +129,7 @@ async fn every_failure_has_its_own_code() {
     let beat = |id, boot| pb::HeartbeatRequest {
         member_id: id,
         boot,
+        catching_up: false,
     };
     let old = client.heartbeat(beat(1, 1)).await.expect_err("old boot");
     assert_eq!(old.code(), Code::FailedPrecondition);

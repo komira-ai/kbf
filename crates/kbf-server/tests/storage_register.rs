@@ -20,7 +20,7 @@ use kbf_server::members::{Members, MembershipConfig};
 use kbf_server::storage_node::{StorageFlags, command, parse, start_storage};
 use kbf_server::{EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_state};
 use kbf_state::{Store, Versioned};
-use kbf_storage::service::ROLE_URI_PREFIX;
+use kbf_storage::service::{CatchUp, ROLE_URI_PREFIX};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, SanType,
@@ -208,7 +208,9 @@ async fn a_node_whose_row_lapsed_registers_again() {
     // Boot 2 is the registration after the lapse: a beat of boot 2 is accepted, and the
     // member has the id it had.
     until("the node to register again", || {
-        f.members.heartbeat(MemberId(1), 2).ok()
+        f.members
+            .heartbeat(MemberId(1), 2, kbf_server::members::Progress::CaughtUp)
+            .ok()
     })
     .await;
     assert_eq!(state(&f, 1), Some(MemberState::Joining));
@@ -258,6 +260,49 @@ async fn a_node_retries_through_failures_and_keeps_its_boot() {
         "one member, registered once"
     );
     joiner.abort();
+}
+
+/// Catches: a rebuilding node that enters the map as anything but CatchingUp, a report of
+/// "still rebuilding" that promotes it, and a report of "done" that does not. A joiner
+/// whose [`CatchUp`] says it is rebuilding registers through the frontend's membership
+/// service and is CatchingUp; a heartbeat while it still rebuilds leaves it so and bumps
+/// no generation; after [`CatchUp::finish`] the next heartbeat makes it Active in a new
+/// generation, which is the one the heartbeat answers. Mutants: `catching_up` not sent
+/// (Joining); the promotion on every beat (Active while rebuilding); no promotion.
+#[tokio::test]
+async fn a_rebuilding_node_registers_catching_up_and_is_promoted_on_its_report() {
+    let f = frontend(None);
+    let channel = Endpoint::from_shared(format!("http://{}", f.worker))
+        .expect("endpoint")
+        .connect_lazy();
+    let who = NodeIdentity {
+        instance_id: "node-r".to_owned(),
+        addr: "192.0.2.6:8982".to_owned(),
+        zone: String::new(),
+        weight: 1,
+    };
+    let catch_up = CatchUp::rebuilding();
+    let mut joiner = Joiner::new(channel, who, 5 * MS).with_catch_up(catch_up.clone());
+    let joined = joiner.register().await.expect("registers");
+    assert_eq!(state(&f, joined.member_id), Some(MemberState::CatchingUp));
+
+    let still = joiner.beat(&joined).await.expect("beats");
+    assert_eq!(
+        still, joined.generation,
+        "a beat while rebuilding changed the map"
+    );
+    assert_eq!(state(&f, joined.member_id), Some(MemberState::CatchingUp));
+
+    catch_up.finish();
+    let promoted = joiner.beat(&joined).await.expect("beats");
+    assert_eq!(state(&f, joined.member_id), Some(MemberState::Active));
+    let map = f.members.current_map().expect("read").expect("a map");
+    assert_eq!(promoted, map.generation());
+    assert_eq!(
+        promoted,
+        joined.generation + 1,
+        "one generation for the promotion"
+    );
 }
 
 /// Catches: flags that are ignored or accepted when they cannot work: the advertised
@@ -494,6 +539,7 @@ async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
         weight: 1,
         zone: String::new(),
         protocol: kbf_server::members::PROTOCOL,
+        catching_up: false,
     };
     let found = until_async("the node in the frontend's map", || {
         let (mut probe, request) = (probe.clone(), request.clone());
