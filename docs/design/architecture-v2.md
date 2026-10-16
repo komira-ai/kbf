@@ -69,8 +69,8 @@ Operations; a queue indexed by platform, size class and QoS (a claim never scans
 ### 4.4 Epoch, expiry and outage
 
 - **Epoch** is the store incarnation, bumped on restore, failover or replacement. `Welcome.epoch` carries it and a daemon seeing a new epoch kills leases from the old one **[F]**. A failover that did not bump it would leave stale leases running. Lease id is `(epoch, seq)`.
-- **Renewal is per daemon session.** One `session/<daemon>` row is extended per interval; a `lease/<id>` row is a fencing token written at claim and commit only.
-- **Post-outage grace.** After recovery or failover every expiry timer restarts with a grace window; otherwise an outage makes all leases look expired and requeues all running work. Red test: a fake clock stopped across a simulated outage requeues nothing inside the window.
+- **Renewal is per daemon session.** One `session/<daemon>` row is extended per interval; a `lease/<id>` row is a fencing token written at claim and commit only. **v1:** the row carries a TTL of the lease grace and a heartbeat renews it once per third of the grace, however many leases the daemon holds.
+- **Post-outage grace.** After recovery or failover every expiry timer restarts with a grace window; otherwise an outage makes all leases look expired and requeues all running work. Red test: a fake clock stopped across a simulated outage requeues nothing inside the window. **v1:** the scheduler's deadlines are in memory, so a write the store cannot take marks an outage; until a write takes again nothing is given up or granted, and the first one that takes restarts every timer with one lease grace.
 - Expiry is judged by the store's clock, never a frontend's (SQLite: the one frontend process that owns the file).
 
 ## 5. Scheduler
@@ -90,7 +90,7 @@ Operations; a queue indexed by platform, size class and QoS (a claim never scans
 
 **Reconnect.** A daemon's `Hello` carries `instance_id` and `predecessor_instance_id` **[F]**. The new frontend bumps `session_gen`, lists the daemon's leases and reconciles with its reported running set (the `worker.rs:1-52` reconcile **[F]**): still-running leases are re-bound, unknown ones, including claimed but never delivered, are requeued.
 
-**Poison actions.** Lost-lease requeues have their own cap (`loss_requeues`), separate from `attempt`; the daemon's report distinguishes the cause where it can; over the cap the operation is refused.
+**Poison actions.** Lost-lease requeues have their own cap (`loss_requeues`), separate from `attempt`; the daemon's report distinguishes the cause where it can; over the cap the operation is refused. **v1:** a lease given up as silent, replaced, restarted or reconnected without it counts, the count is a `loss/<op>` row written with the give-up, and the third loss refuses the operation through the log with the reason (FAILED_PRECONDITION); a worker's own report, the memory ladder, a GUI session switch and a `Start` that never arrived keep their separate budgets.
 
 **Waiters.** The operation is durable at submit. A waiter is held by the frontend with the client's stream and reached through the change feed, or in-process when committer and waiter are the same frontend (the v1 case). A client of a dead frontend re-attaches with `WaitExecution` through the LB.
 
