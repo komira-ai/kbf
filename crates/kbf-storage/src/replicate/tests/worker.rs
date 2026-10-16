@@ -430,6 +430,10 @@ async fn at_most_the_concurrency_is_repaired_at_once() {
         let repairs = Arc::clone(&repairs);
         tokio::spawn(async move { repairs.pass().await })
     };
+    // Two copies begin; a third does not, however long it is given.
+    while farm.nodes[1].mem.knobs.begun.load(Ordering::SeqCst) < 2 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(farm.nodes[1].mem.knobs.begun.load(Ordering::SeqCst), 2);
     farm.nodes[1].mem.knobs.hold_appends(false);
@@ -444,6 +448,15 @@ async fn at_most_the_concurrency_is_repaired_at_once() {
     for digest in &digests {
         assert!(held(&farm, 1, digest));
     }
+}
+
+/// Catches a default that would repair nothing, or everything at once: a pass every few
+/// seconds, a few blobs at a time.
+#[test]
+fn the_default_pace_is_a_few_blobs_every_few_seconds() {
+    let pace = RepairConfig::default();
+    assert_eq!(pace.concurrency, 4);
+    assert_eq!(pace.interval, Duration::from_secs(5));
 }
 
 /// Catches a worker that never runs on its own, or that does not tell the frontend what is
