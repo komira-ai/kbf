@@ -130,7 +130,10 @@ fn live_holding_old(dir: &Path) -> PathBuf {
     let store = open(&seed);
     put(&store, "old", "1");
     drop(store);
-    assert!(!beside(&seed, "-wal").exists(), "a closed store folds its log in");
+    assert!(
+        !beside(&seed, "-wal").exists(),
+        "a closed store folds its log in"
+    );
     let db = dir.join("state.db");
     fs::copy(&seed, &db).expect("copy");
     db
