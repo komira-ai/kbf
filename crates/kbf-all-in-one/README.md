@@ -56,10 +56,41 @@ server's own code:
   not match; without one, `PutRange` hashes each record as its bytes arrive.
 - **A whole blob** (`put`, and `put_chunks` through it): hashed once, by the server,
   under the admission a ByteStream `Write` takes.
-- **Reads** (`get`, and `read_to` through it) and **FindMissing** (`missing`): the cache's
-  own, which checks every blob it reads against its digest.
+- **Reads** (`get`) and **FindMissing** (`missing`): the cache's own, which checks every
+  blob it reads against its digest.
+- **Streamed reads** (`read_to`, what the input cache fills a file with): the cache's
+  streamed read (`LocalStore::read_stream`), pumped on the server half's runtime a chunk
+  at a time into the file as it arrives (at most two chunks between the halves, never
+  the blob), and hashed: a stream cut short is not taken for the blob.
 
 No message a remote daemon sends changes: `kbf-daemon` still uses the transfer engine.
+
+## One cache (`src/one_cache.rs`)
+
+When the hot store (`--hot-store`) is a directory on the filesystem of `--data-dir`,
+the daemon half's input cache and the server half's hot store are one cache on that disk
+([architecture-v2.md](../../docs/design/architecture-v2.md#10-locality),
+`kbf_storage::local_cache`):
+
+- **One copy of a blob.** The input cache's directory (`<data-dir>/cache`) and its index
+  are the node's only local copies: the hot store deletes a block once it is flushed
+  rather than keeping a flushed copy, and a start deletes the flushed copies an earlier
+  run kept. A lease's input is a hard link to the entry (the same inode), and a shared
+  read-only tree (`<data-dir>/trees`, at its own path) is built from links to entries.
+  What the hot store still holds is its unflushed blocks: acknowledged uploads waiting
+  for the cold store, which no cache may drop. While one of them holds a blob a lease
+  also needs, the blob is on the disk twice, until that block is flushed.
+- **One budget.** The input cache evicts its entries (least recently used, never one a
+  running lease pins) until they and the hot store's blocks fit its budget: after each
+  input it fills, and within about a second of the hot store growing (uploads with no lease
+  running). A hot store budgeted at or above the input cache leaves room for pinned
+  entries alone; the daemon warns when its blocks fill the whole budget.
+- **One fill.** `/metrics` reports `kbf_local_cache_input_bytes`,
+  `kbf_local_cache_storage_bytes` and their sum, `kbf_local_cache_fill_bytes`.
+
+With no hot store, or one on another filesystem, each half keeps what it keeps without
+the other, and the start says why (`one cache: off (...)`). The cold store is the
+durable store, not a cache: a `file://` cold store on the same disk holds its own copy.
 
 ## How it is tested
 
@@ -77,8 +108,22 @@ No message a remote daemon sends changes: `kbf-daemon` still uses the transfer e
 - `tests/one_read.rs`: the container driver's output collection over a lease of the
   plane, with a write tier and without: an inotify watch counts the opens of each output
   file, which must be one each, and every blob reads back as the file.
+- `tests/binary.rs` also runs one action whose 3 MiB input a client uploaded: once the
+  hot store is flushed, one inode under the hot store and the data directory holds the
+  input (the input cache's entry) and `/metrics` counts it once; after a SIGKILL and a
+  restart, the same action leaves the same.
+- `tests/one_cache.rs`: the input cache filled over the plane: a 12 MiB input reaches
+  its file through one streamed read and no whole-blob read, the file never more than
+  five chunks behind what the stream handed out; two leases needing one input at once
+  read it once, into one entry both link; what a streamed read answers when the stream
+  is damaged or cut, the blob is absent, the file cannot be written or the server half
+  is gone; the hot store's staged blocks reported to the one cache as its storage
+  bytes; and a server half that keeps flushed copies without the one cache and none
+  with it.
 - `src/plane_tests.rs`: a digest that does not parse, a server half whose runtime is
   gone, a file changed after the walk hashed it.
+- `src/one_cache_tests.rs`: one cache only when the hot store shares the data
+  directory's filesystem, given to both halves.
 - `src/intake_tests.rs`: batches sent while the walk goes on (by bytes and by file
   count), the wait for room among the batches in flight, one digest stored once, a
   file left unfinished storing nothing, a file over the largest blob not taken, and a

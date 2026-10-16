@@ -66,6 +66,7 @@ impl Server {
         let api = Api {
             listen: loopback(),
             token: None,
+            local_cache: None,
         };
         let bound =
             bind_server_with_policy(Arc::clone(&cache), listeners, Some(api), policy, shutdown)
