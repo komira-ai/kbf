@@ -1,7 +1,7 @@
 //! The read side: queries on a connection of their own, which in WAL mode never wait
 //! for the writer and never see a transaction that has not committed.
 
-use rusqlite::{Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 
 use super::schema::{self, KIND_DELETE, KIND_PUT};
 use super::writer::{from_nanos, to_nanos, to_sql, uint};
@@ -103,8 +103,8 @@ pub(super) fn changes_after_head(
     limit: usize,
     between: &mut dyn FnMut(),
 ) -> Result<Changes, StoreError> {
-    let tx: &Connection = conn;
-    let head = schema::head(tx)?;
+    let tx = Transaction::new(conn, TransactionBehavior::Deferred)?;
+    let head = schema::head(&tx)?;
     between();
     let mut statement = tx.prepare(
         "SELECT revision, key, kind, value FROM feed WHERE revision > ?1 ORDER BY revision LIMIT ?2",
