@@ -13,7 +13,7 @@
 
 use thiserror::Error;
 
-use crate::{LogIndex, NotLeader, ServerId};
+use crate::{LogIndex, Membership, NotLeader, ServerId};
 
 /// One server's change of role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,4 +56,42 @@ pub enum ChangeError {
     /// A group needs a voter: the last one cannot be removed.
     #[error("{0} is the last voter")]
     LastVoter(ServerId),
+}
+
+impl Membership {
+    /// The membership after `change`, one server apart from this one.
+    ///
+    /// # Errors
+    ///
+    /// [`ChangeError::AlreadyMember`], [`ChangeError::NotALearner`],
+    /// [`ChangeError::NotAMember`] or [`ChangeError::LastVoter`] for a change that does
+    /// not apply to this membership.
+    pub fn changed(&self, change: Change) -> Result<Self, ChangeError> {
+        let mut next = self.clone();
+        match change {
+            Change::AddLearner(id) => {
+                if self.contains(id) {
+                    return Err(ChangeError::AlreadyMember(id));
+                }
+                next.learners.insert(id);
+            }
+            Change::Promote(id) => {
+                if !next.learners.remove(&id) {
+                    return Err(ChangeError::NotALearner(id));
+                }
+                next.voters.insert(id);
+            }
+            Change::Remove(id) => {
+                if !self.contains(id) {
+                    return Err(ChangeError::NotAMember(id));
+                }
+                if self.voters.len() == 1 && self.is_voter(id) {
+                    return Err(ChangeError::LastVoter(id));
+                }
+                next.voters.remove(&id);
+                next.learners.remove(&id);
+            }
+        }
+        Ok(next)
+    }
 }

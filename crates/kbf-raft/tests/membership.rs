@@ -121,12 +121,15 @@ impl Cluster {
     /// A new server joins: the leader adds it as a learner, and it starts with an empty
     /// log and the membership the leader answered with.
     fn join(&mut self, id: ServerId) {
+        self.run_until(|c| c.leader().is_some());
         let leader = self.leader().expect("a leader");
-        self.node(leader)
+        let at = self
+            .node(leader)
             .change_membership(Change::AddLearner(id))
             .expect("the leader adds the learner");
         let answer = self.node(leader).core().membership().clone();
         self.start(id, answer, MemStorage::new());
+        self.run_until(|c| c.nodes[&leader].core().commit_index() >= at);
     }
 
     /// Crashes `id`, keeping only what it synced: it is down until [`Cluster::up`].
@@ -174,13 +177,15 @@ impl Cluster {
 
     fn step(&mut self) {
         let pending: Vec<_> = self.wire.borrow_mut().drain(..).collect();
+        // Each server draws its own election timeouts, so two never time out together
+        // forever.
         for (from, to, msg) in pending {
             if let Some(node) = self.nodes.get_mut(&to) {
-                node.receive(from, msg, 0).expect("in memory");
+                node.receive(from, msg, to.0 * 3).expect("in memory");
             }
         }
-        for node in self.nodes.values_mut() {
-            node.tick(0).expect("in memory");
+        for (id, node) in &mut self.nodes {
+            node.tick(id.0 * 3).expect("in memory");
         }
     }
 
@@ -202,7 +207,8 @@ impl Cluster {
         });
     }
 
-    /// Runs until the change at the leader commits on every running server.
+    /// Runs until the change at the leader commits on every running member of the new
+    /// membership. A removed server is not sent its removal.
     fn change(&mut self, change: Change) {
         self.run_until(|c| c.leader().is_some());
         let leader = self.leader().expect("a leader");
@@ -210,7 +216,13 @@ impl Cluster {
             .node(leader)
             .change_membership(change)
             .expect("accepted");
-        self.run_until(|c| c.nodes.values().all(|n| n.core().commit_index() >= at));
+        let members = self.nodes[&leader].core().membership().clone();
+        self.run_until(|c| {
+            c.nodes
+                .iter()
+                .filter(|(id, _)| members.contains(**id))
+                .all(|(_, n)| n.core().commit_index() >= at)
+        });
     }
 
     fn voters(&self, id: ServerId) -> Vec<ServerId> {
@@ -272,6 +284,12 @@ fn learners_join_catch_up_are_promoted_and_the_cluster_survives_a_leader_restart
     let disk = cluster.down(old);
     cluster.run_until(|c| c.leader().is_some());
     let new = cluster.leader().expect("a new leader");
+    // Its blank entry is not acknowledged yet: until it commits an entry of its term,
+    // a change of the old leader's may still be uncommitted elsewhere.
+    assert_eq!(
+        cluster.node(new).change_membership(Change::AddLearner(S4)),
+        Err(HostError::Change(ChangeError::NotReady))
+    );
     cluster.commit(b"after-the-leader-left");
 
     cluster.up(old, disk);
@@ -420,4 +438,36 @@ fn the_membership_survives_a_restart_from_the_log_and_from_a_snapshot() {
         applied_by_s3,
         "a removed server is no longer sent the log"
     );
+}
+
+/// Catches: a leader that keeps leading after its own removal commits (it no longer
+/// counts in any quorum, and the remaining voters elect a leader of their own), and one
+/// that steps down before the removal commits (the change would be left to a new
+/// leader that may not hold it).
+#[test]
+fn a_removed_leader_leads_until_its_removal_commits_then_steps_down() {
+    let mut cluster = Cluster::bootstrap();
+    cluster.join(S2);
+    cluster.change(Change::Promote(S2));
+    cluster.join(S3);
+    cluster.change(Change::Promote(S3));
+    let old = cluster.leader().expect("a leader");
+
+    let at = cluster
+        .node(old)
+        .change_membership(Change::Remove(old))
+        .expect("a leader may remove itself");
+    assert_eq!(
+        cluster.nodes[&old].core().role(),
+        Role::Leader,
+        "it leads until the removal commits"
+    );
+    cluster.run_until(|c| c.nodes[&old].core().commit_index() >= at);
+    assert_ne!(cluster.nodes[&old].core().role(), Role::Leader);
+    cluster.run_until(|c| c.leader().is_some());
+    cluster.commit(b"after-the-removal");
+    let rest: Vec<ServerId> = [S1, S2, S3].into_iter().filter(|&s| s != old).collect();
+    for id in &rest {
+        assert_eq!(&cluster.voters(*id), &rest, "{}", cluster.describe());
+    }
 }

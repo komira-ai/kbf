@@ -96,7 +96,15 @@ enum State {
 /// same decisions, so a simulation seed replays them exactly.
 #[derive(Clone, Debug)]
 pub struct Raft {
+    /// The configuration, whose membership is the one in effect: the latest
+    /// [`Payload::Membership`] in the log, else `base_membership`.
     config: Config,
+    /// The membership as of the snapshot base: the one the core was opened with, or
+    /// the one a compaction folded in.
+    base_membership: Membership,
+    /// The index of the entry the membership in effect comes from (the base's index
+    /// when it is `base_membership`).
+    membership_index: LogIndex,
     hard: HardState,
     log: Log,
     commit: LogIndex,
@@ -153,8 +161,11 @@ impl Raft {
         if log.last_id().term > hard.term {
             return Err(ConfigError::BadLog(log.last_id()));
         }
+        let base_membership = config.membership.clone();
         let mut raft = Self {
             config,
+            base_membership,
+            membership_index: base.index,
             hard,
             log,
             commit: base.index,
@@ -166,7 +177,15 @@ impl Raft {
             effects: Vec::new(),
         };
         raft.reset_election_timer(entropy);
+        raft.adopt_log_membership();
         Ok(raft)
+    }
+
+    /// Replaces the membership as of the snapshot base with `membership`, the one a
+    /// snapshot holds, and takes up the membership in effect again.
+    pub(crate) fn restore_base_membership(&mut self, membership: Membership) {
+        self.base_membership = membership;
+        self.adopt_log_membership();
     }
 
     /// This server.
@@ -175,10 +194,20 @@ impl Raft {
         self.config.id
     }
 
-    /// The voters and learners this server was opened with.
+    /// The voters and learners in effect: those of the latest membership entry in this
+    /// server's log, committed or not, else those it was opened with (or its snapshot
+    /// holds).
     #[must_use]
     pub fn membership(&self) -> &Membership {
         &self.config.membership
+    }
+
+    /// The index of the entry the membership in effect comes from: 0 (or the snapshot
+    /// base's index) for the membership the server was opened with. Of two answers
+    /// about the membership, the one with the higher index is the newer.
+    #[must_use]
+    pub fn membership_index(&self) -> LogIndex {
+        self.membership_index
     }
 
     /// The current role.
@@ -247,9 +276,25 @@ impl Raft {
             });
         }
         let base = self.log.base();
-        self.log
+        let folded = self
+            .log
+            .entries()
+            .iter()
+            .take_while(|e| e.id.index <= through)
+            .filter_map(|e| match &e.payload {
+                Payload::Membership(m) => Some(m),
+                _ => None,
+            })
+            .last()
+            .cloned();
+        let compacted = self
+            .log
             .compact(through)
-            .ok_or(CompactError::BeforeBase { through, base })
+            .ok_or(CompactError::BeforeBase { through, base })?;
+        if let Some(m) = folded {
+            self.base_membership = m;
+        }
+        Ok(compacted)
     }
 
     /// On a leader, the peers that rejected an append at this server's snapshot base:
@@ -358,23 +403,90 @@ impl Raft {
         })
     }
 
-    /// Proposes `change` to the membership, if this server leads (see
-    /// [`Change`]).
+    /// Appends a [`Payload::Membership`] entry for `change`, if this server leads, and
+    /// uses the new membership at once (see [`Change`]). It is committed when the
+    /// commit index reaches [`Proposed::index`]; the state machine never sees it.
     ///
     /// # Errors
     ///
-    /// Every change is refused for now.
+    /// [`ChangeError::NotLeader`] on a server that does not lead,
+    /// [`ChangeError::NotReady`] before the leader has committed an entry of its term,
+    /// [`ChangeError::InProgress`] while the previous change is uncommitted, and the
+    /// errors of [`Membership::changed`]. Nothing is appended on an error.
     pub fn change_membership(&mut self, change: Change) -> Result<Proposed, ChangeError> {
-        let _ = change;
-        Err(ChangeError::NotLeader(NotLeader {
-            leader: self.leader,
-        }))
+        if !matches!(self.state, State::Leader { .. }) {
+            return Err(ChangeError::NotLeader(NotLeader {
+                leader: self.leader,
+            }));
+        }
+        if self.log.term_at(self.commit) != Some(self.hard.term) {
+            return Err(ChangeError::NotReady);
+        }
+        if self.membership_index > self.commit {
+            return Err(ChangeError::InProgress {
+                pending: self.membership_index,
+            });
+        }
+        let next = self.config.membership.changed(change)?;
+        let index = self.append_local([Payload::Membership(next)]);
+        self.adopt_log_membership();
+        self.broadcast_append();
+        self.advance_commit();
+        Ok(Proposed {
+            index,
+            effects: self.take_effects(),
+        })
     }
 
     /// The membership as of the snapshot base: what a snapshot taken now must hold.
     #[must_use]
     pub fn snapshot_membership(&self) -> &Membership {
-        &self.config.membership
+        &self.base_membership
+    }
+
+    /// Takes up the latest membership in the log (else the base's) as the one in
+    /// effect, and on a leader tracks exactly its peers: a new peer is probed from the
+    /// end of the log, a removed one is no longer sent anything.
+    fn adopt_log_membership(&mut self) {
+        let latest = self
+            .log
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                Payload::Membership(m) => Some((e.id.index, m.clone())),
+                _ => None,
+            });
+        let (index, membership) =
+            latest.unwrap_or_else(|| (self.log.base().index, self.base_membership.clone()));
+        self.config.membership = membership;
+        self.membership_index = index;
+        let peers = self.peers();
+        let next = self.log.last_index().next();
+        let State::Leader { progress, .. } = &mut self.state else {
+            return;
+        };
+        progress.retain(|id, _| peers.contains(id));
+        for peer in peers {
+            progress.entry(peer).or_insert(Progress {
+                next,
+                matched: LogIndex(0),
+                behind_base: false,
+            });
+        }
+    }
+
+    /// A leader the committed membership no longer counts as a voter steps down: it
+    /// led only until its removal committed.
+    fn step_down_if_removed(&mut self) {
+        let removed = !self.config.membership.is_voter(self.config.id);
+        if matches!(self.state, State::Leader { .. })
+            && removed
+            && self.commit >= self.membership_index
+        {
+            self.state = State::Follower;
+            self.leader = None;
+        }
     }
 
     fn take_effects(&mut self) -> Vec<Effect> {
@@ -627,6 +739,7 @@ impl Raft {
         }
         let matched = LogIndex(prev.index.0 + entries.len() as u64);
         let mut fresh = Vec::new();
+        let mut membership_changed = false;
         for entry in entries {
             let expected = entry.id.index;
             if fresh.is_empty() {
@@ -634,12 +747,20 @@ impl Raft {
                     Some(t) if t == entry.id.term => continue,
                     // Never drop a committed entry; a leader that asks is broken.
                     Some(_) if expected <= self.commit => return,
-                    Some(_) => self.log.truncate_from(expected),
+                    Some(_) => {
+                        // The membership in effect may have come from a dropped entry.
+                        membership_changed |= self.membership_index >= expected;
+                        self.log.truncate_from(expected);
+                    }
                     None => {}
                 }
             }
+            membership_changed |= matches!(entry.payload, Payload::Membership(_));
             self.log.push(entry.clone());
             fresh.push(entry);
+        }
+        if membership_changed {
+            self.adopt_log_membership();
         }
         if !fresh.is_empty() {
             self.effects.push(Effect::PersistEntries(fresh));
@@ -721,6 +842,7 @@ impl Raft {
             if held >= quorum {
                 self.commit = n;
                 self.apply_committed();
+                self.step_down_if_removed();
                 return;
             }
             n = n.prev();

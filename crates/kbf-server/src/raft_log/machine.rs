@@ -133,7 +133,7 @@ impl Machine for MetaMachine {
     fn apply(&mut self, entry: &Entry) {
         self.applied = entry.id.index;
         let Payload::Command(bytes) = &entry.payload else {
-            return; // a leader's blank entry
+            return; // a leader's blank entry, or a membership change
         };
         if self.failed.is_some() {
             return;

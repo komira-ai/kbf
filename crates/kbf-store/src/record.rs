@@ -6,14 +6,18 @@
 //! length is caught, not followed.
 //!
 //! An entry's payload is its index and term (`u64` each, little endian), a kind byte
-//! (0 blank, 1 command) and, for a command, its bytes. The hard state's payload is the
-//! term (`u64`), a vote byte (0 none, 1 some) and, with a vote, the server (`u64`).
+//! (0 blank, 1 command, 2 membership) and, for a command, its bytes, for a membership,
+//! the membership. A membership is the voters, then the learners, each as a count
+//! (`u32`, little endian) and the servers in order (`u64` each). The hard state's
+//! payload is the term (`u64`), a vote byte (0 none, 1 some) and, with a vote, the
+//! server (`u64`).
 //!
 //! A snapshot file is a header record, whose payload is the base's index and term and
-//! the state's length in bytes (`u64` each, little endian), followed by the state in
-//! records of at most [`SNAPSHOT_CHUNK`] bytes each (none for an empty state).
+//! the state's length in bytes (`u64` each, little endian), then the membership as of
+//! the base if the snapshot holds one; followed by the state in records of at most
+//! [`SNAPSHOT_CHUNK`] bytes each (none for an empty state).
 
-use kbf_raft::{Entry, HardState, LogId, LogIndex, Payload, ServerId, Snapshot, Term};
+use kbf_raft::{Entry, HardState, LogId, LogIndex, Membership, Payload, ServerId, Snapshot, Term};
 
 use crate::crc::crc32c;
 
@@ -29,7 +33,8 @@ const ENTRY_FIXED: usize = 17;
 /// The most state bytes one record of a snapshot file carries: 1 MiB.
 pub const SNAPSHOT_CHUNK: usize = 1 << 20;
 
-/// A snapshot header's payload: base index, base term, state length.
+/// The fixed part of a snapshot header's payload: base index, base term, state
+/// length. The membership follows it, if there is one.
 const SNAPSHOT_HEADER: usize = 24;
 
 /// Appends one record carrying `payload` to `out`.
@@ -67,9 +72,14 @@ pub fn any_record(bytes: &[u8]) -> bool {
 
 /// The payload of `entry`.
 pub fn encode_entry(entry: &Entry) -> Vec<u8> {
+    let membership;
     let data: &[u8] = match &entry.payload {
-        Payload::Blank | Payload::Membership(_) => &[],
+        Payload::Blank => &[],
         Payload::Command(c) => c,
+        Payload::Membership(m) => {
+            membership = encode_membership(m);
+            &membership
+        }
     };
     let mut out = Vec::with_capacity(ENTRY_FIXED + data.len());
     out.extend_from_slice(&entry.id.index.0.to_le_bytes());
@@ -94,10 +104,47 @@ pub fn decode_entry(payload: &[u8]) -> Result<Entry, &'static str> {
         0 if data.is_empty() => Payload::Blank,
         0 => return Err("blank entry with bytes"),
         1 => Payload::Command(data.to_vec()),
-        2 => return Err("membership entries are not stored yet"),
+        2 => Payload::Membership(decode_membership(data)?),
         _ => return Err("unknown entry kind"),
     };
     Ok(Entry { id, payload })
+}
+
+/// The bytes of `m` (see the module docs).
+fn encode_membership(m: &Membership) -> Vec<u8> {
+    let mut out = Vec::new();
+    for servers in [m.voters().collect::<Vec<_>>(), m.learners().collect()] {
+        // A membership's servers are far fewer than `u32::MAX`.
+        out.extend_from_slice(&(servers.len() as u32).to_le_bytes());
+        for ServerId(s) in servers {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// The membership all of `bytes` encode, or why they do not encode one.
+fn decode_membership(bytes: &[u8]) -> Result<Membership, &'static str> {
+    const MALFORMED: &str = "malformed membership";
+    let (voters, rest) = servers(bytes).ok_or(MALFORMED)?;
+    let (learners, rest) = servers(rest).ok_or(MALFORMED)?;
+    if !rest.is_empty() {
+        return Err(MALFORMED);
+    }
+    Membership::new(voters, learners)
+        .map_err(|_| "membership with no voter or a server in both roles")
+}
+
+/// The servers a count and ids at the start of `bytes` name, and the bytes after them.
+fn servers(bytes: &[u8]) -> Option<(Vec<ServerId>, &[u8])> {
+    let count = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
+    let end = usize::try_from(count)
+        .ok()?
+        .checked_mul(8)?
+        .checked_add(4)?;
+    let ids = bytes.get(4..end)?;
+    let servers = ids.chunks_exact(8).map(|c| ServerId(u64_at(c, 0)));
+    Some((servers.collect(), &bytes[end..]))
 }
 
 /// The payload of `hard`.
@@ -133,6 +180,9 @@ pub fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
     head.extend_from_slice(&snapshot.base.index.0.to_le_bytes());
     head.extend_from_slice(&snapshot.base.term.0.to_le_bytes());
     head.extend_from_slice(&(state.len() as u64).to_le_bytes());
+    if let Some(m) = &snapshot.membership {
+        head.extend_from_slice(&encode_membership(m));
+    }
     let chunks = state.len().div_ceil(SNAPSHOT_CHUNK);
     let mut out = Vec::with_capacity(HEADER * (chunks + 1) + SNAPSHOT_HEADER + state.len());
     put_record(&mut out, &head);
@@ -149,9 +199,13 @@ pub fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
 pub fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, (usize, &'static str)> {
     let damaged = |at| (at, "damaged snapshot record");
     let (head, mut off) = get_record(bytes).ok_or(damaged(0))?;
-    if head.len() != SNAPSHOT_HEADER {
+    if head.len() < SNAPSHOT_HEADER {
         return Err((0, "malformed snapshot header"));
     }
+    let membership = match &head[SNAPSHOT_HEADER..] {
+        [] => None,
+        bytes => Some(decode_membership(bytes).map_err(|e| (0, e))?),
+    };
     let base = LogId::new(Term(u64_at(head, 8)), LogIndex(u64_at(head, 0)));
     let mut state = Vec::new();
     while off < bytes.len() {
@@ -165,7 +219,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, (usize, &'static str)> 
     Ok(Snapshot {
         base,
         state,
-        membership: None,
+        membership,
     })
 }
 
@@ -250,6 +304,9 @@ mod tests {
             membership: Some(m),
         };
         assert_eq!(decode_snapshot(&encode_snapshot(&snapshot)), Ok(snapshot));
+        let mut bad_head = Vec::new();
+        put_record(&mut bad_head, &[0; SNAPSHOT_HEADER + 1]);
+        assert_eq!(decode_snapshot(&bad_head), Err((0, "malformed membership")));
     }
 
     /// Catches: a record accepted with a bad CRC, a damaged length, a short body or a

@@ -10,7 +10,7 @@ use kbf_meta::{Applied, Command, Retention};
 use kbf_raft::{LogIndex, ServerId};
 use kbf_server::RaftMetaLog;
 use kbf_server::raft_log::{JoinError, JoinRequest};
-use kbf_store::FaultFs;
+use kbf_store::{Fault, FaultFs};
 
 type Log = RaftMetaLog<FaultFs>;
 
@@ -98,4 +98,19 @@ async fn a_join_for_another_cluster_is_refused_and_commits_nothing() {
     );
     assert_eq!(log.applied_index(), applied);
     assert_eq!(learners(&log), Vec::<ServerId>::new());
+}
+
+/// Catches: a join answered though its change never reached the disk (the node would
+/// count on a membership a restart forgets).
+#[tokio::test]
+async fn a_join_the_log_cannot_make_durable_is_refused() {
+    let fs = FaultFs::new();
+    let log = open(&fs).await;
+    fs.fail_at(fs.ops(), Fault::Error);
+    let request = JoinRequest {
+        cluster: id(LOG_ID),
+        node: ServerId(2),
+    };
+    let refused = log.join(&request);
+    assert!(matches!(refused, Err(JoinError::Refused(_))), "{refused:?}");
 }

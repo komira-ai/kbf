@@ -54,10 +54,19 @@
 //!   writing, and refuses every later one `Unavailable`, so nothing reaches the raft
 //!   directory once the drop returns and the directory can be opened again in the
 //!   same process (kbf#651).
+//! - **Joining** ([`RaftMetaLog::join`], docs/design/cluster.md section 5.3): a node
+//!   that expects this log id is added as a Raft learner, one membership change at a
+//!   time, committed in the log like any entry, so a restart reads it back. A learner
+//!   does not vote, so the log still has one voter: it commits alone and raises its
+//!   own machine version as before. Its membership is the latest membership entry in
+//!   the log, else the record's single voter.
 //!
 //! Not yet: snapshots (the metadata state has no snapshot encoding, so the log is
-//! never compacted, and a directory holding a snapshot is refused), more than one
-//! voter, and the scheduler's state, which stays in memory.
+//! never compacted, and a directory holding a snapshot is refused); a transport, so a
+//! learner is added but sent nothing, and nobody is promoted to a voter (a second
+//! voter would stop the commits that a single voter makes alone); the joining node's
+//! side (opening a log from a join answer); the node's address and eligibility; and
+//! the scheduler's state, which stays in memory.
 
 mod join;
 mod machine;
@@ -79,8 +88,8 @@ use kbf_log::{Bootstrap, DecodeError, EncodeError, FarmLogId, LogCommand, Machin
 use kbf_meta::{Applied, Command, MetaState, Retention};
 use kbf_objstore::{KeyError, KeyPrefix};
 use kbf_raft::{
-    Config, ConfigError, Host, HostError, LogIndex, Membership, Message, OpenError, Role, ServerId,
-    Transport,
+    Change, Config, ConfigError, Host, HostError, LogIndex, Membership, Message, OpenError, Role,
+    ServerId, Transport,
 };
 use kbf_store::{Fs, Options, StdFs, Store, StoreError};
 use kbf_types::FarmTime;
@@ -441,12 +450,33 @@ impl<F: Fs> RaftMetaLog<F> {
     /// Adds the node `request` names to the log's cell as a learner, if it expects this
     /// cluster (see [`JoinRequest`]).
     ///
+    /// A node that is already a member gets the answer without a new change.
+    ///
     /// # Errors
     ///
-    /// Every join is refused for now.
+    /// [`JoinError::WrongCluster`] if the node expects another log id, and
+    /// [`JoinError::Refused`] if the change could not be committed.
     pub fn join(&self, request: &JoinRequest) -> Result<JoinAnswer, JoinError> {
-        let _ = request;
-        Err(JoinError::Refused("not built yet".to_owned()))
+        let actual = self.shared.log_id;
+        if request.cluster != actual {
+            return Err(JoinError::WrongCluster {
+                expected: request.cluster,
+                actual,
+            });
+        }
+        let mut host = self.shared.lock();
+        if !host.core().membership().contains(request.node) {
+            // A single voter commits the change before this returns.
+            let added = host.change_membership(Change::AddLearner(request.node));
+            added.map_err(join_refused)?;
+        }
+        let core = host.core();
+        Ok(JoinAnswer {
+            cluster: actual,
+            leader: core.id(),
+            membership: core.membership().clone(),
+            config_index: core.membership_index(),
+        })
     }
 
     /// The log's Raft membership: its voters and learners.
@@ -655,6 +685,11 @@ const NOT_APPLIED: &str = "the metadata log did not apply its own proposal";
 const CLOSED: &str = "the metadata log was closed";
 
 const NOT_ANSWERED: &str = "the metadata log's committer stopped without answering";
+
+/// A join the host refused.
+fn join_refused(e: HostError<StoreError>) -> JoinError {
+    JoinError::Refused(e.to_string())
+}
 
 /// A log error as the front sees it: the leader could not answer.
 fn unavailable(e: impl Display) -> MetaLogError {

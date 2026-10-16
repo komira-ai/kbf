@@ -179,6 +179,9 @@ impl<S: Storage, T: Transport, M: Machine> Host<S, T, M> {
     /// Opens a server from what `storage` holds: `machine` (in its initial state) is
     /// restored from the stored snapshot, if there is one, and the core from the hard
     /// state, the snapshot's base and the entries after it (see [`Raft::restore`]).
+    /// The membership in effect is the latest membership entry among those entries,
+    /// else the snapshot's membership, else `config`'s: a server bootstrapped alone, or
+    /// a joiner opened with the membership the leader answered.
     ///
     /// # Errors
     ///
@@ -214,8 +217,14 @@ impl<S: Storage, T: Transport, M: Machine> Host<S, T, M> {
         if let Some(snapshot) = &stored.snapshot {
             machine.restore(snapshot).map_err(OpenError::Machine)?;
         }
-        let core = Raft::restore(config, stored.hard, base, stored.entries, entropy)
+        let membership = stored.snapshot.and_then(|s| s.membership);
+        let mut core = Raft::restore(config, stored.hard, base, stored.entries, entropy)
             .map_err(OpenError::Core)?;
+        // The snapshot's membership replaces the one the caller opens with: the
+        // entries it folded in may have changed it.
+        if let Some(membership) = membership {
+            core.restore_base_membership(membership);
+        }
         Ok(Self {
             core,
             storage,
