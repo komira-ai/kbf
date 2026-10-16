@@ -104,6 +104,10 @@ ruzstd = "0.9.1"
 # drives `crun` through: run, kill and delete. The async client; the crate has no
 # synchronous client in the same build.
 runc = { version = "0.3.0", features = ["async"] }
+# The SQLite state store (kbf-state): the C library is compiled in (`bundled`), so the file
+# format and WAL behaviour do not depend on the host's libsqlite3; `hooks` for the commit
+# counter. No default features: no statement cache (hashlink) and no wasm shim.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 # Directory-relative, no-follow file access (openat with O_NOFOLLOW) for reading outputs;
 # the effective uid, to check who owns the operator API token file (kbf-server).
 rustix = "1.1.5"
