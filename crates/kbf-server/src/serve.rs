@@ -12,7 +12,7 @@ use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
     ByteStreamService, CONNECTION_WINDOW_BYTES, Cache, CasService, Connections,
-    MAX_CONCURRENT_STREAMS, MAX_MESSAGE_BYTES, MetaLog, RECORDER_CHANNEL, Recorder,
+    DEFAULT_WORKER_STREAMS, MAX_MESSAGE_BYTES, MetaLog, RECORDER_CHANNEL, Recorder,
     RequestMetadataLayer, STREAM_WINDOW_BYTES, SegmentsConfig, SegmentsService,
 };
 use kbf_objstore::ObjectStore;
@@ -33,6 +33,7 @@ use crate::health::Readiness;
 use crate::http_blobs::BlobReaders;
 use crate::http_invocations::InvocationReaders;
 use crate::identity::{DenyList, Peers};
+use crate::streams::StreamLimits;
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
 
@@ -82,6 +83,9 @@ pub struct Listeners {
     /// The worker listener's segment uploads (`--segment-upload-*`;
     /// `docs/design/write-path.md`, section 4).
     pub segments: SegmentsConfig,
+    /// The most HTTP/2 streams one connection may have open on each listener
+    /// (`--reapi-max-streams`, `--worker-max-streams`).
+    pub streams: StreamLimits,
 }
 
 /// The worker listener's mutual TLS: every daemon's certificate must name its node
@@ -203,7 +207,7 @@ fn bind_api(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), S
 /// (`kbf_front::CONNECTION_WINDOW_BYTES`).
 fn flow_control(server: Server) -> Server {
     server
-        .max_concurrent_streams(Some(MAX_CONCURRENT_STREAMS))
+        .max_concurrent_streams(Some(DEFAULT_WORKER_STREAMS))
         .initial_stream_window_size(Some(STREAM_WINDOW_BYTES))
         .initial_connection_window_size(Some(CONNECTION_WINDOW_BYTES))
 }
