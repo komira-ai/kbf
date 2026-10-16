@@ -198,10 +198,12 @@ fn only_the_scheduling_modes_take_a_state_store() {
     let path = std::path::PathBuf::from("/var/lib/kbf/state.db");
     assert!(matches!(&both, Invocation::AllInOne(flags)
         if flags.server.state_store == Some(kbf_server::StateStoreUri::Sqlite(path.clone()))));
-    let postgres = with(BOTH, &["--state-store=postgres://db.example/kbf"]);
-    let both = parse_from(postgres).expect("all-in-one");
-    assert!(matches!(&both, Invocation::AllInOne(flags)
-        if matches!(flags.server.state_store, Some(kbf_server::StateStoreUri::Postgres(_)))));
+    // The all-in-one's single frontend is SQLite always (arch-v2 section 1).
+    let postgres = error(with(BOTH, &["--state-store=postgres://db.example/kbf"]));
+    assert!(postgres.contains("SQLite"), "{postgres}");
+    let default = parse_from(with(BOTH, &[])).expect("all-in-one");
+    assert!(matches!(&default, Invocation::AllInOne(flags)
+        if matches!(flags.server.state_store, Some(kbf_server::StateStoreUri::Sqlite(_)))));
     let file = error(with(BOTH, &["--state-store=file:///var/lib/kbf"]));
     assert!(file.contains("scheme \"file\""), "{file}");
     let daemon = refusal(with(DAEMON, &["--state-store=sqlite:///x.db"]));

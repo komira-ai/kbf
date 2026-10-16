@@ -351,12 +351,20 @@ pub struct Args {
     /// process owns; every start is a new epoch, so daemons kill the runs of the leases
     /// they held before) or `postgres://...` (a database that outlives the process; a
     /// start keeps its epoch, so daemons keep their runs). Any other scheme is refused.
-    /// This build has neither backend yet: a start with the flag is refused. Left out, the
-    /// scheduler's state is in memory and a restart loses it
+    /// A SQLite file is created, with its directory, if missing, and held by one process
+    /// (a second frontend on it refuses to start); a `postgres://` value needs a build
+    /// with the `postgres` feature and carries no password (see
+    /// `--state-store-password-file`). Left out, the scheduler's state is in memory and a
+    /// restart loses it
     // Listed beside `--meta-dir`, whose place in the help it takes without moving the
     // flags declared after it.
     #[arg(long, value_name = "URI", display_order = 5)]
     pub state_store: Option<crate::state_store::StateStoreUri>,
+    /// A file whose first line is the password of a `postgres://` `--state-store` (the
+    /// command line is readable by every user of the machine, so the URL carries none:
+    /// one that does is refused). Keep it readable by this process's user alone.
+    #[arg(long, value_name = "FILE", requires = "state_store", display_order = 5)]
+    pub state_store_password_file: Option<PathBuf>,
 }
 
 /// This server in the tier registry. A farm runs one server today

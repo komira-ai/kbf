@@ -9,8 +9,13 @@
 //! native drivers run actions as the farm's own user, beside the server's state, and
 //! belong to Macs, which run `kbf-daemon`), and `--cas` (the daemon half reads and
 //! writes blobs through calls into the server half, not over the network).
+//!
+//! The scheduler's state is always SQLite (`docs/design/architecture-v2.md`, section 1):
+//! `--state-store` is given as `sqlite:///absolute/path`, or left out for
+//! `<data-dir>/state.db`, beside the daemon's data. A `postgres://` value is refused.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use clap::error::ErrorKind;
 use clap::{ArgMatches, Command, CommandFactory as _, FromArgMatches as _};
@@ -18,6 +23,17 @@ use clap::{ArgMatches, Command, CommandFactory as _, FromArgMatches as _};
 /// What the binary is, for `--help`.
 const ABOUT: &str = "The kbf farm server and a worker daemon in one process (Linux, the \
                      container driver only).";
+
+/// The scheduler's state file in the data directory, when `--state-store` is left out.
+const STATE_FILE: &str = "state.db";
+
+/// `--state-store` here, in place of the server's: this binary always has one.
+const STATE_STORE_HELP: &str = "Where the scheduler keeps its state, written before each change \
+    is acknowledged and replayed at start: `sqlite:///absolute/path`, a file on a local disk \
+    that this process owns (created, with its directory, if missing; every start is a new \
+    epoch, so the daemon kills the runs of the leases it held before). Left out, it is \
+    `<data-dir>/state.db`. A `postgres://` value is refused: this binary is one frontend and \
+    keeps its state in SQLite";
 
 /// The one command: the daemon's flags, then the server's that do not share a name with
 /// one of them.
@@ -29,6 +45,12 @@ pub fn command() -> Command {
         .get_arguments()
         .filter(|a| !taken.contains(a.get_id()))
         .cloned()
+        .map(|a| match a.get_id().as_str() {
+            "state_store" => a.help(STATE_STORE_HELP),
+            // Only a Postgres store has a password, and this binary has none.
+            "state_store_password_file" => a.hide(true),
+            _ => a,
+        })
         .collect();
     daemon
         .name("kbf-all-in-one")
@@ -49,7 +71,8 @@ pub struct Flags {
 /// Both halves' flags from what [`command`] matched.
 ///
 /// # Errors
-/// A `--driver` other than `container`, or `--cas`.
+/// A `--driver` other than `container`, `--cas`, a `postgres://` `--state-store`, or
+/// a relative `--data-dir` (which the state file would be put in).
 pub fn parse(matches: &ArgMatches) -> Result<Flags, clap::Error> {
     let refuse = |message: String| command().error(ErrorKind::ArgumentConflict, message);
     if matches.value_source("cas").is_some() {
@@ -69,6 +92,29 @@ pub fn parse(matches: &ArgMatches) -> Result<Flags, clap::Error> {
     }
     let daemon = kbf_node::Cli::from_arg_matches(matches)?;
     let mut server = kbf_server::Args::from_arg_matches(matches)?;
+    match &server.state_store {
+        Some(kbf_server::StateStoreUri::Postgres(_)) => {
+            return Err(refuse(
+                "--state-store: kbf-all-in-one keeps its state in SQLite; run kbf-server \
+                 and kbf-daemon for a postgres:// state store"
+                    .to_owned(),
+            ));
+        }
+        Some(kbf_server::StateStoreUri::Sqlite(_)) => {}
+        None => {
+            let dir = matches
+                .get_one::<PathBuf>("data_dir")
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from(kbf_node::DEFAULT_DATA_DIR));
+            if !dir.is_absolute() {
+                return Err(refuse(format!(
+                    "--data-dir {}: must be absolute (the state file {STATE_FILE} goes in it)",
+                    dir.display()
+                )));
+            }
+            server.state_store = Some(kbf_server::StateStoreUri::Sqlite(dir.join(STATE_FILE)));
+        }
+    }
     // The thread flags matched are the daemon's.
     server.threads = kbf_threads::PoolArgs::default();
     Ok(Flags { server, daemon })

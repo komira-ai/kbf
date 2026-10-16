@@ -87,10 +87,11 @@ No message a remote daemon sends changes: `kbf-daemon` still uses the transfer e
 
 ## Not done yet
 
-- **Production use.** The server half's scheduler state is in memory, so a restart of
-  the process loses every lease and operation (the cache's index is kept: the server's
-  metadata log is on disk, under `--meta-dir` or the hot store). Until the
-  scheduler's state is durable, all-in-one is a development shape.
+- **Production use.** The scheduler's state is a SQLite file, `<data-dir>/state.db` (or
+  the `--state-store=sqlite:///...` given), so a restart keeps queued operations and
+  every start is a new epoch: the daemon half kills the runs of the leases the earlier
+  start granted, and they are queued again. The trust warning below still stands, so
+  all-in-one is a development and single-box shape.
 - **The in-process plane's admission.** A remote daemon's blob calls are admitted by its
   certificate and the deny list; this plane's calls are not admitted.
 - **`--reserve-cpus` across both halves.** The daemon half takes the flag as
