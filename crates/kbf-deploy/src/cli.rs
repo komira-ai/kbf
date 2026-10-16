@@ -273,7 +273,8 @@ enum Linux {
     /// Extract a meta-backup archive into an empty directory and check every file.
     MetaVerify(meta::cli::VerifyArgs),
     /// Check, read only, that a certificate is its row of the farm's certificate table:
-    /// its one role, its extended key usage and its chain to the CA.
+    /// its one role, its extended key usage and its chain to the CA. The frontend's
+    /// REAPI certificate is not the farm CA's and is no row.
     VerifyCert(linux::verify_cert::VerifyArgs),
     /// Make, activate and list the build swapfile (as root).
     Swap {

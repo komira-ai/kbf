@@ -92,10 +92,9 @@ fn check(ca: &Ca, cert: &str, row: Row) -> Vec<String> {
 }
 
 /// Catches a row's certificate refused (each role and EKU set as the issuer's table
-/// has them, the frontend's two certificates told apart by EKU alone), and any row's
-/// certificate passed as another row's: a REAPI certificate taken for the worker
-/// listener's (which also calls storage as a client), a frontend's for a storage
-/// node's, a daemon's for anything that serves.
+/// has them), and any row's certificate passed as another row's: a frontend's for a
+/// storage node's (the same EKU set, told apart by role alone), a daemon's for
+/// anything that serves.
 #[test]
 fn each_rows_certificate_passes_as_its_row_and_no_other() {
     let ca = ca();
@@ -113,7 +112,6 @@ fn each_rows_certificate_passes_as_its_row_and_no_other() {
     assert_eq!(
         Row::ALL.map(|r| (r.role(), r.ekus().join(","))),
         [
-            ("frontend", "serverAuth".to_owned()),
             ("frontend", "serverAuth,clientAuth".to_owned()),
             ("storage", "serverAuth,clientAuth".to_owned()),
             ("daemon", "clientAuth".to_owned()),
@@ -157,21 +155,22 @@ fn a_certificate_names_exactly_the_rows_one_role() {
     }
 }
 
-/// Catches an EKU set compared as a subset (an extra use passed, or a REAPI-only
-/// certificate passed for the worker listener), a certificate with no EKU extension
-/// passed (TLS takes it for every use; the table does not), and an EKU outside the two
-/// shown unnamed.
+/// Catches an EKU set compared as a subset (an extra use passed: a serving certificate
+/// passed for a daemon; or a missing one: a server-only certificate passed for the
+/// worker listener), a certificate with no EKU extension passed (TLS takes it for every
+/// use; the table does not), and an EKU outside the two shown unnamed.
 #[test]
 fn the_eku_set_is_the_rows_exactly() {
     let ca = ca();
-    let names = ["DNS:frontend.farm.example", "URI:urn:kbf:role:frontend"];
-    let worker = leaf(&ca, &names, row_ekus(Row::FrontendWorker), |_| {});
+    let daemon = ["DNS:node-1", "URI:urn:kbf:role:daemon"];
+    let serving = leaf(&ca, &daemon, row_ekus(Row::FrontendWorker), |_| {});
     assert_eq!(
-        check(&ca, &worker, Row::FrontendReapi),
-        ["FAIL eku: its extended key usage is serverAuth,clientAuth, not serverAuth"]
+        check(&ca, &serving, Row::Daemon),
+        ["FAIL eku: its extended key usage is serverAuth,clientAuth, not clientAuth"]
     );
-    let reapi = leaf(&ca, &names, vec![Eku::ServerAuth], |_| {});
-    let lines = check(&ca, &reapi, Row::FrontendWorker);
+    let names = ["DNS:frontend.farm.example", "URI:urn:kbf:role:frontend"];
+    let server_only = leaf(&ca, &names, vec![Eku::ServerAuth], |_| {});
+    let lines = check(&ca, &server_only, Row::FrontendWorker);
     assert_eq!(
         lines[0],
         "FAIL eku: its extended key usage is serverAuth, not serverAuth,clientAuth"
@@ -181,12 +180,13 @@ fn the_eku_set_is_the_rows_exactly() {
     assert!(lines[1].starts_with("FAIL chain: it does not chain to the CA for clientAuth: "));
     let none = leaf(&ca, &names, Vec::new(), |_| {});
     assert_eq!(
-        check(&ca, &none, Row::FrontendReapi),
-        ["FAIL eku: its extended key usage is none, not serverAuth"]
+        check(&ca, &none, Row::FrontendWorker),
+        ["FAIL eku: its extended key usage is none, not serverAuth,clientAuth"]
     );
     let every = vec![
         Eku::Any,
         Eku::ServerAuth,
+        Eku::ClientAuth,
         Eku::CodeSigning,
         Eku::EmailProtection,
         Eku::TimeStamping,
@@ -195,9 +195,9 @@ fn the_eku_set_is_the_rows_exactly() {
     ];
     let extra = leaf(&ca, &names, every, |_| {});
     assert_eq!(
-        check(&ca, &extra, Row::FrontendReapi),
+        check(&ca, &extra, Row::FrontendWorker),
         [
-            "FAIL eku: its extended key usage is serverAuth,anyExtendedKeyUsage,codeSigning,emailProtection,timeStamping,OCSPSigning,1.3.6.1.4.1.99999.1, not serverAuth"
+            "FAIL eku: its extended key usage is serverAuth,clientAuth,anyExtendedKeyUsage,codeSigning,emailProtection,timeStamping,OCSPSigning,1.3.6.1.4.1.99999.1, not serverAuth,clientAuth"
         ]
     );
 }
@@ -252,23 +252,19 @@ fn the_certificate_chains_to_the_ca_now_for_each_use() {
     let lines = check(&ca, &expired, Row::Storage);
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert!(lines.iter().all(|l| l.contains("expired")), "{lines:?}");
-    let nameless = leaf(
-        &ca,
-        &["URI:urn:kbf:role:frontend"],
-        vec![Eku::ServerAuth],
-        |_| {},
-    );
+    let worker = || row_ekus(Row::FrontendWorker);
+    let nameless = leaf(&ca, &["URI:urn:kbf:role:frontend"], worker(), |_| {});
     assert_eq!(
-        check(&ca, &nameless, Row::FrontendReapi),
+        check(&ca, &nameless, Row::FrontendWorker),
         ["FAIL chain: it names no DNS name or address, so no TLS client can check it as a server"]
     );
     let v6 = leaf(
         &ca,
         &["IP:2001:db8::1", "URI:urn:kbf:role:frontend"],
-        vec![Eku::ServerAuth],
+        worker(),
         |_| {},
     );
-    assert_eq!(check(&ca, &v6, Row::FrontendReapi), Vec::<String>::new());
+    assert_eq!(check(&ca, &v6, Row::FrontendWorker), Vec::<String>::new());
 }
 
 /// Catches what cannot be checked read as a broken certificate (exit 1) instead of

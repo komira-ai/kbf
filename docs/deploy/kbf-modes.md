@@ -203,10 +203,12 @@ new modes' mutual TLS from the one CA, each with exactly one role, by this table
 
 | row | role (`urn:kbf:role:<role>`) | extended key usage | names |
 |---|---|---|---|
-| `frontend-reapi` | `frontend` | serverAuth | the name clients dial |
 | `frontend-worker` | `frontend` | serverAuth, clientAuth (it also calls storage) | the frontend's names |
 | `storage` | `storage` | serverAuth, clientAuth (replication calls) | the node's names |
 | `daemon` | `daemon` | clientAuth | exactly one DNS name, the node id |
+
+The frontend's REAPI listener, the name clients dial, presents a certificate that is not
+the farm CA's, so it has no row and `verify-cert --row frontend-reapi` is refused (exit 2).
 
 `kbf-deploy linux verify-cert` checks one certificate against its row, read only,
 before a unit is pointed at it:

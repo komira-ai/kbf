@@ -8,10 +8,12 @@
 //!
 //! | row | role | EKU |
 //! |---|---|---|
-//! | `frontend-reapi` | `frontend` | serverAuth (the REAPI listener clients dial) |
 //! | `frontend-worker` | `frontend` | serverAuth, clientAuth (the worker listener, and the frontend calling storage) |
 //! | `storage` | `storage` | serverAuth, clientAuth (the storage listener, and replication calls) |
 //! | `daemon` | `daemon` | clientAuth (a daemon's client certificate) |
+//!
+//! The frontend's REAPI listener, the name clients dial, presents a certificate the
+//! farm CA does not issue, so it is no row: `--row frontend-reapi` is refused.
 //!
 //! The checks, each a `FAIL <check>:` line:
 //!
@@ -58,8 +60,6 @@ pub const CLIENT_AUTH: &str = "clientAuth";
 /// A row of the certificate table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Row {
-    /// The frontend's REAPI listener, the name clients dial.
-    FrontendReapi,
     /// The frontend's worker listener, and the frontend when it calls storage.
     FrontendWorker,
     /// A storage node's listener, and its calls to other storage nodes.
@@ -70,18 +70,13 @@ pub enum Row {
 
 impl Row {
     /// Every row, in the table's order.
-    pub const ALL: [Row; 4] = [
-        Row::FrontendReapi,
-        Row::FrontendWorker,
-        Row::Storage,
-        Row::Daemon,
-    ];
+    pub const ALL: [Row; 3] = [Row::FrontendWorker, Row::Storage, Row::Daemon];
 
     /// The role the row's certificate names after [`ROLE_URI_PREFIX`].
     #[must_use]
     pub fn role(self) -> &'static str {
         match self {
-            Row::FrontendReapi | Row::FrontendWorker => "frontend",
+            Row::FrontendWorker => "frontend",
             Row::Storage => "storage",
             Row::Daemon => "daemon",
         }
@@ -91,7 +86,6 @@ impl Row {
     #[must_use]
     pub fn ekus(self) -> &'static [&'static str] {
         match self {
-            Row::FrontendReapi => &[SERVER_AUTH],
             Row::FrontendWorker | Row::Storage => &[SERVER_AUTH, CLIENT_AUTH],
             Row::Daemon => &[CLIENT_AUTH],
         }
@@ -100,7 +94,8 @@ impl Row {
 
 #[derive(Args)]
 pub struct VerifyArgs {
-    /// The row of the certificate table the certificate is for.
+    /// The row of the certificate table the certificate is for. The frontend's REAPI
+    /// certificate is not the farm CA's and is no row.
     #[arg(long, value_enum)]
     row: Row,
     /// The certificate (PEM; any certificates after the first are its intermediates).

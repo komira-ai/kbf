@@ -329,6 +329,24 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
     let (code, _, err) = cli(&mut exec, &no_env, &args);
     assert_eq!(code, ExitCode::from(2));
     assert!(err.contains("--node-id"), "{err}");
+    // The frontend's REAPI certificate is not the farm CA's: no row checks it.
+    let args = [
+        "linux",
+        "verify-cert",
+        "--row",
+        "frontend-reapi",
+        "--cert",
+        "/srv/none/reapi.pem",
+        "--ca-cert",
+        "/srv/none/ca.pem",
+    ];
+    let (code, out, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""));
+    assert!(
+        err.contains("invalid value 'frontend-reapi' for '--row <ROW>'"),
+        "{err}"
+    );
+    assert!(!err.contains("REFUSED: cannot read"), "{err}");
 
     // A rollback of a host whose services are on: a dry run plans, exits 0.
     let mut exec = FakeExec::new(501);
