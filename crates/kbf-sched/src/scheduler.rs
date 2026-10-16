@@ -451,7 +451,6 @@ impl Scheduler {
                 worker: worker.clone(),
                 reason,
             });
-        let lost = given_up.is_some() && reason.is_loss();
         if let Some(log) = &mut self.requeues {
             log.extend(given_up);
         }
@@ -460,7 +459,8 @@ impl Scheduler {
             .ops
             .get_mut(&id)
             .expect("held leases name live operations");
-        op.losses += u32::from(lost);
+        // Only an operation that holds a lease is requeued, so every call is a give-up.
+        op.losses += u32::from(reason.is_loss());
         op.state = OpState::Queued;
         self.queue.insert((Reverse(op.request.qos.clone()), id));
     }

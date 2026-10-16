@@ -552,6 +552,67 @@ async fn a_daemon_session_is_renewed_once_per_interval_not_per_lease() {
     assert_eq!(disk.store.scan_prefix("lease/").expect("scan"), lease_rows);
 }
 
+/// Catches: a write refused as stale (its row is gone: the store working) taken for an
+/// outage, which would hold every lease for the grace: a result whose lease row was
+/// deleted behind the farm's back is dropped, and a silent worker's other lease is
+/// still given up at the lease grace.
+#[tokio::test(start_paused = true)]
+async fn a_write_refused_as_stale_is_not_an_outage() {
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (_stream, mut inbox) = register(&farm);
+    submit(&farm, request(1)).expect("submitted");
+    submit(&farm, request(2)).expect("submitted");
+    let [first, _second] = starts(&mut inbox)[..] else {
+        panic!("two leases expected");
+    };
+    let stale = Txn::new().delete(
+        format!("lease/{:016x}.{:016x}", first.term, first.seq),
+        kbf_state::Cond::Any,
+    );
+    disk.store.txn(stale).expect("store").expect("delete");
+    assert!(accepted(&farm, first).await);
+    assert_eq!(
+        disk.rows("op/"),
+        2,
+        "the result was written though it was stale"
+    );
+
+    tokio::time::advance(kbf_sched::fence::LEASE_GRACE + Duration::from_secs(1)).await;
+    farm.tick().await;
+    assert_eq!(
+        disk.rows("queue/"),
+        1,
+        "the silent worker's lease was held for an outage's grace"
+    );
+}
+
+/// Catches: a session renewal the store refused that is not tried again (the row would
+/// expire under a daemon that heartbeats): the next heartbeat writes it.
+#[tokio::test(start_paused = true)]
+async fn a_session_renewal_the_store_refused_is_tried_at_the_next_heartbeat() {
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (stream, _inbox) = register(&farm);
+    let session = || {
+        disk.store
+            .get("session/node-a")
+            .expect("get")
+            .expect("a row")
+    };
+    let first = session();
+    tokio::time::advance(kbf_server::SESSION_RENEWAL + Duration::from_secs(1)).await;
+    disk.store.set_down(true);
+    assert!(farm.heartbeat(&node(), stream, 1, Vec::new()).await);
+    assert_eq!(session().version, first.version);
+    disk.store.set_down(false);
+    assert!(farm.heartbeat(&node(), stream, 2, Vec::new()).await);
+    assert!(
+        session().version > first.version,
+        "the refused renewal was not tried again"
+    );
+}
+
 /// Loses operation 1's lease as a daemon that reconnected without it does, on `farm`: a
 /// new session of the daemon, and a heartbeat that does not list the lease. Returns the
 /// new session's stream and inbox.
