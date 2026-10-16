@@ -33,6 +33,10 @@
 //! - `kbf-deploy linux swap --config FILE [--kubelet-allows-swap] [--remove] [--apply]`
 //!   ([`swap`]): the swapfile, active and in `/etc/fstab`.
 //!
+//! `kbf-deploy linux meta-backup --meta-dir DIR [--hot-dir DIR] --out FILE [--apply]`
+//! copies kbf-server's metadata log into one archive in a brief stop (as root), and
+//! `linux meta-verify --archive FILE --into DIR` extracts and checks one ([`meta`]).
+//!
 //! The settings are a closed set of `KEY=VALUE` lines ([`config::KEYS`],
 //! `templates/linux/config.example`).
 
@@ -41,6 +45,7 @@ pub mod config;
 pub mod host;
 pub mod images;
 pub mod install;
+pub mod meta;
 pub mod modes;
 pub mod render;
 pub mod swap;

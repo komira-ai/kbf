@@ -531,6 +531,80 @@ sudo kbf-deploy linux install-units --config node.conf --uninstall [--apply]
   `/var/lib/kbf-linux/removed/<unix seconds>/`; the binaries, the metadata log, the
   data directory, the bucket and the swapfile stay.
 
+## Metadata backup and restore
+
+kbf-server has no snapshot or backup command yet. The metadata directory (`--meta-dir`,
+or `<hot store>/meta`) holds the log's record (`log-record`), its lock, the Raft hard
+state and the log's segment files; a byte copy of every file taken while the server is
+**stopped** is a valid backup. A server started over the copy opens the same log (its
+start line prints the same `log=` id) at the same entry, and a copy that lost
+`log-record` is refused at start ("holds files but no log-record") rather than opened as
+a new, empty log. `kbf-server`'s `tests/file_cold_store.rs`
+(`a_copy_of_a_stopped_servers_meta_dir_is_a_backup`) checks both.
+
+A backup is a brief stop, taken by `kbf-deploy` as root:
+
+```text
+sudo kbf-deploy linux meta-backup --meta-dir DIR [--hot-dir DIR] --out FILE
+                                  [--metrics URL] [--unit NAME] [--ready-secs N] [--apply]
+kbf-deploy linux meta-verify --archive FILE --into DIR
+```
+
+- `meta-backup` reads `/metrics` (`--metrics`, default
+  `http://127.0.0.1:8982/metrics`, the operator API port) and refuses unless
+  `kbf_write_tier_unflushed_bytes` and `kbf_write_tier_unflushed_blocks` are 0 and
+  `kbf_write_tier_flush_conflicts_total` is 0; an answer it cannot read is a refusal.
+  The write tier is not flushed at shutdown, so a block left on the hot store holds
+  acknowledged bytes the object store does not have. A server with a write tier needs
+  `--hot-dir` (its `--hot-store` directory); one without needs none.
+- It then stops the unit (`--unit`, default `kbf-server`), refuses if the hot store
+  holds a `*.blk` block (written between the read and the stop; a flushed copy is
+  `*.seg`), and writes `--out`: an uncompressed tar of every file of the directory
+  (`*.tmp` aside, which the server removes at start) as `meta/<name>`, and
+  `MANIFEST.sha256` with one `sha256sum` line per file. The archive is written beside
+  `--out`, synced, linked into place (an existing file is never replaced) and its
+  directory synced. It starts the unit and waits up to `--ready-secs` (300) for
+  `/readyz` on the same port, then prints the archive's size and sha256 and
+  `downtime: <s> s`, the seconds from the stop to the ready answer. Any failure after
+  the stop starts the unit again before the verb exits 1.
+- Without `--apply` it reads `/metrics` and the paths, refuses as an apply would, and
+  prints each step as `DRY-RUN:`. Exit codes: 0 done, 1 a failure after the stop (the
+  unit restarted), 2 refused before anything changed (`REFUSED:` on stderr).
+- Copy the archive off the node and check its sha256 there. `--out` must not be inside
+  the metadata directory; a copy on the same disk is no backup of that disk.
+
+`meta-verify` extracts an archive into an empty or new directory (files 0600, the
+directory 0700, each synced), checks every file against the manifest and that
+`log-record` is there, and prints the file count, bytes, log segment count and the log
+id. A file that does not match, one missing or unlisted, or no record exits 1 with a
+`FAIL` line and removes what it wrote. It never starts a server. A plain
+`tar -xf FILE && sha256sum -c MANIFEST.sha256` checks the same hashes.
+
+**A restored copy shares the live log's id and its writer epochs.** A server started
+over it writes object keys under the same `kbf/<log id>/` prefix, and the epochs it
+takes follow the backup's, which the live server has already used. So:
+
+- Never start a restored copy with write access to the live server's object store
+  while the live server runs: its uploads can land on keys the live server wrote.
+- Never start one against a live `file://` store at all: the start-up pass deletes
+  every file of an earlier epoch under the prefix that the index does not name, and the
+  copy's index lacks everything written since the backup.
+
+To test a restore, start the copy on a spare host, as yourself (no service), with its
+listeners on loopback, against either a throwaway MinIO holding a copy of the bucket
+under the same prefix root or the live bucket through a read-only key. If the live
+server has a write tier, give the copy a fresh, empty `--hot-store`: with nothing staged
+at the backup it registers a new tier, and its `write tier attached` line must show
+`lost=0`. Check that the start line's `log=` equals the live server's, that `/readyz`
+answers 200, and that blobs and action-cache entries written before the backup read
+back. Time the restore as the seconds from the start of `meta-verify` to that `/readyz`
+200, beside the backup's `downtime:` and the directory's size.
+
+The log keeps every entry it has committed, so the directory, the backup's downtime and
+the restore's time all grow with the log until snapshots and compaction land
+([metadata-snapshots.md](../design/metadata-snapshots.md)). Measure again at every
+backup.
+
 ## What the tests check
 
 - `crates/kbf-it/tests/deploy_units.rs` runs `kbf-server`'s flag parser over the
@@ -553,3 +627,10 @@ sudo kbf-deploy linux install-units --config node.conf --uninstall [--apply]
   supplementary groups in the child. The rendered units'
   `ExecStart=` lines go through `kbf-server`'s parser (`kbf-it`) and `kbf-daemon`'s
   (`kbf-node`) too.
+- `kbf-deploy`'s `src/linux/meta/tests.rs` and `archive_tests.rs` refuse a backup on
+  each write-tier reading (unflushed bytes, blocks, conflicts, an unreadable answer)
+  before any step, require the unit started again after every failure that follows the
+  stop (a late `*.blk`, an archive that fails, a failed stop), a dry run that runs
+  nothing, a manifest that lists every file and no `*.tmp`, and a verify that catches a
+  flipped byte, a lost, unlisted or stray entry, a missing `log-record` and a non-empty
+  target.
