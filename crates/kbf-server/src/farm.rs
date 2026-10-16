@@ -47,7 +47,8 @@ use kbf_proto::worker::{
 };
 use kbf_sched::fence::START_VALIDITY;
 use kbf_sched::{
-    Cordon, DaemonInstance, Event, FARM_RERUNS, Input, MemoryLadder, OpState, Requeue, Scheduler,
+    Cordon, DaemonInstance, Event, FARM_RERUNS, Input, LOSS_REQUEUES, MemoryLadder, OpState,
+    Requeue, Scheduler,
 };
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, Failure, FarmRun, FarmTime, LeaseGrant, LeaseId,
@@ -57,11 +58,14 @@ use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
 
 mod beat;
+mod durable;
 mod phase;
 mod record;
 
+pub use durable::{EpochPolicy, SESSION_RENEWAL, StateError};
 pub use phase::Reported;
 
+use self::durable::Durable;
 use crate::action_usage::{self, Measured, Shapes};
 use crate::fault;
 use crate::fleet::{
@@ -200,6 +204,18 @@ struct State {
     /// The operations a recorded call waits on: the only ones [`record`] tells the
     /// recorder of. Each leaves at its end.
     recorded: BTreeSet<OperationId>,
+    /// The state store every change is written through before it is acknowledged, if
+    /// the farm has one ([`Farm::with_state`]).
+    durable: Option<Durable>,
+    /// Leases given up that the state store has not yet been told of, oldest first.
+    /// Until it has, it still holds the lease and no queue row for the operation, so
+    /// every one is written again before anything that follows it is
+    /// ([`State::log_requeues`]).
+    unsettled: Vec<(Requeue, Option<u32>)>,
+    /// The scheduler was told the state store is unavailable ([`State::watch_store`]).
+    store_down: bool,
+    /// When each node's session row in the state store was last written.
+    renewed: BTreeMap<WorkerId, FarmTime>,
 }
 
 /// What a finished operation tells its callers, and the action-cache entry to write
@@ -234,6 +250,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         let sched = Scheduler::new(term)
             .with_unservable_wait(unservable_wait)
             .with_finished_retention(finished_retention)
+            .with_loss_requeues(LOSS_REQUEUES)
             .recording_requeues();
         Self {
             cache,
@@ -251,6 +268,10 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 paused: BTreeSet::new(),
                 recorder: Recorder::off(),
                 recorded: BTreeSet::new(),
+                durable: None,
+                unsettled: Vec::new(),
+                store_down: false,
+                renewed: BTreeMap::new(),
             }),
         }
     }
@@ -352,6 +373,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             let cause = "the daemon restarted, or two daemons hold this node's certificate";
             tracing::warn!(%worker, cause, "another daemon process registered as this node");
         }
+        state.record_session(now, worker, &instance, stopped, &reported);
         let event = Event::WorkerUp {
             worker: worker.clone(),
             instance,
@@ -703,6 +725,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
         let waiting = std::time::Instant::now();
         let mut state = self.lock();
         self.cache.metrics().sched_lock_wait.since(waiting);
+        state.admit(&submission.request)?;
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
         let waiter = state.machine.submit(Waiter {
@@ -874,6 +897,7 @@ impl State {
     /// effects in order. Returns the answers, for the caller to deliver once the lock
     /// is released.
     fn feed(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
+        self.watch_store(now);
         let mut effects: VecDeque<Effect> = self.sched.apply(Input::new(now, event)).into();
         effects.extend(self.sched.apply(Input::new(now, Event::Tick)));
         self.log_requeues();
@@ -884,9 +908,14 @@ impl State {
                     if let ControlRecord::Lease(grant) = &record {
                         self.offer(grant);
                     }
-                    // Single node: appended is committed. The replicated log goes here.
+                    // Appended is committed; the effects of the commit (the `Start`, the
+                    // answer) are carried out only once the state store has taken what
+                    // they settle.
                     let committed = Event::Committed(record);
-                    effects.extend(self.sched.apply(Input::new(now, committed)));
+                    let next = self.sched.apply(Input::new(now, committed));
+                    if self.durably("a committed record", |d| d.persist(&next)) {
+                        effects.extend(next);
+                    }
                 }
                 Effect::Start(start) => self.start(start),
                 Effect::Answer(answer) => {
@@ -929,7 +958,9 @@ impl State {
     /// feed. A requeue only names an operation the scheduler held when it was made;
     /// one dropped since is logged with an empty name, never looked up by index.
     fn log_requeues(&mut self) {
-        for requeue in self.sched.take_requeues() {
+        let given_up = self.sched.take_requeues();
+        self.settle_requeues(&given_up);
+        for requeue in given_up {
             self.record_requeue(&requeue);
             let Requeue {
                 operation,
@@ -1218,64 +1249,4 @@ fn unrun(outcome: Outcome, farm_runs: &[FarmRun]) -> Finished {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Catches a server process that reuses an earlier process's term (issue #137:
-    /// every process granted leases from `(1, 0)`), and one whose term does not order
-    /// after that of a process started a few milliseconds before. A term is also never
-    /// 1, the term every server before the fix used.
-    #[test]
-    fn each_process_term_is_new_and_later() {
-        let first = process_term();
-        std::thread::sleep(Duration::from_millis(3));
-        let second = process_term();
-        assert!(second > first, "{second} does not order after {first}");
-        assert!(first >> 16 > 0, "{first} could be a pre-fix term");
-    }
-
-    /// Catches a result the farm settles with no detail that is not a farm fault (a
-    /// committed `Completed` whose worker report this process never saw) being answered
-    /// as anything but the fixed INTERNAL "could not run the action", or panicking.
-    #[test]
-    fn a_result_without_detail_that_is_no_fault_is_answered_internal() {
-        let farm = Farm::new(
-            Arc::new(Cache::memory()),
-            kbf_sched::UNSERVABLE_WAIT,
-            kbf_sched::FINISHED_RETENTION,
-        );
-        let answer = kbf_types::Answer {
-            operation: kbf_types::OperationId(1),
-            lease: kbf_types::LeaseId::new(1, 0),
-            waiters: Vec::new(),
-            outcome: Outcome::Completed {
-                action_result: kbf_types::Digest::new(
-                    kbf_types::DigestFunction::Sha256,
-                    [1; 32],
-                    1,
-                ),
-            },
-            memory_runs: Vec::new(),
-            farm_runs: Vec::new(),
-        };
-        let settled = farm.lock().settle(&answer, None);
-        assert_eq!(
-            settled.finished,
-            failed(Code::Internal, "the farm could not run the action")
-        );
-    }
-
-    /// Catches a farm fault (Infra, node memory pressure, a lost run) with no detail being
-    /// answered as the plain INTERNAL, which drops the farm's runs and the operator fix.
-    #[test]
-    fn a_result_without_detail_that_is_a_farm_fault_names_the_fault() {
-        for failure in [Failure::Infra, Failure::NodeMemoryPressure] {
-            let finished = unrun(Outcome::Failed(failure), &[]);
-            assert_eq!(finished, fault::finished(&[]), "{failure:?}");
-            assert_ne!(
-                finished,
-                failed(Code::Internal, "the farm could not run the action")
-            );
-        }
-    }
-}
+mod tests;
