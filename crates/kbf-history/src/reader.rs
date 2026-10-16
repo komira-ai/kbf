@@ -182,7 +182,7 @@ impl<O: ObjectStore> Reader<O> {
 fn locate(index: &dyn Store, root: &HistoryRoot, id: RunId) -> Result<Option<Located>, ReadError> {
     let day = id.day();
     let streams = index.scan_prefix(&rows::stream_prefix(day, id.stream()))?;
-    // Rows sort by first commit time: the run's stream is the newest at or before it.
+    // Rows sort by open time: the run's stream is the newest opened at or before it.
     let found = streams
         .iter()
         .rev()

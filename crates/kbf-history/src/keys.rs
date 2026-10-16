@@ -300,7 +300,8 @@ pub mod rows {
         format!("ui/stream/{day}/{stream}/")
     }
 
-    /// The row of `stream` on `day` whose first run committed at `first_ms`. The time is
+    /// The row of `stream` on `day` that opened at `first_ms` (its first id's time, which
+    /// no later id of the stream precedes). The time is
     /// part of the key, so a fallback stream id reused after a restart gets a row of its
     /// own and the newest row at or before a run's time is the run's stream.
     #[must_use]

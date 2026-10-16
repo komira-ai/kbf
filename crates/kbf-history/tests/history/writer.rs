@@ -412,6 +412,7 @@ fn a_chunk_is_cut_at_its_size_on_a_new_day_and_on_a_new_stream() {
             inv: inv.clone(),
             record: Box::new(r),
             failed: None,
+            stream_opened_ms: T,
         });
     }
     life.close(&inv);
@@ -754,7 +755,7 @@ fn a_chunk_footer_carries_its_digest_table_and_slowest_runs() {
     // Slower to execute, faster on the wall clock.
     let a = life.run(&inv, T, "main", RunOutcome::Ok);
     // Faster to execute, slower on the wall clock, and failed (with a section).
-    let id = life.minter.mint(&inv.key, T + 1).id;
+    let minted = life.minter.mint(&inv.key, T + 1);
     let mut b = run_record("main", RunOutcome::Failed, T + 1);
     b.timestamps = Some(Timestamps {
         queued_us: 0,
@@ -763,11 +764,12 @@ fn a_chunk_footer_carries_its_digest_table_and_slowest_runs() {
         worker_completed_us: 10_000,
         ..Timestamps::default()
     });
-    b.set_run_id(id);
+    b.set_run_id(minted.id);
     assert!(life.queue.offer(Event::Run {
         inv: inv.clone(),
         record: Box::new(b.clone()),
         failed: Some(failed_section("main")),
+        stream_opened_ms: minted.stream_opened_ms,
     }));
     // A hit whose digest sorts before the runs', though its record comes after them.
     assert!(life.queue.offer(Event::Hit {
@@ -903,4 +905,39 @@ fn index_transactions_retried_on_conflicts_count_against_the_step_bound() {
         3,
         "only the failed write's rows counted"
     );
+}
+
+#[test]
+fn a_stream_row_is_keyed_by_the_stream_open_time_whatever_order_events_arrive() {
+    // Catches: a `ui/stream` row keyed by whichever run of the stream the writer took
+    // first. Events reach the queue from concurrent requests in no fixed order, so a
+    // later run first keys the row past the earlier run's time, and that run's id no
+    // longer resolves (or, with a fallback id reused across lives, resolves to the
+    // other life's chunk).
+    let mut life = Life::fresh(Limits::default());
+    let inv = InvRef::named("b1");
+    let m0 = life.minter.mint(&inv.key, T);
+    let m1 = life.minter.mint(&inv.key, T + 5);
+    let mut runs = Vec::new();
+    for m in [m0, m1] {
+        let mut r = run_record("main", RunOutcome::Ok, m.id.time_ms());
+        r.set_run_id(m.id);
+        runs.push((m, r));
+    }
+    // The later run reaches the queue first.
+    for (m, r) in runs.iter().rev() {
+        assert!(life.queue.offer(Event::Run {
+            inv: inv.clone(),
+            record: Box::new(r.clone()),
+            failed: None,
+            stream_opened_ms: m.stream_opened_ms,
+        }));
+    }
+    life.close(&inv);
+    life.step(T + 5);
+    let reader = life.reader();
+    for (_, r) in &runs {
+        let got = futures::executor::block_on(reader.run(r.run_id(), &all)).unwrap();
+        assert_eq!(got.map(|v| v.run).as_ref(), Some(r), "{}", r.run_id());
+    }
 }

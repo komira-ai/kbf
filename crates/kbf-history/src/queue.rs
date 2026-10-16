@@ -56,6 +56,9 @@ pub enum Event {
         record: Box<RunRecord>,
         /// The failed-run section.
         failed: Option<FailedRun>,
+        /// When the run's stream opened, from its [`Minted`](crate::Minted): the
+        /// stream row's key, whichever of the stream's runs the writer takes first.
+        stream_opened_ms: u64,
     },
     /// A cache hit that was answered.
     Hit {
@@ -221,6 +224,7 @@ mod tests {
             inv: InvRef::idless(WriterId(1), Day::from_number(20_261_016)),
             record: Box::default(),
             failed,
+            stream_opened_ms: 0,
         };
         let section = FailedRun {
             instance: "x".repeat(1000),

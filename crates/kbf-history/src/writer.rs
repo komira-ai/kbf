@@ -145,7 +145,7 @@ struct Inv {
     building: Building,
     slowest_execution: Vec<Slow>,
     slowest_wall: Vec<Slow>,
-    /// The first commit time of each stream this writer has seen, its row key's time.
+    /// The open time of each stream this writer has seen, its row key's time.
     stream_first: BTreeMap<u32, u64>,
 }
 
@@ -358,6 +358,7 @@ impl Core {
                 inv,
                 record,
                 failed,
+                stream_opened_ms,
             } => {
                 let day = Day::from_ms(record.time_ms);
                 self.break_if(&inv, day, Some(record.stream), now_ms);
@@ -370,7 +371,7 @@ impl Core {
                 state
                     .stream_first
                     .entry(record.stream)
-                    .or_insert(record.time_ms);
+                    .or_insert(stream_opened_ms);
                 let mut size = record.encoded_len();
                 let b = start(&mut state.building, day, now_ms);
                 b.stream = Some(record.stream);

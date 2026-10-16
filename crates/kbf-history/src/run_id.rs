@@ -9,7 +9,12 @@
 //! in-process counter in a range no block uses (top bit set, then the writer's 7-bit
 //! frontend index, then 16 bits), so minting never waits on the state store. Fallback
 //! ids are not durable and are reused after a restart; the `ui/stream` row key carries
-//! the stream's first commit time, so a reused id still resolves to its own chunk.
+//! the stream's open time, so a reused id still resolves to its own chunk.
+//!
+//! The minter owns that open time: it is the time of the stream's first id, and every
+//! later id of the stream carries a time no earlier than the one before it (a commit
+//! time read before the lock is raised to it), so time order follows sequence order
+//! and no run of a stream is earlier than the stream's row.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -143,13 +148,28 @@ impl FromStr for RunId {
     }
 }
 
-/// A freshly minted run id, and whether it opened its stream.
+/// A freshly minted run id, whether it opened its stream, and when the stream opened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Minted {
     /// The id.
     pub id: RunId,
     /// The id is its stream's first (sequence 0).
     pub opened_stream: bool,
+    /// The time of the stream's first id, milliseconds: the `ui/stream` row's key. The
+    /// history event of the run carries it ([`Event::Run`](crate::Event::Run)).
+    pub stream_opened_ms: u64,
+}
+
+/// An open stream of one (invocation, day).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpenStream {
+    stream: StreamId,
+    /// The next sequence.
+    next: u32,
+    /// The time of its first id.
+    opened_ms: u64,
+    /// The time of its newest id.
+    last_ms: u64,
 }
 
 /// Mints run ids from memory. Shared between the request path, which mints, and the
@@ -169,8 +189,8 @@ struct MintState {
     spare: Option<u32>,
     /// The next fallback id's low 16 bits.
     fallback: u16,
-    /// The open stream of each (invocation, day), with its next sequence.
-    open: BTreeMap<(InvKey, Day), (StreamId, u32)>,
+    /// The open stream of each (invocation, day).
+    open: BTreeMap<(InvKey, Day), OpenStream>,
 }
 
 impl Minter {
@@ -197,19 +217,36 @@ impl Minter {
 
     /// The id of a run of invocation `inv` whose `Result` committed at `commit_ms`.
     /// Never waits: a stream id comes from the current block, the spare block, or the
-    /// fallback range.
+    /// fallback range. The id's time is `commit_ms`, raised to the stream's newest id's
+    /// time when the caller's clock read lost a race with another mint.
     pub fn mint(&self, inv: &InvKey, commit_ms: u64) -> Minted {
         let mut st = self.state();
         let day = Day::from_ms(commit_ms);
         let slot = (inv.clone(), day);
-        let (stream, seq) = match st.open.get(&slot) {
-            Some(&(stream, seq)) if seq <= MAX_SEQ => (stream, seq),
-            _ => (st.next_stream(), 0),
+        let open = match st.open.get(&slot) {
+            // The raised time is the newest id's, of the same day.
+            Some(&o) if o.next <= MAX_SEQ => OpenStream {
+                last_ms: o.last_ms.max(commit_ms),
+                ..o
+            },
+            _ => OpenStream {
+                stream: st.next_stream(),
+                next: 0,
+                opened_ms: commit_ms,
+                last_ms: commit_ms,
+            },
         };
-        st.open.insert(slot, (stream, seq + 1));
+        st.open.insert(
+            slot,
+            OpenStream {
+                next: open.next + 1,
+                ..open
+            },
+        );
         Minted {
-            id: RunId::new(commit_ms, stream, seq),
-            opened_stream: seq == 0,
+            id: RunId::new(open.last_ms, open.stream, open.next),
+            opened_stream: open.next == 0,
+            stream_opened_ms: open.opened_ms,
         }
     }
 
@@ -394,7 +431,8 @@ mod tests {
         {
             let mut st = m.state();
             let slot = (inv(1), Day::from_ms(T));
-            st.open.insert(slot, (c.id.stream(), MAX_SEQ));
+            let open = st.open.get_mut(&slot).unwrap();
+            open.next = MAX_SEQ;
         }
         let last = m.mint(&inv(1), T + 2).id;
         assert_eq!((last.stream(), last.seq()), (c.id.stream(), MAX_SEQ));
@@ -417,6 +455,29 @@ mod tests {
         m.state().fallback = u16::MAX;
         assert_eq!(m.mint(&inv(1), T).id.stream(), StreamId(0x80_FFFF));
         assert_eq!(m.mint(&inv(2), T).id.stream(), StreamId(0x80_0000));
+    }
+
+    #[test]
+    fn a_stream_keeps_its_open_time_and_its_ids_never_go_back_in_time() {
+        // Catches: a run id whose time is earlier than its stream's previous id (a
+        // commit time read before the lock, minted after a later one), which would sort
+        // seq 1 before seq 0 and fall before the stream's row; and an open time that
+        // is not the stream's first id's.
+        let m = Minter::new(0);
+        let a = m.mint(&inv(1), T + 5);
+        assert_eq!((a.id.time_ms(), a.stream_opened_ms), (T + 5, T + 5));
+        let b = m.mint(&inv(1), T);
+        assert_eq!(
+            (b.id.seq(), b.id.time_ms()),
+            (1, T + 5),
+            "raised to the newest"
+        );
+        assert!(a.id < b.id);
+        let c = m.mint(&inv(1), T + 9);
+        assert_eq!((c.id.time_ms(), c.stream_opened_ms), (T + 9, T + 5));
+        // A new stream opens at its own first id's time.
+        let d = m.mint(&inv(2), T + 1);
+        assert_eq!((d.id.time_ms(), d.stream_opened_ms), (T + 1, T + 1));
     }
 
     #[test]

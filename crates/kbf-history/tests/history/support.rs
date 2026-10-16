@@ -356,6 +356,7 @@ impl Life {
             inv: inv.clone(),
             record: Box::new(r.clone()),
             failed,
+            stream_opened_ms: minted.stream_opened_ms,
         }));
         r
     }

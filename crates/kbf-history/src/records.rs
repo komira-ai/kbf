@@ -709,7 +709,8 @@ pub struct ChunkSummary {
     /// restore takes them from the footer range it read.
     #[prost(message, optional, tag = "4")]
     pub row: Option<ChunkRow>,
-    /// The first commit time of the chunk's stream, the `ui/stream` row's key.
+    /// The open time of the chunk's stream (its first id's time), the `ui/stream` row's
+    /// key.
     #[prost(uint64, tag = "5")]
     pub stream_first_ms: u64,
     /// The invocation's header as of this chunk.

@@ -55,13 +55,15 @@ fn a_run_reads_back_with_its_failed_section_and_an_ok_run_without() {
     }
     // A failed run written without a section reads back with none.
     let other = InvRef::named("bare");
-    let id = life.minter.mint(&other.key, T + 10).id;
+    let minted = life.minter.mint(&other.key, T + 10);
+    let id = minted.id;
     let mut r = crate::support::run_record("a", RunOutcome::Failed, T + 10);
     r.set_run_id(id);
     life.queue.offer(kbf_history::Event::Run {
         inv: other.clone(),
         record: Box::new(r.clone()),
         failed: None,
+        stream_opened_ms: minted.stream_opened_ms,
     });
     life.close(&other);
     life.step(T + 10);
