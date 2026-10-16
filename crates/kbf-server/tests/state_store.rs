@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
-use kbf_front::{Cache, Dispatch, MemoryMetaLog, Submission};
+use kbf_front::{Cache, Dispatch, Finished, MemoryMetaLog, Stage, Submission};
 use kbf_objstore::MemoryStore;
 use kbf_proto::google::rpc;
 use kbf_proto::worker::{self, ServerMessage, server_message};
@@ -420,6 +420,165 @@ async fn a_bumped_epoch_requeues_the_old_term_leases_the_daemon_killed() {
     assert_eq!(starts(&mut inbox), [LeaseId::new(epoch + 1, 1)]);
     assert!(!accepted(&after, old).await, "the old term's result");
     assert_eq!(disk.rows("lease/"), 1);
+}
+
+/// Catches: an outage that makes every lease look expired the moment the store returns.
+/// The farm could not write, so it could not hear its workers either; the lease must not
+/// be given up (and, here, requeued in the store) until the grace after the store's return
+/// has passed, and a lease nobody renewed goes after it.
+#[tokio::test(start_paused = true)]
+async fn an_outage_requeues_nothing_inside_the_grace_and_the_unrenewed_lease_after_it() {
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (_stream, mut inbox) = register(&farm);
+    submit(&farm, request(1)).expect("submitted");
+    assert_eq!(starts(&mut inbox).len(), 1);
+
+    disk.store.set_down(true);
+    let refused = submit(&farm, request(2)).expect_err("the outage is noticed");
+    assert_eq!(refused.code(), Code::Unavailable);
+    // The farm's clock runs on through the outage; nobody is heard meanwhile.
+    tokio::time::advance(kbf_sched::fence::LEASE_GRACE * 10).await;
+    farm.tick().await;
+    disk.store.set_down(false);
+    farm.tick().await;
+    assert_eq!(
+        (disk.rows("lease/"), disk.rows("queue/")),
+        (1, 0),
+        "the lease was given up the moment the store returned"
+    );
+
+    tokio::time::advance(kbf_sched::fence::LEASE_GRACE - Duration::from_secs(5)).await;
+    farm.tick().await;
+    assert_eq!((disk.rows("lease/"), disk.rows("queue/")), (1, 0));
+    assert!(starts(&mut inbox).is_empty());
+
+    tokio::time::advance(Duration::from_secs(10)).await;
+    farm.tick().await;
+    assert_eq!(
+        (disk.rows("lease/"), disk.rows("queue/")),
+        (0, 1),
+        "the unrenewed lease outlived the grace"
+    );
+}
+
+/// Catches: renewal per lease (a heartbeat of a node holding three leases writing three
+/// rows, or any write per heartbeat) instead of one row per daemon session per interval;
+/// a renewal that touches a lease row (the fencing token is written at the grant only);
+/// and a session row that never expires (a daemon that left would look live for ever).
+#[tokio::test(start_paused = true)]
+async fn a_daemon_session_is_renewed_once_per_interval_not_per_lease() {
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (stream, mut inbox) = register(&farm);
+    for tag in 1..=3 {
+        submit(&farm, request(tag)).expect("submitted");
+    }
+    let leases = starts(&mut inbox);
+    assert_eq!(leases.len(), 3);
+    let session = || {
+        let row = disk.store.get("session/node-a").expect("get");
+        row.expect("a session row")
+    };
+    let first = session();
+    assert!(first.expires_at.is_some(), "a session row must expire");
+    let lease_rows = disk.store.scan_prefix("lease/").expect("scan");
+    let writes = disk.store.commit_stats().txns;
+
+    let mut seq = 0;
+    for _ in 0..5 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        seq += 1;
+        assert!(farm.heartbeat(&node(), stream, seq, leases.clone()).await);
+    }
+    assert_eq!(
+        disk.store.commit_stats().txns,
+        writes,
+        "a heartbeat inside the interval wrote"
+    );
+
+    tokio::time::advance(kbf_server::SESSION_RENEWAL).await;
+    seq += 1;
+    assert!(farm.heartbeat(&node(), stream, seq, leases).await);
+    assert_eq!(
+        disk.store.commit_stats().txns,
+        writes + 1,
+        "one write renews the session, whatever it holds"
+    );
+    let renewed = session();
+    assert!(renewed.version > first.version);
+    assert!(renewed.expires_at > first.expires_at);
+    assert_eq!(disk.store.scan_prefix("lease/").expect("scan"), lease_rows);
+}
+
+/// Loses operation 1's lease as a daemon that reconnected without it does, on `farm`: a
+/// new session of the daemon, and a heartbeat that does not list the lease. Returns the
+/// new session's stream and inbox.
+async fn lose_lease(farm: &TestFarm) -> (StreamId, Inbox) {
+    let (stream, inbox) = register(farm);
+    assert!(farm.heartbeat(&node(), stream, 1, Vec::new()).await);
+    (stream, inbox)
+}
+
+/// Catches: a loss count that a restart forgets (an action that kills the scheduler's
+/// host starts from none each time and loops for ever): two losses are written, survive a
+/// crash, and the third, the recovered lease's, refuses the operation, whose rows then go.
+#[tokio::test(start_paused = true)]
+async fn lost_leases_are_counted_across_a_restart_and_the_third_is_refused() {
+    let mut disk = Disk::new();
+    let before = disk.farm(EpochPolicy::Keep);
+    let (_, mut inbox) = register(&before);
+    submit(&before, request(1)).expect("submitted");
+    assert_eq!(starts(&mut inbox).len(), 1);
+    for lost in 1..=2u8 {
+        let (_, mut inbox) = lose_lease(&before).await;
+        assert_eq!(
+            starts(&mut inbox).len(),
+            1,
+            "granted again after loss {lost}"
+        );
+        assert_eq!(disk.rows("loss/"), 1, "the count is written");
+    }
+    disk.crash(before);
+
+    let after = disk.farm(EpochPolicy::Keep);
+    let (stream, mut inbox) = register(&after);
+    assert!(after.heartbeat(&node(), stream, 1, Vec::new()).await);
+    assert!(
+        starts(&mut inbox).is_empty(),
+        "a third lost lease was granted again"
+    );
+    assert_eq!(disk.rows("op/"), 0, "the refused operation was kept");
+    assert_eq!(disk.rows("loss/"), 0, "its count was kept");
+    assert_eq!((disk.rows("lease/"), disk.rows("queue/")), (0, 0));
+}
+
+/// Catches: a refusal that leaves the caller waiting, or answers with another code than
+/// FAILED_PRECONDITION (the code of every refusal), or with no reason.
+#[tokio::test(start_paused = true)]
+async fn the_third_lost_lease_answers_the_caller_with_the_reason() {
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (_, mut inbox) = register(&farm);
+    let ticket = farm
+        .submit(Submission {
+            request: request(1),
+            call: None,
+        })
+        .expect("submitted");
+    assert_eq!(starts(&mut inbox).len(), 1);
+    for _ in 1..=2 {
+        let (_, mut inbox) = lose_lease(&farm).await;
+        assert_eq!(starts(&mut inbox).len(), 1);
+    }
+    assert!(!matches!(*ticket.stage.borrow(), Stage::Done(_)));
+    let (_, mut inbox) = lose_lease(&farm).await;
+    assert!(starts(&mut inbox).is_empty());
+    let Stage::Done(Finished::Failed(status)) = ticket.stage.borrow().clone() else {
+        panic!("the caller was not answered");
+    };
+    assert_eq!(status.code, Code::FailedPrecondition as i32);
+    assert!(status.message.contains("lost"), "{}", status.message);
 }
 
 /// Catches: a lease given up for silence that stays in the store as held (a restart

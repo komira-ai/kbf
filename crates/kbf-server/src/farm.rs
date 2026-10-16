@@ -63,7 +63,7 @@ mod durable;
 mod phase;
 mod record;
 
-pub use durable::{EpochPolicy, StateError};
+pub use durable::{EpochPolicy, SESSION_RENEWAL, StateError};
 pub use phase::Reported;
 
 use self::durable::Durable;

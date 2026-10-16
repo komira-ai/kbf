@@ -73,6 +73,7 @@ fn queued(operation: u64, request: Request) -> Recovered {
         request,
         waiter: WaiterId(operation),
         lease: None,
+        losses: 0,
     }
 }
 

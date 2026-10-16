@@ -2,7 +2,9 @@
 
 mod fault;
 mod give_up;
+pub(crate) mod loss;
 pub(crate) mod memory;
+mod outage;
 mod phase;
 mod recover;
 mod state;

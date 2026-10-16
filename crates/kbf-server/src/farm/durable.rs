@@ -21,7 +21,7 @@
 //! decides what a row may hold.
 
 use std::sync::{Arc, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_front::{MetaLog, Stage};
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
@@ -38,6 +38,12 @@ use tonic::Status;
 
 use super::{Farm, FarmMachine, Reported, Sent, Stamp, State, Waiter, process_term};
 use crate::state_store::StateStore;
+
+/// How often a daemon session's row in the store is renewed while the daemon heartbeats:
+/// a third of the lease grace, so the row outlives two missed renewals. One write per
+/// session per interval, whatever the number of leases it holds.
+pub const SESSION_RENEWAL: Duration =
+    Duration::from_secs(kbf_sched::fence::LEASE_GRACE.as_secs() / 3);
 
 const EPOCH: &str = "meta/epoch";
 const NEXT_OP: &str = "meta/next_op";

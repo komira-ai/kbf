@@ -21,6 +21,9 @@ pub struct Recovered {
     pub waiter: WaiterId,
     /// The committed lease it holds, if one was granted and not given up.
     pub lease: Option<RecoveredLease>,
+    /// How many of its leases were lost before (counted by
+    /// [`Scheduler::with_loss_requeues`]), as the store holds it.
+    pub losses: u32,
 }
 
 /// A committed lease of a [`Recovered`] operation.
@@ -63,6 +66,7 @@ impl Scheduler {
                 request,
                 waiter,
                 lease,
+                losses: _,
             } = recovered;
             if request.joinable() {
                 self.in_flight.insert(request.key.clone(), id);

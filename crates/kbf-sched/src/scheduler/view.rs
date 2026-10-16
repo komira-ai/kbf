@@ -140,4 +140,12 @@ impl Scheduler {
             granted && !held_here
         })
     }
+
+    /// How many of `operation`'s leases were lost so far, if the scheduler holds it and
+    /// counts them ([`Scheduler::with_loss_requeues`]).
+    #[must_use]
+    pub fn losses(&self, operation: OperationId) -> Option<u32> {
+        let _ = operation;
+        None
+    }
 }
