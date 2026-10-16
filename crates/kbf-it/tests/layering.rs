@@ -25,6 +25,10 @@
 //!   a frontend crate (`STORAGE_MUST_NOT_REACH`: the scheduler and authorization), which
 //!   would make a storage process link the frontend; and the storage crate renamed or
 //!   removed, which would make that check pass vacuously;
+//! - the routing library (`kbf-route`) depending, directly or through another crate, on a
+//!   frontend crate, the server, or the daemon's side (`ROUTE_MUST_NOT_REACH`): the
+//!   frontend and the daemon both link it, and neither may pull in the other's code
+//!   through it;
 //! - a daemon crate (`DAEMON_ONLY`: `kbf-node`, the `kbf-daemon` binary's library, and
 //!   `kbf-daemon` beneath it) depending, directly or through another crate, on the object
 //!   store client, a crate that holds one, or a standalone HTTP client one could be
@@ -378,6 +382,36 @@ fn a_daemon_cannot_build_a_cold_store_client() {
         violations.is_empty(),
         "a daemon crate reaches an object-store client (a daemon-only node holds no \
          cold-store credential, docs/design/architecture-v2.md section 9):\n{}",
+        violations.join("\n")
+    );
+}
+
+/// What the routing library's normal dependencies must not reach: the frontend's scheduler
+/// and authorization, the server, and the daemon's side (the transfer engine and the node).
+/// The frontend and the daemon both use it (docs/design/architecture-v2.md, section 7); a
+/// path to either side's code would make the other link it.
+const ROUTE_MUST_NOT_REACH: &[&str] = &[
+    "kbf-sched",
+    "kbf-auth",
+    "kbf-front",
+    "kbf-server",
+    "kbf-transfer",
+    "kbf-node",
+    "kbf-daemon",
+];
+
+#[test]
+fn route_reaches_neither_the_frontend_nor_the_daemon() {
+    let g = load_graph();
+    let (_, root) = g
+        .members
+        .get("kbf-route")
+        .expect("kbf-route is a workspace member");
+    assert!(root.is_some(), "kbf-route must have a library target");
+    let violations = reaches(&g, "kbf-route", ROUTE_MUST_NOT_REACH);
+    assert!(
+        violations.is_empty(),
+        "kbf-route reaches a frontend or daemon crate:\n{}",
         violations.join("\n")
     );
 }
