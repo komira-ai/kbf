@@ -169,7 +169,7 @@ fn a_refused_start_exits_2_and_a_state_store_is_refused() {
     ]);
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("unexpected argument '--state-store"), "{err}");
+    assert!(err.contains("kbf storage refuses --state-store: "), "{err}");
     assert!(out.stdout.is_empty());
 }
 
