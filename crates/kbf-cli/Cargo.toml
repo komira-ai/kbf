@@ -22,6 +22,15 @@ kbf-node.workspace = true
 kbf-server.workspace = true
 
 [dev-dependencies]
+# The REAPI conformance suite, run against a `kbf storage` process (tests/storage_process.rs):
+# the daemon's transfer engine over real gRPC, and the storage client.
+bytes.workspace = true
+kbf-cas-conformance.workspace = true
+kbf-storage.workspace = true
+kbf-transfer.workspace = true
+kbf-types.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+tonic.workspace = true
 # The units `kbf-deploy linux render-units --mode` writes, parsed with kbf's own
 # parser (tests/deploy_units.rs).
 kbf-deploy.workspace = true

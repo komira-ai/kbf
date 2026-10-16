@@ -6,9 +6,9 @@
 //! (`kbf_front::CacheStorage`), and `kbf-server`'s in-process store
 //! (`kbf_server::LocalStore`, what `kbf-all-in-one`'s daemon reads and writes through)
 //! holds an `Arc<dyn Storage>`. The cache's code moves into this crate later; the trait
-//! is the boundary it moves behind, so the callers do not change when it does. A
-//! storage process of its own and a client that routes calls to one will be further
-//! implementations.
+//! is the boundary it moves behind, so the callers do not change when it does. A storage
+//! process of its own serves one over gRPC, and [`service::RemoteStorage`] is the
+//! implementation that calls it ([`service`]).
 //!
 //! Object safe and asynchronous: each call returns a boxed future ([`Answer`]), so a
 //! caller holds `Arc<dyn Storage>` and never names the metadata log or the object store
@@ -24,6 +24,8 @@
 //!
 //! This crate depends on no frontend crate: not the scheduler (`kbf-sched`) and not
 //! authorization (`kbf-auth`). `crates/kbf-it/tests/layering.rs` checks it.
+
+pub mod service;
 
 use std::sync::Arc;
 

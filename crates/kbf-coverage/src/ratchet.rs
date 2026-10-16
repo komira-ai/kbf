@@ -6,16 +6,41 @@
 //!
 //! The ratchet compares missed counts (items no test runs), not percentages: a crate
 //! fails when, for lines or branches, it misses more than its baseline value, it has
-//! no data where the baseline has a value (its code moved out of every test binary, or
-//! the report lost it), or the baseline says `-` and it now misses anything (new code
-//! that tests do not fully cover). A workspace crate missing from the baseline, and a
-//! baseline crate missing from the workspace, fail too, so the file always names
-//! exactly the workspace's crates. A crate whose baseline is looser than what was
-//! measured (fewer misses, or measured code where the baseline says `-`) fails as well:
-//! the slack would let a later change leave that many items uncovered without failing,
-//! so a change that covers more must lower its line in the same pull request (copy the
-//! measured file the job writes). The baseline therefore always equals the
-//! measurement.
+//! no data where the baseline has a count (its code moved out of every test binary, or
+//! the report lost it, which would hide what it misses), or the baseline says `-` and
+//! it now misses anything (new code that tests do not fully cover). One exception:
+//! branches recorded 0 and now `-` while the crate's lines are still measured is not a
+//! rise. The crate is still instrumented and has no branch left (as
+//! kbf-cas-conformance once lost its last one), so nothing is missed and nothing can
+//! be: it is looser, like a lower count, and `tighten` records `-`. Lines recorded 0
+//! and now `-` is a rise, because no test binary instruments the crate any more: a
+//! crate whose library says `[lib] test = false` (or whose test target is otherwise
+//! gone) has no record in the tracefile at all, so any code added to it, covered or
+//! not, would go unseen. A crate whose lines legitimately stop being measured (all of
+//! its code removed, say) is a hand edit of its line to `- -`, made in a reviewed pull
+//! request; `tighten` refuses it and says so. Branches recorded above 0 and now `-`
+//! is a rise too, even with the lines measured: the missed branches went without
+//! being covered (or the measurement lost branch data), so it is a reviewed hand edit
+//! as well.
+//!
+//! The values `tighten` writes follow from these rules and one more for a crate the
+//! file does not list (it must arrive as `0 0` or `0 -`). In one sentence:
+//! `tighten` writes no count above the recorded one (a value recorded as `-`, and each
+//! value of a crate the file does not list, counts as 0), never turns lines into `-`,
+//! and turns branches into `-` only from 0 and only while the crate's lines are
+//! measured, so a new crate goes in only as `0 0` or `0 -`.
+//!
+//! A workspace crate missing from the baseline, and a baseline crate missing from the
+//! workspace, fail too, so the file always names exactly the workspace's crates. A
+//! crate whose baseline is looser than what was measured (fewer misses, measured code
+//! where the baseline says `-`, or no branch data where it says 0 and lines are
+//! measured) fails as well: the slack would let a later change leave that many items
+//! uncovered without failing, so a change that covers more must lower its line in the
+//! same pull request. That
+//! is what `kbf-coverage tighten` ([`crate::tighten`]) does from the measured file
+//! the job writes: it is the required step when coverage improves, and not a bypass,
+//! since it only lowers counts and refuses every rise. The baseline therefore always
+//! equals the measurement.
 //!
 //! What this enforces: no change raises a crate's uncovered count, and the file never
 //! keeps slack. A change that adds partly covered code fails unless it also covers as
@@ -123,7 +148,7 @@ impl fmt::Display for Status {
                 let m: Vec<String> = m.iter().map(Metric::to_string).collect();
                 write!(
                     f,
-                    "BASELINE LOOSER THAN MEASURED ({}); copy coverage-baseline.measured",
+                    "BASELINE LOOSER THAN MEASURED ({}); run kbf-coverage tighten",
                     m.join(", ")
                 )
             }
@@ -137,13 +162,51 @@ impl fmt::Display for Status {
     }
 }
 
-/// True when a `measured` missed count fails the `recorded` one; see the module docs.
-fn more_missed(recorded: Option<u64>, measured: Option<u64>) -> bool {
-    match (recorded, measured) {
+/// How a recorded missed count (`None`: `-`) stands against the measured one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compare {
+    /// The same value.
+    Equal,
+    /// The record allows more than was measured: fewer misses measured, `-` recorded
+    /// where every measured item ran, or branches 0 recorded where the crate has no
+    /// branch left and its lines are still measured. `kbf-coverage tighten` lowers it.
+    Looser,
+    /// More missed than recorded, data lost where the record has a count (any count
+    /// for lines, above 0 for branches, and 0 too once the lines are lost), or `-`
+    /// recorded where measured items did not run. Only covering code fixes it, or, for
+    /// data lost, a reviewed hand edit of the line.
+    MoreMissed,
+}
+
+/// Compares a crate's lines and branches, recorded against measured; see the module
+/// docs. Both at once, since whether branches may go from 0 to `-` depends on whether
+/// the crate's lines are still measured.
+pub fn compare(recorded: Entry, measured: Entry) -> [(Metric, Compare); 2] {
+    // Branches 0 -> `-` hides nothing only while the crate is still instrumented.
+    let instrumented = measured.lines.is_some();
+    [
+        (Metric::Lines, one(recorded.lines, measured.lines, false)),
+        (
+            Metric::Branches,
+            one(recorded.branches, measured.branches, instrumented),
+        ),
+    ]
+}
+
+/// One metric; `zero_may_vanish`: 0 recorded and nothing measured is looser.
+fn one(recorded: Option<u64>, measured: Option<u64>, zero_may_vanish: bool) -> Compare {
+    let more_missed = match (recorded, measured) {
         (Some(r), Some(m)) => m > r,
-        (Some(_), None) => true,
+        (Some(r), None) => r > 0 || !zero_may_vanish,
         (None, Some(m)) => m > 0,
         (None, None) => false,
+    };
+    if more_missed {
+        Compare::MoreMissed
+    } else if recorded != measured {
+        Compare::Looser
+    } else {
+        Compare::Equal
     }
 }
 
@@ -164,17 +227,12 @@ impl Row {
                 None => Status::Stale,
             };
         };
-        let now = Entry::of(m);
-        let pairs = [
-            (Metric::Lines, r.lines, now.lines),
-            (Metric::Branches, r.branches, now.branches),
-        ];
         let (mut more, mut loose) = (Vec::new(), Vec::new());
-        for (metric, recorded, measured) in pairs {
-            if more_missed(recorded, measured) {
-                more.push(metric);
-            } else if recorded != measured {
-                loose.push(metric);
+        for (metric, compared) in compare(r, Entry::of(m)) {
+            match compared {
+                Compare::MoreMissed => more.push(metric),
+                Compare::Looser => loose.push(metric),
+                Compare::Equal => {}
             }
         }
         if !more.is_empty() {
@@ -200,9 +258,11 @@ pub fn rows(measured: &BTreeMap<String, CrateCoverage>, baseline: &Baseline) -> 
         .collect()
 }
 
-/// `hit/found`, the percentage, the gap to 100% and the missed count for one metric.
+/// `hit/found`, the percentage, the gap to 100% and the missed count for one metric;
+/// `-` in all four where nothing was measured (no crate, or no item found), as the
+/// baseline writes it.
 fn cells(c: Option<Counts>) -> [String; 4] {
-    let Some(c) = c else {
+    let Some(c) = c.filter(|c| c.found() > 0) else {
         return ["-".into(), "-".into(), "-".into(), "-".into()];
     };
     let p = c.percent();
@@ -364,11 +424,40 @@ mod tests {
             row(Some(half), at(0, 0)).status(),
             Status::MoreMissed(vec![Metric::Lines, Metric::Branches])
         );
-        // Data lost: the baseline has values, the crate now has nothing measured.
+        // Data lost: the crate now has nothing measured where the baseline has a
+        // count, which would hide its misses. Lines lost hide any code added to a
+        // crate no test binary instruments (`[lib] test = false`), so even 0 -> `-`
+        // is a rise for lines, and for branches once the lines are lost too.
         let none = CrateCoverage::default();
+        assert_eq!(
+            row(Some(none), at(1, 2)).status(),
+            Status::MoreMissed(vec![Metric::Lines, Metric::Branches])
+        );
+        assert_eq!(
+            row(Some(none), at(0, 1)).status(),
+            Status::MoreMissed(vec![Metric::Lines, Metric::Branches])
+        );
         assert_eq!(
             row(Some(none), at(0, 0)).status(),
             Status::MoreMissed(vec![Metric::Lines, Metric::Branches])
+        );
+        assert_eq!(
+            row(Some(none), rec(Some(0), None)).status(),
+            Status::MoreMissed(vec![Metric::Lines])
+        );
+        assert_eq!(
+            row(Some(none), rec(None, Some(0))).status(),
+            Status::MoreMissed(vec![Metric::Branches])
+        );
+        // Branches 0 -> `-` with the lines still measured: the crate lost its last
+        // branch (kbf-cas-conformance once did), nothing is hidden, so looser.
+        assert_eq!(
+            row(Some(cov(3, 3, 0, 0)), at(0, 0)).status(),
+            Status::Loose(vec![Metric::Branches])
+        );
+        assert_eq!(
+            row(Some(cov(3, 2, 0, 0)), at(1, 0)).status(),
+            Status::Loose(vec![Metric::Branches])
         );
         // `-` recorded: new code must be fully covered to pass.
         assert_eq!(row(Some(none), rec(None, None)).status(), Status::Ok);
@@ -451,7 +540,8 @@ mod tests {
     }
 
     /// Catches: a table that misplaces a column, hides the gap to 100% or the missed
-    /// counts, totals the wrong rows or prints PASS while a crate fails.
+    /// counts, totals the wrong rows, prints PASS while a crate fails, or prints `0/0`
+    /// (a count) for a metric with nothing measured, where the baseline writes `-`.
     #[test]
     fn renders_the_table() {
         let rows = [
@@ -484,7 +574,7 @@ mod tests {
         assert!(pass.ends_with("\ncoverage ratchet: PASS\n"), "{pass}");
         let empty = render(&[row(Some(CrateCoverage::default()), None)]);
         assert!(
-            empty.contains("| k | 0/0 | - | - | - | 0/0 | - | - | - | - | NOT IN BASELINE |"),
+            empty.contains("| k | - | - | - | - | - | - | - | - | - | NOT IN BASELINE |"),
             "{empty}"
         );
     }
@@ -506,7 +596,7 @@ mod tests {
             labels,
             [
                 "ok",
-                "BASELINE LOOSER THAN MEASURED (branches); copy coverage-baseline.measured",
+                "BASELINE LOOSER THAN MEASURED (branches); run kbf-coverage tighten",
                 "MORE MISSED THAN BASELINE (lines, branches)",
                 "NOT IN BASELINE",
                 "NOT IN WORKSPACE",

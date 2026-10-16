@@ -110,7 +110,8 @@ per-pool slots shared across rollouts, canary and soak, and the rollout steps af
   before, or lands `#[ignore = "issue #N"]`.
 - **Coverage.** A new test raises measured coverage of `kbf-sched` and `kbf-server`,
   and the ratchet in `coverage-baseline` must match the measurement exactly, so each
-  PR re-measures with the CI coverage command and sets the rows.
+  PR lowers the rows with `kbf-coverage tighten`, the command the failing coverage
+  job prints (see CONTRIBUTING.md).
 
 ## 4. Invariants
 

@@ -485,7 +485,7 @@ impl Args {
     /// of the whole cap would hold its ranges in memory past the bound uploads share.
     /// A function of its own: only the unit test reaches the refusal, and the integration
     /// tests reach the rest of `listeners`, so neither would cover all of one function.
-    fn segment_upload_fits_write_bound(&self) -> Result<(), ConfigError> {
+    pub(crate) fn segment_upload_fits_write_bound(&self) -> Result<(), ConfigError> {
         if self.segment_upload_max_bytes > self.write_bytes_in_flight {
             return Err(ConfigError::SegmentUploadOverWriteBound {
                 cap: self.segment_upload_max_bytes,
@@ -633,7 +633,7 @@ pub fn loopback_only(ip: IpAddr) -> bool {
     ip.to_canonical().is_loopback()
 }
 
-fn read(path: &PathBuf) -> Result<Vec<u8>, ConfigError> {
+pub(crate) fn read(path: &PathBuf) -> Result<Vec<u8>, ConfigError> {
     std::fs::read(path).map_err(|source| ConfigError::Read {
         path: path.clone(),
         source,

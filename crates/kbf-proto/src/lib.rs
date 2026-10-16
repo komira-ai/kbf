@@ -59,6 +59,12 @@ pub mod kbf {
             tonic::include_proto!("kbf.log.v1");
         }
     }
+    pub mod storage {
+        /// The storage node's action-cache calls, beside the standard blob protocols.
+        pub mod v1 {
+            tonic::include_proto!("kbf.storage.v1");
+        }
+    }
     pub mod worker {
         /// The protocol between `kbf-daemon` and `kbf-server`.
         pub mod v1 {
@@ -69,6 +75,8 @@ pub mod kbf {
 
 /// The Remote Execution API v2, under a short name.
 pub use build::bazel::remote::execution::v2 as reapi;
+/// The `kbf.storage.v1` protocol, under a short name.
+pub use kbf::storage::v1 as storage;
 /// The `kbf.worker.v1` protocol, under a short name.
 pub use kbf::worker::v1 as worker;
 
