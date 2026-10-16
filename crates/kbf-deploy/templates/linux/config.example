@@ -40,6 +40,12 @@ KBF_SERVER_USER=kbf-server
 KBF_REAPI_PORT=8980
 KBF_WORKER_PORT=8981
 KBF_API_PORT=8982
+# `kbf storage`'s gRPC port (--storage-listen), on KBF_LISTEN_ADDRESS. Not kbf's own
+# default (8982), which is KBF_API_PORT's.
+KBF_STORAGE_PORT=8983
+# `kbf storage`'s hot store (--hot-store=file://<dir>): the SSD tier uploads land in
+# before they are flushed to the cold store. On local disk, the server user's.
+KBF_HOT_DIR=/var/lib/kbf-server/hot
 
 # --- kbf-daemon ---
 KBF_USER=kbf

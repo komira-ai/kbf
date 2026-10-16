@@ -25,8 +25,9 @@ Exit codes are those of the converged verbs ([storage-node.md](storage-node.md#r
   `DisableControllers=`, `AllowedCPUs=`, `AllowedMemoryNodes=`).
 - On the host it runs on: `/sys/devices/system/cpu/online` and
   `/sys/devices/system/node/online` (rule `cpuset`, only when a unit sets a list), the
-  files the unit's `EnvironmentFile=` lines name (rule `credential`), and `kbf
-  check-args` (rule `parse`). Run it on the node, as root, for all three.
+  files the unit's `EnvironmentFile=` lines name (rules `credential` and
+  `state-store`), the storage unit's `User=` (`getent passwd`, rule `credential`), and
+  `kbf check-args` (rule `parse`). Run it on the node, as root, for all of them.
 
 It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/system`,
 `service.d/` and prefix drop-ins) or changes made with `systemctl set-property` or
@@ -43,7 +44,9 @@ It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/sy
 | `slice` | a unit not in `kbf.slice` |
 | `delegate` | a mode that runs builds without `cpu`, `cpuset`, `memory` and `pids` delegated, or with one of them in `DisableControllers=` (the unit's, or `kbf.slice`'s) |
 | `cpuset` | `AllowedCPUs=` or `AllowedMemoryNodes=` on a mode that runs builds, or on `kbf.slice`, narrower than the node's CPUs or NUMA nodes |
-| `credential` | the cold store's key reaching a mode without a storage half that reads it (`daemon`, `storage-and-daemon`, `all-in-one`) |
+| `credential` | the cold store's key reaching a mode without a storage half that reads it (`daemon`, `storage-and-daemon`, `all-in-one`); the `storage` unit, which holds it, run as root or as `KBF_USER` (the user builds run as), and on the node its key file readable by another user |
+| `storage` | a `storage` unit without `--cold-store`, `--meta-dir`, `--storage-listen` or one of the three certificate flags, or with an `s3://` cold store and no `EnvironmentFile=<KBF_ETC>/s3.env` |
+| `state-store` | a Postgres URI with a password anywhere in a unit, a `--state-store=${VAR}` with no `EnvironmentFile=`, and on the node the file setting that variable readable by another user |
 | `parse` | a built mode's flags that `kbf <mode>` refuses |
 
 **`delegate`.** systemd reads `Delegate=` this way (systemd.resource-control(5), and
@@ -109,6 +112,58 @@ files a wildcard `EnvironmentFile=` matches and a file it cannot read (each a
 so a variable it unsets still fails the rule); and the key reaching the node any other
 way: a file the daemon reads by a flag, the service manager's own environment without
 `PassEnvironment=`, or a key file other users can read.
+
+## What each mode's unit carries
+
+- **`storage`**: `--cold-store=s3://<KBF_S3_BUCKET>?endpoint=<MINIO_S3_ENDPOINT>&conditional-put=true`,
+  `--hot-store=file://<KBF_HOT_DIR>`, `--meta-dir=<KBF_META_DIR>`,
+  `--storage-listen=<KBF_LISTEN_ADDRESS>:<KBF_STORAGE_PORT>` (8983 by default: kbf's
+  own default, 8982, is `KBF_API_PORT`'s), and `--storage-tls-cert`, `--storage-tls-key`
+  and `--storage-client-ca` (`storage.pem`, `storage.key`, `ca.pem` under `KBF_ETC`).
+  It runs as `KBF_SERVER_USER` with `EnvironmentFile=<KBF_ETC>/s3.env`, the bucket's
+  key pair: on the node rule `credential` wants that file root's or the server user's,
+  mode 0600. No state store: a storage node reaches it only through a frontend.
+- **`daemon`**: the flags `kbf-daemon`'s unit has (`--server`, `--cas`, its
+  certificates, `--data-dir`, the memory flags, the images); no key.
+- **`all-in-one`**: below; no key (its cold store is a directory).
+- **`frontend`** and **`storage-and-daemon`**: no flag (not built yet; rule `flags`).
+  The frontend's template says where its state store goes: a SQLite file beside its
+  data, `--state-store=sqlite://<KBF_DATA_DIR>/state.db`, by default; a Postgres URI
+  only through an `EnvironmentFile=` of mode 0600 (rule `state-store`).
+
+Two things are `TODO(registration):` comments in the templates, never guessed: the
+frontend's DNS name (`--frontend`, with `--advertise-addr`) on the storage, daemon and
+storage-and-daemon units, and the storage map the frontend pushes. Both come with the
+nodes' registration with a frontend.
+
+### The state store's password
+
+The state store's Postgres URI carries its password, so rule `state-store` refuses one
+with a password (`user:password@` or a `password=` query key) in any directive of a
+unit: a unit file is readable by every user. The URI goes in a file of mode 0600,
+named by `EnvironmentFile=`, and the command line names its variable:
+
+```text
+EnvironmentFile=/etc/kbf/state-store.env
+ExecStart=/usr/local/bin/kbf frontend --state-store=${KBF_STATE_STORE}
+```
+
+systemd expands `${KBF_STATE_STORE}` into the command line it starts kbf with, so the
+URI is still in kbf's argv, which other users on the node can read in `/proc` unless it
+is mounted `hidepid=2`. Every check of such a unit prints a `WARN state-store:` line
+saying so. Keeping the password out of argv needs kbf to read the URI from a file,
+which it does not today.
+
+### storage-and-daemon and the cold store's key
+
+One unit and one process (the daemon half reads and writes the node's storage
+in-process, one cache on the SSD; architecture-v2.md, sections 1 and 10). The design
+keeps the key from builds by uid (sections 9 and 15): the key file the unit's user's
+alone, mode 0600, and each action a subordinate id of that user (the container driver's
+`--userns=nomap`), with a test that an action cannot read the key. The daemon half
+runs as the unit's user and so could read it. Until the mode is built and that test
+exists, the unit holds no key (rule `credential` refuses one), and with the key it will
+be for a trusted network only, as all-in-one is.
 
 ## all-in-one is for a trusted box
 

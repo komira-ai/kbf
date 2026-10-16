@@ -719,11 +719,11 @@ fn bad_settings_are_refused_before_anything_renders() {
         ),
         (
             format!("{EXAMPLE}KBF_RAM=1\n"),
-            "line 59: unknown key KBF_RAM",
+            "line 65: unknown key KBF_RAM",
         ),
         (
             format!("{EXAMPLE}KBF_RAM_GIB=1\n"),
-            "line 59: KBF_RAM_GIB is already set on line 17",
+            "line 65: KBF_RAM_GIB is already set on line 17",
         ),
         (
             example_with(&[("KBF_NODE_ID", "a;b")]),
@@ -773,6 +773,14 @@ fn bad_settings_are_refused_before_anything_renders() {
         (
             example_with(&[("KBF_META_DIR", "/var/lib/../raft")]),
             "KBF_META_DIR: \"/var/lib/../raft\" has an empty",
+        ),
+        (
+            example_with(&[("KBF_STORAGE_PORT", "0")]),
+            "KBF_STORAGE_PORT must be a port number from 1 to 65535, not '0'",
+        ),
+        (
+            example_with(&[("KBF_HOT_DIR", "hot")]),
+            "KBF_HOT_DIR: \"hot\" is not absolute",
         ),
         (
             example_with(&[("MINIO_UNIT", "minio")]),

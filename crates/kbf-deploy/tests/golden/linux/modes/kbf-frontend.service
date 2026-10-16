@@ -16,9 +16,15 @@ Slice=kbf.slice
 MemorySwapMax=0
 OOMScoreAdjust=-925
 CPUWeight=300
+# TODO: the frontend's flags, once `kbf frontend` has them: its listen addresses,
+# the certificate flags, and the state store. The state store defaults to a SQLite file
+# beside the frontend's data, --state-store=sqlite:///var/lib/kbf/state.db (a single
+# frontend). A Postgres URI carries a password, so it never goes in this file or on the
+# command line: it comes from an EnvironmentFile= of mode 0600 (check-units rule
+# `state-store`).
+# TODO(registration): the frontend's DNS name, the one address clients, daemons and
+# storage nodes know, and the storage map it pushes to them.
 ExecStart=/usr/local/bin/kbf frontend
-# TODO: the frontend's flags (its listen addresses, the state store,
-# the certificate flags), once `kbf frontend` has them.
 Restart=on-failure
 # Exit 2 is a command line kbf refused (or a mode not built yet): a restart cannot fix it.
 RestartPreventExitStatus=2

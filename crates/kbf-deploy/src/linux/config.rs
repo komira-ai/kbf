@@ -16,6 +16,7 @@ pub const KEYS: &[&str] = &[
     "KBF_REAPI_PORT",
     "KBF_WORKER_PORT",
     "KBF_API_PORT",
+    "KBF_STORAGE_PORT",
     "KBF_RAM_GIB",
     "MINIO_RESERVATION_GIB",
     "KBF_SERVER_RESERVATION_GIB",
@@ -25,6 +26,7 @@ pub const KEYS: &[&str] = &[
     "MINIO_S3_ENDPOINT",
     "KBF_S3_BUCKET",
     "KBF_META_DIR",
+    "KBF_HOT_DIR",
     "KBF_DATA_DIR",
     "KBF_IMAGES",
     "KBF_USER",
@@ -47,6 +49,8 @@ pub struct LinuxConfig {
     pub reapi_port: u16,
     pub worker_port: u16,
     pub api_port: u16,
+    /// `kbf storage`'s `--storage-listen` port, on `KBF_LISTEN_ADDRESS`.
+    pub storage_port: u16,
     pub ram_gib: u64,
     pub minio_reservation_gib: u64,
     pub server_reservation_gib: u64,
@@ -61,6 +65,8 @@ pub struct LinuxConfig {
     pub s3_bucket: String,
     /// kbf-server's `--meta-dir`: its metadata log, a single-voter Raft log.
     pub meta_dir: HostPath,
+    /// `kbf storage`'s `--hot-store` directory: the SSD tier in front of the cold store.
+    pub hot_dir: HostPath,
     /// kbf-daemon's `--data-dir`: lease directories, the input cache and the trees.
     pub data_dir: HostPath,
     /// The pinned images, in podman's bare `<repo>@sha256:<digest>` form.
@@ -184,6 +190,7 @@ impl LinuxConfig {
             reapi_port: port("KBF_REAPI_PORT", "8980")?,
             worker_port: port("KBF_WORKER_PORT", "8981")?,
             api_port: port("KBF_API_PORT", "8982")?,
+            storage_port: port("KBF_STORAGE_PORT", "8983")?,
             ram_gib,
             minio_reservation_gib: minio,
             server_reservation_gib: server,
@@ -194,6 +201,7 @@ impl LinuxConfig {
             minio_s3_endpoint: or("MINIO_S3_ENDPOINT", "http://127.0.0.1:9000"),
             s3_bucket: or("KBF_S3_BUCKET", "kbf-cas"),
             meta_dir: path("KBF_META_DIR", "/var/lib/kbf-server/raft")?,
+            hot_dir: path("KBF_HOT_DIR", "/var/lib/kbf-server/hot")?,
             data_dir: path("KBF_DATA_DIR", "/var/lib/kbf")?,
             images,
             user: or("KBF_USER", "kbf"),

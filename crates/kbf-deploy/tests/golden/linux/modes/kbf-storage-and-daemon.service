@@ -21,11 +21,20 @@ OOMScoreAdjust=-925
 CPUWeight=300
 # No MemorySwapMax=: leases may swap, and they live in this unit's cgroup.
 Environment=XDG_RUNTIME_DIR=/run/user/1500
-# TODO: the cold store's key, readable by the storage half's uid and not by the
-# actions' (design section 9); no EnvironmentFile= until that split exists.
+# One unit, one process: the daemon half reads and writes the node's storage in-process,
+# one cache on the SSD (design sections 1 and 10). The design keeps the cold store's key
+# from builds by uid (sections 9 and 15): the key file the unit's user's alone, mode
+# 0600, and each action a subordinate id of that user (the container driver's
+# --userns=nomap), with a test that an action cannot read the key. The daemon half runs
+# as the unit's user and so could read it.
+# TODO: the cold store's key (EnvironmentFile=/etc/kbf/s3.env), once the mode is built
+# and that test exists; until then the unit holds none (check-units rule `credential`),
+# and with the key it is for a trusted network only, as all-in-one is.
 ExecStart=/usr/local/bin/kbf storage-and-daemon
-# TODO: the mode's flags (the storage node's and the daemon's, --frontend,
-# --advertise-addr, the certificate flags), once `kbf storage-and-daemon` has them.
+# TODO: the mode's flags (the storage node's and the daemon's, the certificate flags),
+# once `kbf storage-and-daemon` has them.
+# TODO(registration): --frontend=<the frontend's DNS name> and --advertise-addr, and the
+# storage map the frontend pushes.
 Restart=on-failure
 # Exit 2 is a command line kbf refused (or a mode not built yet): a restart cannot fix it.
 RestartPreventExitStatus=2

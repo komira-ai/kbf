@@ -59,6 +59,15 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
                         "/etc/kbf/ca.pem"
                     ]
                 );
+                // Its stores and listener are the settings', read as kbf reads them:
+                // the bucket, the hot store and the metadata log, on the pinned address.
+                assert_eq!(flags.listen.to_string(), "192.0.2.10:8983");
+                assert_eq!(
+                    flags.server.meta_dir.as_deref(),
+                    Some(std::path::Path::new("/var/lib/kbf-server/raft"))
+                );
+                assert!(flags.server.cold_store.is_some(), "no cold store");
+                assert!(flags.server.hot_store.is_some(), "no hot store");
             }
             Invocation::NotBuilt { mode: m, .. } => {
                 assert_eq!(m, mode.name());
@@ -173,13 +182,17 @@ fn check_units_with<E: Exec>(
 fn check_units_parses_a_built_modes_flags_with_this_kbf() {
     assert_eq!(kbf_deploy::linux::modes::CHECK_ARGS, kbf_cli::CHECK_ARGS);
     let c = config();
-    for mode in [Mode::Daemon, Mode::AllInOne] {
+    for mode in [Mode::Storage, Mode::Daemon, Mode::AllInOne] {
         let text = render(&c, Some(1500), mode).expect("renders");
-        // all-in-one is labelled trusted; nothing else is said.
-        let notes: Vec<String> = if mode == Mode::AllInOne {
-            vec![TRUSTED_NOTE.to_owned()]
-        } else {
-            Vec::new()
+        // all-in-one is labelled trusted; the storage unit's key file is not on this
+        // machine; nothing else is said.
+        let notes: Vec<String> = match mode {
+            Mode::AllInOne => vec![TRUSTED_NOTE.to_owned()],
+            Mode::Storage => vec![
+                "SKIP credential: no key file at /etc/kbf/s3.env yet, so its owner and mode were not checked"
+                    .to_owned(),
+            ],
+            _ => Vec::new(),
         };
         assert_eq!(
             check_units(&format!("clean_{mode}"), mode, &text),
@@ -210,6 +223,21 @@ fn check_units_parses_a_built_modes_flags_with_this_kbf() {
         );
         assert_eq!(notes, Vec::<String>::new());
     }
+    // The storage node's parser, which refuses kbf-server's other flags by name.
+    let text = render(&c, Some(1500), Mode::Storage).expect("renders");
+    let edited = text.replace(
+        "--meta-dir=",
+        "--worker-listen=192.0.2.10:8981 \\\n    --meta-dir=",
+    );
+    assert_ne!(edited, text);
+    let (failures, _) = check_units("edited_storage", Mode::Storage, &edited);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0].starts_with(&format!(
+            "FAIL parse: kbf storage refuses the flags of kbf-storage.service ({bin} check-args: exit 2): error: kbf storage refuses --worker-listen"
+        )),
+        "{failures:?}"
+    );
 }
 
 /// What a `kbf` without `check-args` answers to `cmd`: clap's refusal, exit 2.

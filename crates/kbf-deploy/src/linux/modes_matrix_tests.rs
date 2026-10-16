@@ -1,0 +1,296 @@
+//! Every rule against every mode: one defect planted in each mode's rendered unit per
+//! rule, and the rule must fail exactly the modes it is for and pass the others. The
+//! rows say which modes each rule is for; a rule run on a mode it is not for, or not
+//! run on one it is for, turns its row red.
+
+use std::cell::RefCell;
+
+use kbf_host::exec::Entry;
+use kbf_host::step::{Owner, Perms};
+use kbf_host::testkit::{FakeExec, reply};
+
+use super::*;
+use crate::linux::render::{Templates, render as render_converged};
+
+const EXAMPLE: &str = include_str!("../../templates/linux/config.example");
+
+fn config() -> LinuxConfig {
+    LinuxConfig::parse(EXAMPLE).expect("valid settings")
+}
+
+/// Insert `line` as the first line of `[Service]`.
+fn first_in_service(text: &str, line: &str) -> String {
+    assert_eq!(text.matches("[Service]\n").count(), 1);
+    text.replace("[Service]\n", &format!("[Service]\n{line}\n"))
+}
+
+/// Insert `line` as the last line of `[Service]` (before `[Install]`), where a
+/// single-valued key wins.
+fn last_in_service(text: &str, line: &str) -> String {
+    assert_eq!(text.matches("\n[Install]\n").count(), 1);
+    text.replace("\n[Install]\n", &format!("\n{line}\n\n[Install]\n"))
+}
+
+/// One planted defect: its rule, what it does to a mode's rendered unit, and the modes
+/// the rule is for.
+struct Row {
+    rule: &'static str,
+    plant: fn(Mode, &str) -> String,
+    fails: &'static [Mode],
+}
+
+const ALL: &[Mode] = &Mode::ALL;
+const BUILDS: &[Mode] = &[Mode::Daemon, Mode::StorageAndDaemon, Mode::AllInOne];
+const UNBUILT: &[Mode] = &[Mode::Frontend, Mode::StorageAndDaemon];
+
+fn rows() -> Vec<Row> {
+    vec![
+        Row {
+            rule: "render",
+            plant: |_, t| format!("{t}# left @KBF_PLANTED@\n"),
+            fails: ALL,
+        },
+        Row {
+            rule: "render",
+            plant: |_, t| format!("{t}# left <kbf uid>\n"),
+            fails: ALL,
+        },
+        Row {
+            rule: "continuation",
+            plant: |_, t| {
+                let d = t
+                    .lines()
+                    .find(|l| l.starts_with("Description="))
+                    .expect("one");
+                t.replacen(d, &format!("{d} \\\n# planted\n    more"), 1)
+            },
+            fails: ALL,
+        },
+        Row {
+            rule: "exec",
+            plant: |m, t| t.replacen(&format!("/kbf {m}"), &format!("/kbf-{m}"), 1),
+            fails: ALL,
+        },
+        Row {
+            rule: "flags",
+            plant: |m, t| t.replacen(&format!("/kbf {m}"), &format!("/kbf {m} --node-id=n1"), 1),
+            fails: UNBUILT,
+        },
+        Row {
+            rule: "slice",
+            plant: |_, t| t.replace("Slice=kbf.slice", "Slice=system.slice"),
+            fails: ALL,
+        },
+        Row {
+            rule: "delegate",
+            plant: |_, t| first_in_service(t, "DisableControllers=cpuset"),
+            fails: BUILDS,
+        },
+        Row {
+            rule: "delegate",
+            plant: |_, t| last_in_service(t, "Delegate="),
+            fails: BUILDS,
+        },
+        // A build node given the key; the storage unit already reads it.
+        Row {
+            rule: "credential",
+            plant: |_, t| first_in_service(t, "EnvironmentFile=-/etc/kbf/s3.env"),
+            fails: BUILDS,
+        },
+        Row {
+            rule: "credential",
+            plant: |_, t| first_in_service(t, "Environment=AWS_ACCESS_KEY_ID=planted"),
+            fails: BUILDS,
+        },
+        // The key's holder run as the user builds run as, or as root.
+        Row {
+            rule: "credential",
+            plant: |_, t| last_in_service(t, "User=kbf"),
+            fails: &[Mode::Storage],
+        },
+        Row {
+            rule: "credential",
+            plant: |_, t| last_in_service(t, "User="),
+            fails: &[Mode::Storage],
+        },
+        Row {
+            rule: "storage",
+            plant: |_, t| match t.lines().find(|l| l.contains("--cold-store=")) {
+                Some(l) => t.replace(&format!("{l}\n"), ""),
+                None => t.to_owned(),
+            },
+            fails: &[Mode::Storage],
+        },
+        Row {
+            rule: "storage",
+            plant: |_, t| t.replace("EnvironmentFile=/etc/kbf/s3.env\n", ""),
+            fails: &[Mode::Storage],
+        },
+        Row {
+            rule: "state-store",
+            plant: |_, t| {
+                first_in_service(t, "Environment=KBF_STATE_STORE=postgres://kbf:pw@db/kbf")
+            },
+            fails: ALL,
+        },
+    ]
+}
+
+/// Catches a rule run on a mode it is not for (a storage unit's own key refused, a
+/// frontend asked to delegate) and one not run on a mode it is for (a build node given
+/// the key, a storage unit without its cold store or run as the builds' user, a state
+/// store password in any mode's unit).
+#[test]
+fn each_rule_fails_exactly_the_modes_it_is_for() {
+    let c = config();
+    let mut wrong = Vec::new();
+    for (i, row) in rows().iter().enumerate() {
+        for mode in Mode::ALL {
+            let text = render(&c, Some(1500), mode).expect("renders");
+            let planted = (row.plant)(mode, &text);
+            if planted == text {
+                // A defect with nothing to plant on (no line to drop) must not be one
+                // of the modes the rule is for.
+                assert!(
+                    !row.fails.contains(&mode),
+                    "row {i} ({}) planted nothing in {mode}",
+                    row.rule
+                );
+                continue;
+            }
+            let r = check(&c, mode, &planted, true).expect("a unit");
+            let got: Vec<&str> = r.failures.iter().map(|f| f.rule).collect();
+            let want: Vec<&str> = if row.fails.contains(&mode) {
+                vec![row.rule]
+            } else {
+                Vec::new()
+            };
+            if got != want {
+                wrong.push(format!("row {i} ({}) on {mode}: {:?}", row.rule, lines(&r)));
+            }
+        }
+    }
+    assert_eq!(wrong, Vec::<String>::new());
+}
+
+fn lines(r: &Report) -> Vec<String> {
+    r.failures.iter().map(ToString::to_string).collect()
+}
+
+fn file(bits: u32, uid: u32, text: &str) -> Entry {
+    Entry::File {
+        perms: Perms::new(bits),
+        owner: Owner { uid, gid: uid },
+        bytes: text.as_bytes().to_vec(),
+    }
+}
+
+/// A node with kbf installed, a key file `key` and a state store file `state`; kbf
+/// refuses every command line (`check-args` exits 2) and `getent passwd kbf-server` is
+/// uid 990.
+fn node(key: Entry, state: Entry) -> FakeExec {
+    let mut exec = FakeExec::new(0);
+    let at = |p: &str| HostPath::new(p).expect("absolute");
+    exec.entries
+        .insert(at("/usr/local/bin/kbf"), file(0o755, 0, ""));
+    exec.entries.insert(at("/etc/kbf/s3.env"), key);
+    exec.entries.insert(at("/etc/kbf/state-store.env"), state);
+    let asked = RefCell::new(Vec::new());
+    exec.answer = Box::new(move |cmd: &Cmd| {
+        asked.borrow_mut().push(cmd.to_string());
+        Ok(match cmd.program.as_str() {
+            "/usr/bin/getent" => reply(
+                0,
+                "kbf-server:x:990:990::/var/lib/kbf-server:/sbin/nologin\n",
+                "",
+            ),
+            "/usr/bin/id" => reply(0, "990\n", ""),
+            _ => reply(2, "", "error: planted refusal\n"),
+        })
+    });
+    exec
+}
+
+/// `text`, the unit of `mode`, naming the state store by a variable a file sets.
+fn state_by_variable(mode: Mode, text: &str) -> String {
+    let named = text.replacen(
+        &format!("/kbf {mode}"),
+        &format!("/kbf {mode} --state-store=${{KBF_STATE_STORE}}"),
+        1,
+    );
+    first_in_service(&named, "EnvironmentFile=/etc/kbf/state-store.env")
+}
+
+/// The rules that read the node, per mode: `parse` runs kbf only for a built mode;
+/// `credential` reads the key file's owner and mode only for the unit that holds it
+/// (a 0644 key or one another user owns fails storage, and only storage);
+/// `state-store` reads the mode of the file that sets `--state-store`'s variable in
+/// every mode. Catches each of these run on the wrong modes or on none.
+#[test]
+fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
+    let c = config();
+    let slice = UnitText::new(
+        SLICE,
+        render_converged(&c, Some(1500), &Templates::BUILT_IN)
+            .expect("renders")
+            .slice,
+    );
+    let state = "KBF_STATE_STORE=postgres://kbf:pw@db/kbf\n";
+    let cases: [(&str, Entry, Entry, &[Mode]); 4] = [
+        (
+            "parse",
+            file(0o600, 990, ""),
+            file(0o600, 0, state),
+            &[Mode::Storage, Mode::Daemon, Mode::AllInOne],
+        ),
+        (
+            "credential",
+            file(0o640, 990, ""),
+            file(0o600, 0, state),
+            &[Mode::Storage],
+        ),
+        (
+            "credential",
+            file(0o600, 1000, ""),
+            file(0o600, 0, state),
+            &[Mode::Storage],
+        ),
+        (
+            "state-store",
+            file(0o600, 990, ""),
+            file(0o644, 0, state),
+            ALL,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (rule, key, state_file, fails) in cases {
+        let exec = node(key, state_file);
+        for mode in Mode::ALL {
+            let text = render(&c, Some(1500), mode).expect("renders");
+            let text = if rule == "state-store" {
+                state_by_variable(mode, &text)
+            } else {
+                text
+            };
+            let unit = UnitText::new(mode.unit_name(), text);
+            let r = check_on_host(&exec, &c, mode, &unit, &slice, true, None).expect("runs");
+            let hits = r.failures.iter().filter(|f| f.rule == rule).count();
+            let want = usize::from(fails.contains(&mode));
+            if hits != want {
+                wrong.push(format!("{rule} on {mode}: {:?}", lines(&r)));
+            }
+            // No other node rule fires on the clean node (rule `flags` aside, which a
+            // flag in a mode not built yet trips, and `parse`, which this kbf refuses).
+            let others: Vec<String> = r
+                .failures
+                .iter()
+                .filter(|f| f.rule != rule && f.rule != "parse" && f.rule != "flags")
+                .map(ToString::to_string)
+                .collect();
+            if !others.is_empty() {
+                wrong.push(format!("{rule} on {mode}, other rules: {others:?}"));
+            }
+        }
+    }
+    assert_eq!(wrong, Vec::<String>::new());
+}

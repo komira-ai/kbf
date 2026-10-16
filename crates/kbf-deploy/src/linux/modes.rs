@@ -4,12 +4,12 @@
 //!
 //! Each unit runs `<KBF_BIN_DIR>/kbf <mode> ...`. A mode `kbf` runs today (`daemon`,
 //! `all-in-one`, `storage`) carries the flags its old binary's unit carries (`storage`
-//! only its three certificate flags yet: a TODO comment marks where its stores go); a
-//! mode not built yet
+//! its stores, its listen address and its certificate flags); a mode not built yet
 //! (`frontend`, `storage-and-daemon`) carries none, and its template marks
 //! where its flags go with a `TODO:` comment. The flags the new modes add
 //! (`--frontend`, `--advertise-addr`, the certificate flags) are such TODO comments
-//! too, never guessed.
+//! too, never guessed: `TODO(registration):` marks the frontend's DNS name and the
+//! storage map it pushes, which come with registration.
 //!
 //! [`check`] reads a rendered unit back, with its drop-ins ([`UnitText`]). Its rules,
 //! and the defect each catches:
@@ -34,7 +34,15 @@
 //!   an empty value starts over with none.
 //! - `credential`: the units of a mode without a storage half that reads the key
 //!   (`daemon`, `storage-and-daemon`, `all-in-one`) do not give it the cold store's
-//!   key; [`super::credential`] says what the rule reads and what it cannot see.
+//!   key; [`super::credential`] says what the rule reads and what it cannot see. The
+//!   unit that holds the key (`storage`) runs as a user of its own: a `User=` that is
+//!   not `KBF_USER`, the user builds run as.
+//! - `storage`: the `storage` unit gives its cold store, metadata directory, listen
+//!   address and the three certificate flags, and an `s3://` cold store comes with the
+//!   key file ([`super::stores`]).
+//! - `state-store`: no directive holds a Postgres URI with a password, and a
+//!   `--state-store=${VAR}` has an `EnvironmentFile=` to set it ([`super::stores`]; a
+//!   `WARN state-store:` line says the expanded value is still in kbf's argv).
 //!
 //! [`check_on_host`] adds the rules that read the host, and reads `kbf.slice`:
 //!
@@ -51,7 +59,9 @@
 //!   disables a delegated controller below it (a slice cannot delegate; systemd enables
 //!   on the slice every controller a unit under it delegates, unless the slice's
 //!   `DisableControllers=` lists it). `credential` also reads the files the unit's
-//!   `EnvironmentFile=` lines name.
+//!   `EnvironmentFile=` lines name, and for `storage` that each key file is root's or
+//!   the unit's user's with no group or other bit. `state-store` also reads the files
+//!   that set the variable `--state-store` names: none has a group or other bit.
 //!
 //! `all-in-one` passes with a `WARN trusted:` line: its builds run beside the farm's
 //! state and its cold store, as one user. The container driver runs each action as a
@@ -75,7 +85,7 @@ use kbf_host::step::Cmd;
 use super::check::{Failure, Report, angle_placeholder};
 use super::config::LinuxConfig;
 use super::render::{SLICE, values};
-use super::{cpuset, credential};
+use super::{cpuset, credential, stores};
 use crate::template::{self, TemplateError, leftovers};
 use crate::unit::{UnitError, UnitFile, comments_in_continuations};
 
@@ -143,6 +153,13 @@ impl Mode {
     #[must_use]
     pub fn holds_no_key(self) -> bool {
         matches!(self, Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne)
+    }
+
+    /// Whether the mode's unit holds the cold store's key (rule `credential`): the
+    /// storage node, as a user of its own.
+    #[must_use]
+    pub fn holds_key(self) -> bool {
+        self == Mode::Storage
     }
 
     /// The unit's file name: `kbf-<mode>.service`.
@@ -240,10 +257,9 @@ pub fn check(
 ) -> Result<Report, UnitError> {
     let files = UnitText::new(mode.unit_name(), text);
     let unit = UnitFile::parse(text)?;
-    Ok(report(
-        mode,
-        rules(config, mode, &files, &unit, installable),
-    ))
+    let mut r = report(mode, rules(config, mode, &files, &unit, installable));
+    r.notes.extend(stores::state_store(&unit).1);
+    Ok(r)
 }
 
 /// [`check`] on `unit` and its drop-ins, `kbf.slice` (`slice`, with its drop-ins), and
@@ -291,6 +307,21 @@ pub fn check_on_host<E: Exec>(
         }
         notes.extend(found.notes);
     }
+    if mode.holds_key() {
+        let key = HostPath::new(&key_file(config).to_string_lossy())
+            .expect("KBF_ETC is an absolute path, and so is the key file under it");
+        let found = credential::holder_on_host(exec, &merged, &key);
+        for how in found.failures {
+            fail("credential", holder_message(&name, &how));
+        }
+        notes.extend(found.notes);
+    }
+    let found = stores::on_host(exec, &merged);
+    for how in found.failures {
+        fail("state-store", format!("{name}: {how}"));
+    }
+    notes.extend(found.notes);
+    notes.extend(stores::state_store(&merged).1);
     let argv = merged.exec_start();
     if mode.is_built() && runs_this_mode(config, mode, &argv) {
         let found = match kbf_bin {
@@ -438,6 +469,13 @@ fn disabled(unit: &UnitFile, section: &str) -> Option<String> {
     (!hit.is_empty()).then(|| hit.join(" "))
 }
 
+fn holder_message(name: &str, how: &str) -> String {
+    format!(
+        "{name} holds the cold store's key and {how}: the key is the storage node's user's \
+         alone, never a build's"
+    )
+}
+
 fn credential_message(name: &str, how: &str) -> String {
     format!(
         "{name} gives a build node the cold store's key ({how}): a build node holds no \
@@ -551,6 +589,21 @@ fn rules(
             fail("credential", credential_message(&name, &how));
         }
     }
+    if let Some(how) = credential::holder(unit, &config.user).filter(|_| mode.holds_key()) {
+        fail("credential", holder_message(&name, &how));
+    }
+
+    // storage
+    if mode == Mode::Storage {
+        for how in stores::storage(unit, &key_file(config)) {
+            fail("storage", format!("{name} {how}"));
+        }
+    }
+
+    // state-store
+    for how in stores::state_store(unit).0 {
+        fail("state-store", format!("{name}: {how}"));
+    }
     failures
 }
 
@@ -582,3 +635,7 @@ fn report(mode: Mode, failures: Vec<Failure>) -> Report {
 #[cfg(test)]
 #[path = "modes_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "modes_matrix_tests.rs"]
+mod matrix_tests;

@@ -214,19 +214,19 @@ fn each_planted_defect_turns_its_rule_red() {
     }
     let left = check(
         &c,
-        Mode::Storage,
-        "[Service]\nSlice=kbf.slice\nExecStart=/usr/local/bin/kbf storage\nUser=@KBF_USER@\n",
+        Mode::Frontend,
+        "[Service]\nSlice=kbf.slice\nExecStart=/usr/local/bin/kbf frontend\nUser=@KBF_USER@\n",
         false,
     )
     .expect("a unit");
     assert_eq!(
         lines(&left),
-        ["FAIL render: kbf-storage.service keeps the placeholder @KBF_USER@"]
+        ["FAIL render: kbf-frontend.service keeps the placeholder @KBF_USER@"]
     );
-    let none = check(&c, Mode::Storage, "[Service]\nSlice=kbf.slice\n", false).expect("a unit");
+    let none = check(&c, Mode::Frontend, "[Service]\nSlice=kbf.slice\n", false).expect("a unit");
     assert_eq!(
         lines(&none),
-        ["FAIL exec: kbf-storage.service starts '', want '/usr/local/bin/kbf storage ...'"]
+        ["FAIL exec: kbf-frontend.service starts '', want '/usr/local/bin/kbf frontend ...'"]
     );
 }
 

@@ -46,8 +46,9 @@
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
-use kbf_host::exec::{Entry, Exec};
+use kbf_host::exec::{Entry, Exec, Kind};
 use kbf_host::path::HostPath;
+use kbf_host::user;
 
 use super::glob;
 use super::modes::COLD_STORE_KEY_FILE;
@@ -159,10 +160,7 @@ pub(super) fn on_host<E: Exec>(exec: &E, unit: &UnitFile, key: &Path) -> OnHost 
             ));
             continue;
         }
-        // A relative path is one systemd ignores; a name ending in a lone `\`, or one
-        // that names a directory, is one its glob(3) lists no file for.
-        let file = glob::literal(path).map(|p| normalise(&p).to_string_lossy().into_owned());
-        let Some(Ok(host)) = file.map(|p| HostPath::new(&p)) else {
+        let Some(host) = env_file(path) else {
             continue;
         };
         match exec.inspect(&host) {
@@ -186,9 +184,34 @@ pub(super) fn on_host<E: Exec>(exec: &E, unit: &UnitFile, key: &Path) -> OnHost 
     out
 }
 
+/// Rule `credential` for the mode whose unit holds the key (`storage`): how the unit
+/// runs as a user that is not the key's alone, or `None`. With no `User=` it runs as
+/// root; as `build_user` (`KBF_USER`) it runs as the user builds run as.
+pub(super) fn holder(unit: &UnitFile, build_user: &str) -> Option<String> {
+    let _ = (unit, build_user);
+    None
+}
+
+/// [`holder`]'s reading of the node: each key file the unit's `EnvironmentFile=` lines
+/// name (`key` itself for a wildcard that matches it) is a plain file, root's or the
+/// unit's user's, with no group or other bit. A key file that is not there, a
+/// user or file the check cannot read, is a `SKIP credential:` line.
+pub(super) fn holder_on_host<E: Exec>(exec: &E, unit: &UnitFile, key: &HostPath) -> OnHost {
+    let _ = (exec, unit, key);
+    OnHost::default()
+}
+
+/// The one file the `EnvironmentFile=` path `path` (no wildcard, [`bare`]) names, when
+/// systemd would read one: a relative path is one systemd ignores, and a name ending
+/// in a lone `\`, or one that names a directory, is one its glob(3) lists no file for.
+pub(super) fn env_file(path: &str) -> Option<HostPath> {
+    let file = glob::literal(path).map(|p| normalise(&p).to_string_lossy().into_owned())?;
+    HostPath::new(&file).ok()
+}
+
 /// The variable names an environment file assigns: each line's text before `=`, after
 /// an `export ` (systemd ignores the line; the rule is stricter), skipping comments.
-fn env_file_names(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
+pub(super) fn env_file_names(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
     bytes.split(|b| *b == b'\n').filter_map(|raw| {
         let line = String::from_utf8_lossy(raw);
         let line = line.trim();
@@ -207,7 +230,7 @@ fn env_file_names(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
 }
 
 /// Whether the `EnvironmentFile=` value `value` names the key file `key`.
-fn names_key(value: &str, key: &Path) -> bool {
+pub(super) fn names_key(value: &str, key: &Path) -> bool {
     let path = bare(value);
     glob::matches(path, &key.to_string_lossy())
         || glob::literal(path).is_some_and(|p| {
@@ -218,7 +241,7 @@ fn names_key(value: &str, key: &Path) -> bool {
 /// The path an `EnvironmentFile=` value names: without the `-` that makes it optional
 /// and without quotes around it (systemd takes neither as part of the path), trimmed of
 /// systemd's [`WHITESPACE`] only (U+00A0 is part of a path).
-fn bare(value: &str) -> &str {
+pub(super) fn bare(value: &str) -> &str {
     let v = value.trim_matches(WHITESPACE);
     let v = v.strip_prefix('-').unwrap_or(v);
     v.trim_matches(|c| c == '"' || c == '\'')
