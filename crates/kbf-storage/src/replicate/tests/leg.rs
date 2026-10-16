@@ -103,6 +103,14 @@ async fn peers_make_one_channel_per_address_and_refuse_a_bad_one() {
     peers.channel("127.0.0.1:1").expect("cached");
     let tls = Peers::tls(tonic::transport::ClientTlsConfig::new());
     tls.channel("localhost:1").expect("a TLS channel");
+    // An identity the TLS stack cannot read is the channel's error, not a connection's.
+    let broken = Peers::tls(tonic::transport::ClientTlsConfig::new().identity(
+        tonic::transport::Identity::from_pem("not a certificate", "not a key"),
+    ));
+    assert!(matches!(
+        broken.channel("localhost:2"),
+        Err(StorageError::Internal(m)) if m.contains("TLS for")
+    ));
 }
 
 /// A ByteStream that reads the first message of a write and then never answers, and says when
