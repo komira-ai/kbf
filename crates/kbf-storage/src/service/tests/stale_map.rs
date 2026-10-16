@@ -189,10 +189,16 @@ fn only_failed_precondition_with_a_decimal_trailer_is_stale_map() {
         lift(&with(Status::failed_precondition("x"), "12"), None),
         StorageError::StaleMap { current: 12 }
     ));
+    let mut unreadable = Status::failed_precondition("x");
+    unreadable.metadata_mut().insert(
+        MAP_GENERATION_HEADER,
+        MetadataValue::try_from(&b"\xff"[..]).expect("a byte HTTP allows"),
+    );
     for status in [
         Status::failed_precondition("x"),
         with(Status::failed_precondition("x"), "twelve"),
         with(Status::failed_precondition("x"), "-1"),
+        unreadable,
     ] {
         assert!(matches!(lift(&status, None), StorageError::Unavailable(_)));
     }
