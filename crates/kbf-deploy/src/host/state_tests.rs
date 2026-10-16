@@ -80,6 +80,23 @@ fn the_lock_is_held_while_a_locked_lives() {
     other.try_lock().expect("free once dropped");
 }
 
+/// Catches a lock file or state file another user can read or write: the state says
+/// which release a root service runs, and anyone who could hold the lock could stall
+/// every deploy. Both are made 0600, and a rewrite keeps the state at 0600.
+///
+/// Mutant seen red: the state file made 0644 (as before this test).
+#[test]
+fn the_lock_and_the_state_are_root_s_alone() {
+    let (root, dir) = host_root("deploy-host-state-modes");
+    let lock = Locked::acquire(&root).expect("lock");
+    lock.write(&full_state()).expect("write");
+    lock.write(&State::default()).expect("rewrite");
+    for file in ["run/kbf-deploy.lock", "var/lib/kbf-deploy/state.json"] {
+        let mode = fs::metadata(dir.join(file)).expect(file).mode() & 0o7777;
+        assert_eq!(mode, 0o600, "{file}");
+    }
+}
+
 /// Catches writers that do not exclude each other: each of several threads adds one to
 /// the order floor many times, through read, change and write under the lock; an update
 /// lost to a concurrent writer leaves the total short.
