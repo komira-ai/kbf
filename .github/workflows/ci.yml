@@ -168,6 +168,14 @@ jobs:
         run: cargo test -p kbf-deploy --test envoy_validate --locked -- --ignored
         env:
           KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
+      # Envoy accepts the gateway's bootstrap, learns the leader from the gateway over ADS,
+      # routes REAPI calls to it, follows the leader claim when it moves and does not route
+      # to a claim whose server fails its health check
+      # (crates/kbf-gateway/tests/envoy.rs).
+      - name: Envoy follows the gateway
+        run: cargo test -p kbf-gateway --test envoy --locked -- --ignored
+        env:
+          KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
       # A measurement: what an action-cache hit costs over a file store against the
       # memory store, by stored objects per hit (crates/kbf-front/tests/measure_hit.rs).
       # The numbers are in the log and gate nothing (runners are noisy: read the

@@ -45,6 +45,8 @@ x509-parser.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true
+# The gateway a registering server calls (tests/register.rs).
+kbf-gateway.workspace = true
 kbf-segments.workspace = true
 # The deterministic simulation kernel's seeded random stream (tests/sim_rollout.rs).
 kbf-sim.workspace = true

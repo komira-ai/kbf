@@ -37,6 +37,10 @@ core-foundation = "0.10.1"
 # host, which ring's C build does not allow). One major for both, already in the tree
 # through ssh-key.
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std"] }
+# The xDS types and the ADS service trait kbf-gateway serves the leader endpoint with
+# (Envoy's data-plane API compiled for tonic and prost 0.14, Apache-2.0). Pinned exactly:
+# the generated API is the wire contract with Envoy.
+envoy-types = "=0.7.7"
 # gzip for the tar.gz archives kbf-deploy installs (`mdm install`) and `cargo xtask
 # fetch` unpacks, and the deflate behind zip (below); the pure-Rust backend, no C zlib.
 flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
@@ -156,6 +160,7 @@ kbf-driver-container = { path = "crates/kbf-driver-container" }
 kbf-driver-native = { path = "crates/kbf-driver-native" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
+kbf-gateway = { path = "crates/kbf-gateway" }
 kbf-host = { path = "crates/kbf-host" }
 kbf-invocation = { path = "crates/kbf-invocation" }
 kbf-it = { path = "crates/kbf-it" }

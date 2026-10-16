@@ -1,0 +1,39 @@
+[package]
+name = "kbf-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The client box's gateway: servers register with it (kbf.gateway.v1), and it serves the
+# one leader endpoint to the box's Envoy as xDS. Links neither the server nor the node
+# library.
+[[bin]]
+name = "kbf-gateway"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+envoy-types.workspace = true
+futures.workspace = true
+kbf-proto.workspace = true
+prost.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tonic = { workspace = true, features = ["tls-ring"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+# The golden responses are hex.
+hex.workspace = true
+# SIGTERM to the binary under test (tests/binary.rs).
+libc.workspace = true
+rcgen.workspace = true
+
+[lints]
+workspace = true
