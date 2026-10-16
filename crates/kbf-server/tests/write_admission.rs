@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use futures::channel::mpsc;
-use futures::stream::{self, StreamExt};
+use futures::stream;
 use kbf_front::{Cache, MemoryMetaLog, WriteConfig};
 use kbf_meta::Retention;
 use kbf_objstore::{
