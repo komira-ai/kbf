@@ -28,8 +28,6 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, ORIGIN, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use kbf_front::MetaLog;
-use kbf_objstore::ObjectStore;
 use kbf_types::WorkerId;
 use serde::Deserialize;
 
@@ -45,44 +43,32 @@ pub const DRAIN_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 /// What the handlers share: the farm, and the token writes must present (`None`:
 /// writes are off).
-struct ApiState<M, O> {
-    farm: Arc<Farm<M, O>>,
+struct ApiState {
+    farm: Arc<Farm>,
     token: Option<ApiToken>,
 }
 
 /// The API's routes over `farm`; writes need `token`, and without one are refused.
 /// Writes read the peer address from [`ConnectInfo`]: serve them with
 /// `into_make_service_with_connect_info`.
-pub fn router<M, O>(farm: Arc<Farm<M, O>>, token: Option<ApiToken>) -> Router
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
+pub fn router(farm: Arc<Farm>, token: Option<ApiToken>) -> Router {
     Router::new()
-        .route("/v1/nodes", get(nodes::<M, O>))
-        .route("/v1/nodes/{target}", post(act::<M, O>))
+        .route("/v1/nodes", get(nodes))
+        .route("/v1/nodes/{target}", post(act))
         .with_state(Arc::new(ApiState { farm, token }))
 }
 
-async fn nodes<M, O>(State(api): State<Arc<ApiState<M, O>>>) -> Response
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
+async fn nodes(State(api): State<Arc<ApiState>>) -> Response {
     json(StatusCode::OK, &api.farm.nodes())
 }
 
-async fn act<M, O>(
-    State(api): State<Arc<ApiState<M, O>>>,
+async fn act(
+    State(api): State<Arc<ApiState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(target): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Response
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
+) -> Response {
     let request = Write {
         peer,
         headers: &headers,
