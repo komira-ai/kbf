@@ -22,10 +22,10 @@ use futures::TryStreamExt as _;
 use kbf_segments::{SegmentWriter, layout::footer_len};
 use kbf_types::Digest;
 
-use crate::footers::{self, FooterRead, FooterReads, SkipReason};
+use crate::footers::{self, FooterRead, FooterReads};
 use crate::{
-    ByteRange, Capabilities, KeyPrefix, ListToken, ObjectKey, ObjectStore, ObjectStoreError,
-    PageSize,
+    ByteRange, Capabilities, KeyPrefix, ListToken, ObjectInfo, ObjectKey, ObjectStore,
+    ObjectStoreError, PageSize,
 };
 
 /// How long the Object Lock check retains its object.
@@ -176,6 +176,12 @@ fn key(prefix: &KeyPrefix, name: &str) -> Result<ObjectKey, String> {
         .map_err(|e| format!("scratch key {name}: {e}"))
 }
 
+fn child(prefix: &KeyPrefix, name: &str) -> Result<KeyPrefix, String> {
+    prefix
+        .child(name)
+        .map_err(|e| format!("scratch prefix {name}: {e}"))
+}
+
 fn range(offset: u64, len: u64) -> ByteRange {
     ByteRange::new(offset, len).expect("the suite's ranges are non-empty and small")
 }
@@ -298,9 +304,7 @@ async fn delete_idempotent<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Che
 }
 
 async fn list_pagination<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
-    let dir = prefix
-        .child("list/")
-        .map_err(|e| format!("list prefix: {e}"))?;
+    let dir = child(prefix, "list/")?;
     let mut want = BTreeSet::new();
     for i in 0..LIST_OBJECTS {
         let k = key(&dir, &format!("k{i}"))?;
@@ -310,37 +314,13 @@ async fn list_pagination<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Check
     // Shares the text `<prefix>list` but not `<prefix>list/`: must not be listed.
     put(store, &key(prefix, "list-outside")?, &pattern(1, 0)).await?;
 
-    let page_size = PageSize::new(LIST_PAGE).expect("in range");
-    let mut seen = Vec::new();
-    let mut token = None;
-    let mut pages = 0;
-    loop {
-        pages += 1;
-        ensure!(
-            pages <= LIST_OBJECTS + 1,
-            "list did not end after {pages} pages"
-        );
-        let page = store
-            .list(&dir, token.as_ref(), page_size)
-            .await
-            .map_err(|e| format!("list page {pages}: {e}"))?;
-        ensure!(
-            page.objects.len() <= usize::from(LIST_PAGE),
-            "page {pages} has {} keys; at most {LIST_PAGE} were asked for",
-            page.objects.len()
-        );
-        seen.extend(page.objects.into_iter().map(|o| (o.key, o.size)));
-        match page.next {
-            Some(t) => token = Some(t),
-            None => break,
-        }
-    }
-    let keys: Vec<&ObjectKey> = seen.iter().map(|(k, _)| k).collect();
+    let (seen, pages) = list_from(store, &dir, None, LIST_PAGE, usize::MAX).await?;
+    let keys: Vec<&ObjectKey> = seen.iter().map(|o| &o.key).collect();
     ensure!(
         keys.windows(2).all(|w| w[0] < w[1]),
         "listed keys are not strictly ascending (out of order or repeated): {keys:?}"
     );
-    let got: BTreeSet<_> = seen.into_iter().collect();
+    let got: BTreeSet<_> = seen.into_iter().map(|o| (o.key, o.size)).collect();
     let missing: Vec<_> = want.difference(&got).map(|(k, _)| k.as_str()).collect();
     let extra: Vec<_> = got.difference(&want).map(|(k, _)| k.as_str()).collect();
     ensure!(
@@ -356,15 +336,15 @@ async fn list_pagination<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Check
 }
 
 /// Lists `prefix` from `after` in pages of `page` keys until the listing ends or
-/// `enough` keys came, failing past [`LIST_OBJECTS`] + 1 pages: the keys in the order
-/// they came, and how many pages.
+/// `enough` keys came, failing past [`LIST_OBJECTS`] + 1 pages or on a page larger than
+/// asked: the objects in the order they came, and how many pages.
 async fn list_from<S: ObjectStore>(
     store: &S,
     prefix: &KeyPrefix,
     mut after: Option<ListToken>,
     page: u16,
     enough: usize,
-) -> Result<(Vec<ObjectKey>, usize), String> {
+) -> Result<(Vec<ObjectInfo>, usize), String> {
     let page_size = PageSize::new(page).expect("in range");
     let mut keys = Vec::new();
     let mut pages = 0;
@@ -383,7 +363,7 @@ async fn list_from<S: ObjectStore>(
             "page {pages} has {} keys; at most {page} were asked for",
             got.objects.len()
         );
-        keys.extend(got.objects.into_iter().map(|o| o.key));
+        keys.extend(got.objects);
         match got.next {
             Some(t) => after = Some(t),
             None => break,
@@ -393,9 +373,7 @@ async fn list_from<S: ObjectStore>(
 }
 
 async fn list_start_after<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
-    let dir = prefix
-        .child("after/")
-        .map_err(|e| format!("list prefix: {e}"))?;
+    let dir = child(prefix, "after/")?;
     let mut all = Vec::new();
     for i in 0..LIST_OBJECTS {
         let k = key(&dir, &format!("k{i}"))?;
@@ -405,25 +383,19 @@ async fn list_start_after<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Chec
     // After a key that exists, and after one that does not but sorts between k2 and k3.
     for from in ["k2", "k2x"] {
         let after = ListToken::after(&key(&dir, from)?);
-        let (got, pages) = list_from(store, &dir, Some(after), LIST_PAGE, usize::MAX).await?;
+        let (got, _) = list_from(store, &dir, Some(after), LIST_PAGE, usize::MAX).await?;
+        let got: Vec<ObjectKey> = got.into_iter().map(|o| o.key).collect();
         ensure!(
             got == all[3..],
             "listing {dir:?} after {from}: expected {:?}, got {got:?}",
             &all[3..]
-        );
-        ensure!(
-            pages >= 2,
-            "{} keys came in {pages} pages of {LIST_PAGE}",
-            got.len()
         );
     }
     Ok(Outcome::Passed)
 }
 
 async fn list_empty_prefix<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
-    let dir = prefix
-        .child("empty/")
-        .map_err(|e| format!("list prefix: {e}"))?;
+    let dir = child(prefix, "empty/")?;
     let mut want = Vec::new();
     for i in 0..5 {
         let k = key(&dir, &format!("e{i}"))?;
@@ -433,12 +405,12 @@ async fn list_empty_prefix<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Che
     // `<prefix>empty` sorts just before `<prefix>empty/e0`, and no key of this run lies
     // between them, so the whole-bucket listing from there starts with `want`.
     let after = ListToken::after(&key(prefix, "empty")?);
-    let (got, pages) = list_from(store, &KeyPrefix::default(), Some(after), 2, want.len()).await?;
+    let (got, _) = list_from(store, &KeyPrefix::default(), Some(after), 2, want.len()).await?;
+    let got: Vec<ObjectKey> = got.into_iter().map(|o| o.key).collect();
     ensure!(
         got.get(..want.len()) == Some(&want[..]),
         "listing the whole bucket after {prefix:?}empty: expected {want:?} first, got {got:?}"
     );
-    ensure!(pages >= 3, "{} keys came in {pages} pages of 2", want.len());
     Ok(Outcome::Passed)
 }
 
@@ -447,32 +419,32 @@ async fn list_empty_prefix<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Che
 const FOOTER_TAIL: u64 = 1200;
 
 async fn footer_reads<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
-    let dir = prefix
-        .child("footers/")
-        .map_err(|e| format!("footer prefix: {e}"))?;
+    let dir = child(prefix, "footers/")?;
     // What the segments hold, as their writer laid them out: records back to back.
     let mut want: BTreeMap<Digest, (ObjectKey, u64)> = BTreeMap::new();
     let mut footers_len = BTreeMap::new();
-    for (name, records) in [("seg-a", 1_usize), ("seg-b", 9)] {
+    for (name, records) in [("seg-a", 1_usize), ("seg-b", 9), ("seg-torn", 1)] {
         let k = key(&dir, name)?;
         let mut writer = SegmentWriter::new(1 << 20);
         let mut offset = 0;
+        let mut index = Vec::new();
         for r in 0..records {
             let blob = pattern(100 + r, name.len() as u8 + r as u8);
             let digest = writer.push(&blob).map_err(|e| format!("{name}: {e}"))?;
-            want.insert(digest, (k.clone(), offset));
+            index.push((digest, (k.clone(), offset)));
             offset += blob.len() as u64;
         }
-        footers_len.insert(k.clone(), footer_len(records as u64));
-        put(store, &k, &writer.finish().into()).await?;
+        let mut bytes = writer.finish();
+        if name == "seg-torn" {
+            // The first byte of the fan-out flipped: the trailer reads, the footer's
+            // CRC does not.
+            bytes[offset as usize] ^= 1;
+        } else {
+            want.extend(index);
+            footers_len.insert(k.clone(), footer_len(records as u64));
+        }
+        put(store, &k, &bytes.into()).await?;
     }
-    let mut torn = SegmentWriter::new(1 << 20);
-    torn.push(&pattern(300, 7))
-        .map_err(|e| format!("torn: {e}"))?;
-    let mut torn = torn.finish();
-    // A byte of the fan-out flipped: the trailer reads, the footer's CRC does not.
-    torn[300] ^= 1;
-    put(store, &key(&dir, "seg-torn")?, &torn.into()).await?;
     put(store, &key(&dir, "foreign")?, &pattern(4096, 8)).await?;
     put(store, &key(&dir, "short")?, &pattern(10, 9)).await?;
 
@@ -504,15 +476,11 @@ async fn footer_reads<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckRes
                 }
             }
             FooterRead::Skipped(s) => {
-                let why = match s.why {
-                    SkipReason::Short => "short",
-                    SkipReason::NotASegment(_) => "not a segment",
-                    other => return Err(format!("{} skipped: {other}", s.key)),
-                };
-                skipped.insert(
-                    s.key.as_str().rsplit('/').next().unwrap_or("").to_owned(),
-                    why,
-                );
+                // The reason without its detail: "not a segment: <why>" or another.
+                let why = s.why.to_string();
+                let why = why.split(':').next().unwrap_or_default().to_owned();
+                let name = s.key.as_str().rsplit('/').next().unwrap_or_default();
+                skipped.insert(name.to_owned(), why);
             }
         }
     }
@@ -520,13 +488,13 @@ async fn footer_reads<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckRes
         got == want,
         "segment indexes read back: expected {want:?}, got {got:?}"
     );
-    let want_skipped: BTreeMap<String, &str> = [
+    let want_skipped: BTreeMap<String, String> = [
         ("foreign", "not a segment"),
         ("seg-torn", "not a segment"),
-        ("short", "short"),
+        ("short", "shorter than a segment trailer"),
     ]
     .into_iter()
-    .map(|(k, v)| (k.to_owned(), v))
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
     .collect();
     ensure!(
         skipped == want_skipped,

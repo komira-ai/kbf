@@ -154,6 +154,23 @@ mod tests {
         futures::executor::block_on(conformance::run(&store, &prefix))
     }
 
+    /// Catches a local store that reads an S3 continuation token as a key to start
+    /// after (a listing would resume at an arbitrary place) instead of refusing it.
+    #[test]
+    fn a_continuation_token_from_another_store_is_refused() {
+        let store = MemoryStore::new(Capabilities::default());
+        let token = ListToken(crate::types::Token::Continue("a".into()));
+        let listed = futures::executor::block_on(store.list(
+            &KeyPrefix::default(),
+            Some(&token),
+            PageSize::MAX,
+        ));
+        assert!(
+            matches!(&listed, Err(ObjectStoreError::Protocol(why)) if why.contains("another store")),
+            "{listed:?}"
+        );
+    }
+
     /// Catches: any break in the fake's contract (ranges, delete, list paging,
     /// conditional writes, Object Lock). The rest of kbf tests against this fake, so a
     /// fake that drifts from the contract makes every test above it lie.

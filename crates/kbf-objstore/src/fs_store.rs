@@ -471,12 +471,7 @@ impl Inner {
         if next.is_none() {
             // The listing is done: free its keys.
             let mut listing = self.listing.lock().unwrap_or_else(PoisonError::into_inner);
-            if listing
-                .as_ref()
-                .is_some_and(|l| Arc::ptr_eq(&l.keys, &keys))
-            {
-                *listing = None;
-            }
+            listing.take_if(|l| Arc::ptr_eq(&l.keys, &keys));
         }
         Ok(ListPage { objects, next })
     }
