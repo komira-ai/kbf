@@ -31,7 +31,7 @@ mod writer;
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -143,8 +143,6 @@ impl SqliteStore {
         let epoch = schema::bump_epoch(&conn, 0)?;
         let head = schema::head(&conn)?;
         let shared = Arc::new(Shared::default());
-        let commits = Arc::clone(&shared.commits);
-        conn.commit_hook(Some(move || count_commit(&commits)))?;
         let reader = Connection::open(path)?;
         schema::configure(&reader)?;
         reader.pragma_update(None, "query_only", true)?;
@@ -220,12 +218,6 @@ impl SqliteStore {
     fn reader(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.reader.lock().unwrap_or_else(PoisonError::into_inner)
     }
-}
-
-/// SQLite's commit hook: counts the commit, and lets it go ahead.
-fn count_commit(commits: &AtomicU64) -> bool {
-    commits.fetch_add(1, Ordering::AcqRel);
-    false
 }
 
 /// The answer to a call the writer cannot take or will never answer.

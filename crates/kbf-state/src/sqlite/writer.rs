@@ -39,8 +39,8 @@ pub(super) struct Request {
 pub(super) struct Shared {
     /// Transactions committed.
     pub(super) txns: AtomicU64,
-    /// SQLite commits, counted by SQLite's own commit hook.
-    pub(super) commits: Arc<AtomicU64>,
+    /// SQLite commits the writer made: one per group that wrote anything.
+    pub(super) commits: AtomicU64,
     /// The commit latency figures.
     pub(super) metrics: Mutex<CommitMetrics>,
 }
@@ -167,6 +167,7 @@ impl Writer {
         drop(applier);
         if let Some(head) = head {
             tx.commit()?;
+            self.shared.commits.fetch_add(1, Ordering::AcqRel);
             self.head = head;
         }
         Ok(replies)
