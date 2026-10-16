@@ -6,10 +6,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::TryStreamExt as _;
 use kbf_objstore::s3::{Credentials, S3Config, S3Store};
 use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListToken, ObjectKey, ObjectStore, ObjectStoreError,
-    PageSize,
+    PageSize, listing,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -305,6 +306,89 @@ async fn list_after_a_key_sends_start_after_then_the_token() {
         ),
         "{}",
         heads[1]
+    );
+}
+
+/// Catches: a listing stream over S3 that does not carry the continuation token from
+/// page to page, or stops at a truncated page: two pages, each asked for once, the
+/// second with the first's token, every key in order.
+#[tokio::test]
+async fn the_listing_stream_follows_continuation_tokens() {
+    let first = "<ListBucketResult><IsTruncated>true</IsTruncated>\
+                 <NextContinuationToken>t2</NextContinuationToken>\
+                 <Contents><Key>p/a</Key><Size>1</Size></Contents>\
+                 <Contents><Key>p/b/c</Key><Size>2</Size></Contents></ListBucketResult>";
+    let last = "<ListBucketResult><IsTruncated>false</IsTruncated>\
+                <Contents><Key>p/c</Key><Size>3</Size></Contents></ListBucketResult>";
+    let (endpoint, seen) = script(vec![
+        answer("200 OK", &[], first),
+        answer("200 OK", &[], last),
+    ])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let prefix = KeyPrefix::new("p/").unwrap();
+    let got: Vec<(String, u64)> = listing::objects(&s, &prefix, None, PageSize::new(2).unwrap())
+        .map_ok(|o| (o.key.as_str().to_owned(), o.size))
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        got,
+        [("p/a".into(), 1), ("p/b/c".into(), 2), ("p/c".into(), 3)]
+    );
+    let heads = seen.lock().unwrap();
+    assert_eq!(heads.len(), 2);
+    assert!(
+        heads[1].starts_with(
+            "GET /kbf-test?continuation-token=t2&list-type=2&max-keys=2&prefix=p%2F HTTP/1.1"
+        ),
+        "{}",
+        heads[1]
+    );
+}
+
+/// Catches: a listing failure mapped to the wrong error, or to an empty page (a rebuild
+/// would take an unreadable bucket for an empty one): an S3 error is `Service` with its
+/// status and code; an answer that is not a ListObjectsV2 result, or that lists a key
+/// kbf cannot name (non-ASCII here: an object kbf did not write), is `Protocol`.
+#[tokio::test]
+async fn listing_failures_are_typed() {
+    let denied = "<Error><Code>AccessDenied</Code><Message>no</Message></Error>";
+    let missing = "<Error><Code>NoSuchBucket</Code><Message>gone</Message></Error>";
+    let foreign = "<ListBucketResult><IsTruncated>false</IsTruncated>\
+                   <Contents><Key>p/caf\u{e9}</Key><Size>1</Size></Contents></ListBucketResult>";
+    let (endpoint, _) = script(vec![
+        answer("403 Forbidden", &[], denied),
+        answer("404 Not Found", &[], missing),
+        answer("200 OK", &[], "<html>not s3</html>"),
+        answer("200 OK", &[], foreign),
+    ])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let prefix = KeyPrefix::new("p/").unwrap();
+    let mut answers = Vec::new();
+    for _ in 0..4 {
+        answers.push(s.list(&prefix, None, PageSize::MAX).await.unwrap_err());
+    }
+    assert!(
+        matches!(&answers[0], ObjectStoreError::Service { status: 403, code, .. } if code == "AccessDenied"),
+        "{:?}",
+        answers[0]
+    );
+    assert!(
+        matches!(&answers[1], ObjectStoreError::Service { status: 404, code, .. } if code == "NoSuchBucket"),
+        "{:?}",
+        answers[1]
+    );
+    assert!(
+        matches!(&answers[2], ObjectStoreError::Protocol(why) if why.contains("root element is <html>")),
+        "{:?}",
+        answers[2]
+    );
+    assert!(
+        matches!(&answers[3], ObjectStoreError::Protocol(why) if why.contains("listed key") && why.contains('\u{e9}')),
+        "{:?}",
+        answers[3]
     );
 }
 
