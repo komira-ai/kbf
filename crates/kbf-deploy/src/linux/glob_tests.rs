@@ -1,7 +1,56 @@
 //! The glob(3) reading behind rule `credential`'s `EnvironmentFile=` wildcards. The
 //! expected answers were taken from glibc 2.42 itself (`fnmatch(3)` with `FNM_PERIOD`
 //! and `glob(3)` over a tree holding `etc/kbf/s3.env` and `etc/other/`, both in the C
-//! locale); the rows marked otherwise follow from systemd's sources.
+//! locale); the rows marked otherwise follow from systemd's or glibc's sources.
+
+// How the glibc rows were made: by hand, on a Linux host with glibc 2.42, never in CI
+// (the answers are pasted into the rows below; nothing here calls the host's libc).
+// The generator is not a checked-in file: the repository lints refuse any new Python
+// file (tools/interpreter_budget.tsv only shrinks). It is this script, reconstructed
+// from the run behind these rows (not rerun since), saved as `glob_expected.py` in an
+// empty scratch directory with the pairs pasted in and run there as
+//
+//     LC_ALL=C python3 -I glob_expected.py
+//
+//     import ctypes, os
+//     libc = ctypes.CDLL("libc.so.6", use_errno=True)
+//     libc.setlocale(6, b"C")  # LC_ALL, as PID 1 runs
+//     libc.gnu_get_libc_version.restype = ctypes.c_char_p
+//     print("glibc", libc.gnu_get_libc_version().decode())
+//     FNM_PERIOD = 4
+//     def fnmatch(pattern, name):
+//         return libc.fnmatch(pattern, name, FNM_PERIOD) == 0
+//     class Glob(ctypes.Structure):
+//         _fields_ = [("pathc", ctypes.c_size_t),
+//                     ("pathv", ctypes.POINTER(ctypes.c_char_p)),
+//                     ("offs", ctypes.c_size_t), ("flags", ctypes.c_int),
+//                     ("funcs", ctypes.c_void_p * 5)]
+//     def glob(pattern):
+//         g = Glob()
+//         libc.glob(pattern, 0, None, ctypes.byref(g))
+//         found = [g.pathv[i] for i in range(g.pathc)]
+//         libc.globfree(ctypes.byref(g))
+//         return found
+//     # names_match_as_glibc_fnmatch_matches_them: (pattern, name) as bytes
+//     FNMATCH = [(rb"s3.env", rb"s3.env")]
+//     # paths_match_as_glibc_glob_lists_them: the glibc rows' patterns
+//     PATHS = [rb"/etc/kbf/s3.env"]
+//     CLASSES = [b"alnum", b"alpha", b"blank", b"cntrl", b"digit", b"graph",
+//                b"lower", b"print", b"punct", b"space", b"upper", b"xdigit"]
+//     for pattern, name in FNMATCH:
+//         print(pattern, name, fnmatch(pattern, name))
+//     for c in CLASSES:
+//         print(c, bytes(b for b in range(1, 256)
+//                        if fnmatch(b"[[:" + c + b":]]", bytes([b]))))
+//     os.makedirs("etc/kbf"); os.makedirs("etc/other")
+//     open("etc/kbf/s3.env", "w").close()
+//     root = os.getcwd().encode()  # a path with no wildcard or `\` in it
+//     for pattern in PATHS:
+//         print(pattern, root + b"/etc/kbf/s3.env" in glob(root + pattern))
+//
+// glob(3) is called with no GLOB_ALTDIRFUNC, so its readdir lists `.` and `..`, which
+// systemd's does not: the rows marked as systemd's are not the script's. A class row
+// is the bytes printed for that class.
 
 use super::*;
 
@@ -190,7 +239,9 @@ fn classes_hold_the_c_locale_bytes() {
 /// kept (or an even one dropped), `\` not taken off a directory written out, `.`,
 /// `..` and `//` not resolved, a part after the first wildcard not matched by fnmatch
 /// (or one with no `\` not opened as written), `[`/`]` across a `/`, and a pattern for
-/// a directory or with too few or too many parts matching the file.
+/// a directory or with too few or too many parts matching the file; and a trailing `/`
+/// read other than glob(3) reads it (a plain name before it listed even as a file, a
+/// wildcard or `\` one only as a directory, an odd `\` before it dropped, a last `.`).
 #[test]
 fn paths_match_as_glibc_glob_lists_them() {
     for (pattern, want) in [
@@ -234,6 +285,21 @@ fn paths_match_as_glibc_glob_lists_them() {
         (r"/etc/kbf/*/../s3.env", true),
         // systemd globs only an absolute path.
         (r"etc/kbf/s3.env", false),
+        // A trailing `/`, from glibc's `posix/glob.c` (the `"pattern/"` case and
+        // `glob_in_dir`): `pattern` is expanded with GLOB_ONLYDIR, which only the
+        // directory read honours. A last name with no wildcard and no `\` is lstat'ed
+        // and kept even as a file; one with either is matched against the directory's
+        // entries and a file skipped. An odd run of `\` before the `/` loses one.
+        (r"/etc/kbf/s3.env/", true),
+        (r"/etc/kbf/s3.env//", true),
+        (r"/etc/*/s3.env/", true),
+        (r"/etc/kbf/s3.env\/", true),
+        (r"/etc/kbf/s3.env\\/", false),
+        (r"/etc/kbf/\s3.env/", false),
+        (r"/etc/kbf/s3*/", false),
+        (r"/etc/kbf/s3.env/.", false),
+        (r"/etc/kbf/s3.env/./", false),
+        (r"/etc/kbf/s3.env/..", false),
     ] {
         assert_eq!(matches(pattern, KEY), want, "{pattern}");
     }
@@ -241,7 +307,8 @@ fn paths_match_as_glibc_glob_lists_them() {
 
 /// Catches a wildcard told from a path by another test than glob(3)'s (`[` alone counts,
 /// an escaped `*` does not), and the path a literal names read with its `\` kept, or a
-/// name ending in a lone `\` read as a file.
+/// name ending in a lone `\` read as a file; a trailing `/` kept, or a pattern that
+/// lists only a directory (a last `.` or `..`, a `\` name before a `/`) read as a file.
 #[test]
 fn a_path_with_no_wildcard_names_its_file_unescaped() {
     for (text, wildcard) in [
@@ -265,4 +332,14 @@ fn a_path_with_no_wildcard_names_its_file_unescaped() {
     );
     assert_eq!(literal(r"/etc/kbf/s3.env\"), None);
     assert_eq!(literal("/etc/*/s3.env"), None);
+    // A trailing `/` is taken off (with the last `\` of an odd run before it); a name
+    // with a `\` before it, or a last `.` or `..`, lists a directory only.
+    assert_eq!(literal("/etc/kbf/s3.env//").as_deref(), Some(KEY));
+    assert_eq!(literal(r"/etc/kbf/s3.env\/").as_deref(), Some(KEY));
+    assert_eq!(literal(r"/etc/kbf/\s3.env/"), None);
+    assert_eq!(literal("/etc/kbf/s3.env/."), None);
+    assert_eq!(literal("/etc/kbf/s3.env/.."), None);
+    assert_eq!(literal(r"/etc/kbf/s3.env/\."), None);
+    assert_eq!(literal("."), None);
+    assert_eq!(literal("/").as_deref(), Some("/"));
 }
