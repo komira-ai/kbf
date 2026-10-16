@@ -1853,7 +1853,6 @@ dependencies = [
  "kbf-auth",
  "kbf-caps",
  "kbf-front",
- "kbf-gateway",
  "kbf-invocation",
  "kbf-log",
  "kbf-mdm-api",

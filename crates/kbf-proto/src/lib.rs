@@ -52,6 +52,12 @@ pub mod grpc {
 
 /// `kbf.*`: kbf's own protocols.
 pub mod kbf {
+    pub mod gateway {
+        /// The protocol between `kbf-server` and the client box's `kbf-gateway`.
+        pub mod v1 {
+            tonic::include_proto!("kbf.gateway.v1");
+        }
+    }
     pub mod log {
         /// The payload of a command entry in the replicated log. The conversions to and
         /// from the domain values are in `kbf-log`.
@@ -69,6 +75,8 @@ pub mod kbf {
 
 /// The Remote Execution API v2, under a short name.
 pub use build::bazel::remote::execution::v2 as reapi;
+/// The `kbf.gateway.v1` protocol, under a short name.
+pub use kbf::gateway::v1 as gateway;
 /// The `kbf.worker.v1` protocol, under a short name.
 pub use kbf::worker::v1 as worker;
 

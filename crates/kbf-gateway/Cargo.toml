@@ -34,6 +34,8 @@ hex.workspace = true
 # SIGTERM to the binary under test (tests/binary.rs).
 libc.workspace = true
 rcgen.workspace = true
+# Envoy's admin listing is read over a plain socket (tests/envoy.rs).
+tokio = { workspace = true, features = ["io-util"] }
 
 [lints]
 workspace = true

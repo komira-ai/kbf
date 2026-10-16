@@ -1,0 +1,38 @@
+// kbf.gateway.v1.Registration: a kbf-server tells a client box's gateway where its
+// REAPI listener is and whether it holds the leader role. The gateway turns the
+// answers into the one endpoint its local Envoy sends REAPI traffic to.
+//
+// Served over mutual TLS. The gateway accepts a caller only if its certificate chains
+// to the farm CA and is a server certificate (extended key usage serverAuth, and so
+// clientAuth as TLS needs it here) naming exactly one DNS name, which is the caller's
+// node name. A daemon's or a client's certificate is refused PERMISSION_DENIED.
+//
+// Registrations are soft state: each call renews the caller's entry for the gateway's
+// TTL, and an entry that is not renewed expires. A restarted gateway knows nothing
+// until the servers' next calls.
+syntax = "proto3";
+
+package kbf.gateway.v1;
+
+service Registration {
+  // Records or renews the caller's entry. Servers call it about every two seconds, and
+  // at once when their role changes. INVALID_ARGUMENT: `reapi_address` is not an
+  // `ip:port`. PERMISSION_DENIED: the certificate is not a server certificate.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+}
+
+message RegisterRequest {
+  // Where the caller's REAPI listener is, as `ip:port` (Envoy takes endpoints of a
+  // cluster it is sent as addresses; it resolves no names there).
+  string reapi_address = 1;
+  // Whether the caller holds the scheduler role now.
+  bool is_leader = 2;
+  // The caller's scheduler term. Of several callers that claim the role, the one with
+  // the highest term is the leader.
+  uint64 term = 3;
+}
+
+message RegisterResponse {
+  // How long, in milliseconds, the entry lives without another call.
+  uint64 ttl_ms = 1;
+}
