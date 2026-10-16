@@ -155,9 +155,7 @@ impl SqliteStore {
             shared: Arc::clone(&shared),
             head: writer::uint(head),
         };
-        let handle = std::thread::Builder::new()
-            .name("kbf-state-writer".to_owned())
-            .spawn(move || writer.run(&queue))?;
+        let handle = writer.spawn(queue)?;
         Ok(SqliteStore {
             path: path.to_owned(),
             clock,

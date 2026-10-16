@@ -2,9 +2,11 @@
 //! arrive inside the commit window into one group, applies the group in one SQLite
 //! transaction, syncs once, and only then answers every request in it.
 
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension, Row, Statement, TransactionBehavior, params};
@@ -81,6 +83,13 @@ pub(super) fn from_nanos(nanos: i64) -> StoreTime {
 }
 
 impl Writer {
+    /// Starts the writer thread, which serves `requests` until every sender is gone.
+    pub(super) fn spawn(self, requests: Receiver<Request>) -> io::Result<JoinHandle<()>> {
+        std::thread::Builder::new()
+            .name("kbf-state-writer".to_owned())
+            .spawn(move || self.run(&requests))
+    }
+
     /// Serves requests until every sender is gone.
     pub(super) fn run(mut self, requests: &Receiver<Request>) {
         while let Ok(first) = requests.recv() {
