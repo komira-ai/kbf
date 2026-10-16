@@ -835,7 +835,7 @@ pub use touches::TouchConfig;
 use touches::Touches;
 pub(crate) use upload::BuiltSegment;
 pub use write_group::{
-    Admitted, CONNECTION_WINDOW_BYTES, MAX_ADMISSION_BYTES, MAX_CONCURRENT_STREAMS, PUT_BACKOFF,
+    Admitted, DEFAULT_REAPI_STREAMS, DEFAULT_WORKER_STREAMS, MAX_ADMISSION_BYTES, PUT_BACKOFF,
     PUT_BACKOFF_FACTOR, STREAM_WINDOW_BYTES, WriteConfig,
 };
 use write_group::{Group, Writer};

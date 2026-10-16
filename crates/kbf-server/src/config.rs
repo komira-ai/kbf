@@ -331,14 +331,17 @@ pub struct Args {
     /// waits, nothing is refused for load. At least the largest blob (1 GiB), so one
     /// can always be admitted, and at least `--segment-upload-max-bytes`. Not covered: each HTTP/2
     /// stream's message as tonic decodes it, before the handler runs, up to 17 MiB per
-    /// stream (about 3.4 GiB for 200 streams) and 200 streams per connection on either listener
-    /// (`kbf_front::MAX_CONCURRENT_STREAMS`).
+    /// stream (about 3.4 GiB for 200 streams), times the streams one connection may open
+    /// (`--reapi-max-streams`, `--worker-max-streams`).
     #[arg(
         long,
         default_value_t = kbf_front::WriteConfig::DEFAULT.bytes_in_flight,
         value_parser = clap::value_parser!(u64).range(kbf_front::MAX_BLOB_BYTES..)
     )]
     pub write_bytes_in_flight: u64,
+    /// The most HTTP/2 streams one connection may have open, per listener.
+    #[command(flatten)]
+    pub streams: crate::streams::StreamArgs,
     /// The most segment PUTs, each with its footer read-back, in flight at once. A
     /// segment sealed while all are busy waits; new blobs go to a new open segment.
     #[arg(long, default_value_t = kbf_front::WriteConfig::DEFAULT.puts_in_flight)]
@@ -524,6 +527,7 @@ impl Args {
                 max_bytes: self.segment_upload_max_bytes,
                 idle: Duration::from_secs(self.segment_upload_idle_secs),
             },
+            stream_limits: self.streams.limits(),
         })
     }
 
