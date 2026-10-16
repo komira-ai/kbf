@@ -150,6 +150,7 @@ x509-parser = "0.18.1"
 zip = { version = "9.0.1", default-features = false, features = ["deflate-flate2"] }
 
 kbf-alert = { path = "crates/kbf-alert" }
+kbf-all-in-one = { path = "crates/kbf-all-in-one" }
 kbf-auth = { path = "crates/kbf-auth" }
 kbf-caps = { path = "crates/kbf-caps" }
 kbf-cas-conformance = { path = "crates/kbf-cas-conformance" }
@@ -178,6 +179,7 @@ kbf-server = { path = "crates/kbf-server" }
 kbf-sim = { path = "crates/kbf-sim" }
 kbf-sim-cell = { path = "crates/kbf-sim-cell" }
 kbf-state = { path = "crates/kbf-state" }
+kbf-storage = { path = "crates/kbf-storage" }
 kbf-store = { path = "crates/kbf-store" }
 kbf-testkit = { path = "crates/kbf-testkit" }
 kbf-threads = { path = "crates/kbf-threads" }

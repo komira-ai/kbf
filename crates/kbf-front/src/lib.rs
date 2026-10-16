@@ -54,6 +54,7 @@ pub mod metrics;
 mod recorder;
 mod request_metadata;
 mod segments;
+mod storage;
 mod wire;
 
 use std::sync::Arc;
@@ -99,6 +100,7 @@ pub use crate::segments::{
     Connection, Connections, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, MIN_SEGMENT_UPLOAD_BYTES,
     SegmentsConfig, SegmentsService, Tracked,
 };
+pub use crate::storage::CacheStorage;
 
 /// The most blob data one `BatchUpdateBlobs` or `BatchReadBlobs` call may carry,
 /// advertised in the capabilities. Larger blobs go through ByteStream. A request is

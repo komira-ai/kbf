@@ -20,7 +20,11 @@
 //!   run both in one process, and any other crate that links both, or either one into
 //!   the other's side of the farm, makes the split meaningless;
 //! - a `main.rs` of those two that grows past `THIN_MAIN_LINES` code lines, which
-//!   means assembly that a combined binary could not reuse is back in a binary.
+//!   means assembly that a combined binary could not reuse is back in a binary;
+//! - the storage crate (`kbf-storage`) depending, directly or through another crate, on
+//!   a frontend crate (`STORAGE_MUST_NOT_REACH`: the scheduler and authorization), which
+//!   would make a storage process link the frontend; and the storage crate renamed or
+//!   removed, which would make that check pass vacuously.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -215,9 +219,9 @@ fn pure_modules_deny_the_clippy_lists() {
     }
 }
 
-/// The one crate allowed to depend on both the server and the node library: the combined
-/// binary.
-const JOINERS: &[&str] = &["kbf-all-in-one"];
+/// The crates allowed to depend on both the server and the node library: the combined
+/// binary and the one `kbf` binary.
+const JOINERS: &[&str] = &["kbf-all-in-one", "kbf-cli"];
 
 /// What the server library's normal dependencies must not reach: the daemon side. The
 /// server stores and schedules; it never moves blobs as a client.
@@ -280,7 +284,11 @@ const THIN_MAIN_LINES: usize = 40;
 #[test]
 fn the_server_and_daemon_binaries_are_thin() {
     let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    for main in ["kbf-server/src/main.rs", "kbf-node/src/main.rs"] {
+    for main in [
+        "kbf-server/src/main.rs",
+        "kbf-node/src/main.rs",
+        "kbf-cli/src/main.rs",
+    ] {
         let path = crates.join(main);
         let src = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -295,4 +303,25 @@ fn the_server_and_daemon_binaries_are_thin() {
              in the library, where a combined binary can call it"
         );
     }
+}
+
+/// What the storage crate's normal dependencies must not reach: the frontend's scheduler
+/// and authorization (docs/design/architecture-v2.md, section 3). A storage process
+/// stores; it neither schedules nor decides who may call.
+const STORAGE_MUST_NOT_REACH: &[&str] = &["kbf-sched", "kbf-auth"];
+
+#[test]
+fn storage_reaches_no_frontend_crate() {
+    let g = load_graph();
+    let (_, root) = g
+        .members
+        .get("kbf-storage")
+        .expect("kbf-storage is a workspace member");
+    assert!(root.is_some(), "kbf-storage must have a library target");
+    let violations = reaches(&g, "kbf-storage", STORAGE_MUST_NOT_REACH);
+    assert!(
+        violations.is_empty(),
+        "kbf-storage reaches a frontend crate:\n{}",
+        violations.join("\n")
+    );
 }
