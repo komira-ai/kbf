@@ -31,7 +31,9 @@ use crate::local::LocalStore;
 use crate::startup_pass::StartPass;
 use crate::stores::{COLD_FILE_FLOOR, FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
-use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, bind_server_with_policy, s3_store};
+use crate::{
+    Args, RaftMetaLog, SERVER_VERSION, ServeError, StateStoreUri, bind_server_with_state, s3_store,
+};
 
 /// The server's thread sizes on a given machine shape: every CPU, then the overrides.
 pub fn sizes_on(args: &Args, topology: Topology) -> kbf_threads::Sizes {
@@ -210,6 +212,11 @@ where
 {
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
+    let state = args
+        .state_store
+        .as_ref()
+        .map(StateStoreUri::open)
+        .transpose()?;
     let routes = Routes {
         invocations: policy.invocations_get.is_some(),
         blobs: policy.invocations_get.is_some() && policy.blobs_get.is_some(),
@@ -228,7 +235,7 @@ where
     let _pass = pass.map(|pass| AbortOnDrop(crate::startup_pass::spawn(Arc::clone(&cache), pass)));
     let shutdown = shutdown()?;
     let api = args.api()?;
-    let bound = bind_server_with_policy(cache, listeners, api, policy, shutdown)?;
+    let bound = bind_server_with_state(cache, listeners, api, policy, state, shutdown)?;
     let plain = args.plain_text_off_loopback();
     Ok(ServerHandle {
         reapi: bound.reapi,
@@ -362,6 +369,39 @@ mod tests {
         let line = server.start_line().to_owned();
         assert!(line.ends_with(&format!(" log={id}")), "{line}");
         drop(server);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Catches: `--state-store` accepted by the flags and then ignored at start (the
+    /// scheduler would run in memory while the operator believes its state is kept): a
+    /// start over a scheme this build has no backend for is refused, naming it, before
+    /// anything is served.
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_with_refuses_a_state_store_without_a_backend() {
+        let root =
+            std::env::temp_dir().join(format!("kbf-server-state-flag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let args = Args::parse_from([
+            "kbf-server",
+            "--listen=127.0.0.1:0",
+            "--worker-listen=127.0.0.1:0",
+            "--state-store=sqlite:///var/lib/kbf/state.db",
+        ]);
+        let log = RaftMetaLog::open_dir(&root.join("raft"), Retention::default(), "kbf/")
+            .await
+            .expect("open the log");
+        let (prefix, id) = (log.store_prefix(), log.log_id());
+        let store = FsStore::open(&root.join("blobs"), Floor::Bytes(1)).expect("open the store");
+        let refused = serve_with(&args, None, log, store, prefix, id, interrupted)
+            .await
+            .err()
+            .expect("refused");
+        assert!(
+            refused
+                .to_string()
+                .contains("no sqlite state store backend"),
+            "{refused}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -78,6 +78,7 @@ pub mod serve;
 pub mod stamp;
 mod start;
 mod startup_pass;
+pub mod state_store;
 pub mod storage_node;
 pub mod stores;
 mod timeout;
@@ -86,7 +87,7 @@ pub mod worker;
 pub mod write_tier;
 
 pub use config::{Args, ConfigError, Role, SERVER, s3_store};
-pub use farm::Farm;
+pub use farm::{EpochPolicy, Farm, SESSION_RENEWAL, StateError};
 pub use health::Readiness;
 pub use identity::{DenyList, DenyListError, Peers};
 pub use kbf_sched::MemoryLadder;
@@ -94,9 +95,11 @@ pub use local::LocalStore;
 pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use serve::{
     Api, Bound, BoundStorage, Listeners, ServeError, StorageListener, StreamTiming, WorkerTls,
-    bind_server, bind_server_with_api, bind_server_with_policy, bind_storage,
+    bind_server, bind_server_with_api, bind_server_with_policy, bind_server_with_state,
+    bind_storage,
 };
 pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start};
+pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};
 pub use worker::WorkerService;
 
 /// The commit the server was built from: 12 hex digits, or `unknown` when the build

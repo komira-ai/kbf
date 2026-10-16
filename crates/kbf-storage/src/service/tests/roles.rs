@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use futures::stream;
-use kbf_proto::google::bytestream::ReadRequest;
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
+use kbf_proto::google::bytestream::{QueryWriteStatusRequest, ReadRequest};
 use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
 use kbf_proto::reapi::{ActionResult, FindMissingBlobsRequest};
 use kbf_proto::storage::action_store_client::ActionStoreClient;
@@ -49,7 +49,7 @@ fn der(sans: Vec<SanType>) -> Vec<u8> {
 /// test), for each endpoint.
 fn expected(endpoint: Endpoint) -> &'static [&'static str] {
     match endpoint {
-        Endpoint::FindMissing | Endpoint::Read | Endpoint::Write => {
+        Endpoint::FindMissing | Endpoint::Read | Endpoint::Write | Endpoint::QueryWriteStatus => {
             &["frontend", "storage", "daemon"]
         }
         Endpoint::ActionGet => &["frontend"],
@@ -202,6 +202,12 @@ async fn call(endpoint: Endpoint, channel: &Channel) -> Result<(), Status> {
                 .await
                 .map(drop)
         }
+        Endpoint::QueryWriteStatus => ByteStreamClient::new(channel.clone())
+            .query_write_status(QueryWriteStatusRequest {
+                resource_name: super::upload_name(&sha(b"x")),
+            })
+            .await
+            .map(drop),
         Endpoint::ActionGet => ActionStoreClient::new(channel.clone())
             .get(GetRequest {
                 map_generation: 0,

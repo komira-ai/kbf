@@ -51,12 +51,15 @@ impl PeerRole {
 /// The endpoints with their own expectation of who calls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Endpoint {
-    /// `FindMissingBlobs`, and `QueryWriteStatus`, which asks the same question.
+    /// `FindMissingBlobs`.
     FindMissing,
     /// ByteStream `Read`.
     Read,
     /// ByteStream `Write`.
     Write,
+    /// ByteStream `QueryWriteStatus`: whether a `Write` of the blob has landed, so it
+    /// is the roles of the `Write` it asks about.
+    QueryWriteStatus,
     /// `ActionStore.Get`: a client's `GetActionResult`.
     ActionGet,
     /// `ActionStore.Prepare`: the first half of an action-cache write.
@@ -69,10 +72,11 @@ pub enum Endpoint {
 
 impl Endpoint {
     /// Every endpoint.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::FindMissing,
         Self::Read,
         Self::Write,
+        Self::QueryWriteStatus,
         Self::ActionGet,
         Self::ActionPrepare,
         Self::ActionCommit,
@@ -87,7 +91,9 @@ impl Endpoint {
     pub const fn allowed(self) -> &'static [PeerRole] {
         use PeerRole::{Daemon, Frontend, Storage};
         match self {
-            Self::FindMissing | Self::Read | Self::Write => &[Frontend, Storage, Daemon],
+            Self::FindMissing | Self::Read | Self::Write | Self::QueryWriteStatus => {
+                &[Frontend, Storage, Daemon]
+            }
             Self::ActionGet => &[Frontend],
             Self::ActionPrepare | Self::ActionCommit => &[Frontend, Daemon],
             Self::Segments => &[Daemon],

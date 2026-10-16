@@ -4,7 +4,8 @@
 //!
 //! Each unit runs `<KBF_BIN_DIR>/kbf <mode> ...`. A mode `kbf` runs today (`daemon`,
 //! `all-in-one`, `storage`) carries the flags its old binary's unit carries (`storage`
-//! none yet: a TODO comment marks where its stores go); a mode not built yet
+//! only its three certificate flags yet: a TODO comment marks where its stores go); a
+//! mode not built yet
 //! (`frontend`, `storage-and-daemon`) carries none, and its template marks
 //! where its flags go with a `TODO:` comment. The flags the new modes add
 //! (`--frontend`, `--advertise-addr`, the certificate flags) are such TODO comments

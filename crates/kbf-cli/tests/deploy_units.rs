@@ -46,7 +46,20 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
         match parsed {
             Invocation::Daemon(_) => assert_eq!(mode, Mode::Daemon),
             Invocation::AllInOne(_) => assert_eq!(mode, Mode::AllInOne),
-            Invocation::Storage(_) => assert_eq!(mode, Mode::Storage),
+            Invocation::Storage(flags) => {
+                assert_eq!(mode, Mode::Storage);
+                // The unit's certificate flags are read as the paths they spell (not
+                // dropped, and not another flag's), so the node starts with mutual TLS.
+                let paths = flags.tls.expect("the storage unit turns on mutual TLS");
+                assert_eq!(
+                    paths.map(|p| p.display().to_string()),
+                    [
+                        "/etc/kbf/storage.pem",
+                        "/etc/kbf/storage.key",
+                        "/etc/kbf/ca.pem"
+                    ]
+                );
+            }
             Invocation::NotBuilt { mode: m, .. } => {
                 assert_eq!(m, mode.name());
                 assert_eq!(argv.len(), 2, "kbf {mode} is not built: {argv:?}");
