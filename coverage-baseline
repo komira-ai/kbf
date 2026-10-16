@@ -41,7 +41,7 @@ kbf-segments              7      5
 kbf-server                0      0
 kbf-sim                   6      3
 kbf-sim-cell              4     15
-kbf-state                 5     15
+kbf-state                11     16
 kbf-storage               0      -
 kbf-store                 0      0
 kbf-testkit               0      0

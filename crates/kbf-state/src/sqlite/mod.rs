@@ -211,8 +211,10 @@ impl SqliteStore {
             queued: Instant::now(),
             reply,
         };
-        self.requests.send(request).map_err(gone)?;
-        answer.recv().map_err(gone)?
+        let sent = self.requests.send(request).is_ok();
+        // The writer has stopped if it would not take the request or dropped it unanswered.
+        let answered = sent.then(|| answer.recv().ok()).flatten();
+        answered.ok_or_else(gone)?
     }
 
     fn reader(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -220,8 +222,8 @@ impl SqliteStore {
     }
 }
 
-/// The answer to a call the writer cannot take or will never answer: it has stopped.
-fn gone<E>(_: E) -> StoreError {
+/// The answer to a call the writer cannot take or will never answer.
+fn gone() -> StoreError {
     StoreError::Failed("the state store's writer has stopped".to_owned())
 }
 
