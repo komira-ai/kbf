@@ -166,3 +166,16 @@ async fn a_generation_already_held_is_not_asked_for() {
         "{seen:?}"
     );
 }
+
+/// Catches a daemon built without a holder that fails on the map a server sends it (in
+/// Welcome and in a `MapUpdate`): it ignores both and goes on with its session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_without_a_holder_ignores_the_map() {
+    let runtime = Arc::new(FakeRuntime::new(Duration::ZERO));
+    let mut h = Harness::with_runtime("map-no-holder", runtime, Duration::from_secs(40)).await;
+    let mut peer = h.session().await;
+    peer.hello().await;
+    peer.welcome_map(Some(map(3)));
+    peer.map_update(map(4));
+    peer.heartbeat().await;
+}

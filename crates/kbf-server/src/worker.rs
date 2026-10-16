@@ -420,3 +420,28 @@ fn entry(capabilities: &[Capability], key: &str) -> Result<Option<u64>, String> 
     })
     .transpose()
 }
+
+#[cfg(test)]
+mod tests {
+    use kbf_map::{Map, Member, MemberId, MemberState, Rule};
+    use kbf_mapsync::FakeMapSource;
+
+    use super::*;
+
+    /// Catches a `Debug` of the service that prints the map source's state (a state
+    /// store handle, a channel) or fails to compile when a source has no `Debug`: the
+    /// source is named, not printed.
+    #[test]
+    fn a_map_source_is_named_not_printed() {
+        let member = Member {
+            id: MemberId(1),
+            addr: "127.0.0.1:1".to_owned(),
+            zone: String::new(),
+            weight: 1,
+            state: MemberState::Active,
+        };
+        let map = Map::new(1, vec![member], Rule::Rendezvous, 1, 1, Vec::new()).expect("map");
+        let source = Source(Arc::new(FakeMapSource::new(map)));
+        assert_eq!(format!("{source:?}"), "MapSource");
+    }
+}

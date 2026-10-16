@@ -68,12 +68,12 @@ mod tests {
         Map::new(generation, vec![member], Rule::Rendezvous, 1, 1, Vec::new()).expect("map")
     }
 
-    fn generation_of(message: Result<ServerMessage, tonic::Status>) -> u64 {
-        match message.expect("not an error").message {
-            Some(server_message::Message::MapUpdate(MapUpdate { map: Some(map) })) => {
-                map.generation
-            }
-            other => panic!("not a MapUpdate: {other:?}"),
+    /// The message a `MapUpdate` of `generation` is.
+    fn update_of(generation: u64) -> ServerMessage {
+        ServerMessage {
+            message: Some(server_message::Message::MapUpdate(MapUpdate {
+                map: Some(wire::Map::from(&map(generation))),
+            })),
         }
     }
 
@@ -92,9 +92,15 @@ mod tests {
         // Two changes before the pusher runs: one update, of the later map.
         source.set(map(2));
         source.set(map(3));
-        assert_eq!(generation_of(sent.recv().await.expect("an update")), 3);
+        assert_eq!(
+            sent.recv().await.expect("an update").expect("not an error"),
+            update_of(3)
+        );
         source.set(map(4));
-        assert_eq!(generation_of(sent.recv().await.expect("an update")), 4);
+        assert_eq!(
+            sent.recv().await.expect("an update").expect("not an error"),
+            update_of(4)
+        );
         pusher.abort();
     }
 

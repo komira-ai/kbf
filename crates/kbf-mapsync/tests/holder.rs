@@ -114,26 +114,37 @@ async fn the_fake_source_serves_the_map_it_announced() {
 }
 
 /// Catches a `follow` that misses the map already held (a client built after the first
-/// push would tag its calls with generation 0), one that applies a map that was refused,
-/// and one that does not stop with the holder (a task for every client for ever).
+/// push would tag its calls with generation 0), one that applies a map that was refused
+/// or applies generation 0 for a holder with no map, and one that does not stop with the
+/// holder (a task for every client for ever).
 #[tokio::test(start_paused = true)]
 async fn follow_applies_each_generation_taken() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     let holder = MapHolder::new();
-    holder.offer(map(4));
-    let applied = Arc::new(AtomicU64::new(0));
+    let applied = Arc::new(AtomicU64::new(u64::MAX));
     let task = holder.follow({
         let applied = Arc::clone(&applied);
         move |generation| applied.store(generation, Ordering::SeqCst)
     });
-    assert_eq!(applied.load(Ordering::SeqCst), 4, "the map already held");
+    assert_eq!(applied.load(Ordering::SeqCst), u64::MAX, "nothing held yet");
+    holder.offer(map(4));
+    tokio::task::yield_now().await;
+    assert_eq!(applied.load(Ordering::SeqCst), 4);
     holder.offer(map(2));
     tokio::task::yield_now().await;
     assert_eq!(applied.load(Ordering::SeqCst), 4, "a refused map");
     holder.offer(map(8));
     tokio::task::yield_now().await;
     assert_eq!(applied.load(Ordering::SeqCst), 8);
+    // A follower of a holder that holds a map has it at once, before any change.
+    let late = Arc::new(AtomicU64::new(0));
+    let second = holder.follow({
+        let late = Arc::clone(&late);
+        move |generation| late.store(generation, Ordering::SeqCst)
+    });
+    assert_eq!(late.load(Ordering::SeqCst), 8);
     drop(holder);
     task.await.expect("the task ends with the holder");
+    second.await.expect("the task ends with the holder");
 }
