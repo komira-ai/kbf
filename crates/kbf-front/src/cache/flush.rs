@@ -1,7 +1,9 @@
 //! The write tier's flusher (`docs/design/write-path.md`, sections 6.1.4 and 6.4):
-//! seals, then each sealed staged object read back from its block, checked, given its
-//! footer, PUT under its usual key, its footer read back, and `ObjectFlushed`
-//! committed, off the ack path.
+//! seals, then each sealed staged object read back from its block in pieces of
+//! [`FLUSH_READ_BYTES`], each piece checked and handed to the store as it is read (a
+//! streamed write, [`ObjectStore::put_stream`]: a multipart upload on S3), then its
+//! footer; the footer read back, and `ObjectFlushed` committed, off the ack path. A
+//! flush holds a piece of the block at a time, never the block.
 //!
 //! - **Same key, same bytes.** An object's key is fixed by its id, and its footer is
 //!   built from the committed blob list (sorted by digest) and the bytes on disk, so
@@ -11,33 +13,41 @@
 //!   whose answer was lost): the footer is read back; if it is ours the flush is done,
 //!   else `FlushConflict` commits, the object stays staged and is read locally, and the
 //!   flusher stops retrying it.
-//! - **Every record is hashed** before the PUT, on the cache's hashing pool (off the
-//!   runtime workers): the daemon's digests were trusted when the upload was
-//!   acknowledged, so this is where they are checked. A record that fails its digest
-//!   is never uploaded: it is counted (`kbf_tier_flush_digest_mismatch_total`), logged
-//!   as an error with its digest and object, and dropped. The object is marked
-//!   unreachable as corrupt and its block discarded, and the records that did hash to
-//!   their digests are staged again as an object of their own (one more block, one
-//!   more flush), so the rest of the segment still reaches the store and stays
-//!   readable; only the bad digest is left unavailable, to be uploaded again.
+//! - **Every record is hashed** as its pieces are read, on the cache's hashing pool
+//!   (off the runtime workers): the daemon's digests were trusted when the upload was
+//!   acknowledged, so this is where they are checked. The footer is written only once
+//!   every record hashed to its digest; a record that fails ends the write in its
+//!   place, so the store keeps nothing (an S3 multipart upload is aborted). The record
+//!   is counted (`kbf_tier_flush_digest_mismatch_total`), logged as an error with its
+//!   digest and object, and dropped. The object is marked unreachable as corrupt, the
+//!   records that did hash to their digests are stored again as an object of their
+//!   own (read from the block and hashed again the same way, then indexed with one
+//!   `PutBlobs`), and the block is discarded, so the rest of the segment still reaches
+//!   the store and stays readable; only the bad digest is left unavailable, to be
+//!   uploaded again.
 //! - **Anything else** (the store or the log unavailable, a read-back that disagrees
 //!   after our own PUT, a disk read error) is retried with backoff,
 //!   [`FLUSH_BACKOFF_FIRST`] doubling to [`FLUSH_BACKOFF_MAX`].
 //! - **Eviction is on committed state:** the block becomes a flushed copy
 //!   ([`kbf_tier::WriteTier::flushed`]) only after `ObjectFlushed` applied.
 
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures::StreamExt;
 use kbf_meta::{Applied, Command, ObjectId, StagedObject, StagedState, UnreachableReason};
-use kbf_objstore::{ObjectStore, ObjectStoreError};
-use kbf_segments::layout::encode_footer;
+use kbf_objstore::{BodyStream, ObjectStore, ObjectStoreError};
+use kbf_segments::layout::{encode_footer, footer_len};
 use kbf_segments::{Footer, IndexEntry};
+use kbf_tier::WriteTier;
 use kbf_types::Digest;
 
+use super::read::READ_WINDOW_BYTES;
 use super::tier::{Staging, blocking};
-use super::upload::BuiltSegment;
-use super::verify::{Verified, verify_records};
+use super::verify::{RecordCheck, Verified};
+use super::write_group::{Group, Writer, placed, read_back};
 use super::{Cache, CacheError, unexpected};
 use crate::meta_log::MetaLog;
 
@@ -75,6 +85,93 @@ pub struct FlushRound {
     pub dropped: Vec<Digest>,
     /// Objects whose flush failed this round, and how long until their next attempt.
     pub retrying: Vec<(ObjectId, Duration)>,
+}
+
+/// The most bytes of a block the flusher reads at once, and the pieces it hands to the
+/// store: one read window.
+pub const FLUSH_READ_BYTES: u64 = READ_WINDOW_BYTES;
+
+/// What a flush's body found when it had read every record.
+type Found = Arc<Mutex<Option<Verified>>>;
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A block being read into an object's body ([`Cache::block_body`]).
+struct Reading<M, O> {
+    writer: Arc<Writer<M, O>>,
+    group: Arc<Group>,
+    tier: Arc<dyn WriteTier>,
+    object: ObjectId,
+    /// The block's ranges left to read.
+    spans: VecDeque<(u64, u64)>,
+    check: RecordCheck,
+    /// Whether the body ended (its footer, or an error, was handed over).
+    done: bool,
+    /// The bytes of the body so far.
+    written: u64,
+    found: Found,
+}
+
+impl<M: MetaLog, O: ObjectStore> Reading<M, O> {
+    /// The next piece of the body, and the reading after it.
+    async fn step(mut self) -> Option<(Result<Bytes, ObjectStoreError>, Self)> {
+        if self.done {
+            return None;
+        }
+        let Some(&(start, end)) = self.spans.front() else {
+            // Every record was read: the footer, or the error that ends the write.
+            self.done = true;
+            let checked = std::mem::take(&mut self.check).finish();
+            let footer = checked
+                .bad
+                .is_empty()
+                .then(|| encode_footer(self.written, &checked.good));
+            *lock(&self.found) = Some(checked);
+            let piece = footer.map(Bytes::from).ok_or_else(|| {
+                ObjectStoreError::Body("records of the block fail their digests".to_owned())
+            });
+            return Some((piece, self));
+        };
+        let len = FLUSH_READ_BYTES.min(end - start);
+        let piece = self.piece(start, len).await;
+        // A piece that failed ends the body; the spans left are never read.
+        self.done = piece.is_err();
+        // The front span, read just above, moves past the piece; once read, it goes.
+        self.spans[0].0 += len;
+        if self.spans[0].0 == end {
+            self.spans.pop_front();
+        }
+        Some((piece, self))
+    }
+
+    /// `len` bytes of the block from `start`, read and hashed into the check.
+    async fn piece(&mut self, start: u64, len: u64) -> Result<Bytes, ObjectStoreError> {
+        let (tier, object) = (Arc::clone(&self.tier), self.object);
+        let n = usize::try_from(len).unwrap_or(usize::MAX);
+        let read = blocking(
+            &self.writer.metrics,
+            Box::new(move || tier.read(object, start, n)),
+        )
+        .await;
+        // The tier reads all of `len` or fails.
+        let read = read.map_err(|e| format!("reading the block of {object}: {e}"));
+        let piece = Bytes::from(read.map_err(ObjectStoreError::Body)?);
+        let mut check = std::mem::take(&mut self.check);
+        let (at, hashed) = (self.written, piece.clone());
+        let check = self
+            .group
+            .hashing
+            .compute(move || {
+                check.update(at, &hashed);
+                check
+            })
+            .await?;
+        self.check = check;
+        self.written += len;
+        Ok(piece)
+    }
 }
 
 /// How one flush ended, short of an error to retry.
@@ -150,7 +247,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     }
 
     /// Flushes `object`, staged with committed length `len` and `blobs` (sorted by
-    /// digest, as the committed list is).
+    /// digest, as the committed list is): its block read in pieces of
+    /// [`FLUSH_READ_BYTES`], each hashed on the hashing pool and handed to the store as
+    /// it is read ([`ObjectStore::put_stream`]), then the footer, built once every
+    /// record has hashed. A record that fails its digest ends the write before the
+    /// footer: the store keeps nothing.
     async fn flush_one(
         &self,
         staging: &Staging,
@@ -158,37 +259,30 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         len: u64,
         blobs: &[(Digest, u64)],
     ) -> Result<Flushed, CacheError> {
-        let tier = std::sync::Arc::clone(&staging.tier);
-        let n = usize::try_from(len).unwrap_or(usize::MAX);
-        let records = blocking(self.metrics(), Box::new(move || tier.read(object, 0, n))).await?;
-        let listed = blobs.to_vec();
-        let (records, found) = self
-            .hashing()
-            .compute(move || {
-                let found = verify_records(&records, &listed);
-                (records, found)
-            })
-            .await?;
-        if !found.bad.is_empty() {
-            return self.drop_mismatched(staging, object, &records, found).await;
-        }
-        let entries = found.good;
-        let footer = encode_footer(len, &entries);
-        let total = len + footer.len() as u64;
-        let ours = Footer::parse(&footer, total)?;
-        let mut body = records;
-        body.extend_from_slice(&footer);
         let key = self.object_key(object)?;
-        let existed = match self
-            .writer
-            .objects
-            .put_new(&key, Bytes::from(body), None)
-            .await
-        {
+        let total = len + footer_len(blobs.len() as u64);
+        let found = Found::default();
+        let body = self.block_body(
+            staging,
+            object,
+            vec![(0, len)],
+            RecordCheck::new(blobs.to_vec()),
+            &found,
+        );
+        let put = self.writer.objects.put_stream(&key, total, body).await;
+        // A store that answers without reading the body found nothing: its footer is
+        // then not ours, and the flush is tried again.
+        let checked = lock(&found).take().unwrap_or_default();
+        if !checked.bad.is_empty() {
+            return self.drop_mismatched(staging, object, &checked).await;
+        }
+        let existed = match put {
             Ok(()) => false,
             Err(ObjectStoreError::AlreadyExists(_)) => true,
             Err(e) => return Err(e.into()),
         };
+        let footer = encode_footer(len, &checked.good);
+        let ours = Footer::parse(&footer, total)?;
         self.writer.recency.written(object, total);
         let stored = match self.writer.read_footer(&key, total).await {
             Ok(footer) => Some(footer),
@@ -224,16 +318,16 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
 
     /// Handles a staged object with records that fail their digests: counts and logs
     /// each (never uploaded), marks the object unreachable as corrupt (its blobs are
-    /// unavailable, and a re-upload heals them), frees its block, and stages the
-    /// records that hashed to their digests again as an object of their own. A failure
-    /// of that last step is logged, not retried: the object has left the flusher's
-    /// queue, and those blobs are unavailable until uploaded again.
+    /// unavailable, and a re-upload heals them), stores the records that hashed to
+    /// their digests again as an object of their own, read from the block as the flush
+    /// reads it, and frees the block. A failure of the restore is logged, not retried:
+    /// the object has left the flusher's queue, and those blobs are unavailable until
+    /// uploaded again.
     async fn drop_mismatched(
         &self,
         staging: &Staging,
         object: ObjectId,
-        records: &[u8],
-        found: Verified,
+        found: &Verified,
     ) -> Result<Flushed, CacheError> {
         for bad in &found.bad {
             tracing::error!(%object, digest = %bad.claimed, found = %bad.actual, "a staged record fails its digest; it is dropped and never flushed");
@@ -242,40 +336,96 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         staging.counters.corrupt.add(1);
         self.mark_unreachable(object, UnreachableReason::Corrupt)
             .await?;
-        let _ = staging.tier.discard(object);
-        if let Err(e) = self.restage(records, &found.good).await {
-            tracing::error!(%object, error = %e, sound = found.good.len(), "the sound records of a corrupt staged object could not be staged again; they are unavailable until uploaded again");
+        if let Err(e) = self.restage(staging, object, &found.good).await {
+            tracing::error!(%object, error = %e, sound = found.good.len(), "the sound records of a corrupt staged object could not be stored again; they are unavailable until uploaded again");
         }
+        let _ = staging.tier.discard(object);
         let dropped = found.bad.iter().map(|m| m.claimed).collect();
         Ok(Flushed::Corrupt(dropped))
     }
 
-    /// Stages `good` (digest-sorted records found at their offsets in `records`) as a
-    /// segment of their own, as an upload does: on the tier, else PUT.
-    async fn restage(&self, records: &[u8], good: &[IndexEntry]) -> Result<(), CacheError> {
+    /// Stores `good` (records of `object`'s block, each at its offset there) again as an
+    /// object of their own, back to back, copied from the block a piece at a time: on
+    /// the write tier, a block of its own staged with one `PutStaged` (flushed, and so
+    /// hashed again, by a later round), when the tier has room; else in the store,
+    /// hashed again as the pieces go, and indexed with one `PutBlobs`.
+    async fn restage(
+        &self,
+        staging: &Staging,
+        object: ObjectId,
+        good: &[IndexEntry],
+    ) -> Result<(), CacheError> {
         if good.is_empty() {
             return Ok(());
         }
-        let mut body = Vec::new();
-        let mut entries = Vec::with_capacity(good.len());
+        let mut spans = Vec::with_capacity(good.len());
+        let mut listed = Vec::with_capacity(good.len());
+        let mut at = 0u64;
         for entry in good {
-            // Hashed in range by `verify_records`.
-            let from = entry.offset as usize;
-            let to = from + entry.digest.size_bytes as usize;
-            entries.push(IndexEntry {
-                offset: body.len() as u64,
-                ..*entry
-            });
-            body.extend_from_slice(&records[from..to]);
+            let size = entry.digest.size_bytes;
+            spans.push((entry.offset, entry.offset + size));
+            listed.push((entry.digest, at));
+            at += size;
         }
-        let footer = encode_footer(body.len() as u64, &entries);
-        body.extend_from_slice(&footer);
-        let sound = BuiltSegment {
-            body: Bytes::from(body),
-            entries,
-            verified: true,
+        if let Some(range) = self.reserve_range(at).await {
+            let (tier, copied) = (Arc::clone(&staging.tier), spans.clone());
+            let copy = move || {
+                let mut to = 0u64;
+                for (start, end) in copied {
+                    for from in (start..end).step_by(FLUSH_READ_BYTES as usize) {
+                        let n = FLUSH_READ_BYTES.min(end - from);
+                        let piece = tier.read(object, from, n as usize)?;
+                        range.write(to, &piece)?;
+                        to += n;
+                    }
+                }
+                Ok(range)
+            };
+            let range = blocking(&self.writer.metrics, Box::new(copy)).await?;
+            return self.stage_range(range, listed).await;
+        }
+        let total = at + footer_len(good.len() as u64);
+        let found = Found::default();
+        let body = self.block_body(staging, object, spans, RecordCheck::new(listed), &found);
+        let sound = self.writer.allocate();
+        let key = self.object_key(sound)?;
+        self.writer.objects.put_stream(&key, total, body).await?;
+        self.writer.recency.written(sound, total);
+        let footer = self
+            .writer
+            .read_footer(&key, total)
+            .await
+            .map_err(read_back)?;
+        let placed = placed(&footer, &key, sound, good.iter().map(|e| e.digest))?;
+        self.writer.commit_segment(placed).await
+    }
+
+    /// The body of an object read from `object`'s block: the bytes of `spans` (ranges
+    /// of the block, in order) in pieces of at most [`FLUSH_READ_BYTES`], each read on
+    /// the blocking pool and hashed into `check` on the hashing pool (the check's
+    /// offsets are the new object's), then the footer of the records, or, if any
+    /// failed its digest, an error in its place, which ends the write with nothing
+    /// stored. What the check found is left in `found` once every record was read.
+    fn block_body(
+        &self,
+        staging: &Staging,
+        object: ObjectId,
+        spans: Vec<(u64, u64)>,
+        check: RecordCheck,
+        found: &Found,
+    ) -> BodyStream {
+        let reading = Reading {
+            writer: Arc::clone(&self.writer),
+            group: Arc::clone(&self.group),
+            tier: Arc::clone(&staging.tier),
+            object,
+            spans: spans.into(),
+            check,
+            done: false,
+            written: 0,
+            found: Arc::clone(found),
         };
-        self.store_upload(vec![sound]).await.map(drop)
+        futures::stream::unfold(reading, Reading::step).boxed()
     }
 
     /// Commits a tier command whose refusal would mean the flusher and the committed

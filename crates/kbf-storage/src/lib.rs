@@ -113,6 +113,22 @@ pub trait Storage: Send + Sync {
     /// [`Storage::put`]. Blocking: call it off the async runtime.
     fn stream(&self, size: u64) -> Option<Box<dyn PutStream>>;
 
+    /// Stores a blob of `size` bytes straight to the object store as `bytes` come,
+    /// holding a piece of it at a time, whatever its size. `claim` names the blob's
+    /// digest once its bytes ended (the bytes must hash to it, or nothing is stored), or
+    /// `None` to withdraw it: nothing is stored and this answers `None`. Answers the
+    /// digest once the blob is present.
+    ///
+    /// # Errors
+    /// [`StorageError::DigestMismatch`] if the bytes do not hash to the claimed digest;
+    /// a piece of `bytes` failed; the store failed.
+    fn put_streamed(
+        &self,
+        size: u64,
+        bytes: BoxStream<'static, std::io::Result<Bytes>>,
+        claim: BoxFuture<'static, Option<Digest>>,
+    ) -> Answer<'_, Option<Digest>>;
+
     /// A `Segments` service of its own over the store, with uploads no other caller
     /// can name: the handlers a remote daemon's `Begin`, `PutRange` and `Commit` reach.
     fn segments(&self) -> Arc<dyn Segments>;
