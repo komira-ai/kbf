@@ -1,25 +1,50 @@
-//! Red-first stub of the SQLite backend: the tests land first and fail on `todo!()`; the
-//! implementation follows in the next commit.
+//! The SQLite backend: the state store for `all-in-one` and for a single frontend.
+//!
+//! - **One writer.** A thread owns the only connection that writes. Calls queue to it;
+//!   it gathers the requests that arrive inside the commit window ([`Options::window`],
+//!   5 ms by default, [`crate::GROUP_COMMIT_WINDOW`]) into one `BEGIN IMMEDIATE`
+//!   transaction, commits it with one sync (WAL mode, `synchronous=FULL`), and only then
+//!   answers every request in the group. Compare-and-set, transactions and counters run
+//!   inside that thread, so they are linearizable by construction.
+//! - **Reads** use a connection of their own: in WAL mode they never wait for the writer
+//!   and see only committed groups, so the change feed needs no horizon beyond the head.
+//! - **One process.** The store holds an exclusive `flock` on `<file>.lock` for as long as
+//!   it is open, and refuses a file on a network filesystem. A second store on the same
+//!   file fails to open with [`SqliteError::Locked`].
+//! - **Epoch.** Every open bumps the epoch recorded in the file ([`SqliteStore::epoch`]);
+//!   [`restore`] does too, so a restored or swapped file never resumes the old file's
+//!   leases.
+//! - **Clock.** Expiry times are stored as nanoseconds on the store's clock, so the clock
+//!   must mean the same thing after a restart: use [`crate::SystemClock`] in production.
+//!
+//! Commit latency, from the call queuing a write to its group being on disk, is kept in
+//! [`CommitMetrics`] for the operator's metrics to export.
 
-// The stubs use none of these yet; the build is `-D warnings`.
-#[allow(dead_code)]
 mod error;
-#[allow(dead_code)]
 mod guard;
-#[allow(dead_code)]
+mod read;
+mod restore;
 mod schema;
+mod writer;
 
 use std::io;
-use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use rusqlite::Connection;
 
 pub use error::SqliteError;
+pub use restore::restore;
 
 use crate::GROUP_COMMIT_WINDOW;
 use crate::clock::{Clock, StoreTime};
 use crate::store::Store;
 use crate::types::{Changes, Commit, CommitStats, Conflict, Revision, StoreError, Txn, Versioned};
+use writer::{Reply, Request, Shared, Writer};
 
 /// How the store groups writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,7 +68,8 @@ impl Default for Options {
     }
 }
 
-/// Commit latency figures, for the operator's metrics.
+/// Commit latency figures, for the operator's metrics. Latency runs from a call queuing
+/// its write to the group it is in being on disk, so it includes the window.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CommitMetrics {
     /// Groups committed.
@@ -59,95 +85,197 @@ pub struct CommitMetrics {
 }
 
 /// The SQLite state store.
-#[derive(Debug)]
 pub struct SqliteStore {
-    _stub: (),
+    path: PathBuf,
+    clock: Arc<dyn Clock>,
+    epoch: u64,
+    /// Taken (`None`) at drop so the writer sees its queue close.
+    requests: Option<SyncSender<Request>>,
+    writer: Option<JoinHandle<()>>,
+    reader: Mutex<Connection>,
+    shared: Arc<Shared>,
+    /// Held for the store's life; released after the writer is gone.
+    _lock: std::fs::File,
 }
 
 impl SqliteStore {
-    /// Opens the state file `path`.
+    /// Opens the state file `path`, creating it when it does not exist, with the system's
+    /// own filesystem check. Bumps the epoch.
     ///
     /// # Errors
-    /// [`SqliteError`].
+    /// [`SqliteError`]: the file is on a network filesystem, another process holds it,
+    /// it is not a state store this binary reads, or a call failed.
     pub fn open(
-        _path: &Path,
-        _clock: Arc<dyn Clock>,
-        _options: Options,
+        path: &Path,
+        clock: Arc<dyn Clock>,
+        options: Options,
     ) -> Result<SqliteStore, SqliteError> {
-        todo!("av2-03: SqliteStore::open")
+        SqliteStore::open_checked(path, clock, options, &guard::filesystem_type)
     }
 
-    #[allow(dead_code)]
+    /// [`SqliteStore::open`] with the filesystem check's probe (the type number of a
+    /// directory's filesystem) given, so a test can present a network filesystem.
     fn open_checked(
-        _path: &Path,
-        _clock: Arc<dyn Clock>,
-        _options: Options,
-        _probe: &dyn Fn(&Path) -> io::Result<u32>,
+        path: &Path,
+        clock: Arc<dyn Clock>,
+        options: Options,
+        probe: &dyn Fn(&Path) -> io::Result<u32>,
     ) -> Result<SqliteStore, SqliteError> {
-        todo!("av2-03: SqliteStore::open_checked")
+        SqliteStore::start(path, clock, options, probe).map_err(|error| error.at(path))
+    }
+
+    fn start(
+        path: &Path,
+        clock: Arc<dyn Clock>,
+        options: Options,
+        probe: &dyn Fn(&Path) -> io::Result<u32>,
+    ) -> Result<SqliteStore, SqliteError> {
+        guard::refuse_network_filesystem(path, probe)?;
+        let lock = guard::take_lock(path)?;
+        let conn = Connection::open(path)?;
+        schema::init(&conn)?;
+        schema::configure(&conn)?;
+        let epoch = schema::bump_epoch(&conn, 0)?;
+        let head: i64 =
+            conn.query_row("SELECT value FROM meta WHERE name = 'head'", [], |row| {
+                row.get(0)
+            })?;
+        let shared = Arc::new(Shared::default());
+        let commits = Arc::clone(&shared.commits);
+        conn.commit_hook(Some(move || {
+            commits.fetch_add(1, Ordering::AcqRel);
+            false
+        }))?;
+        let reader = Connection::open(path)?;
+        schema::configure(&reader)?;
+        reader.pragma_update(None, "query_only", true)?;
+
+        let (requests, queue) = mpsc::sync_channel(options.max_group.max(1));
+        let writer = Writer {
+            conn,
+            clock: Arc::clone(&clock),
+            options,
+            shared: Arc::clone(&shared),
+            head: writer::uint(head),
+        };
+        let handle = std::thread::Builder::new()
+            .name("kbf-state-writer".to_owned())
+            .spawn(move || writer.run(&queue))?;
+        Ok(SqliteStore {
+            path: path.to_owned(),
+            clock,
+            epoch,
+            requests: Some(requests),
+            writer: Some(handle),
+            reader: Mutex::new(reader),
+            shared,
+            _lock: lock,
+        })
     }
 
     /// The state file.
     #[must_use]
     pub fn path(&self) -> &Path {
-        todo!("av2-03: SqliteStore::path")
+        &self.path
     }
 
     /// The clock the store was opened with.
     #[must_use]
     pub fn clock(&self) -> Arc<dyn Clock> {
-        todo!("av2-03: SqliteStore::clock")
+        Arc::clone(&self.clock)
     }
 
-    /// The store's incarnation.
+    /// The store's incarnation: one past the epoch of the previous open (or restore) of
+    /// the file. A daemon that sees a new epoch kills the leases of the old one.
     #[must_use]
     pub fn epoch(&self) -> u64 {
-        todo!("av2-03: SqliteStore::epoch")
+        self.epoch
     }
 
     /// The commit latency figures so far.
     #[must_use]
     pub fn commit_metrics(&self) -> CommitMetrics {
-        todo!("av2-03: SqliteStore::commit_metrics")
+        *self
+            .shared
+            .metrics
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Queues a request for the writer and waits for its group to be on disk.
+    fn call(&self, txns: Vec<Txn>, reap: bool) -> Result<Reply, StoreError> {
+        let (reply, answer) = mpsc::sync_channel(1);
+        let request = Request {
+            txns,
+            reap,
+            queued: Instant::now(),
+            reply,
+        };
+        let gone = || StoreError::Failed("the state store's writer has stopped".to_owned());
+        self.requests
+            .as_ref()
+            .ok_or_else(gone)?
+            .send(request)
+            .map_err(|_| gone())?;
+        answer.recv().map_err(|_| gone())?
+    }
+
+    fn reader(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.reader.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl std::fmt::Debug for SqliteStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqliteStore")
+            .field("path", &self.path)
+            .field("epoch", &self.epoch)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SqliteStore {
+    fn drop(&mut self) {
+        // Closing the queue ends the writer after the requests already in it.
+        self.requests = None;
+        if let Some(writer) = self.writer.take() {
+            // A writer that panicked has nothing more to say to us.
+            let _ = writer.join();
+        }
     }
 }
 
 impl Store for SqliteStore {
-    fn apply_batch(&self, _batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
-        todo!("av2-03: SqliteStore::apply_batch")
+    fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
+        Ok(self.call(batch, false)?.commits)
     }
 
-    fn get(&self, _key: &str) -> Result<Option<Versioned>, StoreError> {
-        todo!("av2-03: SqliteStore::get")
+    fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {
+        read::get(&self.reader(), key, self.clock.now())
     }
 
-    fn scan_prefix(&self, _prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
-        todo!("av2-03: SqliteStore::scan_prefix")
+    fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
+        read::scan_prefix(&self.reader(), prefix, self.clock.now())
     }
 
-    fn changes(&self, _after: Revision, _limit: usize) -> Result<Changes, StoreError> {
-        todo!("av2-03: SqliteStore::changes")
+    fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {
+        read::changes(&mut self.reader(), after, limit)
     }
 
     fn reap_expired(&self) -> Result<usize, StoreError> {
-        todo!("av2-03: SqliteStore::reap_expired")
+        Ok(self.call(Vec::new(), true)?.reaped)
     }
 
     fn commit_stats(&self) -> CommitStats {
-        todo!("av2-03: SqliteStore::commit_stats")
+        CommitStats {
+            txns: self.shared.txns.load(Ordering::Acquire),
+            syncs: self.shared.commits.load(Ordering::Acquire),
+        }
     }
 
     fn now(&self) -> StoreTime {
-        todo!("av2-03: SqliteStore::now")
+        self.clock.now()
     }
-}
-
-/// Replaces the state file `dest` with a copy of `backup`.
-///
-/// # Errors
-/// [`SqliteError`].
-pub fn restore(_backup: &Path, _dest: &Path) -> Result<u64, SqliteError> {
-    todo!("av2-03: restore")
 }
 
 #[cfg(test)]
