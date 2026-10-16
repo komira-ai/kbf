@@ -61,10 +61,34 @@ fn the_highest_term_among_leader_claims_wins() {
     assert_eq!(registry.servers(), ["a", "b", "c", "d"]);
 }
 
+/// What the log of one test receives.
+#[derive(Clone, Default)]
+struct Log(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Log {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Catches: a tie at the top term decided by arrival order or by address instead of the
-/// lowest name; the tied names not being reported (they are what the warning logs).
+/// lowest name; the tied names not being reported (they are what the warning logs), or
+/// logged again at every call while the tie stands.
 #[test]
 fn a_tie_goes_to_the_lowest_name() {
+    let log = Log::default();
+    let writer = log.clone();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish(),
+    );
     let claims = [
         claim("zed", 1, true, 7),
         claim("amy", 2, true, 7),
@@ -85,6 +109,17 @@ fn a_tie_goes_to_the_lowest_name() {
     registry.register(claim("amy", 2, true, 7));
     registry.register(claim("amy", 2, true, 7));
     assert_eq!(*registry.subscribe().borrow(), Some(leader("amy", 2, 7)));
+    let logged = String::from_utf8(log.0.lock().expect("log").clone()).expect("UTF-8");
+    assert_eq!(
+        logged.matches("several servers claim").count(),
+        1,
+        "{logged}"
+    );
+    assert!(logged.contains("amy") && logged.contains("zed"), "{logged}");
+    assert!(
+        format!("{registry:?}").contains("Clock"),
+        "the clock is debuggable"
+    );
 }
 
 /// Catches: an entry that outlives its TTL, one dropped at the TTL's last instant, a

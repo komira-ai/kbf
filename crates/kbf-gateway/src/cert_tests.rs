@@ -1,4 +1,4 @@
-use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, SanType};
+use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, SanType};
 
 use super::*;
 
@@ -7,6 +7,8 @@ fn der(names: &[&str], usages: Vec<ExtendedKeyUsagePurpose>) -> Vec<u8> {
     let names: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
     let mut params = CertificateParams::new(names).expect("params");
     params.extended_key_usages = usages;
+    // An extension the rule does not read, which it must pass over.
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     let key = KeyPair::generate().expect("key");
     params
         .self_signed(&key)

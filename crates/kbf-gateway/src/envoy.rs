@@ -166,6 +166,8 @@ fn listener(listen: SocketAddr) -> Value {
 pub fn render(options: &Options) -> String {
     let config = json!({
         "admin": {"address": socket(options.admin)},
+        // ADS needs the node's id and cluster; Envoy refuses the config without them.
+        "node": {"id": "kbf-envoy", "cluster": "kbf-client"},
         "dynamic_resources": {
             "ads_config": {
                 "api_type": "GRPC",

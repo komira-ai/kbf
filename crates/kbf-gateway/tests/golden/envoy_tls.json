@@ -21,6 +21,10 @@
       "transport_api_version": "V3"
     }
   },
+  "node": {
+    "cluster": "kbf-client",
+    "id": "kbf-envoy"
+  },
   "static_resources": {
     "clusters": [
       {

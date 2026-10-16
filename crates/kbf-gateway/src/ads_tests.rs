@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use envoy_types::pb::google::rpc::Status as RpcStatus;
 use futures::channel::mpsc as requests;
-use prost::{Message as _, Name as _};
 use tokio::task::JoinHandle;
 
 use super::*;
