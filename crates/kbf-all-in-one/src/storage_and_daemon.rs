@@ -41,16 +41,22 @@ const ABOUT: &str = "The storage node and a worker daemon in one process, the da
 /// The mode's name, as `kbf` spells it.
 const NAME: &str = "storage-and-daemon";
 
+/// The help position of the storage node's first flag: after every flag of the daemon's.
+const STORAGE_FLAGS_FROM: usize = 1000;
+
 /// The one command: the daemon's flags, then the storage node's that do not share a
 /// name with one of them.
 #[must_use]
 pub fn command() -> Command {
     let daemon = kbf_node::Cli::command();
     let taken: BTreeSet<clap::Id> = daemon.get_arguments().map(|a| a.get_id().clone()).collect();
+    // Listed after the daemon's, in their own order: both commands number their flags from
+    // 0, and flags that tie would interleave in `--help`.
     let storage: Vec<clap::Arg> = storage_node::command()
         .get_arguments()
         .filter(|a| !taken.contains(a.get_id()))
-        .cloned()
+        .enumerate()
+        .map(|(i, a)| a.clone().display_order(STORAGE_FLAGS_FROM + i))
         .collect();
     daemon.name(NAME).bin_name(NAME).about(ABOUT).args(storage)
 }
