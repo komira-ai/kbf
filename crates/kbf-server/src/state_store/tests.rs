@@ -190,9 +190,9 @@ fn the_password_is_the_first_line_of_its_file() {
     std::fs::write(&file, "hunter2").expect("write");
     assert_eq!(read_password(&file).expect("no newline"), "hunter2");
     std::fs::write(&file, "\n").expect("write");
-    let empty = read_password(&file).err().expect("empty");
+    let empty = read_password(&file).expect_err("empty");
     assert!(empty.to_string().contains("is empty"), "{empty}");
-    let missing = read_password(&dir.join("absent")).err().expect("missing");
+    let missing = read_password(&dir.join("absent")).expect_err("missing");
     assert!(missing.to_string().contains("absent"), "{missing}");
     let _ = std::fs::remove_dir_all(&dir);
 }

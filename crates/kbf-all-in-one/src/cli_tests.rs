@@ -76,7 +76,10 @@ fn other_drivers_and_cas_are_refused() {
 /// replaces a file the operator named.
 #[test]
 fn the_state_file_defaults_to_the_data_directory() {
-    let store = |extra: &[&str]| flags(extra).expect("flags").server.state_store;
+    let store = |extra: &[&str]| {
+        let given = [&["--driver=container"], extra].concat();
+        flags(&given).expect("flags").server.state_store
+    };
     let sqlite = |path: &str| Some(kbf_server::StateStoreUri::Sqlite(path.into()));
     assert_eq!(store(&[]), sqlite("/var/lib/kbf/state.db"));
     assert_eq!(store(&["--data-dir=/srv/kbf"]), sqlite("/srv/kbf/state.db"));
@@ -95,19 +98,28 @@ fn the_state_file_defaults_to_the_data_directory() {
 /// working directory. Each refusal says what to do instead.
 #[test]
 fn postgres_and_a_relative_data_directory_are_refused() {
-    let refused = flags(&["--state-store=postgres://db.example/kbf"]).expect_err("refused");
+    let refused = flags(&[
+        "--driver=container",
+        "--state-store=postgres://db.example/kbf",
+    ])
+    .expect_err("refused");
     assert_eq!(refused.kind(), ErrorKind::ArgumentConflict);
     let said = refused.to_string();
     assert!(
         said.contains("SQLite") && said.contains("kbf-server"),
         "{said}"
     );
-    let relative = flags(&["--data-dir=kbf-data"]).expect_err("relative");
+    let relative = flags(&["--driver=container", "--data-dir=kbf-data"]).expect_err("relative");
     assert_eq!(relative.kind(), ErrorKind::ArgumentConflict);
     assert!(
         relative.to_string().contains("must be absolute"),
         "{relative}"
     );
     // A named state file needs no data directory to hold it.
-    flags(&["--data-dir=kbf-data", "--state-store=sqlite:///s.db"]).expect("named file");
+    flags(&[
+        "--driver=container",
+        "--data-dir=kbf-data",
+        "--state-store=sqlite:///s.db",
+    ])
+    .expect("named file");
 }
