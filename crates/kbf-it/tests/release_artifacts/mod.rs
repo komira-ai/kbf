@@ -82,13 +82,13 @@ fn base(path: &str) -> &str {
     path.rsplit_once('/').map_or(path, |(_, name)| name)
 }
 
-/// The position of the first step of `steps` with a line for which `found` is true,
-/// and whether that step is conditional.
-fn first<'a>(
-    steps: &'a [workflows::Step],
+/// The position and the step of the first step of `steps` from `from` on with a line for
+/// which `found` is true.
+fn first(
+    steps: &[workflows::Step],
     from: usize,
     found: impl Fn(&str) -> bool,
-) -> Option<(usize, &'a workflows::Step)> {
+) -> Option<(usize, &workflows::Step)> {
     steps
         .iter()
         .enumerate()
@@ -568,13 +568,20 @@ mod rules {
             ),
             &["packages kbf-deploy without a `cargo xtask sign-darwin`"],
         );
-        names(
-            &broken(
-                "cargo xtask darwin-asset \"dist/kbf-$GITHUB_SHA-darwin-arm64.tar.gz\" kbf",
-                "echo cargo xtask darwin-asset",
-            ),
-            &["packages kbf without a `cargo xtask darwin-asset`"],
-        );
+        // The check as a comment, as an echo, or as the shell script it replaced.
+        for planted in [
+            "echo cargo xtask darwin-asset",
+            "bash tools/ci/check-darwin-asset.sh x y",
+            "|\n          # cargo xtask darwin-asset \"dist/kbf-$GITHUB_SHA-darwin-arm64.tar.gz\" kbf\n          true",
+        ] {
+            names(
+                &broken(
+                    "cargo xtask darwin-asset \"dist/kbf-$GITHUB_SHA-darwin-arm64.tar.gz\" kbf",
+                    planted,
+                ),
+                &["packages kbf without a `cargo xtask darwin-asset`"],
+            );
+        }
         names(
             &broken(
                 "cargo xtask darwin-asset \"dist/kbf-daemon-$GITHUB_SHA-darwin-arm64.tar.gz\" kbf-daemon",

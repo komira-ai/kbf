@@ -20,6 +20,10 @@ clap.workspace = true
 kbf-all-in-one.workspace = true
 kbf-node.workspace = true
 kbf-server.workspace = true
+# The schema version of the SQLite state file, which `kbf --version --json` reports.
+kbf-state.workspace = true
+# The identity `kbf --version --json` prints (src/version.rs).
+serde_json.workspace = true
 
 [dev-dependencies]
 # The REAPI conformance suite, run against a `kbf storage` process (tests/storage_process.rs):
@@ -29,8 +33,9 @@ kbf-cas-conformance.workspace = true
 kbf-storage.workspace = true
 kbf-transfer.workspace = true
 kbf-types.workspace = true
-# The shape of `kbf --version --json` (tests/binary.rs).
-serde_json.workspace = true
+# The protocol the daemon half speaks, which `kbf --version --json` reports as the
+# server's (src/tests.rs pins them equal).
+kbf-daemon.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 tonic.workspace = true
 # The units `kbf-deploy linux render-units --mode` writes, parsed with kbf's own
