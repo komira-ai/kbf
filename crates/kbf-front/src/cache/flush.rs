@@ -580,6 +580,47 @@ mod tests {
         );
     }
 
+    /// Catches a cycle broken at an object that only waits on a cycle without being in
+    /// it: object 1 holds a result whose closure is in object 2, and 2 and 3 were staged
+    /// crosswise. Breaking at 1 would PUT its result before its closure; the break is at
+    /// the cycle's oldest object, 2, and 1 follows it.
+    #[test]
+    fn a_cycle_is_broken_inside_it_not_at_an_object_waiting_on_it() {
+        assert_eq!(
+            order(&[(1, &[2]), (2, &[3]), (3, &[2])], 4),
+            [(2, vec![]), (3, vec![2]), (1, vec![2])]
+        );
+    }
+
+    /// Catches the same fault with two disjoint cycles, each with a chain waiting on it:
+    /// every break is inside a cycle, and every chain object follows what it waits for.
+    #[test]
+    fn disjoint_cycles_are_each_broken_inside_and_their_chains_follow() {
+        assert_eq!(
+            order(
+                &[
+                    (1, &[2]),
+                    (2, &[5]),
+                    (3, &[7]),
+                    (5, &[6]),
+                    (6, &[5]),
+                    (7, &[8]),
+                    (8, &[7])
+                ],
+                8
+            ),
+            [
+                (5, vec![]),
+                (2, vec![5]),
+                (1, vec![2]),
+                (6, vec![5]),
+                (7, vec![]),
+                (3, vec![7]),
+                (8, vec![7])
+            ]
+        );
+    }
+
     /// Catches: a backoff that does not grow (a store outage met by a retry every
     /// round), one that grows without bound (a flush that waits hours after the store
     /// came back), and an overflow at many failures.
