@@ -273,6 +273,40 @@ async fn each_written_segment_is_one_put_blobs_commit() {
     assert_eq!(log.batches(), [5, 2, 2, 1]);
 }
 
+/// Catches a whole-blob read (the blobs the server decodes) that keeps only its first
+/// window, or loses or repeats bytes where windows meet: a blob one byte over a read
+/// window, one of exactly a window, and the empty blob each read back whole and equal;
+/// and a range not within the blob (reversed, or past its end) read as if it were.
+#[tokio::test]
+async fn a_whole_blob_read_gathers_every_window() {
+    let cache = Cache::open(SharedLog::new(), conditional(), KeyPrefix::default())
+        .await
+        .expect("open");
+    let window = usize::try_from(kbf_front::READ_WINDOW_BYTES).expect("a window fits");
+    let over: Vec<u8> = (0..=window).map(|i| (i % 251) as u8).collect();
+    let contents = [
+        Bytes::from(over),
+        Bytes::from(vec![3u8; window]),
+        Bytes::new(),
+    ];
+    let blobs: Vec<VerifiedBlob> = contents.iter().cloned().map(VerifiedBlob::hashed).collect();
+    let digests: Vec<Digest> = blobs.iter().map(VerifiedBlob::digest).collect();
+    cache.store_blobs(blobs).await.expect("store");
+    for (digest, bytes) in digests.iter().zip(contents) {
+        let read = cache.read_blob(digest).await.expect("read");
+        assert_eq!(read, bytes, "{digest}");
+    }
+    // A range not within the blob is refused before anything is read.
+    let over = digests[0];
+    for (from, to) in [(2, 1), (0, over.size_bytes + 1)] {
+        let refused = cache.read_windows(&over, from, to).await.err();
+        assert!(
+            matches!(refused, Some(CacheError::Invalid(_))),
+            "{from}..{to}"
+        );
+    }
+}
+
 /// Catches: a blob too large to share a segment stored as raw bytes with no footer (no
 /// digest or CRC in the store, so nothing could rebuild its index entry), or at an
 /// offset other than 0. It must be an object of its own that parses as a segment of one
