@@ -186,3 +186,35 @@ fn a_chunk_s_rows_and_its_header_share_a_transaction_under_a_backlog() {
     life.step(T + 2);
     assert_eq!(life.index.keys("ui/invid/").len(), 2);
 }
+
+#[test]
+fn a_batch_whose_rows_all_exist_leaves_the_rest_of_the_budget_to_the_next_batch() {
+    // Catches: a step that stops once conflicts have emptied a batch, though budget is
+    // left: restored pointer rows that landed already (a lost acknowledgement) would
+    // hold back the rows behind them for a step each.
+    let limits = Limits {
+        txn_rows: 2,
+        txns_per_step: 4,
+        ..Limits::default()
+    };
+    let (mut life, inv) = {
+        let mut life = Life::fresh(limits);
+        life.step(T);
+        let inv = InvRef::named("b1");
+        life.run(&inv, T, "main", RunOutcome::Ok);
+        life.close(&inv);
+        (life, inv)
+    };
+    life.index.lose_acks.store(1, Ordering::SeqCst);
+    life.step(T); // two rows land, reported failed; the header lands after them
+    assert_eq!(life.writer.kept_objects(), 1);
+    life.step(T + 1); // the closed invocation is forgotten: all three rows come back
+    assert_eq!(life.writer.pending_rows(), 3);
+    life.step(T + 2);
+    assert_eq!(
+        life.writer.pending_rows(),
+        0,
+        "three conflicts over two batches in one step"
+    );
+    assert_closed_and_complete(&mut life, &inv, 1, 1);
+}

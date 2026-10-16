@@ -364,6 +364,19 @@ mod tests {
             ["ui/ichunk/d"],
             "and one past the byte bound"
         );
+        assert_eq!(keys(p.take(10, 1000)), ["ui/invid/d"]);
+        for (key, value) in [
+            ("ui/stream/f", "s"),
+            ("ui/ichunk/f", "i"),
+            ("ui/invid/f", "h"),
+        ] {
+            p.insert(key.into(), from(value, "f")).unwrap();
+        }
+        assert_eq!(
+            keys(p.take(2, 1000)),
+            ["ui/stream/f", "ui/ichunk/f"],
+            "a split takes as many rows as the bound allows"
+        );
         assert_eq!(p.len(), 1);
     }
 
