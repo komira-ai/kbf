@@ -5,8 +5,8 @@ Status: design, nothing built. It supersedes the leader-elected server cluster i
 ## 1. Decisions
 
 - **[D]** kbf is four parts, as Buildbarn is frontend, scheduler, storage and worker.
-  - **Frontend.** Stateless when the state store is Postgres (on SQLite its queue lives in the file on its own disk, section 4.3). Runs behind a load balancer (LB) in an autoscaling group; its DNS name is the one address clients, daemons and storage nodes know. Serves REAPI, runs the scheduler logic and the UI. Holds no durable state of its own beyond the state store.
-  - **State store.** The queue, leases (each action handed out once), operations and membership. Two backends only: SQLite (a single frontend, and always `all-in-one`) and Postgres (required for several frontends, allowed for a single one), chosen by `--state-store`.
+  - **Frontend.** Stateless when the state store is Postgres (on SQLite its queue lives in the file on its own disk, section 4.3). Runs behind a load balancer (LB) in an autoscaling group; its DNS name is the one address clients, daemons and storage nodes know. Serves REAPI, runs the scheduler logic and the UI. Holds no durable state of its own beyond the state store (scheduler rows and the UI's index rows) and the object store (UI history objects, `ui-data.md` 5.2).
+  - **State store.** The queue, leases (each action handed out once), operations and membership. An interface: a backend is any implementation of the `kbf-state` trait that passes the conformance suite (4.1). SQLite (a single frontend, and always `all-in-one`) and Postgres (required for several frontends, allowed for a single one) are built first; the `--state-store` URI's scheme names the backend.
   - **Storage.** CAS, action cache (AC), SSD hot store, background flush to the cold store (MinIO or S3). Sharded by digest with a replication factor R (default 2). No leader. Storage nodes do not schedule.
   - **Daemon.** Runs actions.
 - **[D]** Modes of the one `kbf` binary: `frontend`, `storage`, `daemon`, `storage-and-daemon` (the daemon reads and writes local storage in-process), `all-in-one` (frontend, storage, daemon and a SQLite state store).
@@ -31,9 +31,9 @@ Status: design, nothing built. It supersedes the leader-elected server cluster i
 
 ### 4.1 Contract
 
-A backend is admitted only if it passes one conformance suite, run against an in-memory fake, SQLite and Postgres.
+A backend is admitted only if it passes one conformance suite, run against an in-memory fake and every backend.
 
-Each clause and how SQLite and Postgres meet it is in 4.3.
+Each clause and how the first two backends, SQLite and Postgres, meet it is in 4.3.
 
 - **C1.** Linearizable compare-and-set per key, with a version.
 - **C2.** Atomic transaction over several keys.
@@ -41,17 +41,17 @@ Each clause and how SQLite and Postgres meet it is in 4.3.
 - **C4.** TTL keys with expiry decided by the store's clock, observable as an event, on an injectable clock in tests.
 - **C5.** Ordered prefix scan and a change feed that resumes from a revision with no skipped rows: a poller never advances past a revision that can still commit. Polling by revision is the baseline; push (watch, `LISTEN/NOTIFY`) is only an optimization, because a notification is not queued for a listener that is disconnected and is not delivered through transaction-mode poolers. If used, it is a coarse wake with no per-row payload: commit-time NOTIFY serializes commits and would hurt at hundreds of commits per second.
 - **C6.** Durable acknowledgement across restart and failover.
-- **C7.** Group commit, because about 5 durable writes per action **[I]** make an ungrouped fsync the limit. Budget **[I]**: 9000 actions in about 2 h is about 1.25 actions/s, about 6 writes/s; a burst of 300 actions/s is about 1500 writes/s; heartbeats are one row per daemon session, negligible. One fsync per write caps near 200 to 1000 writes/s, so 1500 writes/s needs real batching. Commits are batched within a bounded window (target 5 ms, a hard limit configurable and exported as a metric), and every `Start` and `Result` acknowledgement waits for its commit.
+- **C7.** Group commit, because about 5 durable writes per action **[I]** make an ungrouped fsync the limit. Budget **[I]**: 9000 actions in about 2 h is about 1.25 actions/s, about 6 writes/s; a burst of 300 actions/s is about 1500 writes/s; heartbeats are one row per daemon session, negligible. One fsync per write caps near 200 to 1000 writes/s, so 1500 writes/s needs real batching. Commits are batched within a bounded window (target 5 ms, a hard limit configurable and exported as a metric), and every `Start` and `Result` acknowledgement waits for its commit. A transaction may be marked background (the UI index rows, `ui-data.md` 5.2): a backend applies it only in a batch with no foreground transaction waiting, or, once it has waited 250 ms or 16 batches (whichever comes first), in the next batch regardless, so the index cannot starve under a sustained burst; either way at most one per batch, never ahead of a foreground transaction already queued, and it refuses one over 256 rows or 256 KiB. The suite's load test asserts two things with background transactions offered at 512 rows/s beside 1500 foreground writes/s: `Result` commit p99 stays within the bound, and the background rows are applied at no less than the offered rate with a bounded background queue; a planted backend that never applies a background transaction must fail it. So a backend admitted later can neither put background work on the acknowledgement path nor starve it.
 
-The only backends are SQLite and Postgres; there is no etcd, Redis or built-in replicated store.
+A backend is any implementation of the `kbf-state` trait that passes this suite; SQLite and Postgres are built first, and others (for example a cloud key-value or database service) may follow on the same terms. There is still no built-in Raft or replicated store of kbf's own. **[I]** C5 (one gap-free feed) and C7 (group commit) are the hard clauses for other stores: one whose stream order or TTL is per partition or imprecise must keep its own revision counter and `expires_at` checks.
 
 ### 4.2 Contents
 
-Operations; a queue indexed by platform, size class and QoS (a claim never scans unrelated entries); `inflight/<action_key>` dedup; leases; one `session/<daemon>` row; members; the map; whole-machine holds; memory-ladder floors; loss marks; repair records.
+Operations; a queue indexed by platform, size class and QoS (a claim never scans unrelated entries); `inflight/<action_key>` dedup; leases; one `session/<daemon>` row; members; the map; whole-machine holds; memory-ladder floors; loss marks; repair records; the UI's index rows and failure pins (`ui/`, `ui-data.md` 5.3).
 
 ### 4.3 Backends
 
-`--state-store=sqlite:///path` or `--state-store=postgres://...`. `ControlRecord` (`Lease | Result | Refusal`, "commit before Start", `work.rs:323-330` **[F]**) becomes rows written through the `kbf-state` trait.
+`--state-store=sqlite:///path` or `--state-store=postgres://...` for the first two backends; each backend claims its URI scheme. `ControlRecord` (`Lease | Result | Refusal`, "commit before Start", `work.rs:323-330` **[F]**) becomes rows written through the `kbf-state` trait.
 
 - **SQLite.** Used by `all-in-one` (always; a file beside its data) and by a single `frontend`. The process takes an exclusive advisory lock (`flock`) on a lockfile beside the database, `<file>.lock`, held for the life of the process, and does not rely on `locking_mode=EXCLUSIVE` (which would also disable WAL readers). A second frontend on the same file refuses to start; so does a `--state-store=sqlite://` on a network filesystem, which the docs forbid (locks and fsync are unreliable there). Operator inspection: the database is in WAL mode, so a read-only `sqlite3 -readonly` open, or a `.backup`, works while the frontend runs and never blocks it; writes by an operator tool are refused while the lock is held. Every frontend start on SQLite bumps the epoch (a restart is a store restart), and `kbf state restore` is offline, requires the lock, and bumps the epoch in the restored file, so a restored or swapped file can never resume old leases. Losing the disk loses the queue; the docs say so plainly. Not highly available. The SQLite writer is one thread: claims, `Start`/`Result` CAS and counters run inside it, and WAL checkpoints can stall it briefly, which is expected and covered by the commit-latency bound in C7.
 - **Postgres.** Required when several frontends sit behind a load balancer; a single frontend may also use it. High availability is the operator's Postgres setup; `synchronous_commit` must be on.
@@ -134,6 +134,7 @@ Operations; a queue indexed by platform, size class and QoS (a claim never scans
 - **Isolated-storage:** only storage nodes hold cold-store credentials. Daemon-only nodes (the Macs, a cloud daemon ASG) hold none and reach bytes only through storage. A test proves a daemon-only process cannot reach the cold store.
 - **Credential gap on `storage-and-daemon`.** A node that holds cold-store credentials and also runs untrusted actions is not isolated unless storage runs under a different uid from actions and the credentials are unreadable by the action's uid. Without that, they are trusted-network only. Decided: separate uids, with a test that an action cannot read the credential (section 15).
 - The state store is reachable only from frontends (a SQLite file is opened by one frontend only).
+- **UI history.** Frontends write UI history objects (`ui-data.md` 5.2) with a credential limited to the history prefix (or a separate bucket), never one that reads or writes `cas/`, so isolated-storage mode still keeps CAS credentials on storage nodes only. The proof is at the credential layer: a test against MinIO shows that an object-store client built from the frontend's configured history credential is refused a GET and a PUT of a `cas/` key, and goes red with the cold-store credential. The history writer's prefix-scoped store also refuses a `cas/` key, as defence in depth, not as the proof.
 
 ## 10. Locality
 
@@ -153,13 +154,13 @@ Operations; a queue indexed by platform, size class and QoS (a claim never scans
 - **Store unavailable:** no new claims; running actions continue; grace on recovery; a failover bumps the epoch.
 - **Daemon partitions past expiry:** duplicate run, result fenced, outputs idempotent.
 - **Storage node dies:** reads from the replica, one-copy writes with a durable repair record, drop from the map after the dwell. Both owners of an unflushed blob lost: loss mark, AC miss, rerun.
-- **Cold store down:** flush backs off, hot tier absorbs, then writes refuse (`cluster.md` 4.4).
+- **Cold store down:** flush backs off, hot tier absorbs, then writes refuse (`cluster.md` 4.4). UI history buffers within its memory bounds, then drops and counts; builds are unaffected (`ui-data.md` 5.2).
 - **Client box dies (v1):** the whole control plane is down; accepted.
 
 ## 13. Phased plan (each PR lands a test that fails first)
 
 - **P0** This document; `cluster.md` marked superseded.
-- **P1 `kbf-state`.** Trait, fake, SQLite backend, suite C1 to C7; scheduler writes through it. Gate: the store-commits benchmark (group commit at 1500 writes/s, commit latency within the C7 bound) passes before P1 merges. Red: non-linearizable fake fails C1; caller-clock expiry fails C4; restart replays acknowledged claims; stale `complete` rejected; a second frontend on the same SQLite file refuses to start; `--state-store` is rejected when neither scheme matches, or when several frontends are configured with SQLite.
+- **P1 `kbf-state`.** Trait, fake, SQLite backend, suite C1 to C7; scheduler writes through it. Gate: the store-commits benchmark (group commit at 1500 writes/s, commit latency within the C7 bound) passes before P1 merges. Red: non-linearizable fake fails C1; caller-clock expiry fails C4; restart replays acknowledged claims; stale `complete` rejected; a second frontend on the same SQLite file refuses to start; `--state-store` is rejected when no compiled-in backend claims its scheme, or when several frontends are configured with SQLite. The store-commits gate runs with a synthetic background load (about 80 rows/s in background transactions of at most 256 rows, plus a 512 rows/s phase standing in for the UI's day-close fold, `ui-data.md` 5.2) beside the 1500 foreground writes/s, and asserts that the background rows were applied at the offered rate (C7); `ui-data.md` U3 reruns it with the real history writer.
 - **P2 `kbf-storage`.** Cut `cache/*` out; `storage` mode; one-member map; `storage-and-daemon` with the in-process `Cas`. Red: the REAPI conformance suite passes through a separate storage process; on `storage-and-daemon`, an input fetched by the daemon is stored once on disk, not twice (the one-cache rule).
 - **P3 Membership and map.** Register, heartbeat, `Welcome.map`, `MapUpdate`, rendezvous, dwell, `STALE_MAP`. Red: removing a member remaps only its blobs; TTL expiry on a fake clock.
 - **P4 Sharding, R=1.** Router, per-owner Segments. Red: a blob exists only on its owner.
@@ -168,9 +169,9 @@ Operations; a queue indexed by platform, size class and QoS (a claim never scans
 - **P7 Security.** Storage-side identity, grants, uid separation, isolated-mode test.
 - **P8 Cutover.** New frontend and storage run against the same MinIO while the old server serves; storage rebuilds its index; daemons flip by pointing `--server` at the frontend name; rollback is flipping back (cold store append-only, new keys carry node ids).
 - **P9 Several frontends.** Batch pull-claim, `session_gen`, grace, poison cap, `WaitExecution` from a second frontend. Red: two claimers, one winner; a result committed on B reaches a waiter on A. Fake clock and deterministic interleaver. P9 runs against the fake store only; the real two-frontend Postgres test is in P10.
-- **P10** Postgres backend passing P1's suite, including the C5 interleaved-commit test; a real two-frontend test on Postgres (two claimers, one winner; a result committed on B reaches a waiter on A); mixed-version tests; UI.
+- **P10** Postgres backend passing P1's suite, including the C5 interleaved-commit test; a real two-frontend test on Postgres (two claimers, one winner; a result committed on B reaches a waiter on A); mixed-version tests; the UI pages (built after `ui-data.md` U3 on the single frontend) proved against Postgres and two frontends.
 
-Before P1 merges, benchmark store commits per second with group commit at 1500 writes/s. Before P4 and P5, benchmark on the farm (none run yet): no-op action latency p50/p99, proxy MB/s at R=1 and R=2 on the 1 GbE box, AC lookup latency, PUT bytes with one flusher versus two.
+Before P1 merges, benchmark store commits per second with group commit at 1500 writes/s, with P1's synthetic background load. Before P4 and P5, benchmark on the farm (none run yet): no-op action latency p50/p99, proxy MB/s at R=1 and R=2 on the 1 GbE box, AC lookup latency, PUT bytes with one flusher versus two.
 
 ## 14. Existing documents and PRs
 
@@ -184,7 +185,7 @@ Before P1 merges, benchmark store commits per second with group commit at 1500 w
 
 All decided by the owner; nothing is open.
 
-1. **State store.** Exactly two backends, SQLite and Postgres, chosen by `--state-store=sqlite:///path` or `--state-store=postgres://...`. `all-in-one` always uses SQLite (a file beside its data). A single `frontend` (for example on one client box) uses SQLite, or Postgres if the operator prefers. Several frontends behind a load balancer require Postgres. A frontend on SQLite takes an exclusive lock on the file; a second frontend on the same file refuses to start. There is no built-in replicated store, no Raft, no etcd backend and no Redis, and no `state` mode.
+1. **State store.** An interface: a backend is any implementation of the `kbf-state` trait that passes the conformance suite (4.1); SQLite and Postgres are built first, chosen by `--state-store=sqlite:///path` or `--state-store=postgres://...` (amended by the owner, 2026-10-16). `all-in-one` always uses SQLite (a file beside its data). A single `frontend` (for example on one client box) uses SQLite, or Postgres if the operator prefers. Several frontends behind a load balancer require Postgres. A frontend on SQLite takes an exclusive lock on the file; a second frontend on the same file refuses to start. There is no built-in replicated store of kbf's own, no Raft, and no `state` mode; etcd, Redis or a cloud service would be a backend only by passing the suite.
 2. **Execution semantics.** At-least-once execution with fenced results.
 3. **Write durability.** Acknowledge when both copies exist, by chain replication over the fast fabric; degrade to one copy only with a durable repair record.
 4. **The six Broadwell nodes.** Separate uids for storage and actions on `storage-and-daemon` nodes, with a test that an action cannot read the cold-store credential; trusted-network mode otherwise.
@@ -201,7 +202,7 @@ All decided by the owner; nothing is open.
 - **Storage nodes reading the store:** wider attack surface; the frontend pushes the map.
 - **Per-lease heartbeats and per-daemon queue scans:** store write and read cliffs; per-session renewal, indexed partitions, batch claims.
 - **`LISTEN/NOTIFY` as the feed:** not queued for disconnected listeners, not delivered through transaction-mode poolers, and it serializes commits; polling baseline.
-- **Redis, etcd, a built-in Raft store for leases:** not offered; SQLite and Postgres only.
+- **A built-in Raft store for leases:** not offered. Redis, etcd or a cloud key-value or database service only as a `kbf-state` backend that passes the suite (4.1).
 - **Any-owner AC hit with W=1 and no loss marks:** unbounded missing-output risk; write ordering and loss marks added.
 - **Certificate alone admits a hash owner:** `joining` and `catching-up` states added.
 - **Lease-id fencing alone:** enough for one frontend only; `session_gen` in P9.
