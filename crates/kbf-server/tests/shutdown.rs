@@ -204,6 +204,12 @@ async fn sigterm_keeps_an_open_stream_when_there_is_no_deadline() {
         server.0.try_wait().expect("try_wait").is_none(),
         "the server exited"
     );
+
+    // The client goes away and the server, with nothing left to wait for, exits 0.
+    drop(executed);
+    drop(client);
+    let status = server.exited(PROMPT).await;
+    assert!(status.success(), "kbf-server exited with {status}");
 }
 
 /// Catches (komira-build-farm#791): a server that sends nothing on an idle Execute
@@ -235,7 +241,7 @@ async fn an_idle_execute_stream_is_sent_progress() {
 /// operation, and the server still starts and answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zero_turns_progress_off() {
-    let (_server, reapi, worker) = Running::start(&[
+    let (mut server, reapi, worker) = Running::start(&[
         "--progress-interval-secs",
         "0",
         "--http2-keepalive-interval-secs",
@@ -257,6 +263,12 @@ async fn zero_turns_progress_off() {
     }
     let quiet = tokio::time::timeout(Duration::from_secs(2), executed.message()).await;
     assert!(quiet.is_err(), "an update with progress off: {quiet:?}");
+    // Stopped by a signal, not killed, so the run's coverage is written.
+    drop(executed);
+    drop(client);
+    server.terminate();
+    let status = server.exited(PROMPT).await;
+    assert!(status.success(), "kbf-server exited with {status}");
 }
 
 /// Catches (komira-build-farm#791): a REAPI listener built without HTTP/2 keepalive.
