@@ -38,6 +38,7 @@ use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::segments_server::Segments;
 use kbf_types::Digest;
 use tonic::Status;
+use tonic::metadata::MetadataValue;
 
 /// The answer of a [`Storage`] call.
 pub type Answer<'a, T> = BoxFuture<'a, Result<T, StorageError>>;
@@ -254,7 +255,13 @@ impl From<StorageError> for Status {
             StorageError::ActionWrite(ActionWriteError::Unreachable(_))
             | StorageError::Unreachable(_)
             | StorageError::Unavailable(_) => Self::unavailable(message),
-            StorageError::StaleMap { .. } => Self::unavailable(message),
+            StorageError::StaleMap { current } => {
+                let mut status = Self::failed_precondition(message);
+                status
+                    .metadata_mut()
+                    .insert(service::MAP_GENERATION_HEADER, MetadataValue::from(current));
+                status
+            }
             StorageError::Internal(_) => Self::internal(message),
         }
     }
