@@ -38,7 +38,7 @@ fn change_of(row: &Row<'_>) -> rusqlite::Result<Change> {
 
 fn is_live(expires: Option<i64>, now: StoreTime) -> bool {
     match expires {
-        Some(at) => at >= to_nanos(now),
+        Some(at) => at > to_nanos(now),
         None => true,
     }
 }
