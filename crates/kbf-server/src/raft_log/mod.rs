@@ -183,6 +183,18 @@ pub enum RaftLogError {
     /// The machine version this binary was asked to run is not one it knows.
     #[error("raft log: this kbf-server does not run machine version {}", .0.get())]
     Runs(MachineVersion),
+    /// The directory holds another cluster's log: a node never creates or joins a
+    /// second cluster.
+    #[error("raft dir: holds cluster {held}, so it cannot create or join cluster {asked}")]
+    OtherCluster {
+        /// The cluster the directory's record names.
+        held: FarmLogId,
+        /// The cluster the call named.
+        asked: FarmLogId,
+    },
+    /// The directory joined `0`: it never creates a cluster, that one included.
+    #[error("raft dir: joined cluster {0}, so it cannot create one")]
+    Joined(FarmLogId),
     /// The committed `Bootstrap` is not the one this start expects: the record names
     /// another log, or the prefix root changed since the log was created.
     #[error(
@@ -295,6 +307,41 @@ where
         new_log_id: impl FnOnce() -> io::Result<FarmLogId>,
     ) -> Result<Self, RaftLogError> {
         Self::open_running(fs, retention, prefix_root, new_log_id, RUNS).await
+    }
+
+    /// Creates a new single-voter cluster with id `cluster` in `fs`, as the gateway's
+    /// `CREATE` directive asks (docs/design/cluster.md, section 5.3), or opens it if
+    /// `fs` already holds the cluster this node created: a repeated create is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// For now, as [`RaftMetaLog::open`] with `cluster` as the new log's id.
+    pub async fn create(
+        fs: F,
+        retention: Retention,
+        prefix_root: &str,
+        cluster: FarmLogId,
+    ) -> Result<Self, RaftLogError> {
+        Self::open(fs, retention, prefix_root, move || Ok(cluster)).await
+    }
+
+    /// Joins the existing cluster the leader's `answer` names, as node `node`, as the
+    /// gateway's `JOIN` directive asks after the leader admitted it
+    /// ([`RaftMetaLog::join`]); or opens the log if `fs` already holds that cluster: a
+    /// repeated join is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Every join is refused for now.
+    pub async fn join_cluster(
+        fs: F,
+        retention: Retention,
+        prefix_root: &str,
+        node: ServerId,
+        answer: &JoinAnswer,
+    ) -> Result<Self, RaftLogError> {
+        let _ = (fs, retention, prefix_root, node, answer);
+        Err(RaftLogError::Record)
     }
 
     /// [`RaftMetaLog::open`], for a binary that runs machine versions up to `runs`: a
