@@ -27,8 +27,14 @@
 //! file system may after a crash) is read as no object at all: `NotFound`, so kbf
 //! marks it missing and the blob is uploaded again; a listing skips it. The store does
 //! not hash what it returns: kbf checks every blob it reads against its digest, from
-//! any store. A listing opens every object file to read its key (`list` serves rebuild
-//! and the sweep only). Nothing reads the objects at open: on a large directory that
+//! any store. A listing's first page opens every object file to read its key (`list`
+//! serves rebuild and the sweep only): file names are hashes, so key order is known only
+//! once every header is read. The keys under the prefix are kept, sorted, and the pages
+//! that follow are cut from them without opening a file again, as long as their token
+//! came with a page of that listing (it names the listing) within [`LISTING_KEPT_FOR`];
+//! the contract lets a listing miss writes made since it began. A listing started
+//! [`ListToken::after`] a key is a new listing: it reads every header again, so it sees
+//! every object written before it began. Nothing reads the objects at open: on a large directory that
 //! would hold up every start. [`FsStore::scan`] reads one shard's headers for the
 //! server's start-up pass, which runs in the background after the server serves (it
 //! deletes orphans and forgets index entries whose file is gone; `kbf-front`'s
@@ -55,15 +61,16 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use kbf_threads::disk::{FreeSpace as _, Space, Statvfs, keep_free};
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
+use crate::types::Token;
 use crate::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectInfo, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
@@ -74,6 +81,14 @@ const MAGIC: &[u8; 8] = b"kbf-obj1";
 
 /// The longest header: the magic, the key's length, and a key of 1024 bytes.
 const MAX_HEADER: usize = MAGIC.len() + 2 + 1024;
+
+/// How long the sorted keys of a listing are kept for the pages that continue it. A
+/// later page reads every header again.
+const LISTING_KEPT_FOR: Duration = Duration::from_secs(300);
+
+/// The id of the next listing that reads every header. Process-wide, so a token from
+/// one store never names another store's kept listing.
+static NEXT_LISTING: AtomicU64 = AtomicU64::new(0);
 
 /// Why a store could not be opened on a directory.
 #[derive(Debug, thiserror::Error)]
@@ -177,6 +192,10 @@ struct Inner {
     tmp: PathBuf,
     /// The name of the next temporary file.
     next: AtomicU64,
+    /// The sorted keys of the last listing, for the pages that continue it.
+    listing: Mutex<Option<Listing>>,
+    /// How many times a listing read every header: once per listing, not per page.
+    walks: AtomicU64,
     /// Held for the store's life: closing it releases the lock.
     _lock: File,
 }
@@ -236,6 +255,8 @@ impl FsStore {
                 full: Notify::new(),
                 tmp,
                 next: AtomicU64::new(0),
+                listing: Mutex::new(None),
+                walks: AtomicU64::new(0),
                 _lock: lock,
             }),
         })
@@ -420,14 +441,64 @@ impl Inner {
         Ok(scan)
     }
 
-    /// Reads the key of every object, keeps those under `prefix` after `after`, and
-    /// returns the first `max` in key order.
+    /// The first `max` keys under `prefix` after `after`, in key order: cut from the
+    /// kept keys of `listing` (the listing a page's token came from), or from every
+    /// header read again.
     fn list(
         &self,
         prefix: &KeyPrefix,
-        after: Option<&str>,
+        after: Option<&ObjectKey>,
+        listing: Option<u64>,
         max: usize,
     ) -> Result<ListPage, ObjectStoreError> {
+        let kept = listing.and_then(|id| {
+            let kept = self.listing.lock().unwrap_or_else(PoisonError::into_inner);
+            kept.as_ref()
+                .filter(|l| {
+                    l.id == id && l.prefix == *prefix && l.taken.elapsed() < LISTING_KEPT_FOR
+                })
+                .map(|l| (l.id, Arc::clone(&l.keys)))
+        });
+        let (id, keys) = match kept {
+            Some(kept) => kept,
+            None => {
+                let keys = self.walk(prefix)?;
+                let id = NEXT_LISTING.fetch_add(1, Ordering::Relaxed);
+                *self.listing.lock().unwrap_or_else(PoisonError::into_inner) = Some(Listing {
+                    id,
+                    prefix: prefix.clone(),
+                    keys: Arc::clone(&keys),
+                    taken: Instant::now(),
+                });
+                (id, keys)
+            }
+        };
+        let start = after.map_or(0, |a| keys.partition_point(|o| o.key <= *a));
+        let end = keys.len().min(start.saturating_add(max));
+        let objects = keys[start..end].to_vec();
+        // The token names this listing and the last key of this page; the next page
+        // starts after it.
+        let next = (end < keys.len())
+            .then(|| {
+                objects.last().map(|last| {
+                    ListToken(Token::Kept {
+                        listing: id,
+                        after: last.key.clone(),
+                    })
+                })
+            })
+            .flatten();
+        if next.is_none() {
+            // The listing is done: free its keys.
+            let mut listing = self.listing.lock().unwrap_or_else(PoisonError::into_inner);
+            listing.take_if(|l| l.id == id);
+        }
+        Ok(ListPage { objects, next })
+    }
+
+    /// Reads the key of every object and returns those under `prefix`, in key order.
+    fn walk(&self, prefix: &KeyPrefix) -> Result<Arc<[ObjectInfo]>, ObjectStoreError> {
+        self.walks.fetch_add(1, Ordering::Relaxed);
         let mut found = BTreeMap::new();
         for shard in entries(&self.objects).map_err(failed("list", &self.objects))? {
             for path in entries(&shard).map_err(failed("list", &shard))? {
@@ -435,23 +506,24 @@ impl Inner {
                 found.extend(
                     object
                         .map(|o| (o.key, o.size))
-                        .filter(|(k, _)| prefix.matches(k) && after.is_none_or(|a| k.as_str() > a)),
+                        .filter(|(k, _)| prefix.matches(k)),
                 );
             }
         }
-        let mut rest = found.into_iter();
-        let objects: Vec<ObjectInfo> = rest
-            .by_ref()
-            .take(max)
+        Ok(found
+            .into_iter()
             .map(|(key, size)| ObjectInfo { key, size })
-            .collect();
-        // The token is the last key of this page; the next page starts after it.
-        let next = rest
-            .next()
-            .and(objects.last())
-            .map(|last| ListToken(last.key.as_str().to_owned()));
-        Ok(ListPage { objects, next })
+            .collect())
     }
+}
+
+/// The sorted keys of one listing ([`Inner::list`]).
+struct Listing {
+    /// Named by the tokens of its pages.
+    id: u64,
+    prefix: KeyPrefix,
+    keys: Arc<[ObjectInfo]>,
+    taken: Instant,
 }
 
 /// An open object file and what its header says.
@@ -642,8 +714,94 @@ impl ObjectStore for FsStore {
         max_keys: PageSize,
     ) -> Result<ListPage, ObjectStoreError> {
         let (inner, prefix) = (Arc::clone(&self.inner), prefix.clone());
-        let after = after.map(|t| t.0.clone());
+        let listing = after.and_then(ListToken::listing);
+        let after = after.map(ListToken::local_after).transpose()?.cloned();
         let max = usize::from(max_keys.get());
-        blocking(move || inner.list(&prefix, after.as_deref(), max)).await
+        blocking(move || inner.list(&prefix, after.as_ref(), listing, max)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(name: &str) -> ObjectKey {
+        ObjectKey::new(name).expect("a valid key")
+    }
+
+    async fn list_all(store: &FsStore, prefix: &KeyPrefix) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut after = None;
+        loop {
+            let page = store
+                .list(prefix, after.as_ref(), PageSize::new(2).expect("size"))
+                .await
+                .expect("list");
+            keys.extend(page.objects.into_iter().map(|o| o.key.as_str().to_owned()));
+            match page.next {
+                Some(t) => after = Some(t),
+                None => return keys,
+            }
+        }
+    }
+
+    /// Catches a listing that reads every header again for each page (a rebuild over
+    /// a directory of N objects would open N files per page, N squared over the
+    /// listing): 7 keys in pages of 2 take one walk. A listing interleaved with one of
+    /// another prefix walks again rather than cutting its pages from the other's keys,
+    /// a token of a listing no longer kept or used under another prefix walks again,
+    /// and a listing that ended keeps nothing for the next.
+    #[tokio::test]
+    async fn a_paged_listing_reads_the_headers_once() {
+        let dir = std::env::temp_dir().join(format!("kbf-objstore-walks.{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = FsStore::open(&dir, Floor::Bytes(1)).expect("open");
+        for i in 0..7 {
+            for p in ["a", "b"] {
+                let k = key(&format!("{p}/{i}"));
+                store
+                    .put_new(&k, Bytes::from_static(b"x"), None)
+                    .await
+                    .expect("put");
+            }
+        }
+        let walks = || store.inner.walks.load(Ordering::Relaxed);
+        let a = KeyPrefix::new("a/").expect("prefix");
+        let b = KeyPrefix::new("b/").expect("prefix");
+        let want: Vec<String> = (0..7).map(|i| format!("a/{i}")).collect();
+        assert_eq!(list_all(&store, &a).await, want);
+        assert_eq!(walks(), 1);
+        assert!(store.inner.listing.lock().expect("lock").is_none());
+
+        let size = PageSize::new(2).expect("size");
+        let first = store.list(&a, None, size).await.expect("list");
+        let other = store.list(&b, None, size).await.expect("list");
+        assert_eq!(other.objects[0].key.as_str(), "b/0");
+        let second = store
+            .list(&a, first.next.as_ref(), size)
+            .await
+            .expect("list");
+        let keys: Vec<&str> = second.objects.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, ["a/2", "a/3"]);
+        assert_eq!(walks(), 4);
+
+        // A token of a listing no longer kept (here, of a's first walk) walks again,
+        // and so does a token of the kept listing used under another prefix.
+        let stale = store
+            .list(&a, first.next.as_ref(), size)
+            .await
+            .expect("list");
+        let keys: Vec<&str> = stale.objects.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, ["a/2", "a/3"]);
+        assert_eq!(walks(), 5);
+        let elsewhere = store
+            .list(&b, stale.next.as_ref(), size)
+            .await
+            .expect("list");
+        let keys: Vec<&str> = elsewhere.objects.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, ["b/0", "b/1"]);
+        assert_eq!(walks(), 6);
+        drop(store);
+        fs::remove_dir_all(&dir).expect("remove");
     }
 }

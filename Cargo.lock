@@ -1403,6 +1403,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "kbf-all-in-one",
+ "kbf-deploy",
  "kbf-node",
  "kbf-server",
 ]
@@ -1765,7 +1766,9 @@ dependencies = [
  "futures",
  "hex",
  "hmac 0.13.0",
+ "kbf-segments",
  "kbf-threads",
+ "kbf-types",
  "md-5",
  "reqwest",
  "roxmltree",

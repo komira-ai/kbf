@@ -1,0 +1,32 @@
+# Rendered by `kbf-deploy linux render-units --mode storage`; installed as
+# /etc/systemd/system/kbf-storage.service (kbf docs/design/architecture-v2.md,
+# sections 1 and 11). `kbf storage` is not built yet: it exits
+# 2 at start, and `check-units --mode storage` refuses any flag on its command line
+# until kbf takes some.
+[Unit]
+Description=kbf build farm storage node
+Wants=network-online.target
+After=network-online.target minio.service
+
+[Service]
+# Not the daemon's user: a storage node holds the cold store's key.
+User=kbf-server
+Slice=kbf.slice
+# kbf-server's peak use today (KBF_SERVER_RESERVATION_GIB).
+MemoryMin=16G
+# A storage node answering from swap would slow every build at once.
+MemorySwapMax=0
+OOMScoreAdjust=-925
+CPUWeight=300
+# AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY of the bucket's MinIO service account,
+# mode 0600: a secret never goes on the command line.
+EnvironmentFile=/etc/kbf/s3.env
+ExecStart=/usr/local/bin/kbf storage
+# TODO: the storage node's flags (its stores, --frontend,
+# --advertise-addr, the certificate flags), once `kbf storage` has them.
+Restart=on-failure
+# Exit 2 is a command line kbf refused (or a mode not built yet): a restart cannot fix it.
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

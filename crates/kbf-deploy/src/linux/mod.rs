@@ -10,6 +10,9 @@
 //! - `kbf-deploy linux check-units --config FILE --dir DIR [--installable]` checks
 //!   them against the host's priorities ([`check`] lists the rules) and prints one
 //!   `FAIL <rule>: <reason>` line per broken rule.
+//! - With `--mode MODE`, both verbs work on one mode of the one `kbf` binary instead
+//!   ([`modes`]): `render-units` writes `kbf.slice` and `kbf-<mode>.service`, and
+//!   `check-units` checks `kbf-<mode>.service` against [`modes`]' rules.
 //!
 //! Exit codes: 0 rendered, or every rule holds; 1 a rule is broken; 2 refused (a bad
 //! setting, a template placeholder with no value, a file that cannot be read or
@@ -36,6 +39,7 @@ pub mod config;
 pub mod host;
 pub mod images;
 pub mod install;
+pub mod modes;
 pub mod render;
 pub mod swap;
 
@@ -47,6 +51,7 @@ use std::path::{Path, PathBuf};
 pub use check::{CheckError, Failure, Report};
 pub use config::{LinuxConfig, LinuxError};
 pub use host::HostError;
+pub use modes::Mode;
 pub use render::{Templates, Units};
 
 use crate::template::TemplateError;
@@ -90,4 +95,50 @@ pub fn render_units(config: &Path, out: &Path, kbf_uid: Option<u32>) -> Result<S
 pub fn check_units(config: &Path, dir: &Path, installable: bool) -> Result<Report, Refusal> {
     let c = LinuxConfig::load(config)?;
     Ok(check::check_dir(&c, dir, installable)?)
+}
+
+/// `render-units --mode`: `kbf.slice` and the unit of `mode`, rendered with the settings
+/// in `config` into `out`, and the line to print.
+pub fn render_mode_unit(
+    config: &Path,
+    out: &Path,
+    kbf_uid: Option<u32>,
+    mode: Mode,
+) -> Result<String, Refusal> {
+    let c = LinuxConfig::load(config)?;
+    let slice = render::render(&c, kbf_uid, &Templates::BUILT_IN)?.slice;
+    let unit = modes::render(&c, kbf_uid, mode)?;
+    std::fs::create_dir_all(out).map_err(|source| Refusal::Write {
+        path: out.to_owned(),
+        source,
+    })?;
+    let name = mode.unit_name();
+    for (file, text) in [(render::SLICE, &slice), (name.as_str(), &unit)] {
+        let path = out.join(file);
+        std::fs::write(&path, text).map_err(|source| Refusal::Write { path, source })?;
+    }
+    Ok(format!(
+        "rendered {} {name} into {} (kbf {mode})",
+        render::SLICE,
+        out.display()
+    ))
+}
+
+/// `check-units --mode`: check `kbf-<mode>.service` in `dir` against the settings in
+/// `config`.
+pub fn check_mode_unit(
+    config: &Path,
+    dir: &Path,
+    mode: Mode,
+    installable: bool,
+) -> Result<Report, Refusal> {
+    let c = LinuxConfig::load(config)?;
+    let name = mode.unit_name();
+    let path = dir.join(&name);
+    let text = std::fs::read_to_string(&path).map_err(|source| CheckError::Read {
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(modes::check(&c, mode, &text, installable)
+        .map_err(|source| CheckError::Unit { name, source })?)
 }
