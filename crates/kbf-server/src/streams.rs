@@ -43,7 +43,7 @@ pub fn flow_windows(max_streams: u32) -> FlowWindows {
     let stream = STREAM_WINDOW_BYTES.min(MAX_WINDOW / streams);
     FlowWindows {
         stream,
-        connection: 200 * STREAM_WINDOW_BYTES,
+        connection: streams * stream,
     }
 }
 
