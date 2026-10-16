@@ -71,8 +71,12 @@ pub struct Listeners {
     /// WaitExecution on it still streams its result; then it is NOT_FOUND.
     pub finished_retention: Duration,
     /// How long shutdown waits for the REAPI listener to drain (see
-    /// [`bind_server_with_api`]) before it stops anyway.
+    /// [`bind_server_with_api`]) before it ends the open streams and stops anyway.
+    /// [`Duration::MAX`] waits for as long as an action runs (`--shutdown-timeout-secs
+    /// 0`, the flag's default): Buck2 never recovers a stream that breaks mid-action.
     pub shutdown_timeout: Duration,
+    /// How long streams stay quiet, and how the connections are kept alive.
+    pub streams: StreamTiming,
     /// How long `GET /readyz` on the operator API, and the REAPI listener's
     /// `grpc.health.v1` service, wait for the object store to answer their probe
     /// ([`crate::health`]).
@@ -84,6 +88,36 @@ pub struct Listeners {
     /// `docs/design/write-path.md`, section 4).
     pub segments: SegmentsConfig,
 }
+
+/// What keeps a long-lived stream from looking idle to a load balancer, a proxy or the
+/// peer: Buck2 sends one Execute per action and never reconnects a broken one, so an
+/// idle-timeout cut fails the action (komira-build-farm#791). Zero turns each off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamTiming {
+    /// How often every open Execute and WaitExecution stream is sent its operation
+    /// again (`--progress-interval-secs`).
+    pub progress_interval: Duration,
+    /// How often the REAPI and worker listeners send an HTTP/2 PING on a connection
+    /// that has been quiet (`--http2-keepalive-interval-secs`).
+    pub keepalive_interval: Duration,
+    /// How long a PING may go unanswered before the connection is closed
+    /// (`--http2-keepalive-timeout-secs`).
+    pub keepalive_timeout: Duration,
+}
+
+impl Default for StreamTiming {
+    fn default() -> Self {
+        Self {
+            progress_interval: Duration::from_secs(30),
+            keepalive_interval: Duration::from_secs(30),
+            keepalive_timeout: Duration::from_secs(20),
+        }
+    }
+}
+
+/// How long, after the shutdown timeout ends the open streams UNAVAILABLE, the server
+/// waits for the clients to take it before it stops.
+const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
 /// The worker listener's mutual TLS: every daemon's certificate must name its node
 /// (see [`crate::identity`]).
@@ -102,6 +136,10 @@ pub struct Api {
     pub listen: SocketAddr,
     /// The token writes must present; `None` turns writes off (reads still answer).
     pub token: Option<ApiToken>,
+    /// The node's one cache, whose fill `/metrics` reports, when the process runs a
+    /// daemon whose input cache shares the disk with this server's store
+    /// (`kbf-all-in-one`).
+    pub local_cache: Option<Arc<kbf_storage::local_cache::LocalCache>>,
 }
 
 /// Why the server could not start or stopped.
@@ -201,6 +239,21 @@ fn bind_api(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), S
     bound.map_err(|source| ServeError::Bind { addr, source })
 }
 
+/// The worker listener's TLS and the way its peers are told apart. Not generic, so
+/// both arms are one set of lines whatever the cache types (a per-instantiation copy
+/// that misses one arm would count as missed lines).
+fn worker_peers(server: Server, tls: Option<WorkerTls>) -> Result<(Server, Peers), ServeError> {
+    Ok(match tls {
+        Some(tls) => (
+            server.tls_config(tls.server)?,
+            Peers::Certified {
+                deny_list: tls.deny_list,
+            },
+        ),
+        None => (server, Peers::Unauthenticated),
+    })
+}
+
 /// `server` with the HTTP/2 limits both listeners state rather than leave to the
 /// transport's defaults: they bound what is held outside `--write-bytes-in-flight`, and
 /// the connection window is what lets a Write admitted after others finish at all
@@ -210,6 +263,16 @@ fn flow_control(server: Server) -> Server {
         .max_concurrent_streams(Some(MAX_CONCURRENT_STREAMS))
         .initial_stream_window_size(Some(STREAM_WINDOW_BYTES))
         .initial_connection_window_size(Some(CONNECTION_WINDOW_BYTES))
+}
+
+/// `server` pinging a quiet connection every `timing.keepalive_interval` and closing it
+/// when a ping stays unanswered for `timing.keepalive_timeout` (HTTP/2 PING, which a
+/// peer must answer even when it never sends data).
+fn keepalive(server: Server, timing: StreamTiming) -> Server {
+    let on = !timing.keepalive_interval.is_zero();
+    server
+        .http2_keepalive_interval(on.then_some(timing.keepalive_interval))
+        .http2_keepalive_timeout(on.then_some(timing.keepalive_timeout))
 }
 
 /// The warning every start logs ([`bind_server_with_api`]).
@@ -306,7 +369,7 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_state(cache, listeners, api, policy, None, shutdown)
+    bind_server_with_options(cache, listeners, api, policy, None, None, shutdown)
 }
 
 /// [`bind_server_with_policy`], with the scheduler's state kept in `state` if given
@@ -320,6 +383,49 @@ pub fn bind_server_with_state<M, O>(
     api: Option<Api>,
     policy: Policy,
     state: Option<StateStore>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
+    bind_server_with_options(cache, listeners, api, policy, state, None, shutdown)
+}
+
+/// [`bind_server_with_policy`], and with a `storage` node (`--storage`) the REAPI
+/// listener proxies the client's CAS, ByteStream and action-cache calls to it
+/// ([`kbf_front::Proxy`]) instead of answering them from `cache`.
+///
+/// # Errors
+/// As [`bind_server_with_policy`].
+pub fn bind_server_with_storage<M, O>(
+    cache: Arc<Cache<M, O>>,
+    listeners: Listeners,
+    api: Option<Api>,
+    policy: Policy,
+    storage: Option<tonic::transport::Endpoint>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
+    bind_server_with_options(cache, listeners, api, policy, None, storage, shutdown)
+}
+
+/// [`bind_server_with_policy`] with both of its options: the scheduler's state in
+/// `state` ([`bind_server_with_state`]) and the client's CAS, ByteStream and
+/// action-cache calls proxied to a `storage` node ([`bind_server_with_storage`]).
+///
+/// # Errors
+/// As [`bind_server_with_state`].
+pub fn bind_server_with_options<M, O>(
+    cache: Arc<Cache<M, O>>,
+    listeners: Listeners,
+    api: Option<Api>,
+    policy: Policy,
+    state: Option<StateStore>,
+    storage: Option<tonic::transport::Endpoint>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
 where
@@ -340,7 +446,9 @@ where
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
     let probe_timeout = listeners.store_probe_timeout;
-    let (api_listen, token) = api.map_or((None, None), |api| (Some(api.listen), api.token));
+    let (api_listen, token, local) = api.map_or((None, None, None), |api| {
+        (Some(api.listen), api.token, api.local_cache)
+    });
     let api_listener = api_listen.map(bind_api).transpose()?;
     let api = api_listener.as_ref().map(|(_, local)| *local);
     let readiness = Arc::new(Readiness::default());
@@ -355,27 +463,20 @@ where
     );
     let api_routes = crate::api::router(Arc::clone(&farm), token)
         .merge(health_routes)
-        .merge(crate::metrics::router(Arc::clone(&cache)))
+        .merge(crate::metrics::router(Arc::clone(&cache), local))
         .merge(blob_routes)
         .merge(page_routes);
     // Logged at every start, the first one too (issue #156).
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     log_state(durable, term, epoch);
 
-    let mut reapi_server = flow_control(Server::builder());
+    let mut reapi_server = keepalive(flow_control(Server::builder()), listeners.streams);
     if let Some(tls) = listeners.reapi_tls {
         reapi_server = reapi_server.tls_config(tls)?;
     }
-    let mut worker_server = flow_control(Server::builder());
-    let peers = match listeners.worker_tls {
-        Some(tls) => {
-            worker_server = worker_server.tls_config(tls.server)?;
-            Peers::Certified {
-                deny_list: tls.deny_list,
-            }
-        }
-        None => Peers::Unauthenticated,
-    };
+    let mut worker_server = keepalive(flow_control(Server::builder()), listeners.streams);
+    let peers;
+    (worker_server, peers) = worker_peers(worker_server, listeners.worker_tls)?;
     let worker_blobs = ByteStreamServer::new(WorkerBlobs::new(
         ByteStreamService::new(Arc::clone(&cache)),
         peers.clone(),
@@ -409,16 +510,29 @@ where
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let (closer, closing) = kbf_front::closing();
+    let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);
-    let reapi_routes = kbf_front::routes_recorded(
-        cache,
-        Arc::clone(&farm),
-        closing,
-        authorizers,
-        &recorder,
-        default_memory,
-    );
+    let reapi_routes = match storage {
+        Some(node) => kbf_front::routes_proxied(
+            &kbf_front::Proxy::to_endpoint(&node, Arc::clone(&authorizers)),
+            cache,
+            Arc::clone(&farm),
+            kbf_front::OpenStreams { closing, progress },
+            authorizers,
+            &recorder,
+            default_memory,
+        ),
+        None => kbf_front::routes_recorded(
+            cache,
+            Arc::clone(&farm),
+            closing,
+            progress,
+            authorizers,
+            &recorder,
+            default_memory,
+        ),
+    };
     let authenticate = AuthenticateLayer::new(policy.authenticator);
     // The layers wrap the REAPI routes (and the fallback for unknown paths) present
     // when they are applied; the health service, added after, is answered without
@@ -473,9 +587,13 @@ where
             // Before anything stops, so a front's health check (`/readyz`, or the
             // health service) sends no new work here.
             stop_readiness.stop();
-            closer.close();
+            // No new Execute; open streams run until their action is done. Buck2 does
+            // not recover a stream that breaks, so only the shutdown timeout ends them.
+            closer.drain();
             let _ = drain.send(());
             tokio::time::sleep(listeners.shutdown_timeout).await;
+            closer.close();
+            tokio::time::sleep(CLOSE_GRACE).await;
             tracing::warn!(
                 timeout = ?listeners.shutdown_timeout,
                 "REAPI connections still open at the shutdown timeout; stopping anyway"
@@ -486,6 +604,8 @@ where
             served = worker_serve => served.map_err(ServeError::from),
             served = api_serve => served.map_err(ServeError::Api),
             () = ticking => Ok(()),
+            // One timer for every open stream's progress operation.
+            () = ticker.run() => Ok(()),
             () = stopping => Ok(()),
         }
     };

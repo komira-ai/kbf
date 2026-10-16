@@ -94,8 +94,9 @@ pub use kbf_sched::MemoryLadder;
 pub use local::LocalStore;
 pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use serve::{
-    Api, Bound, BoundStorage, Listeners, ServeError, StorageListener, WorkerTls, bind_server,
-    bind_server_with_api, bind_server_with_policy, bind_server_with_state, bind_storage,
+    Api, Bound, BoundStorage, Listeners, ServeError, StorageListener, StreamTiming, WorkerTls,
+    bind_server, bind_server_with_api, bind_server_with_options, bind_server_with_policy,
+    bind_server_with_state, bind_server_with_storage, bind_storage,
 };
 pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start};
 pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};

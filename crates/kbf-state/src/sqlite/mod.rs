@@ -41,6 +41,7 @@ use rusqlite::Connection;
 
 pub use error::SqliteError;
 pub use restore::restore;
+pub use schema::SCHEMA_VERSION;
 
 use crate::GROUP_COMMIT_WINDOW;
 use crate::clock::{Clock, StoreTime};
