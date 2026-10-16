@@ -1,0 +1,55 @@
+# Rendered by `kbf-deploy linux render-units --mode all-in-one`; installed as
+# /etc/systemd/system/kbf-all-in-one.service (kbf docs/design/architecture-v2.md,
+# sections 1 and 11). `kbf all-in-one` takes exactly the flags kbf-all-in-one takes:
+# kbf-server's and kbf-daemon's, but --cas, and the container driver only.
+[Unit]
+Description=kbf build farm, all in one process
+Wants=network-online.target
+After=network-online.target @MINIO_UNIT@
+
+[Service]
+# The daemon half runs rootless Podman as the kbf user.
+User=@KBF_USER@
+Slice=kbf.slice
+# The daemon half manages its own cgroup: supervisor/ for itself, actions/ for builds.
+Delegate=yes
+# kbf-server's peak use (KBF_SERVER_RESERVATION_GIB).
+MemoryMin=@SERVER_MEMORY_MIN@
+OOMScoreAdjust=-925
+CPUWeight=300
+# No MemorySwapMax=: leases may swap, and they live in this unit's cgroup.
+Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@
+# AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY of the bucket's MinIO service account,
+# mode 0600: a secret never goes on the command line.
+EnvironmentFile=@KBF_ETC@/s3.env
+ExecStart=@KBF_BIN_DIR@/kbf all-in-one \
+    --cold-store=s3://@KBF_S3_BUCKET@?endpoint=@MINIO_S3_ENDPOINT@&conditional-put=true \
+    --meta-dir=@KBF_META_DIR@ \
+    --listen=@KBF_LISTEN_HOST@:@KBF_REAPI_PORT@ \
+    --reapi-tls-cert=@KBF_ETC@/reapi.pem \
+    --reapi-tls-key=@KBF_ETC@/reapi.key \
+    --worker-listen=@KBF_LISTEN_HOST@:@KBF_WORKER_PORT@ \
+    --worker-tls-cert=@KBF_ETC@/worker.pem \
+    --worker-tls-key=@KBF_ETC@/worker.key \
+    --worker-client-ca=@KBF_ETC@/ca.pem \
+    --worker-deny-list=@KBF_ETC@/deny-list \
+    --api-listen=127.0.0.1:@KBF_API_PORT@ \
+    --api-token-file=@KBF_ETC@/api-token \
+    --driver=container \
+    --server=https://@KBF_HOST_NAME@:@KBF_WORKER_PORT@ \
+    --ca-cert=@KBF_ETC@/ca.pem \
+    --cert=@KBF_ETC@/node.pem \
+    --key=@KBF_ETC@/node.key \
+    --node-id=@KBF_NODE_ID@ \
+    --data-dir=@KBF_DATA_DIR@ \
+@DAEMON_IMAGE_ARGS@
+    --actions-memory-max-gib=@ACTIONS_MEMORY_MAX_GIB@ \
+    --supervisor-memory-min-mib=@KBF_DAEMON_MEMORY_MIN_MIB@
+# TODO(av2-08): the certificate flags of the new modes, which replace the worker
+# listener's, once `kbf all-in-one` has them.
+Restart=on-failure
+# Exit 2 is a command line kbf refused: a restart cannot fix it.
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

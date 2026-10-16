@@ -1,0 +1,27 @@
+# Rendered by `kbf-deploy linux render-units --mode frontend`; installed as
+# /etc/systemd/system/kbf-frontend.service (kbf docs/design/architecture-v2.md,
+# sections 1 and 11). `kbf frontend` is not built yet (work-plan unit av2-07): it exits
+# 2 at start, and `check-units --mode frontend` refuses any flag on its command line
+# until kbf takes some.
+[Unit]
+Description=kbf build farm frontend
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# Not the daemon's user: the frontend holds the state store and the operator token.
+User=@KBF_SERVER_USER@
+Slice=kbf.slice
+# A frontend answering from swap would slow every build at once.
+MemorySwapMax=0
+OOMScoreAdjust=-925
+CPUWeight=300
+ExecStart=@KBF_BIN_DIR@/kbf frontend
+# TODO(av2-07, av2-08): the frontend's flags (its listen addresses, the state store,
+# the certificate flags), once `kbf frontend` has them.
+Restart=on-failure
+# Exit 2 is a command line kbf refused (or a mode not built yet): a restart cannot fix it.
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

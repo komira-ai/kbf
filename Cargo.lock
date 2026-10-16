@@ -1389,6 +1389,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "kbf-all-in-one",
+ "kbf-deploy",
  "kbf-node",
  "kbf-server",
 ]

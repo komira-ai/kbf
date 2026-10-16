@@ -5,8 +5,8 @@
 //!                          --mc PATH [--key-file PATH [--key-owner USER]] [--remove] [--apply]
 //! kbf-deploy minio nodeport --kubectl PATH --kubeconfig PATH [--context NAME]
 //!                           --namespace NS --service NAME --node-port N [--remove] [--apply]
-//! kbf-deploy linux render-units --config FILE --out DIR [--kbf-uid UID]
-//! kbf-deploy linux check-units --config FILE --dir DIR [--installable]
+//! kbf-deploy linux render-units --config FILE --out DIR [--kbf-uid UID] [--mode MODE]
+//! kbf-deploy linux check-units --config FILE --dir DIR [--installable] [--mode MODE]
 //! kbf-deploy linux install-units --config FILE [--bin-dir DIR] [--restart-minio] [--apply]
 //! kbf-deploy linux install-units --config FILE --uninstall [--apply]
 //! kbf-deploy linux image-pull --config FILE [--image REF]... [--platform OS/ARCH] [--apply]
@@ -197,6 +197,9 @@ enum Linux {
         /// unit keeps `<kbf uid>`, which `check-units --installable` refuses.
         #[arg(long)]
         kbf_uid: Option<u32>,
+        /// Render kbf.slice and the unit of this mode of the one kbf binary instead.
+        #[arg(long, value_enum)]
+        mode: Option<linux::Mode>,
     },
     /// Check rendered units against the host's priorities.
     CheckUnits {
@@ -209,6 +212,9 @@ enum Linux {
         /// Also refuse a `<...>` placeholder.
         #[arg(long)]
         installable: bool,
+        /// Check the unit of this mode of the one kbf binary instead.
+        #[arg(long, value_enum)]
+        mode: Option<linux::Mode>,
     },
     /// Install the binaries and units, and start kbf-server and kbf-daemon (as root).
     InstallUnits {
@@ -549,12 +555,22 @@ fn linux_kit<E: Exec>(
             config,
             out: dir,
             kbf_uid,
-        } => linux::render_units(&config, &dir, kbf_uid).map(|line| (vec![line], 0)),
+            mode,
+        } => match mode {
+            None => linux::render_units(&config, &dir, kbf_uid),
+            Some(mode) => linux::render_mode_unit(&config, &dir, kbf_uid, mode),
+        }
+        .map(|line| (vec![line], 0)),
         Linux::CheckUnits {
             config,
             dir,
             installable,
-        } => linux::check_units(&config, &dir, installable).map(|report| {
+            mode,
+        } => match mode {
+            None => linux::check_units(&config, &dir, installable),
+            Some(mode) => linux::check_mode_unit(&config, &dir, mode, installable),
+        }
+        .map(|report| {
             let code = u8::from(!report.failures.is_empty());
             let mut lines: Vec<String> = report.failures.iter().map(ToString::to_string).collect();
             lines.push(report.summary);
