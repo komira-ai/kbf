@@ -119,6 +119,12 @@ impl Pending {
         out
     }
 
+    /// Whether a write of `key` is pending.
+    #[must_use]
+    pub fn contains(&self, key: &str) -> bool {
+        self.rows.contains_key(key)
+    }
+
     /// Writes pending.
     #[must_use]
     pub fn len(&self) -> usize {

@@ -39,6 +39,11 @@ const MAX_SEQ: u32 = 0xFF_FFFF;
 /// The largest commit time a run id carries (6 bytes of milliseconds, year 10889).
 const MAX_TIME_MS: u64 = 0xFFFF_FFFF_FFFF;
 
+/// Open streams the minter holds at most (one per invocation and day, about 100 bytes
+/// each). Past it the first by key is forgotten, which costs only a new stream id for
+/// that invocation's next run.
+const OPEN_STREAMS: usize = 65_536;
+
 /// A stream of run ids: 24 bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId(pub u32);
@@ -191,6 +196,8 @@ struct MintState {
     fallback: u16,
     /// The open stream of each (invocation, day).
     open: BTreeMap<(InvKey, Day), OpenStream>,
+    /// Entries of `open` at most.
+    open_limit: usize,
 }
 
 impl Minter {
@@ -206,6 +213,7 @@ impl Minter {
                 spare: None,
                 fallback: 0,
                 open: BTreeMap::new(),
+                open_limit: OPEN_STREAMS,
             }),
         }
     }
@@ -236,6 +244,9 @@ impl Minter {
                 last_ms: commit_ms,
             },
         };
+        if st.open.len() >= st.open_limit && !st.open.contains_key(&slot) {
+            st.open.pop_first();
+        }
         st.open.insert(
             slot,
             OpenStream {
@@ -478,6 +489,32 @@ mod tests {
         // A new stream opens at its own first id's time.
         let d = m.mint(&inv(2), T + 1);
         assert_eq!((d.id.time_ms(), d.stream_opened_ms), (T + 1, T + 1));
+    }
+
+    #[test]
+    fn open_streams_are_bounded_and_a_forgotten_one_reopens() {
+        // Catches: one open stream kept per client invocation id until the day ends,
+        // so a client sending fresh ids grows the minter without bound.
+        let m = Minter::new(0);
+        m.state().open_limit = 2;
+        m.mint(&inv(1), T);
+        m.mint(&inv(2), T);
+        // A stream already held takes no room.
+        assert_eq!(m.mint(&inv(2), T).id.seq(), 1);
+        assert_eq!(m.state().open.len(), 2);
+        m.mint(&inv(3), T);
+        let held: Vec<InvKey> = m.state().open.keys().map(|(i, _)| i.clone()).collect();
+        assert_eq!(held.len(), 2);
+        assert!(held.contains(&inv(3)));
+        let gone: Vec<InvKey> = [inv(1), inv(2)]
+            .into_iter()
+            .filter(|i| !held.contains(i))
+            .collect();
+        assert_eq!(gone.len(), 1);
+        assert!(
+            m.mint(&gone[0], T).opened_stream,
+            "the forgotten one opens anew"
+        );
     }
 
     #[test]

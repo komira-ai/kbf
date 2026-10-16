@@ -19,7 +19,14 @@
 //!   past it the oldest is dropped (`stage="buffer"`) and its invocation's header counts
 //!   the hole. Index rows past [`Pending`]'s bounds, and rows whose transaction failed,
 //!   are dropped (`stage="index"`) and their object kept for re-insertion once the
-//!   backlog drains: the rows come back from the object's footer with no LIST.
+//!   backlog drains: the rows come back from the object's footer with no LIST. The
+//!   invocations held are bounded by [`Limits::invocations`] (idle ones forgotten
+//!   first, then new ones refused, `stage="invocations"`).
+//! - **Headers.** A newly seen invocation's stored header (a previous life's, or this
+//!   writer's from before it forgot the invocation) is read after the drain, at most
+//!   [`Limits::header_reads_per_step`] a step, and merged with what the writer added
+//!   meanwhile. Until the read succeeds no header row is written, so a failed read
+//!   never replaces the stored header with a fresh count.
 //!
 //! TODO: mark the index transactions background once the `kbf-state` trait has the
 //! mark (the C7 background lane); until then they are ordinary transactions, sent at
@@ -71,6 +78,14 @@ pub struct Limits {
     pub txns_per_step: usize,
     /// Kept objects re-read per step at most.
     pub reinserts_per_step: usize,
+    /// Invocations the writer holds state for at most. Each holds its header, its two
+    /// lists of the [`SLOWEST`] runs (about 2 KiB together), its instance names and one
+    /// entry per stream; past the bound an idle one is forgotten to make room, and with
+    /// none idle a new invocation's event is dropped (`stage="invocations"`).
+    pub invocations: usize,
+    /// Stored headers read per step at most, for invocations the writer has just
+    /// opened (one index read each).
+    pub header_reads_per_step: usize,
 }
 
 impl Default for Limits {
@@ -85,6 +100,8 @@ impl Default for Limits {
             txn_bytes: 256 * 1024,
             txns_per_step: 1,
             reinserts_per_step: 64,
+            invocations: 4096,
+            header_reads_per_step: 256,
         }
     }
 }
@@ -99,6 +116,9 @@ pub struct Drops {
     pub put: u64,
     /// Index rows dropped (each restored from its object later, when it has one).
     pub index: u64,
+    /// Events dropped because the writer held [`Limits::invocations`] invocations and
+    /// none was idle enough to forget.
+    pub invocations: u64,
 }
 
 /// Records gathered for one chunk.
@@ -141,7 +161,14 @@ struct Cut {
 /// What the writer holds for one invocation.
 #[derive(Debug, Default)]
 struct Inv {
+    /// The header; while `unread`, only what this writer added since it opened the
+    /// invocation.
     header: InvocationHeader,
+    /// The stored header has not been read yet. No header row is written until it is
+    /// and the two are merged, so a failed read never replaces the stored header.
+    unread: bool,
+    /// A header row write was held back while `unread`.
+    held: bool,
     building: Building,
     slowest_execution: Vec<Slow>,
     slowest_wall: Vec<Slow>,
@@ -287,21 +314,92 @@ impl Core {
         for event in self.queue.drain() {
             self.ingest(event, now_ms);
         }
+        self.read_headers();
         self.cut_due(now_ms);
     }
 
-    /// Forgets invocations with nothing buffered or unwritten that are closed or were
-    /// last seen before yesterday (UTC). A later record of one reloads its header from
-    /// the index and continues it.
+    /// Whether the writer may forget `inv`: nothing buffered or unwritten, its stored
+    /// header read, and no header row of it pending (a later record reloads the header
+    /// from the index, so the index must have it).
+    fn idle(&self, key: &InvKey, s: &Inv) -> bool {
+        s.building.records() == 0
+            && !s.unread
+            && !self.ready.iter().any(|c| &c.inv == key)
+            && !self.pending.contains(&rows::invid(key))
+    }
+
+    /// Forgets idle invocations that are closed or were last seen before yesterday
+    /// (UTC). A later record of one reloads its header from the index and continues it.
     fn prune(&mut self, now_ms: u64) {
         let yesterday = Day::from_ms(now_ms.saturating_sub(MS_PER_DAY));
-        let ready = &self.ready;
-        self.invs.retain(|key, s| {
-            let idle = s.building.records() == 0 && !ready.iter().any(|c| &c.inv == key);
-            let done = s.header.state() == InvState::Closed
-                || Day::from_ms(s.header.last_seen_ms) < yesterday;
-            !(idle && done)
-        });
+        let forget: Vec<InvKey> = self
+            .invs
+            .iter()
+            .filter(|(key, s)| {
+                let done = s.header.state() == InvState::Closed
+                    || Day::from_ms(s.header.last_seen_ms) < yesterday;
+                done && self.idle(key, s)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in forget {
+            self.invs.remove(&key);
+        }
+    }
+
+    /// Forgets the idle invocation seen longest ago, to make room for a new one.
+    /// Returns whether one was.
+    fn evict_one(&mut self) -> bool {
+        let oldest = self
+            .invs
+            .iter()
+            .filter(|(key, s)| self.idle(key, s))
+            .min_by_key(|(_, s)| s.header.last_seen_ms)
+            .map(|(key, _)| key.clone());
+        let Some(key) = oldest else {
+            return false;
+        };
+        self.invs.remove(&key);
+        true
+    }
+
+    /// Reads the stored headers of up to [`Limits::header_reads_per_step`] invocations
+    /// opened since, merging each with what this writer added. A failed read leaves the
+    /// rest for the next step: the index is not answering.
+    fn read_headers(&mut self) {
+        let unread: Vec<InvKey> = self
+            .invs
+            .iter()
+            .filter(|(_, s)| s.unread)
+            .map(|(key, _)| key.clone())
+            .take(self.limits.header_reads_per_step)
+            .collect();
+        for key in unread {
+            let Ok(stored) = self.index.get(&rows::invid(&key)) else {
+                return;
+            };
+            let stored = stored.and_then(|v| InvocationHeader::decode(v.value.as_slice()).ok());
+            let state = self.state(&key);
+            if let Some(stored) = stored {
+                state.header = merge(stored, &state.header);
+            }
+            state.unread = false;
+            if std::mem::take(&mut state.held) {
+                let value = state.header.encode_to_vec();
+                self.queue_row(rows::invid(&key), value, Cond::Any, None);
+            }
+        }
+    }
+
+    /// Queues `inv`'s header row, or holds it back until its stored header is read.
+    fn write_header(&mut self, inv: &InvKey, origin: Option<KeptObject>) {
+        let state = self.state(inv);
+        if state.unread {
+            state.held = true;
+            return;
+        }
+        let value = state.header.encode_to_vec();
+        self.queue_row(rows::invid(inv), value, Cond::Any, origin);
     }
 
     /// How many kept objects to read back this step: none while rows are pending or
@@ -325,26 +423,29 @@ impl Core {
         }
     }
 
-    /// The writer's state for `inv`, made on first sight. A restarted frontend continues
-    /// the header a previous life wrote; a failed read starts a fresh header.
-    fn open(&mut self, inv: &InvRef) -> &mut Inv {
-        let index = &self.index;
-        self.invs.entry(inv.key.clone()).or_insert_with(|| {
-            let header = index
-                .get(&rows::invid(&inv.key))
-                .ok()
-                .flatten()
-                .and_then(|v| InvocationHeader::decode(v.value.as_slice()).ok())
-                .unwrap_or_else(|| InvocationHeader {
-                    record_id: inv.record_id.clone().unwrap_or_default(),
-                    idless: inv.record_id.is_none(),
-                    ..InvocationHeader::default()
-                });
-            Inv {
-                header,
-                ..Inv::default()
-            }
-        })
+    /// Makes the writer's state for `inv` on first sight, with its stored header still
+    /// to read (a restarted frontend continues the header a previous life wrote).
+    /// Returns whether the writer holds it: at [`Limits::invocations`] with none idle,
+    /// a new invocation is refused.
+    fn open(&mut self, inv: &InvRef) -> bool {
+        if self.invs.contains_key(&inv.key) {
+            return true;
+        }
+        if self.invs.len() >= self.limits.invocations && !self.evict_one() {
+            return false;
+        }
+        let header = InvocationHeader {
+            record_id: inv.record_id.clone().unwrap_or_default(),
+            idless: inv.record_id.is_none(),
+            ..InvocationHeader::default()
+        };
+        let state = Inv {
+            header,
+            unread: true,
+            ..Inv::default()
+        };
+        self.invs.insert(inv.key.clone(), state);
+        true
     }
 
     /// The writer's state for an invocation it has already opened.
@@ -353,6 +454,13 @@ impl Core {
     }
 
     fn ingest(&mut self, event: Event, now_ms: u64) {
+        let inv = match &event {
+            Event::Run { inv, .. } | Event::Hit { inv, .. } | Event::Close { inv } => inv,
+        };
+        if !self.open(inv) {
+            self.drops.invocations += 1;
+            return;
+        }
         match event {
             Event::Run {
                 inv,
@@ -362,7 +470,7 @@ impl Core {
             } => {
                 let day = Day::from_ms(record.time_ms);
                 self.break_if(&inv, day, Some(record.stream), now_ms);
-                let state = self.open(&inv);
+                let state = self.state(&inv.key);
                 note(&mut state.header, &record.instance, record.time_ms);
                 state.header.runs += 1;
                 state.header.failed += u64::from(record.failed());
@@ -386,7 +494,7 @@ impl Core {
             Event::Hit { inv, mut record } => {
                 let day = Day::from_ms(record.time_ms);
                 self.break_if(&inv, day, None, now_ms);
-                let state = self.open(&inv);
+                let state = self.state(&inv.key);
                 note(&mut state.header, &record.instance, record.time_ms);
                 state.header.hits += 1;
                 let b = start(&mut state.building, day, now_ms);
@@ -398,13 +506,12 @@ impl Core {
             }
             Event::Close { inv } => {
                 self.minter.close(&inv.key);
-                let state = self.open(&inv);
+                let state = self.state(&inv.key);
                 state.header.state = InvState::Closed.into();
                 if state.building.records() > 0 {
                     self.cut(&inv.key, now_ms);
                 } else {
-                    let value = state.header.encode_to_vec();
-                    self.queue_row(rows::invid(&inv.key), value, Cond::Any, None);
+                    self.write_header(&inv.key, None);
                 }
             }
         }
@@ -412,7 +519,7 @@ impl Core {
 
     /// Cuts `inv`'s chunk if a record of `day` and `stream` cannot join it.
     fn break_if(&mut self, inv: &InvRef, day: Day, stream: Option<u32>, now_ms: u64) {
-        if self.open(inv).building.breaks_on(day, stream) {
+        if self.state(&inv.key).building.breaks_on(day, stream) {
             self.cut(&inv.key, now_ms);
         }
     }
@@ -576,7 +683,6 @@ impl Core {
         let state = self.state(&cut.inv);
         state.header.chunks += 1;
         state.header.last_chunk_ms = now_ms;
-        let header = state.header.encode_to_vec();
         if cut.row.runs > 0 {
             let value = StreamRow {
                 inv_key: cut.inv.as_str().to_owned(),
@@ -598,7 +704,7 @@ impl Core {
             Cond::Absent,
             Some(origin.clone()),
         );
-        self.queue_row(rows::invid(&cut.inv), header, Cond::Any, Some(origin));
+        self.write_header(&cut.inv, Some(origin));
         None
     }
 
@@ -763,13 +869,43 @@ fn start(b: &mut Building, day: Day, now_ms: u64) -> &mut Building {
 /// it if it was closed.
 fn note(h: &mut InvocationHeader, instance: &str, time_ms: u64) {
     h.state = InvState::Open.into();
+    add_instance(h, instance);
+    h.first_seen_ms = earliest(h.first_seen_ms, time_ms);
+    h.last_seen_ms = h.last_seen_ms.max(time_ms);
+}
+
+fn add_instance(h: &mut InvocationHeader, instance: &str) {
     if let Err(at) = h.instances.binary_search_by(|i| i.as_str().cmp(instance)) {
         h.instances.insert(at, instance.to_owned());
     }
-    if h.first_seen_ms == 0 || time_ms < h.first_seen_ms {
-        h.first_seen_ms = time_ms;
+}
+
+/// The earlier of two times, where 0 is "none yet".
+fn earliest(a: u64, b: u64) -> u64 {
+    match (a, b) {
+        (0, t) | (t, 0) => t,
+        (a, b) => a.min(b),
     }
-    h.last_seen_ms = h.last_seen_ms.max(time_ms);
+}
+
+/// The stored header with what a writer added since it opened the invocation (`added`,
+/// counted from zero): counts summed, instances joined, the time span widened, and
+/// the state the writer saw last.
+fn merge(stored: InvocationHeader, added: &InvocationHeader) -> InvocationHeader {
+    let mut h = stored;
+    for i in &added.instances {
+        add_instance(&mut h, i);
+    }
+    h.runs += added.runs;
+    h.hits += added.hits;
+    h.failed += added.failed;
+    h.dropped += added.dropped;
+    h.chunks += added.chunks;
+    h.first_seen_ms = earliest(h.first_seen_ms, added.first_seen_ms);
+    h.last_seen_ms = h.last_seen_ms.max(added.last_seen_ms);
+    h.last_chunk_ms = h.last_chunk_ms.max(added.last_chunk_ms);
+    h.state = added.state;
+    h
 }
 
 /// Puts `record` among the [`SLOWEST`] runs of `list` by `us`, slowest first.
@@ -789,61 +925,5 @@ fn rank(list: &mut Vec<Slow>, record: &RunRecord, us: u64) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_slowest_list_keeps_the_top_twenty_slowest_first() {
-        // Catches: a list that grows without bound, keeps the fastest, or puts a tie
-        // ahead of an earlier run of the same time.
-        let mut list = Vec::new();
-        for us in 0..30u64 {
-            let r = RunRecord {
-                seq: us as u32,
-                ..RunRecord::default()
-            };
-            rank(&mut list, &r, us % 25);
-        }
-        assert_eq!(list.len(), SLOWEST);
-        let times: Vec<u64> = list.iter().map(|s| s.us).collect();
-        assert_eq!(times[..3], [24, 23, 22]);
-        assert!(times.windows(2).all(|w| w[0] >= w[1]));
-        let r = RunRecord::default();
-        rank(&mut list, &r, 0);
-        assert!(
-            list.iter().all(|s| s.us >= 5),
-            "a run faster than every kept one stays out"
-        );
-    }
-
-    #[test]
-    fn a_header_notes_instances_once_sorted_and_the_time_span() {
-        // Catches: an instance listed twice (an all-must-allow check would ask twice),
-        // or a first-seen time that a later, earlier-stamped record does not move.
-        let mut h = InvocationHeader::default();
-        note(&mut h, "b", 20);
-        note(&mut h, "a", 30);
-        note(&mut h, "b", 10);
-        assert_eq!(h.instances, ["a", "b"]);
-        assert_eq!((h.first_seen_ms, h.last_seen_ms), (10, 30));
-    }
-
-    #[test]
-    fn a_chunk_breaks_on_a_new_day_or_stream_but_not_for_hits() {
-        // Catches: two streams in one chunk (the block index would find the wrong run)
-        // or a chunk spanning two days (its key carries one).
-        let d1 = Day::from_number(20_261_016);
-        let d2 = Day::from_number(20_261_017);
-        let empty = Building::default();
-        assert!(!empty.breaks_on(d1, Some(1)));
-        let b = Building {
-            day: Some(d1),
-            stream: Some(1),
-            ..Building::default()
-        };
-        assert!(!b.breaks_on(d1, Some(1)));
-        assert!(!b.breaks_on(d1, None));
-        assert!(b.breaks_on(d1, Some(2)));
-        assert!(b.breaks_on(d2, None));
-    }
-}
+#[path = "writer_tests.rs"]
+mod tests;

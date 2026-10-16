@@ -547,14 +547,27 @@ fn a_restarted_writer_continues_the_header_and_reopens_a_closed_invocation() {
         (3, 1, 2)
     );
 
-    // A header that cannot be read starts afresh: the index is down, not the history.
+    // A header that cannot be read is read again: the stored one is never replaced by
+    // a fresh count, and what the writer added meanwhile is merged into it.
     let mut third = Life::start(&objects, &index, 3, Limits::default());
     index.fail_gets.store(true, Ordering::SeqCst);
     third.run(&inv, T + 20, "c", RunOutcome::Ok);
     third.step(T + 20);
-    index.fail_gets.store(false, Ordering::SeqCst);
     third.step(T + 140_000);
-    assert_eq!(header(&third, &inv).runs, 1);
+    assert_eq!(chunks(&objects).len(), 3, "the chunk is written meanwhile");
+    assert_eq!(
+        header(&third, &inv).runs,
+        3,
+        "the stored header is untouched"
+    );
+    index.fail_gets.store(false, Ordering::SeqCst);
+    third.step(T + 140_001);
+    third.step(T + 140_002);
+    let h = header(&third, &inv);
+    assert_eq!((h.runs, h.failed, h.chunks), (4, 1, 3));
+    assert_eq!(h.instances, ["a", "b", "c"]);
+    assert_eq!(h.first_seen_ms, T);
+    assert_eq!(h.state(), kbf_history::records::InvState::Open);
 }
 
 #[test]
@@ -940,4 +953,100 @@ fn a_stream_row_is_keyed_by_the_stream_open_time_whatever_order_events_arrive() 
         let got = futures::executor::block_on(reader.run(r.run_id(), &all)).unwrap();
         assert_eq!(got.map(|v| v.run).as_ref(), Some(r), "{}", r.run_id());
     }
+}
+
+#[test]
+fn stored_headers_are_read_a_bounded_number_a_step() {
+    // Catches: one blocking index read per new invocation inside the drain, so a queue
+    // full of distinct client ids becomes that many reads in one step.
+    let limits = Limits {
+        header_reads_per_step: 1,
+        ..Limits::default()
+    };
+    let mut life = Life::fresh(limits);
+    for n in 0..3 {
+        let inv = InvRef::named(&format!("b{n}"));
+        life.run(&inv, T, "main", RunOutcome::Ok);
+        life.close(&inv);
+    }
+    let mut reads = Vec::new();
+    for t in 0..4 {
+        let before = life.index.gets.load(Ordering::SeqCst);
+        life.step(T + t);
+        reads.push(life.index.gets.load(Ordering::SeqCst) - before);
+    }
+    assert_eq!(reads, [1, 1, 1, 0]);
+    assert_eq!(
+        life.index.keys(INVID).len(),
+        3,
+        "each header written once read"
+    );
+    assert_eq!(life.writer.open_invocations(), 0);
+}
+
+#[test]
+fn open_invocations_are_bounded_forgetting_idle_ones_first() {
+    // Catches: per-invocation state bounded only by client input (every fresh id held
+    // until it closes or the day ends), an idle invocation kept while a new one is
+    // refused, and a refusal that is not counted.
+    let limits = Limits {
+        invocations: 2,
+        ..Limits::default()
+    };
+    let mut life = Life::fresh(limits);
+    let idle = InvRef::named("idle");
+    let busy = InvRef::named("busy");
+    life.run(&idle, T, "main", RunOutcome::Ok);
+    life.step(T);
+    life.step(T + 120_000); // written and applied: open, but idle
+    life.run(&busy, T + 120_000, "main", RunOutcome::Ok);
+    life.step(T + 120_000);
+    assert_eq!(life.writer.open_invocations(), 2);
+    let fresh = InvRef::named("fresh");
+    life.run(&fresh, T + 120_001, "main", RunOutcome::Ok);
+    life.step(T + 120_001);
+    assert_eq!(life.writer.open_invocations(), 2, "the idle one made room");
+    assert_eq!(life.writer.drops().invocations, 0);
+    // Both held invocations have records buffered: a fourth is refused and counted.
+    let refused = InvRef::named("refused");
+    life.run(&refused, T + 120_002, "main", RunOutcome::Ok);
+    life.close(&refused);
+    life.step(T + 120_002);
+    assert_eq!(life.writer.drops().invocations, 2, "its run and its close");
+    assert_eq!(life.writer.open_invocations(), 2);
+    // The forgotten invocation continues its stored header when it is seen again.
+    life.close(&busy);
+    life.close(&fresh);
+    life.step(T + 120_003);
+    life.run(&idle, T + 120_004, "main", RunOutcome::Ok);
+    life.close(&idle);
+    life.drain(T + 120_004, 5);
+    let h = header(&life, &idle);
+    assert_eq!((h.runs, h.chunks), (2, 2));
+    assert!(
+        life.index
+            .inner
+            .get(&format!("{INVID}{}", refused.key))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn a_closed_invocation_whose_header_row_is_pending_is_not_forgotten() {
+    // Catches: an invocation forgotten while its header row still waits in the pending
+    // rows; a late record would reload the older header from the index and its write
+    // would replace the pending one, losing the counts it held.
+    let limits = Limits {
+        txns_per_step: 0,
+        ..Limits::default()
+    };
+    let mut life = Life::fresh(limits);
+    let inv = InvRef::named("b1");
+    life.run(&inv, T, "main", RunOutcome::Ok);
+    life.close(&inv);
+    life.step(T);
+    assert_eq!(life.writer.unwritten_chunks(), 0);
+    assert_eq!(life.writer.pending_rows(), 3);
+    assert_eq!(life.writer.open_invocations(), 1);
 }

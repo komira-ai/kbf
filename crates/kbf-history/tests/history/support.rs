@@ -188,6 +188,7 @@ pub struct Index {
     /// Answer a counter increment with no counter value.
     pub empty_counters: AtomicBool,
     pub txns: AtomicU64,
+    pub gets: AtomicU64,
 }
 
 impl Index {
@@ -200,6 +201,7 @@ impl Index {
             fail_gets: AtomicBool::new(false),
             empty_counters: AtomicBool::new(false),
             txns: AtomicU64::new(0),
+            gets: AtomicU64::new(0),
         })
     }
 
@@ -257,6 +259,7 @@ impl Store for Index {
     }
 
     fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
         if self.fail_gets.load(Ordering::SeqCst) {
             return Err(failed("get"));
         }
