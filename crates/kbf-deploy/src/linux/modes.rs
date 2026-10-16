@@ -40,9 +40,14 @@
 //! - `storage`: the `storage` unit gives its cold store, metadata directory, listen
 //!   address and the three certificate flags, and an `s3://` cold store comes with the
 //!   key file ([`super::stores`]).
-//! - `state-store`: no directive holds a Postgres URI with a password, and a
-//!   `--state-store=${VAR}` has an `EnvironmentFile=` to set it ([`super::stores`]; a
-//!   `WARN state-store:` line says the expanded value is still in kbf's argv).
+//! - `state-store`: no directive holds a Postgres URI with a password, `--state-store`
+//!   names no variable (systemd would expand it into kbf's argv), and a Postgres
+//!   `--state-store` comes with `--state-store-password-file`, an absolute path or a
+//!   `%d/<name>` credential the unit loads ([`super::stores`]).
+//! - `ports`: no two of the unit's listeners share a port ([`super::stores`]).
+//! - `stop`: a mode that drains on SIGTERM (`frontend`, `all-in-one`) has
+//!   `TimeoutStopSec=infinity` and `KillSignal=SIGTERM`, so systemd never kills it
+//!   mid-drain and fails the builds in flight ([`super::stop`]).
 //!
 //! [`check_on_host`] adds the rules that read the host, and reads `kbf.slice`:
 //!
@@ -60,8 +65,8 @@
 //!   on the slice every controller a unit under it delegates, unless the slice's
 //!   `DisableControllers=` lists it). `credential` also reads the files the unit's
 //!   `EnvironmentFile=` lines name, and for `storage` that each key file is root's or
-//!   the unit's user's with no group or other bit. `state-store` also reads the files
-//!   that set the variable `--state-store` names: none has a group or other bit.
+//!   the unit's user's with no group or other bit. `state-store` also reads the
+//!   password file: a plain file of the unit's user with no group or other bit.
 //!
 //! `all-in-one` passes with a `WARN trusted:` line: its builds run beside the farm's
 //! state and its cold store, as one user. The container driver runs each action as a
@@ -82,10 +87,11 @@ use kbf_host::exec::Exec;
 use kbf_host::path::HostPath;
 use kbf_host::step::Cmd;
 
+use super::Refusal;
 use super::check::{Failure, Report, angle_placeholder};
 use super::config::LinuxConfig;
 use super::render::{SLICE, values};
-use super::{cpuset, credential, stores};
+use super::{cpuset, credential, stop, stores};
 use crate::template::{self, TemplateError, leftovers};
 use crate::unit::{UnitError, UnitFile, comments_in_continuations};
 
@@ -146,6 +152,12 @@ impl Mode {
         matches!(self, Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne)
     }
 
+    /// Whether the mode runs a frontend, which drains on SIGTERM (rule `stop`).
+    #[must_use]
+    pub fn drains(self) -> bool {
+        matches!(self, Mode::Frontend | Mode::AllInOne)
+    }
+
     /// Whether the mode runs builds without a storage half that reads the cold store's
     /// key today (rule `credential`): `all-in-one`'s cold store is a `file://`
     /// directory, and `storage-and-daemon` gets the key once its storage half's uid is
@@ -189,12 +201,13 @@ impl fmt::Display for Mode {
 
 /// The unit of `mode`, rendered with `config` (the values `render-units` renders the
 /// converged units with); `kbf_uid` as there.
-pub fn render(
-    config: &LinuxConfig,
-    kbf_uid: Option<u32>,
-    mode: Mode,
-) -> Result<String, TemplateError> {
-    render_template(config, kbf_uid, mode, mode.template())
+///
+/// # Errors
+/// Settings `mode` needs left out ([`LinuxConfig::for_mode`]), or a placeholder with no
+/// value.
+pub fn render(config: &LinuxConfig, kbf_uid: Option<u32>, mode: Mode) -> Result<String, Refusal> {
+    config.for_mode(mode)?;
+    Ok(render_template(config, kbf_uid, mode, mode.template())?)
 }
 
 /// [`render`] with another template, for the tests that plant a defect in one.
@@ -257,9 +270,10 @@ pub fn check(
 ) -> Result<Report, UnitError> {
     let files = UnitText::new(mode.unit_name(), text);
     let unit = UnitFile::parse(text)?;
-    let mut r = report(mode, rules(config, mode, &files, &unit, installable));
-    r.notes.extend(stores::state_store(&unit).1);
-    Ok(r)
+    Ok(report(
+        mode,
+        rules(config, mode, &files, &unit, installable),
+    ))
 }
 
 /// [`check`] on `unit` and its drop-ins, `kbf.slice` (`slice`, with its drop-ins), and
@@ -321,7 +335,6 @@ pub fn check_on_host<E: Exec>(
         fail("state-store", format!("{name}: {how}"));
     }
     notes.extend(found.notes);
-    notes.extend(stores::state_store(&merged).1);
     let argv = merged.exec_start();
     if mode.is_built() && runs_this_mode(config, mode, &argv) {
         let found = match kbf_bin {
@@ -601,8 +614,20 @@ fn rules(
     }
 
     // state-store
-    for how in stores::state_store(unit).0 {
+    for how in stores::state_store(unit) {
         fail("state-store", format!("{name}: {how}"));
+    }
+
+    // ports
+    for how in stores::ports(unit) {
+        fail("ports", format!("{name}: {how}"));
+    }
+
+    // stop
+    if mode.drains() {
+        for how in stop::check(unit) {
+            fail("stop", format!("{name} {how}"));
+        }
     }
     failures
 }

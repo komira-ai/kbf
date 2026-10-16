@@ -42,6 +42,7 @@ struct Row {
 const ALL: &[Mode] = &Mode::ALL;
 const BUILDS: &[Mode] = &[Mode::Daemon, Mode::StorageAndDaemon, Mode::AllInOne];
 const UNBUILT: &[Mode] = &[Mode::Frontend, Mode::StorageAndDaemon];
+const DRAINS: &[Mode] = &[Mode::Frontend, Mode::AllInOne];
 
 fn rows() -> Vec<Row> {
     vec![
@@ -133,6 +134,17 @@ fn rows() -> Vec<Row> {
             },
             fails: ALL,
         },
+        // A drain cut short: a finite stop timeout, or a signal kbf does not drain on.
+        Row {
+            rule: "stop",
+            plant: |_, t| last_in_service(t, "TimeoutStopSec=90"),
+            fails: DRAINS,
+        },
+        Row {
+            rule: "stop",
+            plant: |_, t| last_in_service(t, "KillSignal=SIGKILL"),
+            fails: DRAINS,
+        },
     ]
 }
 
@@ -185,7 +197,7 @@ fn file(bits: u32, uid: u32, text: &str) -> Entry {
     }
 }
 
-/// A node with kbf installed, a key file `key` and a state store file `state`; kbf
+/// A node with kbf installed, a key file `key` and a state store password file `state`; kbf
 /// refuses every command line (`check-args` exits 2) and `getent passwd kbf-server` is
 /// uid 990.
 fn node(key: Entry, state: Entry) -> FakeExec {
@@ -194,7 +206,8 @@ fn node(key: Entry, state: Entry) -> FakeExec {
     exec.entries
         .insert(at("/usr/local/bin/kbf"), file(0o755, 0, ""));
     exec.entries.insert(at("/etc/kbf/s3.env"), key);
-    exec.entries.insert(at("/etc/kbf/state-store.env"), state);
+    exec.entries
+        .insert(at("/etc/kbf/state-store.password"), state);
     let asked = RefCell::new(Vec::new());
     exec.answer = Box::new(move |cmd: &Cmd| {
         asked.borrow_mut().push(cmd.to_string());
@@ -211,21 +224,22 @@ fn node(key: Entry, state: Entry) -> FakeExec {
     exec
 }
 
-/// `text`, the unit of `mode`, naming the state store by a variable a file sets.
-fn state_by_variable(mode: Mode, text: &str) -> String {
-    let named = text.replacen(
+/// `text`, the unit of `mode`, with a Postgres state store and its password file.
+fn state_in_postgres(mode: Mode, text: &str) -> String {
+    text.replacen(
         &format!("/kbf {mode}"),
-        &format!("/kbf {mode} --state-store=${{KBF_STATE_STORE}}"),
+        &format!(
+            "/kbf {mode} --state-store=postgres://kbf@db/kbf --state-store-password-file=/etc/kbf/state-store.password"
+        ),
         1,
-    );
-    first_in_service(&named, "EnvironmentFile=/etc/kbf/state-store.env")
+    )
 }
 
 /// The rules that read the node, per mode: `parse` runs kbf only for a built mode;
 /// `credential` reads the key file's owner and mode only for the unit that holds it
 /// (a 0644 key or one another user owns fails storage, and only storage);
-/// `state-store` reads the mode of the file that sets `--state-store`'s variable in
-/// every mode. Catches each of these run on the wrong modes or on none.
+/// `state-store` reads the mode of the state store's password file in every mode.
+/// Catches each of these run on the wrong modes or on none.
 #[test]
 fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
     let c = config();
@@ -235,7 +249,7 @@ fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
             .expect("renders")
             .slice,
     );
-    let state = "KBF_STATE_STORE=postgres://kbf:pw@db/kbf\n";
+    let state = "pw\n";
     let cases: [(&str, Entry, Entry, &[Mode]); 4] = [
         (
             "parse",
@@ -258,7 +272,7 @@ fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
         (
             "state-store",
             file(0o600, 990, ""),
-            file(0o644, 0, state),
+            file(0o644, 990, state),
             ALL,
         ),
     ];
@@ -268,7 +282,7 @@ fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
         for mode in Mode::ALL {
             let text = render(&c, Some(1500), mode).expect("renders");
             let text = if rule == "state-store" {
-                state_by_variable(mode, &text)
+                state_in_postgres(mode, &text)
             } else {
                 text
             };

@@ -19,12 +19,20 @@ CPUWeight=300
 # TODO: the frontend's flags, once `kbf frontend` has them: its listen addresses,
 # the certificate flags, and the state store. The state store defaults to a SQLite file
 # beside the frontend's data, --state-store=sqlite://@KBF_DATA_DIR@/state.db (a single
-# frontend). A Postgres URI carries a password, so it never goes in this file or on the
-# command line: it comes from an EnvironmentFile= of mode 0600 (check-units rule
-# `state-store`).
+# frontend). A Postgres store is a postgres:// URI of a user, a host and a database,
+# with no password in it, and --state-store-password-file=@KBF_ETC@/state-store.password,
+# a file of mode 0600 that is @KBF_SERVER_USER@'s (or %d/NAME with LoadCredential=NAME:FILE):
+# this file and the command line are readable by every user, and systemd expands an
+# ${VAR} into the command line (check-units rule `state-store`).
 # TODO(registration): the frontend's DNS name, the one address clients, daemons and
 # storage nodes know, and the storage map it pushes to them.
 ExecStart=@KBF_BIN_DIR@/kbf frontend
+# kbf drains on SIGTERM: it refuses new builds and keeps every open Execute stream
+# until its action is done, with no deadline (--shutdown-timeout-secs 0). A stop that
+# ends sooner fails every build in flight, so systemd sends SIGTERM and never kills it
+# for taking long (check-units rule `stop`).
+KillSignal=SIGTERM
+TimeoutStopSec=infinity
 Restart=on-failure
 # Exit 2 is a command line kbf refused (or a mode not built yet): a restart cannot fix it.
 RestartPreventExitStatus=2
