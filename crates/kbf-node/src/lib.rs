@@ -840,7 +840,7 @@ mod container {
             LeasePlacement::NumaNode => {
                 // The memory the scheduler books on this node (the report's `mem_gib`):
                 // a lease that asks for all of it is the whole host's and is not pinned.
-                let whole_host = super::offered(NodeReport::detect(&[])?, capacity).mem_bytes();
+                let whole_host = super::offered(kbf_daemon::NodeReport::detect(&[])?, capacity).mem_bytes();
                 kbf_driver_container::numa::start(&cli.numa_dir, mount, &parent, whole_host)?
             }
         };
