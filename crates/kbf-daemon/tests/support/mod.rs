@@ -191,6 +191,23 @@ impl Peer {
         }));
     }
 
+    /// A message with no content, as a server newer than the daemon might send.
+    pub fn send_empty(&self) {
+        let guard = self.outbound.lock().expect("outbound lock");
+        let tx = guard.as_ref().expect("session is open");
+        tx.send(Ok(ServerMessage { message: None }))
+            .expect("the stream is open");
+    }
+
+    /// A lease offer that names no lease.
+    pub fn offer_without_lease(&self) {
+        self.send(server_message::Message::LeaseOffer(LeaseOffer {
+            lease_id: None,
+            kind: "action".to_owned(),
+            action_digest: Some(digest()),
+        }));
+    }
+
     /// A Welcome that names no lease epoch and carries `map`.
     pub fn welcome_map(&self, map: Option<kbf_proto::kbf::map::v1::Map>) {
         self.send(server_message::Message::Welcome(Welcome {
@@ -692,6 +709,28 @@ impl<R: Runtime> Harness<R> {
             None,
             phase,
             Some((stall, above)),
+            None,
+        )
+        .await
+    }
+
+    /// Starts a server and a daemon that give a stream up when its connection, its open
+    /// or its Welcome takes longer than `within`.
+    pub async fn with_welcome_timeout(name: &str, runtime: Arc<R>, within: Duration) -> Self {
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        let configure = |config: &mut DaemonConfig| {
+            config.welcome_timeout = within;
+        };
+        Self::build_with(
+            name,
+            runtimes,
+            runtime,
+            Duration::from_secs(40),
+            configure,
+            None,
+            None,
+            None,
+            None,
             None,
         )
         .await
