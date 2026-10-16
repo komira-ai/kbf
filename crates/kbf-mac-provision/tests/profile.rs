@@ -783,3 +783,92 @@ fn the_pool_volume_and_daemon_settings_are_accepted_and_printed() {
     });
     assert_eq!(refusal(&below), "accepted", "a pool below lease_uids");
 }
+
+/// The test profile with `kbf_data_dir` spelled with its old name, `kbf_scratch`.
+fn with_old_key() -> String {
+    edited(replace("kbf_data_dir=", "kbf_scratch="))
+}
+
+/// The daemon's arguments without the node label (it holds the profile's SHA-256, which
+/// differs when the file's bytes do).
+fn args_without_node_label(p: &Profile) -> Vec<String> {
+    let label = p.node_label();
+    kbf_mac_provision::launchd::daemon_args(p)
+        .into_iter()
+        .filter(|a| *a != label)
+        .collect()
+}
+
+/// Catches: the profile's `kbf_data_dir` not rendered as the daemon's `--data-dir`, or
+/// rendered with the removed `--scratch` or `--cache-dir` (the daemon refuses both).
+#[test]
+fn kbf_data_dir_renders_data_dir_and_no_removed_flag() {
+    let p = Profile::parse(edited(|_| {}).as_bytes()).unwrap();
+    assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    let args = kbf_mac_provision::launchd::daemon_args(&p);
+    let at = args.iter().position(|a| a == "--data-dir").unwrap();
+    assert_eq!(args[at + 1], "/Volumes/kbf/data");
+    let plist = kbf_mac_provision::launchd::render_plist(&p);
+    for removed in ["--scratch", "--cache-dir", "--cache-", "--tree-"] {
+        assert!(!plist.contains(removed), "{removed} in\n{plist}");
+    }
+}
+
+/// Catches: the old key `kbf_scratch` refused (a profile written before the rename
+/// would stop provisioning), accepted without a warning, or not treated as
+/// `kbf_data_dir` (the daemon would run without `--data-dir`).
+#[test]
+fn the_old_key_is_accepted_with_a_warning_and_renders_the_same() {
+    let new = Profile::parse(edited(|_| {}).as_bytes()).unwrap();
+    let old = Profile::parse(with_old_key().as_bytes()).unwrap();
+    assert_eq!(old.get("kbf_data_dir"), "/Volumes/kbf/data");
+    assert_eq!(old.warnings.len(), 1, "{:?}", old.warnings);
+    assert!(
+        old.warnings[0].contains("kbf_scratch is deprecated, use kbf_data_dir"),
+        "{}",
+        old.warnings[0]
+    );
+    assert_eq!(args_without_node_label(&old), args_without_node_label(&new));
+    assert!(!kbf_mac_provision::launchd::render_plist(&old).contains("--scratch"));
+}
+
+/// Catches: a profile with both `kbf_scratch` and `kbf_data_dir` accepted (which one
+/// wins would be a guess), in either order, or refused without naming both keys.
+#[test]
+fn both_the_old_and_the_new_key_are_refused() {
+    let old_after = edited(append("kbf_scratch=/Volumes/kbf/other"));
+    let old_first = edited(|l| {
+        let at = l
+            .iter()
+            .position(|x| x.starts_with("kbf_data_dir="))
+            .unwrap();
+        l.insert(at, "kbf_scratch=/Volumes/kbf/other".to_owned());
+    });
+    for (name, text) in [("old after new", old_after), ("old before new", old_first)] {
+        let said = refusal(&text);
+        assert!(
+            said.contains("kbf_scratch and kbf_data_dir are both set")
+                && said.contains("keep only kbf_data_dir"),
+            "{name}: {said}"
+        );
+    }
+}
+
+/// Catches: the old key given twice reported as anything but a repeated key.
+#[test]
+fn the_old_key_twice_is_a_duplicate() {
+    let text = format!("{}kbf_scratch=/Volumes/kbf/x\n", with_old_key());
+    assert_eq!(
+        refusal(&text),
+        "profile line 42: duplicate key: kbf_scratch"
+    );
+}
+
+/// Catches: a profile with neither key accepted (the daemon would get no data dir).
+#[test]
+fn neither_data_dir_key_is_missing_key() {
+    assert_eq!(
+        refusal(&edited(drop_keys(&["kbf_data_dir"]))),
+        "missing key: kbf_data_dir"
+    );
+}
