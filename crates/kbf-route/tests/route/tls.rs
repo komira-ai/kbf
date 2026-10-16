@@ -246,14 +246,15 @@ async fn a_member_that_cannot_be_dialled_is_an_internal_error() {
 
 /// How long a test waits for a call that should have failed over before it calls the call
 /// stuck. Not a speed: the calls under test come back in a fraction of it.
-const STUCK: Duration = Duration::from_secs(30);
+const STUCK: Duration = Duration::from_secs(10);
 
-/// Liveness short enough that a test need not wait for the defaults.
+/// Liveness short enough that a test need not wait for the defaults, and long enough that a
+/// healthy node on a busy machine is not given up on.
 fn quick() -> Liveness {
     Liveness {
-        connect: Duration::from_millis(200),
-        keepalive_interval: Duration::from_millis(100),
-        keepalive_timeout: Duration::from_millis(100),
+        connect: Duration::from_secs(1),
+        keepalive_interval: Duration::from_millis(500),
+        keepalive_timeout: Duration::from_millis(500),
     }
 }
 

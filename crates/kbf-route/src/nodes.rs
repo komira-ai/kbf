@@ -38,7 +38,7 @@ pub trait Nodes: Send + Sync {
 pub struct Liveness {
     /// How long dialling may take, for the TCP connection and for the TLS handshake each.
     pub connect: Duration,
-    /// How often a connection is pinged (HTTP/2 PING), while it is in use and while idle.
+    /// How often a connection with a call on it is pinged (HTTP/2 PING).
     pub keepalive_interval: Duration,
     /// How long a ping may go unanswered before the connection is dropped and the calls
     /// on it fail.
@@ -103,9 +103,12 @@ impl TlsNodes {
             .map_err(|e| bad(member, "its address is not a host and port", &e))?;
         // No domain name is set: tonic then verifies the certificate against the host of
         // the endpoint's URI, which is the host of this member's address.
-        let _ = self.liveness;
+        let live = self.liveness;
         let channel = endpoint
-            .tls_config(self.tls.clone())
+            .connect_timeout(live.connect)
+            .http2_keep_alive_interval(live.keepalive_interval)
+            .keep_alive_timeout(live.keepalive_timeout)
+            .tls_config(self.tls.clone().timeout(live.connect))
             .map_err(|e| bad(member, "its TLS configuration is not usable", &e))?
             .connect_lazy();
         channels.insert(key, channel.clone());
