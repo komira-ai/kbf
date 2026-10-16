@@ -84,7 +84,7 @@ fn check(file: &Path) -> Result<Summary, SqliteError> {
     File::open(file)?.take(100).read_to_end(&mut header)?;
     single_file(&header)?;
     let conn = Connection::open_with_flags(file, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    // MUTANT M4: the schema version not checked.
+    require_state_store(&conn)?;
     let integrity: String = conn.query_row("PRAGMA integrity_check", [], first_string)?;
     if integrity != "ok" {
         return Err(SqliteError::NotAStateStore(format!(

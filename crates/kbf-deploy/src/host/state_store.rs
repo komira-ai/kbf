@@ -355,8 +355,7 @@ fn hold(db: &Path, apply: bool) -> Result<Option<StoreLock>, StateFileError> {
             Err(error) => return Err(StateFileError::Store(error)),
         }
     } else {
-        // MUTANT M2: the dry run's lock probe ignored.
-        StoreLock::is_held(db).map_err(StateFileError::Store)? && apply
+        StoreLock::is_held(db).map_err(StateFileError::Store)?
     };
     if held {
         return Err(StateFileError::InUse(db.to_owned()));
@@ -399,8 +398,7 @@ fn execute(lock: &StoreLock, src: &Path, plan: &Plan) -> Result<u64, StateFileEr
     chown(&lock_file, Some(uid), Some(gid)).map_err(io_at("chown", &lock_file))?;
     if let Some(keep) = &plan.keep {
         copy_new(db, keep, plan)?;
-        // MUTANT M6: the log beside the current file is not kept.
-        if plan.wal && db.as_os_str().is_empty() {
+        if plan.wal {
             copy_new(&beside(db, "-wal"), &beside(keep, "-wal"), plan)?;
         }
         sync_dir(keep)?;
