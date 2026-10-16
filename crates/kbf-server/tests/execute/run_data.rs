@@ -234,7 +234,11 @@ async fn node_pressure_kills(cell: Cell) {
         let run = attempt.run.as_deref().expect("a run");
         assert_eq!(run.booked_memory_bytes, Some(GIB), "attempt {n}");
         assert_eq!(run.cap_bytes, None, "attempt {n}");
-        assert_eq!(attempt.memory_kill(), Some(Kill::NodePressure), "attempt {n}");
+        assert_eq!(
+            attempt.memory_kill(),
+            Some(Kill::NodePressure),
+            "attempt {n}"
+        );
     }
 }
 
