@@ -481,9 +481,10 @@ fn a_storage_node_has_no_state_store_flag() {
         // conflict, a bare one has no value), the refusal names the flag.
         assert!(err.to_string().contains("--state-store"), "{flag}: {err}");
     }
-    let cmd = kbf_server::storage_node::command();
-    for arg in cmd.get_arguments() {
-        assert!(!arg.get_id().as_str().contains("state"), "{}", arg.get_id());
+    // The command lists every flag of `kbf-server` to refuse it by name; none about a
+    // state store is one the node takes.
+    for id in kbf_server::storage_node::ALLOWED {
+        assert!(!id.contains("state"), "{id}");
     }
     // Every flag of kbf-server the node does not take is refused by name, so one added
     // later (a state store, say) is refused with no edit.
