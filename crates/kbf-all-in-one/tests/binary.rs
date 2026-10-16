@@ -485,3 +485,229 @@ const PASS_DONE: &str = "start-up pass over the cold store directory done";
 
 /// What a round of eviction that evicted logs (`kbf-front`'s `Cache::evict_round`).
 const EVICTED: &str = "evicted the least recently used objects";
+
+/// An input of more bytes than any chunk or buffer of the read path (a ByteStream chunk
+/// and the input cache's copy buffer are 1 MiB), none of whose 64-byte runs repeats.
+fn input_bytes() -> Vec<u8> {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    (0..(3 << 20) + 7)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[3]
+        })
+        .collect()
+}
+
+/// The farm in `dir` started with `flags`: running, with its REAPI and operator API
+/// addresses from its start line.
+fn start_farm(dir: &Path, bin: &Path, flags: &[String]) -> (Running, SocketAddr, SocketAddr) {
+    let mut child = farm(dir, bin, &image_path(bin), flags.to_vec())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let running = Running(child);
+    let line = stdout.lines().next().expect("a start line").expect("read");
+    let field = |name: &str| -> SocketAddr {
+        line.split(' ')
+            .find_map(|field| field.strip_prefix(name))
+            .unwrap_or_else(|| panic!("no {name} in {line:?}"))
+            .parse()
+            .expect("an address")
+    };
+    (running, field("reapi="), field("api="))
+}
+
+/// Runs one action whose input root holds `input` as `in/input.bin`; the action
+/// succeeds.
+fn run_with_input(reapi: SocketAddr, image: &str, input: &[u8]) {
+    let tokio = tokio::runtime::Runtime::new().expect("runtime");
+    tokio.block_on(async {
+        let channel = Endpoint::from_shared(format!("http://{reapi}"))
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect");
+        let cas = Transfers::over(channel.clone(), TransferConfig::default());
+        let file = kbf_proto::reapi::FileNode {
+            name: "input.bin".to_owned(),
+            digest: Some(put(&cas, input.to_vec()).await),
+            ..kbf_proto::reapi::FileNode::default()
+        };
+        let inner = Directory {
+            files: vec![file],
+            ..Directory::default()
+        };
+        let root = Directory {
+            directories: vec![kbf_proto::reapi::DirectoryNode {
+                name: "in".to_owned(),
+                digest: Some(put(&cas, inner.encode_to_vec()).await),
+            }],
+            ..Directory::default()
+        };
+        let command = ReapiCommand {
+            arguments: vec!["true".to_owned()],
+            ..ReapiCommand::default()
+        };
+        let action = Action {
+            command_digest: Some(put(&cas, command.encode_to_vec()).await),
+            input_root_digest: Some(put(&cas, root.encode_to_vec()).await),
+            platform: Some(Platform {
+                properties: vec![Property {
+                    name: "container-image".to_owned(),
+                    value: image.to_owned(),
+                }],
+            }),
+            ..Action::default()
+        };
+        let action = put(&cas, action.encode_to_vec()).await;
+        let result = tokio::time::timeout(PROMPT, execute(channel, action))
+            .await
+            .expect("the action ran in time");
+        assert_eq!(result.exit_code, 0, "{result:?}");
+    });
+}
+
+/// `GET /metrics` on the operator API at `api`: each sample by name.
+fn metrics(api: SocketAddr) -> std::collections::BTreeMap<String, u64> {
+    use std::io::{Read as _, Write as _};
+    let mut stream = std::net::TcpStream::connect(api).expect("connect");
+    let request = "GET /metrics HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n";
+    stream.write_all(request.as_bytes()).expect("request");
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).expect("answer");
+    let samples = answer.lines().filter(|line| !line.starts_with('#'));
+    samples
+        .filter_map(|line| {
+            let (name, value) = line.split_once(' ')?;
+            Some((name.to_owned(), value.parse().ok()?))
+        })
+        .collect()
+}
+
+/// Waits until the write tier holds no block: everything uploaded is flushed. Returns
+/// the samples then.
+fn flushed(api: SocketAddr) -> std::collections::BTreeMap<String, u64> {
+    let deadline = std::time::Instant::now() + PROMPT;
+    loop {
+        let samples = metrics(api);
+        if samples.get("kbf_write_tier_used_bytes") == Some(&0) {
+            return samples;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "not flushed: {samples:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Every file under `dirs` (recursively, not following symlinks) that holds `bytes`
+/// whole, each inode once: its path and size.
+fn files_holding(dirs: &[PathBuf], bytes: &[u8]) -> Vec<(PathBuf, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut found = std::collections::BTreeMap::new();
+    let mut todo: Vec<PathBuf> = dirs.to_vec();
+    while let Some(at) = todo.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&at) else {
+            continue;
+        };
+        if meta.is_dir() {
+            let listed = std::fs::read_dir(&at).into_iter().flatten().flatten();
+            todo.extend(listed.map(|entry| entry.path()));
+            continue;
+        }
+        if !meta.is_file() || meta.len() < bytes.len() as u64 {
+            continue;
+        }
+        let Ok(held) = std::fs::read(&at) else {
+            continue;
+        };
+        let anchor = &bytes[..64];
+        let holds = held
+            .windows(64)
+            .enumerate()
+            .filter(|(_, run)| *run == anchor)
+            .any(|(at, _)| held.get(at..at + bytes.len()) == Some(bytes));
+        if holds {
+            found
+                .entry((meta.dev(), meta.ino()))
+                .or_insert((at, meta.len()));
+        }
+    }
+    found.into_values().collect()
+}
+
+/// Asserts `input` is on the node's disk once: one inode under the hot store and the
+/// data directory holds it, the input cache's entry, of the input's size; and the one
+/// cache's fill counts it once, beside no flushed copy.
+fn on_disk_once(dir: &Path, input: &[u8], samples: &std::collections::BTreeMap<String, u64>) {
+    let digest = kbf_transfer::digest_of(input);
+    let copies = files_holding(&[dir.join("hot"), dir.join("data")], input);
+    let [(path, size)] = &copies[..] else {
+        panic!(
+            "the input is on the disk {} times: {copies:?}",
+            copies.len()
+        );
+    };
+    let name = format!("{}-{}", digest.hash, digest.size_bytes);
+    assert!(path.starts_with(dir.join("data/cache")), "{path:?}");
+    assert!(path.ends_with(&name), "{path:?}");
+    assert_eq!(*size, input.len() as u64);
+    let sample = |name: &str| {
+        *samples
+            .get(name)
+            .unwrap_or_else(|| panic!("no {name}: {samples:?}"))
+    };
+    assert_eq!(
+        sample("kbf_write_tier_flushed_copy_bytes"),
+        0,
+        "{samples:?}"
+    );
+    assert_eq!(sample("kbf_local_cache_input_bytes"), input.len() as u64);
+    assert_eq!(
+        sample("kbf_local_cache_storage_bytes"),
+        sample("kbf_write_tier_used_bytes") + sample("kbf_write_tier_flushed_copy_bytes")
+    );
+    assert_eq!(sample("kbf_local_cache_fill_bytes"), input.len() as u64);
+}
+
+/// Catches the input cache and local storage keeping two copies of a blob on one disk
+/// (the "two directories" mutant: the hot store keeps flushed copies beside the input
+/// cache's entries), a fill metric that counts a blob twice or leaves the hot store
+/// out, and a restart after a crash that rebuilds the one index with a duplicate or a
+/// leak. A client uploads an input of 3 MiB (every blob its own block on the hot
+/// store, so each is flushed at once); the action that reads it runs; once the hot
+/// store is flushed, one inode under the hot store and the data directory holds the
+/// input (the input cache's entry, which the lease linked) and `/metrics` counts it
+/// once. The process is then killed (SIGKILL) and started again, and the same action
+/// runs again: still one inode, counted once.
+#[test]
+fn an_input_is_on_the_nodes_disk_once() {
+    let dir = scratch("one-cache");
+    pki(&dir);
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("mkdir");
+    let image = podman(&bin, &["echo", "ran"]);
+    let mut flags = farm_flags(&dir, free_port());
+    flags.extend([
+        "--api-listen=127.0.0.1:0".to_owned(),
+        "--write-own-segment-bytes=1".to_owned(),
+    ]);
+    let input = input_bytes();
+    let (running, reapi, api) = start_farm(&dir, &bin, &flags);
+    run_with_input(reapi, &image, &input);
+    on_disk_once(&dir, &input, &flushed(api));
+
+    let pid = rustix::process::Pid::from_child(&running.0);
+    rustix::process::kill_process(pid, rustix::process::Signal::KILL).expect("SIGKILL");
+    drop(running);
+    let (running, reapi, api) = start_farm(&dir, &bin, &flags);
+    run_with_input(reapi, &image, &input);
+    on_disk_once(&dir, &input, &flushed(api));
+    let pid = rustix::process::Pid::from_child(&running.0);
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM).expect("SIGTERM");
+    assert!(running.wait().success());
+}

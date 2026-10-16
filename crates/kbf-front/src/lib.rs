@@ -91,7 +91,8 @@ pub use crate::described::Described;
 pub use crate::execution::{
     BOOK_CPUS_KEY, BOOK_MEM_GIB_KEY, Closer, Closing, DEFAULT_RESOURCES, Dispatch, ERROR_DOMAIN,
     ExecutionService, Finished, GPU_KEY, LEASE_KIND_KEY, LEASE_KINDS, NO_WORKER_REASON,
-    OperationStream, Stage, Submission, Ticket, closing, missing_status,
+    OperationStream, Progress, ProgressTicker, Stage, Submission, Ticket, closing, missing_status,
+    progress,
 };
 pub use crate::input_tree::{ENTRY_OVERHEAD, InputTreeConfig};
 pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
@@ -152,7 +153,8 @@ where
 
 /// The cache services and `Execution` over `cache` and `dispatch`, with capabilities
 /// that advertise execution. Open Execute and WaitExecution streams end UNAVAILABLE
-/// when `closing`'s [`Closer`] closes. Every call is allowed.
+/// when `closing`'s [`Closer`] closes; a drain refuses new Execute calls and leaves the
+/// open ones. Every call is allowed.
 pub fn routes_with_execution<M, O, D>(
     cache: Arc<Cache<M, O>>,
     dispatch: Arc<D>,
@@ -183,6 +185,7 @@ where
         cache,
         dispatch,
         closing,
+        Progress::off(),
         authorizers,
         &Recorder::off(),
         DEFAULT_RESOURCES.memory_bytes,
@@ -190,12 +193,13 @@ where
 }
 
 /// [`routes_with_authorizers`], each call that carries an invocation id sent to
-/// `recorder`, and an `action` that names no memory size booking `default_memory`
-/// bytes ([`ExecutionService::with_default_memory`]).
+/// `recorder`, open streams re-sent at each tick of `progress`, and an `action` that
+/// names no memory size booking `default_memory` bytes ([`ExecutionService::with_default_memory`]).
 pub fn routes_recorded<M, O, D>(
     cache: Arc<Cache<M, O>>,
     dispatch: Arc<D>,
     closing: Closing,
+    progress: Progress,
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
     default_memory: u64,
@@ -213,6 +217,7 @@ where
             Arc::clone(&authorizers),
         )
         .recording(recorder.clone())
+        .with_progress(progress)
         .with_default_memory(default_memory),
     )
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
@@ -221,14 +226,23 @@ where
     cache_routes(cache, capabilities, &authorizers, recorder).add_service(execution)
 }
 
-/// [`routes_recorded`] with the client's CAS, ByteStream and action-cache calls answered
-/// by the storage nodes of `proxy` ([`Proxy`]) instead of `cache`. `cache` still serves
+/// What keeps open Execute streams going: the drain that ends them and the tick that
+/// re-sends them while their action waits.
+pub struct OpenStreams {
+    /// Ends the streams when closed ([`closing`]).
+    pub closing: Closing,
+    /// Re-sends each at every tick ([`progress`]).
+    pub progress: Progress,
+}
+
+/// [`routes_recorded`] (its `streams` closed and re-sent as there) with the client's CAS,
+/// ByteStream and action-cache calls answered by the storage nodes of `proxy` ([`Proxy`]) instead of `cache`. `cache` still serves
 /// `Execution` (and so Execute's action-cache hits) until the scheduler uses storage.
 pub fn routes_proxied<M, O, D>(
     proxy: &Proxy,
     cache: Arc<Cache<M, O>>,
     dispatch: Arc<D>,
-    closing: Closing,
+    streams: OpenStreams,
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
     default_memory: u64,
@@ -238,9 +252,11 @@ where
     O: ObjectStore + 'static,
     D: Dispatch,
 {
+    let OpenStreams { closing, progress } = streams;
     let execution = ExecutionServer::new(
         ExecutionService::with_authorizers(cache, dispatch, closing, Arc::clone(&authorizers))
             .recording(recorder.clone())
+            .with_progress(progress)
             .with_default_memory(default_memory),
     )
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
