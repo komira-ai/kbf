@@ -499,6 +499,45 @@ fn a_main_push_job_still_gets_no_other_write_scope() {
     }
 }
 
+/// The `if:` line under which a job may sign provenance: a push to main or to the
+/// development branch.
+const SIGNING_PUSH_IF: &str = "    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}\n";
+
+#[test]
+fn signing_scopes_are_allowed_for_a_push_to_main_or_the_development_branch_only() {
+    // Catches: the development branch's pushes still unable to attest (the rehearsal
+    // would deploy unattested builds); and the widening taken further than those two
+    // refs: any push, any branch, a pull request or the merge queue (an event other than
+    // `push`), a tag, another spelling of the same condition, or a trailing `|| true`.
+    let signing = "{contents: read, id-token: write, attestations: write}";
+    clean(&workflow(&format!(
+        "    runs-on: ubuntu-latest\n{SIGNING_PUSH_IF}    permissions: {signing}\n"
+    )));
+    for cond in [
+        "    if: ${{ github.event_name == 'push' }}\n",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/feature/arch-v2' }}\n",
+        "    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/other') }}\n",
+        "    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/feature/arch-v2' || github.ref == 'refs/heads/main') }}\n",
+        "    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') }}\n",
+        "    if: ${{ github.event_name == 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}\n",
+        "    if: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}\n",
+        "    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') || true }}\n",
+        "    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2')\n",
+    ] {
+        for scope in ["id-token", "attestations"] {
+            let body =
+                format!("    runs-on: ubuntu-latest\n{cond}    permissions: {{{scope}: write}}\n");
+            let found = scan(&workflow(&body));
+            assert!(
+                found.iter().any(|m| m.contains(&format!(
+                    "`{scope}: write` is allowed only in a job whose `if:` is exactly"
+                ))),
+                "{body}\n-> {found:?}"
+            );
+        }
+    }
+}
+
 /// The `if:` line under which a job may create a release, as the lint requires it.
 const TAG_PUSH_IF: &str =
     "    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}\n";

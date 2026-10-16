@@ -36,6 +36,7 @@
 mod attested_assets;
 mod coverage_wiring;
 mod interpreters;
+mod release_artifacts;
 mod test_spawns;
 mod workflows;
 

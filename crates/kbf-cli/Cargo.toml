@@ -29,6 +29,8 @@ kbf-cas-conformance.workspace = true
 kbf-storage.workspace = true
 kbf-transfer.workspace = true
 kbf-types.workspace = true
+# The shape of `kbf --version --json` (tests/binary.rs).
+serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 tonic.workspace = true
 # The units `kbf-deploy linux render-units --mode` writes, parsed with kbf's own

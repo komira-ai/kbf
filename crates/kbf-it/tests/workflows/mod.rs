@@ -218,6 +218,78 @@ pub fn job_steps(text: &str, job: &str) -> Result<Vec<Step>, String> {
         .collect())
 }
 
+/// The top-level mapping of a workflow text. An error when it does not parse or is
+/// not a mapping.
+fn top_of(root: &Node) -> Result<&[(Node, Node)], String> {
+    match &root.value {
+        Value::Map(top) => Ok(top),
+        _ => Err("the workflow is not a mapping".to_owned()),
+    }
+}
+
+/// The names of the events the workflow's `on:` lists (a string, a list or a mapping),
+/// in order. An error when the text does not parse or has no `on:`.
+pub fn events(text: &str) -> Result<Vec<String>, String> {
+    let root = yaml::load(text)?;
+    let on = get(top_of(&root)?, "on").ok_or("the workflow has no `on:`")?;
+    Ok(match &on.value {
+        Value::Scalar { .. } => on.as_str().map(str::to_owned).into_iter().collect(),
+        Value::Seq(items) => items
+            .iter()
+            .filter_map(|n| n.as_str().map(str::to_owned))
+            .collect(),
+        Value::Map(entries) => entries
+            .iter()
+            .filter_map(|(k, _)| k.as_str().map(str::to_owned))
+            .collect(),
+    })
+}
+
+/// The `branches:` of the workflow's `push` trigger, in order. An error when the text
+/// does not parse, `on:` is not a mapping with a `push` mapping, or that has no
+/// `branches:` list of strings (a push of any branch would run the workflow).
+pub fn push_branches(text: &str) -> Result<Vec<String>, String> {
+    let root = yaml::load(text)?;
+    let on = get(top_of(&root)?, "on").ok_or("the workflow has no `on:`")?;
+    let Value::Map(on) = &on.value else {
+        return Err("`on:` is not a mapping".to_owned());
+    };
+    let Some(Value::Map(push)) = get(on, "push").map(|p| &p.value) else {
+        return Err("`on:` has no `push:` mapping".to_owned());
+    };
+    let Some(Value::Seq(branches)) = get(push, "branches").map(|b| &b.value) else {
+        return Err("`push:` has no `branches:` list".to_owned());
+    };
+    branches
+        .iter()
+        .map(|b| {
+            b.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "a `branches:` entry is not a string".to_owned())
+        })
+        .collect()
+}
+
+/// The job `job`'s own `if:` (its key matched ignoring ASCII case): `None` when it has
+/// none. An error when the text does not parse, has no such job, or the `if:` is not a
+/// string.
+pub fn job_condition(text: &str, job: &str) -> Result<Option<String>, String> {
+    let root = yaml::load(text)?;
+    let Some(Value::Map(jobs)) = get(top_of(&root)?, "jobs").map(|j| &j.value) else {
+        return Err("the workflow has no `jobs` mapping".to_owned());
+    };
+    let Some(Value::Map(found)) = get(jobs, job).map(|j| &j.value) else {
+        return Err(format!("the workflow has no job `{job}`"));
+    };
+    match get(found, "if") {
+        None => Ok(None),
+        Some(c) => c
+            .as_str()
+            .map(|c| Some(c.to_owned()))
+            .ok_or_else(|| format!("the `if:` of job `{job}` is not a string")),
+    }
+}
+
 /// One step with a `run:` script, in a workflow job or an action file's composite
 /// steps, as the interpreter budget reads it.
 #[derive(Debug, PartialEq, Eq)]
