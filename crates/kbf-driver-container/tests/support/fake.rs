@@ -236,11 +236,21 @@ impl Fake {
         spec: &Spec,
         steps: &[impl AsRef<str>],
     ) -> Result<kbf_proto::reapi::ActionResult, RuntimeError> {
+        self.run_with(seq, spec, steps, Resources::new(2000, 1 << 30))
+            .await
+    }
+
+    /// [`Fake::run`], with the lease booking `resources`.
+    pub async fn run_with(
+        &self,
+        seq: u64,
+        spec: &Spec,
+        steps: &[impl AsRef<str>],
+        resources: Resources,
+    ) -> Result<kbf_proto::reapi::ActionResult, RuntimeError> {
         self.action(steps);
         let action = store_action(&self.cas, spec);
-        self.runtime
-            .run(work(seq, action, Resources::new(2000, 1 << 30)))
-            .await
+        self.runtime.run(work(seq, action, resources)).await
     }
 
     /// A second runtime on this fake's configuration, as a restarted daemon makes.

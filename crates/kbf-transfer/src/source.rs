@@ -23,6 +23,7 @@ use std::os::unix::fs::FileExt as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
@@ -157,8 +158,9 @@ impl FileSource {
 /// Where a blob's bytes are.
 #[derive(Clone, Debug)]
 pub enum Source {
-    /// In memory (a Directory or Tree message).
-    Bytes(Arc<[u8]>),
+    /// In memory: a Directory or Tree message, or a file whose bytes a store took
+    /// as the walk read them ([`crate::Intake`]).
+    Bytes(Bytes),
     /// A file the walk hashed.
     File(FileSource),
     /// Written at `offset` of an unlinked spool file ([`crate::Spool`]).
@@ -204,7 +206,7 @@ impl Record {
         Self {
             digest: kbf_segments::sha256(&bytes),
             crc32c: kbf_segments::crc32c(&bytes),
-            source: Source::Bytes(bytes.into()),
+            source: Source::Bytes(Bytes::from(bytes)),
         }
     }
 

@@ -8,8 +8,15 @@
 //!
 //! This is the only time the daemon reads an output file to hash it. One pass over the
 //! bytes computes the SHA-256 and the CRC-32C the segment footer needs
-//! ([`RecordHasher`]); nothing is copied anywhere, and the upload reads the file again
-//! only to send it, by the [`Stamp`] taken here.
+//! ([`RecordHasher`]). When the store takes files as they are read
+//! ([`Cas::intake`](kbf_daemon::cas::Cas::intake),
+//! the in-process plane), the same pass hands each chunk to it, and the file is never
+//! read again ([`Digested::taken`]). Otherwise nothing is copied anywhere, and the
+//! upload reads the file again only to send it, by the [`Stamp`] taken here.
+//!
+//! **The per-file memory bound** is [`CHUNK`]: a worker reads, hashes and hands over one
+//! chunk of a file at a time and holds no more of it, whatever its size; what a store
+//! that takes the chunks keeps of them is the store's.
 //!
 //! Each worker reuses one read buffer for all its files, grown to the largest file it has
 //! met up to [`CHUNK`], not one zeroed megabyte per file, and keeps the descriptor of the
@@ -30,12 +37,13 @@ use std::os::unix::fs::FileExt as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use kbf_daemon::cas::{OPEN_FILE, RecordHasher, Stamp, descend};
+use kbf_daemon::cas::{Intake, IntakeFile, OPEN_FILE, RecordHasher, Stamp, descend};
 use kbf_daemon::cpu_pool::CpuPool;
 use kbf_types::Digest;
 use rustix::fs::{FileType, Mode};
 
-/// How much of a file a worker reads at a time: the most of one it holds in memory.
+/// How much of a file a worker reads at a time: the most of one it holds in memory
+/// (the per-file memory bound).
 pub(crate) const CHUNK: usize = 1 << 20;
 
 /// A file at least this large is hashed first.
@@ -64,6 +72,9 @@ pub(crate) struct Digested {
     /// What the file looked like while it was hashed: the upload refuses a file that no
     /// longer matches.
     pub stamp: Stamp,
+    /// Whether the store's intake took the bytes as they were read: then the file is
+    /// stored when the intake is finished and is not sent again.
+    pub taken: bool,
 }
 
 /// What hashing one file came to: its digest, `None` when it did not fit the byte
@@ -71,11 +82,18 @@ pub(crate) struct Digested {
 pub(crate) type Outcome = std::io::Result<Option<Digested>>;
 
 /// Hashes the regular file `name` in `dir`, reading at most `max + 1` bytes; `None` when
-/// it holds more than `max`. `buffer` is the worker's, grown as needed. The type is
-/// checked on the open descriptor: an entry that stopped being a regular file after it
-/// was listed is an error, never read. The file is stamped before and after the read:
-/// one that changed while it was hashed is an error too.
-pub(crate) fn hash_file(dir: &OwnedFd, name: &str, max: u64, buffer: &mut Vec<u8>) -> Outcome {
+/// it holds more than `max`. `buffer` is the worker's, grown as needed. Each chunk read
+/// is handed to `intake` too, when there is one, and the file finished there once it
+/// hashed. The type is checked on the open descriptor: an entry that stopped being a
+/// regular file after it was listed is an error, never read. The file is stamped before
+/// and after the read: one that changed while it was hashed is an error too.
+pub(crate) fn hash_file(
+    dir: &OwnedFd,
+    name: &str,
+    max: u64,
+    buffer: &mut Vec<u8>,
+    intake: Option<&dyn Intake>,
+) -> Outcome {
     let fd = rustix::fs::openat(dir, name, OPEN_FILE, Mode::empty())?;
     let stat = rustix::fs::fstat(&fd)?;
     #[allow(clippy::unnecessary_cast)] // `st_mode` is u32 on Linux, u16 on macOS
@@ -91,41 +109,66 @@ pub(crate) fn hash_file(dir: &OwnedFd, name: &str, max: u64, buffer: &mut Vec<u8
         return Ok(None);
     }
     let file = std::fs::File::from(fd);
-    // A file of `n` bytes needs no more than `n + 1` bytes of buffer to be read through
-    // to its end; a large one is read a chunk at a time.
-    let want = usize::try_from(before.size.saturating_add(1)).map_or(CHUNK, |n| n.min(CHUNK));
-    if buffer.len() < want {
-        buffer.resize(want, 0);
-    }
-    let mut hasher = RecordHasher::new();
-    let mut size = 0u64;
-    loop {
-        // One byte past `max` is enough to tell the file is too large; the bound is on
-        // the bytes read, not on `st_size` (a file can grow).
-        let room = max.saturating_add(1).saturating_sub(size);
-        let len = usize::try_from(room).map_or(buffer.len(), |n| n.min(buffer.len()));
-        let read = file.read_at(&mut buffer[..len], size)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        size += read as u64;
-        if size > max {
-            return Ok(None);
-        }
-    }
+    let mut taking = intake.and_then(|intake| intake.file(before.size));
+    let Some((digest, crc32c)) =
+        read_through(&file, before.size, max, buffer, taking.as_deref_mut())?
+    else {
+        return Ok(None);
+    };
     // Both parts are looked at, whichever is true: no short-circuit to cover.
-    let changed = (Stamp::of(&file)? != before) | (size != before.size);
+    let changed = (Stamp::of(&file)? != before) | (digest.size_bytes != before.size);
     if changed {
         return Err(std::io::Error::other("changed while it was being hashed"));
     }
-    let (digest, crc32c) = hasher.finish();
+    let taken = taking.map(|file| file.finish(digest, crc32c)).is_some();
     Ok(Some(Digested {
         digest,
         crc32c,
         executable,
         stamp: before,
+        taken,
     }))
+}
+
+/// Reads `file` from its start to its end, one chunk of `buffer` at a time (at most
+/// [`CHUNK`], fewer for a file of `size` bytes), hashing each chunk and handing it to
+/// `taking` when there is one; returns the digest and CRC-32C of what was read, or
+/// `None` once more than `max` bytes were: at most `max + 1` are read. The bound is on
+/// the bytes read, not on `size` (a file can grow).
+pub(crate) fn read_through(
+    file: &std::fs::File,
+    size: u64,
+    max: u64,
+    buffer: &mut Vec<u8>,
+    mut taking: Option<&mut (dyn IntakeFile + 'static)>,
+) -> std::io::Result<Option<(Digest, u32)>> {
+    // A file of `n` bytes needs no more than `n + 1` bytes of buffer to be read through
+    // to its end; a large one is read a chunk at a time.
+    let want = usize::try_from(size.saturating_add(1)).map_or(CHUNK, |n| n.min(CHUNK));
+    if buffer.len() < want {
+        buffer.resize(want, 0);
+    }
+    let mut hasher = RecordHasher::new();
+    let mut read_so_far = 0u64;
+    loop {
+        // One byte past `max` is enough to tell the file is too large.
+        let room = max.saturating_add(1).saturating_sub(read_so_far);
+        let len = usize::try_from(room).map_or(buffer.len(), |n| n.min(buffer.len()));
+        let read = file.read_at(&mut buffer[..len], read_so_far)?;
+        if read == 0 {
+            break;
+        }
+        read_so_far += read as u64;
+        if read_so_far > max {
+            return Ok(None);
+        }
+        let chunk = &buffer[..read];
+        hasher.update(chunk);
+        if let Some(taking) = &mut taking {
+            taking.write(chunk);
+        }
+    }
+    Ok(Some(hasher.finish()))
 }
 
 /// The directory a worker read last.
@@ -142,6 +185,7 @@ fn hash_job(
     max: u64,
     held: &mut Option<Held>,
     buffer: &mut Vec<u8>,
+    intake: Option<&dyn Intake>,
 ) -> Outcome {
     let dir = match held.take() {
         Some(h) if Arc::ptr_eq(&h.dirs, &job.dirs) => h,
@@ -151,7 +195,7 @@ fn hash_job(
         },
     };
     let dir = held.insert(dir);
-    hash_file(&dir.fd, &job.name, max, buffer)
+    hash_file(&dir.fd, &job.name, max, buffer, intake)
 }
 
 fn gone() -> std::io::Error {
@@ -170,6 +214,8 @@ struct Shared {
     max: u64,
     /// Bytes of the files hashed so far.
     used: AtomicU64,
+    /// The store's, when it takes each file as it is read.
+    intake: Option<Arc<dyn Intake>>,
 }
 
 /// The threads that hashed, for the test that counts them: by the address of the upper
@@ -209,6 +255,7 @@ fn work(shared: &Shared) -> Vec<(usize, Outcome)> {
                 left,
                 &mut held,
                 &mut buffer,
+                shared.intake.as_deref(),
             );
             match &outcome {
                 Ok(Some(d)) => {
@@ -236,14 +283,16 @@ impl Drop for CancelOnDrop {
 }
 
 /// Hashes `jobs` on up to `pool.threads()` of the pool's threads, the files together
-/// holding at most `max` bytes. The outcome of `jobs[i]` is at `[i]`; `None` is a file
-/// no worker hashed: one listed before it failed or did not fit, or the worker that had
-/// it panicked.
+/// holding at most `max` bytes, each file's chunks handed to `intake` as they are read
+/// when there is one. The outcome of `jobs[i]` is at `[i]`; `None` is a file no worker
+/// hashed: one listed before it failed or did not fit, or the worker that had it
+/// panicked.
 pub(crate) async fn hash_all(
     pool: &CpuPool,
     upper: &Arc<OwnedFd>,
     jobs: Arc<[Job]>,
     max: u64,
+    intake: Option<Arc<dyn Intake>>,
 ) -> Vec<Option<Outcome>> {
     let mut order: Vec<usize> = (0..jobs.len()).collect();
     // Stable: large files first, each group in walk order.
@@ -257,6 +306,7 @@ pub(crate) async fn hash_all(
         first_bad: AtomicUsize::new(usize::MAX),
         max,
         used: AtomicU64::new(0),
+        intake,
     });
     let _guard = CancelOnDrop(Arc::clone(&shared));
     let runs: Vec<_> = (0..workers)

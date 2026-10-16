@@ -862,7 +862,7 @@ async fn a_record_shorter_than_its_digest_fails_with_a_read_error() {
     let front = Front::start(Mode::Serve).await;
     let whole = patterned(5, 200);
     let mut record = Record::bytes(whole.clone());
-    record.source = Source::Bytes(Arc::from(&whole[..100]));
+    record.source = Source::Bytes(bytes::Bytes::copy_from_slice(&whole[..100]));
     let failed = front
         .engine
         .put_records(vec![record])
