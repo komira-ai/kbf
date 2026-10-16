@@ -205,17 +205,17 @@ pub fn read_password(file: &Path) -> Result<String, StateError> {
 /// Runs `call` on a thread of its own and waits. The Postgres client drives its own
 /// runtime and panics when a call is made from a thread that is running another one,
 /// which every call from a gRPC handler or a start is.
-#[cfg(any(feature = "postgres", test))]
+#[allow(dead_code)]
 fn off_runtime<T: Send>(call: impl FnOnce() -> T + Send) -> T {
     // Not off the runtime yet: the test of the wrapper fails against this.
     call()
 }
 
 /// A store whose every call runs [`off_runtime`].
-#[cfg(any(feature = "postgres", test))]
+#[allow(dead_code)]
 struct OffRuntime<S>(S);
 
-#[cfg(any(feature = "postgres", test))]
+#[allow(dead_code)]
 impl<S: Store> Store for OffRuntime<S> {
     fn apply_batch(
         &self,
