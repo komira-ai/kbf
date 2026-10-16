@@ -52,7 +52,8 @@ All **[D]** by the owner (section 10).
 - **Every history record and index row carries its instance name**, and every read is filtered by the caller's authority on that instance, as the built invocation routes are (section 8).
 - **Shape identity covers every action** (kbf#765), refined by `cfg` and by a target name when one is known. Tests are the shapes marked as tests; the farm never needs the client to say "this is a test".
 - **Built fields keep their names and formats.** New data adds keys; nothing built is renamed (6.1).
-- **The client may add what REAPI cannot carry** (commit, target names, critical path, test cases) through one upload route, written only by the record's owner, and only on a farm whose policy authenticates each caller (4.6, 8). Nothing in the farm requires it.
+- **[D] The farm never keys its data on what a client says (owner, 2026-10-16).** A client bug must not be able to misattribute farm data. Metrics are measured by the farm; the target label is derived on the server from each action's own output paths (`<cell>/<pkg>/__<name>__/`, read by the shape parser; komira-ai/komira-build-farm#796), `target: null` where paths are hashed; a client `target_id` is shown only as a hint. Commit and branch become keys (first failing commit, history per branch, 4.3) only when the farm itself fetched that commit (the async remote build job, a later phase); a commit in a client report is shown as `reported_commit` and is never a key.
+- **The client may add what REAPI cannot carry** (critical path, test cases, a reported commit) through one upload route, written only by the record's owner, and only on a farm whose policy authenticates each caller (4.6, 8). It is display-only enrichment beside the farm's data, never a key. Nothing in the farm requires it.
 
 ## 2. Users and the questions they ask
 
@@ -253,6 +254,9 @@ Routes (new): `GET /v1/shapes?kind=test&status=failing|flaky|slower|oom_killed&t
 - Route: `GET /v1/series/{name}?from=&to=&step=&labels=` (new); `GET /v1/series` lists names, units and retention.
 
 ### 4.6 Client report (what REAPI cannot carry)
+
+**Display only (section 1).** Everything below is shown beside the farm's own data and labelled as client-reported. It never becomes a key: not for target identity (derived from output paths, #796), not for first failing commit or branch history (farm-fetched commits only), not for flakiness (digest outcomes only).
+
 
 - Route: `POST /v1/invocations/{id}/report`, body one of: a buck2 build report (`--build-report`), buck2 `log what-ran --format json`, buck2 `log critical-path --format json`, a JUnit XML file per test, and a small JSON of `{commit, branch, repo}`. Bazel BES is later.
 - **Who may write.** A caller whose `public` metadata equals the record's `owner` (`invocations.md` 2.4), and, once read tokens exist, not a `read` role. A different owner's report goes to its own `<id>~<n>` record, as its calls would, and never changes the first record's commit or target map. **[F]** The owner check means something only under a per-caller authenticator: `owner` is the caller's `public` metadata (`crates/kbf-front/src/recorder.rs:470-475`), an `allow` authenticator gives every caller the same fixed metadata (`crates/kbf-auth/src/policy.rs:280-290`), and with no policy file every caller's metadata is empty (`invocations.md:170-172`), so under either every caller owns every record. Hence the route is off unless the policy authenticates callers (8).
