@@ -12,15 +12,64 @@ use tokio::sync::watch;
 
 use crate::farm::Outbound;
 
-/// The map `source` holds now, as the wire has it.
-pub(crate) fn wire_map(source: &dyn MapSource) -> wire::Map {
-    wire::Map::from(&*source.current())
+/// The storage map a worker service sends, if it has one: the code the generic session
+/// handler calls, so that none of it is conditional there (generic code is covered once per
+/// instantiation of the farm's log and store types, and this is not generic).
+#[derive(Clone)]
+pub(crate) struct MapFeed(Option<Arc<dyn MapSource>>);
+
+impl std::fmt::Debug for MapFeed {
+    /// The source is named, not printed: implementors hold state stores and channels.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "MapFeed(MapSource)"
+        } else {
+            "MapFeed(none)"
+        })
+    }
+}
+
+impl MapFeed {
+    /// No map: a farm of one member.
+    pub(crate) const NONE: Self = Self(None);
+
+    pub(crate) fn new(source: Arc<dyn MapSource>) -> Self {
+        Self(Some(source))
+    }
+
+    /// A receiver of the source's changes. Taken before [`Self::welcome_map`], so a change
+    /// between the two is sent again as a `MapUpdate`, never missed.
+    pub(crate) fn subscribe(&self) -> Option<watch::Receiver<u64>> {
+        self.0.as_ref().map(|source| source.changes())
+    }
+
+    /// The map the source holds now, as the wire has it, for `Welcome`.
+    pub(crate) fn welcome_map(&self) -> Option<wire::Map> {
+        self.0
+            .as_ref()
+            .map(|source| wire::Map::from(&*source.current()))
+    }
+
+    /// Starts sending a `MapUpdate` on `outbound` for each change in `changes` (from
+    /// [`Self::subscribe`]), until the stream is gone. Called after the `Welcome` was
+    /// queued on `outbound`, so the first update follows it.
+    pub(crate) fn push(&self, changes: Option<watch::Receiver<u64>>, outbound: &Outbound) {
+        if let Some((source, changes)) = self.0.clone().zip(changes) {
+            tokio::spawn(push_changes(source, changes, outbound.clone()));
+        }
+    }
+
+    /// The answer to a `MapRequest`: a `MapUpdate` of the map held now, when there is a
+    /// source.
+    pub(crate) fn answer(&self) -> Option<server_message::Message> {
+        self.0.as_deref().map(update)
+    }
 }
 
 /// A `MapUpdate` of the map `source` holds now.
-pub(crate) fn update(source: &dyn MapSource) -> server_message::Message {
+fn update(source: &dyn MapSource) -> server_message::Message {
     server_message::Message::MapUpdate(MapUpdate {
-        map: Some(wire_map(source)),
+        map: Some(wire::Map::from(&*source.current())),
     })
 }
 
@@ -75,6 +124,15 @@ mod tests {
                 map: Some(wire::Map::from(&map(generation))),
             })),
         }
+    }
+
+    /// Catches a `Debug` of the service that prints the map source's state (a state store
+    /// handle, a channel), or fails to build when a source has no `Debug`.
+    #[test]
+    fn a_map_source_is_named_not_printed() {
+        let source = Arc::new(FakeMapSource::new(map(1)));
+        assert_eq!(format!("{:?}", MapFeed::new(source)), "MapFeed(MapSource)");
+        assert_eq!(format!("{:?}", MapFeed::NONE), "MapFeed(none)");
     }
 
     /// Catches a pusher that sends the map it was subscribed at instead of the one the

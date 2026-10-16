@@ -51,13 +51,18 @@ impl MapLink {
     }
 
     /// Completes when the holder is asked to reach a generation it was not before.
-    async fn asked(&mut self) -> Option<()> {
-        self.asks.changed().await.ok()
+    async fn asked(&mut self) {
+        // The link holds the holder, whose sender lives as long as it does: the wait
+        // cannot fail.
+        let _ = self.asks.changed().await;
     }
 }
 
-/// Completes when `link` has a new wait; never without a link (`None` disables the select
-/// arm).
-pub(crate) async fn map_asked(link: Option<&mut MapLink>) -> Option<()> {
-    link?.asked().await
+/// Completes when `link` has a new wait; never without a link. (A plain future rather
+/// than a `Some(()) =` pattern in the select: a pattern arm adds a path nothing runs.)
+pub(crate) async fn map_asked(link: Option<&mut MapLink>) {
+    match link {
+        Some(link) => link.asked().await,
+        None => std::future::pending().await,
+    }
 }

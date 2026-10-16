@@ -61,7 +61,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::farm::{Farm, Outbound, Reported, StreamId};
 use crate::identity::{PeerCert, Peers};
-use crate::map_push;
+use crate::map_push::MapFeed;
 
 /// The `kbf.worker.v1` version this server speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -77,18 +77,7 @@ pub struct WorkerService<M, O> {
     peers: Peers,
     heartbeat_interval: Duration,
     hello_wait: Duration,
-    map: Option<Source>,
-}
-
-/// The map source a service sends from. `MapSource` is not `Debug`, as its implementors
-/// hold state stores and channels.
-#[derive(Clone)]
-struct Source(Arc<dyn MapSource>);
-
-impl std::fmt::Debug for Source {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("MapSource")
-    }
+    map: MapFeed,
 }
 
 impl<M, O> WorkerService<M, O> {
@@ -106,7 +95,7 @@ impl<M, O> WorkerService<M, O> {
             peers,
             heartbeat_interval,
             hello_wait,
-            map: None,
+            map: MapFeed::NONE,
         }
     }
 
@@ -114,7 +103,7 @@ impl<M, O> WorkerService<M, O> {
     /// in a `MapUpdate` each time it changes.
     #[must_use]
     pub fn with_map(mut self, map: Arc<dyn MapSource>) -> Self {
-        self.map = Some(Source(map));
+        self.map = MapFeed::new(map);
         self
     }
 }
@@ -163,16 +152,13 @@ where
         let predecessor = DaemonInstance::new(hello.predecessor_instance_id);
         // Subscribed before the map is read: a change between the two is sent again as a
         // `MapUpdate`, never missed.
-        let changes = self.map.as_ref().map(|source| source.0.changes());
+        let changes = self.map.subscribe();
         let welcome = message(server_message::Message::Welcome(Welcome {
             protocol_version: version,
             heartbeat_interval_ms: u64::try_from(self.heartbeat_interval.as_millis())
                 .unwrap_or(u64::MAX),
             epoch: self.farm.lease_epoch(),
-            map: self
-                .map
-                .as_ref()
-                .map(|source| map_push::wire_map(&*source.0)),
+            map: self.map.welcome_map(),
         }));
         let (outbound, responses) = mpsc::unbounded_channel();
         let capacity = reported.capacity;
@@ -185,12 +171,10 @@ where
             welcome,
         );
         tracing::info!(%worker, ?capacity, "worker registered");
-        if let Some((Source(source), changes)) = self.map.clone().zip(changes) {
-            // After `register`, which queued the `Welcome`: the first update follows it.
-            tokio::spawn(map_push::push_changes(source, changes, outbound.clone()));
-        }
+        // After `register`, which queued the `Welcome`: the first update follows it.
+        self.map.push(changes, &outbound);
         let session = Session {
-            map: self.map.clone().map(|source| source.0),
+            map: self.map.clone(),
             farm: Arc::clone(&self.farm),
             peers: self.peers.clone(),
             peer,
@@ -207,7 +191,7 @@ where
 
 /// One stream after its first `Hello`.
 struct Session<M, O> {
-    map: Option<Arc<dyn MapSource>>,
+    map: MapFeed,
     farm: Arc<Farm<M, O>>,
     peers: Peers,
     /// The stream's client certificate (`None` in plain text).
@@ -311,7 +295,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Session<M, O> {
                 self.peers
                     .admit(self.peer.as_ref(), worker.as_str())
                     .await?;
-                self.map.as_deref().map(map_push::update)
+                self.map.answer()
             }
             Some(daemon_message::Message::Offer(_)) => None,
             None => {
@@ -419,29 +403,4 @@ fn entry(capabilities: &[Capability], key: &str) -> Result<Option<u64>, String> 
         })
     })
     .transpose()
-}
-
-#[cfg(test)]
-mod tests {
-    use kbf_map::{Map, Member, MemberId, MemberState, Rule};
-    use kbf_mapsync::FakeMapSource;
-
-    use super::*;
-
-    /// Catches a `Debug` of the service that prints the map source's state (a state
-    /// store handle, a channel) or fails to compile when a source has no `Debug`: the
-    /// source is named, not printed.
-    #[test]
-    fn a_map_source_is_named_not_printed() {
-        let member = Member {
-            id: MemberId(1),
-            addr: "127.0.0.1:1".to_owned(),
-            zone: String::new(),
-            weight: 1,
-            state: MemberState::Active,
-        };
-        let map = Map::new(1, vec![member], Rule::Rendezvous, 1, 1, Vec::new()).expect("map");
-        let source = Source(Arc::new(FakeMapSource::new(map)));
-        assert_eq!(format!("{source:?}"), "MapSource");
-    }
 }
