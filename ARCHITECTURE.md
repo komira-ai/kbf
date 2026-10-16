@@ -109,7 +109,10 @@ to the server half's worker listener on loopback); its blobs move through calls 
 server half's cache and `Segments` handlers (`LocalDataPlane`), with no listener between.
 Not yet production-ready: a restart loses the scheduler's state, which is in memory, and
 the deploy shape, the unit and the ownership step are not written
-([README](crates/kbf-all-in-one/README.md)).
+([README](crates/kbf-all-in-one/README.md)). The same crate holds `kbf
+storage-and-daemon`: the storage node (`kbf_server::storage_half`, `kbf storage`'s start
+with the storage it serves kept) and the same daemon half over the same `LocalDataPlane`,
+which knows the store only as `kbf_storage::Storage`.
 
 ## Crates
 
@@ -142,7 +145,7 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-driver-container` | no | the rootless Podman execution driver |
 | `kbf-driver-native` | no | the native execution driver: plain processes, for Macs |
 | `kbf-node` | no | the worker daemon as a library (flags, the driver `--driver` names, the data directory `--data-dir` (`leases/`, the input cache and the input trees, sized from the filesystem), `start` returning a `NodeHandle`, over the transfer engine; `start_with`, over a data plane the caller makes) and the `kbf-daemon` binary, a thin main over it. Only a combined binary may link both this and `kbf-server` (`kbf-it` `layering`) |
-| `kbf-all-in-one` | no | the server and a daemon in one process (the `kbf-all-in-one` binary, above): one command line of both binaries' flags, and `LocalDataPlane`, the daemon's data plane as calls into the server's `LocalStore` on the server half's runtime ([README](crates/kbf-all-in-one/README.md)) |
+| `kbf-all-in-one` | no | the server and a daemon in one process (the `kbf-all-in-one` binary, above): one command line of both binaries' flags, and `LocalDataPlane`, the daemon's data plane as calls into the server's `LocalStore` on the server half's runtime; and `kbf storage-and-daemon` (`storage_and_daemon`), the storage node and a daemon in one process over the same plane ([README](crates/kbf-all-in-one/README.md)) |
 | `kbf-cas-conformance` | no | the checks every implementation of the daemon's data plane (`kbf_transfer::Cas`) must pass, generic over the implementation (`tests!`); run against the gRPC implementation `kbf_transfer::Transfers`, and in `kbf-all-in-one` against `LocalDataPlane` over a server with a write tier and one without |
 | `kbf-threads` | no | thread and disk sizing for both binaries (disk: a filesystem's size and free space, the floor it keeps free, and the shares a cache, a tree store or a hot store may take: `disk`); thread sizing: on the daemon `--reserve-cpus` (and `--reserve-share`) size the pools and leave the leases the other CPUs, limited to the physical cores (`Topology`); the server has no reserve and uses every CPU it may (one async worker and one hashing thread per logical CPU, tokio's blocking cap); `--async-threads`, `--blocking-threads` and `--cpu-threads` override on both; and the tokio runtime built with them |
 | `kbf-mdm` | no | `kbf-mdm-gate`, the only holder of the Mac MDM's API key: its verbs and caps over mutual TLS, operator-signed erase requests, the `MdmBackend` trait and its NanoHUB client ([mdm-backend.md](docs/design/mdm-backend.md)). With the `testkit` feature, security-key signatures made in software, for other crates' tests |

@@ -26,16 +26,31 @@
 //!   A blob of [`Cas::put_chunks`] over [`MAX_UNSTAGED_BLOB_BYTES`] is streamed to the
 //!   object store as its chunks are read ([`LocalStore::put_streamed`]), as a ByteStream
 //!   `Write` of one is: never gathered, never refused for its size.
-//! - **Reads**: [`Cas::get`], the cache's own whole-blob read, which checks the bytes
-//!   against the digest; [`Cas::read_to`] (the input cache's fills), the cache's
-//!   streamed read ([`LocalStore::read_stream`]), pumped on the server half's runtime a
-//!   chunk at a time (at most two chunks between the halves, never the blob) into the
-//!   file as it arrives, and hashed here too: a stream cut short by a server half that
-//!   went away is not taken for a whole blob.
+//! - **Reads** ([`Cas::read_to`], the input cache's fills, and [`Cas::get`]): the
+//!   storage's streamed read ([`LocalStore::read_stream`]), pumped on the server half's
+//!   runtime a chunk at a time (at most two chunks between the halves, never the blob)
+//!   into the file (or, for `get`, the `Vec`) as it arrives, and hashed here. A stream
+//!   that runs past the digest's size stops at its first byte past it, answered
+//!   [`CasError::Corrupt`] as the transfer engine answers one, so no storage fills the
+//!   disk (or memory) with more than the blob asked for. A stream that ends with an
+//!   error item is [`CasError::Unavailable`] (the same read may pass later); one that
+//!   ends cleanly but short, or with other bytes, is [`CasError::Corrupt`].
 //! - **FindMissing** ([`Cas::missing`]): the cache's own answer. A call that fails
 //!   answers every digest missing, as the transfer engine's does.
 //!
 //! A server half that is gone (its runtime shut down) fails each call UNAVAILABLE.
+//!
+//! **Over any storage.** The plane knows the store only as [`kbf_storage::Storage`]
+//! (`LocalStore::over`), so it is the one adapter from the daemon's `Cas` to the
+//! storage boundary: `kbf all-in-one` gives it the server's cache, `kbf
+//! storage-and-daemon` the storage node's (`crate::storage_and_daemon`), and over a
+//! `kbf_storage::service::RemoteStorage` it reads and writes a storage node over gRPC
+//! with the same answers (tests/storage_plane.rs runs one suite over both). "The server
+//! half" above is whichever runtime the storage's calls run on. Unlike the transfer
+//! engine, the plane neither retries a failed call nor resumes a broken read from where
+//! it stopped: in-process there is no connection to lose. Before a daemon-only node
+//! reads a storage node through it (av2-09), that retry belongs in the plane or in the
+//! storage it is given.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -56,7 +71,7 @@ use kbf_transfer::{
     read_pieces,
 };
 use kbf_types::{DigestFunction, LeaseId};
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncWrite, AsyncWriteExt as _};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::Sender;
 use tonic::{Code, Request, Status};
@@ -119,6 +134,52 @@ impl LocalDataPlane {
         let store = self.store.clone();
         self.call(async move { store.find_missing(&digests).await.map_err(Status::from) })
             .await
+    }
+
+    /// The blob `digest` streamed into `into` and flushed (the module docs, **Reads**):
+    /// a chunk at a time, stopped at the first byte past the digest's size, hashed. Not
+    /// generic, so `get` and `read_to` run one copy of it.
+    async fn receive(
+        &self,
+        digest: &Digest,
+        into: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<(), CasError> {
+        let blob = label(digest);
+        let Some(parsed) = parse(digest) else {
+            return Err(CasError::Missing(blob));
+        };
+        let (chunks, mut arriving) = tokio::sync::mpsc::channel(1);
+        let store = self.store.clone();
+        let opened = self.call(async move {
+            let stream = store.read_stream(&parsed).await.map_err(Status::from)?;
+            tokio::spawn(pump(stream, chunks));
+            Ok(())
+        });
+        match opened.await {
+            Ok(()) => {}
+            Err(status) if status.code() == Code::NotFound => return Err(CasError::Missing(blob)),
+            Err(status) => return Err(unavailable(&blob, &status)),
+        }
+        let size = parsed.size_bytes;
+        let mut at = 0_u64;
+        let mut hasher = RecordHasher::new();
+        // Dropping `arriving` on an early return stops the pump, and the stream with it.
+        while let Some(chunk) = arriving.recv().await {
+            let chunk = chunk.map_err(|e| unavailable(&blob, &Status::from(e)))?;
+            at = at.saturating_add(chunk.len() as u64);
+            if at > size {
+                return Err(CasError::Corrupt(blob, format!("more than {size} bytes")));
+            }
+            hasher.update(&chunk);
+            let written = into.write_all(&chunk).await;
+            written.map_err(|e| CasError::Write(blob.clone(), e.to_string()))?;
+        }
+        let (read, _) = hasher.finish();
+        if read != parsed {
+            return Err(CasError::Corrupt(blob, label(&proto_digest(&read))));
+        }
+        let flushed = into.flush().await;
+        flushed.map_err(|e| CasError::Write(blob, e.to_string()))
     }
 
     /// One upload: `Begin` with the segments' footers, each range of the records'
@@ -244,16 +305,6 @@ fn unavailable(blob: &str, status: &Status) -> CasError {
     CasError::Unavailable(blob.to_owned(), status.message().to_owned())
 }
 
-/// A read of `blob` the server refused or did not answer: missing only when the blob is
-/// not held.
-fn unread(blob: String, status: &Status) -> CasError {
-    if status.code() == Code::NotFound {
-        CasError::Missing(blob)
-    } else {
-        CasError::Unavailable(blob, status.message().to_owned())
-    }
-}
-
 /// An upload of outputs the server refused or did not answer.
 fn not_stored(status: Status) -> CasError {
     CasError::Unavailable("outputs".to_owned(), status.message().to_owned())
@@ -271,46 +322,18 @@ impl Cas for LocalDataPlane {
         Arc::clone(self)
     }
 
+    /// The whole blob, in memory: [`Cas`] makes this a `Vec`. The daemon calls it only
+    /// for what it decodes (the action, its command, the input tree's directories,
+    /// bounded by the message size); every input file is a [`Cas::read_to`]. Read as
+    /// `read_to` reads, into the `Vec`: never more than the digest's size, hashed here.
     async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
-        let blob = label(digest);
-        let Some(parsed) = parse(digest) else {
-            return Err(CasError::Missing(blob));
-        };
-        let store = self.store.clone();
-        let read = self.call(async move { store.read_blob(&parsed).await.map_err(Status::from) });
-        read.await.map_err(|status| unread(blob, &status))
+        let mut bytes = Vec::new();
+        self.receive(digest, &mut bytes).await?;
+        Ok(bytes)
     }
 
     async fn read_to(&self, digest: &Digest, file: &mut tokio::fs::File) -> Result<(), CasError> {
-        let blob = label(digest);
-        let Some(parsed) = parse(digest) else {
-            return Err(CasError::Missing(blob));
-        };
-        let (chunks, mut arriving) = tokio::sync::mpsc::channel(1);
-        let store = self.store.clone();
-        let opened = self.call(async move {
-            let stream = store.read_stream(&parsed).await.map_err(Status::from)?;
-            tokio::spawn(pump(stream, chunks));
-            Ok(())
-        });
-        match opened.await {
-            Ok(()) => {}
-            Err(status) if status.code() == Code::NotFound => return Err(CasError::Missing(blob)),
-            Err(status) => return Err(unavailable(&blob, &status)),
-        }
-        let mut hasher = RecordHasher::new();
-        while let Some(chunk) = arriving.recv().await {
-            let chunk = chunk.map_err(|e| unavailable(&blob, &Status::from(e)))?;
-            hasher.update(&chunk);
-            let written = file.write_all(&chunk).await;
-            written.map_err(|e| CasError::Write(blob.clone(), e.to_string()))?;
-        }
-        let (read, _) = hasher.finish();
-        if read != parsed {
-            return Err(CasError::Corrupt(blob, label(&proto_digest(&read))));
-        }
-        let flushed = file.flush().await;
-        flushed.map_err(|e| CasError::Write(blob, e.to_string()))
+        self.receive(digest, file).await
     }
 
     async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CasError> {

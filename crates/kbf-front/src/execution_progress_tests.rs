@@ -17,9 +17,14 @@ const EVERY: Duration = Duration::from_secs(30);
 
 /// A ticket whose stage the test holds; the sender must outlive the stream.
 fn ticket(stage: Stage) -> (watch::Sender<Stage>, Ticket) {
+    ticket_named(stage, "operations/0")
+}
+
+/// [`ticket`] for the operation called `name`.
+fn ticket_named(stage: Stage, name: &str) -> (watch::Sender<Stage>, Ticket) {
     let (tx, rx) = watch::channel(stage);
     let ticket = Ticket {
-        name: "operations/0".to_owned(),
+        name: name.to_owned(),
         instance: "main".to_owned(),
         action: sha256(b"action"),
         stage: rx,
@@ -59,6 +64,18 @@ async fn an_idle_stream_gets_a_progress_operation_every_tick() {
     ticking.abort();
 }
 
+/// The next item of `ops`; a panic if none comes within a hang deadline (not a speed
+/// bound: on a regression the stream never ends and the paused clock would otherwise
+/// wait for ever), saying `what` was awaited.
+async fn read(
+    ops: &mut super::OperationStream,
+    what: &str,
+) -> Option<Result<kbf_proto::google::longrunning::Operation, tonic::Status>> {
+    tokio::time::timeout(10 * EVERY, ops.next())
+        .await
+        .unwrap_or_else(|_| panic!("no {what} within the hang deadline"))
+}
+
 /// Catches a stream that ignores its own stage change while ticks are also arriving:
 /// the done operation is sent as the stream's last, and ends it.
 #[tokio::test(start_paused = true)]
@@ -69,15 +86,22 @@ async fn a_progress_stream_still_ends_with_the_done_operation() {
     let ticking = tokio::spawn(ticker.run());
     let metrics = CacheMetrics::default();
     let mut ops = operations(ticket, closing, progress, metrics.execute.wait());
-    ops.next().await.expect("queued").expect("healthy");
-    ops.next()
+    read(&mut ops, "first operation")
         .await
-        .expect("a progress operation")
+        .expect("open")
+        .expect("healthy");
+    read(&mut ops, "progress operation (is the ticker running?)")
+        .await
+        .expect("open")
         .expect("healthy");
     stage.send_replace(Stage::Done(super::Finished::Ran(Box::default())));
-    let done = ops.next().await.expect("done").expect("healthy");
+    let done = read(&mut ops, "done operation, with ticks arriving")
+        .await
+        .expect("open")
+        .expect("healthy");
     assert!(done.done, "{done:?}");
-    assert!(ops.next().await.is_none());
+    let end = read(&mut ops, "end of the stream").await;
+    assert!(end.is_none(), "{end:?}");
     ticking.abort();
 }
 
@@ -129,4 +153,57 @@ async fn a_zero_interval_never_ticks() {
     stage.send_replace(Stage::Executing);
     ops.next().await.expect("executing").expect("healthy");
     ticking.abort();
+}
+
+/// Catches `kbf_front_open_executions` that is not raised when the stream is made
+/// (a stream the client has not read yet would be invisible to a drain that waits for
+/// 0) or that stays raised however the stream ends. Each way a stream ends lowers it
+/// exactly once: the done operation, a client that drops the stream, and
+/// `Closer::close`. Mutants: `operations` not calling `OpenExecute::streaming` (the
+/// first assertion fails); `Drop` not lowering it (the three settled assertions fail);
+/// `streaming` raising twice per call (the first assertion reads 2).
+#[tokio::test(start_paused = true)]
+async fn open_executions_is_raised_with_the_stream_and_lowered_however_it_ends() {
+    let metrics = CacheMetrics::default();
+    let gauge = &metrics.execute.open_executions;
+
+    // Done.
+    let (stage, queued) = ticket(Stage::Queued);
+    let (_closer, open) = closing();
+    let mut ops = operations(queued, open, Progress::off(), metrics.execute.wait());
+    assert_eq!(gauge.get(), 1, "raised before the first item is read");
+    ops.next().await.expect("queued").expect("healthy");
+    assert_eq!(gauge.get(), 1);
+    stage.send_replace(Stage::Done(super::Finished::Ran(Box::default())));
+    let done = ops.next().await.expect("done").expect("healthy");
+    assert!(done.done);
+    assert_eq!(gauge.get(), 0, "lowered when the done operation is made");
+    assert!(ops.next().await.is_none());
+    assert_eq!(gauge.get(), 0);
+
+    // The client drops a stream it has read from, and one it never read.
+    let (_stage, first) = ticket(Stage::Executing);
+    let (_closer, open) = closing();
+    let mut read = operations(first, open.clone(), Progress::off(), metrics.execute.wait());
+    read.next().await.expect("executing").expect("healthy");
+    let (_stage2, second) = ticket_named(Stage::Executing, "operations/1");
+    let unread = operations(second, open, Progress::off(), metrics.execute.wait());
+    assert_eq!(gauge.get(), 2);
+    drop(read);
+    assert_eq!(gauge.get(), 1);
+    drop(unread);
+    assert_eq!(gauge.get(), 0, "a stream dropped before its first item");
+
+    // Close: the stream ends UNAVAILABLE and is gone.
+    let (_stage, held) = ticket(Stage::Executing);
+    let (closer, open) = closing();
+    let mut ops = operations(held, open, Progress::off(), metrics.execute.wait());
+    ops.next().await.expect("executing").expect("healthy");
+    assert_eq!(gauge.get(), 1);
+    closer.close();
+    let gone = ops.next().await.expect("an end").expect_err("closed");
+    assert_eq!(gone.code(), tonic::Code::Unavailable);
+    assert_eq!(gauge.get(), 0, "lowered when the close ends the stream");
+    assert!(ops.next().await.is_none());
+    assert_eq!(gauge.get(), 0);
 }

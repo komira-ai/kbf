@@ -46,6 +46,15 @@ fn stores(name: &str) -> [String; 4] {
 /// How long a test waits for the server to print its start line or to exit.
 const BOUND: Duration = Duration::from_secs(10);
 
+/// The address `key` names in a start line.
+fn address(line: &str, key: &str) -> SocketAddr {
+    line.split_whitespace()
+        .find_map(|w| w.strip_prefix(key))
+        .unwrap_or_else(|| panic!("no {key} in {line:?}"))
+        .parse()
+        .expect("an address")
+}
+
 /// A running server, killed and reaped when dropped, so a failed assertion never
 /// leaves it running.
 struct Running(Child);
@@ -54,6 +63,12 @@ impl Running {
     /// Starts the server with `args` on free loopback ports; it and the REAPI and
     /// worker addresses of its start line.
     fn start(args: &[&str]) -> (Self, SocketAddr, SocketAddr) {
+        let (child, line) = Self::start_line(args);
+        (child, address(&line, "reapi="), address(&line, "worker="))
+    }
+
+    /// [`Running::start`], and the start line itself.
+    fn start_line(args: &[&str]) -> (Self, String) {
         let mut child = Self(
             Command::new(BIN)
                 .args(["--listen", "127.0.0.1:0", "--worker-listen", "127.0.0.1:0"])
@@ -74,21 +89,21 @@ impl Running {
             .recv_timeout(BOUND)
             .expect("a start line in time")
             .expect("a start line");
-        let addr = |key: &str| -> SocketAddr {
-            line.split_whitespace()
-                .find_map(|w| w.strip_prefix(key))
-                .unwrap_or_else(|| panic!("no {key} in {line:?}"))
-                .parse()
-                .expect("an address")
-        };
-        let (reapi, worker) = (addr("reapi="), addr("worker="));
-        (child, reapi, worker)
+        (child, line)
     }
 
+    /// Sends SIGTERM: the first of a drain, or the second that ends it.
     fn terminate(&self) {
         let pid = i32::try_from(self.0.id()).expect("pid");
         // SAFETY: kill(2) on the child this test spawned and has not reaped.
         assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    }
+
+    /// SIGTERM, then waits for the exit 0 (a server killed on drop writes no coverage).
+    async fn stop(&mut self) {
+        self.terminate();
+        let status = self.exited(PROMPT).await;
+        assert!(status.success(), "kbf-server exited with {status}");
     }
 
     /// Waits up to `within` for the server to exit; panics (and so kills it) if it
@@ -271,23 +286,11 @@ async fn zero_turns_progress_off() {
     assert!(status.success(), "kbf-server exited with {status}");
 }
 
-/// Catches (komira-build-farm#791): a REAPI listener built without HTTP/2 keepalive.
-/// A client that connects, says nothing and answers nothing is sent a PING frame by
-/// the server within `--http2-keepalive-interval-secs`. The planted mutant is
-/// `keepalive` not applied to the REAPI builder (no PING arrives).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_reapi_listener_pings_an_idle_connection() {
+/// Reads frames from `addr` after the HTTP/2 preface and an empty SETTINGS, saying
+/// nothing more, until the server sends a PING (not an acknowledgement of ours).
+async fn expects_a_ping_from(addr: SocketAddr, what: &str) {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    let (_server, reapi, _worker) = Running::start(&[
-        "--http2-keepalive-interval-secs",
-        "1",
-        "--http2-keepalive-timeout-secs",
-        "5",
-    ]);
-    let mut conn = tokio::net::TcpStream::connect(reapi)
-        .await
-        .expect("connect");
-    // The HTTP/2 preface and an empty SETTINGS frame, then silence.
+    let mut conn = tokio::net::TcpStream::connect(addr).await.expect("connect");
     conn.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
         .await
         .expect("preface");
@@ -312,7 +315,38 @@ async fn the_reapi_listener_pings_an_idle_connection() {
     };
     tokio::time::timeout(PROMPT, ping)
         .await
-        .expect("a PING frame within the bound (no keepalive?)");
+        .unwrap_or_else(|_| panic!("{what}: a PING frame within the bound (no keepalive?)"));
+}
+
+/// Catches (komira-build-farm#791): a REAPI listener built without HTTP/2 keepalive.
+/// A client that connects, says nothing and answers nothing is sent a PING frame by
+/// the server within `--http2-keepalive-interval-secs`. The planted mutant is
+/// `keepalive` not applied to the REAPI builder (no PING arrives).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_reapi_listener_pings_an_idle_connection() {
+    let (mut server, reapi, _worker) = Running::start(&[
+        "--http2-keepalive-interval-secs",
+        "1",
+        "--http2-keepalive-timeout-secs",
+        "5",
+    ]);
+    expects_a_ping_from(reapi, "the REAPI listener").await;
+    server.stop().await;
+}
+
+/// The same for the worker listener, which a daemon's stream (a lease's whole life)
+/// crosses a proxy on. The planted mutant is `keepalive` not applied to the worker
+/// builder: the REAPI test above stays green, this one gets no PING.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_worker_listener_pings_an_idle_connection() {
+    let (mut server, _reapi, worker) = Running::start(&[
+        "--http2-keepalive-interval-secs",
+        "1",
+        "--http2-keepalive-timeout-secs",
+        "5",
+    ]);
+    expects_a_ping_from(worker, "the worker listener").await;
+    server.stop().await;
 }
 
 /// Whether `op` is queued with the reason no live worker can run it.
@@ -365,4 +399,152 @@ async fn a_stuck_upload_is_cut_off_at_the_shutdown_timeout() {
         "stopped after {took:?}, before the 1 s shutdown timeout"
     );
     drop(chunks);
+}
+
+/// A token file for `--api-token-file`: mode 0600, unique to this call.
+fn token_file(name: &str) -> (String, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let token = "kbf-test-token-0123456789abcdef0123456789".to_owned();
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-shutdown");
+    std::fs::create_dir_all(&dir).expect("a directory");
+    let path = dir.join(format!("{name}-{}", std::process::id()));
+    std::fs::write(&path, format!("{token}\n")).expect("write the token");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    (token, path)
+}
+
+/// A GET or POST of the operator API at `api`, off the async threads.
+async fn api(
+    api: SocketAddr,
+    token: Option<&str>,
+    method: &'static str,
+    path: &'static str,
+) -> kbf_server::api_client::Reply {
+    let token = token.map(str::to_owned);
+    tokio::task::spawn_blocking(move || {
+        let client = kbf_server::api_client::OperatorClient::new(api, token);
+        match method {
+            "GET" => client.get(path),
+            _ => client.post(path, ""),
+        }
+        .expect("a reply")
+    })
+    .await
+    .expect("the call runs")
+}
+
+/// Waits until `GET /readyz` is 503, which a stop signal or a drain makes it.
+async fn not_ready(addr: SocketAddr) {
+    let deadline = Instant::now() + PROMPT;
+    while api(addr, None, "GET", "/readyz").await.status != 503 {
+        assert!(Instant::now() < deadline, "/readyz still ready");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Catches a second SIGTERM that is swallowed (the handler of the first is all there
+/// is): systemd, an operator or the rollout that waited out its drain sends another to
+/// end the drain, and with no shutdown timeout (the default) nothing else would.
+/// The first SIGTERM drains and the stream is kept (the status names it: one stream
+/// open, one operation queued); the second ends the stream UNAVAILABLE and the server
+/// exits 0. The planted mutant is `serve_escalating` not spawning the escalation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_sigterm_ends_the_drain() {
+    let (mut server, line) = Running::start_line(&["--api-listen", "127.0.0.1:0"]);
+    let (reapi, worker, operator) = (
+        address(&line, "reapi="),
+        address(&line, "worker="),
+        address(&line, "api="),
+    );
+    let client = Client::connect(reapi, worker).await;
+    let job = Job::new("ended by a second signal", &[]);
+    client.upload(&job.blobs()).await;
+    let mut executed = client.execute(&job.action).await;
+    loop {
+        let op = tokio::time::timeout(PROMPT, executed.message())
+            .await
+            .expect("an update in time")
+            .expect("healthy")
+            .expect("an update");
+        if waits_for_a_worker(&op) {
+            break;
+        }
+    }
+
+    server.terminate();
+    not_ready(operator).await;
+    let drain = api(operator, None, "GET", "/v1/frontend/drain").await;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&drain.body).expect("JSON"),
+        serde_json::json!({"draining": true, "open_executions": 1, "queued_operations": 1}),
+        "the first signal drains and keeps the stream"
+    );
+
+    server.terminate();
+    let status = tokio::time::timeout(PROMPT, executed.message())
+        .await
+        .expect("the stream ends after the second signal")
+        .expect_err("it ends with an error");
+    assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+    assert!(status.message().contains("shutting down"), "{status:?}");
+    drop(executed);
+    drop(client);
+    let status = server.exited(PROMPT).await;
+    assert!(status.success(), "kbf-server exited with {status}");
+}
+
+/// Catches a drain endpoint that does not drain the binary: `POST /v1/frontend/drain`
+/// takes it out of `/readyz`, refuses a new Execute, and keeps the open stream; the
+/// server then exits 0 by itself when the stream is gone, with no signal (so the run
+/// writes its coverage). The planted mutant is the endpoint answering 200 and doing
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_drain_endpoint_drains_the_binary_and_it_exits_when_the_streams_are_done() {
+    let (token, path) = token_file("endpoint");
+    let path = path.display().to_string();
+    let (mut server, line) =
+        Running::start_line(&["--api-listen", "127.0.0.1:0", "--api-token-file", &path]);
+    let (reapi, worker, operator) = (
+        address(&line, "reapi="),
+        address(&line, "worker="),
+        address(&line, "api="),
+    );
+    let client = Client::connect(reapi, worker).await;
+    let job = Job::new("drained in the binary", &[]);
+    client.upload(&job.blobs()).await;
+    let mut executed = client.execute(&job.action).await;
+    loop {
+        let op = tokio::time::timeout(PROMPT, executed.message())
+            .await
+            .expect("an update in time")
+            .expect("healthy")
+            .expect("an update");
+        if waits_for_a_worker(&op) {
+            break;
+        }
+    }
+
+    let begun = api(operator, Some(&token), "POST", "/v1/frontend/drain").await;
+    assert_eq!(begun.status, 200, "{begun:?}");
+    not_ready(operator).await;
+    // UNAVAILABLE from the service, or a transport error once the connection has been
+    // sent GOAWAY: either way the call is not taken.
+    let refused = client.execute_with(&job.action, false).await;
+    refused.expect_err("a new Execute during the drain");
+    let drain = api(operator, None, "GET", "/v1/frontend/drain").await;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&drain.body).expect("JSON"),
+        serde_json::json!({"draining": true, "open_executions": 1, "queued_operations": 1}),
+        "the refused Execute was queued"
+    );
+    assert!(
+        server.0.try_wait().expect("try_wait").is_none(),
+        "the server exited with a stream open"
+    );
+
+    // The client goes away; the server has nothing left to wait for and exits 0.
+    drop(executed);
+    drop(client);
+    let status = server.exited(PROMPT).await;
+    assert!(status.success(), "kbf-server exited with {status}");
 }
