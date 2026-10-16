@@ -186,6 +186,11 @@ mod tests {
         );
         assert_eq!(upload_id(created.as_bytes()).unwrap(), "abc.def-1");
         assert!(upload_id(b"<InitiateMultipartUploadResult/>").is_err());
+        let empty =
+            b"<InitiateMultipartUploadResult><UploadId></UploadId></InitiateMultipartUploadResult>";
+        assert!(upload_id(empty).is_err(), "an empty upload id");
+        assert!(upload_id(b"\xff\xfe").is_err(), "not UTF-8");
+        assert!(upload_id(b"<unclosed").is_err(), "not XML");
         assert!(upload_id(b"<Error><UploadId>x</UploadId></Error>").is_err());
         let body = complete_request(&["\"a1\"".into(), "b&2".into()]);
         assert!(
@@ -200,10 +205,8 @@ mod tests {
         );
         assert!(complete_answer(done.as_bytes()).is_ok());
         let late = b"<Error><Code>InternalError</Code><Message>m</Message></Error>";
-        assert!(matches!(
-            complete_answer(late),
-            Err(ObjectStoreError::Service { status: 200, code, .. }) if code == "InternalError"
-        ));
+        let late = complete_answer(late).err().map(|e| e.to_string());
+        assert_eq!(late.as_deref(), Some("store answered 200 InternalError: m"));
         assert!(matches!(
             complete_answer(b""),
             Err(ObjectStoreError::Protocol(_))

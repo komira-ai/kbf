@@ -597,22 +597,7 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
         packed: &BTreeSet<Digest>,
     ) -> Result<Vec<(Digest, Location)>, CacheError> {
         let (segment, key, footer) = self.store_segment(group, body, packed.len()).await?;
-        packed
-            .iter()
-            .map(|d| {
-                let entry = footer.find(d).ok_or_else(|| {
-                    CacheError::Internal(format!("segment {key} came back without blob {d}"))
-                })?;
-                Ok((
-                    *d,
-                    Location {
-                        store: StoreId::CONFIGURED,
-                        object: segment,
-                        offset: entry.offset,
-                    },
-                ))
-            })
-            .collect()
+        placed(&footer, &key, segment, packed.iter().copied())
     }
 
     /// Stores one whole segment of `records` records: under one of `group`'s
@@ -722,6 +707,35 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
             other => Err(unexpected(&other)),
         }
     }
+}
+
+/// Where each of `digests` is in `object` (under `key`), as its `footer` read back from
+/// the store says.
+///
+/// # Errors
+/// [`CacheError::Internal`] for a digest the footer does not list: the store holds
+/// another object than the one written.
+pub(super) fn placed(
+    footer: &Footer,
+    key: &ObjectKey,
+    object: ObjectId,
+    digests: impl Iterator<Item = Digest>,
+) -> Result<Vec<(Digest, Location)>, CacheError> {
+    let at = |d: Digest| {
+        let entry = footer.find(&d);
+        let entry =
+            entry.ok_or_else(|| CacheError::Internal(format!("{key} came back without {d}")));
+        let offset = entry?.offset;
+        Ok((
+            d,
+            Location {
+                store: StoreId::CONFIGURED,
+                object,
+                offset,
+            },
+        ))
+    };
+    digests.map(at).collect()
 }
 
 /// Whether a failed PUT may be tried again: it did not complete (connect, reset,

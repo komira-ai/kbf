@@ -110,6 +110,17 @@ mod tests {
         NonZeroUsize::MIN.saturating_add(1)
     }
 
+    /// Catches a hashing job that panicked in a streamed write's body taken for
+    /// anything but the body's failure (the write must end, storing nothing).
+    #[test]
+    fn a_failed_job_fails_a_streamed_body() {
+        let failed = kbf_objstore::ObjectStoreError::from(JobFailed("it panicked".into()));
+        assert_eq!(
+            failed.to_string(),
+            "the body of a streamed write failed: a hashing job failed: it panicked"
+        );
+    }
+
     /// Eight jobs offered at once to a pool of two run two at a time: never more (the
     /// bound), and two together (it is a pool, not a lock).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

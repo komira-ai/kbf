@@ -6,13 +6,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use futures::StreamExt;
-use kbf_meta::{Location, StoreId};
 use kbf_objstore::{BodyStream, ObjectStore, ObjectStoreError};
 use kbf_segments::layout::{encode_footer, footer_len};
 use kbf_segments::{IndexEntry, RecordHasher};
 use kbf_types::Digest;
 
-use super::write_group::{Group, read_back};
+use super::write_group::{Group, placed, read_back};
 use super::{Cache, CacheError};
 use crate::meta_log::MetaLog;
 
@@ -65,18 +64,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             .read_footer(&key, total)
             .await
             .map_err(read_back)?;
-        let entry = footer.find(&digest).filter(|e| e.offset == 0);
-        if entry.is_none() {
-            return Err(CacheError::Internal(format!(
-                "object {key} came back without blob {digest}"
-            )));
-        }
-        let at = Location {
-            store: StoreId::CONFIGURED,
-            object,
-            offset: 0,
-        };
-        self.writer.commit_segment(vec![(digest, at)]).await
+        let at = placed(&footer, &key, object, std::iter::once(digest))?;
+        self.writer.commit_segment(at).await
     }
 }
 

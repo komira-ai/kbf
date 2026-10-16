@@ -437,10 +437,8 @@ async fn streamed_put<S: ObjectStore>(
     let body = pattern(STREAMED_LEN, 11);
     let len = body.len() as u64;
     let k = key(prefix, "streamed")?;
-    store
-        .put_stream(&k, len, streamed(&body, None))
-        .await
-        .map_err(|e| format!("put_stream {k}: {e}"))?;
+    let wrote = store.put_stream(&k, len, streamed(&body, None)).await;
+    ensure!(wrote.is_ok(), "put_stream {k}: {wrote:?}");
     const WINDOW: usize = 4 << 20;
     for at in (0..body.len()).step_by(WINDOW) {
         let n = WINDOW.min(body.len() - at);
@@ -462,19 +460,16 @@ async fn streamed_put<S: ObjectStore>(
     let wrote = store
         .put_stream(&short, len + 1, streamed(&body, None))
         .await;
-    ensure!(
-        matches!(wrote, Err(ObjectStoreError::Body(_))),
-        "{short}: a body one byte short answered {wrote:?}"
-    );
+    let refused = matches!(wrote, Err(ObjectStoreError::Body(_)));
+    ensure!(refused, "{short}: a short body answered {wrote:?}");
     absent(store, &short).await?;
     if !caps.conditional_put {
         return Ok(Outcome::Passed);
     }
     let other = pattern(STREAMED_LEN, 12);
-    match store.put_stream(&k, len, streamed(&other, None)).await {
-        Err(ObjectStoreError::AlreadyExists(_)) => {}
-        other => return Err(format!("{k}: streamed overwrite answered {other:?}")),
-    }
+    let again = store.put_stream(&k, len, streamed(&other, None)).await;
+    let refused = matches!(again, Err(ObjectStoreError::AlreadyExists(_)));
+    ensure!(refused, "{k}: a streamed overwrite answered {again:?}");
     let kept = read(store, &k, range(0, 64)).await?;
     ensure!(
         kept == body.slice(..64),

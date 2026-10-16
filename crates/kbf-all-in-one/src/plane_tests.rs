@@ -3,7 +3,7 @@
 
 use std::os::fd::OwnedFd;
 
-use kbf_front::{Cache, SegmentsConfig};
+use kbf_front::{Cache, MetaLog as _, SegmentsConfig};
 use kbf_transfer::{FileSource, RecordHasher, Source, Stamp, digest_of, fetch};
 
 use super::*;
@@ -167,4 +167,69 @@ fn put_chunks_refuses_a_large_blob_and_stores_a_small_one() {
         let read = plane.put_chunks(digest_of(b"x"), failing).await;
         assert!(matches!(read, Err(CasError::Read(..))), "{read:?}");
     });
+}
+
+/// Catches a `read_to` that writes other bytes than the blob's, takes a blob whose
+/// bytes fail their digest (past its first window) for read, answers a file it cannot
+/// write as anything but `Write`, or a blob not held as anything but `Missing`. A held
+/// blob reads into its file; one of 9 MiB with its last byte flipped in the store is
+/// `Unavailable`; a file opened read-only is `Write`; an absent blob is `Missing`.
+#[test]
+fn read_to_writes_the_blob_or_says_why_not() {
+    use kbf_meta::BlobAnswer;
+    use kbf_objstore::{ByteRange, ObjectStore};
+    let server = server();
+    let cache = {
+        let _context = server.enter();
+        Arc::new(Cache::memory())
+    };
+    let store = {
+        let _context = server.enter();
+        LocalStore::new(Arc::clone(&cache), SegmentsConfig::DEFAULT)
+    };
+    let plane = LocalDataPlane::new(store, server.handle().clone());
+    let path = std::env::temp_dir().join(format!("kbf-read-to-{}", std::process::id()));
+    server.block_on(async {
+        let held = plane.put(b"held bytes".to_vec()).await.expect("put");
+        let mut file = tokio::fs::File::create(&path).await.expect("create");
+        plane.read_to(&held, &mut file).await.expect("read");
+        assert_eq!(std::fs::read(&path).expect("read back"), b"held bytes");
+        let mut read_only = tokio::fs::File::open(&path).await.expect("open");
+        let refused = plane.read_to(&held, &mut read_only).await;
+        assert!(matches!(refused, Err(CasError::Write(..))), "{refused:?}");
+        let absent = digest_of(b"absent");
+        let missing = plane.read_to(&absent, &mut file).await;
+        assert_eq!(missing, Err(CasError::Missing(label(&absent))));
+
+        let large = vec![5u8; 9 << 20];
+        let digest = plane.put(large.clone()).await.expect("put");
+        let parsed = parse(&digest).expect("a digest");
+        let answer = cache
+            .meta()
+            .query(move |s| s.blob(&parsed))
+            .await
+            .expect("query");
+        let BlobAnswer::Present { location, .. } = answer else {
+            panic!("{answer:?}");
+        };
+        let key = cache.object_key(location.object).expect("key");
+        let all = ByteRange::new(0, u64::from(u32::MAX)).expect("range");
+        let mut stored = cache
+            .objects()
+            .get_range(&key, all)
+            .await
+            .expect("get")
+            .to_vec();
+        let last = usize::try_from(location.offset).expect("offset") + large.len() - 1;
+        stored[last] ^= 1;
+        cache.objects().delete(&key).await.expect("delete");
+        let replaced = cache.objects().put_new(&key, stored.into(), None).await;
+        replaced.expect("put");
+        let damaged = plane.read_to(&digest, &mut file).await;
+        assert!(
+            matches!(damaged, Err(CasError::Unavailable(..))),
+            "{damaged:?}"
+        );
+    });
+    let _ = std::fs::remove_file(&path);
 }

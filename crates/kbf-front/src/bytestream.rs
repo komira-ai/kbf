@@ -336,14 +336,13 @@ fn messages(
                 Some(message) => message,
                 None => match r.stream.message().await {
                     Ok(Some(message)) => message,
-                    Ok(None) => {
+                    // The stream ended without `finish_write`, or broke.
+                    ended => {
                         r.finished = true;
-                        let ended = "write stream ended without finish_write";
-                        return Some((refuse(Status::invalid_argument(ended)), r));
-                    }
-                    Err(status) => {
-                        r.finished = true;
-                        return Some((refuse(status), r));
+                        let ended = ended.err().unwrap_or_else(|| {
+                            Status::invalid_argument("write stream ended without finish_write")
+                        });
+                        return Some((refuse(ended), r));
                     }
                 },
             };

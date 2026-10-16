@@ -103,20 +103,19 @@ impl Upload {
 }
 
 impl Drop for Upload {
+    /// Aborts an upload still open from a task of its own; outside a runtime it is left
+    /// for the bucket's lifecycle rule.
     fn drop(&mut self) {
         if !self.open {
             return;
         }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            tracing::warn!(key = %self.key, "a multipart upload dropped outside a runtime is left for the bucket's lifecycle rule");
-            return;
-        };
         let (conn, key, id) = (
             Arc::clone(&self.conn),
             self.key.clone(),
             std::mem::take(&mut self.id),
         );
-        runtime.spawn(async move { abort(&conn, &key, &id).await });
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        runtime.map(|r| r.spawn(async move { abort(&conn, &key, &id).await }));
     }
 }
 
@@ -212,21 +211,23 @@ async fn complete(upload: &Upload, etags: &[String]) -> Result<(), ObjectStoreEr
     }
 }
 
-/// AbortMultipartUpload. An upload the store no longer knows (completed after all, or
-/// aborted already) needs nothing more.
+/// AbortMultipartUpload; a failure is logged. An upload the store no longer knows
+/// (completed after all, or aborted already) needs nothing more.
 async fn abort(conn: &Conn, key: &ObjectKey, id: &str) {
+    if let Err(e) = try_abort(conn, key, id).await {
+        tracing::warn!(%key, error = %e, "a multipart upload could not be aborted; the bucket's lifecycle rule must remove it");
+    }
+}
+
+async fn try_abort(conn: &Conn, key: &ObjectKey, id: &str) -> Result<(), ObjectStoreError> {
     let query = [("uploadId", id.to_owned())];
-    let sent = conn
+    let resp = conn
         .send(Method::DELETE, Some(key), &query, Vec::new(), Bytes::new())
-        .await;
-    let failed = match sent {
-        Ok(resp) => match resp.status() {
-            StatusCode::NO_CONTENT | StatusCode::OK | StatusCode::NOT_FOUND => return,
-            _ => failure(resp).await,
-        },
-        Err(e) => e,
-    };
-    tracing::warn!(%key, error = %failed, "a multipart upload could not be aborted; the bucket's lifecycle rule must remove it");
+        .await?;
+    match resp.status() {
+        StatusCode::NO_CONTENT | StatusCode::OK | StatusCode::NOT_FOUND => Ok(()),
+        _ => Err(failure(resp).await),
+    }
 }
 
 #[cfg(test)]

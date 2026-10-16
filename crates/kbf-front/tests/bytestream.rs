@@ -168,6 +168,30 @@ async fn bytestream_write_refuses_wrong_bytes_and_offsets() {
         .expect_err("skewed offset");
     assert_eq!(refused.code(), Code::InvalidArgument);
 
+    let mut renamed = chunks(&name, &blob.data, 10);
+    renamed[1].resource_name = write_name(&Blob::new(pseudo_random(30, 2)));
+    let refused = farm
+        .bytestream()
+        .write(futures::stream::iter(renamed))
+        .await
+        .expect_err("renamed");
+    assert!(
+        refused.message().contains("changed resource"),
+        "{refused:?}"
+    );
+
+    let mut long = chunks(&name, &blob.data, 10);
+    long[2].data.push(0);
+    let refused = farm
+        .bytestream()
+        .write(futures::stream::iter(long))
+        .await
+        .expect_err("too long");
+    assert!(
+        refused.message().contains("more than the 30 bytes"),
+        "{refused:?}"
+    );
+
     let mut unfinished = chunks(&name, &blob.data, 10);
     unfinished[2].finish_write = false;
     let refused = farm

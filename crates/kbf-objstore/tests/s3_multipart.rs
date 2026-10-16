@@ -296,3 +296,98 @@ async fn an_abort_that_fails_leaves_the_write_failed_with_its_own_error() {
     );
     assert_eq!(s3.incomplete_uploads(), 1);
 }
+
+/// Catches the S3 store reading a missing object or a range past an object's end as
+/// anything but `NotFound` and `InvalidRange` (the cache marks an object missing on the
+/// first), and a conditional single PUT over an existing key not refused.
+#[tokio::test]
+async fn missing_objects_ranges_past_the_end_and_taken_keys_are_told_apart() {
+    let s3 = FakeS3::start().await;
+    let store = s3.store(CONDITIONAL);
+    let k = key("small");
+    let one = ByteRange::new(0, 1).unwrap();
+    let missing = store.get_range(&k, one).await;
+    assert!(
+        matches!(missing, Err(ObjectStoreError::NotFound(_))),
+        "{missing:?}"
+    );
+    store
+        .put_new(&k, Bytes::from_static(b"abc"), None)
+        .await
+        .unwrap();
+    let past = store.get_range(&k, ByteRange::new(3, 1).unwrap()).await;
+    assert!(
+        matches!(past, Err(ObjectStoreError::InvalidRange { .. })),
+        "{past:?}"
+    );
+    let again = store.put_new(&k, Bytes::from_static(b"xyz"), None).await;
+    assert!(
+        matches!(again, Err(ObjectStoreError::AlreadyExists(_))),
+        "{again:?}"
+    );
+    assert_eq!(
+        store.get_range(&k, one).await.unwrap(),
+        Bytes::from_static(b"a")
+    );
+}
+
+/// Catches a fake S3 service that completes what S3 would refuse: an upload it never
+/// began, a completion that does not parse, one naming a part it does not hold, and one
+/// whose first part is under 5 MiB; and one that answers a request it does not serve.
+/// Each is refused with S3's code, and nothing is completed.
+#[tokio::test]
+async fn the_fake_refuses_what_s3_refuses() {
+    let s3 = FakeS3::start().await;
+    let client = reqwest::Client::new();
+    let url = |path: &str| format!("{}/kbf-fake/cas/k{path}", s3.endpoint());
+    let complete = |id: &str, body: String| {
+        client
+            .post(url(&format!("?uploadId={id}")))
+            .body(body)
+            .send()
+    };
+    let refused = |answer: reqwest::Response| async move {
+        assert_eq!(answer.status(), 400);
+        answer.text().await.unwrap()
+    };
+    let never = complete("never", String::new()).await.unwrap();
+    assert!(refused(never).await.contains("NoSuchUpload"));
+    let created = client.post(url("?uploads")).send().await.unwrap();
+    assert!(
+        created
+            .text()
+            .await
+            .unwrap()
+            .contains("<UploadId>upload-1</UploadId>")
+    );
+    let mut etags = Vec::new();
+    for n in 1..=2 {
+        let part = client
+            .put(url(&format!("?partNumber={n}&uploadId=upload-1")))
+            .body("small")
+            .send()
+            .await
+            .unwrap();
+        etags.push(part.headers()["etag"].to_str().unwrap().to_owned());
+    }
+    let named = |parts: &[(u32, &str)]| {
+        let parts: String = parts
+            .iter()
+            .map(|(n, e)| format!("<Part><PartNumber>{n}</PartNumber><ETag>{e}</ETag></Part>"))
+            .collect();
+        format!("<CompleteMultipartUpload>{parts}</CompleteMultipartUpload>")
+    };
+    let cases = [
+        ("not xml".to_owned(), "MalformedXML"),
+        (named(&[(9, &etags[0])]), "InvalidPart"),
+        (named(&[(1, "\"other\"")]), "InvalidPart"),
+        (named(&[(1, &etags[0]), (2, &etags[1])]), "EntityTooSmall"),
+    ];
+    for (body, code) in cases {
+        let answer = complete("upload-1", body).await.unwrap();
+        assert!(refused(answer).await.contains(code), "{code}");
+    }
+    let other = client.head(url("")).send().await.unwrap();
+    assert_eq!(other.status(), 501);
+    assert_eq!((s3.stats().completed, s3.incomplete_uploads()), (0, 1));
+}

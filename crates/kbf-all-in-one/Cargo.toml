@@ -48,6 +48,9 @@ kbf-cas-conformance.workspace = true
 kbf-daemon.workspace = true
 # The image store layout the stand-in `podman` reads (tests/binary.rs).
 kbf-driver-container.workspace = true
+# Where a blob is and the store it is in, to damage one (src/plane_tests.rs).
+kbf-meta.workspace = true
+kbf-objstore.workspace = true
 # The act steps the stand-in `podman` runs as each action, through this test binary.
 kbf-testkit.workspace = true
 prost.workspace = true

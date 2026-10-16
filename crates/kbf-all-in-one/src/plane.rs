@@ -195,31 +195,25 @@ impl Cas for LocalDataPlane {
     async fn read_to(&self, digest: &Digest, file: &mut tokio::fs::File) -> Result<(), CasError> {
         use tokio::io::AsyncWriteExt as _;
         let blob = label(digest);
-        let Some(parsed) = parse(digest) else {
-            return Err(CasError::Missing(blob));
-        };
+        let unread = |status: Status| unread(blob.clone(), &status);
+        let unwritten = |e: std::io::Error| CasError::Write(blob.clone(), e.to_string());
+        let parsed = parse(digest).ok_or(Status::not_found("not a digest"));
         let store = self.store.clone();
-        let opened = self.call(async move { store.read(&parsed).await.map_err(Status::from) });
-        let mut read = opened
-            .await
-            .map_err(|status| unread(blob.clone(), &status))?;
+        let opened = self.call(async move { store.read(&parsed?).await.map_err(Status::from) });
+        let mut read = opened.await.map_err(unread)?;
         loop {
             let next = self.call(async move {
-                let window = read.next().await;
+                let window = read.next().await.transpose().map_err(Status::from);
                 Ok((read, window))
             });
-            let (back, window) = next.await.map_err(|status| unread(blob.clone(), &status))?;
+            let (back, window) = next.await.map_err(unread)?;
             read = back;
-            let Some(window) = window else {
+            let Some(window) = window.map_err(unread)? else {
                 break;
             };
-            let window = window.map_err(|e| unread(blob.clone(), &Status::from(e)))?;
-            let written = file.write_all(&window).await;
-            written.map_err(|e| CasError::Write(blob.clone(), e.to_string()))?;
+            file.write_all(&window).await.map_err(unwritten)?;
         }
-        file.flush()
-            .await
-            .map_err(|e| CasError::Write(blob, e.to_string()))
+        file.flush().await.map_err(unwritten)
     }
 
     async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CasError> {

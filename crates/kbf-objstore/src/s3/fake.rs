@@ -171,8 +171,10 @@ impl FakeS3 {
         let state = Arc::new(Mutex::new(State::default()));
         let shared = Arc::clone(&state);
         tokio::spawn(async move {
-            while let Ok((sock, _)) = listener.accept().await {
-                tokio::spawn(serve(sock, Arc::clone(&shared)));
+            loop {
+                let accepted = listener.accept().await;
+                let serving = accepted.map(|(sock, _)| serve(sock, Arc::clone(&shared)));
+                serving.map(tokio::spawn).ok();
             }
         });
         Self { endpoint, state }
@@ -246,23 +248,20 @@ struct Request {
     body: Vec<u8>,
 }
 
-async fn serve(mut sock: TcpStream, state: Arc<Mutex<State>>) {
+/// Serves one connection's requests, one after another, until it closes.
+async fn serve(mut sock: TcpStream, state: Arc<Mutex<State>>) -> Option<()> {
     let mut buf = Vec::new();
     let mut chunk = vec![0u8; RUN];
     loop {
-        let head_end = loop {
-            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                break i + 4;
-            }
-            match sock.read(&mut chunk).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            }
-        };
+        let mut head_end = buf.windows(4).position(|w| w == b"\r\n\r\n");
+        while head_end.is_none() {
+            let n = sock.read(&mut chunk).await.ok().filter(|n| *n > 0)?;
+            buf.extend_from_slice(&chunk[..n]);
+            head_end = buf.windows(4).position(|w| w == b"\r\n\r\n");
+        }
+        let head_end = head_end? + 4;
         let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
-        let Some(mut request) = parse_head(&head) else {
-            return;
-        };
+        let mut request = parse_head(&head)?;
         let len: usize = request
             .headers
             .get("content-length")
@@ -270,10 +269,8 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<State>>) {
             .unwrap_or(0);
         buf.reserve((head_end + len).saturating_sub(buf.len()));
         while buf.len() < head_end + len {
-            match sock.read(&mut chunk).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            }
+            let n = sock.read(&mut chunk).await.ok().filter(|n| *n > 0)?;
+            buf.extend_from_slice(&chunk[..n]);
         }
         let rest = buf.split_off(head_end + len);
         request.body = buf.split_off(head_end);
@@ -282,9 +279,7 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<State>>) {
             let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
             handle(&mut state, &request)
         };
-        if sock.write_all(&answer).await.is_err() {
-            return;
-        }
+        sock.write_all(&answer).await.ok()?;
     }
 }
 
@@ -438,10 +433,8 @@ fn assemble(upload: &Upload, body: &[u8]) -> Result<Kept, &'static str> {
 
 /// CompleteMultipartUpload ([`assemble`]); conditional on `If-None-Match: *`.
 fn complete(state: &mut State, id: &str, key: &str, conditional: bool, body: &[u8]) -> Vec<u8> {
-    let Some(upload) = state.uploads.get(id).filter(|u| u.key == key) else {
-        return error("404 Not Found", "NoSuchUpload");
-    };
-    let object = match assemble(upload, body) {
+    let upload = state.uploads.get(id).filter(|u| u.key == key);
+    let object = match upload.ok_or("NoSuchUpload").and_then(|u| assemble(u, body)) {
         Ok(object) => object,
         Err(code) => return error("400 Bad Request", code),
     };

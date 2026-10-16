@@ -37,9 +37,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::StreamExt;
-use kbf_meta::{
-    Applied, Command, Location, ObjectId, StagedObject, StagedState, StoreId, UnreachableReason,
-};
+use kbf_meta::{Applied, Command, ObjectId, StagedObject, StagedState, UnreachableReason};
 use kbf_objstore::{BodyStream, ObjectStore, ObjectStoreError};
 use kbf_segments::layout::{encode_footer, footer_len};
 use kbf_segments::{Footer, IndexEntry};
@@ -49,7 +47,7 @@ use kbf_types::Digest;
 use super::read::READ_WINDOW_BYTES;
 use super::tier::{Staging, blocking};
 use super::verify::{RecordCheck, Verified};
-use super::write_group::{Group, Writer, read_back};
+use super::write_group::{Group, Writer, placed, read_back};
 use super::{Cache, CacheError, unexpected};
 use crate::meta_log::MetaLog;
 
@@ -398,23 +396,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             .read_footer(&key, total)
             .await
             .map_err(read_back)?;
-        let placed = good
-            .iter()
-            .map(|entry| {
-                let found = footer.find(&entry.digest).ok_or_else(|| {
-                    CacheError::Internal(format!(
-                        "object {key} came back without blob {}",
-                        entry.digest
-                    ))
-                })?;
-                let at = Location {
-                    store: StoreId::CONFIGURED,
-                    object: sound,
-                    offset: found.offset,
-                };
-                Ok((entry.digest, at))
-            })
-            .collect::<Result<Vec<_>, CacheError>>()?;
+        let placed = placed(&footer, &key, sound, good.iter().map(|e| e.digest))?;
         self.writer.commit_segment(placed).await
     }
 

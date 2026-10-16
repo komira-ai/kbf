@@ -143,6 +143,12 @@ mod tests {
         assert_eq!(one, [&b"abcd"[..], b"efgh", b"ij"]);
         let exact = parts(&[b"ab", b"cd"], 4, 4).unwrap();
         assert_eq!(exact, [&b"abcd"[..]]);
+        let trailing = parts(&[b"abcd", b"", b""], 4, 4).unwrap();
+        assert_eq!(
+            trailing,
+            [&b"abcd"[..]],
+            "empty pieces after the end are no bytes"
+        );
     }
 
     /// Catches: a body longer or shorter than declared written as if it were whole
@@ -175,9 +181,10 @@ mod tests {
             let mut parts = Parts::new(failing, 4);
             parts.next(4).await
         });
-        assert!(
-            matches!(&got, Err(ObjectStoreError::Body(m)) if m == "the source broke"),
-            "{got:?}"
+        let why = got.err().map(|e| e.to_string());
+        assert_eq!(
+            why.as_deref(),
+            Some("the body of a streamed write failed: the source broke")
         );
     }
 }
