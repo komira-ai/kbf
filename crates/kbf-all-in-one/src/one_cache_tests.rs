@@ -1,20 +1,7 @@
 //! When the two halves keep one cache.
 
-use std::path::PathBuf;
-
 use super::*;
 use crate::cli::{Flags, command, parse};
-
-/// A directory under the test binary's (unit tests get no `CARGO_TARGET_TMPDIR`); not
-/// made: the check judges a path by its nearest existing directory.
-fn under_target(name: &str) -> PathBuf {
-    std::env::current_exe()
-        .expect("test binary")
-        .parent()
-        .expect("deps")
-        .join("kbf-all-in-one-unit")
-        .join(format!("{name}-{}", std::process::id()))
-}
 
 fn flags(extra: &[String]) -> Flags {
     let base = [
@@ -55,7 +42,7 @@ fn a_hot_store_on_the_data_directorys_disk_is_one_cache() {
         .as_ref()
         .expect("the server half's");
     assert!(Arc::ptr_eq(&local, server));
-    assert!(daemon_shares(&flags));
+    assert!(daemon_holds(&local, &flags.daemon));
 }
 
 /// Catches one cache made where the halves do not share a disk (the budget would count

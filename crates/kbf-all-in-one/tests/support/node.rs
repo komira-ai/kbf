@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::Duration;
 
-use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair, SanType};
 
 /// How long the test waits for what should happen promptly.
 pub(crate) const PROMPT: Duration = Duration::from_secs(60);
@@ -19,8 +19,9 @@ pub(crate) const PROMPT: Duration = Duration::from_secs(60);
 pub(crate) const MANIFEST: &[u8] =
     br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
 
-/// A CA, the node's certificate (`node-1`, its one DNS name) and the server's
-/// (`localhost`), written into `dir`.
+/// A CA, the node's certificate (`node-1`, its one DNS name), the server's
+/// (`localhost`), and a storage client's (`client.pem`, naming the role `frontend` as a
+/// storage listener under mutual TLS requires), written into `dir`.
 pub(crate) fn pki(dir: &Path) {
     let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -35,6 +36,13 @@ pub(crate) fn pki(dir: &Path) {
         std::fs::write(dir.join(format!("{name}.pem")), cert.pem()).expect("write");
         std::fs::write(dir.join(format!("{name}.key")), key.serialize_pem()).expect("write");
     }
+    let mut client = CertificateParams::new(Vec::<String>::new()).expect("params");
+    let role = format!("{}frontend", kbf_storage::service::ROLE_URI_PREFIX);
+    client.subject_alt_names = vec![SanType::URI(role.try_into().expect("IA5"))];
+    let key = KeyPair::generate().expect("key");
+    let cert = client.signed_by(&key, &ca).expect("sign");
+    std::fs::write(dir.join("client.pem"), cert.pem()).expect("write");
+    std::fs::write(dir.join("client.key"), key.serialize_pem()).expect("write");
 }
 
 /// `--id-files`: a passwd naming this test's user `kbf`, with 65,536 subordinate ids.

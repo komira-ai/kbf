@@ -83,7 +83,7 @@ pub fn parse(matches: &ArgMatches) -> Result<Flags, clap::Error> {
 #[must_use]
 pub fn run(flags: &Flags) -> std::process::ExitCode {
     kbf_server::log_file::init(&flags.storage.server);
-    crate::run::exit("kbf storage-and-daemon", serve(flags))
+    crate::run::exit("kbf storage-and-daemon", "storage", serve(prepared(flags)))
 }
 
 /// `kbf storage-and-daemon` off Linux: it refuses to run.
@@ -97,25 +97,32 @@ pub fn run(_flags: &Flags) -> std::process::ExitCode {
     std::process::ExitCode::from(2)
 }
 
-/// The storage half on a runtime of its own, then the daemon half over it in-process,
-/// the two given one cache when they share a disk.
+/// Both halves' flags as the mode runs them: given one cache when they share a disk
+/// (`crate::one_cache`).
 #[cfg(target_os = "linux")]
-fn serve(flags: &Flags) -> Result<(), crate::run::Failed> {
-    use crate::run::{Failed, with_daemon};
-
+fn prepared(flags: &Flags) -> Flags {
     let mut flags = flags.clone();
     crate::one_cache::share(&mut flags.storage.server, &mut flags.daemon);
+    flags
+}
+
+/// The storage half on a runtime of its own, then the daemon half over it in-process.
+/// Both halves start from `flags`, as [`prepared`] made them: no half sees another copy.
+#[cfg(target_os = "linux")]
+fn serve(flags: Flags) -> Result<(), crate::run::Failed> {
+    use crate::run::{Failed, with_daemon};
+
     let sizes = kbf_server::sizes_on(&flags.storage.server, kbf_threads::Topology::detect());
     sizes.log();
-    let tokio = sizes.runtime().map_err(|e| Failed::server("storage", e))?;
+    let tokio = sizes.runtime().map_err(Failed::server)?;
     let start = kbf_server::storage_half::start(&flags.storage, kbf_server::interrupted);
     let half = tokio.block_on(start);
-    let half = half.map_err(|e| Failed::server("storage", e))?;
+    let half = half.map_err(Failed::server)?;
     println!("{}", half.start_line());
     let store = kbf_server::LocalStore::over(half.storage());
     let plane = crate::LocalDataPlane::new(store, tokio.handle().clone());
     let serving = Box::pin(half.serve());
-    with_daemon(&tokio, "storage", serving, plane, &flags.daemon)
+    with_daemon(&tokio, serving, plane, &flags.daemon)
 }
 
 #[cfg(test)]

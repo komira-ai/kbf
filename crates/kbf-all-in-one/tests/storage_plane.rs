@@ -9,7 +9,7 @@
 //!
 //! The storage the plane sees is wrapped in [`Seen`], which counts its whole-blob reads,
 //! its ranged reads and the chunks they deliver; the storage served can cut a read short
-//! or change a byte of it ([`Damage`]). Each check runs on both arms, and the
+//! (with an error, or cleanly), change a byte of it, or run it past the blob ([`Damage`]). Each check runs on both arms, and the
 //! conformance suite (`kbf-cas-conformance`) runs on the remote arm (the in-process arm
 //! is tests/storage_seam.rs's).
 
@@ -40,7 +40,14 @@ enum Damage {
     Cut,
     /// Every chunk, the first with one byte changed; the stream ends cleanly.
     Flip,
+    /// The first chunk; the stream ends cleanly, short.
+    Short,
+    /// Every chunk, then [`EXTRA_CHUNKS`] more of zeros: a stream that runs past the blob.
+    Long,
 }
+
+/// How many chunks past the blob a [`Damage::Long`] read sends.
+const EXTRA_CHUNKS: usize = 8;
 
 /// The storage served: a cache, its ranged reads damaged as `damage` says.
 struct Served {
@@ -68,6 +75,12 @@ fn damaged(stream: ReadStream, damage: Damage, digest: Digest) -> ReadStream {
                 })
             })
             .boxed(),
+        Damage::Short => stream.take(1).boxed(),
+        Damage::Long => {
+            let zeros = Bytes::from(vec![0; READ_CHUNK_BYTES]);
+            let extra = futures::stream::iter(vec![Ok(zeros); EXTRA_CHUNKS]);
+            stream.chain(extra).boxed()
+        }
     }
 }
 
@@ -251,7 +264,9 @@ fn large() -> Vec<u8> {
 /// default `read_to`, through `get`: one `read_blob`), that reads it as one piece, or
 /// that writes other bytes than the blob's: a blob of three chunks and seven bytes,
 /// stored through the plane, is read into a file through one ranged read in exactly
-/// four chunks, never a whole-blob read, and the file holds the blob.
+/// four chunks, never a whole-blob read, and the file holds the blob. And a `get` that
+/// has the storage hold the blob whole (`read_blob`, which over a `RemoteStorage`
+/// collects a stream with no bound): it streams too, and answers the blob.
 async fn a_large_blob_streams_into_its_file(arm: Arm) {
     let (plane, seen) = plane(arm, Damage::None).await;
     let blob = large();
@@ -265,6 +280,16 @@ async fn a_large_blob_streams_into_its_file(arm: Arm) {
     assert_eq!(seen.ranges.load(Ordering::SeqCst), 1);
     let chunks = seen.chunks.load(Ordering::SeqCst);
     assert_eq!(chunks, blob.len().div_ceil(READ_CHUNK_BYTES), "{arm:?}");
+    assert!(
+        plane.get(&digest).await.expect("get") == blob,
+        "get: other bytes"
+    );
+    assert_eq!(
+        seen.whole.load(Ordering::SeqCst),
+        0,
+        "get: a whole-blob read"
+    );
+    assert_eq!(seen.ranges.load(Ordering::SeqCst), 2);
 }
 
 /// Catches an absent blob answered as another failure (a daemon would retry a blob that
@@ -285,8 +310,8 @@ async fn an_absent_blob_is_missing(arm: Arm) {
 
 /// Catches a read that fails after its first chunk taken for a whole blob, or for a
 /// damaged one (the store failed, so the same read may pass later: UNAVAILABLE, not
-/// "corrupt"): `read_to` answers [`CasError::Unavailable`], and the file holds no more
-/// than the one chunk that arrived.
+/// "corrupt"): `read_to` and `get` answer [`CasError::Unavailable`], and the file holds
+/// no more than the one chunk that arrived.
 async fn a_read_cut_short_is_unavailable(arm: Arm) {
     let (plane, _) = plane(arm, Damage::Cut).await;
     let blob = large();
@@ -300,20 +325,58 @@ async fn a_read_cut_short_is_unavailable(arm: Arm) {
     drop(into);
     let written = std::fs::metadata(&path).expect("stat").len();
     assert!(written <= READ_CHUNK_BYTES as u64, "{written}");
+    let got = plane.get(&digest).await;
+    assert!(
+        matches!(&got, Err(CasError::Unavailable(blob, _)) if *blob == label(&digest)),
+        "{arm:?}: get: {got:?}"
+    );
+}
+
+/// What a damaged read answers through both reads, `read_to` and `get`, and how many
+/// bytes the file holds after `read_to`.
+async fn read_both(
+    arm: Arm,
+    damage: Damage,
+) -> (kbf_proto::reapi::Digest, [Result<(), CasError>; 2], u64) {
+    let (plane, _) = plane(arm, damage).await;
+    let digest = plane.put(large()).await.expect("put");
+    let (mut into, path) = file(&format!("{damage:?}-{arm:?}")).await;
+    let read = plane.read_to(&digest, &mut into).await;
+    drop(into);
+    let written = std::fs::metadata(&path).expect("stat").len();
+    let got = plane.get(&digest).await.map(drop);
+    (digest, [read, got], written)
 }
 
 /// Catches a read whose bytes are not the blob's taken for the blob (the plane must
-/// hash what it writes: a stream that ends cleanly is not proof): a read with one byte
-/// changed answers [`CasError::Corrupt`] naming the blob.
+/// hash what it reads: a stream that ends cleanly is not proof), with one byte changed
+/// or cut short with no error: `read_to` and `get` answer [`CasError::Corrupt`] naming
+/// the blob.
 async fn other_bytes_are_corrupt(arm: Arm) {
-    let (plane, _) = plane(arm, Damage::Flip).await;
-    let digest = plane.put(large()).await.expect("put");
-    let (mut into, _) = file(&format!("flip-{arm:?}")).await;
-    let read = plane.read_to(&digest, &mut into).await;
-    assert!(
-        matches!(&read, Err(CasError::Corrupt(blob, _)) if *blob == label(&digest)),
-        "{arm:?}: {read:?}"
-    );
+    for damage in [Damage::Flip, Damage::Short] {
+        let (digest, answers, _) = read_both(arm, damage).await;
+        for read in answers {
+            assert!(
+                matches!(&read, Err(CasError::Corrupt(blob, _)) if *blob == label(&digest)),
+                "{arm:?} {damage:?}: {read:?}"
+            );
+        }
+    }
+}
+
+/// Catches a read that writes on past the digest's size until the storage stops
+/// sending (a storage that sends without end would fill the disk, or with `get` the
+/// memory, before the hash is checked): a read that runs [`EXTRA_CHUNKS`] chunks past
+/// the blob answers [`CasError::Corrupt`] as the transfer engine does ("more than N
+/// bytes"), on both reads, and the file holds no byte past the blob's size.
+async fn a_read_past_the_size_stops_there(arm: Arm) {
+    let (digest, answers, written) = read_both(arm, Damage::Long).await;
+    let size = large().len();
+    let says = format!("more than {size} bytes");
+    for read in answers {
+        assert_eq!(read, Err(CasError::Corrupt(label(&digest), says.clone())));
+    }
+    assert!(written <= size as u64, "{arm:?}: wrote {written} of {size}");
 }
 
 /// Each check above, as a test on each arm.
@@ -344,6 +407,7 @@ on_both_arms!(
     an_absent_blob_is_missing
     a_read_cut_short_is_unavailable
     other_bytes_are_corrupt
+    a_read_past_the_size_stops_there
 );
 
 /// The conformance suite's subject: a plane over a [`RemoteStorage`] to a new

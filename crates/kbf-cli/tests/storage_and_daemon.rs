@@ -32,7 +32,7 @@ use node::{
     PROMPT, Running, cgroup_tree, files_holding, id_files, image_path, input_bytes, pki, podman,
 };
 use prost::Message as _;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 // The stand-in `podman` runs each action as `kbf-act` beside it: a link to this test
 // binary, which answers as `kbf-act` through it.
@@ -81,15 +81,26 @@ fn scheduler(tokio: &tokio::runtime::Runtime, dir: &Path) -> (SocketAddr, Socket
     addrs
 }
 
+/// The storage listener's mutual-TLS flags, as the deployed unit gives them.
+const STORAGE_TLS: [&str; 3] = [
+    "--storage-tls-cert",
+    "--storage-tls-key",
+    "--storage-client-ca",
+];
+
 /// The node's flags: the storage half's stores in `dir` (a hot store on the data
-/// directory's filesystem, so the two halves keep one cache) and a plain-text listener on
-/// loopback; the daemon half's container driver dialling the scheduler's `worker`
-/// listener.
+/// directory's filesystem, so the two halves keep one cache) and a listener on loopback
+/// under mutual TLS, as the deployed unit's (so a daemon half that reached its storage
+/// over that listener, with no certificate, would read nothing); the daemon half's
+/// container driver dialling the scheduler's `worker` listener.
 fn node_flags(dir: &Path, worker: SocketAddr) -> Vec<String> {
     let at = |name: &str| dir.join(name).display().to_string();
     vec![
         "storage-and-daemon".to_owned(),
         "--storage-listen=127.0.0.1:0".to_owned(),
+        format!("{}={}", STORAGE_TLS[0], at("server.pem")),
+        format!("{}={}", STORAGE_TLS[1], at("server.key")),
+        format!("{}={}", STORAGE_TLS[2], at("ca.pem")),
         format!("--cold-store=file://{}", at("cold")),
         format!("--hot-store=file://{}", at("hot")),
         // Every blob its own block, flushed at once.
@@ -138,6 +149,23 @@ fn start_node(bin: &Path, flags: &[String]) -> (Running, SocketAddr) {
 async fn connect(addr: SocketAddr) -> Channel {
     Endpoint::from_shared(format!("http://{addr}"))
         .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect")
+}
+
+/// A client of the node's storage listener at `addr`, under mutual TLS with the
+/// storage client's certificate in `dir` (`node::pki`).
+async fn connect_tls(dir: &Path, addr: SocketAddr) -> Channel {
+    let read = |name: &str| std::fs::read(dir.join(name)).expect("read");
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(read("ca.pem")))
+        .domain_name("localhost")
+        .identity(Identity::from_pem(read("client.pem"), read("client.key")));
+    Endpoint::from_shared(format!("https://{addr}"))
+        .expect("endpoint")
+        .tls_config(tls)
+        .expect("TLS")
         .connect()
         .await
         .expect("connect")
@@ -255,10 +283,12 @@ fn on_disk_once(dir: &Path, input: &[u8]) {
 }
 
 /// Catches `kbf storage-and-daemon` not built (it exits 2 at once), a daemon half that
-/// reads its inputs anywhere but its own storage (over the network from the scheduler,
-/// whose copy of the input is damaged here: the action would fail), outputs that do not
+/// reads its inputs anywhere but its own storage in-process (over the network from the
+/// scheduler, whose copy of the input is damaged here, or through its own storage
+/// listener, which takes only certified callers: the action would fail), outputs that do not
 /// reach the node's storage, the halves keeping two copies of an input on one disk (the
-/// one cache not given to them), a fill that leaves a file in the input cache's `tmp/`,
+/// one cache given to neither; that both are given the same one is pinned by
+/// the unit tests of `prepared`), a fill that leaves a file in the input cache's `tmp/`,
 /// and SIGTERM not stopping both halves with exit 0. One action reads an input of more
 /// than three chunks and writes one output file.
 #[test]
@@ -280,7 +310,7 @@ fn storage_and_daemon_runs_an_action_over_its_own_storage() {
     let output = tokio.block_on(async {
         let reapi = connect(reapi).await;
         let server = Transfers::over(reapi.clone(), TransferConfig::default());
-        let node = Transfers::over(connect(storage).await, TransferConfig::default());
+        let node = Transfers::over(connect_tls(&dir, storage).await, TransferConfig::default());
         let action = action(&[&server, &node], &image, &input).await;
         // The scheduler accepts a result only once its outputs are in its cache.
         let output = put_all(&[&server], OUTPUT).await;
@@ -349,7 +379,11 @@ fn a_start_either_half_refuses_says_which() {
     pki(&dir);
     let worker: SocketAddr = "127.0.0.1:1".parse().expect("address");
     let wide = ["--storage-listen=0.0.0.0:0".to_owned()];
-    let (code, out, err) = refused(&replaced(node_flags(&dir, worker), &wide), &[]);
+    let plain: Vec<String> = node_flags(&dir, worker)
+        .into_iter()
+        .filter(|flag| !STORAGE_TLS.iter().any(|tls| flag.starts_with(tls)))
+        .collect();
+    let (code, out, err) = refused(&replaced(plain, &wide), &[]);
     assert_eq!(code, Some(2), "{err}");
     assert!(err.contains("kbf storage-and-daemon: storage: "), "{err}");
     assert!(out.is_empty(), "{out}");

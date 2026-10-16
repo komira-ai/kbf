@@ -79,3 +79,20 @@ fn other_drivers_cas_and_server_flags_are_refused() {
         assert!(refused.to_string().contains(says), "{says}: {refused}");
     }
 }
+
+/// Catches a half started from flags other than the ones given the one cache (the
+/// daemon half handed a copy made before the sharing, or the storage half): with the
+/// hot store on the data directory's disk, both halves of the flags `serve` takes hold
+/// the same cache.
+#[cfg(target_os = "linux")]
+#[test]
+fn both_halves_start_with_the_one_cache() {
+    let dir = crate::one_cache::under_target("prepared-storage-and-daemon");
+    let at = |name: &str| dir.join(name).display().to_string();
+    let hot = format!("--hot-store=file://{}", at("hot"));
+    let data = format!("--data-dir={}", at("data"));
+    let flags = prepared(&flags(&[&hot, &data]).expect("flags"));
+    let local = flags.storage.server.local_cache.as_ref();
+    let local = local.expect("the storage half's");
+    assert!(crate::one_cache::daemon_holds(local, &flags.daemon));
+}

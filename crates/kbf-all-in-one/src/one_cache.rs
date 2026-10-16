@@ -52,6 +52,28 @@ fn device(path: &Path) -> Option<u64> {
         .map(|found| found.dev())
 }
 
+/// For the modes' tests: whether `daemon` holds `local` itself, not a cache of its own
+/// nor none. Marks `local` (its storage bytes read 4242), so call it once per cache.
+#[cfg(test)]
+pub(crate) fn daemon_holds(local: &LocalCache, daemon: &kbf_node::Cli) -> bool {
+    assert!(local.attach_storage(Box::new(|| 4242)), "marked before");
+    format!("{daemon:?}")
+        .contains("local_cache: Some(LocalCache { fill: Fill { inputs: 0, storage: 4242 } })")
+}
+
+/// For the modes' tests: a directory under the test binary's (unit tests get no
+/// `CARGO_TARGET_TMPDIR`), not made: the check judges a path by its nearest existing
+/// directory.
+#[cfg(test)]
+pub(crate) fn under_target(name: &str) -> std::path::PathBuf {
+    std::env::current_exe()
+        .expect("test binary")
+        .parent()
+        .expect("deps")
+        .join("kbf-all-in-one-unit")
+        .join(format!("{name}-{}", std::process::id()))
+}
+
 #[cfg(test)]
 #[path = "one_cache_tests.rs"]
 mod tests;
