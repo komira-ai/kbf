@@ -306,8 +306,9 @@ fn learners_join_catch_up_are_promoted_and_the_cluster_survives_a_leader_restart
 }
 
 /// Catches: a leader that starts a second change before the first is committed (two
-/// changes at once can leave the old and new majorities disjoint), and changes that make
-/// no sense (adding a member, promoting a voter, removing a stranger or the last voter).
+/// changes at once can leave the old and new majorities disjoint), changes that make no
+/// sense (adding a member, promoting a voter, removing a stranger or the last voter),
+/// and a last-voter rule that also keeps a learner beside a single voter.
 #[test]
 fn an_unsafe_or_meaningless_change_is_refused() {
     let mut cluster = Cluster::bootstrap();
@@ -360,11 +361,16 @@ fn an_unsafe_or_meaningless_change_is_refused() {
         "{not_leader:?}"
     );
 
+    // The last voter stays; a learner beside it can still be removed.
     let mut alone = Cluster::bootstrap();
     assert_eq!(
         alone.node(S1).change_membership(Change::Remove(S1)),
         Err(HostError::Change(ChangeError::LastVoter(S1)))
     );
+    alone.join(S5);
+    alone.change(Change::Remove(S5));
+    assert_eq!(alone.voters(S1), [S1]);
+    assert!(alone.learners(S1).is_empty());
 }
 
 /// Catches: a membership that a restart forgets, from the log (changes kept only in
