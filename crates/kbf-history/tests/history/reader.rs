@@ -114,7 +114,8 @@ fn an_invocation_spanning_instances_is_answered_only_when_every_one_is_allowed()
 fn records_of_an_instance_the_header_does_not_list_are_still_filtered() {
     // Catches: a reader that trusts the header's instance list for every record, so a
     // header that undercounts (restored from an older chunk's footer) hands out the
-    // records of an instance the caller may not see.
+    // records of an instance the caller may not see. (The invocation's summary is
+    // refused here, since its newest chunk names b; the records are read page by page.)
     let mut life = Life::fresh(Limits::default());
     let (inv, _) = closed_build(&mut life);
     let key = IndexRoot::default().invid(&inv.key);
@@ -123,7 +124,12 @@ fn records_of_an_instance_the_header_does_not_list_are_still_filtered() {
     header.instances = vec!["a".into()];
     life.index.put(&key, header.encode_to_vec());
     let reader = life.reader();
-    let got = whole(&reader, &inv.key, &only_a).unwrap().unwrap();
+    let summary = futures::executor::block_on(reader.invocation(&inv.key, &only_a));
+    assert_eq!(summary.unwrap(), None);
+    let got = futures::executor::block_on(reader.records(&inv.key, None, MAX_PAGE_CHUNKS, &only_a))
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.next, None, "one chunk");
     assert!(got.runs.iter().all(|r| r.instance == "a"));
     assert_eq!(got.runs.len(), 2);
     assert!(got.failed.iter().all(|f| f.instance == "a"));
@@ -428,4 +434,79 @@ fn a_newest_summary_that_does_not_decode_is_an_error() {
     let (inv, _) = plant_with(&life, Vec::new(), holds_run0(), vec![0xFF]);
     let err = futures::executor::block_on(life.reader().invocation(&inv.key, &all)).unwrap_err();
     assert!(err.to_string().contains("chunk summary"), "{err}");
+}
+
+#[test]
+fn a_run_resolves_when_events_arrived_out_of_order_across_a_cut() {
+    // Catches: a run located in the first chunk whose sequence range holds it, and no
+    // other tried. Minting happens on the request path and the offer to the queue is a
+    // separate step, so a later run can land in an earlier chunk: here runs 0 and 2 are
+    // cut together by age ([0..2]) and run 1 lands in the next chunk, so the first
+    // chunk's range holds run 1 and only the second chunk does.
+    let mut life = Life::fresh(Limits::default());
+    let inv = InvRef::named("b1");
+    let runs: Vec<_> = (0..3)
+        .map(|i| {
+            let m = life.minter.mint(&inv.key, B + i);
+            let mut r = crate::support::run_record("a", RunOutcome::Ok, m.id.time_ms());
+            r.set_run_id(m.id);
+            (m, r)
+        })
+        .collect();
+    let queue = life.queue.clone();
+    let offer = |n: usize| {
+        let (m, r) = &runs[n];
+        assert!(queue.offer(kbf_history::Event::Run {
+            inv: inv.clone(),
+            record: Box::new(r.clone()),
+            failed: None,
+            stream_opened_ms: m.stream_opened_ms,
+        }));
+    };
+    offer(0);
+    offer(2);
+    life.step(B + 2);
+    life.step(B + 120_002); // cut by age: runs 0 and 2
+    offer(1);
+    life.close(&inv);
+    life.drain(B + 120_003, 10);
+    assert_eq!(life.index.keys("ui/ichunk/").len(), 2);
+    let reader = life.reader();
+    for (_, r) in &runs {
+        let got = futures::executor::block_on(reader.run(r.run_id(), &all)).unwrap();
+        assert_eq!(got.map(|v| v.run).as_ref(), Some(r), "{}", r.run_id());
+    }
+}
+
+#[test]
+fn a_newest_summary_ahead_of_its_header_is_all_must_allow_too() {
+    // Catches: an invocation authorized against the stored header alone while its
+    // newest chunk's summary, which can land first, names another instance: an
+    // A-only caller would get B in `newest.header.instances`, B's run ids in the
+    // slowest lists and B's action digests. A previous life stored the header [a]; this
+    // life writes a chunk of instance b while its header read fails, so the chunk row
+    // lands and the header write waits.
+    let objects = crate::support::Objects::new();
+    let index = crate::support::Index::fake();
+    let mut first = Life::start(&objects, &index, 1, Limits::default());
+    let inv = InvRef::named("b1");
+    first.run(&inv, B, "a", RunOutcome::Ok);
+    first.close(&inv);
+    first.step(B);
+    let mut second = Life::start(&objects, &index, 2, Limits::default());
+    index.fail_gets.store(true, Ordering::SeqCst);
+    second.run(&inv, B + 1, "b", RunOutcome::Ok);
+    second.close(&inv);
+    second.step(B + 1);
+    index.fail_gets.store(false, Ordering::SeqCst);
+    assert_eq!(index.keys("ui/ichunk/").len(), 2, "the chunk row landed");
+    let reader = second.reader();
+    let view = futures::executor::block_on(reader.invocation(&inv.key, &only_a)).unwrap();
+    assert_eq!(view, None);
+    let view = futures::executor::block_on(reader.invocation(&inv.key, &all))
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.header.instances, ["a"], "the header still lags");
+    let newest = view.newest.unwrap().header.unwrap();
+    assert_eq!(newest.instances, ["b"]);
 }

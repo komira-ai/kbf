@@ -5,11 +5,13 @@
 //! the newest `ui/stream/<day>/<stream>/<first ms>` row at or before its time gives the
 //! invocation and writer (so a fallback stream id reused after a restart still resolves
 //! to its own life's chunk), the `ichunk` rows of that invocation and writer give the
-//! chunk holding its sequence, and the chunk's footer gives the block. That is the
-//! index plus at most three range reads: footer, run block, failed-run block.
+//! chunks whose sequence range holds it, and a chunk's footer gives the block. That is
+//! the index plus at most three range reads (footer, run block, failed-run block) per
+//! candidate chunk: one, or two when events arrived out of order across a cut.
 //!
 //! Every answer holds only records whose instance `allow` accepts, and an invocation
-//! is answered only when `allow` accepts every instance its header lists (an
+//! is answered only when `allow` accepts every instance its header lists, and, for
+//! [`Reader::invocation`], every instance its newest chunk's summary lists (an
 //! invocation spanning instances is all-must-allow, ui-data.md section 8).
 //!
 //! Index calls go through the [`HistoryIndex`]'s offload, so the reader's `async fn`s
@@ -142,32 +144,44 @@ impl<O: ObjectStore> Reader<O> {
         id: RunId,
         allow: &dyn Fn(&str) -> bool,
     ) -> Result<Option<RunView>, ReadError> {
-        let Some(at) = self.locate(id).await? else {
-            return Ok(None);
-        };
-        let range = footer_range(&at.row)?;
-        let footer = decode_tail(&self.objects.get_range(&at.key, range).await?)?;
-        let run_key = chunk_key(SECTION_RUN, id.seq());
-        let block = self.block(&at.key, &footer, &run_key).await?;
-        let Some(run) = find_run(&block, id, allow) else {
-            return Ok(None);
-        };
+        // Events reach the writer out of order, so two chunks' sequence ranges may
+        // overlap: try each chunk whose range holds the run, in order (one or two).
+        for at in self.locate(id).await? {
+            let range = footer_range(&at.row)?;
+            let footer = decode_tail(&self.objects.get_range(&at.key, range).await?)?;
+            let run_key = chunk_key(SECTION_RUN, id.seq());
+            let block = self.block(&at.key, &footer, &run_key).await?;
+            if let Some(run) = find_run(&block, id, allow) {
+                return self.with_failed(at, &footer, run).await.map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    /// `run`, found in chunk `at` whose footer is `footer`, with its failed-run section.
+    async fn with_failed(
+        &self,
+        at: Located,
+        footer: &Footer,
+        run: RunRecord,
+    ) -> Result<RunView, ReadError> {
+        let id = run.run_id();
         let failed_key = chunk_key(SECTION_FAILED, id.seq());
         let failed = if run.failed() {
-            let block = self.block(&at.key, &footer, &failed_key).await?;
+            let block = self.block(&at.key, footer, &failed_key).await?;
             find_failed(&block, id.seq())
         } else {
             None
         };
-        Ok(Some(RunView {
+        Ok(RunView {
             inv: at.inv,
             run,
             failed,
-        }))
+        })
     }
 
     /// Invocation `inv`'s header and its newest chunk's summary, if history holds it and
-    /// `allow` accepts every instance it lists: the index and one range read.
+    /// `allow` accepts every instance either lists: the index and one range read.
     ///
     /// # Errors
     /// As [`Reader::run`].
@@ -190,6 +204,13 @@ impl<O: ObjectStore> Reader<O> {
                 let tail = self.objects.get_range(&object, footer_range(row)?).await?;
                 let summary = ChunkSummary::decode(decode_tail(&tail)?.summary.as_slice())
                     .map_err(|e| FormatError::decode("chunk summary", &e))?;
+                // The newest chunk's row can land before the header written with it (a
+                // failed transaction, a header held for its read), and its summary names
+                // that chunk's instances, runs and digests. All must allow those too.
+                let instances = summary.header.as_ref().map(|h| h.instances.as_slice());
+                if !instances.unwrap_or_default().iter().all(|i| allow(i)) {
+                    return Ok(None);
+                }
                 Some(summary)
             }
             None => None,
@@ -254,8 +275,10 @@ impl<O: ObjectStore> Reader<O> {
         Ok(header.instances.iter().all(|i| allow(i)).then_some(header))
     }
 
-    /// Finds run `id`'s chunk through the index, or `None` when no row names it.
-    async fn locate(&self, id: RunId) -> Result<Option<Located>, ReadError> {
+    /// The chunks that may hold run `id`, through the index: every chunk of its stream's
+    /// invocation and writer whose sequence range holds it, in order. None when no row
+    /// names it.
+    async fn locate(&self, id: RunId) -> Result<Vec<Located>, ReadError> {
         let rows = self.index.root();
         let streams = self
             .index
@@ -267,7 +290,7 @@ impl<O: ObjectStore> Reader<O> {
             .rev()
             .find(|(k, _)| IndexRoot::stream_first_ms(k).is_some_and(|t| t <= id.time_ms()));
         let Some((key, value)) = found else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         let stream = decode_row::<StreamRow>(key, &value.value)?;
         let inv = InvKey::parse(&stream.inv_key).map_err(|e| ReadError::Row {
@@ -276,16 +299,15 @@ impl<O: ObjectStore> Reader<O> {
         })?;
         let writer = WriterId(stream.writer);
         let prefix = format!("{}{writer}/", rows.ichunk_prefix(&inv));
-        let chunk = self
-            .chunk_rows(prefix)
-            .await?
-            .into_iter()
-            .find(|(_, row)| row.holds(id.stream().0, id.seq()));
-        Ok(chunk.map(|(key, row)| Located {
-            key: chunk_object_key(&self.root, &inv, &key, &row),
-            inv,
-            row,
-        }))
+        let chunks = self.chunk_rows(prefix).await?.into_iter();
+        Ok(chunks
+            .filter(|(_, row)| row.holds(id.stream().0, id.seq()))
+            .map(|(key, row)| Located {
+                key: chunk_object_key(&self.root, &inv, &key, &row),
+                inv: inv.clone(),
+                row,
+            })
+            .collect())
     }
 
     /// The `ichunk` rows under `prefix`, decoded, in key order.
