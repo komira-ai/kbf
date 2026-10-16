@@ -9,7 +9,7 @@
 
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -36,6 +36,19 @@ struct Seen {
     /// The most bytes the stream had handed out beyond what the fills' files held,
     /// measured before each chunk.
     lag: AtomicU64,
+    /// Chunks of streams of the watched blob handed out.
+    handed: AtomicUsize,
+    /// A stream of the watched blob was dropped.
+    dropped: AtomicBool,
+}
+
+/// Marks [`Seen::dropped`] when the stream holding it is dropped.
+struct OnDrop(Arc<Seen>);
+
+impl Drop for OnDrop {
+    fn drop(&mut self) {
+        self.0.dropped.store(true, Ordering::SeqCst);
+    }
 }
 
 /// A storage that passes every call to `inner` and watches the reads of one blob:
@@ -48,6 +61,8 @@ struct Watched {
     seen: Arc<Seen>,
     /// When set, what a streamed read of any blob answers instead.
     script: Mutex<Option<Vec<Result<Bytes, StorageError>>>>,
+    /// When set, a stream of the watched blob hands out each chunk only for a permit.
+    gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl Watched {
@@ -85,6 +100,7 @@ impl Storage for Watched {
     ) -> Answer<'a, ReadStream> {
         let watched = self.watches(digest);
         let (tmp, seen) = (self.tmp.clone(), Arc::clone(&self.seen));
+        let gate = self.gate.lock().expect("lock").clone();
         if let Some(script) = self.script.lock().expect("lock").take() {
             return Box::pin(async move { Ok(futures::stream::iter(script).boxed()) });
         }
@@ -94,9 +110,21 @@ impl Storage for Watched {
                 return Ok(stream);
             }
             seen.streams.fetch_add(1, Ordering::SeqCst);
+            let gated = stream.then(move |chunk| {
+                let gate = gate.clone();
+                async move {
+                    if let Some(gate) = gate {
+                        gate.acquire().await.expect("a permit").forget();
+                    }
+                    chunk
+                }
+            });
             let mut handed = 0;
-            Ok(stream
+            let on_drop = OnDrop(Arc::clone(&seen));
+            Ok(gated
                 .map(move |chunk| {
+                    let seen = &on_drop.0;
+                    seen.handed.fetch_add(1, Ordering::SeqCst);
                     let lag = handed - bytes_in(&tmp).min(handed);
                     seen.lag.fetch_max(lag, Ordering::SeqCst);
                     handed += chunk.as_ref().map_or(0, |c| c.len() as u64);
@@ -168,6 +196,7 @@ impl Kit {
             tmp: dir.join("cache/v1/tmp"),
             seen: Arc::default(),
             script: Mutex::new(None),
+            gate: Mutex::new(None),
         });
         let store = LocalStore::over(Arc::clone(&storage) as Arc<dyn Storage>);
         let plane = LocalDataPlane::new(store, tokio::runtime::Handle::current());
@@ -221,11 +250,13 @@ fn big() -> Vec<u8> {
 /// Catches a fill over the in-process plane that holds the blob whole between the
 /// halves (the plane's `read_to` gathering the stream, or the plane's whole-blob
 /// `get`, before writing: the "buffer" mutants), or that writes it anywhere but the
-/// entry's file. A 12 MiB input reaches the lease's file through one streamed read and
-/// no whole-blob read; before each chunk is handed out, the fill's file holds all but at
-/// most five chunks of what came before (the channel between the halves holds one, the
-/// fill one being written and one the file's writer holds, a chunk in hand; a gathered
-/// blob would lag by eleven).
+/// entry's file, or that lets more than two chunks sit between the halves (a wider
+/// channel: the "channel(3)" mutant). A 12 MiB input reaches the lease's file through
+/// one streamed read and no whole-blob read; before each chunk is handed out (the pump
+/// holding none then), the fill's file holds all but at most three chunks of what came
+/// before: one in the channel between the halves, one the fill holds while the file
+/// takes it and one the file's writer is still writing. A channel of three would let
+/// five lag, and a gathered blob eleven.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fill_streams_the_input_into_its_file() {
     let kit = Kit::new("stream");
@@ -238,7 +269,7 @@ async fn a_fill_streams_the_input_into_its_file() {
     assert_eq!(seen.streams.load(Ordering::SeqCst), 1);
     let lag = seen.lag.load(Ordering::SeqCst);
     assert!(
-        lag <= 5 * READ_CHUNK_BYTES as u64,
+        lag <= 3 * READ_CHUNK_BYTES as u64,
         "the fill lagged {lag} bytes"
     );
     kit.cache.stop();
@@ -263,6 +294,51 @@ async fn two_leases_needing_one_input_read_it_once_into_one_file() {
     let ino = |path: &Path| std::fs::metadata(path).expect("stat").ino();
     assert_eq!(ino(&one.join("input.bin")), ino(&entry));
     assert_eq!(ino(&two.join("input.bin")), ino(&entry));
+    kit.cache.stop();
+}
+
+/// Catches the plane's pump reading on for a fill that is gone (a lease killed while
+/// its inputs are written drops the fill: the "pump ignores a closed channel" mutant
+/// reads the blob to its end for nobody) or keeping the storage's stream open: with the
+/// stream handing out a chunk per permit, the fill is dropped once its first chunk is in
+/// its file; the pump takes the one chunk it was waiting for, finds nobody to give it to
+/// and drops the stream, two of thirteen chunks handed out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fill_dropped_midway_stops_the_storages_stream() {
+    let kit = Kit::new("dropped");
+    let digest = kit.plane.put(big()).await.expect("put");
+    let parsed = kbf_types::Digest::parse(kbf_types::DigestFunction::Sha256, &label(&digest));
+    *kit.storage.blob.lock().expect("lock") = Some(parsed.expect("a digest"));
+    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    *kit.storage.gate.lock().expect("lock") = Some(Arc::clone(&gate));
+    let path = kit.dir.join("dropped");
+    let mut file = tokio::fs::File::create(&path).await.expect("create");
+    let seen = Arc::clone(&kit.storage.seen);
+    {
+        let read = kit.plane.read_to(&digest, &mut file);
+        let first = async {
+            while std::fs::metadata(&path).map_or(0, |m| m.len()) < READ_CHUNK_BYTES as u64 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        tokio::select! {
+            read = read => panic!("the read ended on one chunk: {read:?}"),
+            () = first => {}
+        }
+    }
+    assert_eq!(seen.handed.load(Ordering::SeqCst), 1);
+    gate.add_permits(100);
+    for _ in 0..1000 {
+        if seen.dropped.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        seen.dropped.load(Ordering::SeqCst),
+        "the stream is still open"
+    );
+    assert_eq!(seen.handed.load(Ordering::SeqCst), 2);
     kit.cache.stop();
 }
 
