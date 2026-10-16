@@ -35,7 +35,9 @@ impl ByteStream for StorageService {
         })?;
         let chunks = self.storage.read_range(&digest, offset, limit).await?;
         let messages = chunks.map(|chunk| match chunk {
-            Ok(data) => Ok(ReadResponse { data: data.to_vec() }),
+            Ok(data) => Ok(ReadResponse {
+                data: data.to_vec(),
+            }),
             Err(e) => Err(Status::from(e)),
         });
         Ok(Response::new(messages.boxed()))
@@ -75,7 +77,8 @@ impl ByteStream for StorageService {
         if self.storage.find_missing(&[digest]).await?.is_empty() {
             return Ok(committed());
         }
-        let room = u32::try_from(size).map_or(self.write_room_bytes, |s| s.min(self.write_room_bytes));
+        let room =
+            u32::try_from(size).map_or(self.write_room_bytes, |s| s.min(self.write_room_bytes));
         // The semaphore is never closed.
         let _room = self.write_room.acquire_many(room).await.ok();
         let mut received = Vec::with_capacity(usize::try_from(size).unwrap_or_default());

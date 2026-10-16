@@ -108,6 +108,11 @@ pub(super) fn lift(status: &Status, at: Option<(Digest, u64)>) -> StorageError {
     }
 }
 
+/// [`lift`] for a call that is not about one blob.
+fn other(status: Status) -> StorageError {
+    lift(&status, None)
+}
+
 /// The refusal a node answered, as the store's error.
 pub(super) fn refused(refusal: &Refusal) -> StorageError {
     let blob = wire::digest(refusal.blob.as_ref());
@@ -142,13 +147,14 @@ impl Storage for RemoteStorage {
             let response = client
                 .find_missing_blobs(self.tag(request))
                 .await
-                .map_err(|s| lift(&s, None))?;
+                .map_err(other)?;
             response
                 .into_inner()
                 .missing_blob_digests
                 .iter()
-                .map(|d| wire::digest(Some(d)).map_err(|s| lift(&s, None)))
-                .collect()
+                .map(|d| wire::digest(Some(d)))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(other)
         })
     }
 
@@ -230,7 +236,7 @@ impl Storage for RemoteStorage {
                 .bytestream()
                 .write(self.tag(stream::iter(requests)))
                 .await
-                .map_err(|s| lift(&s, None))?;
+                .map_err(other)?;
             let committed = response.into_inner().committed_size;
             if committed as u64 != digest.size_bytes {
                 return Err(StorageError::Internal(format!(
@@ -259,15 +265,11 @@ impl Storage for RemoteStorage {
                 map_generation: self.generation,
                 action: Some(wire::to_proto(action)),
             };
-            let response = self
-                .actions()
-                .get(self.tag(request))
-                .await
-                .map_err(|s| lift(&s, None))?;
+            let response = self.actions().get(self.tag(request)).await.map_err(other)?;
             let Some(entry) = response.into_inner().entry else {
                 return Ok(None);
             };
-            let digest = wire::digest(entry.result_digest.as_ref()).map_err(|s| lift(&s, None))?;
+            let digest = wire::digest(entry.result_digest.as_ref()).map_err(other)?;
             let result = entry.result.unwrap_or_default();
             Ok(Some((digest, result)))
         })
@@ -283,16 +285,16 @@ impl Storage for RemoteStorage {
                 .actions()
                 .prepare(self.tag(request))
                 .await
-                .map_err(|s| lift(&s, None))?;
+                .map_err(other)?;
             match response.into_inner().outcome {
                 Some(prepare_response::Outcome::Record(record)) => Ok(ActionRecord {
-                    result: wire::digest(record.result.as_ref()).map_err(|s| lift(&s, None))?,
+                    result: wire::digest(record.result.as_ref()).map_err(other)?,
                     closure: record
                         .closure
                         .iter()
                         .map(|d| wire::digest(Some(d)))
                         .collect::<Result<Closure, _>>()
-                        .map_err(|s| lift(&s, None))?,
+                        .map_err(other)?,
                 }),
                 Some(prepare_response::Outcome::Refused(refusal)) => Err(refused(&refusal)),
                 None => Err(StorageError::Internal("an empty Prepare answer".to_owned())),
@@ -321,7 +323,7 @@ impl Storage for RemoteStorage {
                 .actions()
                 .commit(self.tag(request))
                 .await
-                .map_err(|s| lift(&s, None))?;
+                .map_err(other)?;
             match response.into_inner().refused {
                 None => Ok(()),
                 Some(refusal) => Err(refused(&refusal)),

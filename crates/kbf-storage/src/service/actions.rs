@@ -3,8 +3,8 @@
 use kbf_meta::{ActionRecord, Closure, Role};
 use kbf_proto::storage::action_store_server::ActionStore;
 use kbf_proto::storage::{
-    CommitRequest, CommitResponse, Entry, GetRequest, GetResponse, PrepareRequest,
-    PrepareResponse, Record, Writer, prepare_response,
+    CommitRequest, CommitResponse, Entry, GetRequest, GetResponse, PrepareRequest, PrepareResponse,
+    Record, Writer, prepare_response,
 };
 use tonic::{Request, Response, Status};
 
@@ -75,7 +75,11 @@ impl ActionStore for StorageService {
         };
         let action = wire::digest(request.action.as_ref())?;
         let record = record_of(request.record.as_ref())?;
-        match self.storage.commit_action_record(role, action, record).await {
+        match self
+            .storage
+            .commit_action_record(role, action, record)
+            .await
+        {
             Ok(()) => Ok(Response::new(CommitResponse { refused: None })),
             Err(StorageError::ActionWrite(refused)) => Ok(Response::new(CommitResponse {
                 refused: Some(wire::refusal_of(&refused)),

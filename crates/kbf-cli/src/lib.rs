@@ -263,7 +263,7 @@ pub fn check_args(args: &[std::ffi::OsString]) -> Result<(), clap::Error> {
         .cloned()
         .collect::<Vec<_>>();
     match parse_from(argv) {
-        Ok(Invocation::Daemon(_) | Invocation::AllInOne(_)) => Ok(()),
+        Ok(Invocation::Daemon(_) | Invocation::AllInOne(_) | Invocation::Storage(_)) => Ok(()),
         Ok(Invocation::NotBuilt { mode }) => {
             Err(command().error(ErrorKind::InvalidSubcommand, names::not_built_line(mode)))
         }

@@ -110,14 +110,15 @@ pub fn command() -> Command {
         let shown = takes(arg.get_id(), &threads);
         cmd = cmd.arg(arg.clone().hide(!shown));
     }
-    let path = |id: &'static str, long: &'static str, requires: [&'static str; 2], help: &'static str| {
-        Arg::new(id)
-            .long(long)
-            .value_name("PATH")
-            .value_parser(clap::value_parser!(PathBuf))
-            .requires_all(requires)
-            .help(help)
-    };
+    let path =
+        |id: &'static str, long: &'static str, requires: [&'static str; 2], help: &'static str| {
+            Arg::new(id)
+                .long(long)
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .requires_all(requires)
+                .help(help)
+        };
     cmd.arg(
         Arg::new(LISTEN)
             .long("storage-listen")
@@ -126,8 +127,18 @@ pub fn command() -> Command {
             .value_parser(clap::value_parser!(SocketAddr))
             .help("Where the node serves gRPC (plain text unless the TLS flags are given)."),
     )
-    .arg(path(TLS[0], "storage-tls-cert", [TLS[1], TLS[2]], "The node's server certificate (PEM)."))
-    .arg(path(TLS[1], "storage-tls-key", [TLS[0], TLS[2]], "The server certificate's private key (PEM)."))
+    .arg(path(
+        TLS[0],
+        "storage-tls-cert",
+        [TLS[1], TLS[2]],
+        "The node's server certificate (PEM).",
+    ))
+    .arg(path(
+        TLS[1],
+        "storage-tls-key",
+        [TLS[0], TLS[2]],
+        "The server certificate's private key (PEM).",
+    ))
     .arg(path(
         TLS[2],
         "storage-client-ca",
@@ -146,7 +157,7 @@ pub fn parse(m: &ArgMatches) -> Result<StorageFlags, clap::Error> {
     for arg in Args::command().get_arguments() {
         let id = arg.get_id();
         if !takes(id, &threads) && m.value_source(id.as_str()) == Some(ValueSource::CommandLine) {
-            let flag = arg.get_long().unwrap_or_else(|| id.as_str());
+            let flag = arg.get_long().map_or(id.as_str(), |long| long);
             return Err(command().error(
                 clap::error::ErrorKind::ArgumentConflict,
                 format!(
@@ -295,7 +306,14 @@ where
     let (prefix, log) = (meta.store_prefix(), meta.log_id());
     let grace = Duration::from_millis(args.cold_store_evict_grace_ms);
     let pass = files.map(|files| StartPass::over_raft(files, grace));
-    assemble(flags, stores.hot.as_ref(), (meta, store, prefix, log), shutdown, pass).await
+    assemble(
+        flags,
+        stores.hot.as_ref(),
+        (meta, store, prefix, log),
+        shutdown,
+        pass,
+    )
+    .await
 }
 
 /// The cache, its write tier, flusher and pass, and the listener over them.

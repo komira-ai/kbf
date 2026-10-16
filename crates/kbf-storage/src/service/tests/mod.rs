@@ -29,8 +29,7 @@ use kbf_proto::reapi::{
 use kbf_proto::storage::action_store_client::ActionStoreClient;
 use kbf_proto::storage::{CommitRequest, PrepareRequest, Record, Writer, refusal};
 use kbf_proto::worker::{
-    BeginRequest, CommitRequest as SegmentsCommit, LocateRequest, PutRangeRequest,
-    ReadRangeRequest,
+    BeginRequest, CommitRequest as SegmentsCommit, LocateRequest, PutRangeRequest, ReadRangeRequest,
 };
 use kbf_types::Digest;
 use tonic::transport::Channel;
@@ -60,7 +59,11 @@ fn write_of(name: &str, parts: &[(&[u8], bool)]) -> Vec<WriteRequest> {
         .enumerate()
         .map(|(i, (data, finish))| {
             let request = WriteRequest {
-                resource_name: if i == 0 { name.to_owned() } else { String::new() },
+                resource_name: if i == 0 {
+                    name.to_owned()
+                } else {
+                    String::new()
+                },
                 write_offset: at,
                 finish_write: *finish,
                 data: data.to_vec(),
@@ -98,7 +101,10 @@ async fn blobs_round_trip_through_the_wire() {
     for bytes in [Vec::new(), b"small".to_vec(), large.clone()] {
         let digest = remote.put(Bytes::from(bytes.clone())).await.expect("put");
         assert_eq!(digest, sha(&bytes));
-        assert_eq!(remote.read_blob(&digest).await.expect("read").to_vec(), bytes);
+        assert_eq!(
+            remote.read_blob(&digest).await.expect("read").to_vec(),
+            bytes
+        );
     }
     let digest = sha(&large);
     let (sizes, bytes) = collect(remote.read_range(&digest, 0, 0).await.expect("all")).await;
@@ -108,11 +114,26 @@ async fn blobs_round_trip_through_the_wire() {
         [READ_CHUNK_BYTES, READ_CHUNK_BYTES, READ_CHUNK_BYTES / 2]
     );
     let from = READ_CHUNK_BYTES + 3;
-    let (_, bytes) = collect(remote.read_range(&digest, from as u64, 10).await.expect("cut")).await;
+    let (_, bytes) = collect(
+        remote
+            .read_range(&digest, from as u64, 10)
+            .await
+            .expect("cut"),
+    )
+    .await;
     assert_eq!(bytes, large[from..from + 10]);
-    let (_, bytes) = collect(remote.read_range(&digest, from as u64, 0).await.expect("tail")).await;
+    let (_, bytes) = collect(
+        remote
+            .read_range(&digest, from as u64, 0)
+            .await
+            .expect("tail"),
+    )
+    .await;
     assert_eq!(bytes, large[from..]);
-    let at_end = remote.read_range(&digest, digest.size_bytes, 0).await.expect("at the end");
+    let at_end = remote
+        .read_range(&digest, digest.size_bytes, 0)
+        .await
+        .expect("at the end");
     assert_eq!(collect(at_end).await, (Vec::new(), Vec::new()));
 }
 
@@ -141,10 +162,20 @@ async fn errors_keep_their_codes_across_the_wire() {
     let (mem, remote, channel) = pair().await;
     let held = remote.put(Bytes::from_static(b"held")).await.expect("put");
     let absent = sha(b"never stored");
-    let error = remote.read_range(&absent, 0, 0).await.err().expect("refused");
-    assert!(matches!(error, StorageError::NotFound(d) if d == absent), "{error:?}");
+    let error = remote
+        .read_range(&absent, 0, 0)
+        .await
+        .err()
+        .expect("refused");
+    assert!(
+        matches!(error, StorageError::NotFound(d) if d == absent),
+        "{error:?}"
+    );
     let error = remote.read_blob(&absent).await.expect_err("refused");
-    assert!(matches!(error, StorageError::NotFound(d) if d == absent), "{error:?}");
+    assert!(
+        matches!(error, StorageError::NotFound(d) if d == absent),
+        "{error:?}"
+    );
     let error = remote.read_range(&held, 9, 0).await.err().expect("refused");
     assert!(
         matches!(error, StorageError::OutOfRange { digest, offset: 9 } if digest == held),
@@ -168,7 +199,11 @@ async fn errors_keep_their_codes_across_the_wire() {
             })
             .await
             .expect_err("refused");
-        assert_eq!(status.code(), code, "{resource_name} {read_offset} {read_limit}");
+        assert_eq!(
+            status.code(),
+            code,
+            "{resource_name} {read_offset} {read_limit}"
+        );
     }
 
     // A read that fails after its first chunk.
@@ -178,16 +213,25 @@ async fn errors_keep_their_codes_across_the_wire() {
         .expect("put");
     *mem.fail_reading.lock().expect("lock") = Some(StorageError::Unreachable(big));
     let mut stream = remote.read_range(&big, 0, 0).await.expect("begins");
-    assert_eq!(stream.next().await.expect("first").expect("ok").len(), READ_CHUNK_BYTES);
+    assert_eq!(
+        stream.next().await.expect("first").expect("ok").len(),
+        READ_CHUNK_BYTES
+    );
     let failed = stream.next().await.expect("second").expect_err("fails");
     assert!(matches!(failed, StorageError::Unavailable(_)), "{failed:?}");
     *mem.fail_reading.lock().expect("lock") = None;
 
     // Whatever the store fails with.
     let cases = [
-        (StorageError::Unavailable(Arc::new(std::fmt::Error)), Code::Unavailable),
+        (
+            StorageError::Unavailable(Arc::new(std::fmt::Error)),
+            Code::Unavailable,
+        ),
         (StorageError::Internal("torn".to_owned()), Code::Internal),
-        (StorageError::Invalid("bad".to_owned()), Code::InvalidArgument),
+        (
+            StorageError::Invalid("bad".to_owned()),
+            Code::InvalidArgument,
+        ),
     ];
     for (injected, code) in cases {
         *mem.fail.lock().expect("lock") = Some(injected);
@@ -198,7 +242,10 @@ async fn errors_keep_their_codes_across_the_wire() {
             _ => matches!(error, StorageError::Invalid(_)),
         };
         assert!(expected, "{code:?}: {error:?}");
-        let error = remote.put(Bytes::from_static(b"x")).await.expect_err("fails");
+        let error = remote
+            .put(Bytes::from_static(b"x"))
+            .await
+            .expect_err("fails");
         assert_eq!(Status::from(error).code(), code);
     }
 }
@@ -216,14 +263,34 @@ fn a_status_becomes_the_error_a_store_would_give() {
         lifted(Code::OutOfRange, at),
         StorageError::OutOfRange { digest, offset: 4 } if digest == d
     ));
-    for code in [Code::InvalidArgument, Code::PermissionDenied, Code::Unauthenticated] {
-        assert!(matches!(lifted(code, at), StorageError::Invalid(m) if m == "m"), "{code:?}");
+    for code in [
+        Code::InvalidArgument,
+        Code::PermissionDenied,
+        Code::Unauthenticated,
+    ] {
+        assert!(
+            matches!(lifted(code, at), StorageError::Invalid(m) if m == "m"),
+            "{code:?}"
+        );
     }
     // Without a blob to name, NOT_FOUND and OUT_OF_RANGE are the node's own confusion.
-    for code in [Code::Internal, Code::Unimplemented, Code::NotFound, Code::OutOfRange] {
-        assert!(matches!(lifted(code, None), StorageError::Internal(m) if m == "m"), "{code:?}");
+    for code in [
+        Code::Internal,
+        Code::Unimplemented,
+        Code::NotFound,
+        Code::OutOfRange,
+    ] {
+        assert!(
+            matches!(lifted(code, None), StorageError::Internal(m) if m == "m"),
+            "{code:?}"
+        );
     }
-    for code in [Code::Unavailable, Code::DeadlineExceeded, Code::Cancelled, Code::Aborted] {
+    for code in [
+        Code::Unavailable,
+        Code::DeadlineExceeded,
+        Code::Cancelled,
+        Code::Aborted,
+    ] {
         let error = lifted(code, at);
         assert!(matches!(error, StorageError::Unavailable(_)), "{code:?}");
         assert_eq!(error.to_string(), "storage node: m");
@@ -257,23 +324,45 @@ async fn find_missing_answers_in_order_and_refuses_what_it_cannot() {
         size_bytes: -1,
     };
     for request in [
-        ask(reapi::digest_function::Value::Sha1 as i32, vec![to_proto(&a)]),
+        ask(
+            reapi::digest_function::Value::Sha1 as i32,
+            vec![to_proto(&a)],
+        ),
         ask(0, vec![bad]),
         ask(0, vec![negative]),
     ] {
         let status = cas.find_missing_blobs(request).await.expect_err("refused");
         assert_eq!(status.code(), Code::InvalidArgument);
     }
-    let explicit = ask(reapi::digest_function::Value::Sha256 as i32, vec![to_proto(&a)]);
-    assert_eq!(cas.find_missing_blobs(explicit).await.expect("ok").into_inner().missing_blob_digests.len(), 1);
+    let explicit = ask(
+        reapi::digest_function::Value::Sha256 as i32,
+        vec![to_proto(&a)],
+    );
+    assert_eq!(
+        cas.find_missing_blobs(explicit)
+            .await
+            .expect("ok")
+            .into_inner()
+            .missing_blob_digests
+            .len(),
+        1
+    );
 
     let refused = [
-        cas.batch_update_blobs(BatchUpdateBlobsRequest::default()).await.map(drop),
-        cas.batch_read_blobs(BatchReadBlobsRequest::default()).await.map(drop),
+        cas.batch_update_blobs(BatchUpdateBlobsRequest::default())
+            .await
+            .map(drop),
+        cas.batch_read_blobs(BatchReadBlobsRequest::default())
+            .await
+            .map(drop),
         cas.get_tree(GetTreeRequest::default()).await.map(drop),
         cas.split_blob(SplitBlobRequest::default()).await.map(drop),
-        cas.splice_blob(SpliceBlobRequest::default()).await.map(drop),
-        cas.get_chunk_mapping(GetChunkMappingRequest::default()).await.map(drop),
+        cas.splice_blob(SpliceBlobRequest::default())
+            .await
+            .map(drop),
+        cas.get_chunk_mapping(GetChunkMappingRequest::default())
+            .await
+            .map(drop),
         cas.register_chunk_mapping(stream::iter([RegisterChunkMappingRequest::default()]))
             .await
             .map(drop),
@@ -294,13 +383,23 @@ async fn a_write_is_checked_against_its_digest() {
     let blob = b"twelve bytes";
     let digest = sha(blob);
     let name = upload_name(&digest);
-    let too_big = Digest::new(kbf_types::DigestFunction::Sha256, [3; 32], MAX_BLOB_BYTES + 1);
+    let too_big = Digest::new(
+        kbf_types::DigestFunction::Sha256,
+        [3; 32],
+        MAX_BLOB_BYTES + 1,
+    );
     let wrong = [b'x'; 12];
     let cases = [
         ("no message", Vec::new()),
         ("not an upload", write_of("blobs/x", &[(blob, true)])),
-        ("over the largest", write_of(&upload_name(&too_big), &[(b"", true)])),
-        ("more than named", write_of(&name, &[(blob, false), (b"!", true)])),
+        (
+            "over the largest",
+            write_of(&upload_name(&too_big), &[(b"", true)]),
+        ),
+        (
+            "more than named",
+            write_of(&name, &[(blob, false), (b"!", true)]),
+        ),
         ("no finish", write_of(&name, &[(blob, false)])),
         ("fewer than named", write_of(&name, &[(&blob[..5], true)])),
         ("other bytes", write_of(&name, &[(&wrong, true)])),
@@ -310,11 +409,17 @@ async fn a_write_is_checked_against_its_digest() {
         assert_eq!(status.code(), Code::InvalidArgument, "{what}: {status}");
     }
     assert!(!mem.blobs.lock().expect("lock").contains_key(&digest));
-    let acknowledged = raw_write(&channel, write_of(&name, &[(&blob[..5], false), (&blob[5..], true)]))
-        .await
-        .expect("a correct write");
+    let acknowledged = raw_write(
+        &channel,
+        write_of(&name, &[(&blob[..5], false), (&blob[5..], true)]),
+    )
+    .await
+    .expect("a correct write");
     assert_eq!(acknowledged.committed_size, 12);
-    assert_eq!(mem.blobs.lock().expect("lock").get(&digest).map(Bytes::len), Some(12));
+    assert_eq!(
+        mem.blobs.lock().expect("lock").get(&digest).map(Bytes::len),
+        Some(12)
+    );
 }
 
 /// Catches a Write that reads and stores a blob the node already holds (the cheapest
@@ -328,16 +433,22 @@ async fn a_held_blob_is_not_written_again() {
     assert_eq!(mem.puts.load(Ordering::SeqCst), 1);
     let again = raw_write(&channel, write_of(&upload_name(&digest), &[(&blob, true)])).await;
     assert_eq!(again.expect("acknowledged").committed_size, 11);
-    assert_eq!(mem.puts.load(Ordering::SeqCst), 1, "the second write stored nothing");
+    assert_eq!(
+        mem.puts.load(Ordering::SeqCst),
+        1,
+        "the second write stored nothing"
+    );
 
     let mut raw = ByteStreamClient::new(channel);
     let status = |d: Digest| {
         let mut raw = raw.clone();
         async move {
             let name = upload_name(&d);
-            raw.query_write_status(QueryWriteStatusRequest { resource_name: name })
-                .await
-                .map(tonic::Response::into_inner)
+            raw.query_write_status(QueryWriteStatusRequest {
+                resource_name: name,
+            })
+            .await
+            .map(tonic::Response::into_inner)
         }
     };
     let held = status(digest).await.expect("status");
@@ -369,7 +480,13 @@ async fn concurrent_writes_wait_for_room() {
     second.expect("second");
     assert_eq!(mem.most_active.load(Ordering::SeqCst), 1);
     let big = Bytes::from(patterned(100));
-    assert_eq!(remote.put(big.clone()).await.expect("larger than the bound"), sha(&big));
+    assert_eq!(
+        remote
+            .put(big.clone())
+            .await
+            .expect("larger than the bound"),
+        sha(&big)
+    );
 }
 
 /// Catches the action cache losing something on the wire: a miss that becomes a hit or
@@ -387,7 +504,10 @@ async fn the_action_cache_round_trips() {
         exit_code: 2,
         ..ActionResult::default()
     };
-    let record = remote.prepare_action_result(&result).await.expect("prepared");
+    let record = remote
+        .prepare_action_result(&result)
+        .await
+        .expect("prepared");
     assert_eq!(record.result, sha(b"out"));
     assert_eq!(record.closure.len(), 2);
 
@@ -395,12 +515,19 @@ async fn the_action_cache_round_trips() {
         .commit_action_record(Role::Client, action, record.clone())
         .await
         .expect_err("a client never writes");
-    assert!(matches!(refused, StorageError::ActionWrite(ActionWriteError::NotDaemon)));
+    assert!(matches!(
+        refused,
+        StorageError::ActionWrite(ActionWriteError::NotDaemon)
+    ));
     remote
         .commit_action_record(Role::Daemon, action, record.clone())
         .await
         .expect("committed");
-    let (digest, got) = remote.action_result(&action).await.expect("hit").expect("a hit");
+    let (digest, got) = remote
+        .action_result(&action)
+        .await
+        .expect("hit")
+        .expect("a hit");
     assert_eq!((digest, got.exit_code), (record.result, 2));
 
     for (code, expected) in [(99, "absent"), (98, "unreachable")] {
@@ -408,7 +535,10 @@ async fn the_action_cache_round_trips() {
             exit_code: code,
             ..ActionResult::default()
         };
-        let error = remote.prepare_action_result(&lacking).await.expect_err("refused");
+        let error = remote
+            .prepare_action_result(&lacking)
+            .await
+            .expect_err("refused");
         match (expected, error) {
             ("absent", StorageError::ActionWrite(ActionWriteError::Absent(d))) => {
                 assert_eq!(d, sha(b"missing"));
@@ -456,12 +586,18 @@ async fn the_action_cache_round_trips() {
         action: None,
         ..commit(Writer::Daemon, Some(record_of(&record)))
     };
-    assert_eq!(raw.commit(no_action).await.expect_err("refused").code(), Code::InvalidArgument);
+    assert_eq!(
+        raw.commit(no_action).await.expect_err("refused").code(),
+        Code::InvalidArgument
+    );
     let no_result = PrepareRequest {
         map_generation: 0,
         result: None,
     };
-    assert_eq!(raw.prepare(no_result).await.expect_err("refused").code(), Code::InvalidArgument);
+    assert_eq!(
+        raw.prepare(no_result).await.expect_err("refused").code(),
+        Code::InvalidArgument
+    );
 }
 
 /// Catches a store failure on the action cache that is answered in the message (a miss,
@@ -476,9 +612,20 @@ async fn an_action_cache_failure_is_a_status() {
         closure: kbf_meta::Closure::new(),
     };
     for error in [
-        remote.action_result(&action).await.map(drop).expect_err("fails"),
-        remote.prepare_action_result(&ActionResult::default()).await.map(drop).expect_err("fails"),
-        remote.commit_action_record(Role::Daemon, action, record).await.expect_err("fails"),
+        remote
+            .action_result(&action)
+            .await
+            .map(drop)
+            .expect_err("fails"),
+        remote
+            .prepare_action_result(&ActionResult::default())
+            .await
+            .map(drop)
+            .expect_err("fails"),
+        remote
+            .commit_action_record(Role::Daemon, action, record)
+            .await
+            .expect_err("fails"),
     ] {
         assert!(matches!(error, StorageError::Internal(_)), "{error:?}");
     }
@@ -495,11 +642,23 @@ async fn segments_are_forwarded_with_the_map_generation() {
         .await
         .expect("begin");
     assert_eq!(begun.into_inner().upload, 7);
-    segments.put_range(Request::new(PutRangeRequest::default())).await.expect("put_range");
-    let committed = segments.commit(Request::new(SegmentsCommit::default())).await.expect("commit");
+    segments
+        .put_range(Request::new(PutRangeRequest::default()))
+        .await
+        .expect("put_range");
+    let committed = segments
+        .commit(Request::new(SegmentsCommit::default()))
+        .await
+        .expect("commit");
     assert_eq!(committed.into_inner().committed.len(), 1);
-    segments.locate(Request::new(LocateRequest::default())).await.expect("locate");
-    let read = segments.read_range(Request::new(ReadRangeRequest::default())).await.expect("read");
+    segments
+        .locate(Request::new(LocateRequest::default()))
+        .await
+        .expect("locate");
+    let read = segments
+        .read_range(Request::new(ReadRangeRequest::default()))
+        .await
+        .expect("read");
     assert_eq!(read.into_inner().bytes, [1, 2]);
     let seen = mem.segments.calls.lock().expect("lock").clone();
     let five = Some("5".to_owned());
@@ -520,26 +679,60 @@ async fn a_client_does_not_trust_a_node_that_contradicts_itself() {
     let remote = RemoteStorage::new(channel, 9);
     let action = sha(b"a");
     let invalid = |e: StorageError| matches!(e, StorageError::Invalid(_));
-    assert!(invalid(remote.action_result(&action).await.map(drop).expect_err("bad digest")));
-    let empty = remote.prepare_action_result(&ActionResult::default()).await.map(drop);
-    assert!(matches!(empty.expect_err("no outcome"), StorageError::Internal(_)));
-    let bad_record = ActionResult {
-        exit_code: 1,
-        ..ActionResult::default()
-    };
-    assert!(invalid(remote.prepare_action_result(&bad_record).await.map(drop).expect_err("bad record")));
+    assert!(invalid(
+        remote
+            .action_result(&action)
+            .await
+            .map(drop)
+            .expect_err("bad digest")
+    ));
+    let empty = remote
+        .prepare_action_result(&ActionResult::default())
+        .await
+        .map(drop);
+    assert!(matches!(
+        empty.expect_err("no outcome"),
+        StorageError::Internal(_)
+    ));
+    for exit_code in [1, 2] {
+        let bad = ActionResult {
+            exit_code,
+            ..ActionResult::default()
+        };
+        let error = remote
+            .prepare_action_result(&bad)
+            .await
+            .expect_err("bad record");
+        assert!(invalid(error));
+    }
+    assert!(
+        remote.stream(5).is_none(),
+        "a streamed write over the wire is put's messages"
+    );
     let record = ActionRecord {
         result: sha(b"r"),
         closure: kbf_meta::Closure::new(),
     };
-    remote.commit_action_record(Role::Daemon, action, record).await.expect("committed");
-    assert_eq!(*odd.generations.lock().expect("lock"), [9, 9, 9, 9]);
+    remote
+        .commit_action_record(Role::Daemon, action, record)
+        .await
+        .expect("committed");
+    assert_eq!(*odd.generations.lock().expect("lock"), [9, 9, 9, 9, 9]);
 
     let five = Digest::new(kbf_types::DigestFunction::Sha256, [1; 32], 5);
-    let short = remote.read_blob(&five).await.expect_err("three bytes of five");
+    let short = remote
+        .read_blob(&five)
+        .await
+        .expect_err("three bytes of five");
     assert!(matches!(short, StorageError::Internal(_)), "{short:?}");
-    let unacknowledged = remote.put(Bytes::from_static(b"abc")).await.expect_err("0 of 3");
-    assert!(matches!(unacknowledged, StorageError::Internal(_)), "{unacknowledged:?}");
+    let unacknowledged = remote
+        .put(Bytes::from_static(b"abc"))
+        .await
+        .expect_err("0 of 3");
+    assert!(
+        matches!(unacknowledged, StorageError::Internal(_)),
+        "{unacknowledged:?}"
+    );
 }
 
 /// Catches a refusal the client cannot read becoming a success or a wrong error, and a
@@ -574,7 +767,9 @@ fn a_refusal_is_read_back_as_it_was_made() {
 #[test]
 fn resource_names_parse_every_spelling() {
     let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-    let seven = wire::read_resource(&format!("blobs/{hash}/7")).expect("plain").size_bytes;
+    let seven = wire::read_resource(&format!("blobs/{hash}/7"))
+        .expect("plain")
+        .size_bytes;
     assert_eq!(seven, 7);
     for name in [
         format!("main/ci/blobs/{hash}/7"),

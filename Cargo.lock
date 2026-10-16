@@ -1389,12 +1389,19 @@ dependencies = [
 name = "kbf-cli"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "kbf-all-in-one",
+ "kbf-cas-conformance",
  "kbf-deploy",
  "kbf-host",
  "kbf-node",
  "kbf-server",
+ "kbf-storage",
+ "kbf-transfer",
+ "kbf-types",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]

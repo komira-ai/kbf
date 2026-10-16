@@ -130,10 +130,8 @@ impl Admission {
         if endpoint.allowed().contains(&role) {
             return Ok(());
         }
-        let refused = Status::permission_denied(format!(
-            "role {} may not call {endpoint:?}",
-            role.name()
-        ));
+        let refused =
+            Status::permission_denied(format!("role {} may not call {endpoint:?}", role.name()));
         tracing::warn!(role = role.name(), ?endpoint, "storage call refused");
         Err(refused)
     }
@@ -172,4 +170,3 @@ pub fn role_of(der: &[u8]) -> Result<PeerRole, Status> {
         .find(|role| role.name() == *name)
         .ok_or_else(|| Status::permission_denied(format!("{name:?} is not a role")))
 }
-

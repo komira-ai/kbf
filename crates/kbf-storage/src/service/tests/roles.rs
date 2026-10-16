@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use futures::stream;
-use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::google::bytestream::ReadRequest;
+use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
 use kbf_proto::reapi::{ActionResult, FindMissingBlobsRequest};
 use kbf_proto::storage::action_store_client::ActionStoreClient;
@@ -20,13 +20,17 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity, ServerTl
 use tonic::{Code, Status};
 
 use super::fake::{Mem, serve_routes, sha};
+use crate::Storage;
 use crate::service::{
     Admission, Config, Endpoint, PeerRole, ROLE_URI_PREFIX, StorageService, role_of,
 };
-use crate::Storage;
 
 fn uri(role: &str) -> SanType {
-    SanType::URI(format!("{ROLE_URI_PREFIX}{role}").try_into().expect("an IA5 name"))
+    SanType::URI(
+        format!("{ROLE_URI_PREFIX}{role}")
+            .try_into()
+            .expect("an IA5 name"),
+    )
 }
 
 fn dns(name: &str) -> SanType {
@@ -69,8 +73,16 @@ fn each_endpoint_takes_the_roles_the_design_gives_it() {
                 assert!(answer.is_ok(), "{role:?} on {endpoint:?}");
             } else {
                 let status = answer.expect_err("refused");
-                assert_eq!(status.code(), Code::PermissionDenied, "{role:?} on {endpoint:?}");
-                assert!(status.message().contains(role.name()), "{}", status.message());
+                assert_eq!(
+                    status.code(),
+                    Code::PermissionDenied,
+                    "{role:?} on {endpoint:?}"
+                );
+                assert!(
+                    status.message().contains(role.name()),
+                    "{}",
+                    status.message()
+                );
             }
         }
     }
@@ -87,7 +99,11 @@ fn each_endpoint_takes_the_roles_the_design_gives_it() {
 #[test]
 fn a_certificate_must_name_exactly_one_known_role() {
     let certified = Admission::Certified;
-    let refused = |leaf: Option<&[u8]>| certified.check_leaf(leaf, Endpoint::Read).expect_err("refused");
+    let refused = |leaf: Option<&[u8]>| {
+        certified
+            .check_leaf(leaf, Endpoint::Read)
+            .expect_err("refused")
+    };
     assert_eq!(refused(None).code(), Code::Unauthenticated);
     assert_eq!(refused(Some(b"not DER")).code(), Code::Unauthenticated);
     for sans in [
@@ -98,7 +114,11 @@ fn a_certificate_must_name_exactly_one_known_role() {
         vec![],
     ] {
         let leaf = der(sans.clone());
-        assert_eq!(refused(Some(&leaf)).code(), Code::PermissionDenied, "{sans:?}");
+        assert_eq!(
+            refused(Some(&leaf)).code(),
+            Code::PermissionDenied,
+            "{sans:?}"
+        );
     }
     for endpoint in Endpoint::ALL {
         assert!(Admission::Open.check_leaf(None, endpoint).is_ok());
@@ -114,8 +134,12 @@ impl Pki {
     fn new() -> Self {
         let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
         ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        ca.distinguished_name.push(DnType::CommonName, "kbf test CA");
-        ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::DigitalSignature];
+        ca.distinguished_name
+            .push(DnType::CommonName, "kbf test CA");
+        ca.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
         let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("key")).expect("CA");
         Self { ca }
     }
@@ -234,6 +258,8 @@ async fn every_endpoint_refuses_an_unexpected_role_over_mutual_tls() {
     }
     // A client of the allowed role really reached the store.
     let channel = pki.client(addr, "daemon").await;
-    call(Endpoint::Write, &channel).await.expect("a daemon writes");
+    call(Endpoint::Write, &channel)
+        .await
+        .expect("a daemon writes");
     assert!(mem.blobs.lock().expect("lock").contains_key(&sha(b"x")));
 }

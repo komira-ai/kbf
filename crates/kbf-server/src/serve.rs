@@ -506,8 +506,8 @@ pub fn bind_storage(
         }
         None => kbf_storage::service::Admission::Open,
     };
-    let routes = kbf_storage::service::StorageService::new(storage, admission, listener.service)
-        .routes();
+    let routes =
+        kbf_storage::service::StorageService::new(storage, admission, listener.service).routes();
     let serving = async move {
         server
             .add_routes(routes)

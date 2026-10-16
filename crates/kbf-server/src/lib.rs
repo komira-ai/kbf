@@ -40,6 +40,11 @@
 //!   on that listener alone and an authorizer per kind of call in the services;
 //!   without the flag every call is accepted and allowed.
 //!
+//! - The storage node ([`storage_node`], `kbf storage`): the same cache and stores,
+//!   served alone over gRPC by `kbf_storage::service` (blobs through the standard
+//!   protocols, the action cache through `kbf.storage.v1`), each call admitted by the
+//!   role in the caller's certificate. No scheduler, REAPI or state store.
+//!
 //! Not yet: the scheduler's state in the Raft log (the control log is in-process: a
 //! record commits as soon as it is appended, see [`farm`]), REAPI authentication other than the policies
 //! `kbf-auth` builds (`allow`, `deny`, `any`, `all`), operator roles (the

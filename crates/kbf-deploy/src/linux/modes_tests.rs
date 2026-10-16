@@ -75,9 +75,9 @@ fn the_converged_units_are_unchanged() {
 /// parser, which takes anything there) and a mode that runs builds without its cgroup
 /// delegated.
 #[test]
-fn the_built_modes_are_daemon_and_all_in_one() {
+fn the_built_modes_are_storage_daemon_and_all_in_one() {
     let built: Vec<_> = Mode::ALL.iter().filter(|m| m.is_built()).collect();
-    assert_eq!(built, [&Mode::Daemon, &Mode::AllInOne]);
+    assert_eq!(built, [&Mode::Storage, &Mode::Daemon, &Mode::AllInOne]);
     let builds: Vec<_> = Mode::ALL.iter().filter(|m| m.runs_builds()).collect();
     assert_eq!(
         builds,
@@ -361,8 +361,8 @@ fn the_parse_rule_runs_kbf_check_args_on_a_built_modes_flags() {
     // A mode not built yet, and a unit that starts an old binary: kbf is not asked.
     for (mode, text) in [
         (
-            Mode::Storage,
-            render(&c, Some(1500), Mode::Storage).expect("renders"),
+            Mode::StorageAndDaemon,
+            render(&c, Some(1500), Mode::StorageAndDaemon).expect("renders"),
         ),
         (
             Mode::Daemon,

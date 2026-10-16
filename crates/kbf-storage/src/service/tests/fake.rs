@@ -20,8 +20,8 @@ use kbf_proto::google::bytestream::{
 use kbf_proto::reapi::{self, ActionResult};
 use kbf_proto::storage::action_store_server::{ActionStore, ActionStoreServer};
 use kbf_proto::storage::{
-    CommitRequest, CommitResponse, Entry, GetRequest, GetResponse, PrepareRequest,
-    PrepareResponse, Record, prepare_response,
+    CommitRequest, CommitResponse, Entry, GetRequest, GetResponse, PrepareRequest, PrepareResponse,
+    Record, prepare_response,
 };
 use kbf_proto::worker::segments_server::Segments;
 use kbf_proto::worker::{
@@ -184,7 +184,9 @@ impl Storage for Mem {
             }
             Ok(ActionRecord {
                 result: sha(&result.stdout_raw),
-                closure: (0..result.exit_code).map(|i| sha(&[i as u8])).collect::<Closure>(),
+                closure: (0..result.exit_code)
+                    .map(|i| sha(&[i as u8]))
+                    .collect::<Closure>(),
             })
         })
     }
@@ -333,7 +335,9 @@ impl ByteStream for Odd {
         let data = vec![ReadResponse {
             data: vec![1, 2, 3],
         }];
-        Ok(Response::new(stream::iter(data.into_iter().map(Ok)).boxed()))
+        Ok(Response::new(
+            stream::iter(data.into_iter().map(Ok)).boxed(),
+        ))
     }
 
     /// Acknowledges no bytes.
@@ -371,8 +375,8 @@ impl ActionStore for Odd {
         }))
     }
 
-    /// No outcome, or a record whose result is not a digest when the result asks (exit
-    /// code 1).
+    /// No outcome, or when the result asks (exit code 1 or 2) a record whose result, or
+    /// whose closure, is not a digest.
     async fn prepare(
         &self,
         request: Request<PrepareRequest>,
@@ -382,12 +386,21 @@ impl ActionStore for Odd {
             .lock()
             .expect("lock")
             .push(request.map_generation);
-        let outcome = (request.result.map_or(0, |r| r.exit_code) == 1).then(|| {
-            prepare_response::Outcome::Record(Record {
+        let good = Some(reapi::Digest {
+            hash: "ab".repeat(32),
+            size_bytes: 1,
+        });
+        let outcome = match request.result.map_or(0, |r| r.exit_code) {
+            1 => Some(prepare_response::Outcome::Record(Record {
                 result: None,
                 closure: Vec::new(),
-            })
-        });
+            })),
+            2 => Some(prepare_response::Outcome::Record(Record {
+                result: good,
+                closure: vec![reapi::Digest::default()],
+            })),
+            _ => None,
+        };
         Ok(Response::new(PrepareResponse { outcome }))
     }
 
