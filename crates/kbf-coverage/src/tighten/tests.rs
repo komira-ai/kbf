@@ -70,17 +70,23 @@ fn lowers_each_looser_metric_to_the_measured_value() {
     );
 }
 
+fn unmeasured(krate: &str, metric: Metric, recorded: u64) -> Refusal {
+    Refusal::NoLongerMeasured {
+        krate: krate.into(),
+        metric,
+        recorded,
+    }
+}
+
 /// Catches: each kind of rise written instead of refused (a higher count, `-` to a
-/// count above 0, a count above 0 to no data), or refused without naming the crate,
-/// the metric and both values.
+/// count above 0), or refused without naming the crate, the metric and both values.
 #[test]
 fn refuses_every_kind_of_rise() {
     for (recorded, measured, metric) in [
         (e(Some(4), Some(15)), e(Some(5), Some(15)), Metric::Lines),
         (e(Some(4), Some(15)), e(Some(4), Some(16)), Metric::Branches),
         (e(None, None), e(Some(1), None), Metric::Lines),
-        (e(Some(0), Some(2)), e(Some(0), None), Metric::Branches),
-        (e(Some(1), Some(0)), e(None, Some(0)), Metric::Lines),
+        (e(None, None), e(Some(0), Some(1)), Metric::Branches),
     ] {
         let got = plan(
             &file(&[("k", recorded)]),
@@ -96,7 +102,6 @@ fn refuses_every_kind_of_rise() {
     let messages: Vec<String> = [
         raised("k", Metric::Lines, Some(4), Some(7)),
         raised("k", Metric::Lines, None, Some(1)),
-        raised("k", Metric::Branches, Some(2), None),
     ]
     .iter()
     .map(Refusal::to_string)
@@ -106,8 +111,62 @@ fn refuses_every_kind_of_rise() {
         [
             "k lines: recorded 4, measured 7: more missed than recorded; cover the code",
             "k lines: recorded -, measured 1: more missed than recorded; cover the code",
-            "k branches: recorded 2, measured -: more missed than recorded; cover the code",
         ]
+    );
+}
+
+/// Catches: a crate whose code no test binary instruments any more read as covered.
+/// A library with `[lib] test = false` has no record in the tracefile at all, so a
+/// crate recorded `0 0` that gains untested code measures `- -`: written, that hides
+/// the new code. Lines 0 -> `-` is refused for the same reason, and so is branches
+/// 0 -> `-` once the lines are unmeasured too; branches 0 -> `-` with the lines still
+/// measured is a crate that lost its last branch, and is lowered. A count to no data
+/// is refused alike, and every such refusal names the hand edit a legitimate case
+/// takes, not "cover the code".
+#[test]
+fn no_data_where_the_file_has_a_count_is_refused_unless_only_branches_vanished() {
+    let ws = set(&["k"]);
+    let run = |recorded: Entry, measured: Entry| {
+        plan(&file(&[("k", recorded)]), &file(&[("k", measured)]), &ws)
+    };
+    // `0 0` -> `- -`: the `[lib] test = false` case.
+    assert_eq!(
+        run(e(Some(0), Some(0)), e(None, None)),
+        Err(vec![
+            unmeasured("k", Metric::Lines, 0),
+            unmeasured("k", Metric::Branches, 0),
+        ])
+    );
+    // Lines 0 -> `-`.
+    assert_eq!(
+        run(e(Some(0), None), e(None, None)),
+        Err(vec![unmeasured("k", Metric::Lines, 0)])
+    );
+    // Branches 0 -> `-` with the lines `-` on both sides.
+    assert_eq!(
+        run(e(None, Some(0)), e(None, None)),
+        Err(vec![unmeasured("k", Metric::Branches, 0)])
+    );
+    // Branches 0 -> `-` with the lines still measured: lowered.
+    assert_eq!(
+        run(e(Some(2), Some(0)), e(Some(2), None)),
+        Ok(vec![lowered("k", Metric::Branches, Some(0), None)])
+    );
+    // A count to no data, lines or branches.
+    assert_eq!(
+        run(e(Some(1), Some(0)), e(None, Some(0))),
+        Err(vec![unmeasured("k", Metric::Lines, 1)])
+    );
+    assert_eq!(
+        run(e(Some(0), Some(2)), e(Some(0), None)),
+        Err(vec![unmeasured("k", Metric::Branches, 2)])
+    );
+    assert_eq!(
+        unmeasured("k", Metric::Lines, 0).to_string(),
+        "k lines: recorded 0, measured -: nothing measured where the file has a count would hide \
+         misses (a crate with `[lib] test = false` has no coverage record at all); give it a test \
+         target back, or, if it has nothing left to measure, change its line to - by hand in a \
+         reviewed pull request"
     );
 }
 
@@ -268,17 +327,21 @@ fn a_tightened_file_has_nothing_left_to_change() {
     assert_eq!(plan(&once, &measured, &ws), Ok(vec![]));
 }
 
-/// Catches: a crate that lost its last branch (0 recorded, nothing measured, as
-/// kbf-cas-conformance once did) refused with "cover the code", which nothing can
-/// do; and the same leniency given to a count above 0, which would hide its misses.
+/// Catches: a crate that lost its last branch (branches 0 recorded, nothing measured,
+/// lines still measured, as kbf-cas-conformance once did) refused, which nothing but a
+/// hand edit could fix; and the same leniency given to a count above 0, which would
+/// hide its misses.
 #[test]
-fn zero_to_no_data_is_lowered_but_a_count_to_no_data_is_refused() {
+fn zero_branches_to_no_data_is_lowered_but_a_count_to_no_data_is_refused() {
     let recorded = file(&[("k", e(Some(0), Some(0))), ("m", e(Some(3), Some(0)))]);
     let measured = file(&[("k", e(Some(0), None)), ("m", e(None, None))]);
     let ws = set(&["k", "m"]);
     assert_eq!(
         plan(&recorded, &measured, &ws),
-        Err(vec![raised("m", Metric::Lines, Some(3), None)])
+        Err(vec![
+            unmeasured("m", Metric::Lines, 3),
+            unmeasured("m", Metric::Branches, 0),
+        ])
     );
     let measured = file(&[("k", e(Some(0), None)), ("m", e(Some(3), None))]);
     let changes = plan(&recorded, &measured, &ws).expect("only lowers");
@@ -308,6 +371,22 @@ fn a_root_without_any_recorded_crate_is_refused() {
             Err(vec![Refusal::NoRecordedCrateInWorkspace { recorded: 2 }])
         );
     }
+    // A one-crate file is guarded too: its crate gone from the root is a wrong root,
+    // not a deletion that would leave the file empty.
+    assert_eq!(
+        plan(&file(&[("a", e(Some(1), Some(1)))]), &file(&[]), &set(&[])),
+        Err(vec![Refusal::NoRecordedCrateInWorkspace { recorded: 1 }])
+    );
+    // The file's crates all measured, but a root of other crates: the root is the
+    // refusal named, not the measured crates missing from it.
+    assert_eq!(
+        plan(
+            &recorded,
+            &file(&[("a", e(Some(1), Some(1))), ("b", e(None, None))]),
+            &set(&["x"])
+        ),
+        Err(vec![Refusal::NoRecordedCrateInWorkspace { recorded: 2 }])
+    );
     // One recorded crate still there: the other is a deletion, as before.
     let measured = file(&[("a", e(Some(1), Some(1)))]);
     assert_eq!(
@@ -331,9 +410,27 @@ fn a_root_without_any_recorded_crate_is_refused() {
             krate: "n".into(),
             measured: e(Some(1), None),
         },
+        unmeasured("k", Metric::Lines, 0),
     ]
     .iter()
     .map(Refusal::of_another_tree)
     .collect();
-    assert_eq!(another, [false, true, true, false, false]);
+    assert_eq!(another, [false, true, true, false, false, false]);
+}
+
+/// Catches: the advice after a refusal chosen wrongly. One refusal that says the
+/// measurement is of another tree decides it, whatever else is refused (a rule that
+/// needs every refusal to say so misses a rise next to a missing crate); any other
+/// refusal of a measured file (CI's, of the merge with main) gets the softer form; a
+/// tracefile measured here gets none.
+#[test]
+fn tree_advice_follows_the_refusals_and_the_input() {
+    let rise = raised("k", Metric::Lines, Some(0), Some(1));
+    let missing = Refusal::Unmeasured { krate: "b".into() };
+    let mixed = [rise.clone(), missing];
+    let rise = [rise];
+    assert_eq!(tree_advice(&mixed, true), Some(OTHER_TREE_ADVICE));
+    assert_eq!(tree_advice(&mixed, false), Some(OTHER_TREE_ADVICE));
+    assert_eq!(tree_advice(&rise, true), Some(MAYBE_OTHER_TREE_ADVICE));
+    assert_eq!(tree_advice(&rise, false), None);
 }

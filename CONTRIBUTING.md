@@ -129,12 +129,22 @@ d=$(mktemp -d) && gh run download <run id> --repo komira-ai/komira-build-farm --
 Commit the rewritten `coverage-baseline` in the same pull request. `tighten` is
 not a bypass of the ratchet: it only lowers counts. It changes a crate's value
 only where the measurement is tighter (fewer items missed, `0` where the file
-says `-`, or `-` where the file says `0`: a crate with nothing left to measure
-had nothing missed), adds a new crate only when every measured value is `0` or
-`-`, and removes a crate only when its `Cargo.toml` is gone. It refuses everything
-else, including a `--root` that holds none of the file's crates,
-naming each crate and metric with the recorded and measured values, and leaves
-the file untouched: a raise is fixed by covering the code, never by the file.
+says `-`, or branches `-` where the file says `0` while the crate's lines are
+still measured: a crate that lost its last branch had nothing missed), adds a
+new crate only when every measured value is `0` or `-`, and removes a crate
+only when its `Cargo.toml` is gone. It refuses everything else, including a
+`--root` that holds none of the file's crates, naming each crate and metric
+with the recorded and measured values, and leaves the file untouched: a raise
+is fixed by covering the code, never by the file.
+
+`tighten` also refuses `-` measured where the file has a count, `0` included,
+for lines, and for branches once the lines are `-` too. A crate that no test
+binary instruments has no coverage record at all: a library with
+`[lib] test = false` measures `- -` however much untested code it gains, so
+taking that measurement would hide the code. Give the crate a test target back.
+When a crate legitimately has nothing left to measure (all of its code removed,
+say), change its line to `-` by hand in a reviewed pull request; the refusal
+names this. That is the one hand edit of `coverage-baseline`.
 It keeps the file's comments and order, prints each change, and replaces the
 file whole. Running the whole command again downloads into another new directory
 and changes nothing.
@@ -143,13 +153,16 @@ CI measures the pull request merged with `main`. When the branch is behind
 `main`, that measurement can name crates the branch does not have (or lack one
 it has), and `tighten` refuses it as a measurement of another tree: bring the
 branch up to date with `main`, let CI run again, and run the command it prints.
+Any other refusal of a measured file prints the same advice as a possibility,
+since `main`'s changes can cause it too; a refusal that stays once the branch
+is up to date is the branch's to fix.
 
 Without CI, `tighten --lcov <tracefile> --root .` measures from a local
 `cargo llvm-cov --branch --lcov` run instead. That run must use the coverage
 job's toolchain and flags (see `.github/workflows/ci.yml`): another toolchain
 can count fewer items missed, and the file it writes then fails CI as more
 missed than recorded, so the mistake fails safe but costs a round trip. Do not
-edit `coverage-baseline` by hand.
+edit `coverage-baseline` by hand, except for the unmeasured crate above.
 
 Changes under `.github/workflows/` will need a review from the code owners
 listed in [.github/CODEOWNERS](.github/CODEOWNERS). That rule is a placeholder

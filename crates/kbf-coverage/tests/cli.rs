@@ -381,14 +381,22 @@ fn tighten_twice_changes_nothing_the_second_time() {
     );
 }
 
+/// The advice after a refusal that says the measured file is of another tree.
+const OTHER_TREE: &str = "\nCI measures the pull request merged with main: bring the branch up \
+     to date with main, re-run CI, and run the command its coverage job prints\n";
+
+/// The advice after any other refusal of a measured file.
+const MAYBE: &str = "\nA measured file from CI is of the pull request merged with main: if the \
+     branch is behind main, main's changes can cause these refusals; bring the branch up to \
+     date with main, re-run CI, and run the command its coverage job prints. A refusal that \
+     stays is this branch's to fix\n";
+
 /// Catches: any rise written (or the run's lowerings written alongside one), a
 /// refusal that exits 0, or one that does not name the crate, the metric and both
 /// values. Each case starts from the recorded file and must leave it byte-identical.
 #[test]
 fn tighten_refuses_every_rise_and_leaves_the_file_untouched() {
     let root = tighten_workspace("tighten-refuses");
-    const OTHER_TREE: &str = "\nCI measures the pull request merged with main: bring the branch up \
-         to date with main, re-run CI, and run the command its coverage job prints\n";
     let measured = |front: &str, sim: &str, storage: &str, zz: &str| {
         let mut m = format!("kbf-front {front}\nkbf-sim-cell {sim}\nkbf-zz {zz}\n");
         if !storage.is_empty() {
@@ -397,28 +405,50 @@ fn tighten_refuses_every_rise_and_leaves_the_file_untouched() {
         m
     };
     for (m, want) in [
-        // A higher count, with kbf-sim-cell's lowering in the same run.
+        // A higher count, with kbf-sim-cell's lowering in the same run. Every
+        // refusal of a measured file ends with advice: CI's file is of the merge
+        // with main, so a branch behind main can see main's changes refused.
         (
             measured("48 8", "4 12", "0 -", "- -"),
-            vec!["kbf-front lines: recorded 47, measured 48: more missed than recorded"],
+            vec![
+                "kbf-front lines: recorded 47, measured 48: more missed than recorded",
+                MAYBE,
+            ],
         ),
         // `-` to a count above 0.
         (
             measured("47 8", "4 15", "0 -", "1 -"),
-            vec!["kbf-zz lines: recorded -, measured 1: more missed than recorded"],
+            vec![
+                "kbf-zz lines: recorded -, measured 1: more missed than recorded",
+                MAYBE,
+            ],
         ),
         // A count to no data, and a second rise: both named.
         (
             measured("47 -", "5 15", "0 -", "- -"),
             vec![
-                "kbf-front branches: recorded 8, measured -: more missed than recorded",
+                "kbf-front branches: recorded 8, measured -: nothing measured where the file has a count",
                 "kbf-sim-cell lines: recorded 4, measured 5: more missed than recorded",
+                MAYBE,
             ],
         ),
         // A new crate with uncovered code.
         (
             measured("47 8", "4 15", "1 -", "- -"),
-            vec!["kbf-storage: not in the baseline, measured 1 -: a new crate must arrive covered"],
+            vec![
+                "kbf-storage: not in the baseline, measured 1 -: a new crate must arrive covered",
+                MAYBE,
+            ],
+        ),
+        // A rise next to a workspace crate the measured file lacks: the measurement
+        // is of another tree, so the firm advice, once.
+        (
+            measured("48 8", "4 15", "", "- -"),
+            vec![
+                "kbf-front lines: recorded 47, measured 48: more missed than recorded",
+                "kbf-storage: crates/kbf-storage/Cargo.toml exists but the measured file has no line for it",
+                OTHER_TREE,
+            ],
         ),
         // A workspace crate the measured file lacks, then the advice for a
         // measurement of another tree (a branch behind main).
@@ -450,20 +480,18 @@ fn tighten_refuses_every_rise_and_leaves_the_file_untouched() {
         assert_eq!(baseline_of(&root), before, "{m}");
         assert_eq!(stdout(&o), "", "{m}");
         let err = stderr(&o);
-        assert!(
-            err.starts_with(
-                "kbf-coverage tighten: refused; ./coverage-baseline is unchanged. tighten only lowers counts:\n"
-            ),
-            "{err}"
-        );
-        // One line per refusal (and the advice) after the first, no more; the
-        // advice only after a refusal of another tree's measurement.
+        assert!(err.starts_with(REFUSED), "{err}");
+        // One line per refusal and one for the advice after the first, no more; the
+        // advice last, the firm form only after a refusal of another tree's
+        // measurement.
         assert_eq!(err.lines().count(), 1 + want.len(), "{m}: {err}");
+        assert!(err.ends_with(want.last().expect("advice")), "{m}: {err}");
         assert_eq!(
-            err.contains("bring the branch up to date"),
+            err.contains(OTHER_TREE),
             want.contains(&OTHER_TREE),
             "{m}: {err}"
         );
+        assert_eq!(err.contains(MAYBE), want.contains(&MAYBE), "{m}: {err}");
         for w in want {
             assert!(err.contains(w), "{m}: want {w:?} in {err}");
         }
@@ -854,4 +882,139 @@ fn the_command_follows_the_flags_and_quotes_for_the_shell() {
         "d=$(mktemp -d) && gh run download 7 --repo '' --name coverage --dir \"$d\" && \
          cargo run -p kbf-coverage -- tighten --measured \"$d\"/m"
     );
+}
+
+/// The first line `tighten` prints on a refusal, for a baseline at `coverage-baseline`
+/// under the working directory.
+const REFUSED: &str = "kbf-coverage tighten: refused; ./coverage-baseline is unchanged. \
+     tighten only lowers counts:\n";
+
+/// Catches (the verifier's probe, end to end): a crate no test binary instruments read
+/// as covered. `notest` says `[lib] test = false`, so `cargo llvm-cov --workspace`
+/// writes no record for it at all (its tracefile has no `SF:` line under
+/// crates/notest), even after it gains the untested function below. Recorded `0 0`, it
+/// measures `- -`; lowering to that would hide the new code. `check` must fail and
+/// print the refusal with the hand edit it takes, and `tighten` must refuse from the
+/// tracefile (no advice: measured here) and from the measured file (the softer advice),
+/// leaving the file as it was.
+#[test]
+fn a_crate_no_test_binary_instruments_is_not_lowered_to_no_data() {
+    let root = workspace("notest");
+    let dir = root.join("crates/notest");
+    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"notest\"\n\n[lib]\ntest = false\n",
+    )
+    .expect("write Cargo.toml");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn untested(x: u8) -> u8 {\n    if x > 0 { x } else { 1 }\n}\n",
+    )
+    .expect("write lib.rs");
+    std::fs::create_dir_all(root.join("target/coverage")).expect("mkdir");
+    let recorded = "a 1 0\nb 0 -\nempty - -\nnotest 0 0\n";
+    let o = ci_check(
+        &root,
+        recorded,
+        &[
+            "--write-baseline",
+            "target/coverage/coverage-baseline.measured",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains(
+            "| notest | 0/0 | - | - | - | 0/0 | - | - | - | 0 / 0 | MORE MISSED THAN BASELINE (lines, branches) |"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.ends_with(
+            "`kbf-coverage tighten` cannot fix this failure: it only lowers counts, and it refuses:\n\n\
+             - notest lines: recorded 0, measured -: nothing measured where the file has a count would \
+             hide misses (a crate with `[lib] test = false` has no coverage record at all); give it a \
+             test target back, or, if it has nothing left to measure, change its line to - by hand in \
+             a reviewed pull request\n\
+             - notest branches: recorded 0, measured -: nothing measured where the file has a count \
+             would hide misses (a crate with `[lib] test = false` has no coverage record at all); give \
+             it a test target back, or, if it has nothing left to measure, change its line to - by hand \
+             in a reviewed pull request\n"
+        ),
+        "{out}"
+    );
+    let measured = "target/coverage/coverage-baseline.measured";
+    let written = std::fs::read_to_string(root.join(measured)).expect("measured");
+    assert!(
+        written
+            .lines()
+            .any(|l| l.split_whitespace().eq(["notest", "-", "-"])),
+        "{written}"
+    );
+    for (args, advice) in [
+        (["--lcov", "lcov.info"], "\n"),
+        (["--measured", measured], MAYBE),
+    ] {
+        let o = Command::new(env!("CARGO_BIN_EXE_kbf-coverage"))
+            .current_dir(&*root)
+            .arg("tighten")
+            .args(args)
+            .arg("--root")
+            .arg(&*root)
+            .arg("--baseline")
+            .arg("./coverage-baseline")
+            .output()
+            .expect("run kbf-coverage tighten");
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {}", stderr(&o));
+        assert_eq!(baseline_of(&root), recorded, "{args:?}");
+        let err = stderr(&o);
+        let lines: Vec<&str> = err.lines().collect();
+        assert_eq!(
+            lines[..3],
+            [
+                REFUSED.trim_end(),
+                "  notest lines: recorded 0, measured -: nothing measured where the file has a count \
+                 would hide misses (a crate with `[lib] test = false` has no coverage record at all); \
+                 give it a test target back, or, if it has nothing left to measure, change its line to \
+                 - by hand in a reviewed pull request",
+                "  notest branches: recorded 0, measured -: nothing measured where the file has a \
+                 count would hide misses (a crate with `[lib] test = false` has no coverage record at \
+                 all); give it a test target back, or, if it has nothing left to measure, change its \
+                 line to - by hand in a reviewed pull request",
+            ],
+            "{args:?}"
+        );
+        // Then the advice (after a measured file) or nothing (after a tracefile).
+        assert_eq!(
+            err,
+            format!("{}{advice}", lines[..3].join("\n")),
+            "{args:?}"
+        );
+    }
+}
+
+/// Catches: a failed rename leaving `coverage-baseline.tighten-tmp` behind (the next
+/// run, or a commit, would pick it up) or reported as success, and the baseline
+/// changed by a replace that failed.
+#[test]
+fn a_failed_rename_leaves_no_temporary_file() {
+    let root = tighten_workspace("tighten-rename");
+    let path = root.join("coverage-baseline");
+    std::fs::write(&path, "old\n").expect("write");
+    let got = kbf_coverage::tighten::replace_with(&path, "new\n", |from, to| {
+        assert_eq!(from, root.join("coverage-baseline.tighten-tmp"));
+        assert_eq!(
+            std::fs::read_to_string(from).expect("written first"),
+            "new\n"
+        );
+        assert_eq!(to, path);
+        Err(std::io::Error::other("planted"))
+    });
+    assert_eq!(got.map_err(|e| e.to_string()), Err("planted".to_owned()));
+    assert!(!root.join("coverage-baseline.tighten-tmp").exists());
+    assert_eq!(std::fs::read_to_string(&path).expect("read"), "old\n");
+    kbf_coverage::tighten::replace(&path, "new\n").expect("replace");
+    assert_eq!(std::fs::read_to_string(&path).expect("read"), "new\n");
+    assert!(!root.join("coverage-baseline.tighten-tmp").exists());
 }

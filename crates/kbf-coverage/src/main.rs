@@ -244,19 +244,6 @@ fn advice(args: &CheckArgs, plan: Result<(), Vec<tighten::Refusal>>) -> String {
     }
 }
 
-/// Replaces `path` with `text` whole: written to a file beside it, then renamed over
-/// it, so an interrupted run leaves the old file or the new one, never part of one.
-fn replace(path: &Path, text: &str) -> std::io::Result<()> {
-    let mut temp = path.as_os_str().to_owned();
-    temp.push(".tighten-tmp");
-    let temp = PathBuf::from(temp);
-    let result = std::fs::write(&temp, text).and_then(|()| std::fs::rename(&temp, path));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    result
-}
-
 /// Lowers `--baseline` to the measurement; returns false (file untouched) on a refusal.
 fn run_tighten(args: &TightenArgs) -> Result<bool, Box<dyn Error>> {
     let baseline_path = args
@@ -284,8 +271,8 @@ fn run_tighten(args: &TightenArgs) -> Result<bool, Box<dyn Error>> {
             for r in &refusals {
                 eprintln!("  {r}");
             }
-            if refusals.iter().any(tighten::Refusal::of_another_tree) {
-                eprintln!("{}", tighten::OTHER_TREE_ADVICE);
+            if let Some(advice) = tighten::tree_advice(&refusals, args.measured.is_some()) {
+                eprintln!("{advice}");
             }
             return Ok(false);
         }
@@ -298,7 +285,7 @@ fn run_tighten(args: &TightenArgs) -> Result<bool, Box<dyn Error>> {
         return Ok(true);
     }
     let new = tighten::apply(&recorded, &changes);
-    replace(baseline_path, &baseline::rewrite(&text, &new))
+    tighten::replace(baseline_path, &baseline::rewrite(&text, &new))
         .map_err(|e| format!("write {}: {e}", baseline_path.display()))?;
     println!(
         "kbf-coverage tighten: lowered {} to the measurement:",

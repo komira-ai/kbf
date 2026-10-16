@@ -8,10 +8,15 @@
 //! metric with [`ratchet::compare`], the ratchet's own rule, and:
 //!
 //! - lowers a [`Compare::Looser`] value to the measured one (a lower count, `-`
-//!   recorded where the crate now measures 0, or 0 recorded where it now measures no
-//!   data: nothing was missed, and nothing can be);
-//! - refuses a [`Compare::MoreMissed`] one (a higher count, `-` to a count above 0, a
-//!   count above 0 to no data, which would hide those misses);
+//!   recorded where the crate now measures 0, or branches 0 recorded where the crate
+//!   now has no branch and its lines are still measured: nothing was missed, and
+//!   nothing can be);
+//! - refuses a [`Compare::MoreMissed`] one: a higher count, or `-` to a count above 0
+//!   ([`Refusal::Raised`]: cover the code); or a count to no data
+//!   ([`Refusal::NoLongerMeasured`]), lines 0 included, since a crate no test binary
+//!   instruments (`[lib] test = false`) has no record at all and would hide any code
+//!   added to it. When a crate's code legitimately stops being measured, its line is
+//!   edited by hand in a reviewed pull request, as the refusal says;
 //! - adds a workspace crate the file lacks only when every measured value is 0 or
 //!   `-` (new code arrives covered), and refuses it otherwise;
 //! - removes a crate that is neither measured nor in the workspace (its
@@ -19,7 +24,8 @@
 //! - refuses any other difference between the file's crates, the measured crates and
 //!   the workspace's crates, which means the measurement is of another tree (CI
 //!   measures the pull request merged with `main`, so a branch behind `main` gets one;
-//!   [`OTHER_TREE_ADVICE`] says what to do);
+//!   [`OTHER_TREE_ADVICE`] says what to do, and [`tree_advice`] gives a softer form
+//!   of it for any other refusal of a measured file);
 //! - refuses everything when none of the file's crates is in the workspace: `--root`
 //!   is not this repository, and every line would otherwise be removed.
 //!
@@ -29,6 +35,8 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use crate::baseline::{Baseline, Entry};
 use crate::ratchet::{self, Compare, Metric};
@@ -79,6 +87,27 @@ impl fmt::Display for Change {
 pub const OTHER_TREE_ADVICE: &str = "CI measures the pull request merged with main: \
      bring the branch up to date with main, re-run CI, and run the command its coverage job prints";
 
+/// What to do when a measured file was refused for other reasons: CI's file measures
+/// the pull request merged with main, so main's changes can cause any refusal.
+pub const MAYBE_OTHER_TREE_ADVICE: &str = "A measured file from CI is of the pull request \
+     merged with main: if the branch is behind main, main's changes can cause these refusals; \
+     bring the branch up to date with main, re-run CI, and run the command its coverage job \
+     prints. A refusal that stays is this branch's to fix";
+
+/// The advice printed after a refused run's `refusals`: [`OTHER_TREE_ADVICE`] when one
+/// says the measurement is of another tree, else [`MAYBE_OTHER_TREE_ADVICE`] when it
+/// came from a measured file (`--measured`, the file CI uploads), else none (measured
+/// here from a tracefile).
+pub fn tree_advice(refusals: &[Refusal], measured_file: bool) -> Option<&'static str> {
+    if refusals.iter().any(Refusal::of_another_tree) {
+        Some(OTHER_TREE_ADVICE)
+    } else if measured_file {
+        Some(MAYBE_OTHER_TREE_ADVICE)
+    } else {
+        None
+    }
+}
+
 /// A difference `tighten` will not write.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Refusal {
@@ -92,6 +121,17 @@ pub enum Refusal {
         metric: Metric,
         recorded: Option<u64>,
         measured: Option<u64>,
+    },
+    #[error(
+        "{krate} {metric}: recorded {recorded}, measured -: nothing measured where the file has a count \
+         would hide misses (a crate with `[lib] test = false` has no coverage record at all); \
+         give it a test target back, or, if it has nothing left to measure, change its line to - by \
+         hand in a reviewed pull request"
+    )]
+    NoLongerMeasured {
+        krate: String,
+        metric: Metric,
+        recorded: u64,
     },
     #[error(
         "{krate}: not in the baseline, measured {}: a new crate must arrive covered (every value 0 or -)",
@@ -169,12 +209,10 @@ pub fn plan(
             }
             continue;
         };
-        for (metric, from, to) in [
-            (Metric::Lines, r.lines, m.lines),
-            (Metric::Branches, r.branches, m.branches),
-        ] {
+        for (metric, compared) in ratchet::compare(r, m) {
             let krate = krate.clone();
-            match ratchet::compare(from, to) {
+            let (from, to) = (r.get(metric), m.get(metric));
+            match compared {
                 Compare::Equal => {}
                 Compare::Looser => changes.push(Change::Lowered {
                     krate,
@@ -182,11 +220,18 @@ pub fn plan(
                     from,
                     to,
                 }),
-                Compare::MoreMissed => refusals.push(Refusal::Raised {
-                    krate,
-                    metric,
-                    recorded: from,
-                    measured: to,
+                Compare::MoreMissed => refusals.push(match (from, to) {
+                    (Some(recorded), None) => Refusal::NoLongerMeasured {
+                        krate,
+                        metric,
+                        recorded,
+                    },
+                    _ => Refusal::Raised {
+                        krate,
+                        metric,
+                        recorded: from,
+                        measured: to,
+                    },
                 }),
             }
         }
@@ -220,6 +265,29 @@ pub fn apply(recorded: &Baseline, changes: &[Change]) -> Baseline {
         }
     }
     out
+}
+
+/// Replaces `path` with `text` whole: written to `<path>.tighten-tmp` beside it, then
+/// renamed over it, so an interrupted run leaves the old file or the new one, never
+/// part of one. A failed write or rename removes the temporary file.
+pub fn replace(path: &Path, text: &str) -> io::Result<()> {
+    replace_with(path, text, |from, to| std::fs::rename(from, to))
+}
+
+/// [`replace`], renaming with `rename` (a test passes one that fails).
+pub fn replace_with(
+    path: &Path,
+    text: &str,
+    rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(".tighten-tmp");
+    let temp = PathBuf::from(temp);
+    let result = std::fs::write(&temp, text).and_then(|()| rename(&temp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 #[cfg(test)]

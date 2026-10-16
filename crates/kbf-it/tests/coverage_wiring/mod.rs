@@ -3,12 +3,15 @@
 //! name what the job uploads: the run is `$GITHUB_RUN_ID` (the id `gh run download`
 //! takes; `$GITHUB_RUN_NUMBER` is another number), the repository is
 //! `$GITHUB_REPOSITORY`, and `--artifact` is the `name:` of an `actions/upload-artifact`
-//! step after it whose `path:` lists the `--write-baseline` file. Nothing else fails
-//! when they drift: the printed command just stops working, and only a contributor
-//! whose coverage improved finds out. [`wiring`] reads them from the workflow.
-//!
-//! Not covered: whether the upload step runs after a failed ratchet step (its `if:`
-//! value is not read here).
+//! step after it whose `path:` lists the `--write-baseline` file. That upload must also
+//! run when the ratchet step fails (its `if:` is `!cancelled()` or `always()`), since a
+//! failing step is when the command is printed, and every path it lists must sit in the
+//! measured file's directory: the artifact's top level is the paths' deepest common
+//! directory, and the command reads `"$d"/<file name>`. Nothing else fails when they
+//! drift: the printed command just stops working, and only a contributor whose coverage
+//! improved finds out. [`wiring`] reads them from the workflow.
+
+use std::path::Path;
 
 use super::workflows;
 
@@ -73,6 +76,33 @@ fn wiring(workflow: &str, job: &str) -> Result<(), String> {
             "the `{artifact}` upload does not list `{written}` in its path"
         ));
     }
+    let dir = Path::new(written).parent();
+    if let Some(other) = paths
+        .lines()
+        .map(str::trim)
+        .find(|p| !p.is_empty() && Path::new(p).parent() != dir)
+    {
+        return Err(format!(
+            "the `{artifact}` upload lists `{other}` outside the directory of `{written}`, \
+             so the file would not be at the artifact's top level"
+        ));
+    }
+    // Without an `if:`, a step runs only while every step before it passed.
+    let condition = upload.condition.as_deref().ok_or_else(|| {
+        format!("the `{artifact}` upload has no `if:`, so a failed ratchet step skips it")
+    })?;
+    let bare = condition
+        .trim()
+        .strip_prefix("${{")
+        .and_then(|c| c.strip_suffix("}}"))
+        .unwrap_or(condition)
+        .trim();
+    if !["!cancelled()", "always()"].contains(&bare) {
+        return Err(format!(
+            "the `{artifact}` upload runs `if: {condition}`, which a failed ratchet step \
+             skips; use `!cancelled()` or `always()`"
+        ));
+    }
     Ok(())
 }
 
@@ -109,10 +139,20 @@ mod rules {
     #[test]
     fn a_matching_step_and_upload_pass() {
         // Catches: the rule refusing the workflow shape CI uses (quoted values, a
-        // multi-line path, another upload before the matching one).
+        // multi-line path, another upload before the matching one), a blank line in
+        // the path list, or either spelling of "run after a failure", with or
+        // without `${{ }}`.
         let other = upload("other", "x");
         let ok = format!("{other}{}", upload("cov", "out/m"));
         assert_eq!(wiring(&workflow(FLAGS, &ok), "coverage"), Ok(()));
+        for condition in ["${{ always() }}", "always()", "${{!cancelled()}}"] {
+            let ok = upload("cov", "\n            out/m").replace("${{ !cancelled() }}", condition);
+            assert_eq!(
+                wiring(&workflow(FLAGS, &ok), "coverage"),
+                Ok(()),
+                "{condition}"
+            );
+        }
     }
 
     #[test]
@@ -154,6 +194,27 @@ mod rules {
                 FLAGS,
                 String::new(),
                 "no actions/upload-artifact step after the kbf-coverage step is named `cov`",
+            ),
+            // Another directory in the upload moves the file below the artifact's
+            // top level, where `"$d"/m` does not find it.
+            (
+                FLAGS,
+                ok.replace("out/lcov.info", "target/lcov.info"),
+                "the `cov` upload lists `target/lcov.info` outside the directory of `out/m`, \
+                 so the file would not be at the artifact's top level",
+            ),
+            // An upload a failed ratchet step skips: the command is printed for a run
+            // that uploaded nothing.
+            (
+                FLAGS,
+                ok.replace("${{ !cancelled() }}", "${{ success() }}"),
+                "the `cov` upload runs `if: ${{ success() }}`, which a failed ratchet step \
+                 skips; use `!cancelled()` or `always()`",
+            ),
+            (
+                FLAGS,
+                ok.replace("        if: ${{ !cancelled() }}\n", ""),
+                "the `cov` upload has no `if:`, so a failed ratchet step skips it",
             ),
         ] {
             assert_eq!(
