@@ -165,15 +165,32 @@ impl Pki {
     /// A client of the server at `addr`, with a certificate whose subjectAltNames are
     /// `sans`.
     async fn client_naming(&self, addr: std::net::SocketAddr, sans: Vec<SanType>) -> Channel {
-        let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
-        params.subject_alt_names = sans;
-        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-        let key = KeyPair::generate().expect("key");
-        let cert = params.signed_by(&key, &self.ca).expect("sign");
+        self.client_presenting(addr, vec![sans]).await
+    }
+
+    /// A client of the server at `addr` presenting a chain of certificates from the CA,
+    /// one per entry of `chain` with those subjectAltNames; the first is the leaf, whose
+    /// key the client holds.
+    async fn client_presenting(
+        &self,
+        addr: std::net::SocketAddr,
+        chain: Vec<Vec<SanType>>,
+    ) -> Channel {
+        let mut pems = Vec::new();
+        let mut leaf_key = None;
+        for sans in chain {
+            let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+            params.subject_alt_names = sans;
+            params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+            let key = KeyPair::generate().expect("key");
+            pems.push(params.signed_by(&key, &self.ca).expect("sign").pem());
+            leaf_key.get_or_insert(key);
+        }
+        let key = leaf_key.expect("a chain of at least one certificate");
         let tls = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(self.ca.pem()))
             .domain_name("localhost")
-            .identity(Identity::from_pem(cert.pem(), key.serialize_pem()));
+            .identity(Identity::from_pem(pems.join("\n"), key.serialize_pem()));
         Channel::from_shared(format!("https://{addr}"))
             .expect("endpoint")
             .tls_config(tls)
@@ -343,4 +360,42 @@ async fn every_method_refuses_an_unexpected_role_over_mutual_tls() {
         .await
         .expect("a daemon writes");
     assert!(mem.blobs.lock().expect("lock").contains_key(&sha(b"x")));
+}
+
+/// Catches the role read from a certificate of the presented chain other than the leaf
+/// (the last, or any of them): a peer holding a frontend key could append a daemon's
+/// public certificate after its own and write segments as a daemon. Over real mutual
+/// TLS, chains of two certificates from the same CA: frontend first, daemon second, is
+/// refused PERMISSION_DENIED on `Segments` (daemon only); daemon first, frontend
+/// second, is refused on `ActionStore.Get` (frontend only) and gets past the check on
+/// `Segments`.
+///
+/// Mutant seen red: `chain.first()` read as `chain.last()` in `Admission::check`.
+#[tokio::test]
+async fn the_role_is_read_from_the_leaf_certificate_alone() {
+    let pki = Pki::new();
+    let storage: Arc<dyn Storage> = Arc::new(Mem::default());
+    let config = Config {
+        write_bytes_in_flight: 1 << 20,
+    };
+    let service = StorageService::new(storage, Admission::Certified, config);
+    let addr = serve_routes(service.routes(), Some(pki.server())).await;
+    let refused = |answer: &Result<(), Status>| matches!(answer, Err(s) if s.code() == Code::PermissionDenied);
+
+    let frontend_leaf = pki
+        .client_presenting(addr, vec![vec![uri("frontend")], vec![uri("daemon")]])
+        .await;
+    let answer = call(Endpoint::Segments, &frontend_leaf).await;
+    assert!(refused(&answer), "frontend leaf on Segments: {answer:?}");
+
+    let daemon_leaf = pki
+        .client_presenting(addr, vec![vec![uri("daemon")], vec![uri("frontend")]])
+        .await;
+    let answer = call(Endpoint::ActionGet, &daemon_leaf).await;
+    assert!(
+        refused(&answer),
+        "daemon leaf on ActionStore.Get: {answer:?}"
+    );
+    let answer = call(Endpoint::Segments, &daemon_leaf).await;
+    assert!(!refused(&answer), "daemon leaf on Segments: {answer:?}");
 }

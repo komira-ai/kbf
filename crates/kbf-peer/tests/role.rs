@@ -43,7 +43,9 @@ fn each_role_is_read_from_its_one_uri() {
 
 /// Catches a certificate given a role it does not name exactly once: no role, two
 /// (also two of the same), a DNS name or a URI of another scheme that spells a role,
-/// a name that is no role or differs in case; and bytes that are no certificate.
+/// a name that is no role or differs in case, the `urn:kbf:role:` prefix in another
+/// case (the prefix is compared byte for byte; mutant seen red: the prefix compared
+/// ignoring ASCII case); and bytes that are no certificate.
 #[test]
 fn a_certificate_names_exactly_one_known_role_or_none() {
     for (sans, want) in [
@@ -51,6 +53,8 @@ fn a_certificate_names_exactly_one_known_role_or_none() {
         (vec![dns("daemon")], RoleError::Count(0)),
         (vec![dns("urn:kbf:role:daemon")], RoleError::Count(0)),
         (vec![uri("urn:other:role:daemon")], RoleError::Count(0)),
+        (vec![uri("URN:KBF:ROLE:daemon")], RoleError::Count(0)),
+        (vec![uri("urn:kbf:Role:daemon")], RoleError::Count(0)),
         (vec![role("daemon"), role("storage")], RoleError::Count(2)),
         (vec![role("daemon"), role("daemon")], RoleError::Count(2)),
         (vec![role("admin")], RoleError::Unknown("admin".to_owned())),

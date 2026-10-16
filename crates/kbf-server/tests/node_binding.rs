@@ -352,6 +352,32 @@ async fn only_a_daemon_certificate_opens_a_session() {
         .expect("the daemon role is welcomed");
 }
 
+/// Catches the role read from a certificate of the presented chain other than the
+/// leaf (the last, or any of them): a peer holding a frontend key could append a
+/// daemon's public certificate after its own and pass as a daemon. A chain of two
+/// certificates from the same CA, both naming node-a: frontend first, daemon second,
+/// is refused PERMISSION_DENIED; daemon first, frontend second, is welcomed.
+///
+/// Mutant seen red: `chain.first()` read as `chain.last()` in the session handler.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_session_reads_the_role_from_the_leaf_certificate_alone() {
+    let pki = Pki::new("leaf-role");
+    let addr = pki.serve(&[]);
+    let chain = |first: &str, then: &str, serial: u64| {
+        let client = ExtendedKeyUsagePurpose::ClientAuth;
+        let (leaf, key) = pki.leaf(&["node-a"], &[first], "leaf", serial, client);
+        let client = ExtendedKeyUsagePurpose::ClientAuth;
+        let (extra, _) = pki.leaf(&["node-a"], &[then], "extra", serial + 1, client);
+        Identity::from_pem(format!("{leaf}\n{extra}"), key)
+    };
+    let status =
+        refused(Session::open(addr, &pki, chain("frontend", "daemon", 31), "node-a").await);
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    Session::open(addr, &pki, chain("daemon", "frontend", 33), "node-a")
+        .await
+        .expect("a daemon leaf is welcomed whatever follows it");
+}
+
 /// Catches (issue #79): the deny list not consulted at `Hello`, read only when the
 /// server starts (a serial denied afterwards must be refused on the node's next
 /// connection), and an open stream of a denied certificate kept: its next `Heartbeat`

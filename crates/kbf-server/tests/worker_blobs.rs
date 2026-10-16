@@ -83,6 +83,30 @@ impl Pki {
 
     /// [`Pki::node`] with a `urn:kbf:role:` URI per `roles` instead of the daemon role.
     fn node_as(&self, names: &[&str], roles: &[&str], serial: u64) -> Node {
+        let (cert, key) = self.signed(names, roles, serial);
+        let (_, parsed) = x509_parser::parse_x509_certificate(cert.der()).expect("parse");
+        let spki = sha2::Sha256::digest(parsed.public_key().raw);
+        Node {
+            identity: Identity::from_pem(cert.pem(), key.serialize_pem()),
+            serial,
+            spki_sha256: spki.iter().map(|b| format!("{b:02x}")).collect(),
+        }
+    }
+
+    /// An identity for node-1 presenting a chain of two certificates from the CA: the
+    /// leaf naming `first` (whose key the identity holds), then one naming `then`.
+    fn chain(&self, first: &str, then: &str, serial: u64) -> Identity {
+        let (leaf, key) = self.signed(&["node-1"], &[first], serial);
+        let (extra, _) = self.signed(&["node-1"], &[then], serial + 1);
+        Identity::from_pem(
+            format!("{}\n{}", leaf.pem(), extra.pem()),
+            key.serialize_pem(),
+        )
+    }
+
+    /// A client certificate signed by the CA, with `names` as DNS names, a
+    /// `urn:kbf:role:` URI per `roles`, and `serial`; and its key.
+    fn signed(&self, names: &[&str], roles: &[&str], serial: u64) -> (rcgen::Certificate, KeyPair) {
         let names: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
         let mut params = CertificateParams::new(names).expect("params");
         params.subject_alt_names.extend(roles.iter().map(|role| {
@@ -99,13 +123,7 @@ impl Pki {
         params.serial_number = Some(SerialNumber::from(serial));
         let key = KeyPair::generate().expect("key");
         let cert = params.signed_by(&key, &self.ca).expect("sign");
-        let (_, parsed) = x509_parser::parse_x509_certificate(cert.der()).expect("parse");
-        let spki = sha2::Sha256::digest(parsed.public_key().raw);
-        Node {
-            identity: Identity::from_pem(cert.pem(), key.serialize_pem()),
-            serial,
-            spki_sha256: spki.iter().map(|b| format!("{b:02x}")).collect(),
-        }
+        (cert, key)
     }
 
     fn write(&self, file: &str, text: &str) -> String {
@@ -710,6 +728,37 @@ async fn every_blob_call_refuses_a_certificate_that_is_not_a_daemons() {
     let channel = pki.channel(worker, Some(&node.identity)).await;
     for (call, code) in codes(&channel, blob).await {
         assert_eq!(code, Code::Ok, "{call} as a daemon");
+    }
+}
+
+/// Catches the role read from a certificate of the presented chain other than the
+/// leaf (the last, or any of them): a peer holding a frontend key could append a
+/// daemon's public certificate after its own and move blobs as a daemon. A chain of
+/// two certificates from the same CA, both naming node-1: frontend first, daemon
+/// second, has every call refused PERMISSION_DENIED; daemon first, frontend second,
+/// is served.
+///
+/// Mutant seen red: `chain.first()` read as `chain.last()` in the blob calls' `admit`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blob_call_reads_the_role_from_the_leaf_certificate_alone() {
+    let pki = Pki::new("leaf-role");
+    let (_, worker) = pki.serve(&[]);
+    let blob = b"a blob only a daemon leaf may move";
+    let channel = pki
+        .channel(worker, Some(&pki.chain("frontend", "daemon", 71)))
+        .await;
+    let every = codes(&channel, blob)
+        .await
+        .into_iter()
+        .chain(chunking_codes(&channel).await);
+    for (call, code) in every {
+        assert_eq!(code, Code::PermissionDenied, "{call}, frontend leaf");
+    }
+    let channel = pki
+        .channel(worker, Some(&pki.chain("daemon", "frontend", 73)))
+        .await;
+    for (call, code) in codes(&channel, blob).await {
+        assert_eq!(code, Code::Ok, "{call}, daemon leaf");
     }
 }
 
