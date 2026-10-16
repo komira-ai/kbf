@@ -73,10 +73,12 @@ fn parse(digest: &Digest) -> Option<kbf_types::Digest> {
     kbf_types::Digest::parse(DigestFunction::Sha256, &label(digest)).ok()
 }
 
-/// A storage failure as the data plane's: only a blob the farm does not hold is missing.
+/// A storage failure as the data plane's: only a blob the farm does not hold is missing,
+/// and only bytes that are not the blob are corrupt.
 fn failed(blob: String, error: &StorageError) -> CasError {
     match error {
         StorageError::NotFound(_) => CasError::Missing(blob),
+        StorageError::Corrupt { actual, .. } => CasError::Corrupt(blob, label(&to_proto(actual))),
         other => CasError::Unavailable(blob, other.to_string()),
     }
 }
