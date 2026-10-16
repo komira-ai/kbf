@@ -14,7 +14,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use kbf_front::{Cache, MetaLog};
@@ -29,6 +29,7 @@ use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
 use kbf_tier::WriteTier;
 
+use crate::drain::Drain;
 use crate::local::LocalStore;
 use crate::startup_pass::StartPass;
 use crate::stores::{COLD_FILE_FLOOR, FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
@@ -39,6 +40,40 @@ use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, bind_server_with_opti
 pub fn sizes_on(args: &Args, topology: Topology) -> kbf_threads::Sizes {
     args.threads.resolve(topology)
 }
+
+/// Runs `serving`, and if `escalation` completes meanwhile (the second stop signal)
+/// calls [`Drain::close`]: the open streams end UNAVAILABLE and the server stops within
+/// a short grace. One function for `kbf-server` and `kbf frontend`.
+pub(crate) async fn escalating<T>(
+    serving: impl Future<Output = T>,
+    drain: &Arc<Drain>,
+    escalation: Option<Escalation>,
+) -> T {
+    let drain = Arc::clone(drain);
+    let _escalation = escalation.map(|second| {
+        AbortOnDrop(tokio::spawn(async move {
+            second.await;
+            tracing::warn!("a second stop signal: ending the open streams now");
+            drain.close();
+        }))
+    });
+    serving.await
+}
+
+/// The first stop signal's future and the second's, installed in one call: a signal
+/// between the two handlers stops the server, and the second is then a third.
+///
+/// # Errors
+/// A handler cannot be installed.
+pub(crate) fn interruptions() -> io::Result<(impl Future<Output = ()> + Send + 'static, Escalation)>
+{
+    let first = interrupted()?;
+    let second: Escalation = Box::pin(second_interrupt()?);
+    Ok((first, second))
+}
+
+/// A future that completes on the second stop signal.
+pub(crate) type Escalation = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// A started server: bound, its write tier attached and its flusher (and any start-up
 /// pass) running, not yet serving. [`ServerHandle::serve`] serves until the shutdown
@@ -52,6 +87,12 @@ pub struct ServerHandle {
     /// Where the operator API listener is, if there is one.
     pub api: Option<SocketAddr>,
     local: LocalStore,
+    drain: Arc<Drain>,
+    /// Completes on the second stop signal ([`start_interruptible`]); [`serve`] then
+    /// calls [`Drain::close`].
+    ///
+    /// [`serve`]: ServerHandle::serve
+    escalation: Option<Escalation>,
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
@@ -73,20 +114,52 @@ impl ServerHandle {
         self.local.clone()
     }
 
+    /// The frontend's drain ([`Drain`]): `POST /v1/frontend/drain` begins it, and the
+    /// shutdown future given to [`start`] does. [`Drain::close`] ends the open streams
+    /// now.
+    #[must_use]
+    pub fn drain(&self) -> Arc<Drain> {
+        Arc::clone(&self.drain)
+    }
+
     /// Serves every listener until the shutdown future ends and its connections close
-    /// or `--shutdown-timeout-secs` runs out.
+    /// or `--shutdown-timeout-secs` runs out. A handle from [`start_interruptible`]
+    /// also ends the open streams, and so the drain, at a second stop signal.
     ///
     /// # Errors
     /// A listener fails while serving.
     pub async fn serve(self) -> Result<(), ServeError> {
+        let drain = self.drain();
         let Self {
             serving,
+            escalation,
             _flusher,
             _pass,
             ..
         } = self;
-        serving.await
+        escalating(serving, &drain, escalation).await
     }
+}
+
+/// [`start`] with the binary's stop signals: SIGINT or SIGTERM stops the server
+/// ([`interrupted`]), and a second one ends the drain that stop began
+/// ([`ServerHandle::serve`] closes the open streams: they end UNAVAILABLE and the
+/// server stops within a short grace). Both handlers are installed before anything is
+/// bound.
+///
+/// # Errors
+/// As [`start`].
+pub async fn start_interruptible(args: &Args) -> Result<ServerHandle, Box<dyn Error>> {
+    let slot: Arc<Mutex<Option<Escalation>>> = Arc::new(Mutex::new(None));
+    let installing = Arc::clone(&slot);
+    let mut handle = start(args, move || {
+        let (first, second) = interruptions()?;
+        *installing.lock().unwrap_or_else(PoisonError::into_inner) = Some(second);
+        Ok(first)
+    })
+    .await?;
+    handle.escalation = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+    Ok(handle)
 }
 
 /// Builds the object store and the metadata log the flags name, binds the listeners
@@ -212,7 +285,10 @@ where
 {
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
-    let state = args.open_state_store().map_err(ServeError::State)?;
+    let state = with_members(
+        args.open_state_store().map_err(ServeError::State)?,
+        args.members(),
+    );
     let routes = Routes {
         invocations: policy.invocations_get.is_some(),
         blobs: policy.invocations_get.is_some() && policy.blobs_get.is_some(),
@@ -241,6 +317,8 @@ where
         worker: bound.worker,
         api: bound.api,
         local,
+        drain: bound.drain,
+        escalation: None,
         start_line: start_line(
             bound.reapi,
             bound.worker,
@@ -257,7 +335,7 @@ where
 
 /// Reports local storage's `bytes` to the node's one cache, if the process has one.
 /// Not generic, so it is compiled once whatever the store.
-fn share_storage(local: Option<&Arc<LocalCache>>, bytes: HeldBytes) {
+pub(crate) fn share_storage(local: Option<&Arc<LocalCache>>, bytes: HeldBytes) {
     if let Some(local) = local {
         local.attach_storage(bytes);
     }
@@ -266,7 +344,9 @@ fn share_storage(local: Option<&Arc<LocalCache>>, bytes: HeldBytes) {
 /// What `cache`'s write tier holds on its disk now: its blocks, and any flushed copies
 /// it keeps; 0 without a tier or once the server is gone (a weak handle, as the input
 /// cache's side is: the one cache keeps neither half alive).
-fn tier_bytes<M: MetaLog, O: ObjectStore + 'static>(cache: Weak<Cache<M, O>>) -> HeldBytes {
+pub(crate) fn tier_bytes<M: MetaLog, O: ObjectStore + 'static>(
+    cache: Weak<Cache<M, O>>,
+) -> HeldBytes {
     Box::new(move || {
         cache
             .upgrade()
@@ -351,6 +431,40 @@ pub fn interrupted() -> io::Result<impl Future<Output = ()> + Send + 'static> {
     })
 }
 
+/// Installs the SIGINT and SIGTERM handlers now and returns a future that completes on
+/// the second signal of either kind (a second SIGTERM, SIGINT, or one of each), which
+/// [`start_interruptible`] hands to [`ServerHandle::serve`] to end the drain a first
+/// signal began. Two signals that arrive before the future is first polled count as one.
+///
+/// # Errors
+/// The handler cannot be installed.
+#[cfg(unix)]
+fn second_interrupt() -> io::Result<impl Future<Output = ()> + Send + 'static> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    Ok(async move {
+        for _ in 0..2 {
+            tokio::select! {
+                _ = sigint.recv() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+    })
+}
+
+/// Returns a future that completes on the second Ctrl-C. Elsewhere than Unix the
+/// handler is installed when the future is first polled.
+#[cfg(not(unix))]
+#[expect(clippy::unnecessary_wraps, reason = "the same signature as on Unix")]
+fn second_interrupt() -> io::Result<impl Future<Output = ()> + Send + 'static> {
+    Ok(async {
+        for _ in 0..2 {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    })
+}
+
 /// Returns a future that completes on Ctrl-C. Elsewhere than Unix the handler is
 /// installed when the future is first polled, after the start line is printed.
 #[cfg(not(unix))]
@@ -361,11 +475,45 @@ pub fn interrupted() -> io::Result<impl Future<Output = ()> + Send + 'static> {
     })
 }
 
+/// The state store with the membership timing the flags name.
+pub(crate) fn with_members(
+    state: Option<crate::StateStore>,
+    members: crate::members::MembershipConfig,
+) -> Option<crate::StateStore> {
+    state.map(|state| crate::StateStore { members, ..state })
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use kbf_state::ManualClock;
+    use kbf_state::fake::{Fake, Flaw};
 
     use super::*;
+
+    /// Catches `--member-ttl-secs`/`--member-dwell-secs` parsed and then dropped at
+    /// start: the store a start opens must carry the flags' timing, keep its other
+    /// fields, and a start without a state store must stay without one.
+    #[test]
+    fn with_members_sets_the_timing_and_keeps_the_rest() {
+        let members = crate::members::MembershipConfig {
+            ttl: Duration::from_secs(9),
+            dwell: Duration::from_secs(40),
+            replication: 2,
+        };
+        let state = crate::StateStore {
+            store: Arc::new(Fake::with_flaw(
+                Arc::new(ManualClock::default()),
+                Flaw::None,
+            )),
+            epoch: crate::farm::EpochPolicy::Keep,
+            members: crate::members::MembershipConfig::default(),
+        };
+        let got = with_members(Some(state), members).expect("still a store");
+        assert_eq!(got.members, members);
+        assert_eq!(got.epoch, crate::farm::EpochPolicy::Keep);
+        assert!(with_members(None, members).is_none());
+    }
 
     /// Catches the public seam [`serve_with`] not assembling a server now that the
     /// flags' path ([`start`], which also attaches the start-up pass) goes around it:

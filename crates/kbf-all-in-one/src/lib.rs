@@ -20,6 +20,9 @@
 //!
 //! Linux only, the container driver only: elsewhere [`main`] exits 2 saying so.
 //!
+//! The crate also holds `kbf storage-and-daemon` ([`storage_and_daemon`]): the same
+//! daemon half and the same plane, beside the storage node in place of the server.
+//!
 //! The scheduler's state is a SQLite file, `<data-dir>/state.db` unless `--state-store`
 //! names one ([`cli`]).
 //!
@@ -35,6 +38,7 @@ mod one_cache;
 mod plane;
 #[cfg(target_os = "linux")]
 mod run;
+pub mod storage_and_daemon;
 
 pub use plane::LocalDataPlane;
 

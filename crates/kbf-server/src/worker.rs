@@ -41,8 +41,6 @@ use std::time::Duration;
 
 use futures::{Stream, stream};
 use kbf_caps::NodeCaps;
-use kbf_front::MetaLog;
-use kbf_objstore::ObjectStore;
 use kbf_proto::worker::{
     Capability, DaemonMessage, HeartbeatAck, Hello, Phase, ServerMessage, Welcome, daemon_message,
     server_message, worker_server::Worker,
@@ -65,19 +63,19 @@ pub const OLDEST_PROTOCOL_VERSION: u32 = 1;
 
 /// The `Worker` service over a [`Farm`].
 #[derive(Debug)]
-pub struct WorkerService<M, O> {
-    farm: Arc<Farm<M, O>>,
+pub struct WorkerService {
+    farm: Arc<Farm>,
     peers: Peers,
     heartbeat_interval: Duration,
     hello_wait: Duration,
 }
 
-impl<M, O> WorkerService<M, O> {
+impl WorkerService {
     /// The service over `farm`, knowing its daemons as `peers`. `Welcome` asks daemons
     /// for a heartbeat every `heartbeat_interval`; a stream that sends no `Hello` within
     /// `hello_wait` is ended DEADLINE_EXCEEDED.
     pub const fn new(
-        farm: Arc<Farm<M, O>>,
+        farm: Arc<Farm>,
         peers: Peers,
         heartbeat_interval: Duration,
         hello_wait: Duration,
@@ -95,11 +93,7 @@ impl<M, O> WorkerService<M, O> {
 pub type SessionStream = Pin<Box<dyn Stream<Item = Result<ServerMessage, Status>> + Send>>;
 
 #[tonic::async_trait]
-impl<M, O> Worker for WorkerService<M, O>
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
+impl Worker for WorkerService {
     type SessionStream = SessionStream;
 
     async fn session(
@@ -166,8 +160,8 @@ where
 }
 
 /// One stream after its first `Hello`.
-struct Session<M, O> {
-    farm: Arc<Farm<M, O>>,
+struct Session {
+    farm: Arc<Farm>,
     peers: Peers,
     /// The stream's client certificate (`None` in plain text).
     peer: Option<PeerCert>,
@@ -175,7 +169,7 @@ struct Session<M, O> {
     stream: StreamId,
 }
 
-impl<M: MetaLog, O: ObjectStore + 'static> Session<M, O> {
+impl Session {
     /// Handles the stream's messages until it ends, or one of them ends it.
     async fn serve(self, mut inbound: Streaming<DaemonMessage>, outbound: Outbound) {
         let worker = &self.worker;

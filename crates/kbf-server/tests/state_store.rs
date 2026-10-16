@@ -10,8 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
-use kbf_front::{Cache, Described, Dispatch, Finished, MemoryMetaLog, Stage, Submission};
-use kbf_objstore::MemoryStore;
+use kbf_front::{Cache, Described, Dispatch, Finished, Stage, Submission};
 use kbf_proto::google::rpc;
 use kbf_proto::worker::{self, ServerMessage, server_message};
 use kbf_sched::{DaemonInstance, Request};
@@ -29,7 +28,7 @@ use tonic::{Code, Status};
 
 const GIB: u64 = 1 << 30;
 
-type TestFarm = Farm<MemoryMetaLog, MemoryStore>;
+type TestFarm = Farm;
 type Inbox = mpsc::UnboundedReceiver<Result<ServerMessage, Status>>;
 
 /// A store whose writes can be made to fail, over the fake (which a restart reopens from
@@ -242,7 +241,11 @@ impl Disk {
             kbf_sched::UNSERVABLE_WAIT,
             kbf_sched::FINISHED_RETENTION,
         )
-        .with_state(Some(StateStore { store, epoch }))
+        .with_state(Some(StateStore {
+            store,
+            epoch,
+            members: Default::default(),
+        }))
     }
 
     /// The process dies: its farm is gone, and the store reopens as the disk left it.
@@ -865,7 +868,7 @@ async fn a_store_with_an_unreadable_row_refuses_the_farm() {
     let disk = Disk::new();
     let put = Txn::new().put("op/0000000000000001", vec![0xff], kbf_state::Cond::Any);
     disk.store.txn(put).expect("store").expect("put");
-    let refused = disk.try_farm(EpochPolicy::Keep).err().expect("refused");
+    let refused = disk.try_farm(EpochPolicy::Keep).expect_err("refused");
     assert!(matches!(refused, StateError::Corrupt { .. }), "{refused:?}");
 }
 
@@ -981,6 +984,7 @@ async fn a_server_binds_over_a_state_store_or_refuses_it() {
     let state = |disk: &Disk| StateStore {
         store: disk.store.clone(),
         epoch: EpochPolicy::Keep,
+        members: Default::default(),
     };
     let bind = |state| {
         kbf_server::bind_server_with_state(

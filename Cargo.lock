@@ -1433,13 +1433,19 @@ dependencies = [
  "kbf-cas-conformance",
  "kbf-daemon",
  "kbf-deploy",
+ "kbf-driver-container",
  "kbf-host",
  "kbf-node",
+ "kbf-proto",
  "kbf-server",
  "kbf-state",
  "kbf-storage",
+ "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
+ "prost",
+ "rcgen",
+ "rustix",
  "serde_json",
  "tokio",
  "tonic",
@@ -1608,6 +1614,22 @@ dependencies = [
  "kbf-testkit",
  "libc",
  "subtle",
+ "thiserror",
+]
+
+[[package]]
+name = "kbf-history"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crc32c",
+ "futures",
+ "hex",
+ "kbf-objstore",
+ "kbf-state",
+ "prost",
+ "ruzstd",
+ "sha2 0.11.0",
  "thiserror",
 ]
 
@@ -1957,6 +1979,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "tracing-core",
  "tracing-subscriber",
  "x509-parser",
 ]
