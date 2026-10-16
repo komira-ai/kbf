@@ -221,6 +221,12 @@ mod tests {
         assert!(matches!(err, ClientError::Malformed { .. }), "{err:?}");
         assert!(err.to_string().starts_with(&garbage.to_string()), "{err}");
 
+        let plain = answering(b"nor this");
+        let err = OperatorClient::new(plain, None)
+            .get("/")
+            .expect_err("garbage");
+        assert!(matches!(err, ClientError::Malformed { .. }), "{err:?}");
+
         let again = answering(b"still not http");
         let err = OperatorClient::new(again, None)
             .node_action("n", "drain", "")
@@ -284,7 +290,7 @@ mod tests {
         let refused =
             reply("HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}").expect("401");
         assert_eq!((refused.status, refused.is_success()), (401, false));
-        let odd = reply("HTTP/1.1 200 OK\r\nnot a header line\r\nContent-Length: 2\r\n\r\nok")
+        let odd = reply("HTTP/1.1 200 OK\r\nnot a header line\r\nContent-Type: x\r\nContent-Length: 2\r\n\r\nok")
             .expect("odd");
         assert_eq!(odd.body, "ok", "a line that is no header is skipped");
         let to_end = reply("HTTP/1.0 200 OK\r\n\r\nrest").expect("no length");
