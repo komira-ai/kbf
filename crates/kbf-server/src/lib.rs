@@ -46,6 +46,7 @@
 //! API's writes need one token, [`token`]), the `x-kbf-qos` header, learned sizes,
 //! capability matching, and the daemon-side `ResultAck` handling (issue #26).
 
+pub mod action_usage;
 pub mod api;
 pub mod blobs;
 #[cfg(test)]

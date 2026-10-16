@@ -195,9 +195,18 @@ pub struct ListToken(pub(crate) Token);
 pub(crate) enum Token {
     /// An S3 continuation token.
     Continue(String),
-    /// Start after this key (S3's `start-after`). The local stores issue these: their
+    /// Start after this key (S3's `start-after`). The in-memory store issues these: its
     /// next page starts after the last key of the page before.
     After(ObjectKey),
+    /// Start after `after`, continuing the `FsStore` listing `listing`: its pages carry
+    /// these, so the next page can be cut from that listing's kept keys. Any other
+    /// store reads it as [`Token::After`].
+    Kept {
+        /// The listing the page came from.
+        listing: u64,
+        /// The last key of that page.
+        after: ObjectKey,
+    },
 }
 
 impl ListToken {
@@ -216,10 +225,18 @@ impl ListToken {
     /// issues and only it can read.
     pub(crate) fn local_after(&self) -> Result<&ObjectKey, ObjectStoreError> {
         match &self.0 {
-            Token::After(key) => Ok(key),
+            Token::After(key) | Token::Kept { after: key, .. } => Ok(key),
             Token::Continue(_) => Err(ObjectStoreError::Protocol(
                 "a continuation token from another store".into(),
             )),
+        }
+    }
+
+    /// The `FsStore` listing this token continues, if it came with one of its pages.
+    pub(crate) fn listing(&self) -> Option<u64> {
+        match &self.0 {
+            Token::Kept { listing, .. } => Some(*listing),
+            Token::After(_) | Token::Continue(_) => None,
         }
     }
 }

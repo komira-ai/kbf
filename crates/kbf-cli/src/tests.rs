@@ -390,3 +390,30 @@ fn an_unbuilt_mode_exits_2_with_one_line() {
     let inv = Invocation::NotBuilt { mode: "frontend" };
     assert_eq!(run(&inv), ExitCode::from(2));
 }
+
+fn check(argv: &[&str]) -> Result<(), String> {
+    let args: Vec<std::ffi::OsString> = argv.iter().map(Into::into).collect();
+    check_args(&args).map_err(|e| e.to_string())
+}
+
+/// Catches `check_args` reading the wrong words (the program's name or `check-args`
+/// itself as the mode), passing a mode not built yet or `--help`, and refusing a built
+/// mode's own command line. The binary's exit codes are tests/binary.rs's.
+#[test]
+fn check_args_parses_the_words_after_check_args() {
+    let mut daemon = vec!["kbf", CHECK_ARGS];
+    daemon.extend(&DAEMON[1..]);
+    assert_eq!(check(&daemon), Ok(()));
+    let mut both = vec!["kbf", CHECK_ARGS];
+    both.extend(&BOTH[1..]);
+    assert_eq!(check(&both), Ok(()));
+    daemon.push("--bogus-flag");
+    let e = check(&daemon).expect_err("refused");
+    assert!(e.contains("unexpected argument '--bogus-flag'"), "{e}");
+    let e = check(&["kbf", CHECK_ARGS, names::STORAGE]).expect_err("refused");
+    assert!(e.contains("kbf storage: mode not built yet"), "{e}");
+    for word in ["--help", "--version"] {
+        let e = check(&["kbf", CHECK_ARGS, word]).expect_err("refused");
+        assert!(e.contains("the mode would not start"), "{word}: {e}");
+    }
+}

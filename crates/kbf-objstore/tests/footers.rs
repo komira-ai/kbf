@@ -15,10 +15,10 @@ use futures::TryStreamExt as _;
 use kbf_objstore::footers::{FooterRead, FooterReads, SkipReason, Totals, read_footers};
 use kbf_objstore::{
     ByteRange, Capabilities, Floor, FsStore, KeyPrefix, ListPage, ListToken, MemoryStore,
-    ObjectKey, ObjectStore, ObjectStoreError, PageSize,
+    ObjectInfo, ObjectKey, ObjectStore, ObjectStoreError, PageSize,
 };
-use kbf_segments::SegmentWriter;
 use kbf_segments::layout::{MAGIC, TRAILER_LEN, VERSION, footer_len};
+use kbf_segments::{MAX_SEGMENT_BYTES, SegmentError, SegmentWriter};
 use kbf_types::Digest;
 
 /// Where each blob is, as the writer laid it out: object, offset.
@@ -227,6 +227,107 @@ async fn damaged_short_and_foreign_objects_are_reported_and_skipped() {
         "{skipped:?}"
     );
     assert!(skipped["cas/torn"].contains("CRC"), "{skipped:?}");
+}
+
+/// One object of `size` bytes, all zero but its last bytes, `tail`, served without
+/// holding the object: a store for objects too large to keep in a test. It records
+/// every range asked for and refuses (as a failed read) one longer than 1 MiB, so a
+/// reader that would hold a huge footer reports that instead of allocating it.
+struct Sparse {
+    key: ObjectKey,
+    size: u64,
+    tail: Vec<u8>,
+    asked: std::sync::Mutex<Vec<(u64, u64)>>,
+}
+
+impl ObjectStore for Sparse {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
+
+    async fn put_new(
+        &self,
+        _: &ObjectKey,
+        _: Bytes,
+        _: Option<std::time::SystemTime>,
+    ) -> Result<(), ObjectStoreError> {
+        Err(ObjectStoreError::Protocol("read-only".into()))
+    }
+
+    async fn get_range(
+        &self,
+        key: &ObjectKey,
+        range: ByteRange,
+    ) -> Result<Bytes, ObjectStoreError> {
+        assert_eq!(*key, self.key);
+        self.asked
+            .lock()
+            .expect("lock")
+            .push((range.offset(), range.size()));
+        let end = self.size.min(range.offset() + range.size());
+        let len = end - range.offset();
+        if len > 1 << 20 {
+            return Err(ObjectStoreError::Protocol(format!("{len} bytes asked for")));
+        }
+        let tail_at = self.size - self.tail.len() as u64;
+        let bytes = (range.offset()..end)
+            .map(|i| i.checked_sub(tail_at).map_or(0, |t| self.tail[t as usize]))
+            .collect::<Vec<u8>>();
+        Ok(bytes.into())
+    }
+
+    async fn delete(&self, _: &ObjectKey) -> Result<(), ObjectStoreError> {
+        Ok(())
+    }
+
+    async fn list(
+        &self,
+        _: &KeyPrefix,
+        _: Option<&ListToken>,
+        _: PageSize,
+    ) -> Result<ListPage, ObjectStoreError> {
+        Ok(ListPage {
+            objects: vec![ObjectInfo {
+                key: self.key.clone(),
+                size: self.size,
+            }],
+            next: None,
+        })
+    }
+}
+
+/// Catches a reader that drops the [`MAX_SEGMENT_BYTES`] bound on the second read: a
+/// trailer whose record count makes its footer just over 128 MiB, in an object longer
+/// than that, would have the reader fetch and hold the whole claimed footer (here
+/// refused as a failed read, which a caller would retry forever). The reader makes its
+/// one tail read and reports the footer as truncated: not a segment, needing the
+/// claimed length and having the tail.
+#[tokio::test]
+async fn a_footer_longer_than_any_segment_is_not_read_past_the_tail() {
+    let entries = (MAX_SEGMENT_BYTES - footer_len(0)) / 52 + 1;
+    let claimed = footer_len(entries);
+    assert!(claimed > MAX_SEGMENT_BYTES && footer_len(entries - 1) <= MAX_SEGMENT_BYTES);
+    let size = claimed + 100;
+    let store = Sparse {
+        key: key("cas/huge-footer"),
+        size,
+        tail: bare_trailer(size - claimed, u32::try_from(entries).expect("fits")),
+        asked: std::sync::Mutex::default(),
+    };
+    let tail = 64 << 10;
+    let got = read_all(&store, &prefix("cas/"), reads(1, 10, tail)).await;
+    let [FooterRead::Skipped(skipped)] = &got[..] else {
+        panic!("{got:?}")
+    };
+    assert!(
+        matches!(
+            skipped.why,
+            SkipReason::NotASegment(SegmentError::Truncated { needed, available })
+                if needed == claimed && available == tail
+        ),
+        "{skipped:?}"
+    );
+    assert_eq!(*store.asked.lock().expect("lock"), [(size - tail, tail)]);
 }
 
 /// A store that counts the bytes it returns and the reads in flight, and can make a
