@@ -1,6 +1,6 @@
 # One binary, three subcommands, two modes
 
-Status: design, nothing built. Revised again on 2026-10-15 for the owner's decisions on subcommands, discovery and routing. Labels: **[F]** fact checked against `main` while writing this revision, **[F#744]** carried from the first draft of this document and not re-checked, **[I]** inference, **[D]** owner decision (2026-10-15), **[V]** verify before building on it.
+Status: design, nothing built. Revised again on 2026-10-15 for the owner's decisions on subcommands, discovery and staged routing. Labels: **[F]** fact checked against `main` while writing this revision, **[F#744]** carried from the first draft of this document and not re-checked, **[I]** inference, **[D]** owner decision (2026-10-15), **[V]** verify before building on it.
 
 This revision replaces the roles, data-path and leader-only-upload parts of the first draft. It does not modify `ha.md` (PR #303); section 11 says how the two relate.
 
@@ -13,7 +13,7 @@ This revision replaces the roles, data-path and leader-only-upload parts of the 
   - This replaces `--build`, `--non-voting`, `--daemon-only` and `--leader-candidates`. A "server node" below means a `server` or `all-in-one` process.
 - **[D]** `--electable` marks a server or all-in-one node as eligible to vote and lead. It is refused with `kbf daemon`. A server or all-in-one node that is not electable is a full non-voting member: it serves, stores and (all-in-one) builds, and never leads.
 - **[D]** No host lists in configuration. `--join=<addresses or a DNS name>` names a few seed members; any one reachable is enough and stale entries are skipped. Membership lives in the Raft configuration, so the cluster is its own directory: a joining node asks any member and learns the membership and the current leader. The first node is started once with `--bootstrap` (explicit, to prevent two clusters). The voter count is a small fixed cluster setting (default 3, may be 5), and the leader promotes electable members to keep it, replacing dead voters; with 100 servers there are still 3 to 5 voters. The deploy tooling renders the seed list from the fleet registry; nobody types hosts (section 5.3).
-- **[D]** Client routing: Envoy starts from the seed list, and kbf serves Envoy's endpoint discovery (xDS/EDS) naming the current leader. That is portable and works for CI runners over a tailnet. An optional floating IP, held by the leader, serves simple single-subnet sites. The load balancer never discovers servers on its own (section 6).
+- **[D]** Client routing is staged (section 6). Stage 1, the cutover, needs no kbf code: Envoy has a static list of the electable servers, rendered by the deploy tooling (3 to 5 entries), with an active health check about every second on each server's leader-ready check (`/readyz`), and outlier ejection. All client traffic goes to the one server that passes. Stage 2: kbf serves Envoy's endpoint discovery (xDS/EDS) naming the current leader, so Envoy follows membership changes without a config edit; the health check stays as the guard against a stale answer. Servers register by joining the kbf cluster, Envoy learns from the cluster, and callers know only Envoy's DNS name. An optional floating IP, held by the leader, serves simple single-subnet sites. The load balancer never discovers servers on its own.
 - **[D]** Two modes, both always supported and both tested: *trusted-network* (every node is `kbf all-in-one`, three electable) and *isolated-storage* (storage nodes are `kbf server --electable`, build nodes are `kbf daemon`). They are two configurations of the same binary. **Nothing in the code branches on the mode**: it branches on the subcommand, on `--electable`, and on which implementation of an interface a node holds. A branch on "mode" is a design bug.
 - **[D]** The same interfaces serve both modes: daemon to server (data plane and control plane, each with an in-process and a remote implementation and one conformance suite), and server to server (Raft replication, leader discovery, peer blob fetch).
 - **[D]** Kept from the first draft: a leader-elected scheduler on a Raft log among the voters; clients are routed to the leader; unflushed hot blobs may be lost with a node; admission by CPUs with the memory ladder; flags, not environment variables; tests never depend on timing; no compatibility with earlier formats.
@@ -243,23 +243,53 @@ A daemon uses the same seed protocol (including steps 1, 2 and 4), minus the con
 
 Raft traffic uses its own mutual-TLS listener and is never behind Envoy.
 
+### 5.4 Relation to the lock-service pattern
+
+kbf embeds what a lock service such as Chubby, ZooKeeper or etcd provides to the systems built on it, inside the binary:
+
+| Lock-service piece | In kbf |
+|---|---|
+| The lock | Raft leadership: at most one leader-ready node per term |
+| The lock's sequence number, used to fence stale holders | The `Takeover` entry's committed index, which is `Welcome.epoch`; daemons refuse a lower one (5.2) |
+| The lock file (who holds it, and the group's membership) | The leader's address and the membership, both in the Raft log (5.3) |
+| Watches | Members answering "who leads and who is a member", and pushing that to Envoy over xDS (6, stage 2) |
+
+Why embedded: kbf is open source and has to run anywhere, including trusted-network mode with no other infrastructure. An external coordinator would still need its own seeds and its own operators, so it would move the bootstrap problem and add a second system to run and secure.
+
+Future work only, not designed here: an optional external election backend (etcd, or a Kubernetes Lease) behind the same leadership interface, for organisations that already run one. The fencing epoch would still come from kbf's own log, so nothing downstream of the interface changes.
+
 ## 6. Client routing
 
-Clients (build clients, CI runners) reach the leader through Envoy. The load balancer never discovers servers on its own: kbf tells it.
+Clients (build clients, CI runners) reach the leader through Envoy. The load balancer never discovers servers on its own. In plain words: servers register by joining the kbf cluster; Envoy learns the servers from the cluster (stage 2) or from a rendered list (stage 1); callers know only Envoy's DNS name and never a server address.
 
-- **Seeds and xDS.** Envoy is configured with the same seed list as every node and an xDS management cluster over it (details in 6.1). Every server and all-in-one node serves Envoy's endpoint discovery service (EDS). The answer names the **current leader** as the only endpoint of the client cluster, taken from the Raft state. A non-leader answers with the leader it knows; with no leader known, it answers with an empty endpoint set that Envoy treats as "no healthy upstream", and clients get `UNAVAILABLE` and retry. On a leadership change every connected node pushes a new version on the open stream. This is portable: it needs only that Envoy can reach one seed, so it works for CI runners over a tailnet, where no virtual IP exists.
-- **Health check kept as a second guard.** Active health checks on the leader-ready check (`kbf.leader`, backed by `/readyz`) stay: a stale EDS answer pointing at a node that is no longer leader-ready is caught within the check interval, and the not-ready node answers `UNAVAILABLE`. With one endpoint, a failing check leaves none, and `panic_threshold: 0` then gives "no healthy upstream"; that is the intended behaviour, and it means the health check can only remove the leader, never choose another node. EDS alone chooses.
-- **Optional floating IP.** For a simple single-subnet site, the leader-ready node holds a virtual IP (VRRP-style: add the address and send gratuitous ARP). It is taken after `Takeover` commits and released at step-down or when CheckQuorum fails. Limits, stated: it works only on one layer-2 segment (no cloud networks that block gratuitous ARP); gratuitous ARP is lossy; on a partition the old leader keeps the address until CheckQuorum fails, up to an election timeout, so two nodes can briefly both hold it. Fencing rule: the node removes the address and closes its client listeners **before** its step-down completes, never after; a node that cannot remove the address (the interface call fails) exits. Connections already open to a deposed leader are closed at release; a slow node still answers `UNAVAILABLE`, so clients retry rather than succeed on a stale node. Clients then need no Envoy. It is off by default, needs the address and interface as flags and the capability to configure them, and does not replace the xDS path. Test: a fake interface in which both nodes hold the address at once, a client write to the stale node gets `UNAVAILABLE`, and the stale node's listeners are closed.
-- **One cluster in v1:** the leader only. All client traffic goes to the leader, which serves from its tier, by peer fetch, or from the cold store. Non-voting members are never in the client cluster. This keeps the first draft's choice and records that it adds client load to the leader's NIC while there is one client box.
-- Widening to a second cluster for blob traffic on any ready server node (health `kbf.reads`) is a later change to what EDS returns, allowed only after peer fetch, `TierDown` and the lookup path pass in both modes.
-- `panic_threshold: 0`, so a lone healthy host does not make Envoy route to non-leaders. Short check interval and low unhealthy threshold. Failover time is bounded by the election timeout (2 to 4 s) plus the EDS push (under 1 s on an open stream) plus, only if EDS is late, one health-check interval (default 2 s with an unhealthy threshold of 2, so 4 s): under about 10 s of `UNAVAILABLE` that clients retry. The simulator asserts the order of events (election, then push), not the duration.
+**The safety argument, for both stages.** Only the leader passes the leader-ready check, because the check is Raft leader, CheckQuorum satisfied and `Takeover` committed (5.2). So a list that names non-leaders as well is safe: a non-leader fails the check and is never routed to. The list only has to contain the leader, not to be right about which node it is.
+
+**Stage 1: static list plus the leader check (cutover, no kbf code).**
+
+- Envoy's client cluster is a static cluster listing the electable servers, as rendered by the deploy tooling from the fleet registry (3 to 5 entries, the same nodes the deploy tooling already marks `--electable`). Adding or removing an electable server re-renders Envoy's config and reloads it; that is rare and is the only reason stage 2 exists.
+- Active health check on every entry, interval about 1 s, on the leader-ready check (`kbf.leader`, backed by `/readyz`), with a low unhealthy threshold and outlier ejection on top. All REAPI traffic goes to the one entry that passes. With no entry passing (an election, or a lost quorum) Envoy has no healthy upstream and clients get `UNAVAILABLE` and retry.
+- `panic_threshold: 0`, so when nothing passes Envoy does not fall back to routing to failing hosts.
+- **The bound on a stale answer.** A deposed leader that is cut off keeps passing the check until CheckQuorum fails, up to an election timeout, plus one check interval for Envoy to notice. In that window two hosts can pass at once, and a request that reaches the old one cannot be acknowledged, because the old one cannot commit `PutStaged` or any other write (4.2); it answers `UNAVAILABLE` and the client retry goes to the other host. Reads that reach it are served from its tier and verify against their digests. So the window costs retries and never a wrong acknowledgement.
+- Failover time: election timeout (2 to 4 s) plus the check interval and thresholds (about 1 s times 1 or 2) gives under about 8 s of `UNAVAILABLE` that clients retry. The simulator asserts the order of events (election, then the new leader passes the check), not the duration.
+
+**Stage 2: kbf serves xDS/EDS.**
+
+- Envoy is configured with the same seed list as every node and an xDS management cluster over it (details in 6.1). Every server and all-in-one node serves Envoy's endpoint discovery service (EDS). The answer names the **current leader** as the only endpoint of the client cluster, taken from the Raft state. A non-leader answers with the leader it knows; with no leader known, it answers with an empty endpoint set that Envoy treats as "no healthy upstream", and clients get `UNAVAILABLE` and retry. On a leadership change every connected node pushes a new version on the open stream. It needs only that Envoy can reach one seed, so it works for CI runners over a tailnet, where no virtual IP exists, and Envoy follows membership changes with no config edit.
+- **The health check stays as the stale-answer guard.** Active health checks on the leader-ready check stay: a stale EDS answer pointing at a node that is no longer leader-ready is caught within the check interval, and the not-ready node answers `UNAVAILABLE`. With one endpoint, a failing check leaves none, and `panic_threshold: 0` then gives "no healthy upstream"; that is the intended behaviour, and it means the health check can only remove the leader, never choose another node. EDS alone chooses.
+- Stage 1 and stage 2 differ only in where the endpoint list comes from (rendered file, or EDS); the health check, retry table and bound above are the same, so moving to stage 2 changes no client behaviour.
+
+**Common to both stages.**
+
+- **Optional floating IP.** For a simple single-subnet site, the leader-ready node holds a virtual IP (VRRP-style: add the address and send gratuitous ARP). It is taken after `Takeover` commits and released at step-down or when CheckQuorum fails. Limits, stated: it works only on one layer-2 segment (no cloud networks that block gratuitous ARP); gratuitous ARP is lossy; on a partition the old leader keeps the address until CheckQuorum fails, up to an election timeout, so two nodes can briefly both hold it. Fencing rule: the node removes the address and closes its client listeners **before** its step-down completes, never after; a node that cannot remove the address (the interface call fails) exits. Connections already open to a deposed leader are closed at release; a slow node still answers `UNAVAILABLE`, so clients retry rather than succeed on a stale node. Clients then need no Envoy. It is off by default, needs the address and interface as flags and the capability to configure them, and does not replace Envoy routing. Test: a fake interface in which both nodes hold the address at once, a client write to the stale node gets `UNAVAILABLE`, and the stale node's listeners are closed.
+- **One cluster in v1:** the leader only. All client traffic goes to the leader, which serves from its tier, by peer fetch, or from the cold store. Non-voting members are never in the client cluster (in stage 1 the rendered list holds electable servers only). This keeps the first draft's choice and records that it adds client load to the leader's NIC while there is one client box.
+- Widening to a second cluster for blob traffic on any ready server node (health `kbf.reads`) is a later change to what the list or EDS returns, allowed only after peer fetch, `TierDown` and the lookup path pass in both modes.
 - Retries by method class: idempotent reads (`FindMissingBlobs`, `GetActionResult`, `BatchReadBlobs`, ByteStream `Read`, `GetCapabilities`) on `unavailable`, `connect-failure`, `reset`; `WaitExecution` on `unavailable`, `connect-failure`; `Execute` and writes only when nothing was sent.
-- **Envoy needs a static fallback.** The xDS management cluster is a static cluster over the seed list, and the client cluster is an EDS cluster. A cold Envoy start with no seed reachable and no cached config serves nothing: that is an outage until one seed returns, stated plainly. There is no static client endpoint to fall back on, because a static endpoint could name a non-leader.
-- **Envoy loses its xDS stream.** Envoy keeps serving its last-known endpoints and reconnects to the seeds in rounds. If the leader moved meanwhile, the old endpoint answers `UNAVAILABLE` (not leader-ready) and fails the health check; clients see errors until xDS returns. No data is at risk.
-- Envoy is a single point of failure for clients, not for the farm. Daemons and peers never go through it.
+- **Cold start.** Stage 1 needs nothing but the rendered list, so a cold Envoy starts routing as soon as one listed server passes the check. Stage 2 adds a static xDS management cluster over the seed list; a cold Envoy start with no seed reachable and no cached config serves nothing until one seed returns, stated plainly. In neither stage does Envoy invent a leader: the static list is never a fallback that bypasses the check, so a non-leader cannot be routed to by being listed.
+- **Envoy loses its xDS stream (stage 2).** Envoy keeps serving its last-known endpoints and reconnects to the seeds in rounds. If the leader moved meanwhile, the old endpoint answers `UNAVAILABLE` (not leader-ready) and fails the health check; clients see errors until xDS returns. No data is at risk.
+- **Envoy as a single point of failure.** One Envoy is a single point of failure for clients, not for the farm; daemons and peers never go through it. Later, run two stateless Envoys behind the one DNS name. They hold no state beyond their config, so any one serves any request and either can restart or fail. Until then, one Envoy on the client box.
 - Planned restarts of the leader transfer leadership in stage 2.
 
-### 6.1 xDS details
+### 6.1 xDS details (stage 2)
 
 State here what an implementer needs; each item has one golden test.
 
@@ -285,7 +315,7 @@ State here what an implementer needs; each item has one golden test.
 
 | Failure | Trusted | Isolated | Test (simulator, logical time) |
 |---|---|---|---|
-| Leader crash | Election; new `Takeover`; EDS pushed to Envoy. Its own daemon and tier go with it. Stage 1 loses queue and leases; stage 2 keeps them | Same; no build slot lost, since storage nodes hold none | epochs strictly increase; stage 2: leases survive |
+| Leader crash | Election; new `Takeover`; the new leader starts passing Envoy's check (stage 2: and EDS is pushed). Its own daemon and tier go with it. Stage 1 loses queue and leases; stage 2 keeps them | Same; no build slot lost, since storage nodes hold none | epochs strictly increase; stage 2: leases survive |
 | Minority or isolated leader | CheckQuorum steps it down; it cannot commit `PutStaged`, so it cannot acknowledge | Same | minority leader not leader-ready; no ack |
 | Rejoining partitioned node | PreVote stops deposing | Same | term unchanged |
 | Two nodes believe they lead | Stale one cannot commit `Takeover`; daemons reject lower epochs | Same | at most one leader-ready per term |
@@ -306,12 +336,12 @@ State here what an implementer needs; each item has one golden test.
 | No leader known | Lookups `UNAVAILABLE`; local-tier reads of known digests still work. Non-electable nodes need the leader for every non-local read (4.3), so they serve only local digests while it is down | Daemon nodes use the membership already learned, or the seeds | local read during election |
 | Credentials leaked from a node | Every node is a source: accepted risk | Only storage nodes; build node holds none | S1 to S4 |
 | Compromised build node | n/a (all nodes hold credentials) | Can read by digest and write results for its own lease; not the object store | S5, S7, lease-bound result test |
-| Envoy picks a stale leader | Not-ready node answers `UNAVAILABLE`; health check removes it | Same | fake-backend routing |
-| Envoy cold start with no seed reachable | No cached config: serves nothing until a seed returns | Same | cold Envoy, seeds down, then one up |
+| Envoy routes to a stale or listed non-leader | Not-ready node fails the check and is never routed to; a deposed leader still passing cannot acknowledge a write and answers `UNAVAILABLE` (bound in 6) | Same | fake-backend routing |
+| Envoy cold start, nothing reachable | Stage 1: routes as soon as one listed server passes. Stage 2: no cached config and no seed: serves nothing until a seed returns | Same | cold Envoy, seeds down, then one up |
 | Daemon sees seeds of two clusters | Pins the first id; refuses the other and reports both | Same | daemon restart against a second cluster refused |
 | Removed member still running, used as a seed | Stops answering membership; if it does answer, its lower configuration index loses and the leader does not confirm it | Same | stale answer discarded; reused disk joins as a new node |
-| Envoy loses its xDS stream | Keeps last-known endpoints, reconnects to the seeds; a moved leader gives `UNAVAILABLE` until xDS returns | Same | stream drop, leader move, then recovery |
-| EDS served by a non-leader | Names the leader it knows, or an empty set with no leader | Same | follower EDS equals leader EDS |
+| Envoy loses its xDS stream (stage 2) | Keeps last-known endpoints, reconnects to the seeds; a moved leader gives `UNAVAILABLE` until xDS returns | Same | stream drop, leader move, then recovery |
+| EDS served by a non-leader (stage 2) | Names the leader it knows, or an empty set with no leader | Same | follower EDS equals leader EDS |
 | Mixed versions | Version gate before `TierDown` | Same | no new entry before the gate |
 
 Surviving one node loss needs 2 of 3 voters; two losses stop scheduling and lose nothing flushed. In isolated mode with storage-node voters, losing build nodes never affects quorum. Client view on a stage-1 failover: queued work is lost, running work is killed, `Execute` streams break. **[V]** How the build client reacts is checked first (PR 0).
@@ -331,7 +361,7 @@ Each PR's first test fails before the change. No test depends on wall time. **Ev
 6. **Per-node tier over the Raft log.** `AllocEpoch`, `AddTier` and `PutStaged` forwarded from any server node, with the idempotency rules of 4.2. Red first: a non-leader's `PutStaged` is not forwarded. Test, both modes: an upload through node B is readable from node C through B's block with zero blob bytes through the leader (a counter on the leader's blob bytes).
 7. **`TierDown` and `TierUp`** with the version gate, the down-tier write rule and the dwell. Red first: a blob on a down tier is served as `Present`. Lands before peer fetch is exposed to clients.
 8. **Peer fetch.** `ReadBlock` service, digest check at the receiver, flush race, fallback order, input-cache keep. Red first: a flushed-while-reading object commits `ObjectUnreachable`; a corrupt peer answer is accepted.
-9. **Envoy via xDS.** kbf serves EDS from every server node naming the leader; Envoy bootstrap from the seed list; golden tests (one per item of 6.1), fake-backend routing test, cold-start-without-seed test, stream-drop test and the retry table. One cluster. The optional floating IP lands here behind its own flag, tested with a fake interface.
+9. **Envoy routing, stage 1 then stage 2.** Stage 1 (the cutover, no kbf code): the deploy tooling renders Envoy's static list of electable servers with the leader-ready health check and outlier ejection; fake-backend routing test (only the passing host gets traffic; a listed non-leader never does; a deposed leader that still passes cannot acknowledge a write), cold-start test and the retry table. Stage 2: kbf serves EDS from every server node naming the leader; golden tests (one per item of 6.1), stream-drop test, cold-start-without-seed test. One cluster. The optional floating IP lands here behind its own flag, tested with a fake interface.
 10. **InstallSnapshot,** then compaction allowed; joins of a new node then stream a snapshot.
 11. **Control-plane trait:** in-process and remote implementations, the conformance suite and the role-change switch. **Data-plane trait:** in-process and remote, conformance suite; the remote one is what isolated mode needs. Red first: a daemon node cannot read or write blobs without cold-store access. Result writes tied to a lease (3.2) land with the remote data plane.
 12. **Drills.** Trusted: kill the leader under a real build; kill a holder under load. Isolated: S8, then the same kills.
@@ -348,7 +378,7 @@ Each PR's first test fails before the change. No test depends on wall time. **Ev
 7. **Block replication** to a second tier before the acknowledgement: a stage 2 flag in both modes, or isolated mode only?
 8. The single-server pilot's log and unflushed hot blobs are abandoned. Acceptable?
 9. Stage 1 loses queued and running work on every failover, subject to PR 0. Acceptable as an interim?
-10. Is one Envoy on the client box enough while CI depends on it, and is client traffic through the leader's NIC acceptable meanwhile?
+10. Is one Envoy on the client box enough while CI depends on it (two stateless Envoys behind the one DNS name later), and is client traffic through the leader's NIC acceptable meanwhile?
 11. Adopt the wiped-disk rule (rejoin as non-voting, promote after catch-up)? Is operator-driven recovery, never automatic, right when most voters die at once (`kbf cluster` recovery command)?
 12. Write side: verify-on-read first, acknowledge-after-flush for `UpdateActionResult` only if misses are frequent. Adopt?
 
@@ -358,9 +388,9 @@ Each PR's first test fails before the change. No test depends on wall time. **Ev
 ## 11. Relation to PR #303 (`ha.md`)
 
 - Absorbed as stage 2: the replicated scheduler (`FarmMachine`), epoch as log id, `Takeover`, the trailer redirect, the version gate and learner flow stay specified there.
-- Superseded for v1: the two-cluster front (`kbf-reads` on any server). With per-node hot stores and a read path that needs `TierDown` and peer fetch first, v1 routes client traffic to the leader (section 6); widening is the later config change.
+- Superseded for v1: the two-cluster front (`kbf-reads` on any server). With per-node hot stores and a read path that needs `TierDown` and peer fetch first, v1 routes client traffic to the leader (section 6, staged); widening is the later config change.
 - Superseded: growth from 1 to 3 voters by `--raft-join`. Here `--join` takes seeds, membership lives in the Raft configuration, the leader promotes electable members and `--bootstrap` starts a cluster (section 5.3). The learner flow of `ha.md` is the mechanism for non-voting members.
-- Added here: the node types and resolver, daemon nodes, the two modes and their security invariants, the stage-1 epoch from a `Takeover` index, the wiped-disk rule, the tier loss semantics, Envoy settings.
+- Added here: the node types and resolver, daemon nodes, the two modes and their security invariants, the stage-1 epoch from a `Takeover` index, the wiped-disk rule, the tier loss semantics, staged Envoy routing and its settings, the lock-service mapping (5.4).
 
 ## Appendix: what changed, and review points not adopted
 
