@@ -1898,6 +1898,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-state"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "kbf-storage"
 version = "0.1.0"
 dependencies = [
