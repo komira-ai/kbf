@@ -9,7 +9,7 @@
 use std::io::{BufRead as _, BufReader};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use kbf_proto::google::longrunning::operation;
@@ -22,8 +22,15 @@ use kbf_proto::reapi::{
 };
 use kbf_transfer::{Cas as _, TransferConfig, Transfers, fetch};
 use prost::Message as _;
-use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 use tonic::transport::{Channel, Endpoint};
+
+#[path = "support/node.rs"]
+mod node;
+
+use node::{
+    PROMPT, Running, cgroup_tree, files_holding, free_port, id_files, image_path, input_bytes, pki,
+    podman,
+};
 
 // The stand-in `podman` runs each action as `kbf-act` beside it: a link to this test
 // binary, which answers as `kbf-act` through it.
@@ -31,12 +38,8 @@ kbf_testkit::act_test_hook!();
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-all-in-one");
 
-/// How long the test waits for what should happen promptly.
-const PROMPT: Duration = Duration::from_secs(60);
-
-/// The per-architecture manifest the stand-in image store holds.
-const MANIFEST: &[u8] =
-    br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
+/// The stand-in `podman` (`node::podman`).
+const FAKE_PODMAN: &str = env!("CARGO_BIN_EXE_kbf-fake-podman");
 
 /// A fresh directory for one test.
 fn scratch(name: &str) -> PathBuf {
@@ -46,92 +49,6 @@ fn scratch(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch");
     dir
-}
-
-/// A CA, the node's certificate (`node-1`, its one DNS name) and the server's
-/// (`localhost`), written into `dir`.
-fn pki(dir: &Path) {
-    let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
-    ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("key")).expect("CA");
-    std::fs::write(dir.join("ca.pem"), ca.pem()).expect("write");
-    for (name, dns) in [("node", "node-1"), ("server", "localhost")] {
-        let key = KeyPair::generate().expect("key");
-        let cert = CertificateParams::new(vec![dns.to_owned()])
-            .expect("params")
-            .signed_by(&key, &ca)
-            .expect("sign");
-        std::fs::write(dir.join(format!("{name}.pem")), cert.pem()).expect("write");
-        std::fs::write(dir.join(format!("{name}.key")), key.serialize_pem()).expect("write");
-    }
-}
-
-/// `--id-files`: a passwd naming this test's user `kbf`, with 65,536 subordinate ids.
-fn id_files(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let ids = dir.join("ids");
-    std::fs::create_dir_all(&ids).expect("mkdir");
-    let passwd = ids.join("passwd");
-    std::fs::write(&passwd, "").expect("write");
-    let uid = std::fs::metadata(&passwd).expect("stat").uid();
-    std::fs::write(&passwd, format!("kbf:x:{uid}:{uid}::/:/usr/bin/false\n")).expect("write");
-    for file in ["subuid", "subgid"] {
-        std::fs::write(ids.join(file), "kbf:100000:65536\n").expect("write");
-    }
-    ids
-}
-
-/// The stand-in `podman` in `bin`, and `kbf-act` beside it, with an image store holding
-/// [`MANIFEST`] as image `img1`; the stand-in runs `steps` as each action. Returns the
-/// image as an action names it.
-fn podman(bin: &Path, steps: &[&str]) -> String {
-    let state = bin.join("state");
-    std::fs::create_dir_all(&state).expect("mkdir");
-    let fake = env!("CARGO_BIN_EXE_kbf-fake-podman");
-    std::os::unix::fs::symlink(fake, bin.join("podman")).expect("link podman");
-    kbf_testkit::act::link_self(&bin.join(kbf_testkit::act::NAME)).expect("link kbf-act");
-    std::fs::write(state.join("image-id"), "img1\n").expect("image id");
-    std::fs::write(state.join("nonce"), format!("{}:", std::process::id())).expect("nonce");
-    let knob: String = steps.iter().map(|s| format!("{s}\n")).collect();
-    std::fs::write(state.join("action"), knob).expect("action");
-    let digest = format!("sha256:{}", kbf_transfer::digest_of(MANIFEST).hash);
-    let store = state.join("store/fake-images/img1");
-    std::fs::create_dir_all(&store).expect("mkdir store");
-    let file = kbf_driver_container::image::manifest_file(&digest);
-    std::fs::write(store.join(file), MANIFEST).expect("manifest");
-    format!("docker://registry.test/tools/busybox@{digest}")
-}
-
-/// A cgroup v2 mount of plain directories at `bin/cgroup`, where the stand-in `podman`
-/// looks, holding the daemon's unit; the flags that point the daemon at it.
-fn cgroup_tree(bin: &Path) -> Vec<String> {
-    let root = bin.join("cgroup");
-    let unit = root.join("kbf.slice/kbf-all-in-one.service");
-    std::fs::create_dir_all(&unit).expect("mkdir");
-    let plant = |path: PathBuf, text: &str| std::fs::write(path, text).expect("plant");
-    plant(
-        root.join("cgroup.controllers"),
-        "cpuset cpu io memory pids\n",
-    );
-    plant(unit.join("cgroup.controllers"), "cpu memory pids\n");
-    plant(unit.join("cgroup.procs"), "1\n");
-    plant(unit.join("cpuset.cpus.effective"), "0\n");
-    let own = bin.join("self-cgroup");
-    plant(own.clone(), "0::/kbf.slice/kbf-all-in-one.service\n");
-    vec![
-        format!("--cgroup-root={}", root.display()),
-        format!("--self-cgroup={}", own.display()),
-    ]
-}
-
-/// A port nothing listens on now.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
 }
 
 /// The flags of a one-node farm in `dir`: the server's worker listener on `port` under
@@ -159,15 +76,6 @@ fn farm_flags(dir: &Path, port: u16) -> Vec<String> {
     ]
 }
 
-/// `PATH` with `bin`, where [`podman`] put the stand-in, first.
-fn image_path(bin: &Path) -> String {
-    format!(
-        "{}:{}",
-        bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    )
-}
-
 /// The binary with `flags` (a one-node farm in `dir`, [`farm_flags`]) whose container
 /// driver runs the stand-in `podman` in `bin`, found through `path`.
 fn farm(dir: &Path, bin: &Path, path: &str, flags: Vec<String>) -> Command {
@@ -181,30 +89,6 @@ fn farm(dir: &Path, bin: &Path, path: &str, flags: Vec<String>) -> Command {
         // driver runs by the name `PATH` finds (argv0 `podman`): from here.
         .current_dir(bin);
     command
-}
-
-/// Kills the process when dropped, so a failed test leaves nothing running.
-struct Running(Child);
-
-impl Running {
-    /// Waits for the process to end on its own, for at most [`PROMPT`].
-    fn wait(mut self) -> std::process::ExitStatus {
-        let deadline = std::time::Instant::now() + PROMPT;
-        loop {
-            if let Some(status) = self.0.try_wait().expect("wait") {
-                return status;
-            }
-            assert!(std::time::Instant::now() < deadline, "still running");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-}
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
 }
 
 /// Stores `bytes` through the REAPI listener.
@@ -269,7 +153,7 @@ fn an_actions_outputs_go_through_the_in_process_plane() {
         "--stderr",
         "to stderr",
     ];
-    let image = podman(&bin, &steps);
+    let image = podman(&bin, FAKE_PODMAN, &steps);
     let flags = farm_flags(&dir, free_port());
     let mut child = farm(&dir, &bin, &image_path(&bin), flags)
         .stdout(Stdio::piped())
@@ -417,7 +301,7 @@ fn the_start_up_pass_and_the_evictor_run_over_a_file_cold_store() {
     pki(&dir);
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).expect("mkdir");
-    podman(&bin, &["true"]);
+    podman(&bin, FAKE_PODMAN, &["true"]);
     let mut flags: Vec<String> = farm_flags(&dir, free_port())
         .into_iter()
         .filter(|flag| !flag.starts_with("--hot-store="))
@@ -485,20 +369,6 @@ const PASS_DONE: &str = "start-up pass over the cold store directory done";
 
 /// What a round of eviction that evicted logs (`kbf-front`'s `Cache::evict_round`).
 const EVICTED: &str = "evicted the least recently used objects";
-
-/// An input of more bytes than any chunk or buffer of the read path (a ByteStream chunk
-/// and the input cache's copy buffer are 1 MiB), none of whose 64-byte runs repeats.
-fn input_bytes() -> Vec<u8> {
-    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-    (0..(3 << 20) + 7)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state.to_le_bytes()[3]
-        })
-        .collect()
-}
 
 /// The farm in `dir` started with `flags`: running, with its REAPI and operator API
 /// addresses from its start line.
@@ -604,42 +474,6 @@ fn flushed(api: SocketAddr) -> std::collections::BTreeMap<String, u64> {
     }
 }
 
-/// Every file under `dirs` (recursively, not following symlinks) that holds `bytes`
-/// whole, each inode once: its path and size.
-fn files_holding(dirs: &[PathBuf], bytes: &[u8]) -> Vec<(PathBuf, u64)> {
-    use std::os::unix::fs::MetadataExt as _;
-    let mut found = std::collections::BTreeMap::new();
-    let mut todo: Vec<PathBuf> = dirs.to_vec();
-    while let Some(at) = todo.pop() {
-        let Ok(meta) = std::fs::symlink_metadata(&at) else {
-            continue;
-        };
-        if meta.is_dir() {
-            let listed = std::fs::read_dir(&at).into_iter().flatten().flatten();
-            todo.extend(listed.map(|entry| entry.path()));
-            continue;
-        }
-        if !meta.is_file() || meta.len() < bytes.len() as u64 {
-            continue;
-        }
-        let Ok(held) = std::fs::read(&at) else {
-            continue;
-        };
-        let anchor = &bytes[..64];
-        let holds = held
-            .windows(64)
-            .enumerate()
-            .filter(|(_, run)| *run == anchor)
-            .any(|(at, _)| held.get(at..at + bytes.len()) == Some(bytes));
-        if holds {
-            found
-                .entry((meta.dev(), meta.ino()))
-                .or_insert((at, meta.len()));
-        }
-    }
-    found.into_values().collect()
-}
-
 /// Asserts `input` is on the node's disk once: one inode under the hot store and the
 /// data directory holds it, the input cache's entry, of the input's size; and the one
 /// cache's fill counts it once, beside no flushed copy.
@@ -690,7 +524,7 @@ fn an_input_is_on_the_nodes_disk_once() {
     pki(&dir);
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).expect("mkdir");
-    let image = podman(&bin, &["echo", "ran"]);
+    let image = podman(&bin, FAKE_PODMAN, &["echo", "ran"]);
     let mut flags = farm_flags(&dir, free_port());
     flags.extend([
         "--api-listen=127.0.0.1:0".to_owned(),

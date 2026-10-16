@@ -322,6 +322,20 @@ impl Farm {
         metrics.sched_leases.set(state.sched.leases_held() as u64);
     }
 
+    /// Operations waiting in the scheduler's queue for a lease, now (read under the
+    /// scheduler's lock, not the gauge `/metrics` serves, which is a tick old).
+    #[must_use]
+    pub fn queued_operations(&self) -> u64 {
+        self.lock().sched.queued_len() as u64
+    }
+
+    /// Execute and WaitExecution operation streams open now
+    /// (`kbf_front_open_executions`).
+    #[must_use]
+    pub fn open_executions(&self) -> u64 {
+        self.cache.metrics().execute.open_executions.get()
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         // Nothing under the lock panics midway through a change.
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
