@@ -22,6 +22,13 @@ use kbf_transfer::{RoutedCas, TransferConfig};
 use kbf_types::Digest;
 use tonic::{Request, Response, Status};
 
+/// A directory these tests may make files in.
+pub fn scratch() -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("routed-unit");
+    std::fs::create_dir_all(&dir).expect("scratch directory");
+    dir
+}
+
 pub fn sha(bytes: &[u8]) -> Digest {
     kbf_segments::sha256(bytes)
 }
@@ -36,6 +43,8 @@ pub struct Fake {
     /// Whether it holds anything: if not, reads are NOT_FOUND.
     pub holds: AtomicBool,
     pub down: AtomicBool,
+    /// Every read passes one chunk and then fails.
+    pub breaks: AtomicBool,
     /// Digests FindMissing finds held.
     held: Mutex<BTreeSet<Digest>>,
     /// The next FindMissing calls fail with these.
@@ -53,6 +62,7 @@ impl Fake {
             data: Mutex::new(Bytes::copy_from_slice(data)),
             holds: AtomicBool::new(true),
             down: AtomicBool::new(false),
+            breaks: AtomicBool::new(false),
             held: Mutex::default(),
             find_failures: Mutex::default(),
             finds: Mutex::default(),
@@ -133,10 +143,14 @@ impl Storage for Fake {
                 return Err(StorageError::NotFound(*digest));
             }
             let data = self.data.lock().expect("lock").clone();
-            let chunks: Vec<Result<Bytes, StorageError>> = (0..data.len())
+            let mut chunks: Vec<Result<Bytes, StorageError>> = (0..data.len())
                 .step_by(4)
                 .map(|at| Ok(data.slice(at..data.len().min(at + 4))))
                 .collect();
+            if self.breaks.load(Ordering::SeqCst) {
+                chunks.truncate(1);
+                chunks.push(Err(unavailable()));
+            }
             Ok(stream::iter(chunks).boxed())
         })
     }

@@ -1407,11 +1407,14 @@ dependencies = [
 name = "kbf-cas-conformance"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures",
  "kbf-front",
  "kbf-map",
+ "kbf-meta",
  "kbf-proto",
  "kbf-route",
+ "kbf-segments",
  "kbf-storage",
  "kbf-transfer",
  "kbf-types",
@@ -2046,8 +2049,6 @@ dependencies = [
  "futures",
  "hex",
  "kbf-front",
- "kbf-map",
- "kbf-meta",
  "kbf-objstore",
  "kbf-proto",
  "kbf-route",

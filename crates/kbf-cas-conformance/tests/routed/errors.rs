@@ -3,7 +3,7 @@
 use kbf_proto::reapi::Digest;
 use kbf_transfer::{Cas, CasError, TransferConfig, digest_of, label};
 
-use super::support::{Fake, plane};
+use super::support::{Fake, plane, scratch};
 
 /// A digest REAPI would never send: not a SHA-256 hash.
 fn not_a_digest() -> Digest {
@@ -22,8 +22,8 @@ async fn only_an_absent_blob_is_missing() {
     let fake = Fake::new(b"whatever");
     let cas = plane(&fake, &TransferConfig::default());
     let digest = digest_of(b"asked for");
-    let scratch = std::env::temp_dir();
-    let mut file = tokio::fs::File::create(scratch.join("kbf-routed-errors"))
+    let dir = scratch();
+    let mut file = tokio::fs::File::create(dir.join("kbf-routed-errors"))
         .await
         .expect("a file");
 
@@ -58,7 +58,7 @@ async fn a_digest_no_store_could_hold_is_missing_without_a_call() {
     let fake = Fake::new(b"whatever");
     let cas = plane(&fake, &TransferConfig::default());
     let bad = not_a_digest();
-    let mut file = tokio::fs::File::create(std::env::temp_dir().join("kbf-routed-bad"))
+    let mut file = tokio::fs::File::create(scratch().join("kbf-routed-bad"))
         .await
         .expect("a file");
 
@@ -79,7 +79,7 @@ async fn a_digest_no_store_could_hold_is_missing_without_a_call() {
 async fn read_to_checks_the_bytes_it_writes() {
     let honest = b"the blob that was asked for".to_vec();
     let digest = digest_of(&honest);
-    let path = std::env::temp_dir().join("kbf-routed-read-to");
+    let path = scratch().join("kbf-routed-read-to");
 
     let fake = Fake::new(b"some other bytes entirely");
     let cas = plane(&fake, &TransferConfig::default());
@@ -100,7 +100,7 @@ async fn read_to_checks_the_bytes_it_writes() {
 /// finding the first one failed) or on the flush (one chunk, buffered).
 #[tokio::test]
 async fn a_file_that_cannot_be_written_fails_the_read() {
-    let path = std::env::temp_dir().join("kbf-routed-read-only");
+    let path = scratch().join("kbf-routed-read-only");
     std::fs::write(&path, b"").expect("a file");
     for blob in [b"1234".to_vec(), b"12345678123456781234".to_vec()] {
         let digest = digest_of(&blob);
@@ -112,5 +112,30 @@ async fn a_file_that_cannot_be_written_fails_the_read() {
             .await
             .expect_err("read-only");
         assert!(matches!(error, CasError::Write(..)), "{error:?}");
+    }
+}
+
+/// Catches a read that breaks for good reported as a short blob or a corrupt one: the
+/// node passes a chunk and fails on every attempt, and the read into a file is
+/// `Unavailable`, as is a read into memory.
+#[tokio::test]
+async fn a_read_that_keeps_breaking_is_unavailable() {
+    let blob = b"12345678123456781234".to_vec();
+    let digest = digest_of(&blob);
+    let fake = Fake::new(&blob);
+    fake.breaks.store(true, std::sync::atomic::Ordering::SeqCst);
+    let cas = plane(&fake, &TransferConfig::default());
+    let mut file = tokio::fs::File::create(scratch().join("kbf-routed-breaks"))
+        .await
+        .expect("a file");
+
+    for answer in [
+        cas.read_to(&digest, &mut file).await,
+        cas.get(&digest).await.map(drop),
+    ] {
+        assert!(
+            matches!(answer, Err(CasError::Unavailable(..))),
+            "{answer:?}"
+        );
     }
 }

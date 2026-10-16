@@ -20,19 +20,23 @@
 //! - **A byte budget** for reads into memory ([`Cas::get`]); `--transfer-bytes-in-flight`
 //!   does not apply. Reads into a file stream, and hold one chunk.
 
-#![expect(dead_code, reason = "the red-first commit: nothing is routed yet")]
-
 use std::future::Future;
 use std::sync::Arc;
 
+use bytes::Bytes;
+use futures::StreamExt as _;
+use futures::future::join_all;
 use kbf_proto::reapi::Digest;
 use kbf_route::Router;
 use kbf_storage::StorageError;
 use kbf_types::{DigestFunction, LeaseId};
+use tokio::io::AsyncWriteExt as _;
 use tokio::sync::Semaphore;
 
 use crate::cas::{Cas, CasError, label};
 use crate::config::TransferConfig;
+use crate::spool::to_proto;
+use kbf_segments::RecordHasher;
 
 /// The daemon's data plane over the storage map. Cheap to clone through its `Arc`.
 pub struct RoutedCas {
@@ -85,24 +89,69 @@ impl Cas for RoutedCas {
     }
 
     async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
-        Err(CasError::Unavailable(
-            label(digest),
-            "not routed yet".to_owned(),
-        ))
+        let blob = label(digest);
+        let Some(parsed) = parse(digest) else {
+            return Err(CasError::Missing(blob));
+        };
+        match self.limited(self.router.read_blob(&parsed)).await {
+            Ok(bytes) => Ok(bytes.to_vec()),
+            Err(e) => Err(failed(blob, &e)),
+        }
     }
 
     async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CasError> {
-        Err(CasError::Unavailable(
-            format!("of {} bytes", bytes.len()),
-            "not routed yet".to_owned(),
-        ))
+        let blob = format!("of {} bytes", bytes.len());
+        match self.limited(self.router.put(Bytes::from(bytes))).await {
+            Ok(digest) => Ok(to_proto(&digest)),
+            Err(e) => Err(failed(blob, &e)),
+        }
     }
 
-    async fn read_to(&self, digest: &Digest, _: &mut tokio::fs::File) -> Result<(), CasError> {
-        Err(CasError::Unavailable(
-            label(digest),
-            "not routed yet".to_owned(),
-        ))
+    async fn read_to(&self, digest: &Digest, file: &mut tokio::fs::File) -> Result<(), CasError> {
+        let blob = label(digest);
+        let Some(parsed) = parse(digest) else {
+            return Err(CasError::Missing(blob));
+        };
+        let _permit = self.requests.acquire().await;
+        let mut stream = self
+            .router
+            .read_range(&parsed, 0, 0)
+            .await
+            .map_err(|e| failed(blob.clone(), &e))?;
+        let mut hasher = RecordHasher::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| failed(blob.clone(), &e))?;
+            hasher.update(&chunk);
+            let written = file.write_all(&chunk).await;
+            written.map_err(|e| CasError::Write(blob.clone(), e.to_string()))?;
+        }
+        let (read, _) = hasher.finish();
+        if read != parsed {
+            return Err(CasError::Corrupt(blob, label(&to_proto(&read))));
+        }
+        let flushed = file.flush().await;
+        flushed.map_err(|e| CasError::Write(blob, e.to_string()))
+    }
+
+    async fn missing(&self, digests: &[Digest]) -> Vec<Digest> {
+        // A digest that does not parse is held by no store: ask nothing about it.
+        let Some(parsed) = digests.iter().map(parse).collect::<Option<Vec<_>>>() else {
+            return digests.to_vec();
+        };
+        let calls = parsed
+            .chunks(self.find_missing_chunk)
+            .map(|chunk| async move {
+                let asked = self.limited(self.router.find_missing(chunk)).await;
+                // A call that fails answers "missing" for its digests: FindMissing only
+                // saves uploads.
+                asked.unwrap_or_else(|_| chunk.to_vec())
+            });
+        join_all(calls)
+            .await
+            .into_iter()
+            .flatten()
+            .map(|d| to_proto(&d))
+            .collect()
     }
 
     fn in_flight(&self) -> usize {
