@@ -40,9 +40,9 @@
 //! copies kbf-server's metadata log into one archive in a brief stop (as root), and
 //! `linux meta-verify --archive FILE --into DIR` extracts and checks one ([`meta`]).
 //!
-//! `kbf-deploy linux issue-cert --role ROLE --name DNS... [--ip IP]... --ca-cert FILE
-//! --ca-key FILE --out DIR [--days N] [--apply]` ([`issue_cert`]) makes a node's role
-//! certificate for the new modes' mutual TLS, signed by the farm's CA.
+//! `kbf-deploy linux verify-cert --row ROW --cert FILE --ca-cert FILE [--node-id ID]`
+//! ([`verify_cert`]) checks, read only, that a certificate is its row of the farm's
+//! certificate table: its one role, its extended key usage, its chain to the CA.
 //!
 //! The settings are a closed set of `KEY=VALUE` lines ([`config::KEYS`],
 //! `templates/linux/config.example`).
@@ -56,13 +56,13 @@ pub mod host;
 pub mod images;
 pub mod install;
 pub mod install_mode;
-pub mod issue_cert;
 pub mod meta;
 pub mod modes;
 pub mod render;
 pub mod stop;
 pub mod stores;
 pub mod swap;
+pub mod verify_cert;
 
 #[cfg(test)]
 mod tests;
@@ -84,6 +84,8 @@ pub enum Refusal {
     Config(#[from] LinuxError),
     #[error(transparent)]
     Template(#[from] TemplateError),
+    #[error(transparent)]
+    Render(#[from] modes::RenderError),
     #[error(transparent)]
     Check(#[from] CheckError),
     /// `--kbf-bin` is not an absolute path.

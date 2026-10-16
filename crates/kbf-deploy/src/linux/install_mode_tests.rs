@@ -263,7 +263,8 @@ fn a_unit_without_a_user_of_its_own_is_refused() {
 /// all-in-one: its data directory before the cold store under it, and the wait for its
 /// operator API's `/readyz` after the start; with `--bin-dir` the new kbf first, the
 /// old one kept. Catches the cold store's directory planned before its parent's owner
-/// and mode, a start not waited for, and a new kbf not installed.
+/// and mode, a start not waited for, a new kbf not installed, and a unit installed
+/// without the stop settings that keep its drain whole.
 #[test]
 fn the_all_in_one_unit_waits_for_readyz_and_installs_a_new_kbf() {
     let (exec, _) = host("install-mode-aio");
@@ -291,12 +292,30 @@ fn the_all_in_one_unit_waits_for_readyz_and_installs_a_new_kbf() {
             "wait up to 60s for http://127.0.0.1:8982/readyz".to_owned(),
         ]
     );
+    // The unit installed is the template's: stopped with SIGTERM, never killed mid-drain.
+    let unit = p
+        .steps()
+        .iter()
+        .find_map(|s| match s {
+            Step::WriteFile { path, bytes, .. }
+                if path.as_str() == "/etc/systemd/system/kbf-all-in-one.service" =>
+            {
+                Some(String::from_utf8_lossy(bytes).into_owned())
+            }
+            _ => None,
+        })
+        .expect("the unit is written");
+    assert!(
+        unit.contains("\nKillSignal=SIGTERM\nTimeoutStopSec=infinity\n"),
+        "{unit}"
+    );
 }
 
 /// The refusals, each before any step: a mode not built yet (its unit would exit 2), a
 /// key file others can read or another user owns, a file the unit reads missing, a
-/// unit kbf's own parser refuses (rule `parse`), a kbf that is not there, and a build
-/// node whose user does not linger. Catches each of these installed anyway.
+/// unit kbf's own parser refuses (rule `parse`), a kbf that is not there, a build node
+/// whose user does not linger, and a storage node with no S3 endpoint set.
+/// Catches each of these installed anyway.
 #[test]
 fn an_install_is_refused_before_any_step() {
     let refused = |name: &str, mode: Mode, edit: &dyn Fn(&ScratchHost, &RefCell<World>)| {
@@ -376,6 +395,16 @@ fn an_install_is_refused_before_any_step() {
         fs::remove_file(exec.at("/var/lib/systemd/linger/kbf")).expect("rm");
     });
     assert!(matches!(&e, HostError::NoLinger { .. }), "{e}");
+    // A storage node whose settings name no S3 endpoint: its unit is not rendered.
+    let (exec, _) = host("install-mode-no-endpoint");
+    let mut a = install(Mode::Storage, None);
+    a.config.minio_s3_endpoint = None;
+    let e = plan_here(&exec, &a).map(|_| ()).expect_err("refused");
+    assert!(
+        e.to_string()
+            .starts_with("MINIO_S3_ENDPOINT must be set for --mode storage"),
+        "{e}"
+    );
 }
 
 /// The files a unit reads, read as systemd reads them: an `EnvironmentFile=` with a

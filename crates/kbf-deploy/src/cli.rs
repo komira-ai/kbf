@@ -268,9 +268,9 @@ enum Linux {
     MetaBackup(meta::cli::BackupArgs),
     /// Extract a meta-backup archive into an empty directory and check every file.
     MetaVerify(meta::cli::VerifyArgs),
-    /// Issue a node's role certificate for the new modes' mutual TLS, signed by the
-    /// farm's CA; prints what it would write unless --apply.
-    IssueCert(linux::issue_cert::IssueArgs),
+    /// Check, read only, that a certificate is its row of the farm's certificate table:
+    /// its one role, its extended key usage and its chain to the CA.
+    VerifyCert(linux::verify_cert::VerifyArgs),
     /// Make, activate and list the build swapfile (as root).
     Swap {
         /// The kit's settings, KEY=VALUE lines.
@@ -654,7 +654,7 @@ fn linux_kit<E: Exec>(
             return meta::cli::backup(a, exec, &meta::metrics::http_get, out, err);
         }
         Linux::MetaVerify(a) => return meta::cli::verify(&a, out, err),
-        Linux::IssueCert(a) => return linux::issue_cert::cli(&a, out, err),
+        Linux::VerifyCert(a) => return linux::verify_cert::cli(&a, out, err),
         Linux::Swap {
             config,
             kubelet_allows_swap,

@@ -40,6 +40,8 @@ pub enum HostError {
     #[error(transparent)]
     Template(#[from] TemplateError),
     #[error(transparent)]
+    Render(#[from] super::modes::RenderError),
+    #[error(transparent)]
     Check(#[from] CheckError),
     #[error(transparent)]
     Path(#[from] PathError),

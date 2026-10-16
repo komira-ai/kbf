@@ -36,8 +36,9 @@ tonic.workspace = true
 kbf-deploy.workspace = true
 # The host `check-units --mode` runs `kbf check-args` on (tests/deploy_units.rs).
 kbf-host.workspace = true
-# A CA for the certificates `kbf-deploy linux issue-cert` makes, read back with the
-# storage node's own role check (tests/deploy_units.rs).
+# Certificates made as the farm's issuer makes them, checked by `kbf-deploy linux
+# verify-cert` and read back with the storage node's own role check
+# (tests/deploy_units.rs).
 rcgen.workspace = true
 
 [lints]

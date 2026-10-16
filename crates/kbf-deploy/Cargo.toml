@@ -41,8 +41,6 @@ kbf-host.workspace = true
 kbf-mdm.workspace = true
 kbf-types.workspace = true
 plist.workspace = true
-# `linux issue-cert`: a node's certificate, signed by the farm CA read from its PEM.
-rcgen = { workspace = true, features = ["x509-parser"] }
 rustls.workspace = true
 rustls-native-certs.workspace = true
 serde.workspace = true
@@ -58,7 +56,8 @@ zip.workspace = true
 kbf-host = { workspace = true, features = ["testkit"] }
 # Security-key signatures made in software, for `mdm erase-request`'s tests.
 kbf-mdm = { workspace = true, features = ["testkit"] }
-# The certificates of the HTTPS servers the `mdm` tests run.
+# The certificates of the HTTPS servers the `mdm` tests run, and the ones
+# `linux verify-cert` is tested against.
 rcgen.workspace = true
 rustix = { workspace = true, features = ["process"] }
 

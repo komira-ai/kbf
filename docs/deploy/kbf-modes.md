@@ -220,34 +220,43 @@ backend is built in.
 
 ## A node's certificate
 
-`kbf-deploy linux issue-cert` makes a node's certificate for the new modes' mutual TLS,
-signed by the farm's CA, on the machine that holds the CA's key:
+kbf-deploy issues no certificate. The farm's one issuer makes every certificate of the
+new modes' mutual TLS from the one CA, each with exactly one role, by this table:
+
+| row | role (`urn:kbf:role:<role>`) | extended key usage | names |
+|---|---|---|---|
+| `frontend-reapi` | `frontend` | serverAuth | the name clients dial |
+| `frontend-worker` | `frontend` | serverAuth, clientAuth (it also calls storage) | the frontend's names |
+| `storage` | `storage` | serverAuth, clientAuth (replication calls) | the node's names |
+| `daemon` | `daemon` | clientAuth | exactly one DNS name, the node id |
+
+`kbf-deploy linux verify-cert` checks one certificate against its row, read only,
+before a unit is pointed at it:
 
 ```text
-kbf-deploy linux issue-cert --role storage --name storage-1.farm.example --ip 192.0.2.10 \
-    --ca-cert ca.pem --ca-key ca.key --out certs/storage-1
-kbf-deploy linux issue-cert ... --apply
+kbf-deploy linux verify-cert --row storage --cert storage.pem --ca-cert ca.pem
+kbf-deploy linux verify-cert --row daemon --cert node.pem --ca-cert ca.pem --node-id node-1
 ```
 
-- The subjectAltName holds each `--name` (DNS) and `--ip`, and the role as the URI
-  `urn:kbf:role:<role>` (`frontend` or `storage`), which a storage node reads to admit
-  each call (architecture-v2.md, section 9). That spelling is provisional until role
-  certificates are settled; a kbf-cli test reads every role this verb issues back with
-  the storage node's own check.
-- A fresh ECDSA P-256 key; extended key usage serverAuth and clientAuth; valid from five
-  minutes ago for `--days` (365 by default, at most 825).
-- Before it prints anything, it checks the certificate as a TLS client would: it chains
-  to `--ca-cert` under every name, and the key is its own. A `--ca-key` that is not the
-  CA certificate's key is refused there. The CA key must be PKCS#8 PEM
-  (`openssl pkcs8 -topk8 -nocrypt` converts one).
-- Without `--apply` it writes nothing and prints the two `DRY-RUN: write` lines. With
-  it, it writes `<out>/<role>.pem` (0644) and `<out>/<role>.key` (0600, made with that
-  mode), and refuses to replace either.
+- `role`: the subjectAltName holds exactly one URI `urn:kbf:role:<role>`, the row's.
+  A storage node reads the same URI to admit each call (architecture-v2.md, section 9);
+  a kbf-cli test makes a certificate of each row and reads it back with the storage
+  node's own check.
+- `eku`: the extended key usage is the row's set exactly; a certificate without the
+  extension fails (TLS would take it for every use).
+- `name` (`daemon`): its DNS and IP names are exactly `--node-id`.
+- `chain`: it chains to `--ca-cert` now, for each use of the row: as a server under its
+  first name, as a client.
 
-Copy the two files to the node's `KBF_ETC` (the storage unit reads `storage.pem` and
-`storage.key`), the key owned by the unit's user. The frontend's certificate is issued
-the same way; `kbf frontend` takes no certificate flags yet. Its `--name` is the
-frontend's DNS name, which the nodes will reach it by once they register with it.
+It prints a `FAIL <check>:` line per failed check and `CERT BROKEN`, or one
+`CERT OK:` line. Exit codes: 0 the certificate is the row's, 1 a check failed, 2 refused
+(a file that cannot be read, no certificate, no usable CA, `--node-id` for a row that
+is not `daemon`).
+
+Copy the certificate and its key to the node's `KBF_ETC` (the storage unit reads
+`storage.pem` and `storage.key`), the key owned by the unit's user; `install-units
+--mode` refuses a key another user owns or others can read. `kbf frontend` takes no
+certificate flags yet.
 
 ## Installing a mode's unit
 

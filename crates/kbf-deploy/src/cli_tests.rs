@@ -297,21 +297,18 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
         assert_eq!(code, ExitCode::from(2), "{args:?}");
         assert!(exec.queries.borrow().is_empty(), "{args:?} asked the host");
     }
-    // issue-cert reaches its kit: a CA that is not there is refused.
+    // verify-cert reaches its kit: a CA that is not there is refused; a daemon's row
+    // needs its node id.
     let mut exec = FakeExec::new(0);
     let args = [
         "linux",
-        "issue-cert",
-        "--role",
+        "verify-cert",
+        "--row",
         "storage",
-        "--name",
-        "storage-1",
+        "--cert",
+        "/srv/none/storage.pem",
         "--ca-cert",
         "/srv/none/ca.pem",
-        "--ca-key",
-        "/srv/none/ca.key",
-        "--out",
-        "/srv/none",
     ];
     let (code, _, err) = cli(&mut exec, &no_env, &args);
     assert_eq!(code, ExitCode::from(2));
@@ -319,6 +316,19 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
         err.starts_with("REFUSED: cannot read /srv/none/ca.pem"),
         "{err}"
     );
+    let args = [
+        "linux",
+        "verify-cert",
+        "--row",
+        "daemon",
+        "--cert",
+        "/srv/none/node.pem",
+        "--ca-cert",
+        "/srv/none/ca.pem",
+    ];
+    let (code, _, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!(code, ExitCode::from(2));
+    assert!(err.contains("--node-id"), "{err}");
 
     // A rollback of a host whose services are on: a dry run plans, exits 0.
     let mut exec = FakeExec::new(501);
