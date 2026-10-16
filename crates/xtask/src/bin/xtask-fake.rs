@@ -41,7 +41,7 @@
 //! `XTASK_FAKE_DEFECT` plants one defect of the real build: `ignores-override` (the
 //! build embeds the head whatever the override), `accepts-bad` (a malformed override
 //! builds), `fails-other` (a malformed override fails, but not on the override),
-//! `build-fails` (every build fails), `stamp-fails` (every build with an override
+//! `build-fails` (every build fails), `json-fails` (`kbf --version --json` exits 1), `stamp-fails` (every build with an override
 //! fails), `vanish` (the build stamped `b2b2b2b2b2b2` deletes the fake cargo, so the
 //! next build cannot start) or `version-fails` (`kbf-server` exits 1). Of the
 //! attestation store: `accepts-all` (every file verifies, whatever the flags) or
@@ -76,10 +76,10 @@ fn server(argv0: &str) -> ExitCode {
 
 /// `kbf --version` and `kbf --version --json`, from the files next to the fake.
 fn kbf(argv0: &str, args: &[String]) -> ExitCode {
-    if defect("version-fails") {
-        return ExitCode::FAILURE;
-    }
     if args == ["--version", "--json"] {
+        if defect("json-fails") {
+            return ExitCode::FAILURE;
+        }
         print!(
             "{}",
             std::fs::read_to_string(format!("{argv0}.json")).expect("json file")

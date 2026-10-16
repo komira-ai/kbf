@@ -335,6 +335,50 @@ fn check_json_passes_a_release_build_of_the_commit_and_names_what_is_wrong() {
 }
 
 #[test]
+fn check_json_reports_a_json_form_that_fails_or_is_not_an_object() {
+    // Catches: a `--version --json` that exits non-zero passed over, or reported as the
+    // plain form failing (the message names the form that failed); and valid JSON that
+    // is not an object (an array, a bare string) read as an object with no fields.
+    let bin = kbf("json-fails", &HEAD[..12], &identity(&HEAD[..12], "release"));
+    let out = xtask(Path::new("."), &["build-commit", "check", "--json"])
+        .arg(&bin)
+        .arg(HEAD)
+        .env("XTASK_FAKE_DEFECT", "json-fails")
+        .output()
+        .expect("run xtask");
+    assert_eq!(
+        outcome(out),
+        (
+            Some(1),
+            String::new(),
+            format!(
+                "xtask: {} --version --json: exit status: 1\n",
+                bin.display()
+            )
+        )
+    );
+    for json in ["[1]\n", "\"release\"\n"] {
+        let bin = kbf("json-array", &HEAD[..12], json);
+        let out = xtask(Path::new("."), &["build-commit", "check", "--json"])
+            .arg(&bin)
+            .arg(HEAD)
+            .output()
+            .expect("run xtask");
+        assert_eq!(
+            outcome(out),
+            (
+                Some(1),
+                String::new(),
+                format!(
+                    "xtask: --version --json: not a JSON object: {}\n",
+                    json.trim_end()
+                )
+            )
+        );
+    }
+}
+
+#[test]
 fn check_without_json_does_not_run_the_json_form() {
     // Catches: the identity check made implicit for every binary, so the kbf-server and
     // kbf-daemon checks (which print no JSON) would fail: here a `kbf` whose JSON is
