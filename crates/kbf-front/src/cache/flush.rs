@@ -107,13 +107,15 @@ type Waiting<'w> = (&'w ObjectId, &'w BTreeSet<ObjectId>);
 
 /// A cycle among the objects of `waits` neither `taken` nor `blocked`, when none of them
 /// is ready (each waits for at least one other of them): its objects in the order they
-/// were walked, and the entry of its oldest. `None` when there are no such objects.
+/// were walked, and the entry of its oldest. `None` when there are no such objects, or
+/// when the walk reaches one that waits for none of them.
 ///
 /// The walk starts at the oldest such object and follows, from each, its oldest wait
 /// among them until it meets an object it walked: the objects from there on are the
 /// cycle. An object not blocked waits only for objects taken or in `waits` and not
-/// blocked, and one not ready waits for one not taken, so the walk never ends short of
-/// a cycle; the objects before the cycle only wait on it, and are never chosen.
+/// blocked, and one not ready waits for one not taken, so as [`flush_order`] calls it
+/// (with none ready) the walk never ends short of a cycle; the objects before the cycle
+/// only wait on it, and are never chosen.
 fn cycle_among<'w>(
     waits: &'w BTreeMap<ObjectId, BTreeSet<ObjectId>>,
     taken: &BTreeSet<ObjectId>,
@@ -631,6 +633,11 @@ mod tests {
             order(&[(1, &[2]), (2, &[3]), (3, &[2])], 4),
             [(2, vec![]), (1, vec![2]), (3, vec![2])]
         );
+        // The walk from 1 enters the cycle at 3, not its oldest: the break is still at 2.
+        assert_eq!(
+            order(&[(1, &[3]), (2, &[3]), (3, &[2])], 4),
+            [(2, vec![]), (3, vec![2]), (1, vec![3])]
+        );
     }
 
     /// Catches the same fault with two disjoint cycles, each with a chain waiting on it:
@@ -660,6 +667,21 @@ mod tests {
                 (8, vec![7])
             ]
         );
+    }
+
+    /// Catches a walk that claims a cycle where there is none: from 1 it reaches 2, which
+    /// waits for no object still open, so there is no cycle to break; none with every
+    /// object taken; and none past a wait for an object not in `waits`.
+    #[test]
+    fn a_walk_that_reaches_a_ready_object_finds_no_cycle() {
+        let none = BTreeSet::new();
+        let chain = waits(&[(1, &[2]), (2, &[])]);
+        assert!(cycle_among(&chain, &none, &none).is_none());
+        let all = chain.keys().copied().collect();
+        assert!(cycle_among(&chain, &all, &none).is_none());
+        // A wait outside `waits` (never so when the caller found nothing blocked) ends
+        // the walk too.
+        assert!(cycle_among(&waits(&[(1, &[9])]), &none, &none).is_none());
     }
 
     /// Catches: a backoff that does not grow (a store outage met by a retry every
