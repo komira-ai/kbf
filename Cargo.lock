@@ -1407,8 +1407,10 @@ name = "kbf-cas-conformance"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "kbf-auth",
  "kbf-front",
  "kbf-proto",
+ "kbf-storage",
  "kbf-transfer",
  "kbf-types",
  "tokio",
@@ -1562,6 +1564,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "futures",
+ "http-body",
  "kbf-auth",
  "kbf-caps",
  "kbf-invocation",

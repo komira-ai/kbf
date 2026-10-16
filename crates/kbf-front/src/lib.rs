@@ -25,6 +25,11 @@
 //!   running twin before anything is queued
 //!   (`ARCHITECTURE.md#executing-an-action`).
 //!
+//! **The proxy.** [`Proxy`] answers a client's CAS, ByteStream and action-cache calls from
+//! storage nodes instead of the cache ([`routes_proxied`]; `kbf-server --storage`):
+//! ByteStream as a raw HTTP/2 pass-through that never holds a blob, the rest at the
+//! tonic level. See the `proxy` module for what it keeps and what it does not do yet.
+//!
 //! **Authorization.** Every service asks a `kbf_auth` authorizer before it serves a
 //! call ([`routes_with_authorizers`]; which call asks which is on each service and in
 //! `docs/reapi-auth.md`). The caller is whoever the server's authentication layer
@@ -52,6 +57,7 @@ mod execution;
 mod input_tree;
 mod meta_log;
 pub mod metrics;
+mod proxy;
 mod recorder;
 mod request_metadata;
 mod segments;
@@ -89,6 +95,7 @@ pub use crate::execution::{
 };
 pub use crate::input_tree::{ENTRY_OVERHEAD, InputTreeConfig};
 pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
+pub use crate::proxy::{Direction, Meter, Method, Owner, Owners, Proxy};
 pub use crate::recorder::{
     ActionLabel, DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording,
     listing, owner, wall_now,
@@ -212,6 +219,37 @@ where
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let capabilities = CapabilitiesService::new(true, Arc::clone(&authorizers));
     cache_routes(cache, capabilities, &authorizers, recorder).add_service(execution)
+}
+
+/// [`routes_recorded`] with the client's CAS, ByteStream and action-cache calls answered
+/// by the storage nodes of `proxy` ([`Proxy`]) instead of `cache`. `cache` still serves
+/// `Execution` (and so Execute's action-cache hits) until the scheduler uses storage.
+pub fn routes_proxied<M, O, D>(
+    proxy: &Proxy,
+    cache: Arc<Cache<M, O>>,
+    dispatch: Arc<D>,
+    closing: Closing,
+    authorizers: Arc<Authorizers>,
+    recorder: &Recorder,
+    default_memory: u64,
+) -> Routes
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+    D: Dispatch,
+{
+    let execution = ExecutionServer::new(
+        ExecutionService::with_authorizers(cache, dispatch, closing, Arc::clone(&authorizers))
+            .recording(recorder.clone())
+            .with_default_memory(default_memory),
+    )
+    .max_decoding_message_size(MAX_MESSAGE_BYTES)
+    .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    let capabilities = CapabilitiesService::new(true, authorizers);
+    proxy
+        .routes()
+        .add_service(CapabilitiesServer::new(capabilities))
+        .add_service(execution)
 }
 
 fn cache_routes<M, O>(

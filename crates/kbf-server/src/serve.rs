@@ -292,6 +292,27 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
+    bind_server_with_storage(cache, listeners, api, policy, None, shutdown)
+}
+
+/// [`bind_server_with_policy`], and with a `storage` node (`--storage`) the REAPI
+/// listener proxies the client's CAS, ByteStream and action-cache calls to it
+/// ([`kbf_front::Proxy`]) instead of answering them from `cache`.
+///
+/// # Errors
+/// As [`bind_server_with_policy`].
+pub fn bind_server_with_storage<M, O>(
+    cache: Arc<Cache<M, O>>,
+    listeners: Listeners,
+    api: Option<Api>,
+    policy: Policy,
+    storage: Option<tonic::transport::Endpoint>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
     let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
     let default_memory = listeners.memory_ladder.first();
     let farm = Arc::new(
@@ -377,14 +398,25 @@ where
     let (closer, closing) = kbf_front::closing();
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);
-    let reapi_routes = kbf_front::routes_recorded(
-        cache,
-        Arc::clone(&farm),
-        closing,
-        authorizers,
-        &recorder,
-        default_memory,
-    );
+    let reapi_routes = match storage {
+        Some(node) => kbf_front::routes_proxied(
+            &kbf_front::Proxy::to_endpoint(&node, Arc::clone(&authorizers)),
+            cache,
+            Arc::clone(&farm),
+            closing,
+            authorizers,
+            &recorder,
+            default_memory,
+        ),
+        None => kbf_front::routes_recorded(
+            cache,
+            Arc::clone(&farm),
+            closing,
+            authorizers,
+            &recorder,
+            default_memory,
+        ),
+    };
     let authenticate = AuthenticateLayer::new(policy.authenticator);
     // The layers wrap the REAPI routes (and the fallback for unknown paths) present
     // when they are applied; the health service, added after, is answered without
