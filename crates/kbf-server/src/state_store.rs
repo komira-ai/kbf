@@ -159,9 +159,15 @@ fn open_error(why: impl fmt::Display) -> StateError {
     StateError::Open(why.to_string())
 }
 
-fn open_sqlite(_path: &Path) -> Result<Arc<dyn Store>, StateError> {
-    // Not wired yet: the tests of the flag fail against this.
-    Err(StateError::NoBackend("sqlite"))
+fn open_sqlite(path: &Path) -> Result<Arc<dyn Store>, StateError> {
+    use kbf_state::SystemClock;
+    use kbf_state::sqlite::{Options, SqliteStore};
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| open_error(format!("{}: {e}", dir.display())))?;
+    }
+    let store = SqliteStore::open(path, Arc::new(SystemClock::default()), Options::default())
+        .map_err(open_error)?;
+    Ok(Arc::new(store))
 }
 
 #[cfg(not(feature = "postgres"))]
@@ -207,8 +213,12 @@ pub fn read_password(file: &Path) -> Result<String, StateError> {
 /// which every call from a gRPC handler or a start is.
 #[cfg(any(feature = "postgres", test))]
 fn off_runtime<T: Send>(call: impl FnOnce() -> T + Send) -> T {
-    // Not off the runtime yet: the test of the wrapper fails against this.
-    call()
+    std::thread::scope(|scope| {
+        scope
+            .spawn(call)
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
 }
 
 /// A store whose every call runs [`off_runtime`].
