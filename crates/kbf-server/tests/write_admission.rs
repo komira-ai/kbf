@@ -171,8 +171,8 @@ async fn concurrent_writes_stay_under_the_bytes_in_flight() {
 /// The signal that the waiting Writes' data has arrived is a count, not a pause: the
 /// connection goes through a forwarder that counts the bytes the client sends, and the
 /// test waits until the waiting Writes have sent their first message and a whole stream
-/// window each (the most a stream can send before the server reads again). Under a
-/// connection window smaller than that, the count is never reached.
+/// window each, less 5% (the most a stream can send before the server reads again is
+/// about that). Under a connection window smaller than that, the count is never reached.
 ///
 /// Catches: a connection window smaller than the streams the listener allows times
 /// the stream window. 1500 waiting Writes leave 1500 x 214,748 B (about 307 MiB) unread,
@@ -227,7 +227,10 @@ async fn more_waiting_writes_than_a_fixed_window_holds_all_finish() {
         }));
     }
     let window = u64::from(kbf_server::streams::flow_windows(10_000).stream);
-    let expected = WAITING as u64 * (SMALL_CHUNK as u64 + window);
+    // What the windows hold, less 5%: the streams send a little under their window (a
+    // run measured 99.7%), and the mutant's connection window stops them at 65%.
+    let held_in_windows = WAITING as u64 * (SMALL_CHUNK as u64 + window);
+    let expected = held_in_windows - held_in_windows / 20;
     let deadline = Instant::now() + Duration::from_secs(60);
     while sent.load(Ordering::SeqCst) - before < expected && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
