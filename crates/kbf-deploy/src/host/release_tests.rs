@@ -582,4 +582,13 @@ fn errors_name_what_is_wrong() {
             .starts_with("cannot read /usr/local/kbf/current: "),
         "{err}"
     );
+    fs::remove_file(exec.at("/usr/local/kbf")).expect("remove");
+    fs::create_dir(exec.at("/usr/local/kbf")).expect("dir");
+    fs::write(exec.at("/usr/local/kbf/releases"), "a file").expect("seed");
+    let err = gc_on(&mut exec, &root, 0).expect_err("releases is a file");
+    let want = format!(
+        "cannot read {}: ",
+        exec.at("/usr/local/kbf/releases").display()
+    );
+    assert!(err.to_string().starts_with(&want), "{err}");
 }

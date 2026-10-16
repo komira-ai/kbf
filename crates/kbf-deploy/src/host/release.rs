@@ -246,7 +246,8 @@ pub fn install<E: Exec>(
     );
     execute(&copy, RunAs::Root, mode, exec, &mut &mut *out)?;
     if mode == Mode::Apply {
-        verify(exec, &a.commit, &source.binary)?;
+        let bin = layout::release_file(&a.commit, layout::RELEASE_BINARY);
+        verify(inspect(exec, &bin)?, bin, &source.binary)?;
     }
     // Installing the current release again keeps its previous one.
     let previous = if state.current.as_ref() == Some(&a.commit) {
@@ -309,11 +310,11 @@ fn plan_copy<E: Exec>(
     Ok(planner.finish())
 }
 
-/// The copied binary's sha256 is the source's: read back from the host, after the copy
-/// and before any link names it.
-fn verify<E: Exec>(exec: &E, commit: &CommitId, source: &[u8]) -> Result<(), ReleaseError> {
-    let path = layout::release_file(commit, layout::RELEASE_BINARY);
-    let got = match inspect(exec, &path)? {
+/// The copied binary at `path` (`copied`, read back from the host after the copy and
+/// before any link names it) has the source's sha256. Not generic over the host, so one
+/// copy of it is measured for coverage, whichever host a test reads it from.
+fn verify(copied: Option<Entry>, path: HostPath, source: &[u8]) -> Result<(), ReleaseError> {
+    let got = match copied {
         Some(Entry::File { bytes, .. }) => sha256(&bytes),
         _ => "none (no file)".to_owned(),
     };
