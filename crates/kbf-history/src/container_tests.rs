@@ -301,3 +301,18 @@ fn a_block_outside_the_object_is_refused() {
         Err(FormatError::Truncated("block"))
     );
 }
+
+#[test]
+fn a_record_count_past_the_block_is_refused_without_reserving_it() {
+    // Catches: room reserved for the footer's record count before the block is split.
+    // The CRC guards against corruption, not a crafted object: a count of u32::MAX
+    // asked for about 100 GB and aborted the reading process.
+    let mut raw = Vec::new();
+    prost::encoding::encode_varint(1, &mut raw);
+    raw.push(b'x');
+    let stored = zstd(&raw);
+    assert_eq!(
+        decode_block(&entry_for(&stored, u32::MAX), &stored),
+        Err(FormatError::Mismatch("block record count"))
+    );
+}

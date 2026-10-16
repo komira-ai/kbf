@@ -338,7 +338,9 @@ pub fn decode_block(entry: &BlockEntry, stored: &[u8]) -> Result<Vec<Vec<u8>>, F
         )));
     }
     let mut rest = raw.as_slice();
-    let mut records = Vec::with_capacity(entry.records as usize);
+    // The count is the footer's claim, checked only after the split: reserve no more
+    // than the block can hold (each record takes at least its length byte).
+    let mut records = Vec::with_capacity((entry.records as usize).min(raw.len()));
     while !rest.is_empty() {
         let len = prost::encoding::decode_varint(&mut rest)
             .map_err(|e| FormatError::decode("record length", &e))?;
