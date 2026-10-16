@@ -67,7 +67,8 @@ role (`--role=all`). The flags are:
   comes from the standard `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` variables,
   never from the command line) or `file:///dir`, a directory on the local disk (under
   the fixed prefix `kbf/<log id>/`), which refuses writes that would leave its file
-  system under 1 GiB free; nothing is evicted; `--hot-store`, optionally, a `file://`
+  system with less than 5% of it (at least 1 GiB) free and evicts the least recently
+  used objects to stay above that; `--hot-store`, optionally, a `file://`
   directory on a fast disk in front of it (the write tier, sized from its filesystem's
   free space, at most `--hot-store-max-bytes`); and the metadata log's directory,
   `<hot store>/meta` or `--meta-dir`. There is no `memory:` store: a `file://` path on a

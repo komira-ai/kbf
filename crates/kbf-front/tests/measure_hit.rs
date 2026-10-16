@@ -21,7 +21,7 @@ use bytes::Bytes;
 use common::Blob;
 use kbf_front::{Cache, MemoryMetaLog, MetaLog, VerifiedBlob};
 use kbf_meta::{Retention, Role};
-use kbf_objstore::{Capabilities, FsStore, KeyPrefix, MemoryStore, ObjectStore};
+use kbf_objstore::{Capabilities, Floor, FsStore, KeyPrefix, MemoryStore, ObjectStore};
 use kbf_proto::reapi::{ActionResult, OutputFile};
 use kbf_types::Digest;
 
@@ -34,7 +34,7 @@ const HITS: usize = 10_000;
 /// Bytes per output blob.
 const OUTPUT_BYTES: usize = 4096;
 /// A floor every file system the tests run on meets: one byte.
-const FLOOR: u64 = 1;
+const FLOOR: Floor = Floor::Bytes(1);
 
 /// A fresh, absent directory for `name`, under the target directory.
 fn scratch(name: &str) -> PathBuf {

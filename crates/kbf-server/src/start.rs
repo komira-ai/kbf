@@ -12,20 +12,24 @@ use std::error::Error;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use kbf_front::Cache;
 use kbf_log::FarmLogId;
 use kbf_meta::Retention;
-use kbf_objstore::{FsStore, KeyPrefix, ObjectStore};
+use kbf_objstore::{
+    Floor, FsStore, FsStoreError, KeyPrefix, ObjectStore, objects_source, statvfs_source,
+};
 use kbf_store::StdFs;
 use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
 
 use crate::local::LocalStore;
 use crate::startup_pass::StartPass;
-use crate::stores::{COLD_FILE_MIN_FREE_BYTES, FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
+use crate::stores::{COLD_FILE_FLOOR, FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
 use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, bind_server_with_policy, s3_store};
 
@@ -106,7 +110,7 @@ where
     }
     match &stores.cold {
         StoreUri::File(dir) => {
-            let store = FsStore::open(dir, COLD_FILE_MIN_FREE_BYTES)?;
+            let store = open_cold_file(args, dir)?;
             let files = store.clone();
             over(
                 args,
@@ -122,6 +126,19 @@ where
             over(args, &stores, (store, None), &uri.prefix, shutdown).await
         }
     }
+}
+
+/// A `file://` cold store: its floor [`COLD_FILE_FLOOR`], or for tests
+/// `--cold-store-floor-bytes`; its filesystem the real one, or for tests one of
+/// `--cold-store-size-bytes`.
+fn open_cold_file(args: &Args, dir: &Path) -> Result<FsStore, FsStoreError> {
+    let floor = args
+        .cold_store_floor_bytes
+        .map_or(COLD_FILE_FLOOR, Floor::Bytes);
+    let space = args
+        .cold_store_size_bytes
+        .map_or_else(statvfs_source, objects_source);
+    FsStore::open_with_space(dir, floor, space)
 }
 
 /// Serves `store` under the Raft metadata log in `stores.meta_dir`, writing under the
@@ -143,7 +160,8 @@ where
 {
     let log = RaftMetaLog::open_dir(&stores.meta_dir, Retention::default(), prefix_root).await?;
     let (prefix, id) = (log.store_prefix(), log.log_id());
-    let pass = files.map(StartPass::over_raft);
+    let grace = Duration::from_millis(args.cold_store_evict_grace_ms);
+    let pass = files.map(|files| StartPass::over_raft(files, grace));
     let hot = stores.hot.as_ref();
     assemble(args, hot, log, store, prefix, id, shutdown, pass).await
 }
@@ -336,7 +354,7 @@ mod tests {
             .await
             .expect("open the log");
         let (prefix, id) = (log.store_prefix(), log.log_id());
-        let store = FsStore::open(&root.join("blobs"), 1).expect("open the store");
+        let store = FsStore::open(&root.join("blobs"), Floor::Bytes(1)).expect("open the store");
         let pending = || Ok(std::future::pending::<()>());
         let server = serve_with(&args, None, log, store, prefix, id, pending)
             .await
