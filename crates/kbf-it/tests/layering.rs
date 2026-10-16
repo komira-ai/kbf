@@ -40,6 +40,7 @@ const PURE: &[&str] = &[
     "kbf-estimator",
     "kbf-raft",
     "kbf-invocation",
+    "kbf-map",
 ];
 
 const FORBIDDEN: &[&str] = &[
