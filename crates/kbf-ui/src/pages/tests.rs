@@ -181,6 +181,19 @@ fn action_shows_its_answer_and_its_logs() {
     assert!(html.contains(&crate::html::escape(STDERR)), "{html}");
     // The stdout blob is gone: never asked for.
     assert_eq!(fake.seen().len(), 2, "{:?}", fake.seen());
+
+    // The same outputs, all of them kept: listed, with no note that the list is cut.
+    let mut doc = action(&json!(null));
+    doc["outputs_truncated"] = json!(false);
+    let base = format!("/v1/invocations/{ID}/actions/{}", action_digest());
+    let fake = Fake::default().json(&base, &doc);
+    let (status, html) = page(&fake, &path);
+    assert_eq!(status, 200, "{html}");
+    assert!(
+        html.contains("<code>out/gen</code> directory 70 B"),
+        "{html}"
+    );
+    assert!(!html.contains("the list is cut"), "{html}");
 }
 
 /// Catches: a large log read into the page, a log linked when the blob route is off,
