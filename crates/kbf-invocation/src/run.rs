@@ -45,19 +45,20 @@ pub struct Target {
     pub label: Text,
 }
 
-/// Whose outputs a `buck-out` path holds.
+/// Whose outputs a `buck-out` path holds, as buck2's roots tell them apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetKind {
-    /// A rule's target.
+    /// A rule's target (`art`, `gen`).
     Target,
-    /// An anonymous target.
+    /// An anonymous target (`art-anon`, `gen-anon`).
     Anon,
-    /// A BXL function.
+    /// A BXL function (`art-bxl`, `gen-bxl`).
     Bxl,
 }
 
 impl TargetKind {
-    /// The kind's name, as the API writes it: `target`, `anon`, `bxl`.
+    /// The kind's name, as the server's logs and the read API write it: `target`,
+    /// `anon`, `bxl`.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -164,7 +165,7 @@ pub struct NumaBytes {
 
 /// How an attempt was killed for memory, if it was.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MemoryKill {
+pub enum MemoryKillKind {
     /// Not killed for memory.
     None,
     /// The action passed its own memory limit.
@@ -173,7 +174,7 @@ pub enum MemoryKill {
     NodePressure,
 }
 
-impl MemoryKill {
+impl MemoryKillKind {
     /// Every kind, by the name the API writes: `none`, `own_limit`, `node_pressure`.
     pub const NAMED: [(Self, &'static str); 3] = [
         (Self::None, "none"),
@@ -194,35 +195,43 @@ impl MemoryKill {
 impl Attempt {
     /// How it was killed for memory, read from how it ended; `None` while it is held.
     #[must_use]
-    pub const fn memory_kill(&self) -> Option<MemoryKill> {
+    pub const fn memory_kill(&self) -> Option<MemoryKillKind> {
         Some(match &self.end {
             None => return None,
             Some(
                 AttemptEnd::Requeued(RequeueReason::OutOfMemory { .. })
                 | AttemptEnd::Failed(Failure::OutOfMemory, _),
-            ) => MemoryKill::OwnLimit,
+            ) => MemoryKillKind::OwnLimit,
             Some(
                 AttemptEnd::Requeued(RequeueReason::NodeMemoryPressure)
                 | AttemptEnd::Failed(Failure::NodeMemoryPressure, _),
-            ) => MemoryKill::NodePressure,
-            Some(_) => MemoryKill::None,
+            ) => MemoryKillKind::NodePressure,
+            Some(_) => MemoryKillKind::None,
         })
     }
 }
 
 /// How long an action's phases took, in microseconds; `None` for one not measured.
+///
+/// Every phase but `queue` is measured only once a lease has ended the operation
+/// (its end accepted or failed): until then a requeued lease's end is not the last
+/// one, and its run not the one that counts. So these four never change once set;
+/// `queue` only grows, by each lease granted after a requeue.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Durations {
-    /// From its first lease's queueing to its last lease's end: the whole time the
-    /// farm held it, requeues included. `None` until its last lease ends.
+    /// From its first lease's queueing to the end of the lease that ended the
+    /// operation: the whole time the farm held it, requeues included. `None` until a
+    /// lease ends it, and for an operation that ended with no lease ending it (given up
+    /// while queued again).
     pub wall: Option<u64>,
-    /// Queued to granted, summed over its leases. `None` without a lease.
+    /// Queued to granted, summed over its leases so far. `None` without a lease.
     pub queue: Option<u64>,
-    /// `execution_start` to `execution_completed` of its last lease's run.
+    /// `execution_start` to `execution_completed` of the run of the lease that ended
+    /// the operation.
     pub execution: Option<u64>,
-    /// `input_fetch_start` to `input_fetch_completed` of its last lease's run.
+    /// `input_fetch_start` to `input_fetch_completed` of that run.
     pub input_fetch: Option<u64>,
-    /// `output_upload_start` to `output_upload_completed` of its last lease's run.
+    /// `output_upload_start` to `output_upload_completed` of that run.
     pub output_upload: Option<u64>,
 }
 
@@ -296,9 +305,19 @@ impl ActionRow {
                     .saturating_sub(a.queued.unix_micros())
             })
             .fold(0_u64, u64::saturating_add);
+        let ended = matches!(
+            last.end,
+            Some(AttemptEnd::Accepted | AttemptEnd::Failed(..))
+        );
+        let Some(ended_at) = last.ended.filter(|_| ended) else {
+            return Durations {
+                queue: Some(queue),
+                ..Durations::default()
+            };
+        };
         let times = last.run.as_ref().map(|r| r.times).unwrap_or_default();
         Durations {
-            wall: between(Some(first.queued), last.ended),
+            wall: between(Some(first.queued), Some(ended_at)),
             queue: Some(queue),
             execution: between(times.execution_start, times.execution_completed),
             input_fetch: between(times.input_fetch_start, times.input_fetch_completed),

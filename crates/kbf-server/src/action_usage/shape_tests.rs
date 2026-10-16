@@ -705,6 +705,19 @@ fn a_compile_names_its_target_in_every_form() {
     );
 }
 
+/// Issue #796: an action whose outputs name two owners takes the target of the first
+/// pattern in pattern order (sorted), as `cfg` does. Catches: the target taken from
+/// another pattern (the last one, or the first the client sent), so one action's
+/// target changes with the order of its outputs.
+#[test]
+fn target_is_the_first_patterns() {
+    let z = format!("buck-out/v2/art/cell/{CFG}/pkg/__z__/o");
+    let a = format!("buck-out/v2/art/cell/{CFG}/pkg/__a__/o");
+    let want = label(TargetKind::Target, "cell//pkg:a");
+    assert_eq!(target_of_paths(&["cc"], &[&z, &a]), want, "sent last");
+    assert_eq!(target_of_paths(&["cc"], &[&a, &z]), want, "sent first");
+}
+
 /// Issue #796: anonymous and BXL owners give their kind. Catches: an anonymous
 /// target's glued configuration or attributes hash left in its label, its kind lost
 /// (read as a rule's target), the root-package form's glued content hash kept in the

@@ -77,6 +77,7 @@
 
 use std::fmt;
 
+pub use kbf_invocation::TargetKind;
 use sha2::{Digest as _, Sha256};
 
 /// The tag hashed ahead of every shape: a new one for any change to what a shape is.
@@ -101,29 +102,6 @@ impl ShapeKey {
 impl fmt::Display for ShapeKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&hex::encode(self.0))
-    }
-}
-
-/// Whose outputs a `buck-out` path holds, as buck2's roots tell them apart.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TargetKind {
-    /// A rule's target (`art`, `gen`).
-    Target,
-    /// An anonymous target (`art-anon`, `gen-anon`).
-    Anon,
-    /// A BXL function (`art-bxl`, `gen-bxl`).
-    Bxl,
-}
-
-impl TargetKind {
-    /// The kind's name, as logs and the read API write it: `target`, `anon`, `bxl`.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Target => "target",
-            Self::Anon => "anon",
-            Self::Bxl => "bxl",
-        }
     }
 }
 

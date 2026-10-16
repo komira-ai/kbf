@@ -146,7 +146,10 @@ fn every_outcome_is_recorded() {
         ]
     );
     assert_eq!(inv.counts().failed, 4);
-    assert_eq!(inv.rows()[1].listing.as_ref().map(|l| l.exit_code), Some(3));
+    assert_eq!(
+        inv.rows()[1].listing.as_ref().map(|l| l.exit_code),
+        Some(Some(3))
+    );
 }
 
 /// Catches attempts out of grant order, a requeue that does not end its lease or names

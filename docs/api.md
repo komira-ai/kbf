@@ -375,7 +375,8 @@ It is matched as the bytes of the path: a percent-encoded character (`%3C`, `%6F
   "collisions": ["0b8c...~2"],
   "links": {"actions": "/v1/invocations/0b8c.../actions", "artifacts": "...", "logs": "...",
             "metrics": "..."},
-  "phase_totals": {"execution_ms": 912345, "queue_ms": 20431},
+  "phase_totals": {"execution_ms": {"sum": 912345, "rows": 769},
+                   "queue_ms": {"sum": 20431, "rows": 769}},
   "top_slowest": {
     "wall_ms": [{"action": "<digest>", "wall_ms": 61234, "href": "/v1/invocations/0b8c.../actions/<digest>"}],
     "execution_ms": [{"action": "<digest>", "execution_ms": 60011, "href": "..."}]}
@@ -388,8 +389,9 @@ no operation in flight, else `open`. `url` is `null` (the link template,
 `--invocation-url-template`, is planned).
 
 **`phase_totals`** sums, over the rows the farm ran for this invocation (`how` =
-`ran`), each phase's milliseconds (see `durations` below; `wall_ms` is not summed); a
-phase no such row measured is left out. **`top_slowest`** lists, for `wall_ms` and for
+`ran`), each phase's milliseconds (see `durations` below; `wall_ms` is not summed):
+`sum`, over the rows that measured the phase, and `rows`, how many did (a mean is
+`sum / rows`); a phase no such row measured is left out. **`top_slowest`** lists, for `wall_ms` and for
 `execution_ms`, the 20 such rows that took longest, longest first (ties in row order),
 each with its `action`, its milliseconds and its `href`. Both are computed from the
 rows at each request.
@@ -414,10 +416,14 @@ own route; then the keys added since (none of the keys above changed):
   read, never guessed. The row's `target` above is what the client's
   `RequestMetadata` said, a hint only (buck2 sends none).
 - `durations`, in whole milliseconds, each left out when not measured: `wall_ms`, from
-  the first lease's queueing to the last lease's end (requeues included; left out
-  until the last lease ends); `queue_ms`, queued to granted summed over its leases;
+  the first lease's queueing to the end of the lease that ended the operation
+  (requeues included); `queue_ms`, queued to granted summed over its leases so far;
   `execution_ms`, `input_fetch_ms` and `output_upload_ms`, each `start` to `completed`
-  of the REAPI times of its last lease's run.
+  of the REAPI times of the run of the lease that ended the operation. All but
+  `queue_ms` are left out until a lease ends the operation (accepted or failed; a
+  requeued lease's end is not the last), and for one that ended with no lease ending
+  it, so once given they never change; `queue_ms` only grows, by each lease granted
+  after a requeue.
 - on each attempt: `memory_kill` once it ended (`none`, `own_limit` or
   `node_pressure`, read from how it ended); `booked_memory_bytes` for a lease killed
   for memory (the one that ended the operation too), `cap_bytes` for an own-limit kill
@@ -466,9 +472,11 @@ given up for that reason (`silent`, `replaced`, `reconnected`, `not_started`,
 then OK is kept by `out_of_memory`. `?memory_kill=own_limit` (or `node_pressure`) keeps
 the rows with a lease killed that way; `none`, the rows with no lease killed for
 memory. `?sort=<phase>` lists the rows that measured that phase (`durations` above),
-longest first, ties in row order; its pages resume after the last row listed, so a row
-whose duration grows past that point after it was passed is not listed again. Filters
-combine, and `next_page` carries them all.
+longest first, ties in row order; its pages resume after the last row listed. No row
+is listed twice; a row whose `queue_ms` grows past that point after it was passed (it
+was requeued and granted again) is not listed again, and a row that measures the
+phase only after the pages passed its place (its operation ended since) is not listed.
+Filters combine, and `next_page` carries them all.
 
 **Pages.** `/actions`, `/artifacts` and `/logs` take `?page_size=` (100 by default,
 1 to 1000) and `?page_token=`, the `next_page_token` of the page before, with the same

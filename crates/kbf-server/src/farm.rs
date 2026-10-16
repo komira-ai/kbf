@@ -602,7 +602,10 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         let ran_on = (worker, stamp);
         // Read before `outcome`, which drops a failed run's result.
         let measured = Measured::of(&result);
-        let run = recorded.then(|| run_record::of(&result, worker, stamp, SystemTime::now()));
+        let run = recorded.then(|| {
+            let usage = measured.as_ref().map(Measured::usage);
+            run_record::of(&result, usage, stamp, SystemTime::now())
+        });
         let (outcome, mut detail) = self.outcome(lease, ran_on, result).await;
 
         let now = self.now();

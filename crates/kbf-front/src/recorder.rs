@@ -530,7 +530,7 @@ pub fn listing(result: Option<Digest>, r: &reapi::ActionResult) -> Listing {
     let log = |d: Option<&reapi::Digest>| d.and_then(|d| wire::digest(Some(d)).ok());
     Listing {
         result,
-        exit_code: r.exit_code,
+        exit_code: result.map(|_| r.exit_code),
         outputs: files.chain(directories).take(OUTPUTS_PER_ROW + 1).collect(),
         stdout: log(r.stdout_digest.as_ref()),
         stderr: log(r.stderr_digest.as_ref()),

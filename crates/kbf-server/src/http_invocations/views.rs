@@ -2,6 +2,9 @@
 //! `docs/design/invocations.md` sections 4.2 and 4.4), and the blobs it lists, whose
 //! `available` is filled in once the cache has been asked.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
 use kbf_invocation::{
     ActionRow, ActionShape, Attempt, AttemptEnd, Counts, Durations, Histogram, How, Invocation,
     Outcome, Phase, Run, RunUsage, State, Text, Usage, WallTime, failure_name, requeue_name,
@@ -91,13 +94,6 @@ impl Builder {
     }
 }
 
-/// The answer to `request` from `inv`, which holds `serial` and whose instance
-/// `names` the reader was allowed on; `blobs_on` says whether the blob route answers,
-/// and `now` is the wall time the record's state is read at.
-///
-/// # Errors
-/// [`still_authorized`]'s; [`Bad::NotFound`] for an action with no row; a page token's
-/// ([`Token::decode`]).
 /// The invocation's own answer (section 4.2).
 pub(super) fn invocation(inv: &Invocation, base: &str, now: WallTime) -> Value {
     let (tool, tool_version) = inv.tool();
@@ -106,6 +102,7 @@ pub(super) fn invocation(inv: &Invocation, base: &str, now: WallTime) -> Value {
         State::Open => "open",
         State::Idle => "idle",
     };
+    let summary = Summary::of(inv);
     json!({
         "id": inv.key().to_string(),
         "url": Value::Null,
@@ -127,10 +124,10 @@ pub(super) fn invocation(inv: &Invocation, base: &str, now: WallTime) -> Value {
             "logs": format!("{base}/logs"),
             "metrics": format!("{base}/metrics"),
         },
-        "phase_totals": phase_totals(inv),
+        "phase_totals": summary.totals(),
         "top_slowest": {
-            "wall_ms": slowest(inv, Phase::Wall, base),
-            "execution_ms": slowest(inv, Phase::Execution, base),
+            "wall_ms": summary.wall.list(inv, Phase::Wall, base),
+            "execution_ms": summary.execution.list(inv, Phase::Execution, base),
         },
     })
 }
@@ -138,48 +135,100 @@ pub(super) fn invocation(inv: &Invocation, base: &str, now: WallTime) -> Value {
 /// How many actions `top_slowest` lists per phase.
 pub(crate) const TOP_SLOWEST: usize = 20;
 
-/// The rows the farm ran for this invocation (`how` = `ran`): a joined row's leases
-/// are its twin's, counted where the twin ran.
-fn ran_rows(inv: &Invocation) -> impl Iterator<Item = &ActionRow> {
-    inv.rows().iter().filter(|r| r.how == How::Ran)
+/// The phases `phase_totals` sums: every one but wall, whose sum over rows that ran
+/// side by side means nothing.
+const TOTALLED: [Phase; 4] = [
+    Phase::Queue,
+    Phase::Execution,
+    Phase::InputFetch,
+    Phase::OutputUpload,
+];
+
+/// What the summary reads from the rows the farm ran for this invocation (`how` =
+/// `ran`; a joined row's leases are its twin's, counted where the twin ran), in one
+/// pass with each row's durations derived once: it runs under the records' lock.
+struct Summary {
+    /// Per phase of [`TOTALLED`]: its microseconds summed over the rows that measured
+    /// it, and how many did.
+    totals: [(u64, u64); 4],
+    wall: Slowest,
+    execution: Slowest,
 }
 
-/// Each phase's milliseconds summed over the `ran` rows that measured it, and how
-/// many did; a phase none measured is left out.
-fn phase_totals(inv: &Invocation) -> Value {
-    let mut totals = Map::new();
-    for (phase, name) in Phase::NAMED.into_iter().filter(|(p, _)| *p != Phase::Wall) {
-        let measured: Vec<u64> = ran_rows(inv)
-            .filter_map(|r| r.durations().of(phase))
-            .collect();
-        if !measured.is_empty() {
-            let sum = measured.iter().fold(0_u64, |a, &v| a.saturating_add(v));
-            totals.insert(name.to_owned(), (sum / 1_000).into());
+impl Summary {
+    fn of(inv: &Invocation) -> Self {
+        let mut summary = Self {
+            totals: [(0, 0); 4],
+            wall: Slowest::default(),
+            execution: Slowest::default(),
+        };
+        for (i, r) in inv.rows().iter().enumerate() {
+            if r.how != How::Ran {
+                continue;
+            }
+            let d = r.durations();
+            for (total, phase) in summary.totals.iter_mut().zip(TOTALLED) {
+                if let Some(micros) = d.of(phase) {
+                    *total = (total.0.saturating_add(micros), total.1 + 1);
+                }
+            }
+            summary.wall.offer(d.wall, i);
+            summary.execution.offer(d.execution, i);
+        }
+        summary
+    }
+
+    /// `phase_totals`: per phase some row measured, its milliseconds summed over the
+    /// rows that measured it (`sum`) and how many did (`rows`); a phase none measured
+    /// is left out.
+    fn totals(&self) -> Value {
+        let mut totals = Map::new();
+        for (&(sum, rows), phase) in self.totals.iter().zip(TOTALLED) {
+            if rows > 0 {
+                totals.insert(
+                    phase.name().to_owned(),
+                    json!({"sum": sum / 1_000, "rows": rows}),
+                );
+            }
+        }
+        Value::Object(totals)
+    }
+}
+
+/// The [`TOP_SLOWEST`] rows that took longest in one phase, kept while the rows are
+/// read: a heap whose top is the one to drop next (the shortest, the later row of a
+/// tie).
+#[derive(Default)]
+struct Slowest(BinaryHeap<(Reverse<u64>, usize)>);
+
+impl Slowest {
+    /// Row `i`, which took `micros` (if it measured the phase).
+    fn offer(&mut self, micros: Option<u64>, i: usize) {
+        let Some(micros) = micros else {
+            return;
+        };
+        self.0.push((Reverse(micros), i));
+        if self.0.len() > TOP_SLOWEST {
+            self.0.pop();
         }
     }
-    Value::Object(totals)
-}
 
-/// The [`TOP_SLOWEST`] `ran` rows that took longest in `phase`, longest first (ties in
-/// row order): each one's action, its milliseconds and its `href`.
-fn slowest(inv: &Invocation, phase: Phase, base: &str) -> Value {
-    let mut found: Vec<(u64, usize, &ActionRow)> = ran_rows(inv)
-        .enumerate()
-        .filter_map(|(i, r)| Some((r.durations().of(phase)?, i, r)))
-        .collect();
-    found.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    found
-        .into_iter()
-        .take(TOP_SLOWEST)
-        .map(|(micros, _, r)| {
-            let action = digest_text(&r.action);
-            json!({
-                "action": action,
-                phase.name(): micros / 1_000,
-                "href": format!("{base}/actions/{action}"),
+    /// The rows kept, longest first (ties in row order): each one's action, its
+    /// milliseconds in `phase` and its `href`.
+    fn list(&self, inv: &Invocation, phase: Phase, base: &str) -> Value {
+        let mut kept: Vec<(Reverse<u64>, usize)> = self.0.iter().copied().collect();
+        kept.sort_unstable();
+        kept.into_iter()
+            .map(|(Reverse(micros), i)| {
+                let action = digest_text(&inv.rows()[i].action);
+                json!({
+                    "action": action,
+                    phase.name(): micros / 1_000,
+                    "href": format!("{base}/actions/{action}"),
+                })
             })
-        })
-        .collect()
+            .collect()
+    }
 }
 
 fn counts(c: &Counts) -> Value {

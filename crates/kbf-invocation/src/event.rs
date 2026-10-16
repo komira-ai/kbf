@@ -349,8 +349,9 @@ pub struct Listing {
     /// The ActionResult blob; `None` for a timed-out run's partial result, which is
     /// never stored (its stdout and stderr are).
     pub result: Option<Digest>,
-    /// The action's exit code.
-    pub exit_code: i32,
+    /// The action's exit code; `None` for a timed-out run's partial result, whose
+    /// action was stopped and has no exit code.
+    pub exit_code: Option<i32>,
     /// Its output files and directories, in the result's order. A row keeps the first
     /// [`crate::OUTPUTS_PER_ROW`].
     pub outputs: Vec<Output>,

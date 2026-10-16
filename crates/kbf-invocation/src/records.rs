@@ -540,9 +540,7 @@ impl Records {
                 // A hit adds a row only for an action the record has not seen.
                 if inv.row_of(action).is_none() {
                     let mut row = ActionRow::new(*action, call, How::CacheHit, None);
-                    row.outcome = Some(Outcome::Ok {
-                        exit_code: listing.exit_code,
-                    });
+                    row.outcome = listing.exit_code.map(|exit_code| Outcome::Ok { exit_code });
                     row.set_listing(listing.clone(), OUTPUTS_PER_ROW);
                     self.add_row(&key, row);
                 }
@@ -581,11 +579,10 @@ impl Records {
             Ok(operation) => operation,
             Err(result) => {
                 let inv = self.record(key);
-                inv.counts.failed += u64::from(result.exit_code != 0);
+                inv.counts.failed += u64::from(result.exit_code.is_some_and(|c| c != 0));
                 if let Some(i) = index {
-                    inv.rows[i].outcome = Some(Outcome::Ok {
-                        exit_code: result.exit_code,
-                    });
+                    inv.rows[i].outcome =
+                        result.exit_code.map(|exit_code| Outcome::Ok { exit_code });
                     self.fill_listing(key, i, (**result).clone());
                 }
                 return;

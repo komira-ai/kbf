@@ -6,8 +6,8 @@ use std::collections::BTreeSet;
 
 use kbf_front::InvocationId as AcceptedId;
 use kbf_invocation::{
-    ActionRow, AttemptEnd, How, Invocation, InvocationId, MemoryKill, Outcome, Phase, RecordKey,
-    WallTime, requeue_name,
+    ActionRow, AttemptEnd, How, Invocation, InvocationId, MemoryKillKind, Outcome, Phase,
+    REQUEUE_NAMES, RecordKey, WallTime, requeue_name,
 };
 use kbf_types::Digest;
 use serde_json::{Map, Value};
@@ -89,20 +89,6 @@ fn outcome_name(outcome: OutcomeFilter) -> &'static str {
         .map_or("", |(_, n)| n)
 }
 
-/// The names `?requeue_reason=` takes: every `requeue_name`.
-const REQUEUE_REASONS: [&str; 10] = [
-    "silent",
-    "replaced",
-    "reconnected",
-    "not_started",
-    "session_switch",
-    "out_of_memory",
-    "node_memory_pressure",
-    "restarted",
-    "lost",
-    "infra",
-];
-
 /// The name of `how`, as the API writes it.
 pub(super) fn how_name(how: How) -> &'static str {
     HOWS.iter().find(|(h, _)| *h == how).map_or("", |(_, n)| n)
@@ -116,7 +102,7 @@ pub(crate) struct Filter {
     outcome: Option<OutcomeFilter>,
     how: Option<How>,
     requeue_reason: Option<&'static str>,
-    memory_kill: Option<MemoryKill>,
+    memory_kill: Option<MemoryKillKind>,
     sort: Option<Phase>,
 }
 
@@ -132,7 +118,7 @@ impl Filter {
         let killed = self.memory_kill.is_none_or(|want| {
             let kills = || row.attempts.iter().filter_map(|a| a.memory_kill());
             match want {
-                MemoryKill::None => kills().all(|k| k == MemoryKill::None),
+                MemoryKillKind::None => kills().all(|k| k == MemoryKillKind::None),
                 kind => kills().any(|k| k == kind),
             }
         });
@@ -170,7 +156,7 @@ impl Filter {
     fn later(self) -> impl Iterator<Item = (&'static str, &'static str)> {
         [
             ("requeue_reason", self.requeue_reason),
-            ("memory_kill", self.memory_kill.map(MemoryKill::name)),
+            ("memory_kill", self.memory_kill.map(MemoryKillKind::name)),
             ("sort", self.sort.map(Phase::name)),
         ]
         .into_iter()
@@ -313,16 +299,16 @@ fn parse_query(text: &str, route: Route) -> Result<Option<PageQuery>, Bad> {
                 })?);
             }
             "requeue_reason" if filtered => {
-                let found = REQUEUE_REASONS.iter().find(|n| **n == value);
+                let found = REQUEUE_NAMES.iter().find(|n| **n == value);
                 query.filter.requeue_reason = Some(*found.ok_or_else(|| {
                     Bad::Invalid(format!(
                         "requeue_reason={value:?}: one of {}",
-                        REQUEUE_REASONS.join(", ")
+                        REQUEUE_NAMES.join(", ")
                     ))
                 })?);
             }
             "memory_kill" if filtered => {
-                let found = MemoryKill::NAMED.iter().find(|(_, n)| *n == value);
+                let found = MemoryKillKind::NAMED.iter().find(|(_, n)| *n == value);
                 query.filter.memory_kill = Some(found.map(|(k, _)| *k).ok_or_else(|| {
                     Bad::Invalid(format!(
                         "memory_kill={value:?}: one of none, own_limit, node_pressure"
@@ -353,6 +339,24 @@ fn parse_query(text: &str, route: Route) -> Result<Option<PageQuery>, Bad> {
 /// at the end, so a position stays valid while the record is held.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Cursor {
+    /// A route walked in row order, one entry at a time.
+    Walk(Walk),
+    /// `/actions?sort=<phase>`: the duration (microseconds) and index of the last
+    /// row listed, `None` before the first page. Rows come longest first, ties in row
+    /// order; a page is read in one pass ([`sorted`]). Only `queue` changes once
+    /// measured, and only grows (by each lease granted after a requeue): a row whose
+    /// queueing grows past the cursor's after it was passed is not listed again, and
+    /// none is listed twice. The other phases are measured once the operation has
+    /// ended and never change.
+    Sorted {
+        phase: Phase,
+        after: Option<(u64, usize)>,
+    },
+}
+
+/// A position in a route walked in row order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Walk {
     /// `/actions`: the next row to look at.
     Actions { row: usize },
     /// `/artifacts`: the next output of a row to look at.
@@ -360,11 +364,6 @@ pub(crate) enum Cursor {
     /// `/logs`: the next row to look at; `rest: None` while it lists failed rows,
     /// then `Some(n)` with `n` the number of rows there were when those ran out.
     Logs { row: usize, rest: Option<usize> },
-    /// `/actions?sort=`: the duration (microseconds) and index of the last row
-    /// listed, `None` before the first page. Rows come longest first, ties in row
-    /// order; a row whose duration grows past the cursor's after it was passed is not
-    /// listed again.
-    Sorted { after: Option<(u64, usize)> },
 }
 
 /// One entry a cursor found: a row, or one output of a row.
@@ -416,22 +415,24 @@ impl Cursor {
     /// Where a route's first page starts, in the order `filter` asks.
     const fn start(route: Route, filter: Filter) -> Self {
         match (route, filter.sort) {
-            (Route::Artifacts, _) => Self::Artifacts { row: 0, output: 0 },
-            (Route::Logs, _) => Self::Logs { row: 0, rest: None },
-            (_, Some(_)) => Self::Sorted { after: None },
-            _ => Self::Actions { row: 0 },
+            (Route::Artifacts, _) => Self::Walk(Walk::Artifacts { row: 0, output: 0 }),
+            (Route::Logs, _) => Self::Walk(Walk::Logs { row: 0, rest: None }),
+            (_, Some(phase)) => Self::Sorted { phase, after: None },
+            _ => Self::Walk(Walk::Actions { row: 0 }),
         }
     }
 
     /// The route's name, as a page token carries it.
     const fn kind(self) -> &'static str {
         match self {
-            Self::Actions { .. } | Self::Sorted { .. } => "actions",
-            Self::Artifacts { .. } => "artifacts",
-            Self::Logs { .. } => "logs",
+            Self::Walk(Walk::Actions { .. }) | Self::Sorted { .. } => "actions",
+            Self::Walk(Walk::Artifacts { .. }) => "artifacts",
+            Self::Walk(Walk::Logs { .. }) => "logs",
         }
     }
+}
 
+impl Walk {
     /// The first entry at or after the cursor that `filter` keeps, and the cursor just
     /// after it; `None` when there is none.
     ///
@@ -442,14 +443,6 @@ impl Cursor {
     /// outcome put it when the page that passed it was read.
     fn next(self, rows: &[ActionRow], filter: Filter) -> Option<(Entry, Self)> {
         match self {
-            Self::Sorted { after } => {
-                let phase = filter.sort?;
-                let &[(value, i)] = sorted(rows, filter, phase, after, 1).as_slice() else {
-                    return None;
-                };
-                let after = Some((value, i));
-                Some((Entry::Row(i), Self::Sorted { after }))
-            }
             Self::Actions { row } => {
                 let i = (row..rows.len()).find(|&i| filter.keeps(&rows[i]))?;
                 Some((Entry::Row(i), Self::Actions { row: i + 1 }))
@@ -518,10 +511,10 @@ impl Token {
     /// The token as it is sent.
     pub(crate) fn encode(self) -> String {
         let (a, b) = match self.cursor {
-            Cursor::Actions { row } => (row, 0),
-            Cursor::Artifacts { row, output } => (row, output as u64),
-            Cursor::Logs { row, rest } => (row, rest.map_or(0, |n| n as u64 + 1)),
-            Cursor::Sorted { after } => after.map_or((0, 0), |(value, row)| (row + 1, value)),
+            Cursor::Walk(Walk::Actions { row }) => (row, 0),
+            Cursor::Walk(Walk::Artifacts { row, output }) => (row, output as u64),
+            Cursor::Walk(Walk::Logs { row, rest }) => (row, rest.map_or(0, |n| n as u64 + 1)),
+            Cursor::Sorted { after, .. } => after.map_or((0, 0), |(value, row)| (row + 1, value)),
         };
         let text = format!(
             "{TOKEN_VERSION}:{}:{}:{}:{a}:{b}",
@@ -574,24 +567,27 @@ impl Token {
             b.parse().map_err(|_| malformed())?,
         );
         let rows = inv.rows().len();
-        if let Cursor::Sorted { .. } = start {
-            if a > rows {
-                return Err(malformed());
+        let walk = match start {
+            Cursor::Sorted { phase, .. } => {
+                if a > rows {
+                    return Err(malformed());
+                }
+                let after = a.checked_sub(1).map(|row| (b, row));
+                return Ok(Cursor::Sorted { phase, after });
             }
-            let after = a.checked_sub(1).map(|row| (b, row));
-            return Ok(Cursor::Sorted { after });
-        }
+            Cursor::Walk(walk) => walk,
+        };
         let rest = b.checked_sub(1);
         if a > rows || rest.is_some_and(|n| n > rows as u64) {
             return Err(malformed());
         }
         // Both fit: `b` is at most one past the rows.
         let (b, rest) = (b as usize, rest.map(|n| n as usize));
-        Ok(match start {
-            Cursor::Actions { .. } | Cursor::Sorted { .. } => Cursor::Actions { row: a },
-            Cursor::Artifacts { .. } => Cursor::Artifacts { row: a, output: b },
-            Cursor::Logs { .. } => Cursor::Logs { row: a, rest },
-        })
+        Ok(Cursor::Walk(match walk {
+            Walk::Actions { .. } => Walk::Actions { row: a },
+            Walk::Artifacts { .. } => Walk::Artifacts { row: a, output: b },
+            Walk::Logs { .. } => Walk::Logs { row: a, rest },
+        }))
     }
 }
 
@@ -693,28 +689,37 @@ fn paged(
         None => start,
     };
     let rows = inv.rows();
-    let found: Vec<Entry> = match (cursor, page.filter.sort) {
-        // One pass over the rows for the page, not one per entry.
-        (Cursor::Sorted { after }, Some(phase)) => {
-            let found = sorted(rows, page.filter, phase, after, page.size);
+    let (found, more): (Vec<Entry>, bool) = match cursor {
+        // One pass over the rows for the page and whether another follows (one row
+        // past it), not one per entry.
+        Cursor::Sorted { phase, after } => {
+            let mut found = sorted(rows, page.filter, phase, after, page.size + 1);
+            let more = found.len() > page.size;
+            found.truncate(page.size);
             if let Some(&last) = found.last() {
-                cursor = Cursor::Sorted { after: Some(last) };
+                cursor = Cursor::Sorted {
+                    phase,
+                    after: Some(last),
+                };
             }
-            found.into_iter().map(|(_, i)| Entry::Row(i)).collect()
+            (
+                found.into_iter().map(|(_, i)| Entry::Row(i)).collect(),
+                more,
+            )
         }
-        _ => {
+        Cursor::Walk(mut walk) => {
             let mut found = Vec::new();
             while found.len() < page.size {
-                let Some((entry, next)) = cursor.next(rows, page.filter) else {
+                let Some((entry, next)) = walk.next(rows, page.filter) else {
                     break;
                 };
                 found.push(entry);
-                cursor = next;
+                walk = next;
             }
-            found
+            cursor = Cursor::Walk(walk);
+            (found, walk.next(rows, page.filter).is_some())
         }
     };
-    let more = cursor.next(rows, page.filter).is_some();
     let mut entries = Vec::new();
     for entry in found {
         let at = format!("/{}/{}", start.kind(), entries.len());

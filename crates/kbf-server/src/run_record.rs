@@ -7,50 +7,45 @@
 use std::time::SystemTime;
 
 use kbf_invocation::{NumaBytes, ReapiTimes, Run, RunUsage, WallTime};
-use kbf_proto::reapi::ActionResult;
+use kbf_proto::reapi::ExecutedActionMetadata;
 use kbf_proto::worker::{self, ResourceUsage};
-use kbf_types::{MemoryKill, MemoryRun, WorkerId};
+use kbf_types::{MemoryKill, MemoryRun};
 use prost_types::Timestamp;
 
 use crate::stamp::Stamp;
 
-/// What `result`, reported by `node` for a run whose server times are `stamp` and
-/// taken in at `received`, measured. The times are those its `ActionResult` would
-/// carry once stamped ([`Stamp::apply`]): the daemon's own, `queued` from the server,
-/// and the worker start and completion the server saw when the daemon left them out
-/// (a killed or lost run reports none of its own).
+/// What `result`, for a run whose server times are `stamp` and taken in at
+/// `received`, measured; `usage` is the `ResourceUsage` its result carried, as
+/// [`crate::action_usage::Measured`] decoded it. The times are those its
+/// `ActionResult` would carry once stamped ([`Stamp::times`]): the daemon's own,
+/// `queued` from the server, and the worker start and completion the server saw when
+/// the daemon left them out (a killed or lost run reports none of its own).
 pub(crate) fn of(
     result: &worker::Result,
-    node: &WorkerId,
+    usage: Option<&ResourceUsage>,
     stamp: Stamp,
     received: SystemTime,
 ) -> Run {
-    let mut stamped = ActionResult {
-        execution_metadata: result
-            .action_result
-            .as_ref()
-            .and_then(|r| r.execution_metadata.clone()),
-        ..ActionResult::default()
-    };
-    stamp.apply(&mut stamped, node, received);
-    let m = stamped.execution_metadata.unwrap_or_default();
-    let usage = result
+    let none = ExecutedActionMetadata::default();
+    let m = result
         .action_result
         .as_ref()
-        .and_then(ResourceUsage::in_result);
+        .and_then(|r| r.execution_metadata.as_ref())
+        .unwrap_or(&none);
+    let stamped = stamp.times(m, received);
     Run {
         times: ReapiTimes {
-            queued: wall(m.queued_timestamp),
-            worker_start: wall(m.worker_start_timestamp),
+            queued: wall(Some(stamped.queued)),
+            worker_start: wall(Some(stamped.worker_start)),
             input_fetch_start: wall(m.input_fetch_start_timestamp),
             input_fetch_completed: wall(m.input_fetch_completed_timestamp),
             execution_start: wall(m.execution_start_timestamp),
             execution_completed: wall(m.execution_completed_timestamp),
             output_upload_start: wall(m.output_upload_start_timestamp),
             output_upload_completed: wall(m.output_upload_completed_timestamp),
-            worker_completed: wall(m.worker_completed_timestamp),
+            worker_completed: wall(Some(stamped.worker_completed)),
         },
-        usage: usage.as_ref().map(run_usage),
+        usage: usage.map(run_usage),
         booked_memory_bytes: None,
         cap_bytes: None,
     }
@@ -70,7 +65,8 @@ pub(crate) fn killed(run: Run, killed: &MemoryRun) -> Run {
 }
 
 fn run_usage(u: &ResourceUsage) -> RunUsage {
-    let c = u.cgroup.clone().unwrap_or_default();
+    let none = worker::CgroupUsage::default();
+    let c = u.cgroup.as_ref().unwrap_or(&none);
     RunUsage {
         wall_micros: u.wall_micros,
         cpu_usage_micros: c.cpu_usage_micros,
@@ -103,8 +99,9 @@ fn wall(t: Option<Timestamp>) -> Option<WallTime> {
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
-    use kbf_proto::reapi::ExecutedActionMetadata;
+    use kbf_proto::reapi::ActionResult;
     use kbf_proto::worker::{CgroupUsage, NumaNodeBytes};
+    use kbf_types::WorkerId;
 
     use super::*;
 
@@ -159,7 +156,11 @@ mod tests {
             queued: secs(1),
             started: secs(50),
         };
-        let run = of(&result, &WorkerId::new("n"), stamp, secs(60));
+        let decoded = result
+            .action_result
+            .as_ref()
+            .and_then(ResourceUsage::in_result);
+        let run = of(&result, decoded.as_ref(), stamp, secs(60));
         let times = run.times.named().map(|(_, t)| t);
         assert_eq!(
             times,
@@ -199,7 +200,7 @@ mod tests {
     fn a_report_without_a_result_has_the_server_s_times_only() {
         let run = of(
             &worker::Result::default(),
-            &WorkerId::new("n"),
+            None,
             Stamp {
                 queued: secs(1),
                 started: secs(2),

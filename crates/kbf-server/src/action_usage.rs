@@ -101,16 +101,11 @@ impl Subject {
     /// call's `RequestMetadata`).
     #[must_use]
     pub fn recorded(&self) -> kbf_invocation::ActionShape {
-        use kbf_invocation::TargetKind as Kind;
         kbf_invocation::ActionShape {
             key: u64::from_be_bytes(self.key.bytes()),
             cfg: self.cfg.clone(),
             target: self.target.as_ref().map(|t| kbf_invocation::Target {
-                kind: match t.kind {
-                    TargetKind::Target => Kind::Target,
-                    TargetKind::Anon => Kind::Anon,
-                    TargetKind::Bxl => Kind::Bxl,
-                },
+                kind: t.kind,
                 label: kbf_invocation::Text::sent(t.label.clone()),
             }),
         }
@@ -185,7 +180,7 @@ impl Measured {
     #[must_use]
     pub fn of(result: &worker::Result) -> Option<Self> {
         let action_result = result.action_result.as_ref()?;
-        let usage = ResourceUsage::in_result(action_result)?.clone();
+        let usage = ResourceUsage::in_result(action_result)?;
         let ok = result
             .status
             .as_ref()
@@ -194,6 +189,12 @@ impl Measured {
             usage,
             exit_code: ok.then_some(action_result.exit_code),
         })
+    }
+
+    /// The `ResourceUsage` the result carried.
+    #[must_use]
+    pub const fn usage(&self) -> &ResourceUsage {
+        &self.usage
     }
 }
 

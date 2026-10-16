@@ -2,7 +2,9 @@
 //! (`docs/design/ui-data.md` 4.2, phase U1): a fake daemon reports, and the row the
 //! server's recorder holds is read back. Each test names the defect it catches.
 
-use kbf_invocation::{AttemptEnd, MemoryKill as Kill, Outcome, WallTime};
+use std::time::Duration;
+
+use kbf_invocation::{AttemptEnd, MemoryKillKind as Kill, Outcome, WallTime};
 use kbf_proto::reapi::{ActionResult, ExecutedActionMetadata};
 use kbf_proto::worker::{self, CgroupUsage, MemoryKill, NumaNodeBytes, ResourceUsage};
 use kbf_sched::RequeueReason;
@@ -103,10 +105,28 @@ async fn a_run_keeps_its_cgroup_block_and_its_reapi_times() {
 
 /// Catches (ui-data 9, U1 red): the attempt that ends the operation, killed at the
 /// largest node, recorded without its booking and cap (only a requeue had them), a
-/// cap taken from another run, and a requeued kill's cap not kept.
+/// cap taken from another run, and a requeued kill's cap not kept. With the default
+/// finished retention the scheduler still holds the operation when the report is
+/// recorded, so its runs are read from there; see the zero-retention twin below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_kill_at_the_largest_node_keeps_its_booking_and_cap() {
-    let cell = Cell::start().await;
+    kill_at_the_largest_node(Cell::start().await).await;
+}
+
+/// Catches (review of ui-data 9): the booking and cap of the kill that ends the
+/// operation read only from the scheduler's operation, which `--finished-retention-secs
+/// 0` has already dropped when the report is recorded; they must come from the
+/// operation's answer (plant `.find(|_| false)` on the answers in `take_report`: red
+/// here, green above).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_no_finished_retention_a_kill_keeps_its_booking_and_cap() {
+    let cell = Cell::start_with(kbf_sched::UNSERVABLE_WAIT, Duration::ZERO).await;
+    kill_at_the_largest_node(cell).await;
+}
+
+/// An action killed at its own limit on a 2 GiB node twice (1 GiB booked, then the
+/// whole node), and what its row keeps of both kills.
+async fn kill_at_the_largest_node(cell: Cell) {
     // Books 1 GiB first (the test ladder), then the whole 2 GiB node.
     let mut daemon = cell.daemon("node-b", 4, 2).await;
     let job = Job::new("hungry", &[]);
@@ -187,5 +207,9 @@ async fn a_timed_out_run_lists_its_logs() {
         (Some(stdout.digest), Some(stderr.digest))
     );
     assert_eq!(listing.result, None, "a partial result is never stored");
+    assert_eq!(
+        listing.exit_code, None,
+        "a stopped action has no exit code (not the partial result's 0)"
+    );
     assert!(listing.outputs.is_empty());
 }

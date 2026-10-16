@@ -204,7 +204,7 @@ pub fn listing(
 ) -> Listing {
     Listing {
         result: Some(result),
-        exit_code,
+        exit_code: Some(exit_code),
         outputs: outputs
             .iter()
             .enumerate()

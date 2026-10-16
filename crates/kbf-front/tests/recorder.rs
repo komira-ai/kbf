@@ -229,7 +229,8 @@ async fn a_call_is_recorded_under_its_id_and_caller() {
 
 /// Catches a row listing that loses an output, mixes up a file and a directory, drops
 /// the executable bit, the logs or the usage, or keeps an output whose digest does
-/// not parse.
+/// not parse; and a timed-out run's partial listing given the partial result's exit
+/// code (an action that was stopped has none).
 #[test]
 fn a_listing_copies_outputs_logs_and_usage() {
     let usage = ResourceUsage {
@@ -279,7 +280,13 @@ fn a_listing_copies_outputs_logs_and_usage() {
         ..Default::default()
     };
     let l = listing(Some(d(9)), &result);
-    assert_eq!((l.result, l.exit_code), (Some(d(9)), 3));
+    assert_eq!((l.result, l.exit_code), (Some(d(9)), Some(3)));
+    let partial = listing(None, &result);
+    assert_eq!(
+        (partial.result, partial.exit_code),
+        (None, None),
+        "a partial result's action was stopped: no exit code, not its 3"
+    );
     assert_eq!(
         l.outputs,
         [

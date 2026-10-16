@@ -6,8 +6,8 @@
 mod support;
 
 use kbf_invocation::{
-    ActionShape, Event, LeaseEnd, MemoryKill, Outcome, Phase, ReapiTimes, Records, Run, RunUsage,
-    Target, TargetKind, Text,
+    ActionShape, Event, LeaseEnd, MemoryKillKind, Outcome, Phase, ReapiTimes, Records, Run,
+    RunUsage, Target, TargetKind, Text,
 };
 use kbf_sched::RequeueReason;
 use kbf_types::{Failure, OperationId};
@@ -212,22 +212,33 @@ fn a_row_derives_its_durations_and_its_memory_kills() {
     assert_eq!(
         kills,
         [
-            Some(MemoryKill::OwnLimit),
-            Some(MemoryKill::NodePressure),
-            Some(MemoryKill::OwnLimit)
+            Some(MemoryKillKind::OwnLimit),
+            Some(MemoryKillKind::NodePressure),
+            Some(MemoryKillKind::OwnLimit)
         ]
     );
+    // Ended by its second lease instead: the phases are that lease's run's.
     let mut middle = row.clone();
     middle.attempts.truncate(2);
-    middle.attempts[1].ended = None;
-    middle.attempts[1].end = None;
+    middle.attempts[1].end = Some(kbf_invocation::AttemptEnd::Accepted);
     let d = middle.durations();
-    assert_eq!(d.wall, None, "its last lease is held");
+    assert_eq!(d.wall, s(19));
     assert_eq!(
         (d.input_fetch, d.execution, d.output_upload),
         (s(2), s(5), None)
     );
-    assert_eq!(middle.attempts[1].memory_kill(), None, "held");
+    let mut held = middle.clone();
+    held.attempts[1].ended = None;
+    held.attempts[1].end = None;
+    assert_eq!(
+        held.durations(),
+        kbf_invocation::Durations {
+            queue: s(2 + 3),
+            ..kbf_invocation::Durations::default()
+        },
+        "its last lease is held: only the queueing so far"
+    );
+    assert_eq!(held.attempts[1].memory_kill(), None, "held");
     for (phase, name) in Phase::NAMED {
         assert_eq!(
             d.of(phase),
@@ -242,7 +253,7 @@ fn a_row_derives_its_durations_and_its_memory_kills() {
         assert_eq!(phase.name(), name);
     }
     assert_eq!(
-        MemoryKill::NAMED.map(|(k, _)| k.name()),
+        MemoryKillKind::NAMED.map(|(k, _)| k.name()),
         ["none", "own_limit", "node_pressure"]
     );
     assert_eq!(
@@ -253,4 +264,51 @@ fn a_row_derives_its_durations_and_its_memory_kills() {
     let mut none = empty;
     none.attempts.clear();
     assert_eq!(none.durations(), kbf_invocation::Durations::default());
+}
+
+/// Catches (review of ui-data 4.2): a row waiting to be granted again after a
+/// requeue given a wall time (first queueing to the requeue, as if final) or the
+/// requeued lease's phases, so a list sorted by either ranks it on a number that
+/// will change; and the queueing so far dropped with them.
+#[test]
+fn a_requeued_row_waiting_again_has_no_wall_or_phases() {
+    let at = |s: u64| Some(t(s));
+    let run = Run {
+        times: ReapiTimes {
+            execution_start: at(3),
+            execution_completed: at(4),
+            ..ReapiTimes::default()
+        },
+        ..Run::default()
+    };
+    let mut r = Records::new();
+    applied(
+        &mut r,
+        [
+            queued("w", t(0), 1, 1),
+            granted(1, 1, "node-a", t(2)),
+            ran(1, 1, run),
+            requeued(
+                1,
+                1,
+                RequeueReason::OutOfMemory {
+                    booked: 1,
+                    raised: 2,
+                },
+                t(5),
+            ),
+        ],
+    );
+    let row = &r.get(&key("w")).expect("w").rows()[0];
+    assert!(
+        row.attempts[0].ended.is_some(),
+        "the requeue ended its lease"
+    );
+    assert_eq!(
+        row.durations(),
+        kbf_invocation::Durations {
+            queue: Some(2_000_000),
+            ..kbf_invocation::Durations::default()
+        }
+    );
 }

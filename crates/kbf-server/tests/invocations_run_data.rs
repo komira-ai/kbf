@@ -276,7 +276,9 @@ async fn a_row_answers_its_shape_and_target() {
 /// Catches (ui-data 4.1, 6.2): `sort=` that does not list longest first, breaks ties
 /// otherwise than by row order, lists a row that has not measured the phase (one in
 /// flight), loses its order on the next page (a page token that does not carry the
-/// sort, or a `next_page` without it), reads `execution_ms` from anything but the
+/// sort, or a `next_page` without it), drops or repeats a row tied with the last of
+/// the page before (a cursor that compares the duration alone: page size 1 walks
+/// through the tie), reads `execution_ms` from anything but the
 /// run's REAPI times; a row's `durations` missing or not in milliseconds; and a sort
 /// the route does not know, or a sorted page's token sent without the sort, answered
 /// anything but `400`.
@@ -303,6 +305,26 @@ async fn actions_sort_longest_first_and_page_on() {
     let second = server.ok(next).await;
     assert_eq!(listed(&second), [text(&a), text(&d)]);
     assert!(second.get("next_page").is_none(), "{second}");
+
+    // One row a page, through the tie of b and c at 50 ms: b, then c, then a.
+    let mut walked = Vec::new();
+    let mut page = server.ok(&format!("{base}?sort=wall_ms&page_size=1")).await;
+    for _ in 0..3 {
+        walked.extend(listed(&page));
+        // The token alone, sent with the same query: what a client holding it does.
+        let token = page["next_page_token"]
+            .as_str()
+            .expect("a token")
+            .to_owned();
+        page = server
+            .ok(&format!(
+                "{base}?sort=wall_ms&page_size=1&page_token={token}"
+            ))
+            .await;
+    }
+    walked.extend(listed(&page));
+    assert_eq!(walked, [text(&b), text(&c), text(&a), text(&d)]);
+    assert!(page.get("next_page").is_none(), "{page}");
 
     let by_execution = server.ok(&format!("{base}?sort=execution_ms")).await;
     assert_eq!(
@@ -415,8 +437,9 @@ async fn filters_keep_rows_by_requeue_reason_and_memory_kill() {
 
 /// Catches (ui-data 4.1): `top_slowest` that lists more than 20, not longest first,
 /// counts a joined row (its twin's time, counted where the twin ran), or links rows
-/// that do not answer; phase totals that sum the wrong rows or units, or write a
-/// phase no row measured as zero.
+/// that do not answer; phase totals that sum the wrong rows or units, leave out how
+/// many rows measured each phase (a mean needs it), or write a phase no row measured
+/// as zero.
 #[tokio::test]
 async fn the_summary_names_the_slowest_and_the_phase_totals() {
     let server = Server::with(OPEN);
@@ -467,17 +490,22 @@ async fn the_summary_names_the_slowest_and_the_phase_totals() {
     );
     let href = wall[0]["href"].as_str().expect("an href");
     assert_eq!(server.ok(href).await["action"], text(&digest(22)));
-    // Executions 22 + 21 + ... + 1 ms; nothing queued; no fetch or upload measured.
+    // Executions 22 + 21 + ... + 1 ms over the 22 rows that ran; nothing queued; no
+    // fetch or upload measured.
     assert_eq!(
         summary["phase_totals"],
-        json!({"execution_ms": 253, "queue_ms": 0})
+        json!({
+            "execution_ms": {"sum": 253, "rows": 22},
+            "queue_ms": {"sum": 0, "rows": 22},
+        })
     );
     server.stop().await;
 }
 
 /// Catches (ui-data 6.1): a built key's form changed by the added ones: a page token
 /// of the built filters written in another form (a client holding one breaks), or
-/// `next_page` reordered; the built keys of a row and an attempt not as they were.
+/// `next_page` reordered; the built keys of a row and an attempt not as they were
+/// (each one present under its built name: a renamed `started` goes red).
 #[tokio::test]
 async fn built_keys_and_links_read_as_before() {
     let server = Server::with(OPEN);
@@ -527,11 +555,61 @@ async fn built_keys_and_links_read_as_before() {
     for key in built {
         assert!(row.get(key).is_some(), "{key}: {row}");
     }
+    let attempt = &row["attempts"][0];
+    for key in [
+        "lease", "worker", "queued", "granted", "started", "ended", "end",
+    ] {
+        assert!(attempt.get(key).is_some(), "{key}: {attempt}");
+    }
     assert_eq!(
-        row["attempts"][0]["end"],
+        attempt["end"],
         json!({"result": "ok"}),
         "an attempt's end as built"
     );
-    assert_eq!(row["attempts"][0]["lease"], "1.1");
+    assert_eq!(attempt["lease"], "1.1");
+    server.stop().await;
+}
+
+/// Catches (review of ui-data 4.2, 6.1): a row waiting to be granted again after an
+/// own-limit requeue answered with a `wall_ms` from its first queueing to the requeue
+/// (as if final) or the requeued lease's `execution_ms`, and so ranked by
+/// `top_slowest` and `?sort=` on numbers that will change; the queueing so far
+/// dropped with them.
+#[tokio::test]
+async fn a_row_waiting_after_a_requeue_has_no_wall_time_yet() {
+    let server = Server::with(OPEN);
+    let (done, waiting) = (digest(1), digest(2));
+    let mut events = one_run("r", done, 1, (0, 1_000), executed(0, 500));
+    events.extend([
+        queued("r", "main", at(0), waiting, 2),
+        granted(2, 1, "node-a", at(2_000)),
+        ran(2, 1, executed(2_000, 90_000)),
+        requeued(
+            2,
+            1,
+            RequeueReason::OutOfMemory {
+                booked: GIB,
+                raised: 2 * GIB,
+            },
+            at(100_000),
+        ),
+    ]);
+    server.feed(events).await;
+    let row = server
+        .ok(&format!("/v1/invocations/r/actions/{}", text(&waiting)))
+        .await;
+    assert_eq!(row["durations"], json!({"queue_ms": 2}));
+    let summary = server.ok("/v1/invocations/r").await;
+    for phase in ["wall_ms", "execution_ms"] {
+        let actions: Vec<&Value> = summary["top_slowest"][phase]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|e| &e["action"])
+            .collect();
+        assert_eq!(actions, [&json!(text(&done))], "{phase}");
+    }
+    let sorted = server.ok("/v1/invocations/r/actions?sort=wall_ms").await;
+    assert_eq!(listed(&sorted), [text(&done)]);
     server.stop().await;
 }
