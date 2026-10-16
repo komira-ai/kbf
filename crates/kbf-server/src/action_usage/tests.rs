@@ -46,7 +46,8 @@ fn usage() -> ResourceUsage {
 }
 
 /// Catches: a failed run's synthetic exit code (0) logged as if it exited 0, an OK
-/// run's exit code lost, and a line made for a report that measured nothing.
+/// run's exit code lost (also for a result with no status, which the farm reads as
+/// OK), and a line made for a report that measured nothing.
 #[test]
 fn only_an_ok_run_has_an_exit_code_and_only_a_measured_one_a_line() {
     let ok = Measured::of(&report(Code::Ok, 7, Some(&usage()))).expect("measured");
@@ -54,6 +55,10 @@ fn only_an_ok_run_has_an_exit_code_and_only_a_measured_one_a_line() {
     let oom = Measured::of(&report(Code::ResourceExhausted, 0, Some(&usage()))).expect("measured");
     assert_eq!(oom.exit_code, None);
     assert_eq!(oom.usage, usage());
+    let mut no_status = report(Code::Ok, 5, Some(&usage()));
+    no_status.status = None;
+    let no_status = Measured::of(&no_status).expect("measured");
+    assert_eq!(no_status.exit_code, Some(5));
     assert_eq!(Measured::of(&report(Code::Ok, 0, None)), None);
     let bare = worker::Result::default();
     assert_eq!(Measured::of(&bare), None);

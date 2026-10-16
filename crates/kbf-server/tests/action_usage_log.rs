@@ -497,6 +497,8 @@ enum FailedPath {
     MissingInput,
     /// The run was fenced on every run the farm's budget allows.
     LostFenced,
+    /// The daemon restarted under the run, on every run the farm's budget allows.
+    LostRestarted,
 }
 
 /// Runs one action through `path` on a node of its own and returns its `action
@@ -565,6 +567,14 @@ async fn usage_lines_of(path: FailedPath) -> Vec<String> {
             })
             .await;
         }
+        FailedPath::LostRestarted => {
+            report_every_run(&mut daemon, start, |lease| {
+                let mut lost = failed(lease, Code::Unavailable);
+                lost.lost = Lost::DaemonRestarted as i32;
+                lost
+            })
+            .await;
+        }
     }
     done(&mut ops).await;
     lines("action usage:", key)
@@ -586,7 +596,7 @@ fn field<'a>(line: &'a str, name: &str) -> &'a str {
 async fn every_failed_path_logs_one_line_per_lease_with_its_outcome() {
     log();
     let lost = 1 + kbf_sched::FARM_RERUNS as usize;
-    let table: [(FailedPath, Vec<(&str, &str)>); 5] = [
+    let table: [(FailedPath, Vec<(&str, &str)>); 6] = [
         (
             FailedPath::NodePressure,
             vec![("node-pressure", "-"), ("ok", "0")],
@@ -595,6 +605,7 @@ async fn every_failed_path_logs_one_line_per_lease_with_its_outcome() {
         (FailedPath::Invalid, vec![("invalid", "-")]),
         (FailedPath::MissingInput, vec![("missing-input", "-")]),
         (FailedPath::LostFenced, vec![("lost-fenced", "-"); lost]),
+        (FailedPath::LostRestarted, vec![("lost-restart", "-"); lost]),
     ];
     for (path, want) in table {
         let got = usage_lines_of(path).await;

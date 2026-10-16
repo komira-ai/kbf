@@ -773,8 +773,8 @@ phases` says where the time went: `list_ms`, `hash_ms`, `find_missing_ms`, `uplo
 
 The server logs one INFO line, `action usage:`, per lease report it takes whose
 `action_result` carries a `ResourceUsage`: an OK run, and a failed one the daemon
-measured (an out-of-memory kill, each rung of the memory ladder included, a timeout, an
-infrastructure failure). It reads the usage before it judges the report, since judging
+measured, whatever the outcome (for example an out-of-memory kill, each rung of the
+memory ladder included, a timeout, an infrastructure failure, a lost run). It reads the usage before it judges the report, since judging
 drops a killed run's result and cuts a timeout's to its logs
 (`kbf_server::action_usage`). The fields, in this order:
 
@@ -809,32 +809,43 @@ tells configurations apart); two actions of one target, or two targets, differ.
   `buck-out/v2/art/cell/<cfg>/pkg/__t__/t.o`,
   `buck-out/v2/art/cell/pkg/__t__/output_artifacts/t.o` and
   `buck-out/v2/gen/cell/pkg/__t__/<content>/t.o` are all `cell/pkg/__t__/t.o`; a
-  dynamic action's `__action__<k>__` stays. An anonymous target: the configuration hash
+  dynamic action's `__action__<k>__` stays. A target name may hold a `/` (buck2 writes
+  `//pkg:foo/bar` as `__foo/bar__`): a name runs from a segment that starts with `__` to
+  the first later one that ends with `__`. An anonymous target: the configuration hash
   glued to its package, and the attributes or content hash right before its
-  `__<name>__`, also where buck2 glues it to the cell (`art-anon/anon<16 hex>/__t__/o`
+  `__<name>__` (any segment of hex digits there, whatever its length), also where buck2 glues it to the cell (`art-anon/anon<16 hex>/__t__/o`
   is `anon/__t__/o`); in content mode buck2 glues the cell to the package, which stays
   glued (a stable key, but not the configuration-hash form's). A BXL function: the
   execution-platform hash after the cell (as `cfg`) and the arguments or content hash
   right after its `__<name>__`
   (`art-bxl/komira/<16 hex>/tools/build/lint/test_weld.bxl/__check__/<16 hex>/test_weld`
   is `komira/tools/build/lint/test_weld.bxl/__check__/test_weld`). buck2 writes the
-  BXL hashes and the anonymous attributes hash unpadded; 13 to 16 hex digits are read
-  as a hash, so the 1 in 65 536 with fewer is kept. Scratch paths (`buck-out/<v>/tmp/`)
-  are left out; any other path is kept as sent. The patterns are sorted and
-  deduplicated (buck2 may send one path as both an output file and an output
-  directory), and `cfg` is the first pattern's that names one.
-- The program: argv\[0\] (normalized the same way under `buck-out`, also after the `@`
-  of an argument file, its file name when it is another absolute path), then, while
-  the last word is a bare program name (no `/`: a program looked up on `PATH`, such as
+  BXL hashes unpadded; 13 to 16 hex digits are read as a hash, so the 1 in 65 536 with
+  fewer is kept. Scratch paths (`buck-out/<v>/tmp/`) are left out; any other path is
+  kept as sent. The patterns are sorted and deduplicated (buck2 may send one path as
+  both an output file and an output directory), and `cfg` is the first pattern's that
+  names one. An action with no outputs has only its program in the key, so every such
+  action of one program shares a key.
+- **Known limit: remotely run tests.** buck2 writes a test's outputs under
+  `buck-out/v2/test/execution/<cell>/<16 hex>/<16 hex>/…`; the first hash is of the
+  whole target identifier, configuration included, the second of the test cases run.
+  No segment holds the configuration on its own, so the path is kept as sent: such an
+  action keys once per target, configuration and set of test cases (stable across
+  builds), and its line says `cfg=-`.
+- The program: argv\[0\] (normalized the same way under `buck-out`, its file name when
+  it is another absolute path; an argument file's path, after its `@`, the same way),
+  then, while the last word is a bare program name (no `/` and no `@`: a program looked up on `PATH`, such as
   `env`, a shell or an interpreter, which may only run the next argument), the next
   argument that is not a flag or a `NAME=value` assignment, up to three words. A `-c`,
   or a cluster of single-letter flags ending in `c` (`-euc`), ends it, kept as the last
   word, so a `-c` script never enters the key (a script after `-e`, as Perl or Node
-  take one, does: `-e` is a shell's flag too, so it is skipped). A buck2 genrule is
+  take one, does: `-e` is a shell's flag too, so it is skipped). Any such cluster ends
+  it, a linker's `-lc` too (`cc -lc a.o` is `cc -lc`). A buck2 genrule is
   `env <shell> <cell>/…/genrule.sh`, a prelude Python tool
   `<interpreter> <cell>/…/<script>.py`, a tool built in the repository its `buck-out`
   pattern alone. A bare-name compiler is read the same way (`cc -c a.c` is `cc -c`,
-  `cc -o a.o a.c` is `cc a.o a.c`, `clang @<argsfile>` is `clang @<its pattern>`). The
+  `cc -o a.o a.c` is `cc a.o a.c`, `clang @<argsfile> a.c` is `clang @<its pattern>`,
+  `clang @<file name>` for an absolute one). The
   rule lists no program names.
 - The key is the first 8 bytes of SHA-256 over the tag `kbf-shape-v1`, the program's
   words and the patterns, each length-prefixed. A change to any rule above changes the

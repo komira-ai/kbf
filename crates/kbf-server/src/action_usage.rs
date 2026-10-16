@@ -5,8 +5,9 @@
 //! **Lines.**
 //!
 //! - `action usage:`, one per accepted report whose result carries a `ResourceUsage`
-//!   (an OK run, and a failed one the daemon measured: an out-of-memory kill, a
-//!   timeout, an infrastructure failure), whatever the scheduler does next (a killed
+//!   (an OK run, and a failed one the daemon measured, whatever the outcome: for
+//!   example an out-of-memory kill, a timeout, an infrastructure failure, a lost run),
+//!   whatever the scheduler does next (a killed
 //!   rung runs again higher up the memory ladder; each rung has its line):
 //!
 //!   ```text

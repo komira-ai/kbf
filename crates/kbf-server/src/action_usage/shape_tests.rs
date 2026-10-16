@@ -504,10 +504,14 @@ fn a_flag_cluster_ending_in_c_is_inline() {
         ["runner", "script"]
     );
     assert_eq!(program(&strings(&["runner", "-"])), ["runner"]);
+    // Documented: any single-letter cluster ending in `c` ends it, a linker's too.
+    assert_eq!(program(&strings(&["cc", "-lc", "a.o"])), ["cc", "-lc"]);
 }
 
 /// Catches: an argument file's path kept as sent (its configuration hash splits
-/// the key per configuration, a content hash every build), or the `@` dropped.
+/// the key per configuration, a content hash every build; an absolute one's
+/// directory, a temporary one, splits it per run), the `@` dropped, or the program
+/// read on past an argument file (its source file entering the key).
 #[test]
 fn an_argument_file_is_normalized_after_its_at() {
     let argsfile =
@@ -530,7 +534,103 @@ fn an_argument_file_is_normalized_after_its_at() {
         ["clang++", "@buck-out/tmp"]
     );
     assert_eq!(
-        program(&strings(&["clang++", "@args.txt"])),
+        program(&strings(&["clang++", "@args.txt", "a.c"])),
         ["clang++", "@args.txt",]
     );
+    let absolute = |dir: &str| program(&strings(&["clang++", &format!("@/{dir}/args"), "a.c"]));
+    assert_eq!(absolute("work/beef"), ["clang++", "@args"]);
+    assert_eq!(absolute("work/cafe"), absolute("work/beef"));
+}
+
+/// A target whose name holds a `/` (`//pkg:foo/bar`), which buck2 writes as it is:
+/// `__foo/bar__` spans two segments. Catches: a name read only within one segment,
+/// so the content hash or `output_artifacts` after it is kept and the key moves every
+/// build; a name start taken from a package directory `__private` above it, so an
+/// anonymous target's attributes hash is not found before its name.
+#[test]
+fn a_name_with_a_slash_spans_segments() {
+    let want = "cell/pkg/__foo/bar__/out.o";
+    for path in [
+        format!("buck-out/v2/art/cell/{CFG}/pkg/__foo/bar__/out.o"),
+        format!("buck-out/v2/art/cell/pkg/__foo/bar__/{CONTENT}/out.o"),
+        "buck-out/v2/art/cell/pkg/__foo/bar__/output_artifacts/out.o".to_owned(),
+    ] {
+        assert_eq!(pat(&path).map(|p| p.0).as_deref(), Some(want), "{path}");
+    }
+    let configured = Shape::of(
+        &strings(&["cc"]),
+        &strings(&[&format!("buck-out/v2/art/cell/{CFG}/pkg/__foo/bar__/out.o")]),
+    );
+    let content = Shape::of(
+        &strings(&["cc"]),
+        &strings(&[&format!(
+            "buck-out/v2/art/cell/pkg/__foo/bar__/{CONTENT2}/out.o"
+        )]),
+    );
+    assert_eq!(configured.key, content.key);
+    assert_eq!(
+        pat(&format!("buck-out/v2/art/cell/pkg/__a/b/c__/{CONTENT}/o")),
+        some("cell/pkg/__a/b/c__/o", None)
+    );
+    assert_eq!(
+        pat(&format!(
+            "buck-out/v2/art/cell/pkg/__foo/bar__/__action__3__/{CONTENT}/o"
+        )),
+        some("cell/pkg/__foo/bar__/__action__3__/o", None)
+    );
+    assert_eq!(
+        pat(&format!(
+            "buck-out/v2/art-anon/komira/{CFG}src/x/3fa9c1/__x/y__/o"
+        )),
+        some("komira/src/x/__x/y__/o", Some(CFG))
+    );
+    assert_eq!(
+        pat(&format!(
+            "buck-out/v2/art-anon/komira/{CFG}src/__private/3fa9c1/__x/y__/o"
+        )),
+        some("komira/src/__private/__x/y__/o", Some(CFG))
+    );
+    // A segment ending in `__` with no start before it is no name.
+    assert_eq!(
+        pat(&format!("buck-out/v2/art/cell/pkg/bar__/{CONTENT}/o")),
+        some(&format!("cell/pkg/bar__/{CONTENT}/o"), None)
+    );
+}
+
+/// Catches: a BXL hash read from fewer than 13 hex digits (a 12-digit directory after
+/// a function's name dropped), and an anonymous target reading an unpadded hash after
+/// its name (buck2 writes none there: its hashes sit before the name).
+#[test]
+fn shorter_hex_directories_after_a_name_are_kept() {
+    assert_eq!(
+        pat("buck-out/v2/art-bxl/komira/x.bxl/__f__/083ffece723d/o"),
+        some("komira/x.bxl/__f__/083ffece723d/o", None)
+    );
+    for dir in [&CONTENT[..13], &CONTENT[..15]] {
+        assert_eq!(
+            pat(&format!(
+                "buck-out/v2/art-anon/komira/{CFG}src/x/3fa9c1/__x__0__/{dir}/o"
+            )),
+            some(&format!("komira/src/x/__x__0__/{dir}/o"), Some(CFG)),
+            "{dir}"
+        );
+    }
+}
+
+/// KNOWN LIMIT, pinned: a test buck2 runs remotely writes under
+/// `buck-out/v2/test/execution/<cell>/<16 hex>/<16 hex>/…`, where the first hash is
+/// of the whole target identifier, configuration included, and the second of the
+/// test cases run. No segment holds the configuration on its own, so the path is
+/// kept as sent: one key per target, configuration and set of test cases, stable
+/// across builds, and `cfg=-`. Catches a change to that (a fix must move this test).
+#[test]
+fn known_limit_a_test_execution_path_keys_per_configuration() {
+    let path = |cfg_hash: &str| {
+        format!("buck-out/v2/test/execution/komira/{cfg_hash}/{CONTENT2}/default/out")
+    };
+    assert_eq!(pat(&path(CFG)), some(&path(CFG), None));
+    let shape = |cfg_hash: &str| Shape::of(&strings(&["runner"]), &strings(&[&path(cfg_hash)]));
+    assert_eq!(shape(CFG).key, shape(CFG).key);
+    assert_ne!(shape(CFG).key, shape(CFG2).key);
+    assert_eq!(shape(CFG).cfg, None);
 }

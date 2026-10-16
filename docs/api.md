@@ -323,8 +323,8 @@ more gets a segment of its own. Over a window, with `rate()`:
 The daemon logs the other side, per lease: its phase times (`lease phases:`) and,
 from its transfer engine, what it read and uploaded (`transfers:`), joined on `lease=`
 ([daemon.md](design/daemon.md#where-a-leases-time-went)). The server logs, per lease
-report that carries usage (an OK run, an out-of-memory kill, a timeout, an
-infrastructure failure), `action usage:` with the same cgroup fields, the action's
+report that carries usage (an OK run or any failed one the daemon measured, for
+example an out-of-memory kill, a timeout or a lost run), `action usage:` with the same cgroup fields, the action's
 shape `key`, its `cfg`, the `outcome` and the `lease`, and names the `key` on each
 `lease granted` line ([daemon.md](design/daemon.md#the-servers-action-usage-line)).
 

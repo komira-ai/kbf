@@ -16,33 +16,46 @@
 //!     `buck-out/v2/art/cell/<cfg>/pkg/__t__/out.o`,
 //!     `buck-out/v2/art/cell/pkg/__t__/output_artifacts/out.o` and
 //!     `buck-out/v2/gen/cell/pkg/__t__/<content>/out.o` are all `cell/pkg/__t__/out.o`.
-//!     A dynamic action's `__action__<k>__` stays, so its actions stay apart;
+//!     A dynamic action's `__action__<k>__` stays, so its actions stay apart. A
+//!     target name may hold a `/` (`__foo/bar__`): a name runs from a segment that
+//!     starts with `__` to the first later one that ends with `__`;
 //!   - an anonymous target's configuration hash glued to its package, and the
-//!     attributes or content hash right before its `__<name>__` (in content mode
+//!     attributes or content hash right before its `__<name>__`: any segment of hex
+//!     digits there, whatever its length (buck2 writes the attributes hash
+//!     unpadded), or a content hash glued to the cell (in content mode
 //!     buck2 glues that one to the cell for the root package:
 //!     `art-anon/anon<16 hex>/__t__/o` is `anon/__t__/o`). In content mode buck2
 //!     also glues the cell to the package (`<cell><pkg>/…`), which stays glued: the
 //!     key is stable, but not the one of the configuration-hash form;
 //!   - a BXL function's execution-platform hash after the cell (`cfg`) and its
 //!     arguments or content hash right after its `__<name>__`. buck2 writes these
-//!     two (and an anonymous target's attributes hash) unpadded: 13 to 16 hex digits
-//!     are read as a hash, so the 1 in 65 536 with fewer is kept.
+//!     two unpadded: 13 to 16 hex digits are read as a hash, so the 1 in 65 536 with
+//!     fewer is kept.
 //!
 //!   Scratch paths (`buck-out/<v>/tmp/`) are left out. Any other path is kept as sent.
+//!   **Known limit:** that includes a remotely run test's
+//!   `buck-out/v2/test/execution/<cell>/<16 hex>/<16 hex>/…`: buck2 hashes the whole
+//!   target identifier, configuration included, into the first hash (and the test
+//!   cases run into the second), so nothing there can be split out. Such an action
+//!   keys once per target, configuration and set of test cases (stable across
+//!   builds), with `cfg=-`. An action with no outputs has only its program in the
+//!   key, so all such actions of one program share a key.
 //! - **The program** (`program`): argv\[0\], normalized the same way when it is under
-//!   `buck-out` (also after the `@` of an argument file), its file name when it is
-//!   another absolute path, as sent otherwise; then, while the last word is a bare
-//!   program name (no `/`: a program looked up on `PATH`, which may only run the next
-//!   argument, as `env`, a shell or an interpreter does), the next argument that is
+//!   `buck-out`, its file name when it is another absolute path, as sent otherwise
+//!   (an argument file's path, after its `@`, the same way); then, while the last word
+//!   is a bare program name (no `/` and no `@`: a program looked up on `PATH`, which
+//!   may only run the next argument, as `env`, a shell or an interpreter does), the
+//!   next argument that is
 //!   not a flag or a `NAME=value` assignment, up to three words. A `-c`, or a cluster
 //!   of single-letter flags ending in `c` (`-euc`), ends it, kept as the last word, so
 //!   a `-c` script never enters the key (a script after `-e`, as Perl or Node take
-//!   one, does: `-e` is a shell's flag too, so it is skipped). A buck2 genrule is
+//!   one, does: `-e` is a shell's flag too, so it is skipped). Any such cluster ends
+//!   it, a linker's `-lc` too (`cc -lc a.o` is `cc -lc`). A buck2 genrule is
 //!   `env <shell> <cell>/…/genrule.sh`, a prelude Python tool
 //!   `<interpreter> <its script>`, a tool built in the repository (a `buck-out` path)
 //!   its pattern alone. A bare-name compiler is read the same way: `cc -c a.c` is
-//!   `cc -c`, `cc -o a.o a.c` is `cc a.o a.c`, `clang @<argsfile>` is
-//!   `clang @<its pattern>`. The rule names no program: what it unwraps is told by
+//!   `cc -c`, `cc -o a.o a.c` is `cc a.o a.c`, `clang @<argsfile> a.c` is
+//!   `clang @<its pattern>` (`clang @<file name>` for an absolute one). The rule names no program: what it unwraps is told by
 //!   shape (bare name, path, flag), so no list of runners can go stale.
 //!
 //! The key is SHA-256 of a version tag and the program's words and the sorted,
@@ -141,7 +154,7 @@ pub fn program(arguments: &[String]) -> Vec<String> {
     };
     let mut words = vec![word(first)];
     let mut rest = rest.iter();
-    while words.len() < MAX_WORDS && words.last().is_some_and(|w| !w.contains('/')) {
+    while words.len() < MAX_WORDS && words.last().is_some_and(|w| is_bare_program(w)) {
         match rest.find(|a| is_inline(a) || !skipped(a)) {
             Some(inline) if is_inline(inline) => {
                 words.push(inline.clone());
@@ -152,6 +165,12 @@ pub fn program(arguments: &[String]) -> Vec<String> {
         }
     }
     words
+}
+
+/// A word that may be a program looked up on `PATH`, which may only run the next
+/// argument: no `/`, and not an argument file (`@…`, read by the program before it).
+fn is_bare_program(word: &str) -> bool {
+    !word.contains('/') && !word.starts_with('@')
 }
 
 /// The flag that hands a program an inline script, with any single-letter flags
@@ -170,8 +189,8 @@ fn skipped(arg: &str) -> bool {
 }
 
 /// One program word: a `buck-out` path's pattern (`buck-out/tmp` for a scratch path),
-/// the same after the `@` of an argument file (`@<pattern>`), an absolute path's file
-/// name, any other argument as sent.
+/// an absolute path's file name, any other argument as sent; an argument file's path
+/// (after its `@`) the same way (`@<pattern>`, `@<file name>`).
 fn word(arg: &str) -> String {
     let (at, path) = match arg.strip_prefix('@') {
         Some(path) => ("@", path),
@@ -182,8 +201,8 @@ fn word(arg: &str) -> String {
         Some(Found::Scratch) => return format!("{at}buck-out/tmp"),
         None => {}
     }
-    if arg.starts_with('/') {
-        return basename(arg).to_owned();
+    if path.starts_with('/') {
+        return format!("{at}{}", basename(path));
     }
     arg.to_owned()
 }
@@ -219,7 +238,8 @@ enum Owner {
     /// `<cell>/<pkg>/__<name>__/<content>/…`.
     Target,
     /// An anonymous target: `<cell>/<cfg><pkg>/<attrs>/__<name>__/…`, or (content
-    /// mode) `<cell><pkg>/<content>/__<name>__/…`. The attributes hash is unpadded.
+    /// mode) `<cell><pkg>/<content>/__<name>__/…`. The attributes hash is unpadded
+    /// (any hex segment there is taken for it).
     Anon,
     /// A BXL function: `<cell>/<exec>/<bxl path>/__<name>__/<args>/…`, or (content
     /// mode) `<cell>/<bxl path>/__<name>__/<content>/…`. The execution platform and
@@ -249,18 +269,19 @@ fn buck_out(path: &str) -> Option<Found> {
     };
     let mut rest: Vec<&str> = segments[at + 3..].to_vec();
     let cfg = take_cfg(owner, &mut rest);
+    let names = Names::of(&rest);
     let mut kept: Vec<&str> = Vec::with_capacity(rest.len());
     for (i, &segment) in rest.iter().enumerate() {
         // The hash right after a `__<name>__` (only the next segment: a hex directory
         // further down is the action's own).
-        let after_name = i > 0 && is_name(rest[i - 1]);
+        let after_name = i > 0 && names.ends[i - 1];
         if after_name && hash_after_name(owner, segment) {
             continue;
         }
-        // An anonymous target's attributes or content hash, right before its
-        // `__<name>__`: a segment of its own, or (content mode, root package) glued
-        // to the cell.
-        let before_name = rest.get(i + 1).is_some_and(|s| is_name(s));
+        // An anonymous target's attributes hash (any hex segment) or content hash,
+        // right before its `__<name>__`: a segment of its own, or (content mode, root
+        // package) glued to the cell.
+        let before_name = names.starts.get(i + 1).copied().unwrap_or(false);
         if owner == Owner::Anon && before_name {
             if i > 0 && is_hex(segment) {
                 continue;
@@ -311,10 +332,44 @@ fn unglue_content_hash(segment: &str) -> Option<&str> {
     is_hex(hash).then_some(cell)
 }
 
-/// A `__<name>__` segment: a target's (`__foo__`), a dynamic action's
-/// (`__action__3__`), or an anonymous target's (`__foo__0__`).
-fn is_name(segment: &str) -> bool {
-    segment.len() > 4 && segment.starts_with("__") && segment.ends_with("__")
+/// Where the `__<name>__` parts of a path start and end: a target's (`__foo__`), a
+/// dynamic action's (`__action__3__`), an anonymous target's (`__foo__0__`). buck2
+/// writes the name as it is, and a target name may hold a `/`, so a name runs over
+/// segments: from one that starts with `__` to the first later one that ends with
+/// `__` (`//pkg:foo/bar` is `__foo/bar__`). Of several segments starting with `__`
+/// before an end, the last starts the name (a package directory `__private`
+/// above it starts none).
+struct Names {
+    /// Segment `i` starts a name.
+    starts: Vec<bool>,
+    /// Segment `i` ends a name.
+    ends: Vec<bool>,
+}
+
+impl Names {
+    fn of(segments: &[&str]) -> Self {
+        let mut names = Self {
+            starts: vec![false; segments.len()],
+            ends: vec![false; segments.len()],
+        };
+        let mut open = None;
+        for (i, segment) in segments.iter().enumerate() {
+            if segment.len() > 4 && segment.starts_with("__") && segment.ends_with("__") {
+                names.starts[i] = true;
+                names.ends[i] = true;
+                open = None;
+            } else if segment.len() > 2 && segment.starts_with("__") {
+                open = Some(i);
+            } else if segment.len() > 2
+                && segment.ends_with("__")
+                && let Some(start) = open.take()
+            {
+                names.starts[start] = true;
+                names.ends[i] = true;
+            }
+        }
+        names
+    }
 }
 
 /// Lowercase hex digits only (true of an empty segment, which a `//` makes).
