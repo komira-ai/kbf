@@ -300,6 +300,62 @@ fn a_status_becomes_the_error_a_store_would_give() {
     }
 }
 
+/// Catches a STALE_MAP the client does not recognise (it would be retried as an outage,
+/// against the same stale owners), one it recognises from the code alone (any
+/// FAILED_PRECONDITION, such as a refused action-cache write, would send the caller to
+/// refetch the map), one it reads without checking the code, and a generation it
+/// misreads.
+#[test]
+fn a_stale_map_status_is_lifted_with_the_nodes_generation() {
+    use super::client::lift;
+    use tonic::metadata::MetadataValue;
+    let with = |code: Code, generation: &str| {
+        let mut status = Status::new(code, "STALE_MAP");
+        status.metadata_mut().insert(
+            MAP_GENERATION_HEADER,
+            MetadataValue::try_from(generation).expect("ASCII"),
+        );
+        status
+    };
+    assert!(matches!(
+        lift(&with(Code::FailedPrecondition, "9"), None),
+        StorageError::StaleMap { current: 9 }
+    ));
+    // The same words without the entry, with an entry that is not a generation, and on
+    // another code, are not a stale map.
+    for status in [
+        Status::failed_precondition("STALE_MAP"),
+        with(Code::FailedPrecondition, "nine"),
+        with(Code::Unavailable, "9"),
+    ] {
+        assert!(
+            matches!(lift(&status, None), StorageError::Unavailable(_)),
+            "{status:?}"
+        );
+    }
+}
+
+/// Catches a STALE_MAP that does not cross the wire as itself: over a real connection a
+/// node's answer reaches the caller as `StaleMap` with the generation, on a blob call
+/// and on an action-cache call, and is not NOT_FOUND, an outage or a refusal.
+#[tokio::test]
+async fn a_stale_map_crosses_the_wire() {
+    let (mem, remote, _) = pair().await;
+    *mem.fail.lock().expect("lock") = Some(StorageError::StaleMap { current: 12 });
+    let digest = sha(b"x");
+    let errors = [
+        remote.find_missing(&[digest]).await.expect_err("stale"),
+        remote.read_range(&digest, 0, 0).await.err().expect("stale"),
+        remote.action_result(&digest).await.expect_err("stale"),
+    ];
+    for error in errors {
+        assert!(
+            matches!(error, StorageError::StaleMap { current: 12 }),
+            "{error:?}"
+        );
+    }
+}
+
 /// Catches FindMissing answering in another order than asked, dropping a held-but-empty
 /// blob into the missing, passing a malformed digest or another digest function, and a
 /// batch call answered when the node does not serve it.

@@ -2,21 +2,22 @@
 //! started over the same store takes up again.
 //!
 //! The store is the in-memory fake, which keeps a durable copy a restart reopens, and
-//! the farm's clock is tokio's, paused: nothing here waits.
+//! the farm's clock is tokio's, paused: nothing here waits. The tests that restart the
+//! farm over its store run a second time over a real SQLite file, closed and reopened.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
-use kbf_front::{Cache, Described, Dispatch, Finished, MemoryMetaLog, Stage, Submission};
-use kbf_objstore::MemoryStore;
+use kbf_front::{Cache, Described, Dispatch, Finished, Stage, Submission};
 use kbf_proto::google::rpc;
 use kbf_proto::worker::{self, ServerMessage, server_message};
 use kbf_sched::{DaemonInstance, Request};
 use kbf_server::farm::{Reported, StreamId};
 use kbf_server::{EpochPolicy, Farm, Listeners, ServeError, StateError, StateStore};
 use kbf_state::fake::{Fake, Flaw};
+use kbf_state::sqlite::{Options, SqliteStore};
 use kbf_state::{
     Changes, Commit, CommitStats, Conflict, ManualClock, Revision, Store, StoreError, StoreTime,
     Txn, Versioned,
@@ -27,25 +28,111 @@ use tonic::{Code, Status};
 
 const GIB: u64 = 1 << 30;
 
-type TestFarm = Farm<MemoryMetaLog, MemoryStore>;
+type TestFarm = Farm;
 type Inbox = mpsc::UnboundedReceiver<Result<ServerMessage, Status>>;
 
 /// A store whose writes can be made to fail, over the fake (which a restart reopens from
 /// what was synced).
 struct Flaky {
-    inner: Fake,
+    inner: Inner,
     down: AtomicBool,
     /// How many more writes take before the store goes down; negative for no limit.
     allow: AtomicI64,
 }
 
+/// What the store is kept in.
+#[derive(Clone, Copy)]
+enum Backing {
+    /// The in-memory fake.
+    Fake,
+    /// A SQLite file in a directory of the test's own.
+    Sqlite,
+}
+
+enum Inner {
+    Fake(Fake),
+    Sqlite(Tracked),
+}
+
+/// A SQLite store that records when it is closed, so a test can tell a restart that
+/// closed the store and opened the file again from one that kept the same object.
+struct Tracked {
+    store: SqliteStore,
+    closed: Arc<AtomicBool>,
+}
+
+impl Tracked {
+    fn new(store: SqliteStore) -> Self {
+        Self {
+            store,
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Inner {
+    fn store(&self) -> &dyn Store {
+        match self {
+            Inner::Fake(store) => store,
+            Inner::Sqlite(tracked) => &tracked.store,
+        }
+    }
+}
+
+/// A directory removed when dropped.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("kbf-state-store-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        Self(dir)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn open_sqlite(path: &std::path::Path) -> SqliteStore {
+    SqliteStore::open(
+        path,
+        Arc::new(kbf_state::SystemClock::default()),
+        Options::default(),
+    )
+    .expect("a SQLite store")
+}
+
 impl Flaky {
     fn new() -> Self {
         let inner = Fake::with_flaw(Arc::new(ManualClock::default()), Flaw::None);
+        Self::over(Inner::Fake(inner))
+    }
+
+    fn over(inner: Inner) -> Self {
         Self {
             inner,
             down: AtomicBool::new(false),
             allow: AtomicI64::new(-1),
+        }
+    }
+
+    /// Set once the SQLite store this wraps is dropped; none over the fake.
+    fn closed(&self) -> Option<Arc<AtomicBool>> {
+        match &self.inner {
+            Inner::Sqlite(tracked) => Some(Arc::clone(&tracked.closed)),
+            Inner::Fake(_) => None,
         }
     }
 
@@ -63,11 +150,17 @@ impl Flaky {
 
     /// A crash and reopen: what the store acknowledged survives.
     fn restart(self) -> Self {
-        Self {
-            inner: self.inner.restart(),
-            down: AtomicBool::new(false),
-            allow: AtomicI64::new(-1),
-        }
+        let inner = match self.inner {
+            Inner::Fake(fake) => Inner::Fake(fake.restart()),
+            Inner::Sqlite(tracked) => {
+                // Dropping the store ends its writer and releases the file's lock; the
+                // file is then opened again by its path, as a new process does.
+                let path = tracked.store.path().to_owned();
+                drop(tracked);
+                Inner::Sqlite(Tracked::new(open_sqlite(&path)))
+            }
+        };
+        Self::over(inner)
     }
 }
 
@@ -81,43 +174,59 @@ impl Store for Flaky {
         if self.down.load(Ordering::SeqCst) {
             return Err(StoreError::Failed("the store is down".to_owned()));
         }
-        self.inner.apply_batch(batch)
+        self.inner.store().apply_batch(batch)
     }
 
     fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {
-        self.inner.get(key)
+        self.inner.store().get(key)
     }
 
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
-        self.inner.scan_prefix(prefix)
+        self.inner.store().scan_prefix(prefix)
     }
 
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {
-        self.inner.changes(after, limit)
+        self.inner.store().changes(after, limit)
     }
 
     fn reap_expired(&self) -> Result<usize, StoreError> {
-        self.inner.reap_expired()
+        self.inner.store().reap_expired()
     }
 
     fn commit_stats(&self) -> CommitStats {
-        self.inner.commit_stats()
+        self.inner.store().commit_stats()
     }
 
     fn now(&self) -> StoreTime {
-        self.inner.now()
+        self.inner.store().now()
     }
 }
 
 /// The store, and farms started over it one after another.
 struct Disk {
     store: Arc<Flaky>,
+    /// Kept for the SQLite file, and removed after the store is closed.
+    _dir: Option<Scratch>,
 }
 
 impl Disk {
     fn new() -> Self {
+        Self::over(Backing::Fake)
+    }
+
+    fn over(backing: Backing) -> Self {
+        let (inner, dir) = match backing {
+            Backing::Fake => (None, None),
+            Backing::Sqlite => {
+                let dir = Scratch::new();
+                let store = open_sqlite(&dir.0.join("state.db"));
+                (Some(Inner::Sqlite(Tracked::new(store))), Some(dir))
+            }
+        };
+        let store = inner.map_or_else(Flaky::new, Flaky::over);
         Self {
-            store: Arc::new(Flaky::new()),
+            store: Arc::new(store),
+            _dir: dir,
         }
     }
 
@@ -132,14 +241,42 @@ impl Disk {
             kbf_sched::UNSERVABLE_WAIT,
             kbf_sched::FINISHED_RETENTION,
         )
-        .with_state(Some(StateStore { store, epoch }))
+        .with_state(Some(StateStore {
+            store,
+            epoch,
+            members: Default::default(),
+        }))
     }
 
     /// The process dies: its farm is gone, and the store reopens as the disk left it.
+    /// Over SQLite the old store must be closed and the file opened again (not the same
+    /// object kept), and the new store must read every row the old one held.
     fn crash(&mut self, farm: TestFarm) {
         drop(farm);
+        let closed = self.store.closed();
+        let rows = closed.as_ref().map(|_| self.all_rows());
+        // The placeholder holds no file: a SQLite store must be closed before it reopens.
         let store = Arc::into_inner(std::mem::replace(&mut self.store, Arc::new(Flaky::new())));
         self.store = Arc::new(store.expect("nothing else holds the store").restart());
+        if let (Some(closed), Some(rows)) = (closed, rows) {
+            assert!(
+                closed.load(Ordering::SeqCst),
+                "the restart kept the store open"
+            );
+            let reopened = self.store.closed().expect("a SQLite store");
+            assert!(!Arc::ptr_eq(&closed, &reopened), "the same store object");
+            assert!(!reopened.load(Ordering::SeqCst), "the new store is open");
+            assert!(!rows.is_empty(), "the test wrote nothing before the crash");
+            assert_eq!(
+                self.all_rows(),
+                rows,
+                "the reopened file lost what was written"
+            );
+        }
+    }
+
+    fn all_rows(&self) -> Vec<(String, Versioned)> {
+        self.store.scan_prefix("").expect("scan")
     }
 
     fn rows(&self, prefix: &str) -> usize {
@@ -232,9 +369,8 @@ async fn accepted(farm: &TestFarm, lease: LeaseId) -> bool {
 /// Catches: a farm that forgets a claim it acknowledged (the daemon runs a lease the
 /// restarted farm has never heard of and refuses its result), and one that accepts it
 /// for another reason than the store (the control, a farm with no store, refuses it).
-#[tokio::test(start_paused = true)]
-async fn a_restart_replays_the_claims_it_acknowledged() {
-    let mut disk = Disk::new();
+async fn a_restart_replays_the_claims_it_acknowledged(backing: Backing) {
+    let mut disk = Disk::over(backing);
     let before = disk.farm(EpochPolicy::Keep);
     let (_, mut inbox) = register(&before);
     submit(&before, request(1)).expect("submitted");
@@ -281,9 +417,8 @@ async fn a_restart_replays_the_claims_it_acknowledged() {
 /// still holds (the run is wasted), keeps one the daemon never received (the operation
 /// never runs), grants a lease id again (the old run's result taken for the new one), or
 /// accepts a result of the lease it gave up.
-#[tokio::test(start_paused = true)]
-async fn after_a_kill_running_leases_are_rebound_and_undelivered_ones_requeued() {
-    let mut disk = Disk::new();
+async fn after_a_kill_running_leases_are_rebound_and_undelivered_ones_requeued(backing: Backing) {
+    let mut disk = Disk::over(backing);
     let before = disk.farm(EpochPolicy::Keep);
     let (_, mut inbox) = register(&before);
     submit(&before, request(1)).expect("submitted");
@@ -316,9 +451,8 @@ async fn after_a_kill_running_leases_are_rebound_and_undelivered_ones_requeued()
 /// let a daemon keep the runs of a restored file's leases; a Postgres start that bumps
 /// it would kill every run at each frontend start), and leases granted under another
 /// term than `Welcome` names.
-#[tokio::test(start_paused = true)]
-async fn the_epoch_follows_the_policy_and_names_the_leases() {
-    let mut disk = Disk::new();
+async fn the_epoch_follows_the_policy_and_names_the_leases(backing: Backing) {
+    let mut disk = Disk::over(backing);
     let first = disk.farm(EpochPolicy::Keep);
     let epoch = first.lease_epoch();
     assert_eq!(first.term(), epoch);
@@ -441,9 +575,8 @@ async fn a_requeue_the_store_refused_is_written_when_it_returns() {
 /// holding a granted lease takes the lease up, and when the daemon, which kills the runs
 /// of an earlier epoch, does not list it, requeues it at once under the new term. The
 /// old lease's result is refused.
-#[tokio::test(start_paused = true)]
-async fn a_bumped_epoch_requeues_the_old_term_leases_the_daemon_killed() {
-    let mut disk = Disk::new();
+async fn a_bumped_epoch_requeues_the_old_term_leases_the_daemon_killed(backing: Backing) {
+    let mut disk = Disk::over(backing);
     let before = disk.farm(EpochPolicy::Keep);
     let epoch = before.lease_epoch();
     let (_, mut inbox) = register(&before);
@@ -624,9 +757,8 @@ async fn lose_lease(farm: &TestFarm) -> (StreamId, Inbox) {
 /// Catches: a loss count that a restart forgets (an action that kills the scheduler's
 /// host starts from none each time and loops for ever): two losses are written, survive a
 /// crash, and the third, the recovered lease's, refuses the operation, whose rows then go.
-#[tokio::test(start_paused = true)]
-async fn lost_leases_are_counted_across_a_restart_and_the_third_is_refused() {
-    let mut disk = Disk::new();
+async fn lost_leases_are_counted_across_a_restart_and_the_third_is_refused(backing: Backing) {
+    let mut disk = Disk::over(backing);
     let before = disk.farm(EpochPolicy::Keep);
     let (_, mut inbox) = register(&before);
     submit(&before, request(1)).expect("submitted");
@@ -641,6 +773,8 @@ async fn lost_leases_are_counted_across_a_restart_and_the_third_is_refused() {
         assert_eq!(disk.rows("loss/"), 1, "the count is written");
     }
     disk.crash(before);
+    assert_eq!(disk.rows("loss/"), 1, "the count survived the restart");
+    assert_eq!(disk.rows("op/"), 1, "the operation survived the restart");
 
     let after = disk.farm(EpochPolicy::Keep);
     let (stream, mut inbox) = register(&after);
@@ -734,8 +868,90 @@ async fn a_store_with_an_unreadable_row_refuses_the_farm() {
     let disk = Disk::new();
     let put = Txn::new().put("op/0000000000000001", vec![0xff], kbf_state::Cond::Any);
     disk.store.txn(put).expect("store").expect("put");
-    let refused = disk.try_farm(EpochPolicy::Keep).err().expect("refused");
+    let refused = disk.try_farm(EpochPolicy::Keep).expect_err("refused");
     assert!(matches!(refused, StateError::Corrupt { .. }), "{refused:?}");
+}
+
+/// Runs each restart test over the fake and over a SQLite file: what the fake keeps
+/// across a crash is what the real store must.
+macro_rules! restarts {
+    ($($name:ident),* $(,)?) => {$(
+        mod $name {
+            use super::*;
+
+            #[tokio::test(start_paused = true)]
+            async fn over_the_fake() {
+                super::$name(Backing::Fake).await;
+            }
+
+            #[tokio::test(start_paused = true)]
+            async fn over_sqlite() {
+                super::$name(Backing::Sqlite).await;
+            }
+        }
+    )*};
+}
+
+restarts!(
+    a_restart_replays_the_claims_it_acknowledged,
+    after_a_kill_running_leases_are_rebound_and_undelivered_ones_requeued,
+    the_epoch_follows_the_policy_and_names_the_leases,
+    a_bumped_epoch_requeues_the_old_term_leases_the_daemon_killed,
+    lost_leases_are_counted_across_a_restart_and_the_third_is_refused
+);
+
+/// A state store opened as a start opens it: from the flag, over `dir`.
+fn store_from_flag(dir: &std::path::Path) -> Result<StateStore, StateError> {
+    let uri = format!("--state-store=sqlite://{}", dir.join("state.db").display());
+    let args = <kbf_server::Args as clap::Parser>::parse_from(["kbf-server", &uri]);
+    args.open_state_store()
+        .map(|state| state.expect("the flag is given"))
+}
+
+fn farm_over(state: StateStore) -> TestFarm {
+    Farm::new(
+        Arc::new(Cache::memory()),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    )
+    .with_state(Some(state))
+    .expect("a farm over the store")
+}
+
+/// Catches: `--state-store=sqlite:///...` parsed and then not opened (the scheduler runs
+/// in memory while the operator believes its queue is kept): an operation submitted
+/// through a farm over the flag's store is granted by the farm a restart starts over the
+/// same file, with the term a SQLite start owes (one past the first's).
+#[tokio::test(start_paused = true)]
+async fn an_operation_submitted_over_the_flag_survives_a_restart_of_the_file() {
+    let dir = Scratch::new();
+    let before = farm_over(store_from_flag(&dir.0).expect("a first start"));
+    let epoch = before.lease_epoch();
+    submit(&before, request(1)).expect("queued, no worker yet");
+    drop(before);
+
+    let after = farm_over(store_from_flag(&dir.0).expect("a second start"));
+    assert_eq!(after.lease_epoch(), epoch + 1, "every SQLite start is new");
+    let (_, mut inbox) = register(&after);
+    let leases = starts(&mut inbox);
+    assert_eq!(leases.len(), 1, "the queued operation was recovered");
+    assert_eq!(leases[0].term, epoch + 1);
+}
+
+/// Catches: a second frontend started on a state file another holds (two schedulers
+/// would hand out the same leases): refused naming the lock, and the file is free again
+/// once the first goes.
+#[test]
+fn a_second_frontend_on_the_same_sqlite_file_is_refused() {
+    let dir = Scratch::new();
+    let first = store_from_flag(&dir.0).expect("a first start");
+    let refused = store_from_flag(&dir.0).err().expect("the file is held");
+    assert!(matches!(refused, StateError::Open(_)), "{refused:?}");
+    let said = refused.to_string();
+    assert!(said.contains("another kbf process"), "{said}");
+    assert!(said.contains("state.db.lock"), "{said}");
+    drop(first);
+    store_from_flag(&dir.0).expect("free again");
 }
 
 fn listeners() -> Listeners {
@@ -768,6 +984,7 @@ async fn a_server_binds_over_a_state_store_or_refuses_it() {
     let state = |disk: &Disk| StateStore {
         store: disk.store.clone(),
         epoch: EpochPolicy::Keep,
+        members: Default::default(),
     };
     let bind = |state| {
         kbf_server::bind_server_with_state(

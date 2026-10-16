@@ -56,6 +56,8 @@ libc.workspace = true
 prost.workspace = true
 rcgen.workspace = true
 tokio = { workspace = true, features = ["io-util", "test-util"] }
+# rebuild_interest_cache for the tests that install a global subscriber while others run.
+tracing-core.workspace = true
 
 [lints]
 workspace = true

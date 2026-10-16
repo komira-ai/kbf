@@ -163,6 +163,16 @@ pub struct Args {
     /// the blob route do, and they are off unless it names their authorizers.
     #[arg(long)]
     pub reapi_auth_policy: Option<PathBuf>,
+    /// Proxy mode (`docs/design/architecture-v2.md`, section 7): the URL of a storage
+    /// node (`kbf storage`), such as `http://127.0.0.1:8990`. The REAPI listener then
+    /// answers a client's CAS, ByteStream and action-cache calls from that node, passing
+    /// ByteStream through without holding a blob. The local stores are still opened:
+    /// Execution and the worker listener use them (`kbf frontend` is this mode without
+    /// them: Execution reads the node too). Plain text (`http://`) only here; `kbf
+    /// frontend` takes the flags of the mutual TLS to the node. Without it, the server
+    /// answers those calls itself.
+    #[arg(long, value_name = "URL")]
+    pub storage: Option<String>,
     /// The `kbf.worker.v1` listener. Without mutual TLS (`--worker-tls-cert`,
     /// `--worker-tls-key`, `--worker-client-ca`) it serves plain text, on any address;
     /// off loopback the start line carries a warning.
@@ -366,16 +376,35 @@ pub struct Args {
     #[arg(long, default_value_t = kbf_front::InputTreeConfig::DEFAULT.reads_in_flight)]
     pub input_tree_reads_in_flight: NonZeroUsize,
     /// Where the scheduler keeps its state, written before each change is acknowledged and
-    /// replayed at start: `sqlite:///absolute/path` (a file on a local disk that this
-    /// process owns; every start is a new epoch, so daemons kill the runs of the leases
-    /// they held before) or `postgres://...` (a database that outlives the process; a
-    /// start keeps its epoch, so daemons keep their runs). Any other scheme is refused.
-    /// This build has neither backend yet: a start with the flag is refused. Left out, the
-    /// scheduler's state is in memory and a restart loses it
+    /// replayed at start: `sqlite:///absolute/path`, a file on a local disk that this
+    /// process owns. Every start is a new epoch, so daemons kill the runs of the leases
+    /// they held before. The file is created, with its directory, if missing (0600, and
+    /// 0700 for a directory it makes) and held by one process: a second frontend on it
+    /// refuses to start. Any other value, `postgres://` included, is refused (Postgres is
+    /// not wired yet). Left out, the scheduler's state is in memory and a restart loses it
     // Listed beside `--meta-dir`, whose place in the help it takes without moving the
     // flags declared after it.
-    #[arg(long, value_name = "URI", display_order = 5)]
+    #[arg(
+        long,
+        value_name = "URI",
+        value_parser = crate::state_store::StateStoreParser,
+        display_order = 5,
+    )]
     pub state_store: Option<crate::state_store::StateStoreUri>,
+    /// How long, in seconds, a storage node's membership row lives without a heartbeat
+    /// before the state store expires it and the member goes down in the storage map.
+    /// Nodes are asked to heartbeat three times as often.
+    #[arg(long, value_name = "SECONDS", default_value_t = 15, requires = "state_store", value_parser = clap::value_parser!(u64).range(3..))]
+    pub member_ttl_secs: u64,
+    /// How long, in seconds, a down storage member stays in the map before it leaves
+    /// and its blobs move to other owners.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = 300,
+        requires = "state_store"
+    )]
+    pub member_dwell_secs: u64,
 }
 
 /// This server in the tier registry. A farm runs one server today
@@ -413,6 +442,13 @@ pub enum ConfigError {
         path: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+    /// `--storage` is not a URL.
+    #[error("--storage {url:?}: {source}")]
+    Storage {
+        url: String,
+        #[source]
+        source: tonic::transport::Error,
     },
     /// A segment upload could declare more than uploads may hold at once.
     #[error(
@@ -527,6 +563,17 @@ impl Args {
         })
     }
 
+    /// How storage members live in the state store: `--member-ttl-secs` and
+    /// `--member-dwell-secs`.
+    #[must_use]
+    pub fn members(&self) -> crate::members::MembershipConfig {
+        crate::members::MembershipConfig {
+            ttl: Duration::from_secs(self.member_ttl_secs),
+            dwell: Duration::from_secs(self.member_dwell_secs),
+            ..crate::members::MembershipConfig::default()
+        }
+    }
+
     /// Refuses a `--segment-upload-max-bytes` over `--write-bytes-in-flight`: an upload
     /// of the whole cap would hold its ranges in memory past the bound uploads share.
     /// A function of its own: only the unit test reaches the refusal, and the integration
@@ -583,6 +630,24 @@ impl Args {
             policy.blobs_get.get_or_insert_with(allow);
         }
         Ok(policy)
+    }
+
+    /// The storage node `--storage` names, if given.
+    ///
+    /// # Errors
+    /// The URL is not one.
+    pub fn storage(&self) -> Result<Option<tonic::transport::Endpoint>, ConfigError> {
+        self.storage
+            .as_ref()
+            .map(|url| {
+                tonic::transport::Endpoint::from_shared(url.clone()).map_err(|source| {
+                    ConfigError::Storage {
+                        url: url.clone(),
+                        source,
+                    }
+                })
+            })
+            .transpose()
     }
 
     /// The operator API these flags describe, if `--api-listen` is given, with the

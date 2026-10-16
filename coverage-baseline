@@ -25,8 +25,9 @@ kbf-deploy                0      0
 kbf-driver-container      0      0
 kbf-driver-native         0      0
 kbf-estimator             -      -
-kbf-front                42      8
+kbf-front                41      7
 kbf-guest                15      6
+kbf-history               0      0
 kbf-host                  0      0
 kbf-invocation            0      0
 kbf-it                    2      1
@@ -42,12 +43,13 @@ kbf-objstore             62     19
 kbf-outputs               0      0
 kbf-proto                 0      0
 kbf-raft                 19     19
+kbf-route                 0      0
 kbf-sched                 1      1
 kbf-segments              7      5
 kbf-server                0      0
 kbf-sim                   6      3
 kbf-sim-cell              4     15
-kbf-state                 3     13
+kbf-state                 2     13
 kbf-storage               0      0
 kbf-store                 0      0
 kbf-testkit               0      0
