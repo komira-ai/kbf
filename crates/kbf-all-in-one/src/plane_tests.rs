@@ -15,6 +15,12 @@ fn plane(server: &tokio::runtime::Runtime) -> LocalDataPlane {
     LocalDataPlane::new(store, server.handle().clone())
 }
 
+/// A file that takes any bytes and keeps none.
+fn null_file() -> tokio::fs::File {
+    let file = std::fs::OpenOptions::new().write(true).open("/dev/null");
+    tokio::fs::File::from_std(file.expect("/dev/null"))
+}
+
 /// A runtime standing in for the server half.
 fn server() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
@@ -39,6 +45,9 @@ fn a_digest_that_does_not_parse_is_missing() {
             size_bytes: 3,
         };
         assert_eq!(plane.get(&bad).await, Err(CasError::Missing(label(&bad))));
+        let mut sink = null_file();
+        let into = plane.read_to(&bad, &mut sink).await;
+        assert_eq!(into, Err(CasError::Missing(label(&bad))));
         let held = plane.put(b"held".to_vec()).await.expect("put");
         assert_eq!(
             plane.missing(&[held.clone(), bad.clone()]).await,
@@ -68,6 +77,8 @@ fn a_gone_server_half_fails_every_call() {
         let digest = digest_of(b"anything");
         let read = plane.get(&digest).await;
         assert!(matches!(read, Err(CasError::Unavailable(..))), "{read:?}");
+        let into = plane.read_to(&digest, &mut null_file()).await;
+        assert!(matches!(into, Err(CasError::Unavailable(..))), "{into:?}");
         let put = plane.put(b"anything".to_vec()).await;
         assert!(matches!(put, Err(CasError::Unavailable(..))), "{put:?}");
         assert_eq!(plane.missing(std::slice::from_ref(&digest)).await, [digest]);

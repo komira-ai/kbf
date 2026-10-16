@@ -1,17 +1,17 @@
-//! An S3 service on loopback, for tests (feature `testkit`): PUT, ranged GET, HEAD,
-//! DELETE, and multipart upload (create, parts, complete, abort), with S3's rules on
+//! An S3 service on loopback, for tests (feature `testkit`): PUT, ranged GET, and
+//! multipart upload (create, parts, complete, abort), with S3's rules on
 //! part sizes enforced at completion and conditional writes (`If-None-Match: *`) on a
 //! PUT and a completion.
 //!
 //! It keeps what a test asks about: the uploads begun and not yet completed or aborted
 //! ([`FakeS3::incomplete_uploads`]), how many single PUTs and parts it took and the
-//! largest request body ([`FakeS3::stats`]). A test can fail one part
-//! ([`FakeS3::fail_part`]) or a completion ([`FakeS3::fail_complete`]).
+//! largest request body ([`FakeS3::stats`]). A test can fail any step of an upload
+//! once ([`FakeS3::fail`]).
 //!
 //! Bytes are kept compactly: a run of zeros is counted, not stored, so an object of
 //! many GiB of zeros costs the test nothing to hold. It does not check signatures.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -107,6 +107,32 @@ impl Kept {
     }
 }
 
+/// A request [`FakeS3::fail`] makes the service fail, once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    /// CreateMultipartUpload answers 500.
+    Create,
+    /// The upload of part `n` (of any upload) answers 500.
+    Part(u32),
+    /// The next part's answer has no ETag.
+    NoEtag,
+    /// CompleteMultipartUpload answers 500; the upload stays open.
+    Complete,
+    /// CompleteMultipartUpload answers 200 with an `<Error>` body, as S3 does when a
+    /// completion fails after its answer started; the upload stays open.
+    CompleteLate,
+    /// AbortMultipartUpload answers 500; the upload stays open.
+    Abort,
+}
+
+impl State {
+    /// Whether `failure` was asked for; it is then used up.
+    fn take(&mut self, failure: Failure) -> bool {
+        let at = self.failures.iter().position(|f| *f == failure);
+        at.map(|i| self.failures.remove(i)).is_some()
+    }
+}
+
 /// One multipart upload in progress.
 #[derive(Debug)]
 struct Upload {
@@ -119,8 +145,7 @@ struct State {
     objects: BTreeMap<String, Kept>,
     uploads: BTreeMap<String, Upload>,
     next: u64,
-    fail_parts: BTreeSet<u32>,
-    fail_complete: bool,
+    failures: Vec<Failure>,
     stats: FakeStats,
     requests: Vec<String>,
 }
@@ -182,15 +207,9 @@ impl FakeS3 {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Answers the next upload of part `number` (of any upload) with a 500.
-    pub fn fail_part(&self, number: u32) {
-        self.lock().fail_parts.insert(number);
-    }
-
-    /// Answers the next completion with a 200 whose body is an `<Error>`, as S3 does
-    /// when a completion fails after its answer started; the upload stays open.
-    pub fn fail_complete(&self) {
-        self.lock().fail_complete = true;
+    /// Fails the next request `failure` names, once.
+    pub fn fail(&self, failure: Failure) {
+        self.lock().failures.push(failure);
     }
 
     /// Multipart uploads begun and neither completed nor aborted.
@@ -318,74 +337,61 @@ fn handle(state: &mut State, request: &Request) -> Vec<u8> {
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
-    state.requests.push(format!(
-        "{} {}?{}",
-        request.method,
-        request.path,
-        query.join("&")
-    ));
+    let line = format!("{} {}?{}", request.method, request.path, query.join("&"));
+    state.requests.push(line);
     let body_len = request.body.len() as u64;
     state.stats.largest_body = state.stats.largest_body.max(body_len);
     // `/bucket/key`: the key is everything after the bucket.
-    let key = request
-        .path
-        .trim_start_matches('/')
-        .split_once('/')
-        .map(|(_, k)| k.to_owned());
-    let Some(key) = key.filter(|k| !k.is_empty()) else {
-        return match request.method.as_str() {
-            "PUT" => answer("200 OK", &[], b""),
-            _ => error("403 Forbidden", "AccessDenied"),
-        };
-    };
+    let key = request.path.trim_start_matches('/');
+    let key = key.split_once('/').map_or("", |(_, k)| k).to_owned();
     let q = |name: &str| request.query.get(name).cloned();
     let conditional = request.headers.get("if-none-match").map(String::as_str) == Some("*");
-    match (request.method.as_str(), q("uploadId"), q("partNumber")) {
-        ("POST", None, None) if request.query.contains_key("uploads") => {
+    let method = request.method.as_str();
+    match (method, q("uploads"), q("uploadId"), q("partNumber")) {
+        ("POST", Some(_), None, None) => {
+            if state.take(Failure::Create) {
+                return error("500 Internal Server Error", "InternalError");
+            }
             state.next += 1;
             let id = format!("upload-{}", state.next);
-            state.uploads.insert(
-                id.clone(),
-                Upload {
-                    key,
-                    parts: BTreeMap::new(),
-                },
-            );
+            let parts = BTreeMap::new();
+            state.uploads.insert(id.clone(), Upload { key, parts });
             let body = format!(
-                "<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key>\
-                 <UploadId>{id}</UploadId></InitiateMultipartUploadResult>"
+                "<InitiateMultipartUploadResult><UploadId>{id}</UploadId>\
+                 </InitiateMultipartUploadResult>"
             );
             answer("200 OK", &[], body.as_bytes())
         }
-        ("PUT", Some(id), Some(number)) => {
-            let Ok(number) = number.parse::<u32>() else {
-                return error("400 Bad Request", "InvalidArgument");
-            };
-            if state.fail_parts.remove(&number) {
+        ("PUT", None, Some(id), Some(number)) => {
+            let number: u32 = number.parse().unwrap_or(0);
+            let (failed, no_etag) = (
+                state.take(Failure::Part(number)),
+                state.take(Failure::NoEtag),
+            );
+            let upload = state.uploads.get_mut(&id).filter(|_| !failed);
+            let Some(upload) = upload else {
                 return error("500 Internal Server Error", "InternalError");
-            }
-            let Some(upload) = state.uploads.get_mut(&id) else {
-                return error("404 Not Found", "NoSuchUpload");
             };
-            if !(1..=10_000).contains(&number) || body_len > super::MAX_PART_BYTES {
-                return error("400 Bad Request", "InvalidArgument");
-            }
             let etag = format!("\"{id}-{number}-{body_len}\"");
-            upload
-                .parts
-                .insert(number, (etag.clone(), Kept::of(&request.body)));
+            let kept = Kept::of(&request.body);
+            upload.parts.insert(number, (etag.clone(), kept));
             state.stats.parts += 1;
-            answer("200 OK", &[("etag", etag)], b"")
+            let headers = if no_etag {
+                vec![]
+            } else {
+                vec![("etag", etag)]
+            };
+            answer("200 OK", &headers, b"")
         }
-        ("POST", Some(id), None) => complete(state, &id, &key, conditional, &request.body),
-        ("DELETE", Some(id), None) => {
-            if state.uploads.remove(&id).is_none() {
-                return error("404 Not Found", "NoSuchUpload");
+        ("POST", None, Some(id), None) => complete(state, &id, &key, conditional, &request.body),
+        ("DELETE", None, Some(id), None) => {
+            if state.take(Failure::Abort) || state.uploads.remove(&id).is_none() {
+                return error("500 Internal Server Error", "InternalError");
             }
             state.stats.aborted += 1;
             answer("204 No Content", &[], b"")
         }
-        ("PUT", None, None) => {
+        ("PUT", None, None, None) => {
             if conditional && state.objects.contains_key(&key) {
                 return error("412 Precondition Failed", "PreconditionFailed");
             }
@@ -393,69 +399,58 @@ fn handle(state: &mut State, request: &Request) -> Vec<u8> {
             state.stats.single_puts += 1;
             answer("200 OK", &[], b"")
         }
-        ("GET", None, None) => get(state, &key, request.headers.get("range")),
-        ("HEAD", None, None) => match state.objects.contains_key(&key) {
-            true => answer("200 OK", &[], b""),
-            false => answer("404 Not Found", &[], b""),
-        },
-        ("DELETE", None, None) => {
-            state.objects.remove(&key);
-            answer("204 No Content", &[], b"")
-        }
+        ("GET", None, None, None) => get(state, &key, request.headers.get("range")),
         _ => error("501 Not Implemented", "NotImplemented"),
     }
 }
 
-/// CompleteMultipartUpload: the parts the body names, in order, each with its ETag,
-/// every one but the last at least 5 MiB.
-fn complete(state: &mut State, id: &str, key: &str, conditional: bool, body: &[u8]) -> Vec<u8> {
-    let Some(upload) = state.uploads.get(id) else {
-        return error("404 Not Found", "NoSuchUpload");
-    };
-    if upload.key != key {
-        return error("400 Bad Request", "InvalidRequest");
-    }
+/// The object an upload's completion names: its parts, in the order the body lists
+/// them, each with its ETag and every one but the last at least 5 MiB; or the S3 error
+/// code that refuses it.
+fn assemble(upload: &Upload, body: &[u8]) -> Result<Kept, &'static str> {
     let text = String::from_utf8_lossy(body);
-    let Ok(doc) = roxmltree::Document::parse(&text) else {
-        return error("400 Bad Request", "MalformedXML");
+    let doc = roxmltree::Document::parse(&text).map_err(|_| "MalformedXML")?;
+    let field = |part: roxmltree::Node<'_, '_>, name: &str| {
+        let node = part.children().find(|n| n.tag_name().name() == name);
+        node.and_then(|n| n.text()).map(str::to_owned)
     };
-    let mut named = Vec::new();
-    for part in doc
-        .root_element()
-        .children()
-        .filter(|n| n.tag_name().name() == "Part")
-    {
-        let field = |name: &str| {
-            part.children()
-                .find(|n| n.tag_name().name() == name)
-                .and_then(|n| n.text())
-                .map(str::to_owned)
-        };
-        let number = field("PartNumber").and_then(|n| n.parse::<u32>().ok());
-        let (Some(number), Some(etag)) = (number, field("ETag")) else {
-            return error("400 Bad Request", "MalformedXML");
-        };
-        named.push((number, etag));
-    }
-    if named.is_empty() || named.windows(2).any(|w| w[0].0 >= w[1].0) {
-        return error("400 Bad Request", "InvalidPartOrder");
-    }
+    let parts = doc.root_element().children().filter(|n| n.is_element());
+    let named: Vec<(Option<u32>, Option<String>)> = parts
+        .map(|p| {
+            (
+                field(p, "PartNumber").and_then(|n| n.parse().ok()),
+                field(p, "ETag"),
+            )
+        })
+        .collect();
     let mut object = Kept::default();
     for (i, (number, etag)) in named.iter().enumerate() {
-        let Some((kept_etag, bytes)) = upload.parts.get(number) else {
-            return error("400 Bad Request", "InvalidPart");
-        };
-        if kept_etag != etag {
-            return error("400 Bad Request", "InvalidPart");
-        }
-        if i + 1 < named.len() && bytes.len < super::MIN_PART_BYTES {
-            return error("400 Bad Request", "EntityTooSmall");
-        }
-        object.extend(bytes);
+        let kept = number.and_then(|n| upload.parts.get(&n));
+        let kept = kept
+            .filter(|(e, _)| Some(e) == etag.as_ref())
+            .ok_or("InvalidPart")?;
+        let small = i + 1 < named.len() && kept.1.len < super::MIN_PART_BYTES;
+        (!small).then_some(()).ok_or("EntityTooSmall")?;
+        object.extend(&kept.1);
     }
-    if std::mem::take(&mut state.fail_complete) {
+    Ok(object)
+}
+
+/// CompleteMultipartUpload ([`assemble`]); conditional on `If-None-Match: *`.
+fn complete(state: &mut State, id: &str, key: &str, conditional: bool, body: &[u8]) -> Vec<u8> {
+    let Some(upload) = state.uploads.get(id).filter(|u| u.key == key) else {
+        return error("404 Not Found", "NoSuchUpload");
+    };
+    let object = match assemble(upload, body) {
+        Ok(object) => object,
+        Err(code) => return error("400 Bad Request", code),
+    };
+    if state.take(Failure::CompleteLate) {
         let body = "<Error><Code>InternalError</Code><Message>late</Message></Error>";
         return answer("200 OK", &[], body.as_bytes());
+    }
+    if state.take(Failure::Complete) {
+        return error("500 Internal Server Error", "InternalError");
     }
     if conditional && state.objects.contains_key(key) {
         return error("412 Precondition Failed", "PreconditionFailed");
@@ -463,35 +458,30 @@ fn complete(state: &mut State, id: &str, key: &str, conditional: bool, body: &[u
     state.uploads.remove(id);
     state.objects.insert(key.to_owned(), object);
     state.stats.completed += 1;
-    let body =
+    let done =
         "<CompleteMultipartUploadResult><ETag>\"done\"</ETag></CompleteMultipartUploadResult>";
-    answer("200 OK", &[], body.as_bytes())
+    answer("200 OK", &[], done.as_bytes())
 }
 
-/// A GET, whole or of one `bytes=first-last` range.
+/// A GET of one `bytes=first-last` range (the S3 store asks for nothing else).
 fn get(state: &State, key: &str, range: Option<&String>) -> Vec<u8> {
     let Some(object) = state.objects.get(key) else {
         return error("404 Not Found", "NoSuchKey");
     };
-    let Some(range) = range else {
-        return answer("200 OK", &[], &object.read(0, object.len));
-    };
     let parsed = range
-        .strip_prefix("bytes=")
+        .and_then(|r| r.strip_prefix("bytes="))
         .and_then(|r| r.split_once('-'))
         .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)));
-    let Some((first, last)) = parsed else {
-        return error("400 Bad Request", "InvalidRange");
-    };
-    if first >= object.len || last < first {
+    let Some((first, last)) = parsed.filter(|(f, l)| f < &object.len && f <= l) else {
         return error("416 Range Not Satisfiable", "InvalidRange");
-    }
+    };
     let end = (last + 1).min(object.len);
     let content_range = format!("bytes {first}-{}/{}", end - 1, object.len);
+    let bytes = object.read(first, end);
     answer(
         "206 Partial Content",
         &[("content-range", content_range)],
-        &object.read(first, end),
+        &bytes,
     )
 }
 

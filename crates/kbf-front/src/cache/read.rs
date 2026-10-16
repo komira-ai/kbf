@@ -196,11 +196,11 @@ impl<M: MetaLog, O: ObjectStore> BlobRead<M, O> {
         let Some(first) = self.next().await.transpose()? else {
             return Ok(Bytes::new());
         };
-        if first.len() as u64 == self.len() {
+        if first.len() as u64 == self.range_len() {
             return Ok(first);
         }
         // The caller bounds the blob's size: a decoded blob, or a batch read's.
-        let mut whole = BytesMut::with_capacity(usize::try_from(self.len()).unwrap_or(0));
+        let mut whole = BytesMut::with_capacity(usize::try_from(self.range_len()).unwrap_or(0));
         whole.extend_from_slice(&first);
         while let Some(window) = self.next().await.transpose()? {
             whole.extend_from_slice(&window);
@@ -210,14 +210,8 @@ impl<M: MetaLog, O: ObjectStore> BlobRead<M, O> {
 
     /// The bytes the read hands over in all: the range asked for.
     #[must_use]
-    pub fn len(&self) -> u64 {
+    pub fn range_len(&self) -> u64 {
         self.to - self.from
-    }
-
-    /// Whether the read hands over no bytes.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.to == self.from
     }
 
     /// The next bytes of the range asked for, at most [`READ_WINDOW_BYTES`]; `None`
@@ -277,12 +271,10 @@ impl<M: MetaLog, O: ObjectStore> BlobRead<M, O> {
             )
             .await;
             match read {
-                Ok(bytes) if bytes.len() as u64 == len => {
+                // The tier reads all of `len` or fails.
+                Ok(bytes) => {
                     staging.counters.local_reads.add(1);
                     return Ok(Bytes::from(bytes));
-                }
-                Ok(_) => {
-                    tracing::warn!(digest = %self.digest, %object, "a write tier read came back short; reading the store")
                 }
                 Err(kbf_tier::TierError::UnknownBlock(_)) => {}
                 Err(e) => {
@@ -293,10 +285,8 @@ impl<M: MetaLog, O: ObjectStore> BlobRead<M, O> {
         }
         let mark = self.staged_on.is_none();
         let key = self.writer.object_key(object)?;
-        let range = ByteRange::new(offset + start, len).ok_or_else(|| {
-            CacheError::Internal(format!("{} has no readable range at {offset}", self.digest))
-        })?;
         let digest = self.digest;
+        let range = ByteRange::new(offset + start, len).ok_or(CacheError::NotFound(digest))?;
         match self.writer.get_range(&key, range).await {
             Ok(bytes) if bytes.len() as u64 == len => Ok(bytes),
             Ok(_) => {

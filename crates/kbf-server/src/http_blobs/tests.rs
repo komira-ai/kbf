@@ -477,3 +477,38 @@ async fn a_large_read_is_admitted_for_one_window() {
         .expect("3");
     assert_eq!(three.num_permits(), 3);
 }
+
+/// Catches a read whose bytes fail their digest past its first window answered as a
+/// whole blob: the answer starts (the first window was sound), and its body ends with
+/// an error before its last window, so the client sees a cut download.
+#[tokio::test]
+async fn a_large_blob_damaged_past_its_first_window_cuts_its_body() {
+    let size = usize::try_from(kbf_front::READ_WINDOW_BYTES).expect("window") + 100;
+    let bytes: &'static [u8] = Box::leak(vec![7u8; size].into_boxed_slice());
+    let (state, digests) = budgeted(READ_BUDGET_BYTES, &[bytes]).await;
+    let digest = digests[0];
+    let location = state
+        .cache
+        .meta()
+        .query(move |s| s.blob(&digest))
+        .await
+        .expect("query");
+    let kbf_meta::BlobAnswer::Present { location, .. } = location else {
+        panic!("{location:?}");
+    };
+    let key = state.cache.object_key(location.object).expect("key");
+    let objects = state.cache.objects();
+    let all = kbf_objstore::ByteRange::new(0, u64::from(u32::MAX)).expect("range");
+    let mut stored = objects.get_range(&key, all).await.expect("get").to_vec();
+    let last = usize::try_from(location.offset).expect("offset") + size - 1;
+    stored[last] ^= 1;
+    objects.delete(&key).await.expect("delete");
+    objects
+        .put_new(&key, Bytes::from(stored), None)
+        .await
+        .expect("put");
+    let answer = get(&state, &digest).await;
+    assert_eq!(answer.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(answer.into_body(), usize::MAX).await;
+    assert!(body.is_err(), "the body ends with an error");
+}

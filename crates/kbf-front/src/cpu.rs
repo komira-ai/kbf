@@ -23,6 +23,13 @@ impl From<JobFailed> for Status {
     }
 }
 
+impl From<JobFailed> for kbf_objstore::ObjectStoreError {
+    /// A streamed write's body whose hashing failed: the write ends, storing nothing.
+    fn from(failed: JobFailed) -> Self {
+        Self::Body(failed.to_string())
+    }
+}
+
 impl From<JobFailed> for CacheError {
     fn from(failed: JobFailed) -> Self {
         CacheError::Internal(failed.to_string())

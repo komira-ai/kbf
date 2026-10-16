@@ -485,7 +485,11 @@ async fn a_failed_streamed_write_leaves_no_file() {
     store.put_stream(&k, 12, pieces(None)).await.expect("put");
     assert_eq!(store.get_range(&k, all(12)).await.unwrap(), "first second");
     let broke = ObjectStoreError::Body("the source broke".into());
-    for (name, len, tail) in [("broke", 12, Some(broke)), ("short", 13, None)] {
+    for (name, len, tail) in [
+        ("broke", 12, Some(broke)),
+        ("short", 13, None),
+        ("long", 11, None),
+    ] {
         let k = key(&format!("streamed/{name}"));
         let wrote = store.put_stream(&k, len, pieces(tail)).await;
         assert!(

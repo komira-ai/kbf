@@ -137,23 +137,19 @@ impl<M: MetaLog, O: ObjectStore> Reading<M, O> {
             return Some((piece, self));
         };
         let len = FLUSH_READ_BYTES.min(end - start);
-        let piece = match self.piece(start, len).await {
-            Ok(piece) => piece,
-            Err(why) => {
-                self.done = true;
-                return Some((Err(ObjectStoreError::Body(why)), self));
-            }
-        };
-        if start + len == end {
+        let piece = self.piece(start, len).await;
+        if piece.is_err() {
+            self.done = true;
+        } else if start + len == end {
             self.spans.pop_front();
         } else if let Some(front) = self.spans.front_mut() {
             front.0 += len;
         }
-        Some((Ok(piece), self))
+        Some((piece, self))
     }
 
     /// `len` bytes of the block from `start`, read and hashed into the check.
-    async fn piece(&mut self, start: u64, len: u64) -> Result<Bytes, String> {
+    async fn piece(&mut self, start: u64, len: u64) -> Result<Bytes, ObjectStoreError> {
         let (tier, object) = (Arc::clone(&self.tier), self.object);
         let n = usize::try_from(len).unwrap_or(usize::MAX);
         let read = blocking(
@@ -161,11 +157,9 @@ impl<M: MetaLog, O: ObjectStore> Reading<M, O> {
             Box::new(move || tier.read(object, start, n)),
         )
         .await;
-        let bytes = read.map_err(|e| format!("reading block of {object}: {e}"))?;
-        if bytes.len() as u64 != len {
-            return Err(format!("the block of {object} is short at {start}"));
-        }
-        let piece = Bytes::from(bytes);
+        // The tier reads all of `len` or fails.
+        let read = read.map_err(|e| format!("reading the block of {object}: {e}"));
+        let piece = Bytes::from(read.map_err(ObjectStoreError::Body)?);
         let mut check = std::mem::take(&mut self.check);
         let (at, hashed) = (self.written, piece.clone());
         let check = self
@@ -175,8 +169,7 @@ impl<M: MetaLog, O: ObjectStore> Reading<M, O> {
                 check.update(at, &hashed);
                 check
             })
-            .await
-            .map_err(|e| e.to_string())?;
+            .await?;
         self.check = check;
         self.written += len;
         Ok(piece)
@@ -279,19 +272,16 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             &found,
         );
         let put = self.writer.objects.put_stream(&key, total, body).await;
-        let checked = lock(&found).take();
-        if let Some(checked) = checked.as_ref().filter(|c| !c.bad.is_empty()) {
-            return self.drop_mismatched(staging, object, checked).await;
+        // A store that answers without reading the body found nothing: its footer is
+        // then not ours, and the flush is tried again.
+        let checked = lock(&found).take().unwrap_or_default();
+        if !checked.bad.is_empty() {
+            return self.drop_mismatched(staging, object, &checked).await;
         }
         let existed = match put {
             Ok(()) => false,
             Err(ObjectStoreError::AlreadyExists(_)) => true,
             Err(e) => return Err(e.into()),
-        };
-        let Some(checked) = checked else {
-            return Err(CacheError::Internal(format!(
-                "the store answered the flush of {object} before reading its records"
-            )));
         };
         let footer = encode_footer(len, &checked.good);
         let ours = Footer::parse(&footer, total)?;

@@ -177,4 +177,17 @@ mod tests {
         assert_eq!(short.good.len(), 2);
         assert_eq!(short.bad[0].actual, kbf_segments::sha256(b"th"));
     }
+
+    /// Catches an empty record (no bytes, at a piece's end or past the last) left
+    /// unchecked or taken for bad: each hashes to the empty digest, wherever it lies.
+    #[test]
+    fn empty_records_check_wherever_they_lie() {
+        let list = [blob(b"ab", 0), blob(b"", 2), blob(b"cd", 2), blob(b"", 4)];
+        let mut check = RecordCheck::new(list.to_vec());
+        check.update(0, b"ab");
+        check.update(2, b"cd");
+        let found = check.finish();
+        assert!(found.bad.is_empty(), "{:?}", found.bad);
+        assert_eq!(found.good.len(), 4);
+    }
 }

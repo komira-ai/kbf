@@ -95,7 +95,7 @@ impl Hashing {
     /// The next piece of the object: a piece of the blob, then its footer (or, if the
     /// bytes were not the blob's, an error in its place).
     async fn step(mut self) -> Option<(Result<Bytes, ObjectStoreError>, Self)> {
-        let mut hasher = self.hasher.take()?;
+        let hasher = self.hasher.take()?;
         let Some(piece) = self.bytes.next().await else {
             let (actual, crc32c) = hasher.finish();
             if actual != self.digest {
@@ -112,18 +112,24 @@ impl Hashing {
             return Some((Ok(Bytes::from(footer)), self));
         };
         let piece = match piece {
-            Ok(piece) => piece,
-            Err(e) => return Some((Err(e), self)),
+            Ok(piece) => self.hash(hasher, piece).await,
+            Err(e) => Err(e),
         };
+        Some((piece, self))
+    }
+
+    /// Hashes `piece` into `hasher` on the hashing pool, and keeps the hasher.
+    async fn hash(
+        &mut self,
+        mut hasher: RecordHasher,
+        piece: Bytes,
+    ) -> Result<Bytes, ObjectStoreError> {
         let hashed = piece.clone();
         let job = self.group.hashing.compute(move || {
             hasher.update(&hashed);
             hasher
         });
-        match job.await {
-            Ok(hasher) => self.hasher = Some(hasher),
-            Err(e) => return Some((Err(ObjectStoreError::Body(e.to_string())), self)),
-        }
-        Some((Ok(piece), self))
+        self.hasher = Some(job.await?);
+        Ok(piece)
     }
 }

@@ -361,10 +361,9 @@ impl Inner {
         self.room_for(len)?;
         let tmp = self.tmp_path();
         let mut file = File::create_new(&tmp).map_err(failed("create", &tmp))?;
-        if let Err(e) = file.write_all(&header(key)) {
-            let _ = fs::remove_file(&tmp);
-            return Err(failed("write", &tmp)(e));
-        }
+        // A failed write leaves the file in `tmp/`, which the next open empties.
+        file.write_all(&header(key))
+            .map_err(failed("write", &tmp))?;
         Ok((file, tmp))
     }
 
@@ -659,36 +658,32 @@ impl ObjectStore for FsStore {
     ) -> Result<(), ObjectStoreError> {
         let (inner, k) = (Arc::clone(&self.inner), key.clone());
         let (file, tmp) = blocking(move || inner.begin(&k, len)).await?;
-        let mut file = Arc::new(file);
         let mut written = 0u64;
         let filled = async {
+            let mut file = file;
             while let Some(piece) = body.next().await {
                 let piece = piece?;
                 written += piece.len() as u64;
                 if written > len {
                     return Err(body::too_long(len));
                 }
-                let (to, path) = (Arc::clone(&file), tmp.clone());
-                blocking(move || {
-                    let mut file: &File = &to;
-                    file.write_all(&piece).map_err(failed("write", &path))
+                let path = tmp.clone();
+                file = blocking(move || {
+                    let mut file = file;
+                    file.write_all(&piece).map_err(failed("write", &path))?;
+                    Ok(file)
                 })
                 .await?;
             }
             if written < len {
                 return Err(body::too_short(len, written));
             }
-            Ok(())
+            Ok(file)
         }
         .await;
         let (inner, key) = (Arc::clone(&self.inner), key.clone());
         blocking(move || {
-            let synced = filled.and_then(|()| {
-                let file = Arc::get_mut(&mut file).ok_or_else(|| {
-                    ObjectStoreError::Protocol("a streamed write's file is still shared".into())
-                })?;
-                file.sync_all().map_err(failed("sync", &tmp))
-            });
+            let synced = filled.and_then(|file| file.sync_all().map_err(failed("sync", &tmp)));
             inner.publish(&key, &tmp, synced)
         })
         .await

@@ -7,7 +7,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream;
-use kbf_objstore::s3::fake::FakeS3;
+use kbf_objstore::s3::fake::{Failure, FakeS3};
 use kbf_objstore::s3::{MULTIPART_THRESHOLD, PART_BYTES};
 use kbf_objstore::{BodyStream, ByteRange, Capabilities, ObjectKey, ObjectStore, ObjectStoreError};
 
@@ -117,7 +117,7 @@ async fn the_threshold_is_the_largest_single_put() {
 async fn a_failed_part_aborts_the_upload() {
     let s3 = FakeS3::start().await;
     let store = s3.store(CONDITIONAL);
-    s3.fail_part(2);
+    s3.fail(Failure::Part(2));
     let bytes = pattern(3 * PART_BYTES as usize);
     let k = key("part-fails");
     let wrote = store
@@ -166,7 +166,7 @@ async fn a_broken_body_aborts_the_upload() {
 async fn a_completion_that_fails_late_aborts_the_upload() {
     let s3 = FakeS3::start().await;
     let store = s3.store(CONDITIONAL);
-    s3.fail_complete();
+    s3.fail(Failure::CompleteLate);
     let bytes = pattern(PART_BYTES as usize + 1);
     let k = key("late");
     let wrote = store
@@ -221,18 +221,78 @@ async fn a_write_dropped_mid_upload_aborts_it() {
     // One part's worth and more, then a body that never ends.
     let pending = stream::iter(vec![Ok(first)]).chain(stream::pending());
     let k = key("dropped");
-    let wrote = tokio::time::timeout(
-        Duration::from_millis(500),
-        store.put_stream(&k, 4 * PART_BYTES, pending.boxed()),
-    )
-    .await;
-    assert!(wrote.is_err(), "the write cannot finish");
+    let writing = tokio::spawn(async move {
+        let _ = store.put_stream(&k, 4 * PART_BYTES, pending.boxed()).await;
+    });
+    // However slow the machine: the first part reaches the service, then the write
+    // waits for a body that never comes, and is dropped.
+    for _ in 0..1000 {
+        if s3.stats().parts == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(s3.stats().parts, 1, "the first part was sent");
-    for _ in 0..100 {
+    assert_eq!(s3.incomplete_uploads(), 1, "the upload is open");
+    writing.abort();
+    assert!(writing.await.is_err_and(|e| e.is_cancelled()));
+    for _ in 0..500 {
         if s3.incomplete_uploads() == 0 {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("the dropped write's upload was not aborted");
+}
+
+/// Catches a failure of any other step taken for a stored object, or a failure that
+/// leaves its upload behind: a refused create (nothing to abort), a refused completion
+/// and a part answered without an ETag each fail the write, store nothing, and leave no
+/// incomplete upload.
+#[tokio::test]
+async fn every_failed_step_fails_the_write_and_leaves_no_upload() {
+    let s3 = FakeS3::start().await;
+    let store = s3.store(CONDITIONAL);
+    let bytes = pattern(PART_BYTES as usize + 1);
+    for (failure, name) in [
+        (Failure::Create, "create"),
+        (Failure::Complete, "complete"),
+        (Failure::NoEtag, "no-etag"),
+    ] {
+        s3.fail(failure);
+        let k = key(name);
+        let wrote = store
+            .put_stream(&k, bytes.len() as u64, body(&bytes, None))
+            .await;
+        let expected = match failure {
+            Failure::NoEtag => {
+                matches!(&wrote, Err(ObjectStoreError::Protocol(m)) if m.contains("ETag"))
+            }
+            _ => matches!(&wrote, Err(ObjectStoreError::Service { status: 500, .. })),
+        };
+        assert!(expected, "{name}: {wrote:?}");
+        assert_eq!(s3.incomplete_uploads(), 0, "{name}: left behind");
+        assert_eq!(s3.object_len(&k), None, "{name}");
+    }
+    assert_eq!(s3.stats().aborted, 2, "create had nothing to abort");
+}
+
+/// Catches an abort's own failure taking the place of the write's error, or hiding
+/// it: the write fails with its part's error, and the upload the store would not
+/// abort is left to the bucket's lifecycle rule.
+#[tokio::test]
+async fn an_abort_that_fails_leaves_the_write_failed_with_its_own_error() {
+    let s3 = FakeS3::start().await;
+    let store = s3.store(CONDITIONAL);
+    s3.fail(Failure::Part(1));
+    s3.fail(Failure::Abort);
+    let bytes = pattern(PART_BYTES as usize + 1);
+    let wrote = store
+        .put_stream(&key("abort-fails"), bytes.len() as u64, body(&bytes, None))
+        .await;
+    assert!(
+        matches!(wrote, Err(ObjectStoreError::Service { status: 500, .. })),
+        "{wrote:?}"
+    );
+    assert_eq!(s3.incomplete_uploads(), 1);
 }

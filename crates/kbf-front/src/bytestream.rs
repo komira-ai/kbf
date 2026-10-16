@@ -114,7 +114,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
         };
         let read = self.cache.read_windows(&digest, offset, end).await?;
         self.recorder.call(&metadata, &caller, &instance, &|| {
-            CallKind::Downloaded(read.len())
+            CallKind::Downloaded(read.range_len())
         });
         let windows = stream::unfold(read, |mut read| async move {
             let window = read.next().await?;
@@ -176,26 +176,74 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
             return Ok(committed(size));
         }
         if size > MAX_UNSTAGED_BLOB_BYTES {
-            // What the write holds at once: a message here, a part in the store.
-            let admitted = self.cache.admit(MAX_UNSTAGED_BLOB_BYTES).await;
-            let refused = Arc::new(Mutex::new(None));
-            let body = messages(first, stream, size, Arc::clone(&refused));
-            let stored = self.cache.store_streamed(digest, body).await;
-            drop(admitted);
-            if let Some(status) = refused
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take()
-            {
-                return Err(status);
-            }
-            stored?;
+            self.write_streamed(first, stream, digest).await?;
             timed.bytes(size);
-            self.recorder
-                .call(&metadata, &caller, &instance, &|| CallKind::Uploaded(size));
-            timed.ok();
-            return Ok(committed(size));
+        } else {
+            self.write_whole(first, stream, digest, &timed).await?;
         }
+        self.recorder
+            .call(&metadata, &caller, &instance, &|| CallKind::Uploaded(size));
+        timed.ok();
+        Ok(committed(size))
+    }
+
+    /// The blob's full size and `complete` once it is durable; 0 and incomplete before.
+    async fn query_write_status(
+        &self,
+        request: Request<QueryWriteStatusRequest>,
+    ) -> Result<Response<QueryWriteStatusResponse>, Status> {
+        let caller = kbf_auth::metadata(&request);
+        let Resource { instance, digest } =
+            wire::write_resource(&request.into_inner().resource_name)?;
+        let call = "/google.bytestream.ByteStream/QueryWriteStatus";
+        authorize(&*self.authorizers.cas_put, &caller, call, &instance).await?;
+        let complete = self.cache.is_durable(&digest).await?;
+        let committed_size = if complete {
+            i64::try_from(digest.size_bytes).unwrap_or(i64::MAX)
+        } else {
+            0
+        };
+        Ok(Response::new(QueryWriteStatusResponse {
+            committed_size,
+            complete,
+        }))
+    }
+}
+
+impl<M: MetaLog, O: ObjectStore + 'static> ByteStreamService<M, O> {
+    /// Receives a blob of more than [`MAX_UNSTAGED_BLOB_BYTES`] from `first` on and
+    /// stores it as its messages arrive ([`Cache::store_streamed`]), admitted for
+    /// [`MAX_UNSTAGED_BLOB_BYTES`]: a message here, a part in the store.
+    async fn write_streamed(
+        &self,
+        first: WriteRequest,
+        stream: Streaming<WriteRequest>,
+        digest: kbf_types::Digest,
+    ) -> Result<(), Status> {
+        let admitted = self.cache.admit(MAX_UNSTAGED_BLOB_BYTES).await;
+        let refused = Arc::new(Mutex::new(None));
+        let body = messages(first, stream, digest.size_bytes, Arc::clone(&refused));
+        let stored = self.cache.store_streamed(digest, body).await;
+        drop(admitted);
+        let refused = refused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        refused.map_or(Ok(()), Err)?;
+        Ok(stored?)
+    }
+
+    /// Receives a blob of at most [`MAX_UNSTAGED_BLOB_BYTES`] from `first` on into
+    /// memory, admitted for its size before anything past `first` is read, verifies it
+    /// and stores it with others.
+    async fn write_whole(
+        &self,
+        first: WriteRequest,
+        mut stream: Streaming<WriteRequest>,
+        digest: kbf_types::Digest,
+        timed: &crate::metrics::Request<'_>,
+    ) -> Result<(), Status> {
+        let (name, size) = (first.resource_name.clone(), digest.size_bytes);
         // Admitted before anything past the first message is read, so every byte held
         // in `received` is counted under `--write-bytes-in-flight`; a Write over the
         // bound waits here. The first message is held like a batch, under the message
@@ -242,32 +290,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
         drop(buffering);
         let blob = VerifiedBlob::new(digest, received)?;
         self.cache.store_admitted(vec![blob], admitted).await?;
-        self.recorder
-            .call(&metadata, &caller, &instance, &|| CallKind::Uploaded(size));
-        timed.ok();
-        Ok(committed(size))
-    }
-
-    /// The blob's full size and `complete` once it is durable; 0 and incomplete before.
-    async fn query_write_status(
-        &self,
-        request: Request<QueryWriteStatusRequest>,
-    ) -> Result<Response<QueryWriteStatusResponse>, Status> {
-        let caller = kbf_auth::metadata(&request);
-        let Resource { instance, digest } =
-            wire::write_resource(&request.into_inner().resource_name)?;
-        let call = "/google.bytestream.ByteStream/QueryWriteStatus";
-        authorize(&*self.authorizers.cas_put, &caller, call, &instance).await?;
-        let complete = self.cache.is_durable(&digest).await?;
-        let committed_size = if complete {
-            i64::try_from(digest.size_bytes).unwrap_or(i64::MAX)
-        } else {
-            0
-        };
-        Ok(Response::new(QueryWriteStatusResponse {
-            committed_size,
-            complete,
-        }))
+        Ok(())
     }
 }
 

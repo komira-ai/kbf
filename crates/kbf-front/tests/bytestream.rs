@@ -276,3 +276,137 @@ async fn the_empty_blob_is_durable_without_a_write() {
     assert!(farm.find_missing(&[&empty]).await.is_empty());
     assert_eq!(status(&farm, &empty).await, (0, true));
 }
+
+/// A blob over [`MAX_UNSTAGED_BLOB_BYTES`], so a Write streams it to the store, and
+/// over two read windows: 20 MiB.
+fn large_blob(seed: u64) -> Blob {
+    Blob::new(pseudo_random(20 << 20, seed))
+}
+
+/// Catches a streamed Write that stores other bytes than it was sent (a piece lost or
+/// repeated between messages and parts), and a windowed Read that hands over other
+/// bytes than asked for at a window's edge, or the bytes of a range other than its
+/// own. A 20 MiB blob is written in 1 MiB messages, then read whole and across the
+/// first window's end.
+#[tokio::test]
+async fn a_large_blob_is_streamed_in_and_read_back_in_windows() {
+    let farm = Farm::start().await;
+    let blob = large_blob(31);
+    let messages = chunks(&write_name(&blob), &blob.data, 1 << 20);
+    let written = farm
+        .bytestream()
+        .write(futures::stream::iter(messages))
+        .await
+        .expect("written")
+        .into_inner();
+    assert_eq!(written.committed_size, blob.data.len() as i64);
+    assert_eq!(farm.find_missing(&[&blob]).await, []);
+    let whole = read(&farm, &blob, 0, 0).await.expect("read").concat();
+    assert!(whole == blob.data, "the whole blob reads back");
+    let window = usize::try_from(kbf_front::READ_WINDOW_BYTES).expect("window");
+    let edge = read(&farm, &blob, (window - 5) as i64, 10)
+        .await
+        .expect("read")
+        .concat();
+    assert_eq!(edge, blob.data[window - 5..window + 5]);
+}
+
+/// Catches a streamed Write stored under a digest its bytes do not have, or answered
+/// other than INVALID_ARGUMENT: one byte of a 20 MiB blob changed in flight is
+/// refused, and the blob stays missing.
+#[tokio::test]
+async fn a_large_write_that_fails_its_digest_is_refused_and_not_stored() {
+    let farm = Farm::start().await;
+    let blob = large_blob(32);
+    let mut sent = blob.data.clone();
+    sent[17 << 20] ^= 1;
+    let messages = chunks(&write_name(&blob), &sent, 1 << 20);
+    let refused = farm
+        .bytestream()
+        .write(futures::stream::iter(messages))
+        .await
+        .expect_err("a changed byte");
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+    assert!(refused.message().contains("hashes to"), "{refused:?}");
+    assert_eq!(farm.find_missing(&[&blob]).await, [blob.digest]);
+}
+
+/// Catches a streamed Write that takes messages the in-memory path refuses: one that
+/// skips ahead, one past the size the resource names, and one that changes the
+/// resource. Each is INVALID_ARGUMENT naming why, and nothing is stored.
+#[tokio::test]
+async fn a_large_write_out_of_order_too_long_or_renamed_is_refused() {
+    let farm = Farm::start().await;
+    let blob = large_blob(33);
+    let name = write_name(&blob);
+    let mut skipped = chunks(&name, &blob.data, 1 << 20);
+    skipped.remove(1);
+    let mut long = chunks(&name, &blob.data, 1 << 20);
+    if let Some(last) = long.last_mut() {
+        last.data.push(0);
+    }
+    let mut renamed = chunks(&name, &blob.data, 1 << 20);
+    renamed[2].resource_name = write_name(&large_blob(34));
+    for (messages, why) in [
+        (skipped, "write_offset"),
+        (long, "more than the"),
+        (renamed, "changed resource"),
+    ] {
+        let refused = farm
+            .bytestream()
+            .write(futures::stream::iter(messages))
+            .await
+            .expect_err(why);
+        assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+        assert!(refused.message().contains(why), "{why}: {refused:?}");
+    }
+    assert_eq!(farm.find_missing(&[&blob]).await, [blob.digest]);
+}
+
+/// Catches a windowed Read that sends a damaged blob's last window, or ends without
+/// an error, or leaves the object readable: a 20 MiB blob with one bit flipped in the
+/// store ends its Read UNAVAILABLE, and FindMissing then reports it missing (marked
+/// corrupt), so a client uploads it again.
+#[tokio::test]
+async fn a_large_blob_damaged_in_the_store_ends_its_read_with_an_error() {
+    let farm = Farm::start().await;
+    let blob = large_blob(35);
+    let messages = chunks(&write_name(&blob), &blob.data, 1 << 20);
+    farm.bytestream()
+        .write(futures::stream::iter(messages))
+        .await
+        .expect("written");
+    farm.corrupt_object_of(&blob).await;
+    assert_eq!(read(&farm, &blob, 0, 0).await, Err(Code::Unavailable));
+    assert_eq!(farm.find_missing(&[&blob]).await, [blob.digest]);
+}
+
+/// Catches a whole read of a blob too large to decode (the server holding it whole),
+/// and a windowed read of a range outside its blob: a blob of 64 MiB + 1, streamed in,
+/// is INVALID_ARGUMENT to `read_blob` and reads back whole through ByteStream; bytes
+/// 5..3 of it, or past its end, are refused.
+#[tokio::test]
+async fn a_blob_too_large_to_decode_is_read_only_in_windows() {
+    let farm = Farm::start().await;
+    let size = kbf_front::MAX_DECODED_BLOB_BYTES as usize + 1;
+    let blob = Blob::new(pseudo_random(size, 36));
+    let messages = chunks(&write_name(&blob), &blob.data, 4 << 20);
+    farm.bytestream()
+        .write(futures::stream::iter(messages))
+        .await
+        .expect("written");
+    let whole = farm.cache.read_blob(&blob.digest).await;
+    assert!(
+        matches!(whole, Err(kbf_front::CacheError::Invalid(_))),
+        "{whole:?}"
+    );
+    let read = read(&farm, &blob, 0, 0).await.expect("read").concat();
+    assert!(read == blob.data, "read back in windows");
+    for (from, to) in [(5, 3), (0, size as u64 + 1)] {
+        let refused = farm.cache.read_windows(&blob.digest, from, to).await;
+        assert!(
+            matches!(refused, Err(kbf_front::CacheError::Invalid(_))),
+            "{from}..{to}"
+        );
+    }
+}
