@@ -20,7 +20,8 @@ struct Backend;
 /// Catches a code changed for any error: a store that could not answer reported as
 /// NOT_FOUND (which a caller takes as "absent, upload it") or a client's mistake as
 /// UNAVAILABLE (which it retries forever), and a refused action-cache write answered as
-/// anything but the code that says why.
+/// anything but the code that says why, and a read offset past the end answered as a
+/// malformed request (INVALID_ARGUMENT) where ByteStream says OUT_OF_RANGE.
 #[test]
 fn each_error_answers_its_code_and_message() {
     let (a, b) = (digest(1), digest(2));
@@ -33,6 +34,13 @@ fn each_error_answers_its_code_and_message() {
                 actual: b,
             },
             Code::InvalidArgument,
+        ),
+        (
+            StorageError::OutOfRange {
+                digest: a,
+                offset: 9,
+            },
+            Code::OutOfRange,
         ),
         (StorageError::Invalid("bad".into()), Code::InvalidArgument),
         (ActionWriteError::NotDaemon.into(), Code::PermissionDenied),

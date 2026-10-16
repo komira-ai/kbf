@@ -121,8 +121,9 @@ pub const MAX_MESSAGE_BYTES: usize = MAX_BATCH_TOTAL_BYTES + (1 << 20);
 /// until then anything bigger is refused before a byte is buffered.
 pub const MAX_BLOB_BYTES: u64 = 1 << 30;
 
-/// The most data in one ByteStream `ReadResponse`.
-pub const READ_CHUNK_BYTES: usize = 1 << 20;
+/// The most data in one ByteStream `ReadResponse`, and in one chunk of a ranged storage
+/// read.
+pub const READ_CHUNK_BYTES: usize = kbf_storage::READ_CHUNK_BYTES;
 
 /// The four cache services over `cache`, ready for a tonic server. Every call is
 /// allowed.
