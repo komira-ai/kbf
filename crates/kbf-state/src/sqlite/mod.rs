@@ -1,8 +1,12 @@
 //! Red-first stub of the SQLite backend: the tests land first and fail on `todo!()`; the
 //! implementation follows in the next commit.
 
+// The stubs use none of these yet; the build is `-D warnings`.
+#[allow(dead_code)]
 mod error;
+#[allow(dead_code)]
 mod guard;
+#[allow(dead_code)]
 mod schema;
 
 use std::io;
