@@ -1,0 +1,28 @@
+# Throwaway (av2-15): resolves the new dependency into Cargo.lock on a runner, because
+# the lock cannot be written on the box this branch is developed on. Deleted in the
+# next commit.
+name: lockgen
+
+on:
+  push:
+    branches: ["av2-15/**"]
+
+permissions: {}
+
+jobs:
+  lock:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo fetch
+      - run: git diff --stat Cargo.lock
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lock
+          path: Cargo.lock
+          if-no-files-found: error

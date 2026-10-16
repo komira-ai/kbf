@@ -7,7 +7,13 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# The Postgres backend (`postgres` module). Off by default: the pure scheduler crates and
+# the single-node build carry no database client.
+postgres = ["dep:postgres"]
+
 [dependencies]
+postgres = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [lints]
