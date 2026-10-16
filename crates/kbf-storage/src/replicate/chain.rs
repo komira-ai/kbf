@@ -7,7 +7,9 @@ use std::time::Duration;
 use kbf_map::{Member, MemberId, MemberState};
 use kbf_types::Digest;
 
-use super::leg::ReplicaLeg;
+use tonic::transport::Channel;
+
+use super::leg::{Leg, ReplicaLeg};
 use super::peers::Peers;
 use super::{MapSource, View, check};
 use crate::StorageError;
@@ -97,6 +99,28 @@ impl Chain {
         let map = self.source.current()?;
         let me = self.source.me()?;
         Some(View { map, me })
+    }
+
+    /// The channel to the peer dialled at `addr`.
+    ///
+    /// # Errors
+    /// [`StorageError::Internal`] if `addr` is not one a channel can be made to.
+    pub(crate) fn peer(&self, addr: &str) -> Result<Channel, StorageError> {
+        self.peers.channel(addr)
+    }
+
+    /// A copy of a blob to `owner`, sent by this node whether or not it owns the blob.
+    ///
+    /// # Errors
+    /// [`StorageError::Internal`] if `owner` has no address a channel can be made to.
+    pub(crate) fn open_copy(&self, view: &View, owner: &Member) -> Result<Leg, StorageError> {
+        Ok(Leg::open(
+            self.peers.channel(&owner.addr)?,
+            view.map.generation(),
+            view.me,
+            self.config.stall,
+            self.config.commit,
+        ))
     }
 
     /// The map source, for a service that judges its other calls by it too.

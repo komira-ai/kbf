@@ -63,6 +63,8 @@ pub(crate) struct Mem {
     /// How long a put takes.
     pub put_takes: Mutex<Duration>,
     pub puts: Arc<AtomicUsize>,
+    /// Calls of `read_range`.
+    pub reads: AtomicUsize,
     /// What a streamed write does ([`Mem::stream`]).
     pub knobs: Arc<Knobs>,
     active: AtomicUsize,
@@ -113,6 +115,7 @@ impl Storage for Mem {
         limit: u64,
     ) -> Answer<'a, ReadStream> {
         Box::pin(async move {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             self.failing()?;
             if self.endless.load(Ordering::SeqCst) {
                 return Ok(stream::repeat(Ok(Bytes::from_static(&[7; 1024]))).boxed());
@@ -163,6 +166,7 @@ impl Storage for Mem {
             "stream panics"
         );
         self.knobs.enabled.load(Ordering::SeqCst).then(|| {
+            self.knobs.begun.fetch_add(1, Ordering::SeqCst);
             Box::new(MemPut {
                 blobs: Arc::clone(&self.blobs),
                 puts: Arc::clone(&self.puts),
@@ -235,6 +239,8 @@ impl Storage for Mem {
 pub(crate) struct Knobs {
     /// Whether [`Mem::stream`] offers a stream.
     pub enabled: AtomicBool,
+    /// Streams opened so far.
+    pub begun: AtomicUsize,
     /// `Mem::stream` panics, as a store's blocking call that fails would.
     pub open_panics: AtomicBool,
     /// Chunks and bytes appended so far, over every stream.
@@ -251,6 +257,7 @@ impl Default for Knobs {
     fn default() -> Self {
         Self {
             enabled: AtomicBool::new(false),
+            begun: AtomicUsize::new(0),
             open_panics: AtomicBool::new(false),
             chunks: AtomicUsize::new(0),
             bytes: AtomicU64::new(0),

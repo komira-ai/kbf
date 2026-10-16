@@ -288,14 +288,12 @@ async fn with_the_primary_down_the_next_owner_takes_the_write() {
     assert_eq!(farm.nodes[0].mem.knobs.chunks.load(Ordering::SeqCst), 0);
 }
 
-/// "Kill an owner mid-build and it finishes". A build of 30 blobs is written through the
-/// owners the map names, the first live one as primary; a third of the way in one node
-/// dies (the map has not noticed), and two thirds in the map turns and names it down. Every
-/// write is answered in the end (those whose primary was the dead node wait for the map and
-/// then go to the next owner), every blob is held by a live node, and every blob that is
-/// on one live node only is owed by that node.
-#[tokio::test]
-async fn an_owner_killed_mid_build_does_not_stop_it() {
+/// The build of [`an_owner_killed_mid_build_does_not_stop_it`]: 30 blobs written through
+/// the owners the map names, the first live one as primary; a third of the way in node 1
+/// dies (the map has not noticed), and two thirds in the map turns and names it down.
+/// Writes whose primary was the dead node wait for the map and then go to the next owner.
+/// Returns the farm, the blobs, and the final map.
+pub(super) async fn a_build_with_a_killed_owner() -> (Farm, Vec<Vec<u8>>, Arc<kbf_map::Map>) {
     let farm = Farm::start(3, ChainConfig::default()).await;
     let mut map = farm.map(1, 2, &[]);
     let mut generation = 1;
@@ -339,6 +337,15 @@ async fn an_owner_killed_mid_build_does_not_stop_it() {
             Err(other) => panic!("blob {i}: {other:?}"),
         }
     }
+    (farm, written, map)
+}
+
+/// "Kill an owner mid-build and it finishes": every write of the build is answered in the
+/// end, every blob is held by a live node, and every blob not on both its owners is owed
+/// by a node that holds it.
+#[tokio::test]
+async fn an_owner_killed_mid_build_does_not_stop_it() {
+    let (farm, written, map) = a_build_with_a_killed_owner().await;
     assert_eq!(written.len(), 30, "every write answered in the end");
     for bytes in &written {
         let digest = sha(bytes);

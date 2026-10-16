@@ -8,3 +8,4 @@ mod generation;
 mod leg;
 mod plan;
 mod tls;
+mod worker;

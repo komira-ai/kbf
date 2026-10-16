@@ -113,6 +113,13 @@ async fn a_panic_in_the_journal_fails_the_call_and_loses_no_debt() {
         "{answer:?}"
     );
     assert_eq!(repairs.open_records(), [record(1)]);
+    // The same for settling a debt: the call fails, and the debt is still owed.
+    let answer = repairs.settle(&digest(1)).await;
+    assert!(
+        matches!(answer, Err(StorageError::Internal(_))),
+        "{answer:?}"
+    );
+    assert_eq!(repairs.open_records(), [record(1)]);
 }
 
 /// Catches a ledger that tells no one being asked for something: both of its reports return
