@@ -188,8 +188,16 @@ pub(super) fn on_host<E: Exec>(exec: &E, unit: &UnitFile, key: &Path) -> OnHost 
 /// runs as a user that is not the key's alone, or `None`. With no `User=` it runs as
 /// root; as `build_user` (`KBF_USER`) it runs as the user builds run as.
 pub(super) fn holder(unit: &UnitFile, build_user: &str) -> Option<String> {
-    let _ = (unit, build_user);
-    None
+    match unit
+        .get_in("Service", "User")
+        .map(|u| u.trim_matches(WHITESPACE))
+    {
+        None | Some("") => Some("runs as root (no User=)".to_owned()),
+        Some(u) if u == build_user => {
+            Some(format!("runs as {u}, the user builds run as (KBF_USER)"))
+        }
+        Some(_) => None,
+    }
 }
 
 /// [`holder`]'s reading of the node: each key file the unit's `EnvironmentFile=` lines
@@ -197,8 +205,74 @@ pub(super) fn holder(unit: &UnitFile, build_user: &str) -> Option<String> {
 /// unit's user's, with no group or other bit. A key file that is not there, a
 /// user or file the check cannot read, is a `SKIP credential:` line.
 pub(super) fn holder_on_host<E: Exec>(exec: &E, unit: &UnitFile, key: &HostPath) -> OnHost {
-    let _ = (exec, unit, key);
-    OnHost::default()
+    let mut out = OnHost::default();
+    let Some(user) = unit
+        .get_in("Service", "User")
+        .map(|u| u.trim_matches(WHITESPACE))
+        .filter(|u| !u.is_empty())
+    else {
+        return out;
+    };
+    let named: Vec<String> = given(unit)
+        .files
+        .iter()
+        .filter(|f| names_key(f, Path::new(key.as_str())))
+        .map(|f| bare(f).to_owned())
+        .collect();
+    for f in named {
+        let path = env_file(&f).unwrap_or_else(|| key.clone());
+        let meta = match exec.stat(&path) {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                out.notes.push(format!(
+                    "SKIP credential: no key file at {path} yet, so its owner and mode were \
+                     not checked"
+                ));
+                continue;
+            }
+            Err(e) => {
+                out.notes.push(format!(
+                    "SKIP credential: cannot read {path} ({e}), so its owner and mode were \
+                     not checked"
+                ));
+                continue;
+            }
+        };
+        if meta.kind != Kind::File {
+            out.failures.push(format!(
+                "{path} is not a plain file (a link or a directory)"
+            ));
+            continue;
+        }
+        let bits = meta.perms.bits();
+        if bits & 0o077 != 0 {
+            out.failures.push(format!(
+                "{path} is mode {bits:04o}, so users other than {user} can read the key: make \
+                 it 0600"
+            ));
+        }
+        // systemd reads the file as root, so a root-owned key works as well; any other
+        // owner can read or replace it.
+        if meta.owner.uid == 0 {
+            continue;
+        }
+        match user::lookup(exec, user) {
+            Ok(Some(u)) if u.uid != meta.owner.uid => out.failures.push(format!(
+                "{path} is uid {}'s, neither root's nor {user}'s (uid {}): that user can \
+                 read or replace the key",
+                meta.owner.uid, u.uid
+            )),
+            Ok(Some(_)) => {}
+            Ok(None) => out
+                .failures
+                .push(format!("User={user} is not a user on this node")),
+            Err(e) => out.notes.push(format!(
+                "SKIP credential: cannot look up User={user} ({e}), so the owner of {path} \
+                 was not checked"
+            )),
+        }
+    }
+    out
 }
 
 /// The one file the `EnvironmentFile=` path `path` (no wildcard, [`bare`]) names, when

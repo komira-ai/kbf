@@ -72,8 +72,33 @@ fn flag<'a>(words: &'a [String], name: &str) -> Option<&'a str> {
 
 /// Rule `storage`: how the unit of a storage node falls short, one line per way.
 pub(super) fn storage(unit: &UnitFile, key: &std::path::Path) -> Vec<String> {
-    let _ = (unit, key);
-    Vec::new()
+    let words = exec_words(unit);
+    let mut out = Vec::new();
+    let missing: Vec<String> = STORAGE_FLAGS
+        .iter()
+        .filter(|f| flag(&words, f).is_none_or(str::is_empty))
+        .map(|f| format!("--{f}"))
+        .collect();
+    if !missing.is_empty() {
+        out.push(format!(
+            "gives no {}: a storage node keeps its blobs in a cold store and its index in a \
+             metadata directory, and serves mutual TLS on its listen address",
+            missing.join(" ")
+        ));
+    }
+    let s3 = flag(&words, "cold-store").is_some_and(|v| v.starts_with("s3://"));
+    let keyed = credential::given(unit)
+        .files
+        .iter()
+        .any(|f| credential::names_key(f, key));
+    if s3 && !keyed {
+        out.push(format!(
+            "has an s3:// cold store and no EnvironmentFile={}: kbf storage starts without \
+             the bucket's key pair and refuses",
+            key.display()
+        ));
+    }
+    out
 }
 
 /// Whether `url`, which starts with a `postgres://` or `postgresql://` scheme, carries
@@ -111,15 +136,77 @@ fn variable(value: &str) -> Option<&str> {
 /// Rule `state-store` on the unit alone: its failures, and the `WARN state-store:`
 /// line when `--state-store` names a variable.
 pub(super) fn state_store(unit: &UnitFile) -> (Vec<String>, Option<String>) {
-    let _ = unit;
-    (Vec::new(), None)
+    let mut failures = Vec::new();
+    for d in unit.directives() {
+        let leaks = credential::words(&d.value)
+            .iter()
+            .any(|w| postgres_uris(w).any(has_password));
+        if leaks {
+            failures.push(format!(
+                "{}= holds a postgres URI with a password: a unit file and a command line \
+                 are readable by every user; put the URI in an EnvironmentFile= of mode 0600 \
+                 and pass --state-store=${{VAR}}",
+                d.key
+            ));
+        }
+    }
+    let words = exec_words(unit);
+    let named = flag(&words, "state-store").and_then(variable);
+    let mut warn = None;
+    if let Some(var) = named {
+        if credential::given(unit).files.is_empty() {
+            failures.push(format!(
+                "--state-store names ${{{var}}} and no EnvironmentFile= sets it"
+            ));
+        }
+        warn = Some(format!(
+            "WARN state-store: systemd expands ${{{var}}} into kbf's command line, which \
+             other users on the node can read in /proc unless it is mounted hidepid=2; \
+             the password is out of the unit file, not out of argv"
+        ));
+    }
+    (failures, warn)
 }
 
 /// Rule `state-store` on the node: each environment file of the unit that sets the
 /// variable `--state-store` names has no group or other bit.
 pub(super) fn on_host<E: Exec>(exec: &E, unit: &UnitFile) -> OnHost {
-    let _ = (exec, unit);
-    OnHost::default()
+    let mut out = OnHost::default();
+    let words = exec_words(unit);
+    let Some(var) = flag(&words, "state-store").and_then(variable) else {
+        return out;
+    };
+    for f in credential::given(unit).files {
+        let bare = credential::bare(&f);
+        if glob::is_wildcard(bare) {
+            out.notes.push(format!(
+                "SKIP state-store: EnvironmentFile={f} is a wildcard; the modes of the files \
+                 it matches were not checked"
+            ));
+            continue;
+        }
+        let Some(path) = credential::env_file(bare) else {
+            continue;
+        };
+        match exec.inspect(&path) {
+            Ok(Some(Entry::File { perms, bytes, .. })) => {
+                let sets = credential::env_file_names(&bytes).any(|n| n == var);
+                let bits = perms.bits();
+                if sets && bits & 0o077 != 0 {
+                    out.failures.push(format!(
+                        "EnvironmentFile={f} sets {var}, the state store's URI, and is mode \
+                         {bits:04o}: other users can read its password; make it 0600"
+                    ));
+                }
+            }
+            Ok(_) => {}
+            Err(e) => out.notes.push(format!(
+                "SKIP state-store: cannot read EnvironmentFile={f} ({e}), so its mode was not \
+                 checked"
+            )),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
