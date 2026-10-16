@@ -8,7 +8,6 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-clap.workspace = true
 kbf-meta.workspace = true
 kbf-segments.workspace = true
 kbf-store.workspace = true

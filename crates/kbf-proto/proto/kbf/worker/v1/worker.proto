@@ -439,8 +439,42 @@ message ResourceUsage {
   uint64 cpu_user_micros = 1;
   // CPU time the kernel spent on the action's behalf, in microseconds.
   uint64 cpu_system_micros = 2;
-  // The largest resident memory of any one process of the action, in bytes.
+  // The largest resident memory of any one process of the action, in bytes (for a
+  // runtime that gives the action a cgroup, the cgroup's `memory.peak`).
   uint64 peak_memory_bytes = 3;
   // Wall time from the action's start to its exit, in microseconds.
   uint64 wall_micros = 4;
+  // What the lease's own cgroup (v2) counted, for a runtime that gives each action
+  // one. Absent for a runtime that does not, so a reader that predates this field
+  // sees the four above unchanged.
+  CgroupUsage cgroup = 5;
+}
+
+// The counters of a lease's cgroup v2, read when the action ended. A field that is
+// absent was not readable (no cgroup v2, or a controller not enabled): absent is not
+// zero. Measurement only: nothing in scheduling reads these.
+message CgroupUsage {
+  // `cpu.stat` usage_usec, user_usec and system_usec: CPU time of every process in
+  // the cgroup, in microseconds.
+  optional uint64 cpu_usage_micros = 1;
+  optional uint64 cpu_user_micros = 2;
+  optional uint64 cpu_system_micros = 3;
+  // `cpu.stat` nr_periods, nr_throttled and throttled_usec: the CFS bandwidth
+  // periods the cgroup ran in, those it was throttled in, and the time it spent
+  // throttled. Zero without a `cpu.max` quota, which kbf does not set.
+  optional uint64 cpu_periods = 4;
+  optional uint64 cpu_throttled_periods = 5;
+  optional uint64 cpu_throttled_micros = 6;
+  // `memory.peak`: the most memory the cgroup held at once, in bytes.
+  optional uint64 memory_peak_bytes = 7;
+  // `memory.numa_stat` anon + file per NUMA node, in bytes, of the sample with the
+  // most memory (the action's end, or an earlier sample while it ran: anon memory is
+  // gone once the processes have exited). Empty when not readable.
+  repeated NumaNodeBytes numa = 8;
+}
+
+// Bytes of one NUMA node.
+message NumaNodeBytes {
+  uint32 node = 1;
+  uint64 bytes = 2;
 }

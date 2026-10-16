@@ -51,7 +51,7 @@ use crate::wire::MAX_MESSAGE_BYTES;
 /// lost every blob it had sent to one failed 1 GiB upload. Under kbf-server's smallest
 /// `--segment-upload-max-bytes` (one 1 GiB blob and its footer), so every server admits
 /// it. The server's PUT of a segment of this size is also one a slow store finishes
-/// within `--s3-min-put-rate`.
+/// within `min-put-rate` of `kbf-server --cold-store`.
 pub const SEGMENT_UPLOAD_BYTES: u64 = 32 << 20;
 
 /// The most records one upload holds: the server's limit.

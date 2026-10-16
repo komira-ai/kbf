@@ -10,10 +10,16 @@
 //! never is. For any other operation each seam costs a set lookup, and no event or
 //! listing is built.
 //!
+//! One thing is told of every operation that ran, recorded or not: the `action usage:`
+//! log line ([`usage_line`]) of a result that carries a `ResourceUsage`, keyed by the
+//! action's mnemonic and target when a recorded call named them.
+//!
 //! [`Dispatch::submit`]: kbf_front::Dispatch::submit
 
-use kbf_front::{ExecuteCall, Finished, wall_now};
+use kbf_front::{ActionLabel, ExecuteCall, Finished, wall_now};
 use kbf_invocation::{Event, LeaseEnd, Outcome as Answered};
+use kbf_proto::reapi::ActionResult;
+use kbf_proto::worker::ResourceUsage;
 use kbf_sched::Requeue;
 use kbf_types::{Answer, Digest, LeaseGrant, OperationId, Outcome, Refusal, StartLease};
 use tonic::Code;
@@ -33,7 +39,9 @@ impl State {
     ) {
         let twin = self.sched.twin(request);
         let operation = twin.unwrap_or_else(|| self.sched.next_operation());
-        self.recorded.insert(operation);
+        // A twin keeps the label of the call that queued it.
+        let label = call.label();
+        self.recorded.entry(operation).or_insert(label);
         for event in call.answered(name.to_owned(), operation, twin.is_some()) {
             self.recorder.emit(event);
         }
@@ -41,7 +49,7 @@ impl State {
 
     /// Whether a recorded call waits on `operation`.
     fn is_recorded(&self, operation: OperationId) -> bool {
-        self.recorded.contains(&operation)
+        self.recorded.contains_key(&operation)
     }
 
     pub(super) fn record_granted(&self, grant: &LeaseGrant) {
@@ -89,7 +97,15 @@ impl State {
         stored: Option<Digest>,
         reason: Option<String>,
     ) {
-        if !self.recorded.remove(&answer.operation) {
+        let label = self.recorded.remove(&answer.operation);
+        // One line per run that reported what it used, for any operation: a call
+        // without an invocation id is not recorded, and has no label.
+        if let Finished::Ran(result) = finished
+            && let Some(line) = usage_line(label.as_ref(), result)
+        {
+            tracing::info!(operation = %answer.operation, "action usage: {line}");
+        }
+        if label.is_none() {
             return;
         }
         let listing = match finished {
@@ -112,7 +128,7 @@ impl State {
 
     /// Sends the end of an operation the scheduler refused: no lease ended it.
     pub(super) fn record_refused(&mut self, refusal: &Refusal) {
-        if !self.recorded.remove(&refusal.operation) {
+        if self.recorded.remove(&refusal.operation).is_none() {
             return;
         }
         self.recorder
@@ -124,6 +140,30 @@ impl State {
                 at: wall_now(),
             }));
     }
+}
+
+/// The fields of the `action usage:` line of an action that ran: its exit code, its
+/// `mnemonic` and `target` as the client sent them (`-` when it sent none, or the
+/// operation was not recorded), the run's wall time and what the lease's cgroup
+/// counted (`kbf_proto::worker::CgroupUsage::log_fields`, the keys of the daemon's
+/// `lease phases:` line). `None` for a result that carries no usage: nothing was
+/// measured, so there is nothing to say.
+fn usage_line(label: Option<&ActionLabel>, result: &ActionResult) -> Option<String> {
+    let usage = ResourceUsage::in_result(result)?;
+    let text = |t: Option<&String>| t.map_or_else(|| "-".to_owned(), |t| format!("{t:?}"));
+    let cgroup = usage
+        .cgroup
+        .as_ref()
+        .map_or_else(kbf_proto::no_cgroup_fields, |c| {
+            c.log_fields(usage.wall_micros)
+        });
+    Some(format!(
+        "exit_code={} mnemonic={} target={} wall_us={} {cgroup}",
+        result.exit_code,
+        text(label.and_then(|l| l.mnemonic.as_ref())),
+        text(label.and_then(|l| l.target.as_ref())),
+        usage.wall_micros,
+    ))
 }
 
 /// What callers told `finished` were answered, as a row records it (section 3.2): an

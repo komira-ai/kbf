@@ -108,9 +108,9 @@ pub struct TierStartup {
     /// The tier this server stages on now.
     pub tier: TierId,
     /// Whether this start registered it (`AddTier`): a directory used for the first
-    /// time, or the one after `--write-tier-abandon`.
+    /// time, or the one after `--hot-store-abandon`.
     pub registered: bool,
-    /// The objects `--write-tier-abandon` marked unreachable as missing.
+    /// The objects `--hot-store-abandon` marked unreachable as missing.
     pub abandoned: Vec<ObjectId>,
     /// What the disk layer's open found and did. Its `lost` objects are marked
     /// unreachable as missing by the time this is returned.
@@ -127,8 +127,8 @@ pub enum TierStartError {
     /// flag must not destroy the index.
     #[error(transparent)]
     Tier(#[from] TierError),
-    /// `--write-tier-abandon` names a tier that is not this server's.
-    #[error("--write-tier-abandon names {named}, but this server's tier is {}", current.map_or_else(|| "none".to_owned(), |t| t.to_string()))]
+    /// `--hot-store-abandon` names a tier that is not this server's.
+    #[error("--hot-store-abandon names {named}, but this server's tier is {}", current.map_or_else(|| "none".to_owned(), |t| t.to_string()))]
     AbandonOther {
         /// The tier the flag names.
         named: TierId,
@@ -277,6 +277,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         location: Location,
         staged_on: Option<TierId>,
     ) -> Result<Bytes, CacheError> {
+        self.used([location.object]);
         if let Some(staging) = self.writer.tier.get()
             && staged_on.is_none_or(|t| t == staging.id)
         {

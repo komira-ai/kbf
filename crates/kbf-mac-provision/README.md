@@ -42,8 +42,8 @@ What the script did not do:
   - `daemon_user` (`role`, the default, or `root`; `kbf_cache`, an absolute path):
     with `role` nothing changes and nothing is checked. With `root` the property list
     has no `UserName` or `GroupName`, the error log is root's, the node key (`kbf_key`)
-    is a regular file with one link, root's, mode 600, and the scratch root and
-    `kbf_cache` (if set) are directories of root's, mode 755, on `kbf_volume`.
+    is a regular file with one link, root's, mode 600, and the data directory
+    (`kbf_data_dir`) and `kbf_cache` (if set) are directories of root's, mode 755, on `kbf_volume`.
     `daemon_user=root` makes kbf-daemon run as root; a profile sets it only once the
     daemon runs every action as a pool user and refuses uid 0 (step 3 of that
     document).
@@ -67,6 +67,10 @@ kbf-mac-provision revert                                # root: put back the rec
   passed to `kbf-daemon` as a `--label`.
 - `--keys` limits `check` and `apply` to the named items. `--root DIR` runs everything
   under DIR; only the tests use it.
+- `kbf_data_dir` is kbf-daemon's `--data-dir` (it keeps `leases/`, `cache/` and `trees/`
+  under it; the profile has no size key, so the daemon sizes the directory from the
+  filesystem). The old name `kbf_scratch` is still accepted, as `kbf_data_dir`, with one
+  warning line on stderr; a profile that sets both keys is refused.
 - An example profile, with placeholder values, is [example.profile](example.profile).
 
 ## Items
@@ -94,7 +98,7 @@ letters and `_` only.
 | `default_developer_dir` | a pinned Xcode's path | `xcode-select -p` | `xcode-select -s` |
 | `probe` (`expect_probe`) | `KEY:/PATH:SHA256`; `KEY:XCODE_BUILD=VALUE` | each probe script's SHA-256 | check only. `expect_probe` lines are validated (a known probe, a pinned Xcode, once each) and printed |
 | `simulator_runtimes` | none | `/Library/Developer/CoreSimulator`: `Images/*.dmg`, `Profiles/Runtimes/*.simruntime`, `Volumes/*` | check only: runtimes live in VM images |
-| `launchd_label` (`kbf_server`, `kbf_cas`, `kbf_ca_cert`, `kbf_cert`, `kbf_key`, `kbf_scratch`, `kbf_labels`, `hostname`, `role_user`) | label | `/Library/LaunchDaemons/<label>.plist` equals the one the profile renders (section 5.3: `UserName`/`GroupName` the role account, `ProcessType` `Interactive`, `ExitTimeOut` 30, the daemon's flags), root-owned, mode 644; `/Library/Logs/kbf` root's, mode 755; the error log in it a regular file with one link, the role account's, mode 644; the job loaded | makes the directory root's, replaces anything else at the error log's path (unlinked, never followed) with a new file of the role account, writes the plist, then restarts the job: `launchctl bootout`, the error log truncated while it is stopped, `launchctl bootstrap`. `restart` refuses, before it stops anything, when the error log is not such a file, so a link the role account plants is never emptied as root |
+| `launchd_label` (`kbf_server`, `kbf_cas`, `kbf_ca_cert`, `kbf_cert`, `kbf_key`, `kbf_data_dir`, `kbf_labels`, `hostname`, `role_user`) | label | `/Library/LaunchDaemons/<label>.plist` equals the one the profile renders (section 5.3: `UserName`/`GroupName` the role account, `ProcessType` `Interactive`, `ExitTimeOut` 30, the daemon's flags), root-owned, mode 644; `/Library/Logs/kbf` root's, mode 755; the error log in it a regular file with one link, the role account's, mode 644; the job loaded | makes the directory root's, replaces anything else at the error log's path (unlinked, never followed) with a new file of the role account, writes the plist, then restarts the job: `launchctl bootout`, the error log truncated while it is stopped, `launchctl bootstrap`. `restart` refuses, before it stops anything, when the error log is not such a file, so a link the role account plants is never emptied as root |
 
 ## Tests
 

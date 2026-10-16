@@ -69,11 +69,13 @@ use tonic::service::Routes;
 
 pub use crate::action_cache::ActionCacheService;
 pub use crate::bytestream::ByteStreamService;
+pub use crate::cache::HIT_CHECKS_IN_FLIGHT;
 pub use crate::cache::{
-    Admitted, BATCH_READS_IN_FLIGHT, CONNECTION_WINDOW_BYTES, Cache, CacheError,
-    FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSHES_PER_ROUND, FlushRound, MAX_ADMISSION_BYTES,
-    MAX_CONCURRENT_STREAMS, PUT_BACKOFF, PUT_BACKOFF_FACTOR, STREAM_WINDOW_BYTES, TierStartError,
-    TierStartup, TouchConfig, VerifiedBlob, WriteConfig,
+    Admitted, BATCH_READS_IN_FLIGHT, CONNECTION_WINDOW_BYTES, Cache, CacheError, EVICT_BATCH,
+    EVICT_EVERY, EVICT_GRACE, EvictReady, EvictRound, FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX,
+    FLUSHES_PER_ROUND, FlushRound, HeldObject, MAX_ADMISSION_BYTES, MAX_CONCURRENT_STREAMS,
+    NEEDS_V3, PASS_OPENS_PER_SEC, PUT_BACKOFF, PUT_BACKOFF_FACTOR, PassReport, STREAM_WINDOW_BYTES,
+    TierStartError, TierStartup, TouchConfig, VerifiedBlob, WriteConfig,
 };
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
@@ -85,8 +87,8 @@ pub use crate::execution::{
 pub use crate::input_tree::{ENTRY_OVERHEAD, InputTreeConfig};
 pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
 pub use crate::recorder::{
-    DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording, listing, owner,
-    wall_now,
+    ActionLabel, DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording,
+    listing, owner, wall_now,
 };
 pub use crate::request_metadata::{
     CallMetadata, HEADER as REQUEST_METADATA_HEADER, Invalid, InvocationId, MAX_HEADER_BYTES,

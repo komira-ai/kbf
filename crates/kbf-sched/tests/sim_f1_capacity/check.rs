@@ -17,8 +17,11 @@
 //! but F1 feeds none, so F1 does not exercise them. Not checked here: I9 (drain states)
 //! and I12 (no daemon model in the in-process world).
 //!
-//! I6 is checked per axis the request uses: a grant is allowed when, on every axis on
-//! which the request is not zero, what is booked plus the request fits the capacity.
+//! I6 is checked per axis the request uses: a grant is allowed when, on the CPU and GPU
+//! axes on which the request is not zero, what is booked plus the request fits the
+//! capacity. Memory is not booked against a worker (an action's memory is the limit it
+//! first runs under): the request needs a worker with that much memory, and an action
+//! at a worker's whole memory runs alone on it.
 //! A capacity that shrank below the bookings on one axis does not keep a request that
 //! books nothing on that axis away (a CPU-only action may go to a node whose GPUs
 //! shrank below its GPU bookings: it makes nothing worse).
@@ -73,10 +76,32 @@ fn sub(a: Axes, b: Axes) -> Axes {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-/// Whether `request` may be booked on a worker of `capacity` that has `booked`: on
-/// every axis the request uses, the sum fits.
-fn fits_beside(capacity: Axes, booked: Axes, request: Axes) -> bool {
-    (0..3).all(|i| request[i] == 0 || booked[i] + request[i] <= capacity[i])
+/// What a worker holds, as far as placement goes.
+#[derive(Clone, Copy, Debug)]
+struct Room {
+    booked: Axes,
+    leases: u64,
+    /// A lease holds the node alone: an action at its whole memory.
+    whole: bool,
+}
+
+/// Whether `request` is an action at the whole host's memory of a worker of `capacity`
+/// (the last step of the memory ladder): it runs alone on the node.
+fn exclusive(capacity: Axes, request: Axes) -> bool {
+    request[1] > 0 && request[1] >= capacity[1]
+}
+
+/// Whether `request` may be placed on a worker of `capacity` that holds `room`: on the
+/// CPU and GPU axes, if the request uses them, the sum fits. Memory is not booked
+/// against the capacity (an action's memory is the limit it first runs under): the
+/// request needs only a node with that much memory, and the whole host runs alone.
+fn fits_beside(capacity: Axes, room: Room, request: Axes) -> bool {
+    !room.whole
+        && [0, 2]
+            .iter()
+            .all(|&i| request[i] == 0 || room.booked[i] + request[i] <= capacity[i])
+        && request[1] <= capacity[1]
+        && (!exclusive(capacity, request) || room.leases == 0)
 }
 
 /// Whether `request` fits in a whole `capacity`.
@@ -91,6 +116,8 @@ struct ShadowWorker {
     last_heard: u64,
     session: u64,
     booked: Axes,
+    leases: u64,
+    whole: bool,
     /// Per interned platform request: whether `caps` satisfy it.
     matches: BTreeMap<usize, bool>,
 }
@@ -359,6 +386,10 @@ impl Checker {
             let res = op.resources;
             let w = self.workers.get_mut(&worker).expect("registered");
             w.booked = sub(w.booked, res);
+            w.leases -= 1;
+            if w.leases == 0 {
+                w.whole = false;
+            }
             self.held.remove(&lease);
             self.touched_workers.insert(worker);
         }
@@ -406,6 +437,8 @@ impl Checker {
                         last_heard: now,
                         session: 0,
                         booked: [0; 3],
+                        leases: 0,
+                        whole: false,
                         matches: BTreeMap::new(),
                     });
                 entry.capacity = axes(*capacity);

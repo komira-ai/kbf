@@ -32,7 +32,7 @@ kbf_cas=https://farm.example.net:8981
 kbf_ca_cert=/usr/local/kbf/etc/ca.pem
 kbf_cert=/usr/local/kbf/etc/node.pem
 kbf_key=/usr/local/kbf/etc/node.key
-kbf_scratch=/Volumes/kbf/scratch
+kbf_data_dir=/Volumes/kbf/data
 kbf_labels=pool=mac rack=r2
 simulator_runtimes=none
 xcode_xip_dir=/Library/kbf/xip

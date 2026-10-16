@@ -48,7 +48,7 @@ pub const REQUIRED: &[&str] = &[
     "kbf_ca_cert",
     "kbf_cert",
     "kbf_key",
-    "kbf_scratch",
+    "kbf_data_dir",
     "kbf_labels",
     "simulator_runtimes",
 ];
@@ -106,6 +106,9 @@ pub enum ProfileError {
     Invalid(String),
 }
 
+/// The old name of `kbf_data_dir`, accepted with a warning.
+const OLD_DATA_DIR: &str = "kbf_scratch";
+
 /// A pinned Xcode: `BUILD:/Applications/Xcode*.app/Contents/Developer:SHA256`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Xcode {
@@ -156,6 +159,9 @@ pub struct Profile {
     pub labels: Vec<String>,
     /// The SHA-256 of the file, in hex.
     pub sha256: String,
+    /// Deprecation warnings, one line each: the profile is accepted, and `load` prints
+    /// them on stderr.
+    pub warnings: Vec<String>,
 }
 
 fn invalid(key: &str, value: &str, what: &str) -> ProfileError {
@@ -175,7 +181,11 @@ impl Profile {
     pub fn load(path: &Path) -> Result<Self, ProfileError> {
         let bytes = std::fs::read(path)
             .map_err(|_| ProfileError::Unreadable(path.display().to_string()))?;
-        Self::parse(&bytes)
+        let profile = Self::parse(&bytes)?;
+        for warning in &profile.warnings {
+            eprintln!("kbf-mac-provision: warning: {warning}");
+        }
+        Ok(profile)
     }
 
     /// Parses a profile's bytes.
@@ -189,6 +199,8 @@ impl Profile {
             _ => return Err(ProfileError::NoFinalNewline),
         };
         let mut values = BTreeMap::new();
+        let mut warnings = Vec::new();
+        let mut old_line = None;
         let mut repeated: BTreeMap<&str, Vec<String>> = BTreeMap::new();
         for (index, line) in body.split(|&b| b == b'\n').enumerate() {
             let line_no = index + 1;
@@ -215,12 +227,32 @@ impl Profile {
                 repeated.entry(name).or_default().push(value);
                 continue;
             }
+            if key_text == OLD_DATA_DIR {
+                if old_line.is_some() {
+                    return Err(ProfileError::Duplicate {
+                        line: line_no,
+                        key: key_text,
+                    });
+                }
+                if values.contains_key("kbf_data_dir") {
+                    return Err(both_data_keys(line_no));
+                }
+                old_line = Some(line_no);
+                warnings.push(format!(
+                    "profile line {line_no}: {OLD_DATA_DIR} is deprecated, use kbf_data_dir (treated as kbf_data_dir)"
+                ));
+                values.insert("kbf_data_dir", value);
+                continue;
+            }
             let Some(&name) = REQUIRED.iter().chain(OPTIONAL).find(|&&k| k == key_text) else {
                 return Err(ProfileError::UnknownKey {
                     line: line_no,
                     key: key_text,
                 });
             };
+            if name == "kbf_data_dir" && old_line.is_some() {
+                return Err(both_data_keys(line_no));
+            }
             if values.insert(name, value).is_some() {
                 return Err(ProfileError::Duplicate {
                     line: line_no,
@@ -233,13 +265,15 @@ impl Profile {
         }
         let mut take = |name| repeated.remove(name).unwrap_or_default();
         let (xcodes, probes, expectations) = (take("xcode"), take("probe"), take("expect_probe"));
-        Self::validate(
+        let mut profile = Self::validate(
             values,
             &xcodes,
             &probes,
             expectations,
             hex::encode(Sha256::digest(bytes)),
-        )
+        )?;
+        profile.warnings = warnings;
+        Ok(profile)
     }
 
     /// The value of `key`, empty when the profile leaves an optional key out.
@@ -391,7 +425,7 @@ impl Profile {
             "an https://host[:port] URL",
         )?;
         want("kbf_cas", pattern::https_url, "an https://host[:port] URL")?;
-        for key in ["kbf_ca_cert", "kbf_cert", "kbf_key", "kbf_scratch"] {
+        for key in ["kbf_ca_cert", "kbf_cert", "kbf_key", "kbf_data_dir"] {
             want(key, pattern::absolute_path, "an absolute path")?;
         }
         let labels: Vec<String> = get("kbf_labels")
@@ -432,8 +466,16 @@ impl Profile {
             time_max_offset_ms,
             labels,
             sha256,
+            warnings: Vec::new(),
         })
     }
+}
+
+/// The refusal of a profile that sets both `kbf_data_dir` and its old name.
+fn both_data_keys(line: usize) -> ProfileError {
+    ProfileError::Invalid(format!(
+        "profile line {line}: {OLD_DATA_DIR} and kbf_data_dir are both set; {OLD_DATA_DIR} is the old name of kbf_data_dir, keep only kbf_data_dir"
+    ))
 }
 
 /// The value of `key` in `values`, empty when it is not set.
@@ -511,7 +553,7 @@ fn volume_and_daemon(
         v => return Err(invalid("daemon_user", v, "role or root")),
     };
     if daemon_user == DaemonUser::Root {
-        for key in ["kbf_scratch", "kbf_cache"] {
+        for key in ["kbf_data_dir", "kbf_cache"] {
             let path = get(key);
             if !path.is_empty() && !path.starts_with(&format!("{volume}/")) {
                 return Err(ProfileError::Invalid(format!(

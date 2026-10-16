@@ -69,13 +69,17 @@
 mod backend;
 pub mod cas;
 mod cgroup;
+mod cgroup_usage;
 pub mod chown_dirs;
 pub mod delegate;
 mod exit_record;
 mod hashing;
 pub mod image;
 mod input_phases;
+#[cfg(test)]
+mod intake_tests;
 mod keeper;
+pub mod numa;
 mod oci;
 mod outputs;
 mod podman;
@@ -92,8 +96,12 @@ kbf_daemon::keeper_test_hook!();
 pub use backend::ContainerRuntime;
 pub use cas::{CHUNK, FileBlob, MemoryCas};
 pub use cgroup::{SwapKill, cpu_weight, memory_max};
-pub use delegate::{DelegateError, Delegation, adopt, capacity, delegate, limit_cpus};
+pub use delegate::{
+    DelegateError, Delegation, adopt, capacity, delegate, enable_cpuset, limit_cpus,
+};
 pub use image::{ImageCheckError, ImageError, ImageRef};
+pub use input_phases::Spot;
+pub use numa::{CpuSet, LeasePlacement, NodeMemory, Pin, Placement, Placer};
 pub use oci::{OciConfig, OciError};
 pub use outputs::OutputLimits;
 pub use podman::{ContainerLimits, EXEC_ROOT, OWNER_LABEL};

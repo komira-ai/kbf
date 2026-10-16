@@ -31,10 +31,10 @@ fn each_flag_reaches_its_half_once() {
         "--driver=container",
         "--worker-listen=127.0.0.1:9981",
         "--listen=127.0.0.1:9980",
-        "--write-tier-bytes=1073741824",
-        "--write-tier-dir=/var/kbf/tier",
+        "--cold-store=file:///var/kbf/cold",
+        "--hot-store=file:///var/kbf/hot",
         "--cpu-threads=3",
-        "--scratch=/var/kbf/leases",
+        "--data-dir=/var/kbf",
     ])
     .expect("flags");
     assert_eq!(flags.server.worker_listen.to_string(), "127.0.0.1:9981");
@@ -42,7 +42,9 @@ fn each_flag_reaches_its_half_once() {
     assert_eq!(flags.server.threads, kbf_threads::PoolArgs::default());
     let daemon = format!("{:?}", flags.daemon);
     assert!(daemon.contains("cpu_threads: Some(3)"), "{daemon}");
-    assert!(daemon.contains("\"/var/kbf/leases\""), "{daemon}");
+    assert!(daemon.contains("\"/var/kbf\""), "{daemon}");
+    let server = format!("{:?}", flags.server);
+    assert!(server.contains("\"/var/kbf/hot\""), "{server}");
 }
 
 /// Catches a driver other than the container driver taken (the native drivers run

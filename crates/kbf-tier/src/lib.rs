@@ -1,7 +1,7 @@
 //! The disk layer of the local write tier (design `docs/design/write-path.md`
-//! section 6, rollout stage 4): block files in `--write-tier-dir`, written in reserved
+//! section 6, rollout stage 4): block files in the hot store directory (`--hot-store`), written in reserved
 //! ranges, synced before anything in them is acknowledged, sealed, counted against
-//! `--write-tier-bytes`, and recovered at a restart from the committed state.
+//! the hot store's budget, and recovered at a restart from the committed state.
 //!
 //! - A **block** is one file, `<epoch>-<seq>.blk`, named by the object it becomes. A
 //!   blob's offset in the block is its offset in that object. Grouped writes share
@@ -17,7 +17,7 @@
 //!   so out-of-order commits never move it back) or fails (the reservation dropped: a
 //!   grouped range's bytes stay as dead bytes; an upload's block is deleted).
 //! - **Seal.** The open grouped block is sealed at the segment limit or after
-//!   `--write-tier-seal-after`: it takes no new range, and once every range is
+//!   the seal-after interval (30 s): it takes no new range, and once every range is
 //!   answered [`WriteTier::poll_seals`] names it for `SealStaged`. A block whose ranges
 //!   all failed is deleted instead.
 //! - **Budget.** Every live block's reserved extent counts, from reservation until
@@ -40,13 +40,11 @@
 //! access goes through [`kbf_store::Fs`], so the tests crash it with
 //! [`kbf_store::FaultFs`].
 
-mod args;
 mod block;
 mod error;
 mod open;
 mod tier;
 
-pub use crate::args::TierArgs;
 pub use kbf_meta::TierId;
 
 pub use crate::block::{TIER, block_name, parse_block_name, parse_seg_name, seg_name};

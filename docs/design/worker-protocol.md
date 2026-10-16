@@ -103,9 +103,9 @@ another process's.
 
 `Hello.predecessor_instance_id` (field 8, issue #22) names the daemon process that ran
 on the node before this one, whose runs this one's drivers killed before its `Hello`.
-The daemon binary writes its own id to `<--scratch>/daemon-instance` once every runtime
+The daemon binary writes its own id to `<--data-dir>/leases/daemon-instance` once every runtime
 is built (each driver sweeps the scratch directory as it is built), and reads the id
-there before it writes its own; empty on a first start, or without `--scratch`. The
+there before it writes its own; empty on a first start, or without `--data-dir`. The
 server takes the claim only when it names the process the node's previous stream came
 from and that stream has closed, and then gives up at once the leases whose `Start`
 went to that process and which the new session's first heartbeat leaves out, as farm
@@ -432,19 +432,19 @@ action's result, and it was written to the action cache under their action's dig
 close this, each on its own:
 
 1. **A lease id names one lease, ever.** Each server process grants its leases under a
-   term of its own, picked at start. Under `--meta-log=memory` it is the start time in
+   term of its own, picked at start. Under the in-memory metadata log (tests only) it is the start time in
    milliseconds on the wall clock, times 2^16, plus 16 random bits. It orders after
    every earlier process's term while the wall clock does not step back across a
    restart, and differs from it unless a restart lands on an earlier start's very
-   millisecond and the random bits match. Under `--meta-log=raft` it is the Raft term
+   millisecond and the random bits match. Under the Raft metadata log it is the Raft term
    the log elects the server in at start, which is greater at every start.
    The server knows only the leases it granted, so a `Result` of an earlier process's
    lease is refused, and a lease of another term listed in a heartbeat is never
    cancelled (it may belong to a newer leader).
 2. **The epoch in `Welcome`.** `Welcome.epoch` names the record of leases the server
-   answers for. Under `--meta-log=memory` that is the process, so the server names
-   its term; under `--meta-log=raft` it names the log id, the same at every start over
-   one `--raft-dir`, and never 0. The daemon remembers the epoch
+   answers for. Under the in-memory metadata log (tests only) that is the process, so the server names
+   its term; under the Raft metadata log it names the log id, the same at every start over
+   one `--meta-dir`, and never 0. The daemon remembers the epoch
    of the newest `Welcome` with every lease it acts on. On a `Welcome` that names
    another epoch, before it resends anything or reads a `Start`, it kills the runs of
    the earlier epoch's leases (they are listed until they stop, like a cancelled run)
@@ -456,7 +456,7 @@ close this, each on its own:
    the new leader knows the committed grants from the log and accepts them
    ([deployment-topology.md](deployment-topology.md#daemons-straight-to-the-servers-one-stream-to-the-leader)).
    **Today** the scheduler's state is not in the log, so after a restart under
-   `--meta-log=raft` the old runs are orphans: rule 1 refuses their results and
+   the Raft metadata log the old runs are orphans: rule 1 refuses their results and
    cancels none of them. Results are never doubled; runs may be. A client's new
    `Execute` of the same action can run beside its orphan, and the server, which
    counts the node's capacity as free, can book new work beside the orphans: at most

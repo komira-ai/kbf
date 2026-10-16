@@ -62,13 +62,17 @@ role (`--role=all`). The flags are:
   are optional: a listener without them serves plain text on any address, with a
   warning on the start line when that address is not loopback (see
   [Security model](#security-model));
-- `--store=memory` or `--store=s3` with `--s3-endpoint`, `--s3-bucket`, `--s3-region`,
-  `--s3-prefix` and `--s3-conditional-put`; the S3 key pair comes from the standard
-  `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` variables, never from the command line;
-  or, in place of `--store`, `--blob-dir`, a directory on the local disk (with
-  `--meta-log=raft` only, under the fixed prefix `kbf/<log id>/`), with
-  `--blob-dir-min-free-bytes` (default 1 GiB) the free space below which it refuses
-  writes; nothing is evicted;
+- `--cold-store`, the durable object store, a URI: `s3://bucket/prefix?endpoint=...`
+  (query keys `endpoint`, `region`, `conditional-put`, `min-put-rate`; the S3 key pair
+  comes from the standard `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` variables,
+  never from the command line) or `file:///dir`, a directory on the local disk (under
+  the fixed prefix `kbf/<log id>/`), which refuses writes that would leave its file
+  system with less than 5% of it (at least 1 GiB) free and evicts the least recently
+  used objects to stay above that; `--hot-store`, optionally, a `file://`
+  directory on a fast disk in front of it (the write tier, sized from its filesystem's
+  free space, at most `--hot-store-max-bytes`); and the metadata log's directory,
+  `<hot store>/meta` or `--meta-dir`. There is no `memory:` store: a `file://` path on a
+  tmpfs is one (storage glossary: [storage-node.md](docs/deploy/storage-node.md#where-the-bytes-live-storage-glossary));
 - `--heartbeat-interval-ms` (default 5000), the interval daemons are asked to
   heartbeat at;
 - `--finished-retention-secs` (default 60), how long a finished operation is kept
@@ -123,10 +127,10 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-raft` | yes | a sans-IO Raft core ([ADR 0001](docs/adr/0001-consensus.md)) and its host loop over `Storage`, `Transport` and `Machine` traits, with an in-memory storage |
 | `kbf-invocation` | yes | the invocation record ([invocations.md](docs/design/invocations.md) section 3): each build's header, counters and action rows, built only from events (calls, lease grants, starts, requeues, finishes), its `kbf.invocation.v1` encoding, and the memory bound of section 3.5 (minted, then idle records evicted; then the largest open one closed to new rows, and whatever else does not fit left out) |
 | `kbf-estimator` | yes | placeholder for learned action sizes (**planned**) |
-| `kbf-objstore` | no | the `ObjectStore` trait, an in-memory store, a local-directory store (`FsStore`, `kbf-server --blob-dir`), an S3 store, the conformance suite |
-| `kbf-tier` | no | the local write tier's disk layer ([write-path.md](docs/design/write-path.md) section 6): block files in `--write-tier-dir` written in reserved ranges and synced (file and name) before a range may be committed, seals at the segment limit or after `--write-tier-seal-after`, the `--write-tier-bytes` budget, and the restart: the `TIER` check, staged blocks cut to their committed length, and the orphan sweep, against the committed state through `StagedIndex`; once flushed, blocks become `.seg` copies evicted least recently read first, only in what the budget leaves over. `kbf-front` (`Cache::attach_tier`, `Cache::flush_tier`) stages writes on it, reads staged blobs from it, and runs the flusher; `kbf-server` attaches it with `--write-tier-dir` over either metadata log (under `--meta-log=raft` it first raises the log to machine version 2, once; a server without a tier never raises it) |
+| `kbf-objstore` | no | the `ObjectStore` trait, an in-memory store, a local-directory store (`FsStore`, `kbf-server --cold-store=file://...`), an S3 store, the conformance suite |
+| `kbf-tier` | no | the local write tier's disk layer ([write-path.md](docs/design/write-path.md) section 6): block files in the hot store directory (`kbf-server --hot-store`) written in reserved ranges and synced (file and name) before a range may be committed, seals at the segment limit or after the seal-after interval, the hot store's budget, and the restart: the `TIER` check, staged blocks cut to their committed length, and the orphan sweep, against the committed state through `StagedIndex`; once flushed, blocks become `.seg` copies evicted least recently read first, only in what the budget leaves over. `kbf-front` (`Cache::attach_tier`, `Cache::flush_tier`) stages writes on it, reads staged blobs from it, and runs the flusher; `kbf-server` attaches it with `--hot-store` over either metadata log (under the Raft metadata log it first raises the log to machine version 2, once; a server without a tier never raises it) |
 | `kbf-front` | no | the REAPI services over a `Cache` and a `Dispatch`, and the invocation `Recorder` the services and the farm send events to (a channel bounded in events and bytes that drops, never waits) |
-| `kbf-server` | no | the server: wires front, scheduler and storage together (`start` returns a `ServerHandle`; the `kbf-server` binary is a thin main over it, so a combined binary can run the server in its own process, and `ServerHandle::local` is the server's cache as calls in that process, `LocalStore`); its side of the MDM gate (`mdm`) |
+| `kbf-server` | no | the server: wires front, scheduler and storage together (`start` returns a `ServerHandle`; the `kbf-server` binary is a thin main over it, so a combined binary can run the server in its own process, and `ServerHandle::local` is the server's cache as calls in that process, `LocalStore`; the stores its flags name, `--cold-store`, `--hot-store` and `--meta-dir`, are parsed and resolved in `stores`); its side of the MDM gate (`mdm`) |
 | `kbf-proto` | no | generated code for REAPI, `kbf.worker.v1` and `kbf.log.v1` |
 | `kbf-log` | no | the replicated log's entry encoding: `kbf-meta` commands and the control commands (batched farm inputs, a result with its action-cache entry, takeover, checkpoint, machine version) to and from `kbf.log.v1`, under the log's format version |
 | `kbf-mdm-api` | no | what `kbf-server` and `kbf-mdm-gate` share: generated `kbf.mdmgate.v1` (status, enforce, withdraw, profile; no erase), the names both check, Apple's catalogue parser and its at-most-daily reader |
@@ -134,10 +138,10 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-transfer` | no | the shared blob transfer engine: the `Cas` trait, and `Transfers`, one per daemon process: one HTTP/2 connection to the worker listener with explicit windows, one in-flight limit and byte budget for every lease, one fetch per digest however many leases ask, FindMissing before every upload, resumed reads after a broken connection, and each lease's `TransferStats` ([worker-cache.md](docs/design/worker-cache.md) section 4) |
 | `kbf-driver-container` | no | the rootless Podman execution driver |
 | `kbf-driver-native` | no | the native execution driver: plain processes, for Macs |
-| `kbf-node` | no | the worker daemon as a library (flags, the driver `--driver` names, `start` returning a `NodeHandle`, over the transfer engine; `start_with`, over a data plane the caller makes) and the `kbf-daemon` binary, a thin main over it. Only a combined binary may link both this and `kbf-server` (`kbf-it` `layering`) |
+| `kbf-node` | no | the worker daemon as a library (flags, the driver `--driver` names, the data directory `--data-dir` (`leases/`, the input cache and the input trees, sized from the filesystem), `start` returning a `NodeHandle`, over the transfer engine; `start_with`, over a data plane the caller makes) and the `kbf-daemon` binary, a thin main over it. Only a combined binary may link both this and `kbf-server` (`kbf-it` `layering`) |
 | `kbf-all-in-one` | no | the server and a daemon in one process (the `kbf-all-in-one` binary, above): one command line of both binaries' flags, and `LocalDataPlane`, the daemon's data plane as calls into the server's `LocalStore` on the server half's runtime ([README](crates/kbf-all-in-one/README.md)) |
 | `kbf-cas-conformance` | no | the checks every implementation of the daemon's data plane (`kbf_transfer::Cas`) must pass, generic over the implementation (`tests!`); run against the gRPC implementation `kbf_transfer::Transfers`, and in `kbf-all-in-one` against `LocalDataPlane` over a server with a write tier and one without |
-| `kbf-threads` | no | thread sizing for both binaries: on the daemon `--reserve-cpus` (and `--reserve-share`) size the pools and leave the leases the other CPUs, limited to the physical cores (`Topology`); the server has no reserve and uses every CPU it may (one async worker and one hashing thread per logical CPU, tokio's blocking cap); `--async-threads`, `--blocking-threads` and `--cpu-threads` override on both; and the tokio runtime built with them |
+| `kbf-threads` | no | thread and disk sizing for both binaries (disk: a filesystem's size and free space, the floor it keeps free, and the shares a cache, a tree store or a hot store may take: `disk`); thread sizing: on the daemon `--reserve-cpus` (and `--reserve-share`) size the pools and leave the leases the other CPUs, limited to the physical cores (`Topology`); the server has no reserve and uses every CPU it may (one async worker and one hashing thread per logical CPU, tokio's blocking cap); `--async-threads`, `--blocking-threads` and `--cpu-threads` override on both; and the tokio runtime built with them |
 | `kbf-mdm` | no | `kbf-mdm-gate`, the only holder of the Mac MDM's API key: its verbs and caps over mutual TLS, operator-signed erase requests, the `MdmBackend` trait and its NanoHUB client ([mdm-backend.md](docs/design/mdm-backend.md)). With the `testkit` feature, security-key signatures made in software, for other crates' tests |
 | `kbf-updater` | no | the root helper that verifies and installs signed software sets on a node ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S3, S4.1); its apt-snapshot applier changes the node only through `kbf-host`; Linux only for now |
 | `kbf-mac-session` | no | the Mac's root helper that gives every lease its own throwaway user, admits an administrator only with the MDM gate's signed grant, switches the GUI session to a lease user (auto-login, then a userspace restart) and resets it at boot ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S4.2, S4.3, S5.2); serves on macOS only |
@@ -238,20 +242,19 @@ See [scheduler.md](docs/design/scheduler.md) and
 
 | State | Today | Planned |
 |---|---|---|
-| CAS index, action cache, farm time | `MetaState` behind `MemoryMetaLog`, in the server's memory (the default, `--meta-log=memory`); with `--meta-log=raft`, behind `RaftMetaLog`, applied from a single-voter Raft log on local disk | the Raft log with three voters |
+| CAS index, action cache, farm time | `MetaState` behind `RaftMetaLog`, applied from a single-voter Raft log on local disk (`--meta-dir`, or `<hot store>/meta`); behind `MemoryMetaLog`, in the process's memory, only in tests | the Raft log with three voters |
 | Blob bytes | segments in an object store (in memory, or an S3 bucket) | the same, with garbage collection and multiple stores |
 | Leases, operations, workers | `Scheduler` in the server's memory; a control record "commits" when appended | the same state machine fed from a replicated control log, kept on the servers' local disks |
 | Memory kills | the scheduler's `MemoryState`, in the server's memory: each action key's memory floor and the order the floors were raised in, each held operation's memory-killed runs and busy-node reruns, each node's busy-node kill count; it compares with `Eq` | the same, inside the machine fed from the replicated control log |
 | Callers, started leases, node registry | `FarmMachine` (`kbf-server`'s `machine` module) in the server's memory: each caller's record, the finished operations whose callers are kept for the finished retention, the leases whose `Start` was sent, and each node that has registered with whether its newest stream is open and its newest `NodeStatus`; each caller's channel and each node's stream stay beside it in the farm core, which tells the machine when a stream has closed | the same machine fed from the replicated control log |
 | Node reports | read at `Hello`: `cpus`, `mem_gib` and `gpu` are booked; `arch`, `cpu.features`, `os` and the other exact keys are matched against each action's platform; held in memory, so a restart forgets every node | operator labels, report changes noticed by hash; the node registry kept durable through the replicated control log, with alerts on absent nodes |
 
-Under `--meta-log=memory` the index is in memory, so a restarted server forgets every
-blob, and with `--store=s3` each start writes under a fresh key prefix so it never reads
-objects a previous process wrote. Under `--meta-log=raft` (which needs `--store=s3` or
-`--blob-dir`) a
-restart reopens the log in `--raft-dir` and keeps the index and the action cache, and
-every start writes under the prefix the log committed when it was created,
-`<--s3-prefix><log id>/`, each in a new writer epoch.
+Under `MemoryMetaLog` (tests only; the binary has no flag for it) the index is in memory,
+so a restarted server forgets every blob, and an S3 store gets a fresh key prefix at
+each start so it never reads objects a previous process wrote. The binary always runs
+the Raft log: a restart reopens the log in its directory and keeps the index and the
+action cache, and every start writes under the prefix the log committed when it was
+created, `<cold store prefix><log id>/`, each in a new writer epoch.
 
 Every piece of state sits behind a trait or a pure state machine, so moving it into a
 replicated log changes the implementation behind the seam, not its callers:
@@ -317,10 +320,10 @@ with what exists today and the probes still to run. In short:
   and placement prefers a worker that already has an action's inputs.
 
 What already holds for this shape in the single-server code: the seams above, lease
-ids that carry the granting process's term (the Raft term under `--meta-log=raft`), a
+ids that carry the granting process's term (the Raft term of the metadata log), a
 scheduler that refuses results from leases it does not hold, a lease epoch in
-`Welcome` that makes a daemon drop leases a restarted server never granted (under
-`--meta-log=raft` the epoch is the log id, the same at every start, so the daemon keeps
+`Welcome` that makes a daemon drop leases a restarted server never granted (with
+the Raft log the epoch is the log id, the same at every start, so the daemon keeps
 its runs, and until the scheduler's state is in the log a restart leaves them running
 as orphans whose results are refused), and a daemon protocol in which only the newest
 stream of a worker counts. See [scheduler.md](docs/design/scheduler.md#more-than-one-server).

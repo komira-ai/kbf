@@ -6,6 +6,10 @@
 //! reach through the worker listener, with no TLS, no protobuf encoding and no socket
 //! between. What a remote daemon sends is unchanged; this plane sends nothing.
 //!
+//! - **Output files, as the walk reads them** ([`Cas::intake`], `crate::intake`): the
+//!   container driver's walk hands each file's chunks to the plane as it hashes them, so
+//!   each output file (and stdout and stderr) is read once; the plane stores them as
+//!   below, from those bytes, in batches while the walk goes on.
 //! - **Outputs** ([`Cas::put_records`], and [`Cas::put_spool`] through it): the walk
 //!   hashed each file once. The plane asks the cache which digests it lacks, packs those
 //!   records into segments and uploads exactly as the transfer engine plans them
@@ -34,14 +38,18 @@ use kbf_proto::worker::{BeginRequest, CommitRequest, PutRangeRequest, UploadSegm
 use kbf_segments::MAX_SEGMENT_BYTES;
 use kbf_server::LocalStore;
 use kbf_transfer::{
-    Cas, CasError, DEFAULT_SEGMENT_UPLOADS, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, Planned, Record,
-    SEGMENT_UPLOAD_BYTES, label, plan, proto_digest, read_pieces,
+    Cas, CasError, DEFAULT_SEGMENT_UPLOADS, Intake, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, Planned,
+    Record, SEGMENT_UPLOAD_BYTES, label, plan, proto_digest, read_pieces,
 };
 use kbf_types::{DigestFunction, LeaseId};
 use tokio::runtime::Handle;
 use tonic::{Code, Request, Status};
 
-/// The daemon's data plane as calls into the server half of this process.
+use crate::intake::Taking;
+
+/// The daemon's data plane as calls into the server half of this process. Clones share
+/// the server half's store and this plane's own `Segments` service.
+#[derive(Clone)]
 pub struct LocalDataPlane {
     store: LocalStore,
     /// This plane's own `Segments` service: its uploads, no one else's.
@@ -61,6 +69,11 @@ impl LocalDataPlane {
             segments,
             server,
         }
+    }
+
+    /// The server half's runtime.
+    pub(crate) fn server(&self) -> &Handle {
+        &self.server
     }
 
     /// Runs `call` on the server half's runtime and returns its answer; UNAVAILABLE when
@@ -209,6 +222,10 @@ impl Cas for LocalDataPlane {
             .buffer_unordered(DEFAULT_SEGMENT_UPLOADS)
             .try_for_each(|()| future::ready(Ok(())))
             .await
+    }
+
+    fn intake(&self) -> Option<Arc<dyn Intake>> {
+        Some(Arc::new(Taking::new(self.clone())))
     }
 }
 

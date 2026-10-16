@@ -27,7 +27,7 @@ ExecStart=@KBF_BIN_DIR@/kbf-daemon \
     --cert=@KBF_ETC@/node.pem \
     --key=@KBF_ETC@/node.key \
     --node-id=@KBF_NODE_ID@ \
-    --scratch=@KBF_SCRATCH_DIR@ \
+    --data-dir=@KBF_DATA_DIR@ \
 @DAEMON_IMAGE_ARGS@
     --actions-memory-max-gib=@ACTIONS_MEMORY_MAX_GIB@ \
     --supervisor-memory-min-mib=@KBF_DAEMON_MEMORY_MIN_MIB@

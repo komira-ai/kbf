@@ -433,7 +433,7 @@ fn a_refused_put_changes_nothing() {
 /// would pass the start check). A server's current tier registered again is a no-op.
 /// Only the server's own old tier counts: an object staged on another server's tier
 /// must not block it (mutant: refuse while any object is staged on any tier, which
-/// would refuse one server's --write-tier-abandon whenever another has unflushed data).
+/// would refuse one server's --hot-store-abandon whenever another has unflushed data).
 #[test]
 fn one_tier_per_server_and_an_id_is_never_reused() {
     let mut m = tiered();
@@ -465,7 +465,7 @@ fn one_tier_per_server_and_an_id_is_never_reused() {
     assert_eq!(tier_cmd(&mut m, add(other, other_tier)), Ok(()));
     put_on(&mut m, other_tier, vec![part(20, 100, &[(3, 0)])]).expect("other open");
 
-    // What --write-tier-abandon does: mark every staged object missing, then register.
+    // What --hot-store-abandon does: mark every staged object missing, then register.
     mark_missing(&mut m, 5);
     assert_eq!(tier_cmd(&mut m, add(SERVER, next)), Ok(()));
     assert_eq!(m.tier(SERVER), Some(next));

@@ -12,10 +12,11 @@ base64.workspace = true
 bytes.workspace = true
 hex.workspace = true
 hmac.workspace = true
+# The free-space floor and the filesystem numbers (`disk`), shared with the daemon.
+kbf-threads.workspace = true
 md-5.workspace = true
 reqwest.workspace = true
 roxmltree.workspace = true
-rustix = { workspace = true, features = ["fs"] }
 sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }

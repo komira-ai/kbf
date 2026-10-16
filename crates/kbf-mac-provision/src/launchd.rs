@@ -49,8 +49,8 @@ pub fn daemon_args(profile: &Profile) -> Vec<String> {
         profile.get("kbf_key"),
         "--node-id",
         profile.get("hostname"),
-        "--scratch",
-        profile.get("kbf_scratch"),
+        "--data-dir",
+        profile.get("kbf_data_dir"),
         "--label",
     ]
     .into_iter()
@@ -244,7 +244,7 @@ pub(crate) fn fix_launchd_label(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> 
 /// The roots a root daemon owns: the scratch root, and the cache when `kbf_cache` is
 /// set.
 fn roots(profile: &Profile) -> Vec<&str> {
-    ["kbf_scratch", "kbf_cache"]
+    ["kbf_data_dir", "kbf_cache"]
         .into_iter()
         .map(|key| profile.get(key))
         .filter(|path| !path.is_empty())

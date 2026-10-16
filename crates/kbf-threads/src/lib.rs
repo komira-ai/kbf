@@ -1,4 +1,6 @@
-//! Thread sizing for the two farm binaries, `kbf-daemon` and `kbf-server`.
+//! Thread and disk sizing for the two farm binaries, `kbf-daemon` and `kbf-server`.
+//! Disk sizing (what a cache, a tree store or a write tier may take of a filesystem) is
+//! the [`disk`] module.
 //!
 //! Each binary runs a tokio runtime with two pools (async workers, and a blocking pool
 //! for calls that wait on a disk or a process) and has CPU-bound work (hashing) that
@@ -43,6 +45,8 @@
 //! `--cpu-threads` is the width of the pool for CPU-bound work. This crate only
 //! resolves it ([`Sizes::cpu_threads`]); the pool is built by the code that has the
 //! work.
+
+pub mod disk;
 
 use std::io;
 use std::num::NonZeroUsize;

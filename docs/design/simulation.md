@@ -23,7 +23,7 @@ daemon's side of fencing are in [worker-protocol.md](worker-protocol.md) and
 | `sim_cell` **exists** | `crates/kbf-sched/tests/sim_cell.rs` | the scheduler on the kernel: a leader, a control log node and two workers with a `SelfFence`; 48 seeds | `Start` only after commit; each operation answered once, by its newest grant; no self-fenced work twice at once; a reboot and a daemon restart inside G; a `Start` lost on a live session; a lease hidden from the running set; replay |
 | `sim_platform` **exists** | `crates/kbf-sched/tests/sim_platform.rs` | the scheduler alone with an in-process log: Linux x86-64, Linux arm64 and a one-core Mac, two random outages each; 64 seeds | grants satisfy the platform on a live worker; answered once; a refusal only after a stated reason and an unbroken unservable run; the refusal tick exactly; replay |
 | `sim_cordon` **exists** | `crates/kbf-sched/tests/sim_cordon.rs` | the scheduler alone, three always-up workers, random cordon, drain and uncordon; 64 seeds | no grant to a cordoned worker; a drain never kills; a cordon never refuses; drain states true; all work runs once uncordoned; replay |
-| `kbf-sim-cell` **exists** | `crates/kbf-sim-cell` | one server as `kbf-server --meta-log=raft` assembles it (the `RaftMetaLog` over an in-memory fault-injecting disk, a `Scheduler` and the `FarmMachine`), three daemons using the daemon's `Contact`, three clients, an object store that can hang, be slow, fail PUTs or lose their answers; calm, restart, power-cut, I/O-error and daemon-partition runs, 64 seeds each, and the write path's store-fault and crash-point runs | properties 1 to 7 of ha.md section 15, and 8 and 9 of the write path, after every step ([section 8](#8-the-cell-kbf-sim-cell)); replay |
+| `kbf-sim-cell` **exists** | `crates/kbf-sim-cell` | one server as `kbf-server the Raft metadata log` assembles it (the `RaftMetaLog` over an in-memory fault-injecting disk, a `Scheduler` and the `FarmMachine`), three daemons using the daemon's `Contact`, three clients, an object store that can hang, be slow, fail PUTs or lose their answers; calm, restart, power-cut, I/O-error and daemon-partition runs, 64 seeds each, and the write path's store-fault and crash-point runs | properties 1 to 7 of ha.md section 15, and 8 and 9 of the write path, after every step ([section 8](#8-the-cell-kbf-sim-cell)); replay |
 
 Measured on the dev box in a debug build: `sim_cell` 0.3 s, `sim_platform` 2.2 s,
 `sim_cordon` 3.9 s, `kbf-sim-cell` 2.5 s (the five sweeps of `tests/cell.rs`) and
@@ -348,7 +348,7 @@ seed and command that show it.
 `kbf-sim-cell` is the one-server skeleton of the high-availability design's
 simulation (ha.md section 15). Its nodes:
 
-- **The server** runs the code `kbf-server --meta-log=raft` runs. Its metadata log is a
+- **The server** runs the code `kbf-server the Raft metadata log` runs. Its metadata log is a
   `RaftMetaLog` (`crates/kbf-server/src/raft_log`) over a `kbf_store::FaultFs`, opened
   as the server opens it, with the new log's id drawn from the seed; the log's futures
   never wait, so each is polled once. Its farm core is a `Scheduler` of the log's term

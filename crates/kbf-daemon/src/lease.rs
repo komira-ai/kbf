@@ -33,8 +33,8 @@ use std::time::Instant;
 use futures::FutureExt as _;
 use kbf_proto::google::rpc::precondition_failure::Violation;
 use kbf_proto::google::rpc::{Code, PreconditionFailure, Status};
-use kbf_proto::reapi::ActionResult;
-use kbf_proto::worker::{self, Lost, MemoryKill, Start};
+use kbf_proto::reapi::{ActionResult, ExecutedActionMetadata};
+use kbf_proto::worker::{self, Lost, MemoryKill, ResourceUsage, Start};
 use kbf_types::{LeaseId, LostWhy, Resources};
 use prost::Message;
 use tokio::sync::mpsc;
@@ -43,8 +43,14 @@ use crate::phases::LeasePhases;
 use crate::runtime::{RuntimeError, Work};
 use crate::runtimes::{AnyRuntime, Runtimes};
 
-/// A finished run: its lease, outcome, and where its time went.
-pub(crate) type Done = (LeaseId, Result<ActionResult, RuntimeError>, LeasePhases);
+/// A finished run: its lease, outcome, what the runtime measured of it if it ended
+/// without a result ([`crate::Runtime::failed_usage`]), and where its time went.
+pub(crate) type Done = (
+    LeaseId,
+    Result<ActionResult, RuntimeError>,
+    Option<ResourceUsage>,
+    LeasePhases,
+);
 
 /// The leases a daemon is running.
 pub(crate) struct Leases {
@@ -122,10 +128,18 @@ impl Leases {
                     Err(panicked(run.driver(), panic.as_ref()))
                 }
             };
+            // An error carries no result, so no usage: the runtime is asked for it. An
+            // out-of-memory kill (the lease's own limit, or the node's) is marked.
+            let usage = outcome.as_ref().err().and_then(|_| run.failed_usage(id));
+            let oom = matches!(
+                outcome,
+                Err(RuntimeError::OutOfMemory { .. } | RuntimeError::BusyNode(_))
+            );
             let phases =
-                LeasePhases::new(id, run.driver(), started.elapsed(), outcome.as_ref().ok());
+                LeasePhases::new(id, run.driver(), started.elapsed(), outcome.as_ref().ok())
+                    .failed_with(usage.as_ref(), oom);
             // The receiver lives as long as the daemon.
-            let _ = done.send((id, outcome, phases));
+            let _ = done.send((id, outcome, usage, phases));
         });
         tracing::info!(lease = %id, driver = runtime.driver(), "lease started");
         self.running.insert(id, Running { runtime });
@@ -168,6 +182,7 @@ impl Leases {
         &mut self,
         id: LeaseId,
         outcome: Result<ActionResult, RuntimeError>,
+        usage: Option<ResourceUsage>,
         phases: &LeasePhases,
     ) -> worker::Result {
         tracing::info!("lease phases: {phases}");
@@ -189,7 +204,11 @@ impl Leases {
                 "lease failed"
             );
         }
-        result_of(id, outcome)
+        let mut result = result_of(id, outcome);
+        if let Some(usage) = usage {
+            carry_usage(&mut result, &usage);
+        }
+        result
     }
 
     /// Whether a running lease is not being fenced yet.
@@ -314,6 +333,18 @@ pub(crate) fn result_of(
             ..failure(id, Code::Unavailable, message)
         },
     }
+}
+
+/// Puts `usage` in the metadata of the result's `action_result` (made if the result has
+/// none): what a lease that ended without a result still counted. Only the server's
+/// reading of an OK result and of a timeout's partial result looks at that field.
+fn carry_usage(result: &mut worker::Result, usage: &ResourceUsage) {
+    let metadata = result
+        .action_result
+        .get_or_insert_with(ActionResult::default)
+        .execution_metadata
+        .get_or_insert_with(ExecutedActionMetadata::default);
+    metadata.auxiliary_metadata.push(usage.to_any());
 }
 
 /// FAILED_PRECONDITION with a `MISSING` violation for `blob` (`hash/size`), as REAPI
@@ -472,12 +503,12 @@ mod tests {
         assert_eq!(leases.fence(), [], "a lease fenced twice");
         let mut results = Vec::new();
         for _ in ids {
-            let (id, outcome, phases) =
+            let (id, outcome, usage, phases) =
                 tokio::time::timeout(std::time::Duration::from_secs(10), done_rx.recv())
                     .await
                     .expect("the fence killed one lease at a time")
                     .expect("open");
-            results.push(leases.finished(id, outcome, &phases));
+            results.push(leases.finished(id, outcome, usage, &phases));
         }
         results.sort_by_key(|r| r.lease_id.map(|l| (l.term, l.seq)));
         let fenced: Vec<_> = results.iter().map(|r| r.lease_id).collect();
@@ -531,12 +562,12 @@ mod tests {
         // One kill ends one run. Were the resend a second run, the fence would wait
         // for a run nothing stops (or, if the kill ended that one, `runs` would be 2).
         assert_eq!(leases.fence().len(), 1);
-        let (ended, outcome, phases) =
+        let (ended, outcome, usage, phases) =
             tokio::time::timeout(std::time::Duration::from_secs(5), done_rx.recv())
                 .await
                 .expect("the fence waited for a second run of one lease")
                 .expect("open");
-        leases.finished(ended, outcome, &phases);
+        leases.finished(ended, outcome, usage, &phases);
         assert_eq!(runtime.runs.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -559,9 +590,9 @@ mod tests {
         assert!(!leases.cancel(LeaseId::new(3, 9)), "a lease never started");
         assert!(leases.cancel(id()));
         assert!(!leases.cancel(id()), "a lease already being cancelled");
-        let (ended, outcome, phases) = done_rx.recv().await.expect("the run ends");
+        let (ended, outcome, usage, phases) = done_rx.recv().await.expect("the run ends");
         assert_eq!(ended, id());
-        let result = leases.finished(ended, outcome, &phases);
+        let result = leases.finished(ended, outcome, usage, &phases);
         assert_eq!(code(&result), Code::Aborted as i32);
         assert_eq!(runtime.killed(), [id()]);
         assert!(leases.running().is_empty());
@@ -602,7 +633,7 @@ mod tests {
             ..Start::default()
         };
         assert_eq!(leases.start(start), None);
-        let (ended, outcome, phases) = done_rx.recv().await.expect("the run ends");
+        let (ended, outcome, usage, phases) = done_rx.recv().await.expect("the run ends");
         let captured = Captured::default();
         let writer = captured.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -611,7 +642,7 @@ mod tests {
             .with_writer(move || writer.clone())
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            leases.finished(ended, outcome, &phases);
+            leases.finished(ended, outcome, usage, &phases);
         });
         // Nothing is buffered; the subscriber never flushes.
         std::io::Write::flush(&mut captured.clone()).expect("flush");
@@ -628,11 +659,26 @@ mod tests {
 
     /// A runtime whose every run ends at once with the one error it was given, before
     /// any input is fetched.
-    struct Failing(std::sync::Mutex<Option<RuntimeError>>);
+    struct Failing {
+        error: std::sync::Mutex<Option<RuntimeError>>,
+        /// What the runtime reports for the run ([`Runtime::failed_usage`]), once.
+        usage: std::sync::Mutex<Option<ResourceUsage>>,
+    }
 
     impl Failing {
         fn with(error: RuntimeError) -> Arc<Self> {
-            Arc::new(Self(std::sync::Mutex::new(Some(error))))
+            Arc::new(Self {
+                error: std::sync::Mutex::new(Some(error)),
+                usage: std::sync::Mutex::new(None),
+            })
+        }
+
+        /// [`Failing::with`] `error`, a run that measured `usage`.
+        fn measured(error: RuntimeError, usage: &ResourceUsage) -> Arc<Self> {
+            Arc::new(Self {
+                error: std::sync::Mutex::new(Some(error)),
+                usage: std::sync::Mutex::new(Some(usage.clone())),
+            })
         }
     }
 
@@ -647,11 +693,15 @@ mod tests {
 
         async fn run(&self, _work: Work) -> Result<ActionResult, RuntimeError> {
             Err(self
-                .0
+                .error
                 .lock()
                 .expect("error lock")
                 .take()
                 .expect("one run per runtime"))
+        }
+
+        fn failed_usage(&self, _lease_id: LeaseId) -> Option<ResourceUsage> {
+            self.usage.lock().expect("usage lock").take()
         }
 
         async fn kill(&self, _lease_id: LeaseId) {}
@@ -672,7 +722,7 @@ mod tests {
         if fence {
             assert_eq!(leases.fence().len(), 1);
         }
-        let (ended, outcome, phases) = done_rx.recv().await.expect("the run ends");
+        let (ended, outcome, usage, phases) = done_rx.recv().await.expect("the run ends");
         let captured = Captured::default();
         let writer = captured.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -681,7 +731,7 @@ mod tests {
             .with_writer(move || writer.clone())
             .finish();
         let result = tracing::subscriber::with_default(subscriber, || {
-            leases.finished(ended, outcome, &phases)
+            leases.finished(ended, outcome, usage, &phases)
         });
         let log = String::from_utf8(captured.0.lock().expect("log lock").clone()).expect("UTF-8");
         (result, log)
@@ -772,6 +822,78 @@ mod tests {
         assert!(warn.contains("lease fenced"), "{warn}");
         assert!(warn.contains("lease=3.4"), "{warn}");
         assert!(!log.contains("lease failed"), "{log}");
+    }
+
+    /// Catches a lease that ends without a result losing what its runtime counted:
+    /// the memory ladder needs the peak of an out-of-memory kill and the CPU of a
+    /// timed-out or killed action, and a result built only from the error carries
+    /// neither. Each error must put the usage in its Result's metadata and its
+    /// counters on the `lease phases:` line; only a memory kill (the lease's own
+    /// limit, or the node's) ends the line with `oom=1`. On the code before this change
+    /// the runtime is never asked, so the Result has no `action_result` for an
+    /// out-of-memory kill and the line says `mem_peak=-`.
+    #[tokio::test]
+    async fn a_lease_that_failed_still_reports_what_it_counted() {
+        let usage = ResourceUsage {
+            cpu_user_micros: 700,
+            wall_micros: 2_000_000,
+            peak_memory_bytes: 4096,
+            cgroup: Some(worker::CgroupUsage {
+                cpu_usage_micros: Some(1_000_000),
+                memory_peak_bytes: Some(4096),
+                ..worker::CgroupUsage::default()
+            }),
+            ..ResourceUsage::default()
+        };
+        let errors = [
+            (
+                RuntimeError::OutOfMemory {
+                    used: 4096,
+                    limit: 4096,
+                },
+                true,
+            ),
+            (RuntimeError::BusyNode("psi".into()), true),
+            (
+                RuntimeError::TimedOut {
+                    stdout: None,
+                    stderr: None,
+                },
+                false,
+            ),
+            (RuntimeError::Killed, false),
+        ];
+        for (error, oom) in errors {
+            let name = failure_kind(&error);
+            let runtime = Failing::measured(error, &usage);
+            let (result, log) = finish_logged(runtime, false).await;
+            let carried = result
+                .action_result
+                .as_ref()
+                .and_then(ResourceUsage::in_result);
+            assert_eq!(carried.as_ref(), Some(&usage), "{name}: {result:?}");
+            let line = log
+                .lines()
+                .find(|l| l.contains("lease phases:"))
+                .expect("a phases line");
+            assert!(line.contains(" cpu_usage_us=1000000 "), "{name}: {line}");
+            assert!(line.contains(" mem_peak=4096 "), "{name}: {line}");
+            assert!(line.contains("parallelism=0.50"), "{name}: {line}");
+            assert_eq!(line.ends_with(" oom=1"), oom, "{name}: {line}");
+        }
+    }
+
+    /// Catches a failed lease whose runtime measured nothing getting a made-up result
+    /// or counters: no usage in the Result, and `-` on the line, with no `oom` key.
+    #[tokio::test]
+    async fn a_failed_lease_without_a_measure_carries_none() {
+        let (result, log) = finish_logged(Failing::with(RuntimeError::Killed), false).await;
+        assert_eq!(result.action_result, None);
+        let line = log
+            .lines()
+            .find(|l| l.contains("lease phases:"))
+            .expect("line");
+        assert!(line.ends_with("numa_spread=-"), "{line}");
     }
 
     /// Catches a reason that is cut mid-character, left unbounded, or left with

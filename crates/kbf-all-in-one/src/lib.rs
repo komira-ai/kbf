@@ -22,10 +22,11 @@
 //!
 //! Not done yet (the README lists it): a durable scheduler state, without which a restart
 //! loses every lease; the in-process plane's admission; the `--reserve-cpus` split
-//! between the halves; the walk handing its buffers to the plane; the simulation's
-//! in-process data plane; and the deploy shape, the ownership step and the unit.
+//! between the halves; the simulation's in-process data plane; and the deploy shape,
+//! the ownership step and the unit.
 
 pub mod cli;
+mod intake;
 mod plane;
 #[cfg(target_os = "linux")]
 mod run;

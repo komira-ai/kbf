@@ -499,11 +499,25 @@ fn kbf_async_threads(flag: &str) -> usize {
 fn each_driver_starts_and_stops_on_sigterm() {
     let status = runs_until_sigterm("fake", &["--driver=fake".to_owned()]);
     assert!(status.success(), "{status}");
-    let scratch = tls("native-scratch").join("leases");
+    // The fake driver keeps nothing on disk, so without `--data-dir` it touches no
+    // directory; given one, it makes it and claims its lease directory.
+    let fake_data = tls("fake-data");
+    let fake = [
+        "--driver=fake".to_owned(),
+        format!("--data-dir={}", fake_data.display()),
+    ];
+    let status = runs_until_sigterm("fake-data", &fake);
+    assert!(status.success(), "{status}");
+    assert!(
+        fake_data.join("leases/daemon-instance").is_file(),
+        "the fake daemon with --data-dir makes and claims its lease directory"
+    );
+    let data = tls("native-scratch");
+    let scratch = data.join("leases");
     let native = [
         "--driver=native".to_owned(),
         "--cas=https://127.0.0.1:1".to_owned(),
-        format!("--scratch={}", scratch.display()),
+        format!("--data-dir={}", data.display()),
     ];
     let one = one_native_daemon();
     let status = runs_until_sigterm("native", &native);
@@ -520,7 +534,7 @@ fn each_driver_starts_and_stops_on_sigterm() {
         let mut container = vec![
             "--driver=container".to_owned(),
             "--cas=https://127.0.0.1:1".to_owned(),
-            format!("--scratch={}", scratch.display()),
+            format!("--data-dir={}", data.display()),
             format!("--id-files={}", ids.display()),
             "--actions-memory-max-gib=1".to_owned(),
         ];
@@ -543,6 +557,102 @@ fn each_driver_starts_and_stops_on_sigterm() {
         );
         assert_eq!(read(&unit.join("actions/memory.max")), "1073741824");
     }
+}
+
+/// A container node started with `--lease-placement=numa-node` over `nodes` (a fake
+/// `/sys/devices/system/node`, one `cpulist` each) on the stand-in cgroup mount. Returns
+/// the unit's directory after SIGTERM and the daemon's log.
+#[cfg(target_os = "linux")]
+fn placed_container_node(name: &str, nodes: &[(u32, &str)]) -> (PathBuf, String) {
+    let dir = tls(name);
+    let numa = dir.join("numa");
+    for (id, list) in nodes {
+        let node = numa.join(format!("node{id}"));
+        std::fs::create_dir_all(&node).expect("mkdir");
+        std::fs::write(node.join("cpulist"), format!("{list}\n")).expect("plant");
+    }
+    let ids = id_files(&format!("{name}-ids"), "65536");
+    let (unit, cgroup_flags) = cgroup_tree(&dir, "cpu cpuset memory pids");
+    let (bin, _) = podman_stub(&format!("{name}-bin"));
+    let mut flags = vec![
+        "--driver=container".to_owned(),
+        "--cas=https://127.0.0.1:1".to_owned(),
+        format!("--data-dir={}", dir.display()),
+        format!("--id-files={}", ids.display()),
+        "--lease-placement=numa-node".to_owned(),
+        format!("--numa-dir={}", numa.display()),
+    ];
+    flags.extend(cgroup_flags);
+    let (status, log) = runs_until_sigterm_logged(name, &flags, Some(&bin));
+    let log = log.join("\n");
+    assert!(status.success(), "{status}: {log}");
+    (unit, log)
+}
+
+/// Catches `--lease-placement=numa-node` not reaching the cgroup setup on a two-node
+/// host (`cpuset` not enabled for `actions/` and its parent, so no lease cgroup would
+/// have cpuset files), and no log line saying the placement is on.
+///
+/// The cgroup mount is plain directories: the kernel's own rules for `cpuset` are in
+/// `delegate_tests.rs`.
+#[test]
+#[cfg(target_os = "linux")]
+fn numa_node_placement_enables_cpuset_on_a_two_node_host() {
+    let (unit, log) = placed_container_node("numa-two", &[(0, "0-21,44-65"), (1, "22-43,66-87")]);
+    assert_eq!(read(&unit.join("cgroup.subtree_control")), "+cpuset");
+    assert_eq!(
+        read(&unit.join("actions/cgroup.subtree_control")),
+        "+cpuset"
+    );
+    assert!(
+        log.contains("lease placement numa-node: node0=0-21,44-65 node1=22-43,66-87"),
+        "{log}"
+    );
+}
+
+/// Catches a single-node host failing the start or touching its cgroups under
+/// `--lease-placement=numa-node`: it runs as `none` and says so once.
+#[test]
+#[cfg(target_os = "linux")]
+fn numa_node_placement_on_a_one_node_host_runs_unplaced() {
+    let (unit, log) = placed_container_node("numa-one", &[(0, "0-87")]);
+    assert_eq!(
+        read(&unit.join("cgroup.subtree_control")),
+        "+cpu +memory +pids"
+    );
+    assert_eq!(log.matches("; not pinned").count(), 1, "{log}");
+}
+
+/// `--lease-placement=numa-node` with a driver that runs no containers is refused (also
+/// what macOS does: it has no container driver), naming the flag and the driver; the
+/// a value that is not a placement is a usage error.
+///
+/// Catches: the flag silently ignored by a driver that cannot honour it (an operator
+/// believes leases are pinned), and a bad value accepted.
+#[test]
+fn a_placement_without_the_container_driver_is_refused() {
+    let dir = tls("placement-refused");
+    let out = Command::new(BIN)
+        .args(base(&dir))
+        .args(["--driver=fake", "--lease-placement=numa-node"])
+        .output()
+        .expect("spawn");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("--lease-placement=numa-node") && stderr.contains("--driver container"),
+        "{stderr}"
+    );
+    let bad = Command::new(BIN)
+        .args(base(&dir))
+        .args(["--driver=fake", "--lease-placement=socket"])
+        .output()
+        .expect("spawn");
+    assert_eq!(
+        bad.status.code(),
+        Some(2),
+        "not a placement is a usage error"
+    );
 }
 
 /// A directory put first in `PATH` holding a `podman` that lists no container and
@@ -620,7 +730,7 @@ fn a_container_node_reports_what_its_leases_may_use() {
             "--node-id=node-1".to_owned(),
             "--driver=container".to_owned(),
             format!("--cas=https://127.0.0.1:{}", front.worker.port()),
-            format!("--scratch={}", dir.join("leases").display()),
+            format!("--data-dir={}", dir.display()),
             format!("--id-files={}", ids.display()),
             "--actions-memory-max-gib=1".to_owned(),
             "--supervisor-memory-min-mib=512".to_owned(),
@@ -735,7 +845,7 @@ fn a_container_nodes_leases_get_the_cpus_minus_the_reserve() {
             "--node-id=node-1".to_owned(),
             "--driver=container".to_owned(),
             format!("--cas=https://127.0.0.1:{}", front.worker.port()),
-            format!("--scratch={}", dir.join("leases").display()),
+            format!("--data-dir={}", dir.display()),
             format!("--id-files={}", ids.display()),
             "--reserve-cpus=1".to_owned(),
         ])
@@ -787,7 +897,7 @@ fn a_container_node_given_its_actions_cgroup_writes_only_its_cap() {
     flags.extend([
         "--driver=container".to_owned(),
         "--cas=https://127.0.0.1:1".to_owned(),
-        format!("--scratch={}", dir.join("leases").display()),
+        format!("--data-dir={}", dir.display()),
         format!("--id-files={}", ids.display()),
         "--cgroup-parent=/kbf.slice/kbf-daemon.service/actions".to_owned(),
         "--actions-memory-max-gib=2".to_owned(),
@@ -821,7 +931,7 @@ fn a_container_node_whose_cgroup_is_not_delegated_refuses_to_start() {
             .args([
                 "--driver=container".to_owned(),
                 "--cas=https://127.0.0.1:1".to_owned(),
-                format!("--scratch={}", dir.join("leases").display()),
+                format!("--data-dir={}", dir.display()),
                 format!("--id-files={}", ids.display()),
             ])
             .args(flags)
@@ -900,15 +1010,19 @@ fn id_files(name: &str, count: &str) -> PathBuf {
 #[test]
 fn a_driver_missing_its_flags_refuses_to_start() {
     let dir = tls("refused");
-    let scratch = format!("--scratch={}", dir.join("leases").display());
+    let scratch = format!("--data-dir={}", dir.display());
     let cases: Vec<(Vec<String>, &str)> = vec![
         (
             vec!["--driver=native".into(), scratch.clone()],
             "--cas is required",
         ),
         (
-            vec!["--driver=native".into(), "--cas=https://127.0.0.1:1".into()],
-            "--scratch is required",
+            vec![
+                "--driver=native".into(),
+                "--cas=https://127.0.0.1:1".into(),
+                "--data-dir=relative".into(),
+            ],
+            "--data-dir relative must be absolute",
         ),
         (
             vec![
@@ -1000,7 +1114,7 @@ fn a_container_node_without_subordinate_ids_refuses_to_start() {
             .args([
                 "--driver=container".to_owned(),
                 "--cas=https://127.0.0.1:1".to_owned(),
-                format!("--scratch={}", ids.join("leases").display()),
+                format!("--data-dir={}", ids.display()),
                 "--cgroup-parent=/kbf.slice/actions".to_owned(),
                 format!("--id-files={}", ids.display()),
             ])
@@ -1033,7 +1147,7 @@ fn a_node_told_to_use_the_oci_backend_needs_its_runtime() {
     let mut container = vec![
         "--driver=container".to_owned(),
         "--cas=https://127.0.0.1:1".to_owned(),
-        format!("--scratch={}", ids.join("leases").display()),
+        format!("--data-dir={}", ids.display()),
         format!("--id-files={}", ids.display()),
         "--actions-memory-max-gib=1".to_owned(),
         "--container-runtime=oci".to_owned(),
@@ -1119,7 +1233,7 @@ fn a_container_node_given_a_zero_limit_refuses_to_start() {
             .args([
                 "--driver=container".to_owned(),
                 "--cas=https://127.0.0.1:1".to_owned(),
-                format!("--scratch={}", dir.join("leases").display()),
+                format!("--data-dir={}", dir.display()),
                 format!("--id-files={}", ids.display()),
                 flag.to_owned(),
             ])
@@ -1198,7 +1312,8 @@ fn wait_for<T>(what: &str, mut read: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-/// The flags of a native daemon in `dir` that serves `front`, with leases under `scratch`.
+/// The flags of a native daemon in `dir` that serves `front`, with leases under
+/// `scratch` (`<--data-dir>/leases`: `scratch`'s parent is the data directory).
 fn native_flags(front: &front::Front, dir: &Path, scratch: &Path) -> Vec<String> {
     vec![
         format!("--server=https://127.0.0.1:{}", front.worker.port()),
@@ -1210,7 +1325,10 @@ fn native_flags(front: &front::Front, dir: &Path, scratch: &Path) -> Vec<String>
         "--reconnect-ms=50".to_owned(),
         "--driver=native".to_owned(),
         format!("--cas=https://127.0.0.1:{}", front.worker.port()),
-        format!("--scratch={}", scratch.display()),
+        format!(
+            "--data-dir={}",
+            scratch.parent().expect("a data dir").display()
+        ),
     ]
 }
 
@@ -1474,7 +1592,7 @@ fn container_flags(dir: &Path, ids: &Path, images: &[String]) -> Vec<String> {
     let mut flags = vec![
         "--driver=container".to_owned(),
         "--cas=https://127.0.0.1:1".to_owned(),
-        format!("--scratch={}", dir.join("leases").display()),
+        format!("--data-dir={}", dir.display()),
         format!("--id-files={}", ids.display()),
     ];
     flags.extend(cgroup_flags);

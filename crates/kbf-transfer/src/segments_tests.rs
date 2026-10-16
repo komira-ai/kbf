@@ -20,7 +20,7 @@ fn record(n: u8, size: u64) -> Record {
     Record {
         digest: KbfDigest::new(DigestFunction::Sha256, hash, size),
         crc32c: u32::from(n),
-        source: Source::Bytes(Arc::from([])),
+        source: Source::Bytes(bytes::Bytes::new()),
     }
 }
 

@@ -170,7 +170,8 @@ pub fn plan<E: Exec>(
     linger(exec, out)?;
 
     let dest = under(&under(&state, "bin")?, "kbf-server")?;
-    let args = exec_start(s, &dest, &pki)?;
+    let meta = under(&state, "meta")?;
+    let args = exec_start(s, &dest, &pki, &meta)?;
     let bytes = supports(exec, &a.bin, &args, platform.arch, out)?;
     let log_dir = under(&state, "log")?;
     let slice = render(
@@ -584,30 +585,36 @@ fn linger(exec: &dyn Exec, out: &mut dyn Write) -> Result<(), PilotError> {
     Ok(())
 }
 
-/// The unit's `ExecStart=` words, each one a unit line carries as it is.
+/// The unit's `ExecStart=` words, each one a unit line carries as it is. The cold store
+/// is the bucket's `s3://` URI, whose `?` and `&` a unit carries as they are; each part
+/// of it is checked on its own. The metadata log lives in `meta`.
 fn exec_start(
     s: &ServerSettings,
     dest: &HostPath,
     pki: &HostPath,
+    meta: &HostPath,
 ) -> Result<Vec<String>, PilotError> {
+    for part in [&s.s3_bucket, &s.s3_prefix, &s.minio_endpoint, &s.s3_region] {
+        carried("a kbf-server argument", "unit", part, false)?;
+    }
+    let conditional = if s.conditional_put {
+        "&conditional-put=true"
+    } else {
+        ""
+    };
+    let cold = format!(
+        "s3://{}/{}?endpoint={}&region={}{conditional}",
+        s.s3_bucket, s.s3_prefix, s.minio_endpoint, s.s3_region
+    );
     let mut args = vec![
         dest.to_string(),
         "--role".into(),
         "all".into(),
-        "--store".into(),
-        "s3".into(),
-        "--s3-endpoint".into(),
-        s.minio_endpoint.clone(),
-        "--s3-bucket".into(),
-        s.s3_bucket.clone(),
-        "--s3-region".into(),
-        s.s3_region.clone(),
-        "--s3-prefix".into(),
-        s.s3_prefix.clone(),
+        "--cold-store".into(),
+        cold,
+        "--meta-dir".into(),
+        meta.to_string(),
     ];
-    if s.conditional_put {
-        args.push("--s3-conditional-put".into());
-    }
     args.extend([
         "--listen".into(),
         format!("{}:{}", s.bind, s.reapi_port),
@@ -620,7 +627,7 @@ fn exec_start(
         "--worker-client-ca".into(),
         under(pki, "ca.pem")?.to_string(),
     ]);
-    for a in &args {
+    for a in args.iter().filter(|a| !a.starts_with("s3://")) {
         carried("a kbf-server argument", "unit", a, false)?;
     }
     Ok(args)

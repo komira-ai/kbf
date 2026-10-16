@@ -71,9 +71,9 @@ async fn a_run_whose_driver_panics_reports_internal_and_the_next_runs() {
         ..Start::default()
     };
     assert_eq!(leases.start(start(id())), None);
-    let (ended, outcome, phases) = reported(&mut done_rx).await;
+    let (ended, outcome, usage, phases) = reported(&mut done_rx).await;
     assert_eq!(ended, id());
-    let result = leases.finished(ended, outcome, &phases);
+    let result = leases.finished(ended, outcome, usage, &phases);
     assert_eq!(code(&result), Code::Internal as i32, "{result:?}");
     let message = &result.status.as_ref().expect("status").message;
     assert_eq!(message, "the panics-once driver panicked: a driver bug");
@@ -82,7 +82,7 @@ async fn a_run_whose_driver_panics_reports_internal_and_the_next_runs() {
     assert_eq!(*runtime.1.lock().expect("kills"), [id()]);
     let next = LeaseId::new(3, 5);
     assert_eq!(leases.start(start(next)), None);
-    let (ended, outcome, _) = reported(&mut done_rx).await;
+    let (ended, outcome, _, _) = reported(&mut done_rx).await;
     assert_eq!(ended, next);
     assert!(outcome.is_ok(), "{outcome:?}");
 }

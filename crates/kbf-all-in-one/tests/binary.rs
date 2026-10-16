@@ -13,11 +13,12 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use kbf_proto::google::longrunning::operation;
+use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
 use kbf_proto::reapi::execution_client::ExecutionClient;
 use kbf_proto::reapi::platform::Property;
 use kbf_proto::reapi::{
     Action, ActionResult, Command as ReapiCommand, Digest, Directory, ExecuteRequest,
-    ExecuteResponse, Platform, Tree,
+    ExecuteResponse, FindMissingBlobsRequest, Platform, Tree,
 };
 use kbf_transfer::{Cas as _, TransferConfig, Transfers, fetch};
 use prost::Message as _;
@@ -134,7 +135,8 @@ fn free_port() -> u16 {
 }
 
 /// The flags of a one-node farm in `dir`: the server's worker listener on `port` under
-/// mutual TLS, a write tier, and the daemon half's container driver dialling it.
+/// mutual TLS, a cold store and a hot store (the write tier, holding the metadata log),
+/// and the daemon half's container driver dialling it.
 fn farm_flags(dir: &Path, port: u16) -> Vec<String> {
     let at = |name: &str| dir.join(name).display().to_string();
     vec![
@@ -143,8 +145,8 @@ fn farm_flags(dir: &Path, port: u16) -> Vec<String> {
         format!("--worker-tls-cert={}", at("server.pem")),
         format!("--worker-tls-key={}", at("server.key")),
         format!("--worker-client-ca={}", at("ca.pem")),
-        format!("--write-tier-dir={}", at("tier")),
-        "--write-tier-bytes=1073741824".to_owned(),
+        format!("--cold-store=file://{}", at("cold")),
+        format!("--hot-store=file://{}", at("hot")),
         format!("--server=https://127.0.0.1:{port}"),
         "--tls-server-name=localhost".to_owned(),
         format!("--ca-cert={}", at("ca.pem")),
@@ -153,8 +155,32 @@ fn farm_flags(dir: &Path, port: u16) -> Vec<String> {
         "--node-id=node-1".to_owned(),
         "--reconnect-ms=50".to_owned(),
         "--driver=container".to_owned(),
-        format!("--scratch={}", at("scratch")),
+        format!("--data-dir={}", at("data")),
     ]
+}
+
+/// `PATH` with `bin`, where [`podman`] put the stand-in, first.
+fn image_path(bin: &Path) -> String {
+    format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+/// The binary with `flags` (a one-node farm in `dir`, [`farm_flags`]) whose container
+/// driver runs the stand-in `podman` in `bin`, found through `path`.
+fn farm(dir: &Path, bin: &Path, path: &str, flags: Vec<String>) -> Command {
+    let mut command = Command::new(BIN);
+    command
+        .args(flags)
+        .arg(format!("--id-files={}", id_files(dir).display()))
+        .args(cgroup_tree(bin))
+        .env("PATH", path)
+        // The stand-in finds its state beside the link it was run through, which the
+        // driver runs by the name `PATH` finds (argv0 `podman`): from here.
+        .current_dir(bin);
+    command
 }
 
 /// Kills the process when dropped, so a failed test leaves nothing running.
@@ -244,19 +270,8 @@ fn an_actions_outputs_go_through_the_in_process_plane() {
         "to stderr",
     ];
     let image = podman(&bin, &steps);
-    let path = format!(
-        "{}:{}",
-        bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let mut child = Command::new(BIN)
-        .args(farm_flags(&dir, free_port()))
-        .arg(format!("--id-files={}", id_files(&dir).display()))
-        .args(cgroup_tree(&bin))
-        .env("PATH", path)
-        // The stand-in finds its state beside the link it was run through, which the
-        // driver runs by the name `PATH` finds (argv0 `podman`): from here.
-        .current_dir(&bin)
+    let flags = farm_flags(&dir, free_port());
+    let mut child = farm(&dir, &bin, &image_path(&bin), flags)
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn");
@@ -348,13 +363,16 @@ fn the_binary_answers_as_a_keeper_before_it_reads_its_flags() {
     assert!(out.stdout.is_empty(), "a server started");
 }
 
-/// Runs the binary with `extra` flags after a one-node farm's in a fresh directory and
-/// returns its exit status and stderr.
+/// Runs the binary with a one-node farm's flags in a fresh directory, `extra` taking the
+/// place of any it names again, and returns its exit status and stderr.
 fn refused(name: &str, extra: &[&str]) -> (Option<i32>, String) {
     let dir = scratch(name);
     pki(&dir);
+    let name = |flag: &str| flag.split('=').next().unwrap_or(flag).to_owned();
+    let named: Vec<String> = extra.iter().map(|flag| name(flag)).collect();
+    let farm = farm_flags(&dir, free_port());
     let output = Command::new(BIN)
-        .args(farm_flags(&dir, free_port()))
+        .args(farm.iter().filter(|flag| !named.contains(&name(flag))))
         .args(extra)
         .output()
         .expect("run");
@@ -364,12 +382,15 @@ fn refused(name: &str, extra: &[&str]) -> (Option<i32>, String) {
 
 /// Catches a start either half refuses that exits 0 or as the other half would, or
 /// that does not say which half refused: a server whose flags its own start refuses
-/// (`--blob-dir` without its Raft log) exits 2, as `kbf-server` does; a daemon whose
+/// (a cold store that cannot be made) exits 2, as `kbf-server` does; a daemon whose
 /// driver cannot start (no subordinate ids for its user) exits 1, as `kbf-daemon` does;
 /// a driver other than the container driver is a usage error, 2.
 #[test]
 fn a_start_either_half_refuses_says_which() {
-    let (code, stderr) = refused("server-refuses", &["--blob-dir=/nonexistent/blobs"]);
+    let (code, stderr) = refused(
+        "server-refuses",
+        &["--cold-store=file:///proc/nonexistent/cold"],
+    );
     assert_eq!(code, Some(2), "{stderr}");
     assert!(stderr.contains("kbf-all-in-one: server: "), "{stderr}");
     let (code, stderr) = refused("daemon-refuses", &["--id-files=/nonexistent/ids"]);
@@ -379,3 +400,88 @@ fn a_start_either_half_refuses_says_which() {
     assert_eq!(code, Some(2), "{stderr}");
     assert!(stderr.contains("container driver only"), "{stderr}");
 }
+
+/// Catches the start-up pass or the evictor not run over the all-in-one's `file://`
+/// cold store (mutants: `kbf_server::start`'s `file://` arm passes no pass; the
+/// evictor loop removed): a single-voter farm is this binary's main use, and the pass
+/// deletes its orphans and forgets its lost objects, the evictor keeps its disk from
+/// filling. Without a hot store (uploads go straight to the cold store), on a fake
+/// 16 MiB filesystem holding only the object files with a 4 MiB floor and no grace
+/// window (the server's hidden test flags, which this binary takes as `kbf-server`
+/// does), the pass logs its last line, twenty uploads of 1 MiB each all succeed, the
+/// evictor logs a round and the first blob is reported missing.
+#[test]
+fn the_start_up_pass_and_the_evictor_run_over_a_file_cold_store() {
+    const MIB: usize = 1 << 20;
+    let dir = scratch("pass");
+    pki(&dir);
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("mkdir");
+    podman(&bin, &["true"]);
+    let mut flags: Vec<String> = farm_flags(&dir, free_port())
+        .into_iter()
+        .filter(|flag| !flag.starts_with("--hot-store="))
+        .collect();
+    flags.extend([
+        format!("--meta-dir={}", dir.join("meta").display()),
+        format!("--cold-store-size-bytes={}", 16 * MIB),
+        format!("--cold-store-floor-bytes={}", 4 * MIB),
+        "--cold-store-evict-grace-ms=0".to_owned(),
+    ]);
+    let mut child = farm(&dir, &bin, &image_path(&bin), flags)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let stderr = BufReader::new(child.stderr.take().expect("stderr"));
+    let _running = Running(child);
+    let (seen, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in stderr.lines().map_while(Result::ok) {
+            if line.contains(PASS_DONE) || line.contains(EVICTED) {
+                let _ = seen.send(line);
+            }
+        }
+    });
+    let line = stdout.lines().next().expect("a start line").expect("read");
+    let reapi = line
+        .split(' ')
+        .find_map(|field| field.strip_prefix("reapi="))
+        .unwrap_or_else(|| panic!("no reapi= in {line:?}"))
+        .to_owned();
+    let line = lines.recv_timeout(PROMPT).expect("the pass's last line");
+    assert!(line.contains(PASS_DONE), "{line}");
+
+    let tokio = tokio::runtime::Runtime::new().expect("runtime");
+    let (first, missing) = tokio.block_on(async {
+        let channel = Endpoint::from_shared(format!("http://{reapi}"))
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect");
+        let cas = Transfers::over(channel.clone(), TransferConfig::default());
+        let mut blobs = Vec::new();
+        for i in 0..20_u8 {
+            blobs.push(put(&cas, vec![i; MIB]).await);
+        }
+        let line = lines.recv_timeout(PROMPT).expect("an eviction round");
+        assert!(line.contains(EVICTED), "{line}");
+        let request = FindMissingBlobsRequest {
+            blob_digests: vec![blobs[0].clone()],
+            ..FindMissingBlobsRequest::default()
+        };
+        let answer = ContentAddressableStorageClient::new(channel)
+            .find_missing_blobs(request)
+            .await
+            .expect("FindMissingBlobs");
+        (blobs[0].clone(), answer.into_inner().missing_blob_digests)
+    });
+    assert_eq!(missing, [first], "the least recently used blob was kept");
+}
+
+/// The start-up pass's last line (`kbf-server`'s `startup_pass`).
+const PASS_DONE: &str = "start-up pass over the cold store directory done";
+
+/// What a round of eviction that evicted logs (`kbf-front`'s `Cache::evict_round`).
+const EVICTED: &str = "evicted the least recently used objects";

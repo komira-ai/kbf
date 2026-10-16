@@ -1,4 +1,4 @@
-//! The simulated server: `kbf-server --meta-log=raft` on a fault-injecting disk.
+//! The simulated server: `kbf-server`'s Raft metadata log on a fault-injecting disk.
 //!
 //! - **Metadata** is a [`RaftMetaLog`] over the server's [`FaultFs`], opened as the
 //!   server opens it (a new log's id drawn from the seed). Its futures never wait: each

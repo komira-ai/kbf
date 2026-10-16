@@ -532,8 +532,8 @@ fn a_cell_that_does_everything_passes() {
     let api = cell.http.addr;
     let server = cell.calls("kbf-server");
     let expected = format!(
-        "--store s3 --s3-endpoint http://{api} --s3-bucket kbf-m1 --s3-conditional-put \
-         --listen 127.0.0.1:8980 --worker-listen 127.0.0.1:8981 \
+        "--cold-store s3://kbf-m1?endpoint=http://{api}&conditional-put=true \
+         --meta-dir {w}/server-meta --listen 127.0.0.1:8980 --worker-listen 127.0.0.1:8981 \
          --worker-tls-cert {w}/pki/server.pem --worker-tls-key {w}/pki/server.key \
          --worker-client-ca {w}/pki/ca.pem --api-listen {api} --api-token-file {w}/api-token"
     );

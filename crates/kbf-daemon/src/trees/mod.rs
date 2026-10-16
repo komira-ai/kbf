@@ -17,7 +17,7 @@
 //! user and not writable). A `rename` or `link` across the mount's boundary fails
 //! `EXDEV`: a tool that hard-links an input out of a tree without a copy fallback fails.
 //! An action that writes into a toolchain directory now fails where it used to succeed;
-//! a node without `--tree-dir` keeps the old behaviour.
+//! a node without a tree store keeps the old behaviour.
 //!
 //! **macOS** has no bind or overlay mounts ([`Delivery::Clone`]): the store's trees are
 //! built from clones of the cache's entries (read-only, as the cache's own), and an
@@ -57,16 +57,16 @@ pub const MAX_MOUNTS: usize = 8;
 /// How the tree store is opened and used (`--tree-*`).
 #[derive(Clone, Debug)]
 pub struct TreeConfig {
-    /// `--tree-dir`: the store's directory, made if missing. It should be on the
+    /// `<--data-dir>/trees`: the store's directory, made if missing. It should be on the
     /// input cache's filesystem (otherwise the trees' files are copies, not links).
     pub dir: PathBuf,
-    /// `--tree-max-bytes`: the most file bytes of trees kept; unpinned trees are
+    /// The most file bytes of trees kept; unpinned trees are
     /// evicted, least recently used first, past it. A node larger than this is never a
     /// tree.
     pub max_bytes: u64,
-    /// `--tree-min-files`: the fewest files and symlinks a node holds to be a tree.
+    /// The fewest files and symlinks a node holds to be a tree.
     pub min_files: u64,
-    /// `--tree-max-mounts`: the most trees one action mounts (or clones).
+    /// The most trees one action mounts (or clones).
     pub max_mounts: usize,
     /// How a tree reaches an action: [`Delivery::platform`], unless a test says
     /// otherwise.

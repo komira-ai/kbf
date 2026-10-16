@@ -100,16 +100,16 @@ impl Hooks for NoHooks {
 /// How a cache is opened and run.
 #[derive(Clone)]
 pub struct CacheConfig {
-    /// `--cache-dir`: the directory the cache owns. It must exist.
+    /// `<--data-dir>/cache`: the directory the cache owns. It must exist.
     pub dir: PathBuf,
     /// The lease scratch directory, whose filesystem the cache should share.
     pub scratch: PathBuf,
-    /// `--cache-max-bytes`: the most bytes of entries kept.
+    /// The most bytes of entries kept (sized from the data directory's filesystem).
     pub max_bytes: u64,
-    /// `--cache-min-free-bytes`: below this much free space on the filesystem,
+    /// Below this much free space on the filesystem,
     /// entries no lease links are evicted. 0 is no floor.
     pub min_free_bytes: u64,
-    /// `--cache-link-concurrency`: how many files of a lease are linked or filled at
+    /// How many files of a lease are linked or filled at
     /// once.
     pub link_concurrency: usize,
     /// How often the index is saved.
@@ -191,8 +191,9 @@ pub enum Disabled {
         "lease-name: a cache directory named kbf-lease-* or lease-* is removed by lease sweeps"
     )]
     LeaseName,
-    /// `--cache-dir` without `--cache-max-bytes`.
-    #[error("no-budget: --cache-dir needs --cache-max-bytes")]
+    /// The data directory's filesystem has no room for a cache once it keeps its floor
+    /// free.
+    #[error("no-budget: the data directory's filesystem is too small for a cache")]
     NoBudget,
     /// The Linux native driver: actions run as the cache's owner and could write it.
     #[error("native-same-uid: native actions run as the daemon's user and could write the cache")]
@@ -412,7 +413,7 @@ impl Cache {
         Ok(Arc::new(Self { inner }))
     }
 
-    /// The directory the cache owns (`--cache-dir`).
+    /// The directory the cache owns (`<--data-dir>/cache`).
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.inner.config.dir

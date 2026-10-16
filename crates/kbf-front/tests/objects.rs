@@ -20,7 +20,7 @@ use kbf_segments::SegmentReader;
 use kbf_segments::layout::footer_len;
 use kbf_types::Digest;
 
-/// A bucket that refuses to replace a key, as `--s3-conditional-put` does, so a key
+/// A bucket that refuses to replace a key, as `conditional-put=true` in `kbf-server --cold-store` does, so a key
 /// named twice fails the second write instead of hiding it.
 fn conditional() -> SharedStore {
     SharedStore(Arc::new(MemoryStore::new(Capabilities {

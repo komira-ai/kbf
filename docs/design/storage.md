@@ -61,9 +61,9 @@ location in any other store fails `INTERNAL`.
 
 The front reaches it only through the `MetaLog` trait: `commit` a command and get back
 what applying it did, or run a read-only `query`. `MemoryMetaLog` is one state behind a
-lock in the server process. `RaftMetaLog` (`--meta-log=raft`, in
+lock in the server process. `RaftMetaLog` (in
 `kbf-server/src/raft_log`) exists today as a **single-voter** Raft log on the local
-disk in `--raft-dir`, and needs `--store=s3` or `--blob-dir`: `commit` encodes the command, proposes
+disk in `--meta-dir` (or `<hot store>/meta`), which is what the binary always runs: `commit` encodes the command, proposes
 it, syncs it, applies it and only then answers. Commits are grouped: commands that
 arrive while a sync is in progress are written together and made durable by the next
 single sync, and each is answered after it; a lone command is committed at once. The
@@ -155,13 +155,13 @@ objects (their only copy is a block on a tier), and raises the loss count once p
 object that held a blob, which the input-tree skip cache reads. It is one scan of the
 index and one of the action cache, on the log's apply path. It is log format 3
 (`kbf_log::Format::V3`, machine version 3, `MetaCommand` field 15): a format-1 or
-format-2 log refuses it on encode and decode. Nothing commits it yet; it is for
-eviction under disk pressure and for a start-up pass that finds index entries with no
-object behind them.
+format-2 log refuses it on encode and decode. Under a `file://` cold store the start-up pass
+commits it for index entries with no file behind them, and the evictor for the objects
+it evicts ([Eviction under disk pressure](#eviction-under-disk-pressure)).
 
-Today, under `--meta-log=raft`, the server commits a `Tick` every second while the log
+Today, under the Raft metadata log, the server commits a `Tick` every second while the log
 is open (`raft_log::TICK`), so the metadata's farm time advances and continues across
-restarts. Under `--meta-log=memory` nothing advances it, and the index is lost at
+restarts. Under the in-memory metadata log (tests only) nothing advances it, and the index is lost at
 restart. In neither mode does the server run `Collect`, so nothing expires while it
 runs. **Planned**: collection runs on a schedule.
 
@@ -209,10 +209,10 @@ most 16 MiB of blob data (`MAX_BATCH_TOTAL_BYTES`; the gRPC message limit is 17 
 
 Object keys are `<prefix>cas/<epoch>/<seq>`, each as 16 lowercase hex digits. Two
 caches over one metadata log hold different epochs, so they never name the same key.
-Under `--meta-log=memory` the metadata is in memory and starts again from epoch 1 at
-every start, so with `--store=s3` each server start writes under its own prefix (the
+Under the in-memory metadata log (tests only) the metadata is in memory and starts again from epoch 1 at
+every start, so with an S3 cold store each server start writes under its own prefix (the
 configured prefix plus the start time), and keys never collide across restarts. Under
-`--meta-log=raft` the epochs are committed in the Raft log, so every start writes
+the Raft metadata log the epochs are committed in the Raft log, so every start writes
 under the one prefix the log committed (the configured prefix plus the log id) in an
 epoch no earlier start used.
 
@@ -342,7 +342,7 @@ normalisation between kbf and a store can turn one key into another.
 
 - `MemoryStore`: in memory; the executable form of the contract and the store tests
   use.
-- `FsStore` (`kbf-server --blob-dir`): a directory on the local disk, for a farm on
+- `FsStore` (`kbf-server --cold-store=file:///dir`): a directory on the local disk, for a farm on
   one host without an S3 service. One file per object under `objects/<hh>/<h>`, `<h>`
   the SHA-256 of the key in hex and `<hh>` its first two digits; the file is a header
   naming the key, then the object's bytes. A write goes to a file in `tmp/`, synced,
@@ -356,8 +356,10 @@ normalisation between kbf and a store can turn one key into another.
   object is there; the cache asks it for every object an action-cache hit needs and
   turns the hit into a miss if one is gone (stores that would need a request answer
   yes without one). A write that would leave less free space than the store's floor
-  is refused; nothing is evicted. The directory is locked while a store is open on
-  it. No Object Lock.
+  (by default 5% of the file system, at least 1 GiB) is refused and wakes the
+  evictor ([Eviction under disk pressure](#eviction-under-disk-pressure)); the store
+  itself deletes nothing. The directory is locked while a store is open on it. No
+  Object Lock.
 - `S3Store`: the S3 REST API with path-style addressing and SigV4 signing of every
   payload. A ranged read answered with anything but the exact range is refused. On a
   store with Object Lock, delete names the exact object version, so a retained object
@@ -369,6 +371,42 @@ normalisation between kbf and a store can turn one key into another.
 paging) and every capability it claims. A backend is trusted only once it passes. CI
 runs the suite against the in-memory store, the local-directory store, and MinIO and
 RustFS containers, each with a plain bucket and an Object Lock bucket.
+
+## Eviction under disk pressure
+
+A `file://` cold store is the store of record: nothing sits behind the directory, so
+what is evicted is gone, not fetched from elsewhere. The client finds out the way it
+finds out about any lost blob: `FindMissingBlobs` reports it missing and the client
+uploads it again, or an action-cache entry that needed it is gone and the action runs
+again.
+
+Eviction is the disk-pressure trigger of the planned collection
+([Planned](#planned)), for the one store that has a disk to fill:
+
+- **When.** The store's floor is `kbf_threads::disk::keep_free` (`Floor::KeepFree`,
+  the rule every evicting farm directory keeps): 5% of the file system, at least 1 GiB. A write that would
+  leave less free is refused and wakes the evictor; it also looks every 10 seconds
+  (`EVICT_EVERY`) once the start-up pass is done. While less than twice the floor is
+  free, a round (`Cache::evict_round`) frees the shortfall to twice the floor.
+- **What.** The least recently used objects, until their lengths cover the shortfall.
+  Use is counted per object in the cache, in memory: a `FindMissingBlobs` answer that
+  reports one of its blobs present, a read of one of its blobs (whether the store or a
+  tier's copy serves it), an action-cache hit that needs it, and its write. Counting in
+  the store would miss most of them: FindMissing never reads the store, and the write
+  tier's flushed copies and the workers' input caches serve repeated reads without it.
+  The count is lost at a restart; the start-up pass seeds it with the objects it kept,
+  which rank before every object used since, oldest file first.
+- **What not.** An object used in the last 60 seconds (`EVICT_GRACE`), and a staged
+  object (its only copy is on a tier). The window stands in for collection's condemn
+  delay: one server writes the directory (its lock), so a use is seen by the same
+  process that would evict, and a touch within the window keeps the object. Under
+  pressure eviction cuts `min_ttl` short: the window is all a blob reported present is
+  promised.
+- **How.** `EvictObjects` for the chosen objects first, in batches, then a delete of
+  each file. A crash between the two leaves files no index entry names, and the next
+  start-up pass deletes them. The pass's sweep is by epoch, never by age: a file of an
+  earlier writer epoch that the index does not name is an orphan; a file of the
+  current epoch is kept whatever its age, since its commit may still be coming.
 
 ## Capabilities
 
@@ -414,7 +452,9 @@ capabilities.
 - **Garbage collection.** Collection marks space dead; a segment is deleted only when no
   entry uses it, through a condemn step with a delay during which any touch revives it.
   Sparse segments are compacted. A periodic sweep removes orphan objects by comparing
-  the bucket with farm state, never by age alone.
+  the bucket with farm state, never by age alone. Under a `file://` cold store, eviction under
+  disk pressure and the start-up pass's sweep are built
+  ([above](#eviction-under-disk-pressure)).
 - **Pins.** Named retention roots (for example a failure's logs) that collection never
   removes until unpinned.
 - **Several stores.** Each location names a store id, bucket and key, so reads follow

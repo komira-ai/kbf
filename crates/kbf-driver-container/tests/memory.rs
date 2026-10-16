@@ -7,10 +7,12 @@
 mod support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
+use futures::future::BoxFuture;
 use kbf_daemon::RuntimeError;
+use kbf_daemon::cas::{Cas, CasError, Intake, IntakeFile, Record};
 use kbf_driver_container::tree::{Exceeded, OutputLimits, TreeError, collect};
 use kbf_driver_container::{CHUNK, FileBlob, MemoryCas};
 use kbf_proto::reapi::ActionResult;
@@ -193,4 +195,111 @@ fn a_stdout_past_its_limit_is_refused_in_bounded_memory() {
     );
     assert!(peak < BOUND, "{peak} bytes live at once");
     fake.assert_clean(1);
+}
+
+/// A store that takes output files as the walk reads them and keeps nothing of them:
+/// it counts the bytes handed over and the largest chunk, so what is live is the
+/// walk's alone.
+#[derive(Default)]
+struct Taking {
+    cas: MemoryCas,
+    bytes: Arc<AtomicU64>,
+    largest: Arc<AtomicUsize>,
+    finished: Arc<AtomicUsize>,
+}
+
+struct Discard {
+    bytes: Arc<AtomicU64>,
+    largest: Arc<AtomicUsize>,
+    finished: Arc<AtomicUsize>,
+}
+
+impl IntakeFile for Discard {
+    fn write(&mut self, chunk: &[u8]) {
+        self.bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        self.largest.fetch_max(chunk.len(), Ordering::Relaxed);
+    }
+
+    fn finish(self: Box<Self>, _: kbf_types::Digest, _: u32) {
+        self.finished.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+struct Discarding(Discard);
+
+impl Intake for Discarding {
+    fn file(&self, _: u64) -> Option<Box<dyn IntakeFile>> {
+        Some(Box::new(Discard {
+            bytes: Arc::clone(&self.0.bytes),
+            largest: Arc::clone(&self.0.largest),
+            finished: Arc::clone(&self.0.finished),
+        }))
+    }
+
+    fn finish(&self) -> BoxFuture<'_, Result<(), CasError>> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+impl Cas for Taking {
+    type Lease = Arc<Self>;
+
+    fn lease(self: &Arc<Self>, _: &kbf_types::LeaseId) -> Arc<Self> {
+        Arc::clone(self)
+    }
+
+    async fn get(&self, digest: &kbf_proto::reapi::Digest) -> Result<Vec<u8>, CasError> {
+        self.cas.get(digest).await
+    }
+
+    async fn put(&self, bytes: Vec<u8>) -> Result<kbf_proto::reapi::Digest, CasError> {
+        self.cas.put(bytes).await
+    }
+
+    async fn put_records(&self, records: Vec<Record>) -> Result<(), CasError> {
+        self.cas.put_records(records).await
+    }
+
+    fn intake(&self) -> Option<Arc<dyn Intake>> {
+        Some(Arc::new(Discarding(Discard {
+            bytes: Arc::clone(&self.bytes),
+            largest: Arc::clone(&self.largest),
+            finished: Arc::clone(&self.finished),
+        })))
+    }
+}
+
+/// Catches an output file held whole on its way to a store that takes it as it is
+/// read (the in-process plane): a 2 GiB output goes to the intake in chunks of at most
+/// [`CHUNK`] bytes that add up to it, finished once, with no more than [`BOUND`] live
+/// at once in the walk (mutant: the file read into one buffer and handed over whole, or
+/// handed over in chunks once read whole; the bound is the walk's own, as this intake
+/// keeps nothing).
+#[test]
+fn a_2_gib_output_goes_to_an_intake_in_bounded_memory() {
+    let upper = support::scratch("memory-intake");
+    std::fs::create_dir(upper.join("out")).expect("mkdir");
+    sparse(&upper.join("out/large"), LARGE);
+    let runtime = runtime();
+    let cas = Taking::default();
+    let (outcome, peak) = peak_during(|| {
+        let mut result = ActionResult::default();
+        let outputs = ["out/large".to_owned()];
+        runtime.block_on(collect(
+            &cas,
+            &upper,
+            &kbf_daemon::cpu_pool::CpuPool::new(4),
+            "",
+            &outputs,
+            OutputLimits::DEFAULT,
+            &mut result,
+        ))
+    });
+    outcome.expect("collect");
+    assert_eq!(cas.bytes.load(Ordering::Relaxed), LARGE);
+    assert_eq!(cas.finished.load(Ordering::Relaxed), 1);
+    let largest = cas.largest.load(Ordering::Relaxed);
+    assert!(largest <= CHUNK, "a chunk of {largest} bytes");
+    assert!(peak < BOUND, "{peak} bytes live at once");
+    support::force_remove(&upper);
 }

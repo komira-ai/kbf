@@ -1,4 +1,4 @@
-//! The `kbf-server` binary with `--store=s3` against a real S3 store: an Execute runs
+//! The `kbf-server` binary with an `s3://` `--cold-store` against a real S3 store: an Execute runs
 //! on a fake daemon, its result is served from the action cache, and the bytes are in
 //! the bucket.
 //!
@@ -42,7 +42,7 @@ fn address(line: &str, key: &str) -> SocketAddr {
         .expect("an address")
 }
 
-/// Catches: `--store=s3` flags that do not reach the cache (blobs kept in memory, or
+/// Catches: an `s3://` `--cold-store` that does not reach the cache (blobs kept in memory, or
 /// nowhere), and a server that cannot run the Execute join on an S3 store.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs an S3 store; see the module docs"]
@@ -61,16 +61,13 @@ async fn executes_with_blobs_in_s3() {
     .expect("store");
     store.create_bucket().await.expect("create the bucket");
 
+    let meta = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("kbf-server-s3-meta-{}", std::process::id()));
+    let uri = format!("s3://{BUCKET}/e2e/?endpoint={endpoint}&conditional-put=true");
     let mut child = Command::new(env!("CARGO_BIN_EXE_kbf-server"))
-        .args([
-            "--store",
-            "s3",
-            "--s3-endpoint",
-            &endpoint,
-            "--s3-bucket",
-            BUCKET,
-        ])
-        .args(["--s3-prefix", "e2e/", "--s3-conditional-put"])
+        .args(["--cold-store", &uri])
+        .arg("--meta-dir")
+        .arg(&meta)
         .args(["--listen", "127.0.0.1:0", "--worker-listen", "127.0.0.1:0"])
         .args(["--heartbeat-interval-ms", "100"])
         .stdout(Stdio::piped())
