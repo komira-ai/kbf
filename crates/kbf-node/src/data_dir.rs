@@ -271,11 +271,12 @@ fn open(dir: &Path) -> Result<(), DataDirError> {
     if mode & 0o001 == 0 {
         let now = std::fs::Permissions::from_mode(mode | 0o011);
         std::fs::set_permissions(dir, now).map_err(made(dir))?;
-        tracing::info!(
+        let said = format!(
             "data dir: {} was {mode:o}, now {:o}: the OCI backend's container ids must search it",
             dir.display(),
             mode | 0o011
         );
+        tracing::info!("{said}");
     }
     Ok(())
 }
