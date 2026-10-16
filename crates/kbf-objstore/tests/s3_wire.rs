@@ -8,7 +8,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use kbf_objstore::s3::{Credentials, S3Config, S3Store};
 use kbf_objstore::{
-    ByteRange, Capabilities, KeyPrefix, ObjectKey, ObjectStore, ObjectStoreError, PageSize,
+    ByteRange, Capabilities, KeyPrefix, ListToken, ObjectKey, ObjectStore, ObjectStoreError,
+    PageSize,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -254,6 +255,47 @@ async fn list_sends_the_token_and_reads_the_next_one() {
     let heads = seen.lock().unwrap();
     assert!(
         heads[0].starts_with("GET /kbf-test?list-type=2&max-keys=3&prefix=p%2F HTTP/1.1"),
+        "{}",
+        heads[0]
+    );
+    assert!(
+        heads[1].starts_with(
+            "GET /kbf-test?continuation-token=t2&list-type=2&max-keys=3&prefix=p%2F HTTP/1.1"
+        ),
+        "{}",
+        heads[1]
+    );
+}
+
+/// Catches: a listing [`ListToken::after`] a key that does not send it as
+/// `start-after` (S3 would read it as a continuation token and refuse it, or list from
+/// the start), or sends it as well as a continuation token on the pages that follow.
+#[tokio::test]
+async fn list_after_a_key_sends_start_after_then_the_token() {
+    let page = "<ListBucketResult><IsTruncated>true</IsTruncated>\
+                <NextContinuationToken>t2</NextContinuationToken>\
+                <Contents><Key>p/c</Key><Size>1</Size></Contents></ListBucketResult>";
+    let (endpoint, seen) = script(vec![
+        answer("200 OK", &[], page),
+        answer("200 OK", &[], page),
+    ])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let prefix = KeyPrefix::new("p/").unwrap();
+    let after = ListToken::after(&ObjectKey::new("p/b").unwrap());
+    let first = s
+        .list(&prefix, Some(&after), PageSize::new(3).unwrap())
+        .await
+        .unwrap();
+    s.list(&prefix, first.next.as_ref(), PageSize::new(3).unwrap())
+        .await
+        .unwrap();
+
+    let heads = seen.lock().unwrap();
+    assert!(
+        heads[0].starts_with(
+            "GET /kbf-test?list-type=2&max-keys=3&prefix=p%2F&start-after=p%2Fb HTTP/1.1"
+        ),
         "{}",
         heads[0]
     );

@@ -118,10 +118,7 @@ impl ObjectStore for MemoryStore {
         let objects = self.objects();
         // The token is the last key of the previous page; the next page starts after it.
         let start = match after {
-            Some(t) => Bound::Excluded(
-                ObjectKey::new(t.0.clone())
-                    .map_err(|e| ObjectStoreError::Protocol(format!("bad list token: {e}")))?,
-            ),
+            Some(t) => Bound::Excluded(t.local_after()?.clone()),
             None => Bound::Unbounded,
         };
         let mut matching = objects
@@ -136,7 +133,7 @@ impl ObjectStore for MemoryStore {
             })
             .collect();
         let next = match (matching.next(), page.last()) {
-            (Some(_), Some(last)) => Some(ListToken(last.key.as_str().to_owned())),
+            (Some(_), Some(last)) => Some(ListToken::after(&last.key)),
             _ => None,
         };
         Ok(ListPage {
