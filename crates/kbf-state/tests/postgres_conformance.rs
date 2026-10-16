@@ -266,7 +266,7 @@ fn claim_past_a_held_row(flaw: Flaw) {
     // gives up on it; a claim that skips never waits.
     let backend = PostgresBackend::new(&url_setting("lock_timeout", "3000"), flaw);
     let config = backend.fresh_config();
-    let store = PostgresStore::open(&config).expect("opens");
+    let store = PostgresStore::open(&config).expect("opens").with_flaw(flaw);
     seed_queue(&store, 5);
 
     let mut other = Client::connect(&url(), NoTls).expect("connects");
