@@ -1,17 +1,28 @@
 //! Unit tests for what a test cannot reach from outside: the filesystem check on a path
 //! that is on a network filesystem, and the error plumbing.
 
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use super::guard::{filesystem_type, lock_path, network_filesystem};
+use super::guard::{
+    filesystem_type, lock_failed, lock_path, network_filesystem, refuse_network_filesystem,
+};
+use super::read::changes_after_head;
 use super::restore::ignore_not_found;
 use super::{Options, SqliteError, SqliteStore};
-use crate::{Clock, StoreError, SystemClock};
+use crate::{Clock, Cond, Revision, StoreError, SystemClock, Txn};
 
 fn clock() -> Arc<dyn Clock> {
     Arc::new(SystemClock::default())
+}
+
+/// An empty directory of its own under the system's temporary directory.
+fn unit_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("kbf-state-unit-{}-{name}", std::process::id()));
+    fs::create_dir_all(&dir).expect("create the directory");
+    dir
 }
 
 // Catches a state file on NFS being opened: its locks and syncs are not reliable there.
@@ -58,18 +69,24 @@ fn the_probe_is_given_the_directory_of_the_file() {
     );
 }
 
-// Catches a table that misses a network filesystem, or names a local one.
+// Catches a table that misses a network filesystem, or names a local one: every row of the
+// table is checked, by its number and its name.
 #[test]
 fn network_filesystems_are_told_from_local_ones() {
     for (magic, name) in [
-        (0x6969, "NFS"),
-        (0x517B, "SMB"),
+        (0x0000_6969, "NFS"),
+        (0x0000_517B, "SMB"),
         (0xFF53_4D42, "CIFS"),
         (0xFE53_4D42, "SMB2"),
         (0x00C3_6400, "CephFS"),
         (0x0102_1997, "9p"),
+        (0x5346_414F, "AFS"),
+        (0x7375_7245, "Coda"),
+        (0x0BD0_0BD0, "Lustre"),
+        (0x4750_4653, "GPFS"),
+        (0x7461_636F, "OCFS2"),
     ] {
-        assert_eq!(network_filesystem(magic), Some(name));
+        assert_eq!(network_filesystem(magic), Some(name), "{magic:#x}");
     }
     // ext4, xfs, btrfs, tmpfs, overlayfs, zfs, and "unknown".
     for magic in [
@@ -89,6 +106,38 @@ fn network_filesystems_are_told_from_local_ones() {
     }
 }
 
+// Catches a refusal that also stops a state file on a local filesystem.
+#[test]
+fn a_local_filesystem_is_not_refused() {
+    for file in ["/data/kbf/state.db", "state.db"] {
+        refuse_network_filesystem(Path::new(file), &|_| Ok(0xEF53))
+            .expect("ext4 is a local filesystem");
+    }
+}
+
+// Catches a failed lock call being reported as another process holding the file (the
+// operator would go looking for a process that does not exist), and a held lock being
+// reported as anything else.
+#[test]
+fn a_lock_call_that_failed_is_not_a_held_lock() {
+    let db = Path::new("/x/state.db");
+    let held = lock_failed(db, lock_path(db), fs::TryLockError::WouldBlock);
+    assert!(matches!(held, SqliteError::Locked { .. }), "got {held}");
+    assert!(
+        held.to_string().contains("another kbf process"),
+        "got {held}"
+    );
+    let failed = lock_failed(
+        db,
+        lock_path(db),
+        fs::TryLockError::Error(io::Error::from(io::ErrorKind::PermissionDenied)),
+    );
+    assert!(matches!(failed, SqliteError::Io(_)), "got {failed}");
+    assert!(
+        failed.to_string().contains("/x/state.db.lock"),
+        "the text names the lock file: {failed}"
+    );
+}
 // Catches a probe that fails on a real directory, which would refuse every start.
 #[test]
 fn the_real_probe_reads_the_filesystem_of_a_directory() {
@@ -159,4 +208,64 @@ fn only_a_missing_file_counts_as_removed() {
         refused.expect_err("denied").kind(),
         io::ErrorKind::PermissionDenied
     );
+}
+
+// Catches a connection that is not in WAL mode with a sync on every commit (the setting
+// that makes an acknowledgement a durable write), on a real file: the failing case above
+// is the in-memory one.
+#[test]
+fn a_file_connection_is_wal_with_full_sync() {
+    let dir = unit_dir("configure");
+    let conn = rusqlite::Connection::open(dir.join("state.db")).expect("open");
+    super::schema::configure(&conn).expect("a file keeps a WAL");
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("journal mode");
+    assert_eq!(mode, "wal");
+    let sync: i64 = conn
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .expect("synchronous");
+    assert_eq!(sync, 2, "2 is FULL; 1 (NORMAL) would not sync each commit");
+    drop(conn);
+    fs::remove_dir_all(&dir).expect("remove the directory");
+}
+
+// Catches a feed page read without one snapshot for the head and the rows: a group
+// committed between the two reads would put rows past the head in the page, and the
+// cursor would fall behind the last row it returned. The commit is made at exactly that
+// moment, so the test does not depend on a race.
+#[test]
+fn a_page_is_read_from_one_snapshot() {
+    let dir = unit_dir("snapshot");
+    let store =
+        SqliteStore::open(&dir.join("state.db"), clock(), Options::default()).expect("open");
+    let put = |key: &str| {
+        store
+            .txn(Txn::new().put(key, "v", Cond::Any))
+            .expect("reachable")
+            .expect("commits");
+    };
+    put("a");
+    put("b");
+
+    let page = changes_after_head(&mut store.reader(), Revision::ZERO, 10, &mut || put("c"))
+        .expect("changes");
+    let revisions: Vec<u64> = page.rows.iter().map(|row| row.revision.0).collect();
+    assert_eq!(
+        revisions,
+        [1, 2],
+        "the page holds the commits the head covers, and not the one made after it was read"
+    );
+    assert_eq!(page.cursor, Revision(2), "the cursor is the head it read");
+
+    let next = store.changes(page.cursor, 10).expect("changes");
+    let revisions: Vec<u64> = next.rows.iter().map(|row| row.revision.0).collect();
+    assert_eq!(
+        revisions,
+        [3],
+        "the next page starts at the commit it missed"
+    );
+    assert_eq!(next.cursor, Revision(3));
+    drop(store);
+    fs::remove_dir_all(&dir).expect("remove the directory");
 }

@@ -585,3 +585,71 @@ fn a_store_describes_itself() {
         "got {text}"
     );
 }
+
+// Catches an acknowledgement that is not yet in the files a crash leaves: the store is
+// still open (nothing closed it, nothing checkpointed the journal) when its two files are
+// copied, as they would be found after a kill, and the copy is opened. Every acknowledged
+// write must be in it. (A copy cannot show a missing fsync, which only a power cut does;
+// the sync setting itself is held by the unit test of the connection settings.)
+#[test]
+fn the_files_a_crash_leaves_hold_every_acknowledged_write() {
+    let dir = scratch("crash-live");
+    let (store, _) = open_manual(&dir, Options::default());
+    for n in 0..20 {
+        put(&store, &format!("k{n:02}"), &format!("v{n}"));
+    }
+    let head = store.changes(Revision::ZERO, 100).expect("changes").cursor;
+
+    let after_crash = scratch("crash-copy");
+    for name in ["state.db", "state.db-wal"] {
+        std::fs::copy(dir.join(name), after_crash.join(name))
+            .expect("the file and its journal are there while the store is open");
+    }
+    let (copy, _) = open_manual(&after_crash, Options::default());
+    for n in 0..20 {
+        let found = copy.get(&format!("k{n:02}")).expect("get").expect("kept");
+        assert_eq!(found.value, format!("v{n}").into_bytes());
+    }
+    assert_eq!(
+        copy.changes(Revision::ZERO, 100).expect("changes").cursor,
+        head,
+        "the feed is the one that was acknowledged"
+    );
+    drop(store);
+}
+
+// Catches an expiry that is off by one at the boundary: a key lives while the clock is before
+// its expiry and is gone at the instant it is reached, in a read, a scan and the reaper.
+#[test]
+fn a_key_expires_at_exactly_its_ttl() {
+    let dir = scratch("ttl-boundary");
+    let (store, clock) = open_manual(&dir, Options::default());
+    let ttl = Duration::from_secs(10);
+    store
+        .txn(Txn::new().put_ttl("lease", "x", ttl, Cond::Any))
+        .expect("reachable")
+        .expect("commits");
+
+    clock.advance(ttl - Duration::from_nanos(1));
+    assert!(
+        has(&store, "lease"),
+        "one nanosecond before the ttl it lives"
+    );
+    assert_eq!(store.scan_prefix("lea").expect("scan").len(), 1);
+    assert_eq!(store.reap_expired().expect("reap"), 0, "nothing is due yet");
+
+    clock.advance(Duration::from_nanos(1));
+    assert!(!has(&store, "lease"), "at the ttl it is gone");
+    assert!(store.scan_prefix("lea").expect("scan").is_empty());
+    assert_eq!(
+        store.reap_expired().expect("reap"),
+        1,
+        "the reaper removes it"
+    );
+    let feed = store.changes(Revision::ZERO, 10).expect("changes");
+    assert_eq!(
+        feed.rows.last().map(|row| row.event.clone()),
+        Some(Event::Expire),
+        "the expiry is in the feed"
+    );
+}

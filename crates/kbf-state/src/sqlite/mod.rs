@@ -10,7 +10,9 @@
 //!   and see only committed groups, so the change feed needs no horizon beyond the head.
 //! - **One process.** The store holds an exclusive `flock` on `<file>.lock` for as long as
 //!   it is open, and refuses a file on a network filesystem. A second store on the same
-//!   file fails to open with [`SqliteError::Locked`].
+//!   file fails to open with [`SqliteError::Locked`]. The network-filesystem check reads
+//!   the `statfs` type of the file's directory, so it is made on Linux only: on any other
+//!   system nothing is refused, and keeping the file on a local disk is the operator's job.
 //! - **Epoch.** Every open bumps the epoch recorded in the file ([`SqliteStore::epoch`]);
 //!   [`restore`] does too, so a restored or swapped file never resumes the old file's
 //!   leases.
@@ -136,10 +138,7 @@ impl SqliteStore {
         schema::init(&conn)?;
         schema::configure(&conn)?;
         let epoch = schema::bump_epoch(&conn, 0)?;
-        let head: i64 =
-            conn.query_row("SELECT value FROM meta WHERE name = 'head'", [], |row| {
-                row.get(0)
-            })?;
+        let head = schema::head(&conn)?;
         let shared = Arc::new(Shared::default());
         let commits = Arc::clone(&shared.commits);
         conn.commit_hook(Some(move || {

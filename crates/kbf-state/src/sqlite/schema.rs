@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, Row, Transaction, TransactionBehavior};
 
 use super::SqliteError;
 
@@ -45,11 +45,27 @@ CREATE TABLE meta (
 INSERT INTO meta (name, value) VALUES ('head', 0), ('epoch', 0);
 ";
 
+/// The first column of a row, as an integer. The row readers are named functions rather
+/// than closures so that each statement that uses one is a single covered line.
+pub(super) fn first_i64(row: &Row<'_>) -> rusqlite::Result<i64> {
+    row.get(0)
+}
+
+/// The first column of a row, as text.
+pub(super) fn first_string(row: &Row<'_>) -> rusqlite::Result<String> {
+    row.get(0)
+}
+
+/// The head revision the file records.
+pub(super) fn head(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT value FROM meta WHERE name = 'head'", [], first_i64)
+}
+
 /// Puts a connection in WAL mode with a sync on every commit (a commit is acknowledged
 /// only once it is on disk).
 pub(super) fn configure(conn: &Connection) -> Result<(), SqliteError> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
-    let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+    let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], first_string)?;
     if !mode.eq_ignore_ascii_case("wal") {
         return Err(SqliteError::NotAStateStore(format!(
             "the filesystem cannot keep a WAL-mode database (journal mode {mode})"
@@ -61,11 +77,11 @@ pub(super) fn configure(conn: &Connection) -> Result<(), SqliteError> {
 
 /// Creates the layout in an empty file, and refuses a file that is not this binary's.
 pub(super) fn init(conn: &Connection) -> Result<(), SqliteError> {
-    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let version: i64 = conn.pragma_query_value(None, "user_version", first_i64)?;
     if version == SCHEMA_VERSION {
         return Ok(());
     }
-    let tables: i64 = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
+    let tables: i64 = conn.query_row("SELECT count(*) FROM sqlite_master", [], first_i64)?;
     if version != 0 || tables != 0 {
         return Err(SqliteError::NotAStateStore(format!(
             "not a kbf state store this binary reads (schema version {version}, {tables} objects)"
@@ -80,7 +96,7 @@ pub(super) fn init(conn: &Connection) -> Result<(), SqliteError> {
 
 /// Refuses a file that is not a state store this binary reads.
 pub(super) fn require_state_store(conn: &Connection) -> Result<(), SqliteError> {
-    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let version: i64 = conn.pragma_query_value(None, "user_version", first_i64)?;
     if version == SCHEMA_VERSION {
         return Ok(());
     }
@@ -91,9 +107,8 @@ pub(super) fn require_state_store(conn: &Connection) -> Result<(), SqliteError> 
 
 /// The epoch the file records.
 pub(super) fn epoch(conn: &Connection) -> Result<u64, SqliteError> {
-    let epoch: i64 = conn.query_row("SELECT value FROM meta WHERE name = 'epoch'", [], |row| {
-        row.get(0)
-    })?;
+    let epoch: i64 =
+        conn.query_row("SELECT value FROM meta WHERE name = 'epoch'", [], first_i64)?;
     Ok(u64::try_from(epoch).unwrap_or_default())
 }
 

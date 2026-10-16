@@ -10,7 +10,7 @@ use rusqlite::Connection;
 
 use super::SqliteError;
 use super::guard::{filesystem_type, refuse_network_filesystem, take_lock};
-use super::schema::{bump_epoch, configure, epoch, require_state_store};
+use super::schema::{bump_epoch, configure, epoch, first_i64, first_string, require_state_store};
 
 /// `dest`'s name with `suffix` after it.
 fn beside(dest: &Path, suffix: &str) -> PathBuf {
@@ -83,7 +83,7 @@ fn stage(backup: &Path, dest: &Path, staging: &Path) -> Result<u64, SqliteError>
     let conn = Connection::open(staging)?;
     configure(&conn)?;
     require_state_store(&conn).map_err(|error| error.at(backup))?;
-    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], first_string)?;
     if integrity != "ok" {
         return Err(SqliteError::NotAStateStore(format!(
             "{}: the backup is damaged ({integrity})",
@@ -91,6 +91,6 @@ fn stage(backup: &Path, dest: &Path, staging: &Path) -> Result<u64, SqliteError>
         )));
     }
     let restored = bump_epoch(&conn, replaced)?;
-    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], first_i64)?;
     Ok(restored)
 }

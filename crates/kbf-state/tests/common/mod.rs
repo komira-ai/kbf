@@ -10,14 +10,15 @@ use kbf_state::conformance::Backend;
 use kbf_state::sqlite::{Options, SqliteStore};
 use kbf_state::{Clock, Conflict, ManualClock, Store, Txn};
 
-/// An empty directory of this name under the test target directory (cargo's, on a disk
-/// that syncs like the one the store runs on).
+/// A new, empty directory under the test target directory (cargo's, on a disk that syncs
+/// like the one the store runs on). Its name carries `name`, the process and a count, so
+/// no two tests in one run, and no two runs, share one.
 pub fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("kbf-state-{name}"));
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("clear the scratch directory");
-    }
-    std::fs::create_dir_all(&dir).expect("create the scratch directory");
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::SeqCst);
+    let id = std::process::id();
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("kbf-state-{name}-{id}-{n}"));
+    std::fs::create_dir(&dir).expect("create a scratch directory of its own");
     dir
 }
 
@@ -70,7 +71,9 @@ impl Backend for SqliteBackend {
         second: Txn,
         between: &mut dyn FnMut(),
     ) -> Result<(), Conflict> {
-        // One writer commits in the order it is given: there is no interleaving to arrange.
+        // One writer commits in the order it is given, so there is no out-of-order commit to
+        // arrange here; the interleaving that matters to the feed, a poller paging it while
+        // a writer commits groups, is `sqlite_feed.rs`.
         store.txn(first).expect("the store is reachable")?;
         between();
         store.txn(second).expect("the store is reachable")?;

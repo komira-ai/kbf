@@ -2,7 +2,7 @@
 //! filesystem SQLite cannot be trusted on.
 
 use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -32,10 +32,12 @@ pub(super) fn lock_path(db: &Path) -> PathBuf {
 
 /// The name of the network filesystem with type number `magic`, if it is one.
 pub(super) fn network_filesystem(magic: u32) -> Option<&'static str> {
-    NETWORK_FILESYSTEMS
-        .iter()
-        .find(|(number, _)| *number == magic)
-        .map(|(_, name)| *name)
+    for (number, name) in NETWORK_FILESYSTEMS {
+        if *number == magic {
+            return Some(*name);
+        }
+    }
+    None
 }
 
 /// The type number of the filesystem `dir` is on.
@@ -46,7 +48,8 @@ pub(super) fn filesystem_type(dir: &Path) -> io::Result<u32> {
     Ok(stat.f_type as u32)
 }
 
-/// The type number of the filesystem `dir` is on: not known off Linux, so none is refused.
+/// The type number of the filesystem `dir` is on: not known off Linux, so the network
+/// filesystem check is a Linux-only check and no other system refuses anything.
 #[cfg(not(target_os = "linux"))]
 pub(super) fn filesystem_type(_dir: &Path) -> io::Result<u32> {
     Ok(0)
@@ -82,10 +85,22 @@ pub(super) fn take_lock(db: &Path) -> Result<File, SqliteError> {
         .open(&lock)?;
     match file.try_lock() {
         Ok(()) => Ok(file),
-        Err(source) => Err(SqliteError::Locked {
+        Err(error) => Err(lock_failed(db, lock, error)),
+    }
+}
+
+/// What a refused `try_lock` means: `Locked` when another descriptor holds the lock (the
+/// one case that means "another process is using this file"), and an I/O error for any
+/// other failure of the call, which says nothing about who holds the file.
+pub(super) fn lock_failed(db: &Path, lock: PathBuf, error: TryLockError) -> SqliteError {
+    match error {
+        TryLockError::WouldBlock => SqliteError::Locked {
             path: db.to_owned(),
             lock,
-            source: io::Error::from(source),
-        }),
+            source: io::Error::from(io::ErrorKind::WouldBlock),
+        },
+        TryLockError::Error(source) => {
+            SqliteError::Io(format!("could not take {}: {source}", lock.display()))
+        }
     }
 }
