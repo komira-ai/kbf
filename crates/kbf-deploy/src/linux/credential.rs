@@ -4,12 +4,15 @@
 //!
 //! What it refuses, in `[Service]`:
 //!
-//! - `EnvironmentFile=` naming the key file: its path, after `-`, quotes, `.`, `..` and
-//!   repeated `/` are taken off, is `<KBF_ETC>/s3.env` or ends in `/s3.env` wherever
+//! - `EnvironmentFile=` naming the key file: its path, after `-` and quotes are taken
+//!   off (and systemd's whitespace, not any Unicode space), is `<KBF_ETC>/s3.env`
+//!   through `.`, `..` or repeated `/`, or is absolute and ends in `/s3.env` wherever
 //!   it is, or it is a wildcard that matches `<KBF_ETC>/s3.env`. systemd expands every
 //!   path with glob(3) ([`super::glob`] reads it as glibc does: `*`, `?`, `[...]` with
 //!   ranges, `!` or `^`, `[:class:]`, `[=c=]` and `[.c.]`, and `\` escapes), so a `\`
-//!   in a path with no wildcard is taken off too.
+//!   in a path with no wildcard is taken off too, and a trailing `/` after the name
+//!   still lists the file (`s3.env/`), while a trailing `/.` (ENOTDIR) or a wildcard
+//!   before a `/` (directories only) lists nothing the rule refuses.
 //! - `Environment=` setting any `AWS_*` variable, with systemd's quoting (several
 //!   assignments on a line, single or double quotes around an assignment or inside
 //!   one). A build node talks to no AWS-style store, so no `AWS_*` variable has a use
@@ -48,7 +51,7 @@ use kbf_host::path::HostPath;
 
 use super::glob;
 use super::modes::COLD_STORE_KEY_FILE;
-use crate::unit::UnitFile;
+use crate::unit::{UnitFile, WHITESPACE};
 
 /// The prefix of the variables an AWS SDK or CLI reads (rule `credential`).
 pub const AWS_PREFIX: &str = "AWS_";
@@ -148,17 +151,18 @@ pub(super) struct OnHost {
 pub(super) fn on_host<E: Exec>(exec: &E, unit: &UnitFile, key: &Path) -> OnHost {
     let mut out = OnHost::default();
     for f in given(unit).files.iter().filter(|f| !names_key(f, key)) {
-        let path = normalise(bare(f)).to_string_lossy().into_owned();
-        if glob::is_wildcard(&path) {
+        let path = bare(f);
+        if glob::is_wildcard(path) {
             out.notes.push(format!(
                 "SKIP credential: EnvironmentFile={f} is a wildcard; the files it matches \
                  were not read"
             ));
             continue;
         }
-        // A relative path is one systemd ignores, and a name ending in a lone `\` one
-        // its glob(3) matches with nothing.
-        let Some(Ok(host)) = glob::literal(&path).map(|p| HostPath::new(&p)) else {
+        // A relative path is one systemd ignores; a name ending in a lone `\`, or one
+        // that names a directory, is one its glob(3) lists no file for.
+        let file = glob::literal(path).map(|p| normalise(&p).to_string_lossy().into_owned());
+        let Some(Ok(host)) = file.map(|p| HostPath::new(&p)) else {
             continue;
         };
         match exec.inspect(&host) {
@@ -204,16 +208,18 @@ fn env_file_names(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
 
 /// Whether the `EnvironmentFile=` value `value` names the key file `key`.
 fn names_key(value: &str, key: &Path) -> bool {
-    let path = normalise(bare(value)).to_string_lossy().into_owned();
-    glob::matches(&path, &key.to_string_lossy())
-        || glob::literal(&path)
-            .is_some_and(|p| Path::new(&p).file_name() == Some(COLD_STORE_KEY_FILE.as_ref()))
+    let path = bare(value);
+    glob::matches(path, &key.to_string_lossy())
+        || glob::literal(path).is_some_and(|p| {
+            p.starts_with('/') && p.rsplit('/').next() == Some(COLD_STORE_KEY_FILE)
+        })
 }
 
 /// The path an `EnvironmentFile=` value names: without the `-` that makes it optional
-/// and without quotes around it (systemd takes neither as part of the path).
+/// and without quotes around it (systemd takes neither as part of the path), trimmed of
+/// systemd's [`WHITESPACE`] only (U+00A0 is part of a path).
 fn bare(value: &str) -> &str {
-    let v = value.trim();
+    let v = value.trim_matches(WHITESPACE);
     let v = v.strip_prefix('-').unwrap_or(v);
     v.trim_matches(|c| c == '"' || c == '\'')
 }
@@ -233,8 +239,8 @@ pub(super) fn normalise(path: &str) -> PathBuf {
     out
 }
 
-/// The words of a systemd value, unquoted as systemd.syntax(7) says: whitespace
-/// separates words outside quotes, `'...'` and `"..."` group (anywhere in a word), and
+/// The words of a systemd value, unquoted as systemd.syntax(7) says: [`WHITESPACE`]
+/// (not any Unicode space) separates words outside quotes, `'...'` and `"..."` group (anywhere in a word), and
 /// `\` outside single quotes keeps the next character.
 pub(super) fn words(value: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -243,7 +249,7 @@ pub(super) fn words(value: &str) -> Vec<String> {
     let mut chars = value.chars();
     while let Some(c) = chars.next() {
         match (quote, c) {
-            (None, c) if c.is_whitespace() => out.extend(word.take()),
+            (None, c) if WHITESPACE.contains(&c) => out.extend(word.take()),
             (None, '\'' | '"') => {
                 quote = Some(c);
                 word.get_or_insert_with(String::new);

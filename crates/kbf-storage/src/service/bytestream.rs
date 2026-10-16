@@ -112,7 +112,7 @@ impl ByteStream for StorageService {
         &self,
         request: Request<QueryWriteStatusRequest>,
     ) -> Result<Response<QueryWriteStatusResponse>, Status> {
-        self.admission.check(&request, Endpoint::FindMissing)?;
+        self.admission.check(&request, Endpoint::QueryWriteStatus)?;
         let digest = wire::write_resource(&request.into_inner().resource_name)?;
         let complete = self.storage.find_missing(&[digest]).await?.is_empty();
         let committed_size = if complete {

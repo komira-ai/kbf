@@ -54,6 +54,9 @@ libc = "0.2.190"
 # xz for the tar.xz archives `cargo xtask fetch` unpacks; pure Rust, no C liblzma.
 lzma-rs = "0.3.0"
 hmac = "0.13.0"
+# The state store's Postgres backend (kbf-state, feature `postgres`): the blocking client,
+# no TLS (an `sslmode=require` URL is refused rather than downgraded).
+postgres = "0.19.10"
 # The MDM gate serves its mutual-TLS listener with hyper directly (axum's own `serve`
 # takes plain TCP only). Both are already in the tree through axum and tonic.
 hyper = { version = "1.12.0", default-features = false }
@@ -101,6 +104,10 @@ ruzstd = "0.9.1"
 # drives `crun` through: run, kill and delete. The async client; the crate has no
 # synchronous client in the same build.
 runc = { version = "0.3.0", features = ["async"] }
+# The SQLite state store (kbf-state): the C library is compiled in (`bundled`), so the file
+# format and WAL behaviour do not depend on the host's libsqlite3; `hooks` for the commit
+# counter. No default features: no statement cache (hashlink) and no wasm shim.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 # Directory-relative, no-follow file access (openat with O_NOFOLLOW) for reading outputs;
 # the effective uid, to check who owns the operator API token file (kbf-server).
 rustix = "1.1.5"

@@ -20,9 +20,17 @@ CPUWeight=300
 # AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY of the bucket's MinIO service account,
 # mode 0600: a secret never goes on the command line.
 EnvironmentFile=/etc/kbf/s3.env
-ExecStart=/usr/local/bin/kbf storage
-# TODO: the storage node's flags (--cold-store, --hot-store, --storage-listen and the
-# --storage-tls-* certificate flags; --frontend and --advertise-addr come with the map).
+ExecStart=/usr/local/bin/kbf storage \
+    --storage-tls-cert=/etc/kbf/storage.pem \
+    --storage-tls-key=/etc/kbf/storage.key \
+    --storage-client-ca=/etc/kbf/ca.pem
+# The three certificate flags come together and turn on mutual TLS with the check of the
+# role in each caller's certificate; without them the node serves plain text on
+# loopback only and refuses to start on any other address. Paths, never the PEM itself
+# and never an environment variable. The key is readable by the server user only.
+# TODO: the rest of the node's flags (--cold-store, --meta-dir, --hot-store and
+# --storage-listen, which needs a port setting; --frontend and --advertise-addr come
+# with the map).
 Restart=on-failure
 # Exit 2 is a command line kbf refused (or a mode not built yet): a restart cannot fix it.
 RestartPreventExitStatus=2

@@ -401,6 +401,14 @@ pub enum ConfigError {
          a segment upload holds its ranges in memory under that bound"
     )]
     SegmentUploadOverWriteBound { cap: u64, bound: u64 },
+    /// `kbf storage` would serve plain text off loopback, admitting every caller.
+    #[error(
+        "--storage-listen {addr} is not a loopback address and the node has no TLS, so it \
+         would admit every caller (Write and ActionCommit included); add \
+         --storage-tls-cert, --storage-tls-key and --storage-client-ca, or listen on a \
+         loopback address"
+    )]
+    PlaintextStorageOffLoopback { addr: SocketAddr },
     /// `--memory-ladder-gib` is empty, holds a 0, does not ascend, or overflows.
     #[error("--memory-ladder-gib: {0}")]
     MemoryLadder(#[from] kbf_sched::LadderError),

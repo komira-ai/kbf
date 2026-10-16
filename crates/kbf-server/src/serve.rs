@@ -505,7 +505,8 @@ pub struct StorageListener {
     /// The listener.
     pub listen: SocketAddr,
     /// Mutual TLS (the server's identity and the client CA); `None` serves plain text,
-    /// where no caller has a role and every call is admitted.
+    /// where no caller has a role and every call is admitted (`kbf storage` builds this
+    /// only for a loopback address: [`crate::storage_node::StorageFlags::listener`]).
     pub tls: Option<ServerTlsConfig>,
     /// What the service keeps.
     pub service: kbf_storage::service::Config,
