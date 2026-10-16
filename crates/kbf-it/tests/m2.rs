@@ -19,6 +19,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use kbf_it::m2::{IMAGE, has_interpreter};
@@ -434,9 +435,13 @@ fn unique(name: &str) -> String {
     unique_at(name, nanos)
 }
 
-/// [`unique`] at the clock reading `nanos`.
+/// [`unique`] at the clock reading `nanos`. The pid parts this run from other live
+/// processes, the count from the other calls of this one (its tests are its threads,
+/// which can read one clock tick), and the clock from earlier runs with this pid.
 fn unique_at(name: &str, nanos: u128) -> String {
-    format!("{name}-{}-{nanos}", std::process::id())
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
+    format!("{name}-{}-{call}-{nanos}", std::process::id())
 }
 
 /// Catches: a name made of the pid and the clock alone. The tests are threads of one
@@ -462,7 +467,9 @@ fn cells_made_at_once_have_their_own_bus_and_remove_it() {
                 })
             })
             .collect();
-        made.into_iter().map(|h| h.join().expect("a cell")).collect()
+        made.into_iter()
+            .map(|h| h.join().expect("a cell"))
+            .collect()
     });
     let runtimes: std::collections::BTreeSet<PathBuf> =
         cells.iter().map(|c| c.runtime.clone()).collect();
@@ -524,8 +531,9 @@ impl Cell {
         }
 
         // A Unix socket path is short (108 bytes); the target directory's may not be.
+        // A new directory, never an existing one: two cells must not share a bus.
         let runtime = std::env::temp_dir().join(unique("m2"));
-        std::fs::create_dir_all(&runtime).expect("runtime directory");
+        std::fs::create_dir(&runtime).expect("runtime directory");
         let bus = UnixListener::bind(runtime.join("bus")).expect("bus");
         Self {
             dir,
@@ -587,6 +595,14 @@ impl Cell {
 
     fn args(&self, role: &str) -> Vec<String> {
         self.calls(role).into_iter().map(|(_, a)| a).collect()
+    }
+}
+
+/// The runtime directory is under the shared temporary directory, so a cell removes it
+/// and its bus. Its scratch directory stays under the target directory for a look.
+impl Drop for Cell {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.runtime);
     }
 }
 
