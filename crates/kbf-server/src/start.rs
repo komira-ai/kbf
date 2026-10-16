@@ -199,10 +199,7 @@ where
     let shutdown = shutdown()?;
     let api = args.api()?;
     let bound = bind_server_for(cache, listeners, api, policy, daemons, shutdown)?;
-    let plain = match daemons {
-        Daemons::Remote => args.plain_text_off_loopback(),
-        Daemons::InProcess => without_worker(args.plain_text_off_loopback()),
-    };
+    let plain = plain_text(args, daemons);
     Ok(ServerHandle {
         reapi: bound.reapi,
         worker: bound.worker,
@@ -220,6 +217,15 @@ where
         serving: Box::pin(bound.serving),
         _flusher,
     })
+}
+
+/// The listeners that serve plain text off loopback ([`Args::plain_text_off_loopback`]),
+/// of those `daemons` calls for.
+fn plain_text(args: &Args, daemons: Daemons) -> Vec<&'static str> {
+    match daemons {
+        Daemons::Remote => args.plain_text_off_loopback(),
+        Daemons::InProcess => without_worker(args.plain_text_off_loopback()),
+    }
 }
 
 /// `plain` less the worker listener, which a server whose daemons are in its process

@@ -97,7 +97,7 @@ use crate::connect::{
     rotate_after, unit_random,
 };
 use crate::contact::Contact;
-use crate::control::{ControlPlane, Dialled};
+use crate::control::{ControlPlane, Dialled, ServerMessages};
 use crate::lease::{Done, Leases, failure, lease_id, proto_lease_id};
 use crate::phases::LeasePhases;
 use crate::pressure;
@@ -530,13 +530,17 @@ impl Daemon {
     pub async fn run(mut self, shutdown: impl Future<Output = ()>) {
         #[cfg(target_os = "linux")]
         crate::numa::log_layout();
-        let sessions = match self.in_process.clone() {
-            Some(plane) => futures::future::Either::Left(self.in_process_forever(plane)),
-            None => futures::future::Either::Right(self.reconnect_forever()),
-        };
         tokio::select! {
-            () = sessions => {}
+            () = self.sessions() => {}
             () = shutdown => tracing::info!("shutting down"),
+        }
+    }
+
+    /// Sessions without end: through the in-process plane if there is one, else dialled.
+    async fn sessions(&mut self) {
+        match self.in_process.clone() {
+            Some(plane) => self.in_process_forever(plane).await,
+            None => self.reconnect_forever().await,
         }
     }
 
@@ -687,10 +691,9 @@ impl Daemon {
             .await
             .map_err(|_| SessionError::WelcomeTimeout(wait))??;
         let first = self
-            .offline(timeout(wait, inbound.next()))
+            .offline(timeout(wait, next_message(&mut inbound)))
             .await
-            .map_err(|_| SessionError::WelcomeTimeout(wait))?
-            .transpose()?;
+            .map_err(|_| SessionError::WelcomeTimeout(wait))??;
         let (interval, epoch) = self.welcome(first)?;
         self.welcomed = true;
         self.contact.new_stream(interval);
@@ -724,7 +727,7 @@ impl Daemon {
         loop {
             let wait = self.until_recheck();
             let wake = tokio::select! {
-                msg = inbound.next() => match msg.transpose()? {
+                msg = next_message(&mut inbound) => match msg? {
                     Some(msg) => Wake::Message(msg),
                     None => return Ok(()),
                 },
@@ -1088,6 +1091,14 @@ impl Daemon {
 fn instance_id() -> String {
     let half = || RandomState::new().hash_one(std::process::id());
     format!("{:016x}{:016x}", half(), half())
+}
+
+/// The server's next message: `None` once it has ended the session, an error if the
+/// stream failed.
+async fn next_message(
+    inbound: &mut ServerMessages,
+) -> Result<Option<ServerMessage>, tonic::Status> {
+    inbound.next().await.transpose()
 }
 
 /// Completes when `driver` has a report the daemon has not taken; never when there is

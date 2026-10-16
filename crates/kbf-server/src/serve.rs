@@ -3,17 +3,18 @@
 
 use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::serve::ListenerExt;
-use futures::StreamExt as _;
 use futures::future::Either;
+use futures::{Stream, StreamExt as _};
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
     ByteStreamService, CONNECTION_WINDOW_BYTES, Cache, CasService, Connections,
     MAX_CONCURRENT_STREAMS, MAX_MESSAGE_BYTES, MetaLog, RECORDER_CHANNEL, Recorder,
-    RequestMetadataLayer, STREAM_WINDOW_BYTES, SegmentsConfig, SegmentsService,
+    RequestMetadataLayer, STREAM_WINDOW_BYTES, SegmentsConfig, SegmentsService, Tracked,
 };
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
@@ -22,6 +23,7 @@ use kbf_proto::reapi::content_addressable_storage_server::ContentAddressableStor
 use kbf_proto::worker::segments_server::SegmentsServer;
 use kbf_proto::worker::worker_server::WorkerServer;
 use kbf_sched::MemoryLadder;
+use tokio::net::TcpStream;
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, ServerTlsConfig};
@@ -330,11 +332,34 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    let listen = move |addr| match daemons {
+    let listen = move |addr| listen_for(daemons, addr);
+    assemble(cache, listeners, api, policy, listen, shutdown)
+}
+
+/// The worker listener `daemons` calls for, bound at `addr`, and its address; none for
+/// [`Daemons::InProcess`].
+fn listen_for(
+    daemons: Daemons,
+    addr: SocketAddr,
+) -> Result<WorkerListen<Option<SocketAddr>>, ServeError> {
+    match daemons {
         Daemons::Remote => bind(addr).map(|(incoming, local)| (Some(incoming), Some(local))),
         Daemons::InProcess => Ok((None, None)),
-    };
-    assemble(cache, listeners, api, policy, listen, shutdown)
+    }
+}
+
+/// The connections a worker listener accepts.
+type WorkerIncoming = Pin<Box<dyn Stream<Item = std::io::Result<Tracked<TcpStream>>> + Send>>;
+
+/// The connections `incoming` accepts, each tracked by `connections`; without a
+/// listener, a stream that never yields one, so the worker routes are never served.
+fn tracked(incoming: Option<TcpIncoming>, connections: Connections) -> WorkerIncoming {
+    match incoming {
+        Some(incoming) => {
+            Box::pin(incoming.map(move |accepted| accepted.map(|stream| connections.track(stream))))
+        }
+        None => Box::pin(futures::stream::pending()),
+    }
 }
 
 /// The worker listener [`assemble`] serves, if any, and what [`Bound::worker`] says of it.
@@ -423,9 +448,7 @@ where
     // connection that began it closes.
     let connections = Connections::new();
     let tracking = connections.clone();
-    let worker_incoming = worker_incoming.map(|incoming| {
-        incoming.map(move |accepted| accepted.map(|stream| tracking.track(stream)))
-    });
+    let worker_incoming = tracked(worker_incoming, tracking);
     let worker_segments = SegmentsServer::new(WorkerSegments::new(
         SegmentsService::new(Arc::clone(&cache), listeners.segments, connections),
         peers.clone(),
@@ -489,16 +512,13 @@ where
             .serve_with_incoming_shutdown(reapi_incoming, async {
                 let _ = draining.await;
             });
-        let worker_routes = worker_server
+        // Without a worker listener, never completes.
+        let worker_serve = worker_server
             .add_service(worker_service)
             .add_service(worker_blobs)
             .add_service(worker_cas)
-            .add_service(worker_segments);
-        // Without a worker listener, never completes.
-        let worker_serve = match worker_incoming {
-            Some(incoming) => Either::Left(worker_routes.serve_with_incoming(incoming)),
-            None => Either::Right(std::future::pending()),
-        };
+            .add_service(worker_segments)
+            .serve_with_incoming(worker_incoming);
         let api_serve = serve_api(api_listener.map(|(listener, _)| listener), api_routes);
         let ticking = async {
             let mut tick = tokio::time::interval(listeners.tick);

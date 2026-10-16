@@ -612,12 +612,7 @@ fn node_over<C: Cas>(
     let phase = node
         .phase
         .unwrap_or_else(|| tokio::sync::watch::channel(kbf_types::NodePhase::Serving).1);
-    let config = DaemonConfig::from_args(&cli.daemon);
-    let daemon = match control {
-        Some(control) => Daemon::in_process(config, runtimes, report, control),
-        None => Daemon::new(config, runtimes, report)?,
-    };
-    let daemon = daemon
+    let daemon = daemon(cli, runtimes, report, control)?
         .with_container_images(cli.images.iter().cloned())
         .with_phase(phase);
     // Every runtime is built, so every sweep has run: claim the scratch directory.
@@ -628,6 +623,21 @@ fn node_over<C: Cas>(
     Ok(match node.reports {
         Some(reports) => (daemon.with_driver_report(reports.clone()), Some(reports)),
         None => (daemon, None),
+    })
+}
+
+/// The daemon over `runtimes` and `report`, configured by `cli`, its sessions opened
+/// through `control` when there is one ([`Daemon::in_process`]), else dialled.
+fn daemon(
+    cli: &Cli,
+    runtimes: Runtimes,
+    report: NodeReport,
+    control: Option<Arc<dyn ControlPlane>>,
+) -> Result<Daemon, Error> {
+    let config = DaemonConfig::from_args(&cli.daemon);
+    Ok(match control {
+        Some(control) => Daemon::in_process(config, runtimes, report, control),
+        None => Daemon::new(config, runtimes, report)?,
     })
 }
 

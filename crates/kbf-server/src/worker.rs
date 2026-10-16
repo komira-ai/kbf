@@ -135,10 +135,9 @@ where
         peer: Option<PeerCert>,
         mut inbound: DaemonStream,
     ) -> Result<SessionStream, Status> {
-        let first = timeout(self.hello_wait, inbound.next())
+        let first = timeout(self.hello_wait, next_message(&mut inbound))
             .await
-            .map_err(|_| Status::deadline_exceeded("no Hello within the wait"))?
-            .transpose()?;
+            .map_err(|_| Status::deadline_exceeded("no Hello within the wait"))??;
         let Some(daemon_message::Message::Hello(hello)) = first.and_then(|m| m.message) else {
             return Err(Status::invalid_argument(
                 "the first message of a session must be Hello",
@@ -245,7 +244,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Session<M, O> {
     /// Handles the stream's messages until it ends, or one of them ends it.
     async fn serve(self, mut inbound: DaemonStream, outbound: Outbound) {
         let worker = &self.worker;
-        while let Some(Ok(received)) = inbound.next().await {
+        while let Ok(Some(received)) = next_message(&mut inbound).await {
             // The response stream outlives this loop unless the stream is gone.
             match self.handle(received.message, &outbound).await {
                 Ok(None) => {}
@@ -340,6 +339,11 @@ impl<M: MetaLog, O: ObjectStore + 'static> Session<M, O> {
         };
         Ok(reply)
     }
+}
+
+/// The daemon's next message: `None` once its stream has ended, an error if it failed.
+async fn next_message(inbound: &mut DaemonStream) -> Result<Option<DaemonMessage>, Status> {
+    inbound.next().await.transpose()
 }
 
 fn message(message: server_message::Message) -> ServerMessage {
