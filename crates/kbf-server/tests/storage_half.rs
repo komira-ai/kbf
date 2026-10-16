@@ -6,11 +6,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::stream;
+use kbf_proto::google::bytestream::WriteRequest;
+use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_server::storage_half::start;
 use kbf_server::storage_node::{StorageFlags, command, parse};
 use kbf_storage::Storage as _;
 use kbf_storage::local_cache::LocalCache;
 use kbf_storage::service::RemoteStorage;
+use sha2::Digest as _;
 
 fn dir(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -119,4 +123,90 @@ async fn a_listener_kbf_storage_refuses_is_refused_first() {
     let said = refused.to_string();
     assert!(said.contains("0.0.0.0:0"), "{said}");
     assert!(!d.join("hot").exists(), "a refused start opened a store");
+}
+
+/// Catches a stop that cuts a write in flight instead of draining it: a ByteStream write
+/// has sent its first half when the shutdown future completes; once the runtime has run the
+/// stop through the listener, the second half goes, and the write must commit the whole
+/// blob, `serve` end only after it, and the blob read through the
+/// handle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_drains_a_write_in_flight() {
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let half = start(&flags(&file_stores(&dir("drain"))), || {
+        Ok(async move {
+            let _ = stopped.await;
+        })
+    })
+    .await
+    .expect("starts");
+    let (storage, addr) = (half.storage(), half.addr);
+    let serving = tokio::spawn(half.serve());
+
+    let blob: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
+    let (head, tail) = blob.split_at(1024);
+    let hash: String = sha2::Sha256::digest(&blob)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let name = format!("uploads/drain/blobs/{hash}/{}", blob.len());
+    let first = WriteRequest {
+        resource_name: name,
+        write_offset: 0,
+        finish_write: false,
+        data: head.to_vec(),
+    };
+    let second = WriteRequest {
+        resource_name: String::new(),
+        write_offset: 1024,
+        finish_write: true,
+        data: tail.to_vec(),
+    };
+    // The second request is released once the first has been taken for sending.
+    let (sent, first_sent) = tokio::sync::oneshot::channel::<()>();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let requests = stream::unfold(
+        (Some(first), Some(second), Some(sent), Some(released)),
+        |(first, second, sent, released)| async move {
+            if let Some(first) = first {
+                return Some((first, (None, second, sent, released)));
+            }
+            if let Some(sent) = sent {
+                let _ = sent.send(());
+            }
+            let _ = released?.await;
+            let second = second?;
+            Some((second, (None, None, None, None)))
+        },
+    );
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    let writing = tokio::spawn(async move {
+        ByteStreamClient::new(channel)
+            .write(requests)
+            .await
+            .map(tonic::Response::into_inner)
+    });
+    first_sent.await.expect("the first half was taken");
+    stop.send(()).expect("stop");
+    // Let the runtime run the stop through the listener: a bounded number of turns, not
+    // a time. A listener that cut its calls ends `serve` within them.
+    for _ in 0..1000 {
+        if serving.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(!serving.is_finished(), "serve ended with a write open");
+    release.send(()).expect("release");
+    let response = writing.await.expect("task").expect("the write drained");
+    assert_eq!(response.committed_size, 2048);
+    serving.await.expect("task").expect("serves to the end");
+    let digest =
+        kbf_types::Digest::parse(kbf_types::DigestFunction::Sha256, &format!("{hash}/2048"))
+            .expect("digest");
+    assert_eq!(storage.read_blob(&digest).await.expect("read"), blob);
 }

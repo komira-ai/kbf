@@ -58,6 +58,28 @@ fn each_flag_reaches_its_half_once() {
     assert!(storage.contains("\"/var/kbf/cold\""), "{storage}");
 }
 
+/// Catches the daemon half holding where the cold store is (its URI, which names the
+/// bucket and the endpoint its credential opens) or any store flag: the cold store is
+/// the storage half's alone, and the daemon reaches blobs only through the in-process
+/// storage. The cold URI given must be in the storage half's flags and in nothing the
+/// daemon half holds, and the daemon's command line (`kbf-daemon`'s) takes no store flag.
+#[test]
+fn the_daemon_half_holds_no_cold_store() {
+    let cold = "s3://private-bucket/kbf/?endpoint=http://127.0.0.1:1";
+    let flags = flags(&[&format!("--cold-store={cold}")]).expect("flags");
+    let storage = format!("{:?}", flags.storage.server);
+    assert!(storage.contains("private-bucket"), "{storage}");
+    let daemon = format!("{:?}", flags.daemon);
+    assert!(!daemon.contains("private-bucket"), "{daemon}");
+    for arg in kbf_node::Cli::command().get_arguments() {
+        let id = arg.get_id().as_str();
+        assert!(
+            !["cold_store", "hot_store", "meta_dir"].contains(&id),
+            "the daemon's own flags include a store flag: {id}"
+        );
+    }
+}
+
 /// Catches a driver other than the container driver taken, `--cas` taken (a remote data
 /// plane beside the storage it would reach over the network), and a flag of
 /// `kbf-server` that `kbf storage` refuses (the REAPI listener, the state store) taken
