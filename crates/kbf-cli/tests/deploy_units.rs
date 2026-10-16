@@ -77,6 +77,39 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
     }
 }
 
+/// The all-in-one unit's `TODO: --state-store=...` seam holds a value kbf all-in-one
+/// takes (an absolute `sqlite://` file beside its data), so lifting the seam once a
+/// backend is built in is moving that value onto the command line. Catches the seam
+/// naming a flag kbf does not have, or a value its parser refuses (a relative path, a
+/// scheme it does not admit).
+#[test]
+fn the_all_in_one_state_store_seam_is_a_value_kbf_takes() {
+    let text = render(&config(), Some(1500), Mode::AllInOne).expect("renders");
+    let value = text
+        .lines()
+        .find_map(|l| l.strip_prefix("# TODO: --state-store="))
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("the all-in-one unit marks its state store seam");
+    assert_eq!(value, "sqlite:///var/lib/kbf/state.db");
+    let unit = UnitFile::parse(&text).expect("a unit");
+    let mut argv: Vec<String> = unit.exec_start().iter().map(|a| (*a).to_owned()).collect();
+    assert!(
+        !argv.iter().any(|a| a.starts_with("--state-store")),
+        "the seam is lifted: drop this test for the parse one above"
+    );
+    argv.push(format!("--state-store={value}"));
+    match parse_from(argv.iter().map(String::as_str)) {
+        Ok(Invocation::AllInOne(flags)) => assert_eq!(
+            flags.server.state_store,
+            Some(kbf_server::StateStoreUri::Sqlite(
+                "/var/lib/kbf/state.db".into()
+            ))
+        ),
+        Ok(_) => panic!("not the all-in-one"),
+        Err(e) => panic!("kbf all-in-one refuses the seam's value: {e}"),
+    }
+}
+
 /// Catches kbf-deploy rendering a mode kbf does not have (a sixth, or an old name),
 /// missing one kbf has, listing them in another order than `kbf --help`, and saying a
 /// mode is built (its unit's flags checked) when kbf has no command line for it, or
