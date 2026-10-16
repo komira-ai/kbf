@@ -256,8 +256,8 @@ fn check_args_exits_2_with_the_refusal_a_start_gets() {
         (&bogus, "unexpected argument '--bogus-flag'"),
         (&cold, "kbf daemon refuses --cold-store: "),
         (
-            &[kbf_cli::CHECK_ARGS, names::FRONTEND],
-            "kbf frontend: mode not built yet",
+            &[kbf_cli::CHECK_ARGS, names::STORAGE_AND_DAEMON],
+            "kbf storage-and-daemon: mode not built yet",
         ),
         (&help, "--help and --version print and exit 0"),
         (&[kbf_cli::CHECK_ARGS], "Usage: kbf"),

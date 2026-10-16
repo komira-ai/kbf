@@ -30,6 +30,10 @@
 //! ByteStream as a raw HTTP/2 pass-through that never holds a blob, the rest at the
 //! tonic level. See the `proxy` module for what it keeps and what it does not do yet.
 //!
+//! **The backend.** Execute reads the store through a [`Backend`], a cache in this
+//! process or a storage node ([`Backend::remote`]); `kbf frontend` runs the second and
+//! holds no cache at all.
+//!
 //! **Authorization.** Every service asks a `kbf_auth` authorizer before it serves a
 //! call ([`routes_with_authorizers`]; which call asks which is on each service and in
 //! `docs/reapi-auth.md`). The caller is whoever the server's authentication layer
@@ -47,6 +51,7 @@
 //! never waits: a full channel drops the event and marks its record incomplete.
 
 mod action_cache;
+mod backend;
 mod bytestream;
 mod cache;
 mod capabilities;
@@ -76,6 +81,7 @@ use kbf_proto::reapi::execution_server::ExecutionServer;
 use tonic::service::Routes;
 
 pub use crate::action_cache::ActionCacheService;
+pub use crate::backend::Backend;
 pub use crate::bytestream::ByteStreamService;
 pub use crate::cache::HIT_CHECKS_IN_FLIGHT;
 pub use crate::cache::{
@@ -222,11 +228,12 @@ where
 }
 
 /// [`routes_recorded`] with the client's CAS, ByteStream and action-cache calls answered
-/// by the storage nodes of `proxy` ([`Proxy`]) instead of `cache`. `cache` still serves
-/// `Execution` (and so Execute's action-cache hits) until the scheduler uses storage.
-pub fn routes_proxied<M, O, D>(
+/// by the storage nodes of `proxy` ([`Proxy`]), and `Execution` over `backend`: a cache
+/// in this process (`kbf-server --storage`, which still holds one) or a storage node
+/// ([`Backend::remote`], which is what `kbf frontend` runs).
+pub fn routes_proxied<D>(
     proxy: &Proxy,
-    cache: Arc<Cache<M, O>>,
+    backend: impl Into<Backend>,
     dispatch: Arc<D>,
     closing: Closing,
     authorizers: Arc<Authorizers>,
@@ -234,12 +241,10 @@ pub fn routes_proxied<M, O, D>(
     default_memory: u64,
 ) -> Routes
 where
-    M: MetaLog,
-    O: ObjectStore + 'static,
     D: Dispatch,
 {
     let execution = ExecutionServer::new(
-        ExecutionService::with_authorizers(cache, dispatch, closing, Arc::clone(&authorizers))
+        ExecutionService::with_authorizers(backend, dispatch, closing, Arc::clone(&authorizers))
             .recording(recorder.clone())
             .with_default_memory(default_memory),
     )

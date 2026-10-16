@@ -146,7 +146,7 @@ pub struct Bound<F> {
 }
 
 /// Aborts its task when dropped.
-struct AbortOnDrop(tokio::task::AbortHandle);
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::AbortHandle);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -159,7 +159,7 @@ impl Drop for AbortOnDrop {
 /// unacknowledged waits for the client's delayed ACK, about 40 ms on Linux, so each
 /// sequential small call pays that. tonic's `Server::tcp_nodelay` does not apply here:
 /// `serve_with_incoming` takes the options of the incoming stream it is given.
-fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeError> {
+pub(crate) fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeError> {
     let bound = TcpIncoming::bind(addr).and_then(|incoming| {
         let local = incoming.local_addr()?;
         Ok((incoming.with_nodelay(Some(true)), local))
@@ -168,7 +168,7 @@ fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeError> {
 }
 
 /// Serves `routes` on `listener` until it fails; without a listener, never completes.
-fn serve_api(
+pub(crate) fn serve_api(
     listener: Option<tokio::net::TcpListener>,
     routes: axum::Router,
 ) -> impl Future<Output = std::io::Result<()>> {
@@ -191,7 +191,9 @@ fn set_nodelay(tcp: &mut tokio::net::TcpStream) {
     let _ = tcp.set_nodelay(true);
 }
 
-fn bind_api(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), ServeError> {
+pub(crate) fn bind_api(
+    addr: SocketAddr,
+) -> Result<(tokio::net::TcpListener, SocketAddr), ServeError> {
     let bound = std::net::TcpListener::bind(addr).and_then(|listener| {
         listener.set_nonblocking(true)?;
         let listener = tokio::net::TcpListener::from_std(listener)?;
@@ -204,7 +206,10 @@ fn bind_api(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), S
 /// The worker listener's TLS and the way its peers are told apart. Not generic, so
 /// both arms are one set of lines whatever the cache types (a per-instantiation copy
 /// that misses one arm would count as missed lines).
-fn worker_peers(server: Server, tls: Option<WorkerTls>) -> Result<(Server, Peers), ServeError> {
+pub(crate) fn worker_peers(
+    server: Server,
+    tls: Option<WorkerTls>,
+) -> Result<(Server, Peers), ServeError> {
     Ok(match tls {
         Some(tls) => (
             server.tls_config(tls.server)?,
@@ -220,7 +225,7 @@ fn worker_peers(server: Server, tls: Option<WorkerTls>) -> Result<(Server, Peers
 /// transport's defaults: they bound what is held outside `--write-bytes-in-flight`, and
 /// the connection window is what lets a Write admitted after others finish at all
 /// (`kbf_front::CONNECTION_WINDOW_BYTES`).
-fn flow_control(server: Server) -> Server {
+pub(crate) fn flow_control(server: Server) -> Server {
     server
         .max_concurrent_streams(Some(MAX_CONCURRENT_STREAMS))
         .initial_stream_window_size(Some(STREAM_WINDOW_BYTES))
@@ -233,7 +238,7 @@ const STATE_IN_MEMORY: &str = "the scheduler's state is in memory: no cordon, dr
 
 /// Logs where the scheduler's state is, at every start. Not generic, unlike the binding
 /// that calls it, so every test binary's runs count toward the same function's coverage.
-fn log_state(durable: bool, term: u64, epoch: u64) {
+pub(crate) fn log_state(durable: bool, term: u64, epoch: u64) {
     if durable {
         tracing::info!(term, epoch, "the scheduler's state is in the state store");
     } else {
