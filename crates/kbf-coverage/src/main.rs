@@ -159,11 +159,11 @@ fn check(args: &CheckArgs) -> Result<bool, Box<dyn Error>> {
     let mut report = ratchet::render(&rows);
     let pass = !rows.iter().any(|r| r.status().fails());
     if !pass {
-        let workspace: BTreeSet<String> = measured.keys().cloned().collect();
         report.push('\n');
-        report.push_str(&advice(
-            args,
-            tighten::plan(&recorded, &now, &workspace).map(|_| ()),
+        report.push_str(&tighten::check_advice(
+            &recorded,
+            &now,
+            &tighten_command(args),
         ));
     }
     print!("{report}");
@@ -218,29 +218,6 @@ fn tighten_command(args: &CheckArgs) -> String {
             arg(&args.lcov),
             arg(&args.root)
         ),
-    }
-}
-
-/// What a failing check prints after the table: the `tighten` command when every
-/// failure is a crate measured tighter than recorded, or why `tighten` cannot help.
-fn advice(args: &CheckArgs, plan: Result<(), Vec<tighten::Refusal>>) -> String {
-    match plan {
-        Ok(()) => format!(
-            "Every failure above is one `kbf-coverage tighten` fixes: coverage improved (fewer items \
-             missed than recorded), or a crate was added fully covered or deleted. Running it is \
-             required, and it is not a bypass: it only lowers counts. Run this, then commit \
-             coverage-baseline in this pull request:\n\n```sh\n{}\n```\n",
-            tighten_command(args)
-        ),
-        Err(refusals) => {
-            let mut out = String::from(
-                "`kbf-coverage tighten` cannot fix this failure: it only lowers counts, and it refuses:\n\n",
-            );
-            for r in refusals {
-                let _ = writeln!(out, "- {r}");
-            }
-            out
-        }
     }
 }
 

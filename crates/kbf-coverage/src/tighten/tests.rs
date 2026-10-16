@@ -78,6 +78,13 @@ fn unmeasured(krate: &str, metric: Metric, recorded: u64) -> Refusal {
     }
 }
 
+fn branches_gone(krate: &str, recorded: u64) -> Refusal {
+    Refusal::BranchesNoLongerMeasured {
+        krate: krate.into(),
+        recorded,
+    }
+}
+
 /// Catches: each kind of rise written instead of refused (a higher count, `-` to a
 /// count above 0), or refused without naming the crate, the metric and both values.
 #[test]
@@ -158,15 +165,23 @@ fn no_data_where_the_file_has_a_count_is_refused_unless_only_branches_vanished()
         Err(vec![unmeasured("k", Metric::Lines, 1)])
     );
     assert_eq!(
+        run(e(Some(0), Some(2)), e(None, None)),
+        Err(vec![
+            unmeasured("k", Metric::Lines, 0),
+            unmeasured("k", Metric::Branches, 2),
+        ])
+    );
+    // With the lines still measured, a branch count to no data has its own refusal.
+    assert_eq!(
         run(e(Some(0), Some(2)), e(Some(0), None)),
-        Err(vec![unmeasured("k", Metric::Branches, 2)])
+        Err(vec![branches_gone("k", 2)])
     );
     assert_eq!(
         unmeasured("k", Metric::Lines, 0).to_string(),
         "k lines: recorded 0, measured -: nothing measured where the file has a count would hide \
          misses (a crate with `[lib] test = false` has no coverage record at all); give it a test \
-         target back, or, if it has nothing left to measure, change its line to - by hand in a \
-         reviewed pull request"
+         target back, or, if it has nothing to measure, put - in its line by hand in a reviewed \
+         pull request"
     );
 }
 
@@ -194,17 +209,15 @@ fn one_rise_refuses_the_whole_run_and_every_rise_is_named() {
 }
 
 /// Catches: a new crate added whatever it measures (new code must arrive covered),
-/// a fully covered one refused, or one added with values other than measured.
+/// a fully covered one refused, or one added with values other than measured; and a
+/// new crate whose lines measure `-` added (`- -` is what a `[lib] test = false` crate
+/// measures whatever untested code it holds, so taking it hides that code; `- 0` is not
+/// what a tracefile gives, and is refused alike).
 #[test]
 fn adds_a_new_crate_only_when_it_arrives_covered() {
     let recorded = file(&[("a", e(Some(1), Some(1)))]);
     let ws = set(&["a", "new"]);
-    for covered in [
-        e(Some(0), None),
-        e(None, None),
-        e(Some(0), Some(0)),
-        e(None, Some(0)),
-    ] {
+    for covered in [e(Some(0), None), e(Some(0), Some(0))] {
         let measured = file(&[("a", e(Some(1), Some(1))), ("new", covered)]);
         let changes = plan(&recorded, &measured, &ws).expect("covered");
         assert_eq!(
@@ -216,15 +229,27 @@ fn adds_a_new_crate_only_when_it_arrives_covered() {
         );
         assert_eq!(apply(&recorded, &changes), measured);
     }
-    for uncovered in [e(Some(1), None), e(None, Some(2)), e(Some(0), Some(1))] {
-        let measured = file(&[("a", e(Some(1), Some(1))), ("new", uncovered)]);
-        assert_eq!(
-            plan(&recorded, &measured, &ws),
-            Err(vec![Refusal::NewCrateUncovered {
-                krate: "new".into(),
-                measured: uncovered,
-            }])
-        );
+    for (measured_new, unmeasured_lines) in [
+        (e(Some(1), None), false),
+        (e(None, Some(2)), false),
+        (e(Some(0), Some(1)), false),
+        (e(None, None), true),
+        (e(None, Some(0)), true),
+    ] {
+        let measured = file(&[("a", e(Some(1), Some(1))), ("new", measured_new)]);
+        let (krate, measured_new) = ("new".to_owned(), measured_new);
+        let refusal = if unmeasured_lines {
+            Refusal::NewCrateUnmeasured {
+                krate,
+                measured: measured_new,
+            }
+        } else {
+            Refusal::NewCrateUncovered {
+                krate,
+                measured: measured_new,
+            }
+        };
+        assert_eq!(plan(&recorded, &measured, &ws), Err(vec![refusal]));
     }
     assert_eq!(
         Change::Added {
@@ -240,7 +265,18 @@ fn adds_a_new_crate_only_when_it_arrives_covered() {
             measured: e(Some(3), None)
         }
         .to_string(),
-        "n: not in the baseline, measured 3 -: a new crate must arrive covered (every value 0 or -)"
+        "n: not in the baseline, measured 3 -: a new crate must arrive covered (`0 0` or `0 -`)"
+    );
+    assert_eq!(
+        Refusal::NewCrateUnmeasured {
+            krate: "n".into(),
+            measured: e(None, None)
+        }
+        .to_string(),
+        "n: not in the baseline, measured - -: a new crate whose lines measure - has no coverage \
+         record (a crate with `[lib] test = false` has none at all, whatever code it holds); give \
+         it a test target, or, if it has nothing to measure, put - in its line by hand in a \
+         reviewed pull request"
     );
 }
 
@@ -411,11 +447,19 @@ fn a_root_without_any_recorded_crate_is_refused() {
             measured: e(Some(1), None),
         },
         unmeasured("k", Metric::Lines, 0),
+        branches_gone("k", 1),
+        Refusal::NewCrateUnmeasured {
+            krate: "n".into(),
+            measured: e(None, None),
+        },
     ]
     .iter()
     .map(Refusal::of_another_tree)
     .collect();
-    assert_eq!(another, [false, true, true, false, false, false]);
+    assert_eq!(
+        another,
+        [false, true, true, false, false, false, false, false]
+    );
 }
 
 /// Catches: the advice after a refusal chosen wrongly. One refusal that says the
@@ -433,4 +477,212 @@ fn tree_advice_follows_the_refusals_and_the_input() {
     assert_eq!(tree_advice(&mixed, false), Some(OTHER_TREE_ADVICE));
     assert_eq!(tree_advice(&rise, true), Some(MAYBE_OTHER_TREE_ADVICE));
     assert_eq!(tree_advice(&rise, false), None);
+}
+
+/// Catches (N5): a branch count above 0 taken to `-` while the crate's lines are still
+/// measured, lowered as if the crate had lost its last branch. Its missed branches went
+/// without being covered (or the measurement lost branch data), so it is refused as a
+/// reviewed hand edit, with its own message rather than the "no coverage record at all"
+/// one (the crate does have a record). Recorded 1 is the edge: a rule that let `r > 1`
+/// alone count as a rise lowers it.
+#[test]
+fn a_branch_count_to_no_data_is_refused_even_with_the_lines_measured() {
+    let ws = set(&["k"]);
+    for recorded in [1, 4] {
+        assert_eq!(
+            plan(
+                &file(&[("k", e(Some(3), Some(recorded)))]),
+                &file(&[("k", e(Some(0), None))]),
+                &ws
+            ),
+            Err(vec![branches_gone("k", recorded)]),
+            "{recorded}"
+        );
+    }
+    assert_eq!(
+        branches_gone("k", 1).to_string(),
+        "k branches: recorded 1, measured - while its lines are measured: the missed branches \
+         were removed rather than covered, or the measurement lost branch data (it needs \
+         --branch); tighten does not turn a count into -: if it has nothing to measure, put - in \
+         its line by hand in a reviewed pull request"
+    );
+}
+
+/// The rule [`INVARIANT`] states, written out here without [`ratchet::compare`] or
+/// [`plan`]: whether `tighten` may take one crate from `recorded` to `measured`
+/// (`None`: not listed, or not measured). A crate not measured has left the workspace
+/// (the grid's workspace is the measured crates) and is removed.
+fn oracle(recorded: Option<Entry>, measured: Option<Entry>) -> bool {
+    let Some(m) = measured else {
+        return true;
+    };
+    // A crate the file does not list counts as `0 0`.
+    let r = recorded.unwrap_or(e(Some(0), Some(0)));
+    // (3) no count above the recorded one, `-` recorded counting as 0.
+    let at_most = |r: Option<u64>, m: Option<u64>| m.is_none_or(|m| m <= r.unwrap_or(0));
+    // (1) lines `-` only where the file already says `-`.
+    let lines = at_most(r.lines, m.lines) && (m.lines.is_some() || r.lines.is_none());
+    // (2) branches `-` only where the file says `-`, or from 0 while the lines are
+    // measured; a count above 0 never (N5).
+    let branches = at_most(r.branches, m.branches)
+        && (m.branches.is_some()
+            || r.branches.is_none()
+            || (r.branches == Some(0) && m.lines.is_some()));
+    lines && branches
+}
+
+const RECORDED: [Option<(Option<u64>, Option<u64>)>; 9] = [
+    None,
+    Some((None, None)),
+    Some((None, Some(0))),
+    Some((Some(0), None)),
+    Some((Some(0), Some(0))),
+    Some((Some(0), Some(3))),
+    Some((Some(2), Some(0))),
+    Some((Some(5), Some(2))),
+    Some((Some(3), Some(1))),
+];
+
+const MEASURED_GRID: [Option<(Option<u64>, Option<u64>)>; 9] = [
+    None,
+    Some((None, None)),
+    Some((None, Some(0))),
+    Some((Some(0), None)),
+    Some((Some(0), Some(0))),
+    Some((Some(0), Some(3))),
+    Some((Some(1), Some(0))),
+    Some((Some(5), Some(2))),
+    Some((Some(7), Some(9))),
+];
+
+/// Catches: any cell where `tighten` and the rule disagree, for one crate and for two
+/// (one recorded, one new: the split of a recorded crate's uncovered code into a new
+/// crate, and a rename). Crate `a` takes every recorded entry and every measurement,
+/// crate `b` too (`b` absent from the file and measured is the new crate), next to a
+/// crate that never changes. Each cell's plan must be refused exactly when the oracle
+/// refuses some crate's transition; an accepted plan must write exactly the
+/// measurement; and the check's advice must offer the `tighten` command exactly when
+/// `tighten` would accept, so it never tells the user to run a refused change.
+#[test]
+fn tighten_and_the_check_advice_agree_with_the_rule_on_every_cell() {
+    let entry = |v: (Option<u64>, Option<u64>)| e(v.0, v.1);
+    let (mut accepted, mut refused) = (0, 0);
+    for ra in RECORDED {
+        for ma in MEASURED_GRID {
+            for rb in RECORDED {
+                for mb in MEASURED_GRID {
+                    let (ra, ma, rb, mb) =
+                        (ra.map(entry), ma.map(entry), rb.map(entry), mb.map(entry));
+                    let pairs = [
+                        ("a", ra, ma),
+                        (
+                            "anchor",
+                            Some(e(Some(0), Some(0))),
+                            Some(e(Some(0), Some(0))),
+                        ),
+                        ("b", rb, mb),
+                    ];
+                    let recorded: Baseline = pairs
+                        .iter()
+                        .filter_map(|(k, r, _)| Some(((*k).to_owned(), (*r)?)))
+                        .collect();
+                    let measured: Baseline = pairs
+                        .iter()
+                        .filter_map(|(k, _, m)| Some(((*k).to_owned(), (*m)?)))
+                        .collect();
+                    let ws: BTreeSet<String> = measured.keys().cloned().collect();
+                    let allowed = oracle(ra, ma) && oracle(rb, mb);
+                    let cell = format!("a {ra:?} -> {ma:?}, b {rb:?} -> {mb:?}");
+                    let got = plan(&recorded, &measured, &ws);
+                    assert_eq!(got.is_ok(), allowed, "{cell}: {got:?}");
+                    if let Ok(changes) = &got {
+                        assert_eq!(apply(&recorded, changes), measured, "{cell}");
+                        accepted += 1;
+                    } else {
+                        refused += 1;
+                    }
+                    let advice = check_advice(&recorded, &measured, "CMD");
+                    assert_eq!(
+                        advice.starts_with("Every failure above is one"),
+                        allowed,
+                        "{cell}: {advice}"
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(accepted + refused, 9 * 9 * 9 * 9);
+    assert!(accepted > 0 && refused > 0, "{accepted} {refused}");
+}
+
+/// Catches: the cases that broke rounds 1 to 3 regressing, named: a new `[lib] test =
+/// false` crate (`- -`) added, a recorded crate's uncovered code split into one
+/// (`5 2` -> `0 0` next to a new `- -`), and a rename to one (old removed, new `- -`).
+#[test]
+fn a_new_crate_measured_no_data_is_refused_alone_split_or_renamed() {
+    let zero = e(Some(0), Some(0));
+    let none = e(None, None);
+    let cases = [
+        // s7: a new crate with `[lib] test = false`.
+        (
+            file(&[("user", zero), ("victim", zero)]),
+            file(&[("user", zero), ("victim", zero), ("victim2", none)]),
+            "victim2",
+        ),
+        // s9: the split.
+        (
+            file(&[("user", zero), ("victim", e(Some(5), Some(2)))]),
+            file(&[("user", zero), ("victim", zero), ("victim2", none)]),
+            "victim2",
+        ),
+        // s10: the rename.
+        (
+            file(&[("user", zero), ("victim", zero)]),
+            file(&[("user", zero), ("vnew", none)]),
+            "vnew",
+        ),
+    ];
+    for (recorded, measured, new) in cases {
+        let ws: BTreeSet<String> = measured.keys().cloned().collect();
+        let new = new.to_owned();
+        assert_eq!(
+            plan(&recorded, &measured, &ws),
+            Err(vec![Refusal::NewCrateUnmeasured {
+                krate: new,
+                measured: none
+            }])
+        );
+    }
+}
+
+/// Catches: the docs stating a rule other than the one `tighten` keeps. The module docs
+/// of `tighten` and `ratchet`, the `coverage-baseline` header and CONTRIBUTING.md must
+/// each state [`INVARIANT`] word for word (comment markers and line breaks aside).
+#[test]
+fn the_docs_state_the_rule_the_same_way() {
+    let words = |text: &str| -> String {
+        text.lines()
+            .map(|l| {
+                l.trim_start()
+                    .trim_start_matches("//!")
+                    .trim_start_matches('#')
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let rule = words(INVARIANT);
+    for (name, text) in [
+        ("tighten.rs", include_str!("../tighten.rs")),
+        ("ratchet.rs", include_str!("../ratchet.rs")),
+        ("baseline::HEADER", crate::baseline::HEADER),
+        (
+            "CONTRIBUTING.md",
+            include_str!("../../../../CONTRIBUTING.md"),
+        ),
+    ] {
+        assert!(words(text).contains(&rule), "{name} does not state: {rule}");
+    }
 }

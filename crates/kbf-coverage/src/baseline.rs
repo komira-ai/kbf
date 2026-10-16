@@ -99,17 +99,19 @@ pub fn parse(text: &str) -> Result<Baseline, BaselineError> {
     Ok(out)
 }
 
-const HEADER: &str = "\
+pub(crate) const HEADER: &str = "\
 # Coverage ratchet, checked by the CI coverage job (crates/kbf-coverage). One line per
 # workspace crate: how many of its lines and branches no test runs; `-` means the crate
 # has nothing to measure. CI fails when a crate misses more than its line here, so a
 # change covers the code it adds (or covers as much existing code as it leaves
 # uncovered), and when it misses fewer, so the file never keeps slack. The target is 0
 # everywhere. When coverage improves, running `kbf-coverage tighten` on the measured
-# file the coverage job uploads is required (the failing job prints the command). It
-# is not a bypass: it only lowers counts, and refuses any rise. The one hand edit is a
-# crate whose code is no longer measured at all (tighten refuses it and says so): its
-# `-` goes in by hand, in a reviewed pull request.
+# file the coverage job uploads is required (the failing job prints the command). It is
+# not a bypass: `tighten` writes no count above the recorded one (a value recorded as
+# `-`, and each value of a crate the file does not list, counts as 0), never turns lines
+# into `-`, and turns branches into `-` only from 0 and only while the crate's lines are
+# measured, so a new crate goes in only as `0 0` or `0 -`. The only hand edit is a `-`
+# that tighten refuses and says to put in by hand, in a reviewed pull request.
 # crate lines-missed branches-missed
 ";
 

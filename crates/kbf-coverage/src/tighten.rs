@@ -4,21 +4,29 @@
 //! The ratchet ([`crate::ratchet`]) fails when the file is looser than measured, so a
 //! change that covers more code must lower the file in the same pull request. Running
 //! `tighten` on the measured file the coverage job uploads is that step: it is
-//! required when coverage improves, and it is not a bypass. [`plan`] compares each
-//! metric with [`ratchet::compare`], the ratchet's own rule, and:
+//! required when coverage improves, and it is not a bypass. The rule it keeps for
+//! every value it writes ([`INVARIANT`]):
+//!
+//! `tighten` writes no count above the recorded one (a value recorded as `-`, and each
+//! value of a crate the file does not list, counts as 0), never turns lines into `-`,
+//! and turns branches into `-` only from 0 and only while the crate's lines are
+//! measured, so a new crate goes in only as `0 0` or `0 -`.
+//!
+//! Lines `-` hides everything: a crate whose library says `[lib] test = false` has no
+//! record in the tracefile at all, so it measures `- -` whatever untested code it
+//! holds. [`plan`] compares each listed crate's metrics with [`ratchet::compare`], the
+//! ratchet's own rule, and:
 //!
 //! - lowers a [`Compare::Looser`] value to the measured one (a lower count, `-`
 //!   recorded where the crate now measures 0, or branches 0 recorded where the crate
-//!   now has no branch and its lines are still measured: nothing was missed, and
-//!   nothing can be);
+//!   now has no branch and its lines are still measured);
 //! - refuses a [`Compare::MoreMissed`] one: a higher count, or `-` to a count above 0
-//!   ([`Refusal::Raised`]: cover the code); or a count to no data
-//!   ([`Refusal::NoLongerMeasured`]), lines 0 included, since a crate no test binary
-//!   instruments (`[lib] test = false`) has no record at all and would hide any code
-//!   added to it. When a crate's code legitimately stops being measured, its line is
-//!   edited by hand in a reviewed pull request, as the refusal says;
-//! - adds a workspace crate the file lacks only when every measured value is 0 or
-//!   `-` (new code arrives covered), and refuses it otherwise;
+//!   ([`Refusal::Raised`]: cover the code); a count to no data
+//!   ([`Refusal::NoLongerMeasured`]), lines 0 included; or a branch count above 0 to
+//!   no data while the lines are measured ([`Refusal::BranchesNoLongerMeasured`]);
+//! - adds a workspace crate the file lacks only as `0 0` or `0 -`: one that misses
+//!   anything is [`Refusal::NewCrateUncovered`], and one whose lines measure `-` is
+//!   [`Refusal::NewCrateUnmeasured`];
 //! - removes a crate that is neither measured nor in the workspace (its
 //!   `crates/<name>/Cargo.toml` is gone);
 //! - refuses any other difference between the file's crates, the measured crates and
@@ -29,12 +37,18 @@
 //! - refuses everything when none of the file's crates is in the workspace: `--root`
 //!   is not this repository, and every line would otherwise be removed.
 //!
+//! Every value that takes `-` where the rule forbids it (a crate whose code
+//! legitimately stops being measured, or a new crate with nothing to measure) is a hand
+//! edit in a reviewed pull request, and the refusal says so ([`HAND_EDIT`]).
+//!
 //! One refusal refuses everything: the file is written only when every difference is
-//! one the ratchet calls looser. The result then equals the measurement, so the
-//! ratchet passes on it and a second run finds nothing to change.
+//! one the rule allows. The result then equals the measurement, so the ratchet passes
+//! on it and a second run finds nothing to change. `check` decides whether to tell the
+//! user to run `tighten` with the same [`plan`] ([`check_advice`]), so it never
+//! suggests a run that would be refused.
 
 use std::collections::BTreeSet;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -52,7 +66,7 @@ pub enum Change {
         from: Option<u64>,
         to: Option<u64>,
     },
-    /// A new workspace crate, every value 0 or `-`.
+    /// A new workspace crate, `0 0` or `0 -`.
     Added { krate: String, entry: Entry },
     /// A crate gone from the workspace.
     Removed { krate: String, entry: Entry },
@@ -81,6 +95,20 @@ impl fmt::Display for Change {
         }
     }
 }
+
+/// The rule `tighten` keeps for every value it writes, as the docs state it.
+pub const INVARIANT: &str = "`tighten` writes no count above the recorded one (a value \
+     recorded as `-`, and each value of a crate the file does not list, counts as 0), never \
+     turns lines into `-`, and turns branches into `-` only from 0 and only while the crate's \
+     lines are measured, so a new crate goes in only as `0 0` or `0 -`.";
+
+/// The fix every "no data" refusal names when no test target can come back.
+pub const HAND_EDIT: &str = "if it has nothing to measure, put - in its line by hand in a \
+     reviewed pull request";
+
+/// What a failing check says `tighten` fixes: the changes [`plan`] writes.
+pub const FIXES: &str = "coverage improved (fewer items missed than recorded), a crate was \
+     added with its lines measured and none missed (`0 0` or `0 -`), or a crate was deleted";
 
 /// What to do about a measurement of another tree, printed after the refusals when
 /// any is [`Refusal::of_another_tree`].
@@ -125,8 +153,8 @@ pub enum Refusal {
     #[error(
         "{krate} {metric}: recorded {recorded}, measured -: nothing measured where the file has a count \
          would hide misses (a crate with `[lib] test = false` has no coverage record at all); \
-         give it a test target back, or, if it has nothing left to measure, change its line to - by \
-         hand in a reviewed pull request"
+         give it a test target back, or, {}",
+        HAND_EDIT
     )]
     NoLongerMeasured {
         krate: String,
@@ -134,10 +162,25 @@ pub enum Refusal {
         recorded: u64,
     },
     #[error(
-        "{krate}: not in the baseline, measured {}: a new crate must arrive covered (every value 0 or -)",
+        "{krate} branches: recorded {recorded}, measured - while its lines are measured: the missed \
+         branches were removed rather than covered, or the measurement lost branch data (it needs \
+         --branch); tighten does not turn a count into -: {}",
+        HAND_EDIT
+    )]
+    BranchesNoLongerMeasured { krate: String, recorded: u64 },
+    #[error(
+        "{krate}: not in the baseline, measured {}: a new crate must arrive covered (`0 0` or `0 -`)",
         pair(*measured)
     )]
     NewCrateUncovered { krate: String, measured: Entry },
+    #[error(
+        "{krate}: not in the baseline, measured {}: a new crate whose lines measure - has no coverage \
+         record (a crate with `[lib] test = false` has none at all, whatever code it holds); give it \
+         a test target, or, {}",
+        pair(*measured),
+        HAND_EDIT
+    )]
+    NewCrateUnmeasured { krate: String, measured: Entry },
     #[error(
         "{krate}: crates/{krate}/Cargo.toml exists but the measured file has no line for it; measure this tree"
     )]
@@ -201,11 +244,13 @@ pub fn plan(
             continue;
         }
         let Some(r) = recorded else {
-            let covered = |v: Option<u64>| v.is_none_or(|v| v == 0);
-            if covered(m.lines) && covered(m.branches) {
-                changes.push(Change::Added { krate, entry: m });
-            } else {
+            let misses = |v: Option<u64>| v.is_some_and(|v| v > 0);
+            if misses(m.lines) || misses(m.branches) {
                 refusals.push(Refusal::NewCrateUncovered { krate, measured: m });
+            } else if m.lines.is_none() {
+                refusals.push(Refusal::NewCrateUnmeasured { krate, measured: m });
+            } else {
+                changes.push(Change::Added { krate, entry: m });
             }
             continue;
         };
@@ -221,6 +266,10 @@ pub fn plan(
                     to,
                 }),
                 Compare::MoreMissed => refusals.push(match (from, to) {
+                    // Lines measured: compare lowers branches 0, so this is a count.
+                    (Some(recorded), None) if metric == Metric::Branches && m.lines.is_some() => {
+                        Refusal::BranchesNoLongerMeasured { krate, recorded }
+                    }
                     (Some(recorded), None) => Refusal::NoLongerMeasured {
                         krate,
                         metric,
@@ -240,6 +289,30 @@ pub fn plan(
         Ok(changes)
     } else {
         Err(refusals)
+    }
+}
+
+/// What a failing check prints after its table: the `tighten` command (`command`)
+/// when [`plan`] takes `recorded` to `measured` (every failure is one [`FIXES`] names),
+/// else every refusal. `measured` lists every workspace crate, as `check` measures.
+pub fn check_advice(recorded: &Baseline, measured: &Baseline, command: &str) -> String {
+    let workspace: BTreeSet<String> = measured.keys().cloned().collect();
+    match plan(recorded, measured, &workspace) {
+        Ok(_) => format!(
+            "Every failure above is one `kbf-coverage tighten` fixes: {FIXES}. Running it is \
+             required, and it is not a bypass: it only lowers counts. Run this, then commit \
+             coverage-baseline in this pull request:\n\n```sh\n{command}\n```\n"
+        ),
+        Err(refusals) => {
+            let mut out = String::from(
+                "`kbf-coverage tighten` cannot fix this failure: it only lowers counts, and it refuses:\n\n",
+            );
+            for r in refusals {
+                // Writing to a String cannot fail.
+                let _ = writeln!(out, "- {r}");
+            }
+            out
+        }
     }
 }
 

@@ -18,7 +18,17 @@
 //! gone) has no record in the tracefile at all, so any code added to it, covered or
 //! not, would go unseen. A crate whose lines legitimately stop being measured (all of
 //! its code removed, say) is a hand edit of its line to `- -`, made in a reviewed pull
-//! request; `tighten` refuses it and says so.
+//! request; `tighten` refuses it and says so. Branches recorded above 0 and now `-`
+//! is a rise too, even with the lines measured: the missed branches went without
+//! being covered (or the measurement lost branch data), so it is a reviewed hand edit
+//! as well.
+//!
+//! The values `tighten` writes follow from these rules and one more for a crate the
+//! file does not list (it must arrive as `0 0` or `0 -`). In one sentence:
+//! `tighten` writes no count above the recorded one (a value recorded as `-`, and each
+//! value of a crate the file does not list, counts as 0), never turns lines into `-`,
+//! and turns branches into `-` only from 0 and only while the crate's lines are
+//! measured, so a new crate goes in only as `0 0` or `0 -`.
 //!
 //! A workspace crate missing from the baseline, and a baseline crate missing from the
 //! workspace, fail too, so the file always names exactly the workspace's crates. A

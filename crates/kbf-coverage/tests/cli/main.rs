@@ -14,6 +14,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod unmeasured;
+
 /// A fixture workspace, removed when dropped.
 struct Workspace(PathBuf);
 
@@ -423,11 +425,12 @@ fn tighten_refuses_every_rise_and_leaves_the_file_untouched() {
                 MAYBE,
             ],
         ),
-        // A count to no data, and a second rise: both named.
+        // A branch count to no data, and a second rise: both named.
         (
             measured("47 -", "5 15", "0 -", "- -"),
             vec![
-                "kbf-front branches: recorded 8, measured -: nothing measured where the file has a count",
+                "kbf-front branches: recorded 8, measured - while its lines are measured: the missed \
+                 branches were removed rather than covered",
                 "kbf-sim-cell lines: recorded 4, measured 5: more missed than recorded",
                 MAYBE,
             ],
@@ -806,7 +809,8 @@ fn a_failure_tighten_fixes_prints_the_command_with_the_run_id() {
         out.ends_with(&format!(
             "coverage ratchet: FAIL (2 crate(s) need attention; see status)\n\n\
              Every failure above is one `kbf-coverage tighten` fixes: coverage improved (fewer items \
-             missed than recorded), or a crate was added fully covered or deleted. Running it is \
+             missed than recorded), a crate was added with its lines measured and none missed (`0 0` \
+             or `0 -`), or a crate was deleted. Running it is \
              required, and it is not a bypass: it only lowers counts. Run this, then commit \
              coverage-baseline in this pull request:\n\n```sh\n{command}\n```\n"
         )),
@@ -888,111 +892,6 @@ fn the_command_follows_the_flags_and_quotes_for_the_shell() {
 /// under the working directory.
 const REFUSED: &str = "kbf-coverage tighten: refused; ./coverage-baseline is unchanged. \
      tighten only lowers counts:\n";
-
-/// Catches (the verifier's probe, end to end): a crate no test binary instruments read
-/// as covered. `notest` says `[lib] test = false`, so `cargo llvm-cov --workspace`
-/// writes no record for it at all (its tracefile has no `SF:` line under
-/// crates/notest), even after it gains the untested function below. Recorded `0 0`, it
-/// measures `- -`; lowering to that would hide the new code. `check` must fail and
-/// print the refusal with the hand edit it takes, and `tighten` must refuse from the
-/// tracefile (no advice: measured here) and from the measured file (the softer advice),
-/// leaving the file as it was.
-#[test]
-fn a_crate_no_test_binary_instruments_is_not_lowered_to_no_data() {
-    let root = workspace("notest");
-    let dir = root.join("crates/notest");
-    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"notest\"\n\n[lib]\ntest = false\n",
-    )
-    .expect("write Cargo.toml");
-    std::fs::write(
-        dir.join("src/lib.rs"),
-        "pub fn untested(x: u8) -> u8 {\n    if x > 0 { x } else { 1 }\n}\n",
-    )
-    .expect("write lib.rs");
-    std::fs::create_dir_all(root.join("target/coverage")).expect("mkdir");
-    let recorded = "a 1 0\nb 0 -\nempty - -\nnotest 0 0\n";
-    let o = ci_check(
-        &root,
-        recorded,
-        &[
-            "--write-baseline",
-            "target/coverage/coverage-baseline.measured",
-        ],
-    );
-    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
-    let out = stdout(&o);
-    assert!(
-        out.contains(
-            "| notest | 0/0 | - | - | - | 0/0 | - | - | - | 0 / 0 | MORE MISSED THAN BASELINE (lines, branches) |"
-        ),
-        "{out}"
-    );
-    assert!(
-        out.ends_with(
-            "`kbf-coverage tighten` cannot fix this failure: it only lowers counts, and it refuses:\n\n\
-             - notest lines: recorded 0, measured -: nothing measured where the file has a count would \
-             hide misses (a crate with `[lib] test = false` has no coverage record at all); give it a \
-             test target back, or, if it has nothing left to measure, change its line to - by hand in \
-             a reviewed pull request\n\
-             - notest branches: recorded 0, measured -: nothing measured where the file has a count \
-             would hide misses (a crate with `[lib] test = false` has no coverage record at all); give \
-             it a test target back, or, if it has nothing left to measure, change its line to - by hand \
-             in a reviewed pull request\n"
-        ),
-        "{out}"
-    );
-    let measured = "target/coverage/coverage-baseline.measured";
-    let written = std::fs::read_to_string(root.join(measured)).expect("measured");
-    assert!(
-        written
-            .lines()
-            .any(|l| l.split_whitespace().eq(["notest", "-", "-"])),
-        "{written}"
-    );
-    for (args, advice) in [
-        (["--lcov", "lcov.info"], "\n"),
-        (["--measured", measured], MAYBE),
-    ] {
-        let o = Command::new(env!("CARGO_BIN_EXE_kbf-coverage"))
-            .current_dir(&*root)
-            .arg("tighten")
-            .args(args)
-            .arg("--root")
-            .arg(&*root)
-            .arg("--baseline")
-            .arg("./coverage-baseline")
-            .output()
-            .expect("run kbf-coverage tighten");
-        assert_eq!(o.status.code(), Some(1), "{args:?}: {}", stderr(&o));
-        assert_eq!(baseline_of(&root), recorded, "{args:?}");
-        let err = stderr(&o);
-        let lines: Vec<&str> = err.lines().collect();
-        assert_eq!(
-            lines[..3],
-            [
-                REFUSED.trim_end(),
-                "  notest lines: recorded 0, measured -: nothing measured where the file has a count \
-                 would hide misses (a crate with `[lib] test = false` has no coverage record at all); \
-                 give it a test target back, or, if it has nothing left to measure, change its line to \
-                 - by hand in a reviewed pull request",
-                "  notest branches: recorded 0, measured -: nothing measured where the file has a \
-                 count would hide misses (a crate with `[lib] test = false` has no coverage record at \
-                 all); give it a test target back, or, if it has nothing left to measure, change its \
-                 line to - by hand in a reviewed pull request",
-            ],
-            "{args:?}"
-        );
-        // Then the advice (after a measured file) or nothing (after a tracefile).
-        assert_eq!(
-            err,
-            format!("{}{advice}", lines[..3].join("\n")),
-            "{args:?}"
-        );
-    }
-}
 
 /// Catches: a failed rename leaving `coverage-baseline.tighten-tmp` behind (the next
 /// run, or a commit, would pick it up) or reported as success, and the baseline
