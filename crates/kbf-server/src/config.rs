@@ -332,7 +332,7 @@ pub struct Args {
     /// can always be admitted, and at least `--segment-upload-max-bytes`. Not covered: each HTTP/2
     /// stream's message as tonic decodes it, before the handler runs, up to 17 MiB per
     /// stream (about 3.4 GiB for 200 streams), times the streams one connection may open
-    /// (`--reapi-max-streams`, `--worker-max-streams`).
+    /// on each listener.
     #[arg(
         long,
         default_value_t = kbf_front::WriteConfig::DEFAULT.bytes_in_flight,
