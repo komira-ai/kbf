@@ -25,6 +25,10 @@
 //! `kbf-server`'s ([`kbf_server::SERVER_VERSION`]), which `kbf-all-in-one` links
 //! anyway, so the artifacts workflow can check `kbf` as it checks `kbf-server`.
 //!
+//! `kbf --version --json` ([`version`]) prints one JSON object on one line naming the
+//! commit, the build profile, the protocol versions and the state schema, so a host can
+//! check what it runs.
+//!
 //! `kbf check-args <mode> [flags...]` ([`check_args`]) parses `kbf <mode> [flags...]`
 //! as a start would, then exits, starting nothing: 0 when the mode would start with
 //! those flags, 2 with clap's message when it would refuse them (and for a mode not
@@ -35,6 +39,7 @@
 
 pub mod cluster;
 pub mod names;
+pub mod version;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
@@ -313,9 +318,10 @@ pub fn check_args(args: &[std::ffi::OsString]) -> Result<(), clap::Error> {
 }
 
 /// The `kbf` binary: the daemon's helper re-execs first (a keeper or a `__chown-dirs`
-/// run of this binary never reads the command line as `kbf`'s), then the command line,
-/// then [`check_args`] for `kbf check-args ...`, [`cluster::run`] for `kbf cluster ...`
-/// or else [`run`]. A command line that
+/// run of this binary never reads the command line as `kbf`'s), then [`version::line`]
+/// for `kbf --version --json`, then the command line, then [`check_args`] for `kbf
+/// check-args ...`, [`cluster::run`] for `kbf cluster ...` or else [`run`]. A command
+/// line that
 /// does not parse exits 2 (0 for `--help` and `--version`).
 #[must_use]
 pub fn main() -> ExitCode {
@@ -323,6 +329,10 @@ pub fn main() -> ExitCode {
         return code;
     }
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if version::asked(&args) {
+        print!("{}", version::line());
+        return ExitCode::SUCCESS;
+    }
     if args.get(1).is_some_and(|word| word == CHECK_ARGS) {
         return match check_args(&args) {
             Ok(()) => ExitCode::SUCCESS,
