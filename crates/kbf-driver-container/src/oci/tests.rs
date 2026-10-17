@@ -63,6 +63,23 @@ fn start(config: &OciConfig, scratch: &Path) -> Result<Arc<Oci>, OciError> {
     Oci::on(config, scratch, "/actions", "x86_64")
 }
 
+/// Catches the helpers running the daemon's binary from where it was installed: a helper
+/// with an action's ids cannot search a 0750 home directory the binary may sit in, so the
+/// daemon copies itself under the scratch directory and runs that copy.
+#[test]
+fn helpers_run_a_copy_of_the_daemon_under_the_scratch_directory() {
+    let dir = scratch("daemon-copy");
+    let oci = start(&config(&dir, true), &dir.join("s")).expect("starts");
+    assert_eq!(oci.daemon, dir.join("s/oci-bin/kbf-daemon"));
+    let mode = std::fs::metadata(&oci.daemon)
+        .expect("copy")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o755);
+    let original = std::fs::read(std::env::current_exe().expect("test binary")).expect("read");
+    assert_eq!(std::fs::read(&oci.daemon).expect("copy"), original);
+}
+
 /// Catches an error that does not name the path it was about, and one that is lost.
 #[test]
 fn an_io_error_names_its_path() {

@@ -772,6 +772,18 @@ async fn a_failed_delete_fails_the_lease() {
     assert!(why.contains("crun delete"), "{why}");
 }
 
+/// Catches a clean failing a lease because `crun delete` lost a race with the `crun run`
+/// of a killed container (which deletes its own state as it exits, and is all a restarted
+/// daemon's sweep meets): the state being gone is what the delete was for.
+#[tokio::test]
+async fn a_delete_that_finds_the_state_gone_is_a_clean_lease() {
+    let fake = FakeOci::new("delete-vanished");
+    fake.knob("delete-vanished", "");
+    fake.run(1, &Spec::new(&image(), "unused"), &["exit", "0"])
+        .await
+        .expect("ran");
+}
+
 /// Catches an action killed by a signal being reported as anything but `128 + n`, the
 /// status `crun run` ends with. (137, SIGKILL, sends the lease to the OOM classification,
 /// which reads the lease cgroup's `memory.events`: `fake_memory`'s.)

@@ -24,6 +24,8 @@
 //! - `busy-once`: the next run fails as crun does when the program's exec finds it busy
 //!   (ETXTBSY), once.
 //! - `kill-fails`, `delete-fails`: that verb fails.
+//! - `delete-vanished`: `delete` finds the container's state already gone and fails, as crun does
+//!   when the `crun run` of a killed container removed it first.
 //! - `chown-fails`: a helper giving to the owner this knob holds (`1:1` or `0:0`) fails.
 //! - `rm-noop`, `rm-fails`: a removing helper does nothing / fails.
 //! - `unpack-fails`: the unpacking helper (`__unpack-layers`) fails before it unpacks.
@@ -606,6 +608,10 @@ impl Fake {
             self.kill_action();
         }
         if self.has("delete-fails") {
+            // The container's state stays, which is what a refused delete leaves.
+            if let (Some(root), Some(id)) = (&call.root, call.rest.last()) {
+                let _ = std::fs::create_dir_all(root.join(String::from_utf8_lossy(id).as_ref()));
+            }
             return refuse("fake crun: delete refused", 1);
         }
         self.touch("removed");
@@ -621,6 +627,20 @@ impl Fake {
             let dir = self.lease_cgroup();
             add_mode(&dir, 0o200);
             remove_files(&dir);
+        }
+        if self.has("delete-vanished") {
+            // As crun fails when the `crun run` of a killed container deleted the state
+            // between the listing and the open (the cleaning above is the cgroup's).
+            if let (Some(root), Some(id)) = (&call.root, call.rest.last()) {
+                let dir = root.join(String::from_utf8_lossy(id).as_ref());
+                return refuse(
+                    &format!(
+                        "cannot open directory `{}`: No such file or directory",
+                        dir.display()
+                    ),
+                    1,
+                );
+            }
         }
         0
     }

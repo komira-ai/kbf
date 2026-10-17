@@ -257,3 +257,20 @@ pub(crate) fn prepare_rootfs(dir: &Path) -> std::io::Result<()> {
     }
     Ok(())
 }
+
+/// Copies the daemon's binary to `<scratch>/oci-bin/kbf-daemon` (mode 0755, replaced
+/// atomically) and returns that path. A helper with an action's ids cannot search the
+/// directories the binary was installed or built under (a home directory is 0750), but the
+/// scratch directory was checked to be searchable by others.
+pub(crate) fn install_daemon(scratch: &Path, daemon: &Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = scratch.join("oci-bin");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))?;
+    let staged = dir.join(format!(".kbf-daemon-{}", std::process::id()));
+    std::fs::copy(daemon, &staged)?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+    let target = dir.join("kbf-daemon");
+    std::fs::rename(&staged, &target)?;
+    Ok(target)
+}

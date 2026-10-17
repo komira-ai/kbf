@@ -279,9 +279,11 @@ impl Oci {
         }
         let helper_root = scratch.join("oci-helper");
         at(&helper_root, helper::prepare_rootfs(&helper_root)).map_err(prepare)?;
+        let daemon =
+            at(scratch, helper::install_daemon(scratch, &config.daemon)).map_err(prepare)?;
         let oci = Arc::new(Self {
             crun: crun::Crun::new(config.runtime.clone()),
-            daemon: config.daemon.clone(),
+            daemon,
             registry,
             ids,
             arch,
