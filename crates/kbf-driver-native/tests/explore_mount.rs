@@ -8,6 +8,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kbf_daemon::Runtime;
+macro_rules! say {
+    ($($t:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($t)*);
+    }};
+}
+
 use support::{MemoryCas, Spec, config, runtime, scratch, stderr, stdout, work};
 
 fn sh(label: &str, script: &str) {
@@ -16,7 +23,7 @@ fn sh(label: &str, script: &str) {
         .arg(script)
         .output()
         .expect("sh");
-    eprintln!(
+    say!(
         "=== {label}: {}\n{}{}",
         out.status,
         String::from_utf8_lossy(&out.stdout),
@@ -61,13 +68,13 @@ find "$HOME/Library" -maxdepth 6 2>/dev/null | head -40
         .await
         .expect("ends");
     match &ran {
-        Ok(r) => eprintln!(
+        Ok(r) => say!(
             "RAN exit={}\n{}\n{}",
             r.exit_code,
             stdout(&cas, r),
             stderr(&cas, r)
         ),
-        Err(e) => eprintln!("RUN ERR {e:?}"),
+        Err(e) => say!("RUN ERR {e:?}"),
     }
     sh("mounts after run", "mount | grep -i -E 'metal|DVT' | head");
     sh(
@@ -119,7 +126,7 @@ find "$HOME/Library" -maxdepth 6 2>/dev/null | head -40
     sh(
         "trace mach+mount",
         &format!(
-            "grep -i -E 'mach-lookup|mount|diskimage|mobile|asset' '{}' | sort -u | head -80",
+            "grep -i -E 'mach-lookup|mount|diskimage|mobile|asset' '{}' | sort -u | head -300",
             trace.display()
         ),
     );
