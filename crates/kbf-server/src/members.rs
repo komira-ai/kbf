@@ -11,6 +11,7 @@
 //! | `down/<id>` | nothing | `dwell` from the moment the member went `Down` |
 //! | `map` | the current `kbf.map.v1.Map` | for ever; a change is one compare-and-set |
 //! | `meta/members_formed` | nothing | for ever: the cluster has had an `Active` member |
+//! | `deny/<kind>/<value>` | the reason and the time it was added | for ever, until [`Members::allow`] |
 //!
 //! and the counters `member-id` and `boot/<id>`. The store assigns both numbers, so no
 //! node picks its identity; `(id, boot)` is the prefix of the node's object keys.
@@ -48,12 +49,25 @@
 //! its (public, sequential) id and boot, so the caller says whether it is the holder of the
 //! address ([`Members::heartbeat`]); the rpc layer answers that with the caller's
 //! certificate. The row is read, the holder asked and only then the boot compared.
+//!
+//! **Who is denied.** The `deny/` rows are the operator's deny list ([`Members::deny`],
+//! [`Members::allow`]). The key is the whole entry, `deny/<kind>/<value>` for a
+//! [`DenyEntry`] in its canonical spelling (`deny/serial/a1b`, `deny/spki-sha256/<64 hex>`,
+//! `deny/node/mac-07`), so an entry is one row whatever it was typed as (a node id in the
+//! lower case the operator API writes), and the value is only the reason and the time. [`Members::refresh`] folds the rows, sorted, into the
+//! map's `denied` list, and a change of that list alone is a new generation: every storage
+//! node is sent the map, and from the first call after it holds that generation refuses
+//! the certificates it names (`kbf_storage::service`'s `Admission`). The membership calls
+//! read the list themselves ([`crate::members_rpc`]): a `Register` the rows, so an entry
+//! counts at once, a `Heartbeat` the map. A node that is refused its beats lapses after
+//! the time to live like any silent one.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use kbf_map::{Map, MapError, Member, MemberId, MemberState, Rule};
+use kbf_map::{DenyEntry, Map, MapError, Member, MemberId, MemberState, Rule};
 use kbf_mapsync::MapSource;
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_state::{Cond, Store, StoreError, Txn, Version, Versioned};
@@ -68,6 +82,15 @@ const ID_COUNTER: &str = "member-id";
 const FORMED: &str = "meta/members_formed";
 /// Reads and commits tried before a call gives up on writers it keeps racing.
 const ATTEMPTS: usize = 16;
+/// The prefix of the deny list's rows.
+const DENY: &str = "deny/";
+/// The most entries the deny list holds: it is carried in every map a node is sent, so it
+/// is bounded. [`Members::deny`] refuses a new entry past it.
+pub const MAX_DENIED: usize = 4096;
+/// The longest value of a deny entry, in bytes: a DNS name is at most 253.
+const MAX_VALUE: usize = 253;
+/// The longest reason a deny entry is stored with, in bytes.
+const MAX_REASON: usize = 512;
 
 /// The newest protocol version this build speaks, and the lowest a registration may
 /// name (the map's `min_protocol`).
@@ -142,6 +165,16 @@ pub struct Registrant {
     pub progress: Progress,
 }
 
+/// The value of a `deny/` row: why the entry was added and when (the store's clock, in
+/// milliseconds since its origin).
+#[derive(Clone, PartialEq, prost::Message)]
+struct DenyRow {
+    #[prost(string, tag = "1")]
+    reason: String,
+    #[prost(uint64, tag = "2")]
+    at_ms: u64,
+}
+
 /// What a registration returns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Registration {
@@ -163,6 +196,9 @@ pub enum MembershipError {
     /// (see [`Members::heartbeat`]). The message gives no more than the member id.
     #[error("member {0} is not at an address the caller's certificate names")]
     NotHolder(MemberId),
+    /// The caller's certificate is on the deny list (the entry that names it).
+    #[error("denied: {0}")]
+    Denied(DenyEntry),
     /// The registration is malformed.
     #[error("invalid registration: {0}")]
     Invalid(&'static str),
@@ -263,6 +299,20 @@ fn instance_key(instance: &str) -> String {
     format!("instance/{instance}")
 }
 
+/// The row of a deny entry: `kind value` is the entry's canonical text, and the row is
+/// `deny/kind/value`. A node id may hold a `/`, a kind never does, so the first one splits.
+fn deny_key(entry: &DenyEntry) -> String {
+    format!("{DENY}{}", entry.to_string().replacen(' ', "/", 1))
+}
+
+/// The entry a `deny/` row's key spells.
+fn denied_entry(key: &str) -> Result<DenyEntry, MembershipError> {
+    key.strip_prefix(DENY)
+        .and_then(|rest| rest.split_once('/'))
+        .and_then(|(kind, value)| format!("{kind} {value}").parse().ok())
+        .ok_or_else(|| MembershipError::Corrupt(format!("deny row {key:?} is not an entry")))
+}
+
 /// What one refresh decided: the next map, who just went down, and what it read.
 struct Plan {
     map: Map,
@@ -270,12 +320,15 @@ struct Plan {
     guards: Vec<(MemberId, Cond)>,
 }
 
-/// The next map from the current one, the live rows and the live `down/` marks; `None`
-/// when it would not change (or there is no member to put in one). Pure.
+/// The next map from the current one, the live rows, the live `down/` marks and the deny
+/// list the `deny/` rows give (`denied`: every entry once, sorted); `None` when it would
+/// not change (or there is no member to put in one). A change of `denied` alone is a change.
+/// Pure.
 fn plan(
     current: Option<&Map>,
     rows: &BTreeMap<MemberId, Live>,
     marks: &BTreeSet<MemberId>,
+    denied: &[DenyEntry],
     config: &MembershipConfig,
 ) -> Result<Option<Plan>, MapError> {
     let mut members: BTreeMap<MemberId, Member> = rows
@@ -309,7 +362,9 @@ fn plan(
     let members: Vec<Member> = members.into_values().collect();
     let count = u8::try_from(members.len()).unwrap_or(u8::MAX);
     let r = config.replication.min(count);
-    if current.is_some_and(|c| c.members() == members.as_slice() && c.r() == r) {
+    if current
+        .is_some_and(|c| c.members() == members.as_slice() && c.r() == r && c.denied() == denied)
+    {
         return Ok(None);
     }
     let map = Map::new(
@@ -318,7 +373,7 @@ fn plan(
         Rule::Rendezvous,
         r,
         current.map_or(PROTOCOL, Map::min_protocol),
-        current.map_or_else(Vec::new, |c| c.denied().to_vec()),
+        denied.to_vec(),
     )?;
     Ok(Some(Plan {
         map,
@@ -605,6 +660,98 @@ impl Members {
         Err(MembershipError::Contended)
     }
 
+    /// Adds `entry` to the deny list, with the operator's `reason`. It reaches the map at the
+    /// next [`Members::refresh`] (the operator call runs one at once). An entry that is
+    /// listed already is left as it is, with its first reason and time. The entry is stored
+    /// as given: a node id is compared with a certificate's DNS names up to ASCII case, but
+    /// `Mac-07` and `mac-07` are two rows (the operator API lowercases a node id, so it
+    /// writes one).
+    ///
+    /// # Errors
+    /// [`MembershipError::Invalid`] for a value over 253 bytes or with a control character
+    /// in it, a node that is an IP address or has a colon (it would name no certificate:
+    /// only DNS names are compared), a reason over 512 bytes, or a new entry when
+    /// [`MAX_DENIED`] are listed; the store failing.
+    pub fn deny(&self, entry: &DenyEntry, reason: &str) -> Result<(), MembershipError> {
+        let (DenyEntry::Serial(value) | DenyEntry::SpkiSha256(value) | DenyEntry::Node(value)) =
+            entry;
+        if value.len() > MAX_VALUE {
+            return Err(MembershipError::Invalid(
+                "a deny entry's value is at most 253 bytes",
+            ));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(MembershipError::Invalid(
+                "a deny entry's value has no control character",
+            ));
+        }
+        if let DenyEntry::Node(node) = entry
+            && (node.contains(':') || node.parse::<IpAddr>().is_ok())
+        {
+            return Err(MembershipError::Invalid(
+                "a node entry is a DNS name, not an IP address or a host:port (a certificate's IP \
+                 names are not compared with it): list the certificate by serial or spki-sha256",
+            ));
+        }
+        if reason.len() > MAX_REASON {
+            return Err(MembershipError::Invalid(
+                "a deny entry's reason is at most 512 bytes",
+            ));
+        }
+        let listed = self.denied()?;
+        if listed.contains(entry) {
+            return Ok(());
+        }
+        if listed.len() >= MAX_DENIED {
+            return Err(MembershipError::Invalid(
+                "the deny list is full: allow an entry before denying another",
+            ));
+        }
+        let row = DenyRow {
+            reason: reason.to_owned(),
+            at_ms: u64::try_from(self.store.now().as_duration().as_millis()).unwrap_or(u64::MAX),
+        };
+        // A conflict is another writer's row for this very entry: denied, as asked.
+        let _won =
+            self.store
+                .txn(Txn::new().put(deny_key(entry), row.encode_to_vec(), Cond::Absent))?;
+        Ok(())
+    }
+
+    /// Removes `entry` from the deny list, from the next [`Members::refresh`] on. Whether it
+    /// was listed.
+    ///
+    /// # Errors
+    /// The store failing; [`MembershipError::Contended`].
+    pub fn allow(&self, entry: &DenyEntry) -> Result<bool, MembershipError> {
+        let key = deny_key(entry);
+        for _ in 0..ATTEMPTS {
+            let Some(stored) = self.store.get(&key)? else {
+                return Ok(false);
+            };
+            let txn = Txn::new().delete(&key, Cond::Version(stored.version));
+            if self.store.txn(txn)?.is_ok() {
+                return Ok(true);
+            }
+        }
+        Err(MembershipError::Contended)
+    }
+
+    /// The deny list as the rows give it now: every entry once, in the order `DenyEntry`
+    /// sorts (serials, then key hashes, then node ids). Not the map's, which lags the rows
+    /// by up to a refresh.
+    ///
+    /// # Errors
+    /// The store failing; [`MembershipError::Corrupt`] for a `deny/` row that is no entry
+    /// (the list is not guessed at: an entry dropped would let its caller back in).
+    pub fn denied(&self) -> Result<Vec<DenyEntry>, MembershipError> {
+        let mut entries = BTreeSet::new();
+        for (key, _) in self.store.scan_prefix(DENY)? {
+            entries.insert(denied_entry(&key)?);
+        }
+        Ok(entries.into_iter().collect())
+    }
+
     /// The current map, or `None` before the first member registered. This is what a
     /// map push (`Welcome.map`, `MapUpdate`) and a `STALE_MAP` answer read.
     ///
@@ -628,8 +775,10 @@ impl Members {
     }
 
     /// Brings the map up to date with the rows: members that expired go `Down`, `Down`
-    /// members whose dwell ran out leave, new and changed rows enter. Returns the map
-    /// after, and bumps the generation by one compare-and-set only if something changed.
+    /// members whose dwell ran out leave, new and changed rows enter, and the map's deny
+    /// list becomes the `deny/` rows ([`Members::denied`]). Returns the map after, and
+    /// bumps the generation by one compare-and-set only if something changed (an entry
+    /// added or removed is a change).
     ///
     /// # Errors
     /// The store failing; [`MembershipError::Contended`].
@@ -639,7 +788,10 @@ impl Members {
             let current = stored.as_ref().map(decode_map).transpose()?;
             let rows = self.read_rows()?;
             let marks = self.read_marks(current.as_ref())?;
-            let Some(plan) = plan(current.as_ref(), &rows, &marks, &self.config)? else {
+            // A deny written after this read is in the next refresh's map (the sweeper's,
+            // within a beat): a row that is not there yet cannot be a precondition.
+            let denied = self.denied()?;
+            let Some(plan) = plan(current.as_ref(), &rows, &marks, &denied, &self.config)? else {
                 current.iter().for_each(|m| self.publish(m));
                 return Ok(current);
             };

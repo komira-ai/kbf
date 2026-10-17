@@ -15,8 +15,15 @@
 //! call, an unreadable one refusing every call UNAVAILABLE). Without TLS every call is
 //! admitted, as on the storage listener.
 //!
+//! **Who is denied.** The operator's deny list, the `deny/` rows ([`Members::deny`]), is
+//! checked beside the file's. `Register` reads the rows themselves, so an entry counts from
+//! the moment it is written; `Heartbeat` reads the map's list, before it touches the row,
+//! so a refused beat does not renew it: the node goes `Down` after the time to live and
+//! leaves the write order, as a node that stopped beating would. Both refuse PERMISSION_DENIED,
+//! saying the entry.
+//!
 //! **Whose instance and address.** A storage certificate speaks for the hosts it names, its
-//! DNS and IP subjectAltNames ([`names_of`]). `Register` is refused PERMISSION_DENIED
+//! DNS and IP subjectAltNames ([`PeerNames`]). `Register` is refused PERMISSION_DENIED
 //! unless they cover the host of the `instance_id` and of the `addr` (`host` or
 //! `host:port`: [`host_of`]), so one node's certificate cannot register another's
 //! instance, which would take over its member id and supersede its heartbeats, nor
@@ -26,9 +33,10 @@
 
 use std::sync::Arc;
 
+use kbf_map::{DenyEntry, Map};
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_server::{Membership, MembershipServer};
-use kbf_storage::service::{Admission, PeerNames, PeerRole, host_of, names_of, role_of};
+use kbf_storage::service::{Admission, PeerNames, PeerRole, host_of, role_of};
 use tonic::{Request, Response, Status};
 
 use crate::identity::{DenyList, PeerCert};
@@ -66,40 +74,55 @@ impl MembershipService {
         MembershipServer::new(self)
     }
 
-    /// Admits the caller of `request`: its role, the deny list, and the names it holds
-    /// (`None` in plain text).
-    async fn admit<T>(&self, request: &Request<T>) -> Result<Option<PeerNames>, Status> {
+    /// Admits the caller of `request`: its role and the deny list file, and the certificate
+    /// that gives its names and what the operator's deny list is compared with (`None` in
+    /// plain text).
+    async fn admit<T>(&self, request: &Request<T>) -> Result<Option<PeerCert>, Status> {
         let certs = kbf_tls::peer_certs(request);
         let leaf = certs
             .as_deref()
             .and_then(|chain| chain.first())
             .map(AsRef::as_ref);
-        let names = self.admit_leaf(leaf)?;
-        if let (Some(_), Some(deny_list), Some(der)) = (&names, &self.deny_list, leaf) {
-            let peer = PeerCert::from_der(der).map_err(Status::unauthenticated)?;
+        let Some(peer) = self.admit_leaf(leaf)? else {
+            return Ok(None);
+        };
+        if let Some(deny_list) = &self.deny_list {
             deny_list.admit_cert(&peer).await?;
         }
-        Ok(names)
+        Ok(Some(peer))
     }
 
-    /// Admits a caller whose verified chain starts with `leaf`; the DNS and IP names it
-    /// holds, or `None` without mutual TLS.
+    /// Admits a caller whose verified chain starts with `leaf`; its certificate, or `None`
+    /// without mutual TLS.
     ///
     /// # Errors
-    /// Under mutual TLS, UNAUTHENTICATED without a certificate; PERMISSION_DENIED for any
-    /// role but `storage` (see [`role_of`]).
-    pub fn admit_leaf(&self, leaf: Option<&[u8]>) -> Result<Option<PeerNames>, Status> {
+    /// Under mutual TLS, UNAUTHENTICATED without a certificate or with one that does not
+    /// parse; PERMISSION_DENIED for any role but `storage` (see [`role_of`]).
+    pub fn admit_leaf(&self, leaf: Option<&[u8]>) -> Result<Option<PeerCert>, Status> {
         if self.admission == Admission::Open {
             return Ok(None);
         }
         let der = leaf.ok_or_else(|| Status::unauthenticated("no client certificate"))?;
         match role_of(der)? {
-            PeerRole::Storage => names_of(der).map(Some),
+            PeerRole::Storage => PeerCert::from_der(der)
+                .map(Some)
+                .map_err(Status::unauthenticated),
             other => Err(Status::permission_denied(format!(
                 "role {} may not register as a storage node",
                 other.name()
             ))),
         }
+    }
+}
+
+/// Refuses a caller whose certificate an entry of `denied` names.
+///
+/// # Errors
+/// [`MembershipError::Denied`], with the entry.
+fn refuse_denied(peer: &PeerCert, denied: &[DenyEntry]) -> Result<(), MembershipError> {
+    match peer.identity().denied_by(denied) {
+        Some(entry) => Err(MembershipError::Denied(entry.clone())),
+        None => Ok(()),
     }
 }
 
@@ -121,7 +144,9 @@ fn covered(names: &PeerNames, field: &str, value: &str) -> Result<(), Status> {
 fn status(e: MembershipError) -> Status {
     let message = e.to_string();
     match e {
-        MembershipError::NotHolder(_) => Status::permission_denied(message),
+        MembershipError::NotHolder(_) | MembershipError::Denied(_) => {
+            Status::permission_denied(message)
+        }
         MembershipError::Invalid(_) => Status::invalid_argument(message),
         MembershipError::Protocol { .. } | MembershipError::Superseded { .. } => {
             Status::failed_precondition(message)
@@ -152,14 +177,15 @@ impl Membership for MembershipService {
         &self,
         request: Request<pb::RegisterRequest>,
     ) -> Result<Response<pb::RegisterResponse>, Status> {
-        let names = self.admit(&request).await?;
+        let peer = self.admit(&request).await?;
         let req = request.into_inner();
         if pb::Role::try_from(req.role) != Ok(pb::Role::Storage) {
             return Err(Status::invalid_argument(
                 "role must be ROLE_STORAGE: only storage nodes register",
             ));
         }
-        if let Some(names) = &names {
+        if let Some(peer) = &peer {
+            let names = peer.identity().names();
             covered(names, "instance_id", &req.instance_id)?;
             covered(names, "addr", &req.addr)?;
         }
@@ -172,7 +198,15 @@ impl Membership for MembershipService {
             progress: Progress::from_wire(req.catching_up),
         };
         let members = Arc::clone(&self.members);
-        let joined = blocking(move || members.register(&who)).await?;
+        let joined = blocking(move || {
+            // The rows, not the map: an entry counts from the moment it is written, and a
+            // refusal comes before the member is assigned an id or a boot.
+            if let Some(peer) = &peer {
+                refuse_denied(peer, &members.denied()?)?;
+            }
+            members.register(&who)
+        })
+        .await?;
         let beat = self.members.config().beat();
         Ok(Response::new(pb::RegisterResponse {
             member_id: joined.id.0,
@@ -186,18 +220,23 @@ impl Membership for MembershipService {
         &self,
         request: Request<pb::HeartbeatRequest>,
     ) -> Result<Response<pb::HeartbeatResponse>, Status> {
-        let names = self.admit(&request).await?;
+        let peer = self.admit(&request).await?;
         let req = request.into_inner();
         let members = Arc::clone(&self.members);
         let id = kbf_map::MemberId(req.member_id);
         let have = req.have_generation;
         let progress = Progress::from_wire(req.catching_up);
         let (map_generation, map) = blocking(move || {
+            if let Some(peer) = &peer {
+                // The map's list, read before the row is touched: a refused beat must not
+                // renew the row, or a denied node would never lapse.
+                let map = members.current_map()?;
+                refuse_denied(peer, map.as_ref().map_or(&[][..], Map::denied))?;
+            }
             // In plain text there are no names, and any caller holds any member.
             let holds = |addr: &str| {
-                names
-                    .as_ref()
-                    .is_none_or(|names| names.covers(host_of(addr)))
+                peer.as_ref()
+                    .is_none_or(|peer| peer.identity().names().covers(host_of(addr)))
             };
             let generation = members.heartbeat(id, req.boot, progress, Some(&holds))?;
             // Read only for a node that is behind: most beats carry no map.

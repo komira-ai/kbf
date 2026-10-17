@@ -23,7 +23,7 @@ reports again after its next `Welcome`.
 
 ## Who may write
 
-A write (cordon, drain, uncordon, a member's state) can take every node in the fleet out of service, so
+A write (cordon, drain, uncordon, a member's state, a deny list entry) can take every node in the fleet out of service, so
 it must come from an operator. Where a request comes from does not show that:
 
 - **Every server host is also a worker.** Build actions run on it, and they can reach
@@ -222,6 +222,78 @@ So promote a joiner when its slice is expected to be empty or its blobs are chea
 rebuild (a new cluster, a cache), or have it hold the slice first; and promote one
 member at a time. `draining` is the reverse: the member takes no new writes, its
 successor takes its slot at once, and it is read first.
+
+## `POST /v1/denied` and `DELETE /v1/denied`
+
+An operator adds an entry to the storage deny list, or takes one off. A denied
+certificate is refused by every storage node on every method, and by the membership
+service ([architecture-v2.md](design/architecture-v2.md) section 9 and section 6,
+Admission). An entry names:
+
+| Entry | Names |
+|---|---|
+| `serial <hex>` | the certificate with that serial (colons, case and leading zeros ignored) |
+| `spki-sha256 <64 hex>` | every certificate with that public key, whatever its serial (`openssl x509 -noout -pubkey \| openssl pkey -pubin -outform DER \| sha256sum`) |
+| `node <id>` | every certificate that carries `<id>` as a DNS name, compared up to ASCII case |
+
+A `node` entry names DNS names only. A certificate's IP names are never compared with it,
+nor is a name with a trailing dot or a port, so a `node` entry that holds an IP address or a
+colon (an IPv6 address, or a member's `host:port`) is `400`: list that certificate by
+`serial` or `spki-sha256`, which also name a certificate that has no DNS name.
+
+`POST /v1/denied` takes `{"entry": "node mac-07", "reason": "retired"}`. Both fields are
+required (an empty reason is `400`: a deny is never anonymous), and any other field is `400`. The
+entry is spelled as a line of the deny list file is; it is stored in its canonical form (a
+serial in lower case without colons or leading zeros, a node id in lower case), so one entry
+is one row whatever it was typed as (`node Mac-07` and `node mac-07` are one entry, and
+either spelling takes it off). The reason is at most 512 bytes and the entry's value at most
+253, with no control character in it; the list
+holds at most 4096 entries (`400` past any of them: take one off first). The answer is
+`{"entry": "serial a1b", "generation": G}`: the entry as stored, and the generation of the
+map that holds it, which the call builds before it answers (`0` before any member has
+registered; the entry is in the first map then). An entry that is listed already answers
+`200` and keeps its first reason.
+
+`DELETE /v1/denied?entry=<entry>` takes the entry off (percent-encode it, or use `+` for the
+space): `200` with the same answer, `404` if it is not listed, `400` with no `entry` or one
+that is not an entry.
+
+Both need a token, a loopback peer, no `Origin` and `Content-Type: application/json` (a
+`DELETE` sends the header and no body), as every write does ([Who may
+write](#who-may-write)); `404` on a server without a state store; `503` when the state
+store cannot be written. A `503` that comes after the row was written leaves the row, and
+the map follows at the next beat.
+
+**When it takes effect.** On the storage nodes, from the first call after a node holds the
+generation the answer names: a node learns a new generation with its next heartbeat
+(a third of the member time to live, 5 s by default). A node that has no map enforces
+nothing: one that takes a map from a frontend (`--frontend`) serves nothing until it has one,
+but a standalone storage node, which has no map source, serves every call and enforces no
+entry. At the membership service, a `Register` counts the entry at once, and a
+`Heartbeat` from the first call after the map holds it; a denied node's row is not renewed,
+so the member is `down` after the time to live and leaves the map after the dwell. Until
+then the frontends still route to it, and the other nodes already refuse its copies, so a
+write it is the primary for fails in that window. The entries are in the map every node
+receives, which `GET /v1/members` does not show.
+
+**What it does not cut.** The entry is applied to the storage nodes and to the membership
+service, not to the worker listener: a daemon whose certificate is denied here loses its
+storage access but keeps its work stream, and goes on receiving actions (their commands,
+environments and input digests), and its blob calls on that listener are served, until it
+is listed in `--worker-deny-list`, the file that listener reads
+([worker-protocol.md](design/worker-protocol.md)). To take a daemon off the farm, list it in
+both. There is no `GET /v1/denied` either: the reasons are kept in the store, and the list
+itself is in the map.
+
+**Locking yourself out.** An entry that names the frontend's own certificate (by serial or
+key, or a `node` that is the name in it) makes every storage node refuse the frontend. The
+way back is `DELETE /v1/denied`, which goes through this API and not through a certificate.
+
+**Upgrading.** Upgrade every storage node and every frontend before relying on an entry. A
+storage node that predates the list ignores it, and the checks at `Register` and `Heartbeat`
+are the frontend's, so a denied storage node can still register and beat through a frontend
+that predates them. A frontend that predates the list copies it forward in the map
+unchanged.
 
 ## `GET /v1/frontend/drain` and `POST /v1/frontend/drain`
 

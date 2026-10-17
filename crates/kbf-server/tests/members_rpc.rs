@@ -222,17 +222,18 @@ fn only_the_storage_role_may_register() {
     let certified = MembershipService::new(Arc::clone(&members), Admission::Certified);
     let open = MembershipService::new(members, Admission::Open);
     assert_eq!(open.admit_leaf(None).expect("open"), None);
-    let names = certified
+    let named = certified
         .admit_leaf(Some(&leaf("storage", &["node-a"])))
         .expect("admitted")
-        .expect("a certified caller has names");
+        .expect("a certified caller has a certificate");
+    let names = named.identity().names();
     assert_eq!(names.to_string(), "node-a");
     assert!(names.covers("node-a") && !names.covers("storage"));
     let nameless = certified
         .admit_leaf(Some(&leaf("storage", &[])))
         .expect("the role is all this checks")
-        .expect("names");
-    assert_eq!(nameless.to_string(), "no DNS or IP name");
+        .expect("a certificate");
+    assert_eq!(nameless.identity().names().to_string(), "no DNS or IP name");
     for role in ["daemon", "frontend"] {
         let e = certified
             .admit_leaf(Some(&leaf(role, &["node-a"])))
