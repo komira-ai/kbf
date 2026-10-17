@@ -325,8 +325,7 @@ async fn a_certificate_for_one_node_cannot_open_another_nodes_session() {
 /// that is not one, no role, or two; each refused PERMISSION_DENIED. The control: the
 /// same node with the daemon role is welcomed.
 ///
-/// Mutants seen red: the role check removed from `Peers::peer`; its compare inverted
-/// (`role == WORKER_LISTENER_ROLE` refused).
+/// Mutant seen red: the role table's layer left off the worker listener.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn only_a_daemon_certificate_opens_a_session() {
     let pki = Pki::new("roles");
@@ -358,7 +357,7 @@ async fn only_a_daemon_certificate_opens_a_session() {
 /// certificates from the same CA, both naming node-a: frontend first, daemon second,
 /// is refused PERMISSION_DENIED; daemon first, frontend second, is welcomed.
 ///
-/// Mutant seen red: `chain.first()` read as `chain.last()` in the session handler.
+/// Mutant seen red: `chain.first()` read as `chain.last()` in the role table's layer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_session_reads_the_role_from_the_leaf_certificate_alone() {
     let pki = Pki::new("leaf-role");

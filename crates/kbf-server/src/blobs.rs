@@ -6,9 +6,10 @@
 //!
 //! Every call of both services is admitted before it is served, by one rule
 //! ([`admit`], over [`crate::identity`]): the listener serves mutual TLS, the call's
-//! client certificate names the daemon role and no other, it names exactly one node,
-//! and neither the certificate (serial,
-//! public key) nor that node is on the deny list, looked at again for this call. A
+//! client certificate names exactly one node, and neither the certificate (serial,
+//! public key) nor that node is on the deny list, looked at again for this call. Before
+//! that, the listener's role table ([`crate::worker_roles`]) took the call from a
+//! certificate naming the daemon role alone. A
 //! streamed request (a Write, a RegisterChunkMapping) is refused before its first
 //! message is read. Under plain text every call is refused UNAUTHENTICATED. An
 //! admitted call is served as the REAPI listener serves it; the chunking calls answer
@@ -17,7 +18,8 @@
 //! `kbf.worker.v1.Segments` ([`WorkerSegments`]: segment upload and segment-range
 //! reads, `docs/design/write-path.md`, section 4) is admitted by the same rule.
 //!
-//! `Execution`, `ActionCache` and `Capabilities` answer UNIMPLEMENTED on this listener.
+//! `Execution`, `ActionCache` and `Capabilities` are not in the role table, so this
+//! listener refuses them PERMISSION_DENIED.
 
 use kbf_front::{ByteStreamService, CasService, MetaLog, SegmentsService};
 use kbf_objstore::ObjectStore;

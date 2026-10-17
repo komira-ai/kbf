@@ -85,7 +85,7 @@ Options:
           PEM private key of the worker listener
 
       --worker-client-ca <WORKER_CLIENT_CA>
-          PEM CA that daemon client certificates must chain to. Each must also name the daemon role (`urn:kbf:role:daemon`), so a frontend or storage certificate from the same CA is refused on this listener
+          PEM CA that client certificates must chain to. Each must also name the role the method it calls takes: the daemon role (`urn:kbf:role:daemon`) for the worker session and blob calls, the storage role (`urn:kbf:role:storage`) for `kbf.map.v1.Membership`; a frontend certificate may call nothing here
 
       --worker-deny-list <WORKER_DENY_LIST>
           The worker listener's deny list: certificate serials, public keys and node ids it refuses (format in the `identity` module docs). Read at start, then again at every `Hello` and `Heartbeat`, so an edit takes effect without a restart. Needs mutual TLS

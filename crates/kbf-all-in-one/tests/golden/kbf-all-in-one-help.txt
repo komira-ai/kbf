@@ -186,7 +186,7 @@ Options:
           [default: 268435456]
 
       --worker-client-ca <WORKER_CLIENT_CA>
-          PEM CA that daemon client certificates must chain to. Each must also name the daemon role (`urn:kbf:role:daemon`), so a frontend or storage certificate from the same CA is refused on this listener
+          PEM CA that client certificates must chain to. Each must also name the role the method it calls takes: the daemon role (`urn:kbf:role:daemon`) for the worker session and blob calls, the storage role (`urn:kbf:role:storage`) for `kbf.map.v1.Membership`; a frontend certificate may call nothing here
 
       --transfer-memory-blob-bytes <BYTES>
           The largest input file fetched through memory, where every lease asking for it at once shares one fetch; a larger one is streamed into its file

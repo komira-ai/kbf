@@ -2,12 +2,9 @@
 //! the deny list (issue #79). The same rules admit a worker stream and each blob call
 //! a daemon makes on that listener ([`crate::blobs`]).
 //!
-//! **The role.** Under mutual TLS every caller's certificate must name the daemon role,
-//! and only it ([`WORKER_LISTENER_ROLE`]; one `urn:kbf:role:daemon` URI subjectAltName,
-//! read by `kbf-peer` as the storage service reads it): a frontend's or a storage node's
-//! certificate from the same CA opens no session and makes no blob call here, and a
-//! certificate with no role or two is refused PERMISSION_DENIED before its node name
-//! and the deny list are looked at.
+//! **The role** is checked before any of this, per method, by the listener's table
+//! ([`crate::worker_roles`]): a worker stream or a blob call reaches these rules only
+//! from a certificate naming the daemon role.
 //!
 //! **The rule.** Under mutual TLS a daemon's client certificate must carry exactly one
 //! DNS name in its subjectAltName extension, and that name must equal, byte for byte,
@@ -41,15 +38,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kbf_map::{DenyEntry, normalize_serial};
-use kbf_storage::service::{PeerRole, role_of};
 use sha2::{Digest, Sha256};
 use tonic::Status;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
-
-/// The one role the worker listener takes (section 9 of
-/// `docs/design/architecture-v2.md`): its worker stream and its blob calls are a
-/// daemon's. A frontend or storage certificate from the same CA is refused there.
-pub const WORKER_LISTENER_ROLE: PeerRole = PeerRole::Daemon;
 
 /// What the server takes from a daemon's client certificate.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,28 +138,18 @@ pub enum Peers {
 
 impl Peers {
     /// The certificate of a new stream or blob call, from the chain TLS verified (`leaf`
-    /// is its first certificate; `None` in plain text). Under mutual TLS it must name
-    /// the daemon role, and no other: every call on the worker listener asks this first.
+    /// is its first certificate; `None` in plain text). Its role was checked before the
+    /// call was routed ([`crate::worker_roles`]).
     ///
     /// # Errors
     /// UNAUTHENTICATED: under mutual TLS, there is no certificate or it does not parse.
-    /// PERMISSION_DENIED: it names no role, several, or one that is not
-    /// [`WORKER_LISTENER_ROLE`].
     pub fn peer(&self, leaf: Option<&[u8]>) -> Result<Option<PeerCert>, Status> {
         match (self, leaf) {
             (Self::Unauthenticated, _) => Ok(None),
             (Self::Certified { .. }, None) => Err(Status::unauthenticated("no client certificate")),
-            (Self::Certified { .. }, Some(der)) => {
-                let peer = PeerCert::from_der(der).map_err(Status::unauthenticated)?;
-                let role = role_of(der)?;
-                if role != WORKER_LISTENER_ROLE {
-                    return Err(Status::permission_denied(format!(
-                        "role {role} may not call the worker listener; only \
-                         {WORKER_LISTENER_ROLE} may"
-                    )));
-                }
-                Ok(Some(peer))
-            }
+            (Self::Certified { .. }, Some(der)) => PeerCert::from_der(der)
+                .map(Some)
+                .map_err(Status::unauthenticated),
         }
     }
 

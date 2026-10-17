@@ -206,42 +206,6 @@ fn a_certified_listener_needs_a_readable_certificate() {
     assert_eq!(peer.serial(), "7");
 }
 
-/// Catches a worker listener that takes any certificate its client CA signed: a
-/// frontend's or a storage node's (same CA, the right node name), one naming a role
-/// that is not one, none (the node name alone), or two, each refused PERMISSION_DENIED
-/// with the reason; and plain text, which has no certificate to read, left as it is.
-/// The daemon role is the one taken, also when spelled beside the node name.
-#[test]
-fn a_certified_listener_takes_the_daemon_role_alone() {
-    let certified = Peers::Certified { deny_list: None };
-    let node = || dns("node-a");
-    for (sans, why) in [
-        (vec![node(), role("frontend")], "role frontend may not"),
-        (vec![node(), role("storage")], "role storage may not"),
-        (vec![node(), role("admin")], "\"admin\" is not a role"),
-        (vec![node()], "exactly one role"),
-        (vec![node(), dns("urn:kbf:role:daemon")], "exactly one role"),
-        (vec![node(), role("daemon"), role("storage")], "names 2"),
-        (vec![node(), role("daemon"), role("daemon")], "names 2"),
-    ] {
-        let der = cert(sans.clone(), "node-a", &[9]);
-        let refused = certified.peer(Some(&der)).expect_err("refused");
-        assert_eq!(refused.code(), Code::PermissionDenied, "{sans:?}");
-        assert!(
-            refused.message().contains(why),
-            "{sans:?}: {}",
-            refused.message()
-        );
-        assert_eq!(
-            Peers::Unauthenticated.peer(Some(&der)).expect("plain"),
-            None
-        );
-    }
-    let daemon = cert(vec![role("daemon"), node()], "node-a", &[9]);
-    let peer = certified.peer(Some(&daemon)).expect("a daemon");
-    assert_eq!(peer.expect("some").node().expect("one node"), "node-a");
-}
-
 /// Catches (issue #79): the node check skipped at admission, the deny list read only
 /// when the server starts (an entry added later must refuse the next check), and a
 /// deny list that breaks after start letting every stream through (it must fail

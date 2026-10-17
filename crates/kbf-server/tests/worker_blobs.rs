@@ -699,8 +699,7 @@ async fn a_certificate_must_name_exactly_one_node() {
 /// calls, the `Segments` calls and the chunking calls, is refused PERMISSION_DENIED; the
 /// control is the same node with the daemon role, served.
 ///
-/// Mutants seen red: the role check removed from `Peers::peer`; its compare inverted;
-/// `admit` left out of `WorkerBlobs::read` alone (Read answers for every role).
+/// Mutant seen red: the role table's layer left off the worker listener.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_blob_call_refuses_a_certificate_that_is_not_a_daemons() {
     let pki = Pki::new("roles");
@@ -738,7 +737,7 @@ async fn every_blob_call_refuses_a_certificate_that_is_not_a_daemons() {
 /// second, has every call refused PERMISSION_DENIED; daemon first, frontend second,
 /// is served.
 ///
-/// Mutant seen red: `chain.first()` read as `chain.last()` in the blob calls' `admit`.
+/// Mutant seen red: `chain.first()` read as `chain.last()` in the role table's layer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_blob_call_reads_the_role_from_the_leaf_certificate_alone() {
     let pki = Pki::new("leaf-role");
@@ -821,6 +820,7 @@ async fn chunking_calls_are_admitted_first_and_then_unimplemented() {
 
 /// Catches: REAPI services other than the daemons' two served on the worker listener:
 /// a node certificate must not Execute, read the action cache, or ask for capabilities.
+/// None of them is in the listener's role table, so each is refused PERMISSION_DENIED.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_worker_listener_serves_no_other_reapi_service() {
     let pki = Pki::new("only-blobs");
@@ -852,7 +852,7 @@ async fn the_worker_listener_serves_no_other_reapi_service() {
         ("GetCapabilities", capabilities),
     ] {
         let code = result.expect_err(call).code();
-        assert_eq!(code, Code::Unimplemented, "{call}");
+        assert_eq!(code, Code::PermissionDenied, "{call}");
     }
 }
 

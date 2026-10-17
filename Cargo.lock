@@ -1978,6 +1978,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "tonic",
+ "tonic-prost",
+ "tower-layer",
  "tracing",
  "tracing-core",
  "tracing-subscriber",
