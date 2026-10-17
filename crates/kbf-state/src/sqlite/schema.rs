@@ -11,7 +11,7 @@ use super::SqliteError;
 pub const SCHEMA_VERSION: i64 = 1;
 
 /// How long a connection waits for a lock another connection holds (a checkpoint).
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The feed row kinds, stored as integers.
 pub(super) const KIND_PUT: i64 = 0;

@@ -9,9 +9,15 @@
 //! that decode their messages, which are bounded by the gRPC message limit, to split
 //! them by owner.
 //!
-//! **Routing** is [`Owners::for_digest`], the one place that maps a digest to the nodes
-//! that hold it. It answers one fixed list today (a farm of one node); routing by digest
-//! replaces it alone.
+//! **Routing** is [`Owners`], the one place that maps a digest to the nodes that hold it.
+//! With a map ([`Owners::routed`], `kbf frontend` with members) the nodes are the map's
+//! for the digest and the whole-blob calls (the batch calls and the action cache) are the
+//! router's: the generation tag, the `STALE_MAP` rule, the digest check at every owner and
+//! failover (`kbf-route`). The raw ByteStream path asks the same map for the nodes
+//! ([`Owners::for_digest`] for a read, the writer for an upload and a status query) and
+//! tells the node the generation it routed by, but holds no blob to check and does not
+//! run a call again on `STALE_MAP`. Without a map, or with a one-member map, the nodes are
+//! the fixed list `--storage` names.
 //!
 //! **Authorization** is the cache's (`kbf_auth::Authorizers`): the tonic services ask it
 //! as the cache's services do, and the raw path asks the same authorizer, of the
@@ -19,11 +25,11 @@
 //! authentication layer found.
 //!
 //! **Execute and the scheduler** read and write the same nodes through
-//! [`crate::Backend::remote`] (`kbf frontend`); `kbf-server --storage` still gives them
-//! its local cache. **Mutual TLS** to the nodes is the channel the proxy is given
+//! [`crate::Backend::routed`] (`kbf frontend`; [`crate::Backend::remote`] without
+//! members); `kbf-server --storage` still gives them its local cache. **Mutual TLS** to the nodes is the channel the proxy is given
 //! (`kbf-server`'s `frontend` module builds it); the proxy dials nothing itself.
 //!
-//! **Not here yet:** GetTree, routing by digest (av2-09).
+//! **Not here yet:** GetTree.
 
 mod ac;
 mod body;
