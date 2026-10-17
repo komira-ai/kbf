@@ -74,25 +74,59 @@ async fn a_digest_no_store_could_hold_is_missing_without_a_call() {
 
 /// Catches bytes written to the file that are not checked against the digest: a node
 /// that answers other bytes than the blob's is `Corrupt`, naming the digest of what it
-/// sent; a node that answers the blob's bytes is read into the file.
+/// sent, whether they are another length or the blob's own (a check of the length alone
+/// passes the second); a node that answers the blob's bytes is read into the file.
 #[tokio::test]
 async fn read_to_checks_the_bytes_it_writes() {
     let honest = b"the blob that was asked for".to_vec();
     let digest = digest_of(&honest);
     let path = scratch().join("kbf-routed-read-to");
 
-    let fake = Fake::new(b"some other bytes entirely");
-    let cas = plane(&fake, &TransferConfig::default());
-    let mut file = tokio::fs::File::create(&path).await.expect("a file");
-    let error = cas.read_to(&digest, &mut file).await.expect_err("lies");
-    let sent = digest_of(b"some other bytes entirely");
-    assert_eq!(error, CasError::Corrupt(label(&digest), label(&sent)));
+    for lie in [
+        &b"some other bytes entirely"[..],
+        &b"the blob that was asked fox"[..],
+    ] {
+        let fake = Fake::new(lie);
+        let cas = plane(&fake, &TransferConfig::default());
+        let mut file = tokio::fs::File::create(&path).await.expect("a file");
+        let error = cas.read_to(&digest, &mut file).await.expect_err("lies");
+        assert_eq!(
+            error,
+            CasError::Corrupt(label(&digest), label(&digest_of(lie)))
+        );
+    }
+    assert_eq!(
+        honest.len(),
+        b"the blob that was asked fox".len(),
+        "a lie of the same length"
+    );
 
     let fake = Fake::new(&honest);
     let cas = plane(&fake, &TransferConfig::default());
     let mut file = tokio::fs::File::create(&path).await.expect("a file");
     cas.read_to(&digest, &mut file).await.expect("read");
     assert_eq!(std::fs::read(&path).expect("the file"), honest);
+}
+
+/// Catches a blob read into memory that is not checked against the digest (the router
+/// compared the length alone): a node that answers the blob's length of other bytes is
+/// `Corrupt`, naming the digest of what it sent, and the bytes are not returned; a node
+/// that answers the blob's own bytes is read.
+#[tokio::test]
+async fn get_checks_the_bytes_it_returns() {
+    let honest = b"the blob that was asked for".to_vec();
+    let digest = digest_of(&honest);
+    let lie = b"the blob that was asked fox";
+    assert_eq!(honest.len(), lie.len(), "a lie of the same length");
+
+    let cas = plane(&Fake::new(lie), &TransferConfig::default());
+    assert_eq!(
+        cas.get(&digest).await,
+        Err(CasError::Corrupt(label(&digest), label(&digest_of(lie))))
+    );
+
+    let cas = plane(&Fake::new(&honest), &TransferConfig::default());
+    assert_eq!(cas.get(&digest).await, Ok(honest));
 }
 
 /// Catches a write error lost: a file that cannot be written fails the read with `Write`,
