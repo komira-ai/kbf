@@ -34,6 +34,7 @@
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::BuildHasher;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -58,10 +59,12 @@ use tonic::{Code, Status};
 
 mod beat;
 mod durable;
+mod handover;
 mod phase;
 mod record;
 
 pub use durable::{DONE_FLOOR, EpochPolicy, SESSION_RENEWAL, StateError};
+pub use handover::LOST_LOOKS;
 pub use phase::Reported;
 
 use self::durable::Durable;
@@ -119,6 +122,8 @@ pub struct Farm {
     epoch_unix_ms: u64,
     /// The action shapes this process has described ([`action_usage`]).
     shapes: Shapes,
+    /// `Result`s being taken now ([`Farm::report`]): a handover waits for none to be.
+    reports: AtomicUsize,
     state: Mutex<State>,
 }
 
@@ -219,6 +224,12 @@ struct State {
     store_down: bool,
     /// When each node's session row in the state store was last written.
     renewed: BTreeMap<WorkerId, FarmTime>,
+    /// A handover took the work from this farm ([`Farm::fence`]): it feeds the scheduler
+    /// nothing and queues nothing.
+    fenced: bool,
+    /// For each operation a successor is followed on ([`Farm::follow`]), how many looks
+    /// in a row found it neither unfinished nor ended.
+    looks: BTreeMap<OperationId, u8>,
 }
 
 /// What a finished operation tells its callers, and the action-cache entry to write
@@ -263,6 +274,7 @@ impl Farm {
             epoch: tokio::time::Instant::now(),
             epoch_unix_ms: unix_ms(),
             shapes: Shapes::default(),
+            reports: AtomicUsize::new(0),
             state: Mutex::new(State {
                 sched,
                 machine: FarmMachine::new(term),
@@ -277,6 +289,8 @@ impl Farm {
                 unsettled: Vec::new(),
                 store_down: false,
                 renewed: BTreeMap::new(),
+                fenced: false,
+                looks: BTreeMap::new(),
             }),
         }
     }
@@ -514,6 +528,8 @@ impl Farm {
         };
         tracing::info!(%worker, ?action, "operator action");
         state.feed_quiet(now, event);
+        let at = self.epoch_unix_ms.saturating_add(now.as_millis());
+        state.durably("a cordon", |d| d.cordoned(worker, action.stored(at)));
         Ok(self.node(&state, worker))
     }
 
@@ -591,6 +607,7 @@ impl Farm {
     /// the acknowledgement, or `None` for a `Result` without a lease id.
     pub async fn report(&self, worker: &WorkerId, result: worker::Result) -> Option<ResultAck> {
         let wire_lease = result.lease_id?;
+        let _taking = self.in_flight();
         let lease = LeaseId::new(wire_lease.term, wire_lease.seq);
         let refused = ResultAck {
             lease_id: Some(wire_lease),
@@ -950,10 +967,10 @@ impl State {
         );
     }
 
-    /// Feeds `event`, then a tick (so placement follows at once), and carries out the
-    /// effects in order. Returns the answers, for the caller to deliver once the lock
-    /// is released.
-    fn feed(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
+    /// [`State::feed`] on a farm that is not fenced: feeds `event`, then a tick (so
+    /// placement follows at once), and carries out the effects in order. Returns the
+    /// answers, for the caller to deliver once the lock is released.
+    fn carry_out(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
         self.watch_store(now);
         let mut effects: VecDeque<Effect> = self.sched.apply(Input::new(now, event)).into();
         effects.extend(self.sched.apply(Input::new(now, Event::Tick)));

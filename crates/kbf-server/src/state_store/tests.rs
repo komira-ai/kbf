@@ -111,6 +111,42 @@ fn every_open_takes_the_next_writer_generation_and_fences_the_one_before() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Catches: a successor that takes a store it was not told about, and one that does not
+/// keep the epoch: opened after a handover it takes only the generation it expects (a
+/// restored or swapped file, or a file another writer has taken since, is refused and
+/// nothing is written), and it keeps the epoch of the store (so the daemons that
+/// reconnect keep the runs of their leases), where an open of any other kind bumps it.
+/// The path it names is the file.
+#[test]
+fn a_store_opened_after_a_handover_expects_its_generation_and_keeps_the_epoch() {
+    use kbf_state::GENERATION;
+    let dir = scratch("handover");
+    let uri = StateStoreUri::Sqlite(dir.join("state.db"));
+    assert_eq!(uri.path(), dir.join("state.db"));
+    let holder = uri.open().expect("opened");
+    assert_eq!(holder.epoch, EpochPolicy::Bump);
+    drop(holder);
+
+    let generation = |state: &StateStore| {
+        let row = state.store.get(GENERATION).expect("read").expect("a row");
+        u64::from_be_bytes(row.value.try_into().expect("8 bytes"))
+    };
+    let refused = uri
+        .open_after_handover(7)
+        .err()
+        .expect("not the generation");
+    assert!(
+        matches!(&refused, StateError::Open(why) if why.contains("generation 1, not the expected 7")),
+        "{refused:?}"
+    );
+    let successor = uri
+        .open_after_handover(1)
+        .expect("the generation it was told");
+    assert_eq!(successor.epoch, EpochPolicy::Keep);
+    assert_eq!(generation(&successor), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Catches: a scheduler that opened a store with a generation row it cannot read taking
 /// the file anyway.
 #[test]
