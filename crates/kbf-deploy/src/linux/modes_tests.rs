@@ -104,12 +104,59 @@ fn every_mode_but_the_frontend_is_built() {
     );
 }
 
+/// Catches rule `stop` skipped for a mode that drains (a storage node finishes its large
+/// Writes at stop; systemd's 90 s default would cut them) or applied to the daemon,
+/// which abandons its leases on SIGTERM.
+#[test]
+fn every_mode_but_the_daemon_drains() {
+    let drains: Vec<_> = Mode::ALL.iter().filter(|m| m.drains()).collect();
+    assert_eq!(
+        drains,
+        [
+            &Mode::Frontend,
+            &Mode::Storage,
+            &Mode::StorageAndDaemon,
+            &Mode::AllInOne
+        ]
+    );
+}
+
 /// Each row plants one defect in one mode's template; the check must fail exactly the
 /// rule meant for it, with this message. `from` must occur once in the template.
 #[test]
 fn each_planted_defect_turns_its_rule_red() {
     let c = config();
-    let rows: [(Mode, &str, &str, &str); 14] = [
+    let rows: [(Mode, &str, &str, &str); 19] = [
+        (
+            Mode::Frontend,
+            "TimeoutStopSec=infinity\n",
+            "TimeoutStopSec=90s\n",
+            "FAIL stop: kbf-frontend.service has TimeoutStopSec=90s, not TimeoutStopSec=infinity: systemd kills kbf when it runs out, before the drain ends, and every build in flight fails",
+        ),
+        (
+            Mode::AllInOne,
+            "KillSignal=SIGTERM\n",
+            "KillSignal=SIGINT\n",
+            "FAIL stop: kbf-all-in-one.service has KillSignal=SIGINT, not KillSignal=SIGTERM: kbf drains on SIGTERM",
+        ),
+        (
+            Mode::Storage,
+            "TimeoutStopSec=infinity\n",
+            "",
+            "FAIL stop: kbf-storage.service gives no TimeoutStopSec=infinity: systemd kills kbf after its default 90 s, before the drain ends, and every build in flight fails",
+        ),
+        (
+            Mode::StorageAndDaemon,
+            "KillSignal=SIGTERM\n",
+            "KillSignal=SIGINT\n",
+            "FAIL stop: kbf-storage-and-daemon.service has KillSignal=SIGINT, not KillSignal=SIGTERM: kbf drains on SIGTERM",
+        ),
+        (
+            Mode::AllInOne,
+            "--api-listen=127.0.0.1:@KBF_API_PORT@",
+            "--api-listen=127.0.0.1:@KBF_WORKER_PORT@",
+            "FAIL ports: kbf-all-in-one.service: --worker-listen and --api-listen are both on port 8981: give each listener its own (KBF_REAPI_PORT, KBF_WORKER_PORT, KBF_API_PORT, KBF_STORAGE_PORT)",
+        ),
         (
             Mode::Daemon,
             "Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@\n",
@@ -216,19 +263,26 @@ fn each_planted_defect_turns_its_rule_red() {
     }
     let left = check(
         &c,
-        Mode::Storage,
-        "[Service]\nSlice=kbf.slice\nExecStart=/usr/local/bin/kbf storage\nUser=@KBF_USER@\n",
+        Mode::Frontend,
+        "[Service]\nSlice=kbf.slice\nExecStart=/usr/local/bin/kbf frontend\nUser=@KBF_USER@\n\
+         TimeoutStopSec=infinity\nKillSignal=SIGTERM\n",
         false,
     )
     .expect("a unit");
     assert_eq!(
         lines(&left),
-        ["FAIL render: kbf-storage.service keeps the placeholder @KBF_USER@"]
+        ["FAIL render: kbf-frontend.service keeps the placeholder @KBF_USER@"]
     );
-    let none = check(&c, Mode::Storage, "[Service]\nSlice=kbf.slice\n", false).expect("a unit");
+    let none = check(
+        &c,
+        Mode::Frontend,
+        "[Service]\nSlice=kbf.slice\nTimeoutStopSec=infinity\nKillSignal=SIGTERM\n",
+        false,
+    )
+    .expect("a unit");
     assert_eq!(
         lines(&none),
-        ["FAIL exec: kbf-storage.service starts '', want '/usr/local/bin/kbf storage ...'"]
+        ["FAIL exec: kbf-frontend.service starts '', want '/usr/local/bin/kbf frontend ...'"]
     );
 }
 
@@ -761,4 +815,63 @@ fn on_the_node_an_environment_file_holding_the_key_fails_rule_credential() {
         };
         assert_eq!(lines(&r), want, "{mode}");
     }
+}
+
+/// Catches rule `stop` reading the unit file alone: a drop-in's `TimeoutSec=` (which
+/// sets the stop timeout too) or `KillSignal=` passed because the unit has the right
+/// lines, and a later drop-in that restores them not read.
+#[test]
+fn rule_stop_reads_the_drop_ins() {
+    let c = config();
+    let text = render(&c, Some(1500), Mode::AllInOne).expect("renders");
+    let exec = FakeExec::new(0);
+    let fails = |unit: &UnitText| -> Vec<String> {
+        lines(
+            &check_on_host(&exec, &c, Mode::AllInOne, unit, &slice(&c), true, None).expect("runs"),
+        )
+    };
+    let unit = UnitText::new(Mode::AllInOne.unit_name(), text);
+    assert_eq!(fails(&unit), Vec::<String>::new());
+    let cut = unit.clone().with_drop_in(
+        "kbf-all-in-one.service.d/10.conf",
+        "[Service]\nTimeoutSec=5min\nKillSignal=SIGKILL\n",
+    );
+    assert_eq!(
+        fails(&cut),
+        [
+            "FAIL stop: kbf-all-in-one.service has TimeoutSec=5min, not TimeoutStopSec=infinity: systemd kills kbf when it runs out, before the drain ends, and every build in flight fails",
+            "FAIL stop: kbf-all-in-one.service has KillSignal=SIGKILL, not KillSignal=SIGTERM: kbf drains on SIGTERM",
+        ]
+    );
+    let restored = cut.with_drop_in(
+        "kbf-all-in-one.service.d/20.conf",
+        "[Service]\nTimeoutStopSec=infinity\nKillSignal=TERM\n",
+    );
+    assert_eq!(fails(&restored), Vec::<String>::new());
+}
+
+/// Catches a storage unit rendered with the converged units' loopback MinIO when the
+/// settings name no `MINIO_S3_ENDPOINT` (a storage node's bucket is elsewhere), and the
+/// refusal applied to a mode whose unit has no S3 cold store.
+#[test]
+fn the_storage_mode_needs_its_s3_endpoint_set() {
+    let text: String = EXAMPLE
+        .lines()
+        .filter(|l| !l.starts_with("MINIO_S3_ENDPOINT="))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let c = LinuxConfig::parse(&text).expect("valid settings");
+    assert_eq!(
+        render(&c, Some(1500), Mode::Storage).map_err(|e| e.to_string()),
+        Err("MINIO_S3_ENDPOINT must be set for --mode storage: the storage node's cold store is the bucket at that endpoint, and no MinIO runs beside it to default to".to_owned())
+    );
+    for mode in Mode::ALL.into_iter().filter(|m| *m != Mode::Storage) {
+        assert_eq!(
+            render(&c, Some(1500), mode).expect("renders"),
+            render(&config(), Some(1500), mode).expect("renders"),
+            "{mode}"
+        );
+    }
+    let set = render(&config(), Some(1500), Mode::Storage).expect("renders");
+    assert!(set.contains("?endpoint=http://127.0.0.1:9000&"), "{set}");
 }
