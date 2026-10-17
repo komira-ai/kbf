@@ -104,9 +104,9 @@ pub const RETRY_AFTER: Duration = Duration::from_secs(120);
 /// clean. A start that finds it sweeps again.
 pub const PENDING: &str = "simulators-left";
 
-/// The lease directory (a name the start's sweep of the scratch root removes) the
-/// background sweep runs `simctl` in.
-pub const SWEEP_DIR: &str = "lease-sweep";
+/// The directory in the scratch root the background sweep runs `simctl` in (as its
+/// lease directory), made when a sweep is owed and kept.
+pub const SWEEP_DIR: &str = "simulator-sweep";
 
 /// How long the driver waits for Xcode to list a lease's new simulator, how often it
 /// looks and how long each look has, before the action runs.
@@ -488,30 +488,22 @@ impl Simctl {
         }
     }
 
-    /// One try of the sweep [`PENDING`] asks for, in a directory [`SWEEP_DIR`] made
-    /// under `scratch` and removed after; a clean end removes [`PENDING`].
+    /// One try of the sweep [`PENDING`] asks for, in [`SWEEP_DIR`] of `scratch`; a
+    /// clean end removes [`PENDING`] (one that stays only makes the next start sweep
+    /// again).
     fn sweep_owed(&self, scratch: &Path) -> Result<(), String> {
         let dir = scratch.join(SWEEP_DIR);
-        // One that cannot be named by its real path is no sandbox directory.
-        let real = std::fs::create_dir_all(&dir)
-            .and_then(|()| std::fs::canonicalize(&dir))
-            .map_err(|e| {
-                format!(
-                    "no directory to sweep simulators in: {}: {e}",
-                    dir.display()
-                )
-            })?;
-        let swept = self.sweep(&real);
-        if let Err(why) = kbf_outputs::remove_tree(&dir) {
-            tracing::warn!(dir = %dir.display(), "cannot remove the sweep directory: {why}");
-        }
-        swept?;
-        match std::fs::remove_file(scratch.join(PENDING)) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                Err(format!("cannot remove {PENDING}: {e}"))
-            }
-            _ => Ok(()),
-        }
+        // The sandbox's directory is a real path, every link resolved.
+        let real = std::fs::create_dir_all(&dir).and_then(|()| std::fs::canonicalize(&dir));
+        let Ok(real) = real else {
+            return Err(format!(
+                "no directory to sweep simulators in: {}",
+                dir.display()
+            ));
+        };
+        self.sweep(&real)?;
+        let _ = std::fs::remove_file(scratch.join(PENDING));
+        Ok(())
     }
 
     /// Shuts down and deletes each of `udids`, one command each; why each delete that
@@ -662,6 +654,7 @@ pub(crate) fn owe(scratch: &Path) -> std::io::Result<()> {
 #[derive(Debug, Default)]
 pub(crate) struct Background {
     shared: Arc<Shared>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Default)]
@@ -700,8 +693,8 @@ impl Shared {
 
 impl Background {
     /// Starts the sweep [`PENDING`] in `scratch` asks for: up to [`SWEEP_ATTEMPTS`]
-    /// tries, `retry` apart, until one ends clean. A thread that cannot be made leaves
-    /// [`PENDING`] for the next start.
+    /// tries, `retry` apart, until one ends clean. Like [`std::thread::spawn`], it
+    /// panics if the OS cannot make a thread.
     pub(crate) fn start(&self, simctl: &Arc<Simctl>, scratch: &Path, retry: Duration) {
         self.shared.state().running = true;
         let (shared, simctl, scratch) = (
@@ -709,32 +702,24 @@ impl Background {
             Arc::clone(simctl),
             scratch.to_owned(),
         );
-        let spawned = std::thread::Builder::new()
-            .name("kbf-simulator-sweep".to_owned())
-            .spawn({
-                let shared = Arc::clone(&shared);
-                move || {
-                    for attempt in 1..=SWEEP_ATTEMPTS {
-                        if attempt > 1 && !shared.pause(retry) {
-                            break;
-                        }
-                        match simctl.sweep_owed(&scratch) {
-                            Ok(()) => break,
-                            Err(why) if attempt < SWEEP_ATTEMPTS => {
-                                tracing::warn!(attempt, "simulators left behind: {why}");
-                            }
-                            Err(why) => tracing::error!(
-                                "simulators left behind, tried again at the next start: {why}"
-                            ),
-                        }
-                    }
-                    shared.finish();
+        let thread = std::thread::spawn(move || {
+            for attempt in 1..=SWEEP_ATTEMPTS {
+                if attempt > 1 && !shared.pause(retry) {
+                    break;
                 }
-            });
-        if let Err(why) = spawned {
-            tracing::error!("no thread to sweep the simulators left behind: {why}");
+                match simctl.sweep_owed(&scratch) {
+                    Ok(()) => break,
+                    Err(why) if attempt < SWEEP_ATTEMPTS => {
+                        tracing::warn!(attempt, "simulators left behind: {why}");
+                    }
+                    Err(why) => tracing::error!(
+                        "simulators left behind, tried again at the next start: {why}"
+                    ),
+                }
+            }
             shared.finish();
-        }
+        });
+        *self.thread.lock().unwrap_or_else(PoisonError::into_inner) = Some(thread);
     }
 
     /// Waits until the sweep has ended (clean, out of tries, or never started), at
@@ -748,10 +733,19 @@ impl Background {
     }
 }
 
+/// Ends the sweep's tries and waits for its thread: at most the `simctl` call it is
+/// in ([`ANSWER_WITHIN`]), as it never waits for the next try once stopped.
 impl Drop for Background {
     fn drop(&mut self) {
         self.shared.state().stop = true;
         self.shared.changed.notify_all();
+        let thread = self
+            .thread
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(thread) = thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 

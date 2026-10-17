@@ -19,7 +19,7 @@ use crate::support::{
 use kbf_daemon::{Runtime, RuntimeError};
 use kbf_driver_native::NativeConfig;
 use kbf_driver_native::network::Isolation;
-use kbf_driver_native::simulator::{Listing, MARKER, PENDING, SWEEP_ATTEMPTS, UDID_VAR};
+use kbf_driver_native::simulator::{Listing, MARKER, PENDING, SWEEP_ATTEMPTS, SWEEP_DIR, UDID_VAR};
 
 /// The UDID the fake `simctl create` prints for [`DEVICE_TYPE`].
 const UDID: &str = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
@@ -1235,6 +1235,54 @@ async fn the_background_sweep_leaves_the_simulator_of_a_running_lease() {
         1,
         "the lease's own end deletes it: {all:?}"
     );
+}
+
+/// Catches: an owed sweep that cannot make its directory (a file is where it goes)
+/// failing the start, or losing the debt: the start returns, no `simctl` call is made,
+/// and the owed file stays for the next start. Mutant planted: the failure taken for a
+/// clean sweep (red: the owed file is gone).
+#[tokio::test]
+async fn a_sweep_directory_that_cannot_be_made_keeps_the_debt() {
+    let dir = scratch("sim-sweep-nodir");
+    let (config, xcrun) = fake_config(&dir, "");
+    list(&xcrun, &[("kbf-lease-5-5", UDID)]);
+    std::fs::create_dir_all(&config.scratch).expect("scratch");
+    std::fs::write(config.scratch.join(PENDING), b"").expect("owed");
+    std::fs::write(config.scratch.join(SWEEP_DIR), b"").expect("a file in the way");
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    swept(&rt);
+    assert_eq!(calls(&xcrun), [""; 0], "nothing to run `simctl` in");
+    assert!(config.scratch.join(PENDING).is_file(), "the debt stays");
+}
+
+/// Catches: a runtime that is dropped while its sweep waits to try again leaving the
+/// thread to run its tries on (or the drop waiting for them): the tries are an hour
+/// apart here and every one fails, so the drop must end the wait, not sit through it.
+/// Mutant planted: the pause ignoring the stop (red: the drop takes the minute).
+#[tokio::test]
+async fn dropping_the_runtime_ends_the_sweeps_wait_for_its_next_try() {
+    let dir = scratch("sim-sweep-drop");
+    let (mut config, xcrun) = fake_config(&dir, "");
+    config.xcrun = dir.join("no-xcrun");
+    config.simulator_retry = Duration::from_secs(60);
+    std::fs::create_dir_all(&config.scratch).expect("scratch");
+    std::fs::write(config.scratch.join(PENDING), b"").expect("owed");
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    assert!(
+        !rt.wait_for_simulator_sweep(Duration::from_millis(200)),
+        "the sweep waits for its second try"
+    );
+    let started = std::time::Instant::now();
+    drop(rt);
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the drop took {:?}",
+        started.elapsed()
+    );
+    assert!(config.scratch.join(PENDING).is_file(), "the debt stays");
+    assert_eq!(calls(&xcrun), [""; 0]);
 }
 
 /// The tests that make real simulators.
