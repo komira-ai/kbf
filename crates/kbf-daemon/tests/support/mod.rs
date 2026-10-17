@@ -6,6 +6,7 @@
 #![allow(dead_code)] // Each test binary uses its own part of this module.
 
 pub mod cache_kit;
+pub mod farm;
 pub mod memory;
 pub mod storage_node;
 

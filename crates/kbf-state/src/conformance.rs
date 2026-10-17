@@ -218,6 +218,33 @@ pub fn c2_atomic_txn<B: Backend>(backend: &B) {
         rows_before, rows_after,
         "C2 aborted: a conflicting transaction wrote feed rows"
     );
+
+    // A counter is part of the transaction: an increment in one that aborts is not kept,
+    // so the next transaction gets the very next value (a counter kept outside the
+    // transaction, as a database sequence is, skips the aborted one).
+    let issued = commit.counters[0];
+    let conflict = run(
+        &store,
+        Txn::new()
+            .next("c2/n")
+            .next("c2/fresh")
+            .check("c2/b", Cond::Version(Version(u64::MAX))),
+    )
+    .expect_err("C2 counter: a transaction with a failing precondition must conflict");
+    assert_eq!(
+        conflict.index, 2,
+        "C2 counter: the conflict names the failing operation"
+    );
+    assert_eq!(
+        next_value(&store, "c2/n"),
+        issued + 1,
+        "C2 counter: a counter incremented in an aborted transaction changed"
+    );
+    assert_eq!(
+        next_value(&store, "c2/fresh"),
+        1,
+        "C2 counter: a counter first used in an aborted transaction was created"
+    );
 }
 
 /// C3: counters are strictly monotonic, across threads, transactions and restart.
@@ -375,6 +402,69 @@ pub fn c4_store_clock_expiry<B: Backend>(backend: &B) {
         value(&store, "c4/keep").is_some(),
         "C4 expiry: a key without a ttl never expires"
     );
+    c4_boundary(&store, &clock);
+}
+
+/// Puts `key` with a ttl and moves the clock to exactly the reading it expires at, having
+/// checked the key is still live one tick before. Returns the version it was put with.
+fn live_until_the_tick_before_expiry<S: Store>(
+    store: &S,
+    clock: &ManualClock,
+    key: &str,
+) -> Version {
+    const ONE_TICK: Duration = Duration::from_nanos(1);
+    run(
+        store,
+        Txn::new().put_ttl(key, "v", Duration::from_secs(5), Cond::Any),
+    )
+    .expect("create the boundary key");
+    let put = value(store, key).expect("the boundary key exists");
+    let expires = put
+        .expires_at
+        .expect("C4 boundary: a key put with a ttl reports when it expires");
+
+    clock.advance(expires.since(clock.now()) - ONE_TICK);
+    assert!(
+        value(store, key).is_some(),
+        "C4 boundary: a key must still be live one tick before its expiry"
+    );
+    clock.advance(ONE_TICK);
+    assert_eq!(
+        clock.now(),
+        expires,
+        "C4 boundary: the clock stands exactly at the expiry"
+    );
+    put.version
+}
+
+/// C4 at the boundary: a key is live up to the reading before `expires_at` and expired
+/// at the reading that equals it, for reads, scans, the reaper and preconditions alike.
+/// Reads and the reaper judge one key and preconditions another, since a backend may
+/// reap a key the first time a write sees it.
+fn c4_boundary<S: Store>(store: &S, clock: &ManualClock) {
+    live_until_the_tick_before_expiry(store, clock, "c4/edge/read");
+    assert!(
+        value(store, "c4/edge/read").is_none(),
+        "C4 boundary: a key whose ttl ends exactly now is expired, and get still reads it"
+    );
+    assert!(
+        store.scan_prefix("c4/edge/").expect("scan").is_empty(),
+        "C4 boundary: a key whose ttl ends exactly now is expired, and a scan still returns it"
+    );
+    assert_eq!(
+        store.reap_expired().expect("reap"),
+        1,
+        "C4 boundary: the reaper removes a key whose ttl ends exactly now"
+    );
+
+    let version = live_until_the_tick_before_expiry(store, clock, "c4/edge/cond");
+    run(store, Txn::new().check("c4/edge/cond", Cond::Absent))
+        .expect("C4 boundary: a key whose ttl ends exactly now counts as absent");
+    run(
+        store,
+        Txn::new().check("c4/edge/cond", Cond::Version(version)),
+    )
+    .expect_err("C4 boundary: a key whose ttl ends exactly now must not match its version");
 }
 
 /// C5: prefix scans are ordered; the feed resumes from a revision and never skips a row
@@ -544,10 +634,13 @@ pub fn c7_group_commit<B: Backend>(backend: &B) {
         results.iter().all(Result::is_ok),
         "C7 grouped: every write in the burst commits"
     );
-    assert!(
-        stats.syncs - stats_before.syncs <= 1,
-        "C7 syncs: the burst took {} durable syncs; a group needs one",
-        stats.syncs - stats_before.syncs
+    // Exactly one: none would be an acknowledgement before any sync, and more than one is
+    // a group that is not one (a second sync costs too little store time to show in the
+    // latency bound above, which the SQLite store's manual clock never advances anyway).
+    assert_eq!(
+        stats.syncs - stats_before.syncs,
+        1,
+        "C7 syncs: a burst of {burst} writes is one group and needs exactly one durable sync"
     );
     assert_eq!(
         stats.txns - stats_before.txns,

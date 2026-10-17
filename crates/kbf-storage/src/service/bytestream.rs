@@ -10,7 +10,6 @@ use kbf_proto::google::bytestream::{
 use tonic::{Request, Response, Status, Streaming};
 
 use super::{Endpoint, StorageService, catch_up, generation, wire};
-use crate::StorageError;
 
 #[tonic::async_trait]
 impl ByteStream for StorageService {
@@ -38,10 +37,11 @@ impl ByteStream for StorageService {
         let catching_up = self.catching_up();
         let chunks = match self.storage.read_range(&digest, offset, limit).await {
             Ok(chunks) => chunks,
-            Err(StorageError::NotFound(_)) if catching_up => {
-                return Err(catch_up::unavailable(&digest.to_string()));
+            Err(e) => {
+                return Err(
+                    catch_up::read_miss(catching_up, &e, &digest).unwrap_or_else(|| e.into())
+                );
             }
-            Err(e) => return Err(e.into()),
         };
         let messages = chunks.map(|chunk| match chunk {
             Ok(data) => Ok(ReadResponse {
@@ -77,20 +77,9 @@ impl ByteStream for StorageService {
             Endpoint::Write
         };
         self.admission.check(&request, endpoint)?;
-        let view = self.view(generation::requested(&request)?).await?;
-        let mut stream = request.into_inner();
-        let first = stream
-            .message()
-            .await?
-            .ok_or_else(|| Status::invalid_argument("write stream sent no message"))?;
-        let digest = wire::write_resource(&first.resource_name)?;
-        let size = digest.size_bytes;
-        let plan = self.plan(view.as_ref(), &digest, leg_from)?;
-        if self.storage.find_missing(&[digest]).await?.is_empty() {
-            return Ok(wire::committed(size));
-        }
-        self.write_blob(digest, first, stream, view.as_ref(), leg_from, plan)
-            .await?;
+        let requested = generation::requested(&request)?;
+        let stream = request.into_inner();
+        let size = self.write_in(requested, leg_from, stream.boxed()).await?;
         Ok(wire::committed(size))
     }
 
