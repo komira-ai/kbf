@@ -531,12 +531,13 @@ impl State {
                 tracing::error!(%error, "the state store did not take {what}");
                 // Only a store that cannot be reached is an outage: a write that lost a
                 // compare-and-set, or found its row gone, is the store working.
-                match &error {
-                    StateError::Store(StoreError::Fenced) => {
-                        durable.fenced.store(true, Ordering::SeqCst);
-                    }
-                    StateError::Store(_) => durable.unreachable.store(true, Ordering::SeqCst),
-                    _ => {}
+                if let StateError::Store(cause) = &error {
+                    let flag = if matches!(cause, StoreError::Fenced) {
+                        &durable.fenced
+                    } else {
+                        &durable.unreachable
+                    };
+                    flag.store(true, Ordering::SeqCst);
                 }
                 false
             }
