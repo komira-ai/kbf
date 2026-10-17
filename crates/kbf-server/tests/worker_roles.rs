@@ -90,6 +90,7 @@ const EXPECTED: [(&str, PeerRole); 19] = {
             "/build.bazel.remote.execution.v2.ContentAddressableStorage/RegisterChunkMapping",
             Daemon,
         ),
+        ("/kbf.update.v1.ReleaseService/Fetch", PeerRole::Daemon),
         ("/kbf.worker.v1.Segments/Begin", Daemon),
         ("/kbf.worker.v1.Segments/PutRange", Daemon),
         ("/kbf.worker.v1.Segments/Commit", Daemon),
