@@ -225,6 +225,7 @@ async fn a_row_answers_its_shape_and_target() {
             kind: TargetKind::Anon,
             label: Text::sent(long.clone()),
         }),
+        test: false,
     };
     let command = |action, shape| Event::Command {
         id: kbf_invocation::InvocationId::new("s"),
@@ -246,6 +247,7 @@ async fn a_row_answers_its_shape_and_target() {
                     key: 1,
                     cfg: None,
                     target: None,
+                    test: false,
                 })),
             ),
         ])

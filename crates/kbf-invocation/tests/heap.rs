@@ -669,6 +669,7 @@ fn shaped(n: usize) -> Event {
                 kind: kbf_invocation::TargetKind::Target,
                 label: kbf_invocation::Text::sent("l".repeat(n)),
             }),
+            test: false,
         })),
     }
 }
