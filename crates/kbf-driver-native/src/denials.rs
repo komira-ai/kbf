@@ -286,6 +286,13 @@ mod tests {
             parse_line("Sandbox: touch(1) denied file-write-create /x"),
             None
         );
+        // A pid too large for one, and a line that ends where the verdict does.
+        assert_eq!(
+            parse_line("Sandbox: touch(99999999999) deny(1) file-write-create /x"),
+            None
+        );
+        let ended = parse_line("Sandbox: touch(1) deny").expect("denial");
+        assert_eq!((ended.pid, ended.operation.as_str()), (1, ""));
         // Parentheses that never close, or never name a pid.
         assert_eq!(
             parse_line("Sandbox: touch(12 deny(1) file-write-create /x"),
