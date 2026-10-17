@@ -10,10 +10,13 @@
 //!   and so is a renamed or retyped column);
 //! - every row reads back unchanged: keys, values, versions, expiry times, the change
 //!   feed, the head revision and a counter;
-//! - a farm started over the file takes up what the scheduler wrote (every `op/`,
-//!   `queue/`, `lease/`, `loss/`, `fate/` and `cordon/` row decodes), answers for the
-//!   `done/` row by the key the code forms today, and accepts a result for a recovered
-//!   lease (the `lease/` key and its value);
+//! - a farm started over the file takes up what the scheduler wrote, each through the
+//!   reader that uses it: the `op/` rows (the queued operation and the one holding a
+//!   lease are known to the farm), the `queue/` row (the queued operation is granted and
+//!   leaves the queue by the key the code forms today), `fate/` (the memory run and the
+//!   raised booking), `cordon/` (the node stays out of placement until uncordoned),
+//!   `loss/` (the next loss is counted from the stored count), the `done/` row (found by
+//!   today's key) and the `lease/` row (a result for it is accepted);
 //! - there is a golden for the current `SCHEMA_VERSION`, so a bump cannot ship without a
 //!   new golden (and, until a migration exists, without the old ones being refused here).
 //!
@@ -34,6 +37,7 @@ use kbf_proto::google::rpc;
 use kbf_proto::worker::{self, MemoryKill, ServerMessage};
 use kbf_sched::{DaemonInstance, Request};
 use kbf_server::farm::{NodeAction, Reported};
+use kbf_server::fleet::PlacementView;
 use kbf_server::{EpochPolicy, Farm, StateStore};
 use kbf_state::sqlite::{Options, SCHEMA_VERSION, SqliteStore};
 use kbf_state::{Fenced, ManualClock, Revision, Store, Txn};
@@ -143,17 +147,22 @@ fn register(farm: &Farm, name: &str, room: Resources) -> (kbf_server::farm::Stre
     (stream, inbox)
 }
 
-fn starts(inbox: &mut Inbox) -> Vec<LeaseId> {
+/// The leases of the `Start`s waiting in `inbox`, each with the memory it books.
+fn booked(inbox: &mut Inbox) -> Vec<(LeaseId, u64)> {
     let mut leases = Vec::new();
     while let Ok(message) = inbox.try_recv() {
         if let Some(worker::server_message::Message::Start(start)) =
             message.expect("no error").message
         {
             let lease = start.lease_id.expect("a lease id");
-            leases.push(LeaseId::new(lease.term, lease.seq));
+            leases.push((LeaseId::new(lease.term, lease.seq), start.memory_bytes));
         }
     }
     leases
+}
+
+fn starts(inbox: &mut Inbox) -> Vec<LeaseId> {
+    booked(inbox).into_iter().map(|(lease, _)| lease).collect()
 }
 
 fn result(lease: LeaseId, memory_kill: MemoryKill) -> worker::Result {
@@ -406,6 +415,128 @@ async fn read_back(golden: &Path) {
     assert!(
         accepted(&farm, "node-b", held[0]).await,
         "{name}: the recovered lease is not taken up"
+    );
+    drop(farm);
+    drop(store);
+    std::fs::remove_dir_all(&scratch).expect("the scratch is removed");
+
+    queue_fate_and_cordon_recovered(golden, &name).await;
+    loss_recovered(golden, &name).await;
+}
+
+/// A new store over a copy of `golden`, and the scratch directory holding it.
+fn copy_of(golden: &Path) -> (Arc<SqliteStore>, PathBuf) {
+    let scratch = tempdir();
+    let copy = scratch.join("state.db");
+    std::fs::copy(golden, &copy).expect("a copy");
+    (Arc::new(open(&copy)), scratch)
+}
+
+fn keys_of(store: &SqliteStore, prefix: &str) -> Vec<String> {
+    store
+        .scan_prefix(prefix)
+        .expect("a scan")
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// The queued operation (`op-0`: `op/`, `queue/`, `fate/` rows, on the cordoned `node-a`):
+/// the farm holds it queued with its memory run, keeps `node-a` cordoned, and once the
+/// node is uncordoned grants it at the raised booking, which takes it out of the queue
+/// by the `queue/` key and writes its lease.
+async fn queue_fate_and_cordon_recovered(golden: &Path, name: &str) {
+    let (store, scratch) = copy_of(golden);
+    assert_eq!(
+        keys_of(&store, "queue/"),
+        ["queue/0000000000000000"],
+        "{name}: the golden's queue"
+    );
+    let farm = farm_over(store.clone());
+    // `op/`: the farm holds the queued operation (and `op-2`, which holds a lease).
+    assert_eq!(farm.queued_operations(), 1, "{name}: the queued operation");
+    // `fate/`: the one memory run of the killed operation.
+    let runs = farm.memory_runs();
+    let [(operation, kills)] = runs.iter().collect::<Vec<_>>()[..] else {
+        panic!("{name}: one operation with a kill expected: {runs:?}");
+    };
+    assert_eq!(*operation, OperationId(0), "{name}: the killed operation");
+    let [kill] = &kills[..] else {
+        panic!("{name}: one memory run expected: {kills:?}");
+    };
+    assert_eq!(kill.worker, WorkerId::new("node-a"), "{name}: its node");
+    assert_eq!(kill.booked, 4 * GIB, "{name}: its booking");
+    assert!(
+        matches!(kill.kill, kbf_types::MemoryKill::OwnLimit { .. }),
+        "{name}: its kill: {kill:?}"
+    );
+
+    // `cordon/`: no lease while the node is cordoned.
+    let (_, mut inbox) = register(&farm, "node-a", Resources::new(4_000, 64 * GIB));
+    let view = farm.node_view(&WorkerId::new("node-a")).expect("the node");
+    assert_eq!(
+        view.placement,
+        PlacementView::Cordoned,
+        "{name}: the cordon"
+    );
+    assert!(
+        booked(&mut inbox).is_empty(),
+        "{name}: a cordoned node was granted"
+    );
+    farm.place(&WorkerId::new("node-a"), NodeAction::Uncordon)
+        .expect("uncordoned");
+    // `fate/` and `queue/`: granted at the raised booking, and out of the queue.
+    let [(lease, memory)] = booked(&mut inbox)[..] else {
+        panic!("{name}: one grant expected after the uncordon");
+    };
+    assert_eq!(memory, 16 * GIB, "{name}: the raised booking");
+    assert_eq!(farm.queued_operations(), 0, "{name}: still queued");
+    assert!(
+        keys_of(&store, "queue/").is_empty(),
+        "{name}: the queue row stayed after the grant"
+    );
+    assert!(
+        keys_of(&store, "lease/")
+            .contains(&format!("lease/{:016x}.{:016x}", lease.term, lease.seq)),
+        "{name}: the grant wrote no lease row"
+    );
+    drop(farm);
+    drop(store);
+    std::fs::remove_dir_all(&scratch).expect("the scratch is removed");
+}
+
+/// `op-2` lost its lease once (`loss/` row of 1) and holds a new one on `node-b`. A
+/// registration of `node-b` that holds no lease loses it again: the farm counts from the
+/// stored count and writes 2.
+async fn loss_recovered(golden: &Path, name: &str) {
+    let (store, scratch) = copy_of(golden);
+    let [loss_key] = &keys_of(&store, "loss/")[..] else {
+        panic!("{name}: expected one loss/ row");
+    };
+    let loss_key = loss_key.clone();
+    let count = |store: &SqliteStore| -> Vec<u8> {
+        store
+            .get(&loss_key)
+            .expect("a read")
+            .expect("a loss row")
+            .value
+    };
+    assert_eq!(
+        count(&store),
+        1u64.to_be_bytes(),
+        "{name}: the golden's count"
+    );
+    let farm = farm_over(store.clone());
+    let (stream, mut inbox) = register(&farm, "node-b", Resources::new(4_000, 2 * GIB));
+    assert!(
+        farm.heartbeat(&WorkerId::new("node-b"), stream, 1, Vec::new())
+            .await
+    );
+    assert_eq!(starts(&mut inbox).len(), 1, "{name}: granted again");
+    assert_eq!(
+        count(&store),
+        2u64.to_be_bytes(),
+        "{name}: the second loss is not counted from the stored one"
     );
     drop(farm);
     drop(store);
