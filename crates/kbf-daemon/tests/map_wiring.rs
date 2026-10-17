@@ -288,7 +288,8 @@ async fn a_blob_written_by_a_daemon_lands_on_its_owner_through_the_maps_the_fron
     }
 
     // The daemon's plane, over the map it was pushed.
-    let nodes = kbf_daemon::storage_nodes(&tls).expect("TLS files");
+    let nodes =
+        kbf_daemon::storage_nodes(&tls, kbf_daemon::Liveness::default()).expect("TLS files");
     let channel = Endpoint::from_shared("http://127.0.0.1:1")
         .expect("endpoint")
         .connect_lazy();
