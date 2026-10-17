@@ -1,7 +1,7 @@
 //! The cache through the storage boundary: [`CacheStorage`] as an `Arc<dyn Storage>`.
 //! The data plane's checks run over it in `kbf-all-in-one` (`tests/storage_seam.rs`);
 //! these cover what they do not: the action cache, and that every error answers the
-//! gRPC code and message the cache's own error answers.
+//! gRPC code and message the cache's own error answers. Streamed puts: `tests/storage_stream.rs`.
 
 mod common;
 
@@ -77,7 +77,7 @@ async fn the_action_cache_answers_through_the_trait() {
     let absent = digest_of(b"an output never stored");
     let refused = storage.prepare_action_result(&result_with(absent)).await;
     assert!(
-        matches!(refused, Err(StorageError::ActionWrite(ActionWriteError::Absent(d))) if d == absent),
+        matches!(&refused, Err(StorageError::ActionWrite(ActionWriteError::Absent(d))) if *d == [absent]),
         "{refused:?}"
     );
 
@@ -213,8 +213,8 @@ fn errors_answer_as_the_cache_answers() {
         },
         CacheError::Invalid("bad".to_owned()),
         CacheError::ActionWrite(ActionWriteError::NotDaemon),
-        CacheError::ActionWrite(ActionWriteError::Absent(a)),
-        CacheError::ActionWrite(ActionWriteError::Unreachable(a)),
+        CacheError::ActionWrite(ActionWriteError::Absent(vec![a])),
+        CacheError::ActionWrite(ActionWriteError::Unreachable(vec![a])),
         CacheError::Meta(MetaLogError::Unavailable("no leader".to_owned())),
         CacheError::Store(ObjectStoreError::Unsupported("retention")),
         CacheError::Internal("torn".to_owned()),

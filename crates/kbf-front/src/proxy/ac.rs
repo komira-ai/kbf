@@ -6,7 +6,6 @@ use std::sync::Arc;
 use kbf_auth::{Authorizers, authorize};
 use kbf_proto::reapi::action_cache_server::ActionCache;
 use kbf_proto::reapi::{ActionResult, GetActionResultRequest, UpdateActionResultRequest};
-use kbf_storage::Storage as _;
 use tonic::{Request, Response, Status};
 
 use super::owners::Owners;
@@ -39,8 +38,7 @@ impl ActionCache for ProxyActionCache {
         .await?;
         wire::check_digest_function(request.digest_function)?;
         let action = wire::digest(request.action_digest.as_ref())?;
-        let owner = self.owners.primary(&action)?;
-        match owner.storage.action_result(&action).await? {
+        match self.owners.action_result(&action).await? {
             Some((_, result)) => Ok(Response::new(result)),
             None => Err(Status::not_found(format!(
                 "no usable action-cache entry for {action}"

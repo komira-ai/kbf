@@ -29,7 +29,6 @@ fn config() -> MembershipConfig {
         ttl: Duration::from_millis(60),
         dwell: Duration::from_secs(1),
         replication: 2,
-        bootstrap: Duration::ZERO,
     }
 }
 
@@ -65,7 +64,7 @@ fn request(i: u32) -> pb::RegisterRequest {
 }
 
 /// Catches: a registration answer that lacks what the node needs (the store's id and
-/// boot, the interval to beat at, the map with the node in it as Joining), an interval
+/// boot, the interval to beat at, the map with the node in it as Active), an interval
 /// not below the TTL, and a heartbeat that does not report the map's generation.
 #[tokio::test]
 async fn register_answers_with_identity_interval_and_map() {
@@ -82,7 +81,7 @@ async fn register_answers_with_identity_interval_and_map() {
     let me = map.member(kbf_map::MemberId(1)).expect("in the map");
     assert_eq!(
         (me.state, me.zone.as_str(), me.weight),
-        (MemberState::Joining, "a", 1)
+        (MemberState::Active, "a", 1)
     );
     assert_eq!(members.current_map().expect("read"), Some(map.clone()));
 
