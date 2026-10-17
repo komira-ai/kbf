@@ -42,6 +42,7 @@ kbf-meta                  7      1
 kbf-node                  0      0
 kbf-objstore             59     19
 kbf-outputs               0      0
+kbf-peer                  0      0
 kbf-proto                 0      0
 kbf-raft                 19     19
 kbf-route                 0      0

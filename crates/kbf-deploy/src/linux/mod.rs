@@ -13,9 +13,9 @@
 //! - With `--mode MODE`, both verbs work on one mode of the one `kbf` binary instead
 //!   ([`modes`]): `render-units` writes `kbf.slice` and `kbf-<mode>.service`, and
 //!   `check-units` checks the two, each with its drop-ins (`<name>.d/*.conf`), against
-//!   [`modes`]' rules (docs/deploy/kbf-modes.md). For a built
-//!   mode it also runs `<kbf> check-args <mode> <flags...>` (`--kbf-bin PATH`, or the
-//!   unit's own binary when it is installed; a `SKIP parse:` line when it is not).
+//!   [`modes`]' rules (docs/deploy/kbf-modes.md). It also
+//!   runs `<kbf> check-args <mode> <flags...>` (`--kbf-bin PATH`, or the unit's own
+//!   binary when it is installed; a `SKIP parse:` line when it is not).
 //!
 //! Exit codes: 0 rendered, or every rule holds; 1 a rule is broken; 2 refused (a bad
 //! setting, a template placeholder with no value, a file that cannot be read or
