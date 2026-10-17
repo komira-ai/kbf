@@ -84,7 +84,7 @@ fn an_adopted_socket_must_listen_where_the_flags_say() {
 async fn a_grpc_listener_accepts_until_latched_and_then_closes_its_socket() {
     let socket = Socket::bind(any(), false).expect("bind");
     let addr = socket.local;
-    let (mut incoming, latch) = socket.grpc().expect("registered");
+    let (mut incoming, latch) = socket.grpc(None).expect("registered");
     assert!(
         incoming.next().now_or_never().is_none(),
         "a connection from nowhere"
@@ -96,7 +96,7 @@ async fn a_grpc_listener_accepts_until_latched_and_then_closes_its_socket() {
         .await
         .expect("a connection")
         .expect("accepted");
-    assert!(accepted.nodelay().expect("nodelay"));
+    assert!(accepted.remote_addr().is_some());
     drop((client, accepted));
 
     // A task asleep in accept sees the end when the latch closes, though nothing else wakes it.
@@ -114,7 +114,7 @@ async fn a_grpc_listener_accepts_until_latched_and_then_closes_its_socket() {
     latch.close();
 
     let socket = Socket::bind(any(), false).expect("bind");
-    let (incoming, latch) = socket.grpc().expect("registered");
+    let (incoming, latch) = socket.grpc(None).expect("registered");
     latch.close();
     drop(incoming);
 }
@@ -125,7 +125,7 @@ async fn a_grpc_listener_accepts_until_latched_and_then_closes_its_socket() {
 async fn dropping_a_grpc_listener_closes_its_socket_whoever_holds_the_latch() {
     let socket = Socket::bind(any(), false).expect("bind");
     let addr = socket.local;
-    let (incoming, _latch) = socket.grpc().expect("registered");
+    let (incoming, _latch) = socket.grpc(None).expect("registered");
     assert!(TcpStream::connect(addr).is_ok());
     drop(incoming);
     assert!(

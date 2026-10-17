@@ -296,7 +296,7 @@ async fn a_stop_closes_the_listeners_registered_with_it_when_it_is_given() {
     let stop = Stop::new();
     let socket = crate::listen::Socket::bind(any(), false).expect("bind");
     let addr = socket.local;
-    let (incoming, latch) = socket.grpc().expect("registered");
+    let (incoming, latch) = socket.grpc(None).expect("registered");
     stop.closes(latch);
     assert!(
         std::net::TcpStream::connect(addr).is_ok(),
@@ -312,7 +312,7 @@ async fn a_stop_closes_the_listeners_registered_with_it_when_it_is_given() {
     // Registered after the stop was given: closed at once.
     let socket = crate::listen::Socket::bind(any(), false).expect("bind");
     let addr = socket.local;
-    let (_incoming, latch) = socket.grpc().expect("registered");
+    let (_incoming, latch) = socket.grpc(None).expect("registered");
     stop.closes(latch);
     assert!(
         std::net::TcpStream::connect(addr).is_err(),
