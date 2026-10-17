@@ -447,19 +447,13 @@ and no dependency on any earlier stage.
 
 The additions:
 
-1. **A verdict check in `verify`.** This is a release-process control in GitHub; it is **not host-update trust** (hosts never
-   read the tag or the verdict, and verify only the artifact attestation). The tag is an annotated, signed git tag, created
-   by the maintainer who cuts the release, whose message carries the gamma verdict. It exists so a bare tag push by anyone
-   with write access cannot publish. A tag push by anyone with write access starts `release.yml` today, so the check is the gate. `verify`
-   checks the tag signature (ssh signature format, `ssh-keygen -Y verify`) against the releasing maintainers' public key **read from the
-   default branch's tip, never from the tagged tree**: the tagged commit controls the workflow and its files, and a committer
-   could otherwise replace the key in the very commit being tagged. The signed verdict binds the set hash and the tag name
-   as well as the commit, so a verdict cannot be moved to another tag. `verify` also checks that every gate is green, that
-   the bake lasted at least 24 hours, and that nothing was waived without a recorded waiver. No new channel back from the
-   operator's network is needed: the tag is the channel for the verdict. A tag with no verdict, or a red one, fails `verify`.
-   *Key lifecycle.* The key file changes only by a reviewed pull request that the owner approves (a code-owner rule); a
-   rotation adds the new key, then removes the old after one release; a compromised key is revoked by removing it, and the
-   tags signed by it are re-issued. A tag-protection ruleset restricting who may create `v*` tags is required (M19).
+1. **A verdict check in `verify`.** This is a release-process check in GitHub; it is **not host-update trust** (hosts never
+   read the tag or the verdict, and verify only the artifact attestation). The tag is an annotated git tag on main whose
+   message carries the gamma verdict (`gamma-verdict.json`). `verify` checks that the verdict names this commit, this set
+   hash and this tag, that every gate is green, that the bake lasted at least 24 hours, and that nothing was waived without
+   a recorded waiver. A tag with no verdict, or a red one, fails `verify`. **No signing key**: who may push a `v*` tag is
+   limited by the tag-protection ruleset on main (M19), and the `publish` job is gated by the `prod` environment's
+   required reviewer (item 2). A signing key would add key custody without adding protection beyond those two.
 2. **A `prod` environment with a required reviewer**, as kci's prod, on the `publish` job.
 3. **Release notes**: generated from the commits between the previous release and this one, plus the gamma verdict's summary
    (bake length, load, the gate values) and a list of anything that is not reversible (section 8.3). Notes are an artifact of
@@ -567,7 +561,7 @@ one issue with one done criterion. "Blocked by" names open pull requests or othe
 | M9 | Bake evaluator: baseline, minimum load, state file, verdict | a restart keeps the clock; an absent metric fails; thin usage extends | M10, M13 |  #950 |
 | M10 | Metric: failed actions by failure class | counter present, labelled by class | |  #951 |
 | M11 | Metric: Execute errors by cause | client abort distinguished from dropped | |  #952 |
-| M12 | Release workflow: verdict check on the signed tag (a release-process control, key from the default branch tip, set hash and tag bound), approval environment, notes | a tag with no or red verdict, or a forged key in the tagged tree, fails `verify` | M7, M9, M19 |  #953 |
+| M12 | Release workflow: verdict check on the release tag (commit, set hash and tag bound; no signing key), approval environment, notes | a tag with no verdict, a red one, or a verdict naming another commit, set or tag fails `verify` | M7, M9, M19 |  #953 |
 | M13 | Metrics: process boot counter and membership-state gauge | both exported; gates read them | |  #954 |
 | M14 | Metric: `FindMissingBlobs` latency histogram | histogram exported; latency gate added | |  #955 |
 | M15 | Updater walk-back: automatic desired-commit set on a red hard gate, mid-roll behaviour, not-reversible flags (B10, B11) | B10 and B11 green | M6, M7 |  #956 |
@@ -596,9 +590,9 @@ dependencies of every "0 failed actions" gate).
 3. **Where the bytes live for gamma.** Decided with the pull updater (#927): the frontend's release store and disk release
    index hold the bytes, filled by its release poller from the GitHub release; there is no feed to host. Whether gamma
    should keep working when GitHub is unreachable is answered by that store (a release already stored is deployable).
-4. **Verdict channel.** The signed tag carrying the verdict (section 8.1, a release-process control, not host trust) versus an
-   operator-posted check or comment. *Recommend the tag*, verified against the key at the default branch's tip: no token for the operator's side to hold in
-   Actions, and it is already the trigger of `release.yml`. Its weakness is the key's own change path (reviewed PR, section 8.1).
+4. **Verdict channel. Decided: the release tag's message, unsigned.** The verdict travels in the annotated `v*` tag on main;
+   the tag-protection ruleset limits who can push it and the `prod` environment reviewer gates `publish`. No signing key
+   (it would add custody with no new protection).
 5. **Does the operator's farm need to be the only gamma?** One farm's usage can be too thin to be a canary. The minimum-load
    rule makes that visible (the bake extends). *Recommend keeping one gamma now*, and revisiting if bakes routinely extend.
 6. **Automatic rollback during a bake.** *Recommend automatic offer for hard gates on a reversible release, a page otherwise*,
@@ -610,7 +604,7 @@ dependencies of every "0 failed actions" gate).
 9. **Where the harness sits when #936 lands.** The stand-in runtime goes. *Recommend B-0 on the stand-in with the weakening
    stated (section 4.2)*, and a crun-with-delegation check on `ubuntu-24.04` as its own item, so beta is not delayed by #936.
 10. **Length.** The page is about 590 lines against a 300 to 500 target. Review asked for fixes that add content (the
-    missing-metric rows, the rollback cases, the key lifecycle), so the minor request to trim was only partly taken (sections 10
+    missing-metric rows, the rollback cases), so the minor request to trim was only partly taken (sections 10
     and 11 were folded). *Recommend accepting the length*; the table in section 12 is most of it.
 
 ## 14. What this page changes in other documents
