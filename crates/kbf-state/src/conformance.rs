@@ -1,4 +1,4 @@
-//! The conformance suite C1 to C7, generic over a [`Backend`] factory so the in-memory
+//! The conformance suite C1 to C8, generic over a [`Backend`] factory so the in-memory
 //! fake, SQLite and Postgres run the same clauses. A backend's own tests call
 //! [`run_all`] with their factory; the fake's tests also run each clause against a
 //! deliberately broken fake and require it to panic.
@@ -7,14 +7,23 @@
 //! what a `should_panic(expected = ...)` test matches. No clause reads the wall clock:
 //! time is the [`ManualClock`] the backend is opened with, and waits are joins.
 
+use std::num::NonZeroUsize;
+use std::ops::Bound;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use crate::clock::{Clock, ManualClock};
 use crate::store::Store;
-use crate::types::{Change, Commit, Cond, Conflict, Event, Revision, Txn, Version, Versioned};
+use crate::types::{
+    Change, Commit, Cond, Conflict, Direction, Event, ResumeToken, Revision, ScanPage, ScanRange,
+    Txn, Version, Versioned,
+};
 use crate::{GROUP_COMMIT_WINDOW, TARGET_WRITES_PER_SECOND};
+
+mod c8_snapshot;
+
+pub use c8_snapshot::C8_SNAPSHOT_PREFIX;
 
 /// How many threads race one compare-and-set in C1.
 pub const C1_RACERS: usize = 8;
@@ -51,7 +60,7 @@ pub trait Backend {
     ) -> Result<(), Conflict>;
 }
 
-/// Runs C1 to C7 against `backend`.
+/// Runs C1 to C8 against `backend`.
 pub fn run_all<B: Backend>(backend: &B) {
     c1_linearizable_cas(backend);
     c2_atomic_txn(backend);
@@ -60,6 +69,7 @@ pub fn run_all<B: Backend>(backend: &B) {
     c5_ordered_feed(backend);
     c6_durable_ack(backend);
     c7_group_commit(backend);
+    c8_bounded_range_scan(backend);
 }
 
 fn run<S: Store>(store: &S, txn: Txn) -> Result<Commit, Conflict> {
@@ -207,6 +217,33 @@ pub fn c2_atomic_txn<B: Backend>(backend: &B) {
     assert_eq!(
         rows_before, rows_after,
         "C2 aborted: a conflicting transaction wrote feed rows"
+    );
+
+    // A counter is part of the transaction: an increment in one that aborts is not kept,
+    // so the next transaction gets the very next value (a counter kept outside the
+    // transaction, as a database sequence is, skips the aborted one).
+    let issued = commit.counters[0];
+    let conflict = run(
+        &store,
+        Txn::new()
+            .next("c2/n")
+            .next("c2/fresh")
+            .check("c2/b", Cond::Version(Version(u64::MAX))),
+    )
+    .expect_err("C2 counter: a transaction with a failing precondition must conflict");
+    assert_eq!(
+        conflict.index, 2,
+        "C2 counter: the conflict names the failing operation"
+    );
+    assert_eq!(
+        next_value(&store, "c2/n"),
+        issued + 1,
+        "C2 counter: a counter incremented in an aborted transaction changed"
+    );
+    assert_eq!(
+        next_value(&store, "c2/fresh"),
+        1,
+        "C2 counter: a counter first used in an aborted transaction was created"
     );
 }
 
@@ -365,6 +402,69 @@ pub fn c4_store_clock_expiry<B: Backend>(backend: &B) {
         value(&store, "c4/keep").is_some(),
         "C4 expiry: a key without a ttl never expires"
     );
+    c4_boundary(&store, &clock);
+}
+
+/// Puts `key` with a ttl and moves the clock to exactly the reading it expires at, having
+/// checked the key is still live one tick before. Returns the version it was put with.
+fn live_until_the_tick_before_expiry<S: Store>(
+    store: &S,
+    clock: &ManualClock,
+    key: &str,
+) -> Version {
+    const ONE_TICK: Duration = Duration::from_nanos(1);
+    run(
+        store,
+        Txn::new().put_ttl(key, "v", Duration::from_secs(5), Cond::Any),
+    )
+    .expect("create the boundary key");
+    let put = value(store, key).expect("the boundary key exists");
+    let expires = put
+        .expires_at
+        .expect("C4 boundary: a key put with a ttl reports when it expires");
+
+    clock.advance(expires.since(clock.now()) - ONE_TICK);
+    assert!(
+        value(store, key).is_some(),
+        "C4 boundary: a key must still be live one tick before its expiry"
+    );
+    clock.advance(ONE_TICK);
+    assert_eq!(
+        clock.now(),
+        expires,
+        "C4 boundary: the clock stands exactly at the expiry"
+    );
+    put.version
+}
+
+/// C4 at the boundary: a key is live up to the reading before `expires_at` and expired
+/// at the reading that equals it, for reads, scans, the reaper and preconditions alike.
+/// Reads and the reaper judge one key and preconditions another, since a backend may
+/// reap a key the first time a write sees it.
+fn c4_boundary<S: Store>(store: &S, clock: &ManualClock) {
+    live_until_the_tick_before_expiry(store, clock, "c4/edge/read");
+    assert!(
+        value(store, "c4/edge/read").is_none(),
+        "C4 boundary: a key whose ttl ends exactly now is expired, and get still reads it"
+    );
+    assert!(
+        store.scan_prefix("c4/edge/").expect("scan").is_empty(),
+        "C4 boundary: a key whose ttl ends exactly now is expired, and a scan still returns it"
+    );
+    assert_eq!(
+        store.reap_expired().expect("reap"),
+        1,
+        "C4 boundary: the reaper removes a key whose ttl ends exactly now"
+    );
+
+    let version = live_until_the_tick_before_expiry(store, clock, "c4/edge/cond");
+    run(store, Txn::new().check("c4/edge/cond", Cond::Absent))
+        .expect("C4 boundary: a key whose ttl ends exactly now counts as absent");
+    run(
+        store,
+        Txn::new().check("c4/edge/cond", Cond::Version(version)),
+    )
+    .expect_err("C4 boundary: a key whose ttl ends exactly now must not match its version");
 }
 
 /// C5: prefix scans are ordered; the feed resumes from a revision and never skips a row
@@ -534,10 +634,13 @@ pub fn c7_group_commit<B: Backend>(backend: &B) {
         results.iter().all(Result::is_ok),
         "C7 grouped: every write in the burst commits"
     );
-    assert!(
-        stats.syncs - stats_before.syncs <= 1,
-        "C7 syncs: the burst took {} durable syncs; a group needs one",
-        stats.syncs - stats_before.syncs
+    // Exactly one: none would be an acknowledgement before any sync, and more than one is
+    // a group that is not one (a second sync costs too little store time to show in the
+    // latency bound above, which the SQLite store's manual clock never advances anyway).
+    assert_eq!(
+        stats.syncs - stats_before.syncs,
+        1,
+        "C7 syncs: a burst of {burst} writes is one group and needs exactly one durable sync"
     );
     assert_eq!(
         stats.txns - stats_before.txns,
@@ -550,5 +653,365 @@ pub fn c7_group_commit<B: Backend>(backend: &B) {
         store.scan_prefix("c7/").expect("scan").len(),
         burst,
         "C7 durable: a write acknowledged in a group was lost across restart"
+    );
+}
+
+/// The live keys C8 stores under its prefix, in bytewise order: the prefix itself, plain
+/// keys, and a key whose multi-byte character sorts after every ASCII one.
+const C8_KEYS: [&str; 6] = ["c8/", "c8/a", "c8/b", "c8/c", "c8/d", "c8/\u{e9}"];
+
+/// Keys just outside C8's prefix on both sides: `.` sorts before `/`, and `0` and `~`
+/// after it.
+const C8_OUTSIDE: [&str; 4] = ["c8", "c8.z", "c80", "c8~"];
+
+/// A forward scan of all of C8's prefix, `limit` rows a page.
+fn c8_scan(limit: usize) -> ScanRange<'static> {
+    ScanRange::new(
+        "c8/",
+        NonZeroUsize::new(limit).expect("C8 limits are positive"),
+    )
+}
+
+fn page<S: Store>(store: &S, scan: ScanRange<'_>) -> ScanPage {
+    store.scan_range(scan).expect("the store is reachable")
+}
+
+fn keys_of(page: &ScanPage) -> Vec<&str> {
+    page.rows.iter().map(|(key, _)| key.as_str()).collect()
+}
+
+/// Every page of `scan`, following each page's token until a page has none.
+fn scan_all<S: Store>(store: &S, scan: ScanRange<'_>) -> Vec<ScanPage> {
+    let mut pages = vec![page(store, scan)];
+    while let Some(token) = pages.last().and_then(|last| last.resume.clone()) {
+        assert!(
+            pages.len() <= C8_KEYS.len() + C8_OUTSIDE.len() + 2,
+            "C8 resume: the scan never ends; a token resumes at or before its own page"
+        );
+        pages.push(page(store, scan.resume(&token)));
+    }
+    pages
+}
+
+/// Paging `scan` with every limit from 1 to one past the prefix returns `expected`, each
+/// page full but the last.
+fn assert_pages<S: Store>(store: &S, scan: ScanRange<'_>, expected: &[&str], clause: &str) {
+    for limit in 1..=C8_KEYS.len() + 1 {
+        let limit = NonZeroUsize::new(limit).expect("positive");
+        let pages = scan_all(store, ScanRange { limit, ..scan });
+        let keys: Vec<&str> = pages.iter().flat_map(keys_of).collect();
+        assert_eq!(
+            keys, expected,
+            "{clause}: paging with limit {limit} returns each live key of the range once, in order, and nothing else"
+        );
+        assert!(
+            pages.iter().all(|page| page.rows.len() <= limit.get()),
+            "{clause}: a page holds at most the limit"
+        );
+        assert!(
+            pages
+                .iter()
+                .rev()
+                .skip(1)
+                .all(|page| page.rows.len() == limit.get()),
+            "{clause}: only the last page may be short (expired keys do not shorten one)"
+        );
+    }
+}
+
+/// C8: a range scan under a prefix is bounded by its limit, ordered as C5's scan or its
+/// reverse, lies within its lower and upper bounds clipped to the prefix, and pages with
+/// a resume token that continues exactly past the last key, across concurrent commits;
+/// each page is read from one snapshot, which a second store checks against a racing
+/// writer.
+pub fn c8_bounded_range_scan<B: Backend>(backend: &B) {
+    let clock = Arc::new(ManualClock::default());
+    let store = backend.open(Arc::clone(&clock));
+    let mut seed = Txn::new();
+    for key in C8_KEYS.iter().rev().chain(C8_OUTSIDE.iter()) {
+        seed = seed.put(*key, *key, Cond::Any);
+    }
+    // A key between live ones that expires: it must neither appear nor shorten a page.
+    seed = seed.put_ttl("c8/bb", "gone", Duration::from_secs(1), Cond::Any);
+    run(&store, seed).expect("seed the C8 keys");
+    clock.advance(Duration::from_secs(2));
+
+    // Reverse runs before upper: the forward-only upper-bound flaws must reach C8 upper,
+    // and the reverse resume flaw must reach C8 reverse before C8 range sees it.
+    c8_forward(&store);
+    c8_reverse(&store);
+    c8_upper(&store);
+    c8_concurrent(&store);
+    c8_empty_prefix(&store);
+    c8_snapshot::c8_page_snapshot(backend);
+}
+
+/// C8 forward: the limit, the lower bound, the prefix and the token.
+fn c8_forward<S: Store>(store: &S) {
+    let first = page(store, c8_scan(2));
+    assert_eq!(
+        keys_of(&first),
+        ["c8/", "c8/a"],
+        "C8 limit: a scan with limit 2 must return the first 2 keys of the prefix in key order"
+    );
+    assert_eq!(
+        first.resume.as_ref().map(ResumeToken::key),
+        Some("c8/a"),
+        "C8 resume: a full page with keys after it names its last key"
+    );
+    assert_eq!(
+        first.rows[1].1,
+        value(store, "c8/a").expect("c8/a exists"),
+        "C8 limit: a row carries the key's value, version and expiry"
+    );
+    let from = |lower, limit| ScanRange {
+        lower,
+        ..c8_scan(limit)
+    };
+    assert_eq!(
+        keys_of(&page(store, from(Bound::Included("c8/c"), 2))),
+        ["c8/c", "c8/d"],
+        "C8 lower: an included lower key is the first row"
+    );
+    assert_eq!(
+        keys_of(&page(store, from(Bound::Included("c8/bz"), 1))),
+        ["c8/c"],
+        "C8 lower: a lower key that is not stored begins at the next key"
+    );
+    // `c8/bb` expired between `c8/b` and `c8/c`: the page is still full, and since a
+    // live key follows it, it still names its token.
+    let around = page(store, from(Bound::Included("c8/b"), 2));
+    assert_eq!(
+        (
+            keys_of(&around),
+            around.resume.as_ref().map(ResumeToken::key)
+        ),
+        (vec!["c8/b", "c8/c"], Some("c8/c")),
+        "C8 expiry: an expired key neither appears in a page, nor shortens it, nor costs it its token"
+    );
+    // The prefix: a lower bound past it finds nothing. `c8~` is stored past the prefix;
+    // nothing is stored at or after `c9`, so that scan runs off the end of the store.
+    for beyond in ["c8~", "c9"] {
+        let past = page(store, from(Bound::Included(beyond), 4));
+        assert_eq!(
+            keys_of(&past),
+            Vec::<&str>::new(),
+            "C8 prefix: a lower bound past the prefix ({beyond}) gives an empty page"
+        );
+        assert_eq!(
+            past.resume, None,
+            "C8 prefix: a lower bound past the prefix ({beyond}) gives a final page"
+        );
+    }
+    let whole = page(store, c8_scan(C8_KEYS.len()));
+    let listed: Vec<(String, Versioned)> = store.scan_prefix("c8/").expect("scan");
+    assert_eq!(
+        whole.rows, listed,
+        "C8 limit: a page as large as the prefix holds every live key, in scan_prefix's order"
+    );
+    assert_eq!(
+        whole.resume, None,
+        "C8 resume: a page that reached the end of the range has no token"
+    );
+
+    let token = first.resume.as_ref().expect("a token");
+    assert_eq!(
+        keys_of(&page(store, c8_scan(2).resume(token))),
+        ["c8/b", "c8/c"],
+        "C8 resume: the token must resume exactly after the last key of the page"
+    );
+    assert_eq!(
+        keys_of(&page(store, from(Bound::Excluded("c8/c"), 1))),
+        ["c8/d"],
+        "C8 lower: an excluded lower key is not returned"
+    );
+    for before in [Bound::Included("c8"), Bound::Excluded("c8.z")] {
+        assert_eq!(
+            keys_of(&page(store, from(before, 1))),
+            ["c8/"],
+            "C8 lower: a lower bound before the prefix begins at the prefix ({before:?})"
+        );
+    }
+    assert_eq!(
+        keys_of(&page(store, from(Bound::Excluded("c8/d"), 4))),
+        ["c8/\u{e9}"],
+        "C8 prefix: the page ends with the prefix's last key in byte order"
+    );
+    assert_pages(store, c8_scan(1), &C8_KEYS, "C8 prefix");
+}
+
+/// C8 upper: a forward scan stops at its upper bound, clipped to the prefix, and bounds
+/// that cross give an empty page.
+fn c8_upper<S: Store>(store: &S) {
+    let until = |upper, limit| ScanRange {
+        upper,
+        ..c8_scan(limit)
+    };
+    let included = page(store, until(Bound::Included("c8/b"), 8));
+    assert_eq!(
+        keys_of(&included),
+        ["c8/", "c8/a", "c8/b"],
+        "C8 upper: an included upper key is the last row"
+    );
+    assert_eq!(
+        included.resume, None,
+        "C8 upper: a page that reached the upper bound has no token"
+    );
+    assert_eq!(
+        keys_of(&page(store, until(Bound::Excluded("c8/b"), 8))),
+        ["c8/", "c8/a"],
+        "C8 upper: an excluded upper key is not returned"
+    );
+    assert_pages(
+        store,
+        until(Bound::Included("c8/b"), 1),
+        &C8_KEYS[..3],
+        "C8 upper",
+    );
+    assert_eq!(
+        keys_of(&page(store, until(Bound::Included("c9"), 8))),
+        C8_KEYS,
+        "C8 upper: an upper bound past the prefix stops at the prefix"
+    );
+    // Bounds that leave no key: before the prefix, crossed, and one key excluded.
+    let empty = [
+        (Bound::Unbounded, Bound::Included("c8.z")),
+        (Bound::Included("c8/d"), Bound::Included("c8/b")),
+        (Bound::Excluded("c8/b"), Bound::Excluded("c8/b")),
+        (Bound::Included("c8/b"), Bound::Excluded("c8/b")),
+        (Bound::Excluded("c8/b"), Bound::Included("c8/b")),
+    ];
+    for (lower, upper) in empty {
+        for direction in [Direction::Forward, Direction::Reverse] {
+            let none = page(
+                store,
+                ScanRange {
+                    lower,
+                    upper,
+                    direction,
+                    ..c8_scan(8)
+                },
+            );
+            assert_eq!(
+                (keys_of(&none), none.resume.as_ref()),
+                (Vec::<&str>::new(), None),
+                "C8 range: bounds {lower:?}..{upper:?} hold no key, so the page is empty and final"
+            );
+        }
+    }
+    let one = ScanRange {
+        lower: Bound::Included("c8/b"),
+        upper: Bound::Included("c8/b"),
+        ..c8_scan(8)
+    };
+    assert_eq!(
+        keys_of(&page(store, one)),
+        ["c8/b"],
+        "C8 range: equal included bounds hold their key"
+    );
+}
+
+/// C8 reverse: descending order from the upper bound, a token that resumes below the
+/// last key, and the lower bound and prefix as in a forward scan.
+fn c8_reverse<S: Store>(store: &S) {
+    let first = page(store, c8_scan(2).reverse());
+    assert_eq!(
+        keys_of(&first),
+        ["c8/\u{e9}", "c8/d"],
+        "C8 reverse: a reverse page holds the last keys of the range, descending"
+    );
+    let token = first
+        .resume
+        .as_ref()
+        .expect("C8 reverse: a full page has a token");
+    assert_eq!(
+        keys_of(&page(store, c8_scan(2).reverse().resume(token))),
+        ["c8/c", "c8/b"],
+        "C8 reverse resume: the token resumes just below the last key, and an expired key does not shorten the page"
+    );
+    let at_or_before = ScanRange {
+        upper: Bound::Included("c8/bz"),
+        ..c8_scan(1).reverse()
+    };
+    assert_eq!(
+        keys_of(&page(store, at_or_before)),
+        ["c8/b"],
+        "C8 reverse: limit 1 under an included upper bound is the last live key at or before it"
+    );
+    let down_to = ScanRange {
+        lower: Bound::Included("c8/c"),
+        ..c8_scan(8).reverse()
+    };
+    let stopped = page(store, down_to);
+    assert_eq!(
+        keys_of(&stopped),
+        ["c8/\u{e9}", "c8/d", "c8/c"],
+        "C8 reverse: a reverse scan stops at its lower bound"
+    );
+    assert_eq!(
+        stopped.resume, None,
+        "C8 reverse: a page that reached the lower bound has no token"
+    );
+    let descending: Vec<&str> = C8_KEYS.iter().rev().copied().collect();
+    assert_pages(
+        store,
+        c8_scan(1).reverse(),
+        &descending,
+        "C8 reverse paging",
+    );
+}
+
+/// C8 concurrent: commits between pages, behind the token, ahead of it, and a delete and
+/// an update ahead of it.
+fn c8_concurrent<S: Store>(store: &S) {
+    let first = page(store, c8_scan(3));
+    assert_eq!(
+        keys_of(&first),
+        ["c8/", "c8/a", "c8/b"],
+        "C8 limit: page of 3"
+    );
+    run(
+        store,
+        Txn::new()
+            .put("c8/aa", "behind", Cond::Absent)
+            .put("c8/bz", "ahead", Cond::Absent)
+            .put("c8/c", "updated", Cond::Any)
+            .delete("c8/d", Cond::Any),
+    )
+    .expect("the concurrent commit applies");
+    let token = first.resume.as_ref().expect("a token");
+    let rest = page(store, c8_scan(8).resume(token));
+    assert_eq!(
+        keys_of(&rest),
+        ["c8/bz", "c8/c", "c8/\u{e9}"],
+        "C8 concurrent keys: the next page holds keys committed ahead of the token, not behind it, and not a deleted key"
+    );
+    assert_eq!(
+        rest.rows[1].1.value, b"updated",
+        "C8 concurrent value: a page shows the value committed before it was read"
+    );
+}
+
+/// C8 empty prefix: every key is under it and no string follows them all, so the span
+/// has no upper bound and a scan runs to the end of the store, or from it in reverse.
+fn c8_empty_prefix<S: Store>(store: &S) {
+    let everything = ScanRange::new("", NonZeroUsize::new(8).expect("positive"));
+    let tail = ScanRange {
+        lower: Bound::Excluded("c8/\u{e9}"),
+        ..everything
+    };
+    assert_eq!(
+        keys_of(&page(store, tail)),
+        ["c80", "c8~"],
+        "C8 empty prefix: a forward scan runs from its lower bound to the last key in the store"
+    );
+    let last = ScanRange {
+        limit: NonZeroUsize::MIN,
+        ..everything.reverse()
+    };
+    assert_eq!(
+        keys_of(&page(store, last)),
+        ["c8~"],
+        "C8 empty prefix: a reverse scan begins at the last key in the store"
     );
 }

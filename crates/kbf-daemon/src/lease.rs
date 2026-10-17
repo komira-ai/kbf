@@ -18,6 +18,11 @@
 //! in the middle of a slow output upload sees it only when the upload ends) must not
 //! hold up the daemon's heartbeats or its next stream. A fenced lease reports, once
 //! its run has stopped, as lost to the farm, whatever the run's own outcome.
+//!
+//! A run whose driver panics reports INTERNAL, naming the panic, once the runtime has
+//! been asked to kill what the run left: the panic ends that run's task only
+//! (the all-in-one design, komira-build-farm#657, section 7.3), and its lease does
+//! not stay running.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -31,6 +36,7 @@ use kbf_types::{LeaseId, LostWhy, Resources};
 use prost::Message;
 use tokio::sync::mpsc;
 
+use crate::lease_panic::contained;
 use crate::phases::LeasePhases;
 use crate::runtime::{RuntimeError, Work};
 use crate::runtimes::{AnyRuntime, Runtimes};
@@ -108,7 +114,7 @@ impl Leases {
         let run = Arc::clone(&runtime);
         tokio::spawn(async move {
             let started = Instant::now();
-            let outcome = run.run(work).await;
+            let outcome = contained(run.as_ref(), id, work).await;
             // An error carries no result, so no usage: the runtime is asked for it. An
             // out-of-memory kill (the lease's own limit, or the node's) is marked.
             let usage = outcome.as_ref().err().and_then(|_| run.failed_usage(id));
@@ -377,6 +383,10 @@ pub(crate) fn proto_lease_id(id: LeaseId) -> worker::LeaseId {
 }
 
 #[cfg(test)]
+#[path = "lease_panic_tests.rs"]
+mod panic_tests;
+
+#[cfg(test)]
 mod tests {
     use kbf_proto::reapi::Digest;
 
@@ -571,6 +581,15 @@ mod tests {
         assert!(!leases.cancel(id()), "a finished lease");
     }
 
+    /// Asks every callsite again whether the subscriber just installed wants it.
+    /// tracing caches each callsite's interest when it is first reached; a test on
+    /// another thread that reaches the callsite while no subscriber (or only that
+    /// test's, with a lower filter) is registered leaves it cached as never, and
+    /// the capture then misses its line. Call it inside `with_default`.
+    fn rebuild_interest() {
+        tracing_core::callsite::rebuild_interest_cache();
+    }
+
     /// Bytes logged through [`Captured::writer`].
     #[derive(Clone, Default)]
     struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -610,6 +629,7 @@ mod tests {
             .with_writer(move || writer.clone())
             .finish();
         tracing::subscriber::with_default(subscriber, || {
+            rebuild_interest();
             leases.finished(ended, outcome, usage, &phases);
         });
         // Nothing is buffered; the subscriber never flushes.
@@ -699,6 +719,7 @@ mod tests {
             .with_writer(move || writer.clone())
             .finish();
         let result = tracing::subscriber::with_default(subscriber, || {
+            rebuild_interest();
             leases.finished(ended, outcome, usage, &phases)
         });
         let log = String::from_utf8(captured.0.lock().expect("log lock").clone()).expect("UTF-8");
