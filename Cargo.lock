@@ -1485,6 +1485,7 @@ dependencies = [
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
+ "kbf-update",
  "libc",
  "prost",
  "prost-types",
@@ -1857,6 +1858,7 @@ dependencies = [
  "kbf-threads",
  "kbf-transfer",
  "kbf-types",
+ "kbf-update",
  "libc",
  "prost",
  "rcgen",
@@ -2190,6 +2192,23 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "kbf-update"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "hex",
+ "kbf-proto",
+ "kbf-threads",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]
