@@ -75,7 +75,15 @@ fn node_info(id: NodeId, row: &NodeRow) -> Result<NodeInfo, Corrupt> {
 /// # Errors
 /// The store failing; a row that does not decode.
 pub fn list_nodes(store: &dyn Store) -> Result<Vec<NodeInfo>, RegistryError> {
-    unimplemented!("stub: the red-first commit has signatures only")
+    let mut out = Vec::new();
+    for (key, stored) in store.scan_prefix(NODE_PREFIX)? {
+        let id = key
+            .strip_prefix(NODE_PREFIX)
+            .and_then(|text| text.parse::<NodeId>().ok())
+            .ok_or(Corrupt("node key"))?;
+        out.push(node_info(id, &rows::decode(&stored, "node")?)?);
+    }
+    Ok(out)
 }
 
 /// The `deny/` keys that end a node's certificates: its unexpired serials (current and
@@ -134,7 +142,25 @@ pub fn revoke_node(
     id: &NodeId,
     by: &str,
 ) -> Result<Vec<DenyEntry>, RegistryError> {
-    unimplemented!("stub: the red-first commit has signatures only")
+    let key = rows::node_key(id);
+    for _ in 0..ATTEMPTS {
+        let read = rows::fetch::<NodeRow>(store, &key, "node")?.ok_or(RegistryError::NotFound)?;
+        if state_of(&read.row)? == NodeState::Revoked {
+            return Err(RegistryError::Invalid("the node is already revoked"));
+        }
+        let now = rows::seconds(store.now());
+        let mut row = read.row;
+        let keys = deny_keys(id, &row, now, true);
+        row.state = STATE_REVOKED;
+        row.revoked_at = Some(now);
+        row.revoked_by = by.to_owned();
+        let txn = Txn::new().put(&key, row.encode_to_vec(), Cond::Version(read.version));
+        let txn = with_deny_rows(txn, &keys, now, by, "revoked");
+        if store.txn(txn)?.is_ok() {
+            return keys.iter().map(|k| Ok(entry_of(k)?)).collect();
+        }
+    }
+    Err(RegistryError::Contended)
 }
 
 /// A deny row with who wrote it and why.
@@ -155,5 +181,15 @@ pub struct DenyRecord {
 /// # Errors
 /// The store failing; a row or key that does not decode.
 pub fn deny_rows(store: &dyn Store) -> Result<Vec<DenyRecord>, RegistryError> {
-    unimplemented!("stub: the red-first commit has signatures only")
+    let mut out = Vec::new();
+    for (key, stored) in store.scan_prefix(DENY_PREFIX)? {
+        let row: DenyRow = rows::decode(&stored, "deny")?;
+        out.push(DenyRecord {
+            entry: entry_of(&key)?,
+            reason: row.reason,
+            at: row.at,
+            by: row.by,
+        });
+    }
+    Ok(out)
 }

@@ -858,3 +858,34 @@ fn nothing_is_written_where_membership_scans() {
             .all(|k| k.starts_with("enroll/") || k.starts_with("deny/"))
     );
 }
+
+// Catches the key row written without Cond::Absent: another node registers the same key
+// between this call's check and its commit, and the commit must fail and be decided again
+// (then refused), not overwrite the other node's key row. (Mutant: Cond::Any on the key put.)
+#[test]
+fn a_key_registered_by_a_rival_during_the_commit_is_not_overwritten() {
+    let env = fake();
+    make_token(&env, 1, &spec(&[Daemon], 3));
+    // The rival uses another token, so the token row's version cannot be what conflicts.
+    make_token(&env, 2, &spec(&[Daemon], 3));
+    let wrap = Wrap::new(env.store.clone(), Mode::Pass);
+    let rival = Arc::clone(&env.store);
+    let now = env.now();
+    wrap.before_first_txn(move || {
+        let mut sign_rival = || Ok(issue(&[Daemon], 1, now));
+        Req::new(2, "rival", &[Daemon])
+            .run(&*rival, &mut sign_rival)
+            .expect("rival");
+    });
+    let late = Req::new(1, "n1", &[Daemon]).run(&wrap, &mut || {
+        // The rival's key under a serial of our own, so only the key row can conflict.
+        let mut certs = issue(&[Daemon], 1, now);
+        certs[0].serial = vec![0x77];
+        Ok(certs)
+    });
+    assert_eq!(late, Err(R::BadCsr));
+    let nodes = list_nodes(&*env.store).expect("nodes");
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].id, node("rival"));
+    assert_eq!(token(&env, 1).uses, 0);
+}

@@ -59,7 +59,7 @@ pub fn renew_txn(
     req: &RenewRequest<'_>,
     sign: &mut dyn FnMut() -> Result<Vec<IssuedRole>, RefusalReason>,
 ) -> Result<Enrolled, RefusalReason> {
-    unimplemented!("stub: the red-first commit has signatures only")
+    attempt(store, req, sign).map_err(|fail| fail.0)
 }
 
 fn attempt(

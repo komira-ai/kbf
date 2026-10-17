@@ -109,7 +109,36 @@ pub fn create_token(
     secret: &TokenSecret,
     spec: &TokenSpec,
 ) -> Result<TokenInfo, RegistryError> {
-    unimplemented!("stub: the red-first commit has signatures only")
+    if !(1..=MAX_USES).contains(&spec.max_uses) {
+        return Err(RegistryError::Invalid("max_uses must be 1 to 1000"));
+    }
+    let ttl = spec.ttl.unwrap_or(DEFAULT_TTL);
+    if ttl < Duration::from_secs(1) || ttl > MAX_TTL {
+        return Err(RegistryError::Invalid(
+            "expires_in must be at least a second and at most 30 days",
+        ));
+    }
+    let now = rows::seconds(store.now());
+    let row = TokenRow {
+        secret_sha256: secret_digest(secret.as_bytes()).to_vec(),
+        roles: spec.roles.iter().map(|r| r.name().to_owned()).collect(),
+        max_uses: spec.max_uses,
+        uses: 0,
+        expires_at: now + ttl.as_secs(),
+        node_id: spec.node_id.as_ref().map(ToString::to_string),
+        node_prefix: spec.node_prefix.clone(),
+        names: spec.names.clone(),
+        replace: spec.replace,
+        label: spec.label.clone(),
+        created_at: now,
+        created_by: spec.created_by.clone(),
+        revoked_at: None,
+    };
+    let txn = Txn::new().put(rows::token_key(id), row.encode_to_vec(), Cond::Absent);
+    if store.txn(txn)?.is_err() {
+        return Err(RegistryError::Invalid("a token with this id exists"));
+    }
+    Ok(info(id, &row)?)
 }
 
 /// Every token, by id. The secret is not in the answer.
@@ -117,7 +146,15 @@ pub fn create_token(
 /// # Errors
 /// The store failing; a row that does not decode.
 pub fn list_tokens(store: &dyn Store) -> Result<Vec<TokenInfo>, RegistryError> {
-    unimplemented!("stub: the red-first commit has signatures only")
+    let mut out = Vec::new();
+    for (key, stored) in store.scan_prefix(TOKEN_PREFIX)? {
+        let id = key
+            .strip_prefix(TOKEN_PREFIX)
+            .and_then(|text| TokenId::parse(text).ok())
+            .ok_or(Corrupt("token key"))?;
+        out.push(info(&id, &rows::decode(&stored, "token")?)?);
+    }
+    Ok(out)
 }
 
 /// Sets `revoked_at` on a token, which stops new enrollments with it; nodes already
@@ -127,5 +164,18 @@ pub fn list_tokens(store: &dyn Store) -> Result<Vec<TokenInfo>, RegistryError> {
 /// [`RegistryError::NotFound`] for an unknown id; the store failing;
 /// [`RegistryError::Contended`].
 pub fn revoke_token(store: &dyn Store, id: &TokenId) -> Result<(), RegistryError> {
-    unimplemented!("stub: the red-first commit has signatures only")
+    let key = rows::token_key(id);
+    for _ in 0..ATTEMPTS {
+        let stored = store.get(&key)?.ok_or(RegistryError::NotFound)?;
+        let mut row: TokenRow = rows::decode(&stored, "token")?;
+        if row.revoked_at.is_some() {
+            return Ok(());
+        }
+        row.revoked_at = Some(rows::seconds(store.now()));
+        let txn = Txn::new().put(&key, row.encode_to_vec(), Cond::Version(stored.version));
+        if store.txn(txn)?.is_ok() {
+            return Ok(());
+        }
+    }
+    Err(RegistryError::Contended)
 }

@@ -93,7 +93,16 @@ pub struct EnrollRequest<'a> {
 /// name, a zero byte, the CSR's length as four big-endian bytes and the CSR.
 #[must_use]
 pub fn request_hash(csrs: &[(Role, &[u8])]) -> [u8; 32] {
-    unimplemented!("stub: the red-first commit has signatures only")
+    let mut sorted: Vec<&(Role, &[u8])> = csrs.iter().collect();
+    sorted.sort_by_key(|(role, _)| *role);
+    let mut hash = Sha256::new();
+    for (role, der) in sorted {
+        hash.update(role.name().as_bytes());
+        hash.update([0u8]);
+        hash.update(u32::try_from(der.len()).unwrap_or(u32::MAX).to_be_bytes());
+        hash.update(der);
+    }
+    hash.finalize().into()
 }
 
 pub(crate) fn stored_certs(row: &NodeRow) -> Result<Vec<StoredCert>, crate::error::Corrupt> {
@@ -274,7 +283,7 @@ pub fn enroll_txn(
     req: &EnrollRequest<'_>,
     sign: &mut dyn FnMut() -> Result<Vec<IssuedRole>, RefusalReason>,
 ) -> Result<Enrolled, RefusalReason> {
-    unimplemented!("stub: the red-first commit has signatures only")
+    attempt(store, req, sign).map_err(|fail| fail.0)
 }
 
 fn attempt(

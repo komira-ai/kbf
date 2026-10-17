@@ -79,7 +79,7 @@ fn generation_of(stored: Option<&Versioned>) -> Result<u64, RegistryError> {
 /// # Errors
 /// The store failing; a value that is not eight bytes.
 pub fn ca_generation(store: &dyn Store) -> Result<u64, RegistryError> {
-    unimplemented!("stub: the red-first commit has signatures only")
+    generation_of(store.get(CA_GENERATION)?.as_ref())
 }
 
 /// Adds one to the count of CA bundle changes and returns the new count.
@@ -87,5 +87,16 @@ pub fn ca_generation(store: &dyn Store) -> Result<u64, RegistryError> {
 /// # Errors
 /// As [`ca_generation`]; [`RegistryError::Contended`].
 pub fn bump_ca_generation(store: &dyn Store) -> Result<u64, RegistryError> {
-    unimplemented!("stub: the red-first commit has signatures only")
+    for _ in 0..ATTEMPTS {
+        let stored = store.get(CA_GENERATION)?;
+        let next = generation_of(stored.as_ref())? + 1;
+        let cond = stored.map_or(Cond::Absent, |s| Cond::Version(s.version));
+        if store
+            .txn(Txn::new().put(CA_GENERATION, next.to_be_bytes(), cond))?
+            .is_ok()
+        {
+            return Ok(next);
+        }
+    }
+    Err(RegistryError::Contended)
 }
