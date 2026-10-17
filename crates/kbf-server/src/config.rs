@@ -220,7 +220,10 @@ pub struct Args {
     /// PEM private key of the worker listener.
     #[arg(long, requires_all = ["worker_tls_cert", "worker_client_ca"])]
     pub worker_tls_key: Option<PathBuf>,
-    /// PEM CA that daemon client certificates must chain to.
+    /// PEM CA that client certificates must chain to. Each must also name the role the
+    /// method it calls takes: the daemon role (`urn:kbf:role:daemon`) for the worker
+    /// session and blob calls, the storage role (`urn:kbf:role:storage`) for
+    /// `kbf.map.v1.Membership`; a frontend certificate may call nothing here.
     #[arg(long, requires_all = ["worker_tls_cert", "worker_tls_key"])]
     pub worker_client_ca: Option<PathBuf>,
     /// The worker listener's deny list: certificate serials, public keys and node ids

@@ -720,11 +720,11 @@ fn bad_settings_are_refused_before_anything_renders() {
         ),
         (
             format!("{EXAMPLE}KBF_RAM=1\n"),
-            "line 67: unknown key KBF_RAM",
+            "line 101: unknown key KBF_RAM",
         ),
         (
             format!("{EXAMPLE}KBF_RAM_GIB=1\n"),
-            "line 67: KBF_RAM_GIB is already set on line 17",
+            "line 101: KBF_RAM_GIB is already set on line 24",
         ),
         (
             example_with(&[("KBF_NODE_ID", "a;b")]),
@@ -917,6 +917,10 @@ fn an_unset_key_takes_the_default_config_example_shows() {
     assert_eq!(
         LinuxConfig {
             minio_s3_endpoint: example.minio_s3_endpoint.clone(),
+            // The example names another frontend and a storage node to call; left out,
+            // the frontend is this host and there is no storage URL.
+            frontend_name: example.frontend_name.clone(),
+            storage_url: example.storage_url.clone(),
             ..minimal.clone()
         },
         example

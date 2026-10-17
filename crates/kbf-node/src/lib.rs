@@ -394,7 +394,7 @@ pub fn start(cli: &Cli) -> Result<NodeHandle, Error> {
     let maps = Arc::new(MapHolder::new());
     let held = Arc::clone(&maps);
     start_over(cli, Some(maps), move |cli, liveness| {
-        farm(cli, &held, liveness)
+        farm(cli, &held, liveness).map(|(plane, _)| plane)
     })
 }
 
@@ -449,19 +449,24 @@ fn start_over<C: Cas>(
 /// never `--tls-server-name`, which names the frontend). A frontend that sends no map
 /// leaves the daemon on `--cas`, as before the map existed. Each change of side is
 /// logged once, by the plane.
-fn farm(cli: &Cli, maps: &Arc<MapHolder>, liveness: Liveness) -> Result<Arc<FarmCas>, Error> {
+///
+/// Answers the plane with the liveness its storage nodes hold, read back from them: the
+/// plane keeps them as `dyn Nodes`, which has none to read, and a test must see that the
+/// flags arrived (`start` drops it).
+fn farm(
+    cli: &Cli,
+    maps: &Arc<MapHolder>,
+    liveness: Liveness,
+) -> Result<(Arc<FarmCas>, Liveness), Error> {
     let server = Arc::new(transfer::engine(cli)?);
     let nodes = kbf_daemon::storage_nodes(&DaemonConfig::from_args(&cli.daemon).tls, liveness)?;
     tracing::info!(
         "data plane: through --cas until the frontend sends a storage map, then to the \
          storage nodes it names"
     );
-    Ok(Arc::new(FarmCas::new(
-        server,
-        Arc::clone(maps),
-        nodes,
-        &cli.transfer.config(),
-    )))
+    let held = nodes.liveness();
+    let plane = FarmCas::new(server, Arc::clone(maps), nodes, &cli.transfer.config());
+    Ok((Arc::new(plane), held))
 }
 
 /// The engine over `--cas` alone, for tests of the node's set-up.
@@ -1663,6 +1668,70 @@ mod tests {
         assert!(why.contains("ca.pem"), "{why}");
     }
 
+    /// The three liveness flags, each different from the others and from the defaults, so
+    /// that a default, or two values swapped, differs from what was asked.
+    const LIVENESS_FLAGS: [&str; 3] = [
+        "--storage-dial-timeout-ms=7000",
+        "--storage-ping-interval-ms=3000",
+        "--storage-ping-timeout-ms=2000",
+    ];
+
+    fn asked() -> Liveness {
+        Liveness {
+            connect: Duration::from_millis(7000),
+            keepalive_interval: Duration::from_millis(3000),
+            keepalive_timeout: Duration::from_millis(2000),
+        }
+    }
+
+    /// Catches the storage-liveness flags stopping short of the nodes the daemon dials
+    /// storage through: `start` handing its plane the defaults instead of the checked
+    /// flags, or interval and timeout swapped on the way. Both the plane factory's
+    /// argument (`start_with`'s and `start`'s path through `start_over`) and the
+    /// `TlsNodes` that `farm` builds are read back.
+    #[test]
+    fn the_storage_liveness_flags_reach_the_plane_and_its_nodes() {
+        assert_ne!(asked(), Liveness::default());
+        let dir = scratch("liveness");
+        tls_files(&dir);
+        let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
+        let mut flags = vec![
+            "kbf-daemon".to_owned(),
+            "--server=https://127.0.0.1:1".to_owned(),
+            flag("ca-cert", &dir.join("ca.pem")),
+            flag("cert", &dir.join("node.pem")),
+            flag("key", &dir.join("node.key")),
+            "--node-id=mac-1".to_owned(),
+            // A driver that moves blobs, so that the plane is made.
+            "--driver=native".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
+            flag("data-dir", &dir),
+            flag("xcode-apps", &dir.join("Applications")),
+        ];
+        flags.extend(LIVENESS_FLAGS.map(str::to_owned));
+        let cli = Cli::try_parse_from(flags).expect("flags");
+        // `farm` builds the nodes from what it is given; what it holds is read back.
+        // The lazy channel to --cas needs a runtime's context.
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        {
+            let _context = runtime.enter();
+            let (_, held) = farm(&cli, &Arc::new(MapHolder::new()), asked()).expect("the plane");
+            assert_eq!(held, asked());
+        }
+        drop(runtime);
+        // start_over checks the flags and hands the plane factory the checked values.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let record = Arc::clone(&seen);
+        let handle = start_over(&cli, None, move |cli, liveness| {
+            *record.lock().expect("lock") = Some(liveness);
+            remote(cli)
+        })
+        .expect("start");
+        drop(handle);
+        assert_eq!(*seen.lock().expect("lock"), Some(asked()));
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
     /// Catches a daemon that starts with storage-liveness flags it cannot honour: a zero
     /// value, or a ping timeout past the interval, is refused by `start` (and by
     /// `start_with`, as the same check) before any driver is set up, naming the flag.
@@ -1684,6 +1753,18 @@ mod tests {
             (
                 "--storage-ping-timeout-ms=10001",
                 "is longer than --storage-ping-interval-ms",
+            ),
+            (
+                "--storage-dial-timeout-ms=3600001",
+                "--storage-dial-timeout-ms must be at most 3600000",
+            ),
+            (
+                "--storage-ping-interval-ms=3600001",
+                "--storage-ping-interval-ms must be at most 3600000",
+            ),
+            (
+                "--storage-ping-timeout-ms=3600001",
+                "--storage-ping-timeout-ms must be at most 3600000",
             ),
         ] {
             let cli = parse(&["--driver=fake", flag]).expect("flags parse");

@@ -2,6 +2,10 @@
 //! the deny list (issue #79). The same rules admit a worker stream and each blob call
 //! a daemon makes on that listener ([`crate::blobs`]).
 //!
+//! **The role** is checked before any of this, per method, by the listener's table
+//! ([`crate::worker_roles`]): a worker stream or a blob call reaches these rules only
+//! from a certificate naming the daemon role.
+//!
 //! **The rule.** Under mutual TLS a daemon's client certificate must carry exactly one
 //! DNS name in its subjectAltName extension, and that name must equal, byte for byte,
 //! the `node_id` of every `Hello` the stream sends. The subject's common name is not
@@ -133,8 +137,9 @@ pub enum Peers {
 }
 
 impl Peers {
-    /// The certificate of a new stream, from the chain TLS verified (`leaf` is its
-    /// first certificate; `None` in plain text).
+    /// The certificate of a new stream or blob call, from the chain TLS verified (`leaf`
+    /// is its first certificate; `None` in plain text). Its role was checked before the
+    /// call was routed ([`crate::worker_roles`]).
     ///
     /// # Errors
     /// UNAUTHENTICATED: under mutual TLS, there is no certificate or it does not parse.
