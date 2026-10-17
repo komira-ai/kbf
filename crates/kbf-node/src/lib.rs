@@ -79,6 +79,12 @@ pub struct Cli {
     /// one connection, within the `--transfer-*` limits.
     #[arg(long)]
     cas: Option<String>,
+    /// The update directory: the daemon fetches the release the frontend offers into
+    /// its `inbox/`, over the connection `--cas` names, and reads the root helper's
+    /// `status.json` there. Left out, the node updates by hand: it says so and touches
+    /// no directory. Not taken by the all-in-one binary yet.
+    #[arg(long, value_name = "DIR")]
+    update_dir: Option<PathBuf>,
     #[command(flatten)]
     data: data_dir::DataArgs,
     #[command(flatten)]
@@ -447,6 +453,16 @@ fn start_over<C: Cas>(
         // The CAS channel is made lazily, which needs the runtime's context.
         let _context = tokio.enter();
         let xcrun = Path::new(xcode::XCRUN);
+        // The update client is the frontend's daemon's alone: the in-process daemon of
+        // the all-in-one binary keeps none (its flags may not name one, so that none is
+        // silently ignored).
+        let update = match &maps {
+            Some(_) => Some(update::link(cli)?),
+            None if cli.update_dir.is_some() => {
+                return Err("--update-dir is not taken by the in-process daemon yet".into());
+            }
+            None => None,
+        };
         let (daemon, _) = node_over(
             cli,
             || native_config(cli),
@@ -454,6 +470,7 @@ fn start_over<C: Cas>(
             maps,
             Box::new(move |cli| plane(cli, liveness)),
         )?;
+        let daemon = update.into_iter().fold(daemon, Daemon::with_update);
         backstop(cli, daemon)
     };
     Ok(NodeHandle { tokio, daemon })
@@ -1027,6 +1044,7 @@ mod data_dir;
 mod instance;
 mod run;
 mod transfer;
+mod update;
 mod whole_machine;
 
 #[cfg(test)]
