@@ -139,9 +139,17 @@ fn a_taken_over_operation_without_a_subject_row_logs_the_empty_shape() {
     let old = disk.generation_farm();
     submit_described(&old);
     disk.crash(old);
+    let keys: Vec<String> = disk
+        .store
+        .scan_prefix("subject/")
+        .expect("scan")
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    assert_eq!(keys.len(), 1, "one subject row expected: {keys:?}");
     disk.store
         .apply_batch(vec![
-            Txn::new().delete("subject/0000000000000001", kbf_state::Cond::Any),
+            Txn::new().delete(keys[0].clone(), kbf_state::Cond::Any),
         ])
         .expect("the row removed");
     assert_eq!(disk.rows("subject/"), 0);
