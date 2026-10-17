@@ -439,14 +439,18 @@ mod tests {
     /// as in flight (the gauge reads 2: one running, one queued) and its wait is at least
     /// the time the first was held after the second was queued (not 0), observed by
     /// `kbf_tier_wait_seconds`; the gauge is back to 0 after. A wait taken from the
-    /// closure's end instead of its start, or a gauge raised inside the closure (it
-    /// would read 1, not 2, while one call waits), is caught.
+    /// closure's end instead of its start (the first call's wait would then cover the
+    /// whole time it is held, not the instant before it starts), or a gauge raised
+    /// inside the closure (it would read 1, not 2, while one call waits), is caught.
     ///
     /// Ordering comes from channels, not from sleeps: the first call signals that it
     /// holds the pool thread and blocks until released; the test queues the second only
-    /// then, and releases the first only once the gauge shows both calls. The only clock
-    /// reading is a lower bound (the wait covers the hold), which a slow runner can
-    /// only enlarge.
+    /// then, and releases the first only once the gauge shows both calls. The second is
+    /// held too, so that after the first finishes `kbf_tier_wait_seconds` holds the
+    /// first call's wait alone. The clock readings are one lower bound (the second's
+    /// wait covers the hold), which a slow runner can only enlarge, and one upper
+    /// bound that no runner can break: the first's wait cannot exceed the time the
+    /// test itself spent until the first call signalled that it started.
     #[test]
     fn a_call_waiting_for_a_pool_thread_is_counted_and_its_wait_observed() {
         const HOLD: Duration = Duration::from_millis(100);
@@ -460,6 +464,8 @@ mod tests {
         runtime.block_on(async {
             let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
             let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let (release_second_tx, release_second_rx) = std::sync::mpsc::channel::<()>();
+            let began = Instant::now();
             let first = {
                 let metrics = Arc::clone(&metrics);
                 tokio::spawn(async move {
@@ -476,11 +482,24 @@ mod tests {
             };
             // The first call holds the only pool thread; only now is the second queued.
             started_rx.await.expect("the first call started");
+            let startup = began.elapsed();
             let second = {
                 let metrics = Arc::clone(&metrics);
-                tokio::spawn(async move { blocking(&metrics, Box::new(|| Ok(2_u8))).await })
+                tokio::spawn(async move {
+                    blocking(
+                        &metrics,
+                        Box::new(move || {
+                            release_second_rx
+                                .recv()
+                                .expect("the test releases the call");
+                            Ok(2_u8)
+                        }),
+                    )
+                    .await
+                })
             };
             // The gauge counts a queued call: it reaches 2 with the first still held.
+            // The 60 s is a hang guard only: a regression fails here instead of hanging.
             tokio::time::timeout(Duration::from_secs(60), async {
                 while metrics.tier_in_flight.get() != 2 {
                     tokio::task::yield_now().await;
@@ -497,13 +516,25 @@ mod tests {
             tokio::time::sleep(HOLD).await;
             release_tx.send(()).expect("the first call is waiting");
             assert!(matches!(first.await.expect("joined"), Ok(1)));
+            // Only the first call's wait is observed so far (the second is held on the
+            // pool thread; its wait is observed when it ends). The first was handed to
+            // the pool after `began` and started before the test saw its signal, so its
+            // wait cannot exceed `startup`; taken from the closure's end it would cover
+            // the whole hold and be at least HOLD.
+            assert_eq!(metrics.tier_wait.count(), 1, "the second is still held");
+            let first_wait = Duration::from_nanos(metrics.tier_wait.sum());
+            assert!(first_wait <= startup, "{first_wait:?} > {startup:?}");
+            release_second_tx
+                .send(())
+                .expect("the second call is waiting");
             assert!(matches!(second.await.expect("joined"), Ok(2)));
         });
         assert_eq!(metrics.tier_in_flight.get(), 0);
         assert_eq!(metrics.tier_wait.count(), 2);
         assert_eq!(metrics.tier_call.count(), 2);
         // The second waited at least HOLD (the first was held that long after the
-        // second was queued); the first did not wait. A slower runner only adds to it.
+        // second was queued) and the first's wait was only `startup`. A slower runner
+        // only adds to the second's wait.
         let waited = Duration::from_nanos(metrics.tier_wait.sum());
         assert!(waited >= HOLD / 2, "{waited:?}");
     }
