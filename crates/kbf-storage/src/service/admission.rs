@@ -110,7 +110,7 @@ impl Admission {
     /// identity and takes the rule of every other call but a copy: admitted.
     #[must_use]
     pub fn permits_unowned<T>(&self, request: &Request<T>) -> bool {
-        let certs = request.peer_certs();
+        let certs = kbf_tls::peer_certs(request);
         let leaf = certs.as_deref().and_then(|chain| chain.first());
         self.permits_unowned_leaf(leaf.map(AsRef::as_ref))
     }

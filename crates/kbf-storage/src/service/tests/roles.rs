@@ -155,6 +155,30 @@ fn only_the_frontend_may_ask_for_an_unowned_copy() {
     assert!(Admission::Open.permits_unowned_leaf(None));
 }
 
+/// Catches an unowned marker that changes what a chain copy is: a leg that carries the marker
+/// is still a leg (judged by a copy's rules: stored where the map says the node owns the blob,
+/// refused where it does not), never an unowned local write. Only a call with no leg, that asked,
+/// from a caller that may ask, is taken as an unowned copy. (Admission already refuses a leg
+/// from any caller but a storage node, and a storage node may not ask for an unowned copy, so
+/// no call reaches the guard with both; it is tested where it is decided.)
+#[test]
+fn a_chain_copy_with_the_unowned_marker_is_still_a_chain_copy() {
+    use super::super::generation::takes_unowned;
+    use kbf_map::MemberId;
+    let leg = Some(MemberId(2));
+    for marked in [false, true] {
+        for permitted in [false, true] {
+            assert!(
+                !takes_unowned(leg, marked, permitted),
+                "{marked} {permitted}"
+            );
+        }
+    }
+    assert!(takes_unowned(None, true, true));
+    assert!(!takes_unowned(None, true, false));
+    assert!(!takes_unowned(None, false, true));
+}
+
 /// A CA, the server's certificate, and client certificates by role.
 pub(crate) struct Pki {
     ca: CertifiedIssuer<'static, KeyPair>,

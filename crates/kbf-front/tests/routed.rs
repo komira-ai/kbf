@@ -765,6 +765,74 @@ async fn a_node_that_judges_its_map_is_called_at_the_generation_the_frontend_hol
     );
 }
 
+/// What a node holds of a map the test moves.
+struct Moving(Mutex<Arc<Map>>);
+
+impl kbf_storage::replicate::MapSource for Moving {
+    fn current(&self) -> Option<Arc<Map>> {
+        Some(Arc::clone(
+            &self.0.lock().unwrap_or_else(PoisonError::into_inner),
+        ))
+    }
+
+    fn me(&self) -> Option<MemberId> {
+        None
+    }
+}
+
+/// Catches a frontend that takes the generation for its `--storage` calls once: the map moves
+/// from 5 to 6 (the node's and the frontend's), and the next call, made by the same backend
+/// and the same proxy, is tagged 6 and answered, not refused as behind (STALE_MAP naming 6).
+/// Mutant: the generation tagged on the first call only.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bootstrap_calls_follow_a_map_bump() {
+    let five = Farm::map(5, &[MemberState::Active], 1);
+    let held = Arc::new(Moving(Mutex::new(Arc::clone(&five))));
+    let store: Arc<dyn Storage> = Arc::new(CacheStorage::new(
+        Arc::new(Cache::memory()),
+        SegmentsConfig::DEFAULT,
+    ));
+    let config = Config {
+        write_bytes_in_flight: 64 << 20,
+    };
+    let service = StorageService::new(Arc::clone(&store), Admission::Open, config)
+        .with_map(Arc::clone(&held) as Arc<dyn kbf_storage::replicate::MapSource>);
+    let channel = lazy(serve(service.routes()));
+
+    let farm = Farm::new(None);
+    let handle = RemoteStorage::new(channel.clone(), 0);
+    let routed = Arc::new(
+        Routed::new(farm.cell.clone(), farm.plain.clone(), farm.plain.clone())
+            .bootstrapped(handle.clone()),
+    );
+    let backend = Backend::routed(Arc::clone(&routed), Arc::new(handle));
+    let owners = Owners::routed(Arc::clone(&routed), Owner::new("bootstrap", channel));
+    let front = lazy(serve(
+        Proxy::new(owners, Arc::new(Authorizers::allow_all())).routes(),
+    ));
+    let blobs: Vec<_> = (0..4).map(blob).collect();
+    let digests: Vec<_> = blobs.iter().map(|(_, d)| *d).collect();
+
+    farm.cell.set(five);
+    assert_eq!(update(&front, &blobs[..2]).await, vec![OK; 2]);
+    assert_eq!(
+        backend.find_missing(&digests).await.expect("at 5"),
+        digests[2..]
+    );
+
+    let six = Farm::map(6, &[MemberState::Active], 1);
+    *held.0.lock().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&six);
+    farm.cell.set(six);
+    assert_eq!(update(&front, &blobs[2..]).await, vec![OK; 2]);
+    assert!(
+        backend
+            .find_missing(&digests)
+            .await
+            .expect("at 6")
+            .is_empty()
+    );
+}
+
 /// Catches a farm that shrinks to one member being sent back to the `--storage` node,
 /// which may be one that left: with members 1 to 3 and `--storage` naming node 1, the map
 /// becomes node 2 alone, and a write lands on node 2 (as the map says), not node 1. The

@@ -32,6 +32,14 @@ pub(super) fn unowned<T>(request: &Request<T>) -> bool {
     request.metadata().get(UNOWNED_HEADER).is_some()
 }
 
+/// Whether a write is taken as an unowned copy: it asked to be one (`marked`), its caller
+/// may ask ([`super::Admission::permits_unowned`]), and it is not a chain copy (`leg_from`):
+/// a leg is a copy from another node, judged by the chain's rules for one, and the marker
+/// on it changes nothing.
+pub(super) fn takes_unowned(leg_from: Option<MemberId>, marked: bool, permitted: bool) -> bool {
+    leg_from.is_none() && marked && permitted
+}
+
 /// The member that sent `request` as a copy of a blob it holds (the `kbf-chain-leg`
 /// entry), if the call is one.
 ///

@@ -73,9 +73,11 @@ impl ByteStream for StorageService {
         let leg_from = generation::leg(&request)?;
         // Only the frontend's identity may ask for an unowned copy; any other caller that
         // sends the header gets the plain-write rule.
-        let unowned = leg_from.is_none()
-            && generation::unowned(&request)
-            && self.admission.permits_unowned(&request);
+        let unowned = generation::takes_unowned(
+            leg_from,
+            generation::unowned(&request),
+            self.admission.permits_unowned(&request),
+        );
         let endpoint = if leg_from.is_some() {
             Endpoint::WriteLeg
         } else {

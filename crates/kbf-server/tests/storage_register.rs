@@ -1043,6 +1043,112 @@ async fn a_write_through_the_halfs_in_process_view_is_judged_by_the_map_and_owes
     );
 }
 
+/// Catches an unowned-copy marker that does not survive the real listener's TLS: the
+/// frontend's closure copy reached a node's listener (a `TlsSource`, not a bare tonic
+/// config) and was refused as a plain write because the caller's certificate was read from
+/// the wrong place, so an action-cache entry was refused on a farm of three. A real half
+/// holds a map in which another member owns the blob (r = 1): a plain write from a frontend
+/// is refused "not the primary"; the marker from a `daemon` certificate is refused the same;
+/// from the `frontend` certificate the blob is stored here as one copy.
+#[tokio::test]
+async fn the_frontends_unowned_copy_is_stored_through_the_real_listener() {
+    let pki = Pki::new();
+    let (frontend_cert, frontend_key) = pki.cert("frontend");
+    let worker_tls = WorkerTls {
+        server: TlsSource::fixed(
+            "worker",
+            frontend_cert.as_bytes(),
+            frontend_key.as_bytes(),
+            Some(pki.ca.pem().as_bytes()),
+        )
+        .expect("the worker listener's TLS"),
+        deny_list: None,
+    };
+    let f = frontend(Some(worker_tls));
+    let d = dir("half-unowned");
+    let write = |name: &str, text: String| {
+        let path = d.join(name);
+        std::fs::write(&path, text).expect("write");
+        path.display().to_string()
+    };
+    let (cert, key) = pki.cert("storage");
+    let more = [
+        format!("--frontend=https://localhost:{}", f.worker.port()),
+        format!("--storage-tls-cert={}", write("node.pem", cert)),
+        format!("--storage-tls-key={}", write("node.key", key)),
+        format!("--storage-client-ca={}", write("ca.pem", pki.ca.pem())),
+    ];
+    let half = kbf_server::storage_half::start(&flags(&d, &more).expect("flags"), never)
+        .await
+        .expect("starts");
+    let (storage, maps, here) = (half.storage(), half.maps(), half.addr);
+    let _serving = tokio::spawn(half.serve());
+    until("the node to register", || row(&f, 1)).await;
+    until("the node to hold a map", || {
+        (maps.generation() > 0).then_some(())
+    })
+    .await;
+
+    let member = |id, port: u16| kbf_map::Member {
+        id: MemberId(id),
+        addr: format!("127.0.0.1:{port}"),
+        zone: String::new(),
+        weight: 1,
+        state: MemberState::Active,
+    };
+    let map = kbf_map::Map::new(
+        1_000,
+        vec![member(1, here.port()), member(2, 1)],
+        kbf_map::Rule::Rendezvous,
+        1,
+        1,
+        Vec::new(),
+    )
+    .expect("a map");
+    let blob = (0..)
+        .map(|i| {
+            format!(
+                "owned by the other member {i} of run {}",
+                std::process::id()
+            )
+            .into_bytes()
+        })
+        .find(|b| map.write_owners(&kbf_segments::sha256(b)) == [MemberId(2)])
+        .expect("a blob");
+    let digest = kbf_segments::sha256(&blob);
+    assert!(maps.offer(map));
+    let client = |role: &str| {
+        let (cert, key) = pki.cert(role);
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(pki.ca.pem()))
+            .identity(Identity::from_pem(cert, key));
+        let channel = Endpoint::from_shared(format!("https://localhost:{}", here.port()))
+            .expect("endpoint")
+            .tls_config(tls)
+            .expect("TLS")
+            .connect_lazy();
+        RemoteStorage::new(channel, 1_000)
+    };
+    let not_primary = |answer: Result<kbf_types::Digest, kbf_storage::StorageError>| matches!(&answer, Err(kbf_storage::StorageError::Invalid(m)) if m.contains("not the primary"));
+
+    let plain = client("frontend")
+        .put(bytes::Bytes::from(blob.clone()))
+        .await;
+    assert!(not_primary(plain));
+    let from_daemon = client("daemon")
+        .put_unowned(bytes::Bytes::from(blob.clone()))
+        .await;
+    assert!(not_primary(from_daemon));
+    assert!(storage.read_blob(&digest).await.is_err());
+
+    let stored = client("frontend")
+        .put_unowned(bytes::Bytes::from(blob))
+        .await
+        .expect("the frontend's copy is taken");
+    assert_eq!(stored, digest);
+    assert!(storage.read_blob(&digest).await.is_ok());
+}
+
 /// Catches a node with no frontend that keeps a repair journal: it is a one-member farm of
 /// itself and owes no one a copy, so it has none and makes no directory for it. A node that
 /// registers in plain text (it copies nothing) has none either.
