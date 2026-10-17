@@ -1,11 +1,6 @@
 //! Test fixtures shared by the modules' tests: a runner that plays the programs, a
 //! trusted host, tarballs and inboxes.
 
-#![allow(
-    dead_code,
-    reason = "the modules that use the rest come in the next changes"
-)]
-
 use std::cell::RefCell;
 use std::fs;
 use std::io;
