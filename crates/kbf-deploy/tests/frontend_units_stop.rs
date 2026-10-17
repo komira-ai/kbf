@@ -88,8 +88,8 @@ fn every_frontend_unit_template_waits_for_its_drain() {
         [
             "kbf-all-in-one.service",
             "kbf-all-in-one.service",
-            "kbf-frontend.service",
-            "kbf-frontend.service",
+            "kbf-frontend@.service",
+            "kbf-frontend@.service",
             "kbf-pilot-server.service",
             "kbf-server.service",
             "kbf-server.service",

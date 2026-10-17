@@ -425,3 +425,18 @@ fn an_older_kbf_fails_the_parse_rule_with_the_line_the_docs_quote() {
         failures[0]
     );
 }
+
+/// Catches `kbf frontend handover` starting instances the unit template does not have:
+/// kbf-cli spells the template's name and instances itself (kbf-deploy is a dev-dependency
+/// only), and the two must be the same words.
+#[test]
+fn the_handover_command_starts_the_instances_of_the_frontends_template() {
+    use kbf_cli::handover::{INSTANCES, TEMPLATE};
+    let instances: Vec<String> = INSTANCES
+        .iter()
+        .map(|i| format!("{TEMPLATE}@{i}.service"))
+        .collect();
+    assert_eq!(instances, Mode::Frontend.instances());
+    assert_eq!(Mode::Frontend.unit_name(), format!("{TEMPLATE}@.service"));
+    assert_eq!(TEMPLATE, format!("kbf-{}", Mode::Frontend.name()));
+}

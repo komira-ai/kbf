@@ -182,6 +182,19 @@ fn a_shape_line_shows_eight_patterns_and_marks_the_rest() {
     );
 }
 
+/// Catches: the test flag dropped between the shape and the record the row keeps (a
+/// run record would never say it is a test), or set on every record.
+#[test]
+fn the_record_says_whether_the_action_is_a_test() {
+    let recorded = |outputs: &[&str]| {
+        let (subject, _) = Subject::of(described(&["runner"], outputs));
+        (subject.test, subject.recorded().test)
+    };
+    let execution = "buck-out/v2/test/execution/cell/7a3c1e9f0b2d4c68/fedcba9876543210/default/o";
+    assert_eq!(recorded(&[execution]), (true, true));
+    assert_eq!(recorded(&["a.o"]), (false, false));
+}
+
 /// Catches: the record given another key than the line's (bytes reordered), the
 /// configuration hash or the target dropped, a kind mapped to another, or the
 /// client's `target_id` recorded as the derived target.

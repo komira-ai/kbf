@@ -385,6 +385,7 @@ fn frontend(worker_tls: Option<WorkerTls>) -> SocketAddr {
             dwell: Duration::from_secs(60),
             replication: 2,
         },
+        history: None,
     };
     let bound = bind_server_with_state(
         Arc::new(Cache::memory()),

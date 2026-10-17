@@ -141,6 +141,8 @@ pub const ALLOWED: &[&str] = &[
     "state_store",
     "member_ttl_secs",
     "member_dwell_secs",
+    "history_objects",
+    "history_index_root",
     "log_dir",
     "log_max_bytes",
     "log_files",
@@ -725,6 +727,8 @@ impl<'a> Prepared<'a> {
         } = self;
         let args = &flags.server;
         let state = crate::start::with_members(state, args.members());
+        let state = crate::history::with_history(state, &args.history)?;
+        let (state, history) = crate::history::take(state);
         let members = members_of(state.as_ref());
         let map = map_of(None, members.as_ref())?;
         let readiness = Arc::new(Readiness::default());
@@ -745,6 +749,7 @@ impl<'a> Prepared<'a> {
         };
 
         let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
+        let recording = crate::history::install(recording, history.as_ref());
         let default_memory = listeners.memory_ladder.first();
         let durable = state.is_some();
         let farm = Farm::new(
@@ -807,7 +812,12 @@ impl<'a> Prepared<'a> {
             members.clone(),
         )
         .merge(crate::health::router_of(Arc::clone(&checks)))
-        .merge(metrics_route(backend.clone(), members.clone(), tls_sources));
+        .merge(metrics_route(
+            backend.clone(),
+            history.as_ref().map(crate::history::History::stats),
+            members.clone(),
+            tls_sources,
+        ));
         // The storage health, if there are members.
         let api_routes = members.iter().fold(api_routes, |routes, members| {
             routes.merge(crate::storage_health::router(Arc::clone(members)))
@@ -902,6 +912,7 @@ impl<'a> Prepared<'a> {
         let shutdown = shutdown()?;
         let stopper = Arc::clone(&drain);
         let serving = async move {
+            let history = crate::history::spawn(history);
             let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
             let reapi_serve = reapi_server
                 .add_routes(reapi_routes)
@@ -951,6 +962,7 @@ impl<'a> Prepared<'a> {
             if reapi_done {
                 stop_api(api_stop_when_done, api_serve).await;
             }
+            crate::history::finish(history).await;
             outcome
         };
         let plain = args.plain_text_off_loopback();
@@ -982,18 +994,24 @@ fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Stor
     state.map(|state| Arc::clone(&state.store))
 }
 
-/// `GET /metrics`: what the service counts, in the Prometheus text format, the storage
-/// health of `members` when there are any, and the reloads of the listeners' `tls` files.
+/// `GET /metrics`: what the service counts, in the Prometheus text format, history's
+/// counters when it keeps history, the storage health of `members` when there are any, and
+/// the reloads of the listeners' `tls` files.
 fn metrics_route(
     backend: Backend,
+    history: Option<Arc<crate::history::Stats>>,
     members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
 ) -> axum::Router {
     let tls = Arc::new(tls);
     let render = move || {
         let (backend, members, tls) = (backend.clone(), members.clone(), Arc::clone(&tls));
+        let history = history.clone();
         async move {
             let mut text = backend.render_metrics();
+            if let Some(history) = history {
+                history.render(&mut text);
+            }
             crate::metrics::scrape_health(&mut text, members.as_ref()).await;
             kbf_tls::render_metrics(tls.iter(), &mut text);
             ([(CONTENT_TYPE, crate::metrics::TEXT_FORMAT)], text)

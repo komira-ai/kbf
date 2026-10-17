@@ -185,6 +185,30 @@ SQLite path that is empty, relative or not normal, and a `--state-store=${VAR}`
 it names, and what it holds is in argv, readable by every user). A unit with no
 `--state-store` passes. No message repeats the value.
 
+### Updating a frontend without failing a build: `kbf-frontend@.service`
+
+The frontend's unit is a template with two instances, `kbf-frontend@a` and
+`kbf-frontend@b`, that run the same command line; only one serves, and only `@a` is
+enabled at boot. To update, put the new `kbf` in place by rename (`install-units --mode
+frontend --bin-dir DIR --apply` does, and with a serving instance restarts nothing), then
+run, on the frontend's host:
+
+```
+kbf frontend handover --wait
+```
+
+It starts the idle instance with `systemctl start`; the unit is `Type=notify`, so the start
+returns when the new frontend has taken the listeners, the state store and the daemons over
+and serves. The old instance then answers the builds it holds and exits by itself (`--wait`
+looks at it until it has). Buck2's open streams are not broken, new calls go to the new
+frontend, daemons reconnect and keep their runs. A new instance that fails before it is
+ready leaves the old one serving, and the command exits 1 and says so. With both instances
+active (the old one still draining) it refuses. What each party sees, and every failure:
+`docs/design/frontend-handover.md`. Rule `handover` of `check-units --mode frontend`
+refuses a unit that is not `Type=notify`, whose `--handover-socket` is outside a
+`RuntimeDirectory=` kept with `RuntimeDirectoryPreserve=yes`, or that has `Conflicts=`
+(starting an instance would stop the one draining).
+
 ### Stopping a frontend: TimeoutStopSec=infinity
 
 On SIGTERM kbf's frontend (and `all-in-one`'s) drains: it refuses new Execute calls,
@@ -295,11 +319,15 @@ toward storage), `ca.pem`, and the REAPI pair `KBF_REAPI_CERT` and `KBF_REAPI_KE
    unit's user's with no group or other bit, and each certificate, CA or deny list flag
    names a file.
 2. It plans, each step only when the host differs: the new `kbf` (with `--bin-dir`; the
-   old one kept as `kbf.previous`), `kbf.slice` and `kbf-<mode>.service` (0644, root's),
+   old one kept as `kbf.previous`), `kbf.slice` and `kbf-<mode>.service` (the frontend's is
+   the template `kbf-frontend@.service`; 0644, root's),
    the directories the unit's flags name (the unit's user's: `--data-dir` 0755,
    `--meta-dir`, a `file://` hot or cold store, and the directory of a `--state-store`
    SQLite file 0700), then `daemon-reload`, enable
-   and restart; with nothing changed, enable and start only if the unit is not. A unit
+   and restart; with nothing changed, enable and start only if the unit is not. The frontend
+   is enabled as the template and `kbf-frontend@a` is started only if neither instance is
+   active: a serving instance is never restarted, the plan says to run `kbf frontend
+   handover` ("Updating a frontend without failing a build"). A unit
    with `--api-listen=127.0.0.1:<port>` (`frontend`, `all-in-one`) is waited for on `/readyz`.
 3. Without `--apply` every step is printed as a `DRY-RUN:` line and nothing is written,
    reloaded or started.
