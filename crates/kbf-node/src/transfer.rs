@@ -211,7 +211,7 @@ mod tests {
         let maps = Arc::new(kbf_daemon::MapHolder::new());
         let held = Arc::clone(&maps);
         let mut node = Node::new(Box::new(move |cli| {
-            super::super::farm(cli, &held, kbf_daemon::Liveness::default())
+            super::super::farm(cli, &held, kbf_daemon::Liveness::default()).map(|(plane, _)| plane)
         }));
         let cli_ok = cli(&at("ca.pem"));
         let first = node.plane(&cli_ok).expect("farm plane");
@@ -220,7 +220,7 @@ mod tests {
 
         let held = Arc::clone(&maps);
         let mut unreadable = Node::new(Box::new(move |cli| {
-            super::super::farm(cli, &held, kbf_daemon::Liveness::default())
+            super::super::farm(cli, &held, kbf_daemon::Liveness::default()).map(|(plane, _)| plane)
         }));
         let why = unreadable
             .plane(&cli(&at("no-such-ca.pem")))

@@ -1882,6 +1882,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-peer"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "thiserror",
+ "x509-parser",
+]
+
+[[package]]
 name = "kbf-proto"
 version = "0.1.0"
 dependencies = [
@@ -1988,6 +1997,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "tonic",
+ "tonic-prost",
+ "tower-layer",
  "tracing",
  "tracing-core",
  "tracing-subscriber",
@@ -2042,6 +2053,7 @@ dependencies = [
  "futures",
  "kbf-map",
  "kbf-meta",
+ "kbf-peer",
  "kbf-proto",
  "kbf-segments",
  "kbf-store",
@@ -2052,7 +2064,6 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
- "x509-parser",
 ]
 
 [[package]]

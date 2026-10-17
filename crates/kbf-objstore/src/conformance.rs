@@ -4,7 +4,8 @@
 //! [`Report`]; it never panics on a misbehaving store. It checks the base contract
 //! (round trip, ranged reads at the boundaries, a missing key, idempotent delete, list
 //! paging (also past S3's 1000-key page), a listing that starts after a key or covers the whole bucket, and the footer
-//! reads a rebuild makes) and every claim in [`Capabilities`]: a store claiming conditional writes must
+//! reads a rebuild makes; the listing checks in `list` page through every page size, a
+//! prefix that matches nothing, nested keys, and keys written during a listing) and every claim in [`Capabilities`]: a store claiming conditional writes must
 //! refuse an overwrite, a store claiming Object Lock must refuse deleting a retained
 //! object and keep it readable, and a store not claiming Object Lock must refuse a
 //! retention date rather than store the object unlocked.
@@ -61,6 +62,22 @@ pub enum Check {
     /// A listing under the empty prefix covers the whole bucket, in order, across pages
     /// (started after a key just before this run's own, so the check reads only those).
     ListEmptyPrefix,
+    /// Six keys listed in pages of 1, 2, 3, 4, 6 and 7 (one key a page, exact
+    /// multiples, a short last page, one page), page by page and streamed through
+    /// [`listing::objects`](crate::listing::objects): every key and size once, in order,
+    /// no page larger than asked.
+    ListPageSizes,
+    /// A prefix that matches no key, between two keys that share its text, lists
+    /// nothing, page by page and streamed.
+    ListNoMatch,
+    /// Keys nested under `/` at several depths, and the characters either side of `/`:
+    /// a listing returns every key under the prefix at any depth (no grouping at `/`),
+    /// in byte order, under a prefix ending in `/` or not.
+    ListNested,
+    /// Between pages, a key written after the cursor and keys deleted behind and ahead
+    /// of it: every key present throughout is listed exactly once, in order. Keys
+    /// written or deleted during the listing may or may not be listed.
+    ListDuringWrites,
     /// [`footers::read_footers`] over segments, a torn segment, a foreign object and a
     /// short one gives every segment's index exactly, skips the rest for the right
     /// reason, and reads only the tails.
@@ -162,6 +179,16 @@ pub async fn run<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Report {
         Check::ListEmptyPrefix,
         list_empty_prefix(store, prefix).await,
     );
+    record(
+        Check::ListPageSizes,
+        list::list_page_sizes(store, prefix).await,
+    );
+    record(Check::ListNoMatch, list::list_no_match(store, prefix).await);
+    record(Check::ListNested, list::list_nested(store, prefix).await);
+    record(
+        Check::ListDuringWrites,
+        list::list_during_writes(store, prefix).await,
+    );
     record(Check::FooterReads, footer_reads(store, prefix).await);
     record(
         Check::PutNewRefusesOverwrite,
@@ -180,6 +207,8 @@ macro_rules! ensure {
         }
     };
 }
+
+mod list;
 
 fn key(prefix: &KeyPrefix, name: &str) -> Result<ObjectKey, String> {
     prefix
