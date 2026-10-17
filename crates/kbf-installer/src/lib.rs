@@ -17,6 +17,10 @@
 //!
 //! The offline check of a release handed over by the unprivileged `kbf`, in parts:
 //!
+//! - [`inbox`] and [`offer`]: an entry the unprivileged process wrote, opened without
+//!   following a link, and the offer that names its files and their sha256.
+//! - [`trust`] and [`settings`]: what the check believes without looking at its content
+//!   (`gh`, the trusted root, the host's settings) and the root-ownership check on it.
 //! - [`archive`], [`binary`] and [`darwin`]: the tarball, the kind of executable and its
 //!   `--version --json`, and on macOS the quarantine attribute and the code signature.
 //! - [`run`]: the one place a process is started, behind a trait a test plays.
@@ -30,13 +34,16 @@ pub mod binary;
 pub mod darwin;
 #[cfg(test)]
 mod fixtures;
+pub mod inbox;
 pub mod layout;
+pub mod offer;
 pub mod refusal;
 pub mod release;
 pub mod run;
 pub mod state;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
+pub mod trust;
 
 use std::fmt;
 
