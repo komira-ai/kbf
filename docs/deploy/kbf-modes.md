@@ -25,8 +25,9 @@ Exit codes are those of the converged verbs ([storage-node.md](storage-node.md#r
   `DisableControllers=`, `AllowedCPUs=`, `AllowedMemoryNodes=`).
 - On the host it runs on: `/sys/devices/system/cpu/online` and
   `/sys/devices/system/node/online` (rule `cpuset`, only when a unit sets a list), the
-  files the unit's `EnvironmentFile=` lines name (rule `credential`), and `kbf
-  check-args` (rule `parse`). Run it on the node, as root, for all three.
+  files the unit's `EnvironmentFile=` lines name (rule `credential`), the storage unit's
+  `User=` (`getent passwd`, rule `credential`), and `kbf check-args` (rule `parse`).
+  Run it on the node, as root, for all of them.
 
 It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/system`,
 `service.d/` and prefix drop-ins) or changes made with `systemctl set-property` or
@@ -43,7 +44,11 @@ It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/sy
 | `slice` | a unit not in `kbf.slice` |
 | `delegate` | a mode that runs builds without `cpu`, `cpuset`, `memory` and `pids` delegated, or with one of them in `DisableControllers=` (the unit's, or `kbf.slice`'s) |
 | `cpuset` | `AllowedCPUs=` or `AllowedMemoryNodes=` on a mode that runs builds, or on `kbf.slice`, narrower than the node's CPUs or NUMA nodes |
-| `credential` | the cold store's key reaching a mode without a storage half that reads it (`daemon`, `storage-and-daemon`, `all-in-one`) |
+| `credential` | the cold store's key reaching a mode without a storage half that reads it (`daemon`, `storage-and-daemon`, `all-in-one`); the `storage` unit, which holds it, run as root or as `KBF_USER` (the user builds run as), and on the node its key file readable by another user |
+| `storage` | a `storage` unit without `--cold-store`, `--meta-dir`, `--storage-listen` or one of the three certificate flags, or with an `s3://` cold store and no `EnvironmentFile=<KBF_ETC>/s3.env` |
+| `state-store` | a `--state-store` that is not `sqlite:///<absolute path>`: a Postgres URI (`postgres://` or `postgresql://`; postgres is not wired yet), any other scheme, an empty or relative SQLite path, or a value that names a variable (below) |
+| `ports` | two of a unit's listeners (`--listen`, `--worker-listen`, `--api-listen`, `--storage-listen`) on one port |
+| `stop` | a mode that drains on SIGTERM (every mode but `daemon`) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
 | `parse` | a built mode's flags that `kbf <mode>` refuses |
 
 **`delegate`.** systemd reads `Delegate=` this way (systemd.resource-control(5), and
@@ -110,6 +115,72 @@ so a variable it unsets still fails the rule); and the key reaching the node any
 way: a file the daemon reads by a flag, the service manager's own environment without
 `PassEnvironment=`, or a key file other users can read.
 
+## What each mode's unit carries
+
+- **`storage`**: `--cold-store=s3://<KBF_S3_BUCKET>?endpoint=<MINIO_S3_ENDPOINT>&conditional-put=true`,
+  `--hot-store=file://<KBF_HOT_DIR>`, `--meta-dir=<KBF_META_DIR>`,
+  `--storage-listen=<KBF_LISTEN_ADDRESS>:<KBF_STORAGE_PORT>` (8983 by default: kbf's
+  own default, 8982, is `KBF_API_PORT`'s), and `--storage-tls-cert`, `--storage-tls-key`
+  and `--storage-client-ca` (`storage.pem`, `storage.key`, `ca.pem` under `KBF_ETC`).
+  It runs as `KBF_SERVER_USER` with `EnvironmentFile=<KBF_ETC>/s3.env`, the bucket's
+  key pair: on the node rule `credential` wants that file root's or the server user's,
+  mode 0600. No state store: a storage node reaches it only through a frontend.
+- **`daemon`**: the flags `kbf-daemon`'s unit has (`--server`, `--cas`, its
+  certificates, `--data-dir`, the memory flags, the images); no key.
+- **`all-in-one`**: below; no key (its cold store is a directory).
+- **`storage-and-daemon`**: the storage unit's three certificate flags (no `--cas`:
+  the daemon half reads the node's storage in-process), then the daemon unit's flags;
+  no key yet (rule `credential`). Its stores are a `TODO:` in the template.
+- **`frontend`**: no flag (not built yet; rule `flags`). Its template says where its state store goes: a SQLite file beside its
+  data, `--state-store=sqlite://<KBF_DATA_DIR>/state.db` (below).
+
+`render-units --mode storage` refuses settings without `MINIO_S3_ENDPOINT`: the
+converged units default to the host's own MinIO, but a storage node's bucket need not be
+on the node. Every mode's settings must give the four ports (`KBF_REAPI_PORT`,
+`KBF_WORKER_PORT`, `KBF_API_PORT`, `KBF_STORAGE_PORT`) four values, or nothing renders.
+
+Two things are `TODO(registration):` comments in the templates, never guessed: the
+frontend's DNS name (`--frontend`, with `--advertise-addr`) on the storage, daemon and
+storage-and-daemon units, and the storage map the frontend pushes. Both come with the
+nodes' registration with a frontend.
+
+### The state store: SQLite only
+
+The only state store kbf opens today is a SQLite file; Postgres is a later backend. Rule
+`state-store` fails a `--state-store` that is not `sqlite:///<absolute path>`: a
+`postgres://` or `postgresql://` URI (postgres is not wired yet), any other scheme, a
+SQLite path that is empty, relative or not normal, and a `--state-store=${VAR}`
+(systemd expands the variable into the command line, so the rule cannot read the store
+it names, and what it holds is in argv, readable by every user). A unit with no
+`--state-store` passes. No message repeats the value.
+
+### Stopping a frontend: TimeoutStopSec=infinity
+
+On SIGTERM kbf's frontend (and `all-in-one`'s) drains: it refuses new Execute calls,
+which Buck2 retries elsewhere, and keeps every open Execute and WaitExecution stream
+until its action is done; `--shutdown-timeout-secs` is 0, no deadline, by default.
+Buck2 never recovers a stream that breaks mid-action, so a stop that ends the drain
+fails every build in flight. systemd kills a unit with SIGKILL when `TimeoutStopSec=`
+runs out, 90 s (`DefaultTimeoutStopSec=`) when the unit gives none. So both units have
+`KillSignal=SIGTERM` and `TimeoutStopSec=infinity` (so do `storage` and
+`storage-and-daemon`: a storage node finishes its large Writes at stop, and systemd's
+90 s default would cut them), and rule `stop` refuses either
+missing or changed: it reads `TimeoutSec=` too (it sets the stop timeout as well; the
+last of the two wins) and the drop-ins. It asks for the word `infinity`: `0` means no
+timeout to systemd as well, but reads as "at once" to a person. A daemon is not held:
+it does not drain on SIGTERM (the operator API's `POST /v1/nodes/{node}:drain` empties a
+node before it is stopped).
+
+### storage-and-daemon and the cold store's key
+
+One unit and one process (the daemon half reads and writes the node's storage
+in-process, one cache on the SSD; architecture-v2.md, sections 1 and 10). The design
+keeps the key from builds by uid (sections 9 and 15): the key file the unit's user's
+alone, mode 0600, and each action a subordinate id of that user (the container driver's
+`--userns=nomap`), with a test that an action cannot read the key. The daemon half
+runs as the unit's user and so could read it. Until that test exists, the unit holds no key (rule `credential` refuses one), and with the key it will
+be for a trusted network only, as all-in-one is.
+
 ## all-in-one is for a trusted box
 
 `kbf all-in-one` runs builds in the process that holds the farm's state and its cold
@@ -123,9 +194,79 @@ WARN trusted: kbf all-in-one runs builds beside the farm's state and its cold st
 ```
 
 Its cold store is `file://<KBF_DATA_DIR>/cold`, the single box's shape (section 11), so
-the unit holds no cold-store key and rule `credential` applies to it. Its scheduler state is the SQLite
-file `<KBF_DATA_DIR>/state.db`, the default of `kbf all-in-one` (a `--state-store=sqlite:///...`
-names another; any other value is refused), so the unit gives no state store flag.
+the unit holds no cold-store key and rule `credential` applies to it. Its scheduler
+state is the SQLite file `<KBF_DATA_DIR>/state.db`, the default of `kbf all-in-one` (a
+`--state-store=sqlite:///...` names another; any other value is refused), so the unit
+gives no state store flag.
+
+## A node's certificate
+
+kbf-deploy issues no certificate. The farm's one issuer makes every certificate of the
+new modes' mutual TLS from the one CA, each with exactly one role, by this table:
+
+| row | role (`urn:kbf:role:<role>`) | extended key usage | names |
+|---|---|---|---|
+| `frontend-worker` | `frontend` | serverAuth, clientAuth (it also calls storage) | the frontend's names |
+| `storage` | `storage` | serverAuth, clientAuth (replication calls) | the node's names |
+| `daemon` | `daemon` | clientAuth | exactly one DNS name, the node id |
+
+The frontend's REAPI listener, the name clients dial, presents a certificate that is not
+the farm CA's, so it has no row and `verify-cert --row frontend-reapi` is refused (exit 2).
+
+`kbf-deploy linux verify-cert` checks one certificate against its row, read only,
+before a unit is pointed at it:
+
+```text
+kbf-deploy linux verify-cert --row storage --cert storage.pem --ca-cert ca.pem
+kbf-deploy linux verify-cert --row daemon --cert node.pem --ca-cert ca.pem --node-id node-1
+```
+
+- `role`: the subjectAltName holds exactly one URI `urn:kbf:role:<role>`, the row's.
+  A storage node reads the same URI to admit each call (architecture-v2.md, section 9);
+  a kbf-cli test makes a certificate of each row and reads it back with the storage
+  node's own check.
+- `eku`: the extended key usage is the row's set exactly; a certificate without the
+  extension fails (TLS would take it for every use).
+- `name` (`daemon`): its DNS and IP names are exactly `--node-id`.
+- `chain`: it chains to `--ca-cert` now, for each use of the row: as a server under its
+  first name, as a client.
+
+It prints a `FAIL <check>:` line per failed check and `CERT BROKEN`, or one
+`CERT OK:` line. Exit codes: 0 the certificate is the row's, 1 a check failed, 2 refused
+(a file that cannot be read, no certificate, no usable CA, `--node-id` for a row that
+is not `daemon`).
+
+Copy the certificate and its key to the node's `KBF_ETC` (the storage unit reads
+`storage.pem` and `storage.key`), the key owned by the unit's user; `install-units
+--mode` refuses a key another user owns or others can read. `kbf frontend` takes no
+certificate flags yet.
+
+## Installing a mode's unit
+
+`kbf-deploy linux install-units --config node.conf --mode MODE [--bin-dir DIR]
+[--apply]` installs one built mode's unit on the node, as root:
+
+1. It checks the host, read only: the mode is built (`frontend` and
+   `storage-and-daemon` are refused: their units would exit 2 at start); the unit's
+   `User=` exists and is not root; for a mode that runs builds, the kbf user has subuid
+   and subgid ranges and lingers; `kbf` is an executable in `--bin-dir` (or
+   `KBF_BIN_DIR`); the rendered unit passes `check-units --mode MODE --installable` on
+   this host, its flags parsed by that `kbf`; every `EnvironmentFile=` is there; and
+   each file a key or token flag names (`--key`, `--*-key`, `--*token-file`) is the
+   unit's user's with no group or other bit, and each certificate, CA or deny list flag
+   names a file.
+2. It plans, each step only when the host differs: the new `kbf` (with `--bin-dir`; the
+   old one kept as `kbf.previous`), `kbf.slice` and `kbf-<mode>.service` (0644, root's),
+   the directories the unit's flags name (the unit's user's: `--data-dir` 0755,
+   `--meta-dir` and a `file://` hot or cold store 0700), then `daemon-reload`, enable
+   and restart; with nothing changed, enable and start only if the unit is not. A unit
+   with `--api-listen=127.0.0.1:<port>` (all-in-one) is waited for on `/readyz`.
+3. Without `--apply` every step is printed as a `DRY-RUN:` line and nothing is written,
+   reloaded or started.
+
+There is no `--uninstall` for a mode's unit yet. A node moving from the converged units
+(`kbf-server.service`) to `kbf-storage.service` stops the old ones first
+(`install-units --uninstall`): both would hold the same directories.
 
 ## Upgrade kbf before kbf-deploy
 

@@ -1478,6 +1478,7 @@ dependencies = [
  "kbf-objstore",
  "kbf-proto",
  "kbf-route",
+ "kbf-segments",
  "kbf-server",
  "kbf-storage",
  "kbf-testkit",
@@ -1974,6 +1975,7 @@ dependencies = [
  "kbf-threads",
  "kbf-tier",
  "kbf-types",
+ "kbf-ui",
  "libc",
  "percent-encoding",
  "prost",
@@ -2118,6 +2120,18 @@ dependencies = [
 name = "kbf-types"
 version = "0.1.0"
 dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "kbf-ui"
+version = "0.1.0"
+dependencies = [
+ "form_urlencoded",
+ "futures",
+ "percent-encoding",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
