@@ -17,7 +17,7 @@ use crate::support::{Index, Life, Objects, T, all};
 fn page(
     reader: &Reader<Objects>,
     q: &ListQuery<'_>,
-    allow: &dyn Fn(&str) -> bool,
+    allow: kbf_history::Allow<'_>,
 ) -> (Vec<kbf_history::InvKey>, Option<PageCursor>) {
     let page = futures::executor::block_on(reader.list_invocations(q, allow)).unwrap();
     (page.items.into_iter().map(|i| i.inv).collect(), page.next)
@@ -132,7 +132,7 @@ fn list_hides_what_the_caller_may_not_read() {
     );
     assert_eq!(page(&reader, &q, &only("other")).0, keys(&["solo-other"]));
 
-    let names = |allow: &dyn Fn(&str) -> bool| {
+    let names = |allow: kbf_history::Allow<'_>| {
         futures::executor::block_on(reader.instances(allow)).unwrap()
     };
     let got = names(&all);
@@ -718,4 +718,59 @@ fn a_page_cut_at_the_end_of_a_scan_chunk_has_a_cursor_for_what_follows() {
         ..ListQuery::new("main", 2)
     };
     assert_eq!(page(&reader, &q, &all).0, keys(&["d2", "d1"]));
+}
+
+#[test]
+fn a_keys_configurations_read_back_one_page_at_a_time_for_the_instances_allowed() {
+    // Catches: a read of a key's rows that takes the next key's (a prefix of the key
+    // without its separator), skips or repeats a configuration at a page's edge, loses
+    // the configuration's name, or answers an instance the caller may not read.
+    let mut life = Life::fresh(Limits::default());
+    let inv = InvRef::named("b1");
+    for (t, instance, shape, cfg) in [
+        (1, "main", 7, "cfg-b"),
+        (2, "main", 7, "cfg-a"),
+        (3, "main", 8, "cfg-a"),
+        (4, "main", 0x70, "cfg-a"),
+        (5, "other", 7, "cfg-c"),
+    ] {
+        crate::rows_support::offer_with(&life, &inv, T + t, instance, RunOutcome::Ok, |r| {
+            r.shape = shape;
+            r.cfg = cfg.into();
+        });
+    }
+    life.close(&inv);
+    life.drain(T + 100, 50);
+    let reader = life.reader();
+
+    let names = |page: &kbf_history::ShapePage| -> Vec<String> {
+        page.items
+            .iter()
+            .map(|e| format!("{}/{}/{}", e.instance, e.shape, e.cfg))
+            .collect()
+    };
+    let both = run(reader.shape_cfgs("main", 7, None, 10, &all)).unwrap();
+    assert_eq!(names(&both), ["main/7/cfg-a", "main/7/cfg-b"]);
+    assert_eq!(both.next, None);
+    let first = run(reader.shape_cfgs("main", 7, None, 1, &all)).unwrap();
+    assert_eq!(names(&first), ["main/7/cfg-a"]);
+    let next = first.next.expect("a page after");
+    let second = run(reader.shape_cfgs("main", 7, Some(&next), 1, &all)).unwrap();
+    assert_eq!(names(&second), ["main/7/cfg-b"]);
+    assert_eq!(second.next, None);
+    let other = run(reader.shape_cfgs("other", 7, None, 10, &all)).unwrap();
+    assert_eq!(names(&other), ["other/7/cfg-c"]);
+    assert!(
+        run(reader.shape_cfgs("main", 7, None, 10, &only("other")))
+            .unwrap()
+            .items
+            .is_empty(),
+        "an instance not allowed"
+    );
+    assert!(
+        run(reader.shape_cfgs("main", 9, None, 10, &all))
+            .unwrap()
+            .items
+            .is_empty()
+    );
 }

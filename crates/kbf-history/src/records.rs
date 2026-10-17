@@ -973,10 +973,10 @@ mod tests {
             target: "//a:t".into(),
             ..RunRecord::default()
         };
-        // Tag 34, length-delimited: key 274 (0x92 0x02).
+        // Tag 37, length-delimited: key 298 (0xaa 0x02).
         assert_eq!(
             run.encode_to_vec(),
-            [0x92, 0x02, 5, b'/', b'/', b'a', b':', b't']
+            [0xaa, 0x02, 5, b'/', b'/', b'a', b':', b't']
         );
         let header = InvocationHeader {
             list_ms: 5,
