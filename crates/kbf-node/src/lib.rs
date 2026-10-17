@@ -47,7 +47,7 @@ use std::time::Duration;
 
 use kbf_daemon::{
     Args, Capacity, DAEMON_VERSION, Daemon, DaemonConfig, DriverWatch, FakeRuntime, FarmCas,
-    MapHolder, NodeReport, Runtime, Runtimes,
+    Liveness, MapHolder, NodeReport, Runtime, Runtimes,
 };
 use kbf_driver_native::slots::Pool;
 use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode, xcode_watch};
@@ -393,7 +393,10 @@ pub fn start(cli: &Cli) -> Result<NodeHandle, Error> {
     // routes by it.
     let maps = Arc::new(MapHolder::new());
     let held = Arc::clone(&maps);
-    start_over(cli, Some(maps), move |cli| farm(cli, &held))
+    // Refused here, before any driver is set up, though only the plane over a storage
+    // map reads the values; the plane gets the checked values, not the flags again.
+    let liveness = cli.daemon.storage_liveness()?;
+    start_over(cli, Some(maps), move |cli| farm(cli, &held, liveness))
 }
 
 /// [`start`], with every runtime reading and writing blobs through the data plane
@@ -408,6 +411,8 @@ pub fn start_with<C: Cas>(
     cli: &Cli,
     plane: impl Fn(&Cli) -> Result<Arc<C>, Error> + 'static,
 ) -> Result<NodeHandle, Error> {
+    // Refused as `start` does, though this plane does not read the values.
+    cli.daemon.storage_liveness()?;
     start_over(cli, None, plane)
 }
 
@@ -418,9 +423,6 @@ fn start_over<C: Cas>(
     maps: Option<Arc<MapHolder>>,
     plane: impl Fn(&Cli) -> Result<Arc<C>, Error> + 'static,
 ) -> Result<NodeHandle, Error> {
-    // Refused here, before any driver is set up, though only the plane over a storage
-    // map reads the values.
-    cli.daemon.storage_liveness()?;
     let sizes = sizes(cli)?;
     sizes.log();
     let tokio = sizes.runtime()?;
@@ -441,12 +443,9 @@ fn start_over<C: Cas>(
 /// never `--tls-server-name`, which names the frontend). A frontend that sends no map
 /// leaves the daemon on `--cas`, as before the map existed. Each change of side is
 /// logged once, by the plane.
-fn farm(cli: &Cli, maps: &Arc<MapHolder>) -> Result<Arc<FarmCas>, Error> {
+fn farm(cli: &Cli, maps: &Arc<MapHolder>, liveness: Liveness) -> Result<Arc<FarmCas>, Error> {
     let server = Arc::new(transfer::engine(cli)?);
-    let nodes = kbf_daemon::storage_nodes(
-        &DaemonConfig::from_args(&cli.daemon).tls,
-        cli.daemon.storage_liveness()?,
-    )?;
+    let nodes = kbf_daemon::storage_nodes(&DaemonConfig::from_args(&cli.daemon).tls, liveness)?;
     tracing::info!(
         "data plane: through --cas until the frontend sends a storage map, then to the \
          storage nodes it names"

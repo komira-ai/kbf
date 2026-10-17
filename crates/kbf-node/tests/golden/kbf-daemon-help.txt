@@ -35,17 +35,17 @@ Options:
           A node label, `key=value`, reported as `label.<key>`; repeatable. A Mac in komira's pool runs with `--label pool=darwin-sized`
 
       --storage-dial-timeout-ms <STORAGE_DIAL_TIMEOUT_MS>
-          The longest, in milliseconds, that dialling a storage node may take: for its TCP connection and for its TLS handshake each. Must be at least 1.
+          The longest, in milliseconds, that dialling a storage node may take: for its TCP connection and for its TLS handshake each. Must be at least 1
           
           [default: 10000]
 
       --storage-ping-interval-ms <STORAGE_PING_INTERVAL_MS>
-          How often, in milliseconds, a connection to a storage node with a call on it is pinged (HTTP/2 PING). Must be at least 1.
+          How often, in milliseconds, a connection to a storage node with a call on it is pinged (HTTP/2 PING). Must be at least 1
           
           [default: 10000]
 
       --storage-ping-timeout-ms <STORAGE_PING_TIMEOUT_MS>
-          How long, in milliseconds, a ping to a storage node may go unanswered before the connection is dropped and the calls on it fail over to the next owner. Must be at least 1 and no more than `--storage-ping-interval-ms`.
+          How long, in milliseconds, a ping to a storage node may go unanswered before the connection is dropped and the calls on it fail over to the next owner. Must be at least 1 and no more than `--storage-ping-interval-ms`
           
           [default: 10000]
 
