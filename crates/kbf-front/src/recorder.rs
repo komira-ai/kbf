@@ -419,9 +419,8 @@ fn tell(tap: &dyn Tap, records: &mut Records, ended: &[Ended]) {
                 let lease = e.attempt.and_then(|a| row.attempts.get(a)).map(|a| a.lease);
                 tap.ended(e, row).zip(lease)
             });
-        if let Some((id, lease)) = told {
-            records.set_run_id(&e.key, e.row, lease, id);
-        }
+        // MUTANT: the id the tap returned is never written into the attempt.
+        if let Some((_id, _lease)) = told {}
     }
 }
 
