@@ -28,11 +28,31 @@ use crate::members::Members;
 /// The media type of the answer: the Prometheus text exposition format.
 pub const TEXT_FORMAT: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-/// What a scrape reads: the cache, the node's one cache if the process has one, and the
-/// members if there is a state store to keep them in.
+/// What a scrape adds to the cache's own metrics: the node's one cache's fill if the
+/// process has one, and build history's counters if the server keeps history. Not
+/// generic: nothing here depends on the cache.
+#[derive(Clone)]
+struct Extras {
+    local: Option<Arc<LocalCache>>,
+    history: Option<Arc<crate::history::Stats>>,
+}
+
+impl Extras {
+    /// Appends what there is to `out`.
+    fn render(self, out: &mut String) {
+        if let Some(local) = self.local {
+            render_fill(out, local.fill());
+        }
+        if let Some(history) = self.history {
+            history.render(out);
+        }
+    }
+}
+
+/// What a scrape reads: the cache, and the extras.
 struct Sources<M, O> {
     cache: Arc<Cache<M, O>>,
-    local: Option<Arc<LocalCache>>,
+    extras: Extras,
     members: Option<Arc<Members>>,
     tls: Arc<[TlsSource]>,
 }
@@ -41,18 +61,20 @@ impl<M, O> Clone for Sources<M, O> {
     fn clone(&self) -> Self {
         Self {
             cache: Arc::clone(&self.cache),
-            local: self.local.clone(),
+            extras: self.extras.clone(),
             members: self.members.clone(),
             tls: Arc::clone(&self.tls),
         }
     }
 }
 
-/// The `/metrics` route over `cache`'s metrics, `local`'s fill, the storage health of
-/// `members` and the reloads of the listeners' `tls` files.
+/// The `/metrics` route over `cache`'s metrics, `local`'s fill, when the server keeps
+/// build history its counters, the storage health of `members` and the reloads of the
+/// listeners' `tls` files.
 pub fn router<M, O>(
     cache: Arc<Cache<M, O>>,
     local: Option<Arc<LocalCache>>,
+    history: Option<Arc<crate::history::Stats>>,
     members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
 ) -> Router
@@ -64,7 +86,7 @@ where
         .route("/metrics", get(metrics::<M, O>))
         .with_state(Sources {
             cache,
-            local,
+            extras: Extras { local, history },
             members,
             tls: tls.into(),
         })
@@ -80,9 +102,7 @@ where
     // this scrape rather than failing it.
     let losses = sources.cache.losses().await;
     losses.iter().for_each(|l| l.render(&mut text));
-    if let Some(local) = sources.local {
-        render_fill(&mut text, local.fill());
-    }
+    sources.extras.render(&mut text);
     scrape_health(&mut text, sources.members.as_ref()).await;
     kbf_tls::render_metrics(sources.tls.iter(), &mut text);
     ([(CONTENT_TYPE, TEXT_FORMAT)], text).into_response()

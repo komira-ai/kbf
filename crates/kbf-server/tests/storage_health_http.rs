@@ -50,6 +50,7 @@ fn start() -> Server {
         store: Arc::clone(&store) as Arc<dyn Store>,
         epoch: EpochPolicy::Keep,
         members: config(),
+        history: None,
     };
     let listeners = Listeners {
         reapi: loopback(),

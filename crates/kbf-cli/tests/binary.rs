@@ -328,3 +328,39 @@ fn help_does_not_name_check_args() {
         assert!(!err.contains(kbf_cli::CHECK_ARGS), "{flag}: {err}");
     }
 }
+
+/// Catches `kbf frontend handover` read as the frontend mode (exit 2 for a word it does
+/// not take, or a start of the frontend), and `kbf frontend` with flags no longer being
+/// the mode. The handover reaches its own entry: with a `systemctl` that is not there it
+/// exits 1 naming the program, starting nothing; a flag of the command that is not
+/// allowed (`--poll-ms` without `--wait`) and a flag of the mode (`--listen`) exit 2.
+#[test]
+fn frontend_handover_is_a_command_and_frontend_stays_a_mode() {
+    let (code, out, err) = run(&[
+        names::FRONTEND,
+        "handover",
+        "--systemctl=/nonexistent/systemctl",
+    ]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert_eq!(
+        err,
+        "kbf frontend handover: cannot run /nonexistent/systemctl: No such file or directory (os error 2)\n"
+    );
+    for args in [
+        &[names::FRONTEND, "handover", "--poll-ms=5"][..],
+        &[names::FRONTEND, "handover", "--listen=127.0.0.1:1"][..],
+    ] {
+        let (code, out, err) = run(args);
+        assert_eq!(code, Some(2), "{args:?}: {err}");
+        assert!(out.is_empty(), "{out}");
+        assert!(err.contains("kbf frontend handover"), "{err}");
+    }
+    let (code, _, err) = run(&[names::FRONTEND, "--listen=127.0.0.1:0"]);
+    assert_eq!(
+        code,
+        Some(2),
+        "a frontend with no --storage is refused: {err}"
+    );
+    assert!(!err.contains("handover"), "{err}");
+}

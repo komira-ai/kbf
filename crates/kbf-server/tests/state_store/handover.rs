@@ -18,6 +18,7 @@ fn farm_over_disk(disk: &Disk, wait: Duration) -> (TestFarm, Backend) {
             store,
             epoch: EpochPolicy::Keep,
             members: Default::default(),
+            history: None,
         }))
         .expect("a farm over the store");
     (farm, backend)
