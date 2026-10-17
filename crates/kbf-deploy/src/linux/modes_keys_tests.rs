@@ -80,6 +80,7 @@ fn each_mode_renders_its_full_flag_set() {
             "--storage-client-key=/etc/kbf/worker.key",
             "--storage-ca=/etc/kbf/ca.pem",
             "--state-store=sqlite:///srv/kbf/state/state.db",
+            "--handover-socket=/run/kbf-frontend/control.sock",
         ])
     );
     assert_eq!(

@@ -77,6 +77,8 @@ pub struct Subject {
     pub cfg: Option<String>,
     /// The target the action's own paths name.
     pub target: Option<Target>,
+    /// Whether the action is a test run ([`Shape::test`]).
+    pub test: bool,
     /// The mnemonic and target the client sent: hints, never keys.
     pub label: ActionLabel,
 }
@@ -91,6 +93,7 @@ impl Subject {
             key: shape.key,
             cfg: shape.cfg.clone(),
             target: shape.target.clone(),
+            test: shape.test,
             label: described.label,
         };
         (subject, shape)
@@ -108,6 +111,7 @@ impl Subject {
                 kind: t.kind,
                 label: kbf_invocation::Text::sent(t.label.clone()),
             }),
+            test: self.test,
         }
     }
 }

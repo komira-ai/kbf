@@ -137,6 +137,10 @@ pub struct Attempt {
     pub end: Option<AttemptEnd>,
     /// What its lease's report measured; `None` without a report the scheduler took.
     pub run: Option<Box<Run>>,
+    /// The id the history writer minted for this attempt in this record, as opaque bytes
+    /// (`kbf_history::RunId::to_bytes`); `None` until the recorder's tap sets one
+    /// ([`crate::Records::set_run_id`]).
+    pub run_id: Option<[u8; 12]>,
 }
 
 /// How a lease ended.
@@ -420,6 +424,8 @@ pub struct Invocation {
     pub(crate) indexed: WallTime,
     /// Whether the memory bound stopped this record taking rows (section 3.5, step 3).
     pub(crate) rows_closed: bool,
+    /// The `last_seen` at which [`crate::Records::idle_since`] last reported the record.
+    pub(crate) idle_reported: Option<WallTime>,
 }
 
 impl Invocation {
@@ -447,6 +453,7 @@ impl Invocation {
             counted: 0,
             indexed: call.at,
             rows_closed: false,
+            idle_reported: None,
         }
     }
 

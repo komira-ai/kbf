@@ -289,6 +289,7 @@ where
         args.open_state_store().map_err(ServeError::State)?,
         args.members(),
     );
+    let state = crate::history::with_history(state, &args.history)?;
     let routes = Routes {
         invocations: policy.invocations_get.is_some(),
         blobs: policy.invocations_get.is_some() && policy.blobs_get.is_some(),
@@ -510,6 +511,7 @@ mod tests {
             )),
             epoch: crate::farm::EpochPolicy::Keep,
             members: crate::members::MembershipConfig::default(),
+            history: None,
         };
         let got = with_members(Some(state), members).expect("still a store");
         assert_eq!(got.members, members);
