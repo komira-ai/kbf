@@ -15,7 +15,10 @@ use crate::tier::{ServerId, StagedObject, StagedPut, TierError, TierId};
 
 mod evict;
 mod lost;
+mod rebuild;
 mod staged;
+
+pub use rebuild::{AdoptRefused, Adopted, Rebuild};
 
 /// One committed change to the metadata state.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,6 +136,33 @@ pub enum Command {
     /// later one ([`StaleWriter`]), so no two processes ever put under one writer. An
     /// epoch writer's puts are not affected.
     SetWriter(NodeWriter),
+    /// Indexes the records of a segment the store holds that this log did not write
+    /// (a rebuild of the index from the segments' footers): each `(digest, offset)` of
+    /// `entries` is recorded at `Location { store: CONFIGURED, object, offset }`
+    /// **only if the digest is not indexed**: an entry already held, at a reachable
+    /// object or not, is kept as it is, so a blob written while the rebuild ran is never
+    /// replaced. Adopted entries count as a touch at the farm time they are applied.
+    /// Afterwards the log takes commands naming `object`'s writer
+    /// ([`Command::ObjectUnreachable`] on a read that fails, [`Command::EvictObjects`]).
+    /// Refused ([`AdoptRefused`]) for an object of the current node writer, whose
+    /// objects its own puts index, and for an object of an epoch this log never
+    /// allocated, which a later [`Command::AllocEpoch`] would name again. Format 4.
+    AdoptSegment {
+        /// The segment object.
+        object: ObjectId,
+        /// Its records: digest and offset in the segment.
+        entries: Vec<(Digest, u64)>,
+    },
+    /// The rebuild of the index has handled every object up to and including the one
+    /// whose key is `after`, in key order: a restart resumes after it. A key not after
+    /// the one held, or one after the rebuild is done, changes nothing. Format 4.
+    RebuildProgress {
+        /// The last object key handled.
+        after: String,
+    },
+    /// The rebuild of the index is complete: the index names every object the store
+    /// held when it started. Never undone; a log that has it does not rebuild. Format 4.
+    RebuildDone,
 }
 
 /// What applying a [`Command`] did.
@@ -168,6 +198,11 @@ pub enum Applied {
     Evicted(Evicted),
     /// [`Command::SetWriter`].
     Writer(Result<(), StaleWriter>),
+    /// [`Command::AdoptSegment`].
+    Adopted(Result<Adopted, AdoptRefused>),
+    /// [`Command::RebuildProgress`] or [`Command::RebuildDone`]: the rebuild's state after
+    /// the command.
+    Rebuild(Rebuild),
 }
 
 /// What a [`Command::PutBlob`] did.
@@ -297,6 +332,11 @@ pub struct MetaState {
     next_epoch: u64,
     /// Each member [`Command::SetWriter`] named, with the latest boot it set.
     node_boots: BTreeMap<NonZeroU64, NonZeroU64>,
+    /// Writers whose objects [`Command::AdoptSegment`] indexed: known to the log from
+    /// then on, though it never allocated or set them.
+    adopted_writers: BTreeSet<Writer>,
+    /// How far the rebuild of the index is ([`MetaState::rebuild`]).
+    rebuild: Rebuild,
     /// The node writer set last: the only one a put of a node object may name.
     current_writer: Option<NodeWriter>,
     /// Each server's current tier.
@@ -326,6 +366,8 @@ impl MetaState {
             blob_losses: 0,
             next_epoch: 1,
             node_boots: BTreeMap::new(),
+            adopted_writers: BTreeSet::new(),
+            rebuild: Rebuild::default(),
             current_writer: None,
             tiers: BTreeMap::new(),
             retired_tiers: BTreeSet::new(),
@@ -452,6 +494,11 @@ impl MetaState {
             Command::FlushConflict { object } => Applied::Tier(self.flush_conflict(object)),
             Command::EvictObjects { objects } => Applied::Evicted(self.evict_objects(&objects)),
             Command::SetWriter(writer) => Applied::Writer(self.set_writer(writer)),
+            Command::AdoptSegment { object, entries } => {
+                Applied::Adopted(self.adopt_segment(object, entries))
+            }
+            Command::RebuildProgress { after } => Applied::Rebuild(self.rebuild_progress(after)),
+            Command::RebuildDone => Applied::Rebuild(self.rebuild_done()),
         }
     }
 
@@ -598,16 +645,18 @@ impl MetaState {
         self.current_writer
     }
 
-    /// Whether this log knows `object`'s writer: an epoch it allocated, or a member it
-    /// set at the object's boot or a later one.
+    /// Whether this log knows `object`'s writer: an epoch it allocated, a member it
+    /// set at the object's boot or a later one, or a writer whose objects it adopted.
     fn known(&self, object: ObjectId) -> Result<(), ForeignWriter> {
-        let known = match object.writer() {
+        let by_rule = match object.writer() {
             Writer::Epoch(epoch) => epoch.get() != 0 && epoch.get() < self.next_epoch,
             Writer::Node(node) => self
                 .node_boots
                 .get(&node.member())
                 .is_some_and(|latest| node.boot() <= *latest),
+            Writer::Legacy(_) => false,
         };
+        let known = by_rule || self.adopted_writers.contains(&object.writer());
         if known {
             Ok(())
         } else {
@@ -621,7 +670,7 @@ impl MetaState {
         match object.writer() {
             Writer::Epoch(_) => self.known(object),
             Writer::Node(node) if self.current_writer == Some(node) => Ok(()),
-            Writer::Node(_) => Err(ForeignWriter(object)),
+            Writer::Node(_) | Writer::Legacy(_) => Err(ForeignWriter(object)),
         }
     }
 

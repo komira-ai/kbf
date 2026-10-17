@@ -38,7 +38,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_front::{CacheStorage, SegmentsConfig};
+use kbf_front::{CacheStorage, RebuildConfig, SegmentsConfig};
 use kbf_mapsync::MapHolder;
 use kbf_meta::Retention;
 use kbf_objstore::{FsStore, ObjectStore};
@@ -47,6 +47,7 @@ use kbf_storage::repair::Repairs;
 use kbf_storage::service::InProcess;
 use kbf_threads::disk::Statvfs;
 
+use crate::rebuild::Background;
 use crate::replication::{REPAIR_DIR, bind_node};
 use crate::serve::{ServeError, StorageListener, bind_storage_socket};
 use crate::start::{AbortOnDrop, open_cold_file, share_storage, tier_bytes};
@@ -68,7 +69,7 @@ pub struct StorageHalf {
     maps: Arc<MapHolder>,
     repairs: Option<Arc<Repairs>>,
     _flusher: Option<AbortOnDrop>,
-    _pass: Option<AbortOnDrop>,
+    _background: Background,
     _joiner: Option<AbortOnDrop>,
     _repair: Option<AbortOnDrop>,
 }
@@ -120,7 +121,7 @@ impl StorageHalf {
         let Self {
             serving,
             _flusher,
-            _pass,
+            _background,
             _joiner,
             _repair,
             ..
@@ -203,7 +204,8 @@ where
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
         AbortOnDrop(tokio::spawn(flusher))
     });
-    let _pass = pass.map(|pass| AbortOnDrop(crate::startup_pass::spawn(Arc::clone(&cache), pass)));
+    let _background =
+        crate::rebuild::spawn(&cache, &registered.catch_up, pass, RebuildConfig::default());
     let segments = SegmentsConfig {
         max_bytes: args.segment_upload_max_bytes,
         idle: Duration::from_secs(args.segment_upload_idle_secs),
@@ -224,7 +226,7 @@ where
         maps: node.maps,
         repairs: node.repairs,
         _flusher,
-        _pass,
+        _background,
         _joiner: node.joiner,
         _repair: node.repair,
     })
