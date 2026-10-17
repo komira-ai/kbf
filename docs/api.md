@@ -148,8 +148,8 @@ message yet: the daemon is not told, and the server simply sends it no new `Star
 
 An operator sets a storage member's state. The body is `{"state": "active"}` or
 `{"state": "draining"}`; the answer is `{"id": N, "state": "...", "generation": G}`,
-the map's generation after the change. `down` is the store's verdict and `joining` and
-`catching_up` are what a registration says, so none of them is accepted (`400`, as is
+the map's generation after the change. `down` is the store's verdict, `catching_up` is what a registration says and `joining` is
+the join handoff's, so none of them is accepted (`400`, as is
 any other body). `404` for an id that has no live row (it expired, or never
 registered) or is not a number, or on a server without a state store; `503` when the
 state store cannot be written; `401`, `403` or `415` from the gates of
@@ -159,17 +159,14 @@ by a refused request.
 When a member becomes `active` the cluster also records that it has formed (see below),
 in the same transaction.
 
-**When a member is `active` without this call.** A cluster with no state yet (an empty
-state store) has no member that could hand a slice to a joiner, and a `joining` member
-is never rank 1, so such a cluster would never get an `active` member. For this reason a
-member that registers while the cluster has not yet formed enters `active`: the first
-registration of a fresh cluster writes the `meta/members_formed` mark and opens a
-window (`bootstrap`, 60 seconds from that registration), and a registration inside the
-window is `active` too, so a fleet that starts together forms together. After the
-window, and for ever after in a cluster that has formed (a restart does not undo it), a
-registration is `joining`, and this call is how it is promoted. A member that registers
-saying it is rebuilding its index enters `catching_up` and becomes `active` by its own
-first beat that says it is done; it opens no window.
+**When a member is `active` without this call.** A registration that says the node's
+index is whole enters `active`, in a fresh cluster and in a formed one alike: it is the
+first start of a cluster, or a restart of a node whose meta log already has its rebuild,
+so a rolling restart leaves every member `active`. The registration also writes the
+`meta/members_formed` mark. A registration that says the node is rebuilding its index
+enters `catching_up` and becomes `active` by its own first beat that says it is done. No
+registration writes `joining`; that state is set by the join handoff in code
+(`Members::set_state`), and a `joining` member is promoted by this call.
 
 **The risk of promoting a joiner.** `active` makes the member a settled owner: it
 takes the rank-1 slots of the digests it wins in the rendezvous order, and it is read
