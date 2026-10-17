@@ -275,7 +275,7 @@ fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Resu
 
 /// Catches the marker walk failing when another test removes its container mid-walk
 /// (issue #105), and the tolerance hiding anything else. The first trigger file find
-/// reaches deletes every other directory of the tree, which find has already listed
+/// reaches deletes the other directory of the tree, which find has already listed
 /// and not yet entered, so one directory vanishes mid-walk whichever order find takes.
 /// That walk must pass and still print the trigger it matched (a marker found during
 /// a race is still found). A tree moved away while find is deep inside it makes fts
@@ -294,22 +294,32 @@ fn a_directory_vanishing_mid_walk_fails_nothing_else() {
         }
         root.to_string_lossy().into_owned()
     };
-    // Deletes every directory of the root ($0) except the one holding this trigger ($1).
-    let remove_others =
-        r#"for d in "$0"/*/; do case "$1" in "$d"*) ;; *) rm -r "$d" ;; esac; done"#;
+    // Each trigger deletes the other directory of the root, which find has already
+    // listed and not yet entered.
     let race = |root: &str| -> Vec<String> {
-        vec![
-            "-name".into(),
-            "trigger".into(),
-            "-exec".into(),
-            "sh".into(),
-            "-c".into(),
-            remove_others.into(),
-            root.into(),
-            "{}".into(),
-            ";".into(),
-            "-print".into(),
+        let (p, q) = (format!("{root}/p"), format!("{root}/q"));
+        [
+            "(",
+            "-path",
+            "*/p/trigger",
+            "-exec",
+            "rm",
+            "-r",
+            q.as_str(),
+            ";",
+            "-o",
+            "-path",
+            "*/q/trigger",
+            "-exec",
+            "rm",
+            "-r",
+            p.as_str(),
+            ";",
+            ")",
+            "-print",
         ]
+        .map(str::to_owned)
+        .to_vec()
     };
     fn strs(v: &[String]) -> Vec<&str> {
         v.iter().map(String::as_str).collect()

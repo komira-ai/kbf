@@ -118,7 +118,7 @@ pub(crate) mod tests {
             overlay_work: PathBuf::from("/scratch/kbf-lease-1-2/work"),
             working_directory: "pkg".to_owned(),
             env: vec![("PATH".to_owned(), "/bin".to_owned())],
-            argv: vec!["sh".to_owned(), "-c".to_owned(), "echo \"a b\"".to_owned()],
+            argv: vec!["tool".to_owned(), "--flag".to_owned(), "a b".to_owned()],
             limits: ContainerLimits {
                 pids: 101,
                 shm_mib: 102,

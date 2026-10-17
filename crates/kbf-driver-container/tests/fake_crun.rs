@@ -32,7 +32,7 @@ async fn a_run_collects_everything_and_leaves_nothing() {
     spec.working_directory = "pkg".to_owned();
     spec.inputs = vec![
         ("pkg/src/in.txt", b"input bytes", false),
-        ("tool.sh", b"#!/bin/sh\n", true),
+        ("tool.sh", b"a tool\n", true),
     ];
     spec.symlinks = vec![("pkg/link-in", "src/in.txt")];
     spec.outputs = vec![
@@ -72,7 +72,7 @@ async fn a_run_collects_everything_and_leaves_nothing() {
         ";",
         "write-lines",
         "$UPPER/pkg/out/dir/run.sh",
-        "#!/bin/sh",
+        "a program",
         ";",
         "chmod",
         "755",
