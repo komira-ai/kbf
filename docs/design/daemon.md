@@ -22,7 +22,11 @@ an action runs under. The messages are in [worker-protocol.md](worker-protocol.m
 
 The daemon is configured by flags only: `--server` (an `https://` URL; repeatable, or
 several separated by commas), `--ca-cert`, `--cert`, `--key`, `--tls-server-name`,
-`--node-id`, `--runtime`, `--reconnect-ms` and `--reconnect-max-ms`.
+`--node-id`, `--runtime`, `--reconnect-ms` and `--reconnect-max-ms`. How long a silent
+storage node is waited on is set by `--storage-dial-timeout-ms`,
+`--storage-ping-interval-ms` and `--storage-ping-timeout-ms` (10000 each; none is zero,
+and the ping timeout is at most the interval); a daemon with one of them wrong does not
+start.
 The certificate must name `--node-id` as its one DNS subjectAltName, or the server
 refuses the session (see
 [worker-protocol.md](worker-protocol.md#node-identity-and-the-deny-list)).

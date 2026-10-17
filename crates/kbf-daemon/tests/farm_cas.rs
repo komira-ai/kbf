@@ -13,7 +13,8 @@ use kbf_daemon::cas::{Cas, CasError, Chunks};
 use kbf_daemon::{FarmCas, HeldMaps, MapHolder, storage_nodes};
 use kbf_map::{Map, Member, MemberId, MemberState, Rule};
 use kbf_proto::reapi::Digest;
-use kbf_route::MapSource as _;
+use kbf_route::{Liveness, MapSource as _, Nodes as _};
+use kbf_storage::Storage as _;
 use kbf_transfer::{Record, RecordHasher, TransferConfig, Transfers, proto_digest};
 use kbf_types::LeaseId;
 use support::storage_node::{Node, serve_plain, serve_tls};
@@ -74,7 +75,7 @@ fn plane_with(
         .connect_lazy();
     let engine = Arc::new(Transfers::over(channel, engine));
     let holder = Arc::new(MapHolder::new());
-    let nodes = storage_nodes(&tls).expect("TLS files");
+    let nodes = storage_nodes(&tls, Liveness::default()).expect("TLS files");
     let cas = FarmCas::new(engine, Arc::clone(&holder), nodes, routed);
     (Arc::new(cas), holder)
 }
@@ -361,9 +362,38 @@ fn storage_nodes_need_all_three_tls_files() {
             "cert" => files.cert = path,
             _ => files.key = path,
         }
-        let Err(error) = storage_nodes(&files) else {
+        let Err(error) = storage_nodes(&files, Liveness::default()) else {
             panic!("a plane was built without its {missing} file");
         };
         assert!(error.to_string().contains(missing), "{error}");
     }
+}
+
+/// Catches a `--storage-dial-timeout-ms` that never reaches the nodes the daemon dials: a
+/// "node" that takes the TCP connection and never speaks TLS fails a call within the
+/// dial timeout given, here 300 ms, not after the default ten seconds the test would
+/// otherwise outlive.
+#[tokio::test]
+async fn a_dial_timeout_given_to_storage_nodes_bounds_a_silent_node() {
+    let pki_ = pki("farm-cas-dial");
+    let mute = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let silent = member(1, mute.local_addr().expect("address").to_string());
+    let liveness = Liveness {
+        connect: Duration::from_millis(300),
+        ..Liveness::default()
+    };
+    let nodes = storage_nodes(&pki_.client, liveness).expect("TLS files");
+    let storage = nodes.node(&silent, 1).expect("a node");
+    let asked = [kbf_types::Digest::new(
+        kbf_types::DigestFunction::Sha256,
+        [0; 32],
+        1,
+    )];
+    let answer = timeout(Duration::from_secs(5), storage.find_missing(&asked))
+        .await
+        .expect("the dial timeout ends the call within 5 s");
+    assert!(answer.is_err(), "{answer:?}");
+    drop(mute);
 }
