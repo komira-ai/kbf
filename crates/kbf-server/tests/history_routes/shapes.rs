@@ -131,7 +131,10 @@ async fn shapes_and_tests_answer_after_a_restart_from_index_only() {
         .ok("/v1/shapes/1111111111111111?instance=main&cfg=cfgA")
         .await;
     assert_eq!(one["key"], "1111111111111111");
-    assert_eq!(one["previous_keys"], Value::Null);
+    assert!(
+        one.get("previous_keys").is_some_and(Value::is_null),
+        "the key is there, and null: no report maps keys yet: {one}"
+    );
     assert_eq!(one["status"], "failing");
     let rows = b.ok("/v1/shapes/1111111111111111").await;
     assert_eq!(keys(&rows), ["1111111111111111"]);

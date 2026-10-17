@@ -2,6 +2,8 @@
 //! it catches.
 
 use kbf_history::records::InvState;
+use kbf_history::{IndexRoot, InvKey};
+use kbf_state::{Cond, Store as _, Txn};
 use serde_json::Value;
 
 use crate::kit::header;
@@ -157,4 +159,57 @@ async fn the_list_filters_by_time_and_state() {
     assert_eq!(ids(&open), ["new"]);
     assert_eq!(open["invocations"][0]["complete"], false);
     b.stop().await;
+}
+
+/// Catches (a merge that passes what a scan has not reached): a page that lists an older
+/// build of one instance while another instance's scan stopped at its bound short of a
+/// newer one, so the newer build comes on a later page: the list is no longer newest
+/// first, and a client that stops at the first page has missed it. The instance `heavy` has
+/// more rows newer than its one real build than a page of the list scans (the rows name
+/// builds with no header, as a build forgotten leaves); `main` has an older real build.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_does_not_pass_what_a_scan_has_not_reached() {
+    let world = World::new();
+    let a = world.start(PAGES_ONLY);
+    let mut events = ran("early", "main", 1, 1, 0);
+    events.extend(ran("late", "heavy", 2, 2, 0));
+    a.feed(events).await;
+    world.flushed("early", 1).await;
+    world.flushed("late", 1).await;
+    let late = header(&world, "late").expect("a header").list_ms;
+    let root = IndexRoot::default();
+    let ghost = InvKey::from_record_id("ghost");
+    let rows = kbf_history::MAX_SCAN as u64 + 5;
+    for from in (0..rows).step_by(1_000) {
+        let mut puts = Txn::new();
+        for t in from..(from + 1_000).min(rows) {
+            puts = puts.put(
+                root.inv_list("heavy", late + 1 + t, &ghost),
+                vec![1],
+                Cond::Any,
+            );
+        }
+        world
+            .state
+            .fake
+            .txn(puts)
+            .expect("a write")
+            .expect("no conflict");
+    }
+    let first = a.ok("/v1/invocations").await;
+    assert_eq!(
+        ids(&first),
+        Vec::<String>::new(),
+        "nothing is passed unscanned: {first}"
+    );
+    let mut seen = Vec::new();
+    let mut next = first["next_page"].as_str().map(str::to_owned);
+    while let Some(link) = next {
+        let page = a.ok(&link).await;
+        seen.extend(ids(&page));
+        next = page["next_page"].as_str().map(str::to_owned);
+        assert!(seen.len() <= 2, "a page repeats: {seen:?}");
+    }
+    assert_eq!(seen, ["late", "early"]);
+    a.stop().await;
 }
