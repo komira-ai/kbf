@@ -9,15 +9,19 @@
 //!   `ActionResult` blob plus its [`Closure`];
 //! - the objects the store has reported unreachable, each with a [`LossMark`]: its
 //!   [`UnreachableReason`] and the [`Generation`] (log index) of the last mark;
-//! - the committed farm time, and the next writer [`Epoch`].
+//! - the committed farm time, the next writer [`Epoch`], and the node writers set
+//!   ([`NodeWriter`]), the latest of them current.
 //! - the local write tiers ([`TierId`]), one current tier per server, and the
 //!   **staged** objects: objects whose only copy is a block file on a tier until they
 //!   are flushed to the store ([`StagedObject`], docs/design/write-path.md, section 6).
 //!   A staged blob answers `Present` with the tier it is staged on.
 //!
-//! Object ids are a writer epoch and a sequence number ([`ObjectId`]). Epochs come only
-//! from [`Command::AllocEpoch`], never twice, and a command naming an object of an epoch
-//! never allocated is refused ([`UnallocatedEpoch`]).
+//! Object ids are a [`Writer`] and a sequence number ([`ObjectId`]). A writer is an
+//! epoch, which comes only from [`Command::AllocEpoch`], never twice, or a registered
+//! storage node's member and boot ([`NodeWriter`]), which the state store hands out and
+//! [`Command::SetWriter`] makes current. A command naming an object of an epoch never
+//! allocated or of a node writer never set is refused, and so is a put naming a node
+//! writer that is not the current one ([`ForeignWriter`]).
 //!
 //! It changes only by [`Command`]s, which every replica applies in log order, each with
 //! the log index of its entry ([`MetaState::execute`]); farm time arrives as
@@ -43,9 +47,11 @@ mod tier;
 
 pub use crate::model::{
     ActionAnswer, ActionRecord, BlobAnswer, Closure, Epoch, FindMissing, Generation, Location,
-    LossMark, Miss, ObjectId, Retention, Role, StoreId, Touch, UnreachableReason,
+    LossMark, Miss, NodeWriter, ObjectId, Retention, Role, StoreId, Touch, UnreachableReason,
+    Writer,
 };
 pub use crate::state::{
-    ActionWriteError, Applied, BlobWrite, Collected, Command, Evicted, MetaState, UnallocatedEpoch,
+    ActionWriteError, Applied, BlobWrite, Collected, Command, Evicted, ForeignWriter, MetaState,
+    StaleWriter,
 };
 pub use crate::tier::{ServerId, StagedObject, StagedPut, StagedState, TierError, TierId};

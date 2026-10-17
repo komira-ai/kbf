@@ -768,7 +768,53 @@ pub fn bind_storage(
     listener: StorageListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
+    serve_storage(storage, bind_storage_socket(listener)?, shutdown)
+}
+
+/// A storage listener's socket: bound, so its address is known and callers queue on it,
+/// and not yet serving ([`bind_storage_socket`], then [`serve_storage`]).
+pub struct StorageSocket {
+    incoming: TcpIncoming,
+    addr: SocketAddr,
+    listener: StorageListener,
+}
+
+impl StorageSocket {
+    /// Where the socket is bound.
+    #[must_use]
+    pub const fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+/// Binds `listener`'s address, serving nothing yet: a storage node registers with its
+/// frontend from the bound address before it opens the cache it serves.
+///
+/// # Errors
+/// The listener cannot be bound.
+pub fn bind_storage_socket(listener: StorageListener) -> Result<StorageSocket, ServeError> {
     let (incoming, addr) = bind(listener.listen)?;
+    Ok(StorageSocket {
+        incoming,
+        addr,
+        listener,
+    })
+}
+
+/// Serves `storage` on `socket`, as [`bind_storage`] does.
+///
+/// # Errors
+/// The TLS configuration is refused (a key that does not match its certificate, say).
+pub fn serve_storage(
+    storage: Arc<dyn kbf_storage::Storage>,
+    socket: StorageSocket,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
+    let StorageSocket {
+        incoming,
+        addr,
+        listener,
+    } = socket;
     let mut server = flow_control(Server::builder());
     let admission = match listener.tls {
         Some(tls) => {

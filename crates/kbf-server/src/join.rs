@@ -113,20 +113,37 @@ impl Joiner {
     /// Registers and heartbeats for ever. A failed call waits [`backoff`] and tries
     /// again; a NOT_FOUND heartbeat registers again.
     pub async fn run(mut self) {
+        let joined = self.join().await;
+        self.keep(joined).await;
+    }
+
+    /// Registers, retrying after [`backoff`] until the frontend answers: what a storage
+    /// node waits for before it opens its cache, which writes as the member and boot
+    /// this returns.
+    pub async fn join(&mut self) -> Joined {
         let mut failures = 0_u32;
         loop {
-            let this = loop {
-                match self.register().await {
-                    Ok(this) => break this,
-                    Err(e) => {
-                        tracing::warn!("registering with the frontend: {}", e.message());
-                        tokio::time::sleep(backoff(self.retry, failures)).await;
-                        failures = failures.saturating_add(1);
-                    }
+            match self.register().await {
+                Ok(this) => {
+                    tracing::info!(member = this.member_id, boot = this.boot, "registered");
+                    return this;
                 }
-            };
-            failures = 0;
-            tracing::info!(member = this.member_id, boot = this.boot, "registered");
+                Err(e) => {
+                    tracing::warn!("registering with the frontend: {}", e.message());
+                    tokio::time::sleep(backoff(self.retry, failures)).await;
+                    failures = failures.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// Heartbeats as `joined` for ever: a failed call waits [`backoff`] and tries
+    /// again; a NOT_FOUND heartbeat registers again ([`Joiner::join`]). A registration
+    /// after a lapse has a larger boot; the node's cache keeps writing as the boot it
+    /// opened with, which no other process is ever given.
+    pub async fn keep(mut self, mut this: Joined) {
+        let mut failures = 0_u32;
+        loop {
             loop {
                 tokio::time::sleep(this.interval).await;
                 match self.beat(&this).await {
@@ -142,6 +159,8 @@ impl Joiner {
                     }
                 }
             }
+            this = self.join().await;
+            failures = 0;
         }
     }
 }

@@ -5,8 +5,8 @@ mod common;
 
 use common::{DAY, digest, in_segment, mark_missing, meta, object, put, tick};
 use kbf_meta::{
-    Applied, BlobAnswer, BlobWrite, Command, Epoch, Location, MetaState, ObjectId, ServerId,
-    StagedPut, StagedState, StoreId, TierError, TierId, UnallocatedEpoch,
+    Applied, BlobAnswer, BlobWrite, Command, Epoch, ForeignWriter, Location, MetaState, ObjectId,
+    ServerId, StagedPut, StagedState, StoreId, TierError, TierId,
 };
 use kbf_types::Digest;
 
@@ -397,7 +397,7 @@ fn a_refused_put_changes_nothing() {
                 object: never,
                 ..part(0, 100, &[])
             },
-            TierError::Unallocated(UnallocatedEpoch(never)),
+            TierError::Foreign(ForeignWriter(never)),
         ),
     ];
     for (name, bad, error) in cases {

@@ -30,10 +30,14 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerT
 
 const MS: Duration = Duration::from_millis(1);
 
+/// An empty directory for `name`. Emptied first: each test's frontend is new, so its
+/// state store hands out boot 1 again, which a metadata directory a previous run left
+/// has set already (a registered node refuses to start over it).
 fn dir(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("storage-register")
         .join(name);
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("directory");
     dir
 }
@@ -319,6 +323,18 @@ async fn the_registration_flags_are_carried_or_refused() {
         none.expect("no error").is_none(),
         "no --frontend, no registration"
     );
+    // Without --frontend the node starts at once, registered nowhere: its cache writes
+    // in an epoch of its own log.
+    let node = start_storage(&alone, never)
+        .await
+        .expect("starts without a frontend");
+    assert!(
+        node.start_line().starts_with("kbf-storage "),
+        "{}",
+        node.start_line()
+    );
+    drop(node);
+    assert_eq!(f.store.fake.scan_prefix("member/").expect("scan").len(), 1);
     let help = command().render_help().to_string();
     for flag in [
         "--frontend",
