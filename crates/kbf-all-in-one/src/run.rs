@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use kbf_server::ServeError;
+use kbf_server::{ServeError, StartFailure};
 use kbf_threads::Topology;
 use tokio::runtime::Runtime;
 
@@ -65,11 +65,12 @@ impl Failed {
         Self::Stopped(e.to_string())
     }
 
-    /// The exit status: 2 for a start the server refused, as `kbf-server` exits; the
+    /// The exit status: for a start the server half refused, 2 as `kbf-server` exits, or
+    /// 75 when a later try can succeed ([`StartFailure`]: a restart is for that one); the
     /// daemon's own for a start it refused; 1 for a server half that stopped.
     fn code(&self) -> ExitCode {
         match self {
-            Self::Server(_) => ExitCode::from(2),
+            Self::Server(e) => StartFailure::of(e.as_ref()).code(),
             Self::Daemon(e) => kbf_node::exit_code(e),
             Self::Stopped(_) => ExitCode::FAILURE,
         }
@@ -199,5 +200,27 @@ mod tests {
         let daemon = Failed::Daemon("no scratch".into());
         assert_eq!(daemon.said("storage"), "daemon: no scratch");
         assert_eq!(daemon.code(), ExitCode::FAILURE);
+    }
+
+    /// Catches a storage half's start that can succeed on a later try but exits 2, which
+    /// `RestartPreventExitStatus=2` never restarts (mutant: `Failed::code` answering 2
+    /// for every `Server`): a log directory the stopping process still holds, and a boot
+    /// the frontend's restored state store handed out again (`StaleWriter`) exit 75, and
+    /// a refusal that no restart clears (a log that is not one) still exits 2.
+    #[test]
+    fn a_start_a_later_try_can_pass_exits_75_and_a_refusal_2() {
+        let stale = kbf_meta::StaleWriter {
+            writer: kbf_meta::NodeWriter::new(std::num::NonZeroU64::MIN, std::num::NonZeroU64::MIN),
+            current: std::num::NonZeroU64::MIN,
+        };
+        let stale = Failed::server(kbf_front::CacheError::StaleWriter(stale));
+        assert_eq!(stale.code(), ExitCode::from(75));
+        let held = Failed::server(kbf_server::RaftLogError::Locked {
+            dir: "meta".into(),
+            source: std::io::Error::other("held"),
+        });
+        assert_eq!(held.code(), ExitCode::from(75));
+        let refused = Failed::server(kbf_server::RaftLogError::NotEmpty);
+        assert_eq!(refused.code(), ExitCode::from(2));
     }
 }

@@ -196,6 +196,41 @@ digits and `: _ . @ -`, ending in a unit type such as `.service`); a value with 
 inside a name, `=`, `%`, `/` or a newline is refused, so the setting cannot add a
 directive. `check-units` accepts the lines.
 
+### Exit 2 and exit 75: what systemd restarts
+
+A start that fails exits 2 or 75. The `storage`, `storage-and-daemon` and `all-in-one`
+units carry `RestartPreventExitStatus=2` and `RestartSec=5`, so exit 2 stays down and exit 75
+(`EX_TEMPFAIL`) is started again five seconds later, below systemd's default start limit
+(five starts in ten seconds).
+
+- **Exit 2, refused.** The default for any failure kbf does not name below: a flag, a
+  certificate or key path that cannot be read, a metadata directory that is not a log, a
+  log of several voters, a path or permission that is wrong. A restart reads the same
+  bytes and fails the same way.
+- **Exit 75, not ready.** Named by the failure's type, never by its text: the metadata
+  or cold-store directory held by a process that is still stopping (its `LOCK`), a file
+  system call that failed because the device was busy, read-only or full, and a
+  registration whose boot the node's metadata log has set already (`StaleWriter`, below).
+  A frontend or daemon that fails to start is not covered: `frontend` and `kbf-server`
+  exit 2 for every start error, and the daemon half's own codes are unchanged.
+
+**After restoring the frontend's state store from an older copy.** The frontend hands each
+node its member id and a boot counter from the store (`boot/<id>`, one more at every
+registration); a node's metadata log remembers the latest boot it wrote as. A restored
+store's counters are behind the nodes' logs, so a node registers, is given a boot its log
+has set already, refuses to open ("member M boot B is not after boot C, the latest set",
+no object is written) and exits 75. systemd starts it again; that start registers again
+and takes the next boot, and the node opens as soon as its boot is past its log's. A gap
+of N boots therefore takes N restarts, about N times five seconds plus the start, each
+node on its own counter and all in parallel; nothing needs to be done but wait, and a node
+is not up before that. Restarting the unit by hand only spends one boot sooner. A node's
+boot rises at every registration (each restart, each lapsed heartbeat row), so a node
+that has run for months can have a gap of hundreds. Do not wipe a node's `--meta-dir` to
+skip the wait: that throws its index away. The frontend cannot refuse to start from a
+store older than its nodes' boots, because it learns a node's boot only when the node
+registers, after the frontend is up. Until a node has opened it serves nothing, though
+its registration put it in the frontend's map; calls routed to it fail.
+
 ### The state store: SQLite only
 
 The only state store kbf opens today is a SQLite file; Postgres is a later backend. Rule

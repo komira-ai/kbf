@@ -106,6 +106,7 @@ mod run_record;
 pub mod serve;
 pub mod stamp;
 mod start;
+mod start_exit;
 mod startup_pass;
 pub mod state_store;
 pub mod storage_half;
@@ -135,6 +136,7 @@ pub use serve::{
     bind_storage,
 };
 pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_interruptible};
+pub use start_exit::{NOT_READY, REFUSED, StartFailure};
 pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};
 pub use streams::{StreamArgs, StreamLimits};
 pub use worker::WorkerService;
