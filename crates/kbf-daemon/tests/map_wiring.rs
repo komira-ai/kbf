@@ -360,7 +360,8 @@ async fn farm(name: &str) -> Farm {
     }
 
     // The daemon's plane, over the map it was pushed.
-    let nodes = kbf_daemon::storage_nodes(&tls).expect("TLS files");
+    let nodes =
+        kbf_daemon::storage_nodes(&tls, kbf_daemon::Liveness::default()).expect("TLS files");
     let channel = Endpoint::from_shared("http://127.0.0.1:1")
         .expect("endpoint")
         .connect_lazy();

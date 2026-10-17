@@ -5,6 +5,7 @@ use std::path::Path;
 
 use kbf_types::{ImageError, ImageRef};
 
+use super::modes::Mode;
 use crate::config::{Config, ConfigError};
 use kbf_host::{HostPath, PathError};
 
@@ -16,6 +17,7 @@ pub const KEYS: &[&str] = &[
     "KBF_REAPI_PORT",
     "KBF_WORKER_PORT",
     "KBF_API_PORT",
+    "KBF_STORAGE_PORT",
     "KBF_RAM_GIB",
     "MINIO_RESERVATION_GIB",
     "KBF_SERVER_RESERVATION_GIB",
@@ -25,6 +27,7 @@ pub const KEYS: &[&str] = &[
     "MINIO_S3_ENDPOINT",
     "KBF_S3_BUCKET",
     "KBF_META_DIR",
+    "KBF_HOT_DIR",
     "KBF_DATA_DIR",
     "KBF_IMAGES",
     "KBF_USER",
@@ -34,6 +37,10 @@ pub const KEYS: &[&str] = &[
     "KBF_SWAP_FILE",
     "KBF_SWAP_SIZE",
 ];
+
+/// The converged units' S3 endpoint when `MINIO_S3_ENDPOINT` is not set: the host's own
+/// MinIO.
+pub const LOOPBACK_MINIO: &str = "http://127.0.0.1:9000";
 
 /// The least RAM, in GiB, left to the kernel, systemd and the daemon.
 const MIN_OS_HEADROOM_GIB: u64 = 4;
@@ -47,6 +54,8 @@ pub struct LinuxConfig {
     pub reapi_port: u16,
     pub worker_port: u16,
     pub api_port: u16,
+    /// `kbf storage`'s `--storage-listen` port, on `KBF_LISTEN_ADDRESS`.
+    pub storage_port: u16,
     pub ram_gib: u64,
     pub minio_reservation_gib: u64,
     pub server_reservation_gib: u64,
@@ -57,10 +66,15 @@ pub struct LinuxConfig {
     /// host"). At least 1.
     pub actions_gib: u64,
     pub minio_unit: String,
-    pub minio_s3_endpoint: String,
+    /// The S3 endpoint of the bucket, when `MINIO_S3_ENDPOINT` is set. The converged
+    /// units default to the host's own MinIO ([`LOOPBACK_MINIO`]); `--mode storage`
+    /// refuses without it ([`LinuxConfig::for_mode`]).
+    pub minio_s3_endpoint: Option<String>,
     pub s3_bucket: String,
     /// kbf-server's `--meta-dir`: its metadata log, a single-voter Raft log.
     pub meta_dir: HostPath,
+    /// `kbf storage`'s `--hot-store` directory: the SSD tier in front of the cold store.
+    pub hot_dir: HostPath,
     /// kbf-daemon's `--data-dir`: lease directories, the input cache and the trees.
     pub data_dir: HostPath,
     /// The pinned images, in podman's bare `<repo>@sha256:<digest>` form.
@@ -93,6 +107,18 @@ pub enum LinuxError {
     AnyAddress(String),
     #[error("MINIO_UNIT={0} is not a .service unit name")]
     MinioUnit(String),
+    #[error("{a} and {b} are both {port}: each listener of a host needs its own port")]
+    SamePort {
+        a: &'static str,
+        b: &'static str,
+        port: u16,
+    },
+    #[error("{key} must be set for --mode {mode}: {why}")]
+    Required {
+        key: &'static str,
+        mode: &'static str,
+        why: &'static str,
+    },
     #[error("KBF_OS_HEADROOM_GIB={0}: keep at least {MIN_OS_HEADROOM_GIB} GiB for the OS")]
     Headroom(u64),
     #[error(
@@ -177,13 +203,26 @@ impl LinuxConfig {
             .split_whitespace()
             .map(image)
             .collect::<Result<_, _>>()?;
+        let ports = [
+            ("KBF_REAPI_PORT", port("KBF_REAPI_PORT", "8980")?),
+            ("KBF_WORKER_PORT", port("KBF_WORKER_PORT", "8981")?),
+            ("KBF_API_PORT", port("KBF_API_PORT", "8982")?),
+            ("KBF_STORAGE_PORT", port("KBF_STORAGE_PORT", "8983")?),
+        ];
+        for (i, &(a, p)) in ports.iter().enumerate() {
+            if let Some(&(b, _)) = ports[i + 1..].iter().find(|(_, q)| *q == p) {
+                return Err(LinuxError::SamePort { a, b, port: p });
+            }
+        }
+        let [reapi_port, worker_port, api_port, storage_port] = ports.map(|(_, p)| p);
         Ok(LinuxConfig {
             host_name: c.require("KBF_HOST_NAME")?.to_owned(),
             listen_address,
             node_id: c.require("KBF_NODE_ID")?.to_owned(),
-            reapi_port: port("KBF_REAPI_PORT", "8980")?,
-            worker_port: port("KBF_WORKER_PORT", "8981")?,
-            api_port: port("KBF_API_PORT", "8982")?,
+            reapi_port,
+            worker_port,
+            api_port,
+            storage_port,
             ram_gib,
             minio_reservation_gib: minio,
             server_reservation_gib: server,
@@ -191,9 +230,13 @@ impl LinuxConfig {
             daemon_memory_min_mib: number("KBF_DAEMON_MEMORY_MIN_MIB", "256")?,
             actions_gib,
             minio_unit,
-            minio_s3_endpoint: or("MINIO_S3_ENDPOINT", "http://127.0.0.1:9000"),
+            minio_s3_endpoint: c
+                .get("MINIO_S3_ENDPOINT")
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned),
             s3_bucket: or("KBF_S3_BUCKET", "kbf-cas"),
             meta_dir: path("KBF_META_DIR", "/var/lib/kbf-server/raft")?,
+            hot_dir: path("KBF_HOT_DIR", "/var/lib/kbf-server/hot")?,
             data_dir: path("KBF_DATA_DIR", "/var/lib/kbf")?,
             images,
             user: or("KBF_USER", "kbf"),
@@ -203,6 +246,24 @@ impl LinuxConfig {
             swap_file: path("KBF_SWAP_FILE", "/swapfile")?,
             swap_size: or("KBF_SWAP_SIZE", "128G"),
         })
+    }
+
+    /// Refuse settings that leave out a key `mode`'s unit needs: `MINIO_S3_ENDPOINT` for
+    /// `storage`, whose cold store is a bucket on MinIO elsewhere (the converged units'
+    /// default, the host's own MinIO, is a guess there).
+    ///
+    /// # Errors
+    /// [`LinuxError::Required`] for the first key left out.
+    pub fn for_mode(&self, mode: Mode) -> Result<&LinuxConfig, LinuxError> {
+        if mode == Mode::Storage && self.minio_s3_endpoint.is_none() {
+            return Err(LinuxError::Required {
+                key: "MINIO_S3_ENDPOINT",
+                mode: mode.name(),
+                why: "the storage node's cold store is the bucket at that endpoint, and no \
+                      MinIO runs beside it to default to",
+            });
+        }
+        Ok(self)
     }
 
     /// The listen address as the host part of a `host:port`: an IPv6 literal goes in

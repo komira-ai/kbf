@@ -25,7 +25,7 @@ kbf-deploy                0      0
 kbf-driver-container      0      0
 kbf-driver-native         0      0
 kbf-estimator             -      -
-kbf-front                41      7
+kbf-front                39      7
 kbf-guest                15      6
 kbf-history               0      0
 kbf-host                  0      0
@@ -58,6 +58,7 @@ kbf-threads               0      0
 kbf-tier                  0      0
 kbf-transfer              0      0
 kbf-types                 3      2
+kbf-ui                    0      0
 kbf-updater               0      0
 kbf-vmm                   0      0
 xtask                     0      0

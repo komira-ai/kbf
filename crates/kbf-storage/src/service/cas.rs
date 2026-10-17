@@ -10,7 +10,7 @@ use kbf_proto::reapi::{
 };
 use tonic::{Request, Response, Status, Streaming};
 
-use super::{Endpoint, MAX_FIND_MISSING_DIGESTS, StorageService, generation, wire};
+use super::{Endpoint, MAX_FIND_MISSING_DIGESTS, StorageService, catch_up, generation, wire};
 
 /// What every call but FindMissingBlobs answers.
 fn not_served<T>(call: &str) -> Result<T, Status> {
@@ -22,7 +22,9 @@ fn not_served<T>(call: &str) -> Result<T, Status> {
 #[tonic::async_trait]
 impl ContentAddressableStorage for StorageService {
     /// The digests the store does not hold, in the order asked. A request naming more than
-    /// [`MAX_FIND_MISSING_DIGESTS`] is refused INVALID_ARGUMENT.
+    /// [`MAX_FIND_MISSING_DIGESTS`] is refused INVALID_ARGUMENT. While the node is catching
+    /// up, a call with any digest missing is UNAVAILABLE as a whole: an answer that left
+    /// out only the missing ones would tell the caller they are held.
     async fn find_missing_blobs(
         &self,
         request: Request<FindMissingBlobsRequest>,
@@ -43,7 +45,15 @@ impl ContentAddressableStorage for StorageService {
             .iter()
             .map(|d| wire::digest(Some(d)))
             .collect::<Result<Vec<_>, _>>()?;
+        let catching_up = self.catching_up();
         let missing = self.storage.find_missing(&digests).await?;
+        if catching_up && !missing.is_empty() {
+            return Err(catch_up::unavailable(&format!(
+                "{} of the {} digests asked",
+                missing.len(),
+                digests.len()
+            )));
+        }
         Ok(Response::new(FindMissingBlobsResponse {
             missing_blob_digests: missing.iter().map(wire::to_proto).collect(),
         }))
