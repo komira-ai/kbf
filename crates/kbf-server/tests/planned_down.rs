@@ -529,3 +529,54 @@ fn planning_down_again_moves_the_end_and_changes_no_generation() {
     farm.beat(0);
     assert_eq!(farm.state(a), Some(MemberState::Active), "85 s: past it");
 }
+
+// Catches the survivor of the end comparison: a heartbeat that lands exactly on the plan's end
+// tick ends the plan (a plan is in force until its end, not at it), and one a nanosecond
+// before does not. Each case is a farm of its own; the clock is set so that the member's beat is
+// the very next thing the store reads (a commit moves the fake's clock, so nothing may come
+// between). Mutant: the beat comparing with `>`.
+fn beat_at_the_end_plus(offset_ns: i64) -> Option<MemberState> {
+    let farm = Farm::new();
+    let a = farm.ids[0];
+    farm.members
+        .plan_down(a, Duration::from_secs(100))
+        .expect("planned");
+    let Planned::Until(end) = farm.members.planned(a).expect("read") else {
+        panic!("a plan with an end");
+    };
+    // Keep both rows alive up to the last 20 s.
+    while end.since(farm.store.now()) > SECOND * 20 {
+        farm.store.clock.advance(SECOND * 10);
+        farm.beat(0);
+        farm.beat(1);
+    }
+    let left = end.since(farm.store.now());
+    farm.store
+        .clock
+        .advance(left.saturating_sub(Duration::from_nanos(1)));
+    if offset_ns >= 0 {
+        farm.store.clock.advance(Duration::from_nanos(1));
+    }
+    let on = farm.store.now();
+    assert_eq!(
+        on == end,
+        offset_ns >= 0,
+        "the clock is {on:?}, the end {end:?}"
+    );
+    farm.beat(0);
+    farm.state(a)
+}
+
+#[test]
+fn a_heartbeat_on_the_end_tick_ends_the_plan_and_one_before_it_does_not() {
+    assert_eq!(
+        beat_at_the_end_plus(-1),
+        Some(MemberState::Down),
+        "a beat 1 ns before the end"
+    );
+    assert_eq!(
+        beat_at_the_end_plus(0),
+        Some(MemberState::Active),
+        "a beat on the end tick"
+    );
+}
