@@ -149,8 +149,9 @@ What the stages add:
   commit with an attested build on the same branch) and verifies it the same way. This is how the N/N-1 jobs of section 9 have
   an N-1.
 
-A branch gap to settle before prod works for this branch: `release.yml` requires the commit to be on main, while this
-line of work lands on feature/arch-v2 (section 13, Q1).
+Releases are cut from main only (decided, #961). Development continues on feature/arch-v2 until the farm works; the branch
+then merges to main (#753), and from then on every release is cut from main. Beta and gamma run on the feature branch
+meanwhile; nothing is published from it.
 
 ## 4. Stage 1: beta
 
@@ -550,8 +551,8 @@ one issue with one done criterion. "Blocked by" names open pull requests or othe
 | M16 | Fetch and verify the previous release for N-1 | N-1 resolved, or the fallback of section 3 | |  #957 |
 | M17 | Stage file and lint (stages, no `pull_request`, `id-token` only in `attest`) | lint red on each planted violation | |  #958 |
 | M18 | Rollout engine (#803) push transport replaced by the pull updater's, or retired | no push transport left | #803 |  #959 |
-| M19 | Repo settings: required checks on feature/arch-v2, tag-protection ruleset for `v*` | settings in place | M1 |  #960 |
-| M20 | Decision: how releases are cut from feature/arch-v2 (Q1) | decision recorded | |  #961 |
+| M19 | Repo settings: required checks and merge rules on feature/arch-v2 (the maintainers' choice); the tag-protection ruleset for `v*` on main once release cuts start | settings in place | M1 |  #960 |
+| M20 | Decision: releases are cut from main only, after feature/arch-v2 merges to main (Q1, decided) | decision recorded | |  #961 (closed) |
 | M21 | Measure the whole farm on a standard hosted runner (peak memory, wall time, safe concurrency) | numbers recorded here | |  #962 |
 | M22 | Result documents, flake classification and history file | one shape, flaky recorded, history written | M1 |  #963 |
 | M23 | crun with cgroup v2 delegation on a hosted runner **[V]** | a real container action runs under crun in CI | #936 |  #964 |
@@ -561,13 +562,14 @@ dependencies of every "0 failed actions" gate).
 
 ## 13. Open questions, with recommendations
 
-1. **Branch convergence for prod.** `release.yml` takes only commits on main; this line of work is on feature/arch-v2.
-   Options: (a) tag only after the branch merges to main; (b) allow a release from the feature branch with its own
-   attestation ref. *Recommend (a)*: prod stays main-only, gamma and beta run on both. The merge makes a new commit, so bytes
-   attested on the feature branch are never what prod publishes: **the first release is rebuilt on main and must re-run beta
-   and gamma on that commit.** Choose (b) if that delay is unacceptable.
-2. **Required checks.** Make the smoke a required check on feature/arch-v2 (merge on green Linux checks) and the full run
-   non-blocking for merge but blocking for the offer. *Recommend yes*, via a ruleset, as part of M18.
+1. **Branch convergence for prod. Decided (#961): main only.** No release is cut from feature/arch-v2. Development
+   continues there until the farm works, then the branch merges to main (#753), and every release from then on is cut from
+   main. The merge makes a new commit, so bytes attested on the feature branch are never what prod publishes: the first
+   release is built on main and runs beta and gamma on that commit.
+2. **Required checks. Decided (#960): the maintainers choose the feature branch's required checks and merge rules.**
+   The recommendation stands as input: the smoke as a required check on feature/arch-v2 (merges on green Linux checks), the
+   full run non-blocking for merge but blocking for the offer. The tag-protection ruleset for `v*` applies to main once
+   release cuts start.
 3. **Where the feed lives.** A signed static file set in a release asset of the repository, or a bucket the operator
    controls. *Recommend a release asset on a dedicated tag for the public feed and an operator-hosted copy for gamma*, so
    gamma does not depend on the public repository being reachable. Owner decision.
