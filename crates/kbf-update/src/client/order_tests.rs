@@ -279,9 +279,11 @@ async fn a_new_epoch_with_a_lower_id_is_newer_and_an_old_epoch_is_not() {
         "order id 2 is not above the newest accepted, 3"
     );
     assert_eq!(as_epoch(&rig, 3, 8, Verb::Confirm), Decision::Replayed);
+    // The same id in another epoch is not a replay: epoch 9 id 3 is a new order, written.
+    assert_eq!(as_epoch(&rig, 3, 9, Verb::Confirm), Decision::Accepted);
     let rig = rig.restart();
     assert_eq!(
         why(&as_epoch(&rig, 9, 7, Verb::Activate)),
-        "order 9 is of epoch 7, older than the newest accepted, 8"
+        "order 9 is of epoch 7, older than the newest accepted, 9"
     );
 }
