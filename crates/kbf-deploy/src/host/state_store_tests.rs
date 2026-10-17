@@ -833,4 +833,11 @@ fn a_backup_of_a_hard_linked_state_file_warns() {
         "{out}"
     );
     assert!(dir.join("two.db").exists());
+
+    // A directory has several links of its own; it is not a second name of a file.
+    fs::create_dir(dir.join("sub")).expect("a directory");
+    fs::create_dir(dir.join("sub").join("inner")).expect("a subdirectory");
+    let (code, out, _) = backup_cli(&dir.join("sub"), &dir.join("three.db"), &[]);
+    assert_eq!(code, ExitCode::from(1), "{out}");
+    assert!(!out.contains("warning"), "{out}");
 }

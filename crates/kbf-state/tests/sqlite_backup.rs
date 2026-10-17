@@ -483,6 +483,13 @@ fn a_state_file_with_a_second_name_is_refused() {
         );
     }
     assert!(!dir.join("hl.db.lock").exists(), "refused before the lock");
+    // A directory has several links of its own; it is not a second name of a state file.
+    let refused = SqliteStore::open(&dir, Arc::clone(&clock), Options::default())
+        .expect_err("a directory is no state file");
+    assert!(
+        !matches!(refused, SqliteError::HardLinked { .. }),
+        "got {refused}"
+    );
     fs::remove_file(&other).expect("one name again");
     drop(SqliteStore::open(&db, clock, Options::default()).expect("one name opens"));
     StoreLock::take(&db).expect("one name locks");
