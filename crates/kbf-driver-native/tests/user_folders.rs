@@ -762,3 +762,62 @@ async fn xcodebuild_builds_a_swift_package() {
         sandbox_denials()
     );
 }
+
+/// Catches a lease that cannot end because of what `xcodebuild` had a system service
+/// mount in its home (issue #178). Run with `CFFIXED_USER_HOME` the lease's home, as
+/// Foundation's tools need it to keep their caches in the lease (issue #179),
+/// `xcodebuild` has the Metal toolchain mounted below `<home>/Library/Developer`,
+/// read-only and root-owned; removing the lease directory then failed with `EROFS`, the
+/// directory was quarantined and the image stayed mounted. The test fails if the
+/// toolchain is not mounted during the action (it would check nothing), the run fails,
+/// a lease directory stays, or a volume stays mounted below the scratch root.
+#[tokio::test]
+async fn a_toolchain_mounted_in_the_leases_home_does_not_keep_the_lease() {
+    let _tools = DEVELOPER_TOOLS.read().await;
+    let Some((build, developer_dir)) = newest_xcode() else {
+        eprintln!("no Xcode on this runner: nothing to check");
+        return;
+    };
+    let dir = scratch("toolchain-mount");
+    let mut config: NativeConfig = config(&dir);
+    config.xcodes = [(build.clone(), developer_dir)].into_iter().collect();
+    let scratch_root = config.clone();
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config, &cas);
+    let mut spec = Spec::sh(&format!(
+        "{LAYOUT}export CFFIXED_USER_HOME=\"$HOME\"; \
+         xcodebuild -showComponent MetalToolchain > /dev/null 2>&1; \
+         xcodebuild -scheme hello -destination 'platform=macOS' \
+         -derivedDataPath \"$TMPDIR/dd\" build > /dev/null 2>&1; \
+         /sbin/mount | grep -c 'MetalToolchain/mounts'"
+    ))
+    .env("PATH", PATH)
+    .property("xcode", &build);
+    spec.inputs = package();
+    let action = spec.timeout(Duration::from_secs(600)).store(&cas);
+    let ran = tokio::time::timeout(Duration::from_secs(630), rt.run(work(1, action, 0)))
+        .await
+        .expect("the run ends");
+    let mounts = std::process::Command::new("/sbin/mount")
+        .output()
+        .expect("mount");
+    let left: Vec<String> = String::from_utf8_lossy(&mounts.stdout)
+        .lines()
+        .filter(|line| line.contains(&dir.display().to_string()))
+        .map(str::to_owned)
+        .collect();
+    let result = ran.unwrap_or_else(|e| panic!("the lease failed: {e}\nmounted: {left:#?}"));
+    let out = stdout(&cas, &result);
+    assert!(
+        out.trim().parse::<u32>().is_ok_and(|n| n > 0),
+        "the toolchain was not mounted during the action, so this checks nothing: {out}\n{}",
+        stderr(&cas, &result)
+    );
+    assert!(left.is_empty(), "mounted after the lease: {left:#?}");
+    assert!(
+        support::no_leases(&scratch_root),
+        "a lease directory stays: {:?}",
+        std::fs::read_dir(&scratch_root.scratch)
+            .map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>())
+    );
+}
