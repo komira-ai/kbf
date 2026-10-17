@@ -140,12 +140,15 @@ fn open(host: &Layout) -> Result<(Locked, State), ReleaseError> {
 }
 
 /// Make `previous` and `current` point where `state` says, `previous` first. Whether a
-/// link moved.
+/// link moved; a state with no current release has nothing to point at.
 fn converge<E: Exec>(
     exec: &mut E,
     state: &State,
     out: &mut dyn Write,
 ) -> Result<bool, ReleaseError> {
+    let Some(current) = &state.current else {
+        return Ok(false);
+    };
     let mut planner = Planner::new(&*exec);
     let mut moved = false;
     match &state.previous {
@@ -154,9 +157,7 @@ fn converge<E: Exec>(
             planner.absent(path(layout::PREVIOUS))?;
         }
     }
-    if let Some(c) = &state.current {
-        moved |= planner.symlink(path(layout::CURRENT), layout::release_link(c))?;
-    }
+    moved |= planner.symlink(path(layout::CURRENT), layout::release_link(current))?;
     let plan = planner.finish();
     execute(&plan, RunAs::Root, Mode::Apply, exec, &mut &mut *out)?;
     Ok(moved)
@@ -340,9 +341,6 @@ pub fn reconcile<E: Exec>(
     out: &mut dyn Write,
 ) -> Result<bool, ReleaseError> {
     let (_lock, state) = open(host)?;
-    if state.current.is_none() {
-        return Ok(false);
-    }
     converge(exec, &state, out)
 }
 
