@@ -20,6 +20,7 @@ use axum::routing::get;
 use kbf_front::{Cache, MetaLog};
 use kbf_objstore::ObjectStore;
 use kbf_storage::local_cache::{Fill, LocalCache};
+use kbf_tls::TlsSource;
 
 /// The media type of the answer: the Prometheus text exposition format.
 pub const TEXT_FORMAT: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -28,6 +29,7 @@ pub const TEXT_FORMAT: &str = "text/plain; version=0.0.4; charset=utf-8";
 struct Sources<M, O> {
     cache: Arc<Cache<M, O>>,
     local: Option<Arc<LocalCache>>,
+    tls: Arc<[TlsSource]>,
 }
 
 impl<M, O> Clone for Sources<M, O> {
@@ -35,19 +37,29 @@ impl<M, O> Clone for Sources<M, O> {
         Self {
             cache: Arc::clone(&self.cache),
             local: self.local.clone(),
+            tls: Arc::clone(&self.tls),
         }
     }
 }
 
-/// The `/metrics` route over `cache`'s metrics, and `local`'s fill.
-pub fn router<M, O>(cache: Arc<Cache<M, O>>, local: Option<Arc<LocalCache>>) -> Router
+/// The `/metrics` route over `cache`'s metrics, `local`'s fill, and the reloads of the
+/// listeners' `tls` files.
+pub fn router<M, O>(
+    cache: Arc<Cache<M, O>>,
+    local: Option<Arc<LocalCache>>,
+    tls: Vec<TlsSource>,
+) -> Router
 where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
     Router::new()
         .route("/metrics", get(metrics::<M, O>))
-        .with_state(Sources { cache, local })
+        .with_state(Sources {
+            cache,
+            local,
+            tls: tls.into(),
+        })
 }
 
 async fn metrics<M, O>(State(sources): State<Sources<M, O>>) -> Response
@@ -63,6 +75,7 @@ where
     if let Some(local) = sources.local {
         render_fill(&mut text, local.fill());
     }
+    kbf_tls::render_metrics(sources.tls.iter(), &mut text);
     ([(CONTENT_TYPE, TEXT_FORMAT)], text).into_response()
 }
 

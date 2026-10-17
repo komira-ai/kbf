@@ -170,7 +170,7 @@ pub trait Storage: Send + Sync {
     /// it checked held, and `result` stored as a blob. The action cache is not touched.
     ///
     /// # Errors
-    /// [`StorageError::ActionWrite`] naming the first blob of the closure not held; a
+    /// [`StorageError::ActionWrite`] naming every blob of the closure not held; a
     /// malformed result; the store failed.
     fn prepare_action_result<'a>(&'a self, result: &'a ActionResult) -> Answer<'a, ActionRecord>;
 

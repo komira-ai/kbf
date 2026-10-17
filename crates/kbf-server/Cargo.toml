@@ -33,6 +33,7 @@ kbf-storage.workspace = true
 kbf-store.workspace = true
 kbf-threads.workspace = true
 kbf-tier.workspace = true
+kbf-tls.workspace = true
 kbf-types.workspace = true
 percent-encoding.workspace = true
 prost.workspace = true

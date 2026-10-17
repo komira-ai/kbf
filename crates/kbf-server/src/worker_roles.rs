@@ -34,7 +34,6 @@ use futures::future::{Either, Ready, ready};
 use kbf_storage::service::{Admission, PeerRole, role_of};
 use tonic::Status;
 use tonic::codegen::{Service, http};
-use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 use tower_layer::Layer;
 
 const DAEMON: &[PeerRole] = &[PeerRole::Daemon];
@@ -173,10 +172,7 @@ where
     }
 
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
-        let certs = request
-            .extensions()
-            .get::<TlsConnectInfo<TcpConnectInfo>>()
-            .and_then(TlsConnectInfo::peer_certs);
+        let certs = kbf_tls::peer_certs_of(request.extensions());
         let leaf = certs.as_deref().and_then(|chain| chain.first());
         let path = request.uri().path();
         match admit(self.admission, path, leaf.map(AsRef::as_ref)) {

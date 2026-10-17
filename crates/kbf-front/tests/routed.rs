@@ -477,7 +477,7 @@ async fn prepare_finds_an_output_at_its_owner() {
         .await
         .expect_err("not held at the --storage node");
     assert!(
-        matches!(alone, StorageError::ActionWrite(ActionWriteError::Absent(d)) if d == case.output.1),
+        matches!(alone, StorageError::ActionWrite(ActionWriteError::Absent(ref d)) if *d == [case.output.1]),
         "{alone:?}"
     );
 }
@@ -517,7 +517,7 @@ async fn prepare_finds_an_output_at_the_previous_generations_owner() {
         .await
         .expect_err("held nowhere");
     assert!(
-        matches!(refused, StorageError::ActionWrite(ActionWriteError::Absent(d)) if d == output.1),
+        matches!(refused, StorageError::ActionWrite(ActionWriteError::Absent(ref d)) if *d == [output.1]),
         "{refused:?}"
     );
 
@@ -537,7 +537,7 @@ async fn prepare_finds_an_output_at_the_previous_generations_owner() {
 }
 
 /// Catches a prepare that accepts a result whose output is held nowhere, or names the
-/// wrong blob: the error is the first blob of the closure no node holds.
+/// wrong blob: the error names the blob of the closure no node holds.
 #[tokio::test(flavor = "multi_thread")]
 async fn prepare_names_the_output_no_node_holds() {
     let farm = Farm::new(None);
@@ -550,9 +550,44 @@ async fn prepare_names_the_output_no_node_holds() {
         .await
         .expect_err("held nowhere");
     assert!(
-        matches!(error, StorageError::ActionWrite(ActionWriteError::Absent(d)) if d == case.output.1),
+        matches!(error, StorageError::ActionWrite(ActionWriteError::Absent(ref d)) if *d == [case.output.1]),
         "{error:?}"
     );
+}
+
+/// Catches a prepare that names only the first of several outputs held nowhere: the
+/// refusal carries every missing blob of the closure, as the refusal of a write at a
+/// storage node does.
+#[tokio::test(flavor = "multi_thread")]
+async fn prepare_names_every_output_no_node_holds() {
+    let farm = Farm::new(None);
+    let map = farm.set(1, &ALL_ACTIVE, 1);
+    let (first, second) = (blob(0).1, blob(1).1);
+    let result = ActionResult {
+        output_files: [("out/a.txt", &first), ("out/b.txt", &second)]
+            .into_iter()
+            .map(|(path, d)| OutputFile {
+                path: path.to_owned(),
+                digest: Some(proto(d)),
+                ..OutputFile::default()
+            })
+            .collect(),
+        ..ActionResult::default()
+    };
+    drop(map);
+
+    let error = farm
+        .backend()
+        .prepare_action_result(&result)
+        .await
+        .expect_err("held nowhere");
+    let StorageError::ActionWrite(ActionWriteError::Absent(mut named)) = error else {
+        panic!("not an absent refusal: {error:?}");
+    };
+    named.sort();
+    let mut expected = vec![first, second];
+    expected.sort();
+    assert_eq!(named, expected);
 }
 
 /// Catches a prepare that checks an output directory's tree but not what the tree names:
@@ -600,7 +635,7 @@ async fn prepare_follows_an_output_directory_to_the_files_in_it() {
         .await
         .expect_err("the file is held nowhere");
     assert!(
-        matches!(error, StorageError::ActionWrite(ActionWriteError::Absent(d)) if d == file.1),
+        matches!(error, StorageError::ActionWrite(ActionWriteError::Absent(ref d)) if *d == [file.1]),
         "{error:?}"
     );
 

@@ -436,11 +436,13 @@ impl Storage for Node {
             }
             if self.check_closure.load(Ordering::SeqCst) {
                 let blobs = self.blobs.lock().expect("lock");
-                let lacking = std::iter::once(&record.result)
+                let lacking: Vec<Digest> = std::iter::once(&record.result)
                     .chain(record.closure.iter())
-                    .find(|d| !blobs.contains_key(d));
-                if let Some(d) = lacking {
-                    return Err(StorageError::ActionWrite(ActionWriteError::Absent(*d)));
+                    .filter(|d| !blobs.contains_key(d))
+                    .copied()
+                    .collect();
+                if !lacking.is_empty() {
+                    return Err(StorageError::ActionWrite(ActionWriteError::Absent(lacking)));
                 }
             }
             self.commits.lock().expect("lock").push(action);

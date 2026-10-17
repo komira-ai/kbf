@@ -125,6 +125,15 @@ impl Storage for Spy {
         self.inner.stream(size)
     }
 
+    fn put_streamed(
+        &self,
+        size: u64,
+        bytes: futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
+        claim: futures::future::BoxFuture<'static, Option<Digest>>,
+    ) -> Answer<'_, Option<Digest>> {
+        self.inner.put_streamed(size, bytes, claim)
+    }
+
     fn segments(&self) -> Arc<dyn Segments> {
         self.inner.segments()
     }
@@ -240,6 +249,23 @@ async fn files_are_asked_about_in_batches() {
     let walked = remote.walk_inputs(root.0).await.expect("walk");
     assert_eq!(walked.absent.len(), files.len());
     assert_eq!(spy.asks.load(Ordering::SeqCst), 2);
+}
+
+/// Catches: a streamed put over the cache's storage that does not land the blob where
+/// FindMissing and reads see it, or that answers another digest than the one claimed.
+#[tokio::test]
+async fn a_streamed_put_over_storage_is_found_and_read_back() {
+    use futures::StreamExt as _;
+    let cache = Arc::new(Cache::memory());
+    let (_, spy) = spy(&cache, Fault::None);
+    let (digest, bytes) = blob("streamed");
+    let size = bytes.len() as u64;
+    let pieces = futures::stream::iter([Ok(bytes.slice(..3)), Ok(bytes.slice(3..))]).boxed();
+    let claim = Box::pin(async move { Some(digest) });
+    let stored = spy.put_streamed(size, pieces, claim).await.expect("put");
+    assert_eq!(stored, Some(digest));
+    assert!(spy.find_missing(&[digest]).await.expect("find").is_empty());
+    assert_eq!(spy.read_blob(&digest).await.expect("read"), bytes);
 }
 
 /// Catches: the two kinds answering a call differently: the action-cache write (both

@@ -18,7 +18,9 @@ use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_server::join::{Identity as NodeIdentity, Joiner};
 use kbf_server::members::{Members, MembershipConfig};
 use kbf_server::storage_node::{StorageFlags, command, parse, start_storage};
-use kbf_server::{EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_state};
+use kbf_server::{
+    EpochPolicy, Listeners, StateStore, TlsSource, WorkerTls, bind_server_with_state,
+};
 use kbf_state::{Store, Versioned};
 use kbf_storage::Storage as _;
 use kbf_storage::service::{CatchUp, ROLE_URI_PREFIX, RemoteStorage};
@@ -27,7 +29,7 @@ use rcgen::{
     KeyPair, KeyUsagePurpose, SanType,
 };
 use tonic::Code;
-use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig};
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 const MS: Duration = Duration::from_millis(1);
 
@@ -426,9 +428,13 @@ async fn over_mutual_tls_only_the_storage_role_registers() {
     let pki = Pki::new();
     let (frontend_cert, frontend_key) = pki.cert("frontend");
     let worker_tls = WorkerTls {
-        server: ServerTlsConfig::new()
-            .identity(Identity::from_pem(frontend_cert, frontend_key))
-            .client_ca_root(Certificate::from_pem(pki.ca.pem())),
+        server: TlsSource::fixed(
+            "worker",
+            frontend_cert.as_bytes(),
+            frontend_key.as_bytes(),
+            Some(pki.ca.pem().as_bytes()),
+        )
+        .expect("the worker listener's TLS"),
         deny_list: None,
     };
     let f = frontend(Some(worker_tls));
@@ -808,4 +814,94 @@ async fn joined_by(map: pb::Map) -> Arc<kbf_mapsync::MapHolder> {
     let joined = joiner.register().await.expect("registers");
     assert_eq!(joiner.beat(&joined).await.expect("beats"), 9);
     maps
+}
+
+/// A membership service whose first two heartbeats fail UNAVAILABLE, then answers; it
+/// counts the registrations and the heartbeats it saw.
+#[derive(Default)]
+struct Flaky {
+    registers: std::sync::atomic::AtomicUsize,
+    beats: std::sync::atomic::AtomicUsize,
+}
+
+/// [`Flaky`], shared with the test that counts.
+struct FlakyService(Arc<Flaky>);
+
+impl std::ops::Deref for FlakyService {
+    type Target = Flaky;
+    fn deref(&self) -> &Flaky {
+        &self.0
+    }
+}
+
+#[tonic::async_trait]
+impl kbf_proto::kbf::map::v1::membership_server::Membership for FlakyService {
+    async fn register(
+        &self,
+        _: tonic::Request<pb::RegisterRequest>,
+    ) -> Result<tonic::Response<pb::RegisterResponse>, tonic::Status> {
+        self.registers
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(tonic::Response::new(pb::RegisterResponse {
+            member_id: 1,
+            boot: 1,
+            heartbeat_interval_ms: 1,
+            map: None,
+        }))
+    }
+
+    async fn heartbeat(
+        &self,
+        _: tonic::Request<pb::HeartbeatRequest>,
+    ) -> Result<tonic::Response<pb::HeartbeatResponse>, tonic::Status> {
+        let seen = self.beats.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if seen < 2 {
+            return Err(tonic::Status::unavailable("injected"));
+        }
+        Ok(tonic::Response::new(pb::HeartbeatResponse {
+            map_generation: 1,
+            map: None,
+        }))
+    }
+}
+
+/// Catches: a node that re-registers, or stops, when a heartbeat fails with anything but
+/// NOT_FOUND. The frontend fails the first two heartbeats UNAVAILABLE; the node waits and
+/// beats again (a third and fourth beat arrive) and registered exactly once. A mutant
+/// that registers again on any failed beat makes the registrations more than one.
+#[tokio::test]
+async fn a_failed_heartbeat_is_retried_without_registering_again() {
+    let flaky = Arc::new(Flaky::default());
+    let incoming =
+        tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = incoming.local_addr().expect("address");
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(
+                kbf_proto::kbf::map::v1::membership_server::MembershipServer::new(FlakyService(
+                    Arc::clone(&flaky),
+                )),
+            )
+            .serve_with_incoming(incoming),
+    );
+    let channel = Endpoint::from_shared(format!("http://{addr}"))
+        .expect("endpoint")
+        .connect_lazy();
+    let who = NodeIdentity {
+        instance_id: "n".to_owned(),
+        addr: "192.0.2.5:1".to_owned(),
+        zone: String::new(),
+        weight: 1,
+    };
+    let joiner = tokio::spawn(Joiner::new(channel, who, MS).run());
+    until("two failed beats and then two good ones", || {
+        (flaky.beats.load(std::sync::atomic::Ordering::SeqCst) >= 4).then_some(())
+    })
+    .await;
+    joiner.abort();
+    assert_eq!(
+        flaky.registers.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "registered once"
+    );
 }

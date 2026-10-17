@@ -25,6 +25,7 @@ kbf-segments.workspace = true
 kbf-storage.workspace = true
 kbf-store.workspace = true
 kbf-tier.workspace = true
+kbf-tls.workspace = true
 kbf-types.workspace = true
 prost.workspace = true
 prost-types.workspace = true

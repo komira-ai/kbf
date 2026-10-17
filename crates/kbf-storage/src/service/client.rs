@@ -2,6 +2,7 @@
 //! caller keeps holding `Arc<dyn Storage>` whether the cache is in its process or not.
 //! This is the storage client the frontend (and, over a map, the daemon) uses.
 
+use std::iter;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -158,10 +159,12 @@ fn other(status: Status) -> StorageError {
 /// The refusal a node answered, as the store's error.
 pub(super) fn refused(refusal: &Refusal) -> StorageError {
     let blob = wire::digest(refusal.blob.as_ref());
-    let error = match (refusal::Kind::try_from(refusal.kind), blob) {
+    let more: Result<Vec<Digest>, _> = refusal.more.iter().map(|d| wire::digest(Some(d))).collect();
+    let lacking = blob.and_then(|b| Ok(iter::once(b).chain(more?).collect::<Vec<_>>()));
+    let error = match (refusal::Kind::try_from(refusal.kind), lacking) {
         (Ok(refusal::Kind::NotDaemon), _) => ActionWriteError::NotDaemon,
-        (Ok(refusal::Kind::Absent), Ok(blob)) => ActionWriteError::Absent(blob),
-        (Ok(refusal::Kind::Unreachable), Ok(blob)) => ActionWriteError::Unreachable(blob),
+        (Ok(refusal::Kind::Absent), Ok(lacking)) => ActionWriteError::Absent(lacking),
+        (Ok(refusal::Kind::Unreachable), Ok(lacking)) => ActionWriteError::Unreachable(lacking),
         _ => {
             return StorageError::Internal(format!("an unreadable refusal {refusal:?}"));
         }

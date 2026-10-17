@@ -97,8 +97,9 @@ pub(super) fn missing_gap(catching_up: bool, missing: usize, asked: usize) -> Op
 /// (UNAVAILABLE), not that the blob is missing (the refusal it would act on by uploading).
 pub(super) fn retryable(catching_up: bool, refused: &ActionWriteError) -> Option<Status> {
     match refused {
-        ActionWriteError::Absent(blob) if catching_up => {
-            Some(unavailable(&format!("closure blob {blob}")))
+        ActionWriteError::Absent(blobs) if catching_up => {
+            let named: Vec<String> = blobs.iter().map(ToString::to_string).collect();
+            Some(unavailable(&format!("closure blobs {}", named.join(", "))))
         }
         _ => None,
     }
