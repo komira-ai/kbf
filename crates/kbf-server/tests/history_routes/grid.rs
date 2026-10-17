@@ -3,7 +3,7 @@
 
 use serde_json::{Value, json};
 
-use crate::kit::{run, shape};
+use crate::kit::{header, run, shape};
 use crate::pages::PAGES_ONLY;
 use crate::world::World;
 
@@ -124,4 +124,33 @@ async fn the_grid_tells_a_pass_from_a_failure_build_by_build() {
         .await;
     assert_eq!(row(&grid, "1111111111111111"), ["pass", "fail"]);
     a.stop().await;
+}
+
+/// Catches: a column read from a header that is not for the build asked for (another
+/// build's header row under this key's hash), and one for a header with no chunk (a
+/// crash before the first was written): each is the answer for a build that is not held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_header_that_is_not_the_builds_or_has_no_chunk_is_no_record() {
+    let world = World::new();
+    let a = world.start(PAGES_ONLY);
+    a.feed(run("held", "main", shape(X, "c", true, None), 1, 0))
+        .await;
+    world.flushed("held", 1).await;
+    a.stop().await;
+    let mut other = header(&world, "held").expect("a header");
+    other.record_id = "someone-else".to_owned();
+    world.set_header("held", &other);
+    let mut bare = other.clone();
+    bare.record_id = "bare".to_owned();
+    world.set_header("bare", &bare);
+
+    let b = world.start(PAGES_ONLY);
+    for id in ["held", "bare"] {
+        let answer = b
+            .get(&format!("/v1/grid?shapes={X:016x}&invocations={id}"))
+            .await;
+        assert_eq!(answer.code, 404, "{id}: {}", answer.json);
+        assert_eq!(answer.json["error"], "no_record", "{id}");
+    }
+    b.stop().await;
 }
