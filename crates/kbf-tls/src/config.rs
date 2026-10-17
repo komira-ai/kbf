@@ -144,8 +144,7 @@ pub(crate) fn build(
     reject_expired: bool,
 ) -> Result<Built, TlsError> {
     let chain = certificates(&files.cert, &material.cert)?;
-    let key = PrivateKeyDer::from_pem_slice(&material.key)
-        .map_err(|e| pem_error(&files.key, e))?;
+    let key = PrivateKeyDer::from_pem_slice(&material.key).map_err(|e| pem_error(&files.key, e))?;
     let (not_after, expired) = validity(&chain[0], &files.cert)?;
     if reject_expired && expired {
         return Err(TlsError::Expired { not_after });
@@ -167,11 +166,13 @@ pub(crate) fn build(
     };
     let mut config = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .and_then(|builder| match verifier {
-            Some(verifier) => builder.with_client_cert_verifier(verifier),
-            None => builder.with_no_client_auth(),
-        }
-        .with_single_cert(chain, key))
+        .and_then(|builder| {
+            match verifier {
+                Some(verifier) => builder.with_client_cert_verifier(verifier),
+                None => builder.with_no_client_auth(),
+            }
+            .with_single_cert(chain, key)
+        })
         .map_err(|e| TlsError::Config(e.to_string()))?;
     // What tonic's own acceptor offers: gRPC runs over HTTP/2 only.
     config.alpn_protocols = vec![b"h2".to_vec()];

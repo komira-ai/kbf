@@ -86,7 +86,10 @@ async fn a_half_written_pair_keeps_the_old_one_until_it_is_whole() {
     assert_eq!(source.reloads().applied, 0);
 
     put(&files.files.key, &new.key);
-    until("the whole pair is applied", || source.reloads().applied == 1).await;
+    until("the whole pair is applied", || {
+        source.reloads().applied == 1
+    })
+    .await;
     let mut after = connect(server.addr, &ca.pem, None).await.expect("connect");
     ping(&mut after).await.expect("ping");
     assert_eq!(served(&after), new.der);
@@ -128,7 +131,11 @@ async fn damaged_files_keep_the_old_configuration_and_count_one_refusal() {
         (&client_ca, ca.pem.as_str()),
     ];
     for (n, (path, what, bad)) in damage.into_iter().enumerate() {
-        let good_text = good.iter().find(|(p, _)| *p == path).expect("a good file").1;
+        let good_text = good
+            .iter()
+            .find(|(p, _)| *p == path)
+            .expect("a good file")
+            .1;
         let before = source.reloads();
         match bad {
             Some(text) => put(path, text),
@@ -147,7 +154,11 @@ async fn damaged_files_keep_the_old_configuration_and_count_one_refusal() {
             .await
             .expect("connect");
         ping(&mut conn).await.expect("ping");
-        assert_eq!(served(&conn), old.der, "{what}: the served certificate moved");
+        assert_eq!(
+            served(&conn),
+            old.der,
+            "{what}: the served certificate moved"
+        );
 
         put(path, good_text);
         until("the good file is back", || {
@@ -179,7 +190,10 @@ async fn an_expired_certificate_is_not_applied() {
     put(&files.files.key, &expired.key);
     until("the mismatch is refused", || source.reloads().rejected == 1).await;
     put(&files.files.cert, &expired.cert);
-    until("the expired pair is refused", || source.reloads().rejected == 2).await;
+    until("the expired pair is refused", || {
+        source.reloads().rejected == 2
+    })
+    .await;
     assert_eq!(source.reloads().applied, 0);
     let mut conn = connect(server.addr, &ca.pem, None).await.expect("connect");
     ping(&mut conn).await.expect("ping");
@@ -206,7 +220,8 @@ fn the_first_load_must_work_but_may_be_expired() {
     let good = server_leaf(&ca);
     let files = Files::write(&dir("start-bad"), &good, Some(&ca.pem));
     let (cert, other) = (good.cert.clone(), server_leaf(&ca));
-    let start = |files: &Files| TlsSource::files("test", files.files.clone(), Duration::from_secs(1));
+    let start =
+        |files: &Files| TlsSource::files("test", files.files.clone(), Duration::from_secs(1));
     assert!(start(&files).is_ok());
 
     put(&files.files.key, &other.key);
@@ -218,7 +233,7 @@ fn the_first_load_must_work_but_may_be_expired() {
     std::fs::remove_file(&files.files.key).expect("remove");
     assert!(matches!(start(&files), Err(TlsError::Read { .. })));
     // The message names the file.
-    let message = start(&files).err().expect("an error").to_string();
+    let message = start(&files).expect_err("an error").to_string();
     assert!(message.contains("server.key"), "{message}");
 }
 
@@ -231,7 +246,10 @@ fn the_first_load_must_work_but_may_be_expired() {
 #[tokio::test]
 async fn a_reloaded_client_ca_changes_who_may_connect() {
     let (server_ca, ca_one, ca_two) = (ca("server CA"), ca("client CA one"), ca("client CA two"));
-    let (one, two) = (client_leaf(&ca_one, "node-1"), client_leaf(&ca_two, "node-2"));
+    let (one, two) = (
+        client_leaf(&ca_one, "node-1"),
+        client_leaf(&ca_two, "node-2"),
+    );
     let files = Files::write(&dir("mtls"), &server_leaf(&server_ca), Some(&ca_one.pem));
     let source = files.source();
     let mut server = echo(tcp(), Some(source.clone()));
@@ -246,15 +264,23 @@ async fn a_reloaded_client_ca_changes_who_may_connect() {
     assert_eq!(chain[0].as_ref(), one.der);
     let local = kept.get_ref().0.local_addr().expect("local address");
     assert_eq!(info.tcp.remote_addr, Some(local));
-    let mut none = connect(server.addr, &server_ca.pem, None).await.expect("connect");
-    assert!(ping(&mut none).await.is_err(), "a client with no certificate");
+    let mut none = connect(server.addr, &server_ca.pem, None)
+        .await
+        .expect("connect");
+    assert!(
+        ping(&mut none).await.is_err(),
+        "a client with no certificate"
+    );
 
     put(&client_ca, &ca_two.pem);
     until("the new CA is applied", || source.reloads().applied == 1).await;
     let mut old_ca = connect(server.addr, &server_ca.pem, Some(&one))
         .await
         .expect("the handshake ends on the client's side");
-    assert!(ping(&mut old_ca).await.is_err(), "the old CA is still trusted");
+    assert!(
+        ping(&mut old_ca).await.is_err(),
+        "the old CA is still trusted"
+    );
     let mut new_ca = connect(server.addr, &server_ca.pem, Some(&two))
         .await
         .expect("connect");
@@ -289,7 +315,10 @@ async fn a_client_that_does_not_handshake_delays_no_one() {
 
     let mut silent = TcpStream::connect(server.addr).await.expect("connect");
     let mut babble = TcpStream::connect(server.addr).await.expect("connect");
-    babble.write_all(b"GET / HTTP/1.1\r\n\r\n").await.expect("write");
+    babble
+        .write_all(b"GET / HTTP/1.1\r\n\r\n")
+        .await
+        .expect("write");
     let mut conn = connect(server.addr, &ca.pem, None).await.expect("connect");
     ping(&mut conn).await.expect("served while the others hang");
 
@@ -327,10 +356,10 @@ async fn the_metrics_name_each_listener_and_outcome() {
     let ca = ca("metrics CA");
     let (a, b) = (server_leaf(&ca), server_leaf(&ca));
     let files = Files::write(&dir("metrics"), &a, None);
-    let first = TlsSource::files("reapi", files.files.clone(), Duration::from_secs(3600))
-        .expect("source");
-    let second = TlsSource::files("worker", files.files.clone(), Duration::from_secs(3600))
-        .expect("source");
+    let first =
+        TlsSource::files("reapi", files.files.clone(), Duration::from_secs(3600)).expect("source");
+    let second =
+        TlsSource::files("worker", files.files.clone(), Duration::from_secs(3600)).expect("source");
 
     assert_eq!(first.reload(), Outcome::Unchanged);
     files.install(&b);
@@ -339,7 +368,11 @@ async fn the_metrics_name_each_listener_and_outcome() {
     assert_eq!(first.reload(), Outcome::Rejected);
     assert_eq!(
         first.reloads(),
-        Reloads { applied: 1, rejected: 1, unchanged: 1 }
+        Reloads {
+            applied: 1,
+            rejected: 1,
+            unchanged: 1
+        }
     );
 
     let mut text = String::new();
@@ -353,10 +386,17 @@ async fn the_metrics_name_each_listener_and_outcome() {
         assert!(text.contains(want), "missing {want:?} in\n{text}");
     }
     assert_eq!(text.matches("# TYPE kbf_tls_reloads_total").count(), 1);
-    assert_eq!(text.matches("# TYPE kbf_tls_leaf_not_after_seconds").count(), 1);
+    assert_eq!(
+        text.matches("# TYPE kbf_tls_leaf_not_after_seconds")
+            .count(),
+        1
+    );
     let gauge = |listener: &str| -> i64 {
         let prefix = format!("kbf_tls_leaf_not_after_seconds{{listener=\"{listener}\"}} ");
-        let line = text.lines().find(|l| l.starts_with(&prefix)).expect("gauge row");
+        let line = text
+            .lines()
+            .find(|l| l.starts_with(&prefix))
+            .expect("gauge row");
         line[prefix.len()..].parse().expect("a number")
     };
     // The reapi source serves the pair it applied (b), the worker one still serves a: two
@@ -373,23 +413,37 @@ async fn the_metrics_name_each_listener_and_outcome() {
 /// an [`Incoming`], and the absence of both on one that did not.
 #[test]
 fn request_helpers_read_the_connection_info() {
-    use kbf_tls::{ConnInfo, peer_certs, remote_addr};
+    use kbf_tls::{ConnInfo, peer_certs, peer_certs_of, remote_addr};
     use std::sync::Arc;
     use tonic::transport::server::TcpConnectInfo;
 
     let bare = tonic::Request::new(());
     assert!(peer_certs(&bare).is_none() && remote_addr(&bare).is_none());
+    assert!(peer_certs_of(&tonic::codegen::http::Extensions::new()).is_none());
 
     let addr = "127.0.0.1:9".parse().expect("address");
     let ca = ca("helper CA");
     let der = rustls::pki_types::CertificateDer::from(server_leaf(&ca).der);
     let mut request = tonic::Request::new(());
     request.extensions_mut().insert(ConnInfo {
-        tcp: TcpConnectInfo { local_addr: None, remote_addr: Some(addr) },
+        tcp: TcpConnectInfo {
+            local_addr: None,
+            remote_addr: Some(addr),
+        },
         certs: Some(Arc::new(vec![der.clone()])),
     });
     assert_eq!(peer_certs(&request).expect("chain")[0], der);
     assert_eq!(remote_addr(&request), Some(addr));
+    // What a layer sees: the HTTP request's extensions carry the same connect info.
+    let mut extensions = tonic::codegen::http::Extensions::new();
+    extensions.insert(
+        request
+            .extensions()
+            .get::<ConnInfo>()
+            .expect("info")
+            .clone(),
+    );
+    assert_eq!(peer_certs_of(&extensions).expect("chain")[0], der);
 }
 
 /// A source made of PEM text has no files: it serves what it was given, a look at it
@@ -408,7 +462,7 @@ async fn a_fixed_source_serves_its_text_and_never_changes() {
 
     let bad = TlsSource::fixed("test", b"", leaf.key.as_bytes(), Some(ca.pem.as_bytes()));
     assert!(matches!(bad, Err(TlsError::Pem { .. })));
-    let named = bad.err().expect("an error").to_string();
+    let named = bad.expect_err("an error").to_string();
     assert!(named.contains("<certificate>"), "{named}");
     let with_ca = TlsSource::fixed(
         "test",

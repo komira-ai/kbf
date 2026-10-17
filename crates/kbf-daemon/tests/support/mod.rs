@@ -55,7 +55,7 @@ pub struct Pki {
 }
 
 impl Pki {
-    /// The same for the farm server's worker listener (`kbf_server::WorkerTls`).
+    /// The same for the server's worker listener (`kbf_server::WorkerTls`).
     pub fn worker_tls(&self) -> kbf_server::TlsSource {
         kbf_server::TlsSource::fixed(
             "worker",

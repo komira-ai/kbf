@@ -25,7 +25,7 @@ use kbf_server::{Listeners, TlsSource, WorkerTls, bind_server};
 use prost::Message;
 use sha2::{Digest as _, Sha256};
 use tokio::time::timeout;
-use tonic::transport::{Certificate, Channel, Endpoint, Identity};
+use tonic::transport::{Channel, Endpoint};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-cell");
 

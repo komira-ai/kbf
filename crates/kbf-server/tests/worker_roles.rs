@@ -32,15 +32,14 @@ use kbf_server::worker_roles::{WORKER_LISTENER_ROLES, WorkerRolesLayer, admit, r
 use kbf_server::{EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_state};
 use kbf_state::Store;
 use kbf_storage::service::{Admission, PeerRole, ROLE_URI_PREFIX};
+use kbf_tls::TlsSource;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, SanType,
 };
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::codegen::{Service, http};
-use tonic::transport::{
-    Certificate, Channel, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig,
-};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tonic::{Code, Status};
 use tower_layer::Layer as _;
 
@@ -314,9 +313,13 @@ impl Pki {
         let key = KeyPair::generate().expect("key");
         let cert = params.signed_by(&key, &self.ca).expect("sign");
         WorkerTls {
-            server: ServerTlsConfig::new()
-                .identity(Identity::from_pem(cert.pem(), key.serialize_pem()))
-                .client_ca_root(Certificate::from_pem(self.ca.pem())),
+            server: TlsSource::fixed(
+                "worker",
+                cert.pem().as_bytes(),
+                key.serialize_pem().as_bytes(),
+                Some(self.ca.pem().as_bytes()),
+            )
+            .expect("server TLS"),
             deny_list: None,
         }
     }
@@ -403,6 +406,7 @@ fn registration() -> pb::RegisterRequest {
         weight: 1,
         zone: "a".to_owned(),
         protocol: PROTOCOL,
+        catching_up: false,
     }
 }
 
@@ -492,6 +496,8 @@ async fn each_half_of_a_node_is_served_on_its_own_certificate() {
     let beat = pb::HeartbeatRequest {
         member_id: registered.member_id,
         boot: registered.boot,
+        have_generation: 0,
+        catching_up: false,
     };
     membership
         .heartbeat(beat)
@@ -531,6 +537,8 @@ async fn a_daemon_certificate_may_not_register_or_heartbeat() {
         .heartbeat(pb::HeartbeatRequest {
             member_id: 1,
             boot: 1,
+            have_generation: 0,
+            catching_up: false,
         })
         .await
         .expect_err("refused");

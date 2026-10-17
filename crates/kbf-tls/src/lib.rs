@@ -27,5 +27,7 @@ mod incoming;
 mod source;
 
 pub use config::{TlsError, TlsFiles};
-pub use incoming::{Conn, ConnInfo, HANDSHAKE_TIMEOUT, Incoming, peer_certs, peer_certs_of, remote_addr};
+pub use incoming::{
+    Conn, ConnInfo, HANDSHAKE_TIMEOUT, Incoming, peer_certs, peer_certs_of, remote_addr,
+};
 pub use source::{Outcome, Reloads, TlsSource, render_metrics};

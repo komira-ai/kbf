@@ -19,7 +19,7 @@ use kbf_proto::worker::{
 use kbf_server::{Api, Args, bind_server_with_api};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose,
+    KeyPair, KeyUsagePurpose, SanType,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -53,8 +53,16 @@ impl Ca {
         self.issuer.pem()
     }
 
-    fn leaf(&self, name: &str, usage: ExtendedKeyUsagePurpose) -> Pair {
+    fn leaf(&self, name: &str, usage: ExtendedKeyUsagePurpose, role: Option<&str>) -> Pair {
         let mut params = CertificateParams::new(vec![name.to_owned()]).expect("params");
+        // The worker listener reads the role from one `urn:kbf:role:<name>` URI.
+        params.subject_alt_names.extend(role.map(|role| {
+            SanType::URI(
+                format!("urn:kbf:role:{role}")
+                    .try_into()
+                    .expect("an IA5 name"),
+            )
+        }));
         params.distinguished_name.push(DnType::CommonName, name);
         params.extended_key_usages = vec![usage];
         let key = KeyPair::generate().expect("key");
@@ -66,7 +74,7 @@ impl Ca {
     }
 
     fn server(&self) -> Pair {
-        self.leaf("localhost", ExtendedKeyUsagePurpose::ServerAuth)
+        self.leaf("localhost", ExtendedKeyUsagePurpose::ServerAuth, None)
     }
 }
 
@@ -280,16 +288,31 @@ async fn the_worker_listener_reloads_its_client_ca_and_identity() {
         path(&d, "ca.pem"),
     ]);
     let node = |issuer: &Ca| {
-        let pair = issuer.leaf("node-1", ExtendedKeyUsagePurpose::ClientAuth);
+        let pair = issuer.leaf(
+            "node-1",
+            ExtendedKeyUsagePurpose::ClientAuth,
+            Some("daemon"),
+        );
         Identity::from_pem(pair.cert, pair.key)
     };
     let (old_node, new_node) = (node(&old_clients), node(&new_clients));
 
-    assert!(session_welcomed(client(running.worker, &server_ca.pem(), Some(old_node.clone())))
-        .await);
+    assert!(
+        session_welcomed(client(
+            running.worker,
+            &server_ca.pem(),
+            Some(old_node.clone())
+        ))
+        .await
+    );
     put(&d, "ca.pem", &new_clients.pem());
     until("the new client CA to be trusted", || async {
-        session_welcomed(client(running.worker, &server_ca.pem(), Some(new_node.clone()))).await
+        session_welcomed(client(
+            running.worker,
+            &server_ca.pem(),
+            Some(new_node.clone()),
+        ))
+        .await
     })
     .await;
     assert!(

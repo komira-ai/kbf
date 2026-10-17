@@ -23,7 +23,7 @@ use prost::Message as _;
 use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tonic::transport::{Certificate, Channel, Endpoint, Identity};
+use tonic::transport::{Channel, Endpoint};
 
 use super::tests::{fake, scratch, surveyed};
 

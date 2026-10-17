@@ -212,7 +212,9 @@ pub async fn connect(
     };
     let tcp = TcpStream::connect(addr).await?;
     let name = ServerName::try_from("localhost").expect("server name");
-    TlsConnector::from(Arc::new(config)).connect(name, tcp).await
+    TlsConnector::from(Arc::new(config))
+        .connect(name, tcp)
+        .await
 }
 
 /// One round trip: whether the server echoed.

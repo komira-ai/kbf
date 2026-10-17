@@ -84,7 +84,11 @@ impl AsyncRead for Conn {
 }
 
 impl AsyncWrite for Conn {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         each_io!(self, io => Pin::new(io).poll_write(cx, buf))
     }
 
@@ -167,11 +171,15 @@ impl Incoming {
         let Some(tls) = &mut self.tls else {
             return Some(Conn {
                 io: Io::Plain(tcp),
-                info: ConnInfo { tcp: info, certs: None },
+                info: ConnInfo {
+                    tcp: info,
+                    certs: None,
+                },
             });
         };
         let acceptor = TlsAcceptor::from(tls.source.config());
-        tls.pending.spawn(handshake(acceptor, tcp, info, tls.handshake));
+        tls.pending
+            .spawn(handshake(acceptor, tcp, info, tls.handshake));
         None
     }
 }

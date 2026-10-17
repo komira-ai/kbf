@@ -24,9 +24,9 @@ use kbf_proto::worker::segments_server::SegmentsServer;
 use kbf_proto::worker::worker_server::WorkerServer;
 use kbf_sched::MemoryLadder;
 use kbf_storage::service::Admission;
+use kbf_tls::{Incoming, TlsSource};
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
-use kbf_tls::{Incoming, TlsSource};
 use tonic::transport::{Server, ServerTlsConfig};
 use tower_layer::{Identity, Stack};
 
@@ -626,11 +626,16 @@ where
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
     let peers_certified = listeners.worker_tls.is_some();
-    let (worker_server, peers, worker_tls) = worker_peers(
+    let (mut worker_server, peers, worker_tls) = worker_peers(
         keepalive(flow_control(Server::builder()), listeners.streams),
         listeners.worker_tls,
     );
-    let tls_sources: Vec<TlsSource> = listeners.reapi_tls.iter().chain(&worker_tls).cloned().collect();
+    let tls_sources: Vec<TlsSource> = listeners
+        .reapi_tls
+        .iter()
+        .chain(&worker_tls)
+        .cloned()
+        .collect();
     let reapi_incoming = Incoming::new(reapi_incoming, listeners.reapi_tls);
     let worker_incoming = Incoming::new(worker_incoming, worker_tls);
     let probe_timeout = listeners.store_probe_timeout;
@@ -654,14 +659,18 @@ where
     );
     let api_routes = crate::api::router(Arc::clone(&farm), token, Arc::clone(&drain))
         .merge(health_routes)
-        .merge(crate::metrics::router(Arc::clone(&cache), local, tls_sources))
+        .merge(crate::metrics::router(
+            Arc::clone(&cache),
+            local,
+            tls_sources,
+        ))
         .merge(blob_routes)
         .merge(page_routes);
     // Logged at every start, the first one too (issue #156).
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     log_state(durable, term, epoch);
 
-    let reapi_server = keepalive(flow_control(Server::builder()), listeners.streams);
+    let mut reapi_server = keepalive(flow_control(Server::builder()), listeners.streams);
     let worker_blobs = ByteStreamServer::new(WorkerBlobs::new(
         ByteStreamService::new(Arc::clone(&cache)),
         peers.clone(),

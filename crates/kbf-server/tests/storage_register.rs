@@ -29,7 +29,7 @@ use rcgen::{
     KeyPair, KeyUsagePurpose, SanType,
 };
 use tonic::Code;
-use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig};
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 const MS: Duration = Duration::from_millis(1);
 
