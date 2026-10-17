@@ -329,6 +329,8 @@ fn copy_release<E: Exec>(
     out: &mut dyn Write,
 ) -> Result<(), ReleaseError> {
     let copy = plan_copy(exec, host, owner, commit, source)?;
+    let dir = layout::release_dir(commit);
+    let existed = inspect(exec, &dir)?.is_some();
     // The first binary is named in the line, as it was when a release held only `kbf`;
     // each other one gets a line of its own.
     let ((_, first), others) = source
@@ -351,14 +353,46 @@ fn copy_release<E: Exec>(
             sha256(bytes)
         );
     }
-    execute(&copy, RunAs::Root, mode, exec, &mut &mut *out)?;
-    if mode == Mode::Apply {
-        for (name, bytes) in &source.binaries {
-            let bin = layout::release_file(commit, name);
-            verify(inspect(exec, &bin)?, bin, bytes)?;
+    let copied = execute(&copy, RunAs::Root, mode, exec, &mut &mut *out)
+        .map_err(ReleaseError::from)
+        .and_then(|()| {
+            if mode == Mode::Apply {
+                for (name, bytes) in &source.binaries {
+                    let bin = layout::release_file(commit, name);
+                    verify(inspect(exec, &bin)?, bin, bytes)?;
+                }
+            }
+            Ok(())
+        });
+    if copied.is_err() && mode == Mode::Apply && !existed {
+        remove_partial(exec, host, &dir);
+    }
+    copied
+}
+
+/// Remove the release directory a failed copy made (a full disk is the usual cause), so
+/// that a retry finds nothing there. A directory left half written would be refused for
+/// ever: it is there with other content, and a release is never replaced. Best effort:
+/// the error the caller returns is the copy's.
+fn remove_partial<E: Exec>(exec: &mut E, host: &Layout, dir: &HostPath) {
+    let mut paths = Vec::new();
+    if contents(host, dir, &mut paths).is_err() {
+        return;
+    }
+    paths.push(dir.clone());
+    let mut planner = Planner::new(&*exec);
+    for p in paths {
+        if planner.absent(p).is_err() {
+            return;
         }
     }
-    Ok(())
+    let _ = execute(
+        &planner.finish(),
+        RunAs::Root,
+        Mode::Apply,
+        exec,
+        &mut io::sink(),
+    );
 }
 
 /// The directories and files of the release, root's; a release directory already there
