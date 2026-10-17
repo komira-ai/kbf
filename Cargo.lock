@@ -1607,6 +1607,7 @@ dependencies = [
  "kbf-storage",
  "kbf-store",
  "kbf-tier",
+ "kbf-tls",
  "kbf-types",
  "prost",
  "prost-types",
@@ -1991,6 +1992,7 @@ dependencies = [
  "kbf-store",
  "kbf-threads",
  "kbf-tier",
+ "kbf-tls",
  "kbf-types",
  "kbf-ui",
  "libc",
@@ -2111,6 +2113,22 @@ dependencies = [
  "kbf-segments",
  "kbf-store",
  "thiserror",
+]
+
+[[package]]
+name = "kbf-tls"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "rcgen",
+ "rustls",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tonic",
+ "tracing",
+ "x509-parser",
 ]
 
 [[package]]
