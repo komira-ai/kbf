@@ -87,6 +87,13 @@ impl TlsNodes {
         self
     }
 
+    /// How these nodes give up on a silent one: what [`TlsNodes::with_liveness`] set, or
+    /// [`Liveness::default`]. Read by the daemon's tests to see that its flags arrived.
+    #[must_use]
+    pub fn liveness(&self) -> Liveness {
+        self.liveness
+    }
+
     /// The connection to `member`, verified against the host of its address. For a caller
     /// that speaks to a node without a [`Storage`] (the frontend's pass-through of a
     /// ByteStream).

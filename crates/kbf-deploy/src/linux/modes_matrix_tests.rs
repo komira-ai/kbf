@@ -41,7 +41,6 @@ struct Row {
 
 const ALL: &[Mode] = &Mode::ALL;
 const BUILDS: &[Mode] = &[Mode::Daemon, Mode::StorageAndDaemon, Mode::AllInOne];
-const UNBUILT: &[Mode] = &[Mode::Frontend];
 const DRAINS: &[Mode] = &[
     Mode::Frontend,
     Mode::Storage,
@@ -78,11 +77,6 @@ fn rows() -> Vec<Row> {
             fails: ALL,
         },
         Row {
-            rule: "flags",
-            plant: |m, t| t.replacen(&format!("/kbf {m}"), &format!("/kbf {m} --node-id=n1"), 1),
-            fails: UNBUILT,
-        },
-        Row {
             rule: "slice",
             plant: |_, t| t.replace("Slice=kbf.slice", "Slice=system.slice"),
             fails: ALL,
@@ -97,10 +91,16 @@ fn rows() -> Vec<Row> {
             plant: |_, t| last_in_service(t, "Delegate="),
             fails: BUILDS,
         },
-        // A build node given the key; the storage unit already reads it.
+        // A build node given the key; the storage unit already reads it, and so does
+        // storage-and-daemon, by the one file it is allowed.
         Row {
             rule: "credential",
             plant: |_, t| first_in_service(t, "EnvironmentFile=-/etc/kbf/s3.env"),
+            fails: BUILDS,
+        },
+        Row {
+            rule: "credential",
+            plant: |_, t| first_in_service(t, "EnvironmentFile=/etc/kbf/*.env"),
             fails: BUILDS,
         },
         Row {
@@ -125,21 +125,30 @@ fn rows() -> Vec<Row> {
                 Some(l) => t.replace(&format!("{l}\n"), ""),
                 None => t.to_owned(),
             },
-            fails: &[Mode::Storage],
+            fails: &[Mode::Storage, Mode::StorageAndDaemon],
         },
         Row {
             rule: "storage",
             plant: |_, t| t.replace("EnvironmentFile=/etc/kbf/s3.env\n", ""),
-            fails: &[Mode::Storage],
+            fails: &[Mode::Storage, Mode::StorageAndDaemon],
         },
         Row {
             rule: "state-store",
+            // The frontend's unit gives a state store already (the last one wins): put the
+            // Postgres URI in its place; the other modes get it as a new flag.
             plant: |m, t| {
-                t.replacen(
-                    &format!("/kbf {m}"),
-                    &format!("/kbf {m} --state-store=postgres://kbf@db/kbf"),
-                    1,
-                )
+                if t.contains("--state-store=sqlite://") {
+                    t.replace(
+                        "--state-store=sqlite://",
+                        "--state-store=postgres://db/kbf#",
+                    )
+                } else {
+                    t.replacen(
+                        &format!("/kbf {m}"),
+                        &format!("/kbf {m} --state-store=postgres://db/kbf"),
+                        1,
+                    )
+                }
             },
             fails: ALL,
         },
@@ -183,9 +192,6 @@ fn each_rule_fails_exactly_the_modes_it_is_for() {
             let got: Vec<&str> = r.failures.iter().map(|f| f.rule).collect();
             let want: Vec<&str> = if !row.fails.contains(&mode) {
                 Vec::new()
-            } else if row.rule == "state-store" && UNBUILT.contains(&mode) {
-                // A flag planted in a mode not built yet also trips `flags`.
-                vec!["flags", row.rule]
             } else {
                 vec![row.rule]
             };
@@ -233,9 +239,11 @@ fn node(key: Entry) -> FakeExec {
     exec
 }
 
-/// The rules that read the node, per mode: `parse` runs kbf only for a built mode;
-/// `credential` reads the key file's owner and mode only for the unit that holds it
-/// (a 0644 key or one another user owns fails storage, and only storage).
+/// The rules that read the node, per mode: `parse` runs kbf for every mode;
+/// `credential` reads the key file's owner and mode only for the units that hold it
+/// (a 0640 key or one another user owns fails storage and storage-and-daemon, and no
+/// other; a key the server user owns passes storage and fails storage-and-daemon, whose
+/// key is root's alone).
 /// Catches each of these run on the wrong modes or on none.
 #[test]
 fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
@@ -246,19 +254,23 @@ fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
             .expect("renders")
             .slice,
     );
-    let cases: [(&str, Entry, &[Mode]); 3] = [
+    let cases: [(&str, Entry, &[Mode]); 4] = [
+        ("parse", file(0o600, 0, ""), &Mode::ALL),
         (
-            "parse",
-            file(0o600, 990, ""),
-            &[
-                Mode::Storage,
-                Mode::Daemon,
-                Mode::StorageAndDaemon,
-                Mode::AllInOne,
-            ],
+            "credential",
+            file(0o640, 0, ""),
+            &[Mode::Storage, Mode::StorageAndDaemon],
         ),
-        ("credential", file(0o640, 990, ""), &[Mode::Storage]),
-        ("credential", file(0o600, 1000, ""), &[Mode::Storage]),
+        (
+            "credential",
+            file(0o600, 1000, ""),
+            &[Mode::Storage, Mode::StorageAndDaemon],
+        ),
+        (
+            "credential",
+            file(0o600, 990, ""),
+            &[Mode::StorageAndDaemon],
+        ),
     ];
     let mut wrong = Vec::new();
     for (rule, key, fails) in cases {
@@ -272,12 +284,12 @@ fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
             if hits != want {
                 wrong.push(format!("{rule} on {mode}: {:?}", lines(&r)));
             }
-            // No other node rule fires on the clean node (rule `flags` aside, which a
-            // flag in a mode not built yet trips, and `parse`, which this kbf refuses).
+            // No other node rule fires on the clean node (`parse` aside, which this kbf
+            // refuses).
             let others: Vec<String> = r
                 .failures
                 .iter()
-                .filter(|f| f.rule != rule && f.rule != "parse" && f.rule != "flags")
+                .filter(|f| f.rule != rule && f.rule != "parse")
                 .map(ToString::to_string)
                 .collect();
             if !others.is_empty() {

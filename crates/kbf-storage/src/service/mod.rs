@@ -38,8 +38,8 @@
 //! NOT_FOUND or FAILED_PRECONDITION. Hits and writes are served.
 //!
 //! **Who may call** is [`Admission`]: the role in the caller's certificate against the
-//! endpoint's table. Roles are the part of this unit that is partly a seam; the module
-//! docs of [`admission`] say which.
+//! endpoint's table, the role read by `kbf-peer`; the module docs of [`admission`] say
+//! what is checked and what is planned.
 //!
 //! **How `Write` takes a blob in.** Where the store offers a [`crate::PutStream`]
 //! ([`Storage::stream`]), each message is appended to it as it arrives and the blob is
