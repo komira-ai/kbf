@@ -46,7 +46,7 @@ impl RunIndex {
     }
 
     /// Notes that `id` was minted for an attempt of row `row` of `key`'s record.
-    fn note(&self, id: [u8; 12], key: RecordKey, row: usize) {
+    pub(crate) fn note(&self, id: [u8; 12], key: RecordKey, row: usize) {
         let mut map = self.map();
         map.insert(id, (key, row));
         while map.len() > RUN_INDEX_CAP {

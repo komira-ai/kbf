@@ -47,6 +47,7 @@ struct Objects(Arc<ObjectsInner>);
 struct ObjectsInner {
     memory: MemoryStore,
     fail_puts: AtomicBool,
+    fail_gets: AtomicBool,
     puts: AtomicU64,
 }
 
@@ -58,12 +59,17 @@ impl Objects {
                 object_lock: false,
             }),
             fail_puts: AtomicBool::new(false),
+            fail_gets: AtomicBool::new(false),
             puts: AtomicU64::new(0),
         }))
     }
 
     fn fail_puts(&self, fail: bool) {
         self.0.fail_puts.store(fail, Ordering::SeqCst);
+    }
+
+    fn fail_gets(&self, fail: bool) {
+        self.0.fail_gets.store(fail, Ordering::SeqCst);
     }
 
     /// Writes that succeeded.
@@ -98,6 +104,9 @@ impl ObjectStore for Objects {
         key: &ObjectKey,
         range: ByteRange,
     ) -> Result<Bytes, ObjectStoreError> {
+        if self.0.fail_gets.load(Ordering::SeqCst) {
+            return Err(ObjectStoreError::Protocol("planted cause".into()));
+        }
         self.0.memory.get_range(key, range).await
     }
 
@@ -657,13 +666,13 @@ async fn run_by_id_live_equals_run_by_id_durable() {
         assert_eq!(durable["href"], format!("/v1/runs/{id}"));
     }
     // A run history does not hold, and text that is not a run id.
-    let unknown = b.get("/v1/runs/0000000000000000000000ff").await;
+    let unknown = b.get("/v1/runs/0a0b0c0d0e0f0a0b0c0d0e0f").await;
     assert_eq!(unknown.code, 404);
     assert_eq!(unknown.json["error"], "no_run");
     for bad in [
         "nothing",
-        "0000000000000000000000FF",
-        "0000000000000000000000f",
+        "0A0B0C0D0E0F0A0B0C0D0E0F",
+        "0a0b0c0d0e0f0a0b0c0d0e0",
     ] {
         let answer = b.get(&format!("/v1/runs/{bad}")).await;
         assert_eq!(answer.code, 404, "{bad}");
@@ -772,7 +781,7 @@ async fn without_history_the_pages_are_what_they_were() {
     let rows = server.ok("/v1/invocations/plain/actions").await;
     let attempt = &rows["actions"][0]["attempts"][0];
     assert!(attempt.get("run_id").is_none() && attempt.get("run_href").is_none());
-    let run = server.get("/v1/runs/0000000000000000000000ff").await;
+    let run = server.get("/v1/runs/0a0b0c0d0e0f0a0b0c0d0e0f").await;
     let nothing = server.get("/v1/nothing/at/all").await;
     assert_eq!((run.code, &run.body), (nothing.code, &nothing.body));
     let missing = server.get("/v1/invocations/missing").await;
@@ -780,4 +789,144 @@ async fn without_history_the_pages_are_what_they_were() {
     assert_eq!(missing.json["error"], "no_record");
     assert_eq!(missing.json.as_object().expect("an object").len(), 3);
     server.stop().await;
+}
+
+/// Catches: an object store or state store that fails answered as a record that is not
+/// there (`404`, which a client takes for "your build was never recorded"), the cause
+/// of the failure sent to the caller, and a failed read that is cached or fails the
+/// server. Each read that touches history answers `503` while it cannot be read, and a
+/// read after it works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_history_that_cannot_be_read_is_503_and_names_no_cause() {
+    let world = World::new();
+    let a = world.start(PAGES_ONLY);
+    a.feed(ran("down", "main", 1, 1, 0)).await;
+    world.flushed("down", 1).await;
+    a.recorder.caught_up().await;
+    let run = hex::encode(
+        a.recorder.get(&key("down")).expect("a record").rows()[0].attempts[0]
+            .run_id
+            .expect("an id"),
+    );
+    a.stop().await;
+
+    let b = world.start(PAGES_ONLY);
+    let routes = ["/v1/invocations/down".to_owned(), format!("/v1/runs/{run}")];
+    // The index does not answer a read of the header.
+    world.state.fail_gets.store(1, Ordering::SeqCst);
+    let answer = b.get(&routes[0]).await;
+    assert_eq!(answer.code, 503, "{}", answer.json);
+    assert_eq!(
+        answer.json["error"],
+        "build history cannot be read right now"
+    );
+    // The object store does not answer: the summary chunk, the records and the run block.
+    world.objects.fail_gets(true);
+    for route in &routes {
+        let answer = b.get(route).await;
+        assert_eq!(answer.code, 503, "{route}: {}", answer.json);
+        let text = answer.json.to_string();
+        assert!(
+            !text.contains("planted"),
+            "{route}: the cause is logged, not sent: {text}"
+        );
+    }
+    world.objects.fail_gets(false);
+    assert_eq!(b.ok(&routes[0]).await["restored"], true);
+    assert_eq!(b.ok(&routes[1]).await["class"], "ok");
+    b.stop().await;
+}
+
+/// Catches: a caller the policy does not accept let in to a run (`401`, as to every other
+/// route), and the run route answering when the policy turns the build pages off: `404`
+/// with the `off` body of the pages, and never `no_run`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_run_route_is_authenticated_and_off_with_the_pages() {
+    let world = World::new();
+    let id = "0a0b0c0d0e0f0a0b0c0d0e0f";
+    let denied = world.start(
+        r#"{"authenticationPolicy": {"deny": "who are you"},
+            "invocations": {"getAuthorizer": {"allow": {}}}}"#,
+    );
+    let answer = denied.get(&format!("/v1/runs/{id}")).await;
+    assert_eq!(answer.code, 401, "{}", answer.json);
+    denied.stop().await;
+    let off = world.start(r#"{"authenticationPolicy": {"allow": {}}}"#);
+    let answer = off.get(&format!("/v1/runs/{id}")).await;
+    assert_eq!(answer.code, 404, "{}", answer.json);
+    assert_eq!(answer.json["off"], "invocations");
+    off.stop().await;
+}
+
+/// Catches: a header under the hash of another invocation's id (a collision, or a row
+/// planted) read as this one's records, and a header whose chunks are gone from the
+/// index (only a close with nothing to write leaves one) answered as an empty record:
+/// both are no record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_header_of_another_id_or_with_no_chunk_is_no_record() {
+    let world = World::new();
+    let a = world.start(PAGES_ONLY);
+    let mut events = ran("swapped", "main", 1, 1, 0);
+    events.extend(ran("hollow", "main", 2, 2, 0));
+    events.extend(ran("fine", "main", 3, 3, 0));
+    a.feed(events).await;
+    for id in ["swapped", "hollow", "fine"] {
+        world.flushed(id, 1).await;
+    }
+    a.stop().await;
+    let other = InvocationHeader {
+        record_id: "someone-else".to_owned(),
+        ..world.header("swapped")
+    };
+    world.set_header("swapped", &other);
+    let prefix = IndexRoot::default().ichunk_prefix(&InvKey::from_record_id("hollow"));
+    for row in world.rows(&prefix) {
+        let delete = kbf_state::Txn::new().delete(row, kbf_state::Cond::Any);
+        world
+            .state
+            .fake
+            .txn(delete)
+            .expect("a write")
+            .expect("no conflict");
+    }
+
+    let b = world.start(PAGES_ONLY);
+    for id in ["swapped", "hollow"] {
+        let answer = b.get(&format!("/v1/invocations/{id}")).await;
+        assert_eq!(answer.code, 404, "{id}: {}", answer.json);
+        assert_eq!(answer.json["error"], "no_record", "{id}");
+    }
+    assert_eq!(b.ok("/v1/invocations/fine").await["actions"], 1);
+    b.stop().await;
+}
+
+/// Catches (mutant "the records are not checked against the names"): an instance added
+/// after the header was read for the summary and before the records were, served to a
+/// caller who was never asked about it. The records are read under the same check as the
+/// summary, and the request answers `503`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_instance_added_between_the_header_and_the_records_is_503_changed() {
+    let world = World::new();
+    let a = world.start(ONLY_A);
+    a.feed(ran("late", "a/main", 1, 1, 0)).await;
+    world.flushed("late", 1).await;
+    a.stop().await;
+    let b = world.start(ONLY_A);
+
+    let grown = InvocationHeader {
+        instances: vec!["a/main".to_owned(), "b".to_owned()],
+        ..world.header("late")
+    };
+    // After the names are read, wait for the summary's read of the header, and add the
+    // instance after that.
+    let first = Arc::clone(&world.state);
+    world.state.after_get("ui/invid/", move || {
+        let second = Arc::clone(&first);
+        first.after_get("ui/invid/", move || set_header(&second, "late", &grown));
+    });
+    let answer = b.get("/v1/invocations/late").await;
+    assert_eq!(answer.code, 503, "{}", answer.json);
+    let why = answer.json["error"].as_str().unwrap_or_default();
+    assert!(why.contains("gained an instance name"), "{why}");
+    b.stop().await;
 }

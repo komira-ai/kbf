@@ -41,7 +41,7 @@ fn base() -> RunRecord {
 /// lost one).
 #[test]
 fn a_run_says_what_the_record_has_and_leaves_out_what_it_has_not() {
-    let id = "0001a2b3c4d0000007000004";
+    let id = "0a1b2c3d4e5f0a1b2c3d4e5f";
     let mut r = base();
     r.set_run_id(id.parse().unwrap());
     let v = render(&r);
@@ -117,7 +117,7 @@ fn a_killed_run_says_how_and_a_shape_what_it_names() {
     r.result = Some(wire(3));
     r.stdout = Some(wire(4));
     r.stderr = Some(wire(5));
-    r.shape = 0x00ab;
+    r.shape = 0x1234_5678_9abc_def0;
     r.cfg = "cfg1".to_owned();
     r.target = "root//a:b".to_owned();
     r.target_kind = 2;
@@ -147,7 +147,7 @@ fn a_killed_run_says_how_and_a_shape_what_it_names() {
     assert_eq!(v["stderr"], text(5));
     assert_eq!(
         v["shape"],
-        json!({"key": "00000000000000ab", "cfg": "cfg1", "test": true,
+        json!({"key": "123456789abcdef0", "cfg": "cfg1", "test": true,
                "target": {"label": "root//a:b", "kind": "anon"}})
     );
     r.memory_kill = MemoryKill::NodePressure.into();
@@ -226,15 +226,143 @@ fn the_times_and_the_cgroup_block_are_what_the_daemon_reported() {
 /// length, or one with a sign, and so an id that is not the route's.
 #[test]
 fn only_the_lowercase_24_digits_are_a_run_id() {
-    assert!(parse("0001a2b3c4d0000007000004").is_some());
+    assert!(parse("0a1b2c3d4e5f0a1b2c3d4e5f").is_some());
     for bad in [
-        "0001A2B3C4D00000070000000004",
-        "0001a2b3c4d0000007000000000",
-        "0001a2b3c4d00000070000044",
+        "0A1B2C3D4E5F0A1B2C3D4E5F",
+        "0a1b2c3d4e5f0a1b2c3d4e5",
+        "0a1b2c3d4e5f0a1b2c3d4e5f0",
         "",
-        "+001a2b3c4d00000070000000004",
+        "+a1b2c3d4e5f0a1b2c3d4e5f",
         "../nodes",
     ] {
         assert!(parse(bad).is_none(), "{bad:?}");
+    }
+}
+
+mod recorder_side {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use kbf_front::{Recorder, Tap};
+    use kbf_history::{HistoryIndex, HistoryRoot, IndexRoot, Inline, Reader};
+    use kbf_invocation::{
+        ActionRow, Call, CallKind, Ended, Event, ExecuteAnswer, Finished, InvocationId, LeaseEnd,
+        Metadata, Outcome, Owner, RecordKey, WallTime,
+    };
+    use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
+    use kbf_state::fake::{Fake, Flaw};
+    use kbf_state::{ManualClock, Store};
+    use kbf_types::{Digest, DigestFunction, LeaseId, OperationId, WorkerId};
+
+    use super::super::Durable;
+    use kbf_history::RunId;
+
+    use crate::history::{HistoryReads, RunIndex, Shared};
+    use crate::http_history::run::{RunState, live};
+
+    /// A tap that gives each attempt the id `[1; 12]` and notes where it is.
+    #[derive(Debug)]
+    struct Mints(Arc<RunIndex>);
+
+    impl Tap for Mints {
+        fn ended(&self, ended: &Ended, _: &ActionRow) -> Option<[u8; 12]> {
+            ended.attempt?;
+            self.0.note([1; 12], ended.key.clone(), ended.row);
+            Some([1; 12])
+        }
+
+        fn idle(&self, _: &RecordKey) {}
+    }
+
+    fn key(id: &str) -> RecordKey {
+        RecordKey::owner(InvocationId::new(id))
+    }
+
+    fn at(us: u64) -> WallTime {
+        WallTime::from_unix_micros(us)
+    }
+
+    /// A recorder holding invocation `held` with one action that ran once, and the state
+    /// of a run route over it, whose index is `runs`.
+    async fn state(runs: &Arc<RunIndex>) -> RunState {
+        let (recorder, recording) = Recorder::new(1 << 20, 64);
+        tokio::spawn(recording.with_tap(Arc::new(Mints(Arc::clone(runs)))).run());
+        let action = Digest::new(DigestFunction::Sha256, [7; 32], 7);
+        let op = OperationId(1);
+        recorder.emit(Event::Call(Box::new(Call {
+            id: InvocationId::new("held"),
+            minted: false,
+            owner: Owner::default(),
+            instance: "main".to_owned(),
+            at: at(1),
+            metadata: Metadata::default(),
+            kind: CallKind::Execute {
+                action,
+                answer: ExecuteAnswer::Queued {
+                    name: "operations/1".to_owned(),
+                    operation: op,
+                },
+            },
+        })));
+        recorder.emit(Event::Granted {
+            operation: op,
+            lease: LeaseId::new(1, 1),
+            worker: WorkerId::new("node-a"),
+            at: at(2),
+        });
+        recorder.emit(Event::Finished(Finished {
+            operation: op,
+            lease: Some((LeaseId::new(1, 1), LeaseEnd::Accepted)),
+            outcome: Outcome::Ok { exit_code: 0 },
+            result: None,
+            at: at(3),
+        }));
+        tokio::time::timeout(Duration::from_secs(30), recorder.caught_up())
+            .await
+            .expect("the events are applied");
+        let objects = Shared(Arc::new(MemoryStore::new(Capabilities {
+            conditional_put: true,
+            object_lock: false,
+        })));
+        let store: Arc<dyn Store> = Arc::new(Fake::with_flaw(
+            Arc::new(ManualClock::default()),
+            Flaw::None,
+        ));
+        let root = HistoryRoot::under(&KeyPrefix::new("kbf/").expect("a prefix")).expect("a root");
+        let index = HistoryIndex::new(store, IndexRoot::default(), Arc::new(Inline));
+        let reads = HistoryReads::new(Reader::new(objects, root, index), Arc::clone(runs));
+        RunState {
+            recorder,
+            readers: None,
+            durable: Arc::new(Durable::new(Arc::new(reads))),
+        }
+    }
+
+    /// Catches: a live run not found (the route would answer from history only, so not at
+    /// all before the chunk is written), one found by an id the tap did not mint, one
+    /// found where the index points at a record the recorder has dropped, a row it no
+    /// longer has, or an attempt that does not carry the id (a record made again under
+    /// the key, whose row has other attempts): each would answer with another run.
+    #[tokio::test]
+    async fn a_live_run_is_found_only_where_the_row_still_names_it() {
+        let runs = Arc::new(RunIndex::default());
+        let state = state(&runs).await;
+        let id = RunId::from_bytes([1; 12]);
+        let record = live(&state, id).expect("the run, from the recorder");
+        assert_eq!(record.run_id(), id);
+        assert_eq!(record.instance, "main");
+        assert_eq!(record.node, "node-a");
+        // An id nothing minted.
+        assert!(live(&state, RunId::from_bytes([2; 12])).is_none());
+        for (what, held, row) in [
+            ("a record the recorder dropped", "gone", 0),
+            ("a row it no longer has", "held", 99),
+        ] {
+            runs.note([3; 12], key(held), row);
+            assert!(live(&state, RunId::from_bytes([3; 12])).is_none(), "{what}");
+        }
+        // The row is there, and its attempt carries another id.
+        runs.note([4; 12], key("held"), 0);
+        assert!(live(&state, RunId::from_bytes([4; 12])).is_none());
     }
 }

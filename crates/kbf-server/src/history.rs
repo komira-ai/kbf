@@ -38,6 +38,8 @@ pub use reads::HistoryReads;
 pub(crate) use reads::Shared;
 pub use stats::Stats;
 pub use tap::HistoryTap;
+#[cfg(test)]
+pub(crate) use tap::RunIndex;
 pub(crate) use tap::run_record;
 
 use kbf_front::Recording;
