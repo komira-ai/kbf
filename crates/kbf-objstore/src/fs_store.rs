@@ -841,7 +841,8 @@ mod tests {
     /// prefix, not the window), one that ends at the end of its first window, and one
     /// that cuts the next page from a used-up window instead of reading the next: 7
     /// keys through a window of 3 in pages of 2 come back whole, in order, never more
-    /// than 3 kept, in 3 walks. Pages that stay within a window walk no more.
+    /// than 3 kept, in 3 walks. Pages that stay within a window walk no more. A file in
+    /// a shard directory that is not an object is skipped by every walk.
     #[tokio::test]
     async fn a_listing_longer_than_its_window_keeps_one_window_at_a_time() {
         let dir = std::env::temp_dir().join(format!("kbf-objstore-window.{}", std::process::id()));
@@ -857,6 +858,9 @@ mod tests {
                     .expect("put");
             }
         }
+        let shard = store.inner.objects.join("00");
+        fs::create_dir_all(&shard).expect("shard");
+        fs::write(shard.join("foreign"), b"not an object").expect("plant");
         let a = KeyPrefix::new("a/").expect("prefix");
         let size = PageSize::new(2).expect("size");
         let (mut got, mut after, mut most) = (Vec::new(), None, 0);

@@ -362,3 +362,13 @@ async fn a_failed_page_ends_the_stream_with_its_error() {
     );
     assert_eq!(store.calls.load(Ordering::SeqCst), 3);
 }
+
+/// Catches: a stream that refuses, or asks past, an empty last page (S3 may answer a
+/// truncated page's token with an empty, untruncated one): the keys before it, no
+/// error, and no call after it.
+#[tokio::test]
+async fn an_empty_last_page_ends_the_stream() {
+    let store = Scripted::new(vec![page(&["p/a"], Some("p/a")), page(&[], None)]);
+    assert_eq!(run(&store, None).await, (vec!["p/a".into()], None));
+    assert_eq!(store.calls.load(Ordering::SeqCst), 2);
+}
