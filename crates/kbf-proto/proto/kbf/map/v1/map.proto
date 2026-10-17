@@ -77,10 +77,10 @@ enum Rule {
 service Membership {
   // Joins, or joins again. The store assigns the member id and the boot counter; the same
   // instance_id gets the same id and a larger boot counter every time. The member starts
-  // as JOINING.
+  // as JOINING, or CATCHING_UP when the request says it is rebuilding its index.
   rpc Register(RegisterRequest) returns (RegisterResponse);
-  // Keeps the member's row alive. NOT_FOUND means the row expired (or never was): register
-  // again.
+  // Keeps the member's row alive, and carries the end of a rebuild (CATCHING_UP to
+  // ACTIVE). NOT_FOUND means the row expired (or never was): register again.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }
 
@@ -100,6 +100,9 @@ message RegisterRequest {
   string zone = 5;
   // The newest protocol version this node speaks; refused below the map's min_protocol.
   uint32 protocol = 6;
+  // The node is rebuilding its index: it enters the map as CATCHING_UP, not JOINING, and
+  // answers what it cannot find UNAVAILABLE until a heartbeat reports the rebuild done.
+  bool catching_up = 7;
 }
 
 message RegisterResponse {
@@ -114,6 +117,12 @@ message RegisterResponse {
 message HeartbeatRequest {
   uint64 member_id = 1;
   uint64 boot = 2;
+  // The generation of the map the node holds (0: none). Absent from an older node, which
+  // reads as 0 and is sent the map every beat.
+  uint64 have_generation = 3;
+  // Whether the node is still rebuilding its index. A member that is CATCHING_UP becomes
+  // ACTIVE at the first heartbeat that says false; no other state is changed by it.
+  bool catching_up = 4;
   // The copies this node owes: blobs it holds that a second owner does not, its open
   // repair-journal records. Read only when debts_known is true.
   uint64 repair_debts = 5;
@@ -127,4 +136,7 @@ message HeartbeatRequest {
 message HeartbeatResponse {
   // The generation of the current map.
   uint64 map_generation = 1;
+  // The current map, when its generation is above the request's have_generation: a node
+  // that missed a bump learns it from its next beat, with no other call.
+  Map map = 2;
 }

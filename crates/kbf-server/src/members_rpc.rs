@@ -20,7 +20,7 @@ use kbf_proto::kbf::map::v1::membership_server::{Membership, MembershipServer};
 use kbf_storage::service::{Admission, PeerRole, role_of};
 use tonic::{Request, Response, Status};
 
-use crate::members::{Members, MembershipError, Registrant};
+use crate::members::{Members, MembershipError, Progress, Registrant};
 use crate::storage_health::Debts;
 
 /// The service over `members`, admitting callers as `admission` says.
@@ -43,7 +43,7 @@ impl MembershipService {
     }
 
     fn admit<T>(&self, request: &Request<T>) -> Result<(), Status> {
-        let certs = request.peer_certs();
+        let certs = kbf_tls::peer_certs(request);
         let leaf = certs.as_deref().and_then(|chain| chain.first());
         self.admit_leaf(leaf.map(AsRef::as_ref))
     }
@@ -115,6 +115,7 @@ impl Membership for MembershipService {
             zone: req.zone,
             weight: req.weight,
             protocol: req.protocol,
+            progress: Progress::from_wire(req.catching_up),
         };
         let members = Arc::clone(&self.members);
         let joined = blocking(move || members.register(&who)).await?;
@@ -135,13 +136,30 @@ impl Membership for MembershipService {
         let req = request.into_inner();
         let members = Arc::clone(&self.members);
         let id = kbf_map::MemberId(req.member_id);
+        let have = req.have_generation;
+        let progress = Progress::from_wire(req.catching_up);
         let debts = Debts::from_wire(req.debts_known, req.repair_debts);
-        let map_generation = blocking(move || members.heartbeat(id, req.boot, debts)).await?;
-        Ok(Response::new(pb::HeartbeatResponse { map_generation }))
+        let (map_generation, map) = blocking(move || {
+            let generation = members.heartbeat(id, req.boot, progress, debts)?;
+            // Read only for a node that is behind: most beats carry no map.
+            let newer = if generation > have {
+                members.current_map()?.filter(|map| map.generation() > have)
+            } else {
+                None
+            };
+            Ok((generation, newer))
+        })
+        .await?;
+        Ok(Response::new(pb::HeartbeatResponse {
+            map_generation,
+            map: map.as_ref().map(pb::Map::from),
+        }))
     }
 }
 
-/// Expires members on the store's clock: every beat, [`Members::refresh`]. Never
+/// Expires members on the store's clock: every beat, [`Members::refresh`], then frees
+/// every expired row of the store ([`Members::reap`]: the farm's session and result rows
+/// as well). Never
 /// completes; a failure is logged and tried again at the next beat.
 pub async fn sweep(members: Arc<Members>) {
     let mut tick = tokio::time::interval(members.config().beat());
@@ -151,6 +169,10 @@ pub async fn sweep(members: Arc<Members>) {
         let refreshing = Arc::clone(&members);
         if let Err(e) = blocking(move || refreshing.refresh()).await {
             tracing::warn!("membership refresh: {}", e.message());
+        }
+        let reaping = Arc::clone(&members);
+        if let Err(e) = blocking(move || reaping.reap()).await {
+            tracing::warn!("state store reap: {}", e.message());
         }
     }
 }

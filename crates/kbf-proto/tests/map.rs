@@ -189,6 +189,7 @@ fn the_heartbeat_debts_are_fields_five_and_six() {
         boot: 2,
         repair_debts: 3,
         debts_known: true,
+        ..Default::default()
     };
     assert_eq!(
         beat.encode_to_vec(),

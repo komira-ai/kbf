@@ -16,7 +16,7 @@ use std::time::Duration;
 use hooked::Hooked;
 use kbf_front::Cache;
 use kbf_map::{MemberId, MemberState};
-use kbf_server::members::{Members, MembershipConfig, PROTOCOL, Registrant};
+use kbf_server::members::{Members, MembershipConfig, PROTOCOL, Progress, Registrant};
 use kbf_server::storage_health::Debts;
 use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
 use kbf_state::{Cond, Store, Txn};
@@ -67,6 +67,7 @@ fn start() -> Server {
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
         streams: kbf_server::StreamTiming::default(),
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     };
     let api = Api {
         listen: loopback(),
@@ -119,6 +120,7 @@ fn node(i: u32) -> Registrant {
         zone: String::new(),
         weight: 1,
         protocol: PROTOCOL,
+        progress: Progress::CaughtUp,
     }
 }
 
@@ -130,7 +132,7 @@ fn farm(s: &Server, debts: &[Debts]) {
             .set_state(joined.id, MemberState::Active)
             .expect("promoted");
         s.members
-            .heartbeat(joined.id, joined.boot, *debts)
+            .heartbeat(joined.id, joined.boot, Progress::CaughtUp, *debts)
             .expect("beats");
     }
 }
@@ -177,7 +179,7 @@ async fn the_api_answers_the_number_or_null_and_why() {
         .set_state(MemberId(1), MemberState::Active)
         .expect("active");
     s.members
-        .heartbeat(MemberId(2), 1, Debts::Known(0))
+        .heartbeat(MemberId(2), 1, Progress::CaughtUp, Debts::Known(0))
         .expect("beats");
     let (_, zero) = storage(&s).await;
     assert_eq!(zero["under_replicated_blobs"], 0);
@@ -222,6 +224,26 @@ async fn the_scrape_has_the_number_only_while_it_is_known() {
     );
 }
 
+/// Arms a panic in the store's next read of the map and asks `ask`; asks again, re-armed, until
+/// `blown` says the panic landed in the request. Another task may read the map first (a map
+/// push, after the farm changed it), and then the hook is spent on it and the request is
+/// answered from a healthy store.
+async fn blown<T, F: std::future::Future<Output = T>>(
+    store: &Hooked,
+    ask: impl Fn() -> F,
+    blown: impl Fn(&T) -> bool,
+) -> T {
+    for _ in 0..200 {
+        store.after_get("map", || panic!("the store blew up"));
+        let answer = ask().await;
+        if blown(&answer) {
+            return answer;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("the store's panic never landed in a request");
+}
+
 /// Catches: a membership that cannot be read taking the API or the scrape down, or being
 /// read as a number. A panic in the store's read answers 503 with the reason on
 /// `/v1/storage`, and the scrape still answers 200 with the known flag at 0 and no number;
@@ -236,8 +258,7 @@ async fn a_membership_that_cannot_be_read_is_a_503_and_an_unknown_scrape() {
         "warmed up: the server's own first timer tick is over"
     );
 
-    s.store.after_get("map", || panic!("the store blew up"));
-    let (code, body) = storage(&s).await;
+    let (code, body) = blown(&s.store, || storage(&s), |(code, _)| *code == 503).await;
     assert_eq!(code, 503);
     assert!(
         body["error"]
@@ -246,8 +267,12 @@ async fn a_membership_that_cannot_be_read_is_a_503_and_an_unknown_scrape() {
         "{body}"
     );
 
-    s.store.after_get("map", || panic!("the store blew up"));
-    let (code, scrape) = get(s.api, "/metrics").await;
+    let (code, scrape) = blown(
+        &s.store,
+        || get(s.api, "/metrics"),
+        |(_, text)| text.contains("\nkbf_storage_health_known 0\n"),
+    )
+    .await;
     assert_eq!(code, 200);
     assert!(
         scrape.contains("\nkbf_storage_health_known 0\n"),

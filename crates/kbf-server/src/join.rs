@@ -2,13 +2,24 @@
 //! frontend, then heartbeat at the interval it names, registering again when the frontend
 //! says the row lapsed, and backing off when it cannot be reached
 //! (`docs/design/architecture-v2.md`, section 6). The node never touches the state store.
+//!
+//! **The map.** The registration answers with the frontend's map, and a heartbeat that
+//! says which generation the node holds is answered with the map when the frontend's is
+//! newer. Each goes into the node's [`MapHolder`] (which keeps the newest and never goes
+//! back), so a node learns every bump from its own beat, with no push to lose.
+//! Every call says whether the node is still rebuilding its index ([`CatchUp`], the state
+//! its storage service reads): a node that registers while rebuilding enters the map as
+//! `CatchingUp`, and the first heartbeat after [`CatchUp::finish`] makes it `Active`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use kbf_map::Map;
+use kbf_mapsync::MapHolder;
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_storage::repair::Repairs;
+use kbf_storage::service::CatchUp;
 use tonic::transport::Channel;
 use tonic::{Code, Status};
 
@@ -59,11 +70,13 @@ pub struct Joiner {
     identity: Identity,
     retry: Duration,
     repairs: Option<Arc<Repairs>>,
+    catch_up: CatchUp,
+    maps: Arc<MapHolder>,
 }
 
 impl Joiner {
     /// A joiner that calls `channel` as `identity`, waiting `retry` after the first
-    /// failure.
+    /// failure, for a node whose index is whole.
     #[must_use]
     pub fn new(channel: Channel, identity: Identity, retry: Duration) -> Self {
         Self {
@@ -71,6 +84,8 @@ impl Joiner {
             identity,
             retry,
             repairs: None,
+            catch_up: CatchUp::caught_up(),
+            maps: Arc::new(MapHolder::new()),
         }
     }
 
@@ -97,6 +112,38 @@ impl Joiner {
             .map_or(Debts::Unknown, Debts::Known)
     }
 
+    /// Keeps the maps this node is sent in `maps`, which whatever else the node runs
+    /// (the checks of its storage service, its replication) reads. The joiner starts
+    /// with a holder of its own.
+    #[must_use]
+    pub fn with_maps(mut self, maps: Arc<MapHolder>) -> Self {
+        self.maps = maps;
+        self
+    }
+
+    /// Puts `map`, as the frontend sent it, in the holder. One the node cannot read is
+    /// warned about and ignored: the next beat sends it again.
+    fn take(&self, map: Option<pb::Map>) {
+        let Some(map) = map else { return };
+        match Map::try_from(map) {
+            Ok(map) => {
+                let generation = map.generation();
+                if self.maps.offer(map) {
+                    tracing::info!(generation, "storage map taken");
+                }
+            }
+            Err(error) => tracing::warn!(%error, "a storage map this node cannot read ignored"),
+        }
+    }
+
+    /// The joiner of a node whose index may be being rebuilt: every call reports what
+    /// `catch_up` says at the time.
+    #[must_use]
+    pub fn with_catch_up(mut self, catch_up: CatchUp) -> Self {
+        self.catch_up = catch_up;
+        self
+    }
+
     /// Registers once.
     ///
     /// # Errors
@@ -112,9 +159,11 @@ impl Joiner {
                 weight: who.weight,
                 zone: who.zone.clone(),
                 protocol: PROTOCOL,
+                catching_up: self.catch_up.is_catching_up(),
             })
             .await?
             .into_inner();
+        self.take(answer.map.clone());
         Ok(Joined {
             member_id: answer.member_id,
             boot: answer.boot,
@@ -123,7 +172,8 @@ impl Joiner {
         })
     }
 
-    /// Heartbeats once; returns the generation of the frontend's current map.
+    /// Heartbeats once, taking the frontend's map if it is newer than the node's; returns
+    /// the generation of the frontend's current map.
     ///
     /// # Errors
     /// NOT_FOUND when the row lapsed (register again); the call failing.
@@ -136,9 +186,13 @@ impl Joiner {
                 boot: joined.boot,
                 repair_debts,
                 debts_known,
+                have_generation: self.maps.generation(),
+                catching_up: self.catch_up.is_catching_up(),
             })
-            .await?;
-        Ok(answer.into_inner().map_generation)
+            .await?
+            .into_inner();
+        self.take(answer.map);
+        Ok(answer.map_generation)
     }
 
     /// Registers and heartbeats for ever. A failed call waits [`backoff`] and tries

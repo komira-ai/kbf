@@ -72,6 +72,7 @@ pub mod farm;
 mod fault;
 mod flag_set;
 pub mod fleet;
+pub mod front_maps;
 pub mod frontend;
 pub mod grpc_health;
 pub mod health;
@@ -82,7 +83,6 @@ pub mod join;
 mod local;
 pub mod log_file;
 pub mod machine;
-pub mod map_feed;
 mod map_push;
 pub mod mdm;
 pub mod members;
@@ -102,26 +102,31 @@ pub mod storage_half;
 pub mod storage_health;
 pub mod storage_node;
 pub mod stores;
+pub mod streams;
 mod timeout;
 pub mod token;
 pub mod worker;
+pub mod worker_roles;
 pub mod write_tier;
 
 pub use config::{Args, ConfigError, Role, SERVER, s3_store};
 pub use drain::{Drain, DrainStatus};
-pub use farm::{EpochPolicy, Farm, SESSION_RENEWAL, StateError};
+pub use farm::{DONE_FLOOR, EpochPolicy, Farm, SESSION_RENEWAL, StateError};
 pub use health::Readiness;
 pub use identity::{DenyList, DenyListError, Peers};
 pub use kbf_sched::MemoryLadder;
+pub use kbf_tls::{TlsError, TlsFiles, TlsSource};
 pub use local::LocalStore;
 pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use serve::{
-    Api, Bound, BoundStorage, Listeners, ServeError, StorageListener, StreamTiming, WorkerTls,
-    bind_server, bind_server_with_api, bind_server_with_map, bind_server_with_options,
+    Api, Bound, BoundStorage, Listeners, NO_MAP_YET, ServeError, StorageListener, StreamTiming,
+    WorkerTls, bind_server, bind_server_with_api, bind_server_with_map, bind_server_with_options,
     bind_server_with_policy, bind_server_with_state, bind_server_with_storage, bind_storage,
+    bind_storage_gated, bind_storage_shared,
 };
 pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_interruptible};
 pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};
+pub use streams::{StreamArgs, StreamLimits};
 pub use worker::WorkerService;
 
 /// The commit the server was built from: 12 hex digits, or `unknown` when the build

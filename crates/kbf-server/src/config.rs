@@ -14,7 +14,7 @@ use clap::{Parser, ValueEnum};
 use kbf_front::WriteConfig;
 use kbf_objstore::Capabilities;
 use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store};
-use tonic::transport::{Certificate, Identity, ServerTlsConfig};
+use kbf_tls::{TlsError, TlsFiles, TlsSource};
 
 use kbf_auth::{AllowAuthorizer, Authorizer, Policy, PolicyError};
 use kbf_front::SegmentsConfig;
@@ -25,6 +25,9 @@ use crate::identity::{DenyList, DenyListError};
 use crate::serve::{Api, Listeners, StreamTiming, WorkerTls};
 use crate::stores::{S3Uri, StoreFlags, StoreUri, Stores, StoresError};
 use crate::token::{ApiToken, TokenFileError};
+
+/// The default of `--tls-reload-interval-secs`.
+const DEFAULT_TLS_RELOAD_SECS: u64 = 30;
 
 /// The longest heartbeat interval `--heartbeat-interval-ms` accepts: half of
 /// [`kbf_sched::fence::START_VALIDITY`].
@@ -78,8 +81,14 @@ pub struct Args {
     /// (5% of its size, at least 1 GiB, and never more than half of what is free), at
     /// most `--hot-store-max-bytes`; at the budget, writes
     /// take the direct path to the cold store. Without it, uploads go straight to the
-    /// cold store. The first start with a hot store raises the metadata log to machine
-    /// version 2, once; a binary that runs only version 1 no longer reads it.
+    /// cold store. A daemon's outputs (a segment upload, or the in-process plane) and a
+    /// ByteStream Write over 16 MiB are written through to it as they arrive, so a
+    /// large one is never held in memory.
+    /// Without it, or when it has no room, a daemon's blob over 16 MiB
+    /// (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) is streamed to the cold store as it
+    /// arrives (a ByteStream Write, or the in-process plane's own stream), never held
+    /// whole and never refused for its size. The first start with a hot store raises
+    /// the metadata log to machine version 2, once; a binary that runs only version 1 no longer reads it.
     /// The metadata log lives in `<dir>/meta`, unless `--meta-dir` says otherwise.
     #[arg(long, value_name = "URI")]
     pub hot_store: Option<StoreUri>,
@@ -214,7 +223,10 @@ pub struct Args {
     /// PEM private key of the worker listener.
     #[arg(long, requires_all = ["worker_tls_cert", "worker_client_ca"])]
     pub worker_tls_key: Option<PathBuf>,
-    /// PEM CA that daemon client certificates must chain to.
+    /// PEM CA that client certificates must chain to. Each must also name the role the
+    /// method it calls takes: the daemon role (`urn:kbf:role:daemon`) for the worker
+    /// session and blob calls, the storage role (`urn:kbf:role:storage`) for
+    /// `kbf.map.v1.Membership`; a frontend certificate may call nothing here.
     #[arg(long, requires_all = ["worker_tls_cert", "worker_tls_key"])]
     pub worker_client_ca: Option<PathBuf>,
     /// The worker listener's deny list: certificate serials, public keys and node ids
@@ -223,6 +235,21 @@ pub struct Args {
     /// mutual TLS.
     #[arg(long, requires_all = ["worker_tls_cert", "worker_tls_key", "worker_client_ca"])]
     pub worker_deny_list: Option<PathBuf>,
+    /// How often, in seconds, the REAPI and worker listeners look at their TLS files
+    /// (`--reapi-tls-cert`, `--reapi-tls-key`, `--worker-tls-cert`, `--worker-tls-key`,
+    /// `--worker-client-ca`). A change is applied to the next TLS handshake, with no
+    /// restart and without ending a connection already open: renew a certificate by
+    /// replacing the files. Files that do not make a working configuration (unreadable,
+    /// not PEM, a key that is not the certificate's, an expired certificate, a renewal
+    /// caught between its two writes) are logged and counted in
+    /// `kbf_tls_reloads_total{outcome="rejected"}`, and the previous files keep serving;
+    /// the next look finds them whole and applies them. The files must be good at start.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_TLS_RELOAD_SECS,
+        value_parser = clap::value_parser!(u64).range(1..=3600)
+    )]
+    pub tls_reload_interval_secs: u64,
     /// The heartbeat interval daemons are asked for, in milliseconds, at most half the
     /// window in which a daemon may act on a `Start` (each `Start` names the newest
     /// heartbeat the server took, so a longer interval would leave it too little).
@@ -300,14 +327,20 @@ pub struct Args {
     )]
     pub invocation_memory: u64,
     /// The most bytes, records and footers together, one segment upload on the worker
-    /// listener may declare (`docs/design/write-path.md`, section 4.2). Ranges are held
-    /// in memory until their upload commits, admitted under `--write-bytes-in-flight`
-    /// with every other upload: a `Begin` waits while that is spent. At least one 1 GiB
-    /// blob and its footer (1 GiB + 1 MiB), so any blob the cache accepts can be
-    /// uploaded, and at most `--write-bytes-in-flight`, so any legal `Begin` can be
-    /// admitted; the server refuses to start otherwise. At most 4 GiB - 1
-    /// (`kbf_front::MAX_ADMISSION_BYTES`), the most one admission counts, so a `Begin`
-    /// never holds more than it is counted for under the bound.
+    /// listener may hold in memory (`docs/design/write-path.md`, section 4.2): the
+    /// segments it declares that are not written to the hot store as they arrive (all
+    /// of them, without one). Not a limit on a blob's size: a segment held in memory
+    /// holds no record over 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`), and an upload
+    /// with a larger one and no room on the hot store is answered FAILED_PRECONDITION,
+    /// so the daemon sends its records by ByteStream, which streams a large blob to the
+    /// cold store. Those ranges are held until the upload commits, admitted
+    /// under `--write-bytes-in-flight` with every other upload: a `Begin` waits while
+    /// that is spent. At least 33 MiB (`kbf_front::MIN_SEGMENT_UPLOAD_BYTES`), a
+    /// daemon's upload of small files with room to spare, and at most
+    /// `--write-bytes-in-flight`, so any legal `Begin` can be admitted; the server
+    /// refuses to start otherwise. At most `kbf_front::MAX_ADMISSION_BYTES`, the most
+    /// one admission counts, so a `Begin` never holds more than it is counted for under
+    /// the bound.
     #[arg(
         long,
         value_name = "BYTES",
@@ -335,20 +368,26 @@ pub struct Args {
     /// the group, so they neither wait for the linger nor hold up small writes.
     #[arg(long, default_value_t = kbf_front::WriteConfig::DEFAULT.own_segment_bytes)]
     pub write_own_segment_bytes: u64,
-    /// The most bytes uploads may hold at once. A ByteStream Write is admitted for its
-    /// blob's size before it reads past its first message, a BatchUpdateBlobs for its
-    /// total, a segment upload's Begin for its whole length; a caller over the bound
-    /// waits, nothing is refused for load. At least the largest blob (1 GiB), so one
-    /// can always be admitted, and at least `--segment-upload-max-bytes`. Not covered: each HTTP/2
+    /// The most bytes uploads may hold at once. A ByteStream Write is admitted before
+    /// it reads past its first message, for its blob's size up to 16 MiB
+    /// (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) and for 16 MiB above that (a larger blob
+    /// is streamed onto the hot store, or to the cold store without room there, not
+    /// held); a BatchUpdateBlobs for its total; a
+    /// segment upload's Begin for what it holds in memory. A caller over the bound
+    /// waits, nothing is refused for load. At least `--segment-upload-max-bytes` (by
+    /// default 33 MiB, under the default 2 GiB). Not covered: each HTTP/2
     /// stream's message as tonic decodes it, before the handler runs, up to 17 MiB per
-    /// stream (about 3.4 GiB for 200 streams) and 200 streams per connection on either listener
-    /// (`kbf_front::MAX_CONCURRENT_STREAMS`).
+    /// stream (about 3.4 GiB for 200 streams), times the streams one connection may open
+    /// on each listener.
     #[arg(
         long,
         default_value_t = kbf_front::WriteConfig::DEFAULT.bytes_in_flight,
-        value_parser = clap::value_parser!(u64).range(kbf_front::MAX_BLOB_BYTES..)
+        value_parser = clap::value_parser!(u64).range(kbf_front::MIN_SEGMENT_UPLOAD_BYTES..)
     )]
     pub write_bytes_in_flight: u64,
+    /// The most HTTP/2 streams one connection may have open, per listener.
+    #[command(flatten)]
+    pub streams: crate::streams::StreamArgs,
     /// The most segment PUTs, each with its footer read-back, in flight at once. A
     /// segment sealed while all are busy waits; new blobs go to a new open segment.
     #[arg(long, default_value_t = kbf_front::WriteConfig::DEFAULT.puts_in_flight)]
@@ -421,6 +460,9 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    /// A listener's TLS files do not make a configuration.
+    #[error("TLS: {0}")]
+    Tls(#[from] TlsError),
     /// The deny list cannot be read or parsed.
     #[error("--worker-deny-list: {0}")]
     DenyList(#[from] DenyListError),
@@ -511,15 +553,22 @@ impl Args {
     /// `--write-bytes-in-flight`; `--memory-ladder-gib` is not a ladder.
     pub fn listeners(&self) -> Result<Listeners, ConfigError> {
         self.segment_upload_fits_write_bound()?;
+        let reload = Duration::from_secs(self.tls_reload_interval_secs);
         let worker_tls = match (
             &self.worker_tls_cert,
             &self.worker_tls_key,
             &self.worker_client_ca,
         ) {
             (Some(cert), Some(key), Some(ca)) => Some(WorkerTls {
-                server: ServerTlsConfig::new()
-                    .identity(Identity::from_pem(read(cert)?, read(key)?))
-                    .client_ca_root(Certificate::from_pem(read(ca)?)),
+                server: TlsSource::files(
+                    "worker",
+                    TlsFiles {
+                        cert: cert.clone(),
+                        key: key.clone(),
+                        client_ca: Some(ca.clone()),
+                    },
+                    reload,
+                )?,
                 deny_list: self
                     .worker_deny_list
                     .as_deref()
@@ -529,9 +578,15 @@ impl Args {
             _ => None,
         };
         let reapi_tls = match (&self.reapi_tls_cert, &self.reapi_tls_key) {
-            (Some(cert), Some(key)) => {
-                Some(ServerTlsConfig::new().identity(Identity::from_pem(read(cert)?, read(key)?)))
-            }
+            (Some(cert), Some(key)) => Some(TlsSource::files(
+                "reapi",
+                TlsFiles {
+                    cert: cert.clone(),
+                    key: key.clone(),
+                    client_ca: None,
+                },
+                reload,
+            )?),
             _ => None,
         };
         Ok(Listeners {
@@ -560,6 +615,7 @@ impl Args {
                 max_bytes: self.segment_upload_max_bytes,
                 idle: Duration::from_secs(self.segment_upload_idle_secs),
             },
+            stream_limits: self.streams.limits(),
         })
     }
 

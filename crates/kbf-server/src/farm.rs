@@ -61,7 +61,7 @@ mod durable;
 mod phase;
 mod record;
 
-pub use durable::{EpochPolicy, SESSION_RENEWAL, StateError};
+pub use durable::{DONE_FLOOR, EpochPolicy, SESSION_RENEWAL, StateError};
 pub use phase::Reported;
 
 use self::durable::Durable;
@@ -192,6 +192,9 @@ struct State {
     /// The callers' records, the finished operations whose callers are kept, the
     /// leases whose `Start` was sent, and the node registry.
     machine: FarmMachine,
+    /// How long the scheduler keeps a finished operation; the state store keeps its
+    /// `done/` row at least as long.
+    finished_retention: Duration,
     /// The channel of each caller the machine keeps, forgotten with its record.
     stages: BTreeMap<WaiterId, watch::Sender<Stage>>,
     next_stream: u64,
@@ -263,6 +266,7 @@ impl Farm {
             state: Mutex::new(State {
                 sched,
                 machine: FarmMachine::new(term),
+                finished_retention,
                 stages: BTreeMap::new(),
                 next_stream: 0,
                 links: BTreeMap::new(),
@@ -1035,7 +1039,18 @@ impl State {
 
     /// Keeps the callers of `operation`, which has just finished, until the scheduler
     /// drops it.
-    fn keep_finished(&mut self, operation: OperationId, waiters: Vec<WaiterId>) {
+    fn keep_finished(
+        &mut self,
+        operation: OperationId,
+        waiters: Vec<WaiterId>,
+        finished: &Finished,
+    ) {
+        // After the finish is durable and before any caller is answered from this
+        // process's memory alone: a process that kept streams open across a handover
+        // reads the result here. A store that does not take it is logged and the callers
+        // here are answered all the same.
+        let retention = self.finished_retention;
+        self.durably("a result", |d| d.done(operation, finished, retention));
         self.machine.keep_finished(operation, waiters);
         self.forget_dropped();
     }
@@ -1198,7 +1213,7 @@ impl State {
         for stage in refusal.waiters.iter().filter_map(|id| self.stages.get(id)) {
             stage.send_replace(Stage::Done(finished.clone()));
         }
-        self.keep_finished(refusal.operation, refusal.waiters.clone());
+        self.keep_finished(refusal.operation, refusal.waiters.clone(), &finished);
     }
 
     /// Works out what the callers of a finished operation get, and keeps them for the
@@ -1247,7 +1262,7 @@ impl State {
             (_, outcome) => (unrun(outcome, &answer.farm_runs), None),
         };
         self.record_finished(answer, &finished, stored, reason);
-        self.keep_finished(answer.operation, answer.waiters.clone());
+        self.keep_finished(answer.operation, answer.waiters.clone(), &finished);
         Settled {
             finished,
             write,

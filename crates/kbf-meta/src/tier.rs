@@ -2,7 +2,7 @@
 //! each server writes to, and the staged objects, whose only copy is a block file on
 //! one tier until it is flushed to the object store.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use kbf_types::Digest;
@@ -91,13 +91,19 @@ pub enum StagedState {
     Conflict,
 }
 
-/// A staged object: its tier, committed length, state and blob list.
+/// A staged object: its tier, committed length, state and blob list, and the objects
+/// its flush waits for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StagedObject {
     pub(crate) tier: TierId,
     pub(crate) len: u64,
     pub(crate) state: StagedState,
     pub(crate) blobs: BTreeMap<Digest, u64>,
+    /// Objects on the same tier holding a closure blob of an action-cache entry whose
+    /// result blob this object holds, as they were when the entry was written
+    /// ([`Command::PutAction`](crate::Command::PutAction)). Kept while they are staged;
+    /// [`MetaState::flush_waits`](crate::MetaState::flush_waits) answers which still are.
+    pub(crate) after: BTreeSet<ObjectId>,
 }
 
 impl StagedObject {

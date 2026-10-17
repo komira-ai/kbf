@@ -26,5 +26,9 @@ ruzstd.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# The in-memory state store the index tests run on (tests/history/support.rs).
+kbf-state = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true

@@ -19,7 +19,9 @@ use std::time::Duration;
 
 use hooked::Hooked;
 use kbf_map::{MemberId, MemberState};
-use kbf_server::members::{Members, MembershipConfig, MembershipError, PROTOCOL, Registrant};
+use kbf_server::members::{
+    Members, MembershipConfig, MembershipError, PROTOCOL, Progress, Registrant,
+};
 use kbf_server::storage_health::{
     Debts, MemberReport, NotReady, Report, StorageGate, StorageHealth, render, storage_health,
 };
@@ -237,6 +239,7 @@ fn node(i: u32) -> Registrant {
         zone: String::new(),
         weight: 1,
         protocol: PROTOCOL,
+        progress: Progress::CaughtUp,
     }
 }
 
@@ -272,13 +275,13 @@ impl Pair {
 
     fn beat_a(&self, debts: Debts) {
         self.members
-            .heartbeat(self.a.0, self.a.1, debts)
+            .heartbeat(self.a.0, self.a.1, Progress::CaughtUp, debts)
             .expect("a beats");
     }
 
     fn beat_b(&self, debts: Debts) {
         self.members
-            .heartbeat(self.b.0, self.b.1, debts)
+            .heartbeat(self.b.0, self.b.1, Progress::CaughtUp, debts)
             .expect("b beats");
     }
 
@@ -396,7 +399,7 @@ fn a_member_that_registers_again_starts_without_a_report() {
     assert_eq!(health.silent, [pair.a.0]);
 
     pair.members
-        .heartbeat(again.id, again.boot, Debts::Known(0))
+        .heartbeat(again.id, again.boot, Progress::CaughtUp, Debts::Known(0))
         .expect("beats");
     assert_eq!(pair.health().under_replicated_blobs, Some(0));
 }
@@ -410,7 +413,9 @@ fn the_report_of_a_superseded_boot_is_refused() {
     pair.members
         .set_state(pair.a.0, MemberState::Active)
         .expect("promoted");
-    let refused = pair.members.heartbeat(pair.a.0, pair.a.1, Debts::Known(0));
+    let refused = pair
+        .members
+        .heartbeat(pair.a.0, pair.a.1, Progress::CaughtUp, Debts::Known(0));
     assert!(matches!(refused, Err(MembershipError::Superseded { .. })));
     assert_eq!(pair.health().silent, [pair.a.0]);
 }
