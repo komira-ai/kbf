@@ -224,6 +224,13 @@ impl MemoryState {
             .collect()
     }
 
+    /// Takes up the kills `operation` had before, in a scheduler that holds it now.
+    pub(super) fn restore(&mut self, operation: OperationId, runs: Vec<MemoryRun>) {
+        if !runs.is_empty() {
+            self.ops.insert(operation, OpKills { runs });
+        }
+    }
+
     /// Forgets the kills of `operation`, which the scheduler has dropped.
     pub(super) fn forget(&mut self, operation: OperationId) {
         self.ops.remove(&operation);
