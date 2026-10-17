@@ -186,7 +186,10 @@ async fn a_result_waits_for_a_closure_object_the_gate_holds_elsewhere() {
 
     let round = cache.flush_tier(later()).await.expect("round");
     assert_eq!(round.flushed, Vec::<ObjectId>::new(), "{round:?}");
-    assert!(farm.store.put_keys().is_empty(), "no PUT of the result alone");
+    assert!(
+        farm.store.put_keys().is_empty(),
+        "no PUT of the result alone"
+    );
     for object in [entry.output, entry.result] {
         assert_eq!(farm.log.staged_state(object), Some(StagedState::Sealed));
     }
