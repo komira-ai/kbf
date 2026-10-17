@@ -60,31 +60,46 @@ const HEARTBEAT_MS: &str = "100";
 // Processes
 
 /// The `kbf` binary of this build. This crate has no `kbf` binary of its own, so the
-/// first caller builds `kbf-cli`'s (a no-op when it is up to date) in the profile
-/// directory the test binary runs from, and the binary is found next to `deps/`.
+/// first caller builds `kbf-cli`'s (a no-op when it is up to date, in the same target
+/// directory and with the same flags as the test, which cargo hands down in the
+/// environment) and asks cargo where the executable is: the test binary does not run
+/// from a fixed place (a coverage run puts it in a build directory of its own).
 pub fn kbf() -> &'static Path {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
     BIN.get_or_init(|| {
-        let exe = std::env::current_exe().expect("this test binary");
-        let profile = exe
-            .parent()
-            .and_then(Path::parent)
-            .expect("target/<profile>/deps/<test>")
-            .to_owned();
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
         let mut build = Command::new(cargo);
-        build.args(["build", "--locked", "-p", "kbf-cli", "--bin", "kbf"]);
-        if profile.file_name().is_some_and(|name| name == "release") {
+        build.args([
+            "build",
+            "--locked",
+            "-p",
+            "kbf-cli",
+            "--bin",
+            "kbf",
+            "--message-format=json-render-diagnostics",
+        ]);
+        // The profile this test was built with: a test of a release build has no debug
+        // assertions.
+        if !cfg!(debug_assertions) {
             build.arg("--release");
         }
         let built = build
             .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .status()
+            .stderr(Stdio::inherit())
+            .output()
             .expect("run cargo");
-        assert!(built.success(), "cargo build -p kbf-cli: {built}");
-        let bin = profile.join("kbf");
-        assert!(bin.exists(), "no kbf binary at {}", bin.display());
-        bin
+        assert!(
+            built.status.success(),
+            "cargo build -p kbf-cli: {}",
+            built.status
+        );
+        String::from_utf8_lossy(&built.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|message| message["reason"] == "compiler-artifact")
+            .filter(|message| message["target"]["name"] == "kbf")
+            .find_map(|message| message["executable"].as_str().map(PathBuf::from))
+            .expect("cargo named the kbf executable")
     })
 }
 
