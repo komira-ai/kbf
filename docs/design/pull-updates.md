@@ -4,7 +4,12 @@ Status: design; the wire contract (section 5) is frozen, the rest is built in th
 Adapted from the pull-update design study; labels: **[F]** read in code at the time of writing,
 **[D]** a design decision, **[V]** verify before building on it.
 
-Related: [fleet-updates.md](fleet-updates.md) and [fleet-updates-security.md](fleet-updates-security.md) (the
+**Supersession.** [split-mode-updates.md](split-mode-updates.md) is the authority for the **order of a rollout, the per-host
+step, the idle and parallelism policy, and the frontend's own update**. It supersedes section 1 items 5 and 7 and section 8
+items 1, 2, 5 and 6 of this document, which are rewritten below to match. This document remains the authority for the wire
+(section 5), the release store and desired-release rows (section 6), the host (section 7) and trust (section 2).
+
+Related: [split-mode-updates.md](split-mode-updates.md) (the sequence), [fleet-updates.md](fleet-updates.md) and [fleet-updates-security.md](fleet-updates-security.md) (the
 earlier push-shaped design this one cuts down), [architecture-v2.md](architecture-v2.md) (sections 4 and 11: the
 state store, protocol skew, upgrade order), [worker-protocol.md](worker-protocol.md), [../api.md](../api.md).
 
@@ -19,12 +24,16 @@ state store, protocol skew, upgrade order), [worker-protocol.md](worker-protocol
    (`ReleaseService.Fetch`), drops it in an inbox directory, and reports `staged`.
 4. A small root helper (no socket, no network) **verifies the build attestation offline** with a pinned `gh` and a
    pinned trusted root, and installs into a new versioned directory. It never overwrites a running binary.
-5. The **frontend alone orders** the rollout: it cordons a host, waits for zero leases (and, on storage nodes, for
-   `under_replicated_blobs == 0`), then sends `UpdateOrder{ACTIVATE}`. The helper flips `current` and restarts.
+5. The **frontend alone orders** the rollout: for a host that is idle or drained it runs the per-host step of
+   split-mode-updates.md 2.6 (cordon, wait for zero leases, on storage nodes mark the member planned-down, wait for
+   write sessions and for the repair gate), then sends `UpdateOrder{ACTIVATE}`. The helper flips `current` and restarts.
 6. The new process registers; the frontend checks health and sends `UpdateOrder{CONFIRM}`. If confirmation does
    not arrive in the window, or the unit crash-loops, the helper reverts locally (commit-confirm).
-7. Order: canary host, storage-and-daemon nodes one at a time, other Linux daemon hosts, the Macs, the frontend last
-   through its own drain.
+7. Order: **nodes update asynchronously, in any order, when idle or drained** (at most one storage node at a time;
+   daemon-only hosts in parallel; a busy Mac is deferred). On an upgrade **the frontend goes first, and only through
+   Envoy**: the new instance starts on the other port, Envoy routes new connections to it, and the old one drains and
+   keeps its in-flight `Execute` streams until they complete. The rollout never waits for `open_executions == 0` and never
+   restarts the serving frontend. Details: split-mode-updates.md 2.5, 2.6 and 3.3.
 8. Rollback is setting the desired release back: a **higher generation** naming an older commit. The old
    directory is still on disk, so nothing is downloaded.
 9. Only the unprivileged `kbf` binary is ever pulled. The helper, unit files, sudoers entry and the pinned trust
@@ -59,9 +68,13 @@ Residuals, stated plainly:
 - **`main` has no branch protection.** Anyone who can push to it gets an attested build, and so a binary every
   host accepts when the frontend offers it. The attestation proves *where a binary was built*, not *that a
   reviewer approved the source*.
-- **A hostile frontend can offer any older attested build.** There is no downgrade floor in the MVP; the
-  generation only orders offers within one frontend. A rollback to an older commit is deliberately possible, so
-  the host cannot refuse "older" without an operator-set floor.
+- **A hostile frontend can offer any older attested build.** Downgrades are allowed on purpose: a rollback is the
+  desired release set to an older commit. The guard is the **desired-state generation**, not a serial floor: a host
+  acts on the highest generation it has seen, a higher generation always wins, and an order carries the store epoch so
+  a restored store cannot replay one. A host therefore cannot refuse "older" without an operator-set floor, which is
+  deferred.
+- **Test-farm switch.** The held installer for the test farm temporarily runs with attestation verification off (to be
+  added back). That is a test-farm setting only; no deployed default and no part of this contract.
 - **The binary holds credentials.** On a storage-and-daemon host the `kbf` process holds the cold-store
   credential, so the set of commits that can be attested is the set of programs that can read it.
 - **The design's separate Ed25519 release key is deferred.** A release key held off CI and off the shared session
@@ -178,7 +191,14 @@ saying which is missing; nothing answers an empty 200.
 | `update/release/<commit>/<platform>/<name>` | the component: `sha256`, `size`, and the attestation once uploaded |
 | `update/desired` | the desired release: `generation`, `commit`, `set_at` |
 | `update/generation` | the counter (C3) the generations come from |
-| `update/auto` | the auto-update rule `{enabled}` |
+| `update/slot` | the rollout slot `{holder, order_id, epoch, state}`; no time to live (section 8) |
+| `update/host/<id>` | the controller's per-host phase `{phase, order_id, generation, since}`: what a restarted controller resumes from (split-mode-updates.md 2.6) |
+| `update/policy` | `{auto_nodes, auto_frontend, idle_wait, min_serving, mac_force_after, new_work_only_to_updated, accept_failing_builds}`; replaces the older `update/auto {enabled}`, whose flag is `auto_nodes` |
+
+**The disk index is the source of truth for bytes.** The release store on disk (`files/<sha256>` and
+`index/<commit>/<platform>/<name>`, with attestation bundles) is authoritative for what the frontend can serve. The
+`update/release/...` rows are metadata over it (digest, size, attestation present); a lost or stale row is rebuilt from
+the disk index, never the reverse. The desired release, the slot, the per-host phase rows and the policy are state-store rows.
 
 ### 6.3 Operator API (writes need the existing token gate)
 
@@ -191,7 +211,7 @@ saying which is missing; nothing answers an empty 200.
 - `GET /v1/releases`: commits with, per platform, which components are present and whether the platform is complete.
 - `POST /v1/update/desired {commit}`: the commit needs at least one complete platform (else 409). Compare-and-set
   on `update/desired`; the counter gives the new generation only when the commit differs from the current one.
-- `GET /v1/update`: `{desired, auto_update, releases}`. `POST /v1/update/auto {enabled}` stores the rule.
+- `GET /v1/update`: `{desired, auto_update, releases}`. `POST /v1/update/auto {enabled}` sets `update/policy.auto_nodes`; the other policy fields are set through `POST /v1/update/policy` (admin).
 - `GET /v1/nodes` gains, per node, an `update` object: state, the three commits, offered generation, refusal,
   `helper_present`, `up_to_date` (true, false or null) and `availability` (`ok`, `unavailable`, `unsupported`).
 
@@ -235,27 +255,29 @@ The frontend alone decides order. It holds one **update slot** in the state stor
 time to live: if the holder dies the slot stays held and the run goes `held`; a broken host never lets a second one
 start).
 
-1. **Order**: canary host, then storage-and-daemon nodes one at a time, then the other Linux daemon hosts, the
-   Macs, the frontend last.
-2. **Per host**: cordon (no new leases), wait for zero leases (a storage node also waits for
-   `under_replicated_blobs == 0` and for reads to be served by the other owner), send `UpdateOrder{ACTIVATE}`,
-   check health (registered at the target commit, serving, storage repaired), send `UpdateOrder{CONFIRM}`,
-   uncordon, next host.
+1. **Order.** Nodes update asynchronously, in any order, each when it is idle or drained, driven by the frontend; every pair
+   of versions in the farm is within N/N-1, so order does not matter for correctness. At most one storage-and-daemon node
+   is in a step at a time (R=2); daemon-only hosts may be in a step in parallel up to the capacity floor `min_serving`; a busy
+   Mac is deferred, not killed. On an **upgrade the frontend goes first**; on a **downgrade across a protocol difference the
+   nodes go first**, so no node ever dials a frontend that does not accept it; if no order keeps every host inside the
+   frontend's accepted `[min_protocol, protocol]` the planner refuses it as a flag day (split-mode-updates.md 3.3).
+2. **Per host** (split-mode-updates.md 2.6, which is the authority): selection when idle, or the least-loaded candidate after
+   `idle_wait`; cordon; wait for zero leases; on a storage node mark the member planned-down and wait for in-flight write
+   sessions to reach zero; re-check the storage gate (every other member `Active`, aggregate repair debt zero); send
+   `UpdateOrder{ACTIVATE}`; wait for registration, `Active` and repaired; send `UpdateOrder{CONFIRM}`; uncordon.
 3. **Failure**: an error after the swap rolls back, never retries. A host reverted by its own timer reports
    `REVERTED`; the run goes `held` and stays held until a person acts.
 4. **Pause** stops granting between hosts, never mid-host. **Rollback** is setting the desired release to the older
-   commit (same gates, same order, no download).
-5. **Protocol skew** (architecture-v2 section 11): the planner takes the frontend's position from the release's
-   `protocol` and `min_protocol`, as `kbf --version --json` declares them: frontend last when the new protocol is
-   not above the frontend's; frontend first when it is, provided the new `min_protocol` admits the oldest running
-   daemon; otherwise it refuses and says it is a flag day. A release with a `state_schema` above the frontend's
-   goes daemons-first.
-6. **The frontend updates itself last**: stage as on any host, wait for an idle window (`open_executions == 0`),
-   activate, then drain (`POST /v1/frontend/drain`): new Executes are refused, open ones finish, the process exits
-   0 and systemd restarts it into the new binary. With socket activation (`LISTEN_FDS`) the listening sockets
-   survive the restart, daemons keep running their actions, the SQLite state store keeps the queue and leases, and
-   daemons reconnect and re-bind their leases. If `/readyz` is not true in the window, the helper reverts.
-   Zero-impact frontend updates need two frontends on a shared database and are later.
+   commit (a higher generation; same gates, same mechanism, no download).
+5. **Protocol skew and state schema**: split-mode-updates.md 3.3 (order rule) and 3.4 (the state-store schema is
+   expand-then-contract; a contract change is refused by the planner and takes the cold path).
+6. **The frontend updates only through Envoy.** The helper on the frontend host installs the release and flips `current`
+   without restarting the serving instance, then starts the other instance of `kbf-frontend@{a,b}` on its own ports. The new
+   process takes the state-store writer baton from the old one over the control socket (#879's protocol without the
+   passed sockets), Envoy routes new connections to it, and the old instance fails its health check, sends GOAWAY, answers its
+   open `Execute` and `WaitExecution` streams from the `done/` rows, and exits when they end. The rollout **never waits for
+   `open_executions == 0` and never restarts the serving frontend**; the confirm window starts when the new instance is
+   serving. Steps E0 to E9, the writer options and the failure matrix are split-mode-updates.md 2.5 and 2.9.
 
 ## 9. The fleet view
 
@@ -291,7 +313,7 @@ Each safety property has a planted mutant that turns its test red.
 | node client | fetch, inbox, status reporting, refuse with live leases, relay of orders |
 | installer core | versioned directories, offline attestation check, commit-confirm, revert, retention |
 | release source | the frontend's read-only poll of GitHub for the newest attested `main` artifacts |
-| rollout controller | the slot, the order, the gates, resume, pause, frontend self-update |
+| rollout controller | the slot, the per-host step, the gates, resume, pause, the frontend switch through Envoy (split-mode-updates.md) |
 | fleet view | the UI page and the auto-update rule |
 | bootstrap and rehearsal | the host-side scripts a human runs once per host; rehearsal on development nodes |
 
@@ -301,6 +323,6 @@ Each safety property has a planted mutant that turns its test red.
 - Sigstore verification beyond the attested-`main` rule (a protected `main`, required reviews).
 - A frontend-signed grant on each order, closing the early-order gap of an inbox writer under the native driver.
 - Maintenance windows, percentage waves, tracks beyond canary plus stable.
-- Two frontends on a shared database (zero-impact frontend update).
+- Several frontends on a shared database (Postgres). A zero-impact update of one frontend does not need it: it is the Envoy switch of section 8.
 - OS, Xcode, VM-image and MDM updates ([fleet-updates.md](fleet-updates.md) owns those).
 - Updating the helper, the units, the sudoers entry and the pinned trust material: manual by design.
