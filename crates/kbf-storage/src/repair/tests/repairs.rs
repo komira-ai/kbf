@@ -9,6 +9,7 @@ use kbf_store::{FaultFile, FaultFs, Fs, FsFile};
 use super::{digest, record};
 use crate::StorageError;
 use crate::repair::{NoLedger, Options, RepairLedger, Repairs};
+use crate::service::tests::fake::Mem;
 
 /// A [`FaultFs`] whose files panic when they are appended to, once armed: the failure of a
 /// blocking call that a journal error does not describe.
@@ -120,7 +121,9 @@ async fn a_panic_in_the_journal_fails_the_call_and_loses_no_debt() {
         "{answer:?}"
     );
     assert_eq!(repairs.open_records(), [record(1)]);
-    let answer = repairs.settle_evicted(&digest(1), repairs.begun()).await;
+    let answer = repairs
+        .settle_evicted(&digest(1), repairs.begun(), &Mem::default())
+        .await;
     assert!(
         matches!(answer, Err(StorageError::Internal(_))),
         "{answer:?}"
@@ -144,6 +147,7 @@ async fn the_ledger_that_tells_no_one_returns_at_once() {
 /// count of a digest's writes dropped to zero by the first.
 #[tokio::test]
 async fn an_evicted_debt_is_dropped_only_when_no_write_is_in_its_window() {
+    let store = Mem::default();
     let repairs =
         Repairs::open(FaultFs::new(), Options::default(), Arc::new(NoLedger)).expect("open");
     let first = repairs.owe(record(1)).await.expect("owed");
@@ -152,7 +156,7 @@ async fn an_evicted_debt_is_dropped_only_when_no_write_is_in_its_window() {
     let begun = repairs.begun();
     assert!(
         !repairs
-            .settle_evicted(&digest(1), begun)
+            .settle_evicted(&digest(1), begun, &store)
             .await
             .expect("asked")
     );
@@ -163,7 +167,7 @@ async fn an_evicted_debt_is_dropped_only_when_no_write_is_in_its_window() {
     );
     assert!(
         !repairs
-            .settle_evicted(&digest(1), begun)
+            .settle_evicted(&digest(1), begun, &store)
             .await
             .expect("asked")
     );
@@ -176,14 +180,14 @@ async fn an_evicted_debt_is_dropped_only_when_no_write_is_in_its_window() {
     drop(other);
     assert!(
         !repairs
-            .settle_evicted(&digest(1), begun)
+            .settle_evicted(&digest(1), begun, &store)
             .await
             .expect("asked")
     );
     let begun = repairs.begun();
     assert!(
         repairs
-            .settle_evicted(&digest(1), begun)
+            .settle_evicted(&digest(1), begun, &store)
             .await
             .expect("asked")
     );
@@ -237,10 +241,55 @@ async fn an_evicted_debt_whose_settling_cannot_be_written_stays_owed() {
     let repairs = Repairs::open(fs.clone(), Options::default(), Arc::new(NoLedger)).expect("open");
     drop(repairs.owe(record(1)).await.expect("owed"));
     fs.fail_at(fs.ops(), kbf_store::Fault::Error);
-    let answer = repairs.settle_evicted(&digest(1), repairs.begun()).await;
+    let answer = repairs
+        .settle_evicted(&digest(1), repairs.begun(), &Mem::default())
+        .await;
     assert!(
         matches!(answer, Err(StorageError::Unavailable(_))),
         "{answer:?}"
     );
     assert_eq!(repairs.open_records(), [record(1)]);
+}
+
+/// Catches a debt dropped for a blob the store holds (a write committed after the worker
+/// read it absent), and one dropped when the store could not say: with the blob held, or the
+/// store failing, `settle_evicted` leaves the debt; with the blob absent it drops it.
+/// Mutants: the store not asked; its error read as "absent".
+#[tokio::test]
+async fn an_evicted_debt_stays_while_the_store_holds_the_blob_or_cannot_say() {
+    let repairs =
+        Repairs::open(FaultFs::new(), Options::default(), Arc::new(NoLedger)).expect("open");
+    drop(repairs.owe(record(1)).await.expect("owed"));
+    let store = Mem::default();
+    store
+        .blobs
+        .lock()
+        .expect("lock")
+        .insert(digest(1), bytes::Bytes::from_static(b"held"));
+    let begun = repairs.begun();
+    assert!(
+        !repairs
+            .settle_evicted(&digest(1), begun, &store)
+            .await
+            .expect("asked")
+    );
+    assert_eq!(repairs.open_records(), [record(1)]);
+
+    *store.fail.lock().expect("lock") = Some(StorageError::Internal("the store".into()));
+    let answer = repairs.settle_evicted(&digest(1), begun, &store).await;
+    assert!(
+        matches!(answer, Err(StorageError::Internal(_))),
+        "{answer:?}"
+    );
+    assert_eq!(repairs.open_records(), [record(1)]);
+
+    store.fail.lock().expect("lock").take();
+    store.blobs.lock().expect("lock").clear();
+    assert!(
+        repairs
+            .settle_evicted(&digest(1), begun, &store)
+            .await
+            .expect("asked")
+    );
+    assert!(repairs.open_records().is_empty());
 }
