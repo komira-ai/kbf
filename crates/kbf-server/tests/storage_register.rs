@@ -20,7 +20,8 @@ use kbf_server::members::{Members, MembershipConfig};
 use kbf_server::storage_node::{StorageFlags, command, parse, start_storage};
 use kbf_server::{EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_state};
 use kbf_state::{Store, Versioned};
-use kbf_storage::service::{CatchUp, ROLE_URI_PREFIX};
+use kbf_storage::Storage as _;
+use kbf_storage::service::{CatchUp, ROLE_URI_PREFIX, RemoteStorage};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, SanType,
@@ -359,7 +360,10 @@ async fn the_registration_flags_are_carried_or_refused() {
         );
     }
     let alone = flags(&d, &[]).expect("flags");
-    let none = alone.joiner("127.0.0.1:1".parse().expect("addr"));
+    let none = alone.joiner(
+        "127.0.0.1:1".parse().expect("addr"),
+        Arc::new(kbf_mapsync::MapHolder::new()),
+    );
     assert!(
         none.expect("no error").is_none(),
         "no --frontend, no registration"
@@ -553,4 +557,222 @@ async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
     node_serving.abort();
     drop(stop);
     serving.await.expect("joins").expect("stops");
+}
+
+/// A node started with `--frontend` that the frontend cannot yet admit (its store fails),
+/// listening, and a client of its storage service.
+async fn waiting_node(
+    f: &Frontend,
+    name: &str,
+) -> (kbf_server::storage_node::StorageHandle, RemoteStorage) {
+    let url = format!("--frontend=http://{}", f.worker);
+    let node = start_storage(&flags(&dir(name), &[url]).expect("flags"), never)
+        .await
+        .expect("starts");
+    let channel = Endpoint::from_shared(format!("http://{}", node.addr))
+        .expect("endpoint")
+        .connect_lazy();
+    (node, RemoteStorage::new(channel, 0))
+}
+
+/// Catches: a node in a multi-member farm that serves before it knows the farm. While the
+/// frontend cannot admit it (its store fails, so there is no map) every kind of call is
+/// refused UNAVAILABLE "no storage map yet", not answered as an empty cache (a
+/// FindMissing that says every blob is missing, a write taken that the map places
+/// elsewhere); once the registration lands the same calls are served. Mutant: a gate that
+/// lets every call through.
+#[tokio::test]
+async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
+    let f = frontend(None);
+    f.store
+        .fail_gets
+        .store(1_000_000, std::sync::atomic::Ordering::SeqCst);
+    let (node, client) = waiting_node(&f, "gate").await;
+    let maps = node.maps();
+    let _serving = tokio::spawn(node.serve());
+    // The node's directory outlives the run: a blob no earlier run stored.
+    let blob = format!(
+        "a blob of run {} at {:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+    )
+    .into_bytes();
+    let digest = kbf_segments::sha256(&blob);
+
+    let refused = |error: kbf_storage::StorageError| {
+        let status = tonic::Status::from(error);
+        (
+            status.code(),
+            status.message().contains(kbf_server::NO_MAP_YET),
+        )
+    };
+    let want = (Code::Unavailable, true);
+    assert_eq!(
+        refused(client.find_missing(&[digest]).await.expect_err("refused")),
+        want
+    );
+    assert_eq!(
+        refused(client.read_blob(&digest).await.expect_err("refused")),
+        want
+    );
+    assert_eq!(
+        refused(
+            client
+                .put(bytes::Bytes::from(blob.clone()))
+                .await
+                .expect_err("refused")
+        ),
+        want
+    );
+    assert_eq!(maps.generation(), 0, "the node has no map");
+
+    f.store
+        .fail_gets
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    until("the node to hold a map", || {
+        (maps.generation() > 0).then_some(())
+    })
+    .await;
+    assert_eq!(
+        client.find_missing(&[digest]).await.expect("served"),
+        [digest]
+    );
+    client
+        .put(bytes::Bytes::from(blob.clone()))
+        .await
+        .expect("a write is taken");
+    assert!(
+        client
+            .find_missing(&[digest])
+            .await
+            .expect("served")
+            .is_empty()
+    );
+}
+
+/// Catches: a node that keeps the map it registered with and never learns a bump (a second
+/// member joining), or whose heartbeat says it holds a map it does not: the frontend
+/// sends the map only to a node that is behind, so a node that did not take it is stuck
+/// for ever. The node holds generation 1 from its registration; a second registrant
+/// makes generation 2, and the node's own next heartbeat brings it. Mutant: a joiner that
+/// ignores the map in a heartbeat's answer.
+#[tokio::test]
+async fn a_heartbeat_brings_a_node_the_map_it_missed() {
+    let f = frontend(None);
+    let url = format!("--frontend=http://{}", f.worker);
+    let node = start_storage(&flags(&dir("beat-map"), &[url]).expect("flags"), never)
+        .await
+        .expect("starts");
+    let maps = node.maps();
+    let _serving = tokio::spawn(node.serve());
+    until("the node to hold its first map", || {
+        maps.current().filter(|m| m.members().len() == 1)
+    })
+    .await;
+    assert_eq!(maps.generation(), 1);
+
+    f.members
+        .register(&kbf_server::members::Registrant {
+            instance_id: "second".to_owned(),
+            addr: "192.0.2.8:8982".to_owned(),
+            zone: String::new(),
+            weight: 1,
+            protocol: kbf_server::members::PROTOCOL,
+            progress: kbf_server::members::Progress::CaughtUp,
+        })
+        .expect("a second member");
+    let learned = until("a heartbeat to bring the new map", || {
+        maps.current().filter(|m| m.members().len() == 2)
+    })
+    .await;
+    assert_eq!(learned.generation(), 2);
+}
+
+/// A membership service that answers every call with the map it holds (a garbled one, or a valid one).
+struct Garbled(pb::Map);
+
+#[tonic::async_trait]
+impl kbf_proto::kbf::map::v1::membership_server::Membership for Garbled {
+    async fn register(
+        &self,
+        _: tonic::Request<pb::RegisterRequest>,
+    ) -> Result<tonic::Response<pb::RegisterResponse>, tonic::Status> {
+        Ok(tonic::Response::new(pb::RegisterResponse {
+            member_id: 1,
+            boot: 1,
+            heartbeat_interval_ms: 1,
+            map: Some(self.0.clone()),
+        }))
+    }
+
+    async fn heartbeat(
+        &self,
+        _: tonic::Request<pb::HeartbeatRequest>,
+    ) -> Result<tonic::Response<pb::HeartbeatResponse>, tonic::Status> {
+        Ok(tonic::Response::new(pb::HeartbeatResponse {
+            map_generation: 9,
+            map: Some(self.0.clone()),
+        }))
+    }
+}
+
+/// Catches: a node that dies, or takes a map of generation 0 as one, when a frontend sends
+/// one it cannot read: it is ignored (the node stays without a map, and so, gated, without
+/// service) whether it came with the registration or with a heartbeat.
+#[tokio::test]
+async fn a_map_the_node_cannot_read_is_ignored() {
+    let maps = joined_by(pb::Map::default()).await;
+    assert!(maps.current().is_none());
+    assert_eq!(maps.generation(), 0);
+}
+
+/// Catches: a node that goes back to an older map, or takes the same one again as news:
+/// the frontend's answer to the registration and to the heartbeat that follows is the same
+/// map of generation 4; the node holds it once, and nothing it held before is "replaced".
+#[tokio::test]
+async fn a_map_that_is_not_newer_changes_nothing() {
+    let member = kbf_map::Member {
+        id: MemberId(1),
+        addr: "192.0.2.5:1".to_owned(),
+        zone: String::new(),
+        weight: 1,
+        state: MemberState::Active,
+    };
+    let map = kbf_map::Map::new(4, vec![member], kbf_map::Rule::Rendezvous, 1, 1, Vec::new())
+        .expect("a map");
+    let maps = joined_by(pb::Map::from(&map)).await;
+    assert_eq!(maps.generation(), 4);
+    assert!(
+        maps.previous().is_none(),
+        "the second copy replaced nothing"
+    );
+}
+
+/// A node that registers and beats once with a frontend that answers with `map` both
+/// times; the maps it holds after.
+async fn joined_by(map: pb::Map) -> Arc<kbf_mapsync::MapHolder> {
+    let incoming =
+        tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = incoming.local_addr().expect("address");
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(
+                kbf_proto::kbf::map::v1::membership_server::MembershipServer::new(Garbled(map)),
+            )
+            .serve_with_incoming(incoming),
+    );
+    let channel = Endpoint::from_shared(format!("http://{addr}"))
+        .expect("endpoint")
+        .connect_lazy();
+    let who = NodeIdentity {
+        instance_id: "n".to_owned(),
+        addr: "192.0.2.5:1".to_owned(),
+        zone: String::new(),
+        weight: 1,
+    };
+    let maps = Arc::new(kbf_mapsync::MapHolder::new());
+    let mut joiner = Joiner::new(channel, who, MS).with_maps(Arc::clone(&maps));
+    let joined = joiner.register().await.expect("registers");
+    assert_eq!(joiner.beat(&joined).await.expect("beats"), 9);
+    maps
 }

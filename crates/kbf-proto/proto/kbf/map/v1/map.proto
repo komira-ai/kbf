@@ -117,12 +117,18 @@ message RegisterResponse {
 message HeartbeatRequest {
   uint64 member_id = 1;
   uint64 boot = 2;
+  // The generation of the map the node holds (0: none). Absent from an older node, which
+  // reads as 0 and is sent the map every beat.
+  uint64 have_generation = 3;
   // Whether the node is still rebuilding its index. A member that is CATCHING_UP becomes
   // ACTIVE at the first heartbeat that says false; no other state is changed by it.
-  bool catching_up = 3;
+  bool catching_up = 4;
 }
 
 message HeartbeatResponse {
   // The generation of the current map.
   uint64 map_generation = 1;
+  // The current map, when its generation is above the request's have_generation: a node
+  // that missed a bump learns it from its next beat, with no other call.
+  Map map = 2;
 }

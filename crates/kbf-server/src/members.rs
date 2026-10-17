@@ -44,12 +44,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kbf_map::{Map, MapError, Member, MemberId, MemberState, Rule};
+use kbf_mapsync::MapSource;
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_state::{Cond, Store, StoreError, Txn, Version, Versioned};
 use prost::Message as _;
 use tokio::sync::watch;
-
-use crate::map_feed::MapFeed;
 
 const MAP_KEY: &str = "map";
 const MEMBERS: &str = "member/";
@@ -326,7 +325,7 @@ pub struct Members {
     config: MembershipConfig,
     /// The newest map this process has seen, whoever bumped it.
     latest: Mutex<Option<Arc<Map>>>,
-    /// Its generation (0 before any): [`MapFeed::changes`].
+    /// Its generation (0 before any): [`MapSource::changes`].
     generation: watch::Sender<u64>,
 }
 
@@ -343,7 +342,7 @@ impl Members {
     }
 
     /// Notes `map` as seen: if it is newer than the last, keeps it and wakes the
-    /// [`MapFeed::changes`] receivers.
+    /// [`MapSource::changes`] receivers.
     fn publish(&self, map: &Map) {
         let mut latest = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
         if latest
@@ -355,19 +354,18 @@ impl Members {
         }
     }
 
-    /// The map the push protocol reads: its current value and a receiver of its
-    /// generation, which changes on every bump this process commits or observes (a
-    /// bump by another frontend is seen at the next [`Members::refresh`], which the
-    /// frontend runs every beat).
+    /// The map the push protocol reads: its current value (`None` until the first member
+    /// registers) and a receiver of its generation, which changes on every bump this
+    /// process commits or observes (a bump by another frontend is seen at the next
+    /// [`Members::refresh`], which the frontend runs every beat). Seeded from the store,
+    /// so a restarted frontend has the map its members left.
     ///
     /// # Errors
-    /// [`MembershipError::NoMap`] before the first member has registered: there is no
-    /// map to hand out; the store failing.
-    pub fn map_feed(self: &Arc<Self>) -> Result<Arc<dyn MapFeed>, MembershipError> {
-        let seed = self.current_map()?.ok_or(MembershipError::NoMap)?;
+    /// The store failing.
+    pub fn map_source(self: &Arc<Self>) -> Result<Arc<dyn MapSource>, MembershipError> {
+        self.current_map()?;
         Ok(Arc::new(MemberMap {
             members: Arc::clone(self),
-            seed: Arc::new(seed),
         }))
     }
 
@@ -616,23 +614,18 @@ fn decode_id(value: &[u8]) -> Result<u64, MembershipError> {
         .map_err(|_| MembershipError::Corrupt("instance entry is not a member id".to_owned()))
 }
 
-/// [`Members`] as a [`MapFeed`].
+/// [`Members`] as a [`MapSource`].
 struct MemberMap {
     members: Arc<Members>,
-    /// The map there was when the source was made; the answer until a newer one is seen.
-    seed: Arc<Map>,
 }
 
-impl MapFeed for MemberMap {
-    fn current(&self) -> Arc<Map> {
-        let latest = self
-            .members
+impl MapSource for MemberMap {
+    fn current(&self) -> Option<Arc<Map>> {
+        self.members
             .latest
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        // `map_feed` published the seed, so `latest` is set; the seed is the answer if it
-        // were not. An `Arc` clone is cheap, so no closure holds a line no test reaches.
-        latest.clone().unwrap_or(Arc::clone(&self.seed))
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn changes(&self) -> watch::Receiver<u64> {
