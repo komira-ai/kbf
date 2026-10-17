@@ -22,6 +22,15 @@
 //!   answers ([`Router::read_blob`]).
 //! - **FindMissing** ([`Router::find_missing`]) asks each digest's primary only, one call
 //!   per primary, and puts the answers back in the order asked.
+//! - **The closure check** (inside [`Router::action_result`]): the node that holds an
+//!   action-cache entry reports its closure with it. The entry is served only if every
+//!   blob of the closure is held by one of the blob's owners: each primary is asked in
+//!   one FindMissing (batched at the node's limit), and what a primary lacks is asked of
+//!   the replica. A blob gone from every owner makes the entry a miss, so the action runs
+//!   again. A node that reports no closure (one from before the field) is served as
+//!   before, unchecked. What was verified is remembered per blob and owner for a time
+//!   ([`DEFAULT_CLOSURE_TTL`]), and forgotten when the map's generation changes
+//!   ([`Router::with_closure_cache`], [`Router::closure_stats`]).
 //! - **Writes** ([`Router::put`], [`Router::commit_action_record`]) go to the first
 //!   write owner that is not `Down` in the map, and to that one alone while it answers
 //!   (the storage side's chain replication is av2-11). An owner that **cannot be
@@ -55,6 +64,7 @@
 //! [`Liveness`] it is given (ten seconds to dial, pings every ten seconds by default), so
 //! a read fails over to the next owner instead of waiting for the operating system.
 
+mod closure;
 mod find;
 mod flights;
 mod nodes;
@@ -66,6 +76,7 @@ mod sink;
 mod source;
 mod write;
 
+pub use closure::{ClosureStats, DEFAULT_CLOSURE_ENTRIES, DEFAULT_CLOSURE_TTL};
 pub use nodes::{Liveness, Nodes, TlsNodes};
 pub use repair::{ReadRepair, RepairLimit};
 pub use resume::MAX_RESUMES;

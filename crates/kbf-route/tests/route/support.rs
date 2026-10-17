@@ -17,7 +17,7 @@ use kbf_proto::worker::{
     PutRangeRequest, PutRangeResponse, ReadRangeRequest, ReadRangeResponse,
 };
 use kbf_route::{MapSource, MapView, Nodes, ReadRepair, RefetchError, Router};
-use kbf_storage::{Answer, PutStream, ReadStream, Storage, StorageError};
+use kbf_storage::{ActionEntry, Answer, PutStream, ReadStream, Storage, StorageError};
 use kbf_types::Digest;
 use tonic::{Request, Response, Status};
 
@@ -249,7 +249,12 @@ impl Node {
 
     /// Holds an entry for `action` that names `closure`, as a node that reports the
     /// closure answers it ([`Node::hold_action`] holds one that does not).
-    pub fn hold_action_with_closure(&self, action: Digest, result_blob: Digest, closure: &[Digest]) {
+    pub fn hold_action_with_closure(
+        &self,
+        action: Digest,
+        result_blob: Digest,
+        closure: &[Digest],
+    ) {
         self.hold_action(action, result_blob);
         self.closures
             .lock()
@@ -482,6 +487,17 @@ impl Storage for Node {
             self.action_gets.fetch_add(1, Ordering::SeqCst);
             self.check()?;
             Ok(self.actions.lock().expect("lock").get(action).cloned())
+        })
+    }
+
+    fn action_entry<'a>(&'a self, action: &'a Digest) -> Answer<'a, Option<ActionEntry>> {
+        Box::pin(async move {
+            let found = self.action_result(action).await?;
+            Ok(found.map(|(result_digest, result)| ActionEntry {
+                result_digest,
+                result,
+                closure: self.closures.lock().expect("lock").get(action).cloned(),
+            }))
         })
     }
 

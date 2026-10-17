@@ -8,6 +8,7 @@ use kbf_storage::StorageError;
 use kbf_types::Digest;
 use tokio::sync::Semaphore;
 
+use crate::closure::{DEFAULT_CLOSURE_ENTRIES, DEFAULT_CLOSURE_TTL, Verified};
 use crate::flights::Flights;
 use crate::nodes::Nodes;
 use crate::repair::{Limiter, ReadRepair, RepairLimit};
@@ -34,6 +35,8 @@ pub struct Router {
     /// KiB, shared by every clone.
     pub(crate) copying: Arc<Semaphore>,
     pub(crate) copy_kib: u32,
+    /// The blobs a closure check found held, shared by every clone.
+    pub(crate) verified: Arc<Verified>,
 }
 
 /// The read-repair hook and its limit.
@@ -73,6 +76,7 @@ impl Router {
             flights: Arc::default(),
             copying: Arc::new(Semaphore::new(DEFAULT_COPY_KIB as usize)),
             copy_kib: DEFAULT_COPY_KIB,
+            verified: Arc::new(Verified::new(DEFAULT_CLOSURE_ENTRIES, DEFAULT_CLOSURE_TTL)),
         }
     }
 

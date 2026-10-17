@@ -21,8 +21,8 @@ use kbf_proto::google::bytestream::{
 use kbf_proto::reapi::{self, ActionResult};
 use kbf_proto::storage::action_store_server::{ActionStore, ActionStoreServer};
 use kbf_proto::storage::{
-    CommitRequest, CommitResponse, Entry, GetRequest, GetResponse, PrepareRequest, PrepareResponse,
-    Record, prepare_response,
+    ClosureDigests, CommitRequest, CommitResponse, Entry, GetRequest, GetResponse, PrepareRequest,
+    PrepareResponse, Record, prepare_response,
 };
 use kbf_proto::worker::segments_server::Segments;
 use kbf_proto::worker::{
@@ -37,7 +37,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::replicate::MapSource;
 use crate::service::{Admission, Config, MAP_GENERATION_HEADER, RemoteStorage, StorageService};
-use crate::{Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError};
+use crate::{ActionEntry, Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError};
 
 /// The digest of `bytes`.
 pub(crate) fn sha(bytes: &[u8]) -> Digest {
@@ -55,6 +55,8 @@ pub(crate) fn patterned(len: usize) -> Vec<u8> {
 pub(crate) struct Mem {
     pub blobs: Arc<Mutex<BTreeMap<Digest, Bytes>>>,
     pub actions: Mutex<BTreeMap<Digest, (Digest, ActionResult)>>,
+    /// An entry is answered without its closure, as a node from before the field does.
+    pub legacy_actions: AtomicBool,
     /// Every call fails with this.
     pub fail: Mutex<Option<StorageError>>,
     /// A read fails with this after its first chunk.
@@ -238,6 +240,26 @@ impl Storage for Mem {
         Box::pin(async move {
             self.failing()?;
             Ok(self.actions.lock().expect("lock").get(action).cloned())
+        })
+    }
+
+    /// The entry, with the closure `prepare_action_result` made for it (its exit code names
+    /// how many blobs); none for a [`Mem`] told to answer as an older node does.
+    fn action_entry<'a>(&'a self, action: &'a Digest) -> Answer<'a, Option<ActionEntry>> {
+        Box::pin(async move {
+            let Some((result_digest, result)) = self.action_result(action).await? else {
+                return Ok(None);
+            };
+            let closure = (!self.legacy_actions.load(Ordering::SeqCst)).then(|| {
+                (0..result.exit_code)
+                    .map(|i| sha(&[i as u8]))
+                    .collect::<Vec<_>>()
+            });
+            Ok(Some(ActionEntry {
+                result_digest,
+                result,
+                closure,
+            }))
         })
     }
 
@@ -706,17 +728,30 @@ impl ByteStream for Odd {
 impl ActionStore for Odd {
     /// An entry whose result digest is not a digest.
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+        let request = request.into_inner();
         self.generations
             .lock()
             .expect("lock")
-            .push(request.into_inner().map_generation);
+            .push(request.map_generation);
+        // An action of two bytes gets a good result digest and a closure that is not.
+        let wrong_closure = request.action.is_some_and(|a| a.size_bytes == 2);
         Ok(Response::new(GetResponse {
             entry: Some(Entry {
                 result_digest: Some(reapi::Digest {
-                    hash: "nope".to_owned(),
+                    hash: if wrong_closure {
+                        "ab".repeat(32)
+                    } else {
+                        "nope".to_owned()
+                    },
                     size_bytes: 1,
                 }),
                 result: None,
+                closure: wrong_closure.then(|| ClosureDigests {
+                    digests: vec![reapi::Digest {
+                        hash: "nope".to_owned(),
+                        size_bytes: 1,
+                    }],
+                }),
             }),
         }))
     }

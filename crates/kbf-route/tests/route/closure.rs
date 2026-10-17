@@ -6,6 +6,7 @@
 //! closure for, as a node does that has the field.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use kbf_map::Map;
 use kbf_route::Router;
@@ -112,7 +113,11 @@ async fn a_blob_missing_on_the_primary_and_held_by_the_replica_is_a_hit() {
 
     assert!(rig.hit(&action).await);
     assert_eq!(rig.finds(1), [3]);
-    assert_eq!(rig.finds(2), [1], "the replica is asked for the one the primary lacks");
+    assert_eq!(
+        rig.finds(2),
+        [1],
+        "the replica is asked for the one the primary lacks"
+    );
 }
 
 /// Catches a check with no cache, or a fan-out per blob. Fifty blobs held by their
@@ -168,7 +173,13 @@ async fn a_long_closure_is_asked_in_batches_the_node_takes() {
         .node(1)
         .hold_action_with_closure(action, digests[0], &digests);
 
-    assert!(router.action_result(&action).await.expect("an answer").is_some());
+    assert!(
+        router
+            .action_result(&action)
+            .await
+            .expect("an answer")
+            .is_some()
+    );
     let sizes: Vec<usize> = cluster.node(1).find_log().iter().map(Vec::len).collect();
     assert_eq!(sizes, [MAX_FIND_MISSING_DIGESTS, 1]);
 }
@@ -194,8 +205,7 @@ async fn a_generation_change_drops_what_was_verified() {
     }
     assert!(rig.hit(&action).await, "still inside the cached generation");
 
-    rig.cell
-        .set(view(&map(2, 2, active(&[1, 2, 3]))));
+    rig.cell.set(view(&map(2, 2, active(&[1, 2, 3]))));
     assert!(!rig.hit(&action).await, "asked again at the new generation");
     assert_eq!(rig.finds(1), [2, 2]);
 }
@@ -256,4 +266,82 @@ async fn a_stale_map_during_the_check_runs_the_call_again() {
     // The first call on node 1 is the check (the entry is on node 3).
     assert!(rig.hit(&action).await);
     assert_eq!(rig.cell.fetched(), [2]);
+}
+
+/// Catches a verified blob that never expires: a blob verified once is trusted for the
+/// time to live and asked about again after it, so one that went away meanwhile (cold GC,
+/// eviction) is found. Mutant: no time to live.
+#[tokio::test(start_paused = true)]
+async fn what_was_verified_is_asked_again_after_the_time_to_live() {
+    let mut rig = rig();
+    rig.router = rig.router.with_closure_cache(1000, Duration::from_secs(30));
+    let blobs = rig.blobs(2);
+    for node in [1, 2] {
+        hold(&rig.cluster.node(node), &blobs);
+    }
+    let action = rig.action(0, &blobs);
+
+    assert!(rig.hit(&action).await);
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert!(rig.hit(&action).await);
+    assert_eq!(rig.finds(1), [2], "still inside the time to live");
+
+    for node in [1, 2] {
+        rig.cluster.node(node).forget(&blobs[1]);
+    }
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(!rig.hit(&action).await, "asked again, and the blob is gone");
+    assert_eq!(rig.finds(1), [2, 2]);
+}
+
+/// Catches an unbounded cache: with room for two entries, three verified blobs push the
+/// least recently used one out, and only that one is asked about again. Mutant: no bound
+/// (nothing is asked again), or a bound that forgets everything (all are).
+#[tokio::test]
+async fn the_cache_forgets_the_least_recently_used_blob_first() {
+    let mut rig = rig();
+    rig.router = rig.router.with_closure_cache(2, Duration::from_secs(60));
+    let blobs = rig.blobs(3);
+    hold(&rig.cluster.node(1), &blobs);
+    let first = rig.action(0, &blobs[..2]);
+    let second = rig.action(1, &blobs[2..]);
+
+    assert!(rig.hit(&first).await);
+    assert!(rig.hit(&second).await);
+    assert_eq!(rig.finds(1), [2, 1]);
+
+    assert!(rig.hit(&first).await);
+    assert_eq!(
+        rig.finds(1),
+        [2, 1, 1],
+        "the oldest was out, the other kept"
+    );
+}
+
+/// Catches counters that do not say what happened: checks that hit, missed, or were not
+/// made (no closure reported), the blobs the cache answered, and the FindMissing calls.
+#[tokio::test]
+async fn the_stats_count_checks_cache_hits_and_calls() {
+    let rig = rig();
+    let blobs = rig.blobs(4);
+    hold(&rig.cluster.node(1), &blobs[..3]);
+    let whole = rig.action(0, &blobs[..3]);
+    let broken = rig.action(1, &blobs[3..]);
+    let old = blobs_with_primary(&rig.map, 3, 6)[5].1;
+    rig.cluster.node(3).hold_action(old, blobs[0]);
+
+    assert!(rig.hit(&whole).await);
+    assert!(rig.hit(&whole).await);
+    assert!(!rig.hit(&broken).await);
+    assert!(rig.hit(&old).await);
+
+    let stats = rig.router.closure_stats();
+    assert_eq!((stats.hit, stats.miss, stats.unchecked), (2, 1, 1));
+    assert_eq!((stats.cache_hits, stats.cache_lookups), (3, 7));
+    assert_eq!(
+        stats.rpcs, 3,
+        "one to the primary, then one to each for the lost one"
+    );
+    assert!((stats.cache_hit_ratio() - 3.0 / 7.0).abs() < 1e-9);
+    assert!((stats.rpcs_per_check() - 1.0).abs() < 1e-9);
 }
