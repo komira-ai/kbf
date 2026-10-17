@@ -21,8 +21,8 @@
 //! to account for. A debt is journalled before the blob is committed here, so a debt whose
 //! write is still committing ([`super::Pending`]) is left alone, and a debt is dropped for
 //! an absent blob only if no write began owing since the pass started
-//! ([`Repairs::settle_evicted`]); otherwise a write answered with one copy and no debt would
-//! be possible.
+//! and the store, asked again after that, still lacks the blob ([`Repairs::settle_evicted`]);
+//! otherwise a write answered with one copy and no debt would be possible.
 //!
 //! An owner that is up and does not answer is waited for like one that is down: the question
 //! "do you hold it" is bounded by [`RepairConfig::probe`], and `run` stops mid-pass.
@@ -175,7 +175,7 @@ impl RepairWorker {
                 // is left to copy, and the loss is the cache's to account for.
                 let dropped = self
                     .repairs
-                    .settle_evicted(&record.digest, begun)
+                    .settle_evicted(&record.digest, begun, self.storage.as_ref())
                     .await
                     .unwrap_or(false);
                 if dropped {
