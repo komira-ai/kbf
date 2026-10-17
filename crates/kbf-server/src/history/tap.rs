@@ -82,6 +82,10 @@ impl HistoryTap {
         let minted = self.minter.mint(&inv.key, at.unix_micros() / 1000);
         let mut record = run_record(row, attempt);
         record.set_run_id(minted.id);
+        // MUTANT: the tap waits for the writer to take what is queued.
+        while !self.queue.is_empty() {
+            std::thread::yield_now();
+        }
         let queued = self.queue.offer(Event::Run {
             inv,
             record: Box::new(record),
