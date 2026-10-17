@@ -158,13 +158,22 @@ fn a_probe_tells_a_held_lock_from_a_free_one_and_a_failure() {
 }
 
 // Catches a file's one name that is not its resolved path: a name without a file name
-// in it resolved as a file, a link loop followed forever or taken for a file, and a
+// in it resolved as a file, a bare name not put in the working directory, a link loop followed forever or taken for a file, and a
 // path through a file taken for a name nobody holds.
 #[test]
 fn a_files_one_name_resolves_links_and_refuses_what_it_cannot_resolve() {
     assert_eq!(
         canonical_db(Path::new("/")).expect("the root"),
         Path::new("/")
+    );
+    let here = std::env::current_dir()
+        .expect("cwd")
+        .canonicalize()
+        .expect("resolve");
+    assert_eq!(
+        canonical_db(Path::new("kbf-state-unit-no-such.db")).expect("a bare name"),
+        here.join("kbf-state-unit-no-such.db"),
+        "a bare name is in the working directory"
     );
     let dir = unit_dir("canonical").canonicalize().expect("resolve");
     std::os::unix::fs::symlink("b.db", dir.join("a.db")).expect("link");
