@@ -6,16 +6,16 @@ use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use futures::StreamExt as _;
-use kbf_meta::Role;
+use kbf_meta::{ActionRecord, ActionWriteError, Role};
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::{
     BeginRequest, CommitRequest, LocateRequest, PutRangeRequest, ReadRangeRequest,
 };
 use tonic::{Code, Request};
 
-use super::fake::{Held, Mem, patterned, sha};
+use super::fake::{Held, Mem, connect, patterned, serve_routes, sha};
 use crate::replicate::MapSource;
-use crate::service::{Admission, Config, InProcess, StorageService};
+use crate::service::{Admission, CatchUp, Config, InProcess, RemoteStorage, StorageService};
 use crate::{Storage, StorageError};
 
 /// A node over `mem` that judges every call by `held`, called in-process. Certified
@@ -245,5 +245,130 @@ async fn the_segments_handlers_are_judged_too() {
     assert_eq!(
         seen,
         ["begin", "put_range", "commit", "locate", "read_range"]
+    );
+}
+
+/// Catches an in-process call that takes a catching-up node's miss for a real one: while the
+/// node rebuilds its index, a read (whole, ranged), a FindMissing with a miss, an
+/// action-cache lookup with no entry, and a Prepare or Commit naming a closure blob the store
+/// did not find must be UNAVAILABLE, with the very text the same node answers over the wire
+/// (the daemon then asks another owner instead of acting on a false miss). Once the rebuild
+/// is done the same calls are the store's own answers: NOT_FOUND, the digest listed, no entry,
+/// the Absent refusal.
+///
+/// Mutants: the in-process read of either kind skipping the catch-up rule (NOT_FOUND comes
+/// back); FindMissing, the action lookup, or the write refusal skipping it; a rule applied
+/// after the rebuild is done.
+#[tokio::test]
+async fn a_miss_on_a_catching_up_node_is_unavailable_as_over_the_wire() {
+    let mem = Arc::new(Mem::default());
+    let storage: Arc<dyn Storage> = Arc::clone(&mem) as Arc<dyn Storage>;
+    let catch_up = CatchUp::rebuilding();
+    let config = Config {
+        write_bytes_in_flight: 1 << 30,
+    };
+    let service = Arc::new(
+        StorageService::new(storage, Admission::Open, config).with_catch_up(catch_up.clone()),
+    );
+    let local = service.in_process().at(0);
+    let wire = RemoteStorage::new(
+        connect(serve_routes(service.shared_routes(), None).await).await,
+        0,
+    );
+
+    let unindexed = sha(b"in cold storage, not yet indexed");
+    let action = sha(b"an action");
+    let absent = ActionResult {
+        exit_code: 99,
+        ..ActionResult::default()
+    };
+    let closure = sha(b"a closure blob");
+    *mem.fail.lock().expect("lock") = None;
+    let record = ActionRecord {
+        result: sha(b"result"),
+        closure: [closure].into_iter().collect(),
+    };
+
+    // Each call as text: the same rule must give the same words by either road.
+    async fn words(
+        storage: &Arc<dyn Storage>,
+        unindexed: &kbf_types::Digest,
+        action: &kbf_types::Digest,
+        absent: &ActionResult,
+    ) -> Vec<String> {
+        vec![
+            format!("{:?}", storage.read_blob(unindexed).await.map(drop)),
+            format!("{:?}", storage.read_range(unindexed, 0, 0).await.map(drop)),
+            format!("{:?}", storage.find_missing(&[*unindexed]).await),
+            format!("{:?}", storage.action_result(action).await),
+            format!("{:?}", storage.prepare_action_result(absent).await),
+        ]
+    }
+    let wire: Arc<dyn Storage> = Arc::new(wire);
+    let (near, far) = (
+        words(&local, &unindexed, &action, &absent).await,
+        words(&wire, &unindexed, &action, &absent).await,
+    );
+    for text in &near {
+        assert!(
+            text.contains("Unavailable") && text.contains("catching up"),
+            "{near:?}"
+        );
+    }
+    assert_eq!(near, far, "the same words in-process and over the wire");
+
+    *mem.fail.lock().expect("lock") = Some(ActionWriteError::Absent(closure).into());
+    let committed = local
+        .commit_action_record(Role::Daemon, action, record.clone())
+        .await;
+    assert!(
+        matches!(&committed, Err(StorageError::Unavailable(why)) if why.to_string().contains("catching up")),
+        "Commit: {committed:?}"
+    );
+    *mem.fail.lock().expect("lock") = Some(StorageError::Internal("disk".to_owned()));
+    let broken = local.prepare_action_result(&absent).await;
+    assert!(
+        matches!(&broken, Err(StorageError::Internal(why)) if why.contains("disk")),
+        "a store failure is not a miss, catching up or not: {broken:?}"
+    );
+    *mem.fail.lock().expect("lock") = None;
+
+    catch_up.finish();
+    let read = local.read_blob(&unindexed).await;
+    assert!(
+        matches!(read, Err(StorageError::NotFound(d)) if d == unindexed),
+        "{read:?}"
+    );
+    let ranged = local.read_range(&unindexed, 0, 0).await.map(drop);
+    assert!(
+        matches!(ranged, Err(StorageError::NotFound(d)) if d == unindexed),
+        "{ranged:?}"
+    );
+    assert_eq!(
+        local.find_missing(&[unindexed]).await.expect("find"),
+        [unindexed]
+    );
+    assert!(
+        local
+            .action_result(&action)
+            .await
+            .expect("lookup")
+            .is_none()
+    );
+    let prepared = local.prepare_action_result(&absent).await;
+    assert!(
+        matches!(
+            prepared,
+            Err(StorageError::ActionWrite(ActionWriteError::Absent(_)))
+        ),
+        "{prepared:?}"
+    );
+    *mem.fail.lock().expect("lock") = Some(ActionWriteError::Absent(closure).into());
+    let committed = local
+        .commit_action_record(Role::Daemon, action, record)
+        .await;
+    assert!(
+        matches!(committed, Err(StorageError::ActionWrite(ActionWriteError::Absent(b))) if b == closure),
+        "{committed:?}"
     );
 }

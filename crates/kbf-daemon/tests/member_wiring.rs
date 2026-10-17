@@ -98,7 +98,7 @@ fn process(node: NodeUnderTest, id: MemberId, held: Arc<MapHolder>, tls: &TlsFil
     );
     assert_eq!(local.addr(), node.addr.to_string());
     let dialled = Arc::new(Counted {
-        inner: kbf_daemon::storage_nodes(tls).expect("TLS files"),
+        inner: kbf_daemon::storage_nodes(tls, kbf_daemon::Liveness::default()).expect("TLS files"),
         dialled: Mutex::default(),
     });
     let cas = member_cas(
@@ -270,7 +270,7 @@ fn plane_over(
         local.node.in_process.clone(),
         Arc::clone(node_map),
     );
-    let nodes = kbf_daemon::storage_nodes(tls).expect("TLS files");
+    let nodes = kbf_daemon::storage_nodes(tls, kbf_daemon::Liveness::default()).expect("TLS files");
     member_cas(held, member, nodes, &TransferConfig::default())
 }
 

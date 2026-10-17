@@ -25,6 +25,11 @@
 //! [`super::MAX_FIND_MISSING_DIGESTS`]: that bounds what a message can ask of the node, and
 //! this caller holds the slice already.
 //!
+//! **A node that is catching up** ([`super::CatchUp`]) answers a miss as its handlers do:
+//! the rules are [`catch_up`]'s, asked here and by the handlers alike, so a read, a
+//! `FindMissing`, an action-cache lookup or a closure-blob refusal that the `Read` and
+//! `ActionStore` handlers would answer UNAVAILABLE is UNAVAILABLE here, with the same text.
+//!
 //! **Reads** go through the same generation check and then the store ([`Storage::read_range`],
 //! verified as a whole before the first byte, as the `Read` handler does): the check is the
 //! service's, so a stale read is refused here as it is over the wire.
@@ -44,8 +49,8 @@ use kbf_proto::worker::{
 use kbf_types::Digest;
 use tonic::{Request, Response, Status};
 
-use super::StorageService;
 use super::client::{lift, write_messages};
+use super::{StorageService, catch_up};
 use crate::{Answer, PutStream, ReadStream, Storage, StorageError};
 
 /// A node's [`StorageService`], called in-process ([`StorageService::in_process`]). Cheap
@@ -75,6 +80,25 @@ impl InProcess {
     }
 }
 
+/// `error` of a read of `digest`, as the `Read` handler would answer it while the node is
+/// catching up ([`catch_up::read_miss`]).
+fn read_error(catching_up: bool, error: StorageError, digest: &Digest) -> StorageError {
+    match catch_up::read_miss(catching_up, &error, digest) {
+        Some(status) => lift(&status, None),
+        None => error,
+    }
+}
+
+/// `error` of an action-cache write, as the `ActionStore` handlers would answer it while the
+/// node is catching up ([`catch_up::retryable`]).
+fn write_error(catching_up: bool, error: StorageError) -> StorageError {
+    let status = match &error {
+        StorageError::ActionWrite(refused) => catch_up::retryable(catching_up, refused),
+        _ => None,
+    };
+    status.map_or(error, |status| lift(&status, None))
+}
+
 /// The node, for one caller routed by `generation`.
 struct Called {
     this: InProcess,
@@ -91,11 +115,24 @@ impl Called {
 
 impl Storage for Called {
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
-        Box::pin(async move { self.judged().await?.storage.find_missing(digests).await })
+        Box::pin(async move {
+            let service = self.judged().await?;
+            let catching_up = service.catching_up();
+            let missing = service.storage.find_missing(digests).await?;
+            match catch_up::missing_gap(catching_up, missing.len(), digests.len()) {
+                Some(status) => Err(lift(&status, None)),
+                None => Ok(missing),
+            }
+        })
     }
 
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> Answer<'a, Bytes> {
-        Box::pin(async move { self.judged().await?.storage.read_blob(digest).await })
+        Box::pin(async move {
+            let service = self.judged().await?;
+            let catching_up = service.catching_up();
+            let read = service.storage.read_blob(digest).await;
+            read.map_err(|e| read_error(catching_up, e, digest))
+        })
     }
 
     fn read_range<'a>(
@@ -105,11 +142,10 @@ impl Storage for Called {
         limit: u64,
     ) -> Answer<'a, ReadStream> {
         Box::pin(async move {
-            self.judged()
-                .await?
-                .storage
-                .read_range(digest, offset, limit)
-                .await
+            let service = self.judged().await?;
+            let catching_up = service.catching_up();
+            let read = service.storage.read_range(digest, offset, limit).await;
+            read.map_err(|e| read_error(catching_up, e, digest))
         })
     }
 
@@ -151,16 +187,23 @@ impl Storage for Called {
         &'a self,
         action: &'a Digest,
     ) -> Answer<'a, Option<(Digest, ActionResult)>> {
-        Box::pin(async move { self.judged().await?.storage.action_result(action).await })
+        Box::pin(async move {
+            let service = self.judged().await?;
+            let catching_up = service.catching_up();
+            let entry = service.storage.action_result(action).await?;
+            match catch_up::entry_miss(catching_up, entry.is_some(), action) {
+                Some(status) => Err(lift(&status, None)),
+                None => Ok(entry),
+            }
+        })
     }
 
     fn prepare_action_result<'a>(&'a self, result: &'a ActionResult) -> Answer<'a, ActionRecord> {
         Box::pin(async move {
-            self.judged()
-                .await?
-                .storage
-                .prepare_action_result(result)
-                .await
+            let service = self.judged().await?;
+            let catching_up = service.catching_up();
+            let record = service.storage.prepare_action_result(result).await;
+            record.map_err(|e| write_error(catching_up, e))
         })
     }
 
@@ -171,11 +214,13 @@ impl Storage for Called {
         record: ActionRecord,
     ) -> Answer<'_, ()> {
         Box::pin(async move {
-            self.judged()
-                .await?
+            let service = self.judged().await?;
+            let catching_up = service.catching_up();
+            let committed = service
                 .storage
                 .commit_action_record(role, action, record)
-                .await
+                .await;
+            committed.map_err(|e| write_error(catching_up, e))
         })
     }
 }

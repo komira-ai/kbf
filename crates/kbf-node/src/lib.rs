@@ -48,7 +48,7 @@ use std::time::Duration;
 pub use kbf_daemon::LocalMember;
 use kbf_daemon::{
     Args, Capacity, DAEMON_VERSION, Daemon, DaemonConfig, DriverWatch, FakeRuntime, FarmCas,
-    MapHolder, NodeReport, Runtime, Runtimes,
+    Liveness, MapHolder, NodeReport, Runtime, Runtimes,
 };
 use kbf_driver_native::slots::Pool;
 use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode, xcode_watch};
@@ -394,7 +394,9 @@ pub fn start(cli: &Cli) -> Result<NodeHandle, Error> {
     // routes by it.
     let maps = Arc::new(MapHolder::new());
     let held = Arc::clone(&maps);
-    start_over(cli, Some(maps), move |cli| farm(cli, &held))
+    start_over(cli, Some(maps), move |cli, liveness| {
+        farm(cli, &held, liveness)
+    })
 }
 
 /// [`start`], for a daemon in the process of the storage node `local` (`kbf
@@ -408,7 +410,9 @@ pub fn start(cli: &Cli) -> Result<NodeHandle, Error> {
 pub fn start_member(cli: &Cli, local: LocalMember) -> Result<NodeHandle, Error> {
     let maps = Arc::new(MapHolder::new());
     let held = Arc::clone(&maps);
-    start_over(cli, Some(maps), move |cli| member(cli, &held, &local))
+    start_over(cli, Some(maps), move |cli, liveness| {
+        member(cli, &held, &local, liveness)
+    })
 }
 
 /// [`start`], with every runtime reading and writing blobs through the data plane
@@ -423,7 +427,7 @@ pub fn start_with<C: Cas>(
     cli: &Cli,
     plane: impl Fn(&Cli) -> Result<Arc<C>, Error> + 'static,
 ) -> Result<NodeHandle, Error> {
-    start_over(cli, None, plane)
+    start_over(cli, None, move |cli, _| plane(cli))
 }
 
 /// [`start_with`], and the daemon keeping the storage map its frontend pushes in `maps`
@@ -431,8 +435,11 @@ pub fn start_with<C: Cas>(
 fn start_over<C: Cas>(
     cli: &Cli,
     maps: Option<Arc<MapHolder>>,
-    plane: impl Fn(&Cli) -> Result<Arc<C>, Error> + 'static,
+    plane: impl Fn(&Cli, Liveness) -> Result<Arc<C>, Error> + 'static,
 ) -> Result<NodeHandle, Error> {
+    // Refused here, before any driver is set up, though only the plane over a storage
+    // map reads the values; the plane gets the checked values, not the flags again.
+    let liveness = cli.daemon.storage_liveness()?;
     let sizes = sizes(cli)?;
     sizes.log();
     let tokio = sizes.runtime()?;
@@ -440,7 +447,13 @@ fn start_over<C: Cas>(
         // The CAS channel is made lazily, which needs the runtime's context.
         let _context = tokio.enter();
         let xcrun = Path::new(xcode::XCRUN);
-        let (daemon, _) = node_over(cli, || native_config(cli), xcrun, maps, Box::new(plane))?;
+        let (daemon, _) = node_over(
+            cli,
+            || native_config(cli),
+            xcrun,
+            maps,
+            Box::new(move |cli| plane(cli, liveness)),
+        )?;
         backstop(cli, daemon)
     };
     Ok(NodeHandle { tokio, daemon })
@@ -453,9 +466,9 @@ fn start_over<C: Cas>(
 /// never `--tls-server-name`, which names the frontend). A frontend that sends no map
 /// leaves the daemon on `--cas`, as before the map existed. Each change of side is
 /// logged once, by the plane.
-fn farm(cli: &Cli, maps: &Arc<MapHolder>) -> Result<Arc<FarmCas>, Error> {
+fn farm(cli: &Cli, maps: &Arc<MapHolder>, liveness: Liveness) -> Result<Arc<FarmCas>, Error> {
     let server = Arc::new(transfer::engine(cli)?);
-    let nodes = kbf_daemon::storage_nodes(&DaemonConfig::from_args(&cli.daemon).tls)?;
+    let nodes = kbf_daemon::storage_nodes(&DaemonConfig::from_args(&cli.daemon).tls, liveness)?;
     tracing::info!(
         "data plane: through --cas until the frontend sends a storage map, then to the \
          storage nodes it names"
@@ -474,8 +487,9 @@ fn member(
     cli: &Cli,
     maps: &Arc<MapHolder>,
     local: &LocalMember,
+    liveness: Liveness,
 ) -> Result<Arc<kbf_transfer::RoutedCas>, Error> {
-    let nodes = kbf_daemon::storage_nodes(&DaemonConfig::from_args(&cli.daemon).tls)?;
+    let nodes = kbf_daemon::storage_nodes(&DaemonConfig::from_args(&cli.daemon).tls, liveness)?;
     Ok(kbf_daemon::member_cas(
         Arc::clone(maps),
         local.clone(),
@@ -1681,5 +1695,36 @@ mod tests {
             .expect_err("no TLS files")
             .to_string();
         assert!(why.contains("ca.pem"), "{why}");
+    }
+
+    /// Catches a daemon that starts with storage-liveness flags it cannot honour: a zero
+    /// value, or a ping timeout past the interval, is refused by `start` (and by
+    /// `start_with`, as the same check) before any driver is set up, naming the flag.
+    #[test]
+    fn start_refuses_unusable_storage_liveness_flags() {
+        for (flag, said) in [
+            (
+                "--storage-dial-timeout-ms=0",
+                "--storage-dial-timeout-ms must be at least 1",
+            ),
+            (
+                "--storage-ping-interval-ms=0",
+                "--storage-ping-interval-ms must be at least 1",
+            ),
+            (
+                "--storage-ping-timeout-ms=0",
+                "--storage-ping-timeout-ms must be at least 1",
+            ),
+            (
+                "--storage-ping-timeout-ms=10001",
+                "is longer than --storage-ping-interval-ms",
+            ),
+        ] {
+            let cli = parse(&["--driver=fake", flag]).expect("flags parse");
+            for refused in [start(&cli).err(), start_with(&cli, remote).err()] {
+                let why = refused.expect(flag).to_string();
+                assert!(why.contains(said), "{flag}: {why}");
+            }
+        }
     }
 }

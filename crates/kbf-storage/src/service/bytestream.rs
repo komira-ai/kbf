@@ -9,7 +9,7 @@ use kbf_proto::google::bytestream::{
 };
 use tonic::{Request, Response, Status, Streaming};
 
-use super::{Endpoint, StorageService, generation, wire};
+use super::{Endpoint, StorageService, catch_up, generation, wire};
 
 #[tonic::async_trait]
 impl ByteStream for StorageService {
@@ -18,7 +18,8 @@ impl ByteStream for StorageService {
     /// `[read_offset, read_offset + read_limit)` of the blob (to its end when the limit is
     /// 0), in the chunks [`crate::Storage::read_range`] makes, none of them collected:
     /// the blob is verified before its first byte is sent (that call's rule), and every
-    /// error that can be known then is the call's status.
+    /// error that can be known then is the call's status. A blob not found while the node
+    /// is catching up is UNAVAILABLE, not NOT_FOUND.
     async fn read(
         &self,
         request: Request<ReadRequest>,
@@ -33,7 +34,15 @@ impl ByteStream for StorageService {
         let limit = u64::try_from(request.read_limit).map_err(|_| {
             Status::invalid_argument(format!("read_limit {} is negative", request.read_limit))
         })?;
-        let chunks = self.storage.read_range(&digest, offset, limit).await?;
+        let catching_up = self.catching_up();
+        let chunks = match self.storage.read_range(&digest, offset, limit).await {
+            Ok(chunks) => chunks,
+            Err(e) => {
+                return Err(
+                    catch_up::read_miss(catching_up, &e, &digest).unwrap_or_else(|| e.into())
+                );
+            }
+        };
         let messages = chunks.map(|chunk| match chunk {
             Ok(data) => Ok(ReadResponse {
                 data: data.to_vec(),

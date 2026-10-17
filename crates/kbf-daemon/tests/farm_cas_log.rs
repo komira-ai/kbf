@@ -10,6 +10,7 @@ use kbf_daemon::cas::Cas as _;
 use kbf_daemon::{FarmCas, MapHolder, storage_nodes};
 use kbf_map::{Map, Member, MemberId, MemberState, Rule};
 use kbf_proto::reapi::Digest;
+use kbf_route::Liveness;
 use kbf_transfer::{RecordHasher, TransferConfig, Transfers, proto_digest};
 use support::storage_node::{Node, serve_plain, serve_tls};
 use support::{Pki, pki};
@@ -21,7 +22,7 @@ fn plane(pki: &Pki, server: &Node) -> (Arc<FarmCas>, Arc<MapHolder>) {
         .connect_lazy();
     let engine = Arc::new(Transfers::over(channel, TransferConfig::default()));
     let holder = Arc::new(MapHolder::new());
-    let nodes = storage_nodes(&pki.client).expect("TLS files");
+    let nodes = storage_nodes(&pki.client, Liveness::default()).expect("TLS files");
     let cas = FarmCas::new(
         engine,
         Arc::clone(&holder),
