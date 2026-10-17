@@ -328,8 +328,8 @@ async fn a_map_that_turns_during_the_write_is_checked_before_the_answer() {
 }
 
 /// Catches the copy an action-cache commit needs on the action's owner being refused: the
-/// owner of an action is not the primary of the blobs of its entry, a plain write there is
-/// "not the primary", and the commit failed (a repeat of an action ran again on a farm of
+/// owner of an action is usually not an owner of the blobs of its entry, a plain write
+/// there is refused as "not the primary", and the commit failed (a repeat of an action ran again on a farm of
 /// three). An unowned write to a node that owns nothing stores one copy there and none is
 /// forwarded or owed; to the blob's primary it is a plain write (the replica holds it
 /// too). Mutants: the unowned marker ignored by the node (refused); taken as local at the

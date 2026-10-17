@@ -747,14 +747,19 @@ async fn survivors(
 /// - writes after the kill succeed: 24 more blobs, whose first owner is the dead node
 ///   for about a third of them, go on to the other owner, and a new action runs to a
 ///   result committed at an owner that is alive;
-/// - the same holds once the frontend lists the dead node's daemon as gone, and then
+/// - the same holds once the frontend lists the dead node's daemon as gone (the
+///   frontend's connection list, not the map: the member's lease outlives this test, so
+///   the map still has the node up and a `Down` owner is not reached here), and then
 ///   every entry is a hit: what the reruns committed is on a live node.
 ///
 /// Catches a farm that writes a blob once (a primary that does not send its copy, a
 /// copy that is owed and never made: the replica check before the kill, then the read
 /// after it, fail), a frontend that fails a write because the first owner is dead
 /// instead of going on to the next, and a commit that fails because its first owner is
-/// dead. Planted to see it fail: `Chain::plan` answering `Plan::Local` for the primary
+/// dead. It reaches the write failover of the frontend's raw upload and of
+/// `Router::commit_with_closure`; `Router::put` and skipping a `Down` owner are covered
+/// by the `kbf-route` tests (`a_write_goes_on_to_the_next_owner_when_the_first_cannot_be_reached`,
+/// `a_write_skips_an_owner_that_is_down`), not here. Planted to see it fail: `Chain::plan` answering `Plan::Local` for the primary
 /// (no copy is written, so the blobs are on one node each).
 #[test]
 fn a_killed_storage_node_loses_no_blob() {
@@ -800,6 +805,13 @@ fn a_killed_storage_node_loses_no_blob() {
     };
     let (first, reruns) = check(&farm, 1);
     eprintln!("{reruns} of {ACTIONS} cache entries were gone with the node: rerun");
+    // The farm is fixed (its map, the digests, the image), so the node holding most blobs
+    // also committed at least one entry: without this a farm where the dead node
+    // committed none would pass with the commit failover never exercised.
+    assert!(
+        reruns > 0,
+        "no cache entry was committed by the killed node: the commit failover is unexercised"
+    );
 
     // The frontend lists the killed node's daemon as gone; the same again.
     let gone: Vec<String> = farm

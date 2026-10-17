@@ -145,7 +145,8 @@ pub struct Node {
     pub action_gets: AtomicUsize,
     /// What `put` answers instead of the digest, if set.
     put_answer: Mutex<Option<Digest>>,
-    /// A plain `put` is refused as a node in a chain refuses a blob it is not the primary of.
+    /// A plain `put` is refused, as a node in a chain refuses a blob it does not own (the mock
+    /// refuses every plain put, owner or not).
     chain_rule: AtomicBool,
     /// A commit is refused as `Absent` unless the node holds the entry's result blob and
     /// closure, as a storage node does.
@@ -314,8 +315,8 @@ impl Node {
         self.put_answer.lock().expect("lock").unwrap_or(digest)
     }
 
-    /// Plain writes are refused from now on, as a chain's node refuses a blob it is not the
-    /// primary of; [`Storage::put_unowned`] still stores.
+    /// Plain writes are refused from now on, as a chain's node refuses a blob it does not
+    /// own (every plain put, owner or not); [`Storage::put_unowned`] still stores.
     pub fn refuse_plain_puts(&self) {
         self.chain_rule.store(true, Ordering::SeqCst);
     }

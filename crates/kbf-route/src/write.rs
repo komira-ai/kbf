@@ -112,7 +112,7 @@ impl Router {
     /// This asks the action's owner which blobs of the entry it lacks, reads each from
     /// wherever the map has it ([`Router::read_blob`]: routed, failing over, and hashed
     /// against its digest, so a bad copy is never passed on), stores it on the owner
-    /// ([`Storage::put`], checked to answer the digest), and then commits. A commit holds
+    /// ([`Storage::put_unowned`], checked to answer the digest), and then commits. A commit holds
     /// at most [`COPIES_IN_FLIGHT`] blobs at a time, each whole, and every commit on a
     /// router and its clones together hold at most [`Router::with_copy_budget`] bytes
     /// ([`crate::DEFAULT_COPY_BYTES`] unless set): a copy waits for room before it reads, and a
@@ -120,7 +120,7 @@ impl Router {
     ///
     /// The blobs pass through this process once. The owner takes a blob it does not own
     /// through [`Storage::put_unowned`]: a node that serves a chain refuses a plain write
-    /// of a blob it is not the primary of. When a write is acknowledged by its replicas
+    /// of a blob it is not a write owner of. When a write is acknowledged by its replicas
     /// (av2-11, av2-12), the entry carries those acknowledgements and this copy goes away.
     /// The copy is an extra, not the replicated one: each blob is still held by its own
     /// owners (the daemon's upload or [`Router::put`] went through the chain), and the node
