@@ -9,7 +9,8 @@ use bytes::Bytes;
 use futures::future;
 use kbf_meta::{
     ActionAnswer, ActionRecord, ActionWriteError, Applied, BlobAnswer, Closure, Collected, Command,
-    Epoch, MetaState, ObjectId, Retention, Role, Touch, UnreachableReason,
+    Epoch, MetaState, NodeWriter, ObjectId, Retention, Role, StaleWriter, Touch, UnreachableReason,
+    Writer as ObjectWriter,
 };
 use kbf_objstore::{
     Capabilities, KeyError, KeyPrefix, MemoryStore, ObjectKey, ObjectStore, ObjectStoreError,
@@ -76,6 +77,10 @@ pub enum CacheError {
     /// An object key could not be built.
     #[error("object key: {0}")]
     Key(#[from] KeyError),
+    /// The metadata log has set this node writer, or a later boot of its member,
+    /// already ([`Cache::open_node`]): two processes would name the same keys.
+    #[error(transparent)]
+    StaleWriter(#[from] StaleWriter),
     /// The cache's own records disagree (a segment read back without a blob just
     /// packed into it, an index entry with no readable range, a log answering with
     /// the wrong outcome). A bug or a broken backend, never the client's fault.
@@ -111,6 +116,7 @@ impl From<CacheError> for Status {
             CacheError::Segment(_)
             | CacheError::Pack(_)
             | CacheError::Key(_)
+            | CacheError::StaleWriter(_)
             | CacheError::Internal(_) => Status::internal(message),
         }
     }
@@ -224,11 +230,25 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// Writes under an epoch `meta` never allocated are refused by the index
     /// ([`CacheError::Internal`]); two caches given one epoch would name the same keys.
     /// Uploads are grouped and bounded as [`WriteConfig::DEFAULT`] says
-    /// ([`Cache::with_writes`]).
+    /// ([`Cache::with_writes`]). A node writer's objects, if the index names any, are
+    /// read under `prefix` too ([`ObjectKeys::under`]).
     #[must_use]
     pub fn new(meta: M, objects: O, prefix: KeyPrefix, epoch: Epoch) -> Self {
+        Self::new_as(
+            meta,
+            objects,
+            ObjectKeys::under(prefix),
+            ObjectWriter::Epoch(epoch),
+        )
+    }
+
+    /// A cache over `meta` and `objects` that names its objects as `writer`, under
+    /// `keys`. `meta` must take puts of `writer` (an epoch it allocated for this cache
+    /// alone, or the node writer it has current: [`Cache::open`], [`Cache::open_node`]).
+    #[must_use]
+    pub fn new_as(meta: M, objects: O, keys: ObjectKeys, writer: ObjectWriter) -> Self {
         Self {
-            writer: Arc::new(Writer::new(meta, objects, prefix, epoch)),
+            writer: Arc::new(Writer::new(meta, objects, keys, writer)),
             group: Arc::new(Group::new(WriteConfig::DEFAULT)),
             touches: Arc::new(Touches::new(TouchConfig::DEFAULT)),
             segment_limit: MAX_SEGMENT_BYTES,
@@ -308,15 +328,57 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// # Errors
     /// The metadata log is unavailable.
     pub async fn open(meta: M, objects: O, prefix: KeyPrefix) -> Result<Self, CacheError> {
+        Self::open_under(meta, objects, ObjectKeys::under(prefix)).await
+    }
+
+    /// [`Cache::open`] with each kind of key under its own prefix: the epoch writer's
+    /// objects under `keys.legacy`, a node writer's (written by an earlier start that
+    /// registered) read under `keys.root`.
+    ///
+    /// # Errors
+    /// The metadata log is unavailable.
+    pub async fn open_under(meta: M, objects: O, keys: ObjectKeys) -> Result<Self, CacheError> {
         match meta.commit(Command::AllocEpoch).await? {
-            Applied::Epoch(epoch) => Ok(Self::new(meta, objects, prefix, epoch)),
+            Applied::Epoch(epoch) => Ok(Self::new_as(
+                meta,
+                objects,
+                keys,
+                ObjectWriter::Epoch(epoch),
+            )),
             other => Err(unexpected(&other)),
         }
     }
 
-    /// The writer epoch this cache names its objects in.
-    pub fn epoch(&self) -> Epoch {
-        self.writer.epoch
+    /// A registered storage node's cache over `meta` and `objects`: it commits
+    /// [`Command::SetWriter`] for `writer` (the member id and boot counter its
+    /// registration was given) and names every object it writes as that writer, under
+    /// `keys.root`, with no writer epoch. The log must take format 4.
+    ///
+    /// # Errors
+    /// [`CacheError::StaleWriter`] if the log has set this boot of the member, or a
+    /// later one, already; the metadata log is unavailable or does not take the
+    /// command.
+    pub async fn open_node(
+        meta: M,
+        objects: O,
+        keys: ObjectKeys,
+        writer: NodeWriter,
+    ) -> Result<Self, CacheError> {
+        match meta.commit(Command::SetWriter(writer)).await? {
+            Applied::Writer(Ok(())) => Ok(Self::new_as(
+                meta,
+                objects,
+                keys,
+                ObjectWriter::Node(writer),
+            )),
+            Applied::Writer(Err(stale)) => Err(stale.into()),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// The writer this cache names its objects as.
+    pub fn writer(&self) -> ObjectWriter {
+        self.writer.names_as
     }
 
     /// The metadata log.
@@ -334,13 +396,13 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self.writer.metrics
     }
 
-    /// The prefix every key this cache writes starts with.
+    /// The prefix of an epoch writer's keys ([`ObjectKeys::legacy`]).
     pub fn prefix(&self) -> &KeyPrefix {
-        &self.writer.prefix
+        &self.writer.keys.legacy
     }
 
-    /// The key of object `id` in the store: `<prefix>cas/<epoch>/<seq>`, each as 16
-    /// lowercase hex digits.
+    /// The key of object `id` in the store ([`ObjectKeys::key`]): `<legacy>cas/<epoch>/<seq>`
+    /// or `<root>cas/<member>/<boot>/<seq>`, each as 16 lowercase hex digits.
     ///
     /// # Errors
     /// [`CacheError::Key`] if the prefix and id do not form a valid key.
@@ -695,6 +757,7 @@ mod evict;
 mod flush;
 mod losses;
 mod read;
+mod rebuild;
 mod stream;
 mod stream_store;
 mod tier;
@@ -713,6 +776,7 @@ pub use flush::{
 };
 pub use losses::Losses;
 pub use read::{BlobRead, MAX_DECODED_BLOB_BYTES, READ_WINDOW_BYTES};
+pub use rebuild::{ADOPT_RECORDS, RebuildConfig, RebuildReport};
 pub(crate) use stream::TierRange;
 pub use stream::{RecordStream, StreamedRecord};
 pub use tier::{TierStartError, TierStartup};
@@ -720,7 +784,7 @@ pub use touches::TouchConfig;
 use touches::Touches;
 pub(crate) use upload::BuiltSegment;
 pub use write_group::{
-    Admitted, DEFAULT_REAPI_STREAMS, DEFAULT_WORKER_STREAMS, MAX_ADMISSION_BYTES, PUT_BACKOFF,
-    PUT_BACKOFF_FACTOR, STREAM_WINDOW_BYTES, WriteConfig,
+    Admitted, DEFAULT_REAPI_STREAMS, DEFAULT_WORKER_STREAMS, MAX_ADMISSION_BYTES, ObjectKeys,
+    PUT_BACKOFF, PUT_BACKOFF_FACTOR, STREAM_WINDOW_BYTES, WriteConfig,
 };
 use write_group::{Group, Writer};

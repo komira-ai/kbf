@@ -928,7 +928,51 @@ pub fn bind_service(
     ),
     ServeError,
 > {
+    serve_service(service, bind_storage_socket(listen)?, tls, shutdown)
+}
+
+/// A storage listener's socket: bound, so its address is known and callers queue on it,
+/// and not yet serving ([`bind_storage_socket`], then [`serve_service`]).
+pub struct StorageSocket {
+    incoming: TcpIncoming,
+    addr: SocketAddr,
+}
+
+impl StorageSocket {
+    /// Where the socket is bound.
+    #[must_use]
+    pub const fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+/// Binds `listen`, serving nothing yet: a storage node registers with its frontend from
+/// the bound address before it opens the cache it serves.
+///
+/// # Errors
+/// The listener cannot be bound.
+pub fn bind_storage_socket(listen: SocketAddr) -> Result<StorageSocket, ServeError> {
     let (incoming, addr) = bind(listen)?;
+    Ok(StorageSocket { incoming, addr })
+}
+
+/// [`bind_service`] over a socket already bound ([`bind_storage_socket`]).
+///
+/// # Errors
+/// As [`bind_storage`].
+pub fn serve_service(
+    service: kbf_storage::service::StorageService,
+    socket: StorageSocket,
+    tls: Option<TlsSource>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<
+    (
+        BoundStorage<impl Future<Output = Result<(), ServeError>>>,
+        kbf_storage::service::InProcess,
+    ),
+    ServeError,
+> {
+    let StorageSocket { incoming, addr } = socket;
     let mut server = flow_control(
         Server::builder(),
         crate::streams::StreamLimits::DEFAULT.worker,

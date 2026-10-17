@@ -100,6 +100,7 @@ pub mod metrics;
 mod missing;
 pub mod node_map;
 pub mod raft_log;
+mod rebuild;
 pub mod replication;
 pub mod rollout;
 mod run_record;

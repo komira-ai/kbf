@@ -8,7 +8,7 @@ use std::fmt;
 use kbf_types::Digest;
 
 use crate::model::ObjectId;
-use crate::state::UnallocatedEpoch;
+use crate::state::ForeignWriter;
 
 /// A local write tier: one directory on one server's disk. The server draws the id the
 /// first time it opens the directory, writes it to the directory's `TIER` file and
@@ -136,9 +136,9 @@ impl StagedObject {
 /// Why a tier command was refused. A refused command changes nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TierError {
-    /// An object names an epoch that was never allocated.
+    /// An object is not of a writer the log takes for the command.
     #[error(transparent)]
-    Unallocated(#[from] UnallocatedEpoch),
+    Foreign(#[from] ForeignWriter),
     /// The tier is not the current tier of any server.
     #[error("{0} is not registered to any server")]
     UnknownTier(TierId),
