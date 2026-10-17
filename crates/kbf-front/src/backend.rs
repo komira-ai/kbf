@@ -407,7 +407,7 @@ impl Plane for RoutedPlane {
 /// [`Cache::prepare_action_result`] does for one node's blobs.
 ///
 /// # Errors
-/// [`ActionWriteError::Absent`] naming the first blob of the closure no owner holds; a
+/// [`ActionWriteError::Absent`] naming every blob of the closure no owner holds; a
 /// missing tree, a malformed result, or owners that could not answer.
 async fn prepare(router: &Router, result: &ActionResult) -> Answer<ActionRecord> {
     let (mut closure, trees) = closure::direct(result)?;
@@ -416,8 +416,9 @@ async fn prepare(router: &Router, result: &ActionResult) -> Answer<ActionRecord>
     }
     let needed: Vec<Digest> = closure.iter().copied().collect();
     let missing = router.find_missing(&needed).await?;
-    if let Some(absent) = first_held_by_none(router, &missing).await? {
-        return Err(ActionWriteError::Absent(vec![absent]).into());
+    let absent = held_by_none(router, &missing).await?;
+    if !absent.is_empty() {
+        return Err(ActionWriteError::Absent(absent).into());
     }
     let stored = router
         .put(bytes::Bytes::from(result.encode_to_vec()))
@@ -428,7 +429,7 @@ async fn prepare(router: &Router, result: &ActionResult) -> Answer<ActionRecord>
     })
 }
 
-/// The first of `missing`, which the digests' primaries lack, that no owner holds. A
+/// Those of `missing`, which the digests' primaries lack, that no owner holds. A
 /// map change moves a blob's primary before the blob is copied there, so a primary that
 /// lacks it is not the farm lacking it: the read order, which ends with the previous
 /// generation's owners, is asked for the first byte. (Unlike a missing input, which the
@@ -436,15 +437,16 @@ async fn prepare(router: &Router, result: &ActionResult) -> Answer<ActionRecord>
 ///
 /// # Errors
 /// An owner of a digest could not say, and none had it.
-async fn first_held_by_none(router: &Router, missing: &[Digest]) -> Answer<Option<Digest>> {
+async fn held_by_none(router: &Router, missing: &[Digest]) -> Answer<Vec<Digest>> {
+    let mut absent = Vec::new();
     for digest in missing {
         match router.read_range(digest, 0, 1).await {
             Ok(_) => {}
-            Err(StorageError::NotFound(_)) => return Ok(Some(*digest)),
+            Err(StorageError::NotFound(_)) => absent.push(*digest),
             Err(e) => return Err(e),
         }
     }
-    Ok(None)
+    Ok(absent)
 }
 
 /// What the input check reads: a blob, and which of some files are held.

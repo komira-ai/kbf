@@ -565,3 +565,67 @@ fn the_flaky_store_reads_through_and_the_handle_prints() {
     assert!(written);
     assert_eq!(format!("{durable:?}"), "Durable");
 }
+
+/// Catches: a result row that goes with the finished retention (a retention of zero would
+/// drop it at once, before a stream kept open by an earlier process reads it), one that
+/// outlives a long retention's end, and one nobody frees: a short retention keeps the row
+/// for the floor, a long one for the retention, and the reaper frees it after.
+#[test]
+fn a_result_row_is_kept_for_the_longer_of_the_retention_and_the_floor() {
+    let clock = Arc::new(ManualClock::default());
+    let store: Arc<dyn Store> = Arc::new(Fake::with_flaw(Arc::clone(&clock), Flaw::None));
+    let durable = Durable::open(Arc::clone(&store), EpochPolicy::Keep, 100)
+        .expect("open")
+        .0;
+    let finished = Finished::Failed(kbf_proto::google::rpc::Status {
+        code: 3,
+        message: "no".to_owned(),
+        details: Vec::new(),
+    });
+    let short = OperationId(1);
+    let long = OperationId(2);
+    durable
+        .done(short, &finished, Duration::from_secs(1))
+        .expect("short");
+    durable
+        .done(long, &finished, Duration::from_secs(3600))
+        .expect("long");
+    let seconds = |n| Duration::from_secs(n);
+    clock.advance(DONE_FLOOR - seconds(1));
+    assert_eq!(durable.ended(short).expect("read"), Some(finished.clone()));
+    clock.advance(seconds(2));
+    assert_eq!(durable.ended(short).expect("read"), None, "past the floor");
+    assert_eq!(durable.ended(long).expect("read"), Some(finished.clone()));
+    assert_eq!(store.reap_expired().expect("reap"), 1, "only the short row");
+    clock.advance(seconds(3600));
+    assert_eq!(
+        durable.ended(long).expect("read"),
+        None,
+        "past the retention"
+    );
+}
+
+/// Catches: a `done/` row that is not a result read as one (a caller would be sent
+/// whatever the bytes decode to), and one that names its row.
+#[test]
+fn a_result_row_that_is_not_a_result_is_refused_naming_it() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    put(&store, &done_key(OperationId(7)), vec![9, 9]);
+    let refused = durable.ended(OperationId(7)).expect_err("junk");
+    assert!(
+        matches!(&refused, StateError::Corrupt { key, .. } if key == "done/0000000000000007"),
+        "{refused:?}"
+    );
+}
+
+/// Catches: a generation read from a row that is not there as 0 (a farm over an unfenced
+/// store names its operations by the epoch, as before) or one that is read wrong.
+#[test]
+fn the_generation_is_the_stored_number_or_none() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    assert_eq!(durable.generation().expect("read"), None);
+    put(&store, GENERATION, 42u64.to_be_bytes().to_vec());
+    assert_eq!(durable.generation().expect("read"), Some(42));
+}
