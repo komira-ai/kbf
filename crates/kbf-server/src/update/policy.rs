@@ -7,13 +7,13 @@ use super::facts::Platform;
 
 /// Every setting and limit of a node update. [`Policy::default`] is the design's defaults.
 ///
-/// **The `update/policy` row** (`pull-updates.md` section 6.2) has eight fields: `auto_nodes`,
-/// `auto_frontend`, `idle_wait`, `min_serving`, `max_hosts_out`, `mac_force_after`,
-/// `new_work_only_to_updated` and `accept_failing_builds`. The module reads `idle_wait`,
-/// `min_serving`, `max_hosts_out` and `mac_force_after`. The other four are carried in the
-/// row and not acted on: they belong to the poller, the frontend step and the dispatcher.
-/// Every other field here is a limit of the node step; the row carries one only if it
-/// differs from the default, and a writer that knows only the eight leaves them at the
+/// **The `update/policy` row** (`pull-updates.md` section 6.2) has nine fields: `auto_nodes`,
+/// `auto_frontend`, `paused`, `idle_wait`, `min_serving`, `max_hosts_out`, `mac_force_after`,
+/// `new_work_only_to_updated` and `accept_failing_builds`. The module reads `paused`,
+/// `idle_wait`, `min_serving`, `max_hosts_out` and `mac_force_after`. The other four are
+/// carried in the row and not acted on: they belong to the poller, the frontend step and the
+/// dispatcher. Every other field here is a limit of the node step; the row carries one only
+/// if it differs from the default, and a writer that knows only the nine leaves them at the
 /// default ([`super::Rows::set_policy`]).
 ///
 /// A limit marked *not in the design* has no value there: the table names the failure but
@@ -27,6 +27,10 @@ pub struct Policy {
     pub auto_nodes: bool,
     /// As `auto_nodes`, for the frontend's own update. Carried; not read by this module.
     pub auto_frontend: bool,
+    /// Whether no host may be started: hosts already in a step finish, and a run that is
+    /// offered while this is set waits until it is cleared ([`super::Rows::set_paused`]).
+    /// Read by the controller at every look; false by default.
+    pub paused: bool,
     /// Whether the dispatcher gives new work only to hosts at the target release (D2; the
     /// default is to dispatch to every host). Carried; not read by this module.
     pub new_work_only_to_updated: bool,
@@ -83,6 +87,7 @@ impl Default for Policy {
         Self {
             auto_nodes: false,
             auto_frontend: false,
+            paused: false,
             new_work_only_to_updated: false,
             accept_failing_builds: false,
             ttl: Duration::from_secs(15),

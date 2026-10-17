@@ -194,9 +194,14 @@ impl Transport for Counting {
         self.inner.activate(host, order, release)
     }
 
-    fn confirm(&mut self, host: &WorkerId, order: OrderId) -> Result<(), TransportError> {
+    fn confirm(
+        &mut self,
+        host: &WorkerId,
+        order: OrderId,
+        release: &Release,
+    ) -> Result<(), TransportError> {
         self.one();
-        self.inner.confirm(host, order)
+        self.inner.confirm(host, order, release)
     }
 
     fn alert(&mut self, host: &WorkerId, alert: &Alert) -> Result<(), TransportError> {

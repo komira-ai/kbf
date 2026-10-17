@@ -44,7 +44,8 @@ pub enum Command {
         /// The id of the order; the helper's status names it.
         order: OrderId,
     },
-    /// Order `CONFIRM` of the activation `order`: the helper cancels its revert timer.
+    /// Order `CONFIRM` of the activation `order`: the helper cancels its revert timer. Like
+    /// `Activate`, it names the host's commit, which the controller takes from the host's row.
     Confirm {
         /// The activation being confirmed.
         order: OrderId,

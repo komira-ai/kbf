@@ -459,9 +459,14 @@ impl Transport for Spy {
         self.inner.activate(host, order, release)
     }
 
-    fn confirm(&mut self, host: &WorkerId, order: OrderId) -> Result<(), TransportError> {
-        self.look(host, Gave::Confirm(order));
-        self.inner.confirm(host, order)
+    fn confirm(
+        &mut self,
+        host: &WorkerId,
+        order: OrderId,
+        release: &Release,
+    ) -> Result<(), TransportError> {
+        self.look(host, Gave::Confirm(order, release.as_str().to_owned()));
+        self.inner.confirm(host, order, release)
     }
 
     fn alert(&mut self, host: &WorkerId, alert: &Alert) -> Result<(), TransportError> {

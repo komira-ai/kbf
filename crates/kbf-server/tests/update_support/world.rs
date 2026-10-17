@@ -88,8 +88,8 @@ pub enum Gave {
     Undown,
     /// An activate order to the helper, naming the release it flips to.
     Activate(OrderId, String),
-    /// A confirm order to the helper.
-    Confirm(OrderId),
+    /// A confirm order to the helper, naming the release the activation flipped to.
+    Confirm(OrderId, String),
 }
 
 /// An order and when and for whom it was given.
@@ -565,14 +565,29 @@ impl Inner {
         Ok(())
     }
 
-    fn confirm(&mut self, host: &WorkerId, order: OrderId) -> Result<(), TransportError> {
+    /// A confirm of the activation the helper last acted on must name the release that
+    /// activation flipped the host to (the host reports it by now): the helper confirms what
+    /// it flipped, not what a later offer names.
+    fn confirm(
+        &mut self,
+        host: &WorkerId,
+        order: OrderId,
+        release: &Release,
+    ) -> Result<(), TransportError> {
         self.outage()?;
         let now = self.now;
-        self.note(host, Gave::Confirm(order));
+        self.note(host, Gave::Confirm(order, release.as_str().to_owned()));
         let at = self.host_index(host.as_str());
         let truth = &mut self.hosts[at];
-        if truth.last_order == Some(order) && truth.confirm_at.is_none() {
-            truth.confirm_at = Some(now + 1);
+        if truth.last_order == Some(order) {
+            assert_eq!(
+                *release, truth.reported,
+                "{} was confirmed for a release it was not flipped to",
+                truth.name
+            );
+            if truth.confirm_at.is_none() {
+                truth.confirm_at = Some(now + 1);
+            }
         }
         Ok(())
     }
@@ -650,8 +665,13 @@ impl Transport for World {
         self.lock().activate(host, order, release)
     }
 
-    fn confirm(&mut self, host: &WorkerId, order: OrderId) -> Result<(), TransportError> {
-        self.lock().confirm(host, order)
+    fn confirm(
+        &mut self,
+        host: &WorkerId,
+        order: OrderId,
+        release: &Release,
+    ) -> Result<(), TransportError> {
+        self.lock().confirm(host, order, release)
     }
 
     fn alert(&mut self, host: &WorkerId, alert: &Alert) -> Result<(), TransportError> {

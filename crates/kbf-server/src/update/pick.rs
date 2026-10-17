@@ -195,11 +195,16 @@ impl<'a> Out<'a> {
             SlotClass::Storage => &self.storage,
             SlotClass::Host => &self.hosts,
         };
-        match out.first() {
-            Some(host) if facts.slot.holds(host) => WaitReason::SlotHeld((*host).clone()),
-            Some(host) => WaitReason::HostInStep((*host).clone()),
-            None => WaitReason::NoneEligible(Vec::new()),
-        }
+        // Every caller asks about a class with no room, which has a host in it; the empty
+        // answer is the total function's last resort.
+        out.first()
+            .map_or(WaitReason::NoneEligible(Vec::new()), |host| {
+                if facts.slot.holds(host) {
+                    WaitReason::SlotHeld((*host).clone())
+                } else {
+                    WaitReason::HostInStep((*host).clone())
+                }
+            })
     }
 }
 
