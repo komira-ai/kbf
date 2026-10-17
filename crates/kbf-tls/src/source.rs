@@ -198,11 +198,8 @@ impl TlsSource {
             }
             Err(e) => {
                 shared.rejected.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    listener = shared.listener,
-                    error = %e,
-                    "TLS files changed but are not usable; still serving the previous ones"
-                );
+                let listener = shared.listener;
+                tracing::warn!(listener, error = %e, "TLS files unusable; previous ones kept");
                 Outcome::Rejected
             }
         }
