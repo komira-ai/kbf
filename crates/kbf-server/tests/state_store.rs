@@ -1629,6 +1629,66 @@ async fn a_stale_refusal_of_a_never_tried_effect_drops_it() {
     drop(starts(&mut inbox));
 }
 
+/// Catches: a report that lands in the feed that expires its lease, with a healthy
+/// store. The scheduler lets the worker's result decide the operation, but the farm's own
+/// requeue had already deleted the lease row, so the answer's write read "row is gone" as
+/// stale: the caller was never answered and the op and queue rows stayed behind, for a
+/// restart to run the finished operation again. The caller is answered and no row is left.
+#[tokio::test(start_paused = true)]
+async fn a_report_in_the_feed_that_expires_its_lease_is_answered_and_leaves_no_rows() {
+    let disk = Disk::new();
+    let (farm, ticket, lease) = running(&disk).await;
+    tokio::time::advance(kbf_sched::fence::LEASE_GRACE + Duration::from_secs(1)).await;
+    assert!(accepted(&farm, lease).await);
+    let Finished::Failed(status) = ended(&ticket) else {
+        panic!("the caller was not answered");
+    };
+    assert_eq!(status.message, "test");
+    assert_eq!(farm.dropped_writes(), 0);
+    assert_eq!(
+        (disk.rows("lease/"), disk.rows("op/"), disk.rows("queue/")),
+        (0, 0, 0),
+        "rows of a finished operation were left"
+    );
+}
+
+/// Catches: the same report with the store down, so its answer is held and the requeue
+/// is written first when the store returns: the retry read "row is gone" as its work
+/// done and delivered the answer without writing it, leaving the op and queue rows (the
+/// operation runs again after a restart). The answer is written for real: the caller is
+/// answered once, from the original report, no second `Start` goes out, no row is left.
+#[tokio::test(start_paused = true)]
+async fn a_held_answer_for_a_lease_the_farm_gave_up_is_written_and_delivered_once() {
+    let disk = Disk::new();
+    let (farm, ticket, lease) = running(&disk).await;
+    let (stream, mut inbox) = register(&farm);
+    tokio::time::advance(kbf_sched::fence::LEASE_GRACE + Duration::from_secs(1)).await;
+    disk.store.set_down(true);
+    assert!(!accepted(&farm, lease).await);
+    assert!(
+        !matches!(*ticket.stage.borrow(), Stage::Done(_)),
+        "answered before the store took the result"
+    );
+    disk.store.set_down(false);
+    for _ in 0..3 {
+        farm.tick().await;
+    }
+    assert!(farm.heartbeat(&node(), stream, 1, Vec::new()).await);
+    farm.tick().await;
+    let Finished::Failed(status) = ended(&ticket) else {
+        panic!("the caller was not answered");
+    };
+    assert_eq!(status.message, "test", "not the original report");
+    assert!(starts(&mut inbox).is_empty(), "the operation was run again");
+    assert_eq!(farm.dropped_writes(), 0);
+    assert_eq!(
+        (disk.rows("lease/"), disk.rows("op/"), disk.rows("queue/")),
+        (0, 0, 0),
+        "rows of a finished operation were left"
+    );
+    assert_eq!(disk.rows("done/"), 1);
+}
+
 /// Catches: an unbounded list of refused `done/` rows: past the cap a new one is
 /// dropped, logged and counted.
 #[tokio::test(start_paused = true)]
