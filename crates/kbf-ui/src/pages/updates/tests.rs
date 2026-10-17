@@ -35,6 +35,8 @@ fn the_page_shows_the_farm_the_releases_the_frontend_and_the_hosts() {
         "<dt>Set at</dt><dd>2026-10-07T10:46:40Z</dd>",
         "<dt>Policy auto_nodes</dt><dd>not set</dd>",
         "<dt>Hosts up to date</dt><dd>1 of 2 judged, 3 hosts in all</dd>",
+        "<dt>Update available</dt><dd>1 hosts (",
+        "<dt>Other complete releases</dt><dd>none</dd>",
         "running</span>",
         "<h2>Frontend</h2>",
         &format!("<dt>Commit</dt><dd>{COMMIT_B}</dd>"),
@@ -168,6 +170,7 @@ fn the_host_table_shows_each_host_with_its_detail() {
         "Running",
         "Desired",
         "Up to date",
+        "Update available",
         "Step",
         "Availability",
         "Last error",
@@ -185,7 +188,7 @@ fn the_host_table_shows_each_host_with_its_detail() {
         row("linux-1"),
         format!(
             "<tr><td>linux-1</td><td>linux (kbf)</td><td>-</td><td>bbbbbbbbbbbb</td>\
-             <td>{COMMIT_B}</td><td>yes</td><td>confirmed</td>\
+             <td>{COMMIT_B}</td><td>yes</td><td>no</td><td>confirmed</td>\
              <td><span class=\"pill ok\">ok</span></td><td>-</td>"
         )
     );
@@ -193,7 +196,7 @@ fn the_host_table_shows_each_host_with_its_detail() {
         row("mac-1"),
         format!(
             "<tr><td>mac-1</td><td>darwin (kbf-daemon)</td><td>-</td><td>aaaaaaaaaaaa</td>\
-             <td>{COMMIT_B}</td><td>no</td><td>refused</td>\
+             <td>{COMMIT_B}</td><td>no</td><td>yes</td><td>refused</td>\
              <td><span class=\"pill ok\">ok</span></td><td>no helper installed</td>"
         )
     );
@@ -201,7 +204,7 @@ fn the_host_table_shows_each_host_with_its_detail() {
     assert_eq!(
         row("old-1"),
         "<tr><td>old-1</td><td>unknown</td><td>-</td><td>-</td><td>-</td>\
-         <td>not judged</td><td>-</td>\
+         <td>not judged</td><td>no</td><td>-</td>\
          <td><span class=\"pill pending\">unsupported</span></td><td>-</td>"
     );
 }
@@ -282,7 +285,7 @@ fn a_refused_detail_route_removes_the_detail_columns_and_keeps_the_summary() {
         assert!(
             html.contains(
                 "<tr><td>mac-1</td><td>darwin (kbf-daemon)</td><td>-</td><td>no</td>\
-                 <td>refused</td><td><span class=\"pill ok\">ok</span></td></tr>"
+                 <td>yes</td><td>refused</td><td><span class=\"pill ok\">ok</span></td></tr>"
             ),
             "{html}"
         );
@@ -507,4 +510,115 @@ fn only_the_updates_path_is_the_page() {
         assert_eq!(render(&fake, path).status(), 404, "{path}");
     }
     assert!(fake.seen().is_empty());
+}
+
+fn releases_doc(desired: &str, releases: Value) -> Value {
+    let mut update = update_doc();
+    update["desired"]["commit"] = json!(desired);
+    update["releases"] = json!({ "releases": releases });
+    update
+}
+
+fn complete(commit: &str, platform: &str) -> Value {
+    json!({"commit": commit, "platforms": [{"platform": platform, "complete": true}]})
+}
+
+/// Catches: "update available" decided wrongly. The rule: other complete releases are
+/// the complete ones whose commit is not the desired one (rows carry no time, so never
+/// "newer"); a host has an update when judged behind and the desired release is
+/// complete for its platform. Mutants: the desired release counted among the others
+/// (shown when it is the only complete one); another complete release not listed; an
+/// incomplete release counted; a host not judged behind shown as available; the
+/// desired release's platform not checked (a Mac behind while only linux is complete).
+#[test]
+fn update_available_follows_the_rule() {
+    let (_, html) = page(&farm_with(&releases_doc(
+        COMMIT_B,
+        json!([complete(COMMIT_B, "linux-arm64")]),
+    )));
+    assert!(
+        html.contains("<dt>Other complete releases</dt><dd>none</dd>"),
+        "{html}"
+    );
+    let (_, html) = page(&farm_with(&releases_doc(
+        COMMIT_B,
+        json!([
+            complete(COMMIT_B, "linux-arm64"),
+            complete(COMMIT_A, "linux-x86_64")
+        ]),
+    )));
+    assert!(
+        html.contains(&format!(
+            "<dt>Other complete releases</dt><dd>{COMMIT_A} (not necessarily newer"
+        )),
+        "{html}"
+    );
+    // An incomplete release never counts, whole or in part.
+    let incomplete = json!({"commit": COMMIT_A, "platforms": [
+        {"platform": "linux-x86_64", "complete": true},
+        {"platform": "darwin-arm64", "complete": false}]});
+    let none = json!({"commit": COMMIT_A, "platforms": []});
+    let (_, html) = page(&farm_with(&releases_doc(
+        COMMIT_B,
+        json!([complete(COMMIT_B, "linux-arm64"), incomplete, none]),
+    )));
+    assert!(
+        html.contains("<dt>Other complete releases</dt><dd>none</dd>"),
+        "{html}"
+    );
+    // mac-1 is behind but the desired release is complete only on linux: no update.
+    assert!(
+        html.contains("<dt>Update available</dt><dd>0 hosts ("),
+        "{html}"
+    );
+    assert!(
+        html.contains("<td>no</td><td>no</td><td>refused</td>"),
+        "{html}"
+    );
+    // Complete on darwin: the Mac has an update, the current Linux host does not.
+    let (_, html) = page(&farm_with(&releases_doc(
+        COMMIT_B,
+        json!([complete(COMMIT_B, "darwin-arm64")]),
+    )));
+    assert!(
+        html.contains("<dt>Update available</dt><dd>1 hosts ("),
+        "{html}"
+    );
+    assert!(
+        html.contains("<td>no</td><td>yes</td><td>refused</td>"),
+        "{html}"
+    );
+    assert!(
+        html.contains("<td>yes</td><td>no</td><td>confirmed</td>"),
+        "{html}"
+    );
+}
+
+/// Catches: the detail rows matched to hosts by a folded key. Two node ids that differ
+/// only in case are two hosts with their own detail. Mutant: the map keyed by the
+/// lowercased node id.
+#[test]
+fn node_ids_differing_only_in_case_keep_their_own_detail() {
+    let up = json!({"state": "confirmed", "up_to_date": true, "availability": "ok"});
+    let nodes = json!({"server": {"version": "0", "commit": COMMIT_B}, "nodes": [
+        node("Node-A", Some("Linux"), &up), node("node-a", Some("Linux"), &up)]});
+    let host = |id: &str, running: &str| {
+        json!({"node_id": id, "desired_commit": COMMIT_B, "running_commit": running,
+               "refusal": ""})
+    };
+    let hosts = json!({"next_page_token": null, "hosts": [
+        host("Node-A", "111111111111"), host("node-a", "222222222222")]});
+    let fake = Fake::default()
+        .json("/v1/update", &update_doc())
+        .json("/v1/nodes", &nodes)
+        .json(HOSTS_URL, &hosts);
+    let (_, html) = page(&fake);
+    assert!(
+        html.contains("<tr><td>Node-A</td><td>linux (kbf)</td><td>-</td><td>111111111111</td>"),
+        "{html}"
+    );
+    assert!(
+        html.contains("<tr><td>node-a</td><td>linux (kbf)</td><td>-</td><td>222222222222</td>"),
+        "{html}"
+    );
 }

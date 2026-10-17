@@ -47,7 +47,7 @@ pub(crate) async fn updates<S: Source>(source: &S) -> Answer {
         farm_block(h, &update, &nodes.nodes);
         releases(h, update.desired.as_ref(), &update.releases.releases);
         frontend(h, &nodes.server.commit);
-        hosts(h, &nodes.nodes, &detail);
+        hosts(h, &update, &nodes.nodes, &detail);
         command(h, update.desired.as_ref());
     });
     Answer::html(200, body)
@@ -83,6 +83,48 @@ async fn load<S: Source>(
     Ok((update, nodes, detail))
 }
 
+/// A release is complete when it lists at least one platform and every platform it
+/// lists is complete. The rows carry no time and no list of required platforms, so a
+/// release missing a platform entirely cannot be told from one that never had it.
+fn release_complete(release: &Release) -> bool {
+    !release.platforms.is_empty() && release.platforms.iter().all(|p| p.complete)
+}
+
+/// The commits of complete releases other than the desired one. The release rows have
+/// no created or fetched time, so these are "other", never "newer": the page does not
+/// invent an order the API does not give.
+fn other_complete(update: &UpdateDoc) -> Vec<&str> {
+    let desired = update.desired.as_ref().map(|d| d.commit.as_str());
+    update
+        .releases
+        .releases
+        .iter()
+        .filter(|r| release_complete(r) && Some(r.commit.as_str()) != desired)
+        .map(|r| r.commit.as_str())
+        .collect()
+}
+
+/// Whether the desired release has a complete platform for this host's platform
+/// (`linux` or `darwin`, matched on the platform's prefix: the node reports no CPU).
+fn desired_fits(update: &UpdateDoc, node: &Node) -> bool {
+    let (Some(d), Some((os, _))) = (update.desired.as_ref(), node_platform(node)) else {
+        return false;
+    };
+    update
+        .releases
+        .releases
+        .iter()
+        .filter(|r| r.commit == d.commit)
+        .flat_map(|r| &r.platforms)
+        .any(|p| p.complete && p.platform.starts_with(os))
+}
+
+/// A host has an update available when it is judged behind (`up_to_date == false`) and
+/// the desired release is complete for its platform.
+fn update_available(update: &UpdateDoc, node: &Node) -> bool {
+    node.update.up_to_date == Some(false) && desired_fits(update, node)
+}
+
 fn farm_block(h: &mut Html, update: &UpdateDoc, nodes: &[Node]) {
     h.el("section", &[attr("class", "card")], |h| {
         h.el("h2", &[], |h| {
@@ -115,7 +157,9 @@ fn farm_block(h: &mut Html, update: &UpdateDoc, nodes: &[Node]) {
             .iter()
             .filter(|n| n.update.up_to_date == Some(true))
             .count();
-        let fields: [(&str, String); 5] = [
+        let behind = nodes.iter().filter(|n| update_available(update, n)).count();
+        let others = other_complete(update);
+        let fields: [(&str, String); 7] = [
             ("Desired release", desired),
             ("Set at", set_at),
             ("Policy auto_nodes", flag("auto_nodes").to_owned()),
@@ -124,6 +168,24 @@ fn farm_block(h: &mut Html, update: &UpdateDoc, nodes: &[Node]) {
                 "Hosts up to date",
                 format!("{current} of {judged} judged, {} hosts in all", nodes.len()),
             ),
+            (
+                "Update available",
+                format!(
+                    "{behind} hosts (judged behind, and the desired release is complete \
+                     for their platform)"
+                ),
+            ),
+            (
+                "Other complete releases",
+                if others.is_empty() {
+                    "none".to_owned()
+                } else {
+                    format!(
+                        "{} (not necessarily newer: release rows carry no time)",
+                        others.join(", ")
+                    )
+                },
+            ),
         ];
         definitions(h, &fields);
     });
@@ -131,7 +193,7 @@ fn farm_block(h: &mut Html, update: &UpdateDoc, nodes: &[Node]) {
 
 /// The release store's commits, each platform complete or not with the component it
 /// needs. The store lists commits in commit order, not time, so the page does not
-/// say which is newest.
+/// say which is newest; the farm block names the complete ones other than desired.
 fn releases(h: &mut Html, desired: Option<&Desired>, releases: &[Release]) {
     h.el("h2", &[], |h| {
         h.text("Releases");
@@ -227,7 +289,7 @@ fn frontend(h: &mut Html, commit: &str) {
     definitions(h, &fields);
 }
 
-fn hosts(h: &mut Html, nodes: &[Node], detail: &Detail) {
+fn hosts(h: &mut Html, update: &UpdateDoc, nodes: &[Node], detail: &Detail) {
     h.el("h2", &[], |h| {
         h.text("Hosts");
     });
@@ -262,7 +324,7 @@ fn hosts(h: &mut Html, nodes: &[Node], detail: &Detail) {
                 let head = ["Node", "Platform", "Role"]
                     .into_iter()
                     .chain(by_node.iter().flat_map(|_| detail_columns))
-                    .chain(["Up to date", "Step", "Availability"])
+                    .chain(["Up to date", "Update available", "Step", "Availability"])
                     .chain(by_node.iter().map(|_| "Last error"));
                 for name in head {
                     h.el("th", &[attr("scope", "col")], |h| {
@@ -273,7 +335,7 @@ fn hosts(h: &mut Html, nodes: &[Node], detail: &Detail) {
         });
         h.el("tbody", &[], |h| {
             for node in nodes {
-                host_row(h, node, by_node);
+                host_row(h, node, update_available(update, node), by_node);
             }
         });
     });
@@ -289,7 +351,12 @@ fn absent_reason(e: &ReadError) -> String {
     }
 }
 
-fn host_row(h: &mut Html, node: &Node, by_node: Option<&HashMap<String, crate::api::Host>>) {
+fn host_row(
+    h: &mut Html,
+    node: &Node,
+    available: bool,
+    by_node: Option<&HashMap<String, crate::api::Host>>,
+) {
     let platform = node_platform(node).map_or_else(
         || "unknown".to_owned(),
         |(os, component)| format!("{os} ({component})"),
@@ -327,6 +394,7 @@ fn host_row(h: &mut Html, node: &Node, by_node: Option<&HashMap<String, crate::a
             cell(h, &commit(host.map(|x| &x.desired_commit)));
         }
         cell(h, up_to_date);
+        cell(h, if available { "yes" } else { "no" });
         cell(h, node.update.state.as_deref().unwrap_or("-"));
         h.el("td", &[], |h| pill(h, availability, class));
         if let Some(host) = detail {
