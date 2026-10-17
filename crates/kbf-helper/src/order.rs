@@ -12,6 +12,12 @@ use serde::Deserialize;
 /// The suffix of an order file.
 pub const SUFFIX: &str = ".json";
 
+/// How far above the last acted-on epoch an order's may be. Epochs move only when a store is
+/// restored (a handover keeps it), so a jump of more than this is a mistake or an attack;
+/// either would put every real order below it. Such an order is refused, not acknowledged.
+/// Not applied to the first order a host acts on (it has no epoch to measure from).
+pub const MAX_EPOCH_JUMP: u64 = 1000;
+
 /// The biggest order file read.
 pub const MAX_BYTES: u64 = 4096;
 

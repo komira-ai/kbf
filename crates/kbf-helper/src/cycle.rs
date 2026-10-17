@@ -277,6 +277,21 @@ impl<E: Exec> Helper<E> {
                 .map_err(|r| format!("{}: {r}", r.code()))
                 .and_then(|bytes| order::parse(id, &bytes).map_err(|e| e.to_string()));
             match parsed {
+                Ok(o)
+                    if memory.acked_epoch != 0
+                        && o.epoch > memory.acked_epoch.saturating_add(order::MAX_EPOCH_JUMP) =>
+                {
+                    refuse(
+                        memory,
+                        &format!(
+                            "order {id} is from epoch {}, more than {} above the last acted on ({}): \
+                             not acted on",
+                            o.epoch,
+                            order::MAX_EPOCH_JUMP,
+                            memory.acked_epoch
+                        ),
+                    );
+                }
                 Ok(o) if o.epoch < memory.acked_epoch => {
                     refuse(
                         memory,
