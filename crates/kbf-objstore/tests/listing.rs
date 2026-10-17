@@ -115,6 +115,57 @@ async fn every_case_over_a_file_store() {
     std::fs::remove_dir_all(&dir).expect("remove");
 }
 
+/// A listing resumed with [`ListToken::after`] a key, as a rebuild resumes after a
+/// restart from the last key it handled: the store's own first page and the whole
+/// stream hold exactly the keys after it, for a key at the start, the middle and the
+/// end of the prefix, a key that was never written, and a key before the prefix.
+async fn resumes_after_a_key<S: ObjectStore>(store: &S) {
+    write_keys(store).await;
+    let p = prefix("p/");
+    let cases: [(&str, &[&str]); 5] = [
+        ("o", &UNDER_P),
+        ("p/a/b", &UNDER_P[1..]),
+        ("p/k1", &UNDER_P[4..]),
+        ("p/k1x", &UNDER_P[4..]),
+        ("p/k4", &[]),
+    ];
+    for (k, rest) in cases {
+        let from = ListToken::after(&key(k));
+        // The store itself, not only the stream (which refuses a key not after `k`).
+        let first = store.list(&p, Some(&from), size(2)).await.expect("list");
+        let keys: Vec<&str> = first.objects.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, rest[..rest.len().min(2)], "first page after {k}");
+        for page in [1, 2, 1000] {
+            assert_eq!(
+                listed(store, &p, Some(from.clone()), page).await,
+                rest,
+                "after {k} in pages of {page}"
+            );
+        }
+    }
+}
+
+/// Catches: a resume that starts at its key (an inclusive `after`) or back at the start
+/// of the prefix, over the in-memory store. A resume that skipped a key would leave a
+/// segment out of a rebuilt index: a false miss once the rebuild ends.
+#[tokio::test]
+async fn a_listing_resumed_after_a_key_lists_only_the_rest_over_the_memory_store() {
+    resumes_after_a_key(&MemoryStore::new(Capabilities::default())).await;
+}
+
+/// The same over a `file://` store (its window crossing is a unit test in `fs_store.rs`).
+#[tokio::test]
+async fn a_listing_resumed_after_a_key_lists_only_the_rest_over_a_file_store() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("kbf-objstore-listing-resumed")
+        .join(std::process::id().to_string());
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = FsStore::open(&dir, Floor::Bytes(1)).expect("open");
+    resumes_after_a_key(&store).await;
+    drop(store);
+    std::fs::remove_dir_all(&dir).expect("remove");
+}
+
 /// Catches: a prefix or key with a character outside kbf's alphabet (here, non-ASCII)
 /// reaching a store, where S3 and a local store would encode or compare it differently.
 #[test]

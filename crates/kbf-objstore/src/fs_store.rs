@@ -879,4 +879,45 @@ mod tests {
         drop(store);
         fs::remove_dir_all(&dir).expect("remove");
     }
+
+    /// Catches a fresh listing [`ListToken::after`] a key that walks from the start of
+    /// the prefix (with more keys before the resume key than the window holds, the
+    /// window is used up before it and the listing ends empty), or that starts at the
+    /// key: resumed after a/2 and after a/5 through a window of 3, in pages of 1 and 2,
+    /// the listing is exactly the keys after it, in order.
+    #[tokio::test]
+    async fn a_file_store_listing_resumed_past_its_window_lists_only_the_rest() {
+        let dir = std::env::temp_dir().join(format!("kbf-objstore-resume.{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = FsStore::open(&dir, Floor::Bytes(1)).expect("open");
+        Arc::get_mut(&mut store.inner).expect("one handle").window = 3;
+        for i in 0..9 {
+            let k = key(&format!("a/{i}"));
+            store
+                .put_new(&k, Bytes::from_static(b"x"), None)
+                .await
+                .expect("put");
+        }
+        let a = KeyPrefix::new("a/").expect("prefix");
+        for (from, first) in [("a/2", 3), ("a/5", 6)] {
+            for size in [1, 2] {
+                let size = PageSize::new(size).expect("size");
+                let (mut got, mut after) = (Vec::new(), Some(ListToken::after(&key(from))));
+                loop {
+                    let page = store.list(&a, after.as_ref(), size).await.expect("list");
+                    got.extend(page.objects.into_iter().map(|o| o.key.as_str().to_owned()));
+                    // A listing that repeats a key would otherwise never end.
+                    assert!(got.len() <= 9, "after {from}: a key listed twice: {got:?}");
+                    match page.next {
+                        Some(t) => after = Some(t),
+                        None => break,
+                    }
+                }
+                let want: Vec<String> = (first..9).map(|i| format!("a/{i}")).collect();
+                assert_eq!(got, want, "after {from} in pages of {}", size.get());
+            }
+        }
+        drop(store);
+        fs::remove_dir_all(&dir).expect("remove");
+    }
 }
