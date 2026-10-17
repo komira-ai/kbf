@@ -258,6 +258,16 @@ fn quick() -> Liveness {
     }
 }
 
+/// Catches `liveness()` answering something other than what `with_liveness` set (the
+/// default always, or one field for another): the daemon's tests read its flags back
+/// through it.
+#[test]
+fn the_nodes_report_the_liveness_they_were_given() {
+    let pki = Pki::new();
+    assert_eq!(pki.nodes().liveness(), Liveness::default());
+    assert_eq!(pki.nodes_with(quick()).liveness(), quick());
+}
+
 /// Reads `digest` whole through `router`, or fails the test if the read is stuck.
 async fn read_whole(router: &Router, digest: &kbf_types::Digest) -> Vec<u8> {
     let read = tokio::time::timeout(STUCK, router.read_blob(digest)).await;

@@ -15,7 +15,8 @@ use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 use tonic::Request;
-use tonic::transport::server::{Connected, TcpConnectInfo, TcpIncoming};
+use tonic::codegen::http::Extensions;
+use tonic::transport::server::{Connected, TcpConnectInfo, TcpIncoming, TlsConnectInfo};
 
 use crate::source::{Poller, TlsSource};
 
@@ -236,6 +237,18 @@ pub fn peer_certs<T>(request: &Request<T>) -> Option<Chain> {
     match request.extensions().get::<ConnInfo>() {
         Some(info) => info.certs.clone(),
         None => request.peer_certs(),
+    }
+}
+
+/// [`peer_certs`] for a layer, which sees the HTTP request's extensions before tonic
+/// has made a `Request` of it.
+#[must_use]
+pub fn peer_certs_of(extensions: &Extensions) -> Option<Chain> {
+    match extensions.get::<ConnInfo>() {
+        Some(info) => info.certs.clone(),
+        None => extensions
+            .get::<TlsConnectInfo<TcpConnectInfo>>()
+            .and_then(TlsConnectInfo::peer_certs),
     }
 }
 

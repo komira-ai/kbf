@@ -311,8 +311,7 @@ fn the_all_in_one_unit_waits_for_readyz_and_installs_a_new_kbf() {
     );
 }
 
-/// The refusals, each before any step: a mode not built yet (its unit would exit 2), a
-/// key file others can read or another user owns, a file the unit reads missing, a
+/// The refusals, each before any step: a key file others can read or another user owns, a file the unit reads missing, a
 /// unit kbf's own parser refuses (rule `parse`), a kbf that is not there, a build node
 /// whose user does not linger, and a storage node with no S3 endpoint set.
 /// Catches each of these installed anyway.
@@ -326,14 +325,6 @@ fn an_install_is_refused_before_any_step() {
             Err(e) => e,
         }
     };
-    let none = |_: &ScratchHost, _: &RefCell<World>| {};
-    for mode in Mode::ALL.iter().copied().filter(|m| !m.is_built()) {
-        let e = refused(&format!("unbuilt-{mode}"), mode, &none);
-        assert!(
-            matches!(e, HostError::NotBuilt(m) if m == mode.name()),
-            "{e}"
-        );
-    }
     let e = refused("readable-key", Mode::Storage, &|exec, _| {
         write(exec, "/etc/kbf/storage.key", "secret", 0o640);
     });
@@ -433,5 +424,63 @@ fn optional_environment_files_are_not_required_and_a_directory_is_no_file() {
     assert!(
         matches!(&e, HostError::Missing(p) if p.as_str() == "/etc/kbf/dir.env"),
         "{e}"
+    );
+}
+
+/// The frontend on a fresh host: its unit, then the SQLite state store's directory made
+/// the server user's alone before the unit starts, and the wait for `/readyz` on the
+/// operator API it now serves (it was refused as not built). Catches the state directory
+/// left for kbf to make (it runs as a user that cannot write under `/var/lib`), a
+/// frontend unit started with no readiness wait, and the frontend refused again.
+#[test]
+fn the_frontend_unit_is_installed_with_its_state_directory() {
+    let (exec, _) = host("install-mode-frontend");
+    let (uid, gid) = me();
+    let a = install(Mode::Frontend, None);
+    let (p, _) = plan_here(&exec, &a).expect("plan");
+    assert_eq!(
+        tail(&p),
+        [
+            "mkdir /var/lib/kbf-server (0755)".to_owned(),
+            format!("mkdir /var/lib/kbf-server/state (0700, owner {uid}:{gid})"),
+            "run /usr/bin/systemctl daemon-reload".to_owned(),
+            "run /usr/bin/systemctl enable kbf-frontend.service".to_owned(),
+            "run /usr/bin/systemctl restart kbf-frontend.service".to_owned(),
+            "wait up to 60s for http://127.0.0.1:8982/readyz".to_owned(),
+        ]
+    );
+}
+
+/// The directories each unit's flags make, from the rendered units: the storage-and-daemon
+/// unit's metadata log and hot store beside its data directory, the frontend's state
+/// directory (the parent of the SQLite file, from the flag), the all-in-one's none
+/// beyond its own. Catches a flag whose directory is left to kbf, which makes it as a
+/// user that may not, and a state directory taken from the wrong flag.
+#[test]
+fn the_directories_come_from_the_flags_the_units_carry() {
+    let dirs = |mode: Mode| {
+        let c = LinuxConfig::parse(EXAMPLE).expect("valid settings");
+        let text = modes::render(&c, Some(1500), mode).expect("renders");
+        directories(&UnitFile::parse(&text).expect("a unit"))
+            .expect("directories")
+            .into_iter()
+            .map(|(p, bits)| format!("{p} {bits:o}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        dirs(Mode::StorageAndDaemon),
+        [
+            "/var/lib/kbf 755",
+            "/var/lib/kbf-server/raft 700",
+            "/var/lib/kbf-server/hot 700",
+        ]
+    );
+    assert_eq!(dirs(Mode::Frontend), ["/var/lib/kbf-server/state 700"]);
+    assert_eq!(
+        dirs(Mode::Storage),
+        [
+            "/var/lib/kbf-server/raft 700",
+            "/var/lib/kbf-server/hot 700"
+        ]
     );
 }

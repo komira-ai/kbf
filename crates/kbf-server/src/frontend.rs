@@ -404,7 +404,10 @@ fn bind_frontend(
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
     let peers_certified = listeners.worker_tls.is_some();
-    let (peers, worker_tls) = worker_peers(listeners.worker_tls);
+    let (worker_server, peers, worker_tls) = worker_peers(
+        keepalive(flow_control(Server::builder()), listeners.streams),
+        listeners.worker_tls,
+    );
     let tls_sources: Vec<TlsSource> = listeners.reapi_tls.iter().chain(&worker_tls).cloned().collect();
     let reapi_incoming = Incoming::new(reapi_incoming, listeners.reapi_tls);
     let worker_incoming = Incoming::new(worker_incoming, worker_tls);
@@ -422,7 +425,6 @@ fn bind_frontend(
     .merge(metrics_route(backend.clone(), tls_sources));
 
     let reapi_server = keepalive(flow_control(Server::builder()), listeners.streams);
-    let worker_server = keepalive(flow_control(Server::builder()), listeners.streams);
     let sessions = WorkerService::new(
         Arc::clone(&farm),
         peers,

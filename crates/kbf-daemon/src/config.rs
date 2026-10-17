@@ -83,16 +83,16 @@ pub struct Args {
     #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
     pub labels: Vec<(String, String)>,
     /// The longest, in milliseconds, that dialling a storage node may take: for its TCP
-    /// connection and for its TLS handshake each. Must be at least 1.
+    /// connection and for its TLS handshake each. Must be 1 to 3600000 (one hour).
     #[arg(long, default_value_t = STORAGE_LIVENESS_DEFAULT_MS)]
     pub storage_dial_timeout_ms: u64,
     /// How often, in milliseconds, a connection to a storage node with a call on it is
-    /// pinged (HTTP/2 PING). Must be at least 1.
+    /// pinged (HTTP/2 PING). Must be 1 to 3600000 (one hour).
     #[arg(long, default_value_t = STORAGE_LIVENESS_DEFAULT_MS)]
     pub storage_ping_interval_ms: u64,
     /// How long, in milliseconds, a ping to a storage node may go unanswered before the
-    /// connection is dropped and the calls on it fail over to the next owner. Must be at
-    /// least 1 and no more than `--storage-ping-interval-ms`.
+    /// connection is dropped and the calls on it fail over to the next owner. Must be 1
+    /// to 3600000 (one hour) and no more than `--storage-ping-interval-ms`.
     #[arg(long, default_value_t = STORAGE_LIVENESS_DEFAULT_MS)]
     pub storage_ping_timeout_ms: u64,
 }
@@ -100,12 +100,17 @@ pub struct Args {
 /// The default of each `--storage-*-ms` flag: [`Liveness::default`]'s ten seconds.
 const STORAGE_LIVENESS_DEFAULT_MS: u64 = 10_000;
 
+/// The largest value of each `--storage-*-ms` flag: one hour. A value beyond it is a
+/// typo (seconds or microseconds given as milliseconds) or a silent node waited on for
+/// longer than any call is worth.
+const STORAGE_LIVENESS_MAX_MS: u64 = 3_600_000;
+
 impl Args {
     /// How long the daemon waits on a silent storage node, from the `--storage-*-ms`
     /// flags.
     ///
     /// # Errors
-    /// A value is zero, or the ping timeout is longer than the ping interval (a ping
+    /// A value is zero or over one hour, or the ping timeout is longer than the ping interval (a ping
     /// would then be sent before the last one is given up on).
     pub fn storage_liveness(&self) -> Result<Liveness, ConfigError> {
         for (flag, ms) in [
@@ -115,6 +120,9 @@ impl Args {
         ] {
             if ms == 0 {
                 return Err(ConfigError::ZeroDuration(flag));
+            }
+            if ms > STORAGE_LIVENESS_MAX_MS {
+                return Err(ConfigError::DurationTooLong(flag));
             }
         }
         if self.storage_ping_timeout_ms > self.storage_ping_interval_ms {
@@ -190,6 +198,8 @@ pub enum ConfigError {
     NoServer,
     #[error("{0} must be at least 1")]
     ZeroDuration(&'static str),
+    #[error("{0} must be at most 3600000 (one hour)")]
+    DurationTooLong(&'static str),
     #[error(
         "--storage-ping-timeout-ms {timeout_ms} is longer than \
          --storage-ping-interval-ms {interval_ms}"
@@ -484,5 +494,39 @@ mod tests {
             "--storage-ping-timeout-ms 10001 is longer than --storage-ping-interval-ms 10000"
         );
         assert!(parse(&["--storage-dial-timeout-ms=ten"]).is_err());
+    }
+
+    /// Catches a missing or off-by-one upper bound: one hour (3600000 ms) is accepted for
+    /// each flag, one millisecond more is refused naming the flag. (The ping timeout is
+    /// held to the interval too, so its bound is tried with the interval at the bound.)
+    #[test]
+    fn the_storage_liveness_flags_accept_one_hour_and_refuse_a_millisecond_more() {
+        let flags = [
+            "--storage-dial-timeout-ms",
+            "--storage-ping-interval-ms",
+            "--storage-ping-timeout-ms",
+        ];
+        for flag in flags {
+            // The timeout may not pass the interval, so its accepted case lifts both; the
+            // refused case leaves the interval alone, so it is the flag that is named.
+            let lifted = |ms: u64| {
+                let mut args = vec![format!("{flag}={ms}")];
+                if flag == "--storage-ping-timeout-ms" && ms <= 3_600_000 {
+                    args.push(format!("--storage-ping-interval-ms={ms}"));
+                }
+                args
+            };
+            let parsed = |ms: u64| {
+                let args = lifted(ms);
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                parse(&args).expect("parses").storage_liveness()
+            };
+            parsed(3_600_000).expect("one hour is allowed");
+            let error = parsed(3_600_001).expect_err("over an hour");
+            assert_eq!(
+                error.to_string(),
+                format!("{flag} must be at most 3600000 (one hour)")
+            );
+        }
     }
 }
