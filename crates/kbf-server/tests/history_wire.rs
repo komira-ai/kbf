@@ -769,7 +769,7 @@ fn history_objects_needs_a_state_store() {
     );
     assert!(args.state_store.is_none());
     for refused in [
-        args.history.open(None).err().expect("refused"),
+        args.history.open(None).expect_err("refused"),
         with_history(None, &args.history).err().expect("refused"),
     ] {
         assert!(
@@ -899,7 +899,7 @@ async fn a_file_history_store_is_opened_and_held_by_one_server() {
     };
     let first = args.history.open(Some(&state)).expect("opens");
     assert!(first.is_some());
-    let second = args.history.open(Some(&state)).err().expect("held");
+    let second = args.history.open(Some(&state)).expect_err("held");
     assert!(matches!(second, HistoryError::Open(_)), "{second}");
     assert!(
         second.to_string().starts_with("--history-objects: "),
@@ -930,8 +930,7 @@ async fn an_s3_history_store_takes_its_key_pair_from_the_environment() {
     let refused = args
         .history
         .open_with(Some(&state), &none)
-        .err()
-        .expect("no key");
+        .expect_err("no key");
     assert!(
         refused.to_string().contains("AWS_ACCESS_KEY_ID"),
         "{refused}"
