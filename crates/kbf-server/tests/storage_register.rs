@@ -35,6 +35,8 @@ fn dir(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("storage-register")
         .join(name);
+    // A state store left by an earlier run would be a cluster that has already formed.
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("directory");
     dir
 }
@@ -62,6 +64,7 @@ fn config() -> MembershipConfig {
         ttl: 60 * MS,
         dwell: Duration::from_secs(1),
         replication: 2,
+        bootstrap: Duration::ZERO,
     }
 }
 
@@ -492,7 +495,8 @@ fn the_wait_after_failures_doubles_to_a_cap() {
 /// (`start_frontend`, SQLite state store, `--member-ttl-secs` and `--member-dwell-secs`)
 /// and a real node register; a second registrant re-registers until the map the
 /// frontend answers with (published by the refresh that follows a registration) holds the
-/// node at its bound address, Joining. The wait is bounded only to fail a hang.
+/// node at its bound address, `Active` (the first member of a fresh cluster is promoted on
+/// arrival). The wait is bounded only to fail a hang.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
     let d = dir("frontend-mode");
@@ -553,7 +557,7 @@ async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
         }
     })
     .await;
-    assert_eq!(found.state, pb::MemberState::Joining as i32);
+    assert_eq!(found.state, pb::MemberState::Active as i32);
     node_serving.abort();
     drop(stop);
     serving.await.expect("joins").expect("stops");
