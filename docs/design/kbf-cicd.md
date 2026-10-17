@@ -211,7 +211,7 @@ repository carry no per-minute charge (a larger runner does). The default build 
 B-0, not the 20 of T5, which is a likely memory risk. The cost that matters is wall time and queue depth, which is why full is off the
 merge path. Record job duration in the result document so a creeping beta shows in the numbers.
 
-**Container runtime [V].** The CEO rule is crun only. The harness today uses a stand-in runtime over a planted cgroup tree.
+**Container runtime [V].** The project runs containers with crun only. The harness today uses a stand-in runtime over a planted cgroup tree.
 Real crun needs cgroup v2 delegation and a systemd scope; the podman jobs in `ci.yml` arrange that with a `Delegate=yes`
 unit, and the same approach is to be tried for crun on `ubuntu-24.04`. Until that is shown to work (#936), **B-0 uses the
 stand-in**, and the page says what that weakens: the `//:pause` and compile loads run through no real container path, so
