@@ -38,7 +38,7 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, ORIGIN, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use kbf_map::{MemberId, MemberState};
+use kbf_map::{Map, MemberId, MemberState};
 use kbf_types::WorkerId;
 use serde::Deserialize;
 
@@ -225,6 +225,15 @@ async fn set_member_state(
     };
     // The store's calls block (its trait says so).
     let set = tokio::task::spawn_blocking(move || members.set_state(MemberId(id), state)).await;
+    member_answer(id, name, set)
+}
+
+/// The answer to a member write, from what the blocking call returned.
+fn member_answer(
+    id: u64,
+    name: &str,
+    set: Result<Result<Map, MembershipError>, tokio::task::JoinError>,
+) -> Response {
     match set {
         Ok(Ok(map)) => {
             tracing::info!(
@@ -237,21 +246,21 @@ async fn set_member_state(
                 &serde_json::json!({ "id": id, "state": name, "generation": map.generation() }),
             )
         }
-        Ok(Err(e)) => {
-            let code = match e {
-                MembershipError::NotRegistered(_) => StatusCode::NOT_FOUND,
-                MembershipError::NotSettable(_) => StatusCode::BAD_REQUEST,
-                MembershipError::Store(_) | MembershipError::Contended => {
-                    StatusCode::SERVICE_UNAVAILABLE
-                }
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            error(code, &e.to_string())
-        }
+        Ok(Err(e)) => error(member_failure(&e), &e.to_string()),
         Err(e) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("membership task: {e}"),
         ),
+    }
+}
+
+/// The status a failed member write answers with.
+const fn member_failure(e: &MembershipError) -> StatusCode {
+    match e {
+        MembershipError::NotRegistered(_) => StatusCode::NOT_FOUND,
+        MembershipError::NotSettable(_) => StatusCode::BAD_REQUEST,
+        MembershipError::Store(_) | MembershipError::Contended => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -382,4 +391,86 @@ fn error(code: StatusCode, why: &str) -> Response {
         answer.headers_mut().insert(WWW_AUTHENTICATE, bearer);
     }
     answer
+}
+
+#[cfg(test)]
+mod tests {
+    use kbf_map::{Member, Rule};
+    use kbf_state::StoreError;
+
+    use super::*;
+
+    fn map() -> Map {
+        let member = Member {
+            id: MemberId(4),
+            addr: "192.0.2.4:8982".to_owned(),
+            zone: String::new(),
+            weight: 1,
+            state: MemberState::Active,
+        };
+        Map::new(9, vec![member], Rule::Rendezvous, 1, 1, Vec::new()).expect("a map")
+    }
+
+    async fn body(answer: Response) -> (StatusCode, serde_json::Value) {
+        let code = answer.status();
+        let bytes = axum::body::to_bytes(answer.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        (code, serde_json::from_slice(&bytes).expect("JSON"))
+    }
+
+    /// Catches a member write whose failure is answered with the wrong status (a client
+    /// told to retry what is its own mistake, or the reverse), and an answer that does not
+    /// carry the generation the change produced: a bad request, an unknown member, a
+    /// store that is down or contended, an unreadable row and a panicked task each get
+    /// their own, and the success names the member, its state and the map's generation.
+    #[tokio::test]
+    async fn a_member_write_answers_each_outcome_with_its_status() {
+        let (code, ok) = body(member_answer(4, "active", Ok(Ok(map())))).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(
+            ok,
+            serde_json::json!({"id": 4, "state": "active", "generation": 9})
+        );
+        let store = || MembershipError::Store(StoreError::Failed("down".to_owned()));
+        let failures = [
+            (
+                MembershipError::NotRegistered(MemberId(4)),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                MembershipError::NotSettable(MemberState::Down),
+                StatusCode::BAD_REQUEST,
+            ),
+            (store(), StatusCode::SERVICE_UNAVAILABLE),
+            (MembershipError::Contended, StatusCode::SERVICE_UNAVAILABLE),
+            (
+                MembershipError::Corrupt("row".to_owned()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+        for (failure, want) in failures {
+            let text = failure.to_string();
+            let (code, answer) = body(member_answer(4, "active", Ok(Err(failure)))).await;
+            assert_eq!(code, want, "{text}");
+            assert_eq!(answer["error"], text);
+        }
+        let panicked = tokio::task::spawn_blocking(|| -> Result<Map, MembershipError> {
+            panic!("the membership call panicked")
+        })
+        .await;
+        let (code, answer) = body(member_answer(
+            4,
+            "active",
+            Err(panicked.expect_err("a panic")),
+        ))
+        .await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            answer["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("membership task")
+        );
+    }
 }
