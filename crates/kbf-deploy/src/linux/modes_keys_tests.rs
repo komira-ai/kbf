@@ -468,6 +468,36 @@ fn the_listen_units_order_after_the_interface_service() {
     );
 }
 
+/// Catches a `storage` or `storage-and-daemon` unit ordered after `MINIO_UNIT`, a unit
+/// that does not exist on a host whose cold store is an external S3 endpoint (the
+/// ordering is a no-op there, and the setting only means something to the converged
+/// units); and `KBF_LISTEN_AFTER` no longer a way to order such a unit after a local
+/// MinIO. With `MINIO_UNIT` set to a name nothing else in the settings uses, the
+/// rendered units never carry it; naming it in `KBF_LISTEN_AFTER` does.
+#[test]
+fn a_storage_unit_is_not_ordered_after_the_minio_unit() {
+    let c = config_with(&[("MINIO_UNIT", "minio-kbf.service")]);
+    for mode in [Mode::Storage, Mode::StorageAndDaemon] {
+        let text = render(&c, Some(1500), mode).expect("renders");
+        assert!(!text.contains("minio-kbf"), "{mode}:\n{text}");
+        assert!(
+            text.contains("\nAfter=network-online.target\n"),
+            "{mode}:\n{text}"
+        );
+    }
+    let c = config_with(&[
+        ("MINIO_UNIT", "minio-kbf.service"),
+        ("KBF_LISTEN_AFTER", "minio-kbf.service"),
+    ]);
+    for mode in [Mode::Storage, Mode::StorageAndDaemon] {
+        let text = render(&c, Some(1500), mode).expect("renders");
+        assert!(
+            text.contains("\nAfter=minio-kbf.service\nWants=minio-kbf.service\n"),
+            "{mode}:\n{text}"
+        );
+    }
+}
+
 /// Catches a `KBF_LISTEN_AFTER` that is pasted into the unit unchecked: a newline or `=`
 /// would add a directive, `%` a specifier, a path or a bare word a name that is not one.
 #[test]

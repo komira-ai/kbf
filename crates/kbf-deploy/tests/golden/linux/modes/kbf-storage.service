@@ -6,7 +6,10 @@
 [Unit]
 Description=kbf build farm storage node
 Wants=network-online.target
-After=network-online.target minio.service
+After=network-online.target
+# No ordering on a MinIO unit: the cold store need not be on this host. KBF_LISTEN_AFTER
+# adds the units this one starts after: a local MinIO's, the frontend name's resolver (a
+# VPN or overlay service), the listen address's interface.
 
 [Service]
 # Not the daemon's user: a storage node holds the cold store's key.

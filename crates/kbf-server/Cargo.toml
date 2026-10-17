@@ -53,6 +53,8 @@ tracing-subscriber.workspace = true
 x509-parser.workspace = true
 
 [dev-dependencies]
+# A connector that fails its first lookups, under a lazy channel (tests/storage_register.rs).
+hyper-util = { workspace = true, features = ["tokio"] }
 kbf-segments.workspace = true
 # The deterministic simulation kernel's seeded random stream (tests/sim_rollout.rs).
 kbf-sim.workspace = true

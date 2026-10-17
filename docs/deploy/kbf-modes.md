@@ -196,6 +196,26 @@ digits and `: _ . @ -`, ending in a unit type such as `.service`); a value with 
 inside a name, `=`, `%`, `/` or a newline is refused, so the setting cannot add a
 directive. `check-units` accepts the lines.
 
+### A frontend name that does not resolve yet
+
+`KBF_FRONTEND_NAME` can be a name that a VPN or overlay network's resolver answers, and
+that resolver may start after `network-online.target`. A failed lookup at start does not end
+either half of `storage-and-daemon`: the storage half's channel to `--frontend` is lazy, so
+the lookup is part of its first registration, and a failed registration waits (1 s, doubling
+to 30 s) and tries again until the frontend answers, before it opens its
+cache; the daemon half resolves `--server` at every connection round, reports a failed
+lookup as a failed attempt, waits and resolves again, and never stops trying. (`daemon`
+does the same.) A node that cannot find its frontend therefore stays up and logs each
+failure; it is not restarted by systemd, and needs no restart when the resolver comes up.
+To order the unit after the resolver's service anyway, so the first tries are not
+wasted, name it in `KBF_LISTEN_AFTER` (`tailscaled.service`, say): the setting orders a
+unit after any unit, not only an interface's.
+
+`storage` and `storage-and-daemon` units are not ordered after a MinIO unit: their cold
+store is an `s3://` endpoint that need not be on the host, and `After=` on a unit that
+does not exist does nothing. On a host with a local MinIO, add `minio.service` to
+`KBF_LISTEN_AFTER`. (The converged `kbf-server.service` still starts after `MINIO_UNIT`.)
+
 ### Exit 2 and exit 75: what systemd restarts
 
 A start that fails exits 2 or 75. The `storage`, `storage-and-daemon` and `all-in-one`
