@@ -1,6 +1,6 @@
 # Pull-based updates: hosts update themselves over the session they already hold
 
-Status: design; the wire contract (section 5) is frozen, the rest is built in the units of section 11.
+Status: design; the wire contract (section 5) is frozen. Built or in review: `kbf-installer` (merged), `kbf-update` (the node client, #908) and `kbf-helper` (the root helper, #929). The rest is built in the units of section 11.
 Adapted from the pull-update design study; labels: **[F]** read in code at the time of writing,
 **[D]** a design decision, **[V]** verify before building on it.
 
@@ -69,7 +69,7 @@ Residuals, stated plainly:
   host accepts when the frontend offers it. The attestation proves *where a binary was built*, not *that a
   reviewer approved the source*.
 - **A hostile frontend can offer any older attested build.** Downgrades are allowed on purpose: a rollback is the
-  desired release set to an older commit. The guard is the **desired-state generation**, not a serial floor: a host
+  desired release set to an older commit. The guard is the **desired-state generation**; **as built**, the installer also keeps a floor on **order ids** (`BelowFloor`) and the helper passes the monotonically increasing `order_id` as the serial, so it is a floor on order ids, not on commits and a commit downgrade is still allowed (a higher generation gives a new, higher order id): a host
   acts on the highest generation it has seen, a higher generation always wins, and an order carries the store epoch so
   a restored store cannot replay one. A host therefore cannot refuse "older" without an operator-set floor, which is
   deferred.
@@ -108,7 +108,7 @@ Residuals, stated plainly:
  operator / UI               frontend host                              every other host
  -------------               -------------                              ----------------
  /v1/update, /v1/releases -> kbf frontend                               kbf (daemon / storage-and-daemon)
- (click, auto rule)            release store (--releases-dir)             update client (kbf-node)
+ (click, auto rule)            release store (--releases-dir)             update client (kbf-update)
                                desired release, rules (state store)         | inbox dir (service user writes)
                                offers + orders over sessions                v
                                rollout controller                         helper (root, no socket)
@@ -120,7 +120,7 @@ Residuals, stated plainly:
 | Wire messages | `crates/kbf-proto/proto/kbf/update/v1/update.proto` | messages and one service; frozen (section 5) |
 | Platform names | `kbf_types::ReleasePlatform` | `linux-x86_64`, `linux-arm64`, `darwin-arm64`; from a node's `os` and `arch` report entries |
 | Release store, desired release, offers, `ReleaseService` | `kbf-server` | section 6 |
-| Update client | `kbf-node` | fetch, inbox, status, refuse an order while a lease is live |
+| Update client | `kbf-update` (the node's side), `kbf-helper` (root), `kbf-installer` (layout, verbs) | fetch, inbox, status, refuse an order while a lease is live |
 | Helper (verify offline, install, flip, revert) | a root unit on each host, one shared installer library | verbs in section 7 |
 | Rollout controller | `kbf-server`, replaces the older record in `rollout.rs` | section 8 |
 | Release discovery | the frontend polls GitHub, read-only | proposes a desired release; never applies |
@@ -154,13 +154,13 @@ platform is **complete** for a commit when the frontend holds every component it
 
 **UpdateOrder.** `order_id` comes from a store counter and strictly increases; a node acts on an order id at most
 once and ignores a lower one. `epoch` is the `Welcome` epoch, so an order sent before a frontend restart (a new
-epoch) is not replayed after it. `window_s` is the confirm window of `ACTIVATE`; the helper clamps it to its own
-limits (default 15 minutes, range 2 to 30), so a compromised frontend cannot set a year. The window starts when the
-new process starts, not when the link flips.
+epoch) is not replayed after it. `window_s` is the confirm window of `ACTIVATE`, **per platform as built**: on Linux the helper ignores it, and the window starts at the new
+process's first start (`kbf-helper boot-check --window-secs`, default 900, range 120 to 1800); on macOS there is no start hook, so the window is
+armed at activation and `window_s` is clamped to 120 to 1800. Either way a compromised frontend cannot set a year.
 
 **UpdateStatus.** Sent after `Welcome` and on every change. `running_commit` is the process's own build commit
 (12 hex or `unknown`); `installed_commit` and `staged_commit` are 40 hex from the helper, empty if not known.
-`acked_order_id` is the newest order acted on; `offered_generation` the newest offer seen. A node that never sends
+`acked_order_id` is the newest order acted on; `offered_generation` the newest offer seen. `helper_present` (field 8) says whether the privileged helper is on the host; `staged_protocol`, `staged_min_protocol` and `staged_state_schema` (fields 9 to 11) are what the staged release declares in `kbf --version --json`, 0 when nothing is staged; the frontend's ordering decision reads them (split-mode-updates.md 2.4 and 3.3). A node that never sends
 it is listed `unsupported`, and a rollout halts at it (it never skips a host silently).
 
 **ReleaseService.Fetch.** On the worker listener, admitted nodes only (mutual TLS). The argument is 64 lowercase
@@ -173,8 +173,9 @@ the offers and orders, never sends a status, and is listed `unsupported`.
 ### Contracts owned by the node client
 
 The inbox directory the unprivileged `kbf` writes and the root helper reads, and the world-readable `status.json`
-the helper writes, are specified by the update-client unit and frozen with it. This document does not restate them
-so that there is one source; they are linked here when that unit lands.
+the helper writes, are specified by the update-client and helper units (`kbf-update`, `kbf-helper`) and frozen with them. This document
+does not restate them so that there is one source. In short: an entry directory per offer (`<generation>-<commit>/` with `offer.json`, the
+tarballs and the attestation bundle) and, in `orders/`, one file per order.
 
 ## 6. The frontend
 
@@ -193,7 +194,8 @@ saying which is missing; nothing answers an empty 200.
 | `update/generation` | the counter (C3) the generations come from |
 | `update/slot` | the rollout slot: one storage holder plus up to `max_hosts_out` host holders, each `{host, order_id, epoch}`, with the run state; no time to live (section 8) |
 | `update/host/<id>` | the controller's per-host phase `{phase, order_id, generation, since, boot_before}`: what a restarted controller resumes from (split-mode-updates.md 2.6) |
-| `update/policy` | `{auto_nodes, auto_frontend, idle_wait, min_serving, max_hosts_out (default 1), mac_force_after, new_work_only_to_updated, accept_failing_builds}`; replaces the older `update/auto {enabled}`, whose flag is `auto_nodes` |
+| `update/available/<commit>` | the release source's proposal and its preflight result; metadata only (split-mode-updates.md 6.2) |
+| `update/policy` | `{auto_nodes (bool), auto_frontend (bool), paused (bool), auto_frontend, idle_wait, min_serving, max_hosts_out (default 1), mac_force_after, new_work_only_to_updated, accept_failing_builds}`; replaces the older `update/auto {enabled}`, whose flag is `auto_nodes` |
 
 **The disk index is the source of truth for bytes.** The release store on disk (`files/<sha256>` and
 `index/<commit>/<platform>/<name>`, with attestation bundles) is authoritative for what the frontend can serve. The
@@ -231,15 +233,17 @@ node and ignored from a replaced stream, exactly as `NodeStatus` is.
 
 Retention: the running, the previous and one more directory.
 
-Helper verbs, fixed, no free-form arguments (the host's own config names the unit; nothing a request carries is a
-path or a command):
+The helper has two commands, with no free-form arguments (its own flags name the unit and the directories; nothing in the inbox is a path, a
+command or a unit):
 
-| Verb | Does |
+| Command | Does |
 |---|---|
-| `stage` | verify the tarball's SHA-256 and its attestation offline; check the tarball holds one file `<name>` and `--version --json` of it names the offered commit (run as the service user, empty environment); install into `releases/<commit>/`; do not activate |
-| `activate` | write `pending_confirm` first (fsync, rename, directory sync); flip `previous` then `current` (atomic symlink rename); restart the one configured unit |
-| `confirm` | cancel the revert timer; record `last_good` |
-| `revert` | the timer, a crash-loop counter, or an order: flip `current` back to `previous`; restart |
+| `kbf-helper run` | each pass: finish a restart it owes; revert a swap whose confirm window ran out; **stage the newest inbox entry itself** (through `kbf-installer`: SHA-256 and attestation verified offline, the tarball holds one file `<name>`, `--version --json` of it names the offered commit, run as the service user with an empty environment; install into `releases/<commit>/`, do not activate); act on orders from `inbox/orders/<id>.json` (`{order_id, epoch, verb, commit, window_s}`) in id order, once each (`activate`: write `pending_confirm` first, flip `previous` then `current`, restart the one configured service; `confirm`: keep it; `revert`: flip back and restart); write `status.json` |
+| `kbf-helper boot-check` | `ExecStartPre` on Linux: count the starts of a release on trial and revert one that keeps failing before it starts again; start the confirm window at the first start |
+
+Orders carry the verbs `activate`, `confirm` and `revert`; they are not helper subcommands. **The helper must not run on the frontend host until the
+frontend-host `activate` of split-mode-updates.md (unit U5) exists**: as built it restarts the one configured service, which for the frontend is the
+restart this design forbids.
 
 - The helper **never executes the new binary as root**.
 - Order of writes: `pending_confirm` before the flip, the flip before the restart; on start the helper reconciles
@@ -298,8 +302,9 @@ Each safety property has a planted mutant that turns its test red.
 - **Bad binary**: starts and exits at once (the counter reverts, Linux); runs but never registers (the window
   expires, the host reverts, the run goes `held`); the frontend dies in the window (the host reverts); `previous`
   missing (the host stays, reports `REFUSED`).
-- **Crash story**: the helper killed at each step of `activate` converges to the old or the new state, never a
-  mix; power loss between rename and directory sync leaves one whole state.
+- **Crash story**: the helper killed at each step of `activate` leaves the links at the old or the new state, never a mix; power loss between
+  rename and directory sync leaves one whole state. The service restart owed after a revert or a window expiry is not yet guaranteed to survive a crash
+  between the link move and the restart; #929 persists the restart-owed before the link move, and until it lands the guarantee is the links only.
 - **Frontend**: a restart after an order resumes from the host's recorded phase and does not stage again; a replayed
   order id is a no-op and a lower epoch is refused.
 - **Store**: the release store is immutable per (commit, platform, name); a crash between writing and renaming
