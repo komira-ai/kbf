@@ -107,7 +107,7 @@ fn cluster(
 fn each_verb_sends_its_call_and_prints_the_answer() {
     let token = token_file("each", "kbf-test-token-0123456789abcdef0123456789");
     let bearer = "authorization: bearer kbf-test-token-0123456789abcdef0123456789";
-    let cases: [(&[&str], &str, &str); 5] = [
+    let cases: [(&[&str], &str, &str); 6] = [
         (&["status"], "GET /v1/nodes HTTP/1.1", ""),
         (
             &["status", "--frontend"],
@@ -135,6 +135,11 @@ fn each_verb_sends_its_call_and_prints_the_answer() {
             &["undrain", "n1", "--token-file", &token],
             "POST /v1/nodes/n1:uncordon HTTP/1.1",
             "",
+        ),
+        (
+            &["member", "7", "--state", "active", "--token-file", &token],
+            "POST /v1/members/7 HTTP/1.1",
+            r#"{"state":"active"}"#,
         ),
     ];
     for (args, line, body) in cases {

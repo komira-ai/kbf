@@ -9,6 +9,9 @@
 //!   `{"deadline_secs": N}`; without one the deadline is [`DRAIN_DEADLINE`]. The answer
 //!   is the node as it is after the action.
 //!
+//! - `POST /v1/members/{id}` with `{"state": "active"|"draining"}`: sets a storage
+//!   member's state ([`Members::set_state`]), the operator's promotion of a joiner.
+//!
 //! - `GET /v1/frontend/drain`: whether the frontend is draining, the Execute and
 //!   WaitExecution streams open and the operations queued ([`DrainStatus`]).
 //!   `POST /v1/frontend/drain` begins the drain ([`crate::drain`]) and answers the same
@@ -35,11 +38,13 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, ORIGIN, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use kbf_map::{MemberId, MemberState};
 use kbf_types::WorkerId;
 use serde::Deserialize;
 
 use crate::drain::{Drain, DrainStatus};
 use crate::farm::{Farm, NodeAction};
+use crate::members::{Members, MembershipError};
 use crate::token::ApiToken;
 
 /// The media type of every body this API returns, and of every write it accepts.
@@ -74,22 +79,37 @@ pub fn node_path(node: &str, verb: &str) -> String {
 }
 
 /// What the handlers share: the farm, the token writes must present (`None`: writes
-/// are off) and the frontend's drain.
+/// are off), the frontend's drain and the storage members (`None`: this server keeps
+/// none, as without a state store).
 struct ApiState {
     farm: Arc<Farm>,
     token: Option<ApiToken>,
     drain: Arc<Drain>,
+    members: Option<Arc<Members>>,
 }
 
 /// The API's routes over `farm`; writes need `token`, and without one are refused.
-/// `drain` is what `POST /v1/frontend/drain` begins. Writes read the peer address from
+/// `drain` is what `POST /v1/frontend/drain` begins; `members` is what
+/// `POST /v1/members/{id}` changes (the same value the `Membership` service registers into).
+/// Writes read the peer address from
 /// [`ConnectInfo`]: serve them with `into_make_service_with_connect_info`.
-pub fn router(farm: Arc<Farm>, token: Option<ApiToken>, drain: Arc<Drain>) -> Router {
+pub fn router(
+    farm: Arc<Farm>,
+    token: Option<ApiToken>,
+    drain: Arc<Drain>,
+    members: Option<Arc<Members>>,
+) -> Router {
     Router::new()
         .route(NODES, get(nodes))
         .route("/v1/nodes/{target}", post(act))
+        .route("/v1/members/{id}", post(set_member_state))
         .route(FRONTEND_DRAIN, get(drain_status).post(begin_drain))
-        .with_state(Arc::new(ApiState { farm, token, drain }))
+        .with_state(Arc::new(ApiState {
+            farm,
+            token,
+            drain,
+            members,
+        }))
 }
 
 /// The drain as it is now.
@@ -154,6 +174,84 @@ async fn act(
             Err(unknown) => error(StatusCode::NOT_FOUND, &unknown.to_string()),
         },
         Err((code, why)) => error(code, &why),
+    }
+}
+
+/// The body of `POST /v1/members/{id}`: the state to put the member in. `Down` is the
+/// store's verdict and `joining`/`catching_up` are the registration's, so none of them
+/// is accepted.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemberBody {
+    state: MemberTarget,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum MemberTarget {
+    Active,
+    Draining,
+}
+
+async fn set_member_state(
+    State(api): State<Arc<ApiState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err((code, why)) = gate(api.token.as_ref(), peer, &headers) {
+        return error(code, &why);
+    }
+    let Some(members) = api.members.clone() else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "this server keeps no storage members: it has no --state-store",
+        );
+    };
+    let Ok(id) = id.parse::<u64>() else {
+        return error(StatusCode::NOT_FOUND, &format!("no member {id:?}"));
+    };
+    let want: MemberBody = match serde_json::from_slice(&body) {
+        Ok(want) => want,
+        Err(e) => {
+            let why = format!("a member body is {{\"state\": \"active\"|\"draining\"}}: {e}");
+            return error(StatusCode::BAD_REQUEST, &why);
+        }
+    };
+    let (state, name) = match want.state {
+        MemberTarget::Active => (MemberState::Active, "active"),
+        MemberTarget::Draining => (MemberState::Draining, "draining"),
+    };
+    // The store's calls block (its trait says so).
+    let set = tokio::task::spawn_blocking(move || members.set_state(MemberId(id), state)).await;
+    match set {
+        Ok(Ok(map)) => {
+            tracing::info!(
+                member = id,
+                state = name,
+                "member state set by the operator API"
+            );
+            json(
+                StatusCode::OK,
+                &serde_json::json!({ "id": id, "state": name, "generation": map.generation() }),
+            )
+        }
+        Ok(Err(e)) => {
+            let code = match e {
+                MembershipError::NotRegistered(_) => StatusCode::NOT_FOUND,
+                MembershipError::NotSettable(_) => StatusCode::BAD_REQUEST,
+                MembershipError::Store(_) | MembershipError::Contended => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            error(code, &e.to_string())
+        }
+        Err(e) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("membership task: {e}"),
+        ),
     }
 }
 

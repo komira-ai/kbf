@@ -221,6 +221,7 @@ async fn a_server_with_a_state_store_sends_daemons_its_members_map() {
         ttl: Duration::from_millis(60),
         dwell: Duration::from_secs(1),
         replication: 1,
+        bootstrap: Duration::ZERO,
     };
     let state = StateStore {
         store: Arc::clone(&store) as Arc<dyn Store>,
