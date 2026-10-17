@@ -225,4 +225,46 @@ mod tests {
             .to_string();
         assert!(why.contains("no-such-ca.pem"), "{why}");
     }
+
+    /// Catches the storage-and-daemon plane (`kbf-daemon`'s `start_member`) not being built
+    /// from the daemon's flags: TLS files that cannot be read fail the start rather than the
+    /// first call to another member.
+    #[tokio::test]
+    async fn the_member_plane_needs_readable_tls_files() {
+        let dir = super::super::tests::scratch("transfer-member");
+        super::super::tests::tls_files(&dir);
+        let at = |name: &str| format!("{}", dir.join(name).display());
+        let cli = |ca: &str| {
+            Cli::try_parse_from([
+                "kbf-daemon".to_owned(),
+                "--server=https://front:7070".to_owned(),
+                format!("--ca-cert={ca}"),
+                format!("--cert={}", at("node.pem")),
+                format!("--key={}", at("node.key")),
+                "--node-id=n1".to_owned(),
+                "--driver=native".to_owned(),
+            ])
+            .expect("flags")
+        };
+        let argv = [
+            "storage".to_owned(),
+            "--storage-listen=127.0.0.1:0".to_owned(),
+            format!("--cold-store=file://{}", dir.join("cold").display()),
+            format!("--meta-dir={}", dir.join("meta").display()),
+        ];
+        let matches = kbf_server::storage_node::command().get_matches_from(argv);
+        let flags = kbf_server::storage_node::parse(&matches).expect("the storage flags");
+        let half = kbf_server::storage_half::start(&flags, || Ok(std::future::pending::<()>()))
+            .await
+            .expect("the storage half starts");
+        let local =
+            kbf_daemon::LocalMember::new(half.addr.to_string(), half.storage(), half.maps());
+        let maps = Arc::new(kbf_daemon::MapHolder::new());
+        super::super::member(&cli(&at("ca.pem")), &maps, &local).expect("the member plane");
+        let why = super::super::member(&cli(&at("no-such-ca.pem")), &maps, &local)
+            .err()
+            .expect("no CA file")
+            .to_string();
+        assert!(why.contains("no-such-ca.pem"), "{why}");
+    }
 }
