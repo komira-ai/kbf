@@ -41,7 +41,9 @@ Goals:
 
 1. A regression that fails a build during an update is found on the merge that introduced it, not on the operator's farm.
 2. The operator's farm is never the first place a release runs, and is never updated by a person typing commands to a host.
-3. The bytes that run in beta, in gamma and in prod are the same bytes: one build per commit, promoted, never rebuilt.
+3. The bytes that run in the full beta, in gamma and in prod are the same bytes: one build per commit, promoted, never
+   rebuilt. (The merge-queue smoke runs the queue ref's own build, which is not what ships; section 4.1. The first release
+   is rebuilt after the branch merges to main and re-runs beta and gamma on that commit; section 13, Q1.)
 4. Every gate is a number with a threshold that the doc states, and every gate fails closed: an absent metric is a failure.
 5. Rollback is a normal, tested path, and the doc says which releases cannot be rolled back.
 
@@ -50,16 +52,18 @@ making the farm reachable from a public runner.
 
 ## 2. The stage model, reused from kci, and where kbf differs
 
-kci (the release tool in the sibling komira repository) models a release as a list of stages. A stage has a name, an `after`
-ordering, a named GitHub environment, and a result document; one job per stage; the same release directory is promoted to
-every stage and never rebuilt (`build.set_hash == gamma.set_hash == prod.set_hash`); a validation job holds no identity
-token; the workflow is checked against the stage list when it starts; `prod` needs a reviewer and is manual. **[F]**
+kci is the release tool in the sibling komira repository (its stage model is in that repository's `docs/ci.md`). Restated
+here so this page stands alone: a release is a list of stages, each with a name, an `after` ordering, a named GitHub
+environment and a result document; one job per stage; the same release directory is promoted to every stage and never rebuilt
+(`build.set_hash == gamma.set_hash == prod.set_hash`); a validation job holds no identity token; `prod` needs a reviewer and
+is manual. kci's stages are build, gamma and prod, and kci's gamma is a publish channel. Here, "reuse" means vocabulary and
+shape only: kbf's build stage is `artifacts.yml`, its gamma is a pull-based farm with no Actions job, and beta is added.
 
 What carries over, unchanged in meaning:
 
 | kci | kbf |
 |---|---|
-| stage list with `after:` | `beta`, `gamma`, `prod`, in a small checked-in stage file |
+| stage list with `after:` | `build` (implicit, `artifacts.yml`), `beta`, `gamma`, `prod`, in a small checked-in stage file |
 | one environment per stage | `beta` (no secrets, no reviewer), `prod` (reviewer); `gamma` is described below |
 | build once, promote by set hash | `artifacts.yml` already builds once per commit and writes `SHA256SUMS`; the set hash is the digest of that file |
 | validation never a skip, distinct exit code | each stage ends in a result document with a verdict; "not run" is not "passed" |
@@ -70,7 +74,7 @@ What carries over, unchanged in meaning:
 
 Where kbf differs, and why:
 
-1. **There is a beta stage; kci has none.** kci has build, gamma, prod. Beta is new: an ephemeral farm per merge that
+1. **There is a beta stage; kci has none.** Beta is new: an ephemeral farm per merge that
    publishes nothing. It is closest to kci's build-plus-validation, not to a channel.
 2. **Gamma is not a publish destination.** kci's channels are places bytes are pushed, permanent and never overwritten.
    Gamma is a farm that pulls: "the desired release" is an entry in a signed feed, and the entry moves. A moving pointer is
@@ -79,9 +83,8 @@ Where kbf differs, and why:
 3. **Gamma and its bake run outside Actions.** A hosted runner on a public repository must not reach the operator's farm, so
    the farm's metrics cannot be read from a workflow. kci's farm-connected jobs are not adopted. The operator side runs the
    evaluator and returns a signed verdict (section 7).
-4. **There is a time gate.** kci has no bake, soak or metric gate, and no rollback verb **[F]**. All three are new here.
-5. **Code is not shared.** kci is Mojo on Buck2; kbf is Rust with `xtask`. The vocabulary carries over; the stage file is
-   plain data checked by a Rust lint.
+4. **There is a time gate.** kci has no bake, soak or metric gate, and no rollback verb. All three are new here.
+5. **Code is not shared.** kci is Mojo on Buck2; kbf is Rust with `xtask`. The stage file is plain data checked by a Rust lint.
 6. **kci's DEPLOY step** (a cloud resource graph apply) does not describe restarting kbf processes on a host. The
    deploy here is the pull updater and the frontend-ordered node steps of `split-mode-updates.md`.
 
@@ -91,10 +94,16 @@ Where kbf differs, and why:
 
 ```toml
 [[stage]]
+name = "build"
+runs = "actions"          # artifacts.yml, the implicit build stage; attests on push only
+after = []
+result = "SHA256SUMS"
+
+[[stage]]
 name = "beta"
 runs = "actions"          # a job in .github/workflows/beta.yml
 environment = "beta"
-after = []                # needs artifacts.yml for the same commit
+after = ["build"]         # smoke: the merge_group build; full: the push build and its attestations
 result = "beta-result.json"
 
 [[stage]]
@@ -124,9 +133,13 @@ so a feature/arch-v2 asset does not verify as main's.
 
 What the stages add:
 
-- **Beta runs the attested files**, not a fresh `cargo build`. Beta downloads the commit's `artifacts.yml` output, runs
-  `cargo xtask verify-assets` on it, and starts the farm from those binaries. Otherwise beta would test bytes nobody ships.
-  The harness (`cargo test`) is the one thing built in the beta job; it is test code, not a shipped file.
+- **The full beta runs the attested files**, not a fresh `cargo build`. It runs after the push build has attested (a job
+  of `artifacts.yml` with `needs: verify`, section 4.1), downloads that output, runs `cargo xtask verify-assets` on it, and
+  starts the farm from those binaries. Otherwise beta would test bytes nobody ships. The harness (`cargo test`) is the one
+  thing built in the beta job; it is test code, not a shipped file.
+- **The merge-queue smoke is unattested.** `artifacts.yml` also runs on `merge_group` (and `pull_request`) but attests only on
+  a push, so no attested files exist before the merge. Smoke runs the binaries that `merge_group` build produced (same recipe,
+  unattested, not the shipped bytes), or, if waiting for that build is too slow, binaries it builds itself with `cargo`.
 - **The beta result is attested.** A last job, the only one in beta with `id-token: write` and `attestations: write`, attests
   `beta-result.json` (commit, set hash, harness commit, every gate with its measured value). No repository code runs in that
   job, as in `attest` today.
@@ -146,10 +159,18 @@ line of work lands on feature/arch-v2 (section 13, Q1).
 Two layers, because "on every merge" and "a merge must not wait an hour" pull apart:
 
 - **Smoke, in the merge queue** (`merge_group`): start the whole farm, run builds, assert zero failures. No update, no kill.
-  Target under 10 minutes. This is a required Linux check.
+  It needs a build of the queue ref, so its duration is that build plus the smoke, not the smoke alone **[V]**: the target of
+  10 minutes holds only if the build is cached or the smoke uses its own `cargo` binaries (a cheaper build than the multi-platform
+  one, since smoke needs one platform). Measure that in B-0 before the check is made required; the order of preference is the
+  `merge_group` build's output, then smoke's own build. Smoke is unattested and says so in its result document.
+  `merge_group` runs repository code from the queue ref with no fork code, so the root-level helpers are acceptable there.
 - **Full, after the merge** (`push` to feature/arch-v2 and main): rolling update of every role under a running build,
-  kill-a-node, the Envoy swap, the all-in-one variant, N/N-1. A red full run does not revert anything; it **blocks the
+  kill-a-node, the Envoy swap, the all-in-one variant, N/N-1, on the attested bytes. It is a job of `artifacts.yml`
+  (`needs: verify`, on `push` only) so the order after attestation needs no `workflow_run` (which runs from the default
+  branch's workflow file and carries its own trust caveats). A red full run does not revert anything; it **blocks the
   commit from being offered to gamma** (the offer needs its beta-result attestation) and opens an issue automatically.
+  A scenario becomes a required part of the full run on the day its blocking pull requests merge (section 4.5), not before,
+  because a fail-closed gate on an absent metric is red by construction.
 
 Neither runs on `pull_request`: they start a farm with root-level helpers and attest results, and a pull request from a
 fork must not run either. The lint of section 2.1 enforces the absence.
@@ -174,8 +195,8 @@ rough budget, to be measured before it is relied on:
 The rule that keeps it inside the box: the harness sets segment size, cache and tier limits to test values, and the load is
 actions that sleep or touch small files (the `//:pause` shape that the `m1`/`m2` cells use), plus a modest compile.
 **Beta is a test of the update and failure paths, not a benchmark.** If a measurement shows the farm does not fit, the order
-of remedies is: smaller limits; then fewer concurrent actions; then a larger GitHub-hosted runner (paid, still ephemeral and
-managed by GitHub); and last, and only with the safety conditions below, a self-hosted runner.
+of remedies is: smaller limits; then fewer concurrent actions; then a larger GitHub-hosted runner (billed, unlike the standard
+one; still ephemeral and managed by GitHub); and last, and only with the safety conditions below, a self-hosted runner.
 
 Why self-hosted is the last resort, on a public repository: a self-hosted runner executes whatever a workflow tells it, and
 a workflow can be changed by a pull request. A non-ephemeral runner keeps state between jobs, so one job can leave something
@@ -186,8 +207,16 @@ workflow. Arm runners are hosted (`ubuntu-24.04-arm`) and available for an arm b
 and `sign-darwin` and has no farm role in beta.
 
 Cost shape **[V]**: per merge, one smoke (minutes) in the queue and one full run after; standard hosted runners on a public
-repository carry no per-minute charge. The cost that matters is wall time and queue depth, which is why full is off the
+repository carry no per-minute charge (a larger runner does). The default build concurrency in smoke is a figure measured in
+B-0, not the 20 of T5, which is a likely memory risk. The cost that matters is wall time and queue depth, which is why full is off the
 merge path. Record job duration in the result document so a creeping beta shows in the numbers.
+
+**Container runtime [V].** The CEO rule is crun only. The harness today uses a stand-in runtime over a planted cgroup tree.
+Real crun needs cgroup v2 delegation and a systemd scope; the podman jobs in `ci.yml` arrange that with a `Delegate=yes`
+unit, and the same approach is to be tried for crun on `ubuntu-24.04`. Until that is shown to work (#936), **B-0 uses the
+stand-in**, and the page says what that weakens: the `//:pause` and compile loads run through no real container path, so
+beta proves the update and failure paths and not container execution (covered by the existing real-runtime jobs). The
+runtime swap is a one-line change of the supervisor's configuration once #936 lands, not a rewrite.
 
 ### 4.3 The harness
 
@@ -235,6 +264,7 @@ scenario (the mutant is listed; a gate never seen red is not a gate).
 | B8 | `roll_all_in_one` | the all-in-one process updated by the same handover (`aio-handover.md`) | a second update path for the small topology |
 | B9 | `mixed_versions` | N and N-1 in both directions, with and without a build in flight (section 9) | a made-required field; a repurposed field |
 | B10 | `rollback_walks_back` | after B4, offer N-1 as a newer signed set and walk back (T16) | rollback restarting the frontend |
+| B11 | `rollback_mid_roll` | a rollback entry issued (a) after the first node step and (b) after the frontend handover, from that half-rolled state, with a build in flight; N and N-1 mixed in the reverse order | a walk back that assumes a clean farm; a node mid-step abandoned instead of finished or reverted |
 
 The gate expressions common to B1 to B6, B8 and B10, read from the scraped metrics and the builds' event logs:
 
@@ -251,8 +281,11 @@ The gate expressions common to B1 to B6, B8 and B10, read from the scraped metri
   (**[P]** 300 s in beta; tuned from B1 measurements) and at the end. It may be above 0 only between a node going out and
   the settle window ending, and never for two nodes' worth at once. The gate is **absent means failed**: if the metric is
   not exported the run is red (T12's "absent debt metric" rule). The metric is not on feature/arch-v2 yet (#912, #913).
-- **Never two members non-Active at a sampled instant**, from the membership gauge, in B1 and B4.
-- **Boot counter +1 per updated process**, none for an untouched one: an update that restarted the wrong thing is red.
+- **Never two members non-Active at a sampled instant**, in B1 and B4. **[missing]** There is no membership-state gauge
+  (M13). Until it exists the gate reads the node log's state transitions and the supervisor's own record.
+- **Each updated process restarted once, none other**: **[missing]** no process boot counter exists in the tree (the only
+  boot id is the kernel's, in `kbf-driver-native`; M13). Until it exists: in beta, the supervisor's process table (pid and
+  start time per role); in gamma, the updater's phase log.
 
 B5 and B6 are expected to *pass the build*. They are not "the farm survives anything": a second unplanned loss while one
 node is out is the stop rule of T14 and is tested there, not asserted green here.
@@ -260,19 +293,20 @@ node is out is the stop rule of T14 and is tested there, not asserted green here
 ### 4.5 Order of work: the beta is built up in steps
 
 A beta that needs every update PR to land first would not start for a long time. The harness is delivered as milestones, each
-useful alone and each required from the day it lands:
+useful alone and each required from the day its blocking pull requests land (B-2's gates are red by construction until
+#912 and #913 export their metric, so B-2 is not enabled before them):
 
 | milestone | adds | blocked on |
 |---|---|---|
-| B-0 | harness library, the pinned Envoy, the real Buck2 load, B0, smoke in the merge queue | #925 box render; otherwise nothing |
+| B-0 | harness library, the pinned Envoy, the real Buck2 load, B0, smoke in the merge queue (on the stand-in runtime, section 4.2) | #925 box render; the runner measurement (M21) before smoke is required |
 | B-1 | B5, B6, B7 (kill-a-node, kill-a-daemon, crash matrix required) | #900, #939 (write failover) |
 | B-2 | B1, B3 (node and daemon roll) | #912, #913, #914, #917 (the metrics and the picker) |
 | B-3 | B2, B8 (frontend swap through Envoy, all-in-one) | #930, #937, #938, the wiring PR of #901, #925, #934 |
-| B-4 | the pull updater replaces the stand-in for the real thing in B1 to B4; B10 | #908, #929, the poller of `split-mode-updates.md` 6.2 |
+| B-4 | the pull updater replaces the stand-in for the real thing in B1 to B4; B10 and B11 (rollback) | #908, #929, the poller of `split-mode-updates.md` 6.2 |
 | B-5 | B9 against a real N-1, state-store and wire checks | a released N-1 (or the fallback of section 3) |
 
 The assertions "0 failed actions" are only reachable once #791 (the frontend fails every in-flight action on restart) is
-closed and the upstream behaviour in #792 is understood; B2 exists to prove that, and if it cannot be made reliable the model
+closed and the upstream behaviour in #792 is understood (this binds gamma's deploy-as-test too, section 5.2); B2 exists to prove that, and if it cannot be made reliable the model
 is wrong and that is reported, as `split-mode-updates.md` says of T5, T6 and E1.
 
 ## 5. Stage 2: gamma, the operator's own farm
@@ -311,8 +345,15 @@ with real builds in flight. The deploy is a test because it is checked as one:
 - **Commit-confirm held**: no process hit its local auto-revert (a node that never becomes active reverts itself in
   minutes; that revert firing during a deploy fails the deploy).
 
-A deploy that fails any of these halts, rolls back what it has changed (section 8) and fails gamma. Nothing about a halt is
-silent: the result document names the gate, the value and the host step.
+The deploy-as-test gates depend on #791 and #792 (a frontend restart fails in-flight actions, and the upstream client does not
+re-attach), exactly as B2 does (section 4.5). Until both are closed the zero-failure gates cannot pass on a real farm, and
+gamma deploy-as-test is blocked, not waived.
+
+A deploy that fails any of these halts, walks back what it has changed (section 8) and fails gamma. Nothing about a halt is
+silent: the result document names the gate, the value and the host step. The walk back is itself a frontend handover and node
+steps and can drop connections too. It is held to the same checks and is reported, but a failure during it is **a red
+verdict and a page, not a retry loop**: nothing retries a walk back on its own, and the host's commit-confirm revert is the
+floor.
 
 ### 5.3 What gamma needs that beta cannot give
 
@@ -358,15 +399,16 @@ Gates, evaluated continuously (a hard gate failing ends the bake red at once) an
 | under-replicated | `under_replicated_blobs` | 0 at the end and 0 after the post-deploy settle window; above 0 for more than **[P]** 10 minutes outside a node step is a failure | yes |
 | handover losses | `kbf_frontend_relay_lost_total` delta | 0 | yes |
 | error rate | `kbf_execute_errors_total` / `kbf_execute_requests_total`, excluding client aborts once M11 exists | at most the larger of twice the baseline and the baseline plus **[P]** 0.5 percentage points | yes |
-| latency | `Execute` queue-to-start p99 and `FindMissingBlobs` p99 against the baseline | not above **[P]** 1.5 times the baseline | no, reported; yes if above 3 times |
+| latency | `Execute` queue-to-start p99 (`kbf_execute_queued_seconds`, a histogram **[F]**) against the baseline | not above **[P]** 1.5 times the baseline | no, reported; yes if above 3 times |
 | write tier | flush failures, unflushed bytes, corrupt, `kbf_tier_flush_digest_mismatch_total` | no new failures or mismatches | yes |
-| restarts | process boot counters | no process restarted that the deploy did not restart | yes |
+| restarts | the updater's phase log until a process boot counter exists (M13) | no process restarted that the deploy did not restart | yes |
 
 The **baseline** is the same ratios over the 7 days before the deploy, taken by the evaluator at deploy start and stored with
 the verdict. An absent metric fails the gate, never passes it. Thresholds marked [P] are starting values; the bake's first
 runs are measured, the thresholds are written down with the evidence, and a change to a threshold is a reviewed change to
 this page and to the evaluator's table in the same commit.
 
+`FindMissingBlobs` has request counters but no latency histogram **[F]**, so it has no latency gate until one is added (M14).
 The evaluator is deliberately not a dashboard: a person reading a graph is not a gate and cannot be required.
 
 ### 7.1 The verdict
@@ -387,10 +429,16 @@ and no dependency on any earlier stage.
 The additions:
 
 1. **A verdict check in `verify`.** The tag is an annotated, signed tag, created by the operator, whose message carries the
-   gamma verdict. `verify` checks the tag signature against the operator's public key committed in the repository, and
-   that the verdict names this commit and set hash, that every gate is green, that the bake lasted at least 24 hours, and that
-   it was not waived without a recorded waiver. No new channel back from the operator's network is needed: the tag is the
-   channel, and creating it is the operator's promotion. A tag with no verdict, or a red one, fails `verify`.
+   gamma verdict. A tag push by anyone with write access starts `release.yml` today, so the check is the gate. `verify`
+   checks the tag signature (ssh signature format, `ssh-keygen -Y verify`) against the operator's public key **read from the
+   default branch's tip, never from the tagged tree**: the tagged commit controls the workflow and its files, and a committer
+   could otherwise replace the key in the very commit being tagged. The signed verdict binds the set hash and the tag name
+   as well as the commit, so a verdict cannot be moved to another tag. `verify` also checks that every gate is green, that
+   the bake lasted at least 24 hours, and that nothing was waived without a recorded waiver. No new channel back from the
+   operator's network is needed: the tag is the channel. A tag with no verdict, or a red one, fails `verify`.
+   *Key lifecycle.* The key file changes only by a reviewed pull request that the owner approves (a code-owner rule); a
+   rotation adds the new key, then removes the old after one release; a compromised key is revoked by removing it, and the
+   verdicts signed by it are re-issued. A tag-protection ruleset restricting who may create `v*` tags is required (M19).
 2. **A `prod` environment with a required reviewer**, as kci's prod, on the `publish` job.
 3. **Release notes**: generated from the commits between the previous release and this one, plus the gamma verdict's summary
    (bake length, load, the gate values) and a list of anything that is not reversible (section 8.3). Notes are an artifact of
@@ -416,7 +464,14 @@ Rollback is the updater walking back, and it is the forward mechanism with the o
 - **Prod rollback** is the same entry in the `prod` feed. The GitHub release is not rewritten (the published files are
   permanent, as kci's names are); the notes of the next release say what was withdrawn, and a withdrawn release is marked in
   the feed so no farm selects it.
-- A rollback is tested in beta (B10) and its result belongs to the same attested record.
+- **When a rollback entry lands mid-roll [P].** A process mid-step is not interrupted: the updater finishes that step to its
+  phase boundary (T13), then walks back from the current state. The first node step and the frontend handover are each a
+  place a rollback can arrive; B11 tests both, with N and N-1 mixed in the reverse order.
+- **Who decides when the evaluator is down.** The evaluator that notices a red gate and the signer that signs the entry are
+  separate commands. If the evaluator is down the bake extends and pages (it never passes), and automatic rollback is
+  unavailable; a person can run the signer's rollback form directly, which does not depend on the evaluator. The only
+  guarantee with both down is the host's own commit-confirm auto-revert, which is per process and minutes-scale.
+- A rollback is tested in beta (B10, B11) and its result belongs to the same attested record.
 
 ### 8.3 Not reversible, and said before the click
 
@@ -442,84 +497,83 @@ Then B9 runs real processes: N frontend with N-1 nodes, N-1 frontend with N node
 and back, each with a build in flight (T10). The previous release comes from section 3. A release whose N-1 is unavailable
 does not skip the check: the beta is red ("not run" is not "passed").
 
-## 10. Failure handling and flake policy
+## 10. Failure handling, flake policy and result documents
 
-- **A red beta is not retried to green silently.** A re-run of the same commit is allowed once, to classify; both attempts are
-  kept. Red then green is recorded as **flaky** in the result document, the gate does not pass for promotion on the green
-  attempt alone, and an issue is opened with both logs.
-- **The assertions are not quarantinable.** A zero-failed-actions gate that flakes may be a real race in the update, and the
-  race is the thing the stage exists to find. A flaky *scenario setup* (a port in use, a runner that ran out of memory) is
-  fixed in the harness; the failed attempt is not hidden. The way out of a stuck gate is a fix or a reverted commit, never a
-  threshold edit.
-- **Timeouts fail.** Every scenario has a wall-clock bound; the job bound is above the sum. A hang is red with the supervisor's
-  process list and logs attached.
-- **Evidence is kept**: process logs, the scraped metric series, the builds' event logs and the result document upload as
-  artifacts on every run, green or red, for the same 90 days as the builds.
-- **Gamma halts, it does not push through.** A halted deploy leaves the farm on a state the run can name (steps done, steps
-  not), resumable from the host's phase (T13) and never started from the top.
-- **Operator-side failure of the evaluator** (it crashed, its metrics source is unreachable) extends the bake and pages; it
-  never counts as a pass.
-- **A broken main**: a red full beta on a commit means no later commit is offered until a later commit has a green one; there
-  is no waiver of a red beta, only a fix.
+- **A red beta is not retried to green silently.** One re-run of the same commit is allowed, to classify; both attempts are
+  kept. Red then green is recorded as **flaky**, the green attempt alone does not pass the commit for promotion, and an issue
+  is opened with both logs.
+- **The assertions are not quarantinable.** A zero-failed-actions gate that flakes may be a real race in the update, which is
+  what the stage exists to find. A flaky scenario setup (a port in use, a runner out of memory) is fixed in the harness. The
+  way out of a stuck gate is a fix or a reverted commit, never a threshold edit or a waiver of a red beta.
+- **Timeouts fail.** Every scenario has a wall-clock bound; a hang is red with the process list and logs attached.
+- **Evidence is kept**: process logs, scraped metric series, event logs and the result document upload on every run for the
+  same 90 days as the builds.
+- **Gamma halts, it does not push through.** A halted deploy leaves a state the run can name, resumable from the host's phase
+  (T13), never started from the top. An evaluator failure extends the bake and pages; it never counts as a pass.
+- **A broken main**: a red full beta means no later commit is offered until a later commit has a green one.
+- **Result documents.** One per stage, one shape (`stage`, `commit`, `set_hash`, `run_id`, `attempt`, `status`, `gates[]` with
+  `name`, `measured`, `threshold`, `verdict`, `started`, `finished`), written RUNNING first and FINISHED on every exit, as kci
+  does. Beta also posts a job summary (gate table, time per scenario, update timeline) and keeps a per-commit history file in
+  the attested artifacts (beta duration, deploy length, bake values) so drift shows before a gate trips (M22).
+- A scenario that only gamma found gets a beta scenario in the fix; the count of such escapes goes in the release notes.
 
-## 11. Observability
+## 11. Metrics the stages read
 
-- One result document per stage, with a shared shape (`stage`, `commit`, `set_hash`, `run_id`, `attempt`, `status`,
-  `gates[]` with `name`, `measured`, `threshold`, `verdict`, `started`, `finished`), written RUNNING first and FINISHED on
-  every exit, as kci does **[F]**; `run_id` is the Actions run id for beta and the evaluator's own id for gamma.
-- Beta posts a job summary: the gate table, the time per scenario, and the update timeline (which role, when, how long it
-  was out).
-- A history of results (per commit: beta duration, gamma deploy length, bake gate values) so a drift in the numbers is
-  visible before a gate trips. [P]: a file in the attested artifacts, not a service.
-- The metrics the stages need (the table of section 12 marks which exist): `kbf_cache_lost_blobs`,
-  `kbf_cache_blob_losses_total`, `kbf_execute_requests_total`, `kbf_execute_errors_total`, `kbf_execute_in_flight`,
-  `kbf_frontend_relay_lost_total`, the write-tier and `FindMissingBlobs` series **[F]**; `under_replicated_blobs`,
-  open-writes and repair debt, planned-down (#912, #913, #914) **[open]**; failed actions by class, and execute errors by
-  cause **[missing]**.
-- A scenario that was found only by gamma gets a beta scenario in the fix. The counts of such escapes are reported in the
-  release notes.
+Exist **[F]**: `kbf_cache_lost_blobs`, `kbf_cache_blob_losses_total`, `kbf_execute_requests_total`, `kbf_execute_errors_total`,
+`kbf_execute_in_flight`, `kbf_execute_queued_seconds` (histogram), `kbf_frontend_relay_lost_total`, the write-tier series.
+Open pull requests **[open]**: `under_replicated_blobs`, open writes, repair debt, planned-down (#912, #913, #914).
+**[missing]**: failed actions by class (M10), execute errors by cause (M11), a process boot counter and a membership-state
+gauge (M13), a `FindMissingBlobs` latency histogram (M14).
 
 ## 12. Missing pieces and the issues to file
 
-Status columns were read from feature/arch-v2 and the open pull requests when this page was written; re-check before use.
-Issue titles are the text to file in this repository; an issue for each, public-safe, linking this page.
+Status was read from feature/arch-v2 and the open pull requests when this page was written; re-check before use. Each row is
+one issue with one done criterion. "Blocked by" names open pull requests or other rows.
 
-| # | Missing piece | Today | Issue to file |
-|---|---|---|---|
-| M1 | Beta workflow: whole farm per merge from the attested files, pinned Envoy in front, real Buck2 load, smoke in the merge queue | the rehearsal is a `cargo test` of one `Execute` and one cache hit; no Envoy, no Buck2, no update | "CI: beta workflow that starts a whole farm and runs real builds on every merge" |
-| M2 | Harness: roll every role while a build runs, assert 0 failed actions, 0 lost blobs, `under_replicated` back to 0 (T1, T2, T5, T6, E1 to E3) | designed in `split-mode-updates.md` section 7; none built | "rehearsal harness: rolling update of every role under a running build" |
-| M3 | Harness: kill-a-node, kill-a-daemon, crash matrix as a required job | #900 in review, frontend only; write failover #939 open | "rehearsal harness: kill a storage node and a daemon during a build; make the crash matrix required" |
-| M4 | N/N-1: wire lint, state-store goldens, mixed-version run both ways, rollback (T10, T11, T16) | none | "CI: N/N-1 compatibility checks (wire lint, state-store goldens, mixed-version run)" |
-| M5 | One frontend update process wired end to end (staged drain, relay, Envoy box, all-in-one) | #937 inert; #930, #925, #934, #938 open; the wiring PR of #901 not opened | "frontend update: wire staged drain, relay and the Envoy box into one update process" |
-| M6 | Pull updater end to end: poller, signed feed client, node-side verification, no SSH push | #908, #929 open on an integration branch; `kbf-updater` is the older socket helper with no pull | "pull updater: poller, signed feed and node client end to end" |
-| M7 | Signed feed and the offer command: stage entries, monotonic serial, beta-result check, plan mode | none | "release feed and `offer`: signed stage entries that require a passing beta" |
-| M8 | Gamma deploy-as-test checks and the bake evaluator with baseline, minimum load, state file and signed verdict | none; confirm window is minutes | "bake evaluator: 24 hour bake with baseline, minimum load and a signed verdict" |
-| M9 | Prod: verdict check on the tag, `prod` environment reviewer, release notes, prod feed entry | `release.yml` has none; no dependency on earlier stages | "release workflow: require a gamma verdict, add an approval environment and release notes" |
-| M10 | Failed actions by class (farm, request, action, ambiguous) as a counter | invocations carry the class; no metric | "metrics: failed actions by failure class" |
-| M11 | Execute errors by cause (client abort, dropped, error) | `kbf_execute_errors_total` has no cause | "metrics: label Execute errors by cause" |
-| M12 | `under_replicated_blobs`, open writes, repair debt, planned-down exported | #912, #913, #914 open | covered by those pull requests; link, no new issue |
-| M13 | Rollback: the updater walks back, automatic offer on a red hard gate, not-reversible flags | one-level manual `host rollback`; rollback only described | "updater: walk-back to the previous release, automatic on a red hard gate" |
-| M14 | Previous-release fetch for N-1 | none | "CI: fetch and verify the previous release for N/N-1 tests" |
-| M15 | Stage file and lint (workflow against stages; no `pull_request`; `id-token` only in `attest`) | the existing workflow lints do not know stages | "lint: check workflows against a stage file" |
-| M16 | Container runtime in CI: remove podman jobs and the stand-in runtime from the harness | #936 open, second part not opened | covered by #936; link |
-| M17 | Rollout engine (#803) is a push-style controller | open; its transport trait is the seam | "rollout engine: replace the push transport with the pull updater's, or retire it" |
-| M18 | Required Linux checks on feature/arch-v2; branch convergence with main for tags | no protection rule was visible; `release.yml` wants main | "repo settings: required checks on feature/arch-v2; how releases are cut from it" |
-| M19 | Existing, link only | #791 (frontend fails in-flight actions on restart), #792 (upstream Buck2 re-attach), #847 (resume a broken owner stream) | the dependencies of every "0 failed actions" gate |
+| # | Missing piece | Done when | Blocked by | Issue |
+|---|---|---|---|---|
+| M1 | Harness library plus B-0: supervisor, pinned Envoy, real Buck2 load, B0, smoke in the merge queue | B0 green on a hosted runner on every merge; smoke measured, then required | #925; M21 | |
+| M2 | Rolling update of every role under a running build (B1 to B4, B8) | each scenario red on its planted mutant and green; 0 failed actions, 0 lost blobs | M1, #912, #913, #914, #917, #930, #937, #938, #934 | |
+| M3 | Kill a storage node and a daemon during a build (B5, B6); crash matrix (B7) required | scenarios green, matrix a required job | M1, #900, #939 | |
+| M4 | N/N-1: wire lint, state-store goldens, mixed-version run both ways (B9) | lint refuses a planted removed field; B9 green | M1, M16 | |
+| M5 | One frontend update process wired end to end (staged drain, relay, Envoy box, all-in-one) | B2 and B8 green | #937, #930, #925, #934, #938, #901 wiring PR | |
+| M6 | Pull updater end to end: poller, signed feed client, node-side verification, no SSH push | the updater replaces the stand-in in B1 to B4 | #908, #929, M7 | |
+| M7 | Signed feed and `offer`: stage entries, monotonic serial, beta-result check, plan mode | `offer` refuses on a red or missing beta result and on a non-increasing serial | | |
+| M8 | Gamma deploy-as-test checks: in-flight invocation record, dropped-connection and lost-blob checks, halt and walk back | a planted dropped connection fails the deploy | M6, #791, #792 | |
+| M9 | Bake evaluator: baseline, minimum load, state file, signed verdict | a restart keeps the clock; an absent metric fails; thin usage extends | M10, M13 | |
+| M10 | Metric: failed actions by failure class | counter present, labelled by class | | |
+| M11 | Metric: Execute errors by cause | client abort distinguished from dropped | | |
+| M12 | Release workflow: verdict check (key from the default branch tip, set hash and tag bound), approval environment, notes, prod feed entry | a tag with no or red verdict, or a forged key in the tagged tree, fails `verify` | M7, M9, M19 | |
+| M13 | Metrics: process boot counter and membership-state gauge | both exported; gates read them | | |
+| M14 | Metric: `FindMissingBlobs` latency histogram | histogram exported; latency gate added | | |
+| M15 | Updater walk-back: automatic offer on a red hard gate, mid-roll behaviour, not-reversible flags (B10, B11) | B10 and B11 green | M6, M7 | |
+| M16 | Fetch and verify the previous release for N-1 | N-1 resolved, or the fallback of section 3 | | |
+| M17 | Stage file and lint (stages, no `pull_request`, `id-token` only in `attest`) | lint red on each planted violation | | |
+| M18 | Rollout engine (#803) push transport replaced by the pull updater's, or retired | no push transport left | #803 | |
+| M19 | Repo settings: required checks on feature/arch-v2, tag-protection ruleset for `v*` | settings in place | M1 | |
+| M20 | Decision: how releases are cut from feature/arch-v2 (Q1) | decision recorded | | |
+| M21 | Measure the whole farm on a standard hosted runner (peak memory, wall time, safe concurrency) | numbers recorded here | | |
+| M22 | Result documents, flake classification and history file | one shape, flaky recorded, history written | M1 | |
+| M23 | crun with cgroup v2 delegation on a hosted runner **[V]** | a real container action runs under crun in CI | #936 | |
+
+Links, not issues: #912, #913, #914 (replication metrics), #936 (container runtime: crun only), #791, #792, #847 (the
+dependencies of every "0 failed actions" gate).
 
 ## 13. Open questions, with recommendations
 
 1. **Branch convergence for prod.** `release.yml` takes only commits on main; this line of work is on feature/arch-v2.
    Options: (a) tag only after the branch merges to main; (b) allow a release from the feature branch with its own
-   attestation ref. *Recommend (a)*: prod stays main-only, gamma and beta run on both, and the first release waits for the
-   merge. This keeps the one "same bytes, attested for main" rule.
+   attestation ref. *Recommend (a)*: prod stays main-only, gamma and beta run on both. The merge makes a new commit, so bytes
+   attested on the feature branch are never what prod publishes: **the first release is rebuilt on main and must re-run beta
+   and gamma on that commit.** Choose (b) if that delay is unacceptable.
 2. **Required checks.** Make the smoke a required check on feature/arch-v2 (merge on green Linux checks) and the full run
    non-blocking for merge but blocking for the offer. *Recommend yes*, via a ruleset, as part of M18.
 3. **Where the feed lives.** A signed static file set in a release asset of the repository, or a bucket the operator
    controls. *Recommend a release asset on a dedicated tag for the public feed and an operator-hosted copy for gamma*, so
    gamma does not depend on the public repository being reachable. Owner decision.
 4. **Verdict channel.** The signed tag carrying the verdict (section 8.1) versus an operator-posted check or comment.
-   *Recommend the tag*: no token for the operator's side to hold in Actions, nothing to forge without the key, and it is
-   already the trigger of `release.yml`.
+   *Recommend the tag*, verified against the key at the default branch's tip: no token for the operator's side to hold in
+   Actions, and it is already the trigger of `release.yml`. Its weakness is the key's own change path (reviewed PR, section 8.1).
 5. **Does the operator's farm need to be the only gamma?** One farm's usage can be too thin to be a canary. The minimum-load
    rule makes that visible (the bake extends). *Recommend keeping one gamma now*, and revisiting if bakes routinely extend.
 6. **Automatic rollback during a bake.** *Recommend automatic offer for hard gates on a reversible release, a page otherwise*,
@@ -528,8 +582,11 @@ Issue titles are the text to file in this repository; an issue for each, public-
    runner) and deciding on a larger hosted runner only on that number. Self-hosted only under the conditions of 4.2.
 8. **Baseline for the error-rate gate** over 7 days versus the previous release's bake. *Recommend 7 days*, since the
    previous bake is one data point and may itself have been bad.
-9. **Where the harness sits when #936 lands.** The stand-in container runtime goes; the harness's cgroup planting must be
-   replaced by a real crun on the runner. *Recommend doing B-0 on top of #936*, not before, so the harness is not written twice.
+9. **Where the harness sits when #936 lands.** The stand-in runtime goes. *Recommend B-0 on the stand-in with the weakening
+   stated (section 4.2)*, and a crun-with-delegation check on `ubuntu-24.04` as its own item, so beta is not delayed by #936.
+10. **Length.** The page is about 590 lines against a 300 to 500 target. Review asked for fixes that add content (the
+    missing-metric rows, the rollback cases, the key lifecycle), so the minor request to trim was only partly taken (sections 10
+    and 11 were folded). *Recommend accepting the length*; the table in section 12 is most of it.
 
 ## 14. What this page changes in other documents
 
