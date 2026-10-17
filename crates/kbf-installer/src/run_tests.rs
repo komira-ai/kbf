@@ -364,6 +364,8 @@ fn what_a_program_leaves_in_its_group_dies_with_the_run() {
 /// pid in `pid` in the working directory, and exits.
 #[test]
 #[ignore = "run as a child program by what_a_program_leaves_in_its_group_dies_with_the_run"]
+// The sleeper is left running on purpose: the run under test has to kill it.
+#[allow(clippy::zombie_processes)]
 fn leaves_a_sleeper() {
     let sleeper = std::process::Command::new("/usr/bin/sleep")
         .arg("60")
