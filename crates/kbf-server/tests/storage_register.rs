@@ -35,6 +35,8 @@ fn dir(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("storage-register")
         .join(name);
+    // A state store left by an earlier run would be a cluster that has already formed.
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("directory");
     dir
 }
@@ -62,6 +64,7 @@ fn config() -> MembershipConfig {
         ttl: 60 * MS,
         dwell: Duration::from_secs(1),
         replication: 2,
+        bootstrap: Duration::ZERO,
     }
 }
 
@@ -493,7 +496,8 @@ fn the_wait_after_failures_doubles_to_a_cap() {
 /// (`start_frontend`, SQLite state store, `--member-ttl-secs` and `--member-dwell-secs`)
 /// and a real node register; a second registrant re-registers until the map the
 /// frontend answers with (published by the refresh that follows a registration) holds the
-/// node at its bound address, Joining. The wait is bounded only to fail a hang.
+/// node at its bound address, `Active` (the first member of a fresh cluster is promoted on
+/// arrival). The wait is bounded only to fail a hang.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
     let d = dir("frontend-mode");
@@ -554,7 +558,7 @@ async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
         }
     })
     .await;
-    assert_eq!(found.state, pb::MemberState::Joining as i32);
+    assert_eq!(found.state, pb::MemberState::Active as i32);
     node_serving.abort();
     drop(stop);
     serving.await.expect("joins").expect("stops");
@@ -580,8 +584,9 @@ async fn waiting_node(
 /// frontend cannot admit it (its store fails, so there is no map) every kind of call is
 /// refused UNAVAILABLE "no storage map yet", not answered as an empty cache (a
 /// FindMissing that says every blob is missing, a write taken that the map places
-/// elsewhere); once the registration lands the same calls are served. Mutant: a gate that
-/// lets every call through.
+/// elsewhere), the action cache and the segment uploads included; once the registration
+/// lands the same calls are served. Mutant: a gate that lets every call through, or one
+/// that spares the action cache or Segments.
 #[tokio::test]
 async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
     let f = frontend(None);
@@ -590,6 +595,9 @@ async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
         .store(1_000_000, std::sync::atomic::Ordering::SeqCst);
     let (node, client) = waiting_node(&f, "gate").await;
     let maps = node.maps();
+    let segments = Endpoint::from_shared(format!("http://{}", node.addr))
+        .expect("endpoint")
+        .connect_lazy();
     let _serving = tokio::spawn(node.serve());
     // The node's directory outlives the run: a blob no earlier run stored.
     let blob = format!(
@@ -622,6 +630,31 @@ async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
                 .put(bytes::Bytes::from(blob.clone()))
                 .await
                 .expect_err("refused")
+        ),
+        want
+    );
+    // The action cache, read and written, and the Segments uploads.
+    assert_eq!(
+        refused(client.action_result(&digest).await.expect_err("refused")),
+        want
+    );
+    assert_eq!(
+        refused(
+            client
+                .prepare_action_result(&kbf_proto::reapi::ActionResult::default())
+                .await
+                .expect_err("refused")
+        ),
+        want
+    );
+    let begun = kbf_proto::worker::segments_client::SegmentsClient::new(segments.clone())
+        .begin(kbf_proto::worker::BeginRequest::default())
+        .await
+        .expect_err("refused");
+    assert_eq!(
+        (
+            begun.code(),
+            begun.message().contains(kbf_server::NO_MAP_YET)
         ),
         want
     );

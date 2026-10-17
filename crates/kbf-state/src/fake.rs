@@ -40,17 +40,26 @@ pub enum Flaw {
     /// C2: preconditions are checked one operation at a time, as each applies, so a
     /// failure leaves the earlier operations written.
     PartialTxn,
+    /// C2: a counter is bumped outside the transaction, as a database sequence is, so an
+    /// increment in a transaction that aborts is kept.
+    CounterSurvivesAbort,
     /// C3: counters are not part of what a sync makes durable, so a restart reissues values.
     CounterNotDurable,
     /// C4: expiry is judged by the clock reading taken when the store opened, standing in
     /// for a caller's clock, not the store's current one.
     CallerClockExpiry,
+    /// C4: a key is still live at the reading that equals its expiry (the check is
+    /// `now <= expires_at`, not `now < expires_at`).
+    InclusiveExpiry,
     /// C5: the feed returns rows past a revision that has not committed yet.
     FeedPastPending,
     /// C6: a write is acknowledged without the sync, so a crash loses it.
     AckBeforeSync,
     /// C7: every transaction pays its own sync, even inside a batch.
     Ungrouped,
+    /// C7: every batch pays two syncs, which costs too little store time to miss the
+    /// commit window, so only the sync count shows it.
+    DoubleSync,
     /// C8: a range scan returns every key of its range, however small the limit.
     ScanIgnoresLimit,
     /// C8: a range scan begins at the prefix whatever lower bound it is given.
@@ -155,6 +164,15 @@ impl Data {
             }
         }
         Ok(())
+    }
+
+    /// Increments the counter of each `Next` in `txn` (the C2 counter flaw).
+    fn bump_counters(&mut self, txn: &Txn) {
+        for op in txn.ops() {
+            if let Op::Next { counter } = op {
+                *self.counters.entry(counter.clone()).or_insert(0) += 1;
+            }
+        }
     }
 
     fn emit(&mut self, revision: u64, key: &str, event: Event) {
@@ -431,10 +449,14 @@ impl Fake {
     }
 
     fn clock_now(&self) -> StoreTime {
-        if self.flaw == Flaw::CallerClockExpiry {
-            self.frozen
-        } else {
-            self.clock.now()
+        match self.flaw {
+            Flaw::CallerClockExpiry => self.frozen,
+            // One tick behind: a key is judged live at the reading that equals its expiry.
+            Flaw::InclusiveExpiry => {
+                let now = self.clock.now();
+                StoreTime::from_duration(now.as_duration().saturating_sub(Duration::from_nanos(1)))
+            }
+            _ => self.clock.now(),
         }
     }
 
@@ -444,8 +466,11 @@ impl Fake {
             return;
         }
         let mut inner = lock(&self.inner);
-        self.clock.advance(FAKE_SYNC_COST);
-        inner.stats.syncs += 1;
+        let syncs = if self.flaw == Flaw::DoubleSync { 2 } else { 1 };
+        for _ in 0..syncs {
+            self.clock.advance(FAKE_SYNC_COST);
+            inner.stats.syncs += 1;
+        }
         let mut snapshot = inner.live.clone();
         if self.flaw == Flaw::CounterNotDurable {
             snapshot.counters.clear();
@@ -466,7 +491,11 @@ impl Fake {
             inner = lock(&self.inner);
             verdict?;
         } else if self.flaw != Flaw::PartialTxn {
-            inner.live.check_all(txn, now)?;
+            let verdict = inner.live.check_all(txn, now);
+            if verdict.is_err() && self.flaw == Flaw::CounterSurvivesAbort {
+                inner.live.bump_counters(txn);
+            }
+            verdict?;
         }
         let base = inner.live.alloc(txn.change_count());
         let commit = inner

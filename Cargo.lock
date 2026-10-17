@@ -1481,6 +1481,7 @@ dependencies = [
  "kbf-segments",
  "kbf-server",
  "kbf-storage",
+ "kbf-store",
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
@@ -2043,6 +2044,7 @@ dependencies = [
 name = "kbf-state"
 version = "0.1.0"
 dependencies = [
+ "kbf-state",
  "postgres",
  "rusqlite",
  "rustix",

@@ -14,7 +14,7 @@ use kbf_objstore::MemoryStore;
 use kbf_proto::reapi::{ActionResult, Digest as ReapiDigest};
 use kbf_proto::worker::segments_server::Segments;
 use kbf_storage::service::{Admission, Config, StorageService};
-use kbf_storage::{Answer, PutStream, ReadStream, Storage, StorageError};
+use kbf_storage::{Answer, PutStream, ReadStream, Storage, StorageError, StreamedPut};
 use kbf_types::{Digest, DigestFunction};
 use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
@@ -23,23 +23,36 @@ use super::Pki;
 
 /// A storage node's store, counting what is read from it.
 pub struct Spy {
-    inner: CacheStorage<MemoryMetaLog, MemoryStore>,
+    inner: Arc<CacheStorage<MemoryMetaLog, MemoryStore>>,
     /// Ranged reads begun (a whole read of a blob is one).
     pub reads: AtomicUsize,
     /// Blob bytes written to it.
-    pub written: AtomicUsize,
+    pub written: Arc<AtomicUsize>,
     /// The next read answers `STALE_MAP` naming this generation, once.
     stale: Mutex<Option<u64>>,
+    /// Whether [`Storage::stream`] hands out a stream (a chain's primary needs one; the
+    /// real cache offers none yet).
+    streams: bool,
 }
 
 impl Spy {
     fn new() -> Arc<Self> {
+        Self::with(false)
+    }
+
+    /// A store that takes a blob as a stream, as a node of a chain needs.
+    pub fn streaming() -> Arc<Self> {
+        Self::with(true)
+    }
+
+    fn with(streams: bool) -> Arc<Self> {
         let cache = Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory());
         Arc::new(Self {
-            inner: CacheStorage::new(cache, SegmentsConfig::DEFAULT),
+            inner: Arc::new(CacheStorage::new(cache, SegmentsConfig::DEFAULT)),
             reads: AtomicUsize::new(0),
-            written: AtomicUsize::new(0),
+            written: Arc::new(AtomicUsize::new(0)),
             stale: Mutex::new(None),
+            streams,
         })
     }
 
@@ -102,7 +115,15 @@ impl Storage for Spy {
     }
 
     fn stream(&self, size: u64) -> Option<Box<dyn PutStream>> {
-        self.inner.stream(size)
+        if !self.streams {
+            return self.inner.stream(size);
+        }
+        Some(Box::new(Buffered {
+            store: Arc::clone(&self.inner),
+            written: Arc::clone(&self.written),
+            bytes: Vec::new(),
+            size,
+        }))
     }
 
     fn put_streamed(
@@ -136,6 +157,49 @@ impl Storage for Spy {
         record: ActionRecord,
     ) -> Answer<'_, ()> {
         self.inner.commit_action_record(role, action, record)
+    }
+}
+
+/// A blob taken as a stream: held until it is finished, then stored whole. It stands in
+/// for a store that writes as bytes arrive, which the real cache does not yet.
+struct Buffered {
+    store: Arc<CacheStorage<MemoryMetaLog, MemoryStore>>,
+    written: Arc<AtomicUsize>,
+    bytes: Vec<u8>,
+    size: u64,
+}
+
+impl PutStream for Buffered {
+    fn append(&mut self, chunk: &[u8]) -> Result<(), StorageError> {
+        self.bytes.extend_from_slice(chunk);
+        if self.bytes.len() as u64 > self.size {
+            return Err(StorageError::Invalid(
+                "more bytes than the stream was made for".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish(
+        self: Box<Self>,
+        digest: Digest,
+        _crc32c: u32,
+    ) -> Result<Box<dyn StreamedPut>, StorageError> {
+        if kbf_segments::sha256(&self.bytes) != digest {
+            return Err(StorageError::Invalid(
+                "the bytes are not the digest's".into(),
+            ));
+        }
+        Ok(self)
+    }
+}
+
+impl StreamedPut for Buffered {
+    fn commit(self: Box<Self>) -> Answer<'static, ()> {
+        Box::pin(async move {
+            self.written.fetch_add(self.bytes.len(), Ordering::SeqCst);
+            self.store.put(Bytes::from(self.bytes)).await.map(drop)
+        })
     }
 }
 

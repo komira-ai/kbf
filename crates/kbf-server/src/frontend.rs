@@ -412,6 +412,7 @@ fn bind_frontend(
         Arc::clone(&farm),
         api.and_then(|api| api.token),
         Arc::clone(&drain),
+        members.clone(),
     )
     .merge(crate::health::router_of(Arc::clone(&checks)))
     .merge(metrics_route(backend.clone()));
