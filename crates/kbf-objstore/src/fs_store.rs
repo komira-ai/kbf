@@ -29,10 +29,14 @@
 //! not hash what it returns: kbf checks every blob it reads against its digest, from
 //! any store. A listing's first page opens every object file to read its key (`list`
 //! serves rebuild and the sweep only): file names are hashes, so key order is known only
-//! once every header is read. The keys under the prefix are kept, sorted, and the pages
-//! that follow are cut from them without opening a file again, as long as their token
-//! came with a page of that listing (it names the listing) within [`LISTING_KEPT_FOR`];
-//! the contract lets a listing miss writes made since it began. A listing started
+//! once every header is read. The first [`LISTING_WINDOW`] keys under the prefix (after
+//! the page's start) are kept, sorted, and the pages that follow are cut from them
+//! without opening a file again, as long as their token came with a page of that
+//! listing (it names the listing) within [`LISTING_KEPT_FOR`]; the contract lets a
+//! listing miss writes made since it began. A listing of more keys than the window
+//! reads every header again once its pages have used the window, keeping the next
+//! window's keys: memory stays bounded by the window whatever the prefix holds, and a
+//! listing of N keys reads the headers N / window times, rounded up. A listing started
 //! [`ListToken::after`] a key is a new listing: it reads every header again, so it sees
 //! every object written before it began. Nothing reads the objects at open: on a large directory that
 //! would hold up every start. [`FsStore::scan`] reads one shard's headers for the
@@ -85,6 +89,11 @@ const MAX_HEADER: usize = MAGIC.len() + 2 + 1024;
 /// How long the sorted keys of a listing are kept for the pages that continue it. A
 /// later page reads every header again.
 const LISTING_KEPT_FOR: Duration = Duration::from_secs(300);
+
+/// How many keys one reading of every header keeps for a listing's pages: sixteen of
+/// the largest pages. kbf's keys are under 100 bytes, so a few MiB; at most 16 MiB of
+/// key text, at S3's 1024-byte limit.
+const LISTING_WINDOW: usize = 16 * PageSize::MAX.get() as usize;
 
 /// The id of the next listing that reads every header. Process-wide, so a token from
 /// one store never names another store's kept listing.
@@ -194,6 +203,8 @@ struct Inner {
     next: AtomicU64,
     /// The sorted keys of the last listing, for the pages that continue it.
     listing: Mutex<Option<Listing>>,
+    /// How many keys a listing keeps ([`LISTING_WINDOW`]; smaller in tests).
+    window: usize,
     /// How many times a listing read every header: once per listing, not per page.
     walks: AtomicU64,
     /// Held for the store's life: closing it releases the lock.
@@ -256,6 +267,7 @@ impl FsStore {
                 tmp,
                 next: AtomicU64::new(0),
                 listing: Mutex::new(None),
+                window: LISTING_WINDOW,
                 walks: AtomicU64::new(0),
                 _lock: lock,
             }),
@@ -442,8 +454,8 @@ impl Inner {
     }
 
     /// The first `max` keys under `prefix` after `after`, in key order: cut from the
-    /// kept keys of `listing` (the listing a page's token came from), or from every
-    /// header read again.
+    /// kept keys of `listing` (the listing a page's token came from) while they last,
+    /// or from a new window of keys, every header read again.
     fn list(
         &self,
         prefix: &KeyPrefix,
@@ -451,34 +463,40 @@ impl Inner {
         listing: Option<u64>,
         max: usize,
     ) -> Result<ListPage, ObjectStoreError> {
+        let start_in =
+            |keys: &[ObjectInfo]| after.map_or(0, |a| keys.partition_point(|o| o.key <= *a));
         let kept = listing.and_then(|id| {
             let kept = self.listing.lock().unwrap_or_else(PoisonError::into_inner);
             kept.as_ref()
                 .filter(|l| {
                     l.id == id && l.prefix == *prefix && l.taken.elapsed() < LISTING_KEPT_FOR
                 })
-                .map(|l| (l.id, Arc::clone(&l.keys)))
+                .map(|l| (l.id, Arc::clone(&l.keys), l.cut))
         });
-        let (id, keys) = match kept {
+        // A kept window whose keys this page has passed, with keys beyond it, is used
+        // up: the page reads the next window.
+        let kept = kept.filter(|(_, keys, cut)| !cut || start_in(keys) < keys.len());
+        let (id, keys, cut) = match kept {
             Some(kept) => kept,
             None => {
-                let keys = self.walk(prefix)?;
+                let (keys, cut) = self.walk(prefix, after)?;
                 let id = NEXT_LISTING.fetch_add(1, Ordering::Relaxed);
                 *self.listing.lock().unwrap_or_else(PoisonError::into_inner) = Some(Listing {
                     id,
                     prefix: prefix.clone(),
                     keys: Arc::clone(&keys),
+                    cut,
                     taken: Instant::now(),
                 });
-                (id, keys)
+                (id, keys, cut)
             }
         };
-        let start = after.map_or(0, |a| keys.partition_point(|o| o.key <= *a));
+        let start = start_in(&keys);
         let end = keys.len().min(start.saturating_add(max));
         let objects = keys[start..end].to_vec();
         // The token names this listing and the last key of this page; the next page
         // starts after it.
-        let next = (end < keys.len())
+        let next = (end < keys.len() || cut)
             .then(|| {
                 objects.last().map(|last| {
                     ListToken(Token::Kept {
@@ -496,24 +514,36 @@ impl Inner {
         Ok(ListPage { objects, next })
     }
 
-    /// Reads the key of every object and returns those under `prefix`, in key order.
-    fn walk(&self, prefix: &KeyPrefix) -> Result<Arc<[ObjectInfo]>, ObjectStoreError> {
+    /// Reads the key of every object and returns the first [`Inner::window`] of those
+    /// under `prefix` and after `after`, in key order, and whether any were left out.
+    fn walk(
+        &self,
+        prefix: &KeyPrefix,
+        after: Option<&ObjectKey>,
+    ) -> Result<(Arc<[ObjectInfo]>, bool), ObjectStoreError> {
         self.walks.fetch_add(1, Ordering::Relaxed);
         let mut found = BTreeMap::new();
+        let mut cut = false;
         for shard in entries(&self.objects).map_err(failed("list", &self.objects))? {
             for path in entries(&shard).map_err(failed("list", &shard))? {
-                let object = Object::open(&path)?;
-                found.extend(
-                    object
-                        .map(|o| (o.key, o.size))
-                        .filter(|(k, _)| prefix.matches(k)),
-                );
+                let Some(object) = Object::open(&path)? else {
+                    continue;
+                };
+                if prefix.matches(&object.key) && after.is_none_or(|a| object.key > *a) {
+                    found.insert(object.key, object.size);
+                    // Never more than the window (and one key) held at once.
+                    if found.len() > self.window {
+                        found.pop_last();
+                        cut = true;
+                    }
+                }
             }
         }
-        Ok(found
+        let keys = found
             .into_iter()
             .map(|(key, size)| ObjectInfo { key, size })
-            .collect())
+            .collect();
+        Ok((keys, cut))
     }
 }
 
@@ -523,6 +553,8 @@ struct Listing {
     id: u64,
     prefix: KeyPrefix,
     keys: Arc<[ObjectInfo]>,
+    /// Whether keys past the last of `keys` were left out (the window was full).
+    cut: bool,
     taken: Instant,
 }
 
@@ -801,6 +833,94 @@ mod tests {
         let keys: Vec<&str> = elsewhere.objects.iter().map(|o| o.key.as_str()).collect();
         assert_eq!(keys, ["b/0", "b/1"]);
         assert_eq!(walks(), 6);
+        drop(store);
+        fs::remove_dir_all(&dir).expect("remove");
+    }
+
+    /// Catches a listing that keeps every key under its prefix (memory growing with the
+    /// prefix, not the window), one that ends at the end of its first window, and one
+    /// that cuts the next page from a used-up window instead of reading the next: 7
+    /// keys through a window of 3 in pages of 2 come back whole, in order, never more
+    /// than 3 kept, in 3 walks. Pages that stay within a window walk no more. A file in
+    /// a shard directory that is not an object is skipped by every walk.
+    #[tokio::test]
+    async fn a_listing_longer_than_its_window_keeps_one_window_at_a_time() {
+        let dir = std::env::temp_dir().join(format!("kbf-objstore-window.{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = FsStore::open(&dir, Floor::Bytes(1)).expect("open");
+        Arc::get_mut(&mut store.inner).expect("one handle").window = 3;
+        for i in 0..7 {
+            for p in ["a", "b"] {
+                let k = key(&format!("{p}/{i}"));
+                store
+                    .put_new(&k, Bytes::from_static(b"x"), None)
+                    .await
+                    .expect("put");
+            }
+        }
+        let shard = store.inner.objects.join("00");
+        fs::create_dir_all(&shard).expect("shard");
+        fs::write(shard.join("foreign"), b"not an object").expect("plant");
+        let a = KeyPrefix::new("a/").expect("prefix");
+        let size = PageSize::new(2).expect("size");
+        let (mut got, mut after, mut most) = (Vec::new(), None, 0);
+        loop {
+            let page = store.list(&a, after.as_ref(), size).await.expect("list");
+            if let Some(kept) = store.inner.listing.lock().expect("lock").as_ref() {
+                most = most.max(kept.keys.len());
+            }
+            got.extend(page.objects.into_iter().map(|o| o.key.as_str().to_owned()));
+            match page.next {
+                Some(t) => after = Some(t),
+                None => break,
+            }
+        }
+        let want: Vec<String> = (0..7).map(|i| format!("a/{i}")).collect();
+        assert_eq!(got, want);
+        assert_eq!(most, 3, "the most keys a listing kept");
+        assert_eq!(store.inner.walks.load(Ordering::Relaxed), 3);
+        assert!(store.inner.listing.lock().expect("lock").is_none());
+        drop(store);
+        fs::remove_dir_all(&dir).expect("remove");
+    }
+
+    /// Catches a fresh listing [`ListToken::after`] a key that walks from the start of
+    /// the prefix (with more keys before the resume key than the window holds, the
+    /// window is used up before it and the listing ends empty), or that starts at the
+    /// key: resumed after a/2 and after a/5 through a window of 3, in pages of 1 and 2,
+    /// the listing is exactly the keys after it, in order.
+    #[tokio::test]
+    async fn a_file_store_listing_resumed_past_its_window_lists_only_the_rest() {
+        let dir = std::env::temp_dir().join(format!("kbf-objstore-resume.{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = FsStore::open(&dir, Floor::Bytes(1)).expect("open");
+        Arc::get_mut(&mut store.inner).expect("one handle").window = 3;
+        for i in 0..9 {
+            let k = key(&format!("a/{i}"));
+            store
+                .put_new(&k, Bytes::from_static(b"x"), None)
+                .await
+                .expect("put");
+        }
+        let a = KeyPrefix::new("a/").expect("prefix");
+        for (from, first) in [("a/2", 3), ("a/5", 6)] {
+            for size in [1, 2] {
+                let size = PageSize::new(size).expect("size");
+                let (mut got, mut after) = (Vec::new(), Some(ListToken::after(&key(from))));
+                loop {
+                    let page = store.list(&a, after.as_ref(), size).await.expect("list");
+                    got.extend(page.objects.into_iter().map(|o| o.key.as_str().to_owned()));
+                    // A listing that repeats a key would otherwise never end.
+                    assert!(got.len() <= 9, "after {from}: a key listed twice: {got:?}");
+                    match page.next {
+                        Some(t) => after = Some(t),
+                        None => break,
+                    }
+                }
+                let want: Vec<String> = (first..9).map(|i| format!("a/{i}")).collect();
+                assert_eq!(got, want, "after {from} in pages of {}", size.get());
+            }
+        }
         drop(store);
         fs::remove_dir_all(&dir).expect("remove");
     }
