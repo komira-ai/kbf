@@ -277,6 +277,21 @@ impl<E: Exec> Helper<E> {
                 .map_err(|r| format!("{}: {r}", r.code()))
                 .and_then(|bytes| order::parse(id, &bytes).map_err(|e| e.to_string()));
             match parsed {
+                Ok(o)
+                    if memory.acked_epoch != 0
+                        && o.epoch > memory.acked_epoch.saturating_add(order::MAX_EPOCH_JUMP) =>
+                {
+                    refuse(
+                        memory,
+                        &format!(
+                            "order {id} is from epoch {}, more than {} above the last acted on ({}): \
+                             not acted on",
+                            o.epoch,
+                            order::MAX_EPOCH_JUMP,
+                            memory.acked_epoch
+                        ),
+                    );
+                }
                 Ok(o) if o.epoch < memory.acked_epoch => {
                     refuse(
                         memory,
@@ -349,7 +364,9 @@ impl<E: Exec> Helper<E> {
     fn activate(&mut self, order: &Order, now: u64) -> Result<Done, String> {
         let ordered = activate::Order {
             commit: order.commit.clone(),
-            order_id: order.id.to_string(),
+            // The epoch is part of the name: a restored store counts ids again, and an activation
+            // under the same id as a pending one would be taken for its repeat.
+            order_id: format!("{}-{}", order.epoch, order.id),
             serial: order.id,
         };
         let arm = self.arm(order);
