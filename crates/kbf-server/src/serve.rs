@@ -41,6 +41,7 @@ use crate::members_rpc::MembershipService;
 use crate::state_store::StateStore;
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
+use kbf_mapsync::MapSource;
 use kbf_proto::kbf::map::v1::membership_server::MembershipServer;
 
 /// How the server listens and paces its daemons.
@@ -467,7 +468,7 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, None, None, shutdown)
+    bind_server_with_options(cache, listeners, api, policy, None, None, None, shutdown)
 }
 
 /// [`bind_server_with_policy`], with the scheduler's state kept in `state` if given
@@ -487,7 +488,28 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, state, None, shutdown)
+    bind_server_with_options(cache, listeners, api, policy, state, None, None, shutdown)
+}
+
+/// [`bind_server_with_state`], sending daemons the storage map `map` holds if given: in
+/// `Welcome`, and in a `MapUpdate` each time it changes ([`WorkerService::with_map`]).
+///
+/// # Errors
+/// As [`bind_server_with_state`].
+pub fn bind_server_with_map<M, O>(
+    cache: Arc<Cache<M, O>>,
+    listeners: Listeners,
+    api: Option<Api>,
+    policy: Policy,
+    state: Option<StateStore>,
+    map: Option<Arc<dyn MapSource>>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
+    bind_server_with_options(cache, listeners, api, policy, state, None, map, shutdown)
 }
 
 /// [`bind_server_with_policy`], and with a `storage` node (`--storage`) the REAPI
@@ -508,15 +530,20 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, None, storage, shutdown)
+    bind_server_with_options(cache, listeners, api, policy, None, storage, None, shutdown)
 }
 
-/// [`bind_server_with_policy`] with both of its options: the scheduler's state in
-/// `state` ([`bind_server_with_state`]) and the client's CAS, ByteStream and
-/// action-cache calls proxied to a `storage` node ([`bind_server_with_storage`]).
+/// [`bind_server_with_policy`] with all of its options: the scheduler's state in
+/// `state` ([`bind_server_with_state`]), the client's CAS, ByteStream and
+/// action-cache calls proxied to a `storage` node ([`bind_server_with_storage`]), and
+/// the storage map `map` sent to daemons ([`bind_server_with_map`]).
 ///
 /// # Errors
 /// As [`bind_server_with_state`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every option the bind functions delegate"
+)]
 pub fn bind_server_with_options<M, O>(
     cache: Arc<Cache<M, O>>,
     listeners: Listeners,
@@ -524,6 +551,7 @@ pub fn bind_server_with_options<M, O>(
     policy: Policy,
     state: Option<StateStore>,
     storage: Option<tonic::transport::Endpoint>,
+    map: Option<Arc<dyn MapSource>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
 where
@@ -605,14 +633,17 @@ where
     ))
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
-    let worker_service = WorkerServer::new(WorkerService::new(
+    let sessions = WorkerService::new(
         Arc::clone(&farm),
         peers,
         listeners.heartbeat_interval,
         listeners.hello_wait,
-    ))
-    .max_decoding_message_size(MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    );
+    // The map, if there is one: no branch in this generic function.
+    let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
+    let worker_service = WorkerServer::new(sessions)
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let membership = membership(members.clone(), peers_certified);
     let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
