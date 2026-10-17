@@ -74,8 +74,11 @@ fn flag<'a>(words: &'a [String], name: &str) -> Option<&'a str> {
     found
 }
 
-/// Rule `storage`: how the unit of a storage node falls short, one line per way.
-pub(super) fn storage(unit: &UnitFile, key: &std::path::Path) -> Vec<String> {
+/// Rule `storage`: how the unit of a storage node falls short, one line per way. With
+/// `exact`, the unit that holds the key beside its builds (`storage-and-daemon`), the key
+/// file must be named exactly (`EnvironmentFile=<key>`, as written), not by a wildcard or
+/// with a `-`.
+pub(super) fn storage(unit: &UnitFile, key: &std::path::Path, exact: bool) -> Vec<String> {
     let words = exec_words(unit);
     let mut out = Vec::new();
     let missing: Vec<String> = STORAGE_FLAGS
@@ -91,10 +94,13 @@ pub(super) fn storage(unit: &UnitFile, key: &std::path::Path) -> Vec<String> {
         ));
     }
     let s3 = flag(&words, "cold-store").is_some_and(|v| v.starts_with("s3://"));
-    let keyed = credential::given(unit)
-        .files
-        .iter()
-        .any(|f| credential::names_key(f, key));
+    let keyed = credential::given(unit).files.iter().any(|f| {
+        if exact {
+            credential::is_exactly(f, key)
+        } else {
+            credential::names_key(f, key)
+        }
+    });
     if s3 && !keyed {
         out.push(format!(
             "has an s3:// cold store and no EnvironmentFile={}: kbf storage starts without \

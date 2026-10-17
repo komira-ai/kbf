@@ -71,26 +71,23 @@ fn the_converged_units_are_unchanged() {
     }
 }
 
-/// Catches an unbuilt mode marked built (its unit's flags would go unchecked by kbf's
-/// parser, which takes anything there) and a mode that runs builds without its cgroup
-/// delegated.
+/// Catches a mode that runs builds without its cgroup delegated, a mode left out of the
+/// credential rule's two sets (it would be checked by neither), and a unit name that is
+/// not `kbf-<mode>.service`.
 #[test]
-fn every_mode_but_the_frontend_is_built() {
-    let built: Vec<_> = Mode::ALL.iter().filter(|m| m.is_built()).collect();
-    assert_eq!(
-        built,
-        [
-            &Mode::Storage,
-            &Mode::Daemon,
-            &Mode::StorageAndDaemon,
-            &Mode::AllInOne
-        ]
-    );
+fn the_modes_are_listed_with_the_sets_the_rules_use() {
     let builds: Vec<_> = Mode::ALL.iter().filter(|m| m.runs_builds()).collect();
     assert_eq!(
         builds,
         [&Mode::Daemon, &Mode::StorageAndDaemon, &Mode::AllInOne]
     );
+    let no_key: Vec<_> = Mode::ALL.iter().filter(|m| m.holds_no_key()).collect();
+    assert_eq!(no_key, [&Mode::Daemon, &Mode::AllInOne]);
+    let beside: Vec<_> = Mode::ALL
+        .iter()
+        .filter(|m| m.holds_key_beside_builds())
+        .collect();
+    assert_eq!(beside, [&Mode::StorageAndDaemon]);
     let names: Vec<_> = Mode::ALL.iter().map(|m| m.unit_name()).collect();
     assert_eq!(
         names,
@@ -126,7 +123,7 @@ fn every_mode_but_the_daemon_drains() {
 #[test]
 fn each_planted_defect_turns_its_rule_red() {
     let c = config();
-    let rows: [(Mode, &str, &str, &str); 19] = [
+    let rows: [(Mode, &str, &str, &str); 21] = [
         (
             Mode::Frontend,
             "TimeoutStopSec=infinity\n",
@@ -207,9 +204,21 @@ fn each_planted_defect_turns_its_rule_red() {
         ),
         (
             Mode::Frontend,
-            "/kbf frontend\n",
-            "/kbf frontend --node-id=n1\n",
-            "FAIL flags: kbf frontend is not built yet and takes no flag kbf can check, but kbf-frontend.service gives '--node-id=n1'",
+            "--state-store=sqlite://@KBF_STATE_DIR@/state.db",
+            "--state-store=postgres://db.example/kbf",
+            "FAIL state-store: kbf-frontend.service: --state-store is a postgres URI: postgres is not wired yet; the state store is sqlite:///<absolute path>",
+        ),
+        (
+            Mode::StorageAndDaemon,
+            "EnvironmentFile=@KBF_ETC@/s3.env\n",
+            "",
+            "FAIL storage: kbf-storage-and-daemon.service has an s3:// cold store and no EnvironmentFile=/etc/kbf/s3.env: kbf storage starts without the bucket's key pair and refuses",
+        ),
+        (
+            Mode::StorageAndDaemon,
+            "Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@\n",
+            "Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@\nEnvironmentFile=@KBF_ETC@/*.env\n",
+            "FAIL credential: kbf-storage-and-daemon.service gives a build node the cold store's key (EnvironmentFile=/etc/kbf/*.env): a build node holds no credential, and its builds run as its user",
         ),
         (
             Mode::Daemon,
@@ -464,22 +473,12 @@ fn the_parse_rule_runs_kbf_check_args_on_a_built_modes_flags() {
         ]
     );
 
-    // A mode not built yet, and a unit that starts an old binary: kbf is not asked.
-    for (mode, text) in [
-        (
-            Mode::Frontend,
-            render(&c, Some(1500), Mode::Frontend).expect("renders"),
-        ),
-        (
-            Mode::Daemon,
-            text.replace("/kbf daemon \\", "/kbf-daemon \\"),
-        ),
-    ] {
-        let (exec, asked) = host(Ok(reply(2, "", "never asked")));
-        let r = on_host(&exec, &c, mode, &text, Some(&given)).expect("runs");
-        assert_eq!(r.notes.len(), 0, "{mode}");
-        assert!(asked.borrow().is_empty(), "{mode}");
-    }
+    // A unit that starts an old binary: kbf is not asked.
+    let old = text.replace("/kbf daemon \\", "/kbf-daemon \\");
+    let (exec, asked) = host(Ok(reply(2, "", "never asked")));
+    let r = on_host(&exec, &c, Mode::Daemon, &old, Some(&given)).expect("runs");
+    assert_eq!(r.notes.len(), 0);
+    assert!(asked.borrow().is_empty());
 }
 
 /// Catches a missing kbf binary read as a failure or a pass with no word (the operator
@@ -566,14 +565,18 @@ fn delegate_is_read_as_systemd_reads_it() {
 /// Catches the rule `credential` looking for another file than the one the storage
 /// modes' units read the key from (a rename of `s3.env` in one place), refusing every
 /// environment file (or one whose directory, not its name, says `s3.env`), and flagging
-/// a mode that holds the storage half's key today.
+/// the two modes that hold the storage half's key (the second by this one file).
 #[test]
 fn the_credential_rule_names_the_file_the_storage_units_read() {
     let c = config();
     let line = format!("EnvironmentFile=@KBF_ETC@/{COLD_STORE_KEY_FILE}\n");
     for mode in Mode::ALL {
         let has = mode.template().contains(&line);
-        assert_eq!(has, matches!(mode, Mode::Storage), "{mode}");
+        assert_eq!(
+            has,
+            matches!(mode, Mode::Storage | Mode::StorageAndDaemon),
+            "{mode}"
+        );
         if has {
             let r = check(
                 &c,
@@ -595,10 +598,7 @@ fn the_credential_rule_names_the_file_the_storage_units_read() {
     let r = check(&c, Mode::Daemon, &own, true).expect("a unit");
     assert_eq!(lines(&r), Vec::<String>::new());
     let holds: Vec<_> = Mode::ALL.iter().filter(|m| m.holds_no_key()).collect();
-    assert_eq!(
-        holds,
-        [&Mode::Daemon, &Mode::StorageAndDaemon, &Mode::AllInOne]
-    );
+    assert_eq!(holds, [&Mode::Daemon, &Mode::AllInOne]);
 }
 
 /// Catches a comment inside a continued `ExecStart=` passed: systemd 239 and older
