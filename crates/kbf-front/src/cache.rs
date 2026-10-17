@@ -21,7 +21,6 @@ use kbf_types::{Digest, FarmTime};
 use prost::Message;
 use tonic::Status;
 
-use crate::MAX_BLOB_BYTES;
 use crate::closure;
 use crate::input_tree::{Horizon, InputTreeConfig, InputTrees};
 use crate::meta_log::{MemoryMetaLog, MetaLog, MetaLogError};

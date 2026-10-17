@@ -239,6 +239,12 @@ impl Farm {
         pki.write_ca(&etc);
         pki.issue(&etc, "worker", Row::FrontendWorker, &["localhost"]);
         pki.issue_reapi(&etc, &["localhost"]);
+        // The unit names `--api-token-file <etc>/api-token`; the test's API calls only read.
+        let token = etc.join("api-token");
+        std::fs::write(&token, "rehearsal-api-token-of-32-or-more-visible-chars\n")
+            .expect("write the API token");
+        std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .expect("the API token's mode");
         farm.ca = std::fs::read(etc.join("ca.pem")).expect("ca");
         let cfg = settings(&root, &loopback(0), "frontend-1", spare, &wiring, "");
         let unit = rendered(&cfg, uid, Mode::Frontend);
