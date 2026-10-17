@@ -233,3 +233,15 @@ fn writes_made_before_a_demote_are_on_disk_for_the_next_store() {
         assert!(new.get(&format!("w{n}")).expect("read").is_some(), "w{n}");
     }
 }
+
+// Catches: a handle that cannot be printed (it is held in structs that derive Debug) or
+// that prints without saying which generation it holds.
+#[test]
+fn a_handle_prints_its_generation() {
+    let handle = Fenced::take(fake(), None).expect("take");
+    let text = format!("{handle:?}");
+    assert!(
+        text.contains("Fenced") && text.contains("generation: 1"),
+        "{text}"
+    );
+}

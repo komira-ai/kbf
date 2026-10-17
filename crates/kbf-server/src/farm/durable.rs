@@ -153,6 +153,10 @@ pub(super) struct Durable {
     /// A write failed because the store could not be reached, and none has been taken
     /// since ([`State::watch_store`] tells the scheduler).
     pub(super) unreachable: AtomicBool,
+    /// A write failed because another writer holds a newer generation of the store: this
+    /// scheduler was superseded and takes no more work. Never cleared; unlike an outage,
+    /// the store coming back does not end it.
+    pub(super) fenced: AtomicBool,
 }
 
 impl std::fmt::Debug for Durable {
@@ -240,6 +244,7 @@ impl Durable {
         let durable = Self {
             store,
             unreachable: AtomicBool::new(false),
+            fenced: AtomicBool::new(false),
         };
         if let Some(cond) = write {
             durable.commit(Txn::new().put(EPOCH, epoch.to_be_bytes(), cond))?;
@@ -526,8 +531,12 @@ impl State {
                 tracing::error!(%error, "the state store did not take {what}");
                 // Only a store that cannot be reached is an outage: a write that lost a
                 // compare-and-set, or found its row gone, is the store working.
-                if matches!(error, StateError::Store(_)) {
-                    durable.unreachable.store(true, Ordering::SeqCst);
+                match &error {
+                    StateError::Store(StoreError::Fenced) => {
+                        durable.fenced.store(true, Ordering::SeqCst);
+                    }
+                    StateError::Store(_) => durable.unreachable.store(true, Ordering::SeqCst),
+                    _ => {}
                 }
                 false
             }
@@ -543,6 +552,16 @@ impl State {
         let Some(durable) = &self.durable else {
             return;
         };
+        if durable.fenced.load(Ordering::SeqCst) {
+            // Superseded: the store is reachable but this scheduler may not write it, so
+            // it stays unavailable (no grant, no lease given up) and never pings back.
+            if !self.store_down {
+                tracing::error!("the state store has a newer writer: this scheduler takes no work");
+                self.store_down = true;
+                self.sched.store_unavailable();
+            }
+            return;
+        }
         if durable.unreachable.load(Ordering::SeqCst) && !self.store_down {
             tracing::warn!("the state store is unavailable: no lease is given up or granted");
             self.store_down = true;
@@ -655,6 +674,15 @@ impl State {
         let id = self.sched.next_operation();
         let joins = self.sched.twin(request).is_some();
         if !joins && !self.durably("a submission", |d| d.submitted(id, request)) {
+            if self
+                .durable
+                .as_ref()
+                .is_some_and(|d| d.fenced.load(Ordering::SeqCst))
+            {
+                return Err(Status::failed_precondition(
+                    "this scheduler was superseded by a newer writer of the state store",
+                ));
+            }
             return Err(Status::unavailable(
                 "the scheduler's state store did not take the request",
             ));

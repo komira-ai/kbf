@@ -36,6 +36,7 @@ type Inbox = mpsc::UnboundedReceiver<Result<ServerMessage, Status>>;
 struct Flaky {
     inner: Inner,
     down: AtomicBool,
+    fenced: AtomicBool,
     /// How many more writes take before the store goes down; negative for no limit.
     allow: AtomicI64,
 }
@@ -124,8 +125,14 @@ impl Flaky {
         Self {
             inner,
             down: AtomicBool::new(false),
+            fenced: AtomicBool::new(false),
             allow: AtomicI64::new(-1),
         }
+    }
+
+    /// Another writer holds a newer generation: every write fails `Fenced`.
+    fn set_fenced(&self) {
+        self.fenced.store(true, Ordering::SeqCst);
     }
 
     /// Set once the SQLite store this wraps is dropped; none over the fake.
@@ -173,6 +180,9 @@ impl Store for Flaky {
         }
         if self.down.load(Ordering::SeqCst) {
             return Err(StoreError::Failed("the store is down".to_owned()));
+        }
+        if self.fenced.load(Ordering::SeqCst) {
+            return Err(StoreError::Fenced);
         }
         self.inner.store().apply_batch(batch)
     }
@@ -541,7 +551,29 @@ async fn nothing_is_granted_while_the_store_is_down() {
     assert_eq!(disk.rows("lease/"), 1);
 }
 
-/// Catches: a lease given up while the store was down that the store is never told of.
+/// Catches: a superseded scheduler (its writes fail Fenced) treated as a store outage
+/// (pinging forever, answering UNAVAILABLE so clients retry it) or still granting work: it
+/// must answer FAILED_PRECONDITION, grant nothing, and stay refusing when writes could
+/// again succeed.
+#[tokio::test(start_paused = true)]
+async fn a_superseded_scheduler_refuses_work_and_does_not_wait_for_the_store() {
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (stream, mut inbox) = register(&farm);
+    disk.store.set_fenced();
+    let refused = submit(&farm, request(1)).expect_err("refused");
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    farm.tick().await;
+    assert!(farm.heartbeat(&node(), stream, 1, Vec::new()).await);
+    assert!(
+        starts(&mut inbox).is_empty(),
+        "a superseded scheduler granted"
+    );
+    assert_eq!(disk.rows("op/"), 0);
+    assert_eq!(disk.rows("lease/"), 0);
+}
+
+/// Catches: a lease given up while the store is never told of.
 /// The store would still hold the old lease and no queue row, so the grant that follows
 /// is refused for want of a queue row, its `Start` is dropped, and the operation never
 /// runs until a restart. Once the store is back, the given-up lease is written and the

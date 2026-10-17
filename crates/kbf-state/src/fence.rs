@@ -111,7 +111,7 @@ impl Store for Fenced {
             .map(|txn| txn.check(GENERATION, Cond::Version(self.version)))
             .collect();
         let results = self.inner.apply_batch(checked)?;
-        let stale = |(result, len): (&Result<Commit, Conflict>, &usize)| matches!(result, Err(c) if c.index == *len && c.key == GENERATION);
+        let stale = |(result, len): (&Result<Commit, Conflict>, &usize)| matches!(result, Err(c) if c.index == *len);
         if results.iter().zip(&own).any(stale) {
             return Err(StoreError::Fenced);
         }
