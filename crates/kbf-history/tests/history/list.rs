@@ -267,7 +267,7 @@ fn the_state_filter_reads_headers_and_the_scan_stops_at_its_bound() {
         ..open_only.clone()
     };
     let (items, next) = page(&reader, &q, &all);
-    assert_eq!(items, [open.key.clone()]);
+    assert_eq!(items, std::slice::from_ref(&open.key));
     assert!(next.is_none(), "{next:?}");
     // The same filter with room finds it in one page.
     let wide = life.reader();

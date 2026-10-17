@@ -177,6 +177,9 @@ impl ObjectStore for Objects {
     }
 }
 
+/// A call made on the real store, once, before a transaction applies.
+pub type Hook = Box<dyn FnOnce(&dyn Store) + Send>;
+
 /// An index that fails on demand, over any store.
 pub struct Index {
     pub inner: Arc<dyn Store>,
@@ -197,7 +200,7 @@ pub struct Index {
     pub rows_read: AtomicU64,
     /// Runs once, with the real store, just before the next transaction applies: another
     /// writer's write landing between this writer's read and its write.
-    pub before_txn: Mutex<Option<Box<dyn FnOnce(&dyn Store) + Send>>>,
+    pub before_txn: Mutex<Option<Hook>>,
     /// A call on this thread panics: the thread that polls the writer and reader.
     pub forbid: Mutex<Option<ThreadId>>,
 }

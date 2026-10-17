@@ -301,7 +301,7 @@ fn the_ring_keeps_the_last_16_runs_in_order() {
     let row = status_row(&life, S).unwrap();
     let want: Vec<_> = made[4..].iter().map(id).collect();
     assert_eq!(run_ids(&row), want);
-    assert_eq!(row.masked, 20.min(64));
+    assert_eq!(row.masked, 20);
     let entry = &row.ring[15];
     assert_eq!(
         (entry.status, entry.digest16, entry.execution_ms),
