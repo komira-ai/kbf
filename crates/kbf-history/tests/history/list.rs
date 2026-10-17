@@ -774,3 +774,30 @@ fn a_keys_configurations_read_back_one_page_at_a_time_for_the_instances_allowed(
             .is_empty()
     );
 }
+
+#[test]
+fn a_row_under_the_catalog_prefix_that_is_no_shape_key_is_skipped() {
+    // Catches: a catalog page that fails or lists a row whose key is not
+    // `<shape>/<cfg>` (a stray write under the prefix), in the whole catalog or in one key's
+    // rows, and a stray row that ends the page early.
+    let mut life = Life::fresh(Limits::default());
+    let inv = InvRef::named("b1");
+    test_run(&life, &inv, T + 1, RunOutcome::Ok, 7, 1);
+    life.close(&inv);
+    life.drain(T + 100, 50);
+    let prefix = life.index_root.shape_prefix("main");
+    life.index.put(&format!("{prefix}not-a-shape-key"), vec![1]);
+    life.index
+        .put(&format!("{prefix}{:016x}/{CFG}x/extra", 7), vec![1]);
+    let reader = life.reader();
+
+    let page = run(reader.shapes("main", None, 10, &all)).unwrap();
+    let got: Vec<_> = page
+        .items
+        .iter()
+        .map(|e| (e.shape, e.cfg.as_str()))
+        .collect();
+    assert_eq!(got, [(7, CFG)]);
+    let page = run(reader.shape_cfgs("main", 7, None, 10, &all)).unwrap();
+    assert_eq!(page.items.len(), 1);
+}

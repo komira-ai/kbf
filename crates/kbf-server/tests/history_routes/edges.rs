@@ -332,22 +332,25 @@ async fn without_history_the_routes_do_not_exist() {
 }
 
 /// Catches: more instances than the index reads at once passed off as all of them: a
-/// list over 257 instances answers from 256 and says `partial`, and a list for one
-/// instance (no names read) does not.
+/// list over 257 instances answers from 256 and says `partial`, on every route that reads
+/// across instances (the invocation list, the shape list and the rows of a key), and a
+/// list for one instance (no names read) does not. The instances after `main` are ghosts,
+/// each with a list row for a build with no header: there to be counted, and nothing to read.
+/// The rows of a key stop after 16 reads of the index with a link to go on from, whether
+/// they found a row (`main` has one) or none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_list_over_too_many_instances_says_partial() {
     let world = World::new();
     let a = world.start(PAGES_ONLY);
-    a.feed(ran("real", "main", 1, 1, 0)).await;
+    a.feed(run("real", "main", shape(SHARED, "c", true, None), 1, 0))
+        .await;
     world.flushed("real", 1).await;
-    // Rows of 257 more instances' lists, each naming a build with no header: the
-    // instances are there to be counted, and nothing to read in them.
     let root = IndexRoot::default();
     let ghost = InvKey::from_record_id("ghost");
     let mut puts = Txn::new();
     for i in 0..257 {
         puts = puts.put(
-            root.inv_list(&format!("i{i:03}"), 1, &ghost),
+            root.inv_list(&format!("z{i:03}"), 1, &ghost),
             vec![1],
             Cond::Any,
         );
@@ -360,10 +363,25 @@ async fn a_list_over_too_many_instances_says_partial() {
         .expect("no conflict");
     let all = a.ok("/v1/invocations").await;
     assert_eq!(all["partial"], true, "{all}");
+    assert_eq!(names(&all, "invocations", "id"), ["real"]);
     let one = a.ok("/v1/invocations?instance=main").await;
     assert!(one.get("partial").is_none());
     assert_eq!(names(&one, "invocations", "id"), ["real"]);
-    // The same bound on a shape list.
+    // The same bound on the shape list, and on the rows of a key.
     assert_eq!(a.ok("/v1/shapes").await["partial"], true);
+    let key = a.ok("/v1/shapes/1111111111111111").await;
+    assert_eq!(key["partial"], true, "{key}");
+    assert_eq!(names(&key, "shapes", "instance"), ["main"]);
+    assert!(key["next_page"].is_string(), "16 reads, then a link: {key}");
+    let none = a.ok("/v1/shapes/4444444444444444").await;
+    assert_eq!(
+        none["shapes"],
+        serde_json::json!([]),
+        "no row is not a 404 while there is more to read: {none}"
+    );
+    assert_eq!(none["partial"], true);
+    assert!(none["next_page"].is_string());
+    let narrow = a.ok("/v1/shapes/1111111111111111?instance=main").await;
+    assert!(narrow.get("partial").is_none(), "{narrow}");
     a.stop().await;
 }
