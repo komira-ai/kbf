@@ -215,6 +215,7 @@ impl Storage for Called {
     ) -> Answer<'_, ()> {
         Box::pin(async move {
             let service = self.judged().await?;
+            let _open = service.open_writes.begin();
             let catching_up = service.catching_up();
             let committed = service
                 .storage

@@ -56,6 +56,7 @@ impl StorageService {
         leg_from: Option<MemberId>,
         mut messages: Messages,
     ) -> Result<u64, Status> {
+        let _open = self.open_writes.begin();
         let view = self.view(requested).await?;
         let first = next_or(&mut messages, "write stream sent no message").await?;
         let digest = super::wire::write_resource(&first.resource_name)?;
