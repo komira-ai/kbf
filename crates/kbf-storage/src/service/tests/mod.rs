@@ -8,6 +8,7 @@
 mod catch_up;
 mod every_call;
 pub(crate) mod fake;
+mod in_process;
 pub(crate) mod roles;
 mod stale_map;
 

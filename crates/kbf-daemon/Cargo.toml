@@ -51,6 +51,7 @@ kbf-meta.workspace = true
 kbf-segments.workspace = true
 kbf-objstore.workspace = true
 kbf-server.workspace = true
+kbf-store.workspace = true
 # The program the tests' actions run, kbf-testkit's act verbs, through the test binary.
 kbf-testkit.workspace = true
 rcgen.workspace = true

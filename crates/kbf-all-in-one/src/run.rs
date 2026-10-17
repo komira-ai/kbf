@@ -103,32 +103,39 @@ fn serve(flags: Flags) -> Result<(), Failed> {
     let started = tokio.block_on(kbf_server::start_interruptible(&flags.server));
     let server = started.map_err(Failed::server)?;
     println!("{}", server.start_line());
-    let plane = LocalDataPlane::new(server.local(), tokio.handle().clone());
+    let plane = Arc::new(LocalDataPlane::new(server.local(), tokio.handle().clone()));
     let serving = Box::pin(server.serve());
-    with_daemon(&tokio, serving, plane, &flags.daemon)
+    with_daemon(&tokio, serving, in_process(plane), &flags.daemon)
 }
 
 /// What the half beside the daemon serves until it stops.
 pub(crate) type Serving = Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>;
 
-/// The daemon half of `daemon` over `plane`, beside the half (server or storage)
+/// How the daemon half starts: from its flags, over the data plane its mode gives it.
+pub(crate) type Starter =
+    Box<dyn FnOnce(&kbf_node::Cli) -> Result<kbf_node::NodeHandle, kbf_node::Error>>;
+
+/// The daemon half over `plane`, the in-process plane of its half.
+pub(crate) fn in_process(plane: Arc<LocalDataPlane>) -> Starter {
+    Box::new(move |cli| kbf_node::start_with(cli, move |_| Ok(Arc::clone(&plane))))
+}
+
+/// The daemon half of `daemon` started by `start`, beside the half (server or storage)
 /// `serving` on `tokio`; returns once that half has stopped and the daemon half after
 /// it. Not generic, so both modes run one copy of it.
 pub(crate) fn with_daemon(
     tokio: &Runtime,
     serving: Serving,
-    plane: LocalDataPlane,
+    start: Starter,
     daemon: &kbf_node::Cli,
 ) -> Result<(), Failed> {
-    let plane = Arc::new(plane);
     // Dropped when the other half stops serving, which stops the daemon half.
     let (ended, other_ended) = tokio::sync::oneshot::channel::<()>();
     let serving = tokio.spawn(async move {
         let _ended = ended;
         serving.await
     });
-    let node = kbf_node::start_with(daemon, move |_| Ok(Arc::clone(&plane)));
-    let node = node.map_err(Failed::Daemon)?;
+    let node = start(daemon).map_err(Failed::Daemon)?;
     node.serve_until(async move {
         let _ = other_ended.await;
     });

@@ -45,6 +45,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use kbf_daemon::LocalMember;
 use kbf_daemon::{
     Args, Capacity, DAEMON_VERSION, Daemon, DaemonConfig, DriverWatch, FakeRuntime, FarmCas,
     Liveness, MapHolder, NodeReport, Runtime, Runtimes,
@@ -398,6 +399,22 @@ pub fn start(cli: &Cli) -> Result<NodeHandle, Error> {
     })
 }
 
+/// [`start`], for a daemon in the process of the storage node `local` (`kbf
+/// storage-and-daemon` with a frontend): the data plane routes every blob by the map the
+/// frontend sends, the blobs of `local` in-process and the others over TLS to their
+/// owners ([`kbf_daemon::member_cas`]). There is no `--cas` leg: with no map held a call
+/// fails UNAVAILABLE and writes nothing.
+///
+/// # Errors
+/// As [`start`].
+pub fn start_member(cli: &Cli, local: LocalMember) -> Result<NodeHandle, Error> {
+    let maps = Arc::new(MapHolder::new());
+    let held = Arc::clone(&maps);
+    start_over(cli, Some(maps), move |cli, liveness| {
+        member(cli, &held, &local, liveness)
+    })
+}
+
 /// [`start`], with every runtime reading and writing blobs through the data plane
 /// `plane` makes, rather than through the transfer engine over `--cas`: for a binary
 /// that runs the daemon in the server's own process. `plane` is called once, in the
@@ -462,6 +479,23 @@ fn farm(cli: &Cli, maps: &Arc<MapHolder>, liveness: Liveness) -> Result<Arc<Farm
         nodes,
         &cli.transfer.config(),
     )))
+}
+
+/// The data plane of [`start_member`]: the daemon's CA and certificate for the members
+/// that are not `local`, each verified against its own name from the map.
+fn member(
+    cli: &Cli,
+    maps: &Arc<MapHolder>,
+    local: &LocalMember,
+    liveness: Liveness,
+) -> Result<Arc<kbf_transfer::RoutedCas>, Error> {
+    let nodes = kbf_daemon::storage_nodes(&DaemonConfig::from_args(&cli.daemon).tls, liveness)?;
+    Ok(kbf_daemon::member_cas(
+        Arc::clone(maps),
+        local.clone(),
+        nodes,
+        &cli.transfer.config(),
+    ))
 }
 
 /// The engine over `--cas` alone, for tests of the node's set-up.
