@@ -47,6 +47,7 @@ use clap::{Args, Subcommand};
 use kbf_host::exec::HostExec;
 use kbf_host::path::Root;
 use kbf_host::plan::Mode;
+use kbf_installer::layout::{Layout, Platform};
 
 use state::{CurrentLink, Status};
 
@@ -73,6 +74,10 @@ pub struct StatusArgs {
     /// The directory the host's paths are under, such as a mounted image.
     #[arg(long, default_value = "/", value_parser = root)]
     root: Root,
+    /// The host's operating system, which decides where its state and lock are
+    /// (`linux` or `macos`); the one this program was built for by default.
+    #[arg(long)]
+    platform: Option<Platform>,
 }
 
 #[derive(Args)]
@@ -105,9 +110,17 @@ pub struct ApplyArgs {
     /// The directory the host's paths are under, such as a mounted image.
     #[arg(long, default_value = "/", value_parser = root)]
     root: Root,
+    /// The host's operating system, which decides where its state and lock are
+    /// (`linux` or `macos`); the one this program was built for by default.
+    #[arg(long)]
+    platform: Option<Platform>,
 }
 
 impl ApplyArgs {
+    fn layout(&self) -> Layout {
+        layout_of(&self.root, self.platform)
+    }
+
     fn mode(&self) -> Mode {
         if self.apply {
             Mode::Apply
@@ -117,6 +130,10 @@ impl ApplyArgs {
     }
 }
 
+fn layout_of(root: &Root, platform: Option<Platform>) -> Layout {
+    Layout::new(root.clone(), platform.unwrap_or_else(Platform::current))
+}
+
 fn root(dir: &str) -> Result<Root, kbf_host::PathError> {
     Root::new(PathBuf::from(dir))
 }
@@ -124,17 +141,17 @@ fn root(dir: &str) -> Result<Root, kbf_host::PathError> {
 /// Run a `host` verb: see the module docs for what each prints and its exit.
 pub fn run(verb: Host, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let done = match verb {
-        Host::Status(a) => return status(&a.root, a.json, out, err),
+        Host::Status(a) => return status(&layout_of(&a.root, a.platform), a.json, out, err),
         Host::Install(a) => {
-            let r = &a.apply.root;
+            let host = a.apply.layout();
             let what = release::Install {
                 commit: a.commit,
                 from: a.from,
             };
             let mode = a.apply.mode();
             release::install(
-                &mut HostExec::new(r.clone()),
-                r,
+                &mut HostExec::new(host.root().clone()),
+                &host,
                 release::ROOT,
                 &what,
                 mode,
@@ -142,13 +159,19 @@ pub fn run(verb: Host, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
             )
         }
         Host::Rollback(a) => {
-            release::rollback(&mut HostExec::new(a.root.clone()), &a.root, a.mode(), out)
+            let host = a.layout();
+            release::rollback(
+                &mut HostExec::new(host.root().clone()),
+                &host,
+                a.mode(),
+                out,
+            )
         }
         Host::Gc(a) => {
-            let r = &a.apply.root;
+            let host = a.apply.layout();
             release::gc(
-                &mut HostExec::new(r.clone()),
-                r,
+                &mut HostExec::new(host.root().clone()),
+                &host,
                 a.keep,
                 a.apply.mode(),
                 out,
@@ -164,8 +187,8 @@ pub fn run(verb: Host, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     }
 }
 
-fn status(root: &Root, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
-    let status = match state::status(root) {
+fn status(host: &Layout, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let status = match state::status(host) {
         Ok(status) => status,
         Err(e) => {
             let _ = writeln!(err, "REFUSED: {e}");
@@ -173,9 +196,9 @@ fn status(root: &Root, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> 
         }
     };
     let text = if json {
-        format!("{}\n", status_json(&status))
+        format!("{}\n", status_json(host, &status))
     } else {
-        status_lines(&status)
+        status_lines(host, &status)
     };
     let _ = out.write_all(text.as_bytes());
     ExitCode::from(u8::from(!status.link_matches()))
@@ -194,9 +217,9 @@ impl fmt::Display for Or<'_> {
 }
 
 /// The lines `host status` prints.
-pub fn status_lines(status: &Status) -> String {
+pub fn status_lines(host: &Layout, status: &Status) -> String {
     let s = &status.state;
-    let mut text = format!("state: {}", layout::STATE_FILE);
+    let mut text = format!("state: {}", host.state_file());
     if !status.exists {
         text.push_str(" (none yet)");
     }
@@ -234,7 +257,7 @@ pub fn status_lines(status: &Status) -> String {
 }
 
 /// The object `host status --json` prints.
-pub fn status_json(status: &Status) -> serde_json::Value {
+pub fn status_json(host: &Layout, status: &Status) -> serde_json::Value {
     let (kind, target) = match &status.link {
         CurrentLink::Missing => ("missing", None),
         CurrentLink::To(target) => ("link", Some(target.display().to_string())),
@@ -242,7 +265,7 @@ pub fn status_json(status: &Status) -> serde_json::Value {
     };
     serde_json::json!({
         "schema": state::SCHEMA,
-        "state_file": layout::STATE_FILE,
+        "state_file": host.state_file().as_str(),
         "exists": status.exists,
         "state": status.state,
         "current_link": {

@@ -1,8 +1,10 @@
-//! The deploy state, `/var/lib/kbf-deploy/state.json`, and the lock it is changed under.
+//! The deploy state, `state.json` in the state directory (`/var/lib/kbf-deploy` on Linux,
+//! `/var/db/kbf-deploy` on macOS), and the lock it is changed under.
 //!
 //! The file is one JSON object: a `schema` number ([`SCHEMA`]) and the fields of
 //! [`State`]. It is changed only through a [`Locked`], which holds an exclusive `flock(2)`
-//! on `/run/kbf-deploy.lock` for as long as it lives, so two kbf-deploy runs cannot both
+//! on the lock file (`/run/kbf-deploy.lock`, or `/var/run/kbf-deploy.lock` on macOS) for as
+//! long as it lives, so two kbf-deploy runs cannot both
 //! read the state, change it and write it back (the second would undo the first). The
 //! lock file and the state file are made 0600, root's alone. A write makes a new file
 //! beside the old one, syncs it, renames it over the old one and syncs the directory: a
@@ -15,11 +17,10 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use kbf_host::path::Root;
 use serde::{Deserialize, Serialize};
 
 use super::CommitId;
-use super::layout;
+use super::layout::{self, Layout};
 
 /// The `schema` number this build writes and the only one it reads.
 pub const SCHEMA: u64 = 1;
@@ -81,11 +82,11 @@ pub struct Locked {
 }
 
 impl Locked {
-    /// Take the exclusive lock on `/run/kbf-deploy.lock` under `root`, waiting while
-    /// another run holds it. The lock file is made (mode 0600) when missing; its
-    /// directory must exist.
-    pub fn acquire(root: &Root) -> Result<Locked, StateError> {
-        let path = root.join(&layout::path(layout::LOCK));
+    /// Take the exclusive lock on the layout's lock file (`/run/kbf-deploy.lock` on
+    /// Linux, `/var/run/kbf-deploy.lock` on macOS), waiting while another run holds it.
+    /// The lock file is made (mode 0600) when missing; its directory must exist.
+    pub fn acquire(host: &Layout) -> Result<Locked, StateError> {
+        let path = host.join(&host.lock());
         let fail = |source| StateError::Lock {
             path: path.clone(),
             source,
@@ -101,7 +102,7 @@ impl Locked {
         lock.lock().map_err(fail)?;
         Ok(Locked {
             _lock: lock,
-            file: state_file(root),
+            file: state_file(host),
         })
     }
 
@@ -135,8 +136,8 @@ struct OnDisk<'a> {
     state: &'a State,
 }
 
-fn state_file(root: &Root) -> PathBuf {
-    root.join(&layout::path(layout::STATE_FILE))
+fn state_file(host: &Layout) -> PathBuf {
+    host.join(&host.state_file())
 }
 
 /// Write `bytes` to a new file beside `path` (mode 0600: root's alone), sync it, rename it over `path` and sync
@@ -161,11 +162,11 @@ fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
-/// The state under `root`, read without the lock: for a dry run, which changes nothing
+/// The state of the host, read without the lock: for a dry run, which changes nothing
 /// and so takes no lock (taking it would make the lock file). `None` when there is no
 /// state file yet.
-pub fn read_unlocked(root: &Root) -> Result<Option<State>, StateError> {
-    read_file(&state_file(root))
+pub fn read_unlocked(host: &Layout) -> Result<Option<State>, StateError> {
+    read_file(&state_file(host))
 }
 
 /// The state in `path`; `None` when there is no such file.
@@ -233,11 +234,11 @@ impl Status {
     }
 }
 
-/// The state and the `current` link under `root`, read without the lock: a write
+/// The state and the `current` link of the host, read without the lock: a write
 /// replaces the state file by a rename, so the file read is one whole state.
-pub fn status(root: &Root) -> Result<Status, StateError> {
-    let state = read_unlocked(root)?;
-    let link_path = root.join(&layout::path(layout::CURRENT));
+pub fn status(host: &Layout) -> Result<Status, StateError> {
+    let state = read_unlocked(host)?;
+    let link_path = host.join(&layout::path(layout::CURRENT));
     let link = current_link(fs::read_link(&link_path)).map_err(|source| StateError::Read {
         path: link_path,
         source,

@@ -1,25 +1,57 @@
 //! The host side of kbf's releases: where a host keeps them, the state it records about
-//! them, and the verbs that install, roll back and remove them.
+//! them, the verbs that install, stage, roll back and remove them, and the offline check
+//! that decides whether a release handed over by the unprivileged `kbf` may be staged.
 //!
-//! - [`layout`]: the paths: each release in its own directory under
+//! The host's records:
+//!
+//! - [`layout`]: the paths ([`layout::Layout`], a directory tree and its
+//!   [`layout::Platform`]): each release in its own directory under
 //!   `/usr/local/kbf/releases/<commit>/`, the `current` and `previous` links beside them,
-//!   kbf-deploy's state under `/var/lib/kbf-deploy/` and its settings under
-//!   `/etc/kbf-deploy/`.
+//!   the state under `/var/lib/kbf-deploy/` (Linux) or `/var/db/kbf-deploy/` (macOS) and
+//!   its settings under `/etc/kbf-deploy/`.
 //! - [`state`]: `state.json` (the current, previous and staged commits, the one waiting
-//!   to be confirmed, and the order floor), read and written under an exclusive lock on
-//!   `/run/kbf-deploy.lock` and replaced whole by a rename.
-//! - [`release`]: the `install`, `rollback` and `gc` verbs.
+//!   to be confirmed, and the order floor), read and written under an exclusive lock and
+//!   replaced whole by a rename.
+//! - [`release`]: the `install`, `stage`, `rollback` and `gc` verbs.
 //! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
 //!   named by.
 //!
+//! The offline check ([`stage::stage_from_inbox`] runs them in the order that matters,
+//! documented there):
+//!
+//! - [`inbox`] and [`offer`]: an entry the unprivileged process wrote, opened without
+//!   following a link, and the offer that names its files and their sha256.
+//! - [`attest`]: `gh attestation verify`, pinned, offline, as an unprivileged user.
+//! - [`trust`] and [`settings`]: what the check believes without looking at its content
+//!   (`gh`, the trusted root, the host's settings) and the root-ownership check on it.
+//! - [`archive`], [`binary`] and [`darwin`]: the tarball, the kind of executable and its
+//!   `--version --json`, and on macOS the quarantine attribute and the code signature.
+//! - [`run`]: the one place a process is started, behind a trait a test plays.
+//! - [`refusal`]: every way a stage is refused, one enum with a stable code per case.
+//!
 //! `kbf-deploy host ...` (the manual path) calls these; so does any other program that
-//! changes a host's releases, so that a host has one state file and one layout.
+//! changes a host's releases, so that a host has one state file and one layout. The
+//! trust rests on GitHub's build attestation of the artifacts workflow on the host's
+//! source ref (docs/deploy/host-releases.md, "What is trusted").
 
+pub mod archive;
+pub mod attest;
+pub mod binary;
+pub mod darwin;
+#[cfg(test)]
+mod fixtures;
+pub mod inbox;
 pub mod layout;
+pub mod offer;
+pub mod refusal;
 pub mod release;
+pub mod run;
+pub mod settings;
+pub mod stage;
 pub mod state;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
+pub mod trust;
 
 use std::fmt;
 
