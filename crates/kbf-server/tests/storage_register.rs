@@ -905,6 +905,121 @@ async fn a_node_over_mutual_tls_keeps_a_repair_journal_and_a_worker_settles_it()
     assert!(maps.generation() > 0, "it needed the map to say so");
 }
 
+/// Catches a `kbf storage-and-daemon` whose in-process view is not the node's own service:
+/// one built over a separate storage with no map and no chain would answer every write at
+/// once, as one copy nobody owes. The real half (`storage_half::start`, mutual TLS, a
+/// frontend) is called through `in_process()`. While the frontend cannot admit it the write
+/// is refused UNAVAILABLE "has not been given a map"; once it holds a map in which it and a
+/// partner that is not listening both own the blob, the same call is answered, the blob is
+/// in this node's store, and the repair journal owes it to the partner. Mutant: `bind_node`
+/// handing `in_process` a service made over another, unmapped, chainless storage.
+#[tokio::test]
+async fn a_write_through_the_halfs_in_process_view_is_judged_by_the_map_and_owes_the_partner() {
+    let pki = Pki::new();
+    let (frontend_cert, frontend_key) = pki.cert("frontend");
+    let worker_tls = WorkerTls {
+        server: ServerTlsConfig::new()
+            .identity(Identity::from_pem(frontend_cert, frontend_key))
+            .client_ca_root(Certificate::from_pem(pki.ca.pem())),
+        deny_list: None,
+    };
+    let f = frontend(Some(worker_tls));
+    f.store
+        .fail_gets
+        .store(1_000_000, std::sync::atomic::Ordering::SeqCst);
+    let d = dir("half-in-process");
+    let write = |name: &str, text: String| {
+        let path = d.join(name);
+        std::fs::write(&path, text).expect("write");
+        path.display().to_string()
+    };
+    let (cert, key) = pki.cert("storage");
+    let more = [
+        format!("--frontend=https://localhost:{}", f.worker.port()),
+        format!("--storage-tls-cert={}", write("node.pem", cert)),
+        format!("--storage-tls-key={}", write("node.key", key)),
+        format!("--storage-client-ca={}", write("ca.pem", pki.ca.pem())),
+    ];
+    let mut flags = flags(&d, &more).expect("flags");
+    flags.repair.interval = 50 * MS;
+    let half = kbf_server::storage_half::start(&flags, never)
+        .await
+        .expect("starts");
+    let (in_process, storage, maps) = (half.in_process(), half.storage(), half.maps());
+    let repairs = half
+        .repairs()
+        .expect("a node over mutual TLS keeps a journal");
+    let here = half.addr;
+    let _serving = tokio::spawn(half.serve());
+
+    let refused = in_process
+        .at(0)
+        .put(bytes::Bytes::from_static(b"before any map"))
+        .await
+        .expect_err("no map yet");
+    let refused = tonic::Status::from(refused);
+    assert_eq!(refused.code(), Code::Unavailable);
+    assert!(
+        refused.message().contains("has not been given a map"),
+        "{refused}"
+    );
+
+    f.store
+        .fail_gets
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    until("the node to register", || row(&f, 1)).await;
+    until("the node to hold a map", || {
+        (maps.generation() > 0).then_some(())
+    })
+    .await;
+
+    // The partner: a member whose address nothing listens on.
+    let gone = {
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        socket.local_addr().expect("address")
+    };
+    let member = |id, addr: SocketAddr| kbf_map::Member {
+        id: MemberId(id),
+        addr: addr.to_string(),
+        zone: String::new(),
+        weight: 1,
+        state: MemberState::Active,
+    };
+    let map = kbf_map::Map::new(
+        1_000,
+        vec![member(1, here), member(2, gone)],
+        kbf_map::Rule::Rendezvous,
+        2,
+        1,
+        Vec::new(),
+    )
+    .expect("a map");
+    // A blob this node is the primary of; the partner is its second owner.
+    let blob = (0..)
+        .map(|i| format!("owed to the partner {i} of run {}", std::process::id()).into_bytes())
+        .find(|b| map.write_owners(&kbf_segments::sha256(b)).first() == Some(&MemberId(1)))
+        .expect("a blob");
+    let digest = kbf_segments::sha256(&blob);
+    assert!(maps.offer(map));
+
+    let answered = in_process
+        .at(1_000)
+        .put(bytes::Bytes::from(blob))
+        .await
+        .expect("the write is answered with one copy");
+    assert_eq!(answered, digest);
+    assert!(
+        storage.read_blob(&digest).await.is_ok(),
+        "one copy is on this node"
+    );
+    let owed = repairs.open_records();
+    assert_eq!(owed.len(), 1, "{owed:?}");
+    assert_eq!(
+        (owed[0].digest, owed[0].replica, owed[0].generation),
+        (digest, MemberId(2), 1_000)
+    );
+}
+
 /// Catches a node with no frontend that keeps a repair journal: it is a one-member farm of
 /// itself and owes no one a copy, so it has none and makes no directory for it. A node that
 /// registers in plain text (it copies nothing) has none either.
