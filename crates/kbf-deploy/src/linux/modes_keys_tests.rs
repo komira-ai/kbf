@@ -350,3 +350,67 @@ fn the_example_documents_exactly_the_closed_key_set() {
         crate::linux::config::KEYS.iter().copied().collect();
     assert_eq!(in_example, in_set);
 }
+
+/// On the node, `storage-and-daemon` may name its key file and nothing else that sets an
+/// `AWS_*` variable: a copy of the key under another name is refused as for a build node,
+/// while the key file itself (root's, 0600) is not read as a copy and not reported twice.
+/// Catches the unit's other environment files going unread on the node.
+#[test]
+fn on_the_node_a_copy_of_the_key_beside_the_allowed_file_is_refused() {
+    use kbf_host::exec::Entry;
+    use kbf_host::step::{Owner, Perms};
+    use kbf_host::testkit::FakeExec;
+
+    let c = config_with(&[]);
+    let unit = render(&c, Some(1500), Mode::StorageAndDaemon)
+        .expect("renders")
+        .replace(
+            "EnvironmentFile=/etc/kbf/s3.env\n",
+            "EnvironmentFile=/etc/kbf/s3.env\nEnvironmentFile=/etc/kbf/copy.env\n",
+        );
+    let slice = UnitText::new(
+        SLICE,
+        crate::linux::render::render(&c, Some(1500), &crate::linux::render::Templates::BUILT_IN)
+            .expect("renders")
+            .slice,
+    );
+    let mut exec = FakeExec::new(0);
+    let file = |bits: u32, uid: u32, text: &str| Entry::File {
+        perms: Perms::new(bits),
+        owner: Owner { uid, gid: uid },
+        bytes: text.as_bytes().to_vec(),
+    };
+    for (path, entry) in [
+        ("/usr/local/bin/kbf", file(0o755, 0, "")),
+        ("/etc/kbf/s3.env", file(0o600, 0, "AWS_ACCESS_KEY_ID=a\n")),
+        (
+            "/etc/kbf/copy.env",
+            file(0o600, 0, "AWS_SECRET_ACCESS_KEY=s\n"),
+        ),
+    ] {
+        exec.entries
+            .insert(kbf_host::HostPath::new(path).expect("absolute"), entry);
+    }
+    let r = check_on_host(
+        &exec,
+        &c,
+        Mode::StorageAndDaemon,
+        &UnitText::new(Mode::StorageAndDaemon.unit_name(), unit),
+        &slice,
+        true,
+        None,
+    )
+    .expect("runs");
+    let credential: Vec<String> = r
+        .failures
+        .iter()
+        .filter(|f| f.rule == "credential")
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        credential,
+        [
+            "FAIL credential: kbf-storage-and-daemon.service gives a build node the cold store's key (EnvironmentFile=/etc/kbf/copy.env, which sets AWS_SECRET_ACCESS_KEY): a build node holds no credential, and its builds run as its user"
+        ]
+    );
+}

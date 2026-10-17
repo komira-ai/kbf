@@ -243,9 +243,9 @@ fn directories(unit: &UnitFile) -> Result<Vec<(HostPath, u32)>, HostError> {
     if let Some(file) = unit
         .flag("state-store")
         .and_then(|v| v.strip_prefix("sqlite://"))
-        && let Some(dir) = file.rsplit_once('/').map(|(dir, _)| dir)
-        && !dir.is_empty()
     {
+        let file = HostPath::new(file)?;
+        let dir = file.as_str().rsplit_once('/').map_or("", |(dir, _)| dir);
         dirs.push((HostPath::new(dir)?, 0o700));
     }
     Ok(dirs)

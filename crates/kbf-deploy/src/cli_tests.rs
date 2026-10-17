@@ -280,7 +280,17 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
         assert!(exec.queries.borrow().is_empty(), "{args:?} asked the host");
     }
 
-    // A mode's unit: the converged units' MinIO restart and rollback are not a mode's.
+    // A mode's unit reaches its own install: on a host with no such user it asks for the
+    // user the frontend runs as and is refused before any step.
+    let mut exec = FakeExec::new(0);
+    let args = [base("install-units"), vec!["--mode", "frontend"]].concat();
+    let (code, _, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!(code, ExitCode::from(2));
+    assert_eq!(
+        err,
+        "REFUSED: /usr/bin/getent passwd -- kbf-server printed \"\", which is not what this kit reads\n"
+    );
+    // The converged units' MinIO restart and rollback are not a mode's.
     for flag in ["--restart-minio", "--uninstall"] {
         let mut exec = FakeExec::new(0);
         let args = [base("install-units"), vec!["--mode", "storage", flag]].concat();
