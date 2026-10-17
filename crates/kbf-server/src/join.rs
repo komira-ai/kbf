@@ -3,14 +3,17 @@
 //! says the row lapsed, and backing off when it cannot be reached
 //! (`docs/design/architecture-v2.md`, section 6). The node never touches the state store.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
+use kbf_storage::repair::Repairs;
 use tonic::transport::Channel;
 use tonic::{Code, Status};
 
 use crate::members::PROTOCOL;
+use crate::storage_health::Debts;
 
 /// The first wait after a failure.
 pub const RETRY_BASE: Duration = Duration::from_secs(1);
@@ -55,6 +58,7 @@ pub struct Joiner {
     client: MembershipClient<Channel>,
     identity: Identity,
     retry: Duration,
+    repairs: Option<Arc<Repairs>>,
 }
 
 impl Joiner {
@@ -66,7 +70,31 @@ impl Joiner {
             client: MembershipClient::new(channel),
             identity,
             retry,
+            repairs: None,
         }
+    }
+
+    /// The joiner of a node that keeps a repair journal: every heartbeat says how many
+    /// copies the journal holds open. Without one a heartbeat says the node cannot say
+    /// ([`Debts::Unknown`]), never none. A [`Repairs`] has read its journal when it is
+    /// opened, so a node that restarts reports the debts it had.
+    #[must_use]
+    pub fn with_repairs(mut self, repairs: Arc<Repairs>) -> Self {
+        self.repairs = Some(repairs);
+        self
+    }
+
+    /// What this node says it owes now. The journal's lock is held across a disk sync by a
+    /// write that owes, so it is asked on a blocking thread; a thread that fails is
+    /// "cannot say".
+    async fn debts(&self) -> Debts {
+        let Some(repairs) = self.repairs.clone() else {
+            return Debts::Unknown;
+        };
+        tokio::task::spawn_blocking(move || repairs.open_debt_count())
+            .await
+            .ok()
+            .map_or(Debts::Unknown, Debts::Known)
     }
 
     /// Registers once.
@@ -100,11 +128,14 @@ impl Joiner {
     /// # Errors
     /// NOT_FOUND when the row lapsed (register again); the call failing.
     pub async fn beat(&mut self, joined: &Joined) -> Result<u64, Status> {
+        let (debts_known, repair_debts) = self.debts().await.to_wire();
         let answer = self
             .client
             .heartbeat(pb::HeartbeatRequest {
                 member_id: joined.member_id,
                 boot: joined.boot,
+                repair_debts,
+                debts_known,
             })
             .await?;
         Ok(answer.into_inner().map_generation)

@@ -594,9 +594,17 @@ where
     );
     let api_routes = crate::api::router(Arc::clone(&farm), token, Arc::clone(&drain))
         .merge(health_routes)
-        .merge(crate::metrics::router(Arc::clone(&cache), local))
+        .merge(crate::metrics::router(
+            Arc::clone(&cache),
+            local,
+            members.clone(),
+        ))
         .merge(blob_routes)
         .merge(page_routes);
+    // The storage health, if there are members: no branch in this generic function.
+    let api_routes = members.iter().fold(api_routes, |routes, members| {
+        routes.merge(crate::storage_health::router(Arc::clone(members)))
+    });
     // Logged at every start, the first one too (issue #156).
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     log_state(durable, term, epoch);

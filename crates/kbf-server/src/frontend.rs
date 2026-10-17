@@ -71,6 +71,7 @@ use crate::drain::Drain;
 use crate::farm::Farm;
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::{Checks, MapProbe, Readiness, StateProbe, StorageProbe};
+use crate::members::Members;
 use crate::serve::{
     AbortOnDrop, ServeError, bind, bind_api, drain_and_stop, flow_control, keepalive, log_state,
     members_of, membership, serve_api, stop_api, sweeping, worker_peers,
@@ -411,7 +412,10 @@ fn bind_frontend(
         Arc::clone(&drain),
     )
     .merge(crate::health::router_of(Arc::clone(&checks)))
-    .merge(metrics_route(backend.clone()));
+    .merge(metrics_route(backend.clone(), members.clone()));
+    let api_routes = members.iter().fold(api_routes, |routes, members| {
+        routes.merge(crate::storage_health::router(Arc::clone(members)))
+    });
 
     let mut reapi_server = keepalive(flow_control(Server::builder()), listeners.streams);
     if let Some(tls) = listeners.reapi_tls {
@@ -535,15 +539,16 @@ fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Stor
     state.map(|state| Arc::clone(&state.store))
 }
 
-/// `GET /metrics`: what the service counts, in the Prometheus text format.
-fn metrics_route(backend: Backend) -> axum::Router {
+/// `GET /metrics`: what the service counts, in the Prometheus text format, and the storage
+/// health of `members` when there are any.
+fn metrics_route(backend: Backend, members: Option<Arc<Members>>) -> axum::Router {
     let render = move || {
         let backend = backend.clone();
+        let members = members.clone();
         async move {
-            (
-                [(CONTENT_TYPE, crate::metrics::TEXT_FORMAT)],
-                backend.render_metrics(),
-            )
+            let mut text = backend.render_metrics();
+            crate::metrics::scrape_health(&mut text, members.as_ref()).await;
+            ([(CONTENT_TYPE, crate::metrics::TEXT_FORMAT)], text)
         }
     };
     axum::Router::new().route("/metrics", get(render))

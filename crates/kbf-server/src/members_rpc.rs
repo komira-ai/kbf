@@ -21,6 +21,7 @@ use kbf_storage::service::{Admission, PeerRole, role_of};
 use tonic::{Request, Response, Status};
 
 use crate::members::{Members, MembershipError, Registrant};
+use crate::storage_health::Debts;
 
 /// The service over `members`, admitting callers as `admission` says.
 pub struct MembershipService {
@@ -134,7 +135,8 @@ impl Membership for MembershipService {
         let req = request.into_inner();
         let members = Arc::clone(&self.members);
         let id = kbf_map::MemberId(req.member_id);
-        let map_generation = blocking(move || members.heartbeat(id, req.boot)).await?;
+        let debts = Debts::from_wire(req.debts_known, req.repair_debts);
+        let map_generation = blocking(move || members.heartbeat(id, req.boot, debts)).await?;
         Ok(Response::new(pb::HeartbeatResponse { map_generation }))
     }
 }
