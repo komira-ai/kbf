@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use futures::executor::block_on;
 use serde_json::{Value, json};
 
-use crate::pages::{ACTION, BUILD, BUILDS, PAGES};
+use crate::pages::{ACTION, BUILD, BUILDS, PAGES, UPDATES};
 use crate::read::Page;
 use crate::{Answer, CONTENT_SECURITY_POLICY, Fetched, Source, SourceError, respond};
 
@@ -211,6 +211,72 @@ pub(crate) fn farm() -> Fake {
         .with(&stderr_href, 200, STDERR)
 }
 
+pub(crate) const COMMIT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+pub(crate) const COMMIT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+/// `GET /v1/update`: desired `COMMIT_B` at generation 7 (not paused), no policy row,
+/// two releases: `COMMIT_A` with a complete linux platform and an incomplete darwin
+/// one, `COMMIT_B` complete on both.
+pub(crate) fn update_doc() -> Value {
+    json!({
+        "desired": {"generation": 7, "commit": COMMIT_B, "set_at_ms": 1_791_370_000_000_u64,
+            "paused": false},
+        "policy": null,
+        "releases": {"releases": [
+            {"commit": COMMIT_A, "platforms": [
+                {"platform": "linux-x86_64", "complete": true, "components": []},
+                {"platform": "darwin-arm64", "complete": false, "components": []}]},
+            {"commit": COMMIT_B, "platforms": [
+                {"platform": "linux-arm64", "complete": true, "components": []},
+                {"platform": "darwin-arm64", "complete": true, "components": []}]}]},
+    })
+}
+
+/// A node of `GET /v1/nodes`.
+pub(crate) fn node(id: &str, os: Option<&str>, update: &Value) -> Value {
+    json!({
+        "node_id": id, "connected": true,
+        "software": os.map(|os| json!({"os_name": os, "xcodes": []})),
+        "update": update, "needs_attention": [], "placement": {"state": "serving"},
+    })
+}
+
+/// `GET /v1/nodes`: the frontend's server at `COMMIT_B`, a current Linux host, a
+/// Mac that refused, and a host that never sent an `UpdateStatus`.
+pub(crate) fn nodes_doc() -> Value {
+    json!({"server": {"version": "0.1.0+bbbbbbbbbbbb", "commit": COMMIT_B}, "nodes": [
+        node("linux-1", Some("Linux"),
+            &json!({"state": "confirmed", "up_to_date": true, "availability": "ok"})),
+        node("mac-1", Some("macOS"),
+            &json!({"state": "refused", "up_to_date": false, "availability": "ok"})),
+        node("old-1", None,
+            &json!({"state": null, "up_to_date": null, "availability": "unsupported"}))]})
+}
+
+/// `GET /v1/update/hosts` for `nodes_doc`.
+pub(crate) fn hosts_doc() -> Value {
+    json!({"desired": null, "paused": false, "next_page_token": null, "hosts": [
+        {"node_id": "linux-1", "connected": true, "availability": "ok", "state": "confirmed",
+         "up_to_date": true, "desired_commit": COMMIT_B, "running_commit": "bbbbbbbbbbbb",
+         "installed_commit": COMMIT_B, "staged_commit": "", "refusal": "",
+         "offered_generation": 7, "helper_present": true, "reported_at_unix_ms": 1},
+        {"node_id": "mac-1", "connected": true, "availability": "ok", "state": "refused",
+         "up_to_date": false, "desired_commit": COMMIT_B, "running_commit": "aaaaaaaaaaaa",
+         "installed_commit": COMMIT_A, "staged_commit": "", "refusal": "no helper installed",
+         "offered_generation": 7, "helper_present": false, "reported_at_unix_ms": 2}]})
+}
+
+/// The URL of the per-host detail, as the page asks for it.
+pub(crate) const HOSTS_URL: &str = "/v1/update/hosts?page_size=1000";
+
+/// A read API that answers all three routes of the Updates page.
+pub(crate) fn updates_farm() -> Fake {
+    Fake::default()
+        .json("/v1/update", &update_doc())
+        .json("/v1/nodes", &nodes_doc())
+        .json(HOSTS_URL, &hosts_doc())
+}
+
 pub(crate) fn render(fake: &Fake, path_and_query: &str) -> Answer {
     let (path, query) = path_and_query
         .split_once('?')
@@ -363,6 +429,7 @@ fn contract_table() -> Vec<(&'static Page, Vec<String>)> {
             ],
         ),
         (&ACTION, vec![action_page()]),
+        (&UPDATES, vec!["/ui/updates".to_owned()]),
     ]
 }
 
@@ -386,7 +453,11 @@ fn every_page_reads_only_the_routes_it_declares() {
     for (page, paths) in &table {
         let mut used = vec![false; page.reads.len()];
         for path in paths {
-            let fake = farm();
+            let fake = if page.name == UPDATES.name {
+                updates_farm()
+            } else {
+                farm()
+            };
             let answer = render(&fake, path);
             assert_eq!(answer.status(), 200, "{path}: {}", body(&answer));
             let seen = fake.seen();
