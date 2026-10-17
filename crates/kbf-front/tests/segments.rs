@@ -1065,3 +1065,42 @@ async fn an_upload_is_an_open_write_until_its_commit_ends() {
     assert_eq!(open.count(), 1, "an upload nobody commits");
     open_reaches(&open, 0).await;
 }
+
+/// Catches a `Begin` that waits for admission (the memory budget another upload holds) and
+/// is not counted: it has been taken in and a daemon is waiting on it, so a node that read
+/// zero then would be stopped under it. The second `Begin` is an open write while it waits
+/// (two with the first), and the count falls with it when its connection goes. Mutant: the
+/// count taken after the admission.
+#[tokio::test]
+async fn a_begin_waiting_for_admission_is_an_open_write() {
+    let open = kbf_storage::service::OpenWrites::new();
+    let config = SegmentsConfig {
+        max_bytes: 4 << 10,
+        idle: Duration::from_secs(3600),
+    };
+    let writes = WriteConfig {
+        bytes_in_flight: 4 << 10,
+        ..WriteConfig::DEFAULT
+    };
+    let front = Front::start_counted(config, writes, Some(open.clone())).await;
+    let first = seg(&[blob(60, 1400), blob(61, 1400)]);
+    let second = seg(&[blob(62, 1500)]);
+    let mut a = front.client().await;
+    front.begin(&mut a, std::slice::from_ref(&first)).await;
+    assert_eq!(open.count(), 1);
+
+    let mut b = front.client().await;
+    let segments = vec![second.upload_segment()];
+    let waiting = tokio::spawn(async move { b.begin(BeginRequest { segments }).await });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while front.service.begins_waiting() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the second Begin waits in the server");
+    assert_eq!(open.count(), 2, "a Begin waiting for the budget is open");
+    waiting.abort();
+    let _ = waiting.await;
+    open_reaches(&open, 1).await;
+}

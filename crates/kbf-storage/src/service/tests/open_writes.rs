@@ -322,3 +322,31 @@ async fn a_commit_waiting_for_the_map_is_open() {
     assert!(local.await.expect("joins").is_err());
     count_reaches(&open, 0).await;
 }
+
+/// Catches a segment upload's `Begin` that is not counted while it waits for the map: the
+/// service judges the map before the store's handlers (which count the upload) see the call.
+/// A `Begin` from a caller ahead of the node is open while the node fetches the map, over the
+/// wire and in-process. Mutant: the count taken after the map is judged.
+#[tokio::test]
+async fn a_segment_begin_waiting_for_the_map_is_open() {
+    use kbf_proto::worker::BeginRequest;
+    let mem = Arc::new(Mem::default());
+    let open = OpenWrites::new();
+    let (remote, in_process) =
+        node_waiting_for_a_map(&mem, &open, Duration::from_millis(600)).await;
+    let (wire, local) = (remote.segments(), in_process.segments());
+    let over_the_wire = tokio::spawn(async move {
+        wire.begin(tonic::Request::new(BeginRequest::default()))
+            .await
+    });
+    count_reaches(&open, 1).await;
+    let in_this_process = tokio::spawn(async move {
+        local
+            .begin(tonic::Request::new(BeginRequest::default()))
+            .await
+    });
+    count_reaches(&open, 2).await;
+    assert!(over_the_wire.await.expect("joins").is_err());
+    assert!(in_this_process.await.expect("joins").is_err());
+    count_reaches(&open, 0).await;
+}
