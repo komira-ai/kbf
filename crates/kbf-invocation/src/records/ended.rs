@@ -154,8 +154,8 @@ impl Records {
         for (_, key) in &self.by_seen {
             let inv = &self.invocations[key];
             match inv.state(now) {
-                State::Idle if inv.idle_reported != Some(inv.last_seen) => idle.push(key.clone()),
-                State::Idle => {}
+                // MUTANT: a record is reported idle on every sweep.
+                State::Idle => idle.push(key.clone()),
                 // A record with an operation in flight is open however old it is.
                 State::Open if inv.in_flight > 0 => {}
                 // Every record after this one was seen later.
