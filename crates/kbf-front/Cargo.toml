@@ -33,6 +33,7 @@ tower-layer.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+kbf-map.workspace = true
 # The REAPI service definitions, read from kbf-proto's vendored files, so the
 # authorization test (tests/auth.rs) covers every method the routes serve.
 protox.workspace = true
