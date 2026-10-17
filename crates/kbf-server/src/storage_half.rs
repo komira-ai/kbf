@@ -212,14 +212,8 @@ where
     // After the log is open: it refuses a directory that holds files it did not write.
     let repair_dir = stores.meta_dir.join(REPAIR_DIR);
     let stop = Box::pin(shutdown()?);
-    let node = bind_node(
-        flags,
-        listener,
-        registered,
-        Arc::clone(&storage),
-        &repair_dir,
-        stop,
-    )?;
+    let served = Arc::clone(&storage);
+    let node = bind_node(flags, listener, registered, served, &repair_dir, stop)?;
     let addr = node.addr;
     Ok(StorageHalf {
         addr,

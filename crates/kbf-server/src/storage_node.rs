@@ -531,14 +531,8 @@ where
     });
     let _pass = pass.map(|pass| AbortOnDrop(crate::startup_pass::spawn(Arc::clone(&cache), pass)));
     let storage = Arc::new(CacheStorage::new(cache, flags.segments()));
-    let node = bind_node(
-        flags,
-        listener,
-        registered,
-        storage,
-        repair_dir,
-        Box::pin(shutdown()?),
-    )?;
+    let stop = Box::pin(shutdown()?);
+    let node = bind_node(flags, listener, registered, storage, repair_dir, stop)?;
     Ok(StorageHandle {
         addr: node.addr,
         start_line: format!(
