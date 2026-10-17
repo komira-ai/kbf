@@ -836,3 +836,40 @@ fn a_fate_row_that_is_not_one_is_refused() {
         assert_eq!(fate::decode(&bad), Err(why));
     }
 }
+
+/// Catches: a fate row with a worker name that is not text accepted, a fate too large to
+/// write encoded anyway (a truncated length), a requeue whose fate cannot be written
+/// reported as success, and a load that skips a fate row it cannot read instead of
+/// refusing the store.
+#[test]
+fn a_fate_that_cannot_be_written_or_read_is_refused() {
+    let mut row = fate::encode(&a_fate()).expect("encodes");
+    // Version, booking, count, then the first name's length (2): its first byte.
+    row[1 + 8 + 4 + 2] = 0xff;
+    assert_eq!(fate::decode(&row), Err("a worker name is not text"));
+
+    let mut huge = a_fate();
+    huge.memory_runs[0].worker = WorkerId::new(&"n".repeat(usize::from(u16::MAX) + 1));
+    assert_eq!(fate::encode(&huge), None);
+
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .submitted(OperationId(4), &request(5))
+        .expect("submit");
+    durable
+        .persist(&[Effect::Start(start(4, 0))])
+        .expect("grant");
+    let error = durable
+        .requeued(&killed(4, 0), None, Some(&huge))
+        .expect_err("too large");
+    assert!(error.to_string().contains("fate/0000000000000004"));
+    assert!(
+        !keys(&store).iter().any(|k| k.starts_with("queue/")),
+        "nothing of the requeue landed"
+    );
+
+    put(&store, "fate/0000000000000004", vec![2]);
+    let error = durable.load().expect_err("a fate of another version");
+    assert!(error.to_string().contains("not a version 1 fate"));
+}
