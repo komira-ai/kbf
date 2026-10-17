@@ -197,30 +197,24 @@ fn a_mode_renders_and_checks_and_an_unknown_mode_is_refused() {
             mode,
         ])
     };
-    let (code, stdout, stderr) = render("storage-and-daemon");
+    let (code, stdout, stderr) = render("frontend");
     assert_eq!((code, stderr.as_str()), (0, ""), "{stdout}");
     assert!(
-        stdout.starts_with("rendered kbf.slice kbf-storage-and-daemon.service into "),
+        stdout.starts_with("rendered kbf.slice kbf-frontend.service into "),
         "{stdout}"
     );
-    let (code, stdout, _) = check("storage-and-daemon");
+    let (code, stdout, _) = check("frontend");
     assert_eq!(
         (code, stdout.as_str()),
-        (
-            0,
-            "UNIT OK: kbf-storage-and-daemon.service runs kbf storage-and-daemon\n"
-        )
+        (0, "UNIT OK: kbf-frontend.service runs kbf frontend\n")
     );
 
-    let unit = out.join("kbf-storage-and-daemon.service");
+    let unit = out.join("kbf-frontend.service");
     let text = std::fs::read_to_string(&unit).expect("unit");
-    let planted = text.replace(
-        "/kbf storage-and-daemon\n",
-        "/kbf storage-and-daemon --node-id=n1\n",
-    );
+    let planted = text.replace("/kbf frontend\n", "/kbf frontend --node-id=n1\n");
     assert_ne!(planted, text, "the defect is not planted");
     std::fs::write(&unit, planted).expect("plant");
-    let (code, stdout, _) = check("storage-and-daemon");
+    let (code, stdout, _) = check("frontend");
     assert_eq!(code, 1, "{stdout}");
     assert!(stdout.starts_with("FAIL flags: "), "{stdout}");
 

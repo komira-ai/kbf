@@ -108,11 +108,15 @@ impl RemoteStorage {
 
 /// The error a failed call is. The codes a [`Storage`] answers are kept (`at` is the
 /// blob and offset of a read, which NOT_FOUND and OUT_OF_RANGE are about): a caller sees
-/// what an in-process store would have said. UNAVAILABLE and every code that says
-/// nothing of the request (a transport failure, a deadline) are `Unavailable`; a
-/// store that is held but unreadable is UNAVAILABLE too, so it is `Unavailable` here
-/// where it was `Unreachable` there.
-pub(super) fn lift(status: &Status, at: Option<(Digest, u64)>) -> StorageError {
+/// what an in-process store would have said. Only UNAVAILABLE, DEADLINE_EXCEEDED and
+/// UNKNOWN, which say nothing of the request (a transport failure, a deadline), are
+/// `Unavailable`; a store that is held but unreadable is UNAVAILABLE too, so it is
+/// `Unavailable` here where it was `Unreachable` there. Every other code is an answer
+/// from a node that was reached and declined (ABORTED, DATA_LOSS, RESOURCE_EXHAUSTED,
+/// CANCELLED, ALREADY_EXISTS, FAILED_PRECONDITION without a map generation): `Internal`
+/// with the code in the message, never an outage, so a primary does not answer a write
+/// with one copy over a replica's refusal ([`crate::replicate`]).
+pub(crate) fn lift(status: &Status, at: Option<(Digest, u64)>) -> StorageError {
     if let Some(current) = stale_generation(status) {
         return StorageError::StaleMap { current };
     }
@@ -126,7 +130,10 @@ pub(super) fn lift(status: &Status, at: Option<(Digest, u64)>) -> StorageError {
         (Code::Internal | Code::Unimplemented | Code::NotFound | Code::OutOfRange, _) => {
             StorageError::Internal(message)
         }
-        _ => StorageError::Unavailable(Arc::new(Remote(message))),
+        (Code::Unavailable | Code::DeadlineExceeded | Code::Unknown, _) => {
+            StorageError::Unavailable(Arc::new(Remote(message)))
+        }
+        (code, _) => StorageError::Internal(format!("{code:?}: {message}")),
     }
 }
 

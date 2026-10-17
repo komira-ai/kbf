@@ -67,15 +67,17 @@ use kbf_threads::Topology;
 use tonic::service::Routes;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server};
 
+use crate::drain::Drain;
 use crate::farm::Farm;
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::{Checks, MapProbe, Readiness, StateProbe, StorageProbe};
 use crate::serve::{
     AbortOnDrop, ServeError, bind, bind_api, drain_and_stop, flow_control, keepalive, log_state,
-    serve_api, worker_peers,
+    members_of, membership, serve_api, stop_api, sweeping, worker_peers,
 };
+use crate::start::{Escalation, escalating, interruptions};
 use crate::worker::WorkerService;
-use crate::{Args, ConfigError, SERVER_VERSION, interrupted, sizes_on};
+use crate::{Args, ConfigError, SERVER_VERSION, sizes_on};
 
 /// The flags of [`Args`] a frontend takes, besides the thread flags
 /// ([`kbf_threads::PoolArgs`]): what it listens on and how it schedules.
@@ -103,6 +105,8 @@ pub const ALLOWED: &[&str] = &[
     "shutdown_timeout_secs",
     "invocation_memory",
     "state_store",
+    "member_ttl_secs",
+    "member_dwell_secs",
     "log_dir",
     "log_max_bytes",
     "log_files",
@@ -267,11 +271,22 @@ pub struct FrontendHandle {
     pub worker: SocketAddr,
     /// Where the operator API listener is, if there is one.
     pub api: Option<SocketAddr>,
+    drain: Arc<Drain>,
+    /// Completes on the second stop signal; [`FrontendHandle::serve`] then closes the
+    /// drain ([`Drain::close`]).
+    escalation: Option<Escalation>,
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
 }
 
 impl FrontendHandle {
+    /// The frontend's drain ([`Drain`]): `POST /v1/frontend/drain` begins it, and the
+    /// shutdown future given to [`start_frontend`] does.
+    #[must_use]
+    pub fn drain(&self) -> Arc<Drain> {
+        Arc::clone(&self.drain)
+    }
+
     /// The line the frontend prints once it is bound:
     /// `kbf-frontend <version> reapi=<addr> worker=<addr>[ api=<addr>] storage=<url>`.
     #[must_use]
@@ -286,7 +301,7 @@ impl FrontendHandle {
     /// # Errors
     /// A listener fails while serving.
     pub async fn serve(self) -> Result<(), ServeError> {
-        self.serving.await
+        escalating(self.serving, &self.drain, self.escalation).await
     }
 }
 
@@ -350,11 +365,14 @@ fn bind_frontend(
     let policy = args.reapi_auth_policy()?;
     let api = args.api()?;
     let channel = flags.storage_endpoint()?.connect_lazy();
-    let state = args
-        .state_store
-        .as_ref()
-        .map(crate::StateStoreUri::open)
-        .transpose()?;
+    let state = crate::start::with_members(
+        args.state_store
+            .as_ref()
+            .map(crate::StateStoreUri::open)
+            .transpose()?,
+        args.members(),
+    );
+    let members = members_of(state.as_ref());
     let readiness = Arc::new(Readiness::default());
     let timeout = listeners.store_probe_timeout;
     let storage = Arc::new(RemoteStorage::new(channel.clone(), 0));
@@ -384,9 +402,16 @@ fn bind_frontend(
     let (worker_incoming, worker) = bind(listeners.worker)?;
     let api_listener = api.as_ref().map(|api| bind_api(api.listen)).transpose()?;
     let api_addr = api_listener.as_ref().map(|(_, local)| *local);
-    let api_routes = crate::api::router(Arc::clone(&farm), api.and_then(|api| api.token))
-        .merge(crate::health::router_of(Arc::clone(&checks)))
-        .merge(metrics_route(backend.clone()));
+    let (closer, closing) = kbf_front::closing();
+    let (drain, goaway) = Drain::new(closer, Arc::clone(&readiness));
+    let drain = Arc::new(drain);
+    let api_routes = crate::api::router(
+        Arc::clone(&farm),
+        api.and_then(|api| api.token),
+        Arc::clone(&drain),
+    )
+    .merge(crate::health::router_of(Arc::clone(&checks)))
+    .merge(metrics_route(backend.clone()));
 
     let mut reapi_server = keepalive(
         flow_control(Server::builder(), listeners.streams.reapi),
@@ -395,6 +420,7 @@ fn bind_frontend(
     if let Some(tls) = listeners.reapi_tls {
         reapi_server = reapi_server.tls_config(tls)?;
     }
+    let peers_certified = listeners.worker_tls.is_some();
     let (mut worker_server, peers) = worker_peers(
         keepalive(
             flow_control(Server::builder(), listeners.streams.worker),
@@ -411,7 +437,7 @@ fn bind_frontend(
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
 
-    let (closer, closing) = kbf_front::closing();
+    let membership = membership(members.clone(), peers_certified);
     let (ticker, progress) = kbf_front::progress(listeners.timing.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
     let proxy = Proxy::new(
@@ -439,19 +465,29 @@ fn bind_frontend(
     )));
 
     let shutdown = shutdown()?;
-    let stop = Arc::clone(&readiness);
+    let stopper = Arc::clone(&drain);
     let serving = async move {
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
-        let (drain, draining) = tokio::sync::oneshot::channel::<()>();
         let reapi_serve = reapi_server
             .add_routes(reapi_routes)
             .serve_with_incoming_shutdown(reapi_incoming, async {
-                let _ = draining.await;
+                let _ = goaway.await;
             });
         let worker_serve = worker_server
             .add_service(worker_service)
+            .add_optional_service(membership)
             .serve_with_incoming(worker_incoming);
-        let api_serve = serve_api(api_listener.map(|(listener, _)| listener), api_routes);
+        // Told when the REAPI listener is done (see `serve::stop_api`).
+        let (api_stop, api_stopped) = tokio::sync::oneshot::channel::<()>();
+        let api_serve = serve_api(
+            api_listener.map(|(listener, _)| listener),
+            api_routes,
+            async {
+                let _ = api_stopped.await;
+            },
+        );
+        tokio::pin!(api_serve);
+        let sweeping = sweeping(members);
         let ticking = async {
             let mut tick = tokio::time::interval(listeners.tick);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -462,22 +498,33 @@ fn bind_frontend(
         };
         let stopping = async {
             shutdown.await;
-            drain_and_stop(&stop, &closer, drain, listeners.shutdown_timeout).await;
+            drain_and_stop(&stopper, listeners.shutdown_timeout).await;
         };
-        tokio::select! {
-            served = reapi_serve => served.map_err(ServeError::from),
+        let mut reapi_done = false;
+        let outcome = tokio::select! {
+            served = reapi_serve => {
+                reapi_done = true;
+                served.map_err(ServeError::from)
+            }
             served = worker_serve => served.map_err(ServeError::from),
-            served = api_serve => served.map_err(ServeError::Api),
+            served = &mut api_serve => served.map_err(ServeError::Api),
+            () = sweeping => Ok(()),
             () = ticking => Ok(()),
             () = ticker.run() => Ok(()),
             () = stopping => Ok(()),
+        };
+        if reapi_done {
+            stop_api(api_stop, api_serve).await;
         }
+        outcome
     };
     let plain = args.plain_text_off_loopback();
     Ok(FrontendHandle {
         reapi,
         worker,
         api: api_addr,
+        drain,
+        escalation: None,
         start_line: start_line(
             reapi,
             worker,
@@ -545,7 +592,9 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
     let sizes = sizes_on(&flags.server, Topology::detect());
     sizes.log();
     sizes.runtime()?.block_on(async {
-        let frontend = start_frontend(flags, interrupted)?;
+        let (first, second) = interruptions()?;
+        let mut frontend = start_frontend(flags, move || Ok(first))?;
+        frontend.escalation = Some(second);
         println!("{}", frontend.start_line());
         Ok(frontend.serve().await?)
     })
