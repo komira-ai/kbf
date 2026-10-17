@@ -82,6 +82,21 @@ pub const MARKER: &str = "simulator";
 /// How long each `simctl` command has to exit.
 pub const ANSWER_WITHIN: Duration = Duration::from_secs(120);
 
+/// How many times the start sweep runs its listing and deletes before it gives up on
+/// the devices a killed daemon left. A `CoreSimulatorService` that stalls answers no
+/// `simctl` for minutes and then answers again, so one cap-long try says nothing of
+/// the next.
+pub const SWEEP_ATTEMPTS: u32 = 3;
+
+/// The file in the scratch root that says a start sweep gave up: the lease directory
+/// that held the [`MARKER`] is removed, so this is what the next start finds, and it
+/// sweeps again until one sweep ends clean.
+pub const PENDING: &str = "simulators-left";
+
+/// The lease directory (the name sweeps remove) the sweep runs `simctl` in when
+/// [`PENDING`] is all that asks for it.
+pub const SWEEP_DIR: &str = "lease-sweep";
+
 /// How long the driver waits for Xcode to list a lease's new simulator, how often it
 /// looks and how long each look has, before the action runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -437,6 +452,53 @@ impl Simctl {
         }
     }
 
+    /// [`Self::sweep`] up to [`SWEEP_ATTEMPTS`] times, in the lease directory `lease`
+    /// (a real path), until one ends clean. A clean end removes [`PENDING`] from
+    /// `scratch`; the last failure is logged and written there, so the next start
+    /// sweeps again after this one's lease directories are gone.
+    pub(crate) fn sweep_left(&self, scratch: &Path, lease: &Path) {
+        let pending = scratch.join(PENDING);
+        let mut failed = String::new();
+        for attempt in 1..=SWEEP_ATTEMPTS {
+            match self.sweep(lease) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&pending);
+                    return;
+                }
+                Err(why) => {
+                    tracing::warn!(attempt, "simulators left behind: {why}");
+                    failed = why;
+                }
+            }
+        }
+        tracing::error!(
+            dir = %lease.display(),
+            "simulators left behind, tried again at the next start: {failed}"
+        );
+        let _ = std::fs::write(&pending, b"");
+    }
+
+    /// The sweep a previous start gave up on ([`PENDING`]), when no left lease
+    /// directory asked for one: run in a directory [`SWEEP_DIR`] made under `scratch`
+    /// and removed with `remove`.
+    pub(crate) fn sweep_pending(
+        &self,
+        scratch: &Path,
+        remove: &dyn Fn(&Path) -> std::io::Result<()>,
+    ) {
+        let dir = scratch.join(SWEEP_DIR);
+        let real = std::fs::create_dir_all(&dir).and_then(|()| std::fs::canonicalize(&dir));
+        match real {
+            Ok(real) => self.sweep_left(scratch, &real),
+            Err(why) => {
+                tracing::error!(dir = %dir.display(), "no directory to sweep simulators in: {why}")
+            }
+        }
+        if let Err(why) = remove(&dir) {
+            tracing::error!(dir = %dir.display(), "cannot remove the sweep directory: {why}");
+        }
+    }
+
     /// Shuts down and deletes each of `udids`, one command each; why each delete that
     /// failed did.
     fn delete(&self, dir: &Path, udids: &[String]) -> Vec<String> {
@@ -567,6 +629,12 @@ fn devices_in(json: &[u8]) -> Result<Vec<(String, String)>, String> {
 /// without following a link.
 pub(crate) fn marked(lease: &Path) -> bool {
     std::fs::symlink_metadata(lease.join(MARKER)).is_ok_and(|m| m.file_type().is_file())
+}
+
+/// Whether an earlier start left [`PENDING`] in `scratch` as a regular file, looked at
+/// without following a link.
+pub(crate) fn pending(scratch: &Path) -> bool {
+    std::fs::symlink_metadata(scratch.join(PENDING)).is_ok_and(|m| m.file_type().is_file())
 }
 
 /// Whether `text` is a UDID as `simctl` prints one: 8-4-4-4-12 hexadecimal digits.

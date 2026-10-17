@@ -19,7 +19,7 @@ use crate::support::{
 use kbf_daemon::{Runtime, RuntimeError};
 use kbf_driver_native::NativeConfig;
 use kbf_driver_native::network::Isolation;
-use kbf_driver_native::simulator::{Listing, MARKER, UDID_VAR};
+use kbf_driver_native::simulator::{Listing, MARKER, PENDING, SWEEP_ATTEMPTS, UDID_VAR};
 
 /// The UDID the fake `simctl create` prints for [`DEVICE_TYPE`].
 const UDID: &str = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
@@ -935,19 +935,36 @@ async fn the_start_sweep_deletes_the_simulators_a_killed_daemon_left() {
     left("lease-7-9", false);
     let cas = Arc::new(MemoryCas::default());
     let _rt = runtime(config.clone(), &cas);
-    assert_eq!(
-        calls(&xcrun),
-        [
-            "list devices -j".to_owned(),
-            format!("shutdown {UDID}"),
-            format!("delete {UDID}"),
-            format!("shutdown {STUCK}"),
-            format!("delete {STUCK}"),
-            format!("shutdown {OTHER}"),
-            format!("delete {OTHER}"),
-        ]
+    // The stuck device cannot be deleted, so every attempt asks again from the list.
+    let attempt = [
+        "list devices -j".to_owned(),
+        format!("shutdown {UDID}"),
+        format!("delete {UDID}"),
+        format!("shutdown {STUCK}"),
+        format!("delete {STUCK}"),
+        format!("shutdown {OTHER}"),
+        format!("delete {OTHER}"),
+    ];
+    let attempts = attempt
+        .iter()
+        .cycle()
+        .take(attempt.len() * SWEEP_ATTEMPTS as usize);
+    assert_eq!(calls(&xcrun), attempts.cloned().collect::<Vec<_>>());
+    assert!(
+        !config.scratch.join("lease-7-7").exists() && !config.scratch.join("lease-7-8").exists(),
+        "every lease directory is removed"
     );
-    assert!(no_leases(&config), "every lease directory is removed");
+    assert!(
+        config.scratch.join(PENDING).is_file(),
+        "and the stuck device is owed"
+    );
+
+    // The next start sweeps on the owed file alone, and finds nothing left.
+    new_log(&xcrun);
+    list(&xcrun, &[("iPhone 16", SHARED)]);
+    let _rt = runtime(config.clone(), &cas);
+    assert_eq!(calls(&xcrun), ["list devices -j".to_owned()]);
+    assert!(no_leases(&config), "a clean sweep owes nothing");
 
     new_log(&xcrun);
     left("lease-7-9", false);
@@ -977,9 +994,112 @@ async fn the_start_sweep_deletes_the_simulators_a_killed_daemon_left() {
     unlisted.xcrun = dir.join("no-xcrun");
     let _rt = runtime(unlisted, &cas);
     assert!(
-        no_leases(&config),
+        !config.scratch.join("lease-9-9").exists(),
         "a list that cannot be read does not stop the start"
     );
+    assert!(
+        config.scratch.join(PENDING).is_file(),
+        "and is owed to the next start"
+    );
+}
+
+/// An `xcrun` script at `dir/bin/xcrun` that logs every call to `calls` beside it and
+/// answers like a CoreSimulatorService that stalls: `simctl list devices -j` sleeps
+/// 30 s (the driver kills it first) for each of the first `stalls` calls and prints
+/// `devices.json` after; `shutdown` exits 149; `delete <udid>` writes `deleted-<udid>`.
+/// A script, not the kbf-testkit fake, because the stall must end after some calls and
+/// the fake's rules have no state to branch on.
+fn stalling_xcrun(dir: &Path, stalls: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("bin");
+    let xcrun = bin.join("xcrun");
+    let script = format!(
+        "#!/bin/sh\n\
+         d=$(dirname \"$0\")\n\
+         echo \"$*\" >> \"$d/calls\"\n\
+         case \"$*\" in\n\
+         'simctl list devices -j')\n\
+         n=$(wc -l < \"$d/calls\")\n\
+         if [ \"$n\" -le {stalls} ]; then exec sleep 30; fi\n\
+         cat \"$d/devices.json\";;\n\
+         'simctl shutdown '*) exit 149;;\n\
+         'simctl delete '*) : > \"$d/deleted-$3\";;\n\
+         esac\n"
+    );
+    std::fs::write(&xcrun, script).expect("script");
+    std::fs::set_permissions(&xcrun, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    list(&xcrun, &[("kbf-lease-5-5", UDID)]);
+    xcrun
+}
+
+/// A configuration whose `simctl` has 400 ms to answer, with [`stalling_xcrun`], and a
+/// lease directory a killed daemon left holding the marker.
+fn stalled_start(dir: &Path, stalls: u32) -> (NativeConfig, PathBuf) {
+    let mut config = config(dir);
+    config.isolation = Isolation::None;
+    config.xcrun = stalling_xcrun(dir, stalls);
+    config.simulator_answer = Duration::from_millis(400);
+    let lease = config.scratch.join("lease-5-5");
+    std::fs::create_dir_all(&lease).expect("lease");
+    std::fs::write(lease.join(MARKER), b"").expect("marker");
+    let xcrun = config.xcrun.clone();
+    (config, xcrun)
+}
+
+fn deleted(xcrun: &Path, udid: &str) -> bool {
+    xcrun.with_file_name(format!("deleted-{udid}")).exists()
+}
+
+/// Catches (issue #717, a native-macos run): the start sweep asked `simctl list
+/// devices -j` once, the stalled CoreSimulatorService did not answer within the cap,
+/// the sweep logged it and moved on, and the booted device a killed daemon left stayed
+/// booted. The fake's first listing stalls and the second answers: the same start
+/// deletes the device. Mutant planted: one attempt (`SWEEP_ATTEMPTS` 1; red: the
+/// device is not deleted).
+#[tokio::test]
+async fn the_start_sweep_asks_again_when_the_listing_does_not_answer() {
+    let dir = scratch("sim-sweep-stall");
+    let (config, xcrun) = stalled_start(&dir, 1);
+    let cas = Arc::new(MemoryCas::default());
+    let _rt = runtime(config.clone(), &cas);
+    assert!(deleted(&xcrun, UDID), "the left device is deleted");
+    assert!(
+        !config.scratch.join(PENDING).exists(),
+        "a sweep that ended clean leaves no request for another"
+    );
+    assert!(no_leases(&config));
+}
+
+/// Catches: a sweep that never gets an answer losing the device for good once its
+/// lease directory (the only record of it) is removed. Every listing of the first
+/// start stalls; the start still ends and removes the lease directory but leaves the
+/// pending file; the next start, with no lease directory left, sweeps on that file
+/// alone, deletes the device and removes the file; a third asks nothing. Mutants
+/// planted: the pending file not written (red: the second start asks nothing); not
+/// removed after a clean sweep (red: the third start asks).
+#[tokio::test]
+async fn a_start_sweep_that_never_gets_an_answer_is_tried_again_at_the_next_start() {
+    let dir = scratch("sim-sweep-pending");
+    let (config, xcrun) = stalled_start(&dir, SWEEP_ATTEMPTS);
+    let cas = Arc::new(MemoryCas::default());
+    let _rt = runtime(config.clone(), &cas);
+    assert!(!deleted(&xcrun, UDID), "no answer, nothing deleted");
+    assert!(config.scratch.join(PENDING).is_file(), "the sweep is owed");
+    assert!(
+        !config.scratch.join("lease-5-5").exists(),
+        "the left lease directory is removed"
+    );
+
+    let _rt = runtime(config.clone(), &cas);
+    assert!(deleted(&xcrun, UDID), "the next start deletes the device");
+    assert!(!config.scratch.join(PENDING).exists(), "and owes nothing");
+    assert!(no_leases(&config), "the sweep's own directory is removed");
+
+    let asked = std::fs::read_to_string(xcrun.with_file_name("calls")).expect("calls");
+    let _rt = runtime(config.clone(), &cas);
+    let after = std::fs::read_to_string(xcrun.with_file_name("calls")).expect("calls");
+    assert_eq!(after, asked, "a third start asks nothing");
 }
 
 /// The tests that make real simulators.

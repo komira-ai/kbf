@@ -148,7 +148,7 @@ impl<C: Cas> NativeRuntime<C> {
             xcrun: config.xcrun.clone(),
             isolation: config.isolation.clone(),
             rules: rules.clone(),
-            within: simulator::ANSWER_WITHIN,
+            within: config.simulator_answer,
             listing: config.simulator_listing,
         });
         // The first lease directory a killed daemon left that may hold a simulator:
@@ -158,9 +158,7 @@ impl<C: Cas> NativeRuntime<C> {
             if simulator::marked(path) && !swept.replace(true) {
                 // One that cannot be named by its real path cannot be removed either.
                 let real = std::fs::canonicalize(path)?;
-                if let Err(why) = simctl.sweep(&real) {
-                    tracing::error!(dir = %path.display(), "simulators left behind: {why}");
-                }
+                simctl.sweep_left(&config.scratch, &real);
             }
             remove(path)
         };
@@ -170,6 +168,10 @@ impl<C: Cas> NativeRuntime<C> {
             config.kill_wait,
             &crate::sweep::SYSTEM,
         )?;
+        // A sweep an earlier start gave up on, when no lease directory asked for one now.
+        if simulator::pending(&config.scratch) && !swept.get() {
+            simctl.sweep_pending(&config.scratch, remove);
+        }
         // After the sweep, which sets aside a `runs` that is not the daemon's directory.
         let mut runs = std::fs::DirBuilder::new();
         std::os::unix::fs::DirBuilderExt::mode(runs.recursive(true), 0o700)
