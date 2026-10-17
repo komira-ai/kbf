@@ -330,7 +330,7 @@ GOAWAY and park parts rewritten.
 
 | # | blocker | evidence |
 |---|---|---|
-| B1 | A running action dies with its daemon process: the keeper holds a pipe only the daemon holds. So the old process lives until its leases end. | `kbf-daemon/src/keeper.rs`, `kbf-driver-container/src/podman_killed.rs` |
+| B1 | A running action dies with its daemon process: the keeper holds a pipe only the daemon holds. So the old process lives until its leases end. | `kbf-daemon/src/keeper.rs` (the container driver runs actions with crun only; Podman is dropped) |
 | B2 | The meta log is single-writer by flock; there is no read-only open, no follower open and no `demote`; it is never compacted, so a start replays all of it. | `kbf-server/src/raft_log/mod.rs` (`RaftLogError::Locked`) |
 | B3 | The cold `file://` store takes an exclusive `LOCK`. | `kbf-objstore/src/fs_store.rs` (`FsStoreError::Locked`) |
 | B4 | The hot tier removes block files no staged object names at open. | `kbf-tier/src/open.rs` |
@@ -644,7 +644,7 @@ Answers, with a real pinned Envoy and stub or real kbf, before any merged PR:
 
 Each test names the defect it catches and the line that turns it red; a mutant is planted and seen red on the farm
 before a PR goes up. Unit tests sit in the library they cover; real Envoy tests use the pinned binary (CI fetches
-it); container tests extend the `podman-x86` job, everything else runs in `test-x86` and `test-arm`.
+it); container tests run in the crun container job (Podman is dropped; kbf runs containers with crun only), everything else runs in `test-x86` and `test-arm`.
 
 | id | test | catches | mutant |
 |---|---|---|---|
