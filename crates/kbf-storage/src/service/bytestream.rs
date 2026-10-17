@@ -71,6 +71,7 @@ impl ByteStream for StorageService {
         request: Request<Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
         let leg_from = generation::leg(&request)?;
+        let unowned = leg_from.is_none() && generation::unowned(&request);
         let endpoint = if leg_from.is_some() {
             Endpoint::WriteLeg
         } else {
@@ -79,7 +80,9 @@ impl ByteStream for StorageService {
         self.admission.check(&request, endpoint)?;
         let requested = generation::requested(&request)?;
         let stream = request.into_inner();
-        let size = self.write_in(requested, leg_from, stream.boxed()).await?;
+        let size = self
+            .write_in(requested, leg_from, unowned, stream.boxed())
+            .await?;
         Ok(wire::committed(size))
     }
 

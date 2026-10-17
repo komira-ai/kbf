@@ -4,7 +4,7 @@
 use kbf_map::MemberId;
 use tonic::{Request, Status};
 
-use super::MAP_GENERATION_HEADER;
+use super::{MAP_GENERATION_HEADER, UNOWNED_HEADER};
 use crate::replicate::LEG_HEADER;
 
 /// The generation `request` was routed by: the decimal in its `kbf-map-generation`
@@ -24,6 +24,12 @@ pub(super) fn requested<T>(request: &Request<T>) -> Result<u64, Status> {
         .ok_or_else(|| {
             Status::invalid_argument(format!("{MAP_GENERATION_HEADER} is not a decimal number"))
         })
+}
+
+/// Whether `request` is a write of a copy the map does not place on the node
+/// ([`UNOWNED_HEADER`]).
+pub(super) fn unowned<T>(request: &Request<T>) -> bool {
+    request.metadata().get(UNOWNED_HEADER).is_some()
 }
 
 /// The member that sent `request` as a copy of a blob it holds (the `kbf-chain-leg`
