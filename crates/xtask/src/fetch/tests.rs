@@ -43,6 +43,23 @@ fn tar() -> Vec<u8> {
     b.into_inner().expect("tar")
 }
 
+/// A zip of the same shape as `tar()`: a directory, a decoy file, `tool-1.0/tool` holding
+/// `TOOL` and a symlink `tool-1.0/link`.
+fn zip() -> Vec<u8> {
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .unix_permissions(0o755);
+    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    w.add_directory("tool-1.0/", options).expect("dir");
+    for (path, data) in [("tool-1.0/README", &b"decoy"[..]), ("tool-1.0/tool", TOOL)] {
+        w.start_file(path, options).expect("file");
+        w.write_all(data).expect("data");
+    }
+    w.add_symlink("tool-1.0/link", "tool", options)
+        .expect("link");
+    w.finish().expect("zip").into_inner()
+}
+
 fn gzip(bytes: &[u8]) -> Vec<u8> {
     let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     e.write_all(bytes).expect("gzip");
@@ -61,6 +78,12 @@ fn zst(bytes: &[u8]) -> Vec<u8> {
 
 fn member(path: &str) -> PathBuf {
     PathBuf::from(path)
+}
+
+fn zip_member_of(path: &str) -> Unpack {
+    Unpack::Zip {
+        member: member(path),
+    }
 }
 
 fn tar_gz(path: &str) -> Unpack {
@@ -172,6 +195,7 @@ fn each_format_yields_the_tool() {
         ("zst-frames", two_frames, Unpack::Zst),
         ("tar-gz", gzip(&tar()), tar_gz("tool-1.0/tool")),
         ("tar-xz", xz(&tar()), xz_tar),
+        ("zip", zip(), zip_member_of("tool-1.0/tool")),
     ] {
         let (result, out) = install_own(name, &bytes, &unpack);
         result.expect(name);
@@ -194,6 +218,7 @@ fn an_archive_that_does_not_decode_is_an_unpack_error_with_nothing_written() {
         ("gz", b"not gzip".to_vec(), tar_gz("x")),
         ("xz", b"not xz".to_vec(), xz_garbage),
         ("tar", gzip(&not_tar), tar_gz("x")),
+        ("zip", b"not a zip".to_vec(), zip_member_of("x")),
     ] {
         // Not `name` alone: each_format_yields_the_tool installs a "zst" at the same
         // time, in the same process, and its file made this test fail at random.
@@ -228,6 +253,44 @@ fn a_missing_member_or_one_that_is_not_a_regular_file_is_refused() {
         Error::NoMember(member("a/b")).to_string(),
         "the archive has no \"a/b\""
     );
+}
+
+#[test]
+fn a_missing_zip_member_or_one_that_is_not_a_regular_file_is_refused() {
+    // Catches: a zip installer that writes an empty file for a member the archive lacks,
+    // for a directory entry, or for a symlink (the unix mode bits say so; `is_file` alone
+    // calls it a file), and one that picks the decoy beside the tool.
+    let archive = zip();
+    let cases = [
+        (
+            "tool-1.0/cargo-deny",
+            Error::NoMember(member("tool-1.0/cargo-deny")),
+        ),
+        ("tool-1.0/link", Error::NotAFile(member("tool-1.0/link"))),
+        ("tool-1.0/", Error::NotAFile(member("tool-1.0/"))),
+    ];
+    for (path, expected) in cases {
+        let (result, out) = install_own(&format!("zip-{path}"), &archive, &zip_member_of(path));
+        assert_eq!(result, Err(expected), "{path}");
+        assert!(!out.exists() && !part_path(&out).exists(), "{path}");
+    }
+}
+
+#[test]
+fn a_zip_entry_that_cannot_be_read_is_an_unpack_error() {
+    // Catches: a lookup failure other than "no such member" reported as NoMember, or
+    // swallowed: the entry's compression method is changed to one this build lacks.
+    let mut archive = zip();
+    // The central directory's entries start at PK\x01\x02; the compression method is the
+    // two bytes at offset 10.
+    let mut at = 0;
+    while let Some(i) = archive[at..].windows(4).position(|w| w == b"PK\x01\x02") {
+        archive[at + i + 10] = 12;
+        at += i + 4;
+    }
+    let (result, out) = install_own("zip-method", &archive, &zip_member_of("tool-1.0/tool"));
+    assert!(matches!(result, Err(Error::Unpack(_))), "{result:?}");
+    assert!(!out.exists() && !part_path(&out).exists());
 }
 
 #[test]
@@ -274,13 +337,17 @@ fn extract_and_member_must_agree() {
             member: member("d/tool")
         })
     );
-    for format in [Format::TarGz, Format::TarXz] {
+    assert_eq!(
+        Unpack::new(Some(Format::Zip), m()),
+        Ok(zip_member_of("d/tool"))
+    );
+    for format in [Format::TarGz, Format::TarXz, Format::Zip] {
         let e = Unpack::new(Some(format), None).expect_err("no member");
         assert!(e.contains("need --member"), "{e}");
     }
     for format in [None, Some(Format::Zst)] {
         let e = Unpack::new(format, m()).expect_err("member out of place");
-        assert!(e.contains("needs --extract tar.gz"), "{e}");
+        assert!(e.contains("needs --extract tar.gz, tar.xz or zip"), "{e}");
     }
 }
 
