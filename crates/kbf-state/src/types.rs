@@ -30,7 +30,8 @@ pub struct Versioned {
     pub value: Vec<u8>,
     /// The version of this value.
     pub version: Version,
-    /// When the store's clock expires the key, if it has a time to live.
+    /// When the store's clock expires the key, if it has a time to live. The key is live
+    /// until the clock reads this and expired from that reading on.
     pub expires_at: Option<StoreTime>,
 }
 

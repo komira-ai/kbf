@@ -64,11 +64,14 @@ pub trait Storage: Send + Sync {
     /// The store could not answer; never a partial answer.
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>>;
 
-    /// A whole blob, checked against its digest, after touching it.
+    /// A whole blob, checked against its digest, after touching it: for a blob the
+    /// caller decodes. A blob of any size is read with [`Storage::read_range`], a window
+    /// at a time.
     ///
     /// # Errors
     /// [`StorageError::NotFound`] only if the blob is not held;
-    /// [`StorageError::Unreachable`] if it is held but cannot be read.
+    /// [`StorageError::Unreachable`] if it is held but cannot be read;
+    /// [`StorageError::Invalid`] for a blob too large to read whole.
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> Answer<'a, Bytes>;
 
     /// The bytes `[offset, offset + limit)` of a blob (to its end when `limit` is 0, the
@@ -77,18 +80,20 @@ pub trait Storage: Send + Sync {
     /// that lost its connection reads on from the bytes it has: `offset` is where it
     /// stopped.
     ///
-    /// **What is verified.** A byte is never in a chunk unless the blob it is from has
-    /// been checked, as a whole, against its digest: a ranged read is verified as
-    /// [`Storage::read_blob`] is, whatever the range, and a blob that fails is
-    /// [`StorageError::Unreachable`], not a short or wrong chunk. So a partial range is
-    /// not "trusted from an index"; an implementation that cannot check a blob before it
-    /// sends its first byte must not offer a read of it. (A resumed read checks the blob
-    /// again.) How much an implementation holds while it verifies is its own to
-    /// document: it is a whole blob unless it can check one in pieces before sending.
+    /// **What is verified.** The blob is checked, as a whole, against its digest, whatever
+    /// the range: a stream that ends cleanly delivered bytes of a blob that hashed to its
+    /// digest, and one that fails (a blob that does not hash to it
+    /// is [`StorageError::Unreachable`]) ends in an error item, never in a short or wrong
+    /// end. A caller discards what it received from a stream that ended in an error. An
+    /// implementation reads and hashes the blob in windows and holds one window at a
+    /// time, whatever the blob's size, handing over the last bytes only once the whole
+    /// blob has checked.
     ///
-    /// The errors are in the answer, before the first chunk, where the code is still
-    /// open to the caller. An `offset` past the end is decided from the digest's size
-    /// alone, before the store is asked.
+    /// The errors that are known by the first chunk (the first window is read before the
+    /// answer, so a blob that is gone, or a one-window blob that is damaged, is among them)
+    /// are in the answer, before it, where the code is still open to the caller. An
+    /// `offset` past the end is decided from the digest's size alone, before the store is
+    /// asked.
     ///
     /// # Errors
     /// [`StorageError::OutOfRange`] if `offset` is past the end of the blob;
@@ -116,6 +121,34 @@ pub trait Storage: Send + Sync {
     /// cannot take one (no write tier, no room on it, or `size` is 0): the caller uses
     /// [`Storage::put`]. Blocking: call it off the async runtime.
     fn stream(&self, size: u64) -> Option<Box<dyn PutStream>>;
+
+    /// Stores a blob of `size` bytes straight to the object store as `bytes` come (a
+    /// multipart upload on S3), holding a piece of it at a time whatever its size: how a
+    /// large blob is stored when [`Storage::stream`] has no tier room for it. `claim`
+    /// names the blob's digest once its bytes ended (they must hash to it, or nothing is
+    /// stored), or `None` to withdraw it: the upload is aborted and this answers `None`.
+    /// Answers the digest once the blob is present.
+    ///
+    /// The default refuses: a storage that cannot take a streamed put (a remote one, which
+    /// writes a blob through [`Storage::put`]) says so rather than gathering the blob.
+    ///
+    /// # Errors
+    /// [`StorageError::DigestMismatch`] if the bytes do not hash to the claimed digest;
+    /// [`StorageError::Invalid`] if the storage takes no streamed put; a piece of `bytes`
+    /// failed; the store failed.
+    fn put_streamed(
+        &self,
+        size: u64,
+        bytes: BoxStream<'static, std::io::Result<Bytes>>,
+        claim: BoxFuture<'static, Option<Digest>>,
+    ) -> Answer<'_, Option<Digest>> {
+        let _ = (size, bytes, claim);
+        Box::pin(async {
+            Err(StorageError::Invalid(
+                "this storage takes no streamed put".to_owned(),
+            ))
+        })
+    }
 
     /// A `Segments` service of its own over the store, with uploads no other caller
     /// can name: the handlers a remote daemon's `Begin`, `PutRange` and `Commit` reach.

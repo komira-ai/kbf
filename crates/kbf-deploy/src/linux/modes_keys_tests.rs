@@ -44,6 +44,7 @@ const ALL_SET: &[(&str, &str)] = &[
     ("KBF_STORAGE_URL", "https://192.0.2.30:9443"),
     ("KBF_REAPI_CERT", "/etc/kbf/front.example.ts.net.crt"),
     ("KBF_REAPI_KEY", "/etc/kbf/front.example.ts.net.key"),
+    ("KBF_API_TOKEN_FILE", "/run/secrets/kbf-api-token"),
     ("KBF_STATE_DIR", "/srv/kbf/state"),
     ("KBF_RESERVE_CPUS", "4"),
     ("KBF_LEASE_PLACEMENT", "numa-node"),
@@ -73,6 +74,7 @@ fn each_mode_renders_its_full_flag_set() {
             "--worker-tls-key=/etc/kbf/worker.key",
             "--worker-client-ca=/etc/kbf/ca.pem",
             "--api-listen=127.0.0.1:8982",
+            "--api-token-file=/run/secrets/kbf-api-token",
             "--storage=https://192.0.2.30:9443",
             "--storage-client-cert=/etc/kbf/worker.pem",
             "--storage-client-key=/etc/kbf/worker.key",
@@ -138,6 +140,7 @@ fn each_mode_renders_its_full_flag_set() {
     for want in [
         "--reapi-tls-cert=/etc/kbf/front.example.ts.net.crt",
         "--reapi-tls-key=/etc/kbf/front.example.ts.net.key",
+        "--api-token-file=/run/secrets/kbf-api-token",
         "--reserve-cpus=4",
         "--lease-placement=numa-node",
         // The all-in-one is the frontend: its daemon half dials itself by its own name.
@@ -157,7 +160,7 @@ fn each_mode_renders_its_full_flag_set() {
 #[test]
 fn each_new_key_reaches_exactly_the_units_that_read_it() {
     use Mode::{AllInOne, Daemon, Frontend, Storage, StorageAndDaemon};
-    let rows: [(&str, &str, &[Mode]); 8] = [
+    let rows: [(&str, &str, &[Mode]); 9] = [
         (
             "KBF_FRONTEND_NAME",
             "other.example.internal",
@@ -171,6 +174,11 @@ fn each_new_key_reaches_exactly_the_units_that_read_it() {
             &[Frontend, AllInOne],
         ),
         ("KBF_REAPI_KEY", "/etc/kbf/other.key", &[Frontend, AllInOne]),
+        (
+            "KBF_API_TOKEN_FILE",
+            "/etc/kbf/other-token",
+            &[Frontend, AllInOne],
+        ),
         ("KBF_STATE_DIR", "/srv/other", &[Frontend]),
         (
             "KBF_RESERVE_CPUS",
@@ -313,6 +321,20 @@ fn the_new_keys_refuse_values_a_unit_cannot_carry() {
     // The REAPI pair follows KBF_ETC when it is not named.
     let moved = config_with(&[("KBF_ETC", "/srv/etc")]);
     assert_eq!(moved.reapi_cert.as_str(), "/srv/etc/reapi.pem");
+    // So does the operator token: the path, not the token, is what a unit carries.
+    assert_eq!(c.api_token_file.as_str(), "/etc/kbf/api-token");
+    assert_eq!(moved.api_token_file.as_str(), "/srv/etc/api-token");
+    for mode in [Mode::Frontend, Mode::AllInOne] {
+        assert!(
+            flags(&moved, mode).contains(&"--api-token-file=/srv/etc/api-token".to_owned()),
+            "{mode}"
+        );
+    }
+    let relative = refuses("KBF_API_TOKEN_FILE", "api-token");
+    assert!(
+        relative.to_string().contains("KBF_API_TOKEN_FILE"),
+        "{relative}"
+    );
 
     // The frontend needs its storage; the others do not.
     let none = LinuxConfig::parse(&text_with(&[("KBF_STORAGE_URL", "")])).expect("valid");

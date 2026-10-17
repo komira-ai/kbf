@@ -19,12 +19,16 @@
 //! - **Epoch.** Every open bumps the epoch recorded in the file ([`SqliteStore::epoch`]);
 //!   [`restore`] does too, so a restored or swapped file never resumes the old file's
 //!   leases.
+//! - **Backup and restore.** [`backup`] copies the file while a store writes it, into a
+//!   single file that [`check_backup`] checks; [`restore`] (or [`restore_locked`], under
+//!   a [`StoreLock`] the caller took) puts one back while no store has the file open.
 //! - **Clock.** Expiry times are stored as nanoseconds on the store's clock, so the clock
 //!   must mean the same thing after a restart: use [`crate::SystemClock`] in production.
 //!
 //! Commit latency, from the call queuing a write to its group being on disk, is kept in
 //! [`CommitMetrics`] for the operator's metrics to export.
 
+mod backup;
 mod error;
 mod guard;
 mod read;
@@ -42,8 +46,10 @@ use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 
+pub use backup::{Summary, backup, check_backup};
 pub use error::SqliteError;
-pub use restore::restore;
+pub use guard::StoreLock;
+pub use restore::{restore, restore_locked};
 pub use schema::SCHEMA_VERSION;
 
 use crate::GROUP_COMMIT_WINDOW;
@@ -144,7 +150,8 @@ impl SqliteStore {
         probe: &dyn Fn(&Path) -> io::Result<u32>,
     ) -> Result<SqliteStore, SqliteError> {
         guard::refuse_network_filesystem(path, probe)?;
-        let lock = guard::take_lock(path)?;
+        guard::refuse_hard_link(path)?;
+        let (lock, _) = guard::take_lock(path)?;
         let conn = Connection::open(path)?;
         schema::init(&conn)?;
         schema::configure(&conn)?;
