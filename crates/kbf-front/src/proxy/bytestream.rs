@@ -192,8 +192,7 @@ impl RawByteStream {
             let unreached = match &answer {
                 Ok(response) => Status::from_header_map(response.headers())
                     .filter(|status| status.code() == Code::Unavailable),
-                Err(status) if status.code() == Code::Unavailable => Some(status.clone()),
-                Err(_) => None,
+                Err(status) => (status.code() == Code::Unavailable).then(|| status.clone()),
             };
             if let Some(unreached) = unreached {
                 // The node could not take the upload (a refused connection, a reset, an
