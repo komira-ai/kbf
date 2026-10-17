@@ -37,7 +37,7 @@ struct Silent {
 }
 
 impl MapSource for Silent {
-    fn current(&self) -> Arc<Map> {
+    fn current(&self) -> Option<Arc<Map>> {
         self.inner.current()
     }
 

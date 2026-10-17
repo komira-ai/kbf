@@ -8,7 +8,8 @@ use kbf_log::{Bootstrap, FarmLogId};
 use kbf_sched::RequeueReason;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{
-    Changes, Commit, CommitStats, Conflict, ManualClock, Revision, StoreTime, Versioned,
+    Changes, Commit, CommitStats, Conflict, ManualClock, Revision, ScanPage, ScanRange, StoreTime,
+    Versioned,
 };
 use kbf_types::{
     ActionKey, Answer, Digest, DigestFunction, Failure, FencePolicy, LeaseKind, Outcome, Qos,
@@ -51,6 +52,10 @@ impl Store for Flaky {
 
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
         self.inner.scan_prefix(prefix)
+    }
+
+    fn scan_range(&self, scan: ScanRange<'_>) -> Result<ScanPage, StoreError> {
+        self.inner.scan_range(scan)
     }
 
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {

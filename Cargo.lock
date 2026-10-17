@@ -1478,6 +1478,7 @@ dependencies = [
  "kbf-objstore",
  "kbf-proto",
  "kbf-route",
+ "kbf-segments",
  "kbf-server",
  "kbf-storage",
  "kbf-testkit",
