@@ -80,14 +80,17 @@ message Refusal {
     KIND_UNSPECIFIED = 0;
     // Only a daemon writes the action cache.
     NOT_DAEMON = 1;
-    // `blob` is needed and not held.
+    // `blob` and `more` are needed and not held.
     ABSENT = 2;
-    // `blob` is needed and held at an object that cannot be read.
+    // `blob` and `more` are needed and held at objects that cannot be read; none
+    // needed is absent.
     UNREACHABLE = 3;
   }
   Kind kind = 1;
-  // Set for ABSENT and UNREACHABLE.
+  // Set for ABSENT and UNREACHABLE: the first blob lacking.
   build.bazel.remote.execution.v2.Digest blob = 2;
+  // For ABSENT and UNREACHABLE, the blobs lacking after `blob`, in order.
+  repeated build.bazel.remote.execution.v2.Digest more = 3;
 }
 
 // Who the writer speaks for. A frontend relays both a client's update and a daemon's

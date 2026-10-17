@@ -33,7 +33,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures::future::BoxFuture;
-use kbf_front::{Cache, MetaLog};
+use kbf_front::{Cache, MetaLog, Routed};
 use kbf_objstore::{ByteRange, ObjectStore, ObjectStoreError};
 use kbf_storage::Storage;
 use kbf_types::{Digest, DigestFunction};
@@ -231,8 +231,15 @@ fn probe_digest() -> Digest {
 /// through the transport, the node's certificate check, its check of the role in the
 /// frontend's certificate (reading the action cache is the one call only a frontend may
 /// make) and its index.
+///
+/// Once the frontend routes by the storage map ([`StorageProbe::routed`] and
+/// [`Routed::active`]) the question goes to the owners the map names for
+/// [`probe_digest`], in order, and the check passes when one of them answers: the
+/// `--storage` node may have left the farm, and a farm whose other members are up is
+/// ready. Before that it is the `--storage` node alone.
 pub struct StorageProbe {
     storage: Arc<dyn Storage>,
+    routed: Option<Arc<Routed>>,
     timeout: Duration,
 }
 
@@ -240,17 +247,39 @@ impl StorageProbe {
     /// A probe of `storage`, waiting at most `timeout` for its answer.
     #[must_use]
     pub fn new(storage: Arc<dyn Storage>, timeout: Duration) -> Self {
-        Self { storage, timeout }
+        Self {
+            storage,
+            routed: None,
+            timeout,
+        }
+    }
+
+    /// The same probe, asking the owners `routed` names instead of `storage` while it is
+    /// routing by the map.
+    #[must_use]
+    pub fn routed(mut self, routed: Arc<Routed>) -> Self {
+        self.routed = Some(routed);
+        self
+    }
+
+    /// The action-cache lookup, at the owners or at the one node.
+    async fn ask(&self) -> Result<(), kbf_storage::StorageError> {
+        let digest = probe_digest();
+        if let Some(routed) = &self.routed {
+            routed.tag_bootstrap();
+        }
+        match self.routed.as_ref().filter(|routed| routed.active()) {
+            Some(routed) => routed.router().action_result(&digest).await.map(drop),
+            None => self.storage.action_result(&digest).await.map(drop),
+        }
     }
 }
 
 impl Probe for StorageProbe {
     fn probe(&self) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
-            let digest = probe_digest();
-            let ask = self.storage.action_result(&digest);
-            match tokio::time::timeout(self.timeout, ask).await {
-                Ok(Ok(_)) => Ok(()),
+            match tokio::time::timeout(self.timeout, self.ask()).await {
+                Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(format!("the storage node did not answer: {e}")),
                 Err(_) => Err(format!(
                     "the storage node had no answer within {} ms",

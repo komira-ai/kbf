@@ -16,7 +16,9 @@ use tonic::{Code, Request, Status};
 
 use super::fake::{Held, Mem, connect, patterned, serve_routes, sha};
 use crate::replicate::MapSource;
-use crate::service::{Admission, CatchUp, Config, InProcess, RemoteStorage, StorageService};
+use crate::service::{
+    Admission, CatchUp, Config, InProcess, RemoteStorage, STREAM_FROM_BYTES, StorageService,
+};
 use crate::{Storage, StorageError};
 
 /// A node over `mem` that judges every call by `held`, called in-process. Certified
@@ -97,6 +99,36 @@ async fn a_write_is_judged_by_the_generation_the_caller_names_and_stored_once() 
     assert_eq!(stored.as_ref(), large.as_slice());
 }
 
+/// Catches an in-process unowned write that skips the generation check or stores nothing:
+/// it is judged by the caller's generation like any write (STALE_MAP behind the node), and
+/// at the node's generation the blob is stored. A store that does not distinguish the two
+/// (the default of `Storage::put_unowned`) takes it as a plain write.
+#[tokio::test]
+async fn an_unowned_write_is_judged_by_the_generation_and_stored() {
+    let mem = Arc::new(Mem::default());
+    let node = node(&mem, &Held::at(7));
+    let stale = node
+        .at(3)
+        .put_unowned(Bytes::from_static(b"copy"))
+        .await
+        .expect_err("behind the node");
+    assert!(
+        matches!(stale, StorageError::StaleMap { current: 7 }),
+        "{stale:?}"
+    );
+    let digest = node
+        .at(7)
+        .put_unowned(Bytes::from_static(b"copy"))
+        .await
+        .expect("stored");
+    assert!(mem.blobs.lock().expect("lock").contains_key(&digest));
+    let plain = mem
+        .put_unowned(Bytes::from_static(b"plain"))
+        .await
+        .expect("the default is a plain put");
+    assert!(mem.blobs.lock().expect("lock").contains_key(&plain));
+}
+
 /// Catches a store failure taken for a stale map or swallowed: the store's failure is the
 /// write's, and reaches the caller as the store's error.
 #[tokio::test]
@@ -148,7 +180,10 @@ async fn a_write_stream_that_ends_early_is_invalid_and_stores_nothing() {
     ];
     for (what, requests, text) in cases {
         let stream = futures::stream::iter(requests.into_iter().map(Ok)).boxed();
-        let status = service.write_in(0, None, stream).await.expect_err(what);
+        let status = service
+            .write_in(0, None, false, stream)
+            .await
+            .expect_err(what);
         assert_eq!(status.code(), Code::InvalidArgument, "{what}: {status}");
         assert_eq!(status.message(), text, "{what}");
     }
@@ -187,7 +222,10 @@ async fn a_write_stream_that_fails_answers_with_its_own_status() {
     ];
     for (what, items) in cases {
         let stream = futures::stream::iter(items).boxed();
-        let status = service.write_in(0, None, stream).await.expect_err(what);
+        let status = service
+            .write_in(0, None, false, stream)
+            .await
+            .expect_err(what);
         assert_eq!(status.code(), Code::Aborted, "{what}: {status}");
         assert_eq!(status.message(), "reset", "{what}");
     }
@@ -401,7 +439,7 @@ async fn a_miss_on_a_catching_up_node_is_unavailable_as_over_the_wire() {
     }
     assert_eq!(near, far, "the same words in-process and over the wire");
 
-    *mem.fail.lock().expect("lock") = Some(ActionWriteError::Absent(closure).into());
+    *mem.fail.lock().expect("lock") = Some(ActionWriteError::Absent(vec![closure]).into());
     let committed = local
         .commit_action_record(Role::Daemon, action, record.clone())
         .await;
@@ -447,12 +485,64 @@ async fn a_miss_on_a_catching_up_node_is_unavailable_as_over_the_wire() {
         ),
         "{prepared:?}"
     );
-    *mem.fail.lock().expect("lock") = Some(ActionWriteError::Absent(closure).into());
+    *mem.fail.lock().expect("lock") = Some(ActionWriteError::Absent(vec![closure]).into());
     let committed = local
         .commit_action_record(Role::Daemon, action, record)
         .await;
     assert!(
-        matches!(committed, Err(StorageError::ActionWrite(ActionWriteError::Absent(b))) if b == closure),
+        matches!(&committed, Err(StorageError::ActionWrite(ActionWriteError::Absent(b))) if *b == [closure]),
         "{committed:?}"
     );
+}
+
+/// Catches an in-process write of a blob past `STREAM_FROM_BYTES`, on a store that cannot
+/// write as bytes arrive, that is gathered whole (the store's `put` called instead of
+/// `put_streamed`, or the blob held in one buffer) or stored wrong: it reaches
+/// `put_streamed` once, in pieces of at most one write message (1 MiB), and is stored
+/// byte for byte.
+#[tokio::test]
+async fn an_in_process_write_past_the_stream_size_is_streamed_in_pieces() {
+    let mem = Arc::new(Mem::default());
+    let node = node(&mem, &Held::at(7));
+    let large = patterned(STREAM_FROM_BYTES as usize + 1);
+    let digest = node
+        .at(7)
+        .put(Bytes::from(large.clone()))
+        .await
+        .expect("written");
+    assert_eq!(digest, sha(&large));
+    assert_eq!(mem.streamed.load(Ordering::SeqCst), 1);
+    assert_eq!(mem.puts.load(Ordering::SeqCst), 0);
+    assert!(mem.streamed_most_held.load(Ordering::SeqCst) <= 1 << 20);
+    assert_eq!(
+        mem.blobs.lock().expect("lock")[&digest].as_ref(),
+        &large[..]
+    );
+    let edge = patterned(STREAM_FROM_BYTES as usize);
+    node.at(7).put(Bytes::from(edge)).await.expect("written");
+    assert_eq!(
+        mem.puts.load(Ordering::SeqCst),
+        1,
+        "a blob of exactly STREAM_FROM_BYTES is put whole"
+    );
+    assert_eq!(mem.streamed.load(Ordering::SeqCst), 1);
+}
+
+/// Catches the messages of a write made all at once (a second whole copy of the blob held
+/// before the first message is sent): with one message taken, the rest are still to be
+/// made from the caller's bytes, which the messages therefore still share.
+#[test]
+fn write_messages_are_made_as_they_are_taken() {
+    let bytes = Bytes::from(patterned(3 << 20));
+    let held = bytes.clone();
+    let mut messages =
+        super::super::client::write_messages("uploads/u/blobs/x/3".to_owned(), bytes);
+    let first = messages.next().expect("a first message");
+    assert_eq!(first.data.len(), 1 << 20);
+    assert!(
+        !held.is_unique(),
+        "the rest of the messages were made before they were taken"
+    );
+    assert_eq!(messages.count(), 2);
+    assert!(held.is_unique());
 }

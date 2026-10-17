@@ -115,11 +115,25 @@ pub trait Storage: Send + Sync {
     /// store failed.
     fn put(&self, bytes: Bytes) -> Answer<'_, Digest>;
 
+    /// [`Storage::put`] of a copy the caller needs on this node although the map does not
+    /// place the blob here: the blobs of an action-cache entry, which the node checks
+    /// against what it holds itself. A node that serves a chain stores the blob as one
+    /// copy (nothing is forwarded, nobody owes a replica) where [`Storage::put`] would be
+    /// refused as not the primary; a node that is the blob's primary treats it as
+    /// [`Storage::put`]. The default is [`Storage::put`].
+    ///
+    /// # Errors
+    /// As [`Storage::put`].
+    fn put_unowned(&self, bytes: Bytes) -> Answer<'_, Digest> {
+        self.put(bytes)
+    }
+
     /// A stream for one blob of `size` bytes, written as its bytes arrive and never
     /// held whole in memory: [`PutStream::append`] each chunk, [`PutStream::finish`]
-    /// with the digest and CRC-32C, then [`StreamedPut::commit`]. `None` when the store
-    /// cannot take one (no write tier, no room on it, or `size` is 0): the caller uses
-    /// [`Storage::put`]. Blocking: call it off the async runtime.
+    /// with the digest and CRC-32C, then [`StreamedPut::commit`]. `None` only when the
+    /// store cannot stream at all (`size` is 0, or it has nowhere to stream to): the
+    /// caller uses [`Storage::put`]. A store with a write tier but no room on it still
+    /// streams, to its object store. Blocking: call it off the async runtime.
     fn stream(&self, size: u64) -> Option<Box<dyn PutStream>>;
 
     /// Stores a blob of `size` bytes straight to the object store as `bytes` come (a
@@ -169,7 +183,7 @@ pub trait Storage: Send + Sync {
     /// it checked held, and `result` stored as a blob. The action cache is not touched.
     ///
     /// # Errors
-    /// [`StorageError::ActionWrite`] naming the first blob of the closure not held; a
+    /// [`StorageError::ActionWrite`] naming every blob of the closure not held; a
     /// malformed result; the store failed.
     fn prepare_action_result<'a>(&'a self, result: &'a ActionResult) -> Answer<'a, ActionRecord>;
 
@@ -198,8 +212,9 @@ pub trait PutStream: Send {
     /// Ends the stream as the blob `digest`, whose bytes have CRC-32C `crc32c`.
     ///
     /// # Errors
-    /// The bytes written are not as many as `digest` names, or their CRC-32C is not
-    /// `crc32c`: nothing is stored.
+    /// The bytes written are not as many as `digest` names, their CRC-32C is not
+    /// `crc32c`, or they do not hash to `digest` ([`StorageError::DigestMismatch`]):
+    /// nothing is stored.
     fn finish(
         self: Box<Self>,
         digest: Digest,

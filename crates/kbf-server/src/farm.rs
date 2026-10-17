@@ -34,6 +34,7 @@
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::BuildHasher;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -46,22 +47,25 @@ use kbf_proto::worker::{
 };
 use kbf_sched::fence::START_VALIDITY;
 use kbf_sched::{
-    Cordon, DaemonInstance, Event, FARM_RERUNS, Input, LOSS_REQUEUES, MemoryLadder, OpState,
+    Cordon, DaemonInstance, Event, FARM_RERUNS, Fate, Input, LOSS_REQUEUES, MemoryLadder, OpState,
     Requeue, Scheduler,
 };
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, Failure, FarmRun, FarmTime, LeaseGrant, LeaseId,
-    OperationId, Outcome, Refusal, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
+    MemoryRun, OperationId, Outcome, Refusal, StartLease, StateMachine, WaiterId, Waiting,
+    WorkerId,
 };
 use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
 
 mod beat;
 mod durable;
+mod handover;
 mod phase;
 mod record;
 
-pub use durable::{EpochPolicy, SESSION_RENEWAL, StateError};
+pub use durable::{DONE_FLOOR, EpochPolicy, SESSION_RENEWAL, StateError};
+pub use handover::LOST_LOOKS;
 pub use phase::Reported;
 
 use self::durable::Durable;
@@ -119,6 +123,8 @@ pub struct Farm {
     epoch_unix_ms: u64,
     /// The action shapes this process has described ([`action_usage`]).
     shapes: Shapes,
+    /// `Result`s being taken now ([`Farm::report`]): a handover waits for none to be.
+    reports: AtomicUsize,
     state: Mutex<State>,
 }
 
@@ -192,6 +198,9 @@ struct State {
     /// The callers' records, the finished operations whose callers are kept, the
     /// leases whose `Start` was sent, and the node registry.
     machine: FarmMachine,
+    /// How long the scheduler keeps a finished operation; the state store keeps its
+    /// `done/` row at least as long.
+    finished_retention: Duration,
     /// The channel of each caller the machine keeps, forgotten with its record.
     stages: BTreeMap<WaiterId, watch::Sender<Stage>>,
     next_stream: u64,
@@ -211,11 +220,17 @@ struct State {
     /// Until it has, it still holds the lease and no queue row for the operation, so
     /// every one is written again before anything that follows it is
     /// ([`State::log_requeues`]).
-    unsettled: Vec<(Requeue, Option<u32>)>,
+    unsettled: Vec<(Requeue, Option<u32>, Option<Fate>)>,
     /// The scheduler was told the state store is unavailable ([`State::watch_store`]).
     store_down: bool,
     /// When each node's session row in the state store was last written.
     renewed: BTreeMap<WorkerId, FarmTime>,
+    /// A handover took the work from this farm ([`Farm::fence`]): it feeds the scheduler
+    /// nothing and queues nothing.
+    fenced: bool,
+    /// For each operation a successor is followed on ([`Farm::follow`]), how many looks
+    /// in a row found it neither unfinished nor ended.
+    looks: BTreeMap<OperationId, u8>,
 }
 
 /// What a finished operation tells its callers, and the action-cache entry to write
@@ -260,9 +275,11 @@ impl Farm {
             epoch: tokio::time::Instant::now(),
             epoch_unix_ms: unix_ms(),
             shapes: Shapes::default(),
+            reports: AtomicUsize::new(0),
             state: Mutex::new(State {
                 sched,
                 machine: FarmMachine::new(term),
+                finished_retention,
                 stages: BTreeMap::new(),
                 next_stream: 0,
                 links: BTreeMap::new(),
@@ -273,6 +290,8 @@ impl Farm {
                 unsettled: Vec::new(),
                 store_down: false,
                 renewed: BTreeMap::new(),
+                fenced: false,
+                looks: BTreeMap::new(),
             }),
         }
     }
@@ -328,6 +347,14 @@ impl Farm {
     #[must_use]
     pub fn queued_operations(&self) -> u64 {
         self.lock().sched.queued_len() as u64
+    }
+
+    /// The memory runs of every operation this farm holds that was killed for memory,
+    /// oldest first ([`kbf_sched::MemoryState::runs_by_operation`]): what a successor
+    /// farm over the same state store must hold too.
+    #[must_use]
+    pub fn memory_runs(&self) -> BTreeMap<OperationId, Vec<MemoryRun>> {
+        self.lock().sched.memory_state().runs_by_operation()
     }
 
     /// Execute and WaitExecution operation streams open now
@@ -510,6 +537,8 @@ impl Farm {
         };
         tracing::info!(%worker, ?action, "operator action");
         state.feed_quiet(now, event);
+        let at = self.epoch_unix_ms.saturating_add(now.as_millis());
+        state.durably("a cordon", |d| d.cordoned(worker, action.stored(at)));
         Ok(self.node(&state, worker))
     }
 
@@ -587,6 +616,7 @@ impl Farm {
     /// the acknowledgement, or `None` for a `Result` without a lease id.
     pub async fn report(&self, worker: &WorkerId, result: worker::Result) -> Option<ResultAck> {
         let wire_lease = result.lease_id?;
+        let _taking = self.in_flight();
         let lease = LeaseId::new(wire_lease.term, wire_lease.seq);
         let refused = ResultAck {
             lease_id: Some(wire_lease),
@@ -946,10 +976,10 @@ impl State {
         );
     }
 
-    /// Feeds `event`, then a tick (so placement follows at once), and carries out the
-    /// effects in order. Returns the answers, for the caller to deliver once the lock
-    /// is released.
-    fn feed(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
+    /// [`State::feed`] on a farm that is not fenced: feeds `event`, then a tick (so
+    /// placement follows at once), and carries out the effects in order. Returns the
+    /// answers, for the caller to deliver once the lock is released.
+    fn carry_out(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
         self.watch_store(now);
         let mut effects: VecDeque<Effect> = self.sched.apply(Input::new(now, event)).into();
         effects.extend(self.sched.apply(Input::new(now, Event::Tick)));
@@ -1035,7 +1065,18 @@ impl State {
 
     /// Keeps the callers of `operation`, which has just finished, until the scheduler
     /// drops it.
-    fn keep_finished(&mut self, operation: OperationId, waiters: Vec<WaiterId>) {
+    fn keep_finished(
+        &mut self,
+        operation: OperationId,
+        waiters: Vec<WaiterId>,
+        finished: &Finished,
+    ) {
+        // After the finish is durable and before any caller is answered from this
+        // process's memory alone: a process that kept streams open across a handover
+        // reads the result here. A store that does not take it is logged and the callers
+        // here are answered all the same.
+        let retention = self.finished_retention;
+        self.durably("a result", |d| d.done(operation, finished, retention));
         self.machine.keep_finished(operation, waiters);
         self.forget_dropped();
     }
@@ -1198,7 +1239,7 @@ impl State {
         for stage in refusal.waiters.iter().filter_map(|id| self.stages.get(id)) {
             stage.send_replace(Stage::Done(finished.clone()));
         }
-        self.keep_finished(refusal.operation, refusal.waiters.clone());
+        self.keep_finished(refusal.operation, refusal.waiters.clone(), &finished);
     }
 
     /// Works out what the callers of a finished operation get, and keeps them for the
@@ -1247,7 +1288,7 @@ impl State {
             (_, outcome) => (unrun(outcome, &answer.farm_runs), None),
         };
         self.record_finished(answer, &finished, stored, reason);
-        self.keep_finished(answer.operation, answer.waiters.clone());
+        self.keep_finished(answer.operation, answer.waiters.clone(), &finished);
         Settled {
             finished,
             write,

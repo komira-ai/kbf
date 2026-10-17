@@ -55,8 +55,14 @@ fn each_error_answers_its_code_and_message() {
             Code::FailedPrecondition,
         ),
         (ActionWriteError::NotDaemon.into(), Code::PermissionDenied),
-        (ActionWriteError::Absent(a).into(), Code::FailedPrecondition),
-        (ActionWriteError::Unreachable(a).into(), Code::Unavailable),
+        (
+            ActionWriteError::Absent(vec![a]).into(),
+            Code::FailedPrecondition,
+        ),
+        (
+            ActionWriteError::Unreachable(vec![a]).into(),
+            Code::Unavailable,
+        ),
         (
             StorageError::Unavailable(Arc::new(Backend)),
             Code::Unavailable,
@@ -95,7 +101,9 @@ fn a_stale_map_status_carries_the_nodes_generation() {
         .expect("the generation entry");
     assert_eq!(header.to_str().expect("ASCII"), "7");
     assert!(status.message().starts_with("STALE_MAP"), "{status:?}");
-    let refused = tonic::Status::from(StorageError::from(ActionWriteError::Absent(digest(1))));
+    let refused = tonic::Status::from(StorageError::from(ActionWriteError::Absent(vec![digest(
+        1,
+    )])));
     assert!(
         refused
             .metadata()

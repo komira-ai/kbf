@@ -158,6 +158,7 @@ fn every_family_is_printed_once_with_its_type() {
     metrics.execute_dir_reads.add(17);
     metrics.sched_queued.set(18);
     metrics.sched_leases.set(19);
+    metrics.frontend_relay_lost.add(20);
     let _presubmit = metrics.execute_presubmit_in_flight.raise();
     let (_tier, _tier2) = (
         metrics.tier_in_flight.raise(),
@@ -210,6 +211,7 @@ fn every_family_is_printed_once_with_its_type() {
             "kbf_input_directories_joined_total counter",
             "kbf_sched_queued gauge",
             "kbf_sched_leases gauge",
+            "kbf_frontend_relay_lost_total counter",
             "kbf_tier_in_flight gauge",
             "kbf_meta_commit_seconds histogram",
             "kbf_execute_requests_total counter",
@@ -237,6 +239,7 @@ fn every_family_is_printed_once_with_its_type() {
         ("kbf_execute_dir_reads_total", 17),
         ("kbf_sched_queued", 18),
         ("kbf_sched_leases", 19),
+        ("kbf_frontend_relay_lost_total", 20),
         ("kbf_execute_presubmit_in_flight", 1),
         ("kbf_tier_in_flight", 2),
     ] {

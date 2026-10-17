@@ -14,7 +14,7 @@ use clap::{Parser, ValueEnum};
 use kbf_front::WriteConfig;
 use kbf_objstore::Capabilities;
 use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store};
-use tonic::transport::{Certificate, Identity, ServerTlsConfig};
+use kbf_tls::{TlsError, TlsFiles, TlsSource};
 
 use kbf_auth::{AllowAuthorizer, Authorizer, Policy, PolicyError};
 use kbf_front::SegmentsConfig;
@@ -25,6 +25,9 @@ use crate::identity::{DenyList, DenyListError};
 use crate::serve::{Api, Listeners, StreamTiming, WorkerTls};
 use crate::stores::{S3Uri, StoreFlags, StoreUri, Stores, StoresError};
 use crate::token::{ApiToken, TokenFileError};
+
+/// The default of `--tls-reload-interval-secs`.
+const DEFAULT_TLS_RELOAD_SECS: u64 = 30;
 
 /// The longest heartbeat interval `--heartbeat-interval-ms` accepts: half of
 /// [`kbf_sched::fence::START_VALIDITY`].
@@ -232,6 +235,20 @@ pub struct Args {
     /// mutual TLS.
     #[arg(long, requires_all = ["worker_tls_cert", "worker_tls_key", "worker_client_ca"])]
     pub worker_deny_list: Option<PathBuf>,
+    /// How often, in seconds, a TLS listener looks at its certificate, key and client CA
+    /// files (the `--*-tls-cert`, `--*-tls-key` and `--*-client-ca` flags). A change is
+    /// applied to the next TLS handshake, with no restart and without ending a connection
+    /// already open: renew a certificate by replacing the files. Files that do not make a working configuration (unreadable,
+    /// not PEM, a key that is not the certificate's, an expired certificate, a renewal
+    /// caught between its two writes) are logged and counted in
+    /// `kbf_tls_reloads_total{outcome="rejected"}`, and the previous files keep serving;
+    /// the next look finds them whole and applies them. The files must be good at start.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_TLS_RELOAD_SECS,
+        value_parser = clap::value_parser!(u64).range(1..=3600)
+    )]
+    pub tls_reload_interval_secs: u64,
     /// The heartbeat interval daemons are asked for, in milliseconds, at most half the
     /// window in which a daemon may act on a `Start` (each `Start` names the newest
     /// heartbeat the server took, so a longer interval would leave it too little).
@@ -426,6 +443,9 @@ pub struct Args {
         requires = "state_store"
     )]
     pub member_dwell_secs: u64,
+    /// Build history: `--history-objects` and `--history-index-root`.
+    #[command(flatten)]
+    pub history: crate::history::HistoryFlags,
 }
 
 /// This server in the tier registry. A farm runs one server today
@@ -442,6 +462,9 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    /// A listener's TLS files do not make a configuration.
+    #[error("TLS: {0}")]
+    Tls(#[from] TlsError),
     /// The deny list cannot be read or parsed.
     #[error("--worker-deny-list: {0}")]
     DenyList(#[from] DenyListError),
@@ -532,15 +555,22 @@ impl Args {
     /// `--write-bytes-in-flight`; `--memory-ladder-gib` is not a ladder.
     pub fn listeners(&self) -> Result<Listeners, ConfigError> {
         self.segment_upload_fits_write_bound()?;
+        let reload = Duration::from_secs(self.tls_reload_interval_secs);
         let worker_tls = match (
             &self.worker_tls_cert,
             &self.worker_tls_key,
             &self.worker_client_ca,
         ) {
             (Some(cert), Some(key), Some(ca)) => Some(WorkerTls {
-                server: ServerTlsConfig::new()
-                    .identity(Identity::from_pem(read(cert)?, read(key)?))
-                    .client_ca_root(Certificate::from_pem(read(ca)?)),
+                server: TlsSource::files(
+                    "worker",
+                    TlsFiles {
+                        cert: cert.clone(),
+                        key: key.clone(),
+                        client_ca: Some(ca.clone()),
+                    },
+                    reload,
+                )?,
                 deny_list: self
                     .worker_deny_list
                     .as_deref()
@@ -550,9 +580,15 @@ impl Args {
             _ => None,
         };
         let reapi_tls = match (&self.reapi_tls_cert, &self.reapi_tls_key) {
-            (Some(cert), Some(key)) => {
-                Some(ServerTlsConfig::new().identity(Identity::from_pem(read(cert)?, read(key)?)))
-            }
+            (Some(cert), Some(key)) => Some(TlsSource::files(
+                "reapi",
+                TlsFiles {
+                    cert: cert.clone(),
+                    key: key.clone(),
+                    client_ca: None,
+                },
+                reload,
+            )?),
             _ => None,
         };
         Ok(Listeners {

@@ -54,7 +54,7 @@ async fn farm(name: &str, source: Arc<dyn MapSource>) -> Arc<MapHolder> {
         worker: SocketAddr::from(([127, 0, 0, 1], 0)),
         reapi_tls: None,
         worker_tls: Some(WorkerTls {
-            server: pki.server_tls(),
+            server: pki.worker_tls(),
             deny_list: None,
         }),
         heartbeat_interval: Duration::from_millis(100),

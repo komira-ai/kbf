@@ -1495,6 +1495,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "tracing-core",
  "tracing-subscriber",
 ]
 
@@ -1600,11 +1601,13 @@ dependencies = [
  "kbf-meta",
  "kbf-objstore",
  "kbf-proto",
+ "kbf-route",
  "kbf-sched",
  "kbf-segments",
  "kbf-storage",
  "kbf-store",
  "kbf-tier",
+ "kbf-tls",
  "kbf-types",
  "prost",
  "prost-types",
@@ -1971,6 +1974,7 @@ dependencies = [
  "kbf-auth",
  "kbf-caps",
  "kbf-front",
+ "kbf-history",
  "kbf-invocation",
  "kbf-log",
  "kbf-map",
@@ -1980,6 +1984,7 @@ dependencies = [
  "kbf-objstore",
  "kbf-proto",
  "kbf-raft",
+ "kbf-route",
  "kbf-sched",
  "kbf-segments",
  "kbf-sim",
@@ -1988,6 +1993,7 @@ dependencies = [
  "kbf-store",
  "kbf-threads",
  "kbf-tier",
+ "kbf-tls",
  "kbf-types",
  "kbf-ui",
  "libc",
@@ -2064,6 +2070,7 @@ dependencies = [
  "kbf-proto",
  "kbf-segments",
  "kbf-store",
+ "kbf-tls",
  "kbf-types",
  "rcgen",
  "sha2 0.11.0",
@@ -2108,6 +2115,22 @@ dependencies = [
  "kbf-segments",
  "kbf-store",
  "thiserror",
+]
+
+[[package]]
+name = "kbf-tls"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "rcgen",
+ "rustls",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tonic",
+ "tracing",
+ "x509-parser",
 ]
 
 [[package]]

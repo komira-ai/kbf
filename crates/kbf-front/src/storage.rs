@@ -13,6 +13,7 @@ use kbf_meta::{ActionRecord, Role};
 use kbf_objstore::{ObjectStore, ObjectStoreError};
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::segments_server::Segments;
+use kbf_segments::RecordHasher;
 use kbf_storage::{
     Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError, StreamedPut,
 };
@@ -102,10 +103,14 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
 
     /// The cache's own stream ([`Cache::stream`]): onto the write tier when it has room,
     /// else to the object store as the bytes come. `None` only for a size of 0 or a cache
-    /// made outside a runtime.
+    /// made outside a runtime. Each append is forwarded as it comes and hashed here, so
+    /// `finish` refuses bytes that are not the digest's (see `Writing`).
     fn stream(&self, size: u64) -> Option<Box<dyn PutStream>> {
         let stream = self.cache.stream(size)?;
-        Some(Box::new(Writing(stream)))
+        Some(Box::new(Writing {
+            stream,
+            hasher: RecordHasher::new(),
+        }))
     }
 
     /// The cache's streamed store ([`Cache::store_streamed_claimed`]), admitted as a
@@ -158,20 +163,48 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
     }
 }
 
-/// A record being written ([`Storage::stream`]): the cache's [`RecordStream`].
-struct Writing<M, O>(RecordStream<M, O>);
+/// A record being written ([`Storage::stream`]): the cache's [`RecordStream`], and the
+/// SHA-256 of the bytes appended to it.
+///
+/// [`RecordStream::finish`] checks the size and the CRC-32C, not the hash: onto the
+/// tier the cache trusts the digest at the commit (the flusher hashes the record later),
+/// which is right for the in-process plane, whose digests are its own hashes, and wrong
+/// for a caller of this trait, whose bytes come from another process. So the hash is
+/// checked here, as the cache's own `stage_streamed` checks a ByteStream `Write` before
+/// its commit: a blob is never present under a digest its bytes do not have. The cost
+/// is one SHA-256 pass over the bytes, on the appending thread; to the store the cache
+/// hashes them again before it completes the upload.
+struct Writing<M, O> {
+    stream: RecordStream<M, O>,
+    hasher: RecordHasher,
+}
 
 impl<M: MetaLog, O: ObjectStore + 'static> PutStream for Writing<M, O> {
+    /// Forwards `chunk` to the cache's stream, then hashes it: a chunk the stream
+    /// refused is not counted.
     fn append(&mut self, chunk: &[u8]) -> Result<(), StorageError> {
-        Ok(self.0.append(chunk)?)
+        self.stream.append(chunk)?;
+        self.hasher.update(chunk);
+        Ok(())
     }
 
+    /// The cache's checks first (the size `digest` names, `crc32c`: `Invalid`), then the
+    /// hash (`DigestMismatch`). Refused either way, the stream is dropped uncommitted and
+    /// nothing is stored.
     fn finish(
         self: Box<Self>,
         digest: Digest,
         crc32c: u32,
     ) -> Result<Box<dyn StreamedPut>, StorageError> {
-        let streamed = self.0.finish(digest, crc32c)?;
+        let Self { stream, hasher } = *self;
+        let streamed = stream.finish(digest, crc32c)?;
+        let (actual, _) = hasher.finish();
+        if actual != digest {
+            return Err(StorageError::DigestMismatch {
+                claimed: digest,
+                actual,
+            });
+        }
         Ok(Box::new(Written(streamed)))
     }
 }

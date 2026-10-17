@@ -14,6 +14,7 @@ use crate::model::{
 use crate::tier::{ServerId, StagedObject, StagedPut, TierError, TierId};
 
 mod evict;
+mod lost;
 mod staged;
 
 /// One committed change to the metadata state.
@@ -229,17 +230,25 @@ pub struct StaleWriter {
 }
 
 /// Why an action-cache write was refused. A refused write changes nothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ActionWriteError {
     /// Only daemons write the action cache.
     #[error("action-cache writes are accepted only from a daemon")]
     NotDaemon,
-    /// A blob the entry needs is not held: the outputs must be stored first.
-    #[error("action-cache entry needs blob {0}, which is not held")]
-    Absent(Digest),
-    /// A blob the entry needs is held at an unreachable object.
-    #[error("action-cache entry needs blob {0}, whose object is unreachable")]
-    Unreachable(Digest),
+    /// Every blob the entry needs that is not held, the result's first, then the
+    /// closure's in digest order; never empty. The outputs must be stored first.
+    #[error("action-cache entry needs blobs that are not held: {}", listed(.0))]
+    Absent(Vec<Digest>),
+    /// Every blob the entry needs that is held at an unreachable object, in the same
+    /// order; never empty. Only when none is absent.
+    #[error("action-cache entry needs blobs whose objects are unreachable: {}", listed(.0))]
+    Unreachable(Vec<Digest>),
+}
+
+/// `digests`, comma-separated, for an error message.
+fn listed(digests: &[Digest]) -> String {
+    let named: Vec<String> = digests.iter().map(ToString::to_string).collect();
+    named.join(", ")
 }
 
 /// A blob an action-cache entry needs that the closure check did not find usable.
@@ -278,6 +287,13 @@ pub struct MetaState {
     unreachable: BTreeMap<ObjectId, LossMark>,
     /// How many times an object went from reachable to marked unreachable.
     losses: u64,
+    /// Objects marked unreachable while they were staged, each with how many index
+    /// entries are at it: those blobs' only copy was the object's block on a write
+    /// tier, so they are lost ([`MetaState::lost_blobs`]). An object leaves when its
+    /// last entry does, or when its mark is cleared.
+    lost: BTreeMap<ObjectId, u64>,
+    /// How many blobs were ever marked lost ([`MetaState::blob_losses`]).
+    blob_losses: u64,
     next_epoch: u64,
     /// Each member [`Command::SetWriter`] named, with the latest boot it set.
     node_boots: BTreeMap<NonZeroU64, NonZeroU64>,
@@ -306,6 +322,8 @@ impl MetaState {
             actions: BTreeMap::new(),
             unreachable: BTreeMap::new(),
             losses: 0,
+            lost: BTreeMap::new(),
+            blob_losses: 0,
             next_epoch: 1,
             node_boots: BTreeMap::new(),
             current_writer: None,
@@ -410,6 +428,7 @@ impl MetaState {
                         .or_insert(LossMark { reason, generation });
                     mark.reason = mark.reason.max(reason);
                     mark.generation = generation;
+                    self.mark_lost(object);
                     self.unstage(object);
                 }))
             }
@@ -421,6 +440,7 @@ impl MetaState {
                         .is_some_and(|mark| mark.generation == generation)
                     {
                         self.unreachable.remove(&object);
+                        self.lost.remove(&object);
                     }
                 }))
             }
@@ -546,6 +566,32 @@ impl MetaState {
         Ok(())
     }
 
+    /// The write-time closure check: every blob of `needed` that is not present and
+    /// reachable, as the refusal of an action-cache write names them
+    /// ([`ActionWriteError::Absent`] if any is absent, else
+    /// [`ActionWriteError::Unreachable`]); `None` if every one is.
+    #[must_use]
+    pub fn lacking<'a>(
+        &self,
+        needed: impl Iterator<Item = &'a Digest>,
+    ) -> Option<ActionWriteError> {
+        let (mut absent, mut unreachable) = (Vec::new(), Vec::new());
+        for digest in needed {
+            match self.blob(digest) {
+                BlobAnswer::Present { .. } => {}
+                BlobAnswer::Unavailable => unreachable.push(*digest),
+                BlobAnswer::Absent => absent.push(*digest),
+            }
+        }
+        if !absent.is_empty() {
+            Some(ActionWriteError::Absent(absent))
+        } else if !unreachable.is_empty() {
+            Some(ActionWriteError::Unreachable(unreachable))
+        } else {
+            None
+        }
+    }
+
     /// The node writer every put of a node object must name, once one is set.
     #[must_use]
     pub const fn current_writer(&self) -> Option<NodeWriter> {
@@ -617,6 +663,7 @@ impl MetaState {
             BlobAnswer::Unavailable => {
                 let replaced = entry.location;
                 entry.location = location;
+                self.entry_left(replaced.object);
                 BlobWrite::Healed { replaced }
             }
         }
@@ -631,11 +678,11 @@ impl MetaState {
         if role != Role::Daemon {
             return Err(ActionWriteError::NotDaemon);
         }
-        self.closure_check(iter::once(&record.result).chain(record.closure.iter()))
-            .map_err(|lack| match lack {
-                Lack::Absent(d) => ActionWriteError::Absent(d),
-                Lack::Unreachable(d) => ActionWriteError::Unreachable(d),
-            })?;
+        if let Some(lacking) = self.lacking(iter::once(&record.result).chain(record.closure.iter()))
+        {
+            return Err(lacking);
+        }
+        self.order_flush(&record.result, record.closure.iter());
         self.actions.insert(
             action,
             ActionEntry {
@@ -679,6 +726,7 @@ impl MetaState {
             .collect();
         for digest in dead {
             if let Some(entry) = self.blobs.remove(&digest) {
+                self.entry_left(entry.location.object);
                 collected.blobs.push((digest, entry.location));
             }
         }
