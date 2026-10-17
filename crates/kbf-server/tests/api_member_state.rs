@@ -118,6 +118,7 @@ fn joined() -> (Server, Members, MemberId) {
         store: Arc::clone(&fake) as Arc<dyn Store>,
         epoch: EpochPolicy::Keep,
         members: config(),
+        history: None,
     };
     let other = Members::new(fake as Arc<dyn Store>, config());
     let registered = other

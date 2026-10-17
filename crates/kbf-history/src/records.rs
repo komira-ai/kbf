@@ -258,6 +258,10 @@ pub struct RunRecord {
     /// The limit it was killed at, bytes.
     #[prost(uint64, tag = "32")]
     pub memory_limit_bytes: u64,
+    /// The action is a test run (its shape names a test execution root). Added after
+    /// the first chunks were written: a record without it reads `false`.
+    #[prost(bool, tag = "33")]
+    pub test: bool,
 }
 
 impl RunRecord {
@@ -742,6 +746,36 @@ pub struct ChunkSummary {
 mod tests {
     use super::*;
     use crate::run_id::StreamId;
+
+    #[test]
+    fn the_test_flag_is_field_33_and_older_records_read_false() {
+        // Catches: a flag renumbered or dropped from the wire (a chunk written by this
+        // version would read back as no test), and a record written before the flag
+        // existed failing to decode or reading true.
+        use prost::Message as _;
+        let test = RunRecord {
+            test: true,
+            ..RunRecord::default()
+        };
+        // Tag 33, varint: key 264 (0x88 0x02), value 1.
+        assert_eq!(test.encode_to_vec(), [0x88, 0x02, 0x01]);
+        assert!(
+            RunRecord::decode([0x88, 0x02, 0x01].as_slice())
+                .unwrap()
+                .test
+        );
+        assert!(!RunRecord::default().test);
+        assert!(RunRecord::default().encode_to_vec().is_empty());
+        let older = RunRecord {
+            seq: 3,
+            ..RunRecord::default()
+        };
+        assert!(
+            !RunRecord::decode(older.encode_to_vec().as_slice())
+                .unwrap()
+                .test
+        );
+    }
 
     #[test]
     fn a_digest_prefix_is_its_first_eight_bytes() {

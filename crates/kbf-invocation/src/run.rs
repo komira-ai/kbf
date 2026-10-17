@@ -20,6 +20,8 @@ pub struct ActionShape {
     pub cfg: Option<String>,
     /// The target the action's paths name; `None` when they name none.
     pub target: Option<Target>,
+    /// Whether the action is a test run: it writes under `buck-out/<v>/test/execution/`.
+    pub test: bool,
 }
 
 impl ActionShape {
