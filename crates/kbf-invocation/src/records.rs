@@ -343,7 +343,8 @@ impl Records {
                     self.spread(operation, at);
                     // A report that carries a run block follows (`Ran`), which then
                     // settles the attempt.
-                    if !ended::reports(reason) {
+                    // MUTANT: a lease given up for a reason the worker reports settles before its report.
+                    if ended::reports(reason) || !ended::reports(reason) {
                         self.settled(operation, lease, EndedKind::Requeued, at);
                     }
                 }
