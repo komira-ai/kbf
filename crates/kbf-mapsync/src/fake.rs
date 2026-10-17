@@ -35,8 +35,8 @@ impl FakeMapSource {
 }
 
 impl MapSource for FakeMapSource {
-    fn current(&self) -> Arc<Map> {
-        Arc::clone(&self.map.lock().expect("lock"))
+    fn current(&self) -> Option<Arc<Map>> {
+        Some(Arc::clone(&self.map.lock().expect("lock")))
     }
 
     fn changes(&self) -> watch::Receiver<u64> {

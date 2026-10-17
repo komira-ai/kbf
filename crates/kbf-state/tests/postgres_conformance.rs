@@ -1,4 +1,4 @@
-//! The Postgres backend against a real server: the suite C1 to C7, the defects the suite
+//! The Postgres backend against a real server: the suite C1 to C8, the defects the suite
 //! must reject, the startup refusals, the claim path and the parts that are
 //! Postgres's alone (the database clock, one transaction per batch).
 //!
@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use kbf_state::conformance::{
     c1_linearizable_cas, c2_atomic_txn, c3_monotonic_counter, c4_store_clock_expiry,
-    c5_ordered_feed, c6_durable_ack, c7_group_commit,
+    c5_ordered_feed, c6_durable_ack, c7_group_commit, c8_bounded_range_scan,
 };
 use kbf_state::postgres::{ConfigError, Flaw, PostgresBackend, PostgresConfig, PostgresStore};
 use kbf_state::{Cond, Event, Revision, Store, StoreError, StoreTime, Txn};
@@ -81,6 +81,12 @@ fn c6_acknowledged_writes_survive_a_restart() {
 #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn c7_a_burst_is_one_group() {
     c7_group_commit(&backend(Flaw::None));
+}
+
+#[test]
+#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+fn c8_a_range_scan_is_bounded_and_resumes() {
+    c8_bounded_range_scan(&backend(Flaw::None));
 }
 
 // Catches revisions taken from a sequence: the later one commits first, the poller moves

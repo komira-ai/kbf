@@ -2,6 +2,8 @@
 //! `MapUpdate` follows each change on every open session, and a `MapRequest` is
 //! answered with the current map. A server with no map source sends and answers nothing.
 
+#[path = "support/hooked.rs"]
+mod hooked;
 mod support;
 
 use std::net::SocketAddr;
@@ -13,7 +15,11 @@ use kbf_map::{Map, Member, MemberId, MemberState, Rule};
 use kbf_mapsync::{FakeMapSource, MapSource};
 use kbf_objstore::MemoryStore;
 use kbf_proto::worker::{MapRequest, daemon_message};
-use kbf_server::{Listeners, bind_server_with_map};
+use kbf_server::members::{Members, MembershipConfig, Progress, Registrant};
+use kbf_server::{
+    EpochPolicy, Listeners, StateStore, bind_server_with_map, bind_server_with_state,
+};
+use kbf_state::Store;
 use support::{FakeDaemon, HELLO_WAIT, INTERVAL, PROMPT, QUIET, hello};
 
 fn map(generation: u64, members: u64) -> Map {
@@ -42,9 +48,9 @@ impl Drop for Server {
     }
 }
 
-fn start(source: Option<Arc<dyn MapSource>>) -> Server {
+fn listeners() -> Listeners {
     let loopback = SocketAddr::from(([127, 0, 0, 1], 0));
-    let listeners = Listeners {
+    Listeners {
         reapi: loopback,
         worker: loopback,
         reapi_tls: None,
@@ -60,12 +66,16 @@ fn start(source: Option<Arc<dyn MapSource>>) -> Server {
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
-    };
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
+    }
+}
+
+fn start(source: Option<Arc<dyn MapSource>>) -> Server {
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let cache = Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory());
     let bound = bind_server_with_map(
         cache,
-        listeners,
+        listeners(),
         None,
         kbf_auth::Policy::allow_all(),
         None,
@@ -187,4 +197,66 @@ async fn a_cell_sends_the_map_too() {
         at_least: 5,
     }));
     assert_eq!(daemon.map_update_within(PROMPT).await, Some(5));
+}
+
+fn registrant(i: u32) -> Registrant {
+    Registrant {
+        instance_id: format!("node-{i}"),
+        addr: format!("10.0.0.{i}:8982"),
+        zone: String::new(),
+        weight: 1,
+        protocol: kbf_server::members::PROTOCOL,
+        progress: Progress::CaughtUp,
+    }
+}
+
+/// Catches a server with a state store that sends daemons no map (the members' map is
+/// the one it holds, with no source given): a daemon that connects before any storage node
+/// registered is welcomed with none and is sent the first map when a node registers,
+/// and a daemon that connects later is welcomed with the members' map. Mutant: a server
+/// that takes no map from its members.
+#[tokio::test]
+async fn a_server_with_a_state_store_sends_daemons_its_members_map() {
+    let store = hooked::Hooked::new();
+    let config = MembershipConfig {
+        ttl: Duration::from_millis(60),
+        dwell: Duration::from_secs(1),
+        replication: 1,
+    };
+    let state = StateStore {
+        store: Arc::clone(&store) as Arc<dyn Store>,
+        epoch: EpochPolicy::Keep,
+        members: config,
+        history: None,
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let bound = bind_server_with_state(
+        Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory()),
+        listeners(),
+        None,
+        kbf_auth::Policy::allow_all(),
+        Some(state),
+        async move {
+            let _ = stopped.await;
+        },
+    )
+    .expect("bind");
+    let server = Server {
+        worker: bound.worker,
+        stop: Some(stop),
+    };
+    tokio::spawn(async move { bound.serving.await.expect("serve") });
+
+    let mut early = connect(&server, "early").await;
+    assert!(early.map.is_none(), "no member, no map to welcome with");
+    let members = Members::new(Arc::clone(&store.fake) as Arc<dyn Store>, config);
+    let first = members.register(&registrant(1)).expect("registers");
+    assert_eq!(
+        early.map_update_within(PROMPT).await,
+        Some(first.map.generation()),
+        "the first map reaches a daemon that was already connected"
+    );
+    let late = connect(&server, "late").await;
+    let welcomed = Map::try_from(late.map.expect("a map in Welcome")).expect("valid");
+    assert_eq!(welcomed.members().len(), 1);
 }
