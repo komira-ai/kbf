@@ -55,6 +55,7 @@ mod cas;
 mod catch_up;
 mod client;
 mod generation;
+mod in_process;
 mod segments;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -78,6 +79,7 @@ pub use admission::{Admission, Endpoint, PeerRole, ROLE_URI_PREFIX, role_of};
 pub use catch_up::CatchUp;
 pub use client::RemoteStorage;
 pub(crate) use client::lift;
+pub use in_process::InProcess;
 
 /// The metadata entry that carries the map generation on the standard calls.
 pub const MAP_GENERATION_HEADER: &str = "kbf-map-generation";
@@ -203,7 +205,14 @@ impl StorageService {
     /// The service as routes, ready to be added to a tonic server.
     #[must_use]
     pub fn routes(self) -> Routes {
-        let this = Arc::new(self);
+        Arc::new(self).shared_routes()
+    }
+
+    /// [`Self::routes`] for a service the caller keeps a handle on, so that the process
+    /// that serves it can also call it ([`Self::in_process`]).
+    #[must_use]
+    pub fn shared_routes(self: &Arc<Self>) -> Routes {
+        let this = Arc::clone(self);
         Routes::new(
             ContentAddressableStorageServer::from_arc(Arc::clone(&this))
                 .max_decoding_message_size(MAX_MESSAGE_BYTES)
@@ -224,5 +233,14 @@ impl StorageService {
                 .max_decoding_message_size(MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_MESSAGE_BYTES),
         )
+    }
+
+    /// The service called in this process, without a connection ([`InProcess`]): what the
+    /// daemon half of a storage-and-daemon process uses for the one member that is its own
+    /// node, so that a write it makes takes the path a call from another node takes (the
+    /// generation check, the chain's forward to the replica).
+    #[must_use]
+    pub fn in_process(self: &Arc<Self>) -> InProcess {
+        InProcess::new(Arc::clone(self))
     }
 }

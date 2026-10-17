@@ -1481,6 +1481,7 @@ dependencies = [
  "kbf-segments",
  "kbf-server",
  "kbf-storage",
+ "kbf-store",
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
