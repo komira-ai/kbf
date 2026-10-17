@@ -105,7 +105,7 @@ pub enum State {
 }
 
 /// The facts of a staged release the frontend plans by.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Staged {
     /// The wire protocol of the staged build.
     pub protocol: u32,

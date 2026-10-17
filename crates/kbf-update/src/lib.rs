@@ -29,14 +29,17 @@ mod client;
 #[cfg(test)]
 mod fixtures;
 mod floors;
+mod grpc;
 pub mod helper;
 pub mod inbox;
 mod offer;
 mod source;
 mod stage;
 mod types;
+mod wire;
 
 pub use client::{Config, Decision, Handle, StartError, Worker, start};
+pub use grpc::ReleaseClient;
 pub use offer::Refusal;
 pub use source::{Chunks, FetchError, Source};
 pub use stage::Backoff;
