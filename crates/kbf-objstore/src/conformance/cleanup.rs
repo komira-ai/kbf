@@ -1,22 +1,24 @@
 //! What the suite leaves behind: nothing but what the store refuses to delete.
 //!
-//! After the last check [`sweep`] lists everything under the run's own prefix and deletes
-//! it, whether the checks passed or not. It never touches a key outside that prefix.
+//! The checks record every key they write in a [`Written`]; after the last check
+//! [`sweep`] deletes exactly those keys, whether the checks passed or not. It never lists
+//! to find what to delete, so no prefix (the empty one, or one that is the start of a
+//! neighbour's) can make it delete a key the suite did not write.
 
 use std::collections::BTreeSet;
+use std::sync::Mutex;
+use std::time::SystemTime;
 
+use bytes::Bytes;
 use futures::{StreamExt as _, stream};
 
 use super::LOCK_KEY;
-use crate::{KeyPrefix, ListToken, ObjectKey, ObjectStore, ObjectStoreError, PageSize};
+use crate::{KeyPrefix, ObjectKey, ObjectStore, ObjectStoreError};
 
 /// How many deletes are in flight at once.
 const DELETES: usize = 16;
-/// Pages of [`PageSize::MAX`] keys the sweep reads before it gives up on a listing that
-/// does not end: far more than any run writes.
-const MAX_PAGES: usize = 100;
 
-/// What the sweep did to the run's prefix.
+/// What the sweep did to the keys the run wrote.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Cleanup {
     /// Objects deleted.
@@ -24,18 +26,51 @@ pub struct Cleanup {
     /// Objects the store refused to delete because they are still under Object Lock
     /// retention. Expected after a run against a store with Object Lock; not a failure.
     pub retained: Vec<ObjectKey>,
-    /// Everything else that went wrong (a listing that failed, a delete refused for
-    /// another reason): objects may remain under the prefix.
+    /// Everything else that went wrong (a delete refused for another reason): the
+    /// object may remain.
     pub failed: Vec<String>,
 }
 
-/// Deletes every object under `prefix`; reports what it could not.
-pub(super) async fn sweep<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Cleanup {
-    let mut cleanup = Cleanup::default();
-    let (keys, listing) = list_all(store, prefix).await;
-    if let Err(why) = listing {
-        cleanup.failed.push(why);
+/// The keys a run has written, in the order they sort.
+#[derive(Debug, Default)]
+pub(super) struct Written(Mutex<BTreeSet<ObjectKey>>);
+
+impl Written {
+    /// `store.put_new`, remembering `key` for the sweep. The key is remembered before the
+    /// answer is known (a put that errors may still have landed) except when the store
+    /// says the key already existed: then it is not this run's to delete.
+    pub(super) async fn put_new<S: ObjectStore>(
+        &self,
+        store: &S,
+        key: &ObjectKey,
+        body: Bytes,
+        retain_until: Option<SystemTime>,
+    ) -> Result<(), ObjectStoreError> {
+        let answer = store.put_new(key, body, retain_until).await;
+        if !matches!(answer, Err(ObjectStoreError::AlreadyExists(_))) {
+            self.0
+                .lock()
+                .expect("no panic holds the lock")
+                .insert(key.clone());
+        }
+        answer
     }
+}
+
+/// Deletes every key in `written`; reports what it could not.
+pub(super) async fn sweep<S: ObjectStore>(
+    store: &S,
+    prefix: &KeyPrefix,
+    written: &Written,
+) -> Cleanup {
+    let mut cleanup = Cleanup::default();
+    let keys: Vec<ObjectKey> = written
+        .0
+        .lock()
+        .expect("no panic holds the lock")
+        .iter()
+        .cloned()
+        .collect();
     let lock_key = prefix.key(LOCK_KEY).ok();
     let answers: Vec<_> = stream::iter(&keys)
         .map(|k| async move { (k, store.delete(k).await) })
@@ -55,26 +90,4 @@ pub(super) async fn sweep<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Clea
     cleanup.retained.sort();
     cleanup.failed.sort();
     cleanup
-}
-
-/// Every key under `prefix` the listing gives, and why it stopped early if it did.
-async fn list_all<S: ObjectStore>(
-    store: &S,
-    prefix: &KeyPrefix,
-) -> (BTreeSet<ObjectKey>, Result<(), String>) {
-    let mut keys = BTreeSet::new();
-    let mut after: Option<ListToken> = None;
-    for _ in 0..MAX_PAGES {
-        let page = match store.list(prefix, after.as_ref(), PageSize::MAX).await {
-            Ok(page) => page,
-            Err(e) => return (keys, Err(format!("list {prefix:?} for cleanup: {e}"))),
-        };
-        keys.extend(page.objects.into_iter().map(|o| o.key));
-        match page.next {
-            Some(t) => after = Some(t),
-            None => return (keys, Ok(())),
-        }
-    }
-    let why = format!("list {prefix:?} for cleanup: no end after {MAX_PAGES} pages");
-    (keys, Err(why))
 }

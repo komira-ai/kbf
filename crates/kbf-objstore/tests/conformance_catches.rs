@@ -650,45 +650,85 @@ fn a_refused_delete_is_a_cleanup_failure_and_the_rest_is_deleted() {
     assert_eq!(bucket_keys(&store.inner), want, "{report}");
 }
 
-/// Catches: a cleanup that hides a listing that fails, or gives up on it: the checks
-/// that list fail as before, the cleanup says it could not list, and what the first
-/// page held is deleted.
+/// Catches: a cleanup that finds its objects by listing: a store whose listing fails
+/// after the first page still ends with only the neighbours and the retained object,
+/// and the cleanup reports nothing failed (the checks that list report their own).
 #[test]
-fn a_listing_that_fails_during_cleanup_is_reported_with_the_checks() {
+fn a_listing_that_fails_does_not_stop_the_cleanup() {
     let (store, report) = run_beside_neighbours(Defect::RefusesSecondPages);
     assert!(report.failures().count() > 1, "{report}");
     assert!(!report.passed(), "{report}");
-    let failed = &report.cleanup.failed;
-    assert_eq!(failed.len(), 1, "{report}");
-    assert!(failed[0].contains("for cleanup"), "{report}");
-    assert!(failed[0].contains("400 InvalidArgument"), "{report}");
-    // The first page of 1000 keys went; the page-cap check's other keys remain.
-    let first_page = report.cleanup.deleted + report.cleanup.retained.len();
-    assert_eq!(first_page, 1000, "{report}");
-    assert!(
-        bucket_keys(&store.inner).len() > NEIGHBOURS.len() + 1,
-        "{report}"
-    );
+    assert!(report.cleanup.failed.is_empty(), "{report}");
+    let mut want = neighbours();
+    want.insert(2, "conformance/locked".to_owned());
+    assert_eq!(bucket_keys(&store.inner), want, "{report}");
 }
 
-/// Catches: a cleanup that follows a listing that never ends for ever: it gives up
-/// after its page limit, says so, and has deleted every key the listing gave once.
+/// Catches: a cleanup that follows a listing for ever or gives up on it with objects
+/// left: a listing that never ends changes nothing about what is deleted.
 #[test]
-fn a_listing_that_never_ends_stops_the_cleanup_with_a_failure() {
+fn a_listing_that_never_ends_does_not_stop_the_cleanup() {
     let (store, report) = run_beside_neighbours(Defect::ListNeverEnds);
-    let failed = &report.cleanup.failed;
-    assert_eq!(failed.len(), 1, "{report}");
-    assert!(failed[0].contains("no end after 100 pages"), "{report}");
-    assert!(!report.passed(), "{report}");
-    assert_eq!(
-        bucket_keys(&store.inner),
-        [
-            "a/keep",
-            "conformance-keep",
-            "conformance/locked",
-            "other/conformance/keep",
-            "zz/keep"
-        ],
+    assert!(report.cleanup.failed.is_empty(), "{report}");
+    let mut want = neighbours();
+    want.insert(2, "conformance/locked".to_owned());
+    assert_eq!(bucket_keys(&store.inner), want, "{report}");
+}
+
+/// A bucket holding `names`, a run under `prefix` against it, and the bucket after.
+fn run_under(prefix: &str, names: &[&str]) -> (Vec<String>, Report) {
+    // Conditional writes: a put onto a key that is there is refused, as on S3.
+    let store = MemoryStore::new(Capabilities {
+        conditional_put: true,
+        object_lock: false,
+    });
+    for name in names {
+        let k = ObjectKey::new(*name).unwrap();
+        block_on(store.put_new(&k, Bytes::from_static(b"mine"), None)).unwrap();
+    }
+    let report = block_on(conformance::run(&store, &KeyPrefix::new(prefix).unwrap()));
+    (bucket_keys(&store), report)
+}
+
+/// Catches: a cleanup that lists the run's prefix and deletes what it finds: with the
+/// empty prefix (which lists the whole bucket) it would delete other users' keys.
+#[test]
+fn a_run_under_the_empty_prefix_leaves_the_neighbours() {
+    let (left, report) = run_under("", &["a/keep", "z/keep"]);
+    assert!(report.cleanup.failed.is_empty(), "{report}");
+    assert!(report.cleanup.deleted > 1001, "{report}");
+    assert_eq!(left, ["a/keep", "z/keep"], "{report}");
+}
+
+/// Catches: a cleanup that deletes by prefix text: `run1` is also the start of `run10/`
+/// and `run1x`, which belong to someone else.
+#[test]
+fn a_prefix_without_a_slash_leaves_the_keys_it_starts() {
+    let (left, report) = run_under("run1", &["run10/keep", "run1x", "run2/keep"]);
+    assert!(report.cleanup.failed.is_empty(), "{report}");
+    assert_eq!(left, ["run10/keep", "run1x", "run2/keep"], "{report}");
+}
+
+/// Catches: a cleanup that deletes a key that was already there: a put refused with
+/// `AlreadyExists` did not write it, so the run must not remove it. The check fails
+/// (its key is taken) and the other user's object survives.
+#[test]
+fn a_key_that_was_already_there_is_not_deleted() {
+    let (left, report) = run_under("conformance/", &["conformance/ranges"]);
+    assert!(
+        report.failures().any(|(c, _)| c == Check::RangeBoundaries),
         "{report}"
     );
+    assert_eq!(left, ["conformance/ranges"], "{report}");
+}
+
+/// Catches: a recorder that forgets the keys of one check: the retention check writes
+/// through the recorder too, so a store that stored the object without Object Lock
+/// (`DropsRetention` claims none, and refuses the date) leaves nothing, and one with
+/// Object Lock leaves exactly its retained object (the test above).
+#[test]
+fn every_key_a_check_writes_is_deleted() {
+    let (left, report) = run_under("conformance/", &[]);
+    assert!(report.passed(), "{report}");
+    assert!(left.is_empty(), "{left:?}\n{report}");
 }
