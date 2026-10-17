@@ -678,7 +678,7 @@ fn a_stored_header_with_no_list_time_takes_the_one_the_writer_chose() {
     // Catches: a header written before invocations were listed (no list time) merged
     // with the writer's into a header that still has none, so its entry would be
     // keyed at time 0 and the build would never appear.
-    let life = Life::fresh(Limits::default());
+    let mut life = Life::fresh(Limits::default());
     let inv = InvRef::named("b1");
     let stored = InvocationHeader {
         record_id: "b1".into(),
@@ -689,7 +689,6 @@ fn a_stored_header_with_no_list_time_takes_the_one_the_writer_chose() {
     };
     life.index
         .put(&life.index_root.invid(&inv.key), stored.encode_to_vec());
-    let mut life = life;
     life.run(&inv, T + 7_000, "main", RunOutcome::Ok);
     life.close(&inv);
     life.drain(T + 8_000, 50);
