@@ -250,7 +250,7 @@ jobs:
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # The state store's Postgres backend against a real server in a service container,
-  # pinned by digest (postgres 17.9): the conformance suite C1 to C7, the defects it must
+  # pinned by digest (postgres 17.9): the conformance suite C1 to C8, the defects it must
   # reject, the startup refusal of a server that does not flush commits, and the claim
   # path (crates/kbf-state/tests/postgres_conformance.rs). The feature is off in the
   # workspace jobs, so this job also lints it. The password is a throwaway for this

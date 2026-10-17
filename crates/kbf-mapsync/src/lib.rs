@@ -35,13 +35,16 @@ pub use holder::MapHolder;
 
 /// The map a frontend holds, and when it changes.
 ///
-/// A source has a map from the start: a frontend that has none does not serve one.
+/// A frontend whose first storage node has not registered yet has no map (a map names at
+/// least one member), but its source exists from the start: [`MapSource::current`] is
+/// `None` and [`MapSource::changes`] holds generation 0 until the first map, and then
+/// announces it. A daemon that connected earlier is sent that map as a `MapUpdate`.
 pub trait MapSource: Send + Sync {
-    /// The map held now.
-    fn current(&self) -> Arc<Map>;
+    /// The map held now; `None` before the first.
+    fn current(&self) -> Option<Arc<Map>>;
 
-    /// A receiver whose value is the generation of the map held, and which is notified
-    /// each time it changes. A caller that wants the map for the tick reads
+    /// A receiver whose value is the generation of the map held (0 before the first), and
+    /// which is notified each time it changes. A caller that wants the map for the tick reads
     /// [`MapSource::current`] after it, so it may see a map newer than the generation it
     /// was woken for, never an older one (a source has stored the map by the time it
     /// announces its generation). A caller that has to miss no change subscribes before

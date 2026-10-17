@@ -1,7 +1,8 @@
 //! The storage half of `kbf storage-and-daemon` (`docs/design/architecture-v2.md`,
 //! sections 1 and 10): the storage node `kbf storage` runs, on the same flags
 //! ([`StorageFlags`]), with the storage it serves also handed to the caller in-process
-//! ([`StorageHalf::storage`]), so the daemon half of the same process reads and writes
+//! ([`StorageHalf::storage`]), and the service that serves it callable in-process
+//! ([`StorageHalf::in_process`]), so the daemon half of the same process reads and writes
 //! it through calls, with no socket between.
 //!
 //! [`start`] opens the stores and binds the listener as
@@ -10,7 +11,15 @@
 //!   cache shares the hot store's disk), the write tier keeps no flushed copies and its
 //!   bytes are counted in that one cache's budget, as `kbf all-in-one`'s server half
 //!   does (`kbf_storage::local_cache`).
-//! - **The handle.** The [`Storage`] the listener serves is kept, for the daemon half.
+//! - **The handle.** The [`Storage`] the listener serves, and the service over it
+//!   ([`kbf_storage::service::InProcess`]), are kept, for the daemon half.
+//!
+//! - **The map.** With `--frontend` the half registers and heartbeats as `kbf storage`
+//!   does, holds the maps the frontend sends in a [`kbf_mapsync::MapHolder`]
+//!   ([`StorageHalf::maps`]), and its listener answers every call UNAVAILABLE `no storage
+//!   map yet` until the first arrives (the daemon half, in the same process, calls the
+//!   service in-process; the listener's gate is a layer of the listener, so the daemon
+//!   half applies the same rule itself, see `kbf_daemon::LocalMember`).
 //!
 //! The rest (the listener's checks, the stores, the metadata log, the flusher and the
 //! start-up pass over a `file://` cold store) is `kbf storage`'s, step for step.
@@ -24,12 +33,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kbf_front::{Cache, CacheStorage, SegmentsConfig};
+use kbf_mapsync::MapHolder;
 use kbf_meta::Retention;
 use kbf_objstore::{FsStore, ObjectStore};
 use kbf_storage::Storage;
+use kbf_storage::service::InProcess;
 use kbf_threads::disk::Statvfs;
 
-use crate::serve::{ServeError, StorageListener, bind_storage};
+use crate::serve::{ServeError, StorageListener, bind_storage_shared};
 use crate::start::{AbortOnDrop, open_cold_file, share_storage, tier_bytes};
 use crate::startup_pass::StartPass;
 use crate::storage_node::StorageFlags;
@@ -43,17 +54,37 @@ pub struct StorageHalf {
     /// Where the listener is.
     pub addr: SocketAddr,
     storage: Arc<dyn Storage>,
+    in_process: InProcess,
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
+    maps: Arc<MapHolder>,
     _flusher: Option<AbortOnDrop>,
     _pass: Option<AbortOnDrop>,
+    _joiner: Option<AbortOnDrop>,
 }
 
 impl StorageHalf {
-    /// The storage the listener serves: the daemon half's, in-process.
+    /// The storage map the node holds ([`crate::storage_node::StorageHandle::maps`]).
+    #[must_use]
+    pub fn maps(&self) -> Arc<MapHolder> {
+        Arc::clone(&self.maps)
+    }
+
+    /// The storage the listener serves, itself, with none of the service's checks: for a
+    /// daemon half that is not part of a farm ([`kbf_storage::service::InProcess`] is the
+    /// view that is).
     #[must_use]
     pub fn storage(&self) -> Arc<dyn Storage> {
         Arc::clone(&self.storage)
+    }
+
+    /// The storage service the listener serves, called in-process: what the daemon half
+    /// reaches the node that is its own member through, so that a write it makes takes the
+    /// path a call over the listener takes (the generation check, the chain's forward to
+    /// the replica).
+    #[must_use]
+    pub fn in_process(&self) -> InProcess {
+        self.in_process.clone()
     }
 
     /// The line the node prints once it is bound, as `kbf storage` prints it:
@@ -73,6 +104,7 @@ impl StorageHalf {
             serving,
             _flusher,
             _pass,
+            _joiner,
             ..
         } = self;
         serving.await
@@ -156,14 +188,25 @@ where
         idle: Duration::from_secs(args.segment_upload_idle_secs),
     };
     let storage: Arc<dyn Storage> = Arc::new(CacheStorage::new(cache, segments));
-    let bound = bind_storage(Arc::clone(&storage), listener, shutdown()?)?;
+    // As `kbf storage` does: register with the frontend if there is one, hold its map,
+    // and serve nothing until the first.
+    let maps = Arc::new(MapHolder::new());
+    let gate = flags.frontend.as_ref().map(|_| Arc::clone(&maps));
+    let (bound, in_process) =
+        bind_storage_shared(Arc::clone(&storage), listener, gate, shutdown()?)?;
     let addr = bound.addr;
+    let _joiner = flags
+        .joiner(addr, Arc::clone(&maps))?
+        .map(|joiner| AbortOnDrop(tokio::spawn(joiner.run())));
     Ok(StorageHalf {
         addr,
         storage,
+        in_process,
         start_line: format!("kbf-storage {SERVER_VERSION} storage={addr} log={log}"),
         serving: Box::pin(bound.serving),
+        maps,
         _flusher,
         _pass,
+        _joiner,
     })
 }

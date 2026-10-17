@@ -6,11 +6,18 @@ use std::sync::Arc;
 use kbf_map::{Map, Member, MemberState};
 use kbf_storage::StorageError;
 use kbf_types::Digest;
+use tokio::sync::Semaphore;
 
 use crate::flights::Flights;
 use crate::nodes::Nodes;
 use crate::repair::{Limiter, ReadRepair, RepairLimit};
 use crate::source::{MapSource, MapView};
+
+/// What [`Router::commit_with_closure`] holds in memory, across all its calls, unless
+/// [`Router::with_copy_budget`] says otherwise: 256 MiB.
+pub const DEFAULT_COPY_BYTES: u64 = 256 << 20;
+
+const DEFAULT_COPY_KIB: u32 = (DEFAULT_COPY_BYTES / 1024) as u32;
 
 /// Calls to the storage nodes of a farm, routed by the storage map.
 ///
@@ -23,6 +30,10 @@ pub struct Router {
     pub(crate) nodes: Arc<dyn Nodes>,
     pub(crate) repair: Option<Arc<Repair>>,
     pub(crate) flights: Arc<Flights>,
+    /// The bytes of blobs that [`Router::commit_with_closure`] holds in memory to copy, in
+    /// KiB, shared by every clone.
+    pub(crate) copying: Arc<Semaphore>,
+    pub(crate) copy_kib: u32,
 }
 
 /// The read-repair hook and its limit.
@@ -55,7 +66,21 @@ impl Router {
             nodes,
             repair: None,
             flights: Arc::default(),
+            copying: Arc::new(Semaphore::new(DEFAULT_COPY_KIB as usize)),
+            copy_kib: DEFAULT_COPY_KIB,
         }
+    }
+
+    /// The same router, holding at most `bytes` of blobs in memory at once (counted in
+    /// KiB, at least one) across every [`Router::commit_with_closure`] on it and its
+    /// clones. A blob larger than that is copied alone. The default is
+    /// [`DEFAULT_COPY_BYTES`].
+    #[must_use]
+    pub fn with_copy_budget(mut self, bytes: u64) -> Self {
+        let kib = u32::try_from(bytes / 1024).unwrap_or(u32::MAX).max(1);
+        self.copying = Arc::new(Semaphore::new(kib as usize));
+        self.copy_kib = kib;
+        self
     }
 
     /// The same router, telling `hook` about a blob a read found away from where it

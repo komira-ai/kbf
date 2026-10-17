@@ -117,7 +117,7 @@ impl Worker for WorkerService {
         &self,
         request: Request<Streaming<DaemonMessage>>,
     ) -> Result<Response<SessionStream>, Status> {
-        let certs = request.peer_certs();
+        let certs = kbf_tls::peer_certs(&request);
         let leaf = certs.as_deref().and_then(|chain| chain.first());
         let peer = self.peers.peer(leaf.map(AsRef::as_ref))?;
         let mut inbound = request.into_inner();
