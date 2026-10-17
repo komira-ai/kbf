@@ -159,12 +159,20 @@ fn routes_by_map(flags: &Flags) -> bool {
     flags.storage.frontend.is_some()
 }
 
+/// This node's own member for the daemon half's plane: registered under the address the
+/// node registers with the frontend (`--advertise-addr`, or the bound address), so the
+/// plane finds itself in the map by the address the map carries.
+#[cfg(target_os = "linux")]
+fn local_member(flags: &Flags, half: &StorageHalf) -> LocalMember {
+    let addr = flags.storage.registers_as(half.addr);
+    LocalMember::new(addr, half.in_process(), half.maps())
+}
+
 /// The daemon half's start over `half` (the module docs, **The daemon half**).
 #[cfg(target_os = "linux")]
 fn starter(flags: &Flags, half: &StorageHalf, tokio: &tokio::runtime::Handle) -> Starter {
     if routes_by_map(flags) {
-        let addr = flags.storage.registers_as(half.addr);
-        let local = LocalMember::new(addr, half.in_process(), half.maps());
+        let local = local_member(flags, half);
         return Box::new(move |cli| kbf_node::start_member(cli, local));
     }
     let store = kbf_server::LocalStore::over(half.storage());

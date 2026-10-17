@@ -96,6 +96,7 @@ fn process(node: NodeUnderTest, id: MemberId, held: Arc<MapHolder>, tls: &TlsFil
         node.in_process.clone(),
         Arc::clone(&node.maps),
     );
+    assert_eq!(local.addr(), node.addr.to_string());
     let dialled = Arc::new(Counted {
         inner: kbf_daemon::storage_nodes(tls).expect("TLS files"),
         dialled: Mutex::default(),
@@ -314,4 +315,34 @@ async fn a_daemon_half_writes_nowhere_until_it_and_its_node_hold_a_map() {
     let cas = plane_over(Some(&map), &a, &a.node.maps, &tls);
     cas.put(own).await.expect("A takes it");
     assert!(a.node.holds(&own_digest).await);
+}
+
+/// Catches a write answered with one copy and nothing owed. The partner B of A's chain is
+/// down (its listener stopped: the leg to it is refused). A's daemon half writes a blob
+/// whose primary is A, in-process: the write is answered (one copy, on A) and A's repair
+/// journal holds the copy owed to B for that digest and no other.
+///
+/// Mutant: the in-process `put` calling the inner storage (`Storage::put`) instead of the
+/// service's `write_in`: the write is answered, the blob is on A, and nothing is owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_with_the_partner_down_is_answered_and_the_copy_is_owed() {
+    let (a, b, map, _front) = farm("member-partner-down").await;
+    b.node.stop_server();
+
+    let bytes = blob_owned_by(&map, a.id, "owed");
+    let blob = digest(&bytes);
+    let stored = a
+        .cas
+        .put(bytes.clone())
+        .await
+        .expect("answered with one copy");
+    assert_eq!(stored, proto_digest(&blob));
+    assert!(a.node.holds(&blob).await, "the blob is on its primary, A");
+    assert!(!b.node.holds(&blob).await, "and not on B, which is down");
+    assert_eq!(
+        a.node.owed(),
+        [(blob, b.id)],
+        "A owes B the copy of this blob, durably, and nothing else"
+    );
+    assert_eq!(a.cas.get(&stored).await.expect("read back"), bytes);
 }

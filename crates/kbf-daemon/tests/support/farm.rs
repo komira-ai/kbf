@@ -174,6 +174,7 @@ pub async fn node(pki: &Pki, front: &Front, name: &str, dir: &Path) -> NodeUnder
         in_process,
         maps,
         me: None,
+        chain: None,
     }
 }
 
@@ -230,19 +231,21 @@ pub async fn chain_node(pki: &Pki, front: &Front, name: &str, dir: &Path) -> Nod
         me: AtomicU64::new(0),
     });
     std::fs::create_dir_all(dir.join("repairs")).expect("repairs dir");
-    let repairs = Repairs::open(
-        StdFs::new(dir.join("repairs")).expect("repairs fs"),
-        Options::default(),
-        Arc::new(NoLedger),
-    )
-    .expect("a journal");
+    let repairs = Arc::new(
+        Repairs::open(
+            StdFs::new(dir.join("repairs")).expect("repairs fs"),
+            Options::default(),
+            Arc::new(NoLedger),
+        )
+        .expect("a journal"),
+    );
     let calls_as = ClientTlsConfig::new()
         .ca_certificate(ca.clone())
         .identity(identity.clone());
     let chain = Arc::new(Chain::new(
         Arc::clone(&held) as Arc<dyn MapSource>,
         Peers::tls(calls_as),
-        Arc::new(repairs),
+        Arc::clone(&repairs),
         ChainConfig::default(),
     ));
     let store = Spy::streaming();
@@ -260,7 +263,7 @@ pub async fn chain_node(pki: &Pki, front: &Front, name: &str, dir: &Path) -> Nod
     let incoming = TcpIncoming::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
     let addr = incoming.local_addr().expect("address");
     let tls = ServerTlsConfig::new().identity(identity).client_ca_root(ca);
-    tokio::spawn(
+    let server = tokio::spawn(
         Server::builder()
             .tls_config(tls)
             .expect("TLS config")
@@ -278,6 +281,10 @@ pub async fn chain_node(pki: &Pki, front: &Front, name: &str, dir: &Path) -> Nod
         in_process: service.in_process(),
         maps,
         me: Some(held),
+        chain: Some(ChainParts {
+            repairs,
+            server: server.abort_handle(),
+        }),
     }
 }
 
@@ -290,6 +297,13 @@ pub struct NodeUnderTest {
     pub maps: Arc<MapHolder>,
     /// A chain node's map source, whose member id the test sets.
     me: Option<Arc<HeldMap>>,
+    /// A chain node's repair journal and the task that serves its listener.
+    chain: Option<ChainParts>,
+}
+
+struct ChainParts {
+    repairs: Arc<Repairs>,
+    server: tokio::task::AbortHandle,
 }
 
 impl NodeUnderTest {
@@ -298,6 +312,23 @@ impl NodeUnderTest {
     pub fn is_member(&self, id: MemberId) {
         let held = self.me.as_ref().expect("a chain node");
         held.me.store(id.0, Ordering::SeqCst);
+    }
+
+    /// Stops a chain node's listener: its port refuses connections from here on (a leg
+    /// to it fails). No call had been made to it before, so no connection outlives this.
+    pub fn stop_server(&self) {
+        self.chain.as_ref().expect("a chain node").server.abort();
+    }
+
+    /// The copies a chain node owes, from its repair journal: (digest, replica).
+    pub fn owed(&self) -> Vec<(Digest, MemberId)> {
+        let chain = self.chain.as_ref().expect("a chain node");
+        chain
+            .repairs
+            .open_records()
+            .into_iter()
+            .map(|r| (r.digest, r.replica))
+            .collect()
     }
 
     pub async fn holds(&self, digest: &Digest) -> bool {

@@ -186,3 +186,42 @@ fn a_starter_starts_the_daemon_half_over_the_storage_half_in_either_mode() {
         let _node = start(&daemon).expect("the daemon half starts");
     }
 }
+
+/// Catches the daemon half taking the bound address for its own member's when the node
+/// registers under `--advertise-addr`: the map carries the advertised address, so a plane
+/// that looks for itself under the bound one never finds itself and dials its own node
+/// over the network (or not at all). With the flag the member is the advertised address, a
+/// routable-looking one that nothing is bound to; without it, the bound address.
+///
+/// Mutant: `local_member` registering `half.addr.to_string()` whatever the flag says.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_local_member_is_registered_under_the_advertised_address() {
+    let dir = crate::one_cache::under_target("local-member");
+    let tokio = tokio::runtime::Runtime::new().expect("runtime");
+    for advertise in [Some("192.0.2.10:9982"), None] {
+        let at = |name: &str| {
+            dir.join(advertise.map_or("bound", |_| "advertised"))
+                .join(name)
+        };
+        let cold = format!("--cold-store=file://{}", at("cold").display());
+        let meta = format!("--meta-dir={}", at("meta").display());
+        let mut extra = vec![
+            "--storage-listen=127.0.0.1:0".to_owned(),
+            cold,
+            meta,
+            "--frontend=http://127.0.0.1:1".to_owned(),
+        ];
+        extra.extend(advertise.map(|a| format!("--advertise-addr={a}")));
+        let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
+        let flags = flags(&extra).expect("flags");
+        let half = tokio
+            .block_on(kbf_server::storage_half::start(&flags.storage, || {
+                Ok(std::future::pending::<()>())
+            }))
+            .expect("the storage half starts");
+        let member = local_member(&flags, &half);
+        let want = advertise.map_or_else(|| half.addr.to_string(), str::to_owned);
+        assert_eq!(member.addr(), want);
+    }
+}

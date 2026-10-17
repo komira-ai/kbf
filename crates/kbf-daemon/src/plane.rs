@@ -242,6 +242,13 @@ impl LocalMember {
             held,
         }
     }
+
+    /// The address the member is registered under: the one of the map's member that is
+    /// this process.
+    #[must_use]
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
 }
 
 /// Why the local member is not used yet: the words of the storage listener's own gate.
