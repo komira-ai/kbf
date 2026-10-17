@@ -37,7 +37,7 @@ fn word(state: &State, memory: &Memory) -> &'static str {
         "activated_unconfirmed"
     } else if memory.event == Event::Refused {
         "refused"
-    } else if memory.event == Event::Reverted && state.staged.is_none() {
+    } else if (memory.event == Event::Reverted) & state.staged.is_none() {
         "reverted"
     } else if state.staged.is_some() {
         "staged"
