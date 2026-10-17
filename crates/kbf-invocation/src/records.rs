@@ -683,10 +683,8 @@ impl Records {
             let held = std::mem::take(&mut inv.rows[i].attempts);
             let mut copy = attempts.to_vec();
             for a in &mut copy {
-                a.run_id = held
-                    .iter()
-                    .find(|h| h.lease == a.lease)
-                    .and_then(|h| h.run_id);
+                // MUTANT: the row's ids are dropped when its attempts are copied again.
+                a.run_id = held.iter().find(|h| h.lease == a.lease).and(None);
             }
             inv.rows[i].attempts = copy;
             inv.refresh_row(i);
