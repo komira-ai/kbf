@@ -27,6 +27,7 @@ use kbf_storage::service::Admission;
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, ServerTlsConfig};
+use tower_layer::{Identity, Stack};
 
 use crate::blobs::{WorkerBlobs, WorkerCas, WorkerSegments};
 use crate::drain::Drain;
@@ -41,6 +42,7 @@ use crate::members_rpc::MembershipService;
 use crate::state_store::StateStore;
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
+use crate::worker_roles::WorkerRolesLayer;
 use kbf_mapsync::MapSource;
 use kbf_proto::kbf::map::v1::membership_server::MembershipServer;
 
@@ -53,8 +55,9 @@ pub struct Listeners {
     /// serves it in plain text, on whatever address `reapi` names (nothing refuses a
     /// bind off loopback; the binary's start line warns about one).
     pub reapi_tls: Option<ServerTlsConfig>,
-    /// The `kbf.worker.v1` listener (daemons): their worker streams, and `ByteStream`
-    /// for their blobs ([`crate::blobs`]).
+    /// The `kbf.worker.v1` listener: daemons' worker streams and blob calls
+    /// ([`crate::blobs`]), and storage nodes' `kbf.map.v1.Membership` calls; who may
+    /// call which method is [`crate::worker_roles`]'s table.
     pub worker: SocketAddr,
     /// Mutual TLS for the worker listener; `None` serves it in plain text, where no
     /// node is bound to a certificate and every blob call is refused.
@@ -262,21 +265,31 @@ pub(crate) fn bind_api(
     bound.map_err(|source| ServeError::Bind { addr, source })
 }
 
-/// The worker listener's TLS and the way its peers are told apart. Not generic, so
-/// both arms are one set of lines whatever the cache types (a per-instantiation copy
-/// that misses one arm would count as missed lines).
+/// The worker listener's server: every call goes through the per-method role table
+/// ([`crate::worker_roles`]) before it is routed.
+pub(crate) type WorkerListener = Server<Stack<WorkerRolesLayer, Identity>>;
+
+/// The worker listener's TLS, its role table, and the way its peers are told apart.
+/// Every worker listener is made here, so none serves a call the table does not list.
+/// Not generic, so both arms are one set of lines whatever the cache types (a
+/// per-instantiation copy that misses one arm would count as missed lines).
 pub(crate) fn worker_peers(
     server: Server,
     tls: Option<WorkerTls>,
-) -> Result<(Server, Peers), ServeError> {
+) -> Result<(WorkerListener, Peers), ServeError> {
     Ok(match tls {
         Some(tls) => (
-            server.tls_config(tls.server)?,
+            server
+                .tls_config(tls.server)?
+                .layer(WorkerRolesLayer::new(Admission::Certified)),
             Peers::Certified {
                 deny_list: tls.deny_list,
             },
         ),
-        None => (server, Peers::Unauthenticated),
+        None => (
+            server.layer(WorkerRolesLayer::new(Admission::Open)),
+            Peers::Unauthenticated,
+        ),
     })
 }
 
@@ -631,10 +644,11 @@ where
     if let Some(tls) = listeners.reapi_tls {
         reapi_server = reapi_server.tls_config(tls)?;
     }
-    let mut worker_server = keepalive(flow_control(Server::builder()), listeners.streams);
     let peers_certified = listeners.worker_tls.is_some();
-    let peers;
-    (worker_server, peers) = worker_peers(worker_server, listeners.worker_tls)?;
+    let (mut worker_server, peers) = worker_peers(
+        keepalive(flow_control(Server::builder()), listeners.streams),
+        listeners.worker_tls,
+    )?;
     let worker_blobs = ByteStreamServer::new(WorkerBlobs::new(
         ByteStreamService::new(Arc::clone(&cache)),
         peers.clone(),
