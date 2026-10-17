@@ -1591,6 +1591,7 @@ dependencies = [
  "kbf-auth",
  "kbf-caps",
  "kbf-invocation",
+ "kbf-map",
  "kbf-meta",
  "kbf-objstore",
  "kbf-proto",
