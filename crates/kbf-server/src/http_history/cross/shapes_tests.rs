@@ -40,7 +40,7 @@ async fn walk(
         std::future::ready(Ok::<_, ReadError>(pages(&instance, after.as_ref(), room)))
     })
     .await;
-    got.ok().expect("a walk")
+    got.expect("a walk")
 }
 
 fn at(name: &str, c: Option<&str>) -> Option<Position> {
@@ -95,7 +95,6 @@ async fn a_walk_reads_a_bounded_number_of_pages() {
         std::future::ready(Ok::<(Vec<u8>, _), ReadError>((Vec::new(), None)))
     })
     .await
-    .ok()
     .expect("a walk");
     assert!(got.is_empty());
     assert_eq!(started.into_inner(), MAX_FETCHES);

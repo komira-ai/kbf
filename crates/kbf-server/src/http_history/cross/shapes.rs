@@ -6,6 +6,12 @@
 //! outcome, the flaky proof and a ring of its last 16 runs); a shape that is not a test
 //! has the catalog row only. Nothing here reads an object.
 
+#![allow(
+    clippy::result_large_err,
+    reason = "the Err is the answer to send, built once on a refusal; boxing it would only \
+              move it"
+)]
+
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
