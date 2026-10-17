@@ -79,7 +79,10 @@ fn usage_lines(successor: &TestFarm) -> Vec<String> {
 /// The line's words that name the subject must be the described action's.
 fn assert_subject_named(lines: &[String]) {
     let (subject, _) = Subject::of(described());
-    assert!(subject.target.is_some(), "the described paths name a target");
+    assert!(
+        subject.target.is_some(),
+        "the described paths name a target"
+    );
     let [line] = lines else {
         panic!("one usage line expected: {lines:?}");
     };
@@ -141,5 +144,9 @@ async fn the_subject_row_goes_when_the_operation_finishes() {
     };
     assert!(accepted(&farm, lease).await);
     assert_eq!(disk.rows("op/"), 0);
-    assert_eq!(disk.rows("subject/"), 0, "the subject outlived its operation");
+    assert_eq!(
+        disk.rows("subject/"),
+        0,
+        "the subject outlived its operation"
+    );
 }
