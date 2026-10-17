@@ -174,9 +174,8 @@ fn paging(q: &Query, route: &str) -> Result<(usize, Option<u64>, Option<RunOutco
 async fn ask(cross: &Cross, scope: &mut Scope<'_>, q: &Query) -> Result<(), Response> {
     let held = cross.durable.reads.today().instances();
     let named = q.get("instance");
-    scope
-        .ask(held.iter().map(String::as_str).chain(named))
-        .await;
+    let asking: Vec<&str> = held.iter().map(String::as_str).chain(named).collect();
+    scope.ask(&asking).await;
     match named.and_then(|n| scope.refusal(n)) {
         Some(why) => Err(refusal(why)),
         None => Ok(()),

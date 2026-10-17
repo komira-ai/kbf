@@ -127,9 +127,13 @@ async fn read(cross: &Cross, parts: &Parts) -> Result<Value, Response> {
         let key = InvKey::from_record_id(id);
         names.push(reads.instances(&key).await.map_err(unreadable)?);
     }
-    scope
-        .ask(names.iter().flatten().flatten().map(String::as_str))
-        .await;
+    let asking: Vec<&str> = names
+        .iter()
+        .flatten()
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    scope.ask(&asking).await;
     let allow: Allow<'_> = &|instance: &str| scope.allows(instance);
     let mut columns = Vec::new();
     for id in ids {
