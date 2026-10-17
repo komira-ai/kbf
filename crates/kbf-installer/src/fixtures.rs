@@ -2,17 +2,15 @@
 //! trusted host, tarballs and inboxes.
 
 use std::cell::RefCell;
-use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use kbf_host::exec::Entry;
 use kbf_host::path::HostPath;
 use kbf_host::step::{Owner, Perms};
 use kbf_host::testkit::FakeExec;
-use sha2::{Digest, Sha256};
 
-use crate::layout::{self, Layout, Platform};
+use crate::layout;
 use crate::run::{Ran, RunAs, Runner, Spawn};
 
 pub const COMMIT: &str = "0f4a3825305cc79733ef098eae9725948eb5d6db";
@@ -33,11 +31,6 @@ impl FakeRunner {
             calls: RefCell::new(Vec::new()),
             answer: Box::new(answer),
         }
-    }
-
-    /// Every program accepted and every binary a release build of `commit`.
-    pub fn ok(commit: &'static str) -> FakeRunner {
-        FakeRunner::new(move |s| Ok(play(s, commit, "release")))
     }
 
     pub fn calls(&self) -> Vec<Spawn> {
@@ -68,30 +61,6 @@ pub fn version_json(commit: &str, profile: &str) -> String {
          \"state_schema\":7,\"version\":\"0.1.0\"}}\n",
         &commit[..12]
     )
-}
-
-/// The answer of a host where every program works: `gh`, `xattr` and `codesign` accept,
-/// a staged binary reports `commit` and `profile`.
-pub fn play(spawn: &Spawn, commit: &str, profile: &str) -> Ran {
-    let name = spawn
-        .program
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    match name {
-        "xattr" => ran(
-            1,
-            "",
-            "xattr: [Errno 93] No such xattr: com.apple.quarantine\n",
-        ),
-        "codesign" if spawn.args.first().is_some_and(|a| a == "--display") => ran(
-            0,
-            "",
-            "CodeDirectory v=20400 size=1 flags=0x10002(adhoc,runtime) hashes=1\n",
-        ),
-        "gh" | "codesign" => ran(0, "", ""),
-        _ => ran(0, &version_json(commit, profile), ""),
-    }
 }
 
 /// The paths of the trust list and every directory above them, as a bootstrap leaves
@@ -133,28 +102,6 @@ pub fn me() -> RunAs {
         uid: rustix::process::geteuid().as_raw(),
         gid: rustix::process::getegid().as_raw(),
     }
-}
-
-pub fn me_owner() -> Owner {
-    let me = me();
-    Owner {
-        uid: me.uid,
-        gid: me.gid,
-    }
-}
-
-/// A scratch host on `platform`: its layout, and the ready directories.
-pub fn scratch_layout(name: &str, platform: Platform) -> (kbf_host::testkit::ScratchHost, Layout) {
-    let exec = kbf_host::testkit::ScratchHost::new(&format!("installer-{name}"));
-    let host = Layout::new(
-        kbf_host::path::Root::new(&exec.root).expect("absolute"),
-        platform,
-    );
-    (exec, host)
-}
-
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
 }
 
 /// An ELF header (64-bit, little-endian) for `machine` (62 x86_64, 183 aarch64), then
@@ -208,48 +155,6 @@ pub fn tar_gz(items: &[Item]) -> Vec<u8> {
     let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     io::Write::write_all(&mut gz, &tarred).expect("gzip");
     gz.finish().expect("gzip")
-}
-
-/// One component of a test release: its name and the tarball that carries it.
-pub struct Part {
-    pub name: &'static str,
-    pub tarball: Vec<u8>,
-}
-
-/// A tarball holding the one file `name` with `bytes`.
-pub fn part(name: &'static str, bytes: &[u8]) -> Part {
-    Part {
-        name,
-        tarball: tar_gz(&[file(name, bytes)]),
-    }
-}
-
-/// The bundle every test inbox carries.
-pub const BUNDLE: &[u8] = b"{\"mediaType\":\"a bundle\"}\n";
-
-/// Write an inbox entry at `dir` offering `commit` with `parts`: the tarballs
-/// (`<name>.tar.gz`), `provenance.jsonl` and `offer.json`. Returns the offer's text.
-pub fn write_inbox(dir: &Path, commit: &str, parts: &[Part]) -> String {
-    fs::create_dir_all(dir).expect("entry");
-    let mut components = Vec::new();
-    for p in parts {
-        let file = format!("{}.tar.gz", p.name);
-        fs::write(dir.join(&file), &p.tarball).expect("tarball");
-        components.push(format!(
-            "{{\"name\":\"{}\",\"file\":\"{file}\",\"sha256\":\"{}\"}}",
-            p.name,
-            sha256_hex(&p.tarball)
-        ));
-    }
-    fs::write(dir.join("provenance.jsonl"), BUNDLE).expect("bundle");
-    let offer = format!(
-        "{{\"schema\":1,\"commit\":\"{commit}\",\"bundle\":{{\"file\":\"provenance.jsonl\",\
-         \"sha256\":\"{}\"}},\"components\":[{}]}}",
-        sha256_hex(BUNDLE),
-        components.join(",")
-    );
-    fs::write(dir.join("offer.json"), &offer).expect("offer");
-    offer
 }
 
 /// A scratch directory for a test's inbox, apart from the host's.
