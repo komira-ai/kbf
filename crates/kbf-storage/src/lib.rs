@@ -118,8 +118,8 @@ pub trait Storage: Send + Sync {
     /// A stream for one blob of `size` bytes, written as its bytes arrive and never
     /// held whole in memory: [`PutStream::append`] each chunk, [`PutStream::finish`]
     /// with the digest and CRC-32C, then [`StreamedPut::commit`]. `None` when the store
-    /// cannot take one (`size` is 0, or a store that cannot stream at all): the caller
-    /// uses [`Storage::put`]. Blocking: call it off the async runtime.
+    /// cannot take one (no write tier, no room on it, or `size` is 0): the caller uses
+    /// [`Storage::put`]. Blocking: call it off the async runtime.
     fn stream(&self, size: u64) -> Option<Box<dyn PutStream>>;
 
     /// Stores a blob of `size` bytes straight to the object store as `bytes` come (a

@@ -135,18 +135,6 @@ durable store, not a cache: a `file://` cold store on the same disk holds its ow
   file, which must be one each (a file over 1 GiB too, held after with a tier and
   without one), and every blob reads back as the file; a blob over 5 GiB is not
   refused for its size.
-- `tests/binary.rs` also runs one action whose 3 MiB input a client uploaded: once the
-  hot store is flushed, one inode under the hot store and the data directory holds the
-  input (the input cache's entry) and `/metrics` counts it once; after a SIGKILL and a
-  restart, the same action leaves the same.
-- `tests/one_cache.rs`: the input cache filled over the plane: a 12 MiB input reaches
-  its file through one streamed read and no whole-blob read, the file never more than
-  five chunks behind what the stream handed out; two leases needing one input at once
-  read it once, into one entry both link; what a streamed read answers when the stream
-  is damaged or cut, the blob is absent, the file cannot be written or the server half
-  is gone; the hot store's staged blocks reported to the one cache as its storage
-  bytes; and a server half that keeps flushed copies without the one cache and none
-  with it.
 - `tests/memory.rs`: a counting allocator over the whole in-process path (the walk,
   the plane, the server's upload until its commit): a 2 GiB output streams onto the
   write tier with under 16 MiB live, and so does a 2 GiB upload through the server's

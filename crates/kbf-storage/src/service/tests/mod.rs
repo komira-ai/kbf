@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fake::{Mem, pair, patterned, serve, serve_odd, serve_spied, sha};
-use futures::{FutureExt as _, StreamExt as _, stream};
+use futures::{StreamExt as _, stream};
 use kbf_meta::{ActionRecord, ActionWriteError, Role};
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::google::bytestream::{
@@ -810,17 +810,6 @@ async fn a_client_does_not_trust_a_node_that_contradicts_itself() {
     assert!(
         remote.stream(5).is_none(),
         "a streamed write over the wire is put's messages"
-    );
-    let streamed = remote
-        .put_streamed(
-            5,
-            stream::empty().boxed(),
-            futures::future::ready(None).boxed(),
-        )
-        .await;
-    assert!(
-        matches!(streamed, Err(StorageError::Invalid(_))),
-        "no streamed put to the object store over the wire: {streamed:?}"
     );
     let record = ActionRecord {
         result: sha(b"r"),

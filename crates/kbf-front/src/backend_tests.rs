@@ -121,15 +121,6 @@ impl Storage for Spy {
         self.inner.stream(size)
     }
 
-    fn put_streamed(
-        &self,
-        size: u64,
-        bytes: futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
-        claim: futures::future::BoxFuture<'static, Option<Digest>>,
-    ) -> Answer<'_, Option<Digest>> {
-        self.inner.put_streamed(size, bytes, claim)
-    }
-
     fn segments(&self) -> Arc<dyn Segments> {
         self.inner.segments()
     }
@@ -245,27 +236,6 @@ async fn files_are_asked_about_in_batches() {
     let walked = remote.walk_inputs(root.0).await.expect("walk");
     assert_eq!(walked.absent.len(), files.len());
     assert_eq!(spy.asks.load(Ordering::SeqCst), 2);
-}
-
-/// Catches: a [`Spy`] that drops a streamed put instead of handing it to the storage it
-/// wraps: the blob streamed through it reads back through the backend over it.
-#[tokio::test]
-async fn a_streamed_put_through_the_spy_reaches_the_storage() {
-    use futures::{FutureExt as _, StreamExt as _};
-    let cache = Arc::new(Cache::memory());
-    let (backend, spy) = spy(&cache, Fault::None);
-    let (digest, bytes) = blob("streamed through the spy");
-    let pieces = futures::stream::iter([Ok(bytes.clone())]).boxed();
-    let stored = spy
-        .put_streamed(
-            bytes.len() as u64,
-            pieces,
-            async move { Some(digest) }.boxed(),
-        )
-        .await
-        .expect("stored");
-    assert_eq!(stored, Some(digest));
-    assert_eq!(backend.read_blob(&digest).await.expect("held"), bytes);
 }
 
 /// Catches: the two kinds answering a call differently: the action-cache write (both
