@@ -279,7 +279,7 @@ A malformed token is refused by the node before any network call, naming which p
 | `DELETE /v1/enroll/tokens/{id}` | revoke (sets `revoked_at`; nodes already enrolled stay enrolled) |
 | `GET /v1/enroll/nodes`, `POST /v1/enroll/nodes/{id}/revoke` | the registry (section 5.7) |
 
-All writes need the existing bearer token gate (loopback only, `403` otherwise **[F]**), so `kbf token ...` runs on the frontend host, like `kbf cluster drain`. The operator API's own roles are planned **[F: api.md]**; until they exist, whoever holds the API token can mint enrollment tokens, which is exactly as powerful as being able to drain the frontend today and must be said in the operator documentation. **The UI is read-only for now (owner): no login and no buttons.** Token creation, the object-store configuration, node revocation and updates (the update button of the updater design is deferred) are done with the CLI and the operator API only; the UI may show tokens, nodes and the object-store mode (never a secret), as pages without actions (unit B2c).
+All writes need the existing bearer token gate (loopback only, `403` otherwise **[F]**), so `kbf token ...` runs on the frontend host, like `kbf cluster drain`. The operator API's own roles are planned **[F: api.md]**; until they exist, whoever holds the API token can mint enrollment tokens, which is exactly as powerful as being able to drain the frontend today and must be said in the operator documentation. **The UI is read-only for now (owner): no login and no buttons.** Token creation, the object-store configuration, node revocation and updates (the update button of the updater design is deferred) are done with the CLI and the operator API only; the UI may show tokens, nodes and the object-store mode (never a secret), as pages without actions (unit B2c). **Decided (owner): the frontend owns farm configuration.** Creating enrollment tokens and registering the object store (as a connection with keys, or as a bucket plus a role) are done through the operator API and CLI now; the web page shows the mode and never a secret.
 
 ### 5.2 The listener
 
@@ -680,6 +680,7 @@ Order by value: P0, then B3a, B2a and B4a in parallel, then B3b and B3c, then B4
 | 6 | `--enroll-adopt-unknown` is off by default | **Decided.** 6.5 |
 | 7 | The frontend's public (REAPI) certificate is renewed outside kbf for now | **Decided.** 6.3, 9 |
 | 8 | The operator configures the object store through the operator API; the frontend pushes it, rotation included, to storage nodes over mTLS (keys in memory only; the node also fetches on start); or `cloud` mode with no keys. Frontend-minted scoped or short-lived keys are dropped | **Decided.** 4.3 |
+| 8a | The frontend owns farm configuration: tokens and the object store (a connection, or a bucket plus a role) are set through the operator API and CLI now; the web page is read-only and shows the mode, never a secret | **Decided.** 4.3, 5.1 |
 | 9 | One key per role on a `storage-and-daemon` node | Lean: two keys; revocation by node id covers both |
 | 10 | The frontend pushes a changed `frontend_url` to nodes | Lean: yes, guarded: adopted only under the same pin, `kbf.toml` kept as fallback |
 | 11 | The frontend container image has no in-image updater | Lean: yes; the orchestrator replaces the image; the `.deb` and the Envoy handover remain the host path |
