@@ -60,9 +60,9 @@ struct RunArgs {
     /// The starts a release on trial gets before it is reverted (Linux).
     #[arg(long, default_value_t = 3)]
     starts: u32,
-    /// One pass, then exit (for a rehearsal).
+    /// Stop after this many passes (a rehearsal or a test); without it, run until stopped.
     #[arg(long)]
-    once: bool,
+    passes: Option<u64>,
 }
 
 #[derive(clap::Args)]
@@ -87,10 +87,11 @@ fn host(root: PathBuf) -> Result<(Layout, HostExec), String> {
 
 fn run(root: PathBuf, args: RunArgs) -> Result<(), String> {
     let (layout, exec) = host(root.clone())?;
-    let restart = match (args.unit, args.launchd_label) {
-        (Some(unit), None) => Restart::Systemd(unit),
-        (None, Some(label)) => Restart::Launchd(label),
-        _ => return Err("name the service: --unit or --launchd-label".to_owned()),
+    // clap makes exactly one of the two flags present (`required_unless_present`,
+    // `conflicts_with`), so the label is there whenever the unit is not.
+    let restart = match args.unit {
+        Some(unit) => Restart::Systemd(unit),
+        None => Restart::Launchd(args.launchd_label.unwrap_or_default()),
     };
     let cfg = Config {
         update_dir: args.update_dir,
@@ -114,16 +115,16 @@ fn run(root: PathBuf, args: RunArgs) -> Result<(), String> {
         stage_from_inbox(&mut ctx, entry)
     };
     helper.recover().map_err(|e| e.to_string())?;
-    loop {
+    let mut left = args.passes;
+    while left != Some(0) {
         helper
             .cycle(now(), &mut stager)
             .map_err(|e| e.to_string())?;
         helper.drain_log(&mut std::io::stderr());
-        if args.once {
-            return Ok(());
-        }
+        left = left.map(|n| n - 1);
         sleep(Duration::from_secs(args.interval_secs));
     }
+    Ok(())
 }
 
 fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), String> {

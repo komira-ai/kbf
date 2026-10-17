@@ -617,3 +617,155 @@ fn only_the_clients_shape_of_order_is_read() {
         assert_eq!(id_of(bad), None, "{bad}");
     }
 }
+
+/// A stager that must not run.
+fn no_stage() -> impl FnMut(&mut ScratchHost, &std::path::Path) -> Result<Staged, Refusal> {
+    |_, _| panic!("nothing is to be staged")
+}
+
+fn inbox_of(rig: &Rig) -> PathBuf {
+    rig.root.join("var/lib/kbf-updater/inbox")
+}
+
+/// Catches a helper that dies, or acts, on an inbox it cannot make sense of: no inbox, an
+/// inbox without orders, an inbox the service user stuffed with entries (more than the
+/// installer reads), an entry for the release already running, an entry whose name is
+/// not `<generation>-<commit>`. Each is quietly skipped or refused with a reason; none is
+/// staged.
+///
+/// Mutants seen red: the entry-count refusal turned into a panic; the already-running
+/// entry staged.
+#[test]
+fn an_inbox_that_is_missing_stuffed_or_for_the_running_release_stages_nothing() {
+    let mut rig = Rig::new("odd-inbox");
+    let inbox = inbox_of(&rig);
+    // An entry for the running release, and names that are not offers.
+    fs::create_dir(inbox.join(format!("{:020}-{A}", 3))).expect("entry");
+    fs::create_dir(inbox.join(format!("short-{B}"))).expect("entry");
+    rig.helper.cycle(T0, &mut no_stage()).expect("pass");
+    assert_eq!(rig.status()["state"], "idle");
+    // More entries than the installer reads.
+    for n in 0..20 {
+        fs::create_dir(inbox.join(format!("junk{n}"))).expect("entry");
+    }
+    rig.helper.cycle(T0 + 3, &mut no_stage()).expect("pass");
+    assert_eq!(rig.status()["state"], "refused");
+    assert!(
+        rig.status()["refusal"]
+            .as_str()
+            .expect("text")
+            .contains("inbox")
+    );
+    // No orders directory, then no inbox at all.
+    fs::remove_dir_all(inbox.join("orders")).expect("remove");
+    rig.helper.cycle(T0 + 6, &mut no_stage()).expect("pass");
+    fs::remove_dir_all(&inbox).expect("remove");
+    rig.helper.cycle(T0 + 9, &mut no_stage()).expect("pass");
+}
+
+/// Catches the same for orders: a directory stuffed past the installer's file limit is
+/// refused as a whole (and says so), and an order file that is a directory is neither
+/// read nor removed through, and is reported.
+#[test]
+fn an_orders_directory_that_is_stuffed_or_holds_a_directory_is_refused() {
+    let mut rig = Rig::new("odd-orders");
+    fs::create_dir(rig.orders().join(format!("{:020}.json", 904))).expect("dir");
+    rig.cycle(T0);
+    assert_eq!(rig.status()["state"], "refused");
+    assert!(
+        rig.orders().join(format!("{:020}.json", 904)).is_dir(),
+        "left alone"
+    );
+    for n in 0..20 {
+        fs::write(rig.orders().join(format!("{:020}.json", 100 + n)), "x").expect("file");
+    }
+    rig.cycle(T0 + 3);
+    assert_eq!(rig.status()["state"], "refused");
+    assert!(
+        rig.status()["refusal"]
+            .as_str()
+            .expect("text")
+            .contains("inbox")
+    );
+}
+
+/// Catches the helper's own files being wrong ending the run in silence or in a guess:
+/// a state.json that cannot be read is a refusal the node can read (at start), a
+/// helper.json that cannot be read stops the pass with an error.
+#[test]
+fn unreadable_state_is_reported_and_unreadable_memory_stops_the_pass() {
+    let mut rig = Rig::new("unreadable");
+    // Links already as the state says: nothing moved, nothing owed.
+    rig.helper.recover().expect("recovers");
+    fs::write(rig.root.join("var/lib/kbf-deploy/state.json"), b"not json").expect("ruin");
+    rig.helper.recover().expect("recovers into a refusal");
+    let memory =
+        fs::read_to_string(rig.root.join("var/lib/kbf-deploy/helper.json")).expect("memory");
+    assert!(memory.contains("refused"), "{memory}");
+    let path = rig.root.join("var/lib/kbf-deploy/helper.json");
+    fs::write(&path, b"not json").expect("ruin");
+    let error = rig
+        .helper
+        .cycle(T0, &mut no_stage())
+        .expect_err("cannot parse it");
+    assert!(error.to_string().contains("helper.json"), "{error}");
+    fs::remove_file(&path).expect("remove");
+    fs::create_dir(&path).expect("a directory where the file belongs");
+    let error = rig
+        .helper
+        .cycle(T0, &mut no_stage())
+        .expect_err("cannot read it");
+    assert!(
+        error.to_string().contains("Is a directory") || error.to_string().contains("directory"),
+        "{error}"
+    );
+}
+
+/// Catches orders that claim more than they can: an activate of the release already
+/// running changes nothing and restarts nothing; one for a release that is not installed
+/// is refused; a confirm with nothing on trial is refused.
+#[test]
+fn orders_the_host_cannot_carry_out_are_refused_and_change_nothing() {
+    let mut rig = Rig::new("cannot");
+    rig.put_order(5, &order_json(5, "activate", A));
+    rig.cycle(T0);
+    assert_eq!(rig.restarts(), 0);
+    assert_eq!(rig.status()["acked_order_id"], 5);
+    rig.put_order(6, &order_json(6, "activate", B));
+    rig.cycle(T0 + 3);
+    assert_eq!(rig.status()["state"], "refused");
+    assert_eq!(rig.state().current, Some(c(A)));
+    rig.put_order(7, &order_json(7, "confirm", B));
+    rig.cycle(T0 + 6);
+    assert_eq!(rig.status()["state"], "refused");
+    assert_eq!(rig.restarts(), 0);
+}
+
+/// Catches a revert that cannot happen being hidden: the swap's window runs out but the
+/// release to go back to is gone; the helper keeps the swap, says why in status.json, and
+/// does not restart onto nothing.
+#[test]
+fn an_expiry_that_cannot_revert_is_reported() {
+    let mut rig = Rig::new("expire-fails");
+    rig.put_offer(1, B);
+    let mut stager = stage_b(rig.layout.clone());
+    rig.helper.cycle(T0, &mut stager).expect("stage");
+    rig.put_order(5, &order_json(5, "activate", B));
+    rig.cycle(T0 + 3);
+    let layout = rig.layout.clone();
+    activate::boot_check(
+        rig.helper.exec_mut(),
+        &layout,
+        T0 + 10,
+        600,
+        &mut Vec::new(),
+    )
+    .expect("starts");
+    fs::remove_file(rig.root.join("usr/local/kbf/releases").join(A).join("kbf")).expect("gone");
+    let before = rig.restarts();
+    rig.cycle(T0 + 10 + 601);
+    assert_eq!(rig.state().current, Some(c(B)));
+    assert_eq!(rig.status()["state"], "activated_unconfirmed");
+    assert!(!rig.status()["refusal"].as_str().expect("text").is_empty());
+    assert_eq!(rig.restarts(), before);
+}

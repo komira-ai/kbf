@@ -58,7 +58,15 @@ fn one_pass_reports_the_host_and_a_refused_entry() {
     )
     .expect("binary");
 
-    let run = ["run", "--once", "--unit", "kbf.service"];
+    let run = [
+        "run",
+        "--passes",
+        "1",
+        "--interval-secs",
+        "0",
+        "--unit",
+        "kbf.service",
+    ];
     let out = helper(&root, &run);
     assert!(
         out.status.success(),
@@ -163,12 +171,67 @@ fn the_boot_check_counts_the_starts_and_reverts_the_last() {
 #[test]
 fn the_service_must_be_named_exactly_once() {
     let root = root("flags");
-    assert_eq!(helper(&root, &["run", "--once"]).status.code(), Some(2));
-    let both = ["run", "--once", "--unit", "a", "--launchd-label", "b"];
+    assert_eq!(
+        helper(&root, &["run", "--passes", "1"]).status.code(),
+        Some(2)
+    );
+    let both = [
+        "run",
+        "--passes",
+        "1",
+        "--unit",
+        "a",
+        "--launchd-label",
+        "b",
+    ];
     assert_eq!(helper(&root, &both).status.code(), Some(2));
     let out = Command::new(BIN)
         .args(["--root", "relative", "boot-check"])
         .output()
         .expect("runs");
     assert_eq!(out.status.code(), Some(1));
+}
+
+/// Catches a loop that does not loop or does not stop: two passes with a launchd label
+/// (the label is taken, and no unit is needed) end on their own; a helper.json the helper
+/// cannot read ends the run with an exit of 1 and a message, not a guess.
+///
+/// Mutant seen red: `passes` ignored (the run never ends; the test would hang), the
+/// decrement dropped.
+#[test]
+fn passes_end_the_run_and_an_unreadable_memory_stops_it() {
+    let root = root("passes");
+    Locked::acquire(&layout(&root))
+        .expect("lock")
+        .write(&State {
+            current: Some(c(A)),
+            ..State::default()
+        })
+        .expect("state");
+    let two = [
+        "run",
+        "--passes",
+        "2",
+        "--interval-secs",
+        "0",
+        "--launchd-label",
+        "com.example.kbf",
+    ];
+    let out = helper(&root, &two);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fs::write(root.join("var/lib/kbf-deploy/helper.json"), b"not json").expect("ruin");
+    let out = helper(&root, &two);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("helper.json"));
+    // A directory the helper cannot write status.json into ends the pass with an error.
+    fs::remove_file(root.join("var/lib/kbf-deploy/helper.json")).expect("remove");
+    let mut elsewhere = two.to_vec();
+    elsewhere.extend(["--update-dir", "/no/such/dir"]);
+    let out = helper(&root, &elsewhere);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("kbf-helper:"));
 }

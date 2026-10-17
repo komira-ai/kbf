@@ -61,16 +61,10 @@ pub struct Helper<E: Exec> {
     written: Vec<u8>,
 }
 
-/// What stages an inbox entry: the installer's `stage_from_inbox` on a host.
-pub trait Stager<E: Exec> {
-    fn stage(&mut self, exec: &mut E, entry: &Path) -> Result<Staged, Refusal>;
-}
-
-impl<E: Exec, F: FnMut(&mut E, &Path) -> Result<Staged, Refusal>> Stager<E> for F {
-    fn stage(&mut self, exec: &mut E, entry: &Path) -> Result<Staged, Refusal> {
-        self(exec, entry)
-    }
-}
+/// What stages an inbox entry: the installer's `stage_from_inbox` on a host. A function
+/// object, not a type parameter: each closure a test passed would be an instantiation of
+/// every function that takes it, and the coverage ratchet counts the best one.
+pub type Stager<'a, E> = &'a mut dyn FnMut(&mut E, &Path) -> Result<Staged, Refusal>;
 
 fn memory_path(host: &Layout) -> HostPath {
     HostPath::new(&format!("{}/helper.json", host.state_dir().as_str()))
@@ -152,7 +146,7 @@ impl<E: Exec> Helper<E> {
     }
 
     /// One pass. `now` is seconds since the epoch.
-    pub fn cycle(&mut self, now: u64, stager: &mut impl Stager<E>) -> Result<(), HelperError> {
+    pub fn cycle(&mut self, now: u64, stager: Stager<E>) -> Result<(), HelperError> {
         let mut memory = self.load()?;
         self.restart_if_owed(&mut memory)?;
         self.expire(now, &mut memory)?;
@@ -214,11 +208,7 @@ impl<E: Exec> Helper<E> {
     }
 
     /// Stage the newest inbox entry, once.
-    fn offers(
-        &mut self,
-        memory: &mut Memory,
-        stager: &mut impl Stager<E>,
-    ) -> Result<(), HelperError> {
+    fn offers(&mut self, memory: &mut Memory, stager: Stager<E>) -> Result<(), HelperError> {
         let inbox = self.dir("inbox");
         let Ok(entry) = Entry::open(&inbox) else {
             return Ok(());
@@ -247,7 +237,7 @@ impl<E: Exec> Helper<E> {
             memory.handled_entry = name;
             return self.save(memory);
         }
-        match stager.stage(&mut self.exec, &inbox.join(&name)) {
+        match stager(&mut self.exec, &inbox.join(&name)) {
             Ok(staged) => {
                 memory.event = Event::Idle;
                 memory.refusal.clear();
