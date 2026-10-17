@@ -4,7 +4,6 @@
 //! so holding one is bounded by construction. Single blobs, however large, go through
 //! the raw ByteStream path ([`super::bytestream`]).
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -20,11 +19,9 @@ use kbf_proto::reapi::{
     SpliceBlobResponse, SplitBlobRequest, SplitBlobResponse, batch_read_blobs_response,
     batch_update_blobs_request, batch_update_blobs_response,
 };
-use kbf_storage::Storage as _;
-use kbf_types::Digest;
 use tonic::{Request, Response, Status, Streaming};
 
-use super::owners::{Owner, Owners};
+use super::owners::Owners;
 use crate::{MAX_BATCH_TOTAL_BYTES, wire};
 
 /// Blobs of one batch in flight at once.
@@ -59,19 +56,7 @@ impl ProxyCas {
         authorize(&**authorizer, caller, call, instance).await
     }
 
-    /// The whole blob from the first node that has it.
-    async fn read_one(&self, digest: &Digest) -> Result<Bytes, Status> {
-        let mut last = super::owners::no_storage();
-        for owner in self.owners.for_digest(digest).iter() {
-            match owner.storage.read_blob(digest).await {
-                Ok(bytes) => return Ok(bytes),
-                Err(e) => last = e.into(),
-            }
-        }
-        Err(last)
-    }
-
-    /// Stores one batch item on its primary, or says why not.
+    /// Stores one batch item on its writer, or says why not.
     async fn store_one(&self, item: batch_update_blobs_request::Request) -> Result<(), Status> {
         let digest = wire::digest(item.digest.as_ref())?;
         if item.compressor != reapi::compressor::Value::Identity as i32 {
@@ -86,9 +71,7 @@ impl ProxyCas {
                 "blob {digest}: the data is {actual}"
             )));
         }
-        let owner = self.owners.primary(&digest)?;
-        owner.storage.put(Bytes::from(item.data)).await?;
-        Ok(())
+        self.owners.put(&digest, Bytes::from(item.data)).await
     }
 
     fn unimplemented<T>(call: &str) -> Result<T, Status> {
@@ -114,22 +97,7 @@ impl ContentAddressableStorage for ProxyCas {
             .await?;
         wire::check_digest_function(request.digest_function)?;
         let asked = wire::digests(&request.blob_digests)?;
-        let mut by_node: BTreeMap<String, (Owner, Vec<Digest>)> = BTreeMap::new();
-        for digest in &asked {
-            let owner = self.owners.primary(digest)?;
-            by_node
-                .entry(owner.id().to_owned())
-                .or_insert_with(|| (owner, Vec::new()))
-                .1
-                .push(*digest);
-        }
-        let answers = futures::future::try_join_all(
-            by_node
-                .values()
-                .map(|(owner, digests)| owner.storage.find_missing(digests)),
-        )
-        .await?;
-        let missing: BTreeSet<Digest> = answers.into_iter().flatten().collect();
+        let missing = self.owners.find_missing(&asked).await?;
         Ok(Response::new(FindMissingBlobsResponse {
             missing_blob_digests: asked
                 .iter()
@@ -199,7 +167,7 @@ impl ContentAddressableStorage for ProxyCas {
         let responses = stream::iter(request.digests)
             .map(|asked| async move {
                 let read = match wire::digest(Some(&asked)) {
-                    Ok(digest) => self.read_one(&digest).await,
+                    Ok(digest) => self.owners.read_blob(&digest).await,
                     Err(e) => Err(e),
                 };
                 let (data, status) = match read {

@@ -9,6 +9,9 @@
 //!   `ActionResult` blob plus its [`Closure`];
 //! - the objects the store has reported unreachable, each with a [`LossMark`]: its
 //!   [`UnreachableReason`] and the [`Generation`] (log index) of the last mark;
+//!   an object marked while it was staged has lost its blobs (their only copy was its
+//!   block on a write tier), counted by [`MetaState::lost_blobs`] and
+//!   [`MetaState::blob_losses`];
 //! - the committed farm time, and the next writer [`Epoch`].
 //! - the local write tiers ([`TierId`]), one current tier per server, and the
 //!   **staged** objects: objects whose only copy is a block file on a tier until they

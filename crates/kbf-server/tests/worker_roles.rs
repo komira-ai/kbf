@@ -32,15 +32,14 @@ use kbf_server::worker_roles::{WORKER_LISTENER_ROLES, WorkerRolesLayer, admit, r
 use kbf_server::{EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_state};
 use kbf_state::Store;
 use kbf_storage::service::{Admission, PeerRole, ROLE_URI_PREFIX};
+use kbf_tls::TlsSource;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, SanType,
 };
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::codegen::{Service, http};
-use tonic::transport::{
-    Certificate, Channel, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig,
-};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tonic::{Code, Status};
 use tower_layer::Layer as _;
 
@@ -314,9 +313,13 @@ impl Pki {
         let key = KeyPair::generate().expect("key");
         let cert = params.signed_by(&key, &self.ca).expect("sign");
         WorkerTls {
-            server: ServerTlsConfig::new()
-                .identity(Identity::from_pem(cert.pem(), key.serialize_pem()))
-                .client_ca_root(Certificate::from_pem(self.ca.pem())),
+            server: TlsSource::fixed(
+                "worker",
+                cert.pem().as_bytes(),
+                key.serialize_pem().as_bytes(),
+                Some(self.ca.pem().as_bytes()),
+            )
+            .expect("server TLS"),
             deny_list: None,
         }
     }
@@ -381,7 +384,6 @@ fn frontend(worker_tls: Option<WorkerTls>) -> SocketAddr {
             ttl: Duration::from_secs(60),
             dwell: Duration::from_secs(60),
             replication: 2,
-            bootstrap: Duration::ZERO,
         },
     };
     let bound = bind_server_with_state(
