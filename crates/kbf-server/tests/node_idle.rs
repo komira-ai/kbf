@@ -19,7 +19,9 @@ use std::time::Duration;
 
 use hooked::Hooked;
 use kbf_map::{MemberId, MemberState};
-use kbf_server::members::{Members, MembershipConfig, PROTOCOL, Progress, Registrant};
+use kbf_server::members::{
+    Members, MembershipConfig, MembershipError, PROTOCOL, Progress, Registrant,
+};
 use kbf_server::storage_health::{
     Class, Debts, MemberReport, NotIdle, Report, Reported, Writes, node_idle, render,
     storage_health,
@@ -496,7 +498,7 @@ impl Pair {
 
     fn beat(&self, who: (MemberId, u64), said: Reported) {
         self.members
-            .heartbeat(who.0, who.1, Progress::CaughtUp, said)
+            .heartbeat(who.0, who.1, Progress::CaughtUp, said, None)
             .expect("beats");
     }
 }
@@ -662,4 +664,48 @@ fn a_membership_that_cannot_be_read_is_unreadable_and_held() {
     let refused = pair.members.node_idle(pair.a.0, 0).expect_err("unreadable");
     assert!(matches!(&refused, NotIdle::Unreadable(why) if why.contains("unreadable")));
     assert_eq!(refused.class(), Class::Held);
+}
+
+// Catches a report written for a member by a caller that does not hold it (#978's holder
+// check runs before the row is rewritten): a node cannot say another node has no open writes
+// and owes nothing, which would let a rollout stop that node. The refused report leaves the
+// debts and the writes unknown; the holder's own is taken. Mutant: the report written before
+// the holder is asked.
+#[test]
+fn a_caller_that_does_not_hold_the_member_cannot_report_for_it() {
+    let pair = Pair::new();
+    let a = pair.a;
+    let quiet_for_a = quiet_report(9);
+    let refuses = |_: &str| false;
+    let refused = pair
+        .members
+        .heartbeat(a.0, a.1, Progress::CaughtUp, quiet_for_a, Some(&refuses));
+    assert!(
+        matches!(refused, Err(MembershipError::NotHolder(id)) if id == a.0),
+        "{refused:?}"
+    );
+    let health = pair.members.storage_health().expect("health");
+    assert_eq!(
+        (
+            health.nodes[0].open_writes,
+            health.nodes[0].repair_debts,
+            health.nodes[0].generation
+        ),
+        (None, None, None),
+        "nothing of a refused report is kept"
+    );
+
+    let holds = |_: &str| true;
+    pair.members
+        .heartbeat(a.0, a.1, Progress::CaughtUp, quiet_for_a, Some(&holds))
+        .expect("the holder reports");
+    let health = pair.members.storage_health().expect("health");
+    assert_eq!(
+        (
+            health.nodes[0].open_writes,
+            health.nodes[0].repair_debts,
+            health.nodes[0].generation
+        ),
+        (Some(0), Some(0), Some(9))
+    );
 }
