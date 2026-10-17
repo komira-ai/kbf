@@ -661,6 +661,46 @@ ignored, as RFC 9110 allows, and the whole blob is sent. Every `200` and `206` s
 
 Errors are JSON, `{"error": "<why>"}`, as everywhere in this API.
 
+## `STALE_MAP` on a storage node's gRPC calls
+
+Not part of the HTTP API: the answer a storage node (`kbf storage`) gives over gRPC to a
+caller that routed a call by an older storage map than the node holds
+([architecture-v2](design/architecture-v2.md) section 6). It is listed here because
+callers (the frontend, the daemons) and tools read it from the wire.
+
+**The caller's generation** is on every call: field 1 (`map_generation`) of every
+`kbf.storage.v1` request (`ActionStore.Get`, `Prepare`, `Commit`), and the ASCII metadata
+entry `kbf-map-generation` (the decimal generation) on every other call:
+`ContentAddressableStorage.FindMissingBlobs`, `ByteStream.Read`, `Write` and
+`QueryWriteStatus`, and each `kbf.worker.v1.Segments` call. A call with no entry is
+generation 0, "no map seen". An entry that is not a decimal `u64` is `INVALID_ARGUMENT`.
+
+**The node's judgement**, made before the call reads anything (so no answer, not even
+"already stored", is given under a placement the node no longer holds). A node that is
+one of several (it is given a source of maps) and has no map yet fetches one the same way
+and serves no call, whatever the caller's generation, until it has one: `UNAVAILABLE`. A
+node that is not part of a multi-member farm has no such source and judges nothing.
+
+| the caller's generation | the node |
+|---|---|
+| equal to the node's | serves the call |
+| older than the node's (0 included) | answers `STALE_MAP` |
+| newer than the node's, or the node has no map yet | fetches the map, waiting at most 2 seconds, then judges again: serves it if the node is now at the caller's generation, `STALE_MAP` if past it; `UNAVAILABLE` if no map came |
+
+**The encoding of `STALE_MAP`:** the gRPC status `FAILED_PRECONDITION` with the trailing
+metadata entry `kbf-map-generation: <n>` (decimal), the node's generation. The message
+is words for a log and is never matched. `FAILED_PRECONDITION` alone is not `STALE_MAP`:
+an action-cache write refused for a closure blob the node does not hold answers that code
+too, and carries no such entry. A reader takes the status for `STALE_MAP` only with both
+the code and the entry, and takes the entry for a number only if it is decimal.
+
+**What the caller does:** fetches a map of generation `<n>` or newer (the next `MapUpdate`
+on its session, or a `MapRequest`: [worker-protocol.md](design/worker-protocol.md)) and
+runs the call again, once. A second `STALE_MAP`, or a fetch that brings no newer map, is
+treated as `UNAVAILABLE`. `UNAVAILABLE` for a caller ahead of the node is the node's
+lost push: the caller's map may be the right one, so the caller tries again, and the
+node's next push makes the call succeed.
+
 ## Planned
 
 `/v1/software`, `/v1/rollouts` and the per-node update state of
