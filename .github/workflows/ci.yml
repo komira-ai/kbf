@@ -12,7 +12,7 @@ on:
   pull_request:
   merge_group:
   push:
-    branches: [main]
+    branches: [main, feature/arch-v2]
 
 permissions: {}
 
@@ -395,7 +395,10 @@ jobs:
   # here (the Linux jobs run the same tests against /proc, where the network is not
   # enforced); the daemon binary is built and started with each driver, which
   # detects the node through sysctl.
+  # Not run for a pull request into feature/arch-v2 (the macOS pool is small and a feature
+  # merge does not wait on it); it runs on pushes to feature/arch-v2 and on all else.
   native-macos:
+    if: ${{ github.event_name != 'pull_request' || github.base_ref != 'feature/arch-v2' }}
     runs-on: macos-latest
     timeout-minutes: 30
     permissions:

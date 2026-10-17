@@ -60,6 +60,7 @@ mod runtime;
 pub mod stop;
 pub mod stores;
 pub mod swap;
+mod traverse;
 pub mod verify_cert;
 
 #[cfg(test)]

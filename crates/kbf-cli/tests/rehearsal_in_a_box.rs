@@ -135,6 +135,20 @@ fn connected(api: u16) -> Option<Vec<String>> {
     Some(ids)
 }
 
+/// How many storage members `GET /v1/members` lists, and whether every one is `active`: a
+/// node that registered rebuilds its index first (`catching_up`), and each promotion is a
+/// new map generation, which a client that wrote meanwhile would be told is stale.
+fn members_active(api: u16) -> Option<(usize, bool)> {
+    let (code, body) = get(api, "/v1/members")?;
+    (code == 200).then_some(())?;
+    let view: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let members = view["members"].as_array()?;
+    Some((
+        members.len(),
+        members.iter().all(|m| m["state"] == "active"),
+    ))
+}
+
 /// What every process of the farm is told about the frontend.
 struct Wiring {
     reapi: u16,
@@ -365,6 +379,9 @@ impl Farm {
         });
         self.wait("every node connected to the frontend", |f| {
             (connected(f.api)? == f.node_ids).then_some(())
+        });
+        self.wait("every storage member active", |f| {
+            (members_active(f.api)? == (f.storage_nodes, true)).then_some(())
         });
     }
 
