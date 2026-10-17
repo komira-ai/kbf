@@ -103,10 +103,6 @@ pub enum HostError {
     NoFlag { bin: HostPath, flag: String },
 
     // install-units --mode
-    #[error(
-        "kbf {0} is not built yet: its unit would exit 2 at start, so there is nothing to install"
-    )]
-    NotBuilt(&'static str),
     #[error("{0} names no User= or root: kbf runs as a user of its own")]
     RunsAsRoot(String),
     #[error(transparent)]
