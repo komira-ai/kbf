@@ -40,6 +40,19 @@ async fn a_flushed_copy_damaged_past_its_first_window_fails_the_read_unmarked() 
     assert_eq!(farm.log.unreachable(at.object), None);
 }
 
+/// Catches a whole-blob read over a write tier that keeps one window or joins the
+/// windows out of order: a 12 MiB blob staged and not yet flushed is a window of 8 MiB
+/// and one of 4 MiB, and `read_blob` returns all of it, in order. Mutant: `gather`
+/// answering its first window (an 8 MiB blob).
+#[tokio::test]
+async fn a_whole_read_of_a_staged_blob_over_one_window_joins_the_windows() {
+    let farm = Farm::new(Capabilities::default());
+    let cache = farm.start(GIB).await;
+    let b = TestBlob::new(44, 12 << 20);
+    cache.store_blobs(vec![b.verified()]).await.expect("stored");
+    assert_eq!(cache.read_blob(&b.digest).await.expect("read"), b.bytes);
+}
+
 /// Catches a damaged flushed copy that fails a read the store can answer, or marks the
 /// object: a blob of one window whose local copy is damaged is read again from the
 /// store, whole and right, and nothing is marked.
