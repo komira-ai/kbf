@@ -12,7 +12,16 @@ use crate::types::{
 
 /// A durable, ordered key-value store with transactions, counters, time-to-live keys and
 /// a change feed. The contract is clauses C1 to C8 of the architecture design; the
-/// `conformance` module is the executable form every backend must pass.
+/// `conformance` module (feature `test-support`) is the executable form every backend
+/// must pass.
+///
+/// # Expiry
+/// A key put with a time to live is live while the store's clock reads strictly before
+/// its `expires_at`, and expired from the reading that equals it: at exactly
+/// `expires_at` a read does not see the key, a scan does not return it, `Cond::Absent`
+/// holds and a `Cond::Version` on it does not, and [`Store::reap_expired`] removes it. So
+/// a key put with a ttl of `d` at reading `t` is live for `t..t + d` and gone at `t + d`.
+/// Every backend judges this the same way (C4 checks the boundary).
 ///
 /// Calls block until done; the SQLite backend's writer thread and the Postgres backend's
 /// connections are behind them. A caller on an async runtime calls from a blocking task.
@@ -27,7 +36,8 @@ pub trait Store: Send + Sync {
     /// [`StoreError`] when the backend fails; no result in the batch is then durable.
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError>;
 
-    /// The live value of `key`. An expired key is absent whether or not it was reaped.
+    /// The live value of `key`. An expired key (its clock reading is at or past
+    /// `expires_at`, see the type's Expiry rules) is absent whether or not it was reaped.
     ///
     /// # Errors
     /// [`StoreError`] when the backend fails.
@@ -131,7 +141,8 @@ impl Span {
         })
     }
 
-    /// The span as borrowed bounds, the form `BTreeMap::range` takes.
+    /// The span as borrowed bounds, the form `BTreeMap::range` takes (the fake's).
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn bounds(&self) -> (Bound<&str>, Bound<&str>) {
         let lower = if self.lower.included {
             Bound::Included(self.lower.key.as_str())
