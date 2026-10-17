@@ -9,6 +9,12 @@
 //! is never listed, and the authorizer is asked once per request about each instance the
 //! index holds.
 
+#![allow(
+    clippy::result_large_err,
+    reason = "the Err is the answer to send, built once on a refusal; boxing it would only \
+              move it"
+)]
+
 use std::sync::Arc;
 
 use axum::extract::{Path, State};

@@ -10,6 +10,12 @@
 //! report), `cached_pass` cells (they need the hits of test shapes in windows) and run
 //! length encoding.
 
+#![allow(
+    clippy::result_large_err,
+    reason = "the Err is the answer to send, built once on a refusal; boxing it would only \
+              move it"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 

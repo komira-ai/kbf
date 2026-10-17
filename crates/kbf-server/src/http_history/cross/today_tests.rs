@@ -55,7 +55,7 @@ fn a_digest_is_the_hash_and_the_size_as_the_api_writes_it() {
 #[test]
 fn a_class_is_one_of_the_apis_words() {
     let known = ["class", "page_size", "page_token"];
-    let q = |text: &str| Query::parse(text, &known).ok().expect("a query");
+    let q = |text: &str| Query::parse(text, &known).expect("a query");
     for (outcome, name) in CLASSES.into_iter().zip([
         "unspecified",
         "ok",
@@ -66,12 +66,10 @@ fn a_class_is_one_of_the_apis_words() {
         "lost",
         "cancelled",
     ]) {
-        let (_, _, wanted) = paging(&q(&format!("class={name}")), "/r")
-            .ok()
-            .expect("a class");
+        let (_, _, wanted) = paging(&q(&format!("class={name}")), "/r").expect("a class");
         assert_eq!(wanted, Some(outcome), "{name}");
     }
-    let (size, after, wanted) = paging(&q(""), "/r").ok().expect("no filter");
+    let (size, after, wanted) = paging(&q(""), "/r").expect("no filter");
     assert_eq!((size, after, wanted), (100, None, None));
     assert!(paging(&q("class=exploded"), "/r").is_err());
     assert!(paging(&q("page_size=0"), "/r").is_err());
@@ -82,16 +80,13 @@ fn a_class_is_one_of_the_apis_words() {
 #[test]
 fn a_position_is_the_number_a_page_named() {
     let known = ["page_size", "page_token"];
-    let first = Query::parse("", &known).ok().expect("a query");
+    let first = Query::parse("", &known).expect("a query");
     let token = first.token("/r", "41");
-    let next = Query::parse(&format!("page_token={token}"), &known)
-        .ok()
-        .expect("a query");
+    let next = Query::parse(&format!("page_token={token}"), &known).expect("a query");
     assert_eq!(paging(&next, "/r").ok().map(|p| p.1), Some(Some(41)));
     assert!(paging(&next, "/other").is_err());
-    let words = Query::parse(&format!("page_token={}", first.token("/r", "x")), &known)
-        .ok()
-        .expect("a query");
+    let words =
+        Query::parse(&format!("page_token={}", first.token("/r", "x")), &known).expect("a query");
     assert!(paging(&words, "/r").is_err());
 }
 
@@ -121,9 +116,7 @@ fn a_run_is_listed_with_its_links_times_and_shape() {
 #[test]
 fn a_page_says_it_is_partial_and_from_when_it_covers() {
     let known = ["class", "page_size", "page_token"];
-    let q = Query::parse("class=failed&page_size=3", &known)
-        .ok()
-        .expect("a query");
+    let q = Query::parse("class=failed&page_size=3", &known).expect("a query");
     let page = TodayPage {
         runs: vec![run(1)],
         next: Some(7),
