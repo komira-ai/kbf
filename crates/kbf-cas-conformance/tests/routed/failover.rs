@@ -312,26 +312,28 @@ fn a_write_queued_when_the_read_is_dropped_writes_nothing() {
         let path = directory("failover-queued").join("blob");
         let mut file = with_head(&path).await;
         let (free, freed) = std::sync::mpsc::channel::<()>();
+        let mut blocker = None;
 
         let queue = async {
             while owner.reads.load(Ordering::SeqCst) == 0 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
             let (busy, busied) = tokio::sync::oneshot::channel();
-            let blocker = tokio::task::spawn_blocking(move || {
+            let busy_thread = tokio::task::spawn_blocking(move || {
                 let _ = busy.send(());
                 let _ = freed.recv();
             });
             busied.await.expect("the blocking thread is busy");
             first.add_permits(1);
+            blocker = Some(busy_thread);
             tokio::time::sleep(Duration::from_millis(100)).await;
-            blocker
         };
-        let blocker = tokio::select! {
+        tokio::select! {
             answer = owners.cas.read_to(&digest, &mut file) => panic!("the read ended: {answer:?}"),
-            blocker = queue => blocker,
-        };
+            () = queue => {}
+        }
         free.send(()).expect("the blocker waits");
+        let blocker = blocker.expect("the blocking thread was made busy");
         blocker.await.expect("the blocker");
         tokio::task::spawn_blocking(|| ())
             .await
