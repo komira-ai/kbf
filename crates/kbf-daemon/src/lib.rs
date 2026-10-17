@@ -89,6 +89,7 @@ pub use cpu_pool::CpuPool;
 pub use daemon::{Daemon, Event, PROTOCOL_VERSION, SessionError, superseded};
 pub use driver_watch::{DriverPart, DriverWatch};
 pub use kbf_mapsync::MapHolder;
+pub use kbf_route::Liveness;
 #[cfg(target_os = "linux")]
 pub use local::{LOCAL_DRIVER, LocalRuntime};
 pub use map::{HeldMaps, REFETCH_WITHIN};
