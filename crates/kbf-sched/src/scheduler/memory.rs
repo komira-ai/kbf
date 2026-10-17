@@ -664,6 +664,29 @@ mod tests {
         assert_eq!(b, c, "the report of forgotten keys is not state");
     }
 
+    /// Catches: equality that ignores the next stamp (two schedulers that rank the next
+    /// raise differently called equal) or the bound (two that forget at different sizes
+    /// called equal), when the floors and their order match.
+    #[test]
+    fn floors_with_the_same_rows_differ_in_the_next_stamp_or_the_bound() {
+        let mut a = Floors::new(4);
+        a.raise(&key(1), GIB);
+        let same = a.clone();
+        assert_eq!(a, same);
+
+        let mut later = a.clone();
+        later.next += 1;
+        assert_eq!(later.asks, a.asks);
+        assert_eq!(later.order, a.order);
+        assert_ne!(a, later, "the next stamp is state");
+
+        let mut wider = a.clone();
+        wider.bound += 1;
+        assert_eq!(wider.asks, a.asks);
+        assert_eq!(wider.order, a.order);
+        assert_ne!(a, wider, "the bound is state");
+    }
+
     /// A scheduler fed one input at a time at farm time `now`, every commit fed
     /// straight back, as the single-node server does; the `Start`s are kept.
     struct Sim {
