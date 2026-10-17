@@ -58,6 +58,14 @@ enum Defect {
     MissingIsEmpty,
     /// Claims no Object Lock and silently stores a retained object unlocked.
     DropsRetention,
+    /// Breaks nothing.
+    Sound,
+    /// Never ends a listing: every page, even an empty one, has a token after it.
+    ListNeverEnds,
+    /// Refuses to delete one object (the first round-trip key) with a server error.
+    RefusesOneDelete,
+    /// Answers a delete of a retained object with a 403, as S3 does, not with `Locked`.
+    DeniesRetainedDelete,
 }
 
 struct Broken {
@@ -138,7 +146,21 @@ impl ObjectStore for Broken {
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
-        self.inner.delete(key).await
+        let server_error = |status, code: &str| ObjectStoreError::Service {
+            status,
+            code: code.into(),
+            message: "refused".into(),
+        };
+        match self.defect {
+            Defect::RefusesOneDelete if key.as_str().ends_with("/round-trip-1") => {
+                Err(server_error(500, "InternalError"))
+            }
+            Defect::DeniesRetainedDelete => match self.inner.delete(key).await {
+                Err(ObjectStoreError::Locked(_)) => Err(server_error(403, "AccessDenied")),
+                other => other,
+            },
+            _ => self.inner.delete(key).await,
+        }
     }
 
     async fn list(
@@ -198,6 +220,15 @@ impl ObjectStore for Broken {
                 let mut page = self.inner.list(prefix, after, max_keys).await?;
                 page.objects
                     .retain(|o| !o.key.as_str()[prefix.as_str().len()..].contains('/'));
+                Ok(page)
+            }
+            Defect::ListNeverEnds => {
+                let mut page = self.inner.list(prefix, after, max_keys).await?;
+                let last = page
+                    .objects
+                    .last()
+                    .map_or_else(|| ObjectKey::new("x").unwrap(), |o| o.key.clone());
+                page.next = Some(ListToken::after(&last));
                 Ok(page)
             }
             Defect::PagesByPosition => self.list_by_position(prefix, after, max_keys).await,
@@ -490,4 +521,174 @@ fn a_store_that_answers_missing_keys_with_empty_bytes_fails() {
 fn a_store_that_drops_retention_silently_fails() {
     let report = run(Defect::DropsRetention);
     assert_fails_only(&report, &[Check::ObjectLock]);
+}
+
+/// Every key in the bucket, in order.
+fn bucket_keys<S: ObjectStore>(store: &S) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut after = None;
+    loop {
+        let page = block_on(store.list(&KeyPrefix::default(), after.as_ref(), PageSize::MAX))
+            .expect("the in-memory store lists");
+        keys.extend(page.objects.into_iter().map(|o| o.key.to_string()));
+        match page.next {
+            Some(t) => after = Some(t),
+            None => return keys,
+        }
+    }
+}
+
+/// Keys of other users of the bucket, none of them under `conformance/`: one sorting
+/// before the run's prefix, one sharing its text without the `/`, one after, and one
+/// holding the prefix inside a longer key.
+const NEIGHBOURS: [&str; 4] = [
+    "a/keep",
+    "conformance-keep",
+    "other/conformance/keep",
+    "zz/keep",
+];
+
+/// A bucket with the neighbours in it, and a run against it under `conformance/`.
+fn run_beside_neighbours(defect: Defect) -> (Broken, Report) {
+    let store = Broken::new(defect);
+    for name in NEIGHBOURS {
+        let k = ObjectKey::new(name).unwrap();
+        block_on(store.put_new(&k, Bytes::from_static(b"mine"), None)).unwrap();
+    }
+    let prefix = KeyPrefix::new("conformance/").unwrap();
+    let report = block_on(conformance::run(&store, &prefix));
+    (store, report)
+}
+
+fn neighbours() -> Vec<String> {
+    NEIGHBOURS.map(str::to_owned).to_vec()
+}
+
+/// Catches: a suite that leaves its objects in the bucket (the page-cap check alone
+/// writes 1001 of them): after a run against a store with Object Lock only the
+/// retained object remains under the prefix, reported as retained and not as a failure.
+#[test]
+fn a_run_deletes_what_it_wrote_except_the_retained_object() {
+    let (store, report) = run_beside_neighbours(Defect::Sound);
+    assert!(report.passed(), "{report}");
+    let locked = ObjectKey::new("conformance/locked").unwrap();
+    assert_eq!(report.cleanup.retained, [locked], "{report}");
+    assert!(report.cleanup.failed.is_empty(), "{report}");
+    // More than the page-cap check's own 1001.
+    assert!(report.cleanup.deleted > 1001, "{report}");
+    let mut want = neighbours();
+    want.insert(2, "conformance/locked".to_owned());
+    assert_eq!(bucket_keys(&store.inner), want, "{report}");
+    assert!(report.to_string().contains("retained conformance/locked"));
+}
+
+/// Catches: a cleanup that skips the objects of a store without Object Lock, or that
+/// reaches outside the run's prefix: the bucket holds exactly the neighbours.
+#[test]
+fn a_run_against_a_store_without_object_lock_leaves_only_the_neighbours() {
+    let store = MemoryStore::new(Capabilities::default());
+    for name in NEIGHBOURS {
+        let k = ObjectKey::new(name).unwrap();
+        block_on(store.put_new(&k, Bytes::from_static(b"mine"), None)).unwrap();
+    }
+    let prefix = KeyPrefix::new("conformance/").unwrap();
+    let report = block_on(conformance::run(&store, &prefix));
+    assert!(report.passed(), "{report}");
+    assert!(report.cleanup.retained.is_empty(), "{report}");
+    assert_eq!(bucket_keys(&store), neighbours(), "{report}");
+}
+
+/// Catches: a cleanup that runs only when every check passed, or that hides the
+/// failure: the failed checks stay in the report and their objects are gone.
+#[test]
+fn a_failing_check_still_gets_its_objects_deleted_and_stays_reported() {
+    let (store, report) = run_beside_neighbours(Defect::IgnoresRange);
+    assert_fails_only(&report, &[Check::RangeBoundaries, Check::FooterReads]);
+    assert!(!report.passed(), "{report}");
+    assert!(report.cleanup.failed.is_empty(), "{report}");
+    let mut want = neighbours();
+    want.insert(2, "conformance/locked".to_owned());
+    assert_eq!(bucket_keys(&store.inner), want, "{report}");
+}
+
+/// Catches: a cleanup that takes S3's 403 on a retained object for a failure (a run
+/// against a real bucket would then always fail), or that fails to see the object.
+#[test]
+fn a_403_on_the_retained_object_is_retained_not_failed() {
+    let (store, report) = run_beside_neighbours(Defect::DeniesRetainedDelete);
+    assert!(report.passed(), "{report}");
+    let locked = ObjectKey::new("conformance/locked").unwrap();
+    assert_eq!(report.cleanup.retained, [locked], "{report}");
+    assert_eq!(
+        bucket_keys(&store.inner).len(),
+        NEIGHBOURS.len() + 1,
+        "{report}"
+    );
+}
+
+/// Catches: a cleanup that stops at the first refused delete, or that takes any refusal
+/// for a retained object: the one refusal is a cleanup failure naming the key, every
+/// other object is deleted, and the run does not pass.
+#[test]
+fn a_refused_delete_is_a_cleanup_failure_and_the_rest_is_deleted() {
+    let (store, report) = run_beside_neighbours(Defect::RefusesOneDelete);
+    assert!(report.failures().next().is_none(), "{report}");
+    assert!(!report.passed(), "{report}");
+    assert_eq!(report.cleanup.failed.len(), 1, "{report}");
+    assert!(
+        report.cleanup.failed[0].starts_with("delete conformance/round-trip-1: "),
+        "{report}"
+    );
+    assert!(
+        report
+            .to_string()
+            .contains("FAIL cleanup: delete conformance/round-trip-1")
+    );
+    let mut want = neighbours();
+    want.insert(2, "conformance/locked".to_owned());
+    want.insert(3, "conformance/round-trip-1".to_owned());
+    assert_eq!(bucket_keys(&store.inner), want, "{report}");
+}
+
+/// Catches: a cleanup that hides a listing that fails, or gives up on it: the checks
+/// that list fail as before, the cleanup says it could not list, and what the first
+/// page held is deleted.
+#[test]
+fn a_listing_that_fails_during_cleanup_is_reported_with_the_checks() {
+    let (store, report) = run_beside_neighbours(Defect::RefusesSecondPages);
+    assert!(report.failures().count() > 1, "{report}");
+    assert!(!report.passed(), "{report}");
+    let failed = &report.cleanup.failed;
+    assert_eq!(failed.len(), 1, "{report}");
+    assert!(failed[0].contains("for cleanup"), "{report}");
+    assert!(failed[0].contains("400 InvalidArgument"), "{report}");
+    // The first page of 1000 keys went; the page-cap check's other keys remain.
+    let first_page = report.cleanup.deleted + report.cleanup.retained.len();
+    assert_eq!(first_page, 1000, "{report}");
+    assert!(
+        bucket_keys(&store.inner).len() > NEIGHBOURS.len() + 1,
+        "{report}"
+    );
+}
+
+/// Catches: a cleanup that follows a listing that never ends for ever: it gives up
+/// after its page limit, says so, and has deleted every key the listing gave once.
+#[test]
+fn a_listing_that_never_ends_stops_the_cleanup_with_a_failure() {
+    let (store, report) = run_beside_neighbours(Defect::ListNeverEnds);
+    let failed = &report.cleanup.failed;
+    assert_eq!(failed.len(), 1, "{report}");
+    assert!(failed[0].contains("no end after 100 pages"), "{report}");
+    assert!(!report.passed(), "{report}");
+    assert_eq!(
+        bucket_keys(&store.inner),
+        [
+            "a/keep",
+            "conformance-keep",
+            "conformance/locked",
+            "other/conformance/keep",
+            "zz/keep"
+        ],
+        "{report}"
+    );
 }

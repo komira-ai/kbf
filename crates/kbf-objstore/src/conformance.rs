@@ -10,8 +10,10 @@
 //! object and keep it readable, and a store not claiming Object Lock must refuse a
 //! retention date rather than store the object unlocked.
 //!
-//! Objects written under Object Lock cannot be removed until their date (one hour), so
-//! give each run a fresh prefix when running against a real store.
+//! When the checks are done, [`run`] deletes everything under the run's prefix, also when
+//! a check failed, and reports it in [`Report::cleanup`]. Objects written under Object
+//! Lock cannot be removed until their date (one hour): they are listed as retained, not
+//! failed, so give each run a fresh prefix when running against a real store.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -23,12 +25,16 @@ use futures::{StreamExt as _, TryStreamExt as _, stream};
 use kbf_segments::{SegmentWriter, layout::footer_len};
 use kbf_types::Digest;
 
+pub use cleanup::Cleanup;
+
 use crate::footers::{self, FooterRead, FooterReads};
 use crate::{
     ByteRange, Capabilities, KeyPrefix, ListToken, ObjectInfo, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
 
+/// The name of the one object the suite retains, under the run's prefix.
+const LOCK_KEY: &str = "locked";
 /// How long the Object Lock check retains its object.
 const LOCK_FOR: Duration = Duration::from_secs(3600);
 /// Objects the list check writes; with pages of [`LIST_PAGE`], the last page is short.
@@ -105,13 +111,16 @@ pub enum Outcome {
 pub struct Report {
     /// One entry per [`Check`].
     pub results: Vec<(Check, Outcome)>,
+    /// What deleting the run's objects did.
+    pub cleanup: Cleanup,
 }
 
 impl Report {
-    /// Whether no check failed.
+    /// Whether no check failed and the run's objects could be deleted (objects the
+    /// store keeps under retention do not count against it).
     #[must_use]
     pub fn passed(&self) -> bool {
-        self.failures().next().is_none()
+        self.failures().next().is_none() && self.cleanup.failed.is_empty()
     }
 
     /// The checks that failed, with what went wrong.
@@ -148,11 +157,20 @@ impl fmt::Display for Report {
                 Outcome::Failed(why) => writeln!(f, "FAIL {check:?}: {why}")?,
             }
         }
+        let c = &self.cleanup;
+        writeln!(f, "cleanup: deleted {}", c.deleted)?;
+        for k in &c.retained {
+            writeln!(f, "cleanup: retained {k} (under Object Lock)")?;
+        }
+        for why in &c.failed {
+            writeln!(f, "FAIL cleanup: {why}")?;
+        }
         Ok(())
     }
 }
 
-/// Runs every check against `store`, writing only under `prefix`.
+/// Runs every check against `store`, writing only under `prefix`, then deletes every
+/// object under `prefix`.
 pub async fn run<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Report {
     let caps = store.capabilities();
     let mut results = Vec::new();
@@ -195,7 +213,9 @@ pub async fn run<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Report {
         refuses_overwrite(store, prefix, caps).await,
     );
     record(Check::ObjectLock, object_lock(store, prefix, caps).await);
-    Report { results }
+    // After every check, whatever they said: a failed check leaves objects too.
+    let cleanup = cleanup::sweep(store, prefix).await;
+    Report { results, cleanup }
 }
 
 type CheckResult = Result<Outcome, String>;
@@ -208,6 +228,7 @@ macro_rules! ensure {
     };
 }
 
+mod cleanup;
 mod list;
 
 fn key(prefix: &KeyPrefix, name: &str) -> Result<ObjectKey, String> {
@@ -599,7 +620,7 @@ async fn object_lock<S: ObjectStore>(
     prefix: &KeyPrefix,
     caps: Capabilities,
 ) -> CheckResult {
-    let k = key(prefix, "locked")?;
+    let k = key(prefix, LOCK_KEY)?;
     let body = pattern(32, 5);
     let until = SystemTime::now() + LOCK_FOR;
     if !caps.object_lock {
