@@ -116,15 +116,16 @@ pub(crate) fn cgroup_tree(bin: &Path) -> Vec<String> {
 /// cannot be left to the binary (the daemon half dials it by the `--server` flag), and a
 /// port number probed on `127.0.0.1` is free only until a test binding `127.0.0.1:0`, or
 /// a connection's source port, takes it. So the address is a loopback address of this
-/// call's own (`127.x.y.z`; all of `127.0.0.0/8` is the host's own on Linux) that nothing
-/// else binds, with a port probed on it: the one thing that could take it is a process
-/// that chose the same address.
+/// call's own (127 and three more bytes; the whole loopback block is the host's own on
+/// Linux) that nothing else binds, with a port probed on it: the one thing that could
+/// take it is a process that chose the same address.
 pub(crate) fn worker_addr() -> SocketAddr {
     static CALLS: AtomicU32 = AtomicU32::new(0);
     let call = CALLS.fetch_add(1, Ordering::Relaxed);
     assert!(call < 15, "more addresses than one process can tell apart");
-    // 23 bits of process and call number under a leading 1 bit: never 127.0.x.y, so
-    // never 127.0.0.1, and with a call number under 15, never 127.255.255.255.
+    // 23 bits of process and call number under a leading 1 bit: the second byte is never
+    // 0, so never the usual loopback address, and with a call number under 15 the three
+    // bytes are never all ones (the block's broadcast address).
     let host = ((std::process::id().wrapping_mul(16) + call) & 0x7F_FFFF) | 0x80_0000;
     let [_, a, b, c] = host.to_be_bytes();
     let port = std::net::TcpListener::bind(SocketAddr::from(([127, a, b, c], 0)))
