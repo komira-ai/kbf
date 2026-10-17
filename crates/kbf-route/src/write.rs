@@ -142,7 +142,7 @@ impl Router {
             .copying
             .acquire_many(u32::try_from(room).unwrap_or(self.copy_kib))
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .ok();
         let bytes = if digest.size_bytes == 0 {
             Bytes::new()
         } else {
