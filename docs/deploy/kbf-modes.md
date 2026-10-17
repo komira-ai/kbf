@@ -49,6 +49,7 @@ It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/sy
 | `state-store` | a `--state-store` that is not `sqlite:///<absolute path>`: a Postgres URI (`postgres://` or `postgresql://`; postgres is not wired yet), any other scheme, an empty or relative SQLite path, or a value that names a variable (below) |
 | `traverse` | on the node, a `file://` `--hot-store` with an existing directory above it that the unit's `User=` cannot enter (no execute bit for it as owner, group member or other); the message names the directory, its mode and owner, and the user. `install-units --mode` refuses it too, before any step |
 | `ports` | two of a unit's listeners (`--listen`, `--worker-listen`, `--api-listen`, `--storage-listen`) on one port |
+| `restart` | a node unit (`storage`, `daemon`, `storage-and-daemon`) without `RestartSec=5` and, in `[Unit]`, `StartLimitIntervalSec=0`: systemd's defaults (100 ms, 5 starts in 10 s) end a quickly repeating failure in `start-limit-hit` with the unit down. The frontend keeps `Restart=on-failure` without them: an old frontend that drained after a handover exits 0 and must stay down |
 | `stop` | a mode that drains on SIGTERM (every mode but `daemon`) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
 | `parse` | flags that `kbf <mode>` refuses |
 
