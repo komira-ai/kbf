@@ -26,13 +26,12 @@ use tokio::net::TcpStream;
 const TOKEN: &str = "kbf-test-token-0123456789abcdef0123456789";
 const OPERATOR: &str = "Authorization: Bearer kbf-test-token-0123456789abcdef0123456789\r\nContent-Type: application/json\r\n";
 
-/// The bootstrap is off, so a registration is `Joining`, the state an operator promotes.
+/// One replica, rows living 30 s.
 fn config() -> MembershipConfig {
     MembershipConfig {
         ttl: Duration::from_secs(30),
         dwell: Duration::from_secs(120),
         replication: 1,
-        bootstrap: Duration::ZERO,
     }
 }
 
@@ -110,7 +109,7 @@ fn start(state: Option<StateStore>) -> Server {
     }
 }
 
-/// A server over a store with one `Joining` member (id 1) registered through another
+/// A server over a store with one `Joining` member (id 1) set to `Joining` through another
 /// frontend, and that frontend to read the result with.
 fn joined() -> (Server, Members, MemberId) {
     let clock = Arc::new(ManualClock::default());
@@ -131,8 +130,12 @@ fn joined() -> (Server, Members, MemberId) {
             progress: Progress::CaughtUp,
         })
         .expect("register");
+    // A registration is Active; the operator promotes a Joining member, so make one.
+    let map = other
+        .set_state(registered.id, MemberState::Joining)
+        .expect("joining");
     assert_eq!(
-        registered.map.member(registered.id).map(|m| m.state),
+        map.member(registered.id).map(|m| m.state),
         Some(MemberState::Joining)
     );
     (start(Some(state)), other, registered.id)
