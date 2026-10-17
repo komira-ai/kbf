@@ -488,18 +488,8 @@ where
 {
     let socket = bind_storage_socket(listener)?;
     let maps = Arc::new(MapHolder::new());
-    let keys = ObjectKeys {
-        root: prefix_root(&prefix, log)?,
-        legacy: prefix,
-    };
-    let (cache, joiner) = match flags.joiner(socket.addr(), Arc::clone(&maps))? {
-        Some(mut joiner) => {
-            let joined = joiner.join().await;
-            let cache = open_registered(meta, store, keys, &joined).await?;
-            (cache, Some((joiner, joined)))
-        }
-        None => (Cache::open_under(meta, store, keys).await?, None),
-    };
+    let (cache, joiner) =
+        open_cache(flags, socket.addr(), &maps, (meta, store, prefix, log)).await?;
     let cache = cache.with_writes(flags.server.write_config());
     let (cache, tier) = crate::write_tier::attach(cache, hot).await?;
     let cache = Arc::new(cache);
@@ -526,6 +516,35 @@ where
         _pass,
         maps,
         _joiner,
+    })
+}
+
+/// The cache of a node bound at `bound`. With `--frontend` the node registers first (retrying
+/// until the frontend answers), so the cache writes as the registration's member and boot
+/// ([`open_registered`]); the registration and what it gave come back for the heartbeats
+/// ([`Joiner::keep`]). Without it the cache writes in an epoch of its own log.
+/// `kbf storage` and the storage half of `kbf storage-and-daemon` both open theirs here.
+///
+/// # Errors
+/// A TLS file or the frontend URL is refused, or the cache cannot be opened
+/// ([`open_registered`]).
+pub(crate) async fn open_cache<O: ObjectStore>(
+    flags: &StorageFlags,
+    bound: SocketAddr,
+    maps: &Arc<MapHolder>,
+    (meta, store, prefix, log): (RaftMetaLog<StdFs>, O, KeyPrefix, FarmLogId),
+) -> Result<(Cache<RaftMetaLog<StdFs>, O>, Option<(Joiner, Joined)>), Box<dyn Error>> {
+    let keys = ObjectKeys {
+        root: prefix_root(&prefix, log)?,
+        legacy: prefix,
+    };
+    Ok(match flags.joiner(bound, Arc::clone(maps))? {
+        Some(mut joiner) => {
+            let joined = joiner.join().await;
+            let cache = open_registered(meta, store, keys, &joined).await?;
+            (cache, Some((joiner, joined)))
+        }
+        None => (Cache::open_under(meta, store, keys).await?, None),
     })
 }
 
@@ -570,7 +589,19 @@ pub(crate) async fn open_registered<O: ObjectStore>(
         )
         .into());
     };
-    one_voter(meta.voters())?;
+    let voters = meta.voters();
+    open_among(meta, store, keys, (member, boot), voters).await
+}
+
+/// [`open_registered`] for a node named `(member, boot)`, over a log of `voters` voters.
+async fn open_among<O: ObjectStore>(
+    meta: RaftMetaLog<StdFs>,
+    store: O,
+    keys: ObjectKeys,
+    (member, boot): (NonZeroU64, NonZeroU64),
+    voters: usize,
+) -> Result<Cache<RaftMetaLog<StdFs>, O>, Box<dyn Error>> {
+    one_voter(voters)?;
     meta.raise_machine_version(MachineVersion::V4)?;
     Ok(Cache::open_node(meta, store, keys, NodeWriter::new(member, boot)).await?)
 }

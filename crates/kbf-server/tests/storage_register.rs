@@ -852,3 +852,120 @@ async fn joined_by(map: pb::Map) -> Arc<kbf_mapsync::MapHolder> {
     assert_eq!(joiner.beat(&joined).await.expect("beats"), 9);
     maps
 }
+
+/// Starts `kbf storage` (`half` false) or the storage half of `kbf storage-and-daemon`
+/// (`half` true) over `dir` with `--frontend` at `f`, writes `text` through its listener
+/// and stops it. A previous start's background tasks may still hold the directory's locks
+/// as it stops; the start is retried while they do.
+async fn write_as_registered(
+    f: &Frontend,
+    dir: &Path,
+    half: bool,
+    text: &str,
+) -> kbf_types::Digest {
+    let url = format!("--frontend=http://{}", f.worker);
+    let flags = flags(dir, &[url]).expect("flags");
+    let (addr, serving) = 'start: {
+        for _ in 0..500 {
+            let started = if half {
+                kbf_server::storage_half::start(&flags, never)
+                    .await
+                    .map(|n| (n.addr, tokio::spawn(async move { n.serve().await })))
+            } else {
+                start_storage(&flags, never)
+                    .await
+                    .map(|n| (n.addr, tokio::spawn(async move { n.serve().await })))
+            };
+            match started {
+                Ok(node) => break 'start node,
+                Err(e) if e.to_string().contains("Locked") => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("starts: {e}"),
+            }
+        }
+        panic!("the previous start never released its directory");
+    };
+    let channel = Endpoint::from_shared(format!("http://{addr}"))
+        .expect("endpoint")
+        .connect_lazy();
+    let digest = RemoteStorage::new(channel, 0)
+        .put(bytes::Bytes::from(text.to_owned()))
+        .await
+        .expect("a write is taken");
+    serving.abort();
+    let _ = serving.await;
+    digest
+}
+
+/// Who the node's metadata log, reopened from `dir` after the node stopped, says wrote
+/// the object that holds `digest`: `Some((member, boot))` for a node writer, `None` for
+/// an epoch writer.
+async fn written_by(dir: &Path, digest: &kbf_types::Digest) -> Option<(u64, u64)> {
+    use kbf_front::MetaLog as _;
+    let meta = 'open: {
+        for _ in 0..500 {
+            match kbf_server::RaftMetaLog::open_dir(
+                &dir.join("meta"),
+                kbf_meta::Retention::default(),
+                "kbf/",
+            )
+            .await
+            {
+                Ok(meta) => break 'open meta,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        panic!("the node never released its metadata directory");
+    };
+    let digest = *digest;
+    let answer = meta
+        .query(move |state| state.blob(&digest))
+        .await
+        .expect("query");
+    let kbf_meta::BlobAnswer::Present { location, .. } = answer else {
+        panic!("the log does not hold the blob: {answer:?}");
+    };
+    match location.object.writer() {
+        kbf_meta::Writer::Node(w) => Some((w.member().get(), w.boot().get())),
+        kbf_meta::Writer::Epoch(_) => None,
+    }
+}
+
+/// Catches: a registered node that names its objects in an epoch of its own log (mutant:
+/// `Cache::open_under` taken under `--frontend` in `assemble`, or `Cache::open` in the
+/// storage half), which a wiped node would then name again. A node of each kind
+/// registers with a frontend and writes: its metadata log says the object was written by
+/// the node writer of that registration (member and boot), not an epoch. The log can only
+/// say so if it committed `SetWriter` for that member and boot.
+#[tokio::test]
+async fn a_registered_node_writes_objects_named_by_member_and_boot() {
+    for (half, name) in [(false, "keys-node"), (true, "keys-half")] {
+        let (f, dir) = (frontend(None), dir(name));
+        let digest = write_as_registered(&f, &dir, half, "a registered node's blob").await;
+        let by = written_by(&dir, &digest).await;
+        assert!(by.is_some_and(|(m, b)| m > 0 && b > 0), "{name}: {by:?}");
+    }
+}
+
+/// Catches: a storage node that loses its metadata directory and names new objects as
+/// the old ones (the storage half of `kbf storage-and-daemon` opened its cache before it
+/// registered, as an epoch writer of its own log). Each kind of node writes, loses its
+/// metadata directory (the cold store stays), registers again at the same frontend and
+/// writes: both blobs are node-named, by pairs of `(member, boot)` that differ.
+#[tokio::test]
+async fn a_wiped_node_of_either_kind_never_reuses_its_keys() {
+    for (half, name) in [(false, "wipe-node"), (true, "wipe-half")] {
+        let (f, dir) = (frontend(None), dir(name));
+        let first = write_as_registered(&f, &dir, half, "before the wipe").await;
+        let before = written_by(&dir, &first).await;
+        std::fs::remove_dir_all(dir.join("meta")).expect("wipe");
+        let second = write_as_registered(&f, &dir, half, "after the wipe").await;
+        let after = written_by(&dir, &second).await;
+        assert!(
+            before.is_some() && after.is_some(),
+            "{name}: {before:?} {after:?}"
+        );
+        assert_ne!(before, after, "{name}: the wiped node is the same writer");
+    }
+}

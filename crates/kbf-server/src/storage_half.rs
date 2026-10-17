@@ -14,8 +14,10 @@
 //! - **The handle.** The [`Storage`] the listener serves, and the service over it
 //!   ([`kbf_storage::service::InProcess`]), are kept, for the daemon half.
 //!
-//! - **The map.** With `--frontend` the half registers and heartbeats as `kbf storage`
-//!   does, holds the maps the frontend sends in a [`kbf_mapsync::MapHolder`]
+//! - **The map.** With `--frontend` the half binds its listener, registers (retrying until
+//!   the frontend answers), opens its cache as the registration's member and boot (its
+//!   objects are named as `kbf storage`'s are), and heartbeats as `kbf storage`
+//!   does; it holds the maps the frontend sends in a [`kbf_mapsync::MapHolder`]
 //!   ([`StorageHalf::maps`]), and its listener answers every call UNAVAILABLE `no storage
 //!   map yet` until the first arrives (the daemon half, in the same process, calls the
 //!   service in-process; the listener's gate is a layer of the listener, so the daemon
@@ -32,7 +34,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_front::{Cache, CacheStorage, SegmentsConfig};
+use kbf_front::{CacheStorage, SegmentsConfig};
 use kbf_mapsync::MapHolder;
 use kbf_meta::Retention;
 use kbf_objstore::{FsStore, ObjectStore};
@@ -40,10 +42,10 @@ use kbf_storage::Storage;
 use kbf_storage::service::InProcess;
 use kbf_threads::disk::Statvfs;
 
-use crate::serve::{ServeError, StorageListener, bind_storage_shared};
+use crate::serve::{ServeError, StorageListener, bind_storage_socket, serve_storage_shared};
 use crate::start::{AbortOnDrop, open_cold_file, share_storage, tier_bytes};
 use crate::startup_pass::StartPass;
-use crate::storage_node::StorageFlags;
+use crate::storage_node::{StorageFlags, open_cache};
 use crate::stores::{FILE_PREFIX_ROOT, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
 use crate::{RaftMetaLog, SERVER_VERSION, s3_store};
@@ -170,9 +172,14 @@ where
     let (prefix, log) = (meta.store_prefix(), meta.log_id());
     let grace = Duration::from_millis(args.cold_store_evict_grace_ms);
     let pass = files.map(|files| StartPass::over_raft(files, grace));
-    let cache = Cache::open(meta, store, prefix)
-        .await?
-        .with_writes(args.write_config());
+    // As `kbf storage` does ([`crate::storage_node::open_cache`]): bind, register with the
+    // frontend if there is one, and only then open the cache, as the registration's member
+    // and boot.
+    let socket = bind_storage_socket(listener)?;
+    let maps = Arc::new(MapHolder::new());
+    let (cache, joiner) =
+        open_cache(flags, socket.addr(), &maps, (meta, store, prefix, log)).await?;
+    let cache = cache.with_writes(args.write_config());
     let local = args.local_cache.as_ref();
     let hot = stores.hot.as_ref();
     let (cache, tier) = crate::write_tier::attach_with(cache, hot, local.is_none()).await?;
@@ -188,16 +195,12 @@ where
         idle: Duration::from_secs(args.segment_upload_idle_secs),
     };
     let storage: Arc<dyn Storage> = Arc::new(CacheStorage::new(cache, segments));
-    // As `kbf storage` does: register with the frontend if there is one, hold its map,
-    // and serve nothing until the first.
-    let maps = Arc::new(MapHolder::new());
+    // With a frontend, hold its map and serve nothing until the first.
     let gate = flags.frontend.as_ref().map(|_| Arc::clone(&maps));
     let (bound, in_process) =
-        bind_storage_shared(Arc::clone(&storage), listener, gate, shutdown()?)?;
+        serve_storage_shared(Arc::clone(&storage), socket, gate, shutdown()?)?;
     let addr = bound.addr;
-    let _joiner = flags
-        .joiner(addr, Arc::clone(&maps))?
-        .map(|joiner| AbortOnDrop(tokio::spawn(joiner.run())));
+    let _joiner = joiner.map(|(joiner, joined)| AbortOnDrop(tokio::spawn(joiner.keep(joined))));
     Ok(StorageHalf {
         addr,
         storage,
