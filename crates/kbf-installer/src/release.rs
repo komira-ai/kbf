@@ -329,6 +329,8 @@ fn copy_release<E: Exec>(
     out: &mut dyn Write,
 ) -> Result<(), ReleaseError> {
     let copy = plan_copy(exec, host, owner, commit, source)?;
+    let dir = layout::release_dir(commit);
+    let existed = inspect(exec, &dir)?.is_some();
     // The first binary is named in the line, as it was when a release held only `kbf`;
     // each other one gets a line of its own.
     let ((_, first), others) = source
@@ -351,13 +353,47 @@ fn copy_release<E: Exec>(
             sha256(bytes)
         );
     }
-    execute(&copy, RunAs::Root, mode, exec, &mut &mut *out)?;
-    if mode == Mode::Apply {
-        for (name, bytes) in &source.binaries {
-            let bin = layout::release_file(commit, name);
-            verify(inspect(exec, &bin)?, bin, bytes)?;
-        }
+    let copied = execute(&copy, RunAs::Root, mode, exec, &mut &mut *out)
+        .map_err(ReleaseError::from)
+        .and_then(|()| {
+            if mode == Mode::Apply {
+                for (name, bytes) in &source.binaries {
+                    let bin = layout::release_file(commit, name);
+                    verify(inspect(exec, &bin)?, bin, bytes)?;
+                }
+            }
+            Ok(())
+        });
+    // A dry run changes nothing, so a failed copy is always an apply.
+    if copied.is_err() && !existed {
+        // Best effort: the error returned is the copy's.
+        let _ = remove_partial(exec, host, &dir);
     }
+    copied
+}
+
+/// Remove the release directory a failed copy made (a full disk is the usual cause), so
+/// that a retry finds nothing there. A directory left half written would be refused for
+/// ever: it is there with other content, and a release is never replaced.
+fn remove_partial<E: Exec>(
+    exec: &mut E,
+    host: &Layout,
+    dir: &HostPath,
+) -> Result<(), ReleaseError> {
+    let mut paths = Vec::new();
+    contents(host, dir, &mut paths)?;
+    paths.push(dir.clone());
+    let mut planner = Planner::new(&*exec);
+    for p in paths {
+        planner.absent(p)?;
+    }
+    execute(
+        &planner.finish(),
+        RunAs::Root,
+        Mode::Apply,
+        exec,
+        &mut io::sink(),
+    )?;
     Ok(())
 }
 

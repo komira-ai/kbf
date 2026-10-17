@@ -890,3 +890,124 @@ fn stage_never_replaces_a_release() {
     .expect_err("no binary");
     assert!(err.to_string().starts_with("cannot read "), "{err}");
 }
+
+/// A host whose disk fills: it applies `left` file writes, and the next one fails with
+/// ENOSPC. Everything else is the scratch host's.
+struct DiskFull<'a> {
+    host: &'a mut ScratchHost,
+    left: usize,
+}
+
+impl Exec for DiskFull<'_> {
+    fn euid(&self) -> u32 {
+        self.host.euid()
+    }
+
+    fn inspect(&self, path: &HostPath) -> std::io::Result<Option<Entry>> {
+        self.host.inspect(path)
+    }
+
+    fn stat(&self, path: &HostPath) -> std::io::Result<Option<Meta>> {
+        self.host.stat(path)
+    }
+
+    fn query(&self, cmd: &Cmd) -> std::io::Result<Output> {
+        self.host.query(cmd)
+    }
+
+    fn http_status(&self, url: &HttpUrl) -> std::io::Result<u16> {
+        self.host.http_status(url)
+    }
+
+    fn apply(&mut self, step: &Step) -> std::io::Result<()> {
+        if matches!(step, Step::WriteFile { .. }) {
+            if self.left == 0 {
+                return Err(std::io::Error::from_raw_os_error(28));
+            }
+            self.left -= 1;
+        }
+        self.host.apply(step)
+    }
+
+    fn check_binary(&self) -> Result<(), Untrusted> {
+        self.host.check_binary()
+    }
+}
+
+/// Catches a stage that fills the disk and leaves a half-written release directory:
+/// the retry would then find the directory there with other content and refuse it for
+/// ever, and `gc` would keep a broken release. After the failure nothing of the release
+/// is there and the state is unchanged; the retry on a healthy disk succeeds. A release
+/// that was already installed whole is never removed by a failed repeat of its stage.
+///
+/// Mutants seen red: the partial directory left in place; the directory removed whether
+/// or not the copy made it (the installed release goes with a failed repeat).
+#[test]
+fn a_stage_that_fills_the_disk_leaves_no_partial_release_and_can_be_retried() {
+    let (mut exec, root) = host("disk-full");
+    let from = source("disk-full", "kbf B", Some(UNITS));
+    fs::write(from.join("kbf-daemon"), "daemon B").expect("a second binary");
+    let dir = exec.at(&format!("/usr/local/kbf/releases/{B}"));
+    let want = Install {
+        commit: c(B),
+        from: from.clone(),
+    };
+
+    // The first binary is written, the second is not.
+    let err = stage(
+        &mut DiskFull {
+            host: &mut exec,
+            left: 1,
+        },
+        &root,
+        me(),
+        &want,
+        Mode::Apply,
+        &mut Vec::new(),
+    )
+    .expect_err("the disk is full");
+    assert!(err.to_string().contains("os error 28"), "{err}");
+    assert!(!dir.exists(), "{:?}", tree(&exec.root));
+    assert!(
+        state::read_unlocked(&root).expect("read").is_none() || state_of(&root).staged.is_none()
+    );
+
+    // The retry, on a disk with room (the same host type, so that one copy of the code
+    // under test runs on both its paths).
+    stage(
+        &mut DiskFull {
+            host: &mut exec,
+            left: 100,
+        },
+        &root,
+        me(),
+        &want,
+        Mode::Apply,
+        &mut Vec::new(),
+    )
+    .expect("retry");
+    assert_eq!(fs::read_to_string(dir.join("kbf")).expect("kbf"), "kbf B");
+    assert_eq!(
+        fs::read_to_string(dir.join("kbf-daemon")).expect("daemon"),
+        "daemon B"
+    );
+    assert_eq!(state_of(&root).staged, Some(c(B)));
+
+    // A repeat of a stage that was whole, failing on a full disk, removes nothing. (The
+    // binary's mode is changed so that the repeat has a file to write again.)
+    fs::set_permissions(dir.join("kbf"), fs::Permissions::from_mode(0o600)).expect("chmod");
+    stage(
+        &mut DiskFull {
+            host: &mut exec,
+            left: 0,
+        },
+        &root,
+        me(),
+        &want,
+        Mode::Apply,
+        &mut Vec::new(),
+    )
+    .expect_err("the disk is full again");
+    assert_eq!(fs::read_to_string(dir.join("kbf")).expect("kbf"), "kbf B");
+    assert!(dir.join("units").join("kbf.slice").exists());
+}
