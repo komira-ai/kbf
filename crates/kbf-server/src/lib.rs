@@ -106,6 +106,7 @@ pub mod streams;
 mod timeout;
 pub mod token;
 pub mod worker;
+pub mod worker_roles;
 pub mod write_tier;
 
 pub use config::{Args, ConfigError, Role, SERVER, s3_store};

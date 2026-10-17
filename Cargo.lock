@@ -1481,6 +1481,7 @@ dependencies = [
  "kbf-segments",
  "kbf-server",
  "kbf-storage",
+ "kbf-store",
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
@@ -1508,9 +1509,11 @@ dependencies = [
  "httparse",
  "kbf-host",
  "kbf-mdm",
+ "kbf-state",
  "kbf-types",
  "plist",
  "rcgen",
+ "rusqlite",
  "rustix",
  "rustls",
  "rustls-native-certs",
@@ -1520,6 +1523,7 @@ dependencies = [
  "ssh-key",
  "tar",
  "thiserror",
+ "time",
  "x509-parser",
  "zip",
 ]
@@ -1884,6 +1888,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-peer"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "thiserror",
+ "x509-parser",
+]
+
+[[package]]
 name = "kbf-proto"
 version = "0.1.0"
 dependencies = [
@@ -1990,6 +2003,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "tonic",
+ "tonic-prost",
+ "tower-layer",
  "tracing",
  "tracing-core",
  "tracing-subscriber",
@@ -2044,6 +2059,7 @@ dependencies = [
  "futures",
  "kbf-map",
  "kbf-meta",
+ "kbf-peer",
  "kbf-proto",
  "kbf-segments",
  "kbf-store",
@@ -2054,7 +2070,6 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
- "x509-parser",
 ]
 
 [[package]]

@@ -310,6 +310,13 @@ impl StorageFlags {
         ))
     }
 
+    /// The address the node registers under, and so the one its member of the map
+    /// carries: `--advertise-addr`, or the address it `bound`.
+    #[must_use]
+    pub fn registers_as(&self, bound: SocketAddr) -> String {
+        self.advertise.clone().unwrap_or_else(|| bound.to_string())
+    }
+
     /// The registration with `--frontend`, for a node bound at `bound`, keeping the maps it
     /// is sent in `node` and telling it which member it is; `None` without the flag.
     /// Connects lazily, so a frontend that is down at start is waited for.
@@ -328,7 +335,7 @@ impl StorageFlags {
         if let (true, Some(tls)) = (url.starts_with("https://"), self.peer_tls()?) {
             endpoint = endpoint.tls_config(tls)?;
         }
-        let addr = self.advertise.clone().unwrap_or_else(|| bound.to_string());
+        let addr = self.registers_as(bound);
         let identity = join::Identity {
             instance_id: addr.clone(),
             addr,

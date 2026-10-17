@@ -311,8 +311,7 @@ fn the_all_in_one_unit_waits_for_readyz_and_installs_a_new_kbf() {
     );
 }
 
-/// The refusals, each before any step: a mode not built yet (its unit would exit 2), a
-/// key file others can read or another user owns, a file the unit reads missing, a
+/// The refusals, each before any step: a key file others can read or another user owns, a file the unit reads missing, a
 /// unit kbf's own parser refuses (rule `parse`), a kbf that is not there, a build node
 /// whose user does not linger, and a storage node with no S3 endpoint set.
 /// Catches each of these installed anyway.
@@ -326,14 +325,6 @@ fn an_install_is_refused_before_any_step() {
             Err(e) => e,
         }
     };
-    let none = |_: &ScratchHost, _: &RefCell<World>| {};
-    for mode in Mode::ALL.iter().copied().filter(|m| !m.is_built()) {
-        let e = refused(&format!("unbuilt-{mode}"), mode, &none);
-        assert!(
-            matches!(e, HostError::NotBuilt(m) if m == mode.name()),
-            "{e}"
-        );
-    }
     let e = refused("readable-key", Mode::Storage, &|exec, _| {
         write(exec, "/etc/kbf/storage.key", "secret", 0o640);
     });
@@ -433,5 +424,142 @@ fn optional_environment_files_are_not_required_and_a_directory_is_no_file() {
     assert!(
         matches!(&e, HostError::Missing(p) if p.as_str() == "/etc/kbf/dir.env"),
         "{e}"
+    );
+}
+
+/// The frontend on a fresh host: its unit, then the SQLite state store's directory made
+/// the server user's alone before the unit starts, and the wait for `/readyz` on the
+/// operator API it now serves (it was refused as not built). Catches the state directory
+/// left for kbf to make (it runs as a user that cannot write under `/var/lib`), a
+/// frontend unit started with no readiness wait, and the frontend refused again.
+#[test]
+fn the_frontend_unit_is_installed_with_its_state_directory() {
+    let (exec, _) = host("install-mode-frontend");
+    let (uid, gid) = me();
+    let a = install(Mode::Frontend, None);
+    let (p, _) = plan_here(&exec, &a).expect("plan");
+    assert_eq!(
+        tail(&p),
+        [
+            "mkdir /var/lib/kbf-server (0755)".to_owned(),
+            format!("mkdir /var/lib/kbf-server/state (0700, owner {uid}:{gid})"),
+            "run /usr/bin/systemctl daemon-reload".to_owned(),
+            "run /usr/bin/systemctl enable kbf-frontend.service".to_owned(),
+            "run /usr/bin/systemctl restart kbf-frontend.service".to_owned(),
+            "wait up to 60s for http://127.0.0.1:8982/readyz".to_owned(),
+        ]
+    );
+}
+
+/// The operator token of the frontend and the all-in-one: the host check reads the file
+/// `KBF_API_TOKEN_FILE` names (the default, or another path), refuses it missing, readable
+/// by group or other, or another user's, and install-units never makes it. Catches a unit
+/// installed whose `--api-token-file` is absent (every write answers 401), a token the
+/// check looks for at the default path after the key moved, and a token file created.
+#[test]
+fn the_operator_token_file_is_checked_where_the_key_names_it() {
+    for mode in [Mode::Frontend, Mode::AllInOne] {
+        let try_with = |name: &str, key: &str, edit: &dyn Fn(&ScratchHost, &RefCell<World>)| {
+            let (exec, world) = host(&format!("install-mode-token-{name}"));
+            edit(&exec, &world);
+            let mut a = install(mode, None);
+            let text = EXAMPLE.replace("KBF_API_TOKEN_FILE=\n", key);
+            a.config = LinuxConfig::parse(&text).expect("valid settings");
+            plan_here(&exec, &a).map(|_| ())
+        };
+        let e = try_with("missing", "KBF_API_TOKEN_FILE=\n", &|exec, _| {
+            fs::remove_file(exec.at("/etc/kbf/api-token")).expect("rm");
+        })
+        .expect_err("no token");
+        assert!(
+            matches!(&e, HostError::Missing(p) if p.as_str() == "/etc/kbf/api-token"),
+            "{mode}: {e}"
+        );
+        let e = try_with("group", "KBF_API_TOKEN_FILE=\n", &|exec, _| {
+            write(exec, "/etc/kbf/api-token", "t", 0o640);
+        })
+        .expect_err("group-readable");
+        assert!(
+            matches!(&e, HostError::Readable { path, .. } if path.as_str() == "/etc/kbf/api-token"),
+            "{mode}: {e}"
+        );
+        write_ok(&try_with("0400", "KBF_API_TOKEN_FILE=\n", &|exec, _| {
+            write(exec, "/etc/kbf/api-token", "t", 0o400);
+        }));
+        // Another path: that file is the one looked for, and the default one is not.
+        let moved = "KBF_API_TOKEN_FILE=/etc/kbf/operator.token\n";
+        let e = try_with("moved-missing", moved, &|_, _| {}).expect_err("no token there");
+        assert!(
+            matches!(&e, HostError::Missing(p) if p.as_str() == "/etc/kbf/operator.token"),
+            "{mode}: {e}"
+        );
+        write_ok(&try_with("moved", moved, &|exec, _| {
+            fs::remove_file(exec.at("/etc/kbf/api-token")).expect("rm");
+            write(exec, "/etc/kbf/operator.token", "t", 0o600);
+        }));
+        let e = try_with("moved-readable", moved, &|exec, _| {
+            write(exec, "/etc/kbf/operator.token", "t", 0o604);
+        })
+        .expect_err("other-readable");
+        assert!(
+            matches!(&e, HostError::Readable { path, .. } if path.as_str() == "/etc/kbf/operator.token"),
+            "{mode}: {e}"
+        );
+    }
+    // Another user's token is refused; the plan never writes one.
+    let (exec, world) = host("install-mode-token-owned");
+    let (uid, gid) = me();
+    world
+        .borrow_mut()
+        .users
+        .insert("kbf-server".to_owned(), (uid + 1, gid));
+    let e = plan_here(&exec, &install(Mode::Frontend, None))
+        .map(|_| ())
+        .expect_err("not the server user's");
+    assert!(matches!(&e, HostError::NotOwned { .. }), "{e}");
+    let (exec, _) = host("install-mode-token-never-made");
+    let (p, _) = plan_here(&exec, &install(Mode::Frontend, None)).expect("plan");
+    assert!(
+        !steps(&p).iter().any(|s| s.contains("api-token")),
+        "{:#?}",
+        steps(&p)
+    );
+}
+
+fn write_ok(r: &Result<(), HostError>) {
+    assert!(r.is_ok(), "{r:?}");
+}
+
+/// The directories each unit's flags make, from the rendered units: the storage-and-daemon
+/// unit's metadata log and hot store beside its data directory, the frontend's state
+/// directory (the parent of the SQLite file, from the flag), the all-in-one's none
+/// beyond its own. Catches a flag whose directory is left to kbf, which makes it as a
+/// user that may not, and a state directory taken from the wrong flag.
+#[test]
+fn the_directories_come_from_the_flags_the_units_carry() {
+    let dirs = |mode: Mode| {
+        let c = LinuxConfig::parse(EXAMPLE).expect("valid settings");
+        let text = modes::render(&c, Some(1500), mode).expect("renders");
+        directories(&UnitFile::parse(&text).expect("a unit"))
+            .expect("directories")
+            .into_iter()
+            .map(|(p, bits)| format!("{p} {bits:o}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        dirs(Mode::StorageAndDaemon),
+        [
+            "/var/lib/kbf 755",
+            "/var/lib/kbf-server/raft 700",
+            "/var/lib/kbf-server/hot 700",
+        ]
+    );
+    assert_eq!(dirs(Mode::Frontend), ["/var/lib/kbf-server/state 700"]);
+    assert_eq!(
+        dirs(Mode::Storage),
+        [
+            "/var/lib/kbf-server/raft 700",
+            "/var/lib/kbf-server/hot 700"
+        ]
     );
 }

@@ -1,7 +1,8 @@
 //! The storage half of `kbf storage-and-daemon` (`docs/design/architecture-v2.md`,
 //! sections 1 and 10): the storage node `kbf storage` runs, on the same flags
 //! ([`StorageFlags`]), with the storage it serves also handed to the caller in-process
-//! ([`StorageHalf::storage`]), so the daemon half of the same process reads and writes
+//! ([`StorageHalf::storage`]), and the service that serves it callable in-process
+//! ([`StorageHalf::in_process`]), so the daemon half of the same process reads and writes
 //! it through calls, with no socket between.
 //!
 //! [`start`] opens the stores and binds the listener as
@@ -10,16 +11,19 @@
 //!   cache shares the hot store's disk), the write tier keeps no flushed copies and its
 //!   bytes are counted in that one cache's budget, as `kbf all-in-one`'s server half
 //!   does (`kbf_storage::local_cache`).
-//! - **The handle.** The [`Storage`] the listener serves is kept, for the daemon half.
+//! - **The handle.** The [`Storage`] the listener serves, and the service over it
+//!   ([`kbf_storage::service::InProcess`]), are kept, for the daemon half.
 //!
 //! - **The map and the chain.** With `--frontend` the half registers and heartbeats as
 //!   `kbf storage` does, holds the maps the frontend sends in a
 //!   [`kbf_mapsync::MapHolder`] ([`StorageHalf::maps`]), and its service judges every call
-//!   by that map, serving nothing until the first arrives; under mutual TLS it is a link of
-//!   the chain that copies a write to the blob's second owner, with the repair worker that
-//!   makes a copy owed ([`StorageHalf::repairs`]); all as [`crate::replication`] says. The
-//!   storage the daemon half is handed in-process is the store itself, not the service:
-//!   what it reads and writes there is not judged by the map and is not copied.
+//!   by that map, serving nothing until the first arrives (UNAVAILABLE `no storage map
+//!   yet`); under mutual TLS it is a link of the chain that copies a write to the blob's
+//!   second owner, with the repair worker that makes a copy owed
+//!   ([`StorageHalf::repairs`]); all as [`crate::replication`] says. The check is the
+//!   service's own, made on every call, so the daemon half, which calls the service
+//!   in-process ([`StorageHalf::in_process`]), is judged by the same map and its writes
+//!   are copied by the same chain as a call over the listener.
 //!
 //! The rest (the listener's checks, the stores, the metadata log, the flusher and the
 //! start-up pass over a `file://` cold store) is `kbf storage`'s, step for step.
@@ -38,6 +42,7 @@ use kbf_meta::Retention;
 use kbf_objstore::{FsStore, ObjectStore};
 use kbf_storage::Storage;
 use kbf_storage::repair::Repairs;
+use kbf_storage::service::InProcess;
 use kbf_threads::disk::Statvfs;
 
 use crate::replication::{REPAIR_DIR, bind_node};
@@ -55,6 +60,7 @@ pub struct StorageHalf {
     /// Where the listener is.
     pub addr: SocketAddr,
     storage: Arc<dyn Storage>,
+    in_process: InProcess,
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     maps: Arc<MapHolder>,
@@ -79,10 +85,21 @@ impl StorageHalf {
         self.repairs.clone()
     }
 
-    /// The storage the listener serves: the daemon half's, in-process.
+    /// The storage the listener serves, itself, with none of the service's checks: for a
+    /// daemon half that is not part of a farm ([`kbf_storage::service::InProcess`] is the
+    /// view that is).
     #[must_use]
     pub fn storage(&self) -> Arc<dyn Storage> {
         Arc::clone(&self.storage)
+    }
+
+    /// The storage service the listener serves, called in-process: what the daemon half
+    /// reaches the node that is its own member through, so that a write it makes takes the
+    /// path a call over the listener takes (the generation check, the chain's forward to
+    /// the replica).
+    #[must_use]
+    pub fn in_process(&self) -> InProcess {
+        self.in_process.clone()
     }
 
     /// The line the node prints once it is bound, as `kbf storage` prints it:
@@ -195,6 +212,7 @@ where
     Ok(StorageHalf {
         addr,
         storage,
+        in_process: node.in_process,
         start_line: format!("kbf-storage {SERVER_VERSION} storage={addr} log={log}"),
         serving: node.serving,
         maps: node.maps,

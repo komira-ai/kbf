@@ -8,6 +8,7 @@
 mod catch_up;
 mod every_call;
 pub(crate) mod fake;
+mod in_process;
 pub(crate) mod roles;
 mod stale_map;
 
@@ -487,6 +488,40 @@ async fn a_write_is_checked_against_its_digest() {
         mem.blobs.lock().expect("lock").get(&digest).map(Bytes::len),
         Some(12)
     );
+}
+
+/// Catches a Write whose stream ends early that is answered with anything but
+/// INVALID_ARGUMENT naming how it ended: a stream with no message at all, and one that
+/// stops before `finish_write` (after one message, and after two). Nothing is stored, and
+/// the same blob written whole afterwards is.
+#[tokio::test]
+async fn a_write_that_ends_early_says_how() {
+    let (mem, _remote, channel) = pair().await;
+    let blob = b"twelve bytes";
+    let digest = sha(blob);
+    let name = upload_name(&digest);
+    let cases = [
+        ("empty stream", Vec::new(), "write stream sent no message"),
+        (
+            "one message",
+            write_of(&name, &[(&blob[..5], false)]),
+            "write stream ended without finish_write",
+        ),
+        (
+            "two messages",
+            write_of(&name, &[(&blob[..5], false), (&blob[5..8], false)]),
+            "write stream ended without finish_write",
+        ),
+    ];
+    for (what, requests, text) in cases {
+        let status = raw_write(&channel, requests).await.expect_err(what);
+        assert_eq!(status.code(), Code::InvalidArgument, "{what}: {status}");
+        assert_eq!(status.message(), text, "{what}");
+    }
+    assert_eq!(mem.puts.load(Ordering::SeqCst), 0, "something was stored");
+    assert!(mem.blobs.lock().expect("lock").is_empty());
+    let whole = raw_write(&channel, write_of(&name, &[(blob, true)])).await;
+    assert_eq!(whole.expect("a whole write").committed_size, 12);
 }
 
 /// Catches a Write that reads and stores a blob the node already holds (the cheapest
@@ -1240,6 +1275,28 @@ async fn a_streamed_write_whose_sender_goes_away_stores_nothing() {
     }
     drop(client);
     mem.pieces_failed.notified().await;
+    assert!(mem.blobs.lock().expect("lock").is_empty());
+    assert_eq!(mem.streamed.load(Ordering::SeqCst), 0);
+}
+
+/// Catches a streamed Write whose second message the server cannot decode (it is larger
+/// than the largest message): the broken stream is the sender's fault, answered with the
+/// decoder's status, not INTERNAL, and nothing is stored.
+#[tokio::test]
+async fn a_streamed_write_with_an_oversized_message_stores_nothing() {
+    let (mem, _remote, channel) = pair().await;
+    let large = patterned(STREAM_FROM_BYTES as usize + 1);
+    let digest = sha(&large);
+    let mut messages = blob_messages(&upload_name(&digest), &large);
+    messages.truncate(1);
+    messages[0].finish_write = false;
+    messages.push(WriteRequest {
+        write_offset: messages[0].data.len() as i64,
+        data: vec![0; super::MAX_MESSAGE_BYTES + 1],
+        ..WriteRequest::default()
+    });
+    let status = raw_write(&channel, messages).await.expect_err("refused");
+    assert_eq!(status.code(), Code::OutOfRange, "{status}");
     assert!(mem.blobs.lock().expect("lock").is_empty());
     assert_eq!(mem.streamed.load(Ordering::SeqCst), 0);
 }

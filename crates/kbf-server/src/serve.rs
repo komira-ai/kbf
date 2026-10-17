@@ -26,6 +26,7 @@ use kbf_storage::service::Admission;
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, ServerTlsConfig};
+use tower_layer::{Identity, Stack};
 
 use crate::blobs::{WorkerBlobs, WorkerCas, WorkerSegments};
 use crate::drain::Drain;
@@ -41,6 +42,7 @@ use crate::state_store::StateStore;
 use crate::streams::{StreamLimits, flow_windows};
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
+use crate::worker_roles::WorkerRolesLayer;
 use kbf_mapsync::MapSource;
 use kbf_proto::kbf::map::v1::membership_server::MembershipServer;
 
@@ -53,8 +55,9 @@ pub struct Listeners {
     /// serves it in plain text, on whatever address `reapi` names (nothing refuses a
     /// bind off loopback; the binary's start line warns about one).
     pub reapi_tls: Option<ServerTlsConfig>,
-    /// The `kbf.worker.v1` listener (daemons): their worker streams, and `ByteStream`
-    /// for their blobs ([`crate::blobs`]).
+    /// The `kbf.worker.v1` listener: daemons' worker streams and blob calls
+    /// ([`crate::blobs`]), and storage nodes' `kbf.map.v1.Membership` calls; who may
+    /// call which method is [`crate::worker_roles`]'s table.
     pub worker: SocketAddr,
     /// Mutual TLS for the worker listener; `None` serves it in plain text, where no
     /// node is bound to a certificate and every blob call is refused.
@@ -265,21 +268,31 @@ pub(crate) fn bind_api(
     bound.map_err(|source| ServeError::Bind { addr, source })
 }
 
-/// The worker listener's TLS and the way its peers are told apart. Not generic, so
-/// both arms are one set of lines whatever the cache types (a per-instantiation copy
-/// that misses one arm would count as missed lines).
+/// The worker listener's server: every call goes through the per-method role table
+/// ([`crate::worker_roles`]) before it is routed.
+pub(crate) type WorkerListener = Server<Stack<WorkerRolesLayer, Identity>>;
+
+/// The worker listener's TLS, its role table, and the way its peers are told apart.
+/// Every worker listener is made here, so none serves a call the table does not list.
+/// Not generic, so both arms are one set of lines whatever the cache types (a
+/// per-instantiation copy that misses one arm would count as missed lines).
 pub(crate) fn worker_peers(
     server: Server,
     tls: Option<WorkerTls>,
-) -> Result<(Server, Peers), ServeError> {
+) -> Result<(WorkerListener, Peers), ServeError> {
     Ok(match tls {
         Some(tls) => (
-            server.tls_config(tls.server)?,
+            server
+                .tls_config(tls.server)?
+                .layer(WorkerRolesLayer::new(Admission::Certified)),
             Peers::Certified {
                 deny_list: tls.deny_list,
             },
         ),
-        None => (server, Peers::Unauthenticated),
+        None => (
+            server.layer(WorkerRolesLayer::new(Admission::Open)),
+            Peers::Unauthenticated,
+        ),
     })
 }
 
@@ -635,13 +648,14 @@ where
     if let Some(tls) = listeners.reapi_tls {
         reapi_server = reapi_server.tls_config(tls)?;
     }
-    let mut worker_server = keepalive(
-        flow_control(Server::builder(), listeners.stream_limits.worker),
-        listeners.streams,
-    );
     let peers_certified = listeners.worker_tls.is_some();
-    let peers;
-    (worker_server, peers) = worker_peers(worker_server, listeners.worker_tls)?;
+    let (mut worker_server, peers) = worker_peers(
+        keepalive(
+            flow_control(Server::builder(), listeners.stream_limits.worker),
+            listeners.streams,
+        ),
+        listeners.worker_tls,
+    )?;
     let worker_blobs = ByteStreamServer::new(WorkerBlobs::new(
         ByteStreamService::new(Arc::clone(&cache)),
         peers.clone(),
@@ -849,12 +863,16 @@ pub fn bind_storage(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
     let service = listener.service(storage);
-    bind_service(service, listener.listen, listener.tls, shutdown)
+    bind_service(service, listener.listen, listener.tls, shutdown).map(|(bound, _)| bound)
 }
 
 /// [`bind_storage`] over a service the caller has set up: a node that is one of several
 /// gives it the map it judges calls by and its chain ([`crate::replication`]). `tls` must be
-/// what the service's admission was made from ([`StorageListener::service`]).
+/// what the service's admission was made from ([`StorageListener::service`]). Also returns
+/// the [`kbf_storage::service::InProcess`] view of the very service the listener serves: a
+/// caller in this process (the daemon half of `kbf storage-and-daemon`) reaches the node
+/// through it and takes the path a call over the listener takes, the service's own map
+/// check and chain included, not the inner storage.
 ///
 /// # Errors
 /// As [`bind_storage`].
@@ -863,7 +881,13 @@ pub fn bind_service(
     listen: SocketAddr,
     tls: Option<ServerTlsConfig>,
     shutdown: impl Future<Output = ()> + Send + 'static,
-) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
+) -> Result<
+    (
+        BoundStorage<impl Future<Output = Result<(), ServeError>>>,
+        kbf_storage::service::InProcess,
+    ),
+    ServeError,
+> {
     let (incoming, addr) = bind(listen)?;
     let mut server = flow_control(
         Server::builder(),
@@ -872,7 +896,8 @@ pub fn bind_service(
     if let Some(tls) = tls {
         server = server.tls_config(tls)?;
     }
-    let routes = service.routes();
+    let service = Arc::new(service);
+    let (routes, in_process) = (service.shared_routes(), service.in_process());
     let serving = async move {
         server
             .add_routes(routes)
@@ -880,5 +905,5 @@ pub fn bind_service(
             .await
             .map_err(ServeError::from)
     };
-    Ok(BoundStorage { addr, serving })
+    Ok((BoundStorage { addr, serving }, in_process))
 }

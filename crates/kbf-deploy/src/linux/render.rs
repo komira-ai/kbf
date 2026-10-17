@@ -87,6 +87,23 @@ pub(super) fn values(c: &LinuxConfig, kbf_uid: Option<u32>) -> Values {
         .iter()
         .map(|i| format!("    --image=docker://{i} \\"))
         .collect();
+    // The cold store's `s3://` path: the bucket, then the prefix when there is one.
+    let s3_location = format!(
+        "{}{}{}",
+        c.s3_bucket,
+        if c.s3_prefix.is_empty() { "" } else { "/" },
+        c.s3_prefix
+    );
+    // The daemon's tuning flags, each on a line of its own in the continued command line.
+    let tuning = c
+        .reserve_cpus
+        .map(|n| format!("    --reserve-cpus={n} \\"))
+        .into_iter()
+        .chain(
+            c.lease_placement
+                .map(|p| format!("    --lease-placement={} \\", p.as_str())),
+        )
+        .collect();
     BTreeMap::from([
         ("SLICE_MEMORY_MIN", Value::Text(format!("{slice_mib}M"))),
         (
@@ -123,6 +140,20 @@ pub(super) fn values(c: &LinuxConfig, kbf_uid: Option<u32>) -> Values {
             ),
         ),
         ("KBF_S3_BUCKET", Value::Text(c.s3_bucket.clone())),
+        ("KBF_S3_LOCATION", Value::Text(s3_location)),
+        ("KBF_FRONTEND_NAME", Value::Text(c.frontend_name.clone())),
+        (
+            "KBF_STORAGE_URL",
+            Value::Text(c.storage_url.clone().unwrap_or_default()),
+        ),
+        ("KBF_REAPI_CERT", Value::Text(c.reapi_cert.to_string())),
+        ("KBF_REAPI_KEY", Value::Text(c.reapi_key.to_string())),
+        (
+            "KBF_API_TOKEN_FILE",
+            Value::Text(c.api_token_file.to_string()),
+        ),
+        ("KBF_STATE_DIR", Value::Text(c.state_dir.to_string())),
+        ("DAEMON_TUNING_ARGS", Value::Lines(tuning)),
         ("KBF_LISTEN_HOST", Value::Text(c.listen_host())),
         ("KBF_HOST_NAME", Value::Text(c.host_name.clone())),
         ("KBF_NODE_ID", Value::Text(c.node_id.clone())),

@@ -36,7 +36,7 @@ use kbf_storage::Storage;
 use kbf_storage::StorageError;
 use kbf_storage::repair::{JournalError, NoLedger, Options, RepairConfig, RepairWorker, Repairs};
 use kbf_storage::replicate::{Chain, ChainConfig, MapSource, Peers};
-use kbf_storage::service::StorageService;
+use kbf_storage::service::{InProcess, StorageService};
 use kbf_store::StdFs;
 use tonic::transport::ClientTlsConfig;
 
@@ -146,6 +146,7 @@ type Serving = Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>;
 pub(crate) struct Node {
     pub addr: SocketAddr,
     pub serving: Serving,
+    pub in_process: InProcess,
     pub maps: Arc<MapHolder>,
     pub repairs: Option<Arc<Repairs>>,
     pub joiner: Option<AbortOnDrop>,
@@ -180,7 +181,7 @@ pub(crate) fn bind_node(
     } else {
         (service, None, None)
     };
-    let bound = bind_service(service, listener.listen, listener.tls, shutdown)?;
+    let (bound, in_process) = bind_service(service, listener.listen, listener.tls, shutdown)?;
     let addr = bound.addr;
     let joiner = flags
         .joiner(addr, node)?
@@ -189,6 +190,7 @@ pub(crate) fn bind_node(
     Ok(Node {
         addr,
         serving: Box::pin(bound.serving),
+        in_process,
         maps,
         repairs,
         joiner,

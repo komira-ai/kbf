@@ -64,7 +64,7 @@ Options:
           The directory of the durable log file, `kbf-server.log` and its rotated `kbf-server.log.1`, `.2`, ... (created if missing): every event stderr gets, in the same format, kept across restarts. Left out, it is `<hot store directory>/log` when the hot store is a directory; with neither, there is no file and the server logs to stderr alone (the start logs which). A directory or file that cannot be written never stops the server ([`crate::log_file`])
 
       --storage-dial-timeout-ms <STORAGE_DIAL_TIMEOUT_MS>
-          The longest, in milliseconds, that dialling a storage node may take: for its TCP connection and for its TLS handshake each. Must be at least 1
+          The longest, in milliseconds, that dialling a storage node may take: for its TCP connection and for its TLS handshake each. Must be 1 to 3600000 (one hour)
           
           [default: 10000]
 
@@ -74,7 +74,7 @@ Options:
           [default: 67108864]
 
       --storage-ping-interval-ms <STORAGE_PING_INTERVAL_MS>
-          How often, in milliseconds, a connection to a storage node with a call on it is pinged (HTTP/2 PING). Must be at least 1
+          How often, in milliseconds, a connection to a storage node with a call on it is pinged (HTTP/2 PING). Must be 1 to 3600000 (one hour)
           
           [default: 10000]
 
@@ -84,7 +84,7 @@ Options:
           [default: 8]
 
       --storage-ping-timeout-ms <STORAGE_PING_TIMEOUT_MS>
-          How long, in milliseconds, a ping to a storage node may go unanswered before the connection is dropped and the calls on it fail over to the next owner. Must be at least 1 and no more than `--storage-ping-interval-ms`
+          How long, in milliseconds, a ping to a storage node may go unanswered before the connection is dropped and the calls on it fail over to the next owner. Must be 1 to 3600000 (one hour) and no more than `--storage-ping-interval-ms`
           
           [default: 10000]
 
@@ -186,7 +186,7 @@ Options:
           Threads for CPU-bound work, such as hashing, which never waits and so is held to the CPUs. Default: every CPU the process may use on the server; `max(2, reserve/2)`, at most the physical cores, on the daemon
 
       --worker-client-ca <WORKER_CLIENT_CA>
-          PEM CA that daemon client certificates must chain to
+          PEM CA that client certificates must chain to. Each must also name the role the method it calls takes: the daemon role (`urn:kbf:role:daemon`) for the worker session and blob calls, the storage role (`urn:kbf:role:storage`) for `kbf.map.v1.Membership`; a frontend certificate may call nothing here
 
       --output-upload-deadline-secs <OUTPUT_UPLOAD_DEADLINE_SECS>
           How long one lease's whole output upload (its output files, stdout and stderr) may take, in seconds, before the lease fails with a reason naming the upload and the time it ran (container and native drivers). Without it, a store that stops answering holds the lease, and its slot, with no error

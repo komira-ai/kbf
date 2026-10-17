@@ -204,19 +204,30 @@ fn a_mode_renders_and_checks_and_an_unknown_mode_is_refused() {
         "{stdout}"
     );
     let (code, stdout, _) = check("frontend");
-    assert_eq!(
-        (code, stdout.as_str()),
-        (0, "UNIT OK: kbf-frontend.service runs kbf frontend\n")
+    // The frontend's flags are parsed by the installed kbf, or the check says it found
+    // none (a machine without kbf, such as CI): a SKIP line, then the verdict.
+    assert_eq!(code, 0, "{stdout}");
+    assert!(
+        stdout.ends_with("UNIT OK: kbf-frontend.service runs kbf frontend\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .rev()
+            .skip(1)
+            .all(|l| l.starts_with("SKIP parse: ")),
+        "{stdout}"
     );
 
     let unit = out.join("kbf-frontend.service");
     let text = std::fs::read_to_string(&unit).expect("unit");
-    let planted = text.replace("/kbf frontend\n", "/kbf frontend --node-id=n1\n");
+    let planted = text.replace("TimeoutStopSec=infinity", "TimeoutStopSec=90s");
     assert_ne!(planted, text, "the defect is not planted");
     std::fs::write(&unit, planted).expect("plant");
     let (code, stdout, _) = check("frontend");
     assert_eq!(code, 1, "{stdout}");
-    assert!(stdout.starts_with("FAIL flags: "), "{stdout}");
+    assert!(stdout.starts_with("FAIL stop: "), "{stdout}");
 
     for bad in ["kbf-server", "worker", ""] {
         let (code, stdout, stderr) = render(bad);

@@ -22,14 +22,15 @@ CPUWeight=200
 # No MemorySwapMax=: leases may swap (the host's swapfile is for them); the
 # daemon's swap watch kills a lease that swaps at its own cap.
 Environment=XDG_RUNTIME_DIR=/run/user/1500
-# TODO(registration): --frontend=<the frontend's DNS name> in place of --server and
-# --cas, and --advertise-addr where the bind address is not routable, once a daemon
-# registers with a frontend and takes the storage map it pushes. (No comment goes inside the continued lines
-# below: systemd 239 and older read one into the command line.)
+# --server and --cas dial the frontend by KBF_FRONTEND_NAME, not this node's own
+# KBF_HOST_NAME. TODO(registration): --frontend=<the frontend's DNS name> in place of
+# them, and --advertise-addr where the bind address is not routable, once a daemon
+# registers with a frontend and takes the storage map it pushes. (No comment goes inside
+# the continued lines below: systemd 239 and older read one into the command line.)
 ExecStart=/usr/local/bin/kbf daemon \
     --driver=container \
-    --server=https://storage-node.example.internal:8981 \
-    --cas=https://storage-node.example.internal:8981 \
+    --server=https://frontend.example.internal:8981 \
+    --cas=https://frontend.example.internal:8981 \
     --ca-cert=/etc/kbf/ca.pem \
     --cert=/etc/kbf/node.pem \
     --key=/etc/kbf/node.key \
