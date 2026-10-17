@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use kbf_mapsync::MapHolder;
 use kbf_proto::reapi::Digest;
-use kbf_route::{Nodes, Router, TlsNodes};
+use kbf_route::{Liveness, Nodes, Router, TlsNodes};
 use kbf_transfer::cas::{Cas, CasError, Chunks, Intake};
 use kbf_transfer::{Record, RoutedCas, Scope, TransferConfig, Transfers};
 use kbf_types::LeaseId;
@@ -27,13 +27,16 @@ use crate::map::{HeldMaps, REFETCH_WITHIN};
 
 /// Storage nodes dialled over mutual TLS with the daemon's CA and certificate, each
 /// verified against its own host from the map. `files.server_name` (the frontend's
-/// name) is not used: [`TlsNodes`] has no way to be given one name for every node.
+/// name) is not used: [`TlsNodes`] has no way to be given one name for every node. A
+/// node that goes silent is given up on as `liveness` says.
 ///
 /// # Errors
 /// A TLS file cannot be read.
-pub fn storage_nodes(files: &TlsFiles) -> Result<Arc<TlsNodes>, ConfigError> {
+pub fn storage_nodes(files: &TlsFiles, liveness: Liveness) -> Result<Arc<TlsNodes>, ConfigError> {
     let (ca, identity) = files.trust()?;
-    Ok(Arc::new(TlsNodes::new(ca, identity)))
+    Ok(Arc::new(
+        TlsNodes::new(ca, identity).with_liveness(liveness),
+    ))
 }
 
 /// Which side a call went to, last time one was made.
