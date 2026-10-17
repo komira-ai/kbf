@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use futures::stream;
+use futures::{StreamExt as _, stream};
 use kbf_meta::{ActionRecord, Role};
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::segments_server::Segments;
@@ -160,10 +160,10 @@ impl Storage for Called {
                 digest.hash_hex(),
                 digest.size_bytes
             );
-            let mut messages = stream::iter(write_messages(&name, &bytes).into_iter().map(Ok));
+            let messages = stream::iter(write_messages(&name, &bytes).into_iter().map(Ok)).boxed();
             self.this
                 .service
-                .write_in(self.generation, None, &mut messages)
+                .write_in(self.generation, None, messages)
                 .await
                 .map_err(|status| lift(&status, None))?;
             Ok(digest)

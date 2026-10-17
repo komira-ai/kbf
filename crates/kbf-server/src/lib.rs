@@ -100,6 +100,7 @@ pub mod state_store;
 pub mod storage_half;
 pub mod storage_node;
 pub mod stores;
+pub mod streams;
 mod timeout;
 pub mod token;
 pub mod worker;
@@ -122,6 +123,7 @@ pub use serve::{
 };
 pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_interruptible};
 pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};
+pub use streams::{StreamArgs, StreamLimits};
 pub use worker::WorkerService;
 
 /// The commit the server was built from: 12 hex digits, or `unknown` when the build

@@ -99,6 +99,8 @@ pub const ALLOWED: &[&str] = &[
     "progress_interval_secs",
     "http2_keepalive_interval_secs",
     "http2_keepalive_timeout_secs",
+    "reapi_max_streams",
+    "worker_max_streams",
     "unservable_wait_secs",
     "memory_ladder_gib",
     "finished_retention_secs",
@@ -414,13 +416,19 @@ fn bind_frontend(
     .merge(crate::health::router_of(Arc::clone(&checks)))
     .merge(metrics_route(backend.clone()));
 
-    let mut reapi_server = keepalive(flow_control(Server::builder()), listeners.streams);
+    let mut reapi_server = keepalive(
+        flow_control(Server::builder(), listeners.stream_limits.reapi),
+        listeners.streams,
+    );
     if let Some(tls) = listeners.reapi_tls {
         reapi_server = reapi_server.tls_config(tls)?;
     }
     let peers_certified = listeners.worker_tls.is_some();
     let (mut worker_server, peers) = worker_peers(
-        keepalive(flow_control(Server::builder()), listeners.streams),
+        keepalive(
+            flow_control(Server::builder(), listeners.stream_limits.worker),
+            listeners.streams,
+        ),
         listeners.worker_tls,
     )?;
     let sessions = WorkerService::new(

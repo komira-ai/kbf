@@ -147,11 +147,8 @@ async fn a_write_stream_that_ends_early_is_invalid_and_stores_nothing() {
         ),
     ];
     for (what, requests, text) in cases {
-        let mut stream = futures::stream::iter(requests.into_iter().map(Ok));
-        let status = service
-            .write_in(0, None, &mut stream)
-            .await
-            .expect_err(what);
+        let stream = futures::stream::iter(requests.into_iter().map(Ok)).boxed();
+        let status = service.write_in(0, None, stream).await.expect_err(what);
         assert_eq!(status.code(), Code::InvalidArgument, "{what}: {status}");
         assert_eq!(status.message(), text, "{what}");
     }
@@ -189,11 +186,8 @@ async fn a_write_stream_that_fails_answers_with_its_own_status() {
         ),
     ];
     for (what, items) in cases {
-        let mut stream = futures::stream::iter(items);
-        let status = service
-            .write_in(0, None, &mut stream)
-            .await
-            .expect_err(what);
+        let stream = futures::stream::iter(items).boxed();
+        let status = service.write_in(0, None, stream).await.expect_err(what);
         assert_eq!(status.code(), Code::Aborted, "{what}: {status}");
         assert_eq!(status.message(), "reset", "{what}");
     }

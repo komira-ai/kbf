@@ -54,15 +54,18 @@ impl ByteStream for StorageService {
 
     /// Receives a blob from offset 0 and answers with its size once it is stored. A
     /// caller whose map generation is not this node's is refused first
-    /// ([`crate::replicate`]); a blob already held is answered at once, unread.
+    /// ([`crate::replicate`]); a blob already held is answered at once, unread. No blob
+    /// is refused for its size.
     ///
     /// The bytes are checked against the digest in the resource name, and never more
     /// than it declares are taken. Where the store can write a blob as it arrives
     /// ([`crate::Storage::stream`]) they are written so and held in the few chunks in
     /// flight, whatever the blob's size; the primary of a chain streams each chunk on to
     /// the replica as well and answers only when both hold the blob. Where the store
-    /// cannot, a node outside a chain holds the blob whole until it is complete
-    /// ([`super::Config::write_bytes_in_flight`]).
+    /// cannot, a node outside a chain holds a blob of at most
+    /// [`super::STREAM_FROM_BYTES`] whole until it is complete
+    /// ([`super::Config::write_bytes_in_flight`]), and streams a larger one to the
+    /// object store ([`crate::Storage::put_streamed`]) without holding it.
     async fn write(
         &self,
         request: Request<Streaming<WriteRequest>>,
@@ -75,8 +78,8 @@ impl ByteStream for StorageService {
         };
         self.admission.check(&request, endpoint)?;
         let requested = generation::requested(&request)?;
-        let mut stream = request.into_inner();
-        let size = self.write_in(requested, leg_from, &mut stream).await?;
+        let stream = request.into_inner();
+        let size = self.write_in(requested, leg_from, stream.boxed()).await?;
         Ok(wire::committed(size))
     }
 

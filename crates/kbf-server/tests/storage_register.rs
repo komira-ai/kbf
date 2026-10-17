@@ -89,6 +89,7 @@ fn listeners(worker_tls: Option<WorkerTls>) -> Listeners {
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
         streams: kbf_server::StreamTiming::default(),
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     }
 }
 
