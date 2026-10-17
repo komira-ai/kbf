@@ -131,3 +131,30 @@ async fn the_result_object_waits_while_the_output_object_fails() {
     assert_eq!(round.flushed, vec![entry.output, entry.result]);
     assert_eq!(farm.log.staged_state(entry.result), None, "flushed");
 }
+
+/// Catches a flusher that, with the output object waiting out its backoff and so not
+/// in the round, flushes the result object it was never ordered after: the round after
+/// the failure, still inside the backoff, must PUT nothing and leave both sealed, and
+/// must not report a retry for the result, which was never attempted.
+#[tokio::test]
+async fn the_result_object_is_not_attempted_while_the_output_waits_out_its_backoff() {
+    let farm = Farm::new(Capabilities::default());
+    let cache = farm.start(GIB).await;
+    let entry = entry(&farm, &cache).await;
+    farm.store.on_put(PutFault::Fail);
+
+    let t0 = later();
+    cache.flush_tier(t0).await.expect("round");
+    let puts = farm.store.put_keys();
+
+    let round = cache
+        .flush_tier(t0 + FLUSH_BACKOFF_FIRST / 2)
+        .await
+        .expect("round");
+    assert_eq!(round.flushed, Vec::<ObjectId>::new(), "{round:?}");
+    assert!(round.retrying.is_empty(), "{round:?}");
+    assert_eq!(farm.store.put_keys(), puts, "no PUT inside the backoff");
+    for object in [entry.output, entry.result] {
+        assert_eq!(farm.log.staged_state(object), Some(StagedState::Sealed));
+    }
+}
