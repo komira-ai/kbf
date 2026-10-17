@@ -468,6 +468,22 @@ impl Durable {
             .map_err(|why| corrupt(&key, &why))
     }
 
+    /// Records what a refused write says about the store. Only a store that cannot be
+    /// reached is an outage; a write that lost a compare-and-set, or found its row gone,
+    /// is the store working; a write the store fenced means another writer holds a newer
+    /// generation, which no return of the store undoes. Not generic, unlike
+    /// [`State::durably`], so every caller's runs count toward the same function.
+    fn note_failure(&self, error: &StateError) {
+        if let StateError::Store(cause) = error {
+            let flag = if matches!(cause, StoreError::Fenced) {
+                &self.fenced
+            } else {
+                &self.unreachable
+            };
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+
     /// A write that tells whether the store takes writes again.
     pub(super) fn ping(&self) -> Result<(), StateError> {
         self.commit(Txn::new().put(ALIVE, Vec::new(), Cond::Any))
@@ -529,16 +545,7 @@ impl State {
             Ok(()) => true,
             Err(error) => {
                 tracing::error!(%error, "the state store did not take {what}");
-                // Only a store that cannot be reached is an outage: a write that lost a
-                // compare-and-set, or found its row gone, is the store working.
-                if let StateError::Store(cause) = &error {
-                    let flag = if matches!(cause, StoreError::Fenced) {
-                        &durable.fenced
-                    } else {
-                        &durable.unreachable
-                    };
-                    flag.store(true, Ordering::SeqCst);
-                }
+                durable.note_failure(&error);
                 false
             }
         }
