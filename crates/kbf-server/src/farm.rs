@@ -233,6 +233,14 @@ struct State {
     /// The `done/` rows the state store has not taken, oldest first
     /// ([`State::retry_results`]).
     undone: Vec<Undone>,
+    /// The previous try of the oldest held effect was refused as unreachable, so a
+    /// "row is gone" now may be its own applied work ([`State::release_unwritten`]).
+    retrying: bool,
+    /// Writes given up on for good: dropped as stale or fenced, past their retention,
+    /// or over the cap ([`Farm::dropped_writes`]).
+    write_drops: u64,
+    /// The most committed records `unwritten` holds before a new one is dropped.
+    held_cap: usize,
     /// The scheduler was told the state store is unavailable ([`State::watch_store`]).
     store_down: bool,
     /// When each node's session row in the state store was last written.
@@ -244,6 +252,9 @@ struct State {
     /// in a row found it neither unfinished nor ended.
     looks: BTreeMap<OperationId, u8>,
 }
+
+/// How many committed records the farm holds for a state store that refuses them.
+const HELD_CAP: usize = 4096;
 
 /// What a finished operation tells its callers, and the action-cache entry to write
 /// first, if any.
@@ -303,6 +314,9 @@ impl Farm {
                 unwritten: VecDeque::new(),
                 parked: BTreeMap::new(),
                 undone: Vec::new(),
+                retrying: false,
+                write_drops: 0,
+                held_cap: HELD_CAP,
                 store_down: false,
                 renewed: BTreeMap::new(),
                 fenced: false,
@@ -362,6 +376,21 @@ impl Farm {
     #[must_use]
     pub fn queued_operations(&self) -> u64 {
         self.lock().sched.queued_len() as u64
+    }
+
+    /// Writes to the state store the farm gave up on for good: held effects dropped as
+    /// stale or on a fence, `done/` rows past their retention, records over the cap.
+    #[must_use]
+    pub fn dropped_writes(&self) -> u64 {
+        self.lock().write_drops
+    }
+
+    /// Held-back committed records the farm keeps for a refusing state store at most.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_held_cap(self, cap: usize) -> Self {
+        self.lock().held_cap = cap;
+        self
     }
 
     /// The memory runs of every operation this farm holds that was killed for memory,
@@ -1039,6 +1068,14 @@ impl State {
                     // until it takes it or a newer writer fences it.
                     let committed = Event::Committed(record);
                     let next = self.sched.apply(Input::new(now, committed));
+                    if self.unwritten.len() >= self.held_cap {
+                        self.write_drops += 1;
+                        tracing::error!(
+                            cap = self.held_cap,
+                            "the state store holds back too many records: a committed record is dropped"
+                        );
+                        continue;
+                    }
                     self.unwritten.push_back(next.into());
                     if answering || self.unwritten.len() == 1 {
                         effects.extend(self.release_unwritten());

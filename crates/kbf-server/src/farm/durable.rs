@@ -41,7 +41,9 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use tokio::time::Instant;
 
 use kbf_front::{Described, Finished, Stage};
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
@@ -231,8 +233,12 @@ enum Attempt {
     Taken,
     /// The store could not be reached: the same write may succeed later.
     Transient,
-    /// The write is stale, cannot be encoded, or a newer writer holds the store: trying
-    /// again cannot help.
+    /// A row the write depends on is gone or changed. On a first try the write is stale;
+    /// on a retry it is also what a write the store applied but did not acknowledge
+    /// leaves (the retry finds its own work done).
+    Stale,
+    /// The write cannot be encoded, or a newer writer holds the store: trying again
+    /// cannot help.
     Dropped,
 }
 
@@ -743,6 +749,7 @@ impl State {
                     StateError::Store(cause) if !matches!(cause, StoreError::Fenced) => {
                         Attempt::Transient
                     }
+                    StateError::Missing(_) | StateError::Conflict(_) => Attempt::Stale,
                     _ => Attempt::Dropped,
                 }
             }
@@ -766,50 +773,67 @@ impl State {
     /// remaining effects, as a refused record always did. Once a newer writer fences the
     /// store, everything held is dropped and nothing is written.
     pub(super) fn release_unwritten(&mut self) -> Vec<Effect> {
-        if self.superseded() {
-            let held: usize = self.unwritten.iter().map(VecDeque::len).sum();
-            if held > 0 {
-                tracing::error!(
-                    held,
-                    "a newer writer holds the state store: held-back effects dropped"
-                );
-            }
-            self.unwritten.clear();
-            self.parked.clear();
-            self.undone.clear();
-            return Vec::new();
-        }
         let mut ready = Vec::new();
-        while let Some(front) = self.unwritten.front() {
+        loop {
+            if self.superseded() {
+                let held: usize = self.unwritten.iter().map(VecDeque::len).sum();
+                if held > 0 {
+                    self.write_drops += held as u64;
+                    tracing::error!(
+                        held,
+                        "a newer writer holds the state store: held-back effects dropped"
+                    );
+                }
+                self.unwritten.clear();
+                self.parked.clear();
+                self.undone.clear();
+                self.retrying = false;
+                return ready;
+            }
+            let Some(front) = self.unwritten.front() else {
+                return ready;
+            };
             let Some(effect) = front.front().cloned() else {
                 self.unwritten.pop_front();
                 continue;
             };
-            match self.attempt("a committed record", |d| {
+            let mut attempt = self.attempt("a committed record", |d| {
                 d.persist(std::slice::from_ref(&effect))
-            }) {
+            });
+            if attempt == Attempt::Stale && self.retrying {
+                // An earlier try of this very write was refused as unreachable; the
+                // store may have applied it all the same, and then the rows it
+                // depends on are gone. Its work is done: carry the effect out.
+                tracing::warn!("a retried write finds its work done; carrying the effect out");
+                attempt = Attempt::Taken;
+            }
+            match attempt {
                 Attempt::Taken => {
+                    self.retrying = false;
                     if let Some(batch) = self.unwritten.front_mut() {
                         batch.pop_front();
                     }
                     ready.push(effect);
                 }
                 Attempt::Transient => {
+                    self.retrying = true;
                     let held: usize = self.unwritten.iter().map(VecDeque::len).sum();
                     tracing::warn!(
                         held,
                         "the state store holds back committed records; written again at the next input"
                     );
-                    break;
+                    return ready;
                 }
-                Attempt::Dropped => {
+                Attempt::Stale | Attempt::Dropped => {
+                    self.retrying = false;
+                    self.write_drops += 1;
+                    tracing::error!("a committed record's remaining effects were dropped");
                     for dropped in self.unwritten.pop_front().into_iter().flatten() {
                         self.forget_parked(&dropped);
                     }
                 }
             }
         }
-        ready
     }
 
     /// Forgets the detail kept for the answer in `effect`, if it is one.
@@ -859,12 +883,14 @@ impl State {
         if self.undone.is_empty() {
             return;
         }
-        if self.superseded() {
-            self.undone.clear();
-            return;
-        }
         let pending = std::mem::take(&mut self.undone);
         for undone in pending {
+            if self.superseded() {
+                // Checked before every row: the first refusal that says `Fenced`
+                // ends the rest of this pass too.
+                self.write_drops += 1;
+                continue;
+            }
             let Undone {
                 operation,
                 finished,
@@ -872,13 +898,17 @@ impl State {
                 since,
             } = &undone;
             if since.elapsed() >= (*retention).max(DONE_FLOOR) {
+                self.write_drops += 1;
+                tracing::error!(%operation, "a result row the state store never took is dropped: its retention has passed");
                 continue;
             }
             let again = self.attempt("a result", |d| {
                 d.done_again(*operation, finished, *retention)
             });
-            if again == Attempt::Transient {
-                self.undone.push(undone);
+            match again {
+                Attempt::Transient => self.undone.push(undone),
+                Attempt::Taken => {}
+                Attempt::Stale | Attempt::Dropped => self.write_drops += 1,
             }
         }
     }
