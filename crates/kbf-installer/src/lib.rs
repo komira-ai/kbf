@@ -19,6 +19,7 @@
 //!
 //! - [`inbox`] and [`offer`]: an entry the unprivileged process wrote, opened without
 //!   following a link, and the offer that names its files and their sha256.
+//! - [`attest`]: `gh attestation verify`, pinned, offline, as an unprivileged user.
 //! - [`trust`] and [`settings`]: what the check believes without looking at its content
 //!   (`gh`, the trusted root, the host's settings) and the root-ownership check on it.
 //! - [`archive`], [`binary`] and [`darwin`]: the tarball, the kind of executable and its
@@ -30,6 +31,7 @@
 //! changes a host's releases, so that a host has one state file and one layout.
 
 pub mod archive;
+pub mod attest;
 pub mod binary;
 pub mod darwin;
 #[cfg(test)]
@@ -40,6 +42,7 @@ pub mod offer;
 pub mod refusal;
 pub mod release;
 pub mod run;
+pub mod settings;
 pub mod state;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;

@@ -4568,6 +4568,7 @@ dependencies = [
  "tar",
  "thiserror",
  "ureq",
+ "zip",
 ]
 
 [[package]]
