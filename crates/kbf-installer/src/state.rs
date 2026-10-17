@@ -42,7 +42,7 @@ pub struct State {
     pub order_floor: u64,
 }
 
-/// A swap that rolls back unless it is confirmed by `deadline`.
+/// A swap that rolls back unless it is confirmed ([`crate::activate`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PendingConfirm {
@@ -51,8 +51,19 @@ pub struct PendingConfirm {
     /// The release that ran before it, which a rollback restores; `None` on a host's
     /// first deploy.
     pub previous: Option<CommitId>,
-    /// Seconds since the Unix epoch.
-    pub deadline: u64,
+    /// Seconds since the Unix epoch by which the confirm must come. `None` until the
+    /// window starts: on Linux that is the first start of the new release, which can be
+    /// hours after the swap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<u64>,
+    /// The order that made the swap; a repeat of it changes nothing, and a confirm must
+    /// name it. `None` for a swap not made by an order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_id: Option<String>,
+    /// How many starts of the new release are still allowed before it is reverted
+    /// unconfirmed; `None` where nothing counts starts (macOS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starts_left: Option<u32>,
 }
 
 /// Why the state could not be read, written or locked.
