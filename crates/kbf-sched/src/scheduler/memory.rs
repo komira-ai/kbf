@@ -264,10 +264,9 @@ struct Floors {
 
 impl PartialEq for Floors {
     fn eq(&self, other: &Self) -> bool {
-        self.asks == other.asks
-            && self.order == other.order
-            && self.next == other.next
-            && self.bound == other.bound
+        // `order` is `asks` read the other way round (each stamp to its key), so it
+        // is equal whenever `asks` is and takes no part here.
+        self.asks == other.asks && self.next == other.next && self.bound == other.bound
     }
 }
 
@@ -666,7 +665,7 @@ mod tests {
 
     /// Catches: equality that ignores the next stamp (two schedulers that rank the next
     /// raise differently called equal) or the bound (two that forget at different sizes
-    /// called equal), when the floors and their order match.
+    /// called equal), when the floors match.
     #[test]
     fn floors_with_the_same_rows_differ_in_the_next_stamp_or_the_bound() {
         let mut a = Floors::new(4);
