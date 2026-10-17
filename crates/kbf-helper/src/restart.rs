@@ -10,13 +10,11 @@ pub enum Restart {
     Systemd(String),
     /// `launchctl kickstart -k system/<label>`.
     Launchd(String),
-    /// Nothing: a host whose service is restarted by other means (or a test).
-    Off,
 }
 
 impl Restart {
-    /// The step that restarts the service, if there is one.
-    pub fn step(&self) -> Option<Step> {
+    /// The step that restarts the service.
+    pub fn step(&self) -> Step {
         let (program, args): (&str, Vec<String>) = match self {
             Restart::Systemd(unit) => (
                 "/usr/bin/systemctl",
@@ -30,10 +28,9 @@ impl Restart {
                     format!("system/{label}"),
                 ],
             ),
-            Restart::Off => return None,
         };
         let program = HostPath::new(program).expect("an absolute path");
         let cmd = args.into_iter().fold(Cmd::new(program), Cmd::arg);
-        Some(Step::Run(cmd))
+        Step::Run(cmd)
     }
 }

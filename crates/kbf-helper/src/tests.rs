@@ -424,13 +424,13 @@ fn status_json_is_read_by_the_node_client() {
 
 /// Catches a restart that runs the wrong program or the wrong unit: argv is fixed by the
 /// helper's own flag, an absolute program, and nothing else (a unit name with a space or
-/// an option-looking prefix stays one argument); a host with no restart runs nothing.
+/// an option-looking prefix stays one argument).
 ///
 /// Mutant seen red: the step returned as `None` (also `a_failed_restart_is_owed...`).
 #[test]
 fn the_restart_is_one_fixed_command() {
     let program = |r: Restart| match r.step() {
-        Some(Step::Run(cmd)) => (cmd.program.as_str().to_owned(), cmd.args),
+        Step::Run(cmd) => (cmd.program.as_str().to_owned(), cmd.args),
         other => panic!("not a command: {other:?}"),
     };
     assert_eq!(
@@ -455,7 +455,6 @@ fn the_restart_is_one_fixed_command() {
             ]
         )
     );
-    assert!(Restart::Off.step().is_none());
 }
 
 /// Catches a confirm window the order chooses: on macOS the window starts at the swap and

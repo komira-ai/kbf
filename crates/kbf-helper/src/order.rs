@@ -66,7 +66,7 @@ struct Raw {
 /// The id an order file's name stands for: twenty digits and [`SUFFIX`].
 pub fn id_of(name: &str) -> Option<u64> {
     let digits = name.strip_suffix(SUFFIX)?;
-    if digits.len() != 20 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    if (digits.len() != 20) | !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     digits.parse().ok()
