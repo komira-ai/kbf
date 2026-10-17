@@ -229,4 +229,11 @@ fn the_real_calls_with_the_ids_the_process_has_succeed_or_are_refused_for_a_user
         cleared.map_err(|e| e.kind()),
         [Err(io::ErrorKind::PermissionDenied), Ok(())][usize::from(is_root)]
     );
+    // The closure a child runs between fork and exec, run in this process (a child's
+    // coverage is not written out): the same three calls, the first of which already
+    // needs root.
+    assert_eq!(
+        in_child(me())().map_err(|e| e.kind()),
+        [Err(io::ErrorKind::PermissionDenied), Ok(())][usize::from(is_root)]
+    );
 }
