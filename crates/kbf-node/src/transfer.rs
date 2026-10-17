@@ -258,7 +258,7 @@ mod tests {
             .await
             .expect("the storage half starts");
         let local =
-            kbf_daemon::LocalMember::new(half.addr.to_string(), half.storage(), half.maps());
+            kbf_daemon::LocalMember::new(half.addr.to_string(), half.in_process(), half.maps());
         let maps = Arc::new(kbf_daemon::MapHolder::new());
         super::super::member(&cli(&at("ca.pem")), &maps, &local).expect("the member plane");
         let why = super::super::member(&cli(&at("no-such-ca.pem")), &maps, &local)

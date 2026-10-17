@@ -164,7 +164,7 @@ fn routes_by_map(flags: &Flags) -> bool {
 fn starter(flags: &Flags, half: &StorageHalf, tokio: &tokio::runtime::Handle) -> Starter {
     if routes_by_map(flags) {
         let addr = flags.storage.registers_as(half.addr);
-        let local = LocalMember::new(addr, half.storage(), half.maps());
+        let local = LocalMember::new(addr, half.in_process(), half.maps());
         return Box::new(move |cli| kbf_node::start_member(cli, local));
     }
     let store = kbf_server::LocalStore::over(half.storage());

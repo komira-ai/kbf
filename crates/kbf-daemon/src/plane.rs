@@ -24,6 +24,7 @@ use kbf_map::Member;
 use kbf_mapsync::MapHolder;
 use kbf_proto::reapi::Digest;
 use kbf_route::{Nodes, Router, TlsNodes};
+use kbf_storage::service::InProcess;
 use kbf_storage::{Storage, StorageError};
 use kbf_transfer::cas::{Cas, CasError, Chunks, Intake};
 use kbf_transfer::{Record, RoutedCas, Scope, TransferConfig, Transfers};
@@ -213,23 +214,31 @@ impl Cas for FarmLease {
 }
 
 /// What the storage half of a `kbf storage-and-daemon` process gives its daemon half: the
-/// node's own storage, the address it registered under (the member of the map that is this
-/// process), and the map the node holds.
+/// node's own storage service called in-process, the address it registered under (the
+/// member of the map that is this process), and the map the node holds.
 #[derive(Clone)]
 pub struct LocalMember {
     addr: String,
-    storage: Arc<dyn Storage>,
+    service: InProcess,
     held: Arc<MapHolder>,
 }
 
 impl LocalMember {
-    /// The member registered as `addr`, served in-process by `storage`, whose own map is
+    /// The member registered as `addr`, served in-process by `service`, whose own map is
     /// in `held`.
+    ///
+    /// `service` must be the view of the very [`StorageService`](kbf_storage::service::StorageService)
+    /// the node's listener serves (`StorageHalf::in_process`), not the storage under it: a
+    /// write the daemon half makes to a blob this node is the primary of must take the path
+    /// a call from another node takes, which stores the blob here and sends it on to the
+    /// replica (the chain, `kbf_storage::replicate`) and judges the call by the map
+    /// generation the daemon routed by. Calling the inner storage would store one copy and
+    /// judge nothing.
     #[must_use]
-    pub fn new(addr: String, storage: Arc<dyn Storage>, held: Arc<MapHolder>) -> Self {
+    pub fn new(addr: String, service: InProcess, held: Arc<MapHolder>) -> Self {
         Self {
             addr,
-            storage,
+            service,
             held,
         }
     }
@@ -241,11 +250,13 @@ const NO_MAP_YET: &str = "no storage map yet";
 /// The member `local` is, called in-process; any other through `rest`.
 ///
 /// Until the storage half holds a map the local member is refused, UNAVAILABLE, as its
-/// listener refuses every call: a node without a map would take a write the map places
+/// listener refuses every call (that gate is a layer of the listener, not of the service,
+/// so it is applied here): a node without a map would take a write the map places
 /// elsewhere, and a daemon on a map of its own must not do through a call what the
 /// listener would refuse. The refusal is the node's alone; reads and writes owned by
-/// other members go on. A call to the local node carries no generation, and the node
-/// does not check one in-process.
+/// other members go on. A call to the local node carries the generation of the map the
+/// daemon routed by, as a call to any other member does (`generation`), and the service
+/// judges it as it judges theirs: STALE_MAP for a daemon behind the node.
 struct WithLocal {
     local: LocalMember,
     rest: Arc<dyn Nodes>,
@@ -261,7 +272,7 @@ impl Nodes for WithLocal {
                 NO_MAP_YET,
             ))));
         }
-        Ok(Arc::clone(&self.local.storage))
+        Ok(self.local.service.at(generation))
     }
 }
 

@@ -3,11 +3,12 @@
 //! whose data plane is the one that mode gives its daemon half ([`member_cas`]) over its
 //! own node's storage and its own node's map.
 //!
-//! The proof of the fix: a blob the daemon beside node A writes and the map places on node
-//! B lands on B (and on no other node), where B's daemon reads it; a blob the map places on
-//! A is written to A's storage with no call through the node dialler at all. Before this,
-//! the daemon half wrote to its own node whatever the map said, and the other nodes' daemons
-//! then looked for the blob at its owner and missed. The tests wait with deadlines that only
+//! The nodes are nodes of a chain (R = 2 on two members: every blob is on both). The proof
+//! of the fix: a blob the daemon beside node A writes and the map places on node B (as its
+//! primary) lands on B and is copied by B's chain to A; a blob whose primary is A is written
+//! through A's own service in-process, with no call through the node dialler at all, and A's
+//! chain copies it to B. Before this, the daemon half wrote to its own node whatever the
+//! map said, and then wrote to its raw storage, which stores one copy and judges no map. The tests wait with deadlines that only
 //! end a hang, and assert no duration.
 
 mod support;
@@ -25,7 +26,7 @@ use kbf_mapsync::MapHolder;
 use kbf_route::Nodes;
 use kbf_storage::{Storage, StorageError};
 use kbf_transfer::{CasError, RoutedCas, TransferConfig, proto_digest};
-use support::farm::{NodeUnderTest, Pki, blob_owned_by, digest, front, map_of, node};
+use support::farm::{NodeUnderTest, Pki, blob_owned_by, chain_node, digest, front, map_of};
 use support::scratch;
 
 /// The node dialler a daemon half calls other members through, counting its calls by
@@ -92,7 +93,7 @@ fn daemon(pki: &Pki, front: &support::farm::Front, name: &str) -> (Arc<MapHolder
 fn process(node: NodeUnderTest, id: MemberId, held: Arc<MapHolder>, tls: &TlsFiles) -> Process {
     let local = LocalMember::new(
         node.addr.to_string(),
-        Arc::clone(&node.storage),
+        node.in_process.clone(),
         Arc::clone(&node.maps),
     );
     let dialled = Arc::new(Counted {
@@ -120,8 +121,8 @@ async fn farm(name: &str) -> (Process, Process, Arc<kbf_map::Map>, support::farm
     let dir = scratch(name);
     let pki = Pki::new(&dir);
     let front = front(&pki, &dir);
-    let a = node(&pki, &front, "node-a", &dir.join("a")).await;
-    let b = node(&pki, &front, "node-b", &dir.join("b")).await;
+    let a = chain_node(&pki, &front, "node-a", &dir.join("a")).await;
+    let b = chain_node(&pki, &front, "node-b", &dir.join("b")).await;
     let (held_a, tls_a) = daemon(&pki, &front, "daemon-a");
     let (held_b, tls_b) = daemon(&pki, &front, "daemon-b");
     let map = map_of("daemon A", &held_a, 2).await;
@@ -138,6 +139,8 @@ async fn farm(name: &str) -> (Process, Process, Arc<kbf_map::Map>, support::farm
     };
     let (id_a, id_b) = (id(a.addr), id(b.addr));
     assert_ne!(id_a, id_b);
+    a.is_member(id_a);
+    b.is_member(id_b);
     (
         process(a, id_a, held_a, &tls_a),
         process(b, id_b, held_b, &tls_b),
@@ -146,59 +149,107 @@ async fn farm(name: &str) -> (Process, Process, Arc<kbf_map::Map>, support::farm
     )
 }
 
-/// Catches a daemon half that writes to its own node whatever the map says (the defect:
-/// every blob its daemon wrote stayed on its node, and another node's daemon, reading by
-/// the map, missed it), and a daemon half that dials a network address for a blob its own
-/// node owns. A's daemon writes a blob owned by B: it lands on B and not on A, B's daemon
-/// reads it with no call to any node, and A's daemon reads it from B. A's daemon writes a
-/// blob owned by A: it lands on A, and A's daemon dialled no node for it, to write or to
-/// read.
+/// Catches a daemon half that writes by its own rules instead of the map's, and one that
+/// reaches its own node around the node's service. The farm is two chain nodes with R = 2,
+/// so every blob is on both.
 ///
-/// Mutants: a node set that returns the local storage for every member (the daemon half
-/// always writes locally: the first blob lands on A, the dial count of A is 0 and B holds
-/// nothing).
+/// A's daemon writes a blob whose primary is B: B stores it and, as the primary, copies it
+/// to its replica A; A's daemon dialled B once and no one else. A's daemon writes a blob
+/// whose primary is A: the write is in-process (A's daemon dialled no node at all), and A,
+/// as the primary, copies it to B, which holds it when the write is answered: only the
+/// service's chain does that, so a daemon that called A's storage directly would leave one
+/// copy.
+///
+/// Mutants: the in-process `put` calling the inner storage (the second blob is on A and
+/// not on B); a node set that returns the local storage for every member (the dial counts
+/// are 0 and the first blob is on A only).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_half_writes_where_the_map_says_and_in_process_for_its_own_node() {
     let (a, b, map, _front) = farm("member-wiring").await;
 
-    // Owned by B, written by A's daemon half.
+    // Primary B, written by A's daemon half: on B, and on its replica A through B's chain.
     let bytes = blob_owned_by(&map, b.id, "b");
     let blob = digest(&bytes);
     let stored = a.cas.put(bytes.clone()).await.expect("stored");
     assert_eq!(stored, proto_digest(&blob));
-    assert!(b.node.holds(&blob).await, "the blob is on its owner, B");
-    assert!(!a.node.holds(&blob).await, "and not on A, which wrote it");
+    assert!(b.node.holds(&blob).await, "the blob is on its primary, B");
+    assert!(
+        a.node.holds(&blob).await,
+        "and on its replica, A, through B's chain"
+    );
     assert_eq!(
         a.dialled.dialled(),
         [b.node.addr.to_string()],
         "A dialled B once and no one else"
     );
-    // B's daemon half finds it on B, in-process.
     assert_eq!(b.cas.get(&stored).await.expect("B reads it"), bytes);
     assert_eq!(
         b.dialled.dialled(),
         Vec::<String>::new(),
         "B dialled no one"
     );
-    // A's reads it from B.
     assert_eq!(a.cas.get(&stored).await.expect("A reads it"), bytes);
 
-    // Owned by A, written by A's daemon half: no call to any node.
+    // Primary A, written by A's daemon half: in-process, and copied to B by A's chain.
     let before = a.dialled.dialled().len();
     let bytes = blob_owned_by(&map, a.id, "a");
     let blob = digest(&bytes);
     let stored = a.cas.put(bytes.clone()).await.expect("stored");
-    assert!(a.node.holds(&blob).await, "the blob is on its owner, A");
-    assert!(!b.node.holds(&blob).await, "and not on B");
+    assert!(a.node.holds(&blob).await, "the blob is on its primary, A");
+    assert!(
+        b.node.holds(&blob).await,
+        "and on its replica, B, through A's chain"
+    );
     assert_eq!(a.cas.get(&stored).await.expect("read back"), bytes);
     assert_eq!(
         a.dialled.dialled().len(),
         before,
-        "a blob A owns crossed no network"
+        "a blob A is the primary of crossed no network from A's daemon"
     );
-    // B's daemon half reads it from A, over the network.
     assert_eq!(b.cas.get(&stored).await.expect("B reads it"), bytes);
-    assert_eq!(b.dialled.dialled(), [a.node.addr.to_string()]);
+}
+
+/// Catches a local arm that judges no map: the daemon half's calls to its own node carry
+/// the generation the daemon routed by, so a daemon behind its node is told so (STALE_MAP),
+/// as it is by any other node, and the blob is stored nowhere. The node learns a newer map
+/// than the one the frontend (and so the daemon, which can fetch nothing newer) holds; the
+/// write the daemon half makes to the blob's primary, its own node, is refused and the
+/// router asks the frontend for the node's newer map, which the frontend does not have (the
+/// call ends when the router's bound on that ask does, a deadline that only ends a hang),
+/// and answers UNAVAILABLE.
+///
+/// Mutants: `InProcess::at` ignoring its generation (the write lands on A and on B);
+/// `check_map` removed from the in-process write body (the same).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_half_behind_its_node_is_told_so_by_its_own_node() {
+    let (a, b, map, _front) = farm("member-stale").await;
+    let newer = kbf_map::Map::new(
+        map.generation() + 1,
+        map.members().to_vec(),
+        kbf_map::Rule::Rendezvous,
+        map.r(),
+        1,
+        Vec::new(),
+    )
+    .expect("a newer map");
+    assert!(a.node.maps.offer(newer), "the node learns a newer map");
+
+    let bytes = blob_owned_by(&map, a.id, "stale");
+    let blob = digest(&bytes);
+    let refused = a
+        .cas
+        .put(bytes)
+        .await
+        .expect_err("the daemon is behind its node");
+    assert!(matches!(refused, CasError::Unavailable(..)), "{refused:?}");
+    assert!(
+        refused
+            .to_string()
+            .contains("could not fetch map generation"),
+        "{refused}"
+    );
+    assert!(!a.node.holds(&blob).await, "nothing reached A");
+    assert!(!b.node.holds(&blob).await, "and nothing B");
 }
 
 /// A plane with the map of `source`'s node held in a holder of its own, and the local
@@ -215,7 +266,7 @@ fn plane_over(
     }
     let member = LocalMember::new(
         local.node.addr.to_string(),
-        Arc::clone(&local.node.storage),
+        local.node.in_process.clone(),
         Arc::clone(node_map),
     );
     let nodes = kbf_daemon::storage_nodes(tls).expect("TLS files");

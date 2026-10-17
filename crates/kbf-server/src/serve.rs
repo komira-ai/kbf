@@ -851,6 +851,28 @@ pub fn bind_storage_gated(
     maps: Option<Arc<kbf_mapsync::MapHolder>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
+    bind_storage_shared(storage, listener, maps, shutdown).map(|(bound, _)| bound)
+}
+
+/// [`bind_storage_gated`], and the [`kbf_storage::service::InProcess`] view of the very
+/// service the listener serves: a caller in this process (the daemon half of
+/// `kbf storage-and-daemon`) reaches the node through it and takes the path a call over
+/// the listener takes, not the inner storage.
+///
+/// # Errors
+/// As [`bind_storage`].
+pub fn bind_storage_shared(
+    storage: Arc<dyn kbf_storage::Storage>,
+    listener: StorageListener,
+    maps: Option<Arc<kbf_mapsync::MapHolder>>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<
+    (
+        BoundStorage<impl Future<Output = Result<(), ServeError>>>,
+        kbf_storage::service::InProcess,
+    ),
+    ServeError,
+> {
     let (incoming, addr) = bind(listener.listen)?;
     let mut server = flow_control(Server::builder());
     let admission = match listener.tls {
@@ -860,8 +882,12 @@ pub fn bind_storage_gated(
         }
         None => kbf_storage::service::Admission::Open,
     };
-    let routes =
-        kbf_storage::service::StorageService::new(storage, admission, listener.service).routes();
+    let service = Arc::new(kbf_storage::service::StorageService::new(
+        storage,
+        admission,
+        listener.service,
+    ));
+    let (routes, in_process) = (service.shared_routes(), service.in_process());
     let gate = tonic::service::InterceptorLayer::new(map_gate(maps));
     let serving = async move {
         server
@@ -871,5 +897,5 @@ pub fn bind_storage_gated(
             .await
             .map_err(ServeError::from)
     };
-    Ok(BoundStorage { addr, serving })
+    Ok((BoundStorage { addr, serving }, in_process))
 }

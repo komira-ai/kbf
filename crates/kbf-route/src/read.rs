@@ -7,6 +7,7 @@ use bytes::{Bytes, BytesMut};
 use futures::{FutureExt as _, StreamExt as _};
 use kbf_map::MemberId;
 use kbf_proto::reapi::ActionResult;
+use kbf_segments::RecordHasher;
 use kbf_storage::{ReadStream, Storage, StorageError};
 use kbf_types::Digest;
 
@@ -18,12 +19,27 @@ use crate::source::MapView;
 pub(crate) enum Walked<T> {
     /// An owner had it.
     Found(T),
-    /// No owner did. `absent` of them said they do not hold it; `failure` is the first
-    /// that could not say (down, or holding it unreadably).
+    /// No owner did. `absent` of them said they do not hold it, or hold it unreadably or
+    /// wrong; `failure` is the first that could not say (down, or one of those).
     Missed {
         absent: usize,
         failure: Option<StorageError>,
     },
+}
+
+impl<T> Walked<T> {
+    /// What the walk found, or why it found nothing: the failure of the first owner that
+    /// could not say, else `NotFound` (every owner said it does not hold `digest`).
+    fn found(self, digest: Digest) -> Result<T, StorageError> {
+        match self {
+            Self::Found(found) => Ok(found),
+            Self::Missed {
+                failure: Some(failure),
+                ..
+            } => Err(failure),
+            Self::Missed { failure: None, .. } => Err(StorageError::NotFound(digest)),
+        }
+    }
 }
 
 impl Router {
@@ -36,7 +52,9 @@ impl Router {
     /// An owner that fails before its first byte is skipped, and a read that fails after
     /// it goes on from the bytes already passed, on whichever owner answers
     /// ([`crate::MAX_RESUMES`] times at most), each owner checking the blob as a whole
-    /// before it sends a byte, as the storage contract says.
+    /// before it sends a byte, as the storage contract says. The router does not hash what
+    /// passes through it: a caller that holds the digest checks the bytes it receives
+    /// (a whole blob is [`Router::read_blob`]).
     ///
     /// # Errors
     /// [`StorageError::NotFound`] only if every owner said it does not hold the blob;
@@ -53,12 +71,17 @@ impl Router {
     }
 
     /// A whole blob, for the small ones a caller keeps in memory. Callers of one digest
-    /// at the same time share one read, whichever owner answers it; the blob is checked
-    /// against the length its digest names (every owner verifies the bytes before it
-    /// sends them).
+    /// at the same time share one read, whichever owner answers it.
+    ///
+    /// The bytes are hashed and compared with `digest` before they are returned, whatever
+    /// the owner says it verified. An owner whose bytes do not hash to it is treated as one
+    /// that failed: the next owner is asked, and the read-repair hook is told the copy is
+    /// bad. An owner that breaks part way is the same, and the next owner is read from the
+    /// start; a blob read whole is not resumed.
     ///
     /// # Errors
-    /// As [`Router::read_range`].
+    /// As [`Router::read_range`]; [`StorageError::Corrupt`] when the first owner that
+    /// could not say was one that sent bytes that are not the blob.
     pub async fn read_blob(&self, digest: &Digest) -> Result<Bytes, StorageError> {
         let digest = *digest;
         let router = self.clone();
@@ -119,30 +142,18 @@ impl Router {
                 .await
             })
             .await?;
-        match walked {
-            Walked::Found(stream) => Ok(stream),
-            Walked::Missed {
-                failure: Some(failure),
-                ..
-            } => Err(failure),
-            Walked::Missed { failure: None, .. } => Err(StorageError::NotFound(digest)),
-        }
+        walked.found(digest)
     }
 
-    /// The whole blob, in one piece.
+    /// The whole blob, in one piece, from the first owner that sends the bytes it names.
     async fn collect(&self, digest: Digest) -> Result<Bytes, StorageError> {
-        let mut stream = self.read_range(&digest, 0, 0).await?;
-        let mut blob = BytesMut::new();
-        while let Some(chunk) = stream.next().await {
-            blob.extend_from_slice(&chunk?);
-        }
-        if blob.len() as u64 != digest.size_bytes {
-            return Err(StorageError::Internal(format!(
-                "{digest} came back as {} bytes",
-                blob.len()
-            )));
-        }
-        Ok(blob.freeze())
+        let walked = self
+            .routed(|view| async move {
+                self.walk(&view, &digest, move |node| whole(node, digest))
+                    .await
+            })
+            .await?;
+        walked.found(digest)
     }
 
     /// Asks the owners of `digest` in read order until one has what `ask` is after.
@@ -187,7 +198,10 @@ impl Router {
                     | StorageError::Invalid(_)),
                 ) => return Err(e),
                 Err(e) => {
-                    if matches!(e, StorageError::Unreachable(_)) {
+                    if matches!(
+                        e,
+                        StorageError::Unreachable(_) | StorageError::Corrupt { .. }
+                    ) {
                         absent.push(member.id);
                     }
                     failure.get_or_insert(e);
@@ -224,4 +238,39 @@ impl Router {
             repair.hook.found_elsewhere(digest, found_at, &missing);
         }
     }
+}
+
+/// The blob `digest` names, read whole from `node` and checked against it: `None` if the
+/// node does not hold it.
+///
+/// At most one byte past the blob's size is read, which is enough to know a node sends too
+/// much; reading on would only fill memory with what is thrown away.
+///
+/// # Errors
+/// [`StorageError::Corrupt`] if the bytes do not hash to `digest`; the node's own failure
+/// if it fails before or while sending.
+async fn whole(node: Arc<dyn Storage>, digest: Digest) -> Result<Option<Bytes>, StorageError> {
+    let mut stream = match node.read_range(&digest, 0, 0).await {
+        Ok(stream) => stream,
+        Err(StorageError::NotFound(_)) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let most = digest.size_bytes.saturating_add(1);
+    let mut blob = BytesMut::new();
+    let mut hasher = RecordHasher::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let room = most.saturating_sub(blob.len() as u64);
+        let take = chunk.len().min(usize::try_from(room).unwrap_or(usize::MAX));
+        hasher.update(&chunk[..take]);
+        blob.extend_from_slice(&chunk[..take]);
+        if blob.len() as u64 == most {
+            break;
+        }
+    }
+    let (actual, _) = hasher.finish();
+    if actual != digest {
+        return Err(StorageError::Corrupt { digest, actual });
+    }
+    Ok(Some(blob.freeze()))
 }

@@ -2,9 +2,9 @@
 //!
 //! The same [`Cas`] a runtime uses against [`crate::Transfers`], but each blob goes to
 //! the storage nodes that own it (`kbf_route::Router`): reads from the owners in rank
-//! order (callers of one blob at once share one read), writes to the primary, FindMissing
-//! split by primary. A daemon holds a connection to a frontend for work, and to storage
-//! nodes for bytes.
+//! order (callers of one blob at once share one read), writes to the first owner that is
+//! not down, FindMissing split by primary. A daemon holds a connection to a frontend for
+//! work, and to storage nodes for bytes.
 //!
 //! What it keeps from the engine: at most `--transfer-in-flight` requests at once for the
 //! process, FindMissing in calls of at most `--transfer-find-missing-chunk` digests, a
@@ -73,10 +73,12 @@ fn parse(digest: &Digest) -> Option<kbf_types::Digest> {
     kbf_types::Digest::parse(DigestFunction::Sha256, &label(digest)).ok()
 }
 
-/// A storage failure as the data plane's: only a blob the farm does not hold is missing.
+/// A storage failure as the data plane's: only a blob the farm does not hold is missing,
+/// and only bytes that are not the blob are corrupt.
 fn failed(blob: String, error: &StorageError) -> CasError {
     match error {
         StorageError::NotFound(_) => CasError::Missing(blob),
+        StorageError::Corrupt { actual, .. } => CasError::Corrupt(blob, label(&to_proto(actual))),
         other => CasError::Unavailable(blob, other.to_string()),
     }
 }

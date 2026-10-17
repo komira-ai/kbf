@@ -129,3 +129,12 @@ pub(super) fn refusal_of(e: &ActionWriteError) -> Refusal {
         blob,
     }
 }
+
+/// The answer of a `Write` that has stored a blob of `size` bytes.
+pub(super) fn committed(
+    size: u64,
+) -> tonic::Response<kbf_proto::google::bytestream::WriteResponse> {
+    tonic::Response::new(kbf_proto::google::bytestream::WriteResponse {
+        committed_size: i64::try_from(size).unwrap_or(i64::MAX),
+    })
+}

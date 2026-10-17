@@ -4,8 +4,10 @@
 
 use std::future::pending;
 use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use kbf_map::{Map, MemberId};
@@ -14,7 +16,10 @@ use kbf_server::frontend::{self, FrontendHandle, start_frontend};
 use kbf_server::storage_half::{self, StorageHalf};
 use kbf_server::storage_node;
 use kbf_storage::Storage;
-use kbf_storage::service::ROLE_URI_PREFIX;
+use kbf_storage::repair::{NoLedger, Options, Repairs};
+use kbf_storage::replicate::{Chain, ChainConfig, MapSource, Peers};
+use kbf_storage::service::{Admission, Config, InProcess, ROLE_URI_PREFIX, StorageService};
+use kbf_store::StdFs;
 use kbf_types::Digest;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -22,6 +27,10 @@ use rcgen::{
 };
 use tokio::sync::oneshot;
 use tokio::time::timeout;
+use tonic::transport::server::TcpIncoming;
+use tonic::transport::{Certificate, ClientTlsConfig, Identity, Server, ServerTlsConfig};
+
+use super::storage_node::Spy;
 
 /// A deadline that only ends a hang.
 pub const HANG: Duration = Duration::from_secs(40);
@@ -156,22 +165,141 @@ pub async fn node(pki: &Pki, front: &Front, name: &str, dir: &Path) -> NodeUnder
     let half = storage_half::start(&flags, || Ok(pending::<()>()))
         .await
         .expect("the node starts");
-    let (addr, storage, maps) = (half.addr, half.storage(), half.maps());
+    let (addr, storage, maps, in_process) =
+        (half.addr, half.storage(), half.maps(), half.in_process());
     tokio::spawn(StorageHalf::serve(half));
     NodeUnderTest {
         addr,
         storage,
+        in_process,
         maps,
+        me: None,
+    }
+}
+
+/// What a chain node learns of the map: the holder the frontend's maps arrive in, and the
+/// member id the frontend gave it (set by the test once the map names it).
+struct HeldMap {
+    maps: Arc<MapHolder>,
+    me: AtomicU64,
+}
+
+impl MapSource for HeldMap {
+    fn current(&self) -> Option<Arc<Map>> {
+        self.maps.current()
+    }
+
+    fn me(&self) -> Option<MemberId> {
+        match self.me.load(Ordering::SeqCst) {
+            0 => None,
+            id => Some(MemberId(id)),
+        }
+    }
+}
+
+/// A storage node that is a node of a chain (R = 2): its service judges every call by the
+/// map the frontend sends it and, as the primary of a blob, copies it to the replica
+/// before it answers. It registers with `front` as `kbf storage-and-daemon`'s half does.
+/// The store is a [`Spy`] that takes a blob as a stream, which the real cache does not
+/// yet and a chain's primary needs; the server does not wire a chain yet either, so the
+/// service is built here.
+pub async fn chain_node(pki: &Pki, front: &Front, name: &str, dir: &Path) -> NodeUnderTest {
+    let own = pki.cert(name, "storage", &["localhost"]);
+    let argv = [
+        "storage".to_owned(),
+        "--storage-listen=127.0.0.1:0".to_owned(),
+        format!("--cold-store=file://{}", dir.join("cold").display()),
+        format!("--meta-dir={}", dir.join("meta").display()),
+        format!("--frontend=https://localhost:{}", front.worker.port()),
+        format!("--storage-tls-cert={}", own.cert.display()),
+        format!("--storage-tls-key={}", own.key.display()),
+        format!("--storage-client-ca={}", pki.ca().display()),
+    ];
+    let flags = storage_node::parse(
+        &storage_node::command()
+            .try_get_matches_from(argv)
+            .expect("the node's flags"),
+    )
+    .expect("parses");
+    let read = |path: &Path| std::fs::read(path).expect("read a TLS file");
+    let ca = Certificate::from_pem(read(&pki.ca()));
+    let identity = Identity::from_pem(read(&own.cert), read(&own.key));
+    let maps = Arc::new(MapHolder::new());
+    let held = Arc::new(HeldMap {
+        maps: Arc::clone(&maps),
+        me: AtomicU64::new(0),
+    });
+    std::fs::create_dir_all(dir.join("repairs")).expect("repairs dir");
+    let repairs = Repairs::open(
+        StdFs::new(dir.join("repairs")).expect("repairs fs"),
+        Options::default(),
+        Arc::new(NoLedger),
+    )
+    .expect("a journal");
+    let calls_as = ClientTlsConfig::new()
+        .ca_certificate(ca.clone())
+        .identity(identity.clone());
+    let chain = Arc::new(Chain::new(
+        Arc::clone(&held) as Arc<dyn MapSource>,
+        Peers::tls(calls_as),
+        Arc::new(repairs),
+        ChainConfig::default(),
+    ));
+    let store = Spy::streaming();
+    let service = Arc::new(
+        StorageService::new(
+            Arc::clone(&store) as Arc<dyn Storage>,
+            Admission::Certified,
+            Config {
+                write_bytes_in_flight: 64 << 20,
+            },
+        )
+        .with_chain(chain)
+        .expect("a certified service"),
+    );
+    let incoming = TcpIncoming::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
+    let addr = incoming.local_addr().expect("address");
+    let tls = ServerTlsConfig::new().identity(identity).client_ca_root(ca);
+    tokio::spawn(
+        Server::builder()
+            .tls_config(tls)
+            .expect("TLS config")
+            .add_routes(service.shared_routes())
+            .serve_with_incoming(incoming),
+    );
+    let joiner = flags
+        .joiner(addr, Arc::clone(&maps))
+        .expect("the joiner")
+        .expect("a frontend");
+    tokio::spawn(joiner.run());
+    NodeUnderTest {
+        addr,
+        storage: store as Arc<dyn Storage>,
+        in_process: service.in_process(),
+        maps,
+        me: Some(held),
     }
 }
 
 pub struct NodeUnderTest {
     pub addr: std::net::SocketAddr,
+    /// The node's store itself.
     pub storage: Arc<dyn Storage>,
+    /// The node's service, called in-process: what a daemon half reaches its own node by.
+    pub in_process: InProcess,
     pub maps: Arc<MapHolder>,
+    /// A chain node's map source, whose member id the test sets.
+    me: Option<Arc<HeldMap>>,
 }
 
 impl NodeUnderTest {
+    /// Tells a chain node which member of the map it is (the frontend assigned the id at
+    /// registration; the map names it by the address the node registered).
+    pub fn is_member(&self, id: MemberId) {
+        let held = self.me.as_ref().expect("a chain node");
+        held.me.store(id.0, Ordering::SeqCst);
+    }
+
     pub async fn holds(&self, digest: &Digest) -> bool {
         self.storage
             .find_missing(std::slice::from_ref(digest))

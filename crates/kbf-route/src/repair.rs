@@ -21,7 +21,7 @@ use tokio::time::Instant;
 pub trait ReadRepair: Send + Sync {
     /// A read of `digest` was answered by `found_at` after the owners `missing_at`, of
     /// the map the read was routed by, answered that they did not hold it (or held it
-    /// unreadably). Returns at once: it queues, it never copies the blob inline.
+    /// unreadably, or sent bytes that are not the blob). Returns at once: it queues, it never copies the blob inline.
     fn found_elsewhere(&self, digest: &Digest, found_at: MemberId, missing_at: &[MemberId]);
 }
 
