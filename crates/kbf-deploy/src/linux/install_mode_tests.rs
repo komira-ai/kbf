@@ -179,7 +179,8 @@ fn the_storage_unit_is_installed_and_a_rerun_plans_nothing() {
         [
             "mkdir /var/lib/kbf-server (0755)".to_owned(),
             format!("mkdir /var/lib/kbf-server/raft (0700, owner {uid}:{gid})"),
-            format!("mkdir /var/lib/kbf-server/hot (0700, owner {uid}:{gid})"),
+            "mkdir /var/lib/kbf (0755)".to_owned(),
+            format!("mkdir /var/lib/kbf/hot (0700, owner {uid}:{gid})"),
             "run /usr/bin/systemctl daemon-reload".to_owned(),
             "run /usr/bin/systemctl enable kbf-storage.service".to_owned(),
             "run /usr/bin/systemctl restart kbf-storage.service".to_owned(),
@@ -612,15 +613,131 @@ fn the_directories_come_from_the_flags_the_units_carry() {
         [
             "/var/lib/kbf 755",
             "/var/lib/kbf-server/raft 700",
-            "/var/lib/kbf-server/hot 700",
+            "/var/lib/kbf/hot 700",
         ]
     );
     assert_eq!(dirs(Mode::Frontend), ["/var/lib/kbf-server/state 700"]);
     assert_eq!(
         dirs(Mode::Storage),
-        [
-            "/var/lib/kbf-server/raft 700",
-            "/var/lib/kbf-server/hot 700"
-        ]
+        ["/var/lib/kbf-server/raft 700", "/var/lib/kbf/hot 700"]
+    );
+}
+
+/// The live failure: `storage-and-daemon` runs as `KBF_USER` and its `--hot-store` sat
+/// under `/var/lib/kbf-server`, the server account's, mode 0700. The scratch host cannot
+/// chown, so the unit's user has another uid than the test's (the owner of every
+/// directory); with the directory above the hot store 0700 the install is refused
+/// before any step, naming the directory and the user, and with it 0755 the check is
+/// silent. Catches a traverse check that is skipped, one that reads the wrong user, and
+/// a message that leaves out the path or the user.
+#[test]
+fn a_hot_store_the_unit_user_cannot_reach_is_refused() {
+    let (uid, gid) = me();
+    let other = |world: &RefCell<World>| {
+        world
+            .borrow_mut()
+            .users
+            .insert("kbf".to_owned(), (uid + 1, gid + 1));
+    };
+    let a = |hot: &str| InstallMode {
+        config: LinuxConfig::parse(&EXAMPLE.replace(
+            "KBF_HOT_DIR=/var/lib/kbf/hot",
+            &format!("KBF_HOT_DIR={hot}"),
+        ))
+        .expect("valid settings"),
+        mode: Mode::StorageAndDaemon,
+        bin_dir: None,
+    };
+    let (exec, world) = host("install-mode-hot-0700");
+    other(&world);
+    fs::set_permissions(exec.at("/"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    let parent = exec.at("/var/lib/kbf-server");
+    fs::create_dir_all(&parent).expect("dirs");
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("chmod");
+    let hot = a("/var/lib/kbf-server/hot");
+    let e = plan_here(&exec, &hot).expect_err("refused");
+    let HostError::Units(failures) = &e else {
+        panic!("{e}");
+    };
+    // (The scratch host's keys are the test's uid's, so rule `credential` fails too.)
+    let traverse: Vec<_> = failures.iter().filter(|f| f.rule == "traverse").collect();
+    assert_eq!(traverse.len(), 1, "{e}");
+    let f = traverse[0];
+    assert!(
+        f.message.contains("/var/lib/kbf-server/hot")
+            && f.message.contains("/var/lib/kbf-server (mode 0700")
+            && f.message.contains("kbf"),
+        "{}",
+        f.message
+    );
+    // Another hot directory, not under it, is reached.
+    let report = |a: &InstallMode| {
+        let c = &a.config;
+        let kbf = modes::render(c, Some(uid + 1), a.mode).expect("renders");
+        let slice = render(c, None, &Templates::BUILT_IN).expect("slice").slice;
+        modes::check_on_host(
+            &exec,
+            c,
+            a.mode,
+            &UnitText::new(a.mode.unit_name(), kbf),
+            &UnitText::new(SLICE, slice),
+            true,
+            None,
+        )
+        .expect("checks")
+    };
+    let ok = report(&a("/var/lib/kbf/hot"));
+    assert!(
+        ok.failures.iter().all(|f| f.rule != "traverse"),
+        "{:?}",
+        ok.failures
+    );
+    // Opened to others, the same directory passes.
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let ok = report(&hot);
+    assert!(
+        ok.failures.iter().all(|f| f.rule != "traverse"),
+        "{:?}",
+        ok.failures
+    );
+    // The same refusal is check-units' on this host.
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("chmod");
+    let bad = report(&hot);
+    assert!(bad.failures.iter().any(|f| f.rule == "traverse"));
+}
+
+/// root enters every directory whatever its mode: a unit whose `User=` is uid 0 over a
+/// 0700 parent of the hot store is not a `traverse` failure. Catches a check that
+/// applies the mode bits to root.
+#[test]
+fn root_is_not_refused_a_hot_store_under_a_0700_directory() {
+    let (exec, world) = host("install-mode-hot-root");
+    world.borrow_mut().users.insert("kbf".to_owned(), (0, 0));
+    fs::set_permissions(exec.at("/"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    let parent = exec.at("/var/lib/kbf-server");
+    fs::create_dir_all(&parent).expect("dirs");
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("chmod");
+    let c = LinuxConfig::parse(&EXAMPLE.replace(
+        "KBF_HOT_DIR=/var/lib/kbf/hot",
+        "KBF_HOT_DIR=/var/lib/kbf-server/hot",
+    ))
+    .expect("valid settings");
+    let mode = Mode::StorageAndDaemon;
+    let kbf = modes::render(&c, Some(0), mode).expect("renders");
+    let slice = render(&c, None, &Templates::BUILT_IN).expect("slice").slice;
+    let report = modes::check_on_host(
+        &exec,
+        &c,
+        mode,
+        &UnitText::new(mode.unit_name(), kbf),
+        &UnitText::new(SLICE, slice),
+        true,
+        None,
+    )
+    .expect("checks");
+    assert!(
+        report.failures.iter().all(|f| f.rule != "traverse"),
+        "{:?}",
+        report.failures
     );
 }
