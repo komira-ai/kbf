@@ -350,3 +350,16 @@ async fn a_segment_begin_waiting_for_the_map_is_open() {
     assert!(in_this_process.await.expect("joins").is_err());
     count_reaches(&open, 0).await;
 }
+
+/// Catches a store that does not count its segment uploads being refused or breaking: the
+/// default `segments_counted` answers the plain handlers (the client of a remote node is one),
+/// which count nothing, so a service over such a store still starts and under-reports only
+/// segment uploads (the trait documents it).
+#[tokio::test]
+async fn a_store_that_does_not_count_answers_its_plain_handlers() {
+    let mem = Arc::new(Mem::default());
+    let open = OpenWrites::new();
+    let (_, remote, _) = node(&mem, &open).await;
+    let _handlers = remote.segments_counted(&open);
+    assert_eq!(open.count(), 0);
+}
