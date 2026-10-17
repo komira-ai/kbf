@@ -120,6 +120,24 @@ impl Entry {
         Ok(names)
     }
 
+    /// Remove the file `name` from the entry, by `unlinkat` on the entry's descriptor: the
+    /// name is one component of the directory that was opened, so no link in the writer's
+    /// control can send the removal elsewhere (it removes a link itself, never its target).
+    /// A name that is not there is removed already.
+    pub fn remove_file(&self, name: &str) -> Result<(), Refusal> {
+        let refuse = |fault| Refusal::Inbox {
+            name: name.to_owned(),
+            fault,
+        };
+        if matches!(name, "" | "." | "..") || name.contains(['/', '\0']) {
+            return Err(refuse(InboxFault::BadName));
+        }
+        match rustix::fs::unlinkat(&self.dir, name, rustix::fs::AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(e) => Err(refuse(fault_of(e, InboxFault::NotRegular))),
+        }
+    }
+
     /// Open the file `name` beneath the entry and judge it by its descriptor: a regular
     /// file with one link, not empty, of at most `cap` bytes.
     pub fn open_file(&self, name: &str, cap: u64) -> Result<File, Refusal> {

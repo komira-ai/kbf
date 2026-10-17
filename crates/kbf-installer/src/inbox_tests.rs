@@ -255,3 +255,36 @@ fn an_open_error_no_rule_names_is_reported_as_unreadable() {
         "{fault:?}"
     );
 }
+
+/// Catches the helper removing what a link points at instead of the link: the entry holds a
+/// link to a file outside it, and removing the link by name leaves the target. Also a name
+/// that is not a single component is refused, and a name that is gone is not an error.
+///
+/// Mutant seen red: the removal done through a path (`fs::remove_file(dir/name)`) with the
+/// name `../secret`: the BadName check dropped, the outside file goes.
+#[test]
+fn a_removal_takes_the_name_in_the_entry_and_nothing_else() {
+    let (dir, entry) = entry_with("inbox-remove", OpenMode::NoFollow);
+    let e = dir.join("entry");
+    fs::write(dir.join("secret"), b"not yours").expect("seed");
+    fs::write(e.join("order"), b"{}").expect("seed");
+    symlink(dir.join("secret"), e.join("link")).expect("link");
+    entry.remove_file("order").expect("removed");
+    entry.remove_file("link").expect("the link is removed");
+    entry.remove_file("order").expect("gone already");
+    assert!(!e.join("order").exists());
+    assert!(e.join("link").symlink_metadata().is_err());
+    assert_eq!(fs::read(dir.join("secret")).expect("kept"), b"not yours");
+    for bad in ["../secret", "a/b", "", ".", ".."] {
+        assert_eq!(
+            entry.remove_file(bad).expect_err("refused").code(),
+            "inbox-bad-name",
+            "{bad:?}"
+        );
+    }
+    assert!(dir.join("secret").exists());
+    // A directory is not a file to remove (unlinkat without REMOVEDIR): refused, kept.
+    fs::create_dir(e.join("sub")).expect("dir");
+    assert!(entry.remove_file("sub").is_err());
+    assert!(e.join("sub").is_dir());
+}
