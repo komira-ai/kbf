@@ -365,8 +365,8 @@ fn listeners(worker_tls: Option<WorkerTls>) -> Listeners {
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
-        timing: kbf_server::StreamTiming::default(),
-        streams: kbf_server::StreamLimits::DEFAULT,
+        streams: kbf_server::StreamTiming::default(),
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     }
 }
 
@@ -404,7 +404,7 @@ fn registration() -> pb::RegisterRequest {
         weight: 1,
         zone: "a".to_owned(),
         protocol: PROTOCOL,
-        catching_up: false,
+        ..pb::RegisterRequest::default()
     }
 }
 
@@ -494,8 +494,7 @@ async fn each_half_of_a_node_is_served_on_its_own_certificate() {
     let beat = pb::HeartbeatRequest {
         member_id: registered.member_id,
         boot: registered.boot,
-        catching_up: false,
-        have_generation: 0,
+        ..pb::HeartbeatRequest::default()
     };
     membership
         .heartbeat(beat)
@@ -535,8 +534,7 @@ async fn a_daemon_certificate_may_not_register_or_heartbeat() {
         .heartbeat(pb::HeartbeatRequest {
             member_id: 1,
             boot: 1,
-            catching_up: false,
-            have_generation: 0,
+            ..pb::HeartbeatRequest::default()
         })
         .await
         .expect_err("refused");

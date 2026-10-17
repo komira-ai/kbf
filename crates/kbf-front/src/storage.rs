@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
@@ -18,7 +18,7 @@ use kbf_storage::{
 };
 use kbf_types::Digest;
 
-use crate::cache::{Cache, CacheError, RecordStream, StreamedRecord, VerifiedBlob};
+use crate::cache::{BlobRead, Cache, CacheError, RecordStream, StreamedRecord, VerifiedBlob};
 use crate::meta_log::MetaLog;
 use crate::segments::{Connections, SegmentsConfig, SegmentsService};
 
@@ -47,16 +47,13 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
         Box::pin(async move { Ok(self.cache.read_blob(digest).await?) })
     }
 
-    /// The cache checks a blob against its digest only after its last window
-    /// ([`Cache::read_windows`]), so this reads every window, gathers the blob, and cuts
-    /// the answer: the blob is read and checked against its digest as a whole, for any
-    /// `offset` and `limit`, before the first chunk is sent.
-    ///
-    /// Memory: the one blob is held once, until the stream is dropped or read to the
-    /// end; each chunk is a zero-copy slice of it, at most [`READ_CHUNK_BYTES`], made
-    /// when the stream is polled. A caller does not hold the blob, but this store does:
-    /// a read in pieces from the object store, checked before it is sent, needs the
-    /// cache to check a record in pieces, which it cannot.
+    /// The cache's windowed read ([`Cache::read_windows`]): the blob is read and hashed
+    /// a window at a time (at most [`crate::READ_WINDOW_BYTES`] in memory, whatever the
+    /// blob's size), the last window handed over only once the whole blob checked against
+    /// its digest, so a stream that ends cleanly delivered a verified blob and a damaged
+    /// one ends in an error (the first window is read before the answer, so a blob
+    /// that fails there is the call's error). The windows are cut to chunks of at most
+    /// [`READ_CHUNK_BYTES`], zero-copy.
     fn read_range<'a>(
         &'a self,
         digest: &'a Digest,
@@ -70,15 +67,23 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
                     offset,
                 });
             }
-            let mut read = self
-                .cache
-                .read_windows(digest, 0, digest.size_bytes)
-                .await?;
-            let mut blob = BytesMut::new();
-            while let Some(window) = read.next().await {
-                blob.extend_from_slice(&window?);
+            let end = if limit == 0 {
+                digest.size_bytes
+            } else {
+                digest.size_bytes.min(offset.saturating_add(limit))
+            };
+            let read = self.cache.read_windows(digest, offset, end).await?;
+            let mut chunks = chunks(read);
+            // The first window is read before the answer, so a blob that is gone or
+            // damaged (found by its first window, or by the whole of a one-window blob) is
+            // the call's error, where its gRPC code is still open.
+            match chunks.next().await {
+                Some(Err(e)) => Err(e),
+                Some(Ok(first)) => Ok(futures::stream::once(async move { Ok(first) })
+                    .chain(chunks)
+                    .boxed()),
+                None => Ok(futures::stream::empty().boxed()),
             }
-            Ok(chunks(blob.freeze(), offset, limit))
         })
     }
 
@@ -95,14 +100,16 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
         })
     }
 
-    /// The cache's own stream, onto its write tier or to the store ([`Cache::stream`]).
+    /// The cache's own stream ([`Cache::stream`]): onto the write tier when it has room,
+    /// else to the object store as the bytes come. `None` only for a size of 0 or a cache
+    /// made outside a runtime.
     fn stream(&self, size: u64) -> Option<Box<dyn PutStream>> {
         let stream = self.cache.stream(size)?;
-        Some(Box::new(stream))
+        Some(Box::new(Writing(stream)))
     }
 
-    /// The cache's own streamed write to the object store
-    /// ([`Cache::store_streamed_claimed`]), each failed piece of `bytes` a body error.
+    /// The cache's streamed store ([`Cache::store_streamed_claimed`]), admitted as a
+    /// ByteStream `Write` that streams to the store is.
     fn put_streamed(
         &self,
         size: u64,
@@ -151,9 +158,12 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
     }
 }
 
-impl<M: MetaLog, O: ObjectStore + 'static> PutStream for RecordStream<M, O> {
+/// A record being written ([`Storage::stream`]): the cache's [`RecordStream`].
+struct Writing<M, O>(RecordStream<M, O>);
+
+impl<M: MetaLog, O: ObjectStore + 'static> PutStream for Writing<M, O> {
     fn append(&mut self, chunk: &[u8]) -> Result<(), StorageError> {
-        Ok(RecordStream::append(self, chunk)?)
+        Ok(self.0.append(chunk)?)
     }
 
     fn finish(
@@ -161,33 +171,33 @@ impl<M: MetaLog, O: ObjectStore + 'static> PutStream for RecordStream<M, O> {
         digest: Digest,
         crc32c: u32,
     ) -> Result<Box<dyn StreamedPut>, StorageError> {
-        let streamed = RecordStream::finish(*self, digest, crc32c)?;
-        Ok(Box::new(streamed))
+        let streamed = self.0.finish(digest, crc32c)?;
+        Ok(Box::new(Written(streamed)))
     }
 }
 
-impl<M: MetaLog, O: ObjectStore + 'static> StreamedPut for StreamedRecord<M, O> {
+/// A record whose bytes are all written and checked ([`StreamedRecord`]).
+struct Written<M, O>(StreamedRecord<M, O>);
+
+impl<M: MetaLog, O: ObjectStore + 'static> StreamedPut for Written<M, O> {
     fn commit(self: Box<Self>) -> Answer<'static, ()> {
-        Box::pin(async move { Ok(StreamedRecord::commit(*self).await?) })
+        Box::pin(async move { Ok(self.0.commit().await?) })
     }
 }
 
-/// `blob[offset..]`, cut to `limit` bytes unless that is 0, as a stream of zero-copy
-/// slices of at most [`READ_CHUNK_BYTES`]. `blob` is the whole blob, already checked.
-fn chunks(blob: Bytes, offset: u64, limit: u64) -> ReadStream {
-    let len = blob.len();
-    let start = usize::try_from(offset).map_or(len, |o| o.min(len));
-    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-    let end = if limit == 0 {
-        len
-    } else {
-        start.saturating_add(limit).min(len)
-    };
-    futures::stream::iter(
-        (start..end)
-            .step_by(READ_CHUNK_BYTES)
-            .map(move |at| Ok(blob.slice(at..end.min(at + READ_CHUNK_BYTES)))),
-    )
+/// The windows `read` hands over, cut to chunks of at most [`READ_CHUNK_BYTES`] as
+/// zero-copy slices. A window that fails is the stream's last item.
+fn chunks<M: MetaLog, O: ObjectStore + 'static>(read: BlobRead<M, O>) -> ReadStream {
+    futures::stream::unfold((read, Bytes::new()), |(mut read, mut held)| async move {
+        if held.is_empty() {
+            match read.next().await? {
+                Ok(window) => held = window,
+                Err(e) => return Some((Err(e.into()), (read, Bytes::new()))),
+            }
+        }
+        let chunk = held.split_to(held.len().min(READ_CHUNK_BYTES));
+        Some((Ok(chunk), (read, held)))
+    })
     .boxed()
 }
 

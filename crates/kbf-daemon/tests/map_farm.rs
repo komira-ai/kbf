@@ -64,11 +64,11 @@ async fn farm(name: &str, source: Arc<dyn MapSource>) -> Arc<MapHolder> {
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: Duration::from_secs(60),
         shutdown_timeout: Duration::from_secs(10),
-        timing: kbf_server::StreamTiming::default(),
-        streams: kbf_server::StreamLimits::DEFAULT,
+        streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     };
     let cache = Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory());
     let bound = bind_server_with_map(

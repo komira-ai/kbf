@@ -80,12 +80,13 @@ server's own code:
 - **A whole blob** (`put`, and `put_chunks` through it): hashed once, by the server,
   under the admission a ByteStream `Write` takes; a `put_chunks` blob over 16 MiB is
   streamed to the cold store as its chunks are read, never gathered.
-- **Reads** (`get`) and **FindMissing** (`missing`): the cache's own, which checks every
-  blob it reads against its digest.
-- **Streamed reads** (`read_to`, what the input cache fills a file with): the cache's
-  streamed read (`LocalStore::read_stream`), pumped on the server half's runtime a chunk
-  at a time into the file as it arrives (at most two chunks between the halves, never
-  the blob), and hashed: a stream cut short is not taken for the blob.
+- **Reads** (`get` whole, for a blob the daemon decodes) and **FindMissing** (`missing`):
+  the cache's own, which checks every blob it reads against its digest.
+- **Streamed reads** (`read_to`, what the input cache fills a file with): the storage's
+  windowed read (`LocalStore::read_stream`, a window of the blob in memory at a time),
+  pumped on the server half's runtime a chunk at a time into the file as it arrives (at
+  most two chunks between the halves, never the blob), and hashed: a stream cut short is
+  not taken for the blob.
 
 No message a remote daemon sends changes: `kbf-daemon` still uses the transfer engine.
 
@@ -134,6 +135,11 @@ durable store, not a cache: a `file://` cold store on the same disk holds its ow
   file, which must be one each (a file over 1 GiB too, held after with a tier and
   without one), and every blob reads back as the file; a blob over 5 GiB is not
   refused for its size.
+- `tests/memory.rs`: a counting allocator over the whole in-process path (the walk,
+  the plane, the server's upload until its commit): a 2 GiB output streams onto the
+  write tier with under 16 MiB live, and so does a 2 GiB upload through the server's
+  `Segments` handlers (a remote daemon's path); without a tier, a 256 MiB output
+  streams to the cold store with under 16 MiB live.
 - `tests/binary.rs` also runs one action whose 3 MiB input a client uploaded: once the
   hot store is flushed, one inode under the hot store and the data directory holds the
   input (the input cache's entry) and `/metrics` counts it once; after a SIGKILL and a
@@ -146,11 +152,6 @@ durable store, not a cache: a `file://` cold store on the same disk holds its ow
   is gone; the hot store's staged blocks reported to the one cache as its storage
   bytes; and a server half that keeps flushed copies without the one cache and none
   with it.
-- `tests/memory.rs`: a counting allocator over the whole in-process path (the walk,
-  the plane, the server's upload until its commit): a 2 GiB output streams onto the
-  write tier with under 16 MiB live, and so does a 2 GiB upload through the server's
-  `Segments` handlers (a remote daemon's path); without a tier, a 256 MiB output
-  streams to the cold store with under 16 MiB live.
 - `tests/helpers.rs`: the daemon's helpers run through this binary. The keeper,
   waiting on its stdin as it does for a run's whole life, has one thread and no
   socket, epoll, eventfd or directory open (read from `/proc`), then writes its kill

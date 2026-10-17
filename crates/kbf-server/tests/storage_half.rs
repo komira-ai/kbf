@@ -163,14 +163,6 @@ impl kbf_storage::Storage for Watched {
     fn stream(&self, size: u64) -> Option<Box<dyn kbf_storage::PutStream>> {
         self.inner.stream(size)
     }
-    fn put_streamed(
-        &self,
-        size: u64,
-        bytes: futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
-        claim: futures::future::BoxFuture<'static, Option<kbf_types::Digest>>,
-    ) -> kbf_storage::Answer<'_, Option<kbf_types::Digest>> {
-        self.inner.put_streamed(size, bytes, claim)
-    }
     fn segments(&self) -> Arc<dyn kbf_proto::worker::segments_server::Segments> {
         self.inner.segments()
     }

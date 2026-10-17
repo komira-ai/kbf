@@ -360,7 +360,7 @@ pub struct Args {
     /// default 33 MiB, under the default 2 GiB). Not covered: each HTTP/2
     /// stream's message as tonic decodes it, before the handler runs, up to 17 MiB per
     /// stream (about 3.4 GiB for 200 streams), times the streams one connection may open
-    /// (each listener's `-max-streams` flag).
+    /// on each listener.
     #[arg(
         long,
         default_value_t = kbf_front::WriteConfig::DEFAULT.bytes_in_flight,
@@ -570,7 +570,7 @@ impl Args {
                 0 => Duration::MAX,
                 secs => Duration::from_secs(secs),
             },
-            timing: StreamTiming {
+            streams: StreamTiming {
                 progress_interval: Duration::from_secs(self.progress_interval_secs),
                 keepalive_interval: Duration::from_secs(self.http2_keepalive_interval_secs),
                 keepalive_timeout: Duration::from_secs(self.http2_keepalive_timeout_secs),
@@ -581,7 +581,7 @@ impl Args {
                 max_bytes: self.segment_upload_max_bytes,
                 idle: Duration::from_secs(self.segment_upload_idle_secs),
             },
-            streams: self.streams.limits(),
+            stream_limits: self.streams.limits(),
         })
     }
 

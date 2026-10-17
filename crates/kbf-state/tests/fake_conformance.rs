@@ -28,6 +28,14 @@ fn partial_transaction_fails_c2() {
     c2_atomic_txn(&FakeBackend::new(Flaw::PartialTxn));
 }
 
+// Catches a counter kept outside the transaction: an aborted increment is not rolled
+// back, so the next value skips it.
+#[test]
+#[should_panic(expected = "C2 counter: a counter incremented in an aborted transaction changed")]
+fn a_counter_that_survives_an_abort_fails_c2() {
+    c2_atomic_txn(&FakeBackend::new(Flaw::CounterSurvivesAbort));
+}
+
 // Catches a counter that is not durable, so a value is reissued after restart.
 #[test]
 #[should_panic(expected = "C3 restart")]
@@ -40,6 +48,14 @@ fn forgotten_counter_fails_c3() {
 #[should_panic(expected = "C4 expiry")]
 fn caller_clock_expiry_fails_c4() {
     c4_store_clock_expiry(&FakeBackend::new(Flaw::CallerClockExpiry));
+}
+
+// Catches a key that is still live at the reading that equals its expiry: the boundary
+// is the one place a `<` and a `<=` differ, and the other C4 steps step over it.
+#[test]
+#[should_panic(expected = "C4 boundary: a key whose ttl ends exactly now is expired, and get")]
+fn a_key_live_at_its_exact_expiry_fails_c4() {
+    c4_store_clock_expiry(&FakeBackend::new(Flaw::InclusiveExpiry));
 }
 
 // Catches a feed that advances past a revision that has not committed: the poller
@@ -62,6 +78,14 @@ fn ack_before_sync_fails_c6() {
 #[should_panic(expected = "C7 latency")]
 fn ungrouped_writes_fail_c7() {
     c7_group_commit(&FakeBackend::new(Flaw::Ungrouped));
+}
+
+// Catches a batch that pays two syncs: 4 ms of store time is inside the window, so the
+// latency bound passes and only the sync count fails.
+#[test]
+#[should_panic(expected = "C7 syncs")]
+fn a_double_sync_fails_c7_on_the_sync_count() {
+    c7_group_commit(&FakeBackend::new(Flaw::DoubleSync));
 }
 
 // Catches a range scan that returns every key of its range, past its limit.

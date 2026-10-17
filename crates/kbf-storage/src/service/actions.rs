@@ -1,6 +1,6 @@
 //! `kbf.storage.v1.ActionStore`: the action cache over [`crate::Storage`].
 
-use kbf_meta::{ActionRecord, ActionWriteError, Closure, Role};
+use kbf_meta::{ActionRecord, Closure, Role};
 use kbf_proto::storage::action_store_server::ActionStore;
 use kbf_proto::storage::{
     CommitRequest, CommitResponse, Entry, GetRequest, GetResponse, PrepareRequest, PrepareResponse,
@@ -24,22 +24,6 @@ fn record_of(record: Option<&Record>) -> Result<ActionRecord, Status> {
     })
 }
 
-/// A write refused for a closure blob the store did not find, while the node is catching
-/// up: the blob may be held but not yet indexed, so the caller is told to try again
-/// (UNAVAILABLE), not that the blob is missing (the refusal it would act on by uploading).
-fn retryable(refused: &ActionWriteError, catching_up: bool) -> Option<Status> {
-    match refused {
-        ActionWriteError::Absent(blobs) if catching_up => {
-            let named: Vec<String> = blobs.iter().map(ToString::to_string).collect();
-            Some(catch_up::unavailable(&format!(
-                "closure blobs {}",
-                named.join(", ")
-            )))
-        }
-        _ => None,
-    }
-}
-
 #[tonic::async_trait]
 impl ActionStore for StorageService {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
@@ -49,10 +33,8 @@ impl ActionStore for StorageService {
         let action = wire::digest(request.action.as_ref())?;
         let catching_up = self.catching_up();
         let entry = self.storage.action_result(&action).await?;
-        if catching_up && entry.is_none() {
-            return Err(catch_up::unavailable(&format!(
-                "the entry of action {action}"
-            )));
+        if let Some(status) = catch_up::entry_miss(catching_up, entry.is_some(), &action) {
+            return Err(status);
         }
         Ok(Response::new(GetResponse {
             entry: entry.map(|(digest, result)| Entry {
@@ -79,7 +61,7 @@ impl ActionStore for StorageService {
                 closure: record.closure.iter().map(wire::to_proto).collect(),
             }),
             Err(StorageError::ActionWrite(refused)) => {
-                if let Some(status) = retryable(&refused, catching_up) {
+                if let Some(status) = catch_up::retryable(catching_up, &refused) {
                     return Err(status);
                 }
                 prepare_response::Outcome::Refused(wire::refusal_of(&refused))
@@ -112,12 +94,14 @@ impl ActionStore for StorageService {
             .await
         {
             Ok(()) => Ok(Response::new(CommitResponse { refused: None })),
-            Err(StorageError::ActionWrite(refused)) => match retryable(&refused, catching_up) {
-                Some(status) => Err(status),
-                None => Ok(Response::new(CommitResponse {
-                    refused: Some(wire::refusal_of(&refused)),
-                })),
-            },
+            Err(StorageError::ActionWrite(refused)) => {
+                match catch_up::retryable(catching_up, &refused) {
+                    Some(status) => Err(status),
+                    None => Ok(Response::new(CommitResponse {
+                        refused: Some(wire::refusal_of(&refused)),
+                    })),
+                }
+            }
             Err(e) => Err(e.into()),
         }
     }

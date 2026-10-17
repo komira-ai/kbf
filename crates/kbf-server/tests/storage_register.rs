@@ -88,8 +88,8 @@ fn listeners(worker_tls: Option<WorkerTls>) -> Listeners {
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
-        timing: kbf_server::StreamTiming::default(),
-        streams: kbf_server::StreamLimits::DEFAULT,
+        streams: kbf_server::StreamTiming::default(),
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     }
 }
 
@@ -580,8 +580,9 @@ async fn waiting_node(
 /// frontend cannot admit it (its store fails, so there is no map) every kind of call is
 /// refused UNAVAILABLE "no storage map yet", not answered as an empty cache (a
 /// FindMissing that says every blob is missing, a write taken that the map places
-/// elsewhere); once the registration lands the same calls are served. Mutant: a gate that
-/// lets every call through.
+/// elsewhere), the action cache and the segment uploads included; once the registration
+/// lands the same calls are served. Mutant: a gate that lets every call through, or one
+/// that spares the action cache or Segments.
 #[tokio::test]
 async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
     let f = frontend(None);
@@ -590,6 +591,9 @@ async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
         .store(1_000_000, std::sync::atomic::Ordering::SeqCst);
     let (node, client) = waiting_node(&f, "gate").await;
     let maps = node.maps();
+    let segments = Endpoint::from_shared(format!("http://{}", node.addr))
+        .expect("endpoint")
+        .connect_lazy();
     let _serving = tokio::spawn(node.serve());
     // The node's directory outlives the run: a blob no earlier run stored.
     let blob = format!(
@@ -622,6 +626,31 @@ async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
                 .put(bytes::Bytes::from(blob.clone()))
                 .await
                 .expect_err("refused")
+        ),
+        want
+    );
+    // The action cache, read and written, and the Segments uploads.
+    assert_eq!(
+        refused(client.action_result(&digest).await.expect_err("refused")),
+        want
+    );
+    assert_eq!(
+        refused(
+            client
+                .prepare_action_result(&kbf_proto::reapi::ActionResult::default())
+                .await
+                .expect_err("refused")
+        ),
+        want
+    );
+    let begun = kbf_proto::worker::segments_client::SegmentsClient::new(segments.clone())
+        .begin(kbf_proto::worker::BeginRequest::default())
+        .await
+        .expect_err("refused");
+    assert_eq!(
+        (
+            begun.code(),
+            begun.message().contains(kbf_server::NO_MAP_YET)
         ),
         want
     );

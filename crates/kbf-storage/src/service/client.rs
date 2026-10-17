@@ -172,6 +172,27 @@ pub(super) fn refused(refusal: &Refusal) -> StorageError {
     error.into()
 }
 
+/// The messages of a `Write` of `bytes` to the resource `name`: one per chunk of at most
+/// 1 MiB, and an empty blob is one message with no data.
+pub(super) fn write_messages(name: &str, bytes: &[u8]) -> Vec<WriteRequest> {
+    let count = bytes.len().div_ceil(WRITE_CHUNK_BYTES).max(1);
+    (0..count)
+        .map(|i| {
+            let start = i * WRITE_CHUNK_BYTES;
+            WriteRequest {
+                resource_name: if i == 0 {
+                    name.to_owned()
+                } else {
+                    String::new()
+                },
+                write_offset: start as i64,
+                finish_write: i + 1 == count,
+                data: bytes[start..bytes.len().min(start + WRITE_CHUNK_BYTES)].to_vec(),
+            }
+        })
+        .collect()
+}
+
 fn record_to_proto(record: &ActionRecord) -> Record {
     Record {
         result: Some(wire::to_proto(&record.result)),
@@ -264,19 +285,7 @@ impl Storage for RemoteStorage {
                 digest.hash_hex(),
                 digest.size_bytes
             );
-            // One message per chunk; an empty blob is one message with no data.
-            let count = bytes.len().div_ceil(WRITE_CHUNK_BYTES).max(1);
-            let requests: Vec<WriteRequest> = (0..count)
-                .map(|i| {
-                    let start = i * WRITE_CHUNK_BYTES;
-                    WriteRequest {
-                        resource_name: if i == 0 { name.clone() } else { String::new() },
-                        write_offset: start as i64,
-                        finish_write: i + 1 == count,
-                        data: bytes[start..bytes.len().min(start + WRITE_CHUNK_BYTES)].to_vec(),
-                    }
-                })
-                .collect();
+            let requests = write_messages(&name, &bytes);
             let response = self
                 .bytestream()
                 .write(self.tag(stream::iter(requests)))
@@ -295,21 +304,6 @@ impl Storage for RemoteStorage {
     /// Always `None`: a streamed write over the wire is [`Storage::put`]'s messages.
     fn stream(&self, _size: u64) -> Option<Box<dyn PutStream>> {
         None
-    }
-
-    /// Refused: the service has no streamed write to the object store; a caller stores
-    /// the blob with [`Storage::put`].
-    fn put_streamed(
-        &self,
-        _size: u64,
-        _bytes: futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
-        _claim: futures::future::BoxFuture<'static, Option<Digest>>,
-    ) -> Answer<'_, Option<Digest>> {
-        Box::pin(async {
-            Err(StorageError::Invalid(
-                "this store takes no streamed put".to_owned(),
-            ))
-        })
     }
 
     fn segments(&self) -> Arc<dyn Segments> {

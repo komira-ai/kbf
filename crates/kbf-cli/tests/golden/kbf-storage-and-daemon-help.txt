@@ -335,7 +335,7 @@ Options:
           [default: 16777216]
 
       --write-bytes-in-flight <WRITE_BYTES_IN_FLIGHT>
-          The most bytes uploads may hold at once. A ByteStream Write is admitted before it reads past its first message, for its blob's size up to 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) and for 16 MiB above that (a larger blob is streamed onto the hot store, or to the cold store without room there, not held); a BatchUpdateBlobs for its total; a segment upload's Begin for what it holds in memory. A caller over the bound waits, nothing is refused for load. At least `--segment-upload-max-bytes` (by default 33 MiB, under the default 2 GiB). Not covered: each HTTP/2 stream's message as tonic decodes it, before the handler runs, up to 17 MiB per stream (about 3.4 GiB for 200 streams), times the streams one connection may open (each listener's `-max-streams` flag)
+          The most bytes uploads may hold at once. A ByteStream Write is admitted before it reads past its first message, for its blob's size up to 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) and for 16 MiB above that (a larger blob is streamed onto the hot store, or to the cold store without room there, not held); a BatchUpdateBlobs for its total; a segment upload's Begin for what it holds in memory. A caller over the bound waits, nothing is refused for load. At least `--segment-upload-max-bytes` (by default 33 MiB, under the default 2 GiB). Not covered: each HTTP/2 stream's message as tonic decodes it, before the handler runs, up to 17 MiB per stream (about 3.4 GiB for 200 streams), times the streams one connection may open on each listener
           
           [default: 2147483648]
 

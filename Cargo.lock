@@ -1481,6 +1481,7 @@ dependencies = [
  "kbf-segments",
  "kbf-server",
  "kbf-storage",
+ "kbf-store",
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
@@ -1508,9 +1509,11 @@ dependencies = [
  "httparse",
  "kbf-host",
  "kbf-mdm",
+ "kbf-state",
  "kbf-types",
  "plist",
  "rcgen",
+ "rusqlite",
  "rustix",
  "rustls",
  "rustls-native-certs",
@@ -1520,6 +1523,7 @@ dependencies = [
  "ssh-key",
  "tar",
  "thiserror",
+ "time",
  "x509-parser",
  "zip",
 ]
@@ -2040,6 +2044,7 @@ dependencies = [
 name = "kbf-state"
 version = "0.1.0"
 dependencies = [
+ "kbf-state",
  "postgres",
  "rusqlite",
  "rustix",

@@ -14,7 +14,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use kbf_meta::ActionWriteError;
+use kbf_types::Digest;
 use tonic::Status;
+
+use crate::StorageError;
 
 /// A node's catch-up state, shared between whatever rebuilds the index (which calls
 /// [`CatchUp::finish`]) and the service and registration that read it.
@@ -50,9 +54,53 @@ impl CatchUp {
 
 /// The answer to a call that found nothing while the node was catching up: UNAVAILABLE,
 /// which a caller treats as "this owner could not say" and asks the next.
-pub(super) fn unavailable(what: &str) -> Status {
+fn unavailable(what: &str) -> Status {
     Status::unavailable(format!(
         "catching up: this node is rebuilding its index, so {what} may be held but not yet \
          indexed; ask another owner or try again"
     ))
+}
+
+// The rules below are the one place the service decides what a miss means. The gRPC handlers
+// and the in-process view ([`super::InProcess`]) both ask them, each with the state it read
+// before its lookup, so a caller gets the same answer by either road.
+
+/// The answer to a read of `digest` that failed with `error`: UNAVAILABLE when the store did
+/// not find it and the node is catching up; `None` (the error stands) otherwise.
+pub(super) fn read_miss(
+    catching_up: bool,
+    error: &StorageError,
+    digest: &Digest,
+) -> Option<Status> {
+    match error {
+        StorageError::NotFound(_) if catching_up => Some(unavailable(&digest.to_string())),
+        _ => None,
+    }
+}
+
+/// The answer to an action-cache lookup of `action` that found no entry: UNAVAILABLE while
+/// catching up. `None` when an entry was found or the node is caught up.
+pub(super) fn entry_miss(catching_up: bool, found: bool, action: &Digest) -> Option<Status> {
+    (catching_up && !found).then(|| unavailable(&format!("the entry of action {action}")))
+}
+
+/// The answer to a `FindMissing` of `asked` digests of which the store reported `missing`
+/// not found: UNAVAILABLE as a whole while catching up (a partial list would tell the caller
+/// the rest is held). `None` when nothing is missing or the node is caught up.
+pub(super) fn missing_gap(catching_up: bool, missing: usize, asked: usize) -> Option<Status> {
+    (catching_up && missing > 0)
+        .then(|| unavailable(&format!("{missing} of the {asked} digests asked")))
+}
+
+/// A write refused for a closure blob the store did not find, while the node is catching
+/// up: the blob may be held but not yet indexed, so the caller is told to try again
+/// (UNAVAILABLE), not that the blob is missing (the refusal it would act on by uploading).
+pub(super) fn retryable(catching_up: bool, refused: &ActionWriteError) -> Option<Status> {
+    match refused {
+        ActionWriteError::Absent(blobs) if catching_up => {
+            let named: Vec<String> = blobs.iter().map(ToString::to_string).collect();
+            Some(unavailable(&format!("closure blobs {}", named.join(", "))))
+        }
+        _ => None,
+    }
 }

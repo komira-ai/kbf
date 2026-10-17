@@ -86,7 +86,7 @@ pub struct Listeners {
     /// 0`, the flag's default): Buck2 never recovers a stream that breaks mid-action.
     pub shutdown_timeout: Duration,
     /// How long streams stay quiet, and how the connections are kept alive.
-    pub timing: StreamTiming,
+    pub streams: StreamTiming,
     /// How long `GET /readyz` on the operator API, and the REAPI listener's
     /// `grpc.health.v1` service, wait for the object store to answer their probe
     /// ([`crate::health`]).
@@ -99,7 +99,7 @@ pub struct Listeners {
     pub segments: SegmentsConfig,
     /// The most HTTP/2 streams one connection may have open on each listener
     /// (`--reapi-max-streams`, `--worker-max-streams`).
-    pub streams: StreamLimits,
+    pub stream_limits: StreamLimits,
 }
 
 /// What keeps a long-lived stream from looking idle to a load balancer, a proxy or the
@@ -642,8 +642,8 @@ where
     log_state(durable, term, epoch);
 
     let mut reapi_server = keepalive(
-        flow_control(Server::builder(), listeners.streams.reapi),
-        listeners.timing,
+        flow_control(Server::builder(), listeners.stream_limits.reapi),
+        listeners.streams,
     );
     if let Some(tls) = listeners.reapi_tls {
         reapi_server = reapi_server.tls_config(tls)?;
@@ -651,8 +651,8 @@ where
     let peers_certified = listeners.worker_tls.is_some();
     let (mut worker_server, peers) = worker_peers(
         keepalive(
-            flow_control(Server::builder(), listeners.streams.worker),
-            listeners.timing,
+            flow_control(Server::builder(), listeners.stream_limits.worker),
+            listeners.streams,
         ),
         listeners.worker_tls,
     )?;
@@ -692,7 +692,7 @@ where
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let membership = membership(members.clone(), peers_certified);
-    let (ticker, progress) = kbf_front::progress(listeners.timing.progress_interval);
+    let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);
     let reapi_routes = match storage {
@@ -877,9 +877,33 @@ pub fn bind_storage_gated(
     maps: Option<Arc<kbf_mapsync::MapHolder>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
+    bind_storage_shared(storage, listener, maps, shutdown).map(|(bound, _)| bound)
+}
+
+/// [`bind_storage_gated`], and the [`kbf_storage::service::InProcess`] view of the very
+/// service the listener serves: a caller in this process (the daemon half of
+/// `kbf storage-and-daemon`) reaches the node through it and takes the path a call over
+/// the listener takes, not the inner storage.
+///
+/// # Errors
+/// As [`bind_storage`].
+pub fn bind_storage_shared(
+    storage: Arc<dyn kbf_storage::Storage>,
+    listener: StorageListener,
+    maps: Option<Arc<kbf_mapsync::MapHolder>>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<
+    (
+        BoundStorage<impl Future<Output = Result<(), ServeError>>>,
+        kbf_storage::service::InProcess,
+    ),
+    ServeError,
+> {
     let (incoming, addr) = bind(listener.listen)?;
-    // The worker listener's default: its callers, like the daemons, hold few streams.
-    let mut server = flow_control(Server::builder(), StreamLimits::DEFAULT.worker);
+    let mut server = flow_control(
+        Server::builder(),
+        crate::streams::StreamLimits::DEFAULT.worker,
+    );
     let admission = match listener.tls {
         Some(tls) => {
             server = server.tls_config(tls)?;
@@ -887,8 +911,12 @@ pub fn bind_storage_gated(
         }
         None => kbf_storage::service::Admission::Open,
     };
-    let routes =
-        kbf_storage::service::StorageService::new(storage, admission, listener.service).routes();
+    let service = Arc::new(kbf_storage::service::StorageService::new(
+        storage,
+        admission,
+        listener.service,
+    ));
+    let (routes, in_process) = (service.shared_routes(), service.in_process());
     let gate = tonic::service::InterceptorLayer::new(map_gate(maps));
     let serving = async move {
         server
@@ -898,5 +926,5 @@ pub fn bind_storage_gated(
             .await
             .map_err(ServeError::from)
     };
-    Ok(BoundStorage { addr, serving })
+    Ok((BoundStorage { addr, serving }, in_process))
 }
