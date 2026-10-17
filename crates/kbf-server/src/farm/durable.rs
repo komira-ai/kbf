@@ -17,12 +17,15 @@
 //!   is written at the grant and at the end, never to renew it);
 //! - `loss/<operation>`: how many of the operation's leases were lost, while it is
 //!   unfinished and has lost any ([`kbf_sched::LOSS_REQUEUES`] refuses it);
-//! - `fate/<operation>`: what the operation's kills for memory changed: the raised
-//!   booking and the memory runs ([`kbf_sched::Fate`]), written in the transaction of the
-//!   requeue that follows a kill and deleted with the operation's other rows, so a
-//!   successor (after a handover or a crash) books the next rung instead of starting the
-//!   ladder over. A store with no row for an operation books and counts as it did before
-//!   the row existed;
+//! - `fate/<operation>`: what the operation's faults changed: the raised booking and the
+//!   memory runs of its kills for memory, the farm runs it used, the nodes placement
+//!   avoids for it and the leases given up as not started ([`kbf_sched::Fate`]), written
+//!   in the transaction of every requeue that follows a fault (whole, so the newest row
+//!   is the whole state) and deleted with the operation's other rows. A successor (after
+//!   a handover or a crash) books the next rung and spends the budgets that are left
+//!   instead of starting over. A store with no row for an operation books and counts as
+//!   it did before the row existed; a row written before the budgets were (version 1)
+//!   carries none of them;
 //! - `done/<operation>`: how a finished or refused operation ended, kept for the finished
 //!   retention (at least [`DONE_FLOOR`]) so a process that did not finish it can still
 //!   answer the callers of it: a tag byte and the `ExecuteResponse` ([`kbf_front::Finished`]);
@@ -48,8 +51,8 @@ use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{DaemonInstance, Fate, Recovered, RecoveredLease, Request, Requeue};
 use kbf_state::{Cond, Conflict, GENERATION, Store, StoreError, Txn, Versioned};
 use kbf_types::{
-    ControlRecord, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, StartLease, WaiterId,
-    WorkerId,
+    ControlRecord, Digest, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, StartLease,
+    WaiterId, WorkerId,
 };
 
 use tokio::sync::watch;
@@ -419,6 +422,26 @@ impl Durable {
         self.commit(txn)
     }
 
+    /// The unfinished operations that run `action` (of `instance`, if given): at most one
+    /// per instance, since a twin joins the operation that is running.
+    pub(super) fn operations_of(
+        &self,
+        instance: Option<&str>,
+        action: &Digest,
+    ) -> Result<Vec<OperationId>, StateError> {
+        let mut found = Vec::new();
+        for (key, row) in self.store.scan_prefix("op/")? {
+            let FarmInput::Submit(request) = decode(&key, &row.value)? else {
+                return Err(corrupt(&key, "not a request"));
+            };
+            let named = instance.is_none_or(|instance| request.key.instance == instance);
+            if named && request.key.action == *action {
+                found.push(parse_operation(&key, "op/")?);
+            }
+        }
+        Ok(found)
+    }
+
     /// Where `operation` stands.
     pub(super) fn progress(&self, operation: OperationId) -> Result<Progress, StateError> {
         if let Some(finished) = self.ended(operation)? {
@@ -477,8 +500,9 @@ impl Durable {
     /// that has finished has nothing to put back.
     ///
     /// `losses` is the operation's count of lost leases, to write down if the give-up is
-    /// one ([`kbf_sched::RequeueReason::is_loss`]). `fate` is what the kill changed, if
-    /// the give-up is a kill for memory: it goes in the same transaction as the queue row.
+    /// one ([`kbf_sched::RequeueReason::is_loss`]). `fate` is what the operation's faults
+    /// changed so far, if they changed anything: it goes in the same transaction as the
+    /// queue row.
     pub(super) fn requeued(
         &self,
         requeue: &Requeue,
@@ -744,11 +768,7 @@ impl State {
             };
             // Taken now, not when the store takes the write: a later kill must not
             // reach an earlier requeue's row.
-            let fate = if requeue.reason.is_memory_kill() {
-                self.sched.fate(requeue.operation)
-            } else {
-                None
-            };
+            let fate = self.sched.fate(requeue.operation);
             self.unsettled.push((requeue.clone(), losses, fate));
         }
         let pending = std::mem::take(&mut self.unsettled);
