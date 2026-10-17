@@ -946,13 +946,14 @@ impl Exec for DiskFull<'_> {
 fn a_stage_that_fills_the_disk_leaves_no_partial_release_and_can_be_retried() {
     let (mut exec, root) = host("disk-full");
     let from = source("disk-full", "kbf B", Some(UNITS));
+    fs::write(from.join("kbf-daemon"), "daemon B").expect("a second binary");
     let dir = exec.at(&format!("/usr/local/kbf/releases/{B}"));
     let want = Install {
         commit: c(B),
         from: from.clone(),
     };
 
-    // The binary is written, the first unit is not.
+    // The first binary is written, the second is not.
     let err = stage(
         &mut DiskFull {
             host: &mut exec,
@@ -971,8 +972,25 @@ fn a_stage_that_fills_the_disk_leaves_no_partial_release_and_can_be_retried() {
         state::read_unlocked(&root).expect("read").is_none() || state_of(&root).staged.is_none()
     );
 
-    stage(&mut exec, &root, me(), &want, Mode::Apply, &mut Vec::new()).expect("retry");
+    // The retry, on a disk with room (the same host type, so that one copy of the code
+    // under test runs on both its paths).
+    stage(
+        &mut DiskFull {
+            host: &mut exec,
+            left: 100,
+        },
+        &root,
+        me(),
+        &want,
+        Mode::Apply,
+        &mut Vec::new(),
+    )
+    .expect("retry");
     assert_eq!(fs::read_to_string(dir.join("kbf")).expect("kbf"), "kbf B");
+    assert_eq!(
+        fs::read_to_string(dir.join("kbf-daemon")).expect("daemon"),
+        "daemon B"
+    );
     assert_eq!(state_of(&root).staged, Some(c(B)));
 
     // A repeat of a stage that was whole, failing on a full disk, removes nothing. (The
