@@ -16,7 +16,9 @@ use tonic::{Code, Request, Status};
 
 use super::fake::{Held, Mem, connect, patterned, serve_routes, sha};
 use crate::replicate::MapSource;
-use crate::service::{Admission, CatchUp, Config, InProcess, RemoteStorage, StorageService};
+use crate::service::{
+    Admission, CatchUp, Config, InProcess, RemoteStorage, STREAM_FROM_BYTES, StorageService,
+};
 use crate::{Storage, StorageError};
 
 /// A node over `mem` that judges every call by `held`, called in-process. Certified
@@ -454,5 +456,30 @@ async fn a_miss_on_a_catching_up_node_is_unavailable_as_over_the_wire() {
     assert!(
         matches!(committed, Err(StorageError::ActionWrite(ActionWriteError::Absent(b))) if b == closure),
         "{committed:?}"
+    );
+}
+
+/// Catches an in-process write of a blob past `STREAM_FROM_BYTES`, on a store that cannot
+/// write as bytes arrive, that is gathered whole (the store's `put` called instead of
+/// `put_streamed`, or the blob held in one buffer) or stored wrong: it reaches
+/// `put_streamed` once, in pieces of at most one write message (1 MiB), and is stored
+/// byte for byte.
+#[tokio::test]
+async fn an_in_process_write_past_the_stream_size_is_streamed_in_pieces() {
+    let mem = Arc::new(Mem::default());
+    let node = node(&mem, &Held::at(7));
+    let large = patterned(STREAM_FROM_BYTES as usize + 1);
+    let digest = node
+        .at(7)
+        .put(Bytes::from(large.clone()))
+        .await
+        .expect("written");
+    assert_eq!(digest, sha(&large));
+    assert_eq!(mem.streamed.load(Ordering::SeqCst), 1);
+    assert_eq!(mem.puts.load(Ordering::SeqCst), 0);
+    assert!(mem.streamed_most_held.load(Ordering::SeqCst) <= 1 << 20);
+    assert_eq!(
+        mem.blobs.lock().expect("lock")[&digest].as_ref(),
+        &large[..]
     );
 }
