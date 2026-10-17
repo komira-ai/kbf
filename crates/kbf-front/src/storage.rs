@@ -263,9 +263,10 @@ impl From<CacheError> for StorageError {
             CacheError::Invalid(m) => Self::Invalid(m),
             CacheError::ActionWrite(w) => Self::ActionWrite(w),
             CacheError::Internal(m) => Self::Internal(m),
-            e @ (CacheError::Segment(_) | CacheError::Pack(_) | CacheError::Key(_)) => {
-                Self::Internal(e.to_string())
-            }
+            e @ (CacheError::Segment(_)
+            | CacheError::Pack(_)
+            | CacheError::Key(_)
+            | CacheError::StaleWriter(_)) => Self::Internal(e.to_string()),
             e @ (CacheError::Meta(_) | CacheError::Store(_) | CacheError::Tier(_)) => {
                 Self::Unavailable(Arc::new(e))
             }
