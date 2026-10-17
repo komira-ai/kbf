@@ -370,18 +370,22 @@ pub(crate) fn map_of(
 }
 
 /// The membership service storage nodes register with, when there are members to keep:
-/// under worker TLS only the storage role may call it. Not generic, for the same reason
+/// under worker TLS only the storage role may call it, each certificate for the names it
+/// holds and not if the listener's deny list refuses it. Not generic, for the same reason
 /// as [`sweeping`].
 pub(crate) fn membership(
     members: Option<Arc<Members>>,
-    certified: bool,
+    peers: &Peers,
 ) -> Option<MembershipServer<MembershipService>> {
-    let admission = if certified {
-        Admission::Certified
-    } else {
-        Admission::Open
+    let (admission, deny_list) = match peers {
+        Peers::Certified { deny_list } => (Admission::Certified, deny_list.clone()),
+        Peers::Unauthenticated => (Admission::Open, None),
     };
-    Some(MembershipService::new(members?, admission).server())
+    Some(
+        MembershipService::new(members?, admission)
+            .with_deny_list(deny_list)
+            .server(),
+    )
 }
 
 /// Expires members while the server runs. Never completes; with no state store there
@@ -633,7 +637,6 @@ where
     let farm = Arc::new(farm.with_state(state)?);
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
-    let peers_certified = listeners.worker_tls.is_some();
     let (mut worker_server, peers, worker_tls) = worker_peers(
         keepalive(
             flow_control(Server::builder(), listeners.stream_limits.worker),
@@ -714,6 +717,7 @@ where
     ))
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    let membership = membership(members.clone(), &peers);
     let sessions = WorkerService::new(
         Arc::clone(&farm),
         peers,
@@ -725,7 +729,6 @@ where
     let worker_service = WorkerServer::new(sessions)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
-    let membership = membership(members.clone(), peers_certified);
     let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);
@@ -927,7 +930,51 @@ pub fn bind_service(
     ),
     ServeError,
 > {
+    serve_service(service, bind_storage_socket(listen)?, tls, shutdown)
+}
+
+/// A storage listener's socket: bound, so its address is known and callers queue on it,
+/// and not yet serving ([`bind_storage_socket`], then [`serve_service`]).
+pub struct StorageSocket {
+    incoming: TcpIncoming,
+    addr: SocketAddr,
+}
+
+impl StorageSocket {
+    /// Where the socket is bound.
+    #[must_use]
+    pub const fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+/// Binds `listen`, serving nothing yet: a storage node registers with its frontend from
+/// the bound address before it opens the cache it serves.
+///
+/// # Errors
+/// The listener cannot be bound.
+pub fn bind_storage_socket(listen: SocketAddr) -> Result<StorageSocket, ServeError> {
     let (incoming, addr) = bind(listen)?;
+    Ok(StorageSocket { incoming, addr })
+}
+
+/// [`bind_service`] over a socket already bound ([`bind_storage_socket`]).
+///
+/// # Errors
+/// As [`bind_storage`].
+pub fn serve_service(
+    service: kbf_storage::service::StorageService,
+    socket: StorageSocket,
+    tls: Option<TlsSource>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<
+    (
+        BoundStorage<impl Future<Output = Result<(), ServeError>>>,
+        kbf_storage::service::InProcess,
+    ),
+    ServeError,
+> {
+    let StorageSocket { incoming, addr } = socket;
     let mut server = flow_control(
         Server::builder(),
         crate::streams::StreamLimits::DEFAULT.worker,
