@@ -260,11 +260,16 @@ fn a_dropped_flog_row_comes_back_from_the_object_with_no_list() {
 /// A kept flog object that is not a good one, restored: the writer queues no row and
 /// goes on.
 fn restored_from(summary: Vec<u8>, name: &str) {
+    restored_as(Family::FailureLog, summary, name);
+}
+
+/// [`restored_from`], for an object whose header and trailer say it is of `family`.
+fn restored_as(family: Family, summary: Vec<u8>, name: &str) {
     let mut life = Life::fresh(Limits::default());
     life.step(T);
     let run = id(8);
     let header = Header {
-        family: Family::FailureLog,
+        family,
         writer: WriterId(1),
         day: Day::from_number(20_261_016),
         seq: 0,
@@ -286,6 +291,23 @@ fn restored_from(summary: Vec<u8>, name: &str) {
     assert_eq!(life.writer.kept_objects(), 1, "{name}");
     life.drain(T + 11, 10);
     assert!(life.index.keys("ui/obj/").is_empty(), "{name}");
+}
+
+#[test]
+fn a_kept_chunk_object_that_does_not_describe_a_chunk_restores_no_row() {
+    // Catches: a restore that dispatches on the object's family wrongly (a chunk's
+    // summary read as a failure log's, or the reverse), and one that panics on, or writes
+    // rows for, a chunk whose summary does not decode or names no invocation.
+    restored_as(
+        Family::InvocationChunk,
+        vec![0xff],
+        "a summary that does not decode",
+    );
+    restored_as(
+        Family::InvocationChunk,
+        kbf_history::records::ChunkSummary::default().encode_to_vec(),
+        "a summary that names no invocation",
+    );
 }
 
 #[test]
@@ -559,20 +581,28 @@ fn a_parts_with_nothing_is_empty_and_a_log_is_cut_into_pieces() {
     // size (a 16 MiB log would be one 16 MiB block, past what a reader inflates).
     assert!(FlogParts::default().is_empty());
     assert!(!parts(None, None, Some(b"")).is_empty());
+    assert!(!parts(Some(b""), None, None).is_empty());
+    assert!(!parts(None, Some(b""), None).is_empty());
     let life = Life::fresh(Limits::default());
     let out = pattern(PIECE_BYTES * 3);
     let s = store(&life);
     let object = s.encode(id(31), &parts(Some(&out), None, None));
     assert!(!object.is_empty());
+    let length = object.len();
     assert_eq!(
         object.key().as_str(),
         format!("kbf/history/r30/flog/20261016/{}", id(31))
     );
-    let decoded = container::decode(&{
+    let stored = {
         let r = futures::executor::block_on(s.put(object)).unwrap();
+        assert_eq!(
+            r.bytes as usize, length,
+            "the ref says how long the object is"
+        );
         life.objects.get(r.key.as_str()).to_vec()
-    })
-    .unwrap();
+    };
+    assert_eq!(stored.len(), length);
+    let decoded = container::decode(&stored).unwrap();
     assert_eq!(decoded.records.len(), 3);
     assert_eq!(decoded.footer.blocks.len(), 3, "a block to a piece");
 }
@@ -621,4 +651,63 @@ fn a_log_of_many_blocks_is_read_in_groups_and_comes_back_whole() {
         read(&life, run, FlogStream::Stdout, first as u64, last as u64),
         out[first..=last]
     );
+}
+
+#[test]
+fn a_range_of_a_log_whose_blocks_fail_is_an_error_of_the_kind_that_failed() {
+    // Catches: a block that cannot be fetched, one that fails its checksum and a piece that
+    // does not decode answered as a shorter log, an empty one or a panic, and the kinds
+    // mixed (the store's failure said to be the object's).
+    let mut life = Life::fresh(Limits::default());
+    let run = id(40);
+    land(&life, run, &parts(Some(b"stdout bytes"), None, None));
+    life.drain(T + 10, 5);
+    let reader = life.reader();
+    let log = futures::executor::block_on(reader.failure_log(run, FlogStream::Stdout, &all))
+        .unwrap()
+        .unwrap();
+    // The store fails the read of the block (the footer was read already).
+    life.objects.counts().fail_gets.store(1, Ordering::SeqCst);
+    let e = futures::executor::block_on(reader.read_log(&log, 0, 5)).unwrap_err();
+    assert!(matches!(e, ReadError::Object(_)), "{e}");
+    // A bit flipped in the stored block: its CRC says so.
+    let key = root().flog(run);
+    let mut bytes = life.objects.get(key.as_str()).to_vec();
+    bytes[container::HEADER_LEN + 3] ^= 0x01;
+    life.objects.replace(key.as_str(), bytes);
+    let e = futures::executor::block_on(reader.read_log(&log, 0, 5)).unwrap_err();
+    assert!(matches!(e, ReadError::Format(_)), "{e}");
+    assert!(e.to_string().contains("CRC"), "{e}");
+    // A block whose record is not a piece.
+    let other = id(41);
+    let header = Header {
+        family: Family::FailureLog,
+        writer: WriterId(1),
+        day: Day::from_number(20_261_016),
+        seq: 0,
+        base_ms: T,
+    };
+    let summary = FlogSummary {
+        run_id: other.to_bytes().to_vec(),
+        day: 20_261_016,
+        instance: "main".into(),
+        stdout_len: Some(4),
+        stderr_len: None,
+        result_len: None,
+    };
+    let records = vec![(flog_key(FlogStream::Stdout, 0).to_vec(), vec![0xff, 0xff])];
+    let encoded = container::encode(&header, records, summary.encode_to_vec());
+    life.objects
+        .replace(root().flog(other).as_str(), encoded.bytes.clone());
+    let row = ObjRow {
+        footer_offset: encoded.footer_offset,
+        footer_len: encoded.footer_len,
+        bytes: encoded.bytes.len() as u64,
+    };
+    life.index.put(
+        &format!("ui/obj/flog/20261016/{other}"),
+        row.encode_to_vec(),
+    );
+    let e = read_err(&life, other, 0, 3);
+    assert!(e.to_string().contains("failure-log record"), "{e}");
 }

@@ -615,7 +615,7 @@ where
     let drain = Arc::new(drain);
     let health_routes =
         crate::health::router(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
-    let blob_routes = crate::http_blobs::router_sharing(
+    let blob_routes = crate::http_blobs::router(
         Arc::clone(&cache),
         BlobReaders::from_policy(&policy),
         budget.clone(),

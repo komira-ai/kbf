@@ -252,13 +252,13 @@ async fn add_logs(
         }
         out.insert(stream.name().to_owned(), log.into());
     }
-    if let Value::Object(keys) = value {
-        if !out.is_empty() {
-            keys.insert("logs".to_owned(), out.into());
-        }
-        if let Some(command) = failed.and_then(|f| f.command.as_ref()) {
-            keys.insert("command_rendering".to_owned(), rendering(command));
-        }
+    // `render` made an object, and nothing since has changed that.
+    let keys = value.as_object_mut().expect("a run renders as an object");
+    if !out.is_empty() {
+        keys.insert("logs".to_owned(), out.into());
+    }
+    if let Some(command) = failed.and_then(|f| f.command.as_ref()) {
+        keys.insert("command_rendering".to_owned(), rendering(command));
     }
 }
 

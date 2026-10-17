@@ -214,18 +214,10 @@ impl AsRef<[u8]> for Held {
     }
 }
 
-/// The blob route over `cache`; with `readers` `None` it answers every request `404`.
-pub fn router<M, O>(cache: Arc<Cache<M, O>>, readers: Option<BlobReaders>) -> Router
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
-    router_sharing(cache, readers, ReadBudget::default())
-}
-
-/// [`router`], taking its memory from `budget`, which the caller shares with the other
-/// readers of the process.
-pub fn router_sharing<M, O>(
+/// The blob route over `cache`; with `readers` `None` it answers every request `404`. The
+/// bytes of its answers are taken from `budget`, which the caller shares with the other
+/// readers of the process (the failure-log route and the history writer's tail reads).
+pub fn router<M, O>(
     cache: Arc<Cache<M, O>>,
     readers: Option<BlobReaders>,
     budget: ReadBudget,

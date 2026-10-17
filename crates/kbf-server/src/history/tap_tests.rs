@@ -779,12 +779,7 @@ mod pool {
         // Its workers run it: the run arrives with a failed section, then the close again,
         // since the invocation was closed meanwhile.
         let handles = workers.spawn();
-        for _ in 0..200 {
-            if rig.queue.len() >= 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        rig.tap.quiesce().await;
         let events = rig.queue.drain();
         assert!(
             matches!(

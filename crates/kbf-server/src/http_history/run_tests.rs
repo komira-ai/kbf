@@ -437,13 +437,27 @@ mod recorder_side {
         runs.note([4; 12], key("held"), 0);
         assert!(live(&state, RunId::from_bytes([4; 12])).is_none());
     }
+
     /// Catches: a digest that is not a SHA-256 one (a hash of the wrong length) making the
     /// run page fail or lose the log (it is shown as sent, with no link and no answer to
-    /// whether it is held), the logs of a run that has none given an empty object, and a
-    /// log's `available` taken from another log's answer.
+    /// whether it is held), a log's `available` taken from another log's answer, a blob
+    /// that is held linked to anything but the blob route, one that is gone given no link
+    /// when the route is on (history holds no copy of it here), a tail put on the log it
+    /// is not of, a failed run's command rendering lost, and the logs of a run that has
+    /// none given an empty object.
     #[tokio::test]
-    async fn a_malformed_digest_is_shown_as_it_is_and_the_logs_of_a_run_without_any_are_absent() {
+    async fn a_run_page_shows_each_log_as_held_gone_or_malformed_with_its_tail() {
+        use kbf_history::records::WireDigest;
+        use kbf_history::records::{CommandRendering, FailedRun, RunRecord, Tail, TailOmitted};
+        let cache = Arc::new(kbf_front::Cache::memory());
+        let blob = kbf_front::VerifiedBlob::hashed(bytes::Bytes::from_static(b"held output"));
+        let held = blob.digest();
+        cache.store_blobs(vec![blob]).await.expect("stored");
         let (state, _, _) = state().await;
+        let state = RunState {
+            presence: cache,
+            ..state
+        };
         let policy = kbf_auth::Policy::from_json(
             r#"{"authenticationPolicy": {"allow": {}},
                 "invocations": {"getAuthorizer": {"allow": {}}},
@@ -451,26 +465,64 @@ mod recorder_side {
         )
         .expect("a policy");
         let readers = InvocationReaders::from_policy(&policy).expect("readers");
-        let record = kbf_history::records::RunRecord {
+        let record = RunRecord {
             instance: "main".into(),
-            stdout: Some(kbf_history::records::WireDigest {
+            stdout: Some(WireDigest::new(held.hash, held.size_bytes)),
+            stderr: Some(WireDigest {
                 hash: vec![1, 2, 3],
                 size: 5,
             }),
-            result: Some(kbf_history::records::WireDigest::new([7; 32], 7)),
-            ..kbf_history::records::RunRecord::default()
+            result: Some(WireDigest::new([7; 32], 7)),
+            ..RunRecord::default()
+        };
+        let failed = FailedRun {
+            stdout: Some(Tail::of(b"held out")),
+            stderr: Some(Tail {
+                bytes: Vec::new(),
+                total_bytes: 5,
+                omitted: TailOmitted::Busy.into(),
+            }),
+            command: Some(CommandRendering {
+                argv: vec!["cc".into()],
+                ..CommandRendering::default()
+            }),
+            ..FailedRun::default()
         };
         let mut value = serde_json::json!({});
-        add_logs(&state, &readers, &record, None, &mut value).await;
-        assert_eq!(value["logs"]["stdout"]["digest"], "010203-5");
-        assert_eq!(value["logs"]["stdout"]["available"], Value::Null);
-        assert_eq!(value["logs"]["stdout"]["href"], Value::Null);
-        assert_eq!(value["logs"]["result"]["available"], false, "{value}");
-        assert!(value["logs"].get("stderr").is_none(), "{value}");
-        // A run with no log at all has no `logs`.
-        let bare = kbf_history::records::RunRecord::default();
+        add_logs(&state, &readers, &record, Some(&failed), &mut value).await;
+        let logs = &value["logs"];
+        assert_eq!(logs["stdout"]["available"], true, "{value}");
+        let href = logs["stdout"]["href"].as_str().expect("a link");
+        assert!(
+            href.starts_with("/v1/blobs/") && href.contains("instance=main"),
+            "{href}"
+        );
+        assert_eq!(logs["stdout"]["tail"], "held out");
+        assert_eq!(logs["stderr"]["digest"], "010203-5");
+        assert_eq!(logs["stderr"]["available"], Value::Null);
+        assert_eq!(logs["stderr"]["href"], Value::Null);
+        assert_eq!(logs["stderr"]["tail_omitted"], "busy");
+        assert_eq!(logs["result"]["available"], false, "{value}");
+        assert!(
+            logs["result"]["href"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("/v1/blobs/"),
+            "no copy is held, so the blob route's link stays: {value}"
+        );
+        assert!(logs["result"].get("tail").is_none(), "{value}");
+        assert_eq!(
+            value["command_rendering"]["argv"],
+            serde_json::json!(["cc"])
+        );
+        // Without a failed section: no tails and no rendering.
         let mut value = serde_json::json!({});
-        add_logs(&state, &readers, &bare, None, &mut value).await;
+        add_logs(&state, &readers, &record, None, &mut value).await;
+        assert!(value["logs"]["stdout"].get("tail").is_none(), "{value}");
+        assert!(value.get("command_rendering").is_none(), "{value}");
+        // A run with no log at all has no `logs`.
+        let mut value = serde_json::json!({});
+        add_logs(&state, &readers, &RunRecord::default(), None, &mut value).await;
         assert!(value.get("logs").is_none(), "{value}");
     }
 }
