@@ -426,7 +426,9 @@ async fn ready_is_sent_while_the_storage_node_does_not_answer() {
     let handle = handle.notifying(Some(manager_path.into_os_string()));
     let proc = Proc::serving(handle, stop);
     let mut buffer = [0_u8; 16];
-    let got = manager.recv(&mut buffer).expect("READY=1 despite the storage node");
+    let got = manager
+        .recv(&mut buffer)
+        .expect("READY=1 despite the storage node");
     assert_eq!(&buffer[..got], b"READY=1");
     let (code, body) = get(proc.api, "/readyz").await;
     assert_eq!(code, 503, "{body}");
