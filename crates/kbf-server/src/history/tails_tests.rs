@@ -700,7 +700,7 @@ async fn a_command_that_cannot_be_rendered_leaves_the_run_without_one() {
     }
     let bounded = by_run[&4].command.as_ref().expect("a rendering");
     let size: usize = bounded.argv.iter().map(String::len).sum();
-    assert!(bounded.truncated && size <= 4096, "{} bytes", size);
+    assert!(bounded.truncated && size <= 4096, "{size} bytes");
     assert_eq!(by_run[&5].flog_omitted(), FlogOmitted::TooLarge);
     assert_eq!(
         rig.blobs.reads.load(Ordering::SeqCst),

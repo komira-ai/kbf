@@ -4,7 +4,7 @@ use kbf_history::records::{Cgroup, MemoryKill, RunOutcome, RunRecord, Timestamps
 use kbf_history::{RunId, StreamId};
 use serde_json::{Value, json};
 
-use super::{add_logs, add_tail, parse, render, rendering};
+use super::{add_tail, parse, render, rendering};
 
 fn wire(n: u8) -> WireDigest {
     WireDigest::new([n; 32], u64::from(n))
