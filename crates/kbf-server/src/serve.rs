@@ -616,6 +616,8 @@ where
     O: ObjectStore + 'static,
 {
     let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
+    let (state, history) = crate::history::take(state);
+    let recording = crate::history::install(recording, history.as_ref());
     let default_memory = listeners.memory_ladder.first();
     let farm = Farm::new(
         Arc::clone(&cache),
@@ -676,6 +678,7 @@ where
     .merge(crate::metrics::router(
         Arc::clone(&cache),
         local,
+        history.as_ref().map(crate::history::History::stats),
         tls_sources,
     ))
     .merge(blob_routes)
@@ -768,6 +771,7 @@ where
     let serving = async move {
         // A task of its own: applying events never delays the tick or an accept loop,
         // and they never delay it. It stops when the serving future does.
+        let history = crate::history::spawn(history);
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
         // `reapi_incoming` carries the REAPI TLS when there is any, so the health
         // service is served over the same TLS as the REAPI routes; the authenticator is
@@ -831,6 +835,7 @@ where
         if reapi_done {
             stop_api(api_stop, api_serve).await;
         }
+        crate::history::finish(history).await;
         outcome
     };
     Ok(Bound {

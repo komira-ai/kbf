@@ -46,7 +46,7 @@ fn each_mode_renders_a_unit_that_passes_every_rule_and_matches_its_golden() {
         assert_eq!(lines(&r), Vec::<String>::new(), "{mode}");
         assert_eq!(
             r.summary,
-            format!("UNIT OK: kbf-{mode}.service runs kbf {mode}")
+            format!("UNIT OK: {} runs kbf {mode}", mode.unit_name())
         );
         assert!(
             text == golden("modes", &mode.unit_name()),
@@ -92,7 +92,7 @@ fn the_modes_are_listed_with_the_sets_the_rules_use() {
     assert_eq!(
         names,
         [
-            "kbf-frontend.service",
+            "kbf-frontend@.service",
             "kbf-storage.service",
             "kbf-daemon.service",
             "kbf-storage-and-daemon.service",
@@ -128,7 +128,7 @@ fn each_planted_defect_turns_its_rule_red() {
             Mode::Frontend,
             "TimeoutStopSec=infinity\n",
             "TimeoutStopSec=90s\n",
-            "FAIL stop: kbf-frontend.service has TimeoutStopSec=90s, not TimeoutStopSec=infinity: systemd kills kbf when it runs out, before the drain ends, and every build in flight fails",
+            "FAIL stop: kbf-frontend@.service has TimeoutStopSec=90s, not TimeoutStopSec=infinity: systemd kills kbf when it runs out, before the drain ends, and every build in flight fails",
         ),
         (
             Mode::AllInOne,
@@ -206,7 +206,7 @@ fn each_planted_defect_turns_its_rule_red() {
             Mode::Frontend,
             "--state-store=sqlite://@KBF_STATE_DIR@/state.db",
             "--state-store=postgres://db.example/kbf",
-            "FAIL state-store: kbf-frontend.service: --state-store is a postgres URI: postgres is not wired yet; the state store is sqlite:///<absolute path>",
+            "FAIL state-store: kbf-frontend@.service: --state-store is a postgres URI: postgres is not wired yet; the state store is sqlite:///<absolute path>",
         ),
         (
             Mode::StorageAndDaemon,
@@ -242,7 +242,7 @@ fn each_planted_defect_turns_its_rule_red() {
             Mode::Frontend,
             "Slice=kbf.slice\n",
             "Slice=system.slice\n",
-            "FAIL slice: kbf-frontend.service is not in kbf.slice",
+            "FAIL slice: kbf-frontend@.service is not in kbf.slice",
         ),
         (
             Mode::Daemon,
@@ -273,14 +273,15 @@ fn each_planted_defect_turns_its_rule_red() {
     let left = check(
         &c,
         Mode::Frontend,
-        "[Service]\nSlice=kbf.slice\nExecStart=/usr/local/bin/kbf frontend\nUser=@KBF_USER@\n\
-         TimeoutStopSec=infinity\nKillSignal=SIGTERM\n",
+        "[Service]\nSlice=kbf.slice\nUser=@KBF_USER@\nTimeoutStopSec=infinity\nKillSignal=SIGTERM\n\
+         Type=notify\nRuntimeDirectory=kbf-frontend\nRuntimeDirectoryPreserve=yes\n\
+         ExecStart=/usr/local/bin/kbf frontend --handover-socket=/run/kbf-frontend/control.sock\n",
         false,
     )
     .expect("a unit");
     assert_eq!(
         lines(&left),
-        ["FAIL render: kbf-frontend.service keeps the placeholder @KBF_USER@"]
+        ["FAIL render: kbf-frontend@.service keeps the placeholder @KBF_USER@"]
     );
     let none = check(
         &c,
@@ -289,9 +290,15 @@ fn each_planted_defect_turns_its_rule_red() {
         false,
     )
     .expect("a unit");
-    assert_eq!(
-        lines(&none),
-        ["FAIL exec: kbf-frontend.service starts '', want '/usr/local/bin/kbf frontend ...'"]
+    // The rule `handover` fails the unit with no command line too; the others pass.
+    let exec = "FAIL exec: kbf-frontend@.service starts '', want '/usr/local/bin/kbf frontend ...'";
+    assert_eq!(lines(&none)[0], exec);
+    assert!(
+        lines(&none)[1..]
+            .iter()
+            .all(|l| l.starts_with("FAIL handover: ")),
+        "{:?}",
+        lines(&none)
     );
 }
 
@@ -779,7 +786,7 @@ fn a_build_modes_unit_and_slice_keep_every_cpu_of_the_node() {
     );
     let frontend = render(&c, Some(1500), Mode::Frontend).expect("renders");
     let f = UnitText::new(Mode::Frontend.unit_name(), frontend).with_drop_in(
-        "kbf-frontend.service.d/cpus.conf",
+        "kbf-frontend@.service.d/cpus.conf",
         "[Service]\nAllowedCPUs=0\n",
     );
     let r = check_on_host(&exec, &c, Mode::Frontend, &f, &wide_slice, true, None).expect("runs");

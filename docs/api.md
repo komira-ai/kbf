@@ -405,6 +405,17 @@ follow; in every other process they are absent.
 | `kbf_local_cache_storage_bytes` | gauge | what local storage holds on that disk: the write tier's blocks |
 | `kbf_local_cache_fill_bytes` | gauge | both, each byte once: what the one budget counts |
 
+**Build history.** With `--history-objects` the server records each attempt and cache hit of
+an invocation a client named, after the call is answered and off its path, and counts what it
+could not keep. Without the flag these families are absent and nothing is recorded.
+
+| Family | Type | What it measures |
+|---|---|---|
+| `kbf_history_dropped_total{stage}` | counter | records dropped instead of kept, by where: `queue` (the writer's queue was full), `buffer` (chunks waiting to be written passed their bound), `put` (an object write failed), `index` (an index row could not be applied), `invocations` (the writer held its bound of invocations) |
+| `kbf_history_queue_events`, `kbf_history_queue_bytes` | gauge | events waiting for the writer, and their bytes |
+| `kbf_history_pending_rows` | gauge | index rows the writer has not applied yet |
+| `kbf_history_open_invocations` | gauge | invocations the writer holds state for |
+
 **Reading a stall with idle slots.** `kbf_sched_queued` high and `kbf_sched_leases` below the
 nodes' slots means work is waiting that placement cannot use (look at the node's booking and
 `GET /v1/nodes`). `kbf_sched_queued` low while buck2 has many Executes open means they have not
