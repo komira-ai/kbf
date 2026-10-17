@@ -7,7 +7,7 @@
 //! | key | value | lives |
 //! |---|---|---|
 //! | `instance/<instance id>` | the member id | for ever: a node that returns keeps its id |
-//! | `member/<id>` | the member (address, zone, weight, admin state) and its boot counter | `ttl` after the last heartbeat |
+//! | `member/<id>` | the member (address, zone, weight, admin state), its boot counter and its newest debts report | `ttl` after the last heartbeat |
 //! | `down/<id>` | nothing | `dwell` from the moment the member went `Down` |
 //! | `map` | the current `kbf.map.v1.Map` | for ever; a change is one compare-and-set |
 //! | `meta/members_formed` | nothing | for ever: the cluster has had an `Active` member |
@@ -25,6 +25,11 @@
 //! registers again meanwhile (a restart: same id, larger boot counter) is `Active` again
 //! if its index is whole, `CatchingUp` if not, and its `down/<id>` mark is deleted. The
 //! last member never leaves: a map needs one member, so it stays `Down` in the map.
+//!
+//! **Debts.** A storage heartbeat says how many copies the node owes ([`Debts`]); the row
+//! keeps the newest report with the store's clock at its receipt, so it dies with the row
+//! and a registration (which rewrites the row) starts without one. A promotion keeps it.
+//! [`Members::storage_health`] judges the rows ([`crate::storage_health`]).
 //!
 //! **The map** is a function of the rows: [`Members::refresh`] reads `map`, `member/` and
 //! the `down/` marks, builds the next member list, and if it differs commits generation
@@ -51,10 +56,18 @@ use std::time::Duration;
 use kbf_map::{Map, MapError, Member, MemberId, MemberState, Rule};
 use kbf_mapsync::MapSource;
 use kbf_proto::kbf::map::v1 as pb;
-use kbf_state::{Cond, Store, StoreError, Txn, Version, Versioned};
+use kbf_state::{Cond, Store, StoreError, StoreTime, Txn, Version, Versioned};
 use prost::Message as _;
 use tokio::sync::watch;
 
+use crate::storage_health::{
+    Debts, MemberReport, NotIdle, Report, Reported, StorageHealth, Writes, node_idle,
+    storage_health,
+};
+
+/// The value of a `down/<id>` mark written by an operator's planned restart
+/// ([`Members::plan_down`]); the sweeper's marks are empty.
+const PLANNED: &[u8] = b"planned";
 const MAP_KEY: &str = "map";
 const MEMBERS: &str = "member/";
 const ID_COUNTER: &str = "member-id";
@@ -95,6 +108,13 @@ impl MembershipConfig {
     #[must_use]
     pub fn beat(&self) -> Duration {
         self.ttl / 3
+    }
+
+    /// How old a debts report may be and still count: two beats, so one lost heartbeat is
+    /// forgiven and two are not.
+    #[must_use]
+    pub fn freshness(&self) -> Duration {
+        self.beat() * 2
     }
 }
 
@@ -179,9 +199,17 @@ pub enum MembershipError {
         current: u64,
     },
     /// Only `Joining`, `CatchingUp`, `Active` and `Draining` are set by hand; `Down` is
-    /// the store's verdict.
+    /// the store's verdict, or an operator's planned restart ([`Members::plan_down`]).
     #[error("a member cannot be set {0:?}")]
     NotSettable(MemberState),
+    /// Only an `Active` member can be planned down.
+    #[error("member {id} is {state:?}: only an Active member can be planned down")]
+    NotActive {
+        /// The member.
+        id: MemberId,
+        /// Its state.
+        state: MemberState,
+    },
     /// Another writer kept winning the compare-and-set.
     #[error("gave up after {ATTEMPTS} attempts against other writers")]
     Contended,
@@ -196,19 +224,70 @@ pub enum MembershipError {
     Map(#[from] MapError),
 }
 
-/// A stored member row: the member as the map will hold it, and its boot counter.
+/// A stored member row: the member as the map will hold it, its boot counter and the
+/// newest debts report.
 #[derive(Clone, PartialEq, prost::Message)]
 struct Row {
     #[prost(message, optional, tag = "1")]
     member: Option<pb::Member>,
     #[prost(uint64, tag = "2")]
     boot: u64,
+    #[prost(message, optional, tag = "3")]
+    report: Option<StoredReport>,
+}
+
+/// [`Report`] as stored.
+#[derive(Clone, PartialEq, prost::Message)]
+struct StoredReport {
+    #[prost(bool, tag = "1")]
+    known: bool,
+    #[prost(uint64, tag = "2")]
+    debts: u64,
+    /// The store's clock at receipt, in nanoseconds.
+    #[prost(uint64, tag = "3")]
+    at_nanos: u64,
+    #[prost(bool, tag = "4")]
+    writes_known: bool,
+    #[prost(uint64, tag = "5")]
+    open_writes: u64,
+    /// The map generation the node held when it reported.
+    #[prost(uint64, tag = "6")]
+    generation: u64,
+}
+
+impl From<&Report> for StoredReport {
+    fn from(report: &Report) -> Self {
+        let (known, debts) = report.said.debts.to_wire();
+        let (writes_known, open_writes) = report.said.writes.to_wire();
+        Self {
+            known,
+            debts,
+            at_nanos: u64::try_from(report.at.as_duration().as_nanos()).unwrap_or(u64::MAX),
+            writes_known,
+            open_writes,
+            generation: report.said.generation,
+        }
+    }
+}
+
+impl From<&StoredReport> for Report {
+    fn from(stored: &StoredReport) -> Self {
+        Self {
+            said: Reported {
+                debts: Debts::from_wire(stored.known, stored.debts),
+                writes: Writes::from_wire(stored.writes_known, stored.open_writes),
+                generation: stored.generation,
+            },
+            at: StoreTime::from_duration(Duration::from_nanos(stored.at_nanos)),
+        }
+    }
 }
 
 /// A decoded row and the version it was read at.
 struct Live {
     member: Member,
     boot: u64,
+    report: Option<Report>,
     version: Version,
 }
 
@@ -220,14 +299,16 @@ fn decode_row(stored: &Versioned) -> Result<Live, MembershipError> {
     Ok(Live {
         member,
         boot: row.boot,
+        report: row.report.as_ref().map(Report::from),
         version: stored.version,
     })
 }
 
-fn encode_row(member: &Member, boot: u64) -> Vec<u8> {
+fn encode_row(member: &Member, boot: u64, report: Option<&Report>) -> Vec<u8> {
     Row {
         member: Some(pb::Member::from(member)),
         boot,
+        report: report.map(StoredReport::from),
     }
     .encode_to_vec()
 }
@@ -321,10 +402,14 @@ fn plan(
 /// How a row is rewritten in place.
 #[derive(Clone, Copy)]
 enum Touch {
-    /// A heartbeat of this boot, and what it reports: a whole time to live more.
-    Beat(u64, Progress),
+    /// A heartbeat of this boot, what it reports and what it says it owes: a whole time to
+    /// live more, and the debts report replaced.
+    Beat(u64, Progress, Reported),
     /// An administrator's state change: the time to live it had.
     State(MemberState),
+    /// An administrator's planned restart of an `Active` member: `Down` in the row, with
+    /// the dwell mark, in one transaction.
+    PlanDown,
 }
 
 /// The maps a process has seen: the newest, and the generation it replaced.
@@ -487,7 +572,7 @@ impl Members {
                 txn = txn.put(FORMED, Vec::new(), Cond::Any);
             }
             let txn = txn
-                .put_ttl(&key, encode_row(member, boot), self.config.ttl, cond)
+                .put_ttl(&key, encode_row(member, boot, None), self.config.ttl, cond)
                 .delete(down_key(member.id), Cond::Any);
             if self.store.txn(txn)?.is_ok() {
                 return Ok(());
@@ -496,9 +581,9 @@ impl Members {
         Err(MembershipError::Contended)
     }
 
-    /// Restarts the time to live of `id`'s row and, if the member is `CatchingUp` and
-    /// `progress` says it is done, makes it `Active` and rebuilds the map. Returns the
-    /// generation of the current map.
+    /// Restarts the time to live of `id`'s row, keeps what the node says it owes (with the
+    /// store's clock) and, if the member is `CatchingUp` and `progress` says it is done,
+    /// makes it `Active` and rebuilds the map. Returns the generation of the current map.
     ///
     /// # Errors
     /// [`MembershipError::NotRegistered`] if the row expired (register again);
@@ -508,8 +593,9 @@ impl Members {
         id: MemberId,
         boot: u64,
         progress: Progress,
+        said: Reported,
     ) -> Result<u64, MembershipError> {
-        if self.touch(id, Touch::Beat(boot, progress))? {
+        if self.touch(id, Touch::Beat(boot, progress, said))? {
             return Ok(self.refresh()?.map_or(0, |map| map.generation()));
         }
         Ok(self.current_map()?.map_or(0, |map| map.generation()))
@@ -529,6 +615,39 @@ impl Members {
         self.refresh()?.ok_or(MembershipError::NoMap)
     }
 
+    /// Takes a live `Active` member out of the write path for a planned restart, and
+    /// rebuilds the map: it is `Down` in the map at once, so every router, chain and repair
+    /// worker that holds the new map skips it for writes and reads its blobs from the other
+    /// owner, and a map an older build holds reads it like any `Down` member. The `down/`
+    /// mark that holds its slot for the dwell is written in the same transaction as the
+    /// row, with a value that says an operator planned it ([`Members::planned_down`]).
+    ///
+    /// The member keeps heartbeating until it stops and a heartbeat does not undo this. It
+    /// is undone by [`Members::set_state`] to `Active` (a restart that did not happen), or
+    /// by the member registering again (the restart did: `Active`, or `CatchingUp` while it
+    /// rebuilds, the mark deleted); if it stops and does not return, its row expires and the
+    /// dwell, counted from this call, decides when it leaves the map.
+    ///
+    /// # Errors
+    /// [`MembershipError::NotRegistered`] if the member has no live row;
+    /// [`MembershipError::NotActive`] unless it is `Active`; the store failing.
+    pub fn plan_down(&self, id: MemberId) -> Result<Map, MembershipError> {
+        self.touch(id, Touch::PlanDown)?;
+        self.refresh()?.ok_or(MembershipError::NoMap)
+    }
+
+    /// Whether `id` is `Down` because an operator planned it ([`Members::plan_down`]), and
+    /// its dwell has not run out. A member the sweeper marked `Down` is not.
+    ///
+    /// # Errors
+    /// The store failing.
+    pub fn planned_down(&self, id: MemberId) -> Result<bool, MembershipError> {
+        Ok(self
+            .store
+            .get(&down_key(id))?
+            .is_some_and(|mark| mark.value == PLANNED))
+    }
+
     /// Rewrites `id`'s row as `how` says; whether its state changed.
     fn touch(&self, id: MemberId, how: Touch) -> Result<bool, MembershipError> {
         let key = member_key(id);
@@ -540,14 +659,18 @@ impl Members {
             let mut live = decode_row(&stored)?;
             let before = live.member.state;
             let ttl = match how {
-                Touch::Beat(boot, _) if boot != live.boot => {
+                Touch::Beat(boot, _, _) if boot != live.boot => {
                     return Err(MembershipError::Superseded {
                         id,
                         boot,
                         current: live.boot,
                     });
                 }
-                Touch::Beat(_, progress) => {
+                Touch::Beat(_, progress, said) => {
+                    live.report = Some(Report {
+                        said,
+                        at: self.store.now(),
+                    });
                     if before == MemberState::CatchingUp && progress == Progress::CaughtUp {
                         live.member.state = MemberState::Active;
                     }
@@ -559,15 +682,29 @@ impl Members {
                         .expires_at
                         .map_or(self.config.ttl, |at| at.since(self.store.now()))
                 }
+                Touch::PlanDown if before != MemberState::Active => {
+                    return Err(MembershipError::NotActive { id, state: before });
+                }
+                Touch::PlanDown => {
+                    live.member.state = MemberState::Down;
+                    stored
+                        .expires_at
+                        .map_or(self.config.ttl, |at| at.since(self.store.now()))
+                }
             };
             let mut put = Txn::new().put_ttl(
                 &key,
-                encode_row(&live.member, live.boot),
+                encode_row(&live.member, live.boot, live.report.as_ref()),
                 ttl,
                 Cond::Version(stored.version),
             );
             if live.member.state == MemberState::Active && before != MemberState::Active {
                 put = put.put(FORMED, Vec::new(), Cond::Any);
+            }
+            if matches!(how, Touch::PlanDown) {
+                put = put.put_ttl(down_key(id), PLANNED, self.config.dwell, Cond::Any);
+            } else if before == MemberState::Down && live.member.state != MemberState::Down {
+                put = put.delete(down_key(id), Cond::Any);
             }
             if self.store.txn(put)?.is_ok() {
                 return Ok(live.member.state != before);
@@ -629,6 +766,68 @@ impl Members {
             }
         }
         Err(MembershipError::Contended)
+    }
+
+    /// The judgement of [`crate::storage_health::storage_health`] over the members the map
+    /// holds and the rows that are live: a member in the map with no row (`Down`, or a row
+    /// that expired a moment ago) counts as it is in the map, with no report; a row the map
+    /// does not hold yet counts as the row says.
+    ///
+    /// # Errors
+    /// The store failing; a stored value not decoding.
+    pub fn storage_health(&self) -> Result<StorageHealth, MembershipError> {
+        let (members, now) = self.member_reports()?;
+        Ok(storage_health(&members, now, self.config.freshness()))
+    }
+
+    /// Whether storage node `node` may be stopped now ([`node_idle`]): `at_generation` is
+    /// the map that stopped routing writes to it, which its last report must have seen.
+    ///
+    /// # Errors
+    /// [`NotIdle`] naming the first reason; a membership that cannot be read is one.
+    pub fn node_idle(&self, node: MemberId, at_generation: u64) -> Result<(), NotIdle> {
+        let (members, now) = self
+            .member_reports()
+            .map_err(|e| NotIdle::Unreadable(e.to_string()))?;
+        node_idle(&members, now, self.config.freshness(), node, at_generation)
+            .into_iter()
+            .next()
+            .map_or(Ok(()), Err)
+    }
+
+    /// The members as the judgements read them, and the store's clock after the reads, so
+    /// a report is judged no fresher than the clock then was.
+    fn member_reports(&self) -> Result<(Vec<MemberReport>, StoreTime), MembershipError> {
+        let mut members: BTreeMap<MemberId, MemberReport> = BTreeMap::new();
+        for member in self.current_map()?.as_ref().map_or(&[][..], Map::members) {
+            members.insert(
+                member.id,
+                MemberReport {
+                    id: member.id,
+                    state: member.state,
+                    planned_down: false,
+                    report: None,
+                },
+            );
+        }
+        for (id, live) in self.read_rows()? {
+            members.insert(
+                id,
+                MemberReport {
+                    id,
+                    state: live.member.state,
+                    planned_down: false,
+                    report: live.report,
+                },
+            );
+        }
+        for member in members.values_mut() {
+            if member.state == MemberState::Down {
+                member.planned_down = self.planned_down(member.id)?;
+            }
+        }
+        let now = self.store.now();
+        Ok((members.into_values().collect(), now))
     }
 
     fn read_rows(&self) -> Result<BTreeMap<MemberId, Live>, MembershipError> {

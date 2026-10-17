@@ -89,8 +89,7 @@ async fn register_answers_with_identity_interval_and_map() {
         .heartbeat(pb::HeartbeatRequest {
             member_id: 1,
             boot: 1,
-            catching_up: false,
-            have_generation: 0,
+            ..Default::default()
         })
         .await
         .expect("beats")
@@ -105,8 +104,8 @@ async fn register_answers_with_identity_interval_and_map() {
         .heartbeat(pb::HeartbeatRequest {
             member_id: 1,
             boot: 1,
-            catching_up: false,
             have_generation: map.generation(),
+            ..Default::default()
         })
         .await
         .expect("beats")
@@ -147,8 +146,7 @@ async fn every_failure_has_its_own_code() {
     let beat = |id, boot| pb::HeartbeatRequest {
         member_id: id,
         boot,
-        catching_up: false,
-        have_generation: 0,
+        ..Default::default()
     };
     let old = client.heartbeat(beat(1, 1)).await.expect_err("old boot");
     assert_eq!(old.code(), Code::FailedPrecondition);
@@ -257,6 +255,107 @@ async fn the_sweeper_expires_members_by_itself() {
         tokio::time::sleep(10 * MS).await;
     }
     panic!("the sweeper never marked the silent member Down");
+}
+
+/// Catches: the wire's report not reaching the judgement, or reaching it wrong. A heartbeat
+/// that says it owes 4 is 4; one that says `debts_known = false` is "cannot say" whatever
+/// count rides with it; and a heartbeat from a node that sends neither field (an older
+/// one) is "cannot say" too, never zero.
+#[tokio::test]
+async fn a_heartbeat_carries_what_the_node_owes() {
+    let store = Hooked::new();
+    let (members, mut client) = serve(&store).await;
+    client.register(request(1)).await.expect("registers");
+    members
+        .set_state(kbf_map::MemberId(1), MemberState::Active)
+        .expect("promoted");
+    let beat = |repair_debts, debts_known| pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 1,
+        repair_debts,
+        debts_known,
+        ..Default::default()
+    };
+    client.heartbeat(beat(4, true)).await.expect("beats");
+    assert_eq!(
+        members
+            .storage_health()
+            .expect("health")
+            .under_replicated_blobs,
+        Some(4)
+    );
+
+    client.heartbeat(beat(9, false)).await.expect("beats");
+    let health = members.storage_health().expect("health");
+    assert_eq!(health.under_replicated_blobs, None);
+    assert_eq!(health.unreported, [kbf_map::MemberId(1)]);
+
+    client.heartbeat(beat(4, true)).await.expect("beats");
+    let older = pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 1,
+        ..Default::default()
+    };
+    client.heartbeat(older).await.expect("beats");
+    assert_eq!(
+        members
+            .storage_health()
+            .expect("health")
+            .under_replicated_blobs,
+        None
+    );
+}
+
+/// Catches: the wire's open-writes report not reaching the judgement, or reaching it wrong,
+/// and the map generation it rides with. A heartbeat that says 3 writes are open at map 7
+/// shows 3 and 7 for the node; one that says `writes_known = false` shows none whatever count
+/// rides with it; one from an older node (neither field) shows none, never zero. Mutants: the
+/// flag ignored; the count read from the debts field; the generation dropped.
+#[tokio::test]
+async fn a_heartbeat_carries_the_writes_the_node_has_open() {
+    let store = Hooked::new();
+    let (members, mut client) = serve(&store).await;
+    client.register(request(1)).await.expect("registers");
+    members
+        .set_state(kbf_map::MemberId(1), MemberState::Active)
+        .expect("promoted");
+    let beat = |open_writes, writes_known| pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 1,
+        have_generation: 7,
+        repair_debts: 5,
+        debts_known: true,
+        open_writes,
+        writes_known,
+        ..Default::default()
+    };
+    let node = || members.storage_health().expect("health").nodes[0];
+
+    client.heartbeat(beat(3, true)).await.expect("beats");
+    let seen = node();
+    assert_eq!(
+        (seen.open_writes, seen.repair_debts, seen.generation),
+        (Some(3), Some(5), Some(7))
+    );
+
+    client.heartbeat(beat(0, true)).await.expect("beats");
+    assert_eq!(node().open_writes, Some(0), "counted, and none");
+
+    client.heartbeat(beat(9, false)).await.expect("beats");
+    assert_eq!(
+        node().open_writes,
+        None,
+        "a count sent unknown is not a count"
+    );
+
+    client.heartbeat(beat(3, true)).await.expect("beats");
+    let older = pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 1,
+        ..Default::default()
+    };
+    client.heartbeat(older).await.expect("beats");
+    assert_eq!(node().open_writes, None, "an older node does not count");
 }
 
 /// Catches: expired rows nobody frees (session rows, the results of finished operations

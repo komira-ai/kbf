@@ -269,6 +269,8 @@ impl Storage for Mem {
     ) -> Answer<'_, ()> {
         Box::pin(async move {
             self.failing()?;
+            // Open unless a test holds the commits (`Knobs::hold_commits`).
+            let _permit = self.knobs.commit_gate.acquire().await;
             if role != Role::Daemon {
                 return Err(ActionWriteError::NotDaemon.into());
             }

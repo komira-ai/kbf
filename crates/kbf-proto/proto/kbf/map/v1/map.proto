@@ -123,6 +123,21 @@ message HeartbeatRequest {
   // Whether the node is still rebuilding its index. A member that is CATCHING_UP becomes
   // ACTIVE at the first heartbeat that says false; no other state is changed by it.
   bool catching_up = 4;
+  // The copies this node owes: blobs it holds that a second owner does not, its open
+  // repair-journal records. Read only when debts_known is true.
+  uint64 repair_debts = 5;
+  // Whether this node has read its repair journal since it started. False says "I cannot
+  // say", never "none": an older node, which sends neither field, reads as false, and so
+  // does a node that has no journal. The frontend sums repair_debts over the members to
+  // judge the farm's under-replicated blobs (docs/design/architecture-v2.md, section 11).
+  bool debts_known = 6;
+  // The writes this node has open now: Write calls it is taking in, as a primary or a
+  // replica, and action-cache commits. Read only when writes_known is true. A rollout
+  // stops a node only after it reports none (docs/design/architecture-v2.md, section 11).
+  uint64 open_writes = 7;
+  // Whether this node counts its open writes. False says "I cannot say", never "none": an
+  // older node, which sends neither field, reads as false.
+  bool writes_known = 8;
 }
 
 message HeartbeatResponse {

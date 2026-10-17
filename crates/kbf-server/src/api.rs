@@ -4,13 +4,18 @@
 //!
 //! - `GET /v1/nodes`: every node registered since the server started, with the newest
 //!   software status each sent and where it is in placement ([`crate::fleet`]).
+//! - `GET /v1/storage`: whether every blob is known to have its copies elsewhere, from the
+//!   storage members' heartbeats ([`crate::storage_health`]); on a frontend with a state
+//!   store.
 //! - `POST /v1/nodes/{node}:cordon`, `:drain` and `:uncordon`: take a node out of
 //!   placement, drain it, or return it ([`NodeAction`]). A drain's body may be
 //!   `{"deadline_secs": N}`; without one the deadline is [`DRAIN_DEADLINE`]. The answer
 //!   is the node as it is after the action.
 //!
-//! - `POST /v1/members/{id}` with `{"state": "active"|"draining"}`: sets a storage
-//!   member's state ([`Members::set_state`]), the operator's promotion of a joiner.
+//! - `POST /v1/members/{id}` with `{"state": "active"|"draining"|"planned_down"}`: sets a
+//!   storage member's state ([`Members::set_state`]), the operator's promotion of a joiner;
+//!   `planned_down` ([`Members::plan_down`]) takes an `Active` member out of the write path
+//!   for a planned restart at once (`409` unless it is `Active`), and `active` undoes it.
 //!
 //! - `GET /v1/frontend/drain`: whether the frontend is draining, the Execute and
 //!   WaitExecution streams open and the operations queued ([`DrainStatus`]).
@@ -191,6 +196,8 @@ struct MemberBody {
 enum MemberTarget {
     Active,
     Draining,
+    #[serde(rename = "planned_down")]
+    PlannedDown,
 }
 
 async fn set_member_state(
@@ -215,16 +222,24 @@ async fn set_member_state(
     let want: MemberBody = match serde_json::from_slice(&body) {
         Ok(want) => want,
         Err(e) => {
-            let why = format!("a member body is {{\"state\": \"active\"|\"draining\"}}: {e}");
+            let why = format!(
+                "a member body is {{\"state\": \"active\"|\"draining\"|\"planned_down\"}}: {e}"
+            );
             return error(StatusCode::BAD_REQUEST, &why);
         }
     };
-    let (state, name) = match want.state {
-        MemberTarget::Active => (MemberState::Active, "active"),
-        MemberTarget::Draining => (MemberState::Draining, "draining"),
+    let name = match want.state {
+        MemberTarget::Active => "active",
+        MemberTarget::Draining => "draining",
+        MemberTarget::PlannedDown => "planned_down",
     };
     // The store's calls block (its trait says so).
-    let set = tokio::task::spawn_blocking(move || members.set_state(MemberId(id), state)).await;
+    let set = tokio::task::spawn_blocking(move || match want.state {
+        MemberTarget::Active => members.set_state(MemberId(id), MemberState::Active),
+        MemberTarget::Draining => members.set_state(MemberId(id), MemberState::Draining),
+        MemberTarget::PlannedDown => members.plan_down(MemberId(id)),
+    })
+    .await;
     member_answer(id, name, set)
 }
 
@@ -255,6 +270,7 @@ const fn member_failure(e: &MembershipError) -> StatusCode {
     match e {
         MembershipError::NotRegistered(_) => StatusCode::NOT_FOUND,
         MembershipError::NotSettable(_) => StatusCode::BAD_REQUEST,
+        MembershipError::NotActive { .. } => StatusCode::CONFLICT,
         MembershipError::Store(_) | MembershipError::Contended => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -374,13 +390,13 @@ fn is_json(value: &[u8]) -> bool {
 
 /// `value` as a JSON body. The views serialize plain strings, numbers and lists, which
 /// cannot fail.
-fn json(code: StatusCode, value: &impl serde::Serialize) -> Response {
+pub(crate) fn json(code: StatusCode, value: &impl serde::Serialize) -> Response {
     let body = serde_json::to_vec(value).unwrap_or_default();
     (code, [(CONTENT_TYPE, JSON)], body).into_response()
 }
 
 /// An error answer; a 401 names the scheme it wants (RFC 9110 section 11.6.1).
-fn error(code: StatusCode, why: &str) -> Response {
+pub(crate) fn error(code: StatusCode, why: &str) -> Response {
     let mut answer = json(code, &serde_json::json!({ "error": why }));
     if code == StatusCode::UNAUTHORIZED {
         let bearer = axum::http::HeaderValue::from_static("Bearer");
