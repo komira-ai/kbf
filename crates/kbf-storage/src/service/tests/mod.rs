@@ -499,6 +499,40 @@ async fn a_write_is_checked_against_its_digest() {
     );
 }
 
+/// Catches a Write whose stream ends early that is answered with anything but
+/// INVALID_ARGUMENT naming how it ended: a stream with no message at all, and one that
+/// stops before `finish_write` (after one message, and after two). Nothing is stored, and
+/// the same blob written whole afterwards is.
+#[tokio::test]
+async fn a_write_that_ends_early_says_how() {
+    let (mem, _remote, channel) = pair().await;
+    let blob = b"twelve bytes";
+    let digest = sha(blob);
+    let name = upload_name(&digest);
+    let cases = [
+        ("empty stream", Vec::new(), "write stream sent no message"),
+        (
+            "one message",
+            write_of(&name, &[(&blob[..5], false)]),
+            "write stream ended without finish_write",
+        ),
+        (
+            "two messages",
+            write_of(&name, &[(&blob[..5], false), (&blob[5..8], false)]),
+            "write stream ended without finish_write",
+        ),
+    ];
+    for (what, requests, text) in cases {
+        let status = raw_write(&channel, requests).await.expect_err(what);
+        assert_eq!(status.code(), Code::InvalidArgument, "{what}: {status}");
+        assert_eq!(status.message(), text, "{what}");
+    }
+    assert_eq!(mem.puts.load(Ordering::SeqCst), 0, "something was stored");
+    assert!(mem.blobs.lock().expect("lock").is_empty());
+    let whole = raw_write(&channel, write_of(&name, &[(blob, true)])).await;
+    assert_eq!(whole.expect("a whole write").committed_size, 12);
+}
+
 /// Catches a Write that reads and stores a blob the node already holds (the cheapest
 /// upload is the one skipped), and QueryWriteStatus that reports a blob not held as
 /// complete or one held as not.

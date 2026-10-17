@@ -7,11 +7,12 @@ use std::sync::atomic::Ordering;
 use bytes::Bytes;
 use futures::StreamExt as _;
 use kbf_meta::{ActionRecord, ActionWriteError, Role};
+use kbf_proto::google::bytestream::WriteRequest;
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::{
     BeginRequest, CommitRequest, LocateRequest, PutRangeRequest, ReadRangeRequest,
 };
-use tonic::{Code, Request};
+use tonic::{Code, Request, Status};
 
 use super::fake::{Held, Mem, connect, patterned, serve_routes, sha};
 use crate::replicate::MapSource;
@@ -108,6 +109,95 @@ async fn a_store_that_fails_fails_the_write() {
         matches!(&answer, Err(StorageError::Internal(why)) if why.contains("disk")),
         "{answer:?}"
     );
+}
+
+/// Catches the write body (the one a `Write` call and an in-process write both run) that
+/// answers a stream ending early with anything but INVALID_ARGUMENT naming how it ended:
+/// no message at all, or messages that stop before `finish_write`. Nothing is stored.
+#[tokio::test]
+async fn a_write_stream_that_ends_early_is_invalid_and_stores_nothing() {
+    let mem = Arc::new(Mem::default());
+    let storage: Arc<dyn Storage> = Arc::clone(&mem) as Arc<dyn Storage>;
+    let service = StorageService::new(
+        storage,
+        Admission::Certified,
+        Config {
+            write_bytes_in_flight: 1 << 30,
+        },
+    );
+    let blob = b"twelve bytes";
+    let name = format!("uploads/u-1/blobs/{}/{}", sha(blob).hash_hex(), blob.len());
+    let message = |name: &str, data: &[u8]| WriteRequest {
+        resource_name: name.to_owned(),
+        write_offset: 0,
+        finish_write: false,
+        data: data.to_vec(),
+    };
+    let cases = [
+        ("empty", Vec::new(), "write stream sent no message"),
+        (
+            "one message",
+            vec![message(&name, &blob[..5])],
+            "write stream ended without finish_write",
+        ),
+        (
+            "two messages",
+            vec![message(&name, &blob[..5]), message("", &blob[5..8])],
+            "write stream ended without finish_write",
+        ),
+    ];
+    for (what, requests, text) in cases {
+        let mut stream = futures::stream::iter(requests.into_iter().map(Ok));
+        let status = service
+            .write_in(0, None, &mut stream)
+            .await
+            .expect_err(what);
+        assert_eq!(status.code(), Code::InvalidArgument, "{what}: {status}");
+        assert_eq!(status.message(), text, "{what}");
+    }
+    assert_eq!(mem.puts.load(Ordering::SeqCst), 0, "something was stored");
+    assert!(mem.blobs.lock().expect("lock").is_empty());
+}
+
+/// Catches a write that swallows or rewrites the error its own stream carries (a client
+/// that resets mid-upload): the status the stream yields, before the first message and
+/// after it, is the call's answer, and nothing is stored.
+#[tokio::test]
+async fn a_write_stream_that_fails_answers_with_its_own_status() {
+    let mem = Arc::new(Mem::default());
+    let storage: Arc<dyn Storage> = Arc::clone(&mem) as Arc<dyn Storage>;
+    let service = StorageService::new(
+        storage,
+        Admission::Certified,
+        Config {
+            write_bytes_in_flight: 1 << 30,
+        },
+    );
+    let blob = b"twelve bytes";
+    let name = format!("uploads/u-1/blobs/{}/{}", sha(blob).hash_hex(), blob.len());
+    let first = WriteRequest {
+        resource_name: name,
+        write_offset: 0,
+        finish_write: false,
+        data: blob[..5].to_vec(),
+    };
+    let cases = [
+        ("before any message", vec![Err(Status::aborted("reset"))]),
+        (
+            "after a message",
+            vec![Ok(first), Err(Status::aborted("reset"))],
+        ),
+    ];
+    for (what, items) in cases {
+        let mut stream = futures::stream::iter(items);
+        let status = service
+            .write_in(0, None, &mut stream)
+            .await
+            .expect_err(what);
+        assert_eq!(status.code(), Code::Aborted, "{what}: {status}");
+        assert_eq!(status.message(), "reset", "{what}");
+    }
+    assert_eq!(mem.puts.load(Ordering::SeqCst), 0, "something was stored");
 }
 
 /// Catches an in-process read, find or action call that skips the generation check: a
