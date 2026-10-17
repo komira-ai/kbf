@@ -491,6 +491,21 @@ async fn a_slot_users_denied_write_is_named_in_its_stderr() {
     let line = text
         .lines()
         .find(|l| l.starts_with("kbf:   ") && l.contains(&name))
-        .unwrap_or_else(|| panic!("no denial names {name}: {text}"));
+        .unwrap_or_else(|| {
+            // What the log holds for the name, to tell a denial the log never got from
+            // one the driver attributed to the wrong pids.
+            let held = Command::new("/usr/bin/log")
+                .args(["show", "--last", "5m", "--style", "compact", "--predicate"])
+                .arg(format!("eventMessage CONTAINS \"{name}\""))
+                .output()
+                .map_or_else(
+                    |e| e.to_string(),
+                    |o| String::from_utf8_lossy(&o.stdout).into_owned(),
+                );
+            panic!(
+                "no denial names {name} (slot uid {}): {text}\nthe log holds:\n{held}",
+                users.0[0].uid
+            )
+        });
     assert!(line.contains("file-write-create"), "{line}");
 }
