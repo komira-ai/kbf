@@ -8,6 +8,9 @@
 
 mod support;
 
+#[path = "frontend/handover.rs"]
+mod handover;
+
 use std::future::pending;
 use std::net::SocketAddr;
 use std::sync::Arc;

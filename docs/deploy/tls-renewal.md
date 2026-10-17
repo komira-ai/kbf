@@ -1,11 +1,12 @@
 # Renewing a listener's certificate
 
-`kbf frontend` and `kbf-server` serve TLS on two listeners, from files:
+`kbf frontend` and `kbf-server` serve TLS on two listeners, and `kbf storage` on one, from files:
 
 | Listener | Files | Flags |
 |---|---|---|
 | REAPI (clients) | server certificate, its key | `--reapi-tls-cert`, `--reapi-tls-key` |
 | worker (daemons, mutual TLS) | server certificate, its key, the CA daemon certificates chain to | `--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca` |
+| storage node (frontends, daemons, other nodes; mutual TLS) | server certificate, its key, the CA callers' certificates chain to | `--storage-tls-cert`, `--storage-tls-key`, `--storage-client-ca` |
 
 They look at those files every `--tls-reload-interval-secs` (default 30, 1 to 3600).
 To renew, replace the files. Nothing is restarted, and no connection is ended:
@@ -35,6 +36,9 @@ The files must be good when the server starts: a start with a bad file stops, as
 (An expired certificate still starts, as before; it is not applied by a later change.)
 
 ## Watching it
+
+A storage node has no operator API: its rejected looks are in its log only (the
+warning above), and it has no `/metrics` to scrape. Watch the log for it.
 
 On the operator API's `/metrics` ([api.md](../api.md#get-metrics)):
 
