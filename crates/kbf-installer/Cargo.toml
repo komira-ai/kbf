@@ -1,0 +1,33 @@
+[package]
+name = "kbf-installer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The host side of a kbf release: where a host keeps its releases and its deploy state,
+# and the verbs that install, roll back and remove them. `kbf-deploy host ...` (the
+# manual path) and the root helper that applies updates are both callers, so there is
+# one state file and one layout on a host. Changes a host only through kbf-host's plan
+# of steps. sha2 and hex check the copied binary against its source.
+
+[features]
+# `testkit`: the scratch host and state helpers other crates' tests of the `host` verbs use.
+testkit = ["kbf-host/testkit"]
+
+[dependencies]
+hex.workspace = true
+kbf-host.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+kbf-host = { workspace = true, features = ["testkit"] }
+rustix = { workspace = true, features = ["process"] }
+
+[lints]
+workspace = true

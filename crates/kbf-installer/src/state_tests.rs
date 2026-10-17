@@ -6,37 +6,7 @@ use std::thread;
 
 use super::*;
 
-pub(crate) const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-pub(crate) const B: &str = "0123456789abcdef0123456789abcdef01234567";
-pub(crate) const C: &str = "cccccccccccccccccccccccccccccccccccccccc";
-
-pub(crate) fn c(id: &str) -> CommitId {
-    CommitId::new(id).expect("a test commit")
-}
-
-/// A scratch root with the directories a host has: `/run`, the state directory and
-/// `/usr/local/kbf`.
-pub(crate) fn host_root(name: &str) -> (Root, PathBuf) {
-    let dir = kbf_host::testkit::scratch(name);
-    for sub in ["run", "var/lib/kbf-deploy", "usr/local/kbf"] {
-        fs::create_dir_all(dir.join(sub)).expect("seed");
-    }
-    (Root::new(&dir).expect("absolute"), dir)
-}
-
-pub(crate) fn full_state() -> State {
-    State {
-        current: Some(c(A)),
-        previous: Some(c(B)),
-        staged: Some(c(C)),
-        pending_confirm: Some(PendingConfirm {
-            commit: c(A),
-            previous: Some(c(B)),
-            deadline: 1_800_000_000,
-        }),
-        order_floor: 7,
-    }
-}
+pub(crate) use crate::testkit::{A, B, C, c, full_state, host_root};
 
 /// Catches a state that does not read back as written (a field dropped or renamed), a
 /// file without its schema number first, and a missing file read as anything but "no

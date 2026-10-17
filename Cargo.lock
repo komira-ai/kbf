@@ -1509,6 +1509,7 @@ dependencies = [
  "hex",
  "httparse",
  "kbf-host",
+ "kbf-installer",
  "kbf-mdm",
  "kbf-state",
  "kbf-types",
@@ -1655,6 +1656,19 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rustix",
+ "thiserror",
+]
+
+[[package]]
+name = "kbf-installer"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "kbf-host",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "thiserror",
 ]
 

@@ -1,14 +1,18 @@
-//! The host side of commit-confirm deploys: where a host keeps kbf's releases and
-//! kbf-deploy's own state, and the `host` verbs that read and change them.
+//! The `host` verbs of the command line: the host side of commit-confirm deploys.
 //!
-//! - [`layout`]: the paths: each release in its own directory under
+//! The layout, the state file and what `install`, `rollback` and `gc` do to a host are
+//! in the `kbf-installer` crate, which this module calls (and re-exports as [`layout`],
+//! [`state`] and [`release`]), so that this manual path and any other caller of the
+//! crate share one state file and one layout:
+//!
+//! - [`layout`]: each release in its own directory under
 //!   `/usr/local/kbf/releases/<commit>/`, the `current` and `previous` links beside them,
 //!   kbf-deploy's state under `/var/lib/kbf-deploy/` and its settings under
 //!   `/etc/kbf-deploy/`.
 //! - [`state`]: `state.json` (the current, previous and staged commits, the one waiting
 //!   to be confirmed, and the order floor), read and written under an exclusive lock on
 //!   `/run/kbf-deploy.lock` and replaced whole by a rename.
-//! - [`release`]: the manual `install`, `rollback` and `gc` verbs.
+//! - [`release`]: the `install`, `rollback` and `gc` verbs.
 //! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
 //!   named by.
 //! - [`state_store`]: the SQLite state store's file backed up while the frontend runs
@@ -38,9 +42,7 @@
 //! `--apply` is given; what each does is in [`release`]. They exit 0 when done and 1
 //! with `kbf-deploy: <why>` on stderr when they refuse or a step fails.
 
-pub mod layout;
-pub mod release;
-pub mod state;
+pub use kbf_installer::{CommitId, NotACommit, layout, release, state};
 pub mod state_store;
 
 use std::fmt;
@@ -52,64 +54,8 @@ use clap::{Args, Subcommand};
 use kbf_host::exec::HostExec;
 use kbf_host::path::Root;
 use kbf_host::plan::Mode;
-use serde::{Deserialize, Serialize};
 
 use state::{CurrentLink, Status};
-
-/// A commit, as Git names it in full: exactly 40 lowercase hex characters. A release
-/// directory, a link target and the state name commits only in this form, so a short or
-/// upper-case id can never name a second copy of one release.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct CommitId(String);
-
-/// Why a string is not a [`CommitId`].
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{0:?} is not a commit id (40 lowercase hex characters)")]
-pub struct NotACommit(pub String);
-
-impl CommitId {
-    pub fn new(id: &str) -> Result<CommitId, NotACommit> {
-        let hex = |b: u8| matches!(b, b'0'..=b'9' | b'a'..=b'f');
-        if id.len() == 40 && id.bytes().all(hex) {
-            Ok(CommitId(id.to_owned()))
-        } else {
-            Err(NotACommit(id.to_owned()))
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<String> for CommitId {
-    type Error = NotACommit;
-
-    fn try_from(id: String) -> Result<CommitId, NotACommit> {
-        CommitId::new(&id)
-    }
-}
-
-impl From<CommitId> for String {
-    fn from(id: CommitId) -> String {
-        id.0
-    }
-}
-
-impl std::str::FromStr for CommitId {
-    type Err = NotACommit;
-
-    fn from_str(id: &str) -> Result<CommitId, NotACommit> {
-        CommitId::new(id)
-    }
-}
-
-impl fmt::Display for CommitId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
 
 /// The `host` verbs of the `kbf-deploy` command line ([`crate::cli`]).
 #[derive(Subcommand)]
