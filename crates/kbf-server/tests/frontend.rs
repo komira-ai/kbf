@@ -24,7 +24,8 @@ use kbf_server::frontend::{self, FrontendFlags, FrontendHandle, start_frontend};
 use kbf_server::health::{MapProbe, Probe, StateProbe, router_of};
 use kbf_server::{BoundStorage, Readiness, StorageListener, bind_storage};
 use kbf_state::{
-    Changes, Commit, CommitStats, Conflict, Revision, Store, StoreError, StoreTime, Txn, Versioned,
+    Changes, Commit, CommitStats, Conflict, Revision, ScanPage, ScanRange, Store, StoreError,
+    StoreTime, Txn, Versioned,
 };
 use kbf_storage::Storage;
 use serde_json::Value;
@@ -516,6 +517,10 @@ impl Store for PlantedStore {
     }
 
     fn scan_prefix(&self, _: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
+        Err(StoreError::Failed("planted".to_owned()))
+    }
+
+    fn scan_range(&self, _: ScanRange<'_>) -> Result<ScanPage, StoreError> {
         Err(StoreError::Failed("planted".to_owned()))
     }
 

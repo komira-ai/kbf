@@ -36,7 +36,7 @@ use crate::health::Readiness;
 use crate::http_blobs::BlobReaders;
 use crate::http_invocations::InvocationReaders;
 use crate::identity::{DenyList, Peers};
-use crate::members::Members;
+use crate::members::{Members, MembershipError};
 use crate::members_rpc::MembershipService;
 use crate::state_store::StateStore;
 use crate::token::ApiToken;
@@ -168,6 +168,9 @@ pub enum ServeError {
     /// The scheduler's state store could not be taken up.
     #[error("--state-store: {0}")]
     State(#[from] StateError),
+    /// The storage map could not be read from the state store.
+    #[error("storage map: {0}")]
+    Map(#[from] MembershipError),
 }
 
 /// A server that is listening: the addresses it bound, and the future that serves
@@ -310,6 +313,23 @@ pub(crate) fn members_of(state: Option<&crate::StateStore>) -> Option<Arc<Member
         Arc::clone(&state.store),
         state.members,
     )))
+}
+
+/// The storage map daemons are sent: `explicit` if a caller gave one, else the members'
+/// (every frontend with a state store has members), else none (a farm of one member, whose
+/// daemons use the cache they were given). Not generic, for the same reason as
+/// [`sweeping`].
+///
+/// # Errors
+/// The state store failing to read the map.
+pub(crate) fn map_of(
+    explicit: Option<Arc<dyn MapSource>>,
+    members: Option<&Arc<Members>>,
+) -> Result<Option<Arc<dyn MapSource>>, MembershipError> {
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    members.map(Members::map_source).transpose()
 }
 
 /// The membership service storage nodes register with, when there are members to keep:
@@ -572,6 +592,7 @@ where
     let durable = state.is_some();
     // Storage nodes register with a frontend that has a state store to keep them in.
     let members = members_of(state.as_ref());
+    let map = map_of(map, members.as_ref())?;
     let farm = Arc::new(farm.with_state(state)?);
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
@@ -787,6 +808,17 @@ pub struct StorageListener {
     pub service: kbf_storage::service::Config,
 }
 
+/// The check each call of a gated node passes ([`bind_storage_gated`]). Not generic, so
+/// the lines count once.
+fn map_gate(
+    maps: Option<Arc<kbf_mapsync::MapHolder>>,
+) -> impl FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Clone {
+    move |request| match &maps {
+        Some(maps) if maps.generation() == 0 => Err(tonic::Status::unavailable(NO_MAP_YET)),
+        _ => Ok(request),
+    }
+}
+
 /// A storage node that is listening.
 pub struct BoundStorage<F> {
     /// Where the listener is.
@@ -807,6 +839,26 @@ pub fn bind_storage(
     listener: StorageListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
+    bind_storage_gated(storage, listener, None, shutdown)
+}
+
+/// The refusal a gated node answers every call with until its first map.
+pub const NO_MAP_YET: &str = "no storage map yet";
+
+/// [`bind_storage`], and with `maps` (a node in a multi-member farm, which registered
+/// with a frontend) every call is answered UNAVAILABLE [`NO_MAP_YET`] until `maps` holds
+/// its first map: a node that does not know the farm's members cannot tell a blob it owns
+/// from one it does not, and would take a write the map places elsewhere. `None` (one
+/// box, whose map is itself) serves at once.
+///
+/// # Errors
+/// As [`bind_storage`].
+pub fn bind_storage_gated(
+    storage: Arc<dyn kbf_storage::Storage>,
+    listener: StorageListener,
+    maps: Option<Arc<kbf_mapsync::MapHolder>>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
     let (incoming, addr) = bind(listener.listen)?;
     let mut server = flow_control(Server::builder());
     let admission = match listener.tls {
@@ -818,8 +870,10 @@ pub fn bind_storage(
     };
     let routes =
         kbf_storage::service::StorageService::new(storage, admission, listener.service).routes();
+    let gate = tonic::service::InterceptorLayer::new(map_gate(maps));
     let serving = async move {
         server
+            .layer(gate)
             .add_routes(routes)
             .serve_with_incoming_shutdown(incoming, shutdown)
             .await
