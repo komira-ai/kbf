@@ -13,7 +13,7 @@ use bytes::Bytes;
 use futures::{StreamExt as _, stream};
 
 use super::LOCK_KEY;
-use crate::{KeyPrefix, ObjectKey, ObjectStore, ObjectStoreError};
+use crate::{BodyStream, KeyPrefix, ObjectKey, ObjectStore, ObjectStoreError};
 
 /// How many deletes are in flight at once.
 const DELETES: usize = 16;
@@ -36,9 +36,9 @@ pub struct Cleanup {
 pub(super) struct Written(Mutex<BTreeSet<ObjectKey>>);
 
 impl Written {
-    /// `store.put_new`, remembering `key` for the sweep. The key is remembered before the
-    /// answer is known (a put that errors may still have landed) except when the store
-    /// says the key already existed: then it is not this run's to delete.
+    /// `store.put_new`, remembering `key` for the sweep. The key is remembered whatever the
+    /// answer (a put that errors may still have landed) except when the store says the
+    /// key already existed: then it is not this run's to delete.
     pub(super) async fn put_new<S: ObjectStore>(
         &self,
         store: &S,
@@ -47,13 +47,30 @@ impl Written {
         retain_until: Option<SystemTime>,
     ) -> Result<(), ObjectStoreError> {
         let answer = store.put_new(key, body, retain_until).await;
+        self.remember(key, &answer);
+        answer
+    }
+
+    /// `store.put_stream`, remembered as [`Written::put_new`] does.
+    pub(super) async fn put_stream<S: ObjectStore>(
+        &self,
+        store: &S,
+        key: &ObjectKey,
+        len: u64,
+        body: BodyStream,
+    ) -> Result<(), ObjectStoreError> {
+        let answer = store.put_stream(key, len, body).await;
+        self.remember(key, &answer);
+        answer
+    }
+
+    fn remember(&self, key: &ObjectKey, answer: &Result<(), ObjectStoreError>) {
         if !matches!(answer, Err(ObjectStoreError::AlreadyExists(_))) {
             self.0
                 .lock()
                 .expect("no panic holds the lock")
                 .insert(key.clone());
         }
-        answer
     }
 }
 

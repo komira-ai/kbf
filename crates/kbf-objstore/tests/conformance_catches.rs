@@ -9,11 +9,12 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use bytes::Bytes;
+use futures::StreamExt;
 use futures::executor::block_on;
 use kbf_objstore::conformance::{self, Check, Outcome, Report};
 use kbf_objstore::{
-    ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
-    ObjectStoreError, PageSize,
+    BodyStream, ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey,
+    ObjectStore, ObjectStoreError, PageSize,
 };
 
 const ALL: Capabilities = Capabilities {
@@ -66,6 +67,8 @@ enum Defect {
     RefusesOneDelete,
     /// Answers a delete of a retained object with a 403, as S3 does, not with `Locked`.
     DeniesRetainedDelete,
+    /// Writes a streamed body's bytes as they came even when it failed or ended short.
+    KeepsBrokenStream,
 }
 
 struct Broken {
@@ -121,6 +124,23 @@ impl ObjectStore for Broken {
             _ => retain_until,
         };
         self.inner.put_new(key, body, retain_until).await
+    }
+
+    async fn put_stream(
+        &self,
+        key: &ObjectKey,
+        len: u64,
+        mut body: BodyStream,
+    ) -> Result<(), ObjectStoreError> {
+        if !matches!(self.defect, Defect::KeepsBrokenStream) {
+            let bytes = kbf_objstore::gather(body, len).await?;
+            return self.put_new(key, bytes, None).await;
+        }
+        let mut got = Vec::new();
+        while let Some(Ok(piece)) = body.next().await {
+            got.extend_from_slice(&piece);
+        }
+        self.inner.put_new(key, Bytes::from(got), None).await
     }
 
     async fn get_range(
@@ -318,7 +338,14 @@ fn assert_fails_only(report: &Report, failed: &[Check]) {
 #[test]
 fn a_store_that_ignores_range_fails() {
     let report = run(Defect::IgnoresRange);
-    assert_fails_only(&report, &[Check::RangeBoundaries, Check::FooterReads]);
+    assert_fails_only(
+        &report,
+        &[
+            Check::RangeBoundaries,
+            Check::FooterReads,
+            Check::StreamedPut,
+        ],
+    );
 }
 
 /// Catches: a suite that does not check the length of what a range returns.
@@ -333,6 +360,7 @@ fn a_store_that_reads_short_fails() {
             Check::FooterReads,
             Check::PutNewRefusesOverwrite,
             Check::ObjectLock,
+            Check::StreamedPut,
         ],
     );
 }
@@ -503,7 +531,10 @@ fn a_store_that_refuses_second_pages_fails() {
 #[test]
 fn a_store_that_claims_conditional_writes_but_overwrites_fails() {
     let report = run(Defect::Overwrites);
-    assert_fails_only(&report, &[Check::PutNewRefusesOverwrite]);
+    assert_fails_only(
+        &report,
+        &[Check::PutNewRefusesOverwrite, Check::StreamedPut],
+    );
 }
 
 /// Catches: a suite that accepts any answer for a missing key, or that does not read
@@ -512,7 +543,14 @@ fn a_store_that_claims_conditional_writes_but_overwrites_fails() {
 #[test]
 fn a_store_that_answers_missing_keys_with_empty_bytes_fails() {
     let report = run(Defect::MissingIsEmpty);
-    assert_fails_only(&report, &[Check::MissingObject, Check::DeleteIdempotent]);
+    assert_fails_only(
+        &report,
+        &[
+            Check::MissingObject,
+            Check::DeleteIdempotent,
+            Check::StreamedPut,
+        ],
+    );
 }
 
 /// Catches: a store without Object Lock that accepts a retention date and stores the
@@ -603,7 +641,14 @@ fn a_run_against_a_store_without_object_lock_leaves_only_the_neighbours() {
 #[test]
 fn a_failing_check_still_gets_its_objects_deleted_and_stays_reported() {
     let (store, report) = run_beside_neighbours(Defect::IgnoresRange);
-    assert_fails_only(&report, &[Check::RangeBoundaries, Check::FooterReads]);
+    assert_fails_only(
+        &report,
+        &[
+            Check::RangeBoundaries,
+            Check::FooterReads,
+            Check::StreamedPut,
+        ],
+    );
     assert!(!report.passed(), "{report}");
     assert!(report.cleanup.failed.is_empty(), "{report}");
     let mut want = neighbours();
@@ -731,4 +776,29 @@ fn every_key_a_check_writes_is_deleted() {
     let (left, report) = run_under("conformance/", &[]);
     assert!(report.passed(), "{report}");
     assert!(left.is_empty(), "{left:?}\n{report}");
+}
+
+/// Catches: a suite that trusts a streamed write without feeding it a body that fails
+/// or ends short; a store that keeps what it got would hold a truncated object under a
+/// key that names a whole one (a segment whose footer is missing).
+#[test]
+fn a_store_that_keeps_a_broken_streamed_body_fails() {
+    let report = run(Defect::KeepsBrokenStream);
+    assert_fails_only(&report, &[Check::StreamedPut]);
+    let Some(Outcome::Failed(why)) = report.outcome(Check::StreamedPut) else {
+        unreachable!("checked above");
+    };
+    assert!(why.contains("a body that failed was written"), "{why}");
+}
+
+/// Catches: a recorder that forgets the streamed writes: the streamed object, and the
+/// two a failing body left behind in a store that keeps what it got, are deleted.
+#[test]
+fn every_key_a_streamed_put_writes_is_deleted() {
+    let (store, report) = run_beside_neighbours(Defect::KeepsBrokenStream);
+    assert_fails_only(&report, &[Check::StreamedPut]);
+    assert!(report.cleanup.failed.is_empty(), "{report}");
+    let mut want = neighbours();
+    want.insert(2, "conformance/locked".to_owned());
+    assert_eq!(bucket_keys(&store.inner), want, "{report}");
 }

@@ -61,6 +61,12 @@ KBF_STORAGE_URL=https://192.0.2.20:8983
 # reapi.key under KBF_ETC. The key is the server user's alone.
 KBF_REAPI_CERT=
 KBF_REAPI_KEY=
+# `--mode frontend` and `--mode all-in-one`: the operator API's bearer token, passed as
+# the path in --api-token-file= (never the token). Without it the API's writes (drain,
+# ...) answer 401 or are off. Empty: api-token under KBF_ETC. The operator puts the file
+# there; install-units never makes it and refuses a missing one, one not the server
+# user's, or one with a group or other bit.
+KBF_API_TOKEN_FILE=
 # `--mode frontend`: the directory of the SQLite state store (--state-store=
 # sqlite://<dir>/state.db). install-units makes it, the server user's, mode 0700.
 KBF_STATE_DIR=/var/lib/kbf-server/state
