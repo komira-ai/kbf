@@ -342,7 +342,7 @@ async fn a_corrupt_copy_is_never_copied_to_the_owner() {
 
 /// Catches a commit that ignores the staleness rule or loops on it: one STALE_MAP from the
 /// owner refetches the map once and the commit then succeeds against the new generation;
-/// a second one is UNAVAILABLE.
+/// stale again against a map nobody can fetch is UNAVAILABLE.
 #[tokio::test]
 async fn a_commit_with_closure_follows_the_stale_map_rule() {
     let one = map(1, 1, active(&[1]));
@@ -376,9 +376,9 @@ async fn a_commit_with_closure_follows_the_stale_map_rule() {
     let error = router
         .commit_with_closure(Role::Daemon, action, record)
         .await
-        .expect_err("two stale answers");
+        .expect_err("generation 4 cannot be had");
     assert!(matches!(error, StorageError::Unavailable(_)), "{error:?}");
-    assert_eq!(cell.fetched(), [2, 3]);
+    assert_eq!(cell.fetched(), [2, 3, 4]);
 }
 
 /// Catches an entry whose result blob is empty (an `ActionResult` with nothing set encodes
