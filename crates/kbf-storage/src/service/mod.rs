@@ -30,9 +30,16 @@
 //! UNAVAILABLE if it cannot get it in time. Such a node that has no map yet fetches one the
 //! same way and serves nothing (UNAVAILABLE) until it has.
 //!
+//! **A node that is catching up** ([`CatchUp`], [`StorageService::with_catch_up`]) is
+//! rebuilding its index, so a miss does not show a blob is not held: a `Read` of a blob it
+//! cannot find, a `FindMissingBlobs` with any digest missing (the whole call, so a router
+//! asks the next owner about every digest of it), an action-cache miss, and an
+//! action-cache write refused for a closure blob not found all answer UNAVAILABLE, never
+//! NOT_FOUND or FAILED_PRECONDITION. Hits and writes are served.
+//!
 //! **Who may call** is [`Admission`]: the role in the caller's certificate against the
-//! endpoint's table. Roles are the part of this unit that is partly a seam; the module
-//! docs of [`admission`] say which.
+//! endpoint's table, the role read by `kbf-peer`; the module docs of [`admission`] say
+//! what is checked and what is planned.
 //!
 //! **How `Write` takes a blob in.** Where the store offers a [`crate::PutStream`]
 //! ([`Storage::stream`]), each message is appended to it as it arrives and the blob is
@@ -45,6 +52,7 @@ mod actions;
 mod admission;
 mod bytestream;
 mod cas;
+mod catch_up;
 mod client;
 mod generation;
 mod segments;
@@ -67,6 +75,7 @@ use crate::replicate::{self, Chain, MapSource};
 use crate::{Storage, StorageError};
 
 pub use admission::{Admission, Endpoint, PeerRole, ROLE_URI_PREFIX, role_of};
+pub use catch_up::CatchUp;
 pub use client::RemoteStorage;
 pub(crate) use client::lift;
 
@@ -106,6 +115,7 @@ pub struct StorageService {
     admission: Admission,
     chain: Option<Arc<Chain>>,
     map: Option<Arc<dyn MapSource>>,
+    catch_up: Option<CatchUp>,
     refetch_wait: Duration,
     write_room: Semaphore,
     write_room_bytes: u32,
@@ -121,6 +131,7 @@ impl StorageService {
             admission,
             chain: None,
             map: None,
+            catch_up: None,
             refetch_wait: replicate::REFETCH_WAIT,
             write_room: Semaphore::new(config.write_bytes_in_flight as usize),
             write_room_bytes: config.write_bytes_in_flight,
@@ -152,6 +163,20 @@ impl StorageService {
         self.map = Some(chain.source());
         self.chain = Some(chain);
         Ok(self)
+    }
+
+    /// The service of a node whose index may be being rebuilt: while `catch_up` says so,
+    /// a miss is UNAVAILABLE (the module docs). A service given none is never catching up.
+    #[must_use]
+    pub fn with_catch_up(mut self, catch_up: CatchUp) -> Self {
+        self.catch_up = Some(catch_up);
+        self
+    }
+
+    /// Whether a miss found from now on must be answered UNAVAILABLE: read before the
+    /// store is asked ([`catch_up`]'s module docs say why).
+    fn catching_up(&self) -> bool {
+        self.catch_up.as_ref().is_some_and(CatchUp::is_catching_up)
     }
 
     /// How long a call routed by a map this node has not been told of waits for the node
