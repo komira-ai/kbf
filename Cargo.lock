@@ -1653,12 +1653,15 @@ dependencies = [
 name = "kbf-installer"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "hex",
  "kbf-host",
+ "libc",
  "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tar",
  "thiserror",
 ]
 
