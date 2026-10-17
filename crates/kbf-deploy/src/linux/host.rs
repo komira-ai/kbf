@@ -105,6 +105,10 @@ pub enum HostError {
     // install-units --mode
     #[error("{0} names no User= or root: kbf runs as a user of its own")]
     RunsAsRoot(String),
+    #[error(
+        "{0} is the kbf package's: apt owns /lib/systemd/system/{0}, and a copy in /etc/systemd/system would shadow it. `render-units --mode node` and `check-units --mode node` check one"
+    )]
+    PackageUnit(String),
     #[error(transparent)]
     ModeCheck(#[from] super::modes::ParseError),
 

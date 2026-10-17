@@ -35,6 +35,10 @@
 //!   a render checked for what the REAPI path through the front depends on
 //!   (`envoy check`), and the render applied to a cluster through kubectl after the
 //!   cluster's prerequisites and a server-side dry run pass (`envoy apply`).
+//! - [`package`]: what the kbf `.deb` does to a Linux host when dpkg installs, stops,
+//!   removes or purges it (`package postinst`, `prerm`, `postrm`): the `kbf` account with
+//!   its subordinate ids and lingering, the directories, the trust files and the shipped
+//!   release, and the `kbf-node` unit's reload and enable.
 //! - [`log`]: the last lines of a kbf-server's durable log across its rotated files
 //!   (`log`; read-only).
 //! - [`pilot`]: a pilot kbf-server run as a systemd user service by the operator's own
@@ -50,6 +54,7 @@ pub mod linux;
 pub mod log;
 pub mod mdm;
 pub mod minio;
+pub mod package;
 pub mod pilot;
 pub mod template;
 pub mod unit;

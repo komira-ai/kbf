@@ -2,7 +2,8 @@
 
 `kbf-deploy linux render-units --mode MODE` writes `kbf.slice` and `kbf-<mode>.service`
 for one mode of `kbf` (`frontend`, `storage`, `daemon`, `storage-and-daemon`,
-`all-in-one`; [architecture-v2.md](../design/architecture-v2.md), sections 1 and 11).
+`all-in-one`; [architecture-v2.md](../design/architecture-v2.md), sections 1 and 11) or
+the package's `node` unit (below).
 `kbf-deploy linux check-units --mode MODE` reads them back, each with its drop-ins, and
 prints one `FAIL <rule>: <reason>` line per broken rule, then any `SKIP` or `WARN` line
 (neither is a failure), then the summary:
@@ -44,13 +45,28 @@ It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/sy
 | `slice` | a unit not in `kbf.slice` |
 | `delegate` | a mode that runs builds without `cpu`, `cpuset`, `memory` and `pids` delegated, or with one of them in `DisableControllers=` (the unit's, or `kbf.slice`'s) |
 | `cpuset` | `AllowedCPUs=` or `AllowedMemoryNodes=` on a mode that runs builds, or on `kbf.slice`, narrower than the node's CPUs or NUMA nodes |
-| `credential` | the cold store's key reaching a mode without a storage half (`daemon`, `all-in-one`); the `storage` unit, which holds it, run as root or as `KBF_USER` (the user builds run as), and on the node its key file readable by another user; in the `storage-and-daemon` unit, any way of giving the key but the one `EnvironmentFile=<KBF_ETC>/s3.env` (below), and on the node that file not a plain file of root's with mode 0600 |
+| `credential` | the cold store's key reaching a mode without a storage half (`daemon`, `all-in-one`), or a `node` unit carrying any key (`s3.env`, an `AWS_*` variable, a systemd credential); the `storage` unit, which holds it, run as root or as `KBF_USER` (the user builds run as), and on the node its key file readable by another user; in the `storage-and-daemon` unit, any way of giving the key but the one `EnvironmentFile=<KBF_ETC>/s3.env` (below), and on the node that file not a plain file of root's with mode 0600 |
 | `storage` | a `storage` or `storage-and-daemon` unit without `--cold-store`, `--meta-dir`, `--storage-listen` or one of the three certificate flags, or with an `s3://` cold store and no `EnvironmentFile=<KBF_ETC>/s3.env` (for `storage-and-daemon`, exactly that path: no `-`, quotes or wildcard) |
 | `state-store` | a `--state-store` that is not `sqlite:///<absolute path>`: a Postgres URI (`postgres://` or `postgresql://`; postgres is not wired yet), any other scheme, an empty or relative SQLite path, or a value that names a variable (below) |
 | `traverse` | on the node, a `file://` `--hot-store` with an existing directory above it that the unit's `User=` cannot enter (no execute bit for it as owner, group member or other); the message names the directory, its mode and owner, and the user. `install-units --mode` refuses it too, before any step |
 | `ports` | two of a unit's listeners (`--listen`, `--worker-listen`, `--api-listen`, `--storage-listen`) on one port |
+| `node` | a `node` unit that does not run as `KBF_USER`, whose `ExecStartPre=` is not exactly `<KBF_BIN_DIR>/kbf enroll --config=<KBF_ETC>/kbf.toml`, whose `ExecStart=` does not give the same `--config=`, or that gives a flag with `key` in its name |
 | `stop` | a mode that drains on SIGTERM (every mode but `daemon`) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
 | `parse` | flags that `kbf <mode>` refuses |
+
+**`node`.** The unit the kbf package ships as `/lib/systemd/system/kbf-node.service`
+(`docs/design/install-and-enrollment.md`, sections 3 and 4.4, in pull request 966 until it merges):
+`ExecStartPre=kbf enroll` gets the node's certificates (it exits 0 at once when they are
+good), and `ExecStart=kbf node` runs the mode the roles the frontend granted select.
+`render-units --mode node` and `check-units --mode node` work as for the other modes; the
+rule `node` refuses a unit that runs as another user than `KBF_USER`, that lacks the
+enrolling `ExecStartPre=` (or has a `-` before it, which makes systemd ignore its
+failure), whose `ExecStart=` reads another config file than `<KBF_ETC>/kbf.toml`, or that
+names a key by any flag (`--key=`, `--object-store-keys-file=`): a node makes its own key
+pair and is sent the cold store's keys over its mTLS session, so rule `credential` also
+refuses `s3.env`, `AWS_*` variables and systemd credentials in it. `install-units --mode
+node` is refused: the package owns the unit. `kbf node` and `kbf enroll` are not in `kbf`
+yet, so rule `parse` reports `kbf check-args node` as an unknown mode until they are.
 
 **`delegate`.** systemd reads `Delegate=` this way (systemd.resource-control(5), and
 `config_parse_delegate` in systemd's `src/core/load-fragment.c`): a boolean delegates

@@ -67,6 +67,9 @@ fn plan_with<E: Exec>(
     out: &mut dyn Write,
 ) -> Result<Plan, HostError> {
     let (c, mode) = (&a.config, a.mode);
+    if mode == Mode::Node {
+        return Err(HostError::PackageUnit(mode.unit_name()));
+    }
     let kbf_user = if mode.runs_builds() {
         let kbf = host::user_named(exec, &c.user)?;
         rootless(exec, &kbf)?;

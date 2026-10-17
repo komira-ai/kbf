@@ -39,13 +39,19 @@ struct Row {
     fails: &'static [Mode],
 }
 
-const ALL: &[Mode] = &Mode::ALL;
-const BUILDS: &[Mode] = &[Mode::Daemon, Mode::StorageAndDaemon, Mode::AllInOne];
+const ALL: &[Mode] = &Mode::EVERY;
+const BUILDS: &[Mode] = &[
+    Mode::Daemon,
+    Mode::StorageAndDaemon,
+    Mode::AllInOne,
+    Mode::Node,
+];
 const DRAINS: &[Mode] = &[
     Mode::Frontend,
     Mode::Storage,
     Mode::StorageAndDaemon,
     Mode::AllInOne,
+    Mode::Node,
 ];
 
 fn rows() -> Vec<Row> {
@@ -116,7 +122,11 @@ fn rows() -> Vec<Row> {
         },
         Row {
             rule: "credential",
-            plant: |_, t| last_in_service(t, "User="),
+            // A node's missing User= is rule `node`'s (node_tests).
+            plant: |m, t| match m {
+                Mode::Node => t.to_owned(),
+                _ => last_in_service(t, "User="),
+            },
             fails: &[Mode::Storage],
         },
         Row {
@@ -175,7 +185,7 @@ fn each_rule_fails_exactly_the_modes_it_is_for() {
     let c = config();
     let mut wrong = Vec::new();
     for (i, row) in rows().iter().enumerate() {
-        for mode in Mode::ALL {
+        for mode in Mode::EVERY {
             let text = render(&c, Some(1500), mode).expect("renders");
             let planted = (row.plant)(mode, &text);
             if planted == text {
@@ -255,7 +265,7 @@ fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
             .slice,
     );
     let cases: [(&str, Entry, &[Mode]); 4] = [
-        ("parse", file(0o600, 0, ""), &Mode::ALL),
+        ("parse", file(0o600, 0, ""), &Mode::EVERY),
         (
             "credential",
             file(0o640, 0, ""),
@@ -275,7 +285,7 @@ fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
     let mut wrong = Vec::new();
     for (rule, key, fails) in cases {
         let exec = node(key);
-        for mode in Mode::ALL {
+        for mode in Mode::EVERY {
             let text = render(&c, Some(1500), mode).expect("renders");
             let unit = UnitText::new(mode.unit_name(), text);
             let r = check_on_host(&exec, &c, mode, &unit, &slice, true, None).expect("runs");

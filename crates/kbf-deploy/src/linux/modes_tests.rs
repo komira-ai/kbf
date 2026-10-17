@@ -40,7 +40,7 @@ fn lines(r: &Report) -> Vec<String> {
 #[test]
 fn each_mode_renders_a_unit_that_passes_every_rule_and_matches_its_golden() {
     let c = config();
-    for mode in Mode::ALL {
+    for mode in Mode::EVERY {
         let text = render(&c, Some(1500), mode).expect("renders");
         let r = check(&c, mode, &text, true).expect("a unit");
         assert_eq!(lines(&r), Vec::<String>::new(), "{mode}");
@@ -76,19 +76,24 @@ fn the_converged_units_are_unchanged() {
 /// not `kbf-<mode>.service`.
 #[test]
 fn the_modes_are_listed_with_the_sets_the_rules_use() {
-    let builds: Vec<_> = Mode::ALL.iter().filter(|m| m.runs_builds()).collect();
+    let builds: Vec<_> = Mode::EVERY.iter().filter(|m| m.runs_builds()).collect();
     assert_eq!(
         builds,
-        [&Mode::Daemon, &Mode::StorageAndDaemon, &Mode::AllInOne]
+        [
+            &Mode::Daemon,
+            &Mode::StorageAndDaemon,
+            &Mode::AllInOne,
+            &Mode::Node
+        ]
     );
-    let no_key: Vec<_> = Mode::ALL.iter().filter(|m| m.holds_no_key()).collect();
-    assert_eq!(no_key, [&Mode::Daemon, &Mode::AllInOne]);
-    let beside: Vec<_> = Mode::ALL
+    let no_key: Vec<_> = Mode::EVERY.iter().filter(|m| m.holds_no_key()).collect();
+    assert_eq!(no_key, [&Mode::Daemon, &Mode::AllInOne, &Mode::Node]);
+    let beside: Vec<_> = Mode::EVERY
         .iter()
         .filter(|m| m.holds_key_beside_builds())
         .collect();
     assert_eq!(beside, [&Mode::StorageAndDaemon]);
-    let names: Vec<_> = Mode::ALL.iter().map(|m| m.unit_name()).collect();
+    let names: Vec<_> = Mode::EVERY.iter().map(|m| m.unit_name()).collect();
     assert_eq!(
         names,
         [
@@ -96,9 +101,13 @@ fn the_modes_are_listed_with_the_sets_the_rules_use() {
             "kbf-storage.service",
             "kbf-daemon.service",
             "kbf-storage-and-daemon.service",
-            "kbf-all-in-one.service"
+            "kbf-all-in-one.service",
+            "kbf-node.service"
         ]
     );
+    // The modes `kbf` takes today are the first five; `node` joins them with `kbf node`.
+    assert_eq!(Mode::EVERY[..5], Mode::ALL);
+    assert_eq!(Mode::EVERY[5], Mode::Node);
 }
 
 /// Catches rule `stop` skipped for a mode that drains (a storage node finishes its large
@@ -106,14 +115,15 @@ fn the_modes_are_listed_with_the_sets_the_rules_use() {
 /// which abandons its leases on SIGTERM.
 #[test]
 fn every_mode_but_the_daemon_drains() {
-    let drains: Vec<_> = Mode::ALL.iter().filter(|m| m.drains()).collect();
+    let drains: Vec<_> = Mode::EVERY.iter().filter(|m| m.drains()).collect();
     assert_eq!(
         drains,
         [
             &Mode::Frontend,
             &Mode::Storage,
             &Mode::StorageAndDaemon,
-            &Mode::AllInOne
+            &Mode::AllInOne,
+            &Mode::Node
         ]
     );
 }
@@ -577,7 +587,7 @@ fn delegate_is_read_as_systemd_reads_it() {
 fn the_credential_rule_names_the_file_the_storage_units_read() {
     let c = config();
     let line = format!("EnvironmentFile=@KBF_ETC@/{COLD_STORE_KEY_FILE}\n");
-    for mode in Mode::ALL {
+    for mode in Mode::EVERY {
         let has = mode.template().contains(&line);
         assert_eq!(
             has,
@@ -604,8 +614,8 @@ fn the_credential_rule_names_the_file_the_storage_units_read() {
     assert_ne!(own, daemon);
     let r = check(&c, Mode::Daemon, &own, true).expect("a unit");
     assert_eq!(lines(&r), Vec::<String>::new());
-    let holds: Vec<_> = Mode::ALL.iter().filter(|m| m.holds_no_key()).collect();
-    assert_eq!(holds, [&Mode::Daemon, &Mode::AllInOne]);
+    let holds: Vec<_> = Mode::EVERY.iter().filter(|m| m.holds_no_key()).collect();
+    assert_eq!(holds, [&Mode::Daemon, &Mode::AllInOne, &Mode::Node]);
 }
 
 /// Catches a comment inside a continued `ExecStart=` passed: systemd 239 and older
@@ -646,7 +656,7 @@ fn a_comment_inside_a_continued_line_fails_rule_continuation() {
 #[test]
 fn all_in_one_is_labelled_trusted() {
     let c = config();
-    for mode in Mode::ALL {
+    for mode in Mode::EVERY {
         let r = check(
             &c,
             mode,
@@ -872,7 +882,7 @@ fn the_storage_mode_needs_its_s3_endpoint_set() {
         render(&c, Some(1500), Mode::Storage).map_err(|e| e.to_string()),
         Err("MINIO_S3_ENDPOINT must be set for --mode storage: the storage node's cold store is the bucket at that endpoint, and no MinIO runs beside it to default to".to_owned())
     );
-    for mode in Mode::ALL.into_iter().filter(|m| *m != Mode::Storage) {
+    for mode in Mode::EVERY.into_iter().filter(|m| *m != Mode::Storage) {
         assert_eq!(
             render(&c, Some(1500), mode).expect("renders"),
             render(&config(), Some(1500), mode).expect("renders"),

@@ -36,6 +36,9 @@
 //!                                 [--s3-env-file FILE] [--apply]
 //! kbf-deploy pilot server-install --config FILE --uninstall [--apply]
 //! kbf-deploy pilot buckconfig --config FILE --worktree DIR [--remove] [--apply]
+//! kbf-deploy package postinst [--apply]
+//! kbf-deploy package prerm [--upgrade] [--apply]
+//! kbf-deploy package postrm [--purge [--purge-data]] [--apply]
 //! kbf-deploy log (--log-dir DIR | --hot-store DIR) [--lines N]
 //! ```
 //!
@@ -57,6 +60,7 @@
 //! planned), 1 a step or the check after an apply failed (`FAIL ...` on stderr), or 2
 //! refused before any step (`REFUSED: ...` on stderr; a render check's `FAIL` lines on
 //! stdout).
+//! The `package` verbs exit as the `linux` host verbs do ([`crate::package`]).
 //! The `mdm` verbs exit as the `linux` host verbs do; `mdm verify` exits 1 when a check
 //! fails, `mdm dep assign` when Apple did not assign every device, and `mdm tls
 //! --check-godaddy` when the account may not use the API ([`crate::mdm`]).
@@ -136,6 +140,10 @@ enum Kit {
     /// REAPI calls to the kbf-servers.
     #[command(subcommand)]
     Envoy(Envoy),
+    /// What the kbf Linux package does to a host when dpkg installs, stops, removes or
+    /// purges it: the kbf account, its directories, the trust files, the shipped release.
+    #[command(subcommand)]
+    Package(crate::package::Package),
     /// A pilot kbf-server as a systemd user service, and the buck2 overlay that points
     /// one worktree at it.
     #[command(subcommand)]
@@ -557,6 +565,9 @@ pub fn run<E: Exec>(
         Kit::Mdm(m) => return mdm_kit(m, exec, out, err),
         Kit::Envoy(e) => return envoy_kit(e, exec, out, err),
         Kit::Log(a) => return log::run(&a, out, err),
+        Kit::Package(p) => {
+            return crate::package::run(p, exec, &crate::package::Env::host(), out, err);
+        }
         Kit::Pilot(p) => {
             return pilot::cli::run(p, exec, env, out, err, &pilot::cli::sleep_a_second);
         }

@@ -59,6 +59,7 @@ pub mod install;
 pub mod install_mode;
 pub mod meta;
 pub mod modes;
+pub mod node;
 pub mod render;
 pub mod stop;
 pub mod stores;

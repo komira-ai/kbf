@@ -48,6 +48,11 @@
 //! - `handover`: the frontend's unit is the template `kbf-frontend@.service` whose two
 //!   instances hand over to one another: `Type=notify`, a control socket in a preserved
 //!   `RuntimeDirectory=`, no `Conflicts=` ([`super::handover`]).
+//! - `node`: the `node` unit runs as `KBF_USER` and reads its one config file: its
+//!   `ExecStartPre=` is exactly `<KBF_BIN_DIR>/kbf enroll --config=<KBF_ETC>/kbf.toml`
+//!   (a `-` prefix would start an unenrolled node), its `ExecStart=` names the same
+//!   file, and no flag of either names a key ([`super::node`]). Its `credential` rule is
+//!   the daemon's: no `s3.env`, no `AWS_*` variable, no systemd credential.
 //! - `stop`: a mode that drains on SIGTERM (every mode but `daemon`) has
 //!   `TimeoutStopSec=infinity` and `KillSignal=SIGTERM`, so systemd never kills it
 //!   mid-drain and fails the builds in flight ([`super::stop`]).
@@ -92,7 +97,7 @@ use kbf_host::step::Cmd;
 use super::check::{Failure, Report, angle_placeholder};
 use super::config::{LinuxConfig, LinuxError};
 use super::render::{SLICE, values};
-use super::{cpuset, credential, handover, stop, stores, traverse};
+use super::{cpuset, credential, handover, node, stop, stores, traverse};
 use crate::template::{self, TemplateError, leftovers};
 use crate::unit::{UnitError, UnitFile, comments_in_continuations};
 
@@ -121,16 +126,31 @@ pub enum Mode {
     Daemon,
     StorageAndDaemon,
     AllInOne,
+    /// The package's unit: `kbf enroll`, then `kbf node`, which runs the mode the roles
+    /// the frontend granted select (docs/design/install-and-enrollment.md, section 4.4).
+    Node,
 }
 
 impl Mode {
-    /// Every mode, in `kbf --help`'s order.
+    /// Every mode the `kbf` binary takes today, in `kbf --help`'s order. kbf-cli's tests
+    /// hold it equal to that list and parse each unit's flags with kbf's own parser, so
+    /// [`Mode::Node`] joins it in the change that adds `kbf node` to kbf-cli.
     pub const ALL: [Mode; 5] = [
         Mode::Frontend,
         Mode::Storage,
         Mode::Daemon,
         Mode::StorageAndDaemon,
         Mode::AllInOne,
+    ];
+
+    /// Every mode this tool renders and checks: [`Mode::ALL`] and [`Mode::Node`].
+    pub const EVERY: [Mode; 6] = [
+        Mode::Frontend,
+        Mode::Storage,
+        Mode::Daemon,
+        Mode::StorageAndDaemon,
+        Mode::AllInOne,
+        Mode::Node,
     ];
 
     /// The word after `kbf`.
@@ -142,13 +162,18 @@ impl Mode {
             Mode::Daemon => "daemon",
             Mode::StorageAndDaemon => "storage-and-daemon",
             Mode::AllInOne => "all-in-one",
+            Mode::Node => "node",
         }
     }
 
-    /// Whether the mode runs builds, and so manages its own cgroup (rule `delegate`).
+    /// Whether the mode runs builds, and so manages its own cgroup (rule `delegate`). A
+    /// node may be granted the daemon role, and its unit is the same for every role.
     #[must_use]
     pub fn runs_builds(self) -> bool {
-        matches!(self, Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne)
+        matches!(
+            self,
+            Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne | Mode::Node
+        )
     }
 
     /// Whether the mode drains on SIGTERM (rule `stop`): a frontend finishes its open
@@ -158,11 +183,12 @@ impl Mode {
         !matches!(self, Mode::Daemon)
     }
 
-    /// Whether the mode runs builds with no cold store of its own to read (rule
-    /// `credential`): `all-in-one`'s cold store is a `file://` directory.
+    /// Whether the mode's unit gives no cold store key (rule `credential`): `daemon` has
+    /// no cold store, `all-in-one`'s is a `file://` directory, and a `node` is sent the
+    /// keys over its mTLS session and holds them in memory only (design section 4.3).
     #[must_use]
     pub fn holds_no_key(self) -> bool {
-        matches!(self, Mode::Daemon | Mode::AllInOne)
+        matches!(self, Mode::Daemon | Mode::AllInOne | Mode::Node)
     }
 
     /// Whether the mode's unit holds the cold store's key beside the builds it runs
@@ -206,6 +232,7 @@ impl Mode {
 
     fn template(self) -> &'static str {
         match self {
+            Mode::Node => include_str!("../../templates/linux/modes/kbf-node.service"),
             Mode::Frontend => include_str!("../../templates/linux/modes/kbf-frontend@.service"),
             Mode::Storage => include_str!("../../templates/linux/modes/kbf-storage.service"),
             Mode::Daemon => include_str!("../../templates/linux/modes/kbf-daemon.service"),
@@ -399,14 +426,14 @@ pub fn check_on_host<E: Exec>(
     if mode.holds_no_key() {
         let found = credential::on_host(exec, &merged, &key_file(config));
         for how in found.failures {
-            fail("credential", credential_message(&name, &how));
+            fail("credential", credential_message(mode, &name, &how));
         }
         notes.extend(found.notes);
     }
     if mode.holds_key_beside_builds() {
         let found = credential::on_host(exec, &merged, &key_file(config));
         for how in found.failures {
-            fail("credential", credential_message(&name, &how));
+            fail("credential", credential_message(mode, &name, &how));
         }
         notes.extend(found.notes);
         let key = HostPath::new(&key_file(config).to_string_lossy())
@@ -588,7 +615,14 @@ fn root_key_message(name: &str, how: &str) -> String {
     )
 }
 
-fn credential_message(name: &str, how: &str) -> String {
+fn credential_message(mode: Mode, name: &str, how: &str) -> String {
+    if mode == Mode::Node {
+        return format!(
+            "{name} carries a key ({how}): a node holds no key file and no AWS_* variable, \
+             the cold store's keys reach a storage node over its mTLS session and stay in \
+             its memory (docs/design/install-and-enrollment.md, section 4.3)"
+        );
+    }
     format!(
         "{name} gives a build node the cold store's key ({how}): a build node holds no \
          credential, and its builds run as its user"
@@ -688,7 +722,7 @@ fn rules(
     if mode.holds_no_key() || mode.holds_key_beside_builds() {
         let allowed = mode.holds_key_beside_builds();
         for how in credential::key_given(unit, &key_file(config), allowed) {
-            fail("credential", credential_message(&name, &how));
+            fail("credential", credential_message(mode, &name, &how));
         }
     }
     if let Some(how) = credential::holder(unit, &config.user).filter(|_| mode.holds_key()) {
@@ -700,6 +734,13 @@ fn rules(
         let exact = mode.holds_key_beside_builds();
         for how in stores::storage(unit, &key_file(config), exact) {
             fail("storage", format!("{name} {how}"));
+        }
+    }
+
+    // node
+    if mode == Mode::Node {
+        for how in node::check(config, unit) {
+            fail("node", format!("{name} {how}"));
         }
     }
 

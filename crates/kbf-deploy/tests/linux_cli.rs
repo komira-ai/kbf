@@ -234,7 +234,7 @@ fn a_mode_renders_and_checks_and_an_unknown_mode_is_refused() {
         assert_eq!((code, stdout.as_str()), (2, ""), "{bad:?}");
         assert!(
             stderr.contains(
-                "[possible values: frontend, storage, daemon, storage-and-daemon, all-in-one]"
+                "[possible values: frontend, storage, daemon, storage-and-daemon, all-in-one, node]"
             ),
             "{bad:?}: {stderr}"
         );

@@ -195,7 +195,7 @@ fn each_new_key_reaches_exactly_the_units_that_read_it() {
     let base = config_with(&[]);
     for (key, value, reads) in rows {
         let c = config_with(&[(key, value)]);
-        for mode in Mode::ALL {
+        for mode in Mode::EVERY {
             let before = render(&base, Some(1500), mode).expect("renders");
             let after = render(&c, Some(1500), mode).expect("renders");
             let carries = after.contains(&value.replace("https://", "")) || after.contains(value);

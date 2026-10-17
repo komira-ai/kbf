@@ -1,0 +1,37 @@
+# Rendered by `kbf-deploy linux render-units --mode node`; the kbf package installs it as
+# /lib/systemd/system/kbf-node.service (kbf docs/design/install-and-enrollment.md,
+# sections 3.2 and 4.4). One unit for every role but the frontend's: `kbf enroll` gets the
+# node's certificates from the frontend (it exits 0 at once when they are good), and `kbf
+# node` runs the mode the roles the frontend granted select (daemon, storage or both).
+# Everything the node needs besides the file below comes from the frontend; no key file
+# and no AWS_* variable belongs in this unit (check-units rules `credential` and `node`).
+# KBF_BIN_DIR is the updater's `current` link, so a pulled release changes what runs
+# without a change to this file.
+[Unit]
+Description=kbf build farm node (enrolls with the frontend, then runs the roles it grants)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=@KBF_ETC@/kbf.toml
+
+[Service]
+User=@KBF_USER@
+Slice=kbf.slice
+# The daemon role manages its own cgroup: supervisor/ for itself, actions/ for builds.
+# Delegate=yes delegates cpuset with cpu, memory and pids (check-units rule `delegate`).
+Delegate=yes
+# Build containers get 0 back from the driver.
+OOMScoreAdjust=-900
+CPUWeight=200
+Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@
+ExecStartPre=@KBF_BIN_DIR@/kbf enroll --config=@KBF_ETC@/kbf.toml
+ExecStart=@KBF_BIN_DIR@/kbf node --config=@KBF_ETC@/kbf.toml
+# A storage role drains its Writes on SIGTERM and systemd must never cut it short
+# (check-units rule `stop`).
+TimeoutStopSec=infinity
+KillSignal=SIGTERM
+Restart=on-failure
+# Exit 2 is a command line or config kbf refused: a restart cannot fix it.
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

@@ -261,6 +261,25 @@ fn a_unit_without_a_user_of_its_own_is_refused() {
     assert_eq!(unit_user(&unit, "u").expect("a user"), "kbf-server");
 }
 
+/// Catches `install-units --mode node` writing a unit to `/etc/systemd/system`, where it
+/// would shadow the one the kbf package owns in `/lib/systemd/system`: it is refused
+/// before the host is read or any step planned, and says who owns the unit.
+#[test]
+fn the_node_unit_is_the_packages_and_is_refused() {
+    let (exec, _) = host("install-mode-node-refused");
+    let e = plan_here(&exec, &install(Mode::Node, None)).expect_err("refused");
+    assert!(
+        matches!(&e, HostError::PackageUnit(n) if n == "kbf-node.service"),
+        "{e}"
+    );
+    assert!(
+        e.to_string()
+            .contains("apt owns /lib/systemd/system/kbf-node.service"),
+        "{e}"
+    );
+    assert!(exec.log.is_empty() && exec.queries.borrow().is_empty());
+}
+
 /// all-in-one: its data directory before the cold store under it, and the wait for its
 /// operator API's `/readyz` after the start; with `--bin-dir` the new kbf first, the
 /// old one kept. Catches the cold store's directory planned before its parent's owner
