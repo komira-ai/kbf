@@ -23,7 +23,7 @@ reports again after its next `Welcome`.
 
 ## Who may write
 
-A write (cordon, drain, uncordon) can take every node in the fleet out of service, so
+A write (cordon, drain, uncordon, a member's state) can take every node in the fleet out of service, so
 it must come from an operator. Where a request comes from does not show that:
 
 - **Every server host is also a worker.** Build actions run on it, and they can reach
@@ -143,6 +143,55 @@ or not, could run, and the time spent waiting for a cordon does not count toward
 A server restart forgets every cordon, as it forgets the rest of the scheduler's
 state, and every start logs a warning that says so. The protocol has no drain
 message yet: the daemon is not told, and the server simply sends it no new `Start`.
+
+## `POST /v1/members/{id}`
+
+An operator sets a storage member's state. The body is `{"state": "active"}` or
+`{"state": "draining"}`; the answer is `{"id": N, "state": "...", "generation": G}`,
+the map's generation after the change. `down` is the store's verdict, `catching_up` is what a registration says and `joining` is
+the join handoff's, so none of them is accepted (`400`, as is
+any other body). `404` for an id that has no live row (it expired, or never
+registered) or is not a number, or on a server without a state store; `503` when the
+state store cannot be written; `401`, `403` or `415` from the gates of
+[Who may write](#who-may-write), the same gates as the node writes. Nothing is changed
+by a refused request.
+
+When a member becomes `active` the cluster also records that it has formed (see below),
+in the same transaction.
+
+**When a member is `active` without this call.** A registration that says the node's
+index is whole enters `active`, in a fresh cluster and in a formed one alike: it is the
+first start of a cluster, or a restart of a node whose meta log already has its rebuild,
+so a rolling restart leaves every member `active`. The registration also writes the
+`meta/members_formed` mark. A registration that says the node is rebuilding its index
+enters `catching_up` and becomes `active` by its own first beat that says it is done. No
+registration writes `joining`; that state is set by the join handoff in code
+(`Members::set_state`), and a `joining` member is promoted by this call.
+
+**The risk of promoting a joiner.** `active` makes the member a settled owner: it
+takes the rank-1 slots of the digests it wins in the rendezvous order, and it is read
+in rank order. Nothing here copies the blobs of that slice to it (the join handoff,
+`architecture-v2.md` section 8.4, is not built). What the router does about it, from
+`kbf-route`'s read walk and `kbf-map`'s `read_order_with_previous`:
+
+- A read that gets `NotFound` from an owner goes on to the next owner in the read
+  order, and the answer is `NotFound` only if every owner said so. So a promoted
+  joiner that lacks a blob costs one extra round trip per read of it, not a failed
+  read.
+- That holds only while an owner that has the blob is still in the list. The list is
+  this generation's top `r` settled owners, then the write owners not yet listed, then
+  the previous generation's list: one generation back, no more. A joiner that wins a
+  digest's top `r` pushes an old copy-holder out of it, and once the map moves on
+  again (any member change bumps the generation) that holder is in no list: the blob
+  is read as missing, and the action is rebuilt or the upload repeated.
+- Writes of that slice go to the joiner as primary (the chain head and the
+  `FindMissing` target): it reports every blob it has not seen as missing, so
+  uploads that were deduplicated are sent again until the slice fills.
+
+So promote a joiner when its slice is expected to be empty or its blobs are cheap to
+rebuild (a new cluster, a cache), or have it hold the slice first; and promote one
+member at a time. `draining` is the reverse: the member takes no new writes, its
+successor takes its slot at once, and it is read first.
 
 ## `GET /v1/frontend/drain` and `POST /v1/frontend/drain`
 
@@ -312,6 +361,7 @@ caller goes away before the answer counts as an error.
 | `kbf_input_directories_cached_total` | counter | Directories the input check took from the decoded-directory cache: the blob is touched and its presence checked, nothing is read |
 | `kbf_input_directories_skipped_total` | counter | Directories skipped with everything under them: an earlier check verified them and the retention guarantee of that check still runs |
 | `kbf_input_directories_joined_total` | counter | Directories found being checked for another request, and waited for |
+| `kbf_cache_lost_blobs`, `kbf_cache_blob_losses_total` | gauge, counter | blobs whose only copy was in a block on a write tier that is gone before the flusher put it in the store (the tier abandoned with `--hot-store-abandon`, the block missing or short at a start, or its bytes failing their digest): lost now, and ever. A lost blob is `UNAVAILABLE`, FindMissingBlobs lists it, an action-cache entry naming it is a miss, and a re-upload takes it off the gauge ([architecture-v2.md](design/architecture-v2.md#8-storage), Loss marks). Read from the metadata state at the scrape; left out of a scrape the metadata log cannot answer |
 
 Latency buckets run from 1 ms to 60 s; size buckets from 1 KiB to 1 GiB by fours;
 the blobs-per-segment buckets from 1 to 16384 by fours.

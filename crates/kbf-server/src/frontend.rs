@@ -3,8 +3,19 @@
 //! the worker listener's work streams, and holds no blob cache: a client's CAS,
 //! ByteStream and action-cache calls are proxied to a storage node ([`kbf_front::Proxy`],
 //! ByteStream passed through without holding a blob), and Execute and the scheduler
-//! read and write the node through [`kbf_front::Backend::remote`] (the action cache,
+//! read and write the node through [`kbf_front::Backend::routed`] (the action cache,
 //! the Action and Command blobs, the input check, the action-cache write of a result).
+//!
+//! **Storage is routed by the map.** With a state store the frontend keeps the members
+//! and so the map, and with the TLS flags it can dial each member: every storage call it
+//! makes is then routed by that map ([`kbf_front::Routed`] over [`crate::front_maps`]),
+//! once the map has two members, to the members the daemons place a blob on. Before that
+//! (no member has registered, or one has), and without a state store or without the TLS
+//! flags, every call goes to the one node `--storage` names. `--storage` is the bootstrap
+//! and the farm of one, never one of several: blobs written to it before the map had two
+//! members are not moved when the map places them elsewhere. Each member is dialled over
+//! mutual TLS with the same client identity as `--storage`, and verified against the host
+//! of the address it registered with.
 //!
 //! **The flags** are `kbf-server`'s own for what a frontend serves (the listeners, their
 //! TLS, the REAPI policy, the scheduler's pacing, the operator API, `--state-store`, the
@@ -33,7 +44,10 @@
 //! **Readiness** (`GET /readyz`, `grpc.health.v1`) fails when the storage node does not
 //! answer an action-cache lookup within `--readyz-store-timeout-ms`, when the state store (if
 //! configured) does not answer a read, and when the storage map is not loaded (always
-//! loaded today: [`crate::health::MapProbe`]).
+//! loaded today: [`crate::health::MapProbe`]). The storage check asks the `--storage`
+//! node until the frontend routes by the map, and then the owners the map names for a
+//! probe digest (it passes when one answers), so a farm that has lost its `--storage`
+//! node is ready while its other members are.
 //!
 //! **Not served here:** the worker listener's `ByteStream`, CAS and `Segments` (a
 //! daemon's blob traffic; daemons reach storage directly once the map reaches them,
@@ -57,10 +71,11 @@ use clap::{Arg, ArgMatches, Command, FromArgMatches as _};
 use kbf_auth::AuthenticateLayer;
 use kbf_front::{
     Backend, MAX_MESSAGE_BYTES, Owner, Owners, Proxy, RECORDER_CHANNEL, Recorder,
-    RequestMetadataLayer,
+    RequestMetadataLayer, Routed,
 };
 use kbf_proto::grpc::health::v1::health_server::HealthServer;
 use kbf_proto::worker::worker_server::WorkerServer;
+use kbf_route::TlsNodes;
 use kbf_storage::Storage;
 use kbf_storage::service::RemoteStorage;
 use kbf_threads::Topology;
@@ -69,8 +84,10 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server}
 
 use crate::drain::Drain;
 use crate::farm::Farm;
+use crate::front_maps::FrontMaps;
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::{Checks, MapProbe, Readiness, StateProbe, StorageProbe};
+use crate::members::Members;
 use crate::serve::{
     AbortOnDrop, ServeError, bind, bind_api, drain_and_stop, flow_control, keepalive, log_state,
     map_of, members_of, membership, serve_api, stop_api, sweeping, worker_peers,
@@ -239,6 +256,20 @@ fn transport(url: &Endpoint, tls: bool) -> Result<(), String> {
 }
 
 impl FrontendFlags {
+    /// The CA and the client identity the TLS flags name, or `None` without them.
+    ///
+    /// # Errors
+    /// A TLS file cannot be read.
+    pub fn storage_identity(&self) -> Result<Option<(Certificate, Identity)>, ConfigError> {
+        let Some([cert, key, ca]) = &self.tls else {
+            return Ok(None);
+        };
+        Ok(Some((
+            Certificate::from_pem(crate::config::read(ca)?),
+            Identity::from_pem(crate::config::read(cert)?, crate::config::read(key)?),
+        )))
+    }
+
     /// The connection to the storage node: lazy, with the client identity and the CA
     /// when the TLS flags are given, the node's certificate checked against the host of
     /// the URL.
@@ -246,15 +277,10 @@ impl FrontendFlags {
     /// # Errors
     /// A TLS file cannot be read, or the transport refuses the configuration.
     pub fn storage_endpoint(&self) -> Result<Endpoint, ConfigError> {
-        let Some([cert, key, ca]) = &self.tls else {
+        let Some((ca, identity)) = self.storage_identity()? else {
             return Ok(self.storage.clone());
         };
-        let tls = ClientTlsConfig::new()
-            .ca_certificate(Certificate::from_pem(crate::config::read(ca)?))
-            .identity(Identity::from_pem(
-                crate::config::read(cert)?,
-                crate::config::read(key)?,
-            ));
+        let tls = ClientTlsConfig::new().ca_certificate(ca).identity(identity);
         self.storage
             .clone()
             .tls_config(tls)
@@ -263,6 +289,39 @@ impl FrontendFlags {
                 source,
             })
     }
+}
+
+/// The frontend's own storage routing: the members' map and a connection to each member,
+/// presenting the identity of the TLS flags. `None` (the node `--storage` names serves
+/// everything) without a state store, which is where the members and their map live, and
+/// without the TLS flags, which every connection to a member needs: a member is dialled
+/// at `https://` and verified against its own address. With a state store but no TLS flags
+/// the start logs a warning that says so, since the farm may have members the daemons
+/// place blobs on that this frontend will not look at. Not generic, for the same reason
+/// as [`crate::serve::sweeping`].
+///
+/// # Errors
+/// A TLS file cannot be read.
+fn routed_of(
+    members: Option<&Arc<Members>>,
+    flags: &FrontendFlags,
+) -> Result<Option<Arc<Routed>>, ConfigError> {
+    let Some(members) = members else {
+        return Ok(None);
+    };
+    let Some((ca, identity)) = flags.storage_identity()? else {
+        tracing::warn!(
+            "a state store is configured but the TLS flags are not: members cannot be dialled, \
+             so every storage call goes to the --storage node alone, and blobs the daemons \
+             place on other members by the map will not be found"
+        );
+        return Ok(None);
+    };
+    let maps = Arc::new(FrontMaps::new(Arc::clone(members)));
+    Ok(Some(Arc::new(Routed::over_tls(
+        maps,
+        Arc::new(TlsNodes::new(ca, identity)),
+    ))))
 }
 
 /// A started frontend: bound, not yet serving.
@@ -308,17 +367,23 @@ impl FrontendHandle {
 }
 
 /// What `/readyz` and the health service ask of a frontend, in the order they list the
-/// failures: the stop signal and the scheduler role ([`Readiness`]), the storage node,
-/// the state store if there is one, and the storage map.
+/// failures: the stop signal and the scheduler role ([`Readiness`]), the storage (the
+/// `--storage` node, or the owners the map names once `routed` routes by it), the state
+/// store if there is one, and the storage map.
 #[must_use]
 pub fn checks(
     readiness: Arc<Readiness>,
     storage: Arc<dyn Storage>,
+    routed: Option<Arc<Routed>>,
     state_store: Option<Arc<dyn kbf_state::Store>>,
     timeout: Duration,
 ) -> Checks {
-    let mut checks =
-        Checks::new(readiness).probing("storage", Arc::new(StorageProbe::new(storage, timeout)));
+    let probe = StorageProbe::new(storage, timeout);
+    let probe = match routed {
+        Some(routed) => probe.routed(routed),
+        None => probe,
+    };
+    let mut checks = Checks::new(readiness).probing("storage", Arc::new(probe));
     if let Some(store) = state_store {
         checks = checks.probing("state_store", Arc::new(StateProbe::new(store, timeout)));
     }
@@ -380,13 +445,18 @@ fn bind_frontend(
     let timeout = listeners.store_probe_timeout;
     let storage = Arc::new(RemoteStorage::new(channel.clone(), 0));
     let state_store = store_of(state.as_ref());
+    let routed = routed_of(members.as_ref(), flags)?;
     let checks = Arc::new(checks(
         Arc::clone(&readiness),
         storage.clone(),
+        routed.clone(),
         state_store,
         timeout,
     ));
-    let backend = Backend::remote(storage);
+    let backend = match &routed {
+        Some(routed) => Backend::routed(Arc::clone(routed), storage),
+        None => Backend::remote(storage),
+    };
 
     let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
     let default_memory = listeners.memory_ladder.first();
@@ -412,6 +482,7 @@ fn bind_frontend(
         Arc::clone(&farm),
         api.and_then(|api| api.token),
         Arc::clone(&drain),
+        members.clone(),
     )
     .merge(crate::health::router_of(Arc::clone(&checks)))
     .merge(metrics_route(backend.clone()));
@@ -446,10 +517,12 @@ fn bind_frontend(
     let membership = membership(members.clone(), peers_certified);
     let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
-    let proxy = Proxy::new(
-        Owners::single(Owner::new(&flags.storage.uri().to_string(), channel)),
-        Arc::clone(&authorizers),
-    );
+    let bootstrap = Owner::new(&flags.storage.uri().to_string(), channel);
+    let owners = match routed {
+        Some(routed) => Owners::routed(routed, bootstrap),
+        None => Owners::single(bootstrap),
+    };
+    let proxy = Proxy::new(owners, Arc::clone(&authorizers));
     let reapi_routes = kbf_front::routes_proxied(
         &proxy,
         backend,

@@ -1495,6 +1495,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "tracing-core",
  "tracing-subscriber",
 ]
 
@@ -1600,6 +1601,7 @@ dependencies = [
  "kbf-meta",
  "kbf-objstore",
  "kbf-proto",
+ "kbf-route",
  "kbf-sched",
  "kbf-segments",
  "kbf-storage",
@@ -1980,6 +1982,7 @@ dependencies = [
  "kbf-objstore",
  "kbf-proto",
  "kbf-raft",
+ "kbf-route",
  "kbf-sched",
  "kbf-segments",
  "kbf-sim",
@@ -2044,6 +2047,7 @@ dependencies = [
 name = "kbf-state"
 version = "0.1.0"
 dependencies = [
+ "kbf-state",
  "postgres",
  "rusqlite",
  "rustix",
