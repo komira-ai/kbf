@@ -25,9 +25,11 @@ pub(crate) fn link(cli: &Cli) -> Result<UpdateLink, Error> {
         return Ok(UpdateLink::manual(BUILD_COMMIT));
     };
     if cli.cas.is_none() {
-        return Err("--update-dir needs --cas: releases are fetched from the server's worker \
+        return Err(
+            "--update-dir needs --cas: releases are fetched from the server's worker \
                     listener it names"
-            .into());
+                .into(),
+        );
     }
     let platform = platform(&NodeReport::detect(&[])?)?;
     let source = ReleaseClient::new(transfer::endpoint(cli)?.connect_lazy());
@@ -48,7 +50,8 @@ fn platform(report: &NodeReport) -> Result<ReleasePlatform, Error> {
     };
     let (os, arch) = (entry("os"), entry("arch"));
     ReleasePlatform::from_report(os, arch).ok_or_else(|| {
-        format!("no release is built for os {os:?} on arch {arch:?}: --update-dir is refused").into()
+        format!("no release is built for os {os:?} on arch {arch:?}: --update-dir is refused")
+            .into()
     })
 }
 

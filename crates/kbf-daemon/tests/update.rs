@@ -17,7 +17,7 @@ use kbf_daemon::{BUILD_COMMIT, UpdateLink};
 use kbf_proto::google::rpc::Code;
 use kbf_proto::update::update_order::Verb;
 use kbf_proto::update::update_status::State;
-use kbf_proto::update::{Component, UpdateOffer, UpdateOrder, UpdateStatus};
+use kbf_proto::update::{Component, UpdateOffer, UpdateOrder};
 use kbf_proto::worker::{Phase, daemon_message::Message};
 use kbf_update::{Chunks, Config, FetchError, Source, start};
 use sha2::{Digest as _, Sha256};
