@@ -26,6 +26,12 @@ The daemon makes its containers with `crun`, rootless, from the `kbf` user's acc
 | headroom under `kernel.keys.maxkeys` (200 per user by default; each container's session keyring counts) | `sysctl kernel.keys.maxkeys` |
 | egress to the registries the pinned images come from (`registry-1.docker.io` for `docker.io`, `gcr.io`) | the network |
 
+What an action sees of the host is only its image and its inputs: its root `/` is the
+unpacked image, **read-only** (unlike a Podman container's, which was writable
+everywhere), and only `/tmp`, `/var/tmp`, `/run`, `/root` and the input root `/kbf/root`
+are writable; an action that writes anywhere else gets `EROFS`. That is the OCI backend's
+behaviour and stays so until a writable overlay of the image is chosen.
+
 The daemon checks the id range, the directories' search permission, `crun` and the two id
 tools at start and refuses to start naming the one that is wrong. Lingering and
 `XDG_RUNTIME_DIR` are not needed by `crun`; `kbf-deploy linux install-units` still checks
