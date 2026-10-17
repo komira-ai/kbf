@@ -63,8 +63,11 @@ pub(super) struct Guard {
 
 impl Guard {
     fn check(&self) -> Result<(), Status> {
-        let owners = self.owners.for_digest(&self.digest);
-        if owners.first().map(|o| o.id()) == Some(&*self.owner) {
+        if self
+            .owners
+            .writer(&self.digest)
+            .is_ok_and(|writer| writer.id() == &*self.owner)
+        {
             return Ok(());
         }
         let refusal = Status::unavailable(format!(

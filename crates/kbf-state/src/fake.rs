@@ -6,25 +6,30 @@
 //! crash: it drops the live copy and reopens from the durable one. Group commit is
 //! visible in the clock: a batch costs one sync however many transactions it holds.
 //!
-//! [`Flaw`] names one deliberate defect per clause. A fake built with a flaw must fail
+//! [`Flaw`] names deliberate defects, at least one per clause. A fake built with a flaw must fail
 //! the clause it breaks, which is what proves the clause can fail.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::clock::{Clock, ManualClock, StoreTime};
-use crate::conformance::{Backend, C1_RACERS, RACE_KEY};
-use crate::store::Store;
+use crate::conformance::{Backend, C1_RACERS, C8_SNAPSHOT_PREFIX, RACE_KEY};
+use crate::store::{Span, Store, page_of};
 use crate::types::{
-    Change, Changes, Commit, CommitStats, Cond, Conflict, Event, Op, Revision, StoreError, Txn,
-    Version, Versioned,
+    Change, Changes, Commit, CommitStats, Cond, Conflict, Direction, Event, Op, ResumeToken,
+    Revision, ScanPage, ScanRange, StoreError, Txn, Version, Versioned,
 };
 
 /// How much store time one durable sync takes on the fake.
 pub const FAKE_SYNC_COST: Duration = Duration::from_millis(2);
 
-/// A deliberate defect, one per clause the suite checks.
+/// The longest [`Flaw::ScanReadsPerRow`] waits between two rows for a commit, in wall
+/// time: the check it breaks keeps a writer committing, so the wait ends long before.
+const PER_ROW_COMMIT_WAIT: Duration = Duration::from_secs(5);
+
+/// A deliberate defect: at least one per clause the suite checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Flaw {
     /// A correct store.
@@ -35,17 +40,62 @@ pub enum Flaw {
     /// C2: preconditions are checked one operation at a time, as each applies, so a
     /// failure leaves the earlier operations written.
     PartialTxn,
+    /// C2: a counter is bumped outside the transaction, as a database sequence is, so an
+    /// increment in a transaction that aborts is kept.
+    CounterSurvivesAbort,
     /// C3: counters are not part of what a sync makes durable, so a restart reissues values.
     CounterNotDurable,
     /// C4: expiry is judged by the clock reading taken when the store opened, standing in
     /// for a caller's clock, not the store's current one.
     CallerClockExpiry,
+    /// C4: a key is still live at the reading that equals its expiry (the check is
+    /// `now <= expires_at`, not `now < expires_at`).
+    InclusiveExpiry,
     /// C5: the feed returns rows past a revision that has not committed yet.
     FeedPastPending,
     /// C6: a write is acknowledged without the sync, so a crash loses it.
     AckBeforeSync,
     /// C7: every transaction pays its own sync, even inside a batch.
     Ungrouped,
+    /// C7: every batch pays two syncs, which costs too little store time to miss the
+    /// commit window, so only the sync count shows it.
+    DoubleSync,
+    /// C8: a range scan returns every key of its range, however small the limit.
+    ScanIgnoresLimit,
+    /// C8: a range scan begins at the prefix whatever lower bound it is given.
+    ScanIgnoresLower,
+    /// C8: an excluded lower bound is treated as included, so resuming a forward scan
+    /// from a token returns the last key of the previous page again.
+    ScanResumesAtToken,
+    /// C8: a range scan is not clipped to its prefix, only to its bounds.
+    ScanPastPrefix,
+    /// C8: a forward scan runs on past its upper bound to the end of the prefix.
+    ScanIgnoresUpper,
+    /// C8: a forward scan treats an excluded upper bound as included.
+    ScanIncludesExcludedUpper,
+    /// C8: a reverse scan reads the forward page from the lower bound and reverses it,
+    /// so it returns the first keys of the range, not the last.
+    ScanReversesForwardPage,
+    /// C8: a reverse scan treats an excluded upper bound as included, so resuming it
+    /// from a token returns the last key of the previous page again.
+    ScanReverseResumesAtToken,
+    /// C8: the limit is applied before the expiry filter (`LIMIT` in SQL, expiry checked
+    /// on the rows it returns), so an expired key in the window takes a row's place and
+    /// the page comes back short with no token.
+    ScanCountsExpired,
+    /// C8: every non-empty page carries a token, the last one too.
+    ScanTokenOnLastPage,
+    /// C8: a resumed page holds only keys that were live when the scan's first page was
+    /// read, as a cursor over the first page's snapshot would, so a key committed ahead
+    /// of the token since is skipped.
+    ScanSkipsAhead,
+    /// C8: a resumed page shows each key's value as of the scan's first page.
+    ScanStaleValues,
+    /// C8: a page's keys are found under one lock, then each row's value is read again by
+    /// key under a lock of its own, so a commit between two rows lands inside the page.
+    /// Only under [`C8_SNAPSHOT_PREFIX`], where it also waits for a commit between rows
+    /// so the defect shows on every page of more than one row.
+    ScanReadsPerRow,
 }
 
 #[derive(Clone)]
@@ -114,6 +164,15 @@ impl Data {
             }
         }
         Ok(())
+    }
+
+    /// Increments the counter of each `Next` in `txn` (the C2 counter flaw).
+    fn bump_counters(&mut self, txn: &Txn) {
+        for op in txn.ops() {
+            if let Op::Next { counter } = op {
+                *self.counters.entry(counter.clone()).or_insert(0) += 1;
+            }
+        }
     }
 
     fn emit(&mut self, revision: u64, key: &str, event: Event) {
@@ -259,6 +318,11 @@ pub struct Fake {
     /// The clock reading at open, for [`Flaw::CallerClockExpiry`].
     frozen: StoreTime,
     gate: Arc<Gate>,
+    /// Signalled with `inner` locked after each commit, for [`Flaw::ScanReadsPerRow`].
+    committed: Condvar,
+    /// The live range at the last forward scan of a whole prefix, for
+    /// [`Flaw::ScanSkipsAhead`] and [`Flaw::ScanStaleValues`].
+    first_page: Arc<Mutex<BTreeMap<String, Versioned>>>,
 }
 
 impl Fake {
@@ -272,6 +336,8 @@ impl Fake {
             flaw,
             frozen,
             gate: Arc::new(Gate::default()),
+            committed: Condvar::new(),
+            first_page: Arc::default(),
         }
     }
 
@@ -281,6 +347,8 @@ impl Fake {
         let durable = lock(&self.inner).durable.clone();
         Fake {
             inner: Arc::new(Mutex::new(Inner::reopened(durable))),
+            // A condition variable serves one mutex; the reopened store has a new one.
+            committed: Condvar::new(),
             ..self
         }
     }
@@ -311,6 +379,7 @@ impl Fake {
                 checked.and_then(|()| inner.live.write(&deferred.txn, now, deferred.base, false));
             if result.is_ok() {
                 inner.stats.txns += 1;
+                self.committed.notify_all();
             }
             result
         };
@@ -320,11 +389,74 @@ impl Fake {
         result
     }
 
+    /// `scan` with the bound defects of the scan flaws applied.
+    fn flawed<'a>(&self, scan: ScanRange<'a>) -> ScanRange<'a> {
+        let included = |bound: Bound<&'a str>| match bound {
+            Bound::Excluded(key) => Bound::Included(key),
+            other => other,
+        };
+        let forward = scan.direction == Direction::Forward;
+        match self.flaw {
+            Flaw::ScanIgnoresLower => ScanRange {
+                lower: Bound::Unbounded,
+                ..scan
+            },
+            Flaw::ScanResumesAtToken => ScanRange {
+                lower: included(scan.lower),
+                ..scan
+            },
+            Flaw::ScanIgnoresUpper if forward => ScanRange {
+                upper: Bound::Unbounded,
+                ..scan
+            },
+            Flaw::ScanIncludesExcludedUpper if forward => ScanRange {
+                upper: included(scan.upper),
+                ..scan
+            },
+            Flaw::ScanReverseResumesAtToken if !forward => ScanRange {
+                upper: included(scan.upper),
+                ..scan
+            },
+            _ => scan,
+        }
+    }
+
+    /// [`Flaw::ScanReadsPerRow`]: each of `rows` read again by key under its own lock
+    /// acquisition, after waiting for a commit since the previous row was read.
+    fn reread_each(
+        &self,
+        rows: Vec<(String, Versioned)>,
+        now: StoreTime,
+    ) -> Vec<(String, Versioned)> {
+        let mut out = Vec::with_capacity(rows.len());
+        let mut seen = None;
+        for (key, found) in rows {
+            let mut inner = lock(&self.inner);
+            if let Some(seen) = seen {
+                inner = self
+                    .committed
+                    .wait_timeout_while(inner, PER_ROW_COMMIT_WAIT, |inner| {
+                        inner.stats.txns == seen
+                    })
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+            let value = inner.live.live_row(&key, now).map_or(found, Row::versioned);
+            seen = Some(inner.stats.txns);
+            out.push((key, value));
+        }
+        out
+    }
+
     fn clock_now(&self) -> StoreTime {
-        if self.flaw == Flaw::CallerClockExpiry {
-            self.frozen
-        } else {
-            self.clock.now()
+        match self.flaw {
+            Flaw::CallerClockExpiry => self.frozen,
+            // One tick behind: a key is judged live at the reading that equals its expiry.
+            Flaw::InclusiveExpiry => {
+                let now = self.clock.now();
+                StoreTime::from_duration(now.as_duration().saturating_sub(Duration::from_nanos(1)))
+            }
+            _ => self.clock.now(),
         }
     }
 
@@ -334,8 +466,11 @@ impl Fake {
             return;
         }
         let mut inner = lock(&self.inner);
-        self.clock.advance(FAKE_SYNC_COST);
-        inner.stats.syncs += 1;
+        let syncs = if self.flaw == Flaw::DoubleSync { 2 } else { 1 };
+        for _ in 0..syncs {
+            self.clock.advance(FAKE_SYNC_COST);
+            inner.stats.syncs += 1;
+        }
         let mut snapshot = inner.live.clone();
         if self.flaw == Flaw::CounterNotDurable {
             snapshot.counters.clear();
@@ -356,13 +491,18 @@ impl Fake {
             inner = lock(&self.inner);
             verdict?;
         } else if self.flaw != Flaw::PartialTxn {
-            inner.live.check_all(txn, now)?;
+            let verdict = inner.live.check_all(txn, now);
+            if verdict.is_err() && self.flaw == Flaw::CounterSurvivesAbort {
+                inner.live.bump_counters(txn);
+            }
+            verdict?;
         }
         let base = inner.live.alloc(txn.change_count());
         let commit = inner
             .live
             .write(txn, now, base, self.flaw == Flaw::PartialTxn)?;
         inner.stats.txns += 1;
+        self.committed.notify_all();
         Ok(commit)
     }
 }
@@ -399,6 +539,96 @@ impl Store for Fake {
             .filter(|(key, row)| key.starts_with(prefix) && row.alive(now))
             .map(|(key, row)| (key.clone(), row.versioned()))
             .collect())
+    }
+
+    fn scan_range(&self, scan: ScanRange<'_>) -> Result<ScanPage, StoreError> {
+        let now = self.clock_now();
+        let reverse = scan.direction == Direction::Reverse;
+        // The forward page of the reverse flaw is the reverse request run forward.
+        let walk_reverse = reverse && self.flaw != Flaw::ScanReversesForwardPage;
+        let mut scan = self.flawed(scan);
+        if self.flaw == Flaw::ScanPastPrefix {
+            // Clipped below by the prefix, never above.
+            if scan.lower == Bound::Unbounded {
+                scan.lower = Bound::Included(scan.prefix);
+            }
+            scan.prefix = "";
+        }
+        let Some(span) = Span::of(&scan) else {
+            return Ok(ScanPage {
+                rows: Vec::new(),
+                resume: None,
+            });
+        };
+        let take = if self.flaw == Flaw::ScanIgnoresLimit {
+            usize::MAX
+        } else {
+            scan.limit.get().saturating_add(1)
+        };
+        let inner = lock(&self.inner);
+        let range = inner.live.rows.range::<str, _>(span.bounds());
+        let walk: Box<dyn Iterator<Item = (&String, &Row)>> = if walk_reverse {
+            Box::new(range.rev())
+        } else {
+            Box::new(range)
+        };
+        let mut rows: Vec<(String, Versioned)> = if self.flaw == Flaw::ScanCountsExpired {
+            walk.take(take)
+                .filter(|(_, row)| row.alive(now))
+                .map(|(key, row)| (key.clone(), row.versioned()))
+                .collect()
+        } else {
+            walk.filter(|(_, row)| row.alive(now))
+                .take(take)
+                .map(|(key, row)| (key.clone(), row.versioned()))
+                .collect()
+        };
+        if reverse && !walk_reverse {
+            rows.reverse();
+        }
+        if self.flaw == Flaw::ScanReadsPerRow && scan.prefix == C8_SNAPSHOT_PREFIX {
+            drop(inner);
+            return Ok(page_of(self.reread_each(rows, now), scan.limit));
+        }
+        // The cursor flaws hold a snapshot per forward scan of a whole prefix and serve
+        // its resumed pages (an excluded lower bound) from it.
+        let whole = scan.direction == Direction::Forward && scan.upper == Bound::Unbounded;
+        if whole && matches!(self.flaw, Flaw::ScanSkipsAhead | Flaw::ScanStaleValues) {
+            let mut first_page = lock(&self.first_page);
+            match (scan.lower, self.flaw) {
+                (Bound::Unbounded, _) => {
+                    *first_page = inner
+                        .live
+                        .rows
+                        .range::<str, _>(span.bounds())
+                        .filter(|(_, row)| row.alive(now))
+                        .map(|(key, row)| (key.clone(), row.versioned()))
+                        .collect();
+                }
+                (Bound::Excluded(_), Flaw::ScanSkipsAhead) => {
+                    rows.retain(|(key, _)| first_page.contains_key(key));
+                }
+                (Bound::Excluded(_), _) => {
+                    for (key, value) in &mut rows {
+                        if let Some(then) = first_page.get(key) {
+                            value.clone_from(then);
+                        }
+                    }
+                }
+                (Bound::Included(_), _) => {}
+            }
+        }
+        if self.flaw == Flaw::ScanIgnoresLimit {
+            return Ok(ScanPage { rows, resume: None });
+        }
+        let mut page = page_of(rows, scan.limit);
+        if self.flaw == Flaw::ScanTokenOnLastPage && page.resume.is_none() {
+            page.resume = page
+                .rows
+                .last()
+                .map(|(key, _)| ResumeToken::after(key.clone()));
+        }
+        Ok(page)
     }
 
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {

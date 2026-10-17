@@ -30,6 +30,7 @@ use kbf_proto::reapi::execution_client::ExecutionClient;
 use kbf_proto::reapi::{
     Action, ActionResult, Command, Digest, Directory, ExecuteRequest, ExecuteResponse, FileNode,
 };
+use kbf_route::Liveness;
 use kbf_server::{Listeners, WorkerTls, bind_server_with_map};
 use kbf_transfer::{TransferConfig, Transfers, digest_of};
 use prost::Message as _;
@@ -187,7 +188,7 @@ async fn build(pki: &Pki, owner: &Node, pushes_map: bool, scratch: &std::path::P
         worker: loopback,
         reapi_tls: None,
         worker_tls: Some(WorkerTls {
-            server: pki.server_tls(),
+            server: pki.worker_tls(),
             deny_list: None,
         }),
         heartbeat_interval: Duration::from_millis(100),
@@ -201,6 +202,7 @@ async fn build(pki: &Pki, owner: &Node, pushes_map: bool, scratch: &std::path::P
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     };
     let source: Option<Arc<dyn MapSource>> =
         pushes_map.then(|| Arc::new(FakeMapSource::new(map(owner))) as Arc<dyn MapSource>);
@@ -253,10 +255,11 @@ async fn build(pki: &Pki, owner: &Node, pushes_map: bool, scratch: &std::path::P
         owner.store.hold(blob).await;
     }
     let action_digest: Digest = digest_of(&blobs[3]);
-    // The frontend accepts a result only if its outputs are in its own store: it does not
-    // yet ask the storage owners (the closure check across owners is av2-12). So the
-    // output is put there ahead, by the client's connection and not the daemon's, and
-    // not at the owner: the owner has it only if the daemon stores it there.
+    // This frontend is `kbf-server` over one cache, not `kbf frontend` (which asks the
+    // owners of a map, `kbf_front::Routed`): it accepts a result only if its outputs are
+    // in its own store. So the output is put there ahead, by the client's connection and
+    // not the daemon's, and not at the owner: the owner has it only if the daemon stores
+    // it there.
     upload.put(noise(2, OUTPUT_BYTES)).await.expect("upload");
 
     // The daemon: its session and its CAS connection both through the relays.
@@ -274,7 +277,7 @@ async fn build(pki: &Pki, owner: &Node, pushes_map: bool, scratch: &std::path::P
     let plane = Arc::new(FarmCas::new(
         Arc::new(Transfers::new(endpoint, TransferConfig::default())),
         Arc::clone(&holder),
-        storage_nodes(&pki.client).expect("TLS files"),
+        storage_nodes(&pki.client, Liveness::default()).expect("TLS files"),
         &TransferConfig::default(),
     ));
     let runtime = Arc::new(Mover {

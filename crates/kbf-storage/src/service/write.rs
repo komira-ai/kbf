@@ -2,13 +2,17 @@
 //! replica by the primary of a chain, whole in memory only where nothing else is
 //! possible.
 
+use std::sync::{Arc, Mutex, PoisonError};
+
 use bytes::Bytes;
+use futures::StreamExt as _;
+use futures::stream::BoxStream;
 use kbf_map::MemberId;
 use kbf_proto::google::bytestream::WriteRequest;
 use kbf_types::Digest;
-use tonic::{Status, Streaming};
+use tonic::Status;
 
-use super::StorageService;
+use super::{STREAM_FROM_BYTES, StorageService};
 use crate::replicate::{Plan, ReplicaLeg, Staging, View};
 use crate::{PutStream, StorageError, StreamedPut};
 
@@ -16,6 +20,12 @@ use crate::{PutStream, StorageError, StreamedPut};
 /// few chunks it holds (the writer's queue, the replica's, and the one in hand), not for
 /// the blob.
 const STREAM_WINDOW: u64 = 4 << 20;
+
+/// The messages of a `Write` after the first: a call's request stream, or the chunks of a
+/// blob an in-process caller holds ([`StorageService::in_process`]). One type for both so
+/// a write is taken in by one body of code. Owned, so that a blob too large to hold can be
+/// handed on to [`crate::Storage::put_streamed`] as it arrives.
+pub(super) type Messages = BoxStream<'static, Result<WriteRequest, Status>>;
 
 impl StorageService {
     /// The map a write routed by generation `requested` is judged by: `None` for a node
@@ -30,6 +40,33 @@ impl StorageService {
             Some(chain) => chain.view(requested, self.refetch_wait).await.map(Some),
             None => self.check_map(requested).await.map(|()| None),
         }
+    }
+
+    /// A whole `Write` once its caller is admitted: judges it by map generation `requested`,
+    /// takes the first message and then the rest from `messages`, and stores the blob as
+    /// this node's [`Plan`] says (forwarded to the replica when this node is the primary of
+    /// a chain). The answer is the blob's size. The one body of code a `Write` call and an
+    /// in-process write ([`StorageService::in_process`]) both run.
+    ///
+    /// # Errors
+    /// What the checks and the store refuse, as the call's status.
+    pub(super) async fn write_in(
+        &self,
+        requested: u64,
+        leg_from: Option<MemberId>,
+        mut messages: Messages,
+    ) -> Result<u64, Status> {
+        let view = self.view(requested).await?;
+        let first = next_or(&mut messages, "write stream sent no message").await?;
+        let digest = super::wire::write_resource(&first.resource_name)?;
+        let size = digest.size_bytes;
+        let plan = self.plan(view.as_ref(), &digest, leg_from)?;
+        if self.storage.find_missing(&[digest]).await?.is_empty() {
+            return Ok(size);
+        }
+        self.write_blob(digest, first, messages, view.as_ref(), leg_from, plan)
+            .await?;
+        Ok(size)
     }
 
     /// What this node does with a write of `digest` under `view`.
@@ -54,7 +91,7 @@ impl StorageService {
         &self,
         digest: Digest,
         first: WriteRequest,
-        mut rest: Streaming<WriteRequest>,
+        rest: Messages,
         view: Option<&View>,
         leg_from: Option<MemberId>,
         plan: Plan,
@@ -81,7 +118,7 @@ impl StorageService {
             u32::try_from(room).map_or(self.write_room_bytes, |r| r.min(self.write_room_bytes));
         // The semaphore is never closed.
         let _room = self.write_room.acquire_many(room).await.ok();
-        let (staged, lost) = receive(digest, put, first, &mut rest, leg).await?;
+        let (staged, lost) = receive(digest, put, first, rest, leg).await?;
         let mut owing = None;
         if let (Some(chain), Some(view)) = (&self.chain, view) {
             chain.confirm(view, &digest, leg_from, &plan)?;
@@ -107,20 +144,37 @@ impl StorageService {
             .map_err(|e| StorageError::Internal(format!("opening a blob stream: {e}")))
     }
 
-    /// Holds the blob whole until it is complete, then stores it with
-    /// [`crate::Storage::put`]: for a store that cannot write as bytes arrive, outside
-    /// a chain.
+    /// For a store that cannot write as bytes arrive, outside a chain: holds a blob of at
+    /// most [`STREAM_FROM_BYTES`] whole until it is complete, then stores it with
+    /// [`crate::Storage::put`], which hashes it; a larger one is never held, its messages
+    /// go to [`crate::Storage::put_streamed`] as they arrive, which hashes them on the way
+    /// and stores nothing unless they hash to the digest. Room for what is held (at most
+    /// [`STREAM_FROM_BYTES`] of it) is taken first. Order is not checked message by
+    /// message: the blob is checked against its digest as a whole.
     async fn write_buffered(
         &self,
         digest: Digest,
         first: WriteRequest,
-        mut rest: Streaming<WriteRequest>,
+        mut rest: Messages,
     ) -> Result<(), Status> {
         let size = digest.size_bytes;
+        let held = size.min(STREAM_FROM_BYTES);
         let room =
-            u32::try_from(size).map_or(self.write_room_bytes, |s| s.min(self.write_room_bytes));
+            u32::try_from(held).map_or(self.write_room_bytes, |s| s.min(self.write_room_bytes));
         // The semaphore is never closed.
         let _room = self.write_room.acquire_many(room).await.ok();
+        if size > STREAM_FROM_BYTES {
+            let fault = Arc::new(Mutex::new(None));
+            let body = pieces(rest, first, size, Arc::clone(&fault));
+            let claim = Box::pin(futures::future::ready(Some(digest)));
+            let stored = self.storage.put_streamed(size, body, claim).await;
+            // A fault of the sender's is INVALID_ARGUMENT, not the store's.
+            if let Some(status) = fault.lock().unwrap_or_else(PoisonError::into_inner).take() {
+                return Err(status);
+            }
+            stored?;
+            return Ok(());
+        }
         let mut received = Vec::with_capacity(usize::try_from(size).unwrap_or_default());
         let mut message = first;
         loop {
@@ -153,11 +207,17 @@ fn more_than(digest: &Digest) -> Status {
 }
 
 /// The next message of a write that has not finished.
-async fn next(stream: &mut Streaming<WriteRequest>) -> Result<WriteRequest, Status> {
+async fn next(stream: &mut Messages) -> Result<WriteRequest, Status> {
+    next_or(stream, "write stream ended without finish_write").await
+}
+
+/// The next message, or INVALID_ARGUMENT `missing` if the stream has ended.
+async fn next_or(stream: &mut Messages, missing: &'static str) -> Result<WriteRequest, Status> {
     stream
-        .message()
-        .await?
-        .ok_or_else(|| Status::invalid_argument("write stream ended without finish_write"))
+        .next()
+        .await
+        .transpose()?
+        .ok_or_else(|| Status::invalid_argument(missing))
 }
 
 /// Streams the blob `digest` into `put`, and on to `leg` if there is one, a message at
@@ -169,7 +229,7 @@ async fn receive(
     digest: Digest,
     put: Box<dyn PutStream>,
     first: WriteRequest,
-    rest: &mut Streaming<WriteRequest>,
+    mut rest: Messages,
     mut leg: Option<ReplicaLeg>,
 ) -> Result<(Box<dyn StreamedPut>, Option<StorageError>), Status> {
     let mut staging = Staging::start(put, digest);
@@ -193,7 +253,7 @@ async fn receive(
         if finish {
             break;
         }
-        message = next(rest).await?;
+        message = next(&mut rest).await?;
     }
     let (staged, replica) = tokio::join!(staging.finish(), async {
         match leg {
@@ -202,4 +262,90 @@ async fn receive(
         }
     });
     Ok((staged?, replica?))
+}
+
+/// The bytes of a `Write` of a blob of `size` bytes, message by message as they arrive,
+/// starting with `first`: the stream [`crate::Storage::put_streamed`] takes. A message
+/// stream that is wrong (more bytes than `size`, fewer at `finish_write`, ended without
+/// it, or broken) fails the stream with the sender's fault noted in `fault`.
+fn pieces(
+    stream: Messages,
+    first: WriteRequest,
+    size: u64,
+    fault: Arc<Mutex<Option<Status>>>,
+) -> BoxStream<'static, std::io::Result<Bytes>> {
+    futures::stream::unfold(
+        Incoming {
+            stream,
+            first: Some(first),
+            got: 0,
+            size,
+            done: false,
+            fault,
+        },
+        Incoming::step,
+    )
+    .boxed()
+}
+
+/// The state of [`pieces`].
+struct Incoming {
+    stream: Messages,
+    first: Option<WriteRequest>,
+    got: u64,
+    size: u64,
+    done: bool,
+    fault: Arc<Mutex<Option<Status>>>,
+}
+
+impl Incoming {
+    /// The next message's bytes, or `None` after the last.
+    async fn step(mut self) -> Option<(std::io::Result<Bytes>, Self)> {
+        loop {
+            if self.done {
+                return None;
+            }
+            let message = match self.first.take() {
+                Some(message) => message,
+                None => match self.stream.next().await {
+                    Some(Ok(message)) => message,
+                    None => {
+                        let status =
+                            Status::invalid_argument("write stream ended without finish_write");
+                        return Some(self.refuse(status));
+                    }
+                    Some(Err(status)) => return Some(self.refuse(status)),
+                },
+            };
+            self.got += message.data.len() as u64;
+            if self.got > self.size {
+                let status = Status::invalid_argument(format!(
+                    "more than the {} bytes the resource names",
+                    self.size
+                ));
+                return Some(self.refuse(status));
+            }
+            if message.finish_write {
+                self.done = true;
+                if self.got < self.size {
+                    let status = Status::invalid_argument(format!(
+                        "{} bytes, fewer than the {} the resource names",
+                        self.got, self.size
+                    ));
+                    return Some(self.refuse(status));
+                }
+            }
+            if !message.data.is_empty() {
+                return Some((Ok(Bytes::from(message.data)), self));
+            }
+        }
+    }
+
+    /// Ends the stream in an error, noting `status` as the sender's fault.
+    fn refuse(mut self, status: Status) -> (std::io::Result<Bytes>, Self) {
+        let error = std::io::Error::other(status.message().to_owned());
+        *self.fault.lock().unwrap_or_else(PoisonError::into_inner) = Some(status);
+        self.done = true;
+        (Err(error), self)
+    }
 }

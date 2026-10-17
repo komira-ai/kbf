@@ -5,7 +5,7 @@ mod common;
 use common::SqliteBackend;
 use kbf_state::conformance::{
     c1_linearizable_cas, c2_atomic_txn, c3_monotonic_counter, c4_store_clock_expiry,
-    c5_ordered_feed, c6_durable_ack, c7_group_commit,
+    c5_ordered_feed, c6_durable_ack, c7_group_commit, c8_bounded_range_scan,
 };
 
 #[test]
@@ -41,4 +41,9 @@ fn c6_acknowledged_writes_survive_a_restart() {
 #[test]
 fn c7_a_burst_is_one_group() {
     c7_group_commit(&SqliteBackend::new("c7"));
+}
+
+#[test]
+fn c8_a_range_scan_is_bounded_and_resumes() {
+    c8_bounded_range_scan(&SqliteBackend::new("c8"));
 }
