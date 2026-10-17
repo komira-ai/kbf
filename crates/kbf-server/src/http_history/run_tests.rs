@@ -349,6 +349,8 @@ mod recorder_side {
             recorder,
             readers: None,
             durable: Arc::new(Durable::new(Arc::new(reads))),
+            presence: Arc::new(kbf_front::Cache::memory()),
+            budget: crate::http_blobs::ReadBudget::default(),
         };
         (state, runs, RunId::from_bytes(id))
     }
