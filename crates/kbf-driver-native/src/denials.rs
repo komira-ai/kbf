@@ -250,7 +250,7 @@ pub fn system_log(_: &Path, _: Duration) -> io::Result<String> {
 mod tests {
     use super::*;
 
-    const LINE: &str = "2026-10-17 10:00:00.1 Df kernel[0:1] (Sandbox) Sandbox: touch(123) deny(1) file-write-create /Users/x/y";
+    const LINE: &str = "2026-10-17 10:00:00.1 Df kernel[0:1] (Sandbox) Sandbox: touch(123) deny(1) file-write-create /work/x/y";
 
     /// Catches a parser that loses the pid, the operation or the target, takes the
     /// count `(1)` for the pid, or cuts a target with spaces.
@@ -263,7 +263,7 @@ mod tests {
                 pid: 123,
                 process: "touch".into(),
                 operation: "file-write-create".into(),
-                target: "/Users/x/y".into(),
+                target: "/work/x/y".into(),
             }
         );
         let spaced = "x Sandbox: Xcode Helper (Plugin)(77) deny(1) file-write-data /a b/c";
@@ -313,11 +313,11 @@ mod tests {
         assert_eq!(found.other[0].pid, 999);
         assert_eq!(
             found.other_lines(),
-            ["touch(999) file-write-create /Users/x/y"]
+            ["touch(999) file-write-create /work/x/y"]
         );
         let note = found.note().expect("a note");
         assert!(
-            note.contains("kbf:   touch(123) file-write-create /Users/x/y\n"),
+            note.contains("kbf:   touch(123) file-write-create /work/x/y\n"),
             "{note}"
         );
         assert!(!note.contains("999"), "{note}");
@@ -332,7 +332,7 @@ mod tests {
         let found = Found::of(LINE, &BTreeSet::new());
         let note = found.note().expect("a note");
         assert!(note.contains("no macOS sandbox denial was seen"), "{note}");
-        assert!(!note.contains("/Users/x/y"), "{note}");
+        assert!(!note.contains("/work/x/y"), "{note}");
     }
 
     /// Catches an unbounded note: many denials, one with a huge target.

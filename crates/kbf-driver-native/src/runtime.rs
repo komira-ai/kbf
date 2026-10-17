@@ -569,6 +569,15 @@ impl<C: Cas> NativeRuntime<C> {
             return;
         };
         let stderr = dir.join("stderr");
+        // The note must not push the action's own stderr past the stdio limit, which
+        // would drop all of it: it stays in the node's log then.
+        let max = self.config.outputs.max_stdio_bytes;
+        let size = std::fs::metadata(&stderr).map_or(u64::MAX, |m| m.len());
+        let note_len = u64::try_from(note.len()).unwrap_or(u64::MAX);
+        if size.saturating_add(note_len) > max {
+            tracing::warn!(%lease, size, max, "the sandbox's denials do not fit in stderr; they are in the node's log");
+            return;
+        }
         let written = std::fs::OpenOptions::new()
             .append(true)
             .open(&stderr)

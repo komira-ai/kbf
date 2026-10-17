@@ -92,6 +92,17 @@ async fn a_failed_action_gets_its_own_denials_in_its_stderr() {
     assert_eq!(result.exit_code, 4);
     assert_eq!(stderr(&cas, &result), "own\n");
 
+    // A note that would push stderr past the stdio limit is left out: the limit
+    // would drop the action's own stderr with it.
+    let (mut config, cas) = sandboxed("denials-limit");
+    config.denial_log = log_with_two;
+    config.outputs.max_stdio_bytes = 100;
+    let rt = runtime(config, &cas);
+    let spec = Spec::act("pgid ; echo --stderr own failure ; exit 3");
+    let result = run(&rt, &cas, 1, &spec).await.expect("ran");
+    assert_eq!(result.exit_code, 3);
+    assert_eq!(stderr(&cas, &result), "own failure\n");
+
     // Without a sandbox there is nothing to read.
     let dir = scratch("denials-none");
     let mut config = config_without_sandbox(&dir);
