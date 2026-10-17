@@ -32,8 +32,8 @@ use kbf_server::stores::StoreUri;
 use kbf_server::{Args, EpochPolicy, StateStore};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{
-    Changes, Commit, CommitStats, Conflict, ManualClock, Op, Revision, Store, StoreError,
-    StoreTime, Txn, Versioned,
+    Changes, Commit, CommitStats, Conflict, ManualClock, Op, Revision, ScanPage, ScanRange, Store,
+    StoreError, StoreTime, Txn, Versioned,
 };
 use prost::Message as _;
 use support::{Cell, FakeDaemon, Job, QUIET, done, failed, output, ran};
@@ -216,6 +216,10 @@ impl Store for Gated {
 
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
         self.inner.scan_prefix(prefix)
+    }
+
+    fn scan_range(&self, scan: ScanRange<'_>) -> Result<ScanPage, StoreError> {
+        self.inner.scan_range(scan)
     }
 
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {
