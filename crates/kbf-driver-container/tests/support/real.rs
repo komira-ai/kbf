@@ -99,6 +99,14 @@ fn trace() {
 /// find another cell's unpack in progress.
 static MAKING: Mutex<()> = Mutex::new(());
 
+/// Holds off the making of any cell, and of any runtime made with [`exclusive`], until
+/// dropped: for a test whose own work unpacks an image into the shared store (an image
+/// the store does not hold yet, even one it then refuses) or that starts a runtime of its
+/// own, which sweeps the store.
+pub fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+    MAKING.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// The image store every cell shares, under the system temporary directory (whose
 /// ancestors every id can search, which the backend's containers need). It is kept
 /// between runs: its files are owned by subordinate ids, and an image is read-only.
@@ -161,7 +169,7 @@ impl Cell {
         config.kill_grace = Duration::from_secs(2);
         configure(&mut config);
         let cas = Arc::new(MemoryCas::new());
-        let making = MAKING.lock().unwrap_or_else(PoisonError::into_inner);
+        let making = exclusive();
         let runtime =
             Arc::new(ContainerRuntime::new(config.clone(), Arc::clone(&cas)).expect("runtime"));
         fetch_test_image(&runtime);

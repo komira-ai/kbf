@@ -29,7 +29,8 @@ use kbf_daemon::{Runtime, RuntimeError};
 use kbf_driver_container::ContainerRuntime;
 use kbf_types::{LeaseId, Resources};
 use support::real::{
-    ACTIONS_MEMORY_MAX, Cell, MOUNT, SUPERVISOR_MEMORY_MIN, delegation, describe, sh, var,
+    ACTIONS_MEMORY_MAX, Cell, MOUNT, SUPERVISOR_MEMORY_MIN, delegation, describe, exclusive, sh,
+    var,
 };
 use support::{Spec, blob, exists, store_action};
 
@@ -428,6 +429,10 @@ async fn there_is_no_network_but_loopback() {
 /// would not pin the bytes (the "tag instead of a digest" mutant).
 #[tokio::test]
 #[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "the guard keeps other tests from making a runtime while this one's lease unpacks"
+)]
 async fn tags_and_index_digests_are_refused() {
     let cell = Cell::new("refused");
     let image = var("KBF_TEST_IMAGE");
@@ -439,7 +444,10 @@ async fn tags_and_index_digests_are_refused() {
         "{outcome:?}"
     );
     let index = Spec::new(&var("KBF_TEST_INDEX_IMAGE"), "true");
+    // The refusal starts an unpack of the index into the store the other tests share.
+    let alone = exclusive();
     let outcome = cell.run(2, &index).await;
+    drop(alone);
     assert!(
         matches!(outcome, Err(RuntimeError::Invalid(ref why)) if why.contains("image index")),
         "{outcome:?}"
@@ -732,13 +740,17 @@ async fn a_restarted_runtime_removes_what_its_predecessor_left() {
         "the predecessor's container is not running"
     );
 
+    let alone = exclusive();
     ContainerRuntime::new(cell.config.clone(), Arc::clone(&cell.cas)).expect("restart");
+    drop(alone);
     cell.assert_clean(1);
     assert!(
         other.container_exists(1),
         "another daemon's container was removed"
     );
+    let alone = exclusive();
     ContainerRuntime::new(other.config.clone(), Arc::clone(&other.cas)).expect("restart");
+    drop(alone);
     other.assert_clean(1);
 }
 
