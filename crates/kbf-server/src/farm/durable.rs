@@ -17,9 +17,18 @@
 //!   is written at the grant and at the end, never to renew it);
 //! - `loss/<operation>`: how many of the operation's leases were lost, while it is
 //!   unfinished and has lost any ([`kbf_sched::LOSS_REQUEUES`] refuses it);
+//! - `fate/<operation>`: what the operation's kills for memory changed: the raised
+//!   booking and the memory runs ([`kbf_sched::Fate`]), written in the transaction of the
+//!   requeue that follows a kill and deleted with the operation's other rows, so a
+//!   successor (after a handover or a crash) books the next rung instead of starting the
+//!   ladder over. A store with no row for an operation books and counts as it did before
+//!   the row existed;
 //! - `done/<operation>`: how a finished or refused operation ended, kept for the finished
 //!   retention (at least [`DONE_FLOOR`]) so a process that did not finish it can still
 //!   answer the callers of it: a tag byte and the `ExecuteResponse` ([`kbf_front::Finished`]);
+//! - `cordon/<worker>`: how an operator placed a node (cordoned, or draining until a
+//!   wall-clock deadline), kept until it is returned to placement, so a successor
+//!   process serves the node as the operator left it;
 //! - `meta/epoch`, `meta/next_op`, `meta/next_seq`: the store incarnation and the first
 //!   operation id and lease sequence no earlier start used;
 //! - `meta/generation`: the writer generation ([`kbf_state::Fenced`]); every write of the
@@ -36,7 +45,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use kbf_front::{Described, Finished, Stage};
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
 use kbf_sched::fence::LEASE_GRACE;
-use kbf_sched::{DaemonInstance, Recovered, RecoveredLease, Request, Requeue};
+use kbf_sched::{DaemonInstance, Fate, Recovered, RecoveredLease, Request, Requeue};
 use kbf_state::{Cond, Conflict, GENERATION, Store, StoreError, Txn, Versioned};
 use kbf_types::{
     ControlRecord, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, StartLease, WaiterId,
@@ -59,6 +68,8 @@ const EPOCH: &str = "meta/epoch";
 const ALIVE: &str = "meta/alive";
 const NEXT_OP: &str = "meta/next_op";
 const NEXT_SEQ: &str = "meta/next_seq";
+const CORDON: &str = "cordon/";
+const FATE: &str = "fate/";
 
 /// The least time a `done/` row is kept, whatever the finished retention: a process that
 /// follows an operation it did not finish needs the row for as long as a stream it kept
@@ -118,6 +129,66 @@ pub(super) struct Stored {
     pub next_seq: u64,
     /// Every unfinished operation, in id order.
     pub operations: Vec<StoredOperation>,
+    /// Every node an operator placed, in node-id order.
+    pub cordons: Vec<(WorkerId, StoredCordon)>,
+}
+
+/// How an operator placed a node, as its `cordon/` row keeps it: a tag byte, and for a
+/// drain the deadline as eight bytes, big-endian, milliseconds since the Unix epoch (a
+/// successor process has a clock of its own for farm time, and the wall clock is the
+/// one both share).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StoredCordon {
+    /// Placement skips the node.
+    Cordoned,
+    /// Placement skips the node and waits for its leases until the deadline.
+    Draining { deadline_unix_ms: u64 },
+}
+
+impl StoredCordon {
+    fn to_row(self) -> Vec<u8> {
+        match self {
+            Self::Cordoned => vec![0],
+            Self::Draining { deadline_unix_ms } => {
+                [&[1][..], &deadline_unix_ms.to_be_bytes()].concat()
+            }
+        }
+    }
+
+    fn from_row(key: &str, row: &[u8]) -> Result<Self, StateError> {
+        match row {
+            [0] => Ok(Self::Cordoned),
+            [1, deadline @ ..] => {
+                let deadline = <[u8; 8]>::try_from(deadline)
+                    .map_err(|_| corrupt(key, "a drain deadline is not 8 bytes"))?;
+                Ok(Self::Draining {
+                    deadline_unix_ms: u64::from_be_bytes(deadline),
+                })
+            }
+            _ => Err(corrupt(key, "not a cordon")),
+        }
+    }
+}
+
+/// Where an operation stands in the state store, as a process that did not run it sees it.
+#[derive(Debug, PartialEq)]
+pub(super) enum Progress {
+    /// It ended, and this is how.
+    Ended(Finished),
+    /// It waits for a lease.
+    Queued,
+    /// It holds a lease.
+    Running,
+    /// The store has no trace of it: not unfinished and not ended. Its writer ends an
+    /// operation in two transactions, so for a moment after the first this is also what
+    /// a successful finish looks like.
+    Gone,
+}
+
+impl Progress {
+    pub(super) const fn is_gone(&self) -> bool {
+        matches!(self, Self::Gone)
+    }
 }
 
 /// An unfinished operation of a store.
@@ -129,6 +200,8 @@ pub(super) struct StoredOperation {
     pub lease: Option<LeaseGrant>,
     /// How many of its leases were lost.
     pub losses: u32,
+    /// What its kills for memory changed, if it was killed.
+    pub fate: Option<Fate>,
 }
 
 impl StoredOperation {
@@ -143,9 +216,12 @@ impl StoredOperation {
                 worker: grant.worker,
             }),
             losses: self.losses,
+            fate: self.fate,
         }
     }
 }
+
+mod fate;
 
 /// The scheduler's handle on its state store.
 pub(super) struct Durable {
@@ -177,8 +253,16 @@ fn loss_key(operation: OperationId) -> String {
     format!("loss/{:016x}", operation.0)
 }
 
+fn fate_key(operation: OperationId) -> String {
+    format!("{FATE}{:016x}", operation.0)
+}
+
 fn done_key(operation: OperationId) -> String {
     format!("done/{:016x}", operation.0)
+}
+
+fn cordon_key(worker: &WorkerId) -> String {
+    format!("{CORDON}{worker}")
 }
 
 fn lease_key(lease: LeaseId) -> String {
@@ -281,6 +365,12 @@ impl Durable {
                 .map_err(|_| corrupt(&key, "not a loss count"))?;
             losses.insert(operation, count);
         }
+        let mut fates = std::collections::BTreeMap::new();
+        for (key, row) in self.store.scan_prefix(FATE)? {
+            let operation = parse_operation(&key, FATE)?;
+            let fate = fate::decode(&row.value).map_err(|why| corrupt(&key, why))?;
+            fates.insert(operation, fate);
+        }
         let mut operations = Vec::new();
         for (key, row) in self.store.scan_prefix("op/")? {
             let FarmInput::Submit(request) = decode(&key, &row.value)? else {
@@ -293,12 +383,53 @@ impl Durable {
                 request,
                 lease,
                 losses: losses.remove(&operation).unwrap_or(0),
+                fate: fates.remove(&operation),
             });
         }
         Ok(Stored {
             next_operation: self.counter(NEXT_OP)?,
             next_seq: self.counter(NEXT_SEQ)?,
             operations,
+            cordons: self.cordons()?,
+        })
+    }
+
+    /// The nodes an operator placed.
+    fn cordons(&self) -> Result<Vec<(WorkerId, StoredCordon)>, StateError> {
+        let rows = self.store.scan_prefix(CORDON)?;
+        rows.into_iter()
+            .map(|(key, row)| {
+                let cordon = StoredCordon::from_row(&key, &row.value)?;
+                Ok((WorkerId::new(&key[CORDON.len()..]), cordon))
+            })
+            .collect()
+    }
+
+    /// An operator placed `worker` as `cordon`, or returned it to placement (`None`).
+    pub(super) fn cordoned(
+        &self,
+        worker: &WorkerId,
+        cordon: Option<StoredCordon>,
+    ) -> Result<(), StateError> {
+        let key = cordon_key(worker);
+        let txn = match cordon {
+            Some(cordon) => Txn::new().put(key, cordon.to_row(), Cond::Any),
+            None => Txn::new().delete(key, Cond::Any),
+        };
+        self.commit(txn)
+    }
+
+    /// Where `operation` stands.
+    pub(super) fn progress(&self, operation: OperationId) -> Result<Progress, StateError> {
+        if let Some(finished) = self.ended(operation)? {
+            return Ok(Progress::Ended(finished));
+        }
+        let unfinished = self.store.get(&op_key(operation))?.is_some();
+        let queued = self.store.get(&queue_key(operation))?.is_some();
+        Ok(match (unfinished, queued) {
+            (false, _) => Progress::Gone,
+            (true, true) => Progress::Queued,
+            (true, false) => Progress::Running,
         })
     }
 
@@ -346,11 +477,13 @@ impl Durable {
     /// that has finished has nothing to put back.
     ///
     /// `losses` is the operation's count of lost leases, to write down if the give-up is
-    /// one ([`kbf_sched::RequeueReason::is_loss`]).
+    /// one ([`kbf_sched::RequeueReason::is_loss`]). `fate` is what the kill changed, if
+    /// the give-up is a kill for memory: it goes in the same transaction as the queue row.
     pub(super) fn requeued(
         &self,
         requeue: &Requeue,
         losses: Option<u32>,
+        fate: Option<&Fate>,
     ) -> Result<(), StateError> {
         if self.store.get(&op_key(requeue.operation))?.is_none() {
             return Ok(());
@@ -363,6 +496,12 @@ impl Durable {
         if let Some(count) = losses {
             let count = u64::from(count).to_be_bytes();
             txn = txn.put(loss_key(requeue.operation), count, Cond::Any);
+        }
+        if let Some(fate) = fate {
+            let row = fate::encode(fate).ok_or_else(|| {
+                corrupt(&fate_key(requeue.operation), "a fate is too large to write")
+            })?;
+            txn = txn.put(fate_key(requeue.operation), row, Cond::Any);
         }
         self.commit(txn.put(queue_key(requeue.operation), Vec::new(), Cond::Any))
     }
@@ -378,7 +517,8 @@ impl Durable {
                 .delete(key, Cond::Version(row.version))
                 .delete(op_key(operation), Cond::Any)
                 .delete(queue_key(operation), Cond::Any)
-                .delete(loss_key(operation), Cond::Any),
+                .delete(loss_key(operation), Cond::Any)
+                .delete(fate_key(operation), Cond::Any),
         )
     }
 
@@ -388,7 +528,8 @@ impl Durable {
             Txn::new()
                 .delete(op_key(operation), Cond::Any)
                 .delete(queue_key(operation), Cond::Any)
-                .delete(loss_key(operation), Cond::Any),
+                .delete(loss_key(operation), Cond::Any)
+                .delete(fate_key(operation), Cond::Any),
         )
     }
 
@@ -595,13 +736,20 @@ impl State {
             } else {
                 None
             };
-            self.unsettled.push((requeue.clone(), losses));
+            // Taken now, not when the store takes the write: a later kill must not
+            // reach an earlier requeue's row.
+            let fate = if requeue.reason.is_memory_kill() {
+                self.sched.fate(requeue.operation)
+            } else {
+                None
+            };
+            self.unsettled.push((requeue.clone(), losses, fate));
         }
         let pending = std::mem::take(&mut self.unsettled);
-        let refused: Vec<(Requeue, Option<u32>)> = pending
+        let refused: Vec<_> = pending
             .into_iter()
-            .filter(|(requeue, losses)| {
-                !self.durably("a requeue", |d| d.requeued(requeue, *losses))
+            .filter(|(requeue, losses, fate)| {
+                !self.durably("a requeue", |d| d.requeued(requeue, *losses, fate.as_ref()))
             })
             .collect();
         self.unsettled = refused;
@@ -610,7 +758,8 @@ impl State {
     /// Renews `worker`'s session row if its last write is a renewal interval old: one
     /// write per daemon session, never one per lease. Called for a heartbeat taken.
     pub(super) fn renew_session(&mut self, now: FarmTime, worker: &WorkerId) {
-        if self.durable.is_none() {
+        // A fenced farm writes nothing: the successor's rows are the truth.
+        if self.durable.is_none() || self.fenced {
             return;
         }
         let due = self
@@ -667,6 +816,7 @@ impl State {
         let next_operation = OperationId(stored.next_operation);
         self.sched
             .recover(epoch, next_operation, stored.next_seq, recovered);
+        self.restore_cordons(stored.cordons);
         self.durable = Some(durable);
         Ok(Some(epoch))
     }
@@ -678,7 +828,7 @@ impl State {
     /// # Errors
     /// UNAVAILABLE if the store did not take it: the request is not queued, and the
     /// client, who is told nothing is queued, asks again.
-    pub(super) fn admit(&self, request: &Request) -> Result<(), Status> {
+    pub(super) fn queue(&self, request: &Request) -> Result<(), Status> {
         let id = self.sched.next_operation();
         let joins = self.sched.twin(request).is_some();
         if !joins && !self.durably("a submission", |d| d.submitted(id, request)) {

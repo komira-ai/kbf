@@ -314,6 +314,11 @@ Options:
           
           [default: 8]
 
+      --tls-reload-interval-secs <TLS_RELOAD_INTERVAL_SECS>
+          How often, in seconds, a TLS listener looks at its certificate, key and client CA files (the `--*-tls-cert`, `--*-tls-key` and `--*-client-ca` flags). A change is applied to the next TLS handshake, with no restart and without ending a connection already open: renew a certificate by replacing the files. Files that do not make a working configuration (unreadable, not PEM, a key that is not the certificate's, an expired certificate, a renewal caught between its two writes) are logged and counted in `kbf_tls_reloads_total{outcome="rejected"}`, and the previous files keep serving; the next look finds them whole and applies them. The files must be good at start
+          
+          [default: 30]
+
       --segment-upload-max-bytes <BYTES>
           The most bytes, records and footers together, one segment upload on the worker listener may hold in memory (`docs/design/write-path.md`, section 4.2): the segments it declares that are not written to the hot store as they arrive (all of them, without one). Not a limit on a blob's size: a segment held in memory holds no record over 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`), and an upload with a larger one and no room on the hot store is answered FAILED_PRECONDITION, so the daemon sends its records by ByteStream, which streams a large blob to the cold store. Those ranges are held until the upload commits, admitted under `--write-bytes-in-flight` with every other upload: a `Begin` waits while that is spent. At least 33 MiB (`kbf_front::MIN_SEGMENT_UPLOAD_BYTES`), a daemon's upload of small files with room to spare, and at most `--write-bytes-in-flight`, so any legal `Begin` can be admitted; the server refuses to start otherwise. At most `kbf_front::MAX_ADMISSION_BYTES`, the most one admission counts, so a `Begin` never holds more than it is counted for under the bound
           

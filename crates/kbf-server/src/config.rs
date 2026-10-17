@@ -235,11 +235,10 @@ pub struct Args {
     /// mutual TLS.
     #[arg(long, requires_all = ["worker_tls_cert", "worker_tls_key", "worker_client_ca"])]
     pub worker_deny_list: Option<PathBuf>,
-    /// How often, in seconds, the REAPI and worker listeners look at their TLS files
-    /// (`--reapi-tls-cert`, `--reapi-tls-key`, `--worker-tls-cert`, `--worker-tls-key`,
-    /// `--worker-client-ca`). A change is applied to the next TLS handshake, with no
-    /// restart and without ending a connection already open: renew a certificate by
-    /// replacing the files. Files that do not make a working configuration (unreadable,
+    /// How often, in seconds, a TLS listener looks at its certificate, key and client CA
+    /// files (the `--*-tls-cert`, `--*-tls-key` and `--*-client-ca` flags). A change is
+    /// applied to the next TLS handshake, with no restart and without ending a connection
+    /// already open: renew a certificate by replacing the files. Files that do not make a working configuration (unreadable,
     /// not PEM, a key that is not the certificate's, an expired certificate, a renewal
     /// caught between its two writes) are logged and counted in
     /// `kbf_tls_reloads_total{outcome="rejected"}`, and the previous files keep serving;
@@ -444,6 +443,9 @@ pub struct Args {
         requires = "state_store"
     )]
     pub member_dwell_secs: u64,
+    /// Build history: `--history-objects` and `--history-index-root`.
+    #[command(flatten)]
+    pub history: crate::history::HistoryFlags,
 }
 
 /// This server in the tier registry. A farm runs one server today
