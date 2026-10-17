@@ -4,12 +4,14 @@
 //!
 //! Each unit runs `<KBF_BIN_DIR>/kbf <mode> ...`. A mode `kbf` runs today (`daemon`,
 //! `all-in-one`, `storage`, `storage-and-daemon`) carries the flags its old binary's
-//! unit carries (`storage` only its three certificate flags yet: a TODO comment marks
-//! where its stores go; `storage-and-daemon` those and the daemon's); a mode not built
-//! yet (`frontend`) carries none, and its template marks where its flags go with a
-//! `TODO:` comment. The flags the new modes add
+//! unit carries (`storage` its stores, its listen address and its certificate flags;
+//! `storage-and-daemon` the storage unit's three certificate flags and the daemon's:
+//! a TODO comment marks where its stores go); a mode not built yet (`frontend`)
+//! carries none, and its template marks where its flags go with a `TODO:` comment.
+//! The flags the new modes add
 //! (`--frontend`, `--advertise-addr`, the certificate flags) are such TODO comments
-//! too, never guessed.
+//! too, never guessed: `TODO(registration):` marks the frontend's DNS name and the
+//! storage map it pushes, which come with registration.
 //!
 //! [`check`] reads a rendered unit back, with its drop-ins ([`UnitText`]). Its rules,
 //! and the defect each catches:
@@ -34,7 +36,19 @@
 //!   an empty value starts over with none.
 //! - `credential`: the units of a mode without a storage half that reads the key
 //!   (`daemon`, `storage-and-daemon`, `all-in-one`) do not give it the cold store's
-//!   key; [`super::credential`] says what the rule reads and what it cannot see.
+//!   key; [`super::credential`] says what the rule reads and what it cannot see. The
+//!   unit that holds the key (`storage`) runs as a user of its own: a `User=` that is
+//!   not `KBF_USER`, the user builds run as.
+//! - `storage`: the `storage` unit gives its cold store, metadata directory, listen
+//!   address and the three certificate flags, and an `s3://` cold store comes with the
+//!   key file ([`super::stores`]).
+//! - `state-store`: a `--state-store` the unit gives is `sqlite:///<absolute path>`
+//!   and names no variable (systemd would expand it into kbf's argv); postgres is not
+//!   wired yet, so a Postgres URI fails ([`super::stores`]).
+//! - `ports`: no two of the unit's listeners share a port ([`super::stores`]).
+//! - `stop`: a mode that drains on SIGTERM (every mode but `daemon`) has
+//!   `TimeoutStopSec=infinity` and `KillSignal=SIGTERM`, so systemd never kills it
+//!   mid-drain and fails the builds in flight ([`super::stop`]).
 //!
 //! [`check_on_host`] adds the rules that read the host, and reads `kbf.slice`:
 //!
@@ -51,7 +65,8 @@
 //!   disables a delegated controller below it (a slice cannot delegate; systemd enables
 //!   on the slice every controller a unit under it delegates, unless the slice's
 //!   `DisableControllers=` lists it). `credential` also reads the files the unit's
-//!   `EnvironmentFile=` lines name.
+//!   `EnvironmentFile=` lines name, and for `storage` that each key file is root's or
+//!   the unit's user's with no group or other bit.
 //!
 //! `all-in-one` passes with a `WARN trusted:` line: its builds run beside the farm's
 //! state and its cold store, as one user. The container driver runs each action as a
@@ -72,10 +87,11 @@ use kbf_host::exec::Exec;
 use kbf_host::path::HostPath;
 use kbf_host::step::Cmd;
 
+use super::Refusal;
 use super::check::{Failure, Report, angle_placeholder};
 use super::config::LinuxConfig;
 use super::render::{SLICE, values};
-use super::{cpuset, credential};
+use super::{cpuset, credential, stop, stores};
 use crate::template::{self, TemplateError, leftovers};
 use crate::unit::{UnitError, UnitFile, comments_in_continuations};
 
@@ -139,6 +155,13 @@ impl Mode {
         matches!(self, Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne)
     }
 
+    /// Whether the mode drains on SIGTERM (rule `stop`): a frontend finishes its open
+    /// streams, a storage half finishes the Writes in flight. Only `daemon` does not.
+    #[must_use]
+    pub fn drains(self) -> bool {
+        !matches!(self, Mode::Daemon)
+    }
+
     /// Whether the mode runs builds without a storage half that reads the cold store's
     /// key today (rule `credential`): `all-in-one`'s cold store is a `file://`
     /// directory, and `storage-and-daemon` gets the key once its storage half's uid is
@@ -146,6 +169,13 @@ impl Mode {
     #[must_use]
     pub fn holds_no_key(self) -> bool {
         matches!(self, Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne)
+    }
+
+    /// Whether the mode's unit holds the cold store's key (rule `credential`): the
+    /// storage node, as a user of its own.
+    #[must_use]
+    pub fn holds_key(self) -> bool {
+        self == Mode::Storage
     }
 
     /// The unit's file name: `kbf-<mode>.service`.
@@ -175,12 +205,13 @@ impl fmt::Display for Mode {
 
 /// The unit of `mode`, rendered with `config` (the values `render-units` renders the
 /// converged units with); `kbf_uid` as there.
-pub fn render(
-    config: &LinuxConfig,
-    kbf_uid: Option<u32>,
-    mode: Mode,
-) -> Result<String, TemplateError> {
-    render_template(config, kbf_uid, mode, mode.template())
+///
+/// # Errors
+/// Settings `mode` needs left out ([`LinuxConfig::for_mode`]), or a placeholder with no
+/// value.
+pub fn render(config: &LinuxConfig, kbf_uid: Option<u32>, mode: Mode) -> Result<String, Refusal> {
+    config.for_mode(mode)?;
+    Ok(render_template(config, kbf_uid, mode, mode.template())?)
 }
 
 /// [`render`] with another template, for the tests that plant a defect in one.
@@ -291,6 +322,15 @@ pub fn check_on_host<E: Exec>(
         let found = credential::on_host(exec, &merged, &key_file(config));
         for how in found.failures {
             fail("credential", credential_message(&name, &how));
+        }
+        notes.extend(found.notes);
+    }
+    if mode.holds_key() {
+        let key = HostPath::new(&key_file(config).to_string_lossy())
+            .expect("KBF_ETC is an absolute path, and so is the key file under it");
+        let found = credential::holder_on_host(exec, &merged, &key);
+        for how in found.failures {
+            fail("credential", holder_message(&name, &how));
         }
         notes.extend(found.notes);
     }
@@ -441,6 +481,13 @@ fn disabled(unit: &UnitFile, section: &str) -> Option<String> {
     (!hit.is_empty()).then(|| hit.join(" "))
 }
 
+fn holder_message(name: &str, how: &str) -> String {
+    format!(
+        "{name} holds the cold store's key and {how}: the key is the storage node's user's \
+         alone, never a build's"
+    )
+}
+
 fn credential_message(name: &str, how: &str) -> String {
     format!(
         "{name} gives a build node the cold store's key ({how}): a build node holds no \
@@ -554,6 +601,33 @@ fn rules(
             fail("credential", credential_message(&name, &how));
         }
     }
+    if let Some(how) = credential::holder(unit, &config.user).filter(|_| mode.holds_key()) {
+        fail("credential", holder_message(&name, &how));
+    }
+
+    // storage
+    if mode == Mode::Storage {
+        for how in stores::storage(unit, &key_file(config)) {
+            fail("storage", format!("{name} {how}"));
+        }
+    }
+
+    // state-store
+    for how in stores::state_store(unit) {
+        fail("state-store", format!("{name}: {how}"));
+    }
+
+    // ports
+    for how in stores::ports(unit) {
+        fail("ports", format!("{name}: {how}"));
+    }
+
+    // stop
+    if mode.drains() {
+        for how in stop::check(unit) {
+            fail("stop", format!("{name} {how}"));
+        }
+    }
     failures
 }
 
@@ -585,3 +659,7 @@ fn report(mode: Mode, failures: Vec<Failure>) -> Report {
 #[cfg(test)]
 #[path = "modes_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "modes_matrix_tests.rs"]
+mod matrix_tests;
