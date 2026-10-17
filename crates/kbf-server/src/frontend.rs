@@ -107,6 +107,8 @@ pub const ALLOWED: &[&str] = &[
     "state_store",
     "member_ttl_secs",
     "member_dwell_secs",
+    "history_objects",
+    "history_index_root",
     "log_dir",
     "log_max_bytes",
     "log_files",
@@ -372,6 +374,8 @@ fn bind_frontend(
             .transpose()?,
         args.members(),
     );
+    let state = crate::history::with_history(state, &args.history)?;
+    let (state, history) = crate::history::take(state);
     let members = members_of(state.as_ref());
     let readiness = Arc::new(Readiness::default());
     let timeout = listeners.store_probe_timeout;
@@ -386,6 +390,7 @@ fn bind_frontend(
     let backend = Backend::remote(storage);
 
     let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
+    let recording = crate::history::install(recording, history.as_ref());
     let default_memory = listeners.memory_ladder.first();
     let durable = state.is_some();
     let farm = Farm::new(
@@ -411,7 +416,10 @@ fn bind_frontend(
         Arc::clone(&drain),
     )
     .merge(crate::health::router_of(Arc::clone(&checks)))
-    .merge(metrics_route(backend.clone()));
+    .merge(metrics_route(
+        backend.clone(),
+        history.as_ref().map(crate::history::History::stats),
+    ));
 
     let mut reapi_server = keepalive(flow_control(Server::builder()), listeners.streams);
     if let Some(tls) = listeners.reapi_tls {
@@ -461,6 +469,7 @@ fn bind_frontend(
     let shutdown = shutdown()?;
     let stopper = Arc::clone(&drain);
     let serving = async move {
+        let history = crate::history::spawn(history);
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
         let reapi_serve = reapi_server
             .add_routes(reapi_routes)
@@ -510,6 +519,7 @@ fn bind_frontend(
         if reapi_done {
             stop_api(api_stop, api_serve).await;
         }
+        crate::history::finish(history).await;
         outcome
     };
     let plain = args.plain_text_off_loopback();
@@ -535,15 +545,18 @@ fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Stor
     state.map(|state| Arc::clone(&state.store))
 }
 
-/// `GET /metrics`: what the service counts, in the Prometheus text format.
-fn metrics_route(backend: Backend) -> axum::Router {
+/// `GET /metrics`: what the service counts, in the Prometheus text format, and history's
+/// counters when it keeps history.
+fn metrics_route(backend: Backend, history: Option<Arc<crate::history::Stats>>) -> axum::Router {
     let render = move || {
         let backend = backend.clone();
+        let history = history.clone();
         async move {
-            (
-                [(CONTENT_TYPE, crate::metrics::TEXT_FORMAT)],
-                backend.render_metrics(),
-            )
+            let mut text = backend.render_metrics();
+            if let Some(history) = history {
+                history.render(&mut text);
+            }
+            ([(CONTENT_TYPE, crate::metrics::TEXT_FORMAT)], text)
         }
     };
     axum::Router::new().route("/metrics", get(render))

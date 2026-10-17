@@ -559,6 +559,8 @@ where
     O: ObjectStore + 'static,
 {
     let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
+    let (state, history) = crate::history::take(state);
+    let recording = crate::history::install(recording, history.as_ref());
     let default_memory = listeners.memory_ladder.first();
     let farm = Farm::new(
         Arc::clone(&cache),
@@ -594,7 +596,11 @@ where
     );
     let api_routes = crate::api::router(Arc::clone(&farm), token, Arc::clone(&drain))
         .merge(health_routes)
-        .merge(crate::metrics::router(Arc::clone(&cache), local))
+        .merge(crate::metrics::router(
+            Arc::clone(&cache),
+            local,
+            history.as_ref().map(crate::history::History::stats),
+        ))
         .merge(blob_routes)
         .merge(page_routes);
     // Logged at every start, the first one too (issue #156).
@@ -690,6 +696,7 @@ where
     let serving = async move {
         // A task of its own: applying events never delays the tick or an accept loop,
         // and they never delay it. It stops when the serving future does.
+        let history = crate::history::spawn(history);
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
         // `reapi_server` carries the REAPI TLS configuration when one is given, so
         // the health service is served over the same TLS as the REAPI routes; the
@@ -753,6 +760,7 @@ where
         if reapi_done {
             stop_api(api_stop, api_serve).await;
         }
+        crate::history::finish(history).await;
         outcome
     };
     Ok(Bound {

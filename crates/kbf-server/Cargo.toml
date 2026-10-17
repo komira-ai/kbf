@@ -15,6 +15,7 @@ hex.workspace = true
 futures.workspace = true
 kbf-auth.workspace = true
 kbf-front.workspace = true
+kbf-history.workspace = true
 kbf-invocation.workspace = true
 kbf-log.workspace = true
 kbf-map.workspace = true

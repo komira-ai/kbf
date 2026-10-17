@@ -104,6 +104,7 @@ impl StateStoreUri {
             epoch: self.epoch_policy(),
             // The defaults; a start sets the --member-* flags (`start::with_members`).
             members: MembershipConfig::default(),
+            history: None,
         })
     }
 }
@@ -159,6 +160,9 @@ pub struct StateStore {
     pub epoch: EpochPolicy,
     /// How long storage members live and dwell in the store ([`crate::members`]).
     pub members: MembershipConfig,
+    /// Build history to write, if `--history-objects` names where: it keeps its index
+    /// rows in this store ([`crate::history`]).
+    pub history: Option<crate::history::History>,
 }
 
 #[cfg(test)]

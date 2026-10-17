@@ -1295,3 +1295,43 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
         .unwrap()
         .expect("served");
 }
+
+/// Catches: `--history-objects` taken by a frontend and not wired (a frontend whose
+/// `/metrics` never names history, one that starts over a directory it does not open),
+/// and one taken without the state store its index rows go to: refused before anything
+/// is bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_with_history_serves_its_counters_and_needs_a_state_store() {
+    let dir = scratch_dir("history");
+    let history = dir.join("history");
+    let history_flag = format!("--history-objects=file://{}", history.display());
+    let without = flags(&["--storage=http://127.0.0.1:1", &history_flag]).expect("parses");
+    let refused = start_frontend(&without, || Ok(pending::<()>()))
+        .err()
+        .expect("no state store");
+    assert!(refused.to_string().contains("--state-store"), "{refused}");
+
+    let state = dir.join("state").join("state.db");
+    let state_flag = format!("--state-store=sqlite://{}", state.display());
+    let f = flags(&["--storage=http://127.0.0.1:1", &state_flag, &history_flag]).expect("parses");
+    let front = Front::start(&f).await;
+    assert!(
+        history.join("objects").is_dir(),
+        "the history store is opened"
+    );
+    let mut stream = TcpStream::connect(front.api)
+        .await
+        .expect("connect to the API");
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("send");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.expect("read");
+    let (_, body) = response.split_once("\r\n\r\n").expect("a head and a body");
+    assert!(body.contains("kbf_history_queue_events 0\n"), "{body}");
+    assert!(
+        body.contains("kbf_history_dropped_total{stage=\"queue\"} 0\n"),
+        "{body}"
+    );
+}

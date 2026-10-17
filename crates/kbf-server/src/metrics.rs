@@ -27,6 +27,7 @@ pub const TEXT_FORMAT: &str = "text/plain; version=0.0.4; charset=utf-8";
 struct Sources<M, O> {
     cache: Arc<Cache<M, O>>,
     local: Option<Arc<LocalCache>>,
+    history: Option<Arc<crate::history::Stats>>,
 }
 
 impl<M, O> Clone for Sources<M, O> {
@@ -34,19 +35,29 @@ impl<M, O> Clone for Sources<M, O> {
         Self {
             cache: Arc::clone(&self.cache),
             local: self.local.clone(),
+            history: self.history.clone(),
         }
     }
 }
 
-/// The `/metrics` route over `cache`'s metrics, and `local`'s fill.
-pub fn router<M, O>(cache: Arc<Cache<M, O>>, local: Option<Arc<LocalCache>>) -> Router
+/// The `/metrics` route over `cache`'s metrics, `local`'s fill and, when the server keeps
+/// build history, its counters.
+pub fn router<M, O>(
+    cache: Arc<Cache<M, O>>,
+    local: Option<Arc<LocalCache>>,
+    history: Option<Arc<crate::history::Stats>>,
+) -> Router
 where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
     Router::new()
         .route("/metrics", get(metrics::<M, O>))
-        .with_state(Sources { cache, local })
+        .with_state(Sources {
+            cache,
+            local,
+            history,
+        })
 }
 
 async fn metrics<M, O>(State(sources): State<Sources<M, O>>) -> Response
@@ -57,6 +68,9 @@ where
     let mut text = sources.cache.render_metrics();
     if let Some(local) = sources.local {
         render_fill(&mut text, local.fill());
+    }
+    if let Some(history) = sources.history {
+        history.render(&mut text);
     }
     ([(CONTENT_TYPE, TEXT_FORMAT)], text).into_response()
 }

@@ -245,6 +245,7 @@ impl Disk {
             store,
             epoch,
             members: Default::default(),
+            history: None,
         }))
     }
 
@@ -985,6 +986,7 @@ async fn a_server_binds_over_a_state_store_or_refuses_it() {
         store: disk.store.clone(),
         epoch: EpochPolicy::Keep,
         members: Default::default(),
+        history: None,
     };
     let bind = |state| {
         kbf_server::bind_server_with_state(

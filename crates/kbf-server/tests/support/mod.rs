@@ -256,6 +256,33 @@ impl Cell {
             retention,
             small_ladder(),
             Some(map),
+            None,
+        )
+        .await
+    }
+
+    /// A cell whose scheduler keeps its state in `state` (and writes the build history it
+    /// names, if any), and that serves the operator API without a token: its `/metrics`
+    /// is at [`Cell::api`].
+    pub async fn start_with_state(state: kbf_server::StateStore) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let api = Api {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            token: None,
+            local_cache: None,
+        };
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve_with_map(
+            cache,
+            store,
+            Some(api),
+            None,
+            wait,
+            retention,
+            small_ladder(),
+            None,
+            Some(state),
         )
         .await
     }
@@ -421,7 +448,7 @@ impl Cell {
         ladder: MemoryLadder,
     ) -> Self {
         Self::serve_with_map(
-            cache, store, api_config, raft_dir, wait, retention, ladder, None,
+            cache, store, api_config, raft_dir, wait, retention, ladder, None, None,
         )
         .await
     }
@@ -437,6 +464,7 @@ impl Cell {
         retention: Duration,
         ladder: MemoryLadder,
         map: Option<Arc<dyn kbf_mapsync::MapSource>>,
+        state: Option<kbf_server::StateStore>,
     ) -> Self {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -478,7 +506,7 @@ impl Cell {
                         listeners,
                         server_api,
                         kbf_auth::Policy::allow_all(),
-                        None,
+                        state,
                         map,
                         shutdown,
                     );

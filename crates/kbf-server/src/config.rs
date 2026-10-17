@@ -405,6 +405,9 @@ pub struct Args {
         requires = "state_store"
     )]
     pub member_dwell_secs: u64,
+    /// Build history: `--history-objects` and `--history-index-root`.
+    #[command(flatten)]
+    pub history: crate::history::HistoryFlags,
 }
 
 /// This server in the tier registry. A farm runs one server today
