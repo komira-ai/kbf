@@ -717,7 +717,8 @@ mod tests {
             "-._",
         ] {
             let segment = IndexRoot::segment(text);
-            assert!(!segment.contains('/') && !segment.is_empty(), "{segment}");
+            assert!(!segment.contains('/'), "{segment}");
+            assert!(!segment.is_empty(), "{segment}");
             assert_eq!(IndexRoot::unsegment(&segment).as_deref(), Some(text));
         }
         assert_eq!(IndexRoot::segment(""), "~");
