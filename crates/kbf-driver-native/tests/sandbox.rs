@@ -329,7 +329,7 @@ async fn an_action_writes_inside_its_lease() {
         lease: PathBuf::from("/unused"),
         tmp: PathBuf::from("/unused"),
         domain: String::new(),
-        user: [(); 6].map(|()| PathBuf::from("/unused")),
+        user: [(); 8].map(|()| PathBuf::from("/unused")),
     };
     let script = attempts(&ways, &unused);
     for (seq, network) in [(1, "off"), (2, "on")] {
