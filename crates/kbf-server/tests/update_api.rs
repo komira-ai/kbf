@@ -2,6 +2,8 @@
 //! `GET /v1/update`, `POST /v1/update/desired`, `pause` and `resume`, over real listeners and
 //! the `update/desired` row of a state store.
 
+#[path = "support/hooked.rs"]
+mod hooked;
 mod support;
 
 use std::net::SocketAddr;
@@ -84,6 +86,20 @@ impl Drop for Running {
 
 fn state() -> StateStore {
     state_and_store().0
+}
+
+/// A state over a store the test controls (it can make reads fail or panic).
+fn state_over(store: Arc<dyn Store>) -> StateStore {
+    StateStore {
+        store,
+        epoch: EpochPolicy::Keep,
+        members: MembershipConfig {
+            ttl: Duration::from_secs(30),
+            dwell: Duration::from_secs(120),
+            replication: 1,
+        },
+        history: None,
+    }
 }
 
 /// The state store a server is given, and the same store for the test to write rows into.
@@ -467,4 +483,111 @@ async fn the_policy_row_is_shown_when_it_exists() {
     assert_eq!(view["policy"]["auto_frontend"], false);
     assert_eq!(view["policy"]["lease_limit_secs"], 900);
     assert_eq!(view["policy"]["mac_force_after_secs"], Value::Null);
+}
+
+/// Catches a store that fails turning into an answer that is not a failure: a read that
+/// fails (or panics inside its blocking task) is 500 saying the rows failed, on the view, the
+/// offer and pause, and a policy read that fails after the desired read succeeded is 500
+/// too; nothing is written by the offer that could not read.
+#[tokio::test]
+async fn a_state_store_that_fails_is_a_500_not_an_empty_answer() {
+    let dir = Dir::new();
+    let store =
+        Arc::new(ReleaseStore::open(&dir.0.join("releases"), Limits::default()).expect("open"));
+    let hooked = hooked::Hooked::new();
+    let running = start(Some(store), Some(state_over(hooked.clone())), &dir);
+    put(&running, A, true).await;
+    let fails = |n: usize| {
+        hooked
+            .fail_gets
+            .store(n, std::sync::atomic::Ordering::SeqCst)
+    };
+    fails(1);
+    assert_eq!(
+        http(running.api, "GET", "/v1/update", false, None, b"")
+            .await
+            .0,
+        500
+    );
+    fails(1);
+    assert_eq!(offer(&running, A).await.0, 500);
+    fails(1);
+    let (code, _) = http(running.api, "POST", "/v1/update/pause", true, None, b"").await;
+    assert_eq!(code, 500);
+    // A store whose read panics inside the blocking task: a 500, not a hung request.
+    hooked
+        .panic_gets
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        http(running.api, "GET", "/v1/update", false, None, b"")
+            .await
+            .0,
+        500
+    );
+    // The desired read succeeds and the policy read after it fails.
+    let again = Arc::clone(&hooked);
+    hooked.after_get("update/desired", move || {
+        again
+            .fail_gets
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    assert_eq!(
+        http(running.api, "GET", "/v1/update", false, None, b"")
+            .await
+            .0,
+        500
+    );
+    // Healthy again: nothing was written meanwhile.
+    let (code, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
+    assert_eq!((code, view["desired"].clone()), (200, Value::Null));
+}
+
+/// Catches a release store that cannot be listed answered as an empty or complete list:
+/// with the index directory replaced by a file, the view and the offer are 500 and name no
+/// path.
+#[tokio::test]
+async fn a_release_store_that_cannot_be_listed_is_a_500() {
+    let dir = Dir::new();
+    let releases = dir.0.join("releases");
+    let store = Arc::new(ReleaseStore::open(&releases, Limits::default()).expect("open"));
+    let running = start(Some(store), Some(state()), &dir);
+    std::fs::remove_dir_all(releases.join("index")).expect("remove");
+    std::fs::write(releases.join("index"), b"not a directory").expect("file");
+    let (code, body) = http(running.api, "GET", "/v1/update", false, None, b"").await;
+    assert_eq!(code, 500);
+    assert!(
+        !body.to_string().contains("releases"),
+        "no path leaks: {body}"
+    );
+    assert_eq!(offer(&running, A).await.0, 500);
+}
+
+/// Catches a write that skips the 503 for a missing half: a store but no state store makes
+/// pause 503 naming `--state-store`; a state store but no release store makes the offer 503
+/// naming `--releases-dir`.
+#[tokio::test]
+async fn the_writes_say_which_half_is_missing() {
+    let dir = Dir::new();
+    let store =
+        Arc::new(ReleaseStore::open(&dir.0.join("releases"), Limits::default()).expect("open"));
+    let no_rows = start(Some(store), None, &dir);
+    let (code, body) = http(no_rows.api, "POST", "/v1/update/pause", true, None, b"").await;
+    assert_eq!(code, 503);
+    assert!(
+        body["error"]
+            .as_str()
+            .expect("text")
+            .contains("--state-store"),
+        "{body}"
+    );
+    let no_store = start(None, Some(state()), &dir);
+    let (code, body) = offer(&no_store, A).await;
+    assert_eq!(code, 503);
+    assert!(
+        body["error"]
+            .as_str()
+            .expect("text")
+            .contains("--releases-dir"),
+        "{body}"
+    );
 }

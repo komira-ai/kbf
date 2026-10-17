@@ -112,11 +112,13 @@ fn policy_view(p: &Policy) -> serde_json::Value {
     })
 }
 
-/// Runs a blocking call on the store (the rows block on it).
+/// Runs a blocking call on the store (the rows block on it). A call that panics fails the
+/// request as a store error does.
 async fn blocking<T: Send + 'static>(
     call: impl FnOnce() -> Result<T, RowError> + Send + 'static,
 ) -> Result<T, RowError> {
-    tokio::task::spawn_blocking(call).await.unwrap_or_else(|e| {
+    let joined = tokio::task::spawn_blocking(call).await;
+    joined.unwrap_or_else(|e| {
         Err(RowError::Store(kbf_state::StoreError::Failed(
             e.to_string(),
         )))
