@@ -168,13 +168,15 @@ pub fn echo_with(tcp: TcpIncoming, tls: Option<TlsSource>, handshake: Option<Dur
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
                     };
-                    // Out in two slices, to run the connection's vectored write.
+                    // Out in two parts, to run the connection's plain write and then
+                    // its vectored one.
                     let (head, tail) = buf[..n].split_at(n / 2);
+                    conn.write_all(head).await.expect("write");
                     let wrote = conn
-                        .write_vectored(&[IoSlice::new(head), IoSlice::new(tail)])
+                        .write_vectored(&[IoSlice::new(tail)])
                         .await
-                        .expect("write");
-                    conn.write_all(&buf[wrote..n]).await.expect("write rest");
+                        .expect("write vectored");
+                    conn.write_all(&tail[wrote..]).await.expect("write rest");
                     conn.flush().await.expect("flush");
                 }
             });
