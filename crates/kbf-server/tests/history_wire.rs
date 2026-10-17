@@ -938,15 +938,15 @@ async fn an_s3_history_store_takes_its_key_pair_from_the_environment() {
     let keys = |name: &str| Some(format!("{name}-value"));
     let opened = args.history.open_with(Some(&state), &keys).expect("opens");
     assert!(opened.is_some());
-    // The server reads the key pair from its own environment: with none there, the same
-    // refusal. (With one, the store opens, and this server never starts.)
-    if std::env::var_os("AWS_ACCESS_KEY_ID").is_none() {
-        let refused = args.history.open(Some(&state)).expect_err("no key");
-        assert!(
-            refused.to_string().contains("AWS_ACCESS_KEY_ID"),
-            "{refused}"
-        );
-        // The flags and their error show as what they are.
+
+    // `open` reads the process environment: it opens exactly when that holds the pair.
+    let held = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+        .iter()
+        .all(|name| std::env::var(name).is_ok());
+    let real = args.history.open(Some(&state));
+    assert_eq!(real.is_ok(), held, "{:?}", real.err());
+    // The flags and their error show as what they are.
+    if let Err(refused) = &real {
         let shown = format!("{:?} {refused:?}", args.history.clone());
         assert!(
             shown.contains("history_objects") && shown.contains("Store"),

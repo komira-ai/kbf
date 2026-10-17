@@ -119,14 +119,19 @@ fn bad(name: &str, why: &str) -> Status {
 
 /// An action-cache write refusal as the wire spells it.
 pub(super) fn refusal_of(e: &ActionWriteError) -> Refusal {
-    let (kind, blob) = match e {
-        ActionWriteError::NotDaemon => (refusal::Kind::NotDaemon, None),
-        ActionWriteError::Absent(d) => (refusal::Kind::Absent, Some(to_proto(d))),
-        ActionWriteError::Unreachable(d) => (refusal::Kind::Unreachable, Some(to_proto(d))),
+    let (kind, lacking): (_, &[Digest]) = match e {
+        ActionWriteError::NotDaemon => (refusal::Kind::NotDaemon, &[]),
+        ActionWriteError::Absent(ds) => (refusal::Kind::Absent, ds),
+        ActionWriteError::Unreachable(ds) => (refusal::Kind::Unreachable, ds),
+    };
+    let (blob, more) = match lacking {
+        [first, more @ ..] => (Some(to_proto(first)), more.iter().map(to_proto).collect()),
+        [] => (None, Vec::new()),
     };
     Refusal {
         kind: kind as i32,
         blob,
+        more,
     }
 }
 

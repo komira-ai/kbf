@@ -12,9 +12,8 @@ use futures::StreamExt as _;
 use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
-    ByteStreamService, CONNECTION_WINDOW_BYTES, Cache, CasService, Connections,
-    MAX_CONCURRENT_STREAMS, MAX_MESSAGE_BYTES, MetaLog, RECORDER_CHANNEL, Recorder,
-    RequestMetadataLayer, STREAM_WINDOW_BYTES, SegmentsConfig, SegmentsService,
+    ByteStreamService, Cache, CasService, Connections, MAX_MESSAGE_BYTES, MetaLog,
+    RECORDER_CHANNEL, Recorder, RequestMetadataLayer, SegmentsConfig, SegmentsService,
 };
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
@@ -24,9 +23,11 @@ use kbf_proto::worker::segments_server::SegmentsServer;
 use kbf_proto::worker::worker_server::WorkerServer;
 use kbf_sched::MemoryLadder;
 use kbf_storage::service::Admission;
+use kbf_tls::{Incoming, TlsSource};
 use tonic::service::Routes;
+use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
-use tonic::transport::{Server, ServerTlsConfig};
+use tower_layer::{Identity, Stack};
 
 use crate::blobs::{WorkerBlobs, WorkerCas, WorkerSegments};
 use crate::drain::Drain;
@@ -39,8 +40,10 @@ use crate::identity::{DenyList, Peers};
 use crate::members::{Members, MembershipError};
 use crate::members_rpc::MembershipService;
 use crate::state_store::StateStore;
+use crate::streams::{StreamLimits, flow_windows};
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
+use crate::worker_roles::WorkerRolesLayer;
 use kbf_mapsync::MapSource;
 use kbf_proto::kbf::map::v1::membership_server::MembershipServer;
 
@@ -49,12 +52,14 @@ use kbf_proto::kbf::map::v1::membership_server::MembershipServer;
 pub struct Listeners {
     /// The REAPI listener (clients: buck2, Bazel).
     pub reapi: SocketAddr,
-    /// TLS for the REAPI listener (a server certificate; clients present none). `None`
-    /// serves it in plain text, on whatever address `reapi` names (nothing refuses a
-    /// bind off loopback; the binary's start line warns about one).
-    pub reapi_tls: Option<ServerTlsConfig>,
-    /// The `kbf.worker.v1` listener (daemons): their worker streams, and `ByteStream`
-    /// for their blobs ([`crate::blobs`]).
+    /// TLS for the REAPI listener (a server certificate; clients present none), re-read
+    /// from its files as they change. `None` serves it in plain text, on whatever
+    /// address `reapi` names (nothing refuses a bind off loopback; the binary's start
+    /// line warns about one).
+    pub reapi_tls: Option<TlsSource>,
+    /// The `kbf.worker.v1` listener: daemons' worker streams and blob calls
+    /// ([`crate::blobs`]), and storage nodes' `kbf.map.v1.Membership` calls; who may
+    /// call which method is [`crate::worker_roles`]'s table.
     pub worker: SocketAddr,
     /// Mutual TLS for the worker listener; `None` serves it in plain text, where no
     /// node is bound to a certificate and every blob call is refused.
@@ -94,6 +99,9 @@ pub struct Listeners {
     /// The worker listener's segment uploads (`--segment-upload-*`;
     /// `docs/design/write-path.md`, section 4).
     pub segments: SegmentsConfig,
+    /// The most HTTP/2 streams one connection may have open on each listener
+    /// (`--reapi-max-streams`, `--worker-max-streams`).
+    pub stream_limits: StreamLimits,
 }
 
 /// What keeps a long-lived stream from looking idle to a load balancer, a proxy or the
@@ -130,8 +138,9 @@ const CLOSE_GRACE: Duration = Duration::from_secs(2);
 /// (see [`crate::identity`]).
 #[derive(Clone, Debug)]
 pub struct WorkerTls {
-    /// The listener's identity and the client CA daemons' certificates chain to.
-    pub server: ServerTlsConfig,
+    /// The listener's identity and the client CA daemons' certificates chain to, both
+    /// re-read from their files as they change.
+    pub server: TlsSource,
     /// The certificates and nodes refused, read again at every check.
     pub deny_list: Option<DenyList>,
 }
@@ -262,33 +271,61 @@ pub(crate) fn bind_api(
     bound.map_err(|source| ServeError::Bind { addr, source })
 }
 
-/// The worker listener's TLS and the way its peers are told apart. Not generic, so
-/// both arms are one set of lines whatever the cache types (a per-instantiation copy
-/// that misses one arm would count as missed lines).
+/// The worker listener's server: every call goes through the per-method role table
+/// ([`crate::worker_roles`]) before it is routed.
+pub(crate) type WorkerListener = Server<Stack<WorkerRolesLayer, Identity>>;
+
+/// The worker listener's role table, its TLS source, and the way its peers are told
+/// apart. Every worker listener is made here, so none serves a call the table does not
+/// list. Not generic, so both arms are one set of lines whatever the cache types (a
+/// per-instantiation copy that misses one arm would count as missed lines).
 pub(crate) fn worker_peers(
     server: Server,
     tls: Option<WorkerTls>,
-) -> Result<(Server, Peers), ServeError> {
-    Ok(match tls {
+) -> (WorkerListener, Peers, Option<TlsSource>) {
+    match tls {
         Some(tls) => (
-            server.tls_config(tls.server)?,
+            server.layer(WorkerRolesLayer::new(Admission::Certified)),
             Peers::Certified {
                 deny_list: tls.deny_list,
             },
+            Some(tls.server),
         ),
-        None => (server, Peers::Unauthenticated),
+        None => (
+            server.layer(WorkerRolesLayer::new(Admission::Open)),
+            Peers::Unauthenticated,
+            None,
+        ),
+    }
+}
+
+/// The accepted connections of the worker listener, each registered in `connections`
+/// until it closes, so an upload is dropped when the connection that began it closes.
+/// Not generic, for the same reason as [`worker_peers`].
+pub(crate) fn tracked(
+    incoming: Incoming,
+    connections: Connections,
+) -> impl futures::Stream<Item = std::io::Result<kbf_front::Tracked<kbf_tls::Conn>>> {
+    incoming.map(move |accepted| {
+        accepted.map(|conn| {
+            let peer = conn.remote_addr();
+            connections.track_peer(conn, peer)
+        })
     })
 }
 
-/// `server` with the HTTP/2 limits both listeners state rather than leave to the
-/// transport's defaults: they bound what is held outside `--write-bytes-in-flight`, and
-/// the connection window is what lets a Write admitted after others finish at all
-/// (`kbf_front::CONNECTION_WINDOW_BYTES`).
-pub(crate) fn flow_control(server: Server) -> Server {
+/// `server` with the HTTP/2 limits a listener states rather than leaves to the
+/// transport's defaults: at most `max_streams` open streams per connection (each
+/// listener its own, [`StreamLimits`]), and the stream and connection windows
+/// ([`flow_windows`]), which bound what is held outside `--write-bytes-in-flight`. The
+/// connection window holds every stream's window at once, which is what lets a Write
+/// admitted after others finish at all.
+pub(crate) fn flow_control(server: Server, max_streams: u32) -> Server {
+    let windows = flow_windows(max_streams);
     server
-        .max_concurrent_streams(Some(MAX_CONCURRENT_STREAMS))
-        .initial_stream_window_size(Some(STREAM_WINDOW_BYTES))
-        .initial_connection_window_size(Some(CONNECTION_WINDOW_BYTES))
+        .max_concurrent_streams(Some(windows.streams))
+        .initial_stream_window_size(Some(windows.stream))
+        .initial_connection_window_size(Some(windows.connection))
 }
 
 /// `server` pinging a quiet connection every `timing.keepalive_interval` and closing it
@@ -596,6 +633,22 @@ where
     let farm = Arc::new(farm.with_state(state)?);
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
+    let peers_certified = listeners.worker_tls.is_some();
+    let (mut worker_server, peers, worker_tls) = worker_peers(
+        keepalive(
+            flow_control(Server::builder(), listeners.stream_limits.worker),
+            listeners.streams,
+        ),
+        listeners.worker_tls,
+    );
+    let tls_sources: Vec<TlsSource> = listeners
+        .reapi_tls
+        .iter()
+        .chain(&worker_tls)
+        .cloned()
+        .collect();
+    let reapi_incoming = Incoming::new(reapi_incoming, listeners.reapi_tls);
+    let worker_incoming = Incoming::new(worker_incoming, worker_tls);
     let probe_timeout = listeners.store_probe_timeout;
     let (api_listen, token, local) = api.map_or((None, None, None), |api| {
         (Some(api.listen), api.token, api.local_cache)
@@ -616,27 +669,29 @@ where
         InvocationReaders::from_policy(&policy),
         history.as_ref().map(crate::history::History::reads),
     );
-    let api_routes = crate::api::router(Arc::clone(&farm), token, Arc::clone(&drain))
-        .merge(health_routes)
-        .merge(crate::metrics::router(
-            Arc::clone(&cache),
-            local,
-            history.as_ref().map(crate::history::History::stats),
-        ))
-        .merge(blob_routes)
-        .merge(page_routes);
+    let api_routes = crate::api::router(
+        Arc::clone(&farm),
+        token,
+        Arc::clone(&drain),
+        members.clone(),
+    )
+    .merge(health_routes)
+    .merge(crate::metrics::router(
+        Arc::clone(&cache),
+        local,
+        history.as_ref().map(crate::history::History::stats),
+        tls_sources,
+    ))
+    .merge(blob_routes)
+    .merge(page_routes);
     // Logged at every start, the first one too (issue #156).
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     log_state(durable, term, epoch);
 
-    let mut reapi_server = keepalive(flow_control(Server::builder()), listeners.streams);
-    if let Some(tls) = listeners.reapi_tls {
-        reapi_server = reapi_server.tls_config(tls)?;
-    }
-    let mut worker_server = keepalive(flow_control(Server::builder()), listeners.streams);
-    let peers_certified = listeners.worker_tls.is_some();
-    let peers;
-    (worker_server, peers) = worker_peers(worker_server, listeners.worker_tls)?;
+    let mut reapi_server = keepalive(
+        flow_control(Server::builder(), listeners.stream_limits.reapi),
+        listeners.streams,
+    );
     let worker_blobs = ByteStreamServer::new(WorkerBlobs::new(
         ByteStreamService::new(Arc::clone(&cache)),
         peers.clone(),
@@ -653,8 +708,7 @@ where
     // connection that began it closes.
     let connections = Connections::new();
     let tracking = connections.clone();
-    let worker_incoming =
-        worker_incoming.map(move |accepted| accepted.map(|stream| tracking.track(stream)));
+    let worker_incoming = tracked(worker_incoming, tracking);
     let worker_segments = SegmentsServer::new(WorkerSegments::new(
         SegmentsService::new(Arc::clone(&cache), listeners.segments, connections),
         peers.clone(),
@@ -720,9 +774,9 @@ where
         // and they never delay it. It stops when the serving future does.
         let history = crate::history::spawn(history);
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
-        // `reapi_server` carries the REAPI TLS configuration when one is given, so
-        // the health service is served over the same TLS as the REAPI routes; the
-        // authenticator is already applied to those routes alone (above).
+        // `reapi_incoming` carries the REAPI TLS when there is any, so the health
+        // service is served over the same TLS as the REAPI routes; the authenticator is
+        // already applied to those routes alone (above).
         let reapi_serve = reapi_server
             .add_routes(reapi_routes)
             .serve_with_incoming_shutdown(reapi_incoming, async {
@@ -801,10 +855,11 @@ where
 pub struct StorageListener {
     /// The listener.
     pub listen: SocketAddr,
-    /// Mutual TLS (the server's identity and the client CA); `None` serves plain text,
-    /// where no caller has a role and every call is admitted (`kbf storage` builds this
-    /// only for a loopback address: [`crate::storage_node::StorageFlags::listener`]).
-    pub tls: Option<ServerTlsConfig>,
+    /// Mutual TLS (the server's identity and the client CA), re-read from its files as
+    /// they change; `None` serves plain text, where no caller has a role and every call
+    /// is admitted (`kbf storage` builds this only for a loopback address:
+    /// [`crate::storage_node::StorageFlags::listener`]).
+    pub tls: Option<TlsSource>,
     /// What the service keeps.
     pub service: kbf_storage::service::Config,
 }
@@ -832,9 +887,11 @@ pub struct BoundStorage<F> {
 /// CAS `FindMissingBlobs`, `Segments` and the action store, on one listener, each call
 /// admitted by the role in the caller's certificate when there is mutual TLS.
 ///
+/// With TLS, call it inside a Tokio runtime: the task that looks at the TLS files starts
+/// here ([`Incoming::new`]).
+///
 /// # Errors
-/// The listener cannot be bound, or the TLS configuration is refused (a key that does
-/// not match its certificate, say).
+/// The listener cannot be bound.
 pub fn bind_storage(
     storage: Arc<dyn kbf_storage::Storage>,
     listener: StorageListener,
@@ -860,17 +917,45 @@ pub fn bind_storage_gated(
     maps: Option<Arc<kbf_mapsync::MapHolder>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
+    bind_storage_shared(storage, listener, maps, shutdown).map(|(bound, _)| bound)
+}
+
+/// [`bind_storage_gated`], and the [`kbf_storage::service::InProcess`] view of the very
+/// service the listener serves: a caller in this process (the daemon half of
+/// `kbf storage-and-daemon`) reaches the node through it and takes the path a call over
+/// the listener takes, not the inner storage.
+///
+/// # Errors
+/// As [`bind_storage`].
+pub fn bind_storage_shared(
+    storage: Arc<dyn kbf_storage::Storage>,
+    listener: StorageListener,
+    maps: Option<Arc<kbf_mapsync::MapHolder>>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<
+    (
+        BoundStorage<impl Future<Output = Result<(), ServeError>>>,
+        kbf_storage::service::InProcess,
+    ),
+    ServeError,
+> {
     let (incoming, addr) = bind(listener.listen)?;
-    let mut server = flow_control(Server::builder());
-    let admission = match listener.tls {
-        Some(tls) => {
-            server = server.tls_config(tls)?;
-            kbf_storage::service::Admission::Certified
-        }
-        None => kbf_storage::service::Admission::Open,
+    let server = flow_control(
+        Server::builder(),
+        crate::streams::StreamLimits::DEFAULT.worker,
+    );
+    let admission = if listener.tls.is_some() {
+        kbf_storage::service::Admission::Certified
+    } else {
+        kbf_storage::service::Admission::Open
     };
-    let routes =
-        kbf_storage::service::StorageService::new(storage, admission, listener.service).routes();
+    let incoming = Incoming::new(incoming, listener.tls);
+    let service = Arc::new(kbf_storage::service::StorageService::new(
+        storage,
+        admission,
+        listener.service,
+    ));
+    let (routes, in_process) = (service.shared_routes(), service.in_process());
     let gate = tonic::service::InterceptorLayer::new(map_gate(maps));
     let serving = async move {
         server
@@ -880,5 +965,5 @@ pub fn bind_storage_gated(
             .await
             .map_err(ServeError::from)
     };
-    Ok(BoundStorage { addr, serving })
+    Ok((BoundStorage { addr, serving }, in_process))
 }

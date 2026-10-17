@@ -11,6 +11,8 @@
 //!   `/readyz`, and exits once its open streams are done.
 //! - `kbf cluster undrain <node>`: `POST /v1/nodes/<node>:uncordon`. A frontend drain
 //!   is not undone (the REAPI listener has said GOAWAY): restart it.
+//! - `kbf cluster member <id> --state active|draining`: `POST /v1/members/<id>`, sets a
+//!   storage member's state; this is how a `joining` member is promoted.
 //!
 //! Writes need `--token-file`, the token file the server was started with. The API
 //! answers writes from loopback only, so this runs on the frontend's own host. Exit 0
@@ -22,7 +24,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use kbf_server::api::{FRONTEND_DRAIN, NODES};
 use kbf_server::api_client::{ClientError, OperatorClient, Reply};
 
@@ -38,6 +40,15 @@ pub struct Cluster {
     pub api: SocketAddr,
     #[command(subcommand)]
     pub verb: Verb,
+}
+
+/// The states `kbf cluster member` sets: the ones the API accepts.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberState {
+    /// A full owner of its ranks.
+    Active,
+    /// Takes no new writes.
+    Draining,
 }
 
 /// What `kbf cluster` does.
@@ -71,6 +82,17 @@ pub enum Verb {
     Undrain {
         /// The node.
         node: String,
+        /// The file holding the server's operator API token.
+        #[arg(long, value_name = "FILE")]
+        token_file: PathBuf,
+    },
+    /// Set a storage member's state (see `GET /v1/members` for the ids).
+    Member {
+        /// The member id the store assigned at registration.
+        id: u64,
+        /// The state to set. `active` promotes a joining member to a full owner.
+        #[arg(long, value_enum)]
+        state: MemberState,
         /// The file holding the server's operator API token.
         #[arg(long, value_name = "FILE")]
         token_file: PathBuf,
@@ -110,6 +132,16 @@ impl Verb {
             Self::Undrain { node, .. } => {
                 Call::Post(kbf_server::api::node_path(node, "uncordon"), String::new())
             }
+            Self::Member { id, state, .. } => {
+                let state = match state {
+                    MemberState::Active => "active",
+                    MemberState::Draining => "draining",
+                };
+                Call::Post(
+                    format!("/v1/members/{id}"),
+                    format!("{{\"state\":\"{state}\"}}"),
+                )
+            }
         }
     }
 
@@ -118,7 +150,9 @@ impl Verb {
     pub fn token_file(&self) -> Option<&PathBuf> {
         match self {
             Self::Status { .. } => None,
-            Self::Drain { token_file, .. } | Self::Undrain { token_file, .. } => Some(token_file),
+            Self::Drain { token_file, .. }
+            | Self::Undrain { token_file, .. }
+            | Self::Member { token_file, .. } => Some(token_file),
         }
     }
 }

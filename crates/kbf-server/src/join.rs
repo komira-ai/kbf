@@ -7,6 +7,9 @@
 //! says which generation the node holds is answered with the map when the frontend's is
 //! newer. Each goes into the node's [`MapHolder`] (which keeps the newest and never goes
 //! back), so a node learns every bump from its own beat, with no push to lose.
+//! Every call says whether the node is still rebuilding its index ([`CatchUp`], the state
+//! its storage service reads): a node that registers while rebuilding enters the map as
+//! `CatchingUp`, and the first heartbeat after [`CatchUp::finish`] makes it `Active`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +18,7 @@ use kbf_map::Map;
 use kbf_mapsync::MapHolder;
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
+use kbf_storage::service::CatchUp;
 use tonic::transport::Channel;
 use tonic::{Code, Status};
 
@@ -63,18 +67,20 @@ pub struct Joiner {
     client: MembershipClient<Channel>,
     identity: Identity,
     retry: Duration,
+    catch_up: CatchUp,
     maps: Arc<MapHolder>,
 }
 
 impl Joiner {
     /// A joiner that calls `channel` as `identity`, waiting `retry` after the first
-    /// failure.
+    /// failure, for a node whose index is whole.
     #[must_use]
     pub fn new(channel: Channel, identity: Identity, retry: Duration) -> Self {
         Self {
             client: MembershipClient::new(channel),
             identity,
             retry,
+            catch_up: CatchUp::caught_up(),
             maps: Arc::new(MapHolder::new()),
         }
     }
@@ -103,6 +109,14 @@ impl Joiner {
         }
     }
 
+    /// The joiner of a node whose index may be being rebuilt: every call reports what
+    /// `catch_up` says at the time.
+    #[must_use]
+    pub fn with_catch_up(mut self, catch_up: CatchUp) -> Self {
+        self.catch_up = catch_up;
+        self
+    }
+
     /// Registers once.
     ///
     /// # Errors
@@ -118,6 +132,7 @@ impl Joiner {
                 weight: who.weight,
                 zone: who.zone.clone(),
                 protocol: PROTOCOL,
+                catching_up: self.catch_up.is_catching_up(),
             })
             .await?
             .into_inner();
@@ -142,6 +157,7 @@ impl Joiner {
                 member_id: joined.member_id,
                 boot: joined.boot,
                 have_generation: self.maps.generation(),
+                catching_up: self.catch_up.is_catching_up(),
             })
             .await?
             .into_inner();

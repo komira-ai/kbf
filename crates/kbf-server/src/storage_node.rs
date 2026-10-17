@@ -49,7 +49,8 @@ use kbf_objstore::{KeyPrefix, ObjectStore};
 use kbf_store::StdFs;
 use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
-use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig};
+use kbf_tls::{TlsFiles, TlsSource};
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 use crate::join::{self, Joiner};
 use crate::serve::{ServeError, StorageListener, bind_storage_gated};
@@ -78,6 +79,7 @@ pub const ALLOWED: &[&str] = &[
     "write_linger",
     "write_own_segment_bytes",
     "write_bytes_in_flight",
+    "tls_reload_interval_secs",
     "write_puts_in_flight",
     "store_put_attempts",
 ];
@@ -264,14 +266,15 @@ impl StorageFlags {
     pub fn listener(&self) -> Result<StorageListener, ConfigError> {
         self.server.segment_upload_fits_write_bound()?;
         let tls = match &self.tls {
-            Some([cert, key, ca]) => Some(
-                ServerTlsConfig::new()
-                    .identity(Identity::from_pem(
-                        crate::config::read(cert)?,
-                        crate::config::read(key)?,
-                    ))
-                    .client_ca_root(Certificate::from_pem(crate::config::read(ca)?)),
-            ),
+            Some([cert, key, ca]) => Some(TlsSource::files(
+                "storage",
+                TlsFiles {
+                    cert: cert.clone(),
+                    key: key.clone(),
+                    client_ca: Some(ca.clone()),
+                },
+                Duration::from_secs(self.server.tls_reload_interval_secs),
+            )?),
             None if crate::config::loopback_only(self.listen.ip()) => None,
             None => {
                 return Err(ConfigError::PlaintextStorageOffLoopback { addr: self.listen });
@@ -285,6 +288,13 @@ impl StorageFlags {
                     .unwrap_or(u32::MAX),
             },
         })
+    }
+
+    /// The address the node registers under, and so the one its member of the map
+    /// carries: `--advertise-addr`, or the address it `bound`.
+    #[must_use]
+    pub fn registers_as(&self, bound: SocketAddr) -> String {
+        self.advertise.clone().unwrap_or_else(|| bound.to_string())
     }
 
     /// The registration with `--frontend`, for a node bound at `bound`, keeping the maps it
@@ -310,7 +320,7 @@ impl StorageFlags {
                 .ca_certificate(Certificate::from_pem(crate::config::read(ca)?));
             endpoint = endpoint.tls_config(tls)?;
         }
-        let addr = self.advertise.clone().unwrap_or_else(|| bound.to_string());
+        let addr = self.registers_as(bound);
         let identity = join::Identity {
             instance_id: addr.clone(),
             addr,

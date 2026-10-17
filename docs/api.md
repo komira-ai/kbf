@@ -23,7 +23,7 @@ reports again after its next `Welcome`.
 
 ## Who may write
 
-A write (cordon, drain, uncordon) can take every node in the fleet out of service, so
+A write (cordon, drain, uncordon, a member's state) can take every node in the fleet out of service, so
 it must come from an operator. Where a request comes from does not show that:
 
 - **Every server host is also a worker.** Build actions run on it, and they can reach
@@ -143,6 +143,55 @@ or not, could run, and the time spent waiting for a cordon does not count toward
 A server restart forgets every cordon, as it forgets the rest of the scheduler's
 state, and every start logs a warning that says so. The protocol has no drain
 message yet: the daemon is not told, and the server simply sends it no new `Start`.
+
+## `POST /v1/members/{id}`
+
+An operator sets a storage member's state. The body is `{"state": "active"}` or
+`{"state": "draining"}`; the answer is `{"id": N, "state": "...", "generation": G}`,
+the map's generation after the change. `down` is the store's verdict, `catching_up` is what a registration says and `joining` is
+the join handoff's, so none of them is accepted (`400`, as is
+any other body). `404` for an id that has no live row (it expired, or never
+registered) or is not a number, or on a server without a state store; `503` when the
+state store cannot be written; `401`, `403` or `415` from the gates of
+[Who may write](#who-may-write), the same gates as the node writes. Nothing is changed
+by a refused request.
+
+When a member becomes `active` the cluster also records that it has formed (see below),
+in the same transaction.
+
+**When a member is `active` without this call.** A registration that says the node's
+index is whole enters `active`, in a fresh cluster and in a formed one alike: it is the
+first start of a cluster, or a restart of a node whose meta log already has its rebuild,
+so a rolling restart leaves every member `active`. The registration also writes the
+`meta/members_formed` mark. A registration that says the node is rebuilding its index
+enters `catching_up` and becomes `active` by its own first beat that says it is done. No
+registration writes `joining`; that state is set by the join handoff in code
+(`Members::set_state`), and a `joining` member is promoted by this call.
+
+**The risk of promoting a joiner.** `active` makes the member a settled owner: it
+takes the rank-1 slots of the digests it wins in the rendezvous order, and it is read
+in rank order. Nothing here copies the blobs of that slice to it (the join handoff,
+`architecture-v2.md` section 8.4, is not built). What the router does about it, from
+`kbf-route`'s read walk and `kbf-map`'s `read_order_with_previous`:
+
+- A read that gets `NotFound` from an owner goes on to the next owner in the read
+  order, and the answer is `NotFound` only if every owner said so. So a promoted
+  joiner that lacks a blob costs one extra round trip per read of it, not a failed
+  read.
+- That holds only while an owner that has the blob is still in the list. The list is
+  this generation's top `r` settled owners, then the write owners not yet listed, then
+  the previous generation's list: one generation back, no more. A joiner that wins a
+  digest's top `r` pushes an old copy-holder out of it, and once the map moves on
+  again (any member change bumps the generation) that holder is in no list: the blob
+  is read as missing, and the action is rebuilt or the upload repeated.
+- Writes of that slice go to the joiner as primary (the chain head and the
+  `FindMissing` target): it reports every blob it has not seen as missing, so
+  uploads that were deduplicated are sent again until the slice fills.
+
+So promote a joiner when its slice is expected to be empty or its blobs are cheap to
+rebuild (a new cluster, a cache), or have it hold the slice first; and promote one
+member at a time. `draining` is the reverse: the member takes no new writes, its
+successor takes its slot at once, and it is read first.
 
 ## `GET /v1/frontend/drain` and `POST /v1/frontend/drain`
 
@@ -298,6 +347,8 @@ caller goes away before the answer counts as an error.
 | `kbf_store_blobs_seconds` | histogram | one store of verified blobs (a Write's, or a batch's): the query for blobs already held, their touch, and the wait until every segment holding its blobs is written: the linger, the wait for a PUT slot, each PUT attempt with the backoff between attempts, the footer read, and the commit with any wait behind commits queued ahead of it |
 | `kbf_segment_put_seconds` | histogram | one PUT attempt of a segment's object; a PUT tried again is observed once per attempt |
 | `kbf_segment_footer_read_seconds` | histogram | one segment's footer read back after its PUT: two range GETs, the trailer and then the footer |
+| `kbf_tls_reloads_total{listener,outcome}` | counter | looks at a TLS listener's files (`reapi`, `worker`; [renewal](deploy/tls-renewal.md)): `applied` (new files now serve new handshakes), `rejected` (changed but unusable: the previous files keep serving; the reason is in the log) and `unchanged`; only for a listener with TLS |
+| `kbf_tls_leaf_not_after_seconds{listener}` | gauge | when the certificate the listener serves stops being valid, in seconds since the epoch; alert on it well before it passes |
 | `kbf_segment_commit_seconds` | histogram | one segment's `PutBlobs` commit to the metadata log, including any wait behind commits queued ahead of it |
 | `kbf_segment_blobs`, `kbf_segment_bytes` | histogram | blobs, and bytes (footer included), per segment written |
 | `kbf_object_get_seconds` | histogram | one range GET of a blob being read (ByteStream Read, GetActionResult, a BatchReadBlobs run); footer reads are not in it |
@@ -312,6 +363,7 @@ caller goes away before the answer counts as an error.
 | `kbf_input_directories_cached_total` | counter | Directories the input check took from the decoded-directory cache: the blob is touched and its presence checked, nothing is read |
 | `kbf_input_directories_skipped_total` | counter | Directories skipped with everything under them: an earlier check verified them and the retention guarantee of that check still runs |
 | `kbf_input_directories_joined_total` | counter | Directories found being checked for another request, and waited for |
+| `kbf_cache_lost_blobs`, `kbf_cache_blob_losses_total` | gauge, counter | blobs whose only copy was in a block on a write tier that is gone before the flusher put it in the store (the tier abandoned with `--hot-store-abandon`, the block missing or short at a start, or its bytes failing their digest): lost now, and ever. A lost blob is `UNAVAILABLE`, FindMissingBlobs lists it, an action-cache entry naming it is a miss, and a re-upload takes it off the gauge ([architecture-v2.md](design/architecture-v2.md#8-storage), Loss marks). Read from the metadata state at the scrape; left out of a scrape the metadata log cannot answer |
 
 Latency buckets run from 1 ms to 60 s; size buckets from 1 KiB to 1 GiB by fours;
 the blobs-per-segment buckets from 1 to 16384 by fours.
@@ -669,12 +721,16 @@ quote, a `;` or a line break in it can never end the value or add a parameter. W
 `filename*`), for a blob of at most 4 MiB (4194304 bytes); a larger one is `400`, and
 still downloads without `inline`.
 
-**Memory.** Like a ByteStream Read, a read holds the whole blob in memory, because the
-cache keeps one digest per blob and can check only all of it; a second read to stream
-from would send bytes nobody checked. So the route keeps a budget: the blobs of all the
-answers it is reading or still sending hold at most 1 GiB (1073741824 bytes, the largest
-blob the cache accepts) at once. An answer gives its share back when its bytes have
-been sent or dropped (the client went away), and a failed read gives it back at once.
+**Memory.** Like a ByteStream Read, a read holds one window of its blob at a time
+(8 MiB, `READ_WINDOW_BYTES`; a smaller blob, its size). Every byte of the blob is
+hashed, the bytes before a range and after it too, and the last window is sent only
+once the digest checked: a blob of one window is checked whole before a byte is sent,
+and one that fails is an error answer; a larger blob whose bytes fail ends its body
+early (the connection is cut), and the client must not take what it got for the blob.
+The route keeps a budget: the windows of all the answers it is reading or still sending
+hold at most 1 GiB (1073741824 bytes) at once. An answer gives its share back when its
+body has been sent or dropped (the client went away), and a failed read gives it back at
+once.
 
 - **Waiting.** A read whose blob does not fit in what is left waits in line, first come
   first served, before a byte is read: a large read at the head of the line is not
@@ -682,9 +738,8 @@ been sent or dropped (the client went away), and a failed read gives it back at 
   they wait while it does). A read still waiting after 10 seconds is `503` with
   `Retry-After: 1` and the body `{"error": "<why>", "busy": true}`; a blob that cannot
   be read is `503` without either, so a client can tell busy from broken.
-- **Too large.** A digest that claims more than 1 GiB is `404` at once, with the limit
-  in the error: the cache refuses such a blob on write, so it never holds one, and no
-  retry can change that. ByteStream Read answers the same digest `NOT_FOUND`.
+- **Any size.** No blob is too large to read. A blob not held is `404` before it waits,
+  whatever size its digest claims.
 - **Slow clients.** A client holds its blob's share until its answer is sent or it goes
   away; the listener has no write timeout.
 
@@ -705,7 +760,7 @@ ignored, as RFC 9110 allows, and the whole blob is sent. Every `200` and `206` s
 | `400` | a malformed digest or query, or `inline=text` for a blob over 4 MiB |
 | `401` | the authentication policy refuses the request |
 | `403` | `blobs.getAuthorizer` refuses the instance name |
-| `404` | the route is off, the blob is not held, or the digest claims more than 1 GiB |
+| `404` | the route is off, or the blob is not held |
 | `416` | the range starts past the end |
 | `503` | busy: the blob's share of the memory budget was not free within 10 seconds (`Retry-After: 1`, `"busy": true`); or the blob is held but its bytes cannot be read (missing from the store, or failing their digest), or the store or the metadata log does not answer |
 | `500` | the cache's own records disagree |
@@ -751,6 +806,26 @@ runs the call again, once. A second `STALE_MAP`, or a fetch that brings no newer
 treated as `UNAVAILABLE`. `UNAVAILABLE` for a caller ahead of the node is the node's
 lost push: the caller's map may be the right one, so the caller tries again, and the
 node's next push makes the call succeed.
+
+## `UNAVAILABLE` from a storage node that is catching up
+
+Also gRPC, not HTTP. A storage node that is rebuilding its index (it registered with
+`catching_up` set in `kbf.map.v1.RegisterRequest`, and is `CATCHING_UP` in the map) may
+hold a blob it has not indexed yet, so it never answers that something is missing:
+
+| call | while catching up |
+|---|---|
+| `ByteStream.Read` of a blob it does not find | `UNAVAILABLE`, not `NOT_FOUND` |
+| `FindMissingBlobs` with any digest it does not find | the whole call `UNAVAILABLE` (an answer naming fewer digests would say the rest are held) |
+| `ActionStore.Get` with no entry | `UNAVAILABLE`, not an empty answer |
+| `ActionStore.Prepare` or `Commit` refused for a closure blob it does not find | `UNAVAILABLE`, not the `ABSENT` refusal |
+
+Every other answer is the usual one: hits are served, writes are taken, and the other
+refusals stand. The message begins `catching up:`; it is words for a log and is never
+matched. A caller treats the node as an owner that could not say, and asks the next owner
+(a router answers `NOT_FOUND` only if every owner did). The node stops at the first
+heartbeat after its rebuild that sends `catching_up` false: the frontend makes it `ACTIVE`
+in the next map generation.
 
 ## Planned
 
