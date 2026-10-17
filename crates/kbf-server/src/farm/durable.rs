@@ -779,15 +779,12 @@ impl State {
                 let held: usize = self.unwritten.iter().map(VecDeque::len).sum();
                 if held > 0 {
                     self.write_drops += held as u64;
-                    tracing::error!(
-                        held,
-                        "a newer writer holds the state store: held-back effects dropped"
-                    );
+                    tracing::error!(held, "a newer writer holds the store: held effects dropped");
                 }
                 self.unwritten.clear();
                 self.parked.clear();
                 self.undone.clear();
-                self.retrying = false;
+                self.retrying = None;
                 return ready;
             }
             let Some(front) = self.unwritten.front() else {
@@ -800,7 +797,7 @@ impl State {
             let mut attempt = self.attempt("a committed record", |d| {
                 d.persist(std::slice::from_ref(&effect))
             });
-            if attempt == Attempt::Stale && self.retrying {
+            if attempt == Attempt::Stale && self.retrying.as_ref() == Some(&effect) {
                 // An earlier try of this very write was refused as unreachable; the
                 // store may have applied it all the same, and then the rows it
                 // depends on are gone. Its work is done: carry the effect out.
@@ -809,38 +806,38 @@ impl State {
             }
             match attempt {
                 Attempt::Taken => {
-                    self.retrying = false;
-                    if let Some(batch) = self.unwritten.front_mut() {
-                        batch.pop_front();
-                    }
+                    self.retrying = None;
+                    self.unwritten.front_mut().and_then(VecDeque::pop_front);
                     ready.push(effect);
                 }
                 Attempt::Transient => {
-                    self.retrying = true;
+                    self.retrying = Some(effect);
                     let held: usize = self.unwritten.iter().map(VecDeque::len).sum();
                     tracing::warn!(
                         held,
-                        "the state store holds back committed records; written again at the next input"
+                        "the state store holds back records; written again later"
                     );
                     return ready;
                 }
                 Attempt::Stale | Attempt::Dropped => {
-                    self.retrying = false;
+                    self.retrying = None;
                     self.write_drops += 1;
                     tracing::error!("a committed record's remaining effects were dropped");
-                    for dropped in self.unwritten.pop_front().into_iter().flatten() {
-                        self.forget_parked(&dropped);
-                    }
+                    self.unwritten.pop_front();
+                    self.forget_parked();
                 }
             }
         }
     }
 
-    /// Forgets the detail kept for the answer in `effect`, if it is one.
-    fn forget_parked(&mut self, effect: &Effect) {
-        if let Effect::Answer(answer) = effect {
-            self.parked.remove(&answer.lease);
-        }
+    /// Forgets the detail of every report whose answer is no longer held.
+    fn forget_parked(&mut self) {
+        let held = &self.unwritten;
+        let waits = |lease: &LeaseId| {
+            let answers = |e: &Effect| matches!(e, Effect::Answer(a) if a.lease == *lease);
+            held.iter().flatten().any(answers)
+        };
+        self.parked.retain(|lease, _| waits(lease));
     }
 
     /// Keeps `detail`, the report of `lease`, for its answer if that waits for the state
@@ -866,6 +863,11 @@ impl State {
     ) {
         let attempt = self.attempt("a result", |d| d.done(operation, finished, retention));
         if attempt == Attempt::Transient {
+            if self.undone.len() >= self.held_cap {
+                self.write_drops += 1;
+                tracing::error!(%operation, "held-back result rows over the cap: one dropped");
+                return;
+            }
             self.undone.push(Undone {
                 operation,
                 finished: finished.clone(),

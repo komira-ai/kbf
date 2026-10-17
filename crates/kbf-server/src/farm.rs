@@ -233,9 +233,10 @@ struct State {
     /// The `done/` rows the state store has not taken, oldest first
     /// ([`State::retry_results`]).
     undone: Vec<Undone>,
-    /// The previous try of the oldest held effect was refused as unreachable, so a
-    /// "row is gone" now may be its own applied work ([`State::release_unwritten`]).
-    retrying: bool,
+    /// The held effect whose last try was refused as unreachable: a "row is gone" for
+    /// this effect and no other may be its own applied work
+    /// ([`State::release_unwritten`]).
+    retrying: Option<Effect>,
     /// Writes given up on for good: dropped as stale or fenced, past their retention,
     /// or over the cap ([`Farm::dropped_writes`]).
     write_drops: u64,
@@ -314,7 +315,7 @@ impl Farm {
                 unwritten: VecDeque::new(),
                 parked: BTreeMap::new(),
                 undone: Vec::new(),
-                retrying: false,
+                retrying: None,
                 write_drops: 0,
                 held_cap: HELD_CAP,
                 store_down: false,
@@ -1072,7 +1073,7 @@ impl State {
                         self.write_drops += 1;
                         tracing::error!(
                             cap = self.held_cap,
-                            "the state store holds back too many records: a committed record is dropped"
+                            "held-back records over the cap: one dropped"
                         );
                         continue;
                     }

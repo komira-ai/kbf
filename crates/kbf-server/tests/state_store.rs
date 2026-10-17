@@ -1542,6 +1542,107 @@ async fn records_held_past_the_cap_are_dropped_and_counted() {
     assert_eq!(farm.dropped_writes(), 1);
 }
 
+/// Catches: an answer held back by a refusing store that is released by another
+/// operation's report and settled with that report's detail, or not at all (the first
+/// caller stays unanswered, or gets the stand-in INTERNAL): both callers get their own
+/// report's detail.
+#[tokio::test(start_paused = true)]
+async fn an_answer_released_by_another_report_keeps_its_own_detail() {
+    let disk = Disk::new();
+    let (farm, tickets, leases) = running_two(&disk).await;
+    disk.store.set_down(true);
+    assert!(!accepted(&farm, leases[0]).await);
+    disk.store.set_down(false);
+    assert!(accepted(&farm, leases[1]).await);
+    for ticket in &tickets {
+        let Finished::Failed(status) = ended(ticket) else {
+            panic!("a caller was not answered");
+        };
+        assert_eq!(status.message, "test");
+    }
+    assert_eq!(farm.dropped_writes(), 0);
+}
+
+/// Catches: a grant carried out ahead of an earlier held record (or released by an input
+/// that delivers no answers), and a held `Start` written after the scheduler gave its
+/// lease up (it would put the lease back in the store over the requeue): the grant waits
+/// behind the held answer; once its lease is given up the old `Start` is never written
+/// and only the regrant starts.
+#[tokio::test(start_paused = true)]
+async fn a_grant_waits_behind_a_held_answer_and_a_given_up_lease_is_not_written() {
+    let disk = Disk::new();
+    let (farm, ticket, lease) = running(&disk).await;
+    disk.store.set_down(true);
+    assert!(!accepted(&farm, lease).await);
+    disk.store.set_down(false);
+    let (stream, mut inbox) = register(&farm);
+    submit(&farm, request(2)).expect("queued");
+    assert!(
+        starts(&mut inbox).is_empty(),
+        "a grant overtook the held answer"
+    );
+    assert!(!matches!(*ticket.stage.borrow(), Stage::Done(_)));
+    tokio::time::advance(kbf_sched::fence::START_GRACE + Duration::from_secs(1)).await;
+    assert!(farm.heartbeat(&node(), stream, 1, Vec::new()).await);
+    let _ = ended(&ticket);
+    farm.tick().await;
+    let started = starts(&mut inbox);
+    // Sequence 0 is the first operation's lease and 1 the given-up grant.
+    assert_eq!(
+        started,
+        [LeaseId::new(farm.lease_epoch(), 2)],
+        "the given-up lease's Start was written and sent"
+    );
+    assert_eq!(disk.rows("lease/"), 1);
+    let key = format!("lease/{:016x}.{:016x}", started[0].term, started[0].seq);
+    assert!(disk.store.get(&key).expect("read").is_some(), "{key}");
+}
+
+/// Catches: a "row is gone" read as already applied for an effect that was never tried
+/// (the retry flag shared by the whole queue): the held `Start` that was refused is
+/// purged when its lease is given up, and the answer behind it, whose rows really are
+/// gone, was never written; it must be dropped, not delivered.
+#[tokio::test(start_paused = true)]
+async fn a_stale_refusal_of_a_never_tried_effect_drops_it() {
+    let disk = Disk::new();
+    let (farm, ticket, lease) = running(&disk).await;
+    let (stream, mut inbox) = register(&farm);
+    // The answer's rows are gone from under it: its write is stale, not applied.
+    let gone = Txn::new().delete(
+        format!("lease/{:016x}.{:016x}", lease.term, lease.seq),
+        kbf_state::Cond::Any,
+    );
+    disk.store.txn(gone).expect("store").expect("delete");
+    // A grant the store refuses is held and tried again (its queue row is still there).
+    disk.store.fail_after(1);
+    submit(&farm, request(2)).expect("queued");
+    // The answer waits behind it, never tried.
+    assert!(!accepted(&farm, lease).await);
+    disk.store.set_down(false);
+    tokio::time::advance(kbf_sched::fence::START_GRACE + Duration::from_secs(1)).await;
+    assert!(farm.heartbeat(&node(), stream, 1, Vec::new()).await);
+    assert!(
+        !matches!(*ticket.stage.borrow(), Stage::Done(_)),
+        "a stale answer that was never written was delivered"
+    );
+    assert!(farm.dropped_writes() >= 1);
+    drop(starts(&mut inbox));
+}
+
+/// Catches: an unbounded list of refused `done/` rows: past the cap a new one is
+/// dropped, logged and counted.
+#[tokio::test(start_paused = true)]
+async fn result_rows_held_past_the_cap_are_dropped_and_counted() {
+    let disk = Disk::new();
+    let (farm, _tickets, leases) = running_two(&disk).await;
+    let farm = farm.with_held_cap(1);
+    disk.store.refuse_done.store(1_000, Ordering::SeqCst);
+    assert!(accepted(&farm, leases[0]).await);
+    assert_eq!(farm.dropped_writes(), 0);
+    assert!(accepted(&farm, leases[1]).await);
+    assert_eq!(farm.dropped_writes(), 1);
+}
+
 /// Catches: a farm with no state store pretending to answer from one: it has no result
 /// for any operation.
 #[test]
