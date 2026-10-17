@@ -1,4 +1,4 @@
-//! Writes: to the primary owner; the chain forwards to the replica (av2-11).
+//! Writes: to the first write owner that is not down.
 
 use bytes::Bytes;
 use kbf_meta::{ActionRecord, Role};
@@ -9,14 +9,14 @@ use crate::router::{Router, unavailable, write_order};
 use crate::source::MapView;
 
 impl Router {
-    /// Stores `bytes` and answers their digest once the primary owner holds them
-    /// durably. The blob goes to the primary only, once; the primary forwards it to the
-    /// replica and answers when both hold it (av2-11), so a client of a 1 GbE link sends
-    /// it once, not R times. A primary that is `Down` in the map is skipped: the write
-    /// goes to the next owner, which is not down.
+    /// Sends `bytes` to the first of the blob's write owners that is not `Down` in the map,
+    /// once, and answers the digest that node gives back, which must be the digest of the
+    /// bytes (hashed here to find the owner). That node answers when it has stored the
+    /// blob; the other owners are not written to by this call, and a node that fails is not
+    /// followed by a write to the next owner. Whether the node passes the blob on to a
+    /// replica is the storage service's (av2-11 in `kbf-storage`), not the router's.
     ///
-    /// The bytes are hashed here to find their owner, and again by the node that stores
-    /// them.
+    /// The bytes are hashed here, and again by the node that stores them.
     ///
     /// # Errors
     /// Every owner of the blob is down; the node's own error.
@@ -34,7 +34,7 @@ impl Router {
     }
 
     /// The second half of an action-cache write: commits the entry for `action` at the
-    /// action's primary owner. (The first half, `prepare_action_result`, takes no action
+    /// first of the action's write owners that is not `Down`. (The first half, `prepare_action_result`, takes no action
     /// digest and so has no owner to be routed to: the closure check across owners is
     /// av2-12's.)
     ///
@@ -78,7 +78,7 @@ impl Router {
     }
 }
 
-/// The owner a write of `digest` goes to.
+/// The owner a write of `digest` goes to: the first write owner that is not down.
 fn primary(view: &MapView, digest: &Digest) -> Result<kbf_map::Member, StorageError> {
     write_order(&view.map, digest)
         .first()

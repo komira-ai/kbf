@@ -310,7 +310,9 @@ where
     let shutdown = shutdown()?;
     let api = args.api()?;
     let storage = args.storage()?;
-    let bound = bind_server_with_options(cache, listeners, api, policy, state, storage, shutdown)?;
+    let bound = bind_server_with_options(
+        cache, listeners, api, policy, state, storage, None, shutdown,
+    )?;
     let plain = args.plain_text_off_loopback();
     Ok(ServerHandle {
         reapi: bound.reapi,

@@ -31,7 +31,7 @@ use kbf_proto::worker::{
 };
 use kbf_server::token::ApiToken;
 use kbf_server::{
-    Api, Bound, Listeners, MemoryLadder, RaftMetaLog, ServeError, bind_server, bind_server_with_api,
+    Api, Bound, Listeners, MemoryLadder, RaftMetaLog, ServeError, bind_server_with_map,
 };
 use kbf_store::FaultFs;
 use prost::Message;
@@ -242,6 +242,24 @@ impl Cell {
         Self::serve(cache, store, None, None, wait, retention, ladder).await
     }
 
+    /// A cell that sends its daemons the storage map `map` holds.
+    pub async fn start_with_map(map: Arc<dyn kbf_mapsync::MapSource>) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve_with_map(
+            cache,
+            store,
+            None,
+            None,
+            wait,
+            retention,
+            small_ladder(),
+            Some(map),
+        )
+        .await
+    }
+
     /// A cell whose scheduler refuses queued work no live worker can run after `wait`,
     /// and keeps a finished operation for `retention`.
     pub async fn start_with(wait: Duration, retention: Duration) -> Self {
@@ -402,6 +420,24 @@ impl Cell {
         retention: Duration,
         ladder: MemoryLadder,
     ) -> Self {
+        Self::serve_with_map(
+            cache, store, api_config, raft_dir, wait, retention, ladder, None,
+        )
+        .await
+    }
+
+    /// [`Cell::serve`], sending its daemons the storage map `map` holds if given.
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_with_map(
+        cache: Arc<Cache<GateLog, SharedStore>>,
+        store: SharedStore,
+        api_config: Option<Api>,
+        raft_dir: Option<FaultFs>,
+        wait: Duration,
+        retention: Duration,
+        ladder: MemoryLadder,
+        map: Option<Arc<dyn kbf_mapsync::MapSource>>,
+    ) -> Self {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
             worker: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -437,17 +473,16 @@ impl Cell {
                     let shutdown = async move {
                         let _ = stop_rx.await;
                     };
-                    match server_api {
-                        None => {
-                            let bound = bind_server(server_cache, listeners, shutdown);
-                            run(bound.expect("bind"), bound_tx).await;
-                        }
-                        Some(api) => {
-                            let bound =
-                                bind_server_with_api(server_cache, listeners, Some(api), shutdown);
-                            run(bound.expect("bind"), bound_tx).await;
-                        }
-                    }
+                    let bound = bind_server_with_map(
+                        server_cache,
+                        listeners,
+                        server_api,
+                        kbf_auth::Policy::allow_all(),
+                        None,
+                        map,
+                        shutdown,
+                    );
+                    run(bound.expect("bind"), bound_tx).await;
                 });
                 drop(runtime);
                 let _ = stopped_tx.send(());
@@ -700,6 +735,8 @@ pub struct FakeDaemon {
     seq: u64,
     /// The lease epoch the Welcome named (0 before it).
     pub epoch: u64,
+    /// The storage map the Welcome carried.
+    pub map: Option<kbf_proto::kbf::map::v1::Map>,
 }
 
 impl FakeDaemon {
@@ -727,6 +764,7 @@ impl FakeDaemon {
                 assert_eq!(w.protocol_version, 1);
                 assert_eq!(w.heartbeat_interval_ms, INTERVAL.as_millis() as u64);
                 d.epoch = w.epoch;
+                d.map = w.map;
                 Ok(d)
             }
             other => panic!("expected Welcome, got {other:?}"),
@@ -756,6 +794,7 @@ impl FakeDaemon {
             kept: VecDeque::new(),
             seq: 0,
             epoch: 0,
+            map: None,
         })
     }
 
@@ -812,6 +851,17 @@ impl FakeDaemon {
             }
             self.kept.push_back(m);
         }
+    }
+
+    /// The generation of the next `MapUpdate`, within `within`.
+    pub async fn map_update_within(&mut self, within: Duration) -> Option<u64> {
+        self.expect_within(within, |m| match m {
+            server_message::Message::MapUpdate(u) => {
+                Some(u.map.as_ref().map_or(0, |m| m.generation))
+            }
+            _ => None,
+        })
+        .await
     }
 
     pub async fn expect<T>(

@@ -260,8 +260,9 @@ async fn a_run_logs_its_usage_keyed_by_shape_and_labelled() {
     };
     assert!(
         first.contains(&format!(
-            "action usage: exit_code=0 mnemonic=\"CxxCompile\" target=\"//lib:foo\" {FIELDS} \
-             key={foo} cfg=- outcome=ok lease={first_lease} node=node-a"
+            "action usage: exit_code=0 mnemonic=\"CxxCompile\" target_hint=\"//lib:foo\" \
+             {FIELDS} key={foo} cfg=- target=- target_kind=- outcome=ok lease={first_lease} \
+             node=node-a"
         )),
         "{first}"
     );
@@ -271,7 +272,8 @@ async fn a_run_logs_its_usage_keyed_by_shape_and_labelled() {
     };
     assert!(
         second.contains(&format!(
-            "action usage: exit_code=7 mnemonic=- target=- {FIELDS} key={bar} cfg=- outcome=ok"
+            "action usage: exit_code=7 mnemonic=- target_hint=- {FIELDS} key={bar} cfg=- \
+             target=- target_kind=- outcome=ok"
         )),
         "{second}"
     );
@@ -319,15 +321,16 @@ async fn an_out_of_memory_rung_and_its_rerun_each_log_a_line() {
     };
     assert!(
         oom.contains(&format!(
-            "action usage: exit_code=- mnemonic=- target=- {FIELDS} key={key} \
-             cfg=7a3c1e9f0b2d4c68 outcome=oom lease={killed_lease} node=node-b"
+            "action usage: exit_code=- mnemonic=- target_hint=- {FIELDS} key={key} \
+             cfg=7a3c1e9f0b2d4c68 target=\"komira//src/foo:foo\" target_kind=target \
+             outcome=oom lease={killed_lease} node=node-b"
         )),
         "{oom}"
     );
     assert!(
         ok.contains(&format!(
-            "exit_code=0 mnemonic=- target=- {FIELDS} key={key} cfg=7a3c1e9f0b2d4c68 \
-             outcome=ok lease={rerun_lease}"
+            "exit_code=0 mnemonic=- target_hint=- {FIELDS} key={key} cfg=7a3c1e9f0b2d4c68 \
+             target=\"komira//src/foo:foo\" target_kind=target outcome=ok lease={rerun_lease}"
         )),
         "{ok}"
     );
@@ -373,8 +376,9 @@ async fn a_timed_out_lease_logs_its_usage() {
     };
     assert!(
         line.contains(&format!(
-            "action usage: exit_code=- mnemonic=- target=- {FIELDS} key={key} cfg=- \
-             outcome=timeout lease={lease} node=node-c"
+            "action usage: exit_code=- mnemonic=- target_hint=- {FIELDS} key={key} cfg=- \
+             target=\"komira//src/slow:slow\" target_kind=target outcome=timeout \
+             lease={lease} node=node-c"
         )),
         "{line}"
     );
@@ -435,7 +439,8 @@ async fn an_unrecorded_call_is_labelled_and_a_twin_logs_once() {
     };
     assert!(
         line.contains(&format!(
-            "action usage: exit_code=0 mnemonic=\"CppCompile\" target=\"//pkg:a\" {FIELDS} key={key}"
+            "action usage: exit_code=0 mnemonic=\"CppCompile\" target_hint=\"//pkg:a\" \
+             {FIELDS} key={key}"
         )),
         "{line}"
     );
@@ -623,4 +628,56 @@ async fn every_failed_path_logs_one_line_per_lease_with_its_outcome() {
             got.iter().map(|l| field(l, "lease")).collect();
         assert_eq!(leases.len(), got.len(), "{path:?}: one line per lease");
     }
+}
+
+/// Issue #796: a client's `target_id` is a hint beside the target the action's own
+/// paths name, never the key. Catches: the client's label written as `target=`, or
+/// the derived target missing from the line or from the invocation record's row,
+/// or the hint lost from the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_target_is_a_hint_beside_the_derived_one() {
+    log();
+    let cell = Cell::start().await;
+    let mut daemon = cell.daemon("node-f", 4, 8).await;
+    let (job, key) = buck_job(
+        &["cc"],
+        &["buck-out/v2/art/komira/7a3c1e9f0b2d4c68/src/lib/__lib__/lib.o"],
+    );
+    cell.upload(&job.blobs()).await;
+    let id = "c4b1f2e0-1d2c-4e5f-8a9b-0c1d2e3f4a5b";
+    let mut ops = execute_labelled(&cell, &job, id, "", "//wrong:other").await;
+    let start = daemon.start().await;
+    let result = with_usage(output(&cell, "lib.o", 0).await, &usage());
+    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
+    done(&mut ops).await;
+
+    let [line] = &lines("action usage:", key)[..] else {
+        panic!("one usage line: {:?}", lines("action usage:", key));
+    };
+    assert!(
+        line.contains(&format!(
+            "target_hint=\"//wrong:other\" {FIELDS} key={key} cfg=7a3c1e9f0b2d4c68 \
+             target=\"komira//src/lib:lib\" target_kind=target outcome=ok"
+        )),
+        "{line}"
+    );
+    cell.recorder.caught_up().await;
+    let inv = cell
+        .recorder
+        .get(&kbf_invocation::RecordKey::owner(
+            kbf_invocation::InvocationId::new(id),
+        ))
+        .expect("the record");
+    let [row] = inv.rows() else {
+        panic!("one row");
+    };
+    let shape = row.shape.as_deref().expect("the row's shape");
+    assert_eq!(shape.key_text(), key.to_string());
+    let target = shape.target.as_ref().expect("a derived target");
+    assert_eq!(target.label.value, "komira//src/lib:lib");
+    assert_eq!(
+        row.target.as_ref().map(|t| t.value.as_str()),
+        Some("//wrong:other"),
+        "the client's hint, kept apart"
+    );
 }
