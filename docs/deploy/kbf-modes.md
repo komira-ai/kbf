@@ -48,7 +48,7 @@ It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/sy
 | `storage` | a `storage` unit without `--cold-store`, `--meta-dir`, `--storage-listen` or one of the three certificate flags, or with an `s3://` cold store and no `EnvironmentFile=<KBF_ETC>/s3.env` |
 | `state-store` | a `--state-store` that is not `sqlite:///<absolute path>`: a Postgres URI (`postgres://` or `postgresql://`; postgres is not wired yet), any other scheme, an empty or relative SQLite path, or a value that names a variable (below) |
 | `ports` | two of a unit's listeners (`--listen`, `--worker-listen`, `--api-listen`, `--storage-listen`) on one port |
-| `stop` | a mode that drains on SIGTERM (`frontend`, `all-in-one`) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
+| `stop` | a mode that drains on SIGTERM (every mode but `daemon`) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
 | `parse` | a built mode's flags that `kbf <mode>` refuses |
 
 **`delegate`.** systemd reads `Delegate=` this way (systemd.resource-control(5), and
@@ -162,7 +162,9 @@ until its action is done; `--shutdown-timeout-secs` is 0, no deadline, by defaul
 Buck2 never recovers a stream that breaks mid-action, so a stop that ends the drain
 fails every build in flight. systemd kills a unit with SIGKILL when `TimeoutStopSec=`
 runs out, 90 s (`DefaultTimeoutStopSec=`) when the unit gives none. So both units have
-`KillSignal=SIGTERM` and `TimeoutStopSec=infinity`, and rule `stop` refuses either
+`KillSignal=SIGTERM` and `TimeoutStopSec=infinity` (so do `storage` and
+`storage-and-daemon`: a storage node finishes its large Writes at stop, and systemd's
+90 s default would cut them), and rule `stop` refuses either
 missing or changed: it reads `TimeoutSec=` too (it sets the stop timeout as well; the
 last of the two wins) and the drop-ins. It asks for the word `infinity`: `0` means no
 timeout to systemd as well, but reads as "at once" to a person. A daemon is not held:

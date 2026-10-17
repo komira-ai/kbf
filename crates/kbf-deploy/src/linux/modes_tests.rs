@@ -104,12 +104,29 @@ fn every_mode_but_the_frontend_is_built() {
     );
 }
 
+/// Catches rule `stop` skipped for a mode that drains (a storage node finishes its large
+/// Writes at stop; systemd's 90 s default would cut them) or applied to the daemon,
+/// which abandons its leases on SIGTERM.
+#[test]
+fn every_mode_but_the_daemon_drains() {
+    let drains: Vec<_> = Mode::ALL.iter().filter(|m| m.drains()).collect();
+    assert_eq!(
+        drains,
+        [
+            &Mode::Frontend,
+            &Mode::Storage,
+            &Mode::StorageAndDaemon,
+            &Mode::AllInOne
+        ]
+    );
+}
+
 /// Each row plants one defect in one mode's template; the check must fail exactly the
 /// rule meant for it, with this message. `from` must occur once in the template.
 #[test]
 fn each_planted_defect_turns_its_rule_red() {
     let c = config();
-    let rows: [(Mode, &str, &str, &str); 17] = [
+    let rows: [(Mode, &str, &str, &str); 19] = [
         (
             Mode::Frontend,
             "TimeoutStopSec=infinity\n",
@@ -121,6 +138,18 @@ fn each_planted_defect_turns_its_rule_red() {
             "KillSignal=SIGTERM\n",
             "KillSignal=SIGINT\n",
             "FAIL stop: kbf-all-in-one.service has KillSignal=SIGINT, not KillSignal=SIGTERM: kbf drains on SIGTERM",
+        ),
+        (
+            Mode::Storage,
+            "TimeoutStopSec=infinity\n",
+            "",
+            "FAIL stop: kbf-storage.service gives no TimeoutStopSec=infinity: systemd kills kbf after its default 90 s, before the drain ends, and every build in flight fails",
+        ),
+        (
+            Mode::StorageAndDaemon,
+            "KillSignal=SIGTERM\n",
+            "KillSignal=SIGINT\n",
+            "FAIL stop: kbf-storage-and-daemon.service has KillSignal=SIGINT, not KillSignal=SIGTERM: kbf drains on SIGTERM",
         ),
         (
             Mode::AllInOne,

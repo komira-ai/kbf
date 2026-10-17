@@ -49,6 +49,11 @@ ExecStart=/usr/local/bin/kbf storage-and-daemon \
 # --storage-listen).
 # TODO(registration): --frontend=<the frontend's DNS name> and --advertise-addr, and the
 # storage map the frontend pushes.
+# The storage half drains on SIGTERM: a Write in flight is finished and acknowledged
+# before the process exits, and a large one takes longer than systemd's 90 s default stop
+# timeout, which would SIGKILL it and fail the upload (check-units rule `stop`).
+KillSignal=SIGTERM
+TimeoutStopSec=infinity
 Restart=on-failure
 # Exit 2 is a command line kbf refused (or a mode not built yet): a restart cannot fix it.
 RestartPreventExitStatus=2

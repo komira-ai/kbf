@@ -46,7 +46,7 @@
 //!   and names no variable (systemd would expand it into kbf's argv); postgres is not
 //!   wired yet, so a Postgres URI fails ([`super::stores`]).
 //! - `ports`: no two of the unit's listeners share a port ([`super::stores`]).
-//! - `stop`: a mode that drains on SIGTERM (`frontend`, `all-in-one`) has
+//! - `stop`: a mode that drains on SIGTERM (every mode but `daemon`) has
 //!   `TimeoutStopSec=infinity` and `KillSignal=SIGTERM`, so systemd never kills it
 //!   mid-drain and fails the builds in flight ([`super::stop`]).
 //!
@@ -155,10 +155,11 @@ impl Mode {
         matches!(self, Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne)
     }
 
-    /// Whether the mode runs a frontend, which drains on SIGTERM (rule `stop`).
+    /// Whether the mode drains on SIGTERM (rule `stop`): a frontend finishes its open
+    /// streams, a storage half finishes the Writes in flight. Only `daemon` does not.
     #[must_use]
     pub fn drains(self) -> bool {
-        matches!(self, Mode::Frontend | Mode::AllInOne)
+        !matches!(self, Mode::Daemon)
     }
 
     /// Whether the mode runs builds without a storage half that reads the cold store's

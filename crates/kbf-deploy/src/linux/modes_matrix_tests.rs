@@ -42,7 +42,12 @@ struct Row {
 const ALL: &[Mode] = &Mode::ALL;
 const BUILDS: &[Mode] = &[Mode::Daemon, Mode::StorageAndDaemon, Mode::AllInOne];
 const UNBUILT: &[Mode] = &[Mode::Frontend];
-const DRAINS: &[Mode] = &[Mode::Frontend, Mode::AllInOne];
+const DRAINS: &[Mode] = &[
+    Mode::Frontend,
+    Mode::Storage,
+    Mode::StorageAndDaemon,
+    Mode::AllInOne,
+];
 
 fn rows() -> Vec<Row> {
     vec![

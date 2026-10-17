@@ -1,11 +1,13 @@
-//! Rule `stop` of [`super::modes`]: a mode that drains on SIGTERM (`frontend`, and
-//! `all-in-one`, which runs a frontend) is stopped with SIGTERM and never killed for
-//! taking long.
+//! Rule `stop` of [`super::modes`]: a mode that drains on SIGTERM (`frontend`,
+//! `all-in-one`, which runs a frontend, and `storage` and `storage-and-daemon`, whose
+//! storage half finishes the Writes in flight) is stopped with SIGTERM and never killed
+//! for taking long.
 //!
 //! On SIGTERM kbf's frontend refuses new Execute calls and keeps every open Execute and
 //! WaitExecution stream until its action is done (`--shutdown-timeout-secs`, 0 by
 //! default: no deadline). Buck2 never recovers a stream that breaks mid-action, so a
-//! stop that ends before the drain fails every build in flight. systemd sends
+//! stop that ends before the drain fails every build in flight. A storage node drains
+//! its large Writes at stop the same way, and a Write cut off fails the upload. systemd sends
 //! `KillSignal=` and, after `TimeoutStopSec=` (`DefaultTimeoutStopSec=`, 90 s, when the
 //! unit gives none), SIGKILL. So the unit's `[Service]` must have:
 //!
@@ -16,9 +18,9 @@
 //! - `KillSignal=SIGTERM` (or `TERM` or `15`, as `signal_from_string` reads it), given:
 //!   kbf drains on it, and the rule does not trust the default to stay SIGTERM.
 //!
-//! Not for `daemon` and `storage-and-daemon`: a daemon does not drain on SIGTERM (its
-//! leases are abandoned; the operator API's `POST /v1/nodes/{node}:drain`
-//! empties a node before it is stopped), so an infinite stop would only hold a reboot on a daemon that hangs.
+//! Not for `daemon`: a daemon does not drain on SIGTERM (its leases are abandoned; the
+//! operator API's `POST /v1/nodes/{node}:drain` empties a node before it is stopped), so
+//! an infinite stop would only hold a reboot on a daemon that hangs.
 //!
 //! What it cannot see: a value systemd ignores because it cannot parse it (a later
 //! `TimeoutStopSec=` it ignores keeps the earlier one, and the rule fails the unit: a
