@@ -10,6 +10,9 @@
 //!   desired one (a repeated click keeps it); a rollback is the older commit offered the same
 //!   way. It passes the gates of every `/v1` write ([`crate::api::operator_gate`]) and wants a
 //!   JSON body.
+//!   An optional `expect_generation` makes it a compare-and-set: the row is written only if the
+//!   desired release is at that generation (0 before any offer), else `409` naming both and
+//!   nothing is written. `GET` also shows the `policy` row when the operator wrote one.
 //! - `POST /v1/update/pause` and `resume` set whether the run may start a host.
 //! - Without a release store (`--releases-dir`) or without a state store (`--state-store`:
 //!   the row has nowhere to live) every answer is `503` saying which is missing.
@@ -34,7 +37,7 @@ use super::store::ReleaseStore;
 use crate::api::{error, json, operator_gate};
 use crate::farm::Farm;
 use crate::token::ApiToken;
-use crate::update::{Desired, Release, RowError, Rows};
+use crate::update::{Desired, Policy, Release, RowError, Rows};
 
 struct Update {
     store: Option<Arc<ReleaseStore>>,
@@ -87,6 +90,28 @@ fn desired_view(desired: Option<&Desired>) -> serde_json::Value {
     })
 }
 
+/// The policy row as the operator sees it: durations in seconds.
+fn policy_view(p: &Policy) -> serde_json::Value {
+    let secs = |d: std::time::Duration| d.as_secs();
+    json!({
+        "auto_nodes": p.auto_nodes,
+        "auto_frontend": p.auto_frontend,
+        "new_work_only_to_updated": p.new_work_only_to_updated,
+        "accept_failing_builds": p.accept_failing_builds,
+        "idle_wait_secs": secs(p.idle_wait),
+        "min_serving": p.min_serving,
+        "max_hosts_out": p.max_hosts_out,
+        "lease_limit_secs": secs(p.lease_limit),
+        "mac_lease_limit_secs": secs(p.mac_lease_limit),
+        "write_limit_secs": secs(p.write_limit),
+        "activate_limit_secs": secs(p.activate_limit),
+        "health_limit_secs": secs(p.health_limit),
+        "rebuild_limit_secs": p.rebuild_limit.map(secs),
+        "repair_wait_secs": secs(p.repair_wait),
+        "mac_force_after_secs": p.mac_force_after.map(secs),
+    })
+}
+
 /// Runs a blocking call on the store (the rows block on it).
 async fn blocking<T: Send + 'static>(
     call: impl FnOnce() -> Result<T, RowError> + Send + 'static,
@@ -105,8 +130,13 @@ async fn view(State(update): State<Arc<Update>>) -> Response {
     let Some(store) = update.store.as_deref() else {
         return unavailable("the release store", "--releases-dir");
     };
+    let policy_rows = rows.clone();
     let desired = match blocking(move || rows.desired()).await {
         Ok(stored) => stored.value,
+        Err(e) => return row_failed(&e),
+    };
+    let policy = match blocking(move || policy_rows.policy_if_set()).await {
+        Ok(policy) => policy,
         Err(e) => return row_failed(&e),
     };
     let releases = match store.list().await {
@@ -121,7 +151,11 @@ async fn view(State(update): State<Arc<Update>>) -> Response {
     };
     json(
         StatusCode::OK,
-        &json!({ "desired": desired_view(desired.as_ref()), "releases": releases }),
+        &json!({
+            "desired": desired_view(desired.as_ref()),
+            "policy": policy.as_ref().map_or(serde_json::Value::Null, policy_view),
+            "releases": releases,
+        }),
     )
 }
 
@@ -129,6 +163,8 @@ async fn view(State(update): State<Arc<Update>>) -> Response {
 #[serde(deny_unknown_fields)]
 struct Offer {
     commit: String,
+    /// Compare-and-set: write only if the desired release is at this generation (0 before any).
+    expect_generation: Option<u64>,
 }
 
 /// The gates of a write, then the JSON content type for a body.
@@ -164,7 +200,11 @@ async fn set_desired(
     let Some(store) = update.store.as_deref() else {
         return unavailable("the release store", "--releases-dir");
     };
-    let Ok(Offer { commit }) = serde_json::from_slice::<Offer>(&body) else {
+    let Ok(Offer {
+        commit,
+        expect_generation,
+    }) = serde_json::from_slice::<Offer>(&body)
+    else {
         return error(
             StatusCode::BAD_REQUEST,
             "the body must be {\"commit\": \"<40 hex>\"}",
@@ -198,8 +238,11 @@ async fn set_desired(
         );
     }
     let now = update.farm.now();
-    match blocking(move || rows.offer(&Release::new(commit), now)).await {
+    match blocking(move || rows.offer_expecting(&Release::new(commit), now, expect_generation))
+        .await
+    {
         Ok(desired) => json(StatusCode::OK, &desired_view(Some(&desired))),
+        Err(e @ RowError::Stale { .. }) => error(StatusCode::CONFLICT, &e.to_string()),
         Err(e) => row_failed(&e),
     }
 }

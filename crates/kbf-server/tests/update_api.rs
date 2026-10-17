@@ -83,10 +83,16 @@ impl Drop for Running {
 }
 
 fn state() -> StateStore {
+    state_and_store().0
+}
+
+/// The state store a server is given, and the same store for the test to write rows into.
+fn state_and_store() -> (StateStore, Arc<dyn Store>) {
     let clock = Arc::new(ManualClock::default());
     let fake = Arc::new(Fake::with_flaw(clock, Flaw::None));
-    StateStore {
-        store: fake as Arc<dyn Store>,
+    let store = fake as Arc<dyn Store>;
+    let state = StateStore {
+        store: Arc::clone(&store),
         epoch: EpochPolicy::Keep,
         members: MembershipConfig {
             ttl: Duration::from_secs(30),
@@ -94,7 +100,8 @@ fn state() -> StateStore {
             replication: 1,
         },
         history: None,
-    }
+    };
+    (state, store)
 }
 
 fn start(releases: Option<Arc<ReleaseStore>>, state: Option<StateStore>, dir: &Dir) -> Running {
@@ -355,4 +362,109 @@ async fn without_a_state_store_or_a_release_store_the_update_routes_say_so() {
             .contains("--releases-dir"),
         "{body}"
     );
+}
+
+/// Catches a stale click replacing a newer decision: `expect_generation` makes the offer a
+/// compare-and-set. A match writes (0 before any offer, then the generation shown); a
+/// mismatch is 409 naming both generations and writes nothing (the commit and generation
+/// stay); a repeat of the desired commit with the wrong expectation is refused too; and a
+/// field the route does not know is still 400.
+///
+/// Mutant seen red: `expect_generation` ignored (the stale click is written).
+#[tokio::test]
+async fn an_offer_can_expect_the_generation_it_was_made_on() {
+    let dir = Dir::new();
+    let store =
+        Arc::new(ReleaseStore::open(&dir.0.join("releases"), Limits::default()).expect("open"));
+    let running = start(Some(store), Some(state()), &dir);
+    put(&running, A, true).await;
+    put(&running, B, true).await;
+    let with = |commit: &'static str, expect: u64| {
+        let body = json!({ "commit": commit, "expect_generation": expect }).to_string();
+        let api = running.api;
+        async move {
+            http(
+                api,
+                "POST",
+                "/v1/update/desired",
+                true,
+                Some("application/json"),
+                body.as_bytes(),
+            )
+            .await
+        }
+    };
+    // Nothing offered yet: the page that saw "no run" says 0.
+    let (code, first) = with(A, 1).await;
+    assert_eq!(code, 409, "{first}");
+    assert!(
+        first["error"]
+            .as_str()
+            .expect("text")
+            .contains("generation 0"),
+        "{first}"
+    );
+    let (_, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
+    assert_eq!(
+        view["desired"],
+        Value::Null,
+        "a refused offer wrote nothing"
+    );
+    assert_eq!(with(A, 0).await.1["generation"], 1);
+    // The page that saw generation 1 sets B; the stale page (still on 1) then cannot set A.
+    assert_eq!(with(B, 1).await.1["generation"], 2);
+    let (code, stale) = with(A, 1).await;
+    assert_eq!(code, 409);
+    let why = stale["error"].as_str().expect("text");
+    assert!(why.contains("generation 2") && why.contains('1'), "{why}");
+    let (_, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
+    assert_eq!(
+        (
+            view["desired"]["commit"].as_str(),
+            view["desired"]["generation"].as_u64()
+        ),
+        (Some(B), Some(2))
+    );
+    // The commit already desired, offered on a stale page: refused, not answered as a no-op.
+    assert_eq!(with(B, 1).await.0, 409);
+    assert_eq!(with(B, 2).await.1["generation"], 2);
+    // Other fields are still refused.
+    let body = json!({ "commit": A, "expect_generation": 2, "x": 1 }).to_string();
+    let (code, _) = http(
+        running.api,
+        "POST",
+        "/v1/update/desired",
+        true,
+        Some("application/json"),
+        body.as_bytes(),
+    )
+    .await;
+    assert_eq!(code, 400);
+}
+
+/// Catches a policy the operator set being invisible to the page, or invented when none was
+/// set: `policy` is null until the row is written, then shows the row (durations in seconds).
+#[tokio::test]
+async fn the_policy_row_is_shown_when_it_exists() {
+    let dir = Dir::new();
+    let store =
+        Arc::new(ReleaseStore::open(&dir.0.join("releases"), Limits::default()).expect("open"));
+    let (state, rows_store) = state_and_store();
+    let running = start(Some(store), Some(state), &dir);
+    let (_, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
+    assert_eq!(view["policy"], Value::Null);
+    let policy = kbf_server::update::Policy {
+        max_hosts_out: 2,
+        auto_nodes: true,
+        ..kbf_server::update::Policy::default()
+    };
+    kbf_server::update::Rows::new(rows_store)
+        .set_policy(&policy)
+        .expect("write");
+    let (_, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
+    assert_eq!(view["policy"]["max_hosts_out"], 2);
+    assert_eq!(view["policy"]["auto_nodes"], true);
+    assert_eq!(view["policy"]["auto_frontend"], false);
+    assert_eq!(view["policy"]["lease_limit_secs"], 900);
+    assert_eq!(view["policy"]["mac_force_after_secs"], Value::Null);
 }

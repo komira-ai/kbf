@@ -831,9 +831,14 @@ row of the state store. Without `--state-store` every answer is `503` naming it;
 `--releases-dir`, naming that.
 
 - `GET /v1/update` is open: `{"desired": null | {"generation", "commit", "set_at_ms",
-  "paused"}, "releases": <the body of GET /v1/releases>}`.
-- `POST /v1/update/desired` with `{"commit": "<40 lowercase hex>"}` (JSON content type, the write
-  gates) offers the commit. `409` unless the release store holds some platform of it complete
+  "paused"}, "policy": null | {...}, "releases": <the body of GET /v1/releases>}`. `policy`
+  is the `update/policy` row when the operator wrote one (`auto_nodes`, `auto_frontend`,
+  `new_work_only_to_updated`, `accept_failing_builds`, `max_hosts_out`, `min_serving` and the
+  limits in seconds), else `null`.
+- `POST /v1/update/desired` with `{"commit": "<40 lowercase hex>"}` and, optionally,
+  `"expect_generation": N` (JSON content type, the write gates) offers the commit. With
+  `expect_generation` it is a compare-and-set: it writes only if the desired release is at
+  generation N (0 before any offer), else `409` naming both and nothing is written. `409` unless the release store holds some platform of it complete
   (see above); `400` for a body that is not exactly that. The answer is the desired release.
   The generation moves only when the commit differs from the desired one, so a repeated click is
   not a new run; a rollback is the older commit offered the same way and gets a higher
