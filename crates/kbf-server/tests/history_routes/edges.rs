@@ -308,6 +308,14 @@ async fn the_routes_follow_the_build_pages_policy() {
     off.stop().await;
 }
 
+/// A response head without its `date` line, which differs between two answers a second
+/// apart.
+fn undated(head: &str) -> Vec<&str> {
+    head.lines()
+        .filter(|line| !line.to_ascii_lowercase().starts_with("date:"))
+        .collect()
+}
+
 /// Catches (cutover, ui-data 5.5): a server with no history that has the routes, or
 /// answers them differently from a path it never had: without history there is nothing
 /// to read, and the answer is the one an unknown path gets, byte for byte.
@@ -326,7 +334,7 @@ async fn without_history_the_routes_do_not_exist() {
         let answer = server.get(route).await;
         assert_eq!(answer.code, unknown.code, "{route}");
         assert_eq!(answer.body, unknown.body, "{route}");
-        assert_eq!(answer.head, unknown.head, "{route}");
+        assert_eq!(undated(&answer.head), undated(&unknown.head), "{route}");
     }
     server.stop().await;
 }
