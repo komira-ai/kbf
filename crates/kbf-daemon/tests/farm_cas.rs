@@ -14,7 +14,6 @@ use kbf_daemon::{FarmCas, HeldMaps, MapHolder, storage_nodes};
 use kbf_map::{Map, Member, MemberId, MemberState, Rule};
 use kbf_proto::reapi::Digest;
 use kbf_route::{Liveness, MapSource as _, Nodes as _};
-use kbf_storage::Storage as _;
 use kbf_transfer::{Record, RecordHasher, TransferConfig, Transfers, proto_digest};
 use kbf_types::LeaseId;
 use support::storage_node::{Node, serve_plain, serve_tls};
