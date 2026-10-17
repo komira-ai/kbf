@@ -258,8 +258,8 @@ fn a_missing_member_or_one_that_is_not_a_regular_file_is_refused() {
 #[test]
 fn a_missing_zip_member_or_one_that_is_not_a_regular_file_is_refused() {
     // Catches: a zip installer that writes an empty file for a member the archive lacks,
-    // for a directory entry, or for a symlink (the unix mode bits say so; `is_file` alone
-    // calls it a file), and one that picks the decoy beside the tool.
+    // for a directory entry, or for a symlink (the unix mode bits say so), and one that
+    // picks the decoy beside the tool.
     let archive = zip();
     let cases = [
         (
