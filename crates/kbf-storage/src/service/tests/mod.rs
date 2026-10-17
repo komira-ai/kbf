@@ -1192,3 +1192,72 @@ async fn a_streamed_write_is_checked_against_its_digest() {
     }
     assert!(mem.blobs.lock().expect("lock").is_empty());
 }
+
+/// Catches a streamed Write whose last message carries no bytes: the blob is complete
+/// before it, and `finish_write` alone ends the write, as a sender that does not know
+/// which message is its last would send it. The blob is stored whole, once.
+#[tokio::test]
+async fn a_streamed_write_may_finish_with_an_empty_message() {
+    let (mem, _remote, channel) = pair().await;
+    let large = patterned(STREAM_FROM_BYTES as usize + 1);
+    let digest = sha(&large);
+    let mut messages = blob_messages(&upload_name(&digest), &large);
+    messages.last_mut().expect("messages").finish_write = false;
+    messages.push(WriteRequest {
+        write_offset: large.len() as i64,
+        finish_write: true,
+        ..WriteRequest::default()
+    });
+    let answer = raw_write(&channel, messages).await.expect("written");
+    assert_eq!(answer.committed_size, large.len() as i64);
+    assert_eq!(mem.streamed.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        mem.blobs.lock().expect("lock")[&digest].as_ref(),
+        &large[..]
+    );
+}
+
+/// Catches a streamed Write whose sender goes away mid-stream (its connection closed after
+/// the store took a piece) that stores a partial blob or leaves the
+/// store waiting: the store's pieces end in an error and nothing is stored.
+#[tokio::test]
+async fn a_streamed_write_whose_sender_goes_away_stores_nothing() {
+    let mem = Arc::new(Mem::default());
+    let channel = serve(&mem, 1 << 30).await;
+    let large = patterned(STREAM_FROM_BYTES as usize + 1);
+    let digest = sha(&large);
+    let mut messages = blob_messages(&upload_name(&digest), &large);
+    messages.pop();
+    let mut client = ByteStreamClient::new(channel);
+    {
+        let call = client.write(stream::iter(messages).chain(stream::pending()));
+        tokio::pin!(call);
+        tokio::select! {
+            answer = &mut call => panic!("answered a write that never finished: {answer:?}"),
+            () = mem.piece_seen.notified() => {}
+        }
+    }
+    drop(client);
+    mem.pieces_failed.notified().await;
+    assert!(mem.blobs.lock().expect("lock").is_empty());
+    assert_eq!(mem.streamed.load(Ordering::SeqCst), 0);
+}
+
+/// Catches a remote storage that gathers a streamed put or answers it as if stored: it
+/// takes none (it writes a blob through `put`), and says so as `Invalid`, consuming
+/// nothing.
+#[tokio::test]
+async fn a_remote_storage_takes_no_streamed_put() {
+    let (mem, remote, _) = pair().await;
+    let bytes = patterned(100);
+    let digest = sha(&bytes);
+    let body = stream::iter([Ok(Bytes::from(bytes))]).boxed();
+    let refused = remote
+        .put_streamed(100, body, Box::pin(async move { Some(digest) }))
+        .await;
+    assert!(
+        matches!(refused, Err(StorageError::Invalid(_))),
+        "{refused:?}"
+    );
+    assert!(mem.blobs.lock().expect("lock").is_empty());
+}

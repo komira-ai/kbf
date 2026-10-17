@@ -72,6 +72,10 @@ pub(crate) struct Mem {
     pub streamed: AtomicUsize,
     /// The most bytes `put_streamed` held at once.
     pub streamed_most_held: AtomicUsize,
+    /// Notified for each piece `put_streamed` takes.
+    pub piece_seen: tokio::sync::Notify,
+    /// Notified when the pieces `put_streamed` takes end in an error.
+    pub pieces_failed: tokio::sync::Notify,
     active: AtomicUsize,
     pub most_active: AtomicUsize,
     pub segments: Arc<Seen>,
@@ -198,9 +202,13 @@ impl Storage for Mem {
             self.failing()?;
             let mut whole = Vec::new();
             while let Some(piece) = bytes.next().await {
-                let piece = piece.map_err(|e| StorageError::Internal(e.to_string()))?;
+                let piece = piece.map_err(|e| {
+                    self.pieces_failed.notify_one();
+                    StorageError::Internal(e.to_string())
+                })?;
                 self.streamed_most_held
                     .fetch_max(piece.len(), Ordering::SeqCst);
+                self.piece_seen.notify_one();
                 whole.extend_from_slice(&piece);
             }
             let Some(claimed) = claim.await else {
