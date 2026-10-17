@@ -285,6 +285,7 @@ impl Pair {
                 self.a.1,
                 Progress::CaughtUp,
                 Reported::debts(debts),
+                None,
             )
             .expect("a beats");
     }
@@ -296,6 +297,7 @@ impl Pair {
                 self.b.1,
                 Progress::CaughtUp,
                 Reported::debts(debts),
+                None,
             )
             .expect("b beats");
     }
@@ -419,6 +421,7 @@ fn a_member_that_registers_again_starts_without_a_report() {
             again.boot,
             Progress::CaughtUp,
             Reported::debts(Debts::Known(0)),
+            None,
         )
         .expect("beats");
     assert_eq!(pair.health().under_replicated_blobs, Some(0));
@@ -438,6 +441,7 @@ fn the_report_of_a_superseded_boot_is_refused() {
         pair.a.1,
         Progress::CaughtUp,
         Reported::debts(Debts::Known(0)),
+        None,
     );
     assert!(matches!(refused, Err(MembershipError::Superseded { .. })));
     assert_eq!(pair.health().silent, [pair.a.0]);

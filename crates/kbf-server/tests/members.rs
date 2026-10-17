@@ -44,7 +44,7 @@ fn other_frontend(store: &Arc<Hooked>, config: MembershipConfig) -> Members {
 fn node(i: u32) -> Registrant {
     Registrant {
         instance_id: format!("node-{i}"),
-        addr: format!("10.0.0.{i}:8982"),
+        addr: format!("192.0.2.{i}:8982"),
         zone: String::new(),
         weight: 1,
         protocol: PROTOCOL,
@@ -131,7 +131,7 @@ fn a_member_goes_down_after_the_ttl_and_leaves_after_the_dwell() {
     let g = map.generation();
 
     s.clock.advance(20 * SECOND);
-    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default())
+    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
         .expect("a beats");
     s.clock.advance(9 * SECOND);
     let early = m.refresh().expect("refresh").expect("a map");
@@ -143,7 +143,7 @@ fn a_member_goes_down_after_the_ttl_and_leaves_after_the_dwell() {
     assert_eq!(early.generation(), g, "nothing changed, nothing bumped");
 
     s.clock.advance(3 * SECOND);
-    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default())
+    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
         .expect("a beats");
     let down = m.refresh().expect("refresh").expect("a map");
     assert_eq!(state(&down, b.id), Some(MemberState::Down));
@@ -152,7 +152,7 @@ fn a_member_goes_down_after_the_ttl_and_leaves_after_the_dwell() {
 
     for _ in 0..10 {
         s.clock.advance(10 * SECOND);
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default())
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
             .expect("a beats");
     }
     let within = m.refresh().expect("refresh").expect("a map");
@@ -165,7 +165,7 @@ fn a_member_goes_down_after_the_ttl_and_leaves_after_the_dwell() {
 
     for _ in 0..3 {
         s.clock.advance(10 * SECOND);
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default())
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
             .expect("a beats");
     }
     let gone = m.refresh().expect("refresh").expect("a map");
@@ -187,9 +187,9 @@ fn heartbeats_keep_a_member_alive_and_set_state_does_not() {
     let g = m.current_map().expect("read").expect("map").generation();
     for round in 1..=6 {
         s.clock.advance(20 * SECOND);
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default())
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
             .expect("a beats");
-        m.heartbeat(b.id, b.boot, Progress::CaughtUp, Reported::default())
+        m.heartbeat(b.id, b.boot, Progress::CaughtUp, Reported::default(), None)
             .expect("b beats");
         let map = m.refresh().expect("refresh").expect("map");
         assert_eq!(
@@ -259,7 +259,7 @@ fn a_racing_refresh_gives_one_winner_and_one_retry() {
     m.set_state(a.id, MemberState::Active).expect("a");
     m.set_state(d.id, MemberState::Active).expect("d");
     s.clock.advance(40 * SECOND);
-    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default())
+    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
         .expect("a beats");
     s.clock.advance(25 * SECOND);
     let down = m.refresh().expect("refresh").expect("map");
@@ -335,7 +335,7 @@ fn removing_a_member_remaps_only_its_blobs() {
         for _ in 0..secs / 10 {
             s.clock.advance(10 * SECOND);
             for r in survivors {
-                m.heartbeat(r.id, r.boot, Progress::CaughtUp, Reported::default())
+                m.heartbeat(r.id, r.boot, Progress::CaughtUp, Reported::default(), None)
                     .expect("beat");
             }
         }
@@ -443,7 +443,7 @@ fn a_report_cannot_change_a_member_that_is_not_catching_up() {
         (&active, Progress::CatchingUp),
     ] {
         assert_eq!(
-            m.heartbeat(who.id, who.boot, progress, Reported::default())
+            m.heartbeat(who.id, who.boot, progress, Reported::default(), None)
                 .expect("beat"),
             g
         );
@@ -455,14 +455,20 @@ fn a_report_cannot_change_a_member_that_is_not_catching_up() {
 
     s.clock.advance(20 * SECOND);
     for who in [&draining, &joining, &active] {
-        m.heartbeat(who.id, who.boot, Progress::CatchingUp, Reported::default())
-            .expect("beat");
+        m.heartbeat(
+            who.id,
+            who.boot,
+            Progress::CatchingUp,
+            Reported::default(),
+            None,
+        )
+        .expect("beat");
     }
     s.clock.advance(11 * SECOND);
     let map = m.refresh().expect("refresh").expect("map");
     assert_eq!(state(&map, down.id), Some(MemberState::Down));
     assert!(matches!(
-        m.heartbeat(down.id, down.boot, Progress::CaughtUp, Reported::default()),
+        m.heartbeat(down.id, down.boot, Progress::CaughtUp, Reported::default(), None),
         Err(MembershipError::NotRegistered(id)) if id == down.id
     ));
     let after = m.current_map().expect("read").expect("map");
@@ -485,17 +491,23 @@ fn a_report_of_done_promotes_only_a_catching_up_member() {
     assert_eq!(state(&map, a.id), Some(MemberState::CatchingUp));
     let g = map.generation();
     assert_eq!(
-        m.heartbeat(a.id, a.boot, Progress::CatchingUp, Reported::default())
-            .expect("beat"),
+        m.heartbeat(
+            a.id,
+            a.boot,
+            Progress::CatchingUp,
+            Reported::default(),
+            None
+        )
+        .expect("beat"),
         g
     );
     assert_eq!(
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default())
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
             .expect("beat"),
         g + 1
     );
     assert_eq!(
-        m.heartbeat(b.id, b.boot, Progress::CaughtUp, Reported::default())
+        m.heartbeat(b.id, b.boot, Progress::CaughtUp, Reported::default(), None)
             .expect("beat"),
         g + 1
     );
@@ -503,7 +515,7 @@ fn a_report_of_done_promotes_only_a_catching_up_member() {
     assert_eq!(state(&map, a.id), Some(MemberState::Active));
     assert_eq!(state(&map, b.id), Some(MemberState::Draining));
     assert_eq!(
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default())
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
             .expect("beat"),
         g + 1,
         "a second report changes nothing"
@@ -539,7 +551,7 @@ fn bad_calls_are_refused_by_name() {
     let a = m.register(&node(1)).expect("a");
     let b = m.register(&node(1)).expect("a again");
     assert!(matches!(
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default()),
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None),
         Err(MembershipError::Superseded {
             boot: 1,
             current: 2,
@@ -547,11 +559,17 @@ fn bad_calls_are_refused_by_name() {
         })
     ));
     assert!(
-        m.heartbeat(b.id, b.boot, Progress::CaughtUp, Reported::default())
+        m.heartbeat(b.id, b.boot, Progress::CaughtUp, Reported::default(), None)
             .is_ok()
     );
     assert!(matches!(
-        m.heartbeat(MemberId(99), 1, Progress::CaughtUp, Reported::default()),
+        m.heartbeat(
+            MemberId(99),
+            1,
+            Progress::CaughtUp,
+            Reported::default(),
+            None
+        ),
         Err(MembershipError::NotRegistered(MemberId(99)))
     ));
     assert!(matches!(
@@ -595,7 +613,7 @@ fn the_map_clamps_replication_and_reports_its_generation() {
     let b = m.register(&node(2)).expect("b");
     assert_eq!(b.map.r(), 2);
     assert_eq!(
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default())
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
             .expect("beat"),
         b.map.generation()
     );
@@ -678,7 +696,7 @@ fn writers_that_keep_losing_give_up_and_store_failures_surface() {
     }
     s.conflict_on(Some("member/"));
     assert!(matches!(
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default()),
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None),
         Err(MembershipError::Contended)
     ));
     s.conflict_on(None);
@@ -826,7 +844,7 @@ fn a_restarted_active_member_is_active_again() {
     assert_eq!(quick.map.generation(), g, "nothing changed in the map");
 
     s.clock.advance(20 * SECOND);
-    m.heartbeat(b.id, b.boot, Progress::CaughtUp, Reported::default())
+    m.heartbeat(b.id, b.boot, Progress::CaughtUp, Reported::default(), None)
         .expect("b");
     s.clock.advance(11 * SECOND);
     let down = m.refresh().expect("refresh").expect("map");
@@ -875,11 +893,95 @@ fn a_catching_up_registration_becomes_active_on_its_caught_up_beat() {
     let a = m.register(&rebuilding).expect("a");
     assert_eq!(state(&a.map, a.id), Some(MemberState::CatchingUp));
     assert_eq!(s.fake.get("meta/members_formed").expect("read"), None);
-    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default())
+    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Reported::default(), None)
         .expect("beat");
     let map = m.current_map().expect("read").expect("a map");
     assert_eq!(state(&map, a.id), Some(MemberState::Active));
     assert!(s.fake.get("meta/members_formed").expect("read").is_some());
+}
+
+/// Catches: a heartbeat that rewrites a row for a caller that does not hold its address,
+/// or that tells such a caller anything about the row. The holder is asked of the
+/// address on the row (`192.0.2.1:8982`) before the boot is compared: a refused holder
+/// gets `NotHolder` with the right boot and with a wrong one (never `Superseded`, which
+/// would tell it the boot), a `NotRegistered` member is still `NotRegistered`, and the
+/// row is not touched (same version, so its time to live is not renewed, and a
+/// `CatchingUp` member is not promoted by a refused caller's report). An accepting holder
+/// beats and promotes, and is asked the same address.
+///
+/// Mutants seen red: the holder asked after the boot comparison; the holder not asked.
+#[test]
+fn a_heartbeat_is_asked_whether_the_caller_holds_the_address_before_the_boot_is_compared() {
+    let s = Hooked::new();
+    let m = members(&s, config(30, 120));
+    let rebuilding = Registrant {
+        progress: Progress::CatchingUp,
+        ..node(1)
+    };
+    let a = m.register(&rebuilding).expect("a");
+    let before = s.fake.get(&format!("member/{}", a.id.0)).expect("read");
+    let asked = std::cell::RefCell::new(Vec::new());
+    let refuses = |addr: &str| {
+        asked.borrow_mut().push(addr.to_owned());
+        false
+    };
+    let accepts = |addr: &str| {
+        asked.borrow_mut().push(addr.to_owned());
+        true
+    };
+    for boot in [a.boot, a.boot + 5] {
+        let refused = m
+            .heartbeat(
+                a.id,
+                boot,
+                Progress::CaughtUp,
+                Reported::default(),
+                Some(&refuses),
+            )
+            .expect_err("the caller does not hold the address");
+        assert!(
+            matches!(refused, MembershipError::NotHolder(id) if id == a.id),
+            "boot {boot}: {refused}"
+        );
+    }
+    assert_eq!(*asked.borrow(), ["192.0.2.1:8982"; 2]);
+    assert_eq!(
+        s.fake.get(&format!("member/{}", a.id.0)).expect("read"),
+        before
+    );
+    let map = m.current_map().expect("read").expect("a map");
+    assert_eq!(state(&map, a.id), Some(MemberState::CatchingUp));
+    assert!(matches!(
+        m.heartbeat(
+            MemberId(99),
+            1,
+            Progress::CaughtUp,
+            Reported::default(),
+            Some(&refuses)
+        ),
+        Err(MembershipError::NotRegistered(MemberId(99)))
+    ));
+
+    assert!(matches!(
+        m.heartbeat(
+            a.id,
+            a.boot + 5,
+            Progress::CaughtUp,
+            Reported::default(),
+            Some(&accepts)
+        ),
+        Err(MembershipError::Superseded { .. })
+    ));
+    m.heartbeat(
+        a.id,
+        a.boot,
+        Progress::CaughtUp,
+        Reported::default(),
+        Some(&accepts),
+    )
+    .expect("the holder beats");
+    let map = m.current_map().expect("read").expect("a map");
+    assert_eq!(state(&map, a.id), Some(MemberState::Active));
 }
 
 /// Catches: `Down` being settable by hand (it is the store's verdict).

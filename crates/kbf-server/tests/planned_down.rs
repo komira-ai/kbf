@@ -84,6 +84,7 @@ impl Farm {
                 self.boots[which],
                 Progress::CaughtUp,
                 Reported::default(),
+                None,
             )
             .expect("beats")
     }
@@ -99,6 +100,9 @@ impl Farm {
 struct Node {
     stopped: AtomicBool,
     puts: Mutex<Vec<Digest>>,
+    commits: Mutex<Vec<Digest>>,
+    /// Calls that reached the node, refused or not.
+    called: std::sync::atomic::AtomicUsize,
 }
 
 impl Node {
@@ -106,6 +110,8 @@ impl Node {
         Arc::new(Self {
             stopped: AtomicBool::new(false),
             puts: Mutex::default(),
+            commits: Mutex::default(),
+            called: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -133,6 +139,7 @@ impl Storage for Node {
 
     fn put(&self, bytes: Bytes) -> Answer<'_, Digest> {
         Box::pin(async move {
+            self.called.fetch_add(1, Ordering::SeqCst);
             if self.stopped.load(Ordering::SeqCst) {
                 return Err(refused());
             }
@@ -176,10 +183,17 @@ impl Storage for Node {
     fn commit_action_record(
         &self,
         _: kbf_meta::Role,
-        _: Digest,
+        action: Digest,
         _: kbf_meta::ActionRecord,
     ) -> Answer<'_, ()> {
-        Box::pin(async { Err(StorageError::Internal("not used".to_owned())) })
+        Box::pin(async move {
+            self.called.fetch_add(1, Ordering::SeqCst);
+            if self.stopped.load(Ordering::SeqCst) {
+                return Err(refused());
+            }
+            self.commits.lock().expect("lock").push(action);
+            Ok(())
+        })
     }
 }
 
@@ -215,41 +229,68 @@ fn router_over(farm: &Farm, primary: MemberId) -> (Router, [Arc<Node>; 2], Bytes
     (router, nodes, blob)
 }
 
-// Catches: the upload failure a restart causes today, and that planning it away works. Node
-// a is the primary of the blob. Control: a stops with no plan, and for as long as the map
-// says it is Active (up to a TTL) the upload is refused. Then, on a fresh farm, a is planned
-// down while it still runs: the upload goes to b, and goes on going to b after a stops.
-// Mutants (planted locally): `plan_down` leaving the member `Active` in the map; the
-// router's write order not skipping `Down` members.
+// Catches: what a restart costs without a plan, and that planning removes it. Member a is the
+// primary of a blob and of an action. Control, a stops with no plan: a put is still taken (the
+// router moves on to b after dialling a, which is what the node's failure costs: a connection
+// attempt per write for up to a TTL), and an action-cache commit does not fail over and is
+// refused UNAVAILABLE. Planned, a is never dialled, the put and the commit both go to b, and
+// they still do after a stops. Mutants (planted locally): `plan_down` leaving the member
+// `Active` in the map; the router's write order not skipping `Down` members.
 #[tokio::test]
 async fn a_write_during_a_planned_restart_goes_to_the_other_owner() {
+    let record = || kbf_meta::ActionRecord {
+        result: kbf_segments::sha256(b"result"),
+        closure: Default::default(),
+    };
+    let action_of = |farm: &Farm| {
+        let map = farm.members.current_map().expect("read").expect("a map");
+        (0_u64..10_000)
+            .map(|i| kbf_segments::sha256(format!("action number {i}").as_bytes()))
+            .find(|d| map.write_owners(d).first() == Some(&farm.ids[0]))
+            .expect("an action that fits")
+    };
+
     let farm = Farm::new();
     let (router, nodes, blob) = router_over(&farm, farm.ids[0]);
     nodes[0].stopped.store(true, Ordering::SeqCst);
-    let error = router
-        .put(blob.clone())
-        .await
-        .expect_err("a stopped primary");
-    assert!(matches!(error, StorageError::Unavailable(_)), "{error:?}");
-    assert!(
-        nodes[1].put_log().is_empty(),
-        "a write goes to one owner only"
+    let digest = kbf_segments::sha256(&blob);
+    assert_eq!(
+        router.put(blob.clone()).await.expect("b takes it after a"),
+        digest
     );
+    assert_eq!(
+        nodes[0].called.load(Ordering::SeqCst),
+        1,
+        "the stopped member was dialled first"
+    );
+    let action = action_of(&farm);
+    let commit = router
+        .commit_action_record(kbf_meta::Role::Daemon, action, record())
+        .await
+        .expect_err("a commit does not fail over");
+    assert!(matches!(commit, StorageError::Unavailable(_)), "{commit:?}");
 
     let farm = Farm::new();
     let (router, nodes, blob) = router_over(&farm, farm.ids[0]);
     farm.members.plan_down(farm.ids[0], PLAN).expect("planned");
-    let digest = kbf_segments::sha256(&blob);
     assert_eq!(router.put(blob.clone()).await.expect("b takes it"), digest);
-    assert!(
-        nodes[0].put_log().is_empty(),
+    let action = action_of(&farm);
+    router
+        .commit_action_record(kbf_meta::Role::Daemon, action, record())
+        .await
+        .expect("the commit goes to b");
+    assert_eq!(
+        nodes[0].called.load(Ordering::SeqCst),
+        0,
         "nothing is sent to the member restarting"
     );
     assert_eq!(nodes[1].put_log(), [digest]);
+    assert_eq!(nodes[1].commits.lock().expect("lock").len(), 1);
 
     nodes[0].stopped.store(true, Ordering::SeqCst);
     assert_eq!(router.put(blob).await.expect("still b"), digest);
     assert_eq!(nodes[1].put_log().len(), 2);
+    assert_eq!(nodes[0].called.load(Ordering::SeqCst), 0);
 }
 
 // Catches: a planned restart that is not Down in the map, or that a heartbeat undoes (the
@@ -425,7 +466,7 @@ fn the_member_returns_by_registering_or_by_an_undo() {
     assert!(!farm.members.planned_down(b).expect("read"));
     let beat = farm
         .members
-        .heartbeat(b, back.boot, Progress::CaughtUp, Reported::default())
+        .heartbeat(b, back.boot, Progress::CaughtUp, Reported::default(), None)
         .expect("done");
     assert!(beat > back.map.generation());
     assert_eq!(farm.state(b), Some(MemberState::Active));
@@ -463,6 +504,7 @@ fn a_planned_restart_ends_by_the_next_beat_after_its_time() {
                 Progress::CaughtUp,
                 Reported::debts(kbf_server::storage_health::Debts::Known(0))
                     .with_writes(kbf_server::storage_health::Writes::Known(0), 0),
+                None,
             )
             .expect("beats")
     };

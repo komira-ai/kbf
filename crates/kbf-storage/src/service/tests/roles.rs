@@ -25,7 +25,8 @@ use tonic::{Code, Status};
 use super::fake::{Mem, serve_routes, sha};
 use crate::Storage;
 use crate::service::{
-    Admission, Config, Endpoint, PeerRole, ROLE_URI_PREFIX, StorageService, role_of,
+    Admission, Config, Endpoint, PeerRole, ROLE_URI_PREFIX, StorageService, host_of, names_of,
+    role_of,
 };
 
 fn uri(role: &str) -> SanType {
@@ -133,6 +134,18 @@ fn a_certificate_must_name_exactly_one_known_role() {
             assert!(answer.is_ok(), "{endpoint:?}");
         }
     }
+}
+
+/// Catches the names read wrongly at this crate's boundary: bytes that are not a
+/// certificate are UNAUTHENTICATED, as for the role, and a certificate's DNS name covers
+/// the host of an address that carries a port.
+#[test]
+fn the_names_of_a_certificate_cover_its_hosts_and_bad_bytes_are_unauthenticated() {
+    let status = names_of(b"not DER").expect_err("refused");
+    assert_eq!(status.code(), Code::Unauthenticated);
+    let names = names_of(&der(vec![uri("storage"), dns("node-a")])).expect("names");
+    assert!(names.covers(host_of("node-a:8982")));
+    assert!(!names.covers(host_of("node-b:8982")));
 }
 
 /// Catches the unowned-copy marker honoured from a role other than the frontend: under
