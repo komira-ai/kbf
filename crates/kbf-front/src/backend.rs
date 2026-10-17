@@ -413,7 +413,7 @@ async fn prepare(router: &Router, result: &ActionResult) -> Answer<ActionRecord>
     let needed: Vec<Digest> = closure.iter().copied().collect();
     let missing = router.find_missing(&needed).await?;
     if let Some(absent) = first_held_by_none(router, &missing).await? {
-        return Err(ActionWriteError::Absent(absent).into());
+        return Err(ActionWriteError::Absent(vec![absent]).into());
     }
     let stored = router
         .put(bytes::Bytes::from(result.encode_to_vec()))

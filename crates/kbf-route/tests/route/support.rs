@@ -418,7 +418,9 @@ impl Storage for Node {
                     .chain(record.closure.iter())
                     .find(|d| !blobs.contains_key(d));
                 if let Some(d) = lacking {
-                    return Err(StorageError::ActionWrite(ActionWriteError::Absent(*d)));
+                    return Err(StorageError::ActionWrite(ActionWriteError::Absent(vec![
+                        *d,
+                    ])));
                 }
             }
             self.commits.lock().expect("lock").push(action);

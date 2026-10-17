@@ -477,7 +477,7 @@ async fn prepare_finds_an_output_at_its_owner() {
         .await
         .expect_err("not held at the --storage node");
     assert!(
-        matches!(alone, StorageError::ActionWrite(ActionWriteError::Absent(d)) if d == case.output.1),
+        matches!(&alone, StorageError::ActionWrite(ActionWriteError::Absent(d)) if *d == [case.output.1]),
         "{alone:?}"
     );
 }
@@ -517,7 +517,7 @@ async fn prepare_finds_an_output_at_the_previous_generations_owner() {
         .await
         .expect_err("held nowhere");
     assert!(
-        matches!(refused, StorageError::ActionWrite(ActionWriteError::Absent(d)) if d == output.1),
+        matches!(&refused, StorageError::ActionWrite(ActionWriteError::Absent(d)) if *d == [output.1]),
         "{refused:?}"
     );
 
@@ -550,7 +550,7 @@ async fn prepare_names_the_output_no_node_holds() {
         .await
         .expect_err("held nowhere");
     assert!(
-        matches!(error, StorageError::ActionWrite(ActionWriteError::Absent(d)) if d == case.output.1),
+        matches!(&error, StorageError::ActionWrite(ActionWriteError::Absent(d)) if *d == [case.output.1]),
         "{error:?}"
     );
 }
@@ -600,7 +600,7 @@ async fn prepare_follows_an_output_directory_to_the_files_in_it() {
         .await
         .expect_err("the file is held nowhere");
     assert!(
-        matches!(error, StorageError::ActionWrite(ActionWriteError::Absent(d)) if d == file.1),
+        matches!(&error, StorageError::ActionWrite(ActionWriteError::Absent(d)) if *d == [file.1]),
         "{error:?}"
     );
 
