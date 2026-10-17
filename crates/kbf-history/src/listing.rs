@@ -191,11 +191,16 @@ impl Walk {
             return self;
         };
         let past = Bound::Excluded(format!("{}{after}", self.prefix));
+        self.go_past(past);
+        self
+    }
+
+    /// Moves the walk's start (the end, for a reverse walk) to `past`.
+    fn go_past(&mut self, past: Bound<String>) {
         match self.direction {
             Direction::Forward => self.lower = past,
             Direction::Reverse => self.upper = past,
         }
-        self
     }
 }
 
@@ -517,11 +522,7 @@ impl<O> Reader<O> {
             if scanned >= self.scan_budget {
                 return Ok((out, Some(cursor(&walk, resume.key()))));
             }
-            let past = Bound::Excluded(resume.key().to_owned());
-            match walk.direction {
-                Direction::Forward => walk.lower = past,
-                Direction::Reverse => walk.upper = past,
-            }
+            walk.go_past(Bound::Excluded(resume.key().to_owned()));
         }
     }
 }
