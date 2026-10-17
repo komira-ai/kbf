@@ -354,8 +354,9 @@ impl<E: Exec> Helper<E> {
     fn activate(&mut self, order: &Order, now: u64) -> Result<Done, String> {
         let ordered = activate::Order {
             commit: order.commit.clone(),
-            order_id: order.id.to_string(),
-            serial: order.id,
+            // The epoch is part of the name: a restored store counts ids again, and an activation
+            // under the same id as a pending one would be taken for its repeat.
+            order_id: format!("{}-{}", order.epoch, order.id),
         };
         let arm = self.arm(order);
         match activate::activate(
