@@ -529,16 +529,29 @@ impl Cell {
         let mut build = self.pause("buck2-pause.log", self.pause)?;
         build.lease(&daemon_log, before)?;
         let deadline = Instant::now() + LEASE_WAIT;
+        // Until there is exactly one: the first container seen may be the state of an
+        // earlier lease on its way out, so seeing two once is not the answer. Two that
+        // stay until the build ends or the wait is over are, and the failure names them.
+        let mut seen = Vec::new();
         let running = loop {
             let running = self.containers();
             let gave_up = !build.running()? | (Instant::now() >= deadline);
-            if (running > 0) | gave_up {
-                break running;
+            let one = running.len() == 1;
+            // The last containers seen, when the build has ended and taken them away.
+            if !running.is_empty() {
+                seen = running;
+            }
+            if one | gave_up {
+                break seen;
             }
             std::thread::sleep(POLL);
         };
-        let why = format!("while //:pause ran, {running} crun containers existed, not one");
-        ensure(running == 1, why)?;
+        let why = format!(
+            "while //:pause ran, {} crun containers existed, not one: {}",
+            running.len(),
+            running.join(" ")
+        );
+        ensure(running.len() == 1, why)?;
         let actions = cgroup.join("actions");
         let lease_cgroups = names(&actions, "kbf-lease-");
         let why = format!(
@@ -569,14 +582,18 @@ impl Cell {
         let (left, dirs) = loop {
             let left = self.containers();
             let dirs = names(&self.leases, LEASE_PREFIX);
-            let clean = (left == 0) & dirs.is_empty();
+            let clean = left.is_empty() & dirs.is_empty();
             if clean | (Instant::now() >= deadline) {
                 break (left, dirs);
             }
             std::thread::sleep(POLL);
         };
-        let why = format!("{left} crun containers are left");
-        ensure(left == 0, why)?;
+        let why = format!(
+            "{} crun containers are left: {}",
+            left.len(),
+            left.join(" ")
+        );
+        ensure(left.is_empty(), why)?;
         let why = format!("lease scratch directories are left: {}", dirs.join(" "));
         ensure(dirs.is_empty(), why)?;
         println!("OK: no container and no lease directory left");
@@ -646,14 +663,20 @@ impl Cell {
         Process::spawn(command, "the //:pause build")
     }
 
-    /// How many `crun` containers the daemon's leases hold: `crun` keeps a state
-    /// directory per container in the `--root` the driver gives it, `<lease>/crun`, and
-    /// removes it when the container ends (`crun run` deletes what it made).
-    fn containers(&self) -> usize {
+    /// The `crun` containers the daemon's leases hold, as `<lease>/<container>`: `crun`
+    /// keeps a state directory per container in the `--root` the driver gives it,
+    /// `<lease>/crun`, and removes it when the container ends (`crun run` deletes what
+    /// it made).
+    fn containers(&self) -> Vec<String> {
         names(&self.leases, LEASE_PREFIX)
             .iter()
-            .map(|lease| names(&self.leases.join(lease).join("crun"), "").len())
-            .sum()
+            .flat_map(|lease| {
+                let state = self.leases.join(lease).join("crun");
+                names(&state, "")
+                    .into_iter()
+                    .map(move |container| format!("{lease}/{container}"))
+            })
+            .collect()
     }
 
     /// buck2, in the project's copy.
