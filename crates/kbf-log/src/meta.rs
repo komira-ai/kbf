@@ -147,18 +147,18 @@ pub(crate) fn to_proto(command: &Command) -> Result<proto::MetaCommand, EncodeEr
             member: writer.member().get(),
             boot: writer.boot().get(),
         }),
-        Command::AdoptSegment { object, entries } => P::AdoptSegment(proto::AdoptSegment {
-            object: Some(object_id(*object)),
-            entries: entries
-                .iter()
-                .map(|(d, offset)| {
-                    Ok(proto::AdoptedBlob {
-                        digest: Some(digest(d)?),
-                        offset: *offset,
-                    })
-                })
-                .collect::<Result<_, EncodeError>>()?,
-        }),
+        Command::AdoptSegment { object, entries } => {
+            let hashes = digests(entries.iter().map(|(d, _)| d))?;
+            let blob =
+                |(digest, (_, offset)): (proto::Digest, &(Digest, u64))| proto::AdoptedBlob {
+                    digest: Some(digest),
+                    offset: *offset,
+                };
+            P::AdoptSegment(proto::AdoptSegment {
+                object: Some(object_id(*object)),
+                entries: hashes.into_iter().zip(entries).map(blob).collect(),
+            })
+        }
         Command::RebuildProgress { after } => P::RebuildProgress(proto::RebuildProgress {
             after_key: after.clone(),
         }),

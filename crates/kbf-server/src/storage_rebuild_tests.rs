@@ -316,17 +316,19 @@ async fn start<O: ObjectStore>(
     dir: &Path,
     meta: &str,
     store: O,
-    frontend: &Frontend,
+    frontend: Option<&Frontend>,
     rebuild: RebuildConfig,
 ) -> Node {
     let meta_dir = dir.join(meta);
-    let argv = [
+    let mut argv = vec![
         "storage".to_owned(),
         "--storage-listen=127.0.0.1:0".to_owned(),
         format!("--cold-store=file://{}", dir.join("unused-cold").display()),
         format!("--meta-dir={}", meta_dir.display()),
-        format!("--frontend=http://{}", frontend.addr),
     ];
+    if let Some(frontend) = frontend {
+        argv.push(format!("--frontend=http://{}", frontend.addr));
+    }
     let matches = command().try_get_matches_from(argv).expect("the flags");
     let flags = parse(&matches).expect("the flags");
     let log = RaftMetaLog::open_dir(&meta_dir, Retention::default(), "kbf/")
@@ -400,7 +402,7 @@ async fn old_segments<O: ObjectStore + Clone>(
 /// a larger boot, and checks the new node holds every blob.
 async fn wipe_and_rebuild<O: ObjectStore + Clone>(store: O, dir: &Path) {
     let frontend = Frontend::start();
-    let first = start(dir, "meta-first", store.clone(), &frontend, small()).await;
+    let first = start(dir, "meta-first", store.clone(), Some(&frontend), small()).await;
     within("the rebuild to finish", first.catch_up.finished()).await;
     let mut blobs = Vec::new();
     for i in 0..5 {
@@ -412,7 +414,7 @@ async fn wipe_and_rebuild<O: ObjectStore + Clone>(store: O, dir: &Path) {
     first.kill().await;
 
     // The metadata directory is gone: a new log, and the frontend hands out boot 2.
-    let second = start(dir, "meta-second", store, &frontend, small()).await;
+    let second = start(dir, "meta-second", store, Some(&frontend), small()).await;
     within("the rebuild to finish", second.catch_up.finished()).await;
     second.holds(&blobs).await;
     assert_eq!(frontend.registrations(), [true, true]);
@@ -459,7 +461,7 @@ async fn a_restart_mid_rebuild_resumes_and_stays_catching_up() {
     assert_eq!(keys.len(), 6);
 
     let held = bucket.scripted(3);
-    let first = start(&dir, "meta", held.clone(), &frontend, small()).await;
+    let first = start(&dir, "meta", held.clone(), Some(&frontend), small()).await;
     within("the first start to list", held.script.entered.notified()).await;
     // The four objects of the first two pages are indexed; wait until they read back.
     let mut indexed = 0;
@@ -482,7 +484,7 @@ async fn a_restart_mid_rebuild_resumes_and_stays_catching_up() {
     reopen_when_free(&dir.join("meta")).await;
 
     let gated = bucket.scripted(1);
-    let second = start(&dir, "meta", gated.clone(), &frontend, small()).await;
+    let second = start(&dir, "meta", gated.clone(), Some(&frontend), small()).await;
     within(
         "the restarted node to list",
         gated.script.entered.notified(),
@@ -524,7 +526,7 @@ async fn a_finished_rebuild_is_not_run_again_by_a_restart() {
     let dir = scratch("finished");
     let frontend = Frontend::start();
     let bucket = Bucket::new();
-    let first = start(&dir, "meta", bucket.scripted(0), &frontend, small()).await;
+    let first = start(&dir, "meta", bucket.scripted(0), Some(&frontend), small()).await;
     within("the rebuild to finish", first.catch_up.finished()).await;
     let bytes = Bytes::from_static(b"a blob of the first start");
     let digest = first.client.put(bytes.clone()).await.expect("put");
@@ -532,7 +534,7 @@ async fn a_finished_rebuild_is_not_run_again_by_a_restart() {
     reopen_when_free(&dir.join("meta")).await;
 
     let view = bucket.scripted(0);
-    let second = start(&dir, "meta", view.clone(), &frontend, small()).await;
+    let second = start(&dir, "meta", view.clone(), Some(&frontend), small()).await;
     assert_eq!(frontend.registrations(), [true, false]);
     assert!(!second.catch_up.is_catching_up());
     assert_eq!(second.client.read_blob(&digest).await.expect("read"), bytes);
@@ -559,7 +561,7 @@ async fn a_failed_rebuild_is_tried_again_and_the_node_stays_catching_up() {
     let old = old_segments(&bucket, 0x11, 3).await;
     let view = bucket.scripted(0);
     view.fail_lists(true);
-    let node = start(&dir, "meta", view.clone(), &frontend, small()).await;
+    let node = start(&dir, "meta", view.clone(), Some(&frontend), small()).await;
     within("a second attempt to list", async {
         while view.lists() < 2 {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -577,4 +579,22 @@ async fn a_failed_rebuild_is_tried_again_and_the_node_stays_catching_up() {
     view.fail_lists(false);
     within("the rebuild to finish", node.catch_up.finished()).await;
     node.holds(&old).await;
+}
+
+/// Catches: a node without `--frontend` that rebuilds (it keeps its objects under its own
+/// log's prefix, and nothing registers it as catching up, so a rebuild there would only
+/// hold its misses back): it is not catching up when it returns, answers a miss NOT_FOUND
+/// at once, and never lists the store. Mutant seen red: `open_cache` taking every node as
+/// rebuilding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_without_a_frontend_owes_no_rebuild() {
+    let dir = scratch("alone");
+    let bucket = Bucket::new();
+    let old = old_segments(&bucket, 0x11, 2).await;
+    let view = bucket.scripted(0);
+    let node = start(&dir, "meta", view.clone(), None, small()).await;
+    assert!(!node.catch_up.is_catching_up());
+    let read = node.client.read_blob(&old[0].0).await;
+    assert!(matches!(read, Err(StorageError::NotFound(_))), "{read:?}");
+    assert_eq!(view.lists(), 0);
 }

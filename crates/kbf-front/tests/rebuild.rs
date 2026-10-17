@@ -10,7 +10,8 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use kbf_front::{
-    Cache, CacheError, MemoryMetaLog, MetaLog, ObjectKeys, RebuildConfig, VerifiedBlob,
+    Cache, CacheError, MemoryMetaLog, MetaLog, MetaLogError, ObjectKeys, RebuildConfig,
+    VerifiedBlob,
 };
 use kbf_meta::{Applied, BlobAnswer, Command, NodeWriter, ObjectId, Rebuild, Retention, Writer};
 use kbf_objstore::footers::FooterReads;
@@ -32,7 +33,15 @@ struct Inner {
     lists: AtomicUsize,
     /// The listing call (counting from 1) that fails; 0 for none.
     fail_list: AtomicUsize,
+    /// How ranged reads go: [`READS_OK`], [`READS_FAIL`] or [`READS_GONE`].
+    reads: AtomicUsize,
 }
+
+const READS_OK: usize = 0;
+/// Every ranged read fails with a store error.
+const READS_FAIL: usize = 1;
+/// Every ranged read finds the object gone.
+const READS_GONE: usize = 2;
 
 impl Bucket {
     fn new() -> Self {
@@ -40,7 +49,12 @@ impl Bucket {
             store: MemoryStore::new(Capabilities::default()),
             lists: AtomicUsize::new(0),
             fail_list: AtomicUsize::new(0),
+            reads: AtomicUsize::new(READS_OK),
         }))
+    }
+
+    fn set_reads(&self, mode: usize) {
+        self.0.reads.store(mode, Ordering::SeqCst);
     }
 
     fn lists(&self) -> usize {
@@ -112,7 +126,11 @@ impl ObjectStore for Bucket {
         key: &ObjectKey,
         range: ByteRange,
     ) -> Result<Bytes, ObjectStoreError> {
-        self.0.store.get_range(key, range).await
+        match self.0.reads.load(Ordering::SeqCst) {
+            READS_OK => self.0.store.get_range(key, range).await,
+            READS_GONE => Err(ObjectStoreError::NotFound(key.clone())),
+            _ => Err(ObjectStoreError::Protocol("a scripted read failure".into())),
+        }
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
@@ -163,8 +181,53 @@ fn blobs(tag: &str, n: usize) -> Vec<(Digest, Bytes)> {
         .collect()
 }
 
-fn fresh_log() -> MemoryMetaLog {
-    MemoryMetaLog::new(Retention::default())
+/// The metadata log of every cache of a test, so every cache is one type
+/// (`Cache<Log, Bucket>`). Clones share the log, as successive processes over one
+/// directory do; one can answer each command of one kind with another command's outcome,
+/// as a broken log would.
+#[derive(Clone)]
+struct Log {
+    log: Arc<MemoryMetaLog>,
+    /// The label ([`kbf_front::metrics::COMMANDS`]) of the command it misanswers.
+    misanswers: Option<&'static str>,
+}
+
+impl Log {
+    fn new() -> Self {
+        Self {
+            log: Arc::new(MemoryMetaLog::new(Retention::default())),
+            misanswers: None,
+        }
+    }
+
+    fn misanswering(label: &'static str) -> Self {
+        Self {
+            misanswers: Some(label),
+            ..Self::new()
+        }
+    }
+}
+
+impl MetaLog for Log {
+    async fn commit(&self, command: Command) -> Result<Applied, MetaLogError> {
+        let label = kbf_front::metrics::COMMANDS[kbf_front::metrics::command_label(&command)];
+        if self.misanswers == Some(label) {
+            return Ok(Applied::Ticked(kbf_types::FarmTime::default()));
+        }
+        self.log.commit(command).await
+    }
+
+    async fn query<R, F>(&self, f: F) -> Result<R, MetaLogError>
+    where
+        F: FnOnce(&kbf_meta::MetaState) -> R + Send,
+        R: Send,
+    {
+        self.log.query(f).await
+    }
+}
+
+fn fresh_log() -> Log {
+    Log::new()
 }
 
 /// Stores `blobs` one segment each through a node writer's cache over a log of its own
@@ -197,7 +260,7 @@ async fn write_as_old_server(bucket: &Bucket, log: u64, blobs: &[(Digest, Bytes)
 }
 
 /// A new node's cache over a new log (id `log`) and the bucket.
-async fn new_node(bucket: &Bucket, log: u64, writer: NodeWriter) -> Cache<MemoryMetaLog, Bucket> {
+async fn new_node(bucket: &Bucket, log: u64, writer: NodeWriter) -> Cache<Log, Bucket> {
     Cache::open_node(fresh_log(), bucket.clone(), keys(log), writer)
         .await
         .expect("open as a node")
@@ -289,7 +352,7 @@ async fn a_wiped_node_finds_its_earlier_boots_and_other_members() {
 }
 
 /// The object the index holds `digest` at, if it holds it present.
-async fn object_of(cache: &Cache<MemoryMetaLog, Bucket>, digest: Digest) -> Option<ObjectId> {
+async fn object_of(cache: &Cache<Log, Bucket>, digest: Digest) -> Option<ObjectId> {
     let found = cache.meta().query(move |s| match s.blob(&digest) {
         BlobAnswer::Present { location, .. } => Some(location.object),
         BlobAnswer::Unavailable | BlobAnswer::Absent => None,
@@ -431,75 +494,17 @@ async fn a_failed_footer_read_stops_the_rebuild_instead_of_skipping() {
     let bucket = Bucket::new();
     let old = blobs("old", 3);
     write_as_old_server(&bucket, 0x11, &old).await;
-    // A second bucket view that fails every read until told not to.
-    let flaky = Arc::new(AtomicUsize::new(READ_FAILS));
-    let view = Flaky {
-        bucket: bucket.clone(),
-        fail: Arc::clone(&flaky),
-    };
-    let node = Cache::open_node(fresh_log(), view, keys(0x33), node(7, 1))
-        .await
-        .expect("open");
+    bucket.set_reads(READS_FAIL);
+    let node = new_node(&bucket, 0x33, node(7, 1)).await;
     let failed = node.rebuild_index(small()).await.err();
     assert!(matches!(failed, Some(CacheError::Store(_))), "{failed:?}");
     assert!(matches!(
         node.meta().query(|s| s.rebuild()).await.expect("query"),
         Rebuild::Pending { .. }
     ));
-    flaky.store(0, Ordering::SeqCst);
+    bucket.set_reads(READS_OK);
     node.rebuild_index(small()).await.expect("retry");
     assert_holds(&node, &old).await;
-}
-
-const READ_FAILS: usize = 1;
-const READ_GONE: usize = 2;
-
-/// A bucket whose ranged reads fail while `fail` is not zero: with a store error when it
-/// is [`READ_FAILS`], as if the object were gone when it is [`READ_GONE`].
-struct Flaky {
-    bucket: Bucket,
-    fail: Arc<AtomicUsize>,
-}
-
-impl ObjectStore for Flaky {
-    fn capabilities(&self) -> Capabilities {
-        self.bucket.capabilities()
-    }
-
-    async fn put_new(
-        &self,
-        key: &ObjectKey,
-        body: Bytes,
-        retain_until: Option<SystemTime>,
-    ) -> Result<(), ObjectStoreError> {
-        self.bucket.put_new(key, body, retain_until).await
-    }
-
-    async fn get_range(
-        &self,
-        key: &ObjectKey,
-        range: ByteRange,
-    ) -> Result<Bytes, ObjectStoreError> {
-        match self.fail.load(Ordering::SeqCst) {
-            0 => {}
-            READ_GONE => return Err(ObjectStoreError::NotFound(key.clone())),
-            _ => return Err(ObjectStoreError::Protocol("a scripted read failure".into())),
-        }
-        self.bucket.get_range(key, range).await
-    }
-
-    async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
-        self.bucket.delete(key).await
-    }
-
-    async fn list(
-        &self,
-        prefix: &KeyPrefix,
-        after: Option<&ListToken>,
-        max_keys: PageSize,
-    ) -> Result<ListPage, ObjectStoreError> {
-        self.bucket.list(prefix, after, max_keys).await
-    }
 }
 
 /// Catches: an object deleted between the listing and the read of its footer (a sweep, a
@@ -509,42 +514,11 @@ impl ObjectStore for Flaky {
 async fn an_object_gone_since_it_was_listed_is_counted_and_skipped() {
     let bucket = Bucket::new();
     write_as_old_server(&bucket, 0x11, &blobs("old", 3)).await;
-    let view = Flaky {
-        bucket: bucket.clone(),
-        fail: Arc::new(AtomicUsize::new(READ_GONE)),
-    };
-    let node = Cache::open_node(fresh_log(), view, keys(0x33), node(7, 1))
-        .await
-        .expect("open");
+    bucket.set_reads(READS_GONE);
+    let node = new_node(&bucket, 0x33, node(7, 1)).await;
     let report = node.rebuild_index(small()).await.expect("rebuild");
     assert_eq!((report.objects, report.gone, report.segments), (3, 3, 0));
     assert_eq!(rebuild_of(&node).await, Rebuild::Done);
-}
-
-/// A log that answers each command of one kind with another command's outcome, as a
-/// broken log would, and applies the rest.
-struct Misanswering {
-    log: MemoryMetaLog,
-    /// The label ([`kbf_front::metrics::COMMANDS`]) of the command it misanswers.
-    label: &'static str,
-}
-
-impl MetaLog for Misanswering {
-    async fn commit(&self, command: Command) -> Result<Applied, kbf_front::MetaLogError> {
-        let label = kbf_front::metrics::COMMANDS[kbf_front::metrics::command_label(&command)];
-        if label == self.label {
-            return Ok(Applied::Ticked(kbf_types::FarmTime::default()));
-        }
-        self.log.commit(command).await
-    }
-
-    async fn query<R, F>(&self, f: F) -> Result<R, kbf_front::MetaLogError>
-    where
-        F: FnOnce(&kbf_meta::MetaState) -> R + Send,
-        R: Send,
-    {
-        self.log.query(f).await
-    }
 }
 
 /// Catches: a rebuild that takes an outcome the log did not give for its command (a broken
@@ -555,10 +529,7 @@ async fn a_log_that_misanswers_a_rebuild_command_fails_the_rebuild() {
     for label in ["adopt_segment", "rebuild_progress", "rebuild_done"] {
         let bucket = Bucket::new();
         write_as_old_server(&bucket, 0x11, &blobs("old", 2)).await;
-        let log = Misanswering {
-            log: fresh_log(),
-            label,
-        };
+        let log = Log::misanswering(label);
         let node = Cache::open_node(log, bucket.clone(), keys(0x33), node(7, 1))
             .await
             .expect("open");
@@ -637,11 +608,8 @@ async fn a_rebuild_leaves_the_nodes_own_objects_to_its_puts() {
 async fn the_marker_is_the_logs_not_the_caches() {
     let bucket = Bucket::new();
     write_as_old_server(&bucket, 0x11, &blobs("old", 2)).await;
-    let log = Arc::new(fresh_log());
-    let open = |boot| {
-        let log = SharedLog(Arc::clone(&log));
-        Cache::open_node(log, bucket.clone(), keys(0x33), node(7, boot))
-    };
+    let log = fresh_log();
+    let open = |boot| Cache::open_node(log.clone(), bucket.clone(), keys(0x33), node(7, boot));
     let first = open(1).await.expect("open");
     first.rebuild_index(small()).await.expect("rebuild");
     let lists = bucket.lists();
@@ -663,24 +631,6 @@ async fn the_marker_is_the_logs_not_the_caches() {
             .already_done
     );
     assert!(bucket.lists() > lists);
-}
-
-/// One log shared by several opens, as successive processes over one directory.
-#[derive(Clone)]
-struct SharedLog(Arc<MemoryMetaLog>);
-
-impl MetaLog for SharedLog {
-    async fn commit(&self, command: Command) -> Result<kbf_meta::Applied, kbf_front::MetaLogError> {
-        self.0.commit(command).await
-    }
-
-    async fn query<R, F>(&self, f: F) -> Result<R, kbf_front::MetaLogError>
-    where
-        F: FnOnce(&kbf_meta::MetaState) -> R + Send,
-        R: Send,
-    {
-        self.0.query(f).await
-    }
 }
 
 /// Catches: an adoption command that a segment of many records does not fit in: a segment

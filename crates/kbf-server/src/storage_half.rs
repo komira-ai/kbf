@@ -177,13 +177,8 @@ where
     let storage: Arc<dyn Storage> = Arc::new(CacheStorage::new(cache, segments));
     // As `kbf storage` does: with a frontend, hold its map and serve nothing until the first.
     let gate = flags.frontend.as_ref().map(|_| Arc::clone(&maps));
-    let bound = serve_storage(
-        Arc::clone(&storage),
-        socket,
-        gate,
-        Some(catch_up.clone()),
-        shutdown()?,
-    )?;
+    let catch = Some(catch_up.clone());
+    let bound = serve_storage(Arc::clone(&storage), socket, gate, catch, shutdown()?)?;
     let addr = bound.addr;
     let _joiner = joiner.map(|(joiner, joined)| AbortOnDrop(tokio::spawn(joiner.keep(joined))));
     Ok(StorageHalf {

@@ -890,6 +890,23 @@ pub fn bind_storage_socket(listener: StorageListener) -> Result<StorageSocket, S
     })
 }
 
+/// The storage service's routes, answering as a node that is rebuilding its index if
+/// `catch_up` is given. Not generic over the shutdown future, so the two kinds of node are
+/// two arms of one function, not of one copy per caller.
+fn storage_routes(
+    storage: Arc<dyn kbf_storage::Storage>,
+    admission: Admission,
+    config: kbf_storage::service::Config,
+    catch_up: Option<kbf_storage::service::CatchUp>,
+) -> Routes {
+    let service = kbf_storage::service::StorageService::new(storage, admission, config);
+    match catch_up {
+        Some(catch_up) => service.with_catch_up(catch_up),
+        None => service,
+    }
+    .routes()
+}
+
 /// Serves `storage` on `socket`, as [`bind_storage_gated`] does, and, with `catch_up`,
 /// as a node that is rebuilding its index until it says otherwise: a miss is answered
 /// UNAVAILABLE, never NOT_FOUND ([`kbf_storage::service::CatchUp`]).
@@ -916,12 +933,7 @@ pub fn serve_storage(
         }
         None => kbf_storage::service::Admission::Open,
     };
-    let service = kbf_storage::service::StorageService::new(storage, admission, listener.service);
-    let routes = match catch_up {
-        Some(catch_up) => service.with_catch_up(catch_up),
-        None => service,
-    }
-    .routes();
+    let routes = storage_routes(storage, admission, listener.service, catch_up);
     let gate = tonic::service::InterceptorLayer::new(map_gate(maps));
     let serving = async move {
         server
