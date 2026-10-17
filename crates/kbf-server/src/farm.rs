@@ -1071,10 +1071,7 @@ impl State {
                     let next = self.sched.apply(Input::new(now, committed));
                     if self.unwritten.len() >= self.held_cap {
                         self.write_drops += 1;
-                        tracing::error!(
-                            cap = self.held_cap,
-                            "held-back records over the cap: one dropped"
-                        );
+                        tracing::error!(cap = self.held_cap, "records over the cap: one dropped");
                         continue;
                     }
                     self.unwritten.push_back(next.into());

@@ -226,6 +226,14 @@ impl StoredOperation {
 
 mod fate;
 
+/// The lease an effect starts, if it is a `Start`.
+fn started(effect: &Effect) -> Option<LeaseId> {
+    match effect {
+        Effect::Start(start) => Some(start.lease),
+        _ => None,
+    }
+}
+
 /// How a write to the state store ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Attempt {
@@ -813,10 +821,7 @@ impl State {
                 Attempt::Transient => {
                     self.retrying = Some(effect);
                     let held: usize = self.unwritten.iter().map(VecDeque::len).sum();
-                    tracing::warn!(
-                        held,
-                        "the state store holds back records; written again later"
-                    );
+                    tracing::warn!(held, "store holds back records; retried later");
                     return ready;
                 }
                 Attempt::Stale | Attempt::Dropped => {
@@ -958,7 +963,7 @@ impl State {
             // is never written: it would put the lease back in the store, held by no
             // one, over the queue row this requeue writes.
             for batch in &mut self.unwritten {
-                batch.retain(|e| !matches!(e, Effect::Start(s) if s.lease == requeue.lease));
+                batch.retain(|e| started(e) != Some(requeue.lease));
             }
             let losses = if requeue.reason.is_loss() {
                 self.sched.losses(requeue.operation)
