@@ -21,6 +21,7 @@ fn readyz_probes_the_store_that_was_opened() {
     let state = StateStore {
         store: Arc::clone(&store),
         epoch: EpochPolicy::Keep,
+        members: crate::members::MembershipConfig::default(),
     };
     let probed = store_of(Some(&state)).expect("an open store is probed");
     assert!(Arc::ptr_eq(&probed, &store));
