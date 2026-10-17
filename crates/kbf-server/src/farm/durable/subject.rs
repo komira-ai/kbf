@@ -4,8 +4,9 @@
 //!
 //! A version byte (1), the shape key (8 bytes), the configuration hash (a presence byte,
 //! then a text), the target (a presence byte, then its kind: 0 target, 1 anon, 2 bxl,
-//! and its label as a text), then the mnemonic and the target hint (each a presence byte
-//! and a text). A text is a 4-byte length, big-endian, then the bytes. A row of another
+//! and its label as a text), whether the action is a test run (0 or 1), then the mnemonic
+//! and the target hint (each a presence byte and a text). A text is a 4-byte length,
+//! big-endian, then the bytes. A row of another
 //! version is refused, not guessed at.
 
 use kbf_front::ActionLabel;
@@ -31,6 +32,7 @@ pub(super) fn encode(subject: &Subject) -> Vec<u8> {
             put(&mut row, &target.label);
         }
     }
+    row.push(u8::from(subject.test));
     text(&mut row, subject.label.mnemonic.as_deref());
     text(&mut row, subject.label.target.as_deref());
     row
@@ -79,6 +81,11 @@ pub(super) fn decode(row: &[u8]) -> Result<Subject, &'static str> {
         }
         _ => return Err("not a presence byte"),
     };
+    let test = match at.take(1)? {
+        [0] => false,
+        [1] => true,
+        _ => return Err("not a test flag"),
+    };
     let label = ActionLabel {
         mnemonic: at.optional()?,
         target: at.optional()?,
@@ -90,6 +97,7 @@ pub(super) fn decode(row: &[u8]) -> Result<Subject, &'static str> {
         key,
         cfg,
         target,
+        test,
         label,
     })
 }

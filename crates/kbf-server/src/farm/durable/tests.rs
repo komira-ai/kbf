@@ -854,6 +854,7 @@ fn a_subject() -> Subject {
             kind: TargetKind::Anon,
             label: "root//pkg:t".to_owned(),
         }),
+        test: true,
         label: ActionLabel {
             mnemonic: Some("CxxCompile".to_owned()),
             target: Some("root//pkg:hint".to_owned()),
@@ -944,6 +945,7 @@ fn a_subject_row_that_is_not_one_is_refused() {
     let bare = Subject {
         cfg: None,
         target: None,
+        test: false,
         label: ActionLabel::default(),
         ..a_subject()
     };
@@ -969,17 +971,21 @@ fn a_subject_row_that_is_not_one_is_refused() {
     let mut utf8 = row.clone();
     utf8[10 + 4] = 0xff;
     // The configuration hash's presence byte (9) and the mnemonic's, after the target:
-    // version 1, key 8, cfg 38, target presence 1, kind 1, label 4 + 11 bytes.
+    // version 1, key 8, cfg 38, target presence 1, kind 1, label 4 + 11 bytes; then the
+    // test flag, then the mnemonic's presence byte.
     let mut cfg_presence = row.clone();
     cfg_presence[9] = 7;
     let mut label_presence = row.clone();
-    label_presence[49 + 4 + 11] = 7;
+    label_presence[49 + 4 + 11 + 1] = 7;
+    let mut flag = row.clone();
+    flag[49 + 4 + 11] = 2;
     for (bad, why) in [
         (other, "not a version 1 subject"),
         (longer, "bytes after the label"),
         (kind, "not a kind of target"),
         (presence, "not a presence byte"),
         (utf8, "a text is not UTF-8"),
+        (flag, "not a test flag"),
         (cfg_presence, "not a presence byte"),
         (label_presence, "not a presence byte"),
     ] {
