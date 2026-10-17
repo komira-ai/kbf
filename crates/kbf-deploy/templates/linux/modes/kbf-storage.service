@@ -41,6 +41,11 @@ ExecStart=@KBF_BIN_DIR@/kbf storage \
     --storage-tls-cert=@KBF_ETC@/storage.pem \
     --storage-tls-key=@KBF_ETC@/storage.key \
     --storage-client-ca=@KBF_ETC@/ca.pem
+# kbf drains on SIGTERM: a Write in flight is finished and acknowledged before the node
+# exits, and a large one takes longer than systemd's 90 s default stop timeout, which
+# would SIGKILL it and fail the upload (check-units rule `stop`).
+KillSignal=SIGTERM
+TimeoutStopSec=infinity
 Restart=on-failure
 # Exit 2 is a command line kbf refused (or a mode not built yet): a restart cannot fix it.
 RestartPreventExitStatus=2

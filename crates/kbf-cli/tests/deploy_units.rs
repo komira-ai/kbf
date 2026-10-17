@@ -3,7 +3,6 @@
 //! for the mode the unit is named after, and kbf-deploy renders exactly kbf's modes;
 //! and `check-units --mode` runs this build's `kbf check-args` on a built mode's flags.
 
-use kbf_cli::names::{Entry, MODES};
 use kbf_cli::{Invocation, parse_from};
 use kbf_deploy::linux::modes::{TRUSTED_NOTE, render};
 use kbf_deploy::linux::{LinuxConfig, Mode, check_mode_unit};
@@ -12,6 +11,14 @@ use kbf_host::exec::{Entry as HostEntry, Exec, HostExec, Meta};
 use kbf_host::path::{HostPath, Root};
 use kbf_host::step::{Cmd, HttpUrl, Step};
 use kbf_host::trust::Untrusted;
+
+/// Modes `kbf` builds whose unit `kbf-deploy` still renders as an unbuilt one: no flag
+/// on `ExecStart=`, `is_built()` false. `kbf frontend` needs `--storage`, so kbf refuses
+/// the rendered command line; the unit's flags (listen addresses, the storage URL and
+/// its three certificate flags, the state store) belong to the `kbf-deploy` change that
+/// owns the templates (av2-16). That change deletes this row, and both tests below say
+/// so by going red the day the unit has flags (or `is_built()` is true).
+const UNITS_BEHIND: &[Mode] = &[Mode::Frontend];
 
 const EXAMPLE: &str = include_str!("../../kbf-deploy/templates/linux/config.example");
 
@@ -39,6 +46,12 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
         let unit = UnitFile::parse(&text).expect("a unit");
         let argv = unit.exec_start();
         assert_eq!(argv[..2], ["/usr/local/bin/kbf", mode.name()], "{mode}");
+        if UNITS_BEHIND.contains(&mode) {
+            let e = parse_from(argv.iter().copied()).expect_err("a unit without --storage");
+            assert!(e.to_string().contains("--storage"), "kbf {mode}: {e}");
+            assert_eq!(argv.len(), 2, "kbf {mode}'s unit has flags now: {argv:?}");
+            continue;
+        }
         let parsed = match parse_from(argv.iter().copied()) {
             Ok(parsed) => parsed,
             Err(e) => panic!("kbf {mode} refuses its rendered ExecStart= {argv:?}:\n{e}"),
@@ -46,6 +59,7 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
         match parsed {
             Invocation::Daemon(_) => assert_eq!(mode, Mode::Daemon),
             Invocation::AllInOne(_) => assert_eq!(mode, Mode::AllInOne),
+            Invocation::Frontend(_) => unreachable!("{mode}: its unit has no --storage yet"),
             Invocation::Storage(flags) => {
                 assert_eq!(mode, Mode::Storage);
                 // The unit's certificate flags are read as the paths they spell (not
@@ -69,9 +83,23 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
                 assert!(flags.server.cold_store.is_some(), "no cold store");
                 assert!(flags.server.hot_store.is_some(), "no hot store");
             }
-            Invocation::NotBuilt { mode: m, .. } => {
-                assert_eq!(m, mode.name());
-                assert_eq!(argv.len(), 2, "kbf {mode} is not built: {argv:?}");
+            Invocation::StorageAndDaemon(flags) => {
+                assert_eq!(mode, Mode::StorageAndDaemon);
+                // The storage half's certificate flags are read as the storage unit's
+                // are, and the daemon half's are its own.
+                let paths = flags
+                    .storage
+                    .tls
+                    .expect("the storage half turns on mutual TLS");
+                assert_eq!(
+                    paths.map(|p| p.display().to_string()),
+                    [
+                        "/etc/kbf/storage.pem",
+                        "/etc/kbf/storage.key",
+                        "/etc/kbf/ca.pem"
+                    ]
+                );
+                assert!(format!("{:?}", flags.daemon).contains("/etc/kbf/node.pem"));
             }
         }
     }
@@ -187,8 +215,8 @@ fn kbf_deploy_renders_exactly_the_modes_kbf_takes() {
     let help: Vec<&str> = kbf.get_subcommands().map(clap::Command::get_name).collect();
     let deploy: Vec<&str> = Mode::ALL.iter().map(|m| m.name()).collect();
     assert_eq!(deploy, help);
-    for (mode, row) in Mode::ALL.iter().zip(MODES) {
-        let built = !matches!(row.entry, Entry::NotBuilt);
+    for mode in Mode::ALL.iter() {
+        let built = !UNITS_BEHIND.contains(mode);
         assert_eq!(mode.is_built(), built, "{mode}");
     }
 }

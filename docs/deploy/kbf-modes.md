@@ -48,7 +48,7 @@ It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/sy
 | `storage` | a `storage` unit without `--cold-store`, `--meta-dir`, `--storage-listen` or one of the three certificate flags, or with an `s3://` cold store and no `EnvironmentFile=<KBF_ETC>/s3.env` |
 | `state-store` | a `--state-store` that is not `sqlite:///<absolute path>`: a Postgres URI (`postgres://` or `postgresql://`; postgres is not wired yet), any other scheme, an empty or relative SQLite path, or a value that names a variable (below) |
 | `ports` | two of a unit's listeners (`--listen`, `--worker-listen`, `--api-listen`, `--storage-listen`) on one port |
-| `stop` | a mode that drains on SIGTERM (`frontend`, `all-in-one`) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
+| `stop` | a mode that drains on SIGTERM (every mode but `daemon`) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
 | `parse` | a built mode's flags that `kbf <mode>` refuses |
 
 **`delegate`.** systemd reads `Delegate=` this way (systemd.resource-control(5), and
@@ -128,8 +128,10 @@ way: a file the daemon reads by a flag, the service manager's own environment wi
 - **`daemon`**: the flags `kbf-daemon`'s unit has (`--server`, `--cas`, its
   certificates, `--data-dir`, the memory flags, the images); no key.
 - **`all-in-one`**: below; no key (its cold store is a directory).
-- **`frontend`** and **`storage-and-daemon`**: no flag (not built yet; rule `flags`).
-  The frontend's template says where its state store goes: a SQLite file beside its
+- **`storage-and-daemon`**: the storage unit's three certificate flags (no `--cas`:
+  the daemon half reads the node's storage in-process), then the daemon unit's flags;
+  no key yet (rule `credential`). Its stores are a `TODO:` in the template.
+- **`frontend`**: no flag (not built yet; rule `flags`). Its template says where its state store goes: a SQLite file beside its
   data, `--state-store=sqlite://<KBF_DATA_DIR>/state.db` (below).
 
 `render-units --mode storage` refuses settings without `MINIO_S3_ENDPOINT`: the
@@ -160,7 +162,9 @@ until its action is done; `--shutdown-timeout-secs` is 0, no deadline, by defaul
 Buck2 never recovers a stream that breaks mid-action, so a stop that ends the drain
 fails every build in flight. systemd kills a unit with SIGKILL when `TimeoutStopSec=`
 runs out, 90 s (`DefaultTimeoutStopSec=`) when the unit gives none. So both units have
-`KillSignal=SIGTERM` and `TimeoutStopSec=infinity`, and rule `stop` refuses either
+`KillSignal=SIGTERM` and `TimeoutStopSec=infinity` (so do `storage` and
+`storage-and-daemon`: a storage node finishes its large Writes at stop, and systemd's
+90 s default would cut them), and rule `stop` refuses either
 missing or changed: it reads `TimeoutSec=` too (it sets the stop timeout as well; the
 last of the two wins) and the drop-ins. It asks for the word `infinity`: `0` means no
 timeout to systemd as well, but reads as "at once" to a person. A daemon is not held:
@@ -174,8 +178,7 @@ in-process, one cache on the SSD; architecture-v2.md, sections 1 and 10). The de
 keeps the key from builds by uid (sections 9 and 15): the key file the unit's user's
 alone, mode 0600, and each action a subordinate id of that user (the container driver's
 `--userns=nomap`), with a test that an action cannot read the key. The daemon half
-runs as the unit's user and so could read it. Until the mode is built and that test
-exists, the unit holds no key (rule `credential` refuses one), and with the key it will
+runs as the unit's user and so could read it. Until that test exists, the unit holds no key (rule `credential` refuses one), and with the key it will
 be for a trusted network only, as all-in-one is.
 
 ## all-in-one is for a trusted box

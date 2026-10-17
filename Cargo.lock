@@ -1433,14 +1433,19 @@ dependencies = [
  "kbf-cas-conformance",
  "kbf-daemon",
  "kbf-deploy",
+ "kbf-driver-container",
  "kbf-host",
  "kbf-node",
+ "kbf-proto",
  "kbf-server",
  "kbf-state",
  "kbf-storage",
+ "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
+ "prost",
  "rcgen",
+ "rustix",
  "serde_json",
  "tokio",
  "tonic",
@@ -1458,14 +1463,20 @@ dependencies = [
 name = "kbf-daemon"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "crc32fast",
  "futures",
  "hex",
+ "kbf-auth",
  "kbf-caps",
  "kbf-front",
+ "kbf-map",
+ "kbf-mapsync",
+ "kbf-meta",
  "kbf-objstore",
  "kbf-proto",
+ "kbf-route",
  "kbf-server",
  "kbf-storage",
  "kbf-testkit",
@@ -1613,6 +1624,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-history"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crc32c",
+ "futures",
+ "hex",
+ "kbf-objstore",
+ "kbf-state",
+ "prost",
+ "ruzstd",
+ "sha2 0.11.0",
+ "thiserror",
+]
+
+[[package]]
 name = "kbf-host"
 version = "0.1.0"
 dependencies = [
@@ -1722,6 +1749,14 @@ dependencies = [
  "sha2 0.11.0",
  "siphasher",
  "thiserror",
+]
+
+[[package]]
+name = "kbf-mapsync"
+version = "0.1.0"
+dependencies = [
+ "kbf-map",
+ "tokio",
 ]
 
 [[package]]
@@ -1921,6 +1956,7 @@ dependencies = [
  "kbf-invocation",
  "kbf-log",
  "kbf-map",
+ "kbf-mapsync",
  "kbf-mdm-api",
  "kbf-meta",
  "kbf-objstore",
@@ -1949,6 +1985,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "tracing-core",
  "tracing-subscriber",
  "x509-parser",
 ]
@@ -1997,12 +2034,16 @@ name = "kbf-storage"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "crc32c",
  "futures",
+ "kbf-map",
  "kbf-meta",
  "kbf-proto",
  "kbf-segments",
+ "kbf-store",
  "kbf-types",
  "rcgen",
+ "sha2 0.11.0",
  "thiserror",
  "tokio",
  "tonic",

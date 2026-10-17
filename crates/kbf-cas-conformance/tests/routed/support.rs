@@ -1,6 +1,6 @@
 //! A storage node that serves what it is told to, whatever was asked, and counts.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -40,6 +40,8 @@ pub fn unavailable() -> StorageError {
 /// A node that answers every read with `data`, in chunks of 4 bytes.
 pub struct Fake {
     data: Mutex<Bytes>,
+    /// Blobs it serves under their own digests, whatever `data` is.
+    blobs: Mutex<BTreeMap<Digest, Bytes>>,
     /// Whether it holds anything: if not, reads are NOT_FOUND.
     pub holds: AtomicBool,
     pub down: AtomicBool,
@@ -60,6 +62,7 @@ impl Fake {
     pub fn new(data: &[u8]) -> Arc<Self> {
         Arc::new(Self {
             data: Mutex::new(Bytes::copy_from_slice(data)),
+            blobs: Mutex::default(),
             holds: AtomicBool::new(true),
             down: AtomicBool::new(false),
             breaks: AtomicBool::new(false),
@@ -70,6 +73,14 @@ impl Fake {
             peak: AtomicUsize::new(0),
             gate: Mutex::default(),
         })
+    }
+
+    /// Serves `blob` to reads of its digest, as the node holding it would.
+    pub fn serve(&self, blob: &[u8]) {
+        self.blobs
+            .lock()
+            .expect("lock")
+            .insert(sha(blob), Bytes::copy_from_slice(blob));
     }
 
     pub fn hold_digests(&self, digests: &[Digest]) {
@@ -142,7 +153,8 @@ impl Storage for Fake {
             if !self.holds.load(Ordering::SeqCst) {
                 return Err(StorageError::NotFound(*digest));
             }
-            let data = self.data.lock().expect("lock").clone();
+            let own = self.blobs.lock().expect("lock").get(digest).cloned();
+            let data = own.unwrap_or_else(|| self.data.lock().expect("lock").clone());
             let mut chunks: Vec<Result<Bytes, StorageError>> = (0..data.len())
                 .step_by(4)
                 .map(|at| Ok(data.slice(at..data.len().min(at + 4))))

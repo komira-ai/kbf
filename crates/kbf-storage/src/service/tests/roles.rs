@@ -52,6 +52,7 @@ fn expected(endpoint: Endpoint) -> &'static [&'static str] {
         Endpoint::FindMissing | Endpoint::Read | Endpoint::Write | Endpoint::QueryWriteStatus => {
             &["frontend", "storage", "daemon"]
         }
+        Endpoint::WriteLeg => &["storage"],
         Endpoint::ActionGet => &["frontend"],
         Endpoint::ActionPrepare | Endpoint::ActionCommit => &["frontend", "daemon"],
         Endpoint::Segments => &["daemon"],
@@ -121,17 +122,23 @@ fn a_certificate_must_name_exactly_one_known_role() {
         );
     }
     for endpoint in Endpoint::ALL {
-        assert!(Admission::Open.check_leaf(None, endpoint).is_ok());
+        let answer = Admission::Open.check_leaf(None, endpoint);
+        if endpoint == Endpoint::WriteLeg {
+            // No identity shows the caller is a storage node: a copy is never admitted.
+            assert_eq!(answer.expect_err("refused").code(), Code::Unauthenticated);
+        } else {
+            assert!(answer.is_ok(), "{endpoint:?}");
+        }
     }
 }
 
 /// A CA, the server's certificate, and client certificates by role.
-struct Pki {
+pub(crate) struct Pki {
     ca: CertifiedIssuer<'static, KeyPair>,
 }
 
 impl Pki {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
         ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         ca.distinguished_name
@@ -154,8 +161,40 @@ impl Pki {
             .client_ca_root(Certificate::from_pem(self.ca.pem()))
     }
 
+    /// What a storage node holds under certificate `role`: one certificate that names the
+    /// role and carries serverAuth and clientAuth, to serve with and to call its peers with
+    /// (the node certificate of the deployment: one role, both usages).
+    pub(crate) fn node(&self, role: &str) -> (ServerTlsConfig, ClientTlsConfig) {
+        let mut params = CertificateParams::new(vec!["localhost".to_owned()]).expect("params");
+        params.subject_alt_names.push(uri(role));
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let key = KeyPair::generate().expect("key");
+        let cert = params.signed_by(&key, &self.ca).expect("sign");
+        let identity = || Identity::from_pem(cert.pem(), key.serialize_pem());
+        let server = ServerTlsConfig::new()
+            .identity(identity())
+            .client_ca_root(Certificate::from_pem(self.ca.pem()));
+        let client = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(self.ca.pem()))
+            .domain_name("localhost")
+            .identity(identity());
+        (server, client)
+    }
+
     /// A client of the server at `addr`, with a certificate for `role`.
-    async fn client(&self, addr: std::net::SocketAddr, role: &str) -> Channel {
+    pub(crate) async fn client(&self, addr: std::net::SocketAddr, role: &str) -> Channel {
+        self.endpoint(addr, role).connect().await.expect("connect")
+    }
+
+    /// [`Pki::client`] that connects when first used.
+    pub(crate) fn lazy_client(&self, addr: std::net::SocketAddr, role: &str) -> Channel {
+        self.endpoint(addr, role).connect_lazy()
+    }
+
+    fn endpoint(&self, addr: std::net::SocketAddr, role: &str) -> tonic::transport::Endpoint {
         let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
         params.subject_alt_names = vec![uri(role)];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
@@ -169,9 +208,6 @@ impl Pki {
             .expect("endpoint")
             .tls_config(tls)
             .expect("TLS")
-            .connect()
-            .await
-            .expect("connect")
     }
 }
 
@@ -199,6 +235,17 @@ async fn call(endpoint: Endpoint, channel: &Channel) -> Result<(), Status> {
             let requests = super::write_of(&super::upload_name(&sha(b"x")), &[(b"x", true)]);
             ByteStreamClient::new(channel.clone())
                 .write(stream::iter(requests))
+                .await
+                .map(drop)
+        }
+        Endpoint::WriteLeg => {
+            let requests = super::write_of(&super::upload_name(&sha(b"x")), &[(b"x", true)]);
+            let mut request = tonic::Request::new(stream::iter(requests));
+            request
+                .metadata_mut()
+                .insert(crate::replicate::LEG_HEADER, "2".parse().expect("ASCII"));
+            ByteStreamClient::new(channel.clone())
+                .write(request)
                 .await
                 .map(drop)
         }

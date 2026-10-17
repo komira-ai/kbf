@@ -327,7 +327,7 @@ fn an_install_is_refused_before_any_step() {
         }
     };
     let none = |_: &ScratchHost, _: &RefCell<World>| {};
-    for mode in [Mode::Frontend, Mode::StorageAndDaemon] {
+    for mode in Mode::ALL.iter().copied().filter(|m| !m.is_built()) {
         let e = refused(&format!("unbuilt-{mode}"), mode, &none);
         assert!(
             matches!(e, HostError::NotBuilt(m) if m == mode.name()),

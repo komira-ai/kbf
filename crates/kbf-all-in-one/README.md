@@ -32,6 +32,16 @@ Linux only, the container driver only. Elsewhere the binary exits 2 and says to 
    does; one the daemon half refuses exits as `kbf-daemon` does (1, or 2 for an
    `--image` the node cannot run).
 
+## `kbf storage-and-daemon`
+
+The same daemon half and the same plane beside the storage node instead of the server
+(`src/storage_and_daemon.rs`, run by the `kbf` binary): one command line of `kbf
+storage`'s flags and `kbf-daemon`'s (the same refusals as above), the storage half
+started as `kbf storage` starts (`kbf_server::storage_half`, which keeps the storage its
+listener serves), and the daemon half's plane over that storage, in-process. Its
+control plane dials `--server` (the frontend's worker listener). The one cache applies
+as in `kbf all-in-one`.
+
 ## The in-process data plane
 
 `LocalDataPlane` implements `kbf_transfer::Cas` over the server's `LocalStore`

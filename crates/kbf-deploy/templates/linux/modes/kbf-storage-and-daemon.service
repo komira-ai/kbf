@@ -1,8 +1,7 @@
 # Rendered by `kbf-deploy linux render-units --mode storage-and-daemon`; installed as
 # /etc/systemd/system/kbf-storage-and-daemon.service (kbf
-# docs/design/architecture-v2.md, sections 1 and 11). `kbf storage-and-daemon` is not
-# built yet: it exits 2 at start, and `check-units --mode
-# storage-and-daemon` refuses any flag on its command line until kbf takes some.
+# docs/design/architecture-v2.md, sections 1 and 11). The daemon half reads and writes
+# the node's storage in-process; its control plane dials --server.
 [Unit]
 Description=kbf build farm storage node and node daemon
 Wants=network-online.target
@@ -27,14 +26,35 @@ Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@
 # 0600, and each action a subordinate id of that user (the container driver's
 # --userns=nomap), with a test that an action cannot read the key. The daemon half runs
 # as the unit's user and so could read it.
-# TODO: the cold store's key (EnvironmentFile=@KBF_ETC@/s3.env), once the mode is built
-# and that test exists; until then the unit holds none (check-units rule `credential`),
-# and with the key it is for a trusted network only, as all-in-one is.
-ExecStart=@KBF_BIN_DIR@/kbf storage-and-daemon
-# TODO: the mode's flags (the storage node's and the daemon's, the certificate flags),
-# once `kbf storage-and-daemon` has them.
+# TODO: the cold store's key (EnvironmentFile=@KBF_ETC@/s3.env), once that test exists;
+# until then the unit holds none (check-units rule `credential`), and with the key it is
+# for a trusted network only, as all-in-one is.
+ExecStart=@KBF_BIN_DIR@/kbf storage-and-daemon \
+    --storage-tls-cert=@KBF_ETC@/storage.pem \
+    --storage-tls-key=@KBF_ETC@/storage.key \
+    --storage-client-ca=@KBF_ETC@/ca.pem \
+    --driver=container \
+    --server=https://@KBF_HOST_NAME@:@KBF_WORKER_PORT@ \
+    --ca-cert=@KBF_ETC@/ca.pem \
+    --cert=@KBF_ETC@/node.pem \
+    --key=@KBF_ETC@/node.key \
+    --node-id=@KBF_NODE_ID@ \
+    --data-dir=@KBF_DATA_DIR@ \
+@DAEMON_IMAGE_ARGS@
+    --actions-memory-max-gib=@ACTIONS_MEMORY_MAX_GIB@ \
+    --supervisor-memory-min-mib=@KBF_DAEMON_MEMORY_MIN_MIB@
+# The storage half's flags are the storage unit's (its three certificate flags; no
+# --cas: the daemon half reads the node's storage in-process), then the daemon unit's.
+# TODO: the rest of the storage half's flags, as the storage unit gets them
+# (--cold-store, --meta-dir, --hot-store on --data-dir's filesystem for the one cache,
+# --storage-listen).
 # TODO(registration): --frontend=<the frontend's DNS name> and --advertise-addr, and the
 # storage map the frontend pushes.
+# The storage half drains on SIGTERM: a Write in flight is finished and acknowledged
+# before the process exits, and a large one takes longer than systemd's 90 s default stop
+# timeout, which would SIGKILL it and fail the upload (check-units rule `stop`).
+KillSignal=SIGTERM
+TimeoutStopSec=infinity
 Restart=on-failure
 # Exit 2 is a command line kbf refused (or a mode not built yet): a restart cannot fix it.
 RestartPreventExitStatus=2

@@ -3,10 +3,12 @@
 //! templates in `templates/linux/modes/`, beside `kbf.slice`.
 //!
 //! Each unit runs `<KBF_BIN_DIR>/kbf <mode> ...`. A mode `kbf` runs today (`daemon`,
-//! `all-in-one`, `storage`) carries the flags its old binary's unit carries (`storage`
-//! its stores, its listen address and its certificate flags); a mode not built yet
-//! (`frontend`, `storage-and-daemon`) carries none, and its template marks
-//! where its flags go with a `TODO:` comment. The flags the new modes add
+//! `all-in-one`, `storage`, `storage-and-daemon`) carries the flags its old binary's
+//! unit carries (`storage` its stores, its listen address and its certificate flags;
+//! `storage-and-daemon` the storage unit's three certificate flags and the daemon's:
+//! a TODO comment marks where its stores go); a mode not built yet (`frontend`)
+//! carries none, and its template marks where its flags go with a `TODO:` comment.
+//! The flags the new modes add
 //! (`--frontend`, `--advertise-addr`, the certificate flags) are such TODO comments
 //! too, never guessed: `TODO(registration):` marks the frontend's DNS name and the
 //! storage map it pushes, which come with registration.
@@ -44,7 +46,7 @@
 //!   and names no variable (systemd would expand it into kbf's argv); postgres is not
 //!   wired yet, so a Postgres URI fails ([`super::stores`]).
 //! - `ports`: no two of the unit's listeners share a port ([`super::stores`]).
-//! - `stop`: a mode that drains on SIGTERM (`frontend`, `all-in-one`) has
+//! - `stop`: a mode that drains on SIGTERM (every mode but `daemon`) has
 //!   `TimeoutStopSec=infinity` and `KillSignal=SIGTERM`, so systemd never kills it
 //!   mid-drain and fails the builds in flight ([`super::stop`]).
 //!
@@ -140,7 +142,10 @@ impl Mode {
     /// takes anything and exits 2, so its unit carries no flag (rule `flags`).
     #[must_use]
     pub fn is_built(self) -> bool {
-        matches!(self, Mode::Storage | Mode::Daemon | Mode::AllInOne)
+        matches!(
+            self,
+            Mode::Storage | Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne
+        )
     }
 
     /// Whether the mode runs builds, and so manages its own cgroup (rule `delegate`).
@@ -149,10 +154,11 @@ impl Mode {
         matches!(self, Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne)
     }
 
-    /// Whether the mode runs a frontend, which drains on SIGTERM (rule `stop`).
+    /// Whether the mode drains on SIGTERM (rule `stop`): a frontend finishes its open
+    /// streams, a storage half finishes the Writes in flight. Only `daemon` does not.
     #[must_use]
     pub fn drains(self) -> bool {
-        matches!(self, Mode::Frontend | Mode::AllInOne)
+        !matches!(self, Mode::Daemon)
     }
 
     /// Whether the mode runs builds without a storage half that reads the cold store's

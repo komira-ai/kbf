@@ -10,8 +10,18 @@
 //!   `kbf-server`'s store, write and log flags and its own listener flags, and refuses
 //!   every other flag of `kbf-server` (and so any state-store flag: a storage node
 //!   reaches the state store only through a frontend).
-//! - `kbf frontend`, `kbf storage-and-daemon`: not built yet. Each exits 2 with one line
-//!   naming the mode.
+//! - `kbf frontend`: the REAPI front end ([`kbf_server::frontend`]). Takes `kbf-server`'s
+//!   listener, scheduler, state-store and log flags, requires `--storage` and takes the
+//!   flags of its mutual TLS to the storage node; refuses every other flag of
+//!   `kbf-server` (a frontend holds no stores).
+//! - `kbf storage-and-daemon`: the storage node and the daemon in one process, the
+//!   daemon reading and writing the node's storage in-process
+//!   ([`kbf_all_in_one::storage_and_daemon`]). Takes `kbf storage`'s flags and
+//!   `kbf-daemon`'s.
+//!
+//! And one word that is not a mode: `kbf cluster status|drain|undrain` ([`cluster`]), a
+//! client of the frontend's operator API that starts nothing. Like `check-args` it is
+//! outside [`names::MODES`]; `kbf --help` ends with a line naming it.
 //!
 //! A mode refuses the flags that belong to another mode ([`refused_by`]): the set is
 //! derived from each mode's own flag set, nothing is listed by hand, so a flag added to
@@ -33,6 +43,7 @@
 //!
 //! The `kbf-server`, `kbf-daemon` and `kbf-all-in-one` binaries are unchanged.
 
+pub mod cluster;
 pub mod names;
 pub mod version;
 
@@ -42,7 +53,7 @@ use std::sync::OnceLock;
 
 use clap::builder::Resettable;
 use clap::error::ErrorKind;
-use clap::{Arg, ArgMatches, Command, CommandFactory as _, FromArgMatches as _};
+use clap::{Arg, ArgMatches, Args as _, Command, CommandFactory as _, FromArgMatches as _};
 use names::{Entry, MODES};
 
 /// A parsed command line. The flags are boxed: the variants differ a lot in size.
@@ -54,11 +65,10 @@ pub enum Invocation {
     AllInOne(Box<kbf_all_in_one::cli::Flags>),
     /// `kbf storage`.
     Storage(Box<kbf_server::storage_node::StorageFlags>),
-    /// A mode that is not built yet.
-    NotBuilt {
-        /// The mode.
-        mode: &'static str,
-    },
+    /// `kbf storage-and-daemon`.
+    StorageAndDaemon(Box<kbf_all_in_one::storage_and_daemon::Flags>),
+    /// `kbf frontend`.
+    Frontend(Box<kbf_server::frontend::FrontendFlags>),
 }
 
 fn longs(cmd: &Command) -> BTreeSet<String> {
@@ -67,27 +77,27 @@ fn longs(cmd: &Command) -> BTreeSet<String> {
         .collect()
 }
 
-/// The command line a mode with an entry point parses; none for an unbuilt mode.
-fn own_command(entry: Entry) -> Option<Command> {
+/// The command line a mode parses.
+fn own_command(entry: Entry) -> Command {
     match entry {
-        Entry::Daemon => Some(kbf_node::Cli::command()),
-        Entry::AllInOne => Some(kbf_all_in_one::cli::command()),
-        Entry::Storage => Some(kbf_server::storage_node::command()),
-        Entry::NotBuilt => None,
+        Entry::Daemon => kbf_node::Cli::command(),
+        Entry::AllInOne => kbf_all_in_one::cli::command(),
+        Entry::Storage => kbf_server::storage_node::command(),
+        Entry::StorageAndDaemon => kbf_all_in_one::storage_and_daemon::command(),
+        Entry::Frontend => kbf_server::frontend::command(),
     }
 }
 
 /// The long names of the flags mode `mode` refuses: every flag of another mode's own
 /// command line that its own does not take (flags that modes share stay accepted).
-/// Empty for a mode with no command line of its own (an unbuilt one, which refuses
-/// everything by exiting 2) and for a mode that takes the union.
+/// Empty for a mode that takes the union.
 #[must_use]
 pub fn refused_by(mode: &str) -> &'static [&'static str] {
     static REFUSED: OnceLock<BTreeMap<&'static str, Vec<&'static str>>> = OnceLock::new();
     let all = REFUSED.get_or_init(|| {
         let own: Vec<(&'static str, BTreeSet<String>)> = MODES
             .iter()
-            .filter_map(|m| own_command(m.entry).map(|c| (m.name, longs(&c))))
+            .map(|m| (m.name, longs(&own_command(m.entry))))
             .collect();
         own.iter()
             .map(|(name, mine)| {
@@ -125,9 +135,12 @@ fn reason(mode: &str, flag: &str) -> String {
 
 fn mode_command(name: &'static str, entry: Entry) -> Command {
     match entry {
-        Entry::Daemon | Entry::AllInOne | Entry::Storage => {
+        Entry::Daemon
+        | Entry::AllInOne
+        | Entry::Storage
+        | Entry::StorageAndDaemon
+        | Entry::Frontend => {
             let mut cmd = own_command(entry)
-                .expect("a mode with an entry point has a command line")
                 .name(name)
                 .bin_name(Resettable::<String>::Reset);
             for flag in refused_by(name) {
@@ -136,13 +149,6 @@ fn mode_command(name: &'static str, entry: Entry) -> Command {
             }
             cmd
         }
-        Entry::NotBuilt => Command::new(name).about("Not built yet").arg(
-            Arg::new("args")
-                .num_args(0..)
-                .allow_hyphen_values(true)
-                .trailing_var_arg(true)
-                .hide(true),
-        ),
     }
 }
 
@@ -158,7 +164,37 @@ pub fn command() -> Command {
     for mode in MODES {
         cmd = cmd.subcommand(mode_command(mode.name, mode.entry));
     }
-    cmd
+    cmd.after_help(format!(
+        "Not a mode: `kbf {CLUSTER} status|drain|undrain` calls a frontend's operator API \
+         (`kbf {CLUSTER} --help`)."
+    ))
+}
+
+/// The word after `kbf` that calls the operator API ([`cluster`]) instead of starting a
+/// mode. Like [`CHECK_ARGS`] it is not in [`names::MODES`], so the mode list stays exact.
+pub const CLUSTER: &str = "cluster";
+
+/// `kbf cluster ...`'s command line.
+#[must_use]
+pub fn cluster_command() -> Command {
+    let cmd = Command::new(CLUSTER)
+        .bin_name(format!("kbf {CLUSTER}"))
+        .about("Drain, undrain and show the cluster through the frontend's operator API.")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .disable_help_subcommand(true);
+    cluster::Cluster::augment_args(cmd)
+}
+
+/// Parses `kbf cluster ...`; `args` is the whole command line, its first word the
+/// program's name and its second [`CLUSTER`].
+///
+/// # Errors
+/// What `clap` refuses.
+pub fn parse_cluster(args: &[std::ffi::OsString]) -> Result<cluster::Cluster, clap::Error> {
+    let argv = args.iter().take(1).chain(args.iter().skip(2));
+    let matches = cluster_command().try_get_matches_from(argv)?;
+    cluster::Cluster::from_arg_matches(&matches)
 }
 
 /// Parses a command line (its first word is the program's name).
@@ -199,7 +235,18 @@ where
                 kbf_server::storage_node::parse(m)?,
             )))
         }
-        Entry::NotBuilt => Ok(Invocation::NotBuilt { mode: mode.name }),
+        Entry::StorageAndDaemon => {
+            refuse_foreign_flags(mode.name, m)?;
+            Ok(Invocation::StorageAndDaemon(Box::new(
+                kbf_all_in_one::storage_and_daemon::parse(m)?,
+            )))
+        }
+        Entry::Frontend => {
+            refuse_foreign_flags(mode.name, m)?;
+            Ok(Invocation::Frontend(Box::new(kbf_server::frontend::parse(
+                m,
+            )?)))
+        }
     }
 }
 
@@ -232,18 +279,15 @@ fn refuse_foreign_flags(mode: &str, m: &ArgMatches) -> Result<(), clap::Error> {
     }
 }
 
-/// Runs a parsed command line: the mode's own entry point, or for a mode not built yet
-/// one line on stderr and exit 2.
+/// Runs a parsed command line: the mode's own entry point.
 #[must_use]
 pub fn run(invocation: &Invocation) -> ExitCode {
     match invocation {
         Invocation::Daemon(cli) => kbf_node::run(cli),
         Invocation::AllInOne(flags) => kbf_all_in_one::run(flags),
         Invocation::Storage(flags) => kbf_server::storage_node::run(flags),
-        Invocation::NotBuilt { mode } => {
-            eprintln!("{}", names::not_built_line(mode));
-            ExitCode::from(2)
-        }
+        Invocation::StorageAndDaemon(flags) => kbf_all_in_one::storage_and_daemon::run(flags),
+        Invocation::Frontend(flags) => kbf_server::frontend::run(flags),
     }
 }
 
@@ -257,8 +301,7 @@ pub const CHECK_ARGS: &str = "check-args";
 /// [`CHECK_ARGS`].
 ///
 /// # Errors
-/// What [`parse_from`] refuses; a mode not built yet, which every start of it is
-/// refused as; and `--help` or `--version`, which would print and exit 0 without
+/// What [`parse_from`] refuses, and `--help` or `--version`, which would print and exit 0 without
 /// starting the mode.
 pub fn check_args(args: &[std::ffi::OsString]) -> Result<(), clap::Error> {
     let argv = args
@@ -268,10 +311,13 @@ pub fn check_args(args: &[std::ffi::OsString]) -> Result<(), clap::Error> {
         .cloned()
         .collect::<Vec<_>>();
     match parse_from(argv) {
-        Ok(Invocation::Daemon(_) | Invocation::AllInOne(_) | Invocation::Storage(_)) => Ok(()),
-        Ok(Invocation::NotBuilt { mode }) => {
-            Err(command().error(ErrorKind::InvalidSubcommand, names::not_built_line(mode)))
-        }
+        Ok(
+            Invocation::Daemon(_)
+            | Invocation::AllInOne(_)
+            | Invocation::Storage(_)
+            | Invocation::StorageAndDaemon(_)
+            | Invocation::Frontend(_),
+        ) => Ok(()),
         Err(e) if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => {
             Err(command().error(
                 ErrorKind::ArgumentConflict,
@@ -285,7 +331,8 @@ pub fn check_args(args: &[std::ffi::OsString]) -> Result<(), clap::Error> {
 /// The `kbf` binary: the daemon's helper re-execs first (a keeper or a `__chown-dirs`
 /// run of this binary never reads the command line as `kbf`'s), then [`version::line`]
 /// for `kbf --version --json`, then the command line, then [`check_args`] for `kbf
-/// check-args ...` or else [`run`]. A command line that
+/// check-args ...`, [`cluster::run`] for `kbf cluster ...` or else [`run`]. A command
+/// line that
 /// does not parse exits 2 (0 for `--help` and `--version`).
 #[must_use]
 pub fn main() -> ExitCode {
@@ -304,6 +351,12 @@ pub fn main() -> ExitCode {
                 let _ = e.print();
                 ExitCode::from(2)
             }
+        };
+    }
+    if args.get(1).is_some_and(|word| word == CLUSTER) {
+        return match parse_cluster(&args) {
+            Ok(cluster) => cluster::run(&cluster),
+            Err(e) => e.exit(),
         };
     }
     match parse_from(args) {

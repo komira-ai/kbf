@@ -9,6 +9,7 @@ use std::sync::Arc;
 use kbf_state::Store;
 
 use crate::farm::{EpochPolicy, StateError};
+use crate::members::MembershipConfig;
 
 /// A `--state-store` value. Only SQLite is wired; a Postgres store plugs in behind the
 /// [`Store`] trait of `kbf-state` when it is.
@@ -101,6 +102,8 @@ impl StateStoreUri {
         Ok(StateStore {
             store: open_sqlite(path)?,
             epoch: self.epoch_policy(),
+            // The defaults; a start sets the --member-* flags (`start::with_members`).
+            members: MembershipConfig::default(),
         })
     }
 }
@@ -154,6 +157,8 @@ pub struct StateStore {
     pub store: Arc<dyn Store>,
     /// The epoch the start takes.
     pub epoch: EpochPolicy,
+    /// How long storage members live and dwell in the store ([`crate::members`]).
+    pub members: MembershipConfig,
 }
 
 #[cfg(test)]

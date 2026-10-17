@@ -34,12 +34,11 @@
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::BuildHasher;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kbf_front::{Cache, Dispatch, Finished, MetaLog, Recorder, Stage, Submission, Ticket};
-use kbf_meta::{ActionRecord, Role};
-use kbf_objstore::ObjectStore;
+use kbf_front::{Backend, Dispatch, Finished, Recorder, Stage, Submission, Ticket};
+use kbf_meta::ActionRecord;
 use kbf_proto::google::rpc;
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::{
@@ -74,6 +73,7 @@ use crate::fleet::{
 use crate::machine::{FarmMachine, Sent, Waiter};
 use crate::memory;
 use crate::missing;
+use crate::run_record;
 use crate::stamp::Stamp;
 
 /// The scheduler term of a new single-node server process: the wall-clock time of its
@@ -104,8 +104,8 @@ pub struct StreamId(u64);
 
 /// The farm core. Cheap to share: every method takes `&self`.
 #[derive(Debug)]
-pub struct Farm<M, O> {
-    cache: Arc<Cache<M, O>>,
+pub struct Farm {
+    cache: Backend,
     /// This process's scheduler term: every lease it grants carries it, and every
     /// operation name it gives out names it.
     term: u64,
@@ -226,7 +226,7 @@ struct Settled {
     stages: Vec<watch::Sender<Stage>>,
 }
 
-impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
+impl Farm {
     /// A farm over `cache`, with an empty scheduler of a new term that refuses queued work once no live worker has been able to run it for
     /// `unservable_wait`, and keeps a finished operation, which WaitExecution still
     /// answers, for `finished_retention`.
@@ -236,11 +236,12 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     /// new [`process_term`] for both otherwise (see the module docs).
     #[must_use]
     pub fn new(
-        cache: Arc<Cache<M, O>>,
+        cache: impl Into<Backend>,
         unservable_wait: Duration,
         finished_retention: Duration,
     ) -> Self {
-        let (term, lease_epoch) = cache.meta().leadership().map_or_else(
+        let cache = cache.into();
+        let (term, lease_epoch) = cache.leadership().map_or_else(
             || {
                 let term = process_term();
                 (term, term)
@@ -320,6 +321,20 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         let metrics = self.cache.metrics();
         metrics.sched_queued.set(state.sched.queued_len() as u64);
         metrics.sched_leases.set(state.sched.leases_held() as u64);
+    }
+
+    /// Operations waiting in the scheduler's queue for a lease, now (read under the
+    /// scheduler's lock, not the gauge `/metrics` serves, which is a tick old).
+    #[must_use]
+    pub fn queued_operations(&self) -> u64 {
+        self.lock().sched.queued_len() as u64
+    }
+
+    /// Execute and WaitExecution operation streams open now
+    /// (`kbf_front_open_executions`).
+    #[must_use]
+    pub fn open_executions(&self) -> u64 {
+        self.cache.metrics().execute.open_executions.get()
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -577,7 +592,14 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             lease_id: Some(wire_lease),
             accepted: false,
         };
-        let holding = self.lock().holder(lease, worker);
+        let (holding, recorded) = {
+            let state = self.lock();
+            let holding = state.holder(lease, worker);
+            let recorded = holding
+                .as_ref()
+                .is_some_and(|(operation, ..)| state.is_recorded(*operation));
+            (holding, recorded)
+        };
         let Some((operation, action, stamp)) = holding else {
             tracing::warn!(%worker, %lease, "result refused: not the holder of the current lease");
             return Some(refused);
@@ -594,13 +616,22 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         let ran_on = (worker, stamp);
         // Read before `outcome`, which drops a failed run's result.
         let measured = Measured::of(&result);
+        let run = recorded.then(|| {
+            let usage = measured.as_ref().map(Measured::usage);
+            run_record::of(&result, usage, stamp, SystemTime::now())
+        });
         let (outcome, mut detail) = self.outcome(lease, ran_on, result).await;
 
         let now = self.now();
         let (answers, accepted) = {
             let mut state = self.lock();
-            let (answers, accepted) =
-                state.take_report(now, worker, operation, lease, outcome, measured);
+            let report = Report {
+                lease,
+                outcome,
+                measured,
+                run,
+            };
+            let (answers, accepted) = state.take_report(now, worker, operation, report);
             let settled: Vec<Settled> = answers
                 .iter()
                 .map(|a| state.settle(a, detail.take()))
@@ -702,10 +733,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     /// Writes the action-cache entry, if any, then answers the callers.
     async fn deliver(&self, settled: Settled) {
         if let Some((action, record)) = settled.write
-            && let Err(e) = self
-                .cache
-                .commit_action_record(Role::Daemon, action, record)
-                .await
+            && let Err(e) = self.cache.commit_action_record(action, record).await
         {
             tracing::error!(%action, error = %e, "action-cache write of an accepted result failed");
         }
@@ -715,12 +743,13 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     }
 }
 
-impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
+impl Dispatch for Farm {
     fn submit(&self, mut submission: Submission) -> Result<Ticket, Status> {
         // Outside the lock: hashes the action's shape and drops its argv and paths.
         let usage = self
             .shapes
             .subject(std::mem::take(&mut submission.described));
+        let shape = submission.call.as_ref().map(|_| usage.recorded());
         let now = self.now();
         let waiting = std::time::Instant::now();
         let mut state = self.lock();
@@ -736,8 +765,8 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
             usage,
         });
         let name = state.machine.name(waiter);
-        if let Some(call) = submission.call.take() {
-            state.record_submit(call, &name, &submission.request);
+        if let Some((call, shape)) = submission.call.take().zip(shape) {
+            state.record_submit(call.with_shape(shape), &name, &submission.request);
         }
         let (stage, receiver) = watch::channel(Stage::Queued);
         state.stages.insert(waiter, stage);
@@ -801,6 +830,9 @@ impl State {
     /// a run and runs the operation again. The replicated log will answer once the
     /// record commits, carrying the result with it.
     ///
+    /// A recorded operation's report the scheduler took has its measurement sent to
+    /// the invocation recorder, with the booking of a memory kill.
+    ///
     /// Not generic, unlike `Farm::report`, so every test binary's runs count toward the
     /// same function's coverage.
     fn take_report(
@@ -808,10 +840,14 @@ impl State {
         now: FarmTime,
         worker: &WorkerId,
         operation: OperationId,
-        lease: LeaseId,
-        outcome: Outcome,
-        measured: Option<Measured>,
+        report: Report,
     ) -> (Vec<Answer>, bool) {
+        let Report {
+            lease,
+            outcome,
+            measured,
+            run,
+        } = report;
         // Taken first: a report that finishes the operation may drop its callers.
         let usage = measured.and_then(|measured| {
             let (_, waiter) = self.first_waiter(operation)?;
@@ -829,6 +865,23 @@ impl State {
         let accepted = rerun || answers.iter().any(|a| a.lease == lease);
         if accepted && let Some((subject, measured)) = &usage {
             action_usage::log(operation, subject, measured, outcome, lease, worker);
+        }
+        if accepted && let Some(run) = run {
+            let killed = match outcome {
+                Outcome::Failed(Failure::OutOfMemory | Failure::NodeMemoryPressure) => answers
+                    .iter()
+                    .find(|a| a.lease == lease)
+                    .map(|a| a.memory_runs.as_slice())
+                    .or_else(|| self.sched.memory_runs(operation))
+                    .and_then(<[_]>::last)
+                    .filter(|r| r.worker == *worker),
+                _ => None,
+            };
+            let run = match killed {
+                Some(killed) => run_record::killed(run, killed),
+                None => run,
+            };
+            self.record_ran(operation, lease, run);
         }
         let (operation, node) = (name, worker);
         match outcome {
@@ -1201,6 +1254,16 @@ impl State {
             stages,
         }
     }
+}
+
+/// A worker's report as [`State::take_report`] feeds it: the lease, the scheduler's
+/// outcome, and what the report measured for the `action usage:` line and for the
+/// invocation record (`None` for an operation no recorded call waits on).
+struct Report {
+    lease: LeaseId,
+    outcome: Outcome,
+    measured: Option<Measured>,
+    run: Option<kbf_invocation::Run>,
 }
 
 /// Now on the wall clock, in milliseconds since the Unix epoch.
