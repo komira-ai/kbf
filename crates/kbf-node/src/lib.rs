@@ -393,10 +393,9 @@ pub fn start(cli: &Cli) -> Result<NodeHandle, Error> {
     // routes by it.
     let maps = Arc::new(MapHolder::new());
     let held = Arc::clone(&maps);
-    // Refused here, before any driver is set up, though only the plane over a storage
-    // map reads the values; the plane gets the checked values, not the flags again.
-    let liveness = cli.daemon.storage_liveness()?;
-    start_over(cli, Some(maps), move |cli| farm(cli, &held, liveness))
+    start_over(cli, Some(maps), move |cli, liveness| {
+        farm(cli, &held, liveness)
+    })
 }
 
 /// [`start`], with every runtime reading and writing blobs through the data plane
@@ -411,9 +410,7 @@ pub fn start_with<C: Cas>(
     cli: &Cli,
     plane: impl Fn(&Cli) -> Result<Arc<C>, Error> + 'static,
 ) -> Result<NodeHandle, Error> {
-    // Refused as `start` does, though this plane does not read the values.
-    cli.daemon.storage_liveness()?;
-    start_over(cli, None, plane)
+    start_over(cli, None, move |cli, _| plane(cli))
 }
 
 /// [`start_with`], and the daemon keeping the storage map its frontend pushes in `maps`
@@ -421,8 +418,11 @@ pub fn start_with<C: Cas>(
 fn start_over<C: Cas>(
     cli: &Cli,
     maps: Option<Arc<MapHolder>>,
-    plane: impl Fn(&Cli) -> Result<Arc<C>, Error> + 'static,
+    plane: impl Fn(&Cli, Liveness) -> Result<Arc<C>, Error> + 'static,
 ) -> Result<NodeHandle, Error> {
+    // Refused here, before any driver is set up, though only the plane over a storage
+    // map reads the values; the plane gets the checked values, not the flags again.
+    let liveness = cli.daemon.storage_liveness()?;
     let sizes = sizes(cli)?;
     sizes.log();
     let tokio = sizes.runtime()?;
@@ -430,7 +430,13 @@ fn start_over<C: Cas>(
         // The CAS channel is made lazily, which needs the runtime's context.
         let _context = tokio.enter();
         let xcrun = Path::new(xcode::XCRUN);
-        let (daemon, _) = node_over(cli, || native_config(cli), xcrun, maps, Box::new(plane))?;
+        let (daemon, _) = node_over(
+            cli,
+            || native_config(cli),
+            xcrun,
+            maps,
+            Box::new(move |cli| plane(cli, liveness)),
+        )?;
         backstop(cli, daemon)
     };
     Ok(NodeHandle { tokio, daemon })
@@ -1681,10 +1687,7 @@ mod tests {
             ),
         ] {
             let cli = parse(&["--driver=fake", flag]).expect("flags parse");
-            for refused in [
-                start(&cli).err(),
-                start_with(&cli, |_| -> Result<Arc<FarmCas>, Error> { unreachable!() }).err(),
-            ] {
+            for refused in [start(&cli).err(), start_with(&cli, remote).err()] {
                 let why = refused.expect(flag).to_string();
                 assert!(why.contains(said), "{flag}: {why}");
             }
