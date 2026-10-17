@@ -200,6 +200,7 @@ impl Rig {
             store: store.clone(),
             epoch: EpochPolicy::Keep,
             members: Default::default(),
+            history: None,
         }))
         .expect("a farm over the store");
         let (closer, _closing) = kbf_front::closing();

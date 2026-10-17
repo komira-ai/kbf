@@ -616,6 +616,8 @@ where
     O: ObjectStore + 'static,
 {
     let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
+    let (state, history) = crate::history::take(state);
+    let recording = crate::history::install(recording, history.as_ref());
     let default_memory = listeners.memory_ladder.first();
     let farm = Farm::new(
         Arc::clone(&cache),
@@ -676,6 +678,7 @@ where
     .merge(crate::metrics::router(
         Arc::clone(&cache),
         local,
+        history.as_ref().map(crate::history::History::stats),
         tls_sources,
     ))
     .merge(blob_routes)
@@ -768,6 +771,7 @@ where
     let serving = async move {
         // A task of its own: applying events never delays the tick or an accept loop,
         // and they never delay it. It stops when the serving future does.
+        let history = crate::history::spawn(history);
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
         // `reapi_incoming` carries the REAPI TLS when there is any, so the health
         // service is served over the same TLS as the REAPI routes; the authenticator is
@@ -831,6 +835,7 @@ where
         if reapi_done {
             stop_api(api_stop, api_serve).await;
         }
+        crate::history::finish(history).await;
         outcome
     };
     Ok(Bound {
@@ -858,14 +863,19 @@ pub struct StorageListener {
     pub service: kbf_storage::service::Config,
 }
 
-/// The check each call of a gated node passes ([`bind_storage_gated`]). Not generic, so
-/// the lines count once.
-fn map_gate(
-    maps: Option<Arc<kbf_mapsync::MapHolder>>,
-) -> impl FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Clone {
-    move |request| match &maps {
-        Some(maps) if maps.generation() == 0 => Err(tonic::Status::unavailable(NO_MAP_YET)),
-        _ => Ok(request),
+impl StorageListener {
+    /// The service over `storage` this listener serves: callers admitted by the role in
+    /// their certificates with mutual TLS, every caller without it.
+    #[must_use]
+    pub fn service(
+        &self,
+        storage: Arc<dyn kbf_storage::Storage>,
+    ) -> kbf_storage::service::StorageService {
+        let admission = match self.tls {
+            Some(_) => kbf_storage::service::Admission::Certified,
+            None => kbf_storage::service::Admission::Open,
+        };
+        kbf_storage::service::StorageService::new(storage, admission, self.service)
     }
 }
 
@@ -891,40 +901,24 @@ pub fn bind_storage(
     listener: StorageListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
-    bind_storage_gated(storage, listener, None, shutdown)
+    let service = listener.service(storage);
+    bind_service(service, listener.listen, listener.tls, shutdown).map(|(bound, _)| bound)
 }
 
-/// The refusal a gated node answers every call with until its first map.
-pub const NO_MAP_YET: &str = "no storage map yet";
-
-/// [`bind_storage`], and with `maps` (a node in a multi-member farm, which registered
-/// with a frontend) every call is answered UNAVAILABLE [`NO_MAP_YET`] until `maps` holds
-/// its first map: a node that does not know the farm's members cannot tell a blob it owns
-/// from one it does not, and would take a write the map places elsewhere. `None` (one
-/// box, whose map is itself) serves at once.
+/// [`bind_storage`] over a service the caller has set up: a node that is one of several
+/// gives it the map it judges calls by and its chain ([`crate::replication`]). `tls` must be
+/// what the service's admission was made from ([`StorageListener::service`]). Also returns
+/// the [`kbf_storage::service::InProcess`] view of the very service the listener serves: a
+/// caller in this process (the daemon half of `kbf storage-and-daemon`) reaches the node
+/// through it and takes the path a call over the listener takes, the service's own map
+/// check and chain included, not the inner storage.
 ///
 /// # Errors
 /// As [`bind_storage`].
-pub fn bind_storage_gated(
-    storage: Arc<dyn kbf_storage::Storage>,
-    listener: StorageListener,
-    maps: Option<Arc<kbf_mapsync::MapHolder>>,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
-    bind_storage_shared(storage, listener, maps, shutdown).map(|(bound, _)| bound)
-}
-
-/// [`bind_storage_gated`], and the [`kbf_storage::service::InProcess`] view of the very
-/// service the listener serves: a caller in this process (the daemon half of
-/// `kbf storage-and-daemon`) reaches the node through it and takes the path a call over
-/// the listener takes, not the inner storage.
-///
-/// # Errors
-/// As [`bind_storage`].
-pub fn bind_storage_shared(
-    storage: Arc<dyn kbf_storage::Storage>,
-    listener: StorageListener,
-    maps: Option<Arc<kbf_mapsync::MapHolder>>,
+pub fn bind_service(
+    service: kbf_storage::service::StorageService,
+    listen: SocketAddr,
+    tls: Option<TlsSource>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<
     (
@@ -933,27 +927,16 @@ pub fn bind_storage_shared(
     ),
     ServeError,
 > {
-    let (incoming, addr) = bind(listener.listen)?;
-    let server = flow_control(
+    let (incoming, addr) = bind(listen)?;
+    let mut server = flow_control(
         Server::builder(),
         crate::streams::StreamLimits::DEFAULT.worker,
     );
-    let admission = if listener.tls.is_some() {
-        kbf_storage::service::Admission::Certified
-    } else {
-        kbf_storage::service::Admission::Open
-    };
-    let incoming = Incoming::new(incoming, listener.tls);
-    let service = Arc::new(kbf_storage::service::StorageService::new(
-        storage,
-        admission,
-        listener.service,
-    ));
+    let incoming = Incoming::new(incoming, tls);
+    let service = Arc::new(service);
     let (routes, in_process) = (service.shared_routes(), service.in_process());
-    let gate = tonic::service::InterceptorLayer::new(map_gate(maps));
     let serving = async move {
         server
-            .layer(gate)
             .add_routes(routes)
             .serve_with_incoming_shutdown(incoming, shutdown)
             .await
