@@ -219,6 +219,14 @@ pub struct Cli {
     #[cfg(target_os = "linux")]
     #[arg(long, default_value = "oci", value_name = "oci")]
     container_runtime: ContainerRuntime,
+    /// The runtime that runs each action's container (container): `oci`, the only one and
+    /// the default, runs each action in a fresh rootless sandbox through `--oci-runtime`
+    /// (`crun`) directly. Podman is not supported. It needs the daemon user's
+    /// subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on
+    /// `PATH`, and every directory down to `--data-dir` searchable by others.
+    #[cfg(not(target_os = "linux"))]
+    #[arg(long, default_value = "oci", value_name = "oci")]
+    container_runtime: String,
     /// Where each lease runs among the node's CPUs (container, Linux): `none`, the
     /// default, lets a lease use any CPU the daemon may; `numa-node` puts each lease on
     /// one NUMA node, its CPUs (`cpuset.cpus`) and memory (`cpuset.mems`), the node with
