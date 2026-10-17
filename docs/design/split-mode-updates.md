@@ -228,8 +228,8 @@ is new. Frontends of both releases serve nodes of both, so the contract of 3.2 h
 
 This is what the node-rolling unit implements. The new frontend's controller drives it and the nodes need not be taken in any
 fixed order: the frontend picks whichever candidate is idle or drained first. **At most one storage-and-daemon node is in a step
-at a time** (2.1: with R=2 two nodes down lose blobs). Daemon-only hosts have no storage coupling and may be in a step in parallel,
-up to the capacity floor. Order is free because the frontend is already at the new release and every pair of versions is within
+at a time** (2.1: with R=2 two nodes down lose blobs). Daemon-only hosts and Macs have no storage coupling and may be in a step
+concurrently, **up to `max_hosts_out` (default 1)** and the capacity floor. Order is free because the frontend is already at the new release and every pair of versions is within
 N/N-1 (3.2), including an R=2 pair that spans two releases. (A daemon-only host runs the same steps minus 3, 4 and 7.)
 
 **Selection.** Candidates are hosts at the old release, not `Held`; a storage candidate also needs no other storage node in a step. The controller looks every
@@ -239,7 +239,7 @@ is never idle still drains one node at a time (**D3**, below). Idle nodes are ne
 
 | # | Step | What happens | Leaves the step when | If it fails |
 |---|---|---|---|---|
-| 1 | Claim | CAS `update/slot` to this host, write `update/host/<id>` = `Selected`. Re-check G_S. | slot held | nothing changed |
+| 1 | Claim | CAS a holder in `update/slot` to this host (the storage holder for a storage-and-daemon node, one of up to `max_hosts_out` host holders otherwise), write `update/host/<id>` = `Selected` with `boot_before`. Re-check G_S. | slot held | nothing changed |
 | 2 | Cordon | `POST /v1/nodes/{node}:cordon`, atomic in the scheduler (and the row persists). A node already at zero leases is cordoned in the same step it is picked, so no lease can arrive between "idle" and "cordoned". | placement `cordoned` | nothing changed |
 | 3 | Leases | wait for the node's leases to end by themselves. Idle for the daemon half is zero leases and no claim granted but undelivered. | zero leases | after the limit (15 min Linux): uncordon, `Pending` (capacity beats update) |
 | 4 | Planned-down | `POST /v1/members/{id}` `{"state":"down","reason":"restart"}`: writes the `down/<id>` mark with the dwell and bumps the map in one transaction; every router stops choosing this node as a write primary. Wait for the node's open write sessions and the frontend router's writes in flight to it to reach zero. | writes in flight zero | undo (member returns by its next heartbeat), uncordon, `Pending` |
@@ -663,9 +663,9 @@ operator API and the hosts' sessions. The CLI and the UI are its clients. The ma
 State in `kbf-state` (one CAS row each; works on SQLite and Postgres): **one set of rows** with `pull-updates.md` section 6.2.
 That document owns `update/release/<commit>/<platform>/<name>`, `update/desired {generation, commit, set_at}` and
 `update/generation`. This one adds:
-- `update/slot {holder, order_id, epoch, state}`: no TTL; if the holder dies the slot stays held and the run is `Held`;
-- `update/host/<id> {phase, order_id, generation, since}`: what the controller resumes from;
-- `update/policy {auto_nodes, auto_frontend, idle_wait, min_serving, new_work_only_to_updated, mac_force_after, accept_failing_builds}`
+- `update/slot`: **one storage holder plus up to `max_hosts_out` host holders** (daemon-only hosts and Macs), each `{host, order_id, epoch}`, with the run state; no TTL: if a holder dies its entry stays held and the run is `Held`, and a broken host never lets another take its place;
+- `update/host/<id> {phase, order_id, generation, since, boot_before}`: what the controller resumes from; `boot_before` is the node's boot counter before the step, which the rejoin check compares with the registered one;
+- `update/policy {auto_nodes, auto_frontend, idle_wait, min_serving, max_hosts_out (default 1), new_work_only_to_updated, mac_force_after, accept_failing_builds}`
   (`pull-updates.md`'s `update/auto {enabled}` is `auto_nodes`);
 - `update/available/<commit>` from the poller: proposals and preflight results, metadata only.
 

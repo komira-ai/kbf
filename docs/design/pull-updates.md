@@ -191,9 +191,9 @@ saying which is missing; nothing answers an empty 200.
 | `update/release/<commit>/<platform>/<name>` | the component: `sha256`, `size`, and the attestation once uploaded |
 | `update/desired` | the desired release: `generation`, `commit`, `set_at` |
 | `update/generation` | the counter (C3) the generations come from |
-| `update/slot` | the rollout slot `{holder, order_id, epoch, state}`; no time to live (section 8) |
-| `update/host/<id>` | the controller's per-host phase `{phase, order_id, generation, since}`: what a restarted controller resumes from (split-mode-updates.md 2.6) |
-| `update/policy` | `{auto_nodes, auto_frontend, idle_wait, min_serving, mac_force_after, new_work_only_to_updated, accept_failing_builds}`; replaces the older `update/auto {enabled}`, whose flag is `auto_nodes` |
+| `update/slot` | the rollout slot: one storage holder plus up to `max_hosts_out` host holders, each `{host, order_id, epoch}`, with the run state; no time to live (section 8) |
+| `update/host/<id>` | the controller's per-host phase `{phase, order_id, generation, since, boot_before}`: what a restarted controller resumes from (split-mode-updates.md 2.6) |
+| `update/policy` | `{auto_nodes, auto_frontend, idle_wait, min_serving, max_hosts_out (default 1), mac_force_after, new_work_only_to_updated, accept_failing_builds}`; replaces the older `update/auto {enabled}`, whose flag is `auto_nodes` |
 
 **The disk index is the source of truth for bytes.** The release store on disk (`files/<sha256>` and
 `index/<commit>/<platform>/<name>`, with attestation bundles) is authoritative for what the frontend can serve. The
@@ -251,13 +251,13 @@ path or a command):
 
 ## 8. The rollout
 
-The frontend alone decides order. It holds one **update slot** in the state store (a compare-and-set row, no
-time to live: if the holder dies the slot stays held and the run goes `held`; a broken host never lets a second one
-start).
+The frontend alone decides order. It holds the **update slot** in the state store (compare-and-set, no time to live): one
+storage holder plus up to `max_hosts_out` (default 1) holders for daemon-only hosts and Macs. If a holder dies its entry stays
+held and the run goes `held`; a broken host never lets another take its place.
 
 1. **Order.** Nodes update asynchronously, in any order, each when it is idle or drained, driven by the frontend; every pair
    of versions in the farm is within N/N-1, so order does not matter for correctness. At most one storage-and-daemon node
-   is in a step at a time (R=2); daemon-only hosts may be in a step in parallel up to the capacity floor `min_serving`; a busy
+   is in a step at a time (R=2); daemon-only hosts and Macs may be in a step concurrently up to `max_hosts_out` (default 1) and the capacity floor `min_serving`; a busy
    Mac is deferred, not killed. On an **upgrade the frontend goes first**; on a **downgrade across a protocol difference the
    nodes go first**, so no node ever dials a frontend that does not accept it; if no order keeps every host inside the
    frontend's accepted `[min_protocol, protocol]` the planner refuses it as a flag day (split-mode-updates.md 3.3).
@@ -293,7 +293,7 @@ Each safety property has a planted mutant that turns its test red.
 - **Wrong bits**: a flipped byte of a tarball is refused at the hash; an attestation for another digest, repo,
   workflow or ref is refused; an inbox entry that is a symlink, a FIFO or oversized is refused with no read outside
   the inbox.
-- **Capacity**: two hosts ordered at once (the slot admits one); storage under-replicated or the metric absent (no
+- **Capacity**: two hosts ordered at once (the slot admits one storage holder and at most `max_hosts_out` others); storage under-replicated or the metric absent (no
   order); a host with live leases (order withheld, and the node refuses it too).
 - **Bad binary**: starts and exits at once (the counter reverts, Linux); runs but never registers (the window
   expires, the host reverts, the run goes `held`); the frontend dies in the window (the host reverts); `previous`
