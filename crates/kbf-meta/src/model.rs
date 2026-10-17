@@ -2,13 +2,14 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 use kbf_types::Digest;
 
 use crate::tier::TierId;
 
-/// A writer epoch: the first half of every [`ObjectId`].
+/// A writer epoch: how an [`Writer::Epoch`] writer is named.
 ///
 /// The metadata core hands out epochs through [`Command::AllocEpoch`](crate::Command::AllocEpoch),
 /// strictly increasing and never twice. A writer (one cache in one process) takes one
@@ -31,16 +32,84 @@ impl Epoch {
     }
 }
 
+/// A registered storage node's writer: the member id and boot counter the state store
+/// assigned at its registration (`docs/design/architecture-v2.md`, section 6). The store
+/// hands each pair to one registration only, and a member's boot counter grows with
+/// every registration, so the pair names one process of the farm for ever: a node whose
+/// metadata directory was wiped still never reuses a key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeWriter {
+    member: NonZeroU64,
+    boot: NonZeroU64,
+}
+
+impl NodeWriter {
+    /// Boot `boot` of member `member`.
+    #[must_use]
+    pub const fn new(member: NonZeroU64, boot: NonZeroU64) -> Self {
+        Self { member, boot }
+    }
+
+    /// The member id.
+    #[must_use]
+    pub const fn member(self) -> NonZeroU64 {
+        self.member
+    }
+
+    /// The boot counter.
+    #[must_use]
+    pub const fn boot(self) -> NonZeroU64 {
+        self.boot
+    }
+}
+
+/// Who named an object: the first half of every [`ObjectId`].
+///
+/// Ordered with every epoch writer before every node writer; within a kind, by number
+/// (member, then boot).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Writer {
+    /// A writer epoch this log allocated ([`Command::AllocEpoch`](crate::Command::AllocEpoch)):
+    /// a server, or a storage node that registers with no frontend.
+    Epoch(Epoch),
+    /// A registered storage node ([`Command::SetWriter`](crate::Command::SetWriter)).
+    Node(NodeWriter),
+}
+
+impl Writer {
+    /// Whether an object of `self` may have been named by `start` or by a writer that
+    /// came after it in the same place: the same epoch or a later one, or the same
+    /// member at the same boot or a later one. A tier refuses to start over a block of
+    /// such an object, since no earlier process can have written it.
+    #[must_use]
+    pub fn at_or_after(self, start: Self) -> bool {
+        match (self, start) {
+            (Self::Epoch(e), Self::Epoch(s)) => e >= s,
+            (Self::Node(n), Self::Node(s)) => n.member == s.member && n.boot >= s.boot,
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for Writer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Epoch(e) => write!(f, "{}", e.0),
+            Self::Node(n) => write!(f, "member {} boot {}", n.member, n.boot),
+        }
+    }
+}
+
 /// An object in the object store that holds blob bytes: a segment of one or more
 /// records.
 ///
-/// An id is the writer's [`Epoch`] and a sequence number within it. Epochs are
-/// allocated by the core and sequence numbers by the one writer that holds the
-/// epoch, so an id names the same bytes for as long as any index entry points at it,
-/// across every store of the farm.
+/// An id is its [`Writer`] and a sequence number the one writer counts. Writers are
+/// never handed out twice (epochs by the core, node writers by the state store), so an
+/// id names the same bytes for as long as any index entry points at it, across every
+/// store of the farm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectId {
-    epoch: Epoch,
+    writer: Writer,
     seq: u64,
 }
 
@@ -48,16 +117,31 @@ impl ObjectId {
     /// Object `seq` of writer epoch `epoch`.
     #[must_use]
     pub const fn new(epoch: Epoch, seq: u64) -> Self {
-        Self { epoch, seq }
+        Self::of(Writer::Epoch(epoch), seq)
     }
 
-    /// The writer epoch.
+    /// Object `seq` of `writer`.
     #[must_use]
-    pub const fn epoch(self) -> Epoch {
-        self.epoch
+    pub const fn of(writer: Writer, seq: u64) -> Self {
+        Self { writer, seq }
     }
 
-    /// The sequence number within the epoch.
+    /// Who named the object.
+    #[must_use]
+    pub const fn writer(self) -> Writer {
+        self.writer
+    }
+
+    /// The writer epoch, for an object of an epoch writer.
+    #[must_use]
+    pub const fn epoch(self) -> Option<Epoch> {
+        match self.writer {
+            Writer::Epoch(e) => Some(e),
+            Writer::Node(_) => None,
+        }
+    }
+
+    /// The sequence number within the writer.
     #[must_use]
     pub const fn seq(self) -> u64 {
         self.seq
@@ -66,7 +150,7 @@ impl ObjectId {
 
 impl fmt::Display for ObjectId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}", self.epoch.0, self.seq)
+        write!(f, "{}/{}", self.writer, self.seq)
     }
 }
 

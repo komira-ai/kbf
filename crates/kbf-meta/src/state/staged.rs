@@ -153,7 +153,7 @@ impl MetaState {
     /// Whether `put` may be applied on `tier`; changes nothing.
     fn stageable(&self, tier: TierId, put: &StagedPut) -> Result<(), TierError> {
         let object = put.object;
-        self.allocated(object)?;
+        self.writable(object)?;
         if self.unreachable.contains_key(&object) {
             return Err(TierError::Unreachable(object));
         }
@@ -191,7 +191,7 @@ impl MetaState {
     }
 
     pub(super) fn seal_staged(&mut self, object: ObjectId) -> Result<(), TierError> {
-        self.allocated(object)?;
+        self.known(object)?;
         match self.staged.get_mut(&object) {
             Some(staged) => {
                 if staged.state == StagedState::Open {
@@ -204,7 +204,7 @@ impl MetaState {
     }
 
     pub(super) fn object_flushed(&mut self, object: ObjectId) -> Result<(), TierError> {
-        self.allocated(object)?;
+        self.known(object)?;
         match self.staged.get(&object).map(|s| s.state) {
             Some(StagedState::Open) => Err(TierError::NotSealed(object)),
             Some(StagedState::Sealed | StagedState::Conflict) => {
@@ -216,7 +216,7 @@ impl MetaState {
     }
 
     pub(super) fn flush_conflict(&mut self, object: ObjectId) -> Result<(), TierError> {
-        self.allocated(object)?;
+        self.known(object)?;
         match self.staged.get_mut(&object) {
             Some(staged) if staged.state == StagedState::Open => Err(TierError::NotSealed(object)),
             Some(staged) => {

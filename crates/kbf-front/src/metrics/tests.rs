@@ -130,6 +130,10 @@ fn each_command_has_its_own_label() {
         Command::EvictObjects {
             objects: [object].into(),
         },
+        Command::SetWriter(kbf_meta::NodeWriter::new(
+            std::num::NonZeroU64::MIN,
+            std::num::NonZeroU64::MIN,
+        )),
     ];
     let labels: Vec<&str> = commands
         .iter()
