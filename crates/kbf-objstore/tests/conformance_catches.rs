@@ -425,7 +425,7 @@ fn a_store_that_groups_keys_at_slash_fails() {
     };
     assert!(
         why.contains(
-            "page by page Ok([(\"conformance/nested/A\", 1), (\"conformance/nested/a\", 1)"
+            "page by page Ok([(\"conformance/nested/A\", 1), (\"conformance/nested/a-b\", 1)"
         ),
         "{why}"
     );

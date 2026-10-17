@@ -117,9 +117,11 @@ pub(super) async fn list_no_match<S: ObjectStore>(store: &S, prefix: &KeyPrefix)
 
 /// The names the nesting check writes, in no order: separators at several depths, and
 /// the characters either side of `/` in byte order (`-` and `.` before it, `0`, `A`,
-/// `a` and `~` after it).
+/// `a` and `~` after it). No name is another name followed by `/`: kbf never writes
+/// such a pair, and MinIO does not list the keys under a key that is also an object
+/// (`a` hides `a/b`).
 const NESTED: [&str; 10] = [
-    "a/b/c/d", "a~", "a", "A", "a/b", "a0", "a.b", "a/b/c", "B/x", "a-b",
+    "a/b/c/d", "a~", "a/c", "A", "a/b/x", "a0", "a.b", "a/b/c/e", "B/x", "a-b",
 ];
 
 pub(super) async fn list_nested<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
