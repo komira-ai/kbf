@@ -54,8 +54,7 @@ Restart=on-failure
 # Exit 2 is a start kbf refused (a flag, a file, a directory that is not a log): a
 # restart cannot fix it. Exit 75 is a start that can pass on a later try (the data
 # directory still held by the process that is stopping, a boot the frontend handed out
-# again after its state store was restored): restarted after RestartSec.
-RestartSec=5
+# again after its state store was restored): restarted after the unit's RestartSec (#1005).
 RestartPreventExitStatus=2
 
 [Install]
