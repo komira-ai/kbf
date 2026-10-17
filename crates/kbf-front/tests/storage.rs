@@ -1,7 +1,7 @@
 //! The cache through the storage boundary: [`CacheStorage`] as an `Arc<dyn Storage>`.
 //! The data plane's checks run over it in `kbf-all-in-one` (`tests/storage_seam.rs`);
 //! these cover what they do not: the action cache, and that every error answers the
-//! gRPC code and message the cache's own error answers.
+//! gRPC code and message the cache's own error answers. Streamed puts: `tests/storage_stream.rs`.
 
 mod common;
 

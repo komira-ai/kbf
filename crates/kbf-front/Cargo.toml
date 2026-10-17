@@ -15,9 +15,11 @@ http-body.workspace = true
 kbf-auth.workspace = true
 kbf-caps.workspace = true
 kbf-invocation.workspace = true
+kbf-map.workspace = true
 kbf-meta.workspace = true
 kbf-objstore.workspace = true
 kbf-proto.workspace = true
+kbf-route.workspace = true
 kbf-sched.workspace = true
 kbf-segments.workspace = true
 kbf-storage.workspace = true
@@ -36,7 +38,6 @@ tracing.workspace = true
 [dev-dependencies]
 # The loopback S3 service (`s3::fake`) the large-blob tests flush to.
 kbf-objstore = { workspace = true, features = ["testkit"] }
-kbf-map.workspace = true
 # The REAPI service definitions, read from kbf-proto's vendored files, so the
 # authorization test (tests/auth.rs) covers every method the routes serve.
 protox.workspace = true

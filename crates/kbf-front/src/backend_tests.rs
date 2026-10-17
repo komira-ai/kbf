@@ -1,13 +1,17 @@
 //! [`Backend`] over a cache in this process and over a [`Storage`]: the same answers,
 //! and the input check over a storage node.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
+use futures::future::BoxFuture;
+use kbf_map::{Map, Member, MemberId, MemberState, Rule};
 use kbf_meta::{ActionRecord, Role};
 use kbf_proto::reapi::{ActionResult, Directory, DirectoryNode, FileNode};
 use kbf_proto::worker::segments_server::Segments;
+use kbf_route::{MapSource, MapView, Nodes, RefetchError};
 use kbf_storage::{Answer, PutStream, ReadStream, Storage, StorageError};
 use kbf_types::Digest;
 use prost::Message as _;
@@ -15,7 +19,7 @@ use prost::Message as _;
 use super::Backend;
 use crate::cache::{Cache, VerifiedBlob};
 use crate::meta_log::MemoryMetaLog;
-use crate::{CacheStorage, SegmentsConfig};
+use crate::{CacheStorage, Channels, Routed, SegmentsConfig};
 
 type Mem = Cache<MemoryMetaLog, kbf_objstore::MemoryStore>;
 
@@ -286,4 +290,270 @@ async fn both_kinds_answer_the_scheduler_calls_alike() {
         assert!(backend.render_metrics().contains("kbf_"), "{remote}");
         assert_eq!(format!("{backend:?}"), "Backend(..)");
     }
+}
+
+/// Three storage nodes in this process, each over a cache of its own, and a map of them.
+struct Trio {
+    nodes: BTreeMap<MemberId, Arc<dyn Storage>>,
+    map: Arc<Map>,
+}
+
+impl Trio {
+    fn new() -> Self {
+        let nodes = (1..=3)
+            .map(|id| {
+                let node: Arc<dyn Storage> = Arc::new(CacheStorage::new(
+                    Arc::new(Cache::memory()),
+                    SegmentsConfig::DEFAULT,
+                ));
+                (MemberId(id), node)
+            })
+            .collect();
+        let members = (1..=3)
+            .map(|id| Member {
+                id: MemberId(id),
+                addr: format!("127.0.0.1:{id}"),
+                zone: String::new(),
+                weight: 1,
+                state: MemberState::Active,
+            })
+            .collect();
+        let map = Map::new(1, members, Rule::Rendezvous, 1, 1, Vec::new()).expect("a map");
+        Self {
+            nodes,
+            map: Arc::new(map),
+        }
+    }
+
+    /// A backend routed by the map, whose `--storage` node is member 1, and the same
+    /// farm as the one node `--storage` names.
+    fn backends(self: &Arc<Self>) -> (Backend, Backend) {
+        let routed = Arc::new(Routed::new(self.clone(), self.clone(), self.clone()));
+        let first = Arc::clone(&self.nodes[&MemberId(1)]);
+        (
+            Backend::routed(routed, Arc::clone(&first)),
+            Backend::remote(first),
+        )
+    }
+
+    /// Stores `blob` on the node the map writes it to.
+    async fn store(&self, blob: &(Digest, Bytes)) {
+        let owner = self.map.write_owners(&blob.0)[0];
+        self.nodes[&owner]
+            .put(blob.1.clone())
+            .await
+            .expect("stored");
+    }
+}
+
+impl Nodes for Trio {
+    fn node(&self, member: &Member, _: u64) -> Result<Arc<dyn Storage>, StorageError> {
+        Ok(Arc::clone(&self.nodes[&member.id]))
+    }
+}
+
+impl Channels for Trio {
+    fn channel(&self, _: &Member) -> Result<tonic::transport::Channel, StorageError> {
+        Err(StorageError::Internal("no channels in process".to_owned()))
+    }
+}
+
+impl MapSource for Trio {
+    fn current(&self) -> Option<MapView> {
+        Some(MapView {
+            map: Arc::clone(&self.map),
+            previous: None,
+        })
+    }
+
+    fn refetch(&self, at_least: u64) -> BoxFuture<'_, Result<MapView, RefetchError>> {
+        Box::pin(async move {
+            Err(RefetchError {
+                at_least,
+                reason: "nothing newer".to_owned(),
+            })
+        })
+    }
+}
+
+/// Catches: the input check asking the `--storage` node about a tree whose directories and
+/// files are on the nodes the map put them on (the rehearsal's failure, in the walk): the
+/// routed walk finds every one, reads each directory once, and names the one file that is
+/// held nowhere; the same tree over the one node reports most of it absent.
+#[tokio::test]
+async fn the_routed_walk_finds_each_blob_at_its_owner() {
+    let trio = Arc::new(Trio::new());
+    let files: Vec<_> = (0..30).map(|n| blob(&format!("file {n}"))).collect();
+    let never = blob("never stored");
+    let subs: Vec<_> = files
+        .chunks(10)
+        .map(|chunk| dir(&chunk.iter().map(|f| f.0).collect::<Vec<_>>(), &[]))
+        .collect();
+    let root = dir(&[never.0], &subs.iter().map(|d| d.0).collect::<Vec<_>>());
+    for held in files.iter().chain(&subs).chain([&root]) {
+        trio.store(held).await;
+    }
+    let (routed, one_node) = trio.backends();
+
+    let walked = routed.walk_inputs(root.0).await.expect("routed walk");
+    assert_eq!(walked.absent, vec![never.0]);
+    assert_eq!(walked.dirs_read, 4);
+    let alone = one_node
+        .walk_inputs(root.0)
+        .await
+        .expect("walk of one node");
+    // The root is not on the `--storage` node, so nothing under it is looked at.
+    assert_eq!(alone.absent, vec![root.0]);
+}
+
+/// Every call the scheduler side makes, in the order a run makes them, against `backend`
+/// over a farm that holds `held` and the directory `root`: the answers are the same whatever
+/// kind the backend is ([`both_kinds_answer_the_scheduler_calls_alike`]).
+async fn scheduler_calls(backend: &Backend, held: (Digest, Bytes), root: (Digest, Bytes)) {
+    let (digest, bytes) = held;
+    assert_eq!(backend.read_blob(&digest).await.expect("held"), bytes);
+    let absent = blob("absent").0;
+    assert_eq!(
+        backend.find_missing(&[digest, absent]).await.expect("ask"),
+        vec![absent]
+    );
+    assert!(matches!(
+        backend.read_blob(&absent).await,
+        Err(StorageError::NotFound(_))
+    ));
+    let walked = backend.walk_inputs(root.0).await.expect("walk");
+    assert_eq!((walked.absent, walked.dirs_read), (Vec::new(), 1));
+
+    assert!(
+        backend
+            .action_result(&digest)
+            .await
+            .expect("miss")
+            .is_none()
+    );
+    let record = backend
+        .prepare_action_result(&ActionResult::default())
+        .await
+        .expect("prepared");
+    backend
+        .commit_action_record(digest, record)
+        .await
+        .expect("committed");
+    let (_, hit) = backend
+        .action_result(&digest)
+        .await
+        .expect("lookup")
+        .expect("a hit");
+    assert_eq!(hit, ActionResult::default());
+
+    assert!(backend.leadership().is_none());
+    assert!(backend.render_metrics().contains("kbf_"));
+    assert_eq!(format!("{backend:?}"), "Backend(..)");
+}
+
+/// Catches: the routed kind answering the scheduler's calls differently from the others
+/// ([`both_kinds_answer_the_scheduler_calls_alike`]), on a farm whose blob, directory and
+/// action-cache entry are not on the `--storage` node.
+#[tokio::test]
+async fn the_routed_kind_answers_the_scheduler_calls_alike() {
+    let trio = Arc::new(Trio::new());
+    let (backend, _) = trio.backends();
+    let elsewhere = |tag: &str| {
+        (0..)
+            .map(|n| blob(&format!("{tag} {n}")))
+            .find(|b| trio.map.write_owners(&b.0)[0] != MemberId(1))
+            .expect("a blob owned by another node")
+    };
+    let held = elsewhere("an action");
+    let root = dir(&[], &[]);
+    trio.store(&held).await;
+    trio.store(&root).await;
+    scheduler_calls(&backend, held, root).await;
+}
+
+/// Catches: a routed prepare that takes a malformed result, a tree that is not one, or a
+/// tree no node holds for a result it can store: each is refused as the cache refuses it.
+#[tokio::test]
+async fn the_routed_prepare_refuses_what_it_cannot_read() {
+    use kbf_proto::reapi::{OutputDirectory, OutputFile};
+    let trio = Arc::new(Trio::new());
+    let (backend, _) = trio.backends();
+
+    let malformed = ActionResult {
+        output_files: vec![OutputFile {
+            path: "f".to_owned(),
+            digest: Some(kbf_proto::reapi::Digest {
+                hash: "not hex".to_owned(),
+                size_bytes: 1,
+            }),
+            ..OutputFile::default()
+        }],
+        ..ActionResult::default()
+    };
+    let e = backend.prepare_action_result(&malformed).await.unwrap_err();
+    assert!(matches!(e, StorageError::Invalid(_)), "{e:?}");
+
+    let junk = blob("not a Tree \u{ff}\u{ff}");
+    trio.store(&junk).await;
+    let tree_result = |tree: &Digest| ActionResult {
+        output_directories: vec![OutputDirectory {
+            path: "d".to_owned(),
+            tree_digest: Some(proto(tree)),
+            ..OutputDirectory::default()
+        }],
+        ..ActionResult::default()
+    };
+    let e = backend
+        .prepare_action_result(&tree_result(&junk.0))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, StorageError::Invalid(m) if m.contains("does not decode")));
+
+    let e = backend
+        .prepare_action_result(&tree_result(&blob("a tree nobody holds").0))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, StorageError::NotFound(_)), "{e:?}");
+}
+
+/// Catches: a routed backend that routes before the map has two members (a frontend whose
+/// farm is one node would then dial an address the node does not answer on), or never:
+/// with a one-member map the calls go to the `--storage` node.
+#[tokio::test]
+async fn the_routed_kind_uses_the_storage_node_until_the_map_has_two_members() {
+    struct One(Trio);
+    impl MapSource for One {
+        fn current(&self) -> Option<MapView> {
+            // A farm of one member, which is not the node `--storage` names.
+            let member = self.0.map.members()[1].clone();
+            let map = Map::new(1, vec![member], Rule::Rendezvous, 1, 1, Vec::new()).expect("map");
+            Some(MapView {
+                map: Arc::new(map),
+                previous: None,
+            })
+        }
+        fn refetch(&self, at_least: u64) -> BoxFuture<'_, Result<MapView, RefetchError>> {
+            self.0.refetch(at_least)
+        }
+    }
+    let trio = Arc::new(Trio::new());
+    let first = Arc::clone(&trio.nodes[&MemberId(1)]);
+    let alone = Arc::new(One(Trio::new()));
+    let routed = Arc::new(Routed::new(alone, trio.clone(), trio.clone()));
+    assert!(!routed.active());
+    let backend = Backend::routed(routed, Arc::clone(&first));
+    // Whatever the map would say, every call is the one node's: the blob and the
+    // directory are held there alone, though the map would put them elsewhere.
+    let elsewhere = |tag: &str| {
+        (0..)
+            .map(|n| blob(&format!("{tag} {n}")))
+            .find(|b| trio.map.write_owners(&b.0)[0] != MemberId(1))
+            .expect("a blob owned by another node")
+    };
+    let held = elsewhere("held");
+    let root = dir(&[], &[]);
+    for stored in [&held, &root] {
+        first.put(stored.1.clone()).await.expect("stored");
+    }
+    scheduler_calls(&backend, held, root).await;
 }

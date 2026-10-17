@@ -255,10 +255,11 @@ async fn build(pki: &Pki, owner: &Node, pushes_map: bool, scratch: &std::path::P
         owner.store.hold(blob).await;
     }
     let action_digest: Digest = digest_of(&blobs[3]);
-    // The frontend accepts a result only if its outputs are in its own store: it does not
-    // yet ask the storage owners (the closure check across owners is av2-12). So the
-    // output is put there ahead, by the client's connection and not the daemon's, and
-    // not at the owner: the owner has it only if the daemon stores it there.
+    // This frontend is `kbf-server` over one cache, not `kbf frontend` (which asks the
+    // owners of a map, `kbf_front::Routed`): it accepts a result only if its outputs are
+    // in its own store. So the output is put there ahead, by the client's connection and
+    // not the daemon's, and not at the owner: the owner has it only if the daemon stores
+    // it there.
     upload.put(noise(2, OUTPUT_BYTES)).await.expect("upload");
 
     // The daemon: its session and its CAS connection both through the relays.
