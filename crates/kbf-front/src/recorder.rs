@@ -281,7 +281,8 @@ impl Shared {
                 }
                 Event::Granted { operation, .. }
                 | Event::Started { operation, .. }
-                | Event::Requeued { operation, .. } => marks.operations.push((after, *operation)),
+                | Event::Requeued { operation, .. }
+                | Event::Ran { operation, .. } => marks.operations.push((after, *operation)),
                 Event::Finished(f) => marks.operations.push((after, f.operation)),
             },
             None => {
@@ -361,6 +362,8 @@ pub struct ExecuteCall {
     call: Call,
     action: Digest,
     command: Digest,
+    /// The shape the dispatcher read from the Command, if it read one.
+    shape: Option<Box<kbf_invocation::ActionShape>>,
 }
 
 /// What an Execute call's `RequestMetadata` says the action is: its kind (`CppCompile`)
@@ -401,18 +404,30 @@ impl ExecuteCall {
             call,
             action,
             command,
+            shape: None,
         })
+    }
+
+    /// The call, with the `shape` the dispatcher read from its Command, which its row
+    /// takes with the Command digest.
+    #[must_use]
+    pub fn with_shape(self, shape: kbf_invocation::ActionShape) -> Self {
+        Self {
+            shape: Some(Box::new(shape)),
+            ..self
+        }
     }
 
     /// The events of the call, answered with the operation name `name` on the
     /// scheduler's `operation`, which it `joined` or queued: the call, then the
-    /// Command digest its row takes.
+    /// Command digest (and shape) its row takes.
     #[must_use]
     pub fn answered(self, name: String, operation: OperationId, joined: bool) -> [Event; 2] {
         let Self {
             mut call,
             action,
             command,
+            shape,
         } = self;
         let answer = if joined {
             ExecuteAnswer::Joined { name, operation }
@@ -425,6 +440,7 @@ impl ExecuteCall {
             owner: call.owner.clone(),
             action,
             command,
+            shape,
         };
         [Event::Call(Box::new(call)), command]
     }
@@ -484,14 +500,15 @@ pub fn wall_now() -> WallTime {
     WallTime::from_unix_micros(u64::try_from(since.as_micros()).unwrap_or(u64::MAX))
 }
 
-/// What a row copies from the ActionResult stored as `result` (section 3.2): its
+/// What a row copies from the ActionResult stored as `result` (`None` for a
+/// timed-out run's partial result, which is never stored) (section 3.2): its
 /// output files and directories (files first, each in the result's order; one whose
 /// digest does not parse is left out), its stdout and stderr digests and the
 /// `ResourceUsage` it carries. It lists at most one output past the
 /// [`OUTPUTS_PER_ROW`] a row keeps, so that the row knows it was cut and an event
 /// holds no more.
 #[must_use]
-pub fn listing(result: Digest, r: &reapi::ActionResult) -> Listing {
+pub fn listing(result: Option<Digest>, r: &reapi::ActionResult) -> Listing {
     let files = r.output_files.iter().filter_map(|f| {
         let digest = wire::digest(f.digest.as_ref()).ok()?;
         Some(Output {
@@ -513,7 +530,7 @@ pub fn listing(result: Digest, r: &reapi::ActionResult) -> Listing {
     let log = |d: Option<&reapi::Digest>| d.and_then(|d| wire::digest(Some(d)).ok());
     Listing {
         result,
-        exit_code: r.exit_code,
+        exit_code: result.map(|_| r.exit_code),
         outputs: files.chain(directories).take(OUTPUTS_PER_ROW + 1).collect(),
         stdout: log(r.stdout_digest.as_ref()),
         stderr: log(r.stderr_digest.as_ref()),

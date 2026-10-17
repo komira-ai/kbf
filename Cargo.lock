@@ -1464,14 +1464,20 @@ dependencies = [
 name = "kbf-daemon"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "crc32fast",
  "futures",
  "hex",
+ "kbf-auth",
  "kbf-caps",
  "kbf-front",
+ "kbf-map",
+ "kbf-mapsync",
+ "kbf-meta",
  "kbf-objstore",
  "kbf-proto",
+ "kbf-route",
  "kbf-server",
  "kbf-storage",
  "kbf-testkit",
@@ -1747,6 +1753,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-mapsync"
+version = "0.1.0"
+dependencies = [
+ "kbf-map",
+ "tokio",
+]
+
+[[package]]
 name = "kbf-mdm"
 version = "0.1.0"
 dependencies = [
@@ -1945,6 +1959,7 @@ dependencies = [
  "kbf-invocation",
  "kbf-log",
  "kbf-map",
+ "kbf-mapsync",
  "kbf-mdm-api",
  "kbf-meta",
  "kbf-objstore",
@@ -2022,10 +2037,13 @@ name = "kbf-storage"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "crc32c",
  "futures",
+ "kbf-map",
  "kbf-meta",
  "kbf-proto",
  "kbf-segments",
+ "kbf-store",
  "kbf-types",
  "rcgen",
  "thiserror",

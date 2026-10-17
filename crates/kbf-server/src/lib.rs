@@ -83,6 +83,7 @@ mod local;
 pub mod log_file;
 pub mod machine;
 pub mod map_feed;
+mod map_push;
 pub mod mdm;
 pub mod members;
 pub mod members_rpc;
@@ -91,6 +92,7 @@ pub mod metrics;
 mod missing;
 pub mod raft_log;
 pub mod rollout;
+mod run_record;
 pub mod serve;
 pub mod stamp;
 mod start;
@@ -115,8 +117,8 @@ pub use local::{LocalStore, LocalStream, LocalStreamed};
 pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use serve::{
     Api, Bound, BoundStorage, Listeners, ServeError, StorageListener, StreamTiming, WorkerTls,
-    bind_server, bind_server_with_api, bind_server_with_options, bind_server_with_policy,
-    bind_server_with_state, bind_server_with_storage, bind_storage,
+    bind_server, bind_server_with_api, bind_server_with_map, bind_server_with_options,
+    bind_server_with_policy, bind_server_with_state, bind_server_with_storage, bind_storage,
 };
 pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_interruptible};
 pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};

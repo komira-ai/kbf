@@ -36,6 +36,13 @@ fn each_error_answers_its_code_and_message() {
             Code::InvalidArgument,
         ),
         (
+            StorageError::Corrupt {
+                digest: a,
+                actual: b,
+            },
+            Code::DataLoss,
+        ),
+        (
             StorageError::OutOfRange {
                 digest: a,
                 offset: 9,

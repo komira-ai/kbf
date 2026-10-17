@@ -187,12 +187,19 @@ impl Node {
             [9; 32],
             (chunks * 1024) as u64,
         );
+        let produced = self.hold_generated_as(digest, chunks);
+        (digest, produced)
+    }
+
+    /// `chunks` chunks of 1 KiB under `digest`, whatever it says of their size, made as
+    /// they are read; the count says how many have been.
+    pub fn hold_generated_as(&self, digest: Digest, chunks: usize) -> Arc<AtomicUsize> {
         let produced = Arc::new(AtomicUsize::new(0));
         self.huge
             .lock()
             .expect("lock")
             .insert(digest, (chunks, Arc::clone(&produced)));
-        (digest, produced)
+        produced
     }
 
     pub fn hold_action(&self, action: Digest, result_blob: Digest) {
