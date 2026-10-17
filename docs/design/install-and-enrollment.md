@@ -1,6 +1,6 @@
 # kbf install and enrollment: packages, one config file, tokens, a frontend-issued certificate
 
-Status: design, nothing built. It defines the units B2 to B5 and the retirement B6 of the product-install work. Labels: **[F]** fact read in the code of `feature/arch-v2` (and `feature/pull-updates` where said), **[D]** a decision this document makes, **[I]** inference, **[V]** verify before building on it, **[CEO]** a choice that is the owner's (section 12 lists them with a lean). Where this document and older prose disagree, the code wins and the disagreement is named (section 2.3).
+Status: design, nothing built. It defines the units B2 to B5 and the retirement B6 of the product-install work. Labels: **[F]** fact read in the code of `feature/arch-v2` (and `feature/pull-updates` where said), **[D]** a decision this document makes, **[I]** inference, **[V]** verify before building on it, **[owner]** a choice that is the owner's (section 12 lists them with a lean). Where this document and older prose disagree, the code wins and the disagreement is named (section 2.3).
 
 Related: [architecture-v2.md](architecture-v2.md) (modes, membership, security), [pull-updates.md](pull-updates.md) and [split-mode-updates.md](split-mode-updates.md) (the updater and the rollout; on `feature/pull-updates` until it merges), [../deploy/kbf-modes.md](../deploy/kbf-modes.md) (the unit rules), [../deploy/tls-renewal.md](../deploy/tls-renewal.md) (certificate reload), [../api.md](../api.md).
 
@@ -48,11 +48,11 @@ The shape, in ten lines:
 - **Host layout.** `/usr/local/kbf/releases/<commit>/`, `current`, `previous`, state in `/var/lib/kbf-deploy`, offline-verification trust in `/usr/local/libexec/kbf-deploy` (`kbf-installer` on `feature/pull-updates`) **[F]**. The paths are constants of that crate.
 - **A node's units** are rendered from templates (`kbf-deploy linux render-units --mode`) and checked by rules (`check-units`), with the `storage` and `daemon` templates still carrying `TODO(registration)` **[F]**.
 - **The container driver** can run `crun` directly (`--container-runtime=oci`) beside Podman **[F]**; the Podman backend is being deleted (#936 and its follow-up).
-- **The pilot's certificate script, in its v2 mode** (outside this repository) issues 15 certificates from the pilot CA by a table: `frontend-worker` (frontend; serverAuth, clientAuth), `storage-<node>` (storage; both), `daemon-<node>` and `daemon-<mac>` (daemon; clientAuth), each with exactly one role, daemon names equal to the node id **[F]**.
+- **The existing certificate script, in its v2 mode** (outside this repository) issues 15 certificates from the existing CA by a table: `frontend-worker` (frontend; serverAuth, clientAuth), `storage-<node>` (storage; both), `daemon-<node>` and `daemon-<mac>` (daemon; clientAuth), each with exactly one role, daemon names equal to the node id **[F]**.
 
 ### 2.2 What the host scripts do today (the work this replaces for a product install)
 
-The pilot's four host-prep scripts (outside this repository), in order: **1** prepares the dev box (kit copy, CA, certificates for every node, copy to nodes). **2** sets one node (stop old units, sudoers, the private storage network, a hosts line, the `kbf` user with subordinate ids and lingering, certificates in `/etc/kbf`, `crun` and `uidmap`, the dev installer). **3** is two cluster writes (a worker label, an object-store NodePort). **4** sets the frontend box (the `kbf-server` account, the worker certificate, a `tailscale cert`, a renew timer, the dev installer). What a **product** install needs from that list is only: the user, subordinate ids, lingering, `crun`, `uidmap`, the units, the first release, and certificates. Everything else is our infrastructure (section 9).
+The four existing host-prep scripts (outside this repository), in order: **1** prepares the build host (kit copy, CA, certificates for every node, copy to nodes). **2** sets one node (stop old units, sudoers, the private storage network, a hosts line, the `kbf` user with subordinate ids and lingering, certificates in `/etc/kbf`, `crun` and `uidmap`, the dev installer). **3** is two cluster writes (a worker label, an object-store NodePort). **4** sets the frontend box (the `kbf-server` account, the worker certificate, a `tailscale cert`, a renew timer, the dev installer). What a **product** install needs from that list is only: the user, subordinate ids, lingering, `crun`, `uidmap`, the units, the first release, and certificates. Everything else is our infrastructure (section 9).
 
 ### 2.3 Where older prose and code disagree
 
@@ -68,7 +68,7 @@ The pilot's four host-prep scripts (outside this repository), in order: **1** pr
 
 | Artifact | For | Contents |
 |---|---|---|
-| `kbf_<version>_<arch>.deb` | Linux node and, with the next package, the frontend | the first release (`kbf`, `kbf-deploy`, the root helper), node units, tmpfiles and sysusers, the pinned `gh` and trusted root for offline verification, maintainer scripts that are two-line stubs calling Rust |
+| `kbf_<version>_<arch>.deb` | Linux node and, with the next package, the frontend | the first release (`kbf`, `kbf-deploy`, the root helper), node units, tmpfiles and sysusers, the pinned `gh` and trusted root for offline verification, maintainer scripts that are a small Rust executable (no shell) |
 | `kbf-frontend_<version>_<arch>.deb` | the frontend host | `kbf-frontend@.service` (the two-instance template of `kbf-modes.md`), the frontend account and directories; `Depends: kbf (= same version)` |
 | `kbf-<version>-macos-arm64.pkg`, and a Homebrew cask that installs it | Macs | `kbf-daemon`, the root helper, the LaunchDaemon plist, the trust directory |
 | `ghcr.io/<owner>/kbf-frontend` (name decided at publish) | the frontend where an orchestrator runs it | the `kbf` binary, entrypoint `kbf frontend` with flags; no updater inside |
@@ -87,19 +87,19 @@ The pilot's four host-prep scripts (outside this repository), in order: **1** pr
 | `/usr/local/libexec/kbf-deploy/` | root | `kbf-deploy package postinst` (copies from `/usr/lib/kbf/libexec`) | what offline verification trusts; the installer's constants name this path |
 | `/lib/systemd/system/kbf-node.service`, `kbf.slice` | root | dpkg | units; `ExecStart` is `/usr/local/kbf/current/kbf node --config /etc/kbf/kbf.toml` |
 | `/etc/kbf/kbf.toml` | root:kbf `0640` | the operator | the node's config (section 4) |
-| `/etc/kbf/enroll.token` | kbf `0600` | the operator | the token file; removed by the node after a successful enrollment |
-| `/etc/kbf/s3.env` | root `0600` | the operator | the cold-store key pair of a storage node (section 4.3: not distributed) |
+| `/var/lib/kbf/enroll.token` | kbf `0600` | the operator | the token file, in the node's own directory so the unprivileged node can read it and **unlink it** after a successful enrollment (a file in root-owned `/etc/kbf` could be neither removed nor, for a `0600` root file, read by `kbf`) |
+| `/etc/kbf/s3.env` | root `0600` | the operator | the cold-store key pair of a storage node, read by **systemd** (`EnvironmentFile=` on `kbf-node.service`, so the unprivileged `kbf` never opens the file; only the process environment holds it). Section 4.3: an explicit departure |
 | `/var/lib/kbf/pki/` | kbf `0700` | the node | `ca.pem`, `<role>.key` (`0600`), `<role>.pem`, `node.json` (ids, serials, config generation) |
 | `/var/lib/kbf/{hot,meta,data}` | kbf `0700` | the node | hot store, metadata log, daemon data |
 | `/var/lib/kbf-deploy/` | root | the installer | state, inbox, `state.json` |
 
 The frontend package adds the account `kbf-frontend` (its keys and database must not be readable by the account builds run as, #819), `/var/lib/kbf-frontend/{state.db,ca/}` (`0700`) and `/etc/kbf/frontend.token` (the operator API's bearer token, as `api-token` today).
 
-macOS: the same layout with the platform differences of host-releases.md (`/var/db/kbf-deploy`), config in `/usr/local/etc/kbf/kbf.toml`, token at `/usr/local/etc/kbf/enroll.token`, PKI in `/var/db/kbf/pki` (`root:wheel`, key `0600`, as macos-end-state.md decides for the node key), plist `/Library/LaunchDaemons/<label>.plist` running `/usr/local/kbf/current/kbf-daemon node --config ...`, logs in `/Library/Logs/kbf`. The label is the profile's `launchd_label` **[F]**, defaulting for the package to `com.komira.kbf-daemon`.
+macOS: the same layout with the platform differences of host-releases.md (`/var/db/kbf-deploy`), config in `/usr/local/etc/kbf/kbf.toml`, token at `/var/db/kbf/enroll.token` (`root:wheel 0600`; the daemon is root and can unlink it; the operator delivers it by `install -m 0600` over a management session or by a file push from the device-management system, never inside the `.pkg`), PKI in `/var/db/kbf/pki` (`root:wheel`, key `0600`, as macos-end-state.md decides for the node key), plist `/Library/LaunchDaemons/<label>.plist` running `/usr/local/kbf/current/kbf-daemon node --config ...`, logs in `/Library/Logs/kbf`. The label is the profile's `launchd_label` **[F]**, defaulting for the package to `com.komira.kbf-daemon`.
 
 ### 3.3 The maintainer scripts are Rust
 
-`postinst`, `prerm` and `postrm` are three-line stubs that `exec /usr/lib/kbf/release/kbf-deploy package <verb> "$@"`. The repository's interpreter budget (`tools/interpreter_budget.tsv`) refuses any other shell, so B5 adds one budget row per stub and nothing else. The verbs, each idempotent, each `DRY-RUN` unless run by dpkg (they use `kbf_host::Plan`, like every kit **[F]**):
+`postinst`, `prerm` and `postrm` are **the executable itself**, not shell: dpkg runs any executable file, so each is a copy of one small Rust program (`kbf-package-hook`, linked statically so it runs before any other package is configured) that dispatches on its own file name. No shell logic exists to budget, and the interpreter budget gains no rows. The verbs (also reachable as `kbf-deploy package <verb>`), each idempotent, each `DRY-RUN` unless run by dpkg (they use `kbf_host::Plan`, like every kit **[F]**):
 
 | Verb | Does | Replaces |
 |---|---|---|
@@ -135,7 +135,7 @@ One file, TOML, closed key set. A mode of the `kbf` binary reads it with `--conf
 url = "https://build.example.com:8990"      # required
 
 [enroll]
-token_file = "/etc/kbf/enroll.token"       # default shown; required until the node is enrolled
+token_file = "/var/lib/kbf/enroll.token"     # default shown; required until the node is enrolled
 
 [node]
 id = "node-02"                              # default: the short hostname, lower case
@@ -161,7 +161,7 @@ Unknown keys, repeated keys (TOML itself refuses duplicates), a wrong type and a
 | Key | Type | Validation | Default |
 |---|---|---|---|
 | `frontend.url` | string | scheme exactly `https`; a host (DNS name, or an IP only with `tls.trust = "pin"`); an optional port 1 to 65535; **no** userinfo, path, query or fragment; at most 253 bytes; the host is lower-cased | required |
-| `enroll.token_file` | absolute path | must exist while the node is unenrolled; a regular file, not a symlink, owned by root or by the service user, mode `0600` or `0400`, at most 4096 bytes, one line (the same checks `token.rs` applies to the API token **[F]**); ignored once `node.json` says enrolled | `/etc/kbf/enroll.token` |
+| `enroll.token_file` | absolute path | must exist while the node is unenrolled; a regular file, not a symlink, owned by the service user (root on macOS), mode `0600` or `0400`, at most 4096 bytes, one line (the same checks `token.rs` applies to the API token **[F]**); ignored once `node.json` says enrolled | `/var/lib/kbf/enroll.token` |
 | `node.id` | string | `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`; becomes the certificate's one DNS name, the member `instance_id` and the `Hello` `node_id` | the short hostname, lower-cased; refused if it fails the pattern (a host with `_` in its name must set it) |
 | `node.advertise` | `host:port` | storage only; host is a DNS name or IP literal; not loopback, unspecified or link-local; not a name of the frontend; port 1 to 65535; no wildcard | `<node.id>:<storage port>` |
 | `node.zone` | string | at most 63 bytes of `[a-z0-9._-]` | empty |
@@ -169,7 +169,7 @@ Unknown keys, repeated keys (TOML itself refuses duplicates), a wrong type and a
 | `storage.hot_dir`, `storage.meta_dir` | absolute path | as `dirs.state`; `hot_dir` on the same filesystem as `daemon.data_dir` (one cache) **[F: kbf-modes.md]** | `<state>/hot`, `<state>/meta` |
 | `daemon.data_dir` | absolute path | as above | `<state>/data` |
 | `daemon.reserve_cpus` | integer | 0 to the node's CPU count minus 1 | kbf's default |
-| `tls.trust` | `"pin"` or `"public"` | `"pin"`: the enroll listener must present a chain containing a certificate whose SHA-256 is the token's pin. `"public"`: the system roots verify the name and the token's pin must still match the CA bundle in the answer (section 5.4) | `"pin"` |
+| `tls.trust` | `"pin"` or `"public"` | `"pin"`: the enroll listener must present a chain containing a certificate whose SHA-256 is the token's pin. `"public"`: the system roots verify the name and the token's pin must still match the CA bundle in the answer (section 5.4) | `"pin"` (the default; `"public"` must be written down on purpose) |
 
 Cross-field checks: a `[storage]` or `[daemon]` table the frontend does not grant a role for is a warning in the log, not an error (the roles come from the token); `node.advertise` set on a node granted only `daemon` is a warning.
 
@@ -195,7 +195,7 @@ message NodeConfig {
 
 The mode `kbf node` runs is a function of `roles`: `{daemon}` is `daemon`, `{storage}` is `storage`, both is `storage-and-daemon`. A change of `roles` or an endpoint is applied at the next restart of the node (the frontend shows "restart pending" from the node's reported generation); `kbf node` never re-executes itself.
 
-**Not pulled: the cold-store credential [D].** The bucket key stays a root-owned file the operator places (`/etc/kbf/s3.env`, the file the `credential` rule already checks **[F]**). Handing a secret to any holder of a storage token is a bigger step than this work needs; the extension (a frontend-vended, scoped, short-lived credential over mTLS) is listed as follow-up work.
+**Not pulled in v1, and an explicit departure: the cold-store credential.** The bucket key stays a root-owned file the operator places (`/etc/kbf/s3.env`, the file the `credential` rule already checks **[F]**), loaded by systemd. This departs from "the frontend decides everything about a node": whoever installs a storage node must also hold the bucket key, and any process of a storage node holds it in its environment. Two guards until it is replaced: **a token that grants `storage` must carry an exact `node_id`** (token creation refuses a storage token without one, so a storage token cannot be spent by an arbitrary host), and the operator guide says so. **Recommendation, an owner decision (section 12, item 4): the frontend vends a scoped, short-lived credential to a storage node over its mTLS session** (a prefix-scoped key, renewed with the certificate), which removes `s3.env` from the product path. It needs the object store to mint scoped credentials, so it is the next unit after B5, not part of it.
 
 ### 4.4 Why `kbf node` and not a rendered unit per role
 
@@ -257,7 +257,7 @@ All writes need the existing bearer token gate (loopback only, `403` otherwise *
 - the REAPI listener is the public name for buck2 and CI, with a certificate the farm CA does not issue; enrollment behind it would tie the trust of the first contact to a public CA;
 - the operator API is loopback by design.
 
-Its certificate is the frontend's own `frontend-worker` certificate (issued by the CA, section 6.2) with the **root appended to the chain** it sends, so a node holding only the pin can verify it (section 5.4). Limits: connection and request rates per source address and in total, a request body of at most 16 KiB, a handshake deadline, and a concurrency cap. Behind an L7 load balancer that terminates TLS the pin cannot be checked on the wire; that is `tls.trust = "public"` (5.4). Behind Envoy during a frontend update, this listener is an L4 pass-through; its traffic is a few requests per node per half-life **[I]**.
+Its certificate is the frontend's own `frontend-worker` certificate (issued by the CA, section 6.2) with the **root appended to the chain** it sends, so a node holding only the pin can verify it (section 5.4). After a rotation (6.4) the chain sent is `leaf, new root cross-signed by the old root, old root`, so a token minted before the rotation still verifies. The node also checks that the leaf carries the `frontend` role URI and `serverAuth`, so a storage or daemon certificate, which any enrolled node holds, cannot impersonate the enrollment server. Limits: connection and request rates per source address and in total, a request body of at most 16 KiB, a handshake deadline, and a concurrency cap. Behind an L7 load balancer that terminates TLS the pin cannot be checked on the wire; that is `tls.trust = "public"` (5.4). Behind Envoy during a frontend update, this listener is an L4 pass-through; its traffic is a few requests per node per half-life **[I]**. Behind an L4 proxy every connection arrives from the proxy, so per-source limits would see one source: `--enroll-proxy-protocol` accepts PROXY protocol v2 and takes the source address from it, only from peers listed in `--enroll-proxy-peer` (a connection from anyone else that sends the header is dropped), and a test proves a spoofed header from an untrusted peer changes nothing. **One active signer.** With two instances of the frontend alive (the Envoy handover) or several frontends, exactly one process signs: a row `enroll/signer` holds `{holder, epoch}` by compare-and-set, taken at start and handed over with the state writer baton of the handover; a process without it answers `Enroll` and `Renew` with `UNAVAILABLE` and a retry hint, and the node retries (its request is idempotent). Serials are random, so a split brain could not collide, but two signers would double the CA key's exposure and break the single audit order; the test kills the holder and checks the other takes over and no request is signed twice.
 
 ### 5.3 Messages
 
@@ -322,7 +322,7 @@ The node knows two things at first contact: the URL, and the token, which contai
 
 | Option | Trust anchor | Costs |
 |---|---|---|
-| **A. Public certificate of the frontend name** | system roots | a rogue or compromised public CA, or a captive TLS-inspecting proxy, sees the token secret and can hand the node a bogus CA bundle; the node has nothing to compare it with; the dev farm's name today is a tailnet name whose certificate is public-CA-issued |
+| **A. Public certificate of the frontend name** | system roots | a rogue or compromised public CA, or a captive TLS-inspecting proxy, sees the token secret and can hand the node a bogus CA bundle; the node has nothing to compare it with; the farm's name today carries a publicly issued certificate |
 | **B. Pinned CA hash in `kbf.toml`** | a value the operator must copy | a third thing to configure; breaks "URL plus token file" |
 | **C. Pin carried inside the token (lean) [D]** | the operator's own copy-and-paste of one string | none for the operator; the pin is minted with the token by the frontend that holds the CA |
 
@@ -353,7 +353,7 @@ The frontend then builds the certificate (via `kbf-ca`, section 6.2):
 | serial | 127 random bits from the CSPRNG, positive; the lower-case hex without leading zeros is the deny list's spelling **[F]** |
 | subject | CN = node id (never read by kbf) |
 | `notBefore` | now minus 5 minutes (clock slack) |
-| `notAfter` | `notBefore` + lifetime; default **7 days** [CEO], 1 hour to 30 days by flag |
+| `notAfter` | `notBefore` + lifetime; default **7 days** [owner], 1 hour to 30 days by flag |
 | basicConstraints | `CA:FALSE`, critical |
 | keyUsage | `digitalSignature` (critical) |
 | extendedKeyUsage | `daemon`: clientAuth. `storage`: serverAuth and clientAuth |
@@ -452,17 +452,17 @@ The last row is why the lifetime is short: revocation is eventually complete wit
 
 - The CA is an ECDSA P-256 key and a self-signed certificate (basicConstraints `CA:TRUE, pathlen 0`, keyUsage `keyCertSign, cRLSign`, ten years), created by `kbf ca init` (or at the frontend's first start with `--ca-init`) in `<frontend state>/ca/` (`ca.key` `0600`, `ca.pem` `0644`), owned by the frontend account.
 - The key is **never** written to the state store, never in the SQLite backups (`kbf-deploy host state-backup` copies the database only **[F]**), never in a release, never in a log; the type's `Debug` prints nothing.
-- All signing goes through a `Signer` trait (`sign(tbs, algorithm) -> signature`). The file signer is v1. A PKCS#11 or cloud-KMS signer is a later implementation of the same trait; nothing in the issuance path may assume the key bytes are in the process [D].
+- All signing goes through a `Signer` trait (`sign(tbs, algorithm) -> signature`). **Production uses a signer outside the frontend process**: either a separate `kbf-signer` process, run as its own account, that owns `ca.key` and serves a Unix domain socket (`SO_PEERCRED` admits only the frontend's uid; it signs only a to-be-signed structure whose role, names and key usage it re-checks against the table of 5.5, so a compromised frontend can mint only well-formed node certificates, never a CA or a frontend-role certificate for a stranger's key), or a cloud KMS. The **in-process file signer is the development and test default**, and the frontend refuses it under `--production`. A PKCS#11 or KMS signer is another implementation of the trait; nothing in the issuance path may assume the key bytes are in the process [D].
 - There is **no escrow** in v1. Losing `ca/` is a recovery, not a disaster: reversible by a new CA and a new set of tokens, because every node's identity is re-creatable (section 6.5). The operator guide says to back up `ca/` with the host's own backups.
 - A frontend that restarts reloads the CA from files; `kbf-tls` reloading does not apply to the CA (it signs; it does not serve), so a CA file change takes a handover/restart.
 
 ### 6.2 `kbf-ca`
 
-A new library crate with no network and no state-store code: key and certificate creation, the `Signer` trait and the file signer, CSR validation (5.5), certificate building (the table), serial generation, the lifetime policy, bundles. Everything takes a clock and a CSPRNG as parameters so tests are deterministic. It depends on `rcgen`, `x509-parser`, `ring` (all already in the tree **[F]**: rcgen is "test certificates only" today, so the workspace comment and `deny.toml` stance on it change, which B3a states in its description).
+A new library crate with no network and no state-store code: key and certificate creation, the `Signer` trait, the file signer and the client of the signer socket, CSR validation (5.5), certificate building (the table), serial generation, the lifetime policy, bundles. Everything takes a clock and a CSPRNG as parameters so tests are deterministic. It depends on `rcgen`, `x509-parser`, `ring` (all already in the tree **[F]**: rcgen is "test certificates only" today, so the workspace comment and `deny.toml` stance on it change, which B3a states in its description).
 
-### 6.3 Roles and the pilot script's v2 table
+### 6.3 Roles and the existing script's v2 table
 
-| pilot script row | Enrollment equivalent | Notes |
+| existing script row | Enrollment equivalent | Notes |
 |---|---|---|
 | `frontend-worker` (frontend, serverAuth + clientAuth) | issued by the frontend **to itself** at start and renewed in-process; never by token | SANs: the frontend's names. A second frontend (Postgres era) gets a certificate from the first through an operator command; no `frontend` role token exists [D] |
 | `storage-<node>` (storage, both EKUs) | token role `storage`, `RoleCsr.role = "storage"` | DNS: node id and advertise host |
@@ -480,19 +480,19 @@ Rotation never needs a flag day because every trust surface is a **bundle** (`--
 3. `kbf ca rotate --activate`: new certificates are issued from `next`. Nodes switch their trust as they renew.
 4. After one full lifetime plus the grace (default 8 days) `kbf ca rotate --retire` drops the old CA from the bundle. Any certificate still carrying the old chain is, at that moment, invalid, which is the intended end.
 
-A pin in a token minted before rotation is the old root's hash: it still verifies, because the answer's bundle contains a certificate whose chain reaches the pin through the cross-signature (5.4 step 3). Tokens minted after `--activate` carry the new pin; the old one stays valid until retirement. The compromise path is `kbf ca rotate --emergency`: stage, activate and retire in one step. A node that renews before the old key is retired gets a certificate from the new CA and trusts the bundle; a node that was offline past that point re-enrolls with a fresh token. Whether the first group is large enough to call this hitless is **[V]**: B3a's test measures it, and until then the honest description is "a re-enrollment for the stragglers".
+A pin in a token minted before rotation is the old root's hash: it still verifies, because the answer's bundle contains a certificate whose chain reaches the pin through the cross-signature (5.4 step 3). Tokens minted after `--activate` carry the new pin; the old one stays valid until retirement. The compromise path is `kbf ca rotate --emergency`: stage, activate and retire in one step, and it **revokes every outstanding token** in the same transaction (reason `ca-rotation`): a token minted under a compromised CA carries a pin an attacker may know, and an attacker holding the old key could stand up an enrollment server that its pin would accept. Operators mint new tokens after the rotation; the listener presents the cross-signed chain of 5.2 until the old root is retired. A node that renews before the old key is retired gets a certificate from the new CA and trusts the bundle; a node that was offline past that point re-enrolls with a fresh token. Whether the first group is large enough to call this hitless is **[V]**: B3a's test measures it, and until then the honest description is "a re-enrollment for the stragglers".
 
 ### 6.5 Losing the CA key, or the state store
 
 - **CA key lost**: nodes keep working until their certificates expire (7 days at most), the frontend creates a new CA, and every node needs a new token and a restart of `kbf enroll` with the new pin. Documented as a drill and tested in the rehearsal (section 10).
-- **State store lost, CA intact**: tokens and the registry are gone; certificates still verify (they are the CA's), so builds keep running; nodes renew by `Renew`, which fails because the registry has no row. B3 gives `Renew` a **re-adoption** path for this case, off by default (`--enroll-adopt-unknown`): a signed CSR for an unknown node whose live certificate (presented as the CSR's attribute) chains to the CA is accepted and the row is rebuilt; this widens trust after a loss, so it is the owner's call (section 12, item 7). The default is re-enrollment.
+- **State store lost, CA intact**: tokens and the registry are gone; certificates still verify (they are the CA's), so builds keep running; nodes renew by `Renew`, which fails because the registry has no row. B3 gives `Renew` a **re-adoption** path for this case, off by default (`--enroll-adopt-unknown`): a signed CSR for an unknown node is accepted and the row rebuilt only when the node also presents its live certificate, the CSR's public key **equals that certificate's SubjectPublicKeyInfo**, the certificate chains to the CA and is unexpired, and its serial is **not in a deny row**. Deny rows live in the same store: **a store loss erases every revocation**, so a node revoked before the loss is adoptable again if its certificate has not expired. That is why the flag is off by default and why, after an adoption, the operator rotates the CA if any revocation was outstanding. It widens trust after a loss, so it is the owner's call (section 12, item 7). The default is re-enrollment.
 
-### 6.6 Migrating the current pilot CA
+### 6.6 Migrating the current farm CA
 
-1. `kbf ca import --cert ca.pem --key ca.key` on the frontend host (the pilot CA directory the operator already holds; the command reads the files, checks they match and are a CA, and copies them into `ca/`). The pin of the imported CA is what tokens carry, so **the existing 15 certificates stay valid and keep working** while nodes migrate.
-2. Enable `--enroll-listen`; the frontend issues itself a `frontend-worker` certificate from the CA and stops needing the dev box's file.
+1. `kbf ca import --cert ca.pem --key ca.key` on the frontend host (the existing CA directory the operator already holds; the command reads the files, checks they match and are a CA, and copies them into `ca/`). The pin of the imported CA is what tokens carry, so **the existing 15 certificates stay valid and keep working** while nodes migrate.
+2. Enable `--enroll-listen` (not on a production frontend before B3c lands: see 8.3); the frontend issues itself a `frontend-worker` certificate from the CA and stops needing the build host's file.
 3. Migrate nodes one at a time: install the package, write `kbf.toml`, place a token; the node enrolls and writes `pki/`. The old certificates in `/etc/kbf` are no longer read by `kbf node`.
-4. When every node is enrolled, run `kbf ca rotate --emergency` (or the staged form) to move to a CA whose key has never been on the dev box, and remove the pilot CA directory. The old certificates stop being valid at that moment, which is the cut.
+4. When every node is enrolled, run `kbf ca rotate --emergency` (or the staged form) to move to a CA whose key has never been on the build host, and remove the existing CA directory. The old certificates stop being valid at that moment, which is the cut.
 
 ## 7. mTLS inside the farm, plain server TLS outside
 
@@ -533,7 +533,7 @@ Counters use the store's C3 counters; the issued serial is random, not a counter
 
 ### 8.3 The deny path is the largest hidden dependency
 
-Revocation as designed needs three things that do not exist: a writer of `Map.denied`, storage-side enforcement, and a store-backed source for the worker listener. They are one unit (B3c) so they land with a test that denies a node and watches **a storage node** refuse it. Until B3c merges, revocation is "refuse renewal and wait for expiry" plus the existing file deny list on the worker listener, and the operator guide must say so.
+Revocation as designed needs three things that do not exist: a writer of `Map.denied`, storage-side enforcement, and a store-backed source for the worker listener. They are one unit (B3c) so they land with a test that denies a node and watches **a storage node** refuse it. **Gate.** B3b registers `--enroll-listen` but the frontend refuses to start with it unless the build carries the marker `DENY_ENFORCED`, which B3c sets in the same change that makes storage apply `Map.denied`; B3b's CI test asserts the refusal. So an enrollment listener cannot be switched on in production, by mistake, while a revoked node would still be served by storage. Until B3c merges, revocation is "refuse renewal and wait for expiry" plus the existing file deny list on the worker listener, and the operator guide must say so.
 
 ### 8.4 Ports and URL
 
@@ -543,11 +543,11 @@ The frontend gains `--enroll-listen`, `--ca-dir`, `--frontend-name` (repeatable:
 
 | Item (all outside this repository) | Product use | Fate |
 |---|---|---|
-| the certificate script, v2 mode | issuing node and frontend certificates | **retired for product**. Stays only as the pilot's way to make the CA that `kbf ca import` reads, until the migration of 6.6 completes; then deleted |
-| the same script, v1 mode (Mac B) | the old server's client certificates | untouched until the old build farm is torn down |
-| the pilot installer and its setup, fetch and pin files | host install | **retired** when B5 lands: the package plus the helper replace it. Stays for the test farm until its nodes are reinstalled from the package |
+| the certificate script, v2 mode | issuing node and frontend certificates | **retired for product**. Stays only as the existing way to make the CA that `kbf ca import` reads, until the migration of 6.6 completes; then deleted |
+| the same script, v1 mode (the first Mac) | the old server's client certificates | untouched until the old build farm is torn down |
+| the existing installer and its setup, fetch and pin files | host install | **retired** when B5 lands: the package plus the helper replace it. Stays for the test farm until its nodes are reinstalled from the package |
 | the frontend certificate renew helper | renewing the farm-CA worker certificate | **retired** (the frontend renews its own). Stays for the **REAPI** certificate (a `tailscale cert` pair) until the owner decides how the public certificate is obtained (section 12, item 8) |
-| host-prep script 1 (dev box: CA, all certificates, copy to nodes) | prepare | **retired**. Replaced by `kbf ca import`, `kbf token create`, `apt install` |
+| host-prep script 1 (build host: CA, all certificates, copy to nodes) | prepare | **retired**. Replaced by `kbf ca import`, `kbf token create`, `apt install` |
 | host-prep script 2, steps for the kit, the user, subordinate ids, lingering, certificates, `crun` and `uidmap`, the installer and key cleanup | per-node host prep | **retired**: `package postinst`. Its steps for stopping the old build-farm units, sudoers, the private storage network and the hosts line are our infrastructure and stay as one-shots |
 | host-prep script 3 (worker label, object-store NodePort) | cluster writes | **stays** (our k3s) |
 | host-prep script 4, steps for the frontend account, worker certificate, renew timer and installer | the frontend host | **retired**: the `kbf-frontend` package and `kbf ca init`. Its steps for the private-network address and the `tailscale cert` stay |
@@ -582,7 +582,7 @@ Each test names the defect it catches and the mutant that turns it red. The bar 
 | `kbf-deploy` package | `postinst` on a scratch root: user, subid block (planted neighbouring range, planted smaller existing range, planted exact collision), linger path, trust files, first release; run twice; run as upgrade | a re-run that duplicates, a range that overlaps | take the first block without reading `/etc/subuid` |
 | `kbf-deploy` package | `postinst` with `current` present never moves `current` or `previous`; with it absent creates it | the package stealing the updater's authority | always flip |
 | `kbf-deploy` package | `check-units --mode node` over the shipped template (the existing rules) and `kbf check-args` of the shipped binary | a unit the binary rejects | rename a flag in the template |
-| repo lint | the budget has exactly the three stub rows and no other shell | shell creeping back | add a script |
+| repo lint | the package's maintainer scripts are ELF files and the budget gains no row | shell creeping back | ship a `#!/bin/sh` postinst |
 
 ### 10.2 The hermetic enrollment test (B3 and B4 together, in `kbf-it`)
 
@@ -616,34 +616,34 @@ Dependency: `P0` first (it is tiny and unblocks the rest), then everything else 
 | **B2a** frontend tokens | `crates/kbf-server/src/enroll/tokens.rs`, `.../tokens_tests.rs`, route hooks in `kbf-server/src/api.rs` (one `mod` line), `docs/api.md` section for the routes | token create, list, revoke, hashed storage, shown once, constant-work compare, expiry, uses | P0 |
 | **B2b** token CLI | `crates/kbf-cli/src/token.rs` (new), one enum variant in `lib.rs` | `kbf token create|list|revoke`, `--out FILE` exclusive `0600` | P0, B2a's routes (contract fixed by P0) |
 | **B2c** token UI page | `crates/kbf-ui/...` (its own files) | token and node list page | B2a, B3b |
-| **B3a** CA | `crates/kbf-ca/` (new crate), workspace `Cargo.toml` member line, `deny.toml` note | 6.1 to 6.4: CA create and import, `Signer`, CSR validation, issuance, rotation | P0 |
+| **B3a** CA | `crates/kbf-ca/` (new crate), `crates/kbf-signer/` (new: the signer process over a Unix socket), workspace `Cargo.toml` member lines, `deny.toml` note | 6.1 to 6.4: CA create and import, `Signer` (file, socket client), the `kbf-signer` process, CSR validation, issuance, rotation | P0 |
 | **B3b** enroll service | `crates/kbf-server/src/enroll/{service.rs,registry.rs,renew.rs,limits.rs}`, `--enroll-listen` and `--ca-dir` flags in `kbf-server/src/config.rs`, the listener in `listen/` | 5.2 to 5.8: the transaction, registry, `Renew`, rate limits, the frontend's own certificate | P0, B3a, B2a (the token row type) |
 | **B3c** revocation path | `crates/kbf-server/src/{members.rs,members_rpc.rs,identity.rs}`, `crates/kbf-map` (if a canonical write helper is needed), `crates/kbf-storage/src/service/admission.rs` and its tests, `POST /v1/enroll/nodes/{id}/revoke` | 5.9 and 8.3: `deny/` rows into `Map.denied`, storage enforcement, the instance-id binding, the worker store-backed deny source | P0 |
 | **B4a** node library | `crates/kbf-enroll/` (new crate): `config.rs` (`kbf.toml`), `token.rs`, `pin.rs`, `client.rs`, `store.rs` (keys, atomic files, `node.json`), `renew.rs` | 4 and 5.4 to 5.8 on the node; no CLI | P0 |
 | **B4b** node wiring | `crates/kbf-cli/src/{node.rs,enroll.rs}` (new), `names.rs` (`node`), one line each in `lib.rs`, `crates/kbf-daemon` (client identity rebuild on renewal, if [V] says it is needed), `crates/kbf-mac-provision` (plist runs `node`) | `kbf node`, `kbf enroll`, the mode from `NodeConfig.roles`, the daemon's identity refresh | B4a |
 | **B5a** package verbs | `crates/kbf-deploy/src/package/` (new), `Mode::Node`, `templates/linux/modes/kbf-node.service`, `check-units` rules for it | 3.3 as Rust with scratch-root tests | B4b's flag names (fixed by this document) |
-| **B5b** Linux packaging | `packaging/linux/` (control, sysusers, tmpfiles, stubs), `crates/xtask/src/deb.rs`, `.github/workflows/package.yml`, `tools/interpreter_budget.tsv` (three rows) | `.deb` and `kbf-frontend.deb` built from the attested tarball; S1 to S3 | B5a |
+| **B5b** Linux packaging | `packaging/linux/` (control, sysusers, tmpfiles, `kbf-package-hook`), `crates/xtask/src/deb.rs`, `.github/workflows/package.yml`, no interpreter-budget row (the hooks are executables) | `.deb` and `kbf-frontend.deb` built from the attested tarball; S1 to S3 | B5a |
 | **B5c** macOS packaging | `packaging/macos/` (pkg scripts as Rust verbs, the plist, the cask), `crates/xtask/src/pkg.rs`, a macOS job in the workflow | `.pkg` and cask | B5a, B4b |
 | **B5d** frontend image | `packaging/container/Containerfile`, an image job in the workflow | 3.4 | B3b |
-| **B6** retirement | outside this repository only: the pilot scripts' docs and run sheets; no code here | marks and later deletes the rows of section 9 | B5b done and one node reinstalled from the package |
+| **B6** retirement | outside this repository only: those scripts' docs and run sheets; no code here | marks and later deletes the rows of section 9 | B5b done and one node reinstalled from the package |
 | **Doc** | `docs/deploy/install.md`, `docs/deploy/enrollment.md` (operator guide, including the residuals of 5.1 and 5.4 and the 8.3 caveat) | written alongside B5b | |
 
 Order by value: P0, then B3a, B2a and B4a in parallel, then B3b and B3c, then B4b, then B5a to B5d. B3c is independent of B3b except at test time and should start early because storage-side enforcement is the long pole.
 
 ## 12. Open decisions
 
-Marked **[CEO]** where the owner decides; the lean is what the work proceeds with if no answer comes.
+Marked **[owner]** where the owner decides; the lean is what the work proceeds with if no answer comes.
 
 | # | Decision | Lean |
 |---|---|---|
-| 1 | **[CEO]** Certificate lifetime and renewal point | 7 days, renew at half. Shorter (24 hours) shrinks the revocation tail but makes a frontend outage over half a day start expiring certificates; renewal needs no certificate, so expiry never locks a node out, which is why 7 days is not the safe-but-lazy choice |
-| 2 | **[CEO]** First-contact trust | the pin inside the token, public-name verification as a declared fallback (5.4) |
-| 3 | **[CEO]** Mac packaging | a signed `.pkg` installed by a Homebrew cask; a formula only for developers |
-| 4 | **[CEO]** The cold-store credential: stays an operator-placed root-owned file, not vended by the frontend | stays a file in v1; a scoped vended credential as the next step, because a storage token would otherwise be a bucket credential |
-| 5 | The CA is a single online self-signed root with a pluggable `Signer`; the alternative is an offline root with an online intermediate | single root now; the cross-signed rotation of 6.4 gives the same recovery without a second key custody story |
+| 1 | **[owner]** Certificate lifetime and renewal point | 7 days, renew at half. Shorter (24 hours) shrinks the revocation tail but makes a frontend outage over half a day start expiring certificates; renewal needs no certificate, so expiry never locks a node out, which is why 7 days is not the safe-but-lazy choice |
+| 2 | **[owner]** First-contact trust | the pin inside the token, public-name verification as a declared fallback (5.4) |
+| 3 | **[owner]** Mac packaging | a signed `.pkg` installed by a Homebrew cask; a formula only for developers |
+| 4 | **[owner]** The cold-store credential | recommended: the frontend vends a scoped, short-lived credential over mTLS (4.3). In v1 the file stays, as an explicit departure, with storage tokens bound to a `node_id` |
+| 5 | The CA is a single self-signed root signing through a separate process or KMS in production (6.1); the alternative is an offline root with an online intermediate | single root now; the cross-signed rotation of 6.4 gives the same recovery without a second key custody story |
 | 6 | One key per role on a `storage-and-daemon` node | two keys; revocation by node id covers both |
-| 7 | **[CEO]** `--enroll-adopt-unknown` (rebuild the registry from live certificates after a store loss) | off by default; re-enrollment is the default recovery |
-| 8 | **[CEO]** How the REAPI certificate is obtained once the public name is real | external renewal writing the files (the reload exists), in-process ACME later and only if wanted |
+| 7 | **[owner]** `--enroll-adopt-unknown` (rebuild the registry from live certificates after a store loss) | off by default; re-enrollment is the default recovery; a store loss erases revocations (6.5) |
+| 8 | **[owner]** How the REAPI certificate is obtained once the public name is real | external renewal writing the files (the reload exists), in-process ACME later and only if wanted |
 | 9 | Frontend pushes a changed `frontend_url` to nodes | yes, guarded: adopted only under the same pin, `kbf.toml` kept as fallback; lets the public rename happen with no node edits |
 | 10 | The frontend as a container image has no in-image updater | yes; the orchestrator replaces the image; the `.deb` and Envoy handover remain our host path |
 | 11 | A signed apt repository (versus the `.deb` as a release asset) | the release asset first; a repository when a second operator exists |
@@ -658,4 +658,4 @@ Marked **[CEO]** where the owner decides; the lean is what the work proceeds wit
 - **Revocation is eventually complete** (section 5.9), immediate for renewal and new storage access once B3c is in, and bounded by 7 days otherwise.
 - **A package upgrade changes root code** and is the one place that does so (3.5). It is an operator act, tested for the `current` link (S2).
 - **Clock skew** is checked by the node on every answer and surfaced; a node with a wrong clock fails loudly instead of installing a certificate it cannot use.
-- **Reversibility.** Enrollment is additive: the five modes, the flags and pilot-script-issued certificates keep working until the CA migration of 6.6 step 4, which is itself a single reversible rotation while the old CA is kept in the bundle.
+- **Reversibility.** Enrollment is additive: the five modes, the flags and script-issued certificates keep working until the CA migration of 6.6 step 4, which is itself a single reversible rotation while the old CA is kept in the bundle.
