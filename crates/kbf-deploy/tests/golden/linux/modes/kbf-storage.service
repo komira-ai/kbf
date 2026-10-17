@@ -8,6 +8,11 @@ Description=kbf build farm storage node
 Wants=network-online.target
 After=network-online.target minio.service
 
+# A failure that repeats quickly (the cold store or a disk not ready) must not use up
+# systemd's start limit of 5 starts in 10 s and leave the unit down (check-units rule
+# `restart`).
+StartLimitIntervalSec=0
+
 [Service]
 # Not the daemon's user: a storage node holds the cold store's key.
 User=kbf-server
@@ -47,6 +52,7 @@ ExecStart=/usr/local/bin/kbf storage \
 KillSignal=SIGTERM
 TimeoutStopSec=infinity
 Restart=on-failure
+RestartSec=5
 # Exit 2 is a command line kbf refused: a restart cannot fix it.
 RestartPreventExitStatus=2
 

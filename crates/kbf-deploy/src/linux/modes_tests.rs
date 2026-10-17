@@ -123,7 +123,25 @@ fn every_mode_but_the_daemon_drains() {
 #[test]
 fn each_planted_defect_turns_its_rule_red() {
     let c = config();
-    let rows: [(Mode, &str, &str, &str); 21] = [
+    let rows: [(Mode, &str, &str, &str); 24] = [
+        (
+            Mode::Daemon,
+            "RestartSec=5\n",
+            "",
+            "FAIL restart: kbf-daemon.service gives no RestartSec=5: systemd restarts after 100 ms, and a failure that repeats quickly ends in start-limit-hit with the unit down",
+        ),
+        (
+            Mode::Storage,
+            "StartLimitIntervalSec=0\n",
+            "StartLimitIntervalSec=10\n",
+            "FAIL restart: kbf-storage.service has StartLimitIntervalSec=10, not StartLimitIntervalSec=0: five starts in that interval end in start-limit-hit with the unit down",
+        ),
+        (
+            Mode::StorageAndDaemon,
+            "RestartSec=5\n",
+            "RestartSec=100ms\n",
+            "FAIL restart: kbf-storage-and-daemon.service has RestartSec=100ms, not RestartSec=5: a failure that repeats quickly must not use up the start limit",
+        ),
         (
             Mode::Frontend,
             "TimeoutStopSec=infinity\n",
