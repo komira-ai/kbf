@@ -407,3 +407,47 @@ async fn client_streams_finish_across_goaway_and_new_calls_land_on_the_new_proce
     drop((ops, waiting, fresh, client));
     assert!(old.proc.wait_exit().success(), "{}", old.proc.log());
 }
+
+/// Catches: an old instance that systemd restarts after a crash (`Restart=on-failure`) and
+/// that flip-flops with the instance now serving, or leaves the store at a wrong generation.
+/// A restarted old instance has the same flags as any successor, so it must take over from
+/// the serving one by the ordinary handover (the generation the serving one holds, the
+/// epoch kept), and the instance it replaces must exit 0 so that systemd does not restart
+/// it in turn. The test hands over, lets the old process finish and exit, starts it again, and requires
+/// the restart to serve at generation + 2 with the epoch kept, the middle instance to exit
+/// 0, and the store untouched by anyone else. (The refusal of a store at another generation
+/// than the serving one reported is `a_successor_told_another_generation_exits_2...`:
+/// exit 2 is in the unit's `RestartPreventExitStatus`.) Mutants: the handed-over instance
+/// exiting non-zero once released (systemd would restart it, a flip-flop); `Released` sent
+/// before the store is demoted (the restart cannot lock the file).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_old_instance_takes_over_once_and_the_instance_it_replaces_exits_0() {
+    let rig = Rig::start("old_restarted");
+    let Build {
+        mut old,
+        client,
+        mut daemon,
+        ops,
+        ..
+    } = Build::start(&rig).await;
+    let before = Rows::read(&rig.state_db());
+
+    let mut new = rig.frontend("new", Some(old.addrs));
+    assert_eq!(daemon.ended().await.code(), Code::Unavailable);
+    drop((ops, client));
+    assert!(old.proc.wait_exit().success(), "{}", old.proc.log());
+
+    // The old instance, started again by systemd after a failure: same flags.
+    let mut again = rig.frontend("old-again", Some(old.addrs));
+    assert!(new.proc.wait_exit().success(), "{}", new.proc.log());
+    let after = Rows::read(&rig.state_db());
+    assert_eq!(after.generation(), before.generation() + 2);
+    assert_eq!(after.epoch(), before.epoch(), "a handover keeps the epoch");
+    assert_eq!(after.keys("op/"), before.keys("op/"));
+    // Nothing flips back: the instance that took over keeps serving.
+    assert!(again.proc.start_line().is_ok(), "{}", again.proc.log());
+    assert_eq!(
+        Rows::read(&rig.state_db()).generation(),
+        before.generation() + 2
+    );
+}
