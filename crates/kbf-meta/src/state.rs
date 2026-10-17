@@ -204,17 +204,25 @@ pub struct Evicted {
 pub struct UnallocatedEpoch(pub ObjectId);
 
 /// Why an action-cache write was refused. A refused write changes nothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ActionWriteError {
     /// Only daemons write the action cache.
     #[error("action-cache writes are accepted only from a daemon")]
     NotDaemon,
-    /// A blob the entry needs is not held: the outputs must be stored first.
-    #[error("action-cache entry needs blob {0}, which is not held")]
-    Absent(Digest),
-    /// A blob the entry needs is held at an unreachable object.
-    #[error("action-cache entry needs blob {0}, whose object is unreachable")]
-    Unreachable(Digest),
+    /// Every blob the entry needs that is not held, the result's first, then the
+    /// closure's in digest order; never empty. The outputs must be stored first.
+    #[error("action-cache entry needs blobs that are not held: {}", listed(.0))]
+    Absent(Vec<Digest>),
+    /// Every blob the entry needs that is held at an unreachable object, in the same
+    /// order; never empty. Only when none is absent.
+    #[error("action-cache entry needs blobs whose objects are unreachable: {}", listed(.0))]
+    Unreachable(Vec<Digest>),
+}
+
+/// `digests`, comma-separated, for an error message.
+fn listed(digests: &[Digest]) -> String {
+    let named: Vec<String> = digests.iter().map(ToString::to_string).collect();
+    named.join(", ")
 }
 
 /// A blob an action-cache entry needs that the closure check did not find usable.
@@ -525,6 +533,32 @@ impl MetaState {
         Ok(())
     }
 
+    /// The write-time closure check: every blob of `needed` that is not present and
+    /// reachable, as the refusal of an action-cache write names them
+    /// ([`ActionWriteError::Absent`] if any is absent, else
+    /// [`ActionWriteError::Unreachable`]); `None` if every one is.
+    #[must_use]
+    pub fn lacking<'a>(
+        &self,
+        needed: impl Iterator<Item = &'a Digest>,
+    ) -> Option<ActionWriteError> {
+        let (mut absent, mut unreachable) = (Vec::new(), Vec::new());
+        for digest in needed {
+            match self.blob(digest) {
+                BlobAnswer::Present { .. } => {}
+                BlobAnswer::Unavailable => unreachable.push(*digest),
+                BlobAnswer::Absent => absent.push(*digest),
+            }
+        }
+        if !absent.is_empty() {
+            Some(ActionWriteError::Absent(absent))
+        } else if !unreachable.is_empty() {
+            Some(ActionWriteError::Unreachable(unreachable))
+        } else {
+            None
+        }
+    }
+
     /// Whether `object`'s epoch was allocated.
     fn allocated(&self, object: ObjectId) -> Result<(), UnallocatedEpoch> {
         let epoch = object.epoch().get();
@@ -576,11 +610,11 @@ impl MetaState {
         if role != Role::Daemon {
             return Err(ActionWriteError::NotDaemon);
         }
-        self.closure_check(iter::once(&record.result).chain(record.closure.iter()))
-            .map_err(|lack| match lack {
-                Lack::Absent(d) => ActionWriteError::Absent(d),
-                Lack::Unreachable(d) => ActionWriteError::Unreachable(d),
-            })?;
+        if let Some(lacking) = self.lacking(iter::once(&record.result).chain(record.closure.iter()))
+        {
+            return Err(lacking);
+        }
+        self.order_flush(&record.result, record.closure.iter());
         self.actions.insert(
             action,
             ActionEntry {

@@ -403,7 +403,7 @@ async fn a_miss_on_a_catching_up_node_is_unavailable_as_over_the_wire() {
     }
     assert_eq!(near, far, "the same words in-process and over the wire");
 
-    *mem.fail.lock().expect("lock") = Some(ActionWriteError::Absent(closure).into());
+    *mem.fail.lock().expect("lock") = Some(ActionWriteError::Absent(vec![closure]).into());
     let committed = local
         .commit_action_record(Role::Daemon, action, record.clone())
         .await;
@@ -449,12 +449,12 @@ async fn a_miss_on_a_catching_up_node_is_unavailable_as_over_the_wire() {
         ),
         "{prepared:?}"
     );
-    *mem.fail.lock().expect("lock") = Some(ActionWriteError::Absent(closure).into());
+    *mem.fail.lock().expect("lock") = Some(ActionWriteError::Absent(vec![closure]).into());
     let committed = local
         .commit_action_record(Role::Daemon, action, record)
         .await;
     assert!(
-        matches!(committed, Err(StorageError::ActionWrite(ActionWriteError::Absent(b))) if b == closure),
+        matches!(&committed, Err(StorageError::ActionWrite(ActionWriteError::Absent(b))) if *b == [closure]),
         "{committed:?}"
     );
 }
