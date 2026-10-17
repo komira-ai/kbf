@@ -43,7 +43,7 @@ use crate::identity::Peers;
 
 /// Admits the call `request` is, as the module docs say, or says why not (and logs it).
 async fn admit<T>(peers: &Peers, request: &Request<T>, call: &'static str) -> Result<(), Status> {
-    let certs = request.peer_certs();
+    let certs = kbf_tls::peer_certs(request);
     let leaf = certs.as_deref().and_then(|chain| chain.first());
     let admitted = peers.admit_call(leaf.map(AsRef::as_ref)).await;
     admitted.map(drop).inspect_err(|refused| {

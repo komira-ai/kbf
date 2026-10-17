@@ -18,7 +18,9 @@ use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_server::join::{Identity as NodeIdentity, Joiner};
 use kbf_server::members::{Members, MembershipConfig};
 use kbf_server::storage_node::{StorageFlags, command, parse, start_storage};
-use kbf_server::{EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_state};
+use kbf_server::{
+    EpochPolicy, Listeners, StateStore, TlsSource, WorkerTls, bind_server_with_state,
+};
 use kbf_state::{Store, Versioned};
 use kbf_storage::Storage as _;
 use kbf_storage::service::{CatchUp, ROLE_URI_PREFIX, RemoteStorage};
@@ -423,9 +425,13 @@ async fn over_mutual_tls_only_the_storage_role_registers() {
     let pki = Pki::new();
     let (frontend_cert, frontend_key) = pki.cert("frontend");
     let worker_tls = WorkerTls {
-        server: ServerTlsConfig::new()
-            .identity(Identity::from_pem(frontend_cert, frontend_key))
-            .client_ca_root(Certificate::from_pem(pki.ca.pem())),
+        server: TlsSource::fixed(
+            "worker",
+            frontend_cert.as_bytes(),
+            frontend_key.as_bytes(),
+            Some(pki.ca.pem().as_bytes()),
+        )
+        .expect("the worker listener's TLS"),
         deny_list: None,
     };
     let f = frontend(Some(worker_tls));

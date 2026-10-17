@@ -26,6 +26,7 @@ use kbf_sched::MemoryLadder;
 use kbf_storage::service::Admission;
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
+use kbf_tls::{Incoming, TlsSource};
 use tonic::transport::{Server, ServerTlsConfig};
 
 use crate::blobs::{WorkerBlobs, WorkerCas, WorkerSegments};
@@ -49,10 +50,11 @@ use kbf_proto::kbf::map::v1::membership_server::MembershipServer;
 pub struct Listeners {
     /// The REAPI listener (clients: buck2, Bazel).
     pub reapi: SocketAddr,
-    /// TLS for the REAPI listener (a server certificate; clients present none). `None`
-    /// serves it in plain text, on whatever address `reapi` names (nothing refuses a
-    /// bind off loopback; the binary's start line warns about one).
-    pub reapi_tls: Option<ServerTlsConfig>,
+    /// TLS for the REAPI listener (a server certificate; clients present none), re-read
+    /// from its files as they change. `None` serves it in plain text, on whatever
+    /// address `reapi` names (nothing refuses a bind off loopback; the binary's start
+    /// line warns about one).
+    pub reapi_tls: Option<TlsSource>,
     /// The `kbf.worker.v1` listener (daemons): their worker streams, and `ByteStream`
     /// for their blobs ([`crate::blobs`]).
     pub worker: SocketAddr,
@@ -130,8 +132,9 @@ const CLOSE_GRACE: Duration = Duration::from_secs(2);
 /// (see [`crate::identity`]).
 #[derive(Clone, Debug)]
 pub struct WorkerTls {
-    /// The listener's identity and the client CA daemons' certificates chain to.
-    pub server: ServerTlsConfig,
+    /// The listener's identity and the client CA daemons' certificates chain to, both
+    /// re-read from their files as they change.
+    pub server: TlsSource,
     /// The certificates and nodes refused, read again at every check.
     pub deny_list: Option<DenyList>,
 }
@@ -265,18 +268,30 @@ pub(crate) fn bind_api(
 /// The worker listener's TLS and the way its peers are told apart. Not generic, so
 /// both arms are one set of lines whatever the cache types (a per-instantiation copy
 /// that misses one arm would count as missed lines).
-pub(crate) fn worker_peers(
-    server: Server,
-    tls: Option<WorkerTls>,
-) -> Result<(Server, Peers), ServeError> {
-    Ok(match tls {
+pub(crate) fn worker_peers(tls: Option<WorkerTls>) -> (Peers, Option<TlsSource>) {
+    match tls {
         Some(tls) => (
-            server.tls_config(tls.server)?,
             Peers::Certified {
                 deny_list: tls.deny_list,
             },
+            Some(tls.server),
         ),
-        None => (server, Peers::Unauthenticated),
+        None => (Peers::Unauthenticated, None),
+    }
+}
+
+/// The accepted connections of the worker listener, each registered in `connections`
+/// until it closes, so an upload is dropped when the connection that began it closes.
+/// Not generic, for the same reason as [`worker_peers`].
+pub(crate) fn tracked(
+    incoming: Incoming,
+    connections: Connections,
+) -> impl futures::Stream<Item = std::io::Result<kbf_front::Tracked<kbf_tls::Conn>>> {
+    incoming.map(move |accepted| {
+        accepted.map(|conn| {
+            let peer = conn.remote_addr();
+            connections.track_peer(conn, peer)
+        })
     })
 }
 
@@ -594,6 +609,11 @@ where
     let farm = Arc::new(farm.with_state(state)?);
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
+    let peers_certified = listeners.worker_tls.is_some();
+    let (peers, worker_tls) = worker_peers(listeners.worker_tls);
+    let tls_sources: Vec<TlsSource> = listeners.reapi_tls.iter().chain(&worker_tls).cloned().collect();
+    let reapi_incoming = Incoming::new(reapi_incoming, listeners.reapi_tls);
+    let worker_incoming = Incoming::new(worker_incoming, worker_tls);
     let probe_timeout = listeners.store_probe_timeout;
     let (api_listen, token, local) = api.map_or((None, None, None), |api| {
         (Some(api.listen), api.token, api.local_cache)
@@ -615,21 +635,15 @@ where
     );
     let api_routes = crate::api::router(Arc::clone(&farm), token, Arc::clone(&drain))
         .merge(health_routes)
-        .merge(crate::metrics::router(Arc::clone(&cache), local))
+        .merge(crate::metrics::router(Arc::clone(&cache), local, tls_sources))
         .merge(blob_routes)
         .merge(page_routes);
     // Logged at every start, the first one too (issue #156).
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     log_state(durable, term, epoch);
 
-    let mut reapi_server = keepalive(flow_control(Server::builder()), listeners.streams);
-    if let Some(tls) = listeners.reapi_tls {
-        reapi_server = reapi_server.tls_config(tls)?;
-    }
-    let mut worker_server = keepalive(flow_control(Server::builder()), listeners.streams);
-    let peers_certified = listeners.worker_tls.is_some();
-    let peers;
-    (worker_server, peers) = worker_peers(worker_server, listeners.worker_tls)?;
+    let reapi_server = keepalive(flow_control(Server::builder()), listeners.streams);
+    let worker_server = keepalive(flow_control(Server::builder()), listeners.streams);
     let worker_blobs = ByteStreamServer::new(WorkerBlobs::new(
         ByteStreamService::new(Arc::clone(&cache)),
         peers.clone(),
@@ -646,8 +660,7 @@ where
     // connection that began it closes.
     let connections = Connections::new();
     let tracking = connections.clone();
-    let worker_incoming =
-        worker_incoming.map(move |accepted| accepted.map(|stream| tracking.track(stream)));
+    let worker_incoming = tracked(worker_incoming, tracking);
     let worker_segments = SegmentsServer::new(WorkerSegments::new(
         SegmentsService::new(Arc::clone(&cache), listeners.segments, connections),
         peers.clone(),
@@ -712,9 +725,9 @@ where
         // A task of its own: applying events never delays the tick or an accept loop,
         // and they never delay it. It stops when the serving future does.
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
-        // `reapi_server` carries the REAPI TLS configuration when one is given, so
-        // the health service is served over the same TLS as the REAPI routes; the
-        // authenticator is already applied to those routes alone (above).
+        // `reapi_incoming` carries the REAPI TLS when there is any, so the health
+        // service is served over the same TLS as the REAPI routes; the authenticator is
+        // already applied to those routes alone (above).
         let reapi_serve = reapi_server
             .add_routes(reapi_routes)
             .serve_with_incoming_shutdown(reapi_incoming, async {

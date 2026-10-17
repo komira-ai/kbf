@@ -277,7 +277,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
 
     /// The upload `id`, if the caller's connection owns it.
     fn upload<T>(&self, request: &Request<T>, id: u64) -> Result<Arc<Upload>, Status> {
-        let caller = self.shared.connections.of(request.remote_addr());
+        let caller = self.shared.connections.of(kbf_tls::remote_addr(request));
         let upload = lock(&self.shared.uploads).get(&id).cloned();
         upload
             .filter(|u| u.owner.as_ref().map(Connection::id) == caller.as_ref().map(Connection::id))
@@ -345,7 +345,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
         &self,
         request: Request<BeginRequest>,
     ) -> Result<Response<BeginResponse>, Status> {
-        let owner = self.shared.connections.of(request.remote_addr());
+        let owner = self.shared.connections.of(kbf_tls::remote_addr(&request));
         let segments: Vec<(u64, &[u8])> = request
             .get_ref()
             .segments
