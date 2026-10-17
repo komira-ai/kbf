@@ -1104,3 +1104,30 @@ async fn a_begin_waiting_for_admission_is_an_open_write() {
     let _ = waiting.await;
     open_reaches(&open, 1).await;
 }
+
+/// Catches the cache-as-a-store (what a storage node runs) handing out `Segments` handlers
+/// that do not count: `segments_counted` is the one a node's service asks for, and its uploads
+/// move the node's handle, while the plain `segments` leaves a handle alone. Mutant:
+/// `segments_counted` returning the plain handlers.
+#[tokio::test]
+async fn the_cache_as_a_store_counts_the_uploads_of_its_counted_handlers_only() {
+    use kbf_storage::Storage as _;
+    let open = kbf_storage::service::OpenWrites::new();
+    let front = Front::start(SegmentsConfig::DEFAULT).await;
+    let store = kbf_front::CacheStorage::new(front.cache.clone(), SegmentsConfig::DEFAULT);
+    let s = seg(&[blob(41, 500)]);
+    let begin = || {
+        tonic::Request::new(BeginRequest {
+            segments: vec![s.upload_segment()],
+        })
+    };
+
+    store.segments().begin(begin()).await.expect("begin");
+    assert_eq!(open.count(), 0, "the plain handlers count nothing");
+    store
+        .segments_counted(&open)
+        .begin(begin())
+        .await
+        .expect("begin");
+    assert_eq!(open.count(), 1, "the counted ones count the upload");
+}
