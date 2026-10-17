@@ -693,14 +693,15 @@ impl Members {
 
     /// `row`'s plan, or the mark's when the member has no live row (it stopped).
     fn planned_of(&self, id: MemberId, row: Option<&Live>) -> Result<Planned, MembershipError> {
-        if let Some(until) = row.and_then(|live| live.planned_until) {
-            return Ok(Planned::Until(until));
+        // A live row carries its own plan, or none; the mark speaks for a member that stopped.
+        if let Some(live) = row {
+            return Ok(live.planned_until.map_or(Planned::No, Planned::Until));
         }
         let marked = self
             .store
             .get(&down_key(id))?
             .is_some_and(|mark| mark.value == PLANNED);
-        Ok(if marked && row.is_none() {
+        Ok(if marked {
             Planned::Stopped
         } else {
             Planned::No
@@ -753,9 +754,10 @@ impl Members {
                         .expires_at
                         .map_or(self.config.ttl, |at| at.since(self.store.now()))
                 }
+                // `Down` on a live row is a plan (nothing else makes one), so a repeat is
+                // taken; so is one whose end an older frontend dropped.
                 Touch::PlanDown(_)
-                    if before != MemberState::Active
-                        && !(before == MemberState::Down && live.planned_until.is_some()) =>
+                    if before != MemberState::Active && before != MemberState::Down =>
                 {
                     return Err(MembershipError::NotActive { id, state: before });
                 }
