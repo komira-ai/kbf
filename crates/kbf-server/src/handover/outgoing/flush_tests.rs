@@ -9,7 +9,7 @@ use kbf_types::WorkerId;
 use tokio::sync::mpsc;
 
 use super::*;
-use crate::farm::{Outbound, Reported};
+use crate::farm::{Outbound, Reported, StreamId};
 use crate::handover::tests::{Rig, request, submit};
 
 /// Log lines written by the test's subscriber on this thread.
@@ -49,7 +49,7 @@ fn node() -> WorkerId {
 
 const LONG: Duration = Duration::from_secs(600);
 
-fn register(rig: &Rig, instance: &str, predecessor: &str, outbound: Outbound) {
+fn register(rig: &Rig, instance: &str, predecessor: &str, outbound: Outbound) -> StreamId {
     let caps = kbf_caps::NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
         .expect("caps")
         .with_drivers(["container"]);
@@ -60,7 +60,7 @@ fn register(rig: &Rig, instance: &str, predecessor: &str, outbound: Outbound) {
         Reported::serving(kbf_types::Resources::new(4_000, 8 << 30), caps),
         outbound,
         Default::default(),
-    );
+    )
 }
 
 fn keys(rig: &Rig, prefix: &str) -> Vec<String> {
@@ -84,8 +84,9 @@ async fn with_an_unsettled_requeue(rig: &Rig) -> String {
     drop(inbox);
     rig.store.refuse_next.store(usize::MAX, Ordering::SeqCst);
     let (outbound, _kept) = mpsc::unbounded_channel();
-    register(rig, "daemon-2", "daemon", outbound);
-    rig.farm.tick().await;
+    let stream = register(rig, "daemon-2", "daemon", outbound);
+    // The new process lists no lease: the one the old process held is given up.
+    assert!(rig.farm.heartbeat(&node(), stream, 1, Vec::new()).await);
     rig.store.refuse_next.store(0, Ordering::SeqCst);
     assert_eq!(
         keys(rig, "lease/").len(),
