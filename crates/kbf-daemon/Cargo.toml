@@ -48,6 +48,7 @@ bytes.workspace = true
 kbf-auth.workspace = true
 kbf-front.workspace = true
 kbf-meta.workspace = true
+kbf-segments.workspace = true
 kbf-objstore.workspace = true
 kbf-server.workspace = true
 # The program the tests' actions run, kbf-testkit's act verbs, through the test binary.

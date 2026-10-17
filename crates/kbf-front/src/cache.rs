@@ -16,6 +16,7 @@ use kbf_objstore::{
 };
 use kbf_proto::reapi;
 use kbf_segments::{MAX_SEGMENT_BYTES, SegmentError, WriteError};
+use kbf_storage::flush::FlushGate;
 use kbf_types::{Digest, FarmTime};
 use prost::Message;
 use tonic::Status;
@@ -187,6 +188,8 @@ pub struct Cache<M, O> {
     /// The runtime the cache was made on, which a record stream to the store runs its
     /// upload on; `None` for a cache made outside one.
     runtime: Option<tokio::runtime::Handle>,
+    /// Which digests this node flushes ([`Cache::with_flush_gate`]); none: all.
+    gate: Option<Arc<dyn FlushGate>>,
 }
 
 impl<M, O> Drop for Cache<M, O> {
@@ -231,7 +234,18 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             segment_limit: MAX_SEGMENT_BYTES,
             trees: Arc::new(InputTrees::new(InputTreeConfig::DEFAULT)),
             runtime: tokio::runtime::Handle::try_current().ok(),
+            gate: None,
         }
+    }
+
+    /// The same cache, flushing only the staged objects that hold a digest `gate` says
+    /// this node flushes (one flusher per digest, `kbf_storage::flush`). A sealed object
+    /// of digests the node does not flush stays staged, whole, off the flusher's queue.
+    /// Without a gate every sealed object is flushed.
+    #[must_use]
+    pub fn with_flush_gate(mut self, gate: Arc<dyn FlushGate>) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// The same cache, remembering input trees as `config` says instead of

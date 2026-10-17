@@ -25,6 +25,7 @@
 //! This crate depends on no frontend crate: not the scheduler (`kbf-sched`) and not
 //! authorization (`kbf-auth`). `crates/kbf-it/tests/layering.rs` checks it.
 
+pub mod flush;
 pub mod local_cache;
 pub mod repair;
 pub mod replicate;

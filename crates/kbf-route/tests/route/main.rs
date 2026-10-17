@@ -7,6 +7,7 @@ mod flights;
 mod placement;
 mod reading;
 mod repair;
+mod sinking;
 mod stale;
 mod tls;
 mod verifying;
