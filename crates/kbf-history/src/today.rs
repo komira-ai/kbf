@@ -158,36 +158,56 @@ struct State {
 }
 
 impl State {
-    /// Forgets the oldest entry, from every index it is in.
-    fn evict(&mut self) {
-        let Some(entry) = self.runs.pop_front() else {
-            return;
-        };
-        self.bytes -= entry.run.cost();
-        self.evicted = true;
-        if let Some(key) = &entry.run.action {
-            forget(&mut self.by_action, key, entry.seq);
-        }
-        forget(&mut self.by_node, &entry.run.node, entry.seq);
-        if let Some(n) = self.instances.get_mut(&entry.run.instance) {
-            *n -= 1;
-            if *n == 0 {
-                self.instances.remove(&entry.run.instance);
+    /// Forgets the oldest entries, from every index they are in, until the rest fit in
+    /// `limit` bytes.
+    fn trim(&mut self, limit: usize) {
+        let (mut freed, mut count) = (0, 0);
+        for entry in &self.runs {
+            if self.bytes - freed <= limit {
+                break;
             }
+            freed += entry.run.cost();
+            count += 1;
+        }
+        self.bytes -= freed;
+        self.evicted |= count > 0;
+        let State {
+            runs,
+            by_action,
+            by_node,
+            instances,
+            ..
+        } = self;
+        for entry in runs.drain(..count) {
+            if let Some(key) = &entry.run.action {
+                drop_oldest(by_action, key);
+            }
+            drop_oldest(by_node, &entry.run.node);
+            uncount(instances, &entry.run.instance);
         }
     }
 }
 
-/// Drops `seq`, the oldest entry of `key`, and the key with its last entry.
-fn forget<K: Ord>(index: &mut BTreeMap<K, Entries>, key: &K, seq: u64) {
-    let Some(entries) = index.get_mut(key) else {
-        return;
-    };
-    if entries.front().is_some_and(|e| e.seq == seq) {
+/// Drops the oldest entry of `key` (the one being forgotten is the oldest of all, so the
+/// oldest of its key), and the key with its last entry.
+fn drop_oldest<K: Ord>(index: &mut BTreeMap<K, Entries>, key: &K) {
+    let emptied = index.get_mut(key).is_some_and(|entries| {
         entries.pop_front();
-    }
-    if entries.is_empty() {
+        entries.is_empty()
+    });
+    if emptied {
         index.remove(key);
+    }
+}
+
+/// Takes one entry off the count of `key`, and the key with its last.
+fn uncount(counts: &mut BTreeMap<String, usize>, key: &str) {
+    let gone = counts.get_mut(key).is_some_and(|n| {
+        *n -= 1;
+        *n == 0
+    });
+    if gone {
+        counts.remove(key);
     }
 }
 
@@ -236,9 +256,7 @@ impl Today {
         *st.instances.entry(entry.run.instance.clone()).or_default() += 1;
         st.bytes += entry.run.cost();
         st.runs.push_back(entry);
-        while st.bytes > self.limit && !st.runs.is_empty() {
-            st.evict();
-        }
+        st.trim(self.limit);
     }
 
     /// Entries held.

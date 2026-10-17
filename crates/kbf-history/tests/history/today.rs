@@ -94,6 +94,17 @@ fn today_index_is_bounded_and_evicts_oldest() {
     let tiny = Today::new(one / 2);
     tiny.push(run(1, "main", "a", 1_000));
     assert!(tiny.is_empty());
+    // A run with no action digest is forgotten from the node and the instance.
+    let mut unnamed = run(2, "main", "a", 1_001);
+    unnamed.action = None;
+    tiny.push(unnamed);
+    assert!(tiny.is_empty());
+    assert!(tiny.instances().is_empty());
+    assert!(
+        tiny.on_node("a", &TodayQuery::newest(5), &all)
+            .runs
+            .is_empty()
+    );
     assert_eq!(tiny.bytes(), 0);
     assert_eq!(
         tiny.covers_from_ms(),
