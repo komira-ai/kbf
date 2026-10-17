@@ -103,7 +103,7 @@ pub(super) fn invocation(inv: &Invocation, base: &str, now: WallTime) -> Value {
         State::Idle => "idle",
     };
     let summary = Summary::of(inv);
-    json!({
+    let mut value = json!({
         "id": inv.key().to_string(),
         "url": Value::Null,
         "tool": tool,
@@ -129,7 +129,18 @@ pub(super) fn invocation(inv: &Invocation, base: &str, now: WallTime) -> Value {
             "wall_ms": summary.wall.list(inv, Phase::Wall, base),
             "execution_ms": summary.execution.list(inv, Phase::Execution, base),
         },
-    })
+    });
+    if inv.from_history()
+        && let Some(keys) = value.as_object_mut()
+    {
+        // A record read back from history says so, and where its hole starts; a live one
+        // has neither key.
+        keys.insert("restored".to_owned(), true.into());
+        if let Some(gap) = inv.gap_from() {
+            keys.insert("gap_from".to_owned(), rfc3339(gap).into());
+        }
+    }
+    value
 }
 
 /// How many actions `top_slowest` lists per phase.
@@ -524,6 +535,12 @@ fn attempt(a: &Attempt) -> Value {
     .map(|(k, v)| (k.to_owned(), v))
     .collect();
     measured(a, &mut keys);
+    if let Some(id) = a.run_id {
+        // The run the history writer minted for this attempt.
+        let id = hex::encode(id);
+        keys.insert("run_href".to_owned(), format!("/v1/runs/{id}").into());
+        keys.insert("run_id".to_owned(), id.into());
+    }
     Value::Object(keys)
 }
 

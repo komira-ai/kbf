@@ -26,14 +26,19 @@
 
 mod driver;
 mod flags;
+mod reads;
 mod stats;
 mod tap;
 
 pub use driver::{History, Options, STEP_EVERY, over};
 pub(crate) use driver::{finish, spawn};
 pub use flags::{HistoryError, HistoryFlags, with_history};
+pub use reads::HistoryReads;
+#[cfg(test)]
+pub(crate) use reads::Shared;
 pub use stats::Stats;
 pub use tap::HistoryTap;
+pub(crate) use tap::run_record;
 
 use kbf_front::Recording;
 
