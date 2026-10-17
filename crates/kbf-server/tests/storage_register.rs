@@ -863,9 +863,13 @@ async fn a_node_over_mutual_tls_keeps_a_repair_journal_and_a_worker_settles_it()
     let pki = Pki::new();
     let (frontend_cert, frontend_key) = pki.cert("frontend");
     let worker_tls = WorkerTls {
-        server: ServerTlsConfig::new()
-            .identity(Identity::from_pem(frontend_cert, frontend_key))
-            .client_ca_root(Certificate::from_pem(pki.ca.pem())),
+        server: TlsSource::fixed(
+            "worker",
+            frontend_cert.as_bytes(),
+            frontend_key.as_bytes(),
+            Some(pki.ca.pem().as_bytes()),
+        )
+        .expect("the worker listener's TLS"),
         deny_list: None,
     };
     let f = frontend(Some(worker_tls));
@@ -924,9 +928,13 @@ async fn a_write_through_the_halfs_in_process_view_is_judged_by_the_map_and_owes
     let pki = Pki::new();
     let (frontend_cert, frontend_key) = pki.cert("frontend");
     let worker_tls = WorkerTls {
-        server: ServerTlsConfig::new()
-            .identity(Identity::from_pem(frontend_cert, frontend_key))
-            .client_ca_root(Certificate::from_pem(pki.ca.pem())),
+        server: TlsSource::fixed(
+            "worker",
+            frontend_cert.as_bytes(),
+            frontend_key.as_bytes(),
+            Some(pki.ca.pem().as_bytes()),
+        )
+        .expect("the worker listener's TLS"),
         deny_list: None,
     };
     let f = frontend(Some(worker_tls));
