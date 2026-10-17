@@ -6,9 +6,10 @@ started on other ports; Envoy sends **new** connections and streams to it only o
 ready and serving; the old process keeps answering what it already holds, then fails its
 health check, finishes and exits. This replaces the first version of this note, which moved
 the listening sockets between processes by fd passing, and an intermediate version that
-parked requests while the new process caught up. **No request is parked or queued at any
-point: section 5.3 states exactly what a call can wait for, and the one residual (the
-switch time) is a measured gate, not a mode.**
+parked requests while the new process caught up. **No request is parked, queued or refused by
+a mode or a flag. Section 5.3 states exactly what a call can wait for: a call that lands in the
+switch is held by its own open call for at most the switch time `T_s`, a measured gate. That is
+a residual hold, stated as one, and whether it is acceptable is the CEO's question (Q1).**
 
 File references are to `origin/feature/arch-v2` (symbols are the authority, line numbers
 rot). "Inference" marks a claim read from code shape or from Envoy's documentation and not
@@ -20,7 +21,9 @@ yet from a test; section 12 lists every inference the spike must turn into a mea
 2. New requests go to the new process, from the moment Envoy sees it ready.
 3. The old process exits when it holds nothing.
 4. Envoy updates by its own hot restart (section 7), under the same three rules.
-5. No phase of an update holds, parks or queues a client request. (Section 5.3.)
+5. No phase of an update parks, queues or refuses a client request, and no flag or mode holds one.
+   The one residual is a call that lands in the switch: it waits inside its own open call for at
+   most `T_s` (gate: p99 under 1 s). That is a bounded hold, not an absence of one (section 5.3, Q1).
 
 No client build may fail because of an update. Buck2 sends one `Execute` per action,
 retries only the opening of that stream (5 attempts, sleeps of about 0.1, 0.2, 0.4 and 0.8 s
@@ -34,8 +37,8 @@ What each party sees:
 | party | during a kbf update |
 |---|---|
 | Buck2 | Its connection to Envoy never changes. Open `Execute` streams continue on the old process. A call that Envoy still sends to the old process after the successor took the roles is answered through the old process (section 5.2), not refused. No GOAWAY comes from kbf: Envoy keeps the downstream connection (section 8). |
-| daemons (remote, and the in-process one of all-in-one) | The old process ends their streams. They redial the same worker address, which is Envoy's, and reach the successor. Leases are kept (the epoch is kept) and nothing is double-booked (section 6). A redial that reaches the old process in the short window before it goes not-ready is refused and retried by the daemon's own loop; a daemon is not a client call. |
-| operator | `kbf handover` starts the other instance and, with `--wait`, polls the old one until it is gone. Operator reads (`/readyz`, `/v1/...`) are by instance on loopback; the public view is Envoy's. |
+| daemons (remote, and the in-process one of all-in-one) | The old process ends their streams. They redial the same worker address, which is Envoy's, and reach the successor. Leases are kept (the epoch is kept) and nothing is double-booked (section 6). A redial that reaches the old process in the short window before it goes not-ready is refused and retried by the daemon's own loop; a daemon is not a client call. Together with the `unready` settle this window must stay well under the 40 s fence (section 6.2, measured in the spike). |
+| operator | `kbf handover` starts the other instance and, with `--wait`, polls the old one until it is gone and shows `draining: N streams, N relays, oldest M min`. Operator reads (`/readyz`, `/v1/...`) are by instance on loopback; the public view is Envoy's. |
 
 SQLite with the single-writer lock, `Store::demote` and the generation fence is enough for
 the scheduler state; no Postgres. (Postgres has no `demote`, `kbf-state/src/store.rs`, and is
@@ -61,6 +64,10 @@ addition (storage and daemon).
 | a write call is answered only when durable | Yes: a ByteStream `Write` or `BatchUpdateBlobs` buffers (admitted by bytes), is grouped into a segment, PUT, committed by one `PutBlobs`, and only then answered. | `kbf-front/src/cache/write_group.rs` |
 | `/readyz` and the gRPC health service agree | Yes: both evaluate `Checks::failing`; `Readiness::stop` flips both; `Readiness::set_leader(false)` exists for a process that is up but must not be picked. | `kbf-server/src/health.rs`, `grpc_health.rs` |
 | kbf-deploy renders an Envoy config | Yes, for a **Kubernetes client front**, not a box: one cleartext h2c listener behind a Tailscale ingress, one STRICT_DNS cluster of servers over TLS to the farm CA, route timeout 0, stream idle timeout 7200 s, no `max_stream_duration`, `healthy_panic_threshold` 0, gRPC health check (5 s interval), a checker that models those properties. It has no circuit breakers, no retry policy, no worker route, no hot restart, and refuses a route whose action has anything but a cluster and timeouts. Section 4 builds on it. | `crates/kbf-deploy/src/envoy/{render,check,config}.rs` |
+| `/readyz` is only the flags | **No.** `Checks::failing` also runs a store probe (a read of the probe digest through the cache, `STORE_PROBE_TIMEOUT` 2 s) besides the `stopping` and `leader` flags. After the cut that probe would run through `HandoverStorage` or a frozen store, so section 5.1 pins `p`'s readiness explicitly. | `kbf-server/src/health.rs` (`failing`, `StoreProbe`) |
+| a cordon is durable | **Not on arch-v2.** It is scheduler state fed as an input, "not a control-log record yet ... gone after a server restart", and `farm/durable.rs` has no cordon row. Section 6.2 makes it new work. | `kbf-sched/src/cordon.rs` module doc |
+| the Welcome epoch is the state store's | The Welcome carries `Farm::lease_epoch` ("this process's term, or the Raft log's id"); `SqliteStore::open` also bumps its own recorded epoch. Which one `Keep` must hold constant is checked in T-7 (section 6.2). | `kbf-server/src/worker.rs`, `kbf-state/src/sqlite/mod.rs` |
+| the REAPI listener advertises unlimited streams | **No.** `max_concurrent_streams` is `StreamTiming`'s `streams`, at most `MAX_STREAMS` (`i32::MAX / 65536`, 32767); the configured value is what Envoy sees. Section 3.1 derives the breaker from it. | `kbf-server/src/serve.rs`, `streams.rs` |
 | a real Envoy is available to tests | Yes: CI fetches a pinned Envoy and validates the kit's render with `--mode validate`. | `.github/workflows/ci.yml`, `crates/kbf-deploy/tests/envoy_validate.rs` |
 
 ## 3. Topology on one box
@@ -114,10 +121,20 @@ that overlap it answers through the successor (section 5.2).
   plain loopback HTTP, since the worker cluster has no TLS of its own. `--api-listen` is already in
   the unit and is required here.
 - Envoy's own view of the flip is read from its admin interface on loopback
-  (`GET /clusters?format=json`, the `health_flags` of each host; inference, the spike checks
-  the field names). The successor reads it to learn that Envoy routes to it (section 5); the
-  settle timer of section 5.1 is the fallback when no admin address is configured. `--envoy-admin` is a flag
+  (`GET /clusters?format=json`; inference, the spike checks the field names). The JSON has no
+  "healthy" field: a healthy host shows no failed flags, and a host not yet checked shows
+  `failed_active_health_check` and `pending_active_hc`. So `i` needs **positive evidence**: in both
+  clusters the host is present, neither flag is set, and two consecutive reads at least one check
+  interval apart agree. A parser that treats "no failed flag" as healthy is a mutant (E6). The
+  admin socket of an Envoy hot restart answers for one epoch only; a handover started while an old
+  epoch is alive waits for that epoch's drain to begin, or is refused (section 7). The settle of
+  section 5.1 is **derived**, `interval x unhealthy_threshold + timeout` plus one interval, not a separate
+  default, and is the fallback when no admin address is configured. `--envoy-admin` is a flag
   of `kbf frontend` and `kbf all-in-one`, loopback only.
+- The worker cluster's check is `/readyz` on the API port, which is a separate unauthenticated route
+  (`health.rs`); `check` and a kbf-it test pin that it answers without a token. It does not prove the
+  worker listener accepts mTLS, so the worker cluster also gets a TCP connect check on the worker
+  port, and a worker listener that fails to bind folds into `Checks::failing` as a `worker` flag.
 - `interval` 1 s, `no_traffic_interval` 1 s, `timeout` 1 s, `unhealthy_threshold` 2, `healthy_threshold` 1.
   The kit's 5 s and 10 s are for a remote cluster; here they would be the update gap
   (section 5), and a loopback check is free. Starting values: the spike sets them.
@@ -132,11 +149,11 @@ mutant (section 10).
 |---|---|---|---|---|
 | route `timeout` | 15 s | `0s` on every route (`ROUTE_TIMEOUT`) | `0s`, REAPI routes | kept (`route-timeout`) |
 | route `max_stream_duration` / `idle_timeout` | none / the HCM's | absent | absent | kept (`max-stream-duration`, `idle-timeout`) |
-| HCM `stream_idle_timeout` | 300 s | `7200s` (`LONG_STREAM`) | `7200s`; the progress frame (30 s) keeps it reset, 7200 s covers `--progress-interval-secs=0` | kept (`idle-timeout`) |
+| HCM `stream_idle_timeout` | 300 s | `7200s` (`LONG_STREAM`) | `7200s` for every route except `Execute` and `WaitExecution`; those two routes carry route-level `idle_timeout: 0s` (overrides the HCM value), because an action's own timeout is uncapped and can exceed 2 h, and a stalled progress task or `--progress-interval-secs=0` would otherwise cut it. `kbf frontend` and `kbf all-in-one` refuse `--progress-interval-secs=0` when `--instance` is given. | kept (`idle-timeout`), plus **new** `execute-idle-off` |
 | HCM `request_timeout` | disabled | absent | absent: a 64 MiB write streams | kept (`request-timeout`) |
-| cluster `close_connections_on_host_health_failure` | false (and `tcp_proxy` only) | absent | false on both clusters: a failed check removes the host from selection and leaves its connections and open streams alone | **new** (`health-keeps-streams`) |
+| cluster `close_connections_on_host_health_failure` | false (and `tcp_proxy` only) | absent | false on both clusters. A failed active check removes the host from selection; Envoy then drains the host's HTTP connection pool gracefully (no new streams, open ones run to completion; inference, E4 asserts it on the pinned Envoy: no RST_STREAM and no error GOAWAY reaches the upstream of an open stream). The flag is documented for `tcp_proxy` only. | **new** (`health-keeps-streams`) |
 | cluster `healthy_panic_threshold` | 50 % | `0` | `0`: with both instances unready Envoy answers 503, it never sends to a fenced one | kept |
-| circuit breakers `max_requests`, `max_connections`, `max_pending_requests`, `max_retries` | modest: 1024 connections per cluster is documented; the others, 1024 and 3, are from the cluster reference and are not re-checked here | **absent**: one open Execute is one request, so about 1000 concurrent actions would be refused with an overflow (the same gap exists in the Kubernetes front) | raised to at least the farm's concurrent-action ceiling (a config key, default 65536) | **new** (`breakers`) |
+| circuit breakers `max_requests`, `max_connections`, `max_pending_requests`, `max_retries` | modest: 1024 connections per cluster is documented; the others, 1024 and 3, are from the cluster reference and are not re-checked here | **absent**: one open Execute is one request, so about 1000 concurrent actions would be refused with an overflow (the same gap exists in the Kubernetes front) | raised on the DEFAULT priority threshold (a HIGH one would not apply) to at least the farm's concurrent-action ceiling (a config key, default 65536); the REAPI listener advertises a finite `max_concurrent_streams` (section 2), so Envoy opens one upstream connection per that many streams and `max_connections >= ceiling / max_concurrent_streams` | **new** (`breakers`, both inequalities; E5 holds more silent streams than the product) |
 | `tcp_proxy` `idle_timeout` (worker) | 1 h | n/a | `0s`: a daemon's session stream is quiet between heartbeats and must not be cut | **new** (`worker-idle`) |
 | upstream/downstream connection idle, `max_connection_duration` | 1 h with no streams / none | default | default (only idle connections close) | refuse a `max_connection_duration` |
 | HTTP/2 upstream keepalive | none | none | `connection_keepalive` 30 s / 20 s, as kbf's own listeners | **new** |
@@ -180,12 +197,19 @@ flags). Instance letter `i`, predecessor `p` (the other letter).
 
 | stage | what changes | reversible | by |
 |---|---|---|---|
-| `hand-over` | `p` starts answering every **new** call through `i` (5.2); scheduler quiesced and fenced; worker streams ended; state store demoted; (all-in-one: the storage block of 6.3). **Readiness is not changed**: `p` stays ready. | no, after the fence | `i`, over the API |
-| `unready` | `Readiness::stop`: `/readyz` and the gRPC health answer not-ready. Envoy stops choosing `p` for new streams and connections; open streams are untouched (section 3.1). | yes, until `p` exits | `i`, after Envoy shows `i` healthy (or `--handover-unready-after-secs` as the fallback); SIGTERM |
+| `hand-over` | `p` starts answering every **new** call through `i` (5.2); scheduler quiesced and fenced; worker streams ended; state store demoted; (all-in-one: the storage block of 6.3). **Readiness is pinned ready**: a `handed_over` flag makes `Checks::failing` skip the store probe (which would run through `HandoverStorage` or a frozen store, up to its 2 s timeout, and could fail during `T_s`) and skip the `worker` flag; only `stopping` and `leader` are evaluated. A watchdog (below) is the only thing that may turn `p` unready besides `i` and SIGTERM. | no, after the fence | `i`, over the API |
+| `unready` | `Readiness::stop`: `/readyz` and the gRPC health answer not-ready. Envoy stops choosing `p` for new streams and connections; open streams are untouched (section 3.1). | yes, until `p` exits | `i`, after Envoy shows `i` healthy (or the derived settle as the fallback); the watchdog; SIGTERM |
 
 SIGTERM and `POST /v1/frontend/drain` without a handover body keep today's meaning: `Drain::begin`
 as it is, readiness off, new `Execute` refused, GOAWAY to the listener (`api.rs`, `FRONTEND_DRAIN`).
 A kbf that is stopped, not updated, still drains the old way; it is not an update path.
+**Watchdog.** After `released`, `p` probes `i`'s API and REAPI listeners every second. If `i` is not
+serving within `--handover-watchdog-secs` (default 15, above the measured `T_s` plus the start
+timeout of the roles latch, below the fence), or either listener becomes unreachable, `p` goes
+`unready` on its own, so Envoy has a clean 503 to answer and Buck2's open retries apply, rather than
+`p` staying chosen while it refuses everything. This replaces "only `i` can send `unready`". A failpoint
+test kills `i` after `released` and asserts `p` flips; the mutant is a watchdog that never fires.
+
 There is no `goaway` stage: `p` has no downstream connection to tell (Envoy owns it), and a
 host Envoy no longer picks gets no new stream.
 
@@ -206,7 +230,15 @@ It does not refuse them (a refusal is a request the client must retry) and does 
 | `FindMissingBlobs`, `GetActionResult`, `GetCapabilities` | `i` (authority questions are never answered from frozen state) | `HandoverStorage` (6.3) |
 | `BatchReadBlobs`, `ByteStream.Read` | `p`'s frozen state first, then `i` | `HandoverStorage` |
 | `ByteStream.Write`, `BatchUpdateBlobs`, `UpdateActionResult` | `i` (a write that is already open at the cut finishes on `p`, 6.3) | `HandoverStorage` |
-| worker session of a daemon | refused UNAVAILABLE: `p` has no scheduler; the daemon's own redial loop reconnects, through Envoy, to `i` or to `p` again until it goes not-ready. This is the only refusal, and it is to a daemon, whose fence is 40 s against a window of a few seconds. | `kbf-server/src/worker.rs` |
+| worker session of a daemon | refused UNAVAILABLE: `p` has no scheduler; the daemon's own redial loop reconnects, through Envoy, to `i` or to `p` again until it goes not-ready. Together with the case "`i` is dead and the watchdog has not fired yet" (5.1) this is the only refusal in the sequence, and the first is to a daemon, whose fence is 40 s. | `kbf-server/src/worker.rs` |
+
+**The relay's own failure.** `Execute` through `i` returns the operation name `i` assigned; `p` keeps it with
+the relayed stream. If the stream to `i` breaks (restart of `i`, a `Bump`), `p` falls back to following that
+operation from the `done/` rows as it does for its own streams, using the operation id, so a relay is not a
+weaker class of stream than a call served by `p`. A relayed `Execute` keeps `p` alive for as long as the
+action runs, so relays are counted (`kbf_handover_relayed_total`, and `draining: N relays` in `kbf handover`)
+and `kbf handover` refuses the next update while any is open. The settle is short (derived, section 3) to keep
+the number small; E6 asserts a relay count against the settle.
 
 Calls already open at the cut are not moved: an `Execute` or `WaitExecution` stream stays on
 `p`, which answers it from the `done/<op>` rows `i` writes (5.4 step 5) until it ends; a read
@@ -222,13 +254,15 @@ long stream. The relay needs one new component and no timer.
 
 ### 5.3 What a call can wait for (no request is held)
 
-There is no queue mode, no park, no admission gate and no `--handover-park-secs`. A call is
-only ever: served by `p` as usual (before the cut, or opened before it); relayed to `i` (5.2);
+There is no queue mode, no park, no admission gate and no `--handover-park-secs`. **That is not "no call
+waits"**: a call that lands in the switch waits, inside its own open call, on `i`'s roles latch for up to `T_s`.
+It is a bounded hold with no object that holds it, and it is the CEO's call whether that satisfies "no request
+is held" (Q1). A call is only ever: served by `p` as usual (before the cut, or opened before it); relayed to `i` (5.2);
 or served by `i` (once Envoy routes there). The residual wait is one thing:
 
 > **Switch time `T_s`**: from the route flag at `p` to `i` holding every role and having
-> caught up (components in 6.3: `p`'s in-flight segment PUTs and last batch, lock handoff, `i`'s
-> catch-up and tier open, scheduler recovery). A relayed call that reaches `i` inside `T_s` is an open call on `i` whose
+> caught up (components in 6.3: `p`'s last meta batch, lock handoff, `i`'s catch-up and tier open,
+> scheduler recovery; not `p`'s segment PUTs, 6.3). A relayed call that reaches `i` inside `T_s` is an open call on `i` whose
 > handler has not started yet, exactly as any call is slow at a process that has just started
 > serving. Nothing is stored, nothing is bounded by a flag, the call's own deadline governs.
 
@@ -261,10 +295,11 @@ zero; this design aims at a few hundred milliseconds inside one call, gates on a
    demote the state store. Its answer is `released` with the generation it held.
 3. `i` takes the next generation, `Fenced::take(store, Some(generation))`, with the epoch kept
    (`EpochPolicy::Keep`; today `StateStoreUri::epoch_policy` is `Bump` only and takes a
-   parameter), recovers, takes the storage roles, opens the latch, `set_leader(true)` and says
-   `READY=1`. From the latch opening `i` serves everything directly.
+   parameter; the lease epoch in the Welcome is held constant, section 6.2), recovers, takes the storage
+   roles in the order of 6.3, opens the latch, `set_leader(true)` and says `READY=1`. From the latch
+   opening `i` serves everything directly.
 4. Envoy marks `i` healthy within one check interval. `i` reads that from the admin interface
-   (both clusters), waits `--handover-settle-secs` (default 3), and calls `p`: `unready`. Envoy
+   (both clusters, positive evidence, section 3), waits the derived settle, and calls `p`: `unready`. Envoy
    stops choosing `p` within `interval x unhealthy_threshold + timeout`; calls that raced the flip
    are relayed (5.2), not refused.
 5. `p` follows its open `Execute` and `WaitExecution` streams from the `done/<op>` rows `i`
@@ -274,10 +309,12 @@ zero; this design aims at a few hundred milliseconds inside one call, gates on a
    unacknowledged and, for all-in-one, no lease is held.
 
 If `i` never becomes ready before step 2 nothing has changed. If `i` dies after `released`, `p`
-still answers its own streams from the rows and relays fail UNAVAILABLE (retried by Buck2's
-open-time retries); systemd restarts `i` as a cold start, which bumps the epoch, so the daemons
-rerun their leases: slower. A stream that `p` was relaying for `i` breaks with `i` (the process that
-held it died: the same class as a crash of `p`); a call that had not opened a stream is retried by Buck2.
+still answers its own streams from the rows; the watchdog (5.1) turns `p` unready within its bound, Envoy
+answers a clean 503 and Buck2's open-time retries apply; systemd restarts `i` as a cold start, which bumps
+the epoch, so the daemons rerun their leases: slower. A relayed stream falls back to the `done/` rows by operation id (5.2)
+and breaks only if `i` never recorded the operation; a call that had not opened a stream is retried by Buck2.
+That window (up to the watchdog bound plus a cold start, which replays an unbounded meta log) is the one committed
+failure that can fail a build; it is in the failure table.
 
 **Why the same process for a frontend and all-in-one.** The sequence, ports, health flip, relay
 and Envoy file are identical; all-in-one adds the storage and daemon halves of section 6.
@@ -300,7 +337,7 @@ GOAWAY and park parts rewritten.
 | B5 | The daemon half dies with the server half: `with_daemon` ends the daemon when `serving` ends. | `kbf-all-in-one/src/run.rs` |
 | B6 | The in-process daemon's data plane is `LocalDataPlane` over the old process's cache. The control plane is a loopback mTLS worker session. | `kbf-all-in-one/src/plane.rs`, `kbf-node` |
 | B7 | Two daemons on one host collide: the start sweep removes every container labelled with the node id and every lease directory; the `daemon-instance` claim; container names; the cache dir lock. | `kbf-driver-container/src/runtime.rs` (`sweep`), `kbf-node/src/instance.rs` |
-| B8 | The scheduler books by worker (`free() = capacity - booked`); two workers on one box would double-book it. | `kbf-sched/src/scheduler.rs` |
+| B8 | The scheduler books by worker (`free() = capacity - booked`); two workers on one box would double-book it. The predecessor's worker is kept out of placement by a cordon, which is not durable on arch-v2 (section 2): a restart of `i` with `p` still detached would register `p`'s daemon uncordoned at full capacity. | `kbf-sched/src/scheduler.rs`, `cordon.rs` |
 | B9 | All-in-one starts with `Bump`; a bump makes every daemon kill its runs. | `kbf-server/src/state_store.rs` |
 | B10 | `Drain` is one-way and `Farm::fence` has no unfence (on the handover branch). Section 5.1's staging puts the reversible work (prepare) in front of the fence. | `kbf-server/src/drain.rs` |
 | B11 | The detached daemon fences itself after 40 s without an acknowledged heartbeat; the successor's `LEASE_GRACE` is 60 s. | `kbf-daemon/src/config.rs` (`FENCE_AFTER`), `kbf-sched/src/fence.rs` |
@@ -315,9 +352,12 @@ GOAWAY and park parts rewritten.
 - **Control plane.** No new mechanism. The detached daemon's stream is ended by `hand-over`; it
   redials `--server`, which is Envoy's worker address, and reaches `i`. Between `hand-over` and
   `unready` a redial can reach `p` again (it is still ready); `p` refuses worker sessions in that window
-  (5.2) and the daemon's redial loop (`--reconnect-ms`) converges. Same node id and instance id, so the
+  (5.2) and the daemon's redial loop (`--reconnect-ms`) converges. The time from the cut to `i` serving worker
+  sessions, with the daemon's backoff, is a spike item and part of the `T_s` check: it must stay well under the 40 s fence. Same node id and instance id, so the
   scheduler sees the same process; it resends its Hello and unacknowledged Results before its first
-  heartbeat, and keeps its runs only if the Welcome epoch equals its leases' epoch, hence `Keep` (B9).
+  heartbeat, and keeps its runs only if the Welcome epoch equals its leases' epoch, hence `Keep` (B9). The Welcome epoch is
+  `Farm::lease_epoch`, not the SQLite store's own epoch, which every open bumps; the `Keep` path must hold
+  `lease_epoch` constant across the SQLite open, and T-7 asserts the Welcome epoch is unchanged across a handover.
 - **Data plane.** At detach the daemon's data plane switches from `LocalDataPlane` over `p`'s cache to the
   remote plane every remote daemon uses, aimed at `i`'s REAPI listener (B6). An action that finishes after
   the cut uploads its outputs to `i` and reports its `Result` once; nothing writes into `p`'s stores
@@ -330,8 +370,11 @@ GOAWAY and park parts rewritten.
   per instance, per-instance daemon directory `<data-dir>/node-<instance>/` only when `--instance` is
   given (existing hosts keep their layout); container lease terms and cgroup names carry the
   instance (B7). Work, not a flag: audit `runtime.rs` for any name that is not owner-scoped.
-- **Cordon, and its reset.** The predecessor's worker is cordoned by a durable `cordon/<worker>`
-  row. Node ids alternate (`-a`, `-b`, `-a`), so in the same transaction as the takeover the
+- **Cordon (new work, durable), and its reset.** A `cordon/<worker>` row is **new**: its encoding, its
+  recovery, and its write in the same state-store transaction as the takeover are PR C (section 14).
+  Recovery applies it before the worker listener accepts a session, so the detached daemon of `p` never
+  registers uncordoned, including after a crash and restart of `i`. T-7 kills and restarts `i` with `p` still detached
+  and asserts `p`'s worker is granted nothing. Node ids alternate (`-a`, `-b`, `-a`), so in the same transaction as the takeover the
   successor **deletes the cordon row of its own node id** and writes the predecessor's; when the
   predecessor exits its worker and cordon rows are deleted. A takeover clears a manual cordon on that
   node id; the operator cordons again.
@@ -364,11 +407,23 @@ does before the cut so the step costs little:
 |---|---|---|
 | route flag | new storage calls go through `HandoverStorage` to `i` (5.2) | `i` binds its REAPI listener; its handlers wait on the roles latch |
 | tier seal | flush the active block into cold; tier read-only and open so a `ByteStream.Read` in flight finishes (`Cache::seal`). The reversible part (seal the active block, drain the flusher) runs at prepare. | none: B4, `i` must not open the tier before the seal |
-| writes already open | a write opened before the flag finishes on `p`: its segment's PUT completes through `p`'s open store handle (objects are immutable and renamed in atomically, keys carry a per-start epoch so two writers never collide, `kbf-front/src/cache/write_group.rs`), and its `PutBlobs` **commit is forwarded to `i`'s meta log** instead of `p`'s. The caller is answered when that commit is durable, as today. No write is cut and there is no write-drain bound. `p` releases the cold-store lock (below) only after its own in-flight segment PUTs have finished, so the longest of them (a blob large enough for a segment of its own is seconds) is a **component of `T_s`**: a write relayed to `i` meanwhile waits for `i` to hold the cold store. Measured by the spike; if it dominates, the cold store takes the PUT without the exclusive lock (an object-store cold tier has none; for `file://` a shared put lock and an exclusive sweep lock is the option to evaluate, Q8). | `i` accepts forwarded commits (an idempotent `PutBlobs` by object key); verified by T-4 |
+| writes already open | Two cases, split by whether the body has been fully received at the route flag. (a) **Body still arriving** (a large upload, a slow client): `p` keeps receiving it, and once complete hands the buffered blobs to `i` as an ordinary write; `p` starts no segment PUT after the flag. A client slower than `T_s` is unaffected. (b) **Segment PUT already started**: it completes through `p`'s open store handle (objects are immutable and renamed in atomically, keys carry a per-start epoch so two writers never collide, `kbf-front/src/cache/write_group.rs`) and its `PutBlobs` **commit is forwarded to `i`'s meta log**; the caller is answered when that commit is durable. **Decision (was Q6)**: the cold-store lock is split into an exclusive open-and-sweep lock and a shared put lock, so `p`'s demote releases the exclusive lock at once and its started PUTs hold only the shared one; `i` takes the exclusive lock at start (no sweep needed: objects are only added) and its own PUTs take the shared one. Then `p`'s PUTs are not a component of `T_s`. An object-store cold tier has no lock at all. If the spike finds the shared lock unsafe for `file://`, the fallback is `p` finishing started PUTs before releasing, which becomes a named component `T_put` with its own gate (p99 under 2 s), and PR 6-9 do not ship without that number. | `i` accepts forwarded commits (an idempotent `PutBlobs` by object key); verified by T-4 |
 | meta log | `RaftMetaLog::demote`: stop the tick task and committer after the in-flight batch, release `log.lock`, keep the applied `MetaState` queryable for frozen reads | `RaftMetaLog::open_follower` (new): read-only tail of the log, applying records as they are committed, so at the cut `i` has only the last batch to apply and then takes the lock. Without it `i` replays the whole log inside `T_s` (B2). The spike measures both. |
 | cold store | `FsStore::demote`: release `LOCK`, keep reads | none: `i` blocks on the lock and takes it on release |
 | state store | `store.demote()` last | `i` opens nothing; the rows are read at takeover (B12): measured inside `T_s` |
 | daemon cache | release the cache dir lock (6.2) | none |
+
+**Lock and latch order (explicit).** In `i`, strictly: (1) meta-log lock, once `p` has demoted it, and from that
+instant `i` accepts **forwarded commits**, which bypass the roles latch (a forwarded commit belongs to a caller
+that is part of the cut; making it wait on the latch is a deadlock and is a planted mutant); (2) the exclusive
+cold-store lock (immediate with the split lock); (3) tier open (after `p`'s seal); (4) scheduler recovery;
+(5) the roles latch opens. A forwarded commit names a segment object that `p` has already written; the cold
+store is one shared namespace for `p` and `i` (`file://` on the same directory, or an object store), which is
+a stated requirement and a `check` rule (same cold-store URI in both drop-ins).
+
+**Frozen reads rule.** After the seal, `p`'s frozen read path reads the cold store and its own applied
+`MetaState` only, never a hot-tier block: `i`'s tier open runs the orphan sweep and may remove any block no
+staged object names. T-5 seals, opens the tier on `i`, then reads a hot-tier digest through `p`.
 
 `HandoverStorage` is one `Arc<dyn Storage>` behind an atomic swap, used by the REAPI services and
 by `LocalStore::over`. After the route flag: authority questions (`FindMissingBlobs`,
@@ -376,7 +431,7 @@ by `LocalStore::over`. After the route flag: authority questions (`FindMissingBl
 `i`; writes go to `i`. None of them is held in `p`: each is an open call on `i`, which answers when its
 roles latch opens (5.3).
 
-**Components of `T_s`**, each measured separately: `p`'s in-flight segment PUTs and the last meta batch; the lock releases; `i`'s meta-log catch-up (the tail after the follower open, or the whole replay without it); tier open on `i`; the scheduler's recovery from the state rows (B12).
+**Components of `T_s`**, each measured separately: `p`'s last meta batch (and, only under the fallback of the writes row, `T_put`); the lock releases; `i`'s meta-log catch-up (the tail after the follower open, or the whole replay without it); tier open on `i`; the scheduler's recovery from the state rows (B12).
 
 **What `i` can and cannot do in advance, stated as claims to measure.** The follower open of the meta log and
 the read-only open of the tier are the two pieces that decide `T_s`: without a follower open the meta log's
@@ -417,7 +472,7 @@ Settings, and why each is not the default:
 |---|---|---|---|
 | `--parent-shutdown-time-s` | 900 | the longest action plus 15 minutes | at expiry the old process is closed with every stream still open; 900 s would fail every action over 15 minutes |
 | `--drain-time-s` | 600 | 60 | below the parent shutdown time as Envoy requires; it only schedules how soon connections are told to go, not when streams are cut (open ordinary streams are left to complete, per the draining documentation) |
-| `--drain-strategy` | `gradual` | `immediate` | clients get the GOAWAY at once and move their new streams to the new process early |
+| `--drain-strategy` | `gradual` | `gradual` (unless E8 shows Buck2 mishandles the two-step GOAWAY) | `immediate` removes the first, lossless announcement and sends the final GOAWAY at once; streams opened in that race are the only Buck2-visible risk and recover only through the 5-attempt open retry (about 1.5 s). `drain_timeout` stays 5 s. E8 opens Executes in a loop across a real hot restart and counts failed opens |
 | `--base-id` | 0 | fixed, unique on the host | the epochs' shared memory |
 | `--skip-hot-restart-on-no-parent` | off | set | a start after a crash of the first process is a normal start |
 
@@ -426,6 +481,14 @@ Settings, and why each is not the default:
 derived number and a check) or Envoy's hot restart can cut an action longer than the parent shutdown time
 (Q2). The box config carries `KBF_LONGEST_ACTION_SECS`; the kit's check refuses a render whose
 parent-shutdown value is below it.
+
+**Worker sessions at a hot restart.** A `tcp_proxy` connection gets no GOAWAY; the draining documentation covers HTTP
+connection managers only. So every daemon session (remote daemons and the in-process one) stays pinned to the
+parent epoch, quiet by design, and all of them are cut at the same instant at `--parent-shutdown-time-s`. Daemons
+redial with jittered backoff (a small daemon change, PR 4) so the 6 h mark is not a herd, and the epoch is kept so
+no lease is lost (the fence is 40 s). Until then the parent carries worker traffic against its own stale health view,
+so a kbf handover during that window may route a redial to the parent's view of `p`; the handover is therefore refused
+while a parent epoch is alive (rule below), not merely warned about.
 
 **What a client sees at an Envoy update.** This is the one place a client sees a GOAWAY. Envoy's HTTP
 connection manager announces a shutdown to a drained HTTP/2 connection and sends the final GOAWAY after
@@ -439,13 +502,21 @@ real-Buck2 build through an Envoy hot restart is a test (T-E8).
 **Rules.** An Envoy hot restart and a kbf handover are serialized by one lock file the updater and
 `kbf handover` both take, so neither starts while the other is mid-way. A second Envoy hot restart while the
 first parent is alive is refused by the updater (it reads `server.hot_restart_epoch` and the parent's
-liveness from the admin interface; Envoy documents no limit on concurrent epochs, so the refusal is ours).
+liveness from the admin interface). Whether Envoy itself limits concurrent epochs is **not verified** (the
+hot-restarter documentation is silent; the source may name a small fixed number of concurrent processes); the spike reads
+the pinned Envoy's source and runs epochs 0 to 3 with live parents. The refusal says why: `blocked by parent
+epoch N, expires in X`. With a parent shutdown of the longest action plus 15 minutes (6.25 h under the Q2 cap), a
+restart can be refused for hours while any long action runs, so **nothing time-critical may depend on a hot restart**:
+certificate renewal does not (below).
 Envoy's binary is versioned and staged like kbf's (section 9). The new Envoy epoch needs no change on the kbf side: its static
 config lists `a` and `b`.
 
 **Certificates.** Envoy holds the client-facing certificate. A renewal needs Envoy to read it again: a hot
-restart (rare, cheap, and the path above) or file-watched secrets (an xDS source from a file, which the owner
-excluded). Recommendation: hot restart (Q3). The backends keep their own live reload (`docs/deploy/tls-renewal.md`).
+restart (blocked for hours by a long action, above) or a file-watched SDS secret (`path_config_source` on a
+watched file; no xDS server, but it is an SDS source, and the owner excluded xDS: asked as Q3). Recommendation:
+the file-watched secret, because renewal must not wait for the longest action; the spike tests that a renewed file is
+picked up by a running Envoy without a restart and without cutting a stream. Fallback if the CEO says no: hot restart plus an alert at
+a third of the certificate's life that a renewal is blocked. The backends keep their own live reload (`docs/deploy/tls-renewal.md`).
 
 ## 8. What a client sees, end to end
 
@@ -461,10 +532,9 @@ A kbf update, Buck2 first:
 
 No GOAWAY is needed from kbf and none reaches Buck2: Envoy owns the downstream connection, and `p` is
 never sent a GOAWAY in an update. Streams open on `p`'s connection continue because a failed health check
-removes a host from selection and leaves its connections alone (3.1; inference, T-E4 measures it on the
-pinned Envoy). There is no window with no healthy backend, so there is no Envoy-generated 503 and no
-reliance on Buck2's 1.5 s open-time retries. The one added latency, `T_s`, is a few hundred milliseconds
-at most by the gate, and only for a call that arrives between t1 and t2 or is still sent to `p` between t2 and t3.
+removes a host from selection and Envoy drains its connection pool gracefully, so open streams run to
+completion (3.1; inference, E4 measures it on the pinned Envoy). There is no window with no healthy backend, so there is no Envoy-generated 503 and no
+reliance on Buck2's 1.5 s open-time retries. The one added wait, `T_s`, is gated at p99 under 1 s, and only for a call that arrives between t1 and t2 or is still sent to `p` between t2 and t3.
 
 For the in-process daemon the cut is `hand-over` ending its stream, then a redial through Envoy, as in 6.2.
 
@@ -508,13 +578,15 @@ Mirrors `kbf-frontend@.service` on the handover branch, for both modes.
 |---|---|---|---|---|
 | `i` fails or is refused before it calls `p` | reversible | nothing | `systemctl start` fails | `p` unchanged; fix, retry |
 | prepare refuses (disk, flush, `T_s` budget, unmeasured) | reversible | nothing | `i` exits with the reason | retry |
-| `i` dies after `released`, before serving | committed | streams `p` relays for `i` break; new calls are answered by `p` with UNAVAILABLE (a refusal only because `i` is gone) and retried by Buck2 until systemd restarts `i` | cold start bumps the epoch; the detached daemon reruns its leases | callers of `p` are answered from rows |
+| `i` dies after `released`, before serving | committed | the watchdog (5.1) turns `p` unready within `--handover-watchdog-secs`; until then new calls to `p` fail UNAVAILABLE (retried by Buck2); relayed streams follow `done/` rows by operation id | cold start (replays the meta log, `TimeoutStartSec` up to `max(120, 3 x replay)`) bumps the epoch; the detached daemon reruns its leases | callers of `p` are answered from rows; this is the one window that can fail a build |
 | `T_s` above its budget | committed | calls in the window are slower; none is dropped | `kbf_handover_switch_ms`; the next update is refused (`refused switch-too-long`) | fix the slow component; see 6.3 |
-| `i` never shows healthy in Envoy (admin API or check broken) | committed | none: `p` stays ready and keeps relaying; no capacity is lost | the fallback timer (`--handover-unready-after-secs`) runs; alert on `p` still relaying | repair Envoy's check; `p` has no way back, so `i` keeps serving |
+| `i` never shows healthy in Envoy (admin API or check broken) | committed | none: `p` stays ready and keeps relaying; no capacity is lost | the derived settle timer runs as the fallback; alert on `p` still relaying | repair Envoy's check; `p` has no way back, so `i` keeps serving |
 | a demote stage fails | committed | open streams on `p` end UNAVAILABLE | `p` exits non-zero, cold start | actions rerun |
 | `p` dies mid-follow | committed | its open streams and relays break (the process holds them) | its daemon and keepers die (B1); marker stays | `--acknowledge-crash` |
 | **Envoy crashes or is killed** | n/a, **new** | every open `Execute` breaks | systemd restarts it; kbf unaffected; worker sessions redial | the cost of the uniform topology: a process in front of every build. Mitigation: low `OOMScoreAdjust`, a memory limit, no `restart`, a watchdog |
 | **Envoy hot restart: parent closed at `--parent-shutdown-time-s`** | n/a, **new** | streams still open then break | `kbf_envoy_parent_cut` | set the time above the longest action (Q2) |
+| Envoy hot restart: worker sessions cut at parent shutdown | n/a, **new** | none | every daemon redials at once (jittered); epoch kept, no lease lost within the 40 s fence | jittered redial (7); E7 holds a worker session past drain time and sees the cut |
+| a second Envoy hot restart or a kbf handover while a parent epoch is alive | n/a | none | refused: `blocked by parent epoch N, expires in X` | wait, or Q3's renewal path that needs no restart |
 | a health check flaps ready on a fenced instance | committed | relayed calls | `kbf_handover_relayed_total` rising after `unready` | the check includes the stop flag |
 | two updates back to back | n/a | n/a | `kbf handover` refuses when both instances are active | bounded by the longest action |
 
@@ -533,14 +605,15 @@ everywhere and the project has taken it.
   adopt and spare dup, the address check against the holder's listeners, GOAWAY as the client's switch, and the
   "connections wait in the backlog" step. The coordination the wire carried (refusal reasons, the generation) is the API
   call of 5.4 and the state store's own generation.
-- **New**: the Execute relay (5.2); `HandoverStorage` (6.3); `RaftMetaLog::open_follower` and a read-only tier open (6.3).
+- **New**: the Execute relay (5.2); `HandoverStorage` (6.3); `RaftMetaLog::open_follower` and a read-only tier open (6.3);
+  the durable `cordon/<worker>` row and its recovery (6.2); the split cold-store lock (6.3); the `handed_over` readiness pin and the watchdog (5.1).
 - **Open**: whether the fd-passing path stays as a no-Envoy shape (Q12 of section 15). Recommendation: trim it. A second way
   to do one thing, tested against none of the Envoy topology, and an unconditional source of the question "which
   update path is this host on".
 
 The assembly of `frontend.rs` (`Prepared`, `Trio`, `hello`, `take_over`, `start_or_take_over`) becomes a
 `handover::Driver` both modes call, with a golden of its call sequence for the frontend taken before the refactor.
-`kbf all-in-one` gains `--instance`, `--envoy-admin`, `--handover-unready-after-secs`, `--handover-settle-secs`,
+`kbf all-in-one` gains `--instance`, `--envoy-admin`, `--handover-watchdog-secs`,
 `--handover-switch-budget-ms`, `--handover-follow-interval-ms`, all off without `--instance`.
 Configuration is flags; the only environment variable is `NOTIFY_SOCKET`.
 
@@ -555,12 +628,15 @@ Answers, with a real pinned Envoy and stub or real kbf, before any merged PR:
    concurrent silent streams through default breakers fail and through the box settings do not;
    `close_connections_on_host_health_failure` on the worker cluster cuts a daemon's session (so it stays false); a hot restart
    with a 60 s drain time leaves a silent stream open past it and closes it at the parent shutdown time; what a second hot
-   restart inside the first's window does.
+   restart inside the first's window does: the pinned Envoy's hot-restart source read, and epochs 0 to 3 run with live parents;
+   a `tcp_proxy` session that survives drain time and is cut at parent shutdown; a file-watched SDS secret renewed in a running Envoy; an open
+   silent stream on `a` when `a` fails the gRPC check completes with no RST_STREAM or GOAWAY error; the `/clusters` flags of a freshly added host
+   (`pending_active_hc`); route-level `idle_timeout: 0s` on a 3 h silent stream (scaled).
 2. **kbf, the switch**: `T_s` and each component of it (6.3) on a realistic host, p99 over repeated cuts: with and without a
    meta-log follower open; with and without a read-only tier open; the longest in-flight segment PUT with large blobs; the
    scheduler's recovery on a busy state file. `RaftMetaLog::demote` keeps its applied state readable. Whether a segment PUT through
-   a handle that has released the cold-store lock is safe for `file://`. The result is a number against
-   `--handover-switch-budget-ms`, and the go or no-go for A in 6.3.
+   a handle that has released the cold-store lock is safe for `file://`. Whether the split cold-store lock (shared put, exclusive open) is safe for `file://`. Cut-to-`i`-serving-worker-sessions time with the daemon's
+   backoff, against the 40 s fence. The result is a number against `--handover-switch-budget-ms`, and the go or no-go for A in 6.3.
 3. **kbf, the relay**: a relayed `Execute` through `i`'s listener before its roles latch opens completes after it, with the
    client's own deadline honoured and nothing queued outside the open call.
 
@@ -574,27 +650,29 @@ it); container tests extend the `podman-x86` job, everything else runs in `test-
 |---|---|---|---|
 | E1 | the box render is golden, passes `envoy --mode validate`, and `envoy check` passes it | a render Envoy refuses or the checker misreads | add an unknown field |
 | E2 | `envoy check` fails each defect of 3.1 alone: route timeout default, `max_stream_duration`, idle timeout default, default breakers, `close_connections_on_host_health_failure` true, worker idle default, a retry policy on `ByteStream` or with `unavailable`, one instance missing, overlapping ports, a parent-shutdown below the longest action | a render that silently cuts or refuses a stream | each setting returned to Envoy's default |
-| E3 | real Envoy and two stub servers: a silent `Execute`-shaped stream longer than the (scaled) timeouts completes | the 15 s and idle defaults | route timeout left at default |
-| E4 | stub `a` turns not-ready while `b` is ready: no new stream reaches `a` within the settle, the open one on `a` finishes, no 503 is ever returned, for the REAPI (L7) and worker (L4) clusters | health failure cutting a stream; a daemon session cut; a gap | `close_connections_on_host_health_failure` true on the worker cluster; `a` turned not-ready before `b` is ready |
-| E5 | more than the default breaker's concurrent silent streams are held open through Envoy | the 1024 cap | breakers left default |
-| E6 | `kbf frontend` a/b with Envoy: an `Execute` open across the handover completes; calls issued continuously through it see zero errors and zero Envoy 503; `kbf_handover_relayed_total` is non-zero (the relay is exercised, not skipped) | the update gap | `unready` sent at the cut instead of after `i` is healthy; relay replaced by a refusal |
-| E7 | real hot restart: a silent stream outlives `--drain-time-s`, new streams reach the new epoch, the parent is gone at the parent-shutdown time; with a parent shutdown below the stream's length the stream is cut and the test goes red | the default 900 s | parent shutdown at 900 s |
+| E3 | real Envoy and two stub servers: a silent `Execute`-shaped stream longer than the (scaled) timeouts completes, including a silent stream longer than the HCM idle timeout with progress 0 | the 15 s and idle defaults, an action longer than the idle timeout | route timeout left at default; the idle timeout left on the Execute route |
+| E4 | stub `a` turns not-ready while `b` is ready: no new stream reaches `a` within the settle, a silent 10 min (scaled) Execute-shaped stream open on `a` completes with no RST_STREAM or error GOAWAY upstream, no 503 is ever returned, for the REAPI (L7) and worker (L4) clusters | health failure cutting a stream; a daemon session cut; a gap | `close_connections_on_host_health_failure` true on the worker or REAPI cluster; `a` turned not-ready before `b` is ready |
+| E5 | more silent streams than `ceiling` and than `max_concurrent_streams x max_connections` are held open through the box render | the 1024 cap; a connection cap hit before the request cap | breakers left default; `max_connections` default |
+| E6 | `kbf frontend` a/b with Envoy: an `Execute` open across the handover completes; calls issued continuously through it see zero errors and zero Envoy 503; `kbf_handover_relayed_total` is non-zero and matches the settle; `i` does not fire `unready` on a host with `pending_active_hc` | the update gap; a premature `unready` | `unready` sent at the cut instead of after `i` is healthy; relay replaced by a refusal; "no failed flag" read as healthy |
+| E7 | real hot restart: a silent stream outlives `--drain-time-s`, new streams reach the new epoch, a worker `tcp_proxy` session survives drain time and is cut at parent shutdown, the parent is gone at the parent-shutdown time; a kbf handover while a parent epoch is alive is refused; with a parent shutdown below the stream's length the stream is cut and the test goes red | the default 900 s; a handover that trusts a stale epoch's health view | parent shutdown at 900 s |
 | E8 | before the last PR: one real Buck2 build through a kbf handover, and one through an Envoy hot restart | Buck2's behavior at GOAWAY and at a relayed open | skip the relay |
 | T-R | the relay: `Execute` and `WaitExecution` after the cut reach `i`, metadata forwarded, `i` authorizes again, the response stream is relayed to the end; a call that reaches `i` before its latch opens completes after it with no queue object outside the call; the client's deadline ends a call that never starts | a lost call, a hold bounded by a flag, a bypassed policy | answer from `p`'s own scheduler; drop the metadata |
-| T-D | `Drain`: `hand-over` alone leaves `/readyz` ready and the gRPC health SERVING; `unready` flips both; no handover body keeps today's `begin` (GOAWAY included); each stage idempotent | a split that loses an effect, readiness off too early | flip readiness in `hand-over` |
+| T-D | `Drain`: `hand-over` alone leaves `/readyz` ready and the gRPC health SERVING, **also with `i`'s latch closed for longer than the 2 s store-probe timeout**; `unready` flips both; no handover body keeps today's `begin` (GOAWAY included); each stage idempotent | a split that loses an effect, readiness off too early | flip readiness in `hand-over`; run the store probe through `HandoverStorage` |
 | T-A | the API call: refusal reasons; a different state path refused; the answer carries the generation; no handover body keeps today's meaning | a refusal that proceeds | accept without comparing |
 | T-1..T-3 | `RaftMetaLog::demote` and `open_follower` (the follower's state equals the writer's at the cut, a torn tail is ignored), `FsStore::demote`; the second open succeeds while reads work | B2, B3 | skip the unlock; apply the torn tail |
-| T-4, T-5 | `Cache::seal` and the orphan pass; `HandoverStorage` (`FindMissing` and action-cache lookups to `i`, named reads frozen then `i`, a write open at the cut finishes and its commit lands once on `i`, a write after the cut lands on `i`) | B4, a stale hit, a lost or doubled write | answer from frozen state; commit on `p` after the demote |
+| T-4, T-5 | `Cache::seal` and the orphan pass; `HandoverStorage` (`FindMissing` and action-cache lookups to `i`, named reads frozen then `i`, a write open at the cut finishes and its commit lands once on `i`, a write after the cut lands on `i`); a segment PUT held open across the cut commits exactly once on `i` with no deadlock; a 64 MiB `ByteStream` write whose body straddles the cut, with a client slower than `T_s`, completes; seal, open the tier on `i` (sweep), then read a hot-tier digest through `p` | B4, a stale hit, a lost or doubled write, a lock-order deadlock | answer from frozen state; commit on `p` after the demote; forwarded commit waits on the latch; `p` reads a tier block after the seal |
 | T-6 | real stages with a failpoint at each cut-block index: fail-closed outcome, no marker, cold start serves; state demote last | a partial demote | move `store.demote` earlier |
-| T-7 | `Keep` on the real start path; recovered lease books on the predecessor's node id; successor registers `total - booked`; two cycles a, b, a, the second gets grants | B8, B9, the stale cordon | `Bump`; skip the cordon delete |
+| T-7 | `Keep` on the real start path, the Welcome epoch unchanged across a handover (SQLite open included); recovered lease books on the predecessor's node id; successor registers `total - booked`; two cycles a, b, a, the second gets grants; **kill and restart `i` with `p` still detached: `p`'s worker is granted nothing** (durable cordon) | B8, B9, the stale cordon, a lost cordon | `Bump`; skip the cordon delete; keep the cordon in memory only |
 | T-8 | the real start sweep against a fake container runtime holding two owner labels | B7 | share the data dir |
 | T-9 | golden of the Driver's call sequence for the frontend, plus the existing suite | a refactor changing both sides | reorder two stages |
 | T-10 | all-in-one with a remote daemon: a long action finishes on the old process; its output readable through the successor; an `Execute` longer than every keepalive completes (container, x86) | the whole contract | kill the old process at `released` |
 | T-11 | an action finishes after the cut, local and remote: its outputs upload to `i`, its `Result` is accepted once, nothing is written into `p`'s stores | unacknowledged results, a write into a demoted store | keep the local data plane |
-| T-12 | `i` dies after `released`: a cold start serves, callers of the old one get answers | the unrecoverable window | the old exits at `released` |
+| T-12 | `i` dies after `released`: `p` goes unready within `--handover-watchdog-secs` (failpoint), a cold start serves, callers of the old one get answers | the unrecoverable window; `p` chosen while refusing everything | the old exits at `released`; a watchdog that never fires |
 | T-13..15 | injected ENOSPC at prepare refuses and the old keeps serving; `T_s` over the budget refuses the next update; the short-fence flag: under budget zero reruns, over it the leases fence and rerun and no caller sees an error from the old one | disk-full reversibility, the budget, the fence interaction | raise the fence; record no `T_s` |
 | T-16 | SIGKILL a detached old: the successor is unaffected, `precheck` refuses the restart, `--acknowledge-crash` clears | restart into takeover | write the marker after `released` |
-| T-17 | a load of writes, reads and `Execute` calls running across the whole cut: every call completes, none is refused by `p`, the longest call is within `T_s` plus its normal latency | any hold, park or refusal in the sequence | add a sleep in the cut; refuse writes at the route flag |
+| T-17 | a load of writes, reads and `Execute` calls running across the whole cut: every call completes, none is refused by `p` (a daemon redial is not a call), the longest call is within `T_s` plus its normal latency | any hold, park or refusal in the sequence | add a sleep in the cut; refuse writes at the route flag |
+
+A kbf-it test pins that `/readyz` answers without a token on the API listener.
 
 Failpoints and the short-fence flag live behind a cargo feature with a gate test that fails when a release build enables
 it. No test pins a wrong answer.
@@ -614,31 +692,34 @@ their farm half (Q12); the rest stack on arch-v2. Sizes are estimated changed li
 | R | the Execute relay beside `kbf-front/src/proxy`, T-R | 600 |
 | 2 | `handover::Driver` out of `frontend.rs`, T-9; the farm half (`fence`, `follow`, `end_worker_streams`) and `Keep` through `StateStoreUri` | 700 |
 | 3 | frontend wiring: `--instance`, `--envoy-admin`, predecessor call, ports, settle and unready | 400 |
-| 4 | `kbf-deploy`: unit templates and per-instance drop-ins, `kbf-envoy.service` with the restarter, binary path, `kbf handover`, lock file | 600 |
+| 4 | `kbf-deploy`: unit templates and per-instance drop-ins, `kbf-envoy.service` with the restarter, binary path, `kbf handover`, lock file; daemon jittered redial | 700 |
+| C | durable `cordon/<worker>` row, its recovery before the worker listener accepts sessions, takeover-transaction write, T-7 restart case (stacks on arch-v2, inert until PR 6-9) | 400 |
 | 5 | E6, E8 and T-17 for the frontend | 400 |
 | 6-9 | all-in-one: `FsStore::demote`, `RaftMetaLog::demote` and `open_follower` (T-1..3), `Cache::seal`, read-only tier open and `HandoverStorage` (T-4, T-5, forwarded commits), the detached daemon with the remote data plane and per-instance data dir (T-8, T-11), the wiring, cordon reset and capacity (T-6, T-7, T-12..16) | about 3500 |
 | 10 | all-in-one `kbf-it` T-10, T-12, T-17, container CI placement | 500 |
 
-PRs 6 to 9 are inert until their flags are given. Everything from PR 6 is gated on the spike's `T_s` answer.
+PRs 6 to 9 (and C) are inert until their flags are given. Everything from PR 6 is gated on the spike's `T_s` answer.
 
 ## 15. Open questions
 
 1. **Is a bounded in-call switch time acceptable as "no request is held"?** The design has no park, queue,
-   admission gate or refusal; a call that lands in the switch is slower by `T_s` (gate: p99 under 1 s). A single-copy store
+   admission gate or refusal flag, but it does hold a call that lands in the switch for up to `T_s` (gate: p99 under 1 s), and says so as a residual, not as an absence. A single-copy store
    with an exclusive writer lock cannot do better, so literal zero wait exists only in split mode (storage nodes routed and
    replicated, frontend relay only). Recommendation: accept `T_s` with the gate; if the spike misses it, all-in-one is
    not updated in place and the supported no-wait shape is `kbf frontend` plus storage and daemon nodes (Alternative C).
 2. **The longest action.** Cap an action's timeout farm-wide (`--max-action-timeout`) so Envoy's parent-shutdown time is a
-   derived number, or accept that an action longer than it is cut by an Envoy hot restart. Recommendation: cap, default 6 h.
-3. **Certificate renewal at Envoy**: hot restart or file-watched secrets. Recommendation: hot restart; it avoids an
-   xDS source and the path is already exercised. (The split-mode note leans to a file-based secret source; one of the two
-   notes changes.)
+   derived number, or accept that an action longer than it is cut by an Envoy hot restart. Recommendation: cap, default 6 h
+   (the Execute-route idle timer is off either way, 3.1; with the cap a hot restart is blocked up to 6.25 h, so renewal must not use it, Q3).
+3. **Certificate renewal at Envoy**: a file-watched SDS secret (`path_config_source` on a watched file, no xDS server; does the
+   owner count it as xDS?) or hot restart. Recommendation: the file-watched secret: a hot restart can be blocked for hours by a long
+   action (section 7), and a renewal inside that window is an expiry incident. (The split-mode note also leans to a file-based secret source.) If the answer is no, hot restart with an alert.
 4. **Cgroup caps across two all-in-one units** (`actions/` `cpu.max`, `--actions-memory-max-gib` are per unit).
    Recommendation: one `actions/` parent shared by both instances; verify before the capacity PR.
 5. **Is all-in-one worth the storage work?** Alternative C already updates a fleet with the frontend half and a no-wait
    storage update. Recommendation: decide after PR 0; build the frontend half first either way.
-6. **Cold store and the PUT lock** (6.3): `file://` needs `FsStore::demote` and the longest in-flight PUT is in `T_s`; an
-   object store has no lock. Recommendation: spike a shared put lock; keep `file://` support.
+6. **Cold store and the PUT lock** (6.3): **decided in the note** as the split lock (exclusive open and sweep, shared put) so
+   in-flight PUTs are not in `T_s`; fallback `T_put` with its own gate if the spike finds it unsafe. Open for the CEO only if `file://` is to be dropped
+   instead. Recommendation: keep `file://`, split lock.
 7. **Node id per instance**: two certificates (no change to `peers.admit`) against a suffix rule. Recommendation: two certificates.
 8. **The split-mode update note's E4 to E6** (successor "accepts and holds"; old goes NOT_SERVING at the offer) contradicts 5.1 and
    5.2. This note's version is the later decision; that note needs the same relay and the same readiness order.
