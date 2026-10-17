@@ -1,13 +1,7 @@
-//! The frontend's listening sockets: bound here, or inherited from the process this one
-//! takes over from ([`crate::handover`]).
-//!
-//! A socket that a handover may pass on keeps a second handle on its file description (a
-//! `dup`), the one that goes over the control socket. That handle is dropped when the
-//! listener stops accepting, so the successor's is the only one left.
+//! The frontend's listening sockets, bound here, and the latch that closes one.
 
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::OwnedFd;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
@@ -22,55 +16,21 @@ use crate::serve::ServeError;
 pub(crate) struct Socket {
     /// Where it listens.
     pub local: SocketAddr,
-    /// A second handle on the same socket, for a successor process; `None` where no
-    /// handover is configured.
-    pub spare: Option<OwnedFd>,
     listener: std::net::TcpListener,
 }
 
 impl Socket {
-    /// A listener on `addr`, with a spare handle when `spare`.
+    /// A listener on `addr`.
     ///
     /// # Errors
     /// The address cannot be bound.
-    pub fn bind(addr: SocketAddr, spare: bool) -> Result<Self, ServeError> {
-        let bound =
-            std::net::TcpListener::bind(addr).and_then(|listener| Self::of(listener, spare));
-        bound.map_err(bind_error(addr))
-    }
-
-    /// The listener `fd` is, which must be listening on `want`: the flags of this process
-    /// decide where it listens, and a handover that passes a socket elsewhere is refused
-    /// (so the checks on the flags, such as plain text off loopback, still describe what
-    /// is served).
-    ///
-    /// # Errors
-    /// `fd` is not a listening TCP socket, or is on another address than `want`.
-    pub fn adopt(fd: OwnedFd, want: SocketAddr, spare: bool) -> Result<Self, ServeError> {
-        let listener = std::net::TcpListener::from(fd);
-        let adopted = listener.local_addr().and_then(|local| {
-            let matches = local == want;
-            matches.then_some(()).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    format!("the inherited listener is on {local}, not the address of the flags"),
-                )
-            })?;
-            Self::of(listener, spare)
+    pub fn bind(addr: SocketAddr) -> Result<Self, ServeError> {
+        let bound = std::net::TcpListener::bind(addr).and_then(|listener| {
+            listener.set_nonblocking(true)?;
+            let local = listener.local_addr()?;
+            Ok(Self { local, listener })
         });
-        adopted.map_err(bind_error(want))
-    }
-
-    fn of(listener: std::net::TcpListener, spare: bool) -> io::Result<Self> {
-        listener.set_nonblocking(true)?;
-        let local = listener.local_addr()?;
-        let copy = spare.then(|| listener.try_clone());
-        let spare = copy.transpose()?.map(OwnedFd::from);
-        Ok(Self {
-            local,
-            spare,
-            listener,
-        })
+        bound.map_err(bind_error(addr))
     }
 
     /// The listener for a gRPC server, and the latch that closes it: connections it
@@ -116,9 +76,9 @@ struct Open {
 /// A gRPC listener that can be closed from outside: [`Latch::close`] ends the stream of
 /// connections and closes the socket at once, wherever the server is in accepting. The
 /// transport's own shutdown keeps the socket open until the last connection is gone, and
-/// stops accepting only when it next looks at the listener; a process that handed its
-/// listener to a successor must not go on holding it (a successor that crashes and is
-/// started again binds the address).
+/// stops accepting only when it next looks at the listener; a process that stops
+/// listening (a handover stops the worker listener) must not go on holding the socket
+/// open, where connections would queue for nobody.
 pub(crate) struct Stoppable(Arc<Mutex<Open>>);
 
 impl Stream for Stoppable {

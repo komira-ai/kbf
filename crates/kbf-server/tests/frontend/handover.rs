@@ -1,6 +1,8 @@
-//! `kbf frontend` taking over from a frontend that serves (`kbf_server::handover`): two
-//! frontends in this process on one state file, the first with a build in flight and a
-//! daemon connected, a fake daemon playing the farm's node.
+//! `kbf frontend` taking over from a frontend that serves (`kbf_server::handover`), the
+//! way it runs behind Envoy: two frontends in this process, instances a and b, each on
+//! listeners of its own and on one state file, the first with a build in flight and a
+//! daemon connected, a fake daemon playing the farm's node. Envoy's own part (choosing a
+//! host by its health) is played by the tests reading `/readyz` of each instance.
 
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
@@ -34,23 +36,28 @@ impl Drop for Dir {
     }
 }
 
-/// The flags of a frontend that hands over, serving on `addresses` (new ones if none).
-fn handover_flags(
-    node: &Node,
-    dir: &Dir,
-    addresses: Option<(SocketAddr, SocketAddr, SocketAddr)>,
-    more: &[&str],
-) -> FrontendFlags {
+/// The flags of a frontend that hands over as instance `instance` (`a` or `b`), on new
+/// loopback ports, with Envoy's check set to a millisecond (so the settle is three).
+fn handover_flags(node: &Node, dir: &Dir, instance: &str, more: &[&str]) -> FrontendFlags {
     let mut argv = vec![
         format!("--storage=http://{}", node.addr),
         format!("--handover-socket={}/control.sock", dir.0.display()),
+        format!("--instance={instance}"),
         "--handover-follow-interval-ms=10".to_owned(),
         "--heartbeat-interval-ms=100".to_owned(),
     ];
-    if let Some((reapi, worker, api)) = addresses {
-        argv.push(format!("--listen={reapi}"));
-        argv.push(format!("--worker-listen={worker}"));
-        argv.push(format!("--api-listen={api}"));
+    if !more
+        .iter()
+        .any(|m| m.starts_with("--envoy-check-interval-ms="))
+    {
+        argv.extend(
+            [
+                "--envoy-check-interval-ms=1",
+                "--envoy-check-timeout-ms=1",
+                "--envoy-unhealthy-threshold=1",
+            ]
+            .map(str::to_owned),
+        );
     }
     if !more.iter().any(|m| m.starts_with("--state-store=")) {
         argv.push(format!(
@@ -75,10 +82,6 @@ struct Proc {
 }
 
 impl Proc {
-    fn addresses(&self) -> (SocketAddr, SocketAddr, SocketAddr) {
-        (self.reapi, self.worker, self.api)
-    }
-
     fn serving(handle: FrontendHandle, stop: oneshot::Sender<()>) -> Self {
         let (reapi, worker, api) = (handle.reapi, handle.worker, handle.api);
         let drain = handle.drain();
@@ -111,8 +114,8 @@ impl Proc {
         Self::serving(handle, stop)
     }
 
-    /// Waits for this frontend to end, which it does once its last REAPI connection has
-    /// closed after a handover.
+    /// Waits for this frontend to end, which it does once it has left Envoy's rotation
+    /// and holds no stream, no relay and no caller.
     async fn ended(self) {
         let served = tokio::time::timeout(Duration::from_secs(20), self.served)
             .await
@@ -134,21 +137,58 @@ async fn taking_over(
     .await
 }
 
-/// Catches: a build failed or hung by a frontend update. The first frontend has a daemon
-/// connected and an Execute stream open with its action running. A second frontend takes
-/// over: the first ends the daemon's stream (the daemon dials again and reaches the
-/// second), keeps the client's stream open, and the second, which kept the epoch, takes
-/// the result of the lease the first granted. The client's stream, on the first frontend,
-/// is answered with that result; a call made after the handover is the second's, and is
-/// answered from the cache the result went to; the first ends once its last connection
-/// is gone. Mutants: `Keep` replaced by a bump of the epoch (the lease is not taken), the
-/// follower ignoring `done/` rows (the stream is never answered), the stand down not
-/// ending the daemon's stream (the daemon never reaches the second frontend).
+/// Waits until `look` says yes, for at most twenty seconds.
+async fn until(what: &str, mut look: impl AsyncFnMut() -> bool) {
+    for _ in 0..1000 {
+        if look().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("never happened: {what}");
+}
+
+/// The status code `GET /readyz` of the operator API at `api` answers.
+async fn readyz(api: SocketAddr) -> u16 {
+    get(api, "/readyz").await.0
+}
+
+/// A counter or gauge of `GET /metrics` at `api`.
+async fn metric(api: SocketAddr, name: &str) -> u64 {
+    let mut stream = TcpStream::connect(api).await.expect("connect to the API");
+    let request = "GET /metrics HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n";
+    stream.write_all(request.as_bytes()).await.expect("send");
+    let mut text = String::new();
+    stream.read_to_string(&mut text).await.expect("read");
+    text.lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+        .unwrap_or_else(|| panic!("no {name} in the metrics"))
+        .parse()
+        .expect("a number")
+}
+
+/// Gives a frontend that should not have acted yet the time it would have taken to.
+async fn meanwhile() {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+/// Catches: a build failed or hung by a frontend update. The first frontend (instance a)
+/// has a daemon connected and an Execute stream open with its action running. A second
+/// (instance b, on ports of its own) takes over: the first ends the daemon's stream (the
+/// daemon dials again and reaches the second), keeps the client's stream open, and the
+/// second, which kept the epoch, takes the result of the lease the first granted. The
+/// client's stream, on the first frontend, is answered with that result; a call made
+/// after the handover is the second's, and is answered from the cache the result went to.
+/// The first never sends GOAWAY, goes not ready once the second serves, and ends once it
+/// holds nothing. Mutants: `Keep` replaced by a bump of the epoch (the lease is not
+/// taken), the follower ignoring `done/` rows (the stream is never answered), the stand
+/// down not ending the daemon's stream (the daemon never reaches the second frontend), a
+/// holder that sends GOAWAY.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_build_in_flight_is_finished_across_a_handover() {
     let node = Node::start().await;
     let dir = Dir::new();
-    let old = Proc::cold(&handover_flags(&node, &dir, None, &[])).await;
+    let old = Proc::cold(&handover_flags(&node, &dir, "a", &[])).await;
     let client = Client::connect(old.reapi, old.worker).await;
     let mut daemon = client.daemon("node-a", 4, 8).await;
     let job = Job::new("a build across the update", &[]);
@@ -157,13 +197,8 @@ async fn a_build_in_flight_is_finished_across_a_handover() {
     let start = daemon.start().await;
     let lease = start.lease_id.expect("a lease id");
 
-    let new = Proc::taking_over(&handover_flags(&node, &dir, Some(old.addresses()), &[])).await;
-    assert_eq!(
-        new.addresses(),
-        old.addresses(),
-        "the successor serves the same addresses"
-    );
-    assert!(old.drain.is_draining());
+    let new = Proc::taking_over(&handover_flags(&node, &dir, "b", &[])).await;
+    assert_ne!(new.reapi, old.reapi, "the successor binds its own ports");
     let ended = daemon.ended().await;
     assert_eq!(ended.code(), Code::Unavailable, "{ended}");
 
@@ -186,21 +221,129 @@ async fn a_build_in_flight_is_finished_across_a_handover() {
 
     let mut again = reached.execute(&job.action).await;
     assert!(response(&done(&mut again).await).cached_result);
+    until("the first frontend leaves Envoy's rotation", async || {
+        old.drain.is_unready()
+    })
+    .await;
+    assert!(!old.drain.is_draining(), "an update sent GOAWAY");
     drop((ops, again, client));
     old.ended().await;
     drop(new);
 }
 
+/// Catches: a call that Envoy still sends to the first frontend after the cut being
+/// refused, dropped or answered by a scheduler that no longer runs (T-6): twelve calls
+/// through the first, a cached one and a new action whose daemon is on the second, all
+/// complete with no error, are counted as relayed in `kbf_handover_relayed_total`, none
+/// is counted on the second, and none is left open. Envoy's check is set to an hour so
+/// the first stays in rotation throughout. Mutants: the relay replaced by a refusal, by an
+/// answer from the first's own scheduler, or not counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn calls_that_still_reach_the_first_frontend_are_relayed_with_no_error() {
+    let node = Node::start().await;
+    let dir = Dir::new();
+    let slow = ["--envoy-check-interval-ms=3600000"];
+    let old = Proc::cold(&handover_flags(&node, &dir, "a", &slow)).await;
+    let client = Client::connect(old.reapi, old.worker).await;
+    let job = Job::new("run once on the second", &[]);
+    let other = Job::new("run through the first", &[]);
+    client.upload(&job.blobs()).await;
+    client.upload(&other.blobs()).await;
+
+    let new = Proc::taking_over(&handover_flags(&node, &dir, "b", &slow)).await;
+    let reached = Client::connect(new.reapi, new.worker).await;
+    let mut daemon = reached.daemon("node-a", 4, 8).await;
+    let mut ops = reached.execute(&job.action).await;
+    let start = daemon.start().await;
+    let result = support::output(&reached, "run once", 0).await;
+    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
+    done(&mut ops).await;
+
+    // Twelve cached calls through the first, some at once.
+    for _ in 0..6 {
+        let mut ops = client.execute(&job.action).await;
+        assert!(response(&done(&mut ops).await).cached_result);
+    }
+    let calls = (0..6).map(|_| async {
+        let mut ops = client.execute(&job.action).await;
+        response(&done(&mut ops).await).cached_result
+    });
+    assert!(
+        futures::future::join_all(calls)
+            .await
+            .into_iter()
+            .all(|c| c)
+    );
+
+    // A call that is not cached: the first relays it, the second's daemon runs it.
+    let mut open = client.execute(&other.action).await;
+    let start = daemon.start().await;
+    let built = support::output(&reached, "run through the first", 0).await;
+    assert!(daemon.report(ran(start.lease_id, &built)).await.accepted);
+    let last = done(&mut open).await;
+    assert_eq!(response(&last).result, Some(built));
+
+    assert_eq!(metric(old.api, "kbf_handover_relayed_total").await, 13);
+    assert_eq!(metric(old.api, "kbf_handover_relays_open").await, 0);
+    assert_eq!(metric(new.api, "kbf_handover_relayed_total").await, 0);
+    assert!(!old.drain.is_unready(), "left Envoy's rotation early");
+}
+
+/// Catches: a first frontend that leaves Envoy's rotation before the second can answer
+/// (Envoy would have no host that can take a new stream: Buck2's open would fail), or
+/// before it is told the second serves (T-D). Between the successor's start and its
+/// serving the first stays ready, `/readyz` 200 though it has handed its roles over; it
+/// goes not ready only once the second answers `/readyz` 200 itself. Mutants: `unready`
+/// at the cut; `unready` when the successor has only started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_frontend_goes_unready_only_after_the_second_is_ready() {
+    let node = Node::start().await;
+    let dir = Dir::new();
+    let old = Proc::cold(&handover_flags(&node, &dir, "a", &[])).await;
+    assert_eq!(readyz(old.api).await, 200);
+    // A build the first holds, so it is still there to be asked when it has left.
+    let client = Client::connect(old.reapi, old.worker).await;
+    let job = Job::new("held by the first", &[]);
+    client.upload(&job.blobs()).await;
+    let _held = client.execute(&job.action).await;
+
+    // The second has the roles, and has not been served: it cannot answer yet.
+    let (stop, stopped) = oneshot::channel::<()>();
+    let handle = taking_over(&handover_flags(&node, &dir, "b", &[]), stopped)
+        .await
+        .expect("takes over");
+    meanwhile().await;
+    assert!(
+        !old.drain.is_unready(),
+        "unready before the successor served"
+    );
+    assert_eq!(readyz(old.api).await, 200, "not ready at the cut");
+
+    let new = Proc::serving(handle, stop);
+    until("the second is ready", async || readyz(new.api).await == 200).await;
+    until("the first leaves Envoy's rotation", async || {
+        old.drain.is_unready()
+    })
+    .await;
+    assert_eq!(
+        readyz(new.api).await,
+        200,
+        "the first left before the second was ready"
+    );
+    assert_eq!(readyz(old.api).await, 503);
+    drop(new);
+}
+
 /// Catches: a failed attempt to take over that changes the frontend serving. The second
-/// frontend is started with a policy file that does not exist: it fails after the first
-/// has offered its listeners and before it says it is ready. The first goes on serving
-/// (not draining, its daemon's stream open, a new Execute answered), and a second
-/// attempt, with good flags, takes over.
+/// frontend is started with a policy file that does not exist: it fails before it asks the
+/// first (its flags and listeners are built first). The first goes on serving (still
+/// ready, not handed over, its daemon's stream open, a new Execute answered), and a
+/// second attempt, with good flags, takes over.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_successor_that_fails_before_ready_leaves_the_frontend_serving() {
     let node = Node::start().await;
     let dir = Dir::new();
-    let old = Proc::cold(&handover_flags(&node, &dir, None, &[])).await;
+    let old = Proc::cold(&handover_flags(&node, &dir, "a", &[])).await;
     let client = Client::connect(old.reapi, old.worker).await;
     let mut daemon = client.daemon("node-a", 4, 8).await;
 
@@ -208,7 +351,7 @@ async fn a_successor_that_fails_before_ready_leaves_the_frontend_serving() {
     let bad = handover_flags(
         &node,
         &dir,
-        Some(old.addresses()),
+        "b",
         &[&format!("--reapi-auth-policy={}", missing.display())],
     );
     let (_stop, stopped) = oneshot::channel::<()>();
@@ -217,7 +360,9 @@ async fn a_successor_that_fails_before_ready_leaves_the_frontend_serving() {
         .err()
         .expect("the start fails");
     assert!(error.to_string().contains("no-such-policy"), "{error}");
-    assert!(!old.drain.is_draining(), "the frontend serving was touched");
+    meanwhile().await;
+    assert!(!old.drain.is_unready() && !old.drain.is_draining());
+    assert_eq!(readyz(old.api).await, 200);
 
     let job = Job::new("served by the first", &[]);
     client.upload(&job.blobs()).await;
@@ -227,28 +372,28 @@ async fn a_successor_that_fails_before_ready_leaves_the_frontend_serving() {
     assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
     assert_eq!(response(&done(&mut ops).await).result, Some(result));
 
-    let new = Proc::taking_over(&handover_flags(&node, &dir, Some(old.addresses()), &[])).await;
-    assert_eq!(new.reapi, old.reapi);
+    let new = Proc::taking_over(&handover_flags(&node, &dir, "b", &[])).await;
+    assert_ne!(new.reapi, old.reapi);
     drop((ops, client));
     old.ended().await;
 }
 
 /// Catches: a frontend that takes over from one started with other flags (another state
-/// file or other addresses): the frontend serving refuses, the start fails with its
-/// reason, and the frontend serving is untouched. Also a stop signal that arrives before
-/// the handover is agreed ends the start and leaves the other frontend alone, and flags
-/// that ask for a handover with no state store are refused.
+/// file, the same instance, or no instance at all): the frontend serving refuses, the
+/// start fails with its reason, and the frontend serving is untouched. Also a stop signal
+/// that arrives before the handover is agreed ends the start and leaves the other
+/// frontend alone, and flags that ask for a handover with no state store are refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_that_cannot_take_over_says_why_and_changes_nothing() {
     let node = Node::start().await;
     let dir = Dir::new();
-    let old = Proc::cold(&handover_flags(&node, &dir, None, &[])).await;
+    let old = Proc::cold(&handover_flags(&node, &dir, "a", &[])).await;
 
     let elsewhere = dir.0.join("other");
     let other_state = handover_flags(
         &node,
         &dir,
-        Some(old.addresses()),
+        "b",
         &[&format!(
             "--state-store=sqlite://{}/state.db",
             elsewhere.display()
@@ -265,16 +410,30 @@ async fn a_start_that_cannot_take_over_says_why_and_changes_nothing() {
     );
     assert!(error.to_string().contains("--state-store"), "{error}");
 
-    let other_ports = handover_flags(&node, &dir, None, &[]);
+    let same_instance = handover_flags(&node, &dir, "a", &[]);
     let (_stop, stopped) = oneshot::channel::<()>();
-    let error = taking_over(&other_ports, stopped)
+    let error = taking_over(&same_instance, stopped)
         .await
         .err()
         .expect("refused");
-    assert!(error.to_string().contains("listen flags"), "{error}");
+    assert!(
+        error.to_string().contains("instance a like this frontend"),
+        "{error}"
+    );
 
-    let same = handover_flags(&node, &dir, Some(old.addresses()), &[]);
-    let error = start_or_take_over(&same, || Ok(std::future::ready(())))
+    let state = format!("--state-store=sqlite://{}/state.db", dir.0.display());
+    let socket = format!("--handover-socket={}/control.sock", dir.0.display());
+    let url = format!("--storage=http://{}", node.addr);
+    let no_instance = flags(&[&url, &state, &socket]).expect("flags");
+    let (_stop, stopped) = oneshot::channel::<()>();
+    let error = taking_over(&no_instance, stopped)
+        .await
+        .err()
+        .expect("refused");
+    assert!(error.to_string().contains("without --instance"), "{error}");
+
+    let good = handover_flags(&node, &dir, "b", &[]);
+    let error = start_or_take_over(&good, || Ok(std::future::ready(())))
         .await
         .err()
         .expect("stopped");
@@ -282,9 +441,10 @@ async fn a_start_that_cannot_take_over_says_why_and_changes_nothing() {
         error.to_string().contains("stopped before the handover"),
         "{error}"
     );
-    assert!(!old.drain.is_draining());
+    meanwhile().await;
+    assert!(!old.drain.is_unready() && !old.drain.is_draining());
 
-    let mut no_state = same.clone();
+    let mut no_state = good.clone();
     no_state.server.state_store = None;
     let (_stop, stopped) = oneshot::channel::<()>();
     let error = taking_over(&no_state, stopped)
@@ -294,19 +454,20 @@ async fn a_start_that_cannot_take_over_says_why_and_changes_nothing() {
     assert!(error.to_string().contains("needs --state-store"), "{error}");
 }
 
-/// Catches: a successor that dies after the frontend serving has let go (the window
+/// Catches (T-12): a successor that dies after the frontend serving has let go (the window
 /// the handover cannot undo) leaving the farm without a frontend that works, or the
-/// callers it kept without an answer: the next start finds no frontend serving (the
-/// socket file is stale), binds the same addresses, bumps the epoch and runs the
-/// operation again, and the first frontend, which kept the client's stream open,
-/// answers it from the result the new one writes. Mutants: the holder keeping its
-/// listeners after it released (the addresses are in use), the control socket left
-/// accepting.
+/// callers it kept without an answer, or Envoy still choosing a frontend that can start
+/// nothing: the first goes not ready as soon as its successor's connection closes, a
+/// start of the successor again finds nobody serving on the control socket (its file is
+/// stale), takes the store cold (the epoch is bumped, the daemon's runs are lost and run
+/// again), and the first, which kept the client's stream open, answers it from the result
+/// the new one writes, and ends. Mutants: no watch on the successor's connection; the
+/// holder exiting at the release.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_successor_that_dies_after_the_release_is_started_again_and_the_streams_finish() {
     let node = Node::start().await;
     let dir = Dir::new();
-    let old = Proc::cold(&handover_flags(&node, &dir, None, &[])).await;
+    let old = Proc::cold(&handover_flags(&node, &dir, "a", &[])).await;
     let client = Client::connect(old.reapi, old.worker).await;
     let mut daemon = client.daemon("node-a", 4, 8).await;
     let job = Job::new("a build whose successor dies", &[]);
@@ -315,26 +476,17 @@ async fn a_successor_that_dies_after_the_release_is_started_again_and_the_stream
     let first = daemon.start().await;
 
     // It has taken over and dies before it serves.
-    let flags = handover_flags(&node, &dir, Some(old.addresses()), &[]);
+    let flags = handover_flags(&node, &dir, "b", &[]);
     let (_stop, stopped) = oneshot::channel::<()>();
     let dying = taking_over(&flags, stopped).await.expect("takes over");
     drop(dying);
     assert!(daemon.ended().await.code() == Code::Unavailable);
+    until("the first frontend goes not ready", async || {
+        old.drain.is_unready()
+    })
+    .await;
 
-    // The frontend that let go closes its handles on the listeners a moment after it says
-    // so, and a service manager restarts a failed unit after a delay; the start is tried
-    // again for the first.
-    let new = loop {
-        let (stop, stopped) = oneshot::channel::<()>();
-        match taking_over(&flags, stopped).await {
-            Ok(handle) => break Proc::serving(handle, stop),
-            Err(error) if error.to_string().contains("in use") => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(error) => panic!("the start after the crash failed: {error}"),
-        }
-    };
-    assert_eq!(new.reapi, old.reapi);
+    let new = Proc::taking_over(&flags).await;
     let reached = Client::connect(new.reapi, new.worker).await;
     let mut daemon = reached.daemon("node-a", 4, 8).await;
     assert_ne!(
@@ -351,6 +503,72 @@ async fn a_successor_that_dies_after_the_release_is_started_again_and_the_stream
     assert_eq!(response(&done(&mut ops).await).result, Some(result));
     drop((ops, client));
     old.ended().await;
+}
+
+/// Catches (T-12): a first frontend that stays in Envoy's rotation for a successor that is
+/// alive and never serves (it holds the store and has said nothing since): when
+/// `--handover-watchdog-secs` runs out the first goes not ready by itself, so Envoy has a
+/// clean answer to give. The successor here is started and not served, with its control
+/// connection open. Mutant: a watchdog that never fires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_successor_that_never_serves_is_given_up_on_at_the_watchdog() {
+    let node = Node::start().await;
+    let dir = Dir::new();
+    let old = Proc::cold(&handover_flags(
+        &node,
+        &dir,
+        "a",
+        &["--handover-watchdog-secs=1"],
+    ))
+    .await;
+    let (_stop, stopped) = oneshot::channel::<()>();
+    let waiting = taking_over(&handover_flags(&node, &dir, "b", &[]), stopped)
+        .await
+        .expect("takes over");
+    assert!(!old.drain.is_unready());
+    until("the watchdog runs out", async || old.drain.is_unready()).await;
+    drop(waiting);
+    old.ended().await;
+}
+
+/// Catches: a stop without a handover that is not what it was before the update path
+/// existed (the golden): a frontend that has the handover flags but is asked to stop, not
+/// to hand over, drains as `kbf-server` does: not ready, new Execute refused, GOAWAY sent
+/// (so `is_draining`), and it ends once its connections have closed. The control socket
+/// and the relay change none of it. Mutant: the stop path going through `hand_over`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_without_a_handover_drains_as_before() {
+    let node = Node::start().await;
+    let dir = Dir::new();
+    let flags = handover_flags(&node, &dir, "a", &[]);
+    let old = Proc::cold(&flags).await;
+    let client = Client::connect(old.reapi, old.worker).await;
+    let job = Job::new("refused while the frontend stops", &[]);
+    client.upload(&job.blobs()).await;
+    assert_eq!(readyz(old.api).await, 200);
+
+    let Proc {
+        drain,
+        served,
+        _stop,
+        ..
+    } = old;
+    drop(_stop);
+    until("the drain begins", async || drain.is_draining()).await;
+    assert!(drain.is_unready());
+    let refused = client.execute_with(&job.action, false).await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.code() == Code::Unavailable),
+        "{refused:?}"
+    );
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(20), served)
+        .await
+        .expect("the frontend ends")
+        .expect("the task")
+        .expect("served without an error");
 }
 
 /// Catches: `READY=1` sent before the frontend serves, never sent after, or sent by a
@@ -373,10 +591,9 @@ async fn the_service_manager_is_told_when_the_frontend_serves() {
     };
 
     let (stop, stopped) = oneshot::channel::<()>();
-    let handle = taking_over(&handover_flags(&node, &dir, None, &[]), stopped)
+    let handle = taking_over(&handover_flags(&node, &dir, "a", &[]), stopped)
         .await
         .expect("a start with no predecessor");
-    let addresses = (handle.reapi, handle.worker, handle.api.expect("api"));
     let handle = handle.notifying(Some(manager_path.clone().into_os_string()));
     manager.set_nonblocking(true).expect("nonblocking");
     let mut buffer = [0_u8; 16];
@@ -386,7 +603,7 @@ async fn the_service_manager_is_told_when_the_frontend_serves() {
     expect_ready(&manager);
 
     let (stop, stopped) = oneshot::channel::<()>();
-    let flags = handover_flags(&node, &dir, Some(addresses), &[]);
+    let flags = handover_flags(&node, &dir, "b", &[]);
     let handle = taking_over(&flags, stopped).await.expect("takes over");
     let handle = handle.notifying(Some(manager_path.into_os_string()));
     manager.set_nonblocking(true).expect("nonblocking");
@@ -399,9 +616,9 @@ async fn the_service_manager_is_told_when_the_frontend_serves() {
 }
 
 /// Catches: flags for a handover that parse without what they need or with what they do
-/// not: a socket needs a state store, the two timings need the socket, the defaults are
-/// the documented ones; and a start without the flag is a start as `start_frontend` makes
-/// it (`start_or_take_over` with nothing to take over from).
+/// not: a socket needs a state store, the instance and the timings need the socket, the
+/// defaults are the documented ones; and a start without the flag is a start as
+/// `start_frontend` makes it (`start_or_take_over` with nothing to take over from).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_handover_flags_need_each_other_and_a_start_without_them_is_a_plain_start() {
     let node = Node::start().await;
@@ -410,6 +627,7 @@ async fn the_handover_flags_need_each_other_and_a_start_without_them_is_a_plain_
         "--handover-socket=/run/kbf/control.sock",
         "--handover-quiesce-secs=5",
         "--handover-follow-interval-ms=5",
+        "--instance=a",
     ] {
         let error = flags(&[&url, lone]).expect_err(lone);
         assert!(error.to_string().contains("--"), "{lone}: {error}");

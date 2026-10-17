@@ -3,13 +3,15 @@
 # (kbf docs/design/frontend-handover.md; architecture-v2.md, sections 1 and 11).
 # `check-units --mode frontend` parses the flags below with `kbf check-args frontend`.
 #
-# A template with two instances, a and b, that run the same command line: only one serves
-# at a time. An update starts the idle one while the other still serves (`kbf frontend
-# handover`): the new process takes the listeners, the state store and the daemons over
-# the control socket, `systemctl start` returns when it has said READY=1, and the old one
-# drains its open builds and exits. Only instance a is enabled (DefaultInstance=a). No
-# `Conflicts=` between the instances: starting one must never stop the other, which is
-# draining (check-units rule `handover`).
+# A template with two instances, a and b: only one serves at a time. An update starts the
+# idle one while the other still serves (`kbf frontend handover`): the new process takes
+# the state store and the daemons over the control socket, on listeners of its own
+# (`--instance=a|b` puts instance b ten ports above a; this unit does not give it yet, and
+# a frontend without it refuses a handover), `systemctl start` returns when it has said
+# READY=1, and the old one goes not ready once Envoy has seen the new one, drains its open
+# builds and exits. Only instance a is enabled (DefaultInstance=a). No `Conflicts=`
+# between the instances: starting one must never stop the other, which is draining
+# (check-units rule `handover`).
 [Unit]
 Description=kbf build farm frontend, instance %i
 Wants=network-online.target

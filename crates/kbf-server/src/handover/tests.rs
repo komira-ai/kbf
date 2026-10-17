@@ -1,8 +1,6 @@
 //! The stop signal, and the rig the tests of the parts of a handover build a serving
 //! frontend from.
 
-use std::net::{SocketAddr, TcpListener};
-use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -20,7 +18,7 @@ use kbf_state::{
 use kbf_types::{ActionKey, Digest, DigestFunction, LeaseKind, Qos, Resources};
 use tonic::Status;
 
-use super::{Facts, Holder, Sockets, Stand, Stop};
+use super::{EnvoyCheck, Facts, Holder, Instance, Leave, Peer, Stand, Stop};
 use crate::drain::Drain;
 use crate::farm::{EpochPolicy, Farm};
 use crate::health::Readiness;
@@ -168,21 +166,21 @@ pub(super) fn submit(farm: &Farm, request: Request) -> Result<kbf_front::Ticket,
 }
 
 /// A serving frontend's parts, as a holder stands them down: a farm over a store, a drain,
-/// the stops of the worker and operator listeners, the task that expires rows, and the
-/// three listeners.
+/// the stop of the worker listener and the task that expires rows.
 pub(super) struct Rig {
     pub dir: Scratch,
     pub store: Arc<Gives>,
     pub backend: Backend,
     pub farm: Arc<Farm>,
     pub drain: Arc<Drain>,
+    pub readiness: Arc<Readiness>,
     pub worker: Stop,
-    pub api: Stop,
     pub sweeper: AbortHandle,
     /// Kept so the sweeper is not aborted before it is told to be.
     pub _sweeping: AbortRegistration,
-    listeners: [TcpListener; 3],
     pub facts: Facts,
+    /// Where the relay of the rig's frontend sends its calls, once a successor is accepted.
+    pub successor: kbf_front::Successor,
 }
 
 impl Rig {
@@ -204,9 +202,8 @@ impl Rig {
         }))
         .expect("a farm over the store");
         let (closer, _closing) = kbf_front::closing();
-        let (drain, _goaway) = Drain::new(closer, Arc::new(Readiness::default()));
-        let listeners = [(); 3].map(|()| TcpListener::bind("127.0.0.1:0").expect("bind"));
-        let [reapi, worker, api] = [0, 1, 2].map(|i| listeners[i].local_addr().expect("address"));
+        let readiness = Arc::new(Readiness::default());
+        let (drain, _goaway) = Drain::new(closer, Arc::clone(&readiness));
         let (sweeper, _sweeping) = AbortHandle::new_pair();
         Self {
             dir: Scratch::new(),
@@ -214,27 +211,15 @@ impl Rig {
             backend,
             farm: Arc::new(farm),
             drain: Arc::new(drain),
+            readiness,
             worker: Stop::new(),
-            api: Stop::new(),
             sweeper,
             _sweeping,
-            listeners,
             facts: Facts {
-                reapi,
-                worker,
-                api: Some(api),
+                instance: Some(Instance::A),
                 state: PathBuf::from("/var/lib/kbf/state.db"),
             },
-        }
-    }
-
-    /// Second handles on the three listeners, as a holder offers them.
-    pub fn sockets(&self) -> Sockets {
-        let dup = |i: usize| OwnedFd::from(self.listeners[i].try_clone().expect("a second handle"));
-        Sockets {
-            reapi: dup(0),
-            worker: dup(1),
-            api: Some(dup(2)),
+            successor: kbf_front::Successor::unknown(),
         }
     }
 
@@ -243,21 +228,53 @@ impl Rig {
             drain: Arc::clone(&self.drain),
             farm: Arc::clone(&self.farm),
             worker: self.worker.clone(),
-            api: self.api.clone(),
             sweeper: self.sweeper.clone(),
             store: self.store.clone(),
             wait,
         }
     }
 
+    /// How the rig's frontend reaches a successor: a lazy channel to the address given
+    /// (nothing is dialled until a call is made), or the reason the test names.
+    pub fn peer(&self, dial: Result<(), &'static str>) -> Peer {
+        Peer {
+            successor: self.successor.clone(),
+            dial: Box::new(move |addr| {
+                dial.map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
+                let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}"));
+                Ok(endpoint.expect("an endpoint").connect_lazy())
+            }),
+        }
+    }
+
+    /// The timings of a holder that leaves: a quarter second of watchdog (the tests that
+    /// need it to run out say so), a settle of a millisecond.
+    pub fn leave(&self, watchdog: Duration) -> Leave {
+        Leave {
+            watchdog,
+            settle: EnvoyCheck {
+                interval: Duration::from_millis(1),
+                timeout: Duration::from_millis(1),
+                unhealthy_threshold: 1,
+            }
+            .settle(),
+            every: Duration::from_millis(1),
+        }
+    }
+
     /// A holder on the rig's control socket for peers running as `uid`.
     pub fn holder(&self, uid: u32, wait: Duration) -> Holder {
+        self.holder_with(uid, wait, self.peer(Ok(())), Duration::from_secs(600))
+    }
+
+    pub fn holder_with(&self, uid: u32, wait: Duration, peer: Peer, watchdog: Duration) -> Holder {
         Holder::bind(
             &self.dir.socket(),
             uid,
             self.facts.clone(),
-            self.sockets(),
             self.stand(wait),
+            peer,
+            self.leave(watchdog),
         )
         .expect("a control socket")
     }
@@ -265,10 +282,6 @@ impl Rig {
     /// The user the tests run as.
     pub fn uid() -> u32 {
         rustix::process::geteuid().as_raw()
-    }
-
-    pub fn addr(&self, i: usize) -> SocketAddr {
-        self.listeners[i].local_addr().expect("address")
     }
 }
 
@@ -295,7 +308,7 @@ async fn a_stop_completes_for_every_waiter_once_it_is_fired() {
 async fn a_stop_closes_the_listeners_registered_with_it_when_it_is_given() {
     let any = || "127.0.0.1:0".parse().expect("address");
     let stop = Stop::new();
-    let socket = crate::listen::Socket::bind(any(), false).expect("bind");
+    let socket = crate::listen::Socket::bind(any()).expect("bind");
     let addr = socket.local;
     let (incoming, latch) = socket.grpc(None).expect("registered");
     stop.closes(latch);
@@ -311,7 +324,7 @@ async fn a_stop_closes_the_listeners_registered_with_it_when_it_is_given() {
     drop(incoming);
 
     // Registered after the stop was given: closed at once.
-    let socket = crate::listen::Socket::bind(any(), false).expect("bind");
+    let socket = crate::listen::Socket::bind(any()).expect("bind");
     let addr = socket.local;
     let (_incoming, latch) = socket.grpc(None).expect("registered");
     stop.closes(latch);

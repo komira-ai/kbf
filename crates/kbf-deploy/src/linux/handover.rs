@@ -2,8 +2,9 @@
 //! instances can hand over to one another (docs/design/frontend-handover.md).
 //!
 //! An update starts the idle instance (`kbf frontend handover`) while the other still
-//! serves; the new process takes the listeners, the state store and the daemons from the
-//! old one over a control socket, and the old one drains its open builds and exits. The
+//! serves; the new process takes the state store and the daemons from the old one over a
+//! control socket (on listeners of its own: `--instance`), and the old one goes not ready
+//! once Envoy has seen the new one, drains its open builds and exits. The
 //! unit must have, in `[Service]` unless said:
 //!
 //! - `Type=notify`, and `NotifyAccess=` not `none` or `exec`: kbf sends `READY=1` from its

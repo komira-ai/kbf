@@ -34,7 +34,7 @@
 //! as long as its action runs.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures::stream;
@@ -86,11 +86,38 @@ pub trait Handed: Send + Sync + 'static {
     fn look(&self, operation: OperationId) -> Result<Option<Stage>, String>;
 }
 
+/// Where a relay sends its calls: the successor's channel, which a frontend that does not
+/// know its successor when it starts is given once the successor says who it is
+/// ([`Successor::set`]). Clones share the one channel.
+#[derive(Clone, Debug, Default)]
+pub struct Successor(Arc<OnceLock<Channel>>);
+
+impl Successor {
+    /// A successor not known yet: a relay with no channel refuses a call UNAVAILABLE.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self::default()
+    }
+
+    /// Names the successor's channel. Returns whether it did: a successor is named once.
+    pub fn set(&self, channel: Channel) -> bool {
+        self.0.set(channel).is_ok()
+    }
+}
+
+impl From<Channel> for Successor {
+    fn from(channel: Channel) -> Self {
+        let successor = Self::unknown();
+        successor.set(channel);
+        successor
+    }
+}
+
 /// The `Execution` service `E`, and the calls it forwards once its farm has handed over.
 pub struct Relay<E> {
     inner: E,
     farm: Arc<dyn Handed>,
-    successor: Channel,
+    successor: Successor,
     backend: Backend,
     closing: Closing,
     progress: Progress,
@@ -108,11 +135,16 @@ impl<E> Relay<E> {
     /// `backend` is what counts them. Streams are never closed and never re-sent until
     /// [`Relay::with_streams`] says so.
     #[must_use]
-    pub fn new(inner: E, farm: Arc<dyn Handed>, successor: Channel, backend: Backend) -> Self {
+    pub fn new(
+        inner: E,
+        farm: Arc<dyn Handed>,
+        successor: impl Into<Successor>,
+        backend: Backend,
+    ) -> Self {
         Self {
             inner,
             farm,
-            successor,
+            successor: successor.into(),
             backend,
             closing: closing().1,
             progress: Progress::off(),
@@ -137,10 +169,15 @@ impl<E> Relay<E> {
         self
     }
 
-    fn client(&self) -> ExecutionClient<Channel> {
-        ExecutionClient::new(self.successor.clone())
+    /// A client of the successor, or UNAVAILABLE while the successor is not known.
+    fn client(&self) -> Result<ExecutionClient<Channel>, Status> {
+        let channel = self.successor.0.get().cloned();
+        let channel = channel.ok_or_else(|| {
+            Status::unavailable("this frontend has no successor to answer the call")
+        })?;
+        Ok(ExecutionClient::new(channel)
             .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(crate::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::MAX_MESSAGE_BYTES))
     }
 
     /// Counts a call that is being relayed, until the guard drops.
@@ -191,9 +228,10 @@ where
             return self.inner.execute(request).await;
         }
         let instance = request.get_ref().instance_name.clone();
+        let mut client = self.client()?;
         let (call, deadline) = forwarded(request);
         let open = self.begin();
-        let live = opened(deadline, self.client().execute(call)).await?;
+        let live = opened(deadline, client.execute(call)).await?;
         Ok(Response::new(self.relayed(
             live.into_inner(),
             Some(instance),
@@ -208,9 +246,10 @@ where
         if !self.farm.handed() {
             return self.inner.wait_execution(request).await;
         }
+        let mut client = self.client()?;
         let (call, deadline) = forwarded(request);
         let open = self.begin();
-        let live = opened(deadline, self.client().wait_execution(call)).await?;
+        let live = opened(deadline, client.wait_execution(call)).await?;
         Ok(Response::new(self.relayed(live.into_inner(), None, open)))
     }
 }

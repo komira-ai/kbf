@@ -7,6 +7,7 @@ use futures::future::BoxFuture;
 
 use super::*;
 use crate::handover::tests::Scratch;
+use crate::handover::wire::Message;
 use crate::health::{Probe, Readiness};
 
 /// A dependency that fails until the test lets it pass, and counts being asked.
@@ -46,6 +47,7 @@ async fn ready_waits_for_the_probes_then_tells_the_manager() {
     let ready = Ready {
         checks: Arc::clone(&checks),
         notify: Some(path.clone().into_os_string()),
+        predecessor: None,
     };
     let task = tokio::spawn(ready.run());
     // Asked twice while the dependency is down: the first failure was followed by a wait.
@@ -66,8 +68,55 @@ async fn ready_waits_for_the_probes_then_tells_the_manager() {
         Ready {
             checks: Arc::clone(&checks),
             notify,
+            predecessor: None,
         }
         .run()
         .await;
     }
+}
+
+/// Catches: a successor that tells its predecessor it serves before its probes pass (the
+/// predecessor would leave Envoy's rotation while the successor cannot answer), never
+/// tells it once they do (the predecessor waits for its watchdog and leaves anyway), or
+/// stops running because the predecessor is gone.
+#[tokio::test]
+async fn the_predecessor_is_told_once_the_probes_pass() {
+    let up = Arc::new(AtomicBool::new(false));
+    let asked = Arc::new(AtomicUsize::new(0));
+    let dependency = Dependency {
+        up: Arc::clone(&up),
+        asked: Arc::clone(&asked),
+    };
+    let checks = Arc::new(
+        Checks::new(Arc::new(Readiness::default())).probing("dependency", Arc::new(dependency)),
+    );
+    let (ours, theirs) = tokio::net::UnixStream::pair().expect("a pair");
+    let mut predecessor = crate::handover::wire::Link::new(theirs);
+    let task = tokio::spawn(
+        Ready {
+            checks: Arc::clone(&checks),
+            notify: None,
+            predecessor: Some(Released::over(crate::handover::wire::Link::new(ours))),
+        }
+        .run(),
+    );
+    while asked.load(Ordering::SeqCst) < 2 {
+        tokio::task::yield_now().await;
+    }
+    let early = tokio::time::timeout(Duration::from_millis(50), predecessor.hear()).await;
+    assert!(early.is_err(), "told it serves while a probe fails");
+    up.store(true, Ordering::SeqCst);
+    assert_eq!(predecessor.hear().await.expect("told"), Message::Serving);
+    task.await.expect("ready ends");
+
+    // A predecessor that has gone is not an error that stops anything.
+    let (ours, theirs) = tokio::net::UnixStream::pair().expect("a pair");
+    drop(theirs);
+    Ready {
+        checks,
+        notify: None,
+        predecessor: Some(Released::over(crate::handover::wire::Link::new(ours))),
+    }
+    .run()
+    .await;
 }
