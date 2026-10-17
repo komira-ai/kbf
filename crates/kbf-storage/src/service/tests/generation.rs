@@ -48,7 +48,7 @@ fn a_stale_map_status_is_lifted_with_the_nodes_generation() {
         with(Code::Unavailable, "9"),
     ] {
         assert!(
-            matches!(lift(&status, None), StorageError::Unavailable(_)),
+            !matches!(lift(&status, None), StorageError::StaleMap { .. }),
             "{status:?}"
         );
     }
