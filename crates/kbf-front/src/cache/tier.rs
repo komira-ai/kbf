@@ -436,12 +436,20 @@ mod tests {
 
     /// Catches: a blocking pool that is full showing as a slow disk, or not at all: the
     /// second call waits for the only pool thread while the first holds it, so it counts
-    /// as in flight and its wait is the time the first took (300 ms here, observed by
-    /// the second's `kbf_tier_wait_seconds`, not 0), and the gauge is back to 0 after.
-    /// A wait taken from the closure's end instead of its start, or a gauge raised
-    /// inside the closure (it would read 1, not 2, while one call waits), is caught.
+    /// as in flight (the gauge reads 2: one running, one queued) and its wait is at least
+    /// the time the first was held after the second was queued (not 0), observed by
+    /// `kbf_tier_wait_seconds`; the gauge is back to 0 after. A wait taken from the
+    /// closure's end instead of its start, or a gauge raised inside the closure (it
+    /// would read 1, not 2, while one call waits), is caught.
+    ///
+    /// Ordering comes from channels, not from sleeps: the first call signals that it
+    /// holds the pool thread and blocks until released; the test queues the second only
+    /// then, and releases the first only once the gauge shows both calls. The only clock
+    /// reading is a lower bound (the wait covers the hold), which a slow runner can
+    /// only enlarge.
     #[test]
     fn a_call_waiting_for_a_pool_thread_is_counted_and_its_wait_observed() {
+        const HOLD: Duration = Duration::from_millis(100);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .max_blocking_threads(1)
@@ -450,38 +458,53 @@ mod tests {
             .expect("runtime");
         let metrics = Arc::new(CacheMetrics::default());
         runtime.block_on(async {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
             let first = {
                 let metrics = Arc::clone(&metrics);
                 tokio::spawn(async move {
                     blocking(
                         &metrics,
-                        Box::new(|| {
-                            std::thread::sleep(Duration::from_millis(300));
+                        Box::new(move || {
+                            started_tx.send(()).expect("the test is waiting");
+                            release_rx.recv().expect("the test releases the call");
                             Ok(1_u8)
                         }),
                     )
                     .await
                 })
             };
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // The first call holds the only pool thread; only now is the second queued.
+            started_rx.await.expect("the first call started");
             let second = {
                 let metrics = Arc::clone(&metrics);
                 tokio::spawn(async move { blocking(&metrics, Box::new(|| Ok(2_u8))).await })
             };
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            assert_eq!(metrics.tier_in_flight.get(), 2, "one running, one queued");
+            // The gauge counts a queued call: it reaches 2 with the first still held.
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while metrics.tier_in_flight.get() != 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("one running and one queued call reach the gauge");
+            assert_eq!(
+                metrics.tier_wait.count(),
+                0,
+                "neither call has run to its end"
+            );
+            // Keep the pool thread for HOLD after the second is queued, then free it.
+            tokio::time::sleep(HOLD).await;
+            release_tx.send(()).expect("the first call is waiting");
             assert!(matches!(first.await.expect("joined"), Ok(1)));
             assert!(matches!(second.await.expect("joined"), Ok(2)));
         });
         assert_eq!(metrics.tier_in_flight.get(), 0);
         assert_eq!(metrics.tier_wait.count(), 2);
         assert_eq!(metrics.tier_call.count(), 2);
-        // The second waited about 200 ms (300 ms less the 100 ms head start); the first
-        // did not wait.
+        // The second waited at least HOLD (the first was held that long after the
+        // second was queued); the first did not wait. A slower runner only adds to it.
         let waited = Duration::from_nanos(metrics.tier_wait.sum());
-        assert!(
-            (Duration::from_millis(150)..Duration::from_millis(280)).contains(&waited),
-            "{waited:?}"
-        );
+        assert!(waited >= HOLD / 2, "{waited:?}");
     }
 }
