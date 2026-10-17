@@ -24,6 +24,8 @@ pub struct Hooked {
     pub map_writes: Mutex<Vec<bool>>,
     /// How many of the next `get`s fail with a store error.
     pub fail_gets: AtomicUsize,
+    /// How many of the next `get`s panic (a store that crashes inside its blocking task).
+    pub panic_gets: AtomicUsize,
 }
 
 impl Hooked {
@@ -36,6 +38,7 @@ impl Hooked {
             conflict_on: Mutex::new(None),
             map_writes: Mutex::new(Vec::new()),
             fail_gets: AtomicUsize::new(0),
+            panic_gets: AtomicUsize::new(0),
         })
     }
 
@@ -132,6 +135,12 @@ impl Store for Hooked {
         {
             return Err(StoreError::Failed("injected".to_owned()));
         }
+        assert!(
+            self.panic_gets
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_err(),
+            "injected panic"
+        );
         let answer = self.fake.get(key)?;
         self.fire(key);
         Ok(answer)

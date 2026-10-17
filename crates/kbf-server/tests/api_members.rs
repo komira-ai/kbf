@@ -1,19 +1,22 @@
 //! `GET /v1/members` over a real listener: the storage members of the current map, read
 //! from the same `Members` the `Membership` service registers into.
 
+#[path = "support/hooked.rs"]
+mod hooked;
 mod support;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hooked::Hooked;
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_map::{MemberId, MemberState};
 use kbf_objstore::MemoryStore;
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL, Registrant};
 use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
 use kbf_state::fake::{Fake, Flaw};
-use kbf_state::{ManualClock, Store};
+use kbf_state::{Cond, ManualClock, Store, Txn};
 use serde_json::{Value, json};
 use support::{HELLO_WAIT, INTERVAL};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -268,4 +271,60 @@ async fn members_is_read_like_nodes_and_takes_no_write() {
     )
     .await;
     assert_eq!(code, 405);
+}
+
+/// A server whose state store is the hooked fake, which the test makes fail.
+fn failing() -> (Arc<Hooked>, Server) {
+    let hooked = Hooked::new();
+    let state = StateStore {
+        store: Arc::clone(&hooked) as Arc<dyn Store>,
+        epoch: EpochPolicy::Keep,
+        members: config(),
+    };
+    (hooked, start(Some(state)))
+}
+
+async fn error_of(api: SocketAddr) -> (u16, String) {
+    let (code, _, body) = http(api, "GET", "/v1/members", "").await;
+    let why = serde_json::from_str::<Value>(&body).expect("JSON")["error"]
+        .as_str()
+        .expect("an error")
+        .to_owned();
+    (code, why)
+}
+
+/// Catches a store that cannot be read answered as an empty farm or as a server bug:
+/// it is `503` (try again), a stored map that does not decode is `500` (the store is
+/// up and its content is wrong), and a store that panics inside the blocking task is
+/// `500` naming the task, not a dropped connection. Each one recovers once the fault
+/// is gone.
+#[tokio::test]
+async fn a_store_that_fails_is_503_and_a_map_that_is_wrong_or_a_panic_is_500() {
+    let (hooked, server) = failing();
+
+    hooked
+        .fail_gets
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let (code, why) = error_of(server.api).await;
+    assert_eq!(code, 503, "{why}");
+    assert!(why.contains("injected"), "{why}");
+    assert_eq!(
+        members(server.api).await,
+        json!({ "generation": 0, "members": [] })
+    );
+
+    hooked
+        .panic_gets
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let (code, why) = error_of(server.api).await;
+    assert_eq!(code, 500, "{why}");
+    assert!(why.contains("membership task"), "{why}");
+
+    hooked
+        .fake
+        .txn(Txn::new().put("map", b"not a map".to_vec(), Cond::Absent))
+        .expect("store")
+        .expect("no conflict");
+    let (code, why) = error_of(server.api).await;
+    assert_eq!(code, 500, "{why}");
 }
