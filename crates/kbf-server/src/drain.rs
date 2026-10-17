@@ -19,6 +19,7 @@ use kbf_front::Closer;
 use serde::Serialize;
 use tokio::sync::{oneshot, watch};
 
+use crate::handover::Stop;
 use crate::health::Readiness;
 
 /// What `GET /v1/frontend/drain` answers, and what a drain reports after it begins.
@@ -44,6 +45,9 @@ pub struct Drain {
     /// first [`Drain::begin`].
     goaway: Mutex<Option<oneshot::Sender<()>>>,
     began: AtomicBool,
+    /// Given by the first [`Drain::begin`]: [`Drain::begun`] completes on it, and the
+    /// listeners registered with [`Drain::begins`] are closed by it.
+    started: Stop,
     closed: watch::Sender<bool>,
 }
 
@@ -61,6 +65,7 @@ impl Drain {
             readiness,
             goaway: Mutex::new(Some(goaway)),
             began: AtomicBool::new(false),
+            started: Stop::new(),
             closed: watch::Sender::new(false),
         };
         (drain, begun)
@@ -78,6 +83,7 @@ impl Drain {
         }
         self.readiness.stop();
         self.closer.drain();
+        self.started.fire();
         // Taken once: the `began` swap above lets one call this far. The listener is gone
         // only if the server already stopped, and the send then has no one to tell.
         let _ = self
@@ -87,6 +93,16 @@ impl Drain {
             .take()
             .map(|goaway| goaway.send(()));
         true
+    }
+
+    /// Completes once the drain has begun (immediately if it has).
+    pub async fn begun(&self) {
+        self.started.fired().await;
+    }
+
+    /// The signal the first [`Drain::begin`] gives, for a listener to be closed by.
+    pub(crate) const fn begins(&self) -> &Stop {
+        &self.started
     }
 
     /// Whether a drain has begun.
@@ -172,6 +188,18 @@ mod tests {
         // The receiver was consumed by the first GOAWAY; a second send would have
         // nowhere to go, and must not panic.
         assert!(!drain.begin());
+    }
+
+    /// Catches a `begun` that completes before the drain begins (a listener stopped on
+    /// it would close while the server is serving) or never completes once it has (a
+    /// listener that keeps accepting after GOAWAY).
+    #[tokio::test(start_paused = true)]
+    async fn begun_completes_when_the_drain_begins() {
+        let (drain, _closing, _readiness, _goaway) = drain();
+        let waiting = tokio::time::timeout(std::time::Duration::from_secs(1), drain.begun());
+        assert!(waiting.await.is_err(), "begun before the drain");
+        drain.begin();
+        drain.begun().await;
     }
 
     /// Catches a `close` that does not announce itself (the shutdown timeout's wait
