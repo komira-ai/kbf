@@ -115,17 +115,36 @@ fn object_refs_name_one_writer_or_are_refused() {
     for id in [
         ObjectId::new(Epoch::new(3), 4),
         ObjectId::of(Writer::Node(NodeWriter::new(n(7), n(2))), 9),
+        ObjectId::of(Writer::Legacy(LegacyWriter::new(n(5), Epoch::new(3))), 9),
     ] {
         assert_eq!(object_id(&object_ref(id)).ok(), Some(id), "{id}");
     }
     let node = object_ref(ObjectId::of(Writer::Node(NodeWriter::new(n(7), n(2))), 9));
     assert_eq!((node.epoch, node.member, node.boot, node.seq), (0, 7, 2, 9));
-    for (epoch, member, boot) in [(3, 7, 2), (0, 7, 0), (0, 0, 2), (3, 0, 2)] {
+    let other = object_ref(ObjectId::of(
+        Writer::Legacy(LegacyWriter::new(n(5), Epoch::new(3))),
+        9,
+    ));
+    assert_eq!(
+        (other.epoch, other.member, other.boot, other.log, other.seq),
+        (3, 0, 0, 5, 9)
+    );
+    for (epoch, member, boot, log) in [
+        (3, 7, 2, 0),
+        (0, 7, 0, 0),
+        (0, 0, 2, 0),
+        (3, 0, 2, 0),
+        (0, 0, 0, 5),
+        (3, 7, 0, 5),
+        (0, 7, 2, 5),
+        (3, 7, 2, 5),
+    ] {
         let bad = ObjectRef {
             epoch,
             seq: 1,
             member,
             boot,
+            log,
         };
         let refused = object_id(&bad).err().map(|s| s.code());
         assert_eq!(refused, Some(Code::InvalidArgument), "{bad:?}");

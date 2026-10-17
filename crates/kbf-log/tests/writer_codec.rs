@@ -138,6 +138,7 @@ fn an_object_id_names_one_writer_or_is_refused() {
         seq: 1,
         member,
         boot,
+        log: 0,
     };
     assert_eq!(
         dec(Format::V4, &mark(id(0, 7, 2))),

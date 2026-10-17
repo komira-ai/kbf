@@ -242,10 +242,14 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     async fn new_tier_id(&self) -> Result<TierId, CacheError> {
         match self.writer.names_as {
             kbf_meta::Writer::Epoch(epoch) => Ok(TierId::new(epoch.get())),
-            kbf_meta::Writer::Node(_) => match self.writer.commit(Command::AllocEpoch).await? {
-                Applied::Epoch(epoch) => Ok(TierId::new(epoch.get())),
-                other => Err(unexpected(&other)),
-            },
+            // A cache never names its objects as another log's epoch; were it to, it has no
+            // epoch of its own, as a node has none.
+            kbf_meta::Writer::Node(_) | kbf_meta::Writer::Legacy(_) => {
+                match self.writer.commit(Command::AllocEpoch).await? {
+                    Applied::Epoch(epoch) => Ok(TierId::new(epoch.get())),
+                    other => Err(unexpected(&other)),
+                }
+            }
         }
     }
 

@@ -172,7 +172,10 @@ fn the_golden_set_names_every_tier_command() {
             | Command::ObjectReachable { .. }
             | Command::Collect => panic!("{name} is a format-1 command"),
             Command::EvictObjects { .. } => panic!("{name} is a format-3 command"),
-            Command::SetWriter(_) => panic!("{name} is a format-4 command"),
+            Command::SetWriter(_)
+            | Command::AdoptSegment { .. }
+            | Command::RebuildProgress { .. }
+            | Command::RebuildDone => panic!("{name} is a format-4 command"),
         };
         seen[i] = true;
     }

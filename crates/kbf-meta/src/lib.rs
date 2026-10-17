@@ -22,6 +22,11 @@
 //! [`Command::SetWriter`] makes current. A command naming an object of an epoch never
 //! allocated or of a node writer never set is refused, and so is a put naming a node
 //! writer that is not the current one ([`ForeignWriter`]).
+//! An object some other writer put (another node, an earlier boot, an epoch of a log
+//! that was lost) enters the index only by [`Command::AdoptSegment`], the step of a
+//! rebuild of the index from the store, which records a segment's records that are not
+//! indexed yet and never replaces one that is; [`Command::RebuildProgress`] and
+//! [`Command::RebuildDone`] keep how far that rebuild is ([`MetaState::rebuild`]).
 //!
 //! It changes only by [`Command`]s, which every replica applies in log order, each with
 //! the log index of its entry ([`MetaState::execute`]); farm time arrives as
@@ -46,12 +51,12 @@ mod state;
 mod tier;
 
 pub use crate::model::{
-    ActionAnswer, ActionRecord, BlobAnswer, Closure, Epoch, FindMissing, Generation, Location,
-    LossMark, Miss, NodeWriter, ObjectId, Retention, Role, StoreId, Touch, UnreachableReason,
-    Writer,
+    ActionAnswer, ActionRecord, BlobAnswer, Closure, Epoch, FindMissing, Generation, LegacyWriter,
+    Location, LossMark, Miss, NodeWriter, ObjectId, Retention, Role, StoreId, Touch,
+    UnreachableReason, Writer,
 };
 pub use crate::state::{
-    ActionWriteError, Applied, BlobWrite, Collected, Command, Evicted, ForeignWriter, MetaState,
-    StaleWriter,
+    ActionWriteError, AdoptRefused, Adopted, Applied, BlobWrite, Collected, Command, Evicted,
+    ForeignWriter, MetaState, Rebuild, StaleWriter,
 };
 pub use crate::tier::{ServerId, StagedObject, StagedPut, StagedState, TierError, TierId};

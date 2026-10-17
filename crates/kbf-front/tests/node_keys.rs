@@ -181,13 +181,30 @@ async fn object_keys_carry_member_and_boot() {
         "kbf/00000000000000aa/cas/0000000000000005/0000000000000003"
     );
     assert_eq!(k.object(&old), Some(epoch));
+    // Another log's epoch writer: named with its log id, and only if it is not the
+    // cache's own log (the `00..aa` above, an epoch writer plain).
+    let other = ObjectId::of(
+        Writer::Legacy(kbf_meta::LegacyWriter::new(
+            NonZeroU64::new(0xbb).expect("not zero"),
+            Epoch::new(5),
+        )),
+        3,
+    );
+    let other_key = k.key(other).expect("key");
+    assert_eq!(
+        other_key.as_str(),
+        "kbf/00000000000000bb/cas/0000000000000005/0000000000000003"
+    );
+    assert_eq!(k.object(&other_key), Some(other));
     for bad in [
         "kbf/cas/0000000000000000/000000000000002b/0000000000000003",
         "kbf/cas/0000000000000007/0000000000000000/0000000000000003",
         "kbf/cas/0000000000000007/000000000000002B/0000000000000003",
         "kbf/cas/7/2b/3",
         "kbf/cas/0000000000000007/000000000000002b",
-        "kbf/00000000000000bb/cas/0000000000000005/0000000000000003",
+        "kbf/00000000000000bb/cas/0000000000000000/0000000000000003",
+        "kbf/00000000000000bb/cas/0000000000000005/00000000000003",
+        "kbf/00000000000000BB/cas/0000000000000005/0000000000000003",
         "other/cas/0000000000000007/000000000000002b/0000000000000003",
     ] {
         assert_eq!(k.object(&ObjectKey::new(bad).expect("key")), None, "{bad}");

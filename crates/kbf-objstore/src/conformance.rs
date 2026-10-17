@@ -517,7 +517,7 @@ async fn footer_reads<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckRes
         page: PageSize::new(2).expect("in range"),
         tail: NonZeroU64::new(FOOTER_TAIL).expect("not zero"),
     };
-    let read: Vec<FooterRead> = footers::read_footers(store, &dir, reads)
+    let read: Vec<FooterRead> = footers::read_footers(store, &dir, None, reads)
         .try_collect()
         .await
         .map_err(|e| format!("reading footers under {dir:?}: {e}"))?;

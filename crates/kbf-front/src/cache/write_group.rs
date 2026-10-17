@@ -262,7 +262,9 @@ enum Answer {
 /// over a metadata log has `legacy` = `<root><log id>/`, so the two never meet: a key
 /// under the log's prefix has 16 hex digits where a node key has `cas`, and one more
 /// number. A cache reads both, so the objects indexed before a node registered stay
-/// readable after.
+/// readable after. An epoch of another log, which only a rebuild of the index names
+/// ([`kbf_meta::LegacyWriter`]), is `<root><log id>/cas/<epoch>/<seq>` for a log id that
+/// is not the cache's own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectKeys {
     /// The prefix of an epoch writer's keys.
@@ -297,11 +299,17 @@ impl ObjectKeys {
                 self.root
                     .key(&format!("cas/{member:016x}/{boot:016x}/{seq:016x}"))?
             }
+            kbf_meta::Writer::Legacy(l) => {
+                let (log, epoch) = (l.log(), l.epoch().get());
+                self.root
+                    .key(&format!("{log:016x}/cas/{epoch:016x}/{seq:016x}"))?
+            }
         })
     }
 
     /// The object `key` names if it is exactly [`ObjectKeys::key`] of some object of
-    /// either kind, else `None`.
+    /// any kind, else `None`. An object under the cache's own log id is an epoch
+    /// writer's, never another log's.
     #[must_use]
     pub fn object(&self, key: &ObjectKey) -> Option<ObjectId> {
         let hex = |s: &str| u64::from_str_radix(s, 16).ok();
@@ -325,7 +333,21 @@ impl ObjectKeys {
                 _ => None,
             })
         };
-        let id = legacy.or_else(node)?;
+        // `<root><log id>/cas/<epoch>/<seq>`, a log id that is not the cache's own (that
+        // one is `legacy`, above, when `legacy` is under `root`).
+        let other_log = || {
+            let name = key.as_str().strip_prefix(self.root.as_str())?;
+            let f: Vec<&str> = name.split('/').collect();
+            let [log, "cas", epoch, seq] = f[..] else {
+                return None;
+            };
+            let writer = kbf_meta::LegacyWriter::new(
+                std::num::NonZeroU64::new(hex(log)?)?,
+                kbf_meta::Epoch::new(std::num::NonZeroU64::new(hex(epoch)?)?.get()),
+            );
+            Some(ObjectId::of(kbf_meta::Writer::Legacy(writer), hex(seq)?))
+        };
+        let id = legacy.or_else(node).or_else(other_log)?;
         // Only the canonical spelling: 16 lowercase digits each.
         (self.key(id).ok()? == *key).then_some(id)
     }
