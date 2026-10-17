@@ -502,7 +502,6 @@ mod tests {
             ttl: Duration::from_secs(9),
             dwell: Duration::from_secs(40),
             replication: 2,
-            bootstrap: Duration::from_secs(5),
         };
         let state = crate::StateStore {
             store: Arc::new(Fake::with_flaw(

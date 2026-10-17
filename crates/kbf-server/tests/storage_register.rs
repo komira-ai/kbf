@@ -18,7 +18,9 @@ use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_server::join::{Identity as NodeIdentity, Joiner};
 use kbf_server::members::{Members, MembershipConfig};
 use kbf_server::storage_node::{StorageFlags, command, parse, start_storage};
-use kbf_server::{EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_state};
+use kbf_server::{
+    EpochPolicy, Listeners, StateStore, TlsSource, WorkerTls, bind_server_with_state,
+};
 use kbf_state::{Store, Versioned};
 use kbf_storage::Storage as _;
 use kbf_storage::service::{CatchUp, ROLE_URI_PREFIX, RemoteStorage};
@@ -27,7 +29,7 @@ use rcgen::{
     KeyPair, KeyUsagePurpose, SanType,
 };
 use tonic::Code;
-use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig};
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 const MS: Duration = Duration::from_millis(1);
 
@@ -64,7 +66,6 @@ fn config() -> MembershipConfig {
         ttl: 60 * MS,
         dwell: Duration::from_secs(1),
         replication: 2,
-        bootstrap: Duration::ZERO,
     }
 }
 
@@ -157,7 +158,7 @@ fn state(f: &Frontend, id: u64) -> Option<MemberState> {
 
 /// Catches: a node that registers but does not keep its row alive, a frontend that never
 /// expires a node that stops, and a registration that tells the frontend something other
-/// than what the node is. The node registers on start (its bound address, Joining); the
+/// than what the node is. The node registers on start (its bound address, Active); the
 /// store's clock then moves 45 ms (TTL 60 ms) after each beat it sees, six times, which is
 /// four TTLs and which the row survives only because the node beats; when the node stops,
 /// 61 ms are enough for the frontend's own timer to mark it Down.
@@ -176,7 +177,7 @@ async fn a_storage_node_registers_and_heartbeats_across_several_ttls() {
     let me = map.member(MemberId(1)).expect("the node is in the map");
     assert_eq!(
         (me.addr.clone(), me.state),
-        (addr.to_string(), MemberState::Joining)
+        (addr.to_string(), MemberState::Active)
     );
     for round in 1..=6 {
         f.store.clock.advance(45 * MS);
@@ -184,7 +185,7 @@ async fn a_storage_node_registers_and_heartbeats_across_several_ttls() {
             row(&f, 1).filter(|r| r.version != seen).map(|r| r.version)
         })
         .await;
-        assert_eq!(state(&f, 1), Some(MemberState::Joining), "round {round}");
+        assert_eq!(state(&f, 1), Some(MemberState::Active), "round {round}");
     }
 
     serving.abort();
@@ -198,7 +199,7 @@ async fn a_storage_node_registers_and_heartbeats_across_several_ttls() {
 /// Catches: a node that treats a lapsed row as fatal or never notices. After its row
 /// expires (the manual clock moves past the TTL right after a beat, and the frontend
 /// marks it Down) its next heartbeat is NOT_FOUND; it registers again, keeps its member
-/// id, gets boot 2 and is Joining.
+/// id, gets boot 2 and is Active.
 #[tokio::test]
 async fn a_node_whose_row_lapsed_registers_again() {
     let f = frontend(None);
@@ -218,7 +219,7 @@ async fn a_node_whose_row_lapsed_registers_again() {
             .ok()
     })
     .await;
-    assert_eq!(state(&f, 1), Some(MemberState::Joining));
+    assert_eq!(state(&f, 1), Some(MemberState::Active));
     assert_eq!(f.store.fake.scan_prefix("member/").expect("scan").len(), 1);
 }
 
@@ -258,7 +259,7 @@ async fn a_node_retries_through_failures_and_keeps_its_boot() {
         row(&f, 1).filter(|r| r.version != first)
     })
     .await;
-    assert_eq!(state(&f, 1), Some(MemberState::Joining));
+    assert_eq!(state(&f, 1), Some(MemberState::Active));
     assert_eq!(
         f.store.fake.scan_prefix("member/").expect("scan").len(),
         1,
@@ -273,7 +274,7 @@ async fn a_node_retries_through_failures_and_keeps_its_boot() {
 /// service and is CatchingUp; a heartbeat while it still rebuilds leaves it so and bumps
 /// no generation; after [`CatchUp::finish`] the next heartbeat makes it Active in a new
 /// generation, which is the one the heartbeat answers. Mutants: `catching_up` not sent
-/// (Joining); the promotion on every beat (Active while rebuilding); no promotion.
+/// (Active); the promotion on every beat (Active while rebuilding); no promotion.
 #[tokio::test]
 async fn a_rebuilding_node_registers_catching_up_and_is_promoted_on_its_report() {
     let f = frontend(None);
@@ -427,9 +428,13 @@ async fn over_mutual_tls_only_the_storage_role_registers() {
     let pki = Pki::new();
     let (frontend_cert, frontend_key) = pki.cert("frontend");
     let worker_tls = WorkerTls {
-        server: ServerTlsConfig::new()
-            .identity(Identity::from_pem(frontend_cert, frontend_key))
-            .client_ca_root(Certificate::from_pem(pki.ca.pem())),
+        server: TlsSource::fixed(
+            "worker",
+            frontend_cert.as_bytes(),
+            frontend_key.as_bytes(),
+            Some(pki.ca.pem().as_bytes()),
+        )
+        .expect("the worker listener's TLS"),
         deny_list: None,
     };
     let f = frontend(Some(worker_tls));
@@ -809,4 +814,94 @@ async fn joined_by(map: pb::Map) -> Arc<kbf_mapsync::MapHolder> {
     let joined = joiner.register().await.expect("registers");
     assert_eq!(joiner.beat(&joined).await.expect("beats"), 9);
     maps
+}
+
+/// A membership service whose first two heartbeats fail UNAVAILABLE, then answers; it
+/// counts the registrations and the heartbeats it saw.
+#[derive(Default)]
+struct Flaky {
+    registers: std::sync::atomic::AtomicUsize,
+    beats: std::sync::atomic::AtomicUsize,
+}
+
+/// [`Flaky`], shared with the test that counts.
+struct FlakyService(Arc<Flaky>);
+
+impl std::ops::Deref for FlakyService {
+    type Target = Flaky;
+    fn deref(&self) -> &Flaky {
+        &self.0
+    }
+}
+
+#[tonic::async_trait]
+impl kbf_proto::kbf::map::v1::membership_server::Membership for FlakyService {
+    async fn register(
+        &self,
+        _: tonic::Request<pb::RegisterRequest>,
+    ) -> Result<tonic::Response<pb::RegisterResponse>, tonic::Status> {
+        self.registers
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(tonic::Response::new(pb::RegisterResponse {
+            member_id: 1,
+            boot: 1,
+            heartbeat_interval_ms: 1,
+            map: None,
+        }))
+    }
+
+    async fn heartbeat(
+        &self,
+        _: tonic::Request<pb::HeartbeatRequest>,
+    ) -> Result<tonic::Response<pb::HeartbeatResponse>, tonic::Status> {
+        let seen = self.beats.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if seen < 2 {
+            return Err(tonic::Status::unavailable("injected"));
+        }
+        Ok(tonic::Response::new(pb::HeartbeatResponse {
+            map_generation: 1,
+            map: None,
+        }))
+    }
+}
+
+/// Catches: a node that re-registers, or stops, when a heartbeat fails with anything but
+/// NOT_FOUND. The frontend fails the first two heartbeats UNAVAILABLE; the node waits and
+/// beats again (a third and fourth beat arrive) and registered exactly once. A mutant
+/// that registers again on any failed beat makes the registrations more than one.
+#[tokio::test]
+async fn a_failed_heartbeat_is_retried_without_registering_again() {
+    let flaky = Arc::new(Flaky::default());
+    let incoming =
+        tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = incoming.local_addr().expect("address");
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(
+                kbf_proto::kbf::map::v1::membership_server::MembershipServer::new(FlakyService(
+                    Arc::clone(&flaky),
+                )),
+            )
+            .serve_with_incoming(incoming),
+    );
+    let channel = Endpoint::from_shared(format!("http://{addr}"))
+        .expect("endpoint")
+        .connect_lazy();
+    let who = NodeIdentity {
+        instance_id: "n".to_owned(),
+        addr: "192.0.2.5:1".to_owned(),
+        zone: String::new(),
+        weight: 1,
+    };
+    let joiner = tokio::spawn(Joiner::new(channel, who, MS).run());
+    until("two failed beats and then two good ones", || {
+        (flaky.beats.load(std::sync::atomic::Ordering::SeqCst) >= 4).then_some(())
+    })
+    .await;
+    joiner.abort();
+    assert_eq!(
+        flaky.registers.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "registered once"
+    );
 }

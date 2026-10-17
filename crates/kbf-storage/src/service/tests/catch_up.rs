@@ -102,7 +102,7 @@ async fn a_closure_write_during_catch_up_is_retryable() {
     assert!(unavailable(&prepared), "Prepare: {prepared:?}");
 
     let missing = sha(b"a closure blob");
-    *mem.fail.lock().expect("lock") = Some(ActionWriteError::Absent(missing).into());
+    *mem.fail.lock().expect("lock") = Some(ActionWriteError::Absent(vec![missing]).into());
     let record = ActionRecord {
         result: sha(b"result"),
         closure: [missing].into_iter().collect(),
