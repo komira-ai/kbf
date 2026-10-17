@@ -500,6 +500,23 @@ async fn an_answer_that_cannot_be_validated_installs_nothing_and_leaves_the_toke
     }
 }
 
+#[tokio::test]
+async fn a_certificate_for_a_role_nobody_asked_for_is_refused_not_ignored() {
+    // Catches: an answer carrying more than was requested being accepted because every
+    // requested role happens to be present.
+    let h = harness("extra-role", "", 1);
+    h.running.fake.spoil(Some(Spoil::ExtraCert));
+    let err = h
+        .enroll(RoleSet::new([Role::Storage]).expect("roles"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EnrollError::Answer(AnswerError::RoleSet)),
+        "{err:?}"
+    );
+    h.assert_nothing_installed();
+}
+
 fn cert_fault(error: &AnswerError, want: CertFault) -> bool {
     matches!(error, AnswerError::Cert { role: Role::Storage, fault } if *fault == want)
 }
