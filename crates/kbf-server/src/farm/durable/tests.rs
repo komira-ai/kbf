@@ -849,7 +849,7 @@ fn a_fate_that_cannot_be_written_or_read_is_refused() {
     assert_eq!(fate::decode(&row), Err("a worker name is not text"));
 
     let mut huge = a_fate();
-    huge.memory_runs[0].worker = WorkerId::new(&"n".repeat(usize::from(u16::MAX) + 1));
+    huge.memory_runs[0].worker = WorkerId::new("n".repeat(usize::from(u16::MAX) + 1));
     assert_eq!(fate::encode(&huge), None);
 
     let store = Flaky::new();
