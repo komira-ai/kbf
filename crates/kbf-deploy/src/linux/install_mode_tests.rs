@@ -444,11 +444,72 @@ fn the_frontend_unit_is_installed_with_its_state_directory() {
             "mkdir /var/lib/kbf-server (0755)".to_owned(),
             format!("mkdir /var/lib/kbf-server/state (0700, owner {uid}:{gid})"),
             "run /usr/bin/systemctl daemon-reload".to_owned(),
-            "run /usr/bin/systemctl enable kbf-frontend.service".to_owned(),
-            "run /usr/bin/systemctl restart kbf-frontend.service".to_owned(),
+            "run /usr/bin/systemctl enable kbf-frontend@.service".to_owned(),
+            "run /usr/bin/systemctl start kbf-frontend@a.service".to_owned(),
             "wait up to 60s for http://127.0.0.1:8982/readyz".to_owned(),
         ]
     );
+}
+
+/// The frontend's unit is a template with two instances, and a serving one is never
+/// restarted: a restart drains it and every new build is refused until the next start.
+/// Catches an update that restarts (or stops) the serving instance instead of leaving the
+/// handover to `kbf frontend handover`, an install that starts the second instance beside
+/// the first (two frontends would ask each other for the listeners), a template enabled
+/// under a name systemd refuses, and a host with neither instance up left without one.
+#[test]
+fn a_serving_frontend_instance_is_not_restarted_by_an_update() {
+    let (mut exec, world) = host("install-mode-frontend-serving");
+    let a = install(Mode::Frontend, None);
+    go(&mut exec, &a, PlanMode::Apply);
+    assert!(
+        exec.at("/etc/systemd/system/kbf-frontend@.service")
+            .exists(),
+        "the template is written under its own name"
+    );
+    assert!(world.borrow().active.contains("kbf-frontend@a.service"));
+    assert!(!world.borrow().active.contains("kbf-frontend@b.service"));
+
+    // The second instance serves; the unit file differs from the host's.
+    {
+        let mut w = world.borrow_mut();
+        w.active.clear();
+        w.active.insert("kbf-frontend@b.service".to_owned());
+        w.enabled.insert("kbf-frontend@a.service".to_owned());
+    }
+    write(
+        &exec,
+        "/etc/systemd/system/kbf-frontend@.service",
+        "[Service]\n",
+        0o644,
+    );
+    let (p, out) = plan_here(&exec, &a).expect("plan");
+    let got = steps(&p);
+    assert!(
+        got.contains(&"run /usr/bin/systemctl daemon-reload".to_owned())
+            && got.contains(&"run /usr/bin/systemctl enable kbf-frontend@.service".to_owned()),
+        "{got:?}"
+    );
+    assert!(
+        !got.iter()
+            .any(|s| s.contains("restart") || s.contains(" start ") || s.contains("stop")),
+        "{got:?}"
+    );
+    assert!(
+        !got.iter().any(|s| s.starts_with("wait")),
+        "nothing was started, so there is no /readyz to wait for: {got:?}"
+    );
+    assert!(
+        out.contains(
+            "kbf-frontend@b.service is serving and is not restarted: run `kbf frontend handover`"
+        ),
+        "{out}"
+    );
+
+    // Unchanged, enabled, and one instance up: nothing at all.
+    go(&mut exec, &a, PlanMode::Apply);
+    let (p, _) = plan_here(&exec, &a).expect("plan");
+    assert_eq!(steps(&p), Vec::<String>::new());
 }
 
 /// The operator token of the frontend and the all-in-one: the host check reads the file

@@ -155,7 +155,9 @@ impl Membership for MembershipService {
     }
 }
 
-/// Expires members on the store's clock: every beat, [`Members::refresh`]. Never
+/// Expires members on the store's clock: every beat, [`Members::refresh`], then frees
+/// every expired row of the store ([`Members::reap`]: the farm's session and result rows
+/// as well). Never
 /// completes; a failure is logged and tried again at the next beat.
 pub async fn sweep(members: Arc<Members>) {
     let mut tick = tokio::time::interval(members.config().beat());
@@ -165,6 +167,10 @@ pub async fn sweep(members: Arc<Members>) {
         let refreshing = Arc::clone(&members);
         if let Err(e) = blocking(move || refreshing.refresh()).await {
             tracing::warn!("membership refresh: {}", e.message());
+        }
+        let reaping = Arc::clone(&members);
+        if let Err(e) = blocking(move || reaping.reap()).await {
+            tracing::warn!("state store reap: {}", e.message());
         }
     }
 }

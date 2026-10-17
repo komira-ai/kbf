@@ -24,6 +24,8 @@ pub struct Hooked {
     pub map_writes: Mutex<Vec<bool>>,
     /// How many of the next `get`s fail with a store error.
     pub fail_gets: AtomicUsize,
+    /// How many of the next `reap_expired` calls fail with a store error.
+    pub fail_reaps: AtomicUsize,
 }
 
 impl Hooked {
@@ -36,6 +38,7 @@ impl Hooked {
             conflict_on: Mutex::new(None),
             map_writes: Mutex::new(Vec::new()),
             fail_gets: AtomicUsize::new(0),
+            fail_reaps: AtomicUsize::new(0),
         })
     }
 
@@ -154,6 +157,13 @@ impl Store for Hooked {
     }
 
     fn reap_expired(&self) -> Result<usize, StoreError> {
+        if self
+            .fail_reaps
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(StoreError::Failed("injected".to_owned()));
+        }
         self.fake.reap_expired()
     }
 

@@ -480,12 +480,15 @@ mod tests {
                     .await
                 })
             };
-            // The first call holds the only pool thread; only now is the second queued.
+            // The first call holds the only pool thread; only now may the second be queued.
             started_rx.await.expect("the first call started");
             let startup = began.elapsed();
+            let go = Arc::new(tokio::sync::Notify::new());
             let second = {
                 let metrics = Arc::clone(&metrics);
+                let go = Arc::clone(&go);
                 tokio::spawn(async move {
+                    go.notified().await;
                     blocking(
                         &metrics,
                         Box::new(move || {
@@ -499,9 +502,15 @@ mod tests {
                 })
             };
             // The gauge counts a queued call: it reaches 2 with the first still held.
-            // The 60 s is a hang guard only: a regression fails here instead of hanging.
+            // The second is released from inside the wait, so the first look at the
+            // gauge always sees 1 (the first call raised it before it signalled, and
+            // nothing lowers it until the test releases that call): the loop body and
+            // both outcomes of its test run on every execution, whatever the
+            // scheduling. The 60 s is a hang guard only: a regression fails here
+            // instead of hanging.
             tokio::time::timeout(Duration::from_secs(60), async {
                 while metrics.tier_in_flight.get() != 2 {
+                    go.notify_one();
                     tokio::task::yield_now().await;
                 }
             })
