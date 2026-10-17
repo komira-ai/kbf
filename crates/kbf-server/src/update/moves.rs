@@ -81,3 +81,37 @@ pub(super) fn split(commands: &[Command], leaves: bool) -> (Vec<Command>, Vec<Co
 pub(super) fn acts_on_the_farm(command: &Command) -> bool {
     !matches!(command, Command::CasSlot(_) | Command::Alert(_))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use crate::update::facts::{Generation, OrderId, Release};
+    use crate::update::slot::Slot;
+
+    /// Catches: a step taken for a host the facts do not show, whether by a panic on a missing
+    /// host or by stepping an invented one. The controller only asks about hosts it found in
+    /// the facts, so no tick reaches this answer: it is checked here, where `decide` can be
+    /// called with a host the controller would never pass.
+    #[test]
+    fn a_host_the_facts_do_not_show_is_refused_by_name() {
+        let facts = Facts {
+            target: Release::new("v2"),
+            generation: Generation(1),
+            next_order: OrderId::new(1, 1),
+            hosts: Vec::new(),
+            members: Vec::new(),
+            slot: Slot::default(),
+            queued_classes: Some(BTreeSet::new()),
+            wait_since: FarmTime::from_millis(0),
+        };
+        let ghost = WorkerId::new("ghost");
+        let now = FarmTime::from_millis(5);
+        let error = decide(&facts, &ghost, &Policy::default(), now).unwrap_err();
+        assert!(
+            matches!(&error, ControllerError::Invariant(why) if why.contains("ghost")),
+            "{error}"
+        );
+    }
+}

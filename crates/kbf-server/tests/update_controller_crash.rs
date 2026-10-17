@@ -212,9 +212,14 @@ impl Transport for FusedTransport {
         self.inner.activate(host, order, release)
     }
 
-    fn confirm(&mut self, host: &WorkerId, order: OrderId) -> Result<(), TransportError> {
+    fn confirm(
+        &mut self,
+        host: &WorkerId,
+        order: OrderId,
+        release: &Release,
+    ) -> Result<(), TransportError> {
         self.go("confirm", host)?;
-        self.inner.confirm(host, order)
+        self.inner.confirm(host, order, release)
     }
 
     fn alert(&mut self, host: &WorkerId, alert: &Alert) -> Result<(), TransportError> {
@@ -359,10 +364,8 @@ fn run_killed_at(backing: Backing, scenario: Scenario, kill: Option<u64>) -> Out
             every.insert(order),
             "{label}: {order:?} was given to two hosts"
         );
-        let confirmed = w
-            .given_to(&host.name)
-            .iter()
-            .any(|g| **g == Gave::Confirm(order));
+        let confirm = Gave::Confirm(order, to.to_owned());
+        let confirmed = w.given_to(&host.name).iter().any(|g| **g == confirm);
         assert!(confirmed, "{label}: the confirm of {} was lost", host.name);
         assert_eq!(
             row_of(&rig.rows, &host.name).record.order,

@@ -3,8 +3,8 @@
 //!
 //! | key | value | written by |
 //! |---|---|---|
-//! | `update/desired` | `{generation, commit, set_at}`, and whether the run is paused ([`Desired`]) | an offer, a pause |
-//! | `update/policy` | the eight settings, and the node step's limits when they are not the default ([`Policy`]) | the operator |
+//! | `update/desired` | `{generation, commit, set_at}` ([`Desired`]) | an offer |
+//! | `update/policy` | the nine settings (the pause among them), and the node step's limits when they are not the default ([`Policy`]) | the operator, the pause button |
 //! | `update/slot` | the places in use, `{host, order_id, epoch}` each ([`Slot`]): one storage, up to `max_hosts_out` others | the controller |
 //! | `update/host/<id>` | `{phase, order_id, generation, since, boot_before}`, and the run's commit ([`HostRow`]) | the controller |
 //!
@@ -15,7 +15,7 @@
 //! compare-and-set on the version read, so a controller that was overtaken (another one
 //! moved the row) gets a [`RowError::Conflict`] and re-reads; the controller writes over no
 //! row it did not read. The one write that is not conditional is the operator's:
-//! [`Rows::set_policy`] replaces the policy whole.
+//! [`Rows::set_policy`] replaces the policy whole, the pause with it.
 //!
 //! The rows are plain key-value rows of the state store, so they work on every backend and
 //! need no table of their own; `kbf-state` is unchanged.
@@ -156,12 +156,12 @@ impl Rows {
         }
     }
 
-    /// Sets the desired release to `commit`, under a higher generation, with the run not
-    /// paused unless it was. A rollback is the older commit offered the same way (section
-    /// 2.11). Setting the commit that is already desired changes nothing and keeps the
-    /// generation (`pull-updates.md` section 5), so a repeated click is not a new run. The
-    /// generation is drawn from the counter `update/generation`; it is never below the
-    /// current run's plus one, whatever the counter says.
+    /// Sets the desired release to `commit`, under a higher generation. A rollback is the
+    /// older commit offered the same way (section 2.11). Setting the commit that is already
+    /// desired changes nothing and keeps the generation (`pull-updates.md` section 5), so a
+    /// repeated click is not a new run. The generation is drawn from the counter
+    /// `update/generation`; it is never below the current run's plus one, whatever the
+    /// counter says. The pause is in `update/policy` and an offer does not touch it.
     ///
     /// A host that has done nothing irreversible is given back when the generation moves
     /// (see [`super::Controller`]); a host past the activate order finishes its step.
@@ -211,7 +211,6 @@ impl Rows {
                 generation: Generation(counter.max(above)),
                 commit: commit.clone(),
                 set_at: now,
-                paused: current.value.as_ref().is_some_and(|d| d.paused),
             };
             let txn = Txn::new().put(DESIRED, encode_desired(&next), current.cond());
             if self.store.txn(txn)?.is_ok() {
@@ -221,27 +220,27 @@ impl Rows {
         Err(RowError::Contended(DESIRED))
     }
 
-    /// Pauses or resumes the run: while paused no host is started and hosts in a step
-    /// finish. Returns whether there is a run to pause.
+    /// Pauses or resumes: while `update/policy.paused` is set no host is started and hosts in
+    /// a step finish. The rest of the policy stays as it was; the row is written by
+    /// compare-and-set on the version read, so a policy written in between is not lost.
+    /// A pause needs no run: it holds the next one that is offered.
     ///
     /// # Errors
-    /// [`RowError`]: the store failed or the row cannot be read.
-    pub fn set_paused(&self, paused: bool) -> Result<bool, RowError> {
+    /// [`RowError`]: the store failed, the row cannot be read, or writers kept racing.
+    pub fn set_paused(&self, paused: bool) -> Result<(), RowError> {
         for _ in 0..ATTEMPTS {
-            let current = self.desired()?;
-            let Some(desired) = &current.value else {
-                return Ok(false);
-            };
-            let next = Desired {
+            let current = self.policy_row()?;
+            let cond = current.cond();
+            let next = Policy {
                 paused,
-                ..desired.clone()
+                ..current.value
             };
-            let txn = Txn::new().put(DESIRED, encode_desired(&next), current.cond());
+            let txn = Txn::new().put(POLICY, encode_policy(&next), cond);
             if self.store.txn(txn)?.is_ok() {
-                return Ok(true);
+                return Ok(());
             }
         }
-        Err(RowError::Contended(DESIRED))
+        Err(RowError::Contended(POLICY))
     }
 
     /// The policy row, if the operator ever wrote one.
@@ -260,14 +259,26 @@ impl Rows {
     /// # Errors
     /// [`RowError`]: the store failed or the row cannot be read.
     pub fn policy(&self) -> Result<Policy, RowError> {
+        Ok(self.policy_row()?.value)
+    }
+
+    fn policy_row(&self) -> Result<Stored<Policy>, RowError> {
         match self.store.get(POLICY)? {
-            None => Ok(Policy::default()),
-            Some(row) => read(POLICY, &row, decode_policy),
+            None => Ok(Stored {
+                value: Policy::default(),
+                version: None,
+            }),
+            Some(row) => Ok(Stored {
+                value: read(POLICY, &row, decode_policy)?,
+                version: Some(row.version),
+            }),
         }
     }
 
     /// Writes the policy, after checking it can be kept. The row is replaced whole, whatever
-    /// it held: the policy has one writer, the operator, and the controller only reads it.
+    /// it held, the pause included: the policy is the operator's to state, and the one other
+    /// writer, [`Rows::set_paused`], changes only `paused`, by compare-and-set. The controller
+    /// only reads it.
     ///
     /// # Errors
     /// [`RowError::Policy`] for a policy that cannot be kept; otherwise the store's.
@@ -432,9 +443,11 @@ impl Rows {
         for _ in 0..ATTEMPTS {
             let current = self.slot()?;
             let mut slot = current.value.clone();
-            if !slot.holder(host).is_some_and(&wanted) || !slot.release(host) {
+            if !slot.holder(host).is_some_and(&wanted) {
                 return Ok(slot);
             }
+            // The host holds a place (the test above), so this frees it and the slot changes.
+            slot.release(host);
             match self.put_slot(&current, &slot) {
                 Ok(()) => return Ok(slot),
                 Err(RowError::Conflict(_)) => {}

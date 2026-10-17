@@ -46,6 +46,16 @@ fn activates(w: &Inner, host: &str) -> Vec<(OrderId, String)> {
         .collect()
 }
 
+fn confirms(w: &Inner, host: &str) -> Vec<(OrderId, String)> {
+    w.given_to(host)
+        .into_iter()
+        .filter_map(|g| match g {
+            Gave::Confirm(order, release) => Some((*order, release.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
 fn position(w: &Inner, host: &str, wanted: &Gave) -> Option<usize> {
     w.given_to(host).iter().position(|g| *g == wanted)
 }
@@ -77,15 +87,10 @@ fn a_run_and_its_rollback_give_every_host_its_orders_once_in_order() {
                 let at =
                     |g: &Gave| position(&w, host, g).unwrap_or_else(|| panic!("{host}: {g:?}"));
                 let activate = at(&Gave::Activate(order, NEW.to_owned()));
+                let confirm = at(&Gave::Confirm(order, NEW.to_owned()));
                 assert!(at(&Gave::Cordon) < activate, "{host}: cordoned first");
-                assert!(
-                    activate < at(&Gave::Confirm(order)),
-                    "{host}: confirmed after"
-                );
-                assert!(
-                    at(&Gave::Confirm(order)) < at(&Gave::Uncordon),
-                    "{host}: uncordon last"
-                );
+                assert!(activate < confirm, "{host}: confirmed after");
+                assert!(confirm < at(&Gave::Uncordon), "{host}: uncordon last");
                 let marked = position(&w, host, &Gave::MarkDown);
                 assert_eq!(
                     marked.is_some(),
@@ -126,6 +131,11 @@ fn a_run_and_its_rollback_give_every_host_its_orders_once_in_order() {
                 acts[1].0 > before,
                 "{host}: the rollback's order is above the first"
             );
+            assert_eq!(
+                confirms(&w, host),
+                [(acts[0].0, NEW.to_owned()), (acts[1].0, OLD.to_owned())],
+                "{host}: a confirm names its activation's order and the release it flipped to"
+            );
             assert_eq!(row_of(&rig.rows, host).record.generation, back, "{host}");
         }
         assert_eq!(w.repeats, 0);
@@ -151,12 +161,12 @@ fn the_row_is_written_before_the_order_it_calls_for() {
                 Gave::Cordon => Some(HostPhase::Cordoned),
                 Gave::MarkDown => Some(HostPhase::PlannedDown),
                 Gave::Activate(..) => Some(HostPhase::Activating),
-                Gave::Confirm(_) => Some(HostPhase::Confirming),
+                Gave::Confirm(..) => Some(HostPhase::Confirming),
                 Gave::Uncordon => Some(HostPhase::RejoiningWork),
                 Gave::Undown => None,
             };
             assert_eq!(Some(&s.phase), want.as_ref(), "{}: {s:?}", s.host);
-            if let Gave::Activate(order, _) | Gave::Confirm(order) = &s.gave {
+            if let Gave::Activate(order, _) | Gave::Confirm(order, _) = &s.gave {
                 assert_eq!(
                     s.order, *order,
                     "{s:?}: the row names the order the helper gets"
@@ -362,15 +372,16 @@ fn nothing_is_done_without_a_run_or_when_every_host_is_at_the_target() {
 
 // Pause.
 
-/// Catches: a pause that is ignored, or one that stops hosts in a step. While the run is
-/// paused no new host is started, hosts in a step go on to `Done`, and a resume carries the
-/// run on to the end.
+/// Catches: a pause that is ignored, or one that stops hosts in a step. While `update/policy`
+/// says paused no new host is started, hosts in a step go on to `Done`, and a resume carries
+/// the run on to the end. (That a pause leaves the rest of the policy as it was is
+/// `update_rows.rs`'s.)
 #[test]
 fn a_paused_run_starts_no_host_and_lets_the_hosts_in_a_step_finish() {
     let mut rig = Rig::new(Backing::Fake, "pause", &spec(2, 3, 0), Policy::default());
     rig.offer(NEW);
     rig.until("a host in a step", 100, |r| counts(r) != (0, 0));
-    assert!(rig.rows.set_paused(true).unwrap());
+    rig.rows.set_paused(true).unwrap();
     let in_step: Vec<String> = rig
         .rows
         .hosts()
@@ -402,7 +413,7 @@ fn a_paused_run_starts_no_host_and_lets_the_hosts_in_a_step_finish() {
         );
     }
     assert!(rig.rows.slot().unwrap().value.is_empty());
-    assert!(rig.rows.set_paused(false).unwrap());
+    rig.rows.set_paused(false).unwrap();
     rig.finish(NEW);
 }
 
@@ -467,6 +478,12 @@ fn a_host_finishes_the_offer_that_began_it_and_is_then_walked_back() {
         [NEW, OLD]
     );
     assert!(acts[1].0 > acts[0].0);
+    // The forward confirm is given while the offer is already `OLD`: it names the release
+    // its own activation flipped to (the row's commit), not the latest offer's.
+    assert_eq!(
+        confirms(&w, "s1"),
+        [(acts[0].0, NEW.to_owned()), (acts[1].0, OLD.to_owned())]
+    );
     assert_eq!(w.host("s1").reported, Release::new(OLD));
     assert!(activates(&w, "s2").is_empty(), "s2 already runs the target");
     assert!(forward < back);
@@ -893,8 +910,13 @@ impl Transport for Flaky {
         self.inner.activate(host, order, release)
     }
 
-    fn confirm(&mut self, host: &WorkerId, order: OrderId) -> Result<(), TransportError> {
-        self.inner.confirm(host, order)
+    fn confirm(
+        &mut self,
+        host: &WorkerId,
+        order: OrderId,
+        release: &Release,
+    ) -> Result<(), TransportError> {
+        self.inner.confirm(host, order, release)
     }
 
     fn alert(&mut self, host: &WorkerId, alert: &Alert) -> Result<(), TransportError> {
