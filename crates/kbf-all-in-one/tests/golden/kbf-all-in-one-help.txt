@@ -397,41 +397,31 @@ Options:
           
           [default: 64]
 
-      --memory-headroom-mib <MEMORY_HEADROOM_MIB>
-          ...plus this many MiB (native). A lease that booked nothing has no limit
-          
-          [default: 512]
-
-      --memory-poll-ms <MEMORY_POLL_MS>
-          How often a lease's memory is measured, in milliseconds (native)
-          
-          [default: 250]
-
-      --member-ttl-secs <SECONDS>
-          How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
-          
-          [default: 15]
-
       --xcode-apps <XCODE_APPS>
           The directory searched for `Xcode*.app` (native). Each Xcode whose own `xcodebuild` answers `-version`, `-license check` and `-checkFirstLaunchStatus`, and for which `xcrun --find clang` does (each within a minute, under the actions' sandbox), is ready: it is reported as an `xcode` entry, and an action that names its build runs with it as `DEVELOPER_DIR`. One that is not is listed in the node's status with why and the command that fixes it, and logged at WARN. The daemon says Hello without waiting for its first survey, which runs in the background: until it ends, each Xcode is listed as not surveyed yet and none is reported
           
           [default: /Applications]
-
-      --member-dwell-secs <SECONDS>
-          How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners
-          
-          [default: 300]
 
       --xcode-recheck-secs <XCODE_RECHECK_SECS>
           How often, in seconds, the Xcodes are asked again (native), so one fixed while the daemon runs becomes ready without a restart
           
           [default: 180]
 
+      --member-ttl-secs <SECONDS>
+          How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
+          
+          [default: 15]
+
       --require-metal-toolchain
           This node's actions use Metal (native): an Xcode whose Metal toolchain is not installed (`xcodebuild -showComponent MetalToolchain`) is not ready
 
       --image <IMAGE>
           A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon checks each is in its user's image store, as the prepare step of every lease does, and exits with status 2 if one is not, or names an image index, saying the fix (`podman pull <repo>@sha256:<d>`). The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
+
+      --member-dwell-secs <SECONDS>
+          How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners
+          
+          [default: 300]
 
       --container-runtime <podman|oci>
           The runtime that runs each action's container (container): `podman`, the default, runs `podman create` and `podman start` per action; `oci` runs each action in a fresh rootless sandbox through `--oci-runtime` directly, with no Podman on the action path (Podman only pulls and exports an image once per digest). `oci` needs the daemon user's subordinate ids in one range, `uidmap`, and every directory down to `--data-dir` searchable by others
