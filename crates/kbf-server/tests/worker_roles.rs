@@ -381,7 +381,6 @@ fn frontend(worker_tls: Option<WorkerTls>) -> SocketAddr {
             ttl: Duration::from_secs(60),
             dwell: Duration::from_secs(60),
             replication: 2,
-            bootstrap: Duration::ZERO,
         },
     };
     let bound = bind_server_with_state(
