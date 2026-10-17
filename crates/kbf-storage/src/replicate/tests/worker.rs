@@ -15,8 +15,8 @@ use super::degrade::a_build_with_a_killed_owner;
 use super::farm::Farm;
 use crate::repair::{Options, Pass, RepairConfig, RepairWorker, Repairs};
 use crate::replicate::{Chain, ChainConfig, MapSource, Peers};
-use crate::service::tests::fake::{Held, StreamFault, sha};
-use crate::{Storage, StorageError};
+use crate::service::tests::fake::{Held, Mem, StreamFault, sha};
+use crate::{Answer, ReadStream, Storage, StorageError};
 
 fn config() -> RepairConfig {
     RepairConfig {
@@ -580,6 +580,147 @@ async fn a_debt_is_not_settled_while_its_write_is_committing() {
     assert_eq!(owed_digests(&farm, 0), [digest]);
     assert_eq!(
         repairs.pass().await,
+        Pass {
+            settled: 1,
+            waiting: 0
+        }
+    );
+    assert!(held(&farm, 1, &digest));
+}
+
+/// A store whose first `read_range` of a blob answers as the store did when it was asked,
+/// and only then lets the write that was committing finish: the worker read NotFound, and
+/// the commit lands before the worker acts on it.
+struct CommitsAfterTheRead {
+    inner: Arc<Mem>,
+    farm_repairs: Arc<Repairs>,
+    first: std::sync::atomic::AtomicBool,
+}
+
+impl Storage for CommitsAfterTheRead {
+    fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
+        self.inner.find_missing(digests)
+    }
+
+    fn read_blob<'a>(&'a self, digest: &'a Digest) -> Answer<'a, Bytes> {
+        self.inner.read_blob(digest)
+    }
+
+    fn read_range<'a>(
+        &'a self,
+        digest: &'a Digest,
+        offset: u64,
+        limit: u64,
+    ) -> Answer<'a, ReadStream> {
+        Box::pin(async move {
+            let answer = self.inner.read_range(digest, offset, limit).await;
+            if self.first.swap(false, Ordering::SeqCst) {
+                assert!(
+                    matches!(answer, Err(StorageError::NotFound(_))),
+                    "the commit is held, so the blob is not here yet"
+                );
+                // Step 3: the write commits and drops its Pending, after the read.
+                self.inner.knobs.release_commits();
+                within(async {
+                    while self.farm_repairs.is_in_flight(digest) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await;
+            }
+            answer
+        })
+    }
+
+    fn put(&self, bytes: Bytes) -> Answer<'_, Digest> {
+        self.inner.put(bytes)
+    }
+
+    fn stream(&self, size: u64) -> Option<Box<dyn crate::PutStream>> {
+        self.inner.stream(size)
+    }
+
+    fn segments(&self) -> Arc<dyn kbf_proto::worker::segments_server::Segments> {
+        self.inner.segments()
+    }
+
+    fn action_result<'a>(
+        &'a self,
+        action: &'a Digest,
+    ) -> Answer<'a, Option<(Digest, kbf_proto::reapi::ActionResult)>> {
+        self.inner.action_result(action)
+    }
+
+    fn prepare_action_result<'a>(
+        &'a self,
+        result: &'a kbf_proto::reapi::ActionResult,
+    ) -> Answer<'a, kbf_meta::ActionRecord> {
+        self.inner.prepare_action_result(result)
+    }
+
+    fn commit_action_record(
+        &self,
+        role: kbf_meta::Role,
+        action: Digest,
+        record: kbf_meta::ActionRecord,
+    ) -> Answer<'_, ()> {
+        self.inner.commit_action_record(role, action, record)
+    }
+}
+
+/// Catches a debt dropped for an absent blob that is present by the time it is dropped: the
+/// write journals its debt (the replica is cut) with its commit held; the worker's pass has
+/// begun counting the write (it began before the pass read `begun`, so the count is
+/// unchanged), asked the replica, and read NotFound locally; then the write commits and
+/// drops its in-flight mark; then the pass settles. The blob is held with one copy, so the
+/// debt must stay, and the next pass makes the copy. Mutant: `settle_evicted` without the
+/// look at the store after the in-flight test.
+#[tokio::test]
+async fn a_debt_is_not_dropped_for_a_blob_committed_after_the_worker_read_it_absent() {
+    let farm = Farm::start(2, ChainConfig::default()).await;
+    let map = farm.map(1, 2, &[]);
+    let bytes = farm.blob(&map, 0, 1, 4096, 23);
+    let digest = sha(&bytes);
+    farm.nodes[1].switch.cut();
+    farm.nodes[0].mem.knobs.hold_commits();
+    let write = tokio::spawn({
+        let client = farm.client(0, 1);
+        async move { client.put(Bytes::from(bytes)).await }
+    });
+    // Step 1: the debt is journalled, the write is in flight, the commit is held.
+    within(async {
+        while owed_digests(&farm, 0).is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    farm.nodes[1].switch.restore();
+    let storage = Arc::new(CommitsAfterTheRead {
+        inner: Arc::clone(&farm.nodes[0].mem),
+        farm_repairs: Arc::clone(&farm.nodes[0].repairs),
+        first: std::sync::atomic::AtomicBool::new(true),
+    });
+    let repairs = RepairWorker::new(
+        storage,
+        Arc::clone(&farm.nodes[0].chain),
+        Arc::clone(&farm.nodes[0].repairs),
+        config(),
+    );
+    // Step 2 to 4: the pass reads begun, asks the replica, reads NotFound, the write
+    // commits, the pass settles.
+    let pass = within(repairs.pass()).await;
+    assert_eq!(
+        within(write).await.expect("joined").expect("answered"),
+        digest
+    );
+    assert!(held(&farm, 0, &digest) && !held(&farm, 1, &digest));
+    assert_eq!(
+        owed_digests(&farm, 0),
+        [digest],
+        "a single copy and no debt (pass {pass:?})"
+    );
+    assert_eq!(
+        within(repairs.pass()).await,
         Pass {
             settled: 1,
             waiting: 0
