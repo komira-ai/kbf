@@ -31,7 +31,8 @@ use kbf_proto::worker::{
 };
 use kbf_server::token::ApiToken;
 use kbf_server::{
-    Api, Bound, Listeners, MemoryLadder, RaftMetaLog, ServeError, bind_server_with_map,
+    Api, Bound, Listeners, MemoryLadder, RaftMetaLog, ServeError, StreamLimits,
+    bind_server_with_map,
 };
 use kbf_store::FaultFs;
 use prost::Message;
@@ -239,7 +240,36 @@ impl Cell {
         let store = SharedStore::new();
         let cache = Self::cold_cache(&store, None).await;
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve(cache, store, None, None, wait, retention, ladder).await
+        Self::serve(
+            cache,
+            store,
+            None,
+            None,
+            wait,
+            retention,
+            ladder,
+            StreamLimits::DEFAULT,
+        )
+        .await
+    }
+
+    /// A cell whose listeners allow `streams` HTTP/2 streams per connection
+    /// (`--reapi-max-streams`, `--worker-max-streams`).
+    pub async fn start_with_streams(streams: StreamLimits) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve(
+            cache,
+            store,
+            None,
+            None,
+            wait,
+            retention,
+            small_ladder(),
+            streams,
+        )
+        .await
     }
 
     /// A cell that sends its daemons the storage map `map` holds.
@@ -255,6 +285,7 @@ impl Cell {
             wait,
             retention,
             small_ladder(),
+            StreamLimits::DEFAULT,
             Some(map),
         )
         .await
@@ -265,7 +296,17 @@ impl Cell {
     pub async fn start_with(wait: Duration, retention: Duration) -> Self {
         let store = SharedStore::new();
         let cache = Self::cold_cache(&store, None).await;
-        Self::serve(cache, store, None, None, wait, retention, small_ladder()).await
+        Self::serve(
+            cache,
+            store,
+            None,
+            None,
+            wait,
+            retention,
+            small_ladder(),
+            StreamLimits::DEFAULT,
+        )
+        .await
     }
 
     /// A cell whose metadata is a Raft log ([`RaftMetaLog`], as `kbf-server` runs it) in
@@ -284,6 +325,7 @@ impl Cell {
             wait,
             retention,
             small_ladder(),
+            StreamLimits::DEFAULT,
         )
         .await
     }
@@ -311,6 +353,7 @@ impl Cell {
             wait,
             retention,
             small_ladder(),
+            StreamLimits::DEFAULT,
         )
         .await
     }
@@ -335,6 +378,7 @@ impl Cell {
             wait,
             retention,
             small_ladder(),
+            StreamLimits::DEFAULT,
         )
         .await
     }
@@ -373,6 +417,7 @@ impl Cell {
             wait,
             retention,
             small_ladder(),
+            StreamLimits::DEFAULT,
         )
         .await
     }
@@ -411,6 +456,7 @@ impl Cell {
         Arc::new(cache.expect("open the cache"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn serve(
         cache: Arc<Cache<GateLog, SharedStore>>,
         store: SharedStore,
@@ -419,9 +465,10 @@ impl Cell {
         wait: Duration,
         retention: Duration,
         ladder: MemoryLadder,
+        streams: StreamLimits,
     ) -> Self {
         Self::serve_with_map(
-            cache, store, api_config, raft_dir, wait, retention, ladder, None,
+            cache, store, api_config, raft_dir, wait, retention, ladder, streams, None,
         )
         .await
     }
@@ -436,6 +483,7 @@ impl Cell {
         wait: Duration,
         retention: Duration,
         ladder: MemoryLadder,
+        streams: StreamLimits,
         map: Option<Arc<dyn kbf_mapsync::MapSource>>,
     ) -> Self {
         let listeners = Listeners {
@@ -454,6 +502,7 @@ impl Cell {
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
             invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
             segments: kbf_front::SegmentsConfig::DEFAULT,
+            stream_limits: streams,
         };
         let (stop, stop_rx) = oneshot::channel::<()>();
         let (stopped_tx, stopped) = oneshot::channel::<()>();
