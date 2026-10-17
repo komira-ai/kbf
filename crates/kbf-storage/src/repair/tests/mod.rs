@@ -2,6 +2,7 @@
 //! write, an error at every operation, and damage at every byte.
 
 mod journal;
+mod repairs;
 
 use kbf_map::MemberId;
 use kbf_types::{Digest, DigestFunction};
