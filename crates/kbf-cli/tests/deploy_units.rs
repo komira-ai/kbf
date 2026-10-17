@@ -135,6 +135,76 @@ fn the_all_in_one_unit_leaves_its_state_store_to_kbfs_sqlite_default() {
     }
 }
 
+/// A certificate made for each row of the farm's certificate table, as the farm's
+/// issuer makes it (an EC P-256 key; `CA:FALSE`, `digitalSignature`, the row's extended
+/// key usage, the authority key id; its names and one role URI in the subjectAltName),
+/// passes `kbf-deploy linux verify-cert` for its row, and names its role the way a
+/// storage node reads it (kbf-storage's `role_of`, the admission of every gRPC call).
+/// Catches the two spellings drifting apart (the `urn:kbf:role:` prefix changed on one
+/// side only, a role spelled otherwise or missing from the table), and a row whose
+/// certificate verify-cert passes but storage reads as another role or none.
+#[test]
+fn each_rows_certificate_names_its_role_as_storage_reads_it() {
+    use kbf_deploy::linux::verify_cert::{CLIENT_AUTH, ROLE_URI_PREFIX, Row, verify};
+    use kbf_storage::service::{PeerRole, role_of};
+    use rcgen::{ExtendedKeyUsagePurpose as Eku, KeyUsagePurpose, SanType};
+
+    assert_eq!(ROLE_URI_PREFIX, kbf_storage::service::ROLE_URI_PREFIX);
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca = rcgen::CertifiedIssuer::self_signed(params, rcgen::KeyPair::generate().expect("key"))
+        .expect("CA");
+    let mut roles = Vec::new();
+    for row in Row::ALL {
+        let name = if row == Row::Daemon {
+            "node-1"
+        } else {
+            "node-1.farm.example"
+        };
+        let mut leaf = rcgen::CertificateParams::new(vec![name.to_owned()]).expect("params");
+        leaf.subject_alt_names.push(SanType::URI(
+            format!("{ROLE_URI_PREFIX}{}", row.role())
+                .try_into()
+                .expect("IA5"),
+        ));
+        leaf.is_ca = rcgen::IsCa::ExplicitNoCa;
+        leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        leaf.extended_key_usages = row
+            .ekus()
+            .iter()
+            .map(|e| {
+                if *e == CLIENT_AUTH {
+                    Eku::ClientAuth
+                } else {
+                    Eku::ServerAuth
+                }
+            })
+            .collect();
+        leaf.use_authority_key_identifier_extension = true;
+        let cert = leaf
+            .signed_by(&rcgen::KeyPair::generate().expect("key"), &ca)
+            .expect("signed");
+        let node_id = (row == Row::Daemon).then_some(name);
+        let failures = verify(
+            ca.pem().as_bytes(),
+            cert.pem().as_bytes(),
+            row,
+            node_id,
+            std::time::SystemTime::now(),
+        )
+        .expect("checked");
+        assert!(failures.is_empty(), "{row:?}: {failures:?}");
+        let role = role_of(cert.der()).expect("a role storage admits");
+        assert_eq!(role.name(), row.role(), "{row:?}");
+        roles.push(role);
+    }
+    // Every role storage knows is some row's.
+    for role in PeerRole::ALL {
+        assert!(roles.contains(&role), "{role:?} is no row's");
+    }
+}
+
 /// Catches kbf-deploy rendering a mode kbf does not have (a sixth, or an old name),
 /// missing one kbf has, listing them in another order than `kbf --help`, and saying a
 /// mode is built (its unit's flags checked) when kbf has no command line for it, or

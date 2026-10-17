@@ -87,9 +87,8 @@ use kbf_host::exec::Exec;
 use kbf_host::path::HostPath;
 use kbf_host::step::Cmd;
 
-use super::Refusal;
 use super::check::{Failure, Report, angle_placeholder};
-use super::config::LinuxConfig;
+use super::config::{LinuxConfig, LinuxError};
 use super::render::{SLICE, values};
 use super::{cpuset, credential, stop, stores};
 use crate::template::{self, TemplateError, leftovers};
@@ -209,9 +208,22 @@ impl fmt::Display for Mode {
 /// # Errors
 /// Settings `mode` needs left out ([`LinuxConfig::for_mode`]), or a placeholder with no
 /// value.
-pub fn render(config: &LinuxConfig, kbf_uid: Option<u32>, mode: Mode) -> Result<String, Refusal> {
+pub fn render(
+    config: &LinuxConfig,
+    kbf_uid: Option<u32>,
+    mode: Mode,
+) -> Result<String, RenderError> {
     config.for_mode(mode)?;
     Ok(render_template(config, kbf_uid, mode, mode.template())?)
+}
+
+/// Why a mode's unit was not rendered.
+#[derive(Debug, thiserror::Error)]
+pub enum RenderError {
+    #[error(transparent)]
+    Settings(#[from] LinuxError),
+    #[error(transparent)]
+    Template(#[from] TemplateError),
 }
 
 /// [`render`] with another template, for the tests that plant a defect in one.

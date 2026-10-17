@@ -199,6 +199,75 @@ state is the SQLite file `<KBF_DATA_DIR>/state.db`, the default of `kbf all-in-o
 `--state-store=sqlite:///...` names another; any other value is refused), so the unit
 gives no state store flag.
 
+## A node's certificate
+
+kbf-deploy issues no certificate. The farm's one issuer makes every certificate of the
+new modes' mutual TLS from the one CA, each with exactly one role, by this table:
+
+| row | role (`urn:kbf:role:<role>`) | extended key usage | names |
+|---|---|---|---|
+| `frontend-worker` | `frontend` | serverAuth, clientAuth (it also calls storage) | the frontend's names |
+| `storage` | `storage` | serverAuth, clientAuth (replication calls) | the node's names |
+| `daemon` | `daemon` | clientAuth | exactly one DNS name, the node id |
+
+The frontend's REAPI listener, the name clients dial, presents a certificate that is not
+the farm CA's, so it has no row and `verify-cert --row frontend-reapi` is refused (exit 2).
+
+`kbf-deploy linux verify-cert` checks one certificate against its row, read only,
+before a unit is pointed at it:
+
+```text
+kbf-deploy linux verify-cert --row storage --cert storage.pem --ca-cert ca.pem
+kbf-deploy linux verify-cert --row daemon --cert node.pem --ca-cert ca.pem --node-id node-1
+```
+
+- `role`: the subjectAltName holds exactly one URI `urn:kbf:role:<role>`, the row's.
+  A storage node reads the same URI to admit each call (architecture-v2.md, section 9);
+  a kbf-cli test makes a certificate of each row and reads it back with the storage
+  node's own check.
+- `eku`: the extended key usage is the row's set exactly; a certificate without the
+  extension fails (TLS would take it for every use).
+- `name` (`daemon`): its DNS and IP names are exactly `--node-id`.
+- `chain`: it chains to `--ca-cert` now, for each use of the row: as a server under its
+  first name, as a client.
+
+It prints a `FAIL <check>:` line per failed check and `CERT BROKEN`, or one
+`CERT OK:` line. Exit codes: 0 the certificate is the row's, 1 a check failed, 2 refused
+(a file that cannot be read, no certificate, no usable CA, `--node-id` for a row that
+is not `daemon`).
+
+Copy the certificate and its key to the node's `KBF_ETC` (the storage unit reads
+`storage.pem` and `storage.key`), the key owned by the unit's user; `install-units
+--mode` refuses a key another user owns or others can read. `kbf frontend` takes no
+certificate flags yet.
+
+## Installing a mode's unit
+
+`kbf-deploy linux install-units --config node.conf --mode MODE [--bin-dir DIR]
+[--apply]` installs one built mode's unit on the node, as root:
+
+1. It checks the host, read only: the mode is built (`frontend` and
+   `storage-and-daemon` are refused: their units would exit 2 at start); the unit's
+   `User=` exists and is not root; for a mode that runs builds, the kbf user has subuid
+   and subgid ranges and lingers; `kbf` is an executable in `--bin-dir` (or
+   `KBF_BIN_DIR`); the rendered unit passes `check-units --mode MODE --installable` on
+   this host, its flags parsed by that `kbf`; every `EnvironmentFile=` is there; and
+   each file a key or token flag names (`--key`, `--*-key`, `--*token-file`) is the
+   unit's user's with no group or other bit, and each certificate, CA or deny list flag
+   names a file.
+2. It plans, each step only when the host differs: the new `kbf` (with `--bin-dir`; the
+   old one kept as `kbf.previous`), `kbf.slice` and `kbf-<mode>.service` (0644, root's),
+   the directories the unit's flags name (the unit's user's: `--data-dir` 0755,
+   `--meta-dir` and a `file://` hot or cold store 0700), then `daemon-reload`, enable
+   and restart; with nothing changed, enable and start only if the unit is not. A unit
+   with `--api-listen=127.0.0.1:<port>` (all-in-one) is waited for on `/readyz`.
+3. Without `--apply` every step is printed as a `DRY-RUN:` line and nothing is written,
+   reloaded or started.
+
+There is no `--uninstall` for a mode's unit yet. A node moving from the converged units
+(`kbf-server.service`) to `kbf-storage.service` stops the old ones first
+(`install-units --uninstall`): both would hold the same directories.
+
 ## Upgrade kbf before kbf-deploy
 
 Rule `parse` runs `<kbf> check-args <mode> <flags...>`. A `kbf` older than
