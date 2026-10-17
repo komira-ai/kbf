@@ -44,6 +44,7 @@ fn member(id: u64, state: MemberState, report: Option<Report>) -> MemberReport {
     MemberReport {
         id: MemberId(id),
         state,
+        planned_down: false,
         report,
     }
 }
@@ -662,4 +663,47 @@ fn a_membership_that_cannot_be_read_is_unreadable_and_held() {
     let refused = pair.members.node_idle(pair.a.0, 0).expect_err("unreadable");
     assert!(matches!(&refused, NotIdle::Unreadable(why) if why.contains("unreadable")));
     assert_eq!(refused.class(), Class::Held);
+}
+
+// Catches: the node that is being restarted judged by the state the restart gives it. Once an
+// operator has planned it down it is `Down` and planned, and must still be judged idle by its
+// own report (quiet, from the map that took it out); a `Down` member nobody planned is not
+// the node a rollout is stopping, and is a hold; and the member planned down is a hold for
+// any other node's restart (a second member out).
+#[test]
+fn a_node_planned_down_is_judged_by_its_report_and_another_one_holds_the_rest() {
+    let planned = |id| MemberReport {
+        planned_down: true,
+        ..member(
+            id,
+            MemberState::Down,
+            said(Debts::Known(0), Writes::Known(0), 6, 100),
+        )
+    };
+    assert_eq!(idle(&[planned(1), quiet(2)], 1, 6), []);
+    assert_eq!(
+        idle(&[planned(1), quiet(2)], 1, 7),
+        [NotIdle::ReportOlderThan {
+            member: MemberId(1),
+            reported: 6,
+            wanted: 7
+        }]
+    );
+    let unplanned = MemberReport {
+        planned_down: false,
+        ..planned(1)
+    };
+    assert_eq!(
+        idle(&[unplanned, quiet(2)], 1, 6),
+        [NotIdle::NodeNotActive {
+            member: MemberId(1),
+            state: MemberState::Down
+        }]
+    );
+    assert_eq!(
+        idle(&[planned(1), quiet(2), quiet(3)], 3, 5),
+        [NotIdle::OtherMemberNotActive {
+            member: MemberId(1)
+        }]
+    );
 }

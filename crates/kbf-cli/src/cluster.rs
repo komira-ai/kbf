@@ -49,6 +49,9 @@ pub enum MemberState {
     Active,
     /// Takes no new writes.
     Draining,
+    /// Out of the write path for a planned restart, at once; `active` undoes it.
+    #[value(name = "planned-down")]
+    PlannedDown,
 }
 
 /// What `kbf cluster` does.
@@ -136,6 +139,7 @@ impl Verb {
                 let state = match state {
                     MemberState::Active => "active",
                     MemberState::Draining => "draining",
+                    MemberState::PlannedDown => "planned_down",
                 };
                 Call::Post(
                     format!("/v1/members/{id}"),

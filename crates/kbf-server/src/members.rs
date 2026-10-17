@@ -65,6 +65,9 @@ use crate::storage_health::{
     storage_health,
 };
 
+/// The value of a `down/<id>` mark written by an operator's planned restart
+/// ([`Members::plan_down`]); the sweeper's marks are empty.
+const PLANNED: &[u8] = b"planned";
 const MAP_KEY: &str = "map";
 const MEMBERS: &str = "member/";
 const ID_COUNTER: &str = "member-id";
@@ -196,9 +199,17 @@ pub enum MembershipError {
         current: u64,
     },
     /// Only `Joining`, `CatchingUp`, `Active` and `Draining` are set by hand; `Down` is
-    /// the store's verdict.
+    /// the store's verdict, or an operator's planned restart ([`Members::plan_down`]).
     #[error("a member cannot be set {0:?}")]
     NotSettable(MemberState),
+    /// Only an `Active` member can be planned down.
+    #[error("member {id} is {state:?}: only an Active member can be planned down")]
+    NotActive {
+        /// The member.
+        id: MemberId,
+        /// Its state.
+        state: MemberState,
+    },
     /// Another writer kept winning the compare-and-set.
     #[error("gave up after {ATTEMPTS} attempts against other writers")]
     Contended,
@@ -396,6 +407,9 @@ enum Touch {
     Beat(u64, Progress, Reported),
     /// An administrator's state change: the time to live it had.
     State(MemberState),
+    /// An administrator's planned restart of an `Active` member: `Down` in the row, with
+    /// the dwell mark, in one transaction.
+    PlanDown,
 }
 
 /// The maps a process has seen: the newest, and the generation it replaced.
@@ -601,6 +615,39 @@ impl Members {
         self.refresh()?.ok_or(MembershipError::NoMap)
     }
 
+    /// Takes a live `Active` member out of the write path for a planned restart, and
+    /// rebuilds the map: it is `Down` in the map at once, so every router, chain and repair
+    /// worker that holds the new map skips it for writes and reads its blobs from the other
+    /// owner, and a map an older build holds reads it like any `Down` member. The `down/`
+    /// mark that holds its slot for the dwell is written in the same transaction as the
+    /// row, with a value that says an operator planned it ([`Members::planned_down`]).
+    ///
+    /// The member keeps heartbeating until it stops and a heartbeat does not undo this. It
+    /// is undone by [`Members::set_state`] to `Active` (a restart that did not happen), or
+    /// by the member registering again (the restart did: `Active`, or `CatchingUp` while it
+    /// rebuilds, the mark deleted); if it stops and does not return, its row expires and the
+    /// dwell, counted from this call, decides when it leaves the map.
+    ///
+    /// # Errors
+    /// [`MembershipError::NotRegistered`] if the member has no live row;
+    /// [`MembershipError::NotActive`] unless it is `Active`; the store failing.
+    pub fn plan_down(&self, id: MemberId) -> Result<Map, MembershipError> {
+        self.touch(id, Touch::PlanDown)?;
+        self.refresh()?.ok_or(MembershipError::NoMap)
+    }
+
+    /// Whether `id` is `Down` because an operator planned it ([`Members::plan_down`]), and
+    /// its dwell has not run out. A member the sweeper marked `Down` is not.
+    ///
+    /// # Errors
+    /// The store failing.
+    pub fn planned_down(&self, id: MemberId) -> Result<bool, MembershipError> {
+        Ok(self
+            .store
+            .get(&down_key(id))?
+            .is_some_and(|mark| mark.value == PLANNED))
+    }
+
     /// Rewrites `id`'s row as `how` says; whether its state changed.
     fn touch(&self, id: MemberId, how: Touch) -> Result<bool, MembershipError> {
         let key = member_key(id);
@@ -635,6 +682,15 @@ impl Members {
                         .expires_at
                         .map_or(self.config.ttl, |at| at.since(self.store.now()))
                 }
+                Touch::PlanDown if before != MemberState::Active => {
+                    return Err(MembershipError::NotActive { id, state: before });
+                }
+                Touch::PlanDown => {
+                    live.member.state = MemberState::Down;
+                    stored
+                        .expires_at
+                        .map_or(self.config.ttl, |at| at.since(self.store.now()))
+                }
             };
             let mut put = Txn::new().put_ttl(
                 &key,
@@ -644,6 +700,11 @@ impl Members {
             );
             if live.member.state == MemberState::Active && before != MemberState::Active {
                 put = put.put(FORMED, Vec::new(), Cond::Any);
+            }
+            if matches!(how, Touch::PlanDown) {
+                put = put.put_ttl(down_key(id), PLANNED, self.config.dwell, Cond::Any);
+            } else if before == MemberState::Down && live.member.state != MemberState::Down {
+                put = put.delete(down_key(id), Cond::Any);
             }
             if self.store.txn(put)?.is_ok() {
                 return Ok(live.member.state != before);
@@ -744,6 +805,7 @@ impl Members {
                 MemberReport {
                     id: member.id,
                     state: member.state,
+                    planned_down: false,
                     report: None,
                 },
             );
@@ -754,9 +816,15 @@ impl Members {
                 MemberReport {
                     id,
                     state: live.member.state,
+                    planned_down: false,
                     report: live.report,
                 },
             );
+        }
+        for member in members.values_mut() {
+            if member.state == MemberState::Down {
+                member.planned_down = self.planned_down(member.id)?;
+            }
         }
         let now = self.store.now();
         Ok((members.into_values().collect(), now))

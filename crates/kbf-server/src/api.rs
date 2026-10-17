@@ -12,8 +12,10 @@
 //!   `{"deadline_secs": N}`; without one the deadline is [`DRAIN_DEADLINE`]. The answer
 //!   is the node as it is after the action.
 //!
-//! - `POST /v1/members/{id}` with `{"state": "active"|"draining"}`: sets a storage
-//!   member's state ([`Members::set_state`]), the operator's promotion of a joiner.
+//! - `POST /v1/members/{id}` with `{"state": "active"|"draining"|"planned_down"}`: sets a
+//!   storage member's state ([`Members::set_state`]), the operator's promotion of a joiner;
+//!   `planned_down` ([`Members::plan_down`]) takes an `Active` member out of the write path
+//!   for a planned restart at once (`409` unless it is `Active`), and `active` undoes it.
 //!
 //! - `GET /v1/frontend/drain`: whether the frontend is draining, the Execute and
 //!   WaitExecution streams open and the operations queued ([`DrainStatus`]).
@@ -194,6 +196,8 @@ struct MemberBody {
 enum MemberTarget {
     Active,
     Draining,
+    #[serde(rename = "planned_down")]
+    PlannedDown,
 }
 
 async fn set_member_state(
@@ -218,16 +222,24 @@ async fn set_member_state(
     let want: MemberBody = match serde_json::from_slice(&body) {
         Ok(want) => want,
         Err(e) => {
-            let why = format!("a member body is {{\"state\": \"active\"|\"draining\"}}: {e}");
+            let why = format!(
+                "a member body is {{\"state\": \"active\"|\"draining\"|\"planned_down\"}}: {e}"
+            );
             return error(StatusCode::BAD_REQUEST, &why);
         }
     };
-    let (state, name) = match want.state {
-        MemberTarget::Active => (MemberState::Active, "active"),
-        MemberTarget::Draining => (MemberState::Draining, "draining"),
+    let name = match want.state {
+        MemberTarget::Active => "active",
+        MemberTarget::Draining => "draining",
+        MemberTarget::PlannedDown => "planned_down",
     };
     // The store's calls block (its trait says so).
-    let set = tokio::task::spawn_blocking(move || members.set_state(MemberId(id), state)).await;
+    let set = tokio::task::spawn_blocking(move || match want.state {
+        MemberTarget::Active => members.set_state(MemberId(id), MemberState::Active),
+        MemberTarget::Draining => members.set_state(MemberId(id), MemberState::Draining),
+        MemberTarget::PlannedDown => members.plan_down(MemberId(id)),
+    })
+    .await;
     member_answer(id, name, set)
 }
 
@@ -258,6 +270,7 @@ const fn member_failure(e: &MembershipError) -> StatusCode {
     match e {
         MembershipError::NotRegistered(_) => StatusCode::NOT_FOUND,
         MembershipError::NotSettable(_) => StatusCode::BAD_REQUEST,
+        MembershipError::NotActive { .. } => StatusCode::CONFLICT,
         MembershipError::Store(_) | MembershipError::Contended => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }

@@ -174,6 +174,9 @@ pub struct MemberReport {
     pub id: MemberId,
     /// Its state in the map.
     pub state: MemberState,
+    /// Whether it is `Down` because an operator planned a restart
+    /// ([`Members::plan_down`]); false in every other case.
+    pub planned_down: bool,
     /// Its newest report; `None` before its first heartbeat and after its row expired.
     pub report: Option<Report>,
 }
@@ -211,6 +214,8 @@ pub struct NodeHealth {
     pub id: MemberId,
     /// Its state in the map.
     pub state: MemberState,
+    /// Whether it is `Down` because an operator planned a restart.
+    pub planned_down: bool,
     /// The copies it owes.
     pub repair_debts: Option<u64>,
     /// The writes it has open.
@@ -309,6 +314,7 @@ fn node_health(member: &MemberReport, now: StoreTime, freshness: Duration) -> No
     NodeHealth {
         id: member.id,
         state: member.state,
+        planned_down: member.planned_down,
         repair_debts: said.and_then(|said| match said.debts {
             Debts::Known(debts) => Some(debts),
             Debts::Unknown => None,
@@ -483,7 +489,9 @@ pub fn node_idle(
             .iter()
             .map(|&member| NotIdle::OtherMemberDebtsUnknown { member }),
     );
-    if me.state != MemberState::Active {
+    // A node taken out of the write path for its restart is the one that is stopped.
+    let out = me.state == MemberState::Down && me.planned_down;
+    if me.state != MemberState::Active && !out {
         reasons.push(NotIdle::NodeNotActive {
             member: node,
             state: me.state,
@@ -599,6 +607,7 @@ struct View {
 struct NodeView {
     id: u64,
     state: &'static str,
+    planned_down: bool,
     repair_debts: Option<u64>,
     open_writes: Option<u64>,
     generation: Option<u64>,
@@ -622,6 +631,7 @@ impl From<&StorageHealth> for View {
                 .map(|node| NodeView {
                     id: node.id.0,
                     state: node.state.name(),
+                    planned_down: node.planned_down,
                     repair_debts: node.repair_debts,
                     open_writes: node.open_writes,
                     generation: node.generation,

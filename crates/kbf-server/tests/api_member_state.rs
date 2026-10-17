@@ -206,19 +206,20 @@ async fn an_operator_promotes_a_joining_member() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_member_write_is_refused_without_the_gates() {
     let (server, other, id) = joined();
-    let want = r#"{"state":"active"}"#;
     let wrong = "Authorization: Bearer not-the-token-not-the-token-000000000\r\n\
                  Content-Type: application/json\r\n";
     let origin = format!("{OPERATOR}Origin: http://evil.example\r\n");
     let plain = "Authorization: Bearer kbf-test-token-0123456789abcdef0123456789\r\n";
-    for (headers, refused) in [
-        ("Content-Type: application/json\r\n", 401),
-        (wrong, 401),
-        (origin.as_str(), 403),
-        (plain, 415),
-    ] {
-        let (code, body) = post(server.api, "/v1/members/1", headers, want).await;
-        assert_eq!(code, refused, "{headers}: {body}");
+    for want in [r#"{"state":"active"}"#, r#"{"state":"planned_down"}"#] {
+        for (headers, refused) in [
+            ("Content-Type: application/json\r\n", 401),
+            (wrong, 401),
+            (origin.as_str(), 403),
+            (plain, 415),
+        ] {
+            let (code, body) = post(server.api, "/v1/members/1", headers, want).await;
+            assert_eq!(code, refused, "{want} {headers}: {body}");
+        }
     }
     assert_eq!(
         map_of(&other).member(id).map(|m| m.state),
@@ -260,4 +261,58 @@ async fn a_server_without_members_answers_404() {
     )
     .await;
     assert_eq!(code, 404, "{body}");
+}
+
+/// Catches: an operator's planned restart that answers 200 without reaching the store, one
+/// that is not `Down` in the map or is not marked as planned, one accepted for a member that
+/// is not `Active` (a `Joining` one would come back `Active` on undo), and an undo that
+/// leaves the mark. The member is promoted, planned down (the map says `Down` in a new
+/// generation), refused a second time with 409, and set `active` again (the map says so and
+/// the mark is gone).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_operator_plans_a_restart_and_undoes_it() {
+    let (server, other, id) = joined();
+    let planned = r#"{"state":"planned_down"}"#;
+    let (code, body) = post(server.api, "/v1/members/1", OPERATOR, planned).await;
+    assert_eq!(code, 409, "a Joining member cannot be planned down: {body}");
+    assert!(body.contains("only an Active member"), "{body}");
+
+    let (code, body) = post(
+        server.api,
+        "/v1/members/1",
+        OPERATOR,
+        r#"{"state":"active"}"#,
+    )
+    .await;
+    assert_eq!(code, 200, "{body}");
+    let before = map_of(&other).generation();
+
+    let (code, body) = post(server.api, "/v1/members/1", OPERATOR, planned).await;
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains(r#""state":"planned_down""#), "{body}");
+    let map = map_of(&other);
+    assert_eq!(map.member(id).map(|m| m.state), Some(MemberState::Down));
+    assert_eq!(map.generation(), before + 1);
+    assert!(
+        body.contains(&format!(r#""generation":{}"#, map.generation())),
+        "{body}"
+    );
+    assert!(other.planned_down(id).expect("read"));
+
+    let (code, body) = post(server.api, "/v1/members/1", OPERATOR, planned).await;
+    assert_eq!(code, 409, "already out of the write path: {body}");
+
+    let (code, body) = post(
+        server.api,
+        "/v1/members/1",
+        OPERATOR,
+        r#"{"state":"active"}"#,
+    )
+    .await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        map_of(&other).member(id).map(|m| m.state),
+        Some(MemberState::Active)
+    );
+    assert!(!other.planned_down(id).expect("read"), "the mark is gone");
 }
