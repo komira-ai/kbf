@@ -194,3 +194,131 @@ async fn a_commit_in_flight_is_an_open_write() {
     in_process.await.expect("joins").expect("committed");
     count_reaches(&open, 0).await;
 }
+
+/// Catches a service whose segment uploads are not counted with the handle the node reports:
+/// the service asks its store for the `Segments` handlers counting in the very handle given
+/// to `with_open_writes` (the store's uploads then move that count; kbf-front's own test
+/// pins that). Mutant: `with_open_writes` leaving the handlers it made at `new`.
+#[tokio::test]
+async fn the_store_counts_its_segment_uploads_in_the_services_handle() {
+    let mem = Arc::new(Mem::default());
+    let open = OpenWrites::new();
+    let _ = node(&mem, &open).await;
+    let given = mem
+        .counted_with
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("the store was asked to count its uploads");
+    let _upload = given.begin();
+    assert_eq!(open.count(), 1, "it is the service's handle");
+}
+
+/// A node holding map 7, the open-writes handle, and a refetch wait of `wait` for a caller
+/// that is ahead of it; the caller's clients at generation 9, over the wire and in-process.
+async fn node_waiting_for_a_map(
+    mem: &Arc<Mem>,
+    open: &OpenWrites,
+    wait: Duration,
+) -> (RemoteStorage, Arc<dyn Storage>) {
+    use super::fake::Held;
+    use crate::replicate::MapSource;
+
+    /// Holds map 7 and takes `wait` to fetch a newer one, which it then does not have.
+    struct Slow(Arc<Held>, Duration);
+
+    impl MapSource for Slow {
+        fn current(&self) -> Option<Arc<kbf_map::Map>> {
+            self.0.current()
+        }
+
+        fn me(&self) -> Option<kbf_map::MemberId> {
+            self.0.me()
+        }
+
+        fn refetch(&self, _: u64) -> futures::future::BoxFuture<'_, Option<Arc<kbf_map::Map>>> {
+            let wait = self.1;
+            Box::pin(async move {
+                tokio::time::sleep(wait).await;
+                None
+            })
+        }
+    }
+
+    let storage: Arc<dyn Storage> = Arc::clone(mem) as Arc<dyn Storage>;
+    let held = Held::at(7);
+    let service = Arc::new(
+        StorageService::new(
+            storage,
+            Admission::Open,
+            Config {
+                write_bytes_in_flight: 1 << 30,
+            },
+        )
+        .with_map(Arc::new(Slow(held, wait)) as Arc<dyn MapSource>)
+        .with_refetch_wait(wait * 2)
+        .with_open_writes(open.clone()),
+    );
+    let channel = connect(serve_routes(service.shared_routes(), None).await).await;
+    (RemoteStorage::new(channel, 9), service.in_process().at(9))
+}
+
+/// Catches a write that is not counted while it waits for the map: a caller ahead of the
+/// node makes it fetch the map, and that wait can be seconds with the call already taken in.
+/// A rollout that read zero then would stop the node under it. The write, over the wire and
+/// in-process, is open while it waits and gives the count back when it is refused. Mutant:
+/// the guard taken after the map is judged.
+#[tokio::test]
+async fn a_write_waiting_for_the_map_is_open() {
+    let mem = Arc::new(Mem::default());
+    let open = OpenWrites::new();
+    let (remote, in_process) =
+        node_waiting_for_a_map(&mem, &open, Duration::from_millis(600)).await;
+    let wire = tokio::spawn(async move {
+        remote
+            .put(bytes::Bytes::from_static(b"over the wire"))
+            .await
+    });
+    count_reaches(&open, 1).await;
+    let local = tokio::spawn(async move {
+        in_process
+            .put(bytes::Bytes::from_static(b"in-process"))
+            .await
+    });
+    count_reaches(&open, 2).await;
+    assert!(wire.await.expect("joins").is_err(), "no map that new");
+    assert!(local.await.expect("joins").is_err(), "no map that new");
+    count_reaches(&open, 0).await;
+}
+
+/// Catches an action-cache commit that is not counted while it waits for the map, over the
+/// wire and in-process. Mutants: the guard taken after the map is judged, in either path.
+#[tokio::test]
+async fn a_commit_waiting_for_the_map_is_open() {
+    let mem = Arc::new(Mem::default());
+    let open = OpenWrites::new();
+    let (remote, in_process) =
+        node_waiting_for_a_map(&mem, &open, Duration::from_millis(600)).await;
+    let record = ActionRecord {
+        result: sha(b"result"),
+        closure: Default::default(),
+    };
+    let wire = {
+        let record = record.clone();
+        tokio::spawn(async move {
+            remote
+                .commit_action_record(Role::Daemon, sha(b"action"), record)
+                .await
+        })
+    };
+    count_reaches(&open, 1).await;
+    let local = tokio::spawn(async move {
+        in_process
+            .commit_action_record(Role::Daemon, sha(b"other"), record)
+            .await
+    });
+    count_reaches(&open, 2).await;
+    assert!(wire.await.expect("joins").is_err());
+    assert!(local.await.expect("joins").is_err());
+    count_reaches(&open, 0).await;
+}

@@ -1,7 +1,9 @@
 //! How many writes a node has open now: what a rollout asks before it stops the node
 //! (`docs/design/architecture-v2.md`, section 11). A write is open from the moment its
 //! call is taken in until the call ends, by an answer, an error or the caller going away;
-//! a node that is a chain's replica counts the copy it is sent as a write too.
+//! a node that is a chain's replica counts the copy it is sent as a write too. A daemon's
+//! segment upload is one from its `Begin` until the commit started for it ends, which runs
+//! detached ([`crate::Storage::segments_counted`]).
 //!
 //! The count is a gauge the service moves ([`OpenWrites::begin`]) and the registration
 //! reads ([`OpenWrites::count`]), like [`super::CatchUp`]: a handle both hold.
