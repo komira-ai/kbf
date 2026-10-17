@@ -289,13 +289,23 @@ fn failing() -> (Arc<Hooked>, Server) {
     (hooked, start(Some(state)))
 }
 
-async fn error_of(api: SocketAddr) -> (u16, String) {
-    let (code, _, body) = http(api, "GET", "/v1/members", "").await;
-    let why = serde_json::from_str::<Value>(&body).expect("JSON")["error"]
-        .as_str()
-        .expect("an error")
-        .to_owned();
-    (code, why)
+/// The error `GET /v1/members` answers once `arm` has set a fault. The server reads the
+/// store on its own timers too, and one of those reads can take the armed fault first;
+/// the fault is armed again until the request itself meets it.
+async fn error_of(api: SocketAddr, arm: impl Fn()) -> (u16, String) {
+    for _ in 0..200 {
+        arm();
+        let (code, _, body) = http(api, "GET", "/v1/members", "").await;
+        if code != 200 {
+            let why = serde_json::from_str::<Value>(&body).expect("JSON")["error"]
+                .as_str()
+                .expect("an error")
+                .to_owned();
+            return (code, why);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the fault never reached the request");
 }
 
 /// Catches a store that cannot be read answered as an empty farm or as a server bug:
@@ -307,10 +317,12 @@ async fn error_of(api: SocketAddr) -> (u16, String) {
 async fn a_store_that_fails_is_503_and_a_map_that_is_wrong_or_a_panic_is_500() {
     let (hooked, server) = failing();
 
-    hooked
-        .fail_gets
-        .store(1, std::sync::atomic::Ordering::SeqCst);
-    let (code, why) = error_of(server.api).await;
+    let (code, why) = error_of(server.api, || {
+        hooked
+            .fail_gets
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+    })
+    .await;
     assert_eq!(code, 503, "{why}");
     assert!(why.contains("injected"), "{why}");
     assert_eq!(
@@ -318,10 +330,12 @@ async fn a_store_that_fails_is_503_and_a_map_that_is_wrong_or_a_panic_is_500() {
         json!({ "generation": 0, "members": [] })
     );
 
-    hooked
-        .panic_gets
-        .store(1, std::sync::atomic::Ordering::SeqCst);
-    let (code, why) = error_of(server.api).await;
+    let (code, why) = error_of(server.api, || {
+        hooked
+            .panic_gets
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+    })
+    .await;
     assert_eq!(code, 500, "{why}");
     assert!(why.contains("membership task"), "{why}");
 
@@ -330,6 +344,6 @@ async fn a_store_that_fails_is_503_and_a_map_that_is_wrong_or_a_panic_is_500() {
         .txn(Txn::new().put("map", b"not a map".to_vec(), Cond::Absent))
         .expect("store")
         .expect("no conflict");
-    let (code, why) = error_of(server.api).await;
+    let (code, why) = error_of(server.api, || ()).await;
     assert_eq!(code, 500, "{why}");
 }
