@@ -800,14 +800,19 @@ pub struct StorageListener {
     pub service: kbf_storage::service::Config,
 }
 
-/// The check each call of a gated node passes ([`bind_storage_gated`]). Not generic, so
-/// the lines count once.
-fn map_gate(
-    maps: Option<Arc<kbf_mapsync::MapHolder>>,
-) -> impl FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Clone {
-    move |request| match &maps {
-        Some(maps) if maps.generation() == 0 => Err(tonic::Status::unavailable(NO_MAP_YET)),
-        _ => Ok(request),
+impl StorageListener {
+    /// The service over `storage` this listener serves: callers admitted by the role in
+    /// their certificates with mutual TLS, every caller without it.
+    #[must_use]
+    pub fn service(
+        &self,
+        storage: Arc<dyn kbf_storage::Storage>,
+    ) -> kbf_storage::service::StorageService {
+        let admission = match self.tls {
+            Some(_) => kbf_storage::service::Admission::Certified,
+            None => kbf_storage::service::Admission::Open,
+        };
+        kbf_storage::service::StorageService::new(storage, admission, self.service)
     }
 }
 
@@ -831,41 +836,30 @@ pub fn bind_storage(
     listener: StorageListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
-    bind_storage_gated(storage, listener, None, shutdown)
+    let service = listener.service(storage);
+    bind_service(service, listener.listen, listener.tls, shutdown)
 }
 
-/// The refusal a gated node answers every call with until its first map.
-pub const NO_MAP_YET: &str = "no storage map yet";
-
-/// [`bind_storage`], and with `maps` (a node in a multi-member farm, which registered
-/// with a frontend) every call is answered UNAVAILABLE [`NO_MAP_YET`] until `maps` holds
-/// its first map: a node that does not know the farm's members cannot tell a blob it owns
-/// from one it does not, and would take a write the map places elsewhere. `None` (one
-/// box, whose map is itself) serves at once.
+/// [`bind_storage`] over a service the caller has set up: a node that is one of several
+/// gives it the map it judges calls by and its chain ([`crate::member`]). `tls` must be
+/// what the service's admission was made from ([`StorageListener::service`]).
 ///
 /// # Errors
 /// As [`bind_storage`].
-pub fn bind_storage_gated(
-    storage: Arc<dyn kbf_storage::Storage>,
-    listener: StorageListener,
-    maps: Option<Arc<kbf_mapsync::MapHolder>>,
+pub fn bind_service(
+    service: kbf_storage::service::StorageService,
+    listen: SocketAddr,
+    tls: Option<ServerTlsConfig>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
-    let (incoming, addr) = bind(listener.listen)?;
+    let (incoming, addr) = bind(listen)?;
     let mut server = flow_control(Server::builder());
-    let admission = match listener.tls {
-        Some(tls) => {
-            server = server.tls_config(tls)?;
-            kbf_storage::service::Admission::Certified
-        }
-        None => kbf_storage::service::Admission::Open,
-    };
-    let routes =
-        kbf_storage::service::StorageService::new(storage, admission, listener.service).routes();
-    let gate = tonic::service::InterceptorLayer::new(map_gate(maps));
+    if let Some(tls) = tls {
+        server = server.tls_config(tls)?;
+    }
+    let routes = service.routes();
     let serving = async move {
         server
-            .layer(gate)
             .add_routes(routes)
             .serve_with_incoming_shutdown(incoming, shutdown)
             .await

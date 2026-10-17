@@ -12,11 +12,14 @@
 //!   does (`kbf_storage::local_cache`).
 //! - **The handle.** The [`Storage`] the listener serves is kept, for the daemon half.
 //!
-//! - **The map.** With `--frontend` the half registers and heartbeats as `kbf storage`
-//!   does, holds the maps the frontend sends in a [`kbf_mapsync::MapHolder`]
-//!   ([`StorageHalf::maps`]), and its listener answers every call UNAVAILABLE `no storage
-//!   map yet` until the first arrives (the daemon half, in the same process, calls the
-//!   storage in-process and is not held back).
+//! - **The map and the chain.** With `--frontend` the half registers and heartbeats as
+//!   `kbf storage` does, holds the maps the frontend sends in a
+//!   [`kbf_mapsync::MapHolder`] ([`StorageHalf::maps`]), and its service judges every call
+//!   by that map, serving nothing until the first arrives; under mutual TLS it is a link of
+//!   the chain that copies a write to the blob's second owner, with the repair worker that
+//!   makes a copy owed ([`StorageHalf::repairs`]); all as [`crate::replication`] says. The
+//!   storage the daemon half is handed in-process is the store itself, not the service:
+//!   what it reads and writes there is not judged by the map and is not copied.
 //!
 //! The rest (the listener's checks, the stores, the metadata log, the flusher and the
 //! start-up pass over a `file://` cold store) is `kbf storage`'s, step for step.
@@ -34,9 +37,11 @@ use kbf_mapsync::MapHolder;
 use kbf_meta::Retention;
 use kbf_objstore::{FsStore, ObjectStore};
 use kbf_storage::Storage;
+use kbf_storage::repair::Repairs;
 use kbf_threads::disk::Statvfs;
 
-use crate::serve::{ServeError, StorageListener, bind_storage_gated};
+use crate::replication::{REPAIR_DIR, bind_node};
+use crate::serve::{ServeError, StorageListener};
 use crate::start::{AbortOnDrop, open_cold_file, share_storage, tier_bytes};
 use crate::startup_pass::StartPass;
 use crate::storage_node::StorageFlags;
@@ -53,9 +58,11 @@ pub struct StorageHalf {
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     maps: Arc<MapHolder>,
+    repairs: Option<Arc<Repairs>>,
     _flusher: Option<AbortOnDrop>,
     _pass: Option<AbortOnDrop>,
     _joiner: Option<AbortOnDrop>,
+    _repair: Option<AbortOnDrop>,
 }
 
 impl StorageHalf {
@@ -63,6 +70,13 @@ impl StorageHalf {
     #[must_use]
     pub fn maps(&self) -> Arc<MapHolder> {
         Arc::clone(&self.maps)
+    }
+
+    /// The copies this node owes: its repair journal. `None` for a node that does not
+    /// replicate (no `--frontend`, or one that admits callers in plain text).
+    #[must_use]
+    pub fn repairs(&self) -> Option<Arc<Repairs>> {
+        self.repairs.clone()
     }
 
     /// The storage the listener serves: the daemon half's, in-process.
@@ -89,6 +103,7 @@ impl StorageHalf {
             _flusher,
             _pass,
             _joiner,
+            _repair,
             ..
         } = self;
         serving.await
@@ -172,23 +187,26 @@ where
         idle: Duration::from_secs(args.segment_upload_idle_secs),
     };
     let storage: Arc<dyn Storage> = Arc::new(CacheStorage::new(cache, segments));
-    // As `kbf storage` does: register with the frontend if there is one, hold its map,
-    // and serve nothing until the first.
-    let maps = Arc::new(MapHolder::new());
-    let gate = flags.frontend.as_ref().map(|_| Arc::clone(&maps));
-    let bound = bind_storage_gated(Arc::clone(&storage), listener, gate, shutdown()?)?;
-    let addr = bound.addr;
-    let _joiner = flags
-        .joiner(addr, Arc::clone(&maps))?
-        .map(|joiner| AbortOnDrop(tokio::spawn(joiner.run())));
+    // After the log is open: it refuses a directory that holds files it did not write.
+    let repair_dir = stores.meta_dir.join(REPAIR_DIR);
+    let node = bind_node(
+        flags,
+        listener,
+        Arc::clone(&storage),
+        &repair_dir,
+        Box::pin(shutdown()?),
+    )?;
+    let addr = node.addr;
     Ok(StorageHalf {
         addr,
         storage,
         start_line: format!("kbf-storage {SERVER_VERSION} storage={addr} log={log}"),
-        serving: Box::pin(bound.serving),
-        maps,
+        serving: node.serving,
+        maps: node.maps,
+        repairs: node.repairs,
         _flusher,
         _pass,
-        _joiner,
+        _joiner: node.joiner,
+        _repair: node.repair,
     })
 }
