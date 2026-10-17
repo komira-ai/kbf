@@ -189,7 +189,7 @@ fn a_state_this_build_does_not_know_is_refused() {
 #[test]
 fn errors_name_the_path_and_change_nothing() {
     let dir = kbf_host::testkit::scratch("deploy-host-state-errors");
-    let root = Root::new(&dir).expect("absolute");
+    let root = Layout::linux(kbf_host::path::Root::new(&dir).expect("absolute"));
     let err = Locked::acquire(&root).expect_err("no /run");
     assert!(matches!(err, StateError::Lock { .. }), "{err:?}");
     assert!(err.to_string().contains("run/kbf-deploy.lock"), "{err}");

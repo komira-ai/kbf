@@ -1,14 +1,17 @@
 //! The host side of kbf's releases: where a host keeps them, the state it records about
-//! them, and the verbs that install, roll back and remove them.
+//! them, and the verbs that install, stage, roll back and remove them.
 //!
-//! - [`layout`]: the paths: each release in its own directory under
+//! The host's records:
+//!
+//! - [`layout`]: the paths ([`layout::Layout`], a directory tree and its
+//!   [`layout::Platform`]): each release in its own directory under
 //!   `/usr/local/kbf/releases/<commit>/`, the `current` and `previous` links beside them,
-//!   kbf-deploy's state under `/var/lib/kbf-deploy/` and its settings under
-//!   `/etc/kbf-deploy/`.
+//!   the state under `/var/lib/kbf-deploy/` (Linux) or `/var/db/kbf-deploy/` (macOS) and
+//!   its settings under `/etc/kbf-deploy/`.
 //! - [`state`]: `state.json` (the current, previous and staged commits, the one waiting
-//!   to be confirmed, and the order floor), read and written under an exclusive lock on
-//!   `/run/kbf-deploy.lock` and replaced whole by a rename.
-//! - [`release`]: the `install`, `rollback` and `gc` verbs.
+//!   to be confirmed, and the order floor), read and written under an exclusive lock and
+//!   replaced whole by a rename.
+//! - [`release`]: the `install`, `stage`, `rollback` and `gc` verbs.
 //! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
 //!   named by.
 //!

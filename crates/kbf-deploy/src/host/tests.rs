@@ -234,6 +234,7 @@ fn rollback_and_gc_run_from_the_command_line() {
     let args = |apply| ApplyArgs {
         apply,
         root: Root::host(),
+        platform: None,
     };
     assert_eq!(
         (args(false).mode(), args(true).mode()),
