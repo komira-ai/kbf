@@ -289,9 +289,9 @@ fn zip_member(zip: &[u8], member: &Path) -> Result<Vec<u8>, Error> {
         Err(zip::result::ZipError::FileNotFound) => return Err(Error::NoMember(member.to_owned())),
         Err(e) => return Err(unpack_error(e)),
     };
-    // A directory, or a symbolic link (a file whose Unix type bits say so).
-    let link = file.unix_mode().is_some_and(|m| m & 0o170_000 == 0o120_000);
-    if !file.is_file() || link {
+    // `is_file` is false for a directory and for a symbolic link (a file whose Unix type
+    // bits say so).
+    if !file.is_file() {
         return Err(Error::NotAFile(member.to_owned()));
     }
     let mut out = Vec::new();
