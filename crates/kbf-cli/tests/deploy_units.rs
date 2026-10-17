@@ -73,6 +73,15 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
                         "/etc/kbf/ca.pem"
                     ]
                 );
+                // Its stores and listener are the settings', read as kbf reads them:
+                // the bucket, the hot store and the metadata log, on the pinned address.
+                assert_eq!(flags.listen.to_string(), "192.0.2.10:8983");
+                assert_eq!(
+                    flags.server.meta_dir.as_deref(),
+                    Some(std::path::Path::new("/var/lib/kbf-server/raft"))
+                );
+                assert!(flags.server.cold_store.is_some(), "no cold store");
+                assert!(flags.server.hot_store.is_some(), "no hot store");
             }
             Invocation::StorageAndDaemon(flags) => {
                 assert_eq!(mode, Mode::StorageAndDaemon);
@@ -93,6 +102,106 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
                 assert!(format!("{:?}", flags.daemon).contains("/etc/kbf/node.pem"));
             }
         }
+    }
+}
+
+/// The all-in-one unit gives no `--state-store`, and kbf all-in-one, parsing the rendered
+/// command line, takes the SQLite file `state.db` in the unit's `--data-dir`: the state
+/// the template's comment promises, and one rule `state-store` passes. Catches the unit
+/// growing a `--state-store` (a Postgres URI, say) or kbf's default moving out of the
+/// data directory, or off SQLite.
+#[test]
+fn the_all_in_one_unit_leaves_its_state_store_to_kbfs_sqlite_default() {
+    let text = render(&config(), Some(1500), Mode::AllInOne).expect("renders");
+    let unit = UnitFile::parse(&text).expect("a unit");
+    let argv = unit.exec_start();
+    assert!(
+        !argv.iter().any(|a| a.starts_with("--state-store")),
+        "{argv:?}"
+    );
+    let data_dir = argv
+        .iter()
+        .find_map(|a| a.strip_prefix("--data-dir="))
+        .expect("the all-in-one unit gives --data-dir");
+    match parse_from(argv.iter().copied()) {
+        Ok(Invocation::AllInOne(flags)) => assert_eq!(
+            flags.server.state_store,
+            Some(kbf_server::StateStoreUri::Sqlite(
+                std::path::Path::new(data_dir).join("state.db")
+            ))
+        ),
+        Ok(_) => panic!("not the all-in-one"),
+        Err(e) => panic!("kbf all-in-one refuses its rendered unit: {e}"),
+    }
+}
+
+/// A certificate made for each row of the farm's certificate table, as the farm's
+/// issuer makes it (an EC P-256 key; `CA:FALSE`, `digitalSignature`, the row's extended
+/// key usage, the authority key id; its names and one role URI in the subjectAltName),
+/// passes `kbf-deploy linux verify-cert` for its row, and names its role the way a
+/// storage node reads it (kbf-storage's `role_of`, the admission of every gRPC call).
+/// Catches the two spellings drifting apart (the `urn:kbf:role:` prefix changed on one
+/// side only, a role spelled otherwise or missing from the table), and a row whose
+/// certificate verify-cert passes but storage reads as another role or none.
+#[test]
+fn each_rows_certificate_names_its_role_as_storage_reads_it() {
+    use kbf_deploy::linux::verify_cert::{CLIENT_AUTH, ROLE_URI_PREFIX, Row, verify};
+    use kbf_storage::service::{PeerRole, role_of};
+    use rcgen::{ExtendedKeyUsagePurpose as Eku, KeyUsagePurpose, SanType};
+
+    assert_eq!(ROLE_URI_PREFIX, kbf_storage::service::ROLE_URI_PREFIX);
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca = rcgen::CertifiedIssuer::self_signed(params, rcgen::KeyPair::generate().expect("key"))
+        .expect("CA");
+    let mut roles = Vec::new();
+    for row in Row::ALL {
+        let name = if row == Row::Daemon {
+            "node-1"
+        } else {
+            "node-1.farm.example"
+        };
+        let mut leaf = rcgen::CertificateParams::new(vec![name.to_owned()]).expect("params");
+        leaf.subject_alt_names.push(SanType::URI(
+            format!("{ROLE_URI_PREFIX}{}", row.role())
+                .try_into()
+                .expect("IA5"),
+        ));
+        leaf.is_ca = rcgen::IsCa::ExplicitNoCa;
+        leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        leaf.extended_key_usages = row
+            .ekus()
+            .iter()
+            .map(|e| {
+                if *e == CLIENT_AUTH {
+                    Eku::ClientAuth
+                } else {
+                    Eku::ServerAuth
+                }
+            })
+            .collect();
+        leaf.use_authority_key_identifier_extension = true;
+        let cert = leaf
+            .signed_by(&rcgen::KeyPair::generate().expect("key"), &ca)
+            .expect("signed");
+        let node_id = (row == Row::Daemon).then_some(name);
+        let failures = verify(
+            ca.pem().as_bytes(),
+            cert.pem().as_bytes(),
+            row,
+            node_id,
+            std::time::SystemTime::now(),
+        )
+        .expect("checked");
+        assert!(failures.is_empty(), "{row:?}: {failures:?}");
+        let role = role_of(cert.der()).expect("a role storage admits");
+        assert_eq!(role.name(), row.role(), "{row:?}");
+        roles.push(role);
+    }
+    // Every role storage knows is some row's.
+    for role in PeerRole::ALL {
+        assert!(roles.contains(&role), "{role:?} is no row's");
     }
 }
 
@@ -201,13 +310,17 @@ fn check_units_with<E: Exec>(
 fn check_units_parses_a_built_modes_flags_with_this_kbf() {
     assert_eq!(kbf_deploy::linux::modes::CHECK_ARGS, kbf_cli::CHECK_ARGS);
     let c = config();
-    for mode in [Mode::Daemon, Mode::AllInOne] {
+    for mode in [Mode::Storage, Mode::Daemon, Mode::AllInOne] {
         let text = render(&c, Some(1500), mode).expect("renders");
-        // all-in-one is labelled trusted; nothing else is said.
-        let notes: Vec<String> = if mode == Mode::AllInOne {
-            vec![TRUSTED_NOTE.to_owned()]
-        } else {
-            Vec::new()
+        // all-in-one is labelled trusted; the storage unit's key file is not on this
+        // machine; nothing else is said.
+        let notes: Vec<String> = match mode {
+            Mode::AllInOne => vec![TRUSTED_NOTE.to_owned()],
+            Mode::Storage => vec![
+                "SKIP credential: no key file at /etc/kbf/s3.env yet, so its owner and mode were not checked"
+                    .to_owned(),
+            ],
+            _ => Vec::new(),
         };
         assert_eq!(
             check_units(&format!("clean_{mode}"), mode, &text),
@@ -238,6 +351,21 @@ fn check_units_parses_a_built_modes_flags_with_this_kbf() {
         );
         assert_eq!(notes, Vec::<String>::new());
     }
+    // The storage node's parser, which refuses kbf-server's other flags by name.
+    let text = render(&c, Some(1500), Mode::Storage).expect("renders");
+    let edited = text.replace(
+        "--meta-dir=",
+        "--worker-listen=192.0.2.10:8981 \\\n    --meta-dir=",
+    );
+    assert_ne!(edited, text);
+    let (failures, _) = check_units("edited_storage", Mode::Storage, &edited);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0].starts_with(&format!(
+            "FAIL parse: kbf storage refuses the flags of kbf-storage.service ({bin} check-args: exit 2): error: kbf storage refuses --worker-listen"
+        )),
+        "{failures:?}"
+    );
 }
 
 /// What a `kbf` without `check-args` answers to `cmd`: clap's refusal, exit 2.
