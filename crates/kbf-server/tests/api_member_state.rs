@@ -15,10 +15,11 @@ use kbf_front::{Cache, MemoryMetaLog};
 use kbf_map::{Map, MemberId, MemberState};
 use kbf_objstore::MemoryStore;
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL, Progress, Registrant};
+use kbf_server::storage_health::Planned;
 use kbf_server::token::ApiToken;
 use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
 use kbf_state::fake::{Fake, Flaw};
-use kbf_state::{ManualClock, Store};
+use kbf_state::{ManualClock, Store, StoreTime};
 use support::{HELLO_WAIT, INTERVAL};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -264,6 +265,16 @@ async fn a_server_without_members_answers_404() {
     assert_eq!(code, 404, "{body}");
 }
 
+/// Whether `planned` ends `secs` seconds from a clock that stands near zero (a few ticks of
+/// the fake's own time have passed).
+fn within(planned: Planned, secs: u64) -> bool {
+    let Planned::Until(end) = planned else {
+        return false;
+    };
+    let from_zero = end.since(StoreTime::from_duration(Duration::ZERO));
+    from_zero >= Duration::from_secs(secs) && from_zero < Duration::from_secs(secs + 5)
+}
+
 /// Catches: an operator's planned restart that answers 200 without reaching the store, one
 /// that is not `Down` in the map or is not marked as planned, one accepted for a member that
 /// is not `Active` (a `Joining` one would come back `Active` on undo), and an undo that
@@ -291,6 +302,12 @@ async fn an_operator_plans_a_restart_and_undoes_it() {
     let (code, body) = post(server.api, "/v1/members/1", OPERATOR, planned).await;
     assert_eq!(code, 200, "{body}");
     assert!(body.contains(r#""state":"planned_down""#), "{body}");
+    // No `for_secs`: the default of 15 minutes, from a clock that stands at zero.
+    assert!(
+        within(other.planned(id).expect("read"), 900),
+        "the default end"
+    );
+    assert_eq!(kbf_server::api::PLANNED_DOWN_FOR, Duration::from_secs(900));
     let map = map_of(&other);
     assert_eq!(map.member(id).map(|m| m.state), Some(MemberState::Down));
     assert_eq!(map.generation(), before + 1);
@@ -300,8 +317,24 @@ async fn an_operator_plans_a_restart_and_undoes_it() {
     );
     assert!(other.planned_down(id).expect("read"));
 
-    let (code, body) = post(server.api, "/v1/members/1", OPERATOR, planned).await;
-    assert_eq!(code, 409, "already out of the write path: {body}");
+    let (code, repeated) = post(server.api, "/v1/members/1", OPERATOR, planned).await;
+    assert_eq!(code, 200, "the same plan again is idempotent: {repeated}");
+    assert_eq!(
+        map_of(&other).generation(),
+        map.generation(),
+        "no new generation"
+    );
+    assert_eq!(repeated, body, "the same answer");
+
+    for (extra, want) in [
+        (r#"{"state":"planned_down","for_secs":0}"#, 400),
+        (r#"{"state":"planned_down","for_secs":86401}"#, 400),
+        (r#"{"state":"active","for_secs":60}"#, 400),
+        (r#"{"state":"planned_down","for_secs":60}"#, 200),
+    ] {
+        let (code, text) = post(server.api, "/v1/members/1", OPERATOR, extra).await;
+        assert_eq!(code, want, "{extra}: {text}");
+    }
 
     let (code, body) = post(
         server.api,

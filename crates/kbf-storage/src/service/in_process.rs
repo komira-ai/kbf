@@ -222,8 +222,9 @@ impl Storage for Called {
         record: ActionRecord,
     ) -> Answer<'_, ()> {
         Box::pin(async move {
+            // Counted from the call, as the wire's is: a commit waiting for the map is open.
+            let _open = self.this.service.open_writes.begin();
             let service = self.judged().await?;
-            let _open = service.open_writes.begin();
             let catching_up = service.catching_up();
             let committed = service
                 .storage
@@ -247,6 +248,7 @@ impl Segments for Judged {
         &self,
         request: Request<BeginRequest>,
     ) -> Result<Response<BeginResponse>, Status> {
+        let _open = self.this.service.open_writes.begin();
         self.this.service.check_map(self.generation).await?;
         self.this.service.segments.begin(request).await
     }

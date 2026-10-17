@@ -190,6 +190,7 @@ impl StorageService {
     /// nobody reads.
     #[must_use]
     pub fn with_open_writes(mut self, open_writes: OpenWrites) -> Self {
+        self.segments = self.storage.segments_counted(&open_writes);
         self.open_writes = open_writes;
         self
     }

@@ -189,6 +189,9 @@ async fn act(
 #[serde(deny_unknown_fields)]
 struct MemberBody {
     state: MemberTarget,
+    /// With `planned_down`: how long the planned restart may last, in seconds, before the
+    /// member returns by its next heartbeat ([`PLANNED_DOWN_FOR`] if absent).
+    for_secs: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -228,6 +231,23 @@ async fn set_member_state(
             return error(StatusCode::BAD_REQUEST, &why);
         }
     };
+    let for_ = match (want.state, want.for_secs) {
+        (MemberTarget::PlannedDown, None) => PLANNED_DOWN_FOR,
+        (MemberTarget::PlannedDown, Some(secs @ 1..=MAX_PLANNED_DOWN_SECS)) => {
+            Duration::from_secs(secs)
+        }
+        (MemberTarget::PlannedDown, Some(_)) => {
+            let why = format!("for_secs is 1 to {MAX_PLANNED_DOWN_SECS}");
+            return error(StatusCode::BAD_REQUEST, &why);
+        }
+        (_, Some(_)) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "for_secs goes with planned_down only",
+            );
+        }
+        (_, None) => Duration::ZERO,
+    };
     let name = match want.state {
         MemberTarget::Active => "active",
         MemberTarget::Draining => "draining",
@@ -237,11 +257,19 @@ async fn set_member_state(
     let set = tokio::task::spawn_blocking(move || match want.state {
         MemberTarget::Active => members.set_state(MemberId(id), MemberState::Active),
         MemberTarget::Draining => members.set_state(MemberId(id), MemberState::Draining),
-        MemberTarget::PlannedDown => members.plan_down(MemberId(id)),
+        MemberTarget::PlannedDown => members.plan_down(MemberId(id), for_),
     })
     .await;
     member_answer(id, name, set)
 }
+
+/// How long a planned restart lasts when the request does not say: an update of a node,
+/// with its start and its catching up, fits in it; a controller that died does not hold the
+/// node out longer.
+pub const PLANNED_DOWN_FOR: Duration = Duration::from_secs(15 * 60);
+
+/// The longest a planned restart may be asked to last: a day.
+pub const MAX_PLANNED_DOWN_SECS: u64 = 24 * 60 * 60;
 
 /// The answer to a member write, from what the blocking call returned.
 fn member_answer(

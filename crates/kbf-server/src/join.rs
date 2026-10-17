@@ -203,7 +203,8 @@ impl Joiner {
     pub async fn beat(&mut self, joined: &Joined) -> Result<u64, Status> {
         // The generation before the count: a write routed by an older map is refused once
         // the node holds the newer one, so a count taken after holds no such write begun
-        // later (docs/design/architecture-v2.md, section 11).
+        // later (docs/design/architecture-v2.md, section 11). No test pins this order: the
+        // two reads cannot be told apart from outside, so a change here is reviewed, not run.
         let have_generation = self.node.maps().generation();
         let (writes_known, open_writes) = self.writes().to_wire();
         let (debts_known, repair_debts) = self.debts().await.to_wire();
