@@ -222,6 +222,27 @@ fn the_times_and_the_cgroup_block_are_what_the_daemon_reported() {
     assert_eq!(render(&r)["reapi_times"], json!({}));
 }
 
+/// Catches: a shape wrongly made or not made when only one of the things that name it is
+/// there: the key alone, a configuration other than `-` alone, a target alone, a test flag
+/// alone, each makes a shape, and a run with none of them has `null`.
+#[test]
+fn any_one_name_makes_a_shape() {
+    let shaped = |f: &dyn Fn(&mut RunRecord)| {
+        let mut r = base();
+        f(&mut r);
+        render(&r)["shape"].clone()
+    };
+    assert_eq!(shaped(&|_| {}), Value::Null);
+    assert_eq!(shaped(&|r| r.shape = 1)["key"], "0000000000000001");
+    assert_eq!(shaped(&|r| r.cfg = "cfg".to_owned())["cfg"], "cfg");
+    assert_eq!(shaped(&|r| r.test = true)["test"], true);
+    let named = shaped(&|r| {
+        r.target = "t".to_owned();
+        r.target_kind = 1;
+    });
+    assert_eq!(named["target"], json!({"label": "t", "kind": "target"}));
+}
+
 /// Catches: a run id taken in upper case (the same run under two links) or of another
 /// length, or one with a sign, and so an id that is not the route's.
 #[test]

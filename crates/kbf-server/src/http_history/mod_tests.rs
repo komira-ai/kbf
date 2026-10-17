@@ -4,8 +4,8 @@
 
 use kbf_history::records::{RunOutcome, RunRecord, WireDigest};
 use kbf_history::{
-    Event, EventQueue, HistoryIndex, HistoryRoot, IndexRoot, Inline, InvKey, InvRef, Limits,
-    Minter, QueueLimits, Reader, Writer, WriterId,
+    Event, EventQueue, HistoryIndex, HistoryRoot, IndexRoot, Inline, InvKey, InvRef,
+    InvocationView, Limits, Minter, QueueLimits, Reader, Writer, WriterId,
 };
 use kbf_invocation::WallTime;
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore, ObjectStore, PageSize};
@@ -183,7 +183,7 @@ async fn a_restored_record_says_what_it_was_made_from() {
     );
     assert_ne!(cut.serial(), whole.serial(), "each restoring has its own");
     // A record with a digest that is no digest is a hole too.
-    let mut broken = gathered.runs;
+    let mut broken = gathered.runs.clone();
     broken[0].action = None;
     let skipped = Gathered {
         runs: broken,
@@ -193,6 +193,14 @@ async fn a_restored_record_says_what_it_was_made_from() {
     let torn = rig.durable.restore(&request, &view, &skipped);
     assert!(!torn.complete() && !torn.rows_capped());
     assert_eq!(torn.rows().len(), 1);
+    // A header that was never closed is a hole whatever was read.
+    let open = InvocationView {
+        complete: false,
+        ..view.clone()
+    };
+    let unclosed = rig.durable.restore(&request, &open, &gathered);
+    assert!(!unclosed.complete() && !unclosed.rows_capped());
+    assert_eq!(unclosed.gap_from(), cut.gap_from());
 }
 
 /// Catches: a read that fails answered as a read that found nothing (a record whose chunk

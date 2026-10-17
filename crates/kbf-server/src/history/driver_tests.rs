@@ -48,6 +48,29 @@ async fn a_stop_gives_up_on_a_last_step_that_never_ends() {
     assert!(gone.load(Ordering::SeqCst), "the task was aborted");
 }
 
+/// Catches: a stop that reports a writer that finished in time as one it gave up on (the
+/// warning is for the last step that ran over), or that does not wait for the writer to
+/// finish before it returns: the task is done when the stop is.
+#[tokio::test]
+async fn a_stop_waits_for_a_last_step_that_ends() {
+    let (stop, stopped) = oneshot::channel::<()>();
+    let done = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&done);
+    let handle = tokio::spawn(async move {
+        flag.store(true, Ordering::SeqCst);
+    });
+    finish(Some(Running {
+        handle: Abort(handle),
+        stop,
+    }))
+    .await;
+    assert!(
+        done.load(Ordering::SeqCst),
+        "the last step ran before the stop returned"
+    );
+    assert!(stopped.await.is_ok(), "the task was told to stop");
+}
+
 /// Catches: a task that outlives its `Running` (a server that dropped its serving future
 /// would leave a writer running against the stores), and a stop of nothing that waits.
 #[tokio::test(start_paused = true)]
@@ -78,6 +101,10 @@ async fn dropping_a_running_writer_aborts_it_and_nothing_stops_at_once() {
 #[test]
 fn a_start_is_named_by_its_time_and_steps_twice_a_second() {
     let a = Options::default();
+    // Options are copied and shown as what they are.
+    let copy = a.clone();
+    assert_eq!(copy.writer, a.writer);
+    assert!(format!("{copy:?}").contains("step_every"));
     assert_ne!(a.writer.0, 0, "microseconds since the epoch");
     assert_eq!(a.step_every, STEP_EVERY);
     assert_eq!(STEP_EVERY, std::time::Duration::from_millis(500));
