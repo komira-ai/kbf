@@ -203,7 +203,7 @@ fn number<T: TryFrom<u64>>(
 ) -> Result<T, BoxError> {
     let value = c.require(key)?;
     let parsed = Some(value)
-        .filter(|v| !v.is_empty() && v.len() <= 10 && v.bytes().all(|b| b.is_ascii_digit()))
+        .filter(|v| v.len() <= 10 && v.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| (min..=max).contains(n))
         .and_then(|n| T::try_from(n).ok());

@@ -711,3 +711,82 @@ fn an_unreadable_duration_is_a_shape_failure() {
     let failures: Vec<&str> = run(&e, &r.args).iter().map(CheckFailure::name).collect();
     assert!(failures.contains(&"envoy-shape"), "{failures:?}");
 }
+
+/// Catches a check that stops at, or skips, a part the render lacks: each plant removes or
+/// breaks one part and the failure that names it must be reported (and the check must
+/// not panic on the rest). Defects: a listener not named `reapi` or `worker`; the REAPI
+/// or worker cluster missing; no HTTP connection manager; a worker filter that is not a
+/// `tcp_proxy`; an upstream keepalive with a zero interval, a zero timeout or neither; both
+/// instances on one port; one instance only; a retry policy with no `retry_on`.
+#[test]
+fn a_part_the_render_lacks_is_a_named_failure() {
+    let keepalive = format!(
+        "{RC}/typed_extension_protocol_options/envoy.extensions.upstreams.http.v3.HttpProtocolOptions/explicit_http_config/http2_protocol_options/connection_keepalive"
+    );
+    let endpoints = format!("{RC}/load_assignment/endpoints/0/lb_endpoints");
+    let cases: Vec<(&str, &str, BoxPlant)> = vec![
+        ("listeners", "no worker listener", |e, _| {
+            set(e, &format!("{WORKER}/name"), json!("other"))
+        }),
+        ("listeners", "no reapi listener", |e, _| {
+            set(e, &format!("{REAPI}/name"), json!("other"))
+        }),
+        ("route-cluster", "no REAPI cluster", |e, _| {
+            set(e, &format!("{RC}/name"), json!("other"))
+        }),
+        ("worker-listener", "no worker cluster", |e, _| {
+            set(e, &format!("{WC}/name"), json!("other"))
+        }),
+        ("hcm", "no connection manager", |e, _| {
+            set(e, &format!("{REAPI}/filter_chains/0/filters"), json!([]))
+        }),
+        ("worker-listener", "not a tcp_proxy", |e, _| {
+            set(e, &format!("{PROXY}/@type"), json!("type.example/other"))
+        }),
+    ];
+    for (name, defect, plant) in cases {
+        let r = rendered(EXAMPLE);
+        let (mut envoy, mut args) = (parsed(&r), r.args.clone());
+        plant(&mut envoy, &mut args);
+        let got: Vec<&str> = run(&envoy, &args).iter().map(CheckFailure::name).collect();
+        assert!(got.contains(&name), "{defect}: {got:?}");
+    }
+    let r = rendered(EXAMPLE);
+    let planted = |change: &dyn Fn(&mut Value)| {
+        let mut e = parsed(&r);
+        change(&mut e);
+        run(&e, &r.args)
+            .iter()
+            .map(CheckFailure::name)
+            .collect::<Vec<_>>()
+    };
+    for (key, value) in [("interval", "0s"), ("timeout", "0s")] {
+        let got = planted(&|e| set(e, &format!("{keepalive}/{key}"), json!(value)));
+        assert_eq!(got, ["upstream-keepalive"], "{key} {value}");
+    }
+    let got = planted(&|e| {
+        let k = at(e, &keepalive).as_object_mut().expect("an object");
+        k.remove("interval");
+        k.remove("timeout");
+    });
+    assert_eq!(got, ["upstream-keepalive"], "neither");
+    let got = planted(&|e| {
+        let port = at(
+            e,
+            &format!("{endpoints}/0/endpoint/address/socket_address/port_value"),
+        )
+        .clone();
+        set(
+            e,
+            &format!("{endpoints}/1/endpoint/address/socket_address/port_value"),
+            port,
+        );
+    });
+    assert!(got.contains(&"instances"), "one port twice: {got:?}");
+    let got = planted(&|e| {
+        at(e, &endpoints).as_array_mut().expect("a list").pop();
+    });
+    assert_eq!(got, ["instances"], "one instance");
+    let got = planted(&|e| remove(e, &format!("{ROUTES}/0/route/retry_policy"), "retry_on"));
+    assert_eq!(got, ["retry-routes"], "no retry_on");
+}
