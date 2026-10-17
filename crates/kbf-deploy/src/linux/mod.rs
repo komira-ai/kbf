@@ -13,9 +13,9 @@
 //! - With `--mode MODE`, both verbs work on one mode of the one `kbf` binary instead
 //!   ([`modes`]): `render-units` writes `kbf.slice` and `kbf-<mode>.service`, and
 //!   `check-units` checks the two, each with its drop-ins (`<name>.d/*.conf`), against
-//!   [`modes`]' rules (docs/deploy/kbf-modes.md). For a built
-//!   mode it also runs `<kbf> check-args <mode> <flags...>` (`--kbf-bin PATH`, or the
-//!   unit's own binary when it is installed; a `SKIP parse:` line when it is not).
+//!   [`modes`]' rules (docs/deploy/kbf-modes.md). It also
+//!   runs `<kbf> check-args <mode> <flags...>` (`--kbf-bin PATH`, or the unit's own
+//!   binary when it is installed; a `SKIP parse:` line when it is not).
 //!
 //! Exit codes: 0 rendered, or every rule holds; 1 a rule is broken; 2 refused (a bad
 //! setting, a template placeholder with no value, a file that cannot be read or
@@ -28,6 +28,8 @@
 //! - `kbf-deploy linux install-units --config FILE [--bin-dir DIR] [--restart-minio]
 //!   [--uninstall] [--apply]` ([`install`]): the binaries, the four units, the Raft and
 //!   scratch directories, and the services started.
+//!   With `--mode MODE` ([`install_mode`]): `kbf` (with `--bin-dir`), `kbf.slice` and
+//!   one built mode's unit, the directories its flags name, and the unit started.
 //! - `kbf-deploy linux image-pull --config FILE [--image REF]... [--platform OS/ARCH]
 //!   [--apply]` ([`images`]): the pinned images in the kbf user's Podman store, pulled
 //!   as that user.
@@ -37,6 +39,10 @@
 //! `kbf-deploy linux meta-backup --meta-dir DIR [--hot-dir DIR] --out FILE [--apply]`
 //! copies kbf-server's metadata log into one archive in a brief stop (as root), and
 //! `linux meta-verify --archive FILE --into DIR` extracts and checks one ([`meta`]).
+//!
+//! `kbf-deploy linux verify-cert --row ROW --cert FILE --ca-cert FILE [--node-id ID]`
+//! ([`verify_cert`]) checks, read only, that a certificate is its row of the farm's
+//! certificate table: its one role, its extended key usage, its chain to the CA.
 //!
 //! The settings are a closed set of `KEY=VALUE` lines ([`config::KEYS`],
 //! `templates/linux/config.example`).
@@ -49,10 +55,14 @@ mod glob;
 pub mod host;
 pub mod images;
 pub mod install;
+pub mod install_mode;
 pub mod meta;
 pub mod modes;
 pub mod render;
+pub mod stop;
+pub mod stores;
 pub mod swap;
+pub mod verify_cert;
 
 #[cfg(test)]
 mod tests;
@@ -74,6 +84,8 @@ pub enum Refusal {
     Config(#[from] LinuxError),
     #[error(transparent)]
     Template(#[from] TemplateError),
+    #[error(transparent)]
+    Render(#[from] modes::RenderError),
     #[error(transparent)]
     Check(#[from] CheckError),
     /// `--kbf-bin` is not an absolute path.

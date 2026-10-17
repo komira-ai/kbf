@@ -220,7 +220,10 @@ pub struct Args {
     /// PEM private key of the worker listener.
     #[arg(long, requires_all = ["worker_tls_cert", "worker_client_ca"])]
     pub worker_tls_key: Option<PathBuf>,
-    /// PEM CA that daemon client certificates must chain to.
+    /// PEM CA that client certificates must chain to. Each must also name the role the
+    /// method it calls takes: the daemon role (`urn:kbf:role:daemon`) for the worker
+    /// session and blob calls, the storage role (`urn:kbf:role:storage`) for
+    /// `kbf.map.v1.Membership`; a frontend certificate may call nothing here.
     #[arg(long, requires_all = ["worker_tls_cert", "worker_tls_key"])]
     pub worker_client_ca: Option<PathBuf>,
     /// The worker listener's deny list: certificate serials, public keys and node ids
@@ -409,6 +412,20 @@ pub struct Args {
         display_order = 5,
     )]
     pub state_store: Option<crate::state_store::StateStoreUri>,
+    /// How long, in seconds, a storage node's membership row lives without a heartbeat
+    /// before the state store expires it and the member goes down in the storage map.
+    /// Nodes are asked to heartbeat three times as often.
+    #[arg(long, value_name = "SECONDS", default_value_t = 15, requires = "state_store", value_parser = clap::value_parser!(u64).range(3..))]
+    pub member_ttl_secs: u64,
+    /// How long, in seconds, a down storage member stays in the map before it leaves
+    /// and its blobs move to other owners.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = 300,
+        requires = "state_store"
+    )]
+    pub member_dwell_secs: u64,
 }
 
 /// This server in the tier registry. A farm runs one server today
@@ -566,6 +583,17 @@ impl Args {
             },
             stream_limits: self.streams.limits(),
         })
+    }
+
+    /// How storage members live in the state store: `--member-ttl-secs` and
+    /// `--member-dwell-secs`.
+    #[must_use]
+    pub fn members(&self) -> crate::members::MembershipConfig {
+        crate::members::MembershipConfig {
+            ttl: Duration::from_secs(self.member_ttl_secs),
+            dwell: Duration::from_secs(self.member_dwell_secs),
+            ..crate::members::MembershipConfig::default()
+        }
     }
 
     /// Refuses a `--segment-upload-max-bytes` over `--write-bytes-in-flight`: an upload

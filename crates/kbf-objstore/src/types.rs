@@ -180,7 +180,7 @@ impl PageSize {
 
     /// The size as a number.
     #[must_use]
-    pub fn get(self) -> u16 {
+    pub const fn get(self) -> u16 {
         self.0
     }
 }

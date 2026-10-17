@@ -7,46 +7,21 @@
 //! UNAUTHENTICATED for no certificate, PERMISSION_DENIED for a certificate with no role,
 //! two, an unknown one or one the endpoint does not take.
 //!
-//! **What is a seam for av2-14 (role certificates).** How a certificate spells its role.
-//! Until that unit settles it, a role is a URI subjectAltName `urn:kbf:role:<name>`
-//! ([`ROLE_URI_PREFIX`]); [`role_of`] is the one place that reads it. Not here, and
-//! planned in section 9 and phase P7: the deny list and node-name checks of
-//! `kbf-server`'s worker listener, and the signed storage-access grant.
+//! **How a certificate names its role** is `kbf-peer`'s: one URI subjectAltName
+//! `urn:kbf:role:<name>` ([`ROLE_URI_PREFIX`]), read by `kbf_peer::role_of`; [`role_of`]
+//! here is it with the refusal as a gRPC status, and `kbf-server`'s worker listener asks
+//! it too.
+//! Not here, and planned in section 9 and phase P7: the deny list and node-name checks
+//! of `kbf-server`'s worker listener, and the signed storage-access grant.
 //!
-//! Plain text ([`Admission::Open`]) has no identity to read, so it admits every call: for
+//! Plain text ([`Admission::Open`]) has no identity to read, so it admits every call but a
+//! copy from another storage node ([`Endpoint::WriteLeg`]), which only a certified storage
+//! caller may send: for
 //! tests and trials on one machine, as the worker listener's `Peers::Unauthenticated`.
 
+use kbf_peer::RoleError;
+pub use kbf_peer::{PeerRole, ROLE_URI_PREFIX};
 use tonic::{Request, Status};
-use x509_parser::extensions::{GeneralName, ParsedExtension};
-
-/// How a certificate names a role (provisional, see the module docs).
-pub const ROLE_URI_PREFIX: &str = "urn:kbf:role:";
-
-/// The role a peer's certificate names (section 9).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PeerRole {
-    /// A frontend, on behalf of a client or of a daemon's result.
-    Frontend,
-    /// Another storage node (replication, repair).
-    Storage,
-    /// A build node.
-    Daemon,
-}
-
-impl PeerRole {
-    /// Every role, in the order section 9 lists them.
-    pub const ALL: [Self; 3] = [Self::Frontend, Self::Storage, Self::Daemon];
-
-    /// The name a certificate spells after [`ROLE_URI_PREFIX`].
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Frontend => "frontend",
-            Self::Storage => "storage",
-            Self::Daemon => "daemon",
-        }
-    }
-}
 
 /// The endpoints with their own expectation of who calls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +32,11 @@ pub enum Endpoint {
     Read,
     /// ByteStream `Write`.
     Write,
+    /// ByteStream `Write` of a copy another storage node sends (the `kbf-chain-leg`
+    /// entry): a primary to its replica, or a repair. Only a storage node makes one; a
+    /// call that names itself a copy and is from another role would be a write that is
+    /// never forwarded to a second owner.
+    WriteLeg,
     /// ByteStream `QueryWriteStatus`: whether a `Write` of the blob has landed, so it
     /// is the roles of the `Write` it asks about.
     QueryWriteStatus,
@@ -72,10 +52,11 @@ pub enum Endpoint {
 
 impl Endpoint {
     /// Every endpoint.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::FindMissing,
         Self::Read,
         Self::Write,
+        Self::WriteLeg,
         Self::QueryWriteStatus,
         Self::ActionGet,
         Self::ActionPrepare,
@@ -94,6 +75,7 @@ impl Endpoint {
             Self::FindMissing | Self::Read | Self::Write | Self::QueryWriteStatus => {
                 &[Frontend, Storage, Daemon]
             }
+            Self::WriteLeg => &[Storage],
             Self::ActionGet => &[Frontend],
             Self::ActionPrepare | Self::ActionCommit => &[Frontend, Daemon],
             Self::Segments => &[Daemon],
@@ -104,7 +86,8 @@ impl Endpoint {
 /// How a storage service learns who is calling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admission {
-    /// Plain text: no identity, every call admitted.
+    /// Plain text: no identity, every call admitted but [`Endpoint::WriteLeg`], which needs
+    /// a caller shown to be a storage node.
     Open,
     /// Mutual TLS: the verified client certificate must name a role the endpoint takes.
     Certified,
@@ -124,12 +107,19 @@ impl Admission {
     /// [`Admission::check`] for a caller whose verified chain starts with `leaf`.
     ///
     /// # Errors
-    /// Under [`Admission::Certified`], UNAUTHENTICATED if there is no certificate or it
+    /// UNAUTHENTICATED for [`Endpoint::WriteLeg`] under [`Admission::Open`]. Under
+    /// [`Admission::Certified`], UNAUTHENTICATED if there is no certificate or it
     /// does not parse; PERMISSION_DENIED if it names no role, several, one that is not
     /// a role, or a role `endpoint` does not take.
     pub fn check_leaf(&self, leaf: Option<&[u8]>, endpoint: Endpoint) -> Result<(), Status> {
         if *self == Self::Open {
-            return Ok(());
+            return if endpoint == Endpoint::WriteLeg {
+                Err(Status::unauthenticated(
+                    "a copy from another storage node needs a certified storage caller",
+                ))
+            } else {
+                Ok(())
+            };
         }
         let der = leaf.ok_or_else(|| Status::unauthenticated("no client certificate"))?;
         let role = role_of(der)?;
@@ -143,36 +133,15 @@ impl Admission {
     }
 }
 
-/// The role a DER certificate names: its one `urn:kbf:role:<name>` URI subjectAltName.
+/// The role a DER certificate names (`kbf_peer::role_of`), a refusal as the status every
+/// listener that takes a client certificate answers it.
 ///
 /// # Errors
 /// UNAUTHENTICATED: the bytes are not a certificate. PERMISSION_DENIED: it names no
 /// role or several, or a name that is no role.
 pub fn role_of(der: &[u8]) -> Result<PeerRole, Status> {
-    let (_, cert) = x509_parser::parse_x509_certificate(der)
-        .map_err(|e| Status::unauthenticated(format!("the client certificate: {e}")))?;
-    let names: Vec<&str> = cert
-        .extensions()
-        .iter()
-        .filter_map(|e| match e.parsed_extension() {
-            ParsedExtension::SubjectAlternativeName(san) => Some(&san.general_names),
-            _ => None,
-        })
-        .flatten()
-        .filter_map(|name| match name {
-            GeneralName::URI(uri) => uri.strip_prefix(ROLE_URI_PREFIX),
-            _ => None,
-        })
-        .collect();
-    let [name] = names.as_slice() else {
-        return Err(Status::permission_denied(format!(
-            "the client certificate must name exactly one role ({ROLE_URI_PREFIX}<name>); \
-             it names {}",
-            names.len()
-        )));
-    };
-    PeerRole::ALL
-        .into_iter()
-        .find(|role| role.name() == *name)
-        .ok_or_else(|| Status::permission_denied(format!("{name:?} is not a role")))
+    kbf_peer::role_of(der).map_err(|e| match e {
+        RoleError::NotACertificate(_) => Status::unauthenticated(e.to_string()),
+        RoleError::Count(_) | RoleError::Unknown(_) => Status::permission_denied(e.to_string()),
+    })
 }

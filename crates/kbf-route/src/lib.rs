@@ -5,13 +5,16 @@
 //!
 //! # What the router does
 //!
-//! - **Reads** ([`Router::read_range`], [`Router::read_blob`], [`Router::action_result`]):
+//! - **Reads** ([`Router::read_range`], [`Router::read_blob`], [`Router::read_blob_into`],
+//!   [`Router::action_result`]):
 //!   owners in rank order, then (while a join or a drain settles) the previous
 //!   generation's. Only the answer "I do not hold it" moves on to the next owner without
 //!   remembering a failure; a blob is `NOT_FOUND` only if every owner said so, and
 //!   `UNAVAILABLE` if one could not. A read that breaks after its first byte goes on from
 //!   the bytes already passed ([`MAX_RESUMES`]). Bytes are passed on chunk by chunk; the
-//!   router holds no blob but the one [`Router::read_blob`] is asked for.
+//!   router holds no blob but the one [`Router::read_blob`] is asked for. A blob read
+//!   whole, into memory or into a [`BlobSink`], is hashed and checked against its digest,
+//!   and a copy that is not the blob is a failed owner: the next one is read.
 //! - **Read repair**: a read answered by an owner after an earlier owner of the same
 //!   generation said it did not hold the blob has found a copy missing. A
 //!   [`ReadRepair`] hook is told, at most as often as a [`RepairLimit`] allows.
@@ -19,9 +22,10 @@
 //!   answers ([`Router::read_blob`]).
 //! - **FindMissing** ([`Router::find_missing`]) asks each digest's primary only, one call
 //!   per primary, and puts the answers back in the order asked.
-//! - **Writes** ([`Router::put`], [`Router::commit_action_record`]) go to the primary
-//!   owner; the chain forwards to the replica (av2-11). An owner that is `Down` in the
-//!   map is skipped.
+//! - **Writes** ([`Router::put`], [`Router::commit_action_record`]) go to the first
+//!   write owner that is not `Down` in the map, and to that one only: the router does not
+//!   write to the others or retry on another owner (the storage side's chain replication
+//!   is av2-11).
 //! - **`STALE_MAP`**: a node that holds a newer map answers [`StorageError::StaleMap`].
 //!   The router fetches the newer map through the [`MapSource`] and runs the call again,
 //!   once; a second answer, or a fetch that brings no newer map, is `UNAVAILABLE`.
@@ -36,7 +40,9 @@
 //! # TLS
 //!
 //! [`TlsNodes`] verifies each node against its own name from the map and has no way to be
-//! given one name for all of them.
+//! given one name for all of them. A node that goes silent is given up on after the
+//! [`Liveness`] it is given (ten seconds to dial, pings every ten seconds by default), so
+//! a read fails over to the next owner instead of waiting for the operating system.
 
 mod find;
 mod flights;
@@ -45,11 +51,13 @@ mod read;
 mod repair;
 mod resume;
 mod router;
+mod sink;
 mod source;
 mod write;
 
-pub use nodes::{Nodes, TlsNodes};
+pub use nodes::{Liveness, Nodes, TlsNodes};
 pub use repair::{ReadRepair, RepairLimit};
 pub use resume::MAX_RESUMES;
 pub use router::{Placement, Router};
+pub use sink::{BlobSink, IntoError};
 pub use source::{MapSource, MapView, RefetchError};

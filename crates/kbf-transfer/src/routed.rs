@@ -2,9 +2,9 @@
 //!
 //! The same [`Cas`] a runtime uses against [`crate::Transfers`], but each blob goes to
 //! the storage nodes that own it (`kbf_route::Router`): reads from the owners in rank
-//! order (callers of one blob at once share one read), writes to the primary, FindMissing
-//! split by primary. A daemon holds a connection to a frontend for work, and to storage
-//! nodes for bytes.
+//! order (callers of one blob at once share one read), writes to the first owner that is
+//! not down, FindMissing split by primary. A daemon holds a connection to a frontend for
+//! work, and to storage nodes for bytes.
 //!
 //! What it keeps from the engine: at most `--transfer-in-flight` requests at once for the
 //! process, FindMissing in calls of at most `--transfer-find-missing-chunk` digests, a
@@ -18,25 +18,27 @@
 //!   chunks, because the storage client has no streamed write ([`kbf_storage::Storage`]
 //!   takes a blob whole).
 //! - **A byte budget** for reads into memory ([`Cas::get`]); `--transfer-bytes-in-flight`
-//!   does not apply. Reads into a file stream, and hold one chunk.
+//!   does not apply. Reads into a file stream, and hold one chunk; a copy that turns out
+//!   not to be the blob is cut off the file and the next owner is read from the start, and
+//!   a read that fails or is dropped part way leaves the file as it was.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::io::{self, Seek as _, SeekFrom, Write as _};
+use std::os::fd::AsFd as _;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
-use futures::StreamExt as _;
 use futures::future::join_all;
 use kbf_proto::reapi::Digest;
-use kbf_route::Router;
+use kbf_route::{BlobSink, IntoError, Router};
 use kbf_storage::StorageError;
 use kbf_types::{DigestFunction, LeaseId};
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::AsyncSeekExt as _;
 use tokio::sync::Semaphore;
 
 use crate::cas::{Cas, CasError, label};
 use crate::config::TransferConfig;
 use crate::spool::to_proto;
-use kbf_segments::RecordHasher;
 
 /// The daemon's data plane over the storage map. Cheap to clone through its `Arc`.
 pub struct RoutedCas {
@@ -67,16 +69,101 @@ impl RoutedCas {
     }
 }
 
+/// A file a blob is read into, from the offset it had when the read began, through a
+/// handle of its own on the caller's open file: its writes move the caller's offset, and
+/// the caller's handle never has one of them in flight.
+///
+/// Unless the read succeeded (`kept`), dropping it cuts the file back to where
+/// the read began and goes back there, at once: a read that fails, and a read its caller
+/// drops part way, leave the file as it was. A write already running when it is dropped
+/// finishes first; one that has not begun writes nothing.
+struct FileSink {
+    handle: Arc<Mutex<Handle>>,
+    start: u64,
+    kept: bool,
+}
+
+/// The sink's handle on the file, and whether the sink has been dropped.
+struct Handle {
+    file: std::fs::File,
+    /// Set when the sink is dropped: no write lands after the file is cut back.
+    cut: bool,
+}
+
+impl Handle {
+    /// Cuts the file back to `to` and goes back there.
+    fn rewind(&mut self, to: u64) -> io::Result<()> {
+        self.file.set_len(to)?;
+        self.file.seek(SeekFrom::Start(to)).map(drop)
+    }
+}
+
+impl FileSink {
+    /// A sink writing into `file` from `start`, its offset once nothing is in flight on it.
+    fn open(file: &tokio::fs::File, start: u64) -> io::Result<Self> {
+        let file = std::fs::File::from(file.as_fd().try_clone_to_owned()?);
+        Ok(Self {
+            handle: Arc::new(Mutex::new(Handle { file, cut: false })),
+            start,
+            kept: false,
+        })
+    }
+
+    /// Runs `work` on the handle, on a blocking thread.
+    async fn run(
+        &self,
+        work: impl FnOnce(&mut Handle) -> io::Result<()> + Send + 'static,
+    ) -> io::Result<()> {
+        let handle = Arc::clone(&self.handle);
+        tokio::task::spawn_blocking(move || {
+            work(&mut handle.lock().unwrap_or_else(PoisonError::into_inner))
+        })
+        .await?
+    }
+}
+
+impl BlobSink for FileSink {
+    type Error = io::Error;
+
+    async fn write(&mut self, chunk: &[u8]) -> io::Result<()> {
+        let chunk = chunk.to_vec();
+        self.run(move |handle| {
+            let chunk: &[u8] = if handle.cut { &[] } else { &chunk };
+            handle.file.write_all(chunk)
+        })
+        .await
+    }
+
+    async fn discard(&mut self) -> io::Result<()> {
+        let start = self.start;
+        self.run(move |handle| handle.rewind(start)).await
+    }
+}
+
+impl Drop for FileSink {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        let mut handle = self.handle.lock().unwrap_or_else(PoisonError::into_inner);
+        handle.cut = true;
+        // No one to tell: the read has failed already, or its caller has gone.
+        let _ = handle.rewind(self.start);
+    }
+}
+
 /// `digest` as storage names it, or `None` when it is not a SHA-256 digest with a size,
 /// which no store holds.
 fn parse(digest: &Digest) -> Option<kbf_types::Digest> {
     kbf_types::Digest::parse(DigestFunction::Sha256, &label(digest)).ok()
 }
 
-/// A storage failure as the data plane's: only a blob the farm does not hold is missing.
+/// A storage failure as the data plane's: only a blob the farm does not hold is missing,
+/// and only bytes that are not the blob are corrupt.
 fn failed(blob: String, error: &StorageError) -> CasError {
     match error {
         StorageError::NotFound(_) => CasError::Missing(blob),
+        StorageError::Corrupt { actual, .. } => CasError::Corrupt(blob, label(&to_proto(actual))),
         other => CasError::Unavailable(blob, other.to_string()),
     }
 }
@@ -107,30 +194,32 @@ impl Cas for RoutedCas {
         }
     }
 
+    /// Streams the blob into `file` from its offset, one chunk at a time, through
+    /// [`Router::read_blob_into`]: the owners are tried as [`Cas::get`] tries them, and
+    /// an owner's copy that is not the blob is cut off the file before the next owner's is
+    /// written. On every error, and when the read is dropped part way, the file holds what
+    /// it held before and its offset is where it was.
     async fn read_to(&self, digest: &Digest, file: &mut tokio::fs::File) -> Result<(), CasError> {
         let blob = label(digest);
         let Some(parsed) = parse(digest) else {
             return Err(CasError::Missing(blob));
         };
-        let _permit = self.requests.acquire().await;
-        let mut stream = self
-            .router
-            .read_range(&parsed, 0, 0)
+        // The offset is known once what the caller's handle had in flight has landed, so
+        // nothing of the caller's lands among the blob's bytes.
+        let opened = file
+            .stream_position()
             .await
-            .map_err(|e| failed(blob.clone(), &e))?;
-        let mut hasher = RecordHasher::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| failed(blob.clone(), &e))?;
-            hasher.update(&chunk);
-            let written = file.write_all(&chunk).await;
-            written.map_err(|e| CasError::Write(blob.clone(), e.to_string()))?;
+            .and_then(|start| FileSink::open(file, start));
+        let mut sink = opened.map_err(|e| CasError::Write(blob.clone(), e.to_string()))?;
+        let _permit = self.requests.acquire().await;
+        match self.router.read_blob_into(&parsed, &mut sink).await {
+            Ok(()) => {
+                sink.kept = true;
+                Ok(())
+            }
+            Err(IntoError::Storage(e)) => Err(failed(blob, &e)),
+            Err(IntoError::Sink(e)) => Err(CasError::Write(blob, e.to_string())),
         }
-        let (read, _) = hasher.finish();
-        if read != parsed {
-            return Err(CasError::Corrupt(blob, label(&to_proto(&read))));
-        }
-        let flushed = file.flush().await;
-        flushed.map_err(|e| CasError::Write(blob, e.to_string()))
     }
 
     async fn missing(&self, digests: &[Digest]) -> Vec<Digest> {

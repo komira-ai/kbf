@@ -21,28 +21,48 @@
 //!
 //! **The map generation** (section 6) rides on every call: a field of every
 //! `kbf.storage.v1` request, and the [`MAP_GENERATION_HEADER`] metadata entry on the
-//! standard calls. A node with one member never reads it; [`RemoteStorage`] sends it.
+//! standard calls. [`RemoteStorage`] sends it. A node given no map source ignores it; one given a
+//! [`crate::replicate::MapSource`] ([`StorageService::with_map`], or
+//! [`StorageService::with_chain`], which brings its own) judges every call by it,
+//! before the call reads anything: STALE_MAP (FAILED_PRECONDITION with the node's
+//! generation in the same entry) for a caller behind the node; for one ahead of it, the node
+//! fetches the map ([`crate::replicate::MapSource::refetch`]) and goes on, or answers
+//! UNAVAILABLE if it cannot get it in time. Such a node that has no map yet fetches one the
+//! same way and serves nothing (UNAVAILABLE) until it has.
+//!
+//! **A node that is catching up** ([`CatchUp`], [`StorageService::with_catch_up`]) is
+//! rebuilding its index, so a miss does not show a blob is not held: a `Read` of a blob it
+//! cannot find, a `FindMissingBlobs` with any digest missing (the whole call, so a router
+//! asks the next owner about every digest of it), an action-cache miss, and an
+//! action-cache write refused for a closure blob not found all answer UNAVAILABLE, never
+//! NOT_FOUND or FAILED_PRECONDITION. Hits and writes are served.
 //!
 //! **Who may call** is [`Admission`]: the role in the caller's certificate against the
-//! endpoint's table. Roles are the part of this unit that is partly a seam; the module
-//! docs of [`admission`] say which.
+//! endpoint's table, the role read by `kbf-peer`; the module docs of [`admission`] say
+//! what is checked and what is planned.
 //!
-//! **Where PutStream plugs in.** `Write` buffers a blob whole: it does not use
-//! [`Storage::stream`] yet, which `kbf-front`'s cache answers with a stream wherever it
-//! can take one. When it does, the handler appends each message to the stream instead,
-//! and [`Config::write_bytes_in_flight`] is needed no more.
+//! **How `Write` takes a blob in.** Where the store offers a [`crate::PutStream`]
+//! ([`Storage::stream`]), each message is appended to it as it arrives and the blob is
+//! never held whole; the primary of a chain streams it on to the replica too
+//! ([`crate::replicate`]). Where it does not (no store hands one out yet), a node that is
+//! in no chain holds the blob until it is complete, within
+//! [`Config::write_bytes_in_flight`].
 
 mod actions;
 mod admission;
 mod bytestream;
 mod cas;
+mod catch_up;
 mod client;
+mod generation;
 mod segments;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod wire;
+mod write;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
 use kbf_proto::reapi::content_addressable_storage_server::ContentAddressableStorageServer;
@@ -51,10 +71,13 @@ use kbf_proto::worker::segments_server::{Segments, SegmentsServer};
 use tokio::sync::Semaphore;
 use tonic::service::Routes;
 
-use crate::Storage;
+use crate::replicate::{self, Chain, MapSource};
+use crate::{Storage, StorageError};
 
 pub use admission::{Admission, Endpoint, PeerRole, ROLE_URI_PREFIX, role_of};
+pub use catch_up::CatchUp;
 pub use client::RemoteStorage;
+pub(crate) use client::lift;
 
 /// The metadata entry that carries the map generation on the standard calls.
 pub const MAP_GENERATION_HEADER: &str = "kbf-map-generation";
@@ -63,8 +86,10 @@ pub const MAP_GENERATION_HEADER: &str = "kbf-map-generation";
 /// around it, `kbf-front`'s `MAX_MESSAGE_BYTES` (a test pins the two equal).
 pub const MAX_MESSAGE_BYTES: usize = (16 << 20) + (1 << 20);
 
-/// The largest blob a `Write` accepts, `kbf-front`'s `MAX_BLOB_BYTES` (pinned the same).
-pub const MAX_BLOB_BYTES: u64 = 1 << 30;
+/// The size past which a `Write` is not held whole but streamed to the store as its
+/// messages arrive ([`crate::Storage::put_streamed`]), `kbf-front`'s
+/// `MAX_UNSTAGED_BLOB_BYTES` (a test pins the two equal). No blob is refused for its size.
+pub const STREAM_FROM_BYTES: u64 = 16 << 20;
 
 /// The most digests one `FindMissingBlobs` may name. `kbf-front` sets none beyond the
 /// message size, and a full message could name 262 144 of them (17 MiB over the 68 bytes
@@ -90,6 +115,10 @@ pub struct StorageService {
     storage: Arc<dyn Storage>,
     segments: Arc<dyn Segments>,
     admission: Admission,
+    chain: Option<Arc<Chain>>,
+    map: Option<Arc<dyn MapSource>>,
+    catch_up: Option<CatchUp>,
+    refetch_wait: Duration,
     write_room: Semaphore,
     write_room_bytes: u32,
 }
@@ -102,8 +131,72 @@ impl StorageService {
             segments: storage.segments(),
             storage,
             admission,
+            chain: None,
+            map: None,
+            catch_up: None,
+            refetch_wait: replicate::REFETCH_WAIT,
             write_room: Semaphore::new(config.write_bytes_in_flight as usize),
             write_room_bytes: config.write_bytes_in_flight,
+        }
+    }
+
+    /// The service judging every call by the map `map` holds ([`crate::replicate`]), with
+    /// no part in a chain (a node that serves reads, or a test).
+    #[must_use]
+    pub fn with_map(mut self, map: Arc<dyn MapSource>) -> Self {
+        self.map = Some(map);
+        self
+    }
+
+    /// The service as a node of a chain ([`crate::replicate`]): it judges every call by the
+    /// chain's map and, as the primary of a blob, copies it to the replica before it
+    /// answers.
+    ///
+    /// # Errors
+    /// [`StorageError::Invalid`] unless the service admits callers by their certificates
+    /// ([`Admission::Certified`]): the copy a primary sends its replica must be shown to come
+    /// from a storage node, or any caller could write a blob that is never copied.
+    pub fn with_chain(mut self, chain: Arc<Chain>) -> Result<Self, StorageError> {
+        if self.admission != Admission::Certified {
+            return Err(StorageError::Invalid(
+                "a node in a chain admits callers by certificate (Admission::Certified)".into(),
+            ));
+        }
+        self.map = Some(chain.source());
+        self.chain = Some(chain);
+        Ok(self)
+    }
+
+    /// The service of a node whose index may be being rebuilt: while `catch_up` says so,
+    /// a miss is UNAVAILABLE (the module docs). A service given none is never catching up.
+    #[must_use]
+    pub fn with_catch_up(mut self, catch_up: CatchUp) -> Self {
+        self.catch_up = Some(catch_up);
+        self
+    }
+
+    /// Whether a miss found from now on must be answered UNAVAILABLE: read before the
+    /// store is asked ([`catch_up`]'s module docs say why).
+    fn catching_up(&self) -> bool {
+        self.catch_up.as_ref().is_some_and(CatchUp::is_catching_up)
+    }
+
+    /// How long a call routed by a map this node has not been told of waits for the node
+    /// to fetch it (default [`replicate::REFETCH_WAIT`]).
+    #[must_use]
+    pub const fn with_refetch_wait(mut self, wait: Duration) -> Self {
+        self.refetch_wait = wait;
+        self
+    }
+
+    /// Whether a call routed by map generation `requested` may be served now: always, for
+    /// a node given no map source ([`replicate::check`]).
+    async fn check_map(&self, requested: u64) -> Result<(), StorageError> {
+        match &self.map {
+            Some(source) => replicate::check(&**source, requested, self.refetch_wait)
+                .await
+                .map(drop),
+            None => Ok(()),
         }
     }
 

@@ -280,6 +280,75 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
         assert!(exec.queries.borrow().is_empty(), "{args:?} asked the host");
     }
 
+    // A mode's unit reaches its own install: on a host with no such user it asks for the
+    // user the frontend runs as and is refused before any step.
+    let mut exec = FakeExec::new(0);
+    let args = [base("install-units"), vec!["--mode", "frontend"]].concat();
+    let (code, _, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!(code, ExitCode::from(2));
+    assert_eq!(
+        err,
+        "REFUSED: /usr/bin/getent passwd -- kbf-server printed \"\", which is not what this kit reads\n"
+    );
+    // The converged units' MinIO restart and rollback are not a mode's.
+    for flag in ["--restart-minio", "--uninstall"] {
+        let mut exec = FakeExec::new(0);
+        let args = [base("install-units"), vec!["--mode", "storage", flag]].concat();
+        let (code, _, _) = cli(&mut exec, &no_env, &args);
+        assert_eq!(code, ExitCode::from(2), "{args:?}");
+        assert!(exec.queries.borrow().is_empty(), "{args:?} asked the host");
+    }
+    // verify-cert reaches its kit: a CA that is not there is refused; a daemon's row
+    // needs its node id.
+    let mut exec = FakeExec::new(0);
+    let args = [
+        "linux",
+        "verify-cert",
+        "--row",
+        "storage",
+        "--cert",
+        "/srv/none/storage.pem",
+        "--ca-cert",
+        "/srv/none/ca.pem",
+    ];
+    let (code, _, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!(code, ExitCode::from(2));
+    assert!(
+        err.starts_with("REFUSED: cannot read /srv/none/ca.pem"),
+        "{err}"
+    );
+    let args = [
+        "linux",
+        "verify-cert",
+        "--row",
+        "daemon",
+        "--cert",
+        "/srv/none/node.pem",
+        "--ca-cert",
+        "/srv/none/ca.pem",
+    ];
+    let (code, _, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!(code, ExitCode::from(2));
+    assert!(err.contains("--node-id"), "{err}");
+    // The frontend's REAPI certificate is not the farm CA's: no row checks it.
+    let args = [
+        "linux",
+        "verify-cert",
+        "--row",
+        "frontend-reapi",
+        "--cert",
+        "/srv/none/reapi.pem",
+        "--ca-cert",
+        "/srv/none/ca.pem",
+    ];
+    let (code, out, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""));
+    assert!(
+        err.contains("invalid value 'frontend-reapi' for '--row <ROW>'"),
+        "{err}"
+    );
+    assert!(!err.contains("REFUSED: cannot read"), "{err}");
+
     // A rollback of a host whose services are on: a dry run plans, exits 0.
     let mut exec = FakeExec::new(501);
     let (code, out, _) = cli(

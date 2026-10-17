@@ -279,7 +279,8 @@ impl Closing {
     }
 
     /// Whether the closer has begun to drain or has closed.
-    fn draining(&self) -> bool {
+    #[must_use]
+    pub fn draining(&self) -> bool {
         *self.0.borrow() != Phase::Open
     }
 }
@@ -491,6 +492,7 @@ where
         }
         let mut window = Presubmit::begin(self.cache.metrics());
         let open = self.cache.metrics().execute.execute();
+        self.cache.metrics().execute.started.add(1);
         let caller = kbf_auth::metadata(&request);
         let call = crate::request_metadata::call_metadata(&request);
         let request = request.into_inner();
@@ -568,7 +570,7 @@ where
                     action,
                     answer: ExecuteAnswer::Cached {
                         name: name.clone(),
-                        result: Box::new(listing(stored, &result)),
+                        result: Box::new(listing(Some(stored), &result)),
                     },
                 });
             let done = operation(
@@ -968,8 +970,10 @@ fn operations(
     ticket: Ticket,
     closing: Closing,
     progress: Progress,
-    open: OpenExecute,
+    mut open: OpenExecute,
 ) -> OperationStream {
+    // Before the first item is read, so a stream the client has not yet polled is open.
+    open.streaming();
     let Ticket {
         name,
         action,
