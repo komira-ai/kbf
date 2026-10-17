@@ -7,7 +7,13 @@
 //! on a `FaultFs` (crashed or restarted as a test needs) and a faulty store. Each test's
 //! comment names the defect it is there to catch.
 
+#[path = "write_tier/ac_order.rs"]
+mod ac_order;
 mod common;
+#[path = "write_tier/reads.rs"]
+mod reads;
+#[path = "write_tier/stream.rs"]
+mod stream;
 #[path = "write_tier/support.rs"]
 mod support;
 

@@ -21,7 +21,7 @@ use kbf_server::storage_node::{StorageFlags, command, parse, start_storage};
 use kbf_server::{EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_state};
 use kbf_state::{Store, Versioned};
 use kbf_storage::Storage as _;
-use kbf_storage::service::{ROLE_URI_PREFIX, RemoteStorage};
+use kbf_storage::service::{CatchUp, ROLE_URI_PREFIX, RemoteStorage};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, SanType,
@@ -35,6 +35,8 @@ fn dir(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("storage-register")
         .join(name);
+    // A state store left by an earlier run would be a cluster that has already formed.
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("directory");
     dir
 }
@@ -89,6 +91,7 @@ fn listeners(worker_tls: Option<WorkerTls>) -> Listeners {
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
         streams: kbf_server::StreamTiming::default(),
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     }
 }
 
@@ -154,7 +157,7 @@ fn state(f: &Frontend, id: u64) -> Option<MemberState> {
 
 /// Catches: a node that registers but does not keep its row alive, a frontend that never
 /// expires a node that stops, and a registration that tells the frontend something other
-/// than what the node is. The node registers on start (its bound address, Joining); the
+/// than what the node is. The node registers on start (its bound address, Active); the
 /// store's clock then moves 45 ms (TTL 60 ms) after each beat it sees, six times, which is
 /// four TTLs and which the row survives only because the node beats; when the node stops,
 /// 61 ms are enough for the frontend's own timer to mark it Down.
@@ -173,7 +176,7 @@ async fn a_storage_node_registers_and_heartbeats_across_several_ttls() {
     let me = map.member(MemberId(1)).expect("the node is in the map");
     assert_eq!(
         (me.addr.clone(), me.state),
-        (addr.to_string(), MemberState::Joining)
+        (addr.to_string(), MemberState::Active)
     );
     for round in 1..=6 {
         f.store.clock.advance(45 * MS);
@@ -181,7 +184,7 @@ async fn a_storage_node_registers_and_heartbeats_across_several_ttls() {
             row(&f, 1).filter(|r| r.version != seen).map(|r| r.version)
         })
         .await;
-        assert_eq!(state(&f, 1), Some(MemberState::Joining), "round {round}");
+        assert_eq!(state(&f, 1), Some(MemberState::Active), "round {round}");
     }
 
     serving.abort();
@@ -195,7 +198,7 @@ async fn a_storage_node_registers_and_heartbeats_across_several_ttls() {
 /// Catches: a node that treats a lapsed row as fatal or never notices. After its row
 /// expires (the manual clock moves past the TTL right after a beat, and the frontend
 /// marks it Down) its next heartbeat is NOT_FOUND; it registers again, keeps its member
-/// id, gets boot 2 and is Joining.
+/// id, gets boot 2 and is Active.
 #[tokio::test]
 async fn a_node_whose_row_lapsed_registers_again() {
     let f = frontend(None);
@@ -210,10 +213,12 @@ async fn a_node_whose_row_lapsed_registers_again() {
     // Boot 2 is the registration after the lapse: a beat of boot 2 is accepted, and the
     // member has the id it had.
     until("the node to register again", || {
-        f.members.heartbeat(MemberId(1), 2).ok()
+        f.members
+            .heartbeat(MemberId(1), 2, kbf_server::members::Progress::CaughtUp)
+            .ok()
     })
     .await;
-    assert_eq!(state(&f, 1), Some(MemberState::Joining));
+    assert_eq!(state(&f, 1), Some(MemberState::Active));
     assert_eq!(f.store.fake.scan_prefix("member/").expect("scan").len(), 1);
 }
 
@@ -253,13 +258,56 @@ async fn a_node_retries_through_failures_and_keeps_its_boot() {
         row(&f, 1).filter(|r| r.version != first)
     })
     .await;
-    assert_eq!(state(&f, 1), Some(MemberState::Joining));
+    assert_eq!(state(&f, 1), Some(MemberState::Active));
     assert_eq!(
         f.store.fake.scan_prefix("member/").expect("scan").len(),
         1,
         "one member, registered once"
     );
     joiner.abort();
+}
+
+/// Catches: a rebuilding node that enters the map as anything but CatchingUp, a report of
+/// "still rebuilding" that promotes it, and a report of "done" that does not. A joiner
+/// whose [`CatchUp`] says it is rebuilding registers through the frontend's membership
+/// service and is CatchingUp; a heartbeat while it still rebuilds leaves it so and bumps
+/// no generation; after [`CatchUp::finish`] the next heartbeat makes it Active in a new
+/// generation, which is the one the heartbeat answers. Mutants: `catching_up` not sent
+/// (Active); the promotion on every beat (Active while rebuilding); no promotion.
+#[tokio::test]
+async fn a_rebuilding_node_registers_catching_up_and_is_promoted_on_its_report() {
+    let f = frontend(None);
+    let channel = Endpoint::from_shared(format!("http://{}", f.worker))
+        .expect("endpoint")
+        .connect_lazy();
+    let who = NodeIdentity {
+        instance_id: "node-r".to_owned(),
+        addr: "192.0.2.6:8982".to_owned(),
+        zone: String::new(),
+        weight: 1,
+    };
+    let catch_up = CatchUp::rebuilding();
+    let mut joiner = Joiner::new(channel, who, 5 * MS).with_catch_up(catch_up.clone());
+    let joined = joiner.register().await.expect("registers");
+    assert_eq!(state(&f, joined.member_id), Some(MemberState::CatchingUp));
+
+    let still = joiner.beat(&joined).await.expect("beats");
+    assert_eq!(
+        still, joined.generation,
+        "a beat while rebuilding changed the map"
+    );
+    assert_eq!(state(&f, joined.member_id), Some(MemberState::CatchingUp));
+
+    catch_up.finish();
+    let promoted = joiner.beat(&joined).await.expect("beats");
+    assert_eq!(state(&f, joined.member_id), Some(MemberState::Active));
+    let map = f.members.current_map().expect("read").expect("a map");
+    assert_eq!(promoted, map.generation());
+    assert_eq!(
+        promoted,
+        joined.generation + 1,
+        "one generation for the promotion"
+    );
 }
 
 /// Catches: flags that are ignored or accepted when they cannot work: the advertised
@@ -448,7 +496,8 @@ fn the_wait_after_failures_doubles_to_a_cap() {
 /// (`start_frontend`, SQLite state store, `--member-ttl-secs` and `--member-dwell-secs`)
 /// and a real node register; a second registrant re-registers until the map the
 /// frontend answers with (published by the refresh that follows a registration) holds the
-/// node at its bound address, Joining. The wait is bounded only to fail a hang.
+/// node at its bound address, `Active` (the first member of a fresh cluster is promoted on
+/// arrival). The wait is bounded only to fail a hang.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
     let d = dir("frontend-mode");
@@ -499,6 +548,7 @@ async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
         weight: 1,
         zone: String::new(),
         protocol: kbf_server::members::PROTOCOL,
+        catching_up: false,
     };
     let found = until_async("the node in the frontend's map", || {
         let (mut probe, request) = (probe.clone(), request.clone());
@@ -508,7 +558,7 @@ async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
         }
     })
     .await;
-    assert_eq!(found.state, pb::MemberState::Joining as i32);
+    assert_eq!(found.state, pb::MemberState::Active as i32);
     node_serving.abort();
     drop(stop);
     serving.await.expect("joins").expect("stops");
@@ -534,8 +584,9 @@ async fn waiting_node(
 /// frontend cannot admit it (its store fails, so there is no map) every kind of call is
 /// refused UNAVAILABLE "no storage map yet", not answered as an empty cache (a
 /// FindMissing that says every blob is missing, a write taken that the map places
-/// elsewhere); once the registration lands the same calls are served. Mutant: a gate that
-/// lets every call through.
+/// elsewhere), the action cache and the segment uploads included; once the registration
+/// lands the same calls are served. Mutant: a gate that lets every call through, or one
+/// that spares the action cache or Segments.
 #[tokio::test]
 async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
     let f = frontend(None);
@@ -544,6 +595,9 @@ async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
         .store(1_000_000, std::sync::atomic::Ordering::SeqCst);
     let (node, client) = waiting_node(&f, "gate").await;
     let maps = node.maps();
+    let segments = Endpoint::from_shared(format!("http://{}", node.addr))
+        .expect("endpoint")
+        .connect_lazy();
     let _serving = tokio::spawn(node.serve());
     // The node's directory outlives the run: a blob no earlier run stored.
     let blob = format!(
@@ -576,6 +630,31 @@ async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
                 .put(bytes::Bytes::from(blob.clone()))
                 .await
                 .expect_err("refused")
+        ),
+        want
+    );
+    // The action cache, read and written, and the Segments uploads.
+    assert_eq!(
+        refused(client.action_result(&digest).await.expect_err("refused")),
+        want
+    );
+    assert_eq!(
+        refused(
+            client
+                .prepare_action_result(&kbf_proto::reapi::ActionResult::default())
+                .await
+                .expect_err("refused")
+        ),
+        want
+    );
+    let begun = kbf_proto::worker::segments_client::SegmentsClient::new(segments.clone())
+        .begin(kbf_proto::worker::BeginRequest::default())
+        .await
+        .expect_err("refused");
+    assert_eq!(
+        (
+            begun.code(),
+            begun.message().contains(kbf_server::NO_MAP_YET)
         ),
         want
     );
@@ -633,6 +712,7 @@ async fn a_heartbeat_brings_a_node_the_map_it_missed() {
             zone: String::new(),
             weight: 1,
             protocol: kbf_server::members::PROTOCOL,
+            progress: kbf_server::members::Progress::CaughtUp,
         })
         .expect("a second member");
     let learned = until("a heartbeat to bring the new map", || {

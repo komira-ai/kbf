@@ -14,7 +14,7 @@ const KEY: &str = "/etc/kbf/s3.env";
 
 fn found(service: &str) -> Vec<String> {
     let unit = UnitFile::parse(&format!("[Service]\n{service}")).expect("a unit");
-    key_given(&unit, Path::new(KEY))
+    key_given(&unit, Path::new(KEY), false)
 }
 
 /// Catches an `EnvironmentFile=` that reaches the key file by another spelling going
@@ -174,7 +174,7 @@ fn environment_assignments_are_unquoted_as_systemd_does() {
     );
     // Not [Service]: not the process's environment.
     let unit = UnitFile::parse("[Unit]\nEnvironment=AWS_PROFILE=x\n").expect("a unit");
-    assert!(key_given(&unit, Path::new(KEY)).is_empty());
+    assert!(key_given(&unit, Path::new(KEY), false).is_empty());
 }
 
 /// Catches `PassEnvironment=` and the systemd credential directives not read: each
@@ -294,4 +294,269 @@ fn paths_are_normalised_by_their_words() {
     assert_eq!(words("a\tb\rc\nd e"), ["a", "b", "c", "d", "e"]);
     assert_eq!(words("a\u{a0}b \u{a0}"), ["a\u{a0}b", "\u{a0}"]);
     assert_eq!(words("''"), [""]);
+}
+
+/// The storage unit, run as `user`, with `files` as its `EnvironmentFile=` lines.
+fn holding(user: &str, files: &[&str]) -> UnitFile {
+    let lines: String = files
+        .iter()
+        .map(|f| format!("EnvironmentFile={f}\n"))
+        .collect();
+    UnitFile::parse(&format!(
+        "[Service]\n{user}{lines}ExecStart=/usr/local/bin/kbf storage\n"
+    ))
+    .expect("a unit")
+}
+
+/// Catches the key holder's file not read on the node: a key other users can read, a
+/// key another user owns, or a link in its place passed; a root-owned 0600 key refused
+/// (systemd reads it as root); a missing key, an unreadable one, or a user that cannot
+/// be looked up passed without a `SKIP` line; a `User=` the node does not have passed;
+/// and a wildcard naming the key not read at the key's own path.
+#[test]
+fn on_the_node_the_key_holders_file_is_root_or_its_users_alone() {
+    let mut exec = FakeExec::new(0);
+    exec.answer = Box::new(|cmd: &kbf_host::step::Cmd| {
+        Ok(
+            match (cmd.program.as_str(), cmd.args.last().map(String::as_str)) {
+                ("/usr/bin/getent", Some("kbf-server")) => kbf_host::testkit::reply(
+                    0,
+                    "kbf-server:x:990:990::/var/lib/kbf-server:/sbin/nologin\n",
+                    "",
+                ),
+                ("/usr/bin/id", _) => kbf_host::testkit::reply(0, "990\n", ""),
+                ("/usr/bin/getent", Some("nobody-here")) => kbf_host::testkit::reply(2, "", ""),
+                _ => kbf_host::testkit::reply(1, "", "getent: broken\n"),
+            },
+        )
+    });
+    let key = HostPath::new(KEY).expect("absolute");
+    let user = "User=kbf-server\n";
+    let set = |exec: &mut FakeExec, bits: u32, uid: u32| {
+        let entry = Entry::File {
+            perms: Perms::new(bits),
+            owner: Owner { uid, gid: uid },
+            bytes: b"AWS_ACCESS_KEY_ID=a\n".to_vec(),
+        };
+        exec.entries
+            .insert(HostPath::new(KEY).expect("absolute"), entry);
+    };
+    let run = |exec: &FakeExec, user: &str, files: &[&str]| {
+        holder_on_host(exec, &holding(user, files), &key)
+    };
+
+    // No key file yet, named directly or by a wildcard: a SKIP line each.
+    let r = run(&exec, user, &[KEY, "/etc/kbf/s3.e*"]);
+    assert_eq!(r.failures, Vec::<String>::new());
+    assert_eq!(
+        r.notes,
+        [
+            "SKIP credential: no key file at /etc/kbf/s3.env yet, so its owner and mode were not checked",
+            "SKIP credential: no key file at /etc/kbf/s3.env yet, so its owner and mode were not checked",
+        ]
+    );
+    // No user, or a file the unit does not name as the key: nothing to read.
+    assert_eq!(run(&exec, "", &[KEY]), OnHost::default());
+    assert_eq!(run(&exec, "User=\n", &[KEY]), OnHost::default());
+    assert_eq!(run(&exec, user, &["/etc/kbf/other.env"]), OnHost::default());
+
+    for (bits, uid, want) in [
+        (0o600, 990, Vec::<String>::new()),
+        (0o600, 0, Vec::new()),
+        (0o400, 990, Vec::new()),
+        (
+            0o640,
+            990,
+            vec!["/etc/kbf/s3.env is mode 0640, so users other than kbf-server can read the key: make it 0600".to_owned()],
+        ),
+        (
+            0o604,
+            0,
+            vec!["/etc/kbf/s3.env is mode 0604, so users other than kbf-server can read the key: make it 0600".to_owned()],
+        ),
+        (
+            0o600,
+            1000,
+            vec!["/etc/kbf/s3.env is uid 1000's, neither root's nor kbf-server's (uid 990): that user can read or replace the key".to_owned()],
+        ),
+    ] {
+        set(&mut exec, bits, uid);
+        let r = run(&exec, user, &[KEY]);
+        assert_eq!((r.failures, r.notes), (want, Vec::new()), "{bits:o} {uid}");
+    }
+
+    set(&mut exec, 0o600, 990);
+    let r = run(&exec, "User=nobody-here\n", &[KEY]);
+    assert_eq!(r.failures, ["User=nobody-here is not a user on this node"]);
+    let r = run(&exec, "User=broken\n", &[KEY]);
+    assert_eq!(r.failures, Vec::<String>::new());
+    assert_eq!(r.notes.len(), 1);
+    assert!(
+        r.notes[0].starts_with("SKIP credential: cannot look up User=broken ("),
+        "{:?}",
+        r.notes
+    );
+
+    exec.entries
+        .insert(HostPath::new(KEY).expect("absolute"), Entry::Other);
+    let r = run(&exec, user, &[KEY]);
+    assert_eq!(
+        r.failures,
+        ["/etc/kbf/s3.env is not a plain file (a link or a directory)"]
+    );
+
+    // A key path the node cannot stat.
+    let unreadable = holder_on_host(
+        &exec,
+        &holding(user, &["/unreadable"]),
+        &HostPath::new("/unreadable").expect("absolute"),
+    );
+    assert_eq!(
+        unreadable.notes,
+        [
+            "SKIP credential: cannot read /unreadable (permission denied), so its owner and mode were not checked"
+        ]
+    );
+}
+
+/// The unit of a mode that holds the key beside its builds, with `lines` in `[Service]`.
+fn beside(lines: &str) -> Vec<String> {
+    let unit = UnitFile::parse(&format!("[Service]\n{lines}")).expect("a unit");
+    key_given(&unit, Path::new(KEY), true)
+}
+
+/// Catches the allowance for `storage-and-daemon` too wide or not made: the key file
+/// exactly as `<KBF_ETC>/s3.env` is the one file it may name; the same file spelled any
+/// other way (optional, quoted, through `.` or `//`, a wildcard, a copy under another
+/// directory, a second assignment of it with an `AWS_*` variable beside) is refused as it is
+/// for a build node, and a mode with no allowance (`daemon`) refuses even the exact file.
+#[test]
+fn the_unit_that_holds_the_key_beside_builds_may_name_exactly_the_key_file() {
+    assert_eq!(
+        beside(&format!("EnvironmentFile={KEY}\n")),
+        Vec::<String>::new()
+    );
+    for value in [
+        "-/etc/kbf/s3.env",
+        "\"/etc/kbf/s3.env\"",
+        "/etc/kbf/./s3.env",
+        "/etc//kbf/s3.env",
+        "/etc/kbf/s3.e*",
+        "/etc/kbf/*.env",
+        "/srv/kbf/s3.env",
+        "/etc/kbf/s3.env/",
+    ] {
+        assert_eq!(
+            beside(&format!("EnvironmentFile={value}\n")),
+            [format!("EnvironmentFile={value}")],
+            "{value}"
+        );
+    }
+    // The exact file plus another way: only the other way is reported.
+    assert_eq!(
+        beside(&format!(
+            "EnvironmentFile={KEY}\nEnvironment=AWS_SESSION_TOKEN=x\nLoadCredential=s3:{KEY}\n"
+        )),
+        [
+            "Environment= sets AWS_SESSION_TOKEN".to_owned(),
+            format!("LoadCredential=s3:{KEY}, a systemd credential"),
+        ]
+    );
+    // The same file twice is still the one file.
+    assert_eq!(
+        beside(&format!("EnvironmentFile={KEY}\nEnvironmentFile={KEY}\n")),
+        Vec::<String>::new()
+    );
+    // No allowance: the exact file is a way to give the key.
+    assert_eq!(
+        found(&format!("EnvironmentFile={KEY}\n")),
+        [format!("EnvironmentFile={KEY}")]
+    );
+}
+
+/// The unit holding the key beside builds, with `lines` in `[Service]`.
+fn keyed(lines: &str) -> UnitFile {
+    UnitFile::parse(&format!("[Service]\n{lines}")).expect("a unit")
+}
+
+/// Catches the key file of `storage-and-daemon` not read on the node, or read as the
+/// storage unit's: it must be a plain file, root's, with no group or other bit (the unit
+/// runs as the build user, so a file that user owns, or that is group-readable, is the key
+/// in a build's reach); a missing or unreadable file is a SKIP line, and a unit that does
+/// not name the exact key file is not read.
+#[test]
+fn on_the_node_the_key_beside_builds_is_roots_alone() {
+    let mut exec = FakeExec::new(0);
+    let key = HostPath::new(KEY).expect("absolute");
+    let set = |exec: &mut FakeExec, bits: u32, uid: u32| {
+        exec.entries.insert(
+            HostPath::new(KEY).expect("absolute"),
+            Entry::File {
+                perms: Perms::new(bits),
+                owner: Owner { uid, gid: uid },
+                bytes: b"AWS_ACCESS_KEY_ID=a\n".to_vec(),
+            },
+        );
+    };
+    let unit = keyed(&format!("User=kbf\nEnvironmentFile={KEY}\n"));
+    let r = root_key_on_host(&exec, &unit, &key);
+    assert_eq!(r.failures, Vec::<String>::new());
+    assert_eq!(
+        r.notes,
+        [
+            "SKIP credential: no key file at /etc/kbf/s3.env yet, so its owner and mode were not checked"
+        ]
+    );
+    for (bits, uid, want) in [
+        (0o600, 0, Vec::<&str>::new()),
+        (0o400, 0, Vec::new()),
+        (
+            0o600,
+            1500,
+            vec!["/etc/kbf/s3.env is uid 1500's, not root's: that user can replace the key"],
+        ),
+        (
+            0o640,
+            0,
+            vec!["/etc/kbf/s3.env is mode 0640, so other users can read the key: make it 0600"],
+        ),
+        (
+            0o644,
+            1500,
+            vec![
+                "/etc/kbf/s3.env is uid 1500's, not root's: that user can replace the key",
+                "/etc/kbf/s3.env is mode 0644, so other users can read the key: make it 0600",
+            ],
+        ),
+    ] {
+        set(&mut exec, bits, uid);
+        let r = root_key_on_host(&exec, &unit, &key);
+        assert_eq!(r.failures, want, "{bits:o} {uid}");
+        assert_eq!(r.notes, Vec::<String>::new(), "{bits:o} {uid}");
+    }
+    // Not named exactly (an optional file, a wildcard) or not named: not read here.
+    for lines in [
+        "EnvironmentFile=-/etc/kbf/s3.env\n",
+        "EnvironmentFile=/etc/kbf/*.env\n",
+        "",
+    ] {
+        set(&mut exec, 0o644, 1500);
+        assert_eq!(
+            root_key_on_host(&exec, &keyed(lines), &key),
+            OnHost::default()
+        );
+    }
+    exec.entries.insert(key.clone(), Entry::Other);
+    assert_eq!(
+        root_key_on_host(&exec, &unit, &key).failures,
+        ["/etc/kbf/s3.env is not a plain file (a link or a directory)"]
+    );
+    let unreadable = HostPath::new("/unreadable").expect("absolute");
+    let r = root_key_on_host(&exec, &keyed("EnvironmentFile=/unreadable\n"), &unreadable);
+    assert_eq!(
+        r.notes,
+        [
+            "SKIP credential: cannot read /unreadable (permission denied), so its owner and mode were not checked"
+        ]
+    );
 }

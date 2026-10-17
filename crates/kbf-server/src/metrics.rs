@@ -1,5 +1,6 @@
 //! `GET /metrics` on the operator API listener: the cache's upload-path metrics
-//! ([`kbf_front::metrics`]), the write tier's when one is attached, and the fill of the
+//! ([`kbf_front::metrics`]), the write tier's when one is attached, the lost-blob
+//! families read from the metadata state ([`kbf_front::Losses`]), and the fill of the
 //! node's one cache when the process has one (`kbf-all-in-one`,
 //! [`kbf_storage::local_cache`]), in the Prometheus text format, for a scraper or for
 //! `curl` while an upload is slow (`docs/api.md#get-metrics`).
@@ -84,6 +85,10 @@ where
     O: ObjectStore + 'static,
 {
     let mut text = sources.cache.render_metrics();
+    // Read from the metadata state now; a log that cannot answer leaves them out of
+    // this scrape rather than failing it.
+    let losses = sources.cache.losses().await;
+    losses.iter().for_each(|l| l.render(&mut text));
     sources.extras.render(&mut text);
     ([(CONTENT_TYPE, TEXT_FORMAT)], text).into_response()
 }

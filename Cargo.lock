@@ -1333,6 +1333,7 @@ dependencies = [
  "kbf-front",
  "kbf-meta",
  "kbf-node",
+ "kbf-objstore",
  "kbf-proto",
  "kbf-segments",
  "kbf-server",
@@ -1480,6 +1481,7 @@ dependencies = [
  "kbf-segments",
  "kbf-server",
  "kbf-storage",
+ "kbf-store",
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
@@ -1493,6 +1495,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "tracing-core",
  "tracing-subscriber",
 ]
 
@@ -1507,9 +1510,11 @@ dependencies = [
  "httparse",
  "kbf-host",
  "kbf-mdm",
+ "kbf-state",
  "kbf-types",
  "plist",
  "rcgen",
+ "rusqlite",
  "rustix",
  "rustls",
  "rustls-native-certs",
@@ -1519,6 +1524,7 @@ dependencies = [
  "ssh-key",
  "tar",
  "thiserror",
+ "time",
  "x509-parser",
  "zip",
 ]
@@ -1591,9 +1597,11 @@ dependencies = [
  "kbf-auth",
  "kbf-caps",
  "kbf-invocation",
+ "kbf-map",
  "kbf-meta",
  "kbf-objstore",
  "kbf-proto",
+ "kbf-route",
  "kbf-sched",
  "kbf-segments",
  "kbf-storage",
@@ -1852,6 +1860,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac 0.13.0",
+ "kbf-objstore",
  "kbf-segments",
  "kbf-threads",
  "kbf-types",
@@ -1861,6 +1870,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1877,6 +1887,15 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "kbf-peer"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "thiserror",
+ "x509-parser",
 ]
 
 [[package]]
@@ -1964,6 +1983,7 @@ dependencies = [
  "kbf-objstore",
  "kbf-proto",
  "kbf-raft",
+ "kbf-route",
  "kbf-sched",
  "kbf-segments",
  "kbf-sim",
@@ -1973,6 +1993,7 @@ dependencies = [
  "kbf-threads",
  "kbf-tier",
  "kbf-types",
+ "kbf-ui",
  "libc",
  "percent-encoding",
  "prost",
@@ -1986,6 +2007,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "tonic",
+ "tonic-prost",
+ "tower-layer",
  "tracing",
  "tracing-core",
  "tracing-subscriber",
@@ -2025,6 +2048,7 @@ dependencies = [
 name = "kbf-state"
 version = "0.1.0"
 dependencies = [
+ "kbf-state",
  "postgres",
  "rusqlite",
  "rustix",
@@ -2040,6 +2064,7 @@ dependencies = [
  "futures",
  "kbf-map",
  "kbf-meta",
+ "kbf-peer",
  "kbf-proto",
  "kbf-segments",
  "kbf-store",
@@ -2050,7 +2075,6 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
- "x509-parser",
 ]
 
 [[package]]
@@ -2117,6 +2141,18 @@ dependencies = [
 name = "kbf-types"
 version = "0.1.0"
 dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "kbf-ui"
+version = "0.1.0"
+dependencies = [
+ "form_urlencoded",
+ "futures",
+ "percent-encoding",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

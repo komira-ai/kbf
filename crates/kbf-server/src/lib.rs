@@ -76,6 +76,7 @@ pub mod farm;
 mod fault;
 mod flag_set;
 pub mod fleet;
+pub mod front_maps;
 pub mod frontend;
 pub mod grpc_health;
 pub mod health;
@@ -105,9 +106,11 @@ pub mod state_store;
 pub mod storage_half;
 pub mod storage_node;
 pub mod stores;
+pub mod streams;
 mod timeout;
 pub mod token;
 pub mod worker;
+pub mod worker_roles;
 pub mod write_tier;
 
 pub use config::{Args, ConfigError, Role, SERVER, s3_store};
@@ -122,10 +125,11 @@ pub use serve::{
     Api, Bound, BoundStorage, Listeners, NO_MAP_YET, ServeError, StorageListener, StreamTiming,
     WorkerTls, bind_server, bind_server_with_api, bind_server_with_map, bind_server_with_options,
     bind_server_with_policy, bind_server_with_state, bind_server_with_storage, bind_storage,
-    bind_storage_gated,
+    bind_storage_gated, bind_storage_shared,
 };
 pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_interruptible};
 pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};
+pub use streams::{StreamArgs, StreamLimits};
 pub use worker::WorkerService;
 
 /// The commit the server was built from: 12 hex digits, or `unknown` when the build

@@ -31,8 +31,9 @@
 //! tonic level. See the `proxy` module for what it keeps and what it does not do yet.
 //!
 //! **The backend.** Execute reads the store through a [`Backend`], a cache in this
-//! process or a storage node ([`Backend::remote`]); `kbf frontend` runs the second and
-//! holds no cache at all.
+//! process, a storage node ([`Backend::remote`]) or the storage nodes of a map
+//! ([`Backend::routed`]); `kbf frontend` runs the last two and holds no cache at all.
+//! The map is a [`Routed`], shared with the proxy ([`Owners::routed`]).
 //!
 //! **Authorization.** Every service asks a `kbf_auth` authorizer before it serves a
 //! call ([`routes_with_authorizers`]; which call asks which is on each service and in
@@ -56,6 +57,7 @@ mod bytestream;
 mod cache;
 mod capabilities;
 mod cas;
+mod closure;
 mod cpu;
 mod described;
 mod execution;
@@ -65,6 +67,7 @@ pub mod metrics;
 mod proxy;
 mod recorder;
 mod request_metadata;
+mod routed;
 mod segments;
 mod storage;
 mod wire;
@@ -85,11 +88,13 @@ pub use crate::backend::Backend;
 pub use crate::bytestream::ByteStreamService;
 pub use crate::cache::HIT_CHECKS_IN_FLIGHT;
 pub use crate::cache::{
-    Admitted, BATCH_READS_IN_FLIGHT, CONNECTION_WINDOW_BYTES, Cache, CacheError, EVICT_BATCH,
-    EVICT_EVERY, EVICT_GRACE, EvictReady, EvictRound, FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX,
-    FLUSHES_PER_ROUND, FlushRound, HeldObject, MAX_ADMISSION_BYTES, MAX_CONCURRENT_STREAMS,
-    NEEDS_V3, PASS_OPENS_PER_SEC, PUT_BACKOFF, PUT_BACKOFF_FACTOR, PassReport, STREAM_WINDOW_BYTES,
-    TierStartError, TierStartup, TouchConfig, VerifiedBlob, WriteConfig,
+    Admitted, BATCH_READS_IN_FLIGHT, BlobRead, Cache, CacheError, DEFAULT_REAPI_STREAMS,
+    DEFAULT_WORKER_STREAMS, EVICT_BATCH, EVICT_EVERY, EVICT_GRACE, EvictReady, EvictRound,
+    FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound,
+    HeldObject, Losses, MAX_ADMISSION_BYTES, MAX_DECODED_BLOB_BYTES, NEEDS_V3, PASS_OPENS_PER_SEC,
+    PUT_BACKOFF, PUT_BACKOFF_FACTOR, PassReport, READ_WINDOW_BYTES, RecordStream,
+    STREAM_WINDOW_BYTES, StreamedRecord, TierStartError, TierStartup, TouchConfig, VerifiedBlob,
+    WriteConfig,
 };
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
@@ -112,6 +117,7 @@ pub use crate::request_metadata::{
     MAX_ID_BYTES, MAX_TEXT_BYTES, Read, ReadRequestMetadata, RequestMetadataLayer, Text,
     call_metadata,
 };
+pub use crate::routed::{Channels, Routed};
 pub use crate::segments::{
     Connection, Connections, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, MIN_SEGMENT_UPLOAD_BYTES,
     SegmentsConfig, SegmentsService, Tracked,
@@ -121,8 +127,9 @@ pub use crate::storage::CacheStorage;
 /// The most blob data one `BatchUpdateBlobs` or `BatchReadBlobs` call may carry,
 /// advertised in the capabilities. Larger blobs go through ByteStream. A request is
 /// decoded whole before its handler runs, so one stream may hold up to
-/// [`MAX_MESSAGE_BYTES`] (17 MiB) of decode buffer: 200 concurrent streams bound the
-/// decode memory at about 3.4 GiB, which `--write-bytes-in-flight` does not cover
+/// [`MAX_MESSAGE_BYTES`] (17 MiB) of decode buffer: the decode memory is that times the
+/// streams a connection may open (`--reapi-max-streams`, `--worker-max-streams`), about
+/// 3.4 GiB for 200, which `--write-bytes-in-flight` does not cover
 /// (`docs/design/write-path.md`).
 pub const MAX_BATCH_TOTAL_BYTES: usize = 16 << 20;
 
@@ -130,12 +137,38 @@ pub const MAX_BATCH_TOTAL_BYTES: usize = 16 << 20;
 /// for the digests and statuses around it.
 pub const MAX_MESSAGE_BYTES: usize = MAX_BATCH_TOTAL_BYTES + (1 << 20);
 
-/// The largest blob the cache accepts. A ByteStream Write is held in memory until it
-/// is verified, so without a cap a client could make the front buffer whatever size
-/// its resource name claims. Chunked uploads (planned,
-/// `docs/design/storage.md#segments`) come later and will stream larger blobs instead;
-/// until then anything bigger is refused before a byte is buffered.
-pub const MAX_BLOB_BYTES: u64 = 1 << 30;
+/// No blob is too large for the cache, on any path, and none is held whole in memory
+/// past [`MAX_UNSTAGED_BLOB_BYTES`]: a ByteStream `Write` of a larger blob is handed to
+/// the store as it arrives (a multipart upload on S3), a segment upload's large records
+/// and the in-process plane's large outputs are written to the write tier as they
+/// arrive, the tier's flusher reads a block in pieces, and every read of a blob is
+/// served in windows of [`READ_WINDOW_BYTES`]. A digest's size is an `i64`, so no blob
+/// is over `i64::MAX` bytes; sizes are added as `u64`, saturating.
+///
+/// The largest blob a daemon's data plane holds in memory on its way into the cache:
+/// 16 MiB. A larger one is never held whole: with a write tier that has room for it, it
+/// is written onto the tier as it arrives (a segment upload's range, the in-process
+/// plane's stream); without one, or when the tier is full, it is streamed to the object
+/// store as it arrives (a ByteStream `Write`, the in-process plane's
+/// `Cache::store_streamed_claimed`). A segment upload that would have to hold one in
+/// memory until its commit is answered FAILED_PRECONDITION at `Begin`
+/// ([`unstaged_refusal`]), and the daemon sends its records by ByteStream instead. No
+/// blob is refused for its size. 16 MiB is where the write group already writes a blob
+/// as a segment of its own (`--write-own-segment-bytes`), four PutRange messages, and
+/// well under the 32 MiB upload a daemon batches small files into, so small outputs
+/// keep the in-memory path unchanged.
+pub const MAX_UNSTAGED_BLOB_BYTES: u64 = 16 << 20;
+
+/// Why a segment upload holding the blob `blob` (its digest), over
+/// [`MAX_UNSTAGED_BLOB_BYTES`], is not taken: no write tier has room for it, and it is
+/// not held in memory instead. The blob itself is stored by a ByteStream `Write`.
+#[must_use]
+pub fn unstaged_refusal(blob: &str) -> String {
+    format!(
+        "{blob} is over {MAX_UNSTAGED_BLOB_BYTES} bytes and no write tier has room for it: \
+         send it by a ByteStream Write, which streams it to the object store"
+    )
+}
 
 /// The most data in one ByteStream `ReadResponse`, and in one chunk of a ranged storage
 /// read.

@@ -8,7 +8,7 @@ use kbf_proto::storage::{
 };
 use tonic::{Request, Response, Status};
 
-use super::{Endpoint, StorageService, wire};
+use super::{Endpoint, StorageService, catch_up, wire};
 use crate::StorageError;
 
 /// The record a `Commit` carries, as the store takes it.
@@ -31,7 +31,11 @@ impl ActionStore for StorageService {
         let request = request.into_inner();
         self.check_map(request.map_generation).await?;
         let action = wire::digest(request.action.as_ref())?;
+        let catching_up = self.catching_up();
         let entry = self.storage.action_result(&action).await?;
+        if let Some(status) = catch_up::entry_miss(catching_up, entry.is_some(), &action) {
+            return Err(status);
+        }
         Ok(Response::new(GetResponse {
             entry: entry.map(|(digest, result)| Entry {
                 result_digest: Some(wire::to_proto(&digest)),
@@ -50,12 +54,16 @@ impl ActionStore for StorageService {
         let result = request
             .result
             .ok_or_else(|| Status::invalid_argument("a result is required"))?;
+        let catching_up = self.catching_up();
         let outcome = match self.storage.prepare_action_result(&result).await {
             Ok(record) => prepare_response::Outcome::Record(Record {
                 result: Some(wire::to_proto(&record.result)),
                 closure: record.closure.iter().map(wire::to_proto).collect(),
             }),
             Err(StorageError::ActionWrite(refused)) => {
+                if let Some(status) = catch_up::retryable(catching_up, &refused) {
+                    return Err(status);
+                }
                 prepare_response::Outcome::Refused(wire::refusal_of(&refused))
             }
             Err(e) => return Err(e.into()),
@@ -79,15 +87,21 @@ impl ActionStore for StorageService {
         };
         let action = wire::digest(request.action.as_ref())?;
         let record = record_of(request.record.as_ref())?;
+        let catching_up = self.catching_up();
         match self
             .storage
             .commit_action_record(role, action, record)
             .await
         {
             Ok(()) => Ok(Response::new(CommitResponse { refused: None })),
-            Err(StorageError::ActionWrite(refused)) => Ok(Response::new(CommitResponse {
-                refused: Some(wire::refusal_of(&refused)),
-            })),
+            Err(StorageError::ActionWrite(refused)) => {
+                match catch_up::retryable(catching_up, &refused) {
+                    Some(status) => Err(status),
+                    None => Ok(Response::new(CommitResponse {
+                        refused: Some(wire::refusal_of(&refused)),
+                    })),
+                }
+            }
             Err(e) => Err(e.into()),
         }
     }
