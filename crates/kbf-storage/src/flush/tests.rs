@@ -148,3 +148,10 @@ async fn a_node_told_it_is_behind_flushes_nothing_until_it_has_the_new_map() {
     assert_eq!(gate.current().expect("held").generation(), 6);
     assert_eq!(gate.me(), Some(MemberId(1)));
 }
+
+/// The gate is `Debug` (the cache that holds it is), and says how new a map it was told of.
+#[test]
+fn the_gate_formats_with_the_newest_generation_it_was_told_of() {
+    let gate = OneFlusher::new(Node::new(Some(1), None));
+    assert!(format!("{gate:?}").contains("newest: 0"), "{gate:?}");
+}
