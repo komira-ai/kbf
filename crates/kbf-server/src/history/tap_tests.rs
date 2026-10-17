@@ -560,7 +560,25 @@ fn the_open_list_is_bounded() {
         rig.tap
             .ended(&ended(&format!("b{n:05}"), EndedKind::Hit, None), &r);
     }
+    // A name already listed is not a new one: nothing is dropped for it.
+    rig.tap
+        .ended(&ended(&format!("b{OPEN_CAP:05}"), EndedKind::Hit, None), &r);
     rig.queue.drain();
     rig.tap.close_all();
-    assert_eq!(rig.queue.drain().len(), OPEN_CAP);
+    let closed: Vec<Option<String>> = rig
+        .queue
+        .drain()
+        .into_iter()
+        .map(|e| match e {
+            Event::Close { inv } => inv.record_id,
+            other => panic!("a close, not {other:?}"),
+        })
+        .collect();
+    assert_eq!(closed.len(), OPEN_CAP);
+    assert!(
+        !closed.contains(&Some("b00000".to_owned())),
+        "the first went to make room"
+    );
+    assert!(closed.contains(&Some("b00001".to_owned())));
+    assert!(closed.contains(&Some(format!("b{OPEN_CAP:05}"))));
 }

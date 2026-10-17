@@ -88,11 +88,8 @@ impl HistoryFlags {
         let state = state.ok_or(HistoryError::NeedsStateStore)?;
         let index_root = self.history_index_root.clone().unwrap_or_default();
         let store = Arc::clone(&state.store);
-        let place = describe(uri);
-        tracing::info!(
-            "history: objects in {place}, index rows under {}",
-            index_root.as_str()
-        );
+        let (place, rows) = (describe(uri), index_root.as_str());
+        tracing::info!("history: objects in {place}, index {rows}");
         let options = Options::default();
         match uri {
             StoreUri::File(dir) => {

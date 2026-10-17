@@ -373,12 +373,15 @@ impl Recording {
             sweep
         });
         loop {
-            // Queued events first: a drop's mark waits for the events sent before it.
+            // Queued events first: a drop's mark waits for the events sent before it. The
+            // sweep is a branch only while there is a tap (and so an interval).
             let (event, swept) = tokio::select! {
                 biased;
                 event = self.events.recv() => (event, false),
                 () = self.shared.marked.notified() => (None, false),
-                () = next_sweep(&mut sweep) => (None, true),
+                _ = sweep.as_mut().expect("a sweep waits for a tap").tick(), if sweep.is_some() => {
+                    (None, true)
+                }
             };
             {
                 let mut records = lock(&self.shared.records);
@@ -392,25 +395,15 @@ impl Recording {
                     }
                 }
                 self.shared.take_marks(&mut records, applied);
-                if let (true, Some(tap)) = (swept, &self.tap) {
-                    for key in records.idle_since(wall_now()) {
-                        tap.idle(&key);
-                    }
+                if swept {
+                    let idle = records.idle_since(wall_now());
+                    let report = |tap: &Arc<dyn Tap>| idle.iter().for_each(|key| tap.idle(key));
+                    self.tap.iter().for_each(report);
                 }
                 self.shared.applied.store(applied, Ordering::Release);
             }
             self.shared.progress.notify_waiters();
         }
-    }
-}
-
-/// Completes at the next tick of `sweep`; never, without one.
-async fn next_sweep(sweep: &mut Option<tokio::time::Interval>) {
-    match sweep {
-        Some(sweep) => {
-            sweep.tick().await;
-        }
-        None => std::future::pending::<()>().await,
     }
 }
 
@@ -422,11 +415,11 @@ fn tell(tap: &dyn Tap, records: &mut Records, ended: &[Ended]) {
         let told = records
             .get(&e.key)
             .and_then(|inv| inv.rows().get(e.row))
-            .map(|row| {
+            .and_then(|row| {
                 let lease = e.attempt.and_then(|a| row.attempts.get(a)).map(|a| a.lease);
-                (tap.ended(e, row), lease)
+                tap.ended(e, row).zip(lease)
             });
-        if let Some((Some(id), Some(lease))) = told {
+        if let Some((id, lease)) = told {
             records.set_run_id(&e.key, e.row, lease, id);
         }
     }

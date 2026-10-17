@@ -180,44 +180,43 @@ async fn run<O: ObjectStore>(
     publish(&writer);
 }
 
-/// A started history writer.
-pub(crate) struct Running {
-    handle: Option<JoinHandle<()>>,
-    stop: Option<oneshot::Sender<()>>,
+/// A spawned task, aborted when this is dropped.
+struct Abort(JoinHandle<()>);
+
+impl Drop for Abort {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
-impl Drop for Running {
-    fn drop(&mut self) {
-        if let Some(handle) = &self.handle {
-            handle.abort();
-        }
-    }
+/// A started history writer: dropped, its task is aborted.
+pub(crate) struct Running {
+    handle: Abort,
+    stop: oneshot::Sender<()>,
 }
 
 /// Starts `history`'s task on the runtime, if there is a history.
 pub(crate) fn spawn(history: Option<History>) -> Option<Running> {
     let History { task, stop, .. } = history?;
     Some(Running {
-        handle: Some(tokio::spawn(task)),
-        stop: Some(stop),
+        handle: Abort(tokio::spawn(task)),
+        stop,
     })
 }
 
 /// Stops `running` as a server's stop does: its writer takes one last step with every
 /// open invocation closed, for at most [`FINAL_STEP`].
 pub(crate) async fn finish(running: Option<Running>) {
-    let Some(mut running) = running else {
+    let Some(Running { mut handle, stop }) = running else {
         return;
     };
-    if let Some(stop) = running.stop.take() {
-        let _ = stop.send(());
-    }
-    if let Some(handle) = running.handle.take() {
-        let abort = handle.abort_handle();
-        if tokio::time::timeout(FINAL_STEP, handle).await.is_err() {
-            abort.abort();
-            tracing::warn!("history: the last step took over {FINAL_STEP:?}; it was dropped");
-        }
+    let _ = stop.send(());
+    if tokio::time::timeout(FINAL_STEP, &mut handle.0)
+        .await
+        .is_err()
+    {
+        // Dropping `handle` aborts the task.
+        tracing::warn!("history: the last step took over {FINAL_STEP:?}; it was dropped");
     }
 }
 

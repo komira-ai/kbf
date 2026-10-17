@@ -23,19 +23,38 @@ use kbf_storage::local_cache::{Fill, LocalCache};
 /// The media type of the answer: the Prometheus text exposition format.
 pub const TEXT_FORMAT: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-/// What a scrape reads: the cache, and the node's one cache if the process has one.
-struct Sources<M, O> {
-    cache: Arc<Cache<M, O>>,
+/// What a scrape adds to the cache's own metrics: the node's one cache's fill if the
+/// process has one, and build history's counters if the server keeps history. Not
+/// generic: nothing here depends on the cache.
+#[derive(Clone)]
+struct Extras {
     local: Option<Arc<LocalCache>>,
     history: Option<Arc<crate::history::Stats>>,
+}
+
+impl Extras {
+    /// Appends what there is to `out`.
+    fn render(self, out: &mut String) {
+        if let Some(local) = self.local {
+            render_fill(out, local.fill());
+        }
+        if let Some(history) = self.history {
+            history.render(out);
+        }
+    }
+}
+
+/// What a scrape reads: the cache, and the extras.
+struct Sources<M, O> {
+    cache: Arc<Cache<M, O>>,
+    extras: Extras,
 }
 
 impl<M, O> Clone for Sources<M, O> {
     fn clone(&self) -> Self {
         Self {
             cache: Arc::clone(&self.cache),
-            local: self.local.clone(),
-            history: self.history.clone(),
+            extras: self.extras.clone(),
         }
     }
 }
@@ -55,8 +74,7 @@ where
         .route("/metrics", get(metrics::<M, O>))
         .with_state(Sources {
             cache,
-            local,
-            history,
+            extras: Extras { local, history },
         })
 }
 
@@ -66,12 +84,7 @@ where
     O: ObjectStore + 'static,
 {
     let mut text = sources.cache.render_metrics();
-    if let Some(local) = sources.local {
-        render_fill(&mut text, local.fill());
-    }
-    if let Some(history) = sources.history {
-        history.render(&mut text);
-    }
+    sources.extras.render(&mut text);
     ([(CONTENT_TYPE, TEXT_FORMAT)], text).into_response()
 }
 
