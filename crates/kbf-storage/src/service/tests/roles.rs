@@ -25,7 +25,8 @@ use tonic::{Code, Status};
 use super::fake::{Mem, serve_routes, sha};
 use crate::Storage;
 use crate::service::{
-    Admission, Config, Endpoint, PeerRole, ROLE_URI_PREFIX, StorageService, role_of,
+    Admission, Config, Endpoint, PeerRole, ROLE_URI_PREFIX, StorageService, host_of, names_of,
+    role_of,
 };
 
 fn uri(role: &str) -> SanType {
@@ -133,6 +134,62 @@ fn a_certificate_must_name_exactly_one_known_role() {
             assert!(answer.is_ok(), "{endpoint:?}");
         }
     }
+}
+
+/// Catches the names read wrongly at this crate's boundary: bytes that are not a
+/// certificate are UNAUTHENTICATED, as for the role, and a certificate's DNS name covers
+/// the host of an address that carries a port.
+#[test]
+fn the_names_of_a_certificate_cover_its_hosts_and_bad_bytes_are_unauthenticated() {
+    let status = names_of(b"not DER").expect_err("refused");
+    assert_eq!(status.code(), Code::Unauthenticated);
+    let names = names_of(&der(vec![uri("storage"), dns("node-a")])).expect("names");
+    assert!(names.covers(host_of("node-a:8982")));
+    assert!(!names.covers(host_of("node-b:8982")));
+}
+
+/// Catches the unowned-copy marker honoured from a role other than the frontend: under
+/// mutual TLS only a certificate naming `frontend` may send it (every other role, no
+/// certificate and a certificate with no role may not); plain text has no identity and
+/// admits it as it admits every call but a copy.
+#[test]
+fn only_the_frontend_may_ask_for_an_unowned_copy() {
+    for role in PeerRole::ALL {
+        let leaf = der(vec![uri(role.name())]);
+        assert_eq!(
+            Admission::Certified.permits_unowned_leaf(Some(&leaf)),
+            role == PeerRole::Frontend,
+            "{role:?}"
+        );
+    }
+    assert!(!Admission::Certified.permits_unowned_leaf(None));
+    assert!(!Admission::Certified.permits_unowned_leaf(Some(b"not DER")));
+    assert!(!Admission::Certified.permits_unowned_leaf(Some(&der(vec![]))));
+    assert!(Admission::Open.permits_unowned_leaf(None));
+}
+
+/// Catches an unowned marker that changes what a chain copy is: a leg that carries the marker
+/// is still a leg (judged by a copy's rules: stored where the map says the node owns the blob,
+/// refused where it does not), never an unowned local write. Only a call with no leg, that asked,
+/// from a caller that may ask, is taken as an unowned copy. (Admission already refuses a leg
+/// from any caller but a storage node, and a storage node may not ask for an unowned copy, so
+/// no call reaches the guard with both; it is tested where it is decided.)
+#[test]
+fn a_chain_copy_with_the_unowned_marker_is_still_a_chain_copy() {
+    use super::super::generation::takes_unowned;
+    use kbf_map::MemberId;
+    let leg = Some(MemberId(2));
+    for marked in [false, true] {
+        for permitted in [false, true] {
+            assert!(
+                !takes_unowned(leg, marked, permitted),
+                "{marked} {permitted}"
+            );
+        }
+    }
+    assert!(takes_unowned(None, true, true));
+    assert!(!takes_unowned(None, true, false));
+    assert!(!takes_unowned(None, false, true));
 }
 
 /// A CA, the server's certificate, and client certificates by role.

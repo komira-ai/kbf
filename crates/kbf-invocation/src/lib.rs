@@ -47,7 +47,7 @@ pub use record::{
     ActionRow, Attempt, AttemptEnd, Counts, How, IDLE_AFTER, Invocation, OUTPUTS_PER_ROW,
     REASON_CAP, ROW_CAP, RecordKey, State, TEXT_CAP, Text,
 };
-pub use records::Records;
+pub use records::{Ended, EndedKind, Records};
 pub use run::{
     ActionShape, Durations, MemoryKillKind, NumaBytes, Phase, ReapiTimes, Run, RunUsage, Target,
     TargetKind,

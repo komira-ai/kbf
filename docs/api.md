@@ -114,6 +114,36 @@ order, with its software and where it is in placement:
 | `placement.state` | `serving`; `cordoned` (no new lease, its leases run on); `draining` (cordoned, waiting for its leases until `deadline_unix_ms`); `drained` (cordoned, no lease left: either its leases ended, or the node disconnected and, after the lease grace, its leases were given up and requeued to run elsewhere; check `connected`); `drain_paused` (the deadline passed with leases still running: they run on, and nothing proceeds until an operator acts) |
 | `placement.leases` | while draining or paused: the leases it still holds, as `term.seq` (each server process has its own term, the Raft term under the Raft metadata log: [worker-protocol.md](design/worker-protocol.md#server-restarts-and-the-lease-epoch)) |
 
+## `GET /v1/members`
+
+The storage members of the current map, as the `Membership` service keeps them
+(`kbf.map.v1.Membership`; [architecture-v2.md](design/architecture-v2.md) section 6),
+in the map's order. A read, open like `GET /v1/nodes`; it takes no write. Storage
+members are not the daemon nodes of `/v1/nodes`: a storage node registers with a
+frontend, a daemon opens a worker stream.
+
+```json
+{ "generation": 7,
+  "members": [
+    { "id": 1, "addr": "192.0.2.11:8982", "state": "active", "weight": 1 },
+    { "id": 2, "addr": "192.0.2.12:8982", "state": "draining", "weight": 1 },
+    { "id": 3, "addr": "192.0.2.13:8982", "state": "down", "weight": 2 }
+] }
+```
+
+| Field | Meaning |
+|---|---|
+| `generation` | the map's generation; `0` with an empty `members` before the first member has registered |
+| `id` | the member id the store assigned at registration (the `member_id` of `RegisterResponse`) |
+| `addr` | the address callers dial |
+| `state` | `joining` (registered, a write owner, read last), `catching_up`, `active` (a full owner), `draining` (takes no new writes) or `down` (its lease lapsed; kept in the map for the dwell, then it leaves the list) |
+| `weight` | its share of the digests relative to the others |
+
+A registered member is `joining` until something promotes it with `Members::set_state`;
+the server does not promote on its own yet, so a script that waits for `active` waits
+for that. A server without a state store keeps no members and answers `404`; a state
+store that cannot be read answers `503`.
+
 ## `POST /v1/nodes/{node}:cordon`, `:drain`, `:uncordon`
 
 An operator takes a node out of placement, drains it, or returns it
@@ -404,6 +434,17 @@ follow; in every other process they are absent.
 | `kbf_local_cache_input_bytes` | gauge | the input cache's entries |
 | `kbf_local_cache_storage_bytes` | gauge | what local storage holds on that disk: the write tier's blocks |
 | `kbf_local_cache_fill_bytes` | gauge | both, each byte once: what the one budget counts |
+
+**Build history.** With `--history-objects` the server records each attempt and cache hit of
+an invocation a client named, after the call is answered and off its path, and counts what it
+could not keep. Without the flag these families are absent and nothing is recorded.
+
+| Family | Type | What it measures |
+|---|---|---|
+| `kbf_history_dropped_total{stage}` | counter | records dropped instead of kept, by where: `queue` (the writer's queue was full), `buffer` (chunks waiting to be written passed their bound), `put` (an object write failed), `index` (an index row could not be applied), `invocations` (the writer held its bound of invocations) |
+| `kbf_history_queue_events`, `kbf_history_queue_bytes` | gauge | events waiting for the writer, and their bytes |
+| `kbf_history_pending_rows` | gauge | index rows the writer has not applied yet |
+| `kbf_history_open_invocations` | gauge | invocations the writer holds state for |
 
 **Reading a stall with idle slots.** `kbf_sched_queued` high and `kbf_sched_leases` below the
 nodes' slots means work is waiting that placement cannot use (look at the node's booking and

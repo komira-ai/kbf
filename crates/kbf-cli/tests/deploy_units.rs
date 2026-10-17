@@ -339,11 +339,12 @@ fn check_units_parses_a_modes_flags_with_this_kbf() {
             ],
             _ => Vec::new(),
         };
-        assert_eq!(
-            check_units(&format!("clean_{mode}"), mode, &text),
-            (Vec::new(), notes),
-            "{mode}"
-        );
+        // Rule `traverse` reads this machine's accounts: it notes a SKIP where the unit's
+        // user is absent (a CI runner) and is silent where it exists, so that note is not
+        // compared here (traverse_tests and install_mode_tests cover the rule).
+        let (failures, mut said) = check_units(&format!("clean_{mode}"), mode, &text);
+        said.retain(|n| !n.starts_with("SKIP traverse: no user "));
+        assert_eq!((failures, said), (Vec::new(), notes), "{mode}");
     }
     let bin = env!("CARGO_BIN_EXE_kbf");
     let text = render(&c, Some(1500), Mode::Daemon).expect("renders");
@@ -424,4 +425,19 @@ fn an_older_kbf_fails_the_parse_rule_with_the_line_the_docs_quote() {
         "docs/deploy/kbf-modes.md does not quote:\n{}",
         failures[0]
     );
+}
+
+/// Catches `kbf frontend handover` starting instances the unit template does not have:
+/// kbf-cli spells the template's name and instances itself (kbf-deploy is a dev-dependency
+/// only), and the two must be the same words.
+#[test]
+fn the_handover_command_starts_the_instances_of_the_frontends_template() {
+    use kbf_cli::handover::{INSTANCES, TEMPLATE};
+    let instances: Vec<String> = INSTANCES
+        .iter()
+        .map(|i| format!("{TEMPLATE}@{i}.service"))
+        .collect();
+    assert_eq!(instances, Mode::Frontend.instances());
+    assert_eq!(Mode::Frontend.unit_name(), format!("{TEMPLATE}@.service"));
+    assert_eq!(TEMPLATE, format!("kbf-{}", Mode::Frontend.name()));
 }

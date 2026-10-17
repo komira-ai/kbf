@@ -52,6 +52,7 @@ pub mod config;
 pub mod cpuset;
 pub mod credential;
 mod glob;
+pub mod handover;
 pub mod host;
 pub mod images;
 pub mod install;
@@ -62,6 +63,7 @@ pub mod render;
 pub mod stop;
 pub mod stores;
 pub mod swap;
+mod traverse;
 pub mod verify_cert;
 
 #[cfg(test)]

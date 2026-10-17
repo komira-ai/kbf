@@ -141,6 +141,8 @@ pub const ALLOWED: &[&str] = &[
     "state_store",
     "member_ttl_secs",
     "member_dwell_secs",
+    "history_objects",
+    "history_index_root",
     "log_dir",
     "log_max_bytes",
     "log_files",
@@ -381,6 +383,7 @@ impl FrontendFlags {
 fn routed_of(
     members: Option<&Arc<Members>>,
     flags: &FrontendFlags,
+    storage: &RemoteStorage,
 ) -> Result<Option<Arc<Routed>>, ConfigError> {
     let Some(members) = members else {
         return Ok(None);
@@ -394,10 +397,9 @@ fn routed_of(
         return Ok(None);
     };
     let maps = Arc::new(FrontMaps::new(Arc::clone(members)));
-    Ok(Some(Arc::new(Routed::over_tls(
-        maps,
-        Arc::new(TlsNodes::new(ca, identity)),
-    ))))
+    Ok(Some(Arc::new(
+        Routed::over_tls(maps, Arc::new(TlsNodes::new(ca, identity))).bootstrapped(storage.clone()),
+    )))
 }
 
 /// A started frontend: bound, not yet serving.
@@ -725,13 +727,15 @@ impl<'a> Prepared<'a> {
         } = self;
         let args = &flags.server;
         let state = crate::start::with_members(state, args.members());
+        let state = crate::history::with_history(state, &args.history)?;
+        let (state, history) = crate::history::take(state);
         let members = members_of(state.as_ref());
         let map = map_of(None, members.as_ref())?;
         let readiness = Arc::new(Readiness::default());
         let timeout = listeners.store_probe_timeout;
         let storage = Arc::new(RemoteStorage::new(channel.clone(), 0));
         let state_store = store_of(state.as_ref());
-        let routed = routed_of(members.as_ref(), flags)?;
+        let routed = routed_of(members.as_ref(), flags, &storage)?;
         let checks = Arc::new(checks(
             Arc::clone(&readiness),
             storage.clone(),
@@ -745,6 +749,7 @@ impl<'a> Prepared<'a> {
         };
 
         let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
+        let recording = crate::history::install(recording, history.as_ref());
         let default_memory = listeners.memory_ladder.first();
         let durable = state.is_some();
         let farm = Farm::new(
@@ -758,7 +763,6 @@ impl<'a> Prepared<'a> {
         log_state(durable, farm.term(), farm.lease_epoch());
 
         let sockets = sockets(adopted, &listeners, api.as_ref(), flags.handover.is_some())?;
-        let peers_certified = listeners.worker_tls.is_some();
         let (mut worker_server, peers, worker_tls) = worker_peers(
             keepalive(
                 flow_control(Server::builder(), listeners.stream_limits.worker),
@@ -807,12 +811,17 @@ impl<'a> Prepared<'a> {
             members.clone(),
         )
         .merge(crate::health::router_of(Arc::clone(&checks)))
-        .merge(metrics_route(backend.clone(), tls_sources));
+        .merge(metrics_route(
+            backend.clone(),
+            history.as_ref().map(crate::history::History::stats),
+            tls_sources,
+        ));
 
         let mut reapi_server = keepalive(
             flow_control(Server::builder(), listeners.stream_limits.reapi),
             listeners.streams,
         );
+        let membership = membership(members.clone(), &peers);
         let sessions = WorkerService::new(
             Arc::clone(&farm),
             peers,
@@ -825,7 +834,6 @@ impl<'a> Prepared<'a> {
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
 
-        let membership = membership(members.clone(), peers_certified);
         let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
         let authorizers = Arc::new(policy.authorizers);
         let bootstrap = Owner::new(&flags.storage.uri().to_string(), channel);
@@ -898,6 +906,7 @@ impl<'a> Prepared<'a> {
         let shutdown = shutdown()?;
         let stopper = Arc::clone(&drain);
         let serving = async move {
+            let history = crate::history::spawn(history);
             let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
             let reapi_serve = reapi_server
                 .add_routes(reapi_routes)
@@ -947,6 +956,7 @@ impl<'a> Prepared<'a> {
             if reapi_done {
                 stop_api(api_stop_when_done, api_serve).await;
             }
+            crate::history::finish(history).await;
             outcome
         };
         let plain = args.plain_text_off_loopback();
@@ -978,13 +988,22 @@ fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Stor
     state.map(|state| Arc::clone(&state.store))
 }
 
-/// `GET /metrics`: what the service counts, in the Prometheus text format.
-fn metrics_route(backend: Backend, tls: Vec<TlsSource>) -> axum::Router {
+/// `GET /metrics`: what the service counts, in the Prometheus text format, history's
+/// counters when it keeps history, and the reloads of the listeners' `tls` files.
+fn metrics_route(
+    backend: Backend,
+    history: Option<Arc<crate::history::Stats>>,
+    tls: Vec<TlsSource>,
+) -> axum::Router {
     let tls = Arc::new(tls);
     let render = move || {
         let (backend, tls) = (backend.clone(), Arc::clone(&tls));
+        let history = history.clone();
         async move {
             let mut text = backend.render_metrics();
+            if let Some(history) = history {
+                history.render(&mut text);
+            }
             kbf_tls::render_metrics(tls.iter(), &mut text);
             ([(CONTENT_TYPE, crate::metrics::TEXT_FORMAT)], text)
         }

@@ -75,7 +75,9 @@ use tonic::service::Routes;
 use crate::replicate::{self, Chain, MapSource};
 use crate::{Storage, StorageError};
 
-pub use admission::{Admission, Endpoint, PeerRole, ROLE_URI_PREFIX, role_of};
+pub use admission::{
+    Admission, Endpoint, PeerNames, PeerRole, ROLE_URI_PREFIX, host_of, names_of, role_of,
+};
 pub use catch_up::CatchUp;
 pub use client::RemoteStorage;
 pub(crate) use client::lift;
@@ -83,6 +85,10 @@ pub use in_process::InProcess;
 
 /// The metadata entry that carries the map generation on the standard calls.
 pub const MAP_GENERATION_HEADER: &str = "kbf-map-generation";
+
+/// The metadata entry that marks a `Write` as a copy the caller needs on this node
+/// although the map does not place the blob here ([`crate::Storage::put_unowned`]).
+pub const UNOWNED_HEADER: &str = "kbf-unowned-copy";
 
 /// The largest gRPC message the service decodes and sends: a full 16 MiB batch and room
 /// around it, `kbf-front`'s `MAX_MESSAGE_BYTES` (a test pins the two equal).

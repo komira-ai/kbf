@@ -1,12 +1,14 @@
 //! A storage node's side of registration (`kbf storage --frontend`): register with a
-//! frontend, then heartbeat at the interval it names, registering again when the frontend
+//! frontend ([`Joiner::join`]), then heartbeat at the interval it names ([`Joiner::keep`]), registering again when the frontend
 //! says the row lapsed, and backing off when it cannot be reached
 //! (`docs/design/architecture-v2.md`, section 6). The node never touches the state store.
 //!
 //! **The map.** The registration answers with the frontend's map, and a heartbeat that
 //! says which generation the node holds is answered with the map when the frontend's is
 //! newer. Each goes into the node's [`MapHolder`] (which keeps the newest and never goes
-//! back), so a node learns every bump from its own beat, with no push to lose.
+//! back), so a node learns every bump from its own beat, with no push to lose. A caller
+//! that routed by a map the node has not been sent ([`MapHolder::reach`]) makes it beat at
+//! once instead of at the next interval.
 //! Every call says whether the node is still rebuilding its index ([`CatchUp`], the state
 //! its storage service reads): a node that registers while rebuilding enters the map as
 //! `CatchingUp`, and the first heartbeat after [`CatchUp::finish`] makes it `Active`.
@@ -14,15 +16,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_map::Map;
+use kbf_map::{Map, MemberId};
 use kbf_mapsync::MapHolder;
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_storage::service::CatchUp;
+use tokio::sync::watch;
 use tonic::transport::Channel;
 use tonic::{Code, Status};
 
 use crate::members::PROTOCOL;
+use crate::node_map::NodeMap;
 
 /// The first wait after a failure.
 pub const RETRY_BASE: Duration = Duration::from_secs(1);
@@ -68,7 +72,7 @@ pub struct Joiner {
     identity: Identity,
     retry: Duration,
     catch_up: CatchUp,
-    maps: Arc<MapHolder>,
+    node: Arc<NodeMap>,
 }
 
 impl Joiner {
@@ -81,16 +85,17 @@ impl Joiner {
             identity,
             retry,
             catch_up: CatchUp::caught_up(),
-            maps: Arc::new(MapHolder::new()),
+            node: Arc::new(NodeMap::new(Arc::new(MapHolder::new()))),
         }
     }
 
-    /// Keeps the maps this node is sent in `maps`, which whatever else the node runs
-    /// (the checks of its storage service, its replication) reads. The joiner starts
-    /// with a holder of its own.
+    /// Keeps the maps this node is sent in `node`'s holder, which whatever else the node
+    /// runs reads (the checks of its storage service, its replication), and tells `node`
+    /// which member it is once it has registered ([`NodeMap`]). The joiner starts with a
+    /// node of its own.
     #[must_use]
-    pub fn with_maps(mut self, maps: Arc<MapHolder>) -> Self {
-        self.maps = maps;
+    pub fn with_node(mut self, node: Arc<NodeMap>) -> Self {
+        self.node = node;
         self
     }
 
@@ -101,7 +106,7 @@ impl Joiner {
         match Map::try_from(map) {
             Ok(map) => {
                 let generation = map.generation();
-                if self.maps.offer(map) {
+                if self.node.maps().offer(map) {
                     tracing::info!(generation, "storage map taken");
                 }
             }
@@ -137,6 +142,7 @@ impl Joiner {
             .await?
             .into_inner();
         self.take(answer.map.clone());
+        self.node.registered(MemberId(answer.member_id));
         Ok(Joined {
             member_id: answer.member_id,
             boot: answer.boot,
@@ -156,7 +162,7 @@ impl Joiner {
             .heartbeat(pb::HeartbeatRequest {
                 member_id: joined.member_id,
                 boot: joined.boot,
-                have_generation: self.maps.generation(),
+                have_generation: self.node.maps().generation(),
                 catching_up: self.catch_up.is_catching_up(),
             })
             .await?
@@ -165,36 +171,71 @@ impl Joiner {
         Ok(answer.map_generation)
     }
 
-    /// Registers and heartbeats for ever. A failed call waits [`backoff`] and tries
-    /// again; a NOT_FOUND heartbeat registers again.
-    pub async fn run(mut self) {
+    /// Registers, retrying after [`backoff`] until the frontend answers: what a storage
+    /// node waits for before it opens its cache, which writes as the member and boot
+    /// this returns.
+    pub async fn join(&mut self) -> Joined {
         let mut failures = 0_u32;
         loop {
-            let this = loop {
-                match self.register().await {
-                    Ok(this) => break this,
-                    Err(e) => {
-                        tracing::warn!("registering with the frontend: {}", e.message());
-                        tokio::time::sleep(backoff(self.retry, failures)).await;
-                        failures = failures.saturating_add(1);
-                    }
+            match self.register().await {
+                Ok(this) => {
+                    tracing::info!(member = this.member_id, boot = this.boot, "registered");
+                    return this;
                 }
-            };
-            failures = 0;
-            tracing::info!(member = this.member_id, boot = this.boot, "registered");
-            loop {
-                tokio::time::sleep(this.interval).await;
-                match self.beat(&this).await {
-                    Ok(_) => failures = 0,
-                    Err(e) if e.code() == Code::NotFound => {
-                        tracing::warn!("the membership row lapsed; registering again");
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::warn!("heartbeat to the frontend: {}", e.message());
-                        tokio::time::sleep(backoff(self.retry, failures)).await;
-                        failures = failures.saturating_add(1);
-                    }
+                Err(e) => {
+                    tracing::warn!("registering with the frontend: {}", e.message());
+                    tokio::time::sleep(backoff(self.retry, failures)).await;
+                    failures = failures.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// Registers ([`Joiner::join`]) and heartbeats for ever, as [`Joiner::keep`] does.
+    pub async fn run(mut self) {
+        let mut asks = self.node.maps().asks();
+        loop {
+            let this = self.join().await;
+            self.beat_until_lapse(&this, &mut asks).await;
+        }
+    }
+
+    /// Heartbeats as `joined` for ever: a failed call waits [`backoff`] and tries
+    /// again; a NOT_FOUND heartbeat registers again ([`Joiner::join`]). A heartbeat is also
+    /// sent at once when a caller asks for a map newer than the node's
+    /// ([`MapHolder::reach`]). A registration after a lapse has a larger boot; the node's
+    /// cache keeps writing as the boot it opened with, which no other process is ever
+    /// given.
+    pub async fn keep(mut self, mut this: Joined) {
+        let mut asks = self.node.maps().asks();
+        loop {
+            self.beat_until_lapse(&this, &mut asks).await;
+            this = self.join().await;
+        }
+    }
+
+    /// Heartbeats as `this` until the frontend says the row lapsed (NOT_FOUND). A failed
+    /// call waits [`backoff`] and tries again.
+    async fn beat_until_lapse(&mut self, this: &Joined, asks: &mut watch::Receiver<u64>) {
+        let mut failures = 0_u32;
+        loop {
+            // A beat is due at the interval, and at once when a caller routed by a map this
+            // node has not been sent ([`MapHolder::reach`] records the generation it
+            // wants): waiting out the interval would refuse its calls for that long.
+            tokio::select! {
+                () = tokio::time::sleep(this.interval) => {}
+                _ = asks.changed() => {}
+            }
+            match self.beat(this).await {
+                Ok(_) => failures = 0,
+                Err(e) if e.code() == Code::NotFound => {
+                    tracing::warn!("the membership row lapsed; registering again");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("heartbeat to the frontend: {}", e.message());
+                    tokio::time::sleep(backoff(self.retry, failures)).await;
+                    failures = failures.saturating_add(1);
                 }
             }
         }

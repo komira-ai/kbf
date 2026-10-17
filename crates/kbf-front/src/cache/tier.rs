@@ -134,7 +134,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     ///    staged there is marked unreachable as missing (its blobs answer
     ///    `Unavailable` until re-uploaded), and a new tier is registered.
     /// 2. The tier is the registered one, or, for a server without one, a new id: this
-    ///    start's writer epoch, which no tier was ever registered under.
+    ///    start's writer epoch, or a fresh epoch for a node writer, which no tier was
+    ///    ever registered under.
     /// 3. The disk layer opens the directory against the committed staged table
     ///    ([`Tier::open`]): the `TIER` check (a wrong or missing `TIER` while objects
     ///    are staged refuses the start), each staged block cut to its committed length,
@@ -185,7 +186,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             tracing::warn!(%named, objects = abandoned.len(), "write tier abandoned");
             current = None;
         }
-        let tier = current.unwrap_or_else(|| TierId::new(self.writer.epoch.get()));
+        let tier = match current {
+            Some(tier) => tier,
+            None => self.new_tier_id().await?,
+        };
         let snapshot = self
             .writer
             .query(StagedSnapshot::of)
@@ -193,7 +197,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             .map_err(CacheError::from)?;
         let start = TierStart {
             tier,
-            epoch: self.writer.epoch,
+            writer: self.writer.names_as,
             options,
         };
         let (opened, recovery) = Tier::open(fs, start, &snapshot, self.seq_source())?;
@@ -221,6 +225,24 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             recovery,
         };
         Ok((self, startup))
+    }
+
+    /// The id of a tier this log never registered: an epoch writer's own epoch, which no
+    /// tier was registered under before. A node writer has no epoch, so it allocates one
+    /// for the id alone (never for an object): every tier id the log registered was
+    /// drawn as an epoch, so a fresh one is new.
+    async fn new_tier_id(&self) -> Result<TierId, CacheError> {
+        match self.writer.names_as {
+            kbf_meta::Writer::Epoch(epoch) => Ok(TierId::new(epoch.get())),
+            // A cache never names its objects as another log's epoch; were it to, it has no
+            // epoch of its own, as a node has none.
+            kbf_meta::Writer::Node(_) | kbf_meta::Writer::Legacy(_) => {
+                match self.writer.commit(Command::AllocEpoch).await? {
+                    Applied::Epoch(epoch) => Ok(TierId::new(epoch.get())),
+                    other => Err(unexpected(&other)),
+                }
+            }
+        }
     }
 
     /// The tier this cache stages on, if one is attached.
@@ -480,12 +502,15 @@ mod tests {
                     .await
                 })
             };
-            // The first call holds the only pool thread; only now is the second queued.
+            // The first call holds the only pool thread; only now may the second be queued.
             started_rx.await.expect("the first call started");
             let startup = began.elapsed();
+            let go = Arc::new(tokio::sync::Notify::new());
             let second = {
                 let metrics = Arc::clone(&metrics);
+                let go = Arc::clone(&go);
                 tokio::spawn(async move {
+                    go.notified().await;
                     blocking(
                         &metrics,
                         Box::new(move || {
@@ -499,9 +524,15 @@ mod tests {
                 })
             };
             // The gauge counts a queued call: it reaches 2 with the first still held.
-            // The 60 s is a hang guard only: a regression fails here instead of hanging.
+            // The second is released from inside the wait, so the first look at the
+            // gauge always sees 1 (the first call raised it before it signalled, and
+            // nothing lowers it until the test releases that call): the loop body and
+            // both outcomes of its test run on every execution, whatever the
+            // scheduling. The 60 s is a hang guard only: a regression fails here
+            // instead of hanging.
             tokio::time::timeout(Duration::from_secs(60), async {
                 while metrics.tier_in_flight.get() != 2 {
+                    go.notify_one();
                     tokio::task::yield_now().await;
                 }
             })

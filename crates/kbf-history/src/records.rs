@@ -258,6 +258,14 @@ pub struct RunRecord {
     /// The limit it was killed at, bytes.
     #[prost(uint64, tag = "32")]
     pub memory_limit_bytes: u64,
+    /// The action is a test run (its shape names a test execution root). Added after
+    /// the first chunks were written: a record without it reads `false`.
+    #[prost(bool, tag = "33")]
+    pub test: bool,
+    /// The target label the run's shape carried (Bazel names it); empty when it had
+    /// none. Added after the first chunks were written: a record without it reads empty.
+    #[prost(string, tag = "34")]
+    pub target: String,
 }
 
 impl RunRecord {
@@ -615,6 +623,11 @@ pub struct InvocationHeader {
     /// list them all. A reader cannot check every instance, so it answers no caller.
     #[prost(bool, tag = "13")]
     pub instances_truncated: bool,
+    /// The time the invocation's `ui/inv` list entries are keyed by: its first record's
+    /// time when the writer first listed it, never moved, so a list has one entry per
+    /// instance. An entry whose key time is not this one is stale and is not shown.
+    #[prost(uint64, tag = "14")]
+    pub list_ms: u64,
 }
 
 /// The `ui/ichunk/<inv-key>/<writer>/<seq>` row: where one chunk is and what it holds.
@@ -742,6 +755,36 @@ pub struct ChunkSummary {
 mod tests {
     use super::*;
     use crate::run_id::StreamId;
+
+    #[test]
+    fn the_test_flag_is_field_33_and_older_records_read_false() {
+        // Catches: a flag renumbered or dropped from the wire (a chunk written by this
+        // version would read back as no test), and a record written before the flag
+        // existed failing to decode or reading true.
+        use prost::Message as _;
+        let test = RunRecord {
+            test: true,
+            ..RunRecord::default()
+        };
+        // Tag 33, varint: key 264 (0x88 0x02), value 1.
+        assert_eq!(test.encode_to_vec(), [0x88, 0x02, 0x01]);
+        assert!(
+            RunRecord::decode([0x88, 0x02, 0x01].as_slice())
+                .unwrap()
+                .test
+        );
+        assert!(!RunRecord::default().test);
+        assert!(RunRecord::default().encode_to_vec().is_empty());
+        let older = RunRecord {
+            seq: 3,
+            ..RunRecord::default()
+        };
+        assert!(
+            !RunRecord::decode(older.encode_to_vec().as_slice())
+                .unwrap()
+                .test
+        );
+    }
 
     #[test]
     fn a_digest_prefix_is_its_first_eight_bytes() {
@@ -899,5 +942,29 @@ mod tests {
             ..ChunkRow::default()
         };
         assert!(!hits_only.holds(0, 0));
+    }
+
+    #[test]
+    fn the_target_and_the_list_time_have_their_own_field_numbers() {
+        // Catches: a field renumbered or dropped from the wire, and a record written
+        // before the fields existed failing to decode or reading them set.
+        use prost::Message as _;
+        let run = RunRecord {
+            target: "//a:t".into(),
+            ..RunRecord::default()
+        };
+        // Tag 34, length-delimited: key 274 (0x92 0x02).
+        assert_eq!(
+            run.encode_to_vec(),
+            [0x92, 0x02, 5, b'/', b'/', b'a', b':', b't']
+        );
+        let header = InvocationHeader {
+            list_ms: 5,
+            ..InvocationHeader::default()
+        };
+        // Tag 14, varint: key 112.
+        assert_eq!(header.encode_to_vec(), [112, 5]);
+        assert_eq!(RunRecord::decode(&[][..]).unwrap().target, "");
+        assert_eq!(InvocationHeader::decode(&[][..]).unwrap().list_ms, 0);
     }
 }

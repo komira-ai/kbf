@@ -179,7 +179,8 @@ fn the_storage_unit_is_installed_and_a_rerun_plans_nothing() {
         [
             "mkdir /var/lib/kbf-server (0755)".to_owned(),
             format!("mkdir /var/lib/kbf-server/raft (0700, owner {uid}:{gid})"),
-            format!("mkdir /var/lib/kbf-server/hot (0700, owner {uid}:{gid})"),
+            "mkdir /var/lib/kbf (0755)".to_owned(),
+            format!("mkdir /var/lib/kbf/hot (0700, owner {uid}:{gid})"),
             "run /usr/bin/systemctl daemon-reload".to_owned(),
             "run /usr/bin/systemctl enable kbf-storage.service".to_owned(),
             "run /usr/bin/systemctl restart kbf-storage.service".to_owned(),
@@ -444,11 +445,72 @@ fn the_frontend_unit_is_installed_with_its_state_directory() {
             "mkdir /var/lib/kbf-server (0755)".to_owned(),
             format!("mkdir /var/lib/kbf-server/state (0700, owner {uid}:{gid})"),
             "run /usr/bin/systemctl daemon-reload".to_owned(),
-            "run /usr/bin/systemctl enable kbf-frontend.service".to_owned(),
-            "run /usr/bin/systemctl restart kbf-frontend.service".to_owned(),
+            "run /usr/bin/systemctl enable kbf-frontend@.service".to_owned(),
+            "run /usr/bin/systemctl start kbf-frontend@a.service".to_owned(),
             "wait up to 60s for http://127.0.0.1:8982/readyz".to_owned(),
         ]
     );
+}
+
+/// The frontend's unit is a template with two instances, and a serving one is never
+/// restarted: a restart drains it and every new build is refused until the next start.
+/// Catches an update that restarts (or stops) the serving instance instead of leaving the
+/// handover to `kbf frontend handover`, an install that starts the second instance beside
+/// the first (two frontends would ask each other for the listeners), a template enabled
+/// under a name systemd refuses, and a host with neither instance up left without one.
+#[test]
+fn a_serving_frontend_instance_is_not_restarted_by_an_update() {
+    let (mut exec, world) = host("install-mode-frontend-serving");
+    let a = install(Mode::Frontend, None);
+    go(&mut exec, &a, PlanMode::Apply);
+    assert!(
+        exec.at("/etc/systemd/system/kbf-frontend@.service")
+            .exists(),
+        "the template is written under its own name"
+    );
+    assert!(world.borrow().active.contains("kbf-frontend@a.service"));
+    assert!(!world.borrow().active.contains("kbf-frontend@b.service"));
+
+    // The second instance serves; the unit file differs from the host's.
+    {
+        let mut w = world.borrow_mut();
+        w.active.clear();
+        w.active.insert("kbf-frontend@b.service".to_owned());
+        w.enabled.insert("kbf-frontend@a.service".to_owned());
+    }
+    write(
+        &exec,
+        "/etc/systemd/system/kbf-frontend@.service",
+        "[Service]\n",
+        0o644,
+    );
+    let (p, out) = plan_here(&exec, &a).expect("plan");
+    let got = steps(&p);
+    assert!(
+        got.contains(&"run /usr/bin/systemctl daemon-reload".to_owned())
+            && got.contains(&"run /usr/bin/systemctl enable kbf-frontend@.service".to_owned()),
+        "{got:?}"
+    );
+    assert!(
+        !got.iter()
+            .any(|s| s.contains("restart") || s.contains(" start ") || s.contains("stop")),
+        "{got:?}"
+    );
+    assert!(
+        !got.iter().any(|s| s.starts_with("wait")),
+        "nothing was started, so there is no /readyz to wait for: {got:?}"
+    );
+    assert!(
+        out.contains(
+            "kbf-frontend@b.service is serving and is not restarted: run `kbf frontend handover`"
+        ),
+        "{out}"
+    );
+
+    // Unchanged, enabled, and one instance up: nothing at all.
+    go(&mut exec, &a, PlanMode::Apply);
+    let (p, _) = plan_here(&exec, &a).expect("plan");
+    assert_eq!(steps(&p), Vec::<String>::new());
 }
 
 /// The operator token of the frontend and the all-in-one: the host check reads the file
@@ -551,15 +613,241 @@ fn the_directories_come_from_the_flags_the_units_carry() {
         [
             "/var/lib/kbf 755",
             "/var/lib/kbf-server/raft 700",
-            "/var/lib/kbf-server/hot 700",
+            "/var/lib/kbf/hot 700",
         ]
     );
     assert_eq!(dirs(Mode::Frontend), ["/var/lib/kbf-server/state 700"]);
     assert_eq!(
         dirs(Mode::Storage),
-        [
-            "/var/lib/kbf-server/raft 700",
-            "/var/lib/kbf-server/hot 700"
-        ]
+        ["/var/lib/kbf-server/raft 700", "/var/lib/kbf/hot 700"]
     );
+}
+
+/// The live failure: `storage-and-daemon` runs as `KBF_USER` and its `--hot-store` sat
+/// under `/var/lib/kbf-server`, the server account's, mode 0700. The scratch host cannot
+/// chown, so the unit's user has another uid than the test's (the owner of every
+/// directory); with the directory above the hot store 0700 the install is refused
+/// before any step, naming the directory and the user, and with it 0755 the check is
+/// silent. Catches a traverse check that is skipped, one that reads the wrong user, and
+/// a message that leaves out the path or the user.
+#[test]
+fn a_hot_store_the_unit_user_cannot_reach_is_refused() {
+    let (uid, gid) = me();
+    let other = |world: &RefCell<World>| {
+        world
+            .borrow_mut()
+            .users
+            .insert("kbf".to_owned(), (uid + 1, gid + 1));
+    };
+    let a = |hot: &str| InstallMode {
+        config: LinuxConfig::parse(&EXAMPLE.replace(
+            "KBF_HOT_DIR=/var/lib/kbf/hot",
+            &format!("KBF_HOT_DIR={hot}"),
+        ))
+        .expect("valid settings"),
+        mode: Mode::StorageAndDaemon,
+        bin_dir: None,
+    };
+    let (exec, world) = host("install-mode-hot-0700");
+    other(&world);
+    fs::set_permissions(exec.at("/"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    let parent = exec.at("/var/lib/kbf-server");
+    fs::create_dir_all(&parent).expect("dirs");
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("chmod");
+    let hot = a("/var/lib/kbf-server/hot");
+    let e = plan_here(&exec, &hot).expect_err("refused");
+    let HostError::Units(failures) = &e else {
+        panic!("{e}");
+    };
+    // (The scratch host's keys are the test's uid's, so rule `credential` fails too.)
+    let traverse: Vec<_> = failures.iter().filter(|f| f.rule == "traverse").collect();
+    assert_eq!(traverse.len(), 1, "{e}");
+    let f = traverse[0];
+    assert!(
+        f.message.contains("/var/lib/kbf-server/hot")
+            && f.message.contains("/var/lib/kbf-server (mode 0700")
+            && f.message.contains("kbf"),
+        "{}",
+        f.message
+    );
+    // Another hot directory, not under it, is reached.
+    let report = |a: &InstallMode| {
+        let c = &a.config;
+        let kbf = modes::render(c, Some(uid + 1), a.mode).expect("renders");
+        let slice = render(c, None, &Templates::BUILT_IN).expect("slice").slice;
+        modes::check_on_host(
+            &exec,
+            c,
+            a.mode,
+            &UnitText::new(a.mode.unit_name(), kbf),
+            &UnitText::new(SLICE, slice),
+            true,
+            None,
+        )
+        .expect("checks")
+    };
+    let ok = report(&a("/var/lib/kbf/hot"));
+    assert!(
+        ok.failures.iter().all(|f| f.rule != "traverse"),
+        "{:?}",
+        ok.failures
+    );
+    // Opened to others, the same directory passes.
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let ok = report(&hot);
+    assert!(
+        ok.failures.iter().all(|f| f.rule != "traverse"),
+        "{:?}",
+        ok.failures
+    );
+    // The same refusal is check-units' on this host.
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("chmod");
+    let bad = report(&hot);
+    assert!(bad.failures.iter().any(|f| f.rule == "traverse"));
+}
+
+/// root enters every directory whatever its mode: a unit whose `User=` is uid 0 over a
+/// 0700 parent of the hot store is not a `traverse` failure. Catches a check that
+/// applies the mode bits to root.
+#[test]
+fn root_is_not_refused_a_hot_store_under_a_0700_directory() {
+    let (exec, world) = host("install-mode-hot-root");
+    world.borrow_mut().users.insert("kbf".to_owned(), (0, 0));
+    fs::set_permissions(exec.at("/"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    let parent = exec.at("/var/lib/kbf-server");
+    fs::create_dir_all(&parent).expect("dirs");
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("chmod");
+    let c = LinuxConfig::parse(&EXAMPLE.replace(
+        "KBF_HOT_DIR=/var/lib/kbf/hot",
+        "KBF_HOT_DIR=/var/lib/kbf-server/hot",
+    ))
+    .expect("valid settings");
+    let mode = Mode::StorageAndDaemon;
+    let kbf = modes::render(&c, Some(0), mode).expect("renders");
+    let slice = render(&c, None, &Templates::BUILT_IN).expect("slice").slice;
+    let report = modes::check_on_host(
+        &exec,
+        &c,
+        mode,
+        &UnitText::new(mode.unit_name(), kbf),
+        &UnitText::new(SLICE, slice),
+        true,
+        None,
+    )
+    .expect("checks");
+    assert!(
+        report.failures.iter().all(|f| f.rule != "traverse"),
+        "{:?}",
+        report.failures
+    );
+}
+
+/// Rule `traverse` reads the host, and says so when it cannot: each case below is the
+/// unit of `storage-and-daemon` checked on a host (or with a unit) where one step of the
+/// rule is unreadable. The rule is skipped with its note, or not applied at all, and it
+/// never turns into a failure. Catches a skip that fails the unit, one that hides its
+/// reason, and a check that runs on a unit with no `file://` hot store or no `User=`.
+#[test]
+fn rule_traverse_is_skipped_with_a_note_where_it_cannot_read() {
+    let mode = Mode::StorageAndDaemon;
+    // The 0700 parent, so that a check that did run would fail.
+    let c = LinuxConfig::parse(&EXAMPLE.replace(
+        "KBF_HOT_DIR=/var/lib/kbf/hot",
+        "KBF_HOT_DIR=/var/lib/kbf-server/x/hot",
+    ))
+    .expect("valid settings");
+    let report = |exec: &ScratchHost, edit: &dyn Fn(String) -> String| {
+        let (uid, _) = me();
+        let unit = edit(modes::render(&c, Some(uid + 1), mode).expect("renders"));
+        let slice = render(&c, None, &Templates::BUILT_IN).expect("slice").slice;
+        modes::check_on_host(
+            exec,
+            &c,
+            mode,
+            &UnitText::new(mode.unit_name(), unit),
+            &UnitText::new(SLICE, slice),
+            true,
+            None,
+        )
+        .expect("checks")
+    };
+    let traverse_notes = |r: &crate::linux::Report| -> Vec<String> {
+        r.notes
+            .iter()
+            .filter(|n| n.starts_with("SKIP traverse"))
+            .cloned()
+            .collect()
+    };
+    let none = |r: &crate::linux::Report| r.failures.iter().all(|f| f.rule != "traverse");
+    let (uid, gid) = me();
+    let (exec, world) = host("install-mode-hot-skips");
+    world
+        .borrow_mut()
+        .users
+        .insert("kbf".to_owned(), (uid + 1, gid + 1));
+    fs::set_permissions(exec.at("/"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    let parent = exec.at("/var/lib/kbf-server");
+    fs::create_dir_all(&parent).expect("dirs");
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("chmod");
+    let same = |s: String| s;
+
+    // Control: the same unit does fail, so the cases below skip for their own reason.
+    let r = report(&exec, &same);
+    assert!(!none(&r), "{:?}", r.failures);
+
+    // No `User=` line value: nobody to judge.
+    let r = report(&exec, &|s| s.replace("\nUser=kbf\n", "\nUser=\n"));
+    assert!(none(&r) && traverse_notes(&r).is_empty(), "{r:?}");
+    // A hot store that is not a file:// one is not a directory to walk.
+    let r = report(&exec, &|s| {
+        s.replace("--hot-store=file://", "--hot-store=s3://")
+    });
+    assert!(none(&r) && traverse_notes(&r).is_empty(), "{r:?}");
+    // A file:// path that is not an absolute one is not read either.
+    let r = report(&exec, &|s| {
+        s.replace("--hot-store=file://", "--hot-store=file://rel")
+    });
+    assert!(none(&r) && traverse_notes(&r).is_empty(), "{r:?}");
+    // A unit with no hot store at all.
+    let r = report(&exec, &|s| s.replace("--hot-store=", "--not-a-store="));
+    assert!(none(&r) && traverse_notes(&r).is_empty(), "{r:?}");
+
+    // No such user on this host.
+    world.borrow_mut().users.remove("kbf");
+    let r = report(&exec, &same);
+    assert!(none(&r), "{:?}", r.failures);
+    assert_eq!(
+        traverse_notes(&r),
+        ["SKIP traverse: no user kbf on this host, so the path to --hot-store was not read"]
+    );
+    world
+        .borrow_mut()
+        .users
+        .insert("kbf".to_owned(), (uid + 1, gid + 1));
+
+    // A directory on the way that cannot be read: the path below a regular file.
+    fs::remove_dir(&parent).expect("rmdir");
+    fs::write(&parent, "").expect("file");
+    let r = report(&exec, &same);
+    assert!(none(&r), "{:?}", r.failures);
+    let notes = traverse_notes(&r);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].starts_with("SKIP traverse: "), "{notes:?}");
+    assert!(notes[0].len() > "SKIP traverse: ".len(), "{notes:?}");
+
+    // `getent` that cannot run: the lookup's own error is the note.
+    let mut exec = exec;
+    let inner = std::mem::replace(&mut exec.answer, Box::new(|_| Ok(reply(0, "", ""))));
+    exec.answer = Box::new(move |cmd| {
+        if cmd.program.as_str() == GETENT {
+            Err(std::io::Error::other("getent missing"))
+        } else {
+            inner(cmd)
+        }
+    });
+    let r = report(&exec, &same);
+    assert!(none(&r), "{:?}", r.failures);
+    let notes = traverse_notes(&r);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("getent missing"), "{notes:?}");
 }

@@ -45,6 +45,9 @@
 //!   and names no variable (systemd would expand it into kbf's argv); postgres is not
 //!   wired yet, so a Postgres URI fails ([`super::stores`]).
 //! - `ports`: no two of the unit's listeners share a port ([`super::stores`]).
+//! - `handover`: the frontend's unit is the template `kbf-frontend@.service` whose two
+//!   instances hand over to one another: `Type=notify`, a control socket in a preserved
+//!   `RuntimeDirectory=`, no `Conflicts=` ([`super::handover`]).
 //! - `stop`: a mode that drains on SIGTERM (every mode but `daemon`) has
 //!   `TimeoutStopSec=infinity` and `KillSignal=SIGTERM`, so systemd never kills it
 //!   mid-drain and fails the builds in flight ([`super::stop`]).
@@ -89,7 +92,7 @@ use kbf_host::step::Cmd;
 use super::check::{Failure, Report, angle_placeholder};
 use super::config::{LinuxConfig, LinuxError};
 use super::render::{SLICE, values};
-use super::{cpuset, credential, stop, stores};
+use super::{cpuset, credential, handover, stop, stores, traverse};
 use crate::template::{self, TemplateError, leftovers};
 use crate::unit::{UnitError, UnitFile, comments_in_continuations};
 
@@ -99,6 +102,11 @@ pub const COLD_STORE_KEY_FILE: &str = "s3.env";
 
 /// The controllers a mode that runs builds must have delegated (rule `delegate`).
 pub const DELEGATED: [&str; 4] = ["cpu", "cpuset", "memory", "pids"];
+
+/// The instances of the frontend's template: one serves, and an update starts the other
+/// (rule `handover`, `kbf frontend handover`). Only the first is enabled at boot
+/// (`DefaultInstance=` in the template).
+pub const FRONTEND_INSTANCES: [&str; 2] = ["a", "b"];
 
 /// The word after `kbf` that parses a command line and starts nothing (kbf-cli's
 /// `kbf_cli::CHECK_ARGS`; its tests hold the two equal).
@@ -173,15 +181,32 @@ impl Mode {
         self == Mode::Storage
     }
 
-    /// The unit's file name: `kbf-<mode>.service`.
+    /// The unit's file name: `kbf-<mode>.service`, and for the frontend the template
+    /// `kbf-frontend@.service` (see [`FRONTEND_INSTANCES`]).
     #[must_use]
     pub fn unit_name(self) -> String {
-        format!("kbf-{}.service", self.name())
+        match self {
+            Mode::Frontend => "kbf-frontend@.service".to_owned(),
+            _ => format!("kbf-{}.service", self.name()),
+        }
+    }
+
+    /// The units the mode runs as: its own name, or for the frontend each instance of
+    /// its template (`kbf-frontend@a.service`, `kbf-frontend@b.service`).
+    #[must_use]
+    pub fn instances(self) -> Vec<String> {
+        match self {
+            Mode::Frontend => FRONTEND_INSTANCES
+                .iter()
+                .map(|i| format!("kbf-frontend@{i}.service"))
+                .collect(),
+            _ => vec![self.unit_name()],
+        }
     }
 
     fn template(self) -> &'static str {
         match self {
-            Mode::Frontend => include_str!("../../templates/linux/modes/kbf-frontend.service"),
+            Mode::Frontend => include_str!("../../templates/linux/modes/kbf-frontend@.service"),
             Mode::Storage => include_str!("../../templates/linux/modes/kbf-storage.service"),
             Mode::Daemon => include_str!("../../templates/linux/modes/kbf-daemon.service"),
             Mode::StorageAndDaemon => {
@@ -288,6 +313,51 @@ pub fn check(
     ))
 }
 
+/// Rule `traverse`: a `file://` `--hot-store` the unit's `User=` can reach. Skipped, with
+/// a note, where the user or a directory cannot be read.
+fn hot_store_reachable<E: Exec>(
+    exec: &E,
+    unit: &UnitFile,
+    failures: &mut Vec<Failure>,
+    notes: &mut Vec<String>,
+) {
+    let Some(dir) = unit
+        .flag("hot-store")
+        .and_then(|v| v.strip_prefix("file://"))
+        .and_then(|v| HostPath::new(v).ok())
+    else {
+        return;
+    };
+    let Some(name) = unit.get_in("Service", "User").filter(|u| !u.is_empty()) else {
+        return;
+    };
+    let user = match kbf_host::user::lookup(exec, name) {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            notes.push(format!(
+                "SKIP traverse: no user {name} on this host, so the path to --hot-store was not read"
+            ));
+            return;
+        }
+        Err(e) => {
+            notes.push(format!("SKIP traverse: {e}"));
+            return;
+        }
+    };
+    // root enters every directory.
+    if user.uid == 0 {
+        return;
+    }
+    match traverse::blocked_by(&user, &dir, |p| exec.stat(p)) {
+        Ok(None) => {}
+        Ok(Some((above, meta))) => failures.push(Failure {
+            rule: "traverse",
+            message: traverse::message(&user, &dir, &above, &meta),
+        }),
+        Err(e) => notes.push(format!("SKIP traverse: {e}")),
+    }
+}
+
 /// [`check`] on `unit` and its drop-ins, `kbf.slice` (`slice`, with its drop-ins), and
 /// then the rules that read the host `exec` runs on: `parse` (`kbf_bin`, or the unit's
 /// own binary when `exec` shows it there, run as `<kbf> check-args <mode> <flags...>`
@@ -356,6 +426,7 @@ pub fn check_on_host<E: Exec>(
         }
         notes.extend(found.notes);
     }
+    hot_store_reachable(exec, &merged, &mut failures, &mut notes);
     let argv = merged.exec_start();
     if runs_this_mode(config, mode, &argv) {
         let found = match kbf_bin {
@@ -445,7 +516,7 @@ fn runs_this_mode(config: &LinuxConfig, mode: Mode, argv: &[&str]) -> bool {
 }
 
 /// systemd's booleans (`parse_boolean`, any case).
-fn boolean(value: &str) -> Option<bool> {
+pub(super) fn boolean(value: &str) -> Option<bool> {
     let v = value.to_ascii_lowercase();
     if ["1", "yes", "y", "true", "t", "on"].contains(&v.as_str()) {
         Some(true)
@@ -640,6 +711,13 @@ fn rules(
     // ports
     for how in stores::ports(unit) {
         fail("ports", format!("{name}: {how}"));
+    }
+
+    // handover
+    if mode == Mode::Frontend {
+        for how in handover::check(unit) {
+            fail("handover", format!("{name} {how}"));
+        }
     }
 
     // stop
