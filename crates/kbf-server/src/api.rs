@@ -236,11 +236,7 @@ fn member_answer(
 ) -> Response {
     match set {
         Ok(Ok(map)) => {
-            tracing::info!(
-                member = id,
-                state = name,
-                "member state set by the operator API"
-            );
+            tracing::info!(member = id, state = name, "member state set");
             json(
                 StatusCode::OK,
                 &serde_json::json!({ "id": id, "state": name, "generation": map.generation() }),
