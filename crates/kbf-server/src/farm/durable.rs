@@ -17,6 +17,15 @@
 //!   is written at the grant and at the end, never to renew it);
 //! - `loss/<operation>`: how many of the operation's leases were lost, while it is
 //!   unfinished and has lost any ([`kbf_sched::LOSS_REQUEUES`] refuses it);
+//! - `fate/<operation>`: what the operation's faults changed: the raised booking and the
+//!   memory runs of its kills for memory, the farm runs it used, the nodes placement
+//!   avoids for it and the leases given up as not started ([`kbf_sched::Fate`]), written
+//!   in the transaction of every requeue that follows a fault (whole, so the newest row
+//!   is the whole state) and deleted with the operation's other rows. A successor (after
+//!   a handover or a crash) books the next rung and spends the budgets that are left
+//!   instead of starting over. A store with no row for an operation books and counts as
+//!   it did before the row existed; a row written before the budgets were (version 1)
+//!   carries none of them;
 //! - `done/<operation>`: how a finished or refused operation ended, kept for the finished
 //!   retention (at least [`DONE_FLOOR`]) so a process that did not finish it can still
 //!   answer the callers of it: a tag byte and the `ExecuteResponse` ([`kbf_front::Finished`]);
@@ -39,11 +48,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use kbf_front::{Described, Finished, Stage};
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
 use kbf_sched::fence::LEASE_GRACE;
-use kbf_sched::{DaemonInstance, Recovered, RecoveredLease, Request, Requeue};
+use kbf_sched::{DaemonInstance, Fate, Recovered, RecoveredLease, Request, Requeue};
 use kbf_state::{Cond, Conflict, GENERATION, Store, StoreError, Txn, Versioned};
 use kbf_types::{
-    ControlRecord, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, StartLease, WaiterId,
-    WorkerId,
+    ControlRecord, Digest, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, StartLease,
+    WaiterId, WorkerId,
 };
 
 use tokio::sync::watch;
@@ -63,6 +72,7 @@ const ALIVE: &str = "meta/alive";
 const NEXT_OP: &str = "meta/next_op";
 const NEXT_SEQ: &str = "meta/next_seq";
 const CORDON: &str = "cordon/";
+const FATE: &str = "fate/";
 
 /// The least time a `done/` row is kept, whatever the finished retention: a process that
 /// follows an operation it did not finish needs the row for as long as a stream it kept
@@ -193,6 +203,8 @@ pub(super) struct StoredOperation {
     pub lease: Option<LeaseGrant>,
     /// How many of its leases were lost.
     pub losses: u32,
+    /// What its kills for memory changed, if it was killed.
+    pub fate: Option<Fate>,
 }
 
 impl StoredOperation {
@@ -207,9 +219,12 @@ impl StoredOperation {
                 worker: grant.worker,
             }),
             losses: self.losses,
+            fate: self.fate,
         }
     }
 }
+
+mod fate;
 
 /// The scheduler's handle on its state store.
 pub(super) struct Durable {
@@ -239,6 +254,10 @@ fn queue_key(operation: OperationId) -> String {
 
 fn loss_key(operation: OperationId) -> String {
     format!("loss/{:016x}", operation.0)
+}
+
+fn fate_key(operation: OperationId) -> String {
+    format!("{FATE}{:016x}", operation.0)
 }
 
 fn done_key(operation: OperationId) -> String {
@@ -349,6 +368,12 @@ impl Durable {
                 .map_err(|_| corrupt(&key, "not a loss count"))?;
             losses.insert(operation, count);
         }
+        let mut fates = std::collections::BTreeMap::new();
+        for (key, row) in self.store.scan_prefix(FATE)? {
+            let operation = parse_operation(&key, FATE)?;
+            let fate = fate::decode(&row.value).map_err(|why| corrupt(&key, why))?;
+            fates.insert(operation, fate);
+        }
         let mut operations = Vec::new();
         for (key, row) in self.store.scan_prefix("op/")? {
             let FarmInput::Submit(request) = decode(&key, &row.value)? else {
@@ -361,6 +386,7 @@ impl Durable {
                 request,
                 lease,
                 losses: losses.remove(&operation).unwrap_or(0),
+                fate: fates.remove(&operation),
             });
         }
         Ok(Stored {
@@ -394,6 +420,26 @@ impl Durable {
             None => Txn::new().delete(key, Cond::Any),
         };
         self.commit(txn)
+    }
+
+    /// The unfinished operations that run `action` (of `instance`, if given): at most one
+    /// per instance, since a twin joins the operation that is running.
+    pub(super) fn operations_of(
+        &self,
+        instance: Option<&str>,
+        action: &Digest,
+    ) -> Result<Vec<OperationId>, StateError> {
+        let mut found = Vec::new();
+        for (key, row) in self.store.scan_prefix("op/")? {
+            let FarmInput::Submit(request) = decode(&key, &row.value)? else {
+                return Err(corrupt(&key, "not a request"));
+            };
+            let named = instance.is_none_or(|instance| request.key.instance == instance);
+            if named && request.key.action == *action {
+                found.push(parse_operation(&key, "op/")?);
+            }
+        }
+        Ok(found)
     }
 
     /// Where `operation` stands.
@@ -454,11 +500,14 @@ impl Durable {
     /// that has finished has nothing to put back.
     ///
     /// `losses` is the operation's count of lost leases, to write down if the give-up is
-    /// one ([`kbf_sched::RequeueReason::is_loss`]).
+    /// one ([`kbf_sched::RequeueReason::is_loss`]). `fate` is what the operation's faults
+    /// changed so far, if they changed anything: it goes in the same transaction as the
+    /// queue row.
     pub(super) fn requeued(
         &self,
         requeue: &Requeue,
         losses: Option<u32>,
+        fate: Option<&Fate>,
     ) -> Result<(), StateError> {
         if self.store.get(&op_key(requeue.operation))?.is_none() {
             return Ok(());
@@ -471,6 +520,12 @@ impl Durable {
         if let Some(count) = losses {
             let count = u64::from(count).to_be_bytes();
             txn = txn.put(loss_key(requeue.operation), count, Cond::Any);
+        }
+        if let Some(fate) = fate {
+            let row = fate::encode(fate).ok_or_else(|| {
+                corrupt(&fate_key(requeue.operation), "a fate is too large to write")
+            })?;
+            txn = txn.put(fate_key(requeue.operation), row, Cond::Any);
         }
         self.commit(txn.put(queue_key(requeue.operation), Vec::new(), Cond::Any))
     }
@@ -486,7 +541,8 @@ impl Durable {
                 .delete(key, Cond::Version(row.version))
                 .delete(op_key(operation), Cond::Any)
                 .delete(queue_key(operation), Cond::Any)
-                .delete(loss_key(operation), Cond::Any),
+                .delete(loss_key(operation), Cond::Any)
+                .delete(fate_key(operation), Cond::Any),
         )
     }
 
@@ -496,7 +552,8 @@ impl Durable {
             Txn::new()
                 .delete(op_key(operation), Cond::Any)
                 .delete(queue_key(operation), Cond::Any)
-                .delete(loss_key(operation), Cond::Any),
+                .delete(loss_key(operation), Cond::Any)
+                .delete(fate_key(operation), Cond::Any),
         )
     }
 
@@ -590,6 +647,12 @@ impl Durable {
             };
             flag.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// Whether a write was refused because a newer writer holds the store: nothing this
+    /// handle writes can succeed any more.
+    pub(super) fn superseded(&self) -> bool {
+        self.fenced.load(Ordering::SeqCst)
     }
 
     /// A write that tells whether the store takes writes again.
@@ -703,13 +766,16 @@ impl State {
             } else {
                 None
             };
-            self.unsettled.push((requeue.clone(), losses));
+            // Taken now, not when the store takes the write: a later kill must not
+            // reach an earlier requeue's row.
+            let fate = self.sched.fate(requeue.operation);
+            self.unsettled.push((requeue.clone(), losses, fate));
         }
         let pending = std::mem::take(&mut self.unsettled);
-        let refused: Vec<(Requeue, Option<u32>)> = pending
+        let refused: Vec<_> = pending
             .into_iter()
-            .filter(|(requeue, losses)| {
-                !self.durably("a requeue", |d| d.requeued(requeue, *losses))
+            .filter(|(requeue, losses, fate)| {
+                !self.durably("a requeue", |d| d.requeued(requeue, *losses, fate.as_ref()))
             })
             .collect();
         self.unsettled = refused;

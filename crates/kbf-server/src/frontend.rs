@@ -383,6 +383,7 @@ impl FrontendFlags {
 fn routed_of(
     members: Option<&Arc<Members>>,
     flags: &FrontendFlags,
+    storage: &RemoteStorage,
 ) -> Result<Option<Arc<Routed>>, ConfigError> {
     let Some(members) = members else {
         return Ok(None);
@@ -396,10 +397,9 @@ fn routed_of(
         return Ok(None);
     };
     let maps = Arc::new(FrontMaps::new(Arc::clone(members)));
-    Ok(Some(Arc::new(Routed::over_tls(
-        maps,
-        Arc::new(TlsNodes::new(ca, identity)),
-    ))))
+    Ok(Some(Arc::new(
+        Routed::over_tls(maps, Arc::new(TlsNodes::new(ca, identity))).bootstrapped(storage.clone()),
+    )))
 }
 
 /// A started frontend: bound, not yet serving.
@@ -735,7 +735,7 @@ impl<'a> Prepared<'a> {
         let timeout = listeners.store_probe_timeout;
         let storage = Arc::new(RemoteStorage::new(channel.clone(), 0));
         let state_store = store_of(state.as_ref());
-        let routed = routed_of(members.as_ref(), flags)?;
+        let routed = routed_of(members.as_ref(), flags, &storage)?;
         let checks = Arc::new(checks(
             Arc::clone(&readiness),
             storage.clone(),
@@ -763,7 +763,6 @@ impl<'a> Prepared<'a> {
         log_state(durable, farm.term(), farm.lease_epoch());
 
         let sockets = sockets(adopted, &listeners, api.as_ref(), flags.handover.is_some())?;
-        let peers_certified = listeners.worker_tls.is_some();
         let (mut worker_server, peers, worker_tls) = worker_peers(
             keepalive(
                 flow_control(Server::builder(), listeners.stream_limits.worker),
@@ -822,6 +821,7 @@ impl<'a> Prepared<'a> {
             flow_control(Server::builder(), listeners.stream_limits.reapi),
             listeners.streams,
         );
+        let membership = membership(members.clone(), &peers);
         let sessions = WorkerService::new(
             Arc::clone(&farm),
             peers,
@@ -834,7 +834,6 @@ impl<'a> Prepared<'a> {
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
 
-        let membership = membership(members.clone(), peers_certified);
         let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
         let authorizers = Arc::new(policy.authorizers);
         let bootstrap = Owner::new(&flags.storage.uri().to_string(), channel);

@@ -138,15 +138,15 @@ pub fn check_box_files(
     dir: Option<&Path>,
 ) -> Result<Vec<check::CheckFailure>, Refusal> {
     let c = BoxConfig::load(config)?;
-    let read = |name: &str| -> Result<(PathBuf, String), Refusal> {
-        let path = dir.map_or_else(|| config.to_owned(), |d| d.join(name));
+    let read = |dir: &Path, name: &str| -> Result<(PathBuf, String), Refusal> {
+        let path = dir.join(name);
         match std::fs::read_to_string(&path) {
             Ok(text) => Ok((path, text)),
             Err(source) => Err(Refusal::Read { path, source }),
         }
     };
     let (envoy, args) = match dir {
-        Some(_) => (read(ENVOY)?, read(ENVOY_ARGS)?.1),
+        Some(dir) => (read(dir, ENVOY)?, read(dir, ENVOY_ARGS)?.1),
         None => {
             let r = box_render::render_box(&c);
             ((config.to_owned(), r.envoy), r.args)

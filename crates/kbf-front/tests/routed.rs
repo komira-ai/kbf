@@ -722,6 +722,117 @@ async fn the_storage_node_is_the_bootstrap_until_the_map_has_two_members() {
     assert_eq!(format!("{:?}", farm.routed), "Routed(..)");
 }
 
+/// Catches a frontend that calls the `--storage` node at generation 0 while the map has one
+/// member: a node that judges calls by its map refuses 0 as behind (STALE_MAP), so a farm of
+/// one would answer nothing. The node holds the map of generation 5 with one member, and the
+/// frontend learns that map only after the backend and the proxy are made, so the tag cannot
+/// have been taken at construction: the backend's and the proxy's calls to the bootstrap node
+/// are answered, and tagged 5. Mutants: the backend not tagging before it uses the
+/// bootstrap node; the proxy's fixed list not tagged.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_that_judges_its_map_is_called_at_the_generation_the_frontend_holds() {
+    let map = Farm::map(5, &[MemberState::Active], 1);
+    let farm = Farm::new(Some(Arc::clone(&map)));
+    let handle = RemoteStorage::new(farm.bootstrap.clone(), 0);
+    let routed = Arc::new(
+        Routed::new(farm.cell.clone(), farm.plain.clone(), farm.plain.clone())
+            .bootstrapped(handle.clone()),
+    );
+    let backend = Backend::routed(Arc::clone(&routed), Arc::new(handle));
+    let owners = Owners::routed(
+        Arc::clone(&routed),
+        Owner::new("bootstrap", farm.bootstrap.clone()),
+    );
+    let front = lazy(serve(
+        Proxy::new(owners, Arc::new(Authorizers::allow_all())).routes(),
+    ));
+    farm.cell.set(map);
+    assert!(!routed.active(), "one member: the bootstrap node is called");
+
+    let blobs: Vec<_> = (0..4).map(blob).collect();
+    let digests: Vec<_> = blobs.iter().map(|(_, d)| *d).collect();
+    assert_eq!(
+        backend.find_missing(&digests).await.expect("answered"),
+        digests
+    );
+    assert_eq!(update(&front, &blobs).await, vec![OK; 4]);
+    assert!(
+        backend
+            .find_missing(&digests)
+            .await
+            .expect("answered")
+            .is_empty()
+    );
+}
+
+/// What a node holds of a map the test moves.
+struct Moving(Mutex<Arc<Map>>);
+
+impl kbf_storage::replicate::MapSource for Moving {
+    fn current(&self) -> Option<Arc<Map>> {
+        Some(Arc::clone(
+            &self.0.lock().unwrap_or_else(PoisonError::into_inner),
+        ))
+    }
+
+    fn me(&self) -> Option<MemberId> {
+        None
+    }
+}
+
+/// Catches a frontend that takes the generation for its `--storage` calls once: the map moves
+/// from 5 to 6 (the node's and the frontend's), and the next call, made by the same backend
+/// and the same proxy, is tagged 6 and answered, not refused as behind (STALE_MAP naming 6).
+/// Mutant: the generation tagged on the first call only.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bootstrap_calls_follow_a_map_bump() {
+    let five = Farm::map(5, &[MemberState::Active], 1);
+    let held = Arc::new(Moving(Mutex::new(Arc::clone(&five))));
+    let store: Arc<dyn Storage> = Arc::new(CacheStorage::new(
+        Arc::new(Cache::memory()),
+        SegmentsConfig::DEFAULT,
+    ));
+    let config = Config {
+        write_bytes_in_flight: 64 << 20,
+    };
+    let service = StorageService::new(Arc::clone(&store), Admission::Open, config)
+        .with_map(Arc::clone(&held) as Arc<dyn kbf_storage::replicate::MapSource>);
+    let channel = lazy(serve(service.routes()));
+
+    let farm = Farm::new(None);
+    let handle = RemoteStorage::new(channel.clone(), 0);
+    let routed = Arc::new(
+        Routed::new(farm.cell.clone(), farm.plain.clone(), farm.plain.clone())
+            .bootstrapped(handle.clone()),
+    );
+    let backend = Backend::routed(Arc::clone(&routed), Arc::new(handle));
+    let owners = Owners::routed(Arc::clone(&routed), Owner::new("bootstrap", channel));
+    let front = lazy(serve(
+        Proxy::new(owners, Arc::new(Authorizers::allow_all())).routes(),
+    ));
+    let blobs: Vec<_> = (0..4).map(blob).collect();
+    let digests: Vec<_> = blobs.iter().map(|(_, d)| *d).collect();
+
+    farm.cell.set(five);
+    assert_eq!(update(&front, &blobs[..2]).await, vec![OK; 2]);
+    assert_eq!(
+        backend.find_missing(&digests).await.expect("at 5"),
+        digests[2..]
+    );
+
+    let six = Farm::map(6, &[MemberState::Active], 1);
+    *held.0.lock().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&six);
+    farm.cell.set(six);
+    assert_eq!(update(&front, &blobs[2..]).await, vec![OK; 2]);
+    assert!(
+        backend
+            .find_missing(&digests)
+            .await
+            .expect("at 6")
+            .is_empty()
+    );
+}
+
 /// Catches a farm that shrinks to one member being sent back to the `--storage` node,
 /// which may be one that left: with members 1 to 3 and `--storage` naming node 1, the map
 /// becomes node 2 alone, and a write lands on node 2 (as the map says), not node 1. The
@@ -870,4 +981,84 @@ async fn a_down_primary_is_gone_around() {
 
     let read = read(&front, &[blobs[0].1]).await;
     assert_eq!(read, vec![(OK, blobs[0].0.clone())]);
+}
+
+/// Catches a CAS write failed for the whole member lease (15 s) by a writer that is dead but
+/// not yet marked down: node 3 is a closed port and the map has it active, and each blob of
+/// a batch whose first owner it is lands on the blob's other owner, with an OK status. The
+/// blobs whose owners are other nodes are written as before. Mutant: the router's write
+/// ends at the first owner's failure (UNAVAILABLE for every blob owned first by node 3).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_update_goes_on_to_the_next_owner_when_the_writer_is_dead_but_active() {
+    let farm = Farm::new(None);
+    let map = farm.set(1, &ALL_ACTIVE, 2);
+    let blobs: Vec<_> = (0..40).map(blob).collect();
+    let dead_first = blobs
+        .iter()
+        .filter(|(_, d)| map.write_owners(d)[0] == MemberId(3))
+        .count();
+    assert!(dead_first >= 4, "blobs that node 3 owns first");
+    farm.plain.take_down(3);
+    let front = farm.front();
+
+    assert_eq!(update(&front, &blobs).await, vec![OK; blobs.len()]);
+
+    for (_, digest) in &blobs {
+        let owners = map.write_owners(digest);
+        let writer = owners
+            .iter()
+            .find(|id| id.0 != 3)
+            .expect("an owner that is up")
+            .0;
+        let held = farm.holders(digest).await;
+        assert_eq!(
+            held,
+            BTreeSet::from([writer]),
+            "{digest:?} owners {owners:?}"
+        );
+    }
+}
+
+/// Catches an entry committed nowhere because the action's owner is dead and the map has
+/// not marked it down: node 3 (the action's first owner) is a closed port, and the
+/// backend's prepare and commit go to the action's other owner, which receives the blobs the
+/// entry names, commits, and a client's GetActionResult through the proxy finds the entry
+/// (the dead owner is passed over by the read). Mutant: the commit ends at the first owner.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_entry_is_committed_at_the_next_owner_when_the_actions_owner_is_dead() {
+    let farm = Farm::new(None);
+    let map = farm.set(1, &ALL_ACTIVE, 2);
+    let case = case(&map);
+    let second = map.write_owners(&case.action)[1].0;
+    for owner in map.write_owners(&case.output.1) {
+        farm.nodes[&owner.0]
+            .put(Bytes::from(case.output.0.clone()))
+            .await
+            .expect("stored");
+    }
+    farm.plain.take_down(3);
+    let backend = farm.backend();
+
+    let record = backend
+        .prepare_action_result(&case.result)
+        .await
+        .expect("prepared");
+    backend
+        .commit_action_record(case.action, record)
+        .await
+        .expect("committed at the action's other owner");
+
+    let through_the_proxy = ActionCacheClient::new(farm.front())
+        .get_action_result(GetActionResultRequest {
+            action_digest: Some(proto(&case.action)),
+            ..GetActionResultRequest::default()
+        })
+        .await
+        .expect("GetActionResult")
+        .into_inner();
+    assert_eq!(through_the_proxy, case.result);
+    assert!(
+        farm.holders(&case.output.1).await.contains(&second),
+        "the output is on the action's other owner"
+    );
 }

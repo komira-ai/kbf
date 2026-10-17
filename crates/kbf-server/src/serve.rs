@@ -370,18 +370,22 @@ pub(crate) fn map_of(
 }
 
 /// The membership service storage nodes register with, when there are members to keep:
-/// under worker TLS only the storage role may call it. Not generic, for the same reason
+/// under worker TLS only the storage role may call it, each certificate for the names it
+/// holds and not if the listener's deny list refuses it. Not generic, for the same reason
 /// as [`sweeping`].
 pub(crate) fn membership(
     members: Option<Arc<Members>>,
-    certified: bool,
+    peers: &Peers,
 ) -> Option<MembershipServer<MembershipService>> {
-    let admission = if certified {
-        Admission::Certified
-    } else {
-        Admission::Open
+    let (admission, deny_list) = match peers {
+        Peers::Certified { deny_list } => (Admission::Certified, deny_list.clone()),
+        Peers::Unauthenticated => (Admission::Open, None),
     };
-    Some(MembershipService::new(members?, admission).server())
+    Some(
+        MembershipService::new(members?, admission)
+            .with_deny_list(deny_list)
+            .server(),
+    )
 }
 
 /// Expires members while the server runs. Never completes; with no state store there
@@ -633,7 +637,6 @@ where
     let farm = Arc::new(farm.with_state(state)?);
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
-    let peers_certified = listeners.worker_tls.is_some();
     let (mut worker_server, peers, worker_tls) = worker_peers(
         keepalive(
             flow_control(Server::builder(), listeners.stream_limits.worker),
@@ -714,6 +717,7 @@ where
     ))
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    let membership = membership(members.clone(), &peers);
     let sessions = WorkerService::new(
         Arc::clone(&farm),
         peers,
@@ -725,7 +729,6 @@ where
     let worker_service = WorkerServer::new(sessions)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
-    let membership = membership(members.clone(), peers_certified);
     let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);
@@ -863,14 +866,19 @@ pub struct StorageListener {
     pub service: kbf_storage::service::Config,
 }
 
-/// The check each call of a gated node passes ([`bind_storage_gated`]). Not generic, so
-/// the lines count once.
-fn map_gate(
-    maps: Option<Arc<kbf_mapsync::MapHolder>>,
-) -> impl FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Clone {
-    move |request| match &maps {
-        Some(maps) if maps.generation() == 0 => Err(tonic::Status::unavailable(NO_MAP_YET)),
-        _ => Ok(request),
+impl StorageListener {
+    /// The service over `storage` this listener serves: callers admitted by the role in
+    /// their certificates with mutual TLS, every caller without it.
+    #[must_use]
+    pub fn service(
+        &self,
+        storage: Arc<dyn kbf_storage::Storage>,
+    ) -> kbf_storage::service::StorageService {
+        let admission = match self.tls {
+            Some(_) => kbf_storage::service::Admission::Certified,
+            None => kbf_storage::service::Admission::Open,
+        };
+        kbf_storage::service::StorageService::new(storage, admission, self.service)
     }
 }
 
@@ -896,40 +904,24 @@ pub fn bind_storage(
     listener: StorageListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
-    bind_storage_gated(storage, listener, None, shutdown)
+    let service = listener.service(storage);
+    bind_service(service, listener.listen, listener.tls, shutdown).map(|(bound, _)| bound)
 }
 
-/// The refusal a gated node answers every call with until its first map.
-pub const NO_MAP_YET: &str = "no storage map yet";
-
-/// [`bind_storage`], and with `maps` (a node in a multi-member farm, which registered
-/// with a frontend) every call is answered UNAVAILABLE [`NO_MAP_YET`] until `maps` holds
-/// its first map: a node that does not know the farm's members cannot tell a blob it owns
-/// from one it does not, and would take a write the map places elsewhere. `None` (one
-/// box, whose map is itself) serves at once.
+/// [`bind_storage`] over a service the caller has set up: a node that is one of several
+/// gives it the map it judges calls by and its chain ([`crate::replication`]). `tls` must be
+/// what the service's admission was made from ([`StorageListener::service`]). Also returns
+/// the [`kbf_storage::service::InProcess`] view of the very service the listener serves: a
+/// caller in this process (the daemon half of `kbf storage-and-daemon`) reaches the node
+/// through it and takes the path a call over the listener takes, the service's own map
+/// check and chain included, not the inner storage.
 ///
 /// # Errors
 /// As [`bind_storage`].
-pub fn bind_storage_gated(
-    storage: Arc<dyn kbf_storage::Storage>,
-    listener: StorageListener,
-    maps: Option<Arc<kbf_mapsync::MapHolder>>,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
-    bind_storage_shared(storage, listener, maps, shutdown).map(|(bound, _)| bound)
-}
-
-/// [`bind_storage_gated`], and the [`kbf_storage::service::InProcess`] view of the very
-/// service the listener serves: a caller in this process (the daemon half of
-/// `kbf storage-and-daemon`) reaches the node through it and takes the path a call over
-/// the listener takes, not the inner storage.
-///
-/// # Errors
-/// As [`bind_storage`].
-pub fn bind_storage_shared(
-    storage: Arc<dyn kbf_storage::Storage>,
-    listener: StorageListener,
-    maps: Option<Arc<kbf_mapsync::MapHolder>>,
+pub fn bind_service(
+    service: kbf_storage::service::StorageService,
+    listen: SocketAddr,
+    tls: Option<TlsSource>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<
     (
@@ -938,27 +930,60 @@ pub fn bind_storage_shared(
     ),
     ServeError,
 > {
-    let (incoming, addr) = bind(listener.listen)?;
-    let server = flow_control(
+    serve_service(service, bind_storage_socket(listen)?, tls, shutdown)
+}
+
+/// A storage listener's socket: bound, so its address is known and callers queue on it,
+/// and not yet serving ([`bind_storage_socket`], then [`serve_service`]).
+pub struct StorageSocket {
+    incoming: TcpIncoming,
+    addr: SocketAddr,
+}
+
+impl StorageSocket {
+    /// Where the socket is bound.
+    #[must_use]
+    pub const fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+/// Binds `listen`, serving nothing yet: a storage node registers with its frontend from
+/// the bound address before it opens the cache it serves.
+///
+/// # Errors
+/// The listener cannot be bound.
+pub fn bind_storage_socket(listen: SocketAddr) -> Result<StorageSocket, ServeError> {
+    let (incoming, addr) = bind(listen)?;
+    Ok(StorageSocket { incoming, addr })
+}
+
+/// [`bind_service`] over a socket already bound ([`bind_storage_socket`]).
+///
+/// # Errors
+/// As [`bind_storage`].
+pub fn serve_service(
+    service: kbf_storage::service::StorageService,
+    socket: StorageSocket,
+    tls: Option<TlsSource>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<
+    (
+        BoundStorage<impl Future<Output = Result<(), ServeError>>>,
+        kbf_storage::service::InProcess,
+    ),
+    ServeError,
+> {
+    let StorageSocket { incoming, addr } = socket;
+    let mut server = flow_control(
         Server::builder(),
         crate::streams::StreamLimits::DEFAULT.worker,
     );
-    let admission = if listener.tls.is_some() {
-        kbf_storage::service::Admission::Certified
-    } else {
-        kbf_storage::service::Admission::Open
-    };
-    let incoming = Incoming::new(incoming, listener.tls);
-    let service = Arc::new(kbf_storage::service::StorageService::new(
-        storage,
-        admission,
-        listener.service,
-    ));
+    let incoming = Incoming::new(incoming, tls);
+    let service = Arc::new(service);
     let (routes, in_process) = (service.shared_routes(), service.in_process());
-    let gate = tonic::service::InterceptorLayer::new(map_gate(maps));
     let serving = async move {
         server
-            .layer(gate)
             .add_routes(routes)
             .serve_with_incoming_shutdown(incoming, shutdown)
             .await
