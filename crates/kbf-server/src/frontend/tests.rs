@@ -398,3 +398,32 @@ async fn an_operator_api_address_in_use_fails_the_start() {
         "{error}"
     );
 }
+
+/// Catches: a frontend that does not bind the three listeners it was asked for, or binds
+/// the operator API's on the REAPI's or worker's port. The unit-test build of `Prepared::new`
+/// otherwise only ever sees its failure, so the success path (and the coverage of it in this
+/// build) is this test's. Mutant: the API socket not bound (`api: None`).
+#[tokio::test]
+async fn a_frontend_binds_its_three_listeners_on_their_own_ports() {
+    let argv = [
+        "frontend".to_owned(),
+        "--storage=http://127.0.0.1:1".to_owned(),
+        "--listen=127.0.0.1:0".to_owned(),
+        "--worker-listen=127.0.0.1:0".to_owned(),
+        "--api-listen=127.0.0.1:0".to_owned(),
+    ];
+    let matches = super::command().try_get_matches_from(argv).expect("flags");
+    let flags = super::parse(&matches).expect("a frontend's flags");
+    let prepared = super::Prepared::new(&flags).expect("free ports bind");
+    let api = prepared.sockets.api.as_ref().expect("the API is bound");
+    let ports = [
+        prepared.sockets.reapi.local.port(),
+        prepared.sockets.worker.local.port(),
+        api.local.port(),
+    ];
+    assert!(ports.iter().all(|port| *port != 0), "{ports:?}");
+    assert!(
+        ports[0] != ports[1] && ports[1] != ports[2] && ports[0] != ports[2],
+        "{ports:?}"
+    );
+}
