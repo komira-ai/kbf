@@ -687,6 +687,49 @@ async fn the_storage_node_is_the_bootstrap_until_the_map_has_two_members() {
     assert_eq!(format!("{:?}", farm.routed), "Routed(..)");
 }
 
+/// Catches a frontend that calls the `--storage` node at generation 0 while the map has one
+/// member: a node that judges calls by its map refuses 0 as behind (STALE_MAP), so a farm of
+/// one would answer nothing. The node holds the map of generation 5 with one member, and the
+/// frontend learns that map only after the backend and the proxy are made, so the tag cannot
+/// have been taken at construction: the backend's and the proxy's calls to the bootstrap node
+/// are answered, and tagged 5. Mutants: the backend not tagging before it uses the
+/// bootstrap node; the proxy's fixed list not tagged.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_that_judges_its_map_is_called_at_the_generation_the_frontend_holds() {
+    let map = Farm::map(5, &[MemberState::Active], 1);
+    let farm = Farm::new(Some(Arc::clone(&map)));
+    let handle = RemoteStorage::new(farm.bootstrap.clone(), 0);
+    let routed = Arc::new(
+        Routed::new(farm.cell.clone(), farm.plain.clone(), farm.plain.clone())
+            .bootstrapped(handle.clone()),
+    );
+    let backend = Backend::routed(Arc::clone(&routed), Arc::new(handle));
+    let owners = Owners::routed(
+        Arc::clone(&routed),
+        Owner::new("bootstrap", farm.bootstrap.clone()),
+    );
+    let front = lazy(serve(
+        Proxy::new(owners, Arc::new(Authorizers::allow_all())).routes(),
+    ));
+    farm.cell.set(map);
+    assert!(!routed.active(), "one member: the bootstrap node is called");
+
+    let blobs: Vec<_> = (0..4).map(blob).collect();
+    let digests: Vec<_> = blobs.iter().map(|(_, d)| *d).collect();
+    assert_eq!(
+        backend.find_missing(&digests).await.expect("answered"),
+        digests
+    );
+    assert_eq!(update(&front, &blobs).await, vec![OK; 4]);
+    assert!(
+        backend
+            .find_missing(&digests)
+            .await
+            .expect("answered")
+            .is_empty()
+    );
+}
+
 /// Catches a farm that shrinks to one member being sent back to the `--storage` node,
 /// which may be one that left: with members 1 to 3 and `--storage` naming node 1, the map
 /// becomes node 2 alone, and a write lands on node 2 (as the map says), not node 1. The

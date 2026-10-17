@@ -305,6 +305,7 @@ impl FrontendFlags {
 fn routed_of(
     members: Option<&Arc<Members>>,
     flags: &FrontendFlags,
+    storage: &RemoteStorage,
 ) -> Result<Option<Arc<Routed>>, ConfigError> {
     let Some(members) = members else {
         return Ok(None);
@@ -318,10 +319,9 @@ fn routed_of(
         return Ok(None);
     };
     let maps = Arc::new(FrontMaps::new(Arc::clone(members)));
-    Ok(Some(Arc::new(Routed::over_tls(
-        maps,
-        Arc::new(TlsNodes::new(ca, identity)),
-    ))))
+    Ok(Some(Arc::new(
+        Routed::over_tls(maps, Arc::new(TlsNodes::new(ca, identity))).bootstrapped(storage.clone()),
+    )))
 }
 
 /// A started frontend: bound, not yet serving.
@@ -445,7 +445,7 @@ fn bind_frontend(
     let timeout = listeners.store_probe_timeout;
     let storage = Arc::new(RemoteStorage::new(channel.clone(), 0));
     let state_store = store_of(state.as_ref());
-    let routed = routed_of(members.as_ref(), flags)?;
+    let routed = routed_of(members.as_ref(), flags, &storage)?;
     let checks = Arc::new(checks(
         Arc::clone(&readiness),
         storage.clone(),
