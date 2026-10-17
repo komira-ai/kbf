@@ -156,7 +156,7 @@ async fn the_api_answers_the_number_or_null_and_why() {
         json!({
             "members_total": 0, "members_active": 0, "not_active": [], "silent": [],
             "unreported": [], "debts_total": 0, "under_replicated_blobs": null,
-            "reasons": ["no storage member is registered"],
+            "reasons": ["no storage member is registered"], "nodes": [],
         })
     );
 
@@ -168,6 +168,10 @@ async fn the_api_answers_the_number_or_null_and_why() {
             "members_total": 2, "members_active": 2, "not_active": [], "silent": [],
             "unreported": [], "debts_total": 3, "under_replicated_blobs": 3,
             "reasons": ["3 blobs owed"],
+            "nodes": [
+                { "id": 1, "state": "active", "repair_debts": 0, "open_writes": null, "generation": 0 },
+                { "id": 2, "state": "active", "repair_debts": 3, "open_writes": null, "generation": 0 },
+            ],
         })
     );
 

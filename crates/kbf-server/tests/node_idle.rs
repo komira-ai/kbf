@@ -21,7 +21,7 @@ use hooked::Hooked;
 use kbf_map::{MemberId, MemberState};
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL, Progress, Registrant};
 use kbf_server::storage_health::{
-    Debts, MemberReport, NotIdle, NotReady, Report, Reported, Writes, node_idle, render,
+    Class, Debts, MemberReport, NotIdle, Report, Reported, Writes, node_idle, render,
     storage_health,
 };
 use kbf_state::{Store, StoreTime};
@@ -78,30 +78,27 @@ fn a_quiet_node_in_a_quiet_farm_is_idle_and_each_unknown_or_busy_value_is_a_reas
         (
             "writes open",
             said(Debts::Known(0), Writes::Known(3), 5, 100),
-            NotIdle::Writing {
-                member: node,
-                open: 3,
-            },
+            NotIdle::OpenWrites { member: node, n: 3 },
         ),
         (
             "writes not counted (an older node)",
             said(Debts::Known(0), Writes::Unknown, 5, 100),
-            NotIdle::WritesUnknown(node),
+            NotIdle::OpenWritesUnknown { member: node },
         ),
         (
             "debts not known",
             said(Debts::Unknown, Writes::Known(0), 5, 100),
-            NotIdle::NodeDebtsUnknown(node),
+            NotIdle::DebtsUnknown { member: node },
         ),
         (
             "its own debts",
             said(Debts::Known(2), Writes::Known(0), 5, 100),
-            NotIdle::Farm(NotReady::Owed(2)),
+            NotIdle::CopiesOwed { n: 2 },
         ),
         (
             "an older map than the one that stopped writes",
             said(Debts::Known(0), Writes::Known(0), 4, 100),
-            NotIdle::Behind {
+            NotIdle::ReportOlderThan {
                 member: node,
                 reported: 4,
                 wanted: 5,
@@ -110,9 +107,13 @@ fn a_quiet_node_in_a_quiet_farm_is_idle_and_each_unknown_or_busy_value_is_a_reas
         (
             "a report older than the freshness window",
             said(Debts::Known(0), Writes::Known(0), 5, 79),
-            NotIdle::NodeSilent(node),
+            NotIdle::NodeStale { member: node },
         ),
-        ("no report at all", None, NotIdle::NodeSilent(node)),
+        (
+            "no report at all",
+            None,
+            NotIdle::NodeStale { member: node },
+        ),
     ];
     for (what, report, reason) in cases {
         assert_eq!(idle(&with(report), 1, 5), [reason], "{what}");
@@ -148,7 +149,7 @@ fn the_rest_of_the_farm_must_hold_the_nodes_blobs() {
     );
     assert_eq!(
         idle(&[quiet(1), owes], 1, 5),
-        [NotIdle::Farm(NotReady::Owed(4))]
+        [NotIdle::CopiesOwed { n: 4 }]
     );
     let silent = member(
         2,
@@ -157,9 +158,9 @@ fn the_rest_of_the_farm_must_hold_the_nodes_blobs() {
     );
     assert_eq!(
         idle(&[quiet(1), silent], 1, 5),
-        [NotIdle::Farm(NotReady::Silent {
+        [NotIdle::OtherMemberStale {
             member: MemberId(2)
-        })]
+        }]
     );
     let blind = member(
         2,
@@ -168,9 +169,9 @@ fn the_rest_of_the_farm_must_hold_the_nodes_blobs() {
     );
     assert_eq!(
         idle(&[quiet(1), blind], 1, 5),
-        [NotIdle::Farm(NotReady::Unreported {
+        [NotIdle::OtherMemberDebtsUnknown {
             member: MemberId(2)
-        })]
+        }]
     );
     for state in [
         MemberState::Joining,
@@ -181,21 +182,23 @@ fn the_rest_of_the_farm_must_hold_the_nodes_blobs() {
         let other = member(2, state, None);
         assert_eq!(
             idle(&[quiet(1), other], 1, 5),
-            [NotIdle::Farm(NotReady::NotActive {
+            [NotIdle::OtherMemberNotActive {
                 member: MemberId(2)
-            })],
+            }],
             "{state:?}"
         );
     }
 
     assert_eq!(
         idle(&[quiet(1)], 1, 5),
-        [NotIdle::Farm(NotReady::NoMembers)],
+        [NotIdle::NoOtherMembers],
         "alone: no other copy"
     );
     assert_eq!(
         idle(&[quiet(1), quiet(2)], 7, 5),
-        [NotIdle::UnknownNode(MemberId(7))]
+        [NotIdle::UnknownNode {
+            member: MemberId(7)
+        }]
     );
     let joining = member(
         1,
@@ -211,48 +214,151 @@ fn the_rest_of_the_farm_must_hold_the_nodes_blobs() {
     );
 }
 
-// Catches: the reasons' text, which an operator reads in the update's status.
-#[test]
-fn the_reasons_say_what_to_wait_for() {
-    let node = MemberId(3);
-    let said = [
-        (
-            NotIdle::Writing {
-                member: node,
-                open: 2,
-            },
-            "member 3 has 2 open writes",
-        ),
-        (
-            NotIdle::WritesUnknown(node),
-            "member 3 does not count its open writes",
-        ),
-        (
-            NotIdle::Behind {
-                member: node,
-                reported: 4,
-                wanted: 6,
-            },
-            "member 3 reported at map 4, before map 6",
-        ),
-        (NotIdle::NodeSilent(node), "member 3 silent"),
-        (
-            NotIdle::NodeDebtsUnknown(node),
-            "member 3 does not know what it owes",
-        ),
-        (
-            NotIdle::NodeNotActive {
-                member: node,
-                state: MemberState::Draining,
-            },
-            "member 3 is draining, not active",
-        ),
-        (NotIdle::UnknownNode(node), "member 3 is not registered"),
-        (NotIdle::Farm(NotReady::Owed(7)), "7 blobs owed"),
-    ];
-    for (reason, text) in said {
-        assert_eq!(reason.to_string(), text);
+/// The position of a reason in the table below. Exhaustive on purpose: a new reason fails to
+/// compile here until the table has a case for it.
+fn position(reason: &NotIdle) -> usize {
+    match reason {
+        NotIdle::UnknownNode { .. } => 0,
+        NotIdle::NoOtherMembers => 1,
+        NotIdle::OtherMemberNotActive { .. } => 2,
+        NotIdle::OtherMemberStale { .. } => 3,
+        NotIdle::OtherMemberDebtsUnknown { .. } => 4,
+        NotIdle::CopiesOwed { .. } => 5,
+        NotIdle::NodeNotActive { .. } => 6,
+        NotIdle::NodeStale { .. } => 7,
+        NotIdle::DebtsUnknown { .. } => 8,
+        NotIdle::OpenWritesUnknown { .. } => 9,
+        NotIdle::OpenWrites { .. } => 10,
+        NotIdle::ReportOlderThan { .. } => 11,
+        NotIdle::Unreadable(_) => 12,
     }
+}
+
+// Catches: a reason that is never produced, worded wrongly, or classed wrongly. Every
+// variant is made by the judgement from the one situation that makes it (the first reason,
+// with the node's own report fine unless it is the cause), says what an operator waits for,
+// and is a Wait (it passes by itself) or a Held (the farm is not fit for the node to go).
+// A controller waits on the first and holds on the second, so a Held read as a Wait would
+// restart a node beside a second member that is not active.
+#[test]
+fn every_reason_is_made_worded_and_classed() {
+    let cause = |report| vec![member(1, MemberState::Active, report), quiet(2)];
+    let own = |debts, writes, generation| said(debts, writes, generation, 100);
+    let ok = || own(Debts::Known(0), Writes::Known(0), 5);
+    let other = |state, report| vec![quiet(1), member(2, state, report)];
+    let cases = vec![
+        (
+            vec![quiet(1), quiet(2)],
+            7,
+            5,
+            0,
+            "member 7 is not registered",
+            Class::Held,
+        ),
+        (
+            vec![quiet(1)],
+            1,
+            5,
+            1,
+            "no other storage member is registered",
+            Class::Held,
+        ),
+        (
+            other(MemberState::Down, None),
+            1,
+            5,
+            2,
+            "member 2 not active",
+            Class::Held,
+        ),
+        (
+            other(
+                MemberState::Active,
+                own(Debts::Known(0), Writes::Known(0), 5).map(|r| Report { at: at(50), ..r }),
+            ),
+            1,
+            5,
+            3,
+            "member 2 silent",
+            Class::Held,
+        ),
+        (
+            other(
+                MemberState::Active,
+                own(Debts::Unknown, Writes::Known(0), 5),
+            ),
+            1,
+            5,
+            4,
+            "member 2 does not know what it owes",
+            Class::Wait,
+        ),
+        (
+            cause(own(Debts::Known(2), Writes::Known(0), 5)),
+            1,
+            5,
+            5,
+            "2 blobs owed",
+            Class::Wait,
+        ),
+        (
+            vec![member(1, MemberState::Draining, ok()), quiet(2)],
+            1,
+            5,
+            6,
+            "member 1 is draining, not active",
+            Class::Held,
+        ),
+        (cause(None), 1, 5, 7, "member 1 silent", Class::Wait),
+        (
+            cause(own(Debts::Unknown, Writes::Known(0), 5)),
+            1,
+            5,
+            8,
+            "member 1 does not know what it owes",
+            Class::Wait,
+        ),
+        (
+            cause(own(Debts::Known(0), Writes::Unknown, 5)),
+            1,
+            5,
+            9,
+            "member 1 does not count its open writes",
+            Class::Wait,
+        ),
+        (
+            cause(own(Debts::Known(0), Writes::Known(2), 5)),
+            1,
+            5,
+            10,
+            "member 1 has 2 open writes",
+            Class::Wait,
+        ),
+        (
+            cause(own(Debts::Known(0), Writes::Known(0), 4)),
+            1,
+            6,
+            11,
+            "member 1 reported at map 4, before map 6",
+            Class::Wait,
+        ),
+    ];
+    let mut made = Vec::new();
+    for (members, who, generation, want, text, class) in cases {
+        let reasons = idle(&members, who, generation);
+        let first = reasons.first().unwrap_or_else(|| panic!("{text}: idle"));
+        assert_eq!(position(first), want, "{text}: {reasons:?}");
+        assert_eq!(first.to_string(), text);
+        assert_eq!(first.class(), class, "{text}");
+        made.push(position(first));
+    }
+
+    let unreadable = NotIdle::Unreadable("x".to_owned());
+    assert_eq!(unreadable.to_string(), "membership unreadable: x");
+    assert_eq!(unreadable.class(), Class::Held);
+    made.push(position(&unreadable));
+    made.sort_unstable();
+    assert_eq!(made, (0..13).collect::<Vec<_>>(), "a reason has no case");
 }
 
 // Catches: the per-node view showing a value that is not fresh and known, and showing zero
@@ -279,7 +385,7 @@ fn the_node_view_has_a_number_only_where_the_node_said_one() {
         member(5, MemberState::Down, None),
     ];
     let health = storage_health(&members, at(100), FRESH);
-    let view: Vec<(u64, Option<u64>, Option<u64>, Option<u64>)> = health
+    let view: Vec<_> = health
         .nodes
         .iter()
         .map(|n| (n.id.0, n.repair_debts, n.open_writes, n.generation))
@@ -429,7 +535,7 @@ fn open_writes_and_repair_debt_count_up_and_down() {
     );
     assert_eq!(
         pair.members.node_idle(a, 4),
-        Err(NotIdle::Farm(NotReady::Owed(2)))
+        Err(NotIdle::CopiesOwed { n: 2 })
     );
     pair.beat(
         pair.a,
@@ -437,7 +543,7 @@ fn open_writes_and_repair_debt_count_up_and_down() {
     );
     assert_eq!(
         pair.members.node_idle(a, 4),
-        Err(NotIdle::Writing { member: a, open: 3 })
+        Err(NotIdle::OpenWrites { member: a, n: 3 })
     );
     pair.beat(
         pair.a,
@@ -464,14 +570,14 @@ fn open_writes_and_repair_debt_count_up_and_down() {
     // The copy b owes is named before a's one open write.
     assert_eq!(
         pair.members.node_idle(a, 4),
-        Err(NotIdle::Farm(NotReady::Owed(1))),
+        Err(NotIdle::CopiesOwed { n: 1 }),
         "the newest report replaces the last"
     );
 
     pair.beat(pair.a, quiet_report(4));
     assert_eq!(
         pair.members.node_idle(a, 4),
-        Err(NotIdle::Farm(NotReady::Owed(1))),
+        Err(NotIdle::CopiesOwed { n: 1 }),
         "b still owes a copy"
     );
     pair.beat(pair.b, quiet_report(4));
@@ -480,7 +586,7 @@ fn open_writes_and_repair_debt_count_up_and_down() {
     assert_eq!(pair.members.node_idle(b, 4), Ok(()));
     assert_eq!(
         pair.members.node_idle(a, 5),
-        Err(NotIdle::Behind {
+        Err(NotIdle::ReportOlderThan {
             member: a,
             reported: 4,
             wanted: 5
@@ -496,7 +602,7 @@ fn a_node_that_has_not_reported_lately_is_not_idle() {
     pair.beat(pair.b, quiet_report(1));
     assert_eq!(
         pair.members.node_idle(pair.a.0, 0),
-        Err(NotIdle::NodeSilent(pair.a.0)),
+        Err(NotIdle::NodeStale { member: pair.a.0 }),
         "registered, never reported"
     );
     pair.beat(pair.a, quiet_report(1));
@@ -505,7 +611,7 @@ fn a_node_that_has_not_reported_lately_is_not_idle() {
     pair.beat(pair.b, quiet_report(1));
     assert_eq!(
         pair.members.node_idle(pair.a.0, 1),
-        Err(NotIdle::NodeSilent(pair.a.0))
+        Err(NotIdle::NodeStale { member: pair.a.0 })
     );
 }
 
@@ -527,16 +633,33 @@ fn the_reports_live_in_the_rows_and_a_registration_clears_them() {
     assert_eq!(health.nodes[0].generation, Some(9));
     assert_eq!(
         restarted.node_idle(pair.a.0, 9),
-        Err(NotIdle::Writing {
+        Err(NotIdle::OpenWrites {
             member: pair.a.0,
-            open: 2
+            n: 2
         })
     );
 
     let again = restarted.register(&registrant(1)).expect("registers again");
     assert_eq!(
         restarted.node_idle(again.id, 0),
-        Err(NotIdle::NodeSilent(again.id)),
+        Err(NotIdle::NodeStale { member: again.id }),
         "the old count is not the new process's"
     );
+}
+
+// Catches: a membership that cannot be read called idle, or its error lost. A stored map that
+// does not decode is `Unreadable`, and a controller holds on it.
+#[test]
+fn a_membership_that_cannot_be_read_is_unreadable_and_held() {
+    let pair = Pair::new();
+    pair.beat(pair.a, quiet_report(1));
+    pair.beat(pair.b, quiet_report(1));
+    pair.store
+        .fake
+        .txn(kbf_state::Txn::new().put("map", vec![0xff], kbf_state::Cond::Any))
+        .expect("store")
+        .expect("commit");
+    let refused = pair.members.node_idle(pair.a.0, 0).expect_err("unreadable");
+    assert!(matches!(&refused, NotIdle::Unreadable(why) if why.contains("unreadable")));
+    assert_eq!(refused.class(), Class::Held);
 }

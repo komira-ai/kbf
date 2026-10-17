@@ -61,7 +61,7 @@ use prost::Message as _;
 use tokio::sync::watch;
 
 use crate::storage_health::{
-    Debts, MemberReport, NotIdle, NotReady, Report, Reported, StorageHealth, Writes, node_idle,
+    Debts, MemberReport, NotIdle, Report, Reported, StorageHealth, Writes, node_idle,
     storage_health,
 };
 
@@ -727,7 +727,7 @@ impl Members {
     pub fn node_idle(&self, node: MemberId, at_generation: u64) -> Result<(), NotIdle> {
         let (members, now) = self
             .member_reports()
-            .map_err(|e| NotIdle::Farm(NotReady::Unreadable(e.to_string())))?;
+            .map_err(|e| NotIdle::Unreadable(e.to_string()))?;
         node_idle(&members, now, self.config.freshness(), node, at_generation)
             .into_iter()
             .next()

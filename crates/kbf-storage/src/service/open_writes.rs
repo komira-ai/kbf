@@ -29,7 +29,6 @@ impl OpenWrites {
 
     /// A write begins; it ends when the guard is dropped, whatever the way (an early
     /// return, an error, the call's future dropped).
-    #[must_use]
     pub fn begin(&self) -> OpenWrite {
         self.0.fetch_add(1, Ordering::AcqRel);
         OpenWrite(Arc::clone(&self.0))

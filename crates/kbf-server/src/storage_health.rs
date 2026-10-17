@@ -322,17 +322,45 @@ fn node_health(member: &MemberReport, now: StoreTime, freshness: Duration) -> No
 }
 
 /// Why a storage node is not idle yet: not safe to stop without failing a write or losing
-/// the only copy of a blob.
+/// the only copy of a blob. Each reason is a [`Class`] a controller acts on: wait, or hold.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum NotIdle {
     /// The node is not a registered member.
-    #[error("member {} is not registered", .0.0)]
-    UnknownNode(MemberId),
-    /// The rest of the farm is not known to hold the node's blobs: a member is not
-    /// `Active`, is silent or does not know its debts, none is registered but the node, or
-    /// copies are owed.
-    #[error("{0}")]
-    Farm(NotReady),
+    #[error("member {} is not registered", .member.0)]
+    UnknownNode {
+        /// The node asked about.
+        member: MemberId,
+    },
+    /// The node is the only member: no other copy of its blobs exists.
+    #[error("no other storage member is registered")]
+    NoOtherMembers,
+    /// Another member is not `Active` (joining, catching up, draining or down): it may be
+    /// the only holder of a blob this node's copy is the other of.
+    #[error("member {} not active", .member.0)]
+    OtherMemberNotActive {
+        /// The other member.
+        member: MemberId,
+    },
+    /// Another `Active` member has not reported within the freshness window: it counts as
+    /// down.
+    #[error("member {} silent", .member.0)]
+    OtherMemberStale {
+        /// The other member.
+        member: MemberId,
+    },
+    /// Another `Active` member reported that it does not know what it owes.
+    #[error("member {} does not know what it owes", .member.0)]
+    OtherMemberDebtsUnknown {
+        /// The other member.
+        member: MemberId,
+    },
+    /// Copies are owed somewhere in the farm (the node's own included): its blobs may have
+    /// no second copy yet.
+    #[error("{n} blobs owed")]
+    CopiesOwed {
+        /// The copies owed, summed.
+        n: u64,
+    },
     /// The node is not `Active`.
     #[error("member {} is {}, not active", .member.0, .state.name())]
     NodeNotActive {
@@ -342,26 +370,35 @@ pub enum NotIdle {
         state: MemberState,
     },
     /// The node has not reported within the freshness window.
-    #[error("member {} silent", .0.0)]
-    NodeSilent(MemberId),
+    #[error("member {} silent", .member.0)]
+    NodeStale {
+        /// The node.
+        member: MemberId,
+    },
     /// The node does not know what it owes.
-    #[error("member {} does not know what it owes", .0.0)]
-    NodeDebtsUnknown(MemberId),
+    #[error("member {} does not know what it owes", .member.0)]
+    DebtsUnknown {
+        /// The node.
+        member: MemberId,
+    },
     /// The node does not count its open writes.
-    #[error("member {} does not count its open writes", .0.0)]
-    WritesUnknown(MemberId),
+    #[error("member {} does not count its open writes", .member.0)]
+    OpenWritesUnknown {
+        /// The node.
+        member: MemberId,
+    },
     /// The node has writes open.
-    #[error("member {member} has {open} open writes", member = .member.0)]
-    Writing {
+    #[error("member {} has {n} open writes", .member.0)]
+    OpenWrites {
         /// The node.
         member: MemberId,
         /// The writes it reported open.
-        open: u64,
+        n: u64,
     },
     /// The node reported from a map older than the one that stopped routing writes to it,
     /// so a write routed by the old map may have begun after the count.
-    #[error("member {member} reported at map {reported}, before map {wanted}", member = .member.0)]
-    Behind {
+    #[error("member {} reported at map {reported}, before map {wanted}", .member.0)]
+    ReportOlderThan {
         /// The node.
         member: MemberId,
         /// The generation it held when it reported.
@@ -369,6 +406,42 @@ pub enum NotIdle {
         /// The generation the caller needs it to have seen.
         wanted: u64,
     },
+    /// The membership could not be read.
+    #[error("membership unreadable: {0}")]
+    Unreadable(String),
+}
+
+/// What a controller does about a [`NotIdle`] reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    /// It passes by itself: writes end, copies are made, a report arrives. Look again.
+    Wait,
+    /// The farm is not in a state to take a node down: a second member is not `Active` or
+    /// has gone silent, the node is the only one, or the question cannot be answered. Do
+    /// not stop the node; waiting is not the remedy.
+    Held,
+}
+
+impl NotIdle {
+    /// Whether to wait or to hold. Exhaustive: a new reason must be classed here.
+    #[must_use]
+    pub const fn class(&self) -> Class {
+        match self {
+            Self::CopiesOwed { .. }
+            | Self::OpenWrites { .. }
+            | Self::OpenWritesUnknown { .. }
+            | Self::DebtsUnknown { .. }
+            | Self::OtherMemberDebtsUnknown { .. }
+            | Self::NodeStale { .. }
+            | Self::ReportOlderThan { .. } => Class::Wait,
+            Self::UnknownNode { .. }
+            | Self::NoOtherMembers
+            | Self::OtherMemberNotActive { .. }
+            | Self::OtherMemberStale { .. }
+            | Self::NodeNotActive { .. }
+            | Self::Unreadable(_) => Class::Held,
+        }
+    }
 }
 
 /// Why `node` is not idle as of `now`, every reason, the first being the one
@@ -387,17 +460,29 @@ pub fn node_idle(
     at_generation: u64,
 ) -> Vec<NotIdle> {
     let Some(me) = members.iter().find(|m| m.id == node) else {
-        return vec![NotIdle::UnknownNode(node)];
+        return vec![NotIdle::UnknownNode { member: node }];
     };
     let others: Vec<MemberReport> = members.iter().filter(|m| m.id != node).copied().collect();
     let farm = storage_health(&others, now, freshness);
-    // The copies owed are counted below, with the node's own.
-    let mut reasons: Vec<NotIdle> = farm
-        .reasons()
-        .into_iter()
-        .filter(|reason| !matches!(reason, NotReady::Owed(_)))
-        .map(NotIdle::Farm)
-        .collect();
+    let mut reasons = Vec::new();
+    if others.is_empty() {
+        reasons.push(NotIdle::NoOtherMembers);
+    }
+    reasons.extend(
+        farm.not_active
+            .iter()
+            .map(|&member| NotIdle::OtherMemberNotActive { member }),
+    );
+    reasons.extend(
+        farm.silent
+            .iter()
+            .map(|&member| NotIdle::OtherMemberStale { member }),
+    );
+    reasons.extend(
+        farm.unreported
+            .iter()
+            .map(|&member| NotIdle::OtherMemberDebtsUnknown { member }),
+    );
     if me.state != MemberState::Active {
         reasons.push(NotIdle::NodeNotActive {
             member: node,
@@ -405,7 +490,7 @@ pub fn node_idle(
         });
     }
     let Some(said) = fresh(me, now, freshness) else {
-        reasons.push(NotIdle::NodeSilent(node));
+        reasons.push(NotIdle::NodeStale { member: node });
         return reasons;
     };
     match said.debts {
@@ -415,19 +500,19 @@ pub fn node_idle(
             let owed = farm
                 .under_replicated_blobs
                 .map(|others| others.saturating_add(own));
-            if let Some(owed @ 1..) = owed {
-                reasons.push(NotIdle::Farm(NotReady::Owed(owed)));
+            if let Some(n @ 1..) = owed {
+                reasons.push(NotIdle::CopiesOwed { n });
             }
         }
-        Debts::Unknown => reasons.push(NotIdle::NodeDebtsUnknown(node)),
+        Debts::Unknown => reasons.push(NotIdle::DebtsUnknown { member: node }),
     }
     match said.writes {
         Writes::Known(0) => {}
-        Writes::Known(open) => reasons.push(NotIdle::Writing { member: node, open }),
-        Writes::Unknown => reasons.push(NotIdle::WritesUnknown(node)),
+        Writes::Known(n) => reasons.push(NotIdle::OpenWrites { member: node, n }),
+        Writes::Unknown => reasons.push(NotIdle::OpenWritesUnknown { member: node }),
     }
     if said.generation < at_generation {
-        reasons.push(NotIdle::Behind {
+        reasons.push(NotIdle::ReportOlderThan {
             member: node,
             reported: said.generation,
             wanted: at_generation,
