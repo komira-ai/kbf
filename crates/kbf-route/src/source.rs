@@ -1,4 +1,5 @@
-//! Where a process learns the storage map: the seam av2-08 fills.
+//! Where a process learns the storage map: the seam av2-08 fills (the daemon's holder
+//! of the pushed map, and `kbf-server`'s `FrontMaps` over the members).
 //!
 //! A node holds the newest map it has been sent (`Welcome.map`, then each `MapUpdate`)
 //! and the one before it while a change settles. The router asks for them with

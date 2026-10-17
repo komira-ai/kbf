@@ -19,9 +19,10 @@ pub(crate) const PROMPT: Duration = Duration::from_secs(60);
 pub(crate) const MANIFEST: &[u8] =
     br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
 
-/// A CA, the node's certificate (`node-1`, its one DNS name), the server's
-/// (`localhost`), and a storage client's (`client.pem`, naming the role `frontend` as a
-/// storage listener under mutual TLS requires), written into `dir`.
+/// A CA, the node's certificate (`node-1`, its one DNS name, and the daemon role its
+/// worker session needs on the worker listener), the server's (`localhost`), and a
+/// storage client's (`client.pem`, naming the role `frontend` as a storage listener
+/// under mutual TLS requires), written into `dir`.
 pub(crate) fn pki(dir: &Path) {
     let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -29,10 +30,14 @@ pub(crate) fn pki(dir: &Path) {
     std::fs::write(dir.join("ca.pem"), ca.pem()).expect("write");
     for (name, dns) in [("node", "node-1"), ("server", "localhost")] {
         let key = KeyPair::generate().expect("key");
-        let cert = CertificateParams::new(vec![dns.to_owned()])
-            .expect("params")
-            .signed_by(&key, &ca)
-            .expect("sign");
+        let mut params = CertificateParams::new(vec![dns.to_owned()]).expect("params");
+        if name == "node" {
+            let role = format!("{}daemon", kbf_storage::service::ROLE_URI_PREFIX);
+            params
+                .subject_alt_names
+                .push(SanType::URI(role.try_into().expect("IA5")));
+        }
+        let cert = params.signed_by(&key, &ca).expect("sign");
         std::fs::write(dir.join(format!("{name}.pem")), cert.pem()).expect("write");
         std::fs::write(dir.join(format!("{name}.key")), key.serialize_pem()).expect("write");
     }

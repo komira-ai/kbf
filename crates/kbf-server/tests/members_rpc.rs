@@ -59,11 +59,12 @@ fn request(i: u32) -> pb::RegisterRequest {
         weight: 1,
         zone: "a".to_owned(),
         protocol: PROTOCOL,
+        catching_up: false,
     }
 }
 
 /// Catches: a registration answer that lacks what the node needs (the store's id and
-/// boot, the interval to beat at, the map with the node in it as Joining), an interval
+/// boot, the interval to beat at, the map with the node in it as Active), an interval
 /// not below the TTL, and a heartbeat that does not report the map's generation.
 #[tokio::test]
 async fn register_answers_with_identity_interval_and_map() {
@@ -80,7 +81,7 @@ async fn register_answers_with_identity_interval_and_map() {
     let me = map.member(kbf_map::MemberId(1)).expect("in the map");
     assert_eq!(
         (me.state, me.zone.as_str(), me.weight),
-        (MemberState::Joining, "a", 1)
+        (MemberState::Active, "a", 1)
     );
     assert_eq!(members.current_map().expect("read"), Some(map.clone()));
 
@@ -88,6 +89,7 @@ async fn register_answers_with_identity_interval_and_map() {
         .heartbeat(pb::HeartbeatRequest {
             member_id: 1,
             boot: 1,
+            catching_up: false,
             have_generation: 0,
         })
         .await
@@ -103,6 +105,7 @@ async fn register_answers_with_identity_interval_and_map() {
         .heartbeat(pb::HeartbeatRequest {
             member_id: 1,
             boot: 1,
+            catching_up: false,
             have_generation: map.generation(),
         })
         .await
@@ -144,6 +147,7 @@ async fn every_failure_has_its_own_code() {
     let beat = |id, boot| pb::HeartbeatRequest {
         member_id: id,
         boot,
+        catching_up: false,
         have_generation: 0,
     };
     let old = client.heartbeat(beat(1, 1)).await.expect_err("old boot");
@@ -253,4 +257,39 @@ async fn the_sweeper_expires_members_by_itself() {
         tokio::time::sleep(10 * MS).await;
     }
     panic!("the sweeper never marked the silent member Down");
+}
+
+/// Catches: expired rows nobody frees (session rows, the results of finished operations
+/// and every other time-to-live key sit in the file for good): the timer, with no caller,
+/// removes a row whose time ran out, as an `Expire` row in the change feed, and a reap
+/// that fails once is tried again at the next beat.
+#[tokio::test]
+async fn the_sweeper_frees_expired_rows() {
+    let store = Hooked::new();
+    let (members, _client) = serve(&store).await;
+    let put = Txn::new().put_ttl("done/0001", "x", 30 * MS, Cond::Any);
+    store.txn(put).expect("store").expect("put");
+    store.clock.advance(31 * MS);
+    store
+        .fail_reaps
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let sweeper = tokio::spawn(sweep(Arc::clone(&members)));
+    for _ in 0..500 {
+        let feed = store.changes(kbf_state::Revision::ZERO, 100).expect("feed");
+        if feed
+            .rows
+            .iter()
+            .any(|row| row.key == "done/0001" && row.event == kbf_state::Event::Expire)
+        {
+            sweeper.abort();
+            assert_eq!(
+                store.fail_reaps.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the failing reap was spent before the one that freed the row"
+            );
+            return;
+        }
+        tokio::time::sleep(10 * MS).await;
+    }
+    panic!("the sweeper never freed the expired row");
 }

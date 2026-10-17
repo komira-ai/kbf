@@ -938,4 +938,11 @@ async fn an_s3_history_store_takes_its_key_pair_from_the_environment() {
     let keys = |name: &str| Some(format!("{name}-value"));
     let opened = args.history.open_with(Some(&state), &keys).expect("opens");
     assert!(opened.is_some());
+
+    // `open` reads the process environment: it opens exactly when that holds the pair.
+    let held = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+        .iter()
+        .all(|name| std::env::var(name).is_ok());
+    let real = args.history.open(Some(&state));
+    assert_eq!(real.is_ok(), held, "{:?}", real.err());
 }

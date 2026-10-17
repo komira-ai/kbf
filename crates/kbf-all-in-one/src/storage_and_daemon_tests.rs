@@ -1,5 +1,7 @@
 //! The one command line of `kbf storage-and-daemon`.
 
+#[cfg(target_os = "linux")]
+use clap::Parser as _;
 use clap::error::ErrorKind;
 
 use super::*;
@@ -117,4 +119,109 @@ fn both_halves_start_with_the_one_cache() {
     let local = flags.storage.server.local_cache.as_ref();
     let local = local.expect("the storage half's");
     assert!(crate::one_cache::daemon_holds(local, &flags.daemon));
+}
+
+/// Catches the daemon half routing by the map on a node that is the whole farm, or not
+/// routing by it on a node that registers with a frontend: with `--frontend` the farm has
+/// other members and a blob belongs to the one the map names (writing it to this node
+/// whatever the map said is the defect this decides), and without one the node is a map of
+/// itself and its blobs stay in-process.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_daemon_half_routes_by_the_map_only_with_a_frontend() {
+    assert!(!routes_by_map(&flags(&[]).expect("flags")));
+    let frontend = flags(&["--frontend=http://127.0.0.1:8981"]).expect("flags");
+    assert!(routes_by_map(&frontend));
+}
+
+/// Catches a starter that cannot start the daemon half over the storage half it is
+/// given, in either mode: the routed one (the node's own member, its storage and its map)
+/// and the one-box in-process plane. Neither dials anything at start: the fake driver
+/// moves no blobs, so no plane is made.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_starter_starts_the_daemon_half_over_the_storage_half_in_either_mode() {
+    let dir = crate::one_cache::under_target("starter");
+    let tokio = tokio::runtime::Runtime::new().expect("runtime");
+    // The daemon reads its certificates at start.
+    std::fs::create_dir_all(&dir).expect("scratch");
+    let ca = rcgen::CertifiedIssuer::self_signed(
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params"),
+        rcgen::KeyPair::generate().expect("key"),
+    )
+    .expect("CA");
+    let key = rcgen::KeyPair::generate().expect("key");
+    let cert = rcgen::CertificateParams::new(vec!["node-1".to_owned()])
+        .expect("params")
+        .signed_by(&key, &ca)
+        .expect("sign");
+    let at = |name: &str| dir.join(name);
+    std::fs::write(at("ca.pem"), ca.pem()).expect("write");
+    std::fs::write(at("node.pem"), cert.pem()).expect("write");
+    std::fs::write(at("node.key"), key.serialize_pem()).expect("write");
+    let daemon = kbf_node::Cli::try_parse_from([
+        "kbf-daemon".to_owned(),
+        "--server=https://127.0.0.1:8981".to_owned(),
+        format!("--ca-cert={}", at("ca.pem").display()),
+        format!("--cert={}", at("node.pem").display()),
+        format!("--key={}", at("node.key").display()),
+        "--node-id=node-1".to_owned(),
+        "--driver=fake".to_owned(),
+        format!("--data-dir={}", at("data").display()),
+    ])
+    .expect("the daemon's flags");
+    for frontend in [None, Some("--frontend=http://127.0.0.1:1")] {
+        let at = |name: &str| dir.join(frontend.map_or("one", |_| "farm")).join(name);
+        let cold = format!("--cold-store=file://{}", at("cold").display());
+        let meta = format!("--meta-dir={}", at("meta").display());
+        let mut extra = vec!["--storage-listen=127.0.0.1:0", &cold, &meta];
+        extra.extend(frontend);
+        let flags = flags(&extra).expect("flags");
+        let half = tokio
+            .block_on(kbf_server::storage_half::start(&flags.storage, || {
+                Ok(std::future::pending::<()>())
+            }))
+            .expect("the storage half starts");
+        let start = starter(&flags, &half, tokio.handle());
+        let _node = start(&daemon).expect("the daemon half starts");
+    }
+}
+
+/// Catches the daemon half taking the bound address for its own member's when the node
+/// registers under `--advertise-addr`: the map carries the advertised address, so a plane
+/// that looks for itself under the bound one never finds itself and dials its own node
+/// over the network (or not at all). With the flag the member is the advertised address, a
+/// routable-looking one that nothing is bound to; without it, the bound address.
+///
+/// Mutant: `local_member` registering `half.addr.to_string()` whatever the flag says.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_local_member_is_registered_under_the_advertised_address() {
+    let dir = crate::one_cache::under_target("local-member");
+    let tokio = tokio::runtime::Runtime::new().expect("runtime");
+    for advertise in [Some("192.0.2.10:9982"), None] {
+        let at = |name: &str| {
+            dir.join(advertise.map_or("bound", |_| "advertised"))
+                .join(name)
+        };
+        let cold = format!("--cold-store=file://{}", at("cold").display());
+        let meta = format!("--meta-dir={}", at("meta").display());
+        let mut extra = vec![
+            "--storage-listen=127.0.0.1:0".to_owned(),
+            cold,
+            meta,
+            "--frontend=http://127.0.0.1:1".to_owned(),
+        ];
+        extra.extend(advertise.map(|a| format!("--advertise-addr={a}")));
+        let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
+        let flags = flags(&extra).expect("flags");
+        let half = tokio
+            .block_on(kbf_server::storage_half::start(&flags.storage, || {
+                Ok(std::future::pending::<()>())
+            }))
+            .expect("the storage half starts");
+        let member = local_member(&flags, &half);
+        let want = advertise.map_or_else(|| half.addr.to_string(), str::to_owned);
+        assert_eq!(member.addr(), want);
+    }
 }

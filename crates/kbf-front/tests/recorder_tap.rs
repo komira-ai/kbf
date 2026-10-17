@@ -196,3 +196,23 @@ async fn an_idle_record_is_reported_once_and_a_fresh_one_not_at_all() {
     }
     assert_eq!(*tap.idle.lock().unwrap(), [key("old")]);
 }
+
+/// Catches: a recorder task started without a tap panicking in its loop (the sweep
+/// branch's future is built even when the branch is off), which would take down every
+/// server run without the history flag. Without a tap, events apply as before.
+#[tokio::test(start_paused = true)]
+async fn a_recorder_without_a_tap_applies_events_and_does_not_panic() {
+    let (recorder, recording) = Recorder::new(1 << 20, 64);
+    let task = tokio::spawn(recording.run());
+    queue(&recorder, "build", 1, 7);
+    recorder.emit(granted(7, 1));
+    recorder.emit(finished_ok(7, 1));
+    // A dead task never catches up: bound the wait so the defect is a failure, not a hang.
+    tokio::time::timeout(Duration::from_secs(60), recorder.caught_up())
+        .await
+        .expect("the recorder task applies its events");
+    tokio::time::sleep(Duration::from_secs(3600)).await;
+    assert!(!task.is_finished(), "the recorder task died");
+    let record = recorder.get(&key("build")).expect("a record");
+    assert_eq!(record.rows()[0].attempts.len(), 1);
+}

@@ -373,15 +373,21 @@ impl Recording {
             sweep
         });
         loop {
-            // Queued events first: a drop's mark waits for the events sent before it. The
-            // sweep is a branch only while there is a tap (and so an interval).
+            // Queued events first: a drop's mark waits for the events sent before it. Without
+            // a tap the sweep's future never completes (select! builds a disabled branch's
+            // future too, so it cannot be an `expect`).
             let (event, swept) = tokio::select! {
                 biased;
                 event = self.events.recv() => (event, false),
                 () = self.shared.marked.notified() => (None, false),
-                _ = sweep.as_mut().expect("a sweep waits for a tap").tick(), if sweep.is_some() => {
-                    (None, true)
-                }
+                () = async {
+                    match sweep.as_mut() {
+                        Some(sweep) => {
+                            sweep.tick().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => (None, true),
             };
             {
                 let mut records = lock(&self.shared.records);

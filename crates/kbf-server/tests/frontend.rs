@@ -8,6 +8,9 @@
 
 mod support;
 
+#[path = "frontend/handover.rs"]
+mod handover;
+
 use std::future::pending;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,7 +24,7 @@ use kbf_proto::grpc::health::v1::HealthCheckRequest;
 use kbf_proto::grpc::health::v1::health_check_response::ServingStatus;
 use kbf_proto::grpc::health::v1::health_client::HealthClient;
 use kbf_server::frontend::{self, FrontendFlags, FrontendHandle, start_frontend};
-use kbf_server::health::{MapProbe, Probe, StateProbe, router_of};
+use kbf_server::health::{MapProbe, Probe, StateProbe, StorageProbe, router_of};
 use kbf_server::{BoundStorage, Readiness, StorageListener, bind_storage};
 use kbf_state::{
     Changes, Commit, CommitStats, Conflict, Revision, ScanPage, ScanRange, Store, StoreError,
@@ -579,6 +582,7 @@ async fn readyz_asks_the_state_store() {
     let checks = frontend::checks(
         Arc::clone(&readiness),
         Arc::clone(&node.storage),
+        None,
         Some(Arc::new(PlantedStore(Answers::Fails))),
         hang_only,
     );
@@ -595,6 +599,118 @@ async fn readyz_asks_the_state_store() {
     readiness.stop();
     let (_, body) = get(api, "/readyz").await;
     assert_eq!(failing(&body), ["stopping", "state_store"], "{body}");
+}
+
+/// A map source with one fixed map, and the connections to the members of it.
+struct Dialled {
+    map: Arc<kbf_map::Map>,
+    channels: std::collections::BTreeMap<kbf_map::MemberId, Channel>,
+}
+
+impl kbf_route::MapSource for Dialled {
+    fn current(&self) -> Option<kbf_route::MapView> {
+        Some(kbf_route::MapView {
+            map: Arc::clone(&self.map),
+            previous: None,
+        })
+    }
+
+    fn refetch(
+        &self,
+        at_least: u64,
+    ) -> futures::future::BoxFuture<'_, Result<kbf_route::MapView, kbf_route::RefetchError>> {
+        Box::pin(async move {
+            Err(kbf_route::RefetchError {
+                at_least,
+                reason: "nothing newer".to_owned(),
+            })
+        })
+    }
+}
+
+impl kbf_route::Nodes for Dialled {
+    fn node(
+        &self,
+        member: &kbf_map::Member,
+        generation: u64,
+    ) -> Result<Arc<dyn Storage>, kbf_storage::StorageError> {
+        Ok(Arc::new(kbf_storage::service::RemoteStorage::new(
+            kbf_front::Channels::channel(self, member)?,
+            generation,
+        )))
+    }
+}
+
+impl kbf_front::Channels for Dialled {
+    fn channel(&self, member: &kbf_map::Member) -> Result<Channel, kbf_storage::StorageError> {
+        Ok(self.channels[&member.id].clone())
+    }
+}
+
+fn lazy(addr: SocketAddr) -> Channel {
+    tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect_lazy()
+}
+
+/// Catches a readiness check that asks the `--storage` node when the frontend routes by
+/// the map: a farm whose `--storage` node is gone but whose other member answers is ready;
+/// one whose members all fail is not; and while the map has had only one member, the
+/// `--storage` node is the check, whatever the member is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_storage_check_asks_the_owners_once_the_frontend_routes_by_the_map() {
+    use kbf_map::{Map, Member, MemberId, MemberState, Rule};
+    let live = Node::start().await;
+    let nowhere: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let dead_storage: Arc<dyn Storage> =
+        Arc::new(kbf_storage::service::RemoteStorage::new(lazy(nowhere), 0));
+    let member = |id| Member {
+        id: MemberId(id),
+        addr: format!("127.0.0.1:{id}"),
+        zone: String::new(),
+        weight: 1,
+        state: MemberState::Active,
+    };
+    let routed_over = |ids: &[u64], addrs: &[SocketAddr]| {
+        let members = ids.iter().map(|id| member(*id)).collect();
+        let map = Map::new(
+            1,
+            members,
+            Rule::Rendezvous,
+            u8::try_from(ids.len().min(2)).unwrap(),
+            1,
+            Vec::new(),
+        )
+        .expect("a map");
+        let dialled = Arc::new(Dialled {
+            map: Arc::new(map),
+            channels: ids
+                .iter()
+                .zip(addrs)
+                .map(|(id, a)| (MemberId(*id), lazy(*a)))
+                .collect(),
+        });
+        Arc::new(kbf_front::Routed::new(
+            dialled.clone(),
+            dialled.clone(),
+            dialled,
+        ))
+    };
+    let probe = |routed| {
+        StorageProbe::new(Arc::clone(&dead_storage), Duration::from_secs(5)).routed(routed)
+    };
+
+    // Two members, one of them gone: the other answers, and `--storage` is not asked.
+    let one_gone = routed_over(&[1, 2], &[nowhere, live.addr]);
+    assert_eq!(probe(one_gone).probe().await, Ok(()));
+    // Two members, both gone.
+    let all_gone = routed_over(&[1, 2], &[nowhere, nowhere]);
+    let failed = probe(all_gone).probe().await.expect_err("nobody answers");
+    assert!(failed.contains("did not answer"), "{failed}");
+    // One member: the `--storage` node is the check, and it is gone.
+    let alone = routed_over(&[1], &[live.addr]);
+    let failed = probe(alone).probe().await.expect_err("the --storage node");
+    assert!(failed.contains("did not answer"), "{failed}");
 }
 
 /// Catches a `--state-store` that is not SQLite reaching a start (or echoing its value, a
@@ -1339,4 +1455,186 @@ async fn a_frontend_with_history_serves_its_counters_and_needs_a_state_store() {
         body.contains("kbf_history_dropped_total{stage=\"queue\"} 0\n"),
         "{body}"
     );
+}
+
+// -------------------------------------------------------------- routing by the map
+
+/// A connection to a storage node as the frontend's certificate dials it, to read what the
+/// node holds.
+fn direct(client_flags: &[String], port: u16) -> kbf_storage::service::RemoteStorage {
+    let path = |flag: &str| {
+        client_flags
+            .iter()
+            .find_map(|f| f.strip_prefix(flag))
+            .map(PathBuf::from)
+            .expect("a flag")
+    };
+    let read = |p: PathBuf| std::fs::read(p).expect("a file");
+    let tls = tonic::transport::ClientTlsConfig::new()
+        .ca_certificate(tonic::transport::Certificate::from_pem(read(path(
+            "--storage-ca=",
+        ))))
+        .identity(tonic::transport::Identity::from_pem(
+            read(path("--storage-client-cert=")),
+            read(path("--storage-client-key=")),
+        ));
+    let channel = tonic::transport::Endpoint::from_shared(format!("https://localhost:{port}"))
+        .expect("endpoint")
+        .tls_config(tls)
+        .expect("tls")
+        .connect_lazy();
+    kbf_storage::service::RemoteStorage::new(channel, 0)
+}
+
+/// Writes `blob` through the frontend's ByteStream (the raw path), by an upload name.
+async fn upload_through(client: &Client, blob: &[u8]) {
+    use kbf_proto::google::bytestream::WriteRequest;
+    use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
+    let digest = kbf_segments::sha256(blob);
+    let write = WriteRequest {
+        resource_name: format!("uploads/u/blobs/{}/{}", digest.hash_hex(), blob.len()),
+        data: blob.to_vec(),
+        finish_write: true,
+        ..Default::default()
+    };
+    ByteStreamClient::new(client.channel())
+        .write(futures::stream::iter([write]))
+        .await
+        .expect("written");
+}
+
+/// Which of the nodes (by port) hold `blob`.
+async fn holders(nodes: &[(u16, kbf_storage::service::RemoteStorage)], blob: &[u8]) -> Vec<u16> {
+    let digest = kbf_segments::sha256(blob);
+    let mut held = Vec::new();
+    for (port, node) in nodes {
+        if node
+            .find_missing(&[digest])
+            .await
+            .expect("asked")
+            .is_empty()
+        {
+            held.push(*port);
+        }
+    }
+    held
+}
+
+/// Catches a frontend that has a map and keeps writing to its one `--storage` node (the
+/// rehearsal's failure, at a smaller size), and one that routes before there is a map to
+/// route by: with a state store and the TLS flags, writes through both of the frontend's
+/// paths (the raw ByteStream and the tonic batch) land on the `--storage` node while no
+/// member, and then only one, has registered; once two storage nodes have registered, each
+/// blob lands on the one node the map writes it to, and the blobs are on both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_with_members_writes_where_the_map_says() {
+    use kbf_proto::kbf::map::v1 as pb;
+    use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
+    use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
+    use kbf_proto::reapi::{BatchUpdateBlobsRequest, batch_update_blobs_request};
+
+    let pki = Pki::new("routed");
+    let (a, b) = (
+        tls_node(&pki, &["localhost"], "a").await,
+        tls_node(&pki, &["localhost"], "b").await,
+    );
+    let client_flags = pki.frontend_flags("frontend");
+    let nodes = [
+        (a.port(), direct(&client_flags, a.port())),
+        (b.port(), direct(&client_flags, b.port())),
+    ];
+    let state = scratch_dir("routed").join("state.db");
+    let mut more = vec![
+        format!("--storage=https://localhost:{}", a.port()),
+        "--readyz-store-timeout-ms=2000".to_owned(),
+        format!("--state-store=sqlite://{}", state.display()),
+    ];
+    more.extend(client_flags.iter().cloned());
+    let front =
+        Front::start(&flags(&more.iter().map(String::as_str).collect::<Vec<_>>()).unwrap()).await;
+    let client = front.client().await;
+    let blobs: Vec<Vec<u8>> = (0..40)
+        .map(|i| format!("routed {i}").into_bytes())
+        .collect();
+
+    // No member: the node `--storage` names.
+    upload_through(&client, &blobs[0]).await;
+    assert_eq!(holders(&nodes, &blobs[0]).await, [a.port()]);
+
+    let mut membership = MembershipClient::new(
+        tonic::transport::Endpoint::from_shared(format!("http://{}", front.worker))
+            .unwrap()
+            .connect()
+            .await
+            .expect("the worker listener"),
+    );
+    let register = |port: u16, name: &str| pb::RegisterRequest {
+        role: pb::Role::Storage.into(),
+        instance_id: name.to_owned(),
+        addr: format!("localhost:{port}"),
+        weight: 1,
+        zone: String::new(),
+        protocol: kbf_server::members::PROTOCOL,
+        catching_up: false,
+    };
+    // One member: still that node, whatever address it advertises.
+    membership
+        .register(register(a.port(), "node-a"))
+        .await
+        .expect("a registers");
+    upload_through(&client, &blobs[1]).await;
+    assert_eq!(holders(&nodes, &blobs[1]).await, [a.port()]);
+
+    // Two members: the map's.
+    let both = membership
+        .register(register(b.port(), "node-b"))
+        .await
+        .expect("b registers")
+        .into_inner();
+    let map = kbf_map::Map::try_from(both.map.expect("a map")).expect("a valid map");
+    let port_of = |digest: &kbf_types::Digest| {
+        let owner = map.write_owners(digest)[0];
+        let member = map.member(owner).expect("a member");
+        member
+            .addr
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse::<u16>()
+            .unwrap()
+    };
+    // Half of them through the raw path, half through the batch.
+    for blob in &blobs[2..21] {
+        upload_through(&client, blob).await;
+    }
+    let batch = blobs[21..]
+        .iter()
+        .map(|bytes| batch_update_blobs_request::Request {
+            digest: Some(kbf_front::digest_to_proto(&kbf_segments::sha256(bytes))),
+            data: bytes.clone(),
+            compressor: kbf_proto::reapi::compressor::Value::Identity as i32,
+        })
+        .collect();
+    let answered = ContentAddressableStorageClient::new(client.channel())
+        .batch_update_blobs(BatchUpdateBlobsRequest {
+            requests: batch,
+            ..Default::default()
+        })
+        .await
+        .expect("the batch")
+        .into_inner();
+    assert!(
+        answered
+            .responses
+            .iter()
+            .all(|r| r.status.as_ref().is_some_and(|s| s.code == 0))
+    );
+
+    let mut used = std::collections::BTreeSet::new();
+    for blob in &blobs[2..] {
+        let want = port_of(&kbf_segments::sha256(blob));
+        used.insert(want);
+        assert_eq!(holders(&nodes, blob).await, [want]);
+    }
+    assert_eq!(used.len(), 2, "every blob went to one node");
 }
