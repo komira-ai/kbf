@@ -445,6 +445,9 @@ fn a_broken_failure_log_object_is_an_error_not_wrong_bytes() {
     let got = futures::executor::block_on(reader.read_log(&log, 8, 21)).unwrap();
     let want: Vec<u8> = [vec![1; 2], vec![2; 10], vec![3; 2]].concat();
     assert_eq!(got.to_vec(), want);
+    // A range that starts past the first piece skips it, and ends before the last.
+    let got = futures::executor::block_on(reader.read_log(&log, 12, 15)).unwrap();
+    assert_eq!(got.to_vec(), vec![2; 4]);
     // No block holds the key: the summary names a length over an object with no pieces.
     let run = id(13);
     handmade(&life, run, &[], 10);
@@ -572,4 +575,50 @@ fn a_parts_with_nothing_is_empty_and_a_log_is_cut_into_pieces() {
     .unwrap();
     assert_eq!(decoded.records.len(), 3);
     assert_eq!(decoded.footer.blocks.len(), 3, "a block to a piece");
+}
+
+#[test]
+fn pieces_that_share_a_block_are_read_with_one_get() {
+    // Catches: a range over two pieces whose keys fall in one block reading that block
+    // twice (a GET per piece, not per block), and the pieces of a block read in the wrong
+    // order or twice into the answer.
+    let life = Life::fresh(Limits::default());
+    let run = id(15);
+    handmade(
+        &life,
+        run,
+        &[
+            (FlogStream::Stdout, 0, vec![1; 65_000]),
+            (FlogStream::Stdout, 65_000, vec![2; 100]),
+        ],
+        65_100,
+    );
+    let reader = life.reader();
+    let log = futures::executor::block_on(reader.failure_log(run, FlogStream::Stdout, &all))
+        .unwrap()
+        .unwrap();
+    let gets = life.objects.counts().gets.load(Ordering::SeqCst);
+    let got = futures::executor::block_on(reader.read_log(&log, 0, u64::MAX)).unwrap();
+    let want: Vec<u8> = [vec![1; 65_000], vec![2; 100]].concat();
+    assert_eq!(got.to_vec(), want);
+    assert_eq!(life.objects.counts().gets.load(Ordering::SeqCst) - gets, 1);
+}
+
+#[test]
+fn a_log_of_many_blocks_is_read_in_groups_and_comes_back_whole() {
+    // Catches: more blocks than one group of parallel reads holds being cut short or read
+    // out of order (34 pieces are two groups), and a range across the group boundary
+    // losing a piece.
+    let mut life = Life::fresh(Limits::default());
+    let out = pattern(PIECE_BYTES * 34 + 7);
+    let run = id(16);
+    land(&life, run, &parts(Some(&out), None, None));
+    life.drain(T + 10, 5);
+    assert_eq!(read(&life, run, FlogStream::Stdout, 0, u64::MAX), out);
+    let piece = PIECE_BYTES;
+    let (first, last) = (piece * 31 + 100, piece * 33 + 100);
+    assert_eq!(
+        read(&life, run, FlogStream::Stdout, first as u64, last as u64),
+        out[first..=last]
+    );
 }

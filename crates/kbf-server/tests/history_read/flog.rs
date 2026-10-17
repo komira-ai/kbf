@@ -405,3 +405,66 @@ async fn no_flog_row_names_an_object_not_written() {
     );
     a.stop().await;
 }
+
+/// Catches: a caller the policy does not accept let in to a log (`401`, as to every other
+/// route), and the log route answering when the policy turns the build pages off: `404`
+/// with the `off` body of the pages, and never `no_run`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_log_route_is_authenticated_and_off_with_the_pages() {
+    let world = World::new();
+    let path = "/v1/runs/0a0b0c0d0e0f0a0b0c0d0e0f/logs/stdout";
+    let denied = world.start(
+        r#"{"authenticationPolicy": {"deny": "who are you"},
+            "invocations": {"getAuthorizer": {"allow": {}}}}"#,
+    );
+    let answer = denied.get(path).await;
+    assert_eq!(answer.code, 401, "{}", answer.json);
+    assert!(
+        answer
+            .head
+            .to_lowercase()
+            .contains("x-content-type-options: nosniff")
+    );
+    denied.stop().await;
+    let off = world.start(r#"{"authenticationPolicy": {"allow": {}}}"#);
+    let answer = off.get(path).await;
+    assert_eq!(answer.code, 404, "{}", answer.json);
+    assert_eq!(answer.json["off"], "invocations");
+    off.stop().await;
+}
+
+/// Catches: a run the recorder holds failing to answer because history cannot be read (its
+/// tails are the only thing missing: the page is the recorder's), the cause of a store's
+/// failure sent to a caller of the log route, and a copy that cannot be read answered as one
+/// that does not exist (`404`, which says there never was one).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_history_that_cannot_be_read_costs_a_live_run_its_tails_and_a_log_its_answer() {
+    let world = World::new();
+    let a = world.start(OPEN);
+    let (out, result) = (a.store(b"out").await, a.store(b"r").await);
+    a.feed(failed_run("live", "main", 1, (Some(out), None), result))
+        .await;
+    copies(&world, 1).await;
+    world.flushed("live", 1).await;
+    let id = run_id(&a, "live");
+    world.objects.fail_gets(true);
+    let page = a.ok(&format!("/v1/runs/{id}")).await;
+    assert_eq!(page["class"], "failed", "{page}");
+    assert!(
+        page["logs"]["stdout"].get("tail").is_none(),
+        "no tails without history: {page}"
+    );
+    let log = a.get(&format!("/v1/runs/{id}/logs/stdout")).await;
+    assert_eq!(log.code, 503, "{}", log.head);
+    assert!(!log.json.to_string().contains("planted"), "{}", log.json);
+    world.objects.fail_gets(false);
+    assert_eq!(a.get(&format!("/v1/runs/{id}/logs/stdout")).await.code, 200);
+    a.stop().await;
+    // After a restart the run is history's alone, and its failure is the answer.
+    let b = world.start(OPEN);
+    world.objects.fail_gets(true);
+    let log = b.get(&format!("/v1/runs/{id}/logs/stdout")).await;
+    assert_eq!(log.code, 503, "{}", log.head);
+    world.objects.fail_gets(false);
+    b.stop().await;
+}

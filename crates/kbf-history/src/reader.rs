@@ -246,7 +246,7 @@ impl<O: ObjectStore> Reader<O> {
         // Events reach the writer out of order, so two chunks' sequence ranges may
         // overlap: try each chunk whose range holds the run, in order (one or two).
         for at in self.locate(id).await? {
-            let range = footer_range(&at.row)?;
+            let range = footer_range(at.row.footer_offset, at.row.footer_len)?;
             let footer = decode_tail(&self.objects.get_range(&at.key, range).await?)?;
             let run_key = chunk_key(SECTION_RUN, id.seq());
             let block = self.block(&at.key, &footer, &run_key).await?;
@@ -276,8 +276,7 @@ impl<O: ObjectStore> Reader<O> {
             return Ok(None);
         };
         let row = decode_row::<ObjRow>(&key, &row.value)?;
-        let range = ByteRange::new(row.footer_offset, u64::from(row.footer_len).max(1));
-        let range = range.ok_or(FormatError::Truncated("footer range"))?;
+        let range = footer_range(row.footer_offset, row.footer_len)?;
         let object = self.root.flog(id);
         let (_, footer) = container::decode_footer(&self.objects.get_range(&object, range).await?)?;
         let summary = FlogSummary::decode(footer.summary.as_slice())
@@ -400,7 +399,10 @@ impl<O: ObjectStore> Reader<O> {
                 let object = chunk_object_key(&self.root, inv, c);
                 let tail = self
                     .objects
-                    .get_range(&object, footer_range(&c.row)?)
+                    .get_range(
+                        &object,
+                        footer_range(c.row.footer_offset, c.row.footer_len)?,
+                    )
                     .await?;
                 let summary = ChunkSummary::decode(decode_tail(&tail)?.summary.as_slice())
                     .map_err(|e| FormatError::decode("chunk summary", &e))?;
@@ -587,9 +589,9 @@ fn listed_whole(header: &InvocationHeader) -> bool {
     !header.instances.is_empty() && !header.instances_truncated
 }
 
-fn footer_range(row: &ChunkRow) -> Result<ByteRange, FormatError> {
+fn footer_range(offset: u64, len: u32) -> Result<ByteRange, FormatError> {
     // A footer range of zero length (a broken row) reads one byte and fails to decode.
-    let range = ByteRange::new(row.footer_offset, u64::from(row.footer_len).max(1));
+    let range = ByteRange::new(offset, u64::from(len).max(1));
     range.ok_or(FormatError::Truncated("footer range"))
 }
 

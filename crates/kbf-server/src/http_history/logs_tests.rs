@@ -14,7 +14,10 @@ use kbf_history::{
     FlogParts, FlogStore, HistoryIndex, HistoryRoot, IndexRoot, Inline, Reader, RunId, StreamId,
     WriterId,
 };
-use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
+use kbf_objstore::{
+    ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
+    ObjectStoreError, PageSize,
+};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{Cond, ManualClock, Store, Txn};
 use prost::Message as _;
@@ -23,6 +26,53 @@ use serde_json::Value;
 use super::{ReadBudget, parse_path, serve};
 use crate::history::{HistoryReads, RunIndex, Shared};
 use crate::http_blobs::READ_BUDGET_WAIT;
+
+/// A memory store whose reads fail once `fail_after` of them have been answered.
+struct Flaky {
+    memory: MemoryStore,
+    reads: std::sync::atomic::AtomicU64,
+    fail_after: std::sync::atomic::AtomicU64,
+}
+
+impl ObjectStore for Flaky {
+    fn capabilities(&self) -> Capabilities {
+        self.memory.capabilities()
+    }
+
+    async fn put_new(
+        &self,
+        key: &ObjectKey,
+        body: bytes::Bytes,
+        retain_until: Option<std::time::SystemTime>,
+    ) -> Result<(), ObjectStoreError> {
+        self.memory.put_new(key, body, retain_until).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &ObjectKey,
+        range: ByteRange,
+    ) -> Result<bytes::Bytes, ObjectStoreError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.reads.fetch_add(1, SeqCst) >= self.fail_after.load(SeqCst) {
+            return Err(ObjectStoreError::Protocol("planted failure".into()));
+        }
+        self.memory.get_range(key, range).await
+    }
+
+    async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
+        self.memory.delete(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &KeyPrefix,
+        after: Option<&ListToken>,
+        max_keys: PageSize,
+    ) -> Result<ListPage, ObjectStoreError> {
+        self.memory.list(prefix, after, max_keys).await
+    }
+}
 
 fn run() -> RunId {
     RunId::new(1_792_108_800_005, StreamId(0x80_0001), 3)
@@ -34,11 +84,15 @@ fn root() -> HistoryRoot {
 
 /// Reads over a store holding the failure-log copy of `run()`'s stdout (the bytes given;
 /// stderr is not held) for instance `main`, and the memory store under it.
-async fn reads(stdout: &[u8]) -> (HistoryReads, Arc<MemoryStore>) {
-    let objects = Arc::new(MemoryStore::new(Capabilities {
-        conditional_put: true,
-        object_lock: false,
-    }));
+async fn reads(stdout: &[u8]) -> (HistoryReads, Arc<Flaky>) {
+    let objects = Arc::new(Flaky {
+        memory: MemoryStore::new(Capabilities {
+            conditional_put: true,
+            object_lock: false,
+        }),
+        reads: std::sync::atomic::AtomicU64::new(0),
+        fail_after: std::sync::atomic::AtomicU64::new(u64::MAX),
+    });
     let shared = Shared(Arc::clone(&objects));
     let state: Arc<dyn Store> = Arc::new(Fake::with_flaw(
         Arc::new(ManualClock::default()),
@@ -240,6 +294,23 @@ async fn a_read_the_budget_cannot_hold_is_busy_and_one_that_never_fits_is_503() 
         .await
         .expect("served");
     assert_eq!(body(part).await, log[10..20]);
+}
+
+/// Catches: a block that cannot be read after the footer was (the object is there, a part of
+/// it is not) answered as a short log or an empty one, or with the store's message.
+#[tokio::test]
+async fn a_block_that_cannot_be_read_is_503_without_the_cause() {
+    let (reads, objects) = reads(&log()).await;
+    // The footer is read, and then every read of the blocks fails.
+    objects
+        .fail_after
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let answer = read(&reads, &ReadBudget::default(), "main", None)
+        .await
+        .expect_err("unreadable");
+    assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let text = json(answer).await;
+    assert_eq!(text["error"], "build history cannot be read right now");
 }
 
 /// Catches: a copy whose object is gone (expired) answered as an empty or absent log (a
