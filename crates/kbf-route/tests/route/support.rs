@@ -125,6 +125,10 @@ pub struct Node {
     actions: Mutex<BTreeMap<Digest, (Digest, ActionResult)>>,
     /// The next calls other than reads fail with these.
     fail: Mutex<VecDeque<StorageError>>,
+    /// The next puts fail with these, after the node's other checks pass.
+    fail_puts: Mutex<VecDeque<StorageError>>,
+    /// The next commits fail with these, after the node's other checks pass.
+    fail_commits: Mutex<VecDeque<StorageError>>,
     /// What the next reads do.
     plans: Mutex<VecDeque<Plan>>,
     /// Every call fails while set.
@@ -153,6 +157,8 @@ impl Node {
             huge: Mutex::default(),
             actions: Mutex::default(),
             fail: Mutex::default(),
+            fail_puts: Mutex::default(),
+            fail_commits: Mutex::default(),
             plans: Mutex::default(),
             down: AtomicBool::new(false),
             gate: Mutex::default(),
@@ -221,6 +227,16 @@ impl Node {
     /// The next call that is not a read fails with `error`.
     pub fn fail_next(&self, error: StorageError) {
         self.fail.lock().expect("lock").push_back(error);
+    }
+
+    /// The next put fails with `error`, while FindMissing and a commit still answer.
+    pub fn fail_next_put(&self, error: StorageError) {
+        self.fail_puts.lock().expect("lock").push_back(error);
+    }
+
+    /// The next commit fails with `error`, while FindMissing and a put still answer.
+    pub fn fail_next_commit(&self, error: StorageError) {
+        self.fail_commits.lock().expect("lock").push_back(error);
     }
 
     /// The next read, after the ones already planned, fails before its first byte.
@@ -375,6 +391,9 @@ impl Storage for Node {
     fn put(&self, bytes: Bytes) -> Answer<'_, Digest> {
         Box::pin(async move {
             self.check()?;
+            if let Some(error) = self.fail_puts.lock().expect("lock").pop_front() {
+                return Err(error);
+            }
             let digest = self.hold(&bytes);
             self.puts.lock().expect("lock").push(digest);
             Ok(self.put_answer.lock().expect("lock").unwrap_or(digest))
@@ -412,6 +431,9 @@ impl Storage for Node {
     ) -> Answer<'_, ()> {
         Box::pin(async move {
             self.check()?;
+            if let Some(error) = self.fail_commits.lock().expect("lock").pop_front() {
+                return Err(error);
+            }
             if self.check_closure.load(Ordering::SeqCst) {
                 let blobs = self.blobs.lock().expect("lock");
                 let lacking = std::iter::once(&record.result)

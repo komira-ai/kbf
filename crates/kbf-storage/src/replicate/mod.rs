@@ -36,8 +36,9 @@
 //! ByteStream `Write` marked as a copy (the [`LEG_HEADER`] entry, admitted from the
 //! `storage` role only: `Endpoint::WriteLeg`). A node judges what it is given by its
 //! `Chain::plan`:
-//! - a client write to a node that is not the primary is INVALID_ARGUMENT, so is a copy
-//!   sent to a node that does not own the blob (or by a node to itself);
+//! - a client write to a node that owns nothing of the blob is INVALID_ARGUMENT, so is a
+//!   copy sent to a node that does not own the blob (or by a node to itself); a client
+//!   write to the second owner is served as the primary (see below);
 //! - a map with more than two owners per blob is refused (INVALID_ARGUMENT), and one
 //!   with fewer write owners than its factor is UNAVAILABLE: neither is answered with
 //!   one copy.
@@ -77,8 +78,12 @@
 //! refusals are not (a stale map, a digest that does not match, a role that may not copy, a
 //! failure of its store).
 //!
-//! If the *primary* is the owner the map names down, the next owner takes the write as
-//! if it were primary and owes the first owner its copy.
+//! The *second* owner takes a client write as if it were primary, whatever state the map
+//! gives the first: a client goes to it when the map names the first down, and also when
+//! the first cannot be reached and the map does not say so yet (the lease has not lapsed;
+//! the router's write fails over, `kbf_route::Router::put`). It sends the first owner the
+//! copy like a replica's, and if the first is down in the map or unreachable it owes the
+//! first owner its copy.
 
 mod chain;
 mod leg;

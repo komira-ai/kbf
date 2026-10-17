@@ -160,7 +160,7 @@ impl Chain {
     ///
     /// # Errors
     /// [`StorageError::Invalid`] if this node is not where the map says the write goes: a
-    /// client write to a node that is not the primary, a copy sent to a node that does not
+    /// client write to a node that owns nothing of the blob, a copy sent to a node that does not
     /// own the blob or by the node itself, or a replication factor above 2;
     /// [`StorageError::Unavailable`] if the map has fewer owners than its factor.
     pub(crate) fn plan(
@@ -199,13 +199,15 @@ impl Chain {
             (None, Some(0), [_, replica]) => Ok(Plan::Primary {
                 replica: member(*replica)?,
             }),
-            // The primary is down: the next owner takes its place for the write, and the
-            // primary is the copy owed.
-            (None, Some(1), [first, _]) if member(*first)?.state == MemberState::Down => {
-                Ok(Plan::Primary {
-                    replica: member(*first)?,
-                })
-            }
+            // The second owner takes a client write as the primary, and the first owner
+            // is the copy: owed at once if the map says it is down, else sent like a
+            // replica's. A client goes to the second owner when the first is down in its
+            // map, or when it could not reach it before the map said so (it is dead, and
+            // the lease has not lapsed): either way the blob lands on both owners, or is
+            // owed to the one that is gone, so the node need not tell the two apart.
+            (None, Some(1), [first, _]) => Ok(Plan::Primary {
+                replica: member(*first)?,
+            }),
             (None, Some(0), _) => Ok(Plan::Local),
             (None, _, _) => Err(StorageError::Invalid(format!(
                 "{} is not the primary of {digest}",

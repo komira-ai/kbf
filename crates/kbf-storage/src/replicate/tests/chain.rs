@@ -327,9 +327,10 @@ async fn a_map_that_turns_during_the_write_is_checked_before_the_answer() {
     );
 }
 
-/// Catches a write taken by the wrong node: a client write to the replica (not the
-/// primary), to a node that owns nothing, or a copy sent to a node that owns nothing or
-/// by the node to itself, and a leg header that is not a member id; none stores anything.
+/// Catches a write taken by the wrong node: a client write to a node that owns nothing, or
+/// a copy sent to a node that owns nothing or by the node to itself, and a leg header that
+/// is not a member id; none stores anything. (A client write to the second owner is
+/// served: `the_second_owner_takes_a_write_while_the_map_has_the_first_up`.)
 #[tokio::test]
 async fn a_write_is_served_only_where_the_map_places_it() {
     let farm = Farm::start(3, ChainConfig::default()).await;
@@ -342,8 +343,6 @@ async fn a_write_is_served_only_where_the_map_places_it() {
         assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
         status.message().to_owned()
     };
-    let replica = invalid(raw(farm.channel(1), &digest, parts, 1, None).await);
-    assert!(replica.contains("not the primary"), "{replica}");
     let third = invalid(raw(farm.channel(2), &digest, parts, 1, None).await);
     assert!(third.contains("not the primary"), "{third}");
     let to_third = invalid(raw(farm.storage_channel(2), &digest, parts, 1, Some(1)).await);
