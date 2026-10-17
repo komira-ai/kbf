@@ -21,7 +21,6 @@ fn config() -> MembershipConfig {
         ttl: Duration::from_secs(30),
         dwell: Duration::from_secs(120),
         replication: 2,
-        bootstrap: Duration::ZERO,
     }
 }
 
