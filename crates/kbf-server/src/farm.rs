@@ -305,6 +305,17 @@ impl Farm {
         self
     }
 
+    /// This farm, keeping at most `bound` memory floors (instead of
+    /// [`kbf_sched::MEMORY_FLOORS`]); past that, the one raised longest ago is forgotten
+    /// first. Set before the farm takes a state store over.
+    #[must_use]
+    pub fn with_memory_floors(mut self, bound: usize) -> Self {
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        state.sched = std::mem::replace(&mut state.sched, Scheduler::new(self.term))
+            .with_memory_floors(bound);
+        self
+    }
+
     /// This farm, each Execute's queued or joined answer, each lease granted, started
     /// and given up, and each operation's end sent to `recorder`
     /// (`docs/design/invocations.md`, section 3.4).
