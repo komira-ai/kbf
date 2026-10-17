@@ -145,7 +145,8 @@
                 "connection_keepalive": {
                   "interval": "30s",
                   "timeout": "20s"
-                }
+                },
+                "max_concurrent_streams": 10000
               }
             }
           }

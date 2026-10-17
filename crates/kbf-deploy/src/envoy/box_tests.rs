@@ -520,6 +520,32 @@ const MUTANTS: &[Mutant] = &[
         },
     ),
     m(
+        "upstream-streams",
+        "no max_concurrent_streams upstream: Envoy assumes unlimited until SETTINGS arrive",
+        |e, _| {
+            remove(
+                e,
+                &format!(
+                    "{RC}/typed_extension_protocol_options/envoy.extensions.upstreams.http.v3.HttpProtocolOptions/explicit_http_config/http2_protocol_options"
+                ),
+                "max_concurrent_streams",
+            )
+        },
+    ),
+    m(
+        "upstream-streams",
+        "max_concurrent_streams above kbf's limit",
+        |e, _| {
+            set(
+                e,
+                &format!(
+                    "{RC}/typed_extension_protocol_options/envoy.extensions.upstreams.http.v3.HttpProtocolOptions/explicit_http_config/http2_protocol_options/max_concurrent_streams"
+                ),
+                json!(10001),
+            )
+        },
+    ),
+    m(
         "health-check",
         "no health check on the REAPI cluster",
         |e, _| set(e, &format!("{RC}/health_checks"), json!([])),

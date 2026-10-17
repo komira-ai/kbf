@@ -142,6 +142,14 @@ pub enum CheckFailure {
     Breakers { cluster: String, why: String },
     #[error("cluster {cluster}: no HTTP/2 keepalive on the upstream connections")]
     UpstreamKeepalive { cluster: String },
+    #[error(
+        "cluster {cluster}: upstream max_concurrent_streams is {got}, not at most kbf's {want}: a burst of streams is sent down one fresh connection and refused"
+    )]
+    UpstreamStreams {
+        cluster: String,
+        got: String,
+        want: String,
+    },
     #[error("cluster {cluster}: {why}")]
     Instances { cluster: String, why: String },
     #[error("port {port} is used twice ({first} and {second})")]
@@ -226,7 +234,7 @@ impl CheckFailure {
 
     /// The checks only the box topology runs ([`super::box_check`]), in the order it runs
     /// them.
-    pub const BOX_NAMES: [&'static str; 16] = [
+    pub const BOX_NAMES: [&'static str; 17] = [
         "listeners",
         "listener-tls",
         "execute-idle-off",
@@ -234,6 +242,7 @@ impl CheckFailure {
         "health-keeps-streams",
         "breakers",
         "upstream-keepalive",
+        "upstream-streams",
         "instances",
         "instance-ports",
         "worker-listener",
@@ -304,6 +313,7 @@ impl CheckFailure {
             CheckFailure::HealthKeepsStreams { .. } => "health-keeps-streams",
             CheckFailure::Breakers { .. } => "breakers",
             CheckFailure::UpstreamKeepalive { .. } => "upstream-keepalive",
+            CheckFailure::UpstreamStreams { .. } => "upstream-streams",
             CheckFailure::Instances { .. } => "instances",
             CheckFailure::InstancePorts { .. } => "instance-ports",
             CheckFailure::WorkerListener { .. } => "worker-listener",

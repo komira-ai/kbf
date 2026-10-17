@@ -341,13 +341,23 @@ fn reapi_cluster(c: &BoxConfig) -> Json {
                         "explicit_http_config",
                         Json::object([(
                             "http2_protocol_options",
-                            Json::object([(
-                                "connection_keepalive",
-                                Json::object([
-                                    ("interval", interval.into()),
-                                    ("timeout", timeout.into()),
-                                ]),
-                            )]),
+                            Json::object([
+                                (
+                                    "connection_keepalive",
+                                    Json::object([
+                                        ("interval", interval.into()),
+                                        ("timeout", timeout.into()),
+                                    ]),
+                                ),
+                                // A fresh upstream connection is assumed to take any number
+                                // of streams until the instance's SETTINGS arrive, so a
+                                // burst of silent Executes is sent down the first
+                                // connection and refused past kbf's limit; this is the limit.
+                                (
+                                    "max_concurrent_streams",
+                                    i64::from(c.reapi_max_streams).into(),
+                                ),
+                            ]),
                         )]),
                     ),
                 ]),

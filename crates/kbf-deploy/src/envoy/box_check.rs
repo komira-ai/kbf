@@ -106,6 +106,22 @@ fn check_envoy(c: &mut Checker, envoy: &Value, spec: &BoxSpec) -> Result<(), Mal
             c.require(on, || CheckFailure::UpstreamKeepalive {
                 cluster: REAPI_CLUSTER.to_owned(),
             });
+            let streams =
+                &opts["explicit_http_config"]["http2_protocol_options"]["max_concurrent_streams"];
+            c.require(
+                streams
+                    .as_u64()
+                    .is_some_and(|n| (1..=u64::from(spec.max_streams)).contains(&n)),
+                || CheckFailure::UpstreamStreams {
+                    cluster: REAPI_CLUSTER.to_owned(),
+                    got: if streams.is_null() {
+                        "absent".to_owned()
+                    } else {
+                        text(streams)
+                    },
+                    want: spec.max_streams.to_string(),
+                },
+            );
         }
         None => c.failures.push(CheckFailure::RouteCluster {
             path: "the REAPI listener".to_owned(),
