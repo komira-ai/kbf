@@ -1164,6 +1164,35 @@ async fn the_api_listener_serves_metrics_in_the_prometheus_text_format() {
     assert!(body.contains("# TYPE "), "{body}");
 }
 
+/// Catches `--releases-dir` accepted without an operator API: the store is filled by `PUT
+/// /v1/releases/...` on that API, so a store with nowhere to be written would be a silent
+/// no-op. Both `kbf frontend` and `kbf-server` refuse the flag without `--api-listen`.
+///
+/// Mutant seen red: `requires = "api_listen"` dropped from the flag.
+#[test]
+fn releases_dir_needs_the_operator_api() {
+    let refused = frontend::command().try_get_matches_from([
+        "frontend",
+        "--storage=http://127.0.0.1:1",
+        "--releases-dir=/x",
+    ]);
+    let e = refused.expect_err("no --api-listen");
+    assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    let server =
+        kbf_server::Args::command().try_get_matches_from(["kbf-server", "--releases-dir=/x"]);
+    let e = server.expect_err("no --api-listen");
+    assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    // With the API it parses.
+    frontend::command()
+        .try_get_matches_from([
+            "frontend",
+            "--storage=http://127.0.0.1:1",
+            "--api-listen=127.0.0.1:0",
+            "--releases-dir=/x",
+        ])
+        .expect("parses");
+}
+
 /// Catches a frontend that takes `--releases-dir` and does not mount the release store: a
 /// tarball put on its operator API with the token comes back through `ReleaseService.Fetch`
 /// on its worker listener, and a put without the token is refused.

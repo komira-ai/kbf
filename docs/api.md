@@ -817,8 +817,11 @@ frontend mounts `kbf_server::release::router`; without a store both answer `503`
   order above, a platform `complete` when both tarballs have their attestation. A component is
   listed when its tarball is stored.
 - `GET /v1/releases` and the gRPC `ReleaseService.Fetch` are unauthenticated at the router and
-  the service. The wiring must mount `Fetch` only behind the worker listener's mutual TLS, and
-  decide who may read `GET /v1/releases` where it mounts the router.
+  the service. `Fetch` is mounted on the worker listener behind its mutual TLS and the role
+  table (the daemon role alone may call it). `GET /v1/releases` is open to whoever reaches the
+  operator API, like `GET /v1/nodes`: it lists commits, platforms and digests, no bytes. The
+  store is mounted by `--releases-dir`, which needs `--api-listen`; without the flag every
+  update endpoint answers `503`.
 
 ## `UNAVAILABLE` from a storage node that is catching up
 
