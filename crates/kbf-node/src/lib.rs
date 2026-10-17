@@ -50,6 +50,7 @@ use kbf_daemon::{
     Args, Capacity, DAEMON_VERSION, Daemon, DaemonConfig, DriverWatch, FakeRuntime, FarmCas,
     Liveness, MapHolder, NodeReport, Runtime, Runtimes,
 };
+#[cfg(target_os = "linux")]
 use kbf_driver_container::ContainerRuntime;
 use kbf_driver_native::slots::Pool;
 use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode, xcode_watch};
@@ -215,6 +216,7 @@ pub struct Cli {
     /// (`crun`) directly. Podman is not supported. It needs the daemon user's
     /// subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on
     /// `PATH`, and every directory down to `--data-dir` searchable by others.
+    #[cfg(target_os = "linux")]
     #[arg(long, default_value = "oci", value_name = "oci")]
     container_runtime: ContainerRuntime,
     /// Where each lease runs among the node's CPUs (container, Linux): `none`, the
