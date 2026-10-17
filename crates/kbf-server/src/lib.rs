@@ -30,6 +30,10 @@
 //!   and withdraw a macOS build, install an allowlisted profile; no erase), a client
 //!   over mutual TLS, and the polling of an update's DDM progress. Not yet called by
 //!   the rollout driver.
+//! - Build history ([`history`]): off unless `--history-objects` is given, each attempt and
+//!   cache hit of an invocation a client named is recorded in an object store, off the
+//!   path of the call it belongs to, with a run id the build pages name the run by. It
+//!   drops and counts when a store is slow; it never delays or fails a call.
 //! - The durable log ([`log_file`]): a size-capped rotating file in `--log-dir` (by default
 //!   `log/` in the hot store's directory) that gets every event stderr gets.
 //! - The [`farm::Farm`] core: `kbf-sched` decides, the farm carries out its effects.
@@ -75,11 +79,14 @@ pub mod fleet;
 pub mod front_maps;
 pub mod frontend;
 pub mod grpc_health;
+pub mod handover;
 pub mod health;
+pub mod history;
 pub mod http_blobs;
 pub mod http_invocations;
 pub mod identity;
 pub mod join;
+mod listen;
 mod local;
 pub mod log_file;
 pub mod machine;

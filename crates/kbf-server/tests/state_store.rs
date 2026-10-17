@@ -26,6 +26,9 @@ use kbf_types::{ActionKey, Digest, DigestFunction, LeaseId, LeaseKind, Qos, Reso
 use tokio::sync::mpsc;
 use tonic::{Code, Status};
 
+#[path = "state_store/handover.rs"]
+mod handover;
+
 const GIB: u64 = 1 << 30;
 
 type TestFarm = Farm;
@@ -259,6 +262,7 @@ impl Disk {
             store,
             epoch,
             members: Default::default(),
+            history: None,
         }))
     }
 
@@ -1022,6 +1026,7 @@ async fn a_server_binds_over_a_state_store_or_refuses_it() {
         store: disk.store.clone(),
         epoch: EpochPolicy::Keep,
         members: Default::default(),
+        history: None,
     };
     let bind = |state| {
         kbf_server::bind_server_with_state(
