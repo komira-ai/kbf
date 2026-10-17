@@ -95,13 +95,13 @@ impl Runner for SystemRunner {
             .stderr(Stdio::piped())
             // Its own process group, so the timeout can kill what it started too.
             .process_group(0);
+        // The descriptors to mark are found here, in the parent, where listing a directory
+        // may allocate; the closure only makes system calls on numbers copied in.
+        let inherited = Inherited::of(FIRST_INHERITED)?;
         // SAFETY: the closure runs in the child between fork and exec; it makes system
         // calls on numbers copied in and allocates nothing.
         unsafe {
-            command.pre_exec(before_exec(
-                spawn.run_as.filter(needs_switch),
-                FIRST_INHERITED,
-            ));
+            command.pre_exec(before_exec(spawn.run_as.filter(needs_switch), inherited));
         }
         let mut child = command.spawn()?;
         let out = capture(child.stdout.take().expect("stdout is piped"));
@@ -120,10 +120,13 @@ impl Runner for SystemRunner {
             }
             thread::sleep(Duration::from_millis(5));
         };
+        // One window for both readers, from now: a descendant that left the group and holds
+        // the pipes costs the run this long once, not once per pipe.
+        let until = Instant::now() + READ_GRACE;
         Ok(Ran {
             code: status.code(),
-            stdout: out.finish()?,
-            stderr: err.finish()?,
+            stdout: out.finish(until)?,
+            stderr: err.finish(until)?,
             timed_out,
         })
     }
@@ -191,35 +194,101 @@ pub fn switch_user(creds: &dyn Creds, user: RunAs) -> io::Result<()> {
     creds.set_uid(user.uid)
 }
 
-/// What the child runs between fork and exec: mark every descriptor from `first_fd` up
-/// (so it holds only its own standard streams, whatever the helper's parent left open),
-/// then become `user` ([`switch_user`]) when it is given one. A named function, so that
-/// the closure is not part of [`SystemRunner::run`] (which the coverage run cannot see
-/// finish in the child) and a test can run it in this process with a high `first_fd`.
-fn before_exec(
-    user: Option<RunAs>,
-    first_fd: u32,
-) -> impl FnMut() -> io::Result<()> + Send + Sync + 'static {
-    move || {
-        cloexec_from(first_fd);
-        match user {
-            Some(user) => switch_user(&Libc, user),
-            None => Ok(()),
+/// The descriptors a program must not inherit: those numbered `first` or more.
+enum Inherited {
+    /// All of them, by one `close_range` in the child (Linux 5.11 and later, when the
+    /// kernel and the sandbox allow it).
+    Range(u32),
+    /// These, found by listing the process's descriptor directory in the parent (macOS, and
+    /// Linux without `close_range`).
+    Listed(Vec<libc::c_int>),
+}
+
+impl Inherited {
+    /// How to keep descriptors from `first` up from a program: the range call when it
+    /// works (probed on a range that holds no descriptor, so nothing of this process is
+    /// changed), else the descriptors listed now.
+    fn of(first: u32) -> io::Result<Inherited> {
+        match range_cloexec(u32::MAX, u32::MAX) {
+            Ok(()) => Ok(Inherited::Range(first)),
+            Err(_) => Ok(Inherited::Listed(listed_from(first)?)),
         }
     }
 }
 
 /// `CLOSE_RANGE_CLOEXEC`: mark the range close-on-exec instead of closing it. Closing would
 /// take the standard library's own pipe, over which a failed exec reports its error.
+#[cfg(target_os = "linux")]
 const CLOSE_RANGE_CLOEXEC: u32 = 4;
 
-/// Make every descriptor numbered `first` or more close at exec. `close_range` with the
-/// flag needs Linux 5.11; where it is missing the descriptors stay as they are (close-on-exec
-/// already when this process made them, which is all Rust's standard library does).
-fn cloexec_from(first: u32) {
-    // SAFETY: close_range reads no memory and closes only descriptors of this process.
-    unsafe {
-        libc::syscall(libc::SYS_close_range, first, u32::MAX, CLOSE_RANGE_CLOEXEC);
+/// Mark descriptors `first` to `last` close-on-exec with one call. An error is the kernel's:
+/// `ENOSYS` before Linux 5.11, or a sandbox that does not allow the call.
+#[cfg(target_os = "linux")]
+fn range_cloexec(first: u32, last: u32) -> io::Result<()> {
+    // SAFETY: close_range reads no memory and changes only descriptors of this process.
+    check(unsafe { libc::syscall(libc::SYS_close_range, first, last, CLOSE_RANGE_CLOEXEC) } as _)
+}
+
+/// There is no `close_range` here.
+#[cfg(not(target_os = "linux"))]
+fn range_cloexec(_first: u32, _last: u32) -> io::Result<()> {
+    Err(io::Error::from_raw_os_error(libc::ENOSYS))
+}
+
+/// Where a process lists its open descriptors.
+#[cfg(target_os = "linux")]
+const FD_DIR: &str = "/proc/self/fd";
+#[cfg(not(target_os = "linux"))]
+const FD_DIR: &str = "/dev/fd";
+
+/// The descriptors of this process numbered `first` or more (the one that lists them
+/// included, which is closed again by the time anyone looks).
+fn listed_from(first: u32) -> io::Result<Vec<libc::c_int>> {
+    let mut fds = Vec::new();
+    for entry in std::fs::read_dir(FD_DIR)? {
+        let name = entry?.file_name();
+        let number = name.to_str().and_then(|n| n.parse::<libc::c_int>().ok());
+        fds.extend(number.filter(|fd| u32::try_from(*fd).is_ok_and(|fd| fd >= first)));
+    }
+    Ok(fds)
+}
+
+/// Mark one descriptor close-on-exec. A descriptor that is not open is fine (the directory
+/// listing's own is gone by now).
+fn cloexec(fd: libc::c_int) -> io::Result<()> {
+    // SAFETY: fcntl on a number only reports EBADF when it is not open.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::EBADF) {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: as above.
+    check(unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) })
+}
+
+/// What the child runs between fork and exec: keep the descriptors `inherited` names from
+/// the program (so it holds only its own standard streams, whatever the helper's parent left
+/// open), then become `user` ([`switch_user`]) when it is given one. A failure ends the
+/// start: a program that might hold a descriptor it should not is not run. A named function,
+/// so that the closure is not part of [`SystemRunner::run`] (which the coverage run cannot
+/// see finish in the child) and a test can run it in this process.
+fn before_exec(
+    user: Option<RunAs>,
+    inherited: Inherited,
+) -> impl FnMut() -> io::Result<()> + Send + Sync + 'static {
+    move || {
+        match &inherited {
+            Inherited::Range(first) => range_cloexec(*first, u32::MAX)?,
+            Inherited::Listed(fds) => fds.iter().try_for_each(|fd| cloexec(*fd))?,
+        }
+        match user {
+            Some(user) => switch_user(&Libc, user),
+            None => Ok(()),
+        }
     }
 }
 
@@ -240,9 +309,13 @@ fn exited(pid: u32) -> io::Result<bool> {
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: the union field is read after a successful waitid, which sets it (0 when
-    // nothing has exited yet).
-    Ok(unsafe { info.si_pid() } != 0)
+    // SAFETY (Linux): the union field is read after a successful waitid, which sets it (0
+    // when nothing has exited yet). Apple's siginfo_t has it as a plain field.
+    #[cfg(target_os = "linux")]
+    let seen = unsafe { info.si_pid() };
+    #[cfg(not(target_os = "linux"))]
+    let seen = info.si_pid;
+    Ok(seen != 0)
 }
 
 /// SIGKILL to the process group `pgid` (the child made itself the leader of a group of
@@ -292,10 +365,13 @@ fn capture(pipe: impl Read + Send + 'static) -> Capture {
 }
 
 impl Capture {
-    /// What was read, once the pipe ended or [`READ_GRACE`] ran out (the reader is left
+    /// What was read, once the pipe ended or `until` passed (the reader is left
     /// to end on its own).
-    fn finish(self) -> io::Result<Vec<u8>> {
-        match self.done.recv_timeout(READ_GRACE) {
+    fn finish(self, until: Instant) -> io::Result<Vec<u8>> {
+        match self
+            .done
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+        {
             Ok(read) => read?,
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
         }
