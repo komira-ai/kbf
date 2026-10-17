@@ -21,6 +21,7 @@ async fn raise(farm: &TestFarm, inbox: &mut Inbox, tag: u8) {
     assert_eq!(memory, 4 * GIB, "action {tag} was floored before its kill");
     let ack = farm.report(&node(), out_of_memory(lease)).await;
     assert!(ack.expect("an acknowledgement").accepted);
+    farm.tick().await;
     let [(again, memory)] = booked(inbox)[..] else {
         panic!("one rerun expected for action {tag}");
     };
@@ -82,14 +83,14 @@ async fn a_floor_is_offered_to_a_fresh_submission_after_a_crash() {
 }
 
 /// Catches: a floor raised again that leaves a second row or the old ask: a rerun killed
-/// at 16 GiB raises the floor to 64 GiB, and the successor offers 64, from one row.
+/// at 16 GiB raises the floor to 32 GiB, and the successor offers 32, from one row.
 #[tokio::test(start_paused = true)]
 async fn a_floor_raised_again_replaces_its_row() {
     let disk = Disk::new();
     let old = disk.generation_farm();
     let (_, mut inbox) = register_big(&old);
     raise(&old, &mut inbox, 1).await;
-    // The fresh submission is floored at 16 GiB, killed there and raised to 64 GiB.
+    // The fresh submission is floored at 16 GiB, killed there and raised to 32 GiB.
     submit(&old, request(1)).expect("submitted");
     let [(lease, memory)] = booked(&mut inbox)[..] else {
         panic!("one lease expected");
@@ -97,14 +98,15 @@ async fn a_floor_raised_again_replaces_its_row() {
     assert_eq!(memory, 16 * GIB);
     let ack = old.report(&node(), out_of_memory(lease)).await;
     assert!(ack.expect("an acknowledgement").accepted);
+    old.tick().await;
     let [(_, memory)] = booked(&mut inbox)[..] else {
         panic!("one rerun expected");
     };
-    assert_eq!(memory, 64 * GIB);
+    assert_eq!(memory, 32 * GIB);
     assert_eq!(disk.rows("floor/"), 1);
 
     let (successor, mut inbox) = handover(&disk, &old, kbf_sched::MEMORY_FLOORS);
-    assert_eq!(offered(&successor, &mut inbox, 1), 64 * GIB);
+    assert_eq!(offered(&successor, &mut inbox, 1), 32 * GIB);
 }
 
 /// Catches: an eviction order that does not survive a reload, and a stamp that restarts
