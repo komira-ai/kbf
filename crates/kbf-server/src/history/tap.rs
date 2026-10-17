@@ -37,6 +37,7 @@ pub struct HistoryTap {
     /// The record names (`<id>` or `<id>~<n>`) an event was offered for since their last
     /// close.
     open: Mutex<BTreeSet<String>>,
+    row_ids: Mutex<std::collections::BTreeMap<(String, Digest), kbf_history::Minted>>,
 }
 
 impl HistoryTap {
@@ -45,6 +46,7 @@ impl HistoryTap {
             queue,
             minter,
             open: Mutex::new(BTreeSet::new()),
+            row_ids: Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -79,7 +81,12 @@ impl HistoryTap {
     fn run(&self, name: &str, row: &ActionRow, i: usize, at: WallTime) -> Option<[u8; 12]> {
         let attempt = row.attempts.get(i)?;
         let inv = InvRef::named(name);
-        let minted = self.minter.mint(&inv.key, at.unix_micros() / 1000);
+        // MUTANT: one id per row, not per attempt.
+        let minted = {
+            let mut ids = self.row_ids.lock().unwrap_or_else(PoisonError::into_inner);
+            *ids.entry((name.to_owned(), row.action))
+                .or_insert_with(|| self.minter.mint(&inv.key, at.unix_micros() / 1000))
+        };
         let mut record = run_record(row, attempt);
         record.set_run_id(minted.id);
         let queued = self.queue.offer(Event::Run {
