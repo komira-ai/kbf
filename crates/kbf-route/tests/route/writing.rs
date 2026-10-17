@@ -705,6 +705,13 @@ async fn a_commit_with_closure_needs_an_owner_and_checks_each_copy() {
         .expect_err("every owner is down");
     assert!(matches!(error, StorageError::Unavailable(_)), "{error:?}");
     assert!(cluster.dialled().is_empty());
+    // A plain commit, which never goes past the first owner, needs one as much.
+    let error = nowhere
+        .commit_action_record(Role::Daemon, sha(b"action"), record.clone())
+        .await
+        .expect_err("every owner is down");
+    assert!(matches!(error, StorageError::Unavailable(_)), "{error:?}");
+    assert!(cluster.dialled().is_empty());
 
     let map = map(1, 2, active(&[1, 2, 3]));
     let cluster = Cluster::of(3);

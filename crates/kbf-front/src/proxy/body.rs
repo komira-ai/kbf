@@ -91,12 +91,12 @@ enum Kept {
 }
 
 impl Kept {
-    fn of(frame: &Frame<Bytes>) -> Option<Self> {
-        match (frame.data_ref(), frame.trailers_ref()) {
-            (Some(data), _) => Some(Self::Data(data.clone())),
-            (None, Some(trailers)) => Some(Self::Trailers(trailers.clone())),
-            (None, None) => None,
-        }
+    fn of(frame: &Frame<Bytes>) -> Self {
+        // A frame is data or trailers, nothing else.
+        frame.data_ref().map_or_else(
+            || Self::Trailers(frame.trailers_ref().cloned().unwrap_or_default()),
+            |data| Self::Data(data.clone()),
+        )
     }
 
     fn frame(&self) -> Frame<Bytes> {
@@ -235,10 +235,8 @@ impl http_body::Body for Resend {
                 if source.sealed && bytes {
                     source.streamed = true;
                     source.prefix.clear();
-                } else if !source.streamed
-                    && let Some(kept) = Kept::of(&frame)
-                {
-                    source.prefix.push(kept);
+                } else if !source.streamed {
+                    source.prefix.push(Kept::of(&frame));
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
