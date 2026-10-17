@@ -556,25 +556,27 @@ fn writers_that_keep_losing_give_up_and_store_failures_surface() {
     assert!(matches!(m.current_map(), Err(MembershipError::Store(_))));
 }
 
-/// Catches: a map source that is not the map: it must refuse before any member exists,
-/// answer with the current map, and wake its receivers on every bump this frontend
+/// Catches: a map source that is not the map: it must say there is no map (and generation 0)
+/// before any member exists, answer with the current map, and wake its receivers on every bump this frontend
 /// commits (registration, promotion, expiry) and on one another frontend committed, once
 /// this one next refreshes.
 #[test]
-fn the_map_feed_follows_every_bump() {
+fn the_map_source_follows_every_bump() {
     let s = Hooked::new();
     let m = Arc::new(members(&s, config(30, 120)));
-    assert!(matches!(m.map_feed(), Err(MembershipError::NoMap)));
-    let a = m.register(&node(1)).expect("a");
-    let source = m.map_feed().expect("source");
+    let source = m.map_source().expect("source");
     let mut changes = source.changes();
+    assert!(source.current().is_none(), "no member, no map");
+    assert_eq!(*changes.borrow_and_update(), 0);
+    let a = m.register(&node(1)).expect("a");
+    assert!(changes.has_changed().expect("open"), "the first map wakes");
     assert_eq!(*changes.borrow_and_update(), 1);
-    assert_eq!(*source.current(), a.map);
+    assert_eq!(*source.current().expect("map"), a.map);
 
     let promoted = m.set_state(a.id, MemberState::Active).expect("promote");
     assert!(changes.has_changed().expect("open"));
     assert_eq!(*changes.borrow_and_update(), promoted.generation());
-    assert_eq!(*source.current(), promoted);
+    assert_eq!(*source.current().expect("map"), promoted);
 
     let elsewhere = other_frontend(&s, config(30, 120));
     let b = elsewhere
@@ -583,9 +585,30 @@ fn the_map_feed_follows_every_bump() {
     assert!(!changes.has_changed().expect("open"), "not seen yet");
     m.refresh().expect("refresh");
     assert_eq!(*changes.borrow_and_update(), b.map.generation());
-    assert_eq!(*source.current(), b.map);
+    assert_eq!(*source.current().expect("map"), b.map);
 
     s.clock.advance(31 * SECOND);
     let down = m.refresh().expect("refresh").expect("map");
     assert_eq!(*changes.borrow_and_update(), down.generation());
+}
+
+/// Catches a map source of a restarted frontend that starts with no map although its
+/// members left one (a daemon welcomed with no map until the first refresh), and one that
+/// hides a store that cannot be read (a frontend that serves an empty map as if it were
+/// the farm's).
+#[test]
+fn a_map_source_is_seeded_from_the_store() {
+    let s = Hooked::new();
+    let before = Arc::new(members(&s, config(30, 120)));
+    let a = before.register(&node(1)).expect("a");
+    let after = Arc::new(other_frontend(&s, config(30, 120)));
+    let source = after.map_source().expect("source");
+    assert_eq!(*source.current().expect("the stored map"), a.map);
+    assert_eq!(*source.changes().borrow(), a.map.generation());
+
+    s.fail_gets.store(1, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(
+        before.map_source().err(),
+        Some(MembershipError::Store(_))
+    ));
 }

@@ -88,11 +88,28 @@ async fn register_answers_with_identity_interval_and_map() {
         .heartbeat(pb::HeartbeatRequest {
             member_id: 1,
             boot: 1,
+            have_generation: 0,
         })
         .await
         .expect("beats")
         .into_inner();
     assert_eq!(beat.map_generation, map.generation());
+    assert_eq!(
+        beat.map,
+        Some(pb::Map::from(&map)),
+        "a node with no map is sent it"
+    );
+    let current = client
+        .heartbeat(pb::HeartbeatRequest {
+            member_id: 1,
+            boot: 1,
+            have_generation: map.generation(),
+        })
+        .await
+        .expect("beats")
+        .into_inner();
+    assert_eq!(current.map_generation, map.generation());
+    assert_eq!(current.map, None, "a node that is current is sent no map");
 }
 
 /// Catches: a failure that reaches a node as the wrong code. A node retries UNAVAILABLE,
@@ -127,6 +144,7 @@ async fn every_failure_has_its_own_code() {
     let beat = |id, boot| pb::HeartbeatRequest {
         member_id: id,
         boot,
+        have_generation: 0,
     };
     let old = client.heartbeat(beat(1, 1)).await.expect_err("old boot");
     assert_eq!(old.code(), Code::FailedPrecondition);
