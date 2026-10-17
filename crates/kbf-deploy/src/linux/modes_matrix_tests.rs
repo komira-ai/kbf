@@ -41,7 +41,7 @@ struct Row {
 
 const ALL: &[Mode] = &Mode::ALL;
 const BUILDS: &[Mode] = &[Mode::Daemon, Mode::StorageAndDaemon, Mode::AllInOne];
-const UNBUILT: &[Mode] = &[Mode::Frontend, Mode::StorageAndDaemon];
+const UNBUILT: &[Mode] = &[Mode::Frontend];
 const DRAINS: &[Mode] = &[Mode::Frontend, Mode::AllInOne];
 
 fn rows() -> Vec<Row> {
@@ -245,7 +245,12 @@ fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
         (
             "parse",
             file(0o600, 990, ""),
-            &[Mode::Storage, Mode::Daemon, Mode::AllInOne],
+            &[
+                Mode::Storage,
+                Mode::Daemon,
+                Mode::StorageAndDaemon,
+                Mode::AllInOne,
+            ],
         ),
         ("credential", file(0o640, 990, ""), &[Mode::Storage]),
         ("credential", file(0o600, 1000, ""), &[Mode::Storage]),

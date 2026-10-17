@@ -3,10 +3,12 @@
 //! templates in `templates/linux/modes/`, beside `kbf.slice`.
 //!
 //! Each unit runs `<KBF_BIN_DIR>/kbf <mode> ...`. A mode `kbf` runs today (`daemon`,
-//! `all-in-one`, `storage`) carries the flags its old binary's unit carries (`storage`
-//! its stores, its listen address and its certificate flags); a mode not built yet
-//! (`frontend`, `storage-and-daemon`) carries none, and its template marks
-//! where its flags go with a `TODO:` comment. The flags the new modes add
+//! `all-in-one`, `storage`, `storage-and-daemon`) carries the flags its old binary's
+//! unit carries (`storage` its stores, its listen address and its certificate flags;
+//! `storage-and-daemon` the storage unit's three certificate flags and the daemon's:
+//! a TODO comment marks where its stores go); a mode not built yet (`frontend`)
+//! carries none, and its template marks where its flags go with a `TODO:` comment.
+//! The flags the new modes add
 //! (`--frontend`, `--advertise-addr`, the certificate flags) are such TODO comments
 //! too, never guessed: `TODO(registration):` marks the frontend's DNS name and the
 //! storage map it pushes, which come with registration.
@@ -141,7 +143,10 @@ impl Mode {
     /// takes anything and exits 2, so its unit carries no flag (rule `flags`).
     #[must_use]
     pub fn is_built(self) -> bool {
-        matches!(self, Mode::Storage | Mode::Daemon | Mode::AllInOne)
+        matches!(
+            self,
+            Mode::Storage | Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne
+        )
     }
 
     /// Whether the mode runs builds, and so manages its own cgroup (rule `delegate`).

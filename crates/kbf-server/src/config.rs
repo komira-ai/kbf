@@ -167,9 +167,10 @@ pub struct Args {
     /// node (`kbf storage`), such as `http://127.0.0.1:8990`. The REAPI listener then
     /// answers a client's CAS, ByteStream and action-cache calls from that node, passing
     /// ByteStream through without holding a blob. The local stores are still opened:
-    /// Execution and the worker listener use them until the scheduler uses storage.
-    /// Plain text (`http://`) only; the node's mutual
-    /// TLS is not wired yet. Without it, the server answers those calls itself.
+    /// Execution and the worker listener use them (`kbf frontend` is this mode without
+    /// them: Execution reads the node too). Plain text (`http://`) only here; `kbf
+    /// frontend` takes the flags of the mutual TLS to the node. Without it, the server
+    /// answers those calls itself.
     #[arg(long, value_name = "URL")]
     pub storage: Option<String>,
     /// The `kbf.worker.v1` listener. Without mutual TLS (`--worker-tls-cert`,
@@ -390,6 +391,20 @@ pub struct Args {
         display_order = 5,
     )]
     pub state_store: Option<crate::state_store::StateStoreUri>,
+    /// How long, in seconds, a storage node's membership row lives without a heartbeat
+    /// before the state store expires it and the member goes down in the storage map.
+    /// Nodes are asked to heartbeat three times as often.
+    #[arg(long, value_name = "SECONDS", default_value_t = 15, requires = "state_store", value_parser = clap::value_parser!(u64).range(3..))]
+    pub member_ttl_secs: u64,
+    /// How long, in seconds, a down storage member stays in the map before it leaves
+    /// and its blobs move to other owners.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = 300,
+        requires = "state_store"
+    )]
+    pub member_dwell_secs: u64,
 }
 
 /// This server in the tier registry. A farm runs one server today
@@ -546,6 +561,17 @@ impl Args {
                 idle: Duration::from_secs(self.segment_upload_idle_secs),
             },
         })
+    }
+
+    /// How storage members live in the state store: `--member-ttl-secs` and
+    /// `--member-dwell-secs`.
+    #[must_use]
+    pub fn members(&self) -> crate::members::MembershipConfig {
+        crate::members::MembershipConfig {
+            ttl: Duration::from_secs(self.member_ttl_secs),
+            dwell: Duration::from_secs(self.member_dwell_secs),
+            ..crate::members::MembershipConfig::default()
+        }
     }
 
     /// Refuses a `--segment-upload-max-bytes` over `--write-bytes-in-flight`: an upload

@@ -10,7 +10,7 @@ use kbf_proto::reapi::{
 };
 use tonic::{Request, Response, Status, Streaming};
 
-use super::{Endpoint, MAX_FIND_MISSING_DIGESTS, StorageService, wire};
+use super::{Endpoint, MAX_FIND_MISSING_DIGESTS, StorageService, generation, wire};
 
 /// What every call but FindMissingBlobs answers.
 fn not_served<T>(call: &str) -> Result<T, Status> {
@@ -28,6 +28,7 @@ impl ContentAddressableStorage for StorageService {
         request: Request<FindMissingBlobsRequest>,
     ) -> Result<Response<FindMissingBlobsResponse>, Status> {
         self.admission.check(&request, Endpoint::FindMissing)?;
+        self.check_map(generation::requested(&request)?).await?;
         let request = request.into_inner();
         if request.blob_digests.len() > MAX_FIND_MISSING_DIGESTS {
             return Err(Status::invalid_argument(format!(

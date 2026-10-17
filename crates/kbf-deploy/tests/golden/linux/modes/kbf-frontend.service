@@ -24,10 +24,13 @@ CPUWeight=300
 # TODO(registration): the frontend's DNS name, the one address clients, daemons and
 # storage nodes know, and the storage map it pushes to them.
 ExecStart=/usr/local/bin/kbf frontend
-# kbf drains on SIGTERM: it refuses new builds and keeps every open Execute stream
-# until its action is done, with no deadline (--shutdown-timeout-secs 0). A stop that
-# ends sooner fails every build in flight, so systemd sends SIGTERM and never kills it
-# for taking long (check-units rule `stop`).
+# kbf drains on SIGTERM: new Execute calls are refused, open streams run until their
+# action is done (Buck2 does not recover a stream that breaks), with no deadline
+# (--shutdown-timeout-secs 0), then the server exits. A stop that ends sooner fails every
+# build in flight, so systemd sends SIGTERM and never kills it for taking long
+# (check-units rule `stop`). A second SIGTERM ends the open streams
+# (`systemctl kill --signal=TERM` on the unit), and `kbf cluster drain --frontend` begins the
+# same drain with no signal.
 KillSignal=SIGTERM
 TimeoutStopSec=infinity
 Restart=on-failure

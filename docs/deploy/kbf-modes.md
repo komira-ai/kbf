@@ -128,8 +128,10 @@ way: a file the daemon reads by a flag, the service manager's own environment wi
 - **`daemon`**: the flags `kbf-daemon`'s unit has (`--server`, `--cas`, its
   certificates, `--data-dir`, the memory flags, the images); no key.
 - **`all-in-one`**: below; no key (its cold store is a directory).
-- **`frontend`** and **`storage-and-daemon`**: no flag (not built yet; rule `flags`).
-  The frontend's template says where its state store goes: a SQLite file beside its
+- **`storage-and-daemon`**: the storage unit's three certificate flags (no `--cas`:
+  the daemon half reads the node's storage in-process), then the daemon unit's flags;
+  no key yet (rule `credential`). Its stores are a `TODO:` in the template.
+- **`frontend`**: no flag (not built yet; rule `flags`). Its template says where its state store goes: a SQLite file beside its
   data, `--state-store=sqlite://<KBF_DATA_DIR>/state.db` (below).
 
 `render-units --mode storage` refuses settings without `MINIO_S3_ENDPOINT`: the
@@ -174,8 +176,7 @@ in-process, one cache on the SSD; architecture-v2.md, sections 1 and 10). The de
 keeps the key from builds by uid (sections 9 and 15): the key file the unit's user's
 alone, mode 0600, and each action a subordinate id of that user (the container driver's
 `--userns=nomap`), with a test that an action cannot read the key. The daemon half
-runs as the unit's user and so could read it. Until the mode is built and that test
-exists, the unit holds no key (rule `credential` refuses one), and with the key it will
+runs as the unit's user and so could read it. Until that test exists, the unit holds no key (rule `credential` refuses one), and with the key it will
 be for a trusted network only, as all-in-one is.
 
 ## all-in-one is for a trusted box

@@ -150,7 +150,8 @@ kbf_cas_conformance::tests!(Seam::new());
 
 /// Catches a plane that reaches the cache some other way than the boundary it was
 /// given: each of its kinds of call (FindMissing, a whole-blob write, a read, and an
-/// output upload through `Segments`) arrives at the storage's own method.
+/// output upload through `Segments`) arrives at the storage's own method; and a `get`
+/// that has the storage hold the blob whole for it (`read_blob`) rather than stream it.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_call_crosses_the_boundary() {
     let (plane, calls) = plane();
@@ -165,7 +166,7 @@ async fn every_call_crosses_the_boundary() {
     assert!(plane.missing(&[whole, digest]).await.is_empty());
     for (name, n) in [
         ("find_missing", &calls.find_missing),
-        ("read_blob", &calls.read_blob),
+        ("read_range", &calls.read_range),
         ("put", &calls.put),
         ("segments", &calls.segments),
     ] {
@@ -174,6 +175,11 @@ async fn every_call_crosses_the_boundary() {
             "no {name} call reached the storage"
         );
     }
+    assert_eq!(
+        calls.read_blob.load(Ordering::SeqCst),
+        0,
+        "a whole-blob read"
+    );
 }
 
 /// Catches a ranged read that is not the storage's own: through the boundary, the bytes

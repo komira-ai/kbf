@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kbf_front::{Described, MetaLog, Stage};
+use kbf_front::{Described, Stage};
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
 use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{DaemonInstance, Recovered, RecoveredLease, Request, Requeue};
@@ -38,7 +38,6 @@ use kbf_types::{
     WorkerId,
 };
 
-use kbf_objstore::ObjectStore;
 use tokio::sync::watch;
 use tonic::Status;
 
@@ -427,7 +426,7 @@ impl Durable {
     }
 }
 
-impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
+impl Farm {
     /// This farm, with `state` as the truth the scheduler keeps its state in, if given:
     /// every operation, lease grant, result and refusal is written to it before it is
     /// acknowledged, and the unfinished operations and leases it already holds are taken
@@ -541,7 +540,7 @@ impl State {
     /// generic, unlike `Farm::with_state`, so every test binary's runs count toward the
     /// same function's coverage.
     fn keep_in(&mut self, state: Option<StateStore>) -> Result<Option<u64>, StateError> {
-        let Some(StateStore { store, epoch }) = state else {
+        let Some(StateStore { store, epoch, .. }) = state else {
             return Ok(None);
         };
         let (durable, epoch) = Durable::open(store, epoch, process_term())?;

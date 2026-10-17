@@ -19,9 +19,10 @@
 //!   answers ([`Router::read_blob`]).
 //! - **FindMissing** ([`Router::find_missing`]) asks each digest's primary only, one call
 //!   per primary, and puts the answers back in the order asked.
-//! - **Writes** ([`Router::put`], [`Router::commit_action_record`]) go to the primary
-//!   owner; the chain forwards to the replica (av2-11). An owner that is `Down` in the
-//!   map is skipped.
+//! - **Writes** ([`Router::put`], [`Router::commit_action_record`]) go to the first
+//!   write owner that is not `Down` in the map, and to that one only: the router does not
+//!   write to the others or retry on another owner (the storage side's chain replication
+//!   is av2-11).
 //! - **`STALE_MAP`**: a node that holds a newer map answers [`StorageError::StaleMap`].
 //!   The router fetches the newer map through the [`MapSource`] and runs the call again,
 //!   once; a second answer, or a fetch that brings no newer map, is `UNAVAILABLE`.
@@ -36,7 +37,9 @@
 //! # TLS
 //!
 //! [`TlsNodes`] verifies each node against its own name from the map and has no way to be
-//! given one name for all of them.
+//! given one name for all of them. A node that goes silent is given up on after the
+//! [`Liveness`] it is given (ten seconds to dial, pings every ten seconds by default), so
+//! a read fails over to the next owner instead of waiting for the operating system.
 
 mod find;
 mod flights;
@@ -48,7 +51,7 @@ mod router;
 mod source;
 mod write;
 
-pub use nodes::{Nodes, TlsNodes};
+pub use nodes::{Liveness, Nodes, TlsNodes};
 pub use repair::{ReadRepair, RepairLimit};
 pub use resume::MAX_RESUMES;
 pub use router::{Placement, Router};

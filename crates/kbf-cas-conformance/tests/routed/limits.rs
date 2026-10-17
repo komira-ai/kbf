@@ -19,9 +19,8 @@ async fn no_more_requests_than_the_limit_are_out_at_once() {
     let cas = plane(&fake, &config);
     assert_eq!(cas.in_flight(), 2);
 
-    // Reads into memory and into files, of four bytes each, as long as the blob the node
-    // serves. The files are made first, so that every read reaches the node the first
-    // time it is polled.
+    // Reads into memory and into files, of four bytes each. The files are made first, so
+    // that every read reaches the node the first time it is polled.
     let dir = scratch();
     let mut files = Vec::new();
     for i in 0..6_u8 {
@@ -29,19 +28,22 @@ async fn no_more_requests_than_the_limit_are_out_at_once() {
         files.push(tokio::fs::File::create(path).await.expect("a file"));
     }
     let reads = futures::future::join_all(files.into_iter().enumerate().map(|(i, mut file)| {
-        // Reads into memory are of different digests, so that they do not share a read;
-        // reads into a file check the bytes, so those are of the digest of what the node
-        // serves.
-        let different = digest_of(&[i as u8; 4]);
+        // Reads into memory are of different blobs, so that they do not share a read;
+        // every read checks the bytes against the digest, so the node serves each blob
+        // under its own.
+        let different = [i as u8; 4];
+        fake.serve(&different);
         let served = digest_of(b"four");
         let cas = cas.clone();
         async move {
             if i % 2 == 0 {
-                cas.get(&different).await
+                cas.get(&digest_of(&different))
+                    .await
+                    .map(|bytes| (bytes, different.to_vec()))
             } else {
                 cas.read_to(&served, &mut file)
                     .await
-                    .map(|()| b"four".to_vec())
+                    .map(|()| (b"four".to_vec(), b"four".to_vec()))
             }
         }
     }));
@@ -52,7 +54,8 @@ async fn no_more_requests_than_the_limit_are_out_at_once() {
     };
     let (answers, ()) = tokio::join!(reads, release);
     for answer in answers {
-        assert_eq!(answer.expect("a blob"), b"four");
+        let (read, blob) = answer.expect("a blob");
+        assert_eq!(read, blob);
     }
     assert_eq!(fake.peak(), 2);
 }

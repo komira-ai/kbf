@@ -18,8 +18,12 @@
 //! instance name in the peeked resource name, with the caller the HTTP-level
 //! authentication layer found.
 //!
-//! **Not here yet:** the scheduler's use of storage (Execute still reads the local
-//! cache), health and readiness (av2-04), mutual TLS to the nodes, GetTree.
+//! **Execute and the scheduler** read and write the same nodes through
+//! [`crate::Backend::remote`] (`kbf frontend`); `kbf-server --storage` still gives them
+//! its local cache. **Mutual TLS** to the nodes is the channel the proxy is given
+//! (`kbf-server`'s `frontend` module builds it); the proxy dials nothing itself.
+//!
+//! **Not here yet:** GetTree, routing by digest (av2-09).
 
 mod ac;
 mod body;
