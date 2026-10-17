@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::process::Output;
 use std::time::{Duration, UNIX_EPOCH};
 
 use kbf_host::exec::{Entry, Meta};
+use kbf_host::path::Root;
 use kbf_host::step::{Cmd, HttpUrl, Step};
 use kbf_host::testkit::{ScratchHost, scratch};
 use kbf_host::trust::Untrusted;
@@ -28,12 +29,12 @@ fn me() -> Owner {
 }
 
 /// A scratch host with the directories a Linux host has above the layout.
-fn host(name: &str) -> (ScratchHost, Root) {
+fn host(name: &str) -> (ScratchHost, Layout) {
     let exec = ScratchHost::new(&format!("deploy-release-{name}"));
     for sub in ["run", "var/lib", "usr/local", "etc"] {
         fs::create_dir_all(exec.root.join(sub)).expect("seed");
     }
-    let root = Root::new(&exec.root).expect("absolute");
+    let root = Layout::linux(Root::new(&exec.root).expect("absolute"));
     (exec, root)
 }
 
@@ -57,7 +58,7 @@ const UNITS: &[(&str, &str)] = &[
 
 fn install_on(
     exec: &mut ScratchHost,
-    root: &Root,
+    root: &Layout,
     commit: &str,
     from: &Path,
     mode: Mode,
@@ -71,13 +72,13 @@ fn install_on(
     Ok(String::from_utf8(out).expect("utf-8"))
 }
 
-fn rollback_on(exec: &mut ScratchHost, root: &Root, mode: Mode) -> Result<String, ReleaseError> {
+fn rollback_on(exec: &mut ScratchHost, root: &Layout, mode: Mode) -> Result<String, ReleaseError> {
     let mut out = Vec::new();
     rollback(exec, root, mode, &mut out)?;
     Ok(String::from_utf8(out).expect("utf-8"))
 }
 
-fn gc_on(exec: &mut ScratchHost, root: &Root, keep: usize) -> Result<String, ReleaseError> {
+fn gc_on(exec: &mut ScratchHost, root: &Layout, keep: usize) -> Result<String, ReleaseError> {
     let mut out = Vec::new();
     gc(exec, root, keep, Mode::Apply, &mut out)?;
     Ok(String::from_utf8(out).expect("utf-8"))
@@ -89,7 +90,7 @@ fn link(exec: &ScratchHost, name: &str) -> Option<String> {
     Some(target.display().to_string())
 }
 
-fn state_of(root: &Root) -> State {
+fn state_of(root: &Layout) -> State {
     state::read_unlocked(root).expect("read").expect("a state")
 }
 
@@ -591,4 +592,297 @@ fn errors_name_what_is_wrong() {
         exec.at("/usr/local/kbf/releases").display()
     );
     assert!(err.to_string().starts_with(&want), "{err}");
+}
+
+/// A scratch Mac: the directories every macOS has above the layout (`/var/run`,
+/// `/var/db`, `/usr`) and not `/usr/local`, which a fresh one lacks.
+fn mac(name: &str) -> (ScratchHost, Layout) {
+    let exec = ScratchHost::new(&format!("deploy-release-mac-{name}"));
+    for sub in ["var/run", "var/db", "usr"] {
+        fs::create_dir_all(exec.root.join(sub)).expect("seed");
+    }
+    let layout = Layout::new(
+        Root::new(&exec.root).expect("absolute"),
+        crate::layout::Platform::MacOs,
+    );
+    (exec, layout)
+}
+
+/// A release for a Mac: `kbf-daemon` holding `binary`.
+fn mac_source(name: &str, binary: &str) -> PathBuf {
+    let dir = scratch(&format!("deploy-release-src-{name}"));
+    fs::write(dir.join("kbf-daemon"), binary).expect("binary");
+    dir
+}
+
+/// Catches a release of two binaries not being copied whole: both come out 0755 with their
+/// bytes, the first is named in the release line as a release of one always was, and the
+/// second has a line of its own with its size and sha256.
+#[test]
+fn a_release_of_two_binaries_is_installed_whole_and_reported() {
+    let (mut exec, root) = host("two-binaries");
+    let from = source("two-binaries-src", "kbf A", None);
+    fs::write(from.join("kbf-daemon"), "daemon A").expect("daemon");
+    let out = install_on(&mut exec, &root, A, &from, Mode::Apply).expect("install");
+    for (file, text) in [("kbf", "kbf A"), ("kbf-daemon", "daemon A")] {
+        let path = format!("/usr/local/kbf/releases/{A}/{file}");
+        assert_eq!(fs::read_to_string(exec.at(&path)).expect(file), text);
+        assert_eq!(mode_of(&exec, &path), 0o755);
+    }
+    let r = format!("/usr/local/kbf/releases/{A}");
+    assert!(
+        out.starts_with(&format!(
+            "release {A}: {r} (5 bytes, sha256 {}), 0 unit(s)\nalso kbf-daemon (8 bytes, sha256 {})\n",
+            sha256(b"kbf A"),
+            sha256(b"daemon A")
+        )),
+        "{out}"
+    );
+
+    // The release is whole or not there: a second binary the directory lacks is a
+    // different release, and is refused.
+    let (mut exec2, root2) = host("two-binaries-differs");
+    let only_kbf = source("two-binaries-only", "kbf A", None);
+    install_on(&mut exec2, &root2, A, &only_kbf, Mode::Apply).expect("install");
+    let err = install_on(&mut exec2, &root2, A, &from, Mode::Apply).expect_err("a new binary");
+    assert!(
+        matches!(&err, ReleaseError::Differs { path } if path.as_str().ends_with("/kbf-daemon")),
+        "{err}"
+    );
+}
+
+/// Catches a source with only `kbf-daemon` being refused (a Mac release has no `kbf`), and
+/// a source with neither being refused naming `kbf` as before.
+#[test]
+fn a_source_needs_one_binary_and_a_daemon_alone_will_do() {
+    let only = mac_source("daemon-only", "daemon A");
+    let s = Source::read(&only).expect("reads");
+    assert_eq!(s.binaries, [("kbf-daemon", b"daemon A".to_vec())]);
+    let none = scratch("deploy-release-src-none");
+    let err = Source::read(&none).expect_err("nothing");
+    assert!(
+        err.to_string()
+            .starts_with(&format!("cannot read {}", none.join("kbf").display())),
+        "{err}"
+    );
+    // A binary that cannot be read is an error, not a missing one.
+    let unreadable = scratch("deploy-release-src-unreadable");
+    fs::create_dir(unreadable.join("kbf")).expect("a directory");
+    let err = Source::read(&unreadable).expect_err("a directory");
+    assert!(err.to_string().starts_with("cannot read "), "{err}");
+}
+
+/// Catches the macOS layout not being used: an install on a Mac puts the state under
+/// `/var/db/kbf-deploy` and takes the lock at `/var/run/kbf-deploy.lock`, never at
+/// `/var/lib` or `/run`; it makes the `/usr/local` a fresh Mac lacks (root's, 0755) and
+/// the state directory; the links point at the release; the next-steps line names the
+/// daemon and `launchctl`, not `kbf` and `systemctl`.
+///
+/// Mutant seen red: `Locked::acquire` taking the Linux lock (`/run` is not there).
+#[test]
+fn a_mac_install_uses_the_mac_layout_and_makes_its_missing_parents() {
+    let (mut exec, layout) = mac("flow");
+    let a = mac_source("mac-flow-a", "daemon A");
+    let b = mac_source("mac-flow-b", "daemon B");
+    assert!(!exec.at("/usr/local").exists());
+    let out = install_on(&mut exec, &layout, A, &a, Mode::Apply).expect("install A");
+    install_on(&mut exec, &layout, B, &b, Mode::Apply).expect("install B");
+    assert!(
+        out.contains("state: written to /var/db/kbf-deploy/state.json\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("restart the units that run /usr/local/kbf/current/kbf-daemon (launchctl kickstart -k system/<label>)"),
+        "{out}"
+    );
+    assert!(exec.at("/var/db/kbf-deploy/state.json").is_file());
+    assert!(exec.at("/var/run/kbf-deploy.lock").is_file());
+    assert!(!exec.at("/var/lib").exists() && !exec.at("/run").exists());
+    for dir in ["/usr/local", "/var/db/kbf-deploy", "/usr/local/kbf"] {
+        assert_eq!(mode_of(&exec, dir), 0o755, "{dir}");
+    }
+    assert_eq!(link(&exec, "current"), Some(format!("releases/{B}")));
+    assert_eq!(link(&exec, "previous"), Some(format!("releases/{A}")));
+    assert_eq!(state_of(&layout).current, Some(c(B)));
+    assert!(
+        !exec
+            .at(&format!("/usr/local/kbf/releases/{A}/kbf"))
+            .exists()
+    );
+
+    // Rolling back finds the previous release by its daemon.
+    let out = rollback_on(&mut exec, &layout, Mode::Apply).expect("rollback");
+    assert!(
+        out.contains(&format!("links: current {B} -> {A}, previous {A} -> none")),
+        "{out}"
+    );
+    assert_eq!(link(&exec, "current"), Some(format!("releases/{A}")));
+}
+
+/// Catches `/usr/local` being touched when the host has one: a Mac (or any host) whose
+/// `/usr/local` is 0775 keeps that mode (its owner is the host's business; the trust
+/// check refuses what others can write), the plan has no step for it, and a host without
+/// one gets `mkdir /usr/local` as the first step.
+///
+/// Mutant seen red: `/usr/local` always planned (the 0775 becomes 0755).
+#[test]
+fn usr_local_is_made_when_missing_and_left_alone_when_there() {
+    let (mut exec, root) = host("usr-local");
+    fs::set_permissions(exec.at("/usr/local"), fs::Permissions::from_mode(0o775)).expect("mode");
+    let from = source("usr-local-src", "kbf A", None);
+    let out = install_on(&mut exec, &root, A, &from, Mode::Apply).expect("install");
+    assert!(!out.contains("/usr/local ("), "{out}");
+    assert_eq!(mode_of(&exec, "/usr/local"), 0o775);
+
+    let (mut exec, root) = host("usr-local-missing");
+    fs::remove_dir(exec.at("/usr/local")).expect("remove");
+    let out = install_on(&mut exec, &root, A, &from, Mode::DryRun).expect("dry run");
+    let first_step = out
+        .lines()
+        .find(|l| l.starts_with("DRY-RUN"))
+        .expect("a step");
+    let owner = me();
+    assert_eq!(
+        first_step,
+        format!(
+            "DRY-RUN: mkdir /usr/local (0755, owner {}:{})",
+            owner.uid, owner.gid
+        )
+    );
+    install_on(&mut exec, &root, A, &from, Mode::Apply).expect("install");
+    assert_eq!(mode_of(&exec, "/usr/local"), 0o755);
+}
+
+/// Catches `stage` doing what `install` does: it must copy and check the release, record
+/// it as the state's `staged` one (and change nothing else of the state), and move no link.
+/// It proceeds while a deploy is pending, keeping that deploy's record; a dry run prints
+/// the plan and changes nothing; and `gc` keeps the staged release.
+///
+/// Mutants seen red: `stage` switching the links; `stage` refusing while pending; the
+/// staged commit not recorded (`gc` then removes the release).
+#[test]
+fn stage_copies_and_records_the_release_and_moves_no_link() {
+    let (mut exec, root) = host("stage");
+    let a = source("stage-a", "kbf A", Some(UNITS));
+    let b = source("stage-b", "kbf B", None);
+    install_on(&mut exec, &root, A, &a, Mode::Apply).expect("install A");
+    Locked::acquire(&root)
+        .expect("lock")
+        .write(&State {
+            pending_confirm: Some(PendingConfirm {
+                commit: c(A),
+                previous: None,
+                deadline: 1,
+            }),
+            ..state_of(&root)
+        })
+        .expect("pending");
+
+    let before = tree(&exec.root);
+    let mut out = Vec::new();
+    stage(
+        &mut exec,
+        &root,
+        me(),
+        &Install {
+            commit: c(B),
+            from: b.clone(),
+        },
+        Mode::DryRun,
+        &mut out,
+    )
+    .expect("dry run");
+    assert_eq!(tree(&exec.root), before);
+    assert!(
+        String::from_utf8(out)
+            .expect("utf-8")
+            .contains(&format!("release {B}:"))
+    );
+
+    let mut out = Vec::new();
+    stage(
+        &mut exec,
+        &root,
+        me(),
+        &Install {
+            commit: c(B),
+            from: b,
+        },
+        Mode::Apply,
+        &mut out,
+    )
+    .expect("stage while pending");
+    let out = String::from_utf8(out).expect("utf-8");
+    assert!(out.ends_with(&format!("state: {B} staged\n")), "{out}");
+    assert_eq!(
+        fs::read_to_string(exec.at(&format!("/usr/local/kbf/releases/{B}/kbf"))).expect("copied"),
+        "kbf B"
+    );
+    let s = state_of(&root);
+    assert_eq!((s.current, s.staged), (Some(c(A)), Some(c(B))));
+    assert_eq!(s.pending_confirm.map(|p| p.commit), Some(c(A)));
+    assert_eq!(link(&exec, "current"), Some(format!("releases/{A}")));
+    assert_eq!(link(&exec, "previous"), None);
+
+    // The staged release survives a gc that removes everything else.
+    Locked::acquire(&root)
+        .expect("lock")
+        .write(&State {
+            pending_confirm: None,
+            ..state_of(&root)
+        })
+        .expect("clear");
+    gc_on(&mut exec, &root, 0).expect("gc");
+    assert!(
+        exec.at(&format!("/usr/local/kbf/releases/{B}/kbf"))
+            .exists()
+    );
+}
+
+/// Catches a stage that replaces a release or leaves a half copy: a release directory with
+/// other bytes is refused and keeps its bytes, and a source with nothing to copy is
+/// refused before the lock.
+#[test]
+fn stage_never_replaces_a_release() {
+    let (mut exec, root) = host("stage-differs");
+    let a = source("stage-differs-a", "kbf A", None);
+    let other = source("stage-differs-b", "kbf other", None);
+    let install = |from: &Path| Install {
+        commit: c(A),
+        from: from.to_owned(),
+    };
+    stage(
+        &mut exec,
+        &root,
+        me(),
+        &install(&a),
+        Mode::Apply,
+        &mut Vec::new(),
+    )
+    .expect("stage");
+    let err = stage(
+        &mut exec,
+        &root,
+        me(),
+        &install(&other),
+        Mode::Apply,
+        &mut Vec::new(),
+    )
+    .expect_err("other bytes");
+    assert!(matches!(err, ReleaseError::Differs { .. }), "{err}");
+    assert_eq!(
+        fs::read_to_string(exec.at(&format!("/usr/local/kbf/releases/{A}/kbf"))).expect("kept"),
+        "kbf A"
+    );
+    let empty = scratch("deploy-release-src-stage-empty");
+    let err = stage(
+        &mut exec,
+        &root,
+        me(),
+        &install(&empty),
+        Mode::Apply,
+        &mut Vec::new(),
+    )
+    .expect_err("no binary");
+    assert!(err.to_string().starts_with("cannot read "), "{err}");
 }

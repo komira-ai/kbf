@@ -1,4 +1,4 @@
-//! The manual release verbs: `install`, `rollback` and `gc`, on the layout of
+//! The release verbs: `install`, `stage`, `rollback` and `gc`, on the layout of
 //! [`super::layout`].
 //!
 //! Each reads the deploy state, plans its steps through a [`Planner`] and prints them
@@ -10,10 +10,16 @@
 //!
 //! - `install` copies a release into `releases/<commit>/` (root's, 0755, so the user a
 //!   service runs as cannot replace its own binary; units 0644), refuses a release
-//!   directory that is there with other content, checks that the copied binary's sha256
-//!   is the source's, then points `previous` at the old current release and `current`
-//!   at the new one and writes the state. Only the files the source names are compared:
-//!   a file the release directory has beyond them is not noticed.
+//!   directory that is there with other content, checks that each copied binary's
+//!   sha256 is the source's, then points `previous` at the old current release and
+//!   `current` at the new one and writes the state. Only the files the source names are
+//!   compared: a file the release directory has beyond them is not noticed. A release
+//!   holds the binaries its source directory has: `kbf` (a Linux release), `kbf-daemon`
+//!   (a macOS one) or both.
+//! - `stage` does the copy and the checks of `install` and no more: no link moves, and
+//!   the state's `staged` names the release, which `gc` then keeps. It is what a
+//!   release that was verified elsewhere ([`crate::stage`]) goes through, and it
+//!   proceeds while a deploy is pending, since it touches nothing that deploy owns.
 //! - `rollback` points `current` at the previous release and removes `previous` (the
 //!   state keeps no release before it); it refuses when there is no previous release or
 //!   its binary is gone.
@@ -32,13 +38,13 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use kbf_host::exec::{Entry, Exec, Kind, Meta};
-use kbf_host::path::{HostPath, Root};
+use kbf_host::path::HostPath;
 use kbf_host::plan::{HostError, Mode, Plan, Planner, RunAs, execute};
 use kbf_host::step::{Owner, Perms};
 use sha2::{Digest, Sha256};
 
 use super::CommitId;
-use super::layout::{self, path};
+use super::layout::{self, Layout, Platform, path};
 use super::state::{self, Locked, State, StateError};
 
 /// Who owns a release: root, so only root can replace what a service runs.
@@ -87,18 +93,34 @@ fn read_failed(path: &Path) -> impl FnOnce(io::Error) -> ReleaseError + '_ {
     }
 }
 
-/// What `install --from <dir>` copies: `<dir>/kbf`, and each file of `<dir>/units/`
-/// (sorted by name) when that directory exists.
+/// What `install --from <dir>` copies: each of `<dir>/kbf` and `<dir>/kbf-daemon` that
+/// exists (at least one must), and each file of `<dir>/units/` (sorted by name) when that
+/// directory exists.
 #[derive(Debug)]
 pub struct Source {
-    pub binary: Vec<u8>,
+    /// The binaries by name, in the order of [`layout::RELEASE_BINARIES`].
+    pub binaries: Vec<(&'static str, Vec<u8>)>,
     pub units: Vec<(String, Vec<u8>)>,
 }
 
 impl Source {
     pub fn read(from: &Path) -> Result<Source, ReleaseError> {
-        let bin = from.join(layout::RELEASE_BINARY);
-        let binary = fs::read(&bin).map_err(read_failed(&bin))?;
+        let mut binaries = Vec::new();
+        let mut missing = None;
+        for name in layout::RELEASE_BINARIES {
+            let bin = from.join(name);
+            match fs::read(&bin) {
+                Ok(bytes) => binaries.push((name, bytes)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    missing.get_or_insert((bin, e));
+                }
+                Err(e) => return Err(read_failed(&bin)(e)),
+            }
+        }
+        // With none, the error is the first one's: the source has no `kbf`.
+        if let Some((bin, e)) = missing.filter(|_| binaries.is_empty()) {
+            return Err(read_failed(&bin)(e));
+        }
         let dir = from.join(layout::RELEASE_UNITS);
         let items = match fs::read_dir(&dir) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
@@ -113,7 +135,7 @@ impl Source {
             units.push((name, fs::read(&file).map_err(read_failed(&file))?));
         }
         units.sort();
-        Ok(Source { binary, units })
+        Ok(Source { binaries, units })
     }
 }
 
@@ -140,14 +162,14 @@ fn inspect<E: Exec>(exec: &E, path: &HostPath) -> Result<Option<Entry>, ReleaseE
 }
 
 /// The lock (only with `--apply`) and the state, refused while a deploy is pending.
-fn begin(root: &Root, mode: Mode) -> Result<(Option<Locked>, State), ReleaseError> {
+fn begin(host: &Layout, mode: Mode) -> Result<(Option<Locked>, State), ReleaseError> {
     let lock = match mode {
-        Mode::Apply => Some(Locked::acquire(root)?),
+        Mode::Apply => Some(Locked::acquire(host)?),
         Mode::DryRun => None,
     };
     let state = match &lock {
         Some(lock) => lock.read()?,
-        None => state::read_unlocked(root)?,
+        None => state::read_unlocked(host)?,
     };
     let state = state.unwrap_or_default();
     if let Some(p) = &state.pending_confirm {
@@ -168,6 +190,7 @@ fn or_none(commit: &Option<CommitId>) -> String {
 /// state with those two and say what is left to do by hand.
 fn switch<E: Exec>(
     exec: &mut E,
+    host: &Layout,
     lock: Option<Locked>,
     was: &State,
     (current, previous): (CommitId, Option<CommitId>),
@@ -200,16 +223,22 @@ fn switch<E: Exec>(
             ..was.clone()
         };
         lock.write(&next)?;
-        let _ = writeln!(out, "state: written to {}", layout::STATE_FILE);
+        let _ = writeln!(out, "state: written to {}", host.state_file());
         // SEAM(unit install): no verb here installs a release's units or restarts a
         // service; `linux install-units` does both. When it takes a release directory,
         // the restart goes here, after the switch.
+        let (binary, restart) = match host.platform() {
+            Platform::Linux => (layout::RELEASE_BINARY, "systemctl restart <unit>"),
+            Platform::MacOs => (
+                layout::RELEASE_DAEMON,
+                "launchctl kickstart -k system/<label>",
+            ),
+        };
         let _ = writeln!(
             out,
-            "next, by hand: restart the units that run {}/{} (systemctl restart <unit>), \
+            "next, by hand: restart the units that run {}/{binary} ({restart}), \
              then check `kbf-deploy host status`",
             layout::CURRENT,
-            layout::RELEASE_BINARY
         );
     }
     Ok(())
@@ -226,53 +255,112 @@ pub struct Install {
 /// can chown only to its own user).
 pub fn install<E: Exec>(
     exec: &mut E,
-    root: &Root,
+    host: &Layout,
     owner: Owner,
     a: &Install,
     mode: Mode,
     out: &mut dyn Write,
 ) -> Result<(), ReleaseError> {
     let source = Source::read(&a.from)?;
-    let (lock, state) = begin(root, mode)?;
-    let copy = plan_copy(exec, owner, &a.commit, &source)?;
-    let _ = writeln!(
-        out,
-        "release {}: {} ({} bytes, sha256 {}), {} unit(s)",
-        a.commit,
-        layout::release_dir(&a.commit),
-        source.binary.len(),
-        sha256(&source.binary),
-        source.units.len()
-    );
-    execute(&copy, RunAs::Root, mode, exec, &mut &mut *out)?;
-    if mode == Mode::Apply {
-        let bin = layout::release_file(&a.commit, layout::RELEASE_BINARY);
-        verify(inspect(exec, &bin)?, bin, &source.binary)?;
-    }
+    let (lock, state) = begin(host, mode)?;
+    copy_release(exec, host, owner, &a.commit, &source, mode, out)?;
     // Installing the current release again keeps its previous one.
     let previous = if state.current.as_ref() == Some(&a.commit) {
         state.previous.clone()
     } else {
         state.current.clone()
     };
-    switch(exec, lock, &state, (a.commit.clone(), previous), out)
+    switch(exec, host, lock, &state, (a.commit.clone(), previous), out)
+}
+
+/// `host stage`: copy and check as `install` does, move no link, and record the release
+/// as the state's `staged` one (with `Mode::Apply`; a dry run prints the plan).
+pub fn stage<E: Exec>(
+    exec: &mut E,
+    host: &Layout,
+    owner: Owner,
+    a: &Install,
+    mode: Mode,
+    out: &mut dyn Write,
+) -> Result<(), ReleaseError> {
+    let source = Source::read(&a.from)?;
+    // Held through the copy, so a `gc` cannot remove the release between the two.
+    let lock = match mode {
+        Mode::Apply => Some(Locked::acquire(host)?),
+        Mode::DryRun => None,
+    };
+    copy_release(exec, host, owner, &a.commit, &source, mode, out)?;
+    if let Some(lock) = lock {
+        let state = lock.read()?.unwrap_or_default();
+        lock.write(&State {
+            staged: Some(a.commit.clone()),
+            ..state
+        })?;
+        let _ = writeln!(out, "state: {} staged", a.commit);
+    }
+    Ok(())
+}
+
+/// The plan of the release's directories and files, printed and (with `Mode::Apply`)
+/// carried out, and then each binary read back from the host and compared with the source.
+fn copy_release<E: Exec>(
+    exec: &mut E,
+    host: &Layout,
+    owner: Owner,
+    commit: &CommitId,
+    source: &Source,
+    mode: Mode,
+    out: &mut dyn Write,
+) -> Result<(), ReleaseError> {
+    let copy = plan_copy(exec, host, owner, commit, source)?;
+    // The first binary is named in the line, as it was when a release held only `kbf`;
+    // each other one gets a line of its own.
+    let ((_, first), others) = source
+        .binaries
+        .split_first()
+        .expect("a source holds at least one binary");
+    let _ = writeln!(
+        out,
+        "release {commit}: {} ({} bytes, sha256 {}), {} unit(s)",
+        layout::release_dir(commit),
+        first.len(),
+        sha256(first),
+        source.units.len()
+    );
+    for (name, bytes) in others {
+        let _ = writeln!(
+            out,
+            "also {name} ({} bytes, sha256 {})",
+            bytes.len(),
+            sha256(bytes)
+        );
+    }
+    execute(&copy, RunAs::Root, mode, exec, &mut &mut *out)?;
+    if mode == Mode::Apply {
+        for (name, bytes) in &source.binaries {
+            let bin = layout::release_file(commit, name);
+            verify(inspect(exec, &bin)?, bin, bytes)?;
+        }
+    }
+    Ok(())
 }
 
 /// The directories and files of the release, root's; a release directory already there
 /// must hold the same files (its modes and owner are then set again, nothing else).
+/// `/usr/local` is made when the host has none, and left as it is when it has.
 fn plan_copy<E: Exec>(
     exec: &E,
+    host: &Layout,
     owner: Owner,
     commit: &CommitId,
     source: &Source,
 ) -> Result<Plan, ReleaseError> {
     let dir = layout::release_dir(commit);
     let units = layout::release_file(commit, layout::RELEASE_UNITS);
-    let mut files = vec![(
-        layout::release_file(commit, layout::RELEASE_BINARY),
-        BINARY,
-        &source.binary,
-    )];
+    let mut files = Vec::new();
+    for (name, bytes) in &source.binaries {
+        files.push((layout::release_file(commit, name), BINARY, bytes));
+    }
     for (name, bytes) in &source.units {
         files.push((child(&units, name), UNIT, bytes));
     }
@@ -292,12 +380,19 @@ fn plan_copy<E: Exec>(
         Some(_) => return Err(ReleaseError::NotADirectory(dir)),
     }
     let mut planner = Planner::new(exec);
-    let mut dirs = vec![
-        path(layout::STATE_DIR),
+    let mut dirs = Vec::new();
+    // A fresh macOS has no `/usr/local`. An existing one is not touched: its owner and
+    // mode are the host's, and the trust check (crate::trust) refuses one others write to.
+    let usr_local = path(layout::USR_LOCAL);
+    if inspect(exec, &usr_local)?.is_none() {
+        dirs.push(usr_local);
+    }
+    dirs.extend([
+        host.state_dir(),
         path(layout::KBF_DIR),
         path(layout::RELEASES),
         dir,
-    ];
+    ]);
     if !source.units.is_empty() {
         dirs.push(units);
     }
@@ -328,27 +423,29 @@ fn verify(copied: Option<Entry>, path: HostPath, source: &[u8]) -> Result<(), Re
 /// `host rollback`: `current` back to the previous release; `previous` removed.
 pub fn rollback<E: Exec>(
     exec: &mut E,
-    root: &Root,
+    host: &Layout,
     mode: Mode,
     out: &mut dyn Write,
 ) -> Result<(), ReleaseError> {
-    let (lock, state) = begin(root, mode)?;
+    let (lock, state) = begin(host, mode)?;
     let Some(previous) = state.previous.clone() else {
         return Err(ReleaseError::NoPrevious);
     };
-    let bin = layout::release_file(&previous, layout::RELEASE_BINARY);
-    let there = matches!(
-        exec.stat(&bin),
-        Ok(Some(Meta {
-            kind: Kind::File,
-            ..
-        }))
-    );
+    // Any binary of a release will do: a Linux one holds `kbf`, a macOS one `kbf-daemon`.
+    let there = layout::RELEASE_BINARIES.iter().any(|name| {
+        matches!(
+            exec.stat(&layout::release_file(&previous, name)),
+            Ok(Some(Meta {
+                kind: Kind::File,
+                ..
+            }))
+        )
+    });
     if !there {
         return Err(ReleaseError::PreviousGone(previous));
     }
     // The state records no release before the previous one, so `previous` goes.
-    switch(exec, lock, &state, (previous, None), out)
+    switch(exec, host, lock, &state, (previous, None), out)
 }
 
 /// `host gc --keep N`: remove each release directory but the kept ones: the state's
@@ -357,13 +454,13 @@ pub fn rollback<E: Exec>(
 /// `releases/` that is not a directory named by a commit id is left alone.
 pub fn gc<E: Exec>(
     exec: &mut E,
-    root: &Root,
+    host: &Layout,
     keep: usize,
     mode: Mode,
     out: &mut dyn Write,
 ) -> Result<(), ReleaseError> {
     // Held through the removals, so an install cannot make a release current meanwhile.
-    let (_lock, state) = begin(root, mode)?;
+    let (_lock, state) = begin(host, mode)?;
     let mut kept: BTreeSet<CommitId> = [state.current, state.previous, state.staged]
         .into_iter()
         .flatten()
@@ -374,7 +471,7 @@ pub fn gc<E: Exec>(
         }
     }
     let mut old = Vec::new();
-    for (commit, modified) in releases(root, out)? {
+    for (commit, modified) in releases(host, out)? {
         if !kept.contains(&commit) {
             old.push((modified, commit));
         }
@@ -385,7 +482,7 @@ pub fn gc<E: Exec>(
     let mut paths = Vec::new();
     for commit in &gone {
         let dir = layout::release_dir(commit);
-        contents(root, &dir, &mut paths)?;
+        contents(host, &dir, &mut paths)?;
         paths.push(dir);
     }
     let mut planner = Planner::new(&*exec);
@@ -417,8 +514,11 @@ fn linked(target: &Path) -> Option<CommitId> {
 }
 
 /// Each directory in `releases/` named by a commit id, with its modification time.
-fn releases(root: &Root, out: &mut dyn Write) -> Result<Vec<(CommitId, SystemTime)>, ReleaseError> {
-    let dir = root.join(&path(layout::RELEASES));
+fn releases(
+    host: &Layout,
+    out: &mut dyn Write,
+) -> Result<Vec<(CommitId, SystemTime)>, ReleaseError> {
+    let dir = host.join(&path(layout::RELEASES));
     let items = match fs::read_dir(&dir) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
         listed => listed
@@ -447,8 +547,8 @@ fn releases(root: &Root, out: &mut dyn Write) -> Result<Vec<(CommitId, SystemTim
 
 /// Everything under `dir`, deepest first, so each removal finds its directory empty.
 /// Links are removed, never followed.
-fn contents(root: &Root, dir: &HostPath, paths: &mut Vec<HostPath>) -> Result<(), ReleaseError> {
-    let full = root.join(dir);
+fn contents(host: &Layout, dir: &HostPath, paths: &mut Vec<HostPath>) -> Result<(), ReleaseError> {
+    let full = host.join(dir);
     let items = fs::read_dir(&full)
         .and_then(Iterator::collect::<io::Result<Vec<_>>>)
         .map_err(read_failed(&full))?;
@@ -460,7 +560,7 @@ fn contents(root: &Root, dir: &HostPath, paths: &mut Vec<HostPath>) -> Result<()
             .map_err(read_failed(&item.path()))?
             .is_dir()
         {
-            contents(root, &p, paths)?;
+            contents(host, &p, paths)?;
         }
         paths.push(p);
     }

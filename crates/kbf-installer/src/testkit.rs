@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use kbf_host::path::Root;
 
 use crate::CommitId;
+use crate::layout::Layout;
 use crate::state::{PendingConfirm, State};
 
 pub const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -18,14 +19,14 @@ pub fn c(id: &str) -> CommitId {
     CommitId::new(id).expect("a test commit")
 }
 
-/// A scratch root with the directories a host has: `/run`, the state directory and
-/// `/usr/local/kbf`.
-pub fn host_root(name: &str) -> (Root, PathBuf) {
+/// A Linux host's layout on a scratch root with the directories a host has: `/run`, the
+/// state directory and `/usr/local/kbf`; and the root's path.
+pub fn host_root(name: &str) -> (Layout, PathBuf) {
     let dir = kbf_host::testkit::scratch(name);
     for sub in ["run", "var/lib/kbf-deploy", "usr/local/kbf"] {
         fs::create_dir_all(dir.join(sub)).expect("seed");
     }
-    (Root::new(&dir).expect("absolute"), dir)
+    (Layout::linux(Root::new(&dir).expect("absolute")), dir)
 }
 
 pub fn full_state() -> State {

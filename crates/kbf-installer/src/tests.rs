@@ -99,3 +99,74 @@ fn the_layout_names_every_path_under_its_directory() {
         std::path::PathBuf::from(format!("releases/{A}"))
     );
 }
+
+/// Catches the two platforms' paths mixed up: Linux keeps its state under
+/// `/var/lib/kbf-deploy` (live hosts use it: it is not renamed) with the lock at
+/// `/run/kbf-deploy.lock`; macOS uses `/var/db/kbf-deploy` and `/var/run/kbf-deploy.lock`;
+/// every path that does not differ is the same, the work directory is in the state
+/// directory, and the pins the verifier trusts are one directory on both.
+///
+/// Mutant seen red: the macOS lock path returning the Linux one.
+#[test]
+fn the_platforms_differ_in_the_state_directory_and_the_lock_only() {
+    use kbf_host::path::Root;
+    use layout::{Layout, Platform};
+    let linux = Layout::linux(Root::host());
+    let mac = Layout::new(Root::host(), Platform::MacOs);
+    assert_eq!(linux.platform(), Platform::Linux);
+    assert_eq!(linux.root(), &Root::host());
+    let paths = |l: &Layout| {
+        [
+            l.state_dir().to_string(),
+            l.state_file().to_string(),
+            l.lock().to_string(),
+            l.work_dir().to_string(),
+        ]
+    };
+    assert_eq!(
+        paths(&linux),
+        [
+            "/var/lib/kbf-deploy",
+            "/var/lib/kbf-deploy/state.json",
+            "/run/kbf-deploy.lock",
+            "/var/lib/kbf-deploy/work"
+        ]
+    );
+    assert_eq!(
+        paths(&mac),
+        [
+            "/var/db/kbf-deploy",
+            "/var/db/kbf-deploy/state.json",
+            "/var/run/kbf-deploy.lock",
+            "/var/db/kbf-deploy/work"
+        ]
+    );
+    assert_eq!(
+        linux.join(&layout::path(layout::CURRENT)),
+        std::path::PathBuf::from("/usr/local/kbf/current")
+    );
+    for p in [layout::GH, layout::TRUSTED_ROOT, layout::SETTINGS] {
+        assert!(p.starts_with("/usr/local/libexec/kbf-deploy/"), "{p}");
+    }
+    assert_eq!(layout::RELEASE_BINARIES, ["kbf", "kbf-daemon"]);
+}
+
+/// Catches the platform spelled differently on the command line than it prints, and an
+/// unknown name accepted.
+#[test]
+fn a_platform_is_named_linux_or_macos() {
+    use layout::Platform;
+    for p in [Platform::Linux, Platform::MacOs] {
+        assert_eq!(p.name().parse::<Platform>(), Ok(p));
+    }
+    assert_eq!(
+        "windows".parse::<Platform>(),
+        Err("\"windows\" is not a platform (linux or macos)".to_owned())
+    );
+    assert_eq!(Platform::named("macos"), Platform::MacOs);
+    assert_eq!(Platform::named("linux"), Platform::Linux);
+    assert_eq!(
+        Platform::current() == Platform::MacOs,
+        cfg!(target_os = "macos")
+    );
+}
