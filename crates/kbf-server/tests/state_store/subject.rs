@@ -130,6 +130,36 @@ fn a_crashed_operation_keeps_its_mnemonic_and_target() {
     assert_subject_named(&usage_lines(&successor));
 }
 
+/// Catches: an operation whose store has no subject row (written by a build from before
+/// the row existed) failing the takeover, or taking another operation's words: it is
+/// taken up and its usage line names the empty shape, not the described action.
+#[test]
+fn a_taken_over_operation_without_a_subject_row_logs_the_empty_shape() {
+    let mut disk = Disk::new();
+    let old = disk.generation_farm();
+    submit_described(&old);
+    disk.crash(old);
+    disk.store
+        .apply_batch(vec![
+            Txn::new().delete("subject/0000000000000001", kbf_state::Cond::Any),
+        ])
+        .expect("the row removed");
+    assert_eq!(disk.rows("subject/"), 0);
+    assert_eq!(disk.rows("op/"), 1);
+    let successor = disk.generation_farm();
+    let lines = usage_lines(&successor);
+    let [line] = lines.as_slice() else {
+        panic!("one usage line expected: {lines:?}");
+    };
+    assert!(
+        line.split(' ').any(|w| w == "mnemonic=-"),
+        "no mnemonic expected in {line}"
+    );
+    for word in ["CxxCompile", "root//pkg:t", "0123456789abcdef"] {
+        assert!(!line.contains(word), "{word} in {line}");
+    }
+}
+
 /// Catches: a subject row left behind when the operation ends, which would grow with
 /// every submission. One row while the operation is unfinished; none once it finishes.
 #[tokio::test(start_paused = true)]

@@ -968,12 +968,20 @@ fn a_subject_row_that_is_not_one_is_refused() {
     presence[47] = 7;
     let mut utf8 = row.clone();
     utf8[10 + 4] = 0xff;
+    // The configuration hash's presence byte (9) and the mnemonic's, after the target:
+    // version 1, key 8, cfg 38, target presence 1, kind 1, label 4 + 11 bytes.
+    let mut cfg_presence = row.clone();
+    cfg_presence[9] = 7;
+    let mut label_presence = row.clone();
+    label_presence[49 + 4 + 11] = 7;
     for (bad, why) in [
         (other, "not a version 1 subject"),
         (longer, "bytes after the label"),
         (kind, "not a kind of target"),
         (presence, "not a presence byte"),
         (utf8, "a text is not UTF-8"),
+        (cfg_presence, "not a presence byte"),
+        (label_presence, "not a presence byte"),
     ] {
         assert_eq!(subject::decode(&bad), Err(why));
     }
