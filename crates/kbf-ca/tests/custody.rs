@@ -118,6 +118,19 @@ fn init_overwrites_nothing_and_refuses_an_open_directory() {
     assert_eq!(key_fault(result), KeyFileFault::Io(ErrorKind::NotFound));
 }
 
+// Catches: a create_in that does not leave a loadable key: the key it returns is the key it
+// stored, in a closed file in a closed directory.
+#[test]
+fn create_in_stores_the_key_it_returns() {
+    let dir = scratch("create-in").join("ca");
+    let signer = FileSigner::create_in(&dir).expect("created");
+    assert_eq!(mode(&dir), 0o700);
+    assert_eq!(mode(&dir.join("ca.key")), 0o600);
+    let loaded = FileSigner::load(&dir).expect("loaded");
+    assert_eq!(loaded.public_key(), signer.public_key());
+    assert_eq!(loaded.to_pem(), signer.to_pem());
+}
+
 // Catches: following a symbolic link planted where the key goes: the write would land in
 // the link's target (a file the attacker chose), and the key would be readable there.
 #[test]

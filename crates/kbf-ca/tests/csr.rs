@@ -412,6 +412,10 @@ fn bytes_that_are_not_a_request_are_refused_never_a_panic() {
         ("algorithm not a sequence", hand(&|h| h.sig_alg_tag = 0x31)),
         ("signature not a bit string", hand(&|h| h.sig_tag = 0x04)),
         ("signature with unused bits", hand(&|h| h.sig_unused = 1)),
+        (
+            "something after the signature",
+            hand(&|h| h.after_sig = vec![0x05, 0x00]),
+        ),
     ];
     for (what, der) in cases {
         assert_eq!(parse_csr(&der), Err(CsrError::Parse), "{what}");

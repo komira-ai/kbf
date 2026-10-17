@@ -270,6 +270,7 @@ pub struct Hand {
     pub sig_alg_tag: u8,
     pub sig_tag: u8,
     pub sig_unused: u8,
+    pub after_sig: Vec<u8>,
 }
 
 impl Hand {
@@ -291,6 +292,7 @@ impl Hand {
             sig_alg_tag: 0x30,
             sig_tag: 0x03,
             sig_unused: 0,
+            after_sig: Vec::new(),
         }
     }
 
@@ -329,6 +331,7 @@ impl Hand {
                 &cri,
                 &tlv(self.sig_alg_tag, &self.sig_alg),
                 &tlv(self.sig_tag, &bits),
+                &self.after_sig,
             ]),
         )
     }
