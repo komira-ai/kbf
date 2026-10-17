@@ -19,8 +19,8 @@ use kbf_server::{EpochPolicy, Farm, Listeners, ServeError, StateError, StateStor
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::sqlite::{Options, SqliteStore};
 use kbf_state::{
-    Changes, Commit, CommitStats, Conflict, ManualClock, Revision, Store, StoreError, StoreTime,
-    Txn, Versioned,
+    Changes, Commit, CommitStats, Conflict, ManualClock, Revision, ScanPage, ScanRange, Store,
+    StoreError, StoreTime, Txn, Versioned,
 };
 use kbf_types::{ActionKey, Digest, DigestFunction, LeaseId, LeaseKind, Qos, Resources, WorkerId};
 use tokio::sync::mpsc;
@@ -183,6 +183,10 @@ impl Store for Flaky {
 
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
         self.inner.store().scan_prefix(prefix)
+    }
+
+    fn scan_range(&self, scan: ScanRange<'_>) -> Result<ScanPage, StoreError> {
+        self.inner.store().scan_range(scan)
     }
 
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {
@@ -972,6 +976,7 @@ fn listeners() -> Listeners {
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     }
 }
 

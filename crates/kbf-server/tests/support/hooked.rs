@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{
-    Changes, Commit, CommitStats, Conflict, ManualClock, Op, Revision, Store, StoreError,
-    StoreTime, Txn, Versioned,
+    Changes, Commit, CommitStats, Conflict, ManualClock, Op, Revision, ScanPage, ScanRange, Store,
+    StoreError, StoreTime, Txn, Versioned,
 };
 
 type Hook = Box<dyn FnOnce() + Send>;
@@ -140,6 +140,12 @@ impl Store for Hooked {
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
         let answer = self.fake.scan_prefix(prefix)?;
         self.fire(prefix);
+        Ok(answer)
+    }
+
+    fn scan_range(&self, scan: ScanRange<'_>) -> Result<ScanPage, StoreError> {
+        let answer = self.fake.scan_range(scan)?;
+        self.fire(scan.prefix);
         Ok(answer)
     }
 

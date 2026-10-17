@@ -5,7 +5,7 @@
 
 use kbf_state::conformance::{
     c1_linearizable_cas, c2_atomic_txn, c3_monotonic_counter, c4_store_clock_expiry,
-    c5_ordered_feed, c6_durable_ack, c7_group_commit, run_all,
+    c5_ordered_feed, c6_durable_ack, c7_group_commit, c8_bounded_range_scan, run_all,
 };
 use kbf_state::fake::{FakeBackend, Flaw};
 
@@ -62,6 +62,106 @@ fn ack_before_sync_fails_c6() {
 #[should_panic(expected = "C7 latency")]
 fn ungrouped_writes_fail_c7() {
     c7_group_commit(&FakeBackend::new(Flaw::Ungrouped));
+}
+
+// Catches a range scan that returns every key of its range, past its limit.
+#[test]
+#[should_panic(expected = "C8 limit")]
+fn a_scan_that_ignores_its_limit_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanIgnoresLimit));
+}
+
+// Catches a range scan that begins at the prefix whatever lower bound it is given.
+#[test]
+#[should_panic(expected = "C8 lower")]
+fn a_scan_that_ignores_its_lower_bound_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanIgnoresLower));
+}
+
+// Catches a resume token that resumes at the last key of its page instead of after it,
+// so the key is returned twice.
+#[test]
+#[should_panic(expected = "C8 resume")]
+fn a_scan_that_resumes_at_its_token_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanResumesAtToken));
+}
+
+// Catches a range scan that runs past the last key under its prefix.
+#[test]
+#[should_panic(expected = "C8 prefix")]
+fn a_scan_past_its_prefix_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanPastPrefix));
+}
+
+// Catches a forward scan that runs on past its upper bound.
+#[test]
+#[should_panic(expected = "C8 upper: an included upper key is the last row")]
+fn a_scan_that_ignores_its_upper_bound_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanIgnoresUpper));
+}
+
+// Catches a forward scan that returns the key of an excluded upper bound.
+#[test]
+#[should_panic(expected = "C8 upper: an excluded upper key is not returned")]
+fn a_scan_that_includes_an_excluded_upper_key_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanIncludesExcludedUpper));
+}
+
+// Catches a reverse scan built as the forward page reversed: the first keys of the
+// range, not the last (`ORDER BY key LIMIT n` then reversing the rows).
+#[test]
+#[should_panic(expected = "C8 reverse: a reverse page holds the last keys")]
+fn a_reverse_scan_of_the_forward_page_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanReversesForwardPage));
+}
+
+// Catches a reverse scan whose token resumes at the last key of its page, so the key is
+// returned twice.
+#[test]
+#[should_panic(expected = "C8 reverse resume")]
+fn a_reverse_scan_that_resumes_at_its_token_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanReverseResumesAtToken));
+}
+
+// Catches a backend that applies its limit before its expiry filter (a natural SQL
+// mistake): the expired `c8/bb` takes a row's place, so the page is short and has lost
+// its token.
+#[test]
+#[should_panic(expected = "C8 expiry")]
+fn a_scan_that_counts_expired_keys_toward_its_limit_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanCountsExpired));
+}
+
+// Catches a last page that still carries a token, so a caller fetches an empty page and
+// a UI shows a "next" link to nothing.
+#[test]
+#[should_panic(expected = "C8 resume: a page that reached the end of the range has no token")]
+fn a_scan_with_a_token_on_its_last_page_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanTokenOnLastPage));
+}
+
+// Catches a resumed page served from the first page's snapshot: a key committed ahead
+// of the token after the first page is missing.
+#[test]
+#[should_panic(expected = "C8 concurrent keys")]
+fn a_scan_that_skips_keys_committed_ahead_of_its_token_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanSkipsAhead));
+}
+
+// Catches a resumed page that shows a key's value from the first page's time, not its
+// own.
+#[test]
+#[should_panic(expected = "C8 concurrent value")]
+fn a_scan_that_shows_stale_values_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanStaleValues));
+}
+
+// Catches a page whose rows are read one at a time, so a commit between two of them
+// splits the page across commits; the store's contract is one snapshot per page.
+#[test]
+#[should_panic(expected = "C8 page snapshot")]
+fn a_scan_that_reads_each_row_on_its_own_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanReadsPerRow));
 }
 
 // The two error types say what failed.
