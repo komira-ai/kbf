@@ -21,7 +21,7 @@ kbf-segments.workspace = true
 kbf-storage.workspace = true
 kbf-types.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 tonic = { workspace = true, features = ["tls-ring"] }
 
 [dev-dependencies]

@@ -72,6 +72,7 @@ pub mod farm;
 mod fault;
 mod flag_set;
 pub mod fleet;
+pub mod front_maps;
 pub mod frontend;
 pub mod grpc_health;
 pub mod handover;
@@ -115,6 +116,7 @@ pub use farm::{DONE_FLOOR, EpochPolicy, Farm, SESSION_RENEWAL, StateError};
 pub use health::Readiness;
 pub use identity::{DenyList, DenyListError, Peers};
 pub use kbf_sched::MemoryLadder;
+pub use kbf_tls::{TlsError, TlsFiles, TlsSource};
 pub use local::LocalStore;
 pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use serve::{

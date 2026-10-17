@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt as _};
 use kbf_map::{Map, Member, MemberId, MemberState, Rule};
-use kbf_meta::{ActionRecord, Role};
+use kbf_meta::{ActionRecord, ActionWriteError, Role};
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::segments_server::Segments;
 use kbf_proto::worker::{
@@ -141,6 +141,9 @@ pub struct Node {
     pub action_gets: AtomicUsize,
     /// What `put` answers instead of the digest, if set.
     put_answer: Mutex<Option<Digest>>,
+    /// A commit is refused as `Absent` unless the node holds the entry's result blob and
+    /// closure, as a storage node does.
+    pub check_closure: AtomicBool,
 }
 
 impl Node {
@@ -160,6 +163,7 @@ impl Node {
             commits: Mutex::default(),
             action_gets: AtomicUsize::new(0),
             put_answer: Mutex::default(),
+            check_closure: AtomicBool::new(false),
         })
     }
 
@@ -170,6 +174,11 @@ impl Node {
             .expect("lock")
             .insert(digest, Bytes::copy_from_slice(bytes));
         digest
+    }
+
+    /// The bytes held under `digest`, if any.
+    pub fn blob(&self, digest: &Digest) -> Option<Bytes> {
+        self.blobs.lock().expect("lock").get(digest).cloned()
     }
 
     /// Holds `bytes` under `digest`, whatever they hash to.
@@ -234,6 +243,11 @@ impl Node {
         self.down.store(down, Ordering::SeqCst);
     }
 
+    /// Makes a commit check the entry's blobs against the node's own, as storage does.
+    pub fn check_closure(&self) {
+        self.check_closure.store(true, Ordering::SeqCst);
+    }
+
     pub fn answer_puts_with(&self, digest: Digest) {
         *self.put_answer.lock().expect("lock") = Some(digest);
     }
@@ -291,7 +305,7 @@ impl Storage for Node {
             let blobs = self.blobs.lock().expect("lock");
             Ok(digests
                 .iter()
-                .filter(|d| !blobs.contains_key(d))
+                .filter(|d| d.size_bytes != 0 && !blobs.contains_key(d))
                 .copied()
                 .collect())
         })
@@ -398,6 +412,17 @@ impl Storage for Node {
     ) -> Answer<'_, ()> {
         Box::pin(async move {
             self.check()?;
+            if self.check_closure.load(Ordering::SeqCst) {
+                let blobs = self.blobs.lock().expect("lock");
+                let lacking: Vec<Digest> = std::iter::once(&record.result)
+                    .chain(record.closure.iter())
+                    .filter(|d| !blobs.contains_key(d))
+                    .copied()
+                    .collect();
+                if !lacking.is_empty() {
+                    return Err(StorageError::ActionWrite(ActionWriteError::Absent(lacking)));
+                }
+            }
             self.commits.lock().expect("lock").push(action);
             self.hold_action(action, record.result);
             Ok(())

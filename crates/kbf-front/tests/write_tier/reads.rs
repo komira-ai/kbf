@@ -40,6 +40,40 @@ async fn a_flushed_copy_damaged_past_its_first_window_fails_the_read_unmarked() 
     assert_eq!(farm.log.unreachable(at.object), None);
 }
 
+/// Catches a whole-blob read over a write tier that keeps one window or joins the
+/// windows out of order: a 12 MiB blob staged and not yet flushed is a window of 8 MiB
+/// and one of 4 MiB, and `read_blob` returns all of it, in order. Mutant: `gather`
+/// answering its first window (an 8 MiB blob).
+#[tokio::test]
+async fn a_whole_read_of_a_staged_blob_over_one_window_joins_the_windows() {
+    let farm = Farm::new(Capabilities::default());
+    let cache = farm.start(GIB).await;
+    let b = TestBlob::new(44, 12 << 20);
+    cache.store_blobs(vec![b.verified()]).await.expect("stored");
+    assert_eq!(cache.read_blob(&b.digest).await.expect("read"), b.bytes);
+}
+
+/// Catches a whole-blob read (`Cache::read_blob`) that hands over the first window of
+/// a blob whose later window fails, as if it were the whole (a decoder would then take a
+/// truncated Directory for a sound one): a flushed 12 MiB copy damaged in its second
+/// window fails the read UNAVAILABLE, with no bytes, and marks nothing. Mutant: `gather`
+/// ignoring a failed later window.
+#[tokio::test]
+async fn a_whole_read_whose_second_window_fails_is_unavailable() {
+    let farm = Farm::new(Capabilities::default());
+    let cache = farm.start(GIB).await;
+    let b = TestBlob::new(45, 12 << 20);
+    cache.store_blobs(vec![b.verified()]).await.expect("stored");
+    let (at, _) = farm.log.located(&b.digest);
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed, [at.object], "{round:?}");
+    let damaged = usize::try_from(at.offset).expect("offset") + (10 << 20);
+    farm.fs.flip(&seg_name(at.object), damaged);
+    let read = cache.read_blob(&b.digest).await;
+    assert!(matches!(read, Err(CacheError::Unreachable(_))), "{read:?}");
+    assert_eq!(farm.log.unreachable(at.object), None);
+}
+
 /// Catches a damaged flushed copy that fails a read the store can answer, or marks the
 /// object: a blob of one window whose local copy is damaged is read again from the
 /// store, whole and right, and nothing is marked.

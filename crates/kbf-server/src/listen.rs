@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 
 use futures::Stream;
+use kbf_tls::{Incoming, TlsSource};
 use tonic::transport::server::TcpIncoming;
 
 use crate::serve::ServeError;
@@ -73,16 +74,18 @@ impl Socket {
     }
 
     /// The listener for a gRPC server, and the latch that closes it: connections it
-    /// accepts have Nagle's algorithm off (see [`crate::serve::bind`]).
+    /// accepts have Nagle's algorithm off (see [`crate::serve::bind`]), and are served
+    /// over TLS when `tls` is given ([`Incoming`]: it must be called inside a Tokio
+    /// runtime).
     ///
     /// # Errors
     /// The runtime cannot register the socket.
-    pub fn grpc(self) -> Result<(Stoppable, Latch), ServeError> {
+    pub fn grpc(self, tls: Option<TlsSource>) -> Result<(Stoppable, Latch), ServeError> {
         let registered = tokio::net::TcpListener::from_std(self.listener);
         let listener = registered.map_err(bind_error(self.local))?;
         let incoming = TcpIncoming::from(listener).with_nodelay(Some(true));
         let open = Arc::new(Mutex::new(Open {
-            incoming: Some(incoming),
+            incoming: Some(Incoming::new(incoming, tls)),
             waker: None,
         }));
         Ok((Stoppable(Arc::clone(&open)), Latch(open)))
@@ -106,7 +109,7 @@ fn bind_error(addr: SocketAddr) -> impl FnOnce(io::Error) -> ServeError {
 /// What a gRPC listener holds: the socket, until it is closed, and the waker of the task
 /// waiting to accept on it.
 struct Open {
-    incoming: Option<TcpIncoming>,
+    incoming: Option<Incoming>,
     waker: Option<Waker>,
 }
 
@@ -119,7 +122,7 @@ struct Open {
 pub(crate) struct Stoppable(Arc<Mutex<Open>>);
 
 impl Stream for Stoppable {
-    type Item = <TcpIncoming as Stream>::Item;
+    type Item = <Incoming as Stream>::Item;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut open = self.0.lock().unwrap_or_else(PoisonError::into_inner);
