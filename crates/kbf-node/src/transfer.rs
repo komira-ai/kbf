@@ -243,6 +243,8 @@ mod tests {
                 format!("--key={}", at("node.key")),
                 "--node-id=n1".to_owned(),
                 "--driver=native".to_owned(),
+                format!("--data-dir={}", dir.display()),
+                format!("--xcode-apps={}", dir.join("Applications").display()),
             ])
             .expect("flags")
         };
@@ -259,12 +261,24 @@ mod tests {
             .expect("the storage half starts");
         let local =
             kbf_daemon::LocalMember::new(half.addr.to_string(), half.in_process(), half.maps());
-        let maps = Arc::new(kbf_daemon::MapHolder::new());
-        super::super::member(&cli(&at("ca.pem")), &maps, &local).expect("the member plane");
-        let why = super::super::member(&cli(&at("no-such-ca.pem")), &maps, &local)
-            .err()
-            .expect("no CA file")
-            .to_string();
+        // `start_member` builds the plane when the native driver is set up, on a thread of
+        // its own: dropping the daemon's runtime in the test's would panic.
+        let start = |ca: String, local: kbf_daemon::LocalMember| {
+            let cli = cli(&ca);
+            tokio::task::spawn_blocking(move || {
+                super::super::start_member(&cli, local)
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            })
+        };
+        start(at("ca.pem"), local.clone())
+            .await
+            .expect("joined")
+            .expect("the member plane");
+        let why = start(at("no-such-ca.pem"), local)
+            .await
+            .expect("joined")
+            .expect_err("no CA file");
         assert!(why.contains("no-such-ca.pem"), "{why}");
     }
 }
