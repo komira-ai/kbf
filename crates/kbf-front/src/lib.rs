@@ -59,6 +59,7 @@ mod cas;
 mod cpu;
 mod described;
 mod execution;
+mod finished_row;
 mod input_tree;
 mod meta_log;
 pub mod metrics;

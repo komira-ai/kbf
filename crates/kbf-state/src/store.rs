@@ -80,6 +80,20 @@ pub trait Store: Send + Sync {
     /// The store's clock reading, the one expiry is judged by.
     fn now(&self) -> StoreTime;
 
+    /// Gives up the writer role while keeping the store readable: the writer stops after
+    /// the calls already queued, whatever else holds the right to write (SQLite's file
+    /// lock) is released, and every later write returns [`StoreError::Fenced`]. Reads
+    /// keep working, so a process that hands the store to its successor can still
+    /// follow the change feed. Calling it again is harmless.
+    ///
+    /// # Errors
+    /// [`StoreError`] when the backend has no writer role to give up (the default).
+    fn demote(&self) -> Result<(), StoreError> {
+        Err(StoreError::Failed(
+            "this backend cannot give up its writer role".to_owned(),
+        ))
+    }
+
     /// Applies one transaction: a batch of one.
     ///
     /// # Errors

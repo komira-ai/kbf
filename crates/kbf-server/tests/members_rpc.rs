@@ -254,3 +254,38 @@ async fn the_sweeper_expires_members_by_itself() {
     }
     panic!("the sweeper never marked the silent member Down");
 }
+
+/// Catches: expired rows nobody frees (session rows, the results of finished operations
+/// and every other time-to-live key sit in the file for good): the timer, with no caller,
+/// removes a row whose time ran out, as an `Expire` row in the change feed, and a reap
+/// that fails once is tried again at the next beat.
+#[tokio::test]
+async fn the_sweeper_frees_expired_rows() {
+    let store = Hooked::new();
+    let (members, _client) = serve(&store).await;
+    let put = Txn::new().put_ttl("done/0001", "x", 30 * MS, Cond::Any);
+    store.txn(put).expect("store").expect("put");
+    store.clock.advance(31 * MS);
+    store
+        .fail_reaps
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let sweeper = tokio::spawn(sweep(Arc::clone(&members)));
+    for _ in 0..500 {
+        let feed = store.changes(kbf_state::Revision::ZERO, 100).expect("feed");
+        if feed
+            .rows
+            .iter()
+            .any(|row| row.key == "done/0001" && row.event == kbf_state::Event::Expire)
+        {
+            sweeper.abort();
+            assert_eq!(
+                store.fail_reaps.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the failing reap was spent before the one that freed the row"
+            );
+            return;
+        }
+        tokio::time::sleep(10 * MS).await;
+    }
+    panic!("the sweeper never freed the expired row");
+}

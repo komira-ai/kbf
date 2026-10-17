@@ -505,6 +505,16 @@ impl Members {
         Ok(map)
     }
 
+    /// Frees the rows the store's clock has expired (member, dwell and session rows
+    /// among them) and returns how many. Reads hide an expired row whether or not this
+    /// has run; it only keeps the file from growing.
+    ///
+    /// # Errors
+    /// The store failing.
+    pub fn reap(&self) -> Result<usize, MembershipError> {
+        Ok(self.store.reap_expired()?)
+    }
+
     /// Brings the map up to date with the rows: members that expired go `Down`, `Down`
     /// members whose dwell ran out leave, new and changed rows enter. Returns the map
     /// after, and bumps the generation by one compare-and-set only if something changed.

@@ -17,8 +17,13 @@
 //!   is written at the grant and at the end, never to renew it);
 //! - `loss/<operation>`: how many of the operation's leases were lost, while it is
 //!   unfinished and has lost any ([`kbf_sched::LOSS_REQUEUES`] refuses it);
+//! - `done/<operation>`: how a finished or refused operation ended, kept for the finished
+//!   retention (at least [`DONE_FLOOR`]) so a process that did not finish it can still
+//!   answer the callers of it: a tag byte and the `ExecuteResponse` ([`kbf_front::Finished`]);
 //! - `meta/epoch`, `meta/next_op`, `meta/next_seq`: the store incarnation and the first
-//!   operation id and lease sequence no earlier start used.
+//!   operation id and lease sequence no earlier start used;
+//! - `meta/generation`: the writer generation ([`kbf_state::Fenced`]); every write of the
+//!   scheduler is checked against it, and operation names carry it.
 //!
 //! Values are the `kbf-log` encoding of the scheduler's own inputs (a `Submit`, the
 //! `Committed` lease, a `WorkerUp`), so the strict codec the replicated log already runs
@@ -28,11 +33,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kbf_front::{Described, Stage};
+use kbf_front::{Described, Finished, Stage};
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
 use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{DaemonInstance, Recovered, RecoveredLease, Request, Requeue};
-use kbf_state::{Cond, Conflict, Store, StoreError, Txn, Versioned};
+use kbf_state::{Cond, Conflict, GENERATION, Store, StoreError, Txn, Versioned};
 use kbf_types::{
     ControlRecord, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, StartLease, WaiterId,
     WorkerId,
@@ -54,6 +59,11 @@ const EPOCH: &str = "meta/epoch";
 const ALIVE: &str = "meta/alive";
 const NEXT_OP: &str = "meta/next_op";
 const NEXT_SEQ: &str = "meta/next_seq";
+
+/// The least time a `done/` row is kept, whatever the finished retention: a process that
+/// follows an operation it did not finish needs the row for as long as a stream it kept
+/// open can take to notice it.
+pub const DONE_FLOOR: Duration = Duration::from_secs(600);
 
 /// What a start does with the store's epoch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,6 +171,10 @@ fn queue_key(operation: OperationId) -> String {
 
 fn loss_key(operation: OperationId) -> String {
     format!("loss/{:016x}", operation.0)
+}
+
+fn done_key(operation: OperationId) -> String {
+    format!("done/{:016x}", operation.0)
 }
 
 fn lease_key(lease: LeaseId) -> String {
@@ -420,6 +434,35 @@ impl Durable {
         self.commit(renewed)
     }
 
+    /// The writer generation the store holds, if it has one (a store opened by
+    /// [`crate::StateStoreUri::open`] always does).
+    fn generation(&self) -> Result<Option<u64>, StateError> {
+        let row = self.store.get(GENERATION)?;
+        row.map(|row| number(GENERATION, &row)).transpose()
+    }
+
+    /// How `operation` ended, kept for `retention` (never less than [`DONE_FLOOR`]).
+    pub(super) fn done(
+        &self,
+        operation: OperationId,
+        finished: &Finished,
+        retention: Duration,
+    ) -> Result<(), StateError> {
+        let ttl = retention.max(DONE_FLOOR);
+        self.commit(Txn::new().put_ttl(done_key(operation), finished.to_row(), ttl, Cond::Any))
+    }
+
+    /// How `operation` ended, if its `done/` row is still there.
+    fn ended(&self, operation: OperationId) -> Result<Option<Finished>, StateError> {
+        let key = done_key(operation);
+        let Some(row) = self.store.get(&key)? else {
+            return Ok(None);
+        };
+        Finished::from_row(&row.value)
+            .map(Some)
+            .map_err(|why| corrupt(&key, &why))
+    }
+
     /// A write that tells whether the store takes writes again.
     pub(super) fn ping(&self) -> Result<(), StateError> {
         self.commit(Txn::new().put(ALIVE, Vec::new(), Cond::Any))
@@ -446,6 +489,23 @@ impl Farm {
         self.term = epoch.unwrap_or(self.term);
         self.lease_epoch = epoch.unwrap_or(self.lease_epoch);
         Ok(self)
+    }
+}
+
+impl Farm {
+    /// How `operation` ended, as the state store keeps it: `None` if the farm has no
+    /// state store, or the operation has no `done/` row (it has not finished, or its row
+    /// outlived the finished retention and the floor). The row is the answer a process
+    /// that did not finish the operation gives the callers it kept waiting.
+    ///
+    /// # Errors
+    /// The store cannot be read, or the row is not a result.
+    pub fn ended(&self, operation: OperationId) -> Result<Option<Finished>, StateError> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state
+            .durable
+            .as_ref()
+            .map_or(Ok(None), |d| d.ended(operation))
     }
 }
 
@@ -545,7 +605,10 @@ impl State {
         };
         let (durable, epoch) = Durable::open(store, epoch, process_term())?;
         let stored = durable.load()?;
-        self.machine = FarmMachine::new(epoch);
+        // Operation names carry the writer generation, not the epoch: a kept epoch must
+        // not let a process name an operation another one named (issue #154). A store
+        // handed in without a fence has no generation, and the epoch names as it did.
+        self.machine = FarmMachine::new(durable.generation()?.unwrap_or(epoch));
         let now = SystemTime::now();
         let mut recovered = Vec::new();
         for op in stored.operations {
