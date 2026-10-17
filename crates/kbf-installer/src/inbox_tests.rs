@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::PathBuf;
 
@@ -52,14 +53,10 @@ fn a_file_the_stage_must_not_read_is_refused_by_its_kind() {
         symlink(dir.join("secret"), e.join("link")).expect("link");
         symlink("../secret", e.join("relative-link")).expect("link");
         let fifo = e.join("fifo");
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &fifo,
-            rustix::fs::FileType::Fifo,
-            Mode::from_raw_mode(0o600),
-            0,
-        )
-        .expect("a fifo");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("no NUL");
+        // SAFETY: mkfifo reads the NUL-terminated path and keeps nothing. (Not rustix's
+        // `mknodat`, which macOS does not have.)
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0, "a fifo");
         fs::create_dir(e.join("subdir")).expect("dir");
         fs::write(dir.join("other-name"), b"two names").expect("seed");
         fs::hard_link(dir.join("other-name"), e.join("hard")).expect("hard link");
