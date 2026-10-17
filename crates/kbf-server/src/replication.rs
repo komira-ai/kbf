@@ -96,10 +96,7 @@ pub(crate) fn replicate(
 ) -> Result<Replicated, ReplicationError> {
     let source: Arc<dyn MapSource> = Arc::clone(node) as Arc<dyn MapSource>;
     let Some(tls) = peer_tls else {
-        tracing::warn!(
-            "this node is one of several and admits callers in plain text: it judges calls by \
-             the map and copies no blob to a second owner"
-        );
+        tracing::warn!("plain text: this node judges calls by the map and copies no blob");
         return Ok(Replicated {
             service: service.with_map(source),
             worker: None,
