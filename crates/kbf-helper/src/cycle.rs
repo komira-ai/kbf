@@ -92,11 +92,6 @@ impl<E: Exec> Helper<E> {
         &mut self.exec
     }
 
-    /// What the installer verbs printed so far.
-    pub fn log(&self) -> String {
-        String::from_utf8_lossy(&self.log).into_owned()
-    }
-
     fn dir(&self, sub: &str) -> std::path::PathBuf {
         let name = format!("{}/{sub}", self.cfg.update_dir.as_str());
         self.host
@@ -160,9 +155,7 @@ impl<E: Exec> Helper<E> {
         if !memory.restart_due {
             return Ok(());
         }
-        if let Some(step) = self.cfg.restart.step()
-            && let Err(e) = self.exec.apply(&step)
-        {
+        if let Err(e) = self.exec.apply(&self.cfg.restart.step()) {
             refuse(memory, &format!("the restart failed: {e}"));
             return self.save(memory);
         }
@@ -185,7 +178,9 @@ impl<E: Exec> Helper<E> {
             self.save(memory)?;
         }
         let result = activate::expire(&mut self.exec, &self.host, now, &mut self.log);
-        memory.restart_due = prior || self.moved(&before)?;
+        let moved = self.moved(&before)?;
+        // `|`, not `||`: no short-circuit for a test to have to reach.
+        memory.restart_due = prior | moved;
         match result {
             Ok(Expiry::Reverted(r)) => {
                 memory.event = Event::Reverted;
@@ -233,7 +228,7 @@ impl<E: Exec> Helper<E> {
             .ok()
             .flatten()
             .is_some();
-        if installed || state.current.as_ref() == Some(&commit) {
+        if installed | (state.current.as_ref() == Some(&commit)) {
             memory.handled_entry = name;
             return self.save(memory);
         }
@@ -329,11 +324,11 @@ impl<E: Exec> Helper<E> {
             Ok(done) => {
                 memory.event = done.event;
                 memory.refusal = done.note;
-                memory.restart_due = prior || done.restart || moved;
+                memory.restart_due = prior | done.restart | moved;
             }
             Err(why) => {
                 refuse(memory, &why);
-                memory.restart_due = prior || moved;
+                memory.restart_due = prior | moved;
             }
         }
         Ok(())
@@ -459,7 +454,7 @@ fn short(c: &Option<CommitId>) -> String {
 /// The commit an inbox entry directory is for: `<generation:020>-<commit>`.
 fn offer_of(name: &str) -> Option<(String, CommitId)> {
     let (generation, commit) = name.split_once('-')?;
-    if generation.len() != 20 || !generation.bytes().all(|b| b.is_ascii_digit()) {
+    if (generation.len() != 20) | !generation.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     Some((name.to_owned(), CommitId::new(commit).ok()?))
