@@ -17,8 +17,8 @@ use tonic::{Code, Request, Status};
 
 use super::farm::Farm;
 use crate::replicate::{ChainConfig, LEG_HEADER};
-use crate::service::MAP_GENERATION_HEADER;
 use crate::service::tests::fake::{StreamFault, patterned, sha};
+use crate::service::{MAP_GENERATION_HEADER, RemoteStorage};
 use crate::{Storage, StorageError};
 
 pub(super) const MIB: usize = 1 << 20;
@@ -366,6 +366,39 @@ async fn an_unowned_copy_is_stored_on_a_node_that_owns_nothing() {
         .expect("the primary takes it");
     assert!(held(&farm, 0, &other_digest) && held(&farm, 1, &other_digest));
     assert!(!held(&farm, 2, &other_digest));
+}
+
+/// Catches an unowned-copy marker honoured from any caller: it skips the chain (no forward,
+/// no repair debt), so only the frontend's identity may send it. A daemon or a storage node
+/// that sends the header gets the plain-write rule (INVALID_ARGUMENT, not the primary) and
+/// nothing is stored; a frontend's is stored as one copy. Mutant: the node honouring the
+/// header whatever the certificate names.
+#[tokio::test]
+async fn an_unowned_copy_is_honoured_only_for_the_frontends_identity() {
+    let farm = Farm::start(3, ChainConfig::default()).await;
+    let map = farm.map(1, 2, &[]);
+    farm.publish(&map);
+    let bytes = farm.blob(&map, 0, 1, 64, 8);
+    let digest = sha(&bytes);
+
+    for role in ["daemon", "storage"] {
+        let refused = RemoteStorage::new(farm.channel_role(2, role), 1)
+            .put_unowned(Bytes::from(bytes.clone()))
+            .await;
+        assert!(
+            matches!(&refused, Err(StorageError::Invalid(m)) if m.contains("not the primary")),
+            "{role}: {refused:?}"
+        );
+        assert!(!held(&farm, 2, &digest), "{role}");
+    }
+
+    let stored = RemoteStorage::new(farm.channel_role(2, "frontend"), 1)
+        .put_unowned(Bytes::from(bytes))
+        .await
+        .expect("the frontend's copy is taken");
+    assert_eq!(stored, digest);
+    assert!(held(&farm, 2, &digest));
+    assert!(!held(&farm, 0, &digest) && !held(&farm, 1, &digest));
 }
 
 /// Catches a write taken by the wrong node: a client write to the replica (not the

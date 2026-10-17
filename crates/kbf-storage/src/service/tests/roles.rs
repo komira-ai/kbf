@@ -135,6 +135,26 @@ fn a_certificate_must_name_exactly_one_known_role() {
     }
 }
 
+/// Catches the unowned-copy marker honoured from a role other than the frontend: under
+/// mutual TLS only a certificate naming `frontend` may send it (every other role, no
+/// certificate and a certificate with no role may not); plain text has no identity and
+/// admits it as it admits every call but a copy.
+#[test]
+fn only_the_frontend_may_ask_for_an_unowned_copy() {
+    for role in PeerRole::ALL {
+        let leaf = der(vec![uri(role.name())]);
+        assert_eq!(
+            Admission::Certified.permits_unowned_leaf(Some(&leaf)),
+            role == PeerRole::Frontend,
+            "{role:?}"
+        );
+    }
+    assert!(!Admission::Certified.permits_unowned_leaf(None));
+    assert!(!Admission::Certified.permits_unowned_leaf(Some(b"not DER")));
+    assert!(!Admission::Certified.permits_unowned_leaf(Some(&der(vec![]))));
+    assert!(Admission::Open.permits_unowned_leaf(None));
+}
+
 /// A CA, the server's certificate, and client certificates by role.
 pub(crate) struct Pki {
     ca: CertifiedIssuer<'static, KeyPair>,

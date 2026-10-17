@@ -79,6 +79,9 @@ impl Router {
     /// through [`Storage::put_unowned`]: a node that serves a chain refuses a plain write
     /// of a blob it is not the primary of. When a write is acknowledged by its replicas
     /// (av2-11, av2-12), the entry carries those acknowledgements and this copy goes away.
+    /// The copy is an extra, not the replicated one: each blob is still held by its own
+    /// owners (the daemon's upload or [`Router::put`] went through the chain), and the node
+    /// takes the marker only from the frontend's certificate.
     ///
     /// # Errors
     /// Every owner of the action is down; a blob of the entry that no owner holds (the
