@@ -331,7 +331,7 @@ impl<E: Exec> Helper<E> {
         }
         let result = match order.verb {
             Verb::Activate => self.activate(order, now),
-            Verb::Confirm => self.confirm(order),
+            Verb::Confirm => self.confirm(order, &before),
             Verb::Revert => self.revert(),
         };
         let moved = self.moved(&before)?;
@@ -383,8 +383,7 @@ impl<E: Exec> Helper<E> {
         }
     }
 
-    fn confirm(&mut self, order: &Order) -> Result<Done, String> {
-        let state = self.state().map_err(|e| e.to_string())?;
+    fn confirm(&mut self, order: &Order, state: &State) -> Result<Done, String> {
         // The activation's own id: the confirm order names the commit, the state names the swap.
         let activation = state
             .pending_confirm
@@ -462,8 +461,10 @@ fn release_err(e: &ReleaseError) -> String {
 }
 
 fn short(c: &Option<CommitId>) -> String {
+    // A swap that expires always has a release it came from; the empty case is never named.
     c.as_ref()
-        .map_or_else(|| "the release".to_owned(), |c| c.as_str()[..12].to_owned())
+        .map(|c| c.as_str()[..12].to_owned())
+        .unwrap_or_default()
 }
 
 /// The commit an inbox entry directory is for: `<generation:020>-<commit>`.

@@ -623,6 +623,20 @@ fn only_the_clients_shape_of_order_is_read() {
         )
         .is_err()
     );
+    // Every field there, and the commit not a commit: its own refusal.
+    let bad_commit = ok.replace(B, "NOT-A-COMMIT");
+    assert_eq!(
+        parse(5, bad_commit.as_bytes()),
+        Err(crate::order::OrderFault::BadCommit(
+            "NOT-A-COMMIT".to_owned()
+        ))
+    );
+    // And a verb that is none of the three.
+    let bad_verb = ok.replace("activate", "reboot");
+    assert!(matches!(
+        parse(5, bad_verb.as_bytes()),
+        Err(crate::order::OrderFault::UnknownVerb(v)) if v == "reboot"
+    ));
     assert!(parse(6, ok.as_bytes()).is_err(), "named for another id");
     assert_eq!(id_of("00000000000000000005.json"), Some(5));
     for bad in [
@@ -718,6 +732,12 @@ fn unreadable_state_is_reported_and_unreadable_memory_stops_the_pass() {
     // Links already as the state says: nothing moved, nothing owed.
     rig.helper.recover().expect("recovers");
     fs::write(rig.root.join("var/lib/kbf-deploy/state.json"), b"not json").expect("ruin");
+    // A pass over a state it cannot read stops with the error (it acts on nothing).
+    let error = rig
+        .helper
+        .cycle(T0, &mut no_stage())
+        .expect_err("cannot read the state");
+    assert!(error.to_string().contains("host state"), "{error}");
     rig.helper.recover().expect("recovers into a refusal");
     let memory =
         fs::read_to_string(rig.root.join("var/lib/kbf-deploy/helper.json")).expect("memory");
@@ -858,4 +878,18 @@ fn the_same_id_in_two_epochs_is_two_activations() {
         "{refusal}"
     );
     assert_eq!(rig.status()["acked_order_id"], 5);
+}
+
+/// Catches a revert with nothing to go back to being reported as done: a host that never
+/// swapped has no previous release, so the order is refused with the installer's reason and
+/// nothing restarts.
+#[test]
+fn a_revert_with_nothing_to_go_back_to_is_refused() {
+    let mut rig = Rig::new("revert-nothing");
+    rig.put_order(5, &order_json(5, "revert", A));
+    rig.cycle(T0);
+    assert_eq!(rig.status()["state"], "refused");
+    assert_eq!(rig.status()["acked_order_id"], 5);
+    assert_eq!(rig.state().current, Some(c(A)));
+    assert_eq!(rig.restarts(), 0);
 }

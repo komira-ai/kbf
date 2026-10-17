@@ -185,6 +185,12 @@ fn the_service_must_be_named_exactly_once() {
         "b",
     ];
     assert_eq!(helper(&root, &both).status.code(), Some(2));
+    // The same for `run`: a relative root is refused before anything is read.
+    let out = Command::new(BIN)
+        .args(["--root", "relative", "run", "--passes", "1", "--unit", "a"])
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(1));
     let out = Command::new(BIN)
         .args(["--root", "relative", "boot-check"])
         .output()
@@ -234,4 +240,41 @@ fn passes_end_the_run_and_an_unreadable_memory_stops_it() {
     let out = helper(&root, &elsewhere);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("kbf-helper:"));
+}
+
+/// Catches settings the host cannot trust being ignored: with an inbox entry to stage and an
+/// installer.conf that root does not own, the stage is refused with the reason in
+/// status.json, not run on defaults.
+#[test]
+fn settings_that_are_not_roots_refuse_the_stage() {
+    let root = root("settings");
+    fs::create_dir_all(root.join("usr/local/libexec/kbf-deploy")).expect("dir");
+    fs::write(
+        root.join("usr/local/libexec/kbf-deploy/installer.conf"),
+        "SOURCE_REFS=refs/heads/main\n",
+    )
+    .expect("settings");
+    fs::create_dir(root.join(format!("var/lib/kbf-updater/inbox/{:020}-{B}", 1))).expect("entry");
+    let out = helper(
+        &root,
+        &[
+            "run",
+            "--passes",
+            "1",
+            "--interval-secs",
+            "0",
+            "--unit",
+            "kbf.service",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let why = status(&root)["refusal"].as_str().expect("text").to_owned();
+    assert!(
+        why.to_ascii_lowercase().contains("settings") || why.contains("trust"),
+        "{why}"
+    );
 }
