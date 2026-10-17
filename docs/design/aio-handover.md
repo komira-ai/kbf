@@ -1,6 +1,6 @@
 # Updating a frontend or an all-in-one host behind Envoy, without failing a build
 
-Status: design, not implemented. One update process for every shape: Envoy stays in front
+Status: design, not implemented (the handover code it builds on, #857, #879 and #887, is merged on arch-v2). One update process for every shape: Envoy stays in front
 of kbf on the host (also on a single box, also for `kbf all-in-one`); a new kbf process is
 started on other ports; Envoy sends **new** connections and streams to it only once it is
 ready and serving; the old process keeps answering what it already holds, then fails its
@@ -56,7 +56,7 @@ addition (storage and daemon).
 | kbf sends nothing on a long Execute and has no HTTP/2 keepalive | **Not true on arch-v2.** Every open `Execute` and `WaitExecution` stream is re-sent its operation every `--progress-interval-secs` (default 30), and both listeners send an HTTP/2 PING every `--http2-keepalive-interval-secs` (default 30, timeout 20). Progress frames are data frames, so they reset Envoy's stream idle timer; a PING is connection-level and does not (inference). The Envoy overrides below stay, because both flags can be 0. | `kbf-server/src/config.rs` (`progress_interval_secs`, `http2_keepalive_*`), `kbf-front/src/execution.rs` (`progress`), `kbf-server/src/serve.rs` (`StreamTiming`, `keepalive`) |
 | the longest action is 1 h | **Not a bound.** The container driver's default timeout is 1 h but an action's own `timeout` replaces it and is not capped. The envoy kit's 3900 s (1 h plus the 300 s unservable wait) is the default case only. | `kbf-driver-container/src/runtime.rs` (`timeout_of`, `default_timeout`), `crates/kbf-deploy/src/envoy/check.rs` (`SILENT`) |
 | #857 is merged and stays needed | Yes: `Fenced`/`meta/generation`, `Store::demote` (SQLite), `done/<op>` rows with `DONE_FLOOR` (600 s); the old process answers its open streams from `Finished` rows it can read without knowing how the result was made. | `kbf-state/src/fence.rs`, `store.rs`, `sqlite/mod.rs`; `kbf-server/src/farm/durable.rs`, `kbf-front/src/finished_row.rs` |
-| the handover halves of #879/#887 | **Not on arch-v2.** No `Farm::quiet/fence/follow/end_worker_streams`, no `handover/` module, no `open_after_handover`. `EpochPolicy::Keep` exists in `Durable::open`, but `StateStoreUri::epoch_policy` returns `Bump` for every SQLite start. Section 11 says what is reused. | `kbf-server/src/farm/durable.rs`, `kbf-server/src/state_store.rs`; branch `av2/frontend-handover-3` |
+| the handover halves of #857/#879/#887 | **Merged on arch-v2.** `Farm::quiet/fence/end_worker_streams/follow` (`farm/handover.rs`), the `handover/` module (control socket, `SCM_RIGHTS` fd passing, `READY=1` notify), `StateStoreUri::open_after_handover(generation)` which opens with `EpochPolicy::Keep`, and `kbf-frontend@` units. `StateStoreUri::epoch_policy` (the plain `open`) still returns `Bump` for every SQLite start, so an all-in-one start has no `Keep` path until it is given one. `Farm::fence` is one-way: there is no unfence. Section 11 says what is reused. | `kbf-server/src/farm/handover.rs`, `kbf-server/src/handover.rs`, `kbf-server/src/state_store.rs`, `kbf-server/src/farm/durable.rs` |
 | `Drain::begin` is one step | Yes: it turns readiness off, refuses new Executes and sends GOAWAY in one call, once. Section 5.1 replaces it with a staged object. | `kbf-server/src/drain.rs` |
 | **the frontend can answer a call for another process** | **Only storage.** `kbf-front/src/proxy` forwards CAS, ByteStream and action-cache calls to storage nodes; there is no Execute or WaitExecution forwarder. Section 5.2 needs one. | `kbf-front/src/proxy/mod.rs` (module doc: storage calls only, GetTree not yet; Execute is the scheduler's call and reaches storage through `Backend::routed`) |
 | the meta log can be read by a second process | **No.** Single writer by flock, never compacted, a directory holding a snapshot is refused; every start replays the whole log. There is no follower open. | `kbf-server/src/raft_log/mod.rs` (`Locked`, module doc "Not yet: snapshots"), `docs/design/metadata-snapshots.md` |
@@ -65,7 +65,7 @@ addition (storage and daemon).
 | `/readyz` and the gRPC health service agree | Yes: both evaluate `Checks::failing`; `Readiness::stop` flips both; `Readiness::set_leader(false)` exists for a process that is up but must not be picked. | `kbf-server/src/health.rs`, `grpc_health.rs` |
 | kbf-deploy renders an Envoy config | Yes, for a **Kubernetes client front**, not a box: one cleartext h2c listener behind a Tailscale ingress, one STRICT_DNS cluster of servers over TLS to the farm CA, route timeout 0, stream idle timeout 7200 s, no `max_stream_duration`, `healthy_panic_threshold` 0, gRPC health check (5 s interval), a checker that models those properties. It has no circuit breakers, no retry policy, no worker route, no hot restart, and refuses a route whose action has anything but a cluster and timeouts. Section 4 builds on it. | `crates/kbf-deploy/src/envoy/{render,check,config}.rs` |
 | `/readyz` is only the flags | **No.** `Checks::failing` also runs a store probe (a read of the probe digest through the cache, `STORE_PROBE_TIMEOUT` 2 s) besides the `stopping` and `leader` flags. After the cut that probe would run through `HandoverStorage` or a frozen store, so section 5.1 pins `p`'s readiness explicitly. | `kbf-server/src/health.rs` (`failing`, `StoreProbe`) |
-| a cordon is durable | **Not on arch-v2.** It is scheduler state fed as an input, "not a control-log record yet ... gone after a server restart", and `farm/durable.rs` has no cordon row. Section 6.2 makes it new work. | `kbf-sched/src/cordon.rs` module doc |
+| a cordon is durable | **Yes for an operator's cordon.** `farm/durable.rs` keeps a `cordon/<worker>` row (written by `Durable::cordoned` on cordon, drain and uncordon) and recovery reads it back (`cordons`, `restore_cordons`), so a restarted process serves a node as the operator left it. The `kbf-sched/src/cordon.rs` module doc still says "gone after a server restart" and is stale. **Still new for this design**: the takeover writes the predecessor's cordon row, and deletes the successor's own node id's row, in the takeover's state-store transaction (section 6.2); today no takeover path writes a cordon. | `kbf-server/src/farm/durable.rs`, `kbf-server/src/farm/handover.rs`, `kbf-sched/src/cordon.rs` |
 | the Welcome epoch is the state store's | The Welcome carries `Farm::lease_epoch` ("this process's term, or the Raft log's id"); `SqliteStore::open` also bumps its own recorded epoch. Which one `Keep` must hold constant is checked in T-7 (section 6.2). | `kbf-server/src/worker.rs`, `kbf-state/src/sqlite/mod.rs` |
 | the REAPI listener advertises unlimited streams | **No.** `max_concurrent_streams` is `StreamTiming`'s `streams`, at most `MAX_STREAMS` (`i32::MAX / 65536`, 32767); the configured value is what Envoy sees. Section 3.1 derives the breaker from it. | `kbf-server/src/serve.rs`, `streams.rs` |
 | a real Envoy is available to tests | Yes: CI fetches a pinned Envoy and validates the kit's render with `--mode validate`. | `.github/workflows/ci.yml`, `crates/kbf-deploy/tests/envoy_validate.rs` |
@@ -294,8 +294,8 @@ zero; this design aims at a few hundred milliseconds inside one call, gates on a
 2. `p` runs `hand-over`: forwarding on, quiesce, fence, end worker streams, (storage block),
    demote the state store. Its answer is `released` with the generation it held.
 3. `i` takes the next generation, `Fenced::take(store, Some(generation))`, with the epoch kept
-   (`EpochPolicy::Keep`; today `StateStoreUri::epoch_policy` is `Bump` only and takes a
-   parameter; the lease epoch in the Welcome is held constant, section 6.2), recovers, takes the storage
+   (`EpochPolicy::Keep`, reached today through `StateStoreUri::open_after_handover(generation)`, which `frontend.rs` calls; the plain
+   `open` and `epoch_policy` are `Bump` for SQLite, so all-in-one calls the handover open; the lease epoch in the Welcome is held constant, section 6.2), recovers, takes the storage
    roles in the order of 6.3, opens the latch, `set_leader(true)` and says `READY=1`. From the latch
    opening `i` serves everything directly.
 4. Envoy marks `i` healthy within one check interval. `i` reads that from the admin interface
@@ -337,9 +337,9 @@ GOAWAY and park parts rewritten.
 | B5 | The daemon half dies with the server half: `with_daemon` ends the daemon when `serving` ends. | `kbf-all-in-one/src/run.rs` |
 | B6 | The in-process daemon's data plane is `LocalDataPlane` over the old process's cache. The control plane is a loopback mTLS worker session. | `kbf-all-in-one/src/plane.rs`, `kbf-node` |
 | B7 | Two daemons on one host collide: the start sweep removes every container labelled with the node id and every lease directory; the `daemon-instance` claim; container names; the cache dir lock. | `kbf-driver-container/src/runtime.rs` (`sweep`), `kbf-node/src/instance.rs` |
-| B8 | The scheduler books by worker (`free() = capacity - booked`); two workers on one box would double-book it. The predecessor's worker is kept out of placement by a cordon, which is not durable on arch-v2 (section 2): a restart of `i` with `p` still detached would register `p`'s daemon uncordoned at full capacity. | `kbf-sched/src/scheduler.rs`, `cordon.rs` |
+| B8 | The scheduler books by worker (`free() = capacity - booked`); two workers on one box would double-book it. The predecessor's worker is kept out of placement by a cordon. Cordon rows are durable on arch-v2 (section 2) but no takeover writes one, so today a restart of `i` with `p` still detached would register `p`'s daemon uncordoned at full capacity. | `kbf-sched/src/scheduler.rs`, `cordon.rs` |
 | B9 | All-in-one starts with `Bump`; a bump makes every daemon kill its runs. | `kbf-server/src/state_store.rs` |
-| B10 | `Drain` is one-way and `Farm::fence` has no unfence (on the handover branch). Section 5.1's staging puts the reversible work (prepare) in front of the fence. | `kbf-server/src/drain.rs` |
+| B10 | `Drain` is one-way and `Farm::fence` has no unfence (merged, `farm/handover.rs`). Section 5.1's staging puts the reversible work (prepare) in front of the fence. | `kbf-server/src/drain.rs` |
 | B11 | The detached daemon fences itself after 40 s without an acknowledged heartbeat; the successor's `LEASE_GRACE` is 60 s. | `kbf-daemon/src/config.rs` (`FENCE_AFTER`), `kbf-sched/src/fence.rs` |
 | B12 | The scheduler's recovery reads the state store, which `p` holds locked until `hand-over`; its time is part of `T_s`. | `kbf-state/src/sqlite/mod.rs`, `kbf-sched/src/scheduler/recover.rs` |
 
@@ -370,9 +370,10 @@ GOAWAY and park parts rewritten.
   per instance, per-instance daemon directory `<data-dir>/node-<instance>/` only when `--instance` is
   given (existing hosts keep their layout); container lease terms and cgroup names carry the
   instance (B7). Work, not a flag: audit `runtime.rs` for any name that is not owner-scoped.
-- **Cordon (new work, durable), and its reset.** A `cordon/<worker>` row is **new**: its encoding, its
-  recovery, and its write in the same state-store transaction as the takeover are PR C (section 14).
-  Recovery applies it before the worker listener accepts a session, so the detached daemon of `p` never
+- **Cordon (row and recovery exist; the takeover write is new), and its reset.** The `cordon/<worker>` row, its
+  encoding and its recovery are merged (`farm/durable.rs`, `restore_cordons`; #879). New here is the write in the same
+  state-store transaction as the takeover, and the delete of the successor's own row (PR 2, section 14).
+  Recovery applies the row before the worker listener accepts a session, so the detached daemon of `p` never
   registers uncordoned, including after a crash and restart of `i`. T-7 kills and restarts `i` with `p` still detached
   and asserts `p`'s worker is granted nothing. Node ids alternate (`-a`, `-b`, `-a`), so in the same transaction as the takeover the
   successor **deletes the cordon row of its own node id** and writes the predecessor's; when the
@@ -540,7 +541,7 @@ For the in-process daemon the cut is `hand-over` ending its stream, then a redia
 
 ## 9. Units, command, marker
 
-Mirrors `kbf-frontend@.service` on the handover branch, for both modes.
+Mirrors `kbf-frontend@.service` (merged, #887), for both modes.
 
 - Template `kbf-frontend@.service` and `kbf-all-in-one@.service`, `Type=notify` (`READY=1` when the instance
   holds the store and its probes pass), `TimeoutStartSec` finite (all-in-one: `max(120, 3 x recorded replay)`),
@@ -596,20 +597,24 @@ a successor that dies with relays open) plus the two Envoy rows. The earlier wri
 cut by a timer. Envoy is a single process in front of every `Execute`; that is the price of one update path
 everywhere and the project has taken it.
 
-## 11. Reuse from the fd-passing branches
+## 11. Reuse from the merged handover code (#857, #879, #887)
 
-- **Kept**: `Farm::quiet/fence/follow/end_worker_streams` and the durable `done/` rows
-  (`farm/handover.rs`), `Drain` as a staged object (5.1), `Fenced`/`Store::demote`, `READY=1`
-  (`handover/notify.rs`, `ready.rs`), the daemon-side redial, the `Stop`/`Latch` pair.
-- **Dropped**: the control socket and `SCM_RIGHTS` wire (`handover/wire.rs`, `incoming.rs`, `outgoing.rs`), `listen.rs`'
-  adopt and spare dup, the address check against the holder's listeners, GOAWAY as the client's switch, and the
-  "connections wait in the backlog" step. The coordination the wire carried (refusal reasons, the generation) is the API
-  call of 5.4 and the state store's own generation.
+All of this is on arch-v2. Build on it; do not re-implement it.
+
+- **Kept**: `Farm::quiet/fence/follow/end_worker_streams` and the durable `done/` and `cordon/` rows
+  (`farm/handover.rs`, `farm/durable.rs`), `open_after_handover` and `EpochPolicy::Keep`, `Fenced`/`Store::demote`,
+  `READY=1` (`handover/notify.rs`, `ready.rs`), the daemon-side redial, the `Stop`/`Latch` pair, the
+  `kbf-frontend@` units. `Drain` is wrapped by the staged object (5.1), not replaced in place.
+- **Dropped from the Envoy path** (merged, so this is code left unused by it, not code never written): the control
+  socket and `SCM_RIGHTS` wire (`handover/wire.rs`, `incoming.rs`, `outgoing.rs`), `listen.rs`' adopt and spare dup, the
+  address check against the holder's listeners, GOAWAY as the client's switch, and the "connections wait in the
+  backlog" step. The coordination the wire carries (refusal reasons, the generation) is the API call of 5.4 and the
+  state store's own generation. Nothing is deleted by this note; Q12 decides whether the wire stays.
 - **New**: the Execute relay (5.2); `HandoverStorage` (6.3); `RaftMetaLog::open_follower` and a read-only tier open (6.3);
-  the durable `cordon/<worker>` row and its recovery (6.2); the split cold-store lock (6.3); the `handed_over` readiness pin and the watchdog (5.1).
-- **Open**: whether the fd-passing path stays as a no-Envoy shape (Q12 of section 15). Recommendation: trim it. A second way
-  to do one thing, tested against none of the Envoy topology, and an unconditional source of the question "which
-  update path is this host on".
+  the takeover's cordon write and own-row delete (6.2); the split cold-store lock (6.3); the `handed_over` readiness pin and the watchdog (5.1);
+  an unfence or a reversible prepare stage in front of `Farm::fence` (5.1, B10).
+- **Open**: whether the fd-passing path stays as a no-Envoy shape (Q12 of section 15). It is merged and has a crash
+  matrix in flight (#900), so trimming is now a removal of tested code, not a choice not to merge it.
 
 The assembly of `frontend.rs` (`Prepared`, `Trio`, `hello`, `take_over`, `start_or_take_over`) becomes a
 `handover::Driver` both modes call, with a golden of its call sequence for the frontend taken before the refactor.
@@ -679,8 +684,9 @@ it. No test pins a wrong answer.
 
 ## 14. PR split
 
-PRs that touch `frontend.rs`, `kbf-deploy` or `kbf-cli` stack on the trimmed #879/#887 or on a re-implementation of
-their farm half (Q12); the rest stack on arch-v2. Sizes are estimated changed lines.
+#857, #879 and #887 are merged on arch-v2, so every PR stacks on arch-v2; none waits for a re-implementation of the
+farm half. PRs that touch `frontend.rs` wait for the answer to Q12. PR 1, R, E1 and E2 are in progress and not merged at
+this refresh. Sizes are estimated changed lines.
 
 | PR | content | size |
 |---|---|---|
@@ -690,15 +696,15 @@ their farm half (Q12); the rest stack on arch-v2. Sizes are estimated changed li
 | E2 | real-Envoy tests E3-E5, E7 against the render | 500 |
 | 1 | `Drain` staged, the API body and status, T-D, T-A | 400 |
 | R | the Execute relay beside `kbf-front/src/proxy`, T-R | 600 |
-| 2 | `handover::Driver` out of `frontend.rs`, T-9; the farm half (`fence`, `follow`, `end_worker_streams`) and `Keep` through `StateStoreUri` | 700 |
+| 2 | `handover::Driver` out of `frontend.rs`, T-9; the farm half exists (merged), so this adds the takeover's cordon write and own-row delete, T-7's restart case, and `Keep` for an all-in-one start | 500 |
 | 3 | frontend wiring: `--instance`, `--envoy-admin`, predecessor call, ports, settle and unready | 400 |
 | 4 | `kbf-deploy`: unit templates and per-instance drop-ins, `kbf-envoy.service` with the restarter, binary path, `kbf handover`, lock file; daemon jittered redial | 700 |
-| C | durable `cordon/<worker>` row, its recovery before the worker listener accepts sessions, takeover-transaction write, T-7 restart case (stacks on arch-v2, inert until PR 6-9) | 400 |
+| C | dropped: #879 delivered the durable `cordon/<worker>` row and its recovery; the takeover write moved to PR 2 | 0 |
 | 5 | E6, E8 and T-17 for the frontend | 400 |
 | 6-9 | all-in-one: `FsStore::demote`, `RaftMetaLog::demote` and `open_follower` (T-1..3), `Cache::seal`, read-only tier open and `HandoverStorage` (T-4, T-5, forwarded commits), the detached daemon with the remote data plane and per-instance data dir (T-8, T-11), the wiring, cordon reset and capacity (T-6, T-7, T-12..16) | about 3500 |
 | 10 | all-in-one `kbf-it` T-10, T-12, T-17, container CI placement | 500 |
 
-PRs 6 to 9 (and C) are inert until their flags are given. Everything from PR 6 is gated on the spike's `T_s` answer.
+PRs 6 to 9 are inert until their flags are given. Everything from PR 6 is gated on the spike's `T_s` answer.
 
 ## 15. Open questions
 
@@ -729,8 +735,11 @@ PRs 6 to 9 (and C) are inert until their flags are given. Everything from PR 6 i
     `/readyz` check on the API port. Recommendation: the gRPC check, it is already specified and checked and is the same evaluation.
 11. **Forwarded caller identity in the relay**: forward request metadata and let `i` authorize again (this note), or forward a signed
     assertion from `p`. Recommendation: forward and re-authorize; `i` trusts nothing `p` says.
-12. **Keep the fd-passing path (#879/#887) as a no-Envoy shape, or trim it?** Recommendation: trim to the farm half
-    (section 11); a second update path is a second thing to test and to explain.
+12. **Keep the merged fd-passing path (#879/#887) as a no-Envoy shape, or remove it?** It is on arch-v2 now, with the
+    units and a crash matrix (#900) in flight. Recommendation: keep the farm half, the `Fenced` generation and `open_after_handover`
+    (the Envoy path uses them) and remove the control socket and fd-passing wire once the Envoy path has shipped for the
+    frontend; a second update path is a second thing to test and to explain. Until then both exist and Envoy hosts do not
+    use the wire. Waiting on the owner's answer; PRs touching `frontend.rs` wait for it.
 
 Reviewed and not taken: (a) readiness off before the cut with Envoy's health check as the only gap cover (5.2: a window with
 no healthy backend, a local 503, longer than Buck2's retry window); (b) `p` stays the storage server and `i` writes through it
