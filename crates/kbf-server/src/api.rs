@@ -195,11 +195,10 @@ struct MemberBody {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 enum MemberTarget {
     Active,
     Draining,
-    #[serde(rename = "planned_down")]
     PlannedDown,
 }
 
@@ -231,36 +230,63 @@ async fn set_member_state(
             return error(StatusCode::BAD_REQUEST, &why);
         }
     };
-    let for_ = match (want.state, want.for_secs) {
-        (MemberTarget::PlannedDown, None) => PLANNED_DOWN_FOR,
-        (MemberTarget::PlannedDown, Some(secs @ 1..=MAX_PLANNED_DOWN_SECS)) => {
-            Duration::from_secs(secs)
-        }
-        (MemberTarget::PlannedDown, Some(_)) => {
-            let why = format!("for_secs is 1 to {MAX_PLANNED_DOWN_SECS}");
-            return error(StatusCode::BAD_REQUEST, &why);
-        }
-        (_, Some(_)) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "for_secs goes with planned_down only",
-            );
-        }
-        (_, None) => Duration::ZERO,
+    let change = match want.change() {
+        Ok(change) => change,
+        Err(why) => return error(StatusCode::BAD_REQUEST, &why),
     };
-    let name = match want.state {
-        MemberTarget::Active => "active",
-        MemberTarget::Draining => "draining",
-        MemberTarget::PlannedDown => "planned_down",
-    };
+    let name = change.name();
     // The store's calls block (its trait says so).
-    let set = tokio::task::spawn_blocking(move || match want.state {
-        MemberTarget::Active => members.set_state(MemberId(id), MemberState::Active),
-        MemberTarget::Draining => members.set_state(MemberId(id), MemberState::Draining),
-        MemberTarget::PlannedDown => members.plan_down(MemberId(id), for_),
-    })
-    .await;
+    let set = tokio::task::spawn_blocking(move || change.apply(&members, MemberId(id))).await;
     member_answer(id, name, set)
+}
+
+/// What a member write asks for. Plain sync code on purpose: the handler is async, and each
+/// test binary that runs it makes its own copy of the coroutine.
+enum Change {
+    Active,
+    Draining,
+    PlannedDown(Duration),
+}
+
+impl MemberBody {
+    /// The change the body asks for.
+    ///
+    /// # Errors
+    /// Why the body is refused: `for_secs` outside 1 to a day, or given with another state.
+    fn change(&self) -> Result<Change, String> {
+        match (self.state, self.for_secs) {
+            (MemberTarget::Active, None) => Ok(Change::Active),
+            (MemberTarget::Draining, None) => Ok(Change::Draining),
+            (MemberTarget::PlannedDown, None) => Ok(Change::PlannedDown(PLANNED_DOWN_FOR)),
+            (MemberTarget::PlannedDown, Some(secs @ 1..=MAX_PLANNED_DOWN_SECS)) => {
+                Ok(Change::PlannedDown(Duration::from_secs(secs)))
+            }
+            (MemberTarget::PlannedDown, Some(_)) => {
+                Err(format!("for_secs is 1 to {MAX_PLANNED_DOWN_SECS}"))
+            }
+            (_, Some(_)) => Err("for_secs goes with planned_down only".to_owned()),
+        }
+    }
+}
+
+impl Change {
+    /// The name the answer gives the state.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Draining => "draining",
+            Self::PlannedDown(_) => "planned_down",
+        }
+    }
+
+    /// Makes the change to member `id`.
+    fn apply(self, members: &Members, id: MemberId) -> Result<Map, MembershipError> {
+        match self {
+            Self::Active => members.set_state(id, MemberState::Active),
+            Self::Draining => members.set_state(id, MemberState::Draining),
+            Self::PlannedDown(for_) => members.plan_down(id, for_),
+        }
+    }
 }
 
 /// How long a planned restart lasts when the request does not say: an update of a node,
@@ -481,6 +507,13 @@ mod tests {
             (
                 MembershipError::NotSettable(MemberState::Down),
                 StatusCode::BAD_REQUEST,
+            ),
+            (
+                MembershipError::NotActive {
+                    id: MemberId(4),
+                    state: MemberState::Joining,
+                },
+                StatusCode::CONFLICT,
             ),
             (store(), StatusCode::SERVICE_UNAVAILABLE),
             (MembershipError::Contended, StatusCode::SERVICE_UNAVAILABLE),
