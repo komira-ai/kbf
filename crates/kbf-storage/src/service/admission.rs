@@ -143,9 +143,10 @@ impl Admission {
         if *self == Self::Open || denied.is_empty() {
             return Ok(());
         }
-        let der = leaf.ok_or_else(|| Status::unauthenticated("no client certificate"))?;
-        let identity = kbf_peer::identity_of(der).map_err(|e| refusal(&e))?;
-        let Some(entry) = identity.denied_by(denied) else {
+        // `check_leaf` refused a missing or unreadable certificate above. Were one to get
+        // here all the same, it is judged denied (by the first entry), never admitted.
+        let identity = leaf.map(kbf_peer::identity_of).and_then(Result::ok);
+        let Some(entry) = identity.map_or(denied.first(), |i| i.denied_by(denied)) else {
             return Ok(());
         };
         tracing::warn!(%entry, ?endpoint, "storage call refused: the caller is denied");

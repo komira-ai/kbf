@@ -362,8 +362,7 @@ fn plan(
     let members: Vec<Member> = members.into_values().collect();
     let count = u8::try_from(members.len()).unwrap_or(u8::MAX);
     let r = config.replication.min(count);
-    if current
-        .is_some_and(|c| c.members() == members.as_slice() && c.r() == r && c.denied() == denied)
+    if current.is_some_and(|c| (c.members(), c.r(), c.denied()) == (members.as_slice(), r, denied))
     {
         return Ok(None);
     }
