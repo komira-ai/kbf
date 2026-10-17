@@ -185,10 +185,12 @@ impl Joiner {
         }
     }
 
-    /// Registers ([`Joiner::join`]) and heartbeats ([`Joiner::keep`]) for ever.
+    /// Registers ([`Joiner::join`]) and heartbeats for ever, as [`Joiner::keep`] does.
     pub async fn run(mut self) {
-        let this = self.join().await;
-        self.keep(this).await;
+        loop {
+            let this = self.join().await;
+            self.beat_until_lapse(&this).await;
+        }
     }
 
     /// Heartbeats as `joined` for ever: a failed call waits [`backoff`] and tries
@@ -196,25 +198,30 @@ impl Joiner {
     /// after a lapse has a larger boot; the node's cache keeps writing as the boot it
     /// opened with, which no other process is ever given.
     pub async fn keep(mut self, mut this: Joined) {
+        loop {
+            self.beat_until_lapse(&this).await;
+            this = self.join().await;
+        }
+    }
+
+    /// Heartbeats as `this` until the frontend says the row lapsed (NOT_FOUND). A failed
+    /// call waits [`backoff`] and tries again.
+    async fn beat_until_lapse(&mut self, this: &Joined) {
         let mut failures = 0_u32;
         loop {
-            loop {
-                tokio::time::sleep(this.interval).await;
-                match self.beat(&this).await {
-                    Ok(_) => failures = 0,
-                    Err(e) if e.code() == Code::NotFound => {
-                        tracing::warn!("the membership row lapsed; registering again");
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::warn!("heartbeat to the frontend: {}", e.message());
-                        tokio::time::sleep(backoff(self.retry, failures)).await;
-                        failures = failures.saturating_add(1);
-                    }
+            tokio::time::sleep(this.interval).await;
+            match self.beat(this).await {
+                Ok(_) => failures = 0,
+                Err(e) if e.code() == Code::NotFound => {
+                    tracing::warn!("the membership row lapsed; registering again");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("heartbeat to the frontend: {}", e.message());
+                    tokio::time::sleep(backoff(self.retry, failures)).await;
+                    failures = failures.saturating_add(1);
                 }
             }
-            this = self.join().await;
-            failures = 0;
         }
     }
 }
