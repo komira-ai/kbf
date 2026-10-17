@@ -25,8 +25,8 @@ use kbf_sched::MemoryLadder;
 use kbf_storage::service::Admission;
 use kbf_tls::{Incoming, TlsSource};
 use tonic::service::Routes;
+use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
-use tonic::transport::{Server, ServerTlsConfig};
 use tower_layer::{Identity, Stack};
 
 use crate::blobs::{WorkerBlobs, WorkerCas, WorkerSegments};
@@ -849,10 +849,11 @@ where
 pub struct StorageListener {
     /// The listener.
     pub listen: SocketAddr,
-    /// Mutual TLS (the server's identity and the client CA); `None` serves plain text,
-    /// where no caller has a role and every call is admitted (`kbf storage` builds this
-    /// only for a loopback address: [`crate::storage_node::StorageFlags::listener`]).
-    pub tls: Option<ServerTlsConfig>,
+    /// Mutual TLS (the server's identity and the client CA), re-read from its files as
+    /// they change; `None` serves plain text, where no caller has a role and every call
+    /// is admitted (`kbf storage` builds this only for a loopback address:
+    /// [`crate::storage_node::StorageFlags::listener`]).
+    pub tls: Option<TlsSource>,
     /// What the service keeps.
     pub service: kbf_storage::service::Config,
 }
@@ -885,9 +886,11 @@ pub struct BoundStorage<F> {
 /// CAS `FindMissingBlobs`, `Segments` and the action store, on one listener, each call
 /// admitted by the role in the caller's certificate when there is mutual TLS.
 ///
+/// With TLS, call it inside a Tokio runtime: the task that looks at the TLS files starts
+/// here ([`Incoming::new`]).
+///
 /// # Errors
-/// The listener cannot be bound, or the TLS configuration is refused (a key that does
-/// not match its certificate, say).
+/// The listener cannot be bound.
 pub fn bind_storage(
     storage: Arc<dyn kbf_storage::Storage>,
     listener: StorageListener,
@@ -910,7 +913,7 @@ pub fn bind_storage(
 pub fn bind_service(
     service: kbf_storage::service::StorageService,
     listen: SocketAddr,
-    tls: Option<ServerTlsConfig>,
+    tls: Option<TlsSource>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<
     (
@@ -924,9 +927,7 @@ pub fn bind_service(
         Server::builder(),
         crate::streams::StreamLimits::DEFAULT.worker,
     );
-    if let Some(tls) = tls {
-        server = server.tls_config(tls)?;
-    }
+    let incoming = Incoming::new(incoming, tls);
     let service = Arc::new(service);
     let (routes, in_process) = (service.shared_routes(), service.in_process());
     let serving = async move {

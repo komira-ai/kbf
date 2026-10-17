@@ -197,7 +197,7 @@ Options:
           The worker listener's deny list: certificate serials, public keys and node ids it refuses (format in the `identity` module docs). Read at start, then again at every `Hello` and `Heartbeat`, so an edit takes effect without a restart. Needs mutual TLS
 
       --tls-reload-interval-secs <TLS_RELOAD_INTERVAL_SECS>
-          How often, in seconds, the REAPI and worker listeners look at their TLS files (`--reapi-tls-cert`, `--reapi-tls-key`, `--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca`). A change is applied to the next TLS handshake, with no restart and without ending a connection already open: renew a certificate by replacing the files. Files that do not make a working configuration (unreadable, not PEM, a key that is not the certificate's, an expired certificate, a renewal caught between its two writes) are logged and counted in `kbf_tls_reloads_total{outcome="rejected"}`, and the previous files keep serving; the next look finds them whole and applies them. The files must be good at start
+          How often, in seconds, a TLS listener looks at its certificate, key and client CA files (the `--*-tls-cert`, `--*-tls-key` and `--*-client-ca` flags). A change is applied to the next TLS handshake, with no restart and without ending a connection already open: renew a certificate by replacing the files. Files that do not make a working configuration (unreadable, not PEM, a key that is not the certificate's, an expired certificate, a renewal caught between its two writes) are logged and counted in `kbf_tls_reloads_total{outcome="rejected"}`, and the previous files keep serving; the next look finds them whole and applies them. The files must be good at start
           
           [default: 30]
 

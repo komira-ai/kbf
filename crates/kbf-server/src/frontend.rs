@@ -49,6 +49,10 @@
 //! probe digest (it passes when one answers), so a farm that has lost its `--storage`
 //! node is ready while its other members are.
 //!
+//! **Handing over** (`--handover-socket`, [`crate::handover`]): a frontend started while
+//! another serves on the same state file takes over its listeners, its state store and its
+//! daemons without failing a build; [`start_or_take_over`] is its start.
+//!
 //! **Not served here:** the worker listener's `ByteStream`, CAS and `Segments` (a
 //! daemon's blob traffic; daemons reach storage directly once the map reaches them,
 //! av2-08), the build pages and the blob route of the operator API (they read a local
@@ -56,6 +60,7 @@
 //! the node's directories each time).
 
 use std::error::Error;
+use std::ffi::OsString;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -68,6 +73,8 @@ use std::time::Duration;
 use axum::http::header::CONTENT_TYPE;
 use axum::routing::get;
 use clap::{Arg, ArgMatches, Command, FromArgMatches as _};
+use futures::FutureExt as _;
+use futures::future::{AbortHandle, Abortable, BoxFuture};
 use kbf_auth::AuthenticateLayer;
 use kbf_front::{
     Backend, MAX_MESSAGE_BYTES, Owner, Owners, Proxy, RECORDER_CHANNEL, Recorder,
@@ -79,7 +86,7 @@ use kbf_route::TlsNodes;
 use kbf_storage::Storage;
 use kbf_storage::service::RemoteStorage;
 use kbf_threads::Topology;
-use kbf_tls::{Incoming, TlsSource};
+use kbf_tls::TlsSource;
 use tonic::service::Routes;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server};
 
@@ -87,11 +94,15 @@ use crate::drain::Drain;
 use crate::farm::Farm;
 use crate::front_maps::FrontMaps;
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
+use crate::handover::{
+    self, Facts, Handover, HandoverError, Holder, Message, Ready, Sockets, Stand, Stop,
+};
 use crate::health::{Checks, MapProbe, Readiness, StateProbe, StorageProbe};
+use crate::listen::Socket;
 use crate::members::Members;
 use crate::serve::{
-    AbortOnDrop, ServeError, bind, bind_api, drain_and_stop, flow_control, keepalive, log_state,
-    map_of, members_of, membership, serve_api, stop_api, sweeping, worker_peers,
+    AbortOnDrop, ServeError, drain_and_stop, flow_control, keepalive, log_state, map_of,
+    members_of, membership, serve_api, stop_api, sweeping, worker_peers,
 };
 use crate::start::{Escalation, escalating, interruptions};
 use crate::worker::WorkerService;
@@ -120,6 +131,8 @@ pub const ALLOWED: &[&str] = &[
     "http2_keepalive_timeout_secs",
     "reapi_max_streams",
     "worker_max_streams",
+    "reapi_max_streams",
+    "worker_max_streams",
     "unservable_wait_secs",
     "memory_ladder_gib",
     "finished_retention_secs",
@@ -137,6 +150,18 @@ pub const ALLOWED: &[&str] = &[
 /// in the order [`FrontendFlags::tls`] reads them.
 const TLS: [&str; 3] = ["storage_client_cert", "storage_client_key", "storage_ca"];
 
+/// The ids of the flags of a handover: the control socket, how long a frontend waits to
+/// stand down, and how often one that has handed over looks for its callers' results.
+const HANDOVER: [&str; 3] = [
+    "handover_socket",
+    "handover_quiesce_secs",
+    "handover_follow_interval_ms",
+];
+
+/// The defaults of the last two.
+const QUIESCE_SECS: &str = "10";
+const FOLLOW_INTERVAL_MS: &str = "200";
+
 /// The frontend's flags, from one command line.
 #[derive(Clone, Debug)]
 pub struct FrontendFlags {
@@ -148,6 +173,9 @@ pub struct FrontendFlags {
     /// The client certificate, its key and the CA the node's certificate chains to, all
     /// three or none.
     pub tls: Option<[PathBuf; 3]>,
+    /// How this frontend hands over to a successor and takes over from a predecessor;
+    /// `None` without `--handover-socket`.
+    pub handover: Option<Handover>,
 }
 
 /// The command line of `kbf frontend`: [`Args`]'s, those it takes shown and the rest
@@ -190,6 +218,46 @@ pub fn command() -> Command {
         "The CA the storage node's certificate chains to; the node must present a \
          certificate for the host in the --storage URL.",
     ))
+    .arg(
+        Arg::new(HANDOVER[0])
+            .long("handover-socket")
+            .value_name("PATH")
+            .value_parser(clap::value_parser!(PathBuf))
+            .requires("state_store")
+            .help(
+                "The control socket of a handover (mode 0600, this user only). A frontend \
+                 serving binds it; one started while another serves on the same \
+                 --state-store asks the other to hand over its listeners, its scheduler \
+                 state and its daemons, and takes them without failing a build. The \
+                 --listen, --worker-listen and --api-listen addresses must be the same, \
+                 and fixed (not port 0).",
+            ),
+    )
+    .arg(
+        Arg::new(HANDOVER[1])
+            .long("handover-quiesce-secs")
+            .value_name("SECONDS")
+            .value_parser(clap::value_parser!(u64))
+            .default_value(QUIESCE_SECS)
+            .requires(HANDOVER[0])
+            .help(
+                "The longest a frontend that hands over waits for the Execute calls between \
+                 their request and their queueing, and the results being taken, before it \
+                 stands down anyway.",
+            ),
+    )
+    .arg(
+        Arg::new(HANDOVER[2])
+            .long("handover-follow-interval-ms")
+            .value_name("MILLISECONDS")
+            .value_parser(clap::value_parser!(u64).range(1..))
+            .default_value(FOLLOW_INTERVAL_MS)
+            .requires(HANDOVER[0])
+            .help(
+                "How often a frontend that has handed over looks in the state store for \
+                 the results of the Execute and WaitExecution streams it kept open.",
+            ),
+    )
 }
 
 /// The flags `m`, matched by [`command`], make.
@@ -221,10 +289,16 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
     // clap makes the three come together.
     let tls = <[PathBuf; 3]>::try_from(paths).ok();
     transport(&storage, tls.is_some()).map_err(refuse)?;
+    let handover = m.get_one::<PathBuf>(HANDOVER[0]).map(|socket| Handover {
+        socket: socket.clone(),
+        quiesce: Duration::from_secs(m.get_one::<u64>(HANDOVER[1]).map_or(0, |secs| *secs)),
+        follow_interval: Duration::from_millis(m.get_one::<u64>(HANDOVER[2]).map_or(0, |ms| *ms)),
+    });
     Ok(FrontendFlags {
         server,
         storage,
         tls,
+        handover,
     })
 }
 
@@ -340,6 +414,11 @@ pub struct FrontendHandle {
     escalation: Option<Escalation>,
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
+    /// Tasks that run while the frontend serves and end with it: the one that expires
+    /// the state store's rows, and the control socket of a handover.
+    background: Vec<BoxFuture<'static, ()>>,
+    /// Tells the service manager the frontend serves, once its probes pass.
+    ready: Ready,
 }
 
 impl FrontendHandle {
@@ -357,6 +436,14 @@ impl FrontendHandle {
         &self.start_line
     }
 
+    /// This frontend, sending `READY=1` to `target` (the service manager's
+    /// `$NOTIFY_SOCKET`; `None` tells no one) once it serves and its probes pass.
+    #[must_use]
+    pub fn notifying(mut self, target: Option<OsString>) -> Self {
+        self.ready.notify = target;
+        self
+    }
+
     /// Serves every listener until the shutdown future given to [`start_frontend`]
     /// completes and the open Execute streams finish or `--shutdown-timeout-secs` runs
     /// out (the drain `kbf-server` runs: [`crate::serve::drain_and_stop`]).
@@ -364,6 +451,13 @@ impl FrontendHandle {
     /// # Errors
     /// A listener fails while serving.
     pub async fn serve(self) -> Result<(), ServeError> {
+        let tasks = self
+            .background
+            .into_iter()
+            .chain([self.ready.run().boxed()]);
+        let _tasks: Vec<AbortOnDrop> = tasks
+            .map(|task| AbortOnDrop(tokio::spawn(task).abort_handle()))
+            .collect();
         escalating(self.serving, &self.drain, self.escalation).await
     }
 }
@@ -403,6 +497,10 @@ type Shutdown = Box<dyn FnOnce() -> io::Result<Pin<Box<dyn Future<Output = ()> +
 /// and returns the future whose completion stops the frontend; the binary's is
 /// [`interrupted`].
 ///
+/// This is a start with no predecessor: with `--handover-socket` it binds the control
+/// socket, and a frontend already serving on it is not asked (see
+/// [`start_or_take_over`]).
+///
 /// # Errors
 /// A flag the frontend refuses, a TLS file that cannot be read, a state store that
 /// cannot be opened, a listener that cannot be bound, or a `shutdown` that fails.
@@ -415,12 +513,15 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     // No branch here: this is the one generic function, and `bind_frontend` is the code.
-    bind_frontend(
-        flags,
-        Box::new(move || {
-            shutdown().map(|f| Box::pin(f) as Pin<Box<dyn Future<Output = ()> + Send>>)
-        }),
-    )
+    bind_frontend(flags, boxed(shutdown))
+}
+
+fn boxed<S, F>(shutdown: S) -> Shutdown
+where
+    S: FnOnce() -> io::Result<F> + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
+    Box::new(move || shutdown().map(|f| Box::pin(f) as Pin<Box<dyn Future<Output = ()> + Send>>))
 }
 
 /// [`start_frontend`], not generic over the shutdown future: every test's start counts
@@ -429,197 +530,447 @@ fn bind_frontend(
     flags: &FrontendFlags,
     shutdown: Shutdown,
 ) -> Result<FrontendHandle, Box<dyn Error>> {
-    let args = &flags.server;
-    let listeners = args.listeners()?;
-    let policy = args.reapi_auth_policy()?;
-    let api = args.api()?;
-    let channel = flags.storage_endpoint()?.connect_lazy();
-    let state = crate::start::with_members(
-        args.state_store
-            .as_ref()
-            .map(crate::StateStoreUri::open)
-            .transpose()?,
-        args.members(),
-    );
-    let members = members_of(state.as_ref());
-    let map = map_of(None, members.as_ref())?;
-    let readiness = Arc::new(Readiness::default());
-    let timeout = listeners.store_probe_timeout;
-    let storage = Arc::new(RemoteStorage::new(channel.clone(), 0));
-    let state_store = store_of(state.as_ref());
-    let routed = routed_of(members.as_ref(), flags, &storage)?;
-    let checks = Arc::new(checks(
-        Arc::clone(&readiness),
-        storage.clone(),
-        routed.clone(),
-        state_store,
-        timeout,
-    ));
-    let backend = match &routed {
-        Some(routed) => Backend::routed(Arc::clone(routed), storage),
-        None => Backend::remote(storage),
+    let prepared = Prepared::new(flags, None)?;
+    let state = flags
+        .server
+        .state_store
+        .as_ref()
+        .map(crate::StateStoreUri::open)
+        .transpose()?;
+    prepared.start(state, shutdown)
+}
+
+/// Starts the frontend the flags describe, taking over from the one serving on
+/// `--handover-socket`, if there is one (see [`crate::handover`]): it adopts that
+/// frontend's listeners, waits for it to stand down, and opens the state store at the
+/// generation it held. Without the flag, or with no frontend on the socket, this is
+/// [`start_frontend`].
+///
+/// `shutdown` is called first. A stop before the serving frontend is told this one is
+/// ready leaves it serving, untouched.
+///
+/// # Errors
+/// As [`start_frontend`]; the frontend serving refuses the handover (other listen
+/// addresses or another state store than this one's), or fails to stand down; the state
+/// store is not at the generation the serving frontend held; or `shutdown` completes
+/// before the handover is agreed.
+pub async fn start_or_take_over<S, F>(
+    flags: &FrontendFlags,
+    shutdown: S,
+) -> Result<FrontendHandle, Box<dyn Error>>
+where
+    S: FnOnce() -> io::Result<F> + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
+    take_over(flags, boxed(shutdown)).await
+}
+
+/// What asking for a handover found.
+enum Asked<'a> {
+    /// Nobody serves: a start with no predecessor.
+    Nobody,
+    /// A frontend serves and offered to hand over; this is everything that does not
+    /// need the state store, built from what it offered.
+    Offered(handover::Offer, Box<Prepared<'a>>),
+}
+
+/// [`start_or_take_over`], not generic.
+async fn take_over(
+    flags: &FrontendFlags,
+    shutdown: Shutdown,
+) -> Result<FrontendHandle, Box<dyn Error>> {
+    let mut stopping = shutdown()?;
+    let Some(handover) = &flags.handover else {
+        return bind_frontend(flags, Box::new(move || Ok(stopping)));
     };
-
-    let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
-    let default_memory = listeners.memory_ladder.first();
-    let durable = state.is_some();
-    let farm = Farm::new(
-        backend.clone(),
-        listeners.unservable_wait,
-        listeners.finished_retention,
-    )
-    .with_memory_ladder(listeners.memory_ladder.clone())
-    .recording(recorder.clone());
-    let farm = Arc::new(farm.with_state(state)?);
-    log_state(durable, farm.term(), farm.lease_epoch());
-
-    let (reapi_incoming, reapi) = bind(listeners.reapi)?;
-    let (worker_incoming, worker) = bind(listeners.worker)?;
-    let peers_certified = listeners.worker_tls.is_some();
-    let (mut worker_server, peers, worker_tls) = worker_peers(
-        keepalive(
-            flow_control(Server::builder(), listeners.stream_limits.worker),
-            listeners.streams,
-        ),
-        listeners.worker_tls,
-    );
-    let tls_sources: Vec<TlsSource> = listeners
-        .reapi_tls
-        .iter()
-        .chain(&worker_tls)
-        .cloned()
-        .collect();
-    let reapi_incoming = Incoming::new(reapi_incoming, listeners.reapi_tls);
-    let worker_incoming = Incoming::new(worker_incoming, worker_tls);
-    let api_listener = api.as_ref().map(|api| bind_api(api.listen)).transpose()?;
-    let api_addr = api_listener.as_ref().map(|(_, local)| *local);
-    let (closer, closing) = kbf_front::closing();
-    let (drain, goaway) = Drain::new(closer, Arc::clone(&readiness));
-    let drain = Arc::new(drain);
-    let api_routes = crate::api::router(
-        Arc::clone(&farm),
-        api.and_then(|api| api.token),
-        Arc::clone(&drain),
-        members.clone(),
-    )
-    .merge(crate::health::router_of(Arc::clone(&checks)))
-    .merge(metrics_route(backend.clone(), tls_sources));
-
-    let mut reapi_server = keepalive(
-        flow_control(Server::builder(), listeners.stream_limits.reapi),
-        listeners.streams,
-    );
-    let sessions = WorkerService::new(
-        Arc::clone(&farm),
-        peers,
-        listeners.heartbeat_interval,
-        listeners.hello_wait,
-    );
-    // Daemons are sent the members' map: Welcome.map and a MapUpdate at each bump.
-    let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
-    let worker_service = WorkerServer::new(sessions)
-        .max_decoding_message_size(MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_MESSAGE_BYTES);
-
-    let membership = membership(members.clone(), peers_certified);
-    let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
-    let authorizers = Arc::new(policy.authorizers);
-    let bootstrap = Owner::new(&flags.storage.uri().to_string(), channel);
-    let owners = match routed {
-        Some(routed) => Owners::routed(routed, bootstrap),
-        None => Owners::single(bootstrap),
+    // Until the serving frontend is told this one is ready, a stop leaves it untouched.
+    let asked = async {
+        let hello = hello(flags)?;
+        let Some((offer, sockets)) = handover::knock(&handover.socket, &hello).await? else {
+            return Ok::<_, Box<dyn Error>>(Asked::Nobody);
+        };
+        Ok(Asked::Offered(
+            offer,
+            Box::new(Prepared::new(flags, Some(sockets))?),
+        ))
     };
-    let proxy = Proxy::new(owners, Arc::clone(&authorizers));
-    let reapi_routes = kbf_front::routes_proxied(
-        &proxy,
-        backend,
-        Arc::clone(&farm),
-        kbf_front::OpenStreams { closing, progress },
-        authorizers,
-        &recorder,
-        default_memory,
-    );
-    let reapi_routes = Routes::from(
-        reapi_routes
-            .into_axum_router()
-            .layer(AuthenticateLayer::new(policy.authenticator))
-            .layer(RequestMetadataLayer::new()),
-    )
-    .add_service(HealthServer::new(HealthService::of(
-        Arc::clone(&checks),
-        WATCH_INTERVAL,
-    )));
-
-    let shutdown = shutdown()?;
-    let stopper = Arc::clone(&drain);
-    let serving = async move {
-        let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
-        let reapi_serve = reapi_server
-            .add_routes(reapi_routes)
-            .serve_with_incoming_shutdown(reapi_incoming, async {
-                let _ = goaway.await;
-            });
-        let worker_serve = worker_server
-            .add_service(worker_service)
-            .add_optional_service(membership)
-            .serve_with_incoming(worker_incoming);
-        // Told when the REAPI listener is done (see `serve::stop_api`).
-        let (api_stop, api_stopped) = tokio::sync::oneshot::channel::<()>();
-        let api_serve = serve_api(
-            api_listener.map(|(listener, _)| listener),
-            api_routes,
-            async {
-                let _ = api_stopped.await;
-            },
-        );
-        tokio::pin!(api_serve);
-        let sweeping = sweeping(members);
-        let ticking = async {
-            let mut tick = tokio::time::interval(listeners.tick);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tick.tick().await;
-                farm.tick().await;
-            }
-        };
-        let stopping = async {
-            shutdown.await;
-            drain_and_stop(&stopper, listeners.shutdown_timeout).await;
-        };
-        let mut reapi_done = false;
-        let outcome = tokio::select! {
-            served = reapi_serve => {
-                reapi_done = true;
-                served.map_err(ServeError::from)
-            }
-            served = worker_serve => served.map_err(ServeError::from),
-            served = &mut api_serve => served.map_err(ServeError::Api),
-            () = sweeping => Ok(()),
-            () = ticking => Ok(()),
-            () = ticker.run() => Ok(()),
-            () = stopping => Ok(()),
-        };
-        if reapi_done {
-            stop_api(api_stop, api_serve).await;
-        }
-        outcome
+    let asked = tokio::select! {
+        biased;
+        () = &mut stopping => return Err("stopped before the handover was agreed".into()),
+        asked = asked => asked?,
     };
-    let plain = args.plain_text_off_loopback();
-    Ok(FrontendHandle {
-        reapi,
-        worker,
-        api: api_addr,
-        drain,
-        escalation: None,
-        start_line: start_line(
-            reapi,
-            worker,
-            api_addr,
-            &flags.storage.uri().to_string(),
-            &plain,
-        ),
-        serving: Box::pin(serving),
+    let (offer, prepared) = match asked {
+        Asked::Nobody => return bind_frontend(flags, Box::new(move || Ok(stopping))),
+        Asked::Offered(offer, prepared) => (offer, prepared),
+    };
+    let generation = offer.generation;
+    offer.ready().await?;
+    let state = state_uri(flags)?.open_after_handover(generation)?;
+    prepared.start(Some(state), Box::new(move || Ok(stopping)))
+}
+
+/// The `--state-store` of a frontend that hands over (the flag requires it).
+fn state_uri(flags: &FrontendFlags) -> Result<&crate::StateStoreUri, HandoverError> {
+    flags
+        .server
+        .state_store
+        .as_ref()
+        .ok_or(HandoverError::NoState)
+}
+
+/// What this frontend tells the one serving, to be allowed to take over.
+fn hello(flags: &FrontendFlags) -> Result<Message, Box<dyn Error>> {
+    let listeners = flags.server.listeners()?;
+    let api = flags.server.api()?;
+    Ok(Message::Hello {
+        version: handover::wire::PROTOCOL,
+        reapi: listeners.reapi,
+        worker: listeners.worker,
+        api: api.map(|api| api.listen),
+        state: state_uri(flags)?.path().to_owned(),
     })
+}
+
+/// A frontend's start up to the state store: everything the flags decide that needs
+/// neither the store nor the sockets bound, and the sockets adopted from a frontend that
+/// is handing over.
+struct Prepared<'a> {
+    flags: &'a FrontendFlags,
+    listeners: crate::serve::Listeners,
+    policy: kbf_auth::Policy,
+    api: Option<crate::serve::Api>,
+    channel: tonic::transport::Channel,
+    /// The sockets of the frontend handing over, checked against the flags.
+    adopted: Option<Trio>,
+}
+
+/// The sockets to serve on: those adopted, or new ones bound.
+fn sockets(
+    adopted: Option<Trio>,
+    listeners: &crate::serve::Listeners,
+    api: Option<&crate::serve::Api>,
+    spare: bool,
+) -> Result<Trio, ServeError> {
+    let bound = || {
+        Ok(Trio {
+            reapi: Socket::bind(listeners.reapi, spare)?,
+            worker: Socket::bind(listeners.worker, spare)?,
+            api: api.map(|api| Socket::bind(api.listen, spare)).transpose()?,
+        })
+    };
+    adopted.map_or_else(bound, Ok)
+}
+
+/// The three listening sockets.
+struct Trio {
+    reapi: Socket,
+    worker: Socket,
+    api: Option<Socket>,
+}
+
+impl Trio {
+    /// The sockets of a frontend handing over, each checked to listen where the flags say.
+    fn adopt(
+        sockets: Sockets,
+        listeners: &crate::serve::Listeners,
+        api: Option<&crate::serve::Api>,
+        spare: bool,
+    ) -> Result<Self, ServeError> {
+        let reapi = Socket::adopt(sockets.reapi, listeners.reapi, spare)?;
+        let worker = Socket::adopt(sockets.worker, listeners.worker, spare)?;
+        let api = sockets
+            .api
+            .zip(api)
+            .map(|(fd, api)| Socket::adopt(fd, api.listen, spare));
+        let api = api.transpose()?;
+        Ok(Self { reapi, worker, api })
+    }
+}
+
+impl<'a> Prepared<'a> {
+    /// Reads the flags, and adopts `inherited` if given: each socket must listen where
+    /// the flags say.
+    fn new(flags: &'a FrontendFlags, inherited: Option<Sockets>) -> Result<Self, Box<dyn Error>> {
+        let args = &flags.server;
+        let listeners = args.listeners()?;
+        let policy = args.reapi_auth_policy()?;
+        let api = args.api()?;
+        let channel = flags.storage_endpoint()?.connect_lazy();
+        let spare = flags.handover.is_some();
+        let adopted = inherited.map(|s| Trio::adopt(s, &listeners, api.as_ref(), spare));
+        let adopted = adopted.transpose()?;
+        Ok(Self {
+            flags,
+            listeners,
+            policy,
+            api,
+            channel,
+            adopted,
+        })
+    }
+
+    /// Opens everything over `state` and binds (or takes) the listeners.
+    fn start(
+        self,
+        state: Option<crate::StateStore>,
+        shutdown: Shutdown,
+    ) -> Result<FrontendHandle, Box<dyn Error>> {
+        let Self {
+            flags,
+            listeners,
+            policy,
+            api,
+            channel,
+            adopted,
+        } = self;
+        let args = &flags.server;
+        let state = crate::start::with_members(state, args.members());
+        let members = members_of(state.as_ref());
+        let map = map_of(None, members.as_ref())?;
+        let readiness = Arc::new(Readiness::default());
+        let timeout = listeners.store_probe_timeout;
+        let storage = Arc::new(RemoteStorage::new(channel.clone(), 0));
+        let state_store = store_of(state.as_ref());
+        let routed = routed_of(members.as_ref(), flags, &storage)?;
+        let checks = Arc::new(checks(
+            Arc::clone(&readiness),
+            storage.clone(),
+            routed.clone(),
+            state_store.clone(),
+            timeout,
+        ));
+        let backend = match &routed {
+            Some(routed) => Backend::routed(Arc::clone(routed), storage),
+            None => Backend::remote(storage),
+        };
+
+        let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
+        let default_memory = listeners.memory_ladder.first();
+        let durable = state.is_some();
+        let farm = Farm::new(
+            backend.clone(),
+            listeners.unservable_wait,
+            listeners.finished_retention,
+        )
+        .with_memory_ladder(listeners.memory_ladder.clone())
+        .recording(recorder.clone());
+        let farm = Arc::new(farm.with_state(state)?);
+        log_state(durable, farm.term(), farm.lease_epoch());
+
+        let sockets = sockets(adopted, &listeners, api.as_ref(), flags.handover.is_some())?;
+        let peers_certified = listeners.worker_tls.is_some();
+        let (mut worker_server, peers, worker_tls) = worker_peers(
+            keepalive(
+                flow_control(Server::builder(), listeners.stream_limits.worker),
+                listeners.streams,
+            ),
+            listeners.worker_tls,
+        );
+        let tls_sources: Vec<TlsSource> = listeners
+            .reapi_tls
+            .iter()
+            .chain(&worker_tls)
+            .cloned()
+            .collect();
+        let (closer, closing) = kbf_front::closing();
+        let (drain, goaway) = Drain::new(closer, Arc::clone(&readiness));
+        let drain = Arc::new(drain);
+        let (worker_stop, api_stop) = (Stop::new(), Stop::new());
+        let Trio {
+            mut reapi,
+            mut worker,
+            api: mut api_socket,
+        } = sockets;
+        let (reapi_addr, worker_addr) = (reapi.local, worker.local);
+        let api_addr = api_socket.as_ref().map(|socket| socket.local);
+        // What a successor is offered, if this frontend hands over.
+        let spares = reapi
+            .spare
+            .take()
+            .zip(worker.spare.take())
+            .map(|(reapi, worker)| Sockets {
+                reapi,
+                worker,
+                api: api_socket.as_mut().and_then(|socket| socket.spare.take()),
+            });
+        // Both listeners are closed the moment the drain begins and the worker listener
+        // is stopped, whatever the transport is doing then.
+        let (reapi_incoming, reapi_latch) = reapi.grpc(listeners.reapi_tls)?;
+        drain.begins().closes(reapi_latch);
+        let (worker_incoming, worker_latch) = worker.grpc(worker_tls)?;
+        worker_stop.closes(worker_latch);
+        let api_listener = api_socket.map(Socket::http).transpose()?;
+        let api_routes = crate::api::router(
+            Arc::clone(&farm),
+            api.and_then(|api| api.token),
+            Arc::clone(&drain),
+            members.clone(),
+        )
+        .merge(crate::health::router_of(Arc::clone(&checks)))
+        .merge(metrics_route(backend.clone(), tls_sources));
+
+        let mut reapi_server = keepalive(
+            flow_control(Server::builder(), listeners.stream_limits.reapi),
+            listeners.streams,
+        );
+        let sessions = WorkerService::new(
+            Arc::clone(&farm),
+            peers,
+            listeners.heartbeat_interval,
+            listeners.hello_wait,
+        );
+        // Daemons are sent the members' map: Welcome.map and a MapUpdate at each bump.
+        let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
+        let worker_service = WorkerServer::new(sessions)
+            .max_decoding_message_size(MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_MESSAGE_BYTES);
+
+        let membership = membership(members.clone(), peers_certified);
+        let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
+        let authorizers = Arc::new(policy.authorizers);
+        let bootstrap = Owner::new(&flags.storage.uri().to_string(), channel);
+        let owners = match routed {
+            Some(routed) => Owners::routed(routed, bootstrap),
+            None => Owners::single(bootstrap),
+        };
+        let proxy = Proxy::new(owners, Arc::clone(&authorizers));
+        let reapi_routes = kbf_front::routes_proxied(
+            &proxy,
+            backend,
+            Arc::clone(&farm),
+            kbf_front::OpenStreams { closing, progress },
+            authorizers,
+            &recorder,
+            default_memory,
+        );
+        let reapi_routes = Routes::from(
+            reapi_routes
+                .into_axum_router()
+                .layer(AuthenticateLayer::new(policy.authenticator))
+                .layer(RequestMetadataLayer::new()),
+        )
+        .add_service(HealthServer::new(HealthService::of(
+            Arc::clone(&checks),
+            WATCH_INTERVAL,
+        )));
+
+        // The tasks that run beside the listeners: the state store's expiry, which a
+        // handover ends, and the control socket.
+        let (sweeper, sweep_registration) = AbortHandle::new_pair();
+        let mut background: Vec<BoxFuture<'static, ()>> = vec![
+            Abortable::new(sweeping(members), sweep_registration)
+                .map(drop)
+                .boxed(),
+        ];
+        let holder = flags
+            .handover
+            .as_ref()
+            .zip(state_store.zip(spares))
+            .map(|(handover, (store, spares))| {
+                let facts = Facts {
+                    reapi: reapi_addr,
+                    worker: worker_addr,
+                    api: api_addr,
+                    state: args
+                        .state_store
+                        .as_ref()
+                        .map_or_else(PathBuf::new, |uri| uri.path().to_owned()),
+                };
+                let stand = Stand {
+                    drain: Arc::clone(&drain),
+                    farm: Arc::clone(&farm),
+                    worker: worker_stop.clone(),
+                    api: api_stop.clone(),
+                    sweeper: sweeper.clone(),
+                    store,
+                    wait: handover.quiesce,
+                };
+                let uid = rustix::process::geteuid().as_raw();
+                Holder::bind(&handover.socket, uid, facts, spares, stand).map(|holder| {
+                    holder
+                        .run(Arc::clone(&farm), handover.follow_interval)
+                        .boxed()
+                })
+            })
+            .transpose();
+        background.extend(holder?);
+
+        let shutdown = shutdown()?;
+        let stopper = Arc::clone(&drain);
+        let serving = async move {
+            let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
+            let reapi_serve = reapi_server
+                .add_routes(reapi_routes)
+                .serve_with_incoming_shutdown(reapi_incoming, async {
+                    let _ = goaway.await;
+                });
+            let worker_stopped = worker_stop.fired();
+            let worker_serve = worker_server
+                .add_service(worker_service)
+                .add_optional_service(membership)
+                .serve_with_incoming_shutdown(worker_incoming, worker_stopped);
+            // Told when the REAPI listener is done (see `serve::stop_api`), or by a handover.
+            let (api_stop_when_done, api_stopped) = tokio::sync::oneshot::channel::<()>();
+            let api_stopped_by_handover = api_stop.fired();
+            let api_serve = serve_api(api_listener, api_routes, async {
+                let _ = futures::future::select(api_stopped, api_stopped_by_handover).await;
+            })
+            .fuse();
+            tokio::pin!(api_serve);
+            let ticking = async {
+                let mut tick = tokio::time::interval(listeners.tick);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    farm.tick().await;
+                }
+            };
+            let stopping = async {
+                shutdown.await;
+                drain_and_stop(&stopper, listeners.shutdown_timeout).await;
+            };
+            let mut reapi_done = false;
+            // A listener that ends without an error does not end the frontend: the worker
+            // and operator API listeners end when a handover stops them, and the frontend
+            // goes on answering the callers it kept until its REAPI listener is done.
+            let outcome = tokio::select! {
+                served = reapi_serve => {
+                    reapi_done = true;
+                    served.map_err(ServeError::from)
+                }
+                Err(e) = worker_serve => Err(ServeError::from(e)),
+                Err(e) = &mut api_serve => Err(ServeError::Api(e)),
+                () = ticking => Ok(()),
+                () = ticker.run() => Ok(()),
+                () = stopping => Ok(()),
+            };
+            if reapi_done {
+                stop_api(api_stop_when_done, api_serve).await;
+            }
+            outcome
+        };
+        let plain = args.plain_text_off_loopback();
+        Ok(FrontendHandle {
+            reapi: reapi_addr,
+            worker: worker_addr,
+            api: api_addr,
+            drain,
+            escalation: None,
+            start_line: start_line(
+                reapi_addr,
+                worker_addr,
+                api_addr,
+                &flags.storage.uri().to_string(),
+                &plain,
+            ),
+            serving: Box::pin(serving),
+            background,
+            ready: Ready {
+                checks,
+                notify: None,
+            },
+        })
+    }
 }
 
 /// The store `/readyz` probes: the open state store's, if there is one.
@@ -679,9 +1030,12 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
     sizes.log();
     sizes.runtime()?.block_on(async {
         let (first, second) = interruptions()?;
-        let mut frontend = start_frontend(flags, move || Ok(first))?;
+        let mut frontend = start_or_take_over(flags, move || Ok(first)).await?;
         frontend.escalation = Some(second);
         println!("{}", frontend.start_line());
+        // Set by the service manager of a `Type=notify` unit (not a flag: it names the
+        // manager's socket, which only the manager knows).
+        let frontend = frontend.notifying(std::env::var_os("NOTIFY_SOCKET"));
         Ok(frontend.serve().await?)
     })
 }

@@ -182,6 +182,7 @@ fn a_submitted_operation_is_loaded_queued() {
                 lease: None,
                 losses: 0,
             }],
+            cordons: Vec::new(),
         }
     );
     let again = durable.submitted(OperationId(4), &request(2));
@@ -628,4 +629,100 @@ fn the_generation_is_the_stored_number_or_none() {
     assert_eq!(durable.generation().expect("read"), None);
     put(&store, GENERATION, 42u64.to_be_bytes().to_vec());
     assert_eq!(durable.generation().expect("read"), Some(42));
+}
+
+/// Catches: an operator's cordon or drain not kept (a successor process would offer
+/// leases to a node the operator took out of placement), a drain that loses its deadline,
+/// a node returned to placement whose row stays (it would come back cordoned at every
+/// start), and a row that is not a cordon taken for one. Each row is read back as it was
+/// written, in node-id order.
+#[test]
+fn a_cordon_is_kept_until_the_node_returns_to_placement() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    let (a, b) = (WorkerId::new("node-a"), WorkerId::new("node-b"));
+    durable
+        .cordoned(
+            &b,
+            Some(StoredCordon::Draining {
+                deadline_unix_ms: 1_234_567,
+            }),
+        )
+        .expect("drain");
+    durable
+        .cordoned(&a, Some(StoredCordon::Cordoned))
+        .expect("cordon");
+    assert_eq!(
+        durable.load().expect("load").cordons,
+        [
+            (a.clone(), StoredCordon::Cordoned),
+            (
+                b,
+                StoredCordon::Draining {
+                    deadline_unix_ms: 1_234_567
+                }
+            ),
+        ]
+    );
+    durable.cordoned(&a, None).expect("uncordon");
+    durable
+        .cordoned(&a, None)
+        .expect("uncordoning twice changes nothing");
+    let left: Vec<String> = keys(&store)
+        .into_iter()
+        .filter(|k| k.starts_with("cordon/"))
+        .collect();
+    assert_eq!(left, ["cordon/node-b"]);
+
+    for (row, why) in [
+        (vec![], "not a cordon"),
+        (vec![2], "not a cordon"),
+        (vec![0, 0], "not a cordon"),
+        (vec![1, 1, 2], "a drain deadline is not 8 bytes"),
+    ] {
+        put(&store, "cordon/node-c", row);
+        let error = durable.load().expect_err("a corrupt row").to_string();
+        assert!(error.contains(why), "{error}");
+    }
+}
+
+/// Catches: a follower that cannot tell the four states of an operation in the store
+/// apart: ended (its `done/` row, whichever other rows are still there), waiting for a
+/// lease, holding one, and no trace of it at all.
+#[test]
+fn an_operation_is_ended_queued_running_or_gone() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    let operation = OperationId(4);
+    assert_eq!(
+        durable.progress(operation).expect("progress"),
+        Progress::Gone
+    );
+    assert!(Progress::Gone.is_gone());
+    assert!(!Progress::Queued.is_gone());
+    durable.submitted(operation, &request(1)).expect("submit");
+    assert_eq!(
+        durable.progress(operation).expect("progress"),
+        Progress::Queued
+    );
+    durable
+        .persist(&[Effect::Start(start(4, 0))])
+        .expect("grant");
+    assert_eq!(
+        durable.progress(operation).expect("progress"),
+        Progress::Running
+    );
+    let finished = Finished::Failed(kbf_proto::google::rpc::Status {
+        code: 3,
+        message: "invalid".to_owned(),
+        details: Vec::new(),
+    });
+    durable
+        .done(operation, &finished, Duration::from_secs(1))
+        .expect("done");
+    assert_eq!(
+        durable.progress(operation).expect("progress"),
+        Progress::Ended(finished),
+        "the result wins over the rows of the operation that are still there"
+    );
 }

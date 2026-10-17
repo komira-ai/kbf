@@ -99,7 +99,7 @@ impl Admission {
     /// # Errors
     /// See [`Admission::check_leaf`].
     pub fn check<T>(&self, request: &Request<T>, endpoint: Endpoint) -> Result<(), Status> {
-        let certs = request.peer_certs();
+        let certs = kbf_tls::peer_certs(request);
         let leaf = certs.as_deref().and_then(|chain| chain.first());
         self.check_leaf(leaf.map(AsRef::as_ref), endpoint)
     }
