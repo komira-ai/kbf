@@ -36,7 +36,7 @@ fn a_header_says_what_kind_of_binary_a_file_is() {
         &elf(243, ""),
         &[0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2],
         &macho(0x0000_000c, ""),
-        b"#!/bin/sh\necho hi\n",
+        b"#!/usr/bin/env kbf-no-such-program\necho hi\n",
         &elf(0x3e, "")[..19],
         b"",
     ];
