@@ -46,6 +46,7 @@ fn shape(inv: &str, action: u8, cfg_bytes: usize) -> Event {
                 kind: TargetKind::Bxl,
                 label: Text::sent("l".repeat(600)),
             }),
+            test: false,
         })),
     }
 }
