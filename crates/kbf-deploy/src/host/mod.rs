@@ -244,12 +244,17 @@ pub fn status_lines(host: &Layout, status: &Status) -> String {
         Or(&s.staged)
     ));
     match &s.pending_confirm {
-        Some(p) => text.push_str(&format!(
-            "pending confirm: {} by {} (unix seconds), else back to {}\n",
-            p.commit,
-            p.deadline,
-            Or(&p.previous)
-        )),
+        Some(p) => {
+            let by = match p.deadline {
+                Some(deadline) => format!("by {deadline} (unix seconds)"),
+                None => "once its window starts (its first start)".to_owned(),
+            };
+            text.push_str(&format!(
+                "pending confirm: {} {by}, else back to {}\n",
+                p.commit,
+                Or(&p.previous)
+            ));
+        }
         None => text.push_str("pending confirm: none\n"),
     }
     text.push_str(&format!("order floor: {}\n", s.order_floor));

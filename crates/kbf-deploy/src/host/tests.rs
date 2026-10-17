@@ -125,6 +125,40 @@ fn status_prints_the_state_and_the_link_verdict() {
     );
 }
 
+/// Catches a swap whose window has not started (a Linux swap waits for the new
+/// release's first start) printed with a deadline that is not there, and the order and
+/// the start budget of the swap left out of what a script parses.
+///
+/// Mutant seen red: the `None` deadline printed as `0`.
+#[test]
+fn status_says_when_the_window_to_confirm_has_not_started() {
+    let (root, dir) = host_root("deploy-host-status-window");
+    let mut state = full_state();
+    let pending = state.pending_confirm.as_mut().expect("pending");
+    pending.deadline = None;
+    pending.order_id = Some("order-1".to_owned());
+    pending.starts_left = Some(3);
+    Locked::acquire(&root)
+        .expect("lock")
+        .write(&state)
+        .expect("write");
+    let (_, out, _) = status_cli(&dir, &[]);
+    assert!(
+        out.contains(&format!(
+            "pending confirm: {A} once its window starts (its first start), else back to {B}\n"
+        )),
+        "{out}"
+    );
+    let (_, out, _) = status_cli(&dir, &["--json"]);
+    assert!(
+        out.contains(&format!(
+            "\"pending_confirm\":{{\"commit\":\"{A}\",\"order_id\":\"order-1\",\
+             \"previous\":\"{B}\",\"starts_left\":3}}"
+        )),
+        "{out}"
+    );
+}
+
 /// Catches a state file that cannot be parsed shown as no state (an operator would
 /// swap on a host whose state is lost), and a relative `--root`.
 #[test]

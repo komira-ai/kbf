@@ -13,6 +13,8 @@
 //!   to be confirmed, and the order floor), read and written under an exclusive lock and
 //!   replaced whole by a rename.
 //! - [`release`]: the `install`, `stage`, `rollback` and `gc` verbs.
+//! - [`activate`]: the swap on trial: `activate`, `confirm`, `revert`, the start check
+//!   and the expiry, and the repair of the links after an interrupted verb.
 //! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
 //!   named by.
 //!
@@ -34,6 +36,7 @@
 //! trust rests on GitHub's build attestation of the artifacts workflow on the host's
 //! source ref (docs/deploy/host-releases.md, "What is trusted").
 
+pub mod activate;
 pub mod archive;
 pub mod attest;
 pub mod binary;

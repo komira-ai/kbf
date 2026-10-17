@@ -37,7 +37,9 @@ pub fn full_state() -> State {
         pending_confirm: Some(PendingConfirm {
             commit: c(A),
             previous: Some(c(B)),
-            deadline: 1_800_000_000,
+            deadline: Some(1_800_000_000),
+            order_id: None,
+            starts_left: None,
         }),
         order_floor: 7,
     }

@@ -512,7 +512,9 @@ fn every_verb_refuses_while_a_deploy_is_pending() {
         pending_confirm: Some(PendingConfirm {
             commit: c(C),
             previous: None,
-            deadline: 1,
+            deadline: Some(1),
+            order_id: None,
+            starts_left: None,
         }),
         ..State::default()
     };
@@ -772,7 +774,9 @@ fn stage_copies_and_records_the_release_and_moves_no_link() {
             pending_confirm: Some(PendingConfirm {
                 commit: c(A),
                 previous: None,
-                deadline: 1,
+                deadline: Some(1),
+                order_id: None,
+                starts_left: None,
             }),
             ..state_of(&root)
         })

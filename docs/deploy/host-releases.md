@@ -138,3 +138,22 @@ otherwise the stage refuses and names the path (`untrusted-owner`, `untrusted-wr
   another user.
 - `kbf-daemon --version --json` is not implemented today (`kbf-daemon --version` prints one
   plain line); the version check above is what a Mac release needs it for.
+
+## Swapping a staged release in on trial
+
+`kbf_installer::activate` is what a program that applies orders calls (no command of
+`kbf-deploy` does yet). It never changes a release's files: a release directory is
+written once, so the process running the old release keeps its file, and only the
+`current` and `previous` links move.
+
+| Call | Does |
+|---|---|
+| `activate` | an order names a staged release, a serial and an order id. The state is written first (`current` = the new release, `previous` = the one that ran, `staged` cleared, the floor raised to the serial, a pending record naming the order), then `previous` and `current` move, each by an atomic rename. The caller restarts the service. A repeat of the order, or an order for the release already current, changes nothing; an order below the floor is refused. |
+| `confirm` | the new release came up: the pending record is cleared. It must name the order that made the swap. |
+| `revert` | `current` goes back to the release that ran before; the state is written first. If that release's files are gone nothing changes and the swap stays pending. |
+| `boot_check` | run before every start of the service. The first start after a swap starts the confirm window (not the swap: the frontend's own update can wait hours between the two); with a start budget, a release started that many times without a confirm is reverted before it starts again. |
+| `expire` | a swap whose window ran out without a confirm is reverted. On macOS, where nothing runs before a start, the window starts at the swap and this is the only trigger. |
+| `reconcile` | after an interrupted verb, make the links agree with the state. |
+
+The window is bounded by the host (120 to 1800 seconds), not by the order. Retention is
+`gc --keep 1`: the running release, the previous one and the newest other.

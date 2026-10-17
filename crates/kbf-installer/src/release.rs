@@ -83,6 +83,22 @@ pub enum ReleaseError {
     NoPrevious,
     #[error("the previous release {0} is gone (no binary at its directory)")]
     PreviousGone(CommitId),
+    #[error("release {0} is not installed (no binary at its directory): stage it first")]
+    NotInstalled(CommitId),
+    #[error(
+        "order serial {serial} is below this host's floor {floor}: a release is never ordered down"
+    )]
+    BelowFloor { serial: u64, floor: u64 },
+    #[error("the pending swap of {commit} was made by {pending}, not by order {got:?}")]
+    OtherOrder {
+        commit: CommitId,
+        pending: String,
+        got: String,
+    },
+    #[error("no swap is pending, and {0} is not the current release")]
+    NotPending(CommitId),
+    #[error("a confirm window of {0} s is outside the {min} to {max} s the host allows", min = crate::activate::WINDOW_MIN_SECS, max = crate::activate::WINDOW_MAX_SECS)]
+    Window(u64),
 }
 
 /// The error closure for a read of `path`.
@@ -431,21 +447,25 @@ pub fn rollback<E: Exec>(
     let Some(previous) = state.previous.clone() else {
         return Err(ReleaseError::NoPrevious);
     };
-    // Any binary of a release will do: a Linux one holds `kbf`, a macOS one `kbf-daemon`.
-    let there = layout::RELEASE_BINARIES.iter().any(|name| {
+    if !has_binary(exec, &previous) {
+        return Err(ReleaseError::PreviousGone(previous));
+    }
+    // The state records no release before the previous one, so `previous` goes.
+    switch(exec, host, lock, &state, (previous, None), out)
+}
+
+/// Whether the release `commit` has a binary in its directory. Any will do: a Linux
+/// release holds `kbf`, a macOS one `kbf-daemon`.
+pub(crate) fn has_binary<E: Exec>(exec: &E, commit: &CommitId) -> bool {
+    layout::RELEASE_BINARIES.iter().any(|name| {
         matches!(
-            exec.stat(&layout::release_file(&previous, name)),
+            exec.stat(&layout::release_file(commit, name)),
             Ok(Some(Meta {
                 kind: Kind::File,
                 ..
             }))
         )
-    });
-    if !there {
-        return Err(ReleaseError::PreviousGone(previous));
-    }
-    // The state records no release before the previous one, so `previous` goes.
-    switch(exec, host, lock, &state, (previous, None), out)
+    })
 }
 
 /// `host gc --keep N`: remove each release directory but the kept ones: the state's
