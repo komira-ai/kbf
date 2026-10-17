@@ -188,7 +188,7 @@ async fn build(pki: &Pki, owner: &Node, pushes_map: bool, scratch: &std::path::P
         worker: loopback,
         reapi_tls: None,
         worker_tls: Some(WorkerTls {
-            server: pki.server_tls(),
+            server: pki.worker_tls(),
             deny_list: None,
         }),
         heartbeat_interval: Duration::from_millis(100),

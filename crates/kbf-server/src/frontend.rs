@@ -79,6 +79,7 @@ use kbf_route::TlsNodes;
 use kbf_storage::Storage;
 use kbf_storage::service::RemoteStorage;
 use kbf_threads::Topology;
+use kbf_tls::{Incoming, TlsSource};
 use tonic::service::Routes;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server};
 
@@ -111,6 +112,7 @@ pub const ALLOWED: &[&str] = &[
     "worker_tls_cert",
     "worker_tls_key",
     "worker_client_ca",
+    "tls_reload_interval_secs",
     "worker_deny_list",
     "heartbeat_interval_ms",
     "progress_interval_secs",
@@ -473,6 +475,22 @@ fn bind_frontend(
 
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
+    let peers_certified = listeners.worker_tls.is_some();
+    let (mut worker_server, peers, worker_tls) = worker_peers(
+        keepalive(
+            flow_control(Server::builder(), listeners.stream_limits.worker),
+            listeners.streams,
+        ),
+        listeners.worker_tls,
+    );
+    let tls_sources: Vec<TlsSource> = listeners
+        .reapi_tls
+        .iter()
+        .chain(&worker_tls)
+        .cloned()
+        .collect();
+    let reapi_incoming = Incoming::new(reapi_incoming, listeners.reapi_tls);
+    let worker_incoming = Incoming::new(worker_incoming, worker_tls);
     let api_listener = api.as_ref().map(|api| bind_api(api.listen)).transpose()?;
     let api_addr = api_listener.as_ref().map(|(_, local)| *local);
     let (closer, closing) = kbf_front::closing();
@@ -485,23 +503,12 @@ fn bind_frontend(
         members.clone(),
     )
     .merge(crate::health::router_of(Arc::clone(&checks)))
-    .merge(metrics_route(backend.clone()));
+    .merge(metrics_route(backend.clone(), tls_sources));
 
     let mut reapi_server = keepalive(
         flow_control(Server::builder(), listeners.stream_limits.reapi),
         listeners.streams,
     );
-    if let Some(tls) = listeners.reapi_tls {
-        reapi_server = reapi_server.tls_config(tls)?;
-    }
-    let peers_certified = listeners.worker_tls.is_some();
-    let (mut worker_server, peers) = worker_peers(
-        keepalive(
-            flow_control(Server::builder(), listeners.stream_limits.worker),
-            listeners.streams,
-        ),
-        listeners.worker_tls,
-    )?;
     let sessions = WorkerService::new(
         Arc::clone(&farm),
         peers,
@@ -621,14 +628,14 @@ fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Stor
 }
 
 /// `GET /metrics`: what the service counts, in the Prometheus text format.
-fn metrics_route(backend: Backend) -> axum::Router {
+fn metrics_route(backend: Backend, tls: Vec<TlsSource>) -> axum::Router {
+    let tls = Arc::new(tls);
     let render = move || {
-        let backend = backend.clone();
+        let (backend, tls) = (backend.clone(), Arc::clone(&tls));
         async move {
-            (
-                [(CONTENT_TYPE, crate::metrics::TEXT_FORMAT)],
-                backend.render_metrics(),
-            )
+            let mut text = backend.render_metrics();
+            kbf_tls::render_metrics(tls.iter(), &mut text);
+            ([(CONTENT_TYPE, crate::metrics::TEXT_FORMAT)], text)
         }
     };
     axum::Router::new().route("/metrics", get(render))
