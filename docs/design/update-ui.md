@@ -1,272 +1,418 @@
-# The update page: versions per host, update available, update action
+# The update page: versions per host, update available, the update button
 
-Status: design. Nothing in this file is built. Facts marked **[F]** were read from the code on two lines of work, named
-here because the page needs both: **arch-v2** (`760fbb06`: `kbf-ui`, `GET /v1/members`, `--api-listen`, `ui-data.md`,
-`split-mode-updates.md`) and **pull-updates** (`6561a838`, not yet containing arch-v2: `kbf.update.v1`, the release store
-in `release/http.rs`, the `Read by a later change` arm at `worker.rs:295`, and the frozen specification
-`pull-updates.md` 6.3, which this file calls "the spec"). Wherever the text says "the update branch" it means pull-updates;
-"this branch" is not used. **[D]** is decided in another document; **[P]** is proposed here; **[Q]** is an open question
-(section 8).
+Status: design. Nothing in this file is built. Facts marked **[F]** were read from the code on three lines of work:
+**arch-v2** (`b74678f0`: `kbf-ui`, `kbf-auth`, `GET /v1/members`, `--api-listen`, `ui-data.md`, `split-mode-updates.md`),
+**pull-updates** (`6561a838`: `kbf.update.v1`, the release store, the frozen specification `pull-updates.md` 6.3, which this
+file calls "the spec") and the open change **#976** (`pu/upd5-12-desired-offers`, head `f73b8c37`, the desired release and the
+update routes). **[D]** is decided in another document, **[P]** is proposed here, **[Q]** is open (section 10).
+
+**Where the amendments live.** This file amends `ui-data.md` (sections 8 and 10, Q16) and the `kbf-ui` page contract, all on
+arch-v2, so this pull request stays on arch-v2 and edits `ui-data.md` itself. It amends `pull-updates.md` 6.3 only by naming
+each change in section 5; the text edits to that file are a separate pull request on the pull-updates line (named in
+section 9), because arch-v2 has no `pull-updates.md` to edit. No route in section 5 beyond what #976 builds is assumed: each
+is an explicit amendment with its reason.
 
 ## 1. Summary
 
-An operator wants to see, on one page, which commit each host runs, which release the farm wants, whether each host's update
-step is done or stuck, and to press "Update to <release>". Today almost none of that is readable.
+An operator sees, on one page, which commit each host runs, which release the farm wants, whether each host's update step is
+done or stuck, and presses **Update to <release>**, after a read-only confirm page that shows the plan. The button writes
+through the same core call the CLI and `curl` use (`POST /v1/update/desired`), with `expect_generation`, `plan_digest` and
+`plan_issued_at`; the server recomputes the digest, checks the generation and the 10-minute expiry. Pause and Resume are two
+more actions on the same path.
 
-- **[F]** The frontend receives each host's `UpdateStatus` (`kbf.update.v1`) and discards it (`worker.rs`, the `Offer(_) |
-  UpdateStatus(_)` arm returns nothing, "Read by a later change").
-- **[F]** There is no desired-release state, no update policy and no update route. The one update route built is the release
-  store (`PUT` and `GET /v1/releases`).
-- **[F]** The UI is read-only and has no form, POST, session or CSRF handling (`kbf-ui`, `ui-data.md` section 8). Every write is
-  gated on a loopback peer, no `Origin` header and a bearer token, so a browser form cannot reach it by design (`api.rs`).
-- **[F]** No `kbf update` CLI verb exists on either line of work. Today the only way to call a write route is `curl`.
+The decision this file makes, and closes **ui-data Q16** with (section 7): the browser gets **a login form that exchanges the
+operator API token for a server-side session, over TLS only; the session authorises a fixed set of three POST routes under
+`/ui/`; the JSON API stays cookie-blind and its gates are unchanged.** The UI process never holds the token (the server keeps
+only its SHA-256, `token.rs`), so there is no token to forward and nothing to be a deputy for.
 
-So the work is a read path first (routes, then a read-only page), and a write path second, which needs one decision (Q1) before
-any code. This document designs both and says what blocks each. Rollout order and the per-host step belong to
-`split-mode-updates.md`; the wire and the release store to `pull-updates.md`; this file only decides what the page reads, how
-it writes, and how it is tested.
+## 2. Facts that bound the design
 
-## 2. Rules the page obeys (from `ui-data.md`)
+- **[F]** The frontend receives each host's `UpdateStatus` and discards it (`worker.rs`, the `Offer(_) | UpdateStatus(_)` arm).
+  No per-host update state is served.
+- **[F]** #976 serves `GET /v1/update` **open** as `{desired, releases}` (`desired` is `{generation, commit, set_at_ms,
+  paused}`), `POST /v1/update/desired` with `Offer` = `deny_unknown_fields {commit}`, and `POST /v1/update/pause` and
+  `/resume` (`release/desired.rs`). Writes pass `operator_gate`. Its owner says it is gaining an optional `expect_generation`
+  (409 on mismatch, no write) and a `policy` object in `GET /v1/update`; **this file builds on both and says so**:
+  `GET /v1/update` = `{desired, releases, policy?}`, `Offer` = `{commit, expect_generation?}`. Pause lives on the desired row
+  until policy rows land; the page reads `policy.paused` when `policy` is present and `desired.paused` otherwise.
+- **[F]** A platform is complete when it has its own components: linux needs `kbf`, darwin needs `kbf-daemon`
+  (`ReleasePlatform::components` in #976). The page shows completeness per platform with that component named.
+- **[F]** `operator_gate` (`api.rs`): loopback peer, no `Origin` header, `Authorization: Bearer` compared in constant time
+  against a digest, `Content-Type: application/json`. The token is read once from `--api-token-file` and **only its SHA-256 is
+  kept** (`ApiToken`, `token.rs`).
+- **[F]** `kbf-auth` has `Authorizer::authorize(metadata, instance_names)` and a `Policy` with `invocations_get` and
+  `blobs_get`; a missing one turns its routes off. No authenticator reads a credential, no roles exist, and `farm.get` is not
+  built (`ui-data.md` Q11).
+- **[F]** `kbf-ui` (merged): `html::Html` escapes every string with no raw write; every `Answer` carries `Content-Security-Policy:
+  default-src 'none'; style-src 'self'; img-src 'self'; script-src 'self'; frame-ancestors 'none'` and `nosniff`; `PAGES`
+  declares each page's reads and a contract test rejects an undeclared or malformed URL. It is "not mounted on a server yet".
+- **[F]** The TLS read listener (`--read-listen`, `--read-tls-cert`, `--read-tls-key`, `--read-listen-insecure`) is decided
+  (`ui-data.md` Q18) and **not built**: `git grep` finds those flags only in design text. Today every route is on the one
+  plain-HTTP `--api-listen`.
+- **[F]** No `kbf update` CLI verb exists on any line of work.
 
-1. **Pages read the JSON API only** (6.1). Each page is a `Page { name, reads }`; its `Reader` refuses a URL that matches no
-   declared pattern, and the page lists every URL it read as a link. The Updates page declares `/v1/update`,
-   `/v1/update/hosts`, `/v1/update/plan`, `/v1/nodes` and `/v1/releases`, and `/v1/members` if the role column needs it
-   (Q4; the role column depends on `/v1/members`, which is on arch-v2 and pull-updates both, not on the update routes). It
-   parses into `kbf-ui`'s own `api.rs` shapes, never the server's structs. **Every declared read is a GET**: the
-   Reader/`PAGES` contract cannot declare a POST, and a page never causes a write-scoped call, directly or through
-   the server it runs in.
-2. **Escaping by construction.** All markup goes through `html::Html`, which escapes every string and has no raw write. A
-   commit, release name, refusal text, hold reason and node id are strings from hosts and are rendered as text. Red test: a
-   refusal of `<script>alert(1)</script>` renders escaped.
-3. **CSP and no script.** Every `Answer` carries `Content-Security-Policy: default-src 'none'; style-src 'self'; img-src 'self';
-   script-src 'self'; frame-ancestors 'none'` and `X-Content-Type-Options: nosniff`. The page has no JavaScript: the confirm
-   step is a second page, not a dialog.
-4. **Page route contract.** The page is added to the `PAGES` array, so the contract test checks that every URL it reads is a
-   declared route, and rejects dot segments, backslashes and control characters.
-5. **Built fields keep their names; new keys are additive.** Timestamps are RFC 3339 strings, durations and sizes carry units
-   (`_ms`, `_bytes`), and absent means not measured, never zero. A host that never sent `UpdateStatus` is `unsupported`, not
-   `idle` (`pull-updates.md` section 5); it is `availability: unsupported`, a key the spec defines (section 4), not an
-   absent key.
-6. **Instance scoping and authority.** Update data names no build and no instance, so it is a fleet read, and the
-   per-instance `invocations.getAuthorizer` filter of `ui-data.md` does not apply to it. It is still not public: the
-   `refusal` text, staged and installed commits, `helper_present`, the desired release, the policy and the plan are an
-   attack map of the update path on a private farm. They go under `farm.get` (Q3), not open. `ui-data.md` 8 keeps `/v1/nodes`
-   open only because it names no build and scrapers use it; the update fields on it are limited to the same standard
-   (section 4). The confirm page must not list builds or invocations from a plan's "failed builds during the run" (a column of
-   split mode) without the `invocations.get` check, because that column names instances.
-7. **Add the routes to the route table** in `ui-data.md` 6.2 in the same PR as each route.
+## 3. Rules the page obeys
 
-## 3. What the page shows
+1. **Pages read the JSON API only, by GET.** Each page is a `Page { name, reads }`; the `Reader` refuses an undeclared URL and
+   the contract cannot declare a POST. **A page, a GET, never causes a write.** Writes are not reads of any page: they are
+   `Action`s (section 6.3), a second declared list with its own contract test.
+2. **Escaping by construction.** Commits, release names, refusal text, hold reasons, node ids and the operator's claimed name
+   are strings from outside and render through `Html`. Forms are built by a `Form` type that emits `method="post"`, an
+   `action` that is a fixed `/ui/...` path, and hidden fields escaped like any text; there is no way to write a raw `<form>`.
+3. **CSP, no script.** Section 6.5 states the one change (adds `form-action 'self'` and `base-uri 'none'`).
+4. **Built keys keep their names; new keys are additive.** Timestamps are RFC 3339 strings except where #976 already serves
+   `set_at_ms` (the page formats it), sizes and durations carry units, absent means not measured. A host that never sent
+   `UpdateStatus` is `availability: unsupported`, never `idle`.
+5. **Instance scoping does not apply** to update data (it names no build). It is still not public: `refusal` text, staged and
+   installed commits and `helper_present` are an attack map of the update path. They are served under `farm.get` (Q3), and the
+   page shows them only to a viewer it has authenticated (section 4). The open summary stays open.
+6. A plan's "failed builds during the run" column of the controller (U4) names instances and is not shown without the
+   `invocations.get` check.
 
-Per host (a table, one row per node, sorted by node id; the page size and token are the API's `page_size` and `page_token`):
+## 4. What the page shows
 
-| Column | Source | Today |
+Viewers: **anonymous** (no session) sees the open parts only; a **session** (any role) also sees the detail table, the audit
+list and the buttons its role allows. Reads of gated routes are made by the UI in-process on behalf of an authenticated viewer
+only, never for an anonymous one.
+
+Farm header: the desired commit, generation and set time from `desired`; **paused** from `policy.paused` (else
+`desired.paused`) with a **Pause** or **Resume** form for a session of the `update` role; the policy fields read-only; the
+releases list with each commit's platforms, each marked complete or not **with the component it needs (linux: `kbf`, darwin:
+`kbf-daemon`)**; "N of M hosts up to date" summed by the page from the per-host `up_to_date` it already reads.
+
+Host table (one row per node, sorted by node id, paginated by `page_size` and `page_token`): node, connected, platform, running
+commit, desired commit, the host's own step state (`UpdateStatus.state`), `availability`, last error (`refusal`, escaped,
+capped). The controller's richer phase is a second column once the controller exists (U4); until then a note says the page
+shows wire state only and invents no phase.
+
+**The frontend is a separate row above the table**, not one of the hosts: it updates only through the frontend switch behind
+Envoy (`split-mode-updates.md` 6.3), never by the node roll, so the Update button's plan lists hosts only and says so beside
+the frontend row. Its commit is the serving process's own build commit (Q7).
+
+Below: the **audit list** (last 50 update actions, section 6.8) and every URL the page read, as links.
+
+## 5. Routes, and exactly what each amends
+
+Built or in #976: `GET /v1/nodes`, `GET /v1/releases`, `PUT /v1/releases/...`, `GET /v1/update` (open), `POST
+/v1/update/desired {commit}`, `POST /v1/update/pause`, `POST /v1/update/resume`.
+
+Amendments, each landing in the pull request that builds it and in `pull-updates.md` 6.3 through the separate text pull
+request (section 9). **Nothing here is assumed to exist.**
+
+| Id | Change | Reason |
 |---|---|---|
-| node, connected | `/v1/nodes` `node_id`, `connected` | **[F]** built |
-| platform | `/v1/nodes` `software.os_name`, `os_version`; capability `arch` | **[F]** built, arch by inference from Hello |
-| role (storage-and-daemon, daemon-only, Mac) | none | gap: `NodeView` has no role; `/v1/members` is keyed by member id (Q4) |
-| running commit | `/v1/update/hosts` (`UpdateStatus.running_commit`) | wire exists, dropped by the server |
-| desired commit | `/v1/update` desired | no state, no route |
-| update step state | `/v1/nodes` `update.state`, from `UpdateStatus.state` (IDLE, FETCHING, STAGED, ACTIVATED_UNCONFIRMED, CONFIRMED, REVERTED, REFUSED, MANUAL) | wire exists, dropped |
-| last error | `/v1/update/hosts` `refusal` (`UpdateStatus.refusal`) with state REFUSED or REVERTED | wire exists, dropped; no machine-readable reason (Q6) |
+| A1 | `GET /v1/update` is `{desired, releases, policy?}`, open. The spec's `auto_update` is dropped; the flag is `policy.auto_nodes` (and `auto_frontend`) as `pull-updates.md` section 6.2 already says | #976 serves it; the spec text lags the policy row |
+| A2 | `Offer` = `{commit, expect_generation?}`; 409 `stale_generation` on mismatch, no write | owner of #976; protects against two operators |
+| A3 | `Offer` gains `plan_digest` and `plan_issued_at`, **both or neither**; with them the server recomputes the plan and refuses `stale_plan`. Without them the call is the spec's, so scripts keep working | `expect_generation` catches another change of desired; it does not catch a host joining, a platform becoming incomplete or a pause since the operator looked. The operator confirms a host list, and the digest is how the server holds the apply to it. It is also why the form cannot be a bare "update to latest" |
+| A4 | `GET /v1/update/plan?commit=<c>`: the preview, a GET on the read authority, computed per call, nothing stored, `Cache-Control: no-store` | confirm needs a read the page can make |
+| A5 | `GET /v1/update/hosts` (paginated, `farm.get`): the full per-node `update` object. `GET /v1/nodes` carries only `update: {state, up_to_date, availability}`; commits, `refusal`, `helper_present`, `offered_generation` move to the new route | `/v1/nodes` is open; free text and commits must not be. `refusal` is capped at 512 bytes on a character boundary, control characters replaced |
+| A6 | `pause` and `resume` documented in the spec | built in #976, absent from the spec |
+| A7 | Every applied or refused `desired`, `pause` or `resume` call writes an audit row (section 6.8), whichever door it came through | "every update action" includes the CLI's |
 
-The controller's richer phase (selected, cordoned with N leases left, waiting for write sessions, restarting, rebuilding,
-held with a reason) is the `update/host/<id>` row. **[F]** No controller exists (`split-mode-updates.md` U4), so the first page
-shows only the wire state and says so in a note; it does not invent phases. **Step state without and with the controller.**
-The column is always the host's own report (`UpdateStatus.state`); the controller's phase, when it exists, is a second
-column beside it, never a replacement, so the first column does not change meaning. A host with no controller row shows
-its wire state only; a controller row for a host that is silent shows the phase with the wire state as `availability:
-unavailable`. A host's wire state can disagree with the controller's phase; the page shows both and does not reconcile.
+There is **no `--allow-unplanned-update` flag** and no new CLI verb in this design (the previous revision proposed both): the
+planned form is what the UI always sends; a script that omits the digest is already an operator with the token, as the spec
+says. A `kbf update` verb is optional later work (PR 8) and not required by the page.
 
-Farm (a header block above the table):
-
-- available releases: `/v1/releases`, each commit with its platforms and whether each is complete;
-- desired commit and generation: `update/desired` `{generation, commit, set_at}`, shown as "none" before any is set;
-- policy: `update/policy` (`paused`, `auto_nodes`, `auto_frontend`, `max_hosts_out`, and the rest), read-only in the first page;
-  the spec's `POST /v1/update/auto` and `POST /v1/update/policy` exist and stay out of scope (Q5);
-- counts ("N of M hosts up to date"): the **page** sums the per-host `up_to_date` values it already reads; the server
-  does not also return counts, so there is one derivation and a script and the page agree on `up_to_date`.
-
-Per-host "up to date" is derived by the server and delivered as `update.up_to_date` (true, false or null), not computed in
-the page (the spec, section 6.3).
-
-## 4. Routes
-
-Built (**[F]**): `GET /v1/nodes`, `GET /v1/releases` (503 without `--releases-dir`; under the spec `GET /v1/releases` and
-`Fetch` carry no authentication of their own, `release/mod.rs`, so the release list is open, which this design does not
-change), `PUT /v1/releases/...`, the node cordon, drain and uncordon posts, `GET`/`POST /v1/frontend/drain`, `GET
-/v1/members` and `POST /v1/members/{id}` (arch-v2 and pull-updates both).
-
-**Alignment with the spec.** The spec (`pull-updates.md` 6.3, frozen) says: `GET /v1/update` is `{desired, auto_update,
-releases}`; `GET /v1/nodes` gains a per-node `update` object with `state`, the three commits, `offered_generation`,
-`refusal`, `helper_present`, `up_to_date` (true, false or null) and `availability` (`ok`, `unavailable`, `unsupported`);
-`POST /v1/update/desired {commit}` is a compare-and-set on `update/desired`; `POST /v1/update/auto` and `POST
-/v1/update/policy` exist. This design uses those shapes unchanged and **adds**, each an amendment of the spec text made in
-the PR that builds it (not silently):
-
-- `GET /v1/update` keeps `{desired, auto_update, releases}` and gains `policy` (the `update/policy` row). No counts. (PR 2)
-- `availability` is how the page tells a node that never sent a status (`unsupported` or `unavailable` with no `state`), one
-  that sent it and went quiet (`unavailable` with the last `state`) and one running an old binary (`unsupported`).
-  Absence of the key is never read as `unsupported`. (PR 1)
-- `GET /v1/update/hosts` (**new**, paginated by `page_size` and `page_token`): the full per-node `update` object for every
-  node. The spec puts the full object on `GET /v1/nodes`, which is open (`api.rs`: reads answer anyone who reaches the
-  listener). To keep the free-text and commit fields off an open route, **`GET /v1/nodes` carries only `update: {state,
-  up_to_date, availability}`** and the rest (`running_commit`, `installed_commit`, `staged_commit`, `offered_generation`,
-  `refusal`, `helper_present`) is on `/v1/update/hosts`, under `farm.get`. This narrows the spec's `/v1/nodes` object and
-  is amended in pull-updates 6.3 in PR 1. `refusal` is host-supplied free text: the server caps it (512 bytes, cut on a
-  character boundary, control characters replaced) on the way in, in addition to the page escaping it. Held in memory per
-  node, newest wins, a status from a replaced stream is ignored as `NodeStatus` is (`pull-updates.md` 6.4), refilled at the
-  next `UpdateStatus` after a restart, like `software` (the `fleet.rs` header).
-- `POST /v1/update/desired {commit, expect_generation, plan_digest, plan_issued_at}`: the spec's compare-and-set plus three
-  request fields, **new**. 409 if no platform is complete for the commit, 409 `stale_generation` if `expect_generation` is
-  not the current generation, 409 `stale_plan` under the rules below, no new generation if the commit equals the current
-  one. Operator gate, as the other writes. A request without `plan_digest` is allowed from a script (the spec's shape)
-  only when `--allow-unplanned-update` is on, default off, so the confirm is not skippable by accident.
-- `GET /v1/update/plan?commit=<c>` (**new**, a read): the preview. **It is a GET on the read authority, not a POST.** It
-  takes a commit in the query, writes nothing, and is computed from the current state each time (no stored plan). It
-  returns the hosts that would change (each with its from-commit and to-commit), the order a rollout would use, the
-  blockers that would stop it, `plan_issued_at` and `plan_digest`. Until the controller exists (U4) it lists hosts and commit
-  changes only and says "order: not planned". The answer is `Cache-Control: no-store`.
-
-**`plan_digest`, exactly.** SHA-256 over the bytes `"kbf.update.plan.v1\0"` followed by the canonical JSON (UTF-8, object
-keys sorted bytewise, no whitespace, integers as decimal, no floats) of
+**`plan_digest`.** SHA-256 over `"kbf.update.plan.v1\0"` followed by canonical JSON (UTF-8, object keys sorted bytewise, no
+whitespace, integers decimal, no floats) of
 
 ```text
-{ "commit": <40 hex>, "generation": <current update/desired generation, or 0>, "issued_at": <RFC 3339, seconds, UTC>,
+{ "commit": <40 hex>, "generation": <current desired generation, or 0>, "issued_at": <RFC 3339, seconds, UTC>,
   "hosts": [ {"node_id": s, "from": <installed commit or null>, "to": <commit>} ... sorted by node_id ],
   "blockers": [ {"code": s, "node_id": s or null} ... sorted by (code, node_id) ] }
 ```
 
-Included: the target commit, the generation the plan was computed against, the issue time, the host list with
-installed and target commits, and the **stable blocker set** (codes: `no_complete_platform` per platform,
-`host_unsupported`, `helper_missing`, `paused`). Excluded, because they change on a reconnect or a status tick and
-would make the confirm page unusable on a live farm: `connected`, step state, `refusal`, `offered_generation`, queue and
-lease counts, timestamps other than `issued_at`. A host that is offline is a row, not a blocker.
+Stable blocker codes: `no_complete_platform` (per platform), `host_unsupported`, `helper_missing`, `paused`. Excluded because they
+change on a reconnect or a status tick: `connected`, step state, `refusal`, `offered_generation`, queue and lease counts. An
+offline host is a row, not a blocker. **At apply time** the server recomputes with the request's `plan_issued_at` and refuses
+`stale_plan` unless the digest equals, `expect_generation` equals the current generation, and the plan is not older than 10
+minutes nor more than 5 seconds in the future by the server's clock. The 409 body names which of the four reasons
+(`digest`, `generation`, `expired`, `future`) so the page can say why.
 
-**Check at apply time.** `POST /v1/update/desired` recomputes the plan from the current state with the request's
-`plan_issued_at`, and refuses `stale_plan` unless (1) the recomputed digest equals `plan_digest` (so a changed host list,
-blocker set or generation refuses), (2) `expect_generation` equals the current generation, and (3) the plan is not older
-than 10 minutes and not more than 5 seconds in the future. The client cannot extend the expiry: `plan_issued_at` is in the
-digest, and the server checks it against its own clock.
+## 6. The write path
 
-All new routes are documented in `docs/api.md` and listed in `GET /v1` and `/llms.txt`.
+### 6.1 Two doors, one core
 
-## 5. The action, authorization and confirmation
+Today's gate protects the bearer token: the module doc of `api.rs` gives why writes are loopback-only, Origin-free and
+JSON-only. This design does not loosen it. The three handlers (`set_desired`, `pause`, `resume`) become thin wrappers over
+**core functions** (`offer_desired`, `set_paused`) that take parsed arguments and an `Actor` and do the checks (commit
+parse, completeness, generation, digest, expiry), the audit and the row write. There are two doors in front of the core:
 
-**Confirmation is built into the page [P].** "Update to <release>" is a link to `GET /ui/updates/confirm?commit=<c>`, which
-reads `GET /v1/update/plan?commit=<c>` through the page's declared reads (a plain GET, the same authority as every other
-read the page makes), shows the plan (hosts, from-to commits, blockers) and the exact command with the commit, the
-generation, the digest and the issue time filled in. A blocker renders the command as text with the reason and marks it not
-to be run. **No GET on the UI causes a write-scoped call, and the UI process holds no operator token.** No single click
-changes the farm.
+| Door | Reached by | Admission | Actor |
+|---|---|---|---|
+| bearer (unchanged) | `curl`, CLI, scripts, on the host | `operator_gate`: loopback, no `Origin`, bearer, JSON | `bearer` |
+| session (new) | a browser form POST to `/ui/updates/...` on the TLS read listener | section 6.4: TLS listener, Origin, session, role, CSRF, rate limit | the session's principal |
 
-**Authorization today.** **[F]** A write needs a loopback peer, no `Origin`, the bearer token and a JSON content type. A
-browser cannot send that, and `ui-data.md` 8 states the UI is read-only and a cookie must never make a POST. Two ways forward:
+The session door is **not** a client of the bearer door. The UI does not call `/v1/update/desired` over loopback with a token:
+it cannot (only the digest is kept), and reading the token file into the UI process would make it a token holder whose every
+bug is a write to the farm. The session door calls the core in-process, with a fixed call set. This is the answer to the
+loopback invariant of `api.rs`: that invariant stays true of the bearer door; the session door is a second, narrower
+admission with its own invariant, tested in section 9. The `api.rs` module doc is amended in PR 3 to say two doors exist.
 
-- **(a) Read-only page plus a command [P, the plan].** The confirm page shows a command to run where the token is. **The
-  command that works today is `curl`**: `curl --header "Authorization: Bearer $(cat <token-file>)" --header 'Content-Type:
-  application/json' --data '{"commit": ..., "expect_generation": ..., "plan_digest": ..., "plan_issued_at": ...}'
-  http://127.0.0.1:<api-port>/v1/update/desired`, with the token read from the file named by `--api-token-file`, never
-  placed on the command line or in the page. A `kbf update set --commit <c> --plan <digest>` verb **does not exist** on
-  either line of work; it is **new work (PR 6, section 7)** and until it lands the page shows the `curl` form only. Nothing
-  in the security model changes.
-- **(b) A UI write path [Q1].** Designed in `split-mode-updates.md` 6.3: a session made from the operator's credential, a CSRF
-  token in every form, `SameSite=Strict`, a server `Origin` check, roles (read, update, admin) and an audit record naming the
-  actor. **This reverses a decision, not an open point**: `ui-data.md` 8 (Q16) decided a reverse proxy for v1 and "no cookie
-  path until a POST is proven cookie-proof", so (b) needs that decision reopened, by a separate design document before any
-  code (it is not part of this one's PR list). That document must answer three things this file does not: (1) the operator
-  write gate requires a loopback peer and no `Origin`, and a session POST arrives from a remote browser, so either the gate
-  is loosened (a change to `api.rs`'s documented invariant) or the UI mount calls the API on loopback with a stored
-  operator token, which is a confused deputy and is refused here; (2) the roles read, update and admin exist only as plans (the
-  code has `Daemon` and `Client`); (3) the audit record needs a home: a state key, its retention and who reads it. It also
-  needs the TLS read listener (Q18 there). **(a) is the plan.**
+**Why this is not a token-holding confused deputy.** (1) The UI holds no token and no way to make one. (2) The set of things a
+session can cause is three core calls chosen by the route, not by any request field (no URL, method or path comes from the
+client). (3) Each call is bound to the session's own CSRF value and to the plan (6.4), so a page the attacker controls cannot
+drive it. (4) The session is made by someone who proved they hold the operator token and is checked against the authorizer on
+every write (6.7). (5) Every write is audited with the session (6.8). (6) The cookie is accepted on exactly these routes
+and is ignored by every `/v1` route, so a cookie makes no JSON API call, GET or POST.
 
-Whichever is chosen, the write is the same `POST /v1/update/desired`; the page never writes the state store itself, and an
-update to the update-controller is never a UI-only code path.
+### 6.2 Login: what authenticates an operator in a browser
 
-## 6. What exists and what to build
+Options, and the choice:
+
+| Option | Keeps token out of the browser | Built today | Identity of the actor |
+|---|---|---|---|
+| **(1) Authenticating proxy principal** (the reverse proxy of ui-data Q16 v1 supplies a verified identity) | yes | no: needs a trusted-proxy flag and an `Authenticator` that reads it | real, per person |
+| **(2) Login form: the operator token for a server-side session [P, v1]** | no, the operator types it once, over TLS, to the server | yes: `ApiToken::admits` | the session plus an unverified name the operator types |
+| (3) UI forwards the bearer token over loopback | n/a | no: only the digest is kept; re-reading the file makes the UI a token holder | the token |
+
+Chosen: **(2) for v1**, with **(1) as a second authenticator on the same session interface** once a trusted proxy is
+configured (Q5). Reasons: (2) needs only the credential that exists and works with no proxy; (1) is the better end state
+because it gives each person an identity and keeps the token out of every browser, but it is not buildable today and a
+design that waits for it ships no button. (3) is refused above. Because the token is shared, the audit's "who" under (2) is a
+session and a typed name, said plainly in the page ("name as typed, not verified"); real identity needs (1).
+
+`GET /ui/login` shows a form (token as `type=password`, `autocomplete=off`; a name field up to 64 characters). `POST
+/ui/login` is the only place the token appears: the body is capped at 1 KiB, the token is compared by `ApiToken::admits`
+(constant time on digests), then dropped; it is never logged, never put in a URL (the form is POST only; a GET carrying
+`token=` is ignored and not logged), never echoed, and never in a later page, so the page has nothing to leak and no script
+could read it (the CSP allows none). The login passes the same TLS, Origin and Sec-Fetch-Site checks as an action.
+
+### 6.3 The session
+
+- **Id**: 256 random bits from the OS generator. **Cookie**: `__Host-kbf-session=<id>; Secure; HttpOnly; SameSite=Strict;
+  Path=/` and no `Domain` (the `__Host-` prefix makes a browser refuse any cookie without `Secure` and `Path=/`, or with a
+  `Domain`). `Path=/` means the browser also sends it to `/v1`; `/v1` ignores it.
+- **Server side**: an in-memory table keyed by the SHA-256 of the id, holding principal, claimed name, role, peer address
+  at login, created and last-used times, a random per-session CSRF secret, and the last four plans the session was shown
+  (for the stale-plan diff, 6.10). At most 64 live sessions; the oldest idle is evicted first.
+- **Lifetime**: idle timeout 15 minutes, absolute 1 hour, whichever is first. Both are enforced on the server's clock at every
+  use; the cookie's own `Max-Age` is advisory. A browser that keeps the cookie past either is refused.
+- **Revocation**: `POST /ui/logout` (CSRF-checked) deletes the entry and clears the cookie. `POST /v1/ui/sessions/revoke-all`
+  on the bearer door deletes every session (the operator's panic button, from the host). A server restart empties the table:
+  sessions are not persisted, because a persisted session would be a second credential store. A frontend handover also ends
+  sessions; the operator logs in again. The audit and the desired row are in the state store and survive.
+- A session is **not bound to an address** (operators move networks); it is bound to the listener it was made on.
+
+### 6.4 Admission of a session POST, in order
+
+Routes: `POST /ui/login`, `POST /ui/logout`, `POST /ui/updates/apply`, `POST /ui/updates/pause`, `POST /ui/updates/resume`.
+Everything else under `/ui` is GET. A request failing a step stops there with the step's status and writes no row (an
+unauthenticated request must not write to the store):
+
+1. **TLS listener.** The write path is on only when the listener it arrived on terminates TLS (a startup fact, not a header
+   such as `X-Forwarded-Proto`). On a listener started with `--read-listen-insecure` the forms are not rendered, the routes
+   answer 404 `write path off: this listener has no TLS`, and the page says so. A plain-HTTP request to a TLS listener gets
+   no page (ui-data Q18).
+2. **Origin and fetch metadata.** `Origin` must be present and equal the configured `--ui-origin` (a flag naming
+   `https://host[:port]`, never derived from `Host`). If `Sec-Fetch-Site` is present it must be `same-origin`. Absent `Origin`
+   is refused (a browser form POST always sends it; the page sets `Referrer-Policy: same-origin`, not `no-referrer`, because a
+   `no-referrer` page makes the browser send `Origin: null`).
+3. **Shape.** `Content-Type: application/x-www-form-urlencoded` exactly, body at most 4 KiB, each field once, no unknown field,
+   hex fields validated by length and alphabet before any use.
+4. **Session**: cookie present, entry found, within idle and absolute lifetime (else 303 to `/ui/login`).
+5. **Role**: the session's principal passes the authorizer for `update` (6.7), else 403.
+6. **CSRF**: the hidden `csrf` field equals `HMAC-SHA256(session_secret, "kbf.ui.csrf.v1\0" action "\0" bound)`, compared
+   in constant time. `bound` for `apply` is `commit "\0" expect_generation "\0" plan_digest "\0" plan_issued_at`; for
+   `pause`, the current generation; for `resume`, the generation shown; for `logout`, empty. The token is therefore bound to the
+   session (secret), to the action and to the plan it confirms: a token from one confirm page does not work on another plan,
+   another action or another session, and editing a hidden field breaks it.
+7. **Rate limit** (6.9).
+8. **Audit and core call** (6.8, 6.1).
+9. Answer **303 See Other** to `GET /ui/updates?audit=<row id>`; the page shows the result from the audit row, never from
+   text in the URL (a link cannot put words on the page). A refresh does not repost.
+
+### 6.5 The CSP and the headers
+
+The current CSP has no `form-action`, and `form-action` does not fall back to `default-src`: with `default-src 'none'` a form
+can still submit to any origin. The change, applied to **every** `Answer` (so no page's policy varies):
+
+```text
+Content-Security-Policy: default-src 'none'; style-src 'self'; img-src 'self'; script-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'
+```
+
+Added: `form-action 'self'` (a form posts only to this origin) and `base-uri 'none'` (an injected `<base>` cannot redirect the
+form's relative action). No script is added; `script-src 'self'` stays as it is today and serves no file. Also on every page:
+`Referrer-Policy: same-origin`, and on every session page, login and action answer: `Cache-Control: no-store` (the token
+and the CSRF value must not be in a shared cache or the back-forward list). `frame-ancestors 'none'` already blocks a page
+that frames the form.
+
+### 6.6 TLS
+
+The write path needs the TLS read listener: `Secure` cookies are never sent to plain HTTP, and a token typed into a form must
+not cross a network in clear. That listener (U1 of `ui-data.md`) is built first (PR 1 of section 9). Behind a load balancer
+that terminates TLS, the balancer-to-frontend hop is the TLS hop (`ui-data.md` section 8), and the listener the UI is mounted
+on terminates it. `--ui-origin` is required to enable forms; without it the page is read-only and says why.
+
+### 6.7 Roles
+
+A session carries a role, checked on every write by the existing `kbf-auth` machinery rather than a new check: a new policy
+key `update.setAuthorizer` (an `Authorizer`, like `invocations_get`) is asked with the session's `AuthenticationMetadata` and
+the single fixed name `farm/update` (the authorizer API is per instance name; the farm-wide update has none, so instance
+scoping does not apply and this name is a constant, not a request field). **A missing key turns the write path off**, as
+`invocations.getAuthorizer` does for its routes, so a farm with no policy file has no UI write. Roles in v1 are `update`
+(Update, Pause, Resume) and none: a session whose principal the authorizer refuses can log in and see the page and cannot
+write. Logging in with the operator token yields the principal `operator`, which the policy decides on. Read-only
+humans have no session today (read tokens are not built, ui-data section 8); they reach the pages through the proxy and see
+the open summary. Skip host, Accept failing builds and Policy edits stay out of scope and need the `admin` role of
+`split-mode-updates.md`.
+
+### 6.8 Audit
+
+The core writes one row per action, **before** it acts (`outcome: pending`) and updates it after (`ok`, `refused` with the
+reason code, or `error`). Key `update/audit/<13-digit unix ms>/<8 random hex>` in the state store, so it is durable where the
+desired row is and shared by frontends. Fields: `id`, `at` (RFC 3339), `action` (`update`, `pause`, `resume`), `door`
+(`bearer` or `session`), `principal`, `claimed_name` (escaped on display, flagged unverified), `session` (first 8 hex of the
+session id's SHA-256, never the id), `peer`, `commit`, `from_commit`, `to_commit`, `expect_generation`, `generation_after`,
+`plan_digest`, `outcome`, `reason`. A request that failed before step 8 of 6.4 writes no row (counted in a metric and logged).
+
+- **Fail closed**: if the pending row cannot be written, the action is refused 503 `audit store unavailable`; no desired
+  write happens without a record of intent. Reads still work.
+- A crash between pending and result leaves a `pending` row; the page shows it as "outcome unknown: check the desired
+  row". A repeat is safe: the same commit already desired makes no new generation (#976), and the stale generation is
+  reported (6.10).
+- The page shows the last 50 rows, newest first, by a reverse range scan (`scan_range`, ui-data Q20). Retention 400 days, the
+  longest class of ui-data 5.3; rows are small and trimmed by the same sweep.
+
+### 6.9 Rate limits
+
+Login: 5 failures per peer address per minute, then 429 with `Retry-After`; 30 failures a minute across all peers (a shared
+budget, so a spray cannot be spread over addresses to help itself). Actions: 6 per session per minute and 20 farm-wide per
+minute; one apply in flight at a time (a second answers 409 `busy`). A rejected login writes a log line and a counter, not a
+row.
+
+### 6.10 Stale plan and generation conflict
+
+On 409 the page does not show a bare error. It says which of `digest`, `generation`, `expired`, `future`, and shows what
+changed: for `generation`, the audit row that moved desired (who, when, to which commit), and if desired already equals the
+submitted commit, "already applied, nothing to do"; for `digest`, a diff between the plan the session was shown (kept in the
+session, 6.3) and a fresh one, as hosts added or removed and blockers appeared or cleared; for `expired`, the age. Every
+variant offers one link, **Re-plan** (`GET /ui/updates/confirm?commit=<c>`), which issues a new digest and form. The refused
+attempt is in the audit list.
+
+### 6.11 Pause and Resume
+
+`Pause` is one form POST from the page's header (no confirm page: pausing only stops new work, and it passes every check of
+6.4). `Resume` goes through a confirm page that shows the current plan for the desired commit, because resuming restarts a run;
+its CSRF value is bound to the generation shown, and the session door refuses `stale_generation` if desired moved. #976's
+`resume` takes no generation, so this check is made by the core before the call (the amendment to carry it into the API is
+Q6).
+
+### 6.12 Failure modes
+
+State store down: reads of rows fail as today; writes refuse (audit first). Frontend restart: sessions gone, re-login, nothing
+lost. Handover mid-apply: the pending row and the CAS make a retry safe (6.8). Clock skew: expiry uses the server's clock only;
+`plan_issued_at` more than 5 seconds ahead is `future`. Listener lost TLS material: the listener refuses to start (ui-data Q18),
+so there is no plain-HTTP fallback that would show a form.
+
+## 7. Resolution of ui-data Q16 (this pull request changes `ui-data.md`)
+
+Replaces the text of `ui-data.md` section 8 ("How a human authenticates") and the item 16 of section 10:
+
+> **How a human authenticates [D] (Q16).** Reads: a reverse proxy that injects the bearer header, or the open summary, as
+> before. **Writes from a browser: a login form that exchanges the operator API token for a server-side session, on the TLS
+> read listener only.** The session cookie (`__Host-kbf-session`, `Secure`, `HttpOnly`, `SameSite=Strict`, idle 15 minutes,
+> absolute 1 hour) is accepted on the `/ui` routes and ignored by every `/v1` route, so no cookie makes a JSON API call. A POST
+> is proven cookie-proof when it passes, in order: a TLS listener, an `Origin` equal to `--ui-origin` and `Sec-Fetch-Site:
+> same-origin`, the session, the authorizer, a CSRF value bound to the session, the action and the plan, and a rate limit; each
+> has a red test with a planted mutant (`update-ui.md` section 9). The operator write gate of `api.rs` is unchanged and remains
+> the only way a script writes. An authenticating proxy principal is a second authenticator on the same session
+> interface, not built.
+
+And replaces the two bullets that say the UI is read-only: *"The UI's pages are read-only. The only writes a page offers are the
+update actions of `update-ui.md` (Update, Pause, Resume); drain, cordon and purge stay CLI and API."*, and the `UI pages` bullet's
+CSP, adding `form-action 'self'; base-uri 'none'` and `Referrer-Policy: same-origin`. Summary line 9 says "read-only pages
+plus one declared write family".
+
+## 8. What exists and what to build
 
 | Piece | State |
 |---|---|
-| `kbf-ui` page framework: `Page`, `Reader`, `Html`, CSP, contract test | built, GET only |
-| `GET /v1/nodes`, `/v1/releases`, `/v1/members` | built (`/v1/releases` mounting is the open `--releases-dir` change) |
-| `UpdateStatus` on the wire | built, ignored by the server |
-| `update` object in `NodeView` (open summary) and `GET /v1/update/hosts` (detail) | to build (PR 1) |
-| `update/desired`, `update/generation`, `update/policy` rows, `GET /v1/update` | to build (PR 2) |
-| `POST /v1/update/desired` (with `expect_generation`, `plan_digest`) and `GET /v1/update/plan` | to build (PR 3) |
-| Updates page, read-only, plus the confirm page with the `curl` command | to build (PR 4) |
-| `farm.get` authority on the update reads | not built (`ui-data.md` Q11); blocks PRs 1 (detail), 2, 3 from serving to anyone but a token holder |
-| `kbf update` CLI verb (`set`, `plan`) | new work (PR 6) |
-| UI session, CSRF, `Origin` check, roles, audit, form POST | not part of this design; a separate document first, only if Q1 reopens (b) |
-| Controller phases, blockers, held reasons | not started (`split-mode-updates.md` U4, U10) |
+| `kbf-ui` pages, `Reader`, `Html`, CSP, contract test | built, GET only, not mounted |
+| `GET /v1/update`, `POST desired`, `pause`, `resume` | #976, open |
+| `expect_generation`, `policy` in `GET /v1/update` | being added to #976 |
+| TLS read listener | decided, not built |
+| `farm.get`, `update.setAuthorizer` | not built |
+| `UpdateStatus` kept by the server, `GET /v1/update/hosts`, plan, digest | to build (A3 to A5) |
+| Session table, CSRF, Origin check, `Form`, `Action` contract, audit rows, rate limits | to build |
+| Updates page and confirm page | to build |
+| Controller phases, blockers, held reasons | not started (U4, U10) |
 
-## 7. PR split and tests
+## 9. PR split and tests
 
-Each PR is red first: the test is committed failing against the old code, then the change makes it pass. Each lists a mutant
-that must turn it red.
+Each PR is red first (the test is committed failing against the old code, then the change turns it green) and lists the
+mutant that must turn it red again. The text pull request on pull-updates carries A1 to A7 into `pull-updates.md` 6.3 and is
+merged before PR 3.
 
-1. **Server keeps `UpdateStatus`; `NodeView.update`; `GET /v1/update/hosts`.** Tests: a host sending a staged-and-refused status
-   shows it on `/v1/update/hosts` and only `{state, up_to_date, availability}` on `/v1/nodes`; a host that never sent one has
-   `availability: unsupported` or `unavailable` (the spec's rule) and the page later says so; a second status replaces the
-   first; a restart empties it; **a status from a replaced (stale) stream is dropped**; a 100 KiB `refusal` is stored cut
-   to 512 bytes on a character boundary. Mutants: keep the oldest instead of the newest; default to `idle` for a silent host;
-   accept a status from the old stream; store `refusal` uncut; put `refusal` on `/v1/nodes`. Amends `pull-updates.md` 6.3.
-2. **Desired-state rows and `GET /v1/update`.** Tests: empty farm answers `desired: null` and the spec's `auto_update`;
-   after a set, the row agrees with `/v1/nodes`. Mutant: drop `auto_update`.
-3. **`POST /v1/update/desired` and `GET /v1/update/plan`.** Tests: 409 for an incomplete platform; same commit gives the same
-   generation; different commit increments it by exactly one; stale `expect_generation` is 409 `stale_generation`; a stale
-   digest, an expired plan (older than 10 minutes), a plan from the future and a plan whose `issued_at` was edited are 409
-   `stale_plan`; **a host reconnecting or changing step state between the plan and the apply does not change the digest**, a
-   changed host list or blocker does; the plan GET writes nothing (a counting store) and works without a token on the read
-   authority and is refused for a POST; no token, an `Origin` header or a non-loopback peer is refused on the POST as for other
-   writes. Mutants: take the generation on every call; ignore the digest; **digest covers a volatile field (`connected`)**;
-   skip the expiry; skip the generation in the digest. Amends `pull-updates.md` 6.3.
-4. **The page.** Tests: every `availability` and every state of `UpdateStatus.State` renders; a refusal string and a node id
-   with markup render escaped; CSP and `nosniff` are on the answer; the page is in `PAGES` and the contract test fails if it
-   reads an undeclared URL **or declares a non-GET**; a blocker marks the command not to be run and shows its reason; the
-   confirm page issues only GETs (a counting `Source` sees zero writes and the UI process holds no token). Mutants: raw-write a
-   refusal; read `/v1/update` from an undeclared pattern; route the plan through a POST; omit the blocker reason.
-5. **(unused; was the UI write path, now a separate design, section 5 (b).)**
-6. **`kbf update` CLI** (`set --commit --plan`, `plan --commit`), on the existing write gates, reading the token from
-   `--api-token-file`. Tests: the verb sends the four request fields; a refused plan prints the 409 reason; no token on the
-   command line. It is not required for the page.
+1. **TLS read listener** (`ui-data.md` U1, owned there). Tests: `--read-listen` without TLS files or the insecure flag exits
+   with a usage error; a plain-HTTP request to the TLS listener gets no page. Mutant: serve plain HTTP on fallback.
+2. **Server keeps `UpdateStatus`; `NodeView.update`; `GET /v1/update/hosts`** (A5). Tests: staged-and-refused status is on
+   hosts and only `{state, up_to_date, availability}` on `/v1/nodes`; a silent host is `unsupported` or `unavailable`, never
+   idle; newest wins; a stale stream is dropped; a 100 KiB `refusal` stored as 512 bytes cut on a character boundary.
+   Mutants: keep oldest; default silent to idle; accept the old stream; store uncut; `refusal` on `/v1/nodes`.
+3. **Core, plan and digest** (A2 to A4, A6, A7; stacks on #976): the handlers become wrappers of `offer_desired` and
+   `set_paused`; `GET /v1/update/plan`; the audit rows. Tests: stale generation is 409 `stale_generation`; a stale digest, an
+   expired plan, a plan from the future and an edited `issued_at` are 409 `stale_plan` with the reason named; a reconnecting
+   host or a step-state change leaves the digest unchanged, a changed host list or blocker changes it; `plan_digest` without
+   `plan_issued_at` is 400; the plan GET writes nothing (counting store); **an audit row exists for an applied, a refused and
+   a CLI-door update, pending before the write and final after**; an unwritable audit store refuses the update and the desired
+   row is unchanged; the bearer door still refuses non-loopback, `Origin`, no token, non-JSON. Mutants: take the generation
+   every call; ignore the digest; digest covers `connected`; skip expiry; write the row after the apply; swallow the audit error.
+4. **Session, CSRF, audit page, `Form` and `Action` contract** (no button yet). Tests, each with its mutant:
+   - login with a wrong token is refused and is rate limited at the sixth try (mutant: no limit; limit per address only);
+   - the token appears in no response body, header or log line (mutant: echo it in an error);
+   - the cookie has exactly `__Host-kbf-session`, `Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/`, no `Domain`
+     (mutant: drop `SameSite`);
+   - an idle-expired and an absolute-expired session are refused on the server's clock even if the cookie is sent
+     (mutant: trust `Max-Age`); a logged-out and a revoke-all session are refused (mutant: logout clears only the cookie);
+   - **missing CSRF refused; a CSRF token from another session, another action or another plan refused; an edited hidden
+     field refused** (mutants: no check; token not bound to the plan; token not bound to the session);
+   - **cross-origin POST refused; absent `Origin` refused; `Sec-Fetch-Site: cross-site` refused** (mutants: compare `Host`; accept
+     absent Origin);
+   - **POST on a listener without TLS refused and the form not rendered** (mutant: trust `X-Forwarded-Proto`);
+   - **a session whose principal the authorizer refuses cannot write** and a missing `update.setAuthorizer` turns the write path off
+     (mutants: skip the authorizer; default allow);
+   - a cookie sent to a `/v1` GET or POST changes nothing (mutant: accept the cookie on `/v1`);
+   - the CSP string is exact including `form-action 'self'; base-uri 'none'`; every `Answer` has it (mutant: drop `form-action`);
+   - the contract test fails if a `Page` declares a POST read, if an `Action` path is outside `/ui/`, or if a `Form` has an absolute
+     `action` (mutants: each);
+   - the audit list renders a claimed name of `<script>` escaped.
+5. **The Updates page and the confirm page** (read-only). Tests: every `availability` and every `UpdateStatus` state renders;
+   a refusal and node id with markup render escaped; completeness names `kbf` for linux and `kbf-daemon` for darwin; the
+   frontend row is separate and the plan lists no frontend; `paused` shown from `policy.paused`, else `desired.paused`; an
+   anonymous viewer sees no detail columns; the confirm page issues only GETs (counting source). Mutants: raw-write a
+   refusal; show detail to anonymous; route the plan through a POST; read `desired.paused` when `policy` exists.
+6. **The Update, Pause and Resume buttons.** Tests: the Update POST reaches the core with the four fields from the hidden
+   form; **stale digest refused and the page names why and links Re-plan**; a generation conflict shows the audit row that
+   moved desired; an applied update shows `ok` in the audit list from the row; a blocker disables the button with its
+   reason; Resume refuses a moved generation; one apply in flight. Mutants: drop `plan_digest` from the form; show the error
+   from the URL text; allow a second concurrent apply.
+7. **Pull-updates text pull request**: edits `pull-updates.md` 6.3 for A1 to A7 (docs only).
+8. **Optional: `kbf update set|plan`** reading the token from `--api-token-file`; not required by the page.
 
-PRs 1 to 4 are independent of the controller. PR 4 is mountable only when the crate is mounted on a server, which is not yet
-the case (`kbf-ui` lib docs: "Not mounted on a server yet").
+PRs 2 to 5 are independent of the controller. PR 4 onward needs the `kbf-ui` mount (not done).
 
-## 8. Open questions
+## 10. Open questions
 
-- **Q1 UI writes.** Choose (a) `curl` (and later the CLI) only, or (b) a session and CSRF write path. Recommendation: (a). (b)
-  reverses `ui-data.md` Q16 and needs a separate design first, which answers the gate, roles and audit questions of section 5.
-- **Q2 Which credential makes a UI session.** Not settled in `split-mode-updates.md` 6.3. Needed only for (b), and so only
-  for its own document.
-- **Q3 Authority of the update reads.** Recommendation: `farm.get` for `/v1/update`, `/v1/update/hosts` and
-  `/v1/update/plan`, and for every field beyond `{state, up_to_date, availability}`; `/v1/nodes` stays open with that
-  summary. `farm.get` is not built (`ui-data.md` Q11), so until it is, those routes are served only to a bearer-token
-  holder (a read gate that does not require loopback), and the page reaches them through the reverse proxy of `ui-data.md`
-  Q16. **Not** "open because commits are public": on a private repository the commits, host `refusal` text and policy are
-  not public.
-- **Q4 Role.** Add `role` to `NodeView`, or have the page join `/v1/members` by node id. Recommendation: `NodeView.role`, so
-  the page makes one read per concern and the join is not duplicated in every consumer. Needs a node-to-member mapping that the
-  code does not give today.
-- **Q5 Skip, Roll back, Accept failing builds, Policy.** Out of scope here; each needs its own confirm page and the admin role,
-  and they depend on the controller.
-- **Q6 Machine-readable refusal.** `refusal` is free text. Until a reason code exists the page shows the text only and groups
-  nothing by it.
-- **Q7 Branch state.** The facts come from two lines of work that have not been merged (section header). PR 1 needs the
-  `UpdateStatus` wire and `NodeView` together, so it stacks on pull-updates after arch-v2 is merged into it; if that has not
-  happened, `GET /v1/members` and the `kbf-ui` crate are missing there.
-- **Q8 `/v1/releases` is open under the spec.** It lists commits and platforms to anyone who reaches the listener. Whether it
-  moves under `farm.get` is a change to the spec; this design leaves it open and flags it.
+- **Q1 (closed here)** UI writes: yes, session door, section 6.
+- **Q2 (closed here)** The credential for a session: the operator API token, exchanged once; the proxy principal later.
+- **Q3 Authority of the update reads.** Recommendation: `farm.get` for `/v1/update/hosts` and `/plan` and fields beyond the summary;
+  `GET /v1/update` stays open as #976 serves it (it shows the desired commit and release list, which `GET /v1/releases` already
+  shows). Until `farm.get` exists those routes need a bearer-token read gate that does not require loopback, or the page reaches
+  them in-process for an authenticated viewer only (section 4).
+- **Q4 Role column.** `NodeView.role` or a join on `/v1/members`; recommendation: `NodeView.role`.
+- **Q5 Proxy principal.** When a trusted proxy exists, add it as a second authenticator on the session interface; needs a
+  `--trusted-proxy` flag. Gives per-person audit identity. Recommendation: do it right after PR 6.
+- **Q6 Carry the resume generation into the API.** Recommendation: add optional `expect_generation` to `resume` too.
+- **Q7 The frontend's commit** for its separate row: build info of the serving process, a new field. Recommendation: yes.
+- **Q8 Machine-readable refusal.** Free text only until a reason code exists.
+- **Q9 Branch state.** `GET /v1/members` and `kbf-ui` are on arch-v2 and the update wire on pull-updates; PRs 2 and 3 need both,
+  so they stack after arch-v2 is merged into pull-updates.
+- **Q10 `/v1/releases` is open under the spec.** Left open, flagged.
 
-## 9. What blocks implementation
+## 11. What blocks implementation
 
-- The change that mounts `--releases-dir` and the release fetch service on the servers (open) blocks `/v1/releases` being
-  served, so blocks the releases list and the plan's completeness check.
-- The server reading `UpdateStatus` (PR 1 above) blocks every per-host column.
-- The root helper (open) blocks hosts reporting `helper_present` and real step states in production, not the page itself.
-- The controller (U4) and poller (U10) block per-host phases, held reasons and preflight blockers, and are not needed for the
-  first page.
-- `farm.get` (not built) blocks serving the update reads to anyone but a token holder (Q3).
-- The TLS read listener and a reopened Q16 block (b), which is not in this design's PR list.
-- PR 6 (the CLI verb) blocks nothing but the page showing a CLI command instead of `curl`.
+The TLS read listener blocks every form (PR 1). #976 with `expect_generation` and `policy` blocks PR 3. The `kbf-ui` mount blocks
+PR 4 onward. `farm.get` blocks serving details to anyone but a session (Q3). The controller (U4, U10) blocks phases, held
+reasons and preflight blockers, none of which the first page needs. The root helper blocks real `helper_present` values in
+production, not the page.
