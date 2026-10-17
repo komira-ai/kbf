@@ -291,7 +291,7 @@ zero; this design aims at a few hundred milliseconds inside one call, gates on a
    the file lock is held.
 1. `i` calls the predecessor's API (`POST /v1/frontend/drain`, `{"handover": {"peer": ...}}`,
    loopback peer, bearer token: the existing gates of `api.rs`; the port is `p`'s, from the port
-   table). `p` runs the **prepare** checks, all reversible (6.3: disk, `T_s` budget, tier seal of
+   table). `p` runs the **prepare** checks and answers with the generation it holds, all reversible (6.3: disk, `T_s` budget, tier seal of
    the reversible part). A refusal (a different state path or address table, both instances
    active, a failed check) answers with a reason, `i` exits non-zero, `p` has not changed.
 2. `p` runs `hand-over`: forwarding on, quiesce, fence, end worker streams, (storage block),
@@ -301,8 +301,9 @@ zero; this design aims at a few hundred milliseconds inside one call, gates on a
    restart `p`. `i` takes `log.lock` with a bounded wait (the kernel dropped `p`'s flock at its exit; a live `p`
    still holds it, and then `i` exits non-zero with `p` unchanged). With no marker (the call failed before `p`
    started the cut, for instance a refused connect) `i` exits non-zero and does not promote, since `p` may be
-   restarted by systemd and race the lock. The generation to take is read from the state store, not from the lost
-   answer. Section 6.4.5 and section 10 give the same rule; T-M18 covers it.
+   restarted by systemd and race the lock. The generation `i` expects is the one `p`'s **prepare** answer carried (step 1 answers with the generation `p`
+   holds, before any cut stage; demote does not change it), not one re-read from the store: re-reading it would make
+   `Fenced::take`'s `expect` check a store against itself and lose the guard against a restored or swapped state file. Section 6.4.5 and section 10 give the same rule; T-M18 covers it.
 3. `i` takes the next generation, `Fenced::take(store, Some(generation))`, with the epoch kept
    (`EpochPolicy::Keep`, reached today through `StateStoreUri::open_after_handover(generation)`, which `frontend.rs` calls; the plain
    `open` and `epoch_policy` are `Bump` for SQLite, so all-in-one calls the handover open; the lease epoch in the Welcome is held constant, section 6.2), recovers, takes the storage
