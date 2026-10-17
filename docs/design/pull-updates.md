@@ -213,9 +213,9 @@ the disk index, never the reverse. The desired release, the slot, the per-host p
 - `GET /v1/releases`: commits with, per platform, which components are present and whether the platform is complete.
 - `POST /v1/update/desired {commit}`: the commit needs at least one complete platform (else 409). Compare-and-set
   on `update/desired`; the counter gives the new generation only when the commit differs from the current one.
-- `GET /v1/update`: `{desired, auto_update, releases}`. `POST /v1/update/auto {enabled}` sets `update/policy.auto_nodes`; the other policy fields are set through `POST /v1/update/policy` (admin).
-- `GET /v1/nodes` gains, per node, an `update` object: state, the three commits, offered generation, refusal,
-  `helper_present`, `up_to_date` (true, false or null) and `availability` (`ok`, `unavailable`, `unsupported`).
+- `GET /v1/update` (open): `{desired, releases, policy?}`; `policy` is the `update/policy` row when it exists, and replaces the earlier `auto_update` (the flag is `policy.auto_nodes`). `POST /v1/update/auto {enabled}` sets `update/policy.auto_nodes`; the other policy fields are set through `POST /v1/update/policy` (admin). `POST /v1/update/pause` and `POST /v1/update/resume` (operator gate) set whether a run may start a host; `paused` is read from `policy.paused` once the policy row exists.
+- Amendments for the update page (`update-ui.md`, each with its reason there): `POST /v1/update/desired` takes `{commit, expect_generation?, plan_digest?, plan_issued_at?}`, the last two both or neither; 409 `stale_generation` on a generation mismatch and 409 `stale_plan` (naming `digest`, `generation`, `expired` or `future`) when the server's recomputed plan differs or is older than 10 minutes. `GET /v1/update/plan?commit=` is a read that computes the plan and its digest, storing nothing. `GET /v1/update/hosts` carries the full per-node `update` object under `farm.get`; `GET /v1/nodes` keeps only `update: {state, up_to_date, availability}`. Every `desired`, `pause` and `resume` call writes an audit row before it acts.
+- `GET /v1/nodes` gains, per node, an `update` object: `state`, `up_to_date` (true, false or null) and `availability` (`ok`, `unavailable`, `unsupported`); the three commits, offered generation, refusal (capped at 512 bytes) and `helper_present` are on `GET /v1/update/hosts` (amended, `update-ui.md`).
 
 ### 6.4 Sessions
 
