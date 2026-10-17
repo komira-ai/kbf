@@ -11,6 +11,10 @@ SHA-256 check are **planned** and not built yet
 ([mac-node-provisioning.md](design/mac-node-provisioning.md) sections 4.1 and 4.2).
 Sections below that describe them say so.
 
+A pull request builds none of this unless it carries the label `needs-artifacts`; adding
+the label to an open pull request starts the build. Pushes and the merge queue always
+build.
+
 ## What is built
 
 Eleven tarballs, each with its SBOM, built by one job per platform:

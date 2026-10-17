@@ -104,7 +104,24 @@ pub fn problems(workflow: &str) -> Result<Vec<String>, String> {
     signing(workflow, &mut out)?;
     identity(workflow, &mut out)?;
     darwin(workflow, &mut out)?;
+    pull_request_gate(workflow, &mut out)?;
     Ok(out)
+}
+
+/// A pull request builds nothing unless it carries [`PR_LABEL`]: each build job's `if:`
+/// names the label, so an unlabelled pull request's run is skipped without a runner.
+const PR_LABEL: &str = "needs-artifacts";
+
+fn pull_request_gate(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
+    for job in BUILD_JOBS {
+        let condition = workflows::job_condition(workflow, job)?.unwrap_or_default();
+        if !condition.contains(&format!("labels.*.name, '{PR_LABEL}'")) {
+            out.push(format!(
+                "the build job `{job}` does not run on a pull request only with the label `{PR_LABEL}`: its `if:` is `{condition}`"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn release_set(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
@@ -335,7 +352,7 @@ mod rules {
         );
         for job in BUILD_JOBS {
             w.push_str(&format!(
-                "  {job}:\n    runs-on: ubuntu-24.04\n    steps:\n"
+                "  {job}:\n    if: ${{{{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, '{PR_LABEL}') }}}}\n    runs-on: ubuntu-24.04\n    steps:\n"
             ));
             let platform = *job;
             let mine: Vec<&str> = ASSETS
@@ -427,6 +444,32 @@ mod rules {
                 "kbf-x for linux-arm64 is packaged but not in the pinned release set",
             ],
         );
+    }
+
+    #[test]
+    fn a_build_job_runs_on_a_pull_request_only_with_the_label() {
+        // Catches: a build job left without the label condition, so every pull request
+        // queues a runner for it (the load this gate removes).
+        let w = good();
+        let line = "    if: ${ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }\n"
+            .replace("${ ", "${{ ")
+            .replace(" }\n", " }}\n");
+        assert!(w.contains(&line), "the fixture's condition");
+        let parts: Vec<&str> = w.split(&line).collect();
+        assert_eq!(parts.len(), 4, "three build jobs");
+        for k in 0..3 {
+            let mut planted = String::new();
+            for (i, part) in parts.iter().enumerate() {
+                planted.push_str(part);
+                if i < 3 && i != k {
+                    planted.push_str(&line);
+                }
+            }
+            names(
+                &planted,
+                &[&format!("the build job `{}` does not run", BUILD_JOBS[k])],
+            );
+        }
     }
 
     #[test]
