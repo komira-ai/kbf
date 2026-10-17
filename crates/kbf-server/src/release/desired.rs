@@ -13,7 +13,8 @@
 //!   An optional `expect_generation` makes it a compare-and-set: the row is written only if the
 //!   desired release is at that generation (0 before any offer), else `409` naming both and
 //!   nothing is written. `GET` also shows the `policy` row when the operator wrote one.
-//! - `POST /v1/update/pause` and `resume` set whether the run may start a host.
+//! - `POST /v1/update/pause` and `resume` set `paused` of the policy row (a compare-and-set of
+//!   that one field): while set, no host is started. It needs no run, and survives the next offer.
 //! - Without a release store (`--releases-dir`) or without a state store (`--state-store`:
 //!   the row has nowhere to live) every answer is `503` saying which is missing.
 //!
@@ -85,7 +86,6 @@ fn desired_view(desired: Option<&Desired>) -> serde_json::Value {
             "generation": d.generation.0,
             "commit": d.commit.as_str(),
             "set_at_ms": d.set_at.as_millis(),
-            "paused": d.paused,
         })
     })
 }
@@ -94,6 +94,7 @@ fn desired_view(desired: Option<&Desired>) -> serde_json::Value {
 fn policy_view(p: &Policy) -> serde_json::Value {
     let secs = |d: std::time::Duration| d.as_secs();
     json!({
+        "paused": p.paused,
         "auto_nodes": p.auto_nodes,
         "auto_frontend": p.auto_frontend,
         "new_work_only_to_updated": p.new_work_only_to_updated,
@@ -141,6 +142,8 @@ async fn view(State(update): State<Arc<Update>>) -> Response {
         Ok(policy) => policy,
         Err(e) => return row_failed(&e),
     };
+    // Without a policy row nothing is paused (the defaults).
+    let paused = policy.as_ref().is_some_and(|p| p.paused);
     let releases = match store.list().await {
         Ok(listing) => super::http::listing_view(&listing),
         Err(e) => {
@@ -155,6 +158,7 @@ async fn view(State(update): State<Arc<Update>>) -> Response {
         StatusCode::OK,
         &json!({
             "desired": desired_view(desired.as_ref()),
+            "paused": paused,
             "policy": policy.as_ref().map_or(serde_json::Value::Null, policy_view),
             "releases": releases,
         }),
@@ -278,11 +282,7 @@ async fn paused(
         return unavailable("the update state", "--state-store");
     };
     match blocking(move || rows.set_paused(paused)).await {
-        Ok(true) => json(StatusCode::OK, &json!({ "paused": paused })),
-        Ok(false) => error(
-            StatusCode::CONFLICT,
-            "there is no run to pause: nothing was offered",
-        ),
+        Ok(()) => json(StatusCode::OK, &json!({ "paused": paused })),
         Err(e) => row_failed(&e),
     }
 }
