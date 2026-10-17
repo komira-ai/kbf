@@ -102,12 +102,8 @@ mod tests {
             .expect("bind");
         let address = listener.local_addr().expect("address");
         let router = Server::builder().add_service(ReleaseServiceServer::new(Fake));
-        tokio::spawn(async move {
-            router
-                .serve_with_incoming(TcpIncoming::from(listener))
-                .await
-                .expect("serve");
-        });
+        // The future itself, not an async block: a line after its `await` would never run.
+        tokio::spawn(router.serve_with_incoming(TcpIncoming::from(listener)));
         let channel = Endpoint::from_shared(format!("http://{address}"))
             .expect("url")
             .connect_lazy();

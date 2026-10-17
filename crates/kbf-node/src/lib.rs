@@ -1784,6 +1784,60 @@ mod tests {
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
+    /// The plane factory the update-dir test hands `start_over` three times: one function
+    /// item, so the three starts are one instantiation (the coverage ratchet counts the
+    /// best instantiation, which must run every arm of the match on the map and the flag).
+    fn plane(cli: &Cli, _: Liveness) -> Result<Arc<kbf_transfer::Transfers>, Error> {
+        remote(cli)
+    }
+
+    /// Catches a flag taken and ignored, and an update client left off: with a storage map
+    /// and `--update-dir` the daemon gets its update client; without a map (the in-process
+    /// daemon of the all-in-one binary) `--update-dir` is refused instead of silently doing
+    /// nothing; with neither, nothing is asked.
+    ///
+    /// Mutants seen red: the refusing arm dropped (the second start succeeds); the link
+    /// made whatever the flag says (the third start fails on the missing directory).
+    #[test]
+    fn the_update_dir_is_for_a_daemon_with_a_map_and_refused_without_one() {
+        let dir = scratch("update-dir");
+        tls_files(&dir);
+        let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
+        let base = vec![
+            "kbf-daemon".to_owned(),
+            "--server=https://127.0.0.1:1".to_owned(),
+            flag("ca-cert", &dir.join("ca.pem")),
+            flag("cert", &dir.join("node.pem")),
+            flag("key", &dir.join("node.key")),
+            "--node-id=mac-1".to_owned(),
+            "--driver=native".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
+            flag("data-dir", &dir),
+            flag("xcode-apps", &dir.join("Applications")),
+        ];
+        let mut asked = base.clone();
+        asked.push(flag("update-dir", &dir.join("update")));
+        let with_dir = Cli::try_parse_from(asked).expect("flags");
+        let base_flags = base.clone();
+        let without = Cli::try_parse_from(base).expect("flags");
+        let started = start_over(&with_dir, Some(Arc::new(MapHolder::new())), plane);
+        drop(started.expect("a daemon with a map takes an update directory"));
+        let why = start_over(&with_dir, None, plane).err().expect("refused");
+        assert!(
+            why.to_string().contains("--update-dir is not taken"),
+            "{why}"
+        );
+        drop(start_over(&without, None, plane).expect("no flag, no client"));
+        // The fourth start fails inside `node_over`: this instantiation also takes the
+        // error return of that call, so it is the one the ratchet counts as fully run.
+        let mut broken = base_flags.clone();
+        broken.push("--lease-placement=numa-node".to_owned());
+        let broken = Cli::try_parse_from(broken).expect("flags");
+        let why = start_over(&broken, None, plane).err().expect("refused");
+        assert!(why.to_string().contains("only --driver container"), "{why}");
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
     /// Catches a daemon that starts with storage-liveness flags it cannot honour: a zero
     /// value, or a ping timeout past the interval, is refused by `start` (and by
     /// `start_with`, as the same check) before any driver is set up, naming the flag.

@@ -344,6 +344,15 @@ impl Daemon {
         self
     }
 
+    /// Lets the update client settle its gate; when it changed, the frontend is told in a
+    /// new `Hello`. A method of its own, not lines in the session loop: the loop is one
+    /// function in every test binary and the ratchet counts the best of those binaries.
+    fn settle_update(&mut self, tx: &UnboundedSender<DaemonMessage>) {
+        if self.update.settle(tx) {
+            send(tx, daemon_message::Message::Hello(self.hello()));
+        }
+    }
+
     /// Hands the frontend's update offers and orders to `update`, reports its status, and
     /// takes no lease while it holds the update gate. Without one the daemon reports nothing.
     #[must_use]
@@ -711,9 +720,7 @@ impl Daemon {
                 Wake::Pressure | Wake::MapAsked | Wake::Update => {}
             }
             self.ask_map(&tx);
-            if self.update.settle(&tx) {
-                send(&tx, daemon_message::Message::Hello(self.hello()));
-            }
+            self.settle_update(&tx);
             // Whatever woke the loop, leases may have started or ended.
             if self.take_pressure() {
                 tracing::info!(phase = self.phase().name(), "node phase changed");
