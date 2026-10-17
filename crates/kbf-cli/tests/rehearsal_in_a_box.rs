@@ -85,6 +85,14 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+/// The last component of `dir`.
+fn file_name(dir: &Path) -> String {
+    dir.file_name()
+        .expect("a name")
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// `n` distinct ports nothing listens on now.
 fn ports(n: usize) -> Vec<u16> {
     let held: Vec<TcpListener> = (0..n)
@@ -248,7 +256,14 @@ impl Farm {
         farm.ca = std::fs::read(etc.join("ca.pem")).expect("ca");
         let cfg = settings(&root, &loopback(0), "frontend-1", spare, &wiring, "");
         let unit = rendered(&cfg, uid, Mode::Frontend);
-        farm.launch(&dir, &root, "frontend", unit, None);
+        // The unit's control socket is in a `RuntimeDirectory=` systemd makes; a test box
+        // has no such directory, and the scratch directory's path is too long for a
+        // socket's (`SUN_LEN`), so the socket is in the temporary directory, named for
+        // the test.
+        let socket = std::env::temp_dir().join(format!("{}.sock", file_name(&dir)));
+        let _ = std::fs::remove_file(&socket);
+        let control = format!("--handover-socket={}", socket.display());
+        farm.launch(&dir, &root, "frontend", unit.replace(&[control]), None);
         let line = farm.start_line(0, "kbf-frontend ");
         farm.reapi = field(&line, "reapi=").to_owned();
 

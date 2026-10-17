@@ -24,6 +24,7 @@ kbf-peer.workspace = true
 kbf-proto.workspace = true
 kbf-segments.workspace = true
 kbf-store.workspace = true
+kbf-tls.workspace = true
 kbf-types.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

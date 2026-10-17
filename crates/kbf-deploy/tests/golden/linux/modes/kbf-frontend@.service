@@ -1,13 +1,33 @@
-# Rendered by `kbf-deploy linux render-units --mode frontend`; installed as
-# /etc/systemd/system/kbf-frontend.service (kbf docs/design/architecture-v2.md,
-# sections 1 and 11). `check-units --mode frontend` parses the flags below with
-# `kbf check-args frontend`.
+# Rendered by `kbf-deploy linux render-units --mode frontend`; installed as the template
+# unit kbf-frontend (the file name has an at sign before the dot) in /etc/systemd/system/
+# (kbf docs/design/frontend-handover.md; architecture-v2.md, sections 1 and 11).
+# `check-units --mode frontend` parses the flags below with `kbf check-args frontend`.
+#
+# A template with two instances, a and b, that run the same command line: only one serves
+# at a time. An update starts the idle one while the other still serves (`kbf frontend
+# handover`): the new process takes the listeners, the state store and the daemons over
+# the control socket, `systemctl start` returns when it has said READY=1, and the old one
+# drains its open builds and exits. Only instance a is enabled (DefaultInstance=a). No
+# `Conflicts=` between the instances: starting one must never stop the other, which is
+# draining (check-units rule `handover`).
 [Unit]
-Description=kbf build farm frontend
+Description=kbf build farm frontend, instance %i
 Wants=network-online.target
 After=network-online.target
 
 [Service]
+# kbf sends READY=1 (sd_notify) once it serves and its probes pass, so `systemctl start`
+# of the idle instance returns only when it can take the builds. A frontend that cannot
+# take the listeners over fails to start and the one serving is not touched.
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=120
+# The control socket's directory, shared by the two instances: it must outlive the
+# instance that stops (RuntimeDirectoryPreserve=yes), or the draining one would take the
+# socket the next handover asks at with it.
+RuntimeDirectory=kbf-frontend
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
 # Not the daemon's user: the frontend holds the state store and the operator token.
 User=kbf-server
 Slice=kbf.slice
@@ -38,8 +58,9 @@ ExecStart=/usr/local/bin/kbf frontend \
     --storage-client-cert=/etc/kbf/worker.pem \
     --storage-client-key=/etc/kbf/worker.key \
     --storage-ca=/etc/kbf/ca.pem \
-    --state-store=sqlite:///var/lib/kbf-server/state/state.db
-# kbf drains on SIGTERM: new Execute calls are refused, open streams run until their
+    --state-store=sqlite:///var/lib/kbf-server/state/state.db \
+    --handover-socket=/run/kbf-frontend/control.sock
+# The instance that handed over drains and exits by itself; kbf drains on SIGTERM too: new Execute calls are refused, open streams run until their
 # action is done (Buck2 does not recover a stream that breaks), with no deadline
 # (--shutdown-timeout-secs 0), then the server exits. A stop that ends sooner fails every
 # build in flight, so systemd sends SIGTERM and never kills it for taking long
@@ -53,4 +74,5 @@ Restart=on-failure
 RestartPreventExitStatus=2
 
 [Install]
+DefaultInstance=a
 WantedBy=multi-user.target

@@ -15,12 +15,15 @@
 //! The plan has each of these only when the host differs:
 //! 1. with `--bin-dir`, `kbf` copied into `KBF_BIN_DIR` (0755, root's), the binary it
 //!    replaces kept as `kbf.previous`;
-//! 2. `kbf.slice` and `kbf-<mode>.service` under `/etc/systemd/system` (0644, root's);
+//! 2. `kbf.slice` and `kbf-<mode>.service` (the frontend's is the template
+//!    `kbf-frontend@.service`) under `/etc/systemd/system` (0644, root's);
 //! 3. the directories the unit's flags name, the unit's user's: `--data-dir` (0755),
 //!    `--meta-dir`, a `file://` `--hot-store` or `--cold-store`, and the directory of a
 //!    `--state-store=sqlite://` file (0700);
 //! 4. when a file changed: `daemon-reload`, then enable and restart the unit; otherwise
-//!    it is enabled and started only if it is not; after any start of a unit with
+//!    it is enabled and started only if it is not (the frontend's template is enabled as
+//!    such and `kbf-frontend@a` started; a serving instance is never restarted, the plan
+//!    says to run `kbf frontend handover`); after any start of a unit with
 //!    `--api-listen=127.0.0.1:<port>`, a wait of up to 60 s for its `/readyz`.
 //!
 //! Without `--apply` every step is a `DRY-RUN:` line: nothing is written, reloaded or
@@ -129,21 +132,48 @@ fn plan_with<E: Exec>(
     }
 
     let mut started = false;
+    // The frontend's unit is a template: it is enabled by that name (DefaultInstance=
+    // makes it the first instance) and started as an instance. A serving instance is
+    // never restarted: a restart drains it and refuses every new build until the next
+    // start, which is what `kbf frontend handover` exists not to do.
+    let instances = mode.instances();
+    let first = instances[0].clone();
+    let serving = || -> Result<Option<String>, HostError> {
+        for instance in &instances {
+            if unit_is(exec, "is-active", instance)? {
+                return Ok(Some(instance.clone()));
+            }
+        }
+        Ok(None)
+    };
     if changed {
         planner.run(systemctl(&["daemon-reload"]));
         planner.run(systemctl(&["enable", &name]));
-        planner.run(systemctl(&["restart", &name]));
-        started = true;
+        if mode != Mode::Frontend {
+            planner.run(systemctl(&["restart", &name]));
+            started = true;
+        } else if let Some(serving) = serving()? {
+            note(
+                out,
+                format_args!(
+                    "{serving} is serving and is not restarted: run `kbf frontend handover` \
+                     to start the other instance on the new unit and binary"
+                ),
+            )?;
+        } else {
+            planner.run(systemctl(&["start", &first]));
+            started = true;
+        }
     } else {
         note(
             out,
             format_args!("unit and binary unchanged: nothing restarted"),
         )?;
-        if !unit_is(exec, "is-enabled", &name)? {
+        if !unit_is(exec, "is-enabled", &first)? {
             planner.run(systemctl(&["enable", &name]));
         }
-        if !unit_is(exec, "is-active", &name)? {
-            planner.run(systemctl(&["start", &name]));
+        if serving()?.is_none() {
+            planner.run(systemctl(&["start", &first]));
             started = true;
         }
     }
