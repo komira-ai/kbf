@@ -249,70 +249,122 @@ fn the_real_calls_with_the_ids_the_process_has_succeed_or_are_refused_for_a_user
     );
 }
 
-/// Catches a program that inherits a descriptor the helper's parent left open (a lock file,
-/// a socket). `before_exec` keeps every descriptor from the given number up from the
-/// program by `close_range` (and, where that is not allowed, by marking the listed ones
-/// itself), and leaves the lower ones as they were. The descriptors are fresh ones this
-/// test opened and numbers it asks for, whatever other tests hold; a real child, started
-/// with a fresh descriptor at the lowest free number from 3 (the boundary), lists none.
-///
-/// Mutants seen red: both ways doing nothing. (The boundary mutant, 4 for 3, is caught
-/// only when the lowest free descriptor is 3.)
-#[test]
-fn the_child_inherits_no_descriptor_above_its_streams() {
-    use std::os::fd::AsRawFd;
-    let file = std::fs::File::open("/").expect("open");
-    let dup = |at: libc::c_int| {
-        // SAFETY: fcntl F_DUPFD takes a descriptor this test holds and a lowest number; the
-        // new descriptor is a raw number closed below.
-        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, at) }
-    };
-    let flags = |fd: i32| unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    let cloexec = |fd: i32| flags(fd) & libc::FD_CLOEXEC != 0;
-    let (above, below, listed) = (
-        dup(HIGH_FD as libc::c_int),
-        dup(20),
-        dup(HIGH_FD as libc::c_int),
-    );
-    assert!(above >= HIGH_FD as libc::c_int && below >= 20 && listed >= HIGH_FD as libc::c_int);
-    // The range way.
-    before_exec(None, Inherited::Range(HIGH_FD))().expect("no user, nothing to switch");
-    assert!(
-        cloexec(above) && cloexec(listed),
-        "the high ones close at exec"
-    );
-    assert!(!cloexec(below), "the low one is as it was");
-    // The listing way, which macOS and a sandbox without close_range take: a fresh high
-    // descriptor is found by the listing and marked.
-    let fresh = dup(HIGH_FD as libc::c_int + 50);
-    let found = listed_from(HIGH_FD).expect("the descriptor directory lists");
-    assert!(
-        found.contains(&fresh) && !found.contains(&below),
-        "{found:?}"
-    );
-    before_exec(None, Inherited::Listed(found))().expect("marks them");
-    assert!(cloexec(fresh));
-    // A listed descriptor that is gone by then is fine; any other failure is not.
-    before_exec(None, Inherited::Listed(vec![fresh + 1000]))().expect("a closed one is skipped");
-    // The probe says the range call works here (this CI and dev box have Linux 5.11+).
-    assert!(matches!(Inherited::of(3), Ok(Inherited::Range(3))));
+/// Two descriptors of this process at fixed numbers no other test uses (dup2 onto them): the
+/// one at `HIGH_FD` and the one below it, closed on drop. They are not close-on-exec, as a
+/// leak from the helper's parent would not be.
+struct Fixed {
+    below: libc::c_int,
+    first: libc::c_int,
+}
 
-    // A real child: a fresh descriptor at the lowest free number from 3 is not inherited.
-    // `readlink` opens no descriptor of its own, so the number is the helper's alone: it
-    // finds the link (exit 0) if the child holds it, nothing (exit 1) if not.
-    let lowest = dup(3);
-    assert!(lowest >= 3);
-    let ran = SystemRunner
-        .run(&spawn(
-            "/usr/bin/readlink",
-            &[&format!("/proc/self/fd/{lowest}")],
-        ))
-        .expect("readlink runs");
-    assert_eq!(ran.code, Some(1), "the child holds descriptor {lowest}");
-    for fd in [above, below, listed, fresh, lowest] {
-        // SAFETY: closing the descriptors this test made.
-        unsafe { libc::close(fd) };
+impl Fixed {
+    fn new() -> Fixed {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open("/").expect("open");
+        let at = |fd: libc::c_int| {
+            // SAFETY: dup2 onto a number this test owns (above anything the other tests of
+            // this crate open); it is closed in drop.
+            let got = unsafe { libc::dup2(file.as_raw_fd(), fd) };
+            assert_eq!(got, fd, "dup2 onto {fd}: is the descriptor limit above it?");
+            fd
+        };
+        Fixed {
+            below: at(HIGH_FD as libc::c_int - 1),
+            first: at(HIGH_FD as libc::c_int),
+        }
     }
+
+    /// Both descriptors as they were made: not close-on-exec.
+    fn unmark(&self) {
+        for fd in [self.below, self.first] {
+            // SAFETY: clearing the flags of descriptors this value owns.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
+        }
+    }
+}
+
+impl Drop for Fixed {
+    fn drop(&mut self) {
+        for fd in [self.below, self.first] {
+            // SAFETY: closing the descriptors this value made.
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+fn cloexec_set(fd: libc::c_int) -> bool {
+    // SAFETY: F_GETFD on a number reports its flags, or EBADF.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    flags & libc::FD_CLOEXEC != 0
+}
+
+/// Whether a real child started with `how` holds descriptor `fd` (`readlink` opens none of
+/// its own, so it finds the link only if the child inherited the descriptor).
+fn child_holds(fd: libc::c_int, how: Inherited) -> bool {
+    let link = format!("/proc/self/fd/{fd}");
+    let ran = start(&spawn("/usr/bin/readlink", &[&link]), how).expect("readlink runs");
+    ran.code == Some(0)
+}
+
+/// Catches a program that inherits a descriptor the helper's parent left open (a lock file,
+/// a socket), at the boundary: the descriptor numbered `first` is kept from the program and
+/// the one below it is left alone, by `close_range` and by the listing way (macOS, and a
+/// sandbox without `close_range`), which finds `>= first` and nothing lower. Run in this
+/// process on descriptors at fixed numbers, whatever other tests hold, then in a real child.
+///
+/// Mutants seen red: both ways doing nothing; `>` for `>=` in the listing.
+#[test]
+fn the_child_inherits_no_descriptor_from_the_first_up() {
+    let fixed = Fixed::new();
+    let first = HIGH_FD;
+    let found = listed_in(Path::new(FD_DIR), first).expect("the descriptor directory lists");
+    assert!(found.contains(&fixed.first), "{found:?}");
+    assert!(!found.contains(&fixed.below), "{found:?}");
+    before_exec(None, Inherited::Listed(found.clone()))().expect("marks them");
+    assert!(cloexec_set(fixed.first) && !cloexec_set(fixed.below));
+    fixed.unmark();
+    before_exec(None, Inherited::Range(first))().expect("the range call");
+    assert!(cloexec_set(fixed.first) && !cloexec_set(fixed.below));
+    fixed.unmark();
+    // A real child, by the range way and by the listing: `first` is not inherited, below it is.
+    assert!(!child_holds(fixed.first, Inherited::Range(first)));
+    assert!(child_holds(fixed.below, Inherited::Range(first)));
+    assert!(!child_holds(fixed.first, Inherited::Listed(found.clone())));
+    // The listing starting one higher leaves `first` alone: the boundary is `>=`.
+    let higher = listed_in(Path::new(FD_DIR), first + 1).expect("lists");
+    assert!(!higher.contains(&fixed.first));
+}
+
+/// The constant the runner starts from: 0, 1 and 2 are the program's own, 3 is the first it
+/// must not inherit.
+#[test]
+fn descriptors_from_three_up_are_not_inherited() {
+    assert_eq!(FIRST_INHERITED, 3);
+}
+
+/// Catches an error in keeping descriptors from a program that is swallowed: a program that
+/// might hold a descriptor it should not is not run. The marking failing ends the start with
+/// that error; a range call the kernel refuses is an error of its own; a failed probe falls
+/// back to the listing, and a listing that fails ends the choice with its error, not a guess.
+///
+/// Mutants seen red: the marking's `?` dropped; the listing's error replaced by `Range`.
+#[test]
+fn a_failure_to_keep_descriptors_from_the_program_ends_the_start() {
+    let err =
+        start(&spawn("/usr/bin/true", &[]), Inherited::Fails(libc::EPERM)).expect_err("fails");
+    assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+    // The kernel refuses a range whose end is below its start.
+    let err = range_cloexec(5, 3).expect_err("EINVAL");
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+    let enosys = || Err(io::Error::from_raw_os_error(libc::ENOSYS));
+    // The probe failed and the directory cannot be listed: the error.
+    let err = Inherited::choose(3, enosys(), Path::new("/no/such/descriptor/dir")).err();
+    assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::NotFound));
+    // The probe failed and the directory lists: the listed way.
+    let chosen = Inherited::choose(3, enosys(), Path::new(FD_DIR)).expect("listed");
+    assert!(matches!(chosen, Inherited::Listed(_)));
+    // A descriptor that is not open is skipped, not an error.
+    cloexec(HIGH_FD as libc::c_int + 300).expect("a closed descriptor is fine");
 }
 
 /// Catches what a program leaves running in its own group: the program ends at once, having

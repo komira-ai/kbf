@@ -11,7 +11,7 @@
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -78,58 +78,63 @@ pub struct SystemRunner;
 
 impl Runner for SystemRunner {
     fn run(&self, spawn: &Spawn) -> io::Result<Ran> {
-        if !spawn.program.is_absolute() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{} is not an absolute path", spawn.program.display()),
-            ));
-        }
-        let mut command = Command::new(&spawn.program);
-        command
-            .args(&spawn.args)
-            .env_clear()
-            .envs(spawn.env.iter().map(|(k, v)| (k, v)))
-            .current_dir(&spawn.cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Its own process group, so the timeout can kill what it started too.
-            .process_group(0);
         // The descriptors to mark are found here, in the parent, where listing a directory
-        // may allocate; the closure only makes system calls on numbers copied in.
-        let inherited = Inherited::of(FIRST_INHERITED)?;
-        // SAFETY: the closure runs in the child between fork and exec; it makes system
-        // calls on numbers copied in and allocates nothing.
-        unsafe {
-            command.pre_exec(before_exec(spawn.run_as.filter(needs_switch), inherited));
-        }
-        let mut child = command.spawn()?;
-        let out = capture(child.stdout.take().expect("stdout is piped"));
-        let err = capture(child.stderr.take().expect("stderr is piped"));
-        let end = Instant::now() + spawn.timeout;
-        let (status, timed_out) = loop {
-            // The program is looked at without being reaped, so that its pid (and with it
-            // the process group's number) cannot be reused before the group is killed.
-            if exited(child.id())? {
-                kill_group(child.id());
-                break (child.wait()?, false);
-            }
-            if Instant::now() >= end {
-                kill_group(child.id());
-                break (child.wait()?, true);
-            }
-            thread::sleep(Duration::from_millis(5));
-        };
-        // One window for both readers, from now: a descendant that left the group and holds
-        // the pipes costs the run this long once, not once per pipe.
-        let until = Instant::now() + READ_GRACE;
-        Ok(Ran {
-            code: status.code(),
-            stdout: out.finish(until)?,
-            stderr: err.finish(until)?,
-            timed_out,
-        })
+        // may allocate; the child only makes system calls on numbers copied in.
+        start(spawn, Inherited::of(FIRST_INHERITED)?)
     }
+}
+
+/// Run `spawn` with `inherited` kept from the program. Not generic over how they are found, so
+/// a test can hand it a way that fails.
+fn start(spawn: &Spawn, inherited: Inherited) -> io::Result<Ran> {
+    if !spawn.program.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not an absolute path", spawn.program.display()),
+        ));
+    }
+    let mut command = Command::new(&spawn.program);
+    command
+        .args(&spawn.args)
+        .env_clear()
+        .envs(spawn.env.iter().map(|(k, v)| (k, v)))
+        .current_dir(&spawn.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Its own process group, so the timeout can kill what it started too.
+        .process_group(0);
+    // SAFETY: the closure runs in the child between fork and exec; it makes system
+    // calls on numbers copied in and allocates nothing.
+    unsafe {
+        command.pre_exec(before_exec(spawn.run_as.filter(needs_switch), inherited));
+    }
+    let mut child = command.spawn()?;
+    let out = capture(child.stdout.take().expect("stdout is piped"));
+    let err = capture(child.stderr.take().expect("stderr is piped"));
+    let end = Instant::now() + spawn.timeout;
+    let (status, timed_out) = loop {
+        // The program is looked at without being reaped, so that its pid (and with it
+        // the process group's number) cannot be reused before the group is killed.
+        if exited(child.id())? {
+            kill_group(child.id());
+            break (child.wait()?, false);
+        }
+        if Instant::now() >= end {
+            kill_group(child.id());
+            break (child.wait()?, true);
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    // One window for both readers, from now: a descendant that left the group and holds
+    // the pipes costs the run this long once, not once per pipe.
+    let until = Instant::now() + READ_GRACE;
+    Ok(Ran {
+        code: status.code(),
+        stdout: out.finish(until)?,
+        stderr: err.finish(until)?,
+        timed_out,
+    })
 }
 
 /// The first descriptor a program does not inherit: 0, 1 and 2 are its own.
@@ -202,6 +207,9 @@ enum Inherited {
     /// These, found by listing the process's descriptor directory in the parent (macOS, and
     /// Linux without `close_range`).
     Listed(Vec<libc::c_int>),
+    /// A marking that fails with this errno, for a test of what the start does then.
+    #[cfg(test)]
+    Fails(i32),
 }
 
 impl Inherited {
@@ -209,9 +217,14 @@ impl Inherited {
     /// works (probed on a range that holds no descriptor, so nothing of this process is
     /// changed), else the descriptors listed now.
     fn of(first: u32) -> io::Result<Inherited> {
-        match range_cloexec(u32::MAX, u32::MAX) {
+        Inherited::choose(first, range_cloexec(u32::MAX, u32::MAX), Path::new(FD_DIR))
+    }
+
+    /// [`Inherited::of`] given the probe's answer and the directory to list.
+    fn choose(first: u32, probe: io::Result<()>, dir: &Path) -> io::Result<Inherited> {
+        match probe {
             Ok(()) => Ok(Inherited::Range(first)),
-            Err(_) => Ok(Inherited::Listed(listed_from(first)?)),
+            Err(_) => Ok(Inherited::Listed(listed_in(dir, first)?)),
         }
     }
 }
@@ -243,9 +256,9 @@ const FD_DIR: &str = "/dev/fd";
 
 /// The descriptors of this process numbered `first` or more (the one that lists them
 /// included, which is closed again by the time anyone looks).
-fn listed_from(first: u32) -> io::Result<Vec<libc::c_int>> {
+fn listed_in(dir: &Path, first: u32) -> io::Result<Vec<libc::c_int>> {
     let mut fds = Vec::new();
-    for entry in std::fs::read_dir(FD_DIR)? {
+    for entry in std::fs::read_dir(dir)? {
         let name = entry?.file_name();
         let number = name.to_str().and_then(|n| n.parse::<libc::c_int>().ok());
         fds.extend(number.filter(|fd| u32::try_from(*fd).is_ok_and(|fd| fd >= first)));
@@ -284,6 +297,8 @@ fn before_exec(
         match &inherited {
             Inherited::Range(first) => range_cloexec(*first, u32::MAX)?,
             Inherited::Listed(fds) => fds.iter().try_for_each(|fd| cloexec(*fd))?,
+            #[cfg(test)]
+            Inherited::Fails(errno) => return Err(io::Error::from_raw_os_error(*errno)),
         }
         match user {
             Some(user) => switch_user(&Libc, user),

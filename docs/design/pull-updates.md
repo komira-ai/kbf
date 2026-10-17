@@ -69,7 +69,7 @@ Residuals, stated plainly:
   host accepts when the frontend offers it. The attestation proves *where a binary was built*, not *that a
   reviewer approved the source*.
 - **A hostile frontend can offer any older attested build.** Downgrades are allowed on purpose: a rollback is the
-  desired release set to an older commit. The guard is the **desired-state generation**; **as built**, the installer also keeps a floor on **order ids** (`BelowFloor`) and the helper passes the monotonically increasing `order_id` as the serial, so it is a floor on order ids, not on commits and a commit downgrade is still allowed (a higher generation gives a new, higher order id): a host
+  desired release set to an older commit. The guard is the **desired-state generation**; **as built**, the installer keeps no floor of its own: orders are ordered by (epoch, then id) in the node's client and the helper (see UpdateOrder), a commit downgrade is allowed, and a rollback is the old release offered again with a higher generation, which gets a new, higher order id. A host
   acts on the highest generation it has seen, a higher generation always wins, and an order carries the store epoch so
   a restored store cannot replay one. A host therefore cannot refuse "older" without an operator-set floor, which is
   deferred.
@@ -160,7 +160,8 @@ newer however large the gap (the counter is the store's, not the host's), and th
 no floor on the installer's side: a rollback is the old release ordered again, and the order of orders is the
 client's and the helper's alone. The helper names an activation `<epoch>-<id>`, so the same id in two epochs is two
 activations. An epoch more than 1000 above the last acted on is refused with the reason in `status.json` and not
-acknowledged, so a mistaken or hostile huge epoch cannot put every real order below the floor; the first order a host
+acknowledged. This is best effort: it blunts a typo or a stray huge epoch, but an order forged at acked+1, or a first
+order at a huge epoch, is taken and wedges the helper until root clears `helper.json`; the first order a host
 acts on is measured from nothing and is taken at any epoch. A compromised service user can still write a first order
 with a huge epoch: an availability limit, the same exposure as ordering an activation early (section 7.3 of the
 design study). `window_s` is the confirm window of `ACTIVATE`, **per platform as built**: on Linux the helper ignores it, and the window starts at the new
