@@ -418,6 +418,10 @@ pub struct CacheMetrics {
     pub sched_queued: Level,
     /// Leases granted or running, as of the last scheduler input.
     pub sched_leases: Level,
+    /// Callers of a frontend that handed its work to a successor and were told UNAVAILABLE
+    /// because the state store held no trace of their operation
+    /// (`kbf_frontend_relay_lost_total`).
+    pub frontend_relay_lost: Counter,
     /// Write-tier calls queued on or running on the blocking pool.
     pub tier_in_flight: Gauge,
     /// The wait of one write-tier call for a blocking-pool thread.
@@ -465,6 +469,7 @@ impl Default for CacheMetrics {
             sched_lock_wait: Histogram::new(Unit::Seconds),
             sched_queued: Level::default(),
             sched_leases: Level::default(),
+            frontend_relay_lost: Counter::default(),
             tier_in_flight: Gauge::default(),
             tier_wait: Histogram::new(Unit::Seconds),
             tier_call: Histogram::new(Unit::Seconds),
@@ -640,6 +645,12 @@ impl CacheMetrics {
             "kbf_sched_leases",
             "Leases granted or running, as of the last scheduler input",
             self.sched_leases.get(),
+        );
+        out.counter(
+            "kbf_frontend_relay_lost_total",
+            "Callers of a frontend that handed its work over, told UNAVAILABLE because the \
+             state store held no trace of their operation",
+            self.frontend_relay_lost.get(),
         );
         out.gauge(
             "kbf_tier_in_flight",

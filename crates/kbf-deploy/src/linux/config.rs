@@ -41,6 +41,7 @@ pub const KEYS: &[&str] = &[
     "KBF_STORAGE_URL",
     "KBF_REAPI_CERT",
     "KBF_REAPI_KEY",
+    "KBF_API_TOKEN_FILE",
     "KBF_STATE_DIR",
     "KBF_RESERVE_CPUS",
     "KBF_LEASE_PLACEMENT",
@@ -137,6 +138,9 @@ pub struct LinuxConfig {
     /// file names are the host's to choose.
     pub reapi_cert: HostPath,
     pub reapi_key: HostPath,
+    /// The operator API's bearer token (`--api-token-file`): a file the operator puts
+    /// there, the server user's alone. install-units never makes it.
+    pub api_token_file: HostPath,
     /// The directory of the frontend's SQLite state store, `state.db` in it.
     pub state_dir: HostPath,
     /// The daemon's `--reserve-cpus`; none leaves kbf's default.
@@ -301,6 +305,7 @@ impl LinuxConfig {
             storage_url,
             reapi_cert: path("KBF_REAPI_CERT", &format!("{etc}/reapi.pem"))?,
             reapi_key: path("KBF_REAPI_KEY", &format!("{etc}/reapi.key"))?,
+            api_token_file: path("KBF_API_TOKEN_FILE", &format!("{etc}/api-token"))?,
             state_dir: path("KBF_STATE_DIR", "/var/lib/kbf-server/state")?,
             reserve_cpus,
             lease_placement,

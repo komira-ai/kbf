@@ -17,13 +17,13 @@ use kbf_proto::reapi::platform::Property;
 use kbf_proto::reapi::{
     Action, ActionResult, Command, Digest, Directory, ExecuteRequest, Platform,
 };
-use kbf_server::{Api, Listeners, WorkerTls, bind_server_with_api};
+use kbf_server::{Api, Listeners, TlsSource, WorkerTls, bind_server_with_api};
 use kbf_transfer::{TransferConfig, Transfers};
 use prost::Message as _;
 use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tonic::transport::{Certificate, Channel, Endpoint, Identity, ServerTlsConfig};
+use tonic::transport::{Channel, Endpoint};
 
 use super::tests::{fake, scratch, surveyed};
 
@@ -44,7 +44,7 @@ const HELLO_WITHIN: Duration = Duration::from_secs(2);
 /// takes the node id from its one DNS name, and requires the daemon role) and a server
 /// certificate for `localhost`, the client's files written into `dir`; returns the
 /// server's TLS.
-fn pki(dir: &Path) -> ServerTlsConfig {
+fn pki(dir: &Path) -> TlsSource {
     let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("key")).expect("CA");
@@ -61,9 +61,13 @@ fn pki(dir: &Path) -> ServerTlsConfig {
     std::fs::write(dir.join("node.pem"), node).expect("write");
     std::fs::write(dir.join("node.key"), node_key).expect("write");
     let (server, server_key) = leaf(vec!["localhost".to_owned()], Vec::new());
-    ServerTlsConfig::new()
-        .identity(Identity::from_pem(server, server_key))
-        .client_ca_root(Certificate::from_pem(ca.pem()))
+    TlsSource::fixed(
+        "worker",
+        server.as_bytes(),
+        server_key.as_bytes(),
+        Some(ca.pem().as_bytes()),
+    )
+    .expect("server TLS")
 }
 
 /// `GET /v1/nodes`, as JSON.
@@ -188,6 +192,7 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     };
     let api = Api {
         listen: loopback,

@@ -66,6 +66,7 @@ fn listeners() -> Listeners {
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     }
 }
 
@@ -226,6 +227,7 @@ async fn a_server_with_a_state_store_sends_daemons_its_members_map() {
         store: Arc::clone(&store) as Arc<dyn Store>,
         epoch: EpochPolicy::Keep,
         members: config,
+        history: None,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let bound = bind_server_with_state(

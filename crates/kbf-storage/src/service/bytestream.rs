@@ -9,8 +9,7 @@ use kbf_proto::google::bytestream::{
 };
 use tonic::{Request, Response, Status, Streaming};
 
-use super::{Endpoint, MAX_BLOB_BYTES, StorageService, catch_up, generation, wire};
-use crate::StorageError;
+use super::{Endpoint, StorageService, catch_up, generation, wire};
 
 #[tonic::async_trait]
 impl ByteStream for StorageService {
@@ -38,10 +37,11 @@ impl ByteStream for StorageService {
         let catching_up = self.catching_up();
         let chunks = match self.storage.read_range(&digest, offset, limit).await {
             Ok(chunks) => chunks,
-            Err(StorageError::NotFound(_)) if catching_up => {
-                return Err(catch_up::unavailable(&digest.to_string()));
+            Err(e) => {
+                return Err(
+                    catch_up::read_miss(catching_up, &e, &digest).unwrap_or_else(|| e.into())
+                );
             }
-            Err(e) => return Err(e.into()),
         };
         let messages = chunks.map(|chunk| match chunk {
             Ok(data) => Ok(ReadResponse {
@@ -54,45 +54,40 @@ impl ByteStream for StorageService {
 
     /// Receives a blob from offset 0 and answers with its size once it is stored. A
     /// caller whose map generation is not this node's is refused first
-    /// ([`crate::replicate`]); a blob already held is answered at once, unread.
+    /// ([`crate::replicate`]); a blob already held is answered at once, unread. No blob
+    /// is refused for its size.
     ///
     /// The bytes are checked against the digest in the resource name, and never more
     /// than it declares are taken. Where the store can write a blob as it arrives
     /// ([`crate::Storage::stream`]) they are written so and held in the few chunks in
     /// flight, whatever the blob's size; the primary of a chain streams each chunk on to
     /// the replica as well and answers only when both hold the blob. Where the store
-    /// cannot, a node outside a chain holds the blob whole until it is complete
-    /// ([`super::Config::write_bytes_in_flight`]).
+    /// cannot, a node outside a chain holds a blob of at most
+    /// [`super::STREAM_FROM_BYTES`] whole until it is complete
+    /// ([`super::Config::write_bytes_in_flight`]), and streams a larger one to the
+    /// object store ([`crate::Storage::put_streamed`]) without holding it.
     async fn write(
         &self,
         request: Request<Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
         let leg_from = generation::leg(&request)?;
+        // Only the frontend's identity may ask for an unowned copy; any other caller that
+        // sends the header gets the plain-write rule.
+        let unowned = generation::takes_unowned(
+            leg_from,
+            generation::unowned(&request),
+            self.admission.permits_unowned(&request),
+        );
         let endpoint = if leg_from.is_some() {
             Endpoint::WriteLeg
         } else {
             Endpoint::Write
         };
         self.admission.check(&request, endpoint)?;
-        let view = self.view(generation::requested(&request)?).await?;
-        let mut stream = request.into_inner();
-        let first = stream
-            .message()
-            .await?
-            .ok_or_else(|| Status::invalid_argument("write stream sent no message"))?;
-        let digest = wire::write_resource(&first.resource_name)?;
-        let size = digest.size_bytes;
-        if size > MAX_BLOB_BYTES {
-            return Err(Status::invalid_argument(format!(
-                "{digest} is larger than the largest blob this node accepts ({MAX_BLOB_BYTES} \
-                 bytes)"
-            )));
-        }
-        let plan = self.plan(view.as_ref(), &digest, leg_from)?;
-        if self.storage.find_missing(&[digest]).await?.is_empty() {
-            return Ok(wire::committed(size));
-        }
-        self.write_blob(digest, first, stream, view.as_ref(), leg_from, plan)
+        let requested = generation::requested(&request)?;
+        let stream = request.into_inner();
+        let size = self
+            .write_in(requested, leg_from, unowned, stream.boxed())
             .await?;
         Ok(wire::committed(size))
     }

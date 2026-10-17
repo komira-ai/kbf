@@ -15,15 +15,24 @@
 //! - **C8** a bounded, ordered range scan under a prefix, between two bounds, forward or
 //!   in reverse, that pages with a [`ResumeToken`] ([`Store::scan_range`], [`ScanRange`]).
 //!
+//! **Fencing** ([`Fenced`]): a writer takes the store's generation, one row, when its
+//! role begins, and every write it makes checks the row in the same transaction. A
+//! writer that began later makes every write of an earlier one fail, so two never act.
+//!
 //! With the `postgres` feature, [`postgres`] is the Postgres backend.
 //!
-//! [`conformance`] states each clause as a function generic over a [`conformance::Backend`]
-//! factory; [`fake`] is the in-memory backend, with a deliberately broken variant per clause
-//! that the suite must reject.
+//! With the `test-support` feature (and in this crate's own unit tests) `conformance`
+//! states each clause as a function generic over a `conformance::Backend` factory, and
+//! `fake` is the in-memory backend, with a deliberately broken variant per clause that
+//! the suite must reject. A default build has neither: a crate that tests against the
+//! fake enables the feature in its `[dev-dependencies]`.
 
 pub mod clock;
+#[cfg(any(test, feature = "test-support"))]
 pub mod conformance;
+#[cfg(any(test, feature = "test-support"))]
 pub mod fake;
+mod fence;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod sqlite;
@@ -33,6 +42,7 @@ mod types;
 use std::time::Duration;
 
 pub use clock::{Clock, ManualClock, StoreTime, SystemClock};
+pub use fence::{Fenced, GENERATION, TakeError};
 pub use store::Store;
 pub use types::{
     Change, Changes, Commit, CommitStats, Cond, Conflict, Direction, Event, Op, ResumeToken,

@@ -129,7 +129,8 @@ way: a file the daemon reads by a flag, the service manager's own environment wi
   `--lease-placement` when `KBF_RESERVE_CPUS` and `KBF_LEASE_PLACEMENT` are set). `--server`
   and `--cas` dial the frontend by `KBF_FRONTEND_NAME`, not the node's own
   `KBF_HOST_NAME` (below); no key.
-- **`all-in-one`**: below; no key (its cold store is a directory).
+- **`all-in-one`**: below; no key (its cold store is a directory); its `--api-token-file` is
+  `KBF_API_TOKEN_FILE` too.
 - **`storage-and-daemon`**: the storage unit's flags (`--cold-store`, with
   `KBF_S3_PREFIX` as its path, `--meta-dir`, `--hot-store`, `--storage-listen`
   `<KBF_LISTEN_ADDRESS>:<KBF_STORAGE_PORT>` and the three certificate flags; no `--cas`:
@@ -146,7 +147,11 @@ way: a file the daemon reads by a flag, the service manager's own environment wi
   file names are settings; default `reapi.pem` and `reapi.key` under `KBF_ETC`);
   `--worker-listen=<KBF_LISTEN_ADDRESS>:<KBF_WORKER_PORT>` with `worker.pem`,
   `worker.key` and `--worker-client-ca=ca.pem`; `--api-listen=127.0.0.1:<KBF_API_PORT>`
-  (no token flag: writes to the operator API are refused until one is given);
+  `--api-token-file=<KBF_API_TOKEN_FILE>` (default `api-token` under `KBF_ETC`; the
+  path only, never the token: without it every write to the operator API, `POST
+  /v1/frontend/drain` included, answers 401). The operator puts that file there;
+  `install-units` never makes it, and refuses a missing one, one the server user does
+  not own, or one with a group or other bit (mode 0600 or 0400);
   `--storage=<KBF_STORAGE_URL>` (required, `https://`) with the frontend's worker
   certificate as its client identity (`--storage-client-cert`, `--storage-client-key`)
   and `--storage-ca=ca.pem`; and `--state-store=sqlite://<KBF_STATE_DIR>/state.db`
@@ -179,6 +184,30 @@ SQLite path that is empty, relative or not normal, and a `--state-store=${VAR}`
 (systemd expands the variable into the command line, so the rule cannot read the store
 it names, and what it holds is in argv, readable by every user). A unit with no
 `--state-store` passes. No message repeats the value.
+
+### Updating a frontend without failing a build: `kbf-frontend@.service`
+
+The frontend's unit is a template with two instances, `kbf-frontend@a` and
+`kbf-frontend@b`, that run the same command line; only one serves, and only `@a` is
+enabled at boot. To update, put the new `kbf` in place by rename (`install-units --mode
+frontend --bin-dir DIR --apply` does, and with a serving instance restarts nothing), then
+run, on the frontend's host:
+
+```
+kbf frontend handover --wait
+```
+
+It starts the idle instance with `systemctl start`; the unit is `Type=notify`, so the start
+returns when the new frontend has taken the listeners, the state store and the daemons over
+and serves. The old instance then answers the builds it holds and exits by itself (`--wait`
+looks at it until it has). Buck2's open streams are not broken, new calls go to the new
+frontend, daemons reconnect and keep their runs. A new instance that fails before it is
+ready leaves the old one serving, and the command exits 1 and says so. With both instances
+active (the old one still draining) it refuses. What each party sees, and every failure:
+`docs/design/frontend-handover.md`. Rule `handover` of `check-units --mode frontend`
+refuses a unit that is not `Type=notify`, whose `--handover-socket` is outside a
+`RuntimeDirectory=` kept with `RuntimeDirectoryPreserve=yes`, or that has `Conflicts=`
+(starting an instance would stop the one draining).
 
 ### Stopping a frontend: TimeoutStopSec=infinity
 
@@ -290,11 +319,15 @@ toward storage), `ca.pem`, and the REAPI pair `KBF_REAPI_CERT` and `KBF_REAPI_KE
    unit's user's with no group or other bit, and each certificate, CA or deny list flag
    names a file.
 2. It plans, each step only when the host differs: the new `kbf` (with `--bin-dir`; the
-   old one kept as `kbf.previous`), `kbf.slice` and `kbf-<mode>.service` (0644, root's),
+   old one kept as `kbf.previous`), `kbf.slice` and `kbf-<mode>.service` (the frontend's is
+   the template `kbf-frontend@.service`; 0644, root's),
    the directories the unit's flags name (the unit's user's: `--data-dir` 0755,
    `--meta-dir`, a `file://` hot or cold store, and the directory of a `--state-store`
    SQLite file 0700), then `daemon-reload`, enable
-   and restart; with nothing changed, enable and start only if the unit is not. A unit
+   and restart; with nothing changed, enable and start only if the unit is not. The frontend
+   is enabled as the template and `kbf-frontend@a` is started only if neither instance is
+   active: a serving instance is never restarted, the plan says to run `kbf frontend
+   handover` ("Updating a frontend without failing a build"). A unit
    with `--api-listen=127.0.0.1:<port>` (`frontend`, `all-in-one`) is waited for on `/readyz`.
 3. Without `--apply` every step is printed as a `DRY-RUN:` line and nothing is written,
    reloaded or started.

@@ -17,6 +17,10 @@ use crate::record::{
 };
 use crate::run::ActionShape;
 
+mod ended;
+
+pub use ended::{Ended, EndedKind};
+
 /// How many dropped calls of records not made yet [`Records`] remembers, so that the
 /// record each would have made starts incomplete (see
 /// [`Records::mark_incomplete_call`]).
@@ -99,6 +103,8 @@ pub struct Records {
     evicted_seen: Option<WallTime>,
     /// Records removed for the bound.
     evicted: u64,
+    /// What the event being applied ended; [`Records::apply`] hands it out.
+    ended: Vec<Ended>,
 }
 
 /// The records of one id that are held.
@@ -194,6 +200,7 @@ impl Records {
             evicted: 0,
             made: 0,
             evicted_seen: None,
+            ended: Vec::new(),
         }
     }
 
@@ -248,8 +255,15 @@ impl Records {
         self.evicted_seen
     }
 
-    /// Applies one event, admitting what it adds within the bound.
-    pub fn apply(&mut self, event: Event) {
+    /// Applies one event, admitting what it adds within the bound, and returns what it
+    /// ended: each attempt of each row that settled, and each cache hit that gained
+    /// its row (see [`Ended`]).
+    pub fn apply(&mut self, event: Event) -> Vec<Ended> {
+        self.apply_event(event);
+        std::mem::take(&mut self.ended)
+    }
+
+    fn apply_event(&mut self, event: Event) {
         match event {
             Event::Call(call) => self.call(&call),
             Event::Command {
@@ -285,6 +299,7 @@ impl Records {
                         ended: None,
                         end: None,
                         run: None,
+                        run_id: None,
                     };
                     let fits = self.make_room(None, attempt_bytes(&attempt));
                     // Making room may have removed every record waiting on it.
@@ -326,6 +341,11 @@ impl Records {
                     }
                     op.queued = at;
                     self.spread(operation, at);
+                    // A report that carries a run block follows (`Ran`), which then
+                    // settles the attempt.
+                    if !ended::reports(reason) {
+                        self.settled(operation, lease, EndedKind::Requeued, at);
+                    }
                 }
             }
             Event::Ran {
@@ -350,6 +370,7 @@ impl Records {
                     }
                     let at = self.now;
                     self.spread(operation, at);
+                    self.settled(operation, lease, EndedKind::Ran, at);
                 }
             }
             Event::Finished(finished) => self.finish(finished),
@@ -542,7 +563,9 @@ impl Records {
                     let mut row = ActionRow::new(*action, call, How::CacheHit, None);
                     row.outcome = listing.exit_code.map(|exit_code| Outcome::Ok { exit_code });
                     row.set_listing(listing.clone(), OUTPUTS_PER_ROW);
-                    self.add_row(&key, row);
+                    if let Some(i) = self.add_row(&key, row) {
+                        self.hit(&key, i, call.at);
+                    }
                 }
             }
             CallKind::Execute { action, answer } => self.execute(&key, call, *action, answer),
@@ -584,6 +607,7 @@ impl Records {
                     inv.rows[i].outcome =
                         result.exit_code.map(|exit_code| Outcome::Ok { exit_code });
                     self.fill_listing(key, i, (**result).clone());
+                    self.hit(key, i, call.at);
                 }
                 return;
             }
@@ -654,7 +678,17 @@ impl Records {
         let had = attempts_bytes(&self.record(key).rows[i].attempts);
         if self.make_room(Some(key), attempts_bytes(attempts).saturating_sub(had)) {
             let inv = self.record(key);
-            inv.rows[i].attempts = attempts.to_vec();
+            // The operation's attempts carry no history id: each row's are its own, set
+            // once (`Records::set_run_id`), and kept across the copies that follow.
+            let held = std::mem::take(&mut inv.rows[i].attempts);
+            let mut copy = attempts.to_vec();
+            for a in &mut copy {
+                a.run_id = held
+                    .iter()
+                    .find(|h| h.lease == a.lease)
+                    .and_then(|h| h.run_id);
+            }
+            inv.rows[i].attempts = copy;
             inv.refresh_row(i);
         } else {
             self.record(key).mark_incomplete();
@@ -767,6 +801,9 @@ impl Records {
                 self.fill_outcome(&w.key, i, &outcome);
                 if let Some(listing) = &f.result {
                     self.fill_listing(&w.key, i, listing.clone());
+                }
+                if let Some((lease, _)) = &f.lease {
+                    self.note_ended(&w.key, i, *lease, EndedKind::Finished, f.at);
                 }
             }
         }

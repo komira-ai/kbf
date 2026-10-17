@@ -51,6 +51,7 @@ fn listeners() -> Listeners {
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     }
 }
 
@@ -102,6 +103,7 @@ fn store() -> (Arc<ManualClock>, Arc<Fake>, StateStore) {
         store: Arc::clone(&fake) as Arc<dyn Store>,
         epoch: EpochPolicy::Keep,
         members: config(),
+        history: None,
     };
     (clock, fake, state)
 }
@@ -178,8 +180,9 @@ async fn no_map_is_empty_and_no_state_store_is_not_found() {
 /// Catches a view that reads another source than the members the `Membership` service
 /// writes (a registered member must appear, with the id the registration answered), one
 /// that drops or renames a field (`id`, `addr`, `state`, `weight`, `generation`), and one
-/// that names a state other than the map's: a registered member is `joining` until
-/// promoted, and `active` after.
+/// that names a state other than the map's: a member the operator set `joining` is
+/// `joining` until promoted, and `active` after (a registration that is caught up is
+/// `active` at once).
 #[tokio::test]
 async fn a_registered_member_is_listed_and_active_once_promoted() {
     let (_clock, fake, state) = store();
@@ -187,9 +190,14 @@ async fn a_registered_member_is_listed_and_active_once_promoted() {
     let frontend = other_frontend(&fake);
     let a = frontend.register(&registrant(1, 1)).expect("a");
     let b = frontend.register(&registrant(2, 3)).expect("b");
+    let registered = members(server.api).await;
+    assert_eq!(registered["members"][0]["state"], json!("active"));
+    assert_eq!(registered["members"][1]["state"], json!("active"));
+    frontend.set_state(a.id, MemberState::Joining).expect("a");
+    let b_map = frontend.set_state(b.id, MemberState::Joining).expect("b");
 
     let joined = members(server.api).await;
-    assert_eq!(joined["generation"], json!(b.map.generation()));
+    assert_eq!(joined["generation"], json!(b_map.generation()));
     assert_eq!(
         joined["members"],
         json!([
@@ -218,6 +226,7 @@ async fn a_draining_or_expired_member_shows_its_state_until_it_leaves() {
     let a = frontend.register(&registrant(1, 1)).expect("a");
     let b = frontend.register(&registrant(2, 1)).expect("b");
     let c = frontend.register(&registrant(3, 1)).expect("c");
+    frontend.set_state(c.id, MemberState::Joining).expect("c");
 
     let state_of = |view: &Value, id: MemberId| -> Option<String> {
         view["members"]
@@ -285,6 +294,7 @@ fn failing() -> (Arc<Hooked>, Server) {
         store: Arc::clone(&hooked) as Arc<dyn Store>,
         epoch: EpochPolicy::Keep,
         members: config(),
+        history: None,
     };
     (hooked, start(Some(state)))
 }

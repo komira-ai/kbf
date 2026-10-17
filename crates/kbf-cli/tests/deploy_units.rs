@@ -42,7 +42,13 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
         };
         match parsed {
             Invocation::Daemon(_) => assert_eq!(mode, Mode::Daemon),
-            Invocation::AllInOne(_) => assert_eq!(mode, Mode::AllInOne),
+            Invocation::AllInOne(flags) => {
+                assert_eq!(mode, Mode::AllInOne);
+                assert_eq!(
+                    flags.server.api_token_file.as_deref(),
+                    Some(std::path::Path::new("/etc/kbf/api-token"))
+                );
+            }
             Invocation::Frontend(flags) => {
                 assert_eq!(mode, Mode::Frontend);
                 // The unit's storage URL and the three flags toward it are read as the
@@ -64,6 +70,11 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
                 assert_eq!(
                     flags.server.api_listen.map(|a| a.to_string()).as_deref(),
                     Some("127.0.0.1:8982")
+                );
+                // The operator API's token is the file the unit names, so a write is not 401.
+                assert_eq!(
+                    flags.server.api_token_file.as_deref(),
+                    Some(std::path::Path::new("/etc/kbf/api-token"))
                 );
                 assert_eq!(
                     flags.server.state_store,
@@ -413,4 +424,19 @@ fn an_older_kbf_fails_the_parse_rule_with_the_line_the_docs_quote() {
         "docs/deploy/kbf-modes.md does not quote:\n{}",
         failures[0]
     );
+}
+
+/// Catches `kbf frontend handover` starting instances the unit template does not have:
+/// kbf-cli spells the template's name and instances itself (kbf-deploy is a dev-dependency
+/// only), and the two must be the same words.
+#[test]
+fn the_handover_command_starts_the_instances_of_the_frontends_template() {
+    use kbf_cli::handover::{INSTANCES, TEMPLATE};
+    let instances: Vec<String> = INSTANCES
+        .iter()
+        .map(|i| format!("{TEMPLATE}@{i}.service"))
+        .collect();
+    assert_eq!(instances, Mode::Frontend.instances());
+    assert_eq!(Mode::Frontend.unit_name(), format!("{TEMPLATE}@.service"));
+    assert_eq!(TEMPLATE, format!("kbf-{}", Mode::Frontend.name()));
 }

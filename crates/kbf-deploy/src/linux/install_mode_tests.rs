@@ -444,11 +444,151 @@ fn the_frontend_unit_is_installed_with_its_state_directory() {
             "mkdir /var/lib/kbf-server (0755)".to_owned(),
             format!("mkdir /var/lib/kbf-server/state (0700, owner {uid}:{gid})"),
             "run /usr/bin/systemctl daemon-reload".to_owned(),
-            "run /usr/bin/systemctl enable kbf-frontend.service".to_owned(),
-            "run /usr/bin/systemctl restart kbf-frontend.service".to_owned(),
+            "run /usr/bin/systemctl enable kbf-frontend@.service".to_owned(),
+            "run /usr/bin/systemctl start kbf-frontend@a.service".to_owned(),
             "wait up to 60s for http://127.0.0.1:8982/readyz".to_owned(),
         ]
     );
+}
+
+/// The frontend's unit is a template with two instances, and a serving one is never
+/// restarted: a restart drains it and every new build is refused until the next start.
+/// Catches an update that restarts (or stops) the serving instance instead of leaving the
+/// handover to `kbf frontend handover`, an install that starts the second instance beside
+/// the first (two frontends would ask each other for the listeners), a template enabled
+/// under a name systemd refuses, and a host with neither instance up left without one.
+#[test]
+fn a_serving_frontend_instance_is_not_restarted_by_an_update() {
+    let (mut exec, world) = host("install-mode-frontend-serving");
+    let a = install(Mode::Frontend, None);
+    go(&mut exec, &a, PlanMode::Apply);
+    assert!(
+        exec.at("/etc/systemd/system/kbf-frontend@.service")
+            .exists(),
+        "the template is written under its own name"
+    );
+    assert!(world.borrow().active.contains("kbf-frontend@a.service"));
+    assert!(!world.borrow().active.contains("kbf-frontend@b.service"));
+
+    // The second instance serves; the unit file differs from the host's.
+    {
+        let mut w = world.borrow_mut();
+        w.active.clear();
+        w.active.insert("kbf-frontend@b.service".to_owned());
+        w.enabled.insert("kbf-frontend@a.service".to_owned());
+    }
+    write(
+        &exec,
+        "/etc/systemd/system/kbf-frontend@.service",
+        "[Service]\n",
+        0o644,
+    );
+    let (p, out) = plan_here(&exec, &a).expect("plan");
+    let got = steps(&p);
+    assert!(
+        got.contains(&"run /usr/bin/systemctl daemon-reload".to_owned())
+            && got.contains(&"run /usr/bin/systemctl enable kbf-frontend@.service".to_owned()),
+        "{got:?}"
+    );
+    assert!(
+        !got.iter()
+            .any(|s| s.contains("restart") || s.contains(" start ") || s.contains("stop")),
+        "{got:?}"
+    );
+    assert!(
+        !got.iter().any(|s| s.starts_with("wait")),
+        "nothing was started, so there is no /readyz to wait for: {got:?}"
+    );
+    assert!(
+        out.contains(
+            "kbf-frontend@b.service is serving and is not restarted: run `kbf frontend handover`"
+        ),
+        "{out}"
+    );
+
+    // Unchanged, enabled, and one instance up: nothing at all.
+    go(&mut exec, &a, PlanMode::Apply);
+    let (p, _) = plan_here(&exec, &a).expect("plan");
+    assert_eq!(steps(&p), Vec::<String>::new());
+}
+
+/// The operator token of the frontend and the all-in-one: the host check reads the file
+/// `KBF_API_TOKEN_FILE` names (the default, or another path), refuses it missing, readable
+/// by group or other, or another user's, and install-units never makes it. Catches a unit
+/// installed whose `--api-token-file` is absent (every write answers 401), a token the
+/// check looks for at the default path after the key moved, and a token file created.
+#[test]
+fn the_operator_token_file_is_checked_where_the_key_names_it() {
+    for mode in [Mode::Frontend, Mode::AllInOne] {
+        let try_with = |name: &str, key: &str, edit: &dyn Fn(&ScratchHost, &RefCell<World>)| {
+            let (exec, world) = host(&format!("install-mode-token-{name}"));
+            edit(&exec, &world);
+            let mut a = install(mode, None);
+            let text = EXAMPLE.replace("KBF_API_TOKEN_FILE=\n", key);
+            a.config = LinuxConfig::parse(&text).expect("valid settings");
+            plan_here(&exec, &a).map(|_| ())
+        };
+        let e = try_with("missing", "KBF_API_TOKEN_FILE=\n", &|exec, _| {
+            fs::remove_file(exec.at("/etc/kbf/api-token")).expect("rm");
+        })
+        .expect_err("no token");
+        assert!(
+            matches!(&e, HostError::Missing(p) if p.as_str() == "/etc/kbf/api-token"),
+            "{mode}: {e}"
+        );
+        let e = try_with("group", "KBF_API_TOKEN_FILE=\n", &|exec, _| {
+            write(exec, "/etc/kbf/api-token", "t", 0o640);
+        })
+        .expect_err("group-readable");
+        assert!(
+            matches!(&e, HostError::Readable { path, .. } if path.as_str() == "/etc/kbf/api-token"),
+            "{mode}: {e}"
+        );
+        write_ok(&try_with("0400", "KBF_API_TOKEN_FILE=\n", &|exec, _| {
+            write(exec, "/etc/kbf/api-token", "t", 0o400);
+        }));
+        // Another path: that file is the one looked for, and the default one is not.
+        let moved = "KBF_API_TOKEN_FILE=/etc/kbf/operator.token\n";
+        let e = try_with("moved-missing", moved, &|_, _| {}).expect_err("no token there");
+        assert!(
+            matches!(&e, HostError::Missing(p) if p.as_str() == "/etc/kbf/operator.token"),
+            "{mode}: {e}"
+        );
+        write_ok(&try_with("moved", moved, &|exec, _| {
+            fs::remove_file(exec.at("/etc/kbf/api-token")).expect("rm");
+            write(exec, "/etc/kbf/operator.token", "t", 0o600);
+        }));
+        let e = try_with("moved-readable", moved, &|exec, _| {
+            write(exec, "/etc/kbf/operator.token", "t", 0o604);
+        })
+        .expect_err("other-readable");
+        assert!(
+            matches!(&e, HostError::Readable { path, .. } if path.as_str() == "/etc/kbf/operator.token"),
+            "{mode}: {e}"
+        );
+    }
+    // Another user's token is refused; the plan never writes one.
+    let (exec, world) = host("install-mode-token-owned");
+    let (uid, gid) = me();
+    world
+        .borrow_mut()
+        .users
+        .insert("kbf-server".to_owned(), (uid + 1, gid));
+    let e = plan_here(&exec, &install(Mode::Frontend, None))
+        .map(|_| ())
+        .expect_err("not the server user's");
+    assert!(matches!(&e, HostError::NotOwned { .. }), "{e}");
+    let (exec, _) = host("install-mode-token-never-made");
+    let (p, _) = plan_here(&exec, &install(Mode::Frontend, None)).expect("plan");
+    assert!(
+        !steps(&p).iter().any(|s| s.contains("api-token")),
+        "{:#?}",
+        steps(&p)
+    );
+}
+
+fn write_ok(r: &Result<(), HostError>) {
+    assert!(r.is_ok(), "{r:?}");
 }
 
 /// The directories each unit's flags make, from the rendered units: the storage-and-daemon
