@@ -482,4 +482,31 @@ async fn an_in_process_write_past_the_stream_size_is_streamed_in_pieces() {
         mem.blobs.lock().expect("lock")[&digest].as_ref(),
         &large[..]
     );
+    let edge = patterned(STREAM_FROM_BYTES as usize);
+    node.at(7).put(Bytes::from(edge)).await.expect("written");
+    assert_eq!(
+        mem.puts.load(Ordering::SeqCst),
+        1,
+        "a blob of exactly STREAM_FROM_BYTES is put whole"
+    );
+    assert_eq!(mem.streamed.load(Ordering::SeqCst), 1);
+}
+
+/// Catches the messages of a write made all at once (a second whole copy of the blob held
+/// before the first message is sent): with one message taken, the rest are still to be
+/// made from the caller's bytes, which the messages therefore still share.
+#[test]
+fn write_messages_are_made_as_they_are_taken() {
+    let bytes = Bytes::from(patterned(3 << 20));
+    let held = bytes.clone();
+    let mut messages =
+        super::super::client::write_messages("uploads/u/blobs/x/3".to_owned(), bytes);
+    let first = messages.next().expect("a first message");
+    assert_eq!(first.data.len(), 1 << 20);
+    assert!(
+        !held.is_unique(),
+        "the rest of the messages were made before they were taken"
+    );
+    assert_eq!(messages.count(), 2);
+    assert!(held.is_unique());
 }
