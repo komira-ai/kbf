@@ -532,29 +532,29 @@ one issue with one done criterion. "Blocked by" names open pull requests or othe
 
 | # | Missing piece | Done when | Blocked by | Issue |
 |---|---|---|---|---|
-| M1 | Harness library plus B-0: supervisor, pinned Envoy, real Buck2 load, B0, smoke in the merge queue | B0 green on a hosted runner on every merge; smoke measured, then required | #925; M21 | |
-| M2 | Rolling update of every role under a running build (B1 to B4, B8) | each scenario red on its planted mutant and green; 0 failed actions, 0 lost blobs | M1, #912, #913, #914, #917, #930, #937, #938, #934 | |
-| M3 | Kill a storage node and a daemon during a build (B5, B6); crash matrix (B7) required | scenarios green, matrix a required job | M1, #900, #939 | |
-| M4 | N/N-1: wire lint, state-store goldens, mixed-version run both ways (B9) | lint refuses a planted removed field; B9 green | M1, M16 | |
-| M5 | One frontend update process wired end to end (staged drain, relay, Envoy box, all-in-one) | B2 and B8 green | #937, #930, #925, #934, #938, #901 wiring PR | |
-| M6 | Pull updater end to end: poller, signed feed client, node-side verification, no SSH push | the updater replaces the stand-in in B1 to B4 | #908, #929, M7 | |
-| M7 | Signed feed and `offer`: stage entries, monotonic serial, beta-result check, plan mode | `offer` refuses on a red or missing beta result and on a non-increasing serial | | |
-| M8 | Gamma deploy-as-test checks: in-flight invocation record, dropped-connection and lost-blob checks, halt and walk back | a planted dropped connection fails the deploy | M6, #791, #792 | |
-| M9 | Bake evaluator: baseline, minimum load, state file, signed verdict | a restart keeps the clock; an absent metric fails; thin usage extends | M10, M13 | |
-| M10 | Metric: failed actions by failure class | counter present, labelled by class | | |
-| M11 | Metric: Execute errors by cause | client abort distinguished from dropped | | |
-| M12 | Release workflow: verdict check (key from the default branch tip, set hash and tag bound), approval environment, notes, prod feed entry | a tag with no or red verdict, or a forged key in the tagged tree, fails `verify` | M7, M9, M19 | |
-| M13 | Metrics: process boot counter and membership-state gauge | both exported; gates read them | | |
-| M14 | Metric: `FindMissingBlobs` latency histogram | histogram exported; latency gate added | | |
-| M15 | Updater walk-back: automatic offer on a red hard gate, mid-roll behaviour, not-reversible flags (B10, B11) | B10 and B11 green | M6, M7 | |
-| M16 | Fetch and verify the previous release for N-1 | N-1 resolved, or the fallback of section 3 | | |
-| M17 | Stage file and lint (stages, no `pull_request`, `id-token` only in `attest`) | lint red on each planted violation | | |
-| M18 | Rollout engine (#803) push transport replaced by the pull updater's, or retired | no push transport left | #803 | |
-| M19 | Repo settings: required checks on feature/arch-v2, tag-protection ruleset for `v*` | settings in place | M1 | |
-| M20 | Decision: how releases are cut from feature/arch-v2 (Q1) | decision recorded | | |
-| M21 | Measure the whole farm on a standard hosted runner (peak memory, wall time, safe concurrency) | numbers recorded here | | |
-| M22 | Result documents, flake classification and history file | one shape, flaky recorded, history written | M1 | |
-| M23 | crun with cgroup v2 delegation on a hosted runner **[V]** | a real container action runs under crun in CI | #936 | |
+| M1 | Harness library plus B-0: supervisor, pinned Envoy, real Buck2 load, B0, smoke in the merge queue | B0 green on a hosted runner on every merge; smoke measured, then required | #925; M21 |  #942 |
+| M2 | Rolling update of every role under a running build (B1 to B4, B8) | each scenario red on its planted mutant and green; 0 failed actions, 0 lost blobs | M1, #912, #913, #914, #917, #930, #937, #938, #934 |  #943 |
+| M3 | Kill a storage node and a daemon during a build (B5, B6); crash matrix (B7) required | scenarios green, matrix a required job | M1, #900, #939 |  #944 |
+| M4 | N/N-1: wire lint, state-store goldens, mixed-version run both ways (B9) | lint refuses a planted removed field; B9 green | M1, M16 |  #945 |
+| M5 | One frontend update process wired end to end (staged drain, relay, Envoy box, all-in-one) | B2 and B8 green | #937, #930, #925, #934, #938, #901 wiring PR |  #946 |
+| M6 | Pull updater end to end: poller, signed feed client, node-side verification, no SSH push | the updater replaces the stand-in in B1 to B4 | #908, #929, M7 |  #947 |
+| M7 | Signed feed and `offer`: stage entries, monotonic serial, beta-result check, plan mode | `offer` refuses on a red or missing beta result and on a non-increasing serial | |  #948 |
+| M8 | Gamma deploy-as-test checks: in-flight invocation record, dropped-connection and lost-blob checks, halt and walk back | a planted dropped connection fails the deploy | M6, #791, #792 |  #949 |
+| M9 | Bake evaluator: baseline, minimum load, state file, signed verdict | a restart keeps the clock; an absent metric fails; thin usage extends | M10, M13 |  #950 |
+| M10 | Metric: failed actions by failure class | counter present, labelled by class | |  #951 |
+| M11 | Metric: Execute errors by cause | client abort distinguished from dropped | |  #952 |
+| M12 | Release workflow: verdict check (key from the default branch tip, set hash and tag bound), approval environment, notes, prod feed entry | a tag with no or red verdict, or a forged key in the tagged tree, fails `verify` | M7, M9, M19 |  #953 |
+| M13 | Metrics: process boot counter and membership-state gauge | both exported; gates read them | |  #954 |
+| M14 | Metric: `FindMissingBlobs` latency histogram | histogram exported; latency gate added | |  #955 |
+| M15 | Updater walk-back: automatic offer on a red hard gate, mid-roll behaviour, not-reversible flags (B10, B11) | B10 and B11 green | M6, M7 |  #956 |
+| M16 | Fetch and verify the previous release for N-1 | N-1 resolved, or the fallback of section 3 | |  #957 |
+| M17 | Stage file and lint (stages, no `pull_request`, `id-token` only in `attest`) | lint red on each planted violation | |  #958 |
+| M18 | Rollout engine (#803) push transport replaced by the pull updater's, or retired | no push transport left | #803 |  #959 |
+| M19 | Repo settings: required checks on feature/arch-v2, tag-protection ruleset for `v*` | settings in place | M1 |  #960 |
+| M20 | Decision: how releases are cut from feature/arch-v2 (Q1) | decision recorded | |  #961 |
+| M21 | Measure the whole farm on a standard hosted runner (peak memory, wall time, safe concurrency) | numbers recorded here | |  #962 |
+| M22 | Result documents, flake classification and history file | one shape, flaky recorded, history written | M1 |  #963 |
+| M23 | crun with cgroup v2 delegation on a hosted runner **[V]** | a real container action runs under crun in CI | #936 |  #964 |
 
 Links, not issues: #912, #913, #914 (replication metrics), #936 (container runtime: crun only), #791, #792, #847 (the
 dependencies of every "0 failed actions" gate).
