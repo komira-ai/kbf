@@ -88,7 +88,7 @@ The four existing host-prep scripts (outside this repository), in order: **1** p
 | `/lib/systemd/system/kbf-node.service`, `kbf.slice` | root | dpkg | units; `ExecStart` is `/usr/local/kbf/current/kbf node --config /etc/kbf/kbf.toml` |
 | `/etc/kbf/kbf.toml` | root:kbf `0640` | the operator | the node's config (section 4) |
 | `/var/lib/kbf/enroll.token` | kbf `0600` | the operator | the token file, in the node's own directory so the unprivileged node can read it and **unlink it** after a successful enrollment (a file in root-owned `/etc/kbf` could be neither removed nor, for a `0600` root file, read by `kbf`) |
-| (no cold-store key file) | | | The cold-store keys are never a file on a node: a storage node receives them from the frontend over its mTLS session, holds them in memory only, and fetches them again at each start (section 4.3) |
+| (no cold-store key file) | | | The cold-store keys are never a file on a node: the frontend pushes them to a storage node over its mTLS session, the node holds them in memory only and fetches them again at each start (section 4.3); in cloud mode there are no keys at all |
 | `/var/lib/kbf/pki/` | kbf `0700` | the node | `ca.pem`, `<role>.key` (`0600`), `<role>.pem`, `node.json` (ids, serials, config generation) |
 | `/var/lib/kbf/{hot,meta,data}` | kbf `0700` | the node | hot store, metadata log, daemon data |
 | `/var/lib/kbf-deploy/` | root | the installer | state, inbox, `state.json` |
@@ -189,7 +189,7 @@ Cross-field checks: a `[storage]` or `[daemon]` table the frontend does not gran
 ### 4.3 What is pulled from the frontend
 
 ```proto
-enum CredentialMode { CREDENTIAL_MODE_UNSPECIFIED = 0; KEYS = 1; AMBIENT = 2; }
+enum CredentialMode { CREDENTIAL_MODE_UNSPECIFIED = 0; KEYS = 1; CLOUD = 2; }
 
 message NodeConfig {
   uint64 generation = 1;             // strictly increases at every change
@@ -198,7 +198,7 @@ message NodeConfig {
   string cas_endpoint = 4;           // what --cas is today for a daemon-only node
   uint32 storage_port = 5;
   string cold_store = 6;             // s3://bucket/prefix/?endpoint=... , never a key
-  CredentialMode credential_mode = 10;  // KEYS (fetch them, 4.3) or AMBIENT (the node's own cloud identity)
+  CredentialMode credential_mode = 10;  // KEYS (pushed, 4.3) or CLOUD (the node's own role, no keys)
   uint32 min_protocol = 7;
   uint32 tls_reload_interval_s = 8;  // 30
   string frontend_url = 9;           // optional, section 4.2
@@ -207,22 +207,27 @@ message NodeConfig {
 
 The mode `kbf node` runs is a function of `roles`: `{daemon}` is `daemon`, `{storage}` is `storage`, both is `storage-and-daemon`. A change of `roles` or an endpoint is applied at the next restart of the node (the frontend shows "restart pending" from the node's reported generation); `kbf node` never re-executes itself.
 
-**The object store is frontend configuration (decided).** This is a private-cloud product, so the endpoint, the bucket, the prefix and the keys belong to the frontend, not to each node. The frontend takes `--object-store-endpoint`, `--object-store-bucket`, `--object-store-prefix`, `--object-store-region` and one of two credential choices:
+**The operator configures the object store; the frontend pushes it (decided).** This is a private-cloud product, so the endpoint, bucket, prefix, region and keys are the operator's configuration of the farm, set through the operator API (`PUT /v1/object-store`, `kbf object-store set`; section 5.1 says why not the UI) and not on any node. The frontend stores it and **pushes every change, rotation included, to every storage node over its mTLS session**. Two modes:
 
-- `--object-store-keys-file PATH`: an access key and secret in a file the frontend account owns (`0600`, checked like the API token file **[F]**), outside the state store, its backups and every release; or
-- `--object-store-credentials=ambient`: **no keys at all.** The node uses its own cloud identity (an instance role or workload identity), and the frontend only tells it so (`credential_mode = AMBIENT`). Whether `kbf-objstore` resolves the platform's default credential chain is **[V]**; B4b proves it or adds it.
+- `keys`: an endpoint, a bucket, a prefix and an access key and secret. The secret is write-only: no read path returns it. It is kept in a file the frontend account owns (`<frontend state>/secrets/object-store.json`, `0600`, replaced by rename), **outside the state store, its backups and every release**; the state store holds only the non-secret fields and a generation. (Several frontends later need a shared secret store; that is open, section 14.8.)
+- `cloud`: the operator names the bucket (and endpoint and region where the cloud needs them) and **no keys exist anywhere**. The node runs under an instance profile or execution role that can reach the bucket, and the operator's policy on that role is the access control. Whether `kbf-objstore` resolves the platform's default credential chain is **[V]**; B4b proves it or adds it.
 
-`NodeConfig` carries the endpoint, bucket, prefix and the mode, **never a key**. In `KEYS` mode, once a storage node has enrolled, it calls a new RPC on its **mTLS session** to the frontend's worker listener:
+`NodeConfig` carries the non-secret fields and the mode, **never a key**. The keys travel on one RPC of the worker listener:
 
 ```proto
-service ColdStore { rpc GetKeys(GetKeysRequest) returns (GetKeysResponse); }   // role table: storage only
-message GetKeysRequest {}
-message GetKeysResponse { string access_key_id = 1; string secret_access_key = 2; }
+service ColdStore { rpc Watch(WatchRequest) returns (stream ColdStoreUpdate); }  // role table: storage only
+message WatchRequest { uint64 have_generation = 1; }
+message ColdStoreUpdate {
+  uint64 generation = 1;
+  CredentialMode mode = 2;
+  string endpoint = 3; string bucket = 4; string prefix = 5; string region = 6;
+  string access_key_id = 7; string secret_access_key = 8;   // KEYS only; empty in CLOUD
+}
 ```
 
-The service sits behind the worker listener's role table (storage role only, a row in `worker_roles.rs`), is bound to the certificate's node (the registry row must be `active` and not denied), and is refused to a revoked node at once, so revocation also ends cold-store access for any node that restarts. On the node the keys are held **in memory only**: handed to the object-store client in-process (not through the environment, an argument list or a file), never logged (a `Debug` that prints `Keys(..)`), never in `NodeConfig`, never on disk, with core dumps disabled for the process (`RLIMIT_CORE` 0, not dumpable). They are **fetched again at every start** and again when the object store refuses them (so replacing the frontend's keys file rotates them with no node action). A storage node that cannot reach the frontend at start serves its hot tier and retries; cold-tier calls fail until the keys arrive, the same behaviour as a cold store that is down **[F: architecture-v2.md, failure modes]**. A `daemon`-only node never calls it and the role table would refuse it.
+The node opens `Watch` at start; the first message is the current configuration (**the node fetches on start**), and the **frontend initiates every later message when the operator changes the configuration** (**push**). The service sits behind the worker listener's role table (storage only, a row in `worker_roles.rs`), is bound to the certificate's node (the registry row must be `active` and not denied), and a revoked node's stream is ended and its next `Watch` refused, so revocation also ends cold-store access for any node that restarts. On the node the keys are **in memory only**: handed to the object-store client in-process (not through the environment, an argument list or a file), never logged (`Debug` prints `Keys(..)`), never in `NodeConfig`, never on disk, core dumps disabled (`RLIMIT_CORE` 0, not dumpable). A new generation replaces them atomically; requests in flight finish or fail and retry under the new ones. A broken stream keeps the keys in memory and reconnects with backoff. A storage node that cannot reach the frontend at start serves its hot tier and retries; cold-tier calls fail until the first message arrives, the same behaviour as a cold store that is down **[F: architecture-v2.md, failure modes]**. A `daemon`-only node never opens it and the role table would refuse it.
 
-The per-node `s3.env` file and its `EnvironmentFile=` line go away when this ships; `check-units --mode node` then **refuses** a node unit that carries one. A short-lived or scoped credential (a prefix-limited key the object store mints) is a later option, not v1. Until the RPC ships (B3b serves it, B4a/B4b fetch it), a storage node keeps using the existing root-owned file, and a token that grants `storage` must carry an exact `node_id` so it cannot be spent by an arbitrary host.
+The per-node `s3.env` file and its `EnvironmentFile=` line go away **when the push lands**; `check-units --mode node` then **refuses** a node unit that carries one. **Until the push lands (B3b serves it, B4a/B4b hold the keys), storage nodes keep the existing root-owned file; that is the one explicit departure from "join = config"**, guarded by one rule: a token that grants `storage` must carry an exact `node_id`, so it cannot be spent by an arbitrary host.
 
 ### 4.4 Why `kbf node` and not a rendered unit per role
 
@@ -274,7 +279,7 @@ A malformed token is refused by the node before any network call, naming which p
 | `DELETE /v1/enroll/tokens/{id}` | revoke (sets `revoked_at`; nodes already enrolled stay enrolled) |
 | `GET /v1/enroll/nodes`, `POST /v1/enroll/nodes/{id}/revoke` | the registry (section 5.7) |
 
-All writes need the existing bearer token gate (loopback only, `403` otherwise **[F]**), so `kbf token ...` runs on the frontend host, like `kbf cluster drain`. The operator API's own roles are planned **[F: api.md]**; until they exist, whoever holds the API token can mint enrollment tokens, which is exactly as powerful as being able to drain the frontend today and must be said in the operator documentation. The page in the UI is a follow-up (unit B2b).
+All writes need the existing bearer token gate (loopback only, `403` otherwise **[F]**), so `kbf token ...` runs on the frontend host, like `kbf cluster drain`. The operator API's own roles are planned **[F: api.md]**; until they exist, whoever holds the API token can mint enrollment tokens, which is exactly as powerful as being able to drain the frontend today and must be said in the operator documentation. **The UI is read-only for now (owner): no login and no buttons.** Token creation, the object-store configuration, node revocation and updates (the update button of the updater design is deferred) are done with the CLI and the operator API only; the UI may show tokens, nodes and the object-store mode (never a secret), as pages without actions (unit B2c).
 
 ### 5.2 The listener
 
@@ -340,6 +345,8 @@ message RenewResponse {
   int64  renew_after = 5;
 }
 ```
+
+`token_id` and `token_secret` of `EnrollRequest` are the `token` arm of a `oneof attestation { token; cloud_identity }` that P0 defines from the start, so role-based enrollment for ephemeral nodes (section 14.2) adds an arm and changes no field.
 
 Status codes: `INVALID_ARGUMENT` for a malformed request (named field); `UNAUTHENTICATED` for the token (5.1); `PERMISSION_DENIED` for a role the token lacks or a revoked node; `ALREADY_EXISTS` for a node id in use without `replace`; `RESOURCE_EXHAUSTED` for a rate limit (with a retry-after); `UNAVAILABLE` when the state store is down (the node retries). The same ones are used for `Renew`.
 
@@ -577,7 +584,7 @@ The frontend gains `--enroll-listen`, `--ca-dir`, `--frontend-name` (repeatable:
 | the frontend certificate renew helper | renewing the farm-CA worker certificate | **retired** (the frontend renews its own). Stays for the **REAPI** certificate (a `tailscale cert` pair) until the public certificate is renewed outside kbf another way (decided: it is renewed outside kbf for now, section 12, item 7) |
 | host-prep script 1 (build host: CA, all certificates, copy to nodes) | prepare | **retired**. Replaced by `kbf ca import`, `kbf token create`, `apt install` |
 | host-prep script 2, steps for the kit, the user, subordinate ids, lingering, certificates, `crun` and `uidmap`, the installer and key cleanup | per-node host prep | **retired**: `package postinst`. Its steps for stopping the old build-farm units, sudoers, the private storage network and the hosts line are our infrastructure and stay as one-shots |
-| the per-node cold-store key file (`s3.env`) and its `EnvironmentFile=` line | storage node credentials | **retired** when the `ColdStore.GetKeys` RPC ships (section 4.3): the keys become frontend configuration. The existing storage-and-daemon units keep using it until each node is reinstalled |
+| the per-node cold-store key file (`s3.env`) and its `EnvironmentFile=` line | storage node credentials | **retired** when the `ColdStore.Watch` push lands (section 4.3): the keys become operator configuration pushed by the frontend, or no keys in cloud mode. The existing storage-and-daemon units keep using it until each node is reinstalled |
 | host-prep script 3 (worker label, object-store NodePort) | cluster writes | **stays** (our k3s) |
 | host-prep script 4, steps for the frontend account, worker certificate, renew timer and installer | the frontend host | **retired**: the `kbf-frontend` package and `kbf ca init`. Its steps for the private-network address and the `tailscale cert` stay |
 | the private-network, node-label, object-store, bucket, teardown, flip and Mac one-shots | our infra | **stay**, never product code |
@@ -644,11 +651,11 @@ Dependency: `P0` first (it is tiny and unblocks the rest), then everything else 
 | **P0** | `crates/kbf-proto/proto/kbf/enroll/v1/enroll.proto`, the generated-code registration, `crates/kbf-types/src/enroll.rs` (token and node id newtypes, role set, the canonical formats of 5.1) | the wire and the shared types, with golden-byte tests; the closed set of refusal reasons | none |
 | **B2a** frontend tokens | `crates/kbf-server/src/enroll/tokens.rs`, `.../tokens_tests.rs`, route hooks in `kbf-server/src/api.rs` (one `mod` line), `docs/api.md` section for the routes | token create, list, revoke, hashed storage, shown once, constant-work compare, expiry, uses | P0 |
 | **B2b** token CLI | `crates/kbf-cli/src/token.rs` (new), one enum variant in `lib.rs` | `kbf token create|list|revoke`, `--out FILE` exclusive `0600` | P0, B2a's routes (contract fixed by P0) |
-| **B2c** token UI page | `crates/kbf-ui/...` (its own files) | token and node list page | B2a, B3b |
+| **B2c** token UI page | `crates/kbf-ui/...` (its own files) | read-only token, node and object-store pages (no login, no actions) | B2a, B3b |
 | **B3a** CA | `crates/kbf-ca/` (new crate), `crates/kbf-signer/` (new: the signer process over a Unix socket), workspace `Cargo.toml` member lines, `deny.toml` note | 6.1 to 6.4: CA create and import, `Signer` (file, socket client), the `kbf-signer` process, CSR validation, issuance, rotation | P0 |
-| **B3b** enroll service | `crates/kbf-server/src/enroll/{service.rs,registry.rs,renew.rs,limits.rs}`, `--enroll-listen` and `--ca-dir` flags in `kbf-server/src/config.rs`, the listener in `listen/` | 5.2 to 5.8: the transaction, registry, `Renew`, rate limits, the frontend's own certificate; the `--object-store-*` flags and the `ColdStore.GetKeys` service (4.3, with its row in `worker_roles.rs`) | P0, B3a, B2a (the token row type) |
+| **B3b** enroll service | `crates/kbf-server/src/enroll/{service.rs,registry.rs,renew.rs,limits.rs}`, `--enroll-listen` and `--ca-dir` flags in `kbf-server/src/config.rs`, the listener in `listen/` | 5.2 to 5.8: the transaction, registry, `Renew`, rate limits, the frontend's own certificate; the `--object-store-*` flags and the `ColdStore.Watch` push (4.3, with its row in `worker_roles.rs`, and `PUT /v1/object-store`) | P0, B3a, B2a (the token row type) |
 | **B3c** revocation path | `crates/kbf-server/src/{members.rs,members_rpc.rs,identity.rs}`, `crates/kbf-map` (if a canonical write helper is needed), `crates/kbf-storage/src/service/admission.rs` and its tests, `POST /v1/enroll/nodes/{id}/revoke` | 5.9 and 8.3: `deny/` rows into `Map.denied`, storage enforcement, the instance-id binding, the worker store-backed deny source | P0 |
-| **B4a** node library | `crates/kbf-enroll/` (new crate): `config.rs` (`kbf.toml`), `token.rs`, `pin.rs`, `client.rs`, `store.rs` (keys, atomic files, `node.json`), `renew.rs` | 4 and 5.4 to 5.8 on the node; the `GetKeys` client that keeps the keys in memory (4.3); no CLI | P0 |
+| **B4a** node library | `crates/kbf-enroll/` (new crate): `config.rs` (`kbf.toml`), `token.rs`, `pin.rs`, `client.rs`, `store.rs` (keys, atomic files, `node.json`), `renew.rs` | 4 and 5.4 to 5.8 on the node; the `Watch` client that holds the keys in memory (4.3); no CLI | P0 |
 | **B4b** node wiring | `crates/kbf-cli/src/{node.rs,enroll.rs}` (new), `names.rs` (`node`), one line each in `lib.rs`, `crates/kbf-daemon` (client identity rebuild on renewal, if [V] says it is needed), `crates/kbf-mac-provision` (plist runs `node`) | `kbf node`, `kbf enroll`, the mode from `NodeConfig.roles`, the daemon's identity refresh | B4a |
 | **B5a** package verbs | `crates/kbf-deploy/src/package/` (new), `Mode::Node`, `templates/linux/modes/kbf-node.service`, `check-units` rules for it, including the refusal of a node unit that carries a key file or `AWS_*` | 3.3 as Rust with scratch-root tests | B4b's flag names (fixed by this document) |
 | **B5b** Linux packaging | `packaging/linux/` (control, sysusers, tmpfiles, `kbf-package-hook`), `crates/xtask/src/deb.rs`, `.github/workflows/package.yml`, no interpreter-budget row (the hooks are executables) | `.deb` and `kbf-frontend.deb` built from the attested tarball; S1 to S3 | B5a |
@@ -672,7 +679,7 @@ Order by value: P0, then B3a, B2a and B4a in parallel, then B3b and B3c, then B4
 | 5 | Macs: a signed `.pkg` installed by a Homebrew cask | **Decided.** 3.1 |
 | 6 | `--enroll-adopt-unknown` is off by default | **Decided.** 6.5 |
 | 7 | The frontend's public (REAPI) certificate is renewed outside kbf for now | **Decided.** 6.3, 9 |
-| 8 | The object store is frontend configuration; storage nodes get the keys over mTLS, in memory only, at each start; or `ambient` mode with no keys; scoped short-lived credentials are a later option | **Decided.** 4.3 |
+| 8 | The operator configures the object store through the operator API; the frontend pushes it, rotation included, to storage nodes over mTLS (keys in memory only; the node also fetches on start); or `cloud` mode with no keys. Frontend-minted scoped or short-lived keys are dropped | **Decided.** 4.3 |
 | 9 | One key per role on a `storage-and-daemon` node | Lean: two keys; revocation by node id covers both |
 | 10 | The frontend pushes a changed `frontend_url` to nodes | Lean: yes, guarded: adopted only under the same pin, `kbf.toml` kept as fallback |
 | 11 | The frontend container image has no in-image updater | Lean: yes; the orchestrator replaces the image; the `.deb` and the Envoy handover remain the host path |
@@ -690,3 +697,73 @@ Order by value: P0, then B3a, B2a and B4a in parallel, then B3b and B3c, then B4
 - **A package upgrade changes root code** and is the one place that does so (3.5). It is an operator act, tested for the `current` link (S2).
 - **Clock skew** is checked by the node on every answer and surfaced; a node with a wrong clock fails loudly instead of installing a certificate it cannot use.
 - **Reversibility.** Enrollment is additive: the five modes, the flags and script-issued certificates keep working until the CA migration of 6.6 step 4, which is itself a single reversible rotation while the old CA is kept in the bundle.
+
+## 14. Ephemeral nodes: spot instances and functions (the shape, not a final answer)
+
+The owner asked for the shape of nodes that appear and vanish: spot or preemptible instances running `storage-and-daemon`, and serverless functions. Everything here is a lean or an open question; nothing is built or decided. Labels as above.
+
+### 14.1 Facts the shape rests on
+
+- A lost daemon is already handled: leases expire, results are fenced, an action runs again (at-least-once) **[F: architecture-v2.md, failure modes]**.
+- Storage writes are acknowledged when both owners hold the blob on the hot tier; with the replica down the primary acknowledges after its own durable write and records a repair debt; **both owners of an unflushed blob lost means a loss mark, an action-cache miss and a rerun** **[F]**.
+- A member that stops heartbeating is `Down` but stays in the map for a dwell (default 300 s) before its slice is re-replicated **[F: `MembershipConfig`]**.
+- Every join and leave turns the map generation and starts a handoff; rendezvous hashing remaps about 1/N of the blobs per change **[F]**.
+- A new owner has no index for blobs a previous owner flushed and rebuilds it from the cold store's footers, staying `catching-up` meanwhile **[F]**.
+- Containers run with no network (`--network=none`) **[F]**, so an action in a container cannot reach the instance metadata service.
+
+### 14.2 How an ephemeral node enrolls
+
+Two ways to prove "this is ours":
+
+| | **T. Enroll token in the launch config** | **R. Role-based enrollment** (the cloud identity proves it) |
+|---|---|---|
+| Mechanism | the same `kbft1` token, in user data, a launch template or a secret manager; a fleet token with `max_uses` = the fleet's ceiling, a `node_prefix`, an expiry | the node sends a cloud-signed statement (an instance identity document with its signature, a presigned caller-identity request, or a provider-signed identity token) instead of a token; the frontend verifies it against the provider (its public keys, or one call to the provider's identity service) and maps the verified identity (account, role, instance profile) through a **policy the operator wrote**: allowed roles, a node-id rule, a certificate lifetime, an `ephemeral` flag |
+| Secret in the launch config | **yes**: readable by anything that reads user data or the metadata service; copied to every instance; a long-lived multi-use token is a standing way to join the farm | **none** |
+| Cloud-specific code | none | one verifier per cloud, in the frontend; the frontend may need outbound access to the provider |
+| Scale-out with no operator step | needs a token valid for the whole scale-out window | yes |
+| Replay | the token is the credential | an identity document replayed within its validity; bound by the policy's role, a short document age, one node id per instance id, and the CSR's key (a replay cannot yield a certificate for another key's holder, only a second node row) |
+| Reuses | everything in section 5 | the CSR, issuance, registry, renewal and revocation of section 5 unchanged |
+
+**Lean: R as the ephemeral path, T as the first step.** The enroll request gets a `oneof attestation { token; cloud_identity }` in the proto from P0, so nothing changes on the wire later. v1 ships T (a fleet token with a prefix, bounded uses and an expiry; the operator guide says what leaving one in a launch template risks). R follows as its own unit (a verifier per cloud, behind a trait with a recorded fake for tests). **Open:** which clouds first; whether the frontend may call out to a provider (an air-gapped farm cannot, which argues for signed documents verified with pinned provider keys); the policy language.
+
+Ephemeral-specific rules (any attestation): the node id is derived from the instance id under the policy's prefix, never chosen by the node; the registry row carries `ephemeral = true` and is **garbage-collected** a grace after its certificate expires (and its deny rows with it), because a churning fleet would otherwise fill the registry; the certificate lifetime comes from the policy (lean 24 hours, renew at half; a function's is its maximum duration with no renewal).
+
+### 14.3 What happens when it vanishes without notice
+
+| Event | Effect | Shape |
+|---|---|---|
+| In-flight write to a vanished primary | no acknowledgement; the writer retries the next owner under the map (`STALE_MAP` path); nothing was acknowledged, so nothing is lost | unchanged |
+| Unflushed hot data on the vanished node | gone; if its replica also vanished (spot reclaim is **correlated**: one pool, one zone, often one wave) the blob is lost, an AC entry whose closure it held is a miss, the action reruns | the real exposure |
+| Repair | the survivor re-replicates after the dwell; many ephemeral nodes mean repeated, overlapping repairs and handoffs | churn cost |
+| A graceful reclaim notice (a spot warning of about two minutes) | the node can self-drain: `Draining`, flush its hot tail to the cold store, deregister | optional; functions get none |
+
+**Should an ephemeral node be a storage owner at all? Lean: no, in v1.** Three reasons: correlated reclaim makes R=2 weaker exactly when it matters; every arrival and departure turns the map and remaps 1/N of the blobs; and a replacement starts with an empty index and rebuilds from the cold store, work that outlives the node. So **ephemeral nodes are `daemon`-only**: they run actions, hold only a cache of fetched inputs, and read and write through the stable storage nodes; a vanished one costs a rerun. This also matches the existing isolation rule that a daemon-only node holds no object-store access **[F]**. The cost is that inputs are fetched over the network instead of read locally; the one-cache locality benefit of `storage-and-daemon` is given up.
+
+If the owner wants ephemeral storage anyway, the shape is a **placement constraint**, not a new tier: nodes carry a `durability = stable | ephemeral` label in the map, and the rendezvous rule never lets both owners of a digest be ephemeral (rank 1 is stable, as zone-awareness already allows a second-owner rule **[F: architecture-v2.md]**), with a short dwell for ephemeral members. **Open:** whether that is worth the placement code; whether an ephemeral owner may hold only a read-through cache (never `Active`, never rank 1, never counted for R); the dwell for a vanished ephemeral member.
+
+### 14.4 The cold store is the durable copy
+
+The model for ephemeral capacity: **a blob is durable when it is in the cold store**; the hot tier of a stable node is a cache with a repair guarantee, and an ephemeral node's disk is scratch. Consequences: the existing flush path and loss marks stay the durability story; the exposure window is the flush lag of the stable nodes (their hot tail), which the existing gauge shows **[F]**; and an AC entry still waits for its closure to be acknowledged on the hot tier, not in the cold store. **Open:** whether results produced by ephemeral nodes should wait for a cold-store acknowledgement of the closure before the AC entry is written (stronger, slower) when the farm is mostly ephemeral; the right flush lag budget.
+
+### 14.5 Roles replace keys for the object store
+
+In `cloud` mode (4.3) no key exists: a stable `storage` node runs under an instance profile or execution role, the push carries only the bucket and region, and the operator's policy on the role (a prefix, read and write, no delete if that is wanted) is the access control. This is the only mode that makes sense for a fleet that is created and destroyed, and it is why `cloud` is a mode of the design and not an afterthought. A `daemon`-only ephemeral node needs no object-store access at all. If an ephemeral node did hold the storage role, containers cannot reach the metadata service (14.1), but a native-driver action on the same host could; **open:** require a metadata-service hop limit of one and no native driver on any node that holds a role with bucket access.
+
+### 14.6 Updates: replaced, not updated
+
+An ephemeral node is **replaced**, not updated. Its image or launch template pins a kbf release (the package of section 3 in the image, with the first release as the one that runs); the pull updater's per-host step (cordon, drain, activate, confirm) is not used on it, and the helper is not installed. The registry's `ephemeral` flag makes the frontend show its node as `replace` (not `up to date`, not `unsupported`) and exclude it from rollout ordering while counting it for capacity. When the desired release moves, the operator rolls the fleet (a new launch template version, an instance refresh); the frontend cannot call a cloud's API and does not try. A node whose protocol falls outside the frontend's accepted range is refused at registration and exits asking to be replaced. Version skew inside the window follows split-mode-updates.md. Updates themselves go through the CLI and operator API only (the UI is read-only, 5.1). **Open:** a small advisory the frontend could emit ("N ephemeral nodes are behind") for the operator's automation to act on.
+
+### 14.7 Serverless functions
+
+A function is the extreme case, and the constraints are different: no inbound listener (so never a `storage` node), a maximum duration, usually no cgroup delegation or user namespaces (so no rootless `crun` container driver), and a cold start per invocation or per pooled instance. The shape: **`daemon`-only, outbound connections only** (the worker session to the frontend and calls to storage owners), a driver that runs the action in the function's own sandbox rather than in a container, role-based enrollment (14.2, option R; a token cannot sensibly be baked into a function), a certificate valid for the function's maximum duration with no renewal, and an `ephemeral` registry row collected soon after. **Open, and larger than the rest:** whether functions are in scope at all; the driver (the native driver in a sandbox that forbids what it needs?); the cost of enrolling per invocation versus a pooled warm instance; how the scheduler represents a node that exists for minutes (leases, capacity and the idle policy assume longer lives); how outputs and logs survive a node that is frozen mid-action.
+
+### 14.8 Open list
+
+1. Which clouds and which attestation form first for option R; whether the frontend may call a provider.
+2. Whether ephemeral storage owners are wanted at all, and if so the `durability` placement rule, the read-through-cache-only variant, and the dwell.
+3. Whether AC entries for ephemeral work wait for a cold-store acknowledgement.
+4. The certificate lifetime for ephemeral nodes (24 hours leaned) and the registry garbage-collection grace.
+5. The shared secret store for the object-store keys when there is more than one frontend (a root-owned file does not replicate).
+6. The metadata-service rule for any ephemeral node that holds a role with bucket access.
+7. Whether functions are in scope and with what driver.
+8. How the operator's fleet automation learns the desired release (the advisory of 14.6).
