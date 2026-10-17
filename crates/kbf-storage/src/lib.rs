@@ -25,6 +25,10 @@
 //! This crate depends on no frontend crate: not the scheduler (`kbf-sched`) and not
 //! authorization (`kbf-auth`). `crates/kbf-it/tests/layering.rs` checks it.
 
+pub mod flush;
+pub mod local_cache;
+pub mod repair;
+pub mod replicate;
 pub mod service;
 
 use std::sync::Arc;
@@ -37,6 +41,7 @@ use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::segments_server::Segments;
 use kbf_types::Digest;
 use tonic::Status;
+use tonic::metadata::MetadataValue;
 
 /// The answer of a [`Storage`] call.
 pub type Answer<'a, T> = BoxFuture<'a, Result<T, StorageError>>;
@@ -203,6 +208,17 @@ pub enum StorageError {
         /// The digest of the bytes it sent.
         actual: Digest,
     },
+    /// Bytes read for a blob do not hash to the digest that names it: a node served the
+    /// wrong bytes (or too many, or too few). Never the caller's fault, and not a reason to
+    /// believe the node: the router goes on to another owner.
+    #[error("blob {digest} came back as bytes that hash to {actual}")]
+    Corrupt {
+        /// The blob asked for.
+        digest: Digest,
+        /// The digest of the bytes that came back: of all of them, or, for a node that
+        /// sent more than `digest` names, of the first byte past its size and those before.
+        actual: Digest,
+    },
     /// A read starting past the end of the blob. ByteStream answers it OUT_OF_RANGE (a
     /// `read_offset` greater than the resource's size), which is not a malformed request
     /// to be fixed but one a caller may make on purpose.
@@ -226,6 +242,15 @@ pub enum StorageError {
     /// [`StorageError::Internal`] instead.
     #[error(transparent)]
     Unavailable(Arc<dyn std::error::Error + Send + Sync>),
+    /// The caller's map is older than the node's (`docs/design/architecture-v2.md`,
+    /// section 6, the staleness protocol): the caller refetches the map and tries again.
+    /// `current` is the node's generation. On the wire it is FAILED_PRECONDITION with the
+    /// generation in the [`service::MAP_GENERATION_HEADER`] metadata entry.
+    #[error("STALE_MAP: the node is at map generation {current}")]
+    StaleMap {
+        /// The map generation the node holds.
+        current: u64,
+    },
     /// The store's own records disagree. A bug or a broken backend, never the caller's
     /// fault.
     #[error("internal: {0}")]
@@ -250,6 +275,14 @@ impl From<StorageError> for Status {
             StorageError::ActionWrite(ActionWriteError::Unreachable(_))
             | StorageError::Unreachable(_)
             | StorageError::Unavailable(_) => Self::unavailable(message),
+            StorageError::StaleMap { current } => {
+                let mut status = Self::failed_precondition(message);
+                status
+                    .metadata_mut()
+                    .insert(service::MAP_GENERATION_HEADER, MetadataValue::from(current));
+                status
+            }
+            StorageError::Corrupt { .. } => Self::data_loss(message),
             StorageError::Internal(_) => Self::internal(message),
         }
     }

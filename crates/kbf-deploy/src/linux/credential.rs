@@ -4,12 +4,15 @@
 //!
 //! What it refuses, in `[Service]`:
 //!
-//! - `EnvironmentFile=` naming the key file: its path, after `-`, quotes, `.`, `..` and
-//!   repeated `/` are taken off, is `<KBF_ETC>/s3.env` or ends in `/s3.env` wherever
+//! - `EnvironmentFile=` naming the key file: its path, after `-` and quotes are taken
+//!   off (and systemd's whitespace, not any Unicode space), is `<KBF_ETC>/s3.env`
+//!   through `.`, `..` or repeated `/`, or is absolute and ends in `/s3.env` wherever
 //!   it is, or it is a wildcard that matches `<KBF_ETC>/s3.env`. systemd expands every
 //!   path with glob(3) ([`super::glob`] reads it as glibc does: `*`, `?`, `[...]` with
 //!   ranges, `!` or `^`, `[:class:]`, `[=c=]` and `[.c.]`, and `\` escapes), so a `\`
-//!   in a path with no wildcard is taken off too.
+//!   in a path with no wildcard is taken off too, and a trailing `/` after the name
+//!   still lists the file (`s3.env/`), while a trailing `/.` (ENOTDIR) or a wildcard
+//!   before a `/` (directories only) lists nothing the rule refuses.
 //! - `Environment=` setting any `AWS_*` variable, with systemd's quoting (several
 //!   assignments on a line, single or double quotes around an assignment or inside
 //!   one). A build node talks to no AWS-style store, so no `AWS_*` variable has a use
@@ -43,12 +46,13 @@
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
-use kbf_host::exec::{Entry, Exec};
+use kbf_host::exec::{Entry, Exec, Kind};
 use kbf_host::path::HostPath;
+use kbf_host::user;
 
 use super::glob;
 use super::modes::COLD_STORE_KEY_FILE;
-use crate::unit::UnitFile;
+use crate::unit::{UnitFile, WHITESPACE};
 
 /// The prefix of the variables an AWS SDK or CLI reads (rule `credential`).
 pub const AWS_PREFIX: &str = "AWS_";
@@ -148,17 +152,15 @@ pub(super) struct OnHost {
 pub(super) fn on_host<E: Exec>(exec: &E, unit: &UnitFile, key: &Path) -> OnHost {
     let mut out = OnHost::default();
     for f in given(unit).files.iter().filter(|f| !names_key(f, key)) {
-        let path = normalise(bare(f)).to_string_lossy().into_owned();
-        if glob::is_wildcard(&path) {
+        let path = bare(f);
+        if glob::is_wildcard(path) {
             out.notes.push(format!(
                 "SKIP credential: EnvironmentFile={f} is a wildcard; the files it matches \
                  were not read"
             ));
             continue;
         }
-        // A relative path is one systemd ignores, and a name ending in a lone `\` one
-        // its glob(3) matches with nothing.
-        let Some(Ok(host)) = glob::literal(&path).map(|p| HostPath::new(&p)) else {
+        let Some(host) = env_file(path) else {
             continue;
         };
         match exec.inspect(&host) {
@@ -168,7 +170,7 @@ pub(super) fn on_host<E: Exec>(exec: &E, unit: &UnitFile, key: &Path) -> OnHost 
                         .push(format!("EnvironmentFile={f}, which sets {name}"));
                 }
             }
-            Ok(Some(Entry::Other)) => out.failures.push(format!(
+            Ok(Some(Entry::Link { .. } | Entry::Other)) => out.failures.push(format!(
                 "EnvironmentFile={f}, a link or special file the check does not follow \
                  (name the file itself)"
             )),
@@ -182,9 +184,108 @@ pub(super) fn on_host<E: Exec>(exec: &E, unit: &UnitFile, key: &Path) -> OnHost 
     out
 }
 
+/// Rule `credential` for the mode whose unit holds the key (`storage`): how the unit
+/// runs as a user that is not the key's alone, or `None`. With no `User=` it runs as
+/// root; as `build_user` (`KBF_USER`) it runs as the user builds run as.
+pub(super) fn holder(unit: &UnitFile, build_user: &str) -> Option<String> {
+    match unit
+        .get_in("Service", "User")
+        .map(|u| u.trim_matches(WHITESPACE))
+    {
+        None | Some("") => Some("runs as root (no User=)".to_owned()),
+        Some(u) if u == build_user => {
+            Some(format!("runs as {u}, the user builds run as (KBF_USER)"))
+        }
+        Some(_) => None,
+    }
+}
+
+/// [`holder`]'s reading of the node: each key file the unit's `EnvironmentFile=` lines
+/// name (`key` itself for a wildcard that matches it) is a plain file, root's or the
+/// unit's user's, with no group or other bit. A key file that is not there, a
+/// user or file the check cannot read, is a `SKIP credential:` line.
+pub(super) fn holder_on_host<E: Exec>(exec: &E, unit: &UnitFile, key: &HostPath) -> OnHost {
+    let mut out = OnHost::default();
+    let Some(user) = unit
+        .get_in("Service", "User")
+        .map(|u| u.trim_matches(WHITESPACE))
+        .filter(|u| !u.is_empty())
+    else {
+        return out;
+    };
+    let named: Vec<String> = given(unit)
+        .files
+        .iter()
+        .filter(|f| names_key(f, Path::new(key.as_str())))
+        .map(|f| bare(f).to_owned())
+        .collect();
+    for f in named {
+        let path = env_file(&f).unwrap_or_else(|| key.clone());
+        let meta = match exec.stat(&path) {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                out.notes.push(format!(
+                    "SKIP credential: no key file at {path} yet, so its owner and mode were \
+                     not checked"
+                ));
+                continue;
+            }
+            Err(e) => {
+                out.notes.push(format!(
+                    "SKIP credential: cannot read {path} ({e}), so its owner and mode were \
+                     not checked"
+                ));
+                continue;
+            }
+        };
+        if meta.kind != Kind::File {
+            out.failures.push(format!(
+                "{path} is not a plain file (a link or a directory)"
+            ));
+            continue;
+        }
+        let bits = meta.perms.bits();
+        if bits & 0o077 != 0 {
+            out.failures.push(format!(
+                "{path} is mode {bits:04o}, so users other than {user} can read the key: make \
+                 it 0600"
+            ));
+        }
+        // systemd reads the file as root, so a root-owned key works as well; any other
+        // owner can read or replace it.
+        if meta.owner.uid == 0 {
+            continue;
+        }
+        match user::lookup(exec, user) {
+            Ok(Some(u)) if u.uid != meta.owner.uid => out.failures.push(format!(
+                "{path} is uid {}'s, neither root's nor {user}'s (uid {}): that user can \
+                 read or replace the key",
+                meta.owner.uid, u.uid
+            )),
+            Ok(Some(_)) => {}
+            Ok(None) => out
+                .failures
+                .push(format!("User={user} is not a user on this node")),
+            Err(e) => out.notes.push(format!(
+                "SKIP credential: cannot look up User={user} ({e}), so the owner of {path} \
+                 was not checked"
+            )),
+        }
+    }
+    out
+}
+
+/// The one file the `EnvironmentFile=` path `path` (no wildcard, [`bare`]) names, when
+/// systemd would read one: a relative path is one systemd ignores, and a name ending
+/// in a lone `\`, or one that names a directory, is one its glob(3) lists no file for.
+pub(super) fn env_file(path: &str) -> Option<HostPath> {
+    let file = glob::literal(path).map(|p| normalise(&p).to_string_lossy().into_owned())?;
+    HostPath::new(&file).ok()
+}
+
 /// The variable names an environment file assigns: each line's text before `=`, after
 /// an `export ` (systemd ignores the line; the rule is stricter), skipping comments.
-fn env_file_names(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
+pub(super) fn env_file_names(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
     bytes.split(|b| *b == b'\n').filter_map(|raw| {
         let line = String::from_utf8_lossy(raw);
         let line = line.trim();
@@ -203,17 +304,19 @@ fn env_file_names(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
 }
 
 /// Whether the `EnvironmentFile=` value `value` names the key file `key`.
-fn names_key(value: &str, key: &Path) -> bool {
-    let path = normalise(bare(value)).to_string_lossy().into_owned();
-    glob::matches(&path, &key.to_string_lossy())
-        || glob::literal(&path)
-            .is_some_and(|p| Path::new(&p).file_name() == Some(COLD_STORE_KEY_FILE.as_ref()))
+pub(super) fn names_key(value: &str, key: &Path) -> bool {
+    let path = bare(value);
+    glob::matches(path, &key.to_string_lossy())
+        || glob::literal(path).is_some_and(|p| {
+            p.starts_with('/') && p.rsplit('/').next() == Some(COLD_STORE_KEY_FILE)
+        })
 }
 
 /// The path an `EnvironmentFile=` value names: without the `-` that makes it optional
-/// and without quotes around it (systemd takes neither as part of the path).
-fn bare(value: &str) -> &str {
-    let v = value.trim();
+/// and without quotes around it (systemd takes neither as part of the path), trimmed of
+/// systemd's [`WHITESPACE`] only (U+00A0 is part of a path).
+pub(super) fn bare(value: &str) -> &str {
+    let v = value.trim_matches(WHITESPACE);
     let v = v.strip_prefix('-').unwrap_or(v);
     v.trim_matches(|c| c == '"' || c == '\'')
 }
@@ -233,8 +336,8 @@ pub(super) fn normalise(path: &str) -> PathBuf {
     out
 }
 
-/// The words of a systemd value, unquoted as systemd.syntax(7) says: whitespace
-/// separates words outside quotes, `'...'` and `"..."` group (anywhere in a word), and
+/// The words of a systemd value, unquoted as systemd.syntax(7) says: [`WHITESPACE`]
+/// (not any Unicode space) separates words outside quotes, `'...'` and `"..."` group (anywhere in a word), and
 /// `\` outside single quotes keeps the next character.
 pub(super) fn words(value: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -243,7 +346,7 @@ pub(super) fn words(value: &str) -> Vec<String> {
     let mut chars = value.chars();
     while let Some(c) = chars.next() {
         match (quote, c) {
-            (None, c) if c.is_whitespace() => out.extend(word.take()),
+            (None, c) if WHITESPACE.contains(&c) => out.extend(word.take()),
             (None, '\'' | '"') => {
                 quote = Some(c);
                 word.get_or_insert_with(String::new);

@@ -2,8 +2,7 @@
 //!
 //! Every place in this crate that spells a mode reads it from here: the clap commands,
 //! the dispatch, the help and the tests. The names follow the arch-v2 design; renaming
-//! a mode is changing its constant, and moving a mode from "not built" to an entry
-//! point is changing its row of [`MODES`].
+//! a mode is changing its constant.
 
 /// The frontend (the REAPI front end).
 pub const FRONTEND: &str = "frontend";
@@ -27,8 +26,13 @@ pub enum Entry {
     /// The storage node: `kbf_server::storage_node::run`, `kbf-server`'s store, write and
     /// log flags and its own listener flags.
     Storage,
-    /// Not built yet: the mode exits 2 saying so.
-    NotBuilt,
+    /// The storage node and the daemon in one process:
+    /// `kbf_all_in_one::storage_and_daemon::run`, the flags of `kbf storage` and of
+    /// `kbf-daemon`.
+    StorageAndDaemon,
+    /// The frontend: `kbf_server::frontend::run`, `kbf-server`'s listener, scheduler and
+    /// log flags and its own storage flags.
+    Frontend,
 }
 
 /// A mode and what it runs.
@@ -42,11 +46,9 @@ pub struct Mode {
 
 /// Every mode, in help order: exactly five.
 pub const MODES: [Mode; 5] = [
-    // The two `NotBuilt` rows (frontend, storage-and-daemon) accept and ignore every
-    // flag: they exit before parsing any. Each gets its real flag set when it is built.
     Mode {
         name: FRONTEND,
-        entry: Entry::NotBuilt,
+        entry: Entry::Frontend,
     },
     Mode {
         name: STORAGE,
@@ -58,16 +60,10 @@ pub const MODES: [Mode; 5] = [
     },
     Mode {
         name: STORAGE_AND_DAEMON,
-        entry: Entry::NotBuilt,
+        entry: Entry::StorageAndDaemon,
     },
     Mode {
         name: ALL_IN_ONE,
         entry: Entry::AllInOne,
     },
 ];
-
-/// The one line an unbuilt mode prints to stderr before it exits 2.
-#[must_use]
-pub fn not_built_line(mode: &str) -> String {
-    format!("kbf {mode}: mode not built yet")
-}

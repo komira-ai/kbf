@@ -14,13 +14,17 @@ publish.workspace = true
 # authorization (crates/kbf-it/tests/layering.rs).
 [dependencies]
 bytes.workspace = true
+crc32c.workspace = true
 futures.workspace = true
+kbf-map.workspace = true
 kbf-meta.workspace = true
 kbf-proto.workspace = true
 kbf-segments.workspace = true
+kbf-store.workspace = true
 kbf-types.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tonic = { workspace = true, features = ["tls-ring"] }
 tracing.workspace = true
 # Reads the role out of a peer's certificate (service/admission.rs), as kbf-server reads
@@ -29,7 +33,7 @@ x509-parser.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "test-util", "time"] }
 
 [lints]
 workspace = true

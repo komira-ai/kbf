@@ -25,6 +25,15 @@
 //!   running twin before anything is queued
 //!   (`ARCHITECTURE.md#executing-an-action`).
 //!
+//! **The proxy.** [`Proxy`] answers a client's CAS, ByteStream and action-cache calls from
+//! storage nodes instead of the cache ([`routes_proxied`]; `kbf-server --storage`):
+//! ByteStream as a raw HTTP/2 pass-through that never holds a blob, the rest at the
+//! tonic level. See the `proxy` module for what it keeps and what it does not do yet.
+//!
+//! **The backend.** Execute reads the store through a [`Backend`], a cache in this
+//! process or a storage node ([`Backend::remote`]); `kbf frontend` runs the second and
+//! holds no cache at all.
+//!
 //! **Authorization.** Every service asks a `kbf_auth` authorizer before it serves a
 //! call ([`routes_with_authorizers`]; which call asks which is on each service and in
 //! `docs/reapi-auth.md`). The caller is whoever the server's authentication layer
@@ -42,6 +51,7 @@
 //! never waits: a full channel drops the event and marks its record incomplete.
 
 mod action_cache;
+mod backend;
 mod bytestream;
 mod cache;
 mod capabilities;
@@ -52,6 +62,7 @@ mod execution;
 mod input_tree;
 mod meta_log;
 pub mod metrics;
+mod proxy;
 mod recorder;
 mod request_metadata;
 mod segments;
@@ -70,6 +81,7 @@ use kbf_proto::reapi::execution_server::ExecutionServer;
 use tonic::service::Routes;
 
 pub use crate::action_cache::ActionCacheService;
+pub use crate::backend::Backend;
 pub use crate::bytestream::ByteStreamService;
 pub use crate::cache::HIT_CHECKS_IN_FLIGHT;
 pub use crate::cache::{
@@ -86,10 +98,12 @@ pub use crate::described::Described;
 pub use crate::execution::{
     BOOK_CPUS_KEY, BOOK_MEM_GIB_KEY, Closer, Closing, DEFAULT_RESOURCES, Dispatch, ERROR_DOMAIN,
     ExecutionService, Finished, GPU_KEY, LEASE_KIND_KEY, LEASE_KINDS, NO_WORKER_REASON,
-    OperationStream, Stage, Submission, Ticket, closing, missing_status,
+    OperationStream, Progress, ProgressTicker, Stage, Submission, Ticket, closing, missing_status,
+    progress,
 };
 pub use crate::input_tree::{ENTRY_OVERHEAD, InputTreeConfig};
 pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
+pub use crate::proxy::{Direction, Meter, Method, Owner, Owners, Proxy};
 pub use crate::recorder::{
     ActionLabel, DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording,
     listing, owner, wall_now,
@@ -146,7 +160,8 @@ where
 
 /// The cache services and `Execution` over `cache` and `dispatch`, with capabilities
 /// that advertise execution. Open Execute and WaitExecution streams end UNAVAILABLE
-/// when `closing`'s [`Closer`] closes. Every call is allowed.
+/// when `closing`'s [`Closer`] closes; a drain refuses new Execute calls and leaves the
+/// open ones. Every call is allowed.
 pub fn routes_with_execution<M, O, D>(
     cache: Arc<Cache<M, O>>,
     dispatch: Arc<D>,
@@ -177,6 +192,7 @@ where
         cache,
         dispatch,
         closing,
+        Progress::off(),
         authorizers,
         &Recorder::off(),
         DEFAULT_RESOURCES.memory_bytes,
@@ -184,12 +200,13 @@ where
 }
 
 /// [`routes_with_authorizers`], each call that carries an invocation id sent to
-/// `recorder`, and an `action` that names no memory size booking `default_memory`
-/// bytes ([`ExecutionService::with_default_memory`]).
+/// `recorder`, open streams re-sent at each tick of `progress`, and an `action` that
+/// names no memory size booking `default_memory` bytes ([`ExecutionService::with_default_memory`]).
 pub fn routes_recorded<M, O, D>(
     cache: Arc<Cache<M, O>>,
     dispatch: Arc<D>,
     closing: Closing,
+    progress: Progress,
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
     default_memory: u64,
@@ -207,12 +224,54 @@ where
             Arc::clone(&authorizers),
         )
         .recording(recorder.clone())
+        .with_progress(progress)
         .with_default_memory(default_memory),
     )
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let capabilities = CapabilitiesService::new(true, Arc::clone(&authorizers));
     cache_routes(cache, capabilities, &authorizers, recorder).add_service(execution)
+}
+
+/// What keeps open Execute streams going: the drain that ends them and the tick that
+/// re-sends them while their action waits.
+pub struct OpenStreams {
+    /// Ends the streams when closed ([`closing`]).
+    pub closing: Closing,
+    /// Re-sends each at every tick ([`progress`]).
+    pub progress: Progress,
+}
+
+/// [`routes_recorded`] with the client's CAS, ByteStream and action-cache calls answered
+/// by the storage nodes of `proxy` ([`Proxy`]), and `Execution` over `backend`: a cache
+/// in this process (`kbf-server --storage`, which still holds one) or a storage node
+/// ([`Backend::remote`], which is what `kbf frontend` runs).
+pub fn routes_proxied<D>(
+    proxy: &Proxy,
+    backend: impl Into<Backend>,
+    dispatch: Arc<D>,
+    streams: OpenStreams,
+    authorizers: Arc<Authorizers>,
+    recorder: &Recorder,
+    default_memory: u64,
+) -> Routes
+where
+    D: Dispatch,
+{
+    let OpenStreams { closing, progress } = streams;
+    let execution = ExecutionServer::new(
+        ExecutionService::with_authorizers(backend, dispatch, closing, Arc::clone(&authorizers))
+            .recording(recorder.clone())
+            .with_progress(progress)
+            .with_default_memory(default_memory),
+    )
+    .max_decoding_message_size(MAX_MESSAGE_BYTES)
+    .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    let capabilities = CapabilitiesService::new(true, authorizers);
+    proxy
+        .routes()
+        .add_service(CapabilitiesServer::new(capabilities))
+        .add_service(execution)
 }
 
 fn cache_routes<M, O>(

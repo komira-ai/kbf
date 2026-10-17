@@ -11,7 +11,11 @@
 //! - **C5** ordered prefix scans and a change feed a poller resumes from a [`Revision`]
 //!   without skipping a row ([`Store::changes`]);
 //! - **C6** an acknowledgement is durable across restart;
-//! - **C7** group commit ([`Store::apply_batch`], [`GROUP_COMMIT_WINDOW`]).
+//! - **C7** group commit ([`Store::apply_batch`], [`GROUP_COMMIT_WINDOW`]);
+//! - **C8** a bounded, ordered range scan under a prefix, between two bounds, forward or
+//!   in reverse, that pages with a [`ResumeToken`] ([`Store::scan_range`], [`ScanRange`]).
+//!
+//! With the `postgres` feature, [`postgres`] is the Postgres backend.
 //!
 //! [`conformance`] states each clause as a function generic over a [`conformance::Backend`]
 //! factory; [`fake`] is the in-memory backend, with a deliberately broken variant per clause
@@ -20,16 +24,19 @@
 pub mod clock;
 pub mod conformance;
 pub mod fake;
+#[cfg(feature = "postgres")]
+pub mod postgres;
+pub mod sqlite;
 mod store;
 mod types;
 
 use std::time::Duration;
 
-pub use clock::{Clock, ManualClock, StoreTime};
+pub use clock::{Clock, ManualClock, StoreTime, SystemClock};
 pub use store::Store;
 pub use types::{
-    Change, Changes, Commit, CommitStats, Cond, Conflict, Event, Op, Revision, StoreError, Txn,
-    Version, Versioned,
+    Change, Changes, Commit, CommitStats, Cond, Conflict, Direction, Event, Op, ResumeToken,
+    Revision, ScanPage, ScanRange, StoreError, Txn, Version, Versioned,
 };
 
 /// The longest a write may wait for the group it commits with (target 5 ms).

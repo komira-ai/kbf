@@ -83,9 +83,13 @@ fn lists_are_read_as_systemd_reads_them() {
     );
     // Numbers as safe_atou reads them.
     assert_eq!(
-        read("AllowedCPUs=0x4 010 0b11 0O5 +6 0X1f 0--0 -0\n").as_deref(),
-        Some("0,3-6,8,31")
+        read("AllowedCPUs=0x4 010 0b11 0O5 +6 0X1f\n").as_deref(),
+        Some("3-6,8,31")
     );
+    // A `-0` upper bound is 0 (safe_atou takes a `-` before 0)...
+    assert_eq!(read("AllowedCPUs=0--0\n").as_deref(), Some("0"));
+    // ...but a word starting with `-` has an empty lower bound: malformed, not CPU 0.
+    assert_eq!(read("AllowedCPUs=-0\n").as_deref(), None);
     assert_eq!(
         read("AllowedCPUs=\" 2\" 0x 0b 08 0xg -1 1-\" 3\"\n").as_deref(),
         Some("1-3")

@@ -169,7 +169,7 @@ fn a_refused_start_exits_2_and_a_state_store_is_refused() {
     ]);
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("unexpected argument '--state-store"), "{err}");
+    assert!(err.contains("kbf storage refuses --state-store: "), "{err}");
     assert!(out.stdout.is_empty());
 }
 
@@ -197,4 +197,76 @@ fn the_s3_and_hot_store_shapes_start_and_stop_on_sigterm() {
     std::fs::create_dir_all(dir.join("hot")).expect("hot directory");
     let mut tiered = spawn(&[&cold, &hot], &[]);
     assert!(tiered.stop().is_some_and(|status| status.success()));
+}
+
+/// Catches a `kbf storage` that serves plain text off loopback (it would admit Write and
+/// ActionCommit from anyone): on a wildcard IPv4 and IPv6 address and on a LAN one, with
+/// no TLS flags, the process exits 2 with one `kbf storage:` line that names the address and the
+/// three flags, prints no start line, and opens no store (the meta directory is not
+/// created); and with the TLS flags it gets past that check (to the missing certificate
+/// file, not to a start). Loopback without TLS is every other test here.
+#[test]
+fn plain_text_off_loopback_is_a_refused_start() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("storage-off-loopback-{}", std::process::id()));
+    let cold = format!("--cold-store=file://{}", dir.join("cold").display());
+    let meta = format!("--meta-dir={}", dir.join("meta").display());
+    // A node that wrongly starts serves until it is killed: wait a while, then kill it
+    // and let the assertions below say it did not exit 2.
+    let run = |listen: &str, more: &[&str]| {
+        let mut child = Command::new(BIN)
+            .args([
+                "storage",
+                &cold,
+                &meta,
+                &format!("--storage-listen={listen}"),
+            ])
+            .args(more)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn kbf storage");
+        for _ in 0..200 {
+            if child.try_wait().expect("wait").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        child.wait_with_output().expect("output")
+    };
+    for listen in ["0.0.0.0:0", "[::]:0", "192.0.2.10:0"] {
+        let out = run(listen, &[]);
+        assert_eq!(out.status.code(), Some(2), "{listen}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        let refusals = err
+            .lines()
+            .filter(|l| l.starts_with("kbf storage: "))
+            .count();
+        assert_eq!(refusals, 1, "{err}");
+        for want in [
+            "kbf storage: --storage-listen ",
+            listen,
+            "--storage-tls-cert",
+            "--storage-tls-key",
+            "--storage-client-ca",
+        ] {
+            assert!(err.contains(want), "{listen}: {err}");
+        }
+        assert!(out.stdout.is_empty(), "{listen}");
+    }
+    assert!(!dir.join("meta").exists(), "a refused start opened a store");
+    let nowhere = dir.join("none.pem").display().to_string();
+    let out = run(
+        "0.0.0.0:0",
+        &[
+            &format!("--storage-tls-cert={nowhere}"),
+            &format!("--storage-tls-key={nowhere}"),
+            &format!("--storage-client-ca={nowhere}"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("read ") && err.contains("none.pem"), "{err}");
+    assert!(!err.contains("--storage-listen"), "{err}");
 }

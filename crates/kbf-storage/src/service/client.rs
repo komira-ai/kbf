@@ -38,7 +38,8 @@ const WRITE_CHUNK_BYTES: usize = 1 << 20;
 #[derive(Clone, Debug)]
 pub struct RemoteStorage {
     channel: Channel,
-    generation: u64,
+    /// Shared by every clone (and so by the `Segments` handle), read once per call.
+    generation: Arc<AtomicU64>,
     uploads: Arc<AtomicU64>,
 }
 
@@ -54,17 +55,35 @@ impl RemoteStorage {
     pub fn new(channel: Channel, generation: u64) -> Self {
         Self {
             channel,
-            generation,
+            generation: Arc::new(AtomicU64::new(generation)),
             uploads: Arc::new(AtomicU64::new(0)),
         }
     }
 
+    /// Tags every call made from now on with map `generation`, on this handle and on
+    /// every clone of it (a map update reaches the one the caller holds). A call already
+    /// begun keeps the generation it read.
+    pub fn set_map_generation(&self, generation: u64) {
+        self.generation.store(generation, Ordering::Relaxed);
+    }
+
+    /// The generation a call made now carries.
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
     /// `message` as a request carrying the map generation.
     fn tag<T>(&self, message: T) -> Request<T> {
+        self.tag_at(message, self.generation())
+    }
+
+    /// `message` as a request carrying `generation`: for a call whose message carries it
+    /// too, so the field and the header are one read of the generation.
+    fn tag_at<T>(&self, message: T, generation: u64) -> Request<T> {
         let mut request = Request::new(message);
         request
             .metadata_mut()
-            .insert(MAP_GENERATION_HEADER, MetadataValue::from(self.generation));
+            .insert(MAP_GENERATION_HEADER, MetadataValue::from(generation));
         request
     }
 
@@ -89,11 +108,18 @@ impl RemoteStorage {
 
 /// The error a failed call is. The codes a [`Storage`] answers are kept (`at` is the
 /// blob and offset of a read, which NOT_FOUND and OUT_OF_RANGE are about): a caller sees
-/// what an in-process store would have said. UNAVAILABLE and every code that says
-/// nothing of the request (a transport failure, a deadline) are `Unavailable`; a
-/// store that is held but unreadable is UNAVAILABLE too, so it is `Unavailable` here
-/// where it was `Unreachable` there.
-pub(super) fn lift(status: &Status, at: Option<(Digest, u64)>) -> StorageError {
+/// what an in-process store would have said. Only UNAVAILABLE, DEADLINE_EXCEEDED and
+/// UNKNOWN, which say nothing of the request (a transport failure, a deadline), are
+/// `Unavailable`; a store that is held but unreadable is UNAVAILABLE too, so it is
+/// `Unavailable` here where it was `Unreachable` there. Every other code is an answer
+/// from a node that was reached and declined (ABORTED, DATA_LOSS, RESOURCE_EXHAUSTED,
+/// CANCELLED, ALREADY_EXISTS, FAILED_PRECONDITION without a map generation): `Internal`
+/// with the code in the message, never an outage, so a primary does not answer a write
+/// with one copy over a replica's refusal ([`crate::replicate`]).
+pub(crate) fn lift(status: &Status, at: Option<(Digest, u64)>) -> StorageError {
+    if let Some(current) = stale_generation(status) {
+        return StorageError::StaleMap { current };
+    }
     let message = status.message().to_owned();
     match (status.code(), at) {
         (Code::NotFound, Some((digest, _))) => StorageError::NotFound(digest),
@@ -104,8 +130,24 @@ pub(super) fn lift(status: &Status, at: Option<(Digest, u64)>) -> StorageError {
         (Code::Internal | Code::Unimplemented | Code::NotFound | Code::OutOfRange, _) => {
             StorageError::Internal(message)
         }
-        _ => StorageError::Unavailable(Arc::new(Remote(message))),
+        (Code::Unavailable | Code::DeadlineExceeded | Code::Unknown, _) => {
+            StorageError::Unavailable(Arc::new(Remote(message)))
+        }
+        (code, _) => StorageError::Internal(format!("{code:?}: {message}")),
     }
+}
+
+/// The generation a node named when it answered `STALE_MAP`: FAILED_PRECONDITION with the
+/// generation in the [`MAP_GENERATION_HEADER`] entry. FAILED_PRECONDITION alone is also a
+/// refused action-cache write, so the entry is what says it.
+fn stale_generation(status: &Status) -> Option<u64> {
+    if status.code() != Code::FailedPrecondition {
+        return None;
+    }
+    let entry = status.metadata().get(MAP_GENERATION_HEADER);
+    entry
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| text.parse().ok())
 }
 
 /// [`lift`] for a call that is not about one blob.
@@ -261,11 +303,16 @@ impl Storage for RemoteStorage {
         action: &'a Digest,
     ) -> Answer<'a, Option<(Digest, ActionResult)>> {
         Box::pin(async move {
+            let generation = self.generation();
             let request = GetRequest {
-                map_generation: self.generation,
+                map_generation: generation,
                 action: Some(wire::to_proto(action)),
             };
-            let response = self.actions().get(self.tag(request)).await.map_err(other)?;
+            let response = self
+                .actions()
+                .get(self.tag_at(request, generation))
+                .await
+                .map_err(other)?;
             let Some(entry) = response.into_inner().entry else {
                 return Ok(None);
             };
@@ -277,13 +324,14 @@ impl Storage for RemoteStorage {
 
     fn prepare_action_result<'a>(&'a self, result: &'a ActionResult) -> Answer<'a, ActionRecord> {
         Box::pin(async move {
+            let generation = self.generation();
             let request = PrepareRequest {
-                map_generation: self.generation,
+                map_generation: generation,
                 result: Some(result.clone()),
             };
             let response = self
                 .actions()
-                .prepare(self.tag(request))
+                .prepare(self.tag_at(request, generation))
                 .await
                 .map_err(other)?;
             match response.into_inner().outcome {
@@ -313,15 +361,16 @@ impl Storage for RemoteStorage {
                 Role::Daemon => Writer::Daemon,
                 Role::Client => Writer::Client,
             };
+            let generation = self.generation();
             let request = CommitRequest {
-                map_generation: self.generation,
+                map_generation: generation,
                 action: Some(wire::to_proto(&action)),
                 record: Some(record_to_proto(&record)),
                 writer: writer as i32,
             };
             let response = self
                 .actions()
-                .commit(self.tag(request))
+                .commit(self.tag_at(request, generation))
                 .await
                 .map_err(other)?;
             match response.into_inner().refused {

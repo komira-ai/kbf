@@ -186,4 +186,47 @@ mod tests {
         let second = node.plane(&cli).expect("engine");
         assert!(Arc::ptr_eq(&first, &second));
     }
+
+    /// Catches the farm's data plane (`kbf-daemon`'s `start`) not being built from the
+    /// daemon's flags: it is made once and shared by every runtime like the engine, and
+    /// TLS files that cannot be read fail the start rather than the first storage call.
+    #[tokio::test]
+    async fn the_farm_plane_is_one_per_process_and_needs_readable_tls_files() {
+        let dir = super::super::tests::scratch("transfer-farm");
+        super::super::tests::tls_files(&dir);
+        let at = |name: &str| format!("{}", dir.join(name).display());
+        let cli = |ca: &str| {
+            Cli::try_parse_from([
+                "kbf-daemon".to_owned(),
+                "--server=https://front:7070".to_owned(),
+                format!("--ca-cert={ca}"),
+                format!("--cert={}", at("node.pem")),
+                format!("--key={}", at("node.key")),
+                "--node-id=n1".to_owned(),
+                "--driver=native".to_owned(),
+                "--cas=https://127.0.0.1:1".to_owned(),
+            ])
+            .expect("flags")
+        };
+        let maps = Arc::new(kbf_daemon::MapHolder::new());
+        let held = Arc::clone(&maps);
+        let mut node = Node::new(Box::new(move |cli| {
+            super::super::farm(cli, &held, kbf_daemon::Liveness::default())
+        }));
+        let cli_ok = cli(&at("ca.pem"));
+        let first = node.plane(&cli_ok).expect("farm plane");
+        let second = node.plane(&cli_ok).expect("farm plane");
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let held = Arc::clone(&maps);
+        let mut unreadable = Node::new(Box::new(move |cli| {
+            super::super::farm(cli, &held, kbf_daemon::Liveness::default())
+        }));
+        let why = unreadable
+            .plane(&cli(&at("no-such-ca.pem")))
+            .err()
+            .expect("no CA file")
+            .to_string();
+        assert!(why.contains("no-such-ca.pem"), "{why}");
+    }
 }

@@ -70,9 +70,9 @@ pub struct TierPlan {
 impl TierPlan {
     fn options(self) -> TierOptions {
         TierOptions {
-            budget: self.budget,
             seal_after: self.seal_after,
             segment_limit: self.segment_limit,
+            ..TierOptions::new(self.budget)
         }
     }
 }

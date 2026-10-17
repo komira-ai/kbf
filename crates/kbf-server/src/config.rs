@@ -22,7 +22,7 @@ use kbf_meta::ServerId;
 use kbf_threads::disk::FreeSpace;
 
 use crate::identity::{DenyList, DenyListError};
-use crate::serve::{Api, Listeners, WorkerTls};
+use crate::serve::{Api, Listeners, StreamTiming, WorkerTls};
 use crate::stores::{S3Uri, StoreFlags, StoreUri, Stores, StoresError};
 use crate::token::{ApiToken, TokenFileError};
 
@@ -48,6 +48,10 @@ pub struct Args {
     /// The roles to run.
     #[arg(long, value_enum, default_value = "all")]
     pub role: Role,
+    /// The node's one cache, when a daemon in this process shares the hot store's disk
+    /// (`kbf-all-in-one`, `kbf_storage::local_cache`). No flag sets it.
+    #[arg(skip)]
+    pub local_cache: Option<Arc<kbf_storage::local_cache::LocalCache>>,
     /// The durable object store, where every blob ends up: `file:///absolute/path` (a
     /// directory, `kbf_objstore::FsStore`: locked while the server runs, a second
     /// server on it is refused; a write that would leave its filesystem with less free
@@ -159,6 +163,16 @@ pub struct Args {
     /// the blob route do, and they are off unless it names their authorizers.
     #[arg(long)]
     pub reapi_auth_policy: Option<PathBuf>,
+    /// Proxy mode (`docs/design/architecture-v2.md`, section 7): the URL of a storage
+    /// node (`kbf storage`), such as `http://127.0.0.1:8990`. The REAPI listener then
+    /// answers a client's CAS, ByteStream and action-cache calls from that node, passing
+    /// ByteStream through without holding a blob. The local stores are still opened:
+    /// Execution and the worker listener use them (`kbf frontend` is this mode without
+    /// them: Execution reads the node too). Plain text (`http://`) only here; `kbf
+    /// frontend` takes the flags of the mutual TLS to the node. Without it, the server
+    /// answers those calls itself.
+    #[arg(long, value_name = "URL")]
+    pub storage: Option<String>,
     /// The `kbf.worker.v1` listener. Without mutual TLS (`--worker-tls-cert`,
     /// `--worker-tls-key`, `--worker-client-ca`) it serves plain text, on any address;
     /// off loopback the start line carries a warning.
@@ -244,11 +258,26 @@ pub struct Args {
     #[arg(long, default_value_t = kbf_sched::FINISHED_RETENTION.as_secs())]
     pub finished_retention_secs: u64,
     /// How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to
-    /// disconnect after their open Execute and WaitExecution streams are ended
-    /// UNAVAILABLE and their connections sent GOAWAY. A client still uploading is cut
-    /// off when it runs out.
-    #[arg(long, default_value_t = 10)]
+    /// finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and
+    /// sends GOAWAY, and every open Execute and WaitExecution stream stays open until
+    /// its action is done. Buck2 never recovers a stream that breaks mid-action, so the
+    /// default, 0, is no deadline; set one at least as long as the longest action. When
+    /// it runs out, the open streams end UNAVAILABLE (a client still uploading is cut
+    /// off).
+    #[arg(long, default_value_t = 0)]
     pub shutdown_timeout_secs: u64,
+    /// How often, in seconds, every open Execute and WaitExecution stream is sent its
+    /// operation again (same name, not done, current stage), so a load balancer's idle
+    /// timeout never cuts a long action. 0 sends none.
+    #[arg(long, default_value_t = 30)]
+    pub progress_interval_secs: u64,
+    /// How often, in seconds, the REAPI and worker listeners send an HTTP/2 PING on a
+    /// quiet connection. 0 sends none (and `--http2-keepalive-timeout-secs` is unused).
+    #[arg(long, default_value_t = 30)]
+    pub http2_keepalive_interval_secs: u64,
+    /// How long, in seconds, a PING may go unanswered before the connection is closed.
+    #[arg(long, default_value_t = 20)]
+    pub http2_keepalive_timeout_secs: u64,
     /// Thread sizes: the overrides `--async-threads`, `--blocking-threads` and
     /// `--cpu-threads` (see `kbf_threads`). Left out, the server uses every CPU it may
     /// (the async workers and the CPU pool each one thread per logical CPU); it has no
@@ -346,6 +375,36 @@ pub struct Args {
     /// all Executes.
     #[arg(long, default_value_t = kbf_front::InputTreeConfig::DEFAULT.reads_in_flight)]
     pub input_tree_reads_in_flight: NonZeroUsize,
+    /// Where the scheduler keeps its state, written before each change is acknowledged and
+    /// replayed at start: `sqlite:///absolute/path`, a file on a local disk that this
+    /// process owns. Every start is a new epoch, so daemons kill the runs of the leases
+    /// they held before. The file is created, with its directory, if missing (0600, and
+    /// 0700 for a directory it makes) and held by one process: a second frontend on it
+    /// refuses to start. Any other value, `postgres://` included, is refused (Postgres is
+    /// not wired yet). Left out, the scheduler's state is in memory and a restart loses it
+    // Listed beside `--meta-dir`, whose place in the help it takes without moving the
+    // flags declared after it.
+    #[arg(
+        long,
+        value_name = "URI",
+        value_parser = crate::state_store::StateStoreParser,
+        display_order = 5,
+    )]
+    pub state_store: Option<crate::state_store::StateStoreUri>,
+    /// How long, in seconds, a storage node's membership row lives without a heartbeat
+    /// before the state store expires it and the member goes down in the storage map.
+    /// Nodes are asked to heartbeat three times as often.
+    #[arg(long, value_name = "SECONDS", default_value_t = 15, requires = "state_store", value_parser = clap::value_parser!(u64).range(3..))]
+    pub member_ttl_secs: u64,
+    /// How long, in seconds, a down storage member stays in the map before it leaves
+    /// and its blobs move to other owners.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = 300,
+        requires = "state_store"
+    )]
+    pub member_dwell_secs: u64,
 }
 
 /// This server in the tier registry. A farm runs one server today
@@ -384,12 +443,27 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    /// `--storage` is not a URL.
+    #[error("--storage {url:?}: {source}")]
+    Storage {
+        url: String,
+        #[source]
+        source: tonic::transport::Error,
+    },
     /// A segment upload could declare more than uploads may hold at once.
     #[error(
         "--segment-upload-max-bytes {cap} is over --write-bytes-in-flight {bound}: \
          a segment upload holds its ranges in memory under that bound"
     )]
     SegmentUploadOverWriteBound { cap: u64, bound: u64 },
+    /// `kbf storage` would serve plain text off loopback, admitting every caller.
+    #[error(
+        "--storage-listen {addr} is not a loopback address and the node has no TLS, so it \
+         would admit every caller (Write and ActionCommit included); add \
+         --storage-tls-cert, --storage-tls-key and --storage-client-ca, or listen on a \
+         loopback address"
+    )]
+    PlaintextStorageOffLoopback { addr: SocketAddr },
     /// `--memory-ladder-gib` is empty, holds a 0, does not ascend, or overflows.
     #[error("--memory-ladder-gib: {0}")]
     MemoryLadder(#[from] kbf_sched::LadderError),
@@ -471,7 +545,15 @@ impl Args {
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
             finished_retention: Duration::from_secs(self.finished_retention_secs),
-            shutdown_timeout: Duration::from_secs(self.shutdown_timeout_secs),
+            shutdown_timeout: match self.shutdown_timeout_secs {
+                0 => Duration::MAX,
+                secs => Duration::from_secs(secs),
+            },
+            streams: StreamTiming {
+                progress_interval: Duration::from_secs(self.progress_interval_secs),
+                keepalive_interval: Duration::from_secs(self.http2_keepalive_interval_secs),
+                keepalive_timeout: Duration::from_secs(self.http2_keepalive_timeout_secs),
+            },
             store_probe_timeout: Duration::from_millis(self.readyz_store_timeout_ms),
             invocation_memory: usize::try_from(self.invocation_memory).unwrap_or(usize::MAX),
             segments: SegmentsConfig {
@@ -479,6 +561,17 @@ impl Args {
                 idle: Duration::from_secs(self.segment_upload_idle_secs),
             },
         })
+    }
+
+    /// How storage members live in the state store: `--member-ttl-secs` and
+    /// `--member-dwell-secs`.
+    #[must_use]
+    pub fn members(&self) -> crate::members::MembershipConfig {
+        crate::members::MembershipConfig {
+            ttl: Duration::from_secs(self.member_ttl_secs),
+            dwell: Duration::from_secs(self.member_dwell_secs),
+            ..crate::members::MembershipConfig::default()
+        }
     }
 
     /// Refuses a `--segment-upload-max-bytes` over `--write-bytes-in-flight`: an upload
@@ -539,6 +632,24 @@ impl Args {
         Ok(policy)
     }
 
+    /// The storage node `--storage` names, if given.
+    ///
+    /// # Errors
+    /// The URL is not one.
+    pub fn storage(&self) -> Result<Option<tonic::transport::Endpoint>, ConfigError> {
+        self.storage
+            .as_ref()
+            .map(|url| {
+                tonic::transport::Endpoint::from_shared(url.clone()).map_err(|source| {
+                    ConfigError::Storage {
+                        url: url.clone(),
+                        source,
+                    }
+                })
+            })
+            .transpose()
+    }
+
     /// The operator API these flags describe, if `--api-listen` is given, with the
     /// token read from `--api-token-file`.
     ///
@@ -553,7 +664,12 @@ impl Args {
             .as_deref()
             .map(ApiToken::from_file)
             .transpose()?;
-        Ok(Some(Api { listen, token }))
+        let local_cache = self.local_cache.clone();
+        Ok(Some(Api {
+            listen,
+            token,
+            local_cache,
+        }))
     }
 
     /// How the cache groups and bounds uploads: `--write-linger`,
@@ -641,384 +757,4 @@ pub(crate) fn read(path: &PathBuf) -> Result<Vec<u8>, ConfigError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
-    use std::time::Duration;
-
-    use clap::Parser;
-    use kbf_front::{MAX_BLOB_BYTES, WriteConfig};
-
-    use kbf_threads::disk::{FreeSpace, Space};
-
-    use super::{Args, loopback_only};
-
-    /// Catches: `min-put-rate` lost on the way from the URI to the store (the flat 60 s
-    /// that cut slow segment PUTs), a default other than 1 MiB/s, `conditional-put` and
-    /// the region dropped, and a rate of 0 accepted (it would divide by zero in the
-    /// store's timeout).
-    #[test]
-    fn the_s3_uri_reaches_the_store_config() {
-        let parse = |query: &str| {
-            let uri = format!("s3://b/p?endpoint=http://e:9{query}");
-            Args::try_parse_from(["kbf-server", "--cold-store", &uri])
-        };
-        let config = |query: &str| {
-            let args = parse(query).expect("a store");
-            let uri = args.cold_store.expect("a store");
-            let uri = uri.as_s3().expect("an s3 store");
-            super::s3_config(uri, super::Credentials::new("k", "s"))
-        };
-        let default = config("");
-        assert_eq!(default.min_body_rate, NonZeroU64::new(1 << 20));
-        assert_eq!(default.region, "us-east-1");
-        assert!(!default.capabilities.conditional_put);
-        assert_eq!(default.endpoint, "http://e:9");
-        assert_eq!(default.bucket, "b");
-        let over = config("&min-put-rate=4096&region=eu-1&conditional-put=true");
-        assert_eq!(over.min_body_rate, NonZeroU64::new(4096));
-        assert_eq!(over.region, "eu-1");
-        assert!(over.capabilities.conditional_put);
-        assert!(parse("&min-put-rate=0").is_err());
-    }
-
-    /// Catches: the store flags not reaching the resolution (a hot store ignored, the
-    /// budget from the wrong filesystem number), a fake free-space source not used, and
-    /// the old flags accepted (a stale unit would go unnoticed).
-    #[test]
-    fn the_store_flags_resolve_and_the_old_ones_are_refused() {
-        let space = Space {
-            total: 100 << 30,
-            available: 50 << 30,
-        };
-        let args = Args::parse_from([
-            "kbf-server",
-            "--cold-store=file:///c",
-            "--hot-store=file:///h",
-        ]);
-        let stores = args.stores(&Fake(space)).expect("stores");
-        assert_eq!(stores.hot.expect("hot").budget, space.of_free(80, None));
-        assert_eq!(stores.meta_dir, std::path::Path::new("/h/meta"));
-        for flag in [
-            "--store=s3",
-            "--blob-dir=/b",
-            "--blob-dir-min-free-bytes=1",
-            "--meta-log=raft",
-            "--raft-dir=/r",
-            "--s3-endpoint=http://e:9",
-            "--s3-bucket=b",
-            "--s3-region=r",
-            "--s3-prefix=p/",
-            "--s3-conditional-put",
-            "--s3-min-put-rate=9",
-            "--write-tier-dir=/t",
-            "--write-tier-bytes=9",
-            "--write-tier-seal-after=9",
-            "--write-tier-abandon=9",
-        ] {
-            let refused = Args::try_parse_from(["kbf-server", flag]).expect_err(flag);
-            assert_eq!(
-                refused.kind(),
-                clap::error::ErrorKind::UnknownArgument,
-                "{flag}"
-            );
-        }
-        for flag in ["--hot-store-max-bytes=9", "--hot-store-abandon=9"] {
-            assert!(
-                Args::try_parse_from(["kbf-server", flag]).is_err(),
-                "{flag}"
-            );
-        }
-    }
-
-    /// Behaviour equivalence for a converged config: the flags of the unit this release
-    /// renders open the stores the old unit's flags did (`--store=s3 --s3-endpoint=...
-    /// --s3-bucket=kbf-cas --s3-conditional-put --meta-log=raft --raft-dir=...`): the
-    /// same endpoint, bucket, region, capabilities, timeouts and put rate; the key prefix
-    /// root `kbf/`; the log in the same directory. And a directory cold store and a hot
-    /// directory keep what `--blob-dir` (prefix `kbf/`) and `--write-tier-dir` (the
-    /// 30 s seal) had; the directory's floor is no longer a fixed 1 GiB but the
-    /// evicting directory's `keep_free` (5%, at least 1 GiB).
-    #[test]
-    fn a_converged_unit_opens_the_stores_the_old_flags_did() {
-        let args = Args::parse_from([
-            "kbf-server",
-            "--cold-store=s3://kbf-cas?endpoint=http://127.0.0.1:9000&conditional-put=true",
-            "--meta-dir=/var/lib/kbf-server/raft",
-        ]);
-        let stores = args
-            .stores(&Fake(Space {
-                total: 100 << 30,
-                available: 50 << 30,
-            }))
-            .expect("stores");
-        let uri = stores.cold.as_s3().expect("an S3 cold store");
-        assert_eq!(uri.prefix, "kbf/", "the old --s3-prefix default");
-        let config = super::s3_config(uri, super::Credentials::new("k", "s"));
-        assert_eq!(config.endpoint, "http://127.0.0.1:9000");
-        assert_eq!(config.bucket, "kbf-cas");
-        assert_eq!(config.region, "us-east-1");
-        assert!(config.capabilities.conditional_put);
-        assert!(!config.capabilities.object_lock);
-        assert_eq!(config.connect_timeout, Duration::from_secs(5));
-        assert_eq!(config.request_timeout, Duration::from_secs(60));
-        assert_eq!(config.min_body_rate, NonZeroU64::new(1 << 20));
-        assert_eq!(
-            stores.meta_dir,
-            std::path::Path::new("/var/lib/kbf-server/raft")
-        );
-        assert_eq!(stores.hot, None, "no tier unless asked, as before");
-        assert_eq!(
-            crate::stores::COLD_FILE_FLOOR,
-            kbf_objstore::Floor::KeepFree
-        );
-        assert_eq!(crate::stores::FILE_PREFIX_ROOT, "kbf/");
-        assert_eq!(kbf_tier::TierOptions::SEAL_AFTER, Duration::from_secs(30));
-    }
-
-    /// A free-space source with one answer.
-    struct Fake(Space);
-
-    impl FreeSpace for Fake {
-        fn space(&self, _: &std::path::Path) -> std::io::Result<Space> {
-            Ok(self.0)
-        }
-    }
-
-    /// Catches a `--cpu-threads` that does not reach the cache's hashing pool (the
-    /// flusher would hash on the default width whatever the operator set), a default
-    /// that is not the CPU count (`kbf_threads`: the server's own `Args::cpu_threads`),
-    /// a `--reserve-cpus` or `--reserve-share` still accepted (a stale unit would go
-    /// unnoticed, and the server would ignore the number it was given), and 0 accepted
-    /// (a pool that never runs a job). Parsing at all catches a second `--cpu-threads`
-    /// (clap panics on a duplicate name).
-    #[test]
-    fn cpu_threads_reaches_the_hashing_pool() {
-        let args = Args::parse_from(["kbf-server"]);
-        let defaults = args.write_config();
-        assert_eq!(defaults.cpu_threads, args.cpu_threads());
-        let machine = kbf_threads::Topology::detect().logical();
-        assert_eq!(defaults.cpu_threads.get(), machine);
-        let set = Args::parse_from(["kbf-server", "--cpu-threads=7"]).write_config();
-        assert_eq!(set.cpu_threads.get(), 7);
-        assert!(Args::try_parse_from(["kbf-server", "--cpu-threads=0"]).is_err());
-        for flag in ["--reserve-cpus=4", "--reserve-share=2"] {
-            let refused = Args::try_parse_from(["kbf-server", flag]).expect_err(flag);
-            assert_eq!(
-                refused.kind(),
-                clap::error::ErrorKind::UnknownArgument,
-                "{flag}"
-            );
-            assert!(
-                refused
-                    .to_string()
-                    .contains(&flag[..flag.find('=').unwrap_or(flag.len())])
-            );
-        }
-    }
-
-    /// Catches a `--segment-upload-*` flag that does not reach the listeners, a default
-    /// other than the design's (1 GiB + 1 MiB, 60 s), and a cap below one largest blob
-    /// and its footer accepted (a `Begin` for such a blob would be refused for good).
-    #[test]
-    fn segment_upload_flags_reach_the_listeners() {
-        let defaults = Args::parse_from(["kbf-server"])
-            .listeners()
-            .expect("listeners");
-        assert_eq!(defaults.segments, kbf_front::SegmentsConfig::DEFAULT);
-        assert_eq!(defaults.segments.max_bytes, (1 << 30) + (1 << 20));
-        assert_eq!(defaults.segments.idle, std::time::Duration::from_secs(60));
-        let set = Args::parse_from([
-            "kbf-server",
-            "--segment-upload-max-bytes=2147483648",
-            "--segment-upload-idle-secs=5",
-        ])
-        .listeners()
-        .expect("listeners");
-        assert_eq!(set.segments.max_bytes, 1 << 31);
-        assert_eq!(set.segments.idle, std::time::Duration::from_secs(5));
-        let below = format!(
-            "--segment-upload-max-bytes={}",
-            (1u64 << 30) + (1 << 20) - 1
-        );
-        for refused in [below.as_str(), "--segment-upload-idle-secs=0"] {
-            assert!(
-                Args::try_parse_from(["kbf-server", refused]).is_err(),
-                "{refused} accepted"
-            );
-        }
-    }
-
-    /// Catches a server that starts with `--segment-upload-max-bytes` over
-    /// `--write-bytes-in-flight` (mutant: the check removed). A segment upload holds its
-    /// ranges in memory under the write bound, so an upload of the whole cap would hold
-    /// more than the bound admits. A cap equal to the bound starts; one byte of bound
-    /// less is refused, naming both flags.
-    #[test]
-    fn a_segment_upload_cap_over_the_write_bound_is_refused() {
-        let cap = kbf_front::MIN_SEGMENT_UPLOAD_BYTES;
-        let args = |bound: u64| {
-            Args::parse_from([
-                "kbf-server".to_owned(),
-                format!("--segment-upload-max-bytes={cap}"),
-                format!("--write-bytes-in-flight={bound}"),
-            ])
-        };
-        args(cap).listeners().expect("a cap equal to the bound");
-        let refused = args(cap - 1)
-            .listeners()
-            .map(drop)
-            .expect_err("a cap over the bound");
-        let message = refused.to_string();
-        assert!(message.contains("--segment-upload-max-bytes"), "{message}");
-        assert!(message.contains("--write-bytes-in-flight"), "{message}");
-    }
-
-    /// Catches a server that starts with a `--segment-upload-max-bytes` larger than one
-    /// admission counts (mutant: the flag's upper limit removed). `Cache::admit` takes at
-    /// most `kbf_front::MAX_ADMISSION_BYTES` (4 GiB - 1) for one call, so an 8 GiB
-    /// `Begin` under a 16 GiB bound would hold 8 GiB of ranges while counting 4 GiB, and
-    /// other uploads could push what is held past the bound. A cap of exactly the most
-    /// one admission counts starts; one byte more is refused, however large the bound.
-    #[test]
-    fn a_segment_upload_cap_over_one_admission_is_refused() {
-        let bound = format!("--write-bytes-in-flight={}", 16u64 << 30);
-        let cap = |cap: u64| format!("--segment-upload-max-bytes={cap}");
-        let most = kbf_front::MAX_ADMISSION_BYTES;
-        Args::try_parse_from(["kbf-server", &cap(most), &bound])
-            .expect("a cap one admission counts in full")
-            .listeners()
-            .expect("under the bound");
-        for over in [most + 1, 8u64 << 30] {
-            let refused = Args::try_parse_from(["kbf-server", &cap(over), &bound])
-                .map(drop)
-                .expect_err("a cap over one admission");
-            let message = refused.to_string();
-            assert!(message.contains("--segment-upload-max-bytes"), "{message}");
-        }
-    }
-
-    /// Catches the input-tree flags not reaching the config, a zero where the check
-    /// needs at least one, and defaults other than the design's.
-    #[test]
-    fn input_tree_flags_make_the_input_tree_config() {
-        let defaults = Args::parse_from(["kbf-server"]).input_tree_config();
-        assert_eq!(defaults, kbf_front::InputTreeConfig::DEFAULT);
-        let set = Args::parse_from([
-            "kbf-server",
-            "--input-tree-cache-entries",
-            "11",
-            "--input-tree-cache-bytes",
-            "2222",
-            "--input-tree-reads-in-flight",
-            "3",
-        ]);
-        let want = kbf_front::InputTreeConfig {
-            max_entries: NonZeroUsize::new(11).expect("11"),
-            max_bytes: 2222,
-            reads_in_flight: NonZeroUsize::new(3).expect("3"),
-        };
-        assert_eq!(set.input_tree_config(), want);
-        for flag in ["--input-tree-cache-entries", "--input-tree-reads-in-flight"] {
-            assert!(
-                Args::try_parse_from(["kbf-server", flag, "0"]).is_err(),
-                "{flag}"
-            );
-        }
-    }
-
-    /// Catches: a `--write-bytes-in-flight` below the largest blob accepted (a Write of
-    /// that blob would wait for admission forever), a flag wired to the wrong field of
-    /// the write configuration, and defaults other than the design's.
-    #[test]
-    fn write_flags_make_the_write_config() {
-        let defaults = Args::parse_from(["kbf-server"]).write_config();
-        // The CPU pool's width is the CPU count (`kbf_threads`), not the front's default.
-        assert_eq!(
-            defaults,
-            WriteConfig {
-                cpu_threads: defaults.cpu_threads,
-                ..WriteConfig::DEFAULT
-            }
-        );
-        let set = Args::parse_from([
-            "kbf-server",
-            "--write-linger",
-            "7",
-            "--write-own-segment-bytes",
-            "12345",
-            "--write-bytes-in-flight",
-            &MAX_BLOB_BYTES.to_string(),
-            "--write-puts-in-flight",
-            "9",
-            "--store-put-attempts",
-            "5",
-            "--cpu-threads",
-            "3",
-        ]);
-        let want = WriteConfig {
-            linger: Duration::from_millis(7),
-            own_segment_bytes: 12345,
-            bytes_in_flight: MAX_BLOB_BYTES,
-            puts_in_flight: NonZeroUsize::new(9).expect("9"),
-            put_attempts: NonZeroU32::new(5).expect("5"),
-            cpu_threads: NonZeroUsize::new(3).expect("3"),
-        };
-        assert_eq!(set.write_config(), want);
-        let below = (MAX_BLOB_BYTES - 1).to_string();
-        for (flag, value) in [
-            ("--write-bytes-in-flight", below.as_str()),
-            ("--write-puts-in-flight", "0"),
-            ("--store-put-attempts", "0"),
-            ("--store-put-attempts", "6"),
-            ("--write-linger", "1001"),
-        ] {
-            let refused = Args::try_parse_from(["kbf-server", flag, value]);
-            assert!(refused.is_err(), "{flag} {value} was accepted");
-        }
-    }
-
-    /// Catches: a `loopback_only` that knows only wildcards (`is_unspecified`), so one
-    /// interface other machines reach (`192.0.2.10`, a documentation address standing
-    /// in for a LAN or mesh one) counts as loopback; and one that drops `to_canonical`,
-    /// so the IPv4-mapped loopback address does not.
-    #[test]
-    fn only_loopback_addresses_are_loopback_only() {
-        for (ip, want) in [
-            ("127.0.0.1", true),
-            ("::1", true),
-            ("::ffff:127.0.0.1", true),
-            ("0.0.0.0", false),
-            ("::", false),
-            ("192.0.2.10", false),
-        ] {
-            assert_eq!(loopback_only(ip.parse().expect("an address")), want, "{ip}");
-        }
-    }
-
-    /// Catches: a call site in [`Args::plain_text_off_loopback`] that does not go
-    /// through `loopback_only`. One listener is on a single non-loopback interface
-    /// (`192.0.2.10`, which a wildcard-only check such as `is_unspecified` misses) and
-    /// the other on the IPv4-mapped loopback address (`::ffff:127.0.0.1`, which
-    /// `is_loopback` without `to_canonical` misses), each way round, so either
-    /// mistake at either listener changes the list.
-    #[test]
-    fn plain_text_off_loopback_checks_each_listener_through_loopback_only() {
-        for (listen, worker_listen, want) in [
-            ("192.0.2.10:0", "[::ffff:127.0.0.1]:0", vec!["reapi"]),
-            ("[::ffff:127.0.0.1]:0", "192.0.2.10:0", vec!["worker"]),
-        ] {
-            let args = Args::parse_from([
-                "kbf-server",
-                "--listen",
-                listen,
-                "--worker-listen",
-                worker_listen,
-            ]);
-            assert_eq!(
-                args.plain_text_off_loopback(),
-                want,
-                "--listen {listen} --worker-listen {worker_listen}"
-            );
-        }
-    }
-}
+mod tests;
