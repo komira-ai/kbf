@@ -741,3 +741,113 @@ fn root_is_not_refused_a_hot_store_under_a_0700_directory() {
         report.failures
     );
 }
+
+/// Rule `traverse` reads the host, and says so when it cannot: each case below is the
+/// unit of `storage-and-daemon` checked on a host (or with a unit) where one step of the
+/// rule is unreadable. The rule is skipped with its note, or not applied at all, and it
+/// never turns into a failure. Catches a skip that fails the unit, one that hides its
+/// reason, and a check that runs on a unit with no `file://` hot store or no `User=`.
+#[test]
+fn rule_traverse_is_skipped_with_a_note_where_it_cannot_read() {
+    let mode = Mode::StorageAndDaemon;
+    // The 0700 parent, so that a check that did run would fail.
+    let c = LinuxConfig::parse(&EXAMPLE.replace(
+        "KBF_HOT_DIR=/var/lib/kbf/hot",
+        "KBF_HOT_DIR=/var/lib/kbf-server/x/hot",
+    ))
+    .expect("valid settings");
+    let report = |exec: &ScratchHost, edit: &dyn Fn(String) -> String| {
+        let (uid, _) = me();
+        let unit = edit(modes::render(&c, Some(uid + 1), mode).expect("renders"));
+        let slice = render(&c, None, &Templates::BUILT_IN).expect("slice").slice;
+        modes::check_on_host(
+            exec,
+            &c,
+            mode,
+            &UnitText::new(mode.unit_name(), unit),
+            &UnitText::new(SLICE, slice),
+            true,
+            None,
+        )
+        .expect("checks")
+    };
+    let traverse_notes = |r: &crate::linux::Report| -> Vec<String> {
+        r.notes
+            .iter()
+            .filter(|n| n.starts_with("SKIP traverse"))
+            .cloned()
+            .collect()
+    };
+    let none = |r: &crate::linux::Report| r.failures.iter().all(|f| f.rule != "traverse");
+    let (uid, gid) = me();
+    let (exec, world) = host("install-mode-hot-skips");
+    world
+        .borrow_mut()
+        .users
+        .insert("kbf".to_owned(), (uid + 1, gid + 1));
+    fs::set_permissions(exec.at("/"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    let parent = exec.at("/var/lib/kbf-server");
+    fs::create_dir_all(&parent).expect("dirs");
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("chmod");
+    let same = |s: String| s;
+
+    // Control: the same unit does fail, so the cases below skip for their own reason.
+    let r = report(&exec, &same);
+    assert!(!none(&r), "{:?}", r.failures);
+
+    // No `User=` line value: nobody to judge.
+    let r = report(&exec, &|s| s.replace("\nUser=kbf\n", "\nUser=\n"));
+    assert!(none(&r) && traverse_notes(&r).is_empty(), "{r:?}");
+    // A hot store that is not a file:// one is not a directory to walk.
+    let r = report(&exec, &|s| {
+        s.replace("--hot-store=file://", "--hot-store=s3://")
+    });
+    assert!(none(&r) && traverse_notes(&r).is_empty(), "{r:?}");
+    // A file:// path that is not an absolute one is not read either.
+    let r = report(&exec, &|s| {
+        s.replace("--hot-store=file://", "--hot-store=file://rel")
+    });
+    assert!(none(&r) && traverse_notes(&r).is_empty(), "{r:?}");
+    // A unit with no hot store at all.
+    let r = report(&exec, &|s| s.replace("--hot-store=", "--not-a-store="));
+    assert!(none(&r) && traverse_notes(&r).is_empty(), "{r:?}");
+
+    // No such user on this host.
+    world.borrow_mut().users.remove("kbf");
+    let r = report(&exec, &same);
+    assert!(none(&r), "{:?}", r.failures);
+    assert_eq!(
+        traverse_notes(&r),
+        ["SKIP traverse: no user kbf on this host, so the path to --hot-store was not read"]
+    );
+    world
+        .borrow_mut()
+        .users
+        .insert("kbf".to_owned(), (uid + 1, gid + 1));
+
+    // A directory on the way that cannot be read: the path below a regular file.
+    fs::remove_dir(&parent).expect("rmdir");
+    fs::write(&parent, "").expect("file");
+    let r = report(&exec, &same);
+    assert!(none(&r), "{:?}", r.failures);
+    let notes = traverse_notes(&r);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].starts_with("SKIP traverse: "), "{notes:?}");
+    assert!(notes[0].len() > "SKIP traverse: ".len(), "{notes:?}");
+
+    // `getent` that cannot run: the lookup's own error is the note.
+    let mut exec = exec;
+    let inner = std::mem::replace(&mut exec.answer, Box::new(|_| Ok(reply(0, "", ""))));
+    exec.answer = Box::new(move |cmd| {
+        if cmd.program.as_str() == GETENT {
+            Err(std::io::Error::other("getent missing"))
+        } else {
+            inner(cmd)
+        }
+    });
+    let r = report(&exec, &same);
+    assert!(none(&r), "{:?}", r.failures);
+    let notes = traverse_notes(&r);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("getent missing"), "{notes:?}");
+}
