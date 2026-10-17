@@ -384,11 +384,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self.writer.keys.legacy
     }
 
-    /// Where this cache's object keys go.
-    pub fn keys(&self) -> &ObjectKeys {
-        &self.writer.keys
-    }
-
     /// The key of object `id` in the store ([`ObjectKeys::key`]): `<legacy>cas/<epoch>/<seq>`
     /// or `<root>cas/<member>/<boot>/<seq>`, each as 16 lowercase hex digits.
     ///

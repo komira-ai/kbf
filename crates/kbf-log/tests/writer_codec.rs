@@ -158,6 +158,21 @@ fn an_object_id_names_one_writer_or_is_refused() {
             "{name}"
         );
     }
+    let evict = proto::LogCommand {
+        command: Some(proto::log_command::Command::Meta(proto::MetaCommand {
+            command: Some(proto::meta_command::Command::EvictObjects(
+                proto::EvictObjects {
+                    objects: vec![id(0, 7, 2), id(3, 7, 2)],
+                },
+            )),
+        })),
+    }
+    .encode_to_vec();
+    assert_eq!(
+        dec(Format::V4, &evict),
+        Err(DecodeError::Writer("EvictObjects.objects")),
+        "a set with an object of no one writer"
+    );
     for (name, member, boot, field) in [
         ("zero member", 0, 2, "SetWriter.member"),
         ("zero boot", 7, 0, "SetWriter.boot"),

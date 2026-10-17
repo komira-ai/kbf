@@ -245,7 +245,11 @@ async fn a_node_retries_through_failures_and_keeps_its_boot() {
     f.store
         .fail_gets
         .store(3, std::sync::atomic::Ordering::SeqCst);
-    let joiner = tokio::spawn(Joiner::new(channel, who, 5 * MS).run());
+    let mut joiner = Joiner::new(channel, who, 5 * MS);
+    let joiner = tokio::spawn(async move {
+        let joined = joiner.join().await;
+        joiner.keep(joined).await;
+    });
     let first = until("the node to register", || row(&f, 1)).await.version;
     f.store
         .fail_gets

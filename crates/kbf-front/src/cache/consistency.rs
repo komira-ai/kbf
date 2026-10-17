@@ -171,7 +171,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                     report.held.insert(id, held);
                 } else if id.writer().at_or_after(writer) {
                     report.held.insert(id, held);
-                } else if earlier_epoch(id.writer(), writer) {
+                } else if both_epochs(id.writer(), writer) {
+                    // An earlier epoch: a later or equal one is held above.
                     unnamed.push((id, &file.key, held));
                 } else {
                     tracing::debug!(key = %file.key, "start-up pass: another writer's object, kept");
@@ -272,10 +273,13 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     }
 }
 
-/// Whether an object of `of` is an orphan candidate for a cache writing as `current`:
-/// both epoch writers of this log, `of` the earlier. Nothing else is ever deleted.
-fn earlier_epoch(of: ObjectWriter, current: ObjectWriter) -> bool {
-    matches!((of, current), (ObjectWriter::Epoch(e), ObjectWriter::Epoch(c)) if e < c)
+/// Whether an object of `of` can be an orphan for a cache writing as `current`: both
+/// are epoch writers of this log. Nothing of another kind of writer is ever deleted.
+fn both_epochs(of: ObjectWriter, current: ObjectWriter) -> bool {
+    matches!(
+        (of, current),
+        (ObjectWriter::Epoch(_), ObjectWriter::Epoch(_))
+    )
 }
 
 /// Spaces the pass's file opens to a rate, on average over each shard.

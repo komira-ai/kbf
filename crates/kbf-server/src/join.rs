@@ -1,5 +1,5 @@
 //! A storage node's side of registration (`kbf storage --frontend`): register with a
-//! frontend, then heartbeat at the interval it names, registering again when the frontend
+//! frontend ([`Joiner::join`]), then heartbeat at the interval it names ([`Joiner::keep`]), registering again when the frontend
 //! says the row lapsed, and backing off when it cannot be reached
 //! (`docs/design/architecture-v2.md`, section 6). The node never touches the state store.
 
@@ -108,13 +108,6 @@ impl Joiner {
             })
             .await?;
         Ok(answer.into_inner().map_generation)
-    }
-
-    /// Registers and heartbeats for ever. A failed call waits [`backoff`] and tries
-    /// again; a NOT_FOUND heartbeat registers again.
-    pub async fn run(mut self) {
-        let joined = self.join().await;
-        self.keep(joined).await;
     }
 
     /// Registers, retrying after [`backoff`] until the frontend answers: what a storage
