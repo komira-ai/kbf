@@ -772,10 +772,14 @@ mod tests {
     #[tokio::test]
     async fn a_busy_program_is_waited_for() {
         let dir = dir("busy");
-        let marker = dir.join("ran");
         let record = dir.join("lease-1-3");
-        let script = dir.join("busy-script");
-        std::fs::write(&script, format!("#!/bin/sh\ntouch {}\n", marker.display())).expect("write");
+        let script = dir.join("busy-program");
+        // Its interpreter is the act steps' link: run, it echoes its own path.
+        std::fs::write(
+            &script,
+            format!("#!{} echo\n", crate::xcode::tests::act().display()),
+        )
+        .expect("write");
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .expect("chmod");
         let held = std::fs::OpenOptions::new()
@@ -783,11 +787,11 @@ mod tests {
             .open(&script)
             .expect("open");
         let (mut command, gate) = gated(&script, &[]);
+        command.stdout(std::process::Stdio::piped());
         let error = gate
             .spawn(&mut command, &record, KeeperFor::Group)
             .expect_err("busy");
         assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY), "{error}");
-        assert!(!marker.exists());
         let error = gate
             .spawn_unbusy(
                 &mut command,
@@ -811,7 +815,11 @@ mod tests {
         closer.await.expect("closer");
         let out = child.wait_with_output().await.expect("wait");
         assert_eq!(out.status.code(), Some(0), "{out:?}");
-        assert!(marker.exists(), "the program ran");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{}\n", script.display()),
+            "not the program that was busy"
+        );
     }
 
     /// Catches a recorder that writes a record, and lets the program run, for a child
