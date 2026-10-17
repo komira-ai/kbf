@@ -1653,11 +1653,11 @@ mod real {
             "pgrep finds a booted simulator by its UDID"
         );
         let cas = Arc::new(MemoryCas::default());
-        let mut config = config.clone();
+        let mut started = config.clone();
         // A service that stalls answers again after minutes: the tries are apart.
-        config.simulator_retry = Duration::from_secs(15);
+        started.simulator_retry = Duration::from_secs(15);
         let rt =
-            tokio::task::spawn_blocking(move || NativeRuntime::new(config, cas).expect("runtime"))
+            tokio::task::spawn_blocking(move || NativeRuntime::new(started, cas).expect("runtime"))
                 .await
                 .expect("start");
         // The start does not wait for `simctl`: the sweep says when it is done.
