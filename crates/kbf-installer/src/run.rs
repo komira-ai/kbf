@@ -91,7 +91,7 @@ impl Runner for SystemRunner {
             // SAFETY: the closure runs in the child between fork and exec and makes
             // three system calls on numbers copied in; it allocates nothing.
             unsafe {
-                command.pre_exec(move || switch_user(&Libc, user));
+                command.pre_exec(in_child(user));
             }
         }
         let mut child = command.spawn()?;
@@ -171,6 +171,13 @@ pub fn switch_user(creds: &dyn Creds, user: RunAs) -> io::Result<()> {
     creds.set_groups_none()?;
     creds.set_gid(user.gid)?;
     creds.set_uid(user.uid)
+}
+
+/// What the child runs between fork and exec to become `user`: [`switch_user`] on the
+/// real calls. A named function, so that the closure is not part of [`SystemRunner::run`]
+/// (which the coverage run cannot see finish in the child).
+fn in_child(user: RunAs) -> impl FnMut() -> io::Result<()> + Send + Sync + 'static {
+    move || switch_user(&Libc, user)
 }
 
 /// SIGKILL to the process group `pgid` (the child made itself the leader of a group of
