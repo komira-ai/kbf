@@ -202,6 +202,7 @@ async fn build(pki: &Pki, owner: &Node, pushes_map: bool, scratch: &std::path::P
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     };
     let source: Option<Arc<dyn MapSource>> =
         pushes_map.then(|| Arc::new(FakeMapSource::new(map(owner))) as Arc<dyn MapSource>);

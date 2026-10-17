@@ -24,9 +24,12 @@ use kbf_daemon::{
 use kbf_map::{Member, MemberId};
 use kbf_mapsync::MapHolder;
 use kbf_route::Nodes;
+use kbf_storage::service::CatchUp;
 use kbf_storage::{Storage, StorageError};
 use kbf_transfer::{CasError, RoutedCas, TransferConfig, proto_digest};
-use support::farm::{NodeUnderTest, Pki, blob_owned_by, chain_node, digest, front, map_of};
+use support::farm::{
+    NodeUnderTest, Pki, blob_owned_by, chain_node, chain_node_with, digest, front, map_of,
+};
 use support::scratch;
 
 /// The node dialler a daemon half calls other members through, counting its calls by
@@ -119,10 +122,18 @@ fn process(node: NodeUnderTest, id: MemberId, held: Arc<MapHolder>, tls: &TlsFil
 /// A farm of two storage-and-daemon processes, A and B, each holding the two-member map,
 /// and the frontend, which the farm lasts as long as.
 async fn farm(name: &str) -> (Process, Process, Arc<kbf_map::Map>, support::farm::Front) {
+    farm_with(name, CatchUp::caught_up()).await
+}
+
+/// [`farm`] whose node A is judged by `catch_up_a`.
+async fn farm_with(
+    name: &str,
+    catch_up_a: CatchUp,
+) -> (Process, Process, Arc<kbf_map::Map>, support::farm::Front) {
     let dir = scratch(name);
     let pki = Pki::new(&dir);
     let front = front(&pki, &dir);
-    let a = chain_node(&pki, &front, "node-a", &dir.join("a")).await;
+    let a = chain_node_with(&pki, &front, "node-a", &dir.join("a"), catch_up_a).await;
     let b = chain_node(&pki, &front, "node-b", &dir.join("b")).await;
     let (held_a, tls_a) = daemon(&pki, &front, "daemon-a");
     let (held_b, tls_b) = daemon(&pki, &front, "daemon-b");
@@ -345,4 +356,41 @@ async fn a_write_with_the_partner_down_is_answered_and_the_copy_is_owed() {
         "A owes B the copy of this blob, durably, and nothing else"
     );
     assert_eq!(a.cas.get(&stored).await.expect("read back"), bytes);
+}
+
+/// Catches a local arm that answers a miss on a node that is catching up as NOT_FOUND. A's
+/// index is being rebuilt, so A's "not held" is no answer: A's daemon half reads a blob A
+/// is the primary of and nobody holds, through the plane (`read_to` and `get`). B, the
+/// other owner, is caught up and says it does not hold it. The walk must end on A's "could
+/// not say", UNAVAILABLE (retryable), not on a miss ([`CasError::Missing`]), which the
+/// daemon takes to mean the farm does not have the blob. Once A has finished catching up,
+/// the same read is the miss. A's own wire listener is not asked: the read is A's
+/// in-process member, whose miss rule is the one under test.
+///
+/// Mutant: the in-process `read_range` skipping `read_error` (the catch-up rule): the
+/// `read_to` assertion fails with `Missing`. Both reads go through `read_range` at the
+/// plane, so this pins the `read_range` rule only; `read_blob`'s rule is pinned by the
+/// kbf-storage in-process tests, not here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_half_reading_a_miss_on_its_catching_up_node_is_told_unavailable() {
+    let catch_up = CatchUp::rebuilding();
+    let (a, b, map, _front) = farm_with("member-catching-up", catch_up.clone()).await;
+    let absent = digest(&blob_owned_by(&map, a.id, "absent"));
+    let wire = proto_digest(&absent);
+
+    let dir = scratch("member-catching-up-file");
+    let mut file = tokio::fs::File::create(dir.join("blob"))
+        .await
+        .expect("a file");
+    let refused = a.cas.read_to(&wire, &mut file).await.expect_err("a miss");
+    assert!(matches!(refused, CasError::Unavailable(..)), "{refused:?}");
+    assert!(refused.to_string().contains("catching up"), "{refused}");
+    let refused = a.cas.get(&wire).await.expect_err("a miss");
+    assert!(matches!(refused, CasError::Unavailable(..)), "{refused:?}");
+    assert!(refused.to_string().contains("catching up"), "{refused}");
+    assert!(!a.node.holds(&absent).await && !b.node.holds(&absent).await);
+
+    catch_up.finish();
+    let missing = a.cas.get(&wire).await.expect_err("a miss");
+    assert!(matches!(missing, CasError::Missing(..)), "{missing:?}");
 }

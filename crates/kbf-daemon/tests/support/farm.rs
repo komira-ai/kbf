@@ -18,7 +18,9 @@ use kbf_server::storage_node;
 use kbf_storage::Storage;
 use kbf_storage::repair::{NoLedger, Options, Repairs};
 use kbf_storage::replicate::{Chain, ChainConfig, MapSource, Peers};
-use kbf_storage::service::{Admission, Config, InProcess, ROLE_URI_PREFIX, StorageService};
+use kbf_storage::service::{
+    Admission, CatchUp, Config, InProcess, ROLE_URI_PREFIX, StorageService,
+};
 use kbf_store::StdFs;
 use kbf_types::Digest;
 use rcgen::{
@@ -205,6 +207,19 @@ impl MapSource for HeldMap {
 /// yet and a chain's primary needs; the server does not wire a chain yet either, so the
 /// service is built here.
 pub async fn chain_node(pki: &Pki, front: &Front, name: &str, dir: &Path) -> NodeUnderTest {
+    chain_node_with(pki, front, name, dir, CatchUp::caught_up()).await
+}
+
+/// [`chain_node`] whose service is judged by `catch_up`: with [`CatchUp::rebuilding`] the
+/// node is rebuilding its index, and a miss it finds is UNAVAILABLE, by its listener and
+/// in-process alike.
+pub async fn chain_node_with(
+    pki: &Pki,
+    front: &Front,
+    name: &str,
+    dir: &Path,
+    catch_up: CatchUp,
+) -> NodeUnderTest {
     let own = pki.cert(name, "storage", &["localhost"]);
     let argv = [
         "storage".to_owned(),
@@ -258,7 +273,8 @@ pub async fn chain_node(pki: &Pki, front: &Front, name: &str, dir: &Path) -> Nod
             },
         )
         .with_chain(chain)
-        .expect("a certified service"),
+        .expect("a certified service")
+        .with_catch_up(catch_up),
     );
     let incoming = TcpIncoming::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
     let addr = incoming.local_addr().expect("address");
