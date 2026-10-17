@@ -116,30 +116,27 @@ impl Found {
         }
     }
 
-    /// The text added to a failed action's stderr: each refusal of its own, capped,
-    /// and how many were the processes of others; `None` when there is nothing to say.
+    /// The text added to a failed action's stderr: each refusal of its own, capped, and
+    /// how many were other processes'; `None` when none of its own was seen (the
+    /// others', which on a busy node are other leases' mostly, stay in the node's log).
     #[must_use]
     pub fn note(&self) -> Option<String> {
-        if self.mine.is_empty() && self.other.is_empty() {
+        if self.mine.is_empty() {
             return None;
         }
-        let mut note = String::from("\nkbf: ");
-        if self.mine.is_empty() {
-            note.push_str("no macOS sandbox denial was seen for this action's processes");
-        } else {
-            let _ = writeln!(
-                note,
-                "the macOS sandbox denied this action {} operation(s); it may write only \
-                 inside its lease directory and /dev (plus the few names its tools use in \
-                 the user's temporary folder):",
-                self.mine.len()
-            );
-            for d in self.mine.iter().take(MAX_LINES) {
-                let _ = writeln!(note, "kbf:   {}", shown(d));
-            }
-            if self.mine.len() > MAX_LINES {
-                let _ = writeln!(note, "kbf:   ... and {} more", self.mine.len() - MAX_LINES);
-            }
+        let mut note = String::new();
+        let _ = writeln!(
+            note,
+            "\nkbf: the macOS sandbox denied this action {} operation(s); it may write only \
+             inside its lease directory and /dev (plus the few names its tools use in \
+             the user's temporary folder):",
+            self.mine.len()
+        );
+        for d in self.mine.iter().take(MAX_LINES) {
+            let _ = writeln!(note, "kbf:   {}", shown(d));
+        }
+        if self.mine.len() > MAX_LINES {
+            let _ = writeln!(note, "kbf:   ... and {} more", self.mine.len() - MAX_LINES);
         }
         if !self.other.is_empty() {
             let _ = writeln!(
@@ -150,15 +147,8 @@ impl Found {
             );
         }
         if note.len() > MAX_NOTE_BYTES {
-            let mut end = MAX_NOTE_BYTES;
-            while !note.is_char_boundary(end) {
-                end -= 1;
-            }
-            note.truncate(end);
+            note.truncate(note.floor_char_boundary(MAX_NOTE_BYTES));
             note.push_str("...\n");
-        }
-        if !note.ends_with('\n') {
-            note.push('\n');
         }
         Some(note)
     }
@@ -296,6 +286,12 @@ mod tests {
             parse_line("Sandbox: touch(1) denied file-write-create /x"),
             None
         );
+        // Parentheses that never close, or never name a pid.
+        assert_eq!(
+            parse_line("Sandbox: touch(12 deny(1) file-write-create /x"),
+            None
+        );
+        assert_eq!(parse_line("Sandbox: touch deny file-write-create /x"), None);
         let bare = parse_line("Sandbox: touch(1) deny file-read-data /x").expect("denial");
         assert_eq!(bare.operation, "file-read-data");
         let none = parse_line("Sandbox: touch(1) deny(1)").expect("denial");
@@ -322,17 +318,17 @@ mod tests {
         );
         assert!(!note.contains("999"), "{note}");
         assert!(note.contains("1 more denial(s)"), "{note}");
+        assert!(note.ends_with('\n'), "{note:?}");
     }
 
-    /// Catches a note for a log with no denials, and a note that hides that only others'
-    /// were seen.
+    /// Catches a note for a log with no denials of the action's own: stderr of a
+    /// failure that was no sandbox's (a test failing, a compile error) stays the action's.
     #[test]
-    fn nothing_seen_is_no_note_and_only_others_are_counted() {
+    fn nothing_of_the_actions_own_is_no_note() {
         assert_eq!(Found::default().note(), None);
         let found = Found::of(LINE, &BTreeSet::new());
-        let note = found.note().expect("a note");
-        assert!(note.contains("no macOS sandbox denial was seen"), "{note}");
-        assert!(!note.contains("/work/x/y"), "{note}");
+        assert_eq!(found.note(), None);
+        assert_eq!(found.other_lines().len(), 1);
     }
 
     /// Catches an unbounded note: many denials, one with a huge target.

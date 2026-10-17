@@ -31,6 +31,24 @@ fn log_with_two(file: &Path, _: Duration) -> io::Result<String> {
     ))
 }
 
+/// A reader that panics.
+fn log_panics(_: &Path, _: Duration) -> io::Result<String> {
+    panic!("the reader panics");
+}
+
+/// A reader that makes stderr read-only and then reports a refusal of the action.
+fn log_locks_stderr(file: &Path, last: Duration) -> io::Result<String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let stderr = file.with_file_name("stderr");
+    std::fs::set_permissions(&stderr, std::fs::Permissions::from_mode(0o444))?;
+    log_with_two(file, last)
+}
+
+/// Only a process of another lease was refused.
+fn log_others_only(_: &Path, _: Duration) -> io::Result<String> {
+    Ok("x Sandbox: touch(1) deny(1) file-write-create /elsewhere/theirs\n".to_owned())
+}
+
 fn log_down(_: &Path, _: Duration) -> io::Result<String> {
     READS.fetch_add(1, Ordering::SeqCst);
     Err(io::Error::other("log is down"))
@@ -92,6 +110,15 @@ async fn a_failed_action_gets_its_own_denials_in_its_stderr() {
     assert_eq!(result.exit_code, 4);
     assert_eq!(stderr(&cas, &result), "own\n");
 
+    // A failure with no refusal of its own keeps its stderr as it was: nothing says a
+    // sandbox failed it, and another lease's paths are not this lease's to show.
+    let (mut config, cas) = sandboxed("denials-others");
+    config.denial_log = log_others_only;
+    let rt = runtime(config, &cas);
+    let spec = Spec::act("echo --stderr own failure ; exit 3");
+    let result = run(&rt, &cas, 1, &spec).await.expect("ran");
+    assert_eq!(stderr(&cas, &result), "own failure\n");
+
     // A note that would push stderr past the stdio limit is left out: the limit
     // would drop the action's own stderr with it.
     let (mut config, cas) = sandboxed("denials-limit");
@@ -102,6 +129,24 @@ async fn a_failed_action_gets_its_own_denials_in_its_stderr() {
     let result = run(&rt, &cas, 1, &spec).await.expect("ran");
     assert_eq!(result.exit_code, 3);
     assert_eq!(stderr(&cas, &result), "own failure\n");
+
+    // A reader that panics, and a stderr that cannot be appended to, leave the result
+    // as the action made it.
+    for (name, reader) in [
+        (
+            "denials-panic",
+            log_panics as kbf_driver_native::denials::LogReader,
+        ),
+        ("denials-locked", log_locks_stderr),
+    ] {
+        let (mut config, cas) = sandboxed(name);
+        config.denial_log = reader;
+        let rt = runtime(config, &cas);
+        let spec = Spec::act("pgid ; echo --stderr own failure ; exit 3");
+        let result = run(&rt, &cas, 1, &spec).await.expect("ran");
+        assert_eq!(result.exit_code, 3, "{name}");
+        assert_eq!(stderr(&cas, &result), "own failure\n", "{name}");
+    }
 
     // Without a sandbox there is nothing to read.
     let dir = scratch("denials-none");

@@ -550,11 +550,14 @@ impl<C: Cas> NativeRuntime<C> {
             return;
         }
         let (read, file) = (self.config.denial_log, dir.join("sandbox-log"));
-        let log = tokio::task::spawn_blocking(move || read(&file, ran)).await;
-        let log = match log.map_err(std::io::Error::other).and_then(|log| log) {
-            Ok(log) => log,
-            Err(why) => {
+        let log = match tokio::task::spawn_blocking(move || read(&file, ran)).await {
+            Ok(Ok(log)) => log,
+            Ok(Err(why)) => {
                 tracing::warn!(%lease, %why, "the sandbox's denials could not be read");
+                return;
+            }
+            Err(why) => {
+                tracing::warn!(%lease, %why, "the read of the sandbox's denials did not finish");
                 return;
             }
         };
