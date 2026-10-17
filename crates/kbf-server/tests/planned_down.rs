@@ -27,12 +27,14 @@ use kbf_server::front_maps::FrontMaps;
 use kbf_server::members::{
     Members, MembershipConfig, MembershipError, PROTOCOL, Progress, Registrant,
 };
-use kbf_server::storage_health::Reported;
+use kbf_server::storage_health::{NotIdle, Planned, Reported};
 use kbf_state::Store;
 use kbf_storage::{Answer, PutStream, ReadStream, Storage, StorageError};
 use kbf_types::Digest;
 
 const SECOND: Duration = Duration::from_secs(1);
+/// How long the plans of these tests last: longer than any of them runs.
+const PLAN: Duration = Duration::from_secs(900);
 
 fn config() -> MembershipConfig {
     MembershipConfig {
@@ -236,7 +238,7 @@ async fn a_write_during_a_planned_restart_goes_to_the_other_owner() {
 
     let farm = Farm::new();
     let (router, nodes, blob) = router_over(&farm, farm.ids[0]);
-    farm.members.plan_down(farm.ids[0]).expect("planned");
+    farm.members.plan_down(farm.ids[0], PLAN).expect("planned");
     let digest = kbf_segments::sha256(&blob);
     assert_eq!(router.put(blob.clone()).await.expect("b takes it"), digest);
     assert!(
@@ -264,7 +266,7 @@ fn planning_down_is_down_in_the_map_survives_heartbeats_and_is_shown() {
         .expect("read")
         .expect("map")
         .generation();
-    let map = farm.members.plan_down(a).expect("planned");
+    let map = farm.members.plan_down(a, PLAN).expect("planned");
     assert_eq!(map.generation(), before + 1);
     assert_eq!(map.member(a).map(|m| m.state), Some(MemberState::Down));
     assert_eq!(map.member(b).map(|m| m.state), Some(MemberState::Active));
@@ -293,8 +295,8 @@ fn planning_down_is_down_in_the_map_survives_heartbeats_and_is_shown() {
 }
 
 // Catches: a restart planned for a member that cannot return to where it was (a joiner or a
-// rebuilding member would be made Active by the undo), one planned twice, and one planned for
-// a member nobody registered.
+// rebuilding member would be made Active by the undo), and one planned for a member nobody
+// registered.
 #[test]
 fn only_an_active_member_can_be_planned_down() {
     let farm = Farm::new();
@@ -305,23 +307,18 @@ fn only_an_active_member_can_be_planned_down() {
         MemberState::Draining,
     ] {
         farm.members.set_state(a, state).expect("set");
-        let refused = farm.members.plan_down(a).expect_err("not active");
+        let refused = farm.members.plan_down(a, PLAN).expect_err("not active");
         assert!(
             matches!(refused, MembershipError::NotActive { id, state: s } if id == a && s == state),
             "{state:?}: {refused:?}"
         );
         assert!(!farm.members.planned_down(a).expect("read"));
     }
-    farm.members.plan_down(b).expect("planned");
-    let again = farm.members.plan_down(b).expect_err("twice");
-    assert!(matches!(
-        again,
-        MembershipError::NotActive {
-            state: MemberState::Down,
-            ..
-        }
-    ));
-    let stranger = farm.members.plan_down(MemberId(9)).expect_err("nobody");
+    farm.members.plan_down(b, PLAN).expect("planned");
+    let stranger = farm
+        .members
+        .plan_down(MemberId(9), PLAN)
+        .expect_err("nobody");
     assert!(matches!(
         stranger,
         MembershipError::NotRegistered(MemberId(9))
@@ -335,7 +332,7 @@ fn only_an_active_member_can_be_planned_down() {
 fn a_planned_restart_survives_a_frontend_restart() {
     let farm = Farm::new();
     let a = farm.ids[0];
-    farm.members.plan_down(a).expect("planned");
+    farm.members.plan_down(a, PLAN).expect("planned");
 
     let restarted = Members::new(Arc::clone(&farm.store) as Arc<dyn Store>, config());
     let map = restarted.current_map().expect("read").expect("map");
@@ -361,7 +358,7 @@ fn a_planned_restart_survives_a_frontend_restart() {
 fn a_planned_member_that_stops_keeps_its_slot_for_the_dwell() {
     let farm = Farm::new();
     let a = farm.ids[0];
-    farm.members.plan_down(a).expect("planned");
+    farm.members.plan_down(a, PLAN).expect("planned");
     // b keeps beating every 20 s; a has stopped.
     let pass = |seconds: u64| {
         for _ in 0..seconds / 20 {
@@ -398,7 +395,7 @@ fn a_planned_member_that_stops_keeps_its_slot_for_the_dwell() {
 fn the_member_returns_by_registering_or_by_an_undo() {
     let farm = Farm::new();
     let [a, b] = farm.ids;
-    let planned = farm.members.plan_down(a).expect("planned");
+    let planned = farm.members.plan_down(a, PLAN).expect("planned");
 
     let again = farm
         .members
@@ -415,7 +412,7 @@ fn the_member_returns_by_registering_or_by_an_undo() {
         "cleared on rejoin"
     );
 
-    farm.members.plan_down(b).expect("planned");
+    farm.members.plan_down(b, PLAN).expect("planned");
     let rebuilding = Registrant {
         progress: Progress::CatchingUp,
         ..registrant(2)
@@ -433,7 +430,7 @@ fn the_member_returns_by_registering_or_by_an_undo() {
     assert!(beat > back.map.generation());
     assert_eq!(farm.state(b), Some(MemberState::Active));
 
-    farm.members.plan_down(a).expect("planned again");
+    farm.members.plan_down(a, PLAN).expect("planned again");
     let undone = farm
         .members
         .set_state(a, MemberState::Active)
@@ -443,4 +440,92 @@ fn the_member_returns_by_registering_or_by_an_undo() {
         !farm.members.planned_down(a).expect("read"),
         "the mark goes with the undo"
     );
+}
+
+// Catches: a controller that dies leaving a healthy node out of service for ever. A plan
+// lasts `for_`; the member keeps beating, and its first beat after that returns it to Active
+// in a new generation, the mark gone, and `node_idle` says the plan ran out before that. Before
+// that time a beat changes nothing. Mutants: the expiry not checked on a beat; checked
+// against the wrong clock (it returns at once).
+#[test]
+fn a_planned_restart_ends_by_the_next_beat_after_its_time() {
+    let farm = Farm::new();
+    let [a, _] = farm.ids;
+    let planned = farm
+        .members
+        .plan_down(a, Duration::from_secs(100))
+        .expect("planned");
+    let quiet = |which: usize| {
+        farm.members
+            .heartbeat(
+                farm.ids[which],
+                farm.boots[which],
+                Progress::CaughtUp,
+                Reported::debts(kbf_server::storage_health::Debts::Known(0))
+                    .with_writes(kbf_server::storage_health::Writes::Known(0), 0),
+            )
+            .expect("beats")
+    };
+    for _ in 0..4 {
+        farm.store.clock.advance(SECOND * 20);
+        quiet(0);
+        quiet(1);
+    }
+    assert_eq!(farm.state(a), Some(MemberState::Down), "80 s of 100");
+    assert!(farm.members.planned_down(a).expect("read"));
+    assert_eq!(quiet(0), planned.generation());
+
+    farm.store.clock.advance(SECOND * 20);
+    quiet(1);
+    assert!(!farm.members.planned_down(a).expect("read"), "run out");
+    assert_eq!(
+        farm.members.node_idle(a, 0),
+        Err(NotIdle::PlannedDownExpired { member: a }),
+        "still Down in the map until the node's beat"
+    );
+    let back = quiet(0);
+    assert!(back > planned.generation(), "a new generation");
+    assert_eq!(farm.state(a), Some(MemberState::Active));
+    assert!(
+        farm.store.fake.get("down/1").expect("read").is_none(),
+        "the mark is gone"
+    );
+    assert_eq!(farm.members.planned(a).expect("read"), Planned::No);
+}
+
+// Catches: a second controller (or a retry) refused with an error, or a repeat that bumps the
+// map: asking again for a member already planned down is the same plan with its end moved
+// to a whole `for_` from now, in the same generation. The plan that would have ended is
+// still running after the repeat. Mutant: the repeat leaves the old end.
+#[test]
+fn planning_down_again_moves_the_end_and_changes_no_generation() {
+    let farm = Farm::new();
+    let [a, _] = farm.ids;
+    let first = farm
+        .members
+        .plan_down(a, Duration::from_secs(60))
+        .expect("planned");
+    farm.store.clock.advance(SECOND * 20);
+    farm.beat(0);
+    farm.beat(1);
+    let again = farm
+        .members
+        .plan_down(a, Duration::from_secs(60))
+        .expect("the same plan again");
+    assert_eq!(again.generation(), first.generation());
+    assert_eq!(farm.state(a), Some(MemberState::Down));
+    for _ in 0..2 {
+        farm.store.clock.advance(SECOND * 20);
+        farm.beat(0);
+        farm.beat(1);
+    }
+    assert_eq!(
+        farm.state(a),
+        Some(MemberState::Down),
+        "60 s: the first plan would have ended here, the repeated one ends at 80 s"
+    );
+    farm.store.clock.advance(SECOND * 25);
+    farm.beat(1);
+    farm.beat(0);
+    assert_eq!(farm.state(a), Some(MemberState::Active), "85 s: past it");
 }

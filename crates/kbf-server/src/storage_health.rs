@@ -167,6 +167,31 @@ pub struct Report {
     pub at: StoreTime,
 }
 
+/// An operator's planned restart of a member ([`Members::plan_down`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Planned {
+    /// None: the member is not down by plan.
+    No,
+    /// The member is beating and out of the write path until this time on the store's
+    /// clock; its first heartbeat after that returns it to `Active`.
+    Until(StoreTime),
+    /// The member stopped (its row expired) and its slot is held for the dwell by the
+    /// plan's mark.
+    Stopped,
+}
+
+impl Planned {
+    /// Whether the plan holds at `now`: the member is out of the write path by plan.
+    #[must_use]
+    pub fn in_force(self, now: StoreTime) -> bool {
+        match self {
+            Self::No => false,
+            Self::Until(until) => now < until,
+            Self::Stopped => true,
+        }
+    }
+}
+
 /// One registered member as [`storage_health`] judges it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemberReport {
@@ -175,8 +200,8 @@ pub struct MemberReport {
     /// Its state in the map.
     pub state: MemberState,
     /// Whether it is `Down` because an operator planned a restart
-    /// ([`Members::plan_down`]); false in every other case.
-    pub planned_down: bool,
+    /// ([`Members::plan_down`]).
+    pub planned: Planned,
     /// Its newest report; `None` before its first heartbeat and after its row expired.
     pub report: Option<Report>,
 }
@@ -314,7 +339,7 @@ fn node_health(member: &MemberReport, now: StoreTime, freshness: Duration) -> No
     NodeHealth {
         id: member.id,
         state: member.state,
-        planned_down: member.planned_down,
+        planned_down: member.planned.in_force(now),
         repair_debts: said.and_then(|said| match said.debts {
             Debts::Known(debts) => Some(debts),
             Debts::Unknown => None,
@@ -374,6 +399,13 @@ pub enum NotIdle {
         member: MemberId,
         /// Its state.
         state: MemberState,
+    },
+    /// The node's planned restart ran out before it was stopped: it is beating, so it
+    /// returns to `Active` at its next heartbeat and is a node in service again.
+    #[error("member {}'s planned restart ran out; it returns to active at its next beat", .member.0)]
+    PlannedDownExpired {
+        /// The node.
+        member: MemberId,
     },
     /// The node has not reported within the freshness window.
     #[error("member {} silent", .member.0)]
@@ -439,6 +471,7 @@ impl NotIdle {
             | Self::DebtsUnknown { .. }
             | Self::OtherMemberDebtsUnknown { .. }
             | Self::NodeStale { .. }
+            | Self::PlannedDownExpired { .. }
             | Self::ReportOlderThan { .. } => Class::Wait,
             Self::UnknownNode { .. }
             | Self::NoOtherMembers
@@ -490,8 +523,11 @@ pub fn node_idle(
             .map(|&member| NotIdle::OtherMemberDebtsUnknown { member }),
     );
     // A node taken out of the write path for its restart is the one that is stopped.
-    let out = me.state == MemberState::Down && me.planned_down;
-    if me.state != MemberState::Active && !out {
+    let out = me.state == MemberState::Down && me.planned.in_force(now);
+    let ran_out = me.state == MemberState::Down && matches!(me.planned, Planned::Until(_)) && !out;
+    if ran_out {
+        reasons.push(NotIdle::PlannedDownExpired { member: node });
+    } else if me.state != MemberState::Active && !out {
         reasons.push(NotIdle::NodeNotActive {
             member: node,
             state: me.state,

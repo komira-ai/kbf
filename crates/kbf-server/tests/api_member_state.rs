@@ -300,8 +300,24 @@ async fn an_operator_plans_a_restart_and_undoes_it() {
     );
     assert!(other.planned_down(id).expect("read"));
 
-    let (code, body) = post(server.api, "/v1/members/1", OPERATOR, planned).await;
-    assert_eq!(code, 409, "already out of the write path: {body}");
+    let (code, repeated) = post(server.api, "/v1/members/1", OPERATOR, planned).await;
+    assert_eq!(code, 200, "the same plan again is idempotent: {repeated}");
+    assert_eq!(
+        map_of(&other).generation(),
+        map.generation(),
+        "no new generation"
+    );
+    assert_eq!(repeated, body, "the same answer");
+
+    for (extra, want) in [
+        (r#"{"state":"planned_down","for_secs":0}"#, 400),
+        (r#"{"state":"planned_down","for_secs":86401}"#, 400),
+        (r#"{"state":"active","for_secs":60}"#, 400),
+        (r#"{"state":"planned_down","for_secs":60}"#, 200),
+    ] {
+        let (code, text) = post(server.api, "/v1/members/1", OPERATOR, extra).await;
+        assert_eq!(code, want, "{extra}: {text}");
+    }
 
     let (code, body) = post(
         server.api,

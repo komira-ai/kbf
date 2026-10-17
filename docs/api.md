@@ -147,7 +147,8 @@ message yet: the daemon is not told, and the server simply sends it no new `Star
 ## `POST /v1/members/{id}`
 
 An operator sets a storage member's state. The body is `{"state": "active"}`,
-`{"state": "draining"}` or `{"state": "planned_down"}`; the answer is
+`{"state": "draining"}` or `{"state": "planned_down"}` (which may add `"for_secs": N`, 1 to
+86400, default 900); the answer is
 `{"id": N, "state": "...", "generation": G}`, the map's generation after the change.
 `down` is the store's verdict, `catching_up` is what a registration says and `joining` is
 the join handoff's, so none of them is accepted (`400`, as is
@@ -169,11 +170,15 @@ map (one new generation, in the answer) has the member `down`, so every router, 
 primary and repair worker that holds the map sends writes to the other owner and reads
 the member's blobs from it, and a node or daemon that holds an older map reads it like
 any `down` member (the wire has no new state). The member keeps serving what reaches it
-and keeps heartbeating until it stops; a heartbeat does not undo this. The `down/<id>`
+and keeps heartbeating until it stops; a heartbeat does not undo this, until `for_secs` has
+passed: the first heartbeat after that returns it to `active` (a controller that died, or a
+restart that never came, does not strand a healthy node out of service). The `down/<id>`
 mark that keeps its slot for the dwell (the same time as for a member that fails) is
 written in the same transaction, with a value that says an operator planned it:
 [`GET /v1/storage`](#get-v1storage) shows `"state": "down", "planned_down": true` for it.
-It is undone by `{"state": "active"}` (a restart that did not happen), or by the member
+Asking again for a member already planned down is the same plan with its end moved to
+`for_secs` from now: `200`, the same answer, no new generation. It is undone by
+`{"state": "active"}` (a restart that did not happen), or by the member
 registering again after the restart: `active` if its index is whole, `catching_up` while
 it rebuilds, the mark deleted. If it never returns, it leaves the map at the end of the
 dwell counted from this call, as any `down` member does. It survives a restart of the
