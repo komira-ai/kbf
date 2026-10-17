@@ -1,10 +1,16 @@
-//! Test fixtures shared by the modules' tests: a runner that plays the programs, binary
-//! headers and tarballs.
+//! Test fixtures shared by the modules' tests: a runner that plays the programs, a
+//! trusted host, tarballs and inboxes.
 
 use std::cell::RefCell;
 use std::io;
 use std::path::PathBuf;
 
+use kbf_host::exec::Entry;
+use kbf_host::path::HostPath;
+use kbf_host::step::{Owner, Perms};
+use kbf_host::testkit::FakeExec;
+
+use crate::layout;
 use crate::run::{Ran, RunAs, Runner, Spawn};
 
 pub const COMMIT: &str = "0f4a3825305cc79733ef098eae9725948eb5d6db";
@@ -55,6 +61,38 @@ pub fn version_json(commit: &str, profile: &str) -> String {
          \"state_schema\":7,\"version\":\"0.1.0\"}}\n",
         &commit[..12]
     )
+}
+
+/// The paths of the trust list and every directory above them, as a bootstrap leaves
+/// them: root's, 0755 (files 0755 and 0644).
+pub fn trusted_host() -> FakeExec {
+    let mut exec = FakeExec::new(0);
+    let root = Owner { uid: 0, gid: 0 };
+    for dir in [
+        "/usr",
+        "/usr/local",
+        "/usr/local/libexec",
+        layout::INSTALLER_DIR,
+    ] {
+        exec.entries.insert(
+            HostPath::new(dir).expect("a path"),
+            Entry::Dir {
+                perms: Perms::new(0o755),
+                owner: root,
+            },
+        );
+    }
+    for (file, mode) in [(layout::GH, 0o755), (layout::TRUSTED_ROOT, 0o644)] {
+        exec.entries.insert(
+            HostPath::new(file).expect("a path"),
+            Entry::File {
+                perms: Perms::new(mode),
+                owner: root,
+                bytes: Vec::new(),
+            },
+        );
+    }
+    exec
 }
 
 /// The test's own ids: what a stage's unprivileged user is when the test runs as no one
