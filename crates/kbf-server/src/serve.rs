@@ -613,11 +613,16 @@ where
         Arc::clone(&cache),
         InvocationReaders::from_policy(&policy),
     );
-    let api_routes = crate::api::router(Arc::clone(&farm), token, Arc::clone(&drain))
-        .merge(health_routes)
-        .merge(crate::metrics::router(Arc::clone(&cache), local))
-        .merge(blob_routes)
-        .merge(page_routes);
+    let api_routes = crate::api::router(
+        Arc::clone(&farm),
+        token,
+        Arc::clone(&drain),
+        members.clone(),
+    )
+    .merge(health_routes)
+    .merge(crate::metrics::router(Arc::clone(&cache), local))
+    .merge(blob_routes)
+    .merge(page_routes);
     // Logged at every start, the first one too (issue #156).
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     log_state(durable, term, epoch);
