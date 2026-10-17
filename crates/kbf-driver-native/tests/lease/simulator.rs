@@ -30,6 +30,8 @@ const OTHER: &str = "1A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
 const STUCK: &str = "2A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
 /// A device of the shared set no lease made.
 const SHARED: &str = "3A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
+/// The device of a lease a killed daemon left.
+const STUCK_LEFT: &str = "5A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
 /// Another lease's device.
 const NEIGHBOUR: &str = "4A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
 
@@ -194,6 +196,7 @@ fn lease_calls(seq: u64, also: &[&str]) -> Vec<String> {
 fn fake_config(dir: &Path, extra: &str) -> (NativeConfig, PathBuf) {
     let mut config = config(dir);
     config.isolation = Isolation::None;
+    config.simulator_retry = Duration::from_millis(20);
     config.xcrun = fake_xcrun(dir, extra);
     let xcrun = config.xcrun.clone();
     (config, xcrun)
@@ -320,6 +323,14 @@ async fn wait_for(path: &Path) {
         }
     });
     waited.await.expect("it appears");
+}
+
+/// Waits until the start's background sweep of `rt` has ended, by its own signal.
+fn swept(rt: &kbf_driver_native::NativeRuntime<MemoryCas>) {
+    assert!(
+        rt.wait_for_simulator_sweep(PROMPT * 3),
+        "the start's simulator sweep ends"
+    );
 }
 
 /// Catches a run the daemon drops (its future dropped mid-action) leaving its
@@ -934,7 +945,8 @@ async fn the_start_sweep_deletes_the_simulators_a_killed_daemon_left() {
     left("lease-7-8", true);
     left("lease-7-9", false);
     let cas = Arc::new(MemoryCas::default());
-    let _rt = runtime(config.clone(), &cas);
+    let rt = runtime(config.clone(), &cas);
+    swept(&rt);
     // The stuck device cannot be deleted, so every attempt asks again from the list.
     let attempt = [
         "list devices -j".to_owned(),
@@ -962,7 +974,8 @@ async fn the_start_sweep_deletes_the_simulators_a_killed_daemon_left() {
     // The next start sweeps on the owed file alone, and finds nothing left.
     new_log(&xcrun);
     list(&xcrun, &[("iPhone 16", SHARED)]);
-    let _rt = runtime(config.clone(), &cas);
+    let rt = runtime(config.clone(), &cas);
+    swept(&rt);
     assert_eq!(calls(&xcrun), ["list devices -j".to_owned()]);
     assert!(no_leases(&config), "a clean sweep owes nothing");
 
@@ -972,13 +985,15 @@ async fn the_start_sweep_deletes_the_simulators_a_killed_daemon_left() {
     std::fs::create_dir_all(&lease).expect("left");
     std::os::unix::fs::symlink(dir.join("bin").join("devices.json"), lease.join(MARKER))
         .expect("link");
-    let _rt = runtime(config.clone(), &cas);
+    let rt = runtime(config.clone(), &cas);
+    swept(&rt);
     assert_eq!(calls(&xcrun), [""; 0], "no marker, no sweep");
     assert!(no_leases(&config));
 
     left("lease-8-2", true);
     list(&xcrun, &[("kbf-lease-8-2", UDID)]);
-    let _rt = runtime(config.clone(), &cas);
+    let rt = runtime(config.clone(), &cas);
+    swept(&rt);
     assert_eq!(
         calls(&xcrun),
         [
@@ -992,7 +1007,8 @@ async fn the_start_sweep_deletes_the_simulators_a_killed_daemon_left() {
     left("lease-9-9", true);
     let mut unlisted = config.clone();
     unlisted.xcrun = dir.join("no-xcrun");
-    let _rt = runtime(unlisted, &cas);
+    let rt = runtime(unlisted, &cas);
+    swept(&rt);
     assert!(
         !config.scratch.join("lease-9-9").exists(),
         "a list that cannot be read does not stop the start"
@@ -1031,43 +1047,101 @@ fn stalled_listing(dir: &Path, once: bool) -> String {
     )
 }
 
-/// Catches (issue #717, a native-macos run): the start sweep asked `simctl list
-/// devices -j` once, the stalled CoreSimulatorService did not answer within the cap,
-/// the sweep logged it and moved on, and the booted device a killed daemon left stayed
-/// booted. The fake's first listing stalls and the second answers: the same start
-/// deletes the device. Mutant planted: one attempt (`SWEEP_ATTEMPTS` 1; red: the
-/// device is not deleted).
+/// A rule for the fake `xcrun`: `simctl list devices -j` does not answer until the
+/// test makes `gate` (it gives up, and fails, after 25 s).
+fn gated_listing(dir: &Path, gate: &Path) -> String {
+    let list = dir.join("bin").join("devices.json");
+    format!(
+        "simctl list devices -j\t-\twait-for {} 25 ; cat {}\n",
+        gate.display(),
+        list.display()
+    )
+}
+
+/// Catches (issue #717, a native-macos run): the start asking `simctl` itself. The
+/// stalled CoreSimulatorService answers nothing for minutes, so a start that sweeps
+/// the left simulators before it returns is held for as long, and a start that gives
+/// up after one cap-long try leaves the booted device booted for good. The fake's
+/// listing does not answer (and the cap is 30 s) until the test lets it: `new` must
+/// return at once, with the sweep still waiting and the owed file in place; then the
+/// device is deleted, the owed file removed, and the sweep reports it is done.
+/// Mutants planted: the sweep run inside `new` (red: `new` takes the 30 s cap and the
+/// "returns at once" assertion fails); the owed file removed before the sweep ends
+/// (red: the file is gone while the listing waits).
 #[tokio::test]
-async fn the_start_sweep_asks_again_when_the_listing_does_not_answer() {
+async fn the_start_returns_while_the_left_simulators_are_swept_in_the_background() {
+    let dir = scratch("sim-sweep-bg");
+    let gate = dir.join("gate");
+    let (mut config, xcrun) = stalled_start(&dir, &gated_listing(&dir, &gate));
+    config.simulator_answer = Duration::from_secs(30);
+    let cas = Arc::new(MemoryCas::default());
+    let started = std::time::Instant::now();
+    let rt = runtime(config.clone(), &cas);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the start returned after {:?}, not waiting for the listing",
+        started.elapsed()
+    );
+    assert!(
+        !rt.wait_for_simulator_sweep(Duration::from_millis(100)),
+        "the sweep is still waiting for the listing"
+    );
+    assert!(config.scratch.join(PENDING).is_file(), "the sweep is owed");
+    assert!(
+        !config.scratch.join("lease-5-5").exists(),
+        "the left lease directory is removed"
+    );
+    std::fs::write(&gate, b"").expect("gate");
+    swept(&rt);
+    assert_eq!(
+        calls(&xcrun),
+        [
+            "list devices -j".to_owned(),
+            format!("shutdown {UDID}"),
+            format!("delete {UDID}")
+        ]
+    );
+    assert!(
+        no_leases(&config),
+        "the owed file and the sweep directory go"
+    );
+}
+
+/// Catches (issue #717): the first listing of the start not answering within the cap
+/// leaving the left device alone for good. The fake's first listing stalls past the
+/// cap and the next answers: the background sweep asks again and deletes the device,
+/// and removes the owed file. Mutant planted: one attempt (`SWEEP_ATTEMPTS` 1; red:
+/// the device is not deleted and the owed file stays).
+#[tokio::test]
+async fn a_listing_that_stalls_past_the_cap_is_asked_again_by_the_background_sweep() {
     let dir = scratch("sim-sweep-stall");
     let (config, xcrun) = stalled_start(&dir, &stalled_listing(&dir, true));
     let cas = Arc::new(MemoryCas::default());
-    let _rt = runtime(config.clone(), &cas);
+    let rt = runtime(config.clone(), &cas);
+    swept(&rt);
     let calls = calls(&xcrun);
     assert!(
         calls.contains(&format!("delete {UDID}")),
         "the left device is deleted: {calls:?}"
     );
-    assert!(
-        !config.scratch.join(PENDING).exists(),
-        "a sweep that ended clean leaves no request for another"
-    );
-    assert!(no_leases(&config));
+    assert!(no_leases(&config), "and nothing is owed");
 }
 
 /// Catches: a sweep that never gets an answer losing the device for good once its
-/// lease directory (the only record of it) is removed. Every listing of the first
-/// start stalls; the start still ends and removes the lease directory but leaves the
-/// pending file; the next start, with no lease directory left, sweeps on that file
-/// alone, deletes the device and removes the file; a third asks nothing. Mutants
-/// planted: the pending file not written (red: the second start asks nothing); not
-/// removed after a clean sweep (red: the third start asks).
+/// lease directory (the only other record of it) is removed. Every listing of the
+/// first start stalls; the start still returns and removes the lease directory, the
+/// sweep ends out of tries and keeps the owed file; the next start, with no lease
+/// directory left, sweeps on that file alone, deletes the device and removes the file;
+/// a third asks nothing. Mutants planted: the owed file not written (red: the second
+/// start asks nothing); dropped when the listing failed (the same); not removed after
+/// a clean sweep (red: the third start asks).
 #[tokio::test]
 async fn a_start_sweep_that_never_gets_an_answer_is_tried_again_at_the_next_start() {
     let dir = scratch("sim-sweep-pending");
     let (config, xcrun) = stalled_start(&dir, &stalled_listing(&dir, false));
     let cas = Arc::new(MemoryCas::default());
-    let _rt = runtime(config.clone(), &cas);
+    let rt = runtime(config.clone(), &cas);
+    swept(&rt);
     let first = calls(&xcrun);
     assert_eq!(first.len(), SWEEP_ATTEMPTS as usize, "{first:?}");
     assert!(first.iter().all(|c| c == "list devices -j"), "{first:?}");
@@ -1076,13 +1150,15 @@ async fn a_start_sweep_that_never_gets_an_answer_is_tried_again_at_the_next_star
         !config.scratch.join("lease-5-5").exists(),
         "the left lease directory is removed"
     );
+    drop(rt);
 
     // The service answers now.
     std::fs::remove_file(&xcrun).expect("old link");
     fake_xcrun(&dir, "");
     list(&xcrun, &[("kbf-lease-5-5", UDID)]);
     new_log(&xcrun);
-    let _rt = runtime(config.clone(), &cas);
+    let rt = runtime(config.clone(), &cas);
+    swept(&rt);
     assert_eq!(
         calls(&xcrun),
         [
@@ -1095,8 +1171,70 @@ async fn a_start_sweep_that_never_gets_an_answer_is_tried_again_at_the_next_star
     assert!(no_leases(&config), "and owes nothing");
 
     new_log(&xcrun);
-    let _rt = runtime(config.clone(), &cas);
+    let rt = runtime(config.clone(), &cas);
+    swept(&rt);
     assert_eq!(calls(&xcrun), [""; 0], "a third start asks nothing");
+}
+
+/// Catches: the background sweep deleting the simulator of a lease that runs while it
+/// does (every device of the daemon's leases starts `kbf-lease-`, and the fake's
+/// listing, held until the test lets it, names the running lease's too). A lease
+/// that asks for a simulator is made while the sweep waits for its listing; the sweep
+/// then deletes the left device and not the lease's, which is deleted by the lease's
+/// own end. Mutant planted: no live names kept (red: `delete {UDID}` twice).
+#[tokio::test]
+async fn the_background_sweep_leaves_the_simulator_of_a_running_lease() {
+    let dir = scratch("sim-sweep-live");
+    let gate = dir.join("gate");
+    let (config, xcrun) = stalled_start(&dir, &gated_listing(&dir, &gate));
+    list(
+        &xcrun,
+        &[("kbf-lease-5-5", STUCK_LEFT), ("kbf-lease-1-1", UDID)],
+    );
+    let cas = Arc::new(MemoryCas::default());
+    let rt = Arc::new(runtime(config.clone(), &cas));
+    let go = dir.join("go");
+    let action = asks(
+        Spec::act(&format!("wait-for {} 20", go.display())),
+        DEVICE_TYPE,
+    )
+    .store(&cas);
+    let running = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        async move { rt.run(crate::support::work(1, action, 0)).await }
+    });
+    // The lease's device exists, and its action runs, before the sweep's listing.
+    let created = format!("create kbf-lease-1-1 {DEVICE_TYPE} {RUNTIME}");
+    let log = xcrun.clone();
+    tokio::time::timeout(PROMPT, async {
+        while !calls(&log).contains(&created) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the lease makes its simulator");
+    std::fs::write(&gate, b"").expect("gate");
+    swept(&rt);
+    let at_sweep = calls(&xcrun);
+    assert!(
+        at_sweep.contains(&format!("delete {STUCK_LEFT}")),
+        "the left device is deleted: {at_sweep:?}"
+    );
+    assert!(
+        !at_sweep.contains(&format!("delete {UDID}")),
+        "the running lease's device is not: {at_sweep:?}"
+    );
+    std::fs::write(&go, b"").expect("go");
+    let result = running.await.expect("task").expect("ran");
+    assert_eq!(result.exit_code, 0);
+    let all = calls(&xcrun);
+    assert_eq!(
+        all.iter()
+            .filter(|c| **c == format!("delete {UDID}"))
+            .count(),
+        1,
+        "the lease's own end deletes it: {all:?}"
+    );
 }
 
 /// The tests that make real simulators.
@@ -1467,12 +1605,22 @@ mod real {
             "pgrep finds a booted simulator by its UDID"
         );
         let cas = Arc::new(MemoryCas::default());
-        let _rt = tokio::task::spawn_blocking({
-            let config = config.clone();
-            move || NativeRuntime::new(config, cas).expect("runtime")
+        let mut config = config.clone();
+        // A service that stalls answers again after minutes: the tries are apart.
+        config.simulator_retry = Duration::from_secs(15);
+        let rt =
+            tokio::task::spawn_blocking(move || NativeRuntime::new(config, cas).expect("runtime"))
+                .await
+                .expect("start");
+        // The start does not wait for `simctl`: the sweep says when it is done.
+        // A guard against a hang, not a wait for the device.
+        let (_rt, done) = tokio::task::spawn_blocking(move || {
+            let done = rt.wait_for_simulator_sweep(Duration::from_secs(1500));
+            (rt, done)
         })
         .await
-        .expect("start");
+        .expect("wait");
+        assert!(done, "the start's sweep ended");
         assert!(!running(&udid), "the left device is shut down");
         assert!(
             !xcrun(&["simctl", "list", "devices", "-j"]).contains(&udid),

@@ -73,6 +73,9 @@ pub struct NativeConfig {
     /// How long each `simctl` command a lease or the start sweep runs has to exit
     /// ([`crate::simulator::ANSWER_WITHIN`]).
     pub simulator_answer: Duration,
+    /// How long the background sweep of the simulators a killed daemon left waits after
+    /// a try that failed ([`crate::simulator::RETRY_AFTER`]).
+    pub simulator_retry: Duration,
     /// How the network is kept off.
     pub isolation: Isolation,
     /// The Xcodes an action may name when the runtime starts, by build (`16C5032a`),
@@ -123,6 +126,7 @@ impl NativeConfig {
             kill_wait: Duration::from_secs(5),
             simulator_listing: Listing::DEFAULT,
             simulator_answer: crate::simulator::ANSWER_WITHIN,
+            simulator_retry: crate::simulator::RETRY_AFTER,
             isolation: Isolation::detect(),
             xcodes: BTreeMap::new(),
             user_folders: UserFolders::detect(),
