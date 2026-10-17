@@ -73,7 +73,7 @@ use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::{Checks, MapProbe, Readiness, StateProbe, StorageProbe};
 use crate::serve::{
     AbortOnDrop, ServeError, bind, bind_api, drain_and_stop, flow_control, keepalive, log_state,
-    members_of, membership, serve_api, stop_api, sweeping, worker_peers,
+    map_of, members_of, membership, serve_api, stop_api, sweeping, worker_peers,
 };
 use crate::start::{Escalation, escalating, interruptions};
 use crate::worker::WorkerService;
@@ -373,6 +373,7 @@ fn bind_frontend(
         args.members(),
     );
     let members = members_of(state.as_ref());
+    let map = map_of(None, members.as_ref())?;
     let readiness = Arc::new(Readiness::default());
     let timeout = listeners.store_probe_timeout;
     let storage = Arc::new(RemoteStorage::new(channel.clone(), 0));
@@ -422,14 +423,17 @@ fn bind_frontend(
         keepalive(flow_control(Server::builder()), listeners.streams),
         listeners.worker_tls,
     )?;
-    let worker_service = WorkerServer::new(WorkerService::new(
+    let sessions = WorkerService::new(
         Arc::clone(&farm),
         peers,
         listeners.heartbeat_interval,
         listeners.hello_wait,
-    ))
-    .max_decoding_message_size(MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    );
+    // Daemons are sent the members' map: Welcome.map and a MapUpdate at each bump.
+    let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
+    let worker_service = WorkerServer::new(sessions)
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES);
 
     let membership = membership(members.clone(), peers_certified);
     let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);

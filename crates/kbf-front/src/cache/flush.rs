@@ -109,13 +109,19 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             let _ = staging.tier.sealed(object);
             round.sealed.push(object);
         }
-        let (tier, waiting) = (staging.id, staging.waiting(now));
+        let (tier, waiting, gate) = (staging.id, staging.waiting(now), self.gate.clone());
         let due = self
             .writer
             .query(move |s| {
                 let ours = |o: &StagedObject| (o.tier(), o.state()) == (tier, StagedState::Sealed);
                 let sealed = s.staged_objects().filter(|(_, o)| ours(o));
                 let sealed = sealed.filter(|(object, _)| !waiting.contains(object));
+                // One flusher: an object none of whose digests this node flushes waits.
+                let flushes = |o: &StagedObject| {
+                    gate.as_ref()
+                        .is_none_or(|g| o.blobs().any(|(d, _)| g.flushes(d)))
+                };
+                let sealed = sealed.filter(|(_, o)| flushes(o));
                 let due = sealed.take(FLUSHES_PER_ROUND).map(|(object, o)| {
                     let blobs: Vec<(Digest, u64)> = o.blobs().map(|(d, at)| (*d, at)).collect();
                     (object, o.committed_len(), blobs)

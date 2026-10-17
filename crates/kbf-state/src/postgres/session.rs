@@ -3,7 +3,7 @@
 //! Every session is checked when it connects: the server must make a commit durable
 //! before it acknowledges it (`synchronous_commit` on), or the store refuses to run.
 
-use std::ops::{Deref, DerefMut};
+use std::ops::{Bound, Deref, DerefMut};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 use postgres::{Client, Config, NoTls, Statement};
@@ -27,6 +27,10 @@ pub(super) struct Statements {
     pub get: Statement,
     /// `$1` prefix, `$2` clock override: `key, value, version, expires_us`, in key order.
     pub scan: Statement,
+    /// C8, one statement per [`RangeShape`] at [`RangeShape::index`]: `$1` clock override,
+    /// `$2` limit, `$3` the lower key, `$4` the upper key when that side is bounded: `key,
+    /// value, version, expires_us` of the live keys in the span, in the shape's direction.
+    pub ranges: Vec<Statement>,
     /// `$1` clock override: the store's time.
     pub now: Statement,
     /// The commit head, read without a lock.
@@ -69,6 +73,10 @@ impl Statements {
                  ORDER BY key LIMIT $3 FOR UPDATE{tail}"
             )
         };
+        let ranges = RangeShape::ALL
+            .iter()
+            .map(|shape| client.prepare(&shape.sql(&now_sql(1))))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Statements {
             get: client.prepare(&format!(
                 "SELECT value, version, expires_us FROM kv WHERE key = $1 \
@@ -79,6 +87,7 @@ impl Statements {
                  WHERE key >= $1 AND starts_with(key, $1) \
                  AND (expires_us IS NULL OR expires_us > {now}) ORDER BY key"
             ))?,
+            ranges,
             now: client.prepare(&format!("SELECT {}", now_sql(1)))?,
             head_read: client.prepare("SELECT rev FROM head")?,
             head_lock: client.prepare("SELECT rev FROM head FOR UPDATE")?,
@@ -110,6 +119,90 @@ impl Statements {
             claim: client.prepare(&claim(" SKIP LOCKED"))?,
             claim_waiting: client.prepare(&claim(""))?,
         })
+    }
+}
+
+/// How the upper side of a C8 span is bounded. (The lower side is always a key, so it
+/// is only included or excluded: [`RangeShape::lower_included`].)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Edge {
+    Included,
+    Excluded,
+    Open,
+}
+
+impl Edge {
+    const ALL: [Edge; 3] = [Edge::Included, Edge::Excluded, Edge::Open];
+
+    pub(super) fn of<T>(bound: &Bound<T>) -> Edge {
+        match bound {
+            Bound::Included(_) => Edge::Included,
+            Bound::Excluded(_) => Edge::Excluded,
+            Bound::Unbounded => Edge::Open,
+        }
+    }
+}
+
+/// The shape of a C8 statement: whether the span's lower key is included, how its upper
+/// side is bounded, and which way the scan walks. Each shape has its own prepared
+/// statement, so the planner sees plain range conditions on the primary key and walks
+/// its index from the right end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RangeShape {
+    pub lower_included: bool,
+    pub upper: Edge,
+    pub reverse: bool,
+}
+
+impl RangeShape {
+    const ALL: [RangeShape; 12] = {
+        let mut all = [RangeShape {
+            lower_included: true,
+            upper: Edge::Open,
+            reverse: false,
+        }; 12];
+        let mut i = 0;
+        while i < 12 {
+            all[i] = RangeShape {
+                lower_included: i / 6 == 0,
+                upper: Edge::ALL[i / 2 % 3],
+                reverse: i % 2 == 1,
+            };
+            i += 1;
+        }
+        all
+    };
+
+    /// Where this shape's statement sits in [`Statements::ranges`]: the inverse of the
+    /// order of [`RangeShape::ALL`].
+    pub(super) fn index(self) -> usize {
+        let upper = match self.upper {
+            Edge::Included => 0,
+            Edge::Excluded => 1,
+            Edge::Open => 2,
+        };
+        usize::from(!self.lower_included) * 6 + upper * 2 + usize::from(self.reverse)
+    }
+
+    fn sql(self, now: &str) -> String {
+        let lower = if self.lower_included { ">=" } else { ">" };
+        let mut conditions = vec![
+            format!("(expires_us IS NULL OR expires_us > {now})"),
+            format!("key {lower} $3"),
+        ];
+        let upper = match self.upper {
+            Edge::Included => Some("<="),
+            Edge::Excluded => Some("<"),
+            Edge::Open => None,
+        };
+        if let Some(op) = upper {
+            conditions.push(format!("key {op} $4"));
+        }
+        let order = if self.reverse { "DESC" } else { "ASC" };
+        format!(
+            "SELECT key, value, version, expires_us FROM kv WHERE {} ORDER BY key {order} LIMIT $2",
+            conditions.join(" AND ")
+        )
     }
 }
 
@@ -285,6 +378,21 @@ impl Drop for Pooled<'_> {
     fn drop(&mut self) {
         if let Some(session) = self.session.take() {
             self.pool.give_back(session);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RangeShape;
+
+    // Catches an index that does not invert the order of the prepared statements, which
+    // would run a scan on another shape's statement (wrong bounds or direction), and a
+    // repeated shape that would leave one shape with no statement.
+    #[test]
+    fn each_shape_indexes_its_own_statement() {
+        for (place, shape) in RangeShape::ALL.iter().enumerate() {
+            assert_eq!(shape.index(), place, "{shape:?}");
         }
     }
 }
