@@ -129,7 +129,8 @@ way: a file the daemon reads by a flag, the service manager's own environment wi
   `--lease-placement` when `KBF_RESERVE_CPUS` and `KBF_LEASE_PLACEMENT` are set). `--server`
   and `--cas` dial the frontend by `KBF_FRONTEND_NAME`, not the node's own
   `KBF_HOST_NAME` (below); no key.
-- **`all-in-one`**: below; no key (its cold store is a directory).
+- **`all-in-one`**: below; no key (its cold store is a directory); its `--api-token-file` is
+  `KBF_API_TOKEN_FILE` too.
 - **`storage-and-daemon`**: the storage unit's flags (`--cold-store`, with
   `KBF_S3_PREFIX` as its path, `--meta-dir`, `--hot-store`, `--storage-listen`
   `<KBF_LISTEN_ADDRESS>:<KBF_STORAGE_PORT>` and the three certificate flags; no `--cas`:
@@ -146,7 +147,11 @@ way: a file the daemon reads by a flag, the service manager's own environment wi
   file names are settings; default `reapi.pem` and `reapi.key` under `KBF_ETC`);
   `--worker-listen=<KBF_LISTEN_ADDRESS>:<KBF_WORKER_PORT>` with `worker.pem`,
   `worker.key` and `--worker-client-ca=ca.pem`; `--api-listen=127.0.0.1:<KBF_API_PORT>`
-  (no token flag: writes to the operator API are refused until one is given);
+  `--api-token-file=<KBF_API_TOKEN_FILE>` (default `api-token` under `KBF_ETC`; the
+  path only, never the token: without it every write to the operator API, `POST
+  /v1/frontend/drain` included, answers 401). The operator puts that file there;
+  `install-units` never makes it, and refuses a missing one, one the server user does
+  not own, or one with a group or other bit (mode 0600 or 0400);
   `--storage=<KBF_STORAGE_URL>` (required, `https://`) with the frontend's worker
   certificate as its client identity (`--storage-client-cert`, `--storage-client-key`)
   and `--storage-ca=ca.pem`; and `--state-store=sqlite://<KBF_STATE_DIR>/state.db`

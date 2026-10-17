@@ -47,12 +47,8 @@ impl ContentAddressableStorage for StorageService {
             .collect::<Result<Vec<_>, _>>()?;
         let catching_up = self.catching_up();
         let missing = self.storage.find_missing(&digests).await?;
-        if catching_up && !missing.is_empty() {
-            return Err(catch_up::unavailable(&format!(
-                "{} of the {} digests asked",
-                missing.len(),
-                digests.len()
-            )));
+        if let Some(status) = catch_up::missing_gap(catching_up, missing.len(), digests.len()) {
+            return Err(status);
         }
         Ok(Response::new(FindMissingBlobsResponse {
             missing_blob_digests: missing.iter().map(wire::to_proto).collect(),

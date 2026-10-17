@@ -1333,6 +1333,7 @@ dependencies = [
  "kbf-front",
  "kbf-meta",
  "kbf-node",
+ "kbf-objstore",
  "kbf-proto",
  "kbf-segments",
  "kbf-server",
@@ -1480,6 +1481,7 @@ dependencies = [
  "kbf-segments",
  "kbf-server",
  "kbf-storage",
+ "kbf-store",
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
@@ -1493,6 +1495,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "tracing-core",
  "tracing-subscriber",
 ]
 
@@ -1507,9 +1510,11 @@ dependencies = [
  "httparse",
  "kbf-host",
  "kbf-mdm",
+ "kbf-state",
  "kbf-types",
  "plist",
  "rcgen",
+ "rusqlite",
  "rustix",
  "rustls",
  "rustls-native-certs",
@@ -1519,6 +1524,7 @@ dependencies = [
  "ssh-key",
  "tar",
  "thiserror",
+ "time",
  "x509-parser",
  "zip",
 ]
@@ -1854,6 +1860,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac 0.13.0",
+ "kbf-objstore",
  "kbf-segments",
  "kbf-threads",
  "kbf-types",
@@ -1863,6 +1870,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2039,6 +2047,7 @@ dependencies = [
 name = "kbf-state"
 version = "0.1.0"
 dependencies = [
+ "kbf-state",
  "postgres",
  "rusqlite",
  "rustix",

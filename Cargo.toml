@@ -215,3 +215,15 @@ xtask = { path = "crates/xtask" }
 [workspace.lints.clippy]
 disallowed_methods = "allow"
 disallowed_types = "allow"
+
+# Dev and test builds: a test binary with full debug info is ~0.5 GB and a target
+# directory holds thousands of them, plus incremental state. Line tables keep panic
+# backtraces and profilers at file:line; variable-level debug info is the part dropped.
+# `test` inherits `dev`; it is spelled out so the two cannot drift. Release is untouched.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false

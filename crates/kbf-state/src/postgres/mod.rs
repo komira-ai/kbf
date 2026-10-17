@@ -28,6 +28,7 @@
 //! client does not speak TLS, so an `sslmode=require` URL is refused instead of
 //! downgraded; calls block, so an async caller uses a blocking task.
 
+#[cfg(any(test, feature = "test-support"))]
 mod backend;
 mod session;
 mod tx;
@@ -42,6 +43,7 @@ use postgres::config::SslMode;
 use postgres::error::SqlState;
 use postgres::types::ToSql;
 
+#[cfg(any(test, feature = "test-support"))]
 pub use backend::PostgresBackend;
 use session::{Edge, Pool, RangeShape, Session};
 use tx::{Level, Row, Tx, micros};

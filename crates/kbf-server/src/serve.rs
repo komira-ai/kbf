@@ -12,9 +12,8 @@ use futures::StreamExt as _;
 use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
-    ByteStreamService, CONNECTION_WINDOW_BYTES, Cache, CasService, Connections,
-    MAX_CONCURRENT_STREAMS, MAX_MESSAGE_BYTES, MetaLog, RECORDER_CHANNEL, Recorder,
-    RequestMetadataLayer, STREAM_WINDOW_BYTES, SegmentsConfig, SegmentsService,
+    ByteStreamService, Cache, CasService, Connections, MAX_MESSAGE_BYTES, MetaLog,
+    RECORDER_CHANNEL, Recorder, RequestMetadataLayer, SegmentsConfig, SegmentsService,
 };
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
@@ -41,6 +40,7 @@ use crate::identity::{DenyList, Peers};
 use crate::members::{Members, MembershipError};
 use crate::members_rpc::MembershipService;
 use crate::state_store::StateStore;
+use crate::streams::{StreamLimits, flow_windows};
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
 use crate::worker_roles::WorkerRolesLayer;
@@ -99,6 +99,9 @@ pub struct Listeners {
     /// The worker listener's segment uploads (`--segment-upload-*`;
     /// `docs/design/write-path.md`, section 4).
     pub segments: SegmentsConfig,
+    /// The most HTTP/2 streams one connection may have open on each listener
+    /// (`--reapi-max-streams`, `--worker-max-streams`).
+    pub stream_limits: StreamLimits,
 }
 
 /// What keeps a long-lived stream from looking idle to a load balancer, a proxy or the
@@ -311,15 +314,18 @@ pub(crate) fn tracked(
     })
 }
 
-/// `server` with the HTTP/2 limits both listeners state rather than leave to the
-/// transport's defaults: they bound what is held outside `--write-bytes-in-flight`, and
-/// the connection window is what lets a Write admitted after others finish at all
-/// (`kbf_front::CONNECTION_WINDOW_BYTES`).
-pub(crate) fn flow_control(server: Server) -> Server {
+/// `server` with the HTTP/2 limits a listener states rather than leaves to the
+/// transport's defaults: at most `max_streams` open streams per connection (each
+/// listener its own, [`StreamLimits`]), and the stream and connection windows
+/// ([`flow_windows`]), which bound what is held outside `--write-bytes-in-flight`. The
+/// connection window holds every stream's window at once, which is what lets a Write
+/// admitted after others finish at all.
+pub(crate) fn flow_control(server: Server, max_streams: u32) -> Server {
+    let windows = flow_windows(max_streams);
     server
-        .max_concurrent_streams(Some(MAX_CONCURRENT_STREAMS))
-        .initial_stream_window_size(Some(STREAM_WINDOW_BYTES))
-        .initial_connection_window_size(Some(CONNECTION_WINDOW_BYTES))
+        .max_concurrent_streams(Some(windows.streams))
+        .initial_stream_window_size(Some(windows.stream))
+        .initial_connection_window_size(Some(windows.connection))
 }
 
 /// `server` pinging a quiet connection every `timing.keepalive_interval` and closing it
@@ -627,7 +633,10 @@ where
     let (worker_incoming, worker) = bind(listeners.worker)?;
     let peers_certified = listeners.worker_tls.is_some();
     let (mut worker_server, peers, worker_tls) = worker_peers(
-        keepalive(flow_control(Server::builder()), listeners.streams),
+        keepalive(
+            flow_control(Server::builder(), listeners.stream_limits.worker),
+            listeners.streams,
+        ),
         listeners.worker_tls,
     );
     let tls_sources: Vec<TlsSource> = listeners
@@ -657,20 +666,28 @@ where
         Arc::clone(&cache),
         InvocationReaders::from_policy(&policy),
     );
-    let api_routes = crate::api::router(Arc::clone(&farm), token, Arc::clone(&drain))
-        .merge(health_routes)
-        .merge(crate::metrics::router(
-            Arc::clone(&cache),
-            local,
-            tls_sources,
-        ))
-        .merge(blob_routes)
-        .merge(page_routes);
+    let api_routes = crate::api::router(
+        Arc::clone(&farm),
+        token,
+        Arc::clone(&drain),
+        members.clone(),
+    )
+    .merge(health_routes)
+    .merge(crate::metrics::router(
+        Arc::clone(&cache),
+        local,
+        tls_sources,
+    ))
+    .merge(blob_routes)
+    .merge(page_routes);
     // Logged at every start, the first one too (issue #156).
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     log_state(durable, term, epoch);
 
-    let mut reapi_server = keepalive(flow_control(Server::builder()), listeners.streams);
+    let mut reapi_server = keepalive(
+        flow_control(Server::builder(), listeners.stream_limits.reapi),
+        listeners.streams,
+    );
     let worker_blobs = ByteStreamServer::new(WorkerBlobs::new(
         ByteStreamService::new(Arc::clone(&cache)),
         peers.clone(),
@@ -894,16 +911,45 @@ pub fn bind_storage_gated(
     maps: Option<Arc<kbf_mapsync::MapHolder>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
+    bind_storage_shared(storage, listener, maps, shutdown).map(|(bound, _)| bound)
+}
+
+/// [`bind_storage_gated`], and the [`kbf_storage::service::InProcess`] view of the very
+/// service the listener serves: a caller in this process (the daemon half of
+/// `kbf storage-and-daemon`) reaches the node through it and takes the path a call over
+/// the listener takes, not the inner storage.
+///
+/// # Errors
+/// As [`bind_storage`].
+pub fn bind_storage_shared(
+    storage: Arc<dyn kbf_storage::Storage>,
+    listener: StorageListener,
+    maps: Option<Arc<kbf_mapsync::MapHolder>>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<
+    (
+        BoundStorage<impl Future<Output = Result<(), ServeError>>>,
+        kbf_storage::service::InProcess,
+    ),
+    ServeError,
+> {
     let (incoming, addr) = bind(listener.listen)?;
-    let server = flow_control(Server::builder());
+    let server = flow_control(
+        Server::builder(),
+        crate::streams::StreamLimits::DEFAULT.worker,
+    );
     let admission = if listener.tls.is_some() {
         kbf_storage::service::Admission::Certified
     } else {
         kbf_storage::service::Admission::Open
     };
     let incoming = Incoming::new(incoming, listener.tls);
-    let routes =
-        kbf_storage::service::StorageService::new(storage, admission, listener.service).routes();
+    let service = Arc::new(kbf_storage::service::StorageService::new(
+        storage,
+        admission,
+        listener.service,
+    ));
+    let (routes, in_process) = (service.shared_routes(), service.in_process());
     let gate = tonic::service::InterceptorLayer::new(map_gate(maps));
     let serving = async move {
         server
@@ -913,5 +959,5 @@ pub fn bind_storage_gated(
             .await
             .map_err(ServeError::from)
     };
-    Ok(BoundStorage { addr, serving })
+    Ok((BoundStorage { addr, serving }, in_process))
 }
