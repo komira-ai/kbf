@@ -12,7 +12,9 @@ use std::time::Duration;
 use hooked::Hooked;
 use kbf_map::{Map, MapError, MemberId, MemberState};
 use kbf_proto::kbf::map::v1 as pb;
-use kbf_server::members::{Members, MembershipConfig, MembershipError, PROTOCOL, Registrant};
+use kbf_server::members::{
+    Members, MembershipConfig, MembershipError, PROTOCOL, Progress, Registrant,
+};
 use kbf_state::{Cond, Store, Txn};
 use kbf_types::{Digest, DigestFunction};
 use prost::Message as _;
@@ -45,6 +47,7 @@ fn node(i: u32) -> Registrant {
         zone: String::new(),
         weight: 1,
         protocol: PROTOCOL,
+        progress: Progress::CaughtUp,
     }
 }
 
@@ -115,7 +118,8 @@ fn a_member_goes_down_after_the_ttl_and_leaves_after_the_dwell() {
     let g = map.generation();
 
     s.clock.advance(20 * SECOND);
-    m.heartbeat(a.id, a.boot).expect("a beats");
+    m.heartbeat(a.id, a.boot, Progress::CaughtUp)
+        .expect("a beats");
     s.clock.advance(9 * SECOND);
     let early = m.refresh().expect("refresh").expect("a map");
     assert_eq!(
@@ -126,7 +130,8 @@ fn a_member_goes_down_after_the_ttl_and_leaves_after_the_dwell() {
     assert_eq!(early.generation(), g, "nothing changed, nothing bumped");
 
     s.clock.advance(3 * SECOND);
-    m.heartbeat(a.id, a.boot).expect("a beats");
+    m.heartbeat(a.id, a.boot, Progress::CaughtUp)
+        .expect("a beats");
     let down = m.refresh().expect("refresh").expect("a map");
     assert_eq!(state(&down, b.id), Some(MemberState::Down));
     assert_eq!(state(&down, a.id), Some(MemberState::Active));
@@ -134,7 +139,8 @@ fn a_member_goes_down_after_the_ttl_and_leaves_after_the_dwell() {
 
     for _ in 0..10 {
         s.clock.advance(10 * SECOND);
-        m.heartbeat(a.id, a.boot).expect("a beats");
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp)
+            .expect("a beats");
     }
     let within = m.refresh().expect("refresh").expect("a map");
     assert_eq!(
@@ -146,7 +152,8 @@ fn a_member_goes_down_after_the_ttl_and_leaves_after_the_dwell() {
 
     for _ in 0..3 {
         s.clock.advance(10 * SECOND);
-        m.heartbeat(a.id, a.boot).expect("a beats");
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp)
+            .expect("a beats");
     }
     let gone = m.refresh().expect("refresh").expect("a map");
     assert_eq!(state(&gone, b.id), None, "130 s: the dwell is over");
@@ -168,8 +175,10 @@ fn heartbeats_keep_a_member_alive_and_set_state_does_not() {
     let g = m.current_map().expect("read").expect("map").generation();
     for round in 1..=6 {
         s.clock.advance(20 * SECOND);
-        m.heartbeat(a.id, a.boot).expect("a beats");
-        m.heartbeat(b.id, b.boot).expect("b beats");
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp)
+            .expect("a beats");
+        m.heartbeat(b.id, b.boot, Progress::CaughtUp)
+            .expect("b beats");
         let map = m.refresh().expect("refresh").expect("map");
         assert_eq!(
             state(&map, a.id),
@@ -238,7 +247,8 @@ fn a_racing_refresh_gives_one_winner_and_one_retry() {
     m.set_state(a.id, MemberState::Active).expect("a");
     m.set_state(d.id, MemberState::Active).expect("d");
     s.clock.advance(40 * SECOND);
-    m.heartbeat(a.id, a.boot).expect("a beats");
+    m.heartbeat(a.id, a.boot, Progress::CaughtUp)
+        .expect("a beats");
     s.clock.advance(25 * SECOND);
     let down = m.refresh().expect("refresh").expect("map");
     assert_eq!(state(&down, d.id), Some(MemberState::Down));
@@ -313,7 +323,7 @@ fn removing_a_member_remaps_only_its_blobs() {
         for _ in 0..secs / 10 {
             s.clock.advance(10 * SECOND);
             for r in survivors {
-                m.heartbeat(r.id, r.boot).expect("beat");
+                m.heartbeat(r.id, r.boot, Progress::CaughtUp).expect("beat");
             }
         }
     };
@@ -386,6 +396,101 @@ fn a_joining_node_is_read_last_until_it_is_active() {
     );
 }
 
+fn rebuilding(i: u32) -> Registrant {
+    Registrant {
+        progress: Progress::CatchingUp,
+        ..node(i)
+    }
+}
+
+/// Catches: a report of "done" that changes a state other than CatchingUp, and one of
+/// "still rebuilding" that demotes. A member reporting done stays Draining, Joining (the
+/// join handoff promotes it, not its own report) and Active; one reporting it is
+/// rebuilding stays Active; a CatchingUp member whose row expired is Down, and its report
+/// is NOT_REGISTERED and leaves it Down. No such beat bumps the generation. Mutants: the
+/// promotion without the CatchingUp condition (Draining and Joining become Active); the
+/// report written as the state (Active demoted to CatchingUp).
+#[test]
+fn a_report_cannot_change_a_member_that_is_not_catching_up() {
+    let s = Hooked::new();
+    let m = members(&s, config(30, 120));
+    let draining = m.register(&rebuilding(1)).expect("draining");
+    let joining = m.register(&node(2)).expect("joining");
+    let active = m.register(&node(3)).expect("active");
+    let down = m.register(&rebuilding(4)).expect("down");
+    m.set_state(draining.id, MemberState::Draining)
+        .expect("drain");
+    let map = m.set_state(active.id, MemberState::Active).expect("active");
+    assert_eq!(state(&map, down.id), Some(MemberState::CatchingUp));
+
+    let g = map.generation();
+    for (who, progress) in [
+        (&draining, Progress::CaughtUp),
+        (&joining, Progress::CaughtUp),
+        (&active, Progress::CaughtUp),
+        (&active, Progress::CatchingUp),
+    ] {
+        assert_eq!(m.heartbeat(who.id, who.boot, progress).expect("beat"), g);
+    }
+    let map = m.current_map().expect("read").expect("map");
+    assert_eq!(state(&map, draining.id), Some(MemberState::Draining));
+    assert_eq!(state(&map, joining.id), Some(MemberState::Joining));
+    assert_eq!(state(&map, active.id), Some(MemberState::Active));
+
+    s.clock.advance(20 * SECOND);
+    for who in [&draining, &joining, &active] {
+        m.heartbeat(who.id, who.boot, Progress::CatchingUp)
+            .expect("beat");
+    }
+    s.clock.advance(11 * SECOND);
+    let map = m.refresh().expect("refresh").expect("map");
+    assert_eq!(state(&map, down.id), Some(MemberState::Down));
+    assert!(matches!(
+        m.heartbeat(down.id, down.boot, Progress::CaughtUp),
+        Err(MembershipError::NotRegistered(id)) if id == down.id
+    ));
+    let after = m.current_map().expect("read").expect("map");
+    assert_eq!(state(&after, down.id), Some(MemberState::Down));
+    assert_eq!(after.generation(), map.generation());
+}
+
+/// Catches: a promotion on a report that overwrites a state set after the member
+/// registered: a CatchingUp member an administrator sets Draining stays Draining when it
+/// reports done. (The promotion is decided in the heartbeat's own compare-and-set on the
+/// row, so a state written between registration and report is what it sees.) And the
+/// rebuilding member that does report done is Active, in one new generation.
+#[test]
+fn a_report_of_done_promotes_only_a_catching_up_member() {
+    let s = Hooked::new();
+    let m = members(&s, config(30, 120));
+    let a = m.register(&rebuilding(1)).expect("a");
+    let b = m.register(&rebuilding(2)).expect("b");
+    let map = m.set_state(b.id, MemberState::Draining).expect("drain b");
+    assert_eq!(state(&map, a.id), Some(MemberState::CatchingUp));
+    let g = map.generation();
+    assert_eq!(
+        m.heartbeat(a.id, a.boot, Progress::CatchingUp)
+            .expect("beat"),
+        g
+    );
+    assert_eq!(
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp).expect("beat"),
+        g + 1
+    );
+    assert_eq!(
+        m.heartbeat(b.id, b.boot, Progress::CaughtUp).expect("beat"),
+        g + 1
+    );
+    let map = m.current_map().expect("read").expect("map");
+    assert_eq!(state(&map, a.id), Some(MemberState::Active));
+    assert_eq!(state(&map, b.id), Some(MemberState::Draining));
+    assert_eq!(
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp).expect("beat"),
+        g + 1,
+        "a second report changes nothing"
+    );
+}
+
 /// Catches: a malformed registration or an old protocol that is accepted, a promotion
 /// that works on a member with no row, a state a hand cannot set, a heartbeat from an
 /// older boot that is allowed to keep a newer registration's row alive, and a
@@ -415,16 +520,16 @@ fn bad_calls_are_refused_by_name() {
     let a = m.register(&node(1)).expect("a");
     let b = m.register(&node(1)).expect("a again");
     assert!(matches!(
-        m.heartbeat(a.id, a.boot),
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp),
         Err(MembershipError::Superseded {
             boot: 1,
             current: 2,
             ..
         })
     ));
-    assert!(m.heartbeat(b.id, b.boot).is_ok());
+    assert!(m.heartbeat(b.id, b.boot, Progress::CaughtUp).is_ok());
     assert!(matches!(
-        m.heartbeat(MemberId(99), 1),
+        m.heartbeat(MemberId(99), 1, Progress::CaughtUp),
         Err(MembershipError::NotRegistered(MemberId(99)))
     ));
     assert!(matches!(
@@ -467,7 +572,10 @@ fn the_map_clamps_replication_and_reports_its_generation() {
     assert_eq!(a.map.r(), 1);
     let b = m.register(&node(2)).expect("b");
     assert_eq!(b.map.r(), 2);
-    assert_eq!(m.heartbeat(a.id, a.boot).expect("beat"), b.map.generation());
+    assert_eq!(
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp).expect("beat"),
+        b.map.generation()
+    );
     assert_eq!(m.config().beat(), 10 * SECOND);
 
     let zero = Hooked::new();
@@ -547,7 +655,7 @@ fn writers_that_keep_losing_give_up_and_store_failures_surface() {
     }
     s.conflict_on(Some("member/"));
     assert!(matches!(
-        m.heartbeat(a.id, a.boot),
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp),
         Err(MembershipError::Contended)
     ));
     s.conflict_on(None);

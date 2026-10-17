@@ -15,7 +15,7 @@ use kbf_map::{Map, Member, MemberId, MemberState, Rule};
 use kbf_mapsync::{FakeMapSource, MapSource};
 use kbf_objstore::MemoryStore;
 use kbf_proto::worker::{MapRequest, daemon_message};
-use kbf_server::members::{Members, MembershipConfig, Registrant};
+use kbf_server::members::{Members, MembershipConfig, Progress, Registrant};
 use kbf_server::{
     EpochPolicy, Listeners, StateStore, bind_server_with_map, bind_server_with_state,
 };
@@ -205,6 +205,7 @@ fn registrant(i: u32) -> Registrant {
         zone: String::new(),
         weight: 1,
         protocol: kbf_server::members::PROTOCOL,
+        progress: Progress::CaughtUp,
     }
 }
 

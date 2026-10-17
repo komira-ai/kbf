@@ -111,13 +111,16 @@ pub(super) fn given(unit: &UnitFile) -> Given {
     g
 }
 
-/// How `unit` gives a build node the key whose file is `key`, one line per way.
-pub(super) fn key_given(unit: &UnitFile, key: &Path) -> Vec<String> {
+/// How `unit` gives a build node the key whose file is `key`, one line per way. With
+/// `allow_file`, the unit that holds the key beside its builds, an `EnvironmentFile=`
+/// that is exactly `key` (its path as written: no `-`, quotes, wildcard or `..`) is not
+/// one; every other way is.
+pub(super) fn key_given(unit: &UnitFile, key: &Path, allow_file: bool) -> Vec<String> {
     let g = given(unit);
     let mut out: Vec<String> = g
         .files
         .iter()
-        .filter(|f| names_key(f, key))
+        .filter(|f| names_key(f, key) && !(allow_file && is_exactly(f, key)))
         .map(|f| format!("EnvironmentFile={f}"))
         .collect();
     out.extend(
@@ -275,6 +278,57 @@ pub(super) fn holder_on_host<E: Exec>(exec: &E, unit: &UnitFile, key: &HostPath)
     out
 }
 
+/// Rule `credential` for the mode whose unit holds the key beside its builds
+/// (`storage-and-daemon`): the key file, when the unit names it exactly, is a plain file,
+/// root's, with no group or other bit. systemd reads it as root, so nothing else needs
+/// to; any other owner can replace the key, and any other bit lets another user read it.
+/// A key file that is not there, or that cannot be read, is a `SKIP credential:` line.
+pub(super) fn root_key_on_host<E: Exec>(exec: &E, unit: &UnitFile, key: &HostPath) -> OnHost {
+    let mut out = OnHost::default();
+    if !given(unit)
+        .files
+        .iter()
+        .any(|f| is_exactly(f, Path::new(key.as_str())))
+    {
+        return out;
+    }
+    let meta = match exec.stat(key) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            out.notes.push(format!(
+                "SKIP credential: no key file at {key} yet, so its owner and mode were not \
+                 checked"
+            ));
+            return out;
+        }
+        Err(e) => {
+            out.notes.push(format!(
+                "SKIP credential: cannot read {key} ({e}), so its owner and mode were not \
+                 checked"
+            ));
+            return out;
+        }
+    };
+    if meta.kind != Kind::File {
+        out.failures
+            .push(format!("{key} is not a plain file (a link or a directory)"));
+        return out;
+    }
+    if meta.owner.uid != 0 {
+        out.failures.push(format!(
+            "{key} is uid {}'s, not root's: that user can replace the key",
+            meta.owner.uid
+        ));
+    }
+    let bits = meta.perms.bits();
+    if bits & 0o077 != 0 {
+        out.failures.push(format!(
+            "{key} is mode {bits:04o}, so other users can read the key: make it 0600"
+        ));
+    }
+    out
+}
+
 /// The one file the `EnvironmentFile=` path `path` (no wildcard, [`bare`]) names, when
 /// systemd would read one: a relative path is one systemd ignores, and a name ending
 /// in a lone `\`, or one that names a directory, is one its glob(3) lists no file for.
@@ -301,6 +355,11 @@ pub(super) fn env_file_names(bytes: &[u8]) -> impl Iterator<Item = String> + '_ 
                 .to_owned(),
         )
     })
+}
+
+/// Whether the `EnvironmentFile=` value `value` is the path `key`, spelled as it is.
+pub(super) fn is_exactly(value: &str, key: &Path) -> bool {
+    Path::new(value) == key && value == key.to_string_lossy()
 }
 
 /// Whether the `EnvironmentFile=` value `value` names the key file `key`.
