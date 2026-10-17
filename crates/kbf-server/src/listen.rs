@@ -9,10 +9,10 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll, Waker};
 
 use futures::Stream;
-use futures::future::BoxFuture;
 use tonic::transport::server::TcpIncoming;
 
 use crate::serve::ServeError;
@@ -73,23 +73,22 @@ impl Socket {
         })
     }
 
-    /// The listener for a gRPC server: connections it accepts have Nagle's algorithm off
-    /// (see [`crate::serve::bind`]), and it stops accepting, and closes its handle on the
-    /// socket, when `stop` completes.
+    /// The listener for a gRPC server, and the latch that closes it: connections it
+    /// accepts have Nagle's algorithm off (see [`crate::serve::bind`]).
     ///
     /// # Errors
     /// The runtime cannot register the socket.
-    pub fn grpc(self, stop: BoxFuture<'static, ()>) -> Result<Stoppable, ServeError> {
+    pub fn grpc(self) -> Result<(Stoppable, Latch), ServeError> {
         let addr = self.local;
         let registered = tokio::net::TcpListener::from_std(self.listener);
-        let incoming =
-            registered.map(|listener| TcpIncoming::from(listener).with_nodelay(Some(true)));
-        incoming
-            .map(|incoming| Stoppable {
-                inner: Some(incoming),
-                stop,
-            })
-            .map_err(|source| ServeError::Bind { addr, source })
+        let incoming = registered
+            .map(|listener| TcpIncoming::from(listener).with_nodelay(Some(true)))
+            .map_err(|source| ServeError::Bind { addr, source })?;
+        let open = Arc::new(Mutex::new(Open {
+            incoming: Some(incoming),
+            waker: None,
+        }));
+        Ok((Stoppable(Arc::clone(&open)), Latch(open)))
     }
 
     /// The listener for the operator API.
@@ -104,28 +103,54 @@ impl Socket {
     }
 }
 
-/// A gRPC listener that stops when told to: it ends the stream of connections and closes
-/// its socket at once, where the transport's own shutdown keeps the socket open until the
-/// last connection is gone. A process that handed its listener to a successor must not go
-/// on holding it (a successor that crashes and is started again binds the address).
-pub(crate) struct Stoppable {
-    inner: Option<TcpIncoming>,
-    stop: BoxFuture<'static, ()>,
+/// What a gRPC listener holds: the socket, until it is closed, and the waker of the task
+/// waiting to accept on it.
+struct Open {
+    incoming: Option<TcpIncoming>,
+    waker: Option<Waker>,
 }
+
+/// A gRPC listener that can be closed from outside: [`Latch::close`] ends the stream of
+/// connections and closes the socket at once, wherever the server is in accepting. The
+/// transport's own shutdown keeps the socket open until the last connection is gone, and
+/// stops accepting only when it next looks at the listener; a process that handed its
+/// listener to a successor must not go on holding it (a successor that crashes and is
+/// started again binds the address).
+pub(crate) struct Stoppable(Arc<Mutex<Open>>);
 
 impl Stream for Stoppable {
     type Item = <TcpIncoming as Stream>::Item;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = &mut *self;
-        let Some(inner) = this.inner.as_mut() else {
-            return Poll::Ready(None);
-        };
-        if this.stop.as_mut().poll(cx).is_ready() {
-            // The socket closes here.
-            this.inner = None;
-            return Poll::Ready(None);
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut open = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        open.waker = Some(cx.waker().clone());
+        match open.incoming.as_mut() {
+            Some(incoming) => Pin::new(incoming).poll_next(cx),
+            None => Poll::Ready(None),
         }
-        Pin::new(inner).poll_next(cx)
     }
 }
+
+impl Drop for Stoppable {
+    fn drop(&mut self) {
+        Latch(Arc::clone(&self.0)).close();
+    }
+}
+
+/// Closes a [`Stoppable`].
+#[derive(Clone)]
+pub(crate) struct Latch(Arc<Mutex<Open>>);
+
+impl Latch {
+    /// Closes the socket, and wakes the task waiting on it so that it sees the stream end.
+    pub fn close(&self) {
+        let mut open = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        open.incoming = None;
+        if let Some(waker) = open.waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

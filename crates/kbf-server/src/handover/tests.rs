@@ -282,5 +282,37 @@ async fn a_stop_completes_for_every_waiter_once_it_is_fired() {
     waiting.await.expect("the waiter completes");
     assert!(stop.fired().now_or_never().is_some(), "a late waiter waits");
     assert!(clone.fired().now_or_never().is_some());
-    assert!(!format!("{stop:?}").is_empty());
+}
+
+/// Catches: a stop that closes its listeners late (when the server next polls them: a
+/// listener asleep in accept keeps its socket, and with it the address), and one that
+/// does not close a listener registered after it was given.
+#[tokio::test]
+async fn a_stop_closes_the_listeners_registered_with_it_when_it_is_given() {
+    let any = || "127.0.0.1:0".parse().expect("address");
+    let stop = Stop::new();
+    let socket = crate::listen::Socket::bind(any(), false).expect("bind");
+    let addr = socket.local;
+    let (incoming, latch) = socket.grpc().expect("registered");
+    stop.closes(latch);
+    assert!(
+        std::net::TcpStream::connect(addr).is_ok(),
+        "closed before the stop"
+    );
+    stop.fire();
+    assert!(
+        std::net::TcpStream::connect(addr).is_err(),
+        "still open after the stop"
+    );
+    drop(incoming);
+
+    // Registered after the stop was given: closed at once.
+    let socket = crate::listen::Socket::bind(any(), false).expect("bind");
+    let addr = socket.local;
+    let (_incoming, latch) = socket.grpc().expect("registered");
+    stop.closes(latch);
+    assert!(
+        std::net::TcpStream::connect(addr).is_err(),
+        "a late listener stays open"
+    );
 }

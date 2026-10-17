@@ -718,7 +718,8 @@ impl State {
     /// Renews `worker`'s session row if its last write is a renewal interval old: one
     /// write per daemon session, never one per lease. Called for a heartbeat taken.
     pub(super) fn renew_session(&mut self, now: FarmTime, worker: &WorkerId) {
-        if self.durable.is_none() {
+        // A fenced farm writes nothing: the successor's rows are the truth.
+        if self.durable.is_none() || self.fenced {
             return;
         }
         let due = self

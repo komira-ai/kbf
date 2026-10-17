@@ -76,7 +76,7 @@ pub(crate) async fn knock(
             Ok(Some((Offer { link, generation }, sockets)))
         }
         (Message::Refused(why), _) => Err(HandoverError::Refused(why)),
-        (other, _) => Err(HandoverError::Unexpected(other)),
+        (other, _) => Err(HandoverError::Unexpected(other.line())),
     }
 }
 
@@ -91,7 +91,7 @@ impl Offer {
         match self.link.hear().await? {
             Message::Released => Ok(()),
             Message::Failed(why) => Err(HandoverError::Failed(why)),
-            other => Err(HandoverError::Unexpected(other)),
+            other => Err(HandoverError::Unexpected(other.line())),
         }
     }
 }

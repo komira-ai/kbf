@@ -54,6 +54,7 @@ impl Stand {
     /// listeners are stopped by then, so the drain is closed: the process only has its
     /// open streams to end.
     pub async fn run(&self) -> Result<(), StoreError> {
+        tracing::info!("standing down for a successor");
         self.drain.begin();
         let _ = tokio::time::timeout(self.wait, self.until_quiet()).await;
         self.farm.fence();
@@ -117,7 +118,12 @@ impl Holder {
     /// callers whose streams it kept open (`every` is how often it looks for their
     /// results). A failure is logged: the frontend goes on serving, unable to hand over.
     pub async fn run(self, farm: Arc<Farm>, every: Duration) {
-        match self.hand_over().await {
+        let handed_over = self.hand_over().await;
+        // The handles on the listeners go, and with them the control socket: the
+        // successor's are the only ones left, and a successor that dies can be started
+        // again on the same addresses.
+        drop(self);
+        match handed_over {
             Ok(()) => follow(&farm, every).await,
             Err(error) => tracing::error!(%error, "the handover control socket failed"),
         }
@@ -214,6 +220,7 @@ impl Holder {
     /// go back, whatever the successor does.
     async fn release(&self, mut link: Link) -> Result<(), HandoverError> {
         let stood = self.stand.run().await;
+        tracing::info!(stood = stood.is_ok(), "handed over to the successor");
         let said = match &stood {
             Ok(()) => Message::Released,
             Err(error) => Message::Failed(error.to_string()),

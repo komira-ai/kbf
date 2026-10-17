@@ -19,6 +19,7 @@ use kbf_front::Closer;
 use serde::Serialize;
 use tokio::sync::{oneshot, watch};
 
+use crate::handover::Stop;
 use crate::health::Readiness;
 
 /// What `GET /v1/frontend/drain` answers, and what a drain reports after it begins.
@@ -44,8 +45,9 @@ pub struct Drain {
     /// first [`Drain::begin`].
     goaway: Mutex<Option<oneshot::Sender<()>>>,
     began: AtomicBool,
-    /// Set by the first [`Drain::begin`]: [`Drain::begun`] completes on it.
-    started: watch::Sender<bool>,
+    /// Given by the first [`Drain::begin`]: [`Drain::begun`] completes on it, and the
+    /// listeners registered with [`Drain::begins`] are closed by it.
+    started: Stop,
     closed: watch::Sender<bool>,
 }
 
@@ -63,7 +65,7 @@ impl Drain {
             readiness,
             goaway: Mutex::new(Some(goaway)),
             began: AtomicBool::new(false),
-            started: watch::Sender::new(false),
+            started: Stop::new(),
             closed: watch::Sender::new(false),
         };
         (drain, begun)
@@ -81,7 +83,7 @@ impl Drain {
         }
         self.readiness.stop();
         self.closer.drain();
-        self.started.send_replace(true);
+        self.started.fire();
         // Taken once: the `began` swap above lets one call this far. The listener is gone
         // only if the server already stopped, and the send then has no one to tell.
         let _ = self
@@ -95,9 +97,12 @@ impl Drain {
 
     /// Completes once the drain has begun (immediately if it has).
     pub async fn begun(&self) {
-        let mut started = self.started.subscribe();
-        // The sender is `self.started`, alive as long as `self`.
-        let _ = started.wait_for(|started| *started).await;
+        self.started.fired().await;
+    }
+
+    /// The signal the first [`Drain::begin`] gives, for a listener to be closed by.
+    pub(crate) const fn begins(&self) -> &Stop {
+        &self.started
     }
 
     /// Whether a drain has begun.

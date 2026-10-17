@@ -140,7 +140,7 @@ async fn an_offer_that_is_not_one_is_an_error() {
             0,
             "refused the handover: other flags",
         ),
-        (Message::Ready, 0, "unexpected handover message: Ready"),
+        (Message::Ready, 0, "unexpected handover message: ready"),
     ];
     for (answer, carried, said) in cases {
         let dir = Scratch::new();
@@ -171,7 +171,7 @@ async fn ready_ends_in_an_error_unless_the_holder_says_released() {
     ];
     let wanted = [
         "could not stand down: the writer cannot stop",
-        "unexpected handover message: Ready",
+        "unexpected handover message: ready",
         "closed the control connection",
     ];
     for (answer, wanted) in answers.into_iter().zip(wanted) {

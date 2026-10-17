@@ -695,9 +695,12 @@ impl<'a> Prepared<'a> {
                 worker,
                 api: api_socket.as_mut().and_then(|socket| socket.spare.take()),
             });
-        let begun = Arc::clone(&drain);
-        let reapi_incoming = reapi.grpc(Box::pin(async move { begun.begun().await }))?;
-        let worker_incoming = worker.grpc(worker_stop.fired())?;
+        // Both listeners are closed the moment the drain begins and the worker listener
+        // is stopped, whatever the transport is doing then.
+        let (reapi_incoming, reapi_latch) = reapi.grpc()?;
+        drain.begins().closes(reapi_latch);
+        let (worker_incoming, worker_latch) = worker.grpc()?;
+        worker_stop.closes(worker_latch);
         let api_listener = api_socket.map(Socket::http).transpose()?;
         let api_routes = crate::api::router(
             Arc::clone(&farm),
@@ -931,9 +934,12 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
     sizes.log();
     sizes.runtime()?.block_on(async {
         let (first, second) = interruptions()?;
-        let mut frontend = start_frontend(flags, move || Ok(first))?;
+        let mut frontend = start_or_take_over(flags, move || Ok(first)).await?;
         frontend.escalation = Some(second);
         println!("{}", frontend.start_line());
+        // Set by the service manager of a `Type=notify` unit (not a flag: it names the
+        // manager's socket, which only the manager knows).
+        let frontend = frontend.notifying(std::env::var_os("NOTIFY_SOCKET"));
         Ok(frontend.serve().await?)
     })
 }

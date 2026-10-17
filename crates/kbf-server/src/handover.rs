@@ -1,5 +1,5 @@
 //! Handing a running frontend's work to a new process of the same build or the next, on
-//! one machine, without failing a build (`docs/design/architecture-v2.md`, section 9).
+//! one machine, without failing a build (`docs/design/architecture-v2.md`, sections 11 and 12).
 //!
 //! Two processes, the holder and the successor, share the listener sockets, the state
 //! store and a control socket:
@@ -38,17 +38,19 @@
 
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
 use tokio::sync::watch;
 
+use crate::listen::Latch;
+
 mod incoming;
-pub mod notify;
+mod notify;
 mod outgoing;
 mod ready;
-pub mod wire;
+pub(crate) mod wire;
 
 pub(crate) use incoming::{Offer, knock};
 pub(crate) use outgoing::{Facts, Holder, Stand};
@@ -90,9 +92,9 @@ pub enum HandoverError {
     /// The frontend serving would not hand over.
     #[error("the serving frontend refused the handover: {0}")]
     Refused(String),
-    /// The frontend serving answered with a message this step does not take.
-    #[error("unexpected handover message: {0:?}")]
-    Unexpected(Message),
+    /// The frontend serving answered with a message this step does not take (its line).
+    #[error("unexpected handover message: {0}")]
+    Unexpected(String),
     /// The offer did not carry the sockets it announced.
     #[error("the offer carried {got} sockets, not the {want} it announced")]
     Sockets { got: usize, want: usize },
@@ -110,23 +112,52 @@ pub enum HandoverError {
     State(#[from] StateError),
 }
 
-/// A signal that, once given, stays given: what stops a listener.
-#[derive(Clone, Debug)]
-pub(crate) struct Stop(Arc<watch::Sender<bool>>);
+/// A signal that, once given, stays given: what stops a listener. The listeners it is
+/// to close are closed as it is given, not when the server next looks at them.
+#[derive(Clone)]
+pub(crate) struct Stop(Arc<Signal>);
+
+struct Signal {
+    given: watch::Sender<bool>,
+    latches: Mutex<Vec<Latch>>,
+}
 
 impl Stop {
     pub fn new() -> Self {
-        Self(Arc::new(watch::Sender::new(false)))
+        Self(Arc::new(Signal {
+            given: watch::Sender::new(false),
+            latches: Mutex::new(Vec::new()),
+        }))
     }
 
-    /// Gives the signal.
+    /// Gives the signal: closes the listeners registered with [`Stop::closes`], and
+    /// completes every [`Stop::fired`].
     pub fn fire(&self) {
-        self.0.send_replace(true);
+        let mut latches = self
+            .0
+            .latches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.0.given.send_replace(true);
+        latches.drain(..).for_each(|latch| latch.close());
+    }
+
+    /// Has `latch` close its listener when the signal is given, at once if it was.
+    pub fn closes(&self, latch: Latch) {
+        let mut latches = self
+            .0
+            .latches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        latches.push(latch.clone());
+        if *self.0.given.borrow() {
+            latch.close();
+        }
     }
 
     /// Completes when the signal is given (immediately if it was).
     pub fn fired(&self) -> BoxFuture<'static, ()> {
-        let mut fired = self.0.subscribe();
+        let mut fired = self.0.given.subscribe();
         // Held by the caller too: the sender outlives every future this returns.
         Box::pin(async move {
             let _ = fired.wait_for(|fired| *fired).await;
