@@ -158,3 +158,44 @@ async fn the_result_object_is_not_attempted_while_the_output_waits_out_its_backo
         assert_eq!(farm.log.staged_state(object), Some(StagedState::Sealed));
     }
 }
+
+/// A gate that holds the digests larger than a segment (the entry's output) while
+/// `output_ours` is false, and flushes everything else.
+#[derive(Debug)]
+struct OutputGate(std::sync::atomic::AtomicBool);
+
+impl kbf_storage::flush::FlushGate for OutputGate {
+    fn flushes(&self, d: &kbf_types::Digest) -> bool {
+        d.size_bytes <= SEGMENT || self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Catches the gate and the closure order composed wrongly: a result object this node
+/// flushes, whose closure object another node flushes, must not be PUT while that
+/// closure object is still staged here (the gate removes the output from the round, and
+/// a flusher that treats a missing wait as satisfied would PUT the result alone). Once
+/// the gate hands the output to this node, the closure order applies as without a gate:
+/// output, then result.
+#[tokio::test]
+async fn a_result_waits_for_a_closure_object_the_gate_holds_elsewhere() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let farm = Farm::new(Capabilities::default());
+    let gate = std::sync::Arc::new(OutputGate(AtomicBool::new(false)));
+    let cache = farm.start(GIB).await.with_flush_gate(gate.clone());
+    let entry = entry(&farm, &cache).await;
+
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed, Vec::<ObjectId>::new(), "{round:?}");
+    assert!(farm.store.put_keys().is_empty(), "no PUT of the result alone");
+    for object in [entry.output, entry.result] {
+        assert_eq!(farm.log.staged_state(object), Some(StagedState::Sealed));
+    }
+
+    gate.0.store(true, Ordering::SeqCst);
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed, vec![entry.output, entry.result]);
+    assert_eq!(
+        farm.store.put_keys(),
+        vec![key(&cache, entry.output), key(&cache, entry.result)]
+    );
+}

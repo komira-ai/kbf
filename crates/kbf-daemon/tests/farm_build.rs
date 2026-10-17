@@ -30,6 +30,7 @@ use kbf_proto::reapi::execution_client::ExecutionClient;
 use kbf_proto::reapi::{
     Action, ActionResult, Command, Digest, Directory, ExecuteRequest, ExecuteResponse, FileNode,
 };
+use kbf_route::Liveness;
 use kbf_server::{Listeners, WorkerTls, bind_server_with_map};
 use kbf_transfer::{TransferConfig, Transfers, digest_of};
 use prost::Message as _;
@@ -275,7 +276,7 @@ async fn build(pki: &Pki, owner: &Node, pushes_map: bool, scratch: &std::path::P
     let plane = Arc::new(FarmCas::new(
         Arc::new(Transfers::new(endpoint, TransferConfig::default())),
         Arc::clone(&holder),
-        storage_nodes(&pki.client).expect("TLS files"),
+        storage_nodes(&pki.client, Liveness::default()).expect("TLS files"),
         &TransferConfig::default(),
     ));
     let runtime = Arc::new(Mover {

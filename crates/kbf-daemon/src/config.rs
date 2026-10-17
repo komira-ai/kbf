@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use kbf_route::Liveness;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 /// T: a daemon fences its leases this long after the newest acknowledged heartbeat
@@ -81,9 +82,54 @@ pub struct Args {
     /// komira's pool runs with `--label pool=darwin-sized`.
     #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
     pub labels: Vec<(String, String)>,
+    /// The longest, in milliseconds, that dialling a storage node may take: for its TCP
+    /// connection and for its TLS handshake each. Must be at least 1.
+    #[arg(long, default_value_t = STORAGE_LIVENESS_DEFAULT_MS)]
+    pub storage_dial_timeout_ms: u64,
+    /// How often, in milliseconds, a connection to a storage node with a call on it is
+    /// pinged (HTTP/2 PING). Must be at least 1.
+    #[arg(long, default_value_t = STORAGE_LIVENESS_DEFAULT_MS)]
+    pub storage_ping_interval_ms: u64,
+    /// How long, in milliseconds, a ping to a storage node may go unanswered before the
+    /// connection is dropped and the calls on it fail over to the next owner. Must be at
+    /// least 1 and no more than `--storage-ping-interval-ms`.
+    #[arg(long, default_value_t = STORAGE_LIVENESS_DEFAULT_MS)]
+    pub storage_ping_timeout_ms: u64,
 }
 
+/// The default of each `--storage-*-ms` flag: [`Liveness::default`]'s ten seconds.
+const STORAGE_LIVENESS_DEFAULT_MS: u64 = 10_000;
+
 impl Args {
+    /// How long the daemon waits on a silent storage node, from the `--storage-*-ms`
+    /// flags.
+    ///
+    /// # Errors
+    /// A value is zero, or the ping timeout is longer than the ping interval (a ping
+    /// would then be sent before the last one is given up on).
+    pub fn storage_liveness(&self) -> Result<Liveness, ConfigError> {
+        for (flag, ms) in [
+            ("--storage-dial-timeout-ms", self.storage_dial_timeout_ms),
+            ("--storage-ping-interval-ms", self.storage_ping_interval_ms),
+            ("--storage-ping-timeout-ms", self.storage_ping_timeout_ms),
+        ] {
+            if ms == 0 {
+                return Err(ConfigError::ZeroDuration(flag));
+            }
+        }
+        if self.storage_ping_timeout_ms > self.storage_ping_interval_ms {
+            return Err(ConfigError::PingTimeoutAfterInterval {
+                timeout_ms: self.storage_ping_timeout_ms,
+                interval_ms: self.storage_ping_interval_ms,
+            });
+        }
+        Ok(Liveness {
+            connect: Duration::from_millis(self.storage_dial_timeout_ms),
+            keepalive_interval: Duration::from_millis(self.storage_ping_interval_ms),
+            keepalive_timeout: Duration::from_millis(self.storage_ping_timeout_ms),
+        })
+    }
+
     /// The node report entries the labels add: `(label.<key>, value)`.
     #[must_use]
     pub fn label_entries(&self) -> Vec<(String, String)> {
@@ -142,6 +188,13 @@ pub enum ConfigError {
     BadServer { url: String, reason: String },
     #[error("no server URL given")]
     NoServer,
+    #[error("{0} must be at least 1")]
+    ZeroDuration(&'static str),
+    #[error(
+        "--storage-ping-timeout-ms {timeout_ms} is longer than \
+         --storage-ping-interval-ms {interval_ms}"
+    )]
+    PingTimeoutAfterInterval { timeout_ms: u64, interval_ms: u64 },
 }
 
 impl TlsFiles {
@@ -373,5 +426,63 @@ mod tests {
                 timeout: Duration::from_secs(20),
             }
         );
+    }
+
+    /// Catches storage-liveness flags whose defaults drifted from the library's, or that
+    /// do not reach the value: each flag must set its own field, in milliseconds.
+    #[test]
+    fn the_storage_liveness_flags_default_to_the_libraries_and_reach_it() {
+        assert_eq!(
+            parse(&[])
+                .expect("defaults")
+                .storage_liveness()
+                .expect("ok"),
+            Liveness::default()
+        );
+        let args = parse(&[
+            "--storage-dial-timeout-ms=300",
+            "--storage-ping-interval-ms=200",
+            "--storage-ping-timeout-ms=100",
+        ])
+        .expect("flags");
+        assert_eq!(
+            args.storage_liveness().expect("valid"),
+            Liveness {
+                connect: Duration::from_millis(300),
+                keepalive_interval: Duration::from_millis(200),
+                keepalive_timeout: Duration::from_millis(100),
+            }
+        );
+        // A timeout equal to the interval is allowed: it is the default.
+        parse(&["--storage-ping-timeout-ms=10000"])
+            .expect("flags")
+            .storage_liveness()
+            .expect("equal");
+    }
+
+    /// Catches a zero that would make every dial or ping fail at once, and a ping
+    /// timeout longer than the interval, each refused with a message naming the flag.
+    #[test]
+    fn the_storage_liveness_flags_refuse_zero_and_a_timeout_past_the_interval() {
+        for flag in [
+            "--storage-dial-timeout-ms",
+            "--storage-ping-interval-ms",
+            "--storage-ping-timeout-ms",
+        ] {
+            let error = parse(&[&format!("{flag}=0")])
+                .expect("parses")
+                .storage_liveness()
+                .expect_err("zero");
+            assert_eq!(error.to_string(), format!("{flag} must be at least 1"));
+        }
+        let error = parse(&["--storage-ping-timeout-ms=10001"])
+            .expect("parses")
+            .storage_liveness()
+            .expect_err("timeout past interval");
+        assert_eq!(
+            error.to_string(),
+            "--storage-ping-timeout-ms 10001 is longer than --storage-ping-interval-ms 10000"
+        );
+        assert!(parse(&["--storage-dial-timeout-ms=ten"]).is_err());
     }
 }

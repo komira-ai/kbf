@@ -299,7 +299,13 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     ///    An object holding an action-cache entry's result blob is flushed only after
     ///    the objects holding its closure's blobs ([`kbf_meta::MetaState::flush_waits`],
     ///    [`flush_order`]): one waiting for an object that is open, waiting out a
-    ///    backoff, or failed this round is left for a later round.
+    ///    backoff, or failed this round is left for a later round. The gate
+    ///    ([`Cache::with_flush_gate`]) filters first, then that order applies among the
+    ///    objects this node flushes. A result this node flushes whose closure object it
+    ///    does not (another node is rank 1 for it) waits for that object while it is
+    ///    staged here: this node cannot tell that the other flusher's PUT landed, so it
+    ///    never guesses. It goes once the object is no longer staged on this tier (this
+    ///    node became its flusher and flushed it, or it left staged state).
     ///
     /// # Errors
     ///
@@ -316,13 +322,22 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             let _ = staging.tier.sealed(object);
             round.sealed.push(object);
         }
-        let (tier, waiting) = (staging.id, staging.waiting(now));
+        let (tier, waiting, gate) = (staging.id, staging.waiting(now), self.gate.clone());
         let due = self
             .writer
             .query(move |s| {
                 let ours = |o: &StagedObject| (o.tier(), o.state()) == (tier, StagedState::Sealed);
                 let sealed = s.staged_objects().filter(|(_, o)| ours(o));
                 let sealed = sealed.filter(|(object, _)| !waiting.contains(object));
+                // One flusher: an object none of whose digests this node flushes waits.
+                let flushes = |o: &StagedObject| {
+                    gate.as_ref()
+                        .is_none_or(|g| o.blobs().any(|(d, _)| g.flushes(d)))
+                };
+                let sealed = sealed.filter(|(_, o)| flushes(o));
+                // Then the closure order among the objects that are left. A closure
+                // object the gate removed is not in `waits`, so (like an open one) it
+                // keeps its result back: nothing reaches the store before its closure.
                 let waits = sealed.map(|(object, _)| (object, s.flush_waits(object)));
                 let order = flush_order(&waits.collect(), FLUSHES_PER_ROUND);
                 let due = order.into_iter().filter_map(|(object, first)| {
