@@ -155,6 +155,9 @@ pub struct Shape {
     pub cfg: Option<String>,
     /// The target its paths name (see the module docs). Not part of the key.
     pub target: Option<Target>,
+    /// Whether it is a test run: an output path is under `buck-out/<v>/test/execution/`
+    /// (buck2's root for a remotely run test). Not part of the key.
+    pub test: bool,
 }
 
 impl Shape {
@@ -163,6 +166,7 @@ impl Shape {
     #[must_use]
     pub fn of(arguments: &[String], outputs: &[String]) -> Self {
         let (program, program_target) = words(arguments);
+        let test = outputs.iter().any(|o| is_test_execution(o));
         let mut patterns: Vec<Pattern> = outputs.iter().filter_map(|o| owned_pattern(o)).collect();
         patterns.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         let cfg = patterns.iter().find_map(|(_, cfg, _)| cfg.clone());
@@ -179,8 +183,18 @@ impl Shape {
             outputs,
             cfg,
             target,
+            test,
         }
     }
+}
+
+/// Whether `path` is under `buck-out/<v>/test/execution/`, buck2's root for the outputs
+/// of a test run remotely.
+fn is_test_execution(path: &str) -> bool {
+    let segments: Vec<&str> = path.split('/').collect();
+    segments
+        .windows(4)
+        .any(|w| w[0] == "buck-out" && w[2] == "test" && w[3] == "execution")
 }
 
 /// SHA-256 over the version tag, the program's words and the outputs, each part

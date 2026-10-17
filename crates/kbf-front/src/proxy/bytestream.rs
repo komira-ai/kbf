@@ -5,21 +5,35 @@
 //! (`resource_name` is field 1 of `ReadRequest`, `WriteRequest` and
 //! `QueryWriteStatusRequest`), authorizes the call against the instance name in it, and
 //! gives the request to a storage node with its headers, `grpc-timeout` and body
-//! unchanged. The response (data and trailers) comes back the same way. No protobuf
-//! message past that first field is decoded, and no payload byte is collected, so a
-//! blob of any size passes in constant memory and nothing here caps one.
+//! unchanged, except for the map generation header (`kbf-map-generation`): the client's
+//! is dropped and the frontend's own is set when it routed by a map, so a node can tell
+//! the frontend's map is old. The response (data and trailers) comes back the same way.
+//! No protobuf message past that first field is decoded, and no payload byte is
+//! collected, so a blob of any size passes in constant memory and nothing here caps one.
 //!
 //! **Read** tries the owners of the blob in rank order: a node that fails before its
 //! first byte (unreachable, an error status in the headers or as the first frame) is
-//! passed over, transparently. Once a byte has been sent the node is the answer: a
+//! passed over, transparently. When no owner answers, the client is told NOT_FOUND only
+//! if every owner said so; otherwise it is told the first failure of an owner that could
+//! not say (it may hold the blob). Once a byte has been sent the node is the answer: a
 //! failure after it ends the call with that error, and the client resumes with
 //! `read_offset`.
 //!
-//! **Write** goes to the primary alone. If the blob's primary changes during the upload
-//! it ends UNAVAILABLE and the client starts the upload again: the frontend holds no
-//! bytes it could send to the new one.
+//! **STALE_MAP.** A node that holds a newer map answers FAILED_PRECONDITION with its
+//! generation; on this raw path that answer goes to the client as it is, with no refetch
+//! of the map and no second try (the whole-blob calls, which go through the router, do
+//! both). The frontend's map is refreshed by its own timer, so the client's next call is
+//! routed by the newer map. A storage node does not judge a call's generation yet; when
+//! it does, a Read or QueryWriteStatus here (whose request is held) can be run again once
+//! the map is fetched, and a Write (whose body is not) cannot.
 //!
-//! **QueryWriteStatus** asks the primary.
+//! **Write** goes to the writer alone: the first owner of the blob that the map does not
+//! say is down (not always the owner a read asks first). If the blob's writer changes
+//! during the upload it ends UNAVAILABLE and the client starts the upload again: the
+//! frontend holds no bytes it could send to the new one. Nothing here hashes what passes:
+//! a node checks the blob it is sent and the blob it sends.
+//!
+//! **QueryWriteStatus** asks the writer.
 //!
 //! **Compression.** A gRPC-compressed message hides the name, so a call whose first
 //! message is compressed, or that names a `grpc-encoding` other than `identity`, is
@@ -33,6 +47,7 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use kbf_auth::{Authorizers, authorize};
+use kbf_storage::service::MAP_GENERATION_HEADER;
 use tonic::body::Body;
 use tonic::codegen::{Service, http};
 use tonic::server::NamedService;
@@ -102,14 +117,14 @@ impl RawByteStream {
         }
     }
 
-    /// Authorizes the call `method` against the instance in `name`, and says which
-    /// nodes hold the blob.
-    async fn route(
+    /// Authorizes the call `method` against the instance in `name`, and says which blob
+    /// it is about.
+    async fn authorized(
         &self,
         parts: &http::request::Parts,
         method: Method,
         named: &str,
-    ) -> Result<(name::Resource, Arc<[Owner]>), Status> {
+    ) -> Result<name::Resource, Status> {
         let resource = name::parse(method, named)?;
         let authorizer = match method {
             Method::Read => &self.authorizers.cas_get,
@@ -117,8 +132,7 @@ impl RawByteStream {
         };
         let caller = kbf_auth::metadata_of_http(&parts.extensions);
         authorize(&**authorizer, &caller, method.path(), &resource.instance).await?;
-        let owners = self.owners.for_digest(&resource.digest);
-        Ok((resource, owners))
+        Ok(resource)
     }
 
     async fn write(
@@ -128,8 +142,8 @@ impl RawByteStream {
     ) -> Result<http::Response<Body>, Status> {
         let mut up = Pass::new(body, &self.meter, Method::Write, Direction::ToStorage);
         let name = up.peek_name().await?;
-        let (resource, owners) = self.route(parts, Method::Write, &name).await?;
-        let owner = owners.first().ok_or_else(no_storage)?;
+        let resource = self.authorized(parts, Method::Write, &name).await?;
+        let owner = self.owners.writer(&resource.digest)?;
         let failed = Arc::new(Mutex::new(None));
         let up = up.guarded(Guard {
             owners: self.owners.clone(),
@@ -137,7 +151,7 @@ impl RawByteStream {
             owner: Arc::from(owner.id()),
             failed: Arc::clone(&failed),
         });
-        let answer = send(owner, parts, up).await;
+        let answer = send(&owner, parts, up).await;
         // The upload ended because its primary changed: that is the answer, whatever the
         // node said of the body that broke.
         let refusal = failed
@@ -164,24 +178,32 @@ impl RawByteStream {
         let name = name_in(&request)?.ok_or_else(|| {
             Status::invalid_argument("the request is shorter than its resource_name")
         })?;
-        let (_, owners) = self.route(parts, method, &name).await?;
-        let tried = if method == Method::Read {
-            owners.len()
+        let resource = self.authorized(parts, method, &name).await?;
+        // A read asks every owner in turn; the status of an upload is the writer's alone.
+        let owners = if method == Method::Read {
+            self.owners.for_digest(&resource.digest)
         } else {
-            1
+            Arc::from(vec![self.owners.writer(&resource.digest)?])
         };
-        let mut last = no_storage();
-        for owner in owners.iter().take(tried) {
+        // NOT_FOUND is the answer only if every owner said it: an owner that could not say
+        // (down, broken) may hold the blob, so the first of those is what the client is
+        // told, as the router does for a whole-blob read.
+        let (mut failure, mut missed) = (None, None);
+        for owner in owners.iter() {
             match self.ask(owner, parts, &request, method).await {
                 Ok(response) => return Ok(response),
                 Err(status) if next_owner_may_answer(status.code()) => {
                     tracing::warn!(node = owner.id(), %status, "storage node failed before its first byte");
-                    last = status;
+                    if status.code() == Code::NotFound {
+                        missed = Some(status);
+                    } else {
+                        failure.get_or_insert(status);
+                    }
                 }
                 Err(status) => return Err(status),
             }
         }
-        Err(last)
+        Err(failure.or(missed).unwrap_or_else(no_storage))
     }
 
     /// One owner's answer, once it has failed or sent its first byte.
@@ -219,6 +241,14 @@ async fn send(
     *request.uri_mut() = parts.uri.clone();
     *request.version_mut() = parts.version;
     *request.headers_mut() = parts.headers.clone();
+    // The generation of the map the frontend routed by, never the client's.
+    request.headers_mut().remove(MAP_GENERATION_HEADER);
+    if owner.generation > 0 {
+        request.headers_mut().insert(
+            MAP_GENERATION_HEADER,
+            http::HeaderValue::from(owner.generation),
+        );
+    }
     // The channel is a tower Buffer: ready it before calling it.
     let mut channel = owner.channel.clone();
     let response = async {

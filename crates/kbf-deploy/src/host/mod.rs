@@ -15,6 +15,8 @@
 //! - [`release`]: the `install`, `rollback` and `gc` verbs.
 //! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
 //!   named by.
+//! - [`state_store`]: the SQLite state store's file backed up while the frontend runs
+//!   and restored while it is stopped.
 //!
 //! The verbs (`kbf-deploy host ...`):
 //!
@@ -23,7 +25,11 @@
 //! kbf-deploy host install --commit <40 hex> --from <dir> [--apply] [--root DIR]
 //! kbf-deploy host rollback [--apply] [--root DIR]
 //! kbf-deploy host gc [--keep N] [--apply] [--root DIR]
+//! kbf-deploy host state-backup --db FILE --dest FILE [--owner USER[:GROUP]] [--mode 0640]
+//! kbf-deploy host state-restore --src FILE --db FILE [--apply]
 //! ```
+//!
+//! What `state-backup` and `state-restore` do and exit is in [`state_store`].
 //!
 //! `status` only reads: it prints the state and whether the `current` link points at
 //! the state's current release, and exits 0 when it does (or when there is neither), 1
@@ -37,6 +43,7 @@
 //! with `kbf-deploy: <why>` on stderr when they refuse or a step fails.
 
 pub use kbf_installer::{CommitId, NotACommit, layout, release, state};
+pub mod state_store;
 
 use std::fmt;
 use std::io::Write;
@@ -64,6 +71,11 @@ pub enum Host {
     /// Remove old release directories, never the current, previous or staged one.
     /// Prints the plan unless --apply.
     Gc(GcArgs),
+    /// Copy the SQLite state store's file while the frontend runs. Writes only --dest.
+    StateBackup(state_store::BackupArgs),
+    /// Put a state-backup copy back in place of the state file, while the frontend is
+    /// stopped. Prints the plan unless --apply.
+    StateRestore(state_store::RestoreArgs),
 }
 
 #[derive(Args)]
@@ -142,6 +154,8 @@ fn root(dir: &str) -> Result<Root, kbf_host::PathError> {
 pub fn run(verb: Host, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let done = match verb {
         Host::Status(a) => return status(&layout_of(&a.root, a.platform), a.json, out, err),
+        Host::StateBackup(a) => return state_store::run_backup(a, out, err),
+        Host::StateRestore(a) => return state_store::run_restore(a, out, err),
         Host::Install(a) => {
             let host = a.apply.layout();
             let what = release::Install {

@@ -173,3 +173,21 @@ async fn a_read_that_keeps_breaking_is_unavailable() {
         );
     }
 }
+
+/// Catches a read into a file whose offset cannot be known going ahead anyway: with no
+/// offset to cut a bad copy back to, a read into a pipe fails with `Write` before any
+/// node is asked.
+#[tokio::test]
+async fn a_file_that_cannot_seek_fails_before_any_read() {
+    let blob = b"1234".to_vec();
+    let digest = digest_of(&blob);
+    let fake = Fake::new(&blob);
+    let cas = plane(&fake, &TransferConfig::default());
+    let (_reader, writer) = std::io::pipe().expect("a pipe");
+    let pipe = std::fs::File::from(std::os::fd::OwnedFd::from(writer));
+    let mut file = tokio::fs::File::from_std(pipe);
+
+    let error = cas.read_to(&digest, &mut file).await.expect_err("a pipe");
+    assert!(matches!(error, CasError::Write(..)), "{error:?}");
+    assert_eq!(fake.reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+}

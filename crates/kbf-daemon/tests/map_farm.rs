@@ -37,7 +37,7 @@ struct Silent {
 }
 
 impl MapSource for Silent {
-    fn current(&self) -> Arc<Map> {
+    fn current(&self) -> Option<Arc<Map>> {
         self.inner.current()
     }
 
@@ -54,7 +54,7 @@ async fn farm(name: &str, source: Arc<dyn MapSource>) -> Arc<MapHolder> {
         worker: SocketAddr::from(([127, 0, 0, 1], 0)),
         reapi_tls: None,
         worker_tls: Some(WorkerTls {
-            server: pki.server_tls(),
+            server: pki.worker_tls(),
             deny_list: None,
         }),
         heartbeat_interval: Duration::from_millis(100),
@@ -68,6 +68,7 @@ async fn farm(name: &str, source: Arc<dyn MapSource>) -> Arc<MapHolder> {
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     };
     let cache = Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory());
     let bound = bind_server_with_map(

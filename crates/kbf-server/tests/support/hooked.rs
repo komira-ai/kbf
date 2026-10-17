@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{
-    Changes, Commit, CommitStats, Conflict, ManualClock, Op, Revision, Store, StoreError,
-    StoreTime, Txn, Versioned,
+    Changes, Commit, CommitStats, Conflict, ManualClock, Op, Revision, ScanPage, ScanRange, Store,
+    StoreError, StoreTime, Txn, Versioned,
 };
 
 type Hook = Box<dyn FnOnce() + Send>;
@@ -24,6 +24,8 @@ pub struct Hooked {
     pub map_writes: Mutex<Vec<bool>>,
     /// How many of the next `get`s fail with a store error.
     pub fail_gets: AtomicUsize,
+    /// How many of the next `reap_expired` calls fail with a store error.
+    pub fail_reaps: AtomicUsize,
 }
 
 impl Hooked {
@@ -36,6 +38,7 @@ impl Hooked {
             conflict_on: Mutex::new(None),
             map_writes: Mutex::new(Vec::new()),
             fail_gets: AtomicUsize::new(0),
+            fail_reaps: AtomicUsize::new(0),
         })
     }
 
@@ -143,11 +146,24 @@ impl Store for Hooked {
         Ok(answer)
     }
 
+    fn scan_range(&self, scan: ScanRange<'_>) -> Result<ScanPage, StoreError> {
+        let answer = self.fake.scan_range(scan)?;
+        self.fire(scan.prefix);
+        Ok(answer)
+    }
+
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {
         self.fake.changes(after, limit)
     }
 
     fn reap_expired(&self) -> Result<usize, StoreError> {
+        if self
+            .fail_reaps
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(StoreError::Failed("injected".to_owned()));
+        }
         self.fake.reap_expired()
     }
 

@@ -35,6 +35,18 @@ pub enum SqliteError {
         /// The filesystem's name.
         fs: &'static str,
     },
+    /// The state file has more than one name (a hard link). The lock is beside one name,
+    /// so a process opening another name would hold another lock and write the same file.
+    #[error(
+        "state file {} has {links} names (hard links); give the file one name, so one lock covers it",
+        path.display()
+    )]
+    HardLinked {
+        /// The state file.
+        path: PathBuf,
+        /// Its link count.
+        links: u64,
+    },
     /// The file is not a state store this binary reads (another schema, or another
     /// application's database), or the filesystem cannot keep it in WAL mode.
     #[error("{0}")]
