@@ -2,9 +2,9 @@
 //!
 //! The same [`Cas`] a runtime uses against [`crate::Transfers`], but each blob goes to
 //! the storage nodes that own it (`kbf_route::Router`): reads from the owners in rank
-//! order (callers of one blob at once share one read), writes to the primary, FindMissing
-//! split by primary. A daemon holds a connection to a frontend for work, and to storage
-//! nodes for bytes.
+//! order (callers of one blob at once share one read), writes to the first owner that is
+//! not down, FindMissing split by primary. A daemon holds a connection to a frontend for
+//! work, and to storage nodes for bytes.
 //!
 //! What it keeps from the engine: at most `--transfer-in-flight` requests at once for the
 //! process, FindMissing in calls of at most `--transfer-find-missing-chunk` digests, a
@@ -18,25 +18,25 @@
 //!   chunks, because the storage client has no streamed write ([`kbf_storage::Storage`]
 //!   takes a blob whole).
 //! - **A byte budget** for reads into memory ([`Cas::get`]); `--transfer-bytes-in-flight`
-//!   does not apply. Reads into a file stream, and hold one chunk.
+//!   does not apply. Reads into a file stream, and hold one chunk; a copy that turns out
+//!   not to be the blob is cut off the file and the next owner is read from the start.
 
 use std::future::Future;
+use std::io::SeekFrom;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::StreamExt as _;
 use futures::future::join_all;
 use kbf_proto::reapi::Digest;
-use kbf_route::Router;
+use kbf_route::{BlobSink, IntoError, Router};
 use kbf_storage::StorageError;
 use kbf_types::{DigestFunction, LeaseId};
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::sync::Semaphore;
 
 use crate::cas::{Cas, CasError, label};
 use crate::config::TransferConfig;
 use crate::spool::to_proto;
-use kbf_segments::RecordHasher;
 
 /// The daemon's data plane over the storage map. Cheap to clone through its `Arc`.
 pub struct RoutedCas {
@@ -67,16 +67,38 @@ impl RoutedCas {
     }
 }
 
+/// A file a blob is read into, from the offset it had when the read began.
+struct FileSink<'a> {
+    file: &'a mut tokio::fs::File,
+    start: u64,
+}
+
+impl BlobSink for FileSink<'_> {
+    type Error = std::io::Error;
+
+    async fn write(&mut self, chunk: &[u8]) -> std::io::Result<()> {
+        self.file.write_all(chunk).await
+    }
+
+    /// Cuts the file back to where the read began and goes back there.
+    async fn discard(&mut self) -> std::io::Result<()> {
+        self.file.set_len(self.start).await?;
+        self.file.seek(SeekFrom::Start(self.start)).await.map(drop)
+    }
+}
+
 /// `digest` as storage names it, or `None` when it is not a SHA-256 digest with a size,
 /// which no store holds.
 fn parse(digest: &Digest) -> Option<kbf_types::Digest> {
     kbf_types::Digest::parse(DigestFunction::Sha256, &label(digest)).ok()
 }
 
-/// A storage failure as the data plane's: only a blob the farm does not hold is missing.
+/// A storage failure as the data plane's: only a blob the farm does not hold is missing,
+/// and only bytes that are not the blob are corrupt.
 fn failed(blob: String, error: &StorageError) -> CasError {
     match error {
         StorageError::NotFound(_) => CasError::Missing(blob),
+        StorageError::Corrupt { actual, .. } => CasError::Corrupt(blob, label(&to_proto(actual))),
         other => CasError::Unavailable(blob, other.to_string()),
     }
 }
@@ -107,30 +129,31 @@ impl Cas for RoutedCas {
         }
     }
 
+    /// Streams the blob into `file` from its offset, one chunk at a time, through
+    /// [`Router::read_blob_into`]: the owners are tried as [`Cas::get`] tries them, and
+    /// an owner's copy that is not the blob is cut off the file before the next owner's is
+    /// written. On every error the file holds what it held before, and its offset is
+    /// where it was.
     async fn read_to(&self, digest: &Digest, file: &mut tokio::fs::File) -> Result<(), CasError> {
         let blob = label(digest);
         let Some(parsed) = parse(digest) else {
             return Err(CasError::Missing(blob));
         };
+        let start = file.stream_position().await;
+        let start = start.map_err(|e| CasError::Write(blob.clone(), e.to_string()))?;
         let _permit = self.requests.acquire().await;
-        let mut stream = self
-            .router
-            .read_range(&parsed, 0, 0)
-            .await
-            .map_err(|e| failed(blob.clone(), &e))?;
-        let mut hasher = RecordHasher::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| failed(blob.clone(), &e))?;
-            hasher.update(&chunk);
-            let written = file.write_all(&chunk).await;
-            written.map_err(|e| CasError::Write(blob.clone(), e.to_string()))?;
-        }
-        let (read, _) = hasher.finish();
-        if read != parsed {
-            return Err(CasError::Corrupt(blob, label(&to_proto(&read))));
-        }
-        let flushed = file.flush().await;
-        flushed.map_err(|e| CasError::Write(blob, e.to_string()))
+        let mut sink = FileSink { file, start };
+        let read = match self.router.read_blob_into(&parsed, &mut sink).await {
+            Ok(()) => sink.file.flush().await,
+            Err(IntoError::Storage(e)) => return Err(failed(blob, &e)),
+            Err(IntoError::Sink(e)) => Err(e),
+        };
+        let Err(error) = read else {
+            return Ok(());
+        };
+        // What was written may be in the file: it goes, if the file still lets it.
+        let _ = sink.discard().await;
+        Err(CasError::Write(blob, error.to_string()))
     }
 
     async fn missing(&self, digests: &[Digest]) -> Vec<Digest> {

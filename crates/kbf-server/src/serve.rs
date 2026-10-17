@@ -3,6 +3,7 @@
 
 use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,6 +23,7 @@ use kbf_proto::reapi::content_addressable_storage_server::ContentAddressableStor
 use kbf_proto::worker::segments_server::SegmentsServer;
 use kbf_proto::worker::worker_server::WorkerServer;
 use kbf_sched::MemoryLadder;
+use kbf_storage::service::Admission;
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, ServerTlsConfig};
@@ -34,9 +36,13 @@ use crate::health::Readiness;
 use crate::http_blobs::BlobReaders;
 use crate::http_invocations::InvocationReaders;
 use crate::identity::{DenyList, Peers};
+use crate::members::{Members, MembershipError};
+use crate::members_rpc::MembershipService;
 use crate::state_store::StateStore;
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
+use kbf_mapsync::MapSource;
+use kbf_proto::kbf::map::v1::membership_server::MembershipServer;
 
 /// How the server listens and paces its daemons.
 #[derive(Clone, Debug)]
@@ -162,6 +168,9 @@ pub enum ServeError {
     /// The scheduler's state store could not be taken up.
     #[error("--state-store: {0}")]
     State(#[from] StateError),
+    /// The storage map could not be read from the state store.
+    #[error("storage map: {0}")]
+    Map(#[from] MembershipError),
 }
 
 /// A server that is listening: the addresses it bound, and the future that serves
@@ -296,6 +305,61 @@ pub(crate) fn keepalive(server: Server, timing: StreamTiming) -> Server {
 const STATE_IN_MEMORY: &str = "the scheduler's state is in memory: no cordon, drain, lease or \
     operation of an earlier server process is restored, and the server keeps no rollout record";
 
+/// The members a frontend with a state store keeps. Not generic, for the same reason as
+/// [`sweeping`].
+pub(crate) fn members_of(state: Option<&crate::StateStore>) -> Option<Arc<Members>> {
+    let state = state?;
+    Some(Arc::new(Members::new(
+        Arc::clone(&state.store),
+        state.members,
+    )))
+}
+
+/// The storage map daemons are sent: `explicit` if a caller gave one, else the members'
+/// (every frontend with a state store has members), else none (a farm of one member, whose
+/// daemons use the cache they were given). Not generic, for the same reason as
+/// [`sweeping`].
+///
+/// # Errors
+/// The state store failing to read the map.
+pub(crate) fn map_of(
+    explicit: Option<Arc<dyn MapSource>>,
+    members: Option<&Arc<Members>>,
+) -> Result<Option<Arc<dyn MapSource>>, MembershipError> {
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    members.map(Members::map_source).transpose()
+}
+
+/// The membership service storage nodes register with, when there are members to keep:
+/// under worker TLS only the storage role may call it. Not generic, for the same reason
+/// as [`sweeping`].
+pub(crate) fn membership(
+    members: Option<Arc<Members>>,
+    certified: bool,
+) -> Option<MembershipServer<MembershipService>> {
+    let admission = if certified {
+        Admission::Certified
+    } else {
+        Admission::Open
+    };
+    Some(MembershipService::new(members?, admission).server())
+}
+
+/// Expires members while the server runs. Never completes; with no state store there
+/// are none, and it waits forever. A function of its own and not generic, so the tests
+/// measure one copy of these lines and not the best of the server's instantiations.
+///
+/// Builds the future and does not await it here: a function that awaits a future that
+/// never completes has a closing line no test can reach.
+pub(crate) fn sweeping(members: Option<Arc<Members>>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    match members {
+        Some(members) => Box::pin(crate::members_rpc::sweep(members)),
+        None => Box::pin(std::future::pending()),
+    }
+}
+
 /// Logs where the scheduler's state is, at every start. Not generic, unlike the binding
 /// that calls it, so every test binary's runs count toward the same function's coverage.
 pub(crate) fn log_state(durable: bool, term: u64, epoch: u64) {
@@ -424,7 +488,7 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, None, None, shutdown)
+    bind_server_with_options(cache, listeners, api, policy, None, None, None, shutdown)
 }
 
 /// [`bind_server_with_policy`], with the scheduler's state kept in `state` if given
@@ -444,7 +508,28 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, state, None, shutdown)
+    bind_server_with_options(cache, listeners, api, policy, state, None, None, shutdown)
+}
+
+/// [`bind_server_with_state`], sending daemons the storage map `map` holds if given: in
+/// `Welcome`, and in a `MapUpdate` each time it changes ([`WorkerService::with_map`]).
+///
+/// # Errors
+/// As [`bind_server_with_state`].
+pub fn bind_server_with_map<M, O>(
+    cache: Arc<Cache<M, O>>,
+    listeners: Listeners,
+    api: Option<Api>,
+    policy: Policy,
+    state: Option<StateStore>,
+    map: Option<Arc<dyn MapSource>>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
+    bind_server_with_options(cache, listeners, api, policy, state, None, map, shutdown)
 }
 
 /// [`bind_server_with_policy`], and with a `storage` node (`--storage`) the REAPI
@@ -465,15 +550,20 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, None, storage, shutdown)
+    bind_server_with_options(cache, listeners, api, policy, None, storage, None, shutdown)
 }
 
-/// [`bind_server_with_policy`] with both of its options: the scheduler's state in
-/// `state` ([`bind_server_with_state`]) and the client's CAS, ByteStream and
-/// action-cache calls proxied to a `storage` node ([`bind_server_with_storage`]).
+/// [`bind_server_with_policy`] with all of its options: the scheduler's state in
+/// `state` ([`bind_server_with_state`]), the client's CAS, ByteStream and
+/// action-cache calls proxied to a `storage` node ([`bind_server_with_storage`]), and
+/// the storage map `map` sent to daemons ([`bind_server_with_map`]).
 ///
 /// # Errors
 /// As [`bind_server_with_state`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every option the bind functions delegate"
+)]
 pub fn bind_server_with_options<M, O>(
     cache: Arc<Cache<M, O>>,
     listeners: Listeners,
@@ -481,6 +571,7 @@ pub fn bind_server_with_options<M, O>(
     policy: Policy,
     state: Option<StateStore>,
     storage: Option<tonic::transport::Endpoint>,
+    map: Option<Arc<dyn MapSource>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
 where
@@ -497,6 +588,9 @@ where
     .with_memory_ladder(listeners.memory_ladder.clone())
     .recording(recorder.clone());
     let durable = state.is_some();
+    // Storage nodes register with a frontend that has a state store to keep them in.
+    let members = members_of(state.as_ref());
+    let map = map_of(map, members.as_ref())?;
     let farm = Arc::new(farm.with_state(state)?);
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
@@ -533,6 +627,7 @@ where
         reapi_server = reapi_server.tls_config(tls)?;
     }
     let mut worker_server = keepalive(flow_control(Server::builder()), listeners.streams);
+    let peers_certified = listeners.worker_tls.is_some();
     let peers;
     (worker_server, peers) = worker_peers(worker_server, listeners.worker_tls)?;
     let worker_blobs = ByteStreamServer::new(WorkerBlobs::new(
@@ -559,14 +654,18 @@ where
     ))
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
-    let worker_service = WorkerServer::new(WorkerService::new(
+    let sessions = WorkerService::new(
         Arc::clone(&farm),
         peers,
         listeners.heartbeat_interval,
         listeners.hello_wait,
-    ))
-    .max_decoding_message_size(MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    );
+    // The map, if there is one: no branch in this generic function.
+    let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
+    let worker_service = WorkerServer::new(sessions)
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    let membership = membership(members.clone(), peers_certified);
     let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);
@@ -626,6 +725,7 @@ where
             .add_service(worker_blobs)
             .add_service(worker_cas)
             .add_service(worker_segments)
+            .add_optional_service(membership)
             .serve_with_incoming(worker_incoming);
         // Told when the REAPI listener is done, so the operator API answers what it is
         // answering (the request that began a drain on an idle frontend, whose
@@ -639,6 +739,7 @@ where
             },
         );
         tokio::pin!(api_serve);
+        let sweeping = sweeping(members);
         let ticking = async {
             let mut tick = tokio::time::interval(listeners.tick);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -665,6 +766,7 @@ where
             // for again below (`reapi_done` stays false).
             served = &mut api_serve => served.map_err(ServeError::Api),
             () = ticking => Ok(()),
+            () = sweeping => Ok(()),
             // One timer for every open stream's progress operation.
             () = ticker.run() => Ok(()),
             () = stopping => Ok(()),
@@ -698,6 +800,17 @@ pub struct StorageListener {
     pub service: kbf_storage::service::Config,
 }
 
+/// The check each call of a gated node passes ([`bind_storage_gated`]). Not generic, so
+/// the lines count once.
+fn map_gate(
+    maps: Option<Arc<kbf_mapsync::MapHolder>>,
+) -> impl FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Clone {
+    move |request| match &maps {
+        Some(maps) if maps.generation() == 0 => Err(tonic::Status::unavailable(NO_MAP_YET)),
+        _ => Ok(request),
+    }
+}
+
 /// A storage node that is listening.
 pub struct BoundStorage<F> {
     /// Where the listener is.
@@ -718,6 +831,26 @@ pub fn bind_storage(
     listener: StorageListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
+    bind_storage_gated(storage, listener, None, shutdown)
+}
+
+/// The refusal a gated node answers every call with until its first map.
+pub const NO_MAP_YET: &str = "no storage map yet";
+
+/// [`bind_storage`], and with `maps` (a node in a multi-member farm, which registered
+/// with a frontend) every call is answered UNAVAILABLE [`NO_MAP_YET`] until `maps` holds
+/// its first map: a node that does not know the farm's members cannot tell a blob it owns
+/// from one it does not, and would take a write the map places elsewhere. `None` (one
+/// box, whose map is itself) serves at once.
+///
+/// # Errors
+/// As [`bind_storage`].
+pub fn bind_storage_gated(
+    storage: Arc<dyn kbf_storage::Storage>,
+    listener: StorageListener,
+    maps: Option<Arc<kbf_mapsync::MapHolder>>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
     let (incoming, addr) = bind(listener.listen)?;
     let mut server = flow_control(Server::builder());
     let admission = match listener.tls {
@@ -729,8 +862,10 @@ pub fn bind_storage(
     };
     let routes =
         kbf_storage::service::StorageService::new(storage, admission, listener.service).routes();
+    let gate = tonic::service::InterceptorLayer::new(map_gate(maps));
     let serving = async move {
         server
+            .layer(gate)
             .add_routes(routes)
             .serve_with_incoming_shutdown(incoming, shutdown)
             .await

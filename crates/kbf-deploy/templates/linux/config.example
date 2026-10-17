@@ -28,7 +28,9 @@ KBF_DAEMON_MEMORY_MIN_MIB=256
 # --- MinIO ---
 # The host's MinIO systemd unit, which the drop-in extends.
 MINIO_UNIT=minio.service
-# kbf-server's S3 endpoint: the host's own MinIO node.
+# The bucket's S3 endpoint. Left out, the converged units use the host's own MinIO
+# (http://127.0.0.1:9000); `render-units --mode storage` refuses without it, since a
+# storage node's MinIO need not be on the node.
 MINIO_S3_ENDPOINT=http://127.0.0.1:9000
 KBF_S3_BUCKET=kbf-cas
 
@@ -40,6 +42,12 @@ KBF_SERVER_USER=kbf-server
 KBF_REAPI_PORT=8980
 KBF_WORKER_PORT=8981
 KBF_API_PORT=8982
+# `kbf storage`'s gRPC port (--storage-listen), on KBF_LISTEN_ADDRESS. Not kbf's own
+# default (8982), which is KBF_API_PORT's.
+KBF_STORAGE_PORT=8983
+# `kbf storage`'s hot store (--hot-store=file://<dir>): the SSD tier uploads land in
+# before they are flushed to the cold store. On local disk, the server user's.
+KBF_HOT_DIR=/var/lib/kbf-server/hot
 
 # --- kbf-daemon ---
 KBF_USER=kbf

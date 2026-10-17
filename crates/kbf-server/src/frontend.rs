@@ -73,7 +73,7 @@ use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::{Checks, MapProbe, Readiness, StateProbe, StorageProbe};
 use crate::serve::{
     AbortOnDrop, ServeError, bind, bind_api, drain_and_stop, flow_control, keepalive, log_state,
-    serve_api, stop_api, worker_peers,
+    map_of, members_of, membership, serve_api, stop_api, sweeping, worker_peers,
 };
 use crate::start::{Escalation, escalating, interruptions};
 use crate::worker::WorkerService;
@@ -105,6 +105,8 @@ pub const ALLOWED: &[&str] = &[
     "shutdown_timeout_secs",
     "invocation_memory",
     "state_store",
+    "member_ttl_secs",
+    "member_dwell_secs",
     "log_dir",
     "log_max_bytes",
     "log_files",
@@ -363,11 +365,15 @@ fn bind_frontend(
     let policy = args.reapi_auth_policy()?;
     let api = args.api()?;
     let channel = flags.storage_endpoint()?.connect_lazy();
-    let state = args
-        .state_store
-        .as_ref()
-        .map(crate::StateStoreUri::open)
-        .transpose()?;
+    let state = crate::start::with_members(
+        args.state_store
+            .as_ref()
+            .map(crate::StateStoreUri::open)
+            .transpose()?,
+        args.members(),
+    );
+    let members = members_of(state.as_ref());
+    let map = map_of(None, members.as_ref())?;
     let readiness = Arc::new(Readiness::default());
     let timeout = listeners.store_probe_timeout;
     let storage = Arc::new(RemoteStorage::new(channel.clone(), 0));
@@ -412,19 +418,24 @@ fn bind_frontend(
     if let Some(tls) = listeners.reapi_tls {
         reapi_server = reapi_server.tls_config(tls)?;
     }
+    let peers_certified = listeners.worker_tls.is_some();
     let (mut worker_server, peers) = worker_peers(
         keepalive(flow_control(Server::builder()), listeners.streams),
         listeners.worker_tls,
     )?;
-    let worker_service = WorkerServer::new(WorkerService::new(
+    let sessions = WorkerService::new(
         Arc::clone(&farm),
         peers,
         listeners.heartbeat_interval,
         listeners.hello_wait,
-    ))
-    .max_decoding_message_size(MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    );
+    // Daemons are sent the members' map: Welcome.map and a MapUpdate at each bump.
+    let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
+    let worker_service = WorkerServer::new(sessions)
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES);
 
+    let membership = membership(members.clone(), peers_certified);
     let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
     let proxy = Proxy::new(
@@ -462,6 +473,7 @@ fn bind_frontend(
             });
         let worker_serve = worker_server
             .add_service(worker_service)
+            .add_optional_service(membership)
             .serve_with_incoming(worker_incoming);
         // Told when the REAPI listener is done (see `serve::stop_api`).
         let (api_stop, api_stopped) = tokio::sync::oneshot::channel::<()>();
@@ -473,6 +485,7 @@ fn bind_frontend(
             },
         );
         tokio::pin!(api_serve);
+        let sweeping = sweeping(members);
         let ticking = async {
             let mut tick = tokio::time::interval(listeners.tick);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -493,6 +506,7 @@ fn bind_frontend(
             }
             served = worker_serve => served.map_err(ServeError::from),
             served = &mut api_serve => served.map_err(ServeError::Api),
+            () = sweeping => Ok(()),
             () = ticking => Ok(()),
             () = ticker.run() => Ok(()),
             () = stopping => Ok(()),

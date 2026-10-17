@@ -25,7 +25,10 @@
 //! This crate depends on no frontend crate: not the scheduler (`kbf-sched`) and not
 //! authorization (`kbf-auth`). `crates/kbf-it/tests/layering.rs` checks it.
 
+pub mod flush;
 pub mod local_cache;
+pub mod repair;
+pub mod replicate;
 pub mod service;
 
 use std::sync::Arc;
@@ -199,6 +202,17 @@ pub enum StorageError {
         /// The digest of the bytes it sent.
         actual: Digest,
     },
+    /// Bytes read for a blob do not hash to the digest that names it: a node served the
+    /// wrong bytes (or too many, or too few). Never the caller's fault, and not a reason to
+    /// believe the node: the router goes on to another owner.
+    #[error("blob {digest} came back as bytes that hash to {actual}")]
+    Corrupt {
+        /// The blob asked for.
+        digest: Digest,
+        /// The digest of the bytes that came back: of all of them, or, for a node that
+        /// sent more than `digest` names, of the first byte past its size and those before.
+        actual: Digest,
+    },
     /// A read starting past the end of the blob. ByteStream answers it OUT_OF_RANGE (a
     /// `read_offset` greater than the resource's size), which is not a malformed request
     /// to be fixed but one a caller may make on purpose.
@@ -262,6 +276,7 @@ impl From<StorageError> for Status {
                     .insert(service::MAP_GENERATION_HEADER, MetadataValue::from(current));
                 status
             }
+            StorageError::Corrupt { .. } => Self::data_loss(message),
             StorageError::Internal(_) => Self::internal(message),
         }
     }

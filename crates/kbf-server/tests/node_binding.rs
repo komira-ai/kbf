@@ -14,8 +14,8 @@ use clap::Parser;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use kbf_front::Cache;
 use kbf_proto::worker::{
-    Capability, DaemonMessage, Heartbeat, Hello, NodeStatus, ServerMessage, Start, daemon_message,
-    server_message, worker_client::WorkerClient,
+    Capability, DaemonMessage, Heartbeat, Hello, MapRequest, NodeStatus, ServerMessage, Start,
+    daemon_message, server_message, worker_client::WorkerClient,
 };
 use kbf_server::{Api, Args, ConfigError, DenyListError, bind_server, bind_server_with_api};
 use rcgen::{
@@ -463,6 +463,43 @@ async fn a_revoked_daemon_cannot_deliver_a_result() {
     assert_eq!(ended.code(), Code::PermissionDenied, "{ended:?}");
     assert!(ended.message().contains("serial 51"), "{}", ended.message());
     assert_eq!(cell.cached(&job.action).await, Err(Code::NotFound));
+}
+
+/// Catches: a `MapRequest` not checked against the deny list, so a node revoked while its
+/// stream is open goes on pulling the storage map. The control: the same stream's request
+/// before the revocation is accepted (this server holds no map, so it is not answered, and
+/// the stream goes on).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_daemon_cannot_ask_for_the_map() {
+    let (pki, _cell, _job, mut daemon, _start) = node_a_holding_a_lease("deny-map").await;
+    daemon.send(daemon_message::Message::MapRequest(MapRequest {
+        at_least: 2,
+    }));
+    let acked = daemon.heartbeat(1).await.expect("the stream goes on");
+    assert!(
+        matches!(
+            acked,
+            Some(ServerMessage {
+                message: Some(server_message::Message::HeartbeatAck(_))
+            })
+        ),
+        "{acked:?}"
+    );
+
+    pki.write("deny.list", "node node-a\n");
+    daemon.send(daemon_message::Message::MapRequest(MapRequest {
+        at_least: 2,
+    }));
+    let ended = daemon
+        .next()
+        .await
+        .expect_err("the MapRequest ended the stream");
+    assert_eq!(ended.code(), Code::PermissionDenied, "{ended:?}");
+    assert!(
+        ended.message().contains("node node-a"),
+        "{}",
+        ended.message()
+    );
 }
 
 /// Catches: a session that goes on reading its stream after it refused a message

@@ -78,15 +78,20 @@ pub mod health;
 pub mod http_blobs;
 pub mod http_invocations;
 pub mod identity;
+pub mod join;
 mod local;
 pub mod log_file;
 pub mod machine;
+mod map_push;
 pub mod mdm;
+pub mod members;
+pub mod members_rpc;
 mod memory;
 pub mod metrics;
 mod missing;
 pub mod raft_log;
 pub mod rollout;
+mod run_record;
 pub mod serve;
 pub mod stamp;
 mod start;
@@ -109,9 +114,10 @@ pub use kbf_sched::MemoryLadder;
 pub use local::LocalStore;
 pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use serve::{
-    Api, Bound, BoundStorage, Listeners, ServeError, StorageListener, StreamTiming, WorkerTls,
-    bind_server, bind_server_with_api, bind_server_with_options, bind_server_with_policy,
-    bind_server_with_state, bind_server_with_storage, bind_storage,
+    Api, Bound, BoundStorage, Listeners, NO_MAP_YET, ServeError, StorageListener, StreamTiming,
+    WorkerTls, bind_server, bind_server_with_api, bind_server_with_map, bind_server_with_options,
+    bind_server_with_policy, bind_server_with_state, bind_server_with_storage, bind_storage,
+    bind_storage_gated,
 };
 pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_interruptible};
 pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};

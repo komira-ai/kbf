@@ -60,7 +60,8 @@ zip.workspace = true
 kbf-host = { workspace = true, features = ["testkit"] }
 # Security-key signatures made in software, for `mdm erase-request`'s tests.
 kbf-mdm = { workspace = true, features = ["testkit"] }
-# The certificates of the HTTPS servers the `mdm` tests run.
+# The certificates of the HTTPS servers the `mdm` tests run, and the ones
+# `linux verify-cert` is tested against.
 rcgen.workspace = true
 rustix = { workspace = true, features = ["process"] }
 # Databases a state restore must refuse: another application's, a damaged one.

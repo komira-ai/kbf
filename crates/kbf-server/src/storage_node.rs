@@ -17,8 +17,18 @@
 //! [`Args`]: a flag added there that is not listed in [`ALLOWED`] is refused here with
 //! no edit.
 //!
-//! **The map** (section 6) is one member: this node. Every request carries a generation
-//! and the node ignores it; membership, `STALE_MAP` and the other members are av2-08.
+//! **The map** (section 6). Without `--frontend` it is one member: this node, for one box.
+//! With `--frontend <url>` the node registers with that frontend once it is listening, and
+//! heartbeats at the interval the frontend names ([`crate::join`]); over `https` it
+//! presents its own certificate and trusts `--storage-client-ca`. It advertises
+//! `--advertise-addr`, or the address it bound (which must then not be a wildcard). The node
+//! never talks to the state store. The maps the frontend sends it (at registration, and at
+//! any heartbeat that finds it behind) are kept in a [`kbf_mapsync::MapHolder`]
+//! ([`StorageHandle::maps`]). Until the first one arrives the node answers every call
+//! UNAVAILABLE `no storage map yet` ([`crate::serve::bind_storage_gated`]): it does not know
+//! the farm's members, so it cannot know which blobs are its own. Every request still
+//! carries a generation, which the node ignores; the `STALE_MAP` check is the storage
+//! service's.
 
 use std::error::Error;
 use std::future::Future;
@@ -33,14 +43,16 @@ use std::time::Duration;
 use clap::{Arg, ArgMatches, Command, FromArgMatches as _};
 use kbf_front::{Cache, CacheStorage, SegmentsConfig};
 use kbf_log::FarmLogId;
+use kbf_mapsync::MapHolder;
 use kbf_meta::Retention;
 use kbf_objstore::{KeyPrefix, ObjectStore};
 use kbf_store::StdFs;
 use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
-use tonic::transport::{Certificate, Identity, ServerTlsConfig};
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig};
 
-use crate::serve::{ServeError, StorageListener, bind_storage};
+use crate::join::{self, Joiner};
+use crate::serve::{ServeError, StorageListener, bind_storage_gated};
 use crate::start::{AbortOnDrop, open_cold_file};
 use crate::startup_pass::StartPass;
 use crate::stores::{FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
@@ -72,6 +84,13 @@ pub const ALLOWED: &[&str] = &[
 
 /// The id of `--storage-listen`.
 const LISTEN: &str = "storage_listen";
+/// The ids of the registration flags.
+const REGISTRATION: [&str; 4] = [
+    "frontend",
+    "advertise_addr",
+    "storage_zone",
+    "storage_weight",
+];
 /// The ids of the three TLS flags, in the order [`StorageFlags::tls`] reads them.
 const TLS: [&str; 3] = ["storage_tls_cert", "storage_tls_key", "storage_client_ca"];
 
@@ -85,6 +104,14 @@ pub struct StorageFlags {
     pub listen: SocketAddr,
     /// The server certificate, its key and the client CA, all three or none.
     pub tls: Option<[PathBuf; 3]>,
+    /// The frontend to register with (`http://` or `https://`), if any.
+    pub frontend: Option<String>,
+    /// The address to tell the frontend callers dial; default the bound address.
+    pub advertise: Option<String>,
+    /// The zone label to register with.
+    pub zone: String,
+    /// The weight to register with.
+    pub weight: u32,
 }
 
 /// The command line of `kbf storage`: [`Args`]'s, those it takes shown and the rest
@@ -128,6 +155,40 @@ pub fn command() -> Command {
         [TLS[0], TLS[2]],
         "The server certificate's private key (PEM).",
     ))
+    .arg(
+        Arg::new(REGISTRATION[0])
+            .long("frontend")
+            .value_name("URL")
+            .help(
+                "Registers with this frontend (http:// or https://) and heartbeats to it. \
+                 Without it the node is a one-member map of itself.",
+            ),
+    )
+    .arg(
+        Arg::new(REGISTRATION[1])
+            .long("advertise-addr")
+            .value_name("HOST:PORT")
+            .requires(REGISTRATION[0])
+            .help(
+                "The address callers dial, where --storage-listen is not routable. Default: \
+                 the address the node bound.",
+            ),
+    )
+    .arg(
+        Arg::new(REGISTRATION[2])
+            .long("storage-zone")
+            .value_name("LABEL")
+            .requires(REGISTRATION[0])
+            .help("The zone label to register with. Default: none."),
+    )
+    .arg(
+        Arg::new(REGISTRATION[3])
+            .long("storage-weight")
+            .value_name("N")
+            .requires(REGISTRATION[0])
+            .value_parser(clap::value_parser!(u32).range(1..))
+            .help("The node's share of the digests relative to the others. Default: 1."),
+    )
     .arg(path(
         TLS[2],
         "storage-client-ca",
@@ -157,13 +218,38 @@ pub fn parse(m: &ArgMatches) -> Result<StorageFlags, clap::Error> {
         .iter()
         .filter_map(|id| m.get_one::<PathBuf>(id).cloned())
         .collect();
+    let listen = *m
+        .get_one::<SocketAddr>(LISTEN)
+        .expect("--storage-listen has a default");
+    // clap makes the three come together.
+    let tls = <[PathBuf; 3]>::try_from(paths).ok();
+    let text = |id: &str| m.get_one::<String>(id).cloned();
+    let (frontend, advertise) = (text(REGISTRATION[0]), text(REGISTRATION[1]));
+    if let Some(url) = &frontend {
+        let secure = url.starts_with("https://");
+        let refusal = if !secure && !url.starts_with("http://") {
+            Some("--frontend must be an http:// or https:// URL")
+        } else if secure && tls.is_none() {
+            Some(
+                "--frontend https:// needs --storage-tls-cert, --storage-tls-key and --storage-client-ca",
+            )
+        } else if advertise.is_none() && listen.ip().is_unspecified() {
+            Some("--storage-listen is a wildcard address, so --advertise-addr is required")
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            return Err(command().error(clap::error::ErrorKind::InvalidValue, refusal));
+        }
+    }
     Ok(StorageFlags {
         server,
-        listen: *m
-            .get_one::<SocketAddr>(LISTEN)
-            .expect("--storage-listen has a default"),
-        // clap makes the three come together.
-        tls: <[PathBuf; 3]>::try_from(paths).ok(),
+        listen,
+        tls,
+        frontend,
+        advertise,
+        zone: text(REGISTRATION[2]).unwrap_or_default(),
+        weight: m.get_one::<u32>(REGISTRATION[3]).copied().unwrap_or(1),
     })
 }
 
@@ -201,6 +287,40 @@ impl StorageFlags {
         })
     }
 
+    /// The registration with `--frontend`, for a node bound at `bound`, keeping the maps it
+    /// is sent in `maps`; `None` without the flag. Connects lazily, so a frontend that is down at start is waited for.
+    ///
+    /// # Errors
+    /// A TLS file cannot be read or is refused; the URL is refused.
+    pub fn joiner(
+        &self,
+        bound: SocketAddr,
+        maps: Arc<MapHolder>,
+    ) -> Result<Option<Joiner>, Box<dyn Error>> {
+        let Some(url) = &self.frontend else {
+            return Ok(None);
+        };
+        let mut endpoint = Endpoint::from_shared(url.clone())?;
+        if let (true, Some([cert, key, ca])) = (url.starts_with("https://"), &self.tls) {
+            let tls = ClientTlsConfig::new()
+                .identity(Identity::from_pem(
+                    crate::config::read(cert)?,
+                    crate::config::read(key)?,
+                ))
+                .ca_certificate(Certificate::from_pem(crate::config::read(ca)?));
+            endpoint = endpoint.tls_config(tls)?;
+        }
+        let addr = self.advertise.clone().unwrap_or_else(|| bound.to_string());
+        let identity = join::Identity {
+            instance_id: addr.clone(),
+            addr,
+            zone: self.zone.clone(),
+            weight: self.weight,
+        };
+        let joiner = Joiner::new(endpoint.connect_lazy(), identity, join::RETRY_BASE);
+        Ok(Some(joiner.with_maps(maps)))
+    }
+
     /// The `Segments` uploads the node keeps: `--segment-upload-*`.
     fn segments(&self) -> SegmentsConfig {
         SegmentsConfig {
@@ -219,9 +339,18 @@ pub struct StorageHandle {
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
     _pass: Option<AbortOnDrop>,
+    maps: Arc<MapHolder>,
+    _joiner: Option<AbortOnDrop>,
 }
 
 impl StorageHandle {
+    /// The storage map this node holds: what the frontend sent it when it registered and
+    /// at each heartbeat that found it behind. Empty for a node with no `--frontend`.
+    #[must_use]
+    pub fn maps(&self) -> Arc<MapHolder> {
+        Arc::clone(&self.maps)
+    }
+
     /// The line the node prints once it is bound:
     /// `kbf-storage <version> storage=<addr> log=<id>`.
     #[must_use]
@@ -239,6 +368,7 @@ impl StorageHandle {
             serving,
             _flusher,
             _pass,
+            _joiner,
             ..
         } = self;
         serving.await
@@ -349,7 +479,14 @@ where
     });
     let _pass = pass.map(|pass| AbortOnDrop(crate::startup_pass::spawn(Arc::clone(&cache), pass)));
     let storage = Arc::new(CacheStorage::new(cache, flags.segments()));
-    let bound = bind_storage(storage, listener, shutdown()?)?;
+    let maps = Arc::new(MapHolder::new());
+    // A node that registers with a frontend is one of several: it serves nothing until
+    // it holds the map. One box (no `--frontend`) serves at once.
+    let gate = flags.frontend.as_ref().map(|_| Arc::clone(&maps));
+    let bound = bind_storage_gated(storage, listener, gate, shutdown()?)?;
+    let _joiner = flags
+        .joiner(bound.addr, Arc::clone(&maps))?
+        .map(|joiner| AbortOnDrop(tokio::spawn(joiner.run())));
     Ok(StorageHandle {
         addr: bound.addr,
         start_line: format!(
@@ -359,6 +496,8 @@ where
         serving: Box::pin(bound.serving),
         _flusher,
         _pass,
+        maps,
+        _joiner,
     })
 }
 

@@ -19,8 +19,8 @@ use kbf_server::{EpochPolicy, Farm, Listeners, ServeError, StateError, StateStor
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::sqlite::{Options, SqliteStore};
 use kbf_state::{
-    Changes, Commit, CommitStats, Conflict, ManualClock, Revision, Store, StoreError, StoreTime,
-    Txn, Versioned,
+    Changes, Commit, CommitStats, Conflict, ManualClock, Revision, ScanPage, ScanRange, Store,
+    StoreError, StoreTime, Txn, Versioned,
 };
 use kbf_types::{ActionKey, Digest, DigestFunction, LeaseId, LeaseKind, Qos, Resources, WorkerId};
 use tokio::sync::mpsc;
@@ -185,6 +185,10 @@ impl Store for Flaky {
         self.inner.store().scan_prefix(prefix)
     }
 
+    fn scan_range(&self, scan: ScanRange<'_>) -> Result<ScanPage, StoreError> {
+        self.inner.store().scan_range(scan)
+    }
+
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {
         self.inner.store().changes(after, limit)
     }
@@ -241,7 +245,11 @@ impl Disk {
             kbf_sched::UNSERVABLE_WAIT,
             kbf_sched::FINISHED_RETENTION,
         )
-        .with_state(Some(StateStore { store, epoch }))
+        .with_state(Some(StateStore {
+            store,
+            epoch,
+            members: Default::default(),
+        }))
     }
 
     /// The process dies: its farm is gone, and the store reopens as the disk left it.
@@ -980,6 +988,7 @@ async fn a_server_binds_over_a_state_store_or_refuses_it() {
     let state = |disk: &Disk| StateStore {
         store: disk.store.clone(),
         epoch: EpochPolicy::Keep,
+        members: Default::default(),
     };
     let bind = |state| {
         kbf_server::bind_server_with_state(

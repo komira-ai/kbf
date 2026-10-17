@@ -23,8 +23,8 @@ use kbf_objstore::{
 };
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{
-    Changes, Commit, CommitStats, Conflict, ManualClock, Op, Revision, Store, StoreError,
-    StoreTime, Txn, Versioned,
+    Changes, Commit, CommitStats, Conflict, ManualClock, Op, Revision, ScanPage, ScanRange, Store,
+    StoreError, StoreTime, Txn, Versioned,
 };
 
 /// 2026-10-16T00:00:00Z.
@@ -291,6 +291,12 @@ impl Store for Index {
         self.check_thread();
         self.scans.fetch_add(1, Ordering::SeqCst);
         self.inner.scan_prefix(prefix)
+    }
+
+    fn scan_range(&self, scan: ScanRange<'_>) -> Result<ScanPage, StoreError> {
+        self.check_thread();
+        self.scans.fetch_add(1, Ordering::SeqCst);
+        self.inner.scan_range(scan)
     }
 
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {
