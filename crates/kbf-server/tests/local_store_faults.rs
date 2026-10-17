@@ -69,6 +69,15 @@ impl Storage for Faulty {
         None
     }
 
+    fn put_streamed(
+        &self,
+        _size: u64,
+        _bytes: futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
+        _claim: futures::future::BoxFuture<'static, Option<Digest>>,
+    ) -> Answer<'_, Option<Digest>> {
+        self.fail()
+    }
+
     fn segments(&self) -> Arc<dyn Segments> {
         self.segments.segments()
     }

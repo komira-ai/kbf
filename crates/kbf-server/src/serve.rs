@@ -12,9 +12,8 @@ use futures::StreamExt as _;
 use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
-    ByteStreamService, CONNECTION_WINDOW_BYTES, Cache, CasService, Connections,
-    MAX_CONCURRENT_STREAMS, MAX_MESSAGE_BYTES, MetaLog, RECORDER_CHANNEL, Recorder,
-    RequestMetadataLayer, STREAM_WINDOW_BYTES, SegmentsConfig, SegmentsService,
+    ByteStreamService, Cache, CasService, Connections, MAX_MESSAGE_BYTES, MetaLog,
+    RECORDER_CHANNEL, Recorder, RequestMetadataLayer, SegmentsConfig, SegmentsService,
 };
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
@@ -40,6 +39,7 @@ use crate::identity::{DenyList, Peers};
 use crate::members::{Members, MembershipError};
 use crate::members_rpc::MembershipService;
 use crate::state_store::StateStore;
+use crate::streams::{StreamLimits, flow_windows};
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
 use crate::worker_roles::WorkerRolesLayer;
@@ -97,6 +97,9 @@ pub struct Listeners {
     /// The worker listener's segment uploads (`--segment-upload-*`;
     /// `docs/design/write-path.md`, section 4).
     pub segments: SegmentsConfig,
+    /// The most HTTP/2 streams one connection may have open on each listener
+    /// (`--reapi-max-streams`, `--worker-max-streams`).
+    pub stream_limits: StreamLimits,
 }
 
 /// What keeps a long-lived stream from looking idle to a load balancer, a proxy or the
@@ -293,15 +296,18 @@ pub(crate) fn worker_peers(
     })
 }
 
-/// `server` with the HTTP/2 limits both listeners state rather than leave to the
-/// transport's defaults: they bound what is held outside `--write-bytes-in-flight`, and
-/// the connection window is what lets a Write admitted after others finish at all
-/// (`kbf_front::CONNECTION_WINDOW_BYTES`).
-pub(crate) fn flow_control(server: Server) -> Server {
+/// `server` with the HTTP/2 limits a listener states rather than leaves to the
+/// transport's defaults: at most `max_streams` open streams per connection (each
+/// listener its own, [`StreamLimits`]), and the stream and connection windows
+/// ([`flow_windows`]), which bound what is held outside `--write-bytes-in-flight`. The
+/// connection window holds every stream's window at once, which is what lets a Write
+/// admitted after others finish at all.
+pub(crate) fn flow_control(server: Server, max_streams: u32) -> Server {
+    let windows = flow_windows(max_streams);
     server
-        .max_concurrent_streams(Some(MAX_CONCURRENT_STREAMS))
-        .initial_stream_window_size(Some(STREAM_WINDOW_BYTES))
-        .initial_connection_window_size(Some(CONNECTION_WINDOW_BYTES))
+        .max_concurrent_streams(Some(windows.streams))
+        .initial_stream_window_size(Some(windows.stream))
+        .initial_connection_window_size(Some(windows.connection))
 }
 
 /// `server` pinging a quiet connection every `timing.keepalive_interval` and closing it
@@ -640,13 +646,19 @@ where
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     log_state(durable, term, epoch);
 
-    let mut reapi_server = keepalive(flow_control(Server::builder()), listeners.streams);
+    let mut reapi_server = keepalive(
+        flow_control(Server::builder(), listeners.stream_limits.reapi),
+        listeners.streams,
+    );
     if let Some(tls) = listeners.reapi_tls {
         reapi_server = reapi_server.tls_config(tls)?;
     }
     let peers_certified = listeners.worker_tls.is_some();
     let (mut worker_server, peers) = worker_peers(
-        keepalive(flow_control(Server::builder()), listeners.streams),
+        keepalive(
+            flow_control(Server::builder(), listeners.stream_limits.worker),
+            listeners.streams,
+        ),
         listeners.worker_tls,
     )?;
     let worker_blobs = ByteStreamServer::new(WorkerBlobs::new(
@@ -871,7 +883,10 @@ pub fn bind_storage_gated(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
     let (incoming, addr) = bind(listener.listen)?;
-    let mut server = flow_control(Server::builder());
+    let mut server = flow_control(
+        Server::builder(),
+        crate::streams::StreamLimits::DEFAULT.worker,
+    );
     let admission = match listener.tls {
         Some(tls) => {
             server = server.tls_config(tls)?;
