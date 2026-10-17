@@ -63,10 +63,43 @@ impl NodeWriter {
     }
 }
 
+/// A writer epoch of another log: what a rebuild of the index names an object by when
+/// the object's key is `<root><log id>/cas/<epoch>/<seq>` under a log id that is not
+/// this log's. The epoch alone would be ambiguous (every log numbers its epochs from
+/// 1), so the id of the log that allocated it comes with it. Such an object is never
+/// written by this log; it enters the index only by
+/// [`Command::AdoptSegment`](crate::Command::AdoptSegment).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LegacyWriter {
+    log: NonZeroU64,
+    epoch: Epoch,
+}
+
+impl LegacyWriter {
+    /// Epoch `epoch` of log `log`.
+    #[must_use]
+    pub const fn new(log: NonZeroU64, epoch: Epoch) -> Self {
+        Self { log, epoch }
+    }
+
+    /// The id of the log that allocated the epoch.
+    #[must_use]
+    pub const fn log(self) -> NonZeroU64 {
+        self.log
+    }
+
+    /// The epoch, in that log.
+    #[must_use]
+    pub const fn epoch(self) -> Epoch {
+        self.epoch
+    }
+}
+
 /// Who named an object: the first half of every [`ObjectId`].
 ///
-/// Ordered with every epoch writer before every node writer; within a kind, by number
-/// (member, then boot).
+/// Ordered with every epoch writer before every node writer, and every node writer
+/// before every other log's epoch writer; within a kind, by number (member, then boot;
+/// log, then epoch).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Writer {
     /// A writer epoch this log allocated ([`Command::AllocEpoch`](crate::Command::AllocEpoch)):
@@ -74,6 +107,9 @@ pub enum Writer {
     Epoch(Epoch),
     /// A registered storage node ([`Command::SetWriter`](crate::Command::SetWriter)).
     Node(NodeWriter),
+    /// An epoch of another log ([`LegacyWriter`]): an object only a rebuild of the
+    /// index ([`Command::AdoptSegment`](crate::Command::AdoptSegment)) names.
+    Legacy(LegacyWriter),
 }
 
 impl Writer {
@@ -86,6 +122,7 @@ impl Writer {
         match (self, start) {
             (Self::Epoch(e), Self::Epoch(s)) => e >= s,
             (Self::Node(n), Self::Node(s)) => n.member == s.member && n.boot >= s.boot,
+            // Another log's writers never write again, and no writer starts after one.
             _ => false,
         }
     }
@@ -96,6 +133,7 @@ impl fmt::Display for Writer {
         match self {
             Self::Epoch(e) => write!(f, "{}", e.0),
             Self::Node(n) => write!(f, "member {} boot {}", n.member, n.boot),
+            Self::Legacy(l) => write!(f, "log {:016x} epoch {}", l.log, l.epoch.0),
         }
     }
 }
@@ -137,7 +175,7 @@ impl ObjectId {
     pub const fn epoch(self) -> Option<Epoch> {
         match self.writer {
             Writer::Epoch(e) => Some(e),
-            Writer::Node(_) => None,
+            Writer::Node(_) | Writer::Legacy(_) => None,
         }
     }
 

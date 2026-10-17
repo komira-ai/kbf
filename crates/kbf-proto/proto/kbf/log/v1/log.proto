@@ -26,6 +26,11 @@
 // Format 3 is format 2 plus `EvictObjects` (MetaCommand field 15), which forgets the
 // objects the store no longer holds. A format-1 or format-2 reader refuses it the same
 // way.
+//
+// Format 4 is format 3 plus node writers (`SetWriter`, and an `ObjectId` naming a node or
+// another log's epoch) and the commands of a rebuild of the index from the store
+// (`AdoptSegment`, `RebuildProgress`, `RebuildDone`: MetaCommand fields 16 to 19). A reader of an earlier
+// format refuses them.
 syntax = "proto3";
 
 package kbf.log.v1;
@@ -74,6 +79,9 @@ message MetaCommand {
     EvictObjects evict_objects = 15;
     // Format 4.
     SetWriter set_writer = 16;
+    AdoptSegment adopt_segment = 17;
+    RebuildProgress rebuild_progress = 18;
+    RebuildDone rebuild_done = 19;
   }
 }
 
@@ -99,14 +107,16 @@ message Digest {
 }
 
 // An object in the object store: its writer and a sequence number within it. The
-// writer is an epoch (`epoch` not zero, `member` and `boot` zero) or, from format 4, a
-// registered storage node (`epoch` zero, `member` and `boot` not zero). Before format 4
-// `member` and `boot` are always zero.
+// writer is an epoch (`epoch` not zero, `member`, `boot` and `log` zero) or, from format
+// 4, a registered storage node (`epoch` and `log` zero, `member` and `boot` not zero) or
+// an epoch of another log (`epoch` and `log` not zero, `member` and `boot` zero). Before
+// format 4 `member`, `boot` and `log` are always zero.
 message ObjectId {
   uint64 epoch = 1;
   uint64 seq = 2;
   uint64 member = 3;
   uint64 boot = 4;
+  uint64 log = 5;
 }
 
 // A record `offset` bytes into an object of store `store` (at most 65535).
@@ -231,6 +241,29 @@ message SetWriter {
   uint64 member = 1;
   uint64 boot = 2;
 }
+
+// Indexes the records of a segment the store holds that this log did not write, each
+// only if its digest is not indexed. `entries` are in the order of the segment's footer; a digest
+// may repeat, and the first is the one held. Format 4.
+message AdoptSegment {
+  ObjectId object = 1;
+  repeated AdoptedBlob entries = 2;
+}
+
+// A record of an adopted segment: a blob at `offset` in the object.
+message AdoptedBlob {
+  Digest digest = 1;
+  uint64 offset = 2;
+}
+
+// Every object key up to and including `after_key` (not empty) is handled by the
+// rebuild of the index. Format 4.
+message RebuildProgress {
+  string after_key = 1;
+}
+
+// The rebuild of the index is complete. Format 4.
+message RebuildDone {}
 
 // ---- Control commands: the farm machine's inputs (ha.md sections 4.2 to 4.9). ----
 

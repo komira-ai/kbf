@@ -134,6 +134,14 @@ fn each_command_has_its_own_label() {
             std::num::NonZeroU64::MIN,
             std::num::NonZeroU64::MIN,
         )),
+        Command::AdoptSegment {
+            object,
+            entries: Vec::new(),
+        },
+        Command::RebuildProgress {
+            after: String::new(),
+        },
+        Command::RebuildDone,
     ];
     let labels: Vec<&str> = commands
         .iter()

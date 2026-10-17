@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 
 use kbf_meta::{
-    ActionRecord, Closure, Command, Epoch, Generation, Location, NodeWriter, ObjectId, Role,
-    ServerId, StagedPut, StoreId, TierId, Touch, UnreachableReason, Writer,
+    ActionRecord, Closure, Command, Epoch, Generation, LegacyWriter, Location, NodeWriter,
+    ObjectId, Role, ServerId, StagedPut, StoreId, TierId, Touch, UnreachableReason, Writer,
 };
 use kbf_proto::kbf::log::v1 as proto;
 use kbf_types::{Digest, DigestFunction, FarmTime};
@@ -31,11 +31,15 @@ pub(crate) const fn since_v3(command: &Command) -> bool {
 }
 
 /// Whether `command` joined the log in [`Format::V4`](crate::Format::V4): `SetWriter`,
-/// and any command that names an object of a node writer.
+/// the commands of a rebuild of the index, and any command that names an object of a
+/// node writer or of another log's epoch.
 pub(crate) fn since_v4(command: &Command) -> bool {
-    let node = |o: &ObjectId| matches!(o.writer(), Writer::Node(_));
+    let node = |o: &ObjectId| matches!(o.writer(), Writer::Node(_) | Writer::Legacy(_));
     match command {
-        Command::SetWriter(_) => true,
+        Command::SetWriter(_)
+        | Command::AdoptSegment { .. }
+        | Command::RebuildProgress { .. }
+        | Command::RebuildDone => true,
         Command::PutBlob { location, .. } => node(&location.object),
         Command::PutBlobs(blobs) => blobs.iter().any(|(_, l)| node(&l.object)),
         Command::PutStaged { objects, .. } => objects.iter().any(|p| node(&p.object)),
@@ -143,6 +147,22 @@ pub(crate) fn to_proto(command: &Command) -> Result<proto::MetaCommand, EncodeEr
             member: writer.member().get(),
             boot: writer.boot().get(),
         }),
+        Command::AdoptSegment { object, entries } => {
+            let hashes = digests(entries.iter().map(|(d, _)| d))?;
+            let blob =
+                |(digest, (_, offset)): (proto::Digest, &(Digest, u64))| proto::AdoptedBlob {
+                    digest: Some(digest),
+                    offset: *offset,
+                };
+            P::AdoptSegment(proto::AdoptSegment {
+                object: Some(object_id(*object)),
+                entries: hashes.into_iter().zip(entries).map(blob).collect(),
+            })
+        }
+        Command::RebuildProgress { after } => P::RebuildProgress(proto::RebuildProgress {
+            after_key: after.clone(),
+        }),
+        Command::RebuildDone => P::RebuildDone(proto::RebuildDone {}),
     };
     Ok(proto::MetaCommand { command: Some(c) })
 }
@@ -189,15 +209,17 @@ fn digests<'a>(set: impl Iterator<Item = &'a Digest>) -> Result<Vec<proto::Diges
 }
 
 const fn object_id(object: ObjectId) -> proto::ObjectId {
-    let (epoch, member, boot) = match object.writer() {
-        Writer::Epoch(e) => (e.get(), 0, 0),
-        Writer::Node(n) => (0, n.member().get(), n.boot().get()),
+    let (epoch, member, boot, log) = match object.writer() {
+        Writer::Epoch(e) => (e.get(), 0, 0, 0),
+        Writer::Node(n) => (0, n.member().get(), n.boot().get(), 0),
+        Writer::Legacy(l) => (l.epoch().get(), 0, 0, l.log().get()),
     };
     proto::ObjectId {
         epoch,
         seq: object.seq(),
         member,
         boot,
+        log,
     }
 }
 
@@ -297,6 +319,21 @@ pub(crate) fn from_proto(command: proto::MetaCommand) -> Result<Command, DecodeE
                 NonZeroU64::new(w.member).ok_or(DecodeError::Missing("SetWriter.member"))?,
                 NonZeroU64::new(w.boot).ok_or(DecodeError::Missing("SetWriter.boot"))?,
             )),
+            P::AdoptSegment(a) => Command::AdoptSegment {
+                object: required_object(a.object, "AdoptSegment.object")?,
+                entries: a
+                    .entries
+                    .into_iter()
+                    .map(|b| Ok((required_digest(b.digest, "AdoptedBlob.digest")?, b.offset)))
+                    .collect::<Result<_, DecodeError>>()?,
+            },
+            P::RebuildProgress(p) => {
+                if p.after_key.is_empty() {
+                    return Err(DecodeError::Missing("RebuildProgress.after_key"));
+                }
+                Command::RebuildProgress { after: p.after_key }
+            }
+            P::RebuildDone(proto::RebuildDone {}) => Command::RebuildDone,
         },
     )
 }
@@ -397,19 +434,29 @@ fn required_object(
     from_object(object.ok_or(DecodeError::Missing(field))?, field)
 }
 
-/// An object id: an epoch writer's when `member` and `boot` are both zero (any epoch,
-/// as every format before 4 reads it), a node writer's when `epoch` is zero and both
-/// are not, refused otherwise.
+/// An object id: an epoch writer's when `member`, `boot` and `log` are all zero (any
+/// epoch, as every format before 4 reads it), a node writer's when `epoch` and `log` are
+/// zero and `member` and `boot` are not, another log's epoch writer's when `member` and
+/// `boot` are zero and `epoch` and `log` are not; refused otherwise.
 fn from_object(object: proto::ObjectId, field: &'static str) -> Result<ObjectId, DecodeError> {
     let proto::ObjectId {
         epoch,
         seq,
         member,
         boot,
+        log,
     } = object;
-    let writer = match (epoch, NonZeroU64::new(member), NonZeroU64::new(boot)) {
-        (_, None, None) => Writer::Epoch(Epoch::new(epoch)),
-        (0, Some(member), Some(boot)) => Writer::Node(NodeWriter::new(member, boot)),
+    let writer = match (
+        epoch,
+        NonZeroU64::new(member),
+        NonZeroU64::new(boot),
+        NonZeroU64::new(log),
+    ) {
+        (_, None, None, None) => Writer::Epoch(Epoch::new(epoch)),
+        (0, Some(member), Some(boot), None) => Writer::Node(NodeWriter::new(member, boot)),
+        (epoch, None, None, Some(log)) if epoch != 0 => {
+            Writer::Legacy(LegacyWriter::new(log, Epoch::new(epoch)))
+        }
         _ => return Err(DecodeError::Writer(field)),
     };
     Ok(ObjectId::of(writer, seq))
