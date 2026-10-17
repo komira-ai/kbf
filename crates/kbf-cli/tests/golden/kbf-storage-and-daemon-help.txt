@@ -345,5 +345,17 @@ Options:
       --storage-tls-key <PATH>
           The server certificate's private key (PEM).
 
+      --frontend <URL>
+          Registers with this frontend (http:// or https://) and heartbeats to it. Without it the node is a one-member map of itself.
+
+      --advertise-addr <HOST:PORT>
+          The address callers dial, where --storage-listen is not routable. Default: the address the node bound.
+
+      --storage-zone <LABEL>
+          The zone label to register with. Default: none.
+
+      --storage-weight <N>
+          The node's share of the digests relative to the others. Default: 1.
+
       --storage-client-ca <PATH>
           The CA callers' certificates chain to; each must name a role (frontend, storage, daemon).

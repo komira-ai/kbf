@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use kbf_map::{Member, MemberId};
 use kbf_storage::Storage;
@@ -26,11 +27,43 @@ pub trait Nodes: Send + Sync {
     fn node(&self, member: &Member, generation: u64) -> Result<Arc<dyn Storage>, StorageError>;
 }
 
+/// How long a connection to a node may be silent before the router gives up on it, so that
+/// a node that has stopped answering (its host is gone, a firewall drops its packets)
+/// fails the call and the router goes on to the next owner, instead of the call waiting
+/// for the operating system's TCP timeouts (minutes).
+///
+/// Nothing here bounds how long a request takes: a large read on a healthy connection is
+/// answered by the HTTP/2 pings as long as the node is there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Liveness {
+    /// How long dialling may take, for the TCP connection and for the TLS handshake each.
+    pub connect: Duration,
+    /// How often a connection with a call on it is pinged (HTTP/2 PING).
+    pub keepalive_interval: Duration,
+    /// How long a ping may go unanswered before the connection is dropped and the calls
+    /// on it fail.
+    pub keepalive_timeout: Duration,
+}
+
+impl Default for Liveness {
+    /// Ten seconds to dial, and a connection that has not answered a ping sent every ten
+    /// seconds within ten more is dropped: a silent node is given up on within about
+    /// twenty seconds.
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(10),
+            keepalive_interval: Duration::from_secs(10),
+            keepalive_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
 /// Storage nodes over mutual TLS, connected when first used.
 #[derive(Debug)]
 pub struct TlsNodes {
     /// The CA and this process's identity, and no domain name.
     tls: ClientTlsConfig,
+    liveness: Liveness,
     /// One connection per member address; a member that moves is a new connection.
     channels: Mutex<HashMap<(MemberId, String), Channel>>,
 }
@@ -41,8 +74,17 @@ impl TlsNodes {
     pub fn new(ca: Certificate, identity: Identity) -> Self {
         Self {
             tls: ClientTlsConfig::new().ca_certificate(ca).identity(identity),
+            liveness: Liveness::default(),
             channels: Mutex::default(),
         }
+    }
+
+    /// The same nodes, giving up on a silent one as `liveness` says rather than as
+    /// [`Liveness::default`] does.
+    #[must_use]
+    pub fn with_liveness(mut self, liveness: Liveness) -> Self {
+        self.liveness = liveness;
+        self
     }
 
     /// The connection to `member`, verified against the host of its address. For a caller
@@ -61,8 +103,12 @@ impl TlsNodes {
             .map_err(|e| bad(member, "its address is not a host and port", &e))?;
         // No domain name is set: tonic then verifies the certificate against the host of
         // the endpoint's URI, which is the host of this member's address.
+        let live = self.liveness;
         let channel = endpoint
-            .tls_config(self.tls.clone())
+            .connect_timeout(live.connect)
+            .http2_keep_alive_interval(live.keepalive_interval)
+            .keep_alive_timeout(live.keepalive_timeout)
+            .tls_config(self.tls.clone().timeout(live.connect))
             .map_err(|e| bad(member, "its TLS configuration is not usable", &e))?
             .connect_lazy();
         channels.insert(key, channel.clone());

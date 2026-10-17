@@ -14,10 +14,13 @@ publish.workspace = true
 # authorization (crates/kbf-it/tests/layering.rs).
 [dependencies]
 bytes.workspace = true
+crc32c.workspace = true
 futures.workspace = true
+kbf-map.workspace = true
 kbf-meta.workspace = true
 kbf-proto.workspace = true
 kbf-segments.workspace = true
+kbf-store.workspace = true
 kbf-types.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }

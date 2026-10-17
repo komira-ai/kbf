@@ -285,7 +285,10 @@ where
 {
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
-    let state = args.open_state_store().map_err(ServeError::State)?;
+    let state = with_members(
+        args.open_state_store().map_err(ServeError::State)?,
+        args.members(),
+    );
     let routes = Routes {
         invocations: policy.invocations_get.is_some(),
         blobs: policy.invocations_get.is_some() && policy.blobs_get.is_some(),
@@ -474,11 +477,45 @@ pub fn interrupted() -> io::Result<impl Future<Output = ()> + Send + 'static> {
     })
 }
 
+/// The state store with the membership timing the flags name.
+pub(crate) fn with_members(
+    state: Option<crate::StateStore>,
+    members: crate::members::MembershipConfig,
+) -> Option<crate::StateStore> {
+    state.map(|state| crate::StateStore { members, ..state })
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use kbf_state::ManualClock;
+    use kbf_state::fake::{Fake, Flaw};
 
     use super::*;
+
+    /// Catches `--member-ttl-secs`/`--member-dwell-secs` parsed and then dropped at
+    /// start: the store a start opens must carry the flags' timing, keep its other
+    /// fields, and a start without a state store must stay without one.
+    #[test]
+    fn with_members_sets_the_timing_and_keeps_the_rest() {
+        let members = crate::members::MembershipConfig {
+            ttl: Duration::from_secs(9),
+            dwell: Duration::from_secs(40),
+            replication: 2,
+        };
+        let state = crate::StateStore {
+            store: Arc::new(Fake::with_flaw(
+                Arc::new(ManualClock::default()),
+                Flaw::None,
+            )),
+            epoch: crate::farm::EpochPolicy::Keep,
+            members: crate::members::MembershipConfig::default(),
+        };
+        let got = with_members(Some(state), members).expect("still a store");
+        assert_eq!(got.members, members);
+        assert_eq!(got.epoch, crate::farm::EpochPolicy::Keep);
+        assert!(with_members(None, members).is_none());
+    }
 
     /// Catches the public seam [`serve_with`] not assembling a server now that the
     /// flags' path ([`start`], which also attaches the start-up pass) goes around it:
