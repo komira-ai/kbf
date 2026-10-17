@@ -13,7 +13,7 @@ use hooked::Hooked;
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_map::{MemberId, MemberState};
 use kbf_objstore::MemoryStore;
-use kbf_server::members::{Members, MembershipConfig, PROTOCOL, Registrant};
+use kbf_server::members::{Members, MembershipConfig, PROTOCOL, Progress, Registrant};
 use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{Cond, ManualClock, Store, Txn};
@@ -118,6 +118,7 @@ fn registrant(i: u32, weight: u32) -> Registrant {
         zone: String::new(),
         weight,
         protocol: PROTOCOL,
+        progress: Progress::CaughtUp,
     }
 }
 
@@ -238,8 +239,12 @@ async fn a_draining_or_expired_member_shows_its_state_until_it_leaves() {
 
     // Only `a` and `b` keep beating: `c` lapses, and is Down in the map.
     clock.advance(TTL - Duration::from_secs(1));
-    frontend.heartbeat(a.id, a.boot).expect("beat a");
-    frontend.heartbeat(b.id, b.boot).expect("beat b");
+    frontend
+        .heartbeat(a.id, a.boot, Progress::CatchingUp)
+        .expect("beat a");
+    frontend
+        .heartbeat(b.id, b.boot, Progress::CaughtUp)
+        .expect("beat b");
     clock.advance(Duration::from_secs(2));
     frontend.refresh().expect("refreshed");
     let view = members(server.api).await;
