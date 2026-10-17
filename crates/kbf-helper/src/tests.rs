@@ -878,6 +878,7 @@ fn the_same_id_in_two_epochs_is_two_activations() {
         "{refusal}"
     );
     assert_eq!(rig.status()["acked_order_id"], 5);
+}
 
 /// Catches a revert with nothing to go back to being reported as done: a host that never
 /// swapped has no previous release, so the order is refused with the installer's reason and
