@@ -158,7 +158,8 @@ fn a_probe_tells_a_held_lock_from_a_free_one_and_a_failure() {
 }
 
 // Catches a file's one name that is not its resolved path: a name without a file name
-// in it resolved as a file, a bare name not put in the working directory, a link loop followed forever or taken for a file, and a
+// in it resolved as a file, a bare name not put in the working directory, a plain file
+// not left as it is, a link loop followed forever or taken for a file, and a
 // path through a file taken for a name nobody holds.
 #[test]
 fn a_files_one_name_resolves_links_and_refuses_what_it_cannot_resolve() {
@@ -187,6 +188,11 @@ fn a_files_one_name_resolves_links_and_refuses_what_it_cannot_resolve() {
     );
     let file = dir.join("a-file");
     fs::write(&file, b"").expect("write");
+    assert_eq!(
+        canonical_db(&file).expect("a file"),
+        file,
+        "a file is its own name"
+    );
     let under = canonical_db(&file.join("state.db")).expect_err("not a directory");
     assert_eq!(under.kind(), io::ErrorKind::NotADirectory, "got {under}");
     assert_eq!(
