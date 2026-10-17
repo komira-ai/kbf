@@ -1,5 +1,6 @@
 //! The host side of kbf's releases: where a host keeps them, the state it records about
-//! them, and the verbs that install, stage, roll back and remove them.
+//! them, the verbs that install, stage, roll back and remove them, and the offline check
+//! that decides whether a release handed over by the unprivileged `kbf` may be staged.
 //!
 //! The host's records:
 //!
@@ -15,7 +16,8 @@
 //! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
 //!   named by.
 //!
-//! The offline check of a release handed over by the unprivileged `kbf`, in parts:
+//! The offline check ([`stage::stage_from_inbox`] runs them in the order that matters,
+//! documented there):
 //!
 //! - [`inbox`] and [`offer`]: an entry the unprivileged process wrote, opened without
 //!   following a link, and the offer that names its files and their sha256.
@@ -28,7 +30,9 @@
 //! - [`refusal`]: every way a stage is refused, one enum with a stable code per case.
 //!
 //! `kbf-deploy host ...` (the manual path) calls these; so does any other program that
-//! changes a host's releases, so that a host has one state file and one layout.
+//! changes a host's releases, so that a host has one state file and one layout. The
+//! trust rests on GitHub's build attestation of the artifacts workflow on the host's
+//! source ref (docs/deploy/host-releases.md, "What is trusted").
 
 pub mod archive;
 pub mod attest;
@@ -43,6 +47,7 @@ pub mod refusal;
 pub mod release;
 pub mod run;
 pub mod settings;
+pub mod stage;
 pub mod state;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
