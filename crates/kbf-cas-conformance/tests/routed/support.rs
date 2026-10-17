@@ -56,6 +56,10 @@ pub struct Fake {
     peak: AtomicUsize,
     /// Reads wait for permits on this.
     gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Reads pass this many chunks, then wait for a permit on this before the rest.
+    pause: Mutex<Option<(usize, Arc<tokio::sync::Semaphore>)>>,
+    /// How many reads were asked of it.
+    pub reads: AtomicUsize,
 }
 
 impl Fake {
@@ -72,7 +76,22 @@ impl Fake {
             active: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             gate: Mutex::default(),
+            pause: Mutex::default(),
+            reads: AtomicUsize::new(0),
         })
+    }
+
+    /// Makes every read pass `after` chunks and then wait for a permit on what is
+    /// returned before it sends the rest.
+    pub fn pause_after(&self, after: usize) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.pause.lock().expect("lock") = Some((after, Arc::clone(&gate)));
+        gate
+    }
+
+    /// Answers every read with `data` from now on.
+    pub fn set_data(&self, data: &[u8]) {
+        *self.data.lock().expect("lock") = Bytes::copy_from_slice(data);
     }
 
     /// Serves `blob` to reads of its digest, as the node holding it would.
@@ -140,6 +159,7 @@ impl Storage for Fake {
         _limit: u64,
     ) -> Answer<'a, ReadStream> {
         Box::pin(async move {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
             let gate = self.gate.lock().expect("lock").clone();
@@ -163,7 +183,19 @@ impl Storage for Fake {
                 chunks.truncate(1);
                 chunks.push(Err(unavailable()));
             }
-            Ok(stream::iter(chunks).boxed())
+            let pause = self.pause.lock().expect("lock").clone();
+            let Some((after, gate)) = pause else {
+                return Ok(stream::iter(chunks).boxed());
+            };
+            let rest = chunks.split_off(after.min(chunks.len()));
+            let wait = stream::once(async move {
+                gate.acquire().await.expect("an open semaphore").forget();
+            })
+            .filter_map(|()| async { None });
+            Ok(stream::iter(chunks)
+                .chain(wait)
+                .chain(stream::iter(rest))
+                .boxed())
         })
     }
 
@@ -229,7 +261,7 @@ impl Segments for NoSegments {
 }
 
 /// A map that never changes.
-struct Fixed(MapView);
+pub struct Fixed(pub MapView);
 
 impl MapSource for Fixed {
     fn current(&self) -> Option<MapView> {
