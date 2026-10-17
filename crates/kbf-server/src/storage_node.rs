@@ -23,8 +23,12 @@
 //! at the interval the frontend names ([`crate::join`]); over `https` it presents its own
 //! certificate and trusts `--storage-client-ca`. It advertises `--advertise-addr`, or the
 //! address it bound (which must then not be a wildcard). The node never talks to the state
-//! store. Every request still carries a generation and the node ignores it; `STALE_MAP`
-//! and the map push are the next change.
+//! store. The maps the frontend sends it (at registration, and at any heartbeat that finds
+//! it behind) are kept in a [`kbf_mapsync::MapHolder`] ([`StorageHandle::maps`]). Until the
+//! first one arrives the node answers every call UNAVAILABLE `no storage map yet`
+//! ([`crate::serve::bind_storage_gated`]): it does not know the farm's members, so it
+//! cannot know which blobs are its own. Every request still carries a generation, which
+//! the node ignores; the `STALE_MAP` check is the storage service's.
 //!
 //! **Object names.** A registered node writes as its registration's member id and boot
 //! counter (`kbf_meta::NodeWriter`): its metadata log is raised to machine version 4, it
@@ -47,6 +51,7 @@ use std::time::Duration;
 use clap::{Arg, ArgMatches, Command, FromArgMatches as _};
 use kbf_front::{Cache, CacheStorage, ObjectKeys, SegmentsConfig};
 use kbf_log::{FarmLogId, MachineVersion};
+use kbf_mapsync::MapHolder;
 use kbf_meta::{NodeWriter, Retention};
 use kbf_objstore::{KeyPrefix, ObjectStore};
 use kbf_store::StdFs;
@@ -290,12 +295,16 @@ impl StorageFlags {
         })
     }
 
-    /// The registration with `--frontend`, for a node bound at `bound`; `None` without the
-    /// flag. Connects lazily, so a frontend that is down at start is waited for.
+    /// The registration with `--frontend`, for a node bound at `bound`, keeping the maps it
+    /// is sent in `maps`; `None` without the flag. Connects lazily, so a frontend that is down at start is waited for.
     ///
     /// # Errors
     /// A TLS file cannot be read or is refused; the URL is refused.
-    pub fn joiner(&self, bound: SocketAddr) -> Result<Option<Joiner>, Box<dyn Error>> {
+    pub fn joiner(
+        &self,
+        bound: SocketAddr,
+        maps: Arc<MapHolder>,
+    ) -> Result<Option<Joiner>, Box<dyn Error>> {
         let Some(url) = &self.frontend else {
             return Ok(None);
         };
@@ -316,11 +325,8 @@ impl StorageFlags {
             zone: self.zone.clone(),
             weight: self.weight,
         };
-        Ok(Some(Joiner::new(
-            endpoint.connect_lazy(),
-            identity,
-            join::RETRY_BASE,
-        )))
+        let joiner = Joiner::new(endpoint.connect_lazy(), identity, join::RETRY_BASE);
+        Ok(Some(joiner.with_maps(maps)))
     }
 
     /// The `Segments` uploads the node keeps: `--segment-upload-*`.
@@ -341,10 +347,18 @@ pub struct StorageHandle {
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
     _pass: Option<AbortOnDrop>,
+    maps: Arc<MapHolder>,
     _joiner: Option<AbortOnDrop>,
 }
 
 impl StorageHandle {
+    /// The storage map this node holds: what the frontend sent it when it registered and
+    /// at each heartbeat that found it behind. Empty for a node with no `--frontend`.
+    #[must_use]
+    pub fn maps(&self) -> Arc<MapHolder> {
+        Arc::clone(&self.maps)
+    }
+
     /// The line the node prints once it is bound:
     /// `kbf-storage <version> storage=<addr> log=<id>`.
     #[must_use]
@@ -465,18 +479,9 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let socket = bind_storage_socket(listener)?;
-    let keys = ObjectKeys {
-        root: prefix_root(&prefix, log)?,
-        legacy: prefix,
-    };
-    let (cache, joiner) = match flags.joiner(socket.addr())? {
-        Some(mut joiner) => {
-            let joined = joiner.join().await;
-            let cache = open_registered(meta, store, keys, &joined).await?;
-            (cache, Some((joiner, joined)))
-        }
-        None => (Cache::open_under(meta, store, keys).await?, None),
-    };
+    let maps = Arc::new(MapHolder::new());
+    let (cache, joiner) =
+        open_cache(flags, socket.addr(), &maps, (meta, store, prefix, log)).await?;
     let cache = cache.with_writes(flags.server.write_config());
     let (cache, tier) = crate::write_tier::attach(cache, hot).await?;
     let cache = Arc::new(cache);
@@ -486,7 +491,10 @@ where
     });
     let _pass = pass.map(|pass| AbortOnDrop(crate::startup_pass::spawn(Arc::clone(&cache), pass)));
     let storage = Arc::new(CacheStorage::new(cache, flags.segments()));
-    let bound = serve_storage(storage, socket, shutdown()?)?;
+    // A node that registers with a frontend is one of several: it serves nothing until
+    // it holds the map. One box (no `--frontend`) serves at once.
+    let gate = flags.frontend.as_ref().map(|_| Arc::clone(&maps));
+    let bound = serve_storage(storage, socket, gate, shutdown()?)?;
     let _joiner = joiner.map(|(joiner, joined)| AbortOnDrop(tokio::spawn(joiner.keep(joined))));
     Ok(StorageHandle {
         addr: bound.addr,
@@ -497,7 +505,36 @@ where
         serving: Box::pin(bound.serving),
         _flusher,
         _pass,
+        maps,
         _joiner,
+    })
+}
+
+/// The cache of a node bound at `bound`. With `--frontend` the node registers first (retrying
+/// until the frontend answers), so the cache writes as the registration's member and boot
+/// ([`open_registered`]); the registration and what it gave come back for the heartbeats
+/// ([`Joiner::keep`]). Without it the cache writes in an epoch of its own log.
+///
+/// # Errors
+/// A TLS file or the frontend URL is refused, or the cache cannot be opened
+/// ([`open_registered`]).
+pub(crate) async fn open_cache<O: ObjectStore>(
+    flags: &StorageFlags,
+    bound: SocketAddr,
+    maps: &Arc<MapHolder>,
+    (meta, store, prefix, log): (RaftMetaLog<StdFs>, O, KeyPrefix, FarmLogId),
+) -> Result<(Cache<RaftMetaLog<StdFs>, O>, Option<(Joiner, Joined)>), Box<dyn Error>> {
+    let keys = ObjectKeys {
+        root: prefix_root(&prefix, log)?,
+        legacy: prefix,
+    };
+    Ok(match flags.joiner(bound, Arc::clone(maps))? {
+        Some(mut joiner) => {
+            let joined = joiner.join().await;
+            let cache = open_registered(meta, store, keys, &joined).await?;
+            (cache, Some((joiner, joined)))
+        }
+        None => (Cache::open_under(meta, store, keys).await?, None),
     })
 }
 

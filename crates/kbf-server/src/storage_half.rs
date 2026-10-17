@@ -12,6 +12,12 @@
 //!   does (`kbf_storage::local_cache`).
 //! - **The handle.** The [`Storage`] the listener serves is kept, for the daemon half.
 //!
+//! - **The map.** With `--frontend` the half registers and heartbeats as `kbf storage`
+//!   does, holds the maps the frontend sends in a [`kbf_mapsync::MapHolder`]
+//!   ([`StorageHalf::maps`]), and its listener answers every call UNAVAILABLE `no storage
+//!   map yet` until the first arrives (the daemon half, in the same process, calls the
+//!   storage in-process and is not held back).
+//!
 //! The rest (the listener's checks, the stores, the metadata log, the flusher and the
 //! start-up pass over a `file://` cold store) is `kbf storage`'s, step for step.
 
@@ -23,16 +29,17 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_front::{Cache, CacheStorage, SegmentsConfig};
+use kbf_front::{CacheStorage, SegmentsConfig};
+use kbf_mapsync::MapHolder;
 use kbf_meta::Retention;
 use kbf_objstore::{FsStore, ObjectStore};
 use kbf_storage::Storage;
 use kbf_threads::disk::Statvfs;
 
-use crate::serve::{ServeError, StorageListener, bind_storage};
+use crate::serve::{ServeError, StorageListener, bind_storage_socket, serve_storage};
 use crate::start::{AbortOnDrop, open_cold_file, share_storage, tier_bytes};
 use crate::startup_pass::StartPass;
-use crate::storage_node::StorageFlags;
+use crate::storage_node::{StorageFlags, open_cache};
 use crate::stores::{FILE_PREFIX_ROOT, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
 use crate::{RaftMetaLog, SERVER_VERSION, s3_store};
@@ -45,11 +52,19 @@ pub struct StorageHalf {
     storage: Arc<dyn Storage>,
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
+    maps: Arc<MapHolder>,
     _flusher: Option<AbortOnDrop>,
     _pass: Option<AbortOnDrop>,
+    _joiner: Option<AbortOnDrop>,
 }
 
 impl StorageHalf {
+    /// The storage map the node holds ([`crate::storage_node::StorageHandle::maps`]).
+    #[must_use]
+    pub fn maps(&self) -> Arc<MapHolder> {
+        Arc::clone(&self.maps)
+    }
+
     /// The storage the listener serves: the daemon half's, in-process.
     #[must_use]
     pub fn storage(&self) -> Arc<dyn Storage> {
@@ -73,6 +88,7 @@ impl StorageHalf {
             serving,
             _flusher,
             _pass,
+            _joiner,
             ..
         } = self;
         serving.await
@@ -138,9 +154,11 @@ where
     let (prefix, log) = (meta.store_prefix(), meta.log_id());
     let grace = Duration::from_millis(args.cold_store_evict_grace_ms);
     let pass = files.map(|files| StartPass::over_raft(files, grace));
-    let cache = Cache::open(meta, store, prefix)
-        .await?
-        .with_writes(args.write_config());
+    let socket = bind_storage_socket(listener)?;
+    let maps = Arc::new(MapHolder::new());
+    let (cache, joiner) =
+        open_cache(flags, socket.addr(), &maps, (meta, store, prefix, log)).await?;
+    let cache = cache.with_writes(args.write_config());
     let local = args.local_cache.as_ref();
     let hot = stores.hot.as_ref();
     let (cache, tier) = crate::write_tier::attach_with(cache, hot, local.is_none()).await?;
@@ -156,14 +174,19 @@ where
         idle: Duration::from_secs(args.segment_upload_idle_secs),
     };
     let storage: Arc<dyn Storage> = Arc::new(CacheStorage::new(cache, segments));
-    let bound = bind_storage(Arc::clone(&storage), listener, shutdown()?)?;
+    // As `kbf storage` does: with a frontend, hold its map and serve nothing until the first.
+    let gate = flags.frontend.as_ref().map(|_| Arc::clone(&maps));
+    let bound = serve_storage(Arc::clone(&storage), socket, gate, shutdown()?)?;
     let addr = bound.addr;
+    let _joiner = joiner.map(|(joiner, joined)| AbortOnDrop(tokio::spawn(joiner.keep(joined))));
     Ok(StorageHalf {
         addr,
         storage,
         start_line: format!("kbf-storage {SERVER_VERSION} storage={addr} log={log}"),
         serving: Box::pin(bound.serving),
+        maps,
         _flusher,
         _pass,
+        _joiner,
     })
 }
