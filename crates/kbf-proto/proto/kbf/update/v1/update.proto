@@ -1,0 +1,126 @@
+// kbf.update.v1: pull-based self-update of a kbf host (docs/design/pull-updates.md).
+//
+// A host learns the release an operator wants over the session it already holds with a
+// frontend: `UpdateOffer` (frontend to host, in `kbf.worker.v1.ServerMessage`) names the
+// commit and, for the host's own platform, the tarballs to fetch and their build
+// attestations. The host fetches them with `ReleaseService.Fetch`, verifies them offline,
+// and reports with `UpdateStatus` (host to frontend, in `kbf.worker.v1.DaemonMessage`).
+// `UpdateOrder` (frontend to host) is the frontend's order of the rollout: when a host
+// may activate, confirm or revert.
+//
+// This file holds messages and one service only. The frontend is NOT trusted for
+// integrity: a host accepts a release only if the build attestation of the tarball
+// verifies on the host itself. Nothing here is a signature.
+//
+// Extending: add fields, never reuse a number. Every enum's zero value is UNSPECIFIED.
+syntax = "proto3";
+
+package kbf.update.v1;
+
+// One file of a release: the single binary a tarball holds.
+message Component {
+  // The binary the tarball holds, exactly one regular file of this name: `kbf` or
+  // `kbf-daemon`.
+  string name = 1;
+  // 64 lowercase hex digits: the SHA-256 of `<name>-<commit>-<platform>.tar.gz`. It is
+  // also the name `ReleaseService.Fetch` serves the tarball under.
+  string sha256 = 2;
+  // The tarball's size in bytes.
+  uint64 size = 3;
+  // The build-provenance attestation bundle of the tarball (JSON lines, at most
+  // 256 KiB), verified on the host against its pinned trusted root.
+  bytes attestation = 4;
+}
+
+// The desired release for one host, level-triggered: sent after `Welcome` and again at
+// every change of the desired release, so a host that connects later gets it too. A
+// host whose platform has no complete release gets no offer.
+message UpdateOffer {
+  // Strictly increases at each change of the desired release, and survives a frontend
+  // restart. An offer with the generation a host already holds is a repeat (for example,
+  // the release became complete for the host's platform after the change).
+  uint64 generation = 1;
+  // The commit: 40 lowercase hex digits.
+  string commit = 2;
+  // The host's own platform: `linux-x86_64`, `linux-arm64` or `darwin-arm64`.
+  string platform = 3;
+  // The tarballs the host needs for that platform.
+  repeated Component components = 4;
+}
+
+// The frontend's order of the rollout to one host.
+message UpdateOrder {
+  enum Verb {
+    VERB_UNSPECIFIED = 0;
+    // Switch to the staged `commit` and restart; the host reverts by itself if it is not
+    // confirmed within `window_s`.
+    VERB_ACTIVATE = 1;
+    // The activated `commit` is healthy at the frontend: keep it.
+    VERB_CONFIRM = 2;
+    // Go back to the previous release.
+    VERB_REVERT = 3;
+  }
+  // Strictly increasing; a host ignores an order it has already acknowledged.
+  uint64 order_id = 1;
+  // The epoch `Welcome` named, so an order from before a frontend restart is not replayed.
+  uint64 epoch = 2;
+  Verb verb = 3;
+  // The commit the order is about: 40 lowercase hex digits.
+  string commit = 4;
+  // The confirm window of VERB_ACTIVATE, in seconds; the host clamps it to its own limits.
+  uint32 window_s = 5;
+}
+
+// What a host reports about its update, resent on every change. Its own message of the
+// session: `NodeStatus` is sent once per `Welcome`, and an update changes more often.
+message UpdateStatus {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_IDLE = 1;
+    STATE_FETCHING = 2;
+    STATE_STAGED = 3;
+    STATE_ACTIVATED_UNCONFIRMED = 4;
+    STATE_CONFIRMED = 5;
+    STATE_REVERTED = 6;
+    // The host refused the offer or the order; `refusal` says why.
+    STATE_REFUSED = 7;
+    // The host takes no update by itself (no helper or not enabled).
+    STATE_MANUAL = 8;
+  }
+  // The process's own build commit: 12 hex digits, or `unknown`.
+  string running_commit = 1;
+  // The commit installed as current, from the helper: 40 hex digits; empty if not known.
+  string installed_commit = 2;
+  // The commit staged and verified, not yet activated: 40 hex digits; empty if none.
+  string staged_commit = 3;
+  State state = 4;
+  // Why STATE_REFUSED, or why the last order was refused.
+  string refusal = 5;
+  // The newest order this host has acted on.
+  uint64 acked_order_id = 6;
+  // The newest offer generation this host has seen.
+  uint64 offered_generation = 7;
+  // Whether the privileged helper that installs releases is present on the host.
+  bool helper_present = 8;
+  // What the staged release declares (`kbf --version --json`), for the frontend's
+  // ordering decision; 0 when nothing is staged.
+  uint32 staged_protocol = 9;
+  uint32 staged_min_protocol = 10;
+  uint32 staged_state_schema = 11;
+}
+
+message FetchRequest {
+  // 64 lowercase hex digits: a `Component.sha256`.
+  string sha256 = 1;
+}
+
+message FetchChunk {
+  bytes data = 1;
+}
+
+// Served on the frontend's worker listener, to admitted nodes only (mutual TLS).
+service ReleaseService {
+  // Streams the stored file whose SHA-256 is `sha256` in 1 MiB chunks. NOT_FOUND for a
+  // digest the store does not hold, INVALID_ARGUMENT for anything but 64 lowercase hex.
+  rpc Fetch(FetchRequest) returns (stream FetchChunk);
+}
