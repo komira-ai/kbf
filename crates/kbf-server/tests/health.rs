@@ -166,6 +166,7 @@ fn start_with_prefix(prefix: &str) -> Server {
         store_probe_timeout: PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     };
     start_on(prefix, listeners)
 }

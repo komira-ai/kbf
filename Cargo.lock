@@ -1333,6 +1333,7 @@ dependencies = [
  "kbf-front",
  "kbf-meta",
  "kbf-node",
+ "kbf-objstore",
  "kbf-proto",
  "kbf-segments",
  "kbf-server",
@@ -1853,6 +1854,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac 0.13.0",
+ "kbf-objstore",
  "kbf-segments",
  "kbf-threads",
  "kbf-types",
@@ -1862,6 +1864,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
