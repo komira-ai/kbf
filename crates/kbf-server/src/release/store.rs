@@ -242,10 +242,27 @@ impl ReleaseStore {
         self.platform_dir(key).join(name)
     }
 
+    /// Creates `dir` and the directories above it that are missing, and syncs the parent
+    /// of each one created, so that a file made in them is still reachable after a power
+    /// cut (a synced file under an unsynced directory can vanish with it).
+    async fn make_dirs(dir: &Path) -> io::Result<()> {
+        let mut created = Vec::new();
+        let mut at = dir;
+        while !tokio::fs::try_exists(at).await? {
+            created.push(at);
+            at = at.parent().unwrap_or(at);
+        }
+        tokio::fs::create_dir_all(dir).await?;
+        for new in created {
+            sync_dir(new.parent().unwrap_or(new)).await?;
+        }
+        Ok(())
+    }
+
     /// Creates `path` holding `content` unless it exists; says which happened.
     async fn publish(path: &Path, content: &[u8]) -> io::Result<Published> {
         let dir = path.parent().unwrap_or(Path::new(""));
-        tokio::fs::create_dir_all(dir).await?;
+        Self::make_dirs(dir).await?;
         let (mut file, partial) = Partial::create(dir).await?;
         file.write_all(content).await?;
         file.sync_all().await?;

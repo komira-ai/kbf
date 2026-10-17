@@ -786,6 +786,9 @@ frontend mounts `kbf_server::release::router`; without a store both answer `503`
   "components": [{"name", "sha256", "size", "attested"}]}]}]}`: commits sorted, platforms in the
   order above, a platform `complete` when both tarballs have their attestation. A component is
   listed when its tarball is stored.
+- `GET /v1/releases` and the gRPC `ReleaseService.Fetch` are unauthenticated at the router and
+  the service. The wiring must mount `Fetch` only behind the worker listener's mutual TLS, and
+  decide who may read `GET /v1/releases` where it mounts the router.
 
 ## `UNAVAILABLE` from a storage node that is catching up
 

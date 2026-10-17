@@ -542,6 +542,12 @@ async fn the_list_names_what_is_stored_and_what_is_complete() {
         put_key(&k, b"bundle", true).await;
     }
     put_key(&key(COMMIT, x86, Component::KbfDaemon), b"d", false).await;
+    // darwin-arm64 holds both tarballs but only one attestation: not complete.
+    let darwin = ReleasePlatform::DarwinArm64;
+    for component in Component::ALL {
+        put_key(&key(COMMIT, darwin, component), b"t", false).await;
+    }
+    put_key(&key(COMMIT, darwin, Component::Kbf), b"bundle", true).await;
     // An attestation alone is not a component.
     put_key(&key(OTHER_COMMIT, x86, Component::Kbf), b"orphan", true).await;
     // Strangers.
@@ -561,6 +567,9 @@ async fn the_list_names_what_is_stored_and_what_is_complete() {
         {"platform": "linux-arm64", "complete": true, "components": [
             {"name": "kbf", "sha256": sha(b"kbf"), "size": 3, "attested": true},
             {"name": "kbf-daemon", "sha256": sha(b"kbf-daemon"), "size": 10, "attested": true}]},
+            {"platform": "darwin-arm64", "complete": false, "components": [
+                {"name": "kbf", "sha256": sha(b"t"), "size": 1, "attested": true},
+                {"name": "kbf-daemon", "sha256": sha(b"t"), "size": 1, "attested": false}]},
     ]}]});
     assert_eq!(listing.json(), want);
     let attestation = store

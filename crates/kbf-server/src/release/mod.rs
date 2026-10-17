@@ -8,6 +8,9 @@
 //!   `GET /v1/releases`.
 //! - The service, [`grpc::service`], is `ReleaseService.Fetch`.
 //!
+//! `GET /v1/releases` and `Fetch` carry no authentication of their own: the wiring puts `Fetch`
+//! behind the worker listener's mutual TLS.
+//!
 //! Not mounted anywhere yet: the frontend adds the router to its operator API and the
 //! service to its worker listener where it starts. Trust is the host's: the store neither
 //! opens a tarball nor checks an attestation.
