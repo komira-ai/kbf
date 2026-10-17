@@ -419,7 +419,7 @@ pub struct FrontendHandle {
     /// Tasks that run while the frontend serves and end with it: the one that expires
     /// the state store's rows, and the control socket of a handover.
     background: Vec<BoxFuture<'static, ()>>,
-    /// Tells the service manager the frontend serves, once its probes pass.
+    /// Tells the service manager the frontend serves (not that the farm is healthy: `/readyz`).
     ready: Ready,
 }
 
@@ -439,7 +439,7 @@ impl FrontendHandle {
     }
 
     /// This frontend, sending `READY=1` to `target` (the service manager's
-    /// `$NOTIFY_SOCKET`; `None` tells no one) once it serves and its probes pass.
+    /// `$NOTIFY_SOCKET`; `None` tells no one) once it serves; `/readyz` is not waited on.
     #[must_use]
     pub fn notifying(mut self, target: Option<OsString>) -> Self {
         self.ready.notify = target;
@@ -976,10 +976,7 @@ impl<'a> Prepared<'a> {
             ),
             serving: Box::pin(serving),
             background,
-            ready: Ready {
-                checks,
-                notify: None,
-            },
+            ready: Ready { notify: None },
         })
     }
 }

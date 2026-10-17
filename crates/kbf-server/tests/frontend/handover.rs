@@ -353,10 +353,9 @@ async fn a_successor_that_dies_after_the_release_is_started_again_and_the_stream
     old.ended().await;
 }
 
-/// Catches: `READY=1` sent before the frontend serves, never sent after, or sent by a
-/// frontend that cannot reach its storage node: the service manager's socket gets it
-/// only once `serve` runs and the probes pass, for a start with no predecessor and for
-/// one that took over alike.
+/// Catches: `READY=1` sent before the frontend serves or never sent after: the service
+/// manager's socket gets it only once `serve` runs, for a start with no predecessor and
+/// for one that took over alike.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_service_manager_is_told_when_the_frontend_serves() {
     let node = Node::start().await;
@@ -396,6 +395,42 @@ async fn the_service_manager_is_told_when_the_frontend_serves() {
     expect_ready(&manager);
     old.ended().await;
     drop(new);
+}
+
+/// Catches: `READY=1` gated on `/readyz` (the storage node's answer). A storage node gets
+/// its map only after it registers with a serving frontend, so a frontend that waits for
+/// the storage check before telling systemd it serves deadlocks a fresh farm. The
+/// frontend here has no storage node at all: it still sends `READY=1`, and `/readyz`
+/// still says 503 naming `storage`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ready_is_sent_while_the_storage_node_does_not_answer() {
+    let dead = {
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        socket.local_addr().expect("its address")
+    };
+    let url = format!("--storage=http://{dead}");
+    let flags = flags(&[&url, "--readyz-store-timeout-ms=200"]).expect("flags");
+    let dir = Dir::new();
+    let manager_path = dir.0.join("notify");
+    let manager = UnixDatagram::bind(&manager_path).expect("a datagram socket");
+    manager
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let (stop, stopped) = oneshot::channel::<()>();
+    let handle = start_frontend(&flags, || {
+        Ok(async move {
+            let _ = stopped.await;
+        })
+    })
+    .expect("starts");
+    let handle = handle.notifying(Some(manager_path.into_os_string()));
+    let proc = Proc::serving(handle, stop);
+    let mut buffer = [0_u8; 16];
+    let got = manager.recv(&mut buffer).expect("READY=1 despite the storage node");
+    assert_eq!(&buffer[..got], b"READY=1");
+    let (code, body) = get(proc.api, "/readyz").await;
+    assert_eq!(code, 503, "{body}");
+    assert!(failing(&body).contains(&"storage"), "{body}");
 }
 
 /// Catches: flags for a handover that parse without what they need or with what they do

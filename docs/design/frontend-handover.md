@@ -15,7 +15,7 @@ instance is up. A serving instance is never restarted by an install: the plan sa
 the handover instead. What the unit has, and why (check-units rule `handover`; rule `stop`
 still asks for `TimeoutStopSec=infinity` and `KillSignal=SIGTERM`):
 
-- `Type=notify`: kbf sends `READY=1` once it serves and its probes pass, so
+- `Type=notify`: kbf sends `READY=1` once it serves (`/readyz` is not waited on: a storage node gets its map only from a serving frontend), so
   `systemctl start` of the idle instance returns when the new frontend can take builds, and
   fails when it could not.
 - `TimeoutStartSec=120`, finite: a new instance that never says ready fails the start.
