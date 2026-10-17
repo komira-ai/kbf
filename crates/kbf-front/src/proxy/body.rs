@@ -558,6 +558,29 @@ mod tests {
         }
     }
 
+    /// A body that yields these results, one at a time, answering `None` entries with
+    /// `Pending` (and a wake, so the reader polls again), then ends.
+    struct Paced(VecDeque<Option<Result<Frame<Bytes>, Status>>>);
+
+    impl http_body::Body for Paced {
+        type Data = Bytes;
+        type Error = Status;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Status>>> {
+            match self.0.pop_front() {
+                Some(None) => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Some(Some(frame)) => Poll::Ready(Some(frame)),
+                None => Poll::Ready(None),
+            }
+        }
+    }
+
     fn data(n: usize) -> Result<Frame<Bytes>, Status> {
         Ok(Frame::data(Bytes::from(vec![7; n])))
     }
@@ -832,6 +855,41 @@ mod tests {
         assert_eq!(read_n(&mut second, 1).await, [3]);
         let broke = poll_fn(|cx| Pin::new(&mut second).poll_frame(cx)).await;
         assert_eq!(broke.unwrap().unwrap_err().code(), Code::Cancelled);
+    }
+
+    /// Catches frames that follow the bytes passed on being kept to send again (the upload
+    /// can no longer be sent again, so they would be held for nothing), and a client body
+    /// that is not ready read as an end: a wait is passed on as a wait, the bytes past the
+    /// prefix end any resend, and the empty frame and trailers after them are passed on
+    /// and not kept. Mutant: frames without bytes kept after the upload streamed.
+    #[tokio::test]
+    async fn frames_after_the_bytes_passed_on_are_not_kept() {
+        let upload = Upload::new(Body::new(Paced(
+            vec![
+                None,
+                Some(data(3)),
+                Some(data(4)),
+                None,
+                Some(data(0)),
+                Some(trailers(&Status::ok(""))),
+            ]
+            .into(),
+        )));
+        let mut first = upload.first();
+        assert_eq!(read_n(&mut first, 1).await, [3]);
+        upload.seal();
+        assert_eq!(read_n(&mut first, 3).await, [4, 0, 0]);
+        assert!(
+            poll_fn(|cx| Pin::new(&mut first).poll_frame(cx))
+                .await
+                .is_none()
+        );
+        assert!(
+            upload.again().is_none(),
+            "bytes past the prefix were passed on"
+        );
+        let source = upload.source.lock().expect("lock");
+        assert!(source.prefix.is_empty(), "frames after the bytes were kept");
     }
 
     /// Catches an upload given up on because the stream's end arrived as a frame (an empty
