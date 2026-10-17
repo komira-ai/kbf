@@ -148,8 +148,8 @@ message yet: the daemon is not told, and the server simply sends it no new `Star
 
 An operator sets a storage member's state. The body is `{"state": "active"}` or
 `{"state": "draining"}`; the answer is `{"id": N, "state": "...", "generation": G}`,
-the map's generation after the change. `down` is the store's verdict and `joining` and
-`catching_up` are what a registration says, so none of them is accepted (`400`, as is
+the map's generation after the change. `down` is the store's verdict, `catching_up` is what a registration says and `joining` is
+the join handoff's, so none of them is accepted (`400`, as is
 any other body). `404` for an id that has no live row (it expired, or never
 registered) or is not a number, or on a server without a state store; `503` when the
 state store cannot be written; `401`, `403` or `415` from the gates of
@@ -159,17 +159,14 @@ by a refused request.
 When a member becomes `active` the cluster also records that it has formed (see below),
 in the same transaction.
 
-**When a member is `active` without this call.** A cluster with no state yet (an empty
-state store) has no member that could hand a slice to a joiner, and a `joining` member
-is never rank 1, so such a cluster would never get an `active` member. For this reason a
-member that registers while the cluster has not yet formed enters `active`: the first
-registration of a fresh cluster writes the `meta/members_formed` mark and opens a
-window (`bootstrap`, 60 seconds from that registration), and a registration inside the
-window is `active` too, so a fleet that starts together forms together. After the
-window, and for ever after in a cluster that has formed (a restart does not undo it), a
-registration is `joining`, and this call is how it is promoted. A member that registers
-saying it is rebuilding its index enters `catching_up` and becomes `active` by its own
-first beat that says it is done; it opens no window.
+**When a member is `active` without this call.** A registration that says the node's
+index is whole enters `active`, in a fresh cluster and in a formed one alike: it is the
+first start of a cluster, or a restart of a node whose meta log already has its rebuild,
+so a rolling restart leaves every member `active`. The registration also writes the
+`meta/members_formed` mark. A registration that says the node is rebuilding its index
+enters `catching_up` and becomes `active` by its own first beat that says it is done. No
+registration writes `joining`; that state is set by the join handoff in code
+(`Members::set_state`), and a `joining` member is promoted by this call.
 
 **The risk of promoting a joiner.** `active` makes the member a settled owner: it
 takes the rank-1 slots of the digests it wins in the rendezvous order, and it is read
@@ -350,6 +347,8 @@ caller goes away before the answer counts as an error.
 | `kbf_store_blobs_seconds` | histogram | one store of verified blobs (a Write's, or a batch's): the query for blobs already held, their touch, and the wait until every segment holding its blobs is written: the linger, the wait for a PUT slot, each PUT attempt with the backoff between attempts, the footer read, and the commit with any wait behind commits queued ahead of it |
 | `kbf_segment_put_seconds` | histogram | one PUT attempt of a segment's object; a PUT tried again is observed once per attempt |
 | `kbf_segment_footer_read_seconds` | histogram | one segment's footer read back after its PUT: two range GETs, the trailer and then the footer |
+| `kbf_tls_reloads_total{listener,outcome}` | counter | looks at a TLS listener's files (`reapi`, `worker`; [renewal](deploy/tls-renewal.md)): `applied` (new files now serve new handshakes), `rejected` (changed but unusable: the previous files keep serving; the reason is in the log) and `unchanged`; only for a listener with TLS |
+| `kbf_tls_leaf_not_after_seconds{listener}` | gauge | when the certificate the listener serves stops being valid, in seconds since the epoch; alert on it well before it passes |
 | `kbf_segment_commit_seconds` | histogram | one segment's `PutBlobs` commit to the metadata log, including any wait behind commits queued ahead of it |
 | `kbf_segment_blobs`, `kbf_segment_bytes` | histogram | blobs, and bytes (footer included), per segment written |
 | `kbf_object_get_seconds` | histogram | one range GET of a blob being read (ByteStream Read, GetActionResult, a BatchReadBlobs run); footer reads are not in it |
@@ -364,6 +363,7 @@ caller goes away before the answer counts as an error.
 | `kbf_input_directories_cached_total` | counter | Directories the input check took from the decoded-directory cache: the blob is touched and its presence checked, nothing is read |
 | `kbf_input_directories_skipped_total` | counter | Directories skipped with everything under them: an earlier check verified them and the retention guarantee of that check still runs |
 | `kbf_input_directories_joined_total` | counter | Directories found being checked for another request, and waited for |
+| `kbf_cache_lost_blobs`, `kbf_cache_blob_losses_total` | gauge, counter | blobs whose only copy was in a block on a write tier that is gone before the flusher put it in the store (the tier abandoned with `--hot-store-abandon`, the block missing or short at a start, or its bytes failing their digest): lost now, and ever. A lost blob is `UNAVAILABLE`, FindMissingBlobs lists it, an action-cache entry naming it is a miss, and a re-upload takes it off the gauge ([architecture-v2.md](design/architecture-v2.md#8-storage), Loss marks). Read from the metadata state at the scrape; left out of a scrape the metadata log cannot answer |
 
 Latency buckets run from 1 ms to 60 s; size buckets from 1 KiB to 1 GiB by fours;
 the blobs-per-segment buckets from 1 to 16384 by fours.

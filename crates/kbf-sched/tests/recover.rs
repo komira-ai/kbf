@@ -415,3 +415,20 @@ fn a_fate_is_empty_only_when_every_part_is() {
     ];
     assert!(parts.iter().all(|part| !part.is_empty()));
 }
+
+/// Catches: `fate()` answering for an operation the scheduler does not hold, and a fate
+/// with no runs that books memory it should not or that leaves a phantom entry of runs
+/// behind (a raised booking is kept; no kills are held).
+#[test]
+fn a_fate_without_runs_raises_the_booking_and_holds_no_kills() {
+    let mut raised = queued(6, request(6));
+    raised.fate = Some(Fate {
+        booked_bytes: 8 * GIB,
+        memory_runs: Vec::new(),
+        ..Fate::default()
+    });
+    let s = recovered(vec![raised]);
+    assert_eq!(s.fate(OperationId(99)), None, "an operation not held");
+    assert_eq!(s.fate(OperationId(6)), None, "no kills to hand on");
+    assert!(s.memory_state().runs_by_operation().is_empty());
+}
