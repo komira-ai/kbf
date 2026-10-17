@@ -314,6 +314,11 @@ Options:
           
           [default: 8]
 
+      --tls-reload-interval-secs <TLS_RELOAD_INTERVAL_SECS>
+          How often, in seconds, the REAPI and worker listeners look at their TLS files (`--reapi-tls-cert`, `--reapi-tls-key`, `--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca`), and a storage node's (`--storage-tls-cert`, `--storage-tls-key`, `--storage-client-ca`). A change is applied to the next TLS handshake, with no restart and without ending a connection already open: renew a certificate by replacing the files. Files that do not make a working configuration (unreadable, not PEM, a key that is not the certificate's, an expired certificate, a renewal caught between its two writes) are logged and counted in `kbf_tls_reloads_total{outcome="rejected"}`, and the previous files keep serving; the next look finds them whole and applies them. The files must be good at start
+          
+          [default: 30]
+
       --segment-upload-max-bytes <BYTES>
           The most bytes, records and footers together, one segment upload on the worker listener may declare (`docs/design/write-path.md`, section 4.2). Ranges are held in memory until their upload commits, admitted under `--write-bytes-in-flight` with every other upload: a `Begin` waits while that is spent. At least one 1 GiB blob and its footer (1 GiB + 1 MiB), so any blob the cache accepts can be uploaded, and at most `--write-bytes-in-flight`, so any legal `Begin` can be admitted; the server refuses to start otherwise. At most 4 GiB - 1 (`kbf_front::MAX_ADMISSION_BYTES`), the most one admission counts, so a `Begin` never holds more than it is counted for under the bound
           

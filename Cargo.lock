@@ -2058,6 +2058,7 @@ dependencies = [
  "kbf-proto",
  "kbf-segments",
  "kbf-store",
+ "kbf-tls",
  "kbf-types",
  "rcgen",
  "sha2 0.11.0",

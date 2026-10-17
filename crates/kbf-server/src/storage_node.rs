@@ -49,7 +49,8 @@ use kbf_objstore::{KeyPrefix, ObjectStore};
 use kbf_store::StdFs;
 use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
-use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig};
+use kbf_tls::{TlsFiles, TlsSource};
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 use crate::join::{self, Joiner};
 use crate::serve::{ServeError, StorageListener, bind_storage_gated};
@@ -78,6 +79,7 @@ pub const ALLOWED: &[&str] = &[
     "write_linger",
     "write_own_segment_bytes",
     "write_bytes_in_flight",
+    "tls_reload_interval_secs",
     "write_puts_in_flight",
     "store_put_attempts",
 ];
@@ -264,14 +266,15 @@ impl StorageFlags {
     pub fn listener(&self) -> Result<StorageListener, ConfigError> {
         self.server.segment_upload_fits_write_bound()?;
         let tls = match &self.tls {
-            Some([cert, key, ca]) => Some(
-                ServerTlsConfig::new()
-                    .identity(Identity::from_pem(
-                        crate::config::read(cert)?,
-                        crate::config::read(key)?,
-                    ))
-                    .client_ca_root(Certificate::from_pem(crate::config::read(ca)?)),
-            ),
+            Some([cert, key, ca]) => Some(TlsSource::files(
+                "storage",
+                TlsFiles {
+                    cert: cert.clone(),
+                    key: key.clone(),
+                    client_ca: Some(ca.clone()),
+                },
+                Duration::from_secs(self.server.tls_reload_interval_secs),
+            )?),
             None if crate::config::loopback_only(self.listen.ip()) => None,
             None => {
                 return Err(ConfigError::PlaintextStorageOffLoopback { addr: self.listen });

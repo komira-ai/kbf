@@ -231,8 +231,9 @@ pub struct Args {
     pub worker_deny_list: Option<PathBuf>,
     /// How often, in seconds, the REAPI and worker listeners look at their TLS files
     /// (`--reapi-tls-cert`, `--reapi-tls-key`, `--worker-tls-cert`, `--worker-tls-key`,
-    /// `--worker-client-ca`). A change is applied to the next TLS handshake, with no
-    /// restart and without ending a connection already open: renew a certificate by
+    /// `--worker-client-ca`), and a storage node's (`--storage-tls-cert`,
+    /// `--storage-tls-key`, `--storage-client-ca`). A change is applied to the next TLS
+    /// handshake, with no restart and without ending a connection already open: renew a certificate by
     /// replacing the files. Files that do not make a working configuration (unreadable,
     /// not PEM, a key that is not the certificate's, an expired certificate, a renewal
     /// caught between its two writes) are logged and counted in
