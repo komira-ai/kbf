@@ -455,3 +455,35 @@ fn a_restore_under_the_lock_prepares_the_staged_copy_first() {
     assert_eq!(store.epoch(), epoch + 1);
     assert!(store.get("k").expect("get").is_some());
 }
+
+// Catches a store opened (or a tool lock taken) on a file with a second hard link: the
+// lock is beside one name, so a process holding another name's lock would write the
+// file a restore renames over, and acknowledged commits would be lost.
+#[test]
+fn a_state_file_with_a_second_name_is_refused() {
+    let dir = scratch("hard-link");
+    let (store, _) = open_manual(&dir, Options::default());
+    drop(store);
+    let db = dir.join("state.db");
+    let other = dir.join("hl.db");
+    fs::hard_link(&db, &other).expect("a second name");
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
+    for name in [&db, &other] {
+        let refused =
+            SqliteStore::open(name, Arc::clone(&clock), Options::default()).expect_err("opened");
+        assert!(
+            matches!(refused, SqliteError::HardLinked { links: 2, .. }),
+            "got {refused}"
+        );
+        assert!(refused.to_string().contains("hard links"), "{refused}");
+        let refused = StoreLock::take(name).expect_err("locked");
+        assert!(
+            matches!(refused, SqliteError::HardLinked { .. }),
+            "got {refused}"
+        );
+    }
+    assert!(!dir.join("hl.db.lock").exists(), "refused before the lock");
+    fs::remove_file(&other).expect("one name again");
+    drop(SqliteStore::open(&db, clock, Options::default()).expect("one name opens"));
+    StoreLock::take(&db).expect("one name locks");
+}

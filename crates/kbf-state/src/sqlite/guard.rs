@@ -114,6 +114,21 @@ pub(super) fn refuse_network_filesystem(
     }
 }
 
+/// Refuses `db` when the file has more than one name: the lock is beside one name, so a
+/// process that opened the file by another would lock elsewhere. A file that does not
+/// exist yet has one name (the one it is created under).
+pub(super) fn refuse_hard_link(db: &Path) -> Result<(), SqliteError> {
+    use std::os::unix::fs::MetadataExt as _;
+    match fs::metadata(db) {
+        Ok(meta) if meta.is_file() && meta.nlink() > 1 => Err(SqliteError::HardLinked {
+            path: db.to_owned(),
+            links: meta.nlink(),
+        }),
+        // Absent, or not a file: the open that follows says what is wrong.
+        _ => Ok(()),
+    }
+}
+
 /// Creates `db`'s lock file if missing and takes an exclusive `flock` on it; returns it
 /// and its name. The lock file is beside the file's one name ([`canonical_db`]), so a
 /// link to the file, or a linked directory, names the same lock. The lock goes with the
@@ -154,6 +169,7 @@ impl StoreLock {
     /// [`SqliteError::NetworkFs`] on a network filesystem; otherwise the failing call.
     pub fn take(db: &Path) -> Result<StoreLock, SqliteError> {
         refuse_network_filesystem(db, &filesystem_type)?;
+        refuse_hard_link(db)?;
         let (file, lock) = take_lock(db)?;
         Ok(StoreLock {
             db: db.to_owned(),

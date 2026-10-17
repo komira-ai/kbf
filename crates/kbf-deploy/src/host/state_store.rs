@@ -20,7 +20,10 @@
 //!
 //! `state-restore` plans by default and changes things only with `--apply`. Both are
 //! refused when `--db` is a symbolic link (the rename would replace the link, not the
-//! file it names), when the source is not a single-file state store backup whose
+//! file it names), when `--db` has a second hard link (the lock is beside one name, so
+//! a frontend that opened another would not be seen, and the rename would leave it
+//! writing the replaced file; the store itself refuses to open such a file, and a
+//! backup of one only warns, its copy being consistent), when the source is not a single-file state store backup whose
 //! `integrity_check` is `ok` (what `state-backup` writes), and while a process holds the
 //! store's lock (the `flock` every open store holds: the frontend is running). The lock
 //! file is `<db>.lock` beside the file's resolved name (links followed), so the
@@ -119,6 +122,13 @@ pub enum StateFileError {
         .0.display()
     )]
     DbIsLink(PathBuf),
+    #[error(
+        "--db {}: {links} names (hard links); a frontend that opens another name locks \
+         another file, so the restore would replace the file under it. Keep one name \
+         (remove the other links) and try again",
+        path.display()
+    )]
+    DbHardLinked { path: PathBuf, links: u64 },
     #[error("{0}")]
     Store(SqliteError),
     #[error("{what} {}: {source}", path.display())]
@@ -242,6 +252,14 @@ fn sync_dir(path: &Path) -> Result<(), StateFileError> {
         .map_err(io_at("sync the directory", dir))
 }
 
+/// The link count of the file `db`, when it has more than one name.
+fn extra_names(db: &Path) -> Option<u64> {
+    fs::metadata(db)
+        .ok()
+        .filter(|m| m.is_file() && m.nlink() > 1)
+        .map(|m| m.nlink())
+}
+
 /// Writes a consistent, checked copy of `db` to `dest`, which must not exist.
 pub fn backup(
     db: &Path,
@@ -265,6 +283,14 @@ pub fn backup(
         Some(o) => format!(", owner {}:{}", o.uid, o.gid),
         None => String::new(),
     };
+    if let Some(links) = extra_names(db) {
+        let _ = writeln!(
+            out,
+            "warning: {} has {links} names (hard links); the copy is consistent, but a \
+             frontend and a restore must agree on one name (state-restore refuses this file)",
+            db.display()
+        );
+    }
     let _ = writeln!(
         out,
         "backed up {} to {}: epoch {}, head revision {}, {} keys, integrity ok; \
@@ -316,6 +342,12 @@ pub fn restore(
         .is_ok_and(|m| m.file_type().is_symlink())
     {
         return Err(StateFileError::DbIsLink(db.to_owned()));
+    }
+    if let Some(links) = extra_names(db) {
+        return Err(StateFileError::DbHardLinked {
+            path: db.to_owned(),
+            links,
+        });
     }
     let s = sqlite::check_backup(src).map_err(StateFileError::Source)?;
     let lock = hold(db, apply)?;

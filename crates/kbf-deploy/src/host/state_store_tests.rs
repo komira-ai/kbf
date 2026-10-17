@@ -789,3 +789,48 @@ fn a_files_directory_is_its_parent_or_here() {
     assert_eq!(dir_of(Path::new("state.db")), Path::new("."));
     assert_eq!(dir_of(Path::new("/")), Path::new("."));
 }
+
+// Catches a restore of a state file that has a second hard link: a frontend that opened
+// the other name holds that name's lock, so the restore would find its own free and
+// rename over a file the frontend is still writing.
+#[test]
+fn a_restore_refuses_a_hard_linked_state_file() {
+    let dir = scratch("state-store-restore-db-hardlink");
+    let src = backup_holding(&dir, "new", "2");
+    let db = live_holding_old(&dir);
+    fs::hard_link(&db, dir.join("hl.db")).expect("a second name");
+    let before = snapshot(&dir);
+    for target in [db.clone(), dir.join("hl.db")] {
+        for apply in [false, true] {
+            let (code, out, err) = restore_at(&src, &target, apply);
+            assert_eq!(code, ExitCode::from(2), "apply {apply}: {out}{err}");
+            assert!(
+                err.starts_with("REFUSED: --db ") && err.contains("2 names (hard links)"),
+                "{err}"
+            );
+            assert_eq!(snapshot(&dir), before, "apply {apply}: nothing written");
+        }
+    }
+    fs::remove_file(dir.join("hl.db")).expect("one name again");
+    let (code, out, err) = restore_at(&src, &db, true);
+    assert_eq!(code, ExitCode::SUCCESS, "{out}{err}");
+}
+
+// Catches a backup of a hard-linked state file that stays silent: its copy is
+// consistent, so it is written, and the operator is told the file has two names.
+#[test]
+fn a_backup_of_a_hard_linked_state_file_warns() {
+    let dir = scratch("state-store-backup-hardlink");
+    let db = live_holding_old(&dir);
+    let (code, out, err) = backup_cli(&db, &dir.join("one.db"), &[]);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert!(!out.contains("warning"), "{out}");
+    fs::hard_link(&db, dir.join("hl.db")).expect("a second name");
+    let (code, out, err) = backup_cli(&db, &dir.join("two.db"), &[]);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert!(
+        out.starts_with("warning: ") && out.contains("2 names"),
+        "{out}"
+    );
+    assert!(dir.join("two.db").exists());
+}
