@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
@@ -48,6 +48,8 @@ struct Flaky {
     fenced: AtomicBool,
     /// How many more writes take before the store goes down; negative for no limit.
     allow: AtomicI64,
+    /// How many writes have been tried, taken or refused.
+    attempts: AtomicUsize,
 }
 
 /// What the store is kept in.
@@ -136,6 +138,7 @@ impl Flaky {
             down: AtomicBool::new(false),
             fenced: AtomicBool::new(false),
             allow: AtomicI64::new(-1),
+            attempts: AtomicUsize::new(0),
         }
     }
 
@@ -182,6 +185,7 @@ impl Flaky {
 
 impl Store for Flaky {
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
         if self.allow.load(Ordering::SeqCst) == 0 {
             self.down.store(true, Ordering::SeqCst);
         } else if self.allow.load(Ordering::SeqCst) > 0 {
@@ -1159,6 +1163,164 @@ async fn a_refused_operation_leaves_its_refusal_in_the_store() {
         farm.ended(kbf_types::OperationId(0)).expect("read"),
         Some(sent)
     );
+}
+
+/// A caller's ticket and the lease its operation holds, on a farm with one node.
+async fn running(disk: &Disk) -> (TestFarm, kbf_front::Ticket, LeaseId) {
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (_, mut inbox) = register(&farm);
+    let ticket = farm
+        .submit(Submission {
+            request: request(1),
+            call: None,
+            described: Described::default(),
+        })
+        .expect("submitted");
+    let leases = starts(&mut inbox);
+    assert_eq!(leases.len(), 1);
+    (farm, ticket, leases[0])
+}
+
+/// Catches: a `done/` row the store refused once and the farm never wrote again. The
+/// caller is answered from memory, but a successor (or a handover's follower) over the
+/// same store finds no result for the operation and tells the client it is lost. The
+/// store refuses the row, and the ticks that follow while it is down, then takes writes:
+/// the row is there, a farm started over the store reads it, and it is the result the
+/// caller was sent.
+#[tokio::test(start_paused = true)]
+async fn a_result_row_the_store_refused_is_written_when_it_returns() {
+    let mut disk = Disk::new();
+    let (farm, ticket, lease) = running(&disk).await;
+    // The result's own rows take; the `done/` row after them does not.
+    disk.store.fail_after(1);
+    assert!(accepted(&farm, lease).await);
+    let sent = ended(&ticket);
+    assert_eq!(disk.rows("done/"), 0, "the store was down");
+    for _ in 0..3 {
+        farm.tick().await;
+        assert_eq!(disk.rows("done/"), 0, "the store was still down");
+    }
+    disk.store.set_down(false);
+    farm.tick().await;
+
+    assert_eq!(
+        disk.rows("done/"),
+        1,
+        "the result row was never written again"
+    );
+    assert_eq!(
+        farm.ended(OperationId(0)).expect("read"),
+        Some(sent.clone())
+    );
+    disk.crash(farm);
+    let successor = disk.farm(EpochPolicy::Keep);
+    assert_eq!(
+        successor.ended(OperationId(0)).expect("read"),
+        Some(sent),
+        "a successor over the store does not find the result"
+    );
+}
+
+/// Catches: a committed result whose rows the store refused, dropped. The scheduler has
+/// finished the operation in memory, so nothing ever asks the store again: the lease and
+/// operation rows stay as if the lease still ran, the caller is never answered, and a
+/// successor would run the action a second time. Held back while the store is down, the
+/// answer (with the report's own detail, not a stand-in) and the rows follow when it
+/// takes writes.
+#[tokio::test(start_paused = true)]
+async fn a_committed_result_the_store_refused_is_written_and_answered_when_it_returns() {
+    let disk = Disk::new();
+    let (farm, ticket, lease) = running(&disk).await;
+    assert_eq!((disk.rows("lease/"), disk.rows("op/")), (1, 1));
+    disk.store.set_down(true);
+    assert!(
+        !accepted(&farm, lease).await,
+        "an answer the store has not taken was acknowledged"
+    );
+    for _ in 0..3 {
+        farm.tick().await;
+    }
+    assert!(
+        !matches!(*ticket.stage.borrow(), Stage::Done(_)),
+        "the caller was answered before the store took the result"
+    );
+    assert_eq!((disk.rows("lease/"), disk.rows("op/")), (1, 1));
+
+    disk.store.set_down(false);
+    farm.tick().await;
+    let Finished::Failed(status) = ended(&ticket) else {
+        panic!("the caller was answered with something else");
+    };
+    assert_eq!(status.code, Code::InvalidArgument as i32);
+    assert_eq!(status.message, "test", "the report's detail was lost");
+    assert_eq!(
+        (disk.rows("lease/"), disk.rows("op/"), disk.rows("queue/")),
+        (0, 0, 0),
+        "the result's rows were never written again"
+    );
+    assert_eq!(disk.rows("done/"), 1);
+    assert!(
+        farm.ended(OperationId(0)).expect("read").is_some(),
+        "no result row for the operation"
+    );
+}
+
+/// Catches: a retry that goes on after a newer writer holds the store (the old scheduler
+/// would write its stale rows over its successor's the moment a write landed, or keep the
+/// store busy for ever): the first refusal that says `Fenced` ends it. No write is tried
+/// after that, whatever feeds the farm, and none lands.
+#[tokio::test(start_paused = true)]
+async fn a_fenced_store_ends_the_retry_of_a_refused_result() {
+    let disk = Disk::new();
+    let (farm, ticket, lease) = running(&disk).await;
+    disk.store.set_down(true);
+    assert!(!accepted(&farm, lease).await);
+    farm.tick().await;
+    disk.store.set_down(false);
+    disk.store.set_fenced();
+    // The farm learns it was superseded from the write it retries.
+    farm.tick().await;
+    let rows = disk.all_rows();
+    let tried = disk.store.attempts.load(Ordering::SeqCst);
+    for _ in 0..3 {
+        farm.tick().await;
+        let _ = farm.report(&node(), invalid(lease)).await;
+    }
+    assert_eq!(
+        disk.store.attempts.load(Ordering::SeqCst),
+        tried,
+        "a write was tried after the store fenced the farm"
+    );
+    assert_eq!(disk.all_rows(), rows, "a write landed after the fence");
+    assert!(!matches!(*ticket.stage.borrow(), Stage::Done(_)));
+}
+
+/// Catches: a retried `done/` row that replaces a row a later write already settled (a
+/// successor's result for the operation, written while this farm's was refused): the row
+/// the store holds stays.
+#[tokio::test(start_paused = true)]
+async fn a_retried_result_row_does_not_replace_one_already_there() {
+    let disk = Disk::new();
+    let (farm, ticket, lease) = running(&disk).await;
+    disk.store.fail_after(1);
+    assert!(accepted(&farm, lease).await);
+    let _ = ended(&ticket);
+    assert_eq!(disk.rows("done/"), 0);
+    let settled = Finished::Failed(rpc::Status {
+        code: Code::Internal as i32,
+        message: "settled by a later write".to_owned(),
+        details: Vec::new(),
+    });
+    disk.store.set_down(false);
+    let row = Txn::new().put(
+        "done/0000000000000000",
+        settled.to_row(),
+        kbf_state::Cond::Any,
+    );
+    disk.store.txn(row).expect("store").expect("put");
+    farm.tick().await;
+    farm.tick().await;
+    assert_eq!(farm.ended(OperationId(0)).expect("read"), Some(settled));
 }
 
 /// Catches: a farm with no state store pretending to answer from one: it has no result
