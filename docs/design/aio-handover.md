@@ -1,6 +1,9 @@
 # Updating a frontend or an all-in-one host behind Envoy, without failing a build
 
-Status: design, not implemented (the handover code it builds on, #857, #879 and #887, is merged on arch-v2). One update process for every shape: Envoy stays in front
+Status: design, not implemented (the handover code it builds on, #857, #879 and #887, is merged on arch-v2).
+**Everything new in 6.4 is a design, not code: `RaftMetaLog::demote`, `open_follower`, `Follower::promote`,
+`Host::open_resumed`, `Raft::restore_applied`, `Store::open_from` and `Store::retire` do not exist on arch-v2 today.**
+Where this note says "today" it means arch-v2; where it says "the change" it means a PR of section 14. One update process for every shape: Envoy stays in front
 of kbf on the host (also on a single box, also for `kbf all-in-one`); a new kbf process is
 started on other ports; Envoy sends **new** connections and streams to it only once it is
 ready and serving; the old process keeps answering what it already holds, then fails its
@@ -406,10 +409,11 @@ does before the cut so the step costs little:
 
 | step in `p` | what | advance work in `i` (before step 1 of 5.4) |
 |---|---|---|
+| cut marker | **first, before any flag or stage**: write `detached-<instance>` durably (temp file, `fsync`, rename, directory `fsync`; 9). From this point `precheck` refuses any restart of `p` by systemd. If the write fails (ENOSPC, EIO) nothing else has run: the cut is refused (`refused marker`) and `p` is unchanged. On the fail-closed path below `p` removes the marker, durably, as the last act before it exits, so a failed cut still ends in a cold start; a `SIGKILL` leaves it | none |
 | route flag | new storage calls go through `HandoverStorage` to `i` (5.2) | `i` binds its REAPI listener; its handlers wait on the roles latch |
 | tier seal | flush the active block into cold; tier read-only and open so a `ByteStream.Read` in flight finishes (`Cache::seal`). The reversible part (seal the active block, drain the flusher) runs at prepare. | none: B4, `i` must not open the tier before the seal |
-| writes already open | Two cases, split by whether the body has been fully received at the route flag. (a) **Body still arriving** (a large upload, a slow client): `p` keeps receiving it, and once complete hands the buffered blobs to `i` as an ordinary write; `p` starts no segment PUT after the flag. A client slower than `T_s` is unaffected. (b) **Segment PUT already started**: it completes through `p`'s open store handle (objects are immutable and renamed in atomically, keys carry a per-start epoch so two writers never collide, `kbf-front/src/cache/write_group.rs`) and its `PutBlobs` **commit is forwarded to `i`'s meta log**; the caller is answered when that commit is durable. **Decision (was Q6)**: the cold-store lock is split into an exclusive open-and-sweep lock and a shared put lock, so `p`'s demote releases the exclusive lock at once and its started PUTs hold only the shared one; `i` takes the exclusive lock at start (no sweep needed: objects are only added) and its own PUTs take the shared one. Then `p`'s PUTs are not a component of `T_s`. An object-store cold tier has no lock at all. If the spike finds the shared lock unsafe for `file://`, the fallback is `p` finishing started PUTs before releasing, which becomes a named component `T_put` with its own gate (p99 under 2 s), and PR 6-9 do not ship without that number. | `i` accepts forwarded commits (an idempotent `PutBlobs` by object key); verified by T-4 |
-| meta log | `RaftMetaLog::demote` (6.4, "Demote"): set `closed`, abort the tick task, take the host mutex (waits for the in-flight batch), release `log.lock` while still holding it, keep the applied `MetaState` queryable for frozen reads. After it no path in `p` can append (`commit_batch` and `raise_machine_version` both check `closed` under the host mutex) | `RaftMetaLog::open_follower` (new, 6.4): a read-only tail of the log, applying whole records as `p` writes them. At the cut `i` applies only the tail `p` wrote since its last poll, takes the lock with `Follower::promote`, and opens the store from the follower's cursor with the warm machine. Without it `i` replays the whole log inside `T_s` (B2). |
+| writes already open | Two cases, split by whether the body has been fully received at the route flag. (a) **Body still arriving** (a large upload, a slow client): `p` keeps receiving it, and once complete hands the buffered blobs to `i` as an ordinary write; `p` starts no segment PUT after the flag. A client slower than `T_s` is unaffected. (b) **Segment PUT already started**: it completes through `p`'s open store handle (objects are immutable and renamed in atomically, keys carry a per-start epoch so two writers never collide, `kbf-front/src/cache/write_group.rs`) and its `PutBlobs` **commit is forwarded to `i`'s meta log**; the caller is answered when that commit is durable. **Decision (was Q6)**: the cold-store lock is split into an exclusive open-and-sweep lock and a shared put lock, so `p`'s demote releases the exclusive lock at once and its started PUTs hold only the shared one; `i` takes the exclusive lock at start (no sweep needed: objects are only added) and its own PUTs take the shared one. Then `p`'s PUTs are not a component of `T_s`. **The cut never waits for a forwarded PUT commit**: that commit is an ordinary command on `i`, and `i` can accept it only once it holds the meta lock, which `p` releases in the demote; waiting for the commit before releasing the lock would make each side wait for the other. The cut waits only for `p`'s own queue (6.4, "Queued commands"), which a forwarded commit is never in. An object-store cold tier has no lock at all. If the spike finds the shared lock unsafe for `file://`, the fallback is `p` finishing started PUTs before releasing, which becomes a named component `T_put` with its own gate (p99 under 2 s), and PR 6-9 do not ship without that number. | `i` accepts forwarded commits (an idempotent `PutBlobs` by object key); verified by T-4 |
+| meta log | `RaftMetaLog::demote` (6.4, "Demote"): abort the tick task, **drain `p`'s execute queue** (6.4, "Queued commands"), then set `closed`, take the host mutex (waits for the in-flight batch), retire the store, release `log.lock` while still holding the mutex, keep the applied `MetaState` queryable for frozen reads. After it no path in `p` can append (`commit_batch` and `raise_machine_version` check `closed` under the host mutex, and the store itself refuses every write, invariant I6) | `RaftMetaLog::open_follower` (new, 6.4): a read-only tail of the log, applying whole records as `p` writes them. At the cut `i` applies only the tail `p` wrote since its last poll, takes the lock with `Follower::promote`, and opens the store from the follower's cursor with the warm machine. Without it `i` replays the whole log inside `T_s` (B2). |
 | cold store | `FsStore::demote`: release `LOCK`, keep reads | none: `i` blocks on the lock and takes it on release |
 | state store | `store.demote()` last | `i` opens nothing; the rows are read at takeover (B12): measured inside `T_s` |
 | daemon cache | release the cache dir lock (6.2) | none |
@@ -424,7 +428,10 @@ a stated requirement and a `check` rule (same cold-store URI in both drop-ins).
 
 **Frozen reads rule.** After the seal, `p`'s frozen read path reads the cold store and its own applied
 `MetaState` only, never a hot-tier block: `i`'s tier open runs the orphan sweep and may remove any block no
-staged object names. T-5 seals, opens the tier on `i`, then reads a hot-tier digest through `p`.
+staged object names. T-5 seals, opens the tier on `i`, then reads a hot-tier digest through `p`. The same read can name a digest that `i`'s retention
+sweep has already dropped from the cold store (`p`'s frozen `MetaState` still lists it). The frozen path treats `NotFound` as
+"ask `i`", never as an answer: it retries the read once through `i`, and `i`'s result (the bytes, or its `NotFound`) is final. A frozen
+read never returns an error from its own missing object. T-5 plants the drop between the seal and the read.
 
 `HandoverStorage` is one `Arc<dyn Storage>` behind an atomic swap, used by the REAPI services and
 by `LocalStore::over`. After the route flag: authority questions (`FindMissingBlobs`,
@@ -432,7 +439,7 @@ by `LocalStore::over`. After the route flag: authority questions (`FindMissingBl
 `i`; writes go to `i`. None of them is held in `p`: each is an open call on `i`, which answers when its
 roles latch opens (5.3).
 
-**Components of `T_s`**, each measured separately: `p`'s last meta batch (and, only under the fallback of the writes row, `T_put`); the lock releases; `i`'s meta-log promote (6.4.2: the final tail, `open_from` and the election; the whole replay only on the fallback); tier open on `i`; the scheduler's recovery from the state rows (B12).
+**Components of `T_s`**, each measured separately: `p`'s queue drain and last meta batch (and, only under the fallback of the writes row, `T_put`); the lock releases; `i`'s meta-log promote (6.4.2: the final tail, `open_from` and the election; the whole replay only on the fallback); tier open on `i`; the scheduler's recovery from the state rows (B12).
 
 **What `i` can and cannot do in advance, stated as claims to measure.** The follower open of the meta log and
 the read-only open of the tier are the two pieces that decide `T_s`: without a follower open the meta log's
@@ -447,11 +454,16 @@ storage node (`kbf-front/src/proxy`).
 
 **Prepare (reversible).** At step 1 of 5.4, before the cut, `p` seals the reversible part of the tier, checks free
 space on the cold, meta and state directories, and evaluates the `T_s` budget of 5.3. It refuses
-(`refused disk`, `refused switch-too-long`, `refused unmeasured`) and nothing has changed. Each successor start
+(`refused disk`, `refused switch-too-long`, `refused unmeasured`, `refused meta-unhealthy`, `refused marker`) and nothing has changed.
+**`meta-unhealthy`** is returned when `p`'s meta host is stopped (`Host` stopped itself after a storage error, so the log is not being
+appended) or its store has `failed`: a store that failed a write or a sync may hold records `p` reported as failed
+and answered `Unavailable`, which a follower reads as whole and committed, so they would become visible on `i`; and a later power
+loss could leave a hole in the middle of the log. In that state the right action is a cold start of `p`, not a handover.
+The same check runs again at `hand-over` after the marker is written, and if it fails there the marker is removed and the cut is refused before any flag. Each successor start
 records its measured `T_s`. The first start into the template is a cold restart that records it.
 
 **Committed cut block**, in the order of the table above. A failure after the route flag is committed: the
-process fails closed (`drain.close()`, non-zero exit, no marker), systemd restarts it as a cold start, its builds
+process fails closed (`drain.close()`, the marker removed durably, non-zero exit), systemd restarts it as a cold start, its builds
 fail and their actions rerun, and `kbf_handover_demote_failed_total` alerts. Each stage has a failpoint test.
 
 
@@ -503,30 +515,82 @@ impl Follower {
 version gate. It never proposes `Bootstrap`, never ticks, and its `MetaState` is not served to callers: before the
 cut `p` answers every call, after it `i` does.
 
-**Demote: no second writer after the lock is released.** Today the only guard against a write after the log is
-closed is `closed`, checked in `commit_batch` under the host mutex, and `Drop` sets it before it takes the mutex.
-`raise_machine_version` takes the host mutex and calls `propose` with no such check, and `demote(&self)` keeps the
-host and its open append fd. So, as the code stands, a raise after the lock is released would append to the
-segment `i` now owns, and "`p` refuses a raise from the moment prepare starts" would be a promise by the caller
-only. The change (PR M3, a kbf-server change to `raft_log/mod.rs`):
+**Invariants.** The tests of section 13 name these; every rule below exists to keep one of them.
 
-1. `demote` does what `Drop` does, in the same order: `closed.store(true)`, abort the ticker, `drop(shared.lock())`
-   is replaced by **holding** the host guard, take the lock file out of `lock`, drop it (the flock is released),
-   then release the guard. Every writer takes the host mutex and checks `closed` under it, so after the flock is
-   released no batch and no raise can write; one that was waiting on the mutex sees `closed` and is refused.
+| id | invariant |
+|---|---|
+| I1 | **One appender.** At any instant at most one process holds `log.lock` and appends to the directory; the flock has no expiry, so a dead holder frees it and a live one never does |
+| I2 | **Acked implies synced.** A caller is answered only after its record is synced, so an answered write survives any process death |
+| I3 | **`promote` `Ok` implies durable.** When `promote` returns the writer, the truncation, the hard state and the election's blank entry are on disk |
+| I4 | **Contiguous, applied once.** The log's indices are contiguous and every index is applied exactly once to a given machine, across follow, cut and promote |
+| I5 | **New term above all.** The term `i` elects at is above every term any earlier start persisted or voted in |
+| I6 | **A demoted handle never writes.** After `demote` released the lock, no path of `p`'s handle appends, persists a hard state, or writes or renames a snapshot, whatever the caller does |
+
+**Demote: no second writer after the lock is released (I1, I6).** Today the only guard against a write after the log
+is closed is `closed`, checked in `commit_batch` under the host mutex, and `Drop` sets it before it takes the mutex.
+`raise_machine_version` takes the host mutex and calls `propose` with no such check, and `demote(&self)` keeps the
+host and its open append fd. And `closed` is the only guard: `Store::persist_entries`, `persist_hard_state` and
+`persist_snapshot` have no closed check of their own (only the `failed` flag a failed write sets), so a demoted `p`
+that reached the store by any other route (a tick of the core, `Host::snapshot`, which writes a snapshot by temp file
+and rename into the directory `i` now owns) would write into `i`'s log. As the code stands a raise after the lock is
+released would append to the segment `i` owns, and "`p` refuses a raise from the moment prepare starts" would be a
+promise by the caller only. The change (PR M3, a `kbf-store` change and a `kbf-server` change to `raft_log/mod.rs`):
+
+1. `demote` follows `Drop`'s order, with the queue drain of "Queued commands" first: abort the ticker, drain,
+   `closed.store(true)`, **hold** the host guard, retire the store (point 4), take the lock file out of `lock`, drop
+   it (the flock is released), then release the guard. Every writer takes the host mutex and checks `closed` under it,
+   so after the flock is released no batch and no raise can write; one that was waiting on the mutex sees `closed`
+   and is refused.
 2. `lock: Option<File>` is a plain field today and `demote` takes `&self`, so it becomes `Mutex<Option<File>>`
    (taken only by `demote` and `Drop`; never on a commit path). A demoted handle's `Drop` finds `None` and only
-   repeats the idempotent steps.
+   repeats the idempotent steps. `log.lock` is **never unlinked**, by `demote`, `Drop` or any clean-up: a flock is on
+   the inode, so removing the name lets a later open create a new file and hold "the" lock while another process
+   holds the old inode, which breaks I1. The lock file is opened `O_CLOEXEC` (std's `OpenOptions` sets it on Linux),
+   so a keeper or container that `p` spawns never inherits the descriptor and keeps the flock after `p`'s
+   demote; a test checks the flag on the descriptor.
 3. `raise_machine_version` calls `still_open(&self.closed)` after taking the host mutex and before it encodes,
    exactly as `commit_batch` does. It returns `MetaLogError::Unavailable` once closed.
-4. **`demote` does not drop the append fd.** Dropping it would need the host to be an `Option` that every user of
-   `Shared::lock` unwraps. The fd is harmless: nothing can write through it (point 3 and the batch check), and
-   `i` opens segments by name. The cost is that `p`'s core, its entries and its `MetaState` stay in memory until the
-   handle drops at `p`'s exit (hours); the memory estimate of 6.4.2 counts it. Freeing the host at demote is a
-   follow-up if the spike's memory number needs it.
+4. **A second guard at the store: `Store::retire`.** A new `Store::retire(&mut self)` sets `failed` (so
+   `persist_entries`, `persist_hard_state`, `persist_snapshot`, `load` and `sync` all return `StoreError::Failed`
+   from then on) and drops the active segment's append handle, so nothing can write through it even by a path that
+   does not check `closed`. `demote` calls it through the host while holding the host mutex, before the flock is
+   released. The host stays in memory (the segments are read by `i` by name); freeing it at demote is a follow-up
+   if the spike's memory number needs it (6.4.2). This replaces the first version's "the fd is harmless"; it is
+   harmless only while every caller checks `closed`, and two of the three store writers do not. Test T-M12 calls
+   each store write directly on a demoted handle and `Host::snapshot` and expects `Failed`, the directory
+   unchanged.
 
 `p`'s refusal of a raise from the start of prepare stays, as a reversible, early answer; it is no longer the
-safety.
+safety. **It is also undone.** The refusal is a flag owned by one prepare generation: an aborted prepare (a refusal,
+an `i` that exits or stops calling before `hand-over`, or `--handover-prepare-ttl-secs`, default 60, expiring
+without a `hand-over`) clears it, and `p` accepts raises again. Without this a refused update leaves `p` unable to
+raise the machine version until it restarts. A `hand-over` that arrives after the clear re-runs prepare's checks
+first. T-M14 refuses, aborts and then raises.
+
+**Queued commands: drain, never refuse (T-17).** `execute` pushes a command on `Queue.waiting` and a committer drains
+it in batches (`commit_queued`); `commit_batch` answers `Unavailable` once `closed` is set. So a command still queued, or
+in a batch that has not reached its `still_open` check, when `closed` is set gets `Unavailable`
+(`mod.rs`, `commit_batch`), and nothing in the code retries it: whether the caller's gRPC client retries is the
+client's choice (Buck2 retries an open, not a started stream), so this design does not count on it. "No write waits,
+none is refused" (6.3, T-17) needs the queue empty before `closed` is set. The choice is to **drain `p`'s queue**,
+not to forward it. Forwarding would give the log a second protocol (a command moved between logs with its answer
+channel, and an ordering rule against what `p` already committed); draining uses the committer that exists.
+
+1. The route flag sends every command that starts after it to `i` through `HandoverStorage`. A command already past
+   that router when the flag flips is a **`p`-path guard**: `HandoverStorage` hands each call to `p`'s log a counted
+   guard, taken before the route check and dropped when the answer is returned. Commands of `p`'s own internal
+   callers (the scheduler is quiesced, the state-store rows are not meta commands) hold the same guard.
+2. After the route flag, `demote` aborts the ticker, then waits until the guard count is zero and `Queue` is empty
+   with no committer running, bounded by `--handover-drain-ms` (default 2000). Each guarded command is one batch
+   long, so the wait is about one commit; it is in `T_s` as "queue drain" and recorded per start.
+3. Only then `closed` is set. A command that raced the drain cannot exist: the guard count covers every command that
+   passed the router, and a command that did not goes to `i`.
+4. If the bound expires the cut is committed, so `demote` proceeds and the commands still queued are answered
+   `Unavailable`; `kbf_handover_drain_refused_total` counts them and the next update is refused until an operator
+   resets it (the same rule as `refused switch-too-long`). This is the only way the cut refuses a write, it is
+   visible, and T-17 must see it at zero.
+
+A forwarded PUT commit is not in `p`'s queue (it goes to `i`) and the drain does not wait on it (6.3).
 
 #### 6.4.1 File-level safety
 
@@ -549,7 +613,7 @@ The follower's first pass is a full read of history. It runs in the background, 
 `T_s`; `i` is ready for the cut when `behind_bytes` is under `--meta-follow-lag-max` (prepare refuses
 `refused meta-follower-behind` otherwise, reversible). With the same single-writer log, the cut then costs:
 
-`T_meta = p's last batch + lock release + final tail (entries since the last poll) + hardstate read + open_from (including its syncs) + Log::restore validation + election (including its fsyncs)`
+`T_meta = p's queue drain + last batch + lock release + final tail (entries since the last poll) + hardstate read + open_from (including its syncs) + Log::restore validation + election (including its fsyncs)`
 
 - **final tail.** The follower polls every `--meta-follow-interval-ms` (default 20). The tail is what `p` committed
   in one interval plus the batch in flight. An idle farm writes one 36-byte `Tick` a second; a `Tick`-only log
@@ -588,7 +652,9 @@ start like the rest of `T_s`.
 `Follower::promote(wait)`:
 
 1. `try_lock` `log.lock` until `wait` expires (`PromoteError::Locked`, nothing changed). Taking the lock is the
-   happens-before: `p` released it after its last append.
+   happens-before: `p` released it after its last append (I1). The lock is on the inode of a file the follower
+   opens `O_CLOEXEC` and nobody unlinks (Demote, point 2). A cold start of `p` that raced `i` and holds the lock
+   is what the cut marker prevents (9, T-M15); if it happens anyway `i` exits `Locked` and nothing is changed.
 2. **After** the lock, `catch_up` once more. Reading before the lock would leave a window for one more batch;
    after it, no writer exists, so a partial record here is a real torn tail.
 3. `Store::open_from(cursor)`: the sealed segments before the cursor are immutable (a single voter never
@@ -618,8 +684,16 @@ start like the rest of `T_s`.
    that applies after `applied`. The invariant `applied == last whole index in the store` is asserted; a mismatch is
    `PromoteError::Diverged` and the process takes the committed-cut failure path (cold start). This is the one seam
    that stops a promoted follower from replaying the log or from applying onto a warm state twice.
-5. Elect (term `hard.term + 1`, blank entry), skip `Bootstrap` (already applied), `keep_answers`, read the farm time,
-   start the tick task.
+5. Elect (term `hard.term + 1`, blank entry), then **verify, not skip, `Bootstrap` and the log id**, as `open_running`
+   does after its election: the log id is read again from the directory's recorded id after the lock (the same file
+   `open_running` reads, never a value cached by the follower), and it must equal the id the follower's `Bootstrap`
+   named and the one `i` expects. If the machine has no `Bootstrap` (a follower opened on a directory that `p` had
+   not yet bootstrapped) `promote` proposes it, exactly as `open_running` does, and a `Bootstrap` that disagrees is
+   `PromoteError::Mismatch` (the writer's `RaftLogError::Mismatch`), a committed-cut failure. Then `keep_answers`,
+   read the farm time, start the tick task. **I3**: `promote` returns `Ok` only after the truncation, the hard-state
+   rename and directory sync, and the blank entry's sync have all returned, so a power loss after `Ok` leaves what
+   a cold start would read; **I5** holds because the term is read after the lock; **I4** because the cursor and
+   `applied` are asserted equal (step 4). Each of these has a failpoint test (T-M16).
 
 The compatibility gate sits at step 0 of `open_follower`: the binary's `RUNS` must be at least the version the log
 has committed (`FollowerError::Unsupported`), so a newer-writer or rolled-back case refuses at prepare, not at the cut.
@@ -654,7 +728,11 @@ follower must not tail across a format it does not read. When the planned snapsh
 | `promote` fails after the lock (open_from, `Diverged`, election) | the lock drops with the follower; `i` exits non-zero, no marker, the cold start serves. This is the existing committed-cut rule |
 | compaction races (after snapshots) | 6.4.4: re-read the snapshot, bounded passes, refusal rather than a silent skip |
 | `p` is killed and restarted while the follower runs (torn tail truncated, hard state bumped, blank entry at a higher term, a possible new segment) | the follower applies only whole records, so its cursor is within the truncated file; it applies the blank entry, keeps contiguity and never applies an index twice; a sealed segment whose length is below the recorded one is `Corrupt`, and `promote`'s recorded-length check falls back to the full open. T-M11 |
-| a raise or a batch after `demote` released the lock | refused under the host mutex (`closed`); the file length is unchanged. T-M12 |
+| a raise or a batch after `demote` released the lock | refused under the host mutex (`closed`) and by the store (`retire`); the file length is unchanged. T-M12 |
+| `p` dies between the meta demote and the marker | cannot happen: the marker is written before the route flag and before the first stage (6.3, 9). With the marker last, systemd would cold-start `p`, whose open could take `log.lock` before `i`'s `promote`; `i` would exit `Locked` and the host would cold-start twice. T-M15 plants the late marker and is red |
+| `p`'s queue holds commands at the cut | drained before `closed` (Demote, "Queued commands"); on the bound expiring they are answered `Unavailable` and counted. T-M17 |
+| `p`'s host is stopped or its store failed when the handover is asked | prepare refuses `refused meta-unhealthy`; nothing changes (6.3, Prepare) |
+| `i`'s `promote` fails inside, at a failpoint | `i` exits non-zero, the lock drops, the next start is a cold start equal to the expected state (I3). T-M16 |
 | `p`'s tick task still running at the cut | the cut aborts it before the lock release, so no `Tick` lands after the lock; a mutant plants one |
 
 #### 6.4.6 Why not the other shapes
@@ -770,8 +848,14 @@ Mirrors `kbf-frontend@.service` (merged, #887), for both modes.
   version a running process maps plus the newest two. Order: stage, check both instances are not active, flip
   the symlink, then `kbf handover --wait`. A refusal before the flip leaves the symlink alone and reports
   "draining: N leases, oldest M minutes".
-- **Detached marker (all-in-one).** `/run/kbf-all-in-one/detached-%i`, written in the demote block before
-  `released`, removed on a clean exit. `ExecCondition=kbf all-in-one precheck --instance=%i` exits non-zero when it exists, so a
+- **Detached marker (all-in-one).** `/run/kbf-all-in-one/detached-%i`, written **first in `hand-over`, durably, before
+  the route flag and before any demote stage** (not merely before `released`): temp file, `fsync`, rename, `fsync` of the directory. Removed on a clean
+  exit, and removed by `p` itself on the fail-closed path just before it exits non-zero, so a cut that failed cleanly still
+  ends in a cold start of `p`. A `SIGKILL` or power loss at any point after the write leaves it. The reason for the order: the meta
+  demote releases `log.lock`, and a `p` that dies after it but before a late marker is cold-started by systemd
+  (`Restart=on-failure`); that open can win `log.lock` against `i`'s `promote`, `i` exits `Locked`, and the host
+  cold-starts twice with a bumped epoch. With the marker first there is no instant at which `p`'s lock is free and
+  its restart is allowed. `ExecCondition=kbf all-in-one precheck --instance=%i` exits non-zero when it exists, so a
   crashed detached process is not restarted into a takeover of the live instance (which would be an update
   backwards); `start_or_take_over` repeats the check; `kbf handover --acknowledge-crash <instance>` is the only way
   back. While detached the unit reads `active (running)` and the process keeps `STATUS=` and a read-only status file current.
@@ -793,7 +877,8 @@ Mirrors `kbf-frontend@.service` (merged, #887), for both modes.
 | `i` dies after `released`, before serving | committed | the watchdog (5.1) turns `p` unready within `--handover-watchdog-secs`; until then new calls to `p` fail UNAVAILABLE (retried by Buck2); relayed streams follow `done/` rows by operation id | cold start (replays the meta log, `TimeoutStartSec` up to `max(120, 3 x replay)`) bumps the epoch; the detached daemon reruns its leases | callers of `p` are answered from rows; this is the one window that can fail a build |
 | `T_s` above its budget | committed | calls in the window are slower; none is dropped | `kbf_handover_switch_ms`; the next update is refused (`refused switch-too-long`) | fix the slow component; see 6.3 |
 | `i` never shows healthy in Envoy (admin API or check broken) | committed | none: `p` stays ready and keeps relaying; no capacity is lost | the derived settle timer runs as the fallback; alert on `p` still relaying | repair Envoy's check; `p` has no way back, so `i` keeps serving |
-| a demote stage fails | committed | open streams on `p` end UNAVAILABLE | `p` exits non-zero, cold start | actions rerun |
+| a demote stage fails | committed | open streams on `p` end UNAVAILABLE | `p` removes its marker, exits non-zero, cold start | actions rerun |
+| `p` is killed after the marker, before `released` | committed | its open streams and relays break | marker stays, so systemd does not restart `p`; `i`'s `promote` takes the freed lock (6.4.5) | `i` serves; `--acknowledge-crash` clears the marker |
 | `p` dies mid-cut, meta lock not yet released | committed | its open streams and relays break | `i`'s `promote` takes the freed lock, applies the whole records, truncates the torn tail (6.4.5) | no answered write is lost |
 | `p` dies mid-follow | committed | its open streams and relays break (the process holds them) | its daemon and keepers die (B1); marker stays | `--acknowledge-crash` |
 | **Envoy crashes or is killed** | n/a, **new** | every open `Execute` breaks | systemd restarts it; kbf unaffected; worker sessions redial | the cost of the uniform topology: a process in front of every build. Mitigation: low `OOMScoreAdjust`, a memory limit, no `restart`, a watchdog |
@@ -876,22 +961,28 @@ it); container tests run in the crun container job (Podman is dropped; kbf runs 
 | T-R | the relay: `Execute` and `WaitExecution` after the cut reach `i`, metadata forwarded, `i` authorizes again, the response stream is relayed to the end; a call that reaches `i` before its latch opens completes after it with no queue object outside the call; the client's deadline ends a call that never starts | a lost call, a hold bounded by a flag, a bypassed policy | answer from `p`'s own scheduler; drop the metadata |
 | T-D | `Drain`: `hand-over` alone leaves `/readyz` ready and the gRPC health SERVING, **also with `i`'s latch closed for longer than the 2 s store-probe timeout**; `unready` flips both; no handover body keeps today's `begin` (GOAWAY included); each stage idempotent | a split that loses an effect, readiness off too early | flip readiness in `hand-over`; run the store probe through `HandoverStorage` |
 | T-A | the API call: refusal reasons; a different state path refused; the answer carries the generation; no handover body keeps today's meaning | a refusal that proceeds | accept without comparing |
-| T-1, T-3 | `RaftMetaLog::demote` (the lock is released after the in-flight batch and state stays readable) and `FsStore::demote`; the second open succeeds while reads work | B2, B3 | skip the unlock; release before the batch ends |
-| T-M12 | after `demote`: `raise_machine_version` returns `Unavailable`, a `commit` returns `Unavailable`, and the active segment's length and the directory hash are unchanged; a raise queued on the host mutex while `demote` runs is refused, not applied; a second open of the directory succeeds and its writes are not interleaved with any from the demoted handle | a second writer after the lock release | delete the `still_open` check in `raise_machine_version` (red: the file grows); set `closed` after the lock release instead of before; take the host mutex after releasing the flock |
+| T-1, T-3 (I1) | `RaftMetaLog::demote` (the lock is released after the in-flight batch and state stays readable) and `FsStore::demote`; the second open succeeds while reads work | B2, B3 | skip the unlock; release before the batch ends |
+| T-M12 (I1, I6) | after `demote`: `raise_machine_version` returns `Unavailable`, a `commit` returns `Unavailable`, and the active segment's length and the directory hash are unchanged; a raise queued on the host mutex while `demote` runs is refused, not applied; a second open of the directory succeeds and its writes are not interleaved with any from the demoted handle; **each store write called directly on the demoted handle (`persist_entries`, `persist_hard_state`, `persist_snapshot`) and `Host::snapshot` return `StoreError::Failed` and leave the directory (a hash, snapshot file included) unchanged**; the descriptor of `log.lock` has `FD_CLOEXEC`, and no unlink of `log.lock` is reachable (I1, I6) | a second writer after the lock release; a snapshot renamed over `i`'s directory | delete the `still_open` check in `raise_machine_version` (red: the file grows); delete `Store::retire` (red: the direct store write lands); open the lock without `O_CLOEXEC`; unlink `log.lock` in `Drop`; set `closed` after the lock release instead of before; take the host mutex after releasing the flock |
 | T-M1 | `scan_readonly` over a segment cut at every byte offset of the last record: whole records apply, a prefix never does, no file changes (a hash of the directory before and after), and the same cut in a non-last segment is `Corrupt` | a follower that applies a prefix or repairs the directory | skip the CRC check; call `truncate` |
-| T-M2 | the follower and the writer on one directory: a writer thread commits while the follower polls; at a pause both `MetaState`s are equal, and `index` is contiguous | a skipped or doubled entry | drop the `index == prev + 1` check |
+| T-M2 (I4) | the follower and the writer on one directory: a writer thread commits while the follower polls; at a pause both `MetaState`s are equal, and `index` is contiguous | a skipped or doubled entry | drop the `index == prev + 1` check |
 | T-M3 | rotation: the writer crosses a small `segment_bytes`; the follower sees the new segment empty (retry), then filled; a record landing in the old segment between its last read and its listing is applied | a lost record at the segment edge | move on without re-reading the old tail |
 | T-M4 | version: a `MachineVersion` raise during following is applied in order; a log above `RUNS` and an undecodable entry give `Unsupported`; `p` refuses `raise_machine_version` after prepare (the safety is T-M12) | a follower that runs on past `failed` | ignore `failed` |
-| T-M5 | `promote`: after it, `MetaState` equals a cold `open_dir` of a copy of the same directory, the term exceeds the old one, no entry is applied twice (a counting machine), and applied entries before the cursor are not re-read (a counting `Fs`) | a replay at takeover, a double apply | pass the cold machine; read every segment in `open_from` |
-| T-M11 | `p` is killed mid-batch (child, SIGKILL) and restarted on the same directory while the follower runs: the follower stays contiguous, applies the new blank entry, never applies an index twice (a counting machine), and a shortened sealed segment is `Corrupt` | a follower that double-applies or reads past a truncation | drop the `index == prev + 1` check; trust a recorded length that shrank |
-| T-M13 | `p` restarts and re-elects during follow (term above 1), then `promote`: `hard.term` is read after the lock, the new term is `hard.term + 1`, and `Raft::restore` accepts; a planted stale read gives `BadLog`/`Diverged` | a promotion at a term not above the old process's | read `HARD_STATE` before taking `log.lock`; hard-code term 1 |
-| T-M6 | crash matrix: the writer is killed (SIGKILL in a child) at each failpoint of a commit (before write, after write before sync, after sync); `promote` truncates a torn tail, keeps every acknowledged entry, and equals a cold open | a lost acknowledged write; a follower ahead of the cold start | truncate before the lock; apply a prefix |
+| T-M5 (I4, I5) | `promote`: after it, `MetaState` equals a cold `open_dir` of a copy of the same directory, the term exceeds the old one, no entry is applied twice (a counting machine), and applied entries before the cursor are not re-read (a counting `Fs`) | a replay at takeover, a double apply | pass the cold machine; read every segment in `open_from` |
+| T-M11 (I4) | `p` is killed mid-batch (child, SIGKILL) and restarted on the same directory while the follower runs: the follower stays contiguous, applies the new blank entry, never applies an index twice (a counting machine), and a shortened sealed segment is `Corrupt` | a follower that double-applies or reads past a truncation | drop the `index == prev + 1` check; trust a recorded length that shrank |
+| T-M13 (I5) | `p` restarts and re-elects during follow (term above 1), then `promote`: `hard.term` is read after the lock, the new term is `hard.term + 1`, and `Raft::restore` accepts; a planted stale read gives `BadLog`/`Diverged` | a promotion at a term not above the old process's | read `HARD_STATE` before taking `log.lock`; hard-code term 1 |
+| T-M14 (I6) | the raise gate: prepare starts refusing `raise_machine_version`; a refusal, an `i` that disappears, and the TTL each clear it, and a raise then commits; a `hand-over` after the clear re-runs prepare | a gate that stays shut after an aborted update | never clear the flag; clear it at `hand-over` start only |
+| T-M15 (I1) | the marker order (I1): `p` (a child) is killed by failpoint after the meta demote and before `released`; with the real order the marker exists, `precheck` refuses, and `i`'s `promote` wins `log.lock` with the contiguous log and no `Locked`; **the mutant writes the marker after the meta demote, and a cold start of `p` (run as systemd would) wins the lock against `i` and `i` exits `Locked`: the test is red**. A failpoint in the marker write itself (before `rename`, after `rename`, before the directory sync) yields either no marker and no stage run (refused), or a marker and a consistent cut, never a stage without a marker | a restart of `p` that races `i` | marker after the meta demote, or after the route flag |
+| T-M16 (I3, I4, I5) | failpoints inside `promote` (each is a child killed by SIGKILL, then a **cold start of the directory that must equal the expected state**): after `log.lock`, after the second `catch_up`, after `open_from`'s truncation, after the hard-state rename, after the blank entry's sync. Expected: every acknowledged entry present, no torn tail, term above every earlier one, one blank entry at most per attempt, `Bootstrap` and log id unchanged, no index twice (a counting machine). Plus `Bootstrap` verification: a directory whose recorded log id differs from the follower's gives `Mismatch` and the lock drops; a follower on a not-yet-bootstrapped directory proposes it once | I3, I4, I5; a promote that returns `Ok` too early; a skipped `Bootstrap` check | return `Ok` before the blank entry's sync; skip the log id check; read the hard state before the lock |
+| T-M17 (I2, I4) | full queue at demote: `N` commands queued on `p`'s execute queue and a batch in flight when `demote` starts (a gated `Fs` holds the batch): every one of the `N` is answered with its real result (none `Unavailable`), is in `i`'s follower-applied state exactly once, and `kbf_handover_drain_refused_total` is zero; with the drain bound at 0 the same load is answered `Unavailable` and counted (so the counter can fail the test); a forwarded PUT commit held open across the demote does not delay the drain (no deadlock) | the refusal of 6.3's "none is refused"; the lock wait in 6.3 | set `closed` before the drain; wait for the forwarded commit before the lock release |
+| T-M18 (I1, I2, I4) | the handover storm (I1, I2, I4): two processes, `p` appending a counter and printing each ack after its answer, `i` as follower; random demote and promote, `SIGKILL` of either process at every failpoint of 6.4 (demote stages, the marker, each `promote` failpoint of T-M16) and at random instants, repeated for N rounds with a restart of the survivor as systemd would after the marker rule. Checks after each round, from a cold open of the directory: the log is contiguous, **every printed ack is present**, no index is applied twice, and the writers' pids in the log form a `p` prefix followed by an `i` suffix (one switch, never `p` after `i`). Same shape as the crash matrix of #900 | any window with two appenders or a lost acknowledged write | allow a restart of `p` after the lock release; ack before sync |
+| T-M19 | `meta-unhealthy`: `p`'s host is stopped (storage error injected), and separately its store has `failed`: prepare and the second check at `hand-over` refuse with `refused meta-unhealthy`, the marker is removed, the follower never applies the failed batch's records | records `p` called failed becoming visible on `i` | omit the check |
+| T-M6 (I2, I3) | crash matrix: the writer is killed (SIGKILL in a child) at each failpoint of a commit (before write, after write before sync, after sync); `promote` truncates a torn tail, keeps every acknowledged entry, and equals a cold open | a lost acknowledged write; a follower ahead of the cold start | truncate before the lock; apply a prefix |
 | T-M7 | trust check: truncate or replace a sealed segment between follow and promote: `open_from` falls back to the full open, the counter increments, the state is correct | trusting a changed prefix | skip the length check |
 | T-M8 | fall behind: a slow `Fs` makes `behind_bytes` large; prepare refuses; the tail still applies after the cut when forced; a live-tail record with a damaged length (above `MAX_PAYLOAD`) is retried, counted in `behind_bytes`, and ends as `refused meta-follower-behind`; at `promote` the same bytes with a valid record after them are `Corrupt` and nothing is truncated | a silent cut over a long tail | report `at_tail` always true |
 | T-M9 | (with snapshots, M5) a snapshot and segment removals during following: mid-segment follower continues; a follower below the base restores; a removed segment that reappears is skipped by both | a stale cursor; two rules for "covered" | follower uses its own rule |
-| T-M10 | the cut with the tick task: no `Tick` after the lock release | a late write by `p` | abort the ticker after the unlock |
-| T-4, T-5 | `Cache::seal` and the orphan pass; `HandoverStorage` (`FindMissing` and action-cache lookups to `i`, named reads frozen then `i`, a write open at the cut finishes and its commit lands once on `i`, a write after the cut lands on `i`); a segment PUT held open across the cut commits exactly once on `i` with no deadlock; a 64 MiB `ByteStream` write whose body straddles the cut, with a client slower than `T_s`, completes; seal, open the tier on `i` (sweep), then read a hot-tier digest through `p` | B4, a stale hit, a lost or doubled write, a lock-order deadlock | answer from frozen state; commit on `p` after the demote; forwarded commit waits on the latch; `p` reads a tier block after the seal |
-| T-6 | real stages with a failpoint at each cut-block index: fail-closed outcome, no marker, cold start serves; state demote last | a partial demote | move `store.demote` earlier |
+| T-M10 (I1, I6) | the cut with the tick task: no `Tick` after the lock release | a late write by `p` | abort the ticker after the unlock |
+| T-4, T-5 | `Cache::seal` and the orphan pass; `HandoverStorage` (`FindMissing` and action-cache lookups to `i`, named reads frozen then `i`, a write open at the cut finishes and its commit lands once on `i`, a write after the cut lands on `i`); a segment PUT held open across the cut commits exactly once on `i` with no deadlock; a 64 MiB `ByteStream` write whose body straddles the cut, with a client slower than `T_s`, completes; seal, open the tier on `i` (sweep), then read a hot-tier digest through `p`; a frozen read of a digest `i`'s retention dropped is answered by `i` (its `NotFound` is final, never an error from `p`) | B4, a stale hit, a lost or doubled write, a lock-order deadlock | answer from frozen state; commit on `p` after the demote; forwarded commit waits on the latch; `p` reads a tier block after the seal |
+| T-6 | real stages with a failpoint at each cut-block index: fail-closed outcome, marker removed before exit, cold start serves; state demote last | a partial demote | move `store.demote` earlier |
 | T-7 | `Keep` on the real start path, the Welcome epoch unchanged across a handover (SQLite open included); recovered lease books on the predecessor's node id; successor registers `total - booked`; two cycles a, b, a, the second gets grants; **kill and restart `i` with `p` still detached: `p`'s worker is granted nothing** (durable cordon) | B8, B9, the stale cordon, a lost cordon | `Bump`; skip the cordon delete; keep the cordon in memory only |
 | T-8 | the real start sweep against a fake container runtime holding two owner labels | B7 | share the data dir |
 | T-9 | golden of the Driver's call sequence for the frontend, plus the existing suite | a refactor changing both sides | reorder two stages |
@@ -899,8 +990,8 @@ it); container tests run in the crun container job (Podman is dropped; kbf runs 
 | T-11 | an action finishes after the cut, local and remote: its outputs upload to `i`, its `Result` is accepted once, nothing is written into `p`'s stores | unacknowledged results, a write into a demoted store | keep the local data plane |
 | T-12 | `i` dies after `released`: `p` goes unready within `--handover-watchdog-secs` (failpoint), a cold start serves, callers of the old one get answers | the unrecoverable window; `p` chosen while refusing everything | the old exits at `released`; a watchdog that never fires |
 | T-13..15 | injected ENOSPC at prepare refuses and the old keeps serving; `T_s` over the budget refuses the next update; the short-fence flag: under budget zero reruns, over it the leases fence and rerun and no caller sees an error from the old one | disk-full reversibility, the budget, the fence interaction | raise the fence; record no `T_s` |
-| T-16 | SIGKILL a detached old: the successor is unaffected, `precheck` refuses the restart, `--acknowledge-crash` clears | restart into takeover | write the marker after `released` |
-| T-17 | a load of writes, reads and `Execute` calls running across the whole cut: every call completes, none is refused by `p` (a daemon redial is not a call), the longest call is within `T_s` plus its normal latency | any hold, park or refusal in the sequence | add a sleep in the cut; refuse writes at the route flag |
+| T-16 | SIGKILL a detached old: the successor is unaffected, `precheck` refuses the restart, `--acknowledge-crash` clears | restart into takeover | write the marker after `released`, or after the meta demote (T-M15) |
+| T-17 | a load of writes, reads and `Execute` calls running across the whole cut: every call completes, none is refused by `p` (a daemon redial is not a call), the longest call is within `T_s` plus its normal latency, `kbf_handover_drain_refused_total` is zero | any hold, park or refusal in the sequence | add a sleep in the cut; refuse writes at the route flag; set `closed` before the drain (T-M17) |
 
 A kbf-it test pins that `/readyz` answers without a token on the API listener.
 
@@ -928,12 +1019,13 @@ this refresh. Sizes are estimated changed lines.
 | 5 | E6, E8 and T-17 for the frontend | 400 |
 | M1 | kbf-store: one read-only scan shared by `Store::open` (which adds the repairs) and the follower; read-only `Fs` view; T-M1 | 400 |
 | M2 | kbf-server: `open_follower`, `Follower::catch_up`, cursor, rotation, version gate; T-M2..4, T-M8 | 600 |
-| M3 | `Store::open_from`, `Raft::restore_applied` and `Host::open_resumed`, `Follower::promote`, `RaftMetaLog::demote` (closed-then-host-then-unlock, `Mutex<Option<File>>`, the `still_open` check in `raise_machine_version`); T-M5..7, T-M10..13, T-1 | 900 |
+| M3 | `Store::open_from`, `Store::retire`, `Raft::restore_applied` and `Host::open_resumed`, `Follower::promote` (with the `Bootstrap` and log id verification), `RaftMetaLog::demote` (queue drain, closed-then-host-then-retire-then-unlock, `Mutex<Option<File>>`, never-unlinked `O_CLOEXEC` `log.lock`, the `still_open` check in `raise_machine_version`, the raise gate's clear); T-M5..7, T-M10..14, T-M16, T-M17, T-1 | 1300 |
+| M4 | the handover storm: a two-process harness with failpoints at every demote stage and every `promote` step, SIGKILL and restart rules; T-M18 | 400 |
 | M5 | snapshot-aware follower, after the snapshot PRs of `metadata-snapshots.md` land; T-M9 | 300 |
-| 6-9 | all-in-one: `FsStore::demote`, the wiring of M1-M3 (flags `--meta-follow-interval-ms`, `--meta-follow-lag-max`), T-3, `Cache::seal`, read-only tier open and `HandoverStorage` (T-4, T-5, forwarded commits), the detached daemon with the remote data plane and per-instance data dir (T-8, T-11), the wiring, cordon reset and capacity (T-6, T-7, T-12..16) | about 3500 |
+| 6-9 | all-in-one: `FsStore::demote`, the wiring of M1-M3 (flags `--meta-follow-interval-ms`, `--meta-follow-lag-max`, `--handover-drain-ms`, `--handover-prepare-ttl-secs`), the cut marker written first and removed on fail-closed (T-M15), the `p`-path guard in `HandoverStorage`, `meta-unhealthy` (T-M19), T-3, `Cache::seal`, read-only tier open and `HandoverStorage` (T-4, T-5, forwarded commits), the detached daemon with the remote data plane and per-instance data dir (T-8, T-11), the wiring, cordon reset and capacity (T-6, T-7, T-12..16) | about 3900 |
 | 10 | all-in-one `kbf-it` T-10, T-12, T-17, container CI placement | 500 |
 
-PRs 6 to 9 are inert until their flags are given. Everything from PR M1 and PR 6 on is gated on the spike's `T_s` answer, and the spike carries a throwaway follower (read-only scan, tail, open from a cursor) so the tail-only time of 6.4.2 is measured, not estimated. M5 waits on the snapshot PRs; until then the follower refuses a directory with a snapshot.
+Sizes of M3, M4 and 6-9 grew with the review of 6.4 (the store guard, the drain, the marker order and the new tests). PRs 6 to 9 are inert until their flags are given. Everything from PR M1 and PR 6 on is gated on the spike's `T_s` answer, and the spike carries a throwaway follower (read-only scan, tail, open from a cursor) so the tail-only time of 6.4.2 is measured, not estimated. M5 waits on the snapshot PRs; until then the follower refuses a directory with a snapshot.
 
 ## 15. Open questions
 
