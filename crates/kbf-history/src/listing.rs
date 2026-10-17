@@ -190,12 +190,18 @@ impl Walk {
         let Some(after) = after else {
             return self;
         };
-        let past = Bound::Excluded(format!("{}{after}", self.prefix));
+        let key = format!("{}{after}", self.prefix);
+        self.move_past(key);
+        self
+    }
+
+    /// Moves the start of the walk past the row `key` (a full key), in its direction.
+    fn move_past(&mut self, key: String) {
+        let past = Bound::Excluded(key);
         match self.direction {
             Direction::Forward => self.lower = past,
             Direction::Reverse => self.upper = past,
         }
-        self
     }
 }
 
@@ -481,11 +487,7 @@ impl<O> Reader<O> {
             if scanned >= self.scan_budget {
                 return Ok((out, Some(cursor(&walk, resume.key()))));
             }
-            let past = Bound::Excluded(resume.key().to_owned());
-            match walk.direction {
-                Direction::Forward => walk.lower = past,
-                Direction::Reverse => walk.upper = past,
-            }
+            walk.move_past(resume.key().to_owned());
         }
     }
 }
