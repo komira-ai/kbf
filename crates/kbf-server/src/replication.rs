@@ -40,8 +40,9 @@ use kbf_storage::service::{InProcess, StorageService};
 use kbf_store::StdFs;
 use tonic::transport::ClientTlsConfig;
 
+use crate::join::{Joined, Joiner};
 use crate::node_map::NodeMap;
-use crate::serve::{ServeError, StorageListener, bind_service};
+use crate::serve::{ServeError, StorageListener, StorageSocket, serve_service};
 use crate::start::AbortOnDrop;
 use crate::storage_node::StorageFlags;
 
@@ -153,24 +154,41 @@ pub(crate) struct Node {
     pub repair: Option<AbortOnDrop>,
 }
 
-/// Binds `storage` as the node `flags` describe: a one-member farm of itself, or, with
-/// `--frontend`, a node that registers with the frontend, judges calls by the map it is
-/// sent, and replicates ([`replicate`]). The repair worker and the registration run beside
-/// the listener; the worker stops when `shutdown` resolves, the calls in flight being
-/// drained by the listener as they are for any node.
+/// A node that is bound and, with `--frontend`, registered: what [`bind_node`] serves
+/// once the node has opened its cache. The cache is opened between the two so that it
+/// writes as the registration's member and boot ([`crate::storage_node::open_cache`]).
+pub(crate) struct Registered {
+    /// The listener's socket, bound and not yet serving.
+    pub socket: StorageSocket,
+    /// The map the node keeps and the member it learned it is.
+    pub node: Arc<NodeMap>,
+    /// The registration, and what it gave, for the heartbeats ([`Joiner::keep`]).
+    pub joiner: Option<(Joiner, Joined)>,
+}
+
+/// Serves `storage` on the socket of `registered` as the node `flags` describe: a
+/// one-member farm of itself, or, with `--frontend`, a node that judges calls by the map
+/// it was sent, and replicates ([`replicate`]). The repair worker and the heartbeats run
+/// beside the listener; the worker stops when `shutdown` resolves, the calls in flight
+/// being drained by the listener as they are for any node.
 ///
 /// # Errors
-/// The listener cannot be bound; the TLS files cannot be read; the node cannot be made a
-/// link of a chain ([`ReplicationError`]).
+/// The TLS files cannot be read; the node cannot be made a link of a chain
+/// ([`ReplicationError`]); the listener's TLS is refused.
 pub(crate) fn bind_node(
     flags: &StorageFlags,
     listener: StorageListener,
+    registered: Registered,
     storage: Arc<dyn Storage>,
     repair_dir: &Path,
     shutdown: BoxFuture<'static, ()>,
 ) -> Result<Node, Box<dyn Error>> {
-    let maps = Arc::new(MapHolder::new());
-    let node = Arc::new(NodeMap::new(Arc::clone(&maps)));
+    let Registered {
+        socket,
+        node,
+        joiner,
+    } = registered;
+    let maps = node.maps();
     let service = listener.service(Arc::clone(&storage));
     let (shutdown, stop) = stopping(shutdown);
     let (service, worker, repairs) = if flags.frontend.is_some() {
@@ -181,11 +199,9 @@ pub(crate) fn bind_node(
     } else {
         (service, None, None)
     };
-    let (bound, in_process) = bind_service(service, listener.listen, listener.tls, shutdown)?;
+    let (bound, in_process) = serve_service(service, socket, listener.tls, shutdown)?;
     let addr = bound.addr;
-    let joiner = flags
-        .joiner(addr, node)?
-        .map(|joiner| AbortOnDrop(tokio::spawn(joiner.run())));
+    let joiner = joiner.map(|(joiner, joined)| AbortOnDrop(tokio::spawn(joiner.keep(joined))));
     let repair = worker.map(|worker| AbortOnDrop(tokio::spawn(run_repairs(worker, stop))));
     Ok(Node {
         addr,
