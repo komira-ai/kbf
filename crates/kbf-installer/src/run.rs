@@ -267,17 +267,12 @@ fn listed_in(dir: &Path, first: u32) -> io::Result<Vec<libc::c_int>> {
 }
 
 /// Mark one descriptor close-on-exec. A descriptor that is not open is fine (the directory
-/// listing's own is gone by now).
+/// listing's own is gone by now); `F_GETFD` fails for no other reason than `EBADF`.
 fn cloexec(fd: libc::c_int) -> io::Result<()> {
     // SAFETY: fcntl on a number only reports EBADF when it is not open.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags < 0 {
-        let error = io::Error::last_os_error();
-        return if error.raw_os_error() == Some(libc::EBADF) {
-            Ok(())
-        } else {
-            Err(error)
-        };
+        return Ok(());
     }
     // SAFETY: as above.
     check(unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) })

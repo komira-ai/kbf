@@ -456,3 +456,35 @@ fn a_descendant_that_left_the_group_cannot_hold_the_run() {
     assert_eq!(ran.code, Some(0));
     assert!(ran.stdout.is_empty());
 }
+
+/// Catches the child's marking step swallowing a failure, in this process (what runs between
+/// fork and exec is not measured, and a failed start reports only its error): the step
+/// returns the marking's error and does not go on to switch user.
+///
+/// Mutant seen red: the `Fails` arm made to succeed.
+#[test]
+fn the_step_before_exec_returns_the_markings_error() {
+    let err = before_exec(None, Inherited::Fails(libc::EPERM))().expect_err("fails");
+    assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+}
+
+/// Catches a failed look at the child being taken for "still running" or "exited": a pid
+/// that is not this process's child has no state to look at, so the call is an error
+/// (`ECHILD`) the run passes on, not an answer.
+///
+/// Mutant seen red: the error answered `Ok(false)`.
+#[test]
+fn looking_at_a_process_that_is_not_a_child_is_an_error() {
+    let err = exited(1).expect_err("pid 1 is not a child of the test");
+    assert_eq!(err.raw_os_error(), Some(libc::ECHILD));
+}
+
+/// The capture sink's `flush` has nothing to do and says so (`io::copy` never calls it).
+#[test]
+fn the_capture_sink_flushes_without_effect() {
+    use std::io::Write;
+    let mut keep = Keep(Arc::new(Mutex::new(Vec::new())));
+    keep.write_all(b"ab").expect("kept");
+    keep.flush().expect("nothing to flush");
+    assert_eq!(*keep.0.lock().expect("lock"), b"ab");
+}
