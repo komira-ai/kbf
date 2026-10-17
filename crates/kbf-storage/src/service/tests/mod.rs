@@ -1244,6 +1244,28 @@ async fn a_streamed_write_whose_sender_goes_away_stores_nothing() {
     assert_eq!(mem.streamed.load(Ordering::SeqCst), 0);
 }
 
+/// Catches a streamed Write whose second message the server cannot decode (it is larger
+/// than the largest message): the broken stream is the sender's fault, answered with the
+/// decoder's status, not INTERNAL, and nothing is stored.
+#[tokio::test]
+async fn a_streamed_write_with_an_oversized_message_stores_nothing() {
+    let (mem, _remote, channel) = pair().await;
+    let large = patterned(STREAM_FROM_BYTES as usize + 1);
+    let digest = sha(&large);
+    let mut messages = blob_messages(&upload_name(&digest), &large);
+    messages.truncate(1);
+    messages[0].finish_write = false;
+    messages.push(WriteRequest {
+        write_offset: messages[0].data.len() as i64,
+        data: vec![0; super::MAX_MESSAGE_BYTES + 1],
+        ..WriteRequest::default()
+    });
+    let status = raw_write(&channel, messages).await.expect_err("refused");
+    assert_eq!(status.code(), Code::OutOfRange, "{status}");
+    assert!(mem.blobs.lock().expect("lock").is_empty());
+    assert_eq!(mem.streamed.load(Ordering::SeqCst), 0);
+}
+
 /// Catches a remote storage that gathers a streamed put or answers it as if stored: it
 /// takes none (it writes a blob through `put`), and says so as `Invalid`, consuming
 /// nothing.
