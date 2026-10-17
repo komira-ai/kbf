@@ -151,9 +151,13 @@ fn row(f: &Frontend, id: u64) -> Option<Versioned> {
     f.store.fake.get(&format!("member/{id}")).expect("read")
 }
 
-fn state(f: &Frontend, id: u64) -> Option<MemberState> {
+fn member(f: &Frontend, id: u64) -> Option<kbf_map::Member> {
     let map = f.members.current_map().expect("read")?;
-    map.member(MemberId(id)).map(|m| m.state)
+    map.member(MemberId(id)).cloned()
+}
+
+fn state(f: &Frontend, id: u64) -> Option<MemberState> {
+    member(f, id).map(|m| m.state)
 }
 
 /// Catches: a node that registers but does not keep its row alive, a frontend that never
@@ -173,8 +177,7 @@ async fn a_storage_node_registers_and_heartbeats_across_several_ttls() {
     let serving = tokio::spawn(node.serve());
 
     let mut seen = until("the node to register", || row(&f, 1)).await.version;
-    let map = f.members.current_map().expect("read").expect("a map");
-    let me = map.member(MemberId(1)).expect("the node is in the map");
+    let me = until("the node in the map", || member(&f, 1)).await;
     assert_eq!(
         (me.addr.clone(), me.state),
         (addr.to_string(), MemberState::Active)
@@ -217,6 +220,13 @@ async fn a_node_whose_row_lapsed_registers_again() {
         f.members
             .heartbeat(MemberId(1), 2, kbf_server::members::Progress::CaughtUp)
             .ok()
+    })
+    .await;
+    // The row of boot 2 is written before the refresh that publishes it, and a beat of
+    // boot 2 is accepted in between: the map is Down until that refresh lands. Wait for
+    // the map to say Active; nothing moves it back, the row is live.
+    until("the map to hold the node Active", || {
+        (state(&f, 1) == Some(MemberState::Active)).then_some(())
     })
     .await;
     assert_eq!(state(&f, 1), Some(MemberState::Active));
@@ -331,8 +341,7 @@ async fn the_registration_flags_are_carried_or_refused() {
         .expect("starts");
     let _serving = tokio::spawn(node.serve());
     until("the node to register", || row(&f, 1)).await;
-    let map = f.members.current_map().expect("read").expect("map");
-    let me = map.member(MemberId(1)).expect("member");
+    let me = until("the node in the map", || member(&f, 1)).await;
     assert_eq!(
         (me.addr.as_str(), me.zone.as_str(), me.weight),
         ("192.0.2.7:8982", "eu-1", 3)
