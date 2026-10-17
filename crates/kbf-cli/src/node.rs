@@ -406,9 +406,10 @@ pub fn run_with(
         .enable_all()
         .build()?;
     let (stop, stopped) = watch::channel(false);
+    let work = move || runtime.block_on(renewer.run(stopped));
     let thread = std::thread::Builder::new()
         .name("kbf-renew".to_owned())
-        .spawn(move || runtime.block_on(renewer.run(stopped)))?;
+        .spawn(work)?;
     let code = launch(&invocation);
     let _ = stop.send(true);
     let _ = thread.join();
