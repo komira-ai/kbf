@@ -82,7 +82,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
                 Some(Ok(first)) => Ok(futures::stream::once(async move { Ok(first) })
                     .chain(chunks)
                     .boxed()),
-                None => Ok(chunks),
+                None => Ok(futures::stream::empty().boxed()),
             }
         })
     }
