@@ -41,7 +41,8 @@ pub(crate) struct Stand {
     /// Ends the task that expires the state store's rows.
     pub sweeper: AbortHandle,
     pub store: Arc<dyn Store>,
-    /// The longest to wait for the farm to be [quiet](Farm::quiet).
+    /// The longest to wait for the farm to be [quiet](Farm::quiet), and again the
+    /// longest to write the requeues the store refused ([`Farm::flush_unsettled`]).
     pub wait: Duration,
 }
 
@@ -59,6 +60,10 @@ impl Stand {
         self.drain.hand_over();
         let _ = tokio::time::timeout(self.wait, self.until_quiet()).await;
         self.farm.fence();
+        // A requeue the store refused is written by nothing else once the farm is fenced;
+        // the successor would recover its operation under the lease it gave up. The
+        // budget is the quiet wait's, again.
+        self.farm.flush_unsettled(self.wait).await;
         self.sweeper.abort();
         self.worker.fire();
         self.farm
@@ -351,5 +356,7 @@ impl Leaving {
     }
 }
 
+#[cfg(test)]
+mod flush_tests;
 #[cfg(test)]
 mod tests;
