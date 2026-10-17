@@ -247,3 +247,5 @@ pub(crate) async fn follow(farm: &Farm, every: Duration) {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod flush_tests;
