@@ -32,11 +32,13 @@ use kbf_state::StoreError;
 use prost::Message;
 
 use crate::container::{self, BlockEntry, Footer, FormatError};
+use crate::flog::PIECE_BYTES;
 use crate::index::HistoryIndex;
 use crate::keys::{Day, HistoryRoot, IndexRoot, InvKey, WriterId};
 use crate::records::{
-    ChunkBody, ChunkRecord, ChunkRow, ChunkSummary, FailedRun, HitRecord, InvState,
-    InvocationHeader, RunRecord, SECTION_FAILED, SECTION_RUN, StreamRow, chunk_key,
+    ChunkBody, ChunkRecord, ChunkRow, ChunkSummary, FailedRun, FlogRecord, FlogStream, FlogSummary,
+    HitRecord, InvState, InvocationHeader, ObjRow, RunRecord, SECTION_FAILED, SECTION_RUN,
+    StreamRow, chunk_key, flog_key,
 };
 use crate::run_id::RunId;
 use crate::scoped::Scoped;
@@ -98,6 +100,46 @@ pub struct InvocationView {
     /// invocation has no chunk.
     pub newest: Option<ChunkSummary>,
 }
+
+/// One log of a failed run, found in its failure-log object: where it is and how long it
+/// is, from the object's footer. [`Reader::read_log`] reads a range of it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FailureLog {
+    key: ObjectKey,
+    footer: Footer,
+    stream: FlogStream,
+    len: u64,
+    instance: String,
+}
+
+impl FailureLog {
+    /// The log's length in bytes.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the log is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The instance the run was asked under.
+    #[must_use]
+    pub fn instance(&self) -> &str {
+        &self.instance
+    }
+
+    /// Which log it is.
+    #[must_use]
+    pub fn stream(&self) -> FlogStream {
+        self.stream
+    }
+}
+
+/// Blocks a range of a log reads at once: 32 GETs in parallel at most.
+const LOG_READS_AT_ONCE: usize = 32;
 
 /// Where a page of an invocation's records starts: after this chunk, named by its
 /// writer and sequence (the order of `ichunk` rows). Opaque to callers, who pass back
@@ -213,6 +255,104 @@ impl<O: ObjectStore> Reader<O> {
             }
         }
         Ok(None)
+    }
+
+    /// The copy of run `id`'s `stream` log in its failure-log object, if there is one, it
+    /// holds that log and `allow` accepts the run's instance: one index row and one range
+    /// read (the footer). No byte of the log is read here, so a caller refused answers
+    /// like a log that is not held.
+    ///
+    /// # Errors
+    /// [`ReadError`] when the index or the object store fails, or a row or object does
+    /// not decode, or the object is not the run's.
+    pub async fn failure_log(
+        &self,
+        id: RunId,
+        stream: FlogStream,
+        allow: Allow<'_>,
+    ) -> Result<Option<FailureLog>, ReadError> {
+        let key = self.index.root().obj_flog(id);
+        let Some(row) = self.index.get(key.clone()).await? else {
+            return Ok(None);
+        };
+        let row = decode_row::<ObjRow>(&key, &row.value)?;
+        let range = ByteRange::new(row.footer_offset, u64::from(row.footer_len).max(1));
+        let range = range.ok_or(FormatError::Truncated("footer range"))?;
+        let object = self.root.flog(id);
+        let (_, footer) = container::decode_footer(&self.objects.get_range(&object, range).await?)?;
+        let summary = FlogSummary::decode(footer.summary.as_slice())
+            .map_err(|e| FormatError::decode("failure-log summary", &e))?;
+        // The row's key names the run; the object it points to must be that run's.
+        if summary.run_id != id.to_bytes() {
+            return Err(FormatError::Mismatch("failure-log run").into());
+        }
+        // An object that names no instance cannot show that `allow` accepts it.
+        let allowed = !summary.instance.is_empty() && allow(&summary.instance);
+        let Some(len) = summary.len_of(stream).filter(|_| allowed) else {
+            return Ok(None);
+        };
+        Ok(Some(FailureLog {
+            key: object,
+            footer,
+            stream,
+            len,
+            instance: summary.instance,
+        }))
+    }
+
+    /// Bytes `first..=last` of `log` (`last` is clamped to its end), read from the blocks
+    /// that hold them: no more than a block's worth past each end. Empty when `first` is
+    /// at or past the end.
+    ///
+    /// # Errors
+    /// [`ReadError`] when the object store fails or the object's blocks do not hold the
+    /// range its footer says.
+    pub async fn read_log(
+        &self,
+        log: &FailureLog,
+        first: u64,
+        last: u64,
+    ) -> Result<Bytes, ReadError> {
+        if first >= log.len || first > last {
+            return Ok(Bytes::new());
+        }
+        let last = last.min(log.len - 1);
+        let piece = PIECE_BYTES as u64;
+        // The blocks of the pieces the range touches, once each, in order.
+        let mut entries: Vec<BlockEntry> = Vec::new();
+        for at in (first / piece..=last / piece).map(|n| n * piece) {
+            let entry = log
+                .footer
+                .block_for(&flog_key(log.stream, at))
+                .cloned()
+                .unwrap_or_default();
+            if entries.last().is_none_or(|e| e.offset != entry.offset) {
+                entries.push(entry);
+            }
+        }
+        let mut out = Vec::with_capacity((last - first + 1) as usize);
+        let mut next = first;
+        for group in entries.chunks(LOG_READS_AT_ONCE) {
+            let reads = group.iter().map(|entry| async move {
+                let range = block_range(entry)?;
+                let stored = self.objects.get_range(&log.key, range).await?;
+                Ok::<_, ReadError>(container::decode_block(entry, &stored)?)
+            });
+            for records in futures::future::try_join_all(reads).await? {
+                for record in records {
+                    let piece = FlogRecord::decode(record.as_slice())
+                        .map_err(|e| FormatError::decode("failure-log record", &e))?;
+                    if piece.stream != i32::from(log.stream) {
+                        continue;
+                    }
+                    take_piece(&mut out, &mut next, last, &piece)?;
+                }
+            }
+        }
+        if next <= last {
+            return Err(FormatError::Truncated("failure log").into());
+        }
+        Ok(Bytes::from(out))
     }
 
     /// `run`, found in chunk `at` whose footer is `footer`, with its failed-run section.
@@ -484,6 +624,30 @@ fn decode_record(bytes: &[u8]) -> Result<ChunkBody, ReadError> {
         what: "chunk record",
         message: "empty record".to_owned(),
     })?)
+}
+
+/// Appends to `out` the part of `piece` that is in `next..=last`, and moves `next` past
+/// it. Pieces come in order, so one that starts after `next` leaves a hole: a broken
+/// object.
+fn take_piece(
+    out: &mut Vec<u8>,
+    next: &mut u64,
+    last: u64,
+    piece: &FlogRecord,
+) -> Result<(), FormatError> {
+    let end = piece.offset + piece.bytes.len() as u64;
+    if end <= *next || piece.offset > last {
+        return Ok(());
+    }
+    if piece.offset > *next {
+        return Err(FormatError::Mismatch("failure-log pieces"));
+    }
+    // Both bounds are inside the piece, which is in memory.
+    let from = (*next - piece.offset) as usize;
+    let to = (end.min(last + 1) - piece.offset) as usize;
+    out.extend_from_slice(&piece.bytes[from..to]);
+    *next = piece.offset + to as u64;
+    Ok(())
 }
 
 fn find_run(block: &[ChunkBody], id: RunId, allow: Allow<'_>) -> Option<RunRecord> {
