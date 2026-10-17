@@ -26,6 +26,7 @@ kbf-meta.workspace = true
 kbf-objstore.workspace = true
 kbf-proto.workspace = true
 kbf-raft.workspace = true
+kbf-route.workspace = true
 kbf-sched.workspace = true
 kbf-state.workspace = true
 kbf-storage.workspace = true
