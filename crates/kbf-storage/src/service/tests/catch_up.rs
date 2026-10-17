@@ -232,3 +232,34 @@ async fn a_node_caught_up_from_the_start_answers_misses() {
         Err(StorageError::NotFound(_))
     ));
 }
+
+/// Catches a `finished` that never returns once the rebuild is done (it waits for a
+/// notification sent before it registered: mutant, the flag read before the waiter is
+/// registered), or that returns while the rebuild is still going: a waiter that began
+/// before `finish` and one that began after both complete; a caught-up state completes
+/// at once. The hang guard is generous and asserts nothing about speed.
+#[tokio::test]
+async fn finished_completes_once_and_only_once_the_rebuild_is_done() {
+    const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
+    let rebuilding = CatchUp::rebuilding();
+    let before = {
+        let rebuilding = rebuilding.clone();
+        tokio::spawn(async move { rebuilding.finished().await })
+    };
+    // Let the waiter run to its wait.
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!before.is_finished(), "still rebuilding");
+    rebuilding.finish();
+    tokio::time::timeout(HANG_GUARD, before)
+        .await
+        .expect("the waiter wakes")
+        .expect("joins");
+    tokio::time::timeout(HANG_GUARD, rebuilding.finished())
+        .await
+        .expect("a waiter after finish completes");
+    tokio::time::timeout(HANG_GUARD, CatchUp::caught_up().finished())
+        .await
+        .expect("a caught-up state completes");
+}

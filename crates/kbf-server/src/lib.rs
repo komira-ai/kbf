@@ -90,6 +90,7 @@ mod memory;
 pub mod metrics;
 mod missing;
 pub mod raft_log;
+mod rebuild;
 pub mod rollout;
 mod run_record;
 pub mod serve;

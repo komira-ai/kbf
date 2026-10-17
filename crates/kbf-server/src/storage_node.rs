@@ -49,17 +49,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Arg, ArgMatches, Command, FromArgMatches as _};
-use kbf_front::{Cache, CacheStorage, ObjectKeys, SegmentsConfig};
+use kbf_front::{Cache, CacheStorage, MetaLog as _, ObjectKeys, RebuildConfig, SegmentsConfig};
 use kbf_log::{FarmLogId, MachineVersion};
 use kbf_mapsync::MapHolder;
 use kbf_meta::{NodeWriter, Retention};
 use kbf_objstore::{KeyPrefix, ObjectStore};
+use kbf_storage::service::CatchUp;
 use kbf_store::StdFs;
 use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig};
 
 use crate::join::{self, Joined, Joiner};
+use crate::rebuild::Background;
 use crate::serve::{ServeError, StorageListener, bind_storage_socket, serve_storage};
 use crate::start::{AbortOnDrop, open_cold_file};
 use crate::startup_pass::StartPass;
@@ -346,8 +348,9 @@ pub struct StorageHandle {
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
-    _pass: Option<AbortOnDrop>,
+    _background: Background,
     maps: Arc<MapHolder>,
+    catch_up: CatchUp,
     _joiner: Option<AbortOnDrop>,
 }
 
@@ -357,6 +360,15 @@ impl StorageHandle {
     #[must_use]
     pub fn maps(&self) -> Arc<MapHolder> {
         Arc::clone(&self.maps)
+    }
+
+    /// Whether the node is rebuilding its index from the store, which it does at a start
+    /// over a metadata log that never finished a rebuild (a new or wiped one) when it
+    /// registers with `--frontend`. It serves meanwhile, answering a miss UNAVAILABLE;
+    /// [`CatchUp::finished`] completes when the rebuild is done.
+    #[must_use]
+    pub fn catch_up(&self) -> CatchUp {
+        self.catch_up.clone()
     }
 
     /// The line the node prints once it is bound:
@@ -375,7 +387,7 @@ impl StorageHandle {
         let Self {
             serving,
             _flusher,
-            _pass,
+            _background,
             _joiner,
             ..
         } = self;
@@ -458,6 +470,7 @@ where
         (meta, store, prefix, log),
         shutdown,
         pass,
+        RebuildConfig::default(),
     )
     .await
 }
@@ -472,6 +485,7 @@ async fn assemble<O, S, F>(
     (meta, store, prefix, log): (RaftMetaLog<StdFs>, O, KeyPrefix, FarmLogId),
     shutdown: S,
     pass: Option<StartPass<RaftMetaLog<StdFs>>>,
+    rebuild: RebuildConfig,
 ) -> Result<StorageHandle, Box<dyn Error>>
 where
     O: ObjectStore + 'static,
@@ -480,7 +494,7 @@ where
 {
     let socket = bind_storage_socket(listener)?;
     let maps = Arc::new(MapHolder::new());
-    let (cache, joiner) =
+    let (cache, joiner, catch_up) =
         open_cache(flags, socket.addr(), &maps, (meta, store, prefix, log)).await?;
     let cache = cache.with_writes(flags.server.write_config());
     let (cache, tier) = crate::write_tier::attach(cache, hot).await?;
@@ -489,12 +503,12 @@ where
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
         AbortOnDrop(tokio::spawn(flusher))
     });
-    let _pass = pass.map(|pass| AbortOnDrop(crate::startup_pass::spawn(Arc::clone(&cache), pass)));
+    let _background = crate::rebuild::spawn(&cache, &catch_up, pass, rebuild);
     let storage = Arc::new(CacheStorage::new(cache, flags.segments()));
     // A node that registers with a frontend is one of several: it serves nothing until
     // it holds the map. One box (no `--frontend`) serves at once.
     let gate = flags.frontend.as_ref().map(|_| Arc::clone(&maps));
-    let bound = serve_storage(storage, socket, gate, shutdown()?)?;
+    let bound = serve_storage(storage, socket, gate, Some(catch_up.clone()), shutdown()?)?;
     let _joiner = joiner.map(|(joiner, joined)| AbortOnDrop(tokio::spawn(joiner.keep(joined))));
     Ok(StorageHandle {
         addr: bound.addr,
@@ -504,8 +518,9 @@ where
         ),
         serving: Box::pin(bound.serving),
         _flusher,
-        _pass,
+        _background,
         maps,
+        catch_up,
         _joiner,
     })
 }
@@ -515,6 +530,11 @@ where
 /// ([`open_registered`]); the registration and what it gave come back for the heartbeats
 /// ([`Joiner::keep`]). Without it the cache writes in an epoch of its own log.
 ///
+/// The [`CatchUp`] says whether the node owes a rebuild of its index: a registered node
+/// whose log has not finished one does, and tells the frontend so in its registration, so
+/// the map ranks it last until it is done. A node without `--frontend` owes none: it
+/// keeps its objects under its log's own prefix, which no other log's loss can orphan.
+///
 /// # Errors
 /// A TLS file or the frontend URL is refused, or the cache cannot be opened
 /// ([`open_registered`]).
@@ -523,18 +543,36 @@ pub(crate) async fn open_cache<O: ObjectStore>(
     bound: SocketAddr,
     maps: &Arc<MapHolder>,
     (meta, store, prefix, log): (RaftMetaLog<StdFs>, O, KeyPrefix, FarmLogId),
-) -> Result<(Cache<RaftMetaLog<StdFs>, O>, Option<(Joiner, Joined)>), Box<dyn Error>> {
+) -> Result<
+    (
+        Cache<RaftMetaLog<StdFs>, O>,
+        Option<(Joiner, Joined)>,
+        CatchUp,
+    ),
+    Box<dyn Error>,
+> {
     let keys = ObjectKeys {
         root: prefix_root(&prefix, log)?,
         legacy: prefix,
     };
     Ok(match flags.joiner(bound, Arc::clone(maps))? {
-        Some(mut joiner) => {
+        Some(joiner) => {
+            let done = meta.query(|state| state.rebuild().is_done()).await?;
+            let catch_up = if done {
+                CatchUp::caught_up()
+            } else {
+                CatchUp::rebuilding()
+            };
+            let mut joiner = joiner.with_catch_up(catch_up.clone());
             let joined = joiner.join().await;
             let cache = open_registered(meta, store, keys, &joined).await?;
-            (cache, Some((joiner, joined)))
+            (cache, Some((joiner, joined)), catch_up)
         }
-        None => (Cache::open_under(meta, store, keys).await?, None),
+        None => (
+            Cache::open_under(meta, store, keys).await?,
+            None,
+            CatchUp::caught_up(),
+        ),
     })
 }
 
@@ -622,3 +660,7 @@ fn serve(flags: &StorageFlags) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 #[path = "storage_node_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "storage_rebuild_tests.rs"]
+mod rebuild_tests;

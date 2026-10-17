@@ -851,7 +851,13 @@ pub fn bind_storage_gated(
     maps: Option<Arc<kbf_mapsync::MapHolder>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
-    serve_storage(storage, bind_storage_socket(listener)?, maps, shutdown)
+    serve_storage(
+        storage,
+        bind_storage_socket(listener)?,
+        maps,
+        None,
+        shutdown,
+    )
 }
 
 /// A storage listener's socket: bound, so its address is known and callers queue on it,
@@ -884,7 +890,9 @@ pub fn bind_storage_socket(listener: StorageListener) -> Result<StorageSocket, S
     })
 }
 
-/// Serves `storage` on `socket`, as [`bind_storage_gated`] does.
+/// Serves `storage` on `socket`, as [`bind_storage_gated`] does, and, with `catch_up`,
+/// as a node that is rebuilding its index until it says otherwise: a miss is answered
+/// UNAVAILABLE, never NOT_FOUND ([`kbf_storage::service::CatchUp`]).
 ///
 /// # Errors
 /// The TLS configuration is refused (a key that does not match its certificate, say).
@@ -892,6 +900,7 @@ pub fn serve_storage(
     storage: Arc<dyn kbf_storage::Storage>,
     socket: StorageSocket,
     maps: Option<Arc<kbf_mapsync::MapHolder>>,
+    catch_up: Option<kbf_storage::service::CatchUp>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
     let StorageSocket {
@@ -907,8 +916,12 @@ pub fn serve_storage(
         }
         None => kbf_storage::service::Admission::Open,
     };
-    let routes =
-        kbf_storage::service::StorageService::new(storage, admission, listener.service).routes();
+    let service = kbf_storage::service::StorageService::new(storage, admission, listener.service);
+    let routes = match catch_up {
+        Some(catch_up) => service.with_catch_up(catch_up),
+        None => service,
+    }
+    .routes();
     let gate = tonic::service::InterceptorLayer::new(map_gate(maps));
     let serving = async move {
         server

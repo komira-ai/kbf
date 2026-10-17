@@ -29,13 +29,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_front::{CacheStorage, SegmentsConfig};
+use kbf_front::{CacheStorage, RebuildConfig, SegmentsConfig};
 use kbf_mapsync::MapHolder;
 use kbf_meta::Retention;
 use kbf_objstore::{FsStore, ObjectStore};
 use kbf_storage::Storage;
 use kbf_threads::disk::Statvfs;
 
+use crate::rebuild::Background;
 use crate::serve::{ServeError, StorageListener, bind_storage_socket, serve_storage};
 use crate::start::{AbortOnDrop, open_cold_file, share_storage, tier_bytes};
 use crate::startup_pass::StartPass;
@@ -54,7 +55,7 @@ pub struct StorageHalf {
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     maps: Arc<MapHolder>,
     _flusher: Option<AbortOnDrop>,
-    _pass: Option<AbortOnDrop>,
+    _background: Background,
     _joiner: Option<AbortOnDrop>,
 }
 
@@ -87,7 +88,7 @@ impl StorageHalf {
         let Self {
             serving,
             _flusher,
-            _pass,
+            _background,
             _joiner,
             ..
         } = self;
@@ -156,7 +157,7 @@ where
     let pass = files.map(|files| StartPass::over_raft(files, grace));
     let socket = bind_storage_socket(listener)?;
     let maps = Arc::new(MapHolder::new());
-    let (cache, joiner) =
+    let (cache, joiner, catch_up) =
         open_cache(flags, socket.addr(), &maps, (meta, store, prefix, log)).await?;
     let cache = cache.with_writes(args.write_config());
     let local = args.local_cache.as_ref();
@@ -168,7 +169,7 @@ where
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
         AbortOnDrop(tokio::spawn(flusher))
     });
-    let _pass = pass.map(|pass| AbortOnDrop(crate::startup_pass::spawn(Arc::clone(&cache), pass)));
+    let _background = crate::rebuild::spawn(&cache, &catch_up, pass, RebuildConfig::default());
     let segments = SegmentsConfig {
         max_bytes: args.segment_upload_max_bytes,
         idle: Duration::from_secs(args.segment_upload_idle_secs),
@@ -176,7 +177,13 @@ where
     let storage: Arc<dyn Storage> = Arc::new(CacheStorage::new(cache, segments));
     // As `kbf storage` does: with a frontend, hold its map and serve nothing until the first.
     let gate = flags.frontend.as_ref().map(|_| Arc::clone(&maps));
-    let bound = serve_storage(Arc::clone(&storage), socket, gate, shutdown()?)?;
+    let bound = serve_storage(
+        Arc::clone(&storage),
+        socket,
+        gate,
+        Some(catch_up.clone()),
+        shutdown()?,
+    )?;
     let addr = bound.addr;
     let _joiner = joiner.map(|(joiner, joined)| AbortOnDrop(tokio::spawn(joiner.keep(joined))));
     Ok(StorageHalf {
@@ -186,7 +193,7 @@ where
         serving: Box::pin(bound.serving),
         maps,
         _flusher,
-        _pass,
+        _background,
         _joiner,
     })
 }

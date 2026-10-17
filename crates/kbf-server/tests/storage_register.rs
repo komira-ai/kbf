@@ -7,7 +7,7 @@ mod hooked;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hooked::Hooked;
@@ -150,6 +150,12 @@ fn row(f: &Frontend, id: u64) -> Option<Versioned> {
     f.store.fake.get(&format!("member/{id}")).expect("read")
 }
 
+/// Whether a registered node's state is one a fresh node is in: `CatchingUp` while it
+/// rebuilds its index from the store, `Active` after its first beat that says it is done.
+fn rebuilt_or_rebuilding(state: Option<MemberState>) -> bool {
+    matches!(state, Some(MemberState::CatchingUp | MemberState::Active))
+}
+
 fn state(f: &Frontend, id: u64) -> Option<MemberState> {
     let map = f.members.current_map().expect("read")?;
     map.member(MemberId(id)).map(|m| m.state)
@@ -157,7 +163,8 @@ fn state(f: &Frontend, id: u64) -> Option<MemberState> {
 
 /// Catches: a node that registers but does not keep its row alive, a frontend that never
 /// expires a node that stops, and a registration that tells the frontend something other
-/// than what the node is. The node registers on start (its bound address, Joining); the
+/// than what the node is. The node registers on start (its bound address; CatchingUp while
+/// it rebuilds its index, Active once its first beat after that says so); the
 /// store's clock then moves 45 ms (TTL 60 ms) after each beat it sees, six times, which is
 /// four TTLs and which the row survives only because the node beats; when the node stops,
 /// 61 ms are enough for the frontend's own timer to mark it Down.
@@ -174,17 +181,19 @@ async fn a_storage_node_registers_and_heartbeats_across_several_ttls() {
     let mut seen = until("the node to register", || row(&f, 1)).await.version;
     let map = f.members.current_map().expect("read").expect("a map");
     let me = map.member(MemberId(1)).expect("the node is in the map");
-    assert_eq!(
-        (me.addr.clone(), me.state),
-        (addr.to_string(), MemberState::Joining)
-    );
+    assert_eq!(me.addr, addr.to_string());
+    assert!(rebuilt_or_rebuilding(Some(me.state)), "{:?}", me.state);
     for round in 1..=6 {
         f.store.clock.advance(45 * MS);
         seen = until("a heartbeat", || {
             row(&f, 1).filter(|r| r.version != seen).map(|r| r.version)
         })
         .await;
-        assert_eq!(state(&f, 1), Some(MemberState::Joining), "round {round}");
+        assert!(
+            rebuilt_or_rebuilding(state(&f, 1)),
+            "round {round}: {:?}",
+            state(&f, 1)
+        );
     }
 
     serving.abort();
@@ -206,9 +215,12 @@ async fn a_node_whose_row_lapsed_registers_again() {
     let node = start_storage(&flags(&dir("lapse"), &[url]).expect("flags"), never)
         .await
         .expect("starts");
+    let caught_up = node.catch_up();
     let _serving = tokio::spawn(node.serve());
     let first = until("the node to register", || row(&f, 1)).await.version;
     until("a beat", || row(&f, 1).filter(|r| r.version != first)).await;
+    // Registers again as a node whose index is whole: Joining, not CatchingUp.
+    caught_up.finished().await;
     f.store.clock.advance(61 * MS);
     // Boot 2 is the registration after the lapse: a beat of boot 2 is accepted, and the
     // member has the id it had.
@@ -512,7 +524,8 @@ fn the_wait_after_failures_doubles_to_a_cap() {
 /// (`start_frontend`, SQLite state store, `--member-ttl-secs` and `--member-dwell-secs`)
 /// and a real node register; a second registrant re-registers until the map the
 /// frontend answers with (published by the refresh that follows a registration) holds the
-/// node at its bound address, Joining. The wait is bounded only to fail a hang.
+/// node at its bound address, CatchingUp or Active (a node that registered rebuilds its
+/// index first). The wait is bounded only to fail a hang.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
     let d = dir("frontend-mode");
@@ -573,19 +586,28 @@ async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
         }
     })
     .await;
-    assert_eq!(found.state, pb::MemberState::Joining as i32);
+    assert!(
+        [
+            pb::MemberState::CatchingUp as i32,
+            pb::MemberState::Active as i32
+        ]
+        .contains(&found.state),
+        "{}",
+        found.state
+    );
     node_serving.abort();
     drop(stop);
     serving.await.expect("joins").expect("stops");
 }
 
-/// A node started with `--frontend` that the frontend cannot yet admit (its store fails),
-/// listening, and a client of its storage service.
+/// A node started with `--frontend` that the frontend admits but sends no map it can read
+/// (`map` is what the frontend sends, which a test replaces), listening, and a client of
+/// its storage service.
 async fn waiting_node(
-    f: &Frontend,
+    map: &Arc<Mutex<pb::Map>>,
     name: &str,
 ) -> (kbf_server::storage_node::StorageHandle, RemoteStorage) {
-    let url = format!("--frontend=http://{}", f.worker);
+    let url = format!("--frontend=http://{}", serve_membership(map));
     let node = start_storage(&flags(&dir(name), &[url]).expect("flags"), never)
         .await
         .expect("starts");
@@ -595,20 +617,31 @@ async fn waiting_node(
     (node, RemoteStorage::new(channel, 0))
 }
 
-/// Catches: a node in a multi-member farm that serves before it knows the farm. While the
-/// frontend cannot admit it (its store fails, so there is no map) every kind of call is
-/// refused UNAVAILABLE "no storage map yet", not answered as an empty cache (a
-/// FindMissing that says every blob is missing, a write taken that the map places
-/// elsewhere); once the registration lands the same calls are served. Mutant: a gate that
-/// lets every call through.
+/// A map of one active member, which a node can read.
+fn readable_map() -> pb::Map {
+    let member = kbf_map::Member {
+        id: MemberId(1),
+        addr: "192.0.2.5:1".to_owned(),
+        zone: String::new(),
+        weight: 1,
+        state: MemberState::Active,
+    };
+    let map = kbf_map::Map::new(4, vec![member], kbf_map::Rule::Rendezvous, 1, 1, Vec::new())
+        .expect("a map");
+    pb::Map::from(&map)
+}
+
+/// Catches: a node in a multi-member farm that serves before it knows the farm. The
+/// frontend admits the node (it registers, and opens its cache) but sends a map the node
+/// cannot read, so it has none: every kind of call is refused UNAVAILABLE "no storage map
+/// yet", not answered as an empty cache (a FindMissing that says every blob is missing, a
+/// write taken that the map places elsewhere); once a heartbeat brings a map the same
+/// calls are served. Mutant: a gate that lets every call through.
 #[tokio::test]
 async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
-    let f = frontend(None);
-    f.store
-        .fail_gets
-        .store(1_000_000, std::sync::atomic::Ordering::SeqCst);
-    let (node, client) = waiting_node(&f, "gate").await;
-    let maps = node.maps();
+    let sent = Arc::new(Mutex::new(pb::Map::default()));
+    let (node, client) = waiting_node(&sent, "gate").await;
+    let (maps, catch_up) = (node.maps(), node.catch_up());
     let _serving = tokio::spawn(node.serve());
     // The node's directory outlives the run: a blob no earlier run stored.
     let blob = format!(
@@ -646,13 +679,13 @@ async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
     );
     assert_eq!(maps.generation(), 0, "the node has no map");
 
-    f.store
-        .fail_gets
-        .store(0, std::sync::atomic::Ordering::SeqCst);
+    *sent.lock().expect("lock") = readable_map();
     until("the node to hold a map", || {
         (maps.generation() > 0).then_some(())
     })
     .await;
+    // A new node over an empty store rebuilds its index first, and says so until done.
+    catch_up.finished().await;
     assert_eq!(
         client.find_missing(&[digest]).await.expect("served"),
         [digest]
@@ -689,7 +722,18 @@ async fn a_heartbeat_brings_a_node_the_map_it_missed() {
         maps.current().filter(|m| m.members().len() == 1)
     })
     .await;
-    assert_eq!(maps.generation(), 1);
+    // A node that rebuilt its index is promoted by its first beat after: a new map. Wait
+    // until the node holds that one, so the generations below are the second member's.
+    until("the node to be promoted", || {
+        (state(&f, 1) == Some(MemberState::Active)).then_some(())
+    })
+    .await;
+    let settled = until("the node to hold the promoted map", || {
+        let current = f.members.current_map().expect("read")?.generation();
+        maps.current().filter(|m| m.generation() == current)
+    })
+    .await
+    .generation();
 
     f.members
         .register(&kbf_server::members::Registrant {
@@ -705,11 +749,18 @@ async fn a_heartbeat_brings_a_node_the_map_it_missed() {
         maps.current().filter(|m| m.members().len() == 2)
     })
     .await;
-    assert_eq!(learned.generation(), 2);
+    assert_eq!(learned.generation(), settled + 1);
 }
 
-/// A membership service that answers every call with the map it holds (a garbled one, or a valid one).
-struct Garbled(pb::Map);
+/// A membership service that answers every call with the map it holds (a garbled one, or a
+/// valid one), which a test replaces.
+struct Garbled(Arc<Mutex<pb::Map>>);
+
+impl Garbled {
+    fn map(&self) -> pb::Map {
+        self.0.lock().expect("lock").clone()
+    }
+}
 
 #[tonic::async_trait]
 impl kbf_proto::kbf::map::v1::membership_server::Membership for Garbled {
@@ -721,7 +772,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for Garbled {
             member_id: 1,
             boot: 1,
             heartbeat_interval_ms: 1,
-            map: Some(self.0.clone()),
+            map: Some(self.map()),
         }))
     }
 
@@ -731,7 +782,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for Garbled {
     ) -> Result<tonic::Response<pb::HeartbeatResponse>, tonic::Status> {
         Ok(tonic::Response::new(pb::HeartbeatResponse {
             map_generation: 9,
-            map: Some(self.0.clone()),
+            map: Some(self.map()),
         }))
     }
 }
@@ -768,19 +819,28 @@ async fn a_map_that_is_not_newer_changes_nothing() {
     );
 }
 
-/// A node that registers and beats once with a frontend that answers with `map` both
-/// times; the maps it holds after.
-async fn joined_by(map: pb::Map) -> Arc<kbf_mapsync::MapHolder> {
+/// A membership service on a port of its own that admits every node as member 1 at boot 1
+/// and answers with whatever `map` holds, at each call.
+fn serve_membership(map: &Arc<Mutex<pb::Map>>) -> SocketAddr {
     let incoming =
         tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
     let addr = incoming.local_addr().expect("address");
     tokio::spawn(
         tonic::transport::Server::builder()
             .add_service(
-                kbf_proto::kbf::map::v1::membership_server::MembershipServer::new(Garbled(map)),
+                kbf_proto::kbf::map::v1::membership_server::MembershipServer::new(Garbled(
+                    Arc::clone(map),
+                )),
             )
             .serve_with_incoming(incoming),
     );
+    addr
+}
+
+/// A node that registers and beats once with a frontend that answers with `map` both
+/// times; the maps it holds after.
+async fn joined_by(map: pb::Map) -> Arc<kbf_mapsync::MapHolder> {
+    let addr = serve_membership(&Arc::new(Mutex::new(map)));
     let channel = Endpoint::from_shared(format!("http://{addr}"))
         .expect("endpoint")
         .connect_lazy();

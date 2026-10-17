@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use kbf_daemon::cas::Cas as _;
 use kbf_daemon::{Daemon, DaemonConfig, FakeRuntime, FarmCas, NodeReport, Runtime, TlsFiles};
-use kbf_map::{Map, MemberId};
+use kbf_map::{Map, MemberId, MemberState};
 use kbf_mapsync::MapHolder;
 use kbf_server::frontend::{self, FrontendHandle, start_frontend};
 use kbf_server::storage_half::{self, StorageHalf};
@@ -196,12 +196,17 @@ impl NodeUnderTest {
     }
 }
 
-/// The map in `holder` once it has `members` members.
+/// The map in `holder` once it has `members` members, every one `Active`: a node that
+/// registered rebuilds its index first (`CatchingUp`), and the map ranks a member by its
+/// state, so the owner of a blob is settled only when every member has been promoted.
 async fn map_of(who: &str, holder: &MapHolder, members: usize) -> Arc<Map> {
     let mut changes = holder.changes();
     let arrived = timeout(HANG, async {
         loop {
-            if let Some(map) = holder.current().filter(|m| m.members().len() == members) {
+            if let Some(map) = holder.current().filter(|m| {
+                m.members().len() == members
+                    && m.members().iter().all(|x| x.state == MemberState::Active)
+            }) {
                 return map;
             }
             changes.changed().await.expect("the holder is open");
