@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use kbf_state::Store;
+use kbf_state::{Fenced, Store};
 
 use crate::farm::{EpochPolicy, StateError};
 use crate::members::MembershipConfig;
@@ -99,8 +99,11 @@ impl StateStoreUri {
     /// filesystem or is not a state store.
     pub fn open(&self) -> Result<StateStore, StateError> {
         let Self::Sqlite(path) = self;
+        // This process is the store's writer from here: it takes the next generation, and
+        // every write through the handle is checked against it ([`Fenced`]).
+        let fenced = Fenced::take(open_sqlite(path)?, None).map_err(open_error)?;
         Ok(StateStore {
-            store: open_sqlite(path)?,
+            store: Arc::new(fenced),
             epoch: self.epoch_policy(),
             // The defaults; a start sets the --member-* flags (`start::with_members`).
             members: MembershipConfig::default(),

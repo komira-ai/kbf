@@ -36,6 +36,7 @@ type Inbox = mpsc::UnboundedReceiver<Result<ServerMessage, Status>>;
 struct Flaky {
     inner: Inner,
     down: AtomicBool,
+    fenced: AtomicBool,
     /// How many more writes take before the store goes down; negative for no limit.
     allow: AtomicI64,
 }
@@ -124,8 +125,14 @@ impl Flaky {
         Self {
             inner,
             down: AtomicBool::new(false),
+            fenced: AtomicBool::new(false),
             allow: AtomicI64::new(-1),
         }
+    }
+
+    /// Another writer holds a newer generation: every write fails `Fenced`.
+    fn set_fenced(&self) {
+        self.fenced.store(true, Ordering::SeqCst);
     }
 
     /// Set once the SQLite store this wraps is dropped; none over the fake.
@@ -173,6 +180,9 @@ impl Store for Flaky {
         }
         if self.down.load(Ordering::SeqCst) {
             return Err(StoreError::Failed("the store is down".to_owned()));
+        }
+        if self.fenced.load(Ordering::SeqCst) {
+            return Err(StoreError::Fenced);
         }
         self.inner.store().apply_batch(batch)
     }
@@ -542,7 +552,29 @@ async fn nothing_is_granted_while_the_store_is_down() {
     assert_eq!(disk.rows("lease/"), 1);
 }
 
-/// Catches: a lease given up while the store was down that the store is never told of.
+/// Catches: a superseded scheduler (its writes fail Fenced) treated as a store outage
+/// (pinging forever, answering UNAVAILABLE so clients retry it) or still granting work: it
+/// must answer FAILED_PRECONDITION, grant nothing, and stay refusing when writes could
+/// again succeed.
+#[tokio::test(start_paused = true)]
+async fn a_superseded_scheduler_refuses_work_and_does_not_wait_for_the_store() {
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (stream, mut inbox) = register(&farm);
+    disk.store.set_fenced();
+    let refused = submit(&farm, request(1)).expect_err("refused");
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    farm.tick().await;
+    assert!(farm.heartbeat(&node(), stream, 1, Vec::new()).await);
+    assert!(
+        starts(&mut inbox).is_empty(),
+        "a superseded scheduler granted"
+    );
+    assert_eq!(disk.rows("op/"), 0);
+    assert_eq!(disk.rows("lease/"), 0);
+}
+
+/// Catches: a lease given up while the store is never told of.
 /// The store would still hold the old lease and no queue row, so the grant that follows
 /// is refused for want of a queue row, its `Start` is dropped, and the operation never
 /// runs until a restart. Once the store is back, the given-up lease is written and the
@@ -1026,5 +1058,125 @@ async fn a_server_binds_over_a_state_store_or_refuses_it() {
     assert!(
         std::error::Error::source(&refused).is_some(),
         "the cause is kept"
+    );
+}
+
+/// How a caller's ticket ended, once it is done.
+fn ended(ticket: &kbf_front::Ticket) -> Finished {
+    let Stage::Done(finished) = ticket.stage.borrow().clone() else {
+        panic!("the caller was not answered");
+    };
+    finished
+}
+
+/// Catches: a result that lives only in the process that finished the operation (a
+/// process that kept a caller's stream open across a handover has nothing to answer it
+/// with): once a worker's result is accepted, the store holds the result the caller was
+/// sent, as a `done/` row, and nothing else of the operation.
+#[tokio::test(start_paused = true)]
+async fn a_finished_operation_leaves_its_result_in_the_store() {
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (_, mut inbox) = register(&farm);
+    let ticket = farm
+        .submit(Submission {
+            request: request(1),
+            call: None,
+            described: Described::default(),
+        })
+        .expect("submitted");
+    let leases = starts(&mut inbox);
+    assert!(
+        farm.ended(kbf_types::OperationId(0))
+            .expect("read")
+            .is_none()
+    );
+    assert!(accepted(&farm, leases[0]).await);
+    let sent = ended(&ticket);
+    assert!(matches!(&sent, Finished::Failed(s) if s.code == Code::InvalidArgument as i32));
+    assert_eq!(disk.rows("done/"), 1);
+    assert_eq!(disk.rows("op/"), 0, "the operation itself is finished");
+    assert_eq!(
+        farm.ended(kbf_types::OperationId(0)).expect("read"),
+        Some(sent)
+    );
+}
+
+/// Catches: a refusal that leaves no row (a stream kept open by an old process would wait
+/// on an operation that was refused before the handover): the row holds the refusal the
+/// caller was sent.
+#[tokio::test(start_paused = true)]
+async fn a_refused_operation_leaves_its_refusal_in_the_store() {
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (_, mut inbox) = register(&farm);
+    let ticket = farm
+        .submit(Submission {
+            request: request(1),
+            call: None,
+            described: Described::default(),
+        })
+        .expect("submitted");
+    assert_eq!(starts(&mut inbox).len(), 1);
+    for _ in 0..2 {
+        let (_, mut inbox) = lose_lease(&farm).await;
+        assert_eq!(starts(&mut inbox).len(), 1);
+    }
+    let (_, _inbox) = lose_lease(&farm).await;
+    let sent = ended(&ticket);
+    assert!(matches!(&sent, Finished::Failed(s) if s.code == Code::FailedPrecondition as i32));
+    assert_eq!(disk.rows("done/"), 1);
+    assert_eq!(
+        farm.ended(kbf_types::OperationId(0)).expect("read"),
+        Some(sent)
+    );
+}
+
+/// Catches: a farm with no state store pretending to answer from one: it has no result
+/// for any operation.
+#[test]
+fn a_farm_without_a_store_has_no_stored_results() {
+    let farm = Farm::new(
+        Arc::new(Cache::memory()),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
+    assert!(
+        farm.ended(kbf_types::OperationId(0))
+            .expect("read")
+            .is_none()
+    );
+}
+
+/// Catches: operation names that repeat across starts that keep the epoch (the hand-over
+/// to a new process keeps it, so a daemon keeps its runs). The names carry the writer
+/// generation, which every start takes: a client holding the first process's name for its
+/// operation is told NOT_FOUND by the second, not handed whichever operation of the second
+/// got the same number (issue #154).
+#[tokio::test(start_paused = true)]
+async fn a_kept_epoch_does_not_reuse_operation_names() {
+    let dir = Scratch::new();
+    let first = farm_over(store_from_flag(&dir.0).expect("a first start"));
+    let epoch = first.lease_epoch();
+    let name = first
+        .submit(Submission {
+            request: request(1),
+            call: None,
+            described: Described::default(),
+        })
+        .expect("submitted")
+        .name;
+    assert!(first.wait(&name).is_some());
+    drop(first);
+
+    let kept = StateStore {
+        epoch: EpochPolicy::Keep,
+        ..store_from_flag(&dir.0).expect("a second start")
+    };
+    let second = farm_over(kept);
+    assert_eq!(second.lease_epoch(), epoch, "the epoch was kept");
+    assert!(
+        second.wait(&name).is_none(),
+        "the first process's name names an operation of the second"
     );
 }
