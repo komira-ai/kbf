@@ -218,14 +218,9 @@ fn handover(
     }
     loop {
         match systemctl.state(&old) {
-            Ok(State::Active) => std::thread::sleep(Duration::from_millis(h.poll_ms)),
             Ok(State::Stopped) => break,
-            Ok(State::Changing(state)) if state == "deactivating" => {
+            Ok(State::Active | State::Changing(_)) => {
                 std::thread::sleep(Duration::from_millis(h.poll_ms));
-            }
-            Ok(State::Changing(state)) => {
-                say(err, format!("{old} is {state}"));
-                return Err(Failed);
             }
             Err(e) => {
                 say(err, e);

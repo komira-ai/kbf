@@ -103,7 +103,7 @@ fn the_control_socket_outlives_an_instance_and_no_instance_stops_the_other() {
              the control socket's directory with it"
         )
     };
-    let rows: [(String, Vec<String>); 9] = [
+    let rows: [(String, Vec<String>); 10] = [
         (
             with(" --handover-socket=/run/kbf-frontend/control.sock", ""),
             vec![
@@ -123,6 +123,13 @@ fn the_control_socket_outlives_an_instance_and_no_instance_stops_the_other() {
         (
             with("/run/kbf-frontend/control.sock", "/run/kbf-frontend/"),
             vec![outside("/run/kbf-frontend/", "kbf-frontend")],
+        ),
+        (
+            with(
+                "RuntimeDirectory=kbf-frontend\n",
+                "RuntimeDirectory=kbf-frontend\nRuntimeDirectory=\n",
+            ),
+            vec![outside("/run/kbf-frontend/control.sock", "none given")],
         ),
         (
             without("RuntimeDirectory=kbf-frontend\n"),

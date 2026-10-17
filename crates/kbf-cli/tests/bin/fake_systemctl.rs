@@ -7,9 +7,11 @@
 //! - `show -p ActiveState --value UNIT`: prints `state.UNIT` (`inactive` when absent). A
 //!   `looks.UNIT` holding N makes the unit exit after N looks: each look lowers N, and at
 //!   0 the state becomes `inactive` first. `show-fails` makes every `show` fail.
-//! - `show -p Result --value UNIT`: prints `result.UNIT` (`success` when absent).
+//!   `show-fails-after-start` makes every `show` fail once a `start` was made (`started`).
+//! - `show -p Result --value UNIT`: prints `result.UNIT` (`success` when absent);
+//!   `result-fails` makes it fail.
 //! - `start UNIT`: sets `state.UNIT` to `active`, as a `Type=notify` start that was told
-//!   `READY=1` ends; `start-fails` makes it fail instead.
+//!   `READY=1` ends; `start-fails` makes it fail instead. Either way `started` is made.
 
 use std::fs;
 use std::io::Write as _;
@@ -31,7 +33,8 @@ fn main() -> ExitCode {
     let knob = |name: &str| dir.join(name).exists();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["show", "-p", property, "--value", unit] => {
-            if knob("show-fails") {
+            let failing = knob("show-fails") || (knob("show-fails-after-start") && knob("started"));
+            if failing || (property == "Result" && knob("result-fails")) {
                 eprintln!("no such unit");
                 return ExitCode::FAILURE;
             }
@@ -56,6 +59,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         ["start", unit] => {
+            let _ = fs::write(dir.join("started"), "");
             if knob("start-fails") {
                 eprintln!("Job for {unit} failed.");
                 return ExitCode::FAILURE;

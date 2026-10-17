@@ -233,3 +233,59 @@ fn wait_follows_the_old_instance_to_its_exit() {
         "{err}"
     );
 }
+
+/// Catches a start that fails with no instance serving reported as a handover that left
+/// the old one up (there is none: the message must say to read the new instance's log), a
+/// failed start whose follow-up look at the old instance cannot be made (the failure must
+/// still be reported, with what systemctl said), and a `--wait` that cannot look at the
+/// old instance or cannot read its result (neither is a clean exit).
+#[test]
+fn a_systemctl_that_fails_to_answer_fails_the_command_with_what_it_said() {
+    let fake = Fake::new("no-old-start-fails");
+    fake.file("start-fails", "");
+    let (code, out, err) = fake.handover(false);
+    assert_eq!(
+        (code, out.as_str()),
+        (
+            1,
+            "kbf frontend handover: no frontend serves; starting kbf-frontend@a.service\n"
+        )
+    );
+    assert_eq!(
+        err,
+        "kbf frontend handover: kbf-frontend@a.service did not become ready: systemctl start exited 1: Job for kbf-frontend@a.service failed.\n\
+         kbf frontend handover: see `journalctl -u kbf-frontend@a.service`\n"
+    );
+
+    let fake = Fake::new("start-fails-then-show-fails");
+    fake.state("a", "active");
+    fake.file("start-fails", "");
+    fake.file("show-fails-after-start", "");
+    let (code, _, err) = fake.handover(false);
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("show kbf-frontend@a.service: no such unit"),
+        "{err}"
+    );
+
+    let fake = Fake::new("wait-show-fails");
+    fake.state("a", "active");
+    fake.file("show-fails-after-start", "");
+    let (code, out, err) = fake.handover(true);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        err.contains("show kbf-frontend@a.service: no such unit"),
+        "{err}"
+    );
+
+    let fake = Fake::new("wait-result-fails");
+    fake.state("a", "active");
+    fake.file("looks.kbf-frontend@a.service", "1");
+    fake.file("result-fails", "");
+    let (code, out, err) = fake.handover(true);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        err.contains("show kbf-frontend@a.service: no such unit"),
+        "{err}"
+    );
+}
