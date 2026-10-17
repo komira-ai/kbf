@@ -189,13 +189,8 @@ where
     let storage: Arc<dyn Storage> = Arc::new(CacheStorage::new(cache, segments));
     // After the log is open: it refuses a directory that holds files it did not write.
     let repair_dir = stores.meta_dir.join(REPAIR_DIR);
-    let node = bind_node(
-        flags,
-        listener,
-        Arc::clone(&storage),
-        &repair_dir,
-        Box::pin(shutdown()?),
-    )?;
+    let stop = Box::pin(shutdown()?);
+    let node = bind_node(flags, listener, Arc::clone(&storage), &repair_dir, stop)?;
     let addr = node.addr;
     Ok(StorageHalf {
         addr,
