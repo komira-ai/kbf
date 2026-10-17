@@ -35,15 +35,15 @@ ExecStart=@KBF_BIN_DIR@/kbf all-in-one \
     --cold-store=file://@KBF_DATA_DIR@/cold \
     --meta-dir=@KBF_META_DIR@ \
     --listen=@KBF_LISTEN_HOST@:@KBF_REAPI_PORT@ \
-    --reapi-tls-cert=@KBF_ETC@/reapi.pem \
-    --reapi-tls-key=@KBF_ETC@/reapi.key \
+    --reapi-tls-cert=@KBF_REAPI_CERT@ \
+    --reapi-tls-key=@KBF_REAPI_KEY@ \
     --worker-listen=@KBF_LISTEN_HOST@:@KBF_WORKER_PORT@ \
     --worker-tls-cert=@KBF_ETC@/worker.pem \
     --worker-tls-key=@KBF_ETC@/worker.key \
     --worker-client-ca=@KBF_ETC@/ca.pem \
     --worker-deny-list=@KBF_ETC@/deny-list \
     --api-listen=127.0.0.1:@KBF_API_PORT@ \
-    --api-token-file=@KBF_ETC@/api-token \
+    --api-token-file=@KBF_API_TOKEN_FILE@ \
     --driver=container \
     --server=https://@KBF_HOST_NAME@:@KBF_WORKER_PORT@ \
     --ca-cert=@KBF_ETC@/ca.pem \
@@ -52,15 +52,19 @@ ExecStart=@KBF_BIN_DIR@/kbf all-in-one \
     --node-id=@KBF_NODE_ID@ \
     --data-dir=@KBF_DATA_DIR@ \
 @DAEMON_IMAGE_ARGS@
+@DAEMON_TUNING_ARGS@
     --actions-memory-max-gib=@ACTIONS_MEMORY_MAX_GIB@ \
     --supervisor-memory-min-mib=@KBF_DAEMON_MEMORY_MIN_MIB@
 # TODO: the certificate flags of the new modes, which replace the worker
 # listener's, once `kbf all-in-one` has them.
-# SIGTERM drains: new Execute calls are refused, open streams run until their action is
-# done (Buck2 does not recover a stream that breaks), then the server exits. systemd must
-# not SIGKILL it meanwhile, so no stop timeout. A second SIGTERM ends the open streams
+# kbf drains on SIGTERM: new Execute calls are refused, open streams run until their
+# action is done (Buck2 does not recover a stream that breaks), with no deadline
+# (--shutdown-timeout-secs 0), then the server exits. A stop that ends sooner fails every
+# build in flight, so systemd sends SIGTERM and never kills it for taking long
+# (check-units rule `stop`). A second SIGTERM ends the open streams
 # (`systemctl kill --signal=TERM` on the unit), and `kbf cluster drain --frontend` begins the
 # same drain with no signal.
+KillSignal=SIGTERM
 TimeoutStopSec=infinity
 Restart=on-failure
 # Exit 2 is a command line kbf refused: a restart cannot fix it.
