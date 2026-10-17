@@ -208,6 +208,17 @@ impl Peer {
         }));
     }
 
+    /// An `UpdateOffer` and an `UpdateOrder`, which a daemon without an update client
+    /// has no use for.
+    pub fn update_messages(&self) {
+        self.send(server_message::Message::UpdateOffer(
+            kbf_proto::update::UpdateOffer::default(),
+        ));
+        self.send(server_message::Message::UpdateOrder(
+            kbf_proto::update::UpdateOrder::default(),
+        ));
+    }
+
     /// A Welcome that names no lease epoch and carries `map`.
     pub fn welcome_map(&self, map: Option<kbf_proto::kbf::map::v1::Map>) {
         self.send(server_message::Message::Welcome(Welcome {
