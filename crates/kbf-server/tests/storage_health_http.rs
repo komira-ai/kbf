@@ -133,7 +133,7 @@ fn farm(s: &Server, debts: &[Debts]) {
             .set_state(joined.id, MemberState::Active)
             .expect("promoted");
         s.members
-            .heartbeat(joined.id, joined.boot, Progress::CaughtUp, *debts)
+            .heartbeat(joined.id, joined.boot, Progress::CaughtUp, *debts, None)
             .expect("beats");
     }
 }
@@ -180,7 +180,7 @@ async fn the_api_answers_the_number_or_null_and_why() {
         .set_state(MemberId(1), MemberState::Active)
         .expect("active");
     s.members
-        .heartbeat(MemberId(2), 1, Progress::CaughtUp, Debts::Known(0))
+        .heartbeat(MemberId(2), 1, Progress::CaughtUp, Debts::Known(0), None)
         .expect("beats");
     let (_, zero) = storage(&s).await;
     assert_eq!(zero["under_replicated_blobs"], 0);
