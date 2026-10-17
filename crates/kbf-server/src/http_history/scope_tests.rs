@@ -60,10 +60,10 @@ async fn each_name_is_asked_once_and_an_unasked_name_is_refused() {
     let readers = readers(recording.clone());
     let caller = AuthenticationMetadata::new(None, None);
     let mut scope = Scope::new(&readers, &caller);
-    scope.ask(["ok1", "deny1", "ok1", "broken1"]).await;
-    scope.ask(["ok1", "ok2"]).await;
-    scope.ask([]).await;
-    scope.ask(["deny1"]).await;
+    scope.ask(&["ok1", "deny1", "ok1", "broken1"]).await;
+    scope.ask(&["ok1", "ok2"]).await;
+    scope.ask(&[]).await;
+    scope.ask(&["deny1"]).await;
     assert_eq!(
         *recording.calls.lock().expect("not poisoned"),
         [vec!["broken1", "deny1", "ok1"], vec!["ok2"]]
@@ -96,7 +96,7 @@ async fn a_name_the_authorizer_gave_no_answer_for_is_refused() {
     let readers = readers(recording);
     let caller = AuthenticationMetadata::new(None, None);
     let mut scope = Scope::new(&readers, &caller);
-    scope.ask(["ok1", "ok2"]).await;
+    scope.ask(&["ok1", "ok2"]).await;
     assert!(scope.allows("ok1"));
     assert!(!scope.allows("ok2"));
     assert_eq!(

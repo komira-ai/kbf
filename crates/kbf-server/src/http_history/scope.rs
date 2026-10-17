@@ -31,9 +31,10 @@ impl<'a> Scope<'a> {
     /// Asks the authorizer, in one call, about each of `names` it has not been asked
     /// about. An authorizer that answers for fewer names than it was asked about refuses
     /// the rest.
-    pub(super) async fn ask<'n>(&mut self, names: impl IntoIterator<Item = &'n str>) {
+    pub(super) async fn ask(&mut self, names: &[&str]) {
         let mut asking: Vec<&str> = names
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|n| !self.decided.contains_key(*n))
             .collect();
         asking.sort_unstable();

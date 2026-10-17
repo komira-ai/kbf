@@ -1,6 +1,10 @@
 //! The shape catalog and the tests, read from index rows after a restart. Each test names
 //! the defect it catches.
 
+use kbf_history::records::TestStatus;
+use kbf_history::{IndexRoot, RingRun, StatusRow};
+use kbf_state::{Cond, Store as _, Txn};
+use prost::Message as _;
 use serde_json::{Value, json};
 
 use crate::kit::{indexed, run, shape, status, until};
@@ -412,4 +416,73 @@ async fn shape_pages_walk_instances_and_configurations_without_repeats() {
     let rest = b.ok(next).await;
     assert_eq!(keys(&rest).len(), 1);
     b.stop().await;
+}
+
+/// Catches: a test whose catalog row is gone (the catalog is never rewritten by a later
+/// run, so a lost row is not restored by one) that has no ring and no listing: the status
+/// row is the test's, and answers by itself: its ring, and its place in the status list
+/// with the kind a test has and no target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_status_row_without_its_catalog_row_still_answers() {
+    let world = World::new();
+    let a = world.start(PAGES_ONLY);
+    // The writer's own rows are not needed: one status row, with its by-status entry.
+    a.feed(run("only", "main", shape(PASSING, "c", true, None), 1, 0))
+        .await;
+    world.flushed("only", 1).await;
+    let root = IndexRoot::default();
+    let lone = StatusRow {
+        last_outcome: TestStatus::Pass.into(),
+        ring: vec![RingRun {
+            run_id: vec![7; 12],
+            status: TestStatus::Pass.into(),
+            execution_ms: 5,
+            digest16: 0,
+        }],
+        last_seen_ms: 9_000,
+        ..StatusRow::default()
+    };
+    let key = 0x5555;
+    let put = Txn::new()
+        .put(
+            root.status("main", key, "c"),
+            lone.encode_to_vec(),
+            Cond::Any,
+        )
+        .put(
+            root.statusx("passing", "main", key, "c"),
+            vec![1],
+            Cond::Any,
+        );
+    world
+        .state
+        .fake
+        .txn(put)
+        .expect("a write")
+        .expect("no conflict");
+
+    let ring = a
+        .ok("/v1/shapes/0000000000005555/runs?instance=main&cfg=c")
+        .await;
+    assert_eq!(ring["covers"], "recent_16");
+    assert_eq!(ring["runs"][0]["run_id"], "07".repeat(12));
+    assert!(
+        ring["runs"][0].get("digest16").is_none(),
+        "a run with no digest shows none"
+    );
+    let list = a.ok("/v1/tests?status=passing&instance=main").await;
+    let lone = list["shapes"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|s| s["key"] == "0000000000005555")
+        .expect("the lone status row is listed");
+    assert_eq!(lone["kind"], "test");
+    assert_eq!(lone["target"], Value::Null);
+    assert!(
+        lone.get("first_seen").is_none(),
+        "no catalog row, no first sight"
+    );
+    assert_eq!(lone["last_seen"], "1970-01-01T00:00:09.000000Z");
+    a.stop().await;
 }

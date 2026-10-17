@@ -438,12 +438,10 @@ fn render(f: &Found) -> Value {
             .filter(|t| !t.is_empty())
             .map_or(Value::Null, Value::from),
     );
-    let mut last_seen = f.catalog.as_ref().map(|c| c.last_seen_ms);
     if let Some(c) = &f.catalog {
         o.insert("first_seen".into(), at_ms(c.first_seen_ms));
     }
     if let Some(s) = &f.status {
-        last_seen = last_seen.max(Some(s.last_seen_ms));
         o.insert(
             "status".into(),
             s.kind().map_or(Value::Null, |k| k.name().into()),
@@ -460,9 +458,15 @@ fn render(f: &Found) -> Value {
             o.insert(name.into(), m.as_ref().map_or(Value::Null, mark));
         }
     }
-    if let Some(ms) = last_seen {
-        o.insert("last_seen".into(), at_ms(ms));
-    }
+    // The later of the two rows' times; a row of an answer has at least one of the two.
+    let last_seen = f
+        .catalog
+        .iter()
+        .map(|c| c.last_seen_ms)
+        .chain(f.status.iter().map(|s| s.last_seen_ms))
+        .max()
+        .unwrap_or_default();
+    o.insert("last_seen".into(), at_ms(last_seen));
     Value::Object(o)
 }
 

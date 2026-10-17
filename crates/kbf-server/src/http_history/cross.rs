@@ -110,9 +110,8 @@ impl Cross {
     ) -> Result<(Vec<String>, bool), Response> {
         let names = self.names().await?;
         let named = q.get("instance");
-        scope
-            .ask(names.list.iter().map(String::as_str).chain(named))
-            .await;
+        let asking: Vec<&str> = names.list.iter().map(String::as_str).chain(named).collect();
+        scope.ask(&asking).await;
         if let Some(name) = named {
             if let Some(why) = scope.refusal(name) {
                 return Err(refusal(why));
