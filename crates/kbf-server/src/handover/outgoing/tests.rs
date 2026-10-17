@@ -394,6 +394,11 @@ async fn the_follower_answers_from_the_store_until_no_caller_waits() {
         tokio::task::yield_now().await;
     }
     rig.store.reads_fail.store(false, Ordering::SeqCst);
+    // A whole look (three reads) finds the caller still waiting before the answer is written.
+    let served = rig.store.reads_served.load(Ordering::SeqCst);
+    while rig.store.reads_served.load(Ordering::SeqCst) < served + 3 {
+        tokio::task::yield_now().await;
+    }
     assert!(
         !matches!(&*ticket.stage.borrow(), Stage::Done(_)),
         "nothing to say yet"

@@ -169,10 +169,7 @@ impl State {
             }
         }
         if lost > 0 {
-            tracing::warn!(
-                lost,
-                "callers answered UNAVAILABLE: the successor left no trace of their operation"
-            );
+            tracing::warn!(lost, "operations the successor lost: answered UNAVAILABLE");
         }
         Ok((waiting, lost))
     }

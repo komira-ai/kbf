@@ -597,6 +597,25 @@ struct Trio {
     api: Option<Socket>,
 }
 
+impl Trio {
+    /// The sockets of a frontend handing over, each checked to listen where the flags say.
+    fn adopt(
+        sockets: Sockets,
+        listeners: &crate::serve::Listeners,
+        api: Option<&crate::serve::Api>,
+        spare: bool,
+    ) -> Result<Self, ServeError> {
+        let reapi = Socket::adopt(sockets.reapi, listeners.reapi, spare)?;
+        let worker = Socket::adopt(sockets.worker, listeners.worker, spare)?;
+        let api = sockets
+            .api
+            .zip(api)
+            .map(|(fd, api)| Socket::adopt(fd, api.listen, spare));
+        let api = api.transpose()?;
+        Ok(Self { reapi, worker, api })
+    }
+}
+
 impl<'a> Prepared<'a> {
     /// Reads the flags, and adopts `inherited` if given: each socket must listen where
     /// the flags say.
@@ -607,19 +626,8 @@ impl<'a> Prepared<'a> {
         let api = args.api()?;
         let channel = flags.storage_endpoint()?.connect_lazy();
         let spare = flags.handover.is_some();
-        let adopted = inherited
-            .map(|sockets| {
-                Ok::<_, ServeError>(Trio {
-                    reapi: Socket::adopt(sockets.reapi, listeners.reapi, spare)?,
-                    worker: Socket::adopt(sockets.worker, listeners.worker, spare)?,
-                    api: sockets
-                        .api
-                        .zip(api.as_ref())
-                        .map(|(fd, api)| Socket::adopt(fd, api.listen, spare))
-                        .transpose()?,
-                })
-            })
-            .transpose()?;
+        let adopted = inherited.map(|s| Trio::adopt(s, &listeners, api.as_ref(), spare));
+        let adopted = adopted.transpose()?;
         Ok(Self {
             flags,
             listeners,
@@ -796,8 +804,8 @@ impl<'a> Prepared<'a> {
                         .boxed()
                 })
             })
-            .transpose()?;
-        background.extend(holder);
+            .transpose();
+        background.extend(holder?);
 
         let shutdown = shutdown()?;
         let stopper = Arc::clone(&drain);

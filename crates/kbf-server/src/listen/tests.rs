@@ -144,3 +144,11 @@ async fn an_http_listener_is_the_socket_bound() {
     assert_eq!(listener.local_addr().expect("address"), addr);
     assert!(TcpStream::connect(addr).is_ok());
 }
+
+/// Catches: a socket error that does not say which address it was for.
+#[test]
+fn a_socket_error_names_its_address() {
+    let addr: SocketAddr = "127.0.0.1:9".parse().expect("address");
+    let error = bind_error(addr)(io::Error::other("no reactor"));
+    assert_eq!(error.to_string(), "bind 127.0.0.1:9: no reactor");
+}

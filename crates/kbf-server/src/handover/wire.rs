@@ -204,22 +204,12 @@ impl Link {
     ) -> io::Result<()> {
         let line = format!("{}\n", message.line());
         let stream = self.stream.get_ref();
-        let sent = stream
-            .async_io(Interest::WRITABLE, || {
-                let mut space =
-                    [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_SOCKETS))];
-                let mut control = SendAncillaryBuffer::new(&mut space);
-                control.push(SendAncillaryMessage::ScmRights(sockets));
-                let lines = [IoSlice::new(line.as_bytes())];
-                Ok(sendmsg(stream, &lines, &mut control, SendFlags::empty())?)
-            })
-            .await?;
+        let sending = stream.async_io(Interest::WRITABLE, || send_once(stream, &line, sockets));
+        let sent = sending.await?;
         // The sockets went with the first byte; a short send of a line this small is
         // rare, and the rest follows as plain bytes.
-        self.stream
-            .get_mut()
-            .write_all(&line.as_bytes()[sent..])
-            .await
+        let rest = &line.as_bytes()[sent..];
+        self.stream.get_mut().write_all(rest).await
     }
 
     /// The next message, and the sockets that came with it.
@@ -228,35 +218,41 @@ impl Link {
     /// The socket fails, the other end has closed it, or what it sent is not a message.
     pub async fn hear_with(&mut self) -> Result<(Message, Vec<OwnedFd>), WireError> {
         let stream = self.stream.get_ref();
-        let (line, sockets) = stream
-            .async_io(Interest::READABLE, || {
-                let mut space = [MaybeUninit::uninit(); RECEIVE_SPACE];
-                let mut control = RecvAncillaryBuffer::new(&mut space);
-                let mut line = [0_u8; 512];
-                let got = recvmsg(
-                    stream,
-                    &mut [IoSliceMut::new(&mut line)],
-                    &mut control,
-                    RECEIVE,
-                )?;
-                let sockets: Vec<OwnedFd> = control
-                    .drain()
-                    .flat_map(|received| match received {
-                        RecvAncillaryMessage::ScmRights(sockets) => sockets.collect::<Vec<_>>(),
-                        _ => Vec::new(),
-                    })
-                    .collect();
-                Ok((line[..got.bytes].to_vec(), sockets))
-            })
-            .await?;
+        let receiving = stream.async_io(Interest::READABLE, || receive_once(stream));
+        let (line, sockets) = receiving.await?;
         if line.is_empty() {
             return Err(WireError::Closed);
         }
         let line = String::from_utf8_lossy(&line);
-        let message = Message::parse(&line)
-            .ok_or_else(|| WireError::Malformed(line.trim_end().to_owned()))?;
+        let message = Message::parse(&line);
+        let message = message.ok_or_else(|| WireError::Malformed(line.trim_end().to_owned()))?;
         Ok((message, sockets))
     }
+}
+
+/// One `sendmsg` of `line` with `sockets` attached.
+fn send_once(stream: &UnixStream, line: &str, sockets: &[BorrowedFd<'_>]) -> io::Result<usize> {
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_SOCKETS))];
+    let mut control = SendAncillaryBuffer::new(&mut space);
+    control.push(SendAncillaryMessage::ScmRights(sockets));
+    let lines = [IoSlice::new(line.as_bytes())];
+    sendmsg(stream, &lines, &mut control, SendFlags::empty()).map_err(io::Error::from)
+}
+
+/// One `recvmsg`: the bytes that came, and the sockets with them.
+fn receive_once(stream: &UnixStream) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
+    let mut space = [MaybeUninit::uninit(); RECEIVE_SPACE];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+    let mut line = [0_u8; 512];
+    let mut lines = [IoSliceMut::new(&mut line)];
+    let got = recvmsg(stream, &mut lines, &mut control, RECEIVE);
+    let got = got.map_err(io::Error::from)?;
+    let sockets = control.drain().flat_map(|received| match received {
+        RecvAncillaryMessage::ScmRights(sockets) => sockets.collect::<Vec<_>>(),
+        _ => Vec::new(),
+    });
+    let sockets = sockets.collect();
+    Ok((line[..got.bytes].to_vec(), sockets))
 }
 
 #[cfg(test)]

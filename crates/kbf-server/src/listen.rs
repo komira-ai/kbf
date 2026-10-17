@@ -35,7 +35,7 @@ impl Socket {
     pub fn bind(addr: SocketAddr, spare: bool) -> Result<Self, ServeError> {
         let bound =
             std::net::TcpListener::bind(addr).and_then(|listener| Self::of(listener, spare));
-        bound.map_err(|source| ServeError::Bind { addr, source })
+        bound.map_err(bind_error(addr))
     }
 
     /// The listener `fd` is, which must be listening on `want`: the flags of this process
@@ -57,15 +57,14 @@ impl Socket {
             })?;
             Self::of(listener, spare)
         });
-        adopted.map_err(|source| ServeError::Bind { addr: want, source })
+        adopted.map_err(bind_error(want))
     }
 
     fn of(listener: std::net::TcpListener, spare: bool) -> io::Result<Self> {
         listener.set_nonblocking(true)?;
         let local = listener.local_addr()?;
-        let spare = spare
-            .then(|| listener.try_clone().map(OwnedFd::from))
-            .transpose()?;
+        let copy = spare.then(|| listener.try_clone());
+        let spare = copy.transpose()?.map(OwnedFd::from);
         Ok(Self {
             local,
             spare,
@@ -79,11 +78,9 @@ impl Socket {
     /// # Errors
     /// The runtime cannot register the socket.
     pub fn grpc(self) -> Result<(Stoppable, Latch), ServeError> {
-        let addr = self.local;
         let registered = tokio::net::TcpListener::from_std(self.listener);
-        let incoming = registered
-            .map(|listener| TcpIncoming::from(listener).with_nodelay(Some(true)))
-            .map_err(|source| ServeError::Bind { addr, source })?;
+        let listener = registered.map_err(bind_error(self.local))?;
+        let incoming = TcpIncoming::from(listener).with_nodelay(Some(true));
         let open = Arc::new(Mutex::new(Open {
             incoming: Some(incoming),
             waker: None,
@@ -96,11 +93,14 @@ impl Socket {
     /// # Errors
     /// The runtime cannot register the socket.
     pub fn http(self) -> Result<tokio::net::TcpListener, ServeError> {
-        tokio::net::TcpListener::from_std(self.listener).map_err(|source| ServeError::Bind {
-            addr: self.local,
-            source,
-        })
+        let registered = tokio::net::TcpListener::from_std(self.listener);
+        registered.map_err(bind_error(self.local))
     }
+}
+
+/// The error of a socket on `addr` that could not be made or registered.
+fn bind_error(addr: SocketAddr) -> impl FnOnce(io::Error) -> ServeError {
+    move |source| ServeError::Bind { addr, source }
 }
 
 /// What a gRPC listener holds: the socket, until it is closed, and the waker of the task

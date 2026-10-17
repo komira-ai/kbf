@@ -59,6 +59,7 @@ pub(super) struct Gives {
     pub refuses_to_demote: AtomicBool,
     pub reads_fail: AtomicBool,
     pub reads_failed: AtomicUsize,
+    pub reads_served: AtomicUsize,
     hook: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
@@ -70,6 +71,7 @@ impl Gives {
             refuses_to_demote: AtomicBool::new(false),
             reads_fail: AtomicBool::new(false),
             reads_failed: AtomicUsize::new(0),
+            reads_served: AtomicUsize::new(0),
             hook: Mutex::new(None),
         })
     }
@@ -95,6 +97,7 @@ impl Store for Gives {
             self.reads_failed.fetch_add(1, Ordering::SeqCst);
             return Err(StoreError::Failed("the store cannot be read".to_owned()));
         }
+        self.reads_served.fetch_add(1, Ordering::SeqCst);
         self.inner.get(key)
     }
 

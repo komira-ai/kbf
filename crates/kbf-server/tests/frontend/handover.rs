@@ -452,3 +452,21 @@ async fn the_handover_flags_need_each_other_and_a_start_without_them_is_a_plain_
     drop(stop);
     served.await.expect("the task").expect("served");
 }
+
+/// Catches: a frontend that starts without its control socket (it would be unable to hand
+/// over, and the operator would find out at the update): a socket that cannot be made
+/// (here, in a directory that does not exist) fails the start, with the reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_socket_that_cannot_be_made_fails_the_start() {
+    let node = Node::start().await;
+    let dir = Dir::new();
+    let nowhere = dir.0.join("missing").join("control.sock");
+    let state = format!("--state-store=sqlite://{}/state.db", dir.0.display());
+    let socket = format!("--handover-socket={}", nowhere.display());
+    let url = format!("--storage=http://{}", node.addr);
+    let flags = flags(&[&url, &state, &socket]).expect("flags");
+    let error = start_frontend(&flags, || Ok(std::future::pending::<()>()))
+        .err()
+        .expect("no control socket");
+    assert!(error.to_string().contains("No such file"), "{error}");
+}

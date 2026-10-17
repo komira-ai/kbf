@@ -3,7 +3,6 @@
 use std::net::TcpListener;
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::ffi::OsStringExt as _;
-use std::os::unix::net::UnixStream as StdUnixStream;
 
 use super::*;
 
@@ -184,6 +183,8 @@ async fn sockets_arrive_with_their_line_in_order() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn control_messages_that_are_not_sockets_are_not_taken_for_them() {
+    use std::os::unix::net::UnixStream as StdUnixStream;
+
     use rustix::net::{
         SendAncillaryBuffer, SendAncillaryMessage, SendFlags, UCred, sendmsg, sockopt,
     };

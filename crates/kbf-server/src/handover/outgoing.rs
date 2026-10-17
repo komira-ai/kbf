@@ -239,7 +239,7 @@ pub(crate) async fn follow(farm: &Farm, every: Duration) {
         look.tick().await;
         match farm.follow() {
             Ok(0) => return,
-            Ok(waiting) => tracing::debug!(waiting, "callers still wait for the successor"),
+            Ok(_waiting) => {}
             Err(error) => tracing::warn!(%error, "the successor's results could not be read"),
         }
     }
