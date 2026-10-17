@@ -248,6 +248,7 @@ impl Segments for Judged {
         &self,
         request: Request<BeginRequest>,
     ) -> Result<Response<BeginResponse>, Status> {
+        let _open = self.this.service.open_writes.begin();
         self.this.service.check_map(self.generation).await?;
         self.this.service.segments.begin(request).await
     }
