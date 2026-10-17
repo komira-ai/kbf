@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use super::config::LinuxConfig;
+use super::config::{LOOPBACK_MINIO, LinuxConfig};
 use crate::template::{self, TemplateError, Value, Values};
 
 /// What `render-units` writes when `--kbf-uid` is not given: the kbf user's uid (the
@@ -116,7 +116,11 @@ pub(super) fn values(c: &LinuxConfig, kbf_uid: Option<u32>) -> Values {
         ("MINIO_UNIT", Value::Text(c.minio_unit.clone())),
         (
             "MINIO_S3_ENDPOINT",
-            Value::Text(c.minio_s3_endpoint.clone()),
+            Value::Text(
+                c.minio_s3_endpoint
+                    .clone()
+                    .unwrap_or_else(|| LOOPBACK_MINIO.to_owned()),
+            ),
         ),
         ("KBF_S3_BUCKET", Value::Text(c.s3_bucket.clone())),
         ("KBF_LISTEN_HOST", Value::Text(c.listen_host())),
@@ -125,8 +129,10 @@ pub(super) fn values(c: &LinuxConfig, kbf_uid: Option<u32>) -> Values {
         ("KBF_REAPI_PORT", Value::Text(c.reapi_port.to_string())),
         ("KBF_WORKER_PORT", Value::Text(c.worker_port.to_string())),
         ("KBF_API_PORT", Value::Text(c.api_port.to_string())),
+        ("KBF_STORAGE_PORT", Value::Text(c.storage_port.to_string())),
         ("KBF_DATA_DIR", Value::Text(c.data_dir.to_string())),
         ("KBF_META_DIR", Value::Text(c.meta_dir.to_string())),
+        ("KBF_HOT_DIR", Value::Text(c.hot_dir.to_string())),
         ("KBF_USER", Value::Text(c.user.clone())),
         ("KBF_SERVER_USER", Value::Text(c.server_user.clone())),
         ("KBF_ETC", Value::Text(c.etc.to_string())),

@@ -40,7 +40,7 @@ kbf-mdm                   0      0
 kbf-mdm-api               0      0
 kbf-meta                  7      1
 kbf-node                  0      0
-kbf-objstore             66     20
+kbf-objstore             59     19
 kbf-outputs               0      0
 kbf-proto                 0      0
 kbf-raft                 19     19
@@ -58,6 +58,7 @@ kbf-threads               0      0
 kbf-tier                  0      0
 kbf-transfer              0      0
 kbf-types                 3      2
+kbf-ui                    0      0
 kbf-updater               0      0
 kbf-vmm                   0      0
 xtask                     0      0

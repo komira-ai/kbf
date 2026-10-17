@@ -31,19 +31,24 @@
 //! Anyone may call it; the frontend does so after every change and on a timer.
 //!
 //! **Promotion** from `Joining` through `CatchingUp` to `Active` is [`Members::set_state`],
-//! the hook the catch-up copy (av2-13a) calls. A node's own request cannot promote it.
+//! the hook the catch-up copy calls. A node's own request promotes it in one case only: a
+//! node that registers saying it is rebuilding its index ([`Progress::CatchingUp`]) enters
+//! as `CatchingUp` instead of `Joining`, and its first heartbeat saying the rebuild is done
+//! ([`Progress::CaughtUp`]) makes it `Active`, in the same compare-and-set as the beat, so
+//! a state set meanwhile (`Draining`) is never overwritten. A heartbeat changes no other
+//! state: a `Joining` member waits for the join handoff, and a member that is `Draining`,
+//! `Active` or `Down` stays so whatever it reports.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kbf_map::{Map, MapError, Member, MemberId, MemberState, Rule};
+use kbf_mapsync::MapSource;
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_state::{Cond, Store, StoreError, Txn, Version, Versioned};
 use prost::Message as _;
 use tokio::sync::watch;
-
-use crate::map_feed::MapFeed;
 
 const MAP_KEY: &str = "map";
 const MEMBERS: &str = "member/";
@@ -85,6 +90,28 @@ impl MembershipConfig {
     }
 }
 
+/// Whether a node is still rebuilding its index, as it says when it registers and at
+/// every heartbeat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Progress {
+    /// Rebuilding: it enters the map as `CatchingUp`, and stays so.
+    CatchingUp,
+    /// Its index is whole: a `CatchingUp` member becomes `Active`.
+    CaughtUp,
+}
+
+impl Progress {
+    /// The wire's `catching_up` field.
+    #[must_use]
+    pub const fn from_wire(catching_up: bool) -> Self {
+        if catching_up {
+            Self::CatchingUp
+        } else {
+            Self::CaughtUp
+        }
+    }
+}
+
 /// What a node says about itself when it registers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Registrant {
@@ -98,6 +125,8 @@ pub struct Registrant {
     pub weight: u32,
     /// The newest protocol version it speaks.
     pub protocol: u32,
+    /// Whether it is rebuilding its index.
+    pub progress: Progress,
 }
 
 /// What a registration returns.
@@ -284,8 +313,8 @@ fn plan(
 /// How a row is rewritten in place.
 #[derive(Clone, Copy)]
 enum Touch {
-    /// A heartbeat of this boot: a whole time to live more.
-    Beat(u64),
+    /// A heartbeat of this boot, and what it reports: a whole time to live more.
+    Beat(u64, Progress),
     /// An administrator's state change: the time to live it had.
     State(MemberState),
 }
@@ -296,7 +325,7 @@ pub struct Members {
     config: MembershipConfig,
     /// The newest map this process has seen, whoever bumped it.
     latest: Mutex<Option<Arc<Map>>>,
-    /// Its generation (0 before any): [`MapFeed::changes`].
+    /// Its generation (0 before any): [`MapSource::changes`].
     generation: watch::Sender<u64>,
 }
 
@@ -313,7 +342,7 @@ impl Members {
     }
 
     /// Notes `map` as seen: if it is newer than the last, keeps it and wakes the
-    /// [`MapFeed::changes`] receivers.
+    /// [`MapSource::changes`] receivers.
     fn publish(&self, map: &Map) {
         let mut latest = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
         if latest
@@ -325,19 +354,18 @@ impl Members {
         }
     }
 
-    /// The map the push protocol reads: its current value and a receiver of its
-    /// generation, which changes on every bump this process commits or observes (a
-    /// bump by another frontend is seen at the next [`Members::refresh`], which the
-    /// frontend runs every beat).
+    /// The map the push protocol reads: its current value (`None` until the first member
+    /// registers) and a receiver of its generation, which changes on every bump this
+    /// process commits or observes (a bump by another frontend is seen at the next
+    /// [`Members::refresh`], which the frontend runs every beat). Seeded from the store,
+    /// so a restarted frontend has the map its members left.
     ///
     /// # Errors
-    /// [`MembershipError::NoMap`] before the first member has registered: there is no
-    /// map to hand out; the store failing.
-    pub fn map_feed(self: &Arc<Self>) -> Result<Arc<dyn MapFeed>, MembershipError> {
-        let seed = self.current_map()?.ok_or(MembershipError::NoMap)?;
+    /// The store failing.
+    pub fn map_source(self: &Arc<Self>) -> Result<Arc<dyn MapSource>, MembershipError> {
+        self.current_map()?;
         Ok(Arc::new(MemberMap {
             members: Arc::clone(self),
-            seed: Arc::new(seed),
         }))
     }
 
@@ -348,7 +376,8 @@ impl Members {
     }
 
     /// Registers a storage node: assigns its id (the same for the same instance) and a
-    /// larger boot counter, writes its row as `Joining`, and rebuilds the map.
+    /// larger boot counter, writes its row as `Joining` (`CatchingUp` if it is rebuilding
+    /// its index), and rebuilds the map.
     ///
     /// # Errors
     /// [`MembershipError::Invalid`] or [`MembershipError::Protocol`] for a bad request;
@@ -372,7 +401,10 @@ impl Members {
             addr: who.addr.clone(),
             zone: who.zone.clone(),
             weight: who.weight,
-            state: MemberState::Joining,
+            state: match who.progress {
+                Progress::CatchingUp => MemberState::CatchingUp,
+                Progress::CaughtUp => MemberState::Joining,
+            },
         };
         self.write_row(&member, boot)?;
         let map = self.refresh()?.ok_or(MembershipError::NoMap)?;
@@ -433,14 +465,22 @@ impl Members {
         Err(MembershipError::Contended)
     }
 
-    /// Restarts the time to live of `id`'s row. Returns the generation of the current
-    /// map.
+    /// Restarts the time to live of `id`'s row and, if the member is `CatchingUp` and
+    /// `progress` says it is done, makes it `Active` and rebuilds the map. Returns the
+    /// generation of the current map.
     ///
     /// # Errors
     /// [`MembershipError::NotRegistered`] if the row expired (register again);
     /// [`MembershipError::Superseded`] if `boot` is not the row's; the store failing.
-    pub fn heartbeat(&self, id: MemberId, boot: u64) -> Result<u64, MembershipError> {
-        self.touch(id, Touch::Beat(boot))?;
+    pub fn heartbeat(
+        &self,
+        id: MemberId,
+        boot: u64,
+        progress: Progress,
+    ) -> Result<u64, MembershipError> {
+        if self.touch(id, Touch::Beat(boot, progress))? {
+            return Ok(self.refresh()?.map_or(0, |map| map.generation()));
+        }
         Ok(self.current_map()?.map_or(0, |map| map.generation()))
     }
 
@@ -458,7 +498,8 @@ impl Members {
         self.refresh()?.ok_or(MembershipError::NoMap)
     }
 
-    fn touch(&self, id: MemberId, how: Touch) -> Result<(), MembershipError> {
+    /// Rewrites `id`'s row as `how` says; whether its state changed.
+    fn touch(&self, id: MemberId, how: Touch) -> Result<bool, MembershipError> {
         let key = member_key(id);
         for _ in 0..ATTEMPTS {
             let stored = self
@@ -466,15 +507,21 @@ impl Members {
                 .get(&key)?
                 .ok_or(MembershipError::NotRegistered(id))?;
             let mut live = decode_row(&stored)?;
+            let before = live.member.state;
             let ttl = match how {
-                Touch::Beat(boot) if boot != live.boot => {
+                Touch::Beat(boot, _) if boot != live.boot => {
                     return Err(MembershipError::Superseded {
                         id,
                         boot,
                         current: live.boot,
                     });
                 }
-                Touch::Beat(_) => self.config.ttl,
+                Touch::Beat(_, progress) => {
+                    if before == MemberState::CatchingUp && progress == Progress::CaughtUp {
+                        live.member.state = MemberState::Active;
+                    }
+                    self.config.ttl
+                }
                 Touch::State(state) => {
                     live.member.state = state;
                     stored
@@ -489,7 +536,7 @@ impl Members {
                 Cond::Version(stored.version),
             );
             if self.store.txn(put)?.is_ok() {
-                return Ok(());
+                return Ok(live.member.state != before);
             }
         }
         Err(MembershipError::Contended)
@@ -567,23 +614,18 @@ fn decode_id(value: &[u8]) -> Result<u64, MembershipError> {
         .map_err(|_| MembershipError::Corrupt("instance entry is not a member id".to_owned()))
 }
 
-/// [`Members`] as a [`MapFeed`].
+/// [`Members`] as a [`MapSource`].
 struct MemberMap {
     members: Arc<Members>,
-    /// The map there was when the source was made; the answer until a newer one is seen.
-    seed: Arc<Map>,
 }
 
-impl MapFeed for MemberMap {
-    fn current(&self) -> Arc<Map> {
-        let latest = self
-            .members
+impl MapSource for MemberMap {
+    fn current(&self) -> Option<Arc<Map>> {
+        self.members
             .latest
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        // `map_feed` published the seed, so `latest` is set; the seed is the answer if it
-        // were not. An `Arc` clone is cheap, so no closure holds a line no test reaches.
-        latest.clone().unwrap_or(Arc::clone(&self.seed))
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn changes(&self) -> watch::Receiver<u64> {

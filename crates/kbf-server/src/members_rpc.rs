@@ -20,7 +20,7 @@ use kbf_proto::kbf::map::v1::membership_server::{Membership, MembershipServer};
 use kbf_storage::service::{Admission, PeerRole, role_of};
 use tonic::{Request, Response, Status};
 
-use crate::members::{Members, MembershipError, Registrant};
+use crate::members::{Members, MembershipError, Progress, Registrant};
 
 /// The service over `members`, admitting callers as `admission` says.
 pub struct MembershipService {
@@ -114,6 +114,7 @@ impl Membership for MembershipService {
             zone: req.zone,
             weight: req.weight,
             protocol: req.protocol,
+            progress: Progress::from_wire(req.catching_up),
         };
         let members = Arc::clone(&self.members);
         let joined = blocking(move || members.register(&who)).await?;
@@ -134,8 +135,23 @@ impl Membership for MembershipService {
         let req = request.into_inner();
         let members = Arc::clone(&self.members);
         let id = kbf_map::MemberId(req.member_id);
-        let map_generation = blocking(move || members.heartbeat(id, req.boot)).await?;
-        Ok(Response::new(pb::HeartbeatResponse { map_generation }))
+        let have = req.have_generation;
+        let progress = Progress::from_wire(req.catching_up);
+        let (map_generation, map) = blocking(move || {
+            let generation = members.heartbeat(id, req.boot, progress)?;
+            // Read only for a node that is behind: most beats carry no map.
+            let newer = if generation > have {
+                members.current_map()?.filter(|map| map.generation() > have)
+            } else {
+                None
+            };
+            Ok((generation, newer))
+        })
+        .await?;
+        Ok(Response::new(pb::HeartbeatResponse {
+            map_generation,
+            map: map.as_ref().map(pb::Map::from),
+        }))
     }
 }
 
