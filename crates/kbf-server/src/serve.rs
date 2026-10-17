@@ -3,6 +3,7 @@
 
 use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ use kbf_proto::reapi::content_addressable_storage_server::ContentAddressableStor
 use kbf_proto::worker::segments_server::SegmentsServer;
 use kbf_proto::worker::worker_server::WorkerServer;
 use kbf_sched::MemoryLadder;
+use kbf_storage::service::Admission;
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, ServerTlsConfig};
@@ -33,10 +35,13 @@ use crate::health::Readiness;
 use crate::http_blobs::BlobReaders;
 use crate::http_invocations::InvocationReaders;
 use crate::identity::{DenyList, Peers};
+use crate::members::Members;
+use crate::members_rpc::MembershipService;
 use crate::state_store::StateStore;
 use crate::streams::{StreamLimits, flow_windows};
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
+use kbf_proto::kbf::map::v1::membership_server::MembershipServer;
 
 /// How the server listens and paces its daemons.
 #[derive(Clone, Debug)]
@@ -302,6 +307,44 @@ pub(crate) fn keepalive(server: Server, timing: StreamTiming) -> Server {
 const STATE_IN_MEMORY: &str = "the scheduler's state is in memory: no cordon, drain, lease or \
     operation of an earlier server process is restored, and the server keeps no rollout record";
 
+/// The members a frontend with a state store keeps. Not generic, for the same reason as
+/// [`sweeping`].
+pub(crate) fn members_of(state: Option<&crate::StateStore>) -> Option<Arc<Members>> {
+    let state = state?;
+    Some(Arc::new(Members::new(
+        Arc::clone(&state.store),
+        state.members,
+    )))
+}
+
+/// The membership service storage nodes register with, when there are members to keep:
+/// under worker TLS only the storage role may call it. Not generic, for the same reason
+/// as [`sweeping`].
+pub(crate) fn membership(
+    members: Option<Arc<Members>>,
+    certified: bool,
+) -> Option<MembershipServer<MembershipService>> {
+    let admission = if certified {
+        Admission::Certified
+    } else {
+        Admission::Open
+    };
+    Some(MembershipService::new(members?, admission).server())
+}
+
+/// Expires members while the server runs. Never completes; with no state store there
+/// are none, and it waits forever. A function of its own and not generic, so the tests
+/// measure one copy of these lines and not the best of the server's instantiations.
+///
+/// Builds the future and does not await it here: a function that awaits a future that
+/// never completes has a closing line no test can reach.
+pub(crate) fn sweeping(members: Option<Arc<Members>>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    match members {
+        Some(members) => Box::pin(crate::members_rpc::sweep(members)),
+        None => Box::pin(std::future::pending()),
+    }
+}
+
 /// Logs where the scheduler's state is, at every start. Not generic, unlike the binding
 /// that calls it, so every test binary's runs count toward the same function's coverage.
 pub(crate) fn log_state(durable: bool, term: u64, epoch: u64) {
@@ -503,6 +546,8 @@ where
     .with_memory_ladder(listeners.memory_ladder.clone())
     .recording(recorder.clone());
     let durable = state.is_some();
+    // Storage nodes register with a frontend that has a state store to keep them in.
+    let members = members_of(state.as_ref());
     let farm = Arc::new(farm.with_state(state)?);
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
@@ -545,6 +590,7 @@ where
         flow_control(Server::builder(), listeners.stream_limits.worker),
         listeners.streams,
     );
+    let peers_certified = listeners.worker_tls.is_some();
     let peers;
     (worker_server, peers) = worker_peers(worker_server, listeners.worker_tls)?;
     let worker_blobs = ByteStreamServer::new(WorkerBlobs::new(
@@ -579,6 +625,7 @@ where
     ))
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    let membership = membership(members.clone(), peers_certified);
     let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);
@@ -638,6 +685,7 @@ where
             .add_service(worker_blobs)
             .add_service(worker_cas)
             .add_service(worker_segments)
+            .add_optional_service(membership)
             .serve_with_incoming(worker_incoming);
         // Told when the REAPI listener is done, so the operator API answers what it is
         // answering (the request that began a drain on an idle frontend, whose
@@ -651,6 +699,7 @@ where
             },
         );
         tokio::pin!(api_serve);
+        let sweeping = sweeping(members);
         let ticking = async {
             let mut tick = tokio::time::interval(listeners.tick);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -677,6 +726,7 @@ where
             // for again below (`reapi_done` stays false).
             served = &mut api_serve => served.map_err(ServeError::Api),
             () = ticking => Ok(()),
+            () = sweeping => Ok(()),
             // One timer for every open stream's progress operation.
             () = ticker.run() => Ok(()),
             () = stopping => Ok(()),

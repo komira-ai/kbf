@@ -241,7 +241,11 @@ impl Disk {
             kbf_sched::UNSERVABLE_WAIT,
             kbf_sched::FINISHED_RETENTION,
         )
-        .with_state(Some(StateStore { store, epoch }))
+        .with_state(Some(StateStore {
+            store,
+            epoch,
+            members: Default::default(),
+        }))
     }
 
     /// The process dies: its farm is gone, and the store reopens as the disk left it.
@@ -981,6 +985,7 @@ async fn a_server_binds_over_a_state_store_or_refuses_it() {
     let state = |disk: &Disk| StateStore {
         store: disk.store.clone(),
         epoch: EpochPolicy::Keep,
+        members: Default::default(),
     };
     let bind = |state| {
         kbf_server::bind_server_with_state(

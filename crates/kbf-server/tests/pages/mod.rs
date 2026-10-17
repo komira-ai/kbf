@@ -206,8 +206,8 @@ pub fn listing(
     logs: (Option<Digest>, Option<Digest>),
 ) -> Listing {
     Listing {
-        result,
-        exit_code,
+        result: Some(result),
+        exit_code: Some(exit_code),
         outputs: outputs
             .iter()
             .enumerate()
