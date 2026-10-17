@@ -645,6 +645,33 @@ fn known_limit_a_test_execution_path_keys_per_configuration() {
     assert_eq!(shape(CFG).cfg, None);
 }
 
+/// A test buck2 runs remotely writes under `buck-out/<v>/test/execution/`, which the
+/// shape says (`Shape::test`, and so the run record's `test`): from any output, under
+/// any version directory and any prefix. Catches: the flag never set, set from the
+/// program rather than an output, set by a path that only names `test` or `execution`
+/// somewhere else (a target called `test`), or set with no `buck-out` in the path.
+#[test]
+fn an_output_under_the_test_execution_root_marks_the_shape_a_test() {
+    let test = |outputs: &[&str]| Shape::of(&strings(&["runner"]), &strings(outputs)).test;
+    let execution = format!("buck-out/v2/test/execution/komira/{CFG}/{CONTENT2}/default/out");
+    assert!(test(&[&execution]));
+    assert!(test(&["a.o", &execution]), "any one output");
+    assert!(test(&[&format!(
+        "/work/buck-out/v3/test/execution/komira/{CFG}/{CONTENT2}/out"
+    )]));
+    assert!(!test(&[]));
+    assert!(!test(&["a.o"]));
+    assert!(!test(&[&format!(
+        "buck-out/v2/art/komira/{CFG}/src/test/__t__/execution/out"
+    )]));
+    assert!(!test(&["out/test/execution/x"]), "no buck-out");
+    assert!(!test(&["buck-out/v2/test/other/x"]));
+    assert!(
+        !Shape::of(&strings(&[&execution]), &strings(&["a.o"])).test,
+        "a program path is not an output"
+    );
+}
+
 fn target_of_paths(argv: &[&str], outputs: &[&str]) -> Option<(TargetKind, String)> {
     Shape::of(&strings(argv), &strings(outputs))
         .target

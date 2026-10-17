@@ -25,7 +25,9 @@
 //! otherwise a write answered with one copy and no debt would be possible.
 //!
 //! An owner that is up and does not answer is waited for like one that is down: the question
-//! "do you hold it" is bounded by [`RepairConfig::probe`], and `run` stops mid-pass.
+//! "do you hold it" is bounded by [`RepairConfig::probe`], and `run` stops mid-pass. So is
+//! the question this node's own store is asked before an evicted debt is dropped. A pass
+//! stopped in the middle of dropping a debt leaves the drop to finish ([`Repairs::settle_evicted`]).
 //!
 //! **Bounded work.** At most [`RepairConfig::concurrency`] blobs are repaired at once, one
 //! pass after another, [`RepairConfig::interval`] apart; a copy streams like a write
@@ -54,9 +56,11 @@ pub struct RepairConfig {
     pub interval: Duration,
     /// The most blobs repaired at once.
     pub concurrency: usize,
-    /// How long an owner may take to say whether it holds a blob. An owner that is up and
-    /// does not answer is a debt waiting, not a pass that never ends. (A copy is bounded
-    /// like a write: [`crate::replicate::ChainConfig`].)
+    /// How long an owner may take to say whether it holds a blob, and so may this node's own
+    /// store when the worker asks it whether an evicted blob is held (that look is made
+    /// under the gate every write that owes waits for). An owner that is up and does not
+    /// answer is a debt waiting, not a pass that never ends. (A copy is bounded like a
+    /// write: [`crate::replicate::ChainConfig`].)
     pub probe: Duration,
 }
 
@@ -175,7 +179,12 @@ impl RepairWorker {
                 // is left to copy, and the loss is the cache's to account for.
                 let dropped = self
                     .repairs
-                    .settle_evicted(&record.digest, begun, self.storage.as_ref())
+                    .settle_evicted(
+                        &record.digest,
+                        begun,
+                        self.storage.as_ref(),
+                        self.config.probe,
+                    )
                     .await
                     .unwrap_or(false);
                 if dropped {
