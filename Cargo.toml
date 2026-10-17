@@ -173,6 +173,7 @@ kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
 kbf-history = { path = "crates/kbf-history" }
 kbf-host = { path = "crates/kbf-host" }
+kbf-installer = { path = "crates/kbf-installer" }
 kbf-invocation = { path = "crates/kbf-invocation" }
 kbf-it = { path = "crates/kbf-it" }
 kbf-log = { path = "crates/kbf-log" }

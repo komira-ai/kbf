@@ -7,7 +7,7 @@
 //! /var/lib/kbf-deploy/incoming/       releases being received, not yet verified
 //! /var/lib/kbf-deploy/staged/         releases verified and ready to swap in
 //! /var/lib/kbf-deploy/deployed/       a record of each release swapped in
-//! /var/lib/kbf-deploy/state.json      the deploy state (crate::host::state)
+//! /var/lib/kbf-deploy/state.json      the deploy state (crate::state)
 //! /etc/kbf-deploy/policy.toml         what this host accepts
 //! /etc/kbf-deploy/pins/               one <commit>.sha256 per pinned release
 //! /etc/kbf-deploy/inventory.allow     the hosts a deploy may name
