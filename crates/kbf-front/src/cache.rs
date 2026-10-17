@@ -880,6 +880,7 @@ mod batch;
 mod consistency;
 mod evict;
 mod flush;
+mod rebuild;
 mod tier;
 mod touches;
 mod upload;
@@ -892,6 +893,7 @@ pub use consistency::{
 };
 pub use evict::{EVICT_EVERY, EVICT_GRACE, EvictRound};
 pub use flush::{FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSHES_PER_ROUND, FlushRound};
+pub use rebuild::{ADOPT_RECORDS, RebuildConfig, RebuildReport};
 pub use tier::{TierStartError, TierStartup};
 pub use touches::TouchConfig;
 use touches::Touches;
