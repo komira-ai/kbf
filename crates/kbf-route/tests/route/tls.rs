@@ -2,9 +2,11 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use kbf_map::{Member, MemberId, MemberState};
-use kbf_route::{Router, TlsNodes};
+use kbf_route::{Liveness, Router, TlsNodes};
 use kbf_storage::service::{Admission, Config, StorageService};
 use kbf_storage::{Storage, StorageError};
 use rcgen::{
@@ -14,7 +16,7 @@ use rcgen::{
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
-use super::support::{Cell, Node, blob_where, collect, map, view};
+use super::support::{Cell, Node, blob_read_from, blob_where, blobs_read_from, collect, map, view};
 
 /// The farm's one CA.
 struct Pki {
@@ -63,6 +65,11 @@ impl Pki {
     /// Nodes that trust the CA and present a client certificate.
     fn nodes(&self) -> Arc<TlsNodes> {
         Arc::new(TlsNodes::new(self.ca(), self.client()))
+    }
+
+    /// Nodes as [`Pki::nodes`], giving up on a silent one as `liveness` says.
+    fn nodes_with(&self, liveness: Liveness) -> Arc<TlsNodes> {
+        Arc::new(TlsNodes::new(self.ca(), self.client()).with_liveness(liveness))
     }
 
     /// `node` served over mutual TLS with `identity` as its certificate.
@@ -235,4 +242,191 @@ async fn a_member_that_cannot_be_dialled_is_an_internal_error() {
         .expect_err("not usable");
     assert!(matches!(error, StorageError::Internal(_)), "{error:?}");
     assert!(error.to_string().contains("TLS"), "{error}");
+}
+
+/// How long a test waits for a call that should have failed over before it calls the call
+/// stuck. Not a speed: the calls under test come back in a fraction of it.
+const STUCK: Duration = Duration::from_secs(10);
+
+/// Liveness short enough that a test need not wait for the defaults, and long enough that a
+/// healthy node on a busy machine is not given up on.
+fn quick() -> Liveness {
+    Liveness {
+        connect: Duration::from_secs(1),
+        keepalive_interval: Duration::from_millis(500),
+        keepalive_timeout: Duration::from_millis(500),
+    }
+}
+
+/// Reads `digest` whole through `router`, or fails the test if the read is stuck.
+async fn read_whole(router: &Router, digest: &kbf_types::Digest) -> Vec<u8> {
+    let read = tokio::time::timeout(STUCK, router.read_blob(digest)).await;
+    read.expect("the read was stuck on a node that does not answer")
+        .expect("a blob")
+        .to_vec()
+}
+
+/// Catches a TLS handshake that waits for ever: node 1 takes the TCP connection (the
+/// operating system does, nobody accepts it) and never speaks, node 2 is a real node. A
+/// blob both own is read from node 2 because node 1 is given up on, not waited for.
+#[tokio::test]
+async fn a_node_that_takes_the_connection_and_never_speaks_is_given_up_on() {
+    let pki = Pki::new();
+    let mute = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind");
+    let mute_port = mute.local_addr().expect("address").port();
+    let two = Node::new();
+    let port_2 = pki.serve(&two, pki.server(ip())).await;
+    let map = map(
+        1,
+        2,
+        vec![
+            at(1, format!("127.0.0.1:{mute_port}")),
+            at(2, format!("127.0.0.1:{port_2}")),
+        ],
+    );
+    let (blob, digest) = blob_read_from(&map, &[1, 2]);
+    two.hold(&blob);
+    let router = Router::new(Cell::with(view(&map)), pki.nodes_with(quick()));
+
+    assert_eq!(read_whole(&router, &digest).await, blob);
+    assert_eq!(two.read_count(), 1);
+    drop(mute);
+}
+
+/// Catches a TCP connect that waits for the operating system: node 1 is a listener whose
+/// queue of connections nobody has accepted is full, so a new connection gets no answer at
+/// all (the packets are dropped, as a firewall would). Node 2 is a real node.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_node_whose_packets_are_dropped_is_given_up_on() {
+    let pki = Pki::new();
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket
+        .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("bind");
+    let mute_port = socket.local_addr().expect("address").port();
+    let listener = socket.listen(1).expect("listen");
+    // Connections up to the queue's length are taken by the system; keep them open until
+    // one is not.
+    let mut filling = Vec::new();
+    for _ in 0..16 {
+        let dial = tokio::net::TcpStream::connect(("127.0.0.1", mute_port));
+        match tokio::time::timeout(Duration::from_millis(500), dial).await {
+            Ok(connected) => filling.push(connected.expect("connected")),
+            Err(_) => break,
+        }
+    }
+    assert!(filling.len() < 16, "the queue never filled");
+
+    let two = Node::new();
+    let port_2 = pki.serve(&two, pki.server(ip())).await;
+    let map = map(
+        1,
+        2,
+        vec![
+            at(1, format!("127.0.0.1:{mute_port}")),
+            at(2, format!("127.0.0.1:{port_2}")),
+        ],
+    );
+    let (blob, digest) = blob_read_from(&map, &[1, 2]);
+    two.hold(&blob);
+    let router = Router::new(Cell::with(view(&map)), pki.nodes_with(quick()));
+
+    assert_eq!(read_whole(&router, &digest).await, blob);
+    drop((listener, filling));
+}
+
+/// A TCP relay to `upstream` that can be told to stop passing bytes while keeping both
+/// connections open: from then on the node behind it is a host that has dropped off the
+/// network.
+struct Relay {
+    port: u16,
+    stalled: Arc<AtomicBool>,
+}
+
+impl Relay {
+    async fn to(upstream: u16) -> Self {
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("address").port();
+        let stalled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stalled);
+        tokio::spawn(async move {
+            loop {
+                let Ok((client, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(server) = tokio::net::TcpStream::connect(("127.0.0.1", upstream)).await
+                else {
+                    return;
+                };
+                let (from_client, to_client) = client.into_split();
+                let (from_server, to_server) = server.into_split();
+                tokio::spawn(pass(from_client, to_server, Arc::clone(&flag)));
+                tokio::spawn(pass(from_server, to_client, Arc::clone(&flag)));
+            }
+        });
+        Self { port, stalled }
+    }
+
+    fn stall(&self) {
+        self.stalled.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Copies `from` to `to` until `from` ends; once `stalled` is set, reads and drops.
+async fn pass(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    stalled: Arc<AtomicBool>,
+) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut buffer = vec![0_u8; 16 * 1024];
+    loop {
+        match from.read(&mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                if !stalled.load(Ordering::SeqCst) && to.write_all(&buffer[..n]).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Catches a connection that is never checked once it is up: node 1 is reached through a
+/// relay, answers one read, and then the relay stops passing anything (neither way, and no
+/// connection is closed). A read of a blob node 1 holds is sent into the silence; it is
+/// failed by the unanswered pings, and the blob comes from node 2.
+#[tokio::test]
+async fn a_node_that_goes_silent_after_connecting_is_given_up_on() {
+    let pki = Pki::new();
+    let (one, two) = (Node::new(), Node::new());
+    let port_1 = pki.serve(&one, pki.server(ip())).await;
+    let port_2 = pki.serve(&two, pki.server(ip())).await;
+    let relay = Relay::to(port_1).await;
+    let map = map(
+        1,
+        2,
+        vec![
+            at(1, format!("127.0.0.1:{}", relay.port)),
+            at(2, format!("127.0.0.1:{port_2}")),
+        ],
+    );
+    let blobs = blobs_read_from(&map, &[1, 2], 2);
+    for (blob, _) in &blobs {
+        one.hold(blob);
+    }
+    two.hold(&blobs[1].0);
+    let router = Router::new(Cell::with(view(&map)), pki.nodes_with(quick()));
+
+    assert_eq!(read_whole(&router, &blobs[0].1).await, blobs[0].0);
+    assert_eq!(one.read_count(), 1);
+
+    relay.stall();
+    assert_eq!(read_whole(&router, &blobs[1].1).await, blobs[1].0);
+    assert_eq!(two.read_count(), 1);
 }
