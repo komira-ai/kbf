@@ -30,7 +30,7 @@ state store, protocol skew, upgrade order), [worker-protocol.md](worker-protocol
 6. The new process registers; the frontend checks health and sends `UpdateOrder{CONFIRM}`. If confirmation does
    not arrive in the window, or the unit crash-loops, the helper reverts locally (commit-confirm).
 7. Order: **nodes update asynchronously, in any order, when idle or drained** (at most one storage node at a time;
-   daemon-only hosts in parallel; a busy Mac is deferred). On an upgrade **the frontend goes first, and only through
+   daemon-only hosts and Macs concurrently up to `max_hosts_out`, default 1; a busy Mac is deferred). On an upgrade **the frontend goes first, and only through
    Envoy**: the new instance starts on the other port, Envoy routes new connections to it, and the old one drains and
    keeps its in-flight `Execute` streams until they complete. The rollout never waits for `open_executions == 0` and never
    restarts the serving frontend. Details: split-mode-updates.md 2.5, 2.6 and 3.3.
