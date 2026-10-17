@@ -158,10 +158,16 @@ impl Chain {
     /// What this node does with a write of `digest` under `view`, `leg_from` being the
     /// member that sent it as a replica's copy, if one did.
     ///
+    /// Any write owner takes a client write as the primary, with the other owner as the
+    /// copy to send or owe: blobs are content-addressed, so a duplicate is harmless, and
+    /// the debt covers an owner that cannot be reached. A writer goes past the first owner
+    /// when the map names it down or it cannot be reached before the map says so; the
+    /// node need not tell the two apart.
+    ///
     /// # Errors
     /// [`StorageError::Invalid`] if this node is not where the map says the write goes: a
-    /// client write to a node that owns nothing of the blob, a copy sent to a node that does not
-    /// own the blob or by the node itself, or a replication factor above 2;
+    /// client write to a node outside the blob's write owners, a copy sent to a node that
+    /// does not own the blob or by the node itself, or a replication factor above 2;
     /// [`StorageError::Unavailable`] if the map has fewer owners than its factor.
     pub(crate) fn plan(
         &self,
@@ -201,10 +207,7 @@ impl Chain {
             }),
             // The second owner takes a client write as the primary, and the first owner
             // is the copy: owed at once if the map says it is down, else sent like a
-            // replica's. A client goes to the second owner when the first is down in its
-            // map, or when it could not reach it before the map said so (it is dead, and
-            // the lease has not lapsed): either way the blob lands on both owners, or is
-            // owed to the one that is gone, so the node need not tell the two apart.
+            // replica's (see above).
             (None, Some(1), [first, _]) => Ok(Plan::Primary {
                 replica: member(*first)?,
             }),

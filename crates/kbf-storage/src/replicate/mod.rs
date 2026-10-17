@@ -78,12 +78,14 @@
 //! refusals are not (a stale map, a digest that does not match, a role that may not copy, a
 //! failure of its store).
 //!
-//! The *second* owner takes a client write as if it were primary, whatever state the map
-//! gives the first: a client goes to it when the map names the first down, and also when
-//! the first cannot be reached and the map does not say so yet (the lease has not lapsed;
-//! the router's write fails over, `kbf_route::Router::put`). It sends the first owner the
-//! copy like a replica's, and if the first is down in the map or unreachable it owes the
-//! first owner its copy.
+//! Any write owner takes a client write as the primary, whatever state the map gives the
+//! other: blobs are content-addressed, so a duplicate is harmless, and the debt covers an
+//! owner that cannot be reached. A client goes to the second owner when the map names the
+//! first down, and also when the first cannot be reached and the map does not say so yet
+//! (the lease has not lapsed; the router's write fails over, `kbf_route::Router::put`). It
+//! sends the first owner the copy like a replica's, and if the first is down in the map or
+//! unreachable it owes the first owner its copy. A node outside the write owners refuses a
+//! client write.
 
 mod chain;
 mod leg;
