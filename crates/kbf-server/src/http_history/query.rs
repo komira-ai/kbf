@@ -1,5 +1,11 @@
 //! The query strings, page tokens and error answers of the cross-build routes.
 
+#![allow(
+    clippy::result_large_err,
+    reason = "the Err is the answer to send, built once on a refusal; boxing it would only \
+              move it"
+)]
+
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use kbf_history::MAX_PAGE;

@@ -23,7 +23,9 @@ fn a_query_takes_known_names_once_and_decodes_them() {
     assert_eq!(q.get("instance"), Some("a/b c"));
     assert_eq!(q.get("state"), Some("open"));
     assert_eq!(q.get("since"), None);
-    let refusal = Query::parse("bogus=1", &KNOWN).err().expect("refused");
+    let Err(refusal) = Query::parse("bogus=1", &KNOWN) else {
+        panic!("a name the route does not take is refused");
+    };
     assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -84,18 +86,15 @@ fn a_token_names_its_route_filters_and_position() {
 /// taken as a time, and the writer's own `at_ms` not reading back as it was written.
 #[test]
 fn times_are_rfc_3339_in_milliseconds() {
-    let ms = |text: &str| query(&format!("since={text}")).time_ms("since");
+    let ms = |text: &str| query(&format!("since={text}")).time_ms("since").ok();
+    assert_eq!(ms("2026-10-11T09:00:00Z"), Some(Some(1_791_709_200_000)));
     assert_eq!(
-        ms("2026-10-11T09:00:00Z").ok(),
-        Some(Some(1_791_709_200_000))
-    );
-    assert_eq!(
-        ms("2026-10-11T10:00:00.250%2B01:00").ok(),
+        ms("2026-10-11T10:00:00.250%2B01:00"),
         Some(Some(1_791_709_200_250))
     );
     assert_eq!(query("").time_ms("since").ok(), Some(None));
     for bad in ["2026-10-11", "yesterday", "1969-12-31T23:59:59Z", ""] {
-        assert!(ms(bad).is_err(), "{bad:?}");
+        assert!(ms(bad).is_none(), "{bad:?}");
     }
     assert_eq!(at_ms(1_791_709_200_250), "2026-10-11T09:00:00.250000Z");
 }
