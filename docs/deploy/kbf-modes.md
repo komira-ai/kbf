@@ -202,7 +202,8 @@ directive. `check-units` accepts the lines.
 that resolver may start after `network-online.target`. A failed lookup at start does not end
 either half of `storage-and-daemon`: the storage half's channel to `--frontend` is lazy, so
 the lookup is part of its first registration, and a failed registration waits (1 s, doubling
-to 30 s) and tries again until the frontend answers, before it opens its
+to 30 s, each wait cut by a random share of up to half, as the daemon's is, so nodes that lost
+one frontend do not return in step) and tries again until the frontend answers, before it opens its
 cache; the daemon half resolves `--server` at every connection round, reports a failed
 lookup as a failed attempt, waits and resolves again, and never stops trying. (`daemon`
 does the same.) A node that cannot find its frontend therefore stays up and logs each

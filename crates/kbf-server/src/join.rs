@@ -1,6 +1,7 @@
 //! A storage node's side of registration (`kbf storage --frontend`): register with a
 //! frontend ([`Joiner::join`]), then heartbeat at the interval it names ([`Joiner::keep`]), registering again when the frontend
-//! says the row lapsed, and backing off when it cannot be reached
+//! says the row lapsed, and backing off when it cannot be reached, each wait jittered down
+//! by up to half ([`jittered`]) so that nodes that lost one frontend do not return in step
 //! (`docs/design/architecture-v2.md`, section 6). The node never touches the state store.
 //!
 //! **The map.** The registration answers with the frontend's map, and a heartbeat that
@@ -13,6 +14,7 @@
 //! its storage service reads): a node that registers while rebuilding enters the map as
 //! `CatchingUp`, and the first heartbeat after [`CatchUp::finish`] makes it `Active`.
 
+use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,11 +68,29 @@ pub fn backoff(base: Duration, failures: u32) -> Duration {
         .min(RETRY_MAX)
 }
 
+/// `wait` less up to half of it: `wait * (1 - unit / 2)` for `unit` in `[0, 1)`, as the
+/// daemon jitters its own reconnect wait (`kbf_daemon::connect`).
+#[must_use]
+pub fn jittered(wait: Duration, unit: f64) -> Duration {
+    wait.mul_f64(1.0 - unit.clamp(0.0, 1.0) / 2.0)
+}
+
+/// A number in `[0, 1)` from a hasher the standard library keys from the operating
+/// system's random source: jitter needs no stronger randomness.
+#[must_use]
+pub fn unit_random() -> f64 {
+    let bits = RandomState::new().hash_one(0_u8) >> 11;
+    #[allow(clippy::cast_precision_loss)] // 53 bits fit an f64 exactly
+    let unit = bits as f64 / (1_u64 << 53) as f64;
+    unit
+}
+
 /// A node's registration with one frontend.
 pub struct Joiner {
     client: MembershipClient<Channel>,
     identity: Identity,
     retry: Duration,
+    unit: fn() -> f64,
     catch_up: CatchUp,
     node: Arc<NodeMap>,
 }
@@ -84,9 +104,23 @@ impl Joiner {
             client: MembershipClient::new(channel),
             identity,
             retry,
+            unit: unit_random,
             catch_up: CatchUp::caught_up(),
             node: Arc::new(NodeMap::new(Arc::new(MapHolder::new()))),
         }
+    }
+
+    /// Draws the jitter of every wait from `unit` (a number in `[0, 1)`) instead of the
+    /// system's random source: a test's way to know the waits.
+    #[must_use]
+    pub fn with_unit(mut self, unit: fn() -> f64) -> Self {
+        self.unit = unit;
+        self
+    }
+
+    /// The wait after `failures` failures in a row: [`backoff`], jittered.
+    fn pause(&self, failures: u32) -> Duration {
+        jittered(backoff(self.retry, failures), (self.unit)())
     }
 
     /// Keeps the maps this node is sent in `node`'s holder, which whatever else the node
@@ -171,7 +205,7 @@ impl Joiner {
         Ok(answer.map_generation)
     }
 
-    /// Registers, retrying after [`backoff`] until the frontend answers: what a storage
+    /// Registers, retrying after [`backoff`] (jittered) until the frontend answers: what a storage
     /// node waits for before it opens its cache, which writes as the member and boot
     /// this returns.
     pub async fn join(&mut self) -> Joined {
@@ -184,7 +218,7 @@ impl Joiner {
                 }
                 Err(e) => {
                     tracing::warn!("registering with the frontend: {}", e.message());
-                    tokio::time::sleep(backoff(self.retry, failures)).await;
+                    tokio::time::sleep(self.pause(failures)).await;
                     failures = failures.saturating_add(1);
                 }
             }
@@ -200,7 +234,7 @@ impl Joiner {
         }
     }
 
-    /// Heartbeats as `joined` for ever: a failed call waits [`backoff`] and tries
+    /// Heartbeats as `joined` for ever: a failed call waits [`backoff`] (jittered) and tries
     /// again; a NOT_FOUND heartbeat registers again ([`Joiner::join`]). A heartbeat is also
     /// sent at once when a caller asks for a map newer than the node's
     /// ([`MapHolder::reach`]). A registration after a lapse has a larger boot; the node's
@@ -215,7 +249,7 @@ impl Joiner {
     }
 
     /// Heartbeats as `this` until the frontend says the row lapsed (NOT_FOUND). A failed
-    /// call waits [`backoff`] and tries again.
+    /// call waits [`backoff`] (jittered) and tries again.
     async fn beat_until_lapse(&mut self, this: &Joined, asks: &mut watch::Receiver<u64>) {
         let mut failures = 0_u32;
         loop {
@@ -234,10 +268,14 @@ impl Joiner {
                 }
                 Err(e) => {
                     tracing::warn!("heartbeat to the frontend: {}", e.message());
-                    tokio::time::sleep(backoff(self.retry, failures)).await;
+                    tokio::time::sleep(self.pause(failures)).await;
                     failures = failures.saturating_add(1);
                 }
             }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "join_tests.rs"]
+mod tests;
