@@ -278,8 +278,9 @@ no registered member.
   (`member 3 not active`, `member 2 silent`, `5 blobs owed`); empty when it is known to be
   zero.
 - `nodes`: every registered member in any state, with what its newest report says:
-  `repair_debts` (the copies it owes), `open_writes` (the `Write` calls and action-cache
-  commits it has open now, as a primary or a replica) and `generation` (the map it held when
+  `repair_debts` (the copies it owes), `open_writes` (the `Write` calls, action-cache
+  commits and daemon segment uploads it has open now, an upload from `Begin` until its
+  commit ends, as a primary or a replica) and `generation` (the map it held when
   it counted). A value is `null` when the member's report is older than the freshness
   window, when it has not reported, or when it cannot say (an older node does not count its
   writes). `null` is unknown, never zero: whoever reads it fails closed. A node is idle for a
