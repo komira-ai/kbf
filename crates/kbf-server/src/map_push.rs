@@ -43,11 +43,14 @@ impl MapFeed {
         self.0.as_ref().map(|source| source.changes())
     }
 
-    /// The map the source holds now, as the wire has it, for `Welcome`.
+    /// The map the source holds now, as the wire has it, for `Welcome`; `None` for a
+    /// farm with no source, and for a source with no map yet (the first one is sent as a
+    /// `MapUpdate` when it comes).
     pub(crate) fn welcome_map(&self) -> Option<wire::Map> {
         self.0
             .as_ref()
-            .map(|source| wire::Map::from(&*source.current()))
+            .and_then(|source| source.current())
+            .map(|map| wire::Map::from(&*map))
     }
 
     /// Starts sending a `MapUpdate` on `outbound` for each change in `changes` (from
@@ -60,17 +63,18 @@ impl MapFeed {
     }
 
     /// The answer to a `MapRequest`: a `MapUpdate` of the map held now, when there is a
-    /// source.
+    /// source with a map.
     pub(crate) fn answer(&self) -> Option<server_message::Message> {
-        self.0.as_deref().map(update)
+        self.0.as_deref().and_then(update)
     }
 }
 
-/// A `MapUpdate` of the map `source` holds now.
-fn update(source: &dyn MapSource) -> server_message::Message {
-    server_message::Message::MapUpdate(MapUpdate {
-        map: Some(wire::Map::from(&*source.current())),
-    })
+/// A `MapUpdate` of the map `source` holds now, if it holds one.
+fn update(source: &dyn MapSource) -> Option<server_message::Message> {
+    let map = source.current()?;
+    Some(server_message::Message::MapUpdate(MapUpdate {
+        map: Some(wire::Map::from(&*map)),
+    }))
 }
 
 /// Sends a `MapUpdate` on `outbound` each time `changes` ticks, until the stream is gone
@@ -88,7 +92,9 @@ pub(crate) async fn push_changes(
     let sending = async {
         while changes.changed().await.is_ok() {
             // A send fails only for a stream that is gone, which `closed` below ends.
-            let _ = outbound.send(Ok(crate::worker::message(update(&*source))));
+            if let Some(update) = update(&*source) {
+                let _ = outbound.send(Ok(crate::worker::message(update)));
+            }
         }
     };
     tokio::select! {
@@ -187,5 +193,84 @@ mod tests {
         drop(dead);
         let (outbound, _sent) = mpsc::unbounded_channel();
         push_changes(source, changes, outbound).await;
+    }
+
+    /// A source with no map until [`Late::arrive`]: a frontend before its first storage
+    /// node registers.
+    struct Late {
+        map: std::sync::Mutex<Option<Arc<Map>>>,
+        generation: watch::Sender<u64>,
+    }
+
+    impl Late {
+        fn new() -> Self {
+            Self {
+                map: std::sync::Mutex::new(None),
+                generation: watch::Sender::new(0),
+            }
+        }
+
+        fn arrive(&self, map: Map) {
+            let generation = map.generation();
+            *self.map.lock().expect("lock") = Some(Arc::new(map));
+            self.generation.send_replace(generation);
+        }
+    }
+
+    impl MapSource for Late {
+        fn current(&self) -> Option<Arc<Map>> {
+            self.map.lock().expect("lock").clone()
+        }
+
+        fn changes(&self) -> watch::Receiver<u64> {
+            self.generation.subscribe()
+        }
+    }
+
+    /// Catches a session that invents a map for a frontend that has none (an empty
+    /// `Welcome.map`, or a `MapUpdate` answering a `MapRequest`, which a daemon would
+    /// take for a map of generation 0), and one that never sends the first map once it
+    /// exists to a daemon that connected before it.
+    #[tokio::test(start_paused = true)]
+    async fn a_source_with_no_map_sends_none_until_it_has_one() {
+        let late = Arc::new(Late::new());
+        let feed = MapFeed::new(Arc::clone(&late) as Arc<dyn MapSource>);
+        assert!(feed.welcome_map().is_none(), "no map to welcome with");
+        assert!(feed.answer().is_none(), "no map to answer with");
+
+        let (outbound, mut sent) = mpsc::unbounded_channel();
+        let changes = feed.subscribe();
+        feed.push(changes, &outbound);
+        late.arrive(map(1));
+        assert_eq!(
+            sent.recv().await.expect("an update").expect("not an error"),
+            update_of(1)
+        );
+        assert!(feed.welcome_map().is_some());
+        assert!(feed.answer().is_some());
+    }
+
+    /// Catches a pusher that sends a `MapUpdate` for a tick that carries no map (a
+    /// source that announces before it stores): the daemon must see none.
+    #[tokio::test(start_paused = true)]
+    async fn a_tick_with_no_map_sends_nothing() {
+        let late = Arc::new(Late::new());
+        let (tick, changes) = watch::channel(0);
+        let (outbound, mut sent) = mpsc::unbounded_channel();
+        let pusher = tokio::spawn(push_changes(
+            Arc::clone(&late) as Arc<dyn MapSource>,
+            changes,
+            outbound,
+        ));
+        tick.send_replace(1);
+        tokio::task::yield_now().await;
+        late.arrive(map(2));
+        tick.send_replace(2);
+        assert_eq!(
+            sent.recv().await.expect("an update").expect("not an error"),
+            update_of(2),
+            "the first thing sent is the map, not an empty update"
+        );
+        pusher.abort();
     }
 }

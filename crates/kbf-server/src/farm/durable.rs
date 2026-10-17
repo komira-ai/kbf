@@ -17,8 +17,16 @@
 //!   is written at the grant and at the end, never to renew it);
 //! - `loss/<operation>`: how many of the operation's leases were lost, while it is
 //!   unfinished and has lost any ([`kbf_sched::LOSS_REQUEUES`] refuses it);
+//! - `done/<operation>`: how a finished or refused operation ended, kept for the finished
+//!   retention (at least [`DONE_FLOOR`]) so a process that did not finish it can still
+//!   answer the callers of it: a tag byte and the `ExecuteResponse` ([`kbf_front::Finished`]);
+//! - `cordon/<worker>`: how an operator placed a node (cordoned, or draining until a
+//!   wall-clock deadline), kept until it is returned to placement, so a successor
+//!   process serves the node as the operator left it;
 //! - `meta/epoch`, `meta/next_op`, `meta/next_seq`: the store incarnation and the first
-//!   operation id and lease sequence no earlier start used.
+//!   operation id and lease sequence no earlier start used;
+//! - `meta/generation`: the writer generation ([`kbf_state::Fenced`]); every write of the
+//!   scheduler is checked against it, and operation names carry it.
 //!
 //! Values are the `kbf-log` encoding of the scheduler's own inputs (a `Submit`, the
 //! `Committed` lease, a `WorkerUp`), so the strict codec the replicated log already runs
@@ -28,11 +36,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kbf_front::{Described, Stage};
+use kbf_front::{Described, Finished, Stage};
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
 use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{DaemonInstance, Recovered, RecoveredLease, Request, Requeue};
-use kbf_state::{Cond, Conflict, Store, StoreError, Txn, Versioned};
+use kbf_state::{Cond, Conflict, GENERATION, Store, StoreError, Txn, Versioned};
 use kbf_types::{
     ControlRecord, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, StartLease, WaiterId,
     WorkerId,
@@ -54,6 +62,12 @@ const EPOCH: &str = "meta/epoch";
 const ALIVE: &str = "meta/alive";
 const NEXT_OP: &str = "meta/next_op";
 const NEXT_SEQ: &str = "meta/next_seq";
+const CORDON: &str = "cordon/";
+
+/// The least time a `done/` row is kept, whatever the finished retention: a process that
+/// follows an operation it did not finish needs the row for as long as a stream it kept
+/// open can take to notice it.
+pub const DONE_FLOOR: Duration = Duration::from_secs(600);
 
 /// What a start does with the store's epoch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,6 +122,66 @@ pub(super) struct Stored {
     pub next_seq: u64,
     /// Every unfinished operation, in id order.
     pub operations: Vec<StoredOperation>,
+    /// Every node an operator placed, in node-id order.
+    pub cordons: Vec<(WorkerId, StoredCordon)>,
+}
+
+/// How an operator placed a node, as its `cordon/` row keeps it: a tag byte, and for a
+/// drain the deadline as eight bytes, big-endian, milliseconds since the Unix epoch (a
+/// successor process has a clock of its own for farm time, and the wall clock is the
+/// one both share).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StoredCordon {
+    /// Placement skips the node.
+    Cordoned,
+    /// Placement skips the node and waits for its leases until the deadline.
+    Draining { deadline_unix_ms: u64 },
+}
+
+impl StoredCordon {
+    fn to_row(self) -> Vec<u8> {
+        match self {
+            Self::Cordoned => vec![0],
+            Self::Draining { deadline_unix_ms } => {
+                [&[1][..], &deadline_unix_ms.to_be_bytes()].concat()
+            }
+        }
+    }
+
+    fn from_row(key: &str, row: &[u8]) -> Result<Self, StateError> {
+        match row {
+            [0] => Ok(Self::Cordoned),
+            [1, deadline @ ..] => {
+                let deadline = <[u8; 8]>::try_from(deadline)
+                    .map_err(|_| corrupt(key, "a drain deadline is not 8 bytes"))?;
+                Ok(Self::Draining {
+                    deadline_unix_ms: u64::from_be_bytes(deadline),
+                })
+            }
+            _ => Err(corrupt(key, "not a cordon")),
+        }
+    }
+}
+
+/// Where an operation stands in the state store, as a process that did not run it sees it.
+#[derive(Debug, PartialEq)]
+pub(super) enum Progress {
+    /// It ended, and this is how.
+    Ended(Finished),
+    /// It waits for a lease.
+    Queued,
+    /// It holds a lease.
+    Running,
+    /// The store has no trace of it: not unfinished and not ended. Its writer ends an
+    /// operation in two transactions, so for a moment after the first this is also what
+    /// a successful finish looks like.
+    Gone,
+}
+
+impl Progress {
+    pub(super) const fn is_gone(&self) -> bool {
+        matches!(self, Self::Gone)
+    }
 }
 
 /// An unfinished operation of a store.
@@ -143,6 +217,10 @@ pub(super) struct Durable {
     /// A write failed because the store could not be reached, and none has been taken
     /// since ([`State::watch_store`] tells the scheduler).
     pub(super) unreachable: AtomicBool,
+    /// A write failed because another writer holds a newer generation of the store: this
+    /// scheduler was superseded and takes no more work. Never cleared; unlike an outage,
+    /// the store coming back does not end it.
+    pub(super) fenced: AtomicBool,
 }
 
 impl std::fmt::Debug for Durable {
@@ -161,6 +239,14 @@ fn queue_key(operation: OperationId) -> String {
 
 fn loss_key(operation: OperationId) -> String {
     format!("loss/{:016x}", operation.0)
+}
+
+fn done_key(operation: OperationId) -> String {
+    format!("done/{:016x}", operation.0)
+}
+
+fn cordon_key(worker: &WorkerId) -> String {
+    format!("{CORDON}{worker}")
 }
 
 fn lease_key(lease: LeaseId) -> String {
@@ -226,6 +312,7 @@ impl Durable {
         let durable = Self {
             store,
             unreachable: AtomicBool::new(false),
+            fenced: AtomicBool::new(false),
         };
         if let Some(cond) = write {
             durable.commit(Txn::new().put(EPOCH, epoch.to_be_bytes(), cond))?;
@@ -280,6 +367,46 @@ impl Durable {
             next_operation: self.counter(NEXT_OP)?,
             next_seq: self.counter(NEXT_SEQ)?,
             operations,
+            cordons: self.cordons()?,
+        })
+    }
+
+    /// The nodes an operator placed.
+    fn cordons(&self) -> Result<Vec<(WorkerId, StoredCordon)>, StateError> {
+        let rows = self.store.scan_prefix(CORDON)?;
+        rows.into_iter()
+            .map(|(key, row)| {
+                let cordon = StoredCordon::from_row(&key, &row.value)?;
+                Ok((WorkerId::new(&key[CORDON.len()..]), cordon))
+            })
+            .collect()
+    }
+
+    /// An operator placed `worker` as `cordon`, or returned it to placement (`None`).
+    pub(super) fn cordoned(
+        &self,
+        worker: &WorkerId,
+        cordon: Option<StoredCordon>,
+    ) -> Result<(), StateError> {
+        let key = cordon_key(worker);
+        let txn = match cordon {
+            Some(cordon) => Txn::new().put(key, cordon.to_row(), Cond::Any),
+            None => Txn::new().delete(key, Cond::Any),
+        };
+        self.commit(txn)
+    }
+
+    /// Where `operation` stands.
+    pub(super) fn progress(&self, operation: OperationId) -> Result<Progress, StateError> {
+        if let Some(finished) = self.ended(operation)? {
+            return Ok(Progress::Ended(finished));
+        }
+        let unfinished = self.store.get(&op_key(operation))?.is_some();
+        let queued = self.store.get(&queue_key(operation))?.is_some();
+        Ok(match (unfinished, queued) {
+            (false, _) => Progress::Gone,
+            (true, true) => Progress::Queued,
+            (true, false) => Progress::Running,
         })
     }
 
@@ -420,6 +547,51 @@ impl Durable {
         self.commit(renewed)
     }
 
+    /// The writer generation the store holds, if it has one (a store opened by
+    /// [`crate::StateStoreUri::open`] always does).
+    fn generation(&self) -> Result<Option<u64>, StateError> {
+        let row = self.store.get(GENERATION)?;
+        row.map(|row| number(GENERATION, &row)).transpose()
+    }
+
+    /// How `operation` ended, kept for `retention` (never less than [`DONE_FLOOR`]).
+    pub(super) fn done(
+        &self,
+        operation: OperationId,
+        finished: &Finished,
+        retention: Duration,
+    ) -> Result<(), StateError> {
+        let ttl = retention.max(DONE_FLOOR);
+        self.commit(Txn::new().put_ttl(done_key(operation), finished.to_row(), ttl, Cond::Any))
+    }
+
+    /// How `operation` ended, if its `done/` row is still there.
+    fn ended(&self, operation: OperationId) -> Result<Option<Finished>, StateError> {
+        let key = done_key(operation);
+        let Some(row) = self.store.get(&key)? else {
+            return Ok(None);
+        };
+        Finished::from_row(&row.value)
+            .map(Some)
+            .map_err(|why| corrupt(&key, &why))
+    }
+
+    /// Records what a refused write says about the store. Only a store that cannot be
+    /// reached is an outage; a write that lost a compare-and-set, or found its row gone,
+    /// is the store working; a write the store fenced means another writer holds a newer
+    /// generation, which no return of the store undoes. Not generic, unlike
+    /// [`State::durably`], so every caller's runs count toward the same function.
+    fn note_failure(&self, error: &StateError) {
+        if let StateError::Store(cause) = error {
+            let flag = if matches!(cause, StoreError::Fenced) {
+                &self.fenced
+            } else {
+                &self.unreachable
+            };
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+
     /// A write that tells whether the store takes writes again.
     pub(super) fn ping(&self) -> Result<(), StateError> {
         self.commit(Txn::new().put(ALIVE, Vec::new(), Cond::Any))
@@ -449,6 +621,23 @@ impl Farm {
     }
 }
 
+impl Farm {
+    /// How `operation` ended, as the state store keeps it: `None` if the farm has no
+    /// state store, or the operation has no `done/` row (it has not finished, or its row
+    /// outlived the finished retention and the floor). The row is the answer a process
+    /// that did not finish the operation gives the callers it kept waiting.
+    ///
+    /// # Errors
+    /// The store cannot be read, or the row is not a result.
+    pub fn ended(&self, operation: OperationId) -> Result<Option<Finished>, StateError> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state
+            .durable
+            .as_ref()
+            .map_or(Ok(None), |d| d.ended(operation))
+    }
+}
+
 impl State {
     /// Runs `write` on the state store, if the farm has one. Whether it took: a
     /// refusal is logged here, and the caller does not acknowledge what depends on it.
@@ -464,11 +653,7 @@ impl State {
             Ok(()) => true,
             Err(error) => {
                 tracing::error!(%error, "the state store did not take {what}");
-                // Only a store that cannot be reached is an outage: a write that lost a
-                // compare-and-set, or found its row gone, is the store working.
-                if matches!(error, StateError::Store(_)) {
-                    durable.unreachable.store(true, Ordering::SeqCst);
-                }
+                durable.note_failure(&error);
                 false
             }
         }
@@ -483,6 +668,16 @@ impl State {
         let Some(durable) = &self.durable else {
             return;
         };
+        if durable.fenced.load(Ordering::SeqCst) {
+            // Superseded: the store is reachable but this scheduler may not write it, so
+            // it stays unavailable (no grant, no lease given up) and never pings back.
+            if !self.store_down {
+                tracing::error!("the state store has a newer writer: this scheduler takes no work");
+                self.store_down = true;
+                self.sched.store_unavailable();
+            }
+            return;
+        }
         if durable.unreachable.load(Ordering::SeqCst) && !self.store_down {
             tracing::warn!("the state store is unavailable: no lease is given up or granted");
             self.store_down = true;
@@ -523,7 +718,8 @@ impl State {
     /// Renews `worker`'s session row if its last write is a renewal interval old: one
     /// write per daemon session, never one per lease. Called for a heartbeat taken.
     pub(super) fn renew_session(&mut self, now: FarmTime, worker: &WorkerId) {
-        if self.durable.is_none() {
+        // A fenced farm writes nothing: the successor's rows are the truth.
+        if self.durable.is_none() || self.fenced {
             return;
         }
         let due = self
@@ -545,7 +741,10 @@ impl State {
         };
         let (durable, epoch) = Durable::open(store, epoch, process_term())?;
         let stored = durable.load()?;
-        self.machine = FarmMachine::new(epoch);
+        // Operation names carry the writer generation, not the epoch: a kept epoch must
+        // not let a process name an operation another one named (issue #154). A store
+        // handed in without a fence has no generation, and the epoch names as it did.
+        self.machine = FarmMachine::new(durable.generation()?.unwrap_or(epoch));
         let now = SystemTime::now();
         let mut recovered = Vec::new();
         for op in stored.operations {
@@ -577,6 +776,7 @@ impl State {
         let next_operation = OperationId(stored.next_operation);
         self.sched
             .recover(epoch, next_operation, stored.next_seq, recovered);
+        self.restore_cordons(stored.cordons);
         self.durable = Some(durable);
         Ok(Some(epoch))
     }
@@ -588,10 +788,19 @@ impl State {
     /// # Errors
     /// UNAVAILABLE if the store did not take it: the request is not queued, and the
     /// client, who is told nothing is queued, asks again.
-    pub(super) fn admit(&self, request: &Request) -> Result<(), Status> {
+    pub(super) fn queue(&self, request: &Request) -> Result<(), Status> {
         let id = self.sched.next_operation();
         let joins = self.sched.twin(request).is_some();
         if !joins && !self.durably("a submission", |d| d.submitted(id, request)) {
+            if self
+                .durable
+                .as_ref()
+                .is_some_and(|d| d.fenced.load(Ordering::SeqCst))
+            {
+                return Err(Status::failed_precondition(
+                    "this scheduler was superseded by a newer writer of the state store",
+                ));
+            }
             return Err(Status::unavailable(
                 "the scheduler's state store did not take the request",
             ));

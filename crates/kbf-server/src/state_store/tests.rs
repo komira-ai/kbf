@@ -81,6 +81,91 @@ fn a_sqlite_value_opens_its_file_and_holds_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Catches: a store opened without the writer fence (a handle left over from an earlier
+/// writer could still write after its successor started): every open takes the next
+/// generation of the file, and once another writer takes the one after it, every write
+/// through the first handle fails.
+#[test]
+fn every_open_takes_the_next_writer_generation_and_fences_the_one_before() {
+    use kbf_state::{Cond, Fenced, GENERATION, StoreError, Txn};
+    let dir = scratch("generation");
+    let uri = StateStoreUri::Sqlite(dir.join("state.db"));
+    let generation = |state: &StateStore| {
+        let row = state.store.get(GENERATION).expect("read").expect("a row");
+        u64::from_be_bytes(row.value.try_into().expect("8 bytes"))
+    };
+    let first = uri.open().expect("opened");
+    assert_eq!(generation(&first), 1);
+    drop(first);
+    let second = uri.open().expect("opened again");
+    assert_eq!(generation(&second), 2);
+    let write = || Txn::new().put("k", "v", Cond::Any);
+    second
+        .store
+        .txn(write())
+        .expect("the holder writes")
+        .expect("commits");
+    Fenced::take(Arc::clone(&second.store), Some(2)).expect("a successor");
+    assert_eq!(second.store.txn(write()).unwrap_err(), StoreError::Fenced);
+    drop(second);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Catches: a successor that takes a store it was not told about, and one that does not
+/// keep the epoch: opened after a handover it takes only the generation it expects (a
+/// restored or swapped file, or a file another writer has taken since, is refused and
+/// nothing is written), and it keeps the epoch of the store (so the daemons that
+/// reconnect keep the runs of their leases), where an open of any other kind bumps it.
+/// The path it names is the file.
+#[test]
+fn a_store_opened_after_a_handover_expects_its_generation_and_keeps_the_epoch() {
+    use kbf_state::GENERATION;
+    let dir = scratch("handover");
+    let uri = StateStoreUri::Sqlite(dir.join("state.db"));
+    assert_eq!(uri.path(), dir.join("state.db"));
+    let holder = uri.open().expect("opened");
+    assert_eq!(holder.epoch, EpochPolicy::Bump);
+    drop(holder);
+
+    let generation = |state: &StateStore| {
+        let row = state.store.get(GENERATION).expect("read").expect("a row");
+        u64::from_be_bytes(row.value.try_into().expect("8 bytes"))
+    };
+    let refused = uri
+        .open_after_handover(7)
+        .err()
+        .expect("not the generation");
+    assert!(
+        matches!(&refused, StateError::Open(why) if why.contains("generation 1, not the expected 7")),
+        "{refused:?}"
+    );
+    let successor = uri
+        .open_after_handover(1)
+        .expect("the generation it was told");
+    assert_eq!(successor.epoch, EpochPolicy::Keep);
+    assert_eq!(generation(&successor), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Catches: a scheduler that opened a store with a generation row it cannot read taking
+/// the file anyway.
+#[test]
+fn a_generation_row_that_is_not_a_number_refuses_the_open() {
+    use kbf_state::{Cond, GENERATION, Txn};
+    let dir = scratch("generation-corrupt");
+    let file = dir.join("state.db");
+    let uri = StateStoreUri::Sqlite(file);
+    let store = uri.open().expect("opened");
+    let junk = Txn::new().put(GENERATION, "junk", Cond::Any);
+    // The holder's own write goes through its fence; the row is then not a number.
+    store.store.txn(junk).expect("store").expect("put");
+    drop(store);
+    let refused = uri.open().err().expect("junk");
+    assert!(matches!(refused, StateError::Open(_)), "{refused:?}");
+    assert!(refused.to_string().contains("generation"), "{refused}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Catches: the scheduler's state (every operation's request, every lease) readable by
 /// other users of the machine: the directory the open makes is 0700, and the state file,
 /// its lock and the journal files SQLite makes beside it are 0600, whatever the umask
