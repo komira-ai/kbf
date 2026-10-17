@@ -99,6 +99,10 @@ async fn dropping_a_running_writer_aborts_it_and_nothing_stops_at_once() {
 /// Catches: a writer id that is not the start's time (two starts would share one, and
 /// their objects would collide on a key), and a step cadence that is not the one the index's transaction budget assumes.
 #[test]
+#[expect(
+    clippy::clone_on_copy,
+    reason = "the derived clone is the code the coverage ratchet counts, and is called here"
+)]
 fn a_start_is_named_by_its_time_and_steps_twice_a_second() {
     let a = Options::default();
     // Options are copied and shown as what they are.
