@@ -138,6 +138,7 @@ fn farm(s: &Server, debts: &[Debts]) {
                 joined.boot,
                 Progress::CaughtUp,
                 Reported::debts(*debts),
+                None,
             )
             .expect("beats");
     }
@@ -194,6 +195,7 @@ async fn the_api_answers_the_number_or_null_and_why() {
             1,
             Progress::CaughtUp,
             Reported::debts(Debts::Known(0)),
+            None,
         )
         .expect("beats");
     let (_, zero) = storage(&s).await;

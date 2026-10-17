@@ -192,10 +192,11 @@ When a member becomes `active` the cluster also records that it has formed (see 
 in the same transaction.
 
 **A planned restart.** `planned_down` takes an `active` member out of the write path at
-once, for a restart an operator is about to make; any other state answers `409`. Today a
-write goes to the first owner that is not `down`, and a member is `down` only 30 s (a
-TTL) after its last heartbeat, while a client retries an upload for about a second and a
-half: without this, an upload whose primary is the restarting node fails. After it, the
+once, for a restart an operator is about to make; any other state answers `409`. A member
+is `down` in the map only a TTL (15 s by default) after its last heartbeat. Until then a write whose
+primary is the stopped node dials it first and then moves on to the next owner, which costs
+a connection attempt per write, and an action-cache commit does not move on at all and is
+refused `UNAVAILABLE`, which a client retries for about a second and a half. After this call the
 map (one new generation, in the answer) has the member `down`, so every router, chain
 primary and repair worker that holds the map sends writes to the other owner and reads
 the member's blobs from it, and a node or daemon that holds an older map reads it like
