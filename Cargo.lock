@@ -1974,6 +1974,7 @@ dependencies = [
  "kbf-auth",
  "kbf-caps",
  "kbf-front",
+ "kbf-history",
  "kbf-invocation",
  "kbf-log",
  "kbf-map",

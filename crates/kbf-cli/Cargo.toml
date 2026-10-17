@@ -24,6 +24,13 @@ name = "kbf-cli-fake-podman"
 path = "../kbf-driver-container/tests/bin/fake_podman.rs"
 test = false
 
+# The stand-in `systemctl` for tests/frontend_handover.rs: `kbf frontend handover` run
+# against it, in Rust like the stand-in `podman` (no shell in test code). Not shipped.
+[[bin]]
+name = "kbf-cli-fake-systemctl"
+path = "tests/bin/fake_systemctl.rs"
+test = false
+
 [dependencies]
 clap.workspace = true
 kbf-all-in-one.workspace = true
