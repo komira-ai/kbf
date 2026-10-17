@@ -1,3 +1,5 @@
+//! Unit tests of the flags (`super`).
+
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 

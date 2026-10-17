@@ -113,7 +113,7 @@ pub use farm::{EpochPolicy, Farm, SESSION_RENEWAL, StateError};
 pub use health::Readiness;
 pub use identity::{DenyList, DenyListError, Peers};
 pub use kbf_sched::MemoryLadder;
-pub use local::{LocalStore, LocalStream, LocalStreamed};
+pub use local::LocalStore;
 pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use serve::{
     Api, Bound, BoundStorage, Listeners, NO_MAP_YET, ServeError, StorageListener, StreamTiming,

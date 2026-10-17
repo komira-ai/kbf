@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::guard::{
-    filesystem_type, lock_failed, lock_path, network_filesystem, refuse_network_filesystem,
+    canonical_db, filesystem_type, held, lock_failed, lock_path, network_filesystem,
+    refuse_network_filesystem,
 };
 use super::read::changes_after_head;
 use super::restore::ignore_not_found;
@@ -138,6 +139,75 @@ fn a_lock_call_that_failed_is_not_a_held_lock() {
         "the text names the lock file: {failed}"
     );
 }
+// Catches a lock probe that takes a refused lock for a free one (a restore would plan to
+// run under a live store), or a failed lock call for either answer.
+#[test]
+fn a_probe_tells_a_held_lock_from_a_free_one_and_a_failure() {
+    let db = Path::new("/x/state.db");
+    assert!(!held(db, lock_path(db), Ok(())).expect("free"));
+    assert!(held(db, lock_path(db), Err(fs::TryLockError::WouldBlock)).expect("held"));
+    let failed = held(
+        db,
+        lock_path(db),
+        Err(fs::TryLockError::Error(io::Error::from(
+            io::ErrorKind::PermissionDenied,
+        ))),
+    )
+    .expect_err("failed");
+    assert!(matches!(failed, SqliteError::Io(_)), "got {failed}");
+}
+
+// Catches a file's one name that is not its resolved path: a name without a file name
+// in it resolved as a file, a bare name not put in the working directory, a plain file
+// not left as it is, a link loop followed forever or taken for a file, and a
+// path through a file taken for a name nobody holds.
+#[test]
+fn a_files_one_name_resolves_links_and_refuses_what_it_cannot_resolve() {
+    assert_eq!(
+        canonical_db(Path::new("/")).expect("the root"),
+        Path::new("/")
+    );
+    let here = std::env::current_dir()
+        .expect("cwd")
+        .canonicalize()
+        .expect("resolve");
+    assert_eq!(
+        canonical_db(Path::new("kbf-state-unit-no-such.db")).expect("a bare name"),
+        here.join("kbf-state-unit-no-such.db"),
+        "a bare name is in the working directory"
+    );
+    let dir = unit_dir("canonical").canonicalize().expect("resolve");
+    std::os::unix::fs::symlink("b.db", dir.join("a.db")).expect("link");
+    std::os::unix::fs::symlink("a.db", dir.join("b.db")).expect("link");
+    let looped = canonical_db(&dir.join("a.db")).expect_err("a loop");
+    assert!(
+        looped
+            .to_string()
+            .contains("symbolic links follow one another"),
+        "got {looped}"
+    );
+    let file = dir.join("a-file");
+    fs::write(&file, b"").expect("write");
+    assert_eq!(
+        canonical_db(&file).expect("a file"),
+        file,
+        "a file is its own name"
+    );
+    let under = canonical_db(&file.join("state.db")).expect_err("not a directory");
+    assert_eq!(under.kind(), io::ErrorKind::NotADirectory, "got {under}");
+    assert_eq!(
+        canonical_db(&dir.join("./x/../new.db"))
+            .expect_err("no x")
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+    fs::create_dir_all(dir.join("x")).expect("x");
+    assert_eq!(
+        canonical_db(&dir.join("./x/../new.db")).expect("resolved"),
+        dir.join("new.db")
+    );
+}
+
 // Catches a probe that fails on a real directory, which would refuse every start.
 #[test]
 fn the_real_probe_reads_the_filesystem_of_a_directory() {

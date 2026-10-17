@@ -88,8 +88,8 @@ fn listeners(worker_tls: Option<WorkerTls>) -> Listeners {
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
-        timing: kbf_server::StreamTiming::default(),
-        streams: kbf_server::StreamLimits::DEFAULT,
+        streams: kbf_server::StreamTiming::default(),
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     }
 }
 

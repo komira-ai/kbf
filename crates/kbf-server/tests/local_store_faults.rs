@@ -75,11 +75,7 @@ impl Storage for Faulty {
         _bytes: futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
         _claim: futures::future::BoxFuture<'static, Option<Digest>>,
     ) -> Answer<'_, Option<Digest>> {
-        Box::pin(async {
-            Err(StorageError::Invalid(
-                "this store takes no streamed put".to_owned(),
-            ))
-        })
+        self.fail()
     }
 
     fn segments(&self) -> Arc<dyn Segments> {

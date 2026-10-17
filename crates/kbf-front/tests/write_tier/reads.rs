@@ -94,6 +94,36 @@ async fn a_damaged_flushed_copy_of_one_window_is_read_from_the_store() {
     assert_eq!(farm.log.unreachable(at.object), None);
 }
 
+/// Catches a whole-blob read that loses, repeats or reorders windows when it joins them:
+/// a blob of one and a half windows (the first window is not the whole, so the rest is
+/// appended) comes back byte for byte, as does a blob of exactly one window (handed over
+/// as it is); the empty blob comes back empty.
+#[tokio::test]
+async fn a_whole_blob_read_joins_its_windows() {
+    let farm = Farm::new(Capabilities::default());
+    let cache = farm.start(GIB).await;
+    let window = usize::try_from(READ_WINDOW_BYTES).expect("window");
+    let one = TestBlob::new(43, window);
+    let more = TestBlob::new(44, window + window / 2);
+    let empty = TestBlob::new(45, 0);
+    cache
+        .store_blobs(vec![one.verified(), more.verified(), empty.verified()])
+        .await
+        .expect("stored");
+    assert!(
+        cache
+            .read_blob(&empty.digest)
+            .await
+            .expect("empty")
+            .is_empty()
+    );
+    assert_eq!(cache.read_blob(&one.digest).await.expect("one"), one.bytes);
+    assert_eq!(
+        cache.read_blob(&more.digest).await.expect("more"),
+        more.bytes
+    );
+}
+
 /// Catches a read whose store cannot be reached answered as a missing or corrupt
 /// object (a mark that would make the blob be uploaded again): with no local copy and
 /// the store's GET failing, the read fails UNAVAILABLE with the store's error and the

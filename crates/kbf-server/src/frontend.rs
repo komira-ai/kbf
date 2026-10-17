@@ -99,6 +99,8 @@ pub const ALLOWED: &[&str] = &[
     "progress_interval_secs",
     "http2_keepalive_interval_secs",
     "http2_keepalive_timeout_secs",
+    "reapi_max_streams",
+    "worker_max_streams",
     "unservable_wait_secs",
     "memory_ladder_gib",
     "finished_retention_secs",
@@ -415,8 +417,8 @@ fn bind_frontend(
     .merge(metrics_route(backend.clone()));
 
     let mut reapi_server = keepalive(
-        flow_control(Server::builder(), listeners.streams.reapi),
-        listeners.timing,
+        flow_control(Server::builder(), listeners.stream_limits.reapi),
+        listeners.streams,
     );
     if let Some(tls) = listeners.reapi_tls {
         reapi_server = reapi_server.tls_config(tls)?;
@@ -424,8 +426,8 @@ fn bind_frontend(
     let peers_certified = listeners.worker_tls.is_some();
     let (mut worker_server, peers) = worker_peers(
         keepalive(
-            flow_control(Server::builder(), listeners.streams.worker),
-            listeners.timing,
+            flow_control(Server::builder(), listeners.stream_limits.worker),
+            listeners.streams,
         ),
         listeners.worker_tls,
     )?;
@@ -442,7 +444,7 @@ fn bind_frontend(
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
 
     let membership = membership(members.clone(), peers_certified);
-    let (ticker, progress) = kbf_front::progress(listeners.timing.progress_interval);
+    let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
     let proxy = Proxy::new(
         Owners::single(Owner::new(&flags.storage.uri().to_string(), channel)),

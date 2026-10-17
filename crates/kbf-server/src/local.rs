@@ -4,8 +4,9 @@
 //!
 //! Each call is one the worker listener serves a remote daemon, on the same [`Cache`]:
 //! FindMissing ([`LocalStore::find_missing`]), a whole-blob read of a blob the daemon
-//! decodes ([`LocalStore::read_blob`]) and a streamed one of any blob
-//! ([`LocalStore::read_stream`]), a whole-blob write hashed here once, under the same
+//! decodes ([`LocalStore::read_blob`]) and a read of any blob in windows
+//! ([`LocalStore::read_stream`], ByteStream Read's path), a whole-blob write hashed here
+//! once, under the same
 //! admission as a ByteStream `Write` ([`LocalStore::put`]), and the `Segments` service
 //! itself ([`LocalStore::segments`]), whose `Begin`, `PutRange` and `Commit` are the
 //! handlers a remote upload runs: with a write tier the daemon's digests are trusted at
@@ -14,13 +15,13 @@
 //! skips a check the listener's path makes.
 //!
 //! Two calls have no remote counterpart. A record streamed as its bytes are read
-//! ([`LocalStore::stream`], over `kbf_front::RecordStream`), so a large output is never
-//! held in memory on its way into the cache: onto the write tier when it has room (its
-//! digest trusted at the commit as a segment upload's is with a tier, and checked by
-//! the flusher), else straight to the object store (hashed as it passes and checked
-//! against the digest claimed at the commit before the store completes it). And a blob
-//! of known digest streamed to the object store ([`LocalStore::put_streamed`]), as a
-//! ByteStream `Write` of a large blob with no room on a tier is.
+//! ([`LocalStore::stream`]), so a large output is never held in memory on its way into
+//! the cache: onto the write tier when it has room (its digest trusted at the commit as
+//! a segment upload's is with a tier, and checked by the flusher), else straight to the
+//! object store (hashed as it passes and checked against the digest claimed at the
+//! commit before the store completes it). And a blob of known digest streamed to the
+//! object store ([`LocalStore::put_streamed`]), as a ByteStream `Write` of a large blob
+//! with no room on a tier is.
 //!
 //! Every call goes through the storage boundary, an `Arc<dyn kbf_storage::Storage>`
 //! ([`LocalStore::over`]); [`LocalStore::new`] puts the cache behind it with
@@ -37,7 +38,7 @@ use futures::stream::BoxStream;
 use kbf_front::{Cache, CacheStorage, MetaLog, SegmentsConfig};
 use kbf_objstore::ObjectStore;
 use kbf_proto::worker::segments_server::Segments;
-use kbf_storage::{PutStream, ReadStream, Storage, StorageError, StreamedPut};
+use kbf_storage::{PutStream, ReadStream, Storage, StorageError};
 use kbf_types::Digest;
 
 /// The server's cache, as calls a daemon in the same process makes, through the
@@ -45,44 +46,6 @@ use kbf_types::Digest;
 #[derive(Clone)]
 pub struct LocalStore {
     inner: Arc<dyn Storage>,
-}
-
-/// One record being streamed onto the server's write tier, or to its object store
-/// ([`LocalStore::stream`]). Dropped before it is committed, nothing is stored.
-pub struct LocalStream(Box<dyn PutStream>);
-
-impl LocalStream {
-    /// Writes `chunk` after the bytes written so far. Blocking: call it off the async
-    /// runtime.
-    ///
-    /// # Errors
-    /// More bytes than the stream was made for, or the write tier failed.
-    pub fn append(&mut self, chunk: &[u8]) -> Result<(), StorageError> {
-        self.0.append(chunk)
-    }
-
-    /// Ends the stream as the blob `digest` with CRC-32C `crc32c`.
-    ///
-    /// # Errors
-    /// The bytes written are not as many as `digest` names, or their CRC-32C is not
-    /// `crc32c`: nothing is stored.
-    pub fn finish(self, digest: Digest, crc32c: u32) -> Result<LocalStreamed, StorageError> {
-        self.0.finish(digest, crc32c).map(LocalStreamed)
-    }
-}
-
-/// A record whose bytes are all written (on the write tier, or on their way to the
-/// store), checked, not yet committed.
-pub struct LocalStreamed(Box<dyn StreamedPut>);
-
-impl LocalStreamed {
-    /// Syncs the record and commits it: present once this answers.
-    ///
-    /// # Errors
-    /// The write tier's sync or the metadata log's commit failed.
-    pub async fn commit(self) -> Result<(), StorageError> {
-        self.0.commit().await
-    }
 }
 
 impl LocalStore {
@@ -120,9 +83,9 @@ impl LocalStore {
         self.inner.read_blob(digest).await.map(Vec::from)
     }
 
-    /// The blob's bytes as a stream of chunks, checked as [`Storage::read_range`]
-    /// says: a stream that ends cleanly delivered only bytes of a blob that hashed to
-    /// its digest.
+    /// The blob's bytes as a stream of chunks, a window of the blob in memory at a time
+    /// whatever its size, checked as [`Storage::read_range`] says: a stream that ends
+    /// cleanly delivered only bytes of a blob that hashed to its digest.
     ///
     /// # Errors
     /// [`StorageError::NotFound`] if the blob is not held, or why it cannot be read.
@@ -143,12 +106,12 @@ impl LocalStore {
 
     /// A stream for one blob of `size` bytes, its bytes written as they are appended
     /// and never held whole: onto the write tier, in a block of its own, when it has
-    /// room for it; else straight to the object store (`kbf_front::Cache::stream`).
-    /// `None` only for a size of 0, or a cache made outside a runtime. Blocking: call
-    /// it off the async runtime.
+    /// room for it; else straight to the object store ([`Storage::stream`]). `None`
+    /// only for a size of 0, or a cache made outside a runtime. Blocking: call it off
+    /// the async runtime.
     #[must_use]
-    pub fn stream(&self, size: u64) -> Option<LocalStream> {
-        self.inner.stream(size).map(LocalStream)
+    pub fn stream(&self, size: u64) -> Option<Box<dyn PutStream>> {
+        self.inner.stream(size)
     }
 
     /// Stores a blob of `size` bytes straight to the object store as `bytes` come (a
@@ -157,8 +120,7 @@ impl LocalStore {
     /// tier is missing or has no room for it. `claim` names the blob's digest once its
     /// bytes ended (the bytes must hash to it, or nothing is stored), or `None` to
     /// withdraw it: the upload is aborted and this answers `None`. Answers the digest
-    /// once the blob is present. Admitted as a ByteStream `Write` streamed to the store
-    /// is.
+    /// once the blob is present.
     ///
     /// # Errors
     /// [`StorageError::DigestMismatch`] if the bytes do not hash to the claimed digest;
