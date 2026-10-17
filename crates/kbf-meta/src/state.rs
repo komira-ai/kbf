@@ -13,6 +13,7 @@ use crate::model::{
 use crate::tier::{ServerId, StagedObject, StagedPut, TierError, TierId};
 
 mod evict;
+mod lost;
 mod staged;
 
 /// One committed change to the metadata state.
@@ -252,6 +253,13 @@ pub struct MetaState {
     unreachable: BTreeMap<ObjectId, LossMark>,
     /// How many times an object went from reachable to marked unreachable.
     losses: u64,
+    /// Objects marked unreachable while they were staged, each with how many index
+    /// entries are at it: those blobs' only copy was the object's block on a write
+    /// tier, so they are lost ([`MetaState::lost_blobs`]). An object leaves when its
+    /// last entry does, or when its mark is cleared.
+    lost: BTreeMap<ObjectId, u64>,
+    /// How many blobs were ever marked lost ([`MetaState::blob_losses`]).
+    blob_losses: u64,
     next_epoch: u64,
     /// Each server's current tier.
     tiers: BTreeMap<ServerId, TierId>,
@@ -276,6 +284,8 @@ impl MetaState {
             actions: BTreeMap::new(),
             unreachable: BTreeMap::new(),
             losses: 0,
+            lost: BTreeMap::new(),
+            blob_losses: 0,
             next_epoch: 1,
             tiers: BTreeMap::new(),
             retired_tiers: BTreeSet::new(),
@@ -378,6 +388,7 @@ impl MetaState {
                         .or_insert(LossMark { reason, generation });
                     mark.reason = mark.reason.max(reason);
                     mark.generation = generation;
+                    self.mark_lost(object);
                     self.unstage(object);
                 }))
             }
@@ -389,6 +400,7 @@ impl MetaState {
                         .is_some_and(|mark| mark.generation == generation)
                     {
                         self.unreachable.remove(&object);
+                        self.lost.remove(&object);
                     }
                 }))
             }
@@ -549,6 +561,7 @@ impl MetaState {
             BlobAnswer::Unavailable => {
                 let replaced = entry.location;
                 entry.location = location;
+                self.entry_left(replaced.object);
                 BlobWrite::Healed { replaced }
             }
         }
@@ -611,6 +624,7 @@ impl MetaState {
             .collect();
         for digest in dead {
             if let Some(entry) = self.blobs.remove(&digest) {
+                self.entry_left(entry.location.object);
                 collected.blobs.push((digest, entry.location));
             }
         }

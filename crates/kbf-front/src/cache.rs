@@ -701,6 +701,7 @@ mod consistency;
 mod direct;
 mod evict;
 mod flush;
+mod losses;
 mod read;
 mod stream;
 mod stream_store;
@@ -718,6 +719,7 @@ pub use evict::{EVICT_EVERY, EVICT_GRACE, EvictRound};
 pub use flush::{
     FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound,
 };
+pub use losses::Losses;
 pub use read::{BlobRead, MAX_DECODED_BLOB_BYTES, READ_WINDOW_BYTES};
 pub(crate) use stream::TierRange;
 pub use stream::{RecordStream, StreamedRecord};

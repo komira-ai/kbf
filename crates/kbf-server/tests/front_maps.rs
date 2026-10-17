@@ -21,7 +21,6 @@ fn config() -> MembershipConfig {
         ttl: Duration::from_secs(30),
         dwell: Duration::from_secs(120),
         replication: 2,
-        bootstrap: Duration::ZERO,
     }
 }
 
@@ -100,4 +99,11 @@ async fn a_refetch_reads_the_state_store() {
     let error = maps.refetch(2).await.expect_err("the store fails");
     assert_eq!(error.at_least, 2);
     assert!(!error.reason.contains("no map that new"), "{error}");
+
+    // A read that dies (a store call that panics) is a failed fetch, not a panic in the
+    // router's call.
+    s.after_get("", || panic!("the store's read died"));
+    let error = maps.refetch(2).await.expect_err("the read dies");
+    assert_eq!(error.at_least, 2);
+    assert!(error.reason.contains("did not finish"), "{error}");
 }

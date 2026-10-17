@@ -11,19 +11,20 @@
 //! | `down/<id>` | nothing | `dwell` from the moment the member went `Down` |
 //! | `map` | the current `kbf.map.v1.Map` | for ever; a change is one compare-and-set |
 //! | `meta/members_formed` | nothing | for ever: the cluster has had an `Active` member |
-//! | `meta/members_forming` | nothing | `bootstrap` from the first registration of a fresh cluster |
 //!
 //! and the counters `member-id` and `boot/<id>`. The store assigns both numbers, so no
 //! node picks its identity; `(id, boot)` is the prefix of the node's object keys.
 //!
-//! **Life of a member.** `register` writes `member/<id>` as `Joining`. A heartbeat
+//! **Life of a member.** `register` writes `member/<id>` as `Active` when the node says
+//! its index is whole ([`Progress::CaughtUp`]: a first start of a cluster, or a restart whose
+//! meta log already has its rebuild) and as `CatchingUp` when it is rebuilding. A heartbeat
 //! rewrites the row to restart its time to live. When the store's clock expires the row
 //! (never a frontend's), the next [`Members::refresh`] marks the member `Down` in the map
 //! and writes `down/<id>` with the dwell as its time to live in the same transaction;
 //! when that expires too, the next refresh drops the member from the map. A member that
-//! registers again meanwhile is `Joining` again (its boot counter is larger, so it
-//! rebuilds as section 8 says) and its `down/<id>` mark is deleted. The last member never
-//! leaves: a map needs one member, so it stays `Down` in the map.
+//! registers again meanwhile (a restart: same id, larger boot counter) is `Active` again
+//! if its index is whole, `CatchingUp` if not, and its `down/<id>` mark is deleted. The
+//! last member never leaves: a map needs one member, so it stays `Down` in the map.
 //!
 //! **The map** is a function of the rows: [`Members::refresh`] reads `map`, `member/` and
 //! the `down/` marks, builds the next member list, and if it differs commits generation
@@ -32,25 +33,16 @@
 //! reads. A conflict is read again; two frontends racing give one winner and one retry.
 //! Anyone may call it; the frontend does so after every change and on a timer.
 //!
-//! **Bootstrap.** A fresh cluster (no `meta/members_formed`) has nobody to hand a slice
-//! to a joiner, and `Joining` is never rank 1, so it would never get an `Active` member.
-//! Until the cluster has formed, a registration that is not catching up is written
-//! `Active`; the first one also writes `meta/members_formed` and opens the window
-//! `meta/members_forming`, in one transaction, so a node registering within the window
-//! (a whole fleet starting together) is `Active` too. Once the window has lapsed, or in
-//! any cluster that has formed, a registration is `Joining` as below. Every row read
-//! for the decision is checked in the registration's transaction, so two frontends
-//! racing decide from the same facts. `bootstrap` zero turns it off.
-//!
-//! **Promotion** from `Joining` through `CatchingUp` to `Active` is [`Members::set_state`],
-//! the hook the catch-up copy calls. A node's own request promotes it in one case only: a
-//! node that registers saying it is rebuilding its index ([`Progress::CatchingUp`]) enters
-//! as `CatchingUp` instead of `Joining`, and its first heartbeat saying the rebuild is done
-//! ([`Progress::CaughtUp`]) makes it `Active`, in the same compare-and-set as the beat, so
-//! a state set meanwhile (`Draining`) is never overwritten. Whatever makes a member
-//! `Active` also writes `meta/members_formed` in the same transaction. A heartbeat changes no other
-//! state: a `Joining` member waits for the join handoff, and a member that is `Draining`,
-//! `Active` or `Down` stays so whatever it reports.
+//! **Promotion.** A node's own request moves it in two ways only. A registration saying the
+//! index is whole ([`Progress::CaughtUp`]) writes `Active`, so a rolling restart leaves
+//! every member `Active`; a registration saying it is rebuilding ([`Progress::CatchingUp`])
+//! writes `CatchingUp`, and its first heartbeat saying the rebuild is done makes it `Active`,
+//! in the same compare-and-set as the beat, so a state set meanwhile (`Draining`) is never
+//! overwritten. Whatever makes a member `Active` also writes `meta/members_formed` in the
+//! same transaction. `Joining` is set by hand ([`Members::set_state`], the hook the join
+//! handoff and the operator call); a heartbeat changes no other state: a `Joining` member
+//! waits for the handoff, and a member that is `Draining`, `Active` or `Down` stays so
+//! whatever it reports.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -66,12 +58,9 @@ use tokio::sync::watch;
 const MAP_KEY: &str = "map";
 const MEMBERS: &str = "member/";
 const ID_COUNTER: &str = "member-id";
-/// Written with the cluster's first `Active` member and never deleted: the cluster has
-/// formed, so no registration is promoted on arrival any more.
+/// Written with every `Active` member and never deleted: the cluster has had an
+/// `Active` member.
 const FORMED: &str = "meta/members_formed";
-/// Lives [`MembershipConfig::bootstrap`] from the first registration: while it lives,
-/// registrations are still the cluster's first and are promoted on arrival.
-const FORMING: &str = "meta/members_forming";
 /// Reads and commits tried before a call gives up on writers it keeps racing.
 const ATTEMPTS: usize = 16;
 
@@ -88,9 +77,6 @@ pub struct MembershipConfig {
     pub dwell: Duration,
     /// The replication factor of the map (clamped to the member count).
     pub replication: u8,
-    /// How long after a fresh cluster's first registration the registrations that are
-    /// not catching up enter `Active` at once; zero turns the bootstrap off.
-    pub bootstrap: Duration,
 }
 
 impl Default for MembershipConfig {
@@ -99,7 +85,6 @@ impl Default for MembershipConfig {
             ttl: Duration::from_secs(15),
             dwell: Duration::from_secs(300),
             replication: 2,
-            bootstrap: Duration::from_secs(60),
         }
     }
 }
@@ -417,9 +402,8 @@ impl Members {
     }
 
     /// Registers a storage node: assigns its id (the same for the same instance) and a
-    /// larger boot counter, writes its row as `Joining` (`CatchingUp` if it is rebuilding
-    /// its index; `Active` while the cluster is bootstrapping, see the module docs), and
-    /// rebuilds the map.
+    /// larger boot counter, writes its row as `Active` (`CatchingUp` if it is rebuilding
+    /// its index, see the module docs), and rebuilds the map.
     ///
     /// # Errors
     /// [`MembershipError::Invalid`] or [`MembershipError::Protocol`] for a bad request;
@@ -445,7 +429,7 @@ impl Members {
             weight: who.weight,
             state: match who.progress {
                 Progress::CatchingUp => MemberState::CatchingUp,
-                Progress::CaughtUp => MemberState::Joining,
+                Progress::CaughtUp => MemberState::Active,
             },
         };
         self.write_row(&member, boot)?;
@@ -479,8 +463,8 @@ impl Members {
     }
 
     /// Stores `member`'s row with a whole time to live, unless a newer boot is there, and
-    /// clears its `down/` mark. A `Joining` member of a cluster still bootstrapping is
-    /// stored `Active`, with the marks of [`Members`]'s module docs in the same transaction.
+    /// clears its `down/` mark. An `Active` row also writes `meta/members_formed`, in the
+    /// same transaction.
     fn write_row(&self, member: &Member, boot: u64) -> Result<(), MembershipError> {
         let key = member_key(member.id);
         for _ in 0..ATTEMPTS {
@@ -498,28 +482,12 @@ impl Members {
                 }
                 None => Cond::Absent,
             };
-            let mut member = member.clone();
             let mut txn = Txn::new();
-            if member.state == MemberState::Joining && !self.config.bootstrap.is_zero() {
-                let formed = self.store.get(FORMED)?;
-                let forming = self.store.get(FORMING)?;
-                if formed.is_none() || forming.is_some() {
-                    member.state = MemberState::Active;
-                }
-                txn = if formed.is_none() {
-                    txn.put(FORMED, Vec::new(), Cond::Absent).put_ttl(
-                        FORMING,
-                        Vec::new(),
-                        self.config.bootstrap,
-                        Cond::Any,
-                    )
-                } else {
-                    txn.check(FORMED, seen(formed.as_ref()))
-                        .check(FORMING, seen(forming.as_ref()))
-                };
+            if member.state == MemberState::Active {
+                txn = txn.put(FORMED, Vec::new(), Cond::Any);
             }
             let txn = txn
-                .put_ttl(&key, encode_row(&member, boot), self.config.ttl, cond)
+                .put_ttl(&key, encode_row(member, boot), self.config.ttl, cond)
                 .delete(down_key(member.id), Cond::Any);
             if self.store.txn(txn)?.is_ok() {
                 return Ok(());
@@ -672,11 +640,6 @@ impl Members {
         }
         Ok(marks)
     }
-}
-
-/// The condition that a key is as it was read: absent, or at that version.
-fn seen(read: Option<&Versioned>) -> Cond {
-    read.map_or(Cond::Absent, |stored| Cond::Version(stored.version))
 }
 
 fn decode_id(value: &[u8]) -> Result<u64, MembershipError> {

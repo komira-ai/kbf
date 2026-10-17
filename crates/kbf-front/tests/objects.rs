@@ -309,6 +309,24 @@ async fn a_blob_too_large_to_share_a_segment_is_a_segment_of_one_record() {
     assert_eq!(read.as_ref(), &[7u8; 300][..]);
 }
 
+/// Catches: a whole-blob read that keeps only the first window of a blob over one
+/// window (`READ_WINDOW_BYTES`, 8 MiB) or joins the windows out of order, over a cache
+/// with no write tier: a 9 MiB blob of distinct bytes comes back whole. Mutant:
+/// `gather` answering its first window.
+#[tokio::test]
+async fn a_whole_read_of_a_blob_over_one_window_comes_back_whole() {
+    let cache = Cache::open(SharedLog::new(), conditional(), KeyPrefix::default())
+        .await
+        .expect("open");
+    let bytes: Vec<u8> = (0..(9u32 << 20))
+        .map(|i| u8::try_from(i % 251).expect("a byte"))
+        .collect();
+    let blob = VerifiedBlob::hashed(Bytes::from(bytes.clone()));
+    cache.store_blobs(vec![blob.clone()]).await.expect("store");
+    let read = cache.read_blob(&blob.digest()).await.expect("read");
+    assert_eq!(read.as_ref(), &bytes[..]);
+}
+
 /// Catches: a read that marks every failure the same way. An object the store does not
 /// have is `Missing` (it may come back, and a re-probe may clear it); bytes that fail
 /// their digest are `Corrupt` (they must never be re-probed into service). Also catches

@@ -160,7 +160,7 @@ impl Storage for Called {
                 digest.hash_hex(),
                 digest.size_bytes
             );
-            let messages = stream::iter(write_messages(&name, &bytes).into_iter().map(Ok)).boxed();
+            let messages = stream::iter(write_messages(name, bytes).map(Ok)).boxed();
             self.this
                 .service
                 .write_in(self.generation, None, messages)
