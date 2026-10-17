@@ -72,6 +72,7 @@ pub mod farm;
 mod fault;
 mod flag_set;
 pub mod fleet;
+pub mod front_maps;
 pub mod frontend;
 pub mod grpc_health;
 pub mod health;

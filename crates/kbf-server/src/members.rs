@@ -342,12 +342,19 @@ enum Touch {
     State(MemberState),
 }
 
+/// The maps a process has seen: the newest, and the generation it replaced.
+#[derive(Default)]
+struct Seen {
+    latest: Option<Arc<Map>>,
+    previous: Option<Arc<Map>>,
+}
+
 /// Membership over a state store.
 pub struct Members {
     store: Arc<dyn Store>,
     config: MembershipConfig,
-    /// The newest map this process has seen, whoever bumped it.
-    latest: Mutex<Option<Arc<Map>>>,
+    /// The newest map this process has seen, whoever bumped it, and the one before it.
+    seen: Mutex<Seen>,
     /// Its generation (0 before any): [`MapSource::changes`].
     generation: watch::Sender<u64>,
 }
@@ -359,7 +366,7 @@ impl Members {
         Self {
             store,
             config,
-            latest: Mutex::new(None),
+            seen: Mutex::default(),
             generation: watch::Sender::new(0),
         }
     }
@@ -367,14 +374,25 @@ impl Members {
     /// Notes `map` as seen: if it is newer than the last, keeps it and wakes the
     /// [`MapSource::changes`] receivers.
     fn publish(&self, map: &Map) {
-        let mut latest = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
-        if latest
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        if seen
+            .latest
             .as_ref()
             .is_none_or(|l| l.generation() < map.generation())
         {
-            *latest = Some(Arc::new(map.clone()));
+            seen.previous = seen.latest.replace(Arc::new(map.clone()));
             self.generation.send_replace(map.generation());
         }
+    }
+
+    /// The newest map this process has seen and the one it replaced, which a call routed
+    /// by the newer finds a blob written before the change in. `None` before any map.
+    /// Reads no store: [`Members::current_map`] does, and publishes what it finds.
+    #[must_use]
+    pub fn view(&self) -> Option<(Arc<Map>, Option<Arc<Map>>)> {
+        let seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        let latest = seen.latest.clone()?;
+        Some((latest, seen.previous.clone()))
     }
 
     /// The map the push protocol reads: its current value (`None` until the first member
@@ -674,11 +692,7 @@ struct MemberMap {
 
 impl MapSource for MemberMap {
     fn current(&self) -> Option<Arc<Map>> {
-        self.members
-            .latest
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.members.view().map(|(latest, _)| latest)
     }
 
     fn changes(&self) -> watch::Receiver<u64> {

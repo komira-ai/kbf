@@ -681,7 +681,7 @@ async fn read_via(owners: Vec<kbf_front::Owner>, name: &str) -> Result<usize, St
 /// unreachable node, a status in the headers, a status as the first thing in the stream)
 /// when the next owner has the blob; a request that the first owner refused as invalid
 /// being asked of the next; a blob that ends empty read as a failure; and, when every
-/// owner fails, the answer not being the last one's. Tried in rank order.
+/// owner fails, the answer being NOT_FOUND only if every one said it. Tried in rank order.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_falls_through_to_the_next_owner_before_its_first_byte() {
     let name = blob("main", '0', 3 * CHUNK as u64);
@@ -730,17 +730,27 @@ async fn a_read_falls_through_to_the_next_owner_before_its_first_byte() {
     assert_eq!(read_via(owners, &name).await.unwrap(), 0);
     assert_eq!(good.calls.load(SeqCst), 0);
 
-    // Every owner failing: the last one's answer.
+    // Every owner failing: NOT_FOUND only if each said it; else the first that could not
+    // say, whichever order they come in (an owner that is down may hold the blob).
     let missing = Fake::forcing('1');
-    let e = read_via(vec![down(), owner("m", node(&missing).await)], &name)
-        .await
-        .unwrap_err();
+    let e = read_via(
+        vec![
+            owner("m", node(&missing).await),
+            owner("n", node(&missing).await),
+        ],
+        &name,
+    )
+    .await
+    .unwrap_err();
     assert_eq!((e.code(), e.message()), (Code::NotFound, "no such blob"));
-    let e = read_via(vec![owner("m", node(&missing).await), down()], &name)
-        .await
-        .unwrap_err();
-    assert_eq!(e.code(), Code::Unavailable);
-    assert!(e.message().contains("storage node down"), "{}", e.message());
+    for owners in [
+        vec![down(), owner("m", node(&missing).await)],
+        vec![owner("m", node(&missing).await), down()],
+    ] {
+        let e = read_via(owners, &name).await.unwrap_err();
+        assert_eq!(e.code(), Code::Unavailable);
+        assert!(e.message().contains("storage node down"), "{}", e.message());
+    }
     let e = read_via(vec![], &name).await.unwrap_err();
     assert_eq!(e.code(), Code::Unavailable);
 }

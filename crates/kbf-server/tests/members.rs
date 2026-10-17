@@ -701,6 +701,43 @@ fn the_map_source_follows_every_bump() {
     assert_eq!(*changes.borrow_and_update(), down.generation());
 }
 
+/// Catches a view that forgets the generation a bump replaced (a blob written before a
+/// join would be looked for only where the new map puts it), one that keeps a map that is
+/// not older, and one that is a map the frontend has not seen: each bump moves the newest
+/// map to `previous`, a refresh that changes nothing moves nothing, and there is no view
+/// before the first member.
+#[test]
+fn the_view_keeps_the_generation_a_bump_replaced() {
+    let s = Hooked::new();
+    let m = members(&s, config(30, 120));
+    assert!(m.view().is_none(), "no member, no map");
+    let a = m.register(&node(1)).expect("a");
+    let (latest, previous) = m.view().expect("a view");
+    assert_eq!(*latest, a.map);
+    assert!(previous.is_none());
+
+    let b = m.register(&node(2)).expect("b");
+    let (latest, previous) = m.view().expect("a view");
+    assert_eq!(*latest, b.map);
+    assert_eq!(previous.as_deref(), Some(&a.map));
+
+    // Nothing changed: the same two maps.
+    m.refresh().expect("refresh");
+    m.current_map().expect("read");
+    let (latest, previous) = m.view().expect("a view");
+    assert_eq!(*latest, b.map);
+    assert_eq!(previous.as_deref(), Some(&a.map));
+
+    // A bump another frontend made is seen at a read, and replaces the newest.
+    let c = other_frontend(&s, config(30, 120))
+        .register(&node(3))
+        .expect("c via another frontend");
+    m.current_map().expect("read");
+    let (latest, previous) = m.view().expect("a view");
+    assert_eq!(*latest, c.map);
+    assert_eq!(previous.as_deref(), Some(&b.map));
+}
+
 /// Catches a map source of a restarted frontend that starts with no map although its
 /// members left one (a daemon welcomed with no map until the first refresh), and one that
 /// hides a store that cannot be read (a frontend that serves an empty map as if it were

@@ -31,8 +31,9 @@
 //! tonic level. See the `proxy` module for what it keeps and what it does not do yet.
 //!
 //! **The backend.** Execute reads the store through a [`Backend`], a cache in this
-//! process or a storage node ([`Backend::remote`]); `kbf frontend` runs the second and
-//! holds no cache at all.
+//! process, a storage node ([`Backend::remote`]) or the storage nodes of a map
+//! ([`Backend::routed`]); `kbf frontend` runs the last two and holds no cache at all.
+//! The map is a [`Routed`], shared with the proxy ([`Owners::routed`]).
 //!
 //! **Authorization.** Every service asks a `kbf_auth` authorizer before it serves a
 //! call ([`routes_with_authorizers`]; which call asks which is on each service and in
@@ -56,6 +57,7 @@ mod bytestream;
 mod cache;
 mod capabilities;
 mod cas;
+mod closure;
 mod cpu;
 mod described;
 mod execution;
@@ -65,6 +67,7 @@ pub mod metrics;
 mod proxy;
 mod recorder;
 mod request_metadata;
+mod routed;
 mod segments;
 mod storage;
 mod wire;
@@ -112,6 +115,7 @@ pub use crate::request_metadata::{
     MAX_ID_BYTES, MAX_TEXT_BYTES, Read, ReadRequestMetadata, RequestMetadataLayer, Text,
     call_metadata,
 };
+pub use crate::routed::{Channels, Routed};
 pub use crate::segments::{
     Connection, Connections, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, MIN_SEGMENT_UPLOAD_BYTES,
     SegmentsConfig, SegmentsService, Tracked,

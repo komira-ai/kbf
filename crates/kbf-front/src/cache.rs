@@ -22,10 +22,11 @@ use kbf_types::{Digest, FarmTime};
 use prost::Message;
 use tonic::Status;
 
+use crate::MAX_BLOB_BYTES;
+use crate::closure;
 use crate::input_tree::{Horizon, InputTreeConfig, InputTrees};
 use crate::meta_log::{MemoryMetaLog, MetaLog, MetaLogError};
 use crate::metrics::CacheMetrics;
-use crate::{MAX_BLOB_BYTES, wire};
 
 /// The most [`ObjectStore::may_hold`] checks one action-cache hit keeps in flight. A
 /// hit needs one check per stored object its entry names; over a local store each is
@@ -159,7 +160,7 @@ impl VerifiedBlob {
 
 /// Whether `d` is the empty blob, which every cache holds: it is reported present and
 /// reads as no bytes whether or not anyone uploaded it.
-fn is_empty_blob(d: &Digest) -> bool {
+pub(crate) fn is_empty_blob(d: &Digest) -> bool {
     d.size_bytes == 0 && *d == kbf_segments::sha256(&[])
 }
 
@@ -618,38 +619,12 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         }
     }
 
-    /// Every blob an `ActionResult` needs besides itself. The empty blob is left out:
-    /// it is always present.
-    ///
-    /// An output directory's `root_directory_digest`, when set, is required as well, so
-    /// a hit never names a root `Directory` a client cannot fetch. REAPI does not make
-    /// the server hold that blob; here the writer (the daemon) must upload it with the
-    /// tree, or the entry is refused as absent.
+    /// Every blob an `ActionResult` needs besides itself ([`crate::closure`]), reading
+    /// each output directory's tree from this cache.
     async fn closure_of(&self, result: &reapi::ActionResult) -> Result<Closure, CacheError> {
-        let mut closure = Closure::new();
-        for file in &result.output_files {
-            insert(&mut closure, proto_digest(file.digest.as_ref())?);
-        }
-        for d in [&result.stdout_digest, &result.stderr_digest]
-            .into_iter()
-            .flatten()
-        {
-            insert(&mut closure, proto_digest(Some(d))?);
-        }
-        for dir in &result.output_directories {
-            let tree_digest = proto_digest(dir.tree_digest.as_ref())?;
-            insert(&mut closure, tree_digest);
-            if let Some(root) = &dir.root_directory_digest {
-                insert(&mut closure, proto_digest(Some(root))?);
-            }
-            let tree = reapi::Tree::decode(self.read_blob(&tree_digest).await?).map_err(|e| {
-                CacheError::Invalid(format!("output tree {tree_digest} does not decode: {e}"))
-            })?;
-            for directory in tree.root.iter().chain(&tree.children) {
-                for file in &directory.files {
-                    insert(&mut closure, proto_digest(file.digest.as_ref())?);
-                }
-            }
+        let (mut closure, trees) = closure::direct(result)?;
+        for tree in trees {
+            closure::add_tree(&mut closure, &tree, self.read_blob(&tree).await?)?;
         }
         Ok(closure)
     }
@@ -798,16 +773,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             other => Err(unexpected(&other)),
         }
     }
-}
-
-fn insert(closure: &mut Closure, digest: Digest) {
-    if !is_empty_blob(&digest) {
-        closure.insert(digest);
-    }
-}
-
-fn proto_digest(d: Option<&reapi::Digest>) -> Result<Digest, CacheError> {
-    wire::digest(d).map_err(|s| CacheError::Invalid(s.message().to_owned()))
 }
 
 /// A [`MetaLog`] answered a command with the outcome of a different one: a broken log.

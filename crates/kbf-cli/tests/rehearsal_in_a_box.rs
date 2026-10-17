@@ -542,8 +542,8 @@ fn the_rendered_units_start_connect_and_serve_cas() {
 /// (a frontend, one storage-and-daemon node, a daemon): inputs uploaded, `Execute`
 /// answered by a daemon, the output read back through the frontend, a repeat answered
 /// from the action cache (`cached_result`, and `GetActionResult` alike). One storage
-/// node because the frontend asks its one `--storage` node for everything; see
-/// [`three_storage_nodes_run_an_action`].
+/// node: the farm of one member the frontend reaches through `--storage`; see
+/// [`three_storage_nodes_run_an_action`] for the map with three.
 #[test]
 fn one_storage_node_runs_an_action_and_repeats_it_from_the_cache() {
     let mut farm = Farm::start("one-node", 1);
@@ -555,16 +555,15 @@ fn one_storage_node_runs_an_action_and_repeats_it_from_the_cache() {
 /// The same session on three storage nodes, and that the map spreads the blobs (each
 /// node holds some).
 ///
-/// NOT RUN: it fails on this tree, and the failure is a defect a real host trips on. The
-/// frontend reaches storage through its one `--storage` node (`Owners::single`, "THE
-/// ROUTING SEAM" in kbf-front's `proxy/owners.rs`; `Backend::remote` over one channel):
-/// a client's CAS writes all land on that node, and a daemon routes an action's output
-/// by the map, to its rendezvous owner, so when that is another node the frontend asks
-/// the `--storage` node `prepare_action_result`, is told the blob "is not held", and
-/// fails the lease as an infrastructure failure on every node in turn. Enable when the
-/// frontend routes by the map.
+/// Catches a frontend that reaches storage through its one `--storage` node (the
+/// `Owners::single` and `Backend::remote` it started with) while the daemons route by the
+/// map: a client's CAS writes would all land on that node, a daemon puts an action's
+/// output on its rendezvous owner, so when that is another node the frontend asks the
+/// `--storage` node `prepare_action_result`, is told the blob "is not held", and fails the
+/// lease as an infrastructure failure on every node in turn. The frontend routes by the
+/// members' map (`kbf_front::Routed`), so the output is found at its owner, the entry is
+/// committed with its blobs at the action's owner, and the repeat is a cache hit.
 #[test]
-#[ignore = "the frontend asks only its --storage node: an output on another owner is 'not held'"]
 fn three_storage_nodes_run_an_action() {
     let mut farm = Farm::start("three-nodes", 3);
     farm.wait_ready();
@@ -586,12 +585,12 @@ fn three_storage_nodes_run_an_action() {
 /// Reads every blob back through the frontend after one storage node is killed.
 ///
 /// NOT RUN until the real binaries wire R=2 (`with_chain` in `kbf storage-and-daemon`,
-/// the open R=2 glue change) and the frontend routes by the map (see
+/// the open R=2 glue change; the frontend routes by the map already, see
 /// [`three_storage_nodes_run_an_action`]): at R=1 the killed node is the only owner of
-/// its blobs, so this fails by construction. Remove the `ignore` when both are in; the
+/// its blobs, so this fails by construction. Remove the `ignore` when R=2 is in; the
 /// flags the units render are the ones R=2 reads, so it needs no other change.
 #[test]
-#[ignore = "needs R=2 wired in the real binaries, and a frontend that routes by the map"]
+#[ignore = "needs R=2 wired in the real binaries"]
 fn a_killed_storage_node_loses_no_blob() {
     let mut farm = Farm::start("kill", 3);
     farm.wait_ready();
