@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use kbf_history::{HistoryRoot, IndexRoot};
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
@@ -46,6 +47,27 @@ async fn a_stop_gives_up_on_a_last_step_that_never_ends() {
         tokio::task::yield_now().await;
     }
     assert!(gone.load(Ordering::SeqCst), "the task was aborted");
+}
+
+/// Catches: a stop that waits out the whole budget for a writer that ends when told to
+/// (a server's exit would take [`FINAL_STEP`] every time), and one that gives up on it as
+/// if it had hung. Also a stop of nothing, which has nothing to wait for. Time is the
+/// paused clock's.
+#[tokio::test(start_paused = true)]
+async fn a_stop_returns_as_soon_as_the_last_step_ends_and_nothing_stops_at_once() {
+    let (stop, stopped) = oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        let _ = stopped.await;
+    });
+    let begun = Instant::now();
+    finish(Some(Running {
+        handle: Abort(handle),
+        stop,
+    }))
+    .await;
+    assert!(begun.elapsed() < FINAL_STEP, "{:?}", begun.elapsed());
+    finish(None).await;
+    assert_eq!(begun.elapsed(), Duration::ZERO);
 }
 
 /// Catches: a task that outlives its `Running` (a server that dropped its serving future

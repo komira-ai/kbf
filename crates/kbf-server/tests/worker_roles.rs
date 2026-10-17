@@ -387,7 +387,7 @@ fn frontend(worker_tls: Option<WorkerTls>) -> SocketAddr {
         },
         history: None,
     };
-let bound = bind_server_with_state(
+    let bound = bind_server_with_state(
         Arc::new(Cache::memory()),
         listeners(worker_tls),
         None,
