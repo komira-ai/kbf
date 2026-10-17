@@ -288,10 +288,8 @@ impl Systemctl<'_> {
         let said = String::from_utf8_lossy(&out.stderr);
         let said = said.lines().map(str::trim).find(|l| !l.is_empty());
         Err(format!(
-            "systemctl start exited {}{}",
-            out.status
-                .code()
-                .map_or_else(|| "by a signal".to_owned(), |c| c.to_string()),
+            "systemctl start failed ({}){}",
+            out.status,
             said.map_or_else(String::new, |s| format!(": {s}"))
         ))
     }

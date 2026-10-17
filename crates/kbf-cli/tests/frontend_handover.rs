@@ -112,7 +112,7 @@ fn a_start_that_fails_leaves_the_serving_instance_serving_and_says_so() {
     assert_eq!(code, 1, "{out}");
     assert_eq!(
         err,
-        "kbf frontend handover: kbf-frontend@b.service did not become ready: systemctl start exited 1: Job for kbf-frontend@b.service failed.\n\
+        "kbf frontend handover: kbf-frontend@b.service did not become ready: systemctl start failed (exit status: 1): Job for kbf-frontend@b.service failed.\n\
          kbf frontend handover: kbf-frontend@a.service is still active; it stands down only for a new instance that is ready (see `journalctl -u kbf-frontend@b.service`)\n"
     );
     assert_eq!(
@@ -253,7 +253,7 @@ fn a_systemctl_that_fails_to_answer_fails_the_command_with_what_it_said() {
     );
     assert_eq!(
         err,
-        "kbf frontend handover: kbf-frontend@a.service did not become ready: systemctl start exited 1: Job for kbf-frontend@a.service failed.\n\
+        "kbf frontend handover: kbf-frontend@a.service did not become ready: systemctl start failed (exit status: 1): Job for kbf-frontend@a.service failed.\n\
          kbf frontend handover: see `journalctl -u kbf-frontend@a.service`\n"
     );
 
