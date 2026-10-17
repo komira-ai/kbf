@@ -101,6 +101,8 @@ pub const ALLOWED: &[&str] = &[
     "progress_interval_secs",
     "http2_keepalive_interval_secs",
     "http2_keepalive_timeout_secs",
+    "reapi_max_streams",
+    "worker_max_streams",
     "unservable_wait_secs",
     "memory_ladder_gib",
     "finished_retention_secs",
@@ -405,7 +407,10 @@ fn bind_frontend(
     let (worker_incoming, worker) = bind(listeners.worker)?;
     let peers_certified = listeners.worker_tls.is_some();
     let (mut worker_server, peers, worker_tls) = worker_peers(
-        keepalive(flow_control(Server::builder()), listeners.streams),
+        keepalive(
+            flow_control(Server::builder(), listeners.stream_limits.worker),
+            listeners.streams,
+        ),
         listeners.worker_tls,
     );
     let tls_sources: Vec<TlsSource> = listeners
@@ -429,7 +434,10 @@ fn bind_frontend(
     .merge(crate::health::router_of(Arc::clone(&checks)))
     .merge(metrics_route(backend.clone(), tls_sources));
 
-    let mut reapi_server = keepalive(flow_control(Server::builder()), listeners.streams);
+    let mut reapi_server = keepalive(
+        flow_control(Server::builder(), listeners.stream_limits.reapi),
+        listeners.streams,
+    );
     let sessions = WorkerService::new(
         Arc::clone(&farm),
         peers,

@@ -86,8 +86,10 @@ pub const MAP_GENERATION_HEADER: &str = "kbf-map-generation";
 /// around it, `kbf-front`'s `MAX_MESSAGE_BYTES` (a test pins the two equal).
 pub const MAX_MESSAGE_BYTES: usize = (16 << 20) + (1 << 20);
 
-/// The largest blob a `Write` accepts, `kbf-front`'s `MAX_BLOB_BYTES` (pinned the same).
-pub const MAX_BLOB_BYTES: u64 = 1 << 30;
+/// The size past which a `Write` is not held whole but streamed to the store as its
+/// messages arrive ([`crate::Storage::put_streamed`]), `kbf-front`'s
+/// `MAX_UNSTAGED_BLOB_BYTES` (a test pins the two equal). No blob is refused for its size.
+pub const STREAM_FROM_BYTES: u64 = 16 << 20;
 
 /// The most digests one `FindMissingBlobs` may name. `kbf-front` sets none beyond the
 /// message size, and a full message could name 262 144 of them (17 MiB over the 68 bytes

@@ -46,6 +46,7 @@ fn start_with(local: Option<Arc<LocalCache>>) -> (SocketAddr, SocketAddr) {
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     };
     let api = Api {
         listen: loopback(),
