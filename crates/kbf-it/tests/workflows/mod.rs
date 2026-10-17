@@ -74,6 +74,8 @@
 //! and action files before it merges. This lint keeps those files from asking for
 //! anything else, so that review has less to catch.
 
+#[cfg(test)]
+mod stages;
 mod yaml;
 
 use yaml::{Node, Value};
