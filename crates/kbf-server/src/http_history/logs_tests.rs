@@ -23,7 +23,7 @@ use kbf_state::{Cond, ManualClock, Store, Txn};
 use prost::Message as _;
 use serde_json::Value;
 
-use super::{ReadBudget, parse_path, serve};
+use super::{PREFIX, ReadBudget, parse_path, serve};
 use crate::history::{HistoryReads, RunIndex, Shared};
 use crate::http_blobs::READ_BUDGET_WAIT;
 
@@ -351,7 +351,7 @@ fn the_path_names_a_run_and_one_of_its_three_logs() {
         format!("/v1/runs/{}/logs/stdout", id.to_uppercase()),
         "/v1/runs//logs/stdout".to_owned(),
     ] {
-        let e = parse_path(&bad).expect_err(&bad);
-        assert_eq!(e.status(), StatusCode::NOT_FOUND, "{bad}");
+        let why = parse_path(&bad).expect_err(&bad);
+        assert!(why.contains(&bad[PREFIX.len()..]), "{bad}: {why}");
     }
 }

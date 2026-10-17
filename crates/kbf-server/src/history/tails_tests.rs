@@ -101,7 +101,6 @@ impl BlobReads for Blobs {
 }
 
 /// An object store that counts writes and can be made to fail them.
-
 struct Objects {
     memory: MemoryStore,
     puts: AtomicU64,

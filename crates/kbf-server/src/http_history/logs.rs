@@ -59,23 +59,20 @@ pub(super) async fn page(State(state): State<Arc<RunState>>, parts: Parts) -> Re
     answer
 }
 
-/// What the path names: a run and one of its logs.
-fn parse_path(path: &str) -> Result<(RunId, FlogStream), Response> {
+/// What the path names: a run and one of its logs; or why it names none.
+fn parse_path(path: &str) -> Result<(RunId, FlogStream), String> {
     let rest = path.strip_prefix(PREFIX).unwrap_or_default();
     let mut parts = rest.split('/');
     let (id, logs, stream, more) = (parts.next(), parts.next(), parts.next(), parts.next());
-    let id = id.and_then(parse).ok_or_else(|| {
-        error(
-            StatusCode::NOT_FOUND,
-            &format!("{rest:?} does not name a run: 24 lowercase hex digits, then /logs/<log>"),
-        )
-    })?;
-    let stream = stream.and_then(FlogStream::named);
-    match (logs, stream, more) {
+    let Some(id) = id.and_then(parse) else {
+        return Err(format!(
+            "{rest:?} does not name a run: 24 lowercase hex digits, then /logs/<log>"
+        ));
+    };
+    match (logs, stream.and_then(FlogStream::named), more) {
         (Some("logs"), Some(stream), None) => Ok((id, stream)),
-        _ => Err(error(
-            StatusCode::NOT_FOUND,
-            &format!("{rest:?} is not a log of a run: the logs are stdout, stderr and result"),
+        _ => Err(format!(
+            "{rest:?} is not a log of a run: the logs are stdout, stderr and result"
         )),
     }
 }
@@ -92,7 +89,8 @@ async fn answer(state: &RunState, parts: &Parts) -> Result<Response, Response> {
             tracing::warn!(call = CALL, error = %e.message(), "log read not authenticated");
             refusal(&e)
         })?;
-    let (id, stream) = parse_path(parts.uri.path())?;
+    let (id, stream) =
+        parse_path(parts.uri.path()).map_err(|why| error(StatusCode::NOT_FOUND, &why))?;
     if parts.uri.query().is_some_and(|q| !q.is_empty()) {
         return Err(error(
             StatusCode::BAD_REQUEST,

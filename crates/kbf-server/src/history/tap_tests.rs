@@ -772,10 +772,7 @@ mod pool {
             "nothing is offered until its tails are read"
         );
         assert_eq!(stats.dropped("tail"), 0);
-        assert_eq!(
-            rig.tap.runs().find(&id).map(|(k, row)| (k, row)),
-            Some((key("b"), 0))
-        );
+        assert_eq!(rig.tap.runs().find(&id), Some((key("b"), 0)));
         // The invocation is open: an idle record closes it.
         rig.tap.idle(&key("b"));
         assert!(matches!(&rig.queue.drain()[..], [Event::Close { .. }]));
