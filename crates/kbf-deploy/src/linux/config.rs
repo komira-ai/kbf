@@ -13,6 +13,7 @@ use kbf_host::{HostPath, PathError};
 pub const KEYS: &[&str] = &[
     "KBF_HOST_NAME",
     "KBF_LISTEN_ADDRESS",
+    "KBF_LISTEN_AFTER",
     "KBF_NODE_ID",
     "KBF_REAPI_PORT",
     "KBF_WORKER_PORT",
@@ -88,6 +89,9 @@ const MIN_OS_HEADROOM_GIB: u64 = 4;
 pub struct LinuxConfig {
     pub host_name: String,
     pub listen_address: String,
+    /// Units the listening units order after and want (`KBF_LISTEN_AFTER`), the service
+    /// that brings up the listen address's interface; empty by default.
+    pub listen_after: Vec<String>,
     pub node_id: String,
     pub reapi_port: u16,
     pub worker_port: u16,
@@ -176,6 +180,10 @@ pub enum LinuxError {
     },
     #[error("KBF_LISTEN_ADDRESS={0}: bind the host's pinned address, not every interface")]
     AnyAddress(String),
+    #[error(
+        "KBF_LISTEN_AFTER: '{0}' is not a systemd unit name (letters, digits and : _ . @ -, ending in .service, .target, .socket, .mount, .device, .path, .timer or .swap)"
+    )]
+    ListenAfter(String),
     #[error("MINIO_UNIT={0} is not a .service unit name")]
     MinioUnit(String),
     #[error("{a} and {b} are both {port}: each listener of a host needs its own port")]
@@ -244,6 +252,10 @@ impl LinuxConfig {
         if matches!(listen_address.as_str(), "0.0.0.0" | "::") {
             return Err(LinuxError::AnyAddress(listen_address));
         }
+        let listen_after = or("KBF_LISTEN_AFTER", "")
+            .split_whitespace()
+            .map(unit_name)
+            .collect::<Result<_, _>>()?;
         let minio_unit = or("MINIO_UNIT", "minio.service");
         if minio_unit
             .strip_suffix(".service")
@@ -317,6 +329,7 @@ impl LinuxConfig {
             s3_prefix: s3_prefix(&or("KBF_S3_PREFIX", ""))?,
             host_name,
             listen_address,
+            listen_after,
             node_id: c.require("KBF_NODE_ID")?.to_owned(),
             reapi_port,
             worker_port,
@@ -380,6 +393,26 @@ impl LinuxConfig {
         } else {
             self.listen_address.clone()
         }
+    }
+}
+
+/// A `KBF_LISTEN_AFTER` entry: a unit name and nothing a unit file could read as more
+/// (no `=`, `%`, `/`, space or newline), so the setting cannot add a line or a directive.
+fn unit_name(entry: &str) -> Result<String, LinuxError> {
+    const TYPES: &[&str] = &[
+        ".service", ".target", ".socket", ".mount", ".device", ".path", ".timer", ".swap",
+    ];
+    let stem = TYPES.iter().find_map(|t| entry.strip_suffix(t));
+    let ok = stem.is_some_and(|s| {
+        !s.is_empty()
+            && !s.starts_with('-')
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || ":_.@-".contains(c))
+    });
+    if ok {
+        Ok(entry.to_owned())
+    } else {
+        Err(LinuxError::ListenAfter(entry.to_owned()))
     }
 }
 

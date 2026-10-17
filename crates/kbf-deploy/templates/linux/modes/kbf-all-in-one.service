@@ -12,6 +12,7 @@
 Description=kbf build farm, all in one process
 Wants=network-online.target
 After=network-online.target
+@KBF_LISTEN_AFTER_LINES@
 
 [Service]
 # The daemon half runs rootless Podman as the kbf user.

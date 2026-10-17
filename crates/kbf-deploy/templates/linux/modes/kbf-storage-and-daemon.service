@@ -6,6 +6,7 @@
 Description=kbf build farm storage node and node daemon
 Wants=network-online.target
 After=network-online.target @MINIO_UNIT@
+@KBF_LISTEN_AFTER_LINES@
 
 [Service]
 User=@KBF_USER@

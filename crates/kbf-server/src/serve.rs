@@ -221,7 +221,9 @@ impl Drop for AbortOnDrop {
 /// sequential small call pays that. tonic's `Server::tcp_nodelay` does not apply here:
 /// `serve_with_incoming` takes the options of the incoming stream it is given.
 pub(crate) fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeError> {
-    let bound = TcpIncoming::bind(addr).and_then(|incoming| {
+    let bound = crate::listen::bind_std(addr).and_then(|listener| {
+        listener.set_nonblocking(true)?;
+        let incoming = TcpIncoming::from(tokio::net::TcpListener::from_std(listener)?);
         let local = incoming.local_addr()?;
         Ok((incoming.with_nodelay(Some(true)), local))
     });
@@ -262,7 +264,7 @@ fn set_nodelay(tcp: &mut tokio::net::TcpStream) {
 pub(crate) fn bind_api(
     addr: SocketAddr,
 ) -> Result<(tokio::net::TcpListener, SocketAddr), ServeError> {
-    let bound = std::net::TcpListener::bind(addr).and_then(|listener| {
+    let bound = crate::listen::bind_std(addr).and_then(|listener| {
         listener.set_nonblocking(true)?;
         let listener = tokio::net::TcpListener::from_std(listener)?;
         let local = listener.local_addr()?;

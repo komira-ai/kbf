@@ -152,3 +152,69 @@ fn a_socket_error_names_its_address() {
     let error = bind_error(addr)(io::Error::other("no reactor"));
     assert_eq!(error.to_string(), "bind 127.0.0.1:9: no reactor");
 }
+
+fn unavailable() -> io::Error {
+    io::Error::from(io::ErrorKind::AddrNotAvailable)
+}
+
+fn listener() -> TcpListener {
+    TcpListener::bind(any()).expect("bind")
+}
+
+/// Catches: no retry of an address that is not there yet (the frontend stays down after a
+/// reboot), and waits that do not start at 250 ms and double.
+#[test]
+fn an_unavailable_address_is_retried_until_it_binds() {
+    let mut script = vec![Err(unavailable()), Err(unavailable()), Ok(listener())].into_iter();
+    let mut waits = Vec::new();
+    let mut attempts = 0;
+    let got = retry_unavailable(Duration::from_secs(90), &mut |d| waits.push(d), &mut || {
+        attempts += 1;
+        script.next().expect("no more attempts")
+    });
+    assert!(got.is_ok());
+    assert_eq!(attempts, 3);
+    assert_eq!(
+        waits,
+        [Duration::from_millis(250), Duration::from_millis(500)]
+    );
+}
+
+/// Catches: a retry of every error (a port in use or a refused bind would wait out the
+/// budget before it is reported).
+#[test]
+fn any_other_bind_error_is_at_once_fatal() {
+    for kind in [io::ErrorKind::AddrInUse, io::ErrorKind::PermissionDenied] {
+        let mut attempts = 0;
+        let mut slept = 0;
+        let got = retry_unavailable(Duration::from_secs(90), &mut |_| slept += 1, &mut || {
+            attempts += 1;
+            Err(io::Error::from(kind))
+        });
+        assert_eq!(got.err().map(|e| e.kind()), Some(kind));
+        assert_eq!((attempts, slept), (1, 0));
+    }
+}
+
+/// Catches: no bound on the retry (a start that never ends, killed by systemd), and a
+/// bound that is exceeded by more than the one wait that crosses it.
+#[test]
+fn the_retry_ends_when_the_waits_reach_the_budget() {
+    let mut waits = Vec::new();
+    let mut attempts = 0;
+    let budget = Duration::from_secs(10);
+    let got = retry_unavailable(budget, &mut |d| waits.push(d), &mut || {
+        attempts += 1;
+        assert!(attempts < 100, "unbounded");
+        Err(unavailable())
+    });
+    assert_eq!(
+        got.err().map(|e| e.kind()),
+        Some(io::ErrorKind::AddrNotAvailable)
+    );
+    let total: Duration = waits.iter().sum();
+    assert!(total >= budget, "{total:?}");
+    assert!(total - *waits.last().expect("a wait") < budget);
+    assert_eq!(attempts, waits.len() + 1);
+    assert!(waits.iter().all(|w| *w <= Duration::from_secs(2)));
+}

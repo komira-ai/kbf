@@ -11,6 +11,7 @@ use std::os::fd::OwnedFd;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use futures::Stream;
 use kbf_tls::{Incoming, TlsSource};
@@ -34,8 +35,7 @@ impl Socket {
     /// # Errors
     /// The address cannot be bound.
     pub fn bind(addr: SocketAddr, spare: bool) -> Result<Self, ServeError> {
-        let bound =
-            std::net::TcpListener::bind(addr).and_then(|listener| Self::of(listener, spare));
+        let bound = bind_std(addr).and_then(|listener| Self::of(listener, spare));
         bound.map_err(bind_error(addr))
     }
 
@@ -98,6 +98,54 @@ impl Socket {
     pub fn http(self) -> Result<tokio::net::TcpListener, ServeError> {
         let registered = tokio::net::TcpListener::from_std(self.listener);
         registered.map_err(bind_error(self.local))
+    }
+}
+
+/// How long a bind that fails with `AddrNotAvailable` is retried before it is fatal.
+///
+/// A listen address on a VPN or overlay interface can appear seconds after
+/// `network-online.target`, which only waits for the ordinary links. The bound is below
+/// the `TimeoutStartSec=120` of the rendered units (systemd would kill a start that
+/// waits longer, with a worse message), and a later start-up step still has its share.
+pub(crate) const BIND_BUDGET: Duration = Duration::from_secs(90);
+
+/// The first wait between two bind attempts; each wait doubles, up to [`BIND_WAIT_MAX`].
+const BIND_WAIT_FIRST: Duration = Duration::from_millis(250);
+const BIND_WAIT_MAX: Duration = Duration::from_secs(2);
+
+/// A std listener on `addr`; an address that is not on this host yet
+/// (`AddrNotAvailable`) is retried for [`BIND_BUDGET`], every other error is at once the
+/// result. Blocks the thread while it waits: it runs at start-up, before serving.
+pub(crate) fn bind_std(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
+    let mut sleep = |wait: Duration| {
+        tracing::warn!(%addr, ?wait, "listen address not available yet, retrying the bind");
+        std::thread::sleep(wait);
+    };
+    retry_unavailable(BIND_BUDGET, &mut sleep, &mut || {
+        std::net::TcpListener::bind(addr)
+    })
+}
+
+/// Runs `attempt` until it succeeds, fails with anything but `AddrNotAvailable`, or the
+/// waits already made add up to `budget`; the last error is then the result. `sleep` is
+/// called with each wait (250 ms, doubling to 2 s). Not generic: a generic function's
+/// copies count once each in the coverage ratchet.
+pub(crate) fn retry_unavailable(
+    budget: Duration,
+    sleep: &mut dyn FnMut(Duration),
+    attempt: &mut dyn FnMut() -> io::Result<std::net::TcpListener>,
+) -> io::Result<std::net::TcpListener> {
+    let mut waited = Duration::ZERO;
+    let mut wait = BIND_WAIT_FIRST;
+    loop {
+        match attempt() {
+            Err(e) if e.kind() == io::ErrorKind::AddrNotAvailable && waited < budget => {
+                sleep(wait);
+                waited += wait;
+                wait = (wait * 2).min(BIND_WAIT_MAX);
+            }
+            other => return other,
+        }
     }
 }
 

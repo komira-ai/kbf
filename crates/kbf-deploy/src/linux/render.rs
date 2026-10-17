@@ -82,6 +82,14 @@ pub(super) fn values(c: &LinuxConfig, kbf_uid: Option<u32>) -> Values {
         (c.minio_reservation_gib + c.server_reservation_gib) * 1024 + c.daemon_memory_min_mib;
     // kbf-daemon --image takes docker://<repo>@sha256:<digest>; KBF_IMAGES holds the
     // bare form podman pulls.
+    // After= and Wants= the unit that brings up the listen address's interface, so the
+    // bind finds it (the retry in kbf-server covers a slow one); no lines when unset.
+    let listen_after = if c.listen_after.is_empty() {
+        Vec::new()
+    } else {
+        let units = c.listen_after.join(" ");
+        vec![format!("After={units}"), format!("Wants={units}")]
+    };
     let images = c
         .images
         .iter()
@@ -155,6 +163,7 @@ pub(super) fn values(c: &LinuxConfig, kbf_uid: Option<u32>) -> Values {
         ("KBF_STATE_DIR", Value::Text(c.state_dir.to_string())),
         ("DAEMON_TUNING_ARGS", Value::Lines(tuning)),
         ("KBF_LISTEN_HOST", Value::Text(c.listen_host())),
+        ("KBF_LISTEN_AFTER_LINES", Value::Lines(listen_after)),
         ("KBF_HOST_NAME", Value::Text(c.host_name.clone())),
         ("KBF_NODE_ID", Value::Text(c.node_id.clone())),
         ("KBF_REAPI_PORT", Value::Text(c.reapi_port.to_string())),
