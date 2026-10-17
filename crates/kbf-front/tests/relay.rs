@@ -355,6 +355,15 @@ fn queued(name: &str) -> Result<Operation, Status> {
     Ok(op(name, ExecStage::Queued, 0))
 }
 
+/// Catches: a relay whose `Debug` output leaks its parts (the farm, the channel) instead
+/// of naming only the type, which a log line of a service stack would then print.
+/// Mutant: `finish_non_exhaustive` replaced by a field listing.
+#[tokio::test]
+async fn a_relay_debugs_as_its_name_only() {
+    let rig = Rig::new(vec![], vec![]).await;
+    assert_eq!(format!("{:?}", rig.relay), "Relay { .. }");
+}
+
 /// Catches: a relay that changes a frontend that has not handed over (a call answered by
 /// the successor, or counted), which would make the relay more than inert. Mutant: the
 /// handed check removed from `execute` and `wait_execution`: the successor is called.

@@ -338,6 +338,41 @@ async fn a_relayed_operation_is_followed_from_the_rows_as_a_kept_caller_is() {
     assert_eq!(backend.metrics().frontend_relay_lost.get(), 1);
 }
 
+/// Catches: rows the relay's fallback cannot read taken for "no such operation": a relayed
+/// call would then be counted lost, or sent again, on a store that is only corrupt. An
+/// `op/` row that holds some other input, one that does not decode, and a `done/` row
+/// that does not parse must each be an error naming the row. Mutants: the `not a request`
+/// arm of `operations_of` skipping the row; an error of either lookup turned into `Ok(None)`.
+#[tokio::test(start_paused = true)]
+async fn rows_the_relay_cannot_read_are_errors_not_absence() {
+    let disk = Disk::new();
+    let (old, _) = farm_over_disk(&disk, kbf_sched::UNSERVABLE_WAIT);
+    let action = request(1).key.action;
+    let put = |key: &str, value: Vec<u8>| {
+        let txn = Txn::new().put(key.to_owned(), value, Cond::Any);
+        disk.store.txn(txn).expect("store").expect("put");
+    };
+
+    let batch = kbf_log::FarmBatch {
+        now: Default::default(),
+        wall: std::time::UNIX_EPOCH,
+        inputs: vec![kbf_log::FarmInput::Tick],
+    };
+    let other =
+        kbf_log::encode(kbf_log::Format::V1, &kbf_log::LogCommand::Farm(batch)).expect("encoded");
+    put("op/0000000000000001", other);
+    let refused = old.operation_of(None, &action).expect_err("not a request");
+    assert!(refused.contains("not a request"), "{refused}");
+
+    put("op/0000000000000001", vec![0xff]);
+    let refused = old.operation_of(None, &action).expect_err("undecodable");
+    assert!(refused.contains("op/0000000000000001"), "{refused}");
+
+    put("done/0000000000000001", vec![0xff]);
+    let refused = old.look(OperationId(1)).expect_err("unreadable done row");
+    assert!(refused.contains("done/0000000000000001"), "{refused}");
+}
+
 /// What the operator did to `node-a`, as the farm shows it.
 fn placement(farm: &TestFarm) -> PlacementView {
     farm.node_view(&node())
