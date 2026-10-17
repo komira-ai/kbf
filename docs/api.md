@@ -176,7 +176,9 @@ restart that never came, does not strand a healthy node out of service). The `do
 mark that keeps its slot for the dwell (the same time as for a member that fails) is
 written in the same transaction, with a value that says an operator planned it:
 [`GET /v1/storage`](#get-v1storage) shows `"state": "down", "planned_down": true` for it.
-Asking again for a member already planned down is the same plan with its end moved to
+The end of the plan is kept in the member's row, which a frontend built before it drops when it
+rewrites the row, so nothing is planned down while a frontend of an older build serves the same
+state store. Asking again for a member already planned down is the same plan with its end moved to
 `for_secs` from now: `200`, the same answer, no new generation. It is undone by
 `{"state": "active"}` (a restart that did not happen), or by the member
 registering again after the restart: `active` if its index is whole, `catching_up` while

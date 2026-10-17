@@ -236,6 +236,8 @@ struct Row {
     report: Option<StoredReport>,
     /// The store's clock, in nanoseconds, at which an operator's planned restart of this
     /// member ends (0: none). Past it, a heartbeat of the member returns it to `Active`.
+    /// A frontend built before this field existed drops it when it rewrites the row, so
+    /// a plan outlives it there: no plan while one serves the same store.
     #[prost(uint64, tag = "4")]
     planned_until_nanos: u64,
 }
@@ -652,6 +654,11 @@ impl Members {
     /// while it rebuilds, the mark deleted); if it stops and does not return, its row
     /// expires and the dwell, counted from this call, decides when it leaves the map.
     ///
+    /// **Mixed frontends.** The end of the plan lives in the member's row (tag 4), which a
+    /// frontend built before it does not know: it keeps the state `Down` when it rewrites the
+    /// row (a heartbeat, a promotion) but drops the end, so the plan would never run out.
+    /// Plan nothing down while a frontend of an older build serves the same state store.
+    ///
     /// Asking again for a member already planned down is the same planned restart with its
     /// end moved to `for_` from now: no new generation.
     ///
@@ -732,7 +739,7 @@ impl Members {
                     if before == MemberState::Down
                         && live
                             .planned_until
-                            .is_some_and(|until| self.store.now() >= until)
+                            .is_some_and(|until| !Planned::Until(until).in_force(self.store.now()))
                     {
                         live.member.state = MemberState::Active;
                         live.planned_until = None;

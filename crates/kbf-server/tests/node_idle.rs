@@ -722,3 +722,19 @@ fn a_node_planned_down_is_judged_by_its_report_and_another_one_holds_the_rest() 
         }]
     );
 }
+
+// Catches an off-by-one in the end of a plan, for the view and for the beat that ends it
+// (both ask `Planned::in_force`): a plan is in force one nanosecond before its end and not at
+// it; a stopped member's plan is in force (the mark holds it); none is never. Mutants: `<=`
+// for `<`.
+#[test]
+fn a_plan_is_in_force_until_its_end_and_not_at_it() {
+    use kbf_server::storage_health::Planned;
+    let end = at(1_000);
+    let before = StoreTime::from_duration(Duration::from_secs(1_000) - Duration::from_nanos(1));
+    assert!(Planned::Until(end).in_force(before));
+    assert!(!Planned::Until(end).in_force(end));
+    assert!(!Planned::Until(end).in_force(at(1_001)));
+    assert!(Planned::Stopped.in_force(at(1_000_000)));
+    assert!(!Planned::No.in_force(at(0)));
+}
