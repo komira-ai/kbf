@@ -78,11 +78,38 @@ impl StartFailure {
     }
 }
 
-/// Whether `e` itself (not its sources) is one of the not-ready types.
-fn not_ready(e: &(dyn Error + 'static)) -> bool {
+/// What an operator must know beside the error, if `e` or an error in its source chain
+/// calls for it: a [`StaleWriter`] means the frontend's state store is older than this
+/// node's log (restored from a backup), and every restart until the boots catch up says
+/// so, so the restarts do not read as an ordinary crash loop.
+#[must_use]
+pub fn hint(e: &(dyn Error + 'static)) -> Option<&'static str> {
+    let mut at = Some(e);
+    while let Some(error) = at {
+        if stale_writer(error) {
+            return Some(STALE_WRITER_HINT);
+        }
+        at = error.source();
+    }
+    None
+}
+
+/// The line [`hint`] gives for a [`StaleWriter`].
+pub const STALE_WRITER_HINT: &str = "the frontend's state store is older than this node's \
+    metadata log (was it restored from a backup?): the node exits 75, systemd starts it \
+    again and each start takes the next boot, so it opens once its boot is past the log's; \
+    wait, do not wipe --meta-dir (docs/deploy/kbf-modes.md, \"After restoring the frontend's \
+    state store\")";
+
+fn stale_writer(e: &(dyn Error + 'static)) -> bool {
     // `CacheError::StaleWriter` is `transparent`: the source chain does not name the
     // inner error, so the cache's own variant is matched.
-    if e.is::<StaleWriter>() || matches!(e.downcast_ref(), Some(CacheError::StaleWriter(_))) {
+    e.is::<StaleWriter>() || matches!(e.downcast_ref(), Some(CacheError::StaleWriter(_)))
+}
+
+/// Whether `e` itself (not its sources) is one of the not-ready types.
+fn not_ready(e: &(dyn Error + 'static)) -> bool {
+    if stale_writer(e) {
         return true;
     }
     if let Some(error) = e.downcast_ref::<RaftLogError>() {

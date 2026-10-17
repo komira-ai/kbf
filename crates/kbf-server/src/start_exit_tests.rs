@@ -142,3 +142,28 @@ fn each_class_has_its_status() {
         StartFailure::NotReady.status()
     );
 }
+
+/// Catches a restore that restarts every node silently (with exit 75 and a restart delay,
+/// a node behind on boots restarts until they catch up, which must not read as an ordinary
+/// crash loop): a `StaleWriter`, bare, inside the cache's variant or wrapped, carries the
+/// line naming the restored state store and the wait; any other failure carries none.
+/// Mutant: `hint` always `None`.
+#[test]
+fn a_stale_writer_says_the_state_store_is_older() {
+    let hint = |e: Box<dyn Error>| super::hint(e.as_ref());
+    assert_eq!(hint(Box::new(stale())), Some(super::STALE_WRITER_HINT));
+    assert_eq!(
+        hint(Box::new(CacheError::StaleWriter(stale()))),
+        Some(super::STALE_WRITER_HINT)
+    );
+    assert_eq!(
+        hint(Box::new(Wrapped(Box::new(stale())))),
+        Some(super::STALE_WRITER_HINT)
+    );
+    assert!(super::STALE_WRITER_HINT.contains("restored from a backup"));
+    assert!(super::STALE_WRITER_HINT.contains("do not wipe --meta-dir"));
+    assert_eq!(
+        hint(Box::new(io::Error::from(io::ErrorKind::ResourceBusy))),
+        None
+    );
+}

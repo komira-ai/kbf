@@ -39,6 +39,9 @@ pub(crate) fn exit(name: &str, half: &str, served: Result<(), Failed>) -> ExitCo
         Ok(()) => ExitCode::SUCCESS,
         Err(failed) => {
             eprintln!("{name}: {}", failed.said(half));
+            if let Some(hint) = failed.hint() {
+                eprintln!("{name}: {hint}");
+            }
             failed.code()
         }
     }
@@ -77,6 +80,14 @@ impl Failed {
     }
 
     /// What failed, `half` naming the half beside the daemon.
+    /// What an operator must know beside the failure ([`kbf_server::start_hint`]).
+    fn hint(&self) -> Option<&'static str> {
+        match self {
+            Self::Server(e) => kbf_server::start_hint(e.as_ref()),
+            Self::Daemon(_) | Self::Stopped(_) => None,
+        }
+    }
+
     fn said(&self, half: &str) -> String {
         match self {
             Self::Server(e) => format!("{half}: {e}"),

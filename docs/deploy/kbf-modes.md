@@ -220,7 +220,7 @@ does not exist does nothing. On a host with a local MinIO, add `minio.service` t
 ### Exit 2 and exit 75: what systemd restarts
 
 A start that fails exits 2 or 75. The `storage`, `storage-and-daemon` and `all-in-one`
-units carry `RestartPreventExitStatus=2` and `RestartSec=5`, so exit 2 stays down and exit 75
+units carry `RestartPreventExitStatus=2` and (with #1005) `RestartSec=5`, so exit 2 stays down and exit 75
 (`EX_TEMPFAIL`) is started again five seconds later, below systemd's default start limit
 (five starts in ten seconds).
 
@@ -240,7 +240,8 @@ node its member id and a boot counter from the store (`boot/<id>`, one more at e
 registration); a node's metadata log remembers the latest boot it wrote as. A restored
 store's counters are behind the nodes' logs, so a node registers, is given a boot its log
 has set already, refuses to open ("member M boot B is not after boot C, the latest set",
-no object is written) and exits 75. systemd starts it again; that start registers again
+no object is written), says on stderr that the state store is older than its log and to
+wait, and exits 75. systemd starts it again; that start registers again
 and takes the next boot, and the node opens as soon as its boot is past its log's. A gap
 of N boots therefore takes N restarts, about N times five seconds plus the start, each
 node on its own counter and all in parallel; nothing needs to be done but wait, and a node

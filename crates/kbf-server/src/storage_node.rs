@@ -705,6 +705,9 @@ pub fn run(flags: &StorageFlags) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("kbf storage: {e}");
+            if let Some(hint) = crate::start_hint(e.as_ref()) {
+                eprintln!("kbf storage: {hint}");
+            }
             StartFailure::of(e.as_ref()).code()
         }
     }
