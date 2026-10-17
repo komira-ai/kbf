@@ -92,10 +92,10 @@ pub use crate::cache::{
     Admitted, BATCH_READS_IN_FLIGHT, BlobRead, Cache, CacheError, DEFAULT_REAPI_STREAMS,
     DEFAULT_WORKER_STREAMS, EVICT_BATCH, EVICT_EVERY, EVICT_GRACE, EvictReady, EvictRound,
     FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound,
-    HeldObject, Losses, MAX_ADMISSION_BYTES, MAX_DECODED_BLOB_BYTES, NEEDS_V3, PASS_OPENS_PER_SEC,
-    PUT_BACKOFF, PUT_BACKOFF_FACTOR, PassReport, READ_WINDOW_BYTES, RecordStream,
-    STREAM_WINDOW_BYTES, StreamedRecord, TierStartError, TierStartup, TouchConfig, VerifiedBlob,
-    WriteConfig,
+    HeldObject, Losses, MAX_ADMISSION_BYTES, MAX_DECODED_BLOB_BYTES, NEEDS_V3, ObjectKeys,
+    PASS_OPENS_PER_SEC, PUT_BACKOFF, PUT_BACKOFF_FACTOR, PassReport, READ_WINDOW_BYTES,
+    RecordStream, STREAM_WINDOW_BYTES, StreamedRecord, TierStartError, TierStartup, TouchConfig,
+    VerifiedBlob, WriteConfig,
 };
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;

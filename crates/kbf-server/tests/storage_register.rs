@@ -7,7 +7,7 @@ mod hooked;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hooked::Hooked;
@@ -35,6 +35,9 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 const MS: Duration = Duration::from_millis(1);
 
+/// An empty directory for `name`. Emptied first: each test's frontend is new, so its
+/// state store hands out boot 1 again, which a metadata directory a previous run left
+/// has set already (a registered node refuses to start over it).
 fn dir(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("storage-register")
@@ -262,7 +265,11 @@ async fn a_node_retries_through_failures_and_keeps_its_boot() {
     f.store
         .fail_gets
         .store(3, std::sync::atomic::Ordering::SeqCst);
-    let joiner = tokio::spawn(Joiner::new(channel, who, 5 * MS).run());
+    let mut joiner = Joiner::new(channel, who, 5 * MS);
+    let joiner = tokio::spawn(async move {
+        let joined = joiner.join().await;
+        joiner.keep(joined).await;
+    });
     let first = until("the node to register", || row(&f, 1)).await.version;
     f.store
         .fail_gets
@@ -385,6 +392,18 @@ async fn the_registration_flags_are_carried_or_refused() {
         none.expect("no error").is_none(),
         "no --frontend, no registration"
     );
+    // Without --frontend the node starts at once, registered nowhere: its cache writes
+    // in an epoch of its own log.
+    let node = start_storage(&alone, never)
+        .await
+        .expect("starts without a frontend");
+    assert!(
+        node.start_line().starts_with("kbf-storage "),
+        "{}",
+        node.start_line()
+    );
+    drop(node);
+    assert_eq!(f.store.fake.scan_prefix("member/").expect("scan").len(), 1);
     let help = command().render_help().to_string();
     for flag in [
         "--frontend",
@@ -581,8 +600,25 @@ async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
     serving.await.expect("joins").expect("stops");
 }
 
-/// A node started with `--frontend` that the frontend cannot yet admit (its store fails),
-/// listening, and a client of its storage service.
+/// A node started with `--frontend` that the frontend admits but sends no map it can read
+/// (`map` is what the frontend sends, which a test replaces), listening, and a client of
+/// its storage service.
+async fn unmapped_node(
+    map: &Arc<Mutex<pb::Map>>,
+    name: &str,
+) -> (kbf_server::storage_node::StorageHandle, RemoteStorage) {
+    let url = format!("--frontend=http://{}", serve_membership(map));
+    let node = start_storage(&flags(&dir(name), &[url]).expect("flags"), never)
+        .await
+        .expect("starts");
+    let channel = Endpoint::from_shared(format!("http://{}", node.addr))
+        .expect("endpoint")
+        .connect_lazy();
+    (node, RemoteStorage::new(channel, 0))
+}
+
+/// A node started with `--frontend` at `f`, listening, and a client of its storage
+/// service.
 async fn waiting_node(
     f: &Frontend,
     name: &str,
@@ -597,20 +633,32 @@ async fn waiting_node(
     (node, RemoteStorage::new(channel, 0))
 }
 
-/// Catches: a node in a multi-member farm that serves before it knows the farm. While the
-/// frontend cannot admit it (its store fails, so there is no map) every kind of call is
-/// refused UNAVAILABLE "has not been given a map", not answered as an empty cache (a
-/// FindMissing that says every blob is missing, a write taken that the map places
-/// elsewhere); once the registration lands, and the caller routes by the map the node
-/// holds, the same calls are served. The refusal is the storage service's own check, the
-/// only one. Mutant: a service given no map source (every call is served at once).
+/// A map of one active member, which a node can read.
+fn readable_map() -> pb::Map {
+    let member = kbf_map::Member {
+        id: MemberId(1),
+        addr: "192.0.2.5:1".to_owned(),
+        zone: String::new(),
+        weight: 1,
+        state: MemberState::Active,
+    };
+    let map = kbf_map::Map::new(4, vec![member], kbf_map::Rule::Rendezvous, 1, 1, Vec::new())
+        .expect("a map");
+    pb::Map::from(&map)
+}
+
+/// Catches: a node in a multi-member farm that serves before it knows the farm. The
+/// frontend admits the node (it registers, and opens its cache) but sends a map the node
+/// cannot read, so it has none: every kind of call is refused UNAVAILABLE "has not been
+/// given a map", not answered as an empty cache (a FindMissing that says every blob is
+/// missing, a write taken that the map places elsewhere); once a heartbeat brings a map,
+/// and the caller routes by the map the node holds, the same calls are served. The refusal
+/// is the storage service's own check, the only one. Mutant: a service given no map source
+/// (every call is served at once).
 #[tokio::test]
 async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
-    let f = frontend(None);
-    f.store
-        .fail_gets
-        .store(1_000_000, std::sync::atomic::Ordering::SeqCst);
-    let (node, client) = waiting_node(&f, "gate").await;
+    let sent = Arc::new(Mutex::new(pb::Map::default()));
+    let (node, client) = unmapped_node(&sent, "gate").await;
     let maps = node.maps();
     let mut segments = SegmentsClient::new(
         Endpoint::from_shared(format!("http://{}", node.addr))
@@ -656,9 +704,7 @@ async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
     assert_eq!(refused_status(begun.expect_err("refused")), want);
     assert_eq!(maps.generation(), 0, "the node has no map");
 
-    f.store
-        .fail_gets
-        .store(0, std::sync::atomic::Ordering::SeqCst);
+    *sent.lock().expect("lock") = readable_map();
     until("the node to hold a map", || {
         (maps.generation() > 0).then_some(())
     })
@@ -719,8 +765,15 @@ async fn a_heartbeat_brings_a_node_the_map_it_missed() {
     assert_eq!(learned.generation(), 2);
 }
 
-/// A membership service that answers every call with the map it holds (a garbled one, or a valid one).
-struct Garbled(pb::Map);
+/// A membership service that answers every call with the map it holds (a garbled one, or a
+/// valid one), which a test replaces.
+struct Garbled(Arc<Mutex<pb::Map>>);
+
+impl Garbled {
+    fn map(&self) -> pb::Map {
+        self.0.lock().expect("lock").clone()
+    }
+}
 
 #[tonic::async_trait]
 impl kbf_proto::kbf::map::v1::membership_server::Membership for Garbled {
@@ -732,7 +785,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for Garbled {
             member_id: 1,
             boot: 1,
             heartbeat_interval_ms: 1,
-            map: Some(self.0.clone()),
+            map: Some(self.map()),
         }))
     }
 
@@ -742,7 +795,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for Garbled {
     ) -> Result<tonic::Response<pb::HeartbeatResponse>, tonic::Status> {
         Ok(tonic::Response::new(pb::HeartbeatResponse {
             map_generation: 9,
-            map: Some(self.0.clone()),
+            map: Some(self.map()),
         }))
     }
 }
@@ -779,6 +832,24 @@ async fn a_map_that_is_not_newer_changes_nothing() {
     );
 }
 
+/// A membership service on a port of its own that admits every node as member 1 at boot 1
+/// and answers with whatever `map` holds, at each call.
+fn serve_membership(map: &Arc<Mutex<pb::Map>>) -> SocketAddr {
+    let incoming =
+        tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = incoming.local_addr().expect("address");
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(
+                kbf_proto::kbf::map::v1::membership_server::MembershipServer::new(Garbled(
+                    Arc::clone(map),
+                )),
+            )
+            .serve_with_incoming(incoming),
+    );
+    addr
+}
+
 /// A node that registers and beats once with a frontend that answers with `map` both
 /// times; the maps it holds after.
 async fn joined_by(map: pb::Map) -> Arc<kbf_mapsync::MapHolder> {
@@ -787,16 +858,7 @@ async fn joined_by(map: pb::Map) -> Arc<kbf_mapsync::MapHolder> {
 
 /// The node of [`joined_by`]: its registration was answered with member id 1.
 async fn joined_node(map: pb::Map) -> Arc<NodeMap> {
-    let incoming =
-        tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
-    let addr = incoming.local_addr().expect("address");
-    tokio::spawn(
-        tonic::transport::Server::builder()
-            .add_service(
-                kbf_proto::kbf::map::v1::membership_server::MembershipServer::new(Garbled(map)),
-            )
-            .serve_with_incoming(incoming),
-    );
+    let addr = serve_membership(&Arc::new(Mutex::new(map)));
     let channel = Endpoint::from_shared(format!("http://{addr}"))
         .expect("endpoint")
         .connect_lazy();
@@ -928,10 +990,11 @@ async fn a_node_over_mutual_tls_keeps_a_repair_journal_and_a_worker_settles_it()
 /// Catches a `kbf storage-and-daemon` whose in-process view is not the node's own service:
 /// one built over a separate storage with no map and no chain would answer every write at
 /// once, as one copy nobody owes. The real half (`storage_half::start`, mutual TLS, a
-/// frontend) is called through `in_process()`. While the frontend cannot admit it the write
-/// is refused UNAVAILABLE "has not been given a map"; once it holds a map in which it and a
-/// partner that is not listening both own the blob, the same call is answered, the blob is
-/// in this node's store, and the repair journal owes it to the partner. Mutant: `bind_node`
+/// frontend) is called through `in_process()`. Once it holds a map in which it and a
+/// partner that is not listening both own the blob, the call is answered, the blob is in
+/// this node's store, and the repair journal owes it to the partner. (The half registers
+/// before it opens its cache, so there is no start that lacks a map to refuse from; that
+/// refusal is `a_node_with_a_frontend_serves_nothing_until_it_holds_a_map`'s.) Mutant: `bind_node`
 /// handing `in_process` a service made over another, unmapped, chainless storage.
 #[tokio::test]
 async fn a_write_through_the_halfs_in_process_view_is_judged_by_the_map_and_owes_the_partner() {
@@ -948,9 +1011,6 @@ async fn a_write_through_the_halfs_in_process_view_is_judged_by_the_map_and_owes
         deny_list: None,
     };
     let f = frontend(Some(worker_tls));
-    f.store
-        .fail_gets
-        .store(1_000_000, std::sync::atomic::Ordering::SeqCst);
     let d = dir("half-in-process");
     let write = |name: &str, text: String| {
         let path = d.join(name);
@@ -976,21 +1036,6 @@ async fn a_write_through_the_halfs_in_process_view_is_judged_by_the_map_and_owes
     let here = half.addr;
     let _serving = tokio::spawn(half.serve());
 
-    let refused = in_process
-        .at(0)
-        .put(bytes::Bytes::from_static(b"before any map"))
-        .await
-        .expect_err("no map yet");
-    let refused = tonic::Status::from(refused);
-    assert_eq!(refused.code(), Code::Unavailable);
-    assert!(
-        refused.message().contains("has not been given a map"),
-        "{refused}"
-    );
-
-    f.store
-        .fail_gets
-        .store(0, std::sync::atomic::Ordering::SeqCst);
     until("the node to register", || row(&f, 1)).await;
     until("the node to hold a map", || {
         (maps.generation() > 0).then_some(())
@@ -1376,4 +1421,135 @@ async fn a_failed_heartbeat_is_retried_without_registering_again() {
         1,
         "registered once"
     );
+}
+
+/// Starts `kbf storage` (`half` false) or the storage half of `kbf storage-and-daemon`
+/// (`half` true) over `dir` with `--frontend` at `f`, writes `text` through its listener
+/// and stops it. A previous start's background tasks may still hold the directory's locks
+/// as it stops; the start is retried while they do.
+async fn write_as_registered(
+    f: &Frontend,
+    dir: &Path,
+    half: bool,
+    text: &str,
+) -> kbf_types::Digest {
+    let url = format!("--frontend=http://{}", f.worker);
+    let flags = flags(dir, &[url]).expect("flags");
+    let (addr, maps, serving) = 'start: {
+        for _ in 0..500 {
+            let started = if half {
+                kbf_server::storage_half::start(&flags, never)
+                    .await
+                    .map(|n| {
+                        (
+                            n.addr,
+                            n.maps(),
+                            tokio::spawn(async move { n.serve().await }),
+                        )
+                    })
+            } else {
+                start_storage(&flags, never).await.map(|n| {
+                    (
+                        n.addr,
+                        n.maps(),
+                        tokio::spawn(async move { n.serve().await }),
+                    )
+                })
+            };
+            match started {
+                Ok(node) => break 'start node,
+                Err(e) if e.to_string().contains("Locked") => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("starts: {e}"),
+            }
+        }
+        panic!("the previous start never released its directory");
+    };
+    let channel = Endpoint::from_shared(format!("http://{addr}"))
+        .expect("endpoint")
+        .connect_lazy();
+    // The registration brought the map, so the node is ready to be written to as the map
+    // says.
+    let client = RemoteStorage::new(channel, 0);
+    client.set_map_generation(maps.generation());
+    let digest = client
+        .put(bytes::Bytes::from(text.to_owned()))
+        .await
+        .expect("a write is taken");
+    serving.abort();
+    let _ = serving.await;
+    digest
+}
+
+/// Who the node's metadata log, reopened from `dir` after the node stopped, says wrote
+/// the object that holds `digest`: `Some((member, boot))` for a node writer, `None` for
+/// an epoch writer.
+async fn written_by(dir: &Path, digest: &kbf_types::Digest) -> Option<(u64, u64)> {
+    use kbf_front::MetaLog as _;
+    let meta = 'open: {
+        for _ in 0..500 {
+            match kbf_server::RaftMetaLog::open_dir(
+                &dir.join("meta"),
+                kbf_meta::Retention::default(),
+                "kbf/",
+            )
+            .await
+            {
+                Ok(meta) => break 'open meta,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        panic!("the node never released its metadata directory");
+    };
+    let digest = *digest;
+    let answer = meta
+        .query(move |state| state.blob(&digest))
+        .await
+        .expect("query");
+    let kbf_meta::BlobAnswer::Present { location, .. } = answer else {
+        panic!("the log does not hold the blob: {answer:?}");
+    };
+    match location.object.writer() {
+        kbf_meta::Writer::Node(w) => Some((w.member().get(), w.boot().get())),
+        kbf_meta::Writer::Epoch(_) => None,
+    }
+}
+
+/// Catches: a registered node that names its objects in an epoch of its own log (mutant:
+/// `Cache::open_under` taken under `--frontend` in `assemble`, or `Cache::open` in the
+/// storage half), which a wiped node would then name again. A node of each kind
+/// registers with a frontend and writes: its metadata log says the object was written by
+/// the node writer of that registration (member and boot), not an epoch. The log can only
+/// say so if it committed `SetWriter` for that member and boot.
+#[tokio::test]
+async fn a_registered_node_writes_objects_named_by_member_and_boot() {
+    for (half, name) in [(false, "keys-node"), (true, "keys-half")] {
+        let (f, dir) = (frontend(None), dir(name));
+        let digest = write_as_registered(&f, &dir, half, "a registered node's blob").await;
+        let by = written_by(&dir, &digest).await;
+        assert!(by.is_some_and(|(m, b)| m > 0 && b > 0), "{name}: {by:?}");
+    }
+}
+
+/// Catches: a storage node that loses its metadata directory and names new objects as
+/// the old ones (the storage half of `kbf storage-and-daemon` opened its cache before it
+/// registered, as an epoch writer of its own log). Each kind of node writes, loses its
+/// metadata directory (the cold store stays), registers again at the same frontend and
+/// writes: both blobs are node-named, by pairs of `(member, boot)` that differ.
+#[tokio::test]
+async fn a_wiped_node_of_either_kind_never_reuses_its_keys() {
+    for (half, name) in [(false, "wipe-node"), (true, "wipe-half")] {
+        let (f, dir) = (frontend(None), dir(name));
+        let first = write_as_registered(&f, &dir, half, "before the wipe").await;
+        let before = written_by(&dir, &first).await;
+        std::fs::remove_dir_all(dir.join("meta")).expect("wipe");
+        let second = write_as_registered(&f, &dir, half, "after the wipe").await;
+        let after = written_by(&dir, &second).await;
+        assert!(
+            before.is_some() && after.is_some(),
+            "{name}: {before:?} {after:?}"
+        );
+        assert_ne!(before, after, "{name}: the wiped node is the same writer");
+    }
 }

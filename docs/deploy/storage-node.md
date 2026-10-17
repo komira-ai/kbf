@@ -295,10 +295,15 @@ kbf-server \
   modification time, never its bytes) at about 1000 files a second, or as fast as it
   can while the disk is under the free-space floor, and then:
   - keeps each file of an object the index names (staged on the write tier
-    included) or of this process's own writer epoch;
+    included) or of this process's own writer (its writer epoch, or for a node
+    registered with `--frontend` its member and boot);
   - deletes each file of an earlier epoch under this log's prefix that the index does
-    not name: an orphan, such as an upload that failed before its commit;
-  - keeps and counts a file under another prefix, and leaves a file without a header;
+    not name, while the process writes in an epoch: an orphan, such as an upload that
+    failed before its commit;
+  - keeps and counts as foreign every other file: under another prefix, or of another
+    writer (another node's, an earlier boot of this node's own member included, whose
+    metadata directory may have been wiped; or an epoch's, once the node writes as a
+    member and boot). It leaves a file without a header;
   - then forgets each indexed object, not staged, that has no file: its blobs leave
     the index, with every action-cache entry that needs one of them, so
     `FindMissingBlobs` reports them and the client uploads them again. Forgetting

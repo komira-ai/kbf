@@ -1,10 +1,11 @@
 //! `kbf_meta::Command` to and from `kbf.log.v1.MetaCommand`.
 
 use std::collections::BTreeSet;
+use std::num::NonZeroU64;
 
 use kbf_meta::{
-    ActionRecord, Closure, Command, Epoch, Generation, Location, ObjectId, Role, ServerId,
-    StagedPut, StoreId, TierId, Touch, UnreachableReason,
+    ActionRecord, Closure, Command, Epoch, Generation, Location, NodeWriter, ObjectId, Role,
+    ServerId, StagedPut, StoreId, TierId, Touch, UnreachableReason, Writer,
 };
 use kbf_proto::kbf::log::v1 as proto;
 use kbf_types::{Digest, DigestFunction, FarmTime};
@@ -29,10 +30,37 @@ pub(crate) const fn since_v3(command: &Command) -> bool {
     matches!(command, Command::EvictObjects { .. })
 }
 
+/// Whether `command` joined the log in [`Format::V4`](crate::Format::V4): `SetWriter`,
+/// and any command that names an object of a node writer.
+pub(crate) fn since_v4(command: &Command) -> bool {
+    let node = |o: &ObjectId| matches!(o.writer(), Writer::Node(_));
+    match command {
+        Command::SetWriter(_) => true,
+        Command::PutBlob { location, .. } => node(&location.object),
+        Command::PutBlobs(blobs) => blobs.iter().any(|(_, l)| node(&l.object)),
+        Command::PutStaged { objects, .. } => objects.iter().any(|p| node(&p.object)),
+        Command::ObjectUnreachable { object, .. }
+        | Command::ObjectReachable { object, .. }
+        | Command::SealStaged { object }
+        | Command::ObjectFlushed { object }
+        | Command::FlushConflict { object } => node(object),
+        Command::EvictObjects { objects } => objects.iter().any(node),
+        Command::Tick(_)
+        | Command::AllocEpoch
+        | Command::PutAction { .. }
+        | Command::Touch(_)
+        | Command::Collect
+        | Command::AddTier { .. } => false,
+    }
+}
+
 /// Whether `format` takes `command`: format 1 takes neither the format-2 nor the
-/// format-3 commands, format 2 takes no format-3 command.
-pub(crate) const fn takes(format: Format, command: &Command) -> bool {
-    if since_v3(command) {
+/// format-3 commands, format 2 takes no format-3 command, and no format before 4 takes
+/// a format-4 one (`SetWriter`, or a node writer's object in any command).
+pub(crate) fn takes(format: Format, command: &Command) -> bool {
+    if since_v4(command) {
+        format.get() >= Format::V4.get()
+    } else if since_v3(command) {
         format.get() >= Format::V3.get()
     } else if since_v2(command) {
         format.get() >= Format::V2.get()
@@ -111,6 +139,10 @@ pub(crate) fn to_proto(command: &Command) -> Result<proto::MetaCommand, EncodeEr
         Command::EvictObjects { objects } => P::EvictObjects(proto::EvictObjects {
             objects: objects.iter().copied().map(object_id).collect(),
         }),
+        Command::SetWriter(writer) => P::SetWriter(proto::SetWriter {
+            member: writer.member().get(),
+            boot: writer.boot().get(),
+        }),
     };
     Ok(proto::MetaCommand { command: Some(c) })
 }
@@ -157,9 +189,15 @@ fn digests<'a>(set: impl Iterator<Item = &'a Digest>) -> Result<Vec<proto::Diges
 }
 
 const fn object_id(object: ObjectId) -> proto::ObjectId {
+    let (epoch, member, boot) = match object.writer() {
+        Writer::Epoch(e) => (e.get(), 0, 0),
+        Writer::Node(n) => (0, n.member().get(), n.boot().get()),
+    };
     proto::ObjectId {
-        epoch: object.epoch().get(),
+        epoch,
         seq: object.seq(),
+        member,
+        boot,
     }
 }
 
@@ -255,6 +293,10 @@ pub(crate) fn from_proto(command: proto::MetaCommand) -> Result<Command, DecodeE
             P::EvictObjects(e) => Command::EvictObjects {
                 objects: object_set(e.objects, "EvictObjects.objects")?,
             },
+            P::SetWriter(w) => Command::SetWriter(NodeWriter::new(
+                NonZeroU64::new(w.member).ok_or(DecodeError::Missing("SetWriter.member"))?,
+                NonZeroU64::new(w.boot).ok_or(DecodeError::Missing("SetWriter.boot"))?,
+            )),
         },
     )
 }
@@ -340,8 +382,8 @@ fn object_set(
 ) -> Result<BTreeSet<ObjectId>, DecodeError> {
     let ids: Vec<ObjectId> = objects
         .into_iter()
-        .map(|o| ObjectId::new(Epoch::new(o.epoch), o.seq))
-        .collect();
+        .map(|o| from_object(o, field))
+        .collect::<Result<_, _>>()?;
     if ids.windows(2).any(|w| w[0] >= w[1]) {
         return Err(DecodeError::SetOrder(field));
     }
@@ -352,6 +394,23 @@ fn required_object(
     object: Option<proto::ObjectId>,
     field: &'static str,
 ) -> Result<ObjectId, DecodeError> {
-    let object = object.ok_or(DecodeError::Missing(field))?;
-    Ok(ObjectId::new(Epoch::new(object.epoch), object.seq))
+    from_object(object.ok_or(DecodeError::Missing(field))?, field)
+}
+
+/// An object id: an epoch writer's when `member` and `boot` are both zero (any epoch,
+/// as every format before 4 reads it), a node writer's when `epoch` is zero and both
+/// are not, refused otherwise.
+fn from_object(object: proto::ObjectId, field: &'static str) -> Result<ObjectId, DecodeError> {
+    let proto::ObjectId {
+        epoch,
+        seq,
+        member,
+        boot,
+    } = object;
+    let writer = match (epoch, NonZeroU64::new(member), NonZeroU64::new(boot)) {
+        (_, None, None) => Writer::Epoch(Epoch::new(epoch)),
+        (0, Some(member), Some(boot)) => Writer::Node(NodeWriter::new(member, boot)),
+        _ => return Err(DecodeError::Writer(field)),
+    };
+    Ok(ObjectId::of(writer, seq))
 }

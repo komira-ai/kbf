@@ -50,11 +50,12 @@ mod connection;
 mod upload;
 
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use kbf_meta::{Epoch, ObjectId};
+use kbf_meta::{Epoch, NodeWriter, ObjectId, Writer};
 use kbf_objstore::ObjectStore;
 use kbf_proto::worker::segments_server::Segments;
 use kbf_proto::worker::{
@@ -593,10 +594,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
             .zip(found)
             .map(|(digest, location)| BlobLocation {
                 digest: Some(wire::digest_to_proto(digest)),
-                object: location.map(|l| ObjectRef {
-                    epoch: l.object.epoch().get(),
-                    seq: l.object.seq(),
-                }),
+                object: location.map(|l| object_ref(l.object)),
                 offset: location.map_or(0, |l| l.offset),
             })
             .collect();
@@ -618,7 +616,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
             )));
         }
         let object = object.ok_or_else(|| Status::invalid_argument("no object named"))?;
-        let id = ObjectId::new(Epoch::new(object.epoch), object.seq);
+        let id = object_id(&object)?;
         match self
             .shared
             .cache
@@ -629,11 +627,47 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
                 bytes: bytes.to_vec(),
             })),
             None => Err(Status::not_found(format!(
-                "object {}/{} holds no {length} bytes at {offset}",
-                object.epoch, object.seq
+                "object {id} holds no {length} bytes at {offset}"
             ))),
         }
     }
+}
+
+/// `object` on the wire: an epoch writer's with `member` and `boot` zero, a node
+/// writer's with `epoch` zero.
+fn object_ref(object: ObjectId) -> ObjectRef {
+    let (epoch, member, boot) = match object.writer() {
+        Writer::Epoch(e) => (e.get(), 0, 0),
+        Writer::Node(n) => (0, n.member().get(), n.boot().get()),
+    };
+    ObjectRef {
+        epoch,
+        seq: object.seq(),
+        member,
+        boot,
+    }
+}
+
+/// The object `object` names: an epoch writer's when `member` and `boot` are both
+/// zero, a node writer's when `epoch` is zero and both are not.
+///
+/// # Errors
+/// INVALID_ARGUMENT for any other combination.
+fn object_id(object: &ObjectRef) -> Result<ObjectId, Status> {
+    let writer = match (
+        object.epoch,
+        NonZeroU64::new(object.member),
+        NonZeroU64::new(object.boot),
+    ) {
+        (epoch, None, None) => Writer::Epoch(Epoch::new(epoch)),
+        (0, Some(member), Some(boot)) => Writer::Node(NodeWriter::new(member, boot)),
+        _ => {
+            return Err(Status::invalid_argument(
+                "an object names an epoch alone, or a member and a boot alone",
+            ));
+        }
+    };
+    Ok(ObjectId::of(writer, object.seq))
 }
 
 #[cfg(test)]
