@@ -15,7 +15,7 @@ use kbf_objstore::{
     ObjectStoreError, PageSize,
 };
 
-use super::{one_voter, open_registered, prefix_root};
+use super::{one_voter, open_among, open_registered, prefix_root};
 use crate::RaftMetaLog;
 use crate::join::Joined;
 
@@ -230,4 +230,34 @@ fn only_a_single_voter_log_is_raised_for_a_node() {
         one_voter(3).err().as_deref(),
         Some("a registered storage node's metadata log has 3 voters; it must have one")
     );
+}
+
+/// Catches: a registered node's open that does not refuse a log of several voters
+/// (mutant: the [`one_voter`] call dropped from the open): the open fails with the
+/// voters' message before the log is raised or anything is written. A log this version
+/// creates has one voter, so the count is the open's argument.
+#[tokio::test]
+async fn a_log_of_several_voters_refuses_the_open_before_it_is_raised() {
+    let dir = meta_dir("voters");
+    let bucket = Bucket::default();
+    let meta = RaftMetaLog::open_dir(&dir, Retention::default(), "kbf/")
+        .await
+        .expect("open the log");
+    let keys = ObjectKeys::under(meta.store_prefix());
+    let one = std::num::NonZeroU64::new(1).expect("not zero");
+    let refused = open_among(meta, bucket.clone(), keys, (one, one), 3)
+        .await
+        .err()
+        .map(|e| e.to_string());
+    assert_eq!(
+        refused.as_deref(),
+        Some("a registered storage node's metadata log has 3 voters; it must have one")
+    );
+    assert!(bucket.written().is_empty());
+    let meta = RaftMetaLog::open_dir(&dir, Retention::default(), "kbf/")
+        .await
+        .expect("open the log again");
+    assert_eq!(meta.machine_version(), MachineVersion::V1, "nothing raised");
+    drop(meta);
+    let _ = std::fs::remove_dir_all(dir);
 }

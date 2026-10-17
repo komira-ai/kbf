@@ -25,7 +25,9 @@
 //! - **Writes** ([`Router::put`], [`Router::commit_action_record`]) go to the first
 //!   write owner that is not `Down` in the map, and to that one only: the router does not
 //!   write to the others or retry on another owner (the storage side's chain replication
-//!   is av2-11).
+//!   is av2-11). An action-cache entry is committed where its action is, and a node
+//!   checks an entry against the blobs it holds itself: [`Router::commit_with_closure`]
+//!   first copies the entry's blobs to that node, from wherever the map has them.
 //! - **`STALE_MAP`**: a node that holds a newer map answers [`StorageError::StaleMap`].
 //!   The router fetches the newer map through the [`MapSource`] and runs the call again,
 //!   once; a second answer, or a fetch that brings no newer map, is `UNAVAILABLE`.
@@ -33,8 +35,10 @@
 //! # What it does not do
 //!
 //! It is not a [`kbf_storage::Storage`]: that trait's `prepare_action_result` carries no
-//! action digest, so it has no owner to go to until av2-12 decides how an entry's closure
-//! is checked across owners. Writes take the blob whole (`Router::put`), as the storage
+//! action digest, so it has no owner to go to. (The frontend does the work of a prepare
+//! itself, over [`Router::find_missing`] and [`Router::put`]; how an entry's closure is
+//! checked across owners for good is av2-12's, and [`Router::commit_with_closure`] stands
+//! in until then.) Writes take the blob whole (`Router::put`), as the storage
 //! trait does today; a streamed write is the storage trait's to gain.
 //!
 //! # TLS
@@ -58,6 +62,6 @@ mod write;
 pub use nodes::{Liveness, Nodes, TlsNodes};
 pub use repair::{ReadRepair, RepairLimit};
 pub use resume::MAX_RESUMES;
-pub use router::{Placement, Router};
+pub use router::{DEFAULT_COPY_BYTES, Placement, Router};
 pub use sink::{BlobSink, IntoError};
 pub use source::{MapSource, MapView, RefetchError};

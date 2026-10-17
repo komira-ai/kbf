@@ -49,7 +49,7 @@ fn a_storage_unit_names_its_stores_listener_and_tls_and_its_key() {
     let env = format!("EnvironmentFile={KEY}\n");
     let key = Path::new(KEY);
     assert_eq!(
-        storage(&storage_unit(FULL, &env), key),
+        storage(&storage_unit(FULL, &env), key, false),
         Vec::<String>::new()
     );
     for f in STORAGE_FLAGS {
@@ -57,19 +57,19 @@ fn a_storage_unit_names_its_stores_listener_and_tls_and_its_key() {
             .split_whitespace()
             .filter(|w| !w.starts_with(&format!("--{f}=")))
             .collect();
-        let got = storage(&storage_unit(&dropped.join(" "), &env), key);
+        let got = storage(&storage_unit(&dropped.join(" "), &env), key, false);
         assert_eq!(got.len(), 1, "--{f}: {got:?}");
         assert!(got[0].starts_with(&format!("gives no --{f}:")), "{got:?}");
     }
     let empty = FULL.replace("--meta-dir=/var/lib/kbf-server/raft", "--meta-dir=");
-    assert_eq!(storage(&storage_unit(&empty, &env), key).len(), 1);
+    assert_eq!(storage(&storage_unit(&empty, &env), key, false).len(), 1);
     let spaced = FULL.replace("--cold-store=", "--cold-store ");
     assert_eq!(
-        storage(&storage_unit(&spaced, &env), key),
+        storage(&storage_unit(&spaced, &env), key, false),
         Vec::<String>::new()
     );
     assert_eq!(
-        storage(&storage_unit(FULL, ""), key),
+        storage(&storage_unit(FULL, ""), key, false),
         [
             "has an s3:// cold store and no EnvironmentFile=/etc/kbf/s3.env: kbf storage starts without the bucket's key pair and refuses"
         ]
@@ -77,14 +77,17 @@ fn a_storage_unit_names_its_stores_listener_and_tls_and_its_key() {
     // The key given through an optional, quoted file still counts.
     let quoted = format!("EnvironmentFile=-\"{KEY}\"\n");
     assert_eq!(
-        storage(&storage_unit(FULL, &quoted), key),
+        storage(&storage_unit(FULL, &quoted), key, false),
         Vec::<String>::new()
     );
     let file = FULL.replace(
         "s3://kbf-cas?endpoint=http://127.0.0.1:9000",
         "file:///var/lib/kbf/cold",
     );
-    assert_eq!(storage(&storage_unit(&file, ""), key), Vec::<String>::new());
+    assert_eq!(
+        storage(&storage_unit(&file, ""), key, false),
+        Vec::<String>::new()
+    );
 }
 
 /// Catches a variable not found in either of systemd's spellings, an unclosed brace

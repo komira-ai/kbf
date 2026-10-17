@@ -2,16 +2,14 @@
 //! the one `kbf` binary (docs/design/architecture-v2.md, sections 1 and 11), from the
 //! templates in `templates/linux/modes/`, beside `kbf.slice`.
 //!
-//! Each unit runs `<KBF_BIN_DIR>/kbf <mode> ...`. A mode `kbf` runs today (`daemon`,
-//! `all-in-one`, `storage`, `storage-and-daemon`) carries the flags its old binary's
-//! unit carries (`storage` its stores, its listen address and its certificate flags;
-//! `storage-and-daemon` the storage unit's three certificate flags and the daemon's:
-//! a TODO comment marks where its stores go); a mode not built yet (`frontend`)
-//! carries none, and its template marks where its flags go with a `TODO:` comment.
-//! The flags the new modes add
-//! (`--frontend`, `--advertise-addr`, the certificate flags) are such TODO comments
-//! too, never guessed: `TODO(registration):` marks the frontend's DNS name and the
-//! storage map it pushes, which come with registration.
+//! Each unit runs `<KBF_BIN_DIR>/kbf <mode> ...` with the flags that mode's `kbf` takes:
+//! `frontend` its three listeners, the storage URL with the frontend's client
+//! certificate, and the SQLite state store; `storage` its stores, its listen address and
+//! its certificate flags; `daemon` the flags `kbf-daemon`'s unit has; `storage-and-daemon`
+//! the storage unit's flags, its registration with the frontend (`--frontend`,
+//! `--advertise-addr`) and the daemon's; `all-in-one` the frontend's and the daemon's.
+//! `TODO(registration):` in the `storage` and `daemon` templates marks the frontend's DNS
+//! name there (`--frontend`, `--advertise-addr`), which those two modes do not give yet.
 //!
 //! [`check`] reads a rendered unit back, with its drop-ins ([`UnitText`]). Its rules,
 //! and the defect each catches:
@@ -22,8 +20,6 @@
 //!   and 239 and older join it into the value, so its words become arguments.
 //! - `exec`: `ExecStart=` is `<KBF_BIN_DIR>/kbf <mode>`, this unit's mode (a unit
 //!   that starts another mode, or an old binary, under this mode's name).
-//! - `flags`: a mode not built yet has no word after its name (kbf takes anything there
-//!   and exits 2, so a flag in its unit would be checked by nothing).
 //! - `slice`: the unit is in `kbf.slice`.
 //! - `delegate`: a mode that runs builds delegates `cpu`, `cpuset`, `memory` and `pids`
 //!   (`Delegate=yes` delegates them all) and disables none of them
@@ -34,25 +30,31 @@
 //!   (`yes` sets the whole set, `no` clears it), a list adds its controllers to what
 //!   earlier lines gave (so `Delegate=yes` then `Delegate=memory` still delegates all),
 //!   an empty value starts over with none.
-//! - `credential`: the units of a mode without a storage half that reads the key
-//!   (`daemon`, `storage-and-daemon`, `all-in-one`) do not give it the cold store's
-//!   key; [`super::credential`] says what the rule reads and what it cannot see. The
-//!   unit that holds the key (`storage`) runs as a user of its own: a `User=` that is
-//!   not `KBF_USER`, the user builds run as.
-//! - `storage`: the `storage` unit gives its cold store, metadata directory, listen
-//!   address and the three certificate flags, and an `s3://` cold store comes with the
-//!   key file ([`super::stores`]).
+//! - `credential`: the units of a mode without a storage half (`daemon`, `all-in-one`)
+//!   do not give it the cold store's key; [`super::credential`] says what the rule reads
+//!   and what it cannot see. The unit that holds the key (`storage`) runs as a user of
+//!   its own: a `User=` that is not `KBF_USER`, the user builds run as.
+//!   `storage-and-daemon` runs as `KBF_USER` and holds the key in exactly one way: the
+//!   `EnvironmentFile=<KBF_ETC>/s3.env`, which on the node is a plain file, root's, with
+//!   no group or other bit; every other way the rule refuses in a build node's unit it
+//!   refuses there too.
+//! - `storage`: the `storage` and `storage-and-daemon` units give their cold store,
+//!   metadata directory, listen address and the three certificate flags, and an `s3://`
+//!   cold store comes with the key file ([`super::stores`]).
 //! - `state-store`: a `--state-store` the unit gives is `sqlite:///<absolute path>`
 //!   and names no variable (systemd would expand it into kbf's argv); postgres is not
 //!   wired yet, so a Postgres URI fails ([`super::stores`]).
 //! - `ports`: no two of the unit's listeners share a port ([`super::stores`]).
+//! - `handover`: the frontend's unit is the template `kbf-frontend@.service` whose two
+//!   instances hand over to one another: `Type=notify`, a control socket in a preserved
+//!   `RuntimeDirectory=`, no `Conflicts=` ([`super::handover`]).
 //! - `stop`: a mode that drains on SIGTERM (every mode but `daemon`) has
 //!   `TimeoutStopSec=infinity` and `KillSignal=SIGTERM`, so systemd never kills it
 //!   mid-drain and fails the builds in flight ([`super::stop`]).
 //!
 //! [`check_on_host`] adds the rules that read the host, and reads `kbf.slice`:
 //!
-//! - `parse`: a built mode's flags are ones `kbf <mode>` takes, by kbf's own parser:
+//! - `parse`: a mode's flags are ones `kbf <mode>` takes, by kbf's own parser:
 //!   `<kbf> check-args <mode> <flags...>` must exit 0 (it parses as a start would and
 //!   starts nothing). `<kbf>` is `--kbf-bin` when given; else the unit's own
 //!   `ExecStart=` binary when it is there; else the rule is skipped with a `SKIP parse:`
@@ -90,7 +92,7 @@ use kbf_host::step::Cmd;
 use super::check::{Failure, Report, angle_placeholder};
 use super::config::{LinuxConfig, LinuxError};
 use super::render::{SLICE, values};
-use super::{cpuset, credential, stop, stores};
+use super::{cpuset, credential, handover, stop, stores};
 use crate::template::{self, TemplateError, leftovers};
 use crate::unit::{UnitError, UnitFile, comments_in_continuations};
 
@@ -100,6 +102,11 @@ pub const COLD_STORE_KEY_FILE: &str = "s3.env";
 
 /// The controllers a mode that runs builds must have delegated (rule `delegate`).
 pub const DELEGATED: [&str; 4] = ["cpu", "cpuset", "memory", "pids"];
+
+/// The instances of the frontend's template: one serves, and an update starts the other
+/// (rule `handover`, `kbf frontend handover`). Only the first is enabled at boot
+/// (`DefaultInstance=` in the template).
+pub const FRONTEND_INSTANCES: [&str; 2] = ["a", "b"];
 
 /// The word after `kbf` that parses a command line and starts nothing (kbf-cli's
 /// `kbf_cli::CHECK_ARGS`; its tests hold the two equal).
@@ -138,16 +145,6 @@ impl Mode {
         }
     }
 
-    /// Whether `kbf <mode>` has a command line of its own yet. A mode that has none
-    /// takes anything and exits 2, so its unit carries no flag (rule `flags`).
-    #[must_use]
-    pub fn is_built(self) -> bool {
-        matches!(
-            self,
-            Mode::Storage | Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne
-        )
-    }
-
     /// Whether the mode runs builds, and so manages its own cgroup (rule `delegate`).
     #[must_use]
     pub fn runs_builds(self) -> bool {
@@ -161,13 +158,20 @@ impl Mode {
         !matches!(self, Mode::Daemon)
     }
 
-    /// Whether the mode runs builds without a storage half that reads the cold store's
-    /// key today (rule `credential`): `all-in-one`'s cold store is a `file://`
-    /// directory, and `storage-and-daemon` gets the key once its storage half's uid is
-    /// split from the actions' (design section 9).
+    /// Whether the mode runs builds with no cold store of its own to read (rule
+    /// `credential`): `all-in-one`'s cold store is a `file://` directory.
     #[must_use]
     pub fn holds_no_key(self) -> bool {
-        matches!(self, Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne)
+        matches!(self, Mode::Daemon | Mode::AllInOne)
+    }
+
+    /// Whether the mode's unit holds the cold store's key beside the builds it runs
+    /// (rule `credential`): `storage-and-daemon`, by `EnvironmentFile=<KBF_ETC>/s3.env`
+    /// alone, a file root owns. Its storage half's uid is not split from the actions'
+    /// yet (design section 9), so the unit is for a trusted network.
+    #[must_use]
+    pub fn holds_key_beside_builds(self) -> bool {
+        self == Mode::StorageAndDaemon
     }
 
     /// Whether the mode's unit holds the cold store's key (rule `credential`): the
@@ -177,15 +181,32 @@ impl Mode {
         self == Mode::Storage
     }
 
-    /// The unit's file name: `kbf-<mode>.service`.
+    /// The unit's file name: `kbf-<mode>.service`, and for the frontend the template
+    /// `kbf-frontend@.service` (see [`FRONTEND_INSTANCES`]).
     #[must_use]
     pub fn unit_name(self) -> String {
-        format!("kbf-{}.service", self.name())
+        match self {
+            Mode::Frontend => "kbf-frontend@.service".to_owned(),
+            _ => format!("kbf-{}.service", self.name()),
+        }
+    }
+
+    /// The units the mode runs as: its own name, or for the frontend each instance of
+    /// its template (`kbf-frontend@a.service`, `kbf-frontend@b.service`).
+    #[must_use]
+    pub fn instances(self) -> Vec<String> {
+        match self {
+            Mode::Frontend => FRONTEND_INSTANCES
+                .iter()
+                .map(|i| format!("kbf-frontend@{i}.service"))
+                .collect(),
+            _ => vec![self.unit_name()],
+        }
     }
 
     fn template(self) -> &'static str {
         match self {
-            Mode::Frontend => include_str!("../../templates/linux/modes/kbf-frontend.service"),
+            Mode::Frontend => include_str!("../../templates/linux/modes/kbf-frontend@.service"),
             Mode::Storage => include_str!("../../templates/linux/modes/kbf-storage.service"),
             Mode::Daemon => include_str!("../../templates/linux/modes/kbf-daemon.service"),
             Mode::StorageAndDaemon => {
@@ -295,7 +316,7 @@ pub fn check(
 /// [`check`] on `unit` and its drop-ins, `kbf.slice` (`slice`, with its drop-ins), and
 /// then the rules that read the host `exec` runs on: `parse` (`kbf_bin`, or the unit's
 /// own binary when `exec` shows it there, run as `<kbf> check-args <mode> <flags...>`
-/// for a built mode whose `ExecStart=` passes rule `exec`), `cpuset`, and
+/// for a mode whose `ExecStart=` passes rule `exec`), `cpuset`, and
 /// `credential`'s reading of the environment files. A rule skipped is a note.
 pub fn check_on_host<E: Exec>(
     exec: &E,
@@ -337,6 +358,20 @@ pub fn check_on_host<E: Exec>(
         }
         notes.extend(found.notes);
     }
+    if mode.holds_key_beside_builds() {
+        let found = credential::on_host(exec, &merged, &key_file(config));
+        for how in found.failures {
+            fail("credential", credential_message(&name, &how));
+        }
+        notes.extend(found.notes);
+        let key = HostPath::new(&key_file(config).to_string_lossy())
+            .expect("KBF_ETC is an absolute path, and so is the key file under it");
+        let found = credential::root_key_on_host(exec, &merged, &key);
+        for how in found.failures {
+            fail("credential", root_key_message(&name, &how));
+        }
+        notes.extend(found.notes);
+    }
     if mode.holds_key() {
         let key = HostPath::new(&key_file(config).to_string_lossy())
             .expect("KBF_ETC is an absolute path, and so is the key file under it");
@@ -347,7 +382,7 @@ pub fn check_on_host<E: Exec>(
         notes.extend(found.notes);
     }
     let argv = merged.exec_start();
-    if mode.is_built() && runs_this_mode(config, mode, &argv) {
+    if runs_this_mode(config, mode, &argv) {
         let found = match kbf_bin {
             Some(bin) => Some(bin.clone()),
             None => on_host(exec, argv[0]),
@@ -435,7 +470,7 @@ fn runs_this_mode(config: &LinuxConfig, mode: Mode, argv: &[&str]) -> bool {
 }
 
 /// systemd's booleans (`parse_boolean`, any case).
-fn boolean(value: &str) -> Option<bool> {
+pub(super) fn boolean(value: &str) -> Option<bool> {
     let v = value.to_ascii_lowercase();
     if ["1", "yes", "y", "true", "t", "on"].contains(&v.as_str()) {
         Some(true)
@@ -500,6 +535,13 @@ fn holder_message(name: &str, how: &str) -> String {
     )
 }
 
+fn root_key_message(name: &str, how: &str) -> String {
+    format!(
+        "{name} holds the cold store's key beside its builds and {how}: the key file is \
+         root's alone, mode 0600, which systemd reads and the unit's user cannot replace"
+    )
+}
+
 fn credential_message(name: &str, how: &str) -> String {
     format!(
         "{name} gives a build node the cold store's key ({how}): a build node holds no \
@@ -557,17 +599,6 @@ fn rules(
         );
     }
 
-    // flags
-    if !mode.is_built() && argv.len() > 2 {
-        fail(
-            "flags",
-            format!(
-                "kbf {mode} is not built yet and takes no flag kbf can check, but {name} gives '{}'",
-                argv[2..].join(" ")
-            ),
-        );
-    }
-
     // slice
     if unit.get_in("Service", "Slice") != Some(SLICE) {
         fail("slice", format!("{name} is not in {SLICE}"));
@@ -608,8 +639,9 @@ fn rules(
     }
 
     // credential
-    if mode.holds_no_key() {
-        for how in credential::key_given(unit, &key_file(config)) {
+    if mode.holds_no_key() || mode.holds_key_beside_builds() {
+        let allowed = mode.holds_key_beside_builds();
+        for how in credential::key_given(unit, &key_file(config), allowed) {
             fail("credential", credential_message(&name, &how));
         }
     }
@@ -618,8 +650,9 @@ fn rules(
     }
 
     // storage
-    if mode == Mode::Storage {
-        for how in stores::storage(unit, &key_file(config)) {
+    if mode == Mode::Storage || mode.holds_key_beside_builds() {
+        let exact = mode.holds_key_beside_builds();
+        for how in stores::storage(unit, &key_file(config), exact) {
             fail("storage", format!("{name} {how}"));
         }
     }
@@ -632,6 +665,13 @@ fn rules(
     // ports
     for how in stores::ports(unit) {
         fail("ports", format!("{name}: {how}"));
+    }
+
+    // handover
+    if mode == Mode::Frontend {
+        for how in handover::check(unit) {
+            fail("handover", format!("{name} {how}"));
+        }
     }
 
     // stop
@@ -675,3 +715,7 @@ mod tests;
 #[cfg(test)]
 #[path = "modes_matrix_tests.rs"]
 mod matrix_tests;
+
+#[cfg(test)]
+#[path = "modes_keys_tests.rs"]
+mod keys_tests;

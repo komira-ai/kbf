@@ -6,6 +6,7 @@
 #![allow(dead_code)] // Each test binary uses its own part of this module.
 
 pub mod cache_kit;
+pub mod farm;
 pub mod memory;
 pub mod storage_node;
 
@@ -30,7 +31,7 @@ use kbf_proto::worker::{
 };
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose,
+    KeyPair, KeyUsagePurpose, SanType,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -55,6 +56,17 @@ pub struct Pki {
 }
 
 impl Pki {
+    /// The same for the server's worker listener (`kbf_server::WorkerTls`).
+    pub fn worker_tls(&self) -> kbf_server::TlsSource {
+        kbf_server::TlsSource::fixed(
+            "worker",
+            self.server_cert.as_bytes(),
+            self.server_key.as_bytes(),
+            Some(self.ca.as_bytes()),
+        )
+        .expect("the worker listener's TLS")
+    }
+
     /// The server half: mutual TLS that requires a client certificate from this CA.
     pub fn server_tls(&self) -> ServerTlsConfig {
         ServerTlsConfig::new()
@@ -110,6 +122,11 @@ pub fn pki(name: &str) -> Pki {
 
     let leaf = |names: Vec<String>, cn: &str, eku: ExtendedKeyUsagePurpose| {
         let mut params = CertificateParams::new(names).expect("leaf params");
+        if eku == ExtendedKeyUsagePurpose::ClientAuth {
+            // The daemon role, as a real server's worker listener requires.
+            let role = "urn:kbf:role:daemon".try_into().expect("an IA5 name");
+            params.subject_alt_names.push(SanType::URI(role));
+        }
         params.distinguished_name.push(DnType::CommonName, cn);
         params.extended_key_usages = vec![eku];
         let key = KeyPair::generate().expect("leaf key");

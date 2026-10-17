@@ -24,11 +24,13 @@
 //! certificate and trusts `--storage-client-ca`. It advertises `--advertise-addr`, or the
 //! address it bound (which must then not be a wildcard). The node never talks to the state
 //! store. The maps the frontend sends it (at registration, and at any heartbeat that finds
-//! it behind) are kept in a [`kbf_mapsync::MapHolder`] ([`StorageHandle::maps`]). Until the
-//! first one arrives the node answers every call UNAVAILABLE `no storage map yet`
-//! ([`crate::serve::bind_storage_gated`]): it does not know the farm's members, so it
-//! cannot know which blobs are its own. Every request still carries a generation, which
-//! the node ignores; the `STALE_MAP` check is the storage service's.
+//! it behind) are kept in a [`kbf_mapsync::MapHolder`] ([`StorageHandle::maps`]), which the
+//! node's storage service reads; the registration brings the first one, so it is held
+//! before the node serves. Until it holds one the node serves nothing (UNAVAILABLE), it
+//! answers a caller whose map is not the current one STALE_MAP, and under mutual TLS it is
+//! a link of the chain that copies a write to the blob's second owner, with the repair
+//! worker that makes a copy owed ([`StorageHandle::repairs`]); all as
+//! [`crate::replication`] says.
 //!
 //! **Object names.** A registered node writes as its registration's member id and boot
 //! counter (`kbf_meta::NodeWriter`): its metadata log is raised to machine version 4, it
@@ -42,7 +44,7 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -54,15 +56,19 @@ use kbf_log::{FarmLogId, MachineVersion};
 use kbf_mapsync::MapHolder;
 use kbf_meta::{NodeWriter, Retention};
 use kbf_objstore::{KeyPrefix, ObjectStore};
+use kbf_storage::repair::{RepairConfig, Repairs};
 use kbf_storage::service::CatchUp;
 use kbf_store::StdFs;
 use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
-use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig};
+use kbf_tls::{TlsFiles, TlsSource};
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 use crate::join::{self, Joined, Joiner};
+use crate::node_map::NodeMap;
 use crate::rebuild::Background;
-use crate::serve::{ServeError, StorageListener, bind_storage_socket, serve_storage};
+use crate::replication::{REPAIR_DIR, Registered, bind_node};
+use crate::serve::{ServeError, StorageListener, StorageSocket, bind_storage_socket};
 use crate::start::{AbortOnDrop, open_cold_file};
 use crate::startup_pass::StartPass;
 use crate::stores::{FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
@@ -88,6 +94,7 @@ pub const ALLOWED: &[&str] = &[
     "write_linger",
     "write_own_segment_bytes",
     "write_bytes_in_flight",
+    "tls_reload_interval_secs",
     "write_puts_in_flight",
     "store_put_attempts",
 ];
@@ -122,6 +129,8 @@ pub struct StorageFlags {
     pub zone: String,
     /// The weight to register with.
     pub weight: u32,
+    /// How the repair worker of a node that registered with a frontend is paced.
+    pub repair: RepairConfig,
 }
 
 /// The command line of `kbf storage`: [`Args`]'s, those it takes shown and the rest
@@ -260,6 +269,7 @@ pub fn parse(m: &ArgMatches) -> Result<StorageFlags, clap::Error> {
         advertise,
         zone: text(REGISTRATION[2]).unwrap_or_default(),
         weight: m.get_one::<u32>(REGISTRATION[3]).copied().unwrap_or(1),
+        repair: RepairConfig::default(),
     })
 }
 
@@ -274,14 +284,15 @@ impl StorageFlags {
     pub fn listener(&self) -> Result<StorageListener, ConfigError> {
         self.server.segment_upload_fits_write_bound()?;
         let tls = match &self.tls {
-            Some([cert, key, ca]) => Some(
-                ServerTlsConfig::new()
-                    .identity(Identity::from_pem(
-                        crate::config::read(cert)?,
-                        crate::config::read(key)?,
-                    ))
-                    .client_ca_root(Certificate::from_pem(crate::config::read(ca)?)),
-            ),
+            Some([cert, key, ca]) => Some(TlsSource::files(
+                "storage",
+                TlsFiles {
+                    cert: cert.clone(),
+                    key: key.clone(),
+                    client_ca: Some(ca.clone()),
+                },
+                Duration::from_secs(self.server.tls_reload_interval_secs),
+            )?),
             None if crate::config::loopback_only(self.listen.ip()) => None,
             None => {
                 return Err(ConfigError::PlaintextStorageOffLoopback { addr: self.listen });
@@ -297,30 +308,49 @@ impl StorageFlags {
         })
     }
 
+    /// The certificate this node calls with and the CA it trusts, as the flags name them:
+    /// for its registration with an `https://` frontend and for its calls to the other
+    /// storage nodes; `None` without the TLS flags.
+    ///
+    /// # Errors
+    /// A TLS file cannot be read.
+    pub fn peer_tls(&self) -> Result<Option<ClientTlsConfig>, ConfigError> {
+        let Some([cert, key, ca]) = &self.tls else {
+            return Ok(None);
+        };
+        let identity = Identity::from_pem(crate::config::read(cert)?, crate::config::read(key)?);
+        let ca = Certificate::from_pem(crate::config::read(ca)?);
+        Ok(Some(
+            ClientTlsConfig::new().identity(identity).ca_certificate(ca),
+        ))
+    }
+
+    /// The address the node registers under, and so the one its member of the map
+    /// carries: `--advertise-addr`, or the address it `bound`.
+    #[must_use]
+    pub fn registers_as(&self, bound: SocketAddr) -> String {
+        self.advertise.clone().unwrap_or_else(|| bound.to_string())
+    }
+
     /// The registration with `--frontend`, for a node bound at `bound`, keeping the maps it
-    /// is sent in `maps`; `None` without the flag. Connects lazily, so a frontend that is down at start is waited for.
+    /// is sent in `node` and telling it which member it is; `None` without the flag.
+    /// Connects lazily, so a frontend that is down at start is waited for.
     ///
     /// # Errors
     /// A TLS file cannot be read or is refused; the URL is refused.
     pub fn joiner(
         &self,
         bound: SocketAddr,
-        maps: Arc<MapHolder>,
+        node: Arc<NodeMap>,
     ) -> Result<Option<Joiner>, Box<dyn Error>> {
         let Some(url) = &self.frontend else {
             return Ok(None);
         };
         let mut endpoint = Endpoint::from_shared(url.clone())?;
-        if let (true, Some([cert, key, ca])) = (url.starts_with("https://"), &self.tls) {
-            let tls = ClientTlsConfig::new()
-                .identity(Identity::from_pem(
-                    crate::config::read(cert)?,
-                    crate::config::read(key)?,
-                ))
-                .ca_certificate(Certificate::from_pem(crate::config::read(ca)?));
+        if let (true, Some(tls)) = (url.starts_with("https://"), self.peer_tls()?) {
             endpoint = endpoint.tls_config(tls)?;
         }
-        let addr = self.advertise.clone().unwrap_or_else(|| bound.to_string());
+        let addr = self.registers_as(bound);
         let identity = join::Identity {
             instance_id: addr.clone(),
             addr,
@@ -328,7 +358,7 @@ impl StorageFlags {
             weight: self.weight,
         };
         let joiner = Joiner::new(endpoint.connect_lazy(), identity, join::RETRY_BASE);
-        Ok(Some(joiner.with_maps(maps)))
+        Ok(Some(joiner.with_node(node)))
     }
 
     /// The `Segments` uploads the node keeps: `--segment-upload-*`.
@@ -351,10 +381,19 @@ pub struct StorageHandle {
     _background: Background,
     maps: Arc<MapHolder>,
     catch_up: CatchUp,
+    repairs: Option<Arc<Repairs>>,
     _joiner: Option<AbortOnDrop>,
+    _repair: Option<AbortOnDrop>,
 }
 
 impl StorageHandle {
+    /// The copies this node owes: its repair journal. `None` for a node that does not
+    /// replicate (no `--frontend`, or one that admits callers in plain text).
+    #[must_use]
+    pub fn repairs(&self) -> Option<Arc<Repairs>> {
+        self.repairs.clone()
+    }
+
     /// The storage map this node holds: what the frontend sent it when it registered and
     /// at each heartbeat that found it behind. Empty for a node with no `--frontend`.
     #[must_use]
@@ -389,6 +428,7 @@ impl StorageHandle {
             _flusher,
             _background,
             _joiner,
+            _repair,
             ..
         } = self;
         serving.await
@@ -463,12 +503,14 @@ where
     let (prefix, log) = (meta.store_prefix(), meta.log_id());
     let grace = Duration::from_millis(args.cold_store_evict_grace_ms);
     let pass = files.map(|files| StartPass::over_raft(files, grace));
+    // After the log is open: it refuses a directory that holds files it did not write.
+    let repair_dir = stores.meta_dir.join(REPAIR_DIR);
     assemble(
         flags,
         listener,
         stores.hot.as_ref(),
         (meta, store, prefix, log),
-        shutdown,
+        (shutdown, &repair_dir),
         pass,
         RebuildConfig::default(),
     )
@@ -483,7 +525,7 @@ async fn assemble<O, S, F>(
     listener: StorageListener,
     hot: Option<&Hot>,
     (meta, store, prefix, log): (RaftMetaLog<StdFs>, O, KeyPrefix, FarmLogId),
-    shutdown: S,
+    (shutdown, repair_dir): (S, &Path),
     pass: Option<StartPass<RaftMetaLog<StdFs>>>,
     rebuild: RebuildConfig,
 ) -> Result<StorageHandle, Box<dyn Error>>
@@ -492,10 +534,8 @@ where
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
-    let socket = bind_storage_socket(listener)?;
-    let maps = Arc::new(MapHolder::new());
-    let (cache, joiner, catch_up) =
-        open_cache(flags, socket.addr(), &maps, (meta, store, prefix, log)).await?;
+    let socket = bind_storage_socket(listener.listen)?;
+    let (cache, registered) = open_cache(flags, socket, (meta, store, prefix, log)).await?;
     let cache = cache.with_writes(flags.server.write_config());
     let (cache, tier) = crate::write_tier::attach(cache, hot).await?;
     let cache = Arc::new(cache);
@@ -503,59 +543,54 @@ where
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
         AbortOnDrop(tokio::spawn(flusher))
     });
+    let catch_up = registered.catch_up.clone();
     let _background = crate::rebuild::spawn(&cache, &catch_up, pass, rebuild);
     let storage = Arc::new(CacheStorage::new(cache, flags.segments()));
-    // A node that registers with a frontend is one of several: it serves nothing until
-    // it holds the map. One box (no `--frontend`) serves at once.
-    let gate = flags.frontend.as_ref().map(|_| Arc::clone(&maps));
-    let bound = serve_storage(storage, socket, gate, Some(catch_up.clone()), shutdown()?)?;
-    let _joiner = joiner.map(|(joiner, joined)| AbortOnDrop(tokio::spawn(joiner.keep(joined))));
+    let stop = Box::pin(shutdown()?);
+    let node = bind_node(flags, listener, registered, storage, repair_dir, stop)?;
     Ok(StorageHandle {
-        addr: bound.addr,
+        addr: node.addr,
         start_line: format!(
             "kbf-storage {SERVER_VERSION} storage={} log={log}",
-            bound.addr
+            node.addr
         ),
-        serving: Box::pin(bound.serving),
+        serving: node.serving,
         _flusher,
         _background,
-        maps,
+        maps: node.maps,
         catch_up,
-        _joiner,
+        repairs: node.repairs,
+        _joiner: node.joiner,
+        _repair: node.repair,
     })
 }
 
-/// The cache of a node bound at `bound`. With `--frontend` the node registers first (retrying
-/// until the frontend answers), so the cache writes as the registration's member and boot
-/// ([`open_registered`]); the registration and what it gave come back for the heartbeats
-/// ([`Joiner::keep`]). Without it the cache writes in an epoch of its own log.
+/// The cache of a node bound at `socket`. With `--frontend` the node registers first
+/// (retrying until the frontend answers), so the cache writes as the registration's member
+/// and boot ([`open_registered`]); the registration and what it gave come back for the
+/// heartbeats ([`Joiner::keep`]). Without it the cache writes in an epoch of its own log.
 ///
-/// The [`CatchUp`] says whether the node owes a rebuild of its index: a registered node
-/// whose log has not finished one does, and tells the frontend so in its registration, so
-/// the map ranks it last until it is done. A node without `--frontend` owes none: it
-/// keeps its objects under its log's own prefix, which no other log's loss can orphan.
+/// The [`CatchUp`] in [`Registered`] says whether the node owes a rebuild of its index: a
+/// registered node whose log has not finished one does, and tells the frontend so in its
+/// registration, so the map ranks it last until it is done. A node without `--frontend`
+/// owes none: it keeps its objects under its log's own prefix, which no other log's loss
+/// can orphan.
+/// `kbf storage` and the storage half of `kbf storage-and-daemon` both open theirs here.
 ///
 /// # Errors
 /// A TLS file or the frontend URL is refused, or the cache cannot be opened
 /// ([`open_registered`]).
 pub(crate) async fn open_cache<O: ObjectStore>(
     flags: &StorageFlags,
-    bound: SocketAddr,
-    maps: &Arc<MapHolder>,
+    socket: StorageSocket,
     (meta, store, prefix, log): (RaftMetaLog<StdFs>, O, KeyPrefix, FarmLogId),
-) -> Result<
-    (
-        Cache<RaftMetaLog<StdFs>, O>,
-        Option<(Joiner, Joined)>,
-        CatchUp,
-    ),
-    Box<dyn Error>,
-> {
+) -> Result<(Cache<RaftMetaLog<StdFs>, O>, Registered), Box<dyn Error>> {
     let keys = ObjectKeys {
         root: prefix_root(&prefix, log)?,
         legacy: prefix,
     };
-    Ok(match flags.joiner(bound, Arc::clone(maps))? {
+    let node = Arc::new(NodeMap::new(Arc::new(MapHolder::new())));
+    Ok(match flags.joiner(socket.addr(), Arc::clone(&node))? {
         Some(joiner) => {
             let done = meta.query(|state| state.rebuild().is_done()).await?;
             let catch_up = if done {
@@ -566,12 +601,25 @@ pub(crate) async fn open_cache<O: ObjectStore>(
             let mut joiner = joiner.with_catch_up(catch_up.clone());
             let joined = joiner.join().await;
             let cache = open_registered(meta, store, keys, &joined).await?;
-            (cache, Some((joiner, joined)), catch_up)
+            let joiner = Some((joiner, joined));
+            (
+                cache,
+                Registered {
+                    socket,
+                    node,
+                    joiner,
+                    catch_up,
+                },
+            )
         }
         None => (
             Cache::open_under(meta, store, keys).await?,
-            None,
-            CatchUp::caught_up(),
+            Registered {
+                socket,
+                node,
+                joiner: None,
+                catch_up: CatchUp::caught_up(),
+            },
         ),
     })
 }
@@ -617,7 +665,19 @@ pub(crate) async fn open_registered<O: ObjectStore>(
         )
         .into());
     };
-    one_voter(meta.voters())?;
+    let voters = meta.voters();
+    open_among(meta, store, keys, (member, boot), voters).await
+}
+
+/// [`open_registered`] for a node named `(member, boot)`, over a log of `voters` voters.
+async fn open_among<O: ObjectStore>(
+    meta: RaftMetaLog<StdFs>,
+    store: O,
+    keys: ObjectKeys,
+    (member, boot): (NonZeroU64, NonZeroU64),
+    voters: usize,
+) -> Result<Cache<RaftMetaLog<StdFs>, O>, Box<dyn Error>> {
+    one_voter(voters)?;
     meta.raise_machine_version(MachineVersion::V4)?;
     Ok(Cache::open_node(meta, store, keys, NodeWriter::new(member, boot)).await?)
 }

@@ -12,11 +12,24 @@
 //!   ([`kbf_server::storage_half::start`]), on an async runtime of its own, and prints
 //!   `kbf storage`'s start line on stdout. Its listener serves the frontend and other
 //!   nodes as any storage node's does.
-//! - **The daemon half** starts as `kbf-daemon` does (`kbf_node::start_with`), on an
-//!   async runtime of its own, its data plane [`crate::LocalDataPlane`] over the storage
-//!   half's [`kbf_storage::Storage`]: no gRPC client, no TLS and no encoding for a
-//!   blob. Its control plane is a remote daemon's: `--server` names the frontend's
-//!   (today the server's) worker listener, over mutual TLS with the node's certificate.
+//! - **The daemon half** starts as `kbf-daemon` does, on an async runtime of its own. Its
+//!   control plane is a remote daemon's: `--server` names the frontend's (today the
+//!   server's) worker listener, over mutual TLS with the node's certificate. Its data
+//!   plane depends on whether the node registers with a frontend (`--frontend`):
+//!   - **Without one** the node is the whole farm, a map of itself:
+//!     [`crate::LocalDataPlane`] over the storage half's [`kbf_storage::Storage`]
+//!     (`kbf_node::start_with`): no gRPC client, no TLS and no encoding for a blob.
+//!   - **With one** the farm has other nodes, and a blob belongs to the member the
+//!     frontend's map names, not to this node (`kbf_node::start_member`). The daemon
+//!     routes every blob by the map its frontend sends it (`Welcome.map`), as a
+//!     standalone daemon does: a blob owned by this node's member (the one registered
+//!     under `--advertise-addr`, or the bound address) goes in-process to the storage
+//!     half, with no socket; any other goes over mutual TLS to its owner. **No map, no
+//!     write**: until the daemon holds a map every call fails UNAVAILABLE (there is no
+//!     `--cas` leg to fall back on), and until the storage half holds one its service refuses
+//!     every call, its own member's included (UNAVAILABLE, as it refuses any caller's). The
+//!     in-process plane of the one-box mode moves output files without spooling them
+//!     (`Cas::intake`); the routed plane does not yet.
 //! - **One cache**: when the hot store is a directory on `--data-dir`'s filesystem, as
 //!   in `kbf all-in-one` (`crate::one_cache`).
 //! - **Stopping**: as `kbf all-in-one`, the storage half in the server half's place.
@@ -27,11 +40,19 @@
 //! Linux only, the container driver only, as `kbf all-in-one`.
 
 use std::collections::BTreeSet;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 
 use clap::{ArgMatches, Command, CommandFactory as _, FromArgMatches as _};
+#[cfg(target_os = "linux")]
+use kbf_node::LocalMember;
+#[cfg(target_os = "linux")]
+use kbf_server::storage_half::StorageHalf;
 use kbf_server::storage_node::{self, StorageFlags};
 
 use crate::cli::refuse_remote_plane;
+#[cfg(target_os = "linux")]
+use crate::run::{Starter, in_process};
 
 /// What the mode is, for `--help`.
 const ABOUT: &str = "The storage node and a worker daemon in one process, the daemon \
@@ -125,10 +146,37 @@ fn serve(flags: Flags) -> Result<(), crate::run::Failed> {
     let half = tokio.block_on(start);
     let half = half.map_err(Failed::server)?;
     println!("{}", half.start_line());
-    let store = kbf_server::LocalStore::over(half.storage());
-    let plane = crate::LocalDataPlane::new(store, tokio.handle().clone());
+    let start = starter(&flags, &half, tokio.handle());
     let serving = Box::pin(half.serve());
-    with_daemon(&tokio, serving, plane, &flags.daemon)
+    with_daemon(&tokio, serving, start, &flags.daemon)
+}
+
+/// Whether the daemon half routes its blobs by the storage map: when the node registers
+/// with a frontend, which holds the farm's map and the other members. Without one the
+/// node is the whole farm, a map of itself.
+#[cfg(target_os = "linux")]
+fn routes_by_map(flags: &Flags) -> bool {
+    flags.storage.frontend.is_some()
+}
+
+/// This node's own member for the daemon half's plane: registered under the address the
+/// node registers with the frontend (`--advertise-addr`, or the bound address), so the
+/// plane finds itself in the map by the address the map carries.
+#[cfg(target_os = "linux")]
+fn local_member(flags: &Flags, half: &StorageHalf) -> LocalMember {
+    let addr = flags.storage.registers_as(half.addr);
+    LocalMember::new(addr, half.in_process())
+}
+
+/// The daemon half's start over `half` (the module docs, **The daemon half**).
+#[cfg(target_os = "linux")]
+fn starter(flags: &Flags, half: &StorageHalf, tokio: &tokio::runtime::Handle) -> Starter {
+    if routes_by_map(flags) {
+        let local = local_member(flags, half);
+        return Box::new(move |cli| kbf_node::start_member(cli, local));
+    }
+    let store = kbf_server::LocalStore::over(half.storage());
+    in_process(Arc::new(crate::LocalDataPlane::new(store, tokio.clone())))
 }
 
 #[cfg(test)]

@@ -45,6 +45,15 @@ impl Scheduler {
         OperationId(self.next_op)
     }
 
+    /// Every operation not finished, in id order: the ones a successor process takes
+    /// over, and the ones whose callers are still waiting.
+    pub fn unfinished(&self) -> impl Iterator<Item = OperationId> + '_ {
+        self.ops
+            .iter()
+            .filter(|(_, op)| !op.state.is_done())
+            .map(|(id, _)| *id)
+    }
+
     /// The waiters attached to `operation`, in attach order.
     #[must_use]
     pub fn waiters(&self, operation: OperationId) -> Option<&[WaiterId]> {

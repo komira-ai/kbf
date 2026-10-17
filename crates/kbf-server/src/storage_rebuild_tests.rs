@@ -27,6 +27,7 @@ use tonic::transport::Endpoint;
 
 use super::{assemble, command, parse};
 use crate::RaftMetaLog;
+use crate::replication::REPAIR_DIR;
 
 /// The fake frontend: every registration is member 1 at the next boot, answered with a
 /// map the node can read; each call's "still rebuilding" report is recorded.
@@ -335,12 +336,13 @@ async fn start<O: ObjectStore>(
         .await
         .expect("open the log");
     let (prefix, id) = (log.store_prefix(), log.log_id());
+    let repair_dir = meta_dir.join(REPAIR_DIR);
     let node = assemble(
         &flags,
         flags.listener().expect("a listener"),
         None,
         (log, store, prefix, id),
-        || Ok(pending::<()>()),
+        (|| Ok(pending::<()>()), &repair_dir),
         None,
         rebuild,
     )
@@ -352,7 +354,8 @@ async fn start<O: ObjectStore>(
     let catch_up = node.catch_up();
     Node {
         catch_up,
-        client: RemoteStorage::new(channel, 0),
+        // The map of a registered node is the fake frontend's, at generation 4.
+        client: RemoteStorage::new(channel, if frontend.is_some() { 4 } else { 0 }),
         serving: tokio::spawn(async move { drop(node.serve().await) }),
     }
 }

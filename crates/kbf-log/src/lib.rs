@@ -9,9 +9,10 @@
 //! [`Format::V2`], which adds the write tier's metadata commands
 //! (docs/design/write-path.md, section 6.5); [`Format::V3`], which adds
 //! `EvictObjects`; or [`Format::V4`], which adds node writers (`SetWriter`, and object
-//! ids naming a storage node's member and boot). Any other format is refused on both sides, and so is a command under
-//! a format before the one it joined, so a binary never writes or reads an encoding the
-//! log does not allow.
+//! ids naming a storage node's member and boot) and the commands of a rebuild of the
+//! index. Any other format is refused on both sides, and so is a command under a format
+//! before the one it joined, so a binary never writes or reads an encoding the log does
+//! not allow.
 //!
 //! Decoding is strict, because every replica must apply the same value or none:
 //! - an enum value that is unspecified (zero) or unnamed is an error, never a default;
@@ -60,7 +61,9 @@ impl Format {
     pub const V3: Self = Self(3);
 
     /// Format 3 plus node writers: `SetWriter`, and an object id that names a
-    /// registered storage node's member and boot instead of an epoch, in any command.
+    /// registered storage node's member and boot instead of an epoch, in any command;
+    /// and the commands of a rebuild of the index (`AdoptSegment`, `RebuildProgress`,
+    /// `RebuildDone`).
     pub const V4: Self = Self(4);
 
     /// Format number `n`, which may not be one this binary supports.

@@ -15,9 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use kbf_meta::{
-    Applied, Command, Location, ObjectId, ServerId, StagedPut, TierId, UnreachableReason,
-};
+use kbf_meta::{Applied, Command, ObjectId, ServerId, StagedPut, TierId, UnreachableReason};
 use kbf_objstore::ObjectStore;
 use kbf_segments::{Footer, IndexEntry};
 use kbf_store::Fs;
@@ -91,15 +89,6 @@ impl Staging {
     pub(super) fn done(&self, object: ObjectId) {
         self.retries().remove(&object);
     }
-}
-
-/// What a local read found.
-enum Local {
-    Read(Bytes),
-    /// The bytes are there but fail their digest.
-    Damaged,
-    /// No local copy (never staged here, flushed and evicted, or unreadable).
-    Absent,
 }
 
 /// What [`Cache::attach_tier`] found and did at this start.
@@ -225,7 +214,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 .await?;
         }
         // A cache takes one tier: attached before it stores anything, and only once.
-        let _ = self.writer.tier.set(Staging::new(Arc::new(opened), tier));
+        let _ = self
+            .writer
+            .tier
+            .set(Arc::new(Staging::new(Arc::new(opened), tier)));
         let startup = TierStartup {
             tier,
             registered: current.is_none(),
@@ -284,41 +276,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         Box::new(move || seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
 
-    /// Reads `digest` at `location` as the index answered it: from this server's tier
-    /// when the object is staged on it, or has a flushed copy here, else from the
-    /// store. An object staged when the query ran is never marked unreachable by a
-    /// read that does not find it in the store (it is not there yet); a staged record
-    /// that fails its digest on the local disk marks it corrupt (the local copy is the
-    /// only one): its block first takes no more ranges (a `PutStaged` into a marked
-    /// object is refused), and once the mark committed a sealed block is deleted (one
-    /// still sealing is left to the next start's sweep). A blob staged on another
-    /// server's tier is not read here.
-    pub(super) async fn fetch_answer(
-        &self,
-        digest: &Digest,
-        location: Location,
-        staged_on: Option<TierId>,
-    ) -> Result<Bytes, CacheError> {
-        self.used([location.object]);
-        if let Some(staging) = self.writer.tier.get()
-            && staged_on.is_none_or(|t| t == staging.id)
-        {
-            match self.read_local(staging, digest, location).await {
-                Local::Read(bytes) => return Ok(bytes),
-                Local::Damaged if staged_on.is_some() => {
-                    staging.tier.close(location.object);
-                    self.mark_unreachable(location.object, UnreachableReason::Corrupt)
-                        .await?;
-                    let _ = staging.tier.discard(location.object);
-                    return Err(CacheError::Unreachable(*digest));
-                }
-                Local::Damaged | Local::Absent => {}
-            }
-        }
-        self.fetch_from_store(digest, location, staged_on.is_none())
-            .await
-    }
-
     /// `len` bytes of `object` from `offset` on this tier (a staged block's committed
     /// bytes, or a flushed copy), unchecked; `None` when there is no tier or it does
     /// not hold the whole range, and the caller reads the store.
@@ -340,32 +297,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             staging.counters.local_reads.add(1);
             Bytes::from(bytes)
         })
-    }
-
-    /// `digest`'s record from the tier's block or flushed copy, checked.
-    async fn read_local(&self, staging: &Staging, digest: &Digest, at: Location) -> Local {
-        let len = usize::try_from(digest.size_bytes).unwrap_or(usize::MAX);
-        let tier = Arc::clone(&staging.tier);
-        let read = blocking(
-            self.metrics(),
-            Box::new(move || tier.read(at.object, at.offset, len)),
-        )
-        .await;
-        match read {
-            Ok(bytes) if kbf_segments::sha256(&bytes) == *digest => {
-                staging.counters.local_reads.add(1);
-                Local::Read(Bytes::from(bytes))
-            }
-            Ok(_) => {
-                tracing::error!(%digest, object = %at.object, "a record on the write tier fails its digest");
-                Local::Damaged
-            }
-            Err(TierError::UnknownBlock(_)) => Local::Absent,
-            Err(e) => {
-                tracing::warn!(%digest, error = %e, "write tier read failed; reading the store");
-                Local::Absent
-            }
-        }
     }
 }
 
@@ -411,11 +342,31 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
             }
         };
         let at = |e: &IndexEntry| (e.digest, synced.offset() + e.offset);
+        let blobs = footer.entries().iter().map(at).collect();
+        self.put_staged(staging, synced, blobs, own).await?;
+        Ok(true)
+    }
+
+    /// Commits one `PutStaged` for `blobs` (each at its offset in the block) in the
+    /// synced range `synced`, sealing its block with the commit when `seal` (a block
+    /// of its own), and answers the range committed.
+    ///
+    /// # Errors
+    ///
+    /// The commit failed. The range is answered as failed unless the committed state
+    /// shows the commit applied anyway (`answer_lost_put`).
+    pub(super) async fn put_staged(
+        &self,
+        staging: &Staging,
+        synced: Synced,
+        blobs: Vec<(Digest, u64)>,
+        seal: bool,
+    ) -> Result<(), CacheError> {
         let put = StagedPut {
             object: synced.object(),
             end: synced.end(),
-            seal: own,
-            blobs: footer.entries().iter().map(at).collect(),
+            seal,
+            blobs,
         };
         let command = Command::PutStaged {
             tier: staging.id,
@@ -432,7 +383,7 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
             Applied::Staged(Ok(_)) => {
                 staging.tier.committed(synced);
                 staging.counters.staged.add(1);
-                Ok(true)
+                Ok(())
             }
             other => Err(unexpected(&other)),
         }
@@ -507,12 +458,24 @@ mod tests {
 
     /// Catches: a blocking pool that is full showing as a slow disk, or not at all: the
     /// second call waits for the only pool thread while the first holds it, so it counts
-    /// as in flight and its wait is the time the first took (300 ms here, observed by
-    /// the second's `kbf_tier_wait_seconds`, not 0), and the gauge is back to 0 after.
-    /// A wait taken from the closure's end instead of its start, or a gauge raised
+    /// as in flight (the gauge reads 2: one running, one queued) and its wait is at least
+    /// the time the first was held after the second was queued (not 0), observed by
+    /// `kbf_tier_wait_seconds`; the gauge is back to 0 after. A wait taken from the
+    /// closure's end instead of its start (the first call's wait would then cover the
+    /// whole time it is held, not the instant before it starts), or a gauge raised
     /// inside the closure (it would read 1, not 2, while one call waits), is caught.
+    ///
+    /// Ordering comes from channels, not from sleeps: the first call signals that it
+    /// holds the pool thread and blocks until released; the test queues the second only
+    /// then, and releases the first only once the gauge shows both calls. The second is
+    /// held too, so that after the first finishes `kbf_tier_wait_seconds` holds the
+    /// first call's wait alone. The clock readings are one lower bound (the second's
+    /// wait covers the hold), which a slow runner can only enlarge, and one upper
+    /// bound that no runner can break: the first's wait cannot exceed the time the
+    /// test itself spent until the first call signalled that it started.
     #[test]
     fn a_call_waiting_for_a_pool_thread_is_counted_and_its_wait_observed() {
+        const HOLD: Duration = Duration::from_millis(100);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .max_blocking_threads(1)
@@ -521,38 +484,89 @@ mod tests {
             .expect("runtime");
         let metrics = Arc::new(CacheMetrics::default());
         runtime.block_on(async {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let (release_second_tx, release_second_rx) = std::sync::mpsc::channel::<()>();
+            let began = Instant::now();
             let first = {
                 let metrics = Arc::clone(&metrics);
                 tokio::spawn(async move {
                     blocking(
                         &metrics,
-                        Box::new(|| {
-                            std::thread::sleep(Duration::from_millis(300));
+                        Box::new(move || {
+                            started_tx.send(()).expect("the test is waiting");
+                            release_rx.recv().expect("the test releases the call");
                             Ok(1_u8)
                         }),
                     )
                     .await
                 })
             };
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // The first call holds the only pool thread; only now may the second be queued.
+            started_rx.await.expect("the first call started");
+            let startup = began.elapsed();
+            let go = Arc::new(tokio::sync::Notify::new());
             let second = {
                 let metrics = Arc::clone(&metrics);
-                tokio::spawn(async move { blocking(&metrics, Box::new(|| Ok(2_u8))).await })
+                let go = Arc::clone(&go);
+                tokio::spawn(async move {
+                    go.notified().await;
+                    blocking(
+                        &metrics,
+                        Box::new(move || {
+                            release_second_rx
+                                .recv()
+                                .expect("the test releases the call");
+                            Ok(2_u8)
+                        }),
+                    )
+                    .await
+                })
             };
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            assert_eq!(metrics.tier_in_flight.get(), 2, "one running, one queued");
+            // The gauge counts a queued call: it reaches 2 with the first still held.
+            // The second is released from inside the wait, so the first look at the
+            // gauge always sees 1 (the first call raised it before it signalled, and
+            // nothing lowers it until the test releases that call): the loop body and
+            // both outcomes of its test run on every execution, whatever the
+            // scheduling. The 60 s is a hang guard only: a regression fails here
+            // instead of hanging.
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while metrics.tier_in_flight.get() != 2 {
+                    go.notify_one();
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("one running and one queued call reach the gauge");
+            assert_eq!(
+                metrics.tier_wait.count(),
+                0,
+                "neither call has run to its end"
+            );
+            // Keep the pool thread for HOLD after the second is queued, then free it.
+            tokio::time::sleep(HOLD).await;
+            release_tx.send(()).expect("the first call is waiting");
             assert!(matches!(first.await.expect("joined"), Ok(1)));
+            // Only the first call's wait is observed so far (the second is held on the
+            // pool thread; its wait is observed when it ends). The first was handed to
+            // the pool after `began` and started before the test saw its signal, so its
+            // wait cannot exceed `startup`; taken from the closure's end it would cover
+            // the whole hold and be at least HOLD.
+            assert_eq!(metrics.tier_wait.count(), 1, "the second is still held");
+            let first_wait = Duration::from_nanos(metrics.tier_wait.sum());
+            assert!(first_wait <= startup, "{first_wait:?} > {startup:?}");
+            release_second_tx
+                .send(())
+                .expect("the second call is waiting");
             assert!(matches!(second.await.expect("joined"), Ok(2)));
         });
         assert_eq!(metrics.tier_in_flight.get(), 0);
         assert_eq!(metrics.tier_wait.count(), 2);
         assert_eq!(metrics.tier_call.count(), 2);
-        // The second waited about 200 ms (300 ms less the 100 ms head start); the first
-        // did not wait.
+        // The second waited at least HOLD (the first was held that long after the
+        // second was queued) and the first's wait was only `startup`. A slower runner
+        // only adds to the second's wait.
         let waited = Duration::from_nanos(metrics.tier_wait.sum());
-        assert!(
-            (Duration::from_millis(150)..Duration::from_millis(280)).contains(&waited),
-            "{waited:?}"
-        );
+        assert!(waited >= HOLD / 2, "{waited:?}");
     }
 }
