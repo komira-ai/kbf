@@ -1,3 +1,6 @@
+use kbf_front::Cache;
+use std::sync::Arc;
+
 use super::*;
 
 /// Catches a server process that reuses an earlier process's term (issue #137:

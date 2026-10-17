@@ -148,13 +148,27 @@ impl TlsFiles {
     /// Reads the files into a client TLS configuration that presents the daemon's
     /// certificate and trusts only the given CA.
     pub fn load(&self) -> Result<ClientTlsConfig, ConfigError> {
-        let ca = Certificate::from_pem(read(&self.ca_cert)?);
-        let identity = Identity::from_pem(read(&self.cert)?, read(&self.key)?);
+        let (ca, identity) = self.trust()?;
         let mut tls = ClientTlsConfig::new().ca_certificate(ca).identity(identity);
         if let Some(name) = &self.server_name {
             tls = tls.domain_name(name.clone());
         }
         Ok(tls)
+    }
+}
+
+impl TlsFiles {
+    /// The CA the daemon trusts and the identity it presents, and no server name: what
+    /// a connection to a storage node is made from. Each node is verified against its
+    /// own name from the map (`kbf_route::TlsNodes`), so `--tls-server-name`, which names
+    /// the frontend, is not read.
+    ///
+    /// # Errors
+    /// A file cannot be read.
+    pub fn trust(&self) -> Result<(Certificate, Identity), ConfigError> {
+        let ca = Certificate::from_pem(read(&self.ca_cert)?);
+        let identity = Identity::from_pem(read(&self.cert)?, read(&self.key)?);
+        Ok((ca, identity))
     }
 }
 

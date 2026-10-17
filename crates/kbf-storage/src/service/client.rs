@@ -108,11 +108,18 @@ impl RemoteStorage {
 
 /// The error a failed call is. The codes a [`Storage`] answers are kept (`at` is the
 /// blob and offset of a read, which NOT_FOUND and OUT_OF_RANGE are about): a caller sees
-/// what an in-process store would have said. UNAVAILABLE and every code that says
-/// nothing of the request (a transport failure, a deadline) are `Unavailable`; a
-/// store that is held but unreadable is UNAVAILABLE too, so it is `Unavailable` here
-/// where it was `Unreachable` there.
-pub(super) fn lift(status: &Status, at: Option<(Digest, u64)>) -> StorageError {
+/// what an in-process store would have said. Only UNAVAILABLE, DEADLINE_EXCEEDED and
+/// UNKNOWN, which say nothing of the request (a transport failure, a deadline), are
+/// `Unavailable`; a store that is held but unreadable is UNAVAILABLE too, so it is
+/// `Unavailable` here where it was `Unreachable` there. Every other code is an answer
+/// from a node that was reached and declined (ABORTED, DATA_LOSS, RESOURCE_EXHAUSTED,
+/// CANCELLED, ALREADY_EXISTS, FAILED_PRECONDITION without a map generation): `Internal`
+/// with the code in the message, never an outage, so a primary does not answer a write
+/// with one copy over a replica's refusal ([`crate::replicate`]).
+pub(crate) fn lift(status: &Status, at: Option<(Digest, u64)>) -> StorageError {
+    if let Some(current) = stale_generation(status) {
+        return StorageError::StaleMap { current };
+    }
     let message = status.message().to_owned();
     match (status.code(), at) {
         (Code::NotFound, Some((digest, _))) => StorageError::NotFound(digest),
@@ -123,8 +130,24 @@ pub(super) fn lift(status: &Status, at: Option<(Digest, u64)>) -> StorageError {
         (Code::Internal | Code::Unimplemented | Code::NotFound | Code::OutOfRange, _) => {
             StorageError::Internal(message)
         }
-        _ => StorageError::Unavailable(Arc::new(Remote(message))),
+        (Code::Unavailable | Code::DeadlineExceeded | Code::Unknown, _) => {
+            StorageError::Unavailable(Arc::new(Remote(message)))
+        }
+        (code, _) => StorageError::Internal(format!("{code:?}: {message}")),
     }
+}
+
+/// The generation a node named when it answered `STALE_MAP`: FAILED_PRECONDITION with the
+/// generation in the [`MAP_GENERATION_HEADER`] entry. FAILED_PRECONDITION alone is also a
+/// refused action-cache write, so the entry is what says it.
+fn stale_generation(status: &Status) -> Option<u64> {
+    if status.code() != Code::FailedPrecondition {
+        return None;
+    }
+    let entry = status.metadata().get(MAP_GENERATION_HEADER);
+    entry
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| text.parse().ok())
 }
 
 /// [`lift`] for a call that is not about one blob.
