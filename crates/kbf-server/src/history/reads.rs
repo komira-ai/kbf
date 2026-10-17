@@ -195,8 +195,6 @@ impl HistoryReads {
     }
 }
 
-impl std::fmt::Debug for HistoryReads {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HistoryReads").finish_non_exhaustive()
-    }
-}
+#[cfg(test)]
+#[path = "reads_tests.rs"]
+mod tests;

@@ -8,30 +8,23 @@ use std::sync::Arc;
 use kbf_history::records::InvocationHeader;
 use kbf_invocation::{Invocation, RecordKey};
 
-/// What a restored record was made from: the counters of the header it was read under.
-/// A header with other counters means history holds more (or less) than the cached
-/// record shows, so the record is made again.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Stamp {
-    chunks: u32,
-    last_chunk_ms: u64,
-    dropped: u64,
-    state: i32,
-    runs: u64,
-    hits: u64,
-}
+/// What a restored record was made from: the counters of the header it was read under
+/// (chunks, last chunk time, records dropped, state, runs and hits). A header with other
+/// counters means history holds more (or less) than the cached record shows, so the
+/// record is made again.
+pub(super) type Stamp = [u64; 6];
 
-impl Stamp {
-    pub(super) fn of(header: &InvocationHeader) -> Self {
-        Self {
-            chunks: header.chunks,
-            last_chunk_ms: header.last_chunk_ms,
-            dropped: header.dropped,
-            state: header.state,
-            runs: header.runs,
-            hits: header.hits,
-        }
-    }
+/// The stamp of `header`.
+pub(super) fn stamp_of(header: &InvocationHeader) -> Stamp {
+    [
+        u64::from(header.chunks),
+        header.last_chunk_ms,
+        header.dropped,
+        // The state's number, never negative.
+        header.state.unsigned_abs().into(),
+        header.runs,
+        header.hits,
+    ]
 }
 
 struct Held {
@@ -93,16 +86,17 @@ impl Cache {
                 used,
             },
         );
-        while self.bytes > self.budget {
-            let Some(oldest) = self
-                .held
-                .iter()
-                .min_by_key(|(_, h)| h.used)
-                .map(|(k, _)| k.clone())
-            else {
-                break;
-            };
-            self.remove(&oldest);
+        if self.bytes > self.budget {
+            // Least recently used first, until what is held fits.
+            let mut by_use: Vec<(u64, RecordKey)> =
+                self.held.iter().map(|(k, h)| (h.used, k.clone())).collect();
+            by_use.sort_unstable();
+            for (_, oldest) in by_use {
+                if self.bytes <= self.budget {
+                    break;
+                }
+                self.remove(&oldest);
+            }
         }
     }
 

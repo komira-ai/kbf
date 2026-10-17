@@ -82,9 +82,11 @@ async fn read(
             &format!("{text:?} is not a run id: 24 lowercase hex digits"),
         )
     })?;
-    let record = match live(state, id) {
-        Some(record) => Some(record),
-        None => state
+    let live = live(state, id);
+    let record = if live.is_some() {
+        live
+    } else {
+        state
             .durable
             .reads
             .run(id, &|_| true)
@@ -96,7 +98,7 @@ async fn read(
                     "build history cannot be read right now",
                 )
             })?
-            .map(|view| view.run),
+            .map(|view| view.run)
     };
     let Some(record) = record else {
         let body = json!({"error": "no_run", "id": text}).to_string();

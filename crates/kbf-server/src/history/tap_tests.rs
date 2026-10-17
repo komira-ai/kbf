@@ -661,3 +661,15 @@ fn the_run_index_finds_what_was_minted_and_forgets_the_oldest() {
     assert_eq!(index.find(&first), None, "the oldest is forgotten");
     assert_eq!(index.find(&last), Some((key("b"), 0)));
 }
+
+/// Catches: a tap that cannot be shown in a failure message (the recorder's task and the
+/// tests print it), with its run index.
+#[test]
+fn a_tap_shows_as_itself() {
+    let rig = rig(16);
+    let shown = format!("{:?}", rig.tap);
+    assert!(
+        shown.contains("HistoryTap") && shown.contains("RunIndex"),
+        "{shown}"
+    );
+}

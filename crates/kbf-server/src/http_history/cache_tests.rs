@@ -8,7 +8,7 @@ use std::sync::Arc;
 use kbf_history::records::InvocationHeader;
 use kbf_invocation::{Invocation, InvocationId, RecordKey, Restored, WallTime};
 
-use super::{Cache, Stamp};
+use super::{Cache, Stamp, stamp_of};
 
 fn key(id: &str) -> RecordKey {
     RecordKey::owner(InvocationId::new(id))
@@ -31,7 +31,7 @@ fn record(id: &str) -> Arc<Invocation> {
 }
 
 fn stamp(chunks: u32) -> Stamp {
-    Stamp::of(&InvocationHeader {
+    stamp_of(&InvocationHeader {
         chunks,
         ..InvocationHeader::default()
     })

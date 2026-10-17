@@ -130,17 +130,19 @@ pub(super) fn invocation(inv: &Invocation, base: &str, now: WallTime) -> Value {
             "execution_ms": summary.execution.list(inv, Phase::Execution, base),
         },
     });
-    if inv.from_history()
-        && let Some(keys) = value.as_object_mut()
-    {
-        // A record read back from history says so, and where its hole starts; a live one
-        // has neither key.
-        keys.insert("restored".to_owned(), true.into());
+    restored_keys(inv, &mut value);
+    value
+}
+
+/// Adds the keys only a record read back from history has to `value`, the invocation's
+/// answer: `restored`, and, when it has a hole, `gap_from`. A live record has neither.
+fn restored_keys(inv: &Invocation, value: &mut Value) {
+    if inv.from_history() {
+        value["restored"] = Value::Bool(true);
         if let Some(gap) = inv.gap_from() {
-            keys.insert("gap_from".to_owned(), rfc3339(gap).into());
+            value["gap_from"] = rfc3339(gap).into();
         }
     }
-    value
 }
 
 /// How many actions `top_slowest` lists per phase.
@@ -535,13 +537,18 @@ fn attempt(a: &Attempt) -> Value {
     .map(|(k, v)| (k.to_owned(), v))
     .collect();
     measured(a, &mut keys);
+    run_keys(a, &mut keys);
+    Value::Object(keys)
+}
+
+/// Adds the run the history writer minted for attempt `a`, if it did: its id and the link
+/// to it.
+fn run_keys(a: &Attempt, keys: &mut Map<String, Value>) {
     if let Some(id) = a.run_id {
-        // The run the history writer minted for this attempt.
         let id = hex::encode(id);
         keys.insert("run_href".to_owned(), format!("/v1/runs/{id}").into());
         keys.insert("run_id".to_owned(), id.into());
     }
-    Value::Object(keys)
 }
 
 fn outcome(o: Option<&Outcome>) -> Value {

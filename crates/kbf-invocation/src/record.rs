@@ -438,7 +438,6 @@ pub struct Invocation {
 /// [`Invocation::restored`]. History does not keep the first caller's owner, the tool,
 /// the correlated id or the call counters that no row shows: a restored record has none
 /// of them.
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Restored {
     /// The record's key.
     pub key: RecordKey,

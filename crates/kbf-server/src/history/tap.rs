@@ -73,7 +73,7 @@ pub struct HistoryTap {
 }
 
 impl HistoryTap {
-    pub(super) fn new(queue: Arc<EventQueue>, minter: Arc<Minter>) -> Self {
+    pub(crate) fn new(queue: Arc<EventQueue>, minter: Arc<Minter>) -> Self {
         Self {
             queue,
             minter,
@@ -83,7 +83,7 @@ impl HistoryTap {
     }
 
     /// Where the live record of each run this tap minted is.
-    pub(super) fn runs(&self) -> Arc<RunIndex> {
+    pub(crate) fn runs(&self) -> Arc<RunIndex> {
         Arc::clone(&self.runs)
     }
 

@@ -1,77 +1,25 @@
 //! Reading an invocation back: how many records one read takes, what a restored record
-//! says of what it was made from, and the answer when the reader stops answering for an
-//! invocation whose names were authorized. Each test names the defect it catches.
+//! says of what it was made from, and a read of a chunk the store lost. Each test names the
+//! defect it catches.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use axum::body::to_bytes;
-use axum::http::StatusCode;
-use axum::response::Response;
-use kbf_history::records::{InvocationHeader, RunOutcome, RunRecord, WireDigest};
+use kbf_history::records::{RunOutcome, RunRecord, WireDigest};
 use kbf_history::{
     Event, EventQueue, HistoryIndex, HistoryRoot, IndexRoot, Inline, InvKey, InvRef, Limits,
     Minter, QueueLimits, Reader, Writer, WriterId,
 };
 use kbf_invocation::WallTime;
-use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
+use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore, ObjectStore, PageSize};
 use kbf_state::fake::{Fake, Flaw};
-use kbf_state::{
-    Changes, Commit, CommitStats, Conflict, ManualClock, Revision, ScanPage, ScanRange, Store,
-    StoreError, StoreTime, Txn, Versioned,
-};
-use serde_json::Value;
+use kbf_state::{ManualClock, Store};
+use std::sync::Arc;
 
-use super::{Durable, Gathered, MAX_RECORDS, RESTORED_SERIAL};
+use super::{Durable, Gathered, RESTORED_SERIAL};
 use crate::history::{HistoryReads, Shared};
 use crate::http_invocations::Request;
 
-/// A state store whose reads can be made to fail.
-struct Flaky {
-    inner: Fake,
-    fail: AtomicBool,
-}
-
-impl Store for Flaky {
-    fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
-        self.inner.apply_batch(batch)
-    }
-
-    fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {
-        if self.fail.load(Ordering::SeqCst) {
-            return Err(StoreError::Failed("planted".to_owned()));
-        }
-        self.inner.get(key)
-    }
-
-    fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
-        self.inner.scan_prefix(prefix)
-    }
-
-    fn scan_range(&self, scan: ScanRange<'_>) -> Result<ScanPage, StoreError> {
-        self.inner.scan_range(scan)
-    }
-
-    fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {
-        self.inner.changes(after, limit)
-    }
-
-    fn reap_expired(&self) -> Result<usize, StoreError> {
-        self.inner.reap_expired()
-    }
-
-    fn commit_stats(&self) -> CommitStats {
-        self.inner.commit_stats()
-    }
-
-    fn now(&self) -> StoreTime {
-        self.inner.now()
-    }
-}
-
 struct Rig {
     durable: Durable,
-    state: Arc<Flaky>,
+    objects: Shared<MemoryStore>,
     inv: InvKey,
 }
 
@@ -82,11 +30,10 @@ async fn rig(name: &str, n: u64) -> Rig {
         conditional_put: true,
         object_lock: false,
     })));
-    let state = Arc::new(Flaky {
-        inner: Fake::with_flaw(Arc::new(ManualClock::default()), Flaw::None),
-        fail: AtomicBool::new(false),
-    });
-    let store: Arc<dyn Store> = state.clone();
+    let store: Arc<dyn Store> = Arc::new(Fake::with_flaw(
+        Arc::new(ManualClock::default()),
+        Flaw::None,
+    ));
     let root = HistoryRoot::under(&KeyPrefix::new("kbf/").expect("a prefix")).expect("a root");
     let index = HistoryIndex::new(store, IndexRoot::default(), Arc::new(Inline));
     let (minter, queue) = (
@@ -131,10 +78,11 @@ async fn rig(name: &str, n: u64) -> Rig {
             break;
         }
     }
-    let reads = HistoryReads::new(Reader::new(objects, root, index), Arc::default());
+    let reader = Reader::new(objects.clone(), root, index);
+    let reads = HistoryReads::new(reader, Arc::default());
     Rig {
         durable: Durable::new(Arc::new(reads)),
-        state,
+        objects,
         inv: inv.key,
     }
 }
@@ -172,7 +120,6 @@ async fn a_read_gathers_every_page_up_to_its_bound() {
     assert_eq!((got.runs.len(), got.capped), (3, false));
     let none = durable.gather(&small.inv, &|_: &str| false).await.unwrap();
     assert!(none.is_none());
-    assert!(MAX_RECORDS > 32, "a page is under the bound");
 }
 
 fn request(id: &str) -> Request {
@@ -248,65 +195,29 @@ async fn a_restored_record_says_what_it_was_made_from() {
     assert_eq!(torn.rows().len(), 1);
 }
 
-async fn answer(response: Response) -> (StatusCode, Value) {
-    let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
-}
-
-fn set_header(rig: &Rig, header: &InvocationHeader) {
-    use prost::Message as _;
-    let key = IndexRoot::default().invid(&rig.inv);
-    let put = Txn::new().put(key, header.encode_to_vec(), kbf_state::Cond::Any);
-    rig.state.inner.txn(put).unwrap().unwrap();
-}
-
-/// Catches: an invocation that stopped answering for a caller whose names were checked
-/// for another reason than a changed list taken for a changed one (a `503` for a thing
-/// that does not go away on retrying), a changed list taken for a gone record (the
-/// retry that would have worked never made), an invocation that is gone told as changed,
-/// and a store that fails told as a record that is not there.
+/// Catches: a read that fails answered as a read that found nothing (a record whose chunk
+/// the object store lost shown as an invocation with fewer rows), a failure that is not
+/// carried to the caller for it to answer `503`.
 #[tokio::test]
-async fn a_reader_that_stops_answering_is_told_apart() {
-    let rig = rig("told", 1).await;
-    let since = WallTime::from_unix_micros(0);
-    let names = vec!["main".to_owned()];
-    let (code, body) = answer(rig.durable.refused(&rig.inv, &names, "told", since).await).await;
-    assert_eq!(
-        (code, &body["error"]),
-        (StatusCode::NOT_FOUND, &Value::from("no_record"))
-    );
-    // The same names listed by another set: it changed.
-    let other = vec!["other".to_owned()];
-    let (code, body) = answer(rig.durable.refused(&rig.inv, &other, "told", since).await).await;
-    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+async fn a_chunk_the_store_lost_is_an_error_not_fewer_records() {
+    let rig = rig("lost", 3).await;
+    let rows = rig.durable.reads.invocation(&rig.inv, &allow).await;
+    assert!(rows.unwrap().is_some());
+    let prefix = KeyPrefix::new("kbf/").expect("a prefix");
+    let size = PageSize::new(100).expect("a size");
+    let listed = rig
+        .objects
+        .list(&prefix, None, size)
+        .await
+        .expect("a listing");
+    assert!(!listed.objects.is_empty());
+    for object in listed.objects {
+        rig.objects.delete(&object.key).await.expect("a delete");
+    }
+    let got = rig.durable.gather(&rig.inv, &allow).await;
     assert!(
-        body["error"]
-            .as_str()
-            .unwrap()
-            .contains("gained an instance name")
+        matches!(got, Err(kbf_history::ReadError::Object(_))),
+        "{:?}",
+        got.map(|g| g.map(|g| g.runs.len()))
     );
-    // An invocation history does not hold.
-    let missing = InvKey::from_record_id("missing");
-    let (code, _) = answer(
-        rig.durable
-            .refused(&missing, &names, "missing", since)
-            .await,
-    )
-    .await;
-    assert_eq!(code, StatusCode::NOT_FOUND);
-    // A list that cannot be checked whole is not held.
-    let header = InvocationHeader {
-        record_id: "told".to_owned(),
-        instances: names.clone(),
-        instances_truncated: true,
-        ..InvocationHeader::default()
-    };
-    set_header(&rig, &header);
-    let (code, _) = answer(rig.durable.refused(&rig.inv, &names, "told", since).await).await;
-    assert_eq!(code, StatusCode::NOT_FOUND);
-    rig.state.fail.store(true, Ordering::SeqCst);
-    let (code, body) = answer(rig.durable.refused(&rig.inv, &names, "told", since).await).await;
-    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body["error"], "build history cannot be read right now");
 }

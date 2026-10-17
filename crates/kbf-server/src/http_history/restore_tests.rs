@@ -262,7 +262,7 @@ fn the_end_and_outcome_follow_the_class() {
     let mut lost = run(1, 10, 0, RunOutcome::Lost);
     lost.reason = reason();
     let accepted = Some(AttemptEnd::Accepted);
-    let cases: [(&str, RunRecord, Option<AttemptEnd>, Option<Outcome>); 11] = [
+    let cases = [
         (
             "ok",
             run(1, 10, 0, RunOutcome::Ok),
@@ -479,4 +479,108 @@ fn the_last_runs_result_logs_and_outputs_are_the_rows_listing() {
     assert_eq!(rows[0].listing.as_ref().and_then(|l| l.exit_code), None);
     let (rows, _) = to_rows(&[run(3, 40, 3, RunOutcome::Ok)], &[]);
     assert!(rows[0].listing.is_none());
+}
+
+/// Catches: a run block made, or not made, on one evidence alone: a record with only a
+/// cgroup block, only a booking, only a cap, or only a time other than its queue time
+/// has measured something; one with none has not.
+#[test]
+fn any_one_measurement_makes_a_run_block() {
+    let bare = || run(1, 10, 0, RunOutcome::Lost);
+    let mut usage = bare();
+    usage.cgroup = Some(Cgroup::default());
+    let mut booked = bare();
+    booked.booked_memory_bytes = 1;
+    let mut capped = bare();
+    capped.cap_bytes = 1;
+    let mut timed = bare();
+    timed.timestamps = Some(Timestamps {
+        worker_completed_us: 5,
+        ..Timestamps::default()
+    });
+    for (what, r) in [
+        ("a cgroup block", usage),
+        ("a booking", booked),
+        ("a cap", capped),
+        ("a time", timed),
+    ] {
+        let (rows, _) = to_rows(&[r], &[]);
+        assert!(rows[0].attempts[0].run.is_some(), "{what}");
+    }
+    let (rows, _) = to_rows(&[bare()], &[]);
+    assert!(rows[0].attempts[0].run.is_none());
+}
+
+/// Catches: a shape made on one evidence alone wrongly refused (only a key, only a
+/// configuration, only a test flag, only a target), one made of a configuration of `-`
+/// or of none (a default record), and a target with no label or no kind made.
+#[test]
+fn any_one_name_makes_a_shape_and_no_name_makes_none() {
+    let some = |f: &dyn Fn(&mut RunRecord)| {
+        let mut r = run(1, 10, 0, RunOutcome::Ok);
+        r.cfg = String::new();
+        f(&mut r);
+        let (rows, _) = to_rows(&[r], &[]);
+        rows[0].shape.clone()
+    };
+    assert!(some(&|_| {}).is_none(), "nothing named");
+    assert!(some(&|r| r.shape = 5).is_some(), "a key");
+    assert!(
+        some(&|r| r.cfg = "abc".to_owned()).is_some(),
+        "a configuration"
+    );
+    assert!(some(&|r| r.test = true).is_some(), "a test flag");
+    assert!(some(&|r| r.cfg = "-".to_owned()).is_none(), "`-` is none");
+    // A kind with no label, a label with no kind: no target, so no shape.
+    assert!(some(&|r| r.target_kind = 1).is_none());
+    assert!(some(&|r| r.target = "t".to_owned()).is_none());
+    let only_key = some(&|r| r.shape = 5).expect("a shape");
+    assert_eq!(only_key.cfg, None, "a configuration of none is none");
+}
+
+/// Catches: a listing missing for a run that kept only one of what it lists (a stderr
+/// alone, outputs alone, a result alone), and an exit code made up for a run that did
+/// not exit, or missing for one that did.
+#[test]
+fn any_one_result_makes_a_listing_and_an_exit_code_is_the_runs() {
+    let listed = |f: &dyn Fn(&mut RunRecord), outcome| {
+        let mut r = run(1, 10, 0, outcome);
+        f(&mut r);
+        let (rows, _) = to_rows(&[r], &[]);
+        rows[0].listing.clone()
+    };
+    let none = listed(&|_| {}, RunOutcome::Ok);
+    assert!(none.is_none());
+    let stderr = listed(&|r| r.stderr = Some(wire(1)), RunOutcome::Ok).expect("a listing");
+    assert_eq!(stderr.exit_code, Some(0), "an ok run exited 0");
+    let result = listed(&|r| r.result = Some(wire(2)), RunOutcome::Failed).expect("a listing");
+    assert_eq!(
+        result.exit_code,
+        Some(0),
+        "a failed run's exit code is kept"
+    );
+    let outputs = listed(
+        &|r| {
+            r.outputs = vec![WireOutput {
+                path: "p".to_owned(),
+                digest: Some(wire(3)),
+                is_dir: false,
+            }];
+        },
+        RunOutcome::Infra,
+    )
+    .expect("a listing");
+    assert_eq!(outputs.exit_code, None, "a run the farm failed has none");
+    // Outputs that all have broken digests list nothing.
+    let broken = listed(
+        &|r| {
+            r.outputs = vec![WireOutput {
+                path: "p".to_owned(),
+                digest: None,
+                is_dir: false,
+            }];
+        },
+        RunOutcome::Ok,
+    );
+    assert!(broken.is_none());
 }

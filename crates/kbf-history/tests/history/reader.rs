@@ -280,6 +280,10 @@ fn an_invocations_instances_are_read_from_its_header_row_alone() {
         .put(&IndexRoot::default().invid(&inv.key), vec![0xFF]);
     let err = futures::executor::block_on(reader.invocation_instances(&inv.key)).unwrap_err();
     assert!(matches!(err, ReadError::Row { .. }), "{err}");
+    // The index itself failing is its own error, not no invocation.
+    life.index.fail_gets.store(true, Ordering::SeqCst);
+    let err = futures::executor::block_on(reader.invocation_instances(&inv.key)).unwrap_err();
+    assert!(matches!(err, ReadError::Index(_)), "{err}");
 }
 
 /// Writes a chunk by hand: `records` under a valid header, with its rows, so a test can

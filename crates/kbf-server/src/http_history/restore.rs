@@ -220,7 +220,11 @@ fn attempt(r: &RunRecord) -> Attempt {
 /// `us` microseconds after the epoch; `None` for 0, which a record keeps for a time that
 /// was not reported.
 fn wall(us: u64) -> Option<WallTime> {
-    (us != 0).then(|| WallTime::from_unix_micros(us))
+    if us == 0 {
+        None
+    } else {
+        Some(WallTime::from_unix_micros(us))
+    }
 }
 
 /// What the attempt's lease measured, if the record has anything but the queue time: a

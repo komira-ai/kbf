@@ -35,7 +35,7 @@ use kbf_history::records::{HitRecord, RunRecord};
 use kbf_history::{Allow, ChunkCursor, InvKey, InvocationView, MAX_PAGE_CHUNKS, ReadError};
 use kbf_invocation::{Invocation, Restored, WallTime};
 
-use self::cache::{Cache, Stamp};
+use self::cache::{Cache, stamp_of};
 use crate::history::HistoryReads;
 use crate::http_blobs::{error, refusal};
 use crate::http_invocations::{Bad, Draft, Request, answer};
@@ -128,7 +128,7 @@ impl Durable {
         if view.newest.is_none() || view.header.record_id != name {
             return Err(gone());
         }
-        let stamp = Stamp::of(&view.header);
+        let stamp = stamp_of(&view.header);
         let held = self.cache().get(&request.key, stamp);
         let inv = match held {
             Some(inv) => inv,

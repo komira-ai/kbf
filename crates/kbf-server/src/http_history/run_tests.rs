@@ -244,35 +244,22 @@ mod recorder_side {
     use std::time::Duration;
 
     use kbf_front::{Recorder, Tap};
-    use kbf_history::{HistoryIndex, HistoryRoot, IndexRoot, Inline, Reader};
+    use kbf_history::{
+        EventQueue, HistoryIndex, HistoryRoot, IndexRoot, Inline, Minter, QueueLimits, Reader,
+        RunId,
+    };
     use kbf_invocation::{
-        ActionRow, Call, CallKind, Ended, Event, ExecuteAnswer, Finished, InvocationId, LeaseEnd,
-        Metadata, Outcome, Owner, RecordKey, WallTime,
+        Call, CallKind, Event, ExecuteAnswer, Finished, InvocationId, LeaseEnd, Metadata, Outcome,
+        Owner, RecordKey, WallTime,
     };
     use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
     use kbf_state::fake::{Fake, Flaw};
     use kbf_state::{ManualClock, Store};
     use kbf_types::{Digest, DigestFunction, LeaseId, OperationId, WorkerId};
 
-    use super::super::Durable;
-    use kbf_history::RunId;
-
-    use crate::history::{HistoryReads, RunIndex, Shared};
+    use crate::history::{HistoryReads, HistoryTap, RunIndex, Shared};
+    use crate::http_history::Durable;
     use crate::http_history::run::{RunState, live};
-
-    /// A tap that gives each attempt the id `[1; 12]` and notes where it is.
-    #[derive(Debug)]
-    struct Mints(Arc<RunIndex>);
-
-    impl Tap for Mints {
-        fn ended(&self, ended: &Ended, _: &ActionRow) -> Option<[u8; 12]> {
-            ended.attempt?;
-            self.0.note([1; 12], ended.key.clone(), ended.row);
-            Some([1; 12])
-        }
-
-        fn idle(&self, _: &RecordKey) {}
-    }
 
     fn key(id: &str) -> RecordKey {
         RecordKey::owner(InvocationId::new(id))
@@ -282,11 +269,15 @@ mod recorder_side {
         WallTime::from_unix_micros(us)
     }
 
-    /// A recorder holding invocation `held` with one action that ran once, and the state
-    /// of a run route over it, whose index is `runs`.
-    async fn state(runs: &Arc<RunIndex>) -> RunState {
+    /// A recorder holding invocation `held` with one action that ran once, the id the
+    /// history tap minted for it, and the state of a run route over it.
+    async fn state() -> (RunState, Arc<RunIndex>, RunId) {
         let (recorder, recording) = Recorder::new(1 << 20, 64);
-        tokio::spawn(recording.with_tap(Arc::new(Mints(Arc::clone(runs)))).run());
+        let queue = Arc::new(EventQueue::new(QueueLimits::default()));
+        let tap = HistoryTap::new(Arc::clone(&queue), Arc::new(Minter::new(0)));
+        let runs = tap.runs();
+        let tap: Arc<dyn Tap> = Arc::new(tap);
+        tokio::spawn(recording.with_tap(tap).run());
         let action = Digest::new(DigestFunction::Sha256, [7; 32], 7);
         let op = OperationId(1);
         recorder.emit(Event::Call(Box::new(Call {
@@ -320,6 +311,8 @@ mod recorder_side {
         tokio::time::timeout(Duration::from_secs(30), recorder.caught_up())
             .await
             .expect("the events are applied");
+        let held = recorder.get(&key("held")).expect("a record");
+        let id = held.rows()[0].attempts[0].run_id.expect("an id");
         let objects = Shared(Arc::new(MemoryStore::new(Capabilities {
             conditional_put: true,
             object_lock: false,
@@ -330,12 +323,13 @@ mod recorder_side {
         ));
         let root = HistoryRoot::under(&KeyPrefix::new("kbf/").expect("a prefix")).expect("a root");
         let index = HistoryIndex::new(store, IndexRoot::default(), Arc::new(Inline));
-        let reads = HistoryReads::new(Reader::new(objects, root, index), Arc::clone(runs));
-        RunState {
+        let reads = HistoryReads::new(Reader::new(objects, root, index), Arc::clone(&runs));
+        let state = RunState {
             recorder,
             readers: None,
             durable: Arc::new(Durable::new(Arc::new(reads))),
-        }
+        };
+        (state, runs, RunId::from_bytes(id))
     }
 
     /// Catches: a live run not found (the route would answer from history only, so not at
@@ -345,9 +339,7 @@ mod recorder_side {
     /// the key, whose row has other attempts): each would answer with another run.
     #[tokio::test]
     async fn a_live_run_is_found_only_where_the_row_still_names_it() {
-        let runs = Arc::new(RunIndex::default());
-        let state = state(&runs).await;
-        let id = RunId::from_bytes([1; 12]);
+        let (state, runs, id) = state().await;
         let record = live(&state, id).expect("the run, from the recorder");
         assert_eq!(record.run_id(), id);
         assert_eq!(record.instance, "main");
