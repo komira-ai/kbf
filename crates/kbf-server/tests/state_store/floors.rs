@@ -65,7 +65,11 @@ async fn a_floor_is_offered_to_a_fresh_submission_after_a_handover() {
 
     let (successor, mut inbox) = handover(&disk, &old, kbf_sched::MEMORY_FLOORS);
     assert_eq!(offered(&successor, &mut inbox, 1), 16 * GIB, "no floor");
-    assert_eq!(offered(&successor, &mut inbox, 2), 4 * GIB, "a floor for all");
+    assert_eq!(
+        offered(&successor, &mut inbox, 2),
+        4 * GIB,
+        "a floor for all"
+    );
 }
 
 /// Catches: the same, when the old process dies without a handover.
@@ -99,10 +103,12 @@ async fn a_floor_raised_again_replaces_its_row() {
     let ack = old.report(&node(), out_of_memory(lease)).await;
     assert!(ack.expect("an acknowledgement").accepted);
     old.tick().await;
-    let [(_, memory)] = booked(&mut inbox)[..] else {
+    let [(again, memory)] = booked(&mut inbox)[..] else {
         panic!("one rerun expected");
     };
     assert_eq!(memory, 32 * GIB);
+    // Finished: a fresh submission of the same action would otherwise join it.
+    assert!(accepted(&old, again).await);
     assert_eq!(disk.rows("floor/"), 1);
 
     let (successor, mut inbox) = handover(&disk, &old, kbf_sched::MEMORY_FLOORS);
@@ -158,7 +164,15 @@ async fn an_evicted_floor_does_not_come_back() {
         } else {
             handover(&disk, &old, 1)
         };
-        assert_eq!(offered(&successor, &mut inbox, 1), 4 * GIB, "crash: {crash}");
-        assert_eq!(offered(&successor, &mut inbox, 2), 16 * GIB, "crash: {crash}");
+        assert_eq!(
+            offered(&successor, &mut inbox, 1),
+            4 * GIB,
+            "crash: {crash}"
+        );
+        assert_eq!(
+            offered(&successor, &mut inbox, 2),
+            16 * GIB,
+            "crash: {crash}"
+        );
     }
 }
