@@ -31,4 +31,6 @@ pub mod status;
 #[cfg(test)]
 mod contract_tests;
 #[cfg(test)]
+mod crash_tests;
+#[cfg(test)]
 mod tests;

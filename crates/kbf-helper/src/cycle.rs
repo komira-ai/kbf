@@ -177,7 +177,22 @@ impl<E: Exec> Helper<E> {
     }
 
     fn expire(&mut self, now: u64, memory: &mut Memory) -> Result<(), HelperError> {
-        match activate::expire(&mut self.exec, &self.host, now, &mut self.log) {
+        // A swap whose window has run out is about to be reverted: owe the restart first,
+        // so a kill between the links moving and the save below cannot lose it.
+        let before = self.state()?;
+        let due = before
+            .pending_confirm
+            .as_ref()
+            .and_then(|p| p.deadline)
+            .is_some_and(|d| now >= d);
+        let prior = memory.restart_due;
+        if due {
+            memory.restart_due = true;
+            self.save(memory)?;
+        }
+        let result = activate::expire(&mut self.exec, &self.host, now, &mut self.log);
+        memory.restart_due = prior || self.moved(&before)?;
+        match result {
             Ok(Expiry::Reverted(r)) => {
                 memory.event = Event::Reverted;
                 memory.refusal = format!(
@@ -185,15 +200,17 @@ impl<E: Exec> Helper<E> {
                     short(&r.from),
                     r.to
                 );
-                memory.restart_due = true;
-                self.save(memory)
             }
-            Ok(_) => Ok(()),
-            Err(e) => {
-                refuse(memory, &e.to_string());
-                self.save(memory)
-            }
+            Ok(_) => {}
+            Err(e) => refuse(memory, &e.to_string()),
         }
+        self.save(memory)
+    }
+
+    /// Whether `current` is not what it was in `before`: the links followed the state, so
+    /// the service runs a release other than the one the links name now.
+    fn moved(&self, before: &State) -> Result<bool, HelperError> {
+        Ok(self.state()?.current != before.current)
     }
 
     /// Stage the newest inbox entry, once.
@@ -246,7 +263,12 @@ impl<E: Exec> Helper<E> {
     }
 
     fn orders(&mut self, now: u64, memory: &mut Memory) -> Result<(), HelperError> {
-        let Ok(dir) = Entry::open(&self.dir("inbox/orders")) else {
+        // `inbox` is opened without following a link and `orders` relative to it: a link
+        // the service user puts in either place is refused, never followed.
+        let Ok(inbox) = Entry::open(&self.dir("inbox")) else {
+            return Ok(());
+        };
+        let Ok(dir) = inbox.sub("orders") else {
             return Ok(());
         };
         let names = match dir.names() {
@@ -263,7 +285,13 @@ impl<E: Exec> Helper<E> {
             .collect();
         files.sort();
         for (id, name) in files {
-            if id > memory.acked_order_id {
+            if id > memory.acked_order_id.saturating_add(order::MAX_JUMP) {
+                // An id this far ahead would put every real order below the floor.
+                refuse(
+                    memory,
+                    &format!("order {id} is too far ahead of {}", memory.acked_order_id),
+                );
+            } else if id > memory.acked_order_id {
                 let read = dir
                     .open_file(&name, order::MAX_BYTES)
                     .and_then(|mut f| read_capped(&mut f, order::MAX_BYTES, &name));
@@ -272,7 +300,7 @@ impl<E: Exec> Helper<E> {
                     .and_then(|bytes| order::parse(id, &bytes).map_err(|e| e.to_string()));
                 match parsed {
                     Ok(o) => {
-                        self.act(&o, now, memory);
+                        self.act(&o, now, memory)?;
                         memory.acked_order_id = id;
                     }
                     // Not acknowledged: a garbage file must not move the floor.
@@ -287,21 +315,34 @@ impl<E: Exec> Helper<E> {
         self.save(memory)
     }
 
-    /// Carry out one order; what came of it goes into `memory`.
-    fn act(&mut self, order: &Order, now: u64, memory: &mut Memory) {
+    /// Carry out one order; what came of it goes into `memory`. An activate or a revert
+    /// moves the links, so the restart is owed (and saved) before the verb runs; a kill
+    /// between the links and the next save then leaves the restart for the next pass.
+    fn act(&mut self, order: &Order, now: u64, memory: &mut Memory) -> Result<(), HelperError> {
+        let before = self.state()?;
+        let prior = memory.restart_due;
+        if order.verb != Verb::Confirm {
+            memory.restart_due = true;
+            self.save(memory)?;
+        }
         let result = match order.verb {
             Verb::Activate => self.activate(order, now),
             Verb::Confirm => self.confirm(order),
             Verb::Revert => self.revert(),
         };
+        let moved = self.moved(&before)?;
         match result {
             Ok(done) => {
                 memory.event = done.event;
                 memory.refusal = done.note;
-                memory.restart_due |= done.restart;
+                memory.restart_due = prior || done.restart || moved;
             }
-            Err(why) => refuse(memory, &why),
+            Err(why) => {
+                refuse(memory, &why);
+                memory.restart_due = prior || moved;
+            }
         }
+        Ok(())
     }
 
     fn arm(&self, order: &Order) -> Arm {

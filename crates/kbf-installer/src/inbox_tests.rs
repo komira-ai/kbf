@@ -288,3 +288,30 @@ fn a_removal_takes_the_name_in_the_entry_and_nothing_else() {
     assert!(entry.remove_file("sub").is_err());
     assert!(e.join("sub").is_dir());
 }
+
+/// Catches a sub-directory followed out of the entry: `orders` replaced by a link to a
+/// directory elsewhere is refused, a real one opens and lists, and a name that is not one
+/// component is refused.
+///
+/// Mutant seen red: the `NOFOLLOW` flag dropped from `sub` (the linked directory opens).
+#[test]
+fn a_sub_directory_is_opened_beneath_the_entry_and_a_link_is_refused() {
+    let (dir, entry) = entry_with("inbox-sub", OpenMode::NoFollow);
+    let e = dir.join("entry");
+    fs::create_dir(e.join("real")).expect("dir");
+    fs::write(e.join("real/a"), b"x").expect("file");
+    fs::create_dir(dir.join("elsewhere")).expect("dir");
+    symlink(dir.join("elsewhere"), e.join("linked")).expect("link");
+    assert_eq!(
+        entry.sub("real").expect("opens").names().expect("lists"),
+        ["a"]
+    );
+    assert!(entry.sub("linked").is_err());
+    assert!(entry.sub("missing").is_err());
+    for bad in ["", ".", "..", "a/b"] {
+        assert_eq!(
+            entry.sub(bad).err().expect("refused").code(),
+            "inbox-bad-name"
+        );
+    }
+}

@@ -20,7 +20,7 @@ impl Restart {
         let (program, args): (&str, Vec<String>) = match self {
             Restart::Systemd(unit) => (
                 "/usr/bin/systemctl",
-                vec!["restart".to_owned(), unit.clone()],
+                vec!["restart".to_owned(), "--".to_owned(), unit.clone()],
             ),
             Restart::Launchd(label) => (
                 "/bin/launchctl",

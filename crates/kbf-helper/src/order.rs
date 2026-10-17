@@ -12,6 +12,10 @@ use serde::Deserialize;
 /// The suffix of an order file.
 pub const SUFFIX: &str = ".json";
 
+/// How far ahead of the last acknowledged id an order may be. The client's ids come from a
+/// counter that grows by one; a far larger one would put every real order below the floor.
+pub const MAX_JUMP: u64 = 1_000_000;
+
 /// The biggest order file read.
 pub const MAX_BYTES: u64 = 4096;
 

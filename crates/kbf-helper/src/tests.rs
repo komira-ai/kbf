@@ -10,7 +10,7 @@ use kbf_host::testkit::{ScratchHost, reply};
 use kbf_host::{Root, Step};
 use kbf_installer::activate;
 use kbf_installer::attest::SourceRef;
-use kbf_installer::layout::Layout;
+use kbf_installer::layout::{Layout, Platform};
 use kbf_installer::refusal::{InboxFault, Refusal};
 use kbf_installer::stage::Staged;
 use kbf_installer::state::{Locked, State};
@@ -40,10 +40,17 @@ impl Rig {
     /// A host running release A, with release B installed beside it, an empty inbox, and
     /// the service restart recorded.
     fn new(name: &str) -> Rig {
+        Rig::on(name, Platform::Linux)
+    }
+
+    /// The same host on `platform`: macOS keeps its state and lock elsewhere.
+    fn on(name: &str, platform: Platform) -> Rig {
         let mut host = ScratchHost::new(&format!("helper-{name}"));
         let root = host.root.clone();
         for sub in [
             "run",
+            "var/run",
+            "var/db/kbf-deploy",
             "var/lib/kbf-deploy",
             "var/lib/kbf-updater/inbox/orders",
             "usr/local/kbf/releases",
@@ -54,7 +61,7 @@ impl Rig {
         fs::create_dir_all(&dir).expect("release");
         fs::write(dir.join("kbf"), b"binary").expect("binary");
         host.answer = Box::new(|_| Ok(reply(0, "", "")));
-        let layout = Layout::linux(Root::new(&root).expect("absolute"));
+        let layout = Layout::new(Root::new(&root).expect("absolute"), platform);
         Locked::acquire(&layout)
             .expect("lock")
             .write(&State {
@@ -105,7 +112,7 @@ impl Rig {
             .exec()
             .log
             .iter()
-            .filter(|s| matches!(s, Step::Run(cmd) if cmd.args == ["restart", UNIT]))
+            .filter(|s| matches!(s, Step::Run(cmd) if cmd.args == ["restart", "--", UNIT]))
             .count()
             - self.base
     }
@@ -430,7 +437,11 @@ fn the_restart_is_one_fixed_command() {
         program(Restart::Systemd("kbf.service".to_owned())),
         (
             "/usr/bin/systemctl".to_owned(),
-            vec!["restart".to_owned(), "kbf.service".to_owned()]
+            vec![
+                "restart".to_owned(),
+                "--".to_owned(),
+                "kbf.service".to_owned()
+            ]
         )
     );
     assert_eq!(
@@ -445,4 +456,164 @@ fn the_restart_is_one_fixed_command() {
         )
     );
     assert!(Restart::Off.step().is_none());
+}
+
+/// Catches a confirm window the order chooses: on macOS the window starts at the swap and
+/// the helper clamps the order's `window_s` to its own 120..=1800 seconds, so neither a
+/// tiny window (reverts a healthy update) nor a year (never reverts a bad one) gets
+/// through.
+///
+/// Mutants seen red: the clamp dropped; the bounds swapped.
+#[test]
+fn the_window_an_order_asks_for_is_clamped_on_macos() {
+    for (asked, kept) in [(5, 120), (600, 600), (99_999, 1800)] {
+        let mut rig = Rig::on(&format!("window-{asked}"), Platform::MacOs);
+        rig.put_offer(1, B);
+        let mut stager = stage_b(rig.layout.clone());
+        rig.helper.cycle(T0, &mut stager).expect("stage");
+        let body = order_json(5, "activate", B).replace("600", &asked.to_string());
+        rig.put_order(5, &body);
+        rig.cycle(T0 + 3);
+        let pending = rig.state().pending_confirm.expect("on trial");
+        assert_eq!(pending.deadline, Some(T0 + 3 + kept), "asked {asked}");
+    }
+}
+
+/// Catches orders taken in the order the directory lists them: three orders in one pass
+/// (activate, confirm, revert) end on the old release only if run by id.
+///
+/// Mutant seen red: the sort dropped (with the files made in reverse id order).
+#[test]
+fn orders_are_acted_on_in_id_order() {
+    let mut rig = Rig::new("order-sort");
+    rig.put_offer(1, B);
+    let mut stager = stage_b(rig.layout.clone());
+    rig.helper.cycle(T0, &mut stager).expect("stage");
+    rig.put_order(7, &order_json(7, "revert", A));
+    rig.put_order(6, &order_json(6, "confirm", B));
+    rig.put_order(5, &order_json(5, "activate", B));
+    rig.cycle(T0 + 3);
+    assert_eq!(rig.state().current, Some(c(A)));
+    assert_eq!(rig.status()["acked_order_id"], 7);
+    assert_eq!(
+        rig.restarts(),
+        1,
+        "one restart for the pass, onto where it ended"
+    );
+}
+
+/// Catches an order id that wedges the helper: one far above the last acknowledged id is
+/// refused and removed without being acknowledged, so the real orders after it still run.
+///
+/// Mutant seen red: the jump check dropped (u64::MAX is acknowledged; the real order is
+/// then below the floor).
+#[test]
+fn an_order_id_far_ahead_does_not_move_the_floor() {
+    let mut rig = Rig::new("order-jump");
+    rig.put_offer(1, B);
+    let mut stager = stage_b(rig.layout.clone());
+    rig.helper.cycle(T0, &mut stager).expect("stage");
+    rig.put_order(
+        crate::order::MAX_JUMP + 1,
+        &order_json(crate::order::MAX_JUMP + 1, "revert", A),
+    );
+    rig.cycle(T0 + 3);
+    assert_eq!(rig.status()["state"], "refused");
+    assert!(
+        rig.status()["refusal"]
+            .as_str()
+            .expect("text")
+            .contains("too far ahead")
+    );
+    assert_eq!(rig.status()["acked_order_id"], 0);
+    assert_eq!(fs::read_dir(rig.orders()).expect("dir").count(), 0);
+    rig.put_order(5, &order_json(5, "activate", B));
+    rig.cycle(T0 + 6);
+    assert_eq!(rig.state().current, Some(c(B)));
+}
+
+/// Catches helper.json readable by the service user, and status.json not (the node reads
+/// it as that user). The modes are set by the write itself, not by the umask of whoever
+/// runs the helper.
+///
+/// Mutant seen red: either mode swapped.
+#[test]
+fn the_helpers_files_have_their_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let rig = Rig::new("modes");
+    let mode = |p: &str| {
+        fs::metadata(rig.root.join(p))
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode("var/lib/kbf-deploy/helper.json"), 0o600);
+    assert_eq!(mode("var/lib/kbf-updater/status.json"), 0o644);
+}
+
+/// Catches staged facts shown for a release that is not the staged one (an old fact kept
+/// after the staged slot was cleared or replaced): only the release the state says is
+/// staged brings its protocol numbers.
+///
+/// Mutant seen red: the filter dropped.
+#[test]
+fn staged_facts_are_shown_only_for_the_staged_release() {
+    use crate::memory::{Memory, StagedFacts};
+    let memory = Memory {
+        staged: Some(StagedFacts {
+            commit: c(B),
+            protocol: 7,
+            min_protocol: 6,
+            state_schema: 3,
+        }),
+        ..Memory::default()
+    };
+    let render = |staged: Option<&str>| {
+        let state = State {
+            current: Some(c(A)),
+            staged: staged.map(c),
+            ..State::default()
+        };
+        let json: serde_json::Value =
+            serde_json::from_slice(&crate::status::render(&state, &memory)).expect("json");
+        json
+    };
+    assert_eq!(render(Some(B))["staged"]["protocol"], 7);
+    assert!(render(None)["staged"].is_null());
+    assert!(render(Some(A))["staged"].is_null());
+}
+
+/// Catches an order file accepted in a shape the client never writes: an extra field, a
+/// missing one, a name that is not twenty digits and `.json` (a shorter or longer number,
+/// a letter, another suffix), or an id the file's name does not carry.
+///
+/// Mutants seen red: `deny_unknown_fields` dropped; the 20-digit length check dropped.
+#[test]
+fn only_the_clients_shape_of_order_is_read() {
+    use crate::order::{id_of, parse};
+    let ok = order_json(5, "activate", B);
+    assert!(parse(5, ok.as_bytes()).is_ok());
+    let extra = ok.replace('}', ",\"path\":\"/etc\"}");
+    assert!(parse(5, extra.as_bytes()).is_err());
+    assert!(
+        parse(
+            5,
+            br#"{"order_id":5,"epoch":1,"verb":"activate","commit":"x"}"#
+        )
+        .is_err()
+    );
+    assert!(parse(6, ok.as_bytes()).is_err(), "named for another id");
+    assert_eq!(id_of("00000000000000000005.json"), Some(5));
+    for bad in [
+        "5.json",
+        "000000000000000000005.json",
+        "0000000000000000005.json",
+        "0000000000000000000a.json",
+        "00000000000000000005.txt",
+        "00000000000000000005",
+        "99999999999999999999.json",
+    ] {
+        assert_eq!(id_of(bad), None, "{bad}");
+    }
 }
