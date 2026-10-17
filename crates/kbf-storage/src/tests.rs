@@ -50,6 +50,10 @@ fn each_error_answers_its_code_and_message() {
             Code::OutOfRange,
         ),
         (StorageError::Invalid("bad".into()), Code::InvalidArgument),
+        (
+            StorageError::StaleMap { current: 7 },
+            Code::FailedPrecondition,
+        ),
         (ActionWriteError::NotDaemon.into(), Code::PermissionDenied),
         (
             ActionWriteError::Absent(vec![a]).into(),
@@ -97,4 +101,13 @@ fn a_stale_map_status_carries_the_nodes_generation() {
         .expect("the generation entry");
     assert_eq!(header.to_str().expect("ASCII"), "7");
     assert!(status.message().starts_with("STALE_MAP"), "{status:?}");
+    let refused = tonic::Status::from(StorageError::from(ActionWriteError::Absent(vec![digest(
+        1,
+    )])));
+    assert!(
+        refused
+            .metadata()
+            .get(crate::service::MAP_GENERATION_HEADER)
+            .is_none()
+    );
 }

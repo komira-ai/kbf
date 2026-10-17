@@ -13,7 +13,9 @@
 //! planned in section 9 and phase P7: the deny list and node-name checks of
 //! `kbf-server`'s worker listener, and the signed storage-access grant.
 //!
-//! Plain text ([`Admission::Open`]) has no identity to read, so it admits every call: for
+//! Plain text ([`Admission::Open`]) has no identity to read, so it admits every call but a
+//! copy from another storage node ([`Endpoint::WriteLeg`]), which only a certified storage
+//! caller may send: for
 //! tests and trials on one machine, as the worker listener's `Peers::Unauthenticated`.
 
 use tonic::{Request, Status};
@@ -57,6 +59,11 @@ pub enum Endpoint {
     Read,
     /// ByteStream `Write`.
     Write,
+    /// ByteStream `Write` of a copy another storage node sends (the `kbf-chain-leg`
+    /// entry): a primary to its replica, or a repair. Only a storage node makes one; a
+    /// call that names itself a copy and is from another role would be a write that is
+    /// never forwarded to a second owner.
+    WriteLeg,
     /// ByteStream `QueryWriteStatus`: whether a `Write` of the blob has landed, so it
     /// is the roles of the `Write` it asks about.
     QueryWriteStatus,
@@ -72,10 +79,11 @@ pub enum Endpoint {
 
 impl Endpoint {
     /// Every endpoint.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::FindMissing,
         Self::Read,
         Self::Write,
+        Self::WriteLeg,
         Self::QueryWriteStatus,
         Self::ActionGet,
         Self::ActionPrepare,
@@ -94,6 +102,7 @@ impl Endpoint {
             Self::FindMissing | Self::Read | Self::Write | Self::QueryWriteStatus => {
                 &[Frontend, Storage, Daemon]
             }
+            Self::WriteLeg => &[Storage],
             Self::ActionGet => &[Frontend],
             Self::ActionPrepare | Self::ActionCommit => &[Frontend, Daemon],
             Self::Segments => &[Daemon],
@@ -104,7 +113,8 @@ impl Endpoint {
 /// How a storage service learns who is calling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admission {
-    /// Plain text: no identity, every call admitted.
+    /// Plain text: no identity, every call admitted but [`Endpoint::WriteLeg`], which needs
+    /// a caller shown to be a storage node.
     Open,
     /// Mutual TLS: the verified client certificate must name a role the endpoint takes.
     Certified,
@@ -124,12 +134,19 @@ impl Admission {
     /// [`Admission::check`] for a caller whose verified chain starts with `leaf`.
     ///
     /// # Errors
-    /// Under [`Admission::Certified`], UNAUTHENTICATED if there is no certificate or it
+    /// UNAUTHENTICATED for [`Endpoint::WriteLeg`] under [`Admission::Open`]. Under
+    /// [`Admission::Certified`], UNAUTHENTICATED if there is no certificate or it
     /// does not parse; PERMISSION_DENIED if it names no role, several, one that is not
     /// a role, or a role `endpoint` does not take.
     pub fn check_leaf(&self, leaf: Option<&[u8]>, endpoint: Endpoint) -> Result<(), Status> {
         if *self == Self::Open {
-            return Ok(());
+            return if endpoint == Endpoint::WriteLeg {
+                Err(Status::unauthenticated(
+                    "a copy from another storage node needs a certified storage caller",
+                ))
+            } else {
+                Ok(())
+            };
         }
         let der = leaf.ok_or_else(|| Status::unauthenticated("no client certificate"))?;
         let role = role_of(der)?;
