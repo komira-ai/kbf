@@ -25,8 +25,8 @@ use kbf_sched::MemoryLadder;
 use kbf_storage::service::Admission;
 use kbf_tls::{Incoming, TlsSource};
 use tonic::service::Routes;
+use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
-use tonic::transport::{Server, ServerTlsConfig};
 use tower_layer::{Identity, Stack};
 
 use crate::blobs::{WorkerBlobs, WorkerCas, WorkerSegments};
@@ -849,10 +849,11 @@ where
 pub struct StorageListener {
     /// The listener.
     pub listen: SocketAddr,
-    /// Mutual TLS (the server's identity and the client CA); `None` serves plain text,
-    /// where no caller has a role and every call is admitted (`kbf storage` builds this
-    /// only for a loopback address: [`crate::storage_node::StorageFlags::listener`]).
-    pub tls: Option<ServerTlsConfig>,
+    /// Mutual TLS (the server's identity and the client CA), re-read from its files as
+    /// they change; `None` serves plain text, where no caller has a role and every call
+    /// is admitted (`kbf storage` builds this only for a loopback address:
+    /// [`crate::storage_node::StorageFlags::listener`]).
+    pub tls: Option<TlsSource>,
     /// What the service keeps.
     pub service: kbf_storage::service::Config,
 }
@@ -880,9 +881,11 @@ pub struct BoundStorage<F> {
 /// CAS `FindMissingBlobs`, `Segments` and the action store, on one listener, each call
 /// admitted by the role in the caller's certificate when there is mutual TLS.
 ///
+/// With TLS, call it inside a Tokio runtime: the task that looks at the TLS files starts
+/// here ([`Incoming::new`]).
+///
 /// # Errors
-/// The listener cannot be bound, or the TLS configuration is refused (a key that does
-/// not match its certificate, say).
+/// The listener cannot be bound.
 pub fn bind_storage(
     storage: Arc<dyn kbf_storage::Storage>,
     listener: StorageListener,
@@ -931,17 +934,16 @@ pub fn bind_storage_shared(
     ServeError,
 > {
     let (incoming, addr) = bind(listener.listen)?;
-    let mut server = flow_control(
+    let server = flow_control(
         Server::builder(),
         crate::streams::StreamLimits::DEFAULT.worker,
     );
-    let admission = match listener.tls {
-        Some(tls) => {
-            server = server.tls_config(tls)?;
-            kbf_storage::service::Admission::Certified
-        }
-        None => kbf_storage::service::Admission::Open,
+    let admission = if listener.tls.is_some() {
+        kbf_storage::service::Admission::Certified
+    } else {
+        kbf_storage::service::Admission::Open
     };
+    let incoming = Incoming::new(incoming, listener.tls);
     let service = Arc::new(kbf_storage::service::StorageService::new(
         storage,
         admission,
