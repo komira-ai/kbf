@@ -324,6 +324,27 @@ kbf-server \
   version 3, objects held back by the guard, the bytes held and how long it took. A
   pass that fails is logged and runs again at the next start; until then nothing is
   evicted.
+- The rebuild of the index (a node registered with `--frontend`, over either kind of cold
+  store): a metadata log that has not finished one (a new or wiped directory, or an
+  upgrade of a node that has run before) makes the node register as catching up, serve
+  from the start, and rebuild in the background. It lists every object under the root
+  the keys of all writers share (a node's `cas/<member>/<boot>/<seq>`, and an epoch of
+  any log's `<log id>/cas/<epoch>/<seq>`, the old server's keys included), reads each
+  object's footer (its last bytes, never the records), and indexes the records that are
+  not indexed yet. Objects the node itself is writing are left to its own writes. An
+  object that is not a whole segment (too short, a torn tail, foreign bytes), or whose
+  key is none of these, is counted and logged, not indexed. Meanwhile a read or
+  `FindMissingBlobs` that finds nothing answers `UNAVAILABLE` and never `NOT_FOUND`: a
+  router asks the next owner; hits and writes are served. The log keeps the last key
+  handled, so a restart resumes after it, and that the rebuild is done, so a later start
+  does not list again; the first heartbeat after it makes the node active. A failed
+  attempt (the store cannot be listed or read) is logged and tried again after a
+  back-off; the node stays catching up. The start-up pass above and the evictor begin
+  once the rebuild is done. The action cache is not rebuilt: its entries live only in the
+  log, so a wiped node answers a miss and the action runs again. A node without
+  `--frontend` has no rebuild. The rebuild's line in the log gives the objects listed,
+  segments and records adopted, records already held, the node's own segments, objects
+  skipped, objects with no name of this node's, objects gone and how long it took.
 - Until the pass reaches it, or for a file lost while the server runs, a blob whose
   file was lost, damaged or left empty is still reported present by
   `FindMissingBlobs` until a read of it fails: that read answers `UNAVAILABLE` and

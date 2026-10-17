@@ -36,7 +36,7 @@ use kbf_storage::Storage;
 use kbf_storage::StorageError;
 use kbf_storage::repair::{JournalError, NoLedger, Options, RepairConfig, RepairWorker, Repairs};
 use kbf_storage::replicate::{Chain, ChainConfig, MapSource, Peers};
-use kbf_storage::service::{InProcess, StorageService};
+use kbf_storage::service::{CatchUp, InProcess, StorageService};
 use kbf_store::StdFs;
 use tonic::transport::ClientTlsConfig;
 
@@ -164,6 +164,9 @@ pub(crate) struct Registered {
     pub node: Arc<NodeMap>,
     /// The registration, and what it gave, for the heartbeats ([`Joiner::keep`]).
     pub joiner: Option<(Joiner, Joined)>,
+    /// Whether the node owes a rebuild of its index: the service answers a miss
+    /// UNAVAILABLE while it does, and the registration and heartbeats say so.
+    pub catch_up: CatchUp,
 }
 
 /// Serves `storage` on the socket of `registered` as the node `flags` describe: a
@@ -187,9 +190,12 @@ pub(crate) fn bind_node(
         socket,
         node,
         joiner,
+        catch_up,
     } = registered;
     let maps = node.maps();
-    let service = listener.service(Arc::clone(&storage));
+    let service = listener
+        .service(Arc::clone(&storage))
+        .with_catch_up(catch_up);
     let (shutdown, stop) = stopping(shutdown);
     let (service, worker, repairs) = if flags.frontend.is_some() {
         let peer_tls = flags.peer_tls()?;

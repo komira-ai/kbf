@@ -55,7 +55,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use kbf_meta::{Epoch, NodeWriter, ObjectId, Writer};
+use kbf_meta::{Epoch, LegacyWriter, NodeWriter, ObjectId, Writer};
 use kbf_objstore::ObjectStore;
 use kbf_proto::worker::segments_server::Segments;
 use kbf_proto::worker::{
@@ -633,23 +633,28 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
     }
 }
 
-/// `object` on the wire: an epoch writer's with `member` and `boot` zero, a node
-/// writer's with `epoch` zero.
+/// `object` on the wire: an epoch writer's with `member`, `boot` and `log` zero, a node
+/// writer's with `epoch` and `log` zero, another log's epoch writer's with `member` and
+/// `boot` zero.
 fn object_ref(object: ObjectId) -> ObjectRef {
-    let (epoch, member, boot) = match object.writer() {
-        Writer::Epoch(e) => (e.get(), 0, 0),
-        Writer::Node(n) => (0, n.member().get(), n.boot().get()),
+    let (epoch, member, boot, log) = match object.writer() {
+        Writer::Epoch(e) => (e.get(), 0, 0, 0),
+        Writer::Node(n) => (0, n.member().get(), n.boot().get(), 0),
+        Writer::Legacy(l) => (l.epoch().get(), 0, 0, l.log().get()),
     };
     ObjectRef {
         epoch,
         seq: object.seq(),
         member,
         boot,
+        log,
     }
 }
 
-/// The object `object` names: an epoch writer's when `member` and `boot` are both
-/// zero, a node writer's when `epoch` is zero and both are not.
+/// The object `object` names: an epoch writer's when `member`, `boot` and `log` are all
+/// zero, a node writer's when `epoch` and `log` are zero and `member` and `boot` are not,
+/// another log's epoch writer's when `member` and `boot` are zero and `epoch` and `log`
+/// are not.
 ///
 /// # Errors
 /// INVALID_ARGUMENT for any other combination.
@@ -658,12 +663,17 @@ fn object_id(object: &ObjectRef) -> Result<ObjectId, Status> {
         object.epoch,
         NonZeroU64::new(object.member),
         NonZeroU64::new(object.boot),
+        NonZeroU64::new(object.log),
     ) {
-        (epoch, None, None) => Writer::Epoch(Epoch::new(epoch)),
-        (0, Some(member), Some(boot)) => Writer::Node(NodeWriter::new(member, boot)),
+        (epoch, None, None, None) => Writer::Epoch(Epoch::new(epoch)),
+        (0, Some(member), Some(boot), None) => Writer::Node(NodeWriter::new(member, boot)),
+        (epoch, None, None, Some(log)) if epoch != 0 => {
+            Writer::Legacy(LegacyWriter::new(log, Epoch::new(epoch)))
+        }
         _ => {
             return Err(Status::invalid_argument(
-                "an object names an epoch alone, or a member and a boot alone",
+                "an object names an epoch alone, a member and a boot alone, or a log and an \
+                 epoch alone",
             ));
         }
     };

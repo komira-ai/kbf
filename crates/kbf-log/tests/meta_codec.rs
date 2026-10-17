@@ -243,7 +243,10 @@ fn the_golden_set_names_every_variant() {
             | Command::ObjectFlushed { .. }
             | Command::FlushConflict { .. }
             | Command::EvictObjects { .. }
-            | Command::SetWriter(_) => panic!("a later format's command in format 1's set"),
+            | Command::SetWriter(_)
+            | Command::AdoptSegment { .. }
+            | Command::RebuildProgress { .. }
+            | Command::RebuildDone => panic!("a later format's command in format 1's set"),
         };
         seen[i] = true;
     }
