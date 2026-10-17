@@ -374,14 +374,22 @@ impl Recording {
         });
         loop {
             // Queued events first: a drop's mark waits for the events sent before it. The
-            // sweep is a branch only while there is a tap (and so an interval).
+            // sweep ticks only while there is a tap (and so an interval); without one it
+            // never completes. (A `select!` branch's expression is evaluated even when its
+            // precondition is false, so the interval cannot be unwrapped there.)
+            let tick = async {
+                match sweep.as_mut() {
+                    Some(sweep) => {
+                        sweep.tick().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            };
             let (event, swept) = tokio::select! {
                 biased;
                 event = self.events.recv() => (event, false),
                 () = self.shared.marked.notified() => (None, false),
-                _ = sweep.as_mut().expect("a sweep waits for a tap").tick(), if sweep.is_some() => {
-                    (None, true)
-                }
+                () = tick => (None, true),
             };
             {
                 let mut records = lock(&self.shared.records);
