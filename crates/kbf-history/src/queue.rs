@@ -170,6 +170,12 @@ impl EventQueue {
         self.len() == 0
     }
 
+    /// The bytes queued now, as [`Event::size`] counts them.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.state().1
+    }
+
     /// Events dropped because the queue was full (`stage="queue"`).
     #[must_use]
     pub fn dropped(&self) -> u64 {
@@ -204,7 +210,13 @@ mod tests {
         assert!(q.offer(hit()));
         assert!(!q.offer(hit()));
         assert_eq!((q.len(), q.dropped()), (2, 1));
+        assert_eq!(
+            q.bytes(),
+            2 * hit().size(),
+            "a dropped event holds no bytes"
+        );
         assert_eq!(q.drain().len(), 2);
+        assert_eq!(q.bytes(), 0);
         assert!(q.offer(hit()), "draining frees the room");
         let small = EventQueue::new(QueueLimits {
             events: 100,
