@@ -2,6 +2,10 @@ use std::ffi::OsString;
 use std::time::Duration;
 
 use super::*;
+
+/// A descriptor number no test of this crate holds, so running the pre-exec closure in
+/// this process closes nothing that matters.
+const HIGH_FD: u32 = 600;
 use crate::fixtures::{me, scratch_dir};
 
 fn spawn(program: &str, args: &[&str]) -> Spawn {
@@ -233,7 +237,85 @@ fn the_real_calls_with_the_ids_the_process_has_succeed_or_are_refused_for_a_user
     // coverage is not written out): the same three calls, the first of which already
     // needs root.
     assert_eq!(
-        in_child(me())().map_err(|e| e.kind()),
+        before_exec(Some(me()), HIGH_FD)().map_err(|e| e.kind()),
         [Err(io::ErrorKind::PermissionDenied), Ok(())][usize::from(is_root)]
     );
+}
+
+/// Catches a program that inherits a descriptor the helper's parent left open (a lock file,
+/// a socket): `before_exec` makes every descriptor from the given number up close-on-exec
+/// and leaves the lower ones as they were, here with duplicates (which are not
+/// close-on-exec) placed above and below; and a real child lists only its own streams.
+///
+/// Mutant seen red: `cloexec_from` doing nothing.
+#[test]
+fn the_child_inherits_no_descriptor_above_its_streams() {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open("/").expect("open");
+    let dup = |at: libc::c_int| {
+        // SAFETY: fcntl F_DUPFD takes a descriptor this test holds and a lowest number; the
+        // new descriptor is a raw number closed below.
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, at) }
+    };
+    let flags = |fd: i32| unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    let above = dup(HIGH_FD as libc::c_int);
+    let below = dup(20);
+    let leaked = dup(50);
+    assert!(above >= HIGH_FD as libc::c_int && below >= 20 && leaked >= 50);
+    before_exec(None, HIGH_FD)().expect("no user, nothing to switch");
+    assert_ne!(
+        flags(above) & libc::FD_CLOEXEC,
+        0,
+        "the high one closes at exec"
+    );
+    assert_eq!(
+        flags(below) & libc::FD_CLOEXEC,
+        0,
+        "the low one is as it was"
+    );
+    let ran = SystemRunner
+        .run(&spawn("/usr/bin/ls", &["/proc/self/fd"]))
+        .expect("ls runs");
+    let listed = text(&ran.stdout);
+    assert!(
+        !listed
+            .lines()
+            .any(|n| n == leaked.to_string() || n == below.to_string()),
+        "the child holds {listed}"
+    );
+    for fd in [above, below, leaked] {
+        // SAFETY: closing the descriptors this test made.
+        unsafe { libc::close(fd) };
+    }
+}
+
+/// Catches a program named by a relative path being looked up on a `PATH` the helper
+/// never meant: refused before anything starts.
+#[test]
+fn a_relative_program_is_refused() {
+    let err = SystemRunner.run(&spawn("ls", &[])).expect_err("refused");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+}
+
+/// Catches a timeout defeated by a descendant that left the process group and keeps the
+/// pipes: `setsid` forks `sleep` into a group of its own with the output open, the program
+/// itself ends, and the run still returns within the read grace instead of when the sleep
+/// does.
+///
+/// Mutant seen red: the readers joined with no grace (the run takes the sleep's thirty
+/// seconds).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_descendant_that_left_the_group_cannot_hold_the_run() {
+    let started = Instant::now();
+    let ran = SystemRunner
+        .run(&spawn("/usr/bin/setsid", &["/usr/bin/sleep", "30"]))
+        .expect("setsid runs");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(ran.code, Some(0));
+    assert!(ran.stdout.is_empty());
 }
