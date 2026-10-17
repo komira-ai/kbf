@@ -51,12 +51,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Arg, ArgMatches, Command, FromArgMatches as _};
-use kbf_front::{Cache, CacheStorage, ObjectKeys, SegmentsConfig};
+use kbf_front::{Cache, CacheStorage, MetaLog as _, ObjectKeys, RebuildConfig, SegmentsConfig};
 use kbf_log::{FarmLogId, MachineVersion};
 use kbf_mapsync::MapHolder;
 use kbf_meta::{NodeWriter, Retention};
 use kbf_objstore::{KeyPrefix, ObjectStore};
 use kbf_storage::repair::{RepairConfig, Repairs};
+use kbf_storage::service::CatchUp;
 use kbf_store::StdFs;
 use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
@@ -65,6 +66,7 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 use crate::join::{self, Joined, Joiner};
 use crate::node_map::NodeMap;
+use crate::rebuild::Background;
 use crate::replication::{REPAIR_DIR, Registered, bind_node};
 use crate::serve::{ServeError, StorageListener, StorageSocket, bind_storage_socket};
 use crate::start::{AbortOnDrop, open_cold_file};
@@ -376,8 +378,9 @@ pub struct StorageHandle {
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
-    _pass: Option<AbortOnDrop>,
+    _background: Background,
     maps: Arc<MapHolder>,
+    catch_up: CatchUp,
     repairs: Option<Arc<Repairs>>,
     _joiner: Option<AbortOnDrop>,
     _repair: Option<AbortOnDrop>,
@@ -398,6 +401,15 @@ impl StorageHandle {
         Arc::clone(&self.maps)
     }
 
+    /// Whether the node is rebuilding its index from the store, which it does at a start
+    /// over a metadata log that never finished a rebuild (a new or wiped one) when it
+    /// registers with `--frontend`. It serves meanwhile, answering a miss UNAVAILABLE;
+    /// [`CatchUp::finished`] completes when the rebuild is done.
+    #[must_use]
+    pub fn catch_up(&self) -> CatchUp {
+        self.catch_up.clone()
+    }
+
     /// The line the node prints once it is bound:
     /// `kbf-storage <version> storage=<addr> log=<id>`.
     #[must_use]
@@ -414,7 +426,7 @@ impl StorageHandle {
         let Self {
             serving,
             _flusher,
-            _pass,
+            _background,
             _joiner,
             _repair,
             ..
@@ -500,6 +512,7 @@ where
         (meta, store, prefix, log),
         (shutdown, &repair_dir),
         pass,
+        RebuildConfig::default(),
     )
     .await
 }
@@ -514,6 +527,7 @@ async fn assemble<O, S, F>(
     (meta, store, prefix, log): (RaftMetaLog<StdFs>, O, KeyPrefix, FarmLogId),
     (shutdown, repair_dir): (S, &Path),
     pass: Option<StartPass<RaftMetaLog<StdFs>>>,
+    rebuild: RebuildConfig,
 ) -> Result<StorageHandle, Box<dyn Error>>
 where
     O: ObjectStore + 'static,
@@ -529,7 +543,8 @@ where
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
         AbortOnDrop(tokio::spawn(flusher))
     });
-    let _pass = pass.map(|pass| AbortOnDrop(crate::startup_pass::spawn(Arc::clone(&cache), pass)));
+    let catch_up = registered.catch_up.clone();
+    let _background = crate::rebuild::spawn(&cache, &catch_up, pass, rebuild);
     let storage = Arc::new(CacheStorage::new(cache, flags.segments()));
     let stop = Box::pin(shutdown()?);
     let node = bind_node(flags, listener, registered, storage, repair_dir, stop)?;
@@ -541,8 +556,9 @@ where
         ),
         serving: node.serving,
         _flusher,
-        _pass,
+        _background,
         maps: node.maps,
+        catch_up,
         repairs: node.repairs,
         _joiner: node.joiner,
         _repair: node.repair,
@@ -553,6 +569,12 @@ where
 /// (retrying until the frontend answers), so the cache writes as the registration's member
 /// and boot ([`open_registered`]); the registration and what it gave come back for the
 /// heartbeats ([`Joiner::keep`]). Without it the cache writes in an epoch of its own log.
+///
+/// The [`CatchUp`] in [`Registered`] says whether the node owes a rebuild of its index: a
+/// registered node whose log has not finished one does, and tells the frontend so in its
+/// registration, so the map ranks it last until it is done. A node without `--frontend`
+/// owes none: it keeps its objects under its log's own prefix, which no other log's loss
+/// can orphan.
 /// `kbf storage` and the storage half of `kbf storage-and-daemon` both open theirs here.
 ///
 /// # Errors
@@ -569,7 +591,14 @@ pub(crate) async fn open_cache<O: ObjectStore>(
     };
     let node = Arc::new(NodeMap::new(Arc::new(MapHolder::new())));
     Ok(match flags.joiner(socket.addr(), Arc::clone(&node))? {
-        Some(mut joiner) => {
+        Some(joiner) => {
+            let done = meta.query(|state| state.rebuild().is_done()).await?;
+            let catch_up = if done {
+                CatchUp::caught_up()
+            } else {
+                CatchUp::rebuilding()
+            };
+            let mut joiner = joiner.with_catch_up(catch_up.clone());
             let joined = joiner.join().await;
             let cache = open_registered(meta, store, keys, &joined).await?;
             let joiner = Some((joiner, joined));
@@ -579,6 +608,7 @@ pub(crate) async fn open_cache<O: ObjectStore>(
                     socket,
                     node,
                     joiner,
+                    catch_up,
                 },
             )
         }
@@ -588,6 +618,7 @@ pub(crate) async fn open_cache<O: ObjectStore>(
                 socket,
                 node,
                 joiner: None,
+                catch_up: CatchUp::caught_up(),
             },
         ),
     })
@@ -689,3 +720,7 @@ fn serve(flags: &StorageFlags) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 #[path = "storage_node_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "storage_rebuild_tests.rs"]
+mod rebuild_tests;

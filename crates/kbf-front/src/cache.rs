@@ -757,6 +757,7 @@ mod evict;
 mod flush;
 mod losses;
 mod read;
+mod rebuild;
 mod stream;
 mod stream_store;
 mod tier;
@@ -775,6 +776,7 @@ pub use flush::{
 };
 pub use losses::Losses;
 pub use read::{BlobRead, MAX_DECODED_BLOB_BYTES, READ_WINDOW_BYTES};
+pub use rebuild::{ADOPT_RECORDS, RebuildConfig, RebuildReport};
 pub(crate) use stream::TierRange;
 pub use stream::{RecordStream, StreamedRecord};
 pub use tier::{TierStartError, TierStartup};

@@ -2,7 +2,7 @@
 
 use std::num::NonZeroU64;
 
-use kbf_meta::{Epoch, NodeWriter, ObjectId, TierId, Writer};
+use kbf_meta::{Epoch, LegacyWriter, NodeWriter, ObjectId, TierId, Writer};
 
 /// The file that names the tier a directory belongs to.
 pub const TIER: &str = "TIER";
@@ -24,7 +24,9 @@ pub(crate) fn parse_tier_file(bytes: &[u8]) -> Option<TierId> {
 }
 
 /// The stem of `object`'s files: `<epoch>-<seq>` for an epoch writer's object,
-/// `<member>-<boot>-<seq>` for a node writer's, each as 16 lowercase hex digits.
+/// `<member>-<boot>-<seq>` for a node writer's, each as 16 lowercase hex digits. An
+/// object of another log's epoch is never staged (only a rebuild of the index names one),
+/// but has a stem all the same: `l<log id>-<epoch>-<seq>`.
 fn stem(object: ObjectId) -> String {
     match object.writer() {
         Writer::Epoch(e) => format!("{:016x}-{:016x}", e.get(), object.seq()),
@@ -32,6 +34,12 @@ fn stem(object: ObjectId) -> String {
             "{:016x}-{:016x}-{:016x}",
             n.member(),
             n.boot(),
+            object.seq()
+        ),
+        Writer::Legacy(l) => format!(
+            "l{:016x}-{:016x}-{:016x}",
+            l.log(),
+            l.epoch().get(),
             object.seq()
         ),
     }
@@ -52,6 +60,12 @@ pub fn parse_block_name(name: &str) -> Option<ObjectId> {
     let fields: Vec<&str> = name.strip_suffix(".blk")?.split('-').collect();
     let object = match fields[..] {
         [epoch, seq] => ObjectId::new(Epoch::new(hex(epoch)?), hex(seq)?),
+        [log, epoch, seq] if log.starts_with('l') => {
+            let log = NonZeroU64::new(hex(&log[1..])?)?;
+            let epoch = NonZeroU64::new(hex(epoch)?)?;
+            let writer = LegacyWriter::new(log, Epoch::new(epoch.get()));
+            ObjectId::of(Writer::Legacy(writer), hex(seq)?)
+        }
         [member, boot, seq] => {
             let member = NonZeroU64::new(hex(member)?)?;
             let boot = NonZeroU64::new(hex(boot)?)?;
@@ -133,6 +147,26 @@ mod tests {
             "0000000000000007-000000000000002B-0000000000000003.blk",
             "0000000000000007-000000000000002b-0000000000000003-0000000000000001.blk",
             "7-2b-3.blk",
+        ] {
+            assert_eq!(parse_block_name(bad), None, "{bad}");
+        }
+    }
+
+    /// Catches: a name for an object of another log's epoch (which a tier never stages,
+    /// but the type allows) that collides with an epoch's or a node's, or does not
+    /// round-trip, or parses with a zero log or epoch.
+    #[test]
+    fn another_logs_block_names_round_trip_and_stay_apart() {
+        let n = |v| NonZeroU64::new(v).expect("not zero");
+        let id = ObjectId::of(Writer::Legacy(LegacyWriter::new(n(9), Epoch::new(2))), 3);
+        let stem = "l0000000000000009-0000000000000002-0000000000000003";
+        assert_eq!(block_name(id), format!("{stem}.blk"));
+        assert_eq!(parse_block_name(&block_name(id)), Some(id));
+        assert_eq!(parse_seg_name(&seg_name(id)), Some(id));
+        for bad in [
+            "l0000000000000000-0000000000000002-0000000000000003.blk",
+            "l0000000000000009-0000000000000000-0000000000000003.blk",
+            "L0000000000000009-0000000000000002-0000000000000003.blk",
         ] {
             assert_eq!(parse_block_name(bad), None, "{bad}");
         }
