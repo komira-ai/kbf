@@ -154,8 +154,9 @@ tracing-subscriber = "0.3.23"
 # feature, so neither aws-lc-rs nor the bundled webpki roots (CDLA licence) come in;
 # the agent is given ring and the host's roots.
 ureq = { version = "3.4.2", default-features = false, features = ["rustls-no-provider"] }
-# Reads the fields of a daemon's client certificate the worker listener checks (its DNS
-# subjectAltName, serial and public key); TLS has already verified the certificate.
+# Reads the fields of a peer's client certificate the listeners check (its role URI,
+# kbf-peer; a daemon's DNS subjectAltName, serial and public key, kbf-server); TLS has
+# already verified the certificate.
 x509-parser = "0.18.1"
 # The zip archives kbf-deploy installs (`mdm install`): deflate only, through flate2.
 zip = { version = "9.0.1", default-features = false, features = ["deflate-flate2"] }
@@ -185,6 +186,7 @@ kbf-meta = { path = "crates/kbf-meta" }
 kbf-node = { path = "crates/kbf-node" }
 kbf-objstore = { path = "crates/kbf-objstore" }
 kbf-outputs = { path = "crates/kbf-outputs" }
+kbf-peer = { path = "crates/kbf-peer" }
 kbf-proto = { path = "crates/kbf-proto" }
 kbf-raft = { path = "crates/kbf-raft" }
 kbf-route = { path = "crates/kbf-route" }
@@ -212,3 +214,15 @@ xtask = { path = "crates/xtask" }
 [workspace.lints.clippy]
 disallowed_methods = "allow"
 disallowed_types = "allow"
+
+# Dev and test builds: a test binary with full debug info is ~0.5 GB and a target
+# directory holds thousands of them, plus incremental state. Line tables keep panic
+# backtraces and profilers at file:line; variable-level debug info is the part dropped.
+# `test` inherits `dev`; it is spelled out so the two cannot drift. Release is untouched.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false

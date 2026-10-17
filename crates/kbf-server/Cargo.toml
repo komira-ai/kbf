@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 axum = { workspace = true, features = ["http1", "tokio"] }
+bytes.workspace = true
 clap.workspace = true
 form_urlencoded.workspace = true
 hex.workspace = true
@@ -43,15 +44,17 @@ subtle.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tonic = { workspace = true, features = ["tls-ring"] }
+tower-layer.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 x509-parser.workspace = true
 
 [dev-dependencies]
-bytes.workspace = true
 kbf-segments.workspace = true
 # The deterministic simulation kernel's seeded random stream (tests/sim_rollout.rs).
 kbf-sim.workspace = true
+# The in-memory state store (src/start.rs, src/frontend, src/farm/durable and tests/).
+kbf-state = { workspace = true, features = ["test-support"] }
 # The pages, rendered over this server's real routes (tests/ui_pages.rs).
 kbf-ui.workspace = true
 # fcntl and kill for the test that holds the server at its start line (tests/binary.rs).
@@ -59,6 +62,9 @@ libc.workspace = true
 prost.workspace = true
 rcgen.workspace = true
 tokio = { workspace = true, features = ["io-util", "test-util"] }
+# The codec of a raw call to each method of the worker listener's role table
+# (tests/worker_roles.rs).
+tonic-prost.workspace = true
 # rebuild_interest_cache for the tests that install a global subscriber while others run.
 tracing-core.workspace = true
 

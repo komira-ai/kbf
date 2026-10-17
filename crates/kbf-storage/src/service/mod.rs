@@ -38,8 +38,8 @@
 //! NOT_FOUND or FAILED_PRECONDITION. Hits and writes are served.
 //!
 //! **Who may call** is [`Admission`]: the role in the caller's certificate against the
-//! endpoint's table. Roles are the part of this unit that is partly a seam; the module
-//! docs of [`admission`] say which.
+//! endpoint's table, the role read by `kbf-peer`; the module docs of [`admission`] say
+//! what is checked and what is planned.
 //!
 //! **How `Write` takes a blob in.** Where the store offers a [`crate::PutStream`]
 //! ([`Storage::stream`]), each message is appended to it as it arrives and the blob is
@@ -55,6 +55,7 @@ mod cas;
 mod catch_up;
 mod client;
 mod generation;
+mod in_process;
 mod segments;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -78,6 +79,7 @@ pub use admission::{Admission, Endpoint, PeerRole, ROLE_URI_PREFIX, role_of};
 pub use catch_up::CatchUp;
 pub use client::RemoteStorage;
 pub(crate) use client::lift;
+pub use in_process::InProcess;
 
 /// The metadata entry that carries the map generation on the standard calls.
 pub const MAP_GENERATION_HEADER: &str = "kbf-map-generation";
@@ -86,8 +88,10 @@ pub const MAP_GENERATION_HEADER: &str = "kbf-map-generation";
 /// around it, `kbf-front`'s `MAX_MESSAGE_BYTES` (a test pins the two equal).
 pub const MAX_MESSAGE_BYTES: usize = (16 << 20) + (1 << 20);
 
-/// The largest blob a `Write` accepts, `kbf-front`'s `MAX_BLOB_BYTES` (pinned the same).
-pub const MAX_BLOB_BYTES: u64 = 1 << 30;
+/// The size past which a `Write` is not held whole but streamed to the store as its
+/// messages arrive ([`crate::Storage::put_streamed`]), `kbf-front`'s
+/// `MAX_UNSTAGED_BLOB_BYTES` (a test pins the two equal). No blob is refused for its size.
+pub const STREAM_FROM_BYTES: u64 = 16 << 20;
 
 /// The most digests one `FindMissingBlobs` may name. `kbf-front` sets none beyond the
 /// message size, and a full message could name 262 144 of them (17 MiB over the 68 bytes
@@ -201,7 +205,14 @@ impl StorageService {
     /// The service as routes, ready to be added to a tonic server.
     #[must_use]
     pub fn routes(self) -> Routes {
-        let this = Arc::new(self);
+        Arc::new(self).shared_routes()
+    }
+
+    /// [`Self::routes`] for a service the caller keeps a handle on, so that the process
+    /// that serves it can also call it ([`Self::in_process`]).
+    #[must_use]
+    pub fn shared_routes(self: &Arc<Self>) -> Routes {
+        let this = Arc::clone(self);
         Routes::new(
             ContentAddressableStorageServer::from_arc(Arc::clone(&this))
                 .max_decoding_message_size(MAX_MESSAGE_BYTES)
@@ -222,5 +233,14 @@ impl StorageService {
                 .max_decoding_message_size(MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_MESSAGE_BYTES),
         )
+    }
+
+    /// The service called in this process, without a connection ([`InProcess`]): what the
+    /// daemon half of a storage-and-daemon process uses for the one member that is its own
+    /// node, so that a write it makes takes the path a call from another node takes (the
+    /// generation check, the chain's forward to the replica).
+    #[must_use]
+    pub fn in_process(self: &Arc<Self>) -> InProcess {
+        InProcess::new(Arc::clone(self))
     }
 }

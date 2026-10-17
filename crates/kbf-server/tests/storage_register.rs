@@ -93,6 +93,7 @@ fn listeners(worker_tls: Option<WorkerTls>) -> Listeners {
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
         streams: kbf_server::StreamTiming::default(),
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     }
 }
 
@@ -614,13 +615,17 @@ fn readable_map() -> pb::Map {
 /// frontend admits the node (it registers, and opens its cache) but sends a map the node
 /// cannot read, so it has none: every kind of call is refused UNAVAILABLE "no storage map
 /// yet", not answered as an empty cache (a FindMissing that says every blob is missing, a
-/// write taken that the map places elsewhere); once a heartbeat brings a map the same
-/// calls are served. Mutant: a gate that lets every call through.
+/// write taken that the map places elsewhere), the action cache and the segment uploads
+/// included; once a heartbeat brings a map the same calls are served. Mutant: a gate that
+/// lets every call through, or one that spares the action cache or Segments.
 #[tokio::test]
 async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
     let sent = Arc::new(Mutex::new(pb::Map::default()));
     let (node, client) = waiting_node(&sent, "gate").await;
     let maps = node.maps();
+    let segments = Endpoint::from_shared(format!("http://{}", node.addr))
+        .expect("endpoint")
+        .connect_lazy();
     let _serving = tokio::spawn(node.serve());
     // The node's directory outlives the run: a blob no earlier run stored.
     let blob = format!(
@@ -653,6 +658,31 @@ async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
                 .put(bytes::Bytes::from(blob.clone()))
                 .await
                 .expect_err("refused")
+        ),
+        want
+    );
+    // The action cache, read and written, and the Segments uploads.
+    assert_eq!(
+        refused(client.action_result(&digest).await.expect_err("refused")),
+        want
+    );
+    assert_eq!(
+        refused(
+            client
+                .prepare_action_result(&kbf_proto::reapi::ActionResult::default())
+                .await
+                .expect_err("refused")
+        ),
+        want
+    );
+    let begun = kbf_proto::worker::segments_client::SegmentsClient::new(segments.clone())
+        .begin(kbf_proto::worker::BeginRequest::default())
+        .await
+        .expect_err("refused");
+    assert_eq!(
+        (
+            begun.code(),
+            begun.message().contains(kbf_server::NO_MAP_YET)
         ),
         want
     );

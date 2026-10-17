@@ -1,7 +1,7 @@
 //! The units `kbf-deploy linux render-units --mode` writes, against this binary's own
 //! parser, in-process: each mode's rendered `ExecStart=` is a command line `kbf` takes,
 //! for the mode the unit is named after, and kbf-deploy renders exactly kbf's modes;
-//! and `check-units --mode` runs this build's `kbf check-args` on a built mode's flags.
+//! and `check-units --mode` runs this build's `kbf check-args` on a mode's flags.
 
 use kbf_cli::{Invocation, parse_from};
 use kbf_deploy::linux::modes::{TRUSTED_NOTE, render};
@@ -11,14 +11,6 @@ use kbf_host::exec::{Entry as HostEntry, Exec, HostExec, Meta};
 use kbf_host::path::{HostPath, Root};
 use kbf_host::step::{Cmd, HttpUrl, Step};
 use kbf_host::trust::Untrusted;
-
-/// Modes `kbf` builds whose unit `kbf-deploy` still renders as an unbuilt one: no flag
-/// on `ExecStart=`, `is_built()` false. `kbf frontend` needs `--storage`, so kbf refuses
-/// the rendered command line; the unit's flags (listen addresses, the storage URL and
-/// its three certificate flags, the state store) belong to the `kbf-deploy` change that
-/// owns the templates (av2-16). That change deletes this row, and both tests below say
-/// so by going red the day the unit has flags (or `is_built()` is true).
-const UNITS_BEHIND: &[Mode] = &[Mode::Frontend];
 
 const EXAMPLE: &str = include_str!("../../kbf-deploy/templates/linux/config.example");
 
@@ -35,9 +27,7 @@ fn config() -> LinuxConfig {
 
 /// Catches a mode unit naming a flag `kbf <mode>` does not take or refuses as another
 /// mode's (a store flag in the daemon's unit, `--cas` in the all-in-one's), a value
-/// its parser refuses, a unit that starts another mode than its name says, and a flag
-/// in the unit of a mode not built yet (kbf takes anything there and exits 2 at start,
-/// so nothing would have checked it).
+/// its parser refuses, and a unit that starts another mode than its name says.
 #[test]
 fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
     let c = config();
@@ -46,20 +36,53 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
         let unit = UnitFile::parse(&text).expect("a unit");
         let argv = unit.exec_start();
         assert_eq!(argv[..2], ["/usr/local/bin/kbf", mode.name()], "{mode}");
-        if UNITS_BEHIND.contains(&mode) {
-            let e = parse_from(argv.iter().copied()).expect_err("a unit without --storage");
-            assert!(e.to_string().contains("--storage"), "kbf {mode}: {e}");
-            assert_eq!(argv.len(), 2, "kbf {mode}'s unit has flags now: {argv:?}");
-            continue;
-        }
         let parsed = match parse_from(argv.iter().copied()) {
             Ok(parsed) => parsed,
             Err(e) => panic!("kbf {mode} refuses its rendered ExecStart= {argv:?}:\n{e}"),
         };
         match parsed {
             Invocation::Daemon(_) => assert_eq!(mode, Mode::Daemon),
-            Invocation::AllInOne(_) => assert_eq!(mode, Mode::AllInOne),
-            Invocation::Frontend(_) => unreachable!("{mode}: its unit has no --storage yet"),
+            Invocation::AllInOne(flags) => {
+                assert_eq!(mode, Mode::AllInOne);
+                assert_eq!(
+                    flags.server.api_token_file.as_deref(),
+                    Some(std::path::Path::new("/etc/kbf/api-token"))
+                );
+            }
+            Invocation::Frontend(flags) => {
+                assert_eq!(mode, Mode::Frontend);
+                // The unit's storage URL and the three flags toward it are read as the
+                // settings spell them: mutual TLS with the frontend's worker certificate.
+                assert_eq!(flags.storage.uri().to_string(), "https://192.0.2.20:8983/");
+                let paths = flags
+                    .tls
+                    .expect("the frontend unit turns on mutual TLS to storage");
+                assert_eq!(
+                    paths.map(|p| p.display().to_string()),
+                    [
+                        "/etc/kbf/worker.pem",
+                        "/etc/kbf/worker.key",
+                        "/etc/kbf/ca.pem"
+                    ]
+                );
+                assert_eq!(flags.server.listen.to_string(), "192.0.2.10:8980");
+                assert_eq!(flags.server.worker_listen.to_string(), "192.0.2.10:8981");
+                assert_eq!(
+                    flags.server.api_listen.map(|a| a.to_string()).as_deref(),
+                    Some("127.0.0.1:8982")
+                );
+                // The operator API's token is the file the unit names, so a write is not 401.
+                assert_eq!(
+                    flags.server.api_token_file.as_deref(),
+                    Some(std::path::Path::new("/etc/kbf/api-token"))
+                );
+                assert_eq!(
+                    flags.server.state_store,
+                    Some(kbf_server::StateStoreUri::Sqlite(
+                        "/var/lib/kbf-server/state/state.db".into()
+                    ))
+                );
+            }
             Invocation::Storage(flags) => {
                 assert_eq!(mode, Mode::Storage);
                 // The unit's certificate flags are read as the paths they spell (not
@@ -206,19 +229,13 @@ fn each_rows_certificate_names_its_role_as_storage_reads_it() {
 }
 
 /// Catches kbf-deploy rendering a mode kbf does not have (a sixth, or an old name),
-/// missing one kbf has, listing them in another order than `kbf --help`, and saying a
-/// mode is built (its unit's flags checked) when kbf has no command line for it, or
-/// the other way round once kbf builds one.
+/// missing one kbf has, and listing them in another order than `kbf --help`.
 #[test]
 fn kbf_deploy_renders_exactly_the_modes_kbf_takes() {
     let kbf = kbf_cli::command();
     let help: Vec<&str> = kbf.get_subcommands().map(clap::Command::get_name).collect();
     let deploy: Vec<&str> = Mode::ALL.iter().map(|m| m.name()).collect();
     assert_eq!(deploy, help);
-    for mode in Mode::ALL.iter() {
-        let built = !UNITS_BEHIND.contains(mode);
-        assert_eq!(mode.is_built(), built, "{mode}");
-    }
 }
 
 /// The scratch directory `name` under the workspace's `target/`, empty.
@@ -302,21 +319,21 @@ fn check_units_with<E: Exec>(
     )
 }
 
-/// Catches `check-units --mode` passing a built mode's unit whose flags kbf refuses (an
+/// Catches `check-units --mode` passing a mode's unit whose flags kbf refuses (an
 /// operator's edit that adds a flag `kbf daemon` does not have, or another mode's flag;
 /// red before rule `parse`, which runs `kbf check-args`), failing a unit kbf takes, and
 /// the two crates spelling `check-args` differently.
 #[test]
-fn check_units_parses_a_built_modes_flags_with_this_kbf() {
+fn check_units_parses_a_modes_flags_with_this_kbf() {
     assert_eq!(kbf_deploy::linux::modes::CHECK_ARGS, kbf_cli::CHECK_ARGS);
     let c = config();
-    for mode in [Mode::Storage, Mode::Daemon, Mode::AllInOne] {
+    for mode in Mode::ALL {
         let text = render(&c, Some(1500), mode).expect("renders");
         // all-in-one is labelled trusted; the storage unit's key file is not on this
         // machine; nothing else is said.
         let notes: Vec<String> = match mode {
             Mode::AllInOne => vec![TRUSTED_NOTE.to_owned()],
-            Mode::Storage => vec![
+            Mode::Storage | Mode::StorageAndDaemon => vec![
                 "SKIP credential: no key file at /etc/kbf/s3.env yet, so its owner and mode were not checked"
                     .to_owned(),
             ],
