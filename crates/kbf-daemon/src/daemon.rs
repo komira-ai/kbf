@@ -846,6 +846,13 @@ impl Daemon {
                     link.take(update.map);
                 }
             }
+            // The update client of a later change takes these; until then a daemon that
+            // is offered or ordered an update goes on with its session.
+            Some(
+                server_message::Message::UpdateOffer(_) | server_message::Message::UpdateOrder(_),
+            ) => {
+                tracing::debug!("an update message ignored: this daemon takes no updates yet");
+            }
             None => tracing::warn!("an empty server message ignored"),
         }
     }
