@@ -86,7 +86,7 @@ fn host(root: PathBuf) -> Result<(Layout, HostExec), String> {
 }
 
 fn run(root: PathBuf, args: RunArgs) -> Result<(), String> {
-    let (layout, exec) = host(root.clone())?;
+    let (layout, exec) = host(root)?;
     // clap makes exactly one of the two flags present (`required_unless_present`,
     // `conflicts_with`), so the label is there whenever the unit is not.
     let restart = match args.unit {
@@ -100,7 +100,7 @@ fn run(root: PathBuf, args: RunArgs) -> Result<(), String> {
         starts: args.starts,
     };
     let mut helper = Helper::new(layout.clone(), exec, cfg);
-    let trust = HostExec::new(Root::new(root).map_err(|e| e.to_string())?);
+    let trust = HostExec::new(layout.root().clone());
     let mut stager = move |exec: &mut HostExec, entry: &std::path::Path| {
         let settings = Settings::load(&trust, &layout)?;
         let mut ctx = Context {
