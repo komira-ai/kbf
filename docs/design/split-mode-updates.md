@@ -10,27 +10,37 @@ end-to-end test named beside it. **[owner]** marks a decision that is the owner'
 ## 0. The plan in one page
 
 The owner's constraints: nothing restarts the frontend by itself (a restart fails every build in flight, buck2 never sends an
-`Execute` again once its stream broke), and the farm is never idle, so there is no quiet moment. The plan is a queue-based
-handover:
+`Execute` again once its stream broke), and the farm is never idle, so there is no quiet moment. **One standard frontend update
+process everywhere, with Envoy in front**, on a single box, in split mode and in all-in-one mode:
 
-1. **Start the new frontend beside the old one.** From then on every new request goes into the shared queue, which is the
-   state store, and is not dispatched by the old frontend.
-2. **The old frontend finishes what it holds, then stops.** It answers its open `Execute` and `WaitExecution` streams and
-   exits when the last one ends.
+1. **Start the new frontend on another port.** Envoy, with a static config naming both instances, sends new connections and
+   streams to it.
+2. **The old frontend drains**: it fails its health check, sends GOAWAY, finishes its in-flight requests and exits. Clients
+   reconnect through Envoy.
 3. **Storage-and-daemon nodes and daemon-only hosts update one at a time, the moment each is idle**, driven by the new
-   frontend: idle, update, rejoin taking queued work. Repeat until every host is new. Macs are daemon-only hosts and follow
-   the daemon rule.
-4. **Rollback is the same mechanism with the old release set as the target.**
-5. Several frontends (Postgres behind a load balancer) are updated one at a time the same way.
+   frontend (idle, update, rejoin taking queued work). Macs follow the daemon rule.
+4. **Rollback is the same mechanism with the old release as the target.**
+5. Several frontends (Postgres) are updated one at a time the same way. Envoy itself updates by its native hot restart.
 
-What checking this against the handover code found (section 2.9 has the full list): **the queue model needs two frontends
-writing the state store at once, and the SQLite backend allows exactly one writer, with a generation fence that locks the
-old frontend out the moment the new one opens the store.** So the queue model is the several-frontends model, which
-`architecture-v2.md` P9/P10 plans for Postgres and is not built. On SQLite, which is the farm today, the same plan runs with
-the writer baton moving once, when the old frontend stands down; the queue is the state store from that instant, and between
-the new frontend's start and that instant a request waits in the listener's backlog. Both are one state machine (section
-2.2); the node step, the idle definitions, the queue alert, the schema rule and rollback are identical. Decisions: **D1
-[owner]** which backend carries the overlap; **D2 [owner]** whether the new frontend dispatches to nodes not yet updated.
+What checking this against the handover code found (section 2.9):
+
+- **Envoy replaces #879's listener passing (SCM_RIGHTS) and nothing else.** GOAWAY and drain, the `done/` rows and the
+  follower, `Farm::fence`, `Store::demote`, the kept epoch, the cordon rows and `READY=1` all stay.
+- **The central problem is the state-store writer.** With Envoy the two frontends overlap in time, and SQLite allows one
+  writer per process lifetime (an exclusive `flock`) and #857 fences the old writer out at the next generation. The
+  resolution proposed (option d, 2.9) is that **the overlap need not include two writers**: the writer baton moves once,
+  as in #879, and the old frontend becomes a read-only relay because its daemons move with the baton and keep their leases. The
+  old frontend then drains for as long as its clients' streams last without writing a row. The options that let it keep writing
+  (a: relax SQLite, b: Postgres, c: forward its writes) are laid out with costs; they are needed only if the owner wants the
+  old frontend to keep its daemon streams.
+- **The claim "a long `WaitExecution` reattaches by operation name" is true of Bazel and false of buck2.** buck2 never calls
+  `WaitExecution` (4.1). With Envoy the old backend's streams are not cut, so buck2 does not need to reattach; reattach is the
+  fallback if the old frontend crashes, and only Bazel uses it.
+- **Envoy's own update is the weak point**: hot restart kills the parent's connections at `--parent-shutdown-time-s`, default
+  900 s, which fails any build stream older than 15 minutes unless the flag is raised (2.5.4).
+
+Decisions: **D1 [owner]** the writer model (2.9); **D2 [owner]** dispatch to nodes not yet updated; **D3 [owner]** forced drain
+of the least-loaded node; **D4 [owner]** where Envoy runs and how it updates (2.5.4).
 
 ## 1. Scope
 
@@ -57,28 +67,21 @@ says what it must do for this sequence.
 - **A failure holds the run.** It does not retry by itself and does not skip the host. A person decides.
 - **Capacity beats update**: if an update holds queued builds longer than its limit (2.8) the controller gives the host back.
 
-### 2.2 One state machine, two backends
+### 2.2 One state machine
 
 ```text
 Idle
  └─ Preflight ─────────── refused: Idle, nothing touched
      └─ Staging              every host fetches and verifies the release in parallel; nothing is installed
-         └─ FrontendPhase    start the new frontend; the queue takes over        (2.5)
-             └─ NodePhase    idle → update → rejoin, one host at a time          (2.6, 2.7)
+         └─ FrontendPhase    start the new frontend behind Envoy; the old one drains    (2.5)
+             └─ NodePhase    idle → update → rejoin, one host at a time                 (2.6, 2.7)
                  └─ Settling the old frontend answers its last streams and exits (runs alongside NodePhase)
                      └─ Done
  any phase ── Held (a person acts) | Paused (between hosts) | Pending (a host or the capacity floor says later)
 ```
 
-The overlap differs by backend, nothing else does:
-
-| | A. SQLite (today) | B. Postgres (P9/P10, not built) |
-|---|---|---|
-| Writers during the overlap | one: the old frontend until `released`, the new one after (the baton moves once) | both, each fenced per daemon session (`session_gen`) |
-| New frontend before it writes | holds connections in the listener backlog; accepts no `Execute` it cannot persist | accepts and queues at once |
-| Old frontend after the new one serves | relays its open streams from `done/` rows; dispatches nothing, grants nothing | keeps its daemon streams and its leases until each host updates; claims nothing new (role `draining`) |
-| Daemon streams | end at stand-down; daemons redial the new frontend | stay on the old frontend until the host restarts, then reconnect to the new one |
-| If the new frontend dies after it serves | no frontend serves until systemd restarts it: a cold start (epoch bump, leases rerun) | the old frontend is still a writer and still serves: nothing is lost |
+The frontend phase is the same on a single box, in split mode and in all-in-one mode. What differs is what the baton carries
+(2.5.5) and, if the owner chooses a different writer model (2.9), the overlap of writers.
 
 ### 2.3 Who owns each step
 
@@ -88,7 +91,7 @@ The overlap differs by backend, nothing else does:
 | Preflight | frontend: planner (2.4) | `kbf --version --json` of each tarball; build facts of every running host |
 | Staging | each host: update client (`kbf-node`) and root helper, offline verification | session to the frontend |
 | Slot, plan, ordering, resume | the **new** frontend: rollout controller (6.1) | `update/*` rows |
-| Start new frontend, stand down | frontend host: the helper starts the idle instance; the old process stands down (#879) | units `kbf-frontend@{a,b}` (#887) |
+| Start the new frontend, switch, drain | frontend host: the helper starts the idle instance on its own ports; the baton moves (#879); Envoy routes by health; the old process drains | units `kbf-frontend@{a,b}` (#887), Envoy static config naming both |
 | Cordon, lease count, queue | scheduler (`Farm`), `cordon/<node>` rows (#879) | none new |
 | Planned-down, member states | `Members` | operator-settable `down` (2.6, step 3) |
 | Open write count, repair debt | storage node: heartbeat fields | not built |
@@ -108,38 +111,112 @@ Inputs: the signed manifest per pool and platform, whose `meta` is `kbf --versio
 3. **Order** (rule in 3.3): the frontend moves first, except a downgrade across a protocol difference, where the nodes move first.
    Refused as a flag day if no order keeps every host inside the frontend's accepted range at every instant.
 4. **Schema**: the rule of 3.4. A release whose schema step is not expand-only is refused here.
-5. **Handover wire** equal to the running frontend's, else the frontend phase is a cold restart (3.5).
+5. **Handover wire** equal to the running frontend's, else the frontend phase is a cold restart (3.5); and **Envoy's config names both instances' ports** (`kbf-deploy envoy check`).
 6. **`meta_log`**: if the release raises the nodes' log machine version, node rollback is "wipe and rebuild" (5.2); the UI says so
    before the click.
 7. **`unit_rev`**: unit files and flags are installed by a held script, never by the updater. A release that needs a newer
-   unit than a host has is refused (the handover refuses a changed listen address or state path, but only after the
-   successor started).
+   unit than a host has is refused (the holder refuses a different state path, but only after the successor started).
 8. **Storage gate** G_S (2.7). The metrics it reads do not exist yet; until they do the plan cannot start a node.
 9. **Capacity**: with one node out, the rest meet `min_serving` (policy), or the operator accepts the slowdown.
 
-### 2.5 Frontend phase: start the new frontend, move the queue
+### 2.5 Frontend phase: one standard process, Envoy in front
 
-**[F]** The mechanics are those of `docs/design/frontend-handover.md` (#887). In order:
+#### 2.5.1 What stands in front
+
+Envoy is a static front that routes by listener to two backends and never changes during an update. **[F]** `kbf-deploy envoy`
+already renders one for a Kubernetes client front (a Tailscale operator Ingress in front of one Envoy that routes REAPI calls by
+method to the servers over TLS to the farm's CA; `grpc_health_check`, `healthy_panic_threshold` 0, routes with `timeout: 0s`, HCM
+`stream_idle_timeout` 7200 s). That kit is the REAPI half; the rest below is new.
+
+| Listener | Carries | Envoy filter | Backend cluster | Health check |
+|---|---|---|---|---|
+| REAPI | Execute, WaitExecution, CAS, AC, ByteStream | HTTP connection manager, h2, TLS terminated here | `kbf_reapi`: instances `a` and `b` | `grpc_health_check` on the same port (**[F]** `grpc.health.v1` on the REAPI listener answers `/readyz`) |
+| Worker | daemon Session streams, storage `Register`/`Heartbeat` | **TCP proxy, TLS passthrough** | `kbf_worker`: instances `a` and `b` | HTTP check of `/readyz` on the instance's API port (`alt_port`) |
+| Operator API and UI | `kbf cluster`, the update page | **not behind Envoy** (below) | each instance's own port | |
+
+- **Two instances, fixed ports.** `kbf-frontend@a` and `@b` keep one template but differ in their listen ports (the instance name
+  selects a flags file; flags, not environment). Envoy's config names both and does not change between updates. The idle
+  instance is stopped, so it fails the health check and gets no traffic.
+- **REAPI route**: one cluster, both endpoints, `lb_policy` round robin; `timeout: 0s` on every route; `stream_idle_timeout` above
+  the frontend's progress interval (**[F]** the frontend sends every open `Execute` its operation again every
+  `--progress-interval-secs`, so a quiet action keeps the stream active); no `max_stream_duration`, no `max_connection_duration`.
+  Retry policy on the unary and `Execute` routes: `retry_on: unavailable,connect-failure,refused-stream`, a small `num_retries`,
+  a previous-host exclusion, so a call that reaches an instance that has just stood down is retried on the other before the client sees it **[U]**.
+- **Health check for the REAPI cluster during an update**: `interval` 1 s, `healthy_threshold` 1, `unhealthy_threshold` 1
+  (the kit's 5 s and 2 would leave a 10 s window), `healthy_panic_threshold` 0 as in the kit (no healthy host means a
+  local `503`, not a call to a draining one). **[F]** `close_connections_on_host_health_failure` is documented as
+  supported only for `tcp_proxy`, and is left unset for the worker cluster: a health failure there must not cut the
+  daemons' connections. **[U]** that a health failure on an HTTP cluster leaves in-flight streams and the upstream connection
+  alone; test E1 proves it on the pinned Envoy.
+- **Worker listener**: the daemons' and storage nodes' mTLS is checked by the frontend against the peer certificate and a deny
+  list (**[F]** `docs/reapi-auth.md`: the worker listener keeps its own mutual TLS), so Envoy must not terminate it. TCP proxy
+  with `idle_timeout` 0 (the default is an hour) passes the connection through; the frontend sees the daemon's certificate.
+- **Operator API and UI stay off Envoy.** **[F]** `api.md`: a write needs a loopback peer and a bearer token, "because ... a
+  reverse proxy on the host makes remote callers loopback". Envoy on the same host would make every caller loopback, so the
+  API is addressed directly, per instance, and the controller publishes which instance is active.
+
+**TLS.** Envoy terminates the REAPI TLS (**[F]** `reapi-auth.md`: a front "terminates TLS and balances load"; the REAPI policy
+reads no certificate). On a single box, Envoy holds the tailnet certificate files and reloads them without a restart through a
+file-based secret source; in the Kubernetes kit the Tailscale Ingress proxy terminates the tailnet certificate and Envoy
+speaks cleartext h2 to it. Envoy re-encrypts to the frontend with the farm CA and checks the instance's name (the kit does);
+both instances' certificates carry their names. **[V]** the cert-reload mechanism of the pinned Envoy.
+
+#### 2.5.2 The sequence
+
+**[F]** The mechanics of the baton are those of `docs/design/frontend-handover.md` (#887) minus the sockets. In order:
 
 | # | Step | Owner | Detail |
 |---|---|---|---|
-| F0 | Gate | controller | no other handover running (the idle unit is `inactive`); the state file is backed up (`VACUUM INTO`); preflight clean |
-| F1 | Flip | frontend helper | install the release; flip `current` by atomic symlink rename; **do not restart the serving instance** |
-| F2 | Start | frontend helper | `systemctl start kbf-frontend@<other>`; the successor asks the control socket, receives the three listener sockets and the store generation, builds everything that needs no store, answers `ready` |
-| F3 | Stand down | old process | GOAWAY on its REAPI connections and close its copy of that listener; wait up to `--handover-quiesce-secs` (10) for calls between request and queueing; fence the farm; end the worker streams; `Store::demote` (stop the writer, release the lock, keep reading); answer `released` |
-| F4 | Serve | new process | open the store at the told generation, keep the epoch, serve from the inherited sockets: from here every `Execute` is a queue row |
-| F5 | Settle | controller | every daemon and storage member connected at F2 is connected again; the map generation did not move; `kbf_frontend_relay_lost_total` did not rise; a probe cycle passed |
-| F6 | Confirm | helper | cancel the revert timer; record `last_good` |
+| E0 | Gate | controller | no other handover running (the idle unit is `inactive`); the state file is backed up (`VACUUM INTO`); preflight clean; Envoy's config names both instances (`kbf-deploy envoy check`) |
+| E1 | Flip | frontend helper | install the release; flip `current` by atomic symlink rename; do not restart the serving instance |
+| E2 | Standby | frontend helper | `systemctl start kbf-frontend@<other>` on its own ports. **[F]** #879 already has the shape: the successor "builds everything that does not need the store" before it asks to take it. It binds its listeners, answers health `NOT_SERVING`, and says `READY=1` when it can take the baton. |
+| E3 | Take | new process | over the control socket: `hello <version>`; the old process answers `offer <generation>` (no sockets) |
+| E4 | Switch | both | at the offer the old flips its health to `NOT_SERVING` and sends GOAWAY (**[F]** the existing drain, #793/#810); the new flips to `SERVING`. Envoy sees both within one 1 s interval. The old still answers calls that reach it until it stands down; the new **accepts and holds** calls (a held `Execute` has not been acknowledged and has not been written) until it is the writer. |
+| E5 | Stand down | old process | wait up to `--handover-quiesce-secs` (10) for calls between request and queueing; fence the farm; end the worker streams; `Store::demote`; answer `released`. A call that reaches it after this is answered `UNAVAILABLE`, which Envoy retries on the new instance. |
+| E6 | Serve | new process | open the store at the told generation, keep the epoch, release the held calls into the queue. Daemons redial through Envoy and reach it with their leases. |
+| E7 | Settle | controller | every daemon and storage member connected at E3 is connected again; the map generation did not move; `kbf_frontend_relay_lost_total` did not rise; a probe cycle passed |
+| E8 | Confirm | helper | cancel the revert timer; record `last_good` |
+| E9 | Settling | old process | answers its open streams from the `done/` rows, then exits (the existing drain: exit 0 when streams reach zero). May take as long as the longest build. |
 
-After F6 the run is in `NodePhase` and `Settling` at once. The old process answers its streams from the `done/` rows the new one
-writes (and a stream whose operation the store has no trace of for three looks ends `UNAVAILABLE`, counted), then exits. It may
-live as long as the longest build. **Nothing may stop it** (not the update, not a package manager); the next frontend handover
-waits for it (the command refuses with both instances active).
+After E8 the run is in `NodePhase` and `Settling` at once. Nothing may stop the old process meanwhile; the next frontend
+update waits for it (both instances active is refused).
 
-**What "the queue" is at F3 to F4 on SQLite.** The new process cannot persist anything before `released`, so it does not
-accept an `Execute` before then: the connection waits in the backlog, which is the kernel's queue and holds for the gap (normally
-under a second, bounded by the 10 s quiesce). Accepting a request into memory would acknowledge what a crash loses, and buck2
-does not send it again. On Postgres (backend B) the new frontend accepts and queues from its first serving moment.
+#### 2.5.3 What the queue is, and the gap
+
+The gap is E4 to E6 (normally under a second, bounded by the 10 s quiesce): calls are held in the new process, not in a kernel
+backlog. A held call is an open HTTP/2 stream with no response: if the new process dies in the gap, those streams break and buck2
+fails those actions (5.4). That replaces #879's "connections wait in the backlog", which lost nothing but needed the listening
+socket to be passed. From E6 every `Execute` is a queue row in the state store. The hold is bounded by the quiesce; above it
+`kbf_handover_gap_seconds` alerts (2.8).
+
+#### 2.5.4 Envoy's own update, and where it runs
+
+Native hot restart (**[F]** Envoy docs): the new process initializes fully, including health checks, then asks the old for its
+listening sockets and tells it to drain; existing connections are **not** transferred; the old process drains for
+`--drain-time-s` (default 600) and is shut down at `--parent-shutdown-time-s` (default 900), "independent of the drain time",
+and any connection still open at that point is closed. So **with the defaults every build stream older than 15 minutes through
+the old Envoy fails when Envoy is updated**. Required: `--parent-shutdown-time-s` of at least the longest build (hours), and a
+gradual drain so clients are sent GOAWAY and reconnect to the new Envoy as their calls end. The clients' reconnect through the new
+Envoy is the same GOAWAY race as 4.1, one hop earlier, and has the same test. Hot restart is for a host running Envoy under a hot
+restarter; the Kubernetes kit runs Envoy as a Deployment, where the equivalent is a rolling update with a very long
+`terminationGracePeriodSeconds` and a pre-stop drain, and **there is no hot restart across pods**. **D4 [owner]**: where Envoy
+runs. Lean: on the frontend host under the hot restarter for the single-box farm; the kit unchanged for Kubernetes with the grace
+period raised; Envoy updates are rare, announced, and never part of the frontend run.
+
+#### 2.5.5 All-in-one and the same process
+
+The same Envoy, the same two instances, the same E0 to E9, with two additions that belong to the all-in-one update design: the
+storage log (`kbf-meta`, single-writer) is handed over with the store, and the old process's **in-process daemon detaches**:
+it dials the new instance through Envoy as a remote daemon, reports its results and uploads its outputs there; its leases are in
+the state store so the new instance does not double-book the box. This document does not design that; it requires that the baton
+of E3 to E6 also carries those two things.
+
+#### 2.5.6 Several frontends
+
+With Postgres behind Envoy (or any load balancer) each frontend is updated in turn by E2 to E9 minus the baton (there is none): start
+the new instance, wait for health, drain the old one, wait for its streams, stop it. The rollout slot is held by a new-release
+frontend only (a controller of the old release checks `update/slot.epoch` and does nothing). Node steps begin once one frontend
+is new. Frontends of both releases serve nodes of both, so the contract of 3.2 holds in all directions.
 
 ### 2.6 The node step: idle, update, rejoin
 
@@ -148,7 +225,7 @@ This is what the node-rolling unit implements. One storage-and-daemon node at a 
 
 **Selection.** Candidates are hosts at the old release, not `Held`, with no other host in a step. The controller looks every
 heartbeat. A candidate is picked when it is **idle** (2.7) and the gates hold. If none is idle after `idle_wait` (default 2
-minutes from F6 or from the last node's uncordon), it picks the candidate with the fewest leases and cordons it, so a farm that
+minutes from E8 or from the last node's uncordon), it picks the candidate with the fewest leases and cordons it, so a farm that
 is never idle still drains one node at a time (**D3**, below). Idle nodes are never skipped for a busier one.
 
 | # | Step | What happens | Leaves the step when | If it fails |
@@ -182,6 +259,11 @@ this with `--shutdown-timeout-secs`). Whether the node does on SIGTERM is not es
 zero write sessions makes the stop safe for writes either way; reads that break mid-stream resume on the next owner
 (**[F]** `kbf-route`: a read that breaks after its first byte "goes on from the bytes already passed").
 
+**D2 [owner]: does the new frontend dispatch to nodes not yet updated?** Under the baton (2.9, option d) every daemon redials the new
+frontend at once, so by default yes: the protocol rule (3.3) makes it safe and capacity is not reduced during an update that may last
+hours. Read literally the plan gives old nodes no new work until they update; the knob `new_work_only_to_updated` does that, at the cost
+of capacity falling to the updated set and the queue alert of 2.8 being the safety. **Lean: yes, dispatch (the default).**
+
 **D3 [owner]: pure opportunism or forced drain of one node.** Waiting only for a node to be idle can starve when the farm never
 is. Lean: the two-stage rule above (opportunistic for `idle_wait`, then cordon the least-loaded node); it never has more than
 one node cordoned, so capacity loss is bounded at 1/N, and it falls back to `Pending` at the limit.
@@ -211,8 +293,8 @@ the frontend sums them (unit U3).
 
 Two holds exist and have separate limits.
 
-- **The handover gap** (SQLite, F3 to F4): connections wait in the backlog. Limit: the quiesce bound, 10 s. The metric
-  `kbf_handover_gap_seconds` is set at F4; above 10 s it is an alert, because a client's connect timeout is the next thing to fail.
+- **The handover gap** (E4 to E6): calls are held in the new process. Limit: the quiesce bound, 10 s. The metric
+  `kbf_handover_gap_seconds` is set at E6; above 10 s it is an alert, because a held stream is the next thing to fail.
 - **The update hold**: the age of the oldest queued operation while a run is active. Metric
   `kbf_update_queue_hold_seconds{platform}`; the controller reads it every heartbeat.
 
@@ -228,43 +310,63 @@ The alert says:
 > or `<waiting for n open write sessions>` or `<waiting for repair debt of n blobs on node m>` or `<restarting, s of deadline>`.
 > At `<hold_limit>` the update uncordons `<host>` and goes Pending. To act: `kbf update pause`, or `kbf update skip <host>`.
 
-### 2.9 Where the queue model conflicts with #857, #879, #887 and #803
+### 2.9 The writer problem, and what of #857, #879 and #887 stays
 
-Every conflict found, with what it needs. **K1 and K2 are decisions for the owner (D1).**
+**The problem as the owner stated it.** With Envoy the old and new frontends genuinely overlap. If the old frontend keeps its
+daemon streams while it finishes, it still writes the store (results, leases, session renewals, `done/` rows) while the new one
+queues and dispatches. **[F]** SQLite is built to refuse that twice: the process takes an exclusive `flock` for its life
+(`architecture-v2.md` 4.3: a second frontend on the file refuses to start; `Store::demote` is the only way the lock moves), and
+#857's `Fenced` adds a check on `meta/generation` to every transaction, so the old handle's writes fail the moment the new
+one opens at `g+1`.
 
-| # | Conflict | Detail | Resolution |
+**What the overlap needs, precisely.** Two things overlap in time: the old frontend's *client streams* and its *daemon streams*.
+In #879 the second is not an overlap: at stand-down the old frontend ends the worker streams; each daemon redials, reaches the new
+frontend with the epoch kept, and keeps its leases and runs (**[F]** #879's test finishes a build in flight across a handover).
+After `released` the old frontend writes nothing: it reads the store through the reader connection `demote` keeps and answers its
+client streams from `done/` rows. So the writers do not overlap even though the processes do. The owner's description holds only
+if the old frontend keeps its daemons.
+
+**Options**, with costs:
+
+| Option | What changes | Costs | Buys |
 |---|---|---|---|
-| K1 | **Two writers** | The plan has the new frontend queueing while the old one still dispatches its in-flight work. **[F]** The SQLite backend takes an exclusive `flock` for the life of the process on purpose (`architecture-v2.md` section 4.3: a second frontend on the file refuses to start). `Store::demote` (#857) is the only way the lock moves, and #879 calls it at stand-down. Who is the writer during the overlap: with SQLite there is no overlap, the old one until `released`. | Backend A: the baton moves once; the new frontend does not accept before `released`. Backend B (Postgres): real overlap. See D1. |
-| K2 | **The generation fence** | **[F]** #857 appends a check on `meta/generation` to every transaction, and `open_after_handover` takes `g+1`. The old frontend's writes fail `Fenced` the instant the new one opens the store. That is the single-writer guarantee and is incompatible with two live writers, even on Postgres. | In B, replace the generation fence with `session_gen` per daemon session (`architecture-v2.md` section 5: a frontend writes lease changes for a daemon only while its `session_gen` matches). In A the fence is right and stays. |
-| K3 | **Daemon streams** | #879 ends all worker streams at stand-down. The plan lets a host stay on the old frontend until it updates. | A: daemons redial the new frontend at stand-down (their leases are kept, epoch kept); the next restart of each is just the update. B: streams stay; the old frontend's worker listener is closed to new connections, existing ones stay. |
-| K4 | **The old frontend stops dispatching** | #879 fences the whole farm (`Farm::fence`: queues nothing, accepts no result, grants nothing). The plan wants a frontend that still serves its leases but takes no new work. | A: fence is right. B: a `draining` role: no claim, existing leases and results served. |
-| K5 | **Accept and queue before the baton** | The plan: "new requests go straight into the shared queue". **[F]** #879 hands the REAPI listener to the successor at the offer but it serves only after `released`. | A: no accept before `released` (2.5); the backlog is the queue for the gap. B: accept at once. |
-| K6 | **`done/` rows and the follower** | Reusable as built. In A they are how the old frontend answers its streams. In B they are how a waiter on one frontend learns of a result committed on the other (`architecture-v2.md` P9). | keep |
-| K7 | **Cordon rows** | `cordon/<node>` persists (#879). The node step needs a cordon that survives a reconnect and a cold start. | reuse; test T3 |
-| K8 | **The strand** | **[F]** After `released` in A the holder cannot take the store back; a successor that dies there means no frontend until systemd restarts it (cold start, epoch bump). B has no such window. | A: documented, tested (C3); this is the strongest argument for B |
-| K9 | **Both instances active** | `kbf frontend handover` refuses when both instances are active (#887). In this plan NodePhase starts at F6, while the old instance is still draining. | node steps do not need the old instance gone; only the next frontend handover waits for it |
-| K10 | **Order and the frontend step in #803** | **[F]** #803 plans storage-and-daemon, frontend, daemon, daemon-mac, and its frontend step drains, waits for open streams (6 h) and swaps, a restart. | order: frontend first; the frontend step is F0 to F6; the engine's per-host steps become 2.6; the ssh transport is replaced by the session, the operator API and the helper's inbox; the engine resumes from `update/host/<id>` instead of the top |
-| K11 | **Two rollout records** | The in-memory `kbf_types::Rollout` and its `RolloutDriver` in `kbf-server` (made for OS updates) and #803's coexist. | one record: durable `update/*` rows; the old driver's phase names survive as display names only |
-| K12 | **Handover wire is an exact match** | **[F]** `wire.rs`: `hello <version>`, holder refuses `version != PROTOCOL`. The one conversation where two releases meet by design. | frozen at 1; growth through optional trailing tokens; a bump is a cold restart (3.5) |
-| K13 | **What is not carried over** | **[F]** #879 known limits: memory-ladder history, usage line, recorder state of operations in flight. | accepted; never fails a build; unit U9 carries it |
-| K14 | **`released` is irreversible but the helper's revert is not** | If the successor never confirms, the helper reverts `current` and a restart runs the old release as a cold start, which is wrong if the schema moved. | schema rule 3.4: automatic revert only across an expand-only change |
+| **(d) One writer at a time, daemons move with the baton** (#879's model; lean) | nothing in `kbf-state`; the baton protocol of #879 without the sockets | the 1 s gap (held calls, 2.5.3); the strand window if the new process dies right after `released` (cold start, epoch bump, actions rerun); a daemon's running actions are not drained (they continue and are re-bound); per-operation memory lost (K13) | built and tested; the SQLite guard keeps its meaning; Envoy needs no knowledge of ownership |
+| (a) Relax SQLite: no `flock`, SQLite's own cross-process write locking (WAL, serialized writers, `busy_timeout`), fencing per row and operation, not per store | the SQLite backend loses its single-writer guard; `Fenced` becomes per-resource (`op.lease` already is; add `session_gen` per daemon, `architecture-v2.md` section 5); both `Farm`s run the scheduler over one queue, which is P9 (pull-claim, a waiter on any frontend, duplicate timers and reapers made safe); group commit (C7) runs per process and the processes serialize on SQLite's lock; the guard against two frontends on one file (or a network filesystem) is gone | L to XL; almost the whole of P9, so it costs about what Postgres costs, without the HA | the plan as stated, on SQLite |
+| (b) Postgres for any deployment that updates without downtime | P9 and P10 of `architecture-v2.md`: backend, `session_gen`, a `draining` role (claims nothing, serves its leases), the fence replaced | L to XL; **the owner said SQLite only for now: this contradicts it** and adds a database to run | the plan as stated, true overlap, no strand window, several frontends, HA |
+| (c) The old frontend forwards its remaining writes to the new one (the new one is the only writer from the switch) | a `ProxyStore` in `kbf-state`: the old process reads through `demote`'s reader and forwards each `Txn` over the control socket (a `Txn` is opaque keys and conditions, so the transport knows no row); the fence belongs to the writer process, the old frontend's authority is its rows (`op.lease == id`, `session/<daemon>.owner`); the new frontend must not touch leases of sessions the old owns, and its reaper must wait for the old's forwarded renewals | M to L; the old frontend cannot finish if the new one is down; two releases speak the `Txn` wire (frozen, like the handover wire); the failure matrix doubles (new dies while old forwards) | the old frontend keeps its daemons until each host updates; no lease handover |
 
-**D1 [owner]. Which backend carries the overlap?**
-- **A. SQLite baton.** Built (#857, #879, #887 once merged). The queue is the state store from `released`; before it, the
-  listener backlog. Cost: a small gap (seconds at worst), the strand window K8, one writer at a time, so the node phase
-  starts only after F6.
-- **B. Postgres, true overlap.** The plan exactly as stated: queue first, old drains, nodes migrate one by one, several
-  frontends. Needs P9 (pull-claim, `session_gen`, a waiter on any frontend) and P10 (the backend and its two-frontend
-  test) first, and replaces the fence (K2). Removes the strand and the gap.
-- **Lean: A for the first release, designed so B drops in**: the state machine, the node step, idle, schema rule, alert and
-  rollback are the same; B changes only F3 to F5 and the fence. The farm runs one SQLite frontend today, and B's
-  prerequisites are weeks away; A is days from merge. Revisit when Postgres lands.
+**(d) is the lean, for these reasons.** It is already built and tested; it keeps the one guard SQLite's whole design rests on; it
+asks nothing new of the state store; (a) and (b) both need P9, which is not built, and (a) trades a safety property for it; (c)
+adds a second moving part to avoid moving daemons, and the daemons move without loss already. **D1 [owner]**: confirm (d) for the
+first release, with (b) as the target when the farm needs HA or several frontends, and (c) only if the owner needs the old
+frontend to keep its daemons.
 
-**D2 [owner]. Does the new frontend dispatch to nodes not yet updated?** The plan says updated nodes "start taking work from
-the queue". Reading it literally, old nodes get no new work, so capacity falls to the updated set and the queue grows until
-nodes update. Lean: **yes, dispatch to old nodes**, because the protocol rule (3.3) already makes it safe and it keeps full
-capacity during an update that may last hours. A knob `new_work_only_to_updated` gives the literal behaviour; with it the
-queue alert of 2.8 is the safety. In B a node on the old frontend gets only that frontend's work in either reading.
+**Kept from #857, #879, #887:** the baton protocol on the control socket (`hello`, `offer <generation>`, `ready`, `released`) and its
+bounded quiesce; `Farm::fence`; `Store::demote` and the generation fence (right for a single writer); the next-generation open with
+the epoch kept; `done/` rows, the follower and `kbf_frontend_relay_lost_total`; operation names that carry the generation;
+cordon rows; `READY=1` and `Type=notify`; the existing drain (health `NOT_SERVING`, GOAWAY, exit at zero open streams, #793/#810);
+`kbf frontend handover` (now: start the other instance in standby and trigger the take); `kbf-frontend@.service` and the
+control socket's `RuntimeDirectoryPreserve`.
+
+**Dropped:** `SCM_RIGHTS` and the `Sockets` of `handover/`; the successor's adoption of listeners and its `local_addr` check; the
+requirement that both instances have identical addresses (they now differ by port, and the holder's refusal of a different
+listen address is removed, while a different state path is still refused); the latches that close the old listeners at once;
+"connections that arrived in the gap wait in the backlog" (replaced by hold and retry). **Changed:** the check-units rule
+`handover` (instances differ in ports); the successor must serve health and *hold* calls before it holds the store (today it
+answers nothing before `ready`); `install-units` writes a flags file per instance.
+
+**Other conflicts and what they need:**
+
+| # | Conflict | Resolution |
+|---|---|---|
+| K8 | After `released` the old process cannot take the store back; a successor that dies there leaves no frontend until systemd restarts it (cold start, epoch bump) | documented, tested (C3); Postgres removes it |
+| K9 | `kbf frontend handover` refuses with both instances active (#887); NodePhase starts while the old one drains | node steps do not need the old instance gone; only the next frontend update waits |
+| K10 | #803 plans storage, frontend, daemon, Mac, and its frontend step drains, waits 6 h and swaps (a restart) | frontend first; the step is E0 to E9; per-host steps become 2.6; the ssh transport is replaced by the session, the operator API and the helper's inbox; the engine resumes from `update/host/<id>` |
+| K11 | Two rollout records: the in-memory `kbf_types::Rollout` driver and #803's | one record: `update/*` rows; the old phase names survive as display names |
+| K12 | The handover `hello` is an exact-match version (**[F]** `wire.rs`) | frozen at 1; growth through optional trailing tokens; a bump is a cold restart (3.5) |
+| K13 | Not carried over: memory-ladder history, usage line, recorder state of operations in flight (**[F]** #879) | accepted; never fails a build; unit U9 |
+| K14 | The helper's revert after `released` is a cold start of the old release | only across an expand-only change (3.4) |
+| K15 | Instance units differing in ports: the helper's `host.toml` names the unit pair and Envoy's static config names both ports | one source of ports: the flags files; `envoy check` verifies Envoy's config names them |
 
 ### 2.10 Daemon-only hosts and the Macs
 
@@ -281,15 +383,7 @@ blob; its loss is capacity only.
 - Quarantine, code signing and TCC grants are the pull updater's concern (a hand-copied binary is refused; ad-hoc signed
   binaries change identity each build, which may reset a grant; **[V]** whether any Mac uses one).
 
-### 2.11 Several frontends
-
-With Postgres behind a load balancer (backend B), each frontend is updated in turn: start the new instance, wait for
-`/readyz`, drain the old one (503 and GOAWAY, `POST /v1/frontend/drain`, which is not undone), wait for its streams, stop it.
-The load balancer is the listener; nothing is passed. The rollout slot is held by a new-release frontend only: a controller of
-the old release checks `update/slot.epoch` and does nothing. Node steps begin once one frontend is new. Frontends of both
-releases serve nodes of both releases in the window, so the contract of 3.2 holds in all directions.
-
-### 2.12 Rollback
+### 2.11 Rollback
 
 **Set the old release as the target; the same mechanism walks back.** The controller offers a new release naming the previous
 artifacts with a higher serial (the old directories are still on the hosts: running, previous, one more), preflight runs, and:
@@ -310,11 +404,11 @@ action-cache entries that only that node's log held are on the other owner (#860
 
 | Window | Frontend | Nodes | Lasts |
 |---|---|---|---|
-| W1 (handover) | holder N and successor N+1, one store (A) | N | seconds, then the holder serves leftover streams from rows |
+| W1 (handover) | holder N and successor N+1, one store | N | seconds, then the holder serves leftover streams from rows |
 | W2 (node phase) | N+1 | k at N+1, the rest at N | hours |
 | W3 (deferred hosts) | N+1 | a busy Mac at N | until it updates |
 | W4 (rollback) | each of the above reversed | | |
-| W5 (B only) | N and N+1 both writing | N | the whole run |
+| W5 (Postgres, option b) | N and N+1 both writing | N | the whole run |
 
 ### 3.2 The compatibility contract
 
@@ -372,9 +466,9 @@ flips it: the same "expand first, activate a release later" rule, not a second m
 ### 3.5 What is not a handover
 
 Refused by preflight unless the operator accepts failing builds (`--accept-failing-builds`, typed reason, `admin`): a
-contract schema change; a handover-wire change; a change of listen, worker or API address or state path (**[F]** the holder
-refuses). The cold path is `systemctl stop` of the serving instance (it drains: refuses new `Execute`, keeps open streams,
-no deadline) and a start of the other.
+contract schema change; a handover-wire change; a change of state path (**[F]** the holder refuses); a change of ports or certificates that Envoy's static config must learn
+(an Envoy reload, not part of the run). The cold path is `systemctl stop` of the serving instance (it drains: refuses new
+`Execute`, keeps open streams, no deadline) and a start of the other.
 
 ### 3.6 What `kbf --version --json` adds
 
@@ -411,6 +505,26 @@ cancelled before it was sent (`Cancelled`: retried). I could not establish which
 fallback is a two-step GOAWAY (first with the maximum stream id, then a PING round trip, then the final one: the sequence RFC 9113
 describes) in `drain.rs`/`handover/outgoing.rs`; no change to buck2.
 
+**Through Envoy.** Two more hops have the same race. Envoy to the frontend: the old backend sends GOAWAY (and fails its health
+check) while Envoy may still hold a request for it; Envoy's upstream connection to it drains, new streams go to the other
+backend, and the retry policy of 2.5.1 retries a call refused with `UNAVAILABLE` before the client sees it **[U]**. The client to
+Envoy: when Envoy itself is hot restarted its old process drains and sends GOAWAY (2.5.4), the client's race is the one above.
+Tests E1, E2 and T6 are the proof.
+
+**Client reattach: the evidence.** The claim "a long `WaitExecution` reattaches by operation name" is **true of Bazel and false of
+buck2**:
+- **buck2 [F]**: never calls `WaitExecution`; a stream broken after it started fails the action (the `client.rs` facts above).
+- **Bazel [F]** (`GrpcRemoteExecutor.handleOperationStream`, read on `master`): after an `Operation` arrives that is not done, a
+  retry of a broken stream calls `WaitExecution` with that operation's name; `NOT_FOUND` from it means the operation was lost,
+  and the next attempt calls `Execute` again (a new operation). The retry is driven by `RemoteRetrier`, whose retriable
+  codes I did not read.
+- **REAPI**: `WaitExecution` exists for exactly this; the server answers with the operation's current state and keeps the stream open.
+
+So the plan cannot rely on reattach for buck2, and does not: Envoy never cuts a stream because a backend is draining, the old
+backend finishes it. Reattach is the safety net for **Bazel** if the old frontend crashes mid-drain: the new frontend must
+resolve the operation name from the store (**[F]** names carry the generation, #857; `op/` and `done/` rows) and answer, or
+`NOT_FOUND` so Bazel re-executes. Test T20 proves it with the pinned Bazel and shows buck2 failing in the same case (documented).
+
 ### 4.2 An `Execute` in flight
 
 **[F]** It stays open and is not told to go away. The old frontend answers it from `done/<op>` rows the new one writes (the follower),
@@ -422,15 +536,15 @@ so a name is never reused. An operation queued but not leased shows what it show
 
 ### 4.3 A new call
 
-Before `released`: served by the old frontend. After GOAWAY: the client opens a connection; it waits in the backlog until the new
-frontend serves (A) or is accepted at once (B). Whether the call that raced the GOAWAY is retried is U1/T6.
+Before E4: served by the old frontend. From E4 Envoy sends new connections and streams to the new instance, which holds them until
+E6 (2.5.3); a call that reaches the old instance after its stand-down is answered `UNAVAILABLE` and retried by Envoy on the new one.
+Whether a call that races the GOAWAY is retried, by Envoy or by buck2, is T6 and E2.
 
 ### 4.4 Daemon worker streams and storage nodes
 
-**[F]** In A, at `released` the old frontend ends the worker streams; each daemon redials the same address and reaches the new
-frontend. The epoch is kept: a daemon keeps its leases and runs and sends again the results the old frontend did not
+**[F]** At `released` the old frontend ends the worker streams; each daemon redials the same name, which Envoy's TCP proxy routes to the new
+instance (the old one is unhealthy by then). The epoch is kept: a daemon keeps its leases and runs and sends again the results the old frontend did not
 acknowledge. A `Result` taken at the moment of stand-down is waited for (`Farm::quiet`); no test holds one in flight (T5 does).
-In B the streams stay until the host restarts.
 
 Storage nodes hold no stream: `Register` and `Heartbeat` are unary and membership lives in the store with a 15 s TTL, so a
 reconnect to the new frontend loses nothing. A gap past the TTL flaps members `Down` and re-routes writes; T5 asserts the map
@@ -452,7 +566,7 @@ attempts; T1 measures it. An `Execute` queued because capacity is short keeps it
 - The controller **holds** on any failure and touches nothing else. It never retries a revert by itself (a revert from a frontend
   outage and one from a bad build look alike from the host).
 - An error from the activate order counts as "swapped, maybe": revert, never retry.
-- Rollback is 2.12.
+- Rollback is 2.11.
 
 ### 5.2 Per step
 
@@ -460,10 +574,11 @@ attempts; T1 measures it. An `Execute` queued because capacity is short keeps it
 |---|---|---|
 | Preflight refuses | `Idle`, reasons, nothing touched | fix the release or take the cold path |
 | Staging fails on a host | that host `REFUSED`; the run cannot start | free disk or re-offer |
-| F2 successor fails before `ready` (flags, certificates, probes, stopped) | the old frontend serves as it was; `current` reverts | journal, fix, re-offer |
-| F3/F4 successor dies after `released` (A) | no frontend until systemd restarts it: cold start, epoch bump, leases rerun; the old process still answers its streams from rows; repeated failure reverts `current` and the cold start runs the old release, **only if** the schema change was expand-only | journal; do not revert if a contract ran |
+| E2/E3 standby fails before `ready` (flags, certificates, probes, stopped) | the old frontend serves as it was; Envoy never saw the new one healthy; `current` reverts | journal, fix, re-offer |
+| E4 to E6 the new process dies while holding calls | the held streams break and buck2 fails those actions (5.4); the old instance is still the writer and re-enters service (its health returns, `offer` withdrawn) if it has not yet demoted; after `released` it is the strand case below | rerun those builds |
+| E5/E6 new process dies after `released` | no frontend until systemd restarts it: cold start, epoch bump, leases rerun; the old process still answers its streams from rows; repeated failure reverts `current` and the cold start runs the old release, **only if** the schema change was expand-only | journal; do not revert if a contract ran |
 | Old frontend dies mid-handover | its open streams end as for any crash; the successor proceeds (the kernel freed the lock) | rerun those builds |
-| F5 daemons or members do not return | no confirm; the timer fires; the revert is a handover back | |
+| E7 daemons or members do not return | no confirm; the timer fires; the revert is a handover back | |
 | Old frontend dies while Settling | the builds on its streams fail; the new frontend is unaffected | rerun; unit U8 |
 | Node, step 3 leases do not end | uncordon at the limit, `Pending` | |
 | Step 4 or 5 gate fails | undo planned-down, uncordon, `Pending` or `Held` | |
@@ -494,12 +609,21 @@ with real processes. IDs are stable so tests and PRs cite them.
 - C8 `Store::demote` fails: `failed`, the successor aborts, the old keeps serving.
 - C9 control socket missing or another user: refused while something serves.
 - C10 both instances active, a second handover: refused.
-- C11 flags differ: refused with the reason.
-- C12 power loss at each of F1 to F4.
+- C11 a different state path: refused with the reason; different ports are now normal.
+- C12 power loss at each of E1 to E6.
 - C13 helper dies between the flip and the start of the other instance: reconciles on restart.
 - C14 handover N to N+1 then back with a build in flight.
-- C15 **queue gap**: the backlog holds a connect longer than the client's connect timeout: counted, alert fires at 10 s.
+- C15 **hold gap**: the new process holds calls longer than the quiesce bound: counted, alert at 10 s, the held streams are the ones at risk.
 - C16 the frontend is killed with queued, undispatched operations: the rows survive; after the cold start they are dispatched; their original streams are gone (those builds fail as for any crash).
+
+**Envoy:**
+- C17 the old backend fails health and sends GOAWAY with a build streaming through it for longer than the health interval: the stream is not cut (**E1**, the [U] of 2.5.1).
+- C18 both backends unhealthy for a moment: Envoy answers a local `503` (`healthy_panic_threshold` 0), the client retries; no call reaches a draining backend.
+- C19 a call reaches the old backend after its stand-down: `UNAVAILABLE`, retried by Envoy on the new one with no client-visible error (**E2**).
+- C60 Envoy killed (not hot restarted): every stream through it breaks (documented; builds fail); the frontend and daemons are unaffected and the worker connections reconnect.
+- C61 Envoy hot restart with a stream older than 900 s and the default `--parent-shutdown-time-s`: the stream is cut (the planted defect); with the raised value it survives (**E3**).
+- C62 the worker cluster's health check fails for the old backend: the daemons' existing connections are not closed (`close_connections_on_host_health_failure` unset) (**E1**).
+- C63 Bazel client, the old frontend killed mid-stream: Bazel reattaches by operation name and finishes, or re-executes on `NOT_FOUND`; buck2 in the same case fails its action (**T20**).
 
 **Node:**
 - C20 the controller dies after cordon, after planned-down, after activate, after confirm, before uncordon: resumes at the host's phase; no host activated twice.
@@ -525,9 +649,10 @@ with real processes. IDs are stable so tests and PRs cite them.
 
 ### 5.4 The residual risk, stated
 
-Still able to fail a build: the old frontend crashing while it holds streams (C4); a successor that dies between `released` and
-serving and a client that sent its `Execute` meanwhile (A only; it queues and runs, its stream does not survive a cold start);
-a GOAWAY race buck2 does not retry (U1); a host power loss. Each has a metric the tests assert on.
+Still able to fail a build: the old frontend crashing while it holds streams (C4); the new process dying while it holds calls in the
+gap, or between `released` and serving (C3; those streams do not survive a cold start); a GOAWAY race that neither Envoy nor buck2
+retries (U1); Envoy killed, or hot restarted with the default parent-shutdown time (C60, C61); a host power loss. Each has a
+metric or a test that asserts on it.
 
 ## 6. Who drives it
 
@@ -545,7 +670,7 @@ State in `kbf-state` (one CAS row each; works on SQLite and Postgres):
 - `update/available/<commit>` from the poller.
 
 The controller that runs is the new release's. In A the old frontend's controller is fenced with the rest of the farm; the new
-one starts at the host phase it reads and writes `Settling` at F6, so it never repeats the handover it is the result of.
+one starts at the host phase it reads and writes `Settling` at E8, so it never repeats the handover it is the result of.
 
 Orders to a host are files in its helper's inbox, written by its unprivileged `kbf` after an order over its session; the helper
 verifies offline. **[F]** The messages (`UpdateOffer`, `UpdateOrder`, `UpdateStatus`) are not in `worker.proto` yet. Requirements
@@ -592,11 +717,11 @@ A server-rendered `kbf-ui` page (**[F]** today read-only, no script, over the re
 | Button | Triggers | Role | Disabled when (reason shown) |
 |---|---|---|---|
 | Update | `update/desired` + the whole sequence per policy | `update` | blockers; run active; nothing available |
-| Update frontend only | F0 to F6 | `update` | blockers; old instance still draining |
+| Update frontend only | E0 to E8 | `update` | blockers; old instance still draining |
 | Update nodes only | node steps | `update` | frontend not new; blockers |
 | Pause, Resume | `update/desired.paused` | `update` | no run |
 | Skip host | marks a `Held` host failed, frees the slot | `admin` | not `Held`; says the host stays cordoned |
-| Roll back | a release naming the previous one | `update` | not reversible (2.12), with the reason |
+| Roll back | a release naming the previous one | `update` | not reversible (2.11), with the reason |
 | Accept failing builds | the cold path | `admin` | never a default; a typed reason |
 | Policy | `update/policy` | `admin` | |
 
@@ -622,11 +747,11 @@ binary and a test-only "N+1" built from the next commit for the mixed-version te
 | T2 | `idle_is_defined_per_half` | a daemon is picked at zero leases and not before; a storage node is not picked with an open write session or with debt; with the other copy's node silent it is not picked | picking on lease count alone (storage); picking with debt |
 | T3 | `cordon_survives_restart_and_rejoin_takes_work` | the node comes back cordoned, takes no work until uncordon, then takes queued work (first lease observed) | reconnect clears the cordon; uncordon without a claim |
 | T4 | `node_that_never_becomes_active_holds` | exits at once, never registers, stays `CatchingUp`: boot-counter revert, window revert, hold; other nodes' pids unchanged; builds still pass | missing revert timer; continuing after a failure |
-| T5 | `frontend_handover_with_builds_in_flight` | 20 concurrent 30 s builds, a handover with a `Result` held in flight at the stand-down: all succeed, `relay_lost == 0`, epoch and map generation unchanged, no `loss_requeues` | fence after demote; result applied twice; follower look count not reset |
-| T6 | `new_calls_across_the_handover` | the pinned buck2 starts a target every 50 ms across the handover: zero failures, retries recorded. **U1's proof** | GOAWAY semantics buck2 does not retry (close instead of GOAWAY → red); successor not accepting from the backlog |
-| T7 | `queue_gap_and_queue_rows` | the gap metric is set at F4 and stays under the bound; queued, undispatched operations survive a cold start (C16) | accepting before `released`; queue rows not durable |
+| T5 | `frontend_switch_with_builds_in_flight` | 20 concurrent 30 s builds, a handover with a `Result` held in flight at the stand-down: all succeed, `relay_lost == 0`, epoch and map generation unchanged, no `loss_requeues` | fence after demote; result applied twice; follower look count not reset |
+| T6 | `new_calls_across_the_switch` | through Envoy, the pinned buck2 starts a target every 50 ms across the switch: zero failed builds; retries by Envoy and by buck2 recorded. **U1's proof** | GOAWAY semantics nobody retries (no retry policy, no health flip → red); the new instance refusing instead of holding |
+| T7 | `hold_gap_and_queue_rows` | the gap metric is set at E6 and stays under the bound; calls held in the new process are released into the queue; queued, undispatched operations survive a cold start (C16) | answering before `released`; queue rows not durable |
 | T8 | `queue_hold_alert` | saturate the farm during a node cordon: warn at `hold_warn` with the text of 2.8, uncordon and `Pending` at `hold_limit` | no limit; alert text missing the cause |
-| T9 | `frontend_crash_matrix` | C1 to C16, one test each | each case's own defect |
+| T9 | `frontend_crash_matrix` | C1 to C19 and C60 to C62, one test each | each case's own defect |
 | T10 | `mixed_versions_both_ways` | base and N+1 in every window of 3.1, both directions: N+1 frontend with N nodes, N with N+1 (downgrade order), handover N to N+1 and back, with a build in flight | made-required field; repurposed field; `done/` row tag change; handover wire bump; unknown `ServerMessage` arm crashing an old daemon |
 | T11 | `schema_expand_contract` | an N+1 that expands: the N holder still reads, rollback opens the file, the contract release is refused while an N frontend runs | strict-equality open; contract on open |
 | T12 | `preflight_refuses` | table: unsigned, older serial, expired, wrong platform, contract schema, protocol flag day, handover mismatch, absent debt metric, silent member, host with no build: each refused and **no process touched** | gate that fails open (absent metric as zero) |
@@ -638,14 +763,21 @@ binary and a test-only "N+1" built from the next commit for the mixed-version te
 | T18 | `update_page` | every state of 6.3 renders; a blocker disables the button with its reason; POST needs CSRF, same-origin, role and plan digest; a stale digest is refused; every write audited | CSRF missing; enabled with blockers; a changed plan applied |
 | T19 | `cold_path_refusals` | contract change or wire change refused unless `--accept-failing-builds`; with it, stop-drain-start leaves open streams to finish | silent cold restart |
 
-T5 and T6 prove the model's one unproven step: if either cannot be made reliable the model is wrong and that is reported, not worked around.
+| E1 | `envoy_health_failure_keeps_streams` | on the pinned Envoy, an old backend that fails its health check and sends GOAWAY while 20 streams run for longer than the health interval: none is cut; new streams go to the new backend; the worker cluster's connections stay | a health failure cutting streams or worker connections (mutant: set `close_connections_on_host_health_failure`; health interval of 5 s leaves a window) |
+| E2 | `envoy_retries_a_standing_down_backend` | a call that reaches the old instance after its stand-down is retried on the new one; the client sees no error | no retry policy (mutant: remove `retry_on`) |
+| E3 | `envoy_hot_restart_keeps_old_streams` | a 20-minute stream through Envoy survives a hot restart with `--parent-shutdown-time-s` raised and is cut with the default 900 | the default left in place |
+| E4 | `envoy_config_names_both_instances` | `kbf-deploy envoy check` fails when a port in Envoy's config differs from an instance's flags file, when the worker listener terminates TLS, or when a route has a finite timeout | a config that drifts from the units |
+| T20 | `bazel_reattach_by_operation_name` | the pinned Bazel (the `m1` cell has one) and the old frontend killed mid-stream: Bazel reattaches with `WaitExecution` and completes or re-executes; buck2 fails its action (the documented difference) | a new frontend that cannot resolve the old one's operation names |
+
+T5, T6 and E1 prove the model's one unproven step: if either cannot be made reliable the model is wrong and that is reported, not worked around.
 
 ## 8. Open questions
 
 **[owner]** marks the owner's call; the rest are decided here and open to correction.
 
-- **D1 [owner]** backend for the overlap: A now, B when Postgres lands (2.9). **Lean A.**
-- **D2 [owner]** dispatch to not-yet-updated nodes (2.9). **Lean yes**, knob for the literal behaviour.
+- **D1 [owner]** the writer model under Envoy (2.9): **lean (d)**, one writer at a time with the daemons moving with the baton, the old frontend a read-only relay; (b) Postgres when HA or several frontends are needed; (a) not recommended; (c) only if the old frontend must keep its daemons.
+- **D2 [owner]** dispatch to not-yet-updated nodes (2.6). **Lean yes**, knob for the literal behaviour.
+- **D4 [owner]** where Envoy runs and how it updates (2.5.4): hot restart with a raised `--parent-shutdown-time-s` on the frontend host; the Kubernetes kit has no hot restart. **Lean: single box under the hot restarter; Kubernetes with a long grace period; Envoy updates are never part of the frontend run.**
 - **D3 [owner]** forced drain of the least-loaded node after `idle_wait` (2.6). **Lean yes**, one node at a time, `Pending` at the limit; without it a never-idle farm never updates.
 - **Q1 [owner] Who signs.** The pull updater has an operator sign each release offline and hosts verify against a pinned root, so a compromised frontend cannot install anything unsigned. The direction here has the frontend poll and apply on a click, which needs a signer: (a) the frontend verifies the attestation and signs with a key it holds (one click; a frontend compromise is a fleet compromise); (b) the operator signs on their machine (strongest; "available" means attested, not signed, one command); (c) a separate signer. **Lean: (b) ships first; (a) opt-in per deployment.** A signed binary runs as the service user, which on a storage-and-daemon node holds the cold-store credential.
 - **Q2 [owner]** `auto_frontend`. **Lean: manual until T5, T6 and C1 to C16 have been green nightly for a month**; the poller never changes it.
@@ -666,11 +798,11 @@ Each lands a test that fails first. Sizes (S under 1 day, M 1 to 3, L 3 to 5 day
 | Unit | What | Size | Depends on |
 |---|---|---|---|
 | U0 | Land #857, #879, #887, #860; bring #803's engine into the controller's crate | merge | review |
-| U1 | The probes first: T6 (buck2 and GOAWAY), then T5 and T7 | S-M | U0 |
+| U1 | The probes first: E1, E2 and T6 (Envoy, GOAWAY and buck2), then T5 and T7 | S-M | U14 |
 | U2 | `--version --json` fields (3.6); manifest `meta`; planner (order rule, refusals) | M | U0 |
 | U3 | `open_writes` and `repair_debt` in the heartbeat; frontend aggregate and G_S; operator `down` (step 4); node graceful stop | M-L | U0 |
 | U4 | `update/*` rows, the controller with resume, the real transport, the node step 2.6 and idle 2.7 (**the node-rolling unit**) | L | U2, U3 |
-| U5 | Frontend phase on the helper: `activate` for two instances, F0 to F6, Settling | M | U4, pull-updater helper |
+| U5 | Frontend phase on the helper: `activate` for two instances, E0 to E8, Settling | M | U4, pull-updater helper |
 | U6 | Queue hold metric, alert and the uncordon rule (2.8) | S | U4 |
 | U7 | The crash matrix of 5.3 with real processes | L | U4, U5 |
 | U8 | State-schema expand/contract (3.4) and the row-encoding freeze test | M | none |
@@ -678,7 +810,8 @@ Each lands a test that fails first. Sizes (S under 1 day, M 1 to 3, L 3 to 5 day
 | U10 | Poller and policy | M | U2 |
 | U11 | UI write path, page and buttons | L | U4, U10 |
 | U12 | Mixed-version nightly and rollback test | M | U5 |
-| U13 | Backend B: replace the generation fence with `session_gen`, a `draining` role, accept-and-queue in the new frontend | L | P9, P10 of `architecture-v2.md`, D1 |
+| U13 | Writer model (b): replace the generation fence with `session_gen`, a `draining` role, accept-and-queue in the new frontend | L | P9, P10 of `architecture-v2.md`, D1 |
+| U14 | Envoy: the static config for two instances (REAPI h2, worker TCP proxy), health, retry and timeouts in `kbf-deploy envoy render`/`check`; the hold in the successor and removal of `SCM_RIGHTS`; E1 to E4 | L | U0 |
 
 What this document does not claim: that any of it is built; that buck2 retries a request that races a GOAWAY (T6); that a node's
 stop is graceful (Q6); that the repair gate has a metric to read (U3); that a restart fits inside the dwell (C30); or that the
