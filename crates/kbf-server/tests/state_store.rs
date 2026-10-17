@@ -26,6 +26,9 @@ use kbf_types::{ActionKey, Digest, DigestFunction, LeaseId, LeaseKind, Qos, Reso
 use tokio::sync::mpsc;
 use tonic::{Code, Status};
 
+#[path = "state_store/handover.rs"]
+mod handover;
+
 const GIB: u64 = 1 << 30;
 
 type TestFarm = Farm;
