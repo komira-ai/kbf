@@ -266,3 +266,24 @@ fn only_a_storage_node_asked_for_keys_is_told_they_are_not_fetched() {
     assert!(!with(&["storage"], 2));
     assert!(!with(&["storage"], 0));
 }
+
+/// Catches a loop that spins (a wait of nothing, or of a time already past) or that sleeps
+/// longer than its cap (a clock that jumped, a machine that slept).
+#[test]
+fn a_nap_is_at_least_a_second_and_at_most_the_cap() {
+    let cap = Duration::from_secs(3600);
+    for (wait, want) in [
+        (-5, 1),
+        (0, 1),
+        (1, 1),
+        (300, 300),
+        (3600, 3600),
+        (302_400, 3600),
+    ] {
+        assert_eq!(nap(wait, cap), Duration::from_secs(want), "{wait}");
+    }
+    assert_eq!(
+        nap(300, Duration::from_millis(10)),
+        Duration::from_millis(10)
+    );
+}

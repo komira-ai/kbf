@@ -270,8 +270,6 @@ pub struct Renewer {
     /// Unix seconds: when the next attempt is due.
     due: i64,
     backoff: Backoff,
-    /// The configuration generation the node holds.
-    generation: u64,
     /// The spread of the schedule, in thousandths (the first attempt's, kept).
     jitter: i32,
     /// The longest one sleep lasts.
@@ -290,7 +288,6 @@ impl Renewer {
             now: Arc::clone(&env.now),
             due: first_attempt((env.now)(), node.renew_after, jitter_permille),
             backoff: Backoff::new(),
-            generation: node.config.generation,
             jitter: jitter_permille,
             nap_max: Duration::from_secs(NAP_MAX_S),
         }
@@ -314,14 +311,9 @@ impl Renewer {
         match self.attempt(now).await {
             Ok(node) => {
                 self.backoff.succeeded();
-                let generation = node.config.generation;
-                if generation != self.generation {
-                    self.generation = generation;
-                    tracing::warn!(generation, "new configuration, applied at next start");
-                }
                 self.due = first_attempt(now, node.renew_after, self.jitter);
-                let not_after = node.earliest_not_after();
-                tracing::info!(not_after, "certificates renewed");
+                let (generation, not_after) = (node.config.generation, node.earliest_not_after());
+                tracing::info!(generation, not_after, "certificates renewed");
             }
             Err(error) => {
                 let wait = self.backoff.failed();
@@ -357,8 +349,7 @@ impl Renewer {
                 _ = stop.changed() => return,
                 wait = self.round() => wait,
             };
-            let nap =
-                Duration::from_secs(u64::try_from(wait).unwrap_or(0).max(1)).min(self.nap_max);
+            let nap = nap(wait, self.nap_max);
             tokio::select! {
                 biased;
                 _ = stop.changed() => return,
@@ -366,6 +357,12 @@ impl Renewer {
             }
         }
     }
+}
+
+/// How long to sleep for a wait of `wait` seconds: at least one (a frontend that says "renew
+/// now" must not make a loop that calls it as fast as it can answer), at most `max`.
+fn nap(wait: i64, max: Duration) -> Duration {
+    Duration::from_secs(u64::try_from(wait).unwrap_or(0).max(1)).min(max)
 }
 
 /// A random permille in -100..=100 for the renewal's jitter.

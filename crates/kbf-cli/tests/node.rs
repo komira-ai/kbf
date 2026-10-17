@@ -688,9 +688,22 @@ fn unenrolled_record() -> kbf_enroll::store::Node {
     }
 }
 
-/// Catches a renew loop that cannot be stopped (the mode has exited and the process would
-/// wait for it), and one that does not go round again: with the clock past the renewal
-/// and a nap of 10 ms it renews once, sleeps and checks again; the stop ends it.
+/// Waits until the frontend has seen `n` `Renew` calls.
+async fn renews_seen(fake: &Arc<Fake>, n: usize) {
+    let fake = Arc::clone(fake);
+    timeout(Duration::from_secs(10), async move {
+        while fake.renews().len() < n {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the frontend did not see {n} renewals"));
+}
+
+/// Catches a renew loop that does not go round again (a nap that is not cut to
+/// `nap_max` would sleep for the days to the next renewal and miss a clock that jumped),
+/// one that cannot be stopped while it sleeps (the mode has exited and the process would
+/// wait an hour), and one that does not stop when its sender is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_loop_renews_naps_and_stops_when_told() {
     let h = Harness::new("renew-loop");
@@ -700,19 +713,26 @@ async fn the_loop_renews_naps_and_stops_when_told() {
     let (stop, stopped) = watch::channel(false);
     let looping = tokio::spawn(renewer.run(stopped));
 
-    let fake = Arc::clone(h.fake());
-    timeout(Duration::from_secs(10), async move {
-        while fake.renews().is_empty() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the loop renews");
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    renews_seen(h.fake(), 1).await;
+    // Half a life later the loop, which has been napping for 10 ms at a time, renews again.
+    h.fake().set_now(h.fake().now() + LIFE_S / 2 + 10);
+    renews_seen(h.fake(), 2).await;
     stop.send(true).expect("running");
     timeout(Duration::from_secs(10), looping)
         .await
         .expect("the loop stops when told")
+        .expect("no panic");
+
+    // Stopped in the middle of an hour's nap.
+    let h = Harness::new("renew-loop-nap");
+    let (renewer, _store) = renewing(&h).await;
+    let (stop, stopped) = watch::channel(false);
+    let looping = tokio::spawn(renewer.run(stopped));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stop.send(true).expect("running");
+    timeout(Duration::from_secs(10), looping)
+        .await
+        .expect("the loop stops while it sleeps")
         .expect("no panic");
 
     // A sender that is gone stops it too.
@@ -722,6 +742,43 @@ async fn the_loop_renews_naps_and_stops_when_told() {
     timeout(Duration::from_secs(10), renewer.run(stopped))
         .await
         .expect("a loop whose sender is gone stops");
+}
+
+/// Catches a stop that waits for a renewal in flight (the mode has exited, the frontend
+/// does not answer, and the process would wait out the connection timeout): the renewer
+/// dials a listener that never speaks TLS, and the stop ends the loop at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_does_not_wait_for_a_renewal_in_flight() {
+    let h = Harness::new("renew-inflight");
+    let (_renewer, _store) = renewing(&h).await;
+    let mute = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    h.write_config(mute.local_addr().expect("addr").port(), "[daemon]\n");
+    let (env, config) = (h.env(), h.config_path());
+    let renewer = tokio::task::spawn_blocking(move || {
+        let loaded = load(&config, &env).expect("loaded");
+        let node = loaded
+            .store
+            .recover()
+            .expect("node.json")
+            .expect("enrolled");
+        Renewer::new(&loaded, &node, &env, 0)
+    })
+    .await
+    .expect("no panic");
+    h.fake().set_now(h.fake().now() + LIFE_S / 2 + 10);
+    let (stop, stopped) = watch::channel(false);
+    let looping = tokio::spawn(renewer.run(stopped));
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop.send(true).expect("running");
+    timeout(Duration::from_secs(5), looping)
+        .await
+        .expect("the stop does not wait for the dial")
+        .expect("no panic");
+    assert!(h.fake().renews().is_empty());
+    drop(mute);
 }
 
 /// Catches a renewer that does not run beside the mode: the node starts with its

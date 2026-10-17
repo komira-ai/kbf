@@ -39,9 +39,10 @@ use crate::map::{HeldMaps, REFETCH_WITHIN};
 /// name) is not used: [`TlsNodes`] has no way to be given one name for every node. A
 /// node that goes silent is given up on as `liveness` says.
 ///
-/// The certificate is read again when its file or the CA's is replaced (a node's
-/// certificate is renewed every few days, in place): connections made after that present
-/// the new one and trust the new bundle, and those already up carry on until they end.
+/// The certificate is read again when its file is replaced (a node's certificate is
+/// renewed every few days, in place, with the CA bundle and key it goes with): connections
+/// made after that present the new one and trust the new bundle, and those already up
+/// carry on until they end.
 ///
 /// # Errors
 /// A TLS file cannot be read.
@@ -61,19 +62,19 @@ pub fn storage_nodes(
 }
 
 /// Which file the identity was read from: the inode, modification time and size of the
-/// certificate and of the CA bundle, `None` for one that cannot be read. A renewal
-/// replaces a file by renaming a new one over it, so it changes the inode.
+/// certificate, `None` when it cannot be read. A renewal replaces the certificate by
+/// renaming a new file over it, last of the files it writes (`kbf_enroll::store`), so a
+/// changed certificate is the sign that the key and the CA bundle are new as well.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Stamp([Option<(u64, i64, i64, u64)>; 2]);
+struct Stamp(Option<(u64, i64, i64, u64)>);
 
 impl Stamp {
     fn of(files: &TlsFiles) -> Self {
-        let one = |path: &std::path::Path| {
-            std::fs::metadata(path)
+        Self(
+            std::fs::metadata(&files.cert)
                 .ok()
-                .map(|m| (m.ino(), m.mtime(), m.mtime_nsec(), m.len()))
-        };
-        Self([one(&files.cert), one(&files.ca_cert)])
+                .map(|m| (m.ino(), m.mtime(), m.mtime_nsec(), m.len())),
+        )
     }
 }
 
