@@ -27,6 +27,7 @@ fn config(ttl: u64, dwell: u64) -> MembershipConfig {
         ttl: Duration::from_secs(ttl),
         dwell: Duration::from_secs(dwell),
         replication: 2,
+        bootstrap: Duration::ZERO,
     }
 }
 
@@ -719,4 +720,115 @@ fn a_map_source_is_seeded_from_the_store() {
         before.map_source().err(),
         Some(MembershipError::Store(_))
     ));
+}
+
+/// A configuration whose bootstrap window is 10 s, with rows living 30 s.
+fn bootstrapping() -> MembershipConfig {
+    MembershipConfig {
+        bootstrap: 10 * SECOND,
+        ..config(30, 120)
+    }
+}
+
+fn states(map: &Map) -> Vec<MemberState> {
+    map.members().iter().map(|m| m.state).collect()
+}
+
+/// Catches: a fresh cluster that never gets an Active member (a Joining member is never
+/// rank 1), a bootstrap that promotes only the first registrant (the rest of a fleet
+/// starting together would stay Joining), and a promotion that does not bump the map:
+/// three nodes register in a row against an empty store; every one is Active in the map
+/// its registration returned, and each registration advanced the generation.
+#[test]
+fn a_fresh_cluster_registers_all_its_members_active() {
+    let s = Hooked::new();
+    let m = members(&s, bootstrapping());
+    let mut generation = 0;
+    for i in 1..=3 {
+        let r = m.register(&node(i)).expect("register");
+        assert_eq!(state(&r.map, r.id), Some(MemberState::Active), "node {i}");
+        assert!(r.map.generation() > generation, "node {i} advanced the map");
+        generation = r.map.generation();
+    }
+    let map = m.current_map().expect("read").expect("a map");
+    assert_eq!(states(&map), vec![MemberState::Active; 3]);
+    assert_eq!(map.generation(), 3);
+}
+
+/// Catches: a bootstrap that never closes (every later joiner Active, though it holds no
+/// slice of its rank-1 range): once the window has lapsed, a new registration is Joining
+/// again, and the members that were Active stay so. Mutant: the `FORMED` put dropped
+/// from `write_row` (the cluster is then never formed) turns this red.
+#[test]
+fn a_registration_after_the_window_is_joining() {
+    let s = Hooked::new();
+    let m = members(&s, bootstrapping());
+    let a = m.register(&node(1)).expect("a");
+    s.clock.advance(9 * SECOND);
+    let b = m.register(&node(2)).expect("b inside the window");
+    assert_eq!(state(&b.map, b.id), Some(MemberState::Active));
+    s.clock.advance(2 * SECOND);
+    let c = m.register(&node(3)).expect("c after the window");
+    assert_eq!(state(&c.map, c.id), Some(MemberState::Joining));
+    assert_eq!(state(&c.map, a.id), Some(MemberState::Active));
+    assert_eq!(state(&c.map, b.id), Some(MemberState::Active));
+}
+
+/// Catches: the formed mark kept in a process, or never written, so that a restart
+/// re-bootstraps: every row of the cluster lapses (all members Down, the last one kept
+/// in the map), a new Members over the same store (a restarted frontend) registers a
+/// node, and it is Joining, not Active. Mutant: the `FORMED` put dropped from
+/// `write_row` leaves only the window mark, which has lapsed, and the node comes in
+/// Active.
+#[test]
+fn a_restart_of_a_formed_cluster_does_not_bootstrap_again() {
+    let s = Hooked::new();
+    let a = members(&s, bootstrapping()).register(&node(1)).expect("a");
+    s.clock.advance(40 * SECOND);
+    let restarted = other_frontend(&s, bootstrapping());
+    let down = restarted.refresh().expect("refresh").expect("a map");
+    assert_eq!(state(&down, a.id), Some(MemberState::Down));
+    let b = restarted.register(&node(2)).expect("b");
+    assert_eq!(state(&b.map, b.id), Some(MemberState::Joining));
+}
+
+/// Catches: a node that says it is rebuilding being made Active by the bootstrap (its
+/// index is not whole), and a cluster that is not marked formed when its first Active
+/// member comes from a caught-up beat instead of a registration: the catching-up
+/// registration stays CatchingUp and opens no window; its CaughtUp beat makes it Active
+/// and marks the cluster formed, so the next registration is Joining. Mutant: the
+/// `FORMED` put dropped from `touch` makes that next registration Active.
+#[test]
+fn a_catching_up_registration_is_not_bootstrapped() {
+    let s = Hooked::new();
+    let m = members(&s, bootstrapping());
+    let rebuilding = Registrant {
+        progress: Progress::CatchingUp,
+        ..node(1)
+    };
+    let a = m.register(&rebuilding).expect("a");
+    assert_eq!(state(&a.map, a.id), Some(MemberState::CatchingUp));
+    m.heartbeat(a.id, a.boot, Progress::CaughtUp).expect("beat");
+    let map = m.current_map().expect("read").expect("a map");
+    assert_eq!(state(&map, a.id), Some(MemberState::Active));
+    let b = m.register(&node(2)).expect("b");
+    assert_eq!(state(&b.map, b.id), Some(MemberState::Joining));
+}
+
+/// Catches: `Down` being settable by hand (it is the store's verdict), and a bootstrap
+/// that cannot be turned off (the other tests of this file rely on `Joining`).
+#[test]
+fn down_is_not_settable_and_a_zero_window_turns_the_bootstrap_off() {
+    let s = Hooked::new();
+    let m = members(&s, bootstrapping());
+    let a = m.register(&node(1)).expect("a");
+    assert!(matches!(
+        m.set_state(a.id, MemberState::Down),
+        Err(MembershipError::NotSettable(MemberState::Down))
+    ));
+    let off = Hooked::new();
+    let b = members(&off, config(30, 120))
+        .register(&node(1))
+        .expect("b");
+    assert_eq!(state(&b.map, b.id), Some(MemberState::Joining));
 }

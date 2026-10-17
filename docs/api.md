@@ -23,7 +23,7 @@ reports again after its next `Welcome`.
 
 ## Who may write
 
-A write (cordon, drain, uncordon) can take every node in the fleet out of service, so
+A write (cordon, drain, uncordon, a member's state) can take every node in the fleet out of service, so
 it must come from an operator. Where a request comes from does not show that:
 
 - **Every server host is also a worker.** Build actions run on it, and they can reach
@@ -143,6 +143,58 @@ or not, could run, and the time spent waiting for a cordon does not count toward
 A server restart forgets every cordon, as it forgets the rest of the scheduler's
 state, and every start logs a warning that says so. The protocol has no drain
 message yet: the daemon is not told, and the server simply sends it no new `Start`.
+
+## `POST /v1/members/{id}`
+
+An operator sets a storage member's state. The body is `{"state": "active"}` or
+`{"state": "draining"}`; the answer is `{"id": N, "state": "...", "generation": G}`,
+the map's generation after the change. `down` is the store's verdict and `joining` and
+`catching_up` are what a registration says, so none of them is accepted (`400`, as is
+any other body). `404` for an id that has no live row (it expired, or never
+registered) or is not a number, or on a server without a state store; `503` when the
+state store cannot be written; `401`, `403` or `415` from the gates of
+[Who may write](#who-may-write), the same gates as the node writes. Nothing is changed
+by a refused request.
+
+When a member becomes `active` the cluster also records that it has formed (see below),
+in the same transaction.
+
+**When a member is `active` without this call.** A cluster with no state yet (an empty
+state store) has no member that could hand a slice to a joiner, and a `joining` member
+is never rank 1, so such a cluster would never get an `active` member. For this reason a
+member that registers while the cluster has not yet formed enters `active`: the first
+registration of a fresh cluster writes the `meta/members_formed` mark and opens a
+window (`bootstrap`, 60 seconds from that registration), and a registration inside the
+window is `active` too, so a fleet that starts together forms together. After the
+window, and for ever after in a cluster that has formed (a restart does not undo it), a
+registration is `joining`, and this call is how it is promoted. A member that registers
+saying it is rebuilding its index enters `catching_up` and becomes `active` by its own
+first beat that says it is done; it opens no window.
+
+**The risk of promoting a joiner.** `active` makes the member a settled owner: it
+takes the rank-1 slots of the digests it wins in the rendezvous order, and it is read
+in rank order. Nothing here copies the blobs of that slice to it (the join handoff,
+`architecture-v2.md` section 8.4, is not built). What the router does about it, from
+`kbf-route`'s read walk and `kbf-map`'s `read_order_with_previous`:
+
+- A read that gets `NotFound` from an owner goes on to the next owner in the read
+  order, and the answer is `NotFound` only if every owner said so. So a promoted
+  joiner that lacks a blob costs one extra round trip per read of it, not a failed
+  read.
+- That holds only while an owner that has the blob is still in the list. The list is
+  this generation's top `r` settled owners, then the write owners not yet listed, then
+  the previous generation's list: one generation back, no more. A joiner that wins a
+  digest's top `r` pushes an old copy-holder out of it, and once the map moves on
+  again (any member change bumps the generation) that holder is in no list: the blob
+  is read as missing, and the action is rebuilt or the upload repeated.
+- Writes of that slice go to the joiner as primary (the chain head and the
+  `FindMissing` target): it reports every blob it has not seen as missing, so
+  uploads that were deduplicated are sent again until the slice fills.
+
+So promote a joiner when its slice is expected to be empty or its blobs are cheap to
+rebuild (a new cluster, a cache), or have it hold the slice first; and promote one
+member at a time. `draining` is the reverse: the member takes no new writes, its
+successor takes its slot at once, and it is read first.
 
 ## `GET /v1/frontend/drain` and `POST /v1/frontend/drain`
 
@@ -615,12 +667,16 @@ quote, a `;` or a line break in it can never end the value or add a parameter. W
 `filename*`), for a blob of at most 4 MiB (4194304 bytes); a larger one is `400`, and
 still downloads without `inline`.
 
-**Memory.** Like a ByteStream Read, a read holds the whole blob in memory, because the
-cache keeps one digest per blob and can check only all of it; a second read to stream
-from would send bytes nobody checked. So the route keeps a budget: the blobs of all the
-answers it is reading or still sending hold at most 1 GiB (1073741824 bytes, the largest
-blob the cache accepts) at once. An answer gives its share back when its bytes have
-been sent or dropped (the client went away), and a failed read gives it back at once.
+**Memory.** Like a ByteStream Read, a read holds one window of its blob at a time
+(8 MiB, `READ_WINDOW_BYTES`; a smaller blob, its size). Every byte of the blob is
+hashed, the bytes before a range and after it too, and the last window is sent only
+once the digest checked: a blob of one window is checked whole before a byte is sent,
+and one that fails is an error answer; a larger blob whose bytes fail ends its body
+early (the connection is cut), and the client must not take what it got for the blob.
+The route keeps a budget: the windows of all the answers it is reading or still sending
+hold at most 1 GiB (1073741824 bytes) at once. An answer gives its share back when its
+body has been sent or dropped (the client went away), and a failed read gives it back at
+once.
 
 - **Waiting.** A read whose blob does not fit in what is left waits in line, first come
   first served, before a byte is read: a large read at the head of the line is not
@@ -628,9 +684,8 @@ been sent or dropped (the client went away), and a failed read gives it back at 
   they wait while it does). A read still waiting after 10 seconds is `503` with
   `Retry-After: 1` and the body `{"error": "<why>", "busy": true}`; a blob that cannot
   be read is `503` without either, so a client can tell busy from broken.
-- **Too large.** A digest that claims more than 1 GiB is `404` at once, with the limit
-  in the error: the cache refuses such a blob on write, so it never holds one, and no
-  retry can change that. ByteStream Read answers the same digest `NOT_FOUND`.
+- **Any size.** No blob is too large to read. A blob not held is `404` before it waits,
+  whatever size its digest claims.
 - **Slow clients.** A client holds its blob's share until its answer is sent or it goes
   away; the listener has no write timeout.
 
@@ -651,7 +706,7 @@ ignored, as RFC 9110 allows, and the whole blob is sent. Every `200` and `206` s
 | `400` | a malformed digest or query, or `inline=text` for a blob over 4 MiB |
 | `401` | the authentication policy refuses the request |
 | `403` | `blobs.getAuthorizer` refuses the instance name |
-| `404` | the route is off, the blob is not held, or the digest claims more than 1 GiB |
+| `404` | the route is off, or the blob is not held |
 | `416` | the range starts past the end |
 | `503` | busy: the blob's share of the memory budget was not free within 10 seconds (`Retry-After: 1`, `"busy": true`); or the blob is held but its bytes cannot be read (missing from the store, or failing their digest), or the store or the metadata log does not answer |
 | `500` | the cache's own records disagree |
