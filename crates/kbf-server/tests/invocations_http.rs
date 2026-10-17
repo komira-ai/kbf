@@ -276,6 +276,7 @@ async fn a_name_without_an_answer_is_refused_and_so_is_an_unknown_caller() {
         authorizers: Authorizers::allow_all(),
         invocations_get: Some(Arc::new(Mute)),
         blobs_get: Some(Arc::new(AllowAuthorizer)),
+        farm_get: None,
     };
     let server = Server::start(mute, kbf_front::DEFAULT_INVOCATION_MEMORY);
     server

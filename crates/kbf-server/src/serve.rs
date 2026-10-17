@@ -680,8 +680,14 @@ where
         token.clone(),
         Arc::clone(&drain),
         members.clone(),
+        update_rows.clone(),
     )
     .merge(crate::release::router(releases.clone(), token.clone()))
+    .merge(crate::update_hosts::router(
+        Arc::clone(&farm),
+        update_rows.clone(),
+        crate::update_hosts::FarmReaders::from_policy(&policy),
+    ))
     .merge(crate::release::desired::router(
         releases.clone(),
         update_rows,

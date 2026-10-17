@@ -118,6 +118,8 @@ pub mod streams;
 mod timeout;
 pub mod token;
 pub mod update;
+pub mod update_hosts;
+pub mod update_status;
 pub mod worker;
 pub mod worker_roles;
 pub mod write_tier;
