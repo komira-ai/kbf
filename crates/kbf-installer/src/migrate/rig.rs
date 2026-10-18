@@ -387,3 +387,92 @@ pub fn commit(id: &str) -> CommitId {
 }
 
 pub const OTHER: &str = C;
+
+// The test farm's hosts, from the files under `testdata/testfarm/`: the units are what
+// `kbf-deploy linux render-units --mode` renders with `KBF_BIN_DIR=/usr/local/kbf/current`
+// (a test in kbf-deploy keeps them equal to the kit's output), the state and the helper's
+// memory are what the dev installer and the helper of `feature/pull-updates` wrote.
+
+pub const FARM_X: &str = "6ed9c1a07f5b4e2d8c3a91f04b7d65e2a8c1f937";
+pub const FARM_Y: &str = "b1e4a7d2c9f0385e6a4d1b7c2f9e0834a5d6c1b2";
+pub const FARM_DAEMON_UNIT: &str =
+    include_str!("../../testdata/testfarm/linux/etc/systemd/system/kbf-daemon.service");
+pub const FARM_SD_UNIT: &str =
+    include_str!("../../testdata/testfarm/linux/etc/systemd/system/kbf-storage-and-daemon.service");
+pub const FARM_HELPER_UNIT: &str =
+    include_str!("../../testdata/testfarm/linux/etc/systemd/system/kbf-helper.service");
+pub const FARM_STATE: &str =
+    include_str!("../../testdata/testfarm/linux/var/lib/kbf-deploy/state.json");
+pub const FARM_HELPER_JSON: &str =
+    include_str!("../../testdata/testfarm/linux/var/lib/kbf-deploy/helper.json");
+pub const FARM_PLIST: &str =
+    include_str!("../../testdata/testfarm/macos/org.example.kbf-daemon.plist");
+
+/// What the farm's release `commit` holds as its binary in these tests: bytes that name the
+/// build (the version probe is played by the rig's runner, which answers by directory).
+pub fn farm_binary(commit: &str) -> String {
+    format!("test farm kbf {commit}\n")
+}
+
+impl Rig {
+    /// A Linux test-farm host: releases `FARM_X` (current) and `FARM_Y` (previous) as
+    /// `kbf-deploy host install` leaves them (the binary and `units/`), the state and the
+    /// helper's memory as the deployed builds wrote them, and the daemon, the
+    /// storage-and-daemon and the helper units, all running.
+    pub fn testfarm_linux() -> Rig {
+        let rig = Rig::bare("testfarm-linux", Platform::Linux);
+        rig.farm_releases("kbf");
+        for (name, text) in [
+            ("kbf-daemon.service", FARM_DAEMON_UNIT),
+            ("kbf-storage-and-daemon.service", FARM_SD_UNIT),
+            ("kbf-helper.service", FARM_HELPER_UNIT),
+        ] {
+            put(&rig.at("etc/systemd/system").join(name), text, 0o644);
+            rig.active.borrow_mut().insert(name.to_owned());
+        }
+        put(&rig.at("var/lib/kbf-deploy/state.json"), FARM_STATE, 0o600);
+        put(
+            &rig.at("var/lib/kbf-deploy/helper.json"),
+            FARM_HELPER_JSON,
+            0o600,
+        );
+        rig
+    }
+
+    /// A macOS test-farm host: the same releases with `kbf-daemon`, and the daemon's
+    /// LaunchDaemon plist as `kbf-mac-provision` renders it.
+    pub fn testfarm_mac() -> Rig {
+        let rig = Rig::bare("testfarm-mac", Platform::MacOs);
+        rig.farm_releases("kbf-daemon");
+        put(
+            &rig.at("Library/LaunchDaemons/org.example.kbf-daemon.plist"),
+            FARM_PLIST,
+            0o644,
+        );
+        rig.active
+            .borrow_mut()
+            .insert("org.example.kbf-daemon.plist".to_owned());
+        put(&rig.at("var/db/kbf-deploy/state.json"), FARM_STATE, 0o600);
+        put(
+            &rig.at("var/db/kbf-deploy/helper.json"),
+            FARM_HELPER_JSON,
+            0o600,
+        );
+        rig
+    }
+
+    fn farm_releases(&self, binary: &str) {
+        let old = self.at("usr/local/kbf");
+        for commit in [FARM_X, FARM_Y] {
+            let dir = old.join("releases").join(commit);
+            put(&dir.join(binary), &farm_binary(commit), 0o755);
+            if binary == "kbf" {
+                put(&dir.join("units/kbf-daemon.service"), FARM_DAEMON_UNIT, 0o644);
+            }
+        }
+        std::os::unix::fs::symlink(format!("releases/{FARM_X}"), old.join("current"))
+            .expect("link");
+        std::os::unix::fs::symlink(format!("releases/{FARM_Y}"), old.join("previous"))
+            .expect("link");
+    }
+}

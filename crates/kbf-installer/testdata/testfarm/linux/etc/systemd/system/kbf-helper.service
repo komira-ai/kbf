@@ -1,0 +1,11 @@
+# The old helper's unit, as the dev installer put it on the test farm's hosts.
+[Unit]
+Description=kbf root helper (applies pulled updates)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/kbf-helper run --unit=kbf-daemon.service
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
