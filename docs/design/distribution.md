@@ -43,7 +43,14 @@ verbs (`kbf cluster status|drain|undrain|member` is the model) are clients of it
   minting (a route of this API, not a `kbf` command), object-store registration and the update endpoints are
   designed, not built [V].
 - **Updates are triggered externally.** Something outside kbf calls the control API to set the desired release;
-  the frontend then rolls the storage and daemon nodes through the drain system, one storage node at a time. For
+  the frontend then rolls the storage and daemon nodes through the drain system, one storage node at a time.
+  The frontend's own update is a second route, `POST /v1/update/frontend {commit}` (same write gates). The
+  frontend writes an order record into its own host's `orders/` directory, the mechanism nodes use, and the
+  host's `kbf-installer` pulls and verifies the release, starts the new instance behind the installed Envoy,
+  waits for its `/readyz`, then hands over; the old instance stops scheduling, relays its open `Execute`
+  streams until they close, and exits. The installer confirms, and reverts if the new instance never becomes
+  ready. One frontend update at a time; a second is refused. `kbf-installer update --frontend` stays as the
+  local fallback. For
   our own farm the trigger is its deployment pipeline. kbf has no update button and does not poll for releases
   (section 10).
 - A same-host proxy makes every caller loopback, which defeats the loopback gate, so the operator API and UI do
@@ -171,8 +178,9 @@ sections 4 and 5):
 - **Activate**: verify the staged release offline (build attestation, pinned `gh` and trusted root), switch
   `current`, restart the unit; the **confirm** order keeps it, a missed window or a crash loop **reverts** to
   `previous` locally (commit-confirm).
-- **Frontend update**, a separate step run by the external trigger as `kbf-installer update --commit SHA
-  --frontend`: it starts the new instance behind the installed Envoy and hands over; the old instance stops
+- **Frontend update**, ordered by a `frontend_update` record the frontend writes for its own host after
+  `POST /v1/update/frontend` (the local fallback is `kbf-installer update --commit SHA --frontend`): it starts
+  the new instance behind the installed Envoy, waits for its readiness, confirms or reverts, and hands over; the old instance stops
   scheduling and relays its open `Execute` streams until they close, with no timeout (OSS Buck2 never calls
   `WaitExecution`). One frontend on SQLite now; Postgres and several frontends later.
 - **Node drain and restart** as part of the per-host step.
