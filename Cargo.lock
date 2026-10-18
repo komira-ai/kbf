@@ -1707,10 +1707,12 @@ name = "kbf-it"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "futures",
  "hex",
  "kbf-daemon",
  "kbf-deploy",
  "kbf-front",
+ "kbf-installer",
  "kbf-objstore",
  "kbf-proto",
  "kbf-server",
