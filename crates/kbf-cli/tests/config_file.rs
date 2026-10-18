@@ -498,3 +498,76 @@ fn enrollments_tables_are_in_the_file_but_are_not_flags() {
     let path = file(&dir, &text, 0o600);
     parse(&path).expect("a scalar named like an enrollment table is enrollment's to refuse");
 }
+
+/// A command with three settings, to read files against `config::file_args` directly:
+/// `listen` and `storage` are in the real group table (`listener`, `storage-client`),
+/// `zz-ungrouped` is in none, which no real mode allows (`config::tests` refuses it).
+fn small_command() -> clap::Command {
+    clap::Command::new("small")
+        .arg(clap::Arg::new("listen").long("listen"))
+        .arg(clap::Arg::new("zz-ungrouped").long("zz-ungrouped"))
+}
+
+fn small_args(text: &str, name: &str) -> Result<Vec<OsString>, String> {
+    let dir = scratch(name);
+    let path = file(&dir, text, 0o600);
+    config::file_args(
+        &small_command(),
+        &std::collections::BTreeSet::new(),
+        &path,
+        &std::collections::BTreeSet::new(),
+    )
+}
+
+/// Catches a file that cannot be read as text passing as an empty one: bytes that are not
+/// UTF-8 are refused, naming the file (the metadata check passes, the read fails).
+#[test]
+fn a_file_that_is_not_text_is_refused() {
+    let dir = scratch("not_text");
+    let path = dir.join("kbf.toml");
+    std::fs::write(&path, [0xff_u8, 0xfe, 0x00]).expect("write");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
+    let err = config::file_args(
+        &small_command(),
+        &std::collections::BTreeSet::new(),
+        &path,
+        &std::collections::BTreeSet::new(),
+    )
+    .expect_err("not UTF-8");
+    assert!(err.contains("cannot read the config file"), "{err}");
+}
+
+/// Catches a top-level key that is no group being dropped: a key outside a table that
+/// names no flag of the mode is refused as unknown (not told to move under a group).
+#[test]
+fn a_top_level_key_that_is_no_setting_is_refused() {
+    let err = small_args("nonsense = 1\n", "top_unknown").expect_err("unknown");
+    assert!(err.contains("unknown key `nonsense`"), "{err}");
+}
+
+/// Catches the same name being read either way: a top-level `worker-listen` is a real
+/// setting of another mode's `[listener]` but not a flag of this command, so it is unknown
+/// here, while the command's own `listen` at top level is told its table. (Not `storage`:
+/// that is enrollment's table name, whose scalar enrollment's own parser refuses.)
+#[test]
+fn a_top_level_flag_of_another_mode_is_unknown_and_of_this_one_is_misplaced() {
+    let other = small_args("worker-listen = \"x\"\n", "top_other").expect_err("unknown");
+    assert!(other.contains("unknown key `worker-listen`"), "{other}");
+    let own = small_args("listen = \"x\"\n", "top_own").expect_err("misplaced");
+    assert!(own.contains("belongs under [listener]"), "{own}");
+}
+
+/// Catches a flag with no group being read from any table: the key is refused as in no
+/// group, naming the flag.
+#[test]
+fn a_flag_that_is_in_no_group_is_refused() {
+    let err = small_args("[listener]\nzz-ungrouped = \"x\"\n", "ungrouped").expect_err("none");
+    assert!(err.contains("--zz-ungrouped is in no group"), "{err}");
+}
+
+/// Catches a float value being refused or rounded: it becomes the flag's text as written.
+#[test]
+fn a_float_setting_becomes_its_flag() {
+    let args = small_args("[listener]\nlisten = 1.5\n", "float").expect("float");
+    assert_eq!(args, vec![OsString::from("--listen=1.5")]);
+}

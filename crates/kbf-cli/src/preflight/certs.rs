@@ -198,13 +198,18 @@ fn pair(
 /// The EKU names of `der`, serverAuth and clientAuth first, then any others by name or
 /// OID; none for a certificate without the extension.
 fn ekus(der: &[u8]) -> Vec<String> {
-    let Ok((_, cert)) = x509_parser::parse_x509_certificate(der) else {
-        return Vec::new();
-    };
-    let Some(ext) = cert.extended_key_usage().ok().flatten() else {
-        return Vec::new();
-    };
-    let e = ext.value;
+    x509_parser::parse_x509_certificate(der)
+        .ok()
+        .and_then(|(_, cert)| {
+            cert.extended_key_usage()
+                .ok()
+                .flatten()
+                .map(|ext| eku_names(ext.value))
+        })
+        .unwrap_or_default()
+}
+
+fn eku_names(e: &x509_parser::extensions::ExtendedKeyUsage<'_>) -> Vec<String> {
     [
         (e.server_auth, SERVER_AUTH),
         (e.client_auth, CLIENT_AUTH),
@@ -246,20 +251,18 @@ fn chains(
         let _ = roots.add(ca);
     }
     let (flag, at, ca_at) = (c.flag, c.path.display(), ca_path.display());
-    if roots.is_empty() {
-        report.refuse(
-            format!("{ca_flag} {ca_at} holds no usable CA certificate"),
-            "the node's certificate is checked against it",
-            format!("write the farm CA's PEM certificate to {ca_at}"),
-        );
-        return;
-    }
+    // Both builders refuse an empty store, which is the one way either fails here.
     let roots = Arc::new(roots);
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let (Ok(server), Ok(client)) = (
         WebPkiServerVerifier::builder_with_provider(roots.clone(), provider.clone()).build(),
         WebPkiClientVerifier::builder_with_provider(roots, provider).build(),
     ) else {
+        report.refuse(
+            format!("{ca_flag} {ca_at} holds no usable CA certificate"),
+            "the node's certificate is checked against it",
+            format!("write the farm CA's PEM certificate to {ca_at}"),
+        );
         return;
     };
     let now = UnixTime::since_unix_epoch(

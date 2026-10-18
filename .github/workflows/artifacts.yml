@@ -126,6 +126,8 @@ jobs:
         run: cargo xtask darwin-asset "dist/kbf-$GITHUB_SHA-darwin-arm64.tar.gz" kbf
       - name: Check the packaged kbf-deploy's signature, and run it
         run: cargo xtask darwin-asset "dist/kbf-deploy-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-deploy
+      - name: The packaged kbf names the commit and a release build
+        run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-darwin-arm64.tar.gz" "$GITHUB_SHA"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-darwin-arm64
@@ -189,6 +191,8 @@ jobs:
         run: cargo xtask package --binary "target/$TARGET/release/kbf-deploy" --sbom crates/kbf-deploy/kbf-deploy_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf
         run: cargo xtask package --binary "target/$TARGET/release/kbf" --sbom crates/kbf-cli/kbf_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
+      - name: The packaged kbf names the commit and a release build
+        run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" "$GITHUB_SHA"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-x86_64
@@ -250,6 +254,8 @@ jobs:
         run: cargo xtask package --binary "target/$TARGET/release/kbf-deploy" --sbom crates/kbf-deploy/kbf-deploy_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf
         run: cargo xtask package --binary "target/$TARGET/release/kbf" --sbom crates/kbf-cli/kbf_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
+      - name: The packaged kbf names the commit and a release build
+        run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" "$GITHUB_SHA"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-arm64
