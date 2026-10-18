@@ -395,6 +395,18 @@ pub struct Args {
     /// segment sealed while all are busy waits; new blobs go to a new open segment.
     #[arg(long, default_value_t = kbf_front::WriteConfig::DEFAULT.puts_in_flight)]
     pub write_puts_in_flight: NonZeroUsize,
+    /// The writers of the write pool: the ByteStream and storage `Write`s of a node with a
+    /// write tier are appended to shared segment files by this many writers, each holding
+    /// one range open, so the node keeps at most this many block files (plus the open
+    /// grouped block) open for writing for those blobs, however many uploads are in
+    /// flight. At least 1.
+    #[arg(long, default_value_t = kbf_front::PoolConfig::DEFAULT.writers)]
+    pub write_pool_writers: NonZeroUsize,
+    /// The most blobs waiting for a write-pool writer. A blob that finds the queue full goes
+    /// straight to the object store, as one does when the write tier has no room. At
+    /// least 1.
+    #[arg(long, default_value_t = kbf_front::PoolConfig::DEFAULT.queue)]
+    pub write_pool_queue: NonZeroUsize,
     /// How many times a segment PUT is tried. Only a PUT that did not complete
     /// (connect, reset, timeout) or that the store answered 5xx is tried again, after
     /// 100 ms and then four times longer each time, under a new object key; if every
@@ -758,6 +770,16 @@ impl Args {
             max_entries: self.input_tree_cache_entries,
             max_bytes: self.input_tree_cache_bytes,
             reads_in_flight: self.input_tree_reads_in_flight,
+        }
+    }
+
+    /// The write pool of the node's write tier: `--write-pool-writers` and
+    /// `--write-pool-queue`.
+    #[must_use]
+    pub const fn write_pool_config(&self) -> kbf_front::PoolConfig {
+        kbf_front::PoolConfig {
+            writers: self.write_pool_writers,
+            queue: self.write_pool_queue,
         }
     }
 

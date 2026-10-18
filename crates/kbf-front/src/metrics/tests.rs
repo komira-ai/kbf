@@ -172,6 +172,11 @@ fn every_family_is_printed_once_with_its_type() {
         metrics.tier_in_flight.raise(),
         metrics.tier_in_flight.raise(),
     );
+    metrics.open_write_fds.set(21);
+    metrics.write_pool_direct.add(22);
+    metrics.write_pool_queue.add_one();
+    metrics.write_pool_queue.add_one();
+    metrics.write_pool_queue.add_one();
     let text = metrics.render();
     let types: Vec<&str> = lines(&text, "# TYPE ")
         .iter()
@@ -221,6 +226,9 @@ fn every_family_is_printed_once_with_its_type() {
             "kbf_sched_leases gauge",
             "kbf_frontend_relay_lost_total counter",
             "kbf_tier_in_flight gauge",
+            "kbf_storage_open_write_fds gauge",
+            "kbf_storage_write_pool_queue gauge",
+            "kbf_storage_write_pool_direct_total counter",
             "kbf_meta_commit_seconds histogram",
             "kbf_execute_requests_total counter",
             "kbf_execute_errors_total counter",
@@ -250,6 +258,9 @@ fn every_family_is_printed_once_with_its_type() {
         ("kbf_frontend_relay_lost_total", 20),
         ("kbf_execute_presubmit_in_flight", 1),
         ("kbf_tier_in_flight", 2),
+        ("kbf_storage_open_write_fds", 21),
+        ("kbf_storage_write_pool_queue", 3),
+        ("kbf_storage_write_pool_direct_total", 22),
     ] {
         assert_eq!(
             lines(&text, &format!("{name} ")),

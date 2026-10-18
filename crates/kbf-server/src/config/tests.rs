@@ -353,6 +353,33 @@ fn write_flags_make_the_write_config() {
     }
 }
 
+/// Catches: the write pool's flags wired to each other's field or ignored, defaults
+/// other than the design's (8 writers, 4,096 queued blobs), and a pool of no writers or no
+/// queue, which would take no blob or hold none.
+#[test]
+fn write_pool_flags_make_the_pool_config() {
+    let defaults = Args::parse_from(["kbf-server"]).write_pool_config();
+    assert_eq!(defaults, kbf_front::PoolConfig::DEFAULT);
+    assert_eq!(defaults.writers.get(), 8);
+    assert_eq!(defaults.queue.get(), 4096);
+    let set = Args::parse_from([
+        "kbf-server",
+        "--write-pool-writers",
+        "3",
+        "--write-pool-queue",
+        "11",
+    ]);
+    let want = kbf_front::PoolConfig {
+        writers: NonZeroUsize::new(3).expect("3"),
+        queue: NonZeroUsize::new(11).expect("11"),
+    };
+    assert_eq!(set.write_pool_config(), want);
+    for flag in ["--write-pool-writers", "--write-pool-queue"] {
+        let refused = Args::try_parse_from(["kbf-server", flag, "0"]);
+        assert!(refused.is_err(), "{flag} 0 was accepted");
+    }
+}
+
 /// Catches: a `loopback_only` that knows only wildcards (`is_unspecified`), so one
 /// interface other machines reach (`192.0.2.10`, a documentation address standing
 /// in for a LAN or mesh one) counts as loopback; and one that drops `to_canonical`,

@@ -196,6 +196,12 @@ pub struct Cache<M, O> {
     runtime: Option<tokio::runtime::Handle>,
     /// Which digests this node flushes ([`Cache::with_flush_gate`]); none: all.
     gate: Option<Arc<dyn FlushGate>>,
+    /// How many writers the write pool has and how many blobs may wait for one
+    /// ([`Cache::with_write_pool`]).
+    pool_config: PoolConfig,
+    /// The write pool, started with the first blob a tier takes; `None` inside if it
+    /// cannot run (no runtime).
+    pool: std::sync::OnceLock<Option<WritePool>>,
 }
 
 impl<M, O> Drop for Cache<M, O> {
@@ -255,7 +261,19 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             trees: Arc::new(InputTrees::new(InputTreeConfig::DEFAULT)),
             runtime: tokio::runtime::Handle::try_current().ok(),
             gate: None,
+            pool_config: PoolConfig::DEFAULT,
+            pool: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The same cache, with the write pool sized as `config` says instead of
+    /// [`PoolConfig::DEFAULT`]: the blobs of ByteStream and storage writes are appended to
+    /// the write tier by `config.writers` writers, at most `config.queue` waiting for one.
+    /// Call it before the cache stores anything.
+    #[must_use]
+    pub fn with_write_pool(mut self, config: PoolConfig) -> Self {
+        self.pool_config = config;
+        self
     }
 
     /// The same cache, flushing only the staged objects that hold a digest `gate` says
@@ -756,6 +774,7 @@ mod direct;
 mod evict;
 mod flush;
 mod losses;
+mod pool;
 mod read;
 mod rebuild;
 mod stream;
@@ -775,6 +794,8 @@ pub use flush::{
     FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound,
 };
 pub use losses::Losses;
+use pool::WritePool;
+pub use pool::{BATCH_BLOBS, BATCH_BYTES, BUFFERED_BLOB_BYTES, PoolConfig};
 pub use read::{BlobRead, MAX_DECODED_BLOB_BYTES, READ_WINDOW_BYTES};
 pub use rebuild::{ADOPT_RECORDS, RebuildConfig, RebuildReport};
 pub(crate) use stream::TierRange;
