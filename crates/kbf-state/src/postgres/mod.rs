@@ -36,7 +36,7 @@ mod tx;
 use std::fmt;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use postgres::NoTls;
@@ -50,7 +50,7 @@ use session::{Edge, Pool, RangeShape, Session};
 use tx::{Level, Row, Tx, micros};
 
 use crate::clock::{Clock, StoreTime};
-use crate::store::{LivenessGuard, Span, Store, page_of};
+use crate::store::{Announcement, LivenessGuard, Span, Store, page_of};
 use crate::{
     Change, Changes, Commit, CommitStats, Cond, Conflict, Direction, Event, Revision, ScanPage,
     ScanRange, StoreError, Txn, Version, Versioned,
@@ -58,6 +58,26 @@ use crate::{
 
 /// The most times a batch is run again after a serialization failure.
 const MAX_ATTEMPTS: usize = 200;
+
+/// How many times [`Store::hold_liveness`] tries the lock, and the pause between tries. A
+/// [`Store::holder_alive`] probe holds the lock for one statement, so a refusal that
+/// outlasts these (about a second) is a real holder.
+const HOLD_ATTEMPTS: u32 = 40;
+const HOLD_BACKOFF: Duration = Duration::from_millis(25);
+
+/// The dedicated connection that holds a liveness lock: the lock lives as long as the
+/// session does.
+struct Holder(Mutex<postgres::Client>);
+
+impl Announcement for Holder {
+    fn is_held(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .query_one("SELECT 1", &[])
+            .is_ok()
+    }
+}
 
 /// A deliberate defect, to show the suite can fail on a Postgres store.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -638,22 +658,33 @@ impl Store for PostgresStore {
             self.config.pg.get_application_name().unwrap_or("kbf-state")
         );
         pg.application_name(&app);
+        // A silent network loss is noticed by the OS, not only by the next query.
+        pg.keepalives(true).keepalives_idle(Duration::from_secs(30));
         let mut client = pg
             .connect(NoTls)
             .map_err(|err| Fail::Pg(err).into_store())?;
-        let got: bool = client
-            .query_one(
-                "SELECT pg_try_advisory_lock(hashtextextended($1, 0))",
-                &[&key],
-            )
-            .map_err(|err| Fail::Pg(err).into_store())?
-            .get(0);
+        let mut got = false;
+        for attempt in 0..HOLD_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(HOLD_BACKOFF);
+            }
+            got = client
+                .query_one(
+                    "SELECT pg_try_advisory_lock(hashtextextended($1, 0))",
+                    &[&key],
+                )
+                .map_err(|err| Fail::Pg(err).into_store())?
+                .get(0);
+            if got {
+                break;
+            }
+        }
         if !got {
             return Err(StoreError::Failed(format!(
                 "generation {generation} already has a live holder"
             )));
         }
-        Ok(LivenessGuard::new(Mutex::new(client)))
+        Ok(LivenessGuard::new(Holder(Mutex::new(client))))
     }
 
     /// Tries the same lock from a pooled connection for the length of one statement

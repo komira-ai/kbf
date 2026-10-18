@@ -122,6 +122,81 @@ fn the_default_conditional_reap_judges_each_precondition() {
     }
 }
 
+/// A store with the default conditional reap, and a hook that runs just before its plain
+/// reap: where a take can land between the default's read and its reap.
+struct Gapped {
+    inner: Arc<dyn Store>,
+    hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Store for Gapped {
+    fn apply_batch(
+        &self,
+        batch: Vec<Txn>,
+    ) -> Result<Vec<Result<kbf_state::Commit, kbf_state::Conflict>>, StoreError> {
+        self.inner.apply_batch(batch)
+    }
+    fn get(&self, key: &str) -> Result<Option<kbf_state::Versioned>, StoreError> {
+        self.inner.get(key)
+    }
+    fn scan_prefix(&self, p: &str) -> Result<Vec<(String, kbf_state::Versioned)>, StoreError> {
+        self.inner.scan_prefix(p)
+    }
+    fn scan_range(&self, s: kbf_state::ScanRange<'_>) -> Result<kbf_state::ScanPage, StoreError> {
+        self.inner.scan_range(s)
+    }
+    fn changes(
+        &self,
+        after: kbf_state::Revision,
+        limit: usize,
+    ) -> Result<kbf_state::Changes, StoreError> {
+        self.inner.changes(after, limit)
+    }
+    fn reap_expired(&self) -> Result<usize, StoreError> {
+        let hook = self.hook.lock().expect("lock").take();
+        if let Some(hook) = hook {
+            hook();
+        }
+        self.inner.reap_expired()
+    }
+    fn commit_stats(&self) -> kbf_state::CommitStats {
+        self.inner.commit_stats()
+    }
+    fn now(&self) -> kbf_state::StoreTime {
+        self.inner.now()
+    }
+}
+
+// Documents the hazard of the trait default, so nobody relies on it: a `Fenced` handle
+// over a store that does NOT override `reap_expired_if` is not atomic. A rival that takes
+// the generation between the default's read and its reap does not stop the superseded
+// handle's reap. This is why a production `Store` must override the method (the fake,
+// SQLite and Postgres do; F8 shows the fenced result for them).
+#[test]
+fn a_store_that_keeps_the_default_conditional_reap_is_not_atomic() {
+    let raw = fake();
+    let gapped = Arc::new(Gapped {
+        inner: Arc::clone(&raw),
+        hook: std::sync::Mutex::default(),
+    });
+    let old = Fenced::take(gapped.clone(), None).expect("take");
+    let rival = Arc::clone(&raw);
+    *gapped.hook.lock().expect("lock") = Some(Box::new(move || {
+        Fenced::take(rival, Some(1)).expect("the rival takes");
+    }));
+    assert!(
+        old.reap_expired().is_ok(),
+        "the default is read-then-reap: the superseded handle's reap went through"
+    );
+    assert_eq!(
+        Fenced::take(raw, Some(2))
+            .expect("the rival held 2")
+            .generation(),
+        3,
+        "the rival did take generation 2 in the gap"
+    );
+}
+
 // Catches a second precondition being forwarded unchecked by a fenced handle: it cannot be
 // checked in the same step as the generation, so it is refused and nothing is reaped.
 #[test]

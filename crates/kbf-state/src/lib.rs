@@ -45,7 +45,7 @@ use std::time::Duration;
 
 pub use clock::{Clock, ManualClock, StoreTime, SystemClock};
 pub use fence::{Fenced, GENERATION, TakeError};
-pub use store::{LivenessGuard, Store};
+pub use store::{Announcement, LivenessGuard, Store};
 pub use types::{
     Change, Changes, Commit, CommitStats, Cond, Conflict, Direction, Event, Op, ResumeToken,
     Revision, ScanPage, ScanRange, StoreError, Txn, Version, Versioned,

@@ -30,6 +30,15 @@ struct Announcement {
     generation: u64,
 }
 
+impl kbf_state::Announcement for Announcement {
+    fn is_held(&self) -> bool {
+        self.alive
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&self.generation)
+    }
+}
+
 impl Drop for Announcement {
     fn drop(&mut self) {
         self.alive
@@ -131,6 +140,11 @@ fn a_backend_that_cannot_announce_says_so_and_take_holding_writes_nothing() {
 #[test]
 fn dropping_the_guard_drops_what_it_holds() {
     struct Flag(Arc<AtomicBool>);
+    impl kbf_state::Announcement for Flag {
+        fn is_held(&self) -> bool {
+            !self.0.load(Ordering::SeqCst)
+        }
+    }
     impl Drop for Flag {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
@@ -140,6 +154,7 @@ fn dropping_the_guard_drops_what_it_holds() {
     let guard = LivenessGuard::new(Flag(Arc::clone(&dropped)));
     assert_eq!(format!("{guard:?}"), "LivenessGuard");
     assert!(!dropped.load(Ordering::SeqCst));
+    assert!(guard.is_held(), "the guard asks what it owns");
     drop(guard);
     assert!(dropped.load(Ordering::SeqCst));
 }

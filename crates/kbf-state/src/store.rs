@@ -14,16 +14,35 @@ use crate::types::{
 /// takes the announcement down; so does the death of the process that owns it.
 #[must_use = "dropping the guard ends the liveness announcement at once"]
 pub struct LivenessGuard {
-    _held: Box<dyn Send + Sync>,
+    held: Box<dyn Announcement>,
+}
+
+/// What a backend keeps up to announce a holder (for Postgres, the dedicated connection
+/// that owns the advisory lock). Dropping it takes the announcement down.
+pub trait Announcement: Send + Sync {
+    /// Whether the announcement is still up, by a cheap check of the thing that holds it
+    /// (not of the store as a whole).
+    fn is_held(&self) -> bool;
 }
 
 impl LivenessGuard {
-    /// A guard that keeps `held` alive; dropping the guard drops it. A backend passes
-    /// whatever owns the announcement (for Postgres, the dedicated connection).
-    pub fn new(held: impl Send + Sync + 'static) -> LivenessGuard {
+    /// A guard that keeps `held` alive; dropping the guard drops it.
+    pub fn new(held: impl Announcement + 'static) -> LivenessGuard {
         LivenessGuard {
-            _held: Box::new(held),
+            held: Box::new(held),
         }
+    }
+
+    /// Whether the announcement is still up. It is a round trip on the connection that
+    /// holds it, so it is cheap but not free: poll it, do not call it per write. `false`
+    /// means the announcement is gone (the server ended the connection: a network
+    /// failure, an idle-session timeout, a terminate): other sessions already see the
+    /// holder as dead, so the holder must stop acting as one (self-fence). `true` is
+    /// proof only up to the moment of the check; the connection can still be lost the
+    /// next instant, which is why the check is repeated.
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        self.held.is_held()
     }
 }
 
@@ -115,8 +134,15 @@ pub trait Store: Send + Sync {
     ///
     /// The default reads `key`, then calls [`Store::reap_expired`]: **not atomic**, a
     /// write can land between the two. It is there so a wrapper that forwards only the
-    /// other methods still works; every backend in this crate overrides it, and a backend
-    /// that is fenced for real must too.
+    /// other methods (a test double) still compiles. **Any `Store` used in production, or
+    /// under a [`crate::Fenced`] handle that must fence, must override it**, and a
+    /// wrapper over a real backend must forward it, not inherit the default.
+    ///
+    /// The fake and SQLite are atomic by construction, which stands in for an in-backend
+    /// race test (no interleaving point exists to test): the fake judges and reaps under
+    /// one held mutex, and SQLite applies the check and the reap in one step of its single
+    /// writer thread. Postgres judges and reaps in one transaction after the commit-head
+    /// lock; its race is tested on a server with a take held open.
     ///
     /// # Errors
     /// [`StoreError`] when the backend fails.
@@ -146,6 +172,12 @@ pub trait Store: Send + Sync {
     /// guard is dropped, and by the backend itself when the process or its connection
     /// dies, so "the holder is dead" is never a guess from a pid. The guard owns its own
     /// connection to the backend, outside any pool, and nothing else uses it.
+    ///
+    /// The server can end that connection while the holder runs; the holder cannot see it
+    /// happen, and others then see it dead. [`LivenessGuard::is_held`] is how it finds
+    /// out. Announcing a generation that is being probed at that instant is retried
+    /// briefly (a probe holds the key for one statement; a real holder holds it
+    /// indefinitely) before it is refused.
     ///
     /// # Errors
     /// [`StoreError`] when the backend cannot announce (the default: only Postgres can,

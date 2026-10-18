@@ -170,3 +170,72 @@ fn take_holding_announces_before_it_writes() {
     assert_eq!(pair.observer.holder_alive(2), Ok(true));
     drop(second_guard);
 }
+
+// Catches a holder that cannot tell its connection was ended: the server ends the guard's
+// connection (a network failure, an idle timeout, a terminate) and other sessions see the
+// holder dead; the guard's own `is_held` must say so too, so the holder can fence itself.
+#[test]
+#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+fn the_guard_notices_when_its_connection_was_ended() {
+    let pair = Pair::new();
+    let guard = pair.holder.hold_liveness(1).expect("announces");
+    assert!(guard.is_held(), "a live connection holds the lock");
+    let mut admin = Client::connect(&url(), NoTls).expect("connects");
+    admin
+        .execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1",
+            &[&format!("{}-holder", pair.app)],
+        )
+        .expect("terminates");
+    for _ in 0..6000 {
+        if !guard.is_held() {
+            becomes(&pair.observer, 1, false);
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    panic!("the guard still reports the lock held after its connection was ended");
+}
+
+// Catches a spurious refusal: `holder_alive` takes the key for one statement, so a
+// probe in flight when `hold_liveness` tries must not make the hold fail. A probe
+// transaction is held open until the hold has made (and lost) its first attempt, then
+// released, and the hold must succeed on a later attempt.
+#[test]
+#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+fn a_probe_racing_a_hold_does_not_make_the_hold_fail() {
+    let pair = Pair::new();
+    let mut probe = Client::connect(&url(), NoTls).expect("connects");
+    probe.batch_execute("BEGIN").expect("begins");
+    let got: bool = probe
+        .query_one(
+            "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&format!("kbf-state/holder/{}/1", pair.app)],
+        )
+        .expect("probes")
+        .get(0);
+    assert!(got, "the probe holds the key");
+    let holder = Arc::clone(&pair.holder);
+    let hold = thread::spawn(move || holder.hold_liveness(1).map(|guard| guard.is_held()));
+    let mut seen = Client::connect(&url(), NoTls).expect("connects");
+    for _ in 0..6000 {
+        let tried: i64 = seen
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1 \
+                 AND state = 'idle' AND query LIKE '%pg_try_advisory_lock%'",
+                &[&format!("{}-holder", pair.app)],
+            )
+            .expect("reads activity")
+            .get(0);
+        if tried > 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    probe.batch_execute("COMMIT").expect("the probe ends");
+    assert_eq!(
+        hold.join().expect("join"),
+        Ok(true),
+        "the hold failed because a probe held the key"
+    );
+}
