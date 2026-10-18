@@ -138,7 +138,7 @@ async fn call(state: &Arc<EnrollState>, route: &Route, peer: SocketAddr, h: Head
         }
         Route::Nodes => nodes(st, ConnectInfo(peer), h).await,
         Route::RevokeNode(id) => {
-            revoke_node(st, ConnectInfo(peer), Path(id.clone()), h, Bytes::new()).await
+            revoke_node_route(st, ConnectInfo(peer), Path(id.clone()), h, Bytes::new()).await
         }
     }
 }

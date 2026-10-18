@@ -134,13 +134,18 @@ pub(crate) struct EnrollState {
 
 impl EnrollState {
     /// The enrollment, if the caller passed the gate and there is one.
-    fn admit(&self, peer: SocketAddr, headers: &HeaderMap) -> Result<Arc<EnrollApi>, Response> {
-        gate(self.token.as_ref(), peer, headers).map_err(|(code, why)| error(code, &why))?;
+    fn admit(
+        &self,
+        peer: SocketAddr,
+        headers: &HeaderMap,
+    ) -> Result<Arc<EnrollApi>, Box<Response>> {
+        gate(self.token.as_ref(), peer, headers)
+            .map_err(|(code, why)| Box::new(error(code, &why)))?;
         self.enroll.clone().ok_or_else(|| {
-            error(
+            Box::new(error(
                 StatusCode::NOT_FOUND,
                 "enrollment is not enabled on this frontend",
-            )
+            ))
         })
     }
 }
@@ -193,7 +198,7 @@ pub(crate) async fn create(
 ) -> Response {
     let api = match state.admit(peer, &headers) {
         Ok(api) => api,
-        Err(refusal) => return refusal,
+        Err(refusal) => return *refusal,
     };
     let request: TokenCreate = match serde_json::from_slice(&body) {
         Ok(request) => request,
@@ -212,7 +217,7 @@ pub(crate) async fn list(
 ) -> Response {
     let api = match state.admit(peer, &headers) {
         Ok(api) => api,
-        Err(refusal) => return refusal,
+        Err(refusal) => return *refusal,
     };
     answer(blocking(move || token_list(&api)).await)
 }
@@ -225,7 +230,7 @@ pub(crate) async fn revoke_token_route(
 ) -> Response {
     let api = match state.admit(peer, &headers) {
         Ok(api) => api,
-        Err(refusal) => return refusal,
+        Err(refusal) => return *refusal,
     };
     answer(blocking(move || revoke_token_by_id(&api, &id)).await)
 }
@@ -237,7 +242,7 @@ pub(crate) async fn nodes(
 ) -> Response {
     let api = match state.admit(peer, &headers) {
         Ok(api) => api,
-        Err(refusal) => return refusal,
+        Err(refusal) => return *refusal,
     };
     answer(blocking(move || node_list(&api)).await)
 }
@@ -256,7 +261,7 @@ pub(crate) async fn revoke_node_route(
 ) -> Response {
     let api = match state.admit(peer, &headers) {
         Ok(api) => api,
-        Err(refusal) => return refusal,
+        Err(refusal) => return *refusal,
     };
     if !body.is_empty()
         && let Err(e) = serde_json::from_slice::<NoBody>(&body)
