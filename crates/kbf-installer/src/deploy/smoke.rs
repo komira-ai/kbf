@@ -13,6 +13,9 @@
 //! 4. `ActionCache.GetActionResult` for a random digest is NOT_FOUND: a hit is a defect
 //!    and any other status (the cache down, the service missing) is a failure, not a miss.
 //!
+//! An `https://` listener is verified against the system roots and an optional extra CA, under
+//! a configured certificate name while the connection goes to loopback.
+//!
 //! The whole run is bounded by one timeout. The blob stays in the store: REAPI has no
 //! delete, and 64 bytes of random content is left to the store's eviction.
 //! The instance name is empty; a listener that needs credentials is not smoked yet.
@@ -28,32 +31,68 @@ use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStor
 use kbf_proto::reapi::{Digest, FindMissingBlobsRequest, GetActionResultRequest};
 use sha2::{Digest as _, Sha256};
 use tonic::Code;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 use super::{Smoke, SmokeResult};
 
 /// The bytes of the blob the smoke writes.
 const BLOB_BYTES: usize = 64;
 
-/// The smoke against the REAPI listener at `url`.
+/// The smoke against the REAPI listener at `url` (`http://` for a plain-text listener,
+/// `https://` for one that serves TLS).
 #[derive(Clone, Debug)]
 pub struct CasSmoke {
     url: String,
     timeout: Duration,
+    /// The name the server's certificate is verified against (https only).
+    server_name: Option<String>,
+    /// PEM of CA certificates trusted besides the system's (https only).
+    ca_pem: Option<Vec<u8>>,
 }
 
 impl CasSmoke {
     /// # Errors
-    /// `url` is not a plain-text `http://host:port` URL.
+    /// `url` is not an `http://host:port` or `https://host:port` URL.
     pub fn new(url: &str, timeout: Duration) -> Result<CasSmoke, String> {
-        let rest = url.strip_prefix("http://").unwrap_or_default();
+        let rest = url
+            .strip_prefix("http://")
+            .or_else(|| url.strip_prefix("https://"))
+            .unwrap_or_default();
         if rest.is_empty() || rest.contains(['/', '?', '#', ' ']) {
-            return Err(format!("{url:?} is not an http://host:port URL"));
+            return Err(format!("{url:?} is not an http(s)://host:port URL"));
         }
         Ok(CasSmoke {
             url: url.to_owned(),
             timeout,
+            server_name: None,
+            ca_pem: None,
         })
+    }
+
+    /// The name the server's certificate must carry (the connection may go to an address
+    /// that is not the name: the local listener is dialled on loopback) and PEM of CA
+    /// certificates trusted besides the system's roots. Without a name the URL's host is
+    /// verified.
+    ///
+    /// # Errors
+    /// The URL is `http://` (the options would do nothing), or `ca_pem` holds no
+    /// certificate.
+    pub fn tls(
+        mut self,
+        server_name: Option<String>,
+        ca_pem: Option<Vec<u8>>,
+    ) -> Result<CasSmoke, String> {
+        if self.url.starts_with("http://") && (server_name.is_some() || ca_pem.is_some()) {
+            return Err("a certificate name or CA was given for an http:// URL".to_owned());
+        }
+        if let Some(pem) = &ca_pem
+            && !x509_parser::pem::Pem::iter_from_buffer(pem).any(|p| p.is_ok())
+        {
+            return Err("the CA file holds no PEM certificate".to_owned());
+        }
+        self.server_name = server_name;
+        self.ca_pem = ca_pem;
+        Ok(self)
     }
 }
 
@@ -66,9 +105,8 @@ impl Smoke for CasSmoke {
             Ok(r) => r,
             Err(e) => return SmokeResult::Fail(format!("no runtime: {e}")),
         };
-        let url = self.url.clone();
-        let timeout = self.timeout;
-        let bounded = async move { tokio::time::timeout(timeout, check(&url)).await };
+        let this = self.clone();
+        let bounded = async move { tokio::time::timeout(this.timeout, check(&this)).await };
         match runtime.block_on(bounded) {
             Ok(Ok(())) => SmokeResult::Pass,
             Ok(Err(why)) => SmokeResult::Fail(why),
@@ -93,15 +131,29 @@ fn digest_of(bytes: &[u8]) -> Digest {
     }
 }
 
-async fn check(url: &str) -> Result<(), String> {
+async fn check(target: &CasSmoke) -> Result<(), String> {
     let blob = random(BLOB_BYTES)?;
     let digest = digest_of(&blob);
     let absent = digest_of(&random(BLOB_BYTES)?);
     let action = digest_of(&random(BLOB_BYTES)?);
     let upload = hex::encode(random(16)?);
 
-    let channel: Channel = Endpoint::from_shared(url.to_owned())
-        .map_err(|e| format!("the address: {e}"))?
+    let mut endpoint =
+        Endpoint::from_shared(target.url.clone()).map_err(|e| format!("the address: {e}"))?;
+    if target.url.starts_with("https://") {
+        // The system roots, the extra CA, and the certificate's own name.
+        let mut tls = ClientTlsConfig::new().with_native_roots();
+        if let Some(pem) = &target.ca_pem {
+            tls = tls.ca_certificate(Certificate::from_pem(pem));
+        }
+        if let Some(name) = &target.server_name {
+            tls = tls.domain_name(name.clone());
+        }
+        endpoint = endpoint
+            .tls_config(tls)
+            .map_err(|e| format!("TLS config: {e}"))?;
+    }
+    let channel: Channel = endpoint
         .connect()
         .await
         .map_err(|e| format!("cannot connect: {e}"))?;

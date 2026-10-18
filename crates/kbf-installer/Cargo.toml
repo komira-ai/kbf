@@ -16,7 +16,8 @@ publish.workspace = true
 # tarball; rustix opens the inbox's files without following a link (openat, openat2);
 # libc drops to the unprivileged user between fork and exec of a program that reads
 # untrusted bytes. `deploy`'s CAS smoke is a small gRPC client of the local REAPI listener
-# (kbf-proto, tonic, a current-thread tokio runtime built for the one check).
+# (kbf-proto, tonic, a current-thread tokio runtime built for the one check); toml and
+# x509-parser read the frontend's own config for the listener's address and certificate name.
 
 [features]
 # `testkit`: the scratch host and state helpers other crates' tests of the `host` verbs use.
@@ -36,9 +37,12 @@ sha2.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "time"] }
-tonic.workspace = true
+tonic = { workspace = true, features = ["tls-native-roots", "tls-ring"] }
+toml.workspace = true
+x509-parser.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 kbf-host = { workspace = true, features = ["testkit"] }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "time"] }
 

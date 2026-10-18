@@ -17,11 +17,14 @@
 pub mod api;
 pub mod bundle;
 pub mod cli;
+mod frontend_addr;
+#[cfg(test)]
+mod frontend_addr_tests;
 mod nodes;
 mod post;
 pub mod smoke;
 #[cfg(test)]
-mod smoke_tests;
+pub(super) mod smoke_tests;
 mod summary;
 #[cfg(test)]
 mod tests;

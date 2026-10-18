@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::api::Http;
+use super::frontend_addr::derive;
 use super::smoke::CasSmoke;
 use super::summary::Exit;
 use super::summary::Summary;
@@ -22,14 +23,23 @@ use crate::CommitId;
 pub const CONFIG: &str = "/etc/kbf-installer/deploy.json";
 
 pub const USAGE: &str = "usage: kbf-installer deploy --commit <40hex> [--api <127.0.0.1:port>] \
-[--token-file <path>] [--config <path>] [--cas http://127.0.0.1:port] [--apply] [--json] [--bundle -|DIR] [--order nodes-first|frontend-first] \
+[--token-file <path>] [--config <path>] [--cas http(s)://127.0.0.1:port] [--cas-ca <pem>] [--cas-server-name <dns>] [--apply] [--json] [--bundle -|DIR] [--order nodes-first|frontend-first] \
 [--allow-offline <id>[,<id>...]] [--node-timeout-s N] [--handover-timeout-s N] [--smoke-timeout-s N] \
 [--lock <path>] [--platform linux-x86_64|linux-arm64|darwin-arm64]";
+
+/// Where the CAS smoke dials and how it verifies a TLS listener; from the flags, else the
+/// host's config. With no address the frontend's own config names it ([`smoke_for`]).
+#[derive(Default)]
+pub(super) struct CasFlags {
+    pub(super) url: Option<String>,
+    pub(super) ca: Option<PathBuf>,
+    pub(super) server_name: Option<String>,
+}
 
 struct Args {
     options: Options,
     api: SocketAddr,
-    cas: Option<String>,
+    cas: CasFlags,
     token_file: PathBuf,
     bundle: Option<String>,
     lock: PathBuf,
@@ -39,19 +49,21 @@ struct Args {
 /// that got here through `sudo` (a deploy account that may only run `deploy`) must not set
 /// them: root would read a file of the caller's choosing and send it to an address of the
 /// caller's choosing. Those values come from the root-owned config.
-const HOST_FLAGS: [&str; 6] = [
+const HOST_FLAGS: [&str; 8] = [
     "--api",
     "--token-file",
     "--config",
     "--lock",
     "--platform",
     "--cas",
+    "--cas-ca",
+    "--cas-server-name",
 ];
 
 fn parse(args: &[String], via_sudo: bool) -> Result<Args, String> {
     let mut commit = None;
     let mut api = None;
-    let mut cas = None;
+    let mut cas = CasFlags::default();
     let mut token_file = None;
     let mut bundle = None;
     let mut apply = false;
@@ -75,7 +87,9 @@ fn parse(args: &[String], via_sudo: bool) -> Result<Args, String> {
             "--json" => {}
             "--commit" => commit = Some(value("--commit")?),
             "--api" => api = Some(value("--api")?),
-            "--cas" => cas = Some(value("--cas")?),
+            "--cas" => cas.url = Some(value("--cas")?),
+            "--cas-ca" => cas.ca = Some(PathBuf::from(value("--cas-ca")?)),
+            "--cas-server-name" => cas.server_name = Some(value("--cas-server-name")?),
             "--token-file" => token_file = Some(PathBuf::from(value("--token-file")?)),
             "--bundle" => bundle = Some(value("--bundle")?),
             "--config" => config = PathBuf::from(value("--config")?),
@@ -109,11 +123,17 @@ fn parse(args: &[String], via_sudo: bool) -> Result<Args, String> {
     // both flags are given.
     let conf = read_config(
         &config,
-        api.is_none() || token_file.is_none() || cas.is_none(),
+        api.is_none()
+            || token_file.is_none()
+            || cas.url.is_none()
+            || cas.ca.is_none()
+            || cas.server_name.is_none(),
     )?;
     let api = api.or(conf.api);
     let token_file = token_file.or(conf.token_file);
-    let cas = cas.or(conf.cas);
+    cas.url = cas.url.or(conf.cas);
+    cas.ca = cas.ca.or(conf.cas_ca);
+    cas.server_name = cas.server_name.or(conf.cas_server_name);
     let commit = commit.ok_or("--commit is required")?;
     let commit = CommitId::new(&commit).map_err(|e| e.to_string())?;
     let api = api.ok_or("--api is required (or `api` in the config)")?;
@@ -126,7 +146,7 @@ fn parse(args: &[String], via_sudo: bool) -> Result<Args, String> {
     ) {
         return Err(format!("--platform {platform:?} is not a platform"));
     }
-    if let Some(url) = &cas {
+    if let Some(url) = &cas.url {
         CasSmoke::new(url, Duration::from_secs(secs[2])).map_err(|e| format!("--cas {e}"))?;
     }
     let mut options = Options::new(commit, &platform);
@@ -153,9 +173,12 @@ struct HostConfig {
     token_file: Option<PathBuf>,
     /// The local REAPI listener the CAS smoke uses.
     cas: Option<String>,
+    cas_ca: Option<PathBuf>,
+    cas_server_name: Option<String>,
 }
 
-/// `{"api": "127.0.0.1:port", "token_file": "/path", "cas": "http://127.0.0.1:port"}`. Read
+/// `{"api": "127.0.0.1:port", "token_file": "/path", "cas": "http://127.0.0.1:port"}` (and `cas_ca`,
+/// `cas_server_name`). Read
 /// only when a flag is missing; it must be a regular file owned by root and writable by no
 /// one else.
 fn read_config(path: &Path, needed: bool) -> Result<HostConfig, String> {
@@ -188,6 +211,8 @@ fn read_config(path: &Path, needed: bool) -> Result<HostConfig, String> {
         api: get("api"),
         token_file: get("token_file").map(PathBuf::from),
         cas: get("cas"),
+        cas_ca: get("cas_ca").map(PathBuf::from),
+        cas_server_name: get("cas_server_name"),
     })
 }
 
@@ -209,15 +234,53 @@ pub fn host_platform() -> &'static str {
     }
 }
 
-/// The smoke a deploy ends with: against the local REAPI listener when the host names one,
-/// else none (which a deploy reports as skipped, exit 5).
-pub(super) fn smoke_for(cas: Option<&str>, timeout: Duration) -> Result<Box<dyn Smoke>, String> {
-    match cas {
-        None => Ok(Box::new(NoSmoke)),
-        Some(url) => CasSmoke::new(url, timeout)
-            .map(|s| Box::new(s) as Box<dyn Smoke>)
-            .map_err(|e| format!("--cas {e}")),
+/// The frontend's own config: where its listener's address and certificate are.
+pub(super) struct FrontendConfig {
+    pub toml: PathBuf,
+    pub units: Vec<PathBuf>,
+}
+
+impl FrontendConfig {
+    pub(super) fn host() -> FrontendConfig {
+        let unit = |name: &str| PathBuf::from("/etc/systemd/system").join(name);
+        FrontendConfig {
+            toml: PathBuf::from("/etc/kbf/kbf.toml"),
+            units: [
+                "kbf-frontend@.service",
+                "kbf-all-in-one.service",
+                "kbf-server.service",
+            ]
+            .map(unit)
+            .to_vec(),
+        }
     }
+}
+
+/// The smoke a deploy ends with: against the REAPI listener the flags or the host config
+/// name, else the one the frontend's own config says, else none (which a deploy reports
+/// as skipped, exit 5).
+pub(super) fn smoke_for(
+    cas: &CasFlags,
+    timeout: Duration,
+    frontend: &FrontendConfig,
+) -> Result<Box<dyn Smoke>, String> {
+    let (url, derived_name) = match &cas.url {
+        Some(url) => (url.clone(), None),
+        None => match derive(&frontend.toml, &frontend.units)? {
+            Some(d) => (d.url, d.server_name),
+            None => return Ok(Box::new(NoSmoke)),
+        },
+    };
+    let ca_pem = cas
+        .ca
+        .as_ref()
+        .map(|p| fs::read(p).map_err(|e| format!("--cas-ca {}: {e}", p.display())))
+        .transpose()?;
+    let name = cas.server_name.clone().or(derived_name);
+    let smoke = CasSmoke::new(&url, timeout)
+        .and_then(|s| s.tls(name, ca_pem))
+        .map_err(|e| format!("--cas {e}"))?;
+    Ok(Box::new(smoke))
 }
 
 /// The token: a regular file owned by root, mode 0600 or 0400, one token of visible ASCII.
@@ -301,9 +364,15 @@ pub fn main_as(
         Some("-") => Some(stdin),
         Some(_) => return usage(err, "--bundle takes - (a tar on standard input)"),
     };
-    let smoke = match smoke_for(parsed.cas.as_deref(), parsed.options.smoke_timeout) {
-        Ok(s) => s,
-        Err(why) => return usage(err, &why),
+    // A plan runs no smoke, so it reads none of the frontend's config either.
+    let smoke: Box<dyn Smoke> = if parsed.options.apply {
+        let frontend = FrontendConfig::host();
+        match smoke_for(&parsed.cas, parsed.options.smoke_timeout, &frontend) {
+            Ok(s) => s,
+            Err(why) => return usage(err, &why),
+        }
+    } else {
+        Box::new(NoSmoke)
     };
     let (clock, check) = (SystemClock, NoCheck);
     let env = Env {

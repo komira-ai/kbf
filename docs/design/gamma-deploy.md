@@ -87,14 +87,25 @@ token path and no host name.
 
 ## The CAS smoke
 
-`--cas http://127.0.0.1:port` (or `cas` in the host config, which `sudo` callers cannot override)
-names the local REAPI listener. The smoke writes 64 random bytes with `ByteStream.Write`
-(the commit must report their size), asks `FindMissingBlobs` for that blob and a random one
-nobody wrote (present, missing), reads the blob back and compares every byte, then asks the
-action cache for a random digest (must be NOT_FOUND; a hit or another status fails). One bound
-for all of it, `--smoke-timeout-s` (default 60). Without `--cas` the smoke is `skipped` and a
-deploy ends exit 5; an unreachable listener or any failed check is `postcheck_failed`, exit 1.
-The listener is plain text, instance name empty. The blob stays in the store until eviction.
+Where it dials, first that applies: `--cas http(s)://host:port`; `cas` in the host config
+(`deploy.json`, which `sudo` callers cannot override); else the frontend's own config. That is
+`/etc/kbf/kbf.toml` (`[listener] listen`, default 127.0.0.1:8980; `[tls] reapi-tls-cert`), then the
+flags of the first installed `kbf-frontend@.service`, `kbf-all-in-one.service` or
+`kbf-server.service` that sets `--listen` (a flag overrides its key). An unspecified listen
+address is dialled on loopback, a specific one at that address. A configured certificate makes
+the address `https://`, verified under the certificate's first DNS name (its common name if none);
+`cas_server_name` / `--cas-server-name` sets another name. An `https://` address is verified
+against the system roots plus the PEM file `cas_ca` / `--cas-ca`, if given. With no address from
+any of these the smoke is `skipped` and the deploy ends exit 5. A plan (no `--apply`) reads none
+of this. Instance b of the frontend template (ports ten above) is not derived: the unit's own
+`--listen` is read.
+
+The smoke writes 64 random bytes with `ByteStream.Write` (the commit must report their size),
+asks `FindMissingBlobs` for that blob and a random one nobody wrote (present, missing), reads the
+blob back and compares every byte, then asks the action cache for a random digest (must be
+NOT_FOUND; a hit or another status fails). One bound for all of it, `--smoke-timeout-s`
+(default 60). An unreachable listener or any failed check is `postcheck_failed`, exit 1. The
+instance name is empty. The blob stays in the store until eviction.
 
 ## What is not built
 

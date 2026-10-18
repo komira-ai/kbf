@@ -1723,6 +1723,7 @@ dependencies = [
  "kbf-host",
  "kbf-proto",
  "libc",
+ "rcgen",
  "rustix",
  "serde",
  "serde_json",
@@ -1730,7 +1731,9 @@ dependencies = [
  "tar",
  "thiserror",
  "tokio",
+ "toml",
  "tonic",
+ "x509-parser",
 ]
 
 [[package]]
@@ -4121,6 +4124,7 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
+ "rustls-native-certs",
  "socket2",
  "sync_wrapper",
  "tokio",

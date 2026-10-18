@@ -1261,7 +1261,7 @@ mod cli_tests {
         let (code, err) = go(argv(&[]));
         assert_eq!(code, 2);
         assert!(err.contains("--api is required"), "{err}");
-        // All three of --api, --token-file and --cas given: the config is not read at all.
+        // Every setting the config can give is given by a flag: the config is not read at all.
         write(0o666, &body);
         let flags = [
             "--api",
@@ -1269,10 +1269,19 @@ mod cli_tests {
             "--token-file",
             token.to_str().unwrap(),
         ];
+        let ca = dir.join("ca.pem");
+        fs::write(&ca, crate::deploy::smoke_tests::pki("farm.example").0).unwrap();
         let mut with_cas = flags.to_vec();
-        with_cas.extend(["--cas", "http://127.0.0.1:1"]);
+        with_cas.extend([
+            "--cas",
+            "https://127.0.0.1:1",
+            "--cas-ca",
+            ca.to_str().unwrap(),
+            "--cas-server-name",
+            "farm.example",
+        ]);
         assert_eq!(go(argv(&with_cas)).0, 1);
-        // Without --cas the config is read for it, so a config others may write is refused.
+        // Without the --cas flags the config is read for them, so a config others may write is refused.
         assert_eq!(go(argv(&flags)).0, 2);
         // No config and no flags.
         let none = dir.join("absent.json");
@@ -1298,21 +1307,50 @@ mod cli_tests {
         }
     }
 
-    /// Proves the production CLI's smoke is the real one when the host names a listener,
-    /// and the config's `cas` is read like the flag. Catches `NoSmoke` left in the path
-    /// (every real deploy then ends exit 5).
+    /// Proves the production CLI's smoke is the real one when the flags, the host config or
+    /// the frontend's own config name a listener, and none when nothing does. Catches
+    /// `NoSmoke` left in the path (every real deploy then ends exit 5).
     #[test]
     fn the_cli_smoke_is_the_cas_smoke_when_a_listener_is_named() {
         use super::super::SmokeResult;
+        use super::super::cli::{CasFlags, FrontendConfig};
         use std::time::Duration;
-        let t = Duration::from_secs(2);
-        assert_eq!(cli::smoke_for(None, t).unwrap().run(), SmokeResult::Skipped);
+        let t = Duration::from_secs(5);
+        let (_, dir) = crate::testkit::host_root("cli-smoke");
+        let none = FrontendConfig {
+            toml: dir.join("absent.toml"),
+            units: vec![dir.join("absent.service")],
+        };
+        let flags = |url: Option<&str>| CasFlags {
+            url: url.map(str::to_owned),
+            ..CasFlags::default()
+        };
+        // Nothing named anywhere: skipped.
+        assert_eq!(
+            cli::smoke_for(&flags(None), t, &none).unwrap().run(),
+            SmokeResult::Skipped
+        );
         // Nothing listens at port 1: the real smoke fails; the stand-in would skip.
-        let real = cli::smoke_for(Some("http://127.0.0.1:1"), t).unwrap();
+        let real = cli::smoke_for(&flags(Some("http://127.0.0.1:1")), t, &none).unwrap();
         assert!(matches!(real.run(), SmokeResult::Fail(_)));
-        assert!(cli::smoke_for(Some("127.0.0.1:1"), t).is_err());
-        let (_, dir) = crate::testkit::host_root("cfg-cas");
-        let conf = dir.join("deploy.json");
+        assert!(cli::smoke_for(&flags(Some("127.0.0.1:1")), t, &none).is_err());
+        // The frontend's config names it (same: nothing listens there).
+        let conf = FrontendConfig {
+            toml: dir.join("kbf.toml"),
+            units: Vec::new(),
+        };
+        fs::write(&conf.toml, "[listener]\nlisten = \"127.0.0.1:1\"\n").unwrap();
+        let derived = cli::smoke_for(&flags(None), t, &conf).unwrap();
+        assert!(matches!(derived.run(), SmokeResult::Fail(_)));
+        // An unreadable CA file is an error before the deploy starts.
+        let bad_ca = CasFlags {
+            ca: Some(dir.join("absent-ca.pem")),
+            ..flags(Some("https://127.0.0.1:1"))
+        };
+        assert!(cli::smoke_for(&bad_ca, t, &none).is_err());
+        // The host config's `cas` flows through the flags.
+        let (_, d2) = crate::testkit::host_root("cfg-cas");
+        let conf = d2.join("deploy.json");
         fs::write(&conf, "{\"cas\": \"http://127.0.0.1:1\"}").unwrap();
         fs::set_permissions(&conf, fs::Permissions::from_mode(0o644)).unwrap();
         let commit = "a".repeat(40);
@@ -1327,10 +1365,69 @@ mod cli_tests {
             "--token-file",
             tok.to_str().unwrap(),
             "--lock",
-            dir.join("run/lock").to_str().unwrap(),
+            d2.join("run/lock").to_str().unwrap(),
         ]);
         // Without --apply the run stops at the plan (exit 1: nothing listens at the API).
         assert_eq!(code, 1, "{err}");
+    }
+
+    /// Proves a host whose frontend serves TLS ends a smoke with no flag at all but the CA:
+    /// the address and the certificate's name come from the frontend's config, the
+    /// connection goes to loopback, and the certificate is verified under its own name.
+    /// Catches an https frontend dialled as plain text, a name that is not passed on, and a
+    /// CA file that is not read.
+    #[test]
+    fn a_tls_frontend_is_smoked_from_its_own_config_and_a_ca_file() {
+        use super::super::SmokeResult;
+        use super::super::cli::{CasFlags, FrontendConfig};
+        use super::super::smoke_tests::tls_farm;
+        use std::time::Duration;
+        let farm = tls_farm("farm.example");
+        let (_, dir) = crate::testkit::host_root("cli-tls");
+        let cert = dir.join("reapi.pem");
+        let ca = dir.join("ca.pem");
+        fs::write(&cert, &farm.cert).unwrap();
+        fs::write(&ca, &farm.ca).unwrap();
+        let conf = FrontendConfig {
+            toml: dir.join("kbf.toml"),
+            units: Vec::new(),
+        };
+        fs::write(
+            &conf.toml,
+            format!(
+                "[listener]\nlisten = \"127.0.0.1:{}\"\n[tls]\nreapi-tls-cert = {:?}\n",
+                farm.port,
+                cert.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let t = Duration::from_secs(30);
+        let with_ca = CasFlags {
+            ca: Some(ca),
+            ..CasFlags::default()
+        };
+        let smoke = cli::smoke_for(&with_ca, t, &conf).unwrap();
+        assert_eq!(smoke.run(), SmokeResult::Pass);
+        // The certificate is for farm.example; asking for another name fails.
+        let wrong = CasFlags {
+            server_name: Some("other.example".into()),
+            ..with_ca
+        };
+        let smoke = cli::smoke_for(&wrong, t, &conf).unwrap();
+        assert!(matches!(smoke.run(), SmokeResult::Fail(_)));
+    }
+
+    /// Proves --cas-ca and --cas-server-name, like --cas, cannot be set through sudo.
+    #[test]
+    fn through_sudo_the_cas_tls_flags_are_refused() {
+        let commit = "a".repeat(40);
+        for flag in ["--cas-ca", "--cas-server-name"] {
+            let list = args(&["--commit", &commit, flag, "x"]);
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = cli::main_as(&list, &mut &b""[..], &mut out, &mut err, true);
+            assert_eq!(code, 2, "{flag}");
+            assert!(String::from_utf8(err).unwrap().contains("through sudo"));
+        }
     }
 
     #[test]

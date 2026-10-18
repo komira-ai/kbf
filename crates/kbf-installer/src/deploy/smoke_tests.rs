@@ -25,8 +25,8 @@ use kbf_proto::reapi::{
     GetTreeResponse, RegisterChunkMappingRequest, RegisterChunkMappingResponse, SpliceBlobRequest,
     SpliceBlobResponse, SplitBlobRequest, SplitBlobResponse, UpdateActionResultRequest,
 };
-use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
 use super::smoke::CasSmoke;
@@ -275,11 +275,30 @@ impl ActionCache for Fake {
 /// A running fake: its URL, its state, and the runtime that serves it.
 struct Served {
     url: String,
+    port: u16,
     state: Arc<State>,
     _rt: tokio::runtime::Runtime,
 }
 
+/// A CA, and a server certificate it signed for `name`: (CA PEM, certificate PEM, key PEM).
+pub(super) fn pki(name: &str) -> (String, String, String) {
+    use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+    let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("key")).expect("CA");
+    let key = KeyPair::generate().expect("key");
+    let cert = CertificateParams::new(vec![name.to_owned()])
+        .expect("params")
+        .signed_by(&key, &ca)
+        .expect("sign");
+    (ca.pem(), cert.pem(), key.serialize_pem())
+}
+
 fn serve(knobs: Knobs) -> Served {
+    serve_with(knobs, None)
+}
+
+fn serve_with(knobs: Knobs, tls: Option<ServerTlsConfig>) -> Served {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -295,8 +314,12 @@ fn serve(knobs: Knobs) -> Served {
         TcpIncoming::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind")
     };
     let addr = incoming.local_addr().expect("an address");
+    let mut builder = Server::builder();
+    if let Some(tls) = tls {
+        builder = builder.tls_config(tls).expect("server TLS");
+    }
     rt.spawn(
-        Server::builder()
+        builder
             .add_service(ByteStreamServer::new(fake.clone()))
             .add_service(ContentAddressableStorageServer::new(fake.clone()))
             .add_service(ActionCacheServer::new(fake))
@@ -304,6 +327,7 @@ fn serve(knobs: Knobs) -> Served {
     );
     Served {
         url: format!("http://{addr}"),
+        port: addr.port(),
         state,
         _rt: rt,
     }
@@ -480,13 +504,124 @@ fn nothing_listening_fails() {
     assert!(matches!(smoke(&url, 5).run(), SmokeResult::Fail(_)));
 }
 
-/// Proves the address must be a plain `http://` URL: a bare host:port or `https://` is a
+/// Proves the address must be an `http://` or `https://` URL: a bare host:port is a
 /// usage error at parse time, not a failure at the end of a deploy.
 #[test]
 fn only_an_http_url_is_accepted() {
     let t = Duration::from_secs(1);
     assert!(CasSmoke::new("http://127.0.0.1:8980", t).is_ok());
-    for bad in ["127.0.0.1:8980", "https://127.0.0.1:8980", "http://", ""] {
+    for bad in [
+        "127.0.0.1:8980",
+        "ftp://127.0.0.1:8980",
+        "http://",
+        "https://",
+        "",
+    ] {
         assert!(CasSmoke::new(bad, t).is_err(), "{bad:?}");
     }
+}
+
+// ---- https ---------------------------------------------------------------------------
+
+/// A server over TLS with a certificate for `name` from a new CA; the CA's PEM.
+fn serve_tls(name: &str) -> (Served, Vec<u8>) {
+    let farm = tls_farm(name);
+    (farm.served, farm.ca.into_bytes())
+}
+
+/// A TLS server and the PEM it was made from.
+pub(super) struct TlsFarm {
+    pub(super) port: u16,
+    pub(super) ca: String,
+    pub(super) cert: String,
+    served: Served,
+}
+
+pub(super) fn tls_farm(name: &str) -> TlsFarm {
+    let (ca, cert, key) = pki(name);
+    let tls = ServerTlsConfig::new().identity(Identity::from_pem(cert.clone(), key));
+    let served = serve_with(Knobs::default(), Some(tls));
+    TlsFarm {
+        port: served.port,
+        ca,
+        cert,
+        served,
+    }
+}
+
+/// Dials 127.0.0.1 on the server's port, as the deploy dials the local listener.
+fn tls_smoke(served: &Served, name: Option<&str>, ca: Option<Vec<u8>>) -> SmokeResult {
+    let url = format!("https://127.0.0.1:{}", served.port);
+    smoke(&url, 30)
+        .tls(name.map(str::to_owned), ca)
+        .expect("TLS options")
+        .run()
+}
+
+/// Proves a TLS listener passes when the smoke connects to loopback but verifies the
+/// certificate's own name against the given CA. Catches a smoke with no TLS (https refused
+/// or spoken as plain text), a CA file that is ignored, and a name that is not passed on
+/// (a certificate for a DNS name is not valid for the IP address dialled).
+#[test]
+fn a_tls_listener_passes_under_the_certificates_name_and_ca() {
+    let (served, ca) = serve_tls("farm.example");
+    assert_eq!(
+        tls_smoke(&served, Some("farm.example"), Some(ca)),
+        SmokeResult::Pass
+    );
+}
+
+/// Catches a verification against the wrong name, or none.
+#[test]
+fn a_certificate_for_another_name_fails() {
+    let (served, ca) = serve_tls("farm.example");
+    let result = tls_smoke(&served, Some("other.example"), Some(ca));
+    assert!(matches!(result, SmokeResult::Fail(_)), "{result:?}");
+}
+
+/// Catches a smoke that trusts a certificate no root vouches for.
+#[test]
+fn a_certificate_no_root_vouches_for_fails() {
+    let (served, _) = serve_tls("farm.example");
+    let result = tls_smoke(&served, Some("farm.example"), None);
+    assert!(matches!(result, SmokeResult::Fail(_)), "{result:?}");
+    // Another CA than the server's.
+    let (other, _, _) = pki("farm.example");
+    let result = tls_smoke(&served, Some("farm.example"), Some(other.into_bytes()));
+    assert!(matches!(result, SmokeResult::Fail(_)), "{result:?}");
+}
+
+/// An https URL to a plain-text listener, and an http URL to a TLS one, are failures.
+#[test]
+fn the_scheme_must_match_the_listener() {
+    let plain = serve(Knobs::default());
+    let (_, ca) = (0, pki("farm.example").0.into_bytes());
+    let result = tls_smoke(&plain, Some("farm.example"), Some(ca));
+    assert!(matches!(result, SmokeResult::Fail(_)), "{result:?}");
+    let (served, _) = serve_tls("farm.example");
+    let url = format!("http://127.0.0.1:{}", served.port);
+    assert!(matches!(smoke(&url, 30).run(), SmokeResult::Fail(_)));
+}
+
+/// Proves https is accepted as a URL, and TLS options with a plain URL are a usage error
+/// (the options would be silently unused), as is a CA that holds no certificate.
+#[test]
+fn tls_options_belong_to_an_https_url() {
+    let t = Duration::from_secs(1);
+    assert!(CasSmoke::new("https://127.0.0.1:8980", t).is_ok());
+    let plain = CasSmoke::new("http://127.0.0.1:8980", t).unwrap();
+    assert!(
+        plain
+            .clone()
+            .tls(Some("farm.example".into()), None)
+            .is_err()
+    );
+    assert!(
+        plain
+            .tls(None, Some(pki("a.example").0.into_bytes()))
+            .is_err()
+    );
+    let https = CasSmoke::new("https://127.0.0.1:8980", t).unwrap();
+    assert!(https.clone().tls(None, Some(b"not pem".to_vec())).is_err());
+    assert!(https.tls(Some("farm.example".into()), None).is_ok());
 }
