@@ -251,7 +251,7 @@ fn create_refuses_names_and_prefixes_that_are_no_hosts_or_ids() {
     assert!(list_tokens(&*env.store).expect("list").is_empty());
     make(
         &["Fixed.example", ".farm.test", "203.0.113.1", "localhost"],
-        Some("lab-"),
+        Some("lab9-"),
     )
     .expect("good names and prefix");
 }
