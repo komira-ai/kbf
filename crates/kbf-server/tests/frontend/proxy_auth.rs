@@ -148,3 +148,60 @@ async fn a_frontend_behind_the_proxy_takes_its_identity_and_gates_writes() {
     ];
     assert_eq!(cordon(front.api, &through).await, 404);
 }
+
+/// The status of a REAPI ByteStream read for an absent blob carrying `claims` as headers.
+async fn reapi_read(reapi: SocketAddr, claims: &[(&str, String)]) -> Code {
+    use kbf_proto::google::bytestream::ReadRequest;
+    use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
+    let mut request = tonic::Request::new(ReadRequest {
+        resource_name: format!("blobs/{}/0", "0".repeat(64)),
+        read_offset: 0,
+        read_limit: 0,
+    });
+    for (name, value) in claims {
+        let key = MetadataKey::from_bytes(name.as_bytes()).expect("a key");
+        let value: MetadataValue<_> = value.parse().expect("a value");
+        request.metadata_mut().insert(key, value);
+    }
+    let channel = Endpoint::from_shared(format!("http://{reapi}"))
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    match ByteStreamClient::new(channel).read(request).await {
+        Ok(stream) => stream
+            .into_inner()
+            .message()
+            .await
+            .map_or_else(|s| s.code(), |_| Code::Ok),
+        Err(status) => status.code(),
+    }
+}
+
+/// Catches a frontend whose REAPI listener is built without the proxy's secret: a call
+/// that presents the secret with an identity that is not one well-formed value must be
+/// refused `PERMISSION_DENIED` by the proxy layer before anything else reads it; without
+/// the layer it reaches the storage lookup and answers some other status.
+///
+/// Mutant seen red: the frontend's REAPI listener built with `ProxyAuthLayer::new(None)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontends_reapi_listener_is_behind_the_proxy() {
+    let dir = scratch_dir("proxy-auth-reapi");
+    let secret = private_file(&dir, "proxy-secret", &SECRET);
+    let front = Front::start(
+        &flags(&[
+            "--storage=http://127.0.0.1:1",
+            &format!("--proxy-auth-file={secret}"),
+        ])
+        .expect("flags"),
+    )
+    .await;
+    let claims = [
+        ("x-kbf-proxy-auth", hex::encode(SECRET)),
+        ("x-kbf-role", "admin".to_owned()),
+    ];
+    assert_eq!(
+        reapi_read(front.reapi, &claims).await,
+        Code::PermissionDenied
+    );
+}

@@ -27,9 +27,10 @@
 //! whatever the result (so no handler can read one), and put the [`Trust`] in the request's
 //! extensions. What reads who the caller is takes the [`Trust`] (an [`Identity`] when
 //! proxied) from there, or the certificate when it is not proxied: see
-//! [`crate::identity::presented`], the one function that decides which. Every listener the
-//! server opens has the layer, with or without the flag, so no `x-kbf-*` header ever reaches
-//! a handler.
+//! [`crate::identity::presented`], the one function that decides which. The REAPI, worker
+//! and operator listeners have the layer, with or without the flag, so no `x-kbf-*` header
+//! ever reaches a handler. The in-process storage listener (`serve_service`) does not: it
+//! reads the certificate itself and stays under its own mutual TLS.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -346,12 +347,21 @@ impl Caller {
 }
 
 impl<S: Send + Sync> FromRequestParts<S> for Caller {
-    type Rejection = <ConnectInfo<SocketAddr> as FromRequestParts<S>>::Rejection;
+    type Rejection = Response;
 
+    /// A request that no [`gate_requests`] layer has seen has no [`Trust`]: it is a
+    /// miswired router, and answering 500 keeps it from passing for a direct caller (and so
+    /// past the gate a flagged server relies on).
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let trust = parts.extensions.get::<Trust>().cloned().unwrap_or_default();
+        let Some(trust) = parts.extensions.get::<Trust>().cloned() else {
+            return Err(crate::api::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the request did not pass the proxy gate",
+            ));
+        };
         ConnectInfo::<SocketAddr>::from_request_parts(parts, state)
             .await
             .map(|ConnectInfo(addr)| Self { addr, trust })
+            .map_err(axum::response::IntoResponse::into_response)
     }
 }

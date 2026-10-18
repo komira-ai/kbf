@@ -99,9 +99,24 @@ listener:
   and `Membership`'s role check use them. A `Hello` whose node id is not the proxy's
   `x-kbf-node-id` is refused `PERMISSION_DENIED`. A `Membership` registration
   or heartbeat has no certificate names behind the proxy: the one name is the proxied node
-  id, so the host of its instance id and its address must be exactly that name (an IP
-  address is refused). A `serial` or `spki-sha256` deny entry cannot name a proxied
-  caller, a `node` entry can.
+  id, so the host of its instance id and its address must be that name (up to ASCII case; an IP
+  address is refused). The proxied role must be `storage`. A `serial` or `spki-sha256` deny entry cannot name a proxied
+  caller, a `node` entry can: revoke by node name while behind the proxy, or have the
+  proxy refuse the certificate.
+
+What the flag does not do, and what the proxy must do:
+
+- The storage listener (`kbf storage`, and the in-process one of all-in-one) is not behind
+  the proxy: it keeps its own mutual TLS and its own admission.
+- `--reapi-auth-policy mtls` finds no certificate on a proxied REAPI call and refuses every
+  call; use another policy behind the proxy until the proxy forwards the identity to it.
+- With the flag, `/metrics` and `/healthz` answer a loopback peer only, and a local `curl`
+  write is refused (see above).
+- The server cannot tell the proxy's `x-kbf-node-id` from a client's if the proxy forwards
+  a client's headers: the proxy must remove every client-supplied `x-kbf-*` header before
+  it adds its own. A call from a Unix-socket peer has no address and is refused. The
+  secret file must be owned by the user the server runs as, so the proxy and the server run
+  as one user.
 
 Without the flag, nothing changes: the headers do nothing (they are removed all the same),
 and the gates are the ones in the table.

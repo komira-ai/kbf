@@ -615,13 +615,11 @@ async fn the_http_layer_applies_the_decision() {
     let mut bare = echo(None, false);
     let (code, body) = call(&mut bare, Some(LOOPBACK), &proxied_headers()).await;
     assert_eq!(
-        (code, body.as_str()),
-        (
-            StatusCode::OK,
-            "Direct 127.0.0.1:4000 [x-kbf-node-id,x-kbf-proxy-auth,x-kbf-role]"
-        ),
-        "with no layer the headers are still there: the layer is what removes them"
+        code,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a router with no gate layer must not pass for a direct caller: {body}"
     );
+    assert!(body.contains("proxy gate"), "{body}");
     let (code, _) = call(&mut bare, None, &HeaderMap::new()).await;
     assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
 }

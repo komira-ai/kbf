@@ -80,6 +80,7 @@ type MemoryCache = Cache<MemoryMetaLog, MemoryStore>;
 /// An in-process server behind a proxy: plain-text listeners on loopback, an operator API
 /// with the token, no TLS flag anywhere.
 struct Server_ {
+    reapi: SocketAddr,
     worker: SocketAddr,
     api: SocketAddr,
     _stop: tokio::sync::oneshot::Sender<()>,
@@ -125,9 +126,14 @@ fn start_denying(with_proxy: bool, deny_list: Option<DenyList>) -> Server_ {
         let _ = stopped.await;
     })
     .expect("bind");
-    let (worker, api) = (bound.worker, bound.api.expect("an API address"));
+    let (reapi, worker, api) = (
+        bound.reapi,
+        bound.worker,
+        bound.api.expect("an API address"),
+    );
     tokio::spawn(async move { bound.serving.await.expect("serve") });
     Server_ {
+        reapi,
         worker,
         api,
         _stop: stop,
@@ -266,6 +272,48 @@ async fn a_worker_session_needs_the_proxys_word() {
     no_node.remove(1);
     let refused = session_as(server.worker, "node-a", &no_node).await;
     assert_eq!(refused.expect_err("no node").code(), Code::Unauthenticated);
+}
+
+/// Catches: the REAPI listener built without the proxy's secret: a call presenting the
+/// secret with a role that is not a role is refused `PERMISSION_DENIED` by the layer
+/// before the REAPI service reads it, and one with a well-formed identity is not.
+///
+/// Mutant seen red: the REAPI listener built with `ProxyAuthLayer::new(None)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_reapi_listener_is_behind_the_proxy() {
+    let server = start(true);
+    let channel = channel(server.reapi).await;
+    let read = |claims: Vec<(String, String)>| {
+        let channel = channel.clone();
+        async move {
+            let mut request = tonic::Request::new(ReadRequest {
+                resource_name: format!("blobs/{}/0", "0".repeat(64)),
+                read_offset: 0,
+                read_limit: 0,
+            });
+            for (name, value) in &claims {
+                put(&mut request, name, value);
+            }
+            let mut client = ByteStreamClient::new(channel);
+            match client.read(request).await {
+                Ok(response) => response.into_inner().message().await.map(drop),
+                Err(status) => Err(status),
+            }
+        }
+    };
+    let refused = read(forwarded("node-a", "admin")).await;
+    assert_eq!(
+        refused.expect_err("a malformed role").code(),
+        Code::PermissionDenied
+    );
+    let passed = read(forwarded("node-a", "daemon")).await;
+    assert!(
+        passed.is_ok()
+            || passed
+                .as_ref()
+                .is_err_and(|s| s.code() != Code::PermissionDenied),
+        "{passed:?}"
+    );
 }
 
 /// Catches: `Hello.node_id` not bound to the node the proxy named: a daemon vouched for as

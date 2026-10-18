@@ -246,18 +246,20 @@ pub struct Args {
     /// without a restart. A `node` entry also refuses a storage certificate with that DNS
     /// name. A list that cannot be read after start refuses all of those calls. Needs
     /// mutual TLS, or `--proxy-auth-file` (then only `node` entries can name a caller: the
-    /// proxy forwards a node id, not a certificate).
+    /// proxy forwards a node id, not a certificate, so a `serial` or `spki-sha256` entry
+    /// never matches).
     #[arg(long)]
     pub worker_deny_list: Option<PathBuf>,
     /// A file holding the per-boot secret of the TLS-terminating proxy in front of this
     /// server (`docs/design/frontend-proxy.md`, section 3): exactly 32 bytes, owned by the
     /// server's user with mode 0600 or 0400, read at start. The proxy presents them as 64
-    /// lower-case hex digits in `x-kbf-proxy-auth`. With it, every listener takes calls from
-    /// loopback only, and believes `x-kbf-node-id` and `x-kbf-role` only from a call that
-    /// presents the secret; every other `x-kbf-*` header is dropped. The worker listener then
+    /// lower-case hex digits in `x-kbf-proxy-auth`. With it, the REAPI, worker and operator
+    /// listeners take calls from loopback only, and believe `x-kbf-node-id` and
+    /// `x-kbf-role` only from a call that presents the secret; every other `x-kbf-*` header is dropped. The worker listener then
     /// takes the proxy's identity in place of a client certificate (it needs no TLS flags),
-    /// and the operator API's writes must come through the proxy as well as carry the token.
-    /// Without it, behavior is as before.
+    /// and the operator API's writes must come through the proxy as well as carry the token (a
+    /// local `curl` write is refused). The storage listener is not covered: it keeps its own
+    /// mutual TLS. Without it, behavior is as before.
     #[arg(long, value_name = "PATH")]
     pub proxy_auth_file: Option<PathBuf>,
     /// How often, in seconds, a TLS listener looks at its certificate, key and client CA
