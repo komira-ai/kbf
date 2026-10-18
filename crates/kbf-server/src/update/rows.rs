@@ -41,7 +41,7 @@ const POLICY: &str = "update/policy";
 pub(super) const SLOT: &str = "update/slot";
 const HOSTS: &str = "update/host/";
 /// Reads and writes tried before a call gives up on writers it keeps racing.
-const ATTEMPTS: usize = 16;
+pub(super) const ATTEMPTS: usize = 16;
 
 /// The key of host `id`'s row.
 pub(super) fn host_key(id: &WorkerId) -> String {
@@ -112,7 +112,7 @@ impl<T> Stored<T> {
 /// The update rows of one state store.
 #[derive(Clone)]
 pub struct Rows {
-    store: Arc<dyn Store>,
+    pub(super) store: Arc<dyn Store>,
 }
 
 impl std::fmt::Debug for Rows {
@@ -121,7 +121,7 @@ impl std::fmt::Debug for Rows {
     }
 }
 
-fn read<T>(
+pub(super) fn read<T>(
     key: &str,
     row: &Versioned,
     decode: impl FnOnce(&[u8]) -> Result<T, Corrupt>,

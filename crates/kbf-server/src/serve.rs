@@ -159,6 +159,10 @@ pub struct Api {
     /// The release store (`--releases-dir`), whose upload route is mounted here and whose
     /// `ReleaseService` the worker listener serves. `None`: the update endpoints answer 503.
     pub releases: Option<Arc<crate::release::ReleaseStore>>,
+    /// The installer's directories on this host (`--installer-orders-dir`), where the
+    /// frontend writes the order for its own update. `None`: `POST /v1/update/frontend`
+    /// answers 503.
+    pub installer: Option<Arc<crate::release::frontend_update::Installer>>,
 }
 
 /// Why the server could not start or stopped.
@@ -657,9 +661,16 @@ where
     let reapi_incoming = Incoming::new(reapi_incoming, listeners.reapi_tls);
     let worker_incoming = Incoming::new(worker_incoming, worker_tls);
     let probe_timeout = listeners.store_probe_timeout;
-    let (api_listen, token, local, releases) = api.map_or((None, None, None, None), |api| {
-        (Some(api.listen), api.token, api.local_cache, api.releases)
-    });
+    let (api_listen, token, local, releases, installer) =
+        api.map_or((None, None, None, None, None), |api| {
+            (
+                Some(api.listen),
+                api.token,
+                api.local_cache,
+                api.releases,
+                api.installer,
+            )
+        });
     let api_listener = api_listen.map(bind_api).transpose()?;
     let api = api_listener.as_ref().map(|(_, local)| *local);
     let readiness = Arc::new(Readiness::default());
@@ -684,9 +695,17 @@ where
     .merge(crate::release::router(releases.clone(), token.clone()))
     .merge(crate::release::desired::router(
         releases.clone(),
+        update_rows.clone(),
+        token.clone(),
+        Arc::clone(&farm),
+        installer.clone(),
+    ))
+    .merge(crate::release::frontend_update::router(
+        releases.clone(),
         update_rows,
         token,
         Arc::clone(&farm),
+        installer,
     ))
     .merge(health_routes)
     .merge(crate::metrics::router(

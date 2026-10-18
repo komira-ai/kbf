@@ -73,6 +73,12 @@ Options:
       --releases-dir <DIR>
           The release store (`docs/design/pull-updates.md`, section 6): a directory where the tarballs of a release and their build attestations are kept, uploaded with `PUT /v1/releases/{commit}/{platform}/{name}` on the operator API (which needs the token) and fetched by the nodes through `ReleaseService.Fetch` on the worker listener, behind its mutual TLS. Made if missing. Without it every update endpoint answers 503 saying so
 
+      --installer-orders-dir <DIR>
+          The root installer's order spool on this host: where `POST /v1/update/frontend` writes the order for the frontend's own update, which the installer pulls, verifies and hands over to (`docs/design/pull-updates.md`). Owned by the service user, mode 0700; made if missing. Without it that route answers 503 saying so
+
+      --installer-status-file <FILE>
+          The installer's `status.json`, which the frontend update routes show and read to see an update end. Default: `status.json` in the parent of `--installer-orders-dir`
+
       --invocations-open
           Serves the build pages (`GET /v1/invocations/{id}` and below) and the blob route (`GET /v1/blobs/{digest}`) on the operator API to every caller the REAPI policy accepts, with no `invocations` or `blobs` key in the policy file (`docs/design/invocations.md` section 4.3): it fills in `allow` for whichever of the two keys the file leaves out. Without it, and without the keys, those routes answer 404. Pages and blobs hold build outputs and logs: give it only for a listener that only trusted people reach
 

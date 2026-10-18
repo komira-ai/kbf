@@ -199,6 +199,7 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
         token: None,
         local_cache: None,
         releases: None,
+        installer: None,
     };
     let cache = Arc::new(kbf_front::Cache::memory());
     let bound = bind_server_with_api(cache, listeners, Some(api), pending()).expect("bind");

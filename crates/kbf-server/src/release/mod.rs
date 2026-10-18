@@ -9,6 +9,8 @@
 //! - The service, [`grpc::service`], is `ReleaseService.Fetch`.
 //! - The desired release, [`desired::router`]: `GET /v1/update`, `POST /v1/update/desired`,
 //!   `pause` and `resume`, over the `update/desired` row.
+//! - The frontend's own update, [`frontend_update::router`]: `POST /v1/update/frontend` writes
+//!   a `frontend_update` order into the installer's spool on this host, and `GET` shows it.
 //!
 //! `GET /v1/releases` and `Fetch` carry no authentication of their own: the wiring puts `Fetch`
 //! behind the worker listener's mutual TLS.
@@ -18,6 +20,7 @@
 //! opens a tarball nor checks an attestation.
 
 pub mod desired;
+pub mod frontend_update;
 pub mod grpc;
 pub mod http;
 pub mod key;

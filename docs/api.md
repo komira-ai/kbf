@@ -851,6 +851,33 @@ for the whole of its retries is `503` with `Retry-After: 1`: send it again.
   row, by compare-and-set of that field alone, and answer `{"paused": bool}`. No run is
   needed, and an offer leaves the flag as it is: while set, no host is started.
 
+## `POST /v1/update/frontend` and `GET /v1/update/frontend`
+
+The frontend's own update (`docs/design/pull-updates.md`), kept in the `update/frontend` row.
+`POST` with `{"commit": "<40 lowercase hex>"}` (JSON content type, the write gates, no other
+field) writes a `frontend_update` order record into the root installer's order spool **on the
+frontend's own host** (`--installer-orders-dir`; `--installer-status-file` names the installer's
+`status.json`, by default the one beside the spool's directory). The installer there pulls and
+verifies the release, starts the new instance behind the installed Envoy, waits for `/readyz`
+and hands over. Answers: `503` naming `--state-store`, `--releases-dir` or
+`--installer-orders-dir` when it is missing; `400` for a commit that is not 40 lowercase hex or
+a body with another field; `409` unless the release store holds the commit complete (tarball
+and attestation) for **this host's own platform**; `409` with `"error": "frontend_busy"` while
+an update is in flight; `500` if the record cannot be written (the row is closed again, nothing
+was ordered); else `202 {"order_id", "epoch", "generation", "commit"}`.
+
+- The row is written before the record, by compare-and-set, so one update is in flight at a
+  time. It is closed when the record has left the spool and the installer, in no update of its
+  own, reports the commit installed, or `reverted` or `refused`; and after 3600 s whatever the
+  installer says, so a dead installer cannot hold the route for ever. The generation is the
+  last update's plus one: a rollback is an older commit under a higher generation.
+- `GET /v1/update/frontend` is open and read-only: `{"enabled": true, "row": null | {"order_id",
+  "epoch", "generation", "commit", "state": "open" | "closed", "written_at_ms",
+  "record_in_spool"}, "installer": {"present": bool, "state", "installed_commit",
+  "previous_commit", "staged_commit", "refusal"}}`. It is `503` without the state store or the
+  installer's spool. `GET /v1/update` carries the same in its `frontend` section (with
+  `"enabled": false` when the server has no installer spool).
+
 ## `UNAVAILABLE` from a storage node that is catching up
 
 Also gRPC, not HTTP. A storage node that is rebuilding its index (it registered with

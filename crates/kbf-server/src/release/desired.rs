@@ -3,7 +3,9 @@
 //! /v1/update/pause` and `POST /v1/update/resume`.
 //!
 //! - `GET /v1/update` is open like `GET /v1/nodes`: the desired release (`null` before any),
-//!   and the commits the release store holds with whether each platform is complete.
+//!   and the commits the release store holds with whether each platform is complete, and the
+//!   `frontend` section (the row of the frontend's own update and the installer's status, see
+//!   [`super::frontend_update`]).
 //! - `POST /v1/update/desired {"commit": "<40 hex>"}` offers the commit: the store must hold
 //!   it complete (tarball and attestation) for at least one platform, else `409` naming
 //!   what is missing. The row's generation moves only when the commit differs from the
@@ -38,6 +40,7 @@ use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::json;
 
+use super::frontend_update::Installer;
 use super::key::Commit;
 use super::store::ReleaseStore;
 use crate::api::{error, json, operator_gate};
@@ -50,6 +53,8 @@ struct Update {
     rows: Option<Rows>,
     token: Option<ApiToken>,
     farm: Arc<Farm>,
+    /// For the frontend section of `GET /v1/update` only (the writes are `frontend_update`'s).
+    installer: Option<Arc<Installer>>,
 }
 
 /// The routes. `store` and `rows` are each `None` when the server has none: the routes then
@@ -59,6 +64,7 @@ pub fn router(
     rows: Option<Rows>,
     token: Option<ApiToken>,
     farm: Arc<Farm>,
+    installer: Option<Arc<Installer>>,
 ) -> Router {
     Router::new()
         .route("/v1/update", get(view))
@@ -70,17 +76,18 @@ pub fn router(
             rows,
             token,
             farm,
+            installer,
         }))
 }
 
-fn unavailable(what: &str, flag: &str) -> Response {
+pub(super) fn unavailable(what: &str, flag: &str) -> Response {
     error(
         StatusCode::SERVICE_UNAVAILABLE,
         &format!("{what} is off: the server was started without {flag}"),
     )
 }
 
-fn row_failed(e: &RowError) -> Response {
+pub(super) fn row_failed(e: &RowError) -> Response {
     if matches!(e, RowError::Contended(_)) {
         tracing::warn!("update rows: {e}");
         let mut busy = error(
@@ -130,7 +137,7 @@ fn policy_view(p: &Policy) -> serde_json::Value {
 
 /// Runs a blocking call on the store (the rows block on it). A call that panics fails the
 /// request as a store error does.
-async fn blocking<T: Send + 'static>(
+pub(super) async fn blocking<T: Send + 'static>(
     call: impl FnOnce() -> Result<T, RowError> + Send + 'static,
 ) -> Result<T, RowError> {
     let joined = tokio::task::spawn_blocking(call).await;
@@ -149,6 +156,7 @@ async fn view(State(update): State<Arc<Update>>) -> Response {
         return unavailable("the release store", "--releases-dir");
     };
     let policy_rows = rows.clone();
+    let frontend_rows = rows.clone();
     let desired = match blocking(move || rows.desired()).await {
         Ok(stored) => stored.value,
         Err(e) => return row_failed(&e),
@@ -159,6 +167,11 @@ async fn view(State(update): State<Arc<Update>>) -> Response {
     };
     // Without a policy row nothing is paused (the defaults).
     let paused = policy.as_ref().is_some_and(|p| p.paused);
+    let frontend = match super::frontend_update::section(frontend_rows, update.installer.clone()).await
+    {
+        Ok(section) => section,
+        Err(e) => return row_failed(&e),
+    };
     let releases = match store.list().await {
         Ok(listing) => super::http::listing_view(&listing),
         Err(e) => {
@@ -175,6 +188,7 @@ async fn view(State(update): State<Arc<Update>>) -> Response {
             "desired": desired_view(desired.as_ref()),
             "paused": paused,
             "policy": policy.as_ref().map_or(serde_json::Value::Null, policy_view),
+            "frontend": frontend,
             "releases": releases,
         }),
     )
@@ -189,13 +203,13 @@ struct Offer {
 }
 
 /// The gates of a write, then the JSON content type for a body.
-fn write_gate(
-    update: &Update,
+pub(super) fn write_gate(
+    token: Option<&ApiToken>,
     peer: SocketAddr,
     headers: &HeaderMap,
     wants_json: bool,
 ) -> Result<(), (StatusCode, String)> {
-    operator_gate(update.token.as_ref(), peer, headers)?;
+    operator_gate(token, peer, headers)?;
     let json = headers.get(CONTENT_TYPE).map(|v| v.as_bytes());
     if wants_json && json != Some(b"application/json") {
         return Err((
@@ -212,7 +226,7 @@ async fn set_desired(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err((code, why)) = write_gate(&update, peer, &headers, true) {
+    if let Err((code, why)) = write_gate(update.token.as_ref(), peer, &headers, true) {
         return error(code, &why);
     }
     let Some(rows) = update.rows.clone() else {
@@ -290,7 +304,7 @@ async fn paused(
     headers: HeaderMap,
     paused: bool,
 ) -> Response {
-    if let Err((code, why)) = write_gate(&update, peer, &headers, false) {
+    if let Err((code, why)) = write_gate(update.token.as_ref(), peer, &headers, false) {
         return error(code, &why);
     }
     let Some(rows) = update.rows.clone() else {

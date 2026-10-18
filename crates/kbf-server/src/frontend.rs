@@ -120,6 +120,8 @@ pub const ALLOWED: &[&str] = &[
     "api_listen",
     "api_token_file",
     "releases_dir",
+    "installer_orders_dir",
+    "installer_status_file",
     "readyz_store_timeout_ms",
     "worker_tls_cert",
     "worker_tls_key",
@@ -806,7 +808,9 @@ impl<'a> Prepared<'a> {
         let (worker_incoming, worker_latch) = worker.grpc(worker_tls)?;
         worker_stop.closes(worker_latch);
         let api_listener = api_socket.map(Socket::http).transpose()?;
-        let (token, releases) = api.map_or((None, None), |api| (api.token, api.releases));
+        let (token, releases, installer) = api.map_or((None, None, None), |api| {
+            (api.token, api.releases, api.installer)
+        });
         let api_routes = crate::api::router(
             Arc::clone(&farm),
             token.clone(),
@@ -817,8 +821,16 @@ impl<'a> Prepared<'a> {
         .merge(crate::release::desired::router(
             releases.clone(),
             state_store.clone().map(crate::update::Rows::new),
+            token.clone(),
+            Arc::clone(&farm),
+            installer.clone(),
+        ))
+        .merge(crate::release::frontend_update::router(
+            releases.clone(),
+            state_store.clone().map(crate::update::Rows::new),
             token,
             Arc::clone(&farm),
+            installer,
         ))
         .merge(crate::health::router_of(Arc::clone(&checks)))
         .merge(metrics_route(

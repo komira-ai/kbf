@@ -206,6 +206,16 @@ pub struct Args {
     /// answers 503 saying so.
     #[arg(long, value_name = "DIR", requires = "api_listen")]
     pub releases_dir: Option<PathBuf>,
+    /// The root installer's order spool on this host: where `POST /v1/update/frontend` writes
+    /// the order for the frontend's own update, which the installer pulls, verifies and hands
+    /// over to (`docs/design/pull-updates.md`). Owned by the service user, mode 0700; made if
+    /// missing. Without it that route answers 503 saying so.
+    #[arg(long, value_name = "DIR", requires = "api_listen")]
+    pub installer_orders_dir: Option<PathBuf>,
+    /// The installer's `status.json`, which the frontend update routes show and read to see
+    /// an update end. Default: `status.json` in the parent of `--installer-orders-dir`.
+    #[arg(long, value_name = "FILE", requires = "installer_orders_dir")]
+    pub installer_status_file: Option<PathBuf>,
     /// Serves the build pages (`GET /v1/invocations/{id}` and below) and the blob route
     /// (`GET /v1/blobs/{digest}`) on the operator API to every caller the REAPI policy
     /// accepts, with no `invocations` or `blobs` key in the policy file
@@ -488,6 +498,12 @@ pub enum ConfigError {
     /// The operator API token file is refused.
     #[error("--api-token-file: {0}")]
     ApiToken(#[from] TokenFileError),
+    /// The installer's order spool cannot be made.
+    #[error("--installer-orders-dir {dir}: {source}", dir = dir.display())]
+    Installer {
+        dir: PathBuf,
+        source: std::io::Error,
+    },
     /// The release store's directory cannot be made.
     #[error("--releases-dir {dir}: {source}", dir = dir.display())]
     Releases {
@@ -748,11 +764,27 @@ impl Args {
                 source,
             })?
             .map(Arc::new);
+        let installer = self
+            .installer_orders_dir
+            .as_deref()
+            .map(|dir| {
+                crate::release::frontend_update::Installer::open(
+                    dir,
+                    self.installer_status_file.as_deref(),
+                )
+            })
+            .transpose()
+            .map_err(|source| ConfigError::Installer {
+                dir: self.installer_orders_dir.clone().unwrap_or_default(),
+                source,
+            })?
+            .map(Arc::new);
         Ok(Some(Api {
             listen,
             token,
             local_cache,
             releases,
+            installer,
         }))
     }
 

@@ -42,6 +42,7 @@ mod codec;
 mod command;
 mod controller;
 mod facts;
+mod frontend_row;
 mod gate;
 mod moves;
 mod node_step;
@@ -54,6 +55,7 @@ mod slot;
 mod steps;
 
 pub use codec::{Desired, HostRow};
+pub use frontend_row::{Began, FrontendRow, FrontendState};
 pub use command::{Alert, Command, GiveBack, HoldReason, Severity, SlotOp};
 pub use controller::Controller;
 pub use facts::{
