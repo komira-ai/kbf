@@ -23,6 +23,7 @@
 
 mod cache;
 mod cross;
+mod logs;
 mod query;
 mod restore;
 mod run;
@@ -33,10 +34,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use axum::response::Response;
+use futures::future::BoxFuture;
 use kbf_auth::{AuthenticationMetadata, authorize};
 use kbf_history::records::{HitRecord, RunRecord};
 use kbf_history::{Allow, ChunkCursor, InvKey, InvocationView, MAX_PAGE_CHUNKS, ReadError};
 use kbf_invocation::{Invocation, Restored, WallTime};
+use kbf_objstore::ObjectStore;
+use kbf_types::Digest;
 
 use self::cache::{Cache, stamp_of};
 use crate::history::HistoryReads;
@@ -46,6 +50,23 @@ use crate::http_invocations::{CALL, InvocationReaders, bad_answer};
 
 pub(crate) use cross::router as cross_router;
 pub(crate) use run::router as run_router;
+
+/// Which blobs the cache holds, with the cache's type erased: a run's links to its logs
+/// are to the blob while it is held.
+pub(crate) trait Presence: Send + Sync {
+    /// Whether each of `digests` is held, in order; `None` when the cache cannot say.
+    fn present<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Option<Vec<bool>>>;
+}
+
+impl<M, O> Presence for kbf_front::Cache<M, O>
+where
+    M: kbf_front::MetaLog,
+    O: ObjectStore + 'static,
+{
+    fn present<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Option<Vec<bool>>> {
+        Box::pin(async move { kbf_front::Cache::present(self, digests).await.ok() })
+    }
+}
 
 /// Restored records are held within this many bytes (the 64 MiB of
 /// [`Invocation::bytes`]), least recently used out first.
@@ -234,7 +255,7 @@ impl Durable {
 
 /// The `503` of a read history could not make: the stores failed or hold what is not
 /// history. The cause is logged, not sent.
-fn unreadable(e: ReadError) -> Response {
+pub(super) fn unreadable(e: ReadError) -> Response {
     tracing::warn!(error = %e, "build history could not be read");
     error(
         axum::http::StatusCode::SERVICE_UNAVAILABLE,

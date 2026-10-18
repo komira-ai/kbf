@@ -60,6 +60,52 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 pub use data_dir::DEFAULT_DATA_DIR;
 pub use run::run;
 
+/// What the daemon's flags ask of its host, for a check before it starts (`kbf`'s
+/// startup self-checks read it): the files it reads and the programs it runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostNeeds {
+    /// `--ca-cert`.
+    pub ca_cert: PathBuf,
+    /// `--cert`.
+    pub cert: PathBuf,
+    /// `--key`.
+    pub key: PathBuf,
+    /// `--node-id`: the one name the certificate must carry.
+    pub node_id: String,
+    /// `--data-dir`, as the daemon resolves it.
+    pub data_dir: PathBuf,
+    /// Set when the container driver runs: what it needs.
+    pub container: Option<ContainerNeeds>,
+}
+
+/// What the container driver asks of its host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainerNeeds {
+    /// `--oci-runtime`: the program that runs the containers.
+    pub oci_runtime: PathBuf,
+}
+
+impl Cli {
+    /// What these flags ask of the host.
+    #[must_use]
+    pub fn host_needs(&self) -> HostNeeds {
+        let container = self
+            .drivers
+            .contains(&Driver::Container)
+            .then(|| ContainerNeeds {
+                oci_runtime: self.oci_runtime.clone(),
+            });
+        HostNeeds {
+            ca_cert: self.daemon.ca_cert.clone(),
+            cert: self.daemon.cert.clone(),
+            key: self.daemon.key.clone(),
+            node_id: self.daemon.node_id.clone(),
+            data_dir: self.data_dir(),
+            container,
+        }
+    }
+}
+
 /// The `kbf-daemon` command line.
 #[derive(Clone, Debug, clap::Parser)]
 #[command(name = "kbf-daemon", version = DAEMON_VERSION, about = "The kbf worker daemon.")]
@@ -269,11 +315,11 @@ enum Driver {
 /// What stops the daemon from starting.
 pub type Error = Box<dyn std::error::Error>;
 
-/// The daemon's exit status when an `--image` cannot run on this node.
-const IMAGE_UNUSABLE: u8 = 2;
+/// The daemon's exit status when the host refuses the start ([`exit_code`]).
+const REFUSED: u8 = 2;
 
 /// An `--image` this node cannot run: missing from the image store, an index, or not
-/// an image by digest. The daemon exits with [`IMAGE_UNUSABLE`].
+/// an image by digest. The daemon exits with [`REFUSED`].
 #[derive(Debug)]
 pub struct ImageUnusable(String);
 
@@ -288,11 +334,37 @@ impl std::error::Error for ImageUnusable {}
 /// The exit status for an error that stopped the daemon from starting.
 #[must_use]
 pub fn exit_code(e: &Error) -> ExitCode {
-    if e.is::<ImageUnusable>() {
-        ExitCode::from(IMAGE_UNUSABLE)
+    if refused(e) {
+        ExitCode::from(REFUSED)
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// A start the host refuses that no driver's error type names: the daemon's own cgroup
+/// cannot be read.
+#[derive(Debug)]
+struct HostRefused(String);
+
+impl std::fmt::Display for HostRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HostRefused {}
+
+/// Whether `e` is a start the host refuses, which a restart would not change: an image
+/// that cannot be used ([`ImageUnusable`]), a daemon user without subordinate ids, a
+/// cgroup that is not delegated, or a container runtime that is missing. The units carry
+/// `RestartPreventExitStatus=2`, so systemd leaves such a daemon down for its operator
+/// instead of restarting it every `RestartSec` forever.
+fn refused(e: &Error) -> bool {
+    e.is::<ImageUnusable>()
+        || e.is::<HostRefused>()
+        || e.is::<kbf_driver_container::SubidError>()
+        || e.is::<kbf_driver_container::DelegateError>()
+        || e.is::<kbf_driver_container::OciError>()
 }
 
 /// Runs the helper this process was started as, if it was: each run's keeper, the
@@ -893,8 +965,9 @@ mod container {
                 parent.clone()
             }
             None => {
-                let own = std::fs::read_to_string(&cli.self_cgroup)
-                    .map_err(|e| format!("read {}: {e}", cli.self_cgroup.display()))?;
+                let own = std::fs::read_to_string(&cli.self_cgroup).map_err(|e| {
+                    super::HostRefused(format!("read {}: {e}", cli.self_cgroup.display()))
+                })?;
                 let memory_min = cli.supervisor_memory_min_mib.saturating_mul(1 << 20);
                 let delegation =
                     kbf_driver_container::delegate(mount, &own, memory_min, memory_max)?;
@@ -1027,6 +1100,8 @@ mod whole_machine;
 
 #[cfg(test)]
 mod deploy_doc_tests;
+#[cfg(test)]
+mod exit_tests;
 #[cfg(test)]
 mod instance_tests;
 #[cfg(test)]

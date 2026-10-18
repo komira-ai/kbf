@@ -140,6 +140,16 @@ pub struct PeerNames {
 }
 
 impl PeerNames {
+    /// Every name as written: the DNS names, then the IP addresses.
+    #[must_use]
+    pub fn all(&self) -> Vec<String> {
+        self.dns
+            .iter()
+            .cloned()
+            .chain(self.ips.iter().map(ToString::to_string))
+            .collect()
+    }
+
     /// The DNS names as written, in the order the certificate lists them.
     #[must_use]
     pub fn dns(&self) -> &[String] {

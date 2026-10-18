@@ -81,14 +81,42 @@ The only verbs it runs are `show` and `start`: it never stops, restarts or kills
 
 **Buck2 builds in flight (open `Execute` and `WaitExecution` streams).** They stay open and
 are not told to go away: no GOAWAY is sent in an update, and Envoy keeps the connection. The
-old frontend answers each from the `done/` row the new one writes when the action finishes, so
-Buck2 receives the result of its action as it would have from one process. While the action
-is leased the stream shows it executing; while it is queued it shows what it showed. If the
-store has no trace of an operation (neither a `done/`, an `op/` nor a queue row) for three
-looks in a row, which is the new frontend having lost it, the stream ends UNAVAILABLE and
-`kbf_frontend_relay_lost_total` counts it: a stream is never left waiting for ever. Buck2
-does not recover a stream that breaks, so that count is the number of builds that failed
-because of a handover; it is zero unless the new frontend died between two writes.
+old frontend relays each until it closes, with no timeout: it answers from the `done/` row the
+new one writes when the action finishes, or from the new one's own stream, so Buck2 receives
+the result of its action as it would have from one process. While the action is leased the
+stream shows it executing; while it is queued it shows what it showed. A stream ends only when
+its operation finishes (its result or refusal is in a `done/` row, or the new frontend's
+stream sent the final response), when the client cancels it, or when the old process stops
+(a kill, which is not a timeout; the crash matrix covers it). No count of looks and no timer
+ends one, and the old frontend never answers UNAVAILABLE for an operation it cannot see. A
+read of the rows that fails is logged once and tried again at the next look.
+
+Can the store have no trace of an operation the old frontend accepted? A queued operation is
+an `op/` row and a `queue/` row written before the call is queued (a call refused before that
+is refused at open, UNAVAILABLE, and is never followed); a leased one keeps its `op/` row; a
+successor that starts cold, with the epoch raised, reruns the leases of the old epoch from
+those same rows, so the operation is queued again, not gone. The writer ends an operation in
+two transactions: the first deletes its `op/` row, the second writes its `done/` row, kept for
+at least `DONE_FLOOR` (600 s) of the store's clock from the write. A look between them finds
+nothing, and the next finds the result. Because every look reads `done/` first and the
+follower looks every second, a row is read within a second of being written and expires
+unread only if the old frontend could not read the store for ten minutes. The one durable gap
+is a successor killed between the two transactions: the result is then in no row. The old
+frontend does not end that stream on a timer either. After two looks in a row with no trace
+it logs a WARN naming the operation and raises `kbf_frontend_relay_untraced`, and the stream
+stays open; it ends when the client cancels (Buck2 does on its own timeouts, interrupts and
+exit; an Envoy or connection drop cancels it too) or the operator stops the old instance. A
+cancelled stream no longer counts as a waiting caller, so the old process can exit once the
+rest have ended. `kbf_frontend_relay_untraced` is 0 unless that gap happened: it replaces
+`kbf_frontend_relay_lost_total`, which counted builds ended by the old three-look rule.
+
+`WaitExecution`, which Buck2 never calls but other clients may, follows the same rule: a
+stream opened before the handover is answered from the same channel as the `Execute` it
+names, and one that reaches the old frontend after the handover is relayed to the new one and,
+if that stream breaks, followed from the rows, with no timeout. If a relayed stream breaks
+before the old frontend can name its operation in the store (the successor's operation name
+does not carry the id; the old frontend finds it by the action's `op/` row), it ends with the
+status the stream broke with, as before: there is nothing to follow.
 
 **New Buck2 calls.** Envoy sends them to the old frontend until it sees the new one healthy
 and the old one goes not ready. A call that reaches the old one after it has handed over is

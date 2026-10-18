@@ -5,7 +5,7 @@
 //! action as a plain process, so the OCI backend's steps can be tested on any machine.
 //! Real `crun` behaviour is tested in `tests/oci_crun.rs`.
 //!
-//! It answers three verbs, after the global options `--root`, `--log`, `--log-format`:
+//! It answers `--version` (the version of crun 1.14.1) and three verbs, after the global options `--root`, `--log`, `--log-format`:
 //! - `run --bundle <dir> <id>`: an action (the config has a pid namespace) or a
 //!   helper container (it has a user and a mount namespace only). The exit status is the action's (`128 + n` for
 //!   a signal), as `crun run`'s is. A helper gives directories to an owner, removes the
@@ -80,6 +80,11 @@ fn main() -> ExitCode {
     let link = PathBuf::from(args.next().unwrap_or_default());
     let args: Vec<Vec<u8>> = args.map(OsString::into_vec).collect();
     let here = link.parent().unwrap_or(Path::new(".")).to_owned();
+    // What `kbf`'s start-up self-check runs to learn the runtime's version.
+    if args == [b"--version".to_vec()] {
+        println!("crun version 1.14.1\ncommit: fake");
+        return ExitCode::SUCCESS;
+    }
     let fake = Fake {
         state: here.join("crun-state"),
         cgroot: here.join("cgroup"),
