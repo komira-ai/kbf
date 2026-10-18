@@ -137,12 +137,18 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    # The Envoy release the envoy kit's image runs (templates/envoy/config.example),
-    # for Envoy's own validation of the kit's render. The sha256 is the release's
-    # checksums.txt.asc entry.
+    # The Envoy release the real-Envoy tests run (CI only: kbf releases pin and fetch no Envoy;
+    # Envoy is a prerequisite checked against crates/kbf-installer/src/envoy/version.rs) and
+    # the installer's box render is held to, for Envoy's own validation of both renders
+    # and the real-Envoy tests of the box. The sha256 is the release's checksums.txt.asc
+    # entry.
     env:
       ENVOY_VERSION: 1.39.3
       ENVOY_SHA256: f61653fb5f7645129d3092a82f21ce3e6f70d0a75fe2e861b0e7417790f2c200
+      # The GitHub CLI release a host pins to check a release's build attestation offline
+      # (crates/kbf-installer/tests/real_gh.rs); the sha256 is the release's checksums file.
+      GH_VERSION: 2.102.0
+      GH_SHA256: bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -172,6 +178,29 @@ jobs:
         run: cargo test -p kbf-deploy --test envoy_validate --locked -- --ignored
         env:
           KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
+      # Envoy accepts the installer's box render and refuses a control with an unknown
+      # field (crates/kbf-it/tests/envoy_validate.rs).
+      - name: Envoy validates the installer's box render
+        run: cargo test -p kbf-it --test envoy_validate --locked -- --ignored
+        env:
+          KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
+      # The installer's box render run by the pinned Envoy in front of two stub instances:
+      # long silent streams, an instance turning not ready, the ceiling of open streams and
+      # a hot restart, each with a control that plants the defect and sees it
+      # (crates/kbf-it/tests/envoy_box). About half a minute.
+      - name: Envoy runs the installer's box render (long streams, health, ceiling, hot restart)
+        run: cargo test -p kbf-it --test envoy_box --locked -- --ignored
+        env:
+          KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
+      # The pinned gh accepts a real build attestation offline and refuses a subject
+      # changed by one byte (crates/kbf-installer/tests/real_gh.rs). The last test of the
+      # run fails unless the four before it ran, so the step cannot pass on zero.
+      - name: Fetch gh (pinned release, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_amd64.tar.gz" --sha256 "$GH_SHA256" --out "$RUNNER_TEMP/tools/gh" --extract tar.gz --member "gh_${GH_VERSION}_linux_amd64/bin/gh"
+      - name: The pinned gh verifies a real attestation offline
+        run: cargo test -p kbf-installer --test real_gh --locked -- --ignored --test-threads=1
+        env:
+          KBF_TEST_GH: ${{ runner.temp }}/tools/gh
       # A measurement: what an action-cache hit costs over a file store against the
       # memory store, by stored objects per hit (crates/kbf-front/tests/measure_hit.rs).
       # The numbers are in the log and gate nothing (runners are noisy: read the
@@ -408,6 +437,10 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      # The darwin-arm64 build of the GitHub CLI a Mac pins (see test-x86).
+      GH_VERSION: 2.102.0
+      GH_SHA256: da922c20d1792e5b2cbf375593d7a658acf034c12c84e007e71c76ef959c337e
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -447,6 +480,16 @@ jobs:
       # sign-darwin` signs it (crates/kbf-mac-session/tests/as_root.rs;
       # docs/design/fleet-updates-security.md S4.2, S4.3, S10).
       - run: cargo test -p kbf-mac-session --locked
+      # The host installer's layout, offline attestation check and stage, compiled and run
+      # on the platform they name, and the pinned gh for darwin-arm64 against a real
+      # attestation (crates/kbf-installer, docs/deploy/host-releases.md).
+      - run: cargo test -p kbf-installer --locked
+      - name: Fetch gh (pinned release, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_macOS_arm64.zip" --sha256 "$GH_SHA256" --out "$RUNNER_TEMP/tools/gh" --extract zip --member "gh_${GH_VERSION}_macOS_arm64/bin/gh"
+      - name: The pinned gh verifies a real attestation offline
+        run: cargo test -p kbf-installer --test real_gh --locked -- --ignored --test-threads=1
+        env:
+          KBF_TEST_GH: ${{ runner.temp }}/tools/gh
       - run: cargo xtask sudo-test -p kbf-mac-session --test as_root -- --test-threads=1 --nocapture
       # The native driver's lease-user pool as root, with throwaway users from uid 690:
       # actions as pool users through `launchctl asuser`, the kill by uid, the keeper's,
