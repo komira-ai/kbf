@@ -32,13 +32,16 @@ pub fn ensure(
     now: i64,
     entropy: &mut dyn Entropy,
 ) -> Result<(Authority, Started), SignerError> {
-    let names: Vec<_> = match fs::read_dir(dir) {
-        Ok(entries) => entries
-            .map(|e| e.map(|e| e.file_name()))
-            .collect::<Result<_, _>>()?,
-        Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(e.into()),
+    // A failure reading any one entry takes the same refusal as a failure to open the
+    // directory (one `?`, the Io error): an entry that could not be read is never
+    // dropped, because a dropped entry could make a populated directory look empty and
+    // `init_dir` would then be asked to write into it.
+    let listing: std::io::Result<Vec<_>> = match fs::read_dir(dir) {
+        Ok(entries) => entries.map(|e| e.map(|e| e.file_name())).collect(),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
     };
+    let names = listing?;
     if names.is_empty() {
         return Ok((
             Authority::init_dir(dir, policy, now, entropy)?,

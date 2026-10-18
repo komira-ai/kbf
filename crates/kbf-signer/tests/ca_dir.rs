@@ -84,3 +84,45 @@ fn a_half_or_foreign_directory_is_refused_and_nothing_is_written() {
         Err(SignerError::Io(_))
     ));
 }
+
+// Catches: a two-file directory that is not exactly ca.key + ca.pem being loaded or
+// completed (key missing; cert missing), and a lone foreign file being taken for a CA
+// state with advice about ca.key. Nothing may be written in any of them.
+#[test]
+fn two_files_that_are_not_a_ca_and_one_foreign_file_are_refused_untouched() {
+    for (name, files, listed) in [
+        ("ensure_nokey", ["ca.pem", "notes.txt"], "holds ca.pem, notes.txt:"),
+        ("ensure_nocert", ["ca.key", "notes.txt"], "holds ca.key, notes.txt:"),
+    ] {
+        let dir = scratch(name).join("ca");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        for f in files {
+            std::fs::write(dir.join(f), b"x").expect("write");
+        }
+        let err = ensure(&dir, Policy::default(), NOW, &mut Stream(7)).expect_err(name);
+        assert!(matches!(err, SignerError::CaDirState { .. }), "{err}");
+        assert!(err.to_string().contains(listed), "{err}");
+        let mut now: Vec<_> = std::fs::read_dir(&dir)
+            .expect("ls")
+            .map(|e| e.expect("e").file_name().to_string_lossy().into_owned())
+            .collect();
+        now.sort();
+        assert_eq!(now, files, "{name}: nothing written");
+        for f in files {
+            assert_eq!(std::fs::read(dir.join(f)).expect("r"), b"x");
+        }
+    }
+
+    let dir = scratch("ensure_lone").join("ca");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("notes.txt"), b"x").expect("write");
+    let err = ensure(&dir, Policy::default(), NOW, &mut Stream(8)).expect_err("lone");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "the CA directory {} holds notes.txt: it must be empty or exactly ca.key and \
+             ca.pem; move the other files out",
+            dir.display()
+        )
+    );
+}
