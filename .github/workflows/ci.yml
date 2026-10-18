@@ -474,6 +474,53 @@ jobs:
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
+  # kbf-installer on a Mac as a user gets it (contract docs/design/kbf-installer.md section
+  # 7): the `.pkg` built by `cargo xtask pkg build` (a stub stands in for the binary until
+  # kbf-installer builds), opened by pkgutil and lsbom, installed by Installer and checked
+  # file by file and owner by owner (a root-owned /usr/local/kbf-installer tree, a 0700
+  # /var/db/kbf-installer); its LaunchDaemon not loaded and not running without
+  # /usr/local/etc/kbf/installer.toml, running with it; `check` refusing a user-owned prefix
+  # (skipped, and said so, while the binary is the stub); the Homebrew cask installing the
+  # package and its uninstall removing the package's files
+  # (crates/xtask/tests/pkg_macos.rs). Run on the same terms as native-macos: a pull
+  # request into feature/arch-v2 needs the label `macos`.
+  pkg-macos:
+    if: ${{ github.event_name != 'pull_request' || github.base_ref != 'feature/arch-v2' || contains(github.event.pull_request.labels.*.name, 'macos') }}
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      # The oldest macOS the binaries support (the test signs with `--minos 14.0`).
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      - run: sw_vers
+      - run: brew --version
+      # The package as root through Installer, then the cask as this user.
+      - run: cargo xtask sudo-test -p xtask --test pkg_macos -- installer
+      - run: cargo test -p xtask --test pkg_macos --locked -- --ignored homebrew
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
   # The container driver against real rootless Podman, each test binary inside a
   # Delegate=yes system unit (crates/xtask/src/podman_tests.rs; the T4 spike found both
   # arches carry it). The same tests show as ignored, with their reason, in the plain

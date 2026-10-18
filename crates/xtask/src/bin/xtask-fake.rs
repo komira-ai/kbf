@@ -16,6 +16,11 @@
 //! - Run as `kbf`, it prints `kbf 0.1.0+<stamp>` for `--version`, with the stamp from the
 //!   file `kbf.stamp` next to it, and for `--version --json` the contents of the file
 //!   `kbf.json` next to it (the identity a test wrote for it, to plant a bad one).
+//! - Run as `kbf-installer`, it is the STUB of the real kbf-installer, which the package
+//!   build and its macOS install test ship until the real tool is built there (one path
+//!   change in `crates/xtask/tests/pkg_macos.rs`): it prints `kbf-installer-stub` and
+//!   its arguments on stdout and on stderr, and exits 0, so `--version` passes the
+//!   signing check and a job that runs it leaves its arguments in its log.
 //! - Run as `gh attestation verify <file> <flags>`, it appends its arguments as one line
 //!   to `gh-args` next to it, and verifies the file when `attested` next to it holds
 //!   the line `<SHA-256 of the file> <flags>`: the store of attestations, each the file
@@ -88,6 +93,14 @@ fn kbf(argv0: &str, args: &[String]) -> ExitCode {
         let stamp = std::fs::read_to_string(format!("{argv0}.stamp")).expect("stamp file");
         println!("kbf 0.1.0+{stamp}");
     }
+    ExitCode::SUCCESS
+}
+
+/// `kbf-installer`, the stand-in: its arguments, once on each output.
+fn installer_stub(args: &[String]) -> ExitCode {
+    let line = format!("kbf-installer-stub {}", args.join(" "));
+    println!("{line}");
+    eprintln!("{line}");
     ExitCode::SUCCESS
 }
 
@@ -331,6 +344,8 @@ fn main() -> ExitCode {
         server(&argv0)
     } else if argv0.ends_with("/kbf") {
         kbf(&argv0, &rest)
+    } else if argv0.ends_with("/kbf-installer") {
+        installer_stub(&rest)
     } else if argv0.ends_with("/gh") {
         gh(&argv0, &rest)
     } else if argv0.ends_with("/sudo") {
