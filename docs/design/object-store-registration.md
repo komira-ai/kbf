@@ -77,9 +77,12 @@ Related: [operator-verbs.md](operator-verbs.md) (every operator verb and its rou
   `Content-Type: application/json` **[F: `docs/api.md` "Who may write",
   `crates/kbf-server/src/api.rs`, `gate`]**. The enrollment routes apply all of it to a GET
   too, answer `Cache-Control: no-store`, answer 404 when the feature is off and 409 on a
-  fenced frontend **[F: `crates/kbf-server/src/enroll/api.rs`]**. This ADR copies that shape.
-- **A reverse proxy on the host makes every caller loopback** **[F: `docs/api.md`, "Through a
-  reverse proxy"]**. Remote operators reach the API that way today.
+  fenced frontend (the object-store routes have no fence: section 18) **[F: `crates/kbf-server/src/enroll/api.rs`]**. This ADR copies that shape.
+- **Both frontend children serve at once.** Under the CEO ruling of section 18, an old and a new
+  frontend child run side by side on one Postgres behind the reverse proxy bundled in
+  `kbf-installer`. Remote operators reach the API through a TLS-terminating proxy, whose
+  connections arrive from loopback and pass the gate **[F: `docs/api.md`, "Through a reverse
+  proxy"]**.
 - **Handover compares enrollment flags.** The open #1064 makes a frontend handover refuse a
   successor whose enrollment flags differ from the holder's **[V: open pull request]**.
 
@@ -106,7 +109,7 @@ Each is an engineering default pending the owner; the question is in section 14.
 | D3 | Node keys are in memory only. A node without `--cold-store` defers its open until the registration arrives, after the order is verified and `/readyz` says what a node with no store reports. | Q3 |
 | D4 | The frontend log route is cut from this work. | Q4 |
 | D5 | Out of scope: update policy, image pull (no source verb exists), meta-backup (an installer and root verb), CA rotation (its own unit). | Q5 |
-| D6 | The secret file lives on the writer host. Other hosts answer 409 `not_writer`. One token, loopback gate, no operator and admin split. | Q6 |
+| D6 | The secret file is host-local, readable by both frontend children, with versioned names. No writer baton and no `not_writer`. One token, loopback gate, no operator and admin split. | Q6 |
 | D7 | Store identity is immutable after the first bind; moving stores is a later migration verb. | Q7 |
 | D8 | A node with a `--cold-store` flag keeps running on it and reports `identity_mismatch` if the registered identity differs. | Q8 |
 
@@ -117,8 +120,7 @@ like `/v1/enroll/*`: the routes expose or change the farm's door, so they are no
 whoever reaches the address. A refused call changes nothing. Every answer carries
 `Cache-Control: no-store`. A body is capped, and a body type refuses unknown fields. Errors are
 `{"error": "...", "code": "..."}`, `code` a closed, stable string and never a store's or a
-node's own text. 404 when the feature is off (section 11); 409 `not_writer` on a fenced
-frontend.
+node's own text. 404 when the feature is off (section 11). No route is fenced.
 
 | Route | Does |
 |---|---|
@@ -238,8 +240,13 @@ documentation names the exclusion, and the installer's backup list is checked fo
   matches, the registration supplies the keys only.
 - **A bad credential** reaching a node reports `probe_failed`; a node that already had a store
   keeps it.
-- **Fenced.** A deposed frontend answers 409 `not_writer` on the API and serves no node
-  configuration, so it cannot hand out a stale secret.
+- **No fence.** Old and new frontend children serve the API and `GetStoreConfig` at once; there
+  is no writer role to lose. Generation bumps are compare-and-set in Postgres, and a secret
+  file is written whole under a new versioned name, so a reader in the other child never sees
+  a partial file.
+- **A newer frontend.** The frontend updates first, so a node meets an N+1 frontend. The node
+  ignores unknown fields in `GetStoreConfig` and heartbeat answers, and a generation or
+  status it does not understand is reported (`unsupported`), never a crash.
 - **No hot swap.** Rotation reaches a running node at its next start; until then `GET` shows
   that node `pending`. kbf never restarts itself. A hot swap needs a lock-free load of the
   credentials on every request of the S3 path and a performance review, and is not scheduled.
@@ -303,7 +310,7 @@ handover whose successor lacks it is refused, tested.
 | frontend down at node boot | the node cannot open a registered store (keys are memory-only); it retries with backoff and serves hot only |
 | bad credential reaching a node | `probe_failed`; a node that had a store keeps it |
 | revoked or denied node | `PERMISSION_DENIED` on its next call; keys it already holds are not recalled, so the operator rotates after revoking |
-| fenced frontend | 409 `not_writer`; serves no node configuration |
+| two frontend children at once | both serve; Postgres compare-and-set arbitrates the generation; versioned secret files are never partial |
 | concurrent operators | `expect_generation` compare-and-set; otherwise last writer wins and both are audited |
 | state restored from an older backup | generation lower than a node's: the node refetches on a difference (section 7) |
 | a node on an older build | `unsupported`, counted separately |
@@ -329,12 +336,11 @@ itself and the installer has no such verb yet. Until it has one, rotation ends w
 operator waiting on `pending`; the verbs table has a row for it
 ([operator-verbs.md](operator-verbs.md)). A hot swap would remove the wait (section 7).
 
-**The proxy.** Remote operators reach the API through a TLS-terminating proxy on the host, and
-the proxy's connections arrive from loopback and pass the gate **[F: `docs/api.md`]**. So the
-desktop app on another machine **can** call these routes today, whatever Q6 intends. Whether
-the proxy may carry the secret-bearing routes (`PUT .../connections/{name}`) or only the reads
-is a question for the owner (Q6), because the secret then crosses the proxy's TLS and its
-logs. Until answered, the operator documentation says to not forward them.
+**The proxy.** The reverse proxy bundled in `kbf-installer` terminates TLS and connects from
+loopback, so it passes the gate and remote operators (the desktop app) can call these routes.
+There is no Envoy. Whether it may carry the secret-bearing route (`PUT .../connections/{name}`)
+or only the reads is a question for the owner (Q6), because the secret then crosses the
+proxy. Until answered, the operator documentation says not to forward it.
 
 ## 14. Questions for the owner
 
@@ -351,10 +357,9 @@ logs. Until answered, the operator documentation says to not forward them.
 - **Q5 "Every remaining verb".** Update policy and image pull have no source verb on the
   branch. Default: out of scope until one exists; meta-backup stays an installer and root
   verb; CA rotation stays its own unit. Confirm.
-- **Q6 Single host and single token.** Default: the secret file lives on the writer host,
-  other hosts answer 409 `not_writer` (#966's open item on a shared secret store, its section
-  14.8, is the reason), and the one-token loopback gate stays. Is that acceptable for the
-  first cutover, and may the proxy carry secret-bearing routes (section 13)?
+- **Q6 Token and proxy.** Default: the secret file is host-local and both frontend children read
+  it; the one-token loopback gate stays. May the installer's proxy carry secret-bearing routes
+  (section 13)? Multiple hosts need a shared secret store (#966 section 14.8), still open.
 - **Q7 Immutable identity.** Moving to a different store is then a migration with no verb.
   Acceptable for now?
 - **Q8 Flag precedence.** Default: D8. Confirm.
@@ -413,3 +418,16 @@ The drift guard (every route of the operator router appears in `docs/api.md` and
 `api::router()` and the routers merged with it, not a test router. It is not in unit A: it is
 the first follow-up, and until it lands the verbs table is checked by hand against the
 `.route(` calls (the reading is in the pull request description).
+
+## 18. CEO ruling on the frontend architecture (overrides earlier text of this page)
+
+- **Postgres only.** SQLite is dropped; Postgres is a runtime dependency of the frontend and
+  the all-in-one. Rows, generation and audit go through the `kbf-state` store on Postgres;
+  tests use its fake or Postgres. Every "state store" above means that.
+- **No writer baton.** The old and new frontend children share one Postgres under the proxy
+  bundled in `kbf-installer`, and both serve the object-store routes. `not_writer` and any
+  fence gating of these routes are removed. The secret file is host-local and readable by both
+  children; writes are atomic with versioned names.
+- **The frontend updates first**, then triggers node updates, so nodes accept an N+1 frontend
+  (section 7).
+- **No Envoy.** Earlier mentions of the proxy mean the installer's.
