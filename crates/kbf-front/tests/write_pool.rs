@@ -1163,6 +1163,8 @@ fn a_stalled_stream_loses_its_writer_and_fails_retryably() {
     let freed: Vec<&str> = text
         .lines()
         .filter(|l| l.contains("a streamed blob sent no chunk in time; its writer is freed"))
+        // The capture is global: another test's stalled stream (idle 200 ms) logs too.
+        .filter(|l| l.contains("idle=300ms"))
         .collect();
     assert_eq!(freed.len(), 1, "one warning per freed writer: {text}");
     assert!(freed[0].contains("WARN"), "{}", freed[0]);
@@ -1172,4 +1174,76 @@ fn a_stalled_stream_loses_its_writer_and_fails_retryably() {
         freed[0]
     );
     assert!(freed[0].contains("idle=300ms"), "{}", freed[0]);
+}
+
+/// Catches a stream that sent every byte, then went quiet past the idle time before it was
+/// ended, taking its commit for a stopped pool (INVALID_ARGUMENT) or hanging on it: the 5
+/// MiB stream sends all its bytes, the writer gives it up after the idle time (its block
+/// of its own closes), and only then is the stream ended and committed. The commit fails
+/// `Stalled` (UNAVAILABLE, retryable), nothing is stored, and the writer takes the next blob.
+#[test]
+fn a_stream_that_sent_all_its_bytes_and_stalled_fails_its_commit_retryably() {
+    bounded(
+        "a_stream_that_sent_all_its_bytes_and_stalled_fails_its_commit_retryably",
+        async {
+            let rig = Rig::new();
+            let config = PoolConfig {
+                stream_idle: Duration::from_millis(200),
+                ..pool(1, 16)
+            };
+            let cache = rig.start_on(&rig.fs, small_blocks(), config).await.0;
+            let blob = TestBlob::new(60, 5 * MIB);
+            let stream = {
+                let (cache, blob) = (Arc::clone(&cache), blob.clone());
+                tokio::task::spawn_blocking(move || {
+                    let mut stream = cache.stream(blob.bytes.len() as u64).expect("a stream");
+                    for piece in blob.bytes.chunks(MIB) {
+                        stream.append(piece).expect("appended");
+                    }
+                    stream
+                })
+                .await
+                .expect("join")
+            };
+            // The writer gave the stream up: its block of its own is closed.
+            open_files_settle_at(&rig, &cache, 0).await;
+            let record = {
+                let blob = blob.clone();
+                tokio::task::spawn_blocking(move || {
+                    stream.finish(blob.digest, kbf_segments::crc32c(&blob.bytes))
+                })
+                .await
+                .expect("join")
+                .expect("the bytes are all there")
+            };
+            let failed = record.commit().await.expect_err("the commit fails");
+            assert!(matches!(failed, CacheError::Stalled(_)), "{failed:?}");
+            assert_eq!(
+                tonic::Status::from(failed).code(),
+                tonic::Code::Unavailable,
+                "retryable"
+            );
+            assert_eq!(rig.log.answer(&blob.digest), BlobAnswer::Absent);
+            put(&cache, &TestBlob::new(61, 10_000))
+                .await
+                .expect("the writer is free");
+        },
+    );
+}
+
+/// Catches an empty blob taking a place in the pool or being counted as refused: a stream
+/// of 0 bytes is not for the pool (`None`, so the caller sends the blob its own way), and
+/// nothing is counted as sent to the store for want of room or opens a file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_blob_is_not_a_pool_blob_and_is_not_counted_as_refused() {
+    let rig = Rig::new();
+    let cache = rig.start(1, 16).await;
+    let none = tokio::task::spawn_blocking(move || {
+        cache
+            .stream(0)
+            .is_none()
+            .then(|| metric(&cache, "kbf_storage_write_pool_direct_total"))
+    });
+    assert_eq!(none.await.expect("join"), Some(0));
+    assert_eq!(rig.fs.probe.open.load(Ordering::SeqCst), 0);
 }

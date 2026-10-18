@@ -233,14 +233,15 @@ impl<M: MetaLog, O: ObjectStore> Worker<M, O> {
     /// not fit (the next batch's first, or a stream).
     fn gather(&self, first: Whole) -> (Vec<Whole>, Option<Job>) {
         // Not waited for: a writer idle in `next` holds the lock, and then nothing is
-        // queued to gather.
-        let Ok(queued) = self.queued.try_lock() else {
-            return (vec![first], None);
-        };
+        // queued to gather. A lock held by another writer is the same as an empty queue
+        // here: the batch is `first` alone.
+        let queued = self.queued.try_lock().ok();
         let mut bytes = first.bytes.len() as u64;
         let mut batch = vec![first];
         while batch.len() < BATCH_BLOBS {
-            let Ok(job) = queued.try_recv() else { break };
+            let Some(job) = queued.as_ref().and_then(|q| q.try_recv().ok()) else {
+                break;
+            };
             self.metrics().write_pool_queue.sub_one();
             match job {
                 Job::Whole(w) if bytes + w.bytes.len() as u64 <= BATCH_BYTES => {
