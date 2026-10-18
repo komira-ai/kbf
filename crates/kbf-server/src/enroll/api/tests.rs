@@ -96,7 +96,11 @@ fn state_over(store: Arc<dyn Store>) -> Arc<EnrollState> {
 /// over one store must not draw the same token id, which the registry refuses as a
 /// duplicate before the fence is reached.
 fn state_over_from(store: Arc<dyn Store>, start: u8) -> Arc<EnrollState> {
-    let api = api(store, Arc::new(Counting(AtomicU8::new(start))), Ok(ca_pin()));
+    let api = api(
+        store,
+        Arc::new(Counting(AtomicU8::new(start))),
+        Ok(ca_pin()),
+    );
     state_with(Some(ApiToken::for_tests(BEARER)), Some(api))
 }
 
