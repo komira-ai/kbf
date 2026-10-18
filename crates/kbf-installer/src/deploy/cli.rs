@@ -13,8 +13,12 @@ use super::summary::Exit;
 use super::{Check, Env, NoCheck, NoSmoke, Options, Order, SystemClock, deploy, lock};
 use crate::CommitId;
 
-pub const USAGE: &str = "usage: kbf-installer deploy --commit <40hex> --api <127.0.0.1:port> \
---token-file <path> [--apply] [--json] [--bundle -|DIR] [--order nodes-first|frontend-first] \
+/// Where the host says which operator API to call and where its token is, so a caller
+/// that may only run `deploy` names neither.
+pub const CONFIG: &str = "/etc/kbf-installer/deploy.json";
+
+pub const USAGE: &str = "usage: kbf-installer deploy --commit <40hex> [--api <127.0.0.1:port>] \
+[--token-file <path>] [--config <path>] [--apply] [--json] [--bundle -|DIR] [--order nodes-first|frontend-first] \
 [--allow-offline <id>[,<id>...]] [--node-timeout-s N] [--handover-timeout-s N] [--smoke-timeout-s N] \
 [--lock <path>] [--platform linux-x86_64|linux-arm64|darwin-arm64]";
 
@@ -36,6 +40,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
     let mut allow = Vec::new();
     let mut lock_path = PathBuf::from(super::LOCK);
     let mut platform = host_platform().to_owned();
+    let mut config = PathBuf::from(CONFIG);
     let mut secs = [1800u64, 900, 300];
     let mut it = args.iter();
     while let Some(flag) = it.next() {
@@ -48,6 +53,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
             "--api" => api = Some(value("--api")?),
             "--token-file" => token_file = Some(PathBuf::from(value("--token-file")?)),
             "--bundle" => bundle = Some(value("--bundle")?),
+            "--config" => config = PathBuf::from(value("--config")?),
             "--lock" => lock_path = PathBuf::from(value("--lock")?),
             "--platform" => platform = value("--platform")?,
             "--order" => {
@@ -74,9 +80,14 @@ fn parse(args: &[String]) -> Result<Args, String> {
             other => return Err(format!("unknown flag {other:?}")),
         }
     }
+    // The host's config fills what the flags leave out. A missing config file is fine when
+    // both flags are given.
+    let (conf_api, conf_token) = read_config(&config, api.is_none() || token_file.is_none())?;
+    let api = api.or(conf_api);
+    let token_file = token_file.or(conf_token);
     let commit = commit.ok_or("--commit is required")?;
     let commit = CommitId::new(&commit).map_err(|e| e.to_string())?;
-    let api = api.ok_or("--api is required")?;
+    let api = api.ok_or("--api is required (or `api` in the config)")?;
     let api: SocketAddr = api
         .parse()
         .map_err(|_| format!("--api {api:?} is not host:port"))?;
@@ -96,10 +107,41 @@ fn parse(args: &[String]) -> Result<Args, String> {
     Ok(Args {
         options,
         api,
-        token_file: token_file.ok_or("--token-file is required")?,
+        token_file: token_file.ok_or("--token-file is required (or `token_file` in the config)")?,
         bundle,
         lock: lock_path,
     })
+}
+
+/// `{"api": "127.0.0.1:port", "token_file": "/path"}`. Read only when a flag is missing;
+/// it must be a regular file owned by root and writable by no one else.
+fn read_config(path: &Path, needed: bool) -> Result<(Option<String>, Option<PathBuf>), String> {
+    if !needed {
+        return Ok((None, None));
+    }
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((None, None)),
+        Err(e) => return Err(format!("config {}: {e}", path.display())),
+    };
+    if !meta.file_type().is_file() || meta.mode() & 0o022 != 0 {
+        return Err(format!(
+            "config {} must be a regular file no one else may write",
+            path.display()
+        ));
+    }
+    #[cfg(not(test))]
+    if meta.uid() != 0 {
+        return Err(format!("config {} must be owned by root", path.display()));
+    }
+    let text = fs::read_to_string(path).map_err(|e| format!("config: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("config: {e}"))?;
+    let get = |key: &str| {
+        v.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    Ok((get("api"), get("token_file").map(PathBuf::from)))
 }
 
 fn number(name: &str, text: &str) -> Result<u64, String> {

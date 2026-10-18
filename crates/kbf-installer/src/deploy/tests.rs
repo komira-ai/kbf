@@ -1031,6 +1031,75 @@ mod cli_tests {
         }
     }
 
+    /// Proves flags can be left to the host's config, a flag wins over it, and a config
+    /// another user could write is refused (the caller could then pick the endpoint).
+    #[test]
+    fn the_host_config_fills_the_api_and_the_token_file() {
+        let token = token("cfg-tok", 0o600, GOOD);
+        let (_, dir) = crate::testkit::host_root("cfg");
+        let conf = dir.join("deploy.json");
+        let write = |mode: u32, body: &str| {
+            fs::write(&conf, body).unwrap();
+            fs::set_permissions(&conf, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let body = format!(
+            "{{\"api\": \"127.0.0.1:1\", \"token_file\": {:?}}}",
+            token.to_str().unwrap()
+        );
+        let lock = dir.join("run/lock");
+        let argv = |extra: &[&str]| {
+            let mut v = vec![
+                "--commit",
+                super::TARGET,
+                "--config",
+                conf.to_str().unwrap(),
+                "--lock",
+                lock.to_str().unwrap(),
+            ];
+            v.extend_from_slice(extra);
+            v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>()
+        };
+        let go = |a: Vec<String>| {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = cli::main(&a, &mut &b""[..], &mut out, &mut err);
+            (code, String::from_utf8(err).unwrap())
+        };
+        write(0o644, &body);
+        // Nothing listens on port 1: the run gets as far as calling the API (exit 1).
+        assert_eq!(go(argv(&[])).0, 1);
+        write(0o666, &body);
+        let (code, err) = go(argv(&[]));
+        assert_eq!(code, 2);
+        assert!(err.contains("no one else may write"), "{err}");
+        write(0o644, "not json");
+        assert_eq!(go(argv(&[])).0, 2);
+        write(0o644, "{}");
+        let (code, err) = go(argv(&[]));
+        assert_eq!(code, 2);
+        assert!(err.contains("--api is required"), "{err}");
+        // Both flags given: the config is not read at all.
+        write(0o666, &body);
+        assert_eq!(
+            go(argv(&[
+                "--api",
+                "127.0.0.1:1",
+                "--token-file",
+                token.to_str().unwrap()
+            ]))
+            .0,
+            1
+        );
+        // No config and no flags.
+        let none = dir.join("absent.json");
+        let (code, _) = go(vec![
+            "--commit".into(),
+            super::TARGET.into(),
+            "--config".into(),
+            none.to_str().unwrap().into(),
+        ]);
+        assert_eq!(code, 2);
+    }
+
     #[test]
     fn a_token_file_must_be_private_and_hold_a_token() {
         assert!(cli::read_token(&token("tok-ok", 0o600, GOOD)).is_ok());

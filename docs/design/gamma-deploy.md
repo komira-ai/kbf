@@ -4,10 +4,17 @@ Status: built in `crates/kbf-installer/src/deploy/`; the routes it calls are spe
 `docs/api.md` and `docs/design/pull-updates.md` section 6.3, and `POST /v1/update/frontend`
 and `GET /v1/update` are not yet served by `kbf-server` (see "What it assumes").
 
-`kbf-installer deploy --commit <40hex> --api 127.0.0.1:<port> --token-file <path> --apply`
-runs on the frontend host, as root, and drives the local operator API through one release.
+`kbf-installer deploy --commit <40hex> --apply [--json] [--bundle -]` runs on the frontend host, as root, and drives the local operator API through one release.
 It orders no node and rolls nothing back: the frontend offers the desired release and the
 drain system rolls the nodes, one storage node at a time.
+
+`--api 127.0.0.1:<port>` and `--token-file <path>` default to the `api` and `token_file` keys of
+`/etc/kbf-installer/deploy.json` (`--config`), so a caller that may only run `deploy` names
+neither. The config must be a regular file nobody else may write (and root-owned); it is not
+read when both flags are given. The token file must be a regular file, mode 0600 or 0400.
+The address must be loopback. A sudoers rule that lets a user run `deploy *` also lets that
+user pass `--api` and `--token-file`, so it can point the token at a listener it controls on
+loopback; scope the rule to a wrapper if that matters.
 
 ## Steps
 
