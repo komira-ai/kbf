@@ -21,11 +21,10 @@ fn run_as(euid: u32, args: &[&str]) -> (Exit, String, String) {
 }
 
 /// Every verb of the contract's table and the pull request that builds it. The verbs that
-/// are not built say so with the phase; the two that are built are not here.
+/// are not built say so with the phase; the three that are built (`run`, `boot-check`, `setup`) are not here.
 fn stubs() -> Vec<(Vec<&'static str>, &'static str, &'static str)> {
     let commit: &'static str = B;
     vec![
-        (vec!["setup", "--mode=daemon"], "setup", "P10"),
         (vec!["status"], "status", "P4"),
         (
             vec!["update", "--commit", commit, "--frontend"],
@@ -58,6 +57,27 @@ fn every_unbuilt_verb_says_which_pull_request_builds_it() {
             format!("kbf-installer: {name}: not implemented ({phase})\n")
         );
     }
+}
+
+/// Catches `setup` answering like a stub, or running without the flags its mode needs: the
+/// verb is built, so it never says "not implemented"; a bare `--mode=daemon` (no frontend URL,
+/// no token) is a usage error, exit 2, whoever runs it, and nothing is changed (no `--apply`).
+#[test]
+fn setup_is_built_and_refuses_flags_that_do_not_make_a_host() {
+    let (exit, out, err) = run_as(0, &["setup", "--mode=daemon"]);
+    assert_eq!(exit, Exit::Usage, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(!err.contains("not implemented"), "{err}");
+    let (exit, _, err) = run_as(1000, &["setup", "--mode=daemon"]);
+    assert_eq!(exit, Exit::Usage);
+    assert!(err.contains("setup needs root"), "{err}");
+    let (_, out, _) = run_as(0, &["--json", "setup", "--mode=daemon"]);
+    let v: Value = serde_json::from_str(out.trim_end()).expect("one json object");
+    assert_eq!(v["verb"], "setup");
+    assert!(
+        ["invalid_flags", "needs_root"].contains(&v["error"].as_str().expect("a word")),
+        "{v}"
+    );
 }
 
 /// Catches a verb that skips the root check, or one that needs root and does not need to:

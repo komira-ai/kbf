@@ -45,13 +45,17 @@ Options:
       --apply
           Do what the verb says. Without it a mutating verb is a dry run
       --release-source <RELEASE_SOURCE>
-          Where releases are fetched from [default: frontend] [possible values: url, frontend]
+          Where releases are fetched from. Default: the frontend for the modes that enroll, a file server (`url`) for `frontend` and `all-in-one` [possible values: url, frontend]
       --release-url <RELEASE_URL>
           The https base URL of the file server, for --release-source url
       --min-generation <MIN_GENERATION>
-          Refuse orders below this generation
+          Refuse orders below this generation. A floor only goes up
       --commit <COMMIT>
-          The first release to install (40 hex characters)
+          The first release to install (40 hex characters); needs --release-source url
+      --frontend-url <FRONTEND_URL>
+          The frontend to enroll with, as https://host[:port]. For `storage`, `daemon` and `storage-and-daemon`; written to kbf.toml
+      --token-file <TOKEN_FILE>
+          The enrollment token (a file of mode 0600 or tighter); setup keeps a copy that only kbf reads. For the modes that enroll
       --no-start
           Enable the units without starting them
   -h, --help

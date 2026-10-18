@@ -20,6 +20,7 @@ use crate::layout::{Layout, Platform};
 use crate::release;
 use crate::run::SystemRunner;
 use crate::settings::Settings;
+use crate::setup;
 use crate::stage::{Context, Limits, stage_from_inbox};
 
 fn now() -> u64 {
@@ -118,7 +119,7 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
     };
     // `run` and `boot-check` keep the helper's own checks (they work on a scratch root as an
     // ordinary user) until P5 replaces them; every other verb is gated here.
-    let gated = cli.verb.built_by().is_some();
+    let gated = !matches!(cli.verb, Verb::Run(_) | Verb::BootCheck(_));
     if gated && cli.verb.needs_root() && euid != 0 {
         return say(
             Exit::Usage,
@@ -129,6 +130,29 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
     let result = match &cli.verb {
         Verb::Run(args) => run(root_of(cli), args),
         Verb::BootCheck(args) => boot_check(root_of(cli), args),
+        Verb::Setup(args) => {
+            // The steps are for a person: standard output, or with --json (where that is one
+            // object) standard error. A failure prints them ahead of its own line.
+            let mut steps = Vec::new();
+            return match setup::cli(root_of(cli), args, cli.apply, &mut steps) {
+                Ok(()) => {
+                    let _ = if cli.json {
+                        err.write_all(&steps)
+                    } else {
+                        out.write_all(&steps)
+                    };
+                    Exit::Ok
+                }
+                Err(e) => say(
+                    e.exit(),
+                    format!(
+                        "{}kbf-installer: setup: {e}",
+                        String::from_utf8_lossy(&steps)
+                    ),
+                    serde_json::json!({"verb": name, "error": e.code(), "message": e.to_string()}),
+                ),
+            };
+        }
         other => {
             let phase = other.built_by().unwrap_or("?");
             return say(

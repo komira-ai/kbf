@@ -221,9 +221,6 @@ kbf-transfer = { path = "crates/kbf-transfer" }
 kbf-types = { path = "crates/kbf-types" }
 kbf-ui = { path = "crates/kbf-ui" }
 kbf-update = { path = "crates/kbf-update" }
-# `installer.toml`, the installer's settings (kbf-installer); the same pin and features as the
-# node config's parser on feature/arch-v2, so the lock entries merge.
-toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
 # The CI verbs (`cargo xtask`); kbf-it reads the interpreter budget with its parser.
 xtask = { path = "crates/xtask" }
 

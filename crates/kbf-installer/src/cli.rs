@@ -89,18 +89,27 @@ pub struct SetupArgs {
     /// The kbf mode this host runs (`kbf --mode=...`).
     #[arg(long, value_enum)]
     pub mode: Mode,
-    /// Where releases are fetched from.
-    #[arg(long, value_enum, default_value = "frontend")]
-    pub release_source: ReleaseSource,
+    /// Where releases are fetched from. Default: the frontend for the modes that enroll,
+    /// a file server (`url`) for `frontend` and `all-in-one`.
+    #[arg(long, value_enum)]
+    pub release_source: Option<ReleaseSource>,
     /// The https base URL of the file server, for --release-source url.
     #[arg(long)]
     pub release_url: Option<String>,
-    /// Refuse orders below this generation.
+    /// Refuse orders below this generation. A floor only goes up.
     #[arg(long)]
     pub min_generation: Option<u64>,
-    /// The first release to install (40 hex characters).
+    /// The first release to install (40 hex characters); needs --release-source url.
     #[arg(long)]
     pub commit: Option<CommitId>,
+    /// The frontend to enroll with, as https://host[:port]. For `storage`, `daemon` and
+    /// `storage-and-daemon`; written to kbf.toml.
+    #[arg(long)]
+    pub frontend_url: Option<String>,
+    /// The enrollment token (a file of mode 0600 or tighter); setup keeps a copy that only
+    /// kbf reads. For the modes that enroll.
+    #[arg(long)]
+    pub token_file: Option<String>,
     /// Enable the units without starting them.
     #[arg(long)]
     pub no_start: bool,
@@ -188,8 +197,8 @@ impl Verb {
     /// verbs that exist (`run`, `boot-check`).
     pub fn built_by(&self) -> Option<&'static str> {
         match self {
-            Verb::Run(_) | Verb::BootCheck(_) => None,
-            Verb::Setup(_) | Verb::Check => Some("P10"),
+            Verb::Run(_) | Verb::BootCheck(_) | Verb::Setup(_) => None,
+            Verb::Check => Some("P10"),
             Verb::Status => Some("P4"),
             Verb::Update(_) => Some("P13"),
             Verb::Confirm(_) | Verb::Revert(_) | Verb::Rollback | Verb::Gc | Verb::Quiesce => {

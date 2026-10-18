@@ -64,6 +64,7 @@ pub mod refusal;
 pub mod release;
 pub mod run;
 pub mod settings;
+pub mod setup;
 pub mod stage;
 pub mod state;
 pub mod state_v2;

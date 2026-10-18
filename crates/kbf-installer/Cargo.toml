@@ -34,7 +34,7 @@ flate2.workspace = true
 hex.workspace = true
 kbf-host.workspace = true
 libc.workspace = true
-rustix = { workspace = true, features = ["fs", "process"] }
+rustix = { workspace = true, features = ["fs", "process", "rand"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
