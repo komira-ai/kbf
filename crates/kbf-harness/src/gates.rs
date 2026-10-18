@@ -63,6 +63,9 @@ pub struct Evidence<'a> {
     pub exited_during_load: &'a [(String, String)],
     /// Roles' ends when the farm was stopped: role and how (`exit 0` is clean).
     pub stopped: &'a [(String, String)],
+    /// Whether the farm was still whole when the load and its settling ended (every node
+    /// connected, every storage member active), or what it lacked.
+    pub farm_whole: &'a Result<(), String>,
     /// Whether the scenario's wall-clock bound was hit.
     pub hung: bool,
     /// The window the load ran in, as two timestamps, and its length in seconds.
@@ -160,8 +163,14 @@ impl Evidence<'_> {
             .iter()
             .filter_map(|b| b.failed_actions.as_ref().err().cloned())
             .collect();
+        // The scrapes that gave a page, of the scrapes tried, or of the scrapes the load
+        // should have seen if the scraper tried fewer (one stuck on a wedged frontend): so
+        // neither a failed scrape nor a missed one is made up for by the scrapes of the
+        // settling window.
         let coverage = if self.load_secs > 0.0 {
-            self.scrapes.samples.len() as f64 / (self.load_secs / self.scrape_every_secs)
+            let got = self.scrapes.samples.len() as f64;
+            let tried = got + self.scrapes.failed as f64;
+            got / tried.max(self.load_secs / self.scrape_every_secs)
         } else {
             0.0
         };
@@ -220,6 +229,13 @@ impl Evidence<'_> {
                 "0",
                 exited.is_empty(),
                 (!exited.is_empty()).then(|| exited.join("; ")),
+            ),
+            self.row(
+                "farm_whole",
+                json!(self.farm_whole.is_ok()),
+                "true: every node connected, every storage member active",
+                self.farm_whole.is_ok(),
+                self.farm_whole.as_ref().err().cloned(),
             ),
             self.row(
                 "clean_stop",

@@ -14,7 +14,8 @@ publish.workspace = true
 # writes `beta-result.json`. It spawns the binaries it is given by path: a library cannot
 # use `CARGO_BIN_EXE_*`, which only the package that owns a binary may, so its callers
 # (kbf-cli's rehearsal test, the beta workflow) pass `kbf` in. It links neither
-# kbf-server nor kbf-node (tests/layering.rs).
+# kbf-server nor kbf-node today; tests/layering.rs fails a crate (outside its joiners) that
+# comes to link both.
 [[bin]]
 name = "kbf-beta"
 path = "src/bin/kbf-beta.rs"

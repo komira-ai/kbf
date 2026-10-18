@@ -228,6 +228,49 @@ fn stop_all_ends_the_last_started_first_and_says_how() {
 }
 
 #[test]
+fn a_role_that_ended_before_its_turn_is_reported_with_how() {
+    // Catches: a stop that skips a role which had already exited on its own and so drops
+    // its status: a node that crashed (exit 1) or left (exit 0) before the stop reached it
+    // would then be in no `clean_stop` evidence, and a crash would pass the gate.
+    let d = dir("ended-before");
+    let mut farm = Farm::supervise(
+        &d,
+        vec![
+            spec(Role::Node(1), "false", &[], &d),
+            spec(Role::Node(2), "true", &[], &d),
+            sleeper(Role::Daemon(1), &d),
+        ],
+    );
+    wait_all_ended_but(&mut farm, Role::Daemon(1));
+    let ended = farm.stop_all();
+    assert_eq!(
+        ended,
+        vec![
+            (Role::Daemon(1), "signal 15".to_owned()),
+            (Role::Node(2), "exit 0".to_owned()),
+            (Role::Node(1), "exit 1".to_owned()),
+        ]
+    );
+}
+
+/// Waits until every process but `except`'s has ended.
+fn wait_all_ended_but(farm: &mut Farm, except: Role) {
+    let until = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let table = farm.process_table();
+        if table
+            .iter()
+            .filter(|p| p.role != except.to_string())
+            .all(|p| p.ended.is_some())
+        {
+            return;
+        }
+        assert!(std::time::Instant::now() < until, "a process never ended");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn a_process_that_ignores_sigterm_is_killed_and_reported() {
     // Catches: a stop that waits for ever on a process that will not drain, or kills it and
     // says it exited cleanly (the `clean_stop` gate reads this text).
@@ -372,4 +415,87 @@ fn term_kills_what_ignores_sigterm_and_says_nothing_of_its_status() {
     wait_until_running(farm.process_table()[0].pid, "sleep");
     assert_eq!(farm.term(Role::Daemon(1)), None);
     assert_eq!(farm.process_table()[0].ended.as_deref(), Some("signal 9"));
+}
+
+/// A stand-in operator API on a free port: it answers each request with the body listed
+/// for its path (and 404 for another), until the test ends.
+fn serve(routes: Vec<(&'static str, &'static str)>) -> u16 {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0_u8; 1024];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let path = request.split_whitespace().nth(1).unwrap_or_default();
+            let (code, body) = routes
+                .iter()
+                .find(|(p, _)| *p == path)
+                .map_or((404, ""), |(_, b)| (200, *b));
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {code} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    port
+}
+
+const NODES_BOTH: &str =
+    r#"{"nodes":[{"node_id":"node-1","connected":true},{"node_id":"node-2","connected":true}]}"#;
+const NODES_ONE: &str =
+    r#"{"nodes":[{"node_id":"node-1","connected":true},{"node_id":"node-2","connected":false}]}"#;
+const MEMBERS_ACTIVE: &str = r#"{"members":[{"state":"active"},{"state":"active"}]}"#;
+const MEMBERS_CATCHING_UP: &str = r#"{"members":[{"state":"active"},{"state":"catching_up"}]}"#;
+
+/// A farm of one sleeper whose frontend API is `routes`, with two storage nodes expected.
+fn farm_with_api(name: &str, routes: Vec<(&'static str, &'static str)>) -> Farm {
+    let d = dir(name);
+    let mut farm = Farm::supervise(&d, vec![sleeper(Role::Frontend, &d)]);
+    farm.api = serve(routes);
+    farm.storage_nodes = 2;
+    farm.node_ids = vec!["node-1".to_owned(), "node-2".to_owned()];
+    farm
+}
+
+#[test]
+fn a_farm_is_whole_when_every_node_is_connected_and_every_member_active() {
+    // Catches: a check that fails a healthy farm (the end-of-load gate would be red on
+    // every run).
+    let farm = farm_with_api(
+        "whole",
+        vec![("/v1/nodes", NODES_BOTH), ("/v1/members", MEMBERS_ACTIVE)],
+    );
+    assert_eq!(farm.whole(), Ok(()));
+}
+
+#[test]
+fn a_farm_that_lost_a_node_a_member_or_its_frontend_is_not_whole() {
+    // Catches: a node that is still running but no longer connected, a member that has
+    // fallen back to catching up, and a frontend that does not answer, each passing as a
+    // whole farm.
+    let lost_node = farm_with_api(
+        "not-whole-node",
+        vec![("/v1/nodes", NODES_ONE), ("/v1/members", MEMBERS_ACTIVE)],
+    );
+    let why = lost_node.whole().expect_err("a node is not connected");
+    assert!(why.starts_with("nodes connected: [\"node-1\"]"), "{why}");
+    let catching_up = farm_with_api(
+        "not-whole-member",
+        vec![
+            ("/v1/nodes", NODES_BOTH),
+            ("/v1/members", MEMBERS_CATCHING_UP),
+        ],
+    );
+    let why = catching_up.whole().expect_err("a member is not active");
+    assert!(why.starts_with("storage members"), "{why}");
+    let no_members = farm_with_api("not-whole-nomembers", vec![("/v1/nodes", NODES_BOTH)]);
+    let why = no_members.whole().expect_err("no /v1/members");
+    assert!(why.contains("/v1/members does not answer"), "{why}");
+    let silent = farm_with_api("not-whole-silent", Vec::new());
+    let why = silent.whole().expect_err("no /v1/nodes");
+    assert!(why.contains("/v1/nodes does not answer"), "{why}");
 }

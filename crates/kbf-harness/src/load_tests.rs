@@ -15,6 +15,7 @@ fn cfg() -> LoadConfig {
         concurrency: 2,
         duration: Duration::from_secs(1),
         build_timeout: Duration::from_secs(5),
+        kill_timeout: Duration::from_secs(5),
         pause_secs: 30,
         fill_kib: 256,
         run_id: "r1".to_owned(),
@@ -215,6 +216,16 @@ fn a_build_that_does_not_end_is_killed_at_its_bound() {
         wait_bounded(&mut bad, Duration::from_secs(60)),
         (Some(1), false)
     );
+}
+
+#[test]
+fn a_kill_of_a_daemon_that_cannot_be_run_is_skipped() {
+    // Catches: a `buck2` that cannot be started (it was never there, or the run is being
+    // torn down after it failed to) panicking the teardown, which would hide the failure
+    // the run is reporting.
+    let c = cfg();
+    kill_lane(&c, 0);
+    kill_daemons(&c);
 }
 
 #[test]

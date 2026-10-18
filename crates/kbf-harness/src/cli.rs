@@ -15,6 +15,9 @@ use crate::b0::{self, B0, Ended, Mutant};
 use crate::envoy::{ENV_VAR, REQUIRE_VAR, required};
 use crate::procs::HANG;
 
+/// The longest one `buck2 kill` is waited for.
+const KILL_BOUND: Duration = Duration::from_secs(10);
+
 #[derive(Parser)]
 #[command(
     name = "kbf-beta",
@@ -141,6 +144,7 @@ pub fn status(
         settle: Duration::from_secs(settle_secs),
         concurrency,
         build_timeout: Duration::from_secs(build_timeout_secs),
+        kill_timeout: KILL_BOUND,
         // The load and the build under way at its end, and a minute to start and stop it.
         wall_bound: Duration::from_secs(duration_secs + build_timeout_secs + 60),
         pause_secs,

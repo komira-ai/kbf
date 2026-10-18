@@ -30,7 +30,8 @@
 //! gate passed. `--mutant` makes the farm worse in one way each gate exists to catch.
 //!
 //! The library spawns the binaries it is given by path and links neither `kbf-server`
-//! nor `kbf-node` (tests/layering.rs): `kbf` is a process here, not a dependency.
+//! nor `kbf-node` today (tests/layering.rs fails a crate outside its joiners that links
+//! both): `kbf` is a process here, not a dependency.
 
 #![cfg(target_os = "linux")]
 

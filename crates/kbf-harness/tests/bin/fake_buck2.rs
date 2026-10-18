@@ -10,6 +10,10 @@
 //! - `no-summary`: exit 0 and no summary line.
 //! - `bad-log`: the event log is not an event log; exit 0.
 //! - `hang`: never ends.
+//!
+//! A second word, `kill-hangs`, makes `kill` slow (as a wedged daemon makes the real one):
+//! it sleeps for twenty seconds and then leaves `.fake-buck2-kill-survived` in the directory
+//! it runs in, which a `kill` that is given up on never does.
 
 use std::io::Write as _;
 use std::time::Duration;
@@ -38,11 +42,19 @@ fn main() {
     }
     // `--isolation-dir <dir>` precedes the subcommand.
     let rest: Vec<&String> = args.iter().skip(2).collect();
+    let words = std::fs::read_to_string(".fake-buck2").unwrap_or_default();
+    let words: Vec<&str> = words.split_whitespace().collect();
+    if rest.first().map(|s| s.as_str()) == Some("kill") {
+        if words.contains(&"kill-hangs") {
+            std::thread::sleep(Duration::from_secs(20));
+            let _ = std::fs::write(".fake-buck2-kill-survived", "");
+        }
+        return;
+    }
     if rest.first().map(|s| s.as_str()) != Some("build") {
         return;
     }
-    let mode = std::fs::read_to_string(".fake-buck2").unwrap_or_default();
-    let mode = mode.trim();
+    let mode = words.first().copied().unwrap_or_default();
     if mode == "hang" {
         // Not for ever: a test that gives up on this build leaves the process behind.
         std::thread::sleep(Duration::from_secs(30));

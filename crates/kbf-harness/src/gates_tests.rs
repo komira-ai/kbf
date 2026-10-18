@@ -36,6 +36,7 @@ struct Run {
     builds: Vec<BuildResult>,
     scrapes: Scrapes,
     exited: Vec<(String, String)>,
+    whole: Result<(), String>,
     stopped: Vec<(String, String)>,
     hung: bool,
 }
@@ -49,6 +50,7 @@ fn pass() -> Run {
                 .collect(),
         ),
         exited: Vec::new(),
+        whole: Ok(()),
         stopped: vec![("frontend".to_owned(), "exit 0".to_owned())],
         hung: false,
     }
@@ -59,6 +61,7 @@ fn gates(run: &Run) -> Vec<Gate> {
         builds: &run.builds,
         scrapes: &run.scrapes,
         exited_during_load: &run.exited,
+        farm_whole: &run.whole,
         stopped: &run.stopped,
         hung: run.hung,
         load: (
@@ -100,7 +103,7 @@ fn a_healthy_run_passes_every_gate() {
     let run = pass();
     assert_eq!(failed(&run), Vec::<String>::new());
     assert!(all_pass(&gates(&run)));
-    assert_eq!(gates(&run).len(), 10);
+    assert_eq!(gates(&run).len(), 11);
 }
 
 #[test]
@@ -261,6 +264,36 @@ fn a_flaky_scrape_is_a_harness_defect() {
 }
 
 #[test]
+fn scrapes_that_failed_count_against_coverage() {
+    // Catches: a coverage measured against the length of the load alone. The scrapes of
+    // the settling window and the last one are extra, so a scraper that failed one in four
+    // of its tries still reached the load's scrape count and passed.
+    let mut run = pass();
+    run.scrapes.failed = 4;
+    assert_eq!(failed(&run), ["scrape_coverage"]);
+    // Three failures of fourteen tries: 11 of 14 is 0.79, under 0.9.
+    run.scrapes.failed = 3;
+    assert_eq!(failed(&run), ["scrape_coverage"]);
+    // One of twelve tries is 11 of 12, which is 0.92.
+    run.scrapes.failed = 1;
+    assert!(failed(&run).is_empty(), "{:?}", failed(&run));
+}
+
+#[test]
+fn a_farm_that_is_not_whole_is_red() {
+    // Catches: a node or member that is still running but is no longer part of the farm
+    // (deregistered, or wedged) passing because the builds went to the others.
+    let mut run = pass();
+    run.whole = Err("nodes connected: [], expected [\"node-1\"]".to_owned());
+    assert_eq!(failed(&run), ["farm_whole"]);
+    let gate = gates(&run)
+        .into_iter()
+        .find(|g| g.name == "farm_whole")
+        .expect("gate");
+    assert!(gate.detail.expect("detail").contains("expected"));
+}
+
+#[test]
 fn a_process_that_exited_during_the_load_is_red() {
     // Catches: a crash of a role the load survived (a retry hid it) passing.
     let mut run = pass();
@@ -312,6 +345,7 @@ fn a_load_of_no_time_has_no_scrape_coverage() {
         builds: &run.builds,
         scrapes: &run.scrapes,
         exited_during_load: &run.exited,
+        farm_whole: &run.whole,
         stopped: &run.stopped,
         hung: false,
         load: (String::new(), String::new()),

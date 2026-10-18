@@ -70,6 +70,9 @@ pub struct LoadConfig {
     pub duration: Duration,
     /// The longest one build may take.
     pub build_timeout: Duration,
+    /// The longest one `buck2 kill` may take: a wedged daemon makes it wait, and nothing
+    /// that waits on it may wait for ever.
+    pub kill_timeout: Duration,
     /// How long the pause action sleeps, in seconds.
     pub pause_secs: u64,
     /// The size of each upload action's output, in KiB.
@@ -220,15 +223,33 @@ impl Load {
     }
 }
 
-/// Stops the Buck2 daemons of every loop: for a run that gives up on its loops.
+/// Stops the Buck2 daemons of every loop, all at once, each for at most
+/// [`LoadConfig::kill_timeout`]: for a run that gives up on its loops, which is the run of a
+/// wedged daemon.
 pub fn kill_daemons(cfg: &LoadConfig) {
-    for lane in 0..cfg.concurrency {
-        let _ = Command::new(&cfg.buck2)
-            .args(["--isolation-dir", &isolation(lane), "kill"])
-            .current_dir(&cfg.project)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    let kills: Vec<_> = (0..cfg.concurrency)
+        .map(|lane| {
+            let cfg = cfg.clone();
+            std::thread::spawn(move || kill_lane(&cfg, lane))
+        })
+        .collect();
+    for kill in kills {
+        let _ = kill.join();
+    }
+}
+
+/// `buck2 kill` for the daemon of `lane`, given up on (the client is killed) after
+/// [`LoadConfig::kill_timeout`].
+fn kill_lane(cfg: &LoadConfig, lane: usize) {
+    let spawned = Command::new(&cfg.buck2)
+        .args(["--isolation-dir", &isolation(lane), "kill"])
+        .current_dir(&cfg.project)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Ok(mut child) = spawned {
+        let _ = wait_bounded(&mut child, cfg.kill_timeout);
     }
 }
 
@@ -248,12 +269,7 @@ fn lane_loop(cfg: &LoadConfig, lane: usize, end: Instant, stop: &AtomicBool) -> 
         n += 1;
     }
     // This loop's daemon goes with it.
-    let _ = Command::new(&cfg.buck2)
-        .args(["--isolation-dir", &isolation(lane), "kill"])
-        .current_dir(&cfg.project)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    kill_lane(cfg, lane);
     outcomes
 }
 

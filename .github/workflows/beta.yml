@@ -39,6 +39,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Incremental artifacts only bloat a cached target directory (as in ci.yml).
+  CARGO_INCREMENTAL: 0
 
 defaults:
   run:
@@ -47,7 +49,7 @@ defaults:
 jobs:
   smoke:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 40
     permissions:
       contents: read
     env:

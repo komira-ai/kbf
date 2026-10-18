@@ -766,6 +766,32 @@ impl Farm {
         Ok(())
     }
 
+    /// Whether the frontend still lists every node as connected and every storage member
+    /// active (what [`Farm::wait_ready`] waited for): a process that is alive proves
+    /// nothing of this, since a node that lost its place in the farm keeps running.
+    ///
+    /// # Errors
+    /// What the frontend lists instead, or that it does not answer.
+    pub fn whole(&self) -> Result<(), String> {
+        let connected = api::connected(self.api)
+            .ok_or_else(|| "the frontend's /v1/nodes does not answer".to_owned())?;
+        if connected != self.node_ids {
+            return Err(format!(
+                "nodes connected: {connected:?}, expected {:?}",
+                self.node_ids
+            ));
+        }
+        let members = api::members_active(self.api)
+            .ok_or_else(|| "the frontend's /v1/members does not answer".to_owned())?;
+        if members != (self.storage_nodes, true) {
+            return Err(format!(
+                "storage members (count, all active): {members:?}, expected {:?}",
+                (self.storage_nodes, true)
+            ));
+        }
+        Ok(())
+    }
+
     /// SIGKILL to `role`, as a host losing power would take it.
     pub fn kill(&mut self, role: Role) {
         let m = self.member_mut(role);
@@ -915,14 +941,19 @@ impl Farm {
 
     /// SIGTERM to each process still running, last started first (the daemons and nodes,
     /// then Envoy, before the frontend, which waits for open streams); each role and how it
-    /// ended. A process still running after [`HANG`] is killed and reported as such.
+    /// ended, a role that had ended on its own before its turn included (with its status
+    /// then). A process still running after [`HANG`] is killed and reported as such; a role
+    /// the harness killed is not reported.
     pub fn stop_all(&mut self) -> Vec<(Role, String)> {
         let mut ended = Vec::new();
         let hang = self.hang;
-        // A role that is not running (killed by the harness, or ended on its own: the
-        // liveness gate has that) is not stopped.
+        // A role the harness killed is not stopped (the harness knows how it ended).
         for m in self.members.iter_mut().rev().filter(|m| !m.killed) {
-            if m.proc.exited().is_some() {
+            // One that ended on its own before its turn is reported as it ended: the stop's
+            // evidence is every role, and a crash must not be absent from it.
+            if let Some(status) = m.proc.exited() {
+                m.killed = true;
+                ended.push((m.role, ended_text(status)));
                 continue;
             }
             let status = m.proc.term_within(hang);

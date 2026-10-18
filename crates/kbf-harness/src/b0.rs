@@ -72,6 +72,8 @@ pub struct B0 {
     pub settle: Duration,
     pub concurrency: usize,
     pub build_timeout: Duration,
+    /// The longest one `buck2 kill` may take ([`LoadConfig::kill_timeout`]).
+    pub kill_timeout: Duration,
     /// The longest the load may take in all, builds under way at its end included: past it
     /// the run is `TIMED_OUT` (the caller gives `duration` + `build_timeout` and some
     /// seconds).
@@ -285,6 +287,7 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
         concurrency: args.concurrency,
         duration: args.duration,
         build_timeout: args.build_timeout,
+        kill_timeout: args.kill_timeout,
         pause_secs: args.pause_secs,
         fill_kib: args.fill_kib,
         run_id: format!("{}-{}", result.doc.run_id, std::process::id()),
@@ -340,13 +343,11 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
         note_exits(&mut farm, &mut exited);
         std::thread::sleep(Duration::from_millis(250));
     }
+    // Alive is not whole: a node that lost its place in the farm keeps running.
+    let farm_whole = farm.whole();
     let scrapes = scraper.stop();
     let stop_started = now();
-    let stopped: Vec<(String, String)> = farm
-        .stop_all()
-        .into_iter()
-        .map(|(role, how)| (role.to_string(), how))
-        .collect();
+    let stopped = stop_farm(&mut farm, &mut exited);
     let stop_finished = now();
     // Which process was which, for the logs beside it.
     let _ = std::fs::write(logs.join("processes.txt"), farm.process_list());
@@ -386,6 +387,7 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
         builds: &builds,
         scrapes: &scrapes,
         exited_during_load: &exited,
+        farm_whole: &farm_whole,
         stopped: &stopped,
         hung,
         load: (load_started, load_finished),
@@ -415,6 +417,17 @@ fn ending(gates: &[Gate], hung: bool) -> (Status, Ended) {
         (false, Ended::Failed) => Status::Failed,
     };
     (status, ended)
+}
+
+/// Stops the farm. A role that left since the last poll (the final scrape can take seconds)
+/// is noted in `exited` first, so that `processes_alive` sees it; and the stop reports every
+/// role, one that had already ended included, so that `clean_stop` sees how it ended.
+fn stop_farm(farm: &mut Farm, exited: &mut Vec<(String, String)>) -> Vec<(String, String)> {
+    note_exits(farm, exited);
+    farm.stop_all()
+        .into_iter()
+        .map(|(role, how)| (role.to_string(), how))
+        .collect()
 }
 
 /// Adds to `exited` the roles that have ended without being ended, once each; whether there

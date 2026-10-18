@@ -3,9 +3,9 @@
 # actions as plain processes. No prelude: the rules are in this project.
 #
 # Not here: the farm's address and the CA it is under, which differ for each run. The
-# harness gives them on every build's command line as
-# `-c buck2_re_client.engine_address=...` (and `action_cache_address`, `cas_address`,
-# `tls_ca_certs`).
+# harness appends them to its copy of this file (`load::write_buckconfig`) as
+# `engine_address`, `action_cache_address`, `cas_address` and `tls_ca_certs`: Buck2 reads
+# them when its daemon starts and ignores them on a command line.
 [cells]
   root = .
 

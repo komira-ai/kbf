@@ -100,6 +100,7 @@ fn b0(name: &str, mode: &str, secs: u64) -> B0 {
         settle: Duration::from_secs(1),
         concurrency: 2,
         build_timeout: Duration::from_secs(60),
+        kill_timeout: Duration::from_secs(30),
         wall_bound: Duration::from_secs(secs + 120),
         pause_secs: 1,
         fill_kib: 4,
@@ -186,7 +187,7 @@ fn a_healthy_farm_passes_every_gate_it_can_behind_envoy() {
     let doc = document(&args);
     assert_eq!(failed(&doc), NOT_EXPORTED, "{doc}");
     assert_eq!(doc["status"], "FAILED");
-    assert_eq!(doc["gates"].as_array().expect("gates").len(), 10);
+    assert_eq!(doc["gates"].as_array().expect("gates").len(), 11);
     assert_eq!(doc["attested"], false);
     assert_eq!(doc["runtime"]["driver"], "native");
     assert_eq!(doc["runtime"]["container"], "none (native driver)");
@@ -332,9 +333,46 @@ fn a_load_past_its_wall_bound_is_timed_out_with_a_report() {
     assert!(list.contains("frontend pid"), "{list}");
 }
 
+/// Whether the stand-in `buck2 kill` of the run in `args` ran to its end (it leaves a marker
+/// then; the harness gives up on it and kills the client before that).
+fn kill_survived(args: &B0) -> bool {
+    args.work.join("project/.fake-buck2-kill-survived").exists()
+}
+
+/// Catches: an unbounded `buck2 kill` at the end of a loop (a wedged daemon holds the call
+/// for ever, so the loop never ends and the run lasts until the job's timeout): the call is
+/// given up on at its bound, which the stand-in shows by never reaching its end. The
+/// assertion is on what the stand-in did, not on how long anything took.
+#[test]
+fn a_kill_that_never_returns_is_given_up_on_at_the_end_of_a_loop() {
+    let mut args = b0("kill-hangs", "kill-hangs", 2);
+    args.concurrency = 1;
+    args.kill_timeout = Duration::from_secs(1);
+    assert_eq!(run(&args).expect("a run"), Ended::Failed);
+    let doc = document(&args);
+    assert_eq!(other_failures(&doc), Vec::<String>::new(), "{doc}");
+    assert!(!kill_survived(&args), "the kill ran to its end");
+}
+
+/// Catches: an unbounded `buck2 kill` in the run that gives up on its load (the wall bound):
+/// the one run that has a wedged daemon would block on it, with no `TIMED_OUT`, no process
+/// list and no stop. The run ends `TIMED_OUT` with its report, and the kill was given up on.
+#[test]
+fn a_kill_that_never_returns_does_not_hold_up_the_wall_bound() {
+    let mut args = b0("bound-kill-hangs", "hang kill-hangs", 2);
+    args.concurrency = 1;
+    args.wall_bound = Duration::from_secs(3);
+    args.kill_timeout = Duration::from_secs(1);
+    assert_eq!(run(&args).expect("a run"), Ended::Failed);
+    let doc = document(&args);
+    assert_eq!(doc["status"], "TIMED_OUT");
+    assert!(args.work.join("logs/processes.txt").exists());
+    assert!(!kill_survived(&args), "the kill ran to its end");
+}
+
 /// Catches: a node that dies on its own (not killed by the harness) going unseen: the run
-/// notices at once, stops loading, fails `processes_alive` with the role and how it died, and
-/// still stops the others cleanly. The load is a hundred seconds long and ends long before
+/// notices at once, stops loading, fails `processes_alive` (and `clean_stop`, which reports
+/// every role) with the role and how it died, and still stops the others cleanly. The load is a hundred seconds long and ends long before
 /// (a bound that only a load which did not stop would break, not a measure of time).
 #[test]
 fn a_node_that_dies_on_its_own_fails_the_liveness_gate() {
@@ -355,7 +393,16 @@ fn a_node_that_dies_on_its_own_fails_the_liveness_gate() {
         .iter()
         .find(|g| g["name"] == "processes_alive");
     assert_eq!(gate.expect("gate")["detail"], "node-3: signal 9");
-    assert_eq!(verdict(&doc, "clean_stop"), "PASS");
+    // The stop reports every role, one that had died before its turn with how it died:
+    // the dead node is not a clean stop, and it is the only one that is not.
+    let stop = doc["gates"]
+        .as_array()
+        .expect("gates")
+        .iter()
+        .find(|g| g["name"] == "clean_stop");
+    let stop = stop.expect("gate");
+    assert_eq!(stop["verdict"], "FAIL", "{stop}");
+    assert_eq!(stop["detail"], "node-3: signal 9");
     let took = doc["duration_secs"].as_f64().expect("a duration");
     assert!(
         took < 90.0,

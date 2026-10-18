@@ -19,6 +19,7 @@ fn args() -> B0 {
         settle: Duration::from_secs(1),
         concurrency: 1,
         build_timeout: Duration::from_secs(1),
+        kill_timeout: Duration::from_secs(1),
         wall_bound: Duration::from_secs(5),
         pause_secs: 1,
         fill_kib: 1,
@@ -158,6 +159,32 @@ fn an_exit_is_noted_once_and_says_whether_it_is_new() {
     assert_eq!(exited, [("node-1".to_owned(), "exit 1".to_owned())]);
     assert!(!note_exits(&mut dead, &mut exited));
     assert_eq!(exited.len(), 1);
+}
+
+#[test]
+fn a_role_that_left_before_the_stop_is_a_liveness_failure_and_an_unclean_stop() {
+    // Catches: a node that exits (0 or not) in the window between the last poll and the
+    // stop, never seen by either gate: `processes_alive` reads `exited`, `clean_stop` reads
+    // what the stop returns, and a role skipped by both passes both.
+    let mut gone = sleeper_farm("b0-left", "true");
+    let until = Instant::now() + Duration::from_secs(60);
+    while gone.process_table()[0].ended.is_none() {
+        assert!(Instant::now() < until, "true never exited");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut exited = Vec::new();
+    let stopped = stop_farm(&mut gone, &mut exited);
+    assert_eq!(exited, [("node-1".to_owned(), "exit 0".to_owned())]);
+    assert_eq!(stopped, [("node-1".to_owned(), "exit 0".to_owned())]);
+    let mut crashed = sleeper_farm("b0-crashed", "false");
+    while crashed.process_table()[0].ended.is_none() {
+        assert!(Instant::now() < until, "false never exited");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut exited = Vec::new();
+    let stopped = stop_farm(&mut crashed, &mut exited);
+    assert_eq!(stopped, [("node-1".to_owned(), "exit 1".to_owned())]);
+    assert_eq!(exited, stopped);
 }
 
 fn writer(name: &str) -> (Writer, PathBuf) {
