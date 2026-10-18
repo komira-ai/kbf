@@ -485,6 +485,43 @@ async fn an_unknown_or_incomplete_platform_is_offered_nothing() {
     }
 }
 
+/// Catches tasks that outlive their frontend: the polling of the table and the sending task of
+/// each session end when the offers are gone (a stopped frontend). Nothing shows to the node:
+/// a daemon's stream does not end with the server, so no message or close tells. What shows is
+/// the runtime's count of live tasks, which a frontend, its node and their offers must leave
+/// as they found it, within `PROMPT` (the poll ends at its next tick, the sending task when
+/// the table's sender goes).
+///
+/// Mutants seen red: a sending task that never ends (`pending` after its `select!`); a
+/// holder of the offers that is never dropped (`mem::forget` of a clone in `Offers::start`,
+/// which also keeps the poll looking).
+#[tokio::test]
+async fn a_stopped_frontend_ends_its_offer_tasks() {
+    let alive = || {
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+    };
+    let before = alive();
+    let front = start();
+    linux(&front, A).await;
+    front.desire(A).await;
+    let mut node = linux_node(&front, "n1").await;
+    assert_eq!(offer(&mut node).await.generation, 1);
+    assert!(alive() > before, "a frontend and its node run tasks");
+    drop(front);
+    drop(node);
+    let deadline = tokio::time::Instant::now() + PROMPT;
+    while alive() > before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{} tasks outlive the stopped frontend",
+            alive() - before
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Catches a look that fails turning into offers that vanish, or into a table that is wrong:
 /// while every read of the state store fails the node is sent nothing new and the table is
 /// kept; once the store answers again the next change is offered.
