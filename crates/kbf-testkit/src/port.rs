@@ -23,11 +23,13 @@
 //! - macOS: that socket owns its port too, but a SYN that finds it is dropped without
 //!   a reset (the socket is in the lookup tables in state CLOSED, and the stack drops
 //!   segments for a CLOSED socket), so `connect` waits out its whole timeout and
-//!   fails with "timed out". So the held socket is also connected to its own address
-//!   (a TCP simultaneous open with itself): a connected socket is found only under
-//!   its full address pair, so a SYN from anyone else finds no socket, is answered
-//!   with a reset, and the port stays owned. [`Reserved::listen`] then has to drop
-//!   that socket and bind the listener; between the two a thief would need to draw
+//!   fails with "timed out". So the held socket is also connected, to a peer socket of
+//!   this process (a listener on a port of its own, whose accepted connection is
+//!   kept): a connected socket is found only under its full address pair, so a SYN
+//!   from anyone else finds no socket, is answered with a reset, and the port stays
+//!   owned. (Connecting the socket to its own address, which would need no peer, is
+//!   refused by macOS with `EINVAL`.) [`Reserved::listen`] then has to drop
+//!   that socket (and its peer) and bind the listener; between the two a thief would need to draw
 //!   exactly that number from the kernel's random ephemeral range within microseconds
 //!   (macOS only; on Linux the socket itself listens and there is no gap).
 //!
@@ -40,16 +42,16 @@ use std::sync::Mutex;
 use rustix::net::{self, AddressFamily, SocketType};
 
 /// A loopback port held by a socket that owns it and refuses connections to it (bound
-/// and not listening on Linux; also connected to itself on macOS, see the module docs).
+/// and not listening on Linux; also connected to a peer on macOS, see the module docs).
 ///
 /// The IPv4 loopback port is held; the same port number on `::1` is held too when the
 /// host has IPv6 loopback and the number is free there (best effort: a test that
 /// dials `::1` with this number then gets "refused" as well).
 #[derive(Debug)]
 pub struct Reserved {
-    v4: OwnedFd,
+    v4: Held,
     // Held for its lifetime only.
-    _v6: Option<OwnedFd>,
+    _v6: Option<Held>,
     port: u16,
 }
 
@@ -61,7 +63,7 @@ impl Reserved {
     #[must_use]
     pub fn new() -> Self {
         let v4 = new_v4();
-        let port = local_port(&v4);
+        let port = local_port(&v4.fd);
         let v6 = held_socket(SocketAddr::from((Ipv6Addr::LOCALHOST, port))).ok();
         Self { v4, _v6: v6, port }
     }
@@ -86,10 +88,10 @@ impl Reserved {
     #[must_use]
     pub fn listen(self) -> TcpListener {
         #[cfg(target_os = "linux")]
-        let fd = self.v4;
+        let fd = self.v4.fd;
         #[cfg(not(target_os = "linux"))]
         let fd = {
-            // A self-connected socket cannot listen: release it and bind the listener
+            // A connected socket cannot listen: release it and its peer and bind the listener
             // (SO_REUSEADDR for the closing connection's leftover state).
             let addr = self.addr();
             drop(self.v4);
@@ -104,7 +106,7 @@ impl Reserved {
 }
 
 /// The IPv4 half of a new [`Reserved`]: a free number on `127.0.0.1`, held.
-fn new_v4() -> OwnedFd {
+fn new_v4() -> Held {
     held_socket(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("bind a loopback socket")
 }
 
@@ -126,28 +128,44 @@ fn bound_socket(addr: SocketAddr) -> rustix::io::Result<OwnedFd> {
     Ok(fd)
 }
 
-/// A socket that owns `addr` and refuses connections to it, on every platform: bound
-/// and connected to its own address (see the module docs for why macOS needs that).
-/// Only the held port of a [`Reserved`] on macOS uses it; Linux tests it too.
+/// A held port: the socket that owns it and, on macOS, the accepted end of the
+/// connection it was made with, kept open so that connection stays established.
+#[derive(Debug)]
+struct Held {
+    fd: OwnedFd,
+    _peer: Option<OwnedFd>,
+}
+
+/// A socket that owns `addr` and refuses connections to it on every platform: bound
+/// and connected to a peer socket of this process (see the module docs for why macOS
+/// needs that). The held port of a [`Reserved`] on macOS uses it; Linux tests it too.
 #[cfg(any(not(target_os = "linux"), test))]
-fn self_connected_socket(addr: SocketAddr) -> rustix::io::Result<OwnedFd> {
+fn connected_socket(addr: SocketAddr) -> rustix::io::Result<Held> {
     let fd = bound_socket(addr)?;
-    // Port 0 was bound to a number: connect to that, the socket's own address.
-    let own = SocketAddr::new(addr.ip(), local_port(&fd));
-    net::connect(&fd, &own)?;
-    Ok(fd)
+    // A listener on a port of its own, used for this one connection and then closed.
+    let listener = bound_socket(SocketAddr::new(addr.ip(), 0))?;
+    net::listen(&listener, 1)?;
+    net::connect(&fd, &SocketAddr::new(addr.ip(), local_port(&listener)))?;
+    let peer = net::accept(&listener)?;
+    Ok(Held {
+        fd,
+        _peer: Some(peer),
+    })
 }
 
 /// The socket that holds `addr`: bound only, on Linux.
 #[cfg(target_os = "linux")]
-fn held_socket(addr: SocketAddr) -> rustix::io::Result<OwnedFd> {
-    bound_socket(addr)
+fn held_socket(addr: SocketAddr) -> rustix::io::Result<Held> {
+    Ok(Held {
+        fd: bound_socket(addr)?,
+        _peer: None,
+    })
 }
 
-/// The socket that holds `addr`: self-connected, elsewhere.
+/// The socket that holds `addr`: connected to a peer, elsewhere.
 #[cfg(not(target_os = "linux"))]
-fn held_socket(addr: SocketAddr) -> rustix::io::Result<OwnedFd> {
-    self_connected_socket(addr)
+fn held_socket(addr: SocketAddr) -> rustix::io::Result<Held> {
+    connected_socket(addr)
 }
 
 fn local_port(fd: &OwnedFd) -> u16 {
@@ -273,13 +291,13 @@ mod tests {
         }
     }
 
-    /// Catches a self-connected socket (the macOS holder, run here too) that can be
-    /// taken or that does not refuse: same assertions as for the Linux holder.
+    /// Catches a connected holder (the macOS one, run here too) that can be taken or
+    /// that does not refuse: same assertions as for the Linux holder.
     #[test]
-    fn a_self_connected_socket_holds_its_port_and_refuses() {
-        let held = self_connected_socket(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-            .expect("self-connect");
-        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, local_port(&held)));
+    fn a_connected_socket_holds_its_port_and_refuses() {
+        let held = connected_socket(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("connect to a peer");
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, local_port(&held.fd)));
         assert!(TcpListener::bind(addr).is_err(), "a thief took the port");
         let err = TcpStream::connect(addr).expect_err("refused");
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused, "{err}");
