@@ -1,18 +1,15 @@
-//! `cargo xtask pkg-config`, `pkg-build` and `pkg-install-test` run as CI runs them, over
-//! copies of the repository's packaging files and the test-only `kbf-installer-stub`.
-//! The programs nfpm and docker are `false`: what is tested here is the command line and
-//! how a failing program is reported; the packages themselves are built and installed
-//! by CI (the `packages` job), and the logic is tested in `src/pkg/tests.rs` and
-//! `src/pkg_install/tests.rs`.
+//! `cargo xtask pkg build|cask` run as CI runs them, with `xtask-fake` copied
+//! as `kbf-installer`, the stub of the real tool, as the binary to package.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
-const STUB: &str = env!("CARGO_BIN_EXE_kbf-installer-stub");
-const FALSE: &str = "/usr/bin/false";
+const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
+const PLIST: &str = "../../packaging/macos/com.komira.kbf-installer.plist";
+const URL: &str = "https://github.com/komira-ai/komira-build-farm/releases/download/v1/x";
 
-/// An empty directory of its own for one test.
+/// An empty directory of its own for one test, holding the stub as `kbf-installer`.
 fn scratch(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("xtask-pkg")
@@ -21,148 +18,173 @@ fn scratch(name: &str) -> PathBuf {
         std::fs::remove_dir_all(&dir).expect("clear scratch");
     }
     std::fs::create_dir_all(&dir).expect("scratch");
+    std::fs::copy(FAKE, dir.join("kbf-installer")).expect("the stub");
     dir
 }
 
-/// Copies the repository's packaging inputs and the stub into `dir`.
-fn copy_inputs(dir: &Path) {
-    let packaging = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux");
-    for sub in ["testdata/units", "testdata/trust"] {
-        let to = dir.join(sub);
-        std::fs::create_dir_all(&to).expect("dir");
-        for entry in std::fs::read_dir(packaging.join(sub)).expect("read") {
-            let entry = entry.expect("entry");
-            std::fs::copy(entry.path(), to.join(entry.file_name())).expect("copy");
-        }
-    }
-    for file in [
-        "sysusers.d/kbf-installer.conf",
-        "tmpfiles.d/kbf-installer.conf",
-    ] {
-        std::fs::copy(packaging.join(file), dir.join(file.replace('/', "-"))).expect("copy");
-    }
-    std::fs::copy(STUB, dir.join("kbf-installer")).expect("stub");
+fn plist() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(PLIST)
+}
+
+fn run(args: &[&str]) -> (Option<i32>, String, String) {
+    let out: Output = Command::new(XTASK).args(args).output().expect("run xtask");
+    let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    (out.status.code(), text(&out.stdout), text(&out.stderr))
 }
 
 fn s(p: &Path) -> &str {
     p.to_str().expect("utf-8 path")
 }
 
-fn xtask(args: &[&str]) -> Output {
-    Command::new(XTASK).args(args).output().expect("run xtask")
-}
-
-fn text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-/// `pkg-config` over the copies in `dir`, into `dir/out`.
-fn config(dir: &Path, version: &str) -> Output {
-    copy_inputs(dir);
-    let out = dir.join("out");
-    xtask(&[
-        "pkg-config",
+fn pkg_build(dir: &Path, out: &Path, extra: &[&str]) -> (Option<i32>, String, String) {
+    let binary = dir.join("kbf-installer");
+    let plist = plist();
+    let mut args = vec![
+        "pkg",
+        "build",
         "--binary",
-        s(&dir.join("kbf-installer")),
-        "--units",
-        s(&dir.join("testdata/units")),
-        "--trust",
-        s(&dir.join("testdata/trust")),
-        "--sysusers",
-        s(&dir.join("sysusers.d-kbf-installer.conf")),
-        "--tmpfiles",
-        s(&dir.join("tmpfiles.d-kbf-installer.conf")),
-        "--platform",
-        "linux-x86_64",
+        s(&binary),
+        "--launchd-plist",
+        s(&plist),
         "--version",
-        version,
+        "0.1.0",
         "--out",
-        s(&out),
-    ])
+        s(out),
+    ];
+    args.extend_from_slice(extra);
+    run(&args)
 }
 
 #[test]
-fn the_stub_prints_its_arguments_and_exits_zero() {
-    let out = Command::new(STUB)
-        .args(["boot-check", "--x"])
+fn the_stub_prints_its_arguments_on_both_outputs_and_exits_0() {
+    let dir = scratch("stub");
+    let out = Command::new(dir.join("kbf-installer"))
+        .args(["serve", "--version"])
         .output()
-        .expect("stub");
+        .expect("run the stub");
     assert!(out.status.success());
-    assert_eq!(
-        text(&out.stdout),
-        "kbf-installer-stub (test only) boot-check --x\n"
-    );
+    assert_eq!(out.stdout, b"kbf-installer-stub serve --version\n");
+    assert_eq!(out.stderr, b"kbf-installer-stub serve --version\n");
 }
 
 #[test]
-fn pkg_config_writes_the_configuration_and_the_listing() {
-    let dir = scratch("config");
-    let out = config(&dir, "0.0.0+ci");
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
-    let yaml = std::fs::read_to_string(dir.join("out/nfpm.yaml")).expect("yaml");
-    assert!(yaml.contains("dst: \"/usr/bin/kbf-installer\""), "{yaml}");
-    let listing = std::fs::read_to_string(dir.join("out/listing.txt")).expect("listing");
+fn pkg_build_writes_the_package_and_names_its_sum_and_is_the_same_twice() {
+    let a = scratch("build-a");
+    let b = scratch("build-b");
+    let trust = a.join("trusted_root.jsonl");
+    std::fs::write(&trust, b"{}\n").unwrap();
+    let (code, stdout, stderr) = pkg_build(&a, &a.join("out"), &["--trust", s(&trust)]);
+    assert_eq!((code, stderr.as_str()), (Some(0), ""), "{stdout}");
+    let name = "kbf-installer-0.1.0-macos-arm64.pkg";
+    let pkg = std::fs::read(a.join("out").join(name)).unwrap();
+    assert_eq!(&pkg[..4], b"xar!");
+    let mut lines = stdout.lines();
+    assert_eq!(lines.next(), Some(format!("packaged {name}:").as_str()));
+    let sum = lines.next().unwrap();
     assert!(
-        listing.contains(" /usr/lib/systemd/system/kbf-node.service "),
-        "{listing}"
+        sum.ends_with(&format!("  {name}")) && sum.len() == 64 + 2 + name.len(),
+        "{sum}"
     );
+    // Another directory and copy of the stub, the same trust file: the same bytes.
+    let trust_b = b.join("trusted_root.jsonl");
+    std::fs::write(&trust_b, b"{}\n").unwrap();
+    let (code, _, stderr) = pkg_build(&b, &b.join("out"), &["--trust", s(&trust_b)]);
+    assert_eq!((code, stderr.as_str()), (Some(0), ""));
+    assert_eq!(pkg, std::fs::read(b.join("out").join(name)).unwrap());
+    // It will not replace the package.
+    let (code, _, stderr) = pkg_build(&a, &a.join("out"), &["--trust", s(&trust)]);
+    assert_eq!(code, Some(1));
+    assert!(stderr.starts_with("xtask: write "), "{stderr}");
 }
 
 #[test]
-fn pkg_config_refuses_a_bad_version_with_every_problem() {
-    let dir = scratch("config-refused");
-    let out = config(&dir, "v 1");
-    assert_eq!(out.status.code(), Some(1));
+fn pkg_build_is_a_usage_error_for_a_bad_version_and_a_refusal_for_an_ungated_job() {
+    let dir = scratch("refuse");
+    let out = dir.join("out");
+    let binary = dir.join("kbf-installer");
+    let good = plist();
+    let args = |plist: &Path, version: &'static str| {
+        run(&[
+            "pkg",
+            "build",
+            "--binary",
+            s(&binary),
+            "--launchd-plist",
+            s(plist),
+            "--version",
+            version,
+            "--out",
+            s(&out),
+        ])
+    };
+    let (code, _, stderr) = args(&good, "1 2");
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("is not a version"), "{stderr}");
+    let ungated = dir.join("job.plist");
+    let text = std::fs::read_to_string(&good).unwrap();
+    std::fs::write(
+        &ungated,
+        text.replace(
+            "<key>RunAtLoad</key>\n\t<false/>",
+            "<key>RunAtLoad</key>\n\t<true/>",
+        ),
+    )
+    .unwrap();
+    let (code, _, stderr) = args(&ungated, "1");
+    assert_eq!(code, Some(1));
     assert!(
-        text(&out.stderr).contains("version \"v 1\""),
-        "{}",
-        text(&out.stderr)
+        stderr.contains("does not say the job is not started at load"),
+        "{stderr}"
     );
+    assert!(!out.exists());
 }
 
 #[test]
-fn pkg_build_and_pkg_install_test_report_a_program_that_fails() {
-    let dir = scratch("programs");
-    assert_eq!(config(&dir, "0.0.0+ci").status.code(), Some(0));
-    let config = dir.join("out/nfpm.yaml");
-    let build = xtask(&[
-        "pkg-build",
-        "--nfpm",
-        FALSE,
-        "--config",
-        s(&config),
+fn pkg_cask_writes_a_file_naming_the_sum_of_what_it_installs() {
+    let dir = scratch("brew");
+    let name = "kbf-installer-1.0.0-macos-arm64.pkg";
+    std::fs::write(dir.join(name), b"pkg bytes").unwrap();
+    let cask = dir.join("cask.rb");
+    let pkg = dir.join(name);
+    let (code, stdout, stderr) = run(&[
+        "pkg",
+        "cask",
+        "--pkg",
+        s(&pkg),
+        "--version",
+        "1.0.0",
+        "--url",
+        URL,
         "--out",
-        s(&dir.join("pkgs")),
-        "--source-date-epoch",
-        "5",
+        s(&cask),
     ]);
-    assert_eq!(build.status.code(), Some(1));
+    assert_eq!((code, stderr.as_str()), (Some(0), ""), "{stdout}");
+    let text = std::fs::read_to_string(&cask).unwrap();
     assert!(
-        text(&build.stderr).contains("nfpm package -p deb"),
-        "{}",
-        text(&build.stderr)
+        text.contains(&format!("sha256 \"{}\"", sha256_of(b"pkg bytes"))),
+        "{text}"
     );
-    let image = dir.join("image");
-    std::fs::create_dir_all(&image).expect("image dir");
-    let install = xtask(&[
-        "pkg-install-test",
-        "--package",
-        s(&dir.join("kbf-installer.deb")),
-        "--format",
-        "deb",
-        "--listing",
-        s(&dir.join("out/listing.txt")),
-        "--image-dir",
-        s(&image),
-        "--gate",
-        "kbf-node.service=/etc/kbf/kbf.toml",
-        "--docker",
-        FALSE,
+    // A name that is not the version's package.
+    let (code, _, stderr) = run(&[
+        "pkg",
+        "cask",
+        "--pkg",
+        s(&pkg),
+        "--version",
+        "2.0.0",
+        "--url",
+        URL,
+        "--out",
+        s(&dir.join("c2.rb")),
     ]);
-    assert_eq!(install.status.code(), Some(1));
+    assert_eq!(code, Some(1));
     assert!(
-        text(&install.stderr).contains("docker build"),
-        "{}",
-        text(&install.stderr)
+        stderr.contains("is not named kbf-installer-2.0.0-macos-arm64.pkg"),
+        "{stderr}"
     );
+}
+
+fn sha256_of(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
 }

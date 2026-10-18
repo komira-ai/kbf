@@ -259,7 +259,7 @@ impl World {
     }
 
     fn stat(&self, path: &str) -> Out {
-        if let Some((_, mode)) = pkg::TMPFILES_DIRS.iter().find(|(p, _)| *p == path) {
+        if let Some((_, mode)) = pkg_linux::TMPFILES_DIRS.iter().find(|(p, _)| *p == path) {
             return if self.users_made && !self.is(Defect::DirNotMade) {
                 ok(&format!("root:root:{mode}:directory"))
             } else {
@@ -296,7 +296,7 @@ impl World {
         for e in &self.entries {
             let Some(unit) = e
                 .dst
-                .strip_prefix(pkg::UNIT_DIR)
+                .strip_prefix(pkg_linux::UNIT_DIR)
                 .and_then(|u| u.strip_prefix('/'))
             else {
                 continue;
@@ -354,7 +354,7 @@ impl World {
                 fail("")
             };
         }
-        if !pkg::USERS.contains(&name) {
+        if !pkg_linux::USERS.contains(&name) {
             return fail("");
         }
         let shell = if self.is(Defect::UserWithShell) && name == "kbf-verify" {
@@ -391,7 +391,7 @@ fn run_with(format: Format, defect: Defect) -> (World, Result<Vec<String>, Error
     static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let listing = dir.join(format!("listing-{}-{call}.txt", std::process::id()));
-    std::fs::write(&listing, pkg::listing(&entries())).expect("listing");
+    std::fs::write(&listing, pkg_linux::listing(&entries())).expect("listing");
     let world = std::cell::RefCell::new(World::new(defect));
     let gates = gates();
     let result = run(
