@@ -36,6 +36,7 @@ kbf_data_dir=/Volumes/kbf/data
 kbf_labels=pool=mac rack=r2
 simulator_runtimes=none
 xcode_xip_dir=/Library/kbf/xip
+xcode_disable_manifest_sandbox=1
 xcode=17A000:/Applications/Xcode-26.6.app/Contents/Developer:1111111111111111111111111111111111111111111111111111111111111111
 xcode=18A000:/Applications/Xcode-27.0.app/Contents/Developer:2222222222222222222222222222222222222222222222222222222222222222
 default_developer_dir=/Applications/Xcode-27.0.app/Contents/Developer

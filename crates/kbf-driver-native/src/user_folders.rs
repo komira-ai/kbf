@@ -36,9 +36,11 @@
 //! `T/TemporaryItems` (not the folder itself: an action that could replace it with a
 //! symlink would aim the daemon's sweep anywhere), to those `xcrun` names, and to an
 //! entry named by one of `MKDTEMP_PREFIXES` and at least one more character, and what
-//! is below it (one regular expression without an end anchor each), and below `C/clang/ModuleCache/`
-//! (not the folder itself, which the sweep makes, mode 0700, when it is missing), and
-//! nothing else in the two folders, the folders themselves included. The daemon finds
+//! is below it (one regular expression without an end anchor each), below `C/clang/ModuleCache/`
+//! (not the folder itself, which the sweep makes, mode 0700, when it is missing) and
+//! `C/com.apple.dt.xcodebuild/` (`xcodebuild`'s `Cache.db` and `fsCachedData`), to
+//! `xcodebuild`'s plug-in cache file (and its temporary name) in
+//! `C/com.apple.DeveloperTools/<version>/Xcode/`, and nothing else in the two folders, the folders themselves included. The daemon finds
 //! the folders once, at start ([`UserFolders::detect`]), with every link resolved: the
 //! sandbox compares the real paths of the files written. The sweep makes
 //! `TemporaryItems` (mode 0700) when it is missing, since an action cannot.
@@ -49,7 +51,8 @@
 //! open there, and can rewrite `xcrun_db`, which the next lease's compiler shims read
 //! to find their tools, or leave a `.pcm` in `ModuleCache` that the next Metal compile
 //! reads (clang checks a module file against its sources and flags, not against who
-//! wrote it). The daemon runs no developer tool outside the sandbox while it
+//! wrote it), or change the `Cache.db` and plug-in cache the next lease's `xcodebuild`
+//! reads. The daemon runs no developer tool outside the sandbox while it
 //! serves, so what a lease wrote there reaches only sandboxed tools: every survey of
 //! the Xcodes, the first and those it repeats while the node serves
 //! ([`crate::xcode_watch`]), asks each question under the actions' sandbox, where
@@ -102,6 +105,15 @@ const XCRUN_DB: &str = "xcrun_db";
 /// `CLANG_MODULE_CACHE_PATH`) keep their module caches: a directory per compiler
 /// configuration, holding the `.pcm` files.
 const MODULE_CACHE: [&str; 2] = ["clang", "ModuleCache"];
+
+/// The folder in the cache folder where `xcodebuild` keeps its `NSURLCache`
+/// (`Cache.db`, `fsCachedData`), found through `DARWIN_USER_CACHE_DIR`, not `HOME`.
+const XCODEBUILD_CACHE: &str = "com.apple.dt.xcodebuild";
+
+/// The tail of what `xcodebuild` writes to
+/// `C/com.apple.DeveloperTools/<Xcode version>-<build>/Xcode/` in the cache folder: its
+/// plug-in cache, and the temporary name it writes before the rename (any suffix).
+const PLUGIN_CACHE: &str = "PlugInCache-xcodebuild.xcplugincache";
 
 /// The names in the temporary folder that a tool makes with `mkdtemp` (or a result
 /// path of its own), each a prefix and then the tool's random characters, and the tool
@@ -200,12 +212,14 @@ impl UserFolders {
         let temp = regex_quote(&self.temp.to_string_lossy());
         let cache = regex_quote(&self.cache.to_string_lossy());
         let modules = MODULE_CACHE.join("/");
+        let xcodebuild_cache = regex_quote(XCODEBUILD_CACHE);
+        let plugin_cache = regex_quote(PLUGIN_CACHE);
         let prefixed: String = MKDTEMP_PREFIXES
             .iter()
             .map(|prefix| format!("  (regex #\"^{temp}/{}[^/]+\")\n", regex_quote(prefix)))
             .collect();
         format!(
-            "(allow file-write*\n  (regex #\"^{temp}/{TEMPORARY_ITEMS}/\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\")\n{prefixed}  (regex #\"^{cache}/{modules}/\"))\n",
+            "(allow file-write*\n  (regex #\"^{temp}/{TEMPORARY_ITEMS}/\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\")\n{prefixed}  (regex #\"^{cache}/{modules}/\")\n  (regex #\"^{cache}/{xcodebuild_cache}/\")\n  (regex #\"^{cache}/com\\.apple\\.DeveloperTools/[^/]+/Xcode/{plugin_cache}[^/]*$\"))\n",
         )
     }
 
@@ -468,7 +482,9 @@ mod tests {
              (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/TemporaryDirectory\\.[^/]+\")\n  \
              (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/cryptex\\.personalize\\.[^/]+\")\n  \
              (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/ResultBundle_[^/]+\")\n  \
-             (regex #\"^/private/var/folders/ab/c\\+d\\.e/C/clang/ModuleCache/\"))\n"
+             (regex #\"^/private/var/folders/ab/c\\+d\\.e/C/clang/ModuleCache/\")\n  \
+             (regex #\"^/private/var/folders/ab/c\\+d\\.e/C/com\\.apple\\.dt\\.xcodebuild/\")\n  \
+             (regex #\"^/private/var/folders/ab/c\\+d\\.e/C/com\\.apple\\.DeveloperTools/[^/]+/Xcode/PlugInCache-xcodebuild\\.xcplugincache[^/]*$\"))\n"
         );
         assert_eq!(
             regex_quote("a.^$*+?()[]{}|b/-"),

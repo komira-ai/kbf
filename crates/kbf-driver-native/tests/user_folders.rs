@@ -732,15 +732,41 @@ fn package_with_a_local_dependency() -> Vec<(String, Vec<u8>)> {
     ]
 }
 
+/// Has SwiftPM's manifest sandbox off for every user of this runner, the way
+/// `kbf-mac-provision`'s `xcode_disable_manifest_sandbox` does on a node (the system
+/// domain of `com.apple.dt.Xcode`, which each user's `xcodebuild` reads after its own).
+/// A hosted runner is not provisioned, so the test does it. The action does not: its
+/// profile denies `user-preference-write`, and `xcodebuild` 26 answers
+/// `-IDEPackageSupportDisableManifestSandbox YES` with its usage text.
+fn disable_manifest_sandbox_for_all_users() {
+    let out = std::process::Command::new("sudo")
+        .args([
+            "-n",
+            "/usr/bin/defaults",
+            "write",
+            "/Library/Preferences/com.apple.dt.Xcode",
+            "IDEPackageSupportDisableManifestSandbox",
+            "-bool",
+            "true",
+        ])
+        .output()
+        .expect("run sudo defaults");
+    assert!(
+        out.status.success(),
+        "the runner's manifest sandbox default cannot be set: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Catches a sandbox under which `xcodebuild` cannot build a Swift package with a
 /// dependency (derived data, package cache and cloned sources in the lease): SwiftPM
 /// writes its manifest cache in `~/Library/Caches/org.swift.swiftpm`, which it finds
-/// through the user database, not `HOME` (issue #179). SwiftPM's own sandbox for
-/// manifests is off (the user default `IDEPackageSupportDisableManifestSandbox`, what
-/// `swift build --disable-sandbox` is above), written to the lease's home through
-/// `CFFIXED_USER_HOME` and not passed as an argument: `xcodebuild` 26 answers
-/// `-IDEPackageSupportDisableManifestSandbox YES` with its usage text. `sandbox-exec`
-/// cannot nest in the action's sandbox ("sandbox_apply: Operation not permitted").
+/// through the user database, not `HOME` (issue #179), and `xcodebuild` writes its own
+/// `Cache.db` and plug-in cache in the per-user cache folder
+/// (`kbf_driver_native::user_folders`). The action is what a user writes: no default
+/// is set in it. SwiftPM's sandbox for manifests is off on the machine
+/// ([`disable_manifest_sandbox_for_all_users`]), since `sandbox-exec` cannot nest in the
+/// action's sandbox ("sandbox_apply: Operation not permitted").
 #[tokio::test]
 async fn xcodebuild_builds_a_swift_package() {
     let _tools = DEVELOPER_TOOLS.read().await;
@@ -748,15 +774,14 @@ async fn xcodebuild_builds_a_swift_package() {
         eprintln!("no Xcode on this runner: nothing to check");
         return;
     };
+    disable_manifest_sandbox_for_all_users();
     let dir = scratch("xcodebuild-package");
     let mut config: NativeConfig = config(&dir);
     config.xcodes = [(build.clone(), developer_dir)].into_iter().collect();
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config, &cas);
     let mut spec = Spec::sh(
-        "export CFFIXED_USER_HOME=\"$HOME\"; \
-         defaults write com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox -bool YES \
-         && xcodebuild -scheme hello -destination 'platform=macOS' \
+        "xcodebuild -scheme hello -destination 'platform=macOS' \
          -derivedDataPath \"$TMPDIR/dd\" -packageCachePath \"$TMPDIR/pc\" \
          -clonedSourcePackagesDirPath \"$TMPDIR/sp\" build \
          && \"$TMPDIR/dd/Build/Products/Debug/hello\"",
@@ -778,11 +803,19 @@ async fn xcodebuild_builds_a_swift_package() {
     );
 }
 
+/// Whether `xcodebuild -showComponent MetalToolchain` says the component is installed.
+fn metal_toolchain_installed(shown: &str) -> bool {
+    let shown = shown.to_lowercase();
+    shown.contains("installed") && !shown.contains("uninstalled")
+}
+
 /// Has the Metal toolchain installed for the Xcode at `developer_dir`, outside any
 /// sandbox, as the user of the runner would: a hosted runner's Xcode ships without it
 /// (`xcodebuild -showComponent MetalToolchain` says `uninstalled`), and without it no
-/// volume is ever mounted, so the test below would check nothing. Panics when the
-/// download fails: that is a runner this test cannot run on, not one to skip.
+/// volume is ever mounted, so the test below would check nothing. Downloads unless the
+/// status says installed (an unexpected status is a download, not a skip), then
+/// requires it to say installed. Panics when it does not: that is a runner this test
+/// cannot run on, not one to skip.
 fn install_metal_toolchain(developer_dir: &Path) {
     let xcodebuild = |component: &str| {
         let out = std::process::Command::new(developer_dir.join("usr/bin/xcodebuild"))
@@ -800,11 +833,19 @@ fn install_metal_toolchain(developer_dir: &Path) {
         )
     };
     let (_, shown) = xcodebuild("-showComponent");
-    if !shown.to_lowercase().contains("uninstalled") {
+    if metal_toolchain_installed(&shown) {
         return;
     }
     let (ok, downloaded) = xcodebuild("-downloadComponent");
-    assert!(ok, "the Metal toolchain cannot be installed: {downloaded}");
+    assert!(
+        ok,
+        "the Metal toolchain cannot be installed (it was: {shown}): {downloaded}"
+    );
+    let (_, shown_after) = xcodebuild("-showComponent");
+    assert!(
+        metal_toolchain_installed(&shown_after),
+        "the Metal toolchain is not installed after its download: {shown_after}"
+    );
 }
 
 /// Catches a lease that cannot end because of what `xcodebuild` had a system service
@@ -817,7 +858,10 @@ fn install_metal_toolchain(developer_dir: &Path) {
 /// a lease directory stays, or a volume stays mounted below the scratch root.
 #[tokio::test]
 async fn a_toolchain_mounted_in_the_leases_home_does_not_keep_the_lease() {
-    let _tools = DEVELOPER_TOOLS.read().await;
+    // The write lock: the asset service mounts the toolchain once for the whole machine,
+    // and a Metal compile in another test of this binary could have it mounted already
+    // (or mount it in its own home), so the count below would not be this lease's.
+    let _tools = DEVELOPER_TOOLS.write().await;
     let Some((build, developer_dir)) = newest_xcode() else {
         eprintln!("no Xcode on this runner: nothing to check");
         return;
@@ -829,16 +873,30 @@ async fn a_toolchain_mounted_in_the_leases_home_does_not_keep_the_lease() {
     let scratch_root = config.clone();
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config, &cas);
+    // The action prints what it saw, so a red run says why: the Xcode, the component's
+    // status, each step's output, and every Metal mount (a count of zero alone cannot
+    // tell a toolchain that was not installed from one that mounted late or elsewhere).
+    // A Metal compile is what has the asset service mount the toolchain (a build without
+    // Metal does not), and the mount may land after the compiler returns: the count is
+    // polled for up to a minute.
     let mut spec = Spec::sh(&format!(
         "{LAYOUT}export CFFIXED_USER_HOME=\"$HOME\"; \
-         xcodebuild -showComponent MetalToolchain > /dev/null 2>&1; \
+         echo \"developer dir: $DEVELOPER_DIR\"; \
+         xcodebuild -showComponent MetalToolchain 2>&1; \
          xcodebuild -scheme hello -destination 'platform=macOS' \
-         -derivedDataPath \"$TMPDIR/dd\" build > /dev/null 2>&1; \
-         /sbin/mount | grep -c 'MetalToolchain/mounts'"
+         -derivedDataPath \"$TMPDIR/dd\" build 2>&1 | tail -n 5; \
+         xcrun metal -c shader.metal -o \"$TMPDIR/shader.air\" 2>&1; \
+         n=0; for i in $(seq 1 30); do \
+         n=$(/sbin/mount | grep -c 'MetalToolchain/mounts'); \
+         [ \"$n\" -gt 0 ] && break; sleep 2; done; \
+         /sbin/mount | grep -i metal; \
+         echo \"mounts: $n\""
     ))
     .env("PATH", PATH)
     .property("xcode", &build);
     spec.inputs = package();
+    spec.inputs
+        .push(("shader.metal".to_owned(), SHADER.as_bytes().to_vec()));
     let action = spec.timeout(Duration::from_secs(600)).store(&cas);
     let ran = tokio::time::timeout(Duration::from_secs(630), rt.run(work(1, action, 0)))
         .await
@@ -853,9 +911,13 @@ async fn a_toolchain_mounted_in_the_leases_home_does_not_keep_the_lease() {
         .collect();
     let result = ran.unwrap_or_else(|e| panic!("the lease failed: {e}\nmounted: {left:#?}"));
     let out = stdout(&cas, &result);
+    let mounts = out
+        .lines()
+        .find_map(|line| line.strip_prefix("mounts: "))
+        .and_then(|n| n.trim().parse::<u32>().ok());
     assert!(
-        out.trim().parse::<u32>().is_ok_and(|n| n > 0),
-        "the toolchain was not mounted during the action, so this checks nothing: {out}\n{}",
+        mounts.is_some_and(|n| n > 0),
+        "the toolchain was not mounted during the action, so this checks nothing:\n{out}\n{}",
         stderr(&cas, &result)
     );
     assert!(left.is_empty(), "mounted after the lease: {left:#?}");
