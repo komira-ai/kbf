@@ -863,6 +863,7 @@ fn readable_map() -> pb::Map {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = kbf_map::Map::new(4, vec![member], kbf_map::Rule::Rendezvous, 1, 1, Vec::new())
         .expect("a map");
@@ -1056,6 +1057,7 @@ async fn a_map_that_is_not_newer_changes_nothing() {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = kbf_map::Map::new(4, vec![member], kbf_map::Rule::Rendezvous, 1, 1, Vec::new())
         .expect("a map");
@@ -1131,6 +1133,7 @@ async fn the_node_map_is_the_holders_and_knows_the_member_the_registration_named
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = |generation| {
         kbf_map::Map::new(
@@ -1288,6 +1291,7 @@ async fn a_write_through_the_halfs_in_process_view_is_judged_by_the_map_and_owes
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = kbf_map::Map::new(
         1_000,
@@ -1376,6 +1380,7 @@ async fn the_frontends_unowned_copy_is_stored_through_the_real_listener() {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = kbf_map::Map::new(
         1_000,
@@ -1477,6 +1482,7 @@ fn a_map(generation: u64) -> pb::Map {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = kbf_map::Map::new(
         generation,
