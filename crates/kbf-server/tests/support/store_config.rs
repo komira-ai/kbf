@@ -176,6 +176,8 @@ pub struct Farm {
     pub addr: SocketAddr,
     pub pki: Pki,
     pub store: Arc<Hooked>,
+    /// The state store the acks are kept in: apart from the members' so a test breaks one.
+    pub ack_store: Arc<Hooked>,
     pub members: Arc<Members>,
     pub acks: Arc<Acks>,
     pub source: Arc<Source>,
@@ -202,7 +204,8 @@ pub async fn farm_denying(
             replication: 1,
         },
     ));
-    let acks = Arc::new(Acks::new(Arc::clone(&store) as Arc<dyn Store>));
+    let ack_store = Hooked::new();
+    let acks = Arc::new(Acks::new(Arc::clone(&ack_store) as Arc<dyn Store>));
     let pki = Pki::new();
     let membership = MembershipService::new(Arc::clone(&members), Admission::Certified)
         .with_store_config(
@@ -231,6 +234,7 @@ pub async fn farm_denying(
         addr,
         pki,
         store,
+        ack_store,
         members,
         acks,
         source,

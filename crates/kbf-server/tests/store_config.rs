@@ -402,3 +402,65 @@ async fn the_worker_deny_list_file_applies_at_every_call() {
         .await
         .expect("node-b is served");
 }
+
+/// Catches: a membership call that fails because the acks cannot be kept. The registration is
+/// the frontend's extra; a node's membership must not depend on it. With the acks' store
+/// failing (a read, a write), conflicting at every attempt, or panicking, `Register` and
+/// `Heartbeat` still answer, the heartbeat's report is lost (the farm reads `pending`, the safe
+/// side), and nothing about the failure reaches the node.
+///
+/// Mutants: the error of `record` or `forget` returned from the call.
+#[tokio::test]
+async fn acks_that_cannot_be_kept_do_not_fail_the_membership_calls() {
+    use std::sync::atomic::Ordering;
+    let farm = farm(Source::new(4), false).await;
+    let channel = farm
+        .pki
+        .channel(farm.addr, farm.pki.client(Some("storage"), &["node-a"]))
+        .await;
+    let mut node = membership(&channel);
+    let beat = |joined: &pb::RegisterResponse| pb::HeartbeatRequest {
+        member_id: joined.member_id,
+        boot: joined.boot,
+        applied_objstore_generation: 4,
+        apply_status: pb::ApplyStatus::Ok as i32,
+        ..Default::default()
+    };
+
+    // The delete at the register fails: the node is still registered.
+    farm.ack_store.fail_txns.store(1, Ordering::SeqCst);
+    let joined = node
+        .register(registration("node-a"))
+        .await
+        .expect("registers")
+        .into_inner();
+    let map = kbf_map::Map::try_from(joined.map.clone().expect("a map")).expect("a map");
+
+    // The read at the heartbeat fails, then panics: the node still beats.
+    farm.ack_store.fail_gets.store(1, Ordering::SeqCst);
+    node.heartbeat(beat(&joined)).await.expect("beats");
+    farm.ack_store.panic_gets.store(1, Ordering::SeqCst);
+    node.heartbeat(beat(&joined)).await.expect("beats");
+    assert!(
+        !farm.acks.convergence(&map, 4).expect("read").converged,
+        "nothing was kept"
+    );
+
+    // Every write conflicts: the report is dropped after its attempts, the delete is a no-op.
+    farm.ack_store.conflict_on(Some("objstore/ack/"));
+    node.heartbeat(beat(&joined)).await.expect("beats");
+    node.register(registration("node-a"))
+        .await
+        .expect("registers again");
+    farm.ack_store.conflict_on(None);
+    assert!(!farm.acks.convergence(&map, 4).expect("read").converged);
+
+    // And with the store back, the next report counts.
+    let again = node
+        .register(registration("node-a"))
+        .await
+        .expect("again")
+        .into_inner();
+    node.heartbeat(beat(&again)).await.expect("beats");
+    assert!(farm.acks.convergence(&map, 4).expect("read").converged);
+}

@@ -28,6 +28,8 @@ pub struct Hooked {
     pub fail_reaps: AtomicUsize,
     /// How many of the next `get`s panic (a store that crashes inside its blocking task).
     pub panic_gets: AtomicUsize,
+    /// How many of the next transactions fail with a store error.
+    pub fail_txns: AtomicUsize,
 }
 
 impl Hooked {
@@ -42,6 +44,7 @@ impl Hooked {
             fail_gets: AtomicUsize::new(0),
             panic_gets: AtomicUsize::new(0),
             fail_reaps: AtomicUsize::new(0),
+            fail_txns: AtomicUsize::new(0),
         })
     }
 
@@ -103,6 +106,13 @@ fn writes_map(txn: &Txn) -> bool {
 
 impl Store for Hooked {
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
+        if self
+            .fail_txns
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(StoreError::Failed("injected".to_owned()));
+        }
         let prefix = self
             .conflict_on
             .lock()
