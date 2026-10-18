@@ -202,6 +202,13 @@ pub struct FrontendFlags {
     pub handover: Option<Handover>,
 }
 
+/// The long names of the flags of [`Args`] that `kbf frontend` hides and refuses by name
+/// ([`parse`]): every flag outside [`ALLOWED`] and the thread flags.
+#[must_use]
+pub fn refused_flags() -> std::collections::BTreeSet<String> {
+    crate::flag_set::refused_names(ALLOWED)
+}
+
 /// The command line of `kbf frontend`: [`Args`]'s, those it takes shown and the rest
 /// hidden (so [`parse`] can refuse them by name), `--storage` required, and the three
 /// flags toward storage.
