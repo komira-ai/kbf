@@ -578,9 +578,41 @@ fn every_verb_refuses_while_a_deploy_is_pending() {
     }
 }
 
+/// Catches a unit whose name is not UTF-8 (it could not be named in a plan line) being
+/// read past: the name and the path it was found at are in the error. This one asks the
+/// check itself, which needs no file system.
+#[test]
+fn a_name_that_is_not_utf8_is_refused_with_its_path() {
+    let name = OsStr::from_bytes(b"bad\xff.service");
+    let full = Path::new("/src/units").join(name);
+    let err = utf8(name, &full).expect_err("not utf-8");
+    assert_eq!(err.to_string(), format!("{full:?} is not a UTF-8 name"));
+    assert_eq!(
+        utf8(OsStr::new("ok.service"), &full).expect("utf-8"),
+        "ok.service"
+    );
+}
+
+/// The same, end to end through a source directory that holds such a unit.
+///
+/// Linux only: APFS and HFS+ refuse to create a file whose name is not valid UTF-8
+/// (EILSEQ, "Illegal byte sequence"), so the directory this reads cannot exist on macOS.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_unit_file_whose_name_is_not_utf8_ends_the_install() {
+    let (mut exec, root) = host("errors-odd-host");
+    let odd = source("errors-odd", "A", Some(&[]));
+    let name = OsStr::from_bytes(b"bad\xff.service");
+    fs::write(odd.join("units").join(name), "x").expect("seed");
+    let err = install_on(&mut exec, &root, A, &odd, Mode::DryRun).expect_err("not utf-8");
+    assert_eq!(
+        err.to_string(),
+        format!("{:?} is not a UTF-8 name", odd.join("units").join(name))
+    );
+}
+
 /// Catches errors passed over or misnamed: a source without `kbf`, with `units` a file,
-/// with a unit whose name is not UTF-8 (it could not be named in a plan line), a state
-/// file that cannot be parsed, a `current` that is a directory, and a layout directory
+/// a state file that cannot be parsed, a `current` that is a directory, and a layout directory
 /// that cannot be read.
 #[test]
 fn errors_name_what_is_wrong() {
@@ -598,14 +630,6 @@ fn errors_name_what_is_wrong() {
         "cannot read {}",
         units_file.join("units").display()
     )));
-    let odd = source("errors-odd", "A", Some(&[]));
-    let name = OsStr::from_bytes(b"bad\xff.service");
-    fs::write(odd.join("units").join(name), "x").expect("seed");
-    let err = install_on(&mut exec, &root, A, &odd, Mode::DryRun).expect_err("not utf-8");
-    assert_eq!(
-        err.to_string(),
-        format!("{:?} is not a UTF-8 name", odd.join("units").join(name))
-    );
 
     let ok = source("errors-ok", "A", None);
     fs::create_dir_all(exec.at("/usr/local/kbf/current")).expect("a directory");
