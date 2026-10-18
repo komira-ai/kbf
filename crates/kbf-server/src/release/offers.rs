@@ -366,6 +366,7 @@ mod tests {
             commit: COMMIT.to_owned(),
             platform: platform.as_str().to_owned(),
             components: Vec::new(),
+            ..UpdateOffer::default()
         }
     }
 
