@@ -8,6 +8,12 @@
 //!   `--json`, `<binary> --version --json` (kbf's build identity, crates/kbf-cli) must
 //!   also print a JSON object whose `commit` is the first 12 of `<commit>` and whose
 //!   `profile` is `release`: the shipped bytes say what they are.
+//! - `check-asset <tarball> <commit>`: `check --json` on the binary in a release
+//!   tarball, so the bytes that ship are the ones checked (`check` runs on the binary
+//!   before it is packaged). The tarball is `<name>-<commit>-<platform>.tar.gz` for
+//!   this `<commit>`, exactly the one entry `package` writes; the binary `<name>` is
+//!   taken out into a directory under `<root>/target` (the job's workspace, which the
+//!   verb removes again) and checked there, as `check --json <name> <commit>`.
 //! - `stamps <commit>`: from the checkout, a plain build of kbf-server passes `check`
 //!   for `<commit>`; builds with `KBF_BUILD_COMMIT_OVERRIDE` set to two stamps each pass
 //!   `check` for their own stamp (so they name no other commit; a `<commit>` that begins
@@ -16,10 +22,12 @@
 //!   `target/debug`. Cargo is the `CARGO` the verb was started with.
 
 use std::ffi::OsStr;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use crate::Error;
+use crate::package::{self, Platform};
 
 /// The variable kbf-server's build script takes in place of the checkout's commit.
 pub const OVERRIDE: &str = "KBF_BUILD_COMMIT_OVERRIDE";
@@ -73,6 +81,16 @@ pub fn control_commit(commit: &str) -> String {
 /// A commit as git writes it: 12 to 40 lowercase hex digits.
 pub fn is_commit(text: &str) -> bool {
     (12..=40).contains(&text.len()) && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A full commit SHA (40 lowercase hex digits), or a usage error naming the flag.
+pub(crate) fn full_commit(flag: &str, commit: &str) -> Result<(), Error> {
+    if commit.len() == 40 && is_commit(commit) {
+        return Ok(());
+    }
+    Err(Error::Usage(format!(
+        "{flag} {commit:?} is not a full commit SHA (40 lowercase hex digits)"
+    )))
 }
 
 /// `check` on a `--version` line, with the comparison `names` given (the real one is
@@ -179,6 +197,84 @@ pub fn check(binary: &Path, commit: &str, json: bool) -> Result<String, Error> {
         return Ok(format!("ok: {version}; {identity}"));
     }
     Ok(format!("ok: {version}"))
+}
+
+/// The binary a release tarball is for: `<name>` in `<name>-<commit>-<platform>.tar.gz`
+/// (the file name of `tarball`, as `package` makes it).
+///
+/// # Errors
+/// The file name is not of that form for this `commit`.
+pub fn asset_name(tarball: &Path, commit: &str) -> Result<String, Error> {
+    let file = tarball
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    file.strip_suffix(".tar.gz")
+        .and_then(|rest| {
+            Platform::ALL
+                .into_iter()
+                .find_map(|p| rest.strip_suffix(&format!("-{}", p.name())))
+        })
+        .and_then(|rest| rest.strip_suffix(&format!("-{commit}")))
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| Error::Failed(format!("{file:?} is not <name>-{commit}-<platform>.tar.gz")))
+}
+
+/// A directory of this process alone where a binary taken out of a tarball runs, removed
+/// when dropped.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    /// `<parent>/xtask-check-asset-<pid>`, empty.
+    fn new(parent: &Path) -> Result<Scratch, Error> {
+        let dir = parent.join(format!("xtask-check-asset-{}", std::process::id()));
+        // Absent unless an earlier process with this pid left it.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).map_err(Error::spawn(format!("create {}", dir.display())))?;
+        Ok(Scratch(dir))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Writes `bytes` to the new file `path`, mode 0755, and closes it, so it can be run.
+fn write_executable(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(path)
+        .and_then(|mut f| f.write_all(bytes))
+        .map_err(Error::spawn(format!("write {}", path.display())))
+}
+
+/// `check-asset <tarball> <commit>`: the line it prints on success. The tarball is
+/// `<name>-<commit>-<platform>.tar.gz` ([`asset_name`]) and must be the one entry
+/// `package` writes. The binary in it is taken out into a directory under `scratch_in`,
+/// removed afterwards, and passes `check --json` for `commit`: the bytes that ship are
+/// the bytes whose identity is checked.
+///
+/// # Errors
+/// `commit` is not a commit, the file name is not that of a tarball of `commit`, the
+/// tarball cannot be read or is not exactly the one binary, or as [`check`] with `json`.
+pub fn check_asset(scratch_in: &Path, tarball: &Path, commit: &str) -> Result<String, Error> {
+    if !is_commit(commit) {
+        return Err(Error::NotACommit(commit.to_owned()));
+    }
+    let name = asset_name(tarball, commit)?;
+    let bytes = crate::darwin::packaged_binary(tarball, &package::read(tarball)?, &name)?;
+    let scratch = Scratch::new(scratch_in)?;
+    let binary = scratch.0.join(&name);
+    write_executable(&binary, &bytes)?;
+    let checked = check(&binary, commit, true)?;
+    let shown = tarball.file_name().unwrap_or(tarball.as_os_str());
+    Ok(format!("{}: {checked}", shown.to_string_lossy()))
 }
 
 /// `cargo build --locked -p kbf-server --bin kbf-server` in `root`, with
@@ -335,6 +431,73 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "control: \"kbf-server 0.1.0+0123456789ab\" also passed for 1123456789ab"
+        );
+    }
+
+    #[test]
+    fn a_tarball_is_named_for_its_binary_commit_and_platform() {
+        // Control: catches an `asset_name` that refuses a name `package` wrote, cuts a
+        // name with a hyphen at its first hyphen, or reads the directory in front.
+        for (file, name) in [
+            (format!("kbf-{COMMIT}-linux-x86_64.tar.gz"), "kbf"),
+            (
+                format!("kbf-deploy-{COMMIT}-darwin-arm64.tar.gz"),
+                "kbf-deploy",
+            ),
+            (
+                format!("dist/kbf-daemon-{COMMIT}-linux-arm64.tar.gz"),
+                "kbf-daemon",
+            ),
+            (
+                format!("./dist/kbf-server-{COMMIT}-linux-x86_64.tar.gz"),
+                "kbf-server",
+            ),
+        ] {
+            assert_eq!(
+                asset_name(Path::new(&file), COMMIT),
+                Ok(name.to_owned()),
+                "{file}"
+            );
+        }
+        // A 12-digit commit is a commit too, and names the file as it was packaged.
+        let short = &COMMIT[..12];
+        assert_eq!(
+            asset_name(Path::new(&format!("kbf-{short}-linux-arm64.tar.gz")), short),
+            Ok("kbf".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_file_name_off_the_asset_form_names_no_binary() {
+        // Catches: a name taken from a file that is not a release tarball of this commit
+        // (the SBOM beside it, a signature, another platform's spelling), and from one
+        // whose commit is another's, a prefix of this, or longer: the commit in the name
+        // must be exactly the one checked, and the name must not be empty.
+        let other = format!("1{}", &COMMIT[1..]);
+        for file in [
+            "kbf.tar.gz".to_owned(),
+            format!("kbf-{COMMIT}-linux-x86_64.tgz"),
+            format!("kbf-{COMMIT}-linux-x86_64.tar.gz.sig"),
+            format!("kbf-{COMMIT}-linux-x86_64.cdx.json"),
+            format!("kbf-{COMMIT}-freebsd-x86_64.tar.gz"),
+            format!("kbf-{COMMIT}.tar.gz"),
+            format!("-{COMMIT}-linux-x86_64.tar.gz"),
+            format!("kbf{COMMIT}-linux-x86_64.tar.gz"),
+            format!("kbf-{other}-linux-x86_64.tar.gz"),
+            format!("kbf-{}-linux-x86_64.tar.gz", &COMMIT[..12]),
+            format!("kbf-{COMMIT}0-linux-x86_64.tar.gz"),
+            String::new(),
+        ] {
+            assert!(
+                asset_name(Path::new(&file), COMMIT).is_err(),
+                "{file:?} named a binary"
+            );
+        }
+        assert_eq!(
+            asset_name(Path::new("kbf-x.tar.gz"), COMMIT),
+            Err(Error::Failed(format!(
+                "\"kbf-x.tar.gz\" is not <name>-{COMMIT}-<platform>.tar.gz"
+            )))
         );
     }
 

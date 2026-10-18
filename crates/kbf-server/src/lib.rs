@@ -26,6 +26,9 @@
 //!   begins, a second signal escalates, and `kbf cluster` calls through [`api_client`].
 //! - Rollouts ([`rollout`]): the record's store (in memory for now) and the driver that
 //!   cordons, drains and hands drained nodes their update, as far as `updating`.
+//! - Node rolling ([`update`]): the pure picker and node step of a split-mode update
+//!   (`docs/design/split-mode-updates.md`, sections 2.6 to 2.11), which host goes next and
+//!   its one next move. No controller drives them yet.
 //! - The MDM gate ([`mdm`]): the server's verbs at `kbf-mdm-gate` (inventory, enforce
 //!   and withdraw a macOS build, install an allowlisted profile; no erase), a client
 //!   over mutual TLS, and the polling of an update's DDM progress. Not yet called by
@@ -72,6 +75,7 @@ pub mod blobs;
 mod build_commit;
 pub mod config;
 pub mod drain;
+pub mod enroll;
 pub mod farm;
 mod fault;
 mod flag_set;
@@ -83,6 +87,7 @@ pub mod handover;
 pub mod health;
 pub mod history;
 pub mod http_blobs;
+mod http_history;
 pub mod http_invocations;
 pub mod identity;
 pub mod join;
@@ -99,6 +104,7 @@ pub mod metrics;
 mod missing;
 pub mod node_map;
 pub mod raft_log;
+mod rebuild;
 pub mod release;
 pub mod replication;
 pub mod rollout;
@@ -106,14 +112,17 @@ mod run_record;
 pub mod serve;
 pub mod stamp;
 mod start;
+mod start_exit;
 mod startup_pass;
 pub mod state_store;
 pub mod storage_half;
+pub mod storage_health;
 pub mod storage_node;
 pub mod stores;
 pub mod streams;
 mod timeout;
 pub mod token;
+pub mod update;
 pub mod worker;
 pub mod worker_roles;
 pub mod write_tier;
@@ -135,6 +144,9 @@ pub use serve::{
     bind_storage,
 };
 pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_interruptible};
+pub use start_exit::{
+    NOT_READY, REFUSED, STALE_WRITER_HINT, StartFailure, hint as start_hint, said as start_said,
+};
 pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};
 pub use streams::{StreamArgs, StreamLimits};
 pub use worker::WorkerService;

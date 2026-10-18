@@ -210,7 +210,8 @@ certificates and nodes. Each line is blank, a `#` comment, or one entry:
 ```
 serial 0A:1B:2C          # a certificate serial, hex; colons, case and leading zeros ignored
 spki-sha256 <64 hex>     # SHA-256 of the certificate's DER SubjectPublicKeyInfo
-node mac-07              # a node id, whatever certificate it presents
+node mac-07              # a node id (any case), whatever certificate it presents; a
+                         # storage certificate with this DNS name too (see "Storage nodes")
 ```
 
 `openssl x509 -noout -serial` prints a certificate's serial;
@@ -218,7 +219,8 @@ node mac-07              # a node id, whatever certificate it presents
 public key hash, which outlives a reissue with the same key. The server reads the file
 at start (a bad file stops it), and looks at it **again at every check**: each first
 `Hello` (reconnects included), each resent `Hello`, each `Heartbeat`, each `Result`,
-each `NodeStatus` and each blob call. A check reads the file's metadata (device,
+each `NodeStatus` and each blob call of a daemon, and each `Register` and `Heartbeat`
+of a storage node (below). A check reads the file's metadata (device,
 inode, size, mode, owner, modification and change time) and reads and parses the file
 again only when that changed since the last read. An entry added while a denied daemon is connected ends its stream
 `PERMISSION_DENIED` at the next of those it sends (a `Result` is refused, so it never
@@ -231,11 +233,39 @@ connection already open too. Replace the file atomically (write a new file, then
 rename it over the old one): an in-place edit that keeps the size and lands within
 the filesystem's timestamp granularity may go unseen until the next change.
 
+**Storage nodes.** The same file applies to the storage nodes that call
+`kbf.map.v1.Membership` on this listener. A storage certificate is refused `Register`
+and `Heartbeat` `PERMISSION_DENIED` when its serial or its public key is listed, or when
+**any DNS name in it** is a listed `node`. So a `node` entry is not only a daemon's node
+id: it also refuses a storage certificate that carries that DNS name, and where a host's
+daemon and its storage half share a DNS name, `node mac-07` takes both off the farm. To
+refuse one of the two, list its `serial` or `spki-sha256`. A `node` entry is compared with
+the certificate's DNS names up to ASCII case; a storage certificate's IP names are never
+matched against `node` entries (so `POST /v1/denied` refuses one that holds an IP address),
+and neither is a name with a trailing dot; list such a certificate by serial or key. A refused storage node's row lapses after the member TTL (`--member-ttl-secs`,
+15 s), its member goes `down`, and after the dwell (`--member-dwell-secs`, 300 s) it
+leaves the map and its blobs move to other owners.
+
+**The file is the worker listener's only.** The storage nodes' own listeners do not read
+it. What they refuse is the storage map's deny list, which the operator writes with
+`POST /v1/denied` ([api.md](../api.md#post-v1denied-and-delete-v1denied)): the same three
+kinds of entry, applied to every storage endpoint and to the membership service, and
+carried to the nodes in the map (the file is not). An entry in the file does not stop a
+storage node's data-plane calls; an entry in the map does. The reverse also holds: this
+listener reads the file only, so an entry added with `POST /v1/denied` takes a daemon's
+storage access and leaves its work stream and its blob calls here open. To remove a daemon,
+list it in the file as well.
+
 A file that cannot be read or parsed after start refuses every check `UNAVAILABLE`
 (fail closed) until it is fixed. That ends **every** connected daemon's stream within
 one heartbeat interval, and refuses their reconnects, so it takes the whole farm off
 line: their leases are placed again only after the grace period G, once the file is
-readable and the daemons are back.
+readable and the daemons are back. It refuses every storage node's `Register` and
+`Heartbeat` the same way. A node retries those with backoff, but one that cannot beat
+within the member TTL lapses and goes `down`, and one kept out for longer than the
+dwell leaves the map and starts re-replication of its slice. A typo in the file is
+therefore an outage for storage as well as for daemons: fix it within the dwell, and
+replace the file atomically so a half-written one is never read.
 
 **Lifetimes bound what the list misses.** There is no CRL or OCSP: a certificate left
 off the list verifies until it expires or the cell CA is replaced. Issue node

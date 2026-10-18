@@ -18,22 +18,32 @@
 //! no edit.
 //!
 //! **The map** (section 6). Without `--frontend` it is one member: this node, for one box.
-//! With `--frontend <url>` the node registers with that frontend once it is listening, and
-//! heartbeats at the interval the frontend names ([`crate::join`]); over `https` it
-//! presents its own certificate and trusts `--storage-client-ca`. It advertises
-//! `--advertise-addr`, or the address it bound (which must then not be a wildcard). The node
-//! never talks to the state store. The maps the frontend sends it (at registration, and at
-//! any heartbeat that finds it behind) are kept in a [`kbf_mapsync::MapHolder`]
-//! ([`StorageHandle::maps`]), which the node's storage service reads: until the first one
-//! arrives it serves nothing (UNAVAILABLE), it answers a caller whose map is not the
-//! current one STALE_MAP, and under mutual TLS it is a link of the chain that copies a
-//! write to the blob's second owner, with the repair worker that makes a copy owed
-//! ([`StorageHandle::repairs`]); all as [`crate::replication`] says.
+//! With `--frontend <url>` the node binds its listener, registers with that frontend
+//! (retrying until it answers), and only then opens its cache, then serves and heartbeats
+//! at the interval the frontend names ([`crate::join`]); over `https` it presents its own
+//! certificate and trusts `--storage-client-ca`. It advertises `--advertise-addr`, or the
+//! address it bound (which must then not be a wildcard). The node never talks to the state
+//! store. The maps the frontend sends it (at registration, and at any heartbeat that finds
+//! it behind) are kept in a [`kbf_mapsync::MapHolder`] ([`StorageHandle::maps`]), which the
+//! node's storage service reads; the registration brings the first one, so it is held
+//! before the node serves. Until it holds one the node serves nothing (UNAVAILABLE), it
+//! answers a caller whose map is not the current one STALE_MAP, and under mutual TLS it is
+//! a link of the chain that copies a write to the blob's second owner, with the repair
+//! worker that makes a copy owed ([`StorageHandle::repairs`]); all as
+//! [`crate::replication`] says.
+//!
+//! **Object names.** A registered node writes as its registration's member id and boot
+//! counter (`kbf_meta::NodeWriter`): its metadata log is raised to machine version 4, it
+//! commits `SetWriter`, and its objects are `<root>cas/<member>/<boot>/<seq>`, so a node
+//! whose metadata directory was wiped never reuses a key (the state store hands each boot
+//! out once). A node without `--frontend` names its objects in a writer epoch of its log,
+//! `<root><log id>/cas/<epoch>/<seq>`, as a server does. Either reads both kinds.
 
 use std::error::Error;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitCode;
@@ -41,27 +51,31 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Arg, ArgMatches, Command, FromArgMatches as _};
-use kbf_front::{Cache, CacheStorage, SegmentsConfig};
-use kbf_log::FarmLogId;
+use kbf_front::{Cache, CacheStorage, MetaLog as _, ObjectKeys, RebuildConfig, SegmentsConfig};
+use kbf_log::{FarmLogId, MachineVersion};
 use kbf_mapsync::MapHolder;
-use kbf_meta::Retention;
+use kbf_meta::{NodeWriter, Retention};
 use kbf_objstore::{KeyPrefix, ObjectStore};
 use kbf_storage::repair::{RepairConfig, Repairs};
+use kbf_storage::service::CatchUp;
 use kbf_store::StdFs;
 use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
 use kbf_tls::{TlsFiles, TlsSource};
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
-use crate::join::{self, Joiner};
+use crate::join::{self, Joined, Joiner};
 use crate::node_map::NodeMap;
-use crate::replication::{REPAIR_DIR, bind_node};
-use crate::serve::{ServeError, StorageListener};
+use crate::rebuild::Background;
+use crate::replication::{REPAIR_DIR, Registered, bind_node};
+use crate::serve::{ServeError, StorageListener, StorageSocket, bind_storage_socket};
 use crate::start::{AbortOnDrop, open_cold_file};
 use crate::startup_pass::StartPass;
 use crate::stores::{FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
-use crate::{Args, ConfigError, RaftMetaLog, SERVER_VERSION, interrupted, s3_store, sizes_on};
+use crate::{
+    Args, ConfigError, RaftMetaLog, SERVER_VERSION, StartFailure, interrupted, s3_store, sizes_on,
+};
 
 /// The flags of [`Args`] a storage node takes, besides the thread flags
 /// ([`kbf_threads::PoolArgs`]): where its bytes are and how they are written.
@@ -84,6 +98,9 @@ pub const ALLOWED: &[&str] = &[
     "write_bytes_in_flight",
     "tls_reload_interval_secs",
     "write_puts_in_flight",
+    "write_pool_writers",
+    "write_pool_queue",
+    "write_pool_stream_idle",
     "store_put_attempts",
 ];
 
@@ -366,8 +383,9 @@ pub struct StorageHandle {
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
-    _pass: Option<AbortOnDrop>,
+    _background: Background,
     maps: Arc<MapHolder>,
+    catch_up: CatchUp,
     repairs: Option<Arc<Repairs>>,
     _joiner: Option<AbortOnDrop>,
     _repair: Option<AbortOnDrop>,
@@ -388,6 +406,15 @@ impl StorageHandle {
         Arc::clone(&self.maps)
     }
 
+    /// Whether the node is rebuilding its index from the store, which it does at a start
+    /// over a metadata log that never finished a rebuild (a new or wiped one) when it
+    /// registers with `--frontend`. It serves meanwhile, answering a miss UNAVAILABLE;
+    /// [`CatchUp::finished`] completes when the rebuild is done.
+    #[must_use]
+    pub fn catch_up(&self) -> CatchUp {
+        self.catch_up.clone()
+    }
+
     /// The line the node prints once it is bound:
     /// `kbf-storage <version> storage=<addr> log=<id>`.
     #[must_use]
@@ -404,7 +431,7 @@ impl StorageHandle {
         let Self {
             serving,
             _flusher,
-            _pass,
+            _background,
             _joiner,
             _repair,
             ..
@@ -490,11 +517,14 @@ where
         (meta, store, prefix, log),
         (shutdown, &repair_dir),
         pass,
+        RebuildConfig::default(),
     )
     .await
 }
 
-/// The cache, its write tier, flusher and pass, and the listener over them.
+/// The cache, its write tier, flusher and pass, and the listener over them. With
+/// `--frontend` the listener is bound and the node registered before the cache opens,
+/// so the cache writes as the registration's member and boot ([`open_registered`]).
 async fn assemble<O, S, F>(
     flags: &StorageFlags,
     listener: StorageListener,
@@ -502,24 +532,29 @@ async fn assemble<O, S, F>(
     (meta, store, prefix, log): (RaftMetaLog<StdFs>, O, KeyPrefix, FarmLogId),
     (shutdown, repair_dir): (S, &Path),
     pass: Option<StartPass<RaftMetaLog<StdFs>>>,
+    rebuild: RebuildConfig,
 ) -> Result<StorageHandle, Box<dyn Error>>
 where
     O: ObjectStore + 'static,
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
-    let cache = Cache::open(meta, store, prefix)
-        .await?
-        .with_writes(flags.server.write_config());
+    let socket = bind_storage_socket(listener.listen)?;
+    let (cache, registered) = open_cache(flags, socket, (meta, store, prefix, log)).await?;
+    let cache = cache
+        .with_writes(flags.server.write_config())
+        .with_write_pool(flags.server.write_pool_config());
     let (cache, tier) = crate::write_tier::attach(cache, hot).await?;
     let cache = Arc::new(cache);
     let _flusher = tier.map(|_| {
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
         AbortOnDrop(tokio::spawn(flusher))
     });
-    let _pass = pass.map(|pass| AbortOnDrop(crate::startup_pass::spawn(Arc::clone(&cache), pass)));
+    let catch_up = registered.catch_up.clone();
+    let _background = crate::rebuild::spawn(&cache, &catch_up, pass, rebuild);
     let storage = Arc::new(CacheStorage::new(cache, flags.segments()));
-    let node = bind_node(flags, listener, storage, repair_dir, Box::pin(shutdown()?))?;
+    let stop = Box::pin(shutdown()?);
+    let node = bind_node(flags, listener, registered, storage, repair_dir, stop)?;
     Ok(StorageHandle {
         addr: node.addr,
         start_line: format!(
@@ -528,24 +563,154 @@ where
         ),
         serving: node.serving,
         _flusher,
-        _pass,
+        _background,
         maps: node.maps,
+        catch_up,
         repairs: node.repairs,
         _joiner: node.joiner,
         _repair: node.repair,
     })
 }
 
+/// The cache of a node bound at `socket`. With `--frontend` the node registers first
+/// (retrying until the frontend answers), so the cache writes as the registration's member
+/// and boot ([`open_registered`]); the registration and what it gave come back for the
+/// heartbeats ([`Joiner::keep`]). Without it the cache writes in an epoch of its own log.
+///
+/// The [`CatchUp`] in [`Registered`] says whether the node owes a rebuild of its index: a
+/// registered node whose log has not finished one does, and tells the frontend so in its
+/// registration, so the map ranks it last until it is done. A node without `--frontend`
+/// owes none: it keeps its objects under its log's own prefix, which no other log's loss
+/// can orphan.
+/// `kbf storage` and the storage half of `kbf storage-and-daemon` both open theirs here.
+///
+/// # Errors
+/// A TLS file or the frontend URL is refused, or the cache cannot be opened
+/// ([`open_registered`]).
+pub(crate) async fn open_cache<O: ObjectStore>(
+    flags: &StorageFlags,
+    socket: StorageSocket,
+    (meta, store, prefix, log): (RaftMetaLog<StdFs>, O, KeyPrefix, FarmLogId),
+) -> Result<(Cache<RaftMetaLog<StdFs>, O>, Registered), Box<dyn Error>> {
+    let keys = ObjectKeys {
+        root: prefix_root(&prefix, log)?,
+        legacy: prefix,
+    };
+    let node = Arc::new(NodeMap::new(Arc::new(MapHolder::new())));
+    Ok(match flags.joiner(socket.addr(), Arc::clone(&node))? {
+        Some(joiner) => {
+            let done = meta.query(|state| state.rebuild().is_done()).await?;
+            let catch_up = if done {
+                CatchUp::caught_up()
+            } else {
+                CatchUp::rebuilding()
+            };
+            let mut joiner = joiner.with_catch_up(catch_up.clone());
+            let joined = joiner.join().await;
+            let cache = open_registered(meta, store, keys, &joined).await?;
+            let joiner = Some((joiner, joined));
+            (
+                cache,
+                Registered {
+                    socket,
+                    node,
+                    joiner,
+                    catch_up,
+                },
+            )
+        }
+        None => (
+            Cache::open_under(meta, store, keys).await?,
+            Registered {
+                socket,
+                node,
+                joiner: None,
+                catch_up: CatchUp::caught_up(),
+            },
+        ),
+    })
+}
+
+/// The prefix a node writer's keys go under: the log's key prefix, `<root><log id>/`,
+/// less its log id, so both kinds of key share the root the log was created with.
+///
+/// # Errors
+/// The prefix does not end in the log's id (a log this binary did not create).
+fn prefix_root(prefix: &KeyPrefix, log: FarmLogId) -> Result<KeyPrefix, Box<dyn Error>> {
+    let root = prefix
+        .as_str()
+        .strip_suffix(&format!("{log}/"))
+        .ok_or_else(|| {
+            let prefix = prefix.as_str();
+            format!("the log's key prefix {prefix} does not end in its id {log}")
+        })?;
+    Ok(KeyPrefix::new(root.to_owned())?)
+}
+
+/// The cache of a node registered as `joined`: its log raised to machine version 4 (a
+/// storage node's log has one voter, so no other replica must run it first) and the
+/// node writer set, so every object it writes is named by `joined`'s member and boot.
+///
+/// # Errors
+/// The registration names a zero member or boot; the log has more than one voter, will
+/// not be raised, or has set this boot of the member already (a state store that handed
+/// the boot out again: [`kbf_front::CacheError::StaleWriter`]).
+pub(crate) async fn open_registered<O: ObjectStore>(
+    meta: RaftMetaLog<StdFs>,
+    store: O,
+    keys: ObjectKeys,
+    joined: &Joined,
+) -> Result<Cache<RaftMetaLog<StdFs>, O>, Box<dyn Error>> {
+    let (member, boot) = (
+        NonZeroU64::new(joined.member_id),
+        NonZeroU64::new(joined.boot),
+    );
+    let (Some(member), Some(boot)) = (member, boot) else {
+        let (m, b) = (joined.member_id, joined.boot);
+        return Err(format!(
+            "the frontend registered this node as member {m} boot {b}; neither may be zero"
+        )
+        .into());
+    };
+    let voters = meta.voters();
+    open_among(meta, store, keys, (member, boot), voters).await
+}
+
+/// [`open_registered`] for a node named `(member, boot)`, over a log of `voters` voters.
+async fn open_among<O: ObjectStore>(
+    meta: RaftMetaLog<StdFs>,
+    store: O,
+    keys: ObjectKeys,
+    (member, boot): (NonZeroU64, NonZeroU64),
+    voters: usize,
+) -> Result<Cache<RaftMetaLog<StdFs>, O>, Box<dyn Error>> {
+    one_voter(voters)?;
+    meta.raise_machine_version(MachineVersion::V4)?;
+    Ok(Cache::open_node(meta, store, keys, NodeWriter::new(member, boot)).await?)
+}
+
+/// Refuses a log of more than one voter for a registered node: raising it to machine
+/// version 4 would make every replica that does not run it refuse the log.
+fn one_voter(voters: usize) -> Result<(), String> {
+    if voters > 1 {
+        return Err(format!(
+            "a registered storage node's metadata log has {voters} voters; it must have one"
+        ));
+    }
+    Ok(())
+}
+
 /// `kbf storage`: the logs, a runtime the thread flags size, the node's start line on
-/// stdout, and serving until SIGINT or SIGTERM. Exit 2 for a start the node refuses.
+/// stdout, and serving until SIGINT or SIGTERM. Exit 2 for a start the node refuses, 75
+/// for one that can succeed on a later try ([`crate::StartFailure`]).
 #[must_use]
 pub fn run(flags: &StorageFlags) -> ExitCode {
     crate::log_file::init(&flags.server);
     match serve(flags) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("kbf storage: {e}");
-            ExitCode::from(2)
+            eprint!("{}", crate::start_said("kbf storage", e.as_ref()));
+            StartFailure::of(e.as_ref()).code()
         }
     }
 }
@@ -559,3 +724,11 @@ fn serve(flags: &StorageFlags) -> Result<(), Box<dyn Error>> {
         Ok(node.serve().await?)
     })
 }
+
+#[cfg(test)]
+#[path = "storage_node_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "storage_rebuild_tests.rs"]
+mod rebuild_tests;
