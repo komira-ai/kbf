@@ -178,8 +178,10 @@ impl FarmMachine {
         self.started.retain(|_, sent| sent.operation != operation);
     }
 
-    /// Records that `worker` registered on a new stream: it is connected, and keeps
-    /// the status it sent on an earlier one.
+    /// Records that `worker` registered on a new stream: it is connected, and keeps the
+    /// software status it sent on an earlier one. Its update status is dropped: a daemon
+    /// that restarted onto a build that predates pull-based updates sends none, and must
+    /// not be shown with the last one the old build sent.
     pub fn register(&mut self, worker: &WorkerId) {
         let node = self.nodes.entry(worker.clone()).or_insert(Node {
             connected: true,
@@ -187,6 +189,7 @@ impl FarmMachine {
             update: None,
         });
         node.connected = true;
+        node.update = None;
     }
 
     /// Records that the newest stream of `worker` has closed. The node stays listed.
@@ -505,7 +508,7 @@ mod tests {
         let back = Node {
             connected: true,
             status: Some(status(1)),
-            update: Some(update(1)),
+            update: None,
         };
         assert_eq!(m.node(&node(1)), Some(&back));
         assert_eq!(m.nodes().collect::<Vec<_>>(), vec![&node(1)]);
