@@ -1,0 +1,85 @@
+# kbf storage: every setting, one table per group; a key is a flag's long name.
+# Generated from the flag definitions (tests/golden). A flag on the command line
+# overrides its key. A secret is the path of the file that holds it.
+
+[daemon]
+# Worker threads of the async runtime, which run every task between its waits. Default: every CPU the process may use on the server; `max(2, reserve/4)`, at most the physical cores, on the daemon
+# async-threads = "N"
+# The most threads the runtime's blocking pool runs at once, for calls that wait on a disk or a process (a thread is made when a call needs one and ends when idle). Default: 512 (tokio's) for the server, 64 for the daemon
+# blocking-threads = "N"
+# Threads for CPU-bound work, such as hashing, which never waits and so is held to the CPUs. Default: every CPU the process may use on the server; `max(2, reserve/2)`, at most the physical cores, on the daemon
+# cpu-threads = "N"
+
+[identity]
+# Registers with this frontend (http:// or https://) and heartbeats to it. Without it the node is a one-member map of itself.
+# frontend = "URL"
+
+[listener]
+# The address callers dial, where --storage-listen is not routable. Default: the address the node bound.
+# advertise-addr = "HOST:PORT"
+# Where the node serves gRPC. Without the TLS flags it serves plain text, and the address must be loopback.
+storage-listen = "127.0.0.1:8982"
+# How often, in seconds, a TLS listener looks at its certificate, key and client CA files (the `--*-tls-cert`, `--*-tls-key` and `--*-client-ca` flags). A change is applied to the next TLS handshake, with no restart and without ending a connection already open: renew a certificate by replacing the files. Files that do not make a working configuration (unreadable, not PEM, a key that is not the certificate's, an expired certificate, a renewal caught between its two writes) are logged and counted in `kbf_tls_reloads_total{outcome="rejected"}`, and the previous files keep serving; the next look finds them whole and applies them. The files must be good at start
+tls-reload-interval-secs = 30
+
+[log]
+# The directory of the durable log file, `kbf-server.log` and its rotated `kbf-server.log.1`, `.2`, ... (created if missing): every event stderr gets, in the same format, kept across restarts. Left out, it is `<hot store directory>/log` when the hot store is a directory; with neither, there is no file and the server logs to stderr alone (the start logs which). A directory or file that cannot be written never stops the server ([`crate::log_file`])
+# log-dir = "DIR"
+# How many log files are kept, the current one included; rotation drops the oldest. The log never exceeds `--log-max-bytes` times this, plus one line
+log-files = 8
+# The most bytes one log file holds before it is rotated; a line longer than this goes alone to a fresh file. With `--log-files` it bounds the log's size on disk
+log-max-bytes = 67108864
+
+[outputs]
+# How long, in seconds, a segment upload may go without a call before it is dropped and its memory returned. An upload is also dropped when the connection that began it closes; one that is committing is kept until its commit ends
+segment-upload-idle-secs = 60
+# The most bytes, records and footers together, one segment upload on the worker listener may hold in memory (`docs/design/write-path.md`, section 4.2): the segments it declares that are not written to the hot store as they arrive (all of them, without one). Not a limit on a blob's size: a segment held in memory holds no record over 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`), and an upload with a larger one and no room on the hot store is answered FAILED_PRECONDITION, so the daemon sends its records by ByteStream, which streams a large blob to the cold store. Those ranges are held until the upload commits, admitted under `--write-bytes-in-flight` with every other upload: a `Begin` waits while that is spent. At least 33 MiB (`kbf_front::MIN_SEGMENT_UPLOAD_BYTES`), a daemon's upload of small files with room to spare, and at most `--write-bytes-in-flight`, so any legal `Begin` can be admitted; the server refuses to start otherwise. At most `kbf_front::MAX_ADMISSION_BYTES`, the most one admission counts, so a `Begin` never holds more than it is counted for under the bound
+segment-upload-max-bytes = 34603008
+
+[storage-node]
+# The node's share of the digests relative to the others. Default: 1.
+# storage-weight = "N"
+# The zone label to register with. Default: none.
+# storage-zone = "LABEL"
+
+[stores]
+# The durable object store, where every blob ends up: `file:///absolute/path` (a directory, `kbf_objstore::FsStore`: locked while the server runs, a second server on it is refused; a write that would leave its filesystem with less free than it keeps, 5% of its size and at least 1 GiB, is refused and wakes the evictor, which forgets the least recently used objects (never one used in the last minute) and deletes their files while less than twice that is free) or `s3://bucket/prefix?endpoint=http://host:port` (MinIO, RustFS; the key pair is `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; query keys `region`, `conditional-put=true` for a store that refuses to overwrite a key, and `min-put-rate=BYTES_PER_SEC`, the slowest rate a PUT body may reach the store at: a PUT is cut after 60 seconds plus its body's length at that rate, 1 MiB/s by default). Objects are keyed under `<prefix><log id>/` (`kbf/` for a directory and for an S3 URI without a path), the id of the metadata log. A directory is checked against the index by a start-up pass in the background; a lost or damaged object is also found when it is read, or before an action-cache hit that needs it is served (a miss). There is no `memory:` store: a `file://` path on a tmpfs is one
+# cold-store = "URI"
+# For tests of eviction only: how long after its last use an object in a `file://` cold store is never evicted, in milliseconds
+cold-store-evict-grace-ms = 60000
+# For tests only: the free bytes a `file://` cold store's filesystem must keep, in place of 5% of it, at least 1 GiB (a test's disk would decide what is evicted)
+# cold-store-floor-bytes = "BYTES"
+# For tests of eviction only: a `file://` cold store's filesystem is taken to be this many bytes, holding nothing but the store's object files
+# cold-store-size-bytes = "BYTES"
+# The fast tier in front of the cold store: `file:///absolute/path`, a directory on an SSD (or a tmpfs). Uploads land there and are flushed to the cold store in the background; reads are served from it while a blob is still there. Its budget is not a flag: 80% of the filesystem's free space less what it keeps free (5% of its size, at least 1 GiB, and never more than half of what is free), at most `--hot-store-max-bytes`; at the budget, writes take the direct path to the cold store. Without it, uploads go straight to the cold store. A daemon's outputs (a segment upload, or the in-process plane) and a ByteStream Write over 16 MiB are written through to it as they arrive, so a large one is never held in memory. Without it, or when it has no room, a daemon's blob over 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) is streamed to the cold store as it arrives (a ByteStream Write, or the in-process plane's own stream), never held whole and never refused for its size. The first start with a hot store raises the metadata log to machine version 2, once; a binary that runs only version 1 no longer reads it. The metadata log lives in `<dir>/meta`, unless `--meta-dir` says otherwise
+# hot-store = "URI"
+# Abandons this server's hot store tier `<id>` at start: every object staged on it is marked unreachable as missing (its blobs answer `Unavailable` until uploaded again; nothing is answered `NOT_FOUND`), and the directory becomes a new tier. For a lost or replaced disk, after a start was refused because the directory's `TIER` file is missing or names another tier. The id is the one the refusal names
+# hot-store-abandon = "ID"
+# The most bytes the hot store's block files may hold before they are flushed, lower than its automatic budget
+# hot-store-max-bytes = "BYTES"
+# The directory of the metadata log (the CAS index and the action cache, a single-voter Raft log), on a local disk; created if missing. An empty directory gets a new log with a new id; every later start over it reads the id from the directory. Left out, it is `<hot store directory>/meta`; required when there is no `file://` hot store. Given, it wins over the hot store's directory
+# meta-dir = "DIR"
+# How many times a segment PUT is tried. Only a PUT that did not complete (connect, reset, timeout) or that the store answered 5xx is tried again, after 100 ms and then four times longer each time, under a new object key; if every attempt fails, the segment's blobs are answered UNAVAILABLE
+store-put-attempts = 3
+# The most bytes uploads may hold at once. A ByteStream Write is admitted before it reads past its first message, for its blob's size up to 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) and for 16 MiB above that (a larger blob is streamed onto the hot store, or to the cold store without room there, not held); a BatchUpdateBlobs for its total; a segment upload's Begin for what it holds in memory. A caller over the bound waits, nothing is refused for load. At least `--segment-upload-max-bytes` (by default 33 MiB, under the default 2 GiB). Not covered: each HTTP/2 stream's message as tonic decodes it, before the handler runs, up to 17 MiB per stream (about 3.4 GiB for 200 streams), times the streams one connection may open on each listener
+write-bytes-in-flight = 2147483648
+# How long, in milliseconds, the oldest blob of an open segment waits for concurrent uploads to join it before the segment is sealed and written (`docs/design/write-path.md`, section 3.1). No caller is answered before its segment has committed, so this is added to an upload's latency at most
+write-linger = 2
+# Blobs of this many bytes or more are written as a segment of their own, past the group, so they neither wait for the linger nor hold up small writes
+write-own-segment-bytes = 16777216
+# The most blobs waiting for a write-pool writer. A blob that finds the queue full goes straight to the object store, as one does when the write tier has no room. At least 1
+write-pool-queue = 4096
+# How long, in seconds, a streamed blob may go without sending a chunk before its write-pool writer is taken back and the upload fails UNAVAILABLE (the client sends it again). Without it, a stalled but connected large upload would hold a writer for ever, and with all writers held every other blob would wait. It limits stalls only: an upload that sends a chunk more often than this (a trickle) can still hold a writer. At least 1
+write-pool-stream-idle = 30
+# The writers of the write pool: the ByteStream and storage `Write`s of a node with a write tier are appended to shared segment files by this many writers, each holding one range open, so the node keeps at most this many block files (plus the open grouped block) open for writing for those blobs, however many uploads are in flight. At least 1
+write-pool-writers = 8
+# The most segment PUTs, each with its footer read-back, in flight at once. A segment sealed while all are busy waits; new blobs go to a new open segment
+write-puts-in-flight = 4
+
+[tls]
+# The CA callers' certificates chain to; each must name a role (frontend, storage, daemon).
+# storage-client-ca = "PATH"
+# The node's server certificate (PEM).
+# storage-tls-cert = "PATH"
+# The server certificate's private key (PEM).
+# storage-tls-key = "PATH"
