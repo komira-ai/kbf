@@ -86,12 +86,9 @@ pub enum OriginFault {
 /// # Errors
 /// The first of the three that is refused.
 pub fn check_origin(endpoint: &str, bucket: &str, prefix: &str) -> Result<(), OriginFault> {
-    // Stub (red first): everything is accepted.
-    let _ = (endpoint, bucket, prefix);
-    if false
-        && endpoint
-            .get(..8)
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+    if endpoint
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
     {
         return Err(OriginFault::Tls);
     }
@@ -110,6 +107,14 @@ pub fn check_origin(endpoint: &str, bucket: &str, prefix: &str) -> Result<(), Or
         Err(S3ConfigError::Bucket(_)) => Err(OriginFault::Bucket),
         Err(_) => Err(OriginFault::Endpoint),
     }
+}
+
+/// [`check_origin`] for an endpoint alone, when no bucket is known yet.
+///
+/// # Errors
+/// [`OriginFault::Tls`] or [`OriginFault::Endpoint`].
+pub fn check_endpoint(endpoint: &str) -> Result<(), OriginFault> {
+    check_origin(endpoint, "kbf-endpoint-check", "")
 }
 
 fn store(target: &ProbeTarget<'_>) -> Result<S3Store, S3ConfigError> {
@@ -173,10 +178,44 @@ impl S3Probe {
 
 impl Probe for S3Probe {
     fn probe(&self, target: &ProbeTarget<'_>) -> Verified {
-        // Stub (red first): nothing is proven.
-        let _ = (target, &self.runtime, &self.budget);
-        Verified::default()
+        let (Ok(store), Some(key)) = (store(target), self.key(target.prefix)) else {
+            return Verified::default();
+        };
+        let mut verified = Verified::default();
+        let steps = steps(&store, &key, target.conditional_put, &mut verified);
+        // A store that answers too slowly keeps the steps it passed: the rest are false.
+        let _ = self
+            .runtime
+            .block_on(tokio::time::timeout(self.budget, steps));
+        verified.ok = verified.put
+            && verified.get
+            && verified.delete
+            && (verified.conditional_put || !target.conditional_put);
+        verified
     }
+}
+
+/// The steps, each recorded in `verified` as it passes, so a cut-off keeps what was proven.
+async fn steps(store: &S3Store, key: &ObjectKey, conditional: bool, verified: &mut Verified) {
+    let body = Bytes::from_static(PROBE_BODY);
+    if store.put_new(key, body.clone(), None).await.is_err() {
+        return;
+    }
+    verified.put = true;
+    if let Some(range) = ByteRange::new(0, body.len() as u64) {
+        verified.get = store
+            .get_range(key, range)
+            .await
+            .is_ok_and(|read| read == body);
+    }
+    if conditional {
+        verified.conditional_put = matches!(
+            store.put_new(key, body, None).await,
+            Err(ObjectStoreError::AlreadyExists(_))
+        );
+    }
+    // The probe object is removed whatever the other steps found.
+    verified.delete = store.delete(key).await.is_ok();
 }
 
 #[cfg(test)]

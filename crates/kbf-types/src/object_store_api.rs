@@ -477,13 +477,30 @@ impl Convergence {
     /// The view of `nodes` against `generation`: a node that reports `ok` at another
     /// generation is `pending`, and the counts and `converged` follow the field docs.
     #[must_use]
-    pub fn of(_generation: u64, nodes: Vec<NodeConvergence>) -> Self {
-        // Stub (red first): nothing is judged yet.
+    pub fn of(generation: u64, mut nodes: Vec<NodeConvergence>) -> Self {
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        for node in &mut nodes {
+            if node.status == NodeStatus::Ok && node.applied_generation != Some(generation) {
+                node.status = NodeStatus::Pending;
+            }
+        }
+        let active = |n: &&NodeConvergence| n.state == MemberStanding::Active;
+        let unsupported = nodes
+            .iter()
+            .filter(active)
+            .filter(|n| n.status == NodeStatus::Unsupported)
+            .count() as u64;
+        let expected = nodes.iter().filter(active).count() as u64 - unsupported;
+        let applied = nodes
+            .iter()
+            .filter(active)
+            .filter(|n| n.status == NodeStatus::Ok)
+            .count() as u64;
         Self {
-            converged: false,
-            expected: 0,
-            applied: 0,
-            unsupported: 0,
+            converged: expected > 0 && applied == expected && unsupported == 0,
+            expected,
+            applied,
+            unsupported,
             nodes,
         }
     }

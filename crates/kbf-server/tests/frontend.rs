@@ -1831,3 +1831,159 @@ async fn a_frontend_with_members_writes_where_the_map_says() {
     }
     assert_eq!(used.len(), 2, "every blob went to one node");
 }
+
+/// Catches `--object-store-secrets-dir` accepted where the routes it turns on could not work:
+/// they are on the operator API, answer only past its token, and keep the registration in the
+/// state store, so a frontend without `--api-listen`, `--api-token-file` or `--state-store`
+/// refuses the flag at parse time instead of serving routes that always answer 403 or 404.
+///
+/// Mutant seen red: `requires_all` dropped from the flag.
+#[test]
+fn the_secrets_dir_needs_the_api_the_token_and_the_state_store() {
+    let all = [
+        "--api-listen=127.0.0.1:0",
+        "--api-token-file=/t",
+        "--state-store=sqlite:///s/state.db",
+    ];
+    // The command line itself: the `flags` helper would add `--api-listen` on its own.
+    let with = |keep: &[&str]| {
+        let mut argv = vec![
+            "frontend",
+            "--storage=http://127.0.0.1:1",
+            "--object-store-secrets-dir=/x",
+        ];
+        argv.extend_from_slice(keep);
+        frontend::command().try_get_matches_from(argv)
+    };
+    let ok = frontend::parse(&with(&all).expect("parses with all three")).expect("flags");
+    assert_eq!(
+        ok.object_store_secrets_dir.as_deref(),
+        Some(Path::new("/x"))
+    );
+    for left_out in 0..all.len() {
+        let rest: Vec<&str> = all
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != left_out)
+            .map(|(_, f)| *f)
+            .collect();
+        let e = with(&rest).expect_err(all[left_out]);
+        assert_eq!(
+            e.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "{}: {e}",
+            all[left_out]
+        );
+    }
+    let none = flags(&["--storage=http://127.0.0.1:1"]).expect("parses");
+    assert_eq!(none.object_store_secrets_dir, None);
+    let help = frontend::command().render_long_help().to_string();
+    assert!(help.contains("--object-store-secrets-dir"), "{help}");
+}
+
+/// Catches a frontend that takes `--object-store-secrets-dir` and does not mount the routes
+/// (or mounts them without the flag): with the flag a connection PUT through the operator
+/// API's token leaves a 0600 secret file in the directory and a row a GET reads back, and
+/// without the flag the same GET answers 404 to a caller past the gate. A directory that
+/// cannot be made stops the start and names the flag.
+///
+/// Mutants seen red: the routes not merged in `frontend.rs`; the routes merged for a frontend
+/// without the flag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_with_a_secrets_dir_serves_the_object_store_routes() {
+    use kbf_server::api_client::OperatorClient;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = scratch_dir("frontend-object-stores");
+    let token = "kbf-test-token-0123456789abcdef0123456789";
+    let token_file = dir.join("token");
+    std::fs::write(&token_file, format!("{token}\n")).expect("token");
+    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let token_flag = format!("--api-token-file={}", token_file.display());
+    let secrets = dir.join("secrets");
+    let secrets_flag = format!("--object-store-secrets-dir={}", secrets.display());
+    let state_flag = |name: &str| {
+        format!(
+            "--state-store=sqlite://{}",
+            dir.join(name).join("state.db").display()
+        )
+    };
+
+    let on = Front::start(
+        &flags(&[
+            "--storage=http://127.0.0.1:1",
+            &token_flag,
+            &secrets_flag,
+            &state_flag("on"),
+        ])
+        .expect("parses"),
+    )
+    .await;
+    let off = Front::start(
+        &flags(&[
+            "--storage=http://127.0.0.1:1",
+            &token_flag,
+            &state_flag("off"),
+        ])
+        .expect("parses"),
+    )
+    .await;
+    let (on_api, off_api) = (on.api, off.api);
+    tokio::task::spawn_blocking(move || {
+        let client = |addr| OperatorClient::new(addr, Some(token.to_owned()));
+        let body = r#"{"endpoint":"http://s3.example:9000","access_key_id":"AKID","secret_access_key":"a-secret-key","verify":false}"#;
+        let put = client(on_api)
+            .put("/v1/object-stores/connections/cold", body)
+            .expect("put");
+        assert_eq!(put.status, 201, "{}", put.body);
+        assert!(!put.body.contains("a-secret-key"));
+        let read = client(on_api)
+            .get_gated("/v1/object-stores/connections/cold")
+            .expect("read");
+        assert_eq!(read.status, 200, "{}", read.body);
+        let status = client(on_api).get_gated("/v1/object-stores").expect("status");
+        assert_eq!(status.status, 200, "{}", status.body);
+        let anonymous = OperatorClient::new(on_api, None);
+        assert_eq!(anonymous.get_gated("/v1/object-stores").expect("get").status, 401);
+
+        let absent = client(off_api).get_gated("/v1/object-stores").expect("get");
+        assert_eq!(absent.status, 404, "{}", absent.body);
+    })
+    .await
+    .expect("the client side");
+
+    let files: Vec<_> = std::fs::read_dir(&secrets)
+        .expect("the secrets directory is made")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+    assert_eq!(mode(&files[0]), 0o600);
+    assert_eq!(mode(&secrets), 0o700);
+    assert!(
+        std::fs::read_to_string(&files[0])
+            .expect("read")
+            .contains("a-secret-key")
+    );
+
+    // A directory that cannot be made stops the start, and the error names the flag.
+    let blocker = dir.join("a-file");
+    std::fs::write(&blocker, "x").expect("file");
+    let blocked = format!(
+        "--object-store-secrets-dir={}",
+        blocker.join("sub").display()
+    );
+    let f = flags(&[
+        "--storage=http://127.0.0.1:1",
+        &token_flag,
+        &blocked,
+        &state_flag("blocked"),
+    ])
+    .expect("parses");
+    let said = start_frontend(&f, || Ok(pending::<()>()))
+        .err()
+        .expect("the directory cannot be made")
+        .to_string();
+    assert!(said.starts_with("--object-store-secrets-dir "), "{said}");
+    std::fs::remove_dir_all(&dir).expect("clean");
+}

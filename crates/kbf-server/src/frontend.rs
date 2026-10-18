@@ -69,7 +69,7 @@ use std::ffi::OsString;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -167,6 +167,10 @@ const HANDOVER: [&str; 3] = [
     "handover_follow_interval_ms",
 ];
 
+/// The id of the flag that turns on the object-store registration API and names where its
+/// secret files are kept.
+const SECRETS_DIR: &str = "object_store_secrets_dir";
+
 /// The ids of the flags that say which instance this is, how long a holder waits for its
 /// successor to serve, the name the successor's certificate carries, and Envoy's check
 /// settings (interval, timeout, unhealthy threshold).
@@ -200,6 +204,10 @@ pub struct FrontendFlags {
     /// How this frontend hands over to a successor and takes over from a predecessor;
     /// `None` without `--handover-socket`.
     pub handover: Option<Handover>,
+    /// `--object-store-secrets-dir`: where the secret keys of the registered object-store
+    /// connections are kept (one 0600 file each), which also turns on the
+    /// `/v1/object-stores` routes of the operator API. `None`: they answer 404.
+    pub object_store_secrets_dir: Option<PathBuf>,
 }
 
 /// The long names of the flags of [`Args`] that `kbf frontend` hides and refuses by name
@@ -329,6 +337,22 @@ pub fn command() -> Command {
                  and this name; without it such a frontend refuses a handover.",
             ),
     )
+    .arg(
+        Arg::new(SECRETS_DIR)
+            .long("object-store-secrets-dir")
+            .value_name("DIR")
+            .value_parser(clap::value_parser!(PathBuf))
+            .requires_all(["api_listen", "api_token_file", "state_store"])
+            .help(
+                "Turns on the object-store registration routes of the operator API \
+                 (/v1/object-stores, docs/api.md) and names the directory where the secret \
+                 key of each registered connection is kept, one file of mode 0600 each, in a \
+                 directory made 0700. The directory must be readable by every frontend \
+                 child that serves at once and left out of any backup of the host. The \
+                 registration itself (endpoints, buckets, the audit log) is kept in the \
+                 state store. Without it those routes answer 404.",
+            ),
+    )
     .arg(check_arg(0, "envoy-check-interval-ms", "MILLISECONDS", "The time between two of Envoy's health checks of a frontend (the cluster's `interval`)."))
     .arg(check_arg(1, "envoy-check-timeout-ms", "MILLISECONDS", "How long Envoy's health check waits for an answer (the cluster's `timeout`)."))
     .arg(check_arg(2, "envoy-unhealthy-threshold", "N", "How many of Envoy's checks in a row must fail before it stops choosing a frontend (`unhealthy_threshold`). The three give the settle: a frontend waits interval x threshold + timeout + interval before it goes not ready (Envoy has then seen the successor) and again before it exits (Envoy then sends it nothing)."))
@@ -393,6 +417,7 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         storage,
         tls,
         handover,
+        object_store_secrets_dir: m.get_one::<PathBuf>(SECRETS_DIR).cloned(),
     })
 }
 
@@ -902,6 +927,11 @@ impl<'a> Prepared<'a> {
         let api_listener = api_socket.map(Socket::http).transpose()?;
         let (token, releases) = api.map_or((None, None), |api| (api.token, api.releases));
         let update_rows = state_store.clone().map(crate::update::Rows::new);
+        let object_stores = flags
+            .object_store_secrets_dir
+            .as_deref()
+            .map(|dir| open_object_stores(dir, state_store.clone()))
+            .transpose()?;
         let api_routes = crate::api::router(
             Arc::clone(&farm),
             token.clone(),
@@ -913,6 +943,10 @@ impl<'a> Prepared<'a> {
             None,
         )
         .merge(crate::release::router(releases.clone(), token.clone()))
+        .merge(crate::object_store::api::routes(
+            token.clone(),
+            object_stores,
+        ))
         .merge(crate::update_hosts::router(
             Arc::clone(&farm),
             update_rows.clone(),
@@ -1170,6 +1204,24 @@ fn dial_of(flags: &FrontendFlags) -> Result<crate::handover::Dial, ConfigError> 
 }
 
 /// The store `/readyz` probes: the open state store's, if there is one.
+/// The object-store registration API over the state store, with secret files in `dir`
+/// (`--object-store-secrets-dir`). No node reports yet, so every convergence is `false`.
+fn open_object_stores(
+    dir: &Path,
+    state: Option<Arc<dyn kbf_state::Store>>,
+) -> Result<Arc<crate::object_store::api::ObjectStoreApi>, Box<dyn Error>> {
+    let store = state.ok_or("--object-store-secrets-dir needs --state-store")?;
+    let runtime = tokio::runtime::Handle::try_current()?;
+    crate::object_store::api::ObjectStoreApi::open(
+        store,
+        dir,
+        runtime,
+        Arc::new(crate::object_store::api::NoAcks),
+    )
+    .map(Arc::new)
+    .map_err(|e| format!("--object-store-secrets-dir {}: {e}", dir.display()).into())
+}
+
 fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Store>> {
     state.map(|state| Arc::clone(&state.store))
 }

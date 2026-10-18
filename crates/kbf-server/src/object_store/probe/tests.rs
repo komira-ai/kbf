@@ -238,7 +238,11 @@ async fn the_conditional_put_is_checked_only_when_declared_and_must_be_refused()
     let (v, seen) = probe_of(Script::OK, true).await;
     assert!(v.ok && v.conditional_put, "{v:?}");
     assert_eq!(seen.len(), 4, "{seen:?}");
-    assert_eq!(seen[1], format!("put {KEY} true"), "{seen:?}");
+    assert_eq!(
+        seen[2],
+        format!("put {KEY} true"),
+        "the second write: {seen:?}"
+    );
 
     let overwriting = Script {
         second_put: 200,
