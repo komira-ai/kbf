@@ -9,10 +9,9 @@ use bytes::Bytes;
 use hyper::{Request, Response};
 use serde::Deserialize;
 
-use super::model::{
-    Failure, Locator, NewChild, OldChild, OrderVerb, Phase, Slot, StagedFacts, UpdateId,
-};
+use super::model::{NewChild, OldChild, UpdateId};
 use crate::CommitId;
+use crate::proxy::model::{Failure, Locator, Phase, Slot, StagedFacts, Verb};
 
 /// Writes one record into `orders/` (FP section 2). The order ids (`order_id`, `epoch`,
 /// `generation`) come from the writer, which owns their counter: where that counter
@@ -20,7 +19,7 @@ use crate::CommitId;
 pub trait OrderWriter: Send {
     fn write(
         &mut self,
-        verb: OrderVerb,
+        verb: Verb,
         commit: &CommitId,
         window_s: u32,
     ) -> Result<Locator, OrderError>;
@@ -46,11 +45,33 @@ pub struct InstallerStatus {
     #[serde(default)]
     pub acked_order_id: u64,
     #[serde(default)]
-    pub staged: Option<StagedFacts>,
+    pub staged: Option<StagedWire>,
+}
+
+/// `staged{}` as `status.json` carries it: the facts, not the commit (that is
+/// `staged_commit`, beside it). [`InstallerStatus::staged_facts`] joins the two.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct StagedWire {
+    pub protocol: u32,
+    pub min_protocol: u32,
+    pub state_schema: u32,
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 impl InstallerStatus {
     /// The stable word of the refusal: what precedes the first colon.
+    pub fn staged_facts(&self) -> Option<StagedFacts> {
+        let (commit, wire) = (self.staged_commit.as_ref()?, self.staged.as_ref()?);
+        Some(StagedFacts {
+            commit: commit.clone(),
+            protocol: wire.protocol,
+            min_protocol: wire.min_protocol,
+            state_schema: wire.state_schema,
+            profile: wire.profile.clone(),
+        })
+    }
+
     pub fn refusal_word(&self) -> &str {
         self.refusal.split(':').next().unwrap_or("").trim()
     }
@@ -147,6 +168,8 @@ pub struct SupervisorStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpdateSpec {
     pub update_id: UpdateId,
+    /// The caller's idempotency key; the swap records it in `update.json`.
+    pub request_id: String,
     pub from: Option<CommitId>,
     pub to: CommitId,
     pub nodes: bool,

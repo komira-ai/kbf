@@ -9,10 +9,10 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use hyper::Request;
-use kbf_installer::proxy::auth::{
+use kbf_installer::proxy::api::auth::{
     Authorize, BearerAuth, RateLimit, Secret, Sha256Hasher, TokenSource,
 };
-use kbf_installer::proxy::traits::Clock;
+use kbf_installer::proxy::api::traits::Clock;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 

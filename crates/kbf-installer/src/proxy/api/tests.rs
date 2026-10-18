@@ -8,12 +8,13 @@ use hyper::StatusCode;
 
 use super::core::{ApiError, Core, Crash, CrashHook, CrashPoint, Fault, NoCrash, Reply};
 use super::fakes::{COMMIT_C, Rig, facts, idle, req, staged};
-use super::model::{OldChild, OrderVerb, Phase, RollbackBlocked, StatusBody, UpdateId};
+use super::model::{OldChild, RollbackBlocked, StatusBody, UpdateId, abortable};
 use super::refusal;
 use super::traits::{
     Compat, CompatGate, InstallerState, InstallerStatus, JsonFileStatus, StatusReader, StubGate,
     SupervisorError,
 };
+use crate::proxy::model::{Phase, Step, Verb};
 use crate::testkit::{A, B, c};
 
 fn accepted(r: Result<Reply, Fault>) -> (UpdateId, Phase) {
@@ -46,7 +47,7 @@ fn old() -> OldChild {
     }
 }
 
-fn written(rig: &Rig) -> Vec<(OrderVerb, String)> {
+fn written(rig: &Rig) -> Vec<(Verb, String)> {
     rig.orders
         .written
         .lock()
@@ -69,10 +70,7 @@ fn post_accepts_and_writes_one_locator_order_and_starts_nothing() {
     let mut core = rig.core();
     let (id, phase) = accepted(core.post(req(B, "r1")));
     assert_eq!(phase, Phase::Accepted);
-    assert_eq!(
-        written(&rig),
-        vec![(OrderVerb::FrontendUpdate, B.to_owned())]
-    );
+    assert_eq!(written(&rig), vec![(Verb::FrontendUpdate, B.to_owned())]);
     assert_eq!(rig.orders.written.lock().unwrap()[0].window_s, 900);
     assert_eq!(rig.sup.starts(), 0);
     let s = body(&mut core);
@@ -349,6 +347,7 @@ fn staging_follows_status_json_to_a_handover() {
         (spec.nodes, spec.rollback, spec.facts),
         (true, false, facts())
     );
+    assert_eq!(spec.request_id, "r1", "the swap records the caller's key");
     assert_eq!(spec.order.order_id, 101);
     // Reading again does not hand over twice.
     body(&mut core);
@@ -379,11 +378,8 @@ fn every_refusal_word_fails_the_update_and_starts_no_child() {
         assert_eq!(s.update_id, Some(id), "{word}");
         assert_eq!(s.phase, Some(Phase::Failed), "{word}");
         let f = s.failure.expect("a failure");
-        assert_eq!(
-            (f.step.as_str(), f.reason.as_str()),
-            (refusal::step(word), *word)
-        );
-        assert_ne!(f.step, "stage", "{word} has a step of its own");
+        assert_eq!((f.step, f.reason.as_str()), (refusal::step(word), *word));
+        assert_ne!(f.step, Step::Stage, "{word} has a step of its own");
         assert_eq!(rig.sup.starts(), 0, "{word}: no child");
         assert_eq!(rig.sup.calls(), Vec::<&str>::new(), "{word}");
         assert_eq!(
@@ -399,24 +395,24 @@ fn every_refusal_word_fails_the_update_and_starts_no_child() {
 #[test]
 fn each_refusal_word_has_its_step() {
     let table = [
-        ("trust_chain", "verify"),
-        ("hash", "verify"),
-        ("attestation", "verify"),
-        ("commit_or_ref", "verify"),
-        ("facts", "verify"),
-        ("installer_too_old", "verify"),
-        ("platform", "verify"),
-        ("size", "verify"),
-        ("disk", "fetch"),
-        ("fetch", "fetch"),
-        ("replay", "order"),
-        ("generation", "order"),
-        ("floor", "order"),
-        ("denied", "order"),
-        ("pending", "host"),
-        ("lease", "host"),
-        ("envoy_range", "host"),
-        ("frontend_busy", "host"),
+        ("trust_chain", Step::Verify),
+        ("hash", Step::Verify),
+        ("attestation", Step::Verify),
+        ("commit_or_ref", Step::Verify),
+        ("facts", Step::Verify),
+        ("installer_too_old", Step::Verify),
+        ("platform", Step::Verify),
+        ("size", Step::Verify),
+        ("disk", Step::Fetch),
+        ("fetch", Step::Fetch),
+        ("replay", Step::Order),
+        ("generation", Step::Order),
+        ("floor", Step::Order),
+        ("denied", Step::Order),
+        ("pending", Step::Host),
+        ("lease", Step::Host),
+        ("envoy_range", Step::Host),
+        ("frontend_busy", Step::Host),
     ];
     assert_eq!(table.len(), refusal::WORDS.len());
     for (word, step) in table {
@@ -437,8 +433,8 @@ fn an_unknown_refusal_word_fails_closed() {
     });
     let f = body(&mut core).failure.expect("failure");
     assert_eq!(
-        (f.step.as_str(), f.reason.as_str()),
-        ("stage", "the restart failed")
+        (f.step, f.reason.as_str()),
+        (Step::Stage, "the restart failed")
     );
     assert_eq!(rig.sup.starts(), 0);
 }
@@ -467,9 +463,9 @@ fn an_incompatible_staged_release_fails_the_update_and_drops_the_stage() {
     let s = body(&mut core);
     assert_eq!(s.phase, Some(Phase::Failed));
     let f = s.failure.expect("failure");
-    assert_eq!((f.step.as_str(), f.reason.as_str()), ("compat", "R4"));
+    assert_eq!((f.step, f.reason.as_str()), (Step::Compat, "R4"));
     assert_eq!(rig.sup.starts(), 0);
-    assert_eq!(written(&rig)[1], (OrderVerb::Revert, B.to_owned()));
+    assert_eq!(written(&rig)[1], (Verb::Revert, B.to_owned()));
 }
 
 #[test]
@@ -481,7 +477,7 @@ fn an_incomplete_staged_release_fails_at_the_compat_step() {
     };
     rig.set_status(staged(B));
     let f = body(&mut core).failure.expect("failure");
-    assert_eq!((f.step.as_str(), f.reason.as_str()), ("compat", "no probe"));
+    assert_eq!((f.step, f.reason.as_str()), (Step::Compat, "no probe"));
     assert_eq!(rig.sup.starts(), 0);
 }
 
@@ -492,8 +488,8 @@ fn a_supervisor_that_cannot_start_fails_the_update_and_drops_the_stage() {
     rig.sup.0.lock().unwrap().start_fails = true;
     rig.set_status(staged(B));
     let f = body(&mut core).failure.expect("failure");
-    assert_eq!(f.step, "start");
-    assert_eq!(written(&rig)[1].0, OrderVerb::Revert);
+    assert_eq!(f.step, Step::Start);
+    assert_eq!(written(&rig)[1].0, Verb::Revert);
 }
 
 #[test]
@@ -502,7 +498,7 @@ fn abort_while_staging_drops_the_stage_and_frees_the_slot() {
     let (mut core, id) = started(&rig);
     let (aborted, phase) = accepted(core.abort());
     assert_eq!((aborted, phase), (id, Phase::RolledBack));
-    assert_eq!(written(&rig)[1], (OrderVerb::Revert, B.to_owned()));
+    assert_eq!(written(&rig)[1], (Verb::Revert, B.to_owned()));
     assert_eq!(body(&mut core).phase, Some(Phase::RolledBack));
     accepted(core.post(req(COMMIT_C, "r2")));
 }
@@ -721,10 +717,11 @@ fn status_json_written_by_the_installer_parses() {
     assert_eq!(read.state, InstallerState::Refused);
     assert_eq!((read.refusal_word(), read.acked_order_id), ("hash", 12));
     assert_eq!(
-        read.staged
-            .map(|f| (f.protocol, f.min_protocol, f.state_schema)),
-        Some((5, 3, 7))
+        read.staged_facts()
+            .map(|f| (f.commit, f.protocol, f.min_protocol, f.state_schema)),
+        Some((c(B), 5, 3, 7))
     );
+    assert_eq!(idle().staged_facts(), None, "nothing staged, no facts");
     assert!(
         JsonFileStatus::new(rig.dir.join("none.json"))
             .read()
@@ -744,9 +741,9 @@ fn an_unknown_state_word_is_busy_not_idle() {
 
 #[test]
 fn phases_order_and_the_abort_boundary() {
-    assert!(Phase::Quiescing.abortable() && !Phase::Switching.abortable());
-    assert!(!Phase::Done.abortable() && !Phase::Failed.abortable());
-    assert!(Phase::Draining.is_open() && !Phase::Done.is_open());
+    assert!(abortable(Phase::Quiescing) && !abortable(Phase::Switching));
+    assert!(!abortable(Phase::Done) && !abortable(Phase::Failed));
+    assert!(!Phase::Draining.is_terminal() && Phase::Done.is_terminal());
     assert_eq!(
         serde_json::to_string(&Phase::RolledBack).unwrap(),
         "\"rolled_back\""

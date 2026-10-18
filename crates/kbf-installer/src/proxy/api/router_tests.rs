@@ -11,9 +11,10 @@ use super::actor::spawn;
 use super::auth::{BearerAuth, PeerKey, RateLimit, Sha256Hasher};
 use super::core::CrashPoint;
 use super::fakes::{COMMIT_C, FakeClock, FakeForwarder, FakeTokens, Rig, TOKEN, idle, staged};
-use super::model::{OldChild, Phase};
+use super::model::OldChild;
 use super::router::{MAX_BODY, Router};
 use super::traits::{Compat, InstallerState, InstallerStatus};
+use crate::proxy::model::Phase;
 use crate::testkit::{A, B};
 
 struct Harness {

@@ -1,79 +1,68 @@
-//! The update API of the frontend proxy (`docs/design/frontend-proxy.md` section 4, unit
-//! U8a): the routes, the bearer-token check, the single actor that owns the state of the
-//! update, and the idempotent request ids.
+//! The frontend swap orchestrator (U7a of `docs/design/frontend-proxy.md`, FP): the core
+//! of the supervisor in `kbf-installer proxy`, written against traits so that it runs with
+//! no listener, no child process and no filesystem beyond `update.json`.
 //!
-//! Nothing here binds a socket, starts a process or touches the filesystem beyond the
-//! proxy's state directory. Everything U8a needs from the rest of the system is a trait
-//! in [`traits`], because none of it is on the feature branch yet: [`traits::OrderWriter`]
-//! (the `frontend_update`/`revert` records), [`traits::StatusReader`] (`status.json`),
-//! [`traits::Supervisor`] (the U7 swap), [`traits::CompatGate`] (R1/R4, a stub until U9)
-//! and [`traits::Forwarder`] (the operator port). U7b and U8b supply the real ones.
+//! What is here: the [`Swap`] phase machine for a frontend host (two children side by
+//! side) and for an all-in-one host (stop, hold, start); recovery after a proxy restart
+//! ([`Swap::adopt`]); the operator's rollback; the retire rule; and [`FileRecorder`], the
+//! fsynced `update.json`. What is not: the proxy itself, the real child control and the
+//! orders spool (U4b, U7b), the update API ([`api`], U8a).
 //!
-//! # How an update moves
-//!
-//! `POST` checks the request (409 and 422 cases), saves its `request_id`, writes a
-//! `frontend_update` order (a locator; the root half fetches, verifies and stages without
-//! flipping, FP section 2) and answers 202 with phase `accepted`. From then on the API
-//! reads `status.json` on every status read and on [`actor::Api::tick`]:
-//!
-//! - `state: fetching` is phase `fetching`;
-//! - `state: refused` for an order at or after ours is phase `failed` with the refusal
-//!   word as `failure.reason` ([`refusal`]); no child is started;
-//! - `staged_commit` equal to ours with `staged{}` facts runs the compatibility gate, and
-//!   a compatible release is handed to the [`traits::Supervisor`], which owns every later
-//!   phase; an incompatible one fails the update and a `revert` order drops the staged
-//!   release.
-//!
-//! The phase `verifying` is never reported by the API: `status.json` has no state between
-//! `fetching` and `staged`.
-//!
-//! # Assumptions on open questions (each lives in one place)
-//!
-//! - **Order ids (Q1).** `order_id`, `epoch` and `generation` come from the
-//!   [`traits::OrderWriter`]; the API does not know where their counter lives.
-//! - **Which refusal is ours (Q1).** `status.json` has one `refusal` string and
-//!   `acked_order_id`; a `refused` state whose `acked_order_id` is at least our order's id
-//!   is ours ([`core::Core::advance`]). A stale refusal has a lower id.
-//! - **Compatibility before the fetch (Q1, U9).** `POST` asks the gate with no facts, so
-//!   a 409 `incompatible` or 422 at `POST` time is possible only for what U9 can know
-//!   without the release; the verdict on the staged facts arrives as `failed` /
-//!   `step: compat` ([`traits::CompatGate`]).
-//! - **Request map (Q5).** `requests.json` in the proxy state directory is this module's
-//!   own file ([`idempotency`]); `update.json` (the swap's intent) is U7's.
-//! - **Restart marker (FP section 10).** The path of the postinst marker is not fixed by
-//!   the design; [`traits::RestartMarker`] takes it from the caller.
-//! - **The confirm window** the orders ask for is [`core::Config::window_s`].
-//! - **Operator port forwards.** `/v1/update/pause` and `/v1/update/resume` are the paths
-//!   of the two forwarded verbs (FP names `/pause`, `/resume` under `/v1/update`).
-//! - **Who runs the forward Postgres migration, and with which credential, is still open
-//!   and is not touched here:** it belongs behind the `Migrator` trait of the update
-//!   driver (U7b), before a candidate child starts, and the API only sees its effect as a
-//!   `failed` phase from the supervisor.
-//!
-//! # What U7b and U8b wire
-//!
-//! U7b implements [`traits::Supervisor`] over the real children and the `confirm`
-//! order; U8b implements [`traits::OrderWriter`] over `orders/` and the counter,
-//! [`traits::Forwarder`] over the operator port, a hyper listener that builds
-//! `Request<Bytes>` (with a [`auth::PeerKey`] extension) and calls [`router::Router::call`],
-//! the timer that calls [`actor::Api::tick`], and the OIDC [`auth::Authorize`] (#1088).
+//! Assumptions, each in one place:
+//! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
+//!   [`ports::ChildAdmin::resume`].
+//! - **Q8** open streams come from the proxy ([`ports::Gate::open_streams`]); open
+//!   executions and queued operations from the child ([`ports::ChildAdmin::open_counts`]).
+//! - **Migration** (open): who runs the forward Postgres migration, and with which
+//!   credential, is undecided; the swap only calls [`ports::Migrator::migrate_forward`]
+//!   before the candidate starts. For an all-in-one host it runs after the old process
+//!   exits.
+//! - **update.json** keeps the recorded process identity of both children
+//!   ([`model::Intent::old_proc`], `new_proc`), which FP section 4 does not list: adoption
+//!   needs pid, start time and executable. A candidate spawned and not yet recorded when
+//!   the proxy dies is not found again (U7b should write a pid file at spawn).
+//! - **confirm** is sent once the bake passes and is idempotent at the root half, because
+//!   a restart between the confirm and the `nodes` record sends it again.
+//! - **abort** ends an update as `failed` with step `abort`, not `rolled_back`; so does an
+//!   abort that arrives while the old child quiesces (it is `abort`, not `switch`).
+//! - **Compatibility gate (R1, R4)** is not here: [`model::StagedFacts`] is carried and
+//!   only its commit is read. The gate that reads `protocol`, `min_protocol` and
+//!   `state_schema` is U9.
+//! - **Order locator (Q1)**: [`model::Locator`] carries `verb` with the other five fields.
+//! - **Rollback** uses a hold, like the swap, so streams move atomically. It records
+//!   `rolling_back` in `update.json` before it touches either child (it has no phase of
+//!   its own), so a restart finishes it, or puts the new child back if it never landed.
+//!   The new child served: it is never killed, only drained and sent SIGTERM.
+//! - **Confirm** is sent up to `Timing::confirm_attempts` times with a doubling wait. If
+//!   it never lands, the new child keeps serving, the staged release is kept, the nodes
+//!   are not sent, the old child is drained and retired, and the update ends `failed`
+//!   with `failure.step == confirm`. After the switch no failure drops the staged release.
+//! - **All-in-one stop**: after `quiesce`, the proxy sends SIGTERM to the old process
+//!   ([`aio`]).
+//! - A dead new child during the bake leaves the update parked in `baking` (red) until the
+//!   operator rolls back; the proxy-supervised respawn with an epoch bump is U7b.
 
-pub mod actor;
-pub mod auth;
-pub mod core;
-pub mod idempotency;
+mod aio;
+pub mod api;
 pub mod model;
-pub mod refusal;
-pub mod router;
-pub mod traits;
+pub mod ports;
+pub mod record;
+mod recover;
+mod retire;
+mod swap;
 
 #[cfg(test)]
-mod auth_tests;
+mod aio_tests;
 #[cfg(test)]
 mod fakes;
 #[cfg(test)]
-mod idempotency_tests;
+mod record_tests;
 #[cfg(test)]
-mod router_tests;
+mod recover_tests;
 #[cfg(test)]
-mod tests;
+mod swap_tests;
+
+pub use model::{Halt, Intent, Phase, Plan, Timing};
+pub use ports::Ports;
+pub use record::FileRecorder;
+pub use swap::Swap;

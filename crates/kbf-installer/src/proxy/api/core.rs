@@ -14,8 +14,7 @@ use hyper::StatusCode;
 
 use super::idempotency::{Entry, Idempotency};
 use super::model::{
-    Failure, Locator, OrderVerb, Phase, RollbackBlocked, StagedFacts, StatusBody, UpdateId,
-    UpdateRequest, rollback_gate,
+    RollbackBlocked, StatusBody, UpdateId, UpdateRequest, abortable, rollback_gate,
 };
 use super::refusal;
 use super::traits::{
@@ -23,6 +22,7 @@ use super::traits::{
     RunningUpdate, StatusReader, Supervisor, SupervisorError, UpdateSpec,
 };
 use crate::CommitId;
+use crate::proxy::model::{Failure, Locator, Phase, StagedFacts, Step, Verb};
 
 /// The longest `request_id` and the longest force-retire reason accepted.
 const MAX_REQUEST_ID: usize = 128;
@@ -164,6 +164,7 @@ pub struct Parts {
 
 struct Staging {
     update_id: UpdateId,
+    request_id: String,
     from: Option<CommitId>,
     to: CommitId,
     nodes: bool,
@@ -323,7 +324,7 @@ impl Core {
             .parts
             .orders
             .write(
-                OrderVerb::FrontendUpdate,
+                Verb::FrontendUpdate,
                 &entry.commit,
                 self.parts.config.window_s,
             )
@@ -331,6 +332,7 @@ impl Core {
         let since = self.parts.clock.wall_s();
         self.active = Active::Staging(Box::new(Staging {
             update_id: entry.update_id.clone(),
+            request_id: entry.request_id.clone(),
             from,
             to: entry.commit.clone(),
             nodes: entry.nodes,
@@ -357,7 +359,7 @@ impl Core {
                 .supervisor
                 .status()
                 .update
-                .is_some_and(|u| u.phase.is_open())
+                .is_some_and(|u| !u.phase.is_terminal())
     }
 
     fn phase_of(&self, id: &UpdateId) -> Option<Phase> {
@@ -391,16 +393,13 @@ impl Core {
         if status.state == InstallerState::Refused && status.acked_order_id >= st.order.order_id {
             let word = status.refusal_word().to_owned();
             let failure = Failure {
-                step: refusal::step(&word).to_owned(),
+                step: refusal::step(&word),
                 reason: word,
             };
             self.active = self.end(&st, Phase::Failed, Some(failure));
             return;
         }
-        let facts = match (&status.staged_commit, &status.staged) {
-            (Some(c), Some(f)) if *c == st.to => Some(f.clone()),
-            _ => None,
-        };
+        let facts = status.staged_facts().filter(|f| f.commit == st.to);
         match facts {
             Some(facts) => self.active = self.hand_over(st, &facts),
             None => {
@@ -436,6 +435,7 @@ impl Core {
             Compat::Compatible => {
                 let spec = UpdateSpec {
                     update_id: st.update_id.clone(),
+                    request_id: st.request_id.clone(),
                     from: st.from.clone(),
                     to: st.to.clone(),
                     nodes: st.nodes,
@@ -446,17 +446,17 @@ impl Core {
                 match self.parts.supervisor.start(&spec) {
                     Ok(()) => return Active::Supervised,
                     Err(e) => Failure {
-                        step: "start".to_owned(),
+                        step: Step::Start,
                         reason: e.to_string(),
                     },
                 }
             }
             Compat::Incompatible { rule } => Failure {
-                step: "compat".to_owned(),
+                step: Step::Compat,
                 reason: rule,
             },
             Compat::Incomplete { reason } => Failure {
-                step: "compat".to_owned(),
+                step: Step::Compat,
                 reason,
             },
         };
@@ -466,10 +466,10 @@ impl Core {
 
     /// Asks the installer to drop the staged release of an update that will not go on.
     fn drop_staged(&mut self, st: &Staging) {
-        if let Err(e) =
-            self.parts
-                .orders
-                .write(OrderVerb::Revert, &st.to, self.parts.config.window_s)
+        if let Err(e) = self
+            .parts
+            .orders
+            .write(Verb::Revert, &st.to, self.parts.config.window_s)
         {
             tracing::warn!(error = %e, "the revert order could not be written");
         }
@@ -537,7 +537,7 @@ impl Core {
             if let Err(e) =
                 self.parts
                     .orders
-                    .write(OrderVerb::Revert, &st.to, self.parts.config.window_s)
+                    .write(Verb::Revert, &st.to, self.parts.config.window_s)
             {
                 self.active = Active::Staging(st);
                 return Err(ApiError::unavailable("order_unwritable", e.to_string()).into());
@@ -550,7 +550,7 @@ impl Core {
             });
         }
         let update = self.open_update()?;
-        if !update.phase.abortable() {
+        if !abortable(update.phase) {
             return Err(ApiError::conflict(
                 "not_abortable",
                 format!(
@@ -620,7 +620,7 @@ impl Core {
             .supervisor
             .status()
             .update
-            .filter(|u| u.phase.is_open())
+            .filter(|u| !u.phase.is_terminal())
             .ok_or_else(|| ApiError::conflict("no_update_open", "no update is open"))
     }
 }

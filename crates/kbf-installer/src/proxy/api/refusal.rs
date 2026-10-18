@@ -7,6 +7,8 @@
 //! `failure.step`, which says what the operator should look at. A word this build does
 //! not know fails closed the same way, with step `stage`.
 
+use crate::proxy::model::Step;
+
 /// Every word of KI section 5, in the order the document lists them.
 pub const WORDS: [&str; 18] = [
     "trust_chain",
@@ -30,13 +32,13 @@ pub const WORDS: [&str; 18] = [
 ];
 
 /// The failing step for a refusal word.
-pub fn step(word: &str) -> &'static str {
+pub fn step(word: &str) -> Step {
     match word {
         "trust_chain" | "hash" | "attestation" | "commit_or_ref" | "facts"
-        | "installer_too_old" | "platform" | "size" => "verify",
-        "fetch" | "disk" => "fetch",
-        "replay" | "generation" | "floor" | "denied" => "order",
-        "pending" | "lease" | "envoy_range" | "frontend_busy" => "host",
-        _ => "stage",
+        | "installer_too_old" | "platform" | "size" => Step::Verify,
+        "fetch" | "disk" => Step::Fetch,
+        "replay" | "generation" | "floor" | "denied" => Step::Order,
+        "pending" | "lease" | "envoy_range" | "frontend_busy" => Step::Host,
+        _ => Step::Stage,
     }
 }
