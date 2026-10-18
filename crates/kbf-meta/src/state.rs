@@ -581,6 +581,16 @@ impl MetaState {
         }
     }
 
+    /// The closure of `action`'s entry (the blobs it needs besides its result blob), in
+    /// digest order; empty without an entry. Not a hit check: [`State::action`] is.
+    #[must_use]
+    pub fn action_closure(&self, action: &Digest) -> Vec<Digest> {
+        self.actions
+            .get(action)
+            .map(|e| e.record.closure.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
     /// The objects in the store that hold the blobs `action`'s entry needs (its result
     /// blob and closure), each once: a reader checks the store still has them before it
     /// serves a hit. A blob staged on a tier is left out (the store does not hold it

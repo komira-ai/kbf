@@ -68,6 +68,7 @@ impl Owners {
                 zone: String::new(),
                 weight: 1,
                 state: MemberState::Active,
+                boot: 0,
             })
             .collect();
         let r = u8::try_from(count).expect("a few owners");
