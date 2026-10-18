@@ -13,6 +13,11 @@
 //!
 //! What was verified is remembered per blob and owner ([`Verified`]), shared by every
 //! action: toolchain blobs repeat across actions, so most of a closure is usually cached.
+//! An entry is trusted only while the owner's map generation and published boot
+//! (`Member::boot`) are those it was verified under: a restarted owner may have lost
+//! blobs it held only in RAM, so a new boot drops its entries even when the generation did
+//! not move. An owner whose boot is 0 (unknown, a node from before the field) is never
+//! remembered: without a boot a restart cannot be told, so every check asks it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -95,10 +100,11 @@ struct Counters {
     rpcs: AtomicU64,
 }
 
-/// One owner's verified blobs, and the map generation they were verified under.
+/// One owner's verified blobs, and the map generation and boot they were verified under.
 #[derive(Default)]
 struct Owned {
     generation: u64,
+    boot: u64,
     /// digest -> (when verified, its place in `Inner::recency`)
     blobs: BTreeMap<Digest, (Instant, u64)>,
 }
@@ -112,17 +118,22 @@ struct Inner {
 }
 
 impl Inner {
-    /// The entries of `member` for `generation`: those of an older generation are dropped
-    /// first. `None` when the caller's generation is older than what is remembered (the
-    /// caller works from an old map: it neither reads nor adds).
-    fn owned(&mut self, member: MemberId, generation: u64) -> Option<&mut Owned> {
-        let remembered = self.members.get(&member).map(|o| o.generation);
-        if remembered.is_some_and(|g| g > generation) {
+    /// The entries of `member` for `generation` and `boot`: those of an older generation or
+    /// another boot are dropped first. `None` when the caller's view is older than what is
+    /// remembered (the caller works from an old map: it neither reads nor adds), or when
+    /// `boot` is 0 (unknown: a restart could not be told, so nothing is remembered).
+    ///
+    /// The generation orders first, the boot second; a restart normally moves both, and the
+    /// boot alone catches a view that shares the generation but not the registration.
+    fn owned(&mut self, member: MemberId, generation: u64, boot: u64) -> Option<&mut Owned> {
+        if boot == 0 {
             return None;
         }
-        if remembered.is_some_and(|g| g < generation) {
-            // TODO(storage-ram-ack PR1): a member's boot (map.proto Member.boot) joins the
-            // generation here, so a restart inside the lease drops its entries too.
+        let remembered = self.members.get(&member).map(|o| (o.generation, o.boot));
+        if remembered.is_some_and(|r| r > (generation, boot)) {
+            return None;
+        }
+        if remembered.is_some_and(|r| r < (generation, boot)) {
             let dropped = self.members.remove(&member).into_iter();
             for (_, seq) in dropped.flat_map(|o| o.blobs.into_values()) {
                 self.recency.remove(&seq);
@@ -130,6 +141,7 @@ impl Inner {
         }
         let owned = self.members.entry(member).or_default();
         owned.generation = generation;
+        owned.boot = boot;
         Some(owned)
     }
 
@@ -175,12 +187,13 @@ impl Verified {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Whether `digest` was verified at `member` under `generation` within the time to
-    /// live. A hit counts as a use.
-    fn fresh(&self, member: MemberId, generation: u64, digest: &Digest, now: Instant) -> bool {
+    /// Whether `digest` was verified at `member` under `generation` and the member's
+    /// published `boot` within the time to live. A hit counts as a use.
+    fn fresh(&self, member: &Member, generation: u64, digest: &Digest, now: Instant) -> bool {
+        let member = (member.id, member.boot);
         let mut inner = self.lock();
         let Some(&(at, seq)) = inner
-            .owned(member, generation)
+            .owned(member.0, generation, member.1)
             .and_then(|owned| owned.blobs.get(digest))
         else {
             return false;
@@ -189,22 +202,24 @@ impl Verified {
             inner.recency.remove(&seq);
             let _ = inner
                 .members
-                .get_mut(&member)
+                .get_mut(&member.0)
                 .and_then(|owned| owned.blobs.remove(digest));
             return false;
         }
-        inner.put(member, *digest, at);
+        inner.put(member.0, *digest, at);
         true
     }
 
-    /// Remembers that `digests` were verified at `member` under `generation` at `now`.
-    fn record(&self, member: MemberId, generation: u64, digests: &[Digest], now: Instant) {
+    /// Remembers that `digests` were verified at `member` under `generation` and the
+    /// member's published `boot` at `now`. A member whose boot is unknown (0) is not
+    /// remembered.
+    fn record(&self, member: &Member, generation: u64, digests: &[Digest], now: Instant) {
         let mut inner = self.lock();
-        if self.capacity == 0 || inner.owned(member, generation).is_none() {
+        if self.capacity == 0 || inner.owned(member.id, generation, member.boot).is_none() {
             return;
         }
         for digest in digests {
-            inner.put(member, *digest, now);
+            inner.put(member.id, *digest, now);
         }
         let excess = inner.recency.len().saturating_sub(self.capacity);
         for _ in 0..excess {
@@ -277,7 +292,7 @@ impl Router {
             let owners = write_order(&view.map, digest);
             if owners
                 .iter()
-                .any(|owner| verified.fresh(owner.id, generation, digest, now))
+                .any(|owner| verified.fresh(owner, generation, digest, now))
             {
                 cached += 1;
             } else {
@@ -342,7 +357,7 @@ impl Router {
                             .filter(|d| !lacking.contains(d))
                             .copied()
                             .collect();
-                        verified.record(owner.id, generation, &present, now);
+                        verified.record(owner, generation, &present, now);
                         for digest in &present {
                             pending.remove(digest);
                         }

@@ -397,3 +397,131 @@ async fn a_caller_on_an_older_map_does_not_disturb_what_a_newer_one_verified() {
     assert!(rig.hit(&action).await);
     assert_eq!(rig.finds(1), [2, 2], "generation 2 is still remembered");
 }
+
+/// Members 1 to 3 with the boots `boots` (members 1, 2, 3 in that order).
+fn booted(boots: [u64; 3]) -> Vec<kbf_map::Member> {
+    let mut members = active(&[1, 2, 3]);
+    for (member, boot) in members.iter_mut().zip(boots) {
+        member.boot = boot;
+    }
+    members
+}
+
+/// Catches a cache that survives a restart that lost RAM-only data: member 1 restarts
+/// (boot 1 to 2) and the map a caller holds says so, at the same generation. What member 1
+/// was verified to hold is asked about again, and the blob it lost is found gone (member 2
+/// does not hold it either). Mutant: entries keyed by generation alone.
+#[tokio::test]
+async fn a_member_whose_boot_changed_at_the_same_generation_is_asked_again() {
+    let rig = rig();
+    let blobs = rig.blobs(2);
+    hold(&rig.cluster.node(1), &blobs);
+    let action = rig.action(0, &blobs);
+
+    assert!(rig.hit(&action).await);
+    assert!(rig.hit(&action).await);
+    assert_eq!(rig.finds(1), [2], "the repeat is cached");
+
+    rig.cluster.node(1).forget(&blobs[0]);
+    rig.cell.set(view(&map(1, 2, booted([2, 1, 1]))));
+    assert!(
+        !rig.hit(&action).await,
+        "the restarted member lost the blob"
+    );
+    assert_eq!(
+        rig.finds(1),
+        [2, 2],
+        "asked again though the generation held"
+    );
+}
+
+/// Catches a boot change of one member dropping what other members verified: member 1
+/// restarts, member 2 does not; blobs verified at member 2 stay cached. Mutant: any boot
+/// change clears the whole cache.
+#[tokio::test]
+async fn a_boot_change_drops_only_that_members_entries() {
+    let rig = rig();
+    let blobs = rig.blobs(2);
+    hold(&rig.cluster.node(2), &blobs);
+    let action = rig.action(0, &blobs);
+
+    assert!(rig.hit(&action).await);
+    assert_eq!((rig.finds(1), rig.finds(2)), (vec![2], vec![2]));
+
+    // Member 3 (the action cache owner) restarts; members 1 and 2 are unchanged.
+    rig.cell.set(view(&map(1, 2, booted([1, 1, 2]))));
+    assert!(rig.hit(&action).await);
+    assert_eq!(
+        (rig.finds(1), rig.finds(2)),
+        (vec![2], vec![2]),
+        "still cached"
+    );
+}
+
+/// Catches the generation rule lost when the boot joined the key: the same boot at a new
+/// generation drops the entries as before (asked again), and the same boot at the same
+/// generation keeps them. Mutant: the generation dropped from the key.
+#[tokio::test]
+async fn the_same_boot_at_a_new_generation_is_asked_again() {
+    let rig = rig();
+    let blobs = rig.blobs(2);
+    hold(&rig.cluster.node(1), &blobs);
+    let action = rig.action(0, &blobs);
+
+    assert!(rig.hit(&action).await);
+    rig.cell.set(view(&map(1, 2, booted([1, 1, 1]))));
+    assert!(rig.hit(&action).await);
+    assert_eq!(rig.finds(1), [2], "same generation, same boot: cached");
+
+    rig.cell.set(view(&map(2, 2, booted([1, 1, 1]))));
+    assert!(rig.hit(&action).await);
+    assert_eq!(rig.finds(1), [2, 2], "a new generation drops them");
+}
+
+/// Catches a caller with an older boot of a member overwriting a newer one: after a
+/// check under boot 2, a caller whose map says boot 1 (same generation) asks again and
+/// does not replace the entries, so boot 2 stays cached. Mutant: the older boot adopted.
+#[tokio::test]
+async fn a_caller_with_an_older_boot_does_not_disturb_a_newer_one() {
+    let rig = rig();
+    let blobs = rig.blobs(2);
+    hold(&rig.cluster.node(1), &blobs);
+    let action = rig.action(0, &blobs);
+    let newer = view(&map(1, 2, booted([2, 1, 1])));
+
+    rig.cell.set(newer.clone());
+    assert!(rig.hit(&action).await);
+    rig.cell.set(view(&map(1, 2, booted([1, 1, 1]))));
+    assert!(rig.hit(&action).await);
+    assert_eq!(rig.finds(1), [2, 2], "the older boot asks again");
+    rig.cell.set(newer);
+    assert!(rig.hit(&action).await);
+    assert_eq!(rig.finds(1), [2, 2], "boot 2 is still remembered");
+}
+
+/// Catches a cache trusting a member whose boot is unknown (0, a node from before the
+/// field): a restart cannot be told, so nothing is remembered and every check asks it,
+/// whether the boot later becomes known or not. Once the boot is known (1) it is cached.
+/// Mutant: boot 0 remembered like any other boot.
+#[tokio::test]
+async fn a_member_with_an_unknown_boot_is_never_remembered() {
+    let rig = rig();
+    let blobs = rig.blobs(2);
+    hold(&rig.cluster.node(1), &blobs);
+    let action = rig.action(0, &blobs);
+    let unknown = view(&map(1, 2, booted([0, 1, 1])));
+
+    rig.cell.set(unknown.clone());
+    assert!(rig.hit(&action).await);
+    assert!(rig.hit(&action).await);
+    assert_eq!(rig.finds(1), [2, 2], "boot 0: every check asks");
+
+    rig.cell.set(view(&map(1, 2, booted([1, 1, 1]))));
+    assert!(rig.hit(&action).await);
+    assert!(rig.hit(&action).await);
+    assert_eq!(
+        rig.finds(1),
+        [2, 2, 2],
+        "boot known: asked once more, then cached"
+    );
+}
