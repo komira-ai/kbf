@@ -1,48 +1,16 @@
-//! The seams U7 and U8 implement: the admin calls on a child, the update-API handler, and
-//! the per-slot counts the update status reports.
+//! The seams U7 and U8 use: the update-API handler and the status the proxy reports.
+//!
+//! The admin calls on a child (`takeover`, `quiesce`, `stand_down`, `resume`, `role`) are not
+//! here. The proxy makes none of them: U7a's supervisor is their only caller, so the trait
+//! (`ChildControl`) lives in `kbf-installer` with the supervisor, and the proxy only supplies
+//! the child's admin port ([`crate::config::UpstreamTable::admin_port`]) and the headers that
+//! authenticate a call to it ([`crate::identity::admin_headers`]).
 
 use std::time::Duration;
 
+use http::{HeaderName, HeaderValue};
+
 use crate::slot::Slot;
-
-/// What a child says about itself on `GET role`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChildRole {
-    /// Holds the generation and schedules.
-    Active,
-    /// Started with `--await-takeover`, not yet taken over.
-    Candidate,
-    /// Quiesced or stood down: finishing open streams only.
-    StandingDown,
-}
-
-/// Why an admin call failed.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum ControlError {
-    /// The child did not answer in time.
-    #[error("the child did not answer")]
-    Timeout,
-    /// The child answered with a refusal.
-    #[error("the child refused: {0}")]
-    Refused(String),
-}
-
-/// The frozen admin contract with a child (`admin_protocol`, design section 10). The
-/// proxy calls it on the child's admin port ([`crate::config::UpstreamTable::admin_port`]);
-/// U7a implements it with fakes and U7b with the real loopback client. Every call is
-/// idempotent.
-pub trait ChildControl: Send + Sync {
-    /// The candidate takes the generation and starts scheduling.
-    fn takeover(&self, slot: Slot) -> impl Future<Output = Result<(), ControlError>> + Send;
-    /// The old child stops scheduling, assigning and requeueing, and flushes.
-    fn quiesce(&self, slot: Slot) -> impl Future<Output = Result<(), ControlError>> + Send;
-    /// The old child ends its worker streams with `UNAVAILABLE "connect again"`.
-    fn stand_down(&self, slot: Slot) -> impl Future<Output = Result<(), ControlError>> + Send;
-    /// The inverse of quiesce and stand-down: full reload, then re-take the generation.
-    fn resume(&self, slot: Slot) -> impl Future<Output = Result<(), ControlError>> + Send;
-    /// The child's own view of its role.
-    fn role(&self, slot: Slot) -> impl Future<Output = Result<ChildRole, ControlError>> + Send;
-}
 
 /// The proxy's count for one slot, for `GET /v1/update/frontend`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -53,15 +21,58 @@ pub struct SlotStats {
     pub oldest_stream_age: Duration,
 }
 
-/// A request to `/v1/update/frontend*`, after the proxy authenticated it.
+/// One read of everything `GET /v1/update/frontend` reports. The fields are read one after
+/// another, so a stream between release and bind is in none of the counts: the snapshot is
+/// a hint, and only `ActiveSlot::retire` is authoritative.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProxySnapshot {
+    /// The active slot.
+    pub active: Option<Slot>,
+    /// Whether new streams are being held.
+    pub holding: bool,
+    /// Streams in the hold queue.
+    pub held: usize,
+    /// Each slot's stats, A then B.
+    pub per_slot: [SlotStats; 2],
+    /// Whether `/readyz` would answer 200 (an active child and a poll that passed).
+    pub ready: bool,
+}
+
+impl ProxySnapshot {
+    /// The stats of `slot`.
+    #[must_use]
+    pub const fn stats(&self, slot: Slot) -> SlotStats {
+        match slot {
+            Slot::A => self.per_slot[0],
+            Slot::B => self.per_slot[1],
+        }
+    }
+}
+
+/// The largest update-API body the proxy passes on; a larger one is answered 413 by the
+/// proxy ([`UpdateReply::payload_too_large`]) without calling the handler.
+pub const MAX_UPDATE_BODY: usize = 4096;
+/// How long the proxy waits for the handler; after that it answers 504
+/// ([`UpdateReply::timed_out`]) and drops the handler's future.
+pub const UPDATE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// A request to `/v1/update/frontend*`, after the proxy authenticated and rate limited it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpdateRequest {
     /// `GET` or `POST`.
     pub method: String,
     /// The path, `/v1/update/frontend` and what follows it.
     pub path: String,
-    /// The JSON body, at most 4 KiB.
+    /// The JSON body, at most [`MAX_UPDATE_BODY`] bytes.
     pub body: Vec<u8>,
+}
+
+impl UpdateRequest {
+    /// Whether a body of `len` bytes may reach the handler.
+    #[must_use]
+    pub const fn body_fits(len: usize) -> bool {
+        len <= MAX_UPDATE_BODY
+    }
 }
 
 /// The answer to an [`UpdateRequest`].
@@ -69,13 +80,49 @@ pub struct UpdateRequest {
 pub struct UpdateReply {
     /// HTTP status.
     pub status: u16,
+    /// Extra response headers, for example `Retry-After` on a 409 or 429. `Content-Type:
+    /// application/json` is always set by the proxy.
+    pub headers: Vec<(HeaderName, HeaderValue)>,
     /// JSON body.
     pub body: Vec<u8>,
 }
 
+impl UpdateReply {
+    /// A reply with no extra headers.
+    #[must_use]
+    pub const fn json(status: u16, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            headers: Vec::new(),
+            body,
+        }
+    }
+
+    /// The same reply with one more header.
+    #[must_use]
+    pub fn with_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+        self.headers.push((name, value));
+        self
+    }
+
+    /// The proxy's own answer to a body over [`MAX_UPDATE_BODY`].
+    #[must_use]
+    pub fn payload_too_large() -> Self {
+        Self::json(413, br#"{"error":"the body is over 4096 bytes"}"#.to_vec())
+    }
+
+    /// The proxy's own answer to a handler that passed [`UPDATE_DEADLINE`].
+    #[must_use]
+    pub fn timed_out() -> Self {
+        Self::json(504, br#"{"error":"the update handler did not answer"}"#.to_vec())
+    }
+}
+
 /// The pluggable handler of the update API: U8a's actor. The proxy authenticates first
-/// ([`crate::auth::decide`] with the update class, the one place that later swaps to OIDC)
-/// and rate limits, then calls this.
+/// ([`crate::auth::decide`] with the update class, the one place that later swaps to OIDC),
+/// rate limits, enforces [`MAX_UPDATE_BODY`] and [`UPDATE_DEADLINE`], and then calls this.
+/// The handler owns no state machine: it asks U7a's actor (a trait in `kbf-installer`) for
+/// `abort`, `rollback` and `force-retire`, and U7a alone writes `update.json`.
 pub trait UpdateHandler: Send + Sync {
     /// Handles one request.
     fn handle(&self, request: UpdateRequest) -> impl Future<Output = UpdateReply> + Send;
@@ -87,10 +134,7 @@ pub struct NoUpdates;
 
 impl UpdateHandler for NoUpdates {
     async fn handle(&self, _request: UpdateRequest) -> UpdateReply {
-        UpdateReply {
-            status: 503,
-            body: br#"{"error":"updates are not wired"}"#.to_vec(),
-        }
+        UpdateReply::json(503, br#"{"error":"updates are not wired"}"#.to_vec())
     }
 }
 
@@ -108,47 +152,6 @@ mod tests {
         }
     }
 
-    struct Fake;
-
-    impl ChildControl for Fake {
-        async fn takeover(&self, _: Slot) -> Result<(), ControlError> {
-            Err(ControlError::Timeout)
-        }
-        async fn quiesce(&self, _: Slot) -> Result<(), ControlError> {
-            Ok(())
-        }
-        async fn stand_down(&self, _: Slot) -> Result<(), ControlError> {
-            Ok(())
-        }
-        async fn resume(&self, _: Slot) -> Result<(), ControlError> {
-            Err(ControlError::Refused("holder is alive".into()))
-        }
-        async fn role(&self, slot: Slot) -> Result<ChildRole, ControlError> {
-            Ok(match slot {
-                Slot::A => ChildRole::Active,
-                Slot::B => ChildRole::Candidate,
-            })
-        }
-    }
-
-    #[test]
-    fn the_admin_contract_is_implementable_and_errors_print() {
-        let c = Fake;
-        assert_eq!(ready(c.takeover(Slot::B)), Err(ControlError::Timeout));
-        assert_eq!(ready(c.quiesce(Slot::A)), Ok(()));
-        assert_eq!(ready(c.stand_down(Slot::A)), Ok(()));
-        let refused = ready(c.resume(Slot::A)).expect_err("refused");
-        assert_eq!(refused.to_string(), "the child refused: holder is alive");
-        assert_eq!(
-            ControlError::Timeout.to_string(),
-            "the child did not answer"
-        );
-        assert_eq!(ready(c.role(Slot::A)), Ok(ChildRole::Active));
-        assert_eq!(ready(c.role(Slot::B)), Ok(ChildRole::Candidate));
-        assert_ne!(ChildRole::StandingDown, ChildRole::Active);
-        assert_eq!(SlotStats::default().open_streams, 0);
-    }
-
     #[test]
     fn until_u8_the_update_api_answers_503() {
         let reply = ready(NoUpdates.handle(UpdateRequest {
@@ -157,6 +160,49 @@ mod tests {
             body: Vec::new(),
         }));
         assert_eq!(reply.status, 503);
+        assert!(reply.headers.is_empty());
         assert!(reply.body.starts_with(b"{"));
+    }
+
+    #[test]
+    fn a_reply_carries_headers_and_the_proxys_own_answers_are_json() {
+        let reply = UpdateReply::json(429, b"{}".to_vec())
+            .with_header(http::header::RETRY_AFTER, HeaderValue::from_static("30"));
+        assert_eq!(reply.headers.len(), 1);
+        assert_eq!(reply.headers[0].0, http::header::RETRY_AFTER);
+        assert_eq!(reply.headers[0].1, "30");
+        for own in [UpdateReply::payload_too_large(), UpdateReply::timed_out()] {
+            assert!(own.body.starts_with(b"{\"error\""));
+        }
+        assert_eq!(UpdateReply::payload_too_large().status, 413);
+        assert_eq!(UpdateReply::timed_out().status, 504);
+    }
+
+    #[test]
+    fn the_body_bound_is_4096_bytes_inclusive() {
+        assert!(UpdateRequest::body_fits(0));
+        assert!(UpdateRequest::body_fits(4096));
+        assert!(!UpdateRequest::body_fits(4097));
+        assert_eq!(UPDATE_DEADLINE, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_snapshot_reads_each_slot_apart() {
+        let snap = ProxySnapshot {
+            active: Some(Slot::B),
+            holding: true,
+            held: 3,
+            per_slot: [
+                SlotStats {
+                    open_streams: 200,
+                    oldest_stream_age: Duration::from_secs(9),
+                },
+                SlotStats::default(),
+            ],
+            ready: false,
+        };
+        assert_eq!(snap.stats(Slot::A).open_streams, 200);
+        assert_eq!(snap.stats(Slot::B), SlotStats::default());
+        assert_eq!(ProxySnapshot::default().active, None);
     }
 }

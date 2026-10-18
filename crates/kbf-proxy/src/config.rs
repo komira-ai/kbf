@@ -69,6 +69,9 @@ pub struct Limits {
     pub max_connections: usize,
     /// Most open connections from one address.
     pub max_connections_per_ip: usize,
+    /// Most streams in flight across all connections (bound, held and dialing); one more
+    /// is refused at header time. Memory is bounded by this times the stream windows.
+    pub max_streams: usize,
     /// Most header-list bytes per request.
     pub max_header_list_bytes: u32,
     /// Interval of the downstream PING that finds dead peers, in seconds.
@@ -83,6 +86,7 @@ impl Default for Limits {
             pre_stream_timeout_s: 10,
             max_connections: 50_000,
             max_connections_per_ip: 2_000,
+            max_streams: 8_192,
             max_header_list_bytes: 16 * 1024,
             keepalive_interval_s: 30,
             keepalive_ack_s: 20,
@@ -120,10 +124,12 @@ pub struct ProxyConfig {
     /// The secret file (default `/run/kbf-proxy/proxy-auth`).
     #[serde(default = "default_secret_file")]
     pub proxy_auth_file: PathBuf,
-    /// The proxy's state directory (default `/var/lib/kbf-proxy`).
+    /// The proxy's state directory (default `/var/lib/kbf-proxy`). The swap state machine and
+    /// `update.json` belong to U7a's actor, not to the proxy.
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
-    /// Hold bound of a frontend swap, in seconds (default 15).
+    /// Hold bound of a frontend swap, in seconds (default 20: the 15 s takeover budget plus a
+    /// 5 s margin).
     #[serde(default = "default_hold_s")]
     pub hold_max_s: u64,
     /// Limits.
@@ -140,10 +146,16 @@ fn default_state_dir() -> PathBuf {
 }
 
 const fn default_hold_s() -> u64 {
-    15
+    20
 }
 
 impl ProxyConfig {
+    /// The hold bound of a frontend swap, to pass to `ActiveSlot::hold`.
+    #[must_use]
+    pub const fn frontend_hold(&self) -> Duration {
+        Duration::from_secs(self.hold_max_s)
+    }
+
     /// Reads and checks a `[proxy]` table (the text of the table's body).
     ///
     /// # Errors
@@ -174,6 +186,9 @@ impl ProxyConfig {
                 "limits.max_connections_per_ip must be 1 to max_connections",
             ));
         }
+        if l.max_streams == 0 {
+            return Err(ConfigError::Invalid("limits.max_streams must be above 0"));
+        }
         if self.hold_max_s == 0 {
             return Err(ConfigError::Invalid("hold_max_s must be above 0"));
         }
@@ -198,7 +213,9 @@ base_port = 18000
     fn a_minimal_table_gets_the_documented_defaults() {
         let c = ProxyConfig::from_toml_str(MIN).expect("valid");
         assert_eq!(c.buck2_auth, Buck2Auth::None);
-        assert_eq!(c.hold_max_s, 15);
+        assert_eq!(c.hold_max_s, 20);
+        assert_eq!(c.frontend_hold(), Duration::from_secs(20));
+        assert_eq!(c.limits.max_streams, 8_192);
         assert_eq!(c.limits, Limits::default());
         assert_eq!(c.limits.pre_stream_timeout(), Duration::from_secs(10));
         assert_eq!(
@@ -243,6 +260,10 @@ base_port = 18000
         let limits = |l: &str| ProxyConfig::from_toml_str(&format!("{MIN}\n[limits]\n{l}\n"));
         assert!(matches!(
             limits("keepalive_ack_s = 0"),
+            Err(ConfigError::Invalid(_))
+        ));
+        assert!(matches!(
+            limits("max_streams = 0"),
             Err(ConfigError::Invalid(_))
         ));
         assert!(matches!(

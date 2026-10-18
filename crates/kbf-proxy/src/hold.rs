@@ -2,49 +2,51 @@
 //!
 //! While [`crate::slot::ActiveSlot::holding`] is true, a new stream is accepted and its
 //! headers read, but nothing is opened to a backend and no flow-control window beyond the
-//! initial one is granted. The initial window is [`HoldPolicy::window_bytes`], and it covers
-//! headers and data together, so a held stream buffers at most that. The number of held
-//! streams is bounded too, so the worst case is `queue_streams * window_bytes`.
+//! initial one is granted. The initial window is [`HoldLimits::window_bytes`] of data; the
+//! header list (at most [`HEADER_BYTES`]) is not counted against an h2 stream window, so a
+//! held stream buffers at most both. The number of held streams is bounded too, so the worst
+//! case is [`HoldLimits::worst_case_bytes`].
+//!
+//! How long a hold lasts is chosen per hold, by the supervisor, in
+//! [`crate::slot::ActiveSlot::hold`]: [`crate::config::ProxyConfig::frontend_hold`] for a
+//! frontend swap, [`ALL_IN_ONE_HOLD`] for a stop-then-start swap.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-/// The bounds of one hold.
+/// The hold of an all-in-one swap (stop, then start).
+pub const ALL_IN_ONE_HOLD: Duration = Duration::from_secs(300);
+/// The cap on a request's header list, which sits outside the stream window.
+pub const HEADER_BYTES: u64 = 16 * 1024;
+/// The stream window once a stream is bound and dispatched upstream. A held or still-queued
+/// stream stays at [`HoldLimits::window_bytes`]; 64 KB for a whole upload would cap it near
+/// 1.3 MB/s at 50 ms.
+pub const BOUND_WINDOW_BYTES: u32 = 1024 * 1024;
+
+/// The size bounds of the hold queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HoldPolicy {
-    /// Longest a stream is held before it gets `UNAVAILABLE`.
-    pub hold_max: Duration,
+pub struct HoldLimits {
     /// Most streams held at once; one more gets `UNAVAILABLE` at once.
     pub queue_streams: usize,
-    /// Per-stream buffer while held: headers plus data.
+    /// Per-stream data buffer while held.
     pub window_bytes: u32,
 }
 
-impl HoldPolicy {
-    /// A frontend swap: 15 s, longer than the 10 s takeover limit.
-    #[must_use]
-    pub const fn frontend() -> Self {
+impl Default for HoldLimits {
+    fn default() -> Self {
         Self {
-            hold_max: Duration::from_secs(15),
             queue_streams: 2048,
             window_bytes: 64 * 1024,
         }
     }
+}
 
-    /// An all-in-one swap (stop, then start): 300 s.
-    #[must_use]
-    pub const fn all_in_one() -> Self {
-        Self {
-            hold_max: Duration::from_secs(300),
-            ..Self::frontend()
-        }
-    }
-
-    /// The most bytes a full queue buffers.
+impl HoldLimits {
+    /// The most bytes a full queue buffers: window plus header list per stream.
     #[must_use]
     pub const fn worst_case_bytes(&self) -> u64 {
-        self.queue_streams as u64 * self.window_bytes as u64
+        self.queue_streams as u64 * (self.window_bytes as u64 + HEADER_BYTES)
     }
 }
 
@@ -56,24 +58,24 @@ pub struct QueueFull;
 /// The count of held streams (`kbf_proxy_held_streams`) and its bound.
 #[derive(Clone, Debug)]
 pub struct HoldQueue {
-    policy: HoldPolicy,
+    limits: HoldLimits,
     held: Arc<AtomicUsize>,
 }
 
 impl HoldQueue {
-    /// An empty queue under `policy`.
+    /// An empty queue under `limits`.
     #[must_use]
-    pub fn new(policy: HoldPolicy) -> Self {
+    pub fn new(limits: HoldLimits) -> Self {
         Self {
-            policy,
+            limits,
             held: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    /// The policy in force.
+    /// The limits in force.
     #[must_use]
-    pub const fn policy(&self) -> HoldPolicy {
-        self.policy
+    pub const fn limits(&self) -> HoldLimits {
+        self.limits
     }
 
     /// Streams held now.
@@ -82,20 +84,21 @@ impl HoldQueue {
         self.held.load(Ordering::Acquire)
     }
 
-    /// Admits one stream at `now`. The ticket counts the stream until it drops (released,
+    /// Admits one stream at `now`, to be answered `UNAVAILABLE` after `hold_max` (the value
+    /// [`crate::slot::Bind::Held`] carried). The ticket counts the stream until it drops (released,
     /// expired or reset by the client).
     ///
     /// # Errors
     /// [`QueueFull`]: the bound is reached.
-    pub fn admit(&self, now: Instant) -> Result<Ticket, QueueFull> {
+    pub fn admit(&self, now: Instant, hold_max: Duration) -> Result<Ticket, QueueFull> {
         self.held
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < self.policy.queue_streams).then_some(n + 1)
+                (n < self.limits.queue_streams).then_some(n + 1)
             })
             .map_err(|_| QueueFull)?;
         Ok(Ticket {
             held: Arc::clone(&self.held),
-            deadline: now + self.policy.hold_max,
+            deadline: now + hold_max,
         })
     }
 }
@@ -119,6 +122,31 @@ impl Ticket {
     pub fn expired(&self, now: Instant) -> bool {
         now >= self.deadline
     }
+
+    /// What the stream's own task does next. The stream decides once, in its own task, so
+    /// release and expiry cannot both win: a release that is seen binds the stream even when
+    /// the deadline has passed too, and an expired stream is never bound afterwards.
+    #[must_use]
+    pub fn wake(&self, now: Instant, released: bool) -> Wake {
+        if released {
+            Wake::Bind
+        } else if self.expired(now) {
+            Wake::Expire
+        } else {
+            Wake::Wait
+        }
+    }
+}
+
+/// The one decision a held stream takes per wakeup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wake {
+    /// Still held: wait for the release epoch to change or the deadline.
+    Wait,
+    /// The gate released: bind again through [`crate::slot::ActiveSlot::bind`].
+    Bind,
+    /// The deadline passed: answer `UNAVAILABLE`.
+    Expire,
 }
 
 impl Drop for Ticket {
@@ -131,41 +159,56 @@ impl Drop for Ticket {
 mod tests {
     use super::*;
 
+    const HOLD: Duration = Duration::from_secs(20);
+
     #[test]
-    fn a_thousand_held_streams_buffer_at_most_the_window_each_and_expire() {
-        let q = HoldQueue::new(HoldPolicy::frontend());
+    fn a_thousand_held_streams_expire_and_the_worst_case_is_window_plus_headers() {
+        let q = HoldQueue::new(HoldLimits::default());
         let t0 = Instant::now();
-        let tickets: Vec<Ticket> = (0..1000).map(|_| q.admit(t0).expect("room")).collect();
+        let tickets: Vec<Ticket> = (0..1000).map(|_| q.admit(t0, HOLD).expect("room")).collect();
         assert_eq!(q.held(), 1000);
-        assert!(1000 * u64::from(q.policy().window_bytes) <= q.policy().worst_case_bytes());
+        // 2048 streams of (64 KiB window + 16 KiB header list).
+        assert_eq!(q.limits().worst_case_bytes(), 2048 * (65_536 + 16_384));
         assert!(
             tickets
                 .iter()
-                .all(|t| !t.expired(t0 + Duration::from_secs(14)))
+                .all(|t| !t.expired(t0 + Duration::from_secs(19)))
         );
         assert!(
             tickets
                 .iter()
-                .all(|t| t.expired(t0 + Duration::from_secs(15)))
+                .all(|t| t.expired(t0 + Duration::from_secs(20)))
         );
-        assert_eq!(tickets[0].deadline(), t0 + Duration::from_secs(15));
+        assert_eq!(tickets[0].deadline(), t0 + HOLD);
         drop(tickets);
         assert_eq!(q.held(), 0);
     }
 
     #[test]
-    fn the_queue_is_bounded_and_all_in_one_waits_longer() {
-        let policy = HoldPolicy {
+    fn the_queue_is_bounded_and_the_deadline_is_chosen_per_hold() {
+        let q = HoldQueue::new(HoldLimits {
             queue_streams: 2,
-            ..HoldPolicy::all_in_one()
-        };
-        assert_eq!(policy.hold_max, Duration::from_secs(300));
-        let q = HoldQueue::new(policy);
+            ..HoldLimits::default()
+        });
         let now = Instant::now();
-        let a = q.admit(now).expect("1");
-        let _b = q.admit(now).expect("2");
-        assert_eq!(q.admit(now).expect_err("full"), QueueFull);
+        let a = q.admit(now, ALL_IN_ONE_HOLD).expect("1");
+        assert_eq!(a.deadline(), now + Duration::from_secs(300));
+        let _b = q.admit(now, HOLD).expect("2");
+        assert_eq!(q.admit(now, HOLD).expect_err("full"), QueueFull);
         drop(a);
-        assert!(q.admit(now).is_ok());
+        assert!(q.admit(now, HOLD).is_ok());
+        const { assert!(BOUND_WINDOW_BYTES > 64 * 1024) };
+    }
+
+    #[test]
+    fn release_wins_over_expiry_when_both_are_seen() {
+        let q = HoldQueue::new(HoldLimits::default());
+        let t0 = Instant::now();
+        let t = q.admit(t0, HOLD).expect("room");
+        assert_eq!(t.wake(t0, false), Wake::Wait);
+        assert_eq!(t.wake(t0 + HOLD, false), Wake::Expire);
+        assert_eq!(t.wake(t0, true), Wake::Bind);
+        // Both at once: one winner, and it is the bind (the gate did release).
+        assert_eq!(t.wake(t0 + HOLD, true), Wake::Bind);
     }
 }

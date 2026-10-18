@@ -5,7 +5,16 @@
 //! [`ReplayBuffer`] of [`REPLAY_BYTES`] from its first byte. While the stream is held the
 //! buffer is what the hold gate holds (the window is the same 64 KB); once the stream is
 //! bound the buffer keeps filling as the client sends, until a data frame would overflow it
-//! or the upstream's first response byte arrives. Either closes the retry window for good.
+//! or the upstream's first response head arrives. Either closes the retry window for good,
+//! except that the fenced check reads that first head *before* it closes anything
+//! ([`ReplayBuffer::on_first_response`]).
+//!
+//! A re-dispatch needs the whole request: the window must be open and the client's
+//! END_STREAM seen ([`ReplayBuffer::replayable`]). A bidirectional call whose body is still
+//! open is not re-dispatched (no splicing of a remainder onto a new upstream stream); the
+//! client gets the answer, which a gRPC client retries by itself. The buffer owns `Bytes`
+//! clones of the frames in U4b-1 (the skeleton counts them) and frees them at `close()`; a
+//! long server-streaming call keeps at most [`REPLAY_BYTES`] until its first response frame.
 
 use http::HeaderMap;
 
@@ -29,6 +38,7 @@ pub struct ReplayBuffer {
     cap: usize,
     len: usize,
     open: bool,
+    ended: bool,
 }
 
 impl ReplayBuffer {
@@ -39,6 +49,7 @@ impl ReplayBuffer {
             cap,
             len: 0,
             open: true,
+            ended: false,
         }
     }
 
@@ -59,10 +70,36 @@ impl ReplayBuffer {
         self.open = false;
     }
 
-    /// Whether the whole request so far is held and nothing has answered.
+    /// Records the client's END_STREAM: the buffer now holds the whole request, if the
+    /// window is still open.
+    pub fn end_request(&mut self) {
+        self.ended = true;
+    }
+
+    /// Whether the window is open: nothing has overflowed it and nothing has answered.
+    #[must_use]
+    pub const fn window_open(&self) -> bool {
+        self.open
+    }
+
+    /// Whether the whole request is held (window open and the client's END_STREAM seen) and
+    /// nothing has answered: the only state a re-dispatch is allowed from.
     #[must_use]
     pub const fn replayable(&self) -> bool {
-        self.open
+        self.open && self.ended
+    }
+
+    /// Reads the upstream's first response head. Returns true if it is the fenced answer
+    /// ([`is_fenced`]); the window then stays open so [`may_retry`] can decide, and the
+    /// caller calls [`ReplayBuffer::close`] once the re-dispatch is issued (or refused).
+    /// Any other head closes the window for good: the request may have had an effect. The
+    /// fenced check must come first, because it reads exactly these headers.
+    pub fn on_first_response(&mut self, headers: &HeaderMap, end_stream: bool) -> bool {
+        let fenced = is_fenced(headers, end_stream);
+        if !fenced {
+            self.close();
+        }
+        fenced
     }
 
     /// Bytes held.
@@ -85,15 +122,23 @@ pub enum Failure {
     Connect,
     /// The upstream sent `REFUSED_STREAM`: it did not process the stream.
     RefusedStream,
+    /// The upstream's GOAWAY named a `last_stream_id` below this stream's id (including a
+    /// write error on an idle pooled connection the peer had closed, with no request byte
+    /// sent): provably unprocessed, so safe like `RefusedStream`. The connection is marked
+    /// draining on the first GOAWAY, graceful two-phase form included.
+    GoAway,
     /// The child answered "fenced, nothing committed" (see [`is_fenced`]).
     Fenced,
     /// Anything else (a reset mid-request, a protocol error): not safe to repeat.
     Other,
 }
 
-/// Whether the proxy may dispatch the request again, to the slot that is active now.
-/// `attempts` counts dispatches so far. Never for ByteStream, never after an upstream
-/// response, never once the request outgrew the buffer.
+/// Whether the proxy may dispatch the request again. The retry is a new bind, not a reuse:
+/// the caller drops the old permit (after resetting the old upstream stream), calls
+/// `ActiveSlot::bind` again with `attempts + 1`, and so lands in the hold queue if a hold is
+/// in force and in whichever slot is active. `attempts` counts dispatches so far. Never for
+/// ByteStream, never after an upstream response, never once the request outgrew the buffer or
+/// while the client's request is still open.
 #[must_use]
 pub fn may_retry(path: &str, failure: Failure, buffer: &ReplayBuffer, attempts: u8) -> bool {
     !is_bytestream(path)
@@ -101,7 +146,7 @@ pub fn may_retry(path: &str, failure: Failure, buffer: &ReplayBuffer, attempts: 
         && buffer.replayable()
         && matches!(
             failure,
-            Failure::Connect | Failure::RefusedStream | Failure::Fenced
+            Failure::Connect | Failure::RefusedStream | Failure::GoAway | Failure::Fenced
         )
 }
 
@@ -132,27 +177,77 @@ mod tests {
         assert!(b.push(6));
         assert!(b.push(4));
         assert_eq!(b.len(), 10);
-        assert!(b.replayable());
+        assert!(b.window_open());
         assert!(!b.push(1));
-        assert!(!b.replayable());
+        assert!(!b.window_open());
+        b.end_request();
+        assert!(!b.replayable(), "an overflowed request is never whole");
         assert!(!b.push(0));
     }
 
+    fn fenced_head() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("grpc-status", HeaderValue::from_static("14"));
+        h.insert(FENCED, HeaderValue::from_static(FENCED_VALUE));
+        h
+    }
+
+    fn whole(bytes: usize) -> ReplayBuffer {
+        let mut b = ReplayBuffer::new(REPLAY_BYTES);
+        assert!(b.push(bytes));
+        b.end_request();
+        b
+    }
+
     #[test]
-    fn an_upstream_response_closes_the_window() {
+    fn an_ordinary_upstream_response_closes_the_window() {
+        let mut b = whole(100);
+        assert!(may_retry(EXEC, Failure::Connect, &b, 1));
+        let mut ok = HeaderMap::new();
+        ok.insert("grpc-status", HeaderValue::from_static("0"));
+        assert!(!b.on_first_response(&ok, true));
+        assert!(!may_retry(EXEC, Failure::Connect, &b, 1));
+        // A body after a 14 is not the fenced shape either: closed.
+        let mut b = whole(100);
+        assert!(!b.on_first_response(&fenced_head(), false));
+        assert!(!b.window_open());
+    }
+
+    #[test]
+    fn a_fenced_first_response_is_read_before_the_window_closes() {
+        let mut b = whole(100);
+        assert!(b.on_first_response(&fenced_head(), true));
+        assert!(b.window_open(), "the check came first");
+        assert!(may_retry(EXEC, Failure::Fenced, &b, 1));
+        // The re-dispatch is issued: close, so a second fenced answer is forwarded.
+        b.close();
+        assert!(!may_retry(EXEC, Failure::Fenced, &b, 2));
+        // A fenced answer that exhausted the attempts is not retried either.
+        let mut again = whole(100);
+        assert!(again.on_first_response(&fenced_head(), true));
+        assert!(!may_retry(EXEC, Failure::Fenced, &again, MAX_ATTEMPTS));
+    }
+
+    #[test]
+    fn an_open_request_is_never_redispatched() {
         let mut b = ReplayBuffer::new(REPLAY_BYTES);
         assert!(b.push(100));
-        assert!(may_retry(EXEC, Failure::Connect, &b, 1));
-        b.close();
-        assert!(!may_retry(EXEC, Failure::Connect, &b, 1));
+        assert!(b.window_open());
+        assert!(!b.replayable());
+        for f in [Failure::Connect, Failure::RefusedStream, Failure::Fenced] {
+            assert!(!may_retry("/kbf.worker.v1.Worker/Session", f, &b, 1), "{f:?}");
+        }
+        b.end_request();
+        assert!(may_retry("/kbf.worker.v1.Worker/Session", Failure::Fenced, &b, 1));
     }
 
     #[test]
     fn only_a_safe_failure_is_retried_and_never_bytestream() {
-        let b = ReplayBuffer::new(REPLAY_BYTES);
+        let b = whole(0);
         for (f, want) in [
             (Failure::Connect, true),
             (Failure::RefusedStream, true),
+            (Failure::GoAway, true),
             (Failure::Fenced, true),
             (Failure::Other, false),
         ] {
@@ -166,6 +261,7 @@ mod tests {
         // A request that overflowed the buffer is never replayed, even on a refused stream.
         let mut big = ReplayBuffer::new(1);
         assert!(!big.push(2));
+        big.end_request();
         assert!(!may_retry(EXEC, Failure::RefusedStream, &big, 1));
     }
 

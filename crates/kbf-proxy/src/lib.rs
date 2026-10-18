@@ -14,7 +14,7 @@
 //! - [`identity`]: the verified certificate to node id and role, and the `x-kbf-*` headers.
 //! - [`replay`]: the replay buffer and the retry rule.
 //! - [`config`]: the `[proxy]` table of `installer.toml`.
-//! - [`control`]: the traits U7 and U8 implement.
+//! - [`control`]: the update-API handler and the status the proxy reports.
 
 pub mod auth;
 pub mod config;

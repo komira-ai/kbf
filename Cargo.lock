@@ -2036,6 +2036,7 @@ dependencies = [
  "kbf-peer",
  "rcgen",
  "serde",
+ "serde_json",
  "sha2 0.11.0",
  "subtle",
  "thiserror",

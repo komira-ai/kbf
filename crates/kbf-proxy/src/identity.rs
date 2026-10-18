@@ -52,14 +52,23 @@ pub fn identity_of(der: &[u8]) -> Result<Identity, IdentityError> {
     let role = role_of(der)?;
     let names = names_of(der)?;
     match names.dns() {
-        [one] if !one.contains('*') => Ok(Identity {
+        [one] if is_node_name(one) => Ok(Identity {
             node_id: one.clone(),
             role,
         }),
         other => Err(IdentityError::NodeId(
-            other.iter().filter(|n| !n.contains('*')).count(),
+            other.iter().filter(|n| is_node_name(n)).count(),
         )),
     }
+}
+
+/// A DNS name the proxy will pass as a node id: 1 to 253 of letters, digits, `-`, `_` and
+/// `.`. No wildcard, no control character, no space.
+fn is_node_name(name: &str) -> bool {
+    (1..=253).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 /// The 32 random bytes in the file under `/run/kbf-proxy/`. The header value is their
@@ -125,6 +134,18 @@ pub fn forward_headers(
     Ok(())
 }
 
+/// The headers of an admin call to a child (`takeover`, `quiesce`, ...): the secret and no
+/// identity, built by the same strip-then-set path as every proxied request, so U7b does not
+/// re-implement the header contract.
+///
+/// # Errors
+/// [`IdentityError::HeaderValue`] (never, for a 32-byte secret).
+pub fn admin_headers(secret: &ProxySecret) -> Result<HeaderMap, IdentityError> {
+    let mut headers = HeaderMap::new();
+    forward_headers(&mut headers, None, secret)?;
+    Ok(headers)
+}
+
 /// Strips every `x-kbf-*` header from a child's answer before it goes to a client. The
 /// proxy reads the one it defines (the fenced marker, [`crate::replay::FENCED`]) first.
 pub fn strip_reserved(headers: &mut HeaderMap) {
@@ -184,6 +205,31 @@ mod tests {
             Err(IdentityError::Role(_))
         ));
         assert!(matches!(identity_of(b"junk"), Err(IdentityError::Role(_))));
+    }
+
+    #[test]
+    fn a_node_name_must_be_plain_dns_characters() {
+        for ok in ["node-1.farm", "a", "N_1.example.com"] {
+            assert!(is_node_name(ok), "{ok}");
+        }
+        for bad in ["", "*.farm", "a b", "a\tb", "a/b", "caf\u{e9}"] {
+            assert!(!is_node_name(bad), "{bad:?}");
+        }
+        assert!(is_node_name(&"a".repeat(253)));
+        assert!(!is_node_name(&"a".repeat(254)));
+        assert_eq!(
+            identity_of(&cert(&["bad name"], Some("daemon"))),
+            Err(IdentityError::NodeId(0))
+        );
+    }
+
+    #[test]
+    fn an_admin_call_carries_the_secret_and_no_identity() {
+        let h = admin_headers(&secret()).expect("headers");
+        assert_eq!(h.get(PROXY_AUTH).expect("secret"), "ab".repeat(32).as_str());
+        assert!(h.get(NODE_ID).is_none());
+        assert!(h.get(ROLE).is_none());
+        assert_eq!(h.len(), 1);
     }
 
     #[test]
