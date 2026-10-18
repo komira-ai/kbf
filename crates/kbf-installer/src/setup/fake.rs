@@ -84,7 +84,7 @@ impl Os for FakeOs {
     fn trusted_binary(&self) -> Result<(), Untrusted> {
         if self.untrusted {
             return Err(Untrusted::Writable {
-                path: "/home/x/kbf-installer".into(),
+                path: "/opt/x/kbf-installer".into(),
                 mode: 0o775,
             });
         }

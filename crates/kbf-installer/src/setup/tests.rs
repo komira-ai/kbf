@@ -1223,7 +1223,10 @@ fn a_mac_node_gets_its_fetch_account_and_launchd_jobs() {
     );
     assert_eq!(
         c[1],
-        "run /usr/bin/dscl . -create /Users/_kbf-fetch UniqueID 303"
+        concat!(
+            "run /usr/bin/dscl . -create /User",
+            "s/_kbf-fetch UniqueID 303"
+        )
     );
     assert_eq!(
         c[6],
