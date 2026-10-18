@@ -145,12 +145,15 @@ impl Offers {
                     component: info.component,
                 };
                 // Complete means attested, and a key never changes: a bundle that is
-                // missing now is a store that fails, and the table is kept.
+                // missing now is a store that fails, and the table is kept. Only a file
+                // taken out of the directory between the listing and this read gets there,
+                // which no input can bring about, so the error is built where it is used
+                // (a closure here would be a function no run enters).
                 let attestation = self
                     .store
                     .attestation(&key)
                     .await?
-                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+                    .ok_or(io::Error::from(io::ErrorKind::NotFound))?;
                 components.push(WireComponent {
                     name: info.component.as_str().to_owned(),
                     sha256: info.sha256.to_string(),
@@ -246,12 +249,21 @@ async fn push(
 mod tests {
     use std::path::PathBuf;
 
+    use axum::body::Bytes;
+    use kbf_proto::worker::ServerMessage;
     use kbf_state::ManualClock;
     use kbf_state::Store;
     use kbf_state::fake::{Fake, Flaw};
+    use kbf_types::FarmTime;
+    use tokio::sync::mpsc;
+    use tonic::Status;
 
+    use super::super::key::Component;
     use super::super::store::Limits;
     use super::*;
+    use crate::update::Release;
+
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("kbf-offers-{name}-{}", std::process::id()));
@@ -299,15 +311,131 @@ mod tests {
         assert!(both.subscribe().borrow().is_empty());
     }
 
-    /// Catches a look that never ends once the offers are gone (a task per frontend left
-    /// running for the life of the process).
+    /// A complete linux-x86_64 release of `COMMIT` in `store`.
+    async fn linux_release(store: &ReleaseStore) {
+        let key = Key {
+            commit: Commit::parse(COMMIT).expect("a commit"),
+            platform: ReleasePlatform::LinuxX86_64,
+            component: Component::Kbf,
+        };
+        let bytes = |b: &'static [u8]| futures::stream::iter([Ok::<_, io::Error>(Bytes::from(b))]);
+        store
+            .put_tarball(&key, &mut bytes(b"tarball"))
+            .await
+            .expect("a tarball");
+        store
+            .put_attestation(&key, &mut bytes(b"bundle"))
+            .await
+            .expect("an attestation");
+    }
+
+    /// Catches a poll that never looks (the desired release is in the row and the store
+    /// before the first look, and the table stays empty), and a look loop that outlives the
+    /// offers (a task per frontend left running for the life of the process). The poll
+    /// takes a look that finds an offer and then ends once the last holder lets go.
     #[tokio::test(start_paused = true)]
-    async fn the_poll_ends_when_the_offers_are_dropped() {
-        let offers = Offers::start(store("poll"), rows(), Duration::from_secs(1));
+    async fn the_poll_looks_and_ends_when_the_offers_are_dropped() {
+        let every = Duration::from_secs(1);
+        let (store, rows) = (store("poll"), rows());
+        linux_release(&store).await;
+        rows.offer(&Release::new(COMMIT), FarmTime::from_millis(1))
+            .expect("the row");
+        let offers = Offers::start(store, rows, every);
+        let mut seen = offers.subscribe();
+        tokio::time::timeout(Duration::from_secs(60), seen.changed())
+            .await
+            .expect("a look in time")
+            .expect("the offers are held");
+        let platforms: Vec<_> = seen.borrow().keys().copied().collect();
+        assert_eq!(platforms, [ReleasePlatform::LinuxX86_64]);
         let held = Arc::downgrade(&offers);
-        drop(offers);
-        tokio::time::timeout(Duration::from_secs(60), poll(held, Duration::from_secs(1)))
+        drop((seen, offers));
+        tokio::time::timeout(Duration::from_secs(60), poll(held, every))
             .await
             .expect("the poll ends");
+    }
+
+    /// The offer of `platform` at `generation`.
+    fn offer_of(platform: ReleasePlatform, generation: u64) -> UpdateOffer {
+        UpdateOffer {
+            generation,
+            commit: COMMIT.to_owned(),
+            platform: platform.as_str().to_owned(),
+            components: Vec::new(),
+        }
+    }
+
+    /// The table of `offers`: each platform's offer at a generation.
+    fn table(offers: &[(ReleasePlatform, u64)]) -> Arc<Table> {
+        let offers = offers.iter();
+        Arc::new(offers.map(|&(p, g)| (p, offer_of(p, g))).collect())
+    }
+
+    /// What a push sends of the offer of `platform` at `generation`.
+    fn sent_of(platform: ReleasePlatform, generation: u64) -> ServerMessage {
+        let offer = offer_of(platform, generation);
+        crate::worker::message(server_message::Message::UpdateOffer(offer))
+    }
+
+    /// The next message sent on `stream`.
+    async fn next_sent(
+        stream: &mut mpsc::UnboundedReceiver<Result<ServerMessage, Status>>,
+    ) -> ServerMessage {
+        tokio::time::timeout(Duration::from_secs(60), stream.recv())
+            .await
+            .expect("a message in time")
+            .expect("the stream is open")
+            .expect("not an error")
+    }
+
+    /// Catches an offer the node already holds sent again (a table republished equal,
+    /// changed in another platform's row, or one the platform left and came back to), an
+    /// offer of another platform sent, a changed offer not sent, the table held when the
+    /// push starts not sent, and a push that outlives the offers (the sender of the table
+    /// dropped). The messages come in order, so a repeat shows as the generation before the
+    /// next one expected.
+    #[tokio::test(start_paused = true)]
+    async fn a_push_sends_each_new_offer_of_its_platform_once_and_ends_with_the_offers() {
+        use ReleasePlatform::{DarwinArm64, LinuxX86_64};
+        let (offers, held) = watch::channel(table(&[(LinuxX86_64, 1)]));
+        let (outbound, mut stream) = mpsc::unbounded_channel();
+        let task = tokio::spawn(push(held, LinuxX86_64, outbound));
+        let first = next_sent(&mut stream).await;
+        assert_eq!(first, sent_of(LinuxX86_64, 1), "the table held");
+        // Each state is looked at before the next: a `watch` keeps only the newest.
+        for next in [
+            table(&[(LinuxX86_64, 1)]),
+            table(&[(LinuxX86_64, 1), (DarwinArm64, 7)]),
+            table(&[(DarwinArm64, 7)]),
+            table(&[(LinuxX86_64, 1), (DarwinArm64, 7)]),
+        ] {
+            offers.send(next).expect("a receiver");
+            tokio::task::yield_now().await;
+        }
+        offers
+            .send(table(&[(LinuxX86_64, 2), (DarwinArm64, 7)]))
+            .expect("a receiver");
+        let next = next_sent(&mut stream).await;
+        assert_eq!(next, sent_of(LinuxX86_64, 2), "nothing repeated");
+        drop(offers);
+        tokio::time::timeout(Duration::from_secs(60), task)
+            .await
+            .expect("the push ends with the offers")
+            .expect("no panic");
+        assert!(stream.recv().await.is_none(), "nothing else was sent");
+    }
+
+    /// Catches a push that outlives its stream (a task per node connection left for as long
+    /// as the offers live). The offers stay: only the stream going ends it.
+    #[tokio::test(start_paused = true)]
+    async fn a_push_ends_with_its_stream() {
+        let (_offers, held) = watch::channel(table(&[]));
+        let (outbound, stream) = mpsc::unbounded_channel();
+        let task = tokio::spawn(push(held, ReleasePlatform::LinuxX86_64, outbound));
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(60), task)
+            .await
+            .expect("the push ends with its stream")
+            .expect("no panic");
     }
 }

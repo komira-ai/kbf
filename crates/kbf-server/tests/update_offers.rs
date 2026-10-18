@@ -609,7 +609,9 @@ async fn a_new_stream_starts_without_a_status() {
 }
 
 /// Catches text a node chose served as it came on the open listing: a commit that is not hex
-/// is shown as unknown or empty, and a long refusal is cut.
+/// is shown as unknown or empty, and a long refusal is cut; one whose 512th byte falls
+/// inside a character (a byte and then two-byte characters) is cut before that character,
+/// not inside it and not after it.
 #[tokio::test]
 async fn what_a_node_says_is_cut_to_its_shape() {
     let front = start();
@@ -625,4 +627,13 @@ async fn what_a_node_says_is_cut_to_its_shape() {
     assert_eq!(shown["running_commit"], "unknown");
     assert_eq!(shown["installed_commit"], "");
     assert_eq!(shown["refusal"].as_str().map(str::len), Some(512));
+
+    let wide = linux_node(&front, "n2").await;
+    wide.send(daemon_message::Message::UpdateStatus(UpdateStatus {
+        refusal: format!("r{}", "é".repeat(1000)),
+        state: State::Refused as i32,
+        ..UpdateStatus::default()
+    }));
+    let shown = front.update_until("n2", |u| u["state"] == "refused").await;
+    assert_eq!(shown["refusal"], format!("r{}", "é".repeat(255)));
 }
