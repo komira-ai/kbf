@@ -15,6 +15,7 @@ form_urlencoded.workspace = true
 hex.workspace = true
 futures.workspace = true
 kbf-auth.workspace = true
+kbf-ca.workspace = true
 kbf-front.workspace = true
 kbf-history.workspace = true
 kbf-invocation.workspace = true
@@ -33,6 +34,7 @@ kbf-proto.workspace = true
 kbf-raft.workspace = true
 kbf-route.workspace = true
 kbf-sched.workspace = true
+kbf-signer.workspace = true
 kbf-state.workspace = true
 kbf-storage.workspace = true
 kbf-store.workspace = true
@@ -56,6 +58,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# The node's client of `kbf.enroll.v1`, run against the real enroll listener (tests/enroll_node.rs).
+kbf-enroll.workspace = true
 # A test certificate's public-key hash and names, read independently of kbf-peer.
 x509-parser.workspace = true
 kbf-segments.workspace = true

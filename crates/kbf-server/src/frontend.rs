@@ -96,6 +96,8 @@ use tonic::service::Routes;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server};
 
 use crate::drain::Drain;
+use crate::enroll::flags::EnrollFlags;
+use crate::enroll::start as enroll_start;
 use crate::farm::Farm;
 use crate::front_maps::FrontMaps;
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
@@ -199,6 +201,8 @@ pub struct FrontendFlags {
     /// How this frontend hands over to a successor and takes over from a predecessor;
     /// `None` without `--handover-socket`.
     pub handover: Option<Handover>,
+    /// The enroll listener (`--enroll-listen` and its companions); `None` without it.
+    pub enroll: Option<EnrollFlags>,
 }
 
 /// The command line of `kbf frontend`: [`Args`]'s, those it takes shown and the rest
@@ -321,6 +325,7 @@ pub fn command() -> Command {
                  and this name; without it such a frontend refuses a handover.",
             ),
     )
+    .args(crate::enroll::flags::args())
     .arg(check_arg(0, "envoy-check-interval-ms", "MILLISECONDS", "The time between two of Envoy's health checks of a frontend (the cluster's `interval`)."))
     .arg(check_arg(1, "envoy-check-timeout-ms", "MILLISECONDS", "How long Envoy's health check waits for an answer (the cluster's `timeout`)."))
     .arg(check_arg(2, "envoy-unhealthy-threshold", "N", "How many of Envoy's checks in a row must fail before it stops choosing a frontend (`unhealthy_threshold`). The three give the settle: a frontend waits interval x threshold + timeout + interval before it goes not ready (Envoy has then seen the successor) and again before it exits (Envoy then sends it nothing)."))
@@ -357,8 +362,9 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
     }
     let mut server = Args::from_arg_matches(m)?;
     let instance = m.get_one::<Instance>(INSTANCE).copied();
+    let mut enroll = crate::enroll::flags::from_matches(m).map_err(refuse)?;
     if let Some(instance) = instance {
-        place(&mut server, instance).map_err(refuse)?;
+        place(&mut server, enroll.as_mut(), instance).map_err(refuse)?;
     }
     let storage = server
         .storage()
@@ -385,6 +391,7 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         storage,
         tls,
         handover,
+        enroll,
     })
 }
 
@@ -398,12 +405,16 @@ fn envoy_check(m: &ArgMatches) -> EnvoyCheck {
     }
 }
 
-/// Moves the listeners of `server` to the port block of `instance`: the flags' for a, ten
-/// ports above for b ([`Instance::port`]).
+/// Moves the listeners of `server` (and the enroll listener, if there is one) to the port
+/// block of `instance`: the flags' for a, ten ports above for b ([`Instance::port`]).
 ///
 /// # Errors
 /// A port of instance b would run past 65535.
-fn place(server: &mut Args, instance: Instance) -> Result<(), String> {
+fn place(
+    server: &mut Args,
+    enroll: Option<&mut EnrollFlags>,
+    instance: Instance,
+) -> Result<(), String> {
     let shift = |flag: &str, addr: SocketAddr| {
         instance
             .port(addr.port())
@@ -422,6 +433,9 @@ fn place(server: &mut Args, instance: Instance) -> Result<(), String> {
         .api_listen
         .map(|addr| shift("api-listen", addr))
         .transpose()?;
+    if let Some(enroll) = enroll {
+        enroll.listen = shift("enroll-listen", enroll.listen)?;
+    }
     Ok(())
 }
 
@@ -531,6 +545,8 @@ pub struct FrontendHandle {
     pub worker: SocketAddr,
     /// Where the operator API listener is, if there is one.
     pub api: Option<SocketAddr>,
+    /// Where the enroll listener is, if there is one.
+    pub enroll: Option<SocketAddr>,
     drain: Arc<Drain>,
     /// Completes on the second stop signal; [`FrontendHandle::serve`] then closes the
     /// drain ([`Drain::close`]).
@@ -739,6 +755,8 @@ struct Prepared<'a> {
     api: Option<crate::serve::Api>,
     channel: tonic::transport::Channel,
     sockets: Bound,
+    /// The enroll listener bound and its CA open, if `--enroll-listen` is given.
+    enroll: Option<enroll_start::Prepared>,
 }
 
 /// The three listening sockets.
@@ -756,6 +774,11 @@ impl<'a> Prepared<'a> {
         let policy = args.reapi_auth_policy()?;
         let api = args.api()?;
         let channel = flags.storage_endpoint()?.connect_lazy();
+        let enroll = flags
+            .enroll
+            .as_ref()
+            .map(enroll_start::prepare)
+            .transpose()?;
         let sockets = Bound {
             reapi: Socket::bind(listeners.reapi)?,
             worker: Socket::bind(listeners.worker)?,
@@ -771,6 +794,7 @@ impl<'a> Prepared<'a> {
             api,
             channel,
             sockets,
+            enroll,
         })
     }
 
@@ -799,6 +823,7 @@ impl<'a> Prepared<'a> {
             api,
             channel,
             sockets,
+            enroll,
         } = self;
         let args = &flags.server;
         let state = crate::start::with_members(state, args.members());
@@ -868,14 +893,31 @@ impl<'a> Prepared<'a> {
         let (worker_incoming, worker_latch) = worker.grpc(worker_tls)?;
         worker_stop.closes(worker_latch);
         let api_listener = api_socket.map(Socket::http).transpose()?;
+        // The enroll listener (which is closed the moment the drain begins, like the
+        // others) and the operator API's enrollment routes, which need the CA's pin: both
+        // are off without `--enroll-listen`, and the routes then answer 404.
+        let enroll_addr = enroll.as_ref().map(enroll_start::Prepared::local);
+        let enrolled = enroll
+            .map(|prepared| {
+                let store = state_store
+                    .clone()
+                    .ok_or("--enroll-listen needs --state-store: the registry lives in it")?;
+                prepared.serve(store)
+            })
+            .transpose()?;
+        let (enroll_api, enroll_serve, enroll_renewal) = match enrolled {
+            Some(serving) => {
+                drain.begins().closes(serving.latch);
+                (Some(serving.api), serving.listener, Some(serving.renewal))
+            }
+            None => (None, futures::future::pending().boxed(), None),
+        };
         let api_routes = crate::api::router(
             Arc::clone(&farm),
             api.and_then(|api| api.token),
             Arc::clone(&drain),
             members.clone(),
-            // The enroll service and the CA that gives it a pin come with the frontend's
-            // enroll listener; until it exists, the enrollment routes answer 404.
-            None,
+            enroll_api,
         )
         .merge(crate::health::router_of(Arc::clone(&checks)))
         .merge(metrics_route(
@@ -1000,6 +1042,7 @@ impl<'a> Prepared<'a> {
             })
             .transpose();
         background.extend(holder?);
+        background.extend(enroll_renewal);
 
         let shutdown = shutdown()?;
         let stopper = Arc::clone(&drain);
@@ -1039,6 +1082,7 @@ impl<'a> Prepared<'a> {
             // A listener that ends without an error does not end the frontend: the worker
             // listener ends when a handover stops it, and the frontend goes on answering
             // the callers it kept until it holds nothing (`departed`).
+            let mut enroll_serve = enroll_serve;
             let outcome = tokio::select! {
                 served = reapi_serve => {
                     reapi_done = true;
@@ -1046,6 +1090,7 @@ impl<'a> Prepared<'a> {
                 }
                 Err(e) = worker_serve => Err(ServeError::from(e)),
                 Err(e) = &mut api_serve => Err(ServeError::Api(e)),
+                Err(e) = &mut enroll_serve => Err(ServeError::from(e)),
                 () = ticking => Ok(()),
                 () = ticker.run() => Ok(()),
                 () = stopping => Ok(()),
@@ -1062,12 +1107,14 @@ impl<'a> Prepared<'a> {
             reapi: reapi_addr,
             worker: worker_addr,
             api: api_addr,
+            enroll: enroll_addr,
             drain,
             escalation: None,
             start_line: start_line(
                 reapi_addr,
                 worker_addr,
                 api_addr,
+                enroll_addr,
                 &flags.storage.uri().to_string(),
                 &plain,
             ),
@@ -1157,17 +1204,21 @@ fn start_line(
     reapi: SocketAddr,
     worker: SocketAddr,
     api: Option<SocketAddr>,
+    enroll: Option<SocketAddr>,
     storage: &str,
     plain: &[&str],
 ) -> String {
     let api = api.map(|a| format!(" api={a}")).unwrap_or_default();
+    let enroll = enroll
+        .map(|a| format!(" enroll={a}"))
+        .unwrap_or_default();
     let warning = if plain.is_empty() {
         String::new()
     } else {
         format!(" warning=plaintext-off-loopback:{}", plain.join(","))
     };
     format!(
-        "kbf-frontend {SERVER_VERSION} reapi={reapi} worker={worker}{api} storage={storage}{warning}"
+        "kbf-frontend {SERVER_VERSION} reapi={reapi} worker={worker}{api}{enroll} storage={storage}{warning}"
     )
 }
 
