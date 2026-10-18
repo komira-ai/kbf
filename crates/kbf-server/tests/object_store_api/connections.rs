@@ -345,3 +345,74 @@ async fn store_failures_are_503_and_a_corrupt_row_is_500() {
         broken.body
     );
 }
+
+// Catches a body that cannot be read to its end (a client that drops the connection mid-body)
+// taken for an empty or partial one, or reported as anything but 400 `bad_body`.
+#[tokio::test]
+async fn a_body_that_fails_midway_is_400() {
+    use super::harness::{TOKEN, loopback, send_body};
+    let farm = Farm::new();
+    let cut = futures::stream::iter([Err::<axum::body::Bytes, std::io::Error>(
+        std::io::Error::other("the client went away"),
+    )]);
+    let bearer = format!("Bearer {TOKEN}");
+    let request = axum::http::Request::builder()
+        .method("PUT")
+        .uri(at("cold"))
+        .header("authorization", bearer)
+        .header("content-type", "application/json");
+    let reply = send_body(
+        &farm.router,
+        loopback(),
+        request,
+        axum::body::Body::from_stream(cut),
+    )
+    .await;
+    assert_eq!(
+        (reply.status, reply.code().as_str()),
+        (400, "bad_body"),
+        "{}",
+        reply.body
+    );
+    assert!(!reply.body.contains("went away"), "{}", reply.body);
+    assert_eq!(farm.generation(), 0);
+}
+
+// Catches a registry that lost a race to another writer reported as success or as a server
+// error: the other frontend child moved the generation, so the write is refused whole
+// (409 `conflict`: read the registry again), and the secret file it had made is removed.
+#[tokio::test]
+async fn a_lost_race_is_409_conflict_and_leaves_no_file() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let farm = Farm::new();
+    farm.flaky.race_next_write.store(true, SeqCst);
+    let put = farm.call("PUT", &at("cold"), &conn_body(SENTINEL)).await;
+    assert_eq!(
+        (put.status, put.code().as_str()),
+        (409, "conflict"),
+        "{}",
+        put.body
+    );
+    assert!(farm.files().is_empty(), "{:?}", farm.files());
+}
+
+// Catches a secret directory that cannot be written reported as a client error or as success:
+// the file system failing is 500 `secret_io`, with neither a path nor an OS error in the text.
+#[tokio::test]
+async fn a_secret_directory_that_cannot_be_written_is_500_secret_io() {
+    let farm = Farm::new();
+    std::fs::remove_dir_all(&farm.dir).expect("remove the directory");
+    let body = conn_body(SENTINEL).replace("}", r#","verify":false}"#);
+    let put = farm.call("PUT", &at("cold"), &body).await;
+    assert_eq!(
+        (put.status, put.code().as_str()),
+        (500, "secret_io"),
+        "{}",
+        put.body
+    );
+    assert!(
+        !put.body.contains(&farm.dir.display().to_string()),
+        "{}",
+        put.body
+    );
+}

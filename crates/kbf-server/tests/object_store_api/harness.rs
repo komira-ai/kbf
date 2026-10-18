@@ -22,8 +22,8 @@ use kbf_server::object_store::probe::{Probe, ProbeTarget};
 use kbf_server::token::ApiToken;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{
-    Changes, Commit, CommitStats, Conflict, ManualClock, Revision, ScanPage, ScanRange, Store,
-    StoreError, StoreTime, Txn, Versioned,
+    Changes, Commit, CommitStats, Cond, Conflict, ManualClock, Revision, ScanPage, ScanRange,
+    Store, StoreError, StoreTime, Txn, Versioned,
 };
 use kbf_types::object_store_api::{NodeConvergence, Verified};
 use serde::de::DeserializeOwned;
@@ -81,6 +81,8 @@ pub struct Call {
 
 /// A probe that records its calls and answers `result`.
 pub struct ScriptedProbe {
+    /// Makes the next probes panic, as a bug in the blocking task would.
+    pub panics: std::sync::atomic::AtomicBool,
     pub result: Mutex<Verified>,
     pub calls: Mutex<Vec<Call>>,
 }
@@ -114,6 +116,7 @@ impl ScriptedProbe {
 
 impl Probe for ScriptedProbe {
     fn probe(&self, target: &ProbeTarget<'_>) -> Verified {
+        assert!(!self.panics.load(Ordering::SeqCst), "a probe that panics");
         self.calls.lock().expect("calls").push(Call {
             endpoint: target.endpoint.to_owned(),
             region: target.region.to_owned(),
@@ -149,6 +152,8 @@ pub struct Flaky {
     inner: Arc<dyn Store>,
     pub fail_reads: std::sync::atomic::AtomicBool,
     pub fail_writes: std::sync::atomic::AtomicBool,
+    /// Another writer moves the generation row just before the next write commits.
+    pub race_next_write: std::sync::atomic::AtomicBool,
 }
 
 impl Flaky {
@@ -157,6 +162,7 @@ impl Flaky {
             inner,
             fail_reads: false.into(),
             fail_writes: false.into(),
+            race_next_write: false.into(),
         })
     }
 
@@ -172,6 +178,10 @@ impl Store for Flaky {
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
         if self.fail_writes.load(Ordering::SeqCst) {
             return Err(StoreError::Failed("injected write".to_owned()));
+        }
+        if self.race_next_write.swap(false, Ordering::SeqCst) {
+            let rival = Txn::new().put("objstore/gen", vec![1], Cond::Any);
+            self.inner.apply_batch(vec![rival])?;
         }
         self.inner.apply_batch(batch)
     }
@@ -242,7 +252,17 @@ pub async fn send(
     for (name, value) in headers {
         request = request.header(*name, *value);
     }
-    let mut request = request.body(Body::from(body.to_vec())).expect("a request");
+    send_body(router, peer, request, Body::from(body.to_vec())).await
+}
+
+/// One call whose body is `body`.
+pub async fn send_body(
+    router: &Router,
+    peer: SocketAddr,
+    request: axum::http::request::Builder,
+    body: Body,
+) -> Reply {
+    let mut request = request.body(body).expect("a request");
     request.extensions_mut().insert(ConnectInfo(peer));
     let response = router.clone().call(request).await.expect("infallible");
     let (parts, body) = response.into_parts();
@@ -281,6 +301,7 @@ impl Farm {
                 .expect("a registry"),
         );
         let probe = Arc::new(ScriptedProbe {
+            panics: false.into(),
             result: Mutex::new(ScriptedProbe::passing()),
             calls: Mutex::new(Vec::new()),
         });

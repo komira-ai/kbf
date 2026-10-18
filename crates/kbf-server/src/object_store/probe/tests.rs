@@ -165,7 +165,7 @@ impl Random for NoRandom {
 fn target<'a>(endpoint: &'a str, secret: &'a Secret) -> ProbeTarget<'a> {
     ProbeTarget {
         endpoint,
-        region: "",
+        region: "eu-west-1",
         access_key_id: "AKID",
         secret,
         bucket: "farm-bucket",
@@ -379,8 +379,10 @@ async fn the_probe_directory_sits_under_the_prefix_whatever_its_spelling() {
         ("", "/farm-bucket/.kbf-probe/abababababababab"),
     ] {
         let store = Store::start(Script::OK).await;
+        // No region: the default one is signed with.
         let t = ProbeTarget {
             prefix,
+            region: "",
             ..target(leaked(&store.endpoint), secret())
         };
         let v = run(Box::new(Fixed), Duration::from_secs(10), t).await;

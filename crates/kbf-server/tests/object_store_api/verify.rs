@@ -261,3 +261,26 @@ async fn a_missing_or_wide_secret_file_fails_closed() {
         "no probe ran with a key that could not be read"
     );
 }
+
+// Catches a blocking task that dies (a bug in a probe, a panic in the registry) taking the
+// request down without an answer, or leaking the panic text: the route answers 500 `internal`
+// and the registry is untouched.
+#[tokio::test]
+async fn a_task_that_panics_is_500_internal() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let farm = Farm::new();
+    let unchecked = conn_body(SENTINEL).replace("}", r#","verify":false}"#);
+    assert_eq!(farm.call("PUT", CONN, &unchecked).await.status, 201);
+    farm.probe.panics.store(true, SeqCst);
+    let bind = farm
+        .call("PUT", "/v1/object-stores/bindings/cold", BIND_BODY)
+        .await;
+    assert_eq!(
+        (bind.status, bind.code().as_str()),
+        (500, "internal"),
+        "{}",
+        bind.body
+    );
+    assert!(!bind.body.contains("panics"), "{}", bind.body);
+    assert_eq!(farm.generation(), 1);
+}

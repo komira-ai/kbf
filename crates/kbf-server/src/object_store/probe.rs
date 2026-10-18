@@ -202,12 +202,12 @@ async fn steps(store: &S3Store, key: &ObjectKey, conditional: bool, verified: &m
         return;
     }
     verified.put = true;
-    if let Some(range) = ByteRange::new(0, body.len() as u64) {
-        verified.get = store
-            .get_range(key, range)
-            .await
-            .is_ok_and(|read| read == body);
-    }
+    // The read is skipped when the body has no length to ask for: it never does.
+    let read = futures::future::OptionFuture::from(
+        ByteRange::new(0, body.len() as u64).map(|range| store.get_range(key, range)),
+    )
+    .await;
+    verified.get = read.is_some_and(|read| read.is_ok_and(|bytes| bytes == body));
     if conditional {
         verified.conditional_put = matches!(
             store.put_new(key, body, None).await,

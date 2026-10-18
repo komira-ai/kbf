@@ -118,14 +118,6 @@ impl ObjectStoreApi {
     }
 }
 
-impl std::fmt::Debug for ObjectStoreApi {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ObjectStoreApi")
-            .field("registry", &self.registry)
-            .finish_non_exhaustive()
-    }
-}
-
 impl ObjectStoreApi {
     /// The API over the registry in `store`, with secret files in `dir` (made 0700), probing
     /// stores with the S3 client on `runtime` and reading the nodes' reports from `acks`.
@@ -443,8 +435,8 @@ fn bad_json(e: &serde_json::Error, what: &str) -> Failure {
     let kind = match e.classify() {
         Category::Syntax => "it is not JSON",
         Category::Eof => "it ends early",
-        Category::Data => "a field is missing, unknown or of the wrong type",
-        Category::Io => "it could not be read",
+        // `from_slice` reads memory: its errors are never `Io`.
+        Category::Data | Category::Io => "a field is missing, unknown or of the wrong type",
     };
     Failure::bad_body(format!(
         "the body is not a {what}: {kind} (line {}, column {})",
@@ -664,7 +656,11 @@ impl ObjectStoreApi {
             .registry
             .bindings()?
             .into_iter()
-            .find(|b| b.role == BindingRole::Cold && b.connection == *name)
+            .find(|b| {
+                // Exhaustive on purpose: a second role must say here whose binding this is.
+                let BindingRole::Cold = b.role;
+                b.connection == *name
+            })
             .map(|b| (b.bucket, b.prefix)))
     }
 

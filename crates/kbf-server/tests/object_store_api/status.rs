@@ -211,3 +211,34 @@ async fn the_audit_lists_the_newest_first_and_checks_its_limit() {
         );
     }
 }
+
+// Catches an audit with no cap (a long-lived registry would answer every row ever written) and
+// a default that is not 50: 510 repeats of one PUT leave 510 audit rows, and the answers are
+// the first 50, the 500 the cap allows for any larger limit, and what was asked below it.
+#[tokio::test]
+async fn the_audit_has_a_default_and_a_cap() {
+    let farm = Farm::new();
+    let body = conn_body(SENTINEL);
+    for _ in 0..510 {
+        let reply = farm
+            .call("PUT", "/v1/object-stores/connections/cold", &body)
+            .await;
+        assert!(reply.status == 200 || reply.status == 201);
+    }
+    let rows = |query: &str| {
+        let path = format!("{AUDIT}{query}");
+        let farm = &farm;
+        async move {
+            farm.call("GET", &path, "")
+                .await
+                .json::<AuditList>()
+                .entries
+        }
+    };
+    let default = rows("").await;
+    assert_eq!(default.len(), 50);
+    assert_eq!(default[0].seq, 510, "newest first");
+    assert_eq!(rows("?limit=1000").await.len(), 500);
+    assert_eq!(rows("?limit=500").await.len(), 500);
+    assert_eq!(rows("?limit=7").await.len(), 7);
+}
