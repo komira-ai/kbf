@@ -1,8 +1,10 @@
 //! `cargo xtask pkg build|cask` run as CI runs them, with `xtask-fake` copied
 //! as `kbf-installer`, the stub of the real tool, as the binary to package.
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
@@ -20,6 +22,28 @@ fn scratch(name: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).expect("scratch");
     std::fs::copy(FAKE, dir.join("kbf-installer")).expect("the stub");
     dir
+}
+
+/// How long [`output_unbusy`] keeps starting a busy program in the tests below.
+const BUSY_WAIT: Duration = Duration::from_secs(5);
+/// The pause between two tries of a busy program.
+const BUSY_POLL: Duration = Duration::from_millis(2);
+
+/// `command.output()`, started again while the program is busy until `wait` is up, then
+/// the last error. A file this process wrote a moment ago is briefly open for writing in
+/// a child that another test thread forked before it execs it (`O_CLOEXEC` closes the
+/// descriptor at that exec, not before), and exec of a file open for writing is
+/// `ETXTBSY`. Closing the file first does not close that window; waiting does.
+fn output_unbusy(command: &mut Command, wait: Duration) -> io::Result<Output> {
+    let give_up = Instant::now() + wait;
+    loop {
+        match command.output() {
+            Err(e) if e.kind() == io::ErrorKind::ExecutableFileBusy && Instant::now() < give_up => {
+                std::thread::sleep(BUSY_POLL);
+            }
+            done => return done,
+        }
+    }
 }
 
 fn plist() -> PathBuf {
@@ -58,13 +82,75 @@ fn pkg_build(dir: &Path, out: &Path, extra: &[&str]) -> (Option<i32>, String, St
 #[test]
 fn the_stub_prints_its_arguments_on_both_outputs_and_exits_0() {
     let dir = scratch("stub");
-    let out = Command::new(dir.join("kbf-installer"))
-        .args(["serve", "--version"])
-        .output()
-        .expect("run the stub");
+    let out = output_unbusy(
+        Command::new(dir.join("kbf-installer")).args(["serve", "--version"]),
+        BUSY_WAIT,
+    )
+    .expect("run the stub");
     assert!(out.status.success());
     assert_eq!(out.stdout, b"kbf-installer-stub serve --version\n");
     assert_eq!(out.stderr, b"kbf-installer-stub serve --version\n");
+}
+
+/// The stub with a descriptor open for writing on it, as a forked child leaves it:
+/// running it is `ETXTBSY` until the descriptor is closed.
+fn held_open(name: &str) -> (PathBuf, std::fs::File) {
+    let stub = scratch(name).join("kbf-installer");
+    let held = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&stub)
+        .expect("open the stub for writing");
+    (stub, held)
+}
+
+#[test]
+fn a_stub_held_open_for_writing_is_busy_to_a_plain_run() {
+    // Catches: the two tests below passing on a file that is not busy at all, which
+    // would prove neither the retry nor the deadline.
+    let (stub, _held) = held_open("busy-plain");
+    let err = Command::new(&stub).output().expect_err("the stub is busy");
+    assert_eq!(err.kind(), io::ErrorKind::ExecutableFileBusy, "{err}");
+}
+
+#[test]
+fn a_busy_stub_runs_once_the_descriptor_closes() {
+    // Catches: a run that gives up on the first ETXTBSY (the coverage job's failure).
+    let (stub, held) = held_open("busy-closes");
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        drop(held);
+    });
+    let started = Instant::now();
+    let out = output_unbusy(Command::new(&stub).arg("late"), BUSY_WAIT).expect("run once free");
+    assert!(
+        started.elapsed() >= Duration::from_millis(100),
+        "ran while it was still held"
+    );
+    assert_eq!(out.stdout, b"kbf-installer-stub late\n");
+    closer.join().expect("closer");
+}
+
+#[test]
+fn a_stub_that_stays_busy_fails_with_busy_at_the_deadline() {
+    // Catches: a retry with no end (the test would hang), and one that hides the error
+    // it gave up on. The run is in a thread so that a loop without a deadline fails
+    // this test instead of hanging the suite.
+    let (stub, _held) = held_open("busy-forever");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let result = output_unbusy(&mut Command::new(&stub), Duration::from_millis(200));
+        let _ = tx.send((result.map(|_| ()), started.elapsed()));
+    });
+    let (result, took) = rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the retry has a deadline");
+    let err = result.expect_err("still busy");
+    assert_eq!(err.kind(), io::ErrorKind::ExecutableFileBusy, "{err}");
+    assert!(
+        took >= Duration::from_millis(200),
+        "gave up early: {took:?}"
+    );
 }
 
 #[test]
