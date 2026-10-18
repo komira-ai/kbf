@@ -24,6 +24,17 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 /// A clock reading well past the build's floor: 2027-01-15.
 pub const NOW: i64 = 1_800_000_000;
 
+/// The system clock in Unix seconds: what a started binary reads.
+pub fn real_now() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after 1970")
+            .as_secs(),
+    )
+    .expect("fits")
+}
+
 /// The account the tests run as.
 pub fn euid() -> u32 {
     rustix::process::geteuid().as_raw()
@@ -81,8 +92,9 @@ pub fn make_ca(name: &str) -> Ca {
 /// thread that lives as long as the test process. Returns the socket's path.
 pub fn serve(ca: &Ca, allowed_uid: u32) -> PathBuf {
     let socket = ca.scratch.join(format!("run-{allowed_uid}")).join("sock");
-    let server =
-        SignerServer::from_dir(&ca.dir, allowed_uid, Policy::default()).expect("the server");
+    let server = SignerServer::from_dir(&ca.dir, allowed_uid, Policy::default())
+        .expect("the server")
+        .with_clock(|| NOW);
     let listener = bind(&socket).expect("bind");
     std::thread::spawn(move || {
         let _ = server.serve(&listener);
@@ -139,6 +151,11 @@ fn authority_over(ca: &Ca, spy: &Arc<Spy>) -> Authority {
 
 /// The to-be-signed structure `Authority::issue_node` builds.
 pub fn node_tbs(ca: &Ca, role: kbf_types::Role, advertise: Option<&str>) -> Vec<u8> {
+    node_tbs_at(ca, role, advertise, NOW)
+}
+
+/// The same, issued at the clock reading `now`.
+pub fn node_tbs_at(ca: &Ca, role: kbf_types::Role, advertise: Option<&str>, now: i64) -> Vec<u8> {
     let spy = Spy::new(&ca.spki);
     let id = "node-a".parse().expect("node id");
     authority_over(ca, &spy)
@@ -149,7 +166,7 @@ pub fn node_tbs(ca: &Ca, role: kbf_types::Role, advertise: Option<&str>) -> Vec<
                 key: &fresh_key(),
                 advertise,
             },
-            NOW,
+            now,
             &mut Stream(7),
         )
         .expect("issue");

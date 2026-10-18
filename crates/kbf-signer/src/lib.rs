@@ -22,7 +22,13 @@
 //!
 //! Creating the root (and so signing a CA certificate) is not a socket request:
 //! [`ensure`] makes the CA directory once at first start, in the account that will own
-//! the key, and loads one the operator placed there.
+//! the key, and loads one the operator placed there. The `kbf-signer` binary calls it at
+//! every start: a missing or empty directory gets a new CA, one holding exactly `ca.key`
+//! and `ca.pem` is loaded, and anything else is refused with nothing written.
+//!
+//! [`bind`] replaces a stale socket (nobody listens) but refuses one a signer is
+//! serving. [`check_tbs`] also reads the signer's clock: a validity that starts more
+//! than the backdate allowance ahead of it, or has ended, is refused.
 //!
 //! # Wire
 //!

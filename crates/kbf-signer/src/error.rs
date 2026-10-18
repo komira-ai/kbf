@@ -20,6 +20,9 @@ pub enum SignerError {
     /// The CA directory is neither empty nor exactly `ca.key` and `ca.pem`.
     #[error("the CA directory is neither empty nor exactly ca.key and ca.pem")]
     CaDirState,
+    /// A signer answers on the socket's path.
+    #[error("a signer is already serving {}", .0.display())]
+    AlreadyServing(std::path::PathBuf),
     /// Something other than a stale socket is at the socket's path.
     #[error("something other than a socket is at the socket's path")]
     SocketPath,

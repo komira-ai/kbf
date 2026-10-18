@@ -7,7 +7,7 @@ use std::io::{self, ErrorKind};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_ca::{Algorithm, Authority, FileSigner, Policy, Signer};
 use x509_parser::prelude::{FromDer, X509Certificate};
@@ -67,15 +67,28 @@ fn prepare_dir(dir: &Path) -> Result<(), SignerError> {
     Ok(())
 }
 
+/// Removes the socket at `path` unless a signer answers on it: a connection that is
+/// accepted means one is serving, and a second must not take its place; only a refused
+/// connection (nobody listens) marks a stale socket.
+fn remove_if_stale(path: &Path) -> Result<(), SignerError> {
+    match UnixStream::connect(path) {
+        Ok(_) => Err(SignerError::AlreadyServing(path.to_path_buf())),
+        Err(e) if e.kind() == ErrorKind::ConnectionRefused => Ok(fs::remove_file(path)?),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Binds the socket at `path`: in a directory of mode 0700 (made if missing), with mode
-/// 0600. A socket left by a previous run is replaced; anything else at `path` is an error.
+/// 0600. A socket left by a previous run (nobody listens on it) is replaced; one a signer
+/// is serving, or anything else at `path`, is an error.
 ///
 /// # Errors
-/// [`SignerError`].
+/// [`SignerError::AlreadyServing`] for a live socket; otherwise other [`SignerError`]s.
 pub fn bind(path: &Path) -> Result<UnixListener, SignerError> {
     prepare_dir(path.parent().ok_or(SignerError::SocketPath)?)?;
     match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => fs::remove_file(path)?,
+        Ok(meta) if meta.file_type().is_socket() => remove_if_stale(path)?,
         Ok(_) => return Err(SignerError::SocketPath),
         // Nothing there (or nothing that can be looked at, which `bind` will say).
         Err(_) => {}
@@ -85,8 +98,21 @@ pub fn bind(path: &Path) -> Result<UnixListener, SignerError> {
     Ok(listener)
 }
 
+/// The signer's clock: Unix seconds.
+type Clock = Box<dyn Fn() -> i64 + Send + Sync>;
+
+/// The system clock in Unix seconds (0 for a clock set before 1970, which refuses all).
+fn system_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .unwrap_or(0)
+}
+
 /// The CA key and the rules it signs by.
 pub struct SignerServer<S: Signer> {
+    clock: Clock,
     key: S,
     root_subject: Vec<u8>,
     allowed_uid: u32,
@@ -133,11 +159,20 @@ impl<S: Signer> SignerServer<S> {
             return Err(SignerError::Root);
         }
         Ok(Self {
+            clock: Box::new(system_now),
             key,
             root_subject: root.subject().as_raw().to_vec(),
             allowed_uid,
             policy,
         })
+    }
+
+    /// The same server reading `clock` (Unix seconds) instead of the system clock: for
+    /// tests that fix time.
+    #[must_use]
+    pub fn with_clock(mut self, clock: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+        self.clock = Box::new(clock);
+        self
     }
 
     /// Serves `listener`, a thread to a connection, for as long as it accepts.
@@ -179,7 +214,8 @@ impl<S: Signer> SignerServer<S> {
     }
 
     fn sign(&self, route: Route, tbs: &[u8]) -> (u8, Vec<u8>) {
-        if let Err(refusal) = check_tbs(tbs, route, self.policy, &self.root_subject) {
+        if let Err(refusal) = check_tbs(tbs, route, self.policy, &self.root_subject, (self.clock)())
+        {
             return (wire::REFUSED, refusal.to_string().into_bytes());
         }
         match self.key.sign(tbs, Algorithm::EcdsaP256Sha256) {
