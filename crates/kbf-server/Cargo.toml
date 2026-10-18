@@ -59,6 +59,8 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 # A test certificate's public-key hash and names, read independently of kbf-peer.
 x509-parser.workspace = true
+# The connector of the TLS reload tests' client attempts, which dials once (tests/tls_reload.rs).
+hyper-util = { workspace = true, features = ["tokio"] }
 kbf-segments.workspace = true
 # The deterministic simulation kernel's seeded random stream (tests/sim_rollout.rs).
 kbf-sim.workspace = true
