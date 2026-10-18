@@ -1,6 +1,6 @@
 The storage node and a worker daemon in one process, the daemon reading and writing the node's storage in-process (Linux, the container driver only).
 
-Usage: kbf storage-and-daemon [OPTIONS] --server <SERVERS> --ca-cert <CA_CERT> --cert <CERT> --key <KEY> --node-id <NODE_ID> --driver <DRIVERS>
+Usage: kbf --mode=storage-and-daemon [OPTIONS] --server <SERVERS> --ca-cert <CA_CERT> --cert <CERT> --key <KEY> --node-id <NODE_ID> --driver <DRIVERS>
 
 Options:
       --server <SERVERS>
