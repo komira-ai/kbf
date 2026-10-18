@@ -61,12 +61,18 @@ spec:
               cpu: "1"
               memory: 1Gi
           volumeMounts:
-            # envoy.json, rendered on the host by `kbf-deploy envoy render`.
-            - name: envoy-config
-              mountPath: /etc/kbf/envoy
+            # envoy.json, rendered on the host by `kbf-deploy envoy render`, and the
+            # certificates, keys and CA it names (`/etc/kbf/tls/...` in the rendered
+            # config; `kbf-deploy` keeps its defaults directly under `/etc/kbf`). Both
+            # layouts lie under `/etc/kbf`, so the whole directory is mounted read-only.
+            # The pod can therefore also read `kbf.toml` and the API token; it cannot
+            # write any of it. `k8s_manifests.rs` fails if a path in the rendered
+            # config is outside a mount.
+            - name: etc-kbf
+              mountPath: /etc/kbf
               readOnly: true
       volumes:
-        - name: envoy-config
+        - name: etc-kbf
           hostPath:
-            path: /etc/kbf/envoy
+            path: /etc/kbf
             type: Directory

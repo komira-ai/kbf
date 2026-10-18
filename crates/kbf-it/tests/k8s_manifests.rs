@@ -14,6 +14,9 @@
 //! - a Role with a wildcard, a verb besides `get` and `patch`, more than the one
 //!   Deployment, or a cluster-wide role or binding;
 //! - a service account token mounted into the Envoy pod;
+//! - an Envoy pod that cannot read a file its rendered `envoy.json` names (the
+//!   certificates and keys): every path in the rendered config, and the config's own path
+//!   in the container args, must lie under a read-only mount of a host directory;
 //! - a Secret, Service, Ingress or PersistentVolumeClaim, and an IP address or tailnet
 //!   name in a public file.
 //!
@@ -282,7 +285,72 @@ fn resources(c: &Node, who: &str, bad: &mut dyn FnMut(&str)) {
     }
 }
 
+/// Every absolute path the rendered Envoy configuration names (`"filename": "..."`):
+/// the golden `kbf-installer envoy render` output for the single-box topology, which is
+/// what the pod's host directory holds.
+fn rendered_paths() -> Vec<String> {
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../kbf-installer/tests/golden/envoy/box/envoy.json");
+    let body = std::fs::read_to_string(&golden).expect("golden envoy.json");
+    let mut out = Vec::new();
+    for part in body.split("\"filename\": \"").skip(1) {
+        out.push(part.split('"').next().unwrap_or("").to_owned());
+    }
+    out
+}
+
+fn under(path: &str, mount: &str) -> bool {
+    path.strip_prefix(mount)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn envoy_files(d: &Node, out: &mut Vec<String>) {
+    let vols = at(d, "spec.template.spec.volumes")
+        .map(seq)
+        .unwrap_or_default();
+    let mut paths = rendered_paths();
+    assert!(
+        paths.len() >= 3,
+        "the golden envoy.json names fewer than three files: {paths:?}"
+    );
+    for c in containers(d) {
+        let args = strings(get(c, "args"));
+        if let Some(i) = args.iter().position(|a| *a == "-c") {
+            paths.extend(args.get(i + 1).map(|a| (*a).to_owned()));
+        }
+        // (mountPath, readOnly, backed by a host directory)
+        let mounts: Vec<(&str, bool, bool)> = at(c, "volumeMounts")
+            .map(seq)
+            .unwrap_or_default()
+            .iter()
+            .map(|m| {
+                let v = vols.iter().find(|v| text(v, "name") == text(m, "name"));
+                (
+                    text(m, "mountPath").unwrap_or(""),
+                    text(m, "readOnly") == Some("true"),
+                    v.and_then(|v| text(v, "hostPath.type")) == Some("Directory"),
+                )
+            })
+            .collect();
+        for p in &paths {
+            if !mounts.iter().any(|(m, _, _)| under(p, m)) {
+                out.push(format!(
+                    "kbf-envoy: {p} is not under any volume mount: Envoy cannot read it"
+                ));
+            }
+        }
+        for (m, ro, host) in &mounts {
+            if !ro || !host {
+                out.push(format!(
+                    "kbf-envoy: mount {m} is not a read-only host directory"
+                ));
+            }
+        }
+    }
+}
+
 fn envoy(d: &Node, out: &mut Vec<String>) {
+    envoy_files(d, out);
     if text(d, "spec.template.spec.automountServiceAccountToken") != Some("false") {
         out.push("kbf-envoy: mounts a service account token".into());
     }
@@ -586,6 +654,32 @@ fn a_token_in_the_envoy_pod_is_refused() {
             "automountServiceAccountToken: true",
         ),
         "kbf-envoy: mounts a service account token",
+    );
+}
+
+/// The Envoy pod mounting only `/etc/kbf/envoy` (the defect found in review) cannot read
+/// the certificates and keys `envoy.json` names under `/etc/kbf/tls`.
+#[test]
+fn an_envoy_pod_that_cannot_read_its_certificates_is_refused() {
+    let f = with(
+        "envoy-deployment.yaml",
+        "mountPath: /etc/kbf\n",
+        "mountPath: /etc/kbf/envoy\n",
+    );
+    refused(&f, "/etc/kbf/tls/reapi.key is not under any volume mount");
+    refused(&f, "/etc/kbf/tls/ca.pem is not under any volume mount");
+}
+
+/// A writable mount would let a compromised Envoy rewrite the certificates.
+#[test]
+fn a_writable_envoy_mount_is_refused() {
+    refused(
+        &with(
+            "envoy-deployment.yaml",
+            "              readOnly: true\n",
+            "",
+        ),
+        "kbf-envoy: mount /etc/kbf is not a read-only host directory",
     );
 }
 

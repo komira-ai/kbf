@@ -7,8 +7,10 @@
 //! - `docker run <image> --version` exits 0 and prints a `kbf <version>+<commit>` line,
 //!   so the binary starts on the base's libraries;
 //! - `docker run <image> --mode=frontend --check`, with no `/etc/kbf/kbf.toml` in the
-//!   image, exits [`REFUSED`] (2): the frontend refuses to start without its config, and
-//!   not for some other reason (a missing library exits 127 or 1).
+//!   image, exits [`REFUSED`] (2) and says on stderr that it cannot read
+//!   [`CONFIG_PATH`]. The exit status alone is not enough: clap's usage error for a flag
+//!   the binary does not know (an image built from a tree without `--mode`) also exits
+//!   2, and a missing library exits 127 or 1.
 //!
 //! The image id is appended to `--summary`. Nothing is pushed.
 
@@ -22,6 +24,8 @@ use crate::Error;
 pub const USER: &str = "65532:65532";
 /// The exit status of a command line or config `kbf` refuses.
 pub const REFUSED: i32 = 2;
+/// The file the frontend refuses to start without, as `kbf` names it in its refusal.
+pub const CONFIG_PATH: &str = "/etc/kbf/kbf.toml";
 
 /// What one `docker` call did.
 #[derive(Debug, PartialEq, Eq)]
@@ -29,6 +33,7 @@ pub struct Ran {
     /// The exit status; `None` when a signal ended the process.
     pub code: Option<i32>,
     pub stdout: String,
+    pub stderr: String,
 }
 
 /// `docker image inspect --format '{{.Id}} {{.Config.User}}'`'s answer: the image id.
@@ -76,17 +81,27 @@ pub fn judge_version(ran: &Ran) -> Result<(), Error> {
     }
 }
 
-/// `kbf --mode=frontend --check`'s answer with no config in the image.
+/// `kbf --mode=frontend --check`'s answer with no config in the image: exit
+/// [`REFUSED`] and a stderr that says it cannot read [`CONFIG_PATH`].
 ///
 /// # Errors
-/// The exit status is not [`REFUSED`].
+/// The exit status is not [`REFUSED`], or stderr does not name the missing config (the
+/// binary refused for another reason, such as an unknown `--mode` flag).
 pub fn judge_refusal(ran: &Ran) -> Result<(), Error> {
-    if ran.code == Some(REFUSED) {
+    if ran.code != Some(REFUSED) {
+        return Err(Error::Failed(format!(
+            "`kbf --mode=frontend --check` with no kbf.toml exited {:?}, not {REFUSED}",
+            ran.code
+        )));
+    }
+    let first = ran.stderr.lines().next().unwrap_or("");
+    if ran.stderr.contains("cannot read") && ran.stderr.contains(CONFIG_PATH) {
         Ok(())
     } else {
         Err(Error::Failed(format!(
-            "`kbf --mode=frontend --check` with no kbf.toml exited {:?}, not {REFUSED}",
-            ran.code
+            "`kbf --mode=frontend --check` with no kbf.toml exited {REFUSED} but did not \
+             say it cannot read {CONFIG_PATH} (stderr starts {first:?}): it refused for \
+             another reason"
         )))
     }
 }
@@ -99,6 +114,7 @@ fn docker(program: &Path, args: &[&str]) -> Result<Ran, Error> {
     Ok(Ran {
         code: out.status.code(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     })
 }
 
