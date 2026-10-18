@@ -19,7 +19,7 @@ use kbf_server::token::ApiToken;
 use kbf_server::verbs::routes;
 use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
 use kbf_state::fake::{Fake, Flaw};
-use kbf_state::{Cond, ManualClock, Store, Txn};
+use kbf_state::{Clock as _, Cond, ManualClock, Store, Txn};
 use kbf_types::operator_api::DeniedList;
 use support::{HELLO_WAIT, INTERVAL};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -82,6 +82,7 @@ fn listeners() -> Listeners {
 /// A whole server over the store's fake; its stop switch is dropped with it.
 struct Server {
     api: SocketAddr,
+    clock: Arc<ManualClock>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -94,8 +95,9 @@ impl Drop for Server {
 }
 
 fn start() -> Server {
+    let clock = Arc::new(ManualClock::default());
     let state = StateStore {
-        store: live_store(),
+        store: store_on(Arc::clone(&clock)),
         epoch: EpochPolicy::Keep,
         members: config(),
         history: None,
@@ -122,12 +124,16 @@ fn start() -> Server {
     tokio::spawn(async move { bound.serving.await.expect("serve") });
     Server {
         api,
+        clock,
         stop: Some(stop),
     }
 }
 
 fn live_store() -> Arc<dyn Store> {
-    let clock = Arc::new(ManualClock::default());
+    store_on(Arc::new(ManualClock::default()))
+}
+
+fn store_on(clock: Arc<ManualClock>) -> Arc<dyn Store> {
     Arc::new(Fake::with_flaw(clock, Flaw::None))
 }
 
@@ -178,6 +184,14 @@ async fn request(api: SocketAddr, method: &str, path: &str, headers: &str, body:
     }
 }
 
+fn assert_no_store(answer: &Answer) {
+    assert!(
+        answer.head.contains("cache-control: no-store"),
+        "{}",
+        answer.head
+    );
+}
+
 async fn deny(api: SocketAddr, entry: &str, reason: &str) {
     let body = serde_json::json!({ "entry": entry, "reason": reason }).to_string();
     let answer = request(api, "POST", "/v1/denied", OPERATOR, &body).await;
@@ -198,14 +212,15 @@ fn names(list: &DeniedList) -> Vec<(&str, &str)> {
 }
 
 /// Catches a deny list that cannot be read back: `GET /v1/denied` must list every entry kind
-/// (serial, key hash, node) with the reason it was added with and a time, in the order the
+/// (serial, key hash, node) with the reason it was added with and a time (the store's clock at the denial), in the order the
 /// list sorts, as `POST` stored it (canonical spelling), and drop an entry that `DELETE`
 /// took off. It is served by the real server, so it also pins that the new `GET` shares the
 /// path with `POST` and `DELETE` (a merge that lost one method would answer 405). The empty
 /// list is `{"denied":[]}`, never 404, and every answer is `no-store`.
 ///
 /// Mutants seen red: the listing reading only `node` rows; the reason left out (empty); the
-/// route merged so that `GET` was never reached (405).
+/// route merged so that `GET` was never reached (405); `at_ms` a constant; `no_store` missing
+/// from the 401/403/415, 404, 503 and 500 answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_deny_list_is_read_back_with_every_kind_and_reason() {
     let server = start();
@@ -213,17 +228,21 @@ async fn the_deny_list_is_read_back_with_every_kind_and_reason() {
     let answer = request(api, "GET", "/v1/denied", OPERATOR, "").await;
     assert_eq!(answer.code, 200, "{}", answer.body);
     assert_eq!(answer.body, r#"{"denied":[]}"#);
-    assert!(
-        answer.head.contains("cache-control: no-store"),
-        "{}",
-        answer.head
-    );
+    assert_no_store(&answer);
     assert!(answer.head.contains("application/json"), "{}", answer.head);
 
-    deny(api, "node Mac-07", "retired").await;
-    deny(api, "serial 0A:1B", "a lost laptop").await;
+    // The store's clock moves between the denials, so each entry has its own time.
+    let mut times = Vec::new();
     let hash = "ab".repeat(32);
-    deny(api, &format!("spki-sha256 {hash}"), "leaked key").await;
+    for (entry, reason) in [
+        ("node Mac-07".to_owned(), "retired"),
+        ("serial 0A:1B".to_owned(), "a lost laptop"),
+        (format!("spki-sha256 {hash}"), "leaked key"),
+    ] {
+        server.clock.advance(Duration::from_secs(7));
+        times.push(u64::try_from(server.clock.now().as_duration().as_millis()).expect("ms"));
+        deny(api, &entry, reason).await;
+    }
 
     let list = listed(api).await;
     assert_eq!(
@@ -234,7 +253,9 @@ async fn the_deny_list_is_read_back_with_every_kind_and_reason() {
             ("node mac-07", "retired"),
         ]
     );
-    assert!(list.denied.iter().all(|d| d.at_ms > 0), "{list:?}");
+    // Listed serial (denied second), spki (third), node (first).
+    let at: Vec<u64> = list.denied.iter().map(|d| d.at_ms).collect();
+    assert_eq!(at, [times[1], times[2], times[0]], "{list:?}");
 
     let gone = request(api, "DELETE", "/v1/denied?entry=serial+a1b", OPERATOR, "").await;
     assert_eq!(gone.code, 200, "{}", gone.body);
@@ -274,6 +295,7 @@ async fn the_listing_passes_the_write_gate() {
     ] {
         let answer = request(api, "GET", "/v1/denied", headers, "").await;
         assert_eq!(answer.code, want, "with {what}: {}", answer.body);
+        assert_no_store(&answer);
         assert!(
             !answer.body.contains("SECRET-REASON"),
             "{what}: {}",
@@ -283,6 +305,7 @@ async fn the_listing_passes_the_write_gate() {
     let off = serve_routes(None, Some(members)).await;
     let answer = request(off, "GET", "/v1/denied", OPERATOR, "").await;
     assert_eq!(answer.code, 403, "writes off: {}", answer.body);
+    assert_no_store(&answer);
 }
 
 /// Catches a server without members answering anything but 404 (after the gate), and a
@@ -294,6 +317,7 @@ async fn a_listing_without_members_answers_404() {
     let none = serve_routes(Some(token()), None).await;
     let answer = request(none, "GET", "/v1/denied", OPERATOR, "").await;
     assert_eq!(answer.code, 404, "{}", answer.body);
+    assert_no_store(&answer);
 }
 
 /// Catches a listing that assumes it is the only frontend: two frontends over one store
@@ -340,6 +364,7 @@ async fn a_listing_that_cannot_read_the_store_says_so_in_fixed_words() {
     store.fail_scans.store(1, Ordering::SeqCst);
     let answer = request(api, "GET", "/v1/denied", OPERATOR, "").await;
     assert_eq!(answer.code, 503, "{}", answer.body);
+    assert_no_store(&answer);
     assert!(
         answer.body.contains("the state store failed"),
         "{}",
@@ -350,6 +375,7 @@ async fn a_listing_that_cannot_read_the_store_says_so_in_fixed_words() {
     store.panic_scans.store(1, Ordering::SeqCst);
     let answer = request(api, "GET", "/v1/denied", OPERATOR, "").await;
     assert_eq!(answer.code, 500, "{}", answer.body);
+    assert_no_store(&answer);
     assert!(
         answer.body.contains("the listing task failed"),
         "{}",
@@ -367,6 +393,7 @@ async fn a_listing_that_cannot_read_the_store_says_so_in_fixed_words() {
             .expect("commit");
         let answer = request(api, "GET", "/v1/denied", OPERATOR, "").await;
         assert_eq!(answer.code, 500, "{key}: {}", answer.body);
+        assert_no_store(&answer);
         assert!(
             answer.body.contains("a stored row is unreadable") && !answer.body.contains("SECRET"),
             "{key}: {}",
