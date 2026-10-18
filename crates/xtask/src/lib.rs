@@ -1,8 +1,9 @@
 //! `cargo xtask <verb>`: kbf's CI logic, in Rust with tests, so each workflow step is one
 //! command (the alias is in `.cargo/config.toml`).
 //!
-//! - `build-commit check <binary> <commit>` and `build-commit stamps <commit>`
-//!   ([`build_commit`]): kbf-server names the commit it was built from.
+//! - `build-commit check <binary> <commit>`, `build-commit check-asset <tarball>
+//!   <commit>` and `build-commit stamps <commit>` ([`build_commit`]): kbf-server names the
+//!   commit it was built from, and `kbf` does in the tarball that ships.
 //! - `budget-diff --base <rev>` ([`budget`]): the interpreter budget may only shrink; a
 //!   row the working tree's budget file has and `<rev>`'s does not is refused. CI runs
 //!   it on pull requests, with the base branch as `<rev>`.
@@ -16,16 +17,25 @@
 //! - `package --binary <path> --sbom <path> --platform <platform> --commit <sha> --out
 //!   <dir>` ([`package`]): one binary as a release asset, a tarball that is the same
 //!   bytes on every runner, and its SBOM, with their lines in `SHA256SUMS.<platform>`.
+//! - `pkg build --binary <path> --launchd-plist <path> [--trust <path>]... --version <v>
+//!   --out <dir>` and `pkg cask` ([`pkg`]): kbf-installer for a Mac, a `.pkg` that is
+//!   the same bytes on every host and installs a root-owned tree and a LaunchDaemon that
+//!   is not loaded, and the Homebrew cask for it (no formula: contract section 7).
 //! - `sums assemble <dir>` and `verify-assets {sums,attestations} <dir>` ([`sums`]): the
 //!   one `SHA256SUMS` over every platform's assets, and the checks the attest job and
 //!   a deployment make of it, each with a control that must fail.
+//! - Each tarball's provenance bundle, `<tarball>.sigstore.json` ([`bundles`]): the
+//!   attestation a host verifies the tarball with offline. `verify-assets
+//!   attestations` and `release check` hold a directory to one bundle per tarball,
+//!   each that tarball's (its one subject is the tarball's digest); `verify-assets
+//!   attestations` also has `gh` verify each tarball against its bundle.
 //! - `release {locate,main-control,check,publish}` ([`release`]): a GitHub release of
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
-//! - `podman-tests [--sudo <path>] [--podman <path>] [--runtime-dir <path>]`
-//!   ([`podman_tests`]): the container driver's real-Podman tests on a hosted Linux
-//!   runner, each test target in its own `Delegate=yes` system unit.
+//! - `crun-tests [--sudo <path>]` ([`crun_tests`]): the container driver's real-`crun`
+//!   tests on a hosted Linux runner, each test target in its own `Delegate=yes` system
+//!   unit.
 //! - `sudo-test -p <package> --test <name> [--sudo <path>] [-- <test args>]`
 //!   ([`sudo_test`]): one integration test target built as this user, then its
 //!   `#[ignore]` tests run as root through `sudo -n`.
@@ -41,11 +51,13 @@ use clap::{Parser, Subcommand};
 
 pub mod budget;
 pub mod build_commit;
+pub mod bundles;
+pub mod crun_tests;
 pub mod darwin;
 pub mod entitlements;
 pub mod fetch;
 pub mod package;
-pub mod podman_tests;
+pub mod pkg;
 pub mod release;
 pub mod sudo_test;
 pub mod sums;
@@ -143,6 +155,9 @@ enum Verb {
         #[arg(long)]
         out: PathBuf,
     },
+    /// kbf-installer for a Mac: its `.pkg`, and the Homebrew cask.
+    #[command(subcommand)]
+    Pkg(PkgVerb),
     /// Sign a macOS binary in place, ad hoc with the hardened runtime and the
     /// entitlements the allow list gives its file name, and check it (macOS only).
     SignDarwin {
@@ -166,19 +181,12 @@ enum Verb {
     /// A GitHub release of a `main` commit's attested assets, never rebuilt.
     #[command(subcommand)]
     Release(ReleaseVerb),
-    /// Run the container driver's real-Podman tests on a hosted Linux runner, each
+    /// Run the container driver's real-crun tests on a hosted Linux runner, each
     /// test target in its own Delegate=yes system unit as this user.
-    PodmanTests {
+    CrunTests {
         /// The sudo program; it is run with `-n`, so it never prompts.
         #[arg(long, default_value = "sudo")]
         sudo: PathBuf,
-        /// The podman program.
-        #[arg(long, default_value = "podman")]
-        podman: PathBuf,
-        /// This user's runtime directory, where its systemd user manager's bus appears
-        /// (default: /run/user/<uid>).
-        #[arg(long)]
-        runtime_dir: Option<PathBuf>,
     },
     /// Build one integration test target, then run its ignored tests as root.
     SudoTest {
@@ -198,6 +206,43 @@ enum Verb {
 }
 
 #[derive(Subcommand)]
+enum PkgVerb {
+    /// Write `kbf-installer-<version>-macos-arm64.pkg` in `--out`.
+    Build {
+        /// The kbf-installer binary, signed ad hoc.
+        #[arg(long)]
+        binary: PathBuf,
+        /// The LaunchDaemon property list; refused unless the job is gated on the
+        /// configuration file.
+        #[arg(long)]
+        launchd_plist: PathBuf,
+        /// A trust file to install in /usr/local/kbf-installer/trust (repeatable).
+        #[arg(long)]
+        trust: Vec<PathBuf>,
+        /// The release's version: letters, digits and `. _ + -`.
+        #[arg(long)]
+        version: String,
+        /// The directory the package goes in; created when missing.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Write the Homebrew cask that installs a package `pkg build` wrote.
+    Cask {
+        /// The package, named as `pkg build` names it.
+        #[arg(long)]
+        pkg: PathBuf,
+        #[arg(long)]
+        version: String,
+        /// Where Homebrew downloads the package from (https:// or file:///).
+        #[arg(long)]
+        url: String,
+        /// The cask file to write; it must not exist.
+        #[arg(long)]
+        out: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum Sums {
     /// Merge `<dir>/SHA256SUMS.<platform>` into `<dir>/SHA256SUMS`, and remove them.
     Assemble {
@@ -213,9 +258,11 @@ enum Sums {
 
 #[derive(Subcommand)]
 enum VerifyAssets {
-    /// `<dir>/SHA256SUMS` lists every other file in `<dir>` once, and each matches.
+    /// `<dir>/SHA256SUMS` lists every other file in `<dir>` once, and each matches
+    /// (a provenance bundle is not listed: it is made after the sums).
     Sums { dir: PathBuf },
-    /// Every asset `<dir>/SHA256SUMS` lists has the attestations a deployment checks.
+    /// Every asset `<dir>/SHA256SUMS` lists has the attestations a deployment checks,
+    /// and every tarball verifies against its own bundle as a host does.
     Attestations {
         dir: PathBuf,
         /// The repository, `<owner>/<repo>` (on Actions, `GITHUB_REPOSITORY`).
@@ -229,6 +276,14 @@ enum VerifyAssets {
         /// `GITHUB_REF`). The default is main's: a release verifies as main.
         #[arg(long, default_value = "refs/heads/main")]
         source_ref: String,
+        /// The commit the files were built from, a full SHA (on Actions, `GITHUB_SHA`;
+        /// a release passes the tag's commit): each tarball's bundle must attest it.
+        #[arg(long)]
+        commit: String,
+        /// A `trusted_root.jsonl` from `gh attestation trusted-root`. With it the bundles
+        /// are verified with no network, as a host's installer does.
+        #[arg(long)]
+        trusted_root: Option<PathBuf>,
         /// The `gh` program.
         #[arg(long, default_value = "gh")]
         gh: PathBuf,
@@ -268,7 +323,8 @@ enum ReleaseVerb {
         #[arg(long, default_value = "gh")]
         gh: PathBuf,
     },
-    /// `<dir>` passes `verify-assets sums` and lists only assets of `--commit`.
+    /// `<dir>` passes `verify-assets sums`, lists only assets of `--commit`, and holds
+    /// exactly one provenance bundle (`<tarball>.sigstore.json`) per tarball.
     Check {
         dir: PathBuf,
         /// The commit the assets were built from, a full SHA.
@@ -308,6 +364,10 @@ enum BuildCommit {
         #[arg(long)]
         json: bool,
     },
+    /// The `kbf` in the release tarball `<tarball>` (`<name>-<commit>-<platform>.tar.gz`)
+    /// names `<commit>` and a release build, as `check --json` finds, run on the bytes
+    /// that ship.
+    CheckAsset { tarball: PathBuf, commit: String },
     /// A plain build, two override stamps and a malformed override, from the checkout.
     Stamps { commit: String },
 }
@@ -376,6 +436,14 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             commit,
             json,
         }) => Ok(vec![build_commit::check(&binary, &commit, json)?]),
+        Verb::BuildCommit(BuildCommit::CheckAsset { tarball, commit }) => {
+            let scratch_in = root.join("target");
+            Ok(vec![build_commit::check_asset(
+                &scratch_in,
+                &tarball,
+                &commit,
+            )?])
+        }
         Verb::BuildCommit(BuildCommit::Stamps { commit }) => {
             build_commit::stamps(&cargo_program(), &root, &commit)
         }
@@ -392,16 +460,10 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             test: &test,
             args: &args,
         }),
-        Verb::PodmanTests {
-            sudo,
-            podman,
-            runtime_dir,
-        } => podman_tests::run(&podman_tests::PodmanTests {
+        Verb::CrunTests { sudo } => crun_tests::run(&crun_tests::CrunTests {
             cargo: &cargo_program(),
             sudo: &sudo,
-            podman: &podman,
             root: &root,
-            runtime_dir: runtime_dir.as_deref(),
         }),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
         Verb::Fetch {
@@ -422,6 +484,25 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             commit,
             out,
         } => package::package(&binary, &sbom, platform, &commit, &out),
+        Verb::Pkg(PkgVerb::Build {
+            binary,
+            launchd_plist,
+            trust,
+            version,
+            out,
+        }) => pkg::build(&pkg::Build {
+            binary: &binary,
+            plist: &launchd_plist,
+            trust: &trust,
+            version: &version,
+            out: &out,
+        }),
+        Verb::Pkg(PkgVerb::Cask {
+            pkg,
+            version,
+            url,
+            out,
+        }) => pkg::cask(&pkg, &version, &url, &out),
         #[cfg(target_os = "macos")]
         Verb::SignDarwin {
             binary,
@@ -495,6 +576,8 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             repo,
             workflow_ref,
             source_ref,
+            commit,
+            trusted_root,
             gh,
         }) => {
             // The flipped copy's directory, of this process alone.
@@ -505,6 +588,8 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 repo: &repo,
                 workflow_ref: &workflow_ref,
                 source_ref: &source_ref,
+                commit: &commit,
+                trusted_root: trusted_root.as_deref(),
                 gh: &gh,
                 scratch: &scratch,
             };

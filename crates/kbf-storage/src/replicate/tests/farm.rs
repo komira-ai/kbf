@@ -235,6 +235,7 @@ impl Farm {
                     .iter()
                     .find(|(n, _)| *n == i)
                     .map_or(MemberState::Active, |(_, s)| *s),
+                boot: 0,
             })
             .collect();
         Arc::new(Map::new(generation, members, Rule::Rendezvous, r, 1, Vec::new()).expect("a map"))
