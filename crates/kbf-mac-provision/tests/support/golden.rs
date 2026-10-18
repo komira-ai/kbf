@@ -22,7 +22,7 @@ pub fn golden_plist_as(sha12: &str, user: Option<&str>) -> String {
 	<key>ProgramArguments</key>
 	<array>
 		<string>/usr/local/kbf/current/kbf</string>
-		<string>node</string>
+		<string>--mode=daemon</string>
 		<string>--config</string>
 		<string>/usr/local/etc/kbf/kbf.toml</string>
 		<string>--label</string>
