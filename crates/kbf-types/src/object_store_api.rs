@@ -221,6 +221,23 @@ pub struct BindingPut {
     /// The generation the operator last read.
     #[serde(default)]
     pub expect_generation: Option<u64>,
+    /// Whether the frontend probes the bucket first; `true` when absent.
+    #[serde(default)]
+    pub verify: Option<bool>,
+}
+
+/// `POST /v1/object-stores/connections/{name}:verify`: where to probe. The body may be
+/// empty or `{}`, and then the probe uses the bucket and prefix of the `cold` binding that
+/// names the connection.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyRequest {
+    /// The bucket to probe; the cold binding's when absent.
+    #[serde(default)]
+    pub bucket: Option<String>,
+    /// The key prefix to probe under; the cold binding's (or empty) when absent.
+    #[serde(default)]
+    pub prefix: Option<String>,
 }
 
 /// What a probe of a store proved, step by step.
@@ -333,6 +350,173 @@ pub struct AuditEntry {
     pub outcome: AuditOutcome,
     /// The registry generation after the call.
     pub generation: u64,
+}
+
+/// `POST .../connections/{name}:verify`: the probe, with nothing changed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyAnswer {
+    /// The connection probed.
+    pub name: ConnectionName,
+    /// The steps and whether they passed.
+    pub verified: Verified,
+}
+
+/// The answer to a binding PUT.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindingPutAnswer {
+    /// The role.
+    pub role: BindingRole,
+    /// The registry generation after the write (unchanged when `changed` is false).
+    pub generation: u64,
+    /// Whether the write changed anything.
+    pub changed: bool,
+    /// The probe of the bucket, when one ran.
+    pub verified: Option<Verified>,
+}
+
+/// The answer to a DELETE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Deleted {
+    /// The registry generation after the delete.
+    pub generation: u64,
+}
+
+/// `GET /v1/object-stores/connections`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionList {
+    /// Every connection, by name.
+    pub connections: Vec<ConnectionInfo>,
+}
+
+/// `GET /v1/object-stores/audit`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditList {
+    /// The newest rows first.
+    pub entries: Vec<AuditEntry>,
+}
+
+/// What a storage node reports about the registration, as a closed set: never a node's
+/// own text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeStatus {
+    /// The node opened the store with the registration and probed it.
+    Ok,
+    /// The node has not applied the current generation (or has not reported since the
+    /// frontend started).
+    Pending,
+    /// The node's probe of the store failed; it keeps the store it had.
+    ProbeFailed,
+    /// The node runs on a `--cold-store` flag whose identity differs from the
+    /// registration; it keeps the flag's store.
+    IdentityMismatch,
+    /// The node's build does not report the registration at all (version skew).
+    Unsupported,
+}
+
+/// A storage member's standing, for what convergence counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberStanding {
+    /// Takes part: expected to apply the registration.
+    Active,
+    /// Leaving: not expected to apply it.
+    Draining,
+    /// On the deny list: not expected to apply it, and never handed it.
+    Denied,
+}
+
+/// One storage node in the convergence view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeConvergence {
+    /// The node id.
+    pub id: String,
+    /// Whether it is expected to apply.
+    pub state: MemberStanding,
+    /// The generation it last reported applying; absent if it never reported.
+    pub applied_generation: Option<u64>,
+    /// What it reports.
+    pub status: NodeStatus,
+    /// Seconds since its last heartbeat; absent if the frontend has not heard from it
+    /// since it started.
+    pub last_seen_secs: Option<u64>,
+}
+
+/// Whether the storage nodes run on the current registration. Never a convergence the
+/// frontend does not know.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Convergence {
+    /// Every expected node has applied the current generation with status `ok`, none is
+    /// `unsupported`, and at least one node is expected.
+    pub converged: bool,
+    /// Active nodes that report the registration (draining, denied and `unsupported`
+    /// nodes are not counted).
+    pub expected: u64,
+    /// Of those, the nodes at the current generation with status `ok`.
+    pub applied: u64,
+    /// Active nodes whose build does not report the registration.
+    pub unsupported: u64,
+    /// Every storage node, by id.
+    pub nodes: Vec<NodeConvergence>,
+}
+
+/// `GET /v1/object-stores`: the desired state, and how far the nodes are from it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Status {
+    /// The registry generation.
+    pub generation: u64,
+    /// Every connection.
+    pub connections: Vec<ConnectionInfo>,
+    /// Every binding.
+    pub bindings: Vec<BindingInfo>,
+    /// The nodes.
+    pub convergence: Convergence,
+}
+
+impl Convergence {
+    /// The view of `nodes` against `generation`: a node that reports `ok` at another
+    /// generation is `pending`, and the counts and `converged` follow the field docs.
+    #[must_use]
+    pub fn of(generation: u64, mut nodes: Vec<NodeConvergence>) -> Self {
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        for node in &mut nodes {
+            if node.status == NodeStatus::Ok && node.applied_generation != Some(generation) {
+                node.status = NodeStatus::Pending;
+            }
+        }
+        let active = |n: &&NodeConvergence| n.state == MemberStanding::Active;
+        let unsupported = nodes
+            .iter()
+            .filter(active)
+            .filter(|n| n.status == NodeStatus::Unsupported)
+            .count() as u64;
+        let expected = nodes.iter().filter(active).count() as u64 - unsupported;
+        let applied = nodes
+            .iter()
+            .filter(active)
+            .filter(|n| n.status == NodeStatus::Ok)
+            .count() as u64;
+        Self {
+            converged: expected > 0 && applied == expected && unsupported == 0,
+            expected,
+            applied,
+            unsupported,
+            nodes,
+        }
+    }
+}
+
+/// An error answer: `error` is for people, `code` is closed and stable. Neither ever holds
+/// the request body, a secret, or text a store or a node sent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorBody {
+    /// A sentence.
+    pub error: String,
+    /// The closed code (`docs/api.md`).
+    pub code: String,
+    /// The probe's steps, on `probe_failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<Verified>,
 }
 
 #[cfg(test)]

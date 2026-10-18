@@ -95,6 +95,7 @@ pub(super) fn bind(connection: &str, bucket: &str) -> BindingPut {
         bucket: bucket.to_owned(),
         prefix: "farm/".to_owned(),
         expect_generation: None,
+        verify: None,
     }
 }
 

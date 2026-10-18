@@ -123,7 +123,7 @@ fn a_binding_body_and_the_answers_round_trip() {
     );
     assert_eq!(
         serde_json::to_string(&bind).unwrap(),
-        r#"{"connection":"c1","bucket":"b","prefix":"p/","expect_generation":3}"#
+        r#"{"connection":"c1","bucket":"b","prefix":"p/","expect_generation":3,"verify":null}"#
     );
 
     let entry = AuditEntry {
@@ -210,4 +210,193 @@ fn a_binding_body_and_the_answers_round_trip() {
             conditional_put: false
         }
     );
+}
+
+fn node(
+    id: &str,
+    state: MemberStanding,
+    applied: Option<u64>,
+    status: NodeStatus,
+) -> NodeConvergence {
+    NodeConvergence {
+        id: id.to_owned(),
+        state,
+        applied_generation: applied,
+        status,
+        last_seen_secs: applied.map(|_| 1),
+    }
+}
+
+// Catches a convergence that counts a draining or denied node as expected (a node leaving
+// would hold `converged` false for ever), one that calls a node done at an older
+// generation, one that lets an `unsupported` node count as expected or as applied, and a
+// farm with no node to ask called converged (a restarted frontend that has heard from
+// nobody must never say true).
+#[test]
+fn convergence_counts_only_active_nodes_at_the_current_generation() {
+    use MemberStanding::{Active, Denied, Draining};
+    use NodeStatus::{IdentityMismatch, Ok, Pending, ProbeFailed, Unsupported};
+
+    let done = Convergence::of(
+        5,
+        vec![
+            node("b", Active, Some(5), Ok),
+            node("a", Active, Some(5), Ok),
+            node("leaving", Draining, Some(2), Pending),
+            node("gone", Denied, None, Pending),
+        ],
+    );
+    assert!(done.converged, "{done:?}");
+    assert_eq!((done.expected, done.applied, done.unsupported), (2, 2, 0));
+    let ids: Vec<&str> = done.nodes.iter().map(|n| n.id.as_str()).collect();
+    assert_eq!(ids, ["a", "b", "gone", "leaving"], "sorted by id");
+
+    // `ok` at an older generation reads as pending, and the farm is not converged.
+    let behind = Convergence::of(
+        5,
+        vec![
+            node("a", Active, Some(5), Ok),
+            node("b", Active, Some(4), Ok),
+        ],
+    );
+    assert!(!behind.converged);
+    assert_eq!((behind.expected, behind.applied), (2, 1));
+    assert_eq!(behind.nodes[1].status, Pending);
+    // A generation that went backwards (a restored state) is not "applied" either.
+    let ahead = Convergence::of(3, vec![node("a", Active, Some(5), Ok)]);
+    assert!(!ahead.converged);
+    assert_eq!(ahead.nodes[0].status, Pending);
+
+    // A failure status is kept as it is, and blocks convergence.
+    for status in [ProbeFailed, IdentityMismatch] {
+        let bad = Convergence::of(5, vec![node("a", Active, Some(5), status)]);
+        assert!(!bad.converged);
+        assert_eq!((bad.expected, bad.applied), (1, 0));
+        assert_eq!(bad.nodes[0].status, status);
+    }
+
+    // An old build is named and counted apart: not expected, not applied, and it blocks.
+    let skew = Convergence::of(
+        5,
+        vec![
+            node("a", Active, Some(5), Ok),
+            node("old", Active, None, Unsupported),
+            node("old-leaving", Draining, None, Unsupported),
+        ],
+    );
+    assert!(!skew.converged);
+    assert_eq!((skew.expected, skew.applied, skew.unsupported), (1, 1, 1));
+
+    // No node at all: nothing is known, so nothing is converged.
+    let none = Convergence::of(5, Vec::new());
+    assert!(!none.converged);
+    assert_eq!((none.expected, none.applied, none.unsupported), (0, 0, 0));
+}
+
+// Catches a status or standing spelled differently on the wire (clients match on these
+// strings), and an error body whose `verified` appears when it is absent.
+#[test]
+fn the_status_vocabulary_and_error_body_have_their_wire_spellings() {
+    for (status, text) in [
+        (NodeStatus::Ok, "ok"),
+        (NodeStatus::Pending, "pending"),
+        (NodeStatus::ProbeFailed, "probe_failed"),
+        (NodeStatus::IdentityMismatch, "identity_mismatch"),
+        (NodeStatus::Unsupported, "unsupported"),
+    ] {
+        assert_eq!(
+            serde_json::to_string(&status).unwrap(),
+            format!("\"{text}\"")
+        );
+    }
+    for (standing, text) in [
+        (MemberStanding::Active, "active"),
+        (MemberStanding::Draining, "draining"),
+        (MemberStanding::Denied, "denied"),
+    ] {
+        assert_eq!(
+            serde_json::to_string(&standing).unwrap(),
+            format!("\"{text}\"")
+        );
+    }
+    let plain = ErrorBody {
+        error: "no".to_owned(),
+        code: "x".to_owned(),
+        verified: None,
+    };
+    assert_eq!(
+        serde_json::to_string(&plain).unwrap(),
+        r#"{"error":"no","code":"x"}"#
+    );
+    let with: ErrorBody =
+        serde_json::from_str(r#"{"error":"no","code":"probe_failed","verified":{"ok":false,"put":true,"get":false,"delete":false,"conditional_put":false}}"#)
+            .unwrap();
+    assert!(with.verified.is_some_and(|v| v.put && !v.get));
+}
+
+// Catches a verify body that takes a field it ignores (a typo would pass silently), and
+// answers that lose a field in a round trip.
+#[test]
+fn the_verify_body_and_the_small_answers_round_trip() {
+    let empty: VerifyRequest = serde_json::from_str("{}").unwrap();
+    assert_eq!(empty, VerifyRequest::default());
+    let some: VerifyRequest = serde_json::from_str(r#"{"bucket":"b","prefix":"p/"}"#).unwrap();
+    assert_eq!(
+        (some.bucket.as_deref(), some.prefix.as_deref()),
+        (Some("b"), Some("p/"))
+    );
+    assert!(serde_json::from_str::<VerifyRequest>(r#"{"bukket":"b"}"#).is_err());
+
+    let answers = (
+        VerifyAnswer {
+            name: "c1".parse().unwrap(),
+            verified: Verified::default(),
+        },
+        BindingPutAnswer {
+            role: BindingRole::Cold,
+            generation: 3,
+            changed: false,
+            verified: None,
+        },
+        Deleted { generation: 9 },
+        AuditList {
+            entries: Vec::new(),
+        },
+        ConnectionList {
+            connections: Vec::new(),
+        },
+    );
+    assert_eq!(
+        serde_json::from_str::<VerifyAnswer>(&serde_json::to_string(&answers.0).unwrap()).unwrap(),
+        answers.0
+    );
+    assert_eq!(
+        serde_json::from_str::<BindingPutAnswer>(&serde_json::to_string(&answers.1).unwrap())
+            .unwrap(),
+        answers.1
+    );
+    assert_eq!(
+        serde_json::from_str::<Deleted>(&serde_json::to_string(&answers.2).unwrap()).unwrap(),
+        answers.2
+    );
+    assert_eq!(
+        serde_json::from_str::<AuditList>(&serde_json::to_string(&answers.3).unwrap()).unwrap(),
+        answers.3
+    );
+    assert_eq!(
+        serde_json::from_str::<ConnectionList>(&serde_json::to_string(&answers.4).unwrap())
+            .unwrap(),
+        answers.4
+    );
+    let status = Status {
+        generation: 1,
+        connections: Vec::new(),
+        bindings: Vec::new(),
+        convergence: Convergence::of(
+            1,
+            vec![node("a", MemberStanding::Active, Some(1), NodeStatus::Ok)],
+        ),
+    };
+    let back: Status = serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
+    assert_eq!(back, status);
 }
