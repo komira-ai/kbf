@@ -1338,14 +1338,12 @@ dependencies = [
  "kbf-segments",
  "kbf-server",
  "kbf-storage",
- "kbf-testkit",
  "kbf-threads",
  "kbf-transfer",
  "kbf-types",
  "prost",
  "rcgen",
  "rustix",
- "serde_json",
  "tokio",
  "tonic",
  "tracing",
@@ -2342,22 +2340,6 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
-]
-
-[[package]]
-name = "kbf-updater"
-version = "0.1.0"
-dependencies = [
- "base64 0.23.1",
- "hex",
- "kbf-host",
- "libc",
- "ring",
- "rustix",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "thiserror",
 ]
 
 [[package]]

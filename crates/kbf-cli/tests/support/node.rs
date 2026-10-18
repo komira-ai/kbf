@@ -1,8 +1,7 @@
 //! What the tests that run a node binary share: its certificates, the stand-in
 //! `crun` and cgroup tree its container driver runs over, and the checks of what is
-//! on its disk. Used by this crate's tests/binary.rs and by kbf-cli's
-//! tests/storage_and_daemon.rs (through `#[path]`: a test can run only its own
-//! package's binaries, so each package that runs a node has a test of its own).
+//! on its disk. Used by tests/all_in_one.rs, tests/storage_and_daemon.rs and
+//! tests/rehearsal_in_a_box.rs (through `#[path]`: each is a test crate of its own).
 
 #![allow(dead_code)] // Each test binary uses its own part of this module.
 
@@ -43,7 +42,9 @@ pub(crate) fn scratch_root() -> std::path::PathBuf {
 /// A CA, the node's certificate (`node-1`, its one DNS name, the daemon role its worker
 /// session needs on the worker listener, and clientAuth, the daemon row of the farm's
 /// table), the server's (`localhost`: role `storage` and both key usages, the storage row,
-/// which is also what the in-process scheduler presents as a TLS server), and a storage
+/// which is also what the in-process scheduler presents as a TLS server), the frontend's
+/// (`frontend.pem`: `localhost`, role `frontend` and both key usages, which `kbf
+/// all-in-one` wants on its worker listener), and a storage
 /// client's (`client.pem`, naming the role `frontend` as a storage listener under mutual
 /// TLS requires), written into `dir`; every key private to this user, as `kbf`'s startup
 /// self-checks want them.
@@ -52,14 +53,22 @@ pub(crate) fn pki(dir: &Path) {
     ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("key")).expect("CA");
     std::fs::write(dir.join("ca.pem"), ca.pem()).expect("write");
-    for (name, dns) in [("node", "node-1"), ("server", "localhost")] {
+    for (name, dns) in [
+        ("node", "node-1"),
+        ("server", "localhost"),
+        ("frontend", "localhost"),
+    ] {
         let key = KeyPair::generate().expect("key");
         let mut params = CertificateParams::new(vec![dns.to_owned()]).expect("params");
         let (role, ekus) = if name == "node" {
             ("daemon", vec![ExtendedKeyUsagePurpose::ClientAuth])
         } else {
             (
-                "storage",
+                if name == "server" {
+                    "storage"
+                } else {
+                    "frontend"
+                },
                 vec![
                     ExtendedKeyUsagePurpose::ServerAuth,
                     ExtendedKeyUsagePurpose::ClientAuth,

@@ -177,7 +177,7 @@ async fn metrics_count_what_the_reapi_listener_serves() {
 }
 
 /// Catches the one cache's fill missing from `/metrics` on a process that has one
-/// (`kbf-all-in-one`), a gauge that reads one half for the other, and a fill that is not
+/// (`kbf all-in-one`), a gauge that reads one half for the other, and a fill that is not
 /// each half once: with the input cache holding 30 bytes and local storage 7, the
 /// gauges say 30, 7 and 37, read when scraped.
 #[tokio::test]
