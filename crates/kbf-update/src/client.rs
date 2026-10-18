@@ -312,6 +312,11 @@ impl Shared {
         let Some(verb) = order.verb else {
             return Decision::Refused(format!("order {id} names no verb"));
         };
+        if verb == Verb::FrontendUpdate {
+            return Decision::Refused(format!(
+                "order {id} is a frontend update, which a node does not take from the session"
+            ));
+        }
         let Some(report) = core.report() else {
             return Decision::Refused(
                 "no update installer reports on this host, so it cannot take an order".to_owned(),
@@ -367,7 +372,8 @@ impl Shared {
                 });
             }
             Verb::Revert => core.gate = None,
-            Verb::Confirm => {}
+            // Refused above, before anything is written.
+            Verb::Confirm | Verb::FrontendUpdate => {}
         }
         Decision::Accepted
     }

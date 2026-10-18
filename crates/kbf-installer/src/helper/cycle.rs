@@ -346,7 +346,12 @@ impl<E: Exec> Helper<E> {
                     // The same epoch and an id not above the last: a replay, dropped silently.
                 } else {
                     self.act(&o, now, memory)?;
-                    memory.acknowledge(kind, o.epoch, o.id);
+                    // A frontend update refused because this host has no frontend set up
+                    // is not taken: like any refusal of a record by the reader, it moves no
+                    // floor, so the next real order still runs.
+                    if o.verb != Verb::FrontendUpdate || self.frontend.is_some() {
+                        memory.acknowledge(kind, o.epoch, o.id);
+                    }
                 }
             }
             // Not acknowledged: a garbage file must not move the floor.

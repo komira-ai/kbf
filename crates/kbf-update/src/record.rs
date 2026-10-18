@@ -79,6 +79,8 @@ pub struct OrderRecord {
 pub enum RecordError {
     #[error("commit {0:?} is not 40 lowercase hex digits")]
     Commit(String),
+    #[error("a node never writes a frontend_update record")]
+    NotForNodes,
     #[error("an activation names no release component")]
     NoComponents,
     #[error("a {0} order carries components or expected facts")]
@@ -123,12 +125,15 @@ impl OrderRecord {
     /// # Errors
     /// An activation without an offer, with an offer that carries no expected facts or an
     /// attestation that is not text, or a record that would be too large; any record
-    /// that fails [`check`](Self::check).
+    /// that fails [`check`](Self::check). A frontend update, which a node never writes.
     pub fn for_order(
         order: &Order,
         verb: Verb,
         offer: Option<&Offer>,
     ) -> Result<Self, RecordError> {
+        if verb == Verb::FrontendUpdate {
+            return Err(RecordError::NotForNodes);
+        }
         let (components, expected) = match (verb, offer) {
             (Verb::Activate, Some(offer)) => {
                 let components = offer
@@ -206,7 +211,8 @@ impl OrderRecord {
 
     /// The shape rules both ends hold: a full commit; an activation names its components
     /// (each within the offer's limits) and the expected facts, every one there (a release
-    /// the frontend never preflighted is not activated); the other verbs carry neither.
+    /// the frontend never preflighted is not activated); a frontend update names its
+    /// components and may leave the facts out; the other verbs carry neither.
     ///
     /// # Errors
     /// The first rule broken.
@@ -214,7 +220,7 @@ impl OrderRecord {
         if !is_hex(&self.commit, 40) {
             return Err(RecordError::Commit(self.commit.clone()));
         }
-        if self.verb != Verb::Activate {
+        if !matches!(self.verb, Verb::Activate | Verb::FrontendUpdate) {
             if !self.components.is_empty() || self.expected.is_some() {
                 return Err(RecordError::Unexpected(self.verb.name()));
             }
@@ -227,8 +233,15 @@ impl OrderRecord {
         for c in &self.components {
             check_component(&c.name, &c.sha256, c.size, c.attestation.len(), &mut seen)?;
         }
+        // The expected facts are the fail-closed claim of an activation. A frontend update
+        // is built from the frontend's own release store, which holds none: optional there,
+        // and complete when given.
         let Some(f) = &self.expected else {
-            return Err(RecordError::NoFacts);
+            return if self.verb == Verb::FrontendUpdate {
+                Ok(())
+            } else {
+                Err(RecordError::NoFacts)
+            };
         };
         if f.platform.is_empty() || f.profile.is_empty() {
             return Err(RecordError::Facts("no platform or profile".to_owned()));
@@ -337,6 +350,78 @@ mod tests {
             OrderRecord::for_order(&o, Verb::Activate, Some(&good_offer())).expect("ok");
         record.components[0].attestation = "a".repeat(2 << 20);
         assert!(matches!(record.to_bytes(), Err(RecordError::TooLarge(_))));
+    }
+
+    /// The golden fixture of a `frontend_update` record: the exact bytes the frontend's writer
+    /// and the installer's reader agree on. Facts are optional for it and complete when
+    /// present; an activation without them is refused (fail closed).
+    ///
+    /// Mutant planted: the exemption widened to every verb (the activation is then accepted).
+    #[test]
+    fn a_frontend_update_record_is_the_golden_bytes_and_its_facts_are_optional() {
+        let sha = "ab".repeat(32);
+        let golden = format!(
+            "{{\"order_id\":5,\"epoch\":2,\"generation\":9,\"verb\":\"frontend_update\",\"commit\":\"{COMMIT}\",\"window_s\":600,\"components\":[{{\"name\":\"kbf\",\"sha256\":\"{sha}\",\"size\":1000,\"attestation\":\"{{}}\"}}]}}"
+        );
+        let record = OrderRecord::parse(golden.as_bytes()).expect("parses without facts");
+        assert_eq!(record.verb, Verb::FrontendUpdate);
+        assert!(record.expected.is_none());
+        assert_eq!(record.to_bytes().expect("bytes"), golden.as_bytes());
+        // The same record as an activation has no claims to stand on.
+        let as_activate = golden.replace("frontend_update", "activate");
+        assert_eq!(
+            OrderRecord::parse(as_activate.as_bytes()),
+            Err(RecordError::NoFacts)
+        );
+        // Given, the facts are held to the same rules.
+        let with_bad_facts = golden.replace(
+            "}]}",
+            "}],\"expected\":{\"platform\":\"linux-x86_64\",\"protocol\":0,\"min_protocol\":0,\"state_schema\":3,\"profile\":\"release\"}}",
+        );
+        assert!(matches!(
+            OrderRecord::parse(with_bad_facts.as_bytes()),
+            Err(RecordError::Facts(_))
+        ));
+    }
+
+    /// Catches a node writing a frontend update: `for_order` refuses that verb whatever
+    /// offer it is given, no wire verb value maps to it, and the word is the contract's
+    /// `frontend_update` in a record (which the reader, not this crate's writer, takes).
+    ///
+    /// Mutants planted: the guard in `for_order` removed; the wire's catch-all arm made to
+    /// map to it.
+    #[test]
+    fn a_node_never_writes_a_frontend_update() {
+        let o = order(COMMIT);
+        assert_eq!(
+            OrderRecord::for_order(&o, Verb::FrontendUpdate, Some(&good_offer())).unwrap_err(),
+            RecordError::NotForNodes
+        );
+        assert_eq!(
+            OrderRecord::for_order(&o, Verb::FrontendUpdate, None).unwrap_err(),
+            RecordError::NotForNodes
+        );
+        for value in -2..=100 {
+            let mapped = Order::from(kbf_proto::update::UpdateOrder {
+                verb: value,
+                commit: COMMIT.to_owned(),
+                ..Default::default()
+            });
+            assert_ne!(mapped.verb, Some(Verb::FrontendUpdate), "wire verb {value}");
+        }
+        // The word, as the reader sees it from the frontend's own writer.
+        let mut by_hand =
+            OrderRecord::for_order(&o, Verb::Activate, Some(&good_offer())).expect("ok");
+        by_hand.verb = Verb::FrontendUpdate;
+        let text = String::from_utf8(by_hand.to_bytes().expect("bytes")).expect("text");
+        assert!(text.contains("\"verb\":\"frontend_update\""), "{text}");
+        assert_eq!(
+            OrderRecord::parse(text.as_bytes()).expect("parses"),
+            by_hand
+        );
+        // A frontend update carries claims like an activation; without them it is refused.
+        by_hand.components.clear();
+        assert_eq!(by_hand.check(), Err(RecordError::NoComponents));
     }
 
     /// Catches a reader that accepts what the writer never makes: an extra key (a path or a

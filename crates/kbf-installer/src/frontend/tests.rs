@@ -648,6 +648,12 @@ fn an_installer_without_a_frontend_refuses_the_record() {
     );
     assert!(w.asked().is_empty());
     assert_eq!(w.left(), 0);
+
+    // The refusal moved no floor: a lower id, once the host is set up, is taken.
+    let mut set_up = w.helper();
+    w.put(&record(3, 1, 2, B));
+    pass(&mut set_up, 1);
+    assert_eq!(w.asked(), ["start b"]);
 }
 
 /// Catches the node path and the frontend path touching one another. A node `activate`

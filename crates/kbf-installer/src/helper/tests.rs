@@ -1036,3 +1036,77 @@ fn a_revert_with_nothing_to_go_back_to_is_refused() {
     assert_eq!(rig.state().current, Some(c(A)));
     assert_eq!(rig.restarts(), 0);
 }
+
+/// Catches a frontend update on an installer with no frontend set up crashing the reader or
+/// moving the floor: the record parses (it carries claims like an activation), is refused in
+/// status.json ("this installer was not set up"), changes nothing, is removed, and does not
+/// advance the acknowledged id or epoch, so a real order of a lower id in the same epoch
+/// still runs. (The frontend floor is held in `frontend::tests`.)
+#[test]
+fn a_frontend_update_record_without_a_frontend_is_refused_and_moves_no_floor() {
+    let mut rig = Rig::new("frontend-update");
+    let mut r = rig.rec(9, 1, 1, Verb::Activate, B);
+    r.verb = Verb::FrontendUpdate;
+    rig.put(&r);
+    rig.cycle(T0);
+    assert_eq!(rig.status()["state"], "refused");
+    assert!(
+        rig.refusal()
+            .contains("frontend_update: this installer was not set up"),
+        "{}",
+        rig.refusal()
+    );
+    assert_eq!(rig.status()["acked_order_id"], 0, "the floor did not move");
+    assert_eq!(rig.current(), Some(c(A)));
+    assert_eq!(rig.fetcher.count(), 0);
+    assert_eq!(rig.restarts(), 0);
+    assert_eq!(rig.left(), 0);
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0 + 3);
+    assert_eq!(
+        rig.current(),
+        Some(c(B)),
+        "order 5 is below 9 but 9 was never taken"
+    );
+}
+
+/// Catches the two kinds of order sharing a floor. The node floor is at (1, 7); a frontend
+/// record of the same epoch and a lower id is not a replay of it (it reaches its own
+/// refusal), and with the frontend floor seeded at (1, 7) a node order of id 3 is not
+/// dropped as a replay of the frontend's: each kind is ordered against its own pair.
+///
+/// Mutants planted: the floor taken from the node pair whatever the kind (the frontend
+/// record is dropped silently, and the node order after the seeded frontend floor too).
+#[test]
+fn node_and_frontend_orders_have_separate_floors() {
+    let mut rig = Rig::new("floors-per-kind");
+    rig.order(7, Verb::Confirm, A);
+    rig.cycle(T0);
+    assert_eq!(rig.status()["acked_order_id"], 7);
+    let mut r = rig.rec(3, 1, 1, Verb::Activate, B);
+    r.verb = Verb::FrontendUpdate;
+    rig.put(&r);
+    rig.cycle(T0 + 3);
+    assert!(
+        rig.refusal()
+            .contains("frontend_update: this installer was not set up"),
+        "a lower id of another kind is not a replay: {}",
+        rig.refusal()
+    );
+
+    let mut rig = Rig::new("floors-per-kind-reverse");
+    let path = rig.root.join("var/lib/kbf-deploy/helper.json");
+    let mut memory: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("memory")).expect("json");
+    memory["frontend_epoch"] = 1.into();
+    memory["frontend_order_id"] = 7.into();
+    fs::write(&path, serde_json::to_vec(&memory).expect("json")).expect("seed");
+    rig.order(3, Verb::Activate, B);
+    rig.cycle(T0);
+    assert_eq!(
+        rig.current(),
+        Some(c(B)),
+        "the node order is above the node floor"
+    );
+    assert_eq!(rig.status()["acked_order_id"], 3);
+}
