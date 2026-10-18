@@ -483,10 +483,13 @@ impl<E: Exec> Helper<E> {
                 "order {id}: an activation carries no release claims"
             ));
         };
-        let (prefix, needs) = match self.host.platform() {
-            Platform::Linux => ("linux-", ["kbf"].as_slice()),
-            Platform::MacOs => ("darwin-", ["kbf-daemon"].as_slice()),
+        // `kbf` is the one component a release of either platform carries that an order may
+        // name (a Mac is given no `kbf-daemon`).
+        let prefix = match self.host.platform() {
+            Platform::Linux => "linux-",
+            Platform::MacOs => "darwin-",
         };
+        let needs = ["kbf"].as_slice();
         if !claims.platform.starts_with(prefix) {
             return Err(format!(
                 "order {id} is for platform {:?}, not this host's ({prefix}*)",

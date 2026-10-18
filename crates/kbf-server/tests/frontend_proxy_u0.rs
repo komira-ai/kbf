@@ -20,7 +20,8 @@ use std::time::Duration;
 use hooked::Hooked;
 use kbf_history::{IndexRoot, InvKey, WriterId};
 use kbf_server::members::{
-    Members, MembershipConfig, PROTOCOL, Progress, Registrant, Registration,
+    Members, MembershipConfig, MembershipError, OLDEST_PROTOCOL, PROTOCOL, Progress, Registrant,
+    Registration,
 };
 use kbf_server::{StateStoreUri, members_rpc};
 use kbf_state::{Cond, Fenced, GENERATION, Store, StoreError, Txn};
@@ -237,28 +238,60 @@ fn an_ordinary_write_cannot_pass_a_takeover() {
 
 // ---- (e) the member-map floor of a fresh store -----------------------------------------
 
-/// Design section 9: "today a fresh map starts at the frontend's own `PROTOCOL`". True: the
-/// first map of an empty store carries `min_protocol == PROTOCOL` (`members.rs`,
-/// `current.map_or(PROTOCOL, Map::min_protocol)`). Pins it, so the U9 fix (an operator-set
-/// floor) has a test to turn: once the build's `PROTOCOL` is above the oldest node's, a
-/// fresh store locks that node out, because `register` also refuses
-/// `protocol < PROTOCOL` (the build's constant, not the map's floor). No `oldest_protocol`
-/// exists in the code, so rule R1 has nothing to compare yet.
+/// Design section 9 (the fix of U9): the first map of an empty store carries the OLDEST
+/// protocol the build accepts, not the build's own `PROTOCOL`, so a fresh store plus the nodes
+/// of release N re-enrolling against a frontend that speaks one number higher locks nobody out
+/// (this test replaced one that pinned the first map's floor at `PROTOCOL`). Every constant is
+/// 1 today, so the build is stood in for: it accepts from protocol 2 (and `PROTOCOL` is 1).
+/// A node that speaks 2 is in and the map's floor is 2; a node that speaks 1 is refused,
+/// naming 2. Catches the floor of the first map, or the verdict of `register`, coming from the
+/// constant (1) and not from the build's oldest.
 #[test]
-fn a_fresh_stores_first_map_floor_is_the_builds_own_protocol() {
+fn a_fresh_stores_first_map_floor_is_the_oldest_protocol_the_build_accepts() {
+    let store = Hooked::new();
+    let members = Members::with_oldest_protocol(
+        Arc::clone(&store.fake) as Arc<dyn Store>,
+        config(),
+        PROTOCOL + 1,
+    );
+    let at = Registrant {
+        protocol: PROTOCOL + 1,
+        ..registrant("node-1")
+    };
+    let first = members.register(&at).expect("register");
+    assert_eq!(first.map.min_protocol(), PROTOCOL + 1);
+    let refused = members
+        .register(&registrant("node-2"))
+        .expect_err("below the floor");
+    assert!(
+        matches!(
+            refused,
+            MembershipError::Protocol { got, min } if (got, min) == (PROTOCOL, PROTOCOL + 1)
+        ),
+        "{refused}"
+    );
+}
+
+/// The same fact for a build as it ships, with its own constants: the first map's floor is
+/// `OLDEST_PROTOCOL`, and a node below it is refused naming it. Equal to `PROTOCOL` today, so
+/// it cannot tell the two apart yet; it goes red at the first release that raises `PROTOCOL`
+/// and leaves `OLDEST_PROTOCOL` where it is, if `Members::new` is ever given the wrong one.
+#[test]
+fn a_build_as_shipped_floors_its_first_map_at_its_oldest_protocol() {
     let store = Hooked::new();
     let members = Members::new(Arc::clone(&store.fake) as Arc<dyn Store>, config());
     let first = members.register(&registrant("node-1")).expect("register");
-    assert_eq!(first.map.min_protocol(), PROTOCOL);
+    assert_eq!(first.map.min_protocol(), OLDEST_PROTOCOL);
     let below = Registrant {
-        protocol: PROTOCOL - 1,
+        protocol: OLDEST_PROTOCOL - 1,
         ..registrant("node-2")
     };
     let refused = members.register(&below).expect_err("below the floor");
     assert!(
         matches!(
             refused,
-            kbf_server::members::MembershipError::Protocol { got: 0, min: 1 }
+            MembershipError::Protocol { got, min }
+                if (got, min) == (OLDEST_PROTOCOL - 1, OLDEST_PROTOCOL)
         ),
         "{refused}"
     );

@@ -63,14 +63,9 @@ fn one_pass_reports_the_host_and_a_refused_order() {
             ..State::default()
         })
         .expect("state");
-    fs::create_dir_all(root.join("var/lib/kbf-installer/releases").join(A)).expect("release");
-    fs::write(
-        root.join("var/lib/kbf-installer/releases")
-            .join(A)
-            .join("kbf"),
-        b"x",
-    )
-    .expect("binary");
+    let release = host.join(&host.release_dir(&c(A)));
+    fs::create_dir_all(&release).expect("release");
+    fs::write(release.join("kbf"), b"x").expect("binary");
 
     let run = ["run", "--passes", "1", "--unit", "kbf.service"];
     let out = helper(&root, &run);
@@ -112,7 +107,13 @@ fn one_pass_reports_the_host_and_a_refused_order() {
             attestation: "{}".to_owned(),
         }],
         expected: Some(kbf_update::Facts {
-            platform: "linux-x86_64".to_owned(),
+            // The platform of the host the binary was built for.
+            platform: if cfg!(target_os = "macos") {
+                "darwin-arm64"
+            } else {
+                "linux-x86_64"
+            }
+            .to_owned(),
             protocol: 7,
             min_protocol: 6,
             state_schema: 3,
@@ -150,7 +151,7 @@ fn the_boot_check_counts_the_starts_and_reverts_the_last() {
     let root = root("boot");
     let host = layout(&root);
     for commit in [A, B] {
-        let dir = root.join("var/lib/kbf-installer/releases").join(commit);
+        let dir = host.join(&host.release_dir(&c(commit)));
         fs::create_dir_all(&dir).expect("release");
         fs::write(dir.join("kbf"), b"x").expect("binary");
     }
