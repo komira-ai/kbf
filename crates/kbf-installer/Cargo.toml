@@ -1,0 +1,48 @@
+[package]
+name = "kbf-installer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The host side of a kbf release: where a host keeps its releases and its deploy state,
+# the verbs that install, stage, roll back and remove them, and the offline check that
+# decides a release may be staged (docs/design/pull-updates.md). `kbf-deploy host ...`
+# (the manual path) and the root helper that applies updates are both callers, so there
+# is one state file and one layout on a host. Changes a host only through kbf-host's plan
+# of steps. sha2 and hex check what was copied; tar and flate2 unpack a component's
+# tarball; rustix opens the inbox's files without following a link (openat, openat2);
+# libc drops to the unprivileged user between fork and exec of a program that reads
+# untrusted bytes. The `helper` module and the `kbf-installer` binary (verbs `run` and
+# `boot-check`) are the root half of the pull-based updates: they poll the inbox the
+# unprivileged `kbf` writes, stage and swap releases through this crate, restart the one
+# configured service and write the world-readable status.json the node reads. There is no
+# socket and no network, and a staged binary is never run as root.
+
+[features]
+# `testkit`: the scratch host and state helpers other crates' tests of the `host` verbs use.
+testkit = ["kbf-host/testkit"]
+
+[dependencies]
+clap.workspace = true
+flate2.workspace = true
+hex.workspace = true
+kbf-host.workspace = true
+libc.workspace = true
+rustix = { workspace = true, features = ["fs", "process"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+kbf-host = { workspace = true, features = ["testkit"] }
+kbf-installer = { workspace = true, features = ["testkit"] }
+kbf-update.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

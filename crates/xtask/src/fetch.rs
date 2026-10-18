@@ -9,7 +9,7 @@
 //!    byte is unpacked or written: nothing is created on disk.
 //! 3. It is unpacked in memory: as is, from zstd (`--extract zst`), or one regular file
 //!    (`--member`, its path inside the archive) out of a gzip or xz tar
-//!    (`--extract tar.gz`, `--extract tar.xz`).
+//!    (`--extract tar.gz`, `--extract tar.xz`) or a zip (`--extract zip`).
 //! 4. The file is written to `<out>.part` beside `--out`, made executable (0755) and
 //!    renamed over `--out`. When writing or renaming fails, `<out>.part` is removed, so
 //!    `--out` holds either the whole new file or what it held before.
@@ -84,6 +84,9 @@ pub enum Format {
     /// An xz-compressed tar: the file is its `--member`.
     #[value(name = "tar.xz")]
     TarXz,
+    /// A zip archive (deflate or stored): the file is its `--member`.
+    #[value(name = "zip")]
+    Zip,
 }
 
 /// How the installed file comes out of the download.
@@ -96,6 +99,8 @@ pub enum Unpack {
     /// The download is a tar archive, gzip-compressed (`xz: false`) or xz-compressed;
     /// the file is the regular file at `member` in it.
     Tar { xz: bool, member: PathBuf },
+    /// The download is a zip archive; the file is the regular file at `member` in it.
+    Zip { member: PathBuf },
 }
 
 impl Unpack {
@@ -107,11 +112,12 @@ impl Unpack {
             (Some(Format::Zst), None) => Ok(Unpack::Zst),
             (Some(Format::TarGz), Some(member)) => Ok(Unpack::Tar { xz: false, member }),
             (Some(Format::TarXz), Some(member)) => Ok(Unpack::Tar { xz: true, member }),
-            (Some(Format::TarGz | Format::TarXz), None) => {
-                Err("--extract tar.gz and tar.xz need --member, the file to take".to_owned())
+            (Some(Format::Zip), Some(member)) => Ok(Unpack::Zip { member }),
+            (Some(Format::TarGz | Format::TarXz | Format::Zip), None) => {
+                Err("--extract tar.gz, tar.xz and zip need --member, the file to take".to_owned())
             }
-            (_, Some(_)) => Err("--member is a file in a tar: it needs --extract tar.gz or \
-                                 --extract tar.xz"
+            (_, Some(_)) => Err("--member is a file in a tar or a zip: it needs --extract \
+                                 tar.gz, tar.xz or zip"
                 .to_owned()),
         }
     }
@@ -133,6 +139,7 @@ impl Unpack {
                 lzma_rs::xz_decompress(&mut &bytes[..], &mut tar).map_err(unpack_error)?;
                 tar_member(&tar, member)
             }
+            Unpack::Zip { member } => zip_member(bytes, member),
         }
     }
 }
@@ -271,6 +278,25 @@ fn tar_member(tar: &[u8], member: &Path) -> Result<Vec<u8>, Error> {
         return Ok(file);
     }
     Err(Error::NoMember(member.to_owned()))
+}
+
+/// The contents of the regular file at `member` in the zip archive `zip`.
+fn zip_member(zip: &[u8], member: &Path) -> Result<Vec<u8>, Error> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip)).map_err(unpack_error)?;
+    let name = member.to_string_lossy();
+    let mut file = match archive.by_name(&name) {
+        Ok(file) => file,
+        Err(zip::result::ZipError::FileNotFound) => return Err(Error::NoMember(member.to_owned())),
+        Err(e) => return Err(unpack_error(e)),
+    };
+    // `is_file` is false for a directory and for a symbolic link (a file whose Unix type
+    // bits say so).
+    if !file.is_file() {
+        return Err(Error::NotAFile(member.to_owned()));
+    }
+    let mut out = Vec::new();
+    file.read_to_end(&mut out).map_err(unpack_error)?;
+    Ok(out)
 }
 
 #[cfg(test)]
