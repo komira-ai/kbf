@@ -200,12 +200,12 @@ fn clients_are_limited_one_by_one() {
         req.extensions_mut().insert(PeerKey(peer.to_owned()));
         req
     };
-    assert_eq!(r.auth.authorize(&from("10.0.0.1")), Ok(Principal::Operator));
+    assert_eq!(r.auth.authorize(&from("peer-a")), Ok(Principal::Operator));
     assert!(matches!(
-        r.auth.authorize(&from("10.0.0.1")),
+        r.auth.authorize(&from("peer-a")),
         Err(Denied::RateLimited { .. })
     ));
-    assert_eq!(r.auth.authorize(&from("10.0.0.2")), Ok(Principal::Operator));
+    assert_eq!(r.auth.authorize(&from("peer-b")), Ok(Principal::Operator));
 }
 
 #[test]

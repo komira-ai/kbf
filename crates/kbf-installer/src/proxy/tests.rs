@@ -2,6 +2,8 @@
 //! codes, bodies, auth, forwarding, the crash retry through the actor) is in
 //! `router_tests.rs`.
 
+use std::sync::atomic::Ordering;
+
 use hyper::StatusCode;
 
 use super::core::{ApiError, Core, Crash, CrashHook, CrashPoint, Fault, NoCrash, Reply};
@@ -885,4 +887,83 @@ fn a_lost_start_is_revived_once_the_other_update_has_ended() {
     accepted(restarted.abort());
     let (id, phase) = accepted(restarted.post(req(B, "r1")));
     assert_eq!((id.0.as_str(), phase), ("upd-1", Phase::Accepted));
+}
+
+#[test]
+fn since_moves_with_each_phase_change_the_api_owns() {
+    let rig = Rig::new("u8a-since");
+    let (mut core, _) = started(&rig);
+    let accepted_at = body(&mut core).since.expect("a since");
+    // Nothing changed: reading again keeps the time the phase began.
+    rig.clock.0.store(5_000, Ordering::SeqCst);
+    assert_eq!(body(&mut core).since, Some(accepted_at));
+    // accepted -> fetching
+    rig.set_status(InstallerStatus {
+        state: InstallerState::Fetching,
+        ..idle()
+    });
+    let s = body(&mut core);
+    assert_eq!(s.phase, Some(Phase::Fetching));
+    assert_eq!(s.since, Some(accepted_at + 5));
+    // Still fetching: the time stays.
+    rig.clock.0.store(9_000, Ordering::SeqCst);
+    assert_eq!(body(&mut core).since, Some(accepted_at + 5));
+    // fetching -> failed (the installer refused our order)
+    rig.set_status(InstallerStatus {
+        state: InstallerState::Refused,
+        refusal: "disk_full: no room".to_owned(),
+        acked_order_id: 101,
+        ..idle()
+    });
+    let s = body(&mut core);
+    assert_eq!(s.phase, Some(Phase::Failed));
+    assert_eq!(s.since, Some(accepted_at + 9));
+}
+
+#[test]
+fn a_revived_request_is_checked_again_like_a_new_one() {
+    type Break = fn(&Rig);
+    let cases: [(&str, Break, &str); 4] = [
+        (
+            "same",
+            |r| r.sup.0.lock().unwrap().status.running = Some(c(B)),
+            "same_commit",
+        ),
+        (
+            "compat",
+            |r| {
+                *r.gate.before.lock().unwrap() = Compat::Incompatible {
+                    rule: "R1".to_owned(),
+                }
+            },
+            "incompatible",
+        ),
+        (
+            "busy",
+            |r| {
+                r.set_status(InstallerStatus {
+                    state: InstallerState::Fetching,
+                    ..idle()
+                })
+            },
+            "installer_busy",
+        ),
+        (
+            "draining",
+            |r| r.sup.0.lock().unwrap().status.old_child_draining = true,
+            "old_child_draining",
+        ),
+    ];
+    for (name, brk, code) in cases {
+        let rig = Rig::new(&format!("u8a-revive-check-{name}"));
+        *rig.die.lock().unwrap() = Some(CrashPoint::AfterRequestSaved);
+        assert_eq!(rig.core().post(req(B, "r1")), Err(Fault::Crash), "{name}");
+        brk(&rig);
+        let e = refused(rig.core().post(req(B, "r1")));
+        assert_eq!(e.code, code, "{name}");
+        assert!(
+            written(&rig).is_empty(),
+            "{name}: no order for a refused revival"
+        );
+    }
 }
