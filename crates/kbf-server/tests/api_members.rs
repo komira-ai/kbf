@@ -3,10 +3,13 @@
 
 #[path = "support/hooked.rs"]
 mod hooked;
+#[path = "support/looks.rs"]
+mod looks;
 mod support;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use hooked::Hooked;
@@ -26,6 +29,11 @@ use tokio::net::TcpStream;
 const TTL: Duration = Duration::from_secs(30);
 const DWELL: Duration = Duration::from_secs(120);
 
+/// The tick of every server here: one that does not come within a test. The update controller
+/// looks at every tick, and its reads of the store meet the faults that a test arms for a
+/// request (`support/looks.rs` says why). No test here waits for a tick.
+const TICK: Duration = Duration::from_secs(3600);
+
 fn config() -> MembershipConfig {
     MembershipConfig {
         ttl: TTL,
@@ -43,7 +51,7 @@ fn listeners() -> Listeners {
         worker_tls: None,
         heartbeat_interval: INTERVAL,
         hello_wait: HELLO_WAIT,
-        tick: Duration::from_millis(50),
+        tick: TICK,
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
@@ -289,35 +297,36 @@ async fn members_is_read_like_nodes_and_takes_no_write() {
     assert_eq!(code, 405);
 }
 
+/// The reads of `(update/desired, deny/)` the server makes by itself as it starts, with no
+/// release store: the update controller reads `update/desired` once (no release is desired),
+/// and the sweeper's refresh reads `deny/` ([`looks::Looks`]). A test that arms a fault first
+/// waits for them; the test at the end holds the numbers.
+const START_LOOKS: (usize, usize) = (1, 1);
+
 /// A server whose state store is the hooked fake, which the test makes fail.
-fn failing() -> (Arc<Hooked>, Server) {
-    let hooked = Hooked::new();
+fn failing(hooked: &Arc<Hooked>) -> Server {
     let state = StateStore {
-        store: Arc::clone(&hooked) as Arc<dyn Store>,
+        store: Arc::clone(hooked) as Arc<dyn Store>,
         epoch: EpochPolicy::Keep,
         members: config(),
         history: None,
     };
-    (hooked, start(Some(state)))
+    start(Some(state))
 }
 
-/// The error `GET /v1/members` answers once `arm` has set a fault. The server reads the
-/// store on its own timers too, and one of those reads can take the armed fault first;
-/// the fault is armed again until the request itself meets it.
+/// The error `GET /v1/members` answers once `arm` has set a fault. The fault is for the
+/// request: the server's own readers of the store have read all they do at start, which
+/// the caller has waited for (`START_LOOKS`), and not again within the test (`TICK` and the
+/// sweeper's beat).
 async fn error_of(api: SocketAddr, arm: impl Fn()) -> (u16, String) {
-    for _ in 0..200 {
-        arm();
-        let (code, _, body) = http(api, "GET", "/v1/members", "").await;
-        if code != 200 {
-            let why = serde_json::from_str::<Value>(&body).expect("JSON")["error"]
-                .as_str()
-                .expect("an error")
-                .to_owned();
-            return (code, why);
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("the fault never reached the request");
+    arm();
+    let (code, _, body) = http(api, "GET", "/v1/members", "").await;
+    assert_ne!(code, 200, "the fault never reached the request: {body}");
+    let why = serde_json::from_str::<Value>(&body).expect("JSON")["error"]
+        .as_str()
+        .expect("an error")
+        .to_owned();
+    (code, why)
 }
 
 /// Catches a store that cannot be read answered as an empty farm or as a server bug:
@@ -327,7 +336,10 @@ async fn error_of(api: SocketAddr, arm: impl Fn()) -> (u16, String) {
 /// is gone.
 #[tokio::test]
 async fn a_store_that_fails_is_503_and_a_map_that_is_wrong_or_a_panic_is_500() {
-    let (hooked, server) = failing();
+    let hooked = Hooked::new();
+    let looks = looks::Looks::count(&hooked);
+    let server = failing(&hooked);
+    looks.done(START_LOOKS).await;
 
     let (code, why) = error_of(server.api, || {
         hooked
@@ -358,4 +370,26 @@ async fn a_store_that_fails_is_503_and_a_map_that_is_wrong_or_a_panic_is_500() {
         .expect("no conflict");
     let (code, why) = error_of(server.api, || ()).await;
     assert_eq!(code, 500, "{why}");
+}
+
+/// Catches the wait of `Looks::done` being wrong, which the failing-store test above cannot
+/// show by itself (it would flake, or hang): the server's own reads of `update/desired` and
+/// `deny/` are `START_LOOKS` at start, and it reads nothing at all by itself after the wait,
+/// for as long as a test runs. A reader added beside the controller and the sweeper, a read
+/// added to one's look, or a tick that comes, makes the total more, and a fault armed after
+/// the wait would be met by one of them and not by its request; a read fewer makes a count
+/// less, and the wait never ends.
+///
+/// Mutants seen red: `START_LOOKS` of `(0, 1)` and of `(1, 0)` (the counts after the wait).
+#[tokio::test]
+async fn the_server_reads_the_store_by_itself_only_at_start() {
+    let hooked = Hooked::new();
+    let looks = looks::Looks::count(&hooked);
+    let every_read = hooked.count("");
+    let _server = failing(&hooked);
+    looks.done(START_LOOKS).await;
+    let at_start = every_read.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(looks.seen(), START_LOOKS);
+    assert_eq!(every_read.load(Ordering::SeqCst), at_start);
 }

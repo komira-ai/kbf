@@ -339,14 +339,30 @@ fn check_exits_0_2_or_75_in_every_mode_and_starts_nothing() {
 /// clap's message, and the problem of the file is the one printed.
 #[test]
 fn check_refuses_what_a_start_refuses() {
-    let r = run(&strings(&["daemon", "--check"]));
+    // A mode given none of its flags reads the host's file: with no file there, the file
+    // is what the refusal names (a list of every missing flag would send the operator to
+    // the wrong place). With some of its flags, the flags are the start.
+    let none = scratch("check-no-file").join("absent.toml");
+    let r = run(&strings(&[
+        "daemon",
+        "--check",
+        "--config",
+        &none.display().to_string(),
+    ]));
+    assert_eq!(r.code, Some(2), "{}", r.err);
+    assert!(
+        r.err.contains("cannot read") && r.err.contains("absent.toml"),
+        "{}",
+        r.err
+    );
+    assert!(r.out.is_empty());
+    let r = run(&strings(&["daemon", "--check", "--node-id=n"]));
     assert_eq!(r.code, Some(2), "{}", r.err);
     assert!(
         r.err.contains("required arguments were not provided"),
         "{}",
         r.err
     );
-    assert!(r.out.is_empty());
     let r = run(&strings(&["daemon", "--check", "--cold-store=file:///x"]));
     assert_eq!(r.code, Some(2), "{}", r.err);
     assert!(
