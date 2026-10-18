@@ -141,7 +141,9 @@ impl Signer for FileSigner {
 
     fn sign(&self, tbs: &[u8], algorithm: Algorithm) -> Result<Vec<u8>, SignError> {
         let Algorithm::EcdsaP256Sha256 = algorithm;
-        SigningKey::sign(&self.key, tbs).map_err(|e| SignError(e.to_string()))
+        // ring signs with a valid key unless the operating system's random source fails,
+        // which stops the process, as it does for `SystemEntropy`.
+        Ok(SigningKey::sign(&self.key, tbs).expect("the operating system's random source failed"))
     }
 }
 
