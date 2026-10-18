@@ -1196,13 +1196,16 @@ fn a_node_needs_its_oci_runtime() {
     assert!(stderr.contains(&says), "{stderr}");
 
     for runtime in ["oci", "runc"] {
-        let out = Command::new(BIN)
+        let log = ids.join(format!("flag-{runtime}"));
+        let mut child = Command::new(BIN)
             .args(base(&ids))
             .args(["--driver=fake", &format!("--container-runtime={runtime}")])
-            .output()
+            .stderr(std::fs::File::create(&log).expect("stderr file"))
+            .spawn()
             .expect("spawn");
-        assert_eq!(out.status.code(), Some(2), "{runtime}");
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let status = refused_within(&mut child, runtime, &log);
+        assert_eq!(status.code(), Some(2), "{runtime}");
+        let stderr = read(&log);
         assert!(
             stderr.contains("unexpected argument '--container-runtime"),
             "{runtime}: {stderr}"

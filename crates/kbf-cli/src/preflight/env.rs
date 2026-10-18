@@ -53,7 +53,7 @@ fn meta_and_data(meta: &Path, data: &Path, report: &mut Report) {
 }
 
 fn crun(path: &Path, host: &dyn Host, report: &mut Report) {
-    const WHY: &str = "--container-runtime=oci runs every container with it";
+    const WHY: &str = "the container driver runs every container with it";
     let at = path.display();
     let fix = "install crun (1.14 or newer), or point --oci-runtime at it".to_owned();
     match host.stat(path) {
