@@ -39,6 +39,10 @@ pub struct NodeView {
     pub node_id: String,
     /// Whether its newest stream is still open.
     pub connected: bool,
+    /// The `kbf.worker.v1` version its newest stream's first `Hello` named; `None` if
+    /// it named none. It is kept after the stream closes, as the version the node last
+    /// spoke.
+    pub protocol: Option<u32>,
     /// The newest software status it sent; `None` if it sent none (a daemon that
     /// predates `NodeStatus`).
     pub software: Option<SoftwareView>,
@@ -351,15 +355,55 @@ pub struct NodesView {
     pub server: ServerView,
     /// The nodes.
     pub nodes: Vec<NodeView>,
+    /// The oldest protocol version among them, and how many name none.
+    #[serde(flatten)]
+    pub protocols: ProtocolSummary,
 }
 
 impl NodesView {
-    /// `nodes`, as this server build lists them.
+    /// `nodes`, as this server build lists them. The protocol summary covers every node
+    /// listed, connected or not: one whose stream closed may come back on the version it
+    /// last spoke.
     #[must_use]
     pub fn of_this_build(nodes: Vec<NodeView>) -> Self {
         Self {
             server: ServerView::this_build(),
+            protocols: ProtocolSummary::of(nodes.iter().map(|node| node.protocol)),
             nodes,
+        }
+    }
+}
+
+/// What the protocol versions of a list of nodes come to, as the envelope of
+/// `GET /v1/nodes` and of `GET /v1/members` states it: the input of the check that a
+/// release may stop accepting the oldest version (`docs/design/frontend-proxy.md`
+/// section 9, rule R1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ProtocolSummary {
+    /// The least version among the nodes whose version is known; `None` when no node's
+    /// is. A list with an unknown version in it says nothing about that node here, so
+    /// the number alone is not "every node speaks at least this": read it with
+    /// `protocol_unknown`.
+    pub oldest_protocol: Option<u32>,
+    /// How many nodes name no version. They are never counted in `oldest_protocol`.
+    pub protocol_unknown: u32,
+}
+
+impl ProtocolSummary {
+    /// The summary of nodes that speak `protocols` (`None`: names none).
+    #[must_use]
+    pub fn of(protocols: impl IntoIterator<Item = Option<u32>>) -> Self {
+        let (mut oldest, mut unknown) = (None::<u32>, 0_u32);
+        for protocol in protocols {
+            match protocol {
+                // Not `oldest.min(protocol)`: `None` is the least `Option`.
+                Some(version) => oldest = Some(oldest.map_or(version, |o| o.min(version))),
+                None => unknown = unknown.saturating_add(1),
+            }
+        }
+        Self {
+            oldest_protocol: oldest,
+            protocol_unknown: unknown,
         }
     }
 }
@@ -563,6 +607,53 @@ mod tests {
                     licence.attention().expect("item")
                 )
             )]
+        );
+    }
+
+    /// Catches: the greatest version reported as the oldest (`max`), the first or the last
+    /// one listed taken for it (the least is in the middle here, and in a different place
+    /// from the unknown ones), a node that names none folded into the oldest as 0 or as a
+    /// number below every version (`Option`'s order puts `None` first, so a
+    /// `min` over the options themselves reports no version at all whenever one is
+    /// unknown), an unknown node not counted, and a list with no known version reported
+    /// as an oldest version of 0.
+    #[test]
+    fn the_oldest_protocol_ignores_the_unknown_and_counts_them() {
+        let summary = |protocols: &[Option<u32>]| ProtocolSummary::of(protocols.iter().copied());
+        assert_eq!(
+            summary(&[Some(3), Some(2), Some(5)]),
+            ProtocolSummary {
+                oldest_protocol: Some(2),
+                protocol_unknown: 0
+            }
+        );
+        assert_eq!(
+            summary(&[None, Some(4), None, Some(2), Some(9), None]),
+            ProtocolSummary {
+                oldest_protocol: Some(2),
+                protocol_unknown: 3
+            }
+        );
+        assert_eq!(
+            summary(&[None, Some(3)]),
+            ProtocolSummary {
+                oldest_protocol: Some(3),
+                protocol_unknown: 1
+            }
+        );
+        assert_eq!(
+            summary(&[None, None]),
+            ProtocolSummary {
+                oldest_protocol: None,
+                protocol_unknown: 2
+            }
+        );
+        assert_eq!(
+            summary(&[]),
+            ProtocolSummary {
+                oldest_protocol: None,
+                protocol_unknown: 0
+            }
         );
     }
 }

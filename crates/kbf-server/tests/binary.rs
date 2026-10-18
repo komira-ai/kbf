@@ -344,7 +344,8 @@ fn api_listen_serves_the_operator_api() {
     let version = built_version();
     let (_, commit) = version.split_once('+').expect("a + in the version");
     let body = format!(
-        "{{\"server\":{{\"version\":\"{version}\",\"commit\":\"{commit}\"}},\"nodes\":[]}}"
+        "{{\"server\":{{\"version\":\"{version}\",\"commit\":\"{commit}\"}},\"nodes\":[],\
+         \"oldest_protocol\":null,\"protocol_unknown\":0}}"
     );
     assert!(response.ends_with(&format!("\r\n\r\n{body}")), "{response}");
     interrupt(child);
