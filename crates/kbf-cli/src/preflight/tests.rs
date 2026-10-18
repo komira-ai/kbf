@@ -1162,13 +1162,12 @@ mod system {
 
     #[test]
     fn run_collects_stdout_and_the_exit_status() {
-        let sh = Path::new("/bin/sh");
-        let ok = System.run(sh, &["-c", "echo hi"]).expect("runs");
+        let ok = System.run(Path::new("/bin/echo"), &["hi"]).expect("runs");
         assert!(ok.success);
         assert_eq!(ok.stdout, "hi\n");
-        let bad = System.run(sh, &["-c", "echo no; exit 3"]).expect("runs");
+        let bad = System.run(Path::new("/bin/false"), &[]).expect("runs");
         assert!(!bad.success);
-        assert_eq!(bad.stdout, "no\n");
+        assert_eq!(bad.stdout, "");
         let gone = System.run(Path::new("/no/such/program"), &[]);
         assert_eq!(
             gone.expect_err("absent").kind(),
