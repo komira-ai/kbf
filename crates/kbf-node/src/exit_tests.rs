@@ -81,7 +81,7 @@ fn the_flags_say_what_the_daemon_asks_of_its_host() {
     assert_eq!(
         n.container,
         Some(ContainerNeeds {
-            oci_runtime: Some(PathBuf::from("/usr/bin/crun"))
+            oci_runtime: PathBuf::from("/usr/bin/crun")
         })
     );
 
@@ -94,7 +94,7 @@ fn the_flags_say_what_the_daemon_asks_of_its_host() {
     assert_eq!(
         n.container,
         Some(ContainerNeeds {
-            oci_runtime: Some(PathBuf::from("/opt/crun"))
+            oci_runtime: PathBuf::from("/opt/crun")
         })
     );
 }

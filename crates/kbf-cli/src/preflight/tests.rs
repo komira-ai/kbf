@@ -76,18 +76,15 @@ impl Fake {
         self
     }
 
-    /// A host a daemon with the container driver passes on: its certificate files, Podman
-    /// and crun, the user's runtime directory.
+    /// A host a daemon with the container driver passes on: its certificate files and
+    /// crun.
     fn healthy(cert_pem: &str, key_pem: &str, ca_pem: &str) -> Self {
         let mut f = Self::empty()
             .file(CA, 0o644, ca_pem.as_bytes())
             .file(CERT, 0o644, cert_pem.as_bytes())
             .file(KEY, 0o600, key_pem.as_bytes())
-            .file("/usr/bin/podman", 0o755, b"")
             .file(CRUN, 0o755, b"")
-            .put("/run/user/1000", Kind::Dir, ME, 0o700, b"")
-            .var("PATH", "/usr/local/bin:/usr/bin")
-            .var("XDG_RUNTIME_DIR", "/run/user/1000");
+            .var("PATH", "/usr/local/bin:/usr/bin");
         f.programs.insert(
             PathBuf::from(CRUN),
             Ok((true, "crun version 1.14.1\ncommit: abc\n".to_owned())),
@@ -237,7 +234,7 @@ fn daemon_needs() -> Needs {
         s3: false,
         meta_and_data: None,
         container: Some(ContainerNeed {
-            oci_runtime: Some(PathBuf::from(CRUN)),
+            oci_runtime: PathBuf::from(CRUN),
         }),
     }
 }
@@ -787,11 +784,11 @@ fn a_meta_dir_beside_the_data_dir_passes() {
     }
 }
 
-fn container_needs(oci: Option<&str>) -> Needs {
+fn container_needs() -> Needs {
     let mut needs = s3_needs();
     needs.s3 = false;
     needs.container = Some(ContainerNeed {
-        oci_runtime: oci.map(PathBuf::from),
+        oci_runtime: PathBuf::from(CRUN),
     });
     needs
 }
@@ -802,70 +799,10 @@ fn container_host() -> Fake {
 }
 
 #[test]
-fn podman_missing_from_the_path_is_refused() {
-    let host = container_host().without("/usr/bin/podman");
-    only(
-        &check(&container_needs(None), &host),
-        Class::Refused,
-        &["podman", "PATH", "/usr/local/bin:/usr/bin"],
-    );
-}
-
-#[test]
-fn podman_found_on_a_later_path_entry_passes() {
-    let host = container_host()
-        .without("/usr/bin/podman")
-        .file("/opt/podman/bin/podman", 0o755, b"")
-        .var("PATH", "/usr/local/bin:/opt/podman/bin");
-    assert_eq!(check(&container_needs(None), &host), Report::default());
-}
-
-#[test]
-fn podman_that_is_not_executable_is_not_found() {
-    let host = container_host().file("/usr/bin/podman", 0o644, b"");
-    only(
-        &check(&container_needs(None), &host),
-        Class::Refused,
-        &["podman", "PATH"],
-    );
-}
-
-#[test]
-fn a_missing_runtime_directory_variable_is_refused_with_the_linger_fix() {
-    let mut host = container_host();
-    host.vars.remove("XDG_RUNTIME_DIR");
-    only(
-        &check(&container_needs(None), &host),
-        Class::Refused,
-        &["XDG_RUNTIME_DIR", "loginctl enable-linger"],
-    );
-}
-
-#[test]
-fn a_runtime_directory_that_does_not_exist_is_refused_with_the_linger_fix() {
-    let host = container_host().without("/run/user/1000");
-    only(
-        &check(&container_needs(None), &host),
-        Class::Refused,
-        &["/run/user/1000", "does not exist", "loginctl enable-linger"],
-    );
-}
-
-#[test]
-fn a_runtime_directory_of_another_user_is_refused() {
-    let host = container_host().put("/run/user/1000", Kind::Dir, 0, 0o700, b"");
-    only(
-        &check(&container_needs(None), &host),
-        Class::Refused,
-        &["owned by uid 0", "uid 1000"],
-    );
-}
-
-#[test]
 fn a_crun_that_is_not_there_is_refused() {
     let host = container_host().without(CRUN);
     only(
-        &check(&container_needs(Some(CRUN)), &host),
+        &check(&container_needs(), &host),
         Class::Refused,
         &[CRUN, "--oci-runtime", "install"],
     );
@@ -875,7 +812,7 @@ fn a_crun_that_is_not_there_is_refused() {
 fn a_crun_without_the_execute_bit_is_refused() {
     let host = container_host().file(CRUN, 0o644, b"");
     only(
-        &check(&container_needs(Some(CRUN)), &host),
+        &check(&container_needs(), &host),
         Class::Refused,
         &[CRUN, "chmod +x"],
     );
@@ -887,7 +824,7 @@ fn a_crun_that_will_not_report_its_version_is_refused() {
     host.programs
         .insert(PathBuf::from(CRUN), Err(io::ErrorKind::PermissionDenied));
     only(
-        &check(&container_needs(Some(CRUN)), &host),
+        &check(&container_needs(), &host),
         Class::Refused,
         &[CRUN, "--version"],
     );
@@ -895,7 +832,7 @@ fn a_crun_that_will_not_report_its_version_is_refused() {
     host.programs
         .insert(PathBuf::from(CRUN), Ok((false, String::new())));
     only(
-        &check(&container_needs(Some(CRUN)), &host),
+        &check(&container_needs(), &host),
         Class::Refused,
         &[CRUN, "--version"],
     );
@@ -911,11 +848,7 @@ fn a_crun_older_than_the_minimum_is_refused_naming_both_versions() {
         let mut host = container_host();
         host.programs
             .insert(PathBuf::from(CRUN), Ok((true, old.to_owned())));
-        only(
-            &check(&container_needs(Some(CRUN)), &host),
-            Class::Refused,
-            &["1.14"],
-        );
+        only(&check(&container_needs(), &host), Class::Refused, &["1.14"]);
     }
 }
 
@@ -931,7 +864,7 @@ fn a_crun_at_or_above_the_minimum_passes() {
         host.programs
             .insert(PathBuf::from(CRUN), Ok((true, good.to_owned())));
         assert_eq!(
-            check(&container_needs(Some(CRUN)), &host),
+            check(&container_needs(), &host),
             Report::default(),
             "{good}"
         );
@@ -944,7 +877,7 @@ fn a_crun_whose_version_cannot_be_read_is_refused() {
     host.programs
         .insert(PathBuf::from(CRUN), Ok((true, "hello\n".to_owned())));
     only(
-        &check(&container_needs(Some(CRUN)), &host),
+        &check(&container_needs(), &host),
         Class::Refused,
         &["hello"],
     );
@@ -955,83 +888,10 @@ fn a_crun_host_needs_neither_podman_nor_a_runtime_directory() {
     // Catches: a self-check that still asks for the programs and directory of the
     // runtime kbf no longer has (`podman` on PATH, a user runtime directory with linger),
     // refusing every start on a host that has only crun.
-    let mut host = container_host()
-        .without("/usr/bin/podman")
-        .without("/run/user/1000");
-    host.vars.remove("XDG_RUNTIME_DIR");
-    assert_eq!(check(&container_needs(Some(CRUN)), &host), Report::default());
-}
-
-#[test]
-fn podman_as_the_runtime_asks_nothing_of_crun() {
-    let host = container_host().without(CRUN);
-    assert_eq!(check(&container_needs(None), &host), Report::default());
-}
-
-#[test]
-fn an_unset_path_is_said_so_when_podman_is_looked_for() {
-    let mut host = container_host();
-    host.vars.remove("PATH");
-    only(
-        &check(&container_needs(None), &host),
-        Class::Refused,
-        &["podman", "PATH is not set"],
-    );
-}
-
-#[test]
-fn an_empty_path_entry_is_the_current_directory() {
-    let host = container_host()
-        .without("/usr/bin/podman")
-        .file("./podman", 0o755, b"")
-        .var("PATH", "/nowhere:");
-    assert_eq!(check(&container_needs(None), &host), Report::default());
-}
-
-#[test]
-fn a_directory_called_podman_on_the_path_is_not_podman() {
-    let host = container_host().without("/usr/bin/podman").put(
-        "/usr/bin/podman",
-        Kind::Dir,
-        ME,
-        0o755,
-        b"",
-    );
-    only(
-        &check(&container_needs(None), &host),
-        Class::Refused,
-        &["podman", "PATH"],
-    );
-}
-
-#[test]
-fn a_runtime_directory_that_cannot_be_statted_is_classed_by_the_error() {
-    for (kind, class) in [
-        (io::ErrorKind::PermissionDenied, Class::Refused),
-        (io::ErrorKind::TimedOut, Class::NotReady),
-    ] {
-        let mut host = container_host();
-        host.stat_errors
-            .insert(PathBuf::from("/run/user/1000"), kind);
-        only(
-            &check(&container_needs(None), &host),
-            class,
-            &[
-                "XDG_RUNTIME_DIR /run/user/1000 cannot be read",
-                "enable-linger",
-            ],
-        );
-    }
-}
-
-#[test]
-fn a_runtime_directory_that_is_a_file_is_refused() {
-    let host = container_host().file("/run/user/1000", 0o700, b"");
-    only(
-        &check(&container_needs(None), &host),
-        Class::Refused,
-        &["/run/user/1000", "not a directory"],
-    );
+    let host = container_host();
+    assert!(!host.files.contains_key(Path::new("/usr/bin/podman")));
+    assert!(!host.vars.contains_key("XDG_RUNTIME_DIR"));
+    assert_eq!(check(&container_needs(), &host), Report::default());
 }
 
 #[test]
@@ -1043,7 +903,7 @@ fn a_crun_that_cannot_be_statted_is_classed_by_the_error() {
         let mut host = container_host();
         host.stat_errors.insert(PathBuf::from(CRUN), kind);
         only(
-            &check(&container_needs(Some(CRUN)), &host),
+            &check(&container_needs(), &host),
             class,
             &[CRUN, "(--oci-runtime) cannot be read"],
         );
@@ -1054,7 +914,7 @@ fn a_crun_that_cannot_be_statted_is_classed_by_the_error() {
 fn a_crun_that_is_a_directory_is_refused() {
     let host = container_host().put(CRUN, Kind::Dir, ME, 0o755, b"");
     only(
-        &check(&container_needs(Some(CRUN)), &host),
+        &check(&container_needs(), &host),
         Class::Refused,
         &[CRUN, "not a regular file"],
     );
@@ -1097,16 +957,12 @@ fn every_failure_is_reported_together_one_line_each_and_the_start_is_refused() {
         PathBuf::from("/var/lib/kbf/meta"),
         PathBuf::from("/var/lib/kbf"),
     ));
-    let host = host
-        .chmod(KEY, ME, 0o644)
-        .without(CA)
-        .without("/usr/bin/podman")
-        .without(CRUN);
+    let host = host.chmod(KEY, ME, 0o644).without(CA).without(CRUN);
     let report = check(&needs, &host);
     let text = report.render("daemon");
-    // The CA file, the key's mode, the S3 pair (2), the meta dir, podman, crun.
-    assert_eq!(report.problems.len(), 7, "{text}");
-    assert_eq!(text.lines().count(), 7, "{text}");
+    // The CA file, the key's mode, the S3 pair (2), the meta dir, crun.
+    assert_eq!(report.problems.len(), 6, "{text}");
+    assert_eq!(text.lines().count(), 6, "{text}");
     for line in text.lines() {
         assert!(line.starts_with("kbf daemon: "), "{line}");
     }
@@ -1116,7 +972,6 @@ fn every_failure_is_reported_together_one_line_each_and_the_start_is_refused() {
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "--meta-dir",
-        "podman",
         CRUN,
     ] {
         assert!(text.contains(word), "{word} not in {text}");
@@ -1245,21 +1100,14 @@ mod wiring {
         assert_eq!(c.ca, Some(("--ca-cert", PathBuf::from("/c/ca.pem"))));
         assert_eq!(
             n.container.expect("container").oci_runtime,
-            Some(PathBuf::from("/opt/crun"))
+            PathBuf::from("/opt/crun")
         );
         assert!(!n.s3 && n.meta_and_data.is_none());
     }
 
     #[test]
-    fn a_daemon_on_podman_asks_nothing_of_crun_and_a_fake_one_asks_nothing() {
-        let podman: Vec<&str> = DAEMON
-            .iter()
-            .copied()
-            .filter(|f| !f.starts_with("--container-runtime") && !f.starts_with("--oci-runtime"))
-            .collect();
-        let n = with("daemon", &podman, &[]);
-        assert_eq!(n.container.expect("container").oci_runtime, None);
-        let fake: Vec<&str> = podman
+    fn a_fake_driver_asks_nothing_of_the_container_programs() {
+        let fake: Vec<&str> = DAEMON
             .iter()
             .map(|f| {
                 if *f == "--driver=container" {

@@ -83,9 +83,8 @@ pub struct HostNeeds {
 /// What the container driver asks of its host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContainerNeeds {
-    /// `--oci-runtime`, when `--container-runtime=oci` runs the containers itself (the
-    /// program that runs them); `None` when Podman does.
-    pub oci_runtime: Option<PathBuf>,
+    /// `--oci-runtime`: the program that runs the containers.
+    pub oci_runtime: PathBuf,
 }
 
 impl Cli {
@@ -96,7 +95,7 @@ impl Cli {
             .drivers
             .contains(&Driver::Container)
             .then(|| ContainerNeeds {
-                oci_runtime: Some(self.oci_runtime.clone()),
+                oci_runtime: self.oci_runtime.clone(),
             });
         HostNeeds {
             ca_cert: self.daemon.ca_cert.clone(),
