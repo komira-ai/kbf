@@ -352,6 +352,21 @@ Options:
           
           [default: 4]
 
+      --write-pool-writers <WRITE_POOL_WRITERS>
+          The writers of the write pool: the ByteStream and storage `Write`s of a node with a write tier are appended to shared segment files by this many writers, each holding one range open, so the node keeps at most this many block files (plus the open grouped block) open for writing for those blobs, however many uploads are in flight. At least 1
+          
+          [default: 8]
+
+      --write-pool-queue <WRITE_POOL_QUEUE>
+          The most blobs waiting for a write-pool writer. A blob that finds the queue full goes straight to the object store, as one does when the write tier has no room. At least 1
+          
+          [default: 4096]
+
+      --write-pool-stream-idle <WRITE_POOL_STREAM_IDLE>
+          How long, in seconds, a streamed blob may go without sending a chunk before its write-pool writer is taken back and the upload fails UNAVAILABLE (the client sends it again). Without it, a stalled but connected large upload would hold a writer for ever, and with all writers held every other blob would wait. It limits stalls only: an upload that sends a chunk more often than this (a trickle) can still hold a writer. At least 1
+          
+          [default: 30]
+
       --store-put-attempts <STORE_PUT_ATTEMPTS>
           How many times a segment PUT is tried. Only a PUT that did not complete (connect, reset, timeout) or that the store answered 5xx is tried again, after 100 ms and then four times longer each time, under a new object key; if every attempt fails, the segment's blobs are answered UNAVAILABLE
           

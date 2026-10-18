@@ -189,7 +189,6 @@ kbf-front = { path = "crates/kbf-front" }
 kbf-history = { path = "crates/kbf-history" }
 kbf-image = { path = "crates/kbf-image" }
 kbf-host = { path = "crates/kbf-host" }
-kbf-helper = { path = "crates/kbf-helper" }
 kbf-installer = { path = "crates/kbf-installer" }
 kbf-invocation = { path = "crates/kbf-invocation" }
 kbf-it = { path = "crates/kbf-it" }
