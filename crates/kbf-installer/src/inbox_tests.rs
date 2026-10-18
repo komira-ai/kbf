@@ -18,10 +18,17 @@ fn refusal(r: Result<File, Refusal>) -> &'static str {
     r.expect_err("refused").code()
 }
 
-/// Both ways of opening beneath the entry are exercised on every kernel that has
-/// `openat2` (the production choice is `Beneath` there, `NoFollow` elsewhere).
-fn modes() -> [OpenMode; 2] {
-    [OpenMode::Beneath, OpenMode::NoFollow]
+/// Both ways of opening beneath the entry are exercised on Linux, where `openat2` is
+/// (the production choice is `Beneath` there); macOS has no `openat2`, so only the way
+/// it uses is exercised there.
+#[cfg(target_os = "linux")]
+fn modes() -> Vec<OpenMode> {
+    vec![OpenMode::Beneath, OpenMode::NoFollow]
+}
+
+#[cfg(not(target_os = "linux"))]
+fn modes() -> Vec<OpenMode> {
+    vec![OpenMode::NoFollow]
 }
 
 /// Catches a regular file not read back whole: its content comes out by the descriptor.
@@ -197,6 +204,23 @@ fn openat2_is_used_where_the_kernel_has_it() {
         chosen == OpenMode::Beneath,
         cfg!(target_os = "linux") && openat2_works()
     );
+}
+
+/// Catches a platform without `openat2` choosing a way that cannot work: here `openat2` is
+/// refused (`ENOSYS`) and the entry opens by `O_NOFOLLOW`, which still refuses a link.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn where_there_is_no_openat2_the_entry_opens_by_nofollow() {
+    let (dir, entry) = entry_with("inbox-no-openat2", OpenMode::NoFollow);
+    assert_eq!(
+        open_beneath(&entry.dir, "x").expect_err("no openat2"),
+        Errno::NOSYS
+    );
+    assert_eq!(OpenMode::for_entry(&entry.dir), OpenMode::NoFollow);
+    symlink(dir.join("entry"), dir.join("entry/link")).expect("link");
+    let chosen = Entry::open(&dir.join("entry")).expect("opens");
+    assert_eq!(chosen.mode, OpenMode::NoFollow);
+    assert_eq!(refusal(chosen.open_file("link", 100)), "inbox-symlink");
 }
 
 fn openat2_works() -> bool {

@@ -1,0 +1,10 @@
+release_source = "frontend"
+confirm_window_s = 900
+confirm_window_max_s = 1800
+min_generation = 0
+min_protocol = 0
+fetch_timeout_s = 900
+max_component_bytes = 536870912
+min_activation_interval_s = 60
+node_cert = "/etc/kbf/node.crt"
+node_key = "/etc/kbf/node.key"

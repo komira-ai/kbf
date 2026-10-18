@@ -11,6 +11,7 @@ use crate::{Answer, PREFIX, Source};
 
 mod action;
 mod build;
+mod updates;
 
 pub(crate) use action::action;
 #[cfg(test)]
@@ -18,6 +19,9 @@ pub(crate) use action::{ACTION, LOG_SHOWN_MAX_BYTES};
 #[cfg(test)]
 pub(crate) use build::BUILD;
 pub(crate) use build::build;
+#[cfg(test)]
+pub(crate) use updates::UPDATES;
+pub(crate) use updates::updates;
 
 /// Builds: look a build up by id.
 pub(crate) const BUILDS: Page = Page {
@@ -27,7 +31,7 @@ pub(crate) const BUILDS: Page = Page {
 
 /// Every page, for the contract test.
 #[cfg(test)]
-pub(crate) const PAGES: [&Page; 3] = [&BUILDS, &BUILD, &ACTION];
+pub(crate) const PAGES: [&Page; 4] = [&BUILDS, &BUILD, &ACTION, &UPDATES];
 
 /// What a path segment keeps unencoded: RFC 3986's unreserved characters.
 const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
