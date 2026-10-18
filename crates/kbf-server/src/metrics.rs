@@ -25,9 +25,9 @@ use kbf_objstore::ObjectStore;
 use kbf_storage::local_cache::{Fill, LocalCache};
 use kbf_tls::TlsSource;
 
-use crate::listen::Socket;
+use crate::listen::{Binder, Socket};
 use crate::members::Members;
-use crate::serve::ServeError;
+use crate::serve::{ServeError, StorageSocket, bind};
 use crate::start::AbortOnDrop;
 
 /// The media type of the answer: the Prometheus text exposition format.
@@ -125,12 +125,13 @@ pub(crate) struct NodeMetrics {
 }
 
 impl NodeMetrics {
-    /// Binds `addr`, on the runtime that will serve it.
+    /// Binds `addr` through `binder` (so a late interface is waited for out of the start's
+    /// one budget), on the runtime that will serve it.
     ///
     /// # Errors
     /// The address cannot be bound, or the runtime cannot register the socket.
-    pub fn bind(addr: SocketAddr) -> Result<Self, ServeError> {
-        let socket = Socket::bind(addr)?;
+    pub fn bind(addr: SocketAddr, binder: &Binder) -> Result<Self, ServeError> {
+        let socket = Socket::bind(addr, binder)?;
         let addr = socket.local;
         socket.http().map(|listener| Self { listener, addr })
     }
@@ -154,6 +155,25 @@ impl NodeMetrics {
         let serving = crate::serve::serve_api(Some(self.listener), routes, std::future::pending());
         (self.addr, AbortOnDrop(tokio::spawn(serving.map(drop))))
     }
+}
+
+/// A storage node's two listeners, the storage socket and, when `--metrics-listen` is
+/// given, the `/metrics` one, bound through one [`Binder`]: both wait for a late interface
+/// out of the same budget, as the frontend's three do.
+///
+/// # Errors
+/// Either address cannot be bound.
+pub(crate) fn bind_node_sockets(
+    listen: SocketAddr,
+    metrics: Option<SocketAddr>,
+    binder: &Binder,
+) -> Result<(StorageSocket, Option<NodeMetrics>), ServeError> {
+    let (incoming, addr) = bind(listen, binder)?;
+    let socket = StorageSocket { incoming, addr };
+    let metrics = metrics
+        .map(|addr| NodeMetrics::bind(addr, binder))
+        .transpose()?;
+    Ok((socket, metrics))
 }
 
 /// Appends the storage health of `members`, when there are any; not generic, so every

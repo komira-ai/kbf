@@ -969,8 +969,8 @@ pub fn bind_service(
 /// A storage listener's socket: bound, so its address is known and callers queue on it,
 /// and not yet serving ([`bind_storage_socket`], then [`serve_service`]).
 pub struct StorageSocket {
-    incoming: TcpIncoming,
-    addr: SocketAddr,
+    pub(crate) incoming: TcpIncoming,
+    pub(crate) addr: SocketAddr,
 }
 
 impl StorageSocket {

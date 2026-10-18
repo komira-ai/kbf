@@ -47,10 +47,11 @@ use kbf_storage::repair::Repairs;
 use kbf_storage::service::InProcess;
 use kbf_threads::disk::Statvfs;
 
-use crate::metrics::NodeMetrics;
+use crate::listen::Binder;
+use crate::metrics::bind_node_sockets;
 use crate::rebuild::Background;
 use crate::replication::{REPAIR_DIR, bind_node};
-use crate::serve::{ServeError, StorageListener, bind_storage_socket};
+use crate::serve::{ServeError, StorageListener};
 use crate::start::{AbortOnDrop, open_cold_file, share_storage, tier_bytes};
 use crate::startup_pass::StartPass;
 use crate::storage_node::{StorageFlags, open_cache};
@@ -197,8 +198,9 @@ where
     // As `kbf storage` does ([`crate::storage_node::open_cache`]): bind, register with the
     // frontend if there is one, and only then open the cache, as the registration's member
     // and boot.
-    let socket = bind_storage_socket(listener.listen)?;
-    let metrics = flags.metrics.map(NodeMetrics::bind).transpose()?;
+    // One start, one bind budget for both listeners, spent before the first await (a
+    // `Binder` is not `Send`).
+    let (socket, metrics) = bind_node_sockets(listener.listen, flags.metrics, &Binder::new())?;
     let (cache, registered) = open_cache(flags, socket, (meta, store, prefix, log)).await?;
     let cache = cache.with_writes(args.write_config());
     let local = args.local_cache.as_ref();

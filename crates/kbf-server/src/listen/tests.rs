@@ -328,3 +328,54 @@ fn a_real_bind_to_an_absent_address_waits_then_says_it_is_not_available() {
         .expect("the bind returned: its budget bounds the wait");
     assert_eq!(kind, Some(io::ErrorKind::AddrNotAvailable));
 }
+
+/// Catches: a storage node's `/metrics` listener (`--metrics-listen`) that does not retry an
+/// address that is not there yet, as its storage socket does: a node on a VPN address would
+/// start with the one and die on the other. Both addresses are absent for one attempt, so
+/// both bind after one wait each. Mutant: `NodeMetrics::bind` calls `TcpListener::bind`
+/// itself, or `Socket::bind` is not given the binder.
+#[tokio::test]
+async fn a_nodes_metrics_listener_retries_an_unavailable_address() {
+    let (binder, slept, tried) = flaky(BIND_BUDGET, 1);
+    let at = |port: u16| -> SocketAddr { format!("192.0.2.10:{port}").parse().expect("address") };
+    let (socket, metrics) =
+        crate::metrics::bind_node_sockets(at(1), Some(at(2)), &binder).expect("both bound");
+    assert_ne!(socket.addr().port(), 0);
+    assert!(metrics.is_some());
+    assert_eq!(*tried.borrow(), [at(1), at(1), at(2), at(2)]);
+    assert_eq!(
+        *slept.borrow(),
+        [Duration::from_millis(250), Duration::from_millis(250)]
+    );
+}
+
+/// Catches: the node's two listeners each given a budget of their own, so a late interface
+/// could keep a node waiting twice the unit's start timeout allows. Each address is absent
+/// for three attempts (1750 ms of waits) and the budget is 2 s: with a budget per listener
+/// both bind, with one shared the second finds 250 ms left and fails, naming its address.
+/// Mutant: `bind_node_sockets` gives the metrics listener a `Binder::new()`.
+#[tokio::test]
+async fn a_nodes_two_listeners_bind_through_one_shared_budget() {
+    let (binder, slept, _) = flaky(Duration::from_secs(2), 3);
+    let at = |port: u16| -> SocketAddr { format!("192.0.2.10:{port}").parse().expect("address") };
+    let error = crate::metrics::bind_node_sockets(at(1), Some(at(2)), &binder)
+        .err()
+        .expect("the second listener runs out of budget");
+    assert!(error.to_string().contains("192.0.2.10:2"), "{error}");
+    assert_eq!(
+        slept.borrow().iter().sum::<Duration>(),
+        Duration::from_secs(2)
+    );
+}
+
+/// Catches: a node with no `--metrics-listen` binding, or failing on, a second listener.
+/// Mutant: `bind_node_sockets` binds the metrics address when it is `None` (an unspecified
+/// one).
+#[tokio::test]
+async fn a_node_without_a_metrics_address_binds_only_its_storage_socket() {
+    let (binder, _, tried) = flaky(BIND_BUDGET, 0);
+    let at: SocketAddr = "192.0.2.10:1".parse().expect("address");
+    let (_, metrics) = crate::metrics::bind_node_sockets(at, None, &binder).expect("bound");
+    assert!(metrics.is_none());
+    assert_eq!(*tried.borrow(), [at]);
+}

@@ -65,11 +65,12 @@ use kbf_tls::{TlsFiles, TlsSource};
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 use crate::join::{self, Joined, Joiner};
-use crate::metrics::NodeMetrics;
+use crate::listen::Binder;
+use crate::metrics::bind_node_sockets;
 use crate::node_map::NodeMap;
 use crate::rebuild::Background;
 use crate::replication::{REPAIR_DIR, Registered, bind_node};
-use crate::serve::{ServeError, StorageListener, StorageSocket, bind_storage_socket};
+use crate::serve::{ServeError, StorageListener, StorageSocket};
 use crate::start::{AbortOnDrop, open_cold_file};
 use crate::startup_pass::StartPass;
 use crate::stores::{FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
@@ -554,8 +555,9 @@ where
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
-    let socket = bind_storage_socket(listener.listen)?;
-    let metrics = flags.metrics.map(NodeMetrics::bind).transpose()?;
+    // One start, one bind budget for both listeners, spent before the first await (a
+    // `Binder` is not `Send`).
+    let (socket, metrics) = bind_node_sockets(listener.listen, flags.metrics, &Binder::new())?;
     let (cache, registered) = open_cache(flags, socket, (meta, store, prefix, log)).await?;
     let cache = cache.with_writes(flags.server.write_config());
     let (cache, tier) = crate::write_tier::attach(cache, hot).await?;
