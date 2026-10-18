@@ -75,9 +75,9 @@ impl TransferArgs {
     }
 }
 
-/// The engine over the blob service `--cas` names, over mutual TLS with the daemon's
-/// own TLS files and the daemon's HTTP/2 keepalive. Connects on first use.
-pub(crate) fn engine(cli: &Cli) -> Result<Transfers, Error> {
+/// The endpoint of the blob service `--cas` names, over mutual TLS with the daemon's own
+/// TLS files and the daemon's HTTP/2 keepalive. Nothing connects until it is used.
+pub(crate) fn endpoint(cli: &Cli) -> Result<Endpoint, Error> {
     let url = cli
         .cas
         .clone()
@@ -91,10 +91,12 @@ pub(crate) fn engine(cli: &Cli) -> Result<Transfers, Error> {
     }
     let config = DaemonConfig::from_args(&cli.daemon);
     let endpoint = Endpoint::from_shared(url)?.tls_config(config.tls.load()?)?;
-    Ok(Transfers::new(
-        config.keep_alive.apply(endpoint),
-        cli.transfer.config(),
-    ))
+    Ok(config.keep_alive.apply(endpoint))
+}
+
+/// The engine over the blob service `--cas` names ([`endpoint`]). Connects on first use.
+pub(crate) fn engine(cli: &Cli) -> Result<Transfers, Error> {
+    Ok(Transfers::new(endpoint(cli)?, cli.transfer.config()))
 }
 
 #[cfg(test)]
@@ -263,8 +265,7 @@ mod tests {
         let half = kbf_server::storage_half::start(&flags, || Ok(std::future::pending::<()>()))
             .await
             .expect("the storage half starts");
-        let local =
-            kbf_daemon::LocalMember::new(half.addr.to_string(), half.in_process(), half.maps());
+        let local = kbf_daemon::LocalMember::new(half.addr.to_string(), half.in_process());
         // `start_member` builds the plane when the native driver is set up, on a thread of
         // its own: dropping the daemon's runtime in the test's would panic.
         let start = |ca: String, local: kbf_daemon::LocalMember| {

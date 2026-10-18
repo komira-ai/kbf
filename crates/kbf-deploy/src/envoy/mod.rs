@@ -79,19 +79,25 @@ pub enum Refusal {
     },
 }
 
+/// Write each `(name, text)` into `out`, creating it.
+fn write_files(out: &Path, files: [(&str, &String); 2]) -> Result<(), Refusal> {
+    std::fs::create_dir_all(out).map_err(|source| Refusal::Write {
+        path: out.to_owned(),
+        source,
+    })?;
+    for (name, text) in files {
+        let path = out.join(name);
+        std::fs::write(&path, text).map_err(|source| Refusal::Write { path, source })?;
+    }
+    Ok(())
+}
+
 /// `envoy render`: render the settings in `config` into `out`, and return the line to
 /// print.
 pub fn render_files(config: &Path, out: &Path) -> Result<String, Refusal> {
     let c = EnvoyConfig::load(config)?;
     let r = render::render(&c);
-    std::fs::create_dir_all(out).map_err(|source| Refusal::Write {
-        path: out.to_owned(),
-        source,
-    })?;
-    for (name, text) in [(MANIFESTS, &r.manifests), (ENVOY, &r.envoy)] {
-        let path = out.join(name);
-        std::fs::write(&path, text).map_err(|source| Refusal::Write { path, source })?;
-    }
+    write_files(out, [(MANIFESTS, &r.manifests), (ENVOY, &r.envoy)])?;
     Ok(format!(
         "rendered {MANIFESTS} {ENVOY} into {}",
         out.display()

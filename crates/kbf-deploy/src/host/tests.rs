@@ -2,108 +2,9 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 
 use super::state::Locked;
-use super::state::tests::{A, B, C, full_state, host_root};
 use super::*;
 use kbf_host::testkit::FakeExec;
-
-/// Catches a commit id check that takes a short or long id, an upper-case one (Git
-/// would name the same commit, and a second release directory would hold it), a
-/// non-hex character, or a multi-byte character of the right byte length; and serde,
-/// parsing or printing that goes around the check.
-#[test]
-fn a_commit_id_is_exactly_40_lowercase_hex_characters() {
-    let id = CommitId::new(B).expect("a commit");
-    assert_eq!((id.as_str(), id.to_string()), (B, B.to_owned()));
-    assert_eq!(String::from(id.clone()), B);
-    assert_eq!(B.parse::<CommitId>(), Ok(id.clone()));
-    assert_eq!(
-        serde_json::to_string(&id).expect("serializes"),
-        format!("\"{B}\"")
-    );
-    let refused = [
-        "",
-        &B[..39],
-        &format!("{B}0"),
-        &B.to_uppercase(),
-        &format!("{}g", &B[..39]),
-        &format!("{}é", &B[..38]),
-        &format!("{} ", &B[..39]),
-        // What would make a release path leave `releases/` or name it twice.
-        "/",
-        ".",
-        "..",
-        &format!("{}/", &B[..39]),
-        &format!("/{}", &B[..39]),
-        &format!("{}.", &B[..39]),
-        &format!("..{}", &B[..38]),
-        &format!("{}\0", &B[..39]),
-        &format!("{}A", &B[..39]),
-    ];
-    for bad in refused {
-        assert_eq!(
-            CommitId::new(bad),
-            Err(NotACommit(bad.to_owned())),
-            "{bad:?}"
-        );
-        let json = serde_json::to_string(bad).expect("a JSON string");
-        let err = serde_json::from_str::<CommitId>(&json).expect_err(bad);
-        assert!(err.to_string().contains("is not a commit id"), "{err}");
-    }
-    assert_eq!(
-        NotACommit("x".to_owned()).to_string(),
-        "\"x\" is not a commit id (40 lowercase hex characters)"
-    );
-}
-
-/// Catches a layout path that is not a valid host path (the constant would panic on
-/// first use), a release, file or pin path built in the wrong directory, and a link
-/// target that is absolute (a copied tree would point out of itself).
-#[test]
-fn the_layout_names_every_path_under_its_directory() {
-    use layout::*;
-    for p in [
-        KBF_DIR,
-        RELEASES,
-        CURRENT,
-        PREVIOUS,
-        STATE_DIR,
-        INCOMING,
-        STAGED,
-        DEPLOYED,
-        STATE_FILE,
-        CONFIG_DIR,
-        POLICY,
-        PINS,
-        INVENTORY_ALLOW,
-        LOCK,
-    ] {
-        assert_eq!(path(p).as_str(), p);
-    }
-    let a = CommitId::new(A).expect("a commit");
-    assert_eq!(
-        release_dir(&a).as_str(),
-        format!("/usr/local/kbf/releases/{A}")
-    );
-    let files = [
-        (RELEASE_BINARY, "kbf"),
-        (RELEASE_UNITS, "units"),
-        (RELEASE_MANIFEST, "manifest.json"),
-    ];
-    for (name, want) in files {
-        assert_eq!(
-            release_file(&a, name).as_str(),
-            format!("/usr/local/kbf/releases/{A}/{want}")
-        );
-    }
-    assert_eq!(
-        pin_file(&a).as_str(),
-        format!("/etc/kbf-deploy/pins/{A}.sha256")
-    );
-    assert_eq!(
-        release_link(&a),
-        std::path::PathBuf::from(format!("releases/{A}"))
-    );
-}
+use kbf_installer::testkit::{A, B, C, full_state, host_root};
 
 /// `kbf-deploy host status <args>` with `--root dir`: exit, stdout, stderr.
 fn status_cli(dir: &std::path::Path, args: &[&str]) -> (ExitCode, String, String) {
@@ -131,12 +32,12 @@ fn status_prints_the_state_and_the_link_verdict() {
     assert_eq!((code, err.as_str()), (ExitCode::SUCCESS, ""));
     assert_eq!(
         out,
-        "state: /var/lib/kbf-deploy/state.json (none yet)\n\
+        "state: /var/lib/kbf-installer/state.json (none yet)\n\
          current: none\n\
          previous: none\n\
          staged: none\n\
          pending confirm: none\n\
-         order floor: 0\n\
+         floor: epoch 0, order 0, generation 0\n\
          current link: missing (matches the state)\n"
     );
     let (code, out, _) = status_cli(&dir, &["--json"]);
@@ -144,29 +45,32 @@ fn status_prints_the_state_and_the_link_verdict() {
     assert_eq!(
         out,
         "{\"current_link\":{\"kind\":\"missing\",\"matches_state\":true,\"target\":null},\
-         \"exists\":false,\"schema\":1,\"state\":{\"current\":null,\"order_floor\":0,\
-         \"pending_confirm\":null,\"previous\":null,\"staged\":null},\
-         \"state_file\":\"/var/lib/kbf-deploy/state.json\"}\n"
+         \"exists\":false,\"schema\":2,\"state\":{\"current\":null,\
+                  \"floor\":{\"epoch\":0,\"generation\":0,\"order_id\":0},\
+         \"last_acked_order_id\":0,\"pending_confirm\":null,\"previous\":null,\
+         \"serving_instance\":null,\"staged\":null,\"unacked\":[]},\
+         \"state_file\":\"/var/lib/kbf-installer/state.json\"}\n"
     );
 
     Locked::acquire(&root)
         .expect("lock")
         .write(&full_state())
         .expect("write");
-    let link = dir.join("usr/local/kbf/current");
-    std::os::unix::fs::symlink(format!("releases/{A}"), &link).expect("link");
+    let link = dir.join("var/lib/kbf-installer/releases/current");
+    fs::create_dir_all(link.parent().expect("a directory")).expect("releases");
+    std::os::unix::fs::symlink(A, &link).expect("link");
     let (code, out, _) = status_cli(&dir, &[]);
     assert_eq!(code, ExitCode::SUCCESS);
     assert_eq!(
         out,
         format!(
-            "state: /var/lib/kbf-deploy/state.json\n\
+            "state: /var/lib/kbf-installer/state.json\n\
              current: {A}\n\
              previous: {B}\n\
              staged: {C}\n\
              pending confirm: {A} by 1800000000 (unix seconds), else back to {B}\n\
-             order floor: 7\n\
-             current link: releases/{A} (matches the state)\n"
+             floor: epoch 3, order 9, generation 7\n\
+             current link: {A} (matches the state)\n"
         )
     );
     let (code, out, _) = status_cli(&dir, &["--json"]);
@@ -175,21 +79,22 @@ fn status_prints_the_state_and_the_link_verdict() {
         out,
         format!(
             "{{\"current_link\":{{\"kind\":\"link\",\"matches_state\":true,\
-             \"target\":\"releases/{A}\"}},\"exists\":true,\"schema\":1,\"state\":{{\
-             \"current\":\"{A}\",\"order_floor\":7,\"pending_confirm\":{{\"commit\":\"{A}\",\
-             \"deadline\":1800000000,\"previous\":\"{B}\"}},\"previous\":\"{B}\",\
-             \"staged\":\"{C}\"}},\"state_file\":\"/var/lib/kbf-deploy/state.json\"}}\n"
+             \"target\":\"{A}\"}},\"exists\":true,\"schema\":2,\"state\":{{\
+             \"current\":\"{A}\",\"floor\":{{\"epoch\":3,\"generation\":7,\"order_id\":9}},\
+             \"last_acked_order_id\":9,\"pending_confirm\":{{\"activation\":\"3-9\",\
+             \"commit\":\"{A}\",\"deadline_mono_s\":86400,\"deadline_wall\":1800000000,\
+             \"previous\":\"{B}\",\"starts_left\":2}},\"previous\":\"{B}\",\
+             \"serving_instance\":\"a\",\"staged\":\"{C}\",\"unacked\":[{{\"epoch\":3,\
+             \"first_seen\":1700000000,\"order_id\":10,\"record\":\"{{}}\"}}]}},\"state_file\":\"/var/lib/kbf-installer/state.json\"}}\n"
         )
     );
 
     fs::remove_file(&link).expect("remove");
-    std::os::unix::fs::symlink(format!("releases/{B}"), &link).expect("link");
+    std::os::unix::fs::symlink(B, &link).expect("link");
     let (code, out, _) = status_cli(&dir, &[]);
     assert_eq!(code, ExitCode::FAILURE);
     assert!(
-        out.ends_with(&format!(
-            "current link: releases/{B} (the state says releases/{A})\n"
-        )),
+        out.ends_with(&format!("current link: {B} (the state says {A})\n")),
         "{out}"
     );
 
@@ -224,16 +129,51 @@ fn status_prints_the_state_and_the_link_verdict() {
     );
 }
 
+/// Catches a swap whose window has not started (a Linux swap waits for the new
+/// release's first start) printed with a deadline that is not there, and the order and
+/// the start budget of the swap left out of what a script parses.
+///
+/// Mutant seen red: the `None` deadline printed as `0`.
+#[test]
+fn status_says_when_the_window_to_confirm_has_not_started() {
+    let (root, dir) = host_root("deploy-host-status-window");
+    let mut state = full_state();
+    let pending = state.pending_confirm.as_mut().expect("pending");
+    pending.deadline_wall = None;
+    pending.activation = "order-1".to_owned();
+    pending.starts_left = Some(3);
+    Locked::acquire(&root)
+        .expect("lock")
+        .write(&state)
+        .expect("write");
+    let (_, out, _) = status_cli(&dir, &[]);
+    assert!(
+        out.contains(&format!(
+            "pending confirm: {A} once its window starts (its first start), else back to {B}\n"
+        )),
+        "{out}"
+    );
+    let (_, out, _) = status_cli(&dir, &["--json"]);
+    assert!(
+        out.contains(&format!(
+            "\"pending_confirm\":{{\"activation\":\"order-1\",\"commit\":\"{A}\",\
+             \"deadline_mono_s\":86400,\"previous\":\"{B}\",\"starts_left\":3}}"
+        )),
+        "{out}"
+    );
+}
+
 /// Catches a state file that cannot be parsed shown as no state (an operator would
 /// swap on a host whose state is lost), and a relative `--root`.
 #[test]
 fn status_refuses_a_broken_state_and_a_relative_root() {
     let (_root, dir) = host_root("deploy-host-status-refused");
-    fs::write(dir.join("var/lib/kbf-deploy/state.json"), "{").expect("seed");
+    fs::write(dir.join("var/lib/kbf-installer/state.json"), "{").expect("seed");
     let (code, out, err) = status_cli(&dir, &[]);
     assert_eq!((code, out.as_str()), (ExitCode::from(2), ""));
     assert!(
-        err.starts_with("REFUSED: ") && err.contains("is not a deploy state"),
+        err.starts_with("REFUSED: ")
+            && err.contains("the state is unusable and nothing was changed"),
         "{err}"
     );
 
@@ -285,21 +225,20 @@ fn install_plans_a_release_only_root_can_change() {
     let (code, out, err) = host_cli(&args);
     assert_eq!((code, err.as_str()), (ExitCode::SUCCESS, ""));
     let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"kbf A"));
-    let r = format!("/usr/local/kbf/releases/{A}");
+    let r = format!("/var/lib/kbf-installer/releases/{A}");
     assert_eq!(
         out,
         format!(
             "release {A}: {r} (5 bytes, sha256 {sha}), 1 unit(s)\n\
-             DRY-RUN: mkdir /var/lib/kbf-deploy (0755, owner 0:0)\n\
-             DRY-RUN: mkdir /usr/local/kbf (0755, owner 0:0)\n\
-             DRY-RUN: mkdir /usr/local/kbf/releases (0755, owner 0:0)\n\
+             DRY-RUN: mkdir /var/lib/kbf-installer (0755, owner 0:0)\n\
+             DRY-RUN: mkdir /var/lib/kbf-installer/releases (0755, owner 0:0)\n\
              DRY-RUN: mkdir {r} (0755, owner 0:0)\n\
              DRY-RUN: mkdir {r}/units (0755, owner 0:0)\n\
              DRY-RUN: write {r}/kbf (0755, owner 0:0, 5 bytes)\n\
              DRY-RUN: write {r}/units/kbf.slice (0644, owner 0:0, 8 bytes)\n\
              dry run: nothing changed. Re-run with --apply.\n\
              links: current none -> {A}, previous none -> none\n\
-             DRY-RUN: link /usr/local/kbf/current -> releases/{A}\n\
+             DRY-RUN: link /var/lib/kbf-installer/releases/current -> {A}\n\
              dry run: nothing changed. Re-run with --apply.\n"
         )
     );
@@ -333,6 +272,7 @@ fn rollback_and_gc_run_from_the_command_line() {
     let args = |apply| ApplyArgs {
         apply,
         root: Root::host(),
+        platform: None,
     };
     assert_eq!(
         (args(false).mode(), args(true).mode()),

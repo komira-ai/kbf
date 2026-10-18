@@ -15,13 +15,20 @@ pub const STORAGE_AND_DAEMON: &str = "storage-and-daemon";
 /// Frontend, storage and build node in one process.
 pub const ALL_IN_ONE: &str = "all-in-one";
 
+/// The node: the one unit for every non-frontend role. It is a word after `kbf`, not a row
+/// of [`MODES`]: it takes `kbf.toml` and the roles the frontend grants, then runs one of
+/// the modes above ([`crate::node`]).
+pub const NODE: &str = "node";
+/// One enrollment of this node, then exit ([`crate::enroll`]); not a row of [`MODES`] either.
+pub const ENROLL: &str = "enroll";
+
 /// What a mode runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Entry {
     /// The worker daemon: `kbf_node::run`, the flags of `kbf-daemon`.
     Daemon,
     /// The server and the daemon in one process: `kbf_all_in_one::run`, the flags of
-    /// `kbf-all-in-one`.
+    /// `kbf-server` and of `kbf-daemon`.
     AllInOne,
     /// The storage node: `kbf_server::storage_node::run`, `kbf-server`'s store, write and
     /// log flags and its own listener flags.

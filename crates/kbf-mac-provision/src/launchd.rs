@@ -1,5 +1,6 @@
-//! The LaunchDaemon that runs kbf-daemon (docs/design/mac-node-provisioning.md,
-//! section 5.3): its property list, rendered from the profile; the check that the
+//! The LaunchDaemon that runs `kbf daemon` (docs/design/mac-node-provisioning.md,
+//! section 5.3): its property list,
+//! rendered from the profile; the check that the
 //! installed one is that file, root's, with a safe error log and the job loaded; the
 //! fix that makes it so; and the restart.
 //!
@@ -17,7 +18,7 @@ use crate::pool::{self, ROOT_DIR};
 use crate::profile::{DaemonUser, Profile};
 
 const LAUNCHCTL: &str = "/bin/launchctl";
-pub const DAEMON_BIN: &str = "/usr/local/kbf/current/kbf-daemon";
+pub const KBF_BIN: &str = "/usr/local/kbf-installer/releases/current/kbf";
 pub const LOG_DIR: &str = "/Library/Logs/kbf";
 pub const ERR_LOG: &str = "/Library/Logs/kbf/kbf-daemon.err.log";
 const ROOT_FILE: &str = "-rw-r--r-- 0 0";
@@ -30,11 +31,14 @@ pub fn plist_path(profile: &Profile) -> String {
     format!("{LAUNCH_DAEMONS}/{}.plist", profile.get("launchd_label"))
 }
 
-/// kbf-daemon's arguments: the native driver, the server, its certificates, the node
-/// id (the host name), the scratch directory, the node label and the profile's labels.
+/// `kbf daemon`'s arguments, in the order and shape of the Mac kit's plist: the native
+/// driver, the server, its certificates, the node id (the host name), the data directory,
+/// the node label and the profile's labels, one word per argument. The CLI's `--mode=daemon` flag replaces
+/// the `daemon` word when it lands.
 pub fn daemon_args(profile: &Profile) -> Vec<String> {
     let mut args: Vec<String> = [
-        DAEMON_BIN,
+        KBF_BIN,
+        "daemon",
         "--driver",
         "native",
         "--server",

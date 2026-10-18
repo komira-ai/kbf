@@ -14,12 +14,18 @@
 //! - **The handle.** The [`Storage`] the listener serves, and the service over it
 //!   ([`kbf_storage::service::InProcess`]), are kept, for the daemon half.
 //!
-//! - **The map.** With `--frontend` the half registers and heartbeats as `kbf storage`
-//!   does, holds the maps the frontend sends in a [`kbf_mapsync::MapHolder`]
-//!   ([`StorageHalf::maps`]), and its listener answers every call UNAVAILABLE `no storage
-//!   map yet` until the first arrives (the daemon half, in the same process, calls the
-//!   service in-process; the listener's gate is a layer of the listener, so the daemon
-//!   half applies the same rule itself, see `kbf_daemon::LocalMember`).
+//! - **The map and the chain.** With `--frontend` the half binds its listener, registers
+//!   (retrying until the frontend answers), opens its cache as the registration's member
+//!   and boot (its objects are named as `kbf storage`'s are), and heartbeats as
+//!   `kbf storage` does. It holds the maps the frontend sends in a
+//!   [`kbf_mapsync::MapHolder`] ([`StorageHalf::maps`]), and its service judges every call
+//!   by that map, serving nothing until the first arrives (UNAVAILABLE `no storage map
+//!   yet`); under mutual TLS it is a link of the chain that copies a write to the blob's
+//!   second owner, with the repair worker that makes a copy owed
+//!   ([`StorageHalf::repairs`]); all as [`crate::replication`] says. The check is the
+//!   service's own, made on every call, so the daemon half, which calls the service
+//!   in-process ([`StorageHalf::in_process`]), is judged by the same map and its writes
+//!   are copied by the same chain as a call over the listener.
 //!
 //! The rest (the listener's checks, the stores, the metadata log, the flusher and the
 //! start-up pass over a `file://` cold store) is `kbf storage`'s, step for step.
@@ -32,18 +38,21 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_front::{Cache, CacheStorage, SegmentsConfig};
+use kbf_front::{CacheStorage, RebuildConfig, SegmentsConfig};
 use kbf_mapsync::MapHolder;
 use kbf_meta::Retention;
 use kbf_objstore::{FsStore, ObjectStore};
 use kbf_storage::Storage;
+use kbf_storage::repair::Repairs;
 use kbf_storage::service::InProcess;
 use kbf_threads::disk::Statvfs;
 
-use crate::serve::{ServeError, StorageListener, bind_storage_shared};
+use crate::rebuild::Background;
+use crate::replication::{REPAIR_DIR, bind_node};
+use crate::serve::{ServeError, StorageListener, bind_storage_socket};
 use crate::start::{AbortOnDrop, open_cold_file, share_storage, tier_bytes};
 use crate::startup_pass::StartPass;
-use crate::storage_node::StorageFlags;
+use crate::storage_node::{StorageFlags, open_cache};
 use crate::stores::{FILE_PREFIX_ROOT, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
 use crate::{RaftMetaLog, SERVER_VERSION, s3_store};
@@ -58,9 +67,11 @@ pub struct StorageHalf {
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     maps: Arc<MapHolder>,
+    repairs: Option<Arc<Repairs>>,
     _flusher: Option<AbortOnDrop>,
-    _pass: Option<AbortOnDrop>,
+    _background: Background,
     _joiner: Option<AbortOnDrop>,
+    _repair: Option<AbortOnDrop>,
 }
 
 impl StorageHalf {
@@ -68,6 +79,13 @@ impl StorageHalf {
     #[must_use]
     pub fn maps(&self) -> Arc<MapHolder> {
         Arc::clone(&self.maps)
+    }
+
+    /// The copies this node owes: its repair journal. `None` for a node that does not
+    /// replicate (no `--frontend`, or one that admits callers in plain text).
+    #[must_use]
+    pub fn repairs(&self) -> Option<Arc<Repairs>> {
+        self.repairs.clone()
     }
 
     /// The storage the listener serves, itself, with none of the service's checks: for a
@@ -103,8 +121,9 @@ impl StorageHalf {
         let Self {
             serving,
             _flusher,
-            _pass,
+            _background,
             _joiner,
+            _repair,
             ..
         } = self;
         serving.await
@@ -170,9 +189,14 @@ where
     let (prefix, log) = (meta.store_prefix(), meta.log_id());
     let grace = Duration::from_millis(args.cold_store_evict_grace_ms);
     let pass = files.map(|files| StartPass::over_raft(files, grace));
-    let cache = Cache::open(meta, store, prefix)
-        .await?
-        .with_writes(args.write_config());
+    // As `kbf storage` does ([`crate::storage_node::open_cache`]): bind, register with the
+    // frontend if there is one, and only then open the cache, as the registration's member
+    // and boot.
+    let socket = bind_storage_socket(listener.listen)?;
+    let (cache, registered) = open_cache(flags, socket, (meta, store, prefix, log)).await?;
+    let cache = cache
+        .with_writes(args.write_config())
+        .with_write_pool(args.write_pool_config());
     let local = args.local_cache.as_ref();
     let hot = stores.hot.as_ref();
     let (cache, tier) = crate::write_tier::attach_with(cache, hot, local.is_none()).await?;
@@ -182,31 +206,30 @@ where
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
         AbortOnDrop(tokio::spawn(flusher))
     });
-    let _pass = pass.map(|pass| AbortOnDrop(crate::startup_pass::spawn(Arc::clone(&cache), pass)));
+    let _background =
+        crate::rebuild::spawn(&cache, &registered.catch_up, pass, RebuildConfig::default());
     let segments = SegmentsConfig {
         max_bytes: args.segment_upload_max_bytes,
         idle: Duration::from_secs(args.segment_upload_idle_secs),
     };
     let storage: Arc<dyn Storage> = Arc::new(CacheStorage::new(cache, segments));
-    // As `kbf storage` does: register with the frontend if there is one, hold its map,
-    // and serve nothing until the first.
-    let maps = Arc::new(MapHolder::new());
-    let gate = flags.frontend.as_ref().map(|_| Arc::clone(&maps));
-    let (bound, in_process) =
-        bind_storage_shared(Arc::clone(&storage), listener, gate, shutdown()?)?;
-    let addr = bound.addr;
-    let _joiner = flags
-        .joiner(addr, Arc::clone(&maps))?
-        .map(|joiner| AbortOnDrop(tokio::spawn(joiner.run())));
+    // After the log is open: it refuses a directory that holds files it did not write.
+    let repair_dir = stores.meta_dir.join(REPAIR_DIR);
+    let stop = Box::pin(shutdown()?);
+    let served = Arc::clone(&storage);
+    let node = bind_node(flags, listener, registered, served, &repair_dir, stop)?;
+    let addr = node.addr;
     Ok(StorageHalf {
         addr,
         storage,
-        in_process,
+        in_process: node.in_process,
         start_line: format!("kbf-storage {SERVER_VERSION} storage={addr} log={log}"),
-        serving: Box::pin(bound.serving),
-        maps,
+        serving: node.serving,
+        maps: node.maps,
+        repairs: node.repairs,
         _flusher,
-        _pass,
-        _joiner,
+        _background,
+        _joiner: node.joiner,
+        _repair: node.repair,
     })
 }

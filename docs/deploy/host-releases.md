@@ -1,21 +1,65 @@
 # Host releases: the layout and the manual verbs
 
+> **Note:** the layout below is the current one. The design of record ([../design/distribution.md](../design/distribution.md)) moves releases to `/var/lib/kbf-installer/releases/<sha>` and replaces the `kbf-deploy host` verbs with `kbf-installer`; `/usr/local/kbf` is retired when that works on the test farm. There is no separate setup command.
+
 A host keeps each kbf release in its own directory and points two links at them.
-`kbf-deploy host` reads and changes that layout. This layout is **Linux-only**: its lock
-lives in `/run`, which macOS does not have, so the macOS install path will choose a
-layout of its own.
+`kbf-deploy host` reads and changes that layout, and so does the root helper that applies
+updates the host pulled: both call the `kbf-installer` crate, so a host has **one state
+file and one layout**, on Linux and on macOS.
 
 ```text
-/usr/local/kbf/releases/<commit>/   one release: kbf, and units/ when it has units
-/usr/local/kbf/current              link to releases/<commit>, the release that runs
-/usr/local/kbf/previous             link to releases/<commit>, the one before it
-/var/lib/kbf-deploy/state.json      the deploy state (0600)
-/run/kbf-deploy.lock                the lock the state is changed under (0600)
+/var/lib/kbf-installer/releases/<commit>/   one release: kbf (all a macOS release has; a Linux one may add kbf-daemon), units/
+/var/lib/kbf-installer/releases/.stage-<commit>.<rand>/   a release being installed, renamed to <commit>
+/var/lib/kbf-installer/releases/current     link to <commit>, the release that runs
+/var/lib/kbf-installer/releases/previous    link to <commit>, the one before it
+<state dir>/state.json                      the installer state, schema 2 (0600)
+<state dir>/state.json.bak                  the last state that read back whole
+<state dir>/work/                           scratch for a stage in progress, removed after it
+<lock>                                      the lock the state is changed under (0600)
+<trust dir>/{gh,trusted_root.jsonl,installer.conf}   what offline verification trusts
 ```
 
-`<commit>` is always the full 40-character lowercase commit id. The links are relative
-(`releases/<commit>`). A release directory, its `units/` and its `kbf` are root's and
-0755 (units 0644), so the user a service runs as cannot replace its own binary.
+The paths are in one place, `kbf_installer::layout`
+(`docs/design/kbf-installer.md`, section 3). The two platforms differ in four of them:
+
+| | Linux | macOS |
+|---|---|---|
+| installer tree | `/var/lib/kbf-installer` | `/usr/local/kbf-installer` |
+| state dir | the installer tree | `/var/db/kbf-installer` |
+| lock | `/run/kbf-installer/lock` | `/var/run/kbf-installer/lock` |
+| trust dir | `/usr/share/kbf-installer/trust` | `/usr/local/kbf-installer/trust` |
+
+This replaces the earlier `/usr/local/kbf`, `/var/lib/kbf-deploy` and
+`/usr/local/libexec/kbf-deploy` (a path change made together in `kbf-deploy` and the
+macOS LaunchDaemon, with no migration of an existing host: that is a separate step). The
+installer's tree is root's and `kbf`'s own state, `/var/lib/kbf`, is never touched.
+`kbf-deploy host` takes the platform it was built for; `--platform linux|macos` names the
+other (for a mounted image). On a fresh Mac the install makes the `/usr/local` and the
+directories it lacks, root-owned and 0755; a `/usr/local` that is there is not touched.
+
+`<commit>` is always the full 40-character lowercase commit id. The links sit beside the
+releases and name their release relative to themselves (`<commit>`). A release directory,
+its `units/` and its binaries are root's and 0755 (units 0644), so the user a service runs
+as cannot replace its own binary. A macOS release holds `kbf`, which is what the Mac's LaunchDaemon runs
+(`/usr/local/kbf-installer/releases/current/kbf`); a Linux release holds `kbf` and may add
+`kbf-daemon`.
+
+**How a host is written** (the order is the crash story):
+
+1. A new release is made under `releases/.stage-<commit>.<rand>/`, each binary read back and
+   compared with its source, every file and directory synced, then renamed to
+   `releases/<commit>/` and `releases/` synced. The final name never holds a half release.
+2. Only then is `state.json` written: the last good one first becomes `state.json.bak`,
+   then the new one replaces `state.json` (written aside, synced, renamed, directory synced).
+3. Only then do the links move, `previous` before `current`, each made as `<name>.new` and
+   renamed over `<name>`. `state.json` is the truth: a crash between 2 and 3 leaves links
+   that the next `reconcile` makes agree with it.
+
+**A damaged state is not an empty one.** If `state.json` is missing or does not parse, the
+backup is used. If neither is usable and the host has a `current` or `previous` link, the
+verb stops with exit code 5 (an operator must restore the file) and writes nothing. A host
+with no state and no link has never been activated and starts empty. A `state.json` of
+another schema is refused, and the backup is not tried.
 
 ## The verbs
 
@@ -30,9 +74,9 @@ sudo kbf-deploy host rollback [--apply]
 sudo kbf-deploy host gc [--keep N] [--apply]
 ```
 
-- `install` copies `<dir>/kbf` (and `<dir>/units/*` when present) into
-  `releases/<commit>/`, refuses a release directory that is already there with other
-  content, checks that the copied binary's sha256 is the source's, then points
+- `install` copies `<dir>/kbf` and `<dir>/kbf-daemon` (whichever are there) and
+  `<dir>/units/*` (when present) into `releases/<commit>/`, refuses a release directory that is already there with other
+  content, checks that each copied binary's sha256 is the source's, then points
   `previous` at the old current release and `current` at the new one and writes the
   state. Installing the current release again changes no link.
 - `rollback` points `current` at the previous release and removes `previous` (the state
@@ -46,6 +90,99 @@ sudo kbf-deploy host gc [--keep N] [--apply]
 Each refuses while a commit-confirm deploy is pending in the state.
 
 **No verb restarts a service.** After `install --apply` or `rollback --apply`, restart
-the units that run `/usr/local/kbf/current/kbf` by hand (`sudo systemctl restart
+the units that run `/var/lib/kbf-installer/releases/current/kbf` by hand (`sudo systemctl restart
 <unit>`), then check `kbf-deploy host status`. Installing the units and restarting them
 belongs to `kbf-deploy linux install-units`.
+
+## Staging a release that was verified offline
+
+The root helper does not use `install` on a file it was handed. It stages: the
+`kbf_installer::stage` module takes an inbox entry (a directory the unprivileged `kbf`
+process wrote: `offer.json`, the release's tarballs and their attestation bundle),
+checks everything below in this order, installs the release into `releases/<commit>/`
+and records it as the state's `staged` release (`kbf_installer::release::stage`). It
+moves no link and restarts nothing; activating is a later, separate step. A refusal
+installs nothing and leaves nothing behind.
+
+1. `gh`, the Sigstore trusted root and the host settings are root's alone (below).
+2. The entry is opened without following a link, and holds only the files `offer.json`
+   names. Each is opened beneath the entry (`O_NOFOLLOW`; `openat2` with
+   `RESOLVE_BENEATH` on Linux) and refused if it is a link, a FIFO, a device, a
+   directory, hard-linked, empty or over its size cap. On macOS, a file carrying the
+   `com.apple.quarantine` attribute is refused.
+3. Each file is copied by its open descriptor into a scratch directory root owns; the
+   original is not read again. The copy is hashed and must have the sha256 the offer
+   names.
+4. `gh attestation verify` accepts each tarball with the bundle, for the offered commit.
+   Nothing has been unpacked or run yet.
+5. Each tarball must hold exactly one regular file named like the component, with no path
+   and no link; it is unpacked, and its header must be this host's kind of binary
+   (ELF on Linux, Mach-O on macOS, for this CPU). On macOS its code signature must be
+   valid and ad hoc with the hardened runtime, which is what CI's `sign-darwin` makes.
+6. The binary runs `--version --json` as the unprivileged user (empty environment, empty
+   directory, a timeout) and must say it is the offered commit's `release` build. Its
+   `protocol`, `min_protocol` and `state_schema` are reported for the rollout planner.
+7. The release is installed. A release directory that is there with other bytes is
+   refused, never replaced.
+
+Every refusal is one case of `kbf_installer::refusal::Refusal` with a stable code
+(`not-attested`, `hash-mismatch`, `inbox-symlink`, `wrong-platform`, ...) and a one-line
+message.
+
+### What is trusted
+
+**MVP trust:** a host trusts the GitHub build attestation of `komira-ai/kbf`'s
+artifacts workflow (`artifacts.yml`; for one release cycle also under the name
+`komira-ai/komira-build-farm`, which releases attested before the rename carry) for a source ref, `refs/heads/main` unless the host's
+settings name others, verified offline with a pinned `gh` and a pinned Sigstore trusted
+root. The frontend and the inbox are untrusted bytes until the attestation passes; the
+frontend only says which commit and carries the files. Residuals: `main` is not
+branch-protected, there is no downgrade floor in the MVP (an older attested release is
+accepted), and a separate Ed25519 release key is a documented later option.
+
+The trust list is the trust directory above (`/usr/share/kbf-installer/trust/` on Linux), root-owned and closed to group and
+other writes, the same on both platforms:
+
+- `gh`: the pinned GitHub CLI release (2.102.0 at this writing; Linux amd64 and arm64
+  tarballs and macOS arm64 zip are in the release's checksum list).
+- `trusted_root.jsonl`: `gh attestation trusted-root`, refreshed when Sigstore rotates a
+  key (a stage then says `not-attested`).
+- `installer.conf` (optional): `SOURCE_REFS`, `RUN_AS_UID`, `RUN_AS_GID`.
+
+They are installed by the host's bootstrap, not by this repository. The pins (version,
+sha256 of `gh`, the trusted root's sha256) live with it. Each of them, and every directory
+above it, must be owned by uid 0, not a link, and not writable by group or others;
+otherwise the stage refuses and names the path (`untrusted-owner`, `untrusted-writable`,
+`untrusted-link`, ...). The pins are not under `/etc` because `/etc` is a link on macOS.
+
+### macOS requirements
+
+- The bootstrap needs a **`gh` for darwin-arm64** (the release's `gh_<version>_macOS_arm64.zip`).
+- `/usr/local` must be `root:wheel` 755 and **not group-writable**: Homebrew on Intel
+  leaves it writable by the `admin` group, and the trust check then refuses, naming
+  `/usr/local`. (On Apple Silicon Homebrew uses `/opt/homebrew`.)
+- Untrusted bytes are handled as `nobody`, which on macOS is uid and gid 4294967294 (-2).
+  UNVERIFIED on the farm's Macs, as is the uid the Mac daemon runs as and whether it is
+  an administrator: the survey of the Macs must confirm both. `installer.conf` can name
+  another user.
+- `kbf-daemon --version --json` is not implemented today (`kbf-daemon --version` prints one
+  plain line); the version check above is what a Mac release needs it for.
+
+## Swapping a staged release in on trial
+
+`kbf_installer::activate` is what a program that applies orders calls (no command of
+`kbf-deploy` does yet). It never changes a release's files: a release directory is
+written once, so the process running the old release keeps its file, and only the
+`current` and `previous` links move.
+
+| Call | Does |
+|---|---|
+| `activate` | an order names a staged release and an order id (the helper names it `<epoch>-<id>`). The state is written first (`current` = the new release, `previous` = the one that ran, `staged` cleared, a pending record naming the order), then `previous` and `current` move, each by an atomic rename. The caller restarts the service. A repeat of the order, or an order for the release already current, changes nothing. The installer keeps no floor; the order of orders is the node's client and the helper's (epoch, then id). |
+| `confirm` | the new release came up: the pending record is cleared. It must name the order that made the swap. |
+| `revert` | `current` goes back to the release that ran before; the state is written first. If that release's files are gone nothing changes and the swap stays pending. |
+| `boot_check` | run before every start of the service. The first start after a swap starts the confirm window (not the swap: the frontend's own update can wait hours between the two); with a start budget, a release started that many times without a confirm is reverted before it starts again. |
+| `expire` | a swap whose window ran out without a confirm is reverted. On macOS, where nothing runs before a start, the window starts at the swap and this is the only trigger. |
+| `reconcile` | after an interrupted verb, make the links agree with the state. |
+
+The window is bounded by the host (120 to 1800 seconds), not by the order. Retention is
+`gc --keep 1`: the running release, the previous one and the newest other.

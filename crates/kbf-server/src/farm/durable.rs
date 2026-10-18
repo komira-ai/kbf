@@ -17,9 +17,36 @@
 //!   is written at the grant and at the end, never to renew it);
 //! - `loss/<operation>`: how many of the operation's leases were lost, while it is
 //!   unfinished and has lost any ([`kbf_sched::LOSS_REQUEUES`] refuses it);
+//! - `fate/<operation>`: what the operation's faults changed: the raised booking and the
+//!   memory runs of its kills for memory, the farm runs it used, the nodes placement
+//!   avoids for it and the leases given up as not started ([`kbf_sched::Fate`]), written
+//!   in the transaction of every requeue that follows a fault (whole, so the newest row
+//!   is the whole state) and deleted with the operation's other rows. A successor (after
+//!   a handover or a crash) books the next rung and spends the budgets that are left
+//!   instead of starting over. A store with no row for an operation books and counts as
+//!   it did before the row existed; a row written before the budgets were (version 1)
+//!   carries none of them;
+//! - `floor/<instance>/<action>`: a memory floor, the least memory a fresh submission of
+//!   the action books ([`kbf_sched::Floor`]): the ask and a stamp that orders the raises,
+//!   written in the transaction of the requeue that raises it, deleted in the one that
+//!   forgets it (the scheduler keeps [`kbf_sched::MEMORY_FLOORS`]), and not deleted with
+//!   an operation. A successor loads them all, oldest stamp first, and raises past the
+//!   largest stamp, so the order of eviction survives a reload. They have no expiry;
+//!   in memory they have none either;
+//! - `subject/<operation>`: what the operation's `action usage:` line says it is (the
+//!   shape key, configuration hash, target and the client's mnemonic and target hint,
+//!   [`crate::action_usage::Subject`]), written in the submission's transaction beside
+//!   `op/` and `queue/` and deleted with them, so a successor logs the same line the
+//!   writer would have. A store with no row for an operation logs the empty shape;
 //! - `done/<operation>`: how a finished or refused operation ended, kept for the finished
 //!   retention (at least [`DONE_FLOOR`]) so a process that did not finish it can still
-//!   answer the callers of it: a tag byte and the `ExecuteResponse` ([`kbf_front::Finished`]);
+//!   answer the callers of it: a tag byte and the `ExecuteResponse` ([`kbf_front::Finished`]).
+//!   It is put in the same transaction that deletes the operation's `op/`, `queue/`,
+//!   `loss/`, `fate/` and `subject/` rows (and its `lease/` row, for a result), so a
+//!   finished operation is always in the store as its unfinished rows or as its result,
+//!   never as neither. The row is as large as the response, and the store sets no bound
+//!   on a row, so a very large response makes a large transaction, as it made a large
+//!   row before;
 //! - `cordon/<worker>`: how an operator placed a node (cordoned, or draining until a
 //!   wall-clock deadline), kept until it is returned to placement, so a successor
 //!   process serves the node as the operator left it;
@@ -32,6 +59,7 @@
 //! `Committed` lease, a `WorkerUp`), so the strict codec the replicated log already runs
 //! decides what a row may hold.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -39,19 +67,27 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use kbf_front::{Described, Finished, Stage};
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
 use kbf_sched::fence::LEASE_GRACE;
-use kbf_sched::{DaemonInstance, Recovered, RecoveredLease, Request, Requeue};
+use kbf_sched::{
+    DaemonInstance, Fate, Floor, FloorChange, Recovered, RecoveredLease, Request, Requeue,
+    RequeueReason,
+};
 use kbf_state::{Cond, Conflict, GENERATION, Store, StoreError, Txn, Versioned};
 use kbf_types::{
-    ControlRecord, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, StartLease, WaiterId,
-    WorkerId,
+    ControlRecord, Digest, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, StartLease,
+    WaiterId, WorkerId,
 };
 
 use tokio::sync::watch;
 use tonic::Status;
 
-use super::{Farm, FarmMachine, Reported, Sent, Stamp, State, Waiter, process_term};
+use super::{
+    Detail, Farm, FarmMachine, Reported, Sent, Stamp, State, Waiter, finished_of, process_term,
+    refused_as,
+};
 use crate::action_usage::Subject;
 use crate::state_store::StateStore;
+
+use self::inflight::Submitted;
 
 /// How often a daemon session's row in the store is renewed while the daemon heartbeats:
 /// a third of the lease grace, so the row outlives two missed renewals. One write per
@@ -63,6 +99,9 @@ const ALIVE: &str = "meta/alive";
 const NEXT_OP: &str = "meta/next_op";
 const NEXT_SEQ: &str = "meta/next_seq";
 const CORDON: &str = "cordon/";
+const FATE: &str = "fate/";
+const FLOOR: &str = "floor/";
+const SUBJECT: &str = "subject/";
 
 /// The least time a `done/` row is kept, whatever the finished retention: a process that
 /// follows an operation it did not finish needs the row for as long as a stream it kept
@@ -122,6 +161,8 @@ pub(super) struct Stored {
     pub next_seq: u64,
     /// Every unfinished operation, in id order.
     pub operations: Vec<StoredOperation>,
+    /// Every memory floor, in key order.
+    pub floors: Vec<Floor>,
     /// Every node an operator placed, in node-id order.
     pub cordons: Vec<(WorkerId, StoredCordon)>,
 }
@@ -173,8 +214,8 @@ pub(super) enum Progress {
     /// It holds a lease.
     Running,
     /// The store has no trace of it: not unfinished and not ended. Its writer ends an
-    /// operation in two transactions, so for a moment after the first this is also what
-    /// a successful finish looks like.
+    /// operation in one transaction (the operation's rows removed, its `done/` row
+    /// put), so a finish never looks like this; a result row past its retention does.
     Gone,
 }
 
@@ -193,6 +234,10 @@ pub(super) struct StoredOperation {
     pub lease: Option<LeaseGrant>,
     /// How many of its leases were lost.
     pub losses: u32,
+    /// What its kills for memory changed, if it was killed.
+    pub fate: Option<Fate>,
+    /// What its `action usage:` line says it is, if the writer recorded it.
+    pub subject: Option<Subject>,
 }
 
 impl StoredOperation {
@@ -207,7 +252,62 @@ impl StoredOperation {
                 worker: grant.worker,
             }),
             losses: self.losses,
+            fate: self.fate,
         }
+    }
+}
+
+mod fate;
+mod floor;
+mod inflight;
+mod subject;
+
+/// The lease an effect starts, if it is a `Start`.
+fn started(effect: &Effect) -> Option<LeaseId> {
+    match effect {
+        Effect::Start(start) => Some(start.lease),
+        _ => None,
+    }
+}
+
+/// How a write to the state store ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Attempt {
+    /// The store took it.
+    Taken,
+    /// The store could not be reached: the same write may succeed later.
+    Transient,
+    /// A row the write depends on is gone or changed. On a first try the write is stale;
+    /// on a retry it is also what a write the store applied but did not acknowledge
+    /// leaves (the retry finds its own work done).
+    Stale,
+    /// The write cannot be encoded, or a newer writer holds the store: trying again
+    /// cannot help.
+    Dropped,
+}
+
+/// How an operation ended, as the `done/` row written in the transaction that removes
+/// the operation's rows.
+#[derive(Debug)]
+pub(super) struct Ending {
+    pub(super) finished: Finished,
+    /// How long the row is kept, at least [`DONE_FLOOR`].
+    pub(super) retention: Duration,
+}
+
+impl Ending {
+    /// `txn`, then the removal of the operation's `op/`, `queue/`, `loss/`, `fate/` and
+    /// `subject/` rows and the put of its result, so one transaction carries all of it.
+    /// The result goes over whatever is there: a row from an earlier try of the same
+    /// finish is its own.
+    fn settle(&self, txn: Txn, operation: OperationId) -> Txn {
+        let ttl = self.retention.max(DONE_FLOOR);
+        txn.delete(op_key(operation), Cond::Any)
+            .delete(queue_key(operation), Cond::Any)
+            .delete(loss_key(operation), Cond::Any)
+            .delete(fate_key(operation), Cond::Any)
+            .delete(subject_key(operation), Cond::Any)
+            .put_ttl(done_key(operation), self.finished.to_row(), ttl, Cond::Any)
     }
 }
 
@@ -239,6 +339,14 @@ fn queue_key(operation: OperationId) -> String {
 
 fn loss_key(operation: OperationId) -> String {
     format!("loss/{:016x}", operation.0)
+}
+
+fn fate_key(operation: OperationId) -> String {
+    format!("{FATE}{:016x}", operation.0)
+}
+
+fn subject_key(operation: OperationId) -> String {
+    format!("{SUBJECT}{:016x}", operation.0)
 }
 
 fn done_key(operation: OperationId) -> String {
@@ -283,6 +391,22 @@ fn parse_operation(key: &str, prefix: &str) -> Result<OperationId, StateError> {
     let id = u64::from_str_radix(&key[prefix.len()..], 16)
         .map_err(|_| corrupt(key, "not an operation id"))?;
     Ok(OperationId(id))
+}
+
+/// The grant a `lease/` row holds.
+fn lease_row(key: &str, row: &Versioned) -> Result<LeaseGrant, StateError> {
+    match decode(key, &row.value)? {
+        FarmInput::Committed(ControlRecord::Lease(grant)) => Ok(grant),
+        _ => Err(corrupt(key, "not a lease grant")),
+    }
+}
+
+/// The request an `op/` row holds.
+fn request_row(key: &str, row: &Versioned) -> Result<Request, StateError> {
+    match decode(key, &row.value)? {
+        FarmInput::Submit(request) => Ok(request),
+        _ => Err(corrupt(key, "not a request")),
+    }
 }
 
 fn number(key: &str, row: &Versioned) -> Result<u64, StateError> {
@@ -336,10 +460,7 @@ impl Durable {
     pub(super) fn load(&self) -> Result<Stored, StateError> {
         let mut leases = std::collections::BTreeMap::new();
         for (key, row) in self.store.scan_prefix("lease/")? {
-            let FarmInput::Committed(ControlRecord::Lease(grant)) = decode(&key, &row.value)?
-            else {
-                return Err(corrupt(&key, "not a lease grant"));
-            };
+            let grant = lease_row(&key, &row)?;
             leases.insert(grant.operation, grant);
         }
         let mut losses = std::collections::BTreeMap::new();
@@ -349,11 +470,33 @@ impl Durable {
                 .map_err(|_| corrupt(&key, "not a loss count"))?;
             losses.insert(operation, count);
         }
+        let mut fates = std::collections::BTreeMap::new();
+        for (key, row) in self.store.scan_prefix(FATE)? {
+            let operation = parse_operation(&key, FATE)?;
+            let fate = fate::decode(&row.value).map_err(|why| corrupt(&key, why))?;
+            fates.insert(operation, fate);
+        }
+        let mut subjects = std::collections::BTreeMap::new();
+        for (key, row) in self.store.scan_prefix(SUBJECT)? {
+            let operation = parse_operation(&key, SUBJECT)?;
+            let subject = subject::decode(&row.value).map_err(|why| corrupt(&key, why))?;
+            subjects.insert(operation, subject);
+        }
+        let mut floors = Vec::new();
+        let mut stamps = std::collections::BTreeSet::new();
+        for (key, row) in self.store.scan_prefix(FLOOR)? {
+            let floor = floor::decode(&row.value).map_err(|why| corrupt(&key, why))?;
+            if key != floor::row_key(&floor.key) {
+                return Err(corrupt(&key, "not the key of the floor it holds"));
+            }
+            if !stamps.insert(floor.stamp) {
+                return Err(corrupt(&key, "a stamp another floor has"));
+            }
+            floors.push(floor);
+        }
         let mut operations = Vec::new();
         for (key, row) in self.store.scan_prefix("op/")? {
-            let FarmInput::Submit(request) = decode(&key, &row.value)? else {
-                return Err(corrupt(&key, "not a request"));
-            };
+            let request = request_row(&key, &row)?;
             let operation = parse_operation(&key, "op/")?;
             let lease = leases.remove(&operation);
             operations.push(StoredOperation {
@@ -361,12 +504,15 @@ impl Durable {
                 request,
                 lease,
                 losses: losses.remove(&operation).unwrap_or(0),
+                fate: fates.remove(&operation),
+                subject: subjects.remove(&operation),
             });
         }
         Ok(Stored {
             next_operation: self.counter(NEXT_OP)?,
             next_seq: self.counter(NEXT_SEQ)?,
             operations,
+            floors,
             cordons: self.cordons()?,
         })
     }
@@ -396,7 +542,27 @@ impl Durable {
         self.commit(txn)
     }
 
-    /// Where `operation` stands.
+    /// The unfinished operations that run `action` (of `instance`, if given): at most one
+    /// per instance, since a twin joins the operation that is running.
+    pub(super) fn operations_of(
+        &self,
+        instance: Option<&str>,
+        action: &Digest,
+    ) -> Result<Vec<OperationId>, StateError> {
+        let mut found = Vec::new();
+        for (key, row) in self.store.scan_prefix("op/")? {
+            let request = request_row(&key, &row)?;
+            let named = instance.is_none_or(|instance| request.key.instance == instance);
+            if named && request.key.action == *action {
+                found.push(parse_operation(&key, "op/")?);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Where `operation` stands. The reads are separate, so a finish may land between
+    /// them: `done/` is read again when the operation's rows are gone, and a finish (one
+    /// transaction) leaves its result by then.
     pub(super) fn progress(&self, operation: OperationId) -> Result<Progress, StateError> {
         if let Some(finished) = self.ended(operation)? {
             return Ok(Progress::Ended(finished));
@@ -404,7 +570,9 @@ impl Durable {
         let unfinished = self.store.get(&op_key(operation))?.is_some();
         let queued = self.store.get(&queue_key(operation))?.is_some();
         Ok(match (unfinished, queued) {
-            (false, _) => Progress::Gone,
+            (false, _) => self
+                .ended(operation)?
+                .map_or(Progress::Gone, Progress::Ended),
             (true, true) => Progress::Queued,
             (true, false) => Progress::Running,
         })
@@ -414,19 +582,46 @@ impl Durable {
         self.store.get(key)?.map_or(Ok(0), |row| number(key, &row))
     }
 
-    /// An operation submitted: its request, and its place in the queue.
+    /// An operation submitted: its request, what its `action usage:` line says it is,
+    /// and its place in the queue, in one transaction.
     pub(super) fn submitted(
         &self,
         operation: OperationId,
         request: &Request,
+        subject: &Subject,
     ) -> Result<(), StateError> {
+        self.commit(self.submission(operation, request, subject)?)
+    }
+
+    /// [`Durable::submitted`], with the action's in-flight row in the same transaction:
+    /// `pin` is its key and what the row must be (absent, or the leftover version).
+    fn submitted_pinned(
+        &self,
+        operation: OperationId,
+        request: &Request,
+        subject: &Subject,
+        (pin, cond): (&str, Cond),
+    ) -> Result<(), StateError> {
+        let txn = self.submission(operation, request, subject)?;
+        self.commit(txn.put(pin, operation.0.to_be_bytes(), cond))
+    }
+
+    fn submission(
+        &self,
+        operation: OperationId,
+        request: &Request,
+        subject: &Subject,
+    ) -> Result<Txn, StateError> {
         let value = encode(FarmInput::Submit(request.clone()))?;
-        self.commit(
-            Txn::new()
-                .put(op_key(operation), value, Cond::Absent)
-                .put(queue_key(operation), Vec::new(), Cond::Absent)
-                .put(NEXT_OP, (operation.0 + 1).to_be_bytes(), Cond::Any),
-        )
+        Ok(Txn::new()
+            .put(op_key(operation), value, Cond::Absent)
+            .put(
+                subject_key(operation),
+                subject::encode(subject),
+                Cond::Absent,
+            )
+            .put(queue_key(operation), Vec::new(), Cond::Absent)
+            .put(NEXT_OP, (operation.0 + 1).to_be_bytes(), Cond::Any))
     }
 
     /// A grant committed: the operation leaves the queue and holds `grant`'s lease. The
@@ -454,17 +649,42 @@ impl Durable {
     /// that has finished has nothing to put back.
     ///
     /// `losses` is the operation's count of lost leases, to write down if the give-up is
-    /// one ([`kbf_sched::RequeueReason::is_loss`]).
+    /// one ([`kbf_sched::RequeueReason::is_loss`]). `fate` is what the operation's faults
+    /// changed so far, if they changed anything: it goes in the same transaction as the
+    /// queue row.
     pub(super) fn requeued(
         &self,
         requeue: &Requeue,
         losses: Option<u32>,
+        fate: Option<&Fate>,
+        floors: &FloorChange,
     ) -> Result<(), StateError> {
+        let mut txn = Txn::new();
+        // The floor outlives the operation: a kill raises it, and the operation may end
+        // before the write is taken.
+        let raised = floors.raised.as_ref();
+        if let Some(floor) = raised {
+            let row = floor::encode(floor).ok_or_else(|| {
+                corrupt(&floor::row_key(&floor.key), "a floor is too large to write")
+            })?;
+            txn = txn.put(floor::row_key(&floor.key), row, Cond::Any);
+        }
+        // A key forgotten and raised again since keeps its row.
+        for key in floors
+            .evicted
+            .iter()
+            .filter(|k| raised.is_none_or(|f| &f.key != *k))
+        {
+            txn = txn.delete(floor::row_key(key), Cond::Any);
+        }
         if self.store.get(&op_key(requeue.operation))?.is_none() {
-            return Ok(());
+            return if raised.is_some() || !floors.evicted.is_empty() {
+                self.commit(txn)
+            } else {
+                Ok(())
+            };
         }
         let key = lease_key(requeue.lease);
-        let mut txn = Txn::new();
         if let Some(row) = self.store.get(&key)? {
             txn = txn.delete(key, Cond::Version(row.version));
         }
@@ -472,43 +692,76 @@ impl Durable {
             let count = u64::from(count).to_be_bytes();
             txn = txn.put(loss_key(requeue.operation), count, Cond::Any);
         }
+        if let Some(fate) = fate {
+            let row = fate::encode(fate).ok_or_else(|| {
+                corrupt(&fate_key(requeue.operation), "a fate is too large to write")
+            })?;
+            txn = txn.put(fate_key(requeue.operation), row, Cond::Any);
+        }
         self.commit(txn.put(queue_key(requeue.operation), Vec::new(), Cond::Any))
     }
 
-    /// A result accepted from `lease`: the operation is finished. Compare-and-set on
-    /// the operation's lease: a result of a lease the operation no longer holds is
-    /// refused, whatever was proposed.
-    fn finished(&self, operation: OperationId, lease: LeaseId) -> Result<(), StateError> {
+    /// A result accepted from `lease`: the operation is finished. The lease row goes if
+    /// it is there, compare-and-set on its version. It may be gone: the scheduler lets a
+    /// worker's result decide an operation whose lease it gave up in the same feed, and
+    /// that give-up ([`Durable::requeued`]) already deleted the row and put the queue row
+    /// back. The operation's own rows go either way, so a finished operation is never
+    /// left queued. A lease row gone with no queue row is not that give-up: `Missing`.
+    ///
+    /// The `done/` row of `ending` is put in the same transaction as the deletes, so the
+    /// store holds the operation's unfinished rows or its result, never neither.
+    fn finished(
+        &self,
+        operation: OperationId,
+        lease: LeaseId,
+        ending: &Ending,
+    ) -> Result<(), StateError> {
         let key = lease_key(lease);
-        let row = self.row(&key)?;
-        self.commit(
-            Txn::new()
-                .delete(key, Cond::Version(row.version))
-                .delete(op_key(operation), Cond::Any)
-                .delete(queue_key(operation), Cond::Any)
-                .delete(loss_key(operation), Cond::Any),
-        )
+        let mut txn = Txn::new();
+        match self.store.get(&key)? {
+            Some(row) => txn = txn.delete(key, Cond::Version(row.version)),
+            // Gone with the operation queued again is the farm's own give-up. Gone
+            // without is another writer's doing: the result is stale.
+            None => {
+                if self.store.get(&queue_key(operation))?.is_none() {
+                    return Err(StateError::Missing(key));
+                }
+            }
+        }
+        let txn = self.unpin(txn, operation)?;
+        self.commit(ending.settle(txn, operation))
     }
 
-    /// A refusal committed: the operation is finished without a lease.
-    fn refused(&self, operation: OperationId) -> Result<(), StateError> {
-        self.commit(
-            Txn::new()
-                .delete(op_key(operation), Cond::Any)
-                .delete(queue_key(operation), Cond::Any)
-                .delete(loss_key(operation), Cond::Any),
-        )
+    /// A refusal committed: the operation is finished without a lease, and its `done/`
+    /// row goes in the same transaction as its rows are removed.
+    fn refused(&self, operation: OperationId, ending: &Ending) -> Result<(), StateError> {
+        let txn = self.unpin(Txn::new(), operation)?;
+        self.commit(ending.settle(txn, operation))
     }
 
     /// Writes what the scheduler's effects of a committed record settle, in order.
     /// Nothing the effects carry (a `Start`, an answer) is carried out unless this
-    /// returns `Ok`.
-    pub(super) fn persist(&self, effects: &[Effect]) -> Result<(), StateError> {
+    /// returns `Ok`. `ending` is how the operation an `Answer` or a `Refuse` finishes
+    /// ended: its row is written with the operation's rows removed, in one transaction
+    /// (an effect that ends an operation and has none is `Missing`, and writes nothing).
+    /// The farm passes one effect at a time (the held queue's front); `ending` is the
+    /// result of the one effect among `effects` that ends an operation, so a slice with
+    /// two endings is not a use of it.
+    pub(super) fn persist(
+        &self,
+        effects: &[Effect],
+        ending: Option<&Ending>,
+    ) -> Result<(), StateError> {
+        let ending = || {
+            ending.ok_or_else(|| StateError::Missing("result of the ending operation".to_owned()))
+        };
         for effect in effects {
             match effect {
                 Effect::Start(start) => self.granted(start)?,
-                Effect::Answer(answer) => self.finished(answer.operation, answer.lease)?,
-                Effect::Refuse(refusal) => self.refused(refusal.operation)?,
+                Effect::Answer(answer) => {
+                    self.finished(answer.operation, answer.lease, ending()?)?;
+                }
+                Effect::Refuse(refusal) => self.refused(refusal.operation, ending()?)?,
                 Effect::Commit(_) | Effect::Waiting(_) => {}
             }
         }
@@ -554,17 +807,6 @@ impl Durable {
         row.map(|row| number(GENERATION, &row)).transpose()
     }
 
-    /// How `operation` ended, kept for `retention` (never less than [`DONE_FLOOR`]).
-    pub(super) fn done(
-        &self,
-        operation: OperationId,
-        finished: &Finished,
-        retention: Duration,
-    ) -> Result<(), StateError> {
-        let ttl = retention.max(DONE_FLOOR);
-        self.commit(Txn::new().put_ttl(done_key(operation), finished.to_row(), ttl, Cond::Any))
-    }
-
     /// How `operation` ended, if its `done/` row is still there.
     fn ended(&self, operation: OperationId) -> Result<Option<Finished>, StateError> {
         let key = done_key(operation);
@@ -590,6 +832,12 @@ impl Durable {
             };
             flag.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// Whether a write was refused because a newer writer holds the store: nothing this
+    /// handle writes can succeed any more.
+    pub(super) fn superseded(&self) -> bool {
+        self.fenced.load(Ordering::SeqCst)
     }
 
     /// A write that tells whether the store takes writes again.
@@ -646,17 +894,152 @@ impl State {
         what: &str,
         write: impl FnOnce(&Durable) -> Result<(), StateError>,
     ) -> bool {
+        self.attempt(what, write) == Attempt::Taken
+    }
+
+    /// [`State::durably`], telling a refusal that a later try can overcome (the store
+    /// could not be reached) from one it cannot (the write is stale, or a newer writer
+    /// holds the store).
+    fn attempt(
+        &self,
+        what: &str,
+        write: impl FnOnce(&Durable) -> Result<(), StateError>,
+    ) -> Attempt {
         let Some(durable) = &self.durable else {
-            return true;
+            return Attempt::Taken;
         };
         match write(durable) {
-            Ok(()) => true,
+            Ok(()) => Attempt::Taken,
             Err(error) => {
                 tracing::error!(%error, "the state store did not take {what}");
                 durable.note_failure(&error);
-                false
+                match error {
+                    StateError::Store(cause) if !matches!(cause, StoreError::Fenced) => {
+                        Attempt::Transient
+                    }
+                    StateError::Missing(_) | StateError::Conflict(_) => Attempt::Stale,
+                    _ => Attempt::Dropped,
+                }
             }
         }
+    }
+
+    /// A newer writer holds the state store ([`Durable::fenced`]): nothing more is
+    /// written to it.
+    fn superseded(&self) -> bool {
+        self.durable
+            .as_ref()
+            .is_some_and(|d| d.fenced.load(Ordering::SeqCst))
+    }
+
+    /// Writes the held-back effects of committed records to the state store, oldest
+    /// first, and returns the ones it took, for the caller to carry out. Stops at the
+    /// first row the store refuses because it cannot be reached: it and everything after
+    /// it wait for the next call, so no later row is written ahead of an earlier one (a
+    /// result must not be written before the grant it follows, nor a grant after the
+    /// result of the lease it names). A row the store refuses as stale drops its record's
+    /// remaining effects, as a refused record always did. Once a newer writer fences the
+    /// store, everything held is dropped and nothing is written.
+    pub(super) fn release_unwritten(&mut self) -> Vec<Effect> {
+        let mut ready = Vec::new();
+        loop {
+            if self.superseded() {
+                let held: usize = self.unwritten.iter().map(VecDeque::len).sum();
+                if held > 0 {
+                    self.write_drops += held as u64;
+                    tracing::error!(held, "a newer writer holds the store: held effects dropped");
+                }
+                // Only the held answers' details go: an answer already written and in
+                // `ready` is settled with its own after this returns.
+                for batch in std::mem::take(&mut self.unwritten) {
+                    self.forget_details(batch);
+                }
+                self.retrying = None;
+                return ready;
+            }
+            let Some(front) = self.unwritten.front() else {
+                return ready;
+            };
+            let Some(effect) = front.front().cloned() else {
+                self.unwritten.pop_front();
+                continue;
+            };
+            let ending = self.ending(&effect);
+            let mut attempt = self.attempt("a committed record", |d| {
+                d.persist(std::slice::from_ref(&effect), ending.as_ref())
+            });
+            if attempt == Attempt::Stale && self.retrying.as_ref() == Some(&effect) {
+                // An earlier try of this very write was refused as unreachable; the
+                // store may have applied it all the same, and then the rows it
+                // depends on are gone. Its work is done: carry the effect out.
+                tracing::warn!("a retried write finds its work done; carrying the effect out");
+                attempt = Attempt::Taken;
+            }
+            match attempt {
+                Attempt::Taken => {
+                    self.retrying = None;
+                    self.unwritten.front_mut().and_then(VecDeque::pop_front);
+                    ready.push(effect);
+                }
+                Attempt::Transient => {
+                    self.retrying = Some(effect);
+                    let held: usize = self.unwritten.iter().map(VecDeque::len).sum();
+                    tracing::warn!(held, "store holds back records; retried later");
+                    return ready;
+                }
+                Attempt::Stale | Attempt::Dropped => {
+                    self.retrying = None;
+                    self.write_drops += 1;
+                    tracing::error!("a committed record's remaining effects were dropped");
+                    let dropped = self.unwritten.pop_front().unwrap_or_default();
+                    self.forget_details(dropped);
+                }
+            }
+        }
+    }
+
+    /// Forgets the details parked for the answers among `dropped` effects, which will
+    /// never be written. The details of answers the store has taken stay: they are
+    /// settled after this feed's writes, whatever a later record does.
+    fn forget_details(&mut self, dropped: VecDeque<Effect>) {
+        for effect in dropped {
+            if let Effect::Answer(answer) = effect {
+                self.parked.remove(&answer.lease);
+            }
+        }
+    }
+
+    /// Forgets the detail of every report whose answer is no longer held.
+    pub(super) fn forget_parked(&mut self) {
+        let held = &self.unwritten;
+        let waits = |lease: &LeaseId| {
+            let answers = |e: &Effect| matches!(e, Effect::Answer(a) if a.lease == *lease);
+            held.iter().flatten().any(answers)
+        };
+        self.parked.retain(|lease, _| waits(lease));
+    }
+
+    /// Keeps `detail`, the report of `lease`, before the report is fed: the answer it
+    /// decides is written with the result it carries, in the transaction that finishes
+    /// the operation ([`State::ending`]), and settled with the same detail
+    /// ([`State::settle`]). Call [`State::forget_parked`] once the answers are settled.
+    pub(super) fn park(&mut self, lease: LeaseId, detail: Detail) {
+        self.parked.insert(lease, detail);
+    }
+
+    /// How the operation of `effect` ended, if the effect ends one: the row the store
+    /// takes in the transaction that finishes it. An answer's is what its callers are
+    /// told ([`finished_of`], from the report's detail if one is kept).
+    fn ending(&self, effect: &Effect) -> Option<Ending> {
+        let finished = match effect {
+            Effect::Answer(answer) => finished_of(answer, self.parked.get(&answer.lease)),
+            Effect::Refuse(refusal) => refused_as(refusal),
+            Effect::Start(_) | Effect::Commit(_) | Effect::Waiting(_) => return None,
+        };
+        Some(Ending {
+            finished,
+            retention: self.finished_retention,
+        })
     }
 
     /// Tells the scheduler when the state store went away and when it came back (see
@@ -698,18 +1081,36 @@ impl State {
     /// grant is refused and the operation never runs.
     pub(super) fn settle_requeues(&mut self, given_up: &[Requeue]) {
         for requeue in given_up {
+            // A grant the store has not taken for a lease the scheduler has given up
+            // is never written: it would put the lease back in the store, held by no
+            // one, over the queue row this requeue writes.
+            for batch in &mut self.unwritten {
+                batch.retain(|e| started(e) != Some(requeue.lease));
+            }
             let losses = if requeue.reason.is_loss() {
                 self.sched.losses(requeue.operation)
             } else {
                 None
             };
-            self.unsettled.push((requeue.clone(), losses));
+            // Taken now, not when the store takes the write: a later kill must not
+            // reach an earlier requeue's row.
+            let fate = self.sched.fate(requeue.operation);
+            // Only a kill past the action's own limit raises a floor, and only a raise
+            // forgets one.
+            let floors = if matches!(requeue.reason, RequeueReason::OutOfMemory { .. }) {
+                self.sched.take_floor_change(requeue.operation)
+            } else {
+                FloorChange::default()
+            };
+            self.unsettled.push((requeue.clone(), losses, fate, floors));
         }
         let pending = std::mem::take(&mut self.unsettled);
-        let refused: Vec<(Requeue, Option<u32>)> = pending
+        let refused: Vec<_> = pending
             .into_iter()
-            .filter(|(requeue, losses)| {
-                !self.durably("a requeue", |d| d.requeued(requeue, *losses))
+            .filter(|(requeue, losses, fate, floors)| {
+                !self.durably("a requeue", |d| {
+                    d.requeued(requeue, *losses, fate.as_ref(), floors)
+                })
             })
             .collect();
         self.unsettled = refused;
@@ -731,6 +1132,39 @@ impl State {
         }
     }
 
+    /// `op`, an operation the state store holds, as the scheduler takes it up: held for
+    /// a caller of its own that no client waits on, which the next request for the
+    /// action joins.
+    fn take_stored(&mut self, mut op: StoredOperation, now: SystemTime) -> Recovered {
+        let key = op.request.key.clone();
+        let waiter = self.machine.submit(Waiter {
+            key: key.clone(),
+            kind: op.request.kind,
+            do_not_cache: op.request.do_not_cache,
+            queued: now,
+            // A row from a writer that did not record the subject (an older build)
+            // leaves the `action usage:` line naming the empty shape.
+            usage: op
+                .subject
+                .take()
+                .unwrap_or_else(|| Subject::of(Described::default()).0),
+        });
+        self.stages.insert(waiter, watch::channel(Stage::Queued).0);
+        if let Some(grant) = &op.lease {
+            let stamp = Stamp {
+                queued: now,
+                started: now,
+            };
+            let sent = Sent {
+                operation: op.operation,
+                action: key.action,
+                stamp,
+            };
+            self.machine.start(grant.lease, sent);
+        }
+        op.recovered(waiter)
+    }
+
     /// [`Farm::with_state`] on the farm's state: opens `state`, reads what it holds and
     /// takes it up. Returns the store's epoch, or `None` if there is no store. Not
     /// generic, unlike `Farm::with_state`, so every test binary's runs count toward the
@@ -748,32 +1182,10 @@ impl State {
         let now = SystemTime::now();
         let mut recovered = Vec::new();
         for op in stored.operations {
-            let key = op.request.key.clone();
-            let waiter = self.machine.submit(Waiter {
-                key: key.clone(),
-                kind: op.request.kind,
-                do_not_cache: op.request.do_not_cache,
-                queued: now,
-                // The command the callers described is not kept: a recovered operation's
-                // `action usage:` line names the empty shape.
-                usage: Subject::of(Described::default()).0,
-            });
-            self.stages.insert(waiter, watch::channel(Stage::Queued).0);
-            if let Some(grant) = &op.lease {
-                let stamp = Stamp {
-                    queued: now,
-                    started: now,
-                };
-                let sent = Sent {
-                    operation: op.operation,
-                    action: key.action,
-                    stamp,
-                };
-                self.machine.start(grant.lease, sent);
-            }
-            recovered.push(op.recovered(waiter));
+            recovered.push(self.take_stored(op, now));
         }
         let next_operation = OperationId(stored.next_operation);
+        self.sched.restore_floors(stored.floors);
         self.sched
             .recover(epoch, next_operation, stored.next_seq, recovered);
         self.restore_cordons(stored.cordons);
@@ -788,10 +1200,17 @@ impl State {
     /// # Errors
     /// UNAVAILABLE if the store did not take it: the request is not queued, and the
     /// client, who is told nothing is queued, asks again.
-    pub(super) fn queue(&self, request: &Request) -> Result<(), Status> {
+    pub(super) fn queue(&mut self, request: &Request, subject: &Subject) -> Result<(), Status> {
+        if self.sched.twin(request).is_some() {
+            return Ok(());
+        }
         let id = self.sched.next_operation();
-        let joins = self.sched.twin(request).is_some();
-        if !joins && !self.durably("a submission", |d| d.submitted(id, request)) {
+        let mut submitted = None;
+        let taken = self.durably("a submission", |d| {
+            submitted = Some(d.submit(id, request, subject)?);
+            Ok(())
+        });
+        if !taken {
             if self
                 .durable
                 .as_ref()
@@ -804,6 +1223,14 @@ impl State {
             return Err(Status::unavailable(
                 "the scheduler's state store did not take the request",
             ));
+        }
+        match submitted {
+            Some(Submitted::Queued(used)) => self.sched.skip_to(used),
+            Some(Submitted::Joined(op)) => {
+                let recovered = self.take_stored(*op, SystemTime::now());
+                self.sched.take_in(recovered);
+            }
+            None => {}
         }
         Ok(())
     }
@@ -825,5 +1252,7 @@ impl State {
     }
 }
 
+#[cfg(test)]
+mod submit_tests;
 #[cfg(test)]
 mod tests;

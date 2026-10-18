@@ -29,7 +29,7 @@ impl ContentAddressableStorage for StorageService {
         &self,
         request: Request<FindMissingBlobsRequest>,
     ) -> Result<Response<FindMissingBlobsResponse>, Status> {
-        self.admission.check(&request, Endpoint::FindMissing)?;
+        self.guard(&request, Endpoint::FindMissing)?;
         self.check_map(generation::requested(&request)?).await?;
         let request = request.into_inner();
         if request.blob_digests.len() > MAX_FIND_MISSING_DIGESTS {

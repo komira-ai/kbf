@@ -7,6 +7,7 @@
 //! no [`RemoteStorage`] would is refused with the code the protocol names.
 
 mod catch_up;
+mod denied;
 mod every_call;
 pub(crate) mod fake;
 mod generation;
@@ -531,6 +532,64 @@ async fn concurrent_writes_wait_for_room() {
     );
 }
 
+/// Catches a closure lost, invented or made mandatory on the wire. An entry's closure
+/// comes back as the store reported it, in order; an entry that needs nothing else comes
+/// back with an empty closure (`Some`, nothing to check); an entry from a store that
+/// reports no closure (a node from before the field) comes back with `None` (unchecked),
+/// not as an empty closure, and `action_result` still answers it. Mutants: the field
+/// dropped (`None` for all), an absent closure read as empty, an empty one as absent.
+#[tokio::test]
+async fn an_entrys_closure_round_trips_and_absent_means_unchecked() {
+    let (mem, remote, _) = pair().await;
+    let bare = sha(b"bare");
+    let needy = sha(b"needy");
+    for (action, blobs) in [(bare, 0), (needy, 3)] {
+        let record = remote
+            .prepare_action_result(&ActionResult {
+                stdout_raw: b"out".to_vec(),
+                exit_code: blobs,
+                ..ActionResult::default()
+            })
+            .await
+            .expect("prepared");
+        remote
+            .commit_action_record(Role::Daemon, action, record)
+            .await
+            .expect("committed");
+    }
+
+    let entry = remote
+        .action_entry(&needy)
+        .await
+        .expect("a hit")
+        .expect("an entry");
+    let wanted: Vec<Digest> = (0..3).map(|i| sha(&[i as u8])).collect();
+    assert_eq!(entry.closure, Some(wanted));
+    assert_eq!(entry.result_digest, sha(b"out"));
+    let entry = remote
+        .action_entry(&bare)
+        .await
+        .expect("a hit")
+        .expect("an entry");
+    assert_eq!(entry.closure, Some(Vec::new()), "reported, and empty");
+    assert!(
+        remote
+            .action_entry(&sha(b"none"))
+            .await
+            .expect("a miss")
+            .is_none()
+    );
+
+    mem.legacy_actions.store(true, Ordering::SeqCst);
+    let entry = remote
+        .action_entry(&needy)
+        .await
+        .expect("a hit")
+        .expect("an entry");
+    assert_eq!(entry.closure, None, "not reported: unchecked");
+    assert!(remote.action_result(&needy).await.expect("a hit").is_some());
+}
+
 /// Catches the action cache losing something on the wire: a miss that becomes a hit or
 /// the reverse, the result blob's digest, a record's closure, a refusal that loses the
 /// blob it names (the three kinds), a client that commits (refused, whatever the store
@@ -690,6 +749,14 @@ async fn a_client_does_not_trust_a_node_that_contradicts_itself() {
             .map(drop)
             .expect_err("bad digest")
     ));
+    let two_bytes = Digest::new(kbf_types::DigestFunction::Sha256, [2; 32], 2);
+    assert!(invalid(
+        remote
+            .action_entry(&two_bytes)
+            .await
+            .map(drop)
+            .expect_err("bad closure digest")
+    ));
     let empty = remote
         .prepare_action_result(&ActionResult::default())
         .await
@@ -721,7 +788,7 @@ async fn a_client_does_not_trust_a_node_that_contradicts_itself() {
         .commit_action_record(Role::Daemon, action, record)
         .await
         .expect("committed");
-    assert_eq!(*odd.generations.lock().expect("lock"), [9, 9, 9, 9, 9]);
+    assert_eq!(*odd.generations.lock().expect("lock"), [9, 9, 9, 9, 9, 9]);
 
     let five = Digest::new(kbf_types::DigestFunction::Sha256, [1; 32], 5);
     let short = remote
