@@ -157,8 +157,8 @@ ExecStart=/var/lib/kbf/releases/current/kbf frontend --config /etc/kbf/kbf.toml 
 - Not `policy-rc.d`: that file is a local administrator and image tool [V].
 - Rootless containers: the daemon runs as `User=kbf` with `Delegate=yes`; rootless Podman runs in the `kbf`
   user's own manager kept alive by lingering. `--userns=nomap` needs a subuid and subgid range for `kbf`
-  (`usermod --add-subuids` is the documented fix). `DynamicUser=` is rejected: it forces `NoNewPrivileges`,
-  which blocks setuid `newuidmap` [V, `daemon.md`, `../deploy/linux-build-host.md`]. Creating the `kbf` user is
+  (`usermod --add-subuids` is the documented fix). `DynamicUser=` is not used: the daemon needs a fixed
+  user that owns subid ranges, and `crun` runs `newuidmap` [V, `daemon.md`]. Creating the `kbf` user is
   sysusers (package); the subid range and lingering are done by `kbf-installer setup` as root, because
   `systemd-sysusers` allocates no subid ranges [L].
 
