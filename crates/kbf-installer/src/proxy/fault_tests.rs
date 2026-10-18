@@ -729,13 +729,14 @@ fn a_restart_while_a_rollback_drains_the_new_child_finishes_the_rollback() {
 }
 
 #[test]
-fn a_restart_while_the_old_child_drains_when_the_new_one_lost_the_generation_rolls_back_first() {
-    // The new child is alive and the store says it is not the holder. The old child must
+fn a_restart_before_the_confirm_when_the_new_one_lost_the_generation_rolls_back_first() {
+    // The proxy stopped as the bake began, before the root's confirm. The new child is
+    // alive and the store says it is not the holder. The old child must
     // not be left waiting on a slot that serves nothing: the restart rolls back (hold,
     // resume the old child), retires the new child by SIGTERM and ends the update `failed`
     // at `switch`. It used to leave both children running for ever.
     let (w, old) = World::with_old();
-    w.crash_at.set(Some(CrashPoint::WhileDraining));
+    *w.crash_on_record.borrow_mut() = Some(Box::new(|i| i.phase == Phase::Baking));
     run_to_crash(&w, plan(Mode::Frontend), Some(old));
     w.st.borrow_mut().procs[1].holder = false;
     w.set_limit(secs(7200));

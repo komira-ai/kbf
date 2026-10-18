@@ -57,7 +57,9 @@ impl<'a> Swap<'a> {
     /// If it is dead or does not hold it while the old child lives, the switch failed, and
     /// the update is reconciled by rolling back before anything is retired
     /// ([`Swap::failed_switch`]). If both children are dead, nobody serves and the new
-    /// release starts again ([`Swap::cold_start`]).
+    /// release starts again ([`Swap::cold_start`]). Once the root's confirm landed
+    /// ([`Swap::confirmed`]) there is no rollback: a dead new child is started again
+    /// beside a draining old one, and a live non-holder new child takes over.
     pub(super) fn recover_post_switch(&mut self) -> Result<Flow, Halt> {
         let new = self.intent.new_slot;
         // A rollback was recorded and its children's half has not finished (it sets
@@ -77,33 +79,61 @@ impl<'a> Swap<'a> {
         if self.intent.new_proc.is_none() {
             return Ok(Flow::Go);
         }
+        let confirmed = self.confirmed();
         match (self.old_alive, role) {
-            (true, Some(_)) => {
+            // Before the confirm the store's answer is a failed switch: roll back.
+            (true, Some(_)) if !confirmed => {
                 self.failed_switch("the new child does not hold the generation".into())
             }
-            (true, None) if !self.new_alive => {
+            (true, None) if !self.new_alive && !confirmed => {
                 self.failed_switch("the new child is gone while the old child lives".into())
             }
-            (false, None) if !self.new_alive => {
+            // The new child is dead and there is nothing to roll back to, or the confirm
+            // landed and `current` names the new release: start it again. A live old
+            // child stands down and drains.
+            (_, None) if !self.new_alive => {
                 let (new, to) = (self.intent.new_slot, self.plan.to.clone());
                 match self.cold_start(new, &to)? {
                     Ok(()) => {
                         self.note(
-                            "both children were gone: the new release was started again".into(),
+                            "the new child was gone: the new release was started again".into(),
                         );
+                        self.stand_down_old();
                         Ok(Flow::Go)
                     }
-                    Err(e) => self.fail(Step::Restart, format!("both children were gone; {e}")),
+                    Err(e) => self.fail(Step::Restart, format!("the new child was gone; {e}")),
                 }
             }
-            // The only live child is the new one and nobody holds the generation: a cold
-            // start (or one the proxy began before it stopped) goes on with the takeover.
-            (false, Some(_)) => match self.cold_takeover(new)? {
-                Ok(()) => Ok(Flow::Go),
-                Err(e) => self.fail(Step::Restart, e),
-            },
+            // The new child is alive and does not hold the generation, and either the old
+            // child is gone (a cold start the proxy began before it stopped goes on) or the
+            // confirm landed: the new child takes over. The old child stands down first.
+            (_, Some(_)) => {
+                self.stand_down_old();
+                match self.cold_takeover(new)? {
+                    Ok(()) => Ok(Flow::Go),
+                    Err(e) => self.fail(Step::Restart, e),
+                }
+            }
             // Alive and silent: nothing proves it lost the generation. The bake sees it.
             (_, None) => Ok(Flow::Go),
+        }
+    }
+
+    /// The root's `confirm` landed: `current` names the new release (phase `nodes` or
+    /// later; with `nodes` false the phase moves from `baking` to `draining`, and a failed
+    /// confirm is not a landed one). After it the store's answer is final: a restart
+    /// never rolls back, it starts the recorded-active release again if it died.
+    fn confirmed(&self) -> bool {
+        self.intent.phase >= Phase::Nodes && !self.confirm_failed()
+    }
+
+    /// Tell a live old child to stand down; a refusal changes nothing, the fence holds.
+    fn stand_down_old(&mut self) {
+        let old = self.intent.old_slot;
+        if self.old_alive
+            && let Err(e) = self.ports.admin.stand_down(old)
+        {
+            self.note(format!("stand-down of the old child failed: {e}"));
         }
     }
 
