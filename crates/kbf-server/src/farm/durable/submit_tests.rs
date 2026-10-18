@@ -26,6 +26,7 @@ use crate::state_store::StateStore;
 struct LostAck {
     inner: Fake,
     armed: AtomicBool,
+    down: AtomicBool,
     /// Applied just before the next transaction that names an `op/` row: a write landing
     /// between the farm's look at the store and its own write.
     before_submit: std::sync::Mutex<Option<Txn>>,
@@ -36,6 +37,7 @@ impl LostAck {
         Arc::new(Self {
             inner: Fake::with_flaw(Arc::new(ManualClock::default()), Flaw::None),
             armed: AtomicBool::new(false),
+            down: AtomicBool::new(false),
             before_submit: std::sync::Mutex::new(None),
         })
     }
@@ -47,6 +49,9 @@ impl LostAck {
 
 impl Store for LostAck {
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
+        if self.down.load(Ordering::SeqCst) {
+            return Err(StoreError::Failed("the store is down".to_owned()));
+        }
         let submits = batch.iter().flat_map(Txn::ops).any(|op| match op {
             kbf_state::Op::Put { key, .. } => key.starts_with("op/"),
             _ => false,
@@ -530,4 +535,45 @@ fn finishing_an_operation_with_no_rows_writes_its_result_alone() {
     refuse(&durable, 7);
     assert_eq!(rows(&store, "inflight/"), 0);
     assert_eq!(rows(&store, "done/"), 1);
+}
+
+/// Catches: a store that is down at the write being taken for a refusal that stays (the
+/// retry of a client after the outage is refused too) or leaving a row; and a farm
+/// with no state store failing to queue in memory.
+#[test]
+fn a_store_that_is_down_refuses_the_submit_and_a_farm_without_one_queues() {
+    let store = LostAck::new();
+    let farm = farm_over(&store);
+    store.down.store(true, Ordering::SeqCst);
+    let refused = submit(&farm, 1);
+    assert_eq!(refused.map(|_| ()).unwrap_err().code(), Code::Unavailable);
+    assert_eq!(rows(&store, "op/"), 0);
+    store.down.store(false, Ordering::SeqCst);
+    assert!(submit(&farm, 1).is_ok());
+    assert_eq!(rows(&store, "op/"), 1);
+
+    let bare = Farm::new(
+        Arc::new(Cache::memory()),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
+    assert!(submit(&bare, 1).is_ok());
+    assert_eq!(unfinished(&bare).len(), 1);
+}
+
+/// Catches: a submit that looks again for ever when a row stays in the way (the store's
+/// counter is stuck behind rows it holds): it gives up, refused, after a few looks, and
+/// writes nothing of its own.
+#[test]
+fn a_row_that_stays_in_the_way_ends_the_looks() {
+    let store = LostAck::new();
+    let farm = farm_over(&store);
+    let block = Txn::new().put("op/0000000000000000", Vec::new(), Cond::Any);
+    store.txn(block).expect("store").expect("put");
+
+    let refused = submit(&farm, 1);
+
+    assert_eq!(refused.map(|_| ()).unwrap_err().code(), Code::Unavailable);
+    assert_eq!(rows(&store, "inflight/"), 0);
+    assert_eq!(rows(&store, "queue/"), 0);
 }

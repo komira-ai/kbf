@@ -63,8 +63,8 @@ impl Durable {
             return Ok(Submitted::Queued(id));
         }
         let pin = inflight_key(&request.key);
-        let mut taken = Err(StateError::Missing("an attempt".to_owned()));
-        for _ in 0..LOOKS {
+        let mut looks = 0;
+        loop {
             let mut cond = Cond::Absent;
             if let Some(row) = self.store.get(&pin)? {
                 let held = OperationId(number(&pin, &row)?);
@@ -77,17 +77,16 @@ impl Durable {
                 // The operation it names is gone: the row is left over, and goes.
                 cond = Cond::Version(row.version);
             }
-            taken = self.submitted_pinned(id, request, subject, (&pin, cond));
-            match taken {
+            match self.submitted_pinned(id, request, subject, (&pin, cond)) {
                 Ok(()) => return Ok(Submitted::Queued(id)),
                 // Another writer took the id, or queued this action since the look.
-                Err(StateError::Conflict(_)) => {
+                Err(StateError::Conflict(_)) if looks < LOOKS => {
+                    looks += 1;
                     id = OperationId(self.counter(NEXT_OP)?.max(id.0));
                 }
-                Err(_) => break,
+                Err(error) => return Err(error),
             }
         }
-        taken.map(|()| Submitted::Queued(id))
     }
 
     /// The operation `operation` as the store holds it, or `None` if it has no `op/` row.
