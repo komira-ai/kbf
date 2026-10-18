@@ -547,6 +547,18 @@ async fn a_stop_without_a_handover_drains_as_before() {
     client.upload(&job.blobs()).await;
     assert_eq!(readyz(old.api).await, 200);
 
+    // Refusal, before any GOAWAY: the connection is open and the listener accepts, so
+    // the only thing that can answer this Execute is the server, and it must say
+    // UNAVAILABLE. (After GOAWAY the client may fail a call locally, see below.)
+    assert!(old.drain.refuse(), "nothing refused yet");
+    let refused = client.execute_with(&job.action, false).await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.code() == Code::Unavailable),
+        "{refused:?}"
+    );
+
     let Proc {
         drain,
         served,
@@ -556,13 +568,40 @@ async fn a_stop_without_a_handover_drains_as_before() {
     drop(_stop);
     until("the drain begins", async || drain.is_draining()).await;
     assert!(drain.is_unready());
+    // A call after GOAWAY is refused, but by whom is a race: the server answers
+    // UNAVAILABLE if the call reached it, and the client fails it locally (`Cancelled`,
+    // "connection was not ready") if the GOAWAY or the close got there first. Both mean
+    // the Execute was not accepted; a started stream or any other error is a failure.
     let refused = client.execute_with(&job.action, false).await;
     assert!(
         refused
             .as_ref()
-            .is_err_and(|e| e.code() == Code::Unavailable),
+            .is_err_and(|e| matches!(e.code(), Code::Unavailable | Code::Cancelled)),
         "{refused:?}"
     );
+    // A fresh connection: the listener has stopped accepting, so it is refused at the
+    // connect, or reset after it, or (accepted just before the close) answered
+    // UNAVAILABLE. It never gets a stream.
+    let fresh = tonic::transport::Endpoint::from_shared(format!("http://{}", client.reapi_addr))
+        .expect("endpoint")
+        .connect()
+        .await;
+    if let Ok(channel) = fresh {
+        let refused = kbf_proto::reapi::execution_client::ExecutionClient::new(channel)
+            .execute(kbf_proto::reapi::ExecuteRequest {
+                instance_name: "main".to_owned(),
+                action_digest: Some(job.action.proto.clone()),
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| matches!(e.code(), Code::Unavailable | Code::Cancelled)),
+            "{:?}",
+            refused.map(|_| ())
+        );
+    }
     drop(client);
     tokio::time::timeout(Duration::from_secs(20), served)
         .await
