@@ -258,7 +258,8 @@ async fn set_desired(
             "the release store holds no platform of this commit complete (tarball and attestation)",
         );
     }
-    let now = update.farm.now();
+    // The wall clock: the controller counts its waits from this, across restarts.
+    let now = update.farm.wall_now();
     match blocking(move || rows.offer_expecting(&Release::new(commit), now, expect_generation))
         .await
     {

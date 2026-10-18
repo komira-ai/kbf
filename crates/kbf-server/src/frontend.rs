@@ -807,6 +807,7 @@ impl<'a> Prepared<'a> {
         worker_stop.closes(worker_latch);
         let api_listener = api_socket.map(Socket::http).transpose()?;
         let (token, releases) = api.map_or((None, None), |api| (api.token, api.releases));
+        let update_store = state_store.clone();
         let offers = crate::release::offers::offers_of(
             releases.clone(),
             state_store.clone().map(crate::update::Rows::new),
@@ -926,6 +927,10 @@ impl<'a> Prepared<'a> {
         let serving = async move {
             let history = crate::history::spawn(history);
             let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
+            // The rolling-update controller; it starts no host until `auto_nodes` is set.
+            let _updates =
+                crate::update::spawn_controller(Arc::clone(&farm), update_store, listeners.tick)
+                    .map(AbortOnDrop);
             let reapi_serve = reapi_server
                 .add_routes(reapi_routes)
                 .serve_with_incoming_shutdown(reapi_incoming, async {

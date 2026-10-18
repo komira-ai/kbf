@@ -637,6 +637,7 @@ where
     let update_rows = state
         .as_ref()
         .map(|s| crate::update::Rows::new(Arc::clone(&s.store)));
+    let update_store = state.as_ref().map(|s| Arc::clone(&s.store));
     let farm = Arc::new(farm.with_state(state)?);
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
@@ -793,6 +794,10 @@ where
         // and they never delay it. It stops when the serving future does.
         let history = crate::history::spawn(history);
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
+        // The rolling-update controller; it starts no host until `auto_nodes` is set.
+        let _updates =
+            crate::update::spawn_controller(Arc::clone(&farm), update_store, listeners.tick)
+                .map(AbortOnDrop);
         // `reapi_incoming` carries the REAPI TLS when there is any, so the health
         // service is served over the same TLS as the REAPI routes; the authenticator is
         // already applied to those routes alone (above).

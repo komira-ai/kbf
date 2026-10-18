@@ -1,0 +1,339 @@
+//! The controller's two ports over the farm and its worker sessions: [`SessionTransport`]
+//! gives the orders ([`Transport`]) and [`FarmFacts`] reads the farm ([`FactsSource`]).
+//! [`ports`] builds the pair; they share what they must agree on, which order ids went to
+//! which host.
+//!
+//! **Orders.** An activation or confirmation goes out as an `UpdateOrder` on the host's
+//! newest stream, with the epoch of the order id, which must be the epoch `Welcome` named
+//! ([`Farm::lease_epoch`]): an order of another epoch is refused here, not sent, because the
+//! node would refuse it. A cordon is the scheduler's own ([`Farm::place`]); an alert is a
+//! line under the target `kbf_server::attention`. A planned-down mark needs the members API
+//! of U3 (#914), which this branch does not have: both orders are refused, and no host that
+//! has a storage half is made eligible (below).
+//!
+//! **A confirmation has an id of its own.** The node and its helper take an id once and drop
+//! the same id again as a replay, so a `CONFIRM` under the activation's id would never be
+//! acted on. The transport draws one from the store's counter ([`Rows::mint_order`]) the
+//! first time it is asked to confirm an activation, and gives the same one again for the same
+//! activation (the controller repeats the order); the facts map a status that names it back
+//! to the activation, which is what the node step compares ([`HelperReport`]). After a
+//! restart of the controller the confirmation is given again under a new id and the old one
+//! is no longer mapped; a `CONFIRMED` that names it counts once the new one is acted on.
+//!
+//! **Facts.** A host is a registered node whose `os` is `macos` (a Mac of class
+//! `macos-<arch>`) or `linux`. A Linux host may have a storage half, which the farm cannot
+//! tell without the join of U3, so it is listed as a storage-and-daemon host that is linked to
+//! no member: the picker never starts it. What the node reports comes from its newest
+//! `UpdateStatus` of its current stream (a stream that replaced it has none until it sends
+//! one): the release it runs is the desired release when the 12 digits of its running commit
+//! begin the desired commit, else its own commit; the helper's report is its state and the
+//! order it acted on. `Work` is read from the scheduler: a lease on the node, else an empty
+//! queue.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, PoisonError};
+
+use kbf_map::MemberId;
+use kbf_proto::update::UpdateOrder;
+use kbf_proto::update::update_order::Verb;
+use kbf_proto::update::update_status::State;
+use kbf_types::{FarmTime, WorkerId};
+
+use super::command::{Alert, Severity};
+use super::facts::{
+    DaemonLoad, HelperReport, HelperStatus, HostFacts, HostKind, HostRecord, OrderId, Platform,
+    PlatformClass, Release, Work,
+};
+use super::ports::{FactsSource, FarmView, SourceError, Transport, TransportError};
+use super::rows::Rows;
+use crate::farm::{Farm, NodeAction, NodeLook};
+
+/// Which confirmation order id went to which host, for which activation.
+#[derive(Debug, Default)]
+struct Issued {
+    confirms: BTreeMap<WorkerId, (OrderId, u64)>,
+}
+
+type Shared = Arc<Mutex<Issued>>;
+
+fn lock(shared: &Shared) -> std::sync::MutexGuard<'_, Issued> {
+    shared.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The transport and the facts source over `farm`, with the rows of its state store.
+#[must_use]
+pub fn ports(farm: Arc<Farm>, rows: Rows) -> (SessionTransport, FarmFacts) {
+    let issued = Shared::default();
+    (
+        SessionTransport {
+            farm: Arc::clone(&farm),
+            rows: rows.clone(),
+            issued: Arc::clone(&issued),
+        },
+        FarmFacts { farm, rows, issued },
+    )
+}
+
+/// The orders, over the sessions.
+pub struct SessionTransport {
+    farm: Arc<Farm>,
+    rows: Rows,
+    issued: Shared,
+}
+
+impl std::fmt::Debug for SessionTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionTransport")
+    }
+}
+
+fn failed(why: impl std::fmt::Display) -> TransportError {
+    TransportError::new(why.to_string())
+}
+
+impl SessionTransport {
+    /// Refuses an order whose epoch is not the one `Welcome` names.
+    fn check_epoch(&self, order: OrderId) -> Result<(), TransportError> {
+        let welcome = self.farm.lease_epoch();
+        if order.epoch == welcome {
+            Ok(())
+        } else {
+            Err(failed(format!(
+                "order {}.{} is of epoch {}; the sessions' epoch is {welcome}",
+                order.epoch, order.seq, order.epoch
+            )))
+        }
+    }
+
+    /// How long the host may take to confirm after the flip: the step's wait for the
+    /// activation and for the confirmation, in seconds. A Mac arms its revert timer with it
+    /// (clamped by the helper); a Linux helper ignores it.
+    fn window_s(&self) -> Result<u32, TransportError> {
+        let policy = self.rows.policy().map_err(failed)?;
+        let window = policy.activate_limit.saturating_add(policy.health_limit);
+        Ok(u32::try_from(window.as_secs()).unwrap_or(u32::MAX))
+    }
+
+    fn send(
+        &self,
+        host: &WorkerId,
+        verb: Verb,
+        order_id: u64,
+        epoch: u64,
+        release: &Release,
+        window_s: u32,
+    ) -> Result<(), TransportError> {
+        let order = UpdateOrder {
+            order_id,
+            epoch,
+            verb: verb as i32,
+            commit: release.as_str().to_owned(),
+            window_s,
+        };
+        self.farm.send_order(host, order).map_err(failed)
+    }
+}
+
+impl Transport for SessionTransport {
+    fn cordon(&mut self, host: &WorkerId) -> Result<(), TransportError> {
+        self.farm
+            .place(host, NodeAction::Cordon)
+            .map(drop)
+            .map_err(failed)
+    }
+
+    fn uncordon(&mut self, host: &WorkerId) -> Result<(), TransportError> {
+        self.farm
+            .place(host, NodeAction::Uncordon)
+            .map(drop)
+            .map_err(failed)
+    }
+
+    fn mark_down(&mut self, host: &WorkerId, _member: MemberId) -> Result<(), TransportError> {
+        Err(failed(format!(
+            "cannot mark {host} down: the planned-down mark (U3, #914) is not in this build"
+        )))
+    }
+
+    fn undown(&mut self, host: &WorkerId, _member: MemberId) -> Result<(), TransportError> {
+        Err(failed(format!(
+            "cannot undo the mark of {host}: the planned-down mark (U3, #914) is not in this build"
+        )))
+    }
+
+    fn activate(
+        &mut self,
+        host: &WorkerId,
+        order: OrderId,
+        release: &Release,
+    ) -> Result<(), TransportError> {
+        self.check_epoch(order)?;
+        let window = self.window_s()?;
+        self.send(
+            host,
+            Verb::Activate,
+            order.seq,
+            order.epoch,
+            release,
+            window,
+        )
+    }
+
+    fn confirm(
+        &mut self,
+        host: &WorkerId,
+        order: OrderId,
+        release: &Release,
+    ) -> Result<(), TransportError> {
+        self.check_epoch(order)?;
+        let known = lock(&self.issued)
+            .confirms
+            .get(host)
+            .filter(|(activation, _)| *activation == order)
+            .map(|(_, id)| *id);
+        let id = match known {
+            Some(id) => id,
+            None => {
+                let drawn = self.rows.mint_order(order.epoch).map_err(failed)?;
+                lock(&self.issued)
+                    .confirms
+                    .insert(host.clone(), (order, drawn.seq));
+                drawn.seq
+            }
+        };
+        self.send(host, Verb::Confirm, id, order.epoch, release, 0)
+    }
+
+    fn alert(&mut self, host: &WorkerId, alert: &Alert) -> Result<(), TransportError> {
+        match alert.severity() {
+            Severity::Page => {
+                tracing::error!(target: "kbf_server::attention", "update: node {host}: {alert:?}");
+            }
+            Severity::Warn => {
+                tracing::warn!(target: "kbf_server::attention", "update: node {host}: {alert:?}");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The facts, from the farm.
+pub struct FarmFacts {
+    farm: Arc<Farm>,
+    rows: Rows,
+    issued: Shared,
+}
+
+impl std::fmt::Debug for FarmFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FarmFacts")
+    }
+}
+
+/// The release a host runs, given the one desired: its own commit, which the desired one
+/// stands for when it begins with it.
+fn running(commit: &str, target: Option<&Release>) -> Option<Release> {
+    if commit.len() != 12 {
+        return None;
+    }
+    match target {
+        Some(target) if target.as_str().starts_with(commit) => Some(target.clone()),
+        _ => Some(Release::new(commit)),
+    }
+}
+
+fn helper_status(state: State) -> Option<HelperStatus> {
+    match state {
+        State::ActivatedUnconfirmed => Some(HelperStatus::ActivatedUnconfirmed),
+        State::Confirmed => Some(HelperStatus::Confirmed),
+        State::Reverted => Some(HelperStatus::Reverted),
+        State::Refused => Some(HelperStatus::Refused),
+        State::Unspecified | State::Idle | State::Fetching | State::Staged | State::Manual => None,
+    }
+}
+
+impl FarmFacts {
+    fn host(
+        &self,
+        look: NodeLook,
+        epoch: u64,
+        target: Option<&Release>,
+        queue_empty: bool,
+    ) -> Option<HostFacts> {
+        let (platform, kind) = match look.os.as_str() {
+            "macos" => (
+                Platform::Mac(PlatformClass::new(format!("macos-{}", look.arch))),
+                HostKind::DaemonOnly,
+            ),
+            // Perhaps a storage half; the join to the member is not available (see the
+            // module docs), so the host is unlinked and never started.
+            "linux" => (Platform::Linux, HostKind::StorageAndDaemon),
+            _ => return None,
+        };
+        let helper = look.update.as_ref().and_then(|u| {
+            let status = helper_status(u.kind)?;
+            let acked = OrderId::new(epoch, u.acked_order_id);
+            let order = lock(&self.issued)
+                .confirms
+                .get(&look.id)
+                .filter(|(_, confirm)| *confirm == u.acked_order_id)
+                .map_or(acked, |(activation, _)| *activation);
+            Some(HelperReport { order, status })
+        });
+        let work = if look.leases > 0 {
+            Work::Leased
+        } else if queue_empty {
+            Work::QueueEmpty
+        } else {
+            Work::Waiting
+        };
+        Some(HostFacts {
+            id: look.id,
+            kind,
+            platform,
+            member: None,
+            release: look
+                .update
+                .as_ref()
+                .and_then(|u| running(&u.running_commit, target)),
+            connected: look.connected,
+            cordoned: Some(look.cordoned),
+            load: Some(DaemonLoad {
+                leases: look.leases,
+                undelivered: look.undelivered,
+                whole_machine_hold: look.whole_machine_hold,
+            }),
+            open_writes: None,
+            routed_writes: None,
+            helper,
+            work: Some(work),
+            record: HostRecord::unstarted(),
+        })
+    }
+}
+
+impl FactsSource for FarmFacts {
+    fn look(&mut self, _now: FarmTime) -> Result<FarmView, SourceError> {
+        let target = self
+            .rows
+            .desired()
+            .map_err(|e| SourceError(e.to_string()))?
+            .value
+            .map(|d| d.commit);
+        let epoch = self.farm.lease_epoch();
+        let queue_empty = self.farm.queued_operations() == 0;
+        let hosts = self
+            .farm
+            .update_look()
+            .into_iter()
+            .filter_map(|look| self.host(look, epoch, target.as_ref(), queue_empty))
+            .collect();
+        Ok(FarmView {
+            hosts,
+            members: Vec::new(),
+            // An empty queue asks for no class. A queue with work in it is not read by
+            // class here, so it is unknown, and the last Mac of a class is never cordoned.
+            queued_classes: queue_empty.then(BTreeSet::new),
+        })
+    }
+}

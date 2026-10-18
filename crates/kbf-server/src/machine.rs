@@ -324,6 +324,7 @@ mod tests {
             staged_protocol: 0,
             staged_min_protocol: 0,
             staged_state_schema: 0,
+            kind: kbf_proto::update::update_status::State::Idle,
         }
     }
 

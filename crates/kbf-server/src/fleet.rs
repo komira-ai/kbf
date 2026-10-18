@@ -92,6 +92,9 @@ pub struct UpdateReport {
     pub staged_protocol: u32,
     pub staged_min_protocol: u32,
     pub staged_state_schema: u32,
+    /// The state as the wire gave it (not listed: `state` says it).
+    #[serde(skip)]
+    pub kind: UpdateState,
 }
 
 /// The longest refusal text kept, in bytes. `GET /v1/nodes` is open and a node's text is its own.
@@ -137,6 +140,7 @@ impl UpdateReport {
             Ok(UpdateState::Unspecified) | Err(_) => "unknown",
         };
         Self {
+            kind: UpdateState::try_from(status.state).unwrap_or(UpdateState::Unspecified),
             state,
             running_commit: hex_or(status.running_commit, 12, "unknown", "unknown"),
             installed_commit: hex_or(status.installed_commit, 40, "", ""),
