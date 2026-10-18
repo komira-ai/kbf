@@ -122,14 +122,24 @@ mod tests {
             .expect("a runtime")
     }
 
+    // One call site for every case: the coverage of a generic function is that of its
+    // best single instantiation, so the three paths (no runtime, a runtime, a panic) go
+    // through the same closure.
+    fn on_a_thread(panics: bool) -> std::thread::ThreadId {
+        off_runtime(move || {
+            assert!(!panics, "the client broke");
+            std::thread::current().id()
+        })
+    }
+
     // Catches a call that runs on the runtime's own thread (the client would panic with
     // "Cannot start a runtime from within a runtime"): inside a runtime the work moves to
     // another thread, outside it stays.
     #[test]
     fn a_call_inside_a_runtime_runs_on_another_thread() {
         let here = std::thread::current().id();
-        assert_eq!(off_runtime(|| std::thread::current().id()), here);
-        let inside = runtime().block_on(async { off_runtime(|| std::thread::current().id()) });
+        assert_eq!(on_a_thread(false), here);
+        let inside = runtime().block_on(async { on_a_thread(false) });
         assert_ne!(inside, here);
     }
 
@@ -137,10 +147,12 @@ mod tests {
     // a result that does not exist): it must come out in the caller, with its message.
     #[test]
     fn a_panic_in_a_call_moved_off_the_runtime_is_raised_in_the_caller() {
-        let caught = std::panic::catch_unwind(|| {
-            runtime().block_on(async { off_runtime(|| -> u8 { panic!("the client broke") }) })
-        });
+        let caught = std::panic::catch_unwind(|| runtime().block_on(async { on_a_thread(true) }));
         let panic = caught.expect_err("the panic comes out");
-        assert_eq!(panic.downcast_ref::<&str>(), Some(&"the client broke"));
+        let said = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied());
+        assert_eq!(said, Some("the client broke"));
     }
 }

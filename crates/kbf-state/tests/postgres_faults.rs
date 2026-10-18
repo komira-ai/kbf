@@ -343,17 +343,23 @@ fn a_reap_answers_what_it_deleted_and_a_guard_that_fails_deletes_nothing() {
     let backend = PostgresBackend::new(&url(), Flaw::None);
     let store = PostgresStore::open(&config(&backend)).expect("opens");
     assert_eq!(store.reap_expired().expect("reaps"), 0, "nothing is due");
+    store
+        .txn(
+            Txn::new()
+                .put_ttl("due1", "d", Duration::ZERO, Cond::Any)
+                .put("keep", "k", Cond::Any),
+        )
+        .expect("store")
+        .expect("commits");
+    assert_eq!(store.reap_expired().expect("reaps"), 1, "due1 goes");
+    assert_eq!(store.reap_expired().expect("reaps"), 0, "it went once");
     assert_eq!(
         store.reap_expired_if("none", Cond::Absent).expect("reaps"),
         Ok(0),
         "a guard that holds over nothing due"
     );
     store
-        .txn(
-            Txn::new()
-                .put_ttl("due", "d", Duration::ZERO, Cond::Any)
-                .put("keep", "k", Cond::Any),
-        )
+        .txn(Txn::new().put_ttl("due2", "d", Duration::ZERO, Cond::Any))
         .expect("store")
         .expect("commits");
     let conflict = store
@@ -366,7 +372,6 @@ fn a_reap_answers_what_it_deleted_and_a_guard_that_fails_deletes_nothing() {
         Ok(1),
         "the due row goes under a guard that holds"
     );
-    assert_eq!(store.reap_expired().expect("reaps"), 0, "it went once");
     assert!(store.get("keep").expect("reads").is_some());
 }
 
