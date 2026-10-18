@@ -1398,6 +1398,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-ca"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "kbf-map",
+ "kbf-peer",
+ "kbf-proto",
+ "kbf-types",
+ "rcgen",
+ "ring",
+ "rustix",
+ "rustls",
+ "sha2 0.11.0",
+ "thiserror",
+ "time",
+ "x509-parser",
+]
+
+[[package]]
 name = "kbf-caps"
 version = "0.1.0"
 dependencies = [
@@ -1618,6 +1637,19 @@ dependencies = [
  "tracing",
  "x509-parser",
  "zeroize",
+]
+
+[[package]]
+name = "kbf-enroll-registry"
+version = "0.1.0"
+dependencies = [
+ "kbf-map",
+ "kbf-state",
+ "kbf-types",
+ "prost",
+ "sha2 0.11.0",
+ "subtle",
+ "thiserror",
 ]
 
 [[package]]
@@ -2049,6 +2081,7 @@ dependencies = [
  "sha2 0.11.0",
  "subtle",
  "thiserror",
+ "time",
  "tokio",
  "tonic",
  "tonic-prost",
