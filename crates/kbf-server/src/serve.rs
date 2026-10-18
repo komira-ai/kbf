@@ -658,6 +658,7 @@ where
     let update_rows = state
         .as_ref()
         .map(|s| crate::update::Rows::new(Arc::clone(&s.store)));
+    let update_store = state.as_ref().map(|s| Arc::clone(&s.store));
     let farm = Arc::new(farm.with_state(state)?);
     // One start, one bind budget: the three listeners wait for a late interface together.
     let binder = Binder::new();
@@ -704,6 +705,8 @@ where
         history.as_ref().map(crate::history::History::reads),
         budget,
     );
+    let offers =
+        crate::release::offers::offers_of(releases.clone(), update_rows.clone(), listeners.tick);
     let api_routes = crate::api::router(
         Arc::clone(&farm),
         token.clone(),
@@ -779,6 +782,10 @@ where
     );
     // The map, if there is one: no branch in this generic function.
     let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
+    // The offers, if there are a release store and a state store: no branch here either.
+    let sessions = offers
+        .into_iter()
+        .fold(sessions, WorkerService::with_offers);
     let worker_service = WorkerServer::new(sessions)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -829,6 +836,10 @@ where
         // and they never delay it. It stops when the serving future does.
         let history = crate::history::spawn(history);
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
+        // The rolling-update controller; it starts no host until `auto_nodes` is set.
+        let _updates =
+            crate::update::spawn_controller(Arc::clone(&farm), update_store, listeners.tick)
+                .map(AbortOnDrop);
         // `reapi_incoming` carries the REAPI TLS when there is any, so the health
         // service is served over the same TLS as the REAPI routes; the authenticator is
         // already applied to those routes alone (above).

@@ -37,7 +37,7 @@ everything the page shows.
   without the key never reads as "running". A wrong "running" is a safety error (the operator runs an update into a paused
   farm or never resumes). #976 is asked to say where pause lives (Q11); this file changes its reading only after it does.
   The page also shows `policy.auto_nodes` and `policy.auto_frontend` when present.
-- **[F]** A platform is complete when it has its own components: linux needs `kbf`, darwin needs `kbf-daemon`
+- **[F]** A platform is complete when it has its own components: linux needs `kbf`, darwin needs `kbf`
   (`ReleasePlatform::components` in #976). The page shows completeness per platform with that component named.
 - **[F]** `operator_gate` (`api.rs`): loopback peer, no `Origin` header, `Authorization: Bearer` compared in constant time
   against a digest, `Content-Type: application/json`. The token is read once from `--api-token-file` and only its SHA-256 is
@@ -75,8 +75,7 @@ credential. The page invents no state when a route is refused.
 
 Farm header: the desired commit, generation and set time from `desired`; **paused** by the rule of section 2 (`policy.paused`
 only if that key is present, else `desired.paused`); `policy.auto_nodes` and `policy.auto_frontend` as read-only values; the
-releases list with each commit's platforms, each marked complete or not **with the component it needs (linux: `kbf`, darwin:
-`kbf-daemon`)**; **update available** when the newest complete release differs from `desired.commit`; "N of M hosts up to date"
+releases list with each commit's platforms, each marked complete or not **with the component it needs (`kbf` on linux and darwin)**; **update available** when the newest complete release differs from `desired.commit`; "N of M hosts up to date"
 summed by the page from the per-host `up_to_date` it already reads.
 
 Host table (one row per node, sorted by node id, paginated by `page_size` and `page_token`): node, connected, platform, running
@@ -165,7 +164,7 @@ PRs below are read-only: none adds a POST, a form, a cookie or a credential.
    changed host list or blocker changes the plan; it writes nothing (counting store); it is a GET only. Mutants: store the
    plan; include `connected` or the step state in the blockers.
 3. **The Updates page** (read-only). Tests: every `availability` and every `UpdateStatus` state renders; a refusal and node id
-   with markup render escaped; completeness names `kbf` for linux and `kbf-daemon` for darwin; the frontend row is separate
+   with markup render escaped; completeness names `kbf` for linux and darwin; the frontend row is separate
    and the plan lists no frontend; **a policy row present without a `paused` key and `desired.paused` true renders paused**,
    and `policy.paused` wins when present; **update available** shows only when the newest complete release differs from
    desired; a refused detail route removes the detail columns and keeps the summary; the page declares no POST and contains no

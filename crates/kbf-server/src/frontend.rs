@@ -901,7 +901,13 @@ impl<'a> Prepared<'a> {
         worker_stop.closes(worker_latch);
         let api_listener = api_socket.map(Socket::http).transpose()?;
         let (token, releases) = api.map_or((None, None), |api| (api.token, api.releases));
+        let update_store = state_store.clone();
         let update_rows = state_store.clone().map(crate::update::Rows::new);
+        let offers = crate::release::offers::offers_of(
+            releases.clone(),
+            update_rows.clone(),
+            listeners.tick,
+        );
         let api_routes = crate::api::router(
             Arc::clone(&farm),
             token.clone(),
@@ -949,6 +955,9 @@ impl<'a> Prepared<'a> {
         );
         // Daemons are sent the members' map: Welcome.map and a MapUpdate at each bump.
         let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
+        let sessions = offers
+            .into_iter()
+            .fold(sessions, WorkerService::with_offers);
         let worker_service = WorkerServer::new(sessions)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -1053,6 +1062,10 @@ impl<'a> Prepared<'a> {
         let serving = async move {
             let history = crate::history::spawn(history);
             let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
+            // The rolling-update controller; it starts no host until `auto_nodes` is set.
+            let _updates =
+                crate::update::spawn_controller(Arc::clone(&farm), update_store, listeners.tick)
+                    .map(AbortOnDrop);
             let reapi_serve = reapi_server
                 .add_routes(reapi_routes)
                 .serve_with_incoming_shutdown(reapi_incoming, async {

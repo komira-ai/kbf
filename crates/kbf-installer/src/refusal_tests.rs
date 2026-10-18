@@ -128,6 +128,10 @@ fn every_case() -> Vec<(&'static str, Refusal)> {
             "offer-commit",
             Refusal::Offer(OfferFault::BadCommit("HEAD".into())),
         ),
+        (
+            "offer-darwin-daemon",
+            Refusal::Offer(OfferFault::DarwinDaemon),
+        ),
         ("inbox-missing", inbox(InboxFault::Missing)),
         ("inbox-symlink", inbox(InboxFault::Symlink)),
         ("inbox-not-regular", inbox(InboxFault::NotRegular)),

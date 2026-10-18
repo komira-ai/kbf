@@ -14,8 +14,9 @@
 //!   sha256 is the source's, then points `previous` at the old current release and
 //!   `current` at the new one and writes the state. Only the files the source names are
 //!   compared: a file the release directory has beyond them is not noticed. A release
-//!   holds the binaries its source directory has: `kbf` (a Linux release), `kbf-daemon`
-//!   (a macOS one) or both. A new release is made in `releases/.stage-<commit>.<rand>/`,
+//!   holds the binaries its source directory has: `kbf` (all a macOS release has),
+//!   `kbf-daemon` (a Linux one may add it) or both.
+//!   A new release is made in `releases/.stage-<commit>.<rand>/`,
 //!   its files and directories synced, then renamed to `releases/<commit>/` and the parent
 //!   synced (S19): the final name never holds a half-written release, and the state is
 //!   written only after all of it.
@@ -246,13 +247,11 @@ fn switch<E: Exec>(
         // SEAM(unit install): no verb here installs a release's units or restarts a
         // service; `linux install-units` does both. When it takes a release directory,
         // the restart goes here, after the switch.
-        let (binary, restart) = match host.platform() {
-            Platform::Linux => (layout::RELEASE_BINARY, "systemctl restart <unit>"),
-            Platform::MacOs => (
-                layout::RELEASE_DAEMON,
-                "launchctl kickstart -k system/<label>",
-            ),
+        let restart = match host.platform() {
+            Platform::Linux => "systemctl restart <unit>",
+            Platform::MacOs => "launchctl kickstart -k system/<label>",
         };
+        let binary = layout::RELEASE_BINARY;
         let _ = writeln!(
             out,
             "next, by hand: restart the units that run {}/{binary} ({restart}), \
@@ -602,8 +601,8 @@ pub fn rollback<E: Exec>(
     switch(exec, host, lock, &state, (previous, None), out)
 }
 
-/// Whether the release `commit` has a binary in its directory. Any will do: a Linux
-/// release holds `kbf`, a macOS one `kbf-daemon`.
+/// Whether the release `commit` has a binary in its directory. Any will do: a release
+/// holds `kbf` (a macOS one holds nothing else) and, on Linux, maybe `kbf-daemon`.
 pub(crate) fn has_binary<E: Exec>(exec: &E, host: &Layout, commit: &CommitId) -> bool {
     layout::RELEASE_BINARIES.iter().any(|name| {
         matches!(
