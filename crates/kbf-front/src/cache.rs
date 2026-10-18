@@ -81,6 +81,10 @@ pub enum CacheError {
     /// already ([`Cache::open_node`]): two processes would name the same keys.
     #[error(transparent)]
     StaleWriter(#[from] StaleWriter),
+    /// A streamed upload sent no chunk for `--write-pool-stream-idle`, so the write pool
+    /// freed its writer. The client may send the blob again: UNAVAILABLE.
+    #[error("{0}")]
+    Stalled(String),
     /// The cache's own records disagree (a segment read back without a blob just
     /// packed into it, an index entry with no readable range, a log answering with
     /// the wrong outcome). A bug or a broken backend, never the client's fault.
@@ -112,6 +116,7 @@ impl From<CacheError> for Status {
             | CacheError::Unreachable(_)
             | CacheError::Meta(_)
             | CacheError::Store(_)
+            | CacheError::Stalled(_)
             | CacheError::Tier(_) => Status::unavailable(message),
             CacheError::Segment(_)
             | CacheError::Pack(_)

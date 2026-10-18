@@ -199,6 +199,11 @@ Options:
           
           [default: 4096]
 
+      --write-pool-stream-idle <WRITE_POOL_STREAM_IDLE>
+          How long, in seconds, a streamed blob may go without sending a chunk before its write-pool writer is taken back and the upload fails UNAVAILABLE (the client sends it again). Without it, a stalled but connected large upload would hold a writer for ever, and with all writers held every other blob would wait. At least 1
+          
+          [default: 30]
+
       --store-put-attempts <STORE_PUT_ATTEMPTS>
           How many times a segment PUT is tried. Only a PUT that did not complete (connect, reset, timeout) or that the store answered 5xx is tried again, after 100 ms and then four times longer each time, under a new object key; if every attempt fails, the segment's blobs are answered UNAVAILABLE
           

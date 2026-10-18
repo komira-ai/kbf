@@ -392,6 +392,11 @@ Options:
           
           [default: 4096]
 
+      --write-pool-stream-idle <WRITE_POOL_STREAM_IDLE>
+          How long, in seconds, a streamed blob may go without sending a chunk before its write-pool writer is taken back and the upload fails UNAVAILABLE (the client sends it again). Without it, a stalled but connected large upload would hold a writer for ever, and with all writers held every other blob would wait. At least 1
+          
+          [default: 30]
+
       --memory-limit-percent <MEMORY_LIMIT_PERCENT>
           A lease's processes are killed past this percentage of its booked memory...
           

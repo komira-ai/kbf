@@ -98,6 +98,7 @@ pub const ALLOWED: &[&str] = &[
     "write_puts_in_flight",
     "write_pool_writers",
     "write_pool_queue",
+    "write_pool_stream_idle",
     "store_put_attempts",
 ];
 

@@ -407,6 +407,16 @@ pub struct Args {
     /// least 1.
     #[arg(long, default_value_t = kbf_front::PoolConfig::DEFAULT.queue)]
     pub write_pool_queue: NonZeroUsize,
+    /// How long, in seconds, a streamed blob may go without sending a chunk before its
+    /// write-pool writer is taken back and the upload fails UNAVAILABLE (the client
+    /// sends it again). Without it, a stalled but connected large upload would hold a
+    /// writer for ever, and with all writers held every other blob would wait. At least 1.
+    #[arg(
+        long,
+        default_value_t = kbf_front::PoolConfig::DEFAULT.stream_idle.as_secs(),
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub write_pool_stream_idle: u64,
     /// How many times a segment PUT is tried. Only a PUT that did not complete
     /// (connect, reset, timeout) or that the store answered 5xx is tried again, after
     /// 100 ms and then four times longer each time, under a new object key; if every
@@ -774,12 +784,13 @@ impl Args {
     }
 
     /// The write pool of the node's write tier: `--write-pool-writers` and
-    /// `--write-pool-queue`.
+    /// `--write-pool-queue` and `--write-pool-stream-idle`.
     #[must_use]
     pub const fn write_pool_config(&self) -> kbf_front::PoolConfig {
         kbf_front::PoolConfig {
             writers: self.write_pool_writers,
             queue: self.write_pool_queue,
+            stream_idle: Duration::from_secs(self.write_pool_stream_idle),
         }
     }
 

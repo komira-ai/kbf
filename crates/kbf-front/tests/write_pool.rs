@@ -288,6 +288,43 @@ fn pool(writers: usize, queue: usize) -> PoolConfig {
     PoolConfig {
         writers: writers.try_into().expect("writers"),
         queue: queue.try_into().expect("queue"),
+        ..PoolConfig::DEFAULT
+    }
+}
+
+/// A tier whose blocks hold 1 MiB, so a 5 MiB stream has a block of its own.
+fn small_blocks() -> TierOptions {
+    let mut options = TierOptions::new(GIB);
+    options.segment_limit = MIB as u64;
+    options
+}
+
+/// How long a test that must not hang may take.
+const BOUND: Duration = Duration::from_secs(20);
+
+/// Runs `body` on its own runtime and fails the test, with `what` in the message, if it
+/// has not finished within [`BOUND`]. A leaked writer or a blocked send otherwise hangs the
+/// test (and the runtime's shutdown, which waits for blocking calls). The clock is the
+/// test thread's, not the runtime's: blocked sends can hold every runtime worker, and
+/// then no tokio timer fires. The runtime is shut down without waiting.
+fn bounded(what: &str, body: impl std::future::Future<Output = ()> + Send + 'static) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (done, finished) = std::sync::mpsc::channel();
+    let task = runtime.spawn(body);
+    runtime.spawn(async move {
+        let _ = done.send(task.await);
+    });
+    let outcome = finished.recv_timeout(BOUND);
+    runtime.shutdown_background();
+    match outcome {
+        Err(_) => panic!("{what}: not finished within {BOUND:?}: a writer or a send is stuck"),
+        Ok(Err(e)) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Ok(Err(e)) => panic!("{what}: {e}"),
+        Ok(Ok(())) => {}
     }
 }
 
@@ -607,62 +644,67 @@ async fn a_batch_ends_at_its_blob_limit() {
 /// blob queued are staged once it is released. A blob opened when the queue is full goes
 /// straight to the store and is present without waiting for the writer; one committed
 /// after the queue filled does too. Neither errors, and the metric counts both.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_full_queue_sends_the_blob_to_the_store_without_an_error() {
-    let rig = Rig::new();
-    let cache = rig.start(1, 1).await;
-    let held = TestBlob::new(6, 10_000);
-    let held_record = prepare(&cache, &held).await.expect("received");
-    // Opened while the queue is empty, committed after it is full.
-    let late = TestBlob::new(7, 10_000);
-    let late_record = prepare(&cache, &late).await.expect("received");
-    rig.fs.pause();
-    let holding = tokio::spawn(held_record.commit());
-    until("the writer to reach the sync", || rig.fs.waiting() == 1).await;
-    let queued = TestBlob::new(8, 10_000);
-    let queued_record = prepare(&cache, &queued).await.expect("received");
-    let queueing = tokio::spawn(queued_record.commit());
-    until("one blob to queue", || {
-        cache.metrics().write_pool_queue.get() == 1
-    })
-    .await;
+#[test]
+fn a_full_queue_sends_the_blob_to_the_store_without_an_error() {
+    bounded(
+        "a_full_queue_sends_the_blob_to_the_store_without_an_error",
+        async {
+            let rig = Rig::new();
+            let cache = rig.start(1, 1).await;
+            let held = TestBlob::new(6, 10_000);
+            let held_record = prepare(&cache, &held).await.expect("received");
+            // Opened while the queue is empty, committed after it is full.
+            let late = TestBlob::new(7, 10_000);
+            let late_record = prepare(&cache, &late).await.expect("received");
+            rig.fs.pause();
+            let holding = tokio::spawn(held_record.commit());
+            until("the writer to reach the sync", || rig.fs.waiting() == 1).await;
+            let queued = TestBlob::new(8, 10_000);
+            let queued_record = prepare(&cache, &queued).await.expect("received");
+            let queueing = tokio::spawn(queued_record.commit());
+            until("one blob to queue", || {
+                cache.metrics().write_pool_queue.get() == 1
+            })
+            .await;
 
-    // Committed with the queue full: straight to the store, answered at once.
-    late_record.commit().await.expect("not an error");
-    assert!(!rig.on_tier(&late.digest), "{} was queued", late.digest);
-    reads_back(&cache, &late).await;
-    // Opened with the queue full: streamed straight to the store from its first chunk.
-    let direct = TestBlob::new(9, 10_000);
-    put(&cache, &direct).await.expect("not an error");
-    assert!(!rig.on_tier(&direct.digest));
-    reads_back(&cache, &direct).await;
-    assert_eq!(metric(&cache, "kbf_storage_write_pool_direct_total"), 2);
-    assert_eq!(rig.log.answer(&held.digest), BlobAnswer::Absent);
+            // Committed with the queue full: straight to the store, answered at once.
+            late_record.commit().await.expect("not an error");
+            assert!(!rig.on_tier(&late.digest), "{} was queued", late.digest);
+            reads_back(&cache, &late).await;
+            // Opened with the queue full: streamed straight to the store from its first chunk.
+            let direct = TestBlob::new(9, 10_000);
+            put(&cache, &direct).await.expect("not an error");
+            assert!(!rig.on_tier(&direct.digest));
+            reads_back(&cache, &direct).await;
+            assert_eq!(metric(&cache, "kbf_storage_write_pool_direct_total"), 2);
+            assert_eq!(rig.log.answer(&held.digest), BlobAnswer::Absent);
 
-    rig.fs.resume();
-    holding.await.expect("join").expect("committed");
-    queueing.await.expect("join").expect("committed");
-    assert!(rig.on_tier(&held.digest) && rig.on_tier(&queued.digest));
-    // A large blob finding the queue full goes to the store too.
-    rig.fs.pause();
-    let again = tokio::spawn({
-        let (cache, held) = (Arc::clone(&cache), TestBlob::new(11, 10_000));
-        async move { put(&cache, &held).await }
-    });
-    until("the writer to reach the sync", || rig.fs.waiting() == 1).await;
-    let queued = TestBlob::new(12, 10_000);
-    let queueing = tokio::spawn(prepare(&cache, &queued).await.expect("received").commit());
-    until("one blob to queue", || {
-        cache.metrics().write_pool_queue.get() == 1
-    })
-    .await;
-    let large = TestBlob::new(13, 5 * MIB);
-    put(&cache, &large).await.expect("not an error");
-    assert!(!rig.on_tier(&large.digest));
-    reads_back(&cache, &large).await;
-    rig.fs.resume();
-    again.await.expect("join").expect("stored");
-    queueing.await.expect("join").expect("committed");
+            rig.fs.resume();
+            holding.await.expect("join").expect("committed");
+            queueing.await.expect("join").expect("committed");
+            assert!(rig.on_tier(&held.digest) && rig.on_tier(&queued.digest));
+            // A large blob finding the queue full goes to the store too.
+            rig.fs.pause();
+            let again = tokio::spawn({
+                let (cache, held) = (Arc::clone(&cache), TestBlob::new(11, 10_000));
+                async move { put(&cache, &held).await }
+            });
+            until("the writer to reach the sync", || rig.fs.waiting() == 1).await;
+            let queued = TestBlob::new(12, 10_000);
+            let queueing = tokio::spawn(prepare(&cache, &queued).await.expect("received").commit());
+            until("one blob to queue", || {
+                cache.metrics().write_pool_queue.get() == 1
+            })
+            .await;
+            let large = TestBlob::new(13, 5 * MIB);
+            put(&cache, &large).await.expect("not an error");
+            assert!(!rig.on_tier(&large.digest));
+            reads_back(&cache, &large).await;
+            rig.fs.resume();
+            again.await.expect("join").expect("stored");
+            queueing.await.expect("join").expect("committed");
+        },
+    );
 }
 
 /// Catches a tier with no room stalling or failing a write: a blob the tier's budget
@@ -716,9 +758,7 @@ async fn a_tier_without_room_sends_the_blob_to_the_store() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_blob_over_the_segment_limit_gets_a_block_of_its_own_through_a_writer() {
     let rig = Rig::new();
-    let mut options = TierOptions::new(GIB);
-    options.segment_limit = MIB as u64;
-    let (cache, _) = rig.start_on(&rig.fs, options, pool(2, 16)).await;
+    let (cache, _) = rig.start_on(&rig.fs, small_blocks(), pool(2, 16)).await;
     let blobs = support::blobs(50, 3, 5 * MIB);
     for blob in &blobs {
         put(&cache, blob).await.expect("stored");
@@ -731,45 +771,50 @@ async fn a_blob_over_the_segment_limit_gets_a_block_of_its_own_through_a_writer(
 /// Catches a stream dropped before its commit keeping its writer, or leaving its bytes
 /// visible: with one writer, a 5 MiB stream that is dropped after two chunks is absent,
 /// and the next blob is written at once (the writer is free).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_abandoned_stream_frees_its_writer_and_stores_nothing() {
-    let rig = Rig::new();
-    let cache = rig.start(1, 16).await;
-    let dropped = TestBlob::new(17, 5 * MIB);
-    {
-        let (cache, dropped) = (Arc::clone(&cache), dropped.clone());
-        tokio::task::spawn_blocking(move || {
-            let mut stream = cache.stream(dropped.bytes.len() as u64).expect("a stream");
-            for piece in dropped.bytes.chunks(MIB).take(2) {
-                stream.append(piece).expect("appended");
+#[test]
+fn an_abandoned_stream_frees_its_writer_and_stores_nothing() {
+    bounded(
+        "an_abandoned_stream_frees_its_writer_and_stores_nothing",
+        async {
+            let rig = Rig::new();
+            let cache = rig.start(1, 16).await;
+            let dropped = TestBlob::new(17, 5 * MIB);
+            {
+                let (cache, dropped) = (Arc::clone(&cache), dropped.clone());
+                tokio::task::spawn_blocking(move || {
+                    let mut stream = cache.stream(dropped.bytes.len() as u64).expect("a stream");
+                    for piece in dropped.bytes.chunks(MIB).take(2) {
+                        stream.append(piece).expect("appended");
+                    }
+                })
+                .await
+                .expect("join");
             }
-        })
-        .await
-        .expect("join");
-    }
-    let next = TestBlob::new(18, 10_000);
-    put(&cache, &next).await.expect("stored");
-    assert!(rig.on_tier(&next.digest));
-    assert_eq!(rig.log.answer(&dropped.digest), BlobAnswer::Absent);
-    // And a stream ended as a digest it does not have stores nothing.
-    let wrong = TestBlob::new(19, 5 * MIB);
-    let liar = {
-        let (cache, wrong) = (Arc::clone(&cache), wrong.clone());
-        tokio::task::spawn_blocking(move || {
-            let mut stream = cache.stream(wrong.bytes.len() as u64).expect("a stream");
-            for piece in wrong.bytes.chunks(MIB) {
-                stream.append(piece).expect("appended");
-            }
-            stream.finish(next.digest, 0).map(drop)
-        })
-        .await
-        .expect("join")
-    };
-    assert!(matches!(liar, Err(CacheError::Invalid(_))), "{liar:?}");
-    assert_eq!(rig.log.answer(&wrong.digest), BlobAnswer::Absent);
-    put(&cache, &TestBlob::new(21, 10_000))
-        .await
-        .expect("the writer is free");
+            let next = TestBlob::new(18, 10_000);
+            put(&cache, &next).await.expect("stored");
+            assert!(rig.on_tier(&next.digest));
+            assert_eq!(rig.log.answer(&dropped.digest), BlobAnswer::Absent);
+            // And a stream ended as a digest it does not have stores nothing.
+            let wrong = TestBlob::new(19, 5 * MIB);
+            let liar = {
+                let (cache, wrong) = (Arc::clone(&cache), wrong.clone());
+                tokio::task::spawn_blocking(move || {
+                    let mut stream = cache.stream(wrong.bytes.len() as u64).expect("a stream");
+                    for piece in wrong.bytes.chunks(MIB) {
+                        stream.append(piece).expect("appended");
+                    }
+                    stream.finish(next.digest, 0).map(drop)
+                })
+                .await
+                .expect("join")
+            };
+            assert!(matches!(liar, Err(CacheError::Invalid(_))), "{liar:?}");
+            assert_eq!(rig.log.answer(&wrong.digest), BlobAnswer::Absent);
+            put(&cache, &TestBlob::new(21, 10_000))
+                .await
+                .expect("the writer is free");
+        },
+    );
 }
 
 /// Catches a failed `PutStaged` answering some of a batch, or leaving the writer stuck: the
@@ -820,6 +865,21 @@ async fn a_refused_commit_fails_the_whole_batch_and_the_writer_goes_on() {
     assert!(rig.on_tier(&next.digest));
 }
 
+/// Catches a failed stream leaking its file: waits until both the filesystem seam and the
+/// tier's own count (`kbf_storage_open_write_fds`, set after each pool step) show `want`
+/// block files open for writing. A stream larger than a segment has a block of its own,
+/// which closes when its reservation is dropped; what stays open is the grouped block.
+async fn open_files_settle_at(rig: &Rig, cache: &TierCache, want: usize) {
+    until("the block files to close", || {
+        rig.fs.probe.open.load(Ordering::SeqCst) == want
+    })
+    .await;
+    until("the tier to count the files", || {
+        metric(cache, "kbf_storage_open_write_fds") == want as u64
+    })
+    .await;
+}
+
 /// Catches a disk error taken for a stored blob, or one that fails the upload instead of
 /// sending a held blob to the store: with every write failing, a held blob goes to the
 /// store (answered, present, readable); with every sync failing, the same; a streamed blob
@@ -828,16 +888,21 @@ async fn a_refused_commit_fails_the_whole_batch_and_the_writer_goes_on() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn disk_errors_send_held_blobs_to_the_store_and_fail_streamed_ones() {
     let rig = Rig::new();
-    let cache = rig.start(1, 16).await;
+    let (cache, _) = rig.start_on(&rig.fs, small_blocks(), pool(1, 16)).await;
     rig.fs.probe.fail_writes.store(true, Ordering::SeqCst);
     let held = TestBlob::new(26, 10_000);
     put(&cache, &held).await.expect("sent to the store");
     assert!(!rig.on_tier(&held.digest));
     reads_back(&cache, &held).await;
+    let open_before = rig.fs.probe.open.load(Ordering::SeqCst);
     let streamed = TestBlob::new(27, 5 * MIB);
     let failed = put(&cache, &streamed).await;
     assert!(failed.is_err(), "{failed:?}");
     assert_eq!(rig.log.answer(&streamed.digest), BlobAnswer::Absent);
+    // The writer dropped the stream's reservation: its block of its own is closed, and
+    // only what was open before it (the grouped block) is (a leaked reservation keeps its
+    // file open for ever).
+    open_files_settle_at(&rig, &cache, open_before).await;
     rig.fs.probe.fail_writes.store(false, Ordering::SeqCst);
 
     rig.fs.probe.fail_syncs.store(true, Ordering::SeqCst);
@@ -944,4 +1009,77 @@ async fn a_shared_block_is_flushed_as_one_object() {
     for blob in &blobs {
         reads_back(&cache, blob).await;
     }
+}
+
+/// Catches a stalled but connected upload holding a writer for ever: with one writer, a
+/// 5 MiB stream sends one chunk and then nothing, and a small blob is queued behind it.
+/// The small blob waits while the stream is within its idle time (so the test would see
+/// the head-of-line blocking), is then acknowledged and on the tier, once the idle time
+/// (300 ms) has passed, and not much later; the stalled upload's next call fails
+/// UNAVAILABLE (retryable, not INVALID_ARGUMENT); and its block of its own is closed (only
+/// the grouped block the small blob went to is open).
+#[test]
+fn a_stalled_stream_loses_its_writer_and_fails_retryably() {
+    bounded(
+        "a_stalled_stream_loses_its_writer_and_fails_retryably",
+        async {
+            let rig = Rig::new();
+            let idle = Duration::from_millis(300);
+            let config = PoolConfig {
+                stream_idle: idle,
+                ..pool(1, 16)
+            };
+            let cache = rig.start_on(&rig.fs, small_blocks(), config).await.0;
+            let stalled = TestBlob::new(40, 5 * MIB);
+            let (sent, sent_rx) = std::sync::mpsc::channel();
+            let (go, go_rx) = std::sync::mpsc::channel::<()>();
+            let upload = {
+                let (cache, stalled) = (Arc::clone(&cache), stalled.clone());
+                tokio::task::spawn_blocking(move || {
+                    let mut stream = cache.stream(stalled.bytes.len() as u64).expect("a stream");
+                    stream.append(&stalled.bytes[..MIB]).expect("appended");
+                    sent.send(()).expect("told");
+                    // Stalled: connected, and sending nothing, until the test lets it go on.
+                    go_rx.recv().expect("told to go on");
+                    stream.append(&stalled.bytes[MIB..2 * MIB])
+                })
+            };
+            tokio::task::spawn_blocking(move || sent_rx.recv().expect("the first chunk"))
+                .await
+                .expect("join");
+            let small = TestBlob::new(41, 10_000);
+            let started = std::time::Instant::now();
+            let putting = tokio::spawn({
+                let (cache, small) = (Arc::clone(&cache), small.clone());
+                async move { put(&cache, &small).await }
+            });
+            tokio::time::sleep(idle / 3).await;
+            assert!(
+                !putting.is_finished(),
+                "the small blob was acknowledged while the writer was held"
+            );
+            putting.await.expect("join").expect("stored");
+            let waited = started.elapsed();
+            assert!(
+                waited >= idle / 2 && waited < idle + Duration::from_secs(5),
+                "the small blob waited {waited:?} for an idle time of {idle:?}"
+            );
+            assert!(rig.on_tier(&small.digest));
+            reads_back(&cache, &small).await;
+            go.send(()).expect("told");
+            let failed = upload
+                .await
+                .expect("join")
+                .expect_err("the stalled upload fails");
+            assert!(matches!(failed, CacheError::Stalled(_)), "{failed:?}");
+            assert_eq!(
+                tonic::Status::from(failed).code(),
+                tonic::Code::Unavailable,
+                "retryable"
+            );
+            assert_eq!(rig.log.answer(&stalled.digest), BlobAnswer::Absent);
+            // The stalled stream's block of its own is closed; the small blob's grouped block is not.
+            open_files_settle_at(&rig, &cache, 1).await;
+        },
+    );
 }

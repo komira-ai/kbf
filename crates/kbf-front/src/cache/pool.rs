@@ -36,9 +36,10 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::StreamExt as _;
@@ -80,14 +81,19 @@ pub struct PoolConfig {
     /// The most blobs waiting for a writer (`--write-pool-queue`). A blob that finds the
     /// queue full goes straight to the object store.
     pub queue: NonZeroUsize,
+    /// How long a writer waits for the next chunk of a streamed blob
+    /// (`--write-pool-stream-idle`). A stream that sends nothing for this long loses its
+    /// writer and fails with [`CacheError::Stalled`] (UNAVAILABLE). Not zero.
+    pub stream_idle: Duration,
 }
 
 impl PoolConfig {
-    /// 8 writers, and room for 4,096 blobs behind them (at most 4 MiB each, under the
-    /// storage node's `--write-bytes-in-flight`).
+    /// 8 writers, room for 4,096 blobs behind them (at most 4 MiB each, under the
+    /// storage node's `--write-bytes-in-flight`), and 30 s for a stream's next chunk.
     pub const DEFAULT: Self = Self {
         writers: NonZeroUsize::MIN.saturating_add(7),
         queue: NonZeroUsize::MIN.saturating_add(4095),
+        stream_idle: Duration::from_secs(30),
     };
 }
 
@@ -124,6 +130,9 @@ struct StreamJob {
     chunks: Receiver<Bytes>,
     /// The digest the blob is committed as, and where to answer.
     commit: oneshot::Receiver<(Digest, oneshot::Sender<Result<(), CacheError>>)>,
+    /// Set by the writer when it gave the stream up for sending no chunk in time, so the
+    /// sender's next call fails as [`CacheError::Stalled`] and not as a stopped pool.
+    stalled: Arc<AtomicBool>,
 }
 
 /// Where the blobs of a pool are queued for its writers.
@@ -155,6 +164,7 @@ impl WritePool {
                 staging: Arc::clone(staging),
                 runtime: runtime.clone(),
                 queued: Arc::clone(&queued),
+                stream_idle: config.stream_idle,
             };
             let name = format!("kbf-write-pool-{n}");
             let spawned = std::thread::Builder::new()
@@ -180,6 +190,8 @@ struct Worker<M, O> {
     staging: Arc<Staging>,
     runtime: tokio::runtime::Handle,
     queued: Arc<Mutex<Receiver<Job>>>,
+    /// How long a streamed blob may go without a chunk ([`PoolConfig::stream_idle`]).
+    stream_idle: Duration,
 }
 
 impl<M: MetaLog, O: ObjectStore> Worker<M, O> {
@@ -328,6 +340,7 @@ impl<M: MetaLog, O: ObjectStore> Worker<M, O> {
             accept,
             chunks,
             commit,
+            stalled,
         } = job;
         let staging = &self.staging;
         let tier = &*staging.tier;
@@ -347,22 +360,40 @@ impl<M: MetaLog, O: ObjectStore> Worker<M, O> {
             }
         };
         let _ = accept.send(true);
-        self.fill(reservation, own, chunks, commit);
+        self.fill(reservation, own, chunks, commit, &stalled);
         self.note_files(tier);
     }
 
     /// Writes the chunks into `reservation`, then, once the sender commits, syncs and
-    /// commits the blob. Abandoned (the sender dropped the chunks or the commit), the
-    /// reservation is dropped: answered as failed.
+    /// commits the blob. Abandoned (the sender dropped the chunks or the commit), or idle
+    /// (no chunk for [`PoolConfig::stream_idle`], so `stalled` is set), the reservation is
+    /// dropped and this writer is free: the sender's next call fails.
     fn fill(
         &self,
         reservation: Reservation,
         own: bool,
         chunks: Receiver<Bytes>,
         commit: oneshot::Receiver<(Digest, oneshot::Sender<Result<(), CacheError>>)>,
+        stalled: &AtomicBool,
     ) {
         let mut at = 0;
-        for chunk in chunks {
+        loop {
+            let chunk = match chunks.recv_timeout(self.stream_idle) {
+                Ok(chunk) => chunk,
+                // The sender ended the chunks, or dropped the stream.
+                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {
+                    // Set before the chunks are dropped: the sender sees the flag when its
+                    // next send fails.
+                    stalled.store(true, Ordering::SeqCst);
+                    tracing::warn!(
+                        idle = ?self.stream_idle,
+                        received = at,
+                        "a streamed blob sent no chunk in time; its writer is freed"
+                    );
+                    return;
+                }
+            };
             if let Err(e) = self.staging.tier.write(&reservation, at, &chunk) {
                 tracing::warn!(error = %e, "the write pool could not write a streamed blob");
                 return;
@@ -413,6 +444,7 @@ enum Inner {
         /// The writer's answer, until the first chunk waited for it.
         accept: Option<oneshot::Receiver<bool>>,
         commit: oneshot::Sender<(Digest, oneshot::Sender<Result<(), CacheError>>)>,
+        stalled: Arc<AtomicBool>,
     },
 }
 
@@ -447,11 +479,13 @@ impl PoolWrite {
         let (chunks, queued_chunks) = mpsc::sync_channel(STREAM_CHUNKS_IN_FLIGHT);
         let (accept_tx, accept_rx) = oneshot::channel();
         let (commit_tx, commit_rx) = oneshot::channel();
+        let stalled = Arc::new(AtomicBool::new(false));
         let job = Job::Stream(StreamJob {
             size,
             accept: accept_tx,
             chunks: queued_chunks,
             commit: commit_rx,
+            stalled: Arc::clone(&stalled),
         });
         // Counted before the send: a writer may take the job at once and lower it.
         metrics.write_pool_queue.add_one();
@@ -465,6 +499,7 @@ impl PoolWrite {
                 chunks,
                 accept: Some(accept_rx),
                 commit: commit_tx,
+                stalled,
             },
             size,
         })
@@ -483,8 +518,13 @@ impl PoolWrite {
                 bytes.extend_from_slice(chunk);
                 Ok(())
             }
-            Inner::Streaming { chunks, accept, .. } => {
-                let stopped = || Refused::Failed(CacheError::Invalid(STOPPED.to_owned()));
+            Inner::Streaming {
+                chunks,
+                accept,
+                stalled,
+                ..
+            } => {
+                let stopped = || Refused::Failed(stopped(stalled));
                 if let Some(accept) = accept.take() {
                     // A writer that went away without answering took no room either.
                     if accept.blocking_recv() != Ok(true) {
@@ -506,7 +546,9 @@ impl PoolWrite {
                 jobs,
             },
             // The chunks end with their sender.
-            Inner::Streaming { commit, .. } => PoolCommit::Stream { commit },
+            Inner::Streaming {
+                commit, stalled, ..
+            } => PoolCommit::Stream { commit, stalled },
         }
     }
 }
@@ -519,7 +561,21 @@ pub(crate) enum PoolCommit {
     },
     Stream {
         commit: oneshot::Sender<(Digest, oneshot::Sender<Result<(), CacheError>>)>,
+        stalled: Arc<AtomicBool>,
     },
+}
+
+/// Why a stream's writer is gone: it gave the stream up for sending nothing in time
+/// (retryable), or the pool stopped taking it.
+fn stopped(stalled: &AtomicBool) -> CacheError {
+    if stalled.load(Ordering::SeqCst) {
+        CacheError::Stalled(
+            "the write pool freed the writer of a streamed blob that sent no chunk in time"
+                .to_owned(),
+        )
+    } else {
+        CacheError::Invalid(STOPPED.to_owned())
+    }
 }
 
 impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
@@ -567,12 +623,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         digest: Digest,
     ) -> Result<(), CacheError> {
         match commit {
-            PoolCommit::Stream { commit } => {
+            PoolCommit::Stream { commit, stalled } => {
                 let (done, answer) = oneshot::channel();
                 // A writer that is gone drops `done` with the message, and the answer fails.
                 let _ = commit.send((digest, done));
-                let stopped = CacheError::Invalid(STOPPED.to_owned());
-                answer.await.unwrap_or(Err(stopped))
+                answer.await.unwrap_or_else(|_| Err(stopped(&stalled)))
             }
             PoolCommit::Whole { bytes, jobs } => {
                 let (done, answer) = oneshot::channel();

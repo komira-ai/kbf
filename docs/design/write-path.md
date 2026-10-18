@@ -751,9 +751,26 @@ Where it differs from the sections above, and why:
   after its bytes are synced and its `PutStaged` applied, as before the pool.**
 - **Larger blobs** stream through a writer: queued when the stream opens, the range
   reserved when a writer takes it, each chunk written as it arrives. The writer is held
-  until the commit or until the stream is dropped, so a slow sender holds a writer, never
-  a second file. A blob larger than the tier's segment limit cannot share a block: it is
+  until the commit, until the stream is dropped, or until the stream is idle for too long
+  (next bullet), so a slow sender holds a writer, never a second file. A blob larger than the tier's segment limit cannot share a block: it is
   written to a block of its own (`reserve_upload`), still by one writer.
+- **Idle streams.** Without a bound, a stalled but connected large upload would hold its
+  writer for ever, and with `--write-pool-writers` of them every small blob would wait
+  behind them. A writer waits `--write-pool-stream-idle` seconds (default 30, at least 1)
+  for the next chunk of a stream; when none comes it drops the reservation (the block of
+  its own is closed, or the range in the grouped block is answered as failed) and takes
+  the next job. The stream's next `append` or its commit then fails with
+  `CacheError::Stalled`, which is UNAVAILABLE (`StorageError::Unavailable` on a storage
+  node): the client sends the blob again, as for any retryable failure. The clock runs from
+  the moment a writer takes the stream; a stream still waiting in the queue is not timed.
+  It covers the wait for chunks, not the commit that follows the last one, which the
+  server itself makes at once.
+- **Known limit.** A streamed blob holds a blocking-pool thread of the server runtime
+  while it appends (its `append` blocks). With the default `--write-bytes-in-flight` the
+  streams in flight stay far below the pool's 512 threads; if that flag is raised until
+  more than about 512 large streams can be queued behind busy writers, the blocking pool
+  is exhausted and other blocking work waits. The idle timeout does not bound this, since
+  a queued stream is not timed.
 - **Backpressure.** A blob that finds the queue full is not queued and not refused: it
   goes straight to the object store (section 3.2's streaming path), as does a blob the
   tier cannot hold (budget, or a disk error before the commit). `kbf_storage_write_pool_direct_total`
