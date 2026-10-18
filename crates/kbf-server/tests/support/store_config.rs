@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::hooked::Hooked;
+use kbf_enroll_registry::{EnrollRequest, IssuedRole, TokenSpec, create_token, enroll_txn};
 use kbf_proto::kbf::enroll::v1::cold_store_client::ColdStoreClient;
 use kbf_proto::kbf::enroll::v1::{GetStoreConfigRequest, StoreConfig};
 use kbf_proto::kbf::map::v1 as pb;
@@ -21,6 +22,7 @@ use kbf_server::store_config::{Snapshot, SourceError, StoreConfigSource};
 use kbf_server::worker_roles::WorkerRolesLayer;
 use kbf_state::Store;
 use kbf_storage::service::{Admission, ROLE_URI_PREFIX};
+use kbf_types::{NodeId, Role, RoleSet, TokenId, TokenSecret};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, SanType,
@@ -265,4 +267,62 @@ pub fn want(have: u64) -> GetStoreConfigRequest {
     GetStoreConfigRequest {
         have_generation: have,
     }
+}
+
+/// A self-signed certificate (DER) with these names and role: what a service sees of a caller.
+pub fn der(role: Option<&str>, names: &[&str]) -> Vec<u8> {
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+    params.subject_alt_names = names.iter().map(|n| dns(n)).collect();
+    if let Some(role) = role {
+        params.subject_alt_names.push(SanType::URI(
+            format!("{ROLE_URI_PREFIX}{role}").try_into().expect("IA5"),
+        ));
+    }
+    let key = KeyPair::generate().expect("key");
+    params.self_signed(&key).expect("sign").der().to_vec()
+}
+
+/// Enrolls node `name` in the registry held in `store` (a daemon-role row: the registry check
+/// reads the row's state, not its roles).
+pub fn enroll(store: &dyn Store, name: &str) {
+    let secret = TokenSecret::from_bytes([7; 32]);
+    let token = TokenId::parse("aaaaaaaaaaaa").expect("a token id");
+    let spec = TokenSpec {
+        roles: RoleSet::new([Role::Daemon]).expect("roles"),
+        max_uses: 5,
+        ttl: None,
+        node_id: None,
+        node_prefix: None,
+        names: Vec::new(),
+        replace: false,
+        label: "t".to_owned(),
+        created_by: "t".to_owned(),
+    };
+    create_token(store, &token, &secret, &spec).expect("token");
+    let node: NodeId = name.parse().expect("a node id");
+    let now = store.now().as_duration().as_secs();
+    let mut sign = || {
+        Ok(vec![IssuedRole {
+            role: Role::Daemon,
+            spki_sha256: [1; 32],
+            serial: vec![1],
+            not_before: now - 300,
+            not_after: now + 86_400,
+            cert_der: vec![1],
+        }])
+    };
+    enroll_txn(
+        store,
+        &EnrollRequest {
+            token_id: &token,
+            secret: secret.as_bytes(),
+            node_id: &node,
+            csrs: &[(Role::Daemon, name.as_bytes())],
+            advertise: "",
+            zone: "z",
+        },
+        &mut sign,
+    )
+    .map_err(|e| format!("{e:?}"))
+    .expect("enrolled");
 }

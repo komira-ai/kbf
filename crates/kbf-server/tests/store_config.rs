@@ -8,10 +8,14 @@ mod hooked;
 #[path = "support/store_config.rs"]
 mod support;
 
+use std::sync::Arc;
+
 use kbf_map::{DenyEntry, MemberId};
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_server::store_config::acks::NodeStatus;
-use support::{SENTINEL, Source, cold, farm, farm_denying, membership, registration, want};
+use support::{
+    SENTINEL, Source, cold, der, enroll, farm, farm_denying, membership, registration, want,
+};
 use tonic::{Code, Status};
 
 /// The unary the farm's registered store replaced: a raw call, since no client exists.
@@ -254,6 +258,17 @@ async fn heartbeats_announce_the_generation_and_report_what_the_node_applied() {
         .expect_err("old boot");
     assert_eq!(stale.code(), Code::FailedPrecondition);
     assert!(!farm.acks.convergence(&map, 5).expect("read").converged);
+
+    // The acks refuse an older boot themselves (called directly: the stale heartbeat above is
+    // refused before it gets here): a report of boot 1 never replaces boot 2's.
+    let member = MemberId(joined.member_id);
+    farm.acks
+        .record(member, again.boot, &beat(5, pb::ApplyStatus::Ok))
+        .expect("the newer boot's report");
+    farm.acks
+        .record(member, joined.boot, &beat(1, pb::ApplyStatus::ProbeFailed))
+        .expect("the older boot's report");
+    assert!(farm.acks.convergence(&map, 5).expect("read").converged);
 }
 
 /// Catches: an older node (one that sends neither field) counted as pending for ever,
@@ -306,6 +321,37 @@ async fn with_a_registry_an_unenrolled_node_is_refused_and_a_failing_registry_is
         .expect_err("unenrolled");
     assert_eq!(refused.code(), Code::PermissionDenied);
     assert_eq!(refused.message(), "the node is not enrolled or is revoked");
+
+    // Enrolled, the same certificate is served.
+    farm.store
+        .clock
+        .advance(std::time::Duration::from_secs(1_000_000));
+    enroll(&*farm.store, "node-a");
+    cold(&channel)
+        .get_store_config(want(0))
+        .await
+        .expect("an active node is served");
+
+    // A certificate that names no node, or a name that is no node id, is not enrolled.
+    let direct = kbf_server::store_config::service::ColdStoreService::new(
+        Source::new(7),
+        kbf_storage::service::Admission::Certified,
+    )
+    .with_registry(Some(Arc::clone(&farm.store) as Arc<dyn kbf_state::Store>));
+    let cases: [&[&str]; 2] = [&[], &["Not A Node!"]];
+    for names in cases {
+        let stranger = der(Some("storage"), names);
+        let refused = direct
+            .admit_leaf(Some(&stranger))
+            .await
+            .expect_err("no node");
+        assert_eq!(refused.code(), Code::PermissionDenied, "{names:?}");
+        assert_eq!(
+            refused.message(),
+            "the certificate names no enrolled node",
+            "{names:?}"
+        );
+    }
 
     farm.store.fail_gets.store(1, Ordering::SeqCst);
     let down = cold(&channel)
@@ -462,4 +508,40 @@ async fn acks_that_cannot_be_kept_do_not_fail_the_membership_calls() {
         .into_inner();
     node.heartbeat(beat(&again)).await.expect("beats");
     assert!(farm.acks.convergence(&map, 4).expect("read").converged);
+}
+
+/// Catches: the service's own checks, which the listener's table hides on the wire (it refuses
+/// a daemon, and a handshake without a certificate never reaches the service): called
+/// directly, plain text admits without a certificate, mutual TLS without one is
+/// UNAUTHENTICATED, a daemon certificate is PERMISSION_DENIED saying so, and a storage
+/// certificate is admitted with the names it carries.
+#[tokio::test]
+async fn the_service_refuses_a_daemon_and_a_missing_certificate_itself() {
+    use kbf_server::store_config::service::ColdStoreService;
+    use kbf_storage::service::Admission;
+    let plain = ColdStoreService::new(Source::new(1), Admission::Open);
+    assert!(plain.admit_leaf(None).await.expect("plain text").is_none());
+
+    let certified = ColdStoreService::new(Source::new(1), Admission::Certified);
+    let none = certified
+        .admit_leaf(None)
+        .await
+        .expect_err("no certificate");
+    assert_eq!(none.code(), Code::Unauthenticated);
+    let daemon = der(Some("daemon"), &["node-a"]);
+    let refused = certified
+        .admit_leaf(Some(&daemon))
+        .await
+        .expect_err("a daemon");
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    assert_eq!(
+        refused.message(),
+        "role daemon may not fetch the cold store"
+    );
+    let storage = der(Some("storage"), &["node-a"]);
+    let admitted = certified.admit_leaf(Some(&storage)).await.expect("storage");
+    assert_eq!(
+        admitted.expect("a certificate").node().expect("a node"),
+        "node-a"
+    );
 }
