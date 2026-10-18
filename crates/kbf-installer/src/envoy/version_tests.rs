@@ -22,7 +22,7 @@ fn refused(output: &str) -> String {
 #[test]
 fn the_program_name_in_front_may_be_a_path() {
     let sha = "6eb0d2d97489ec1b4e1584a004f5de443d97a41b";
-    for name in ["envoy", "/home/runner/_temp/tools/envoy", "./envoy-static"] {
+    for name in ["envoy", "/opt/ci/tools/envoy", "./envoy-static"] {
         let text = format!("{name}  version: {sha}/1.39.3/Clean/RELEASE/BoringSSL\n");
         assert_eq!(
             check_output(&text).expect("supported").to_string(),
