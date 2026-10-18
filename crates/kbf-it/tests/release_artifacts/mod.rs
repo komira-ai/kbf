@@ -106,6 +106,49 @@ pub fn problems(workflow: &str) -> Result<Vec<String>, String> {
     signing(workflow, &mut out)?;
     identity(workflow, &mut out)?;
     darwin(workflow, &mut out)?;
+    pull_request_gate(workflow, &mut out)?;
+    Ok(out)
+}
+
+/// A pull request builds nothing unless it carries [`PR_LABEL`]: each build job's `if:`
+/// names the label, so an unlabelled pull request's run is skipped without a runner.
+const PR_LABEL: &str = "needs-artifacts";
+
+fn pull_request_gate(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
+    for job in BUILD_JOBS {
+        let condition = workflows::job_condition(workflow, job)?.unwrap_or_default();
+        if !condition.contains(&format!("labels.*.name, '{PR_LABEL}'")) {
+            out.push(format!(
+                "the build job `{job}` does not run on a pull request only with the label `{PR_LABEL}`: its `if:` is `{condition}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The one `if:` of ci.yml's `native-macos` job: skipped for a pull request into
+/// feature/arch-v2 unless it carries the label `macos`, as before for every other event.
+pub const MACOS_IF: &str = "${{ github.event_name != 'pull_request' || github.base_ref != 'feature/arch-v2' || contains(github.event.pull_request.labels.*.name, 'macos') }}";
+
+/// What differs between ci.yml's `native-macos` condition and [`MACOS_IF`], and whether
+/// ci.yml runs on `labeled` pull request events (without which the label starts nothing).
+pub fn macos_problems(ci: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let condition = workflows::job_condition(ci, "native-macos")?;
+    if condition.as_deref() != Some(MACOS_IF) {
+        out.push(format!(
+            "the job `native-macos` has `if: {}`, not exactly `{MACOS_IF}`",
+            condition.as_deref().unwrap_or("(none)")
+        ));
+    }
+    let header: String = ci
+        .lines()
+        .take_while(|l| !l.starts_with("jobs:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !header.contains("types: [opened, synchronize, reopened, labeled]") {
+        out.push("ci.yml's `pull_request` does not list the types `opened, synchronize, reopened, labeled`: adding the label `macos` would start nothing".to_owned());
+    }
     Ok(out)
 }
 
@@ -303,6 +346,19 @@ fn the_workflow_builds_signs_checks_and_attests_what_the_release_set_says() {
 }
 
 #[test]
+fn native_macos_runs_for_a_feature_pull_request_only_with_the_label() {
+    // Catches: ci.yml's native-macos condition drifting (the label no longer starting
+    // it, or the job running on every feature pull request again), or `labeled` dropped
+    // from the pull_request types so that adding the label does nothing.
+    let path = ".github/workflows/ci.yml";
+    let text = std::fs::read_to_string(super::repo_root().join(path)).expect(path);
+    match macos_problems(&text) {
+        Ok(found) => assert!(found.is_empty(), "{path}:\n{}", found.join("\n")),
+        Err(e) => panic!("{path}: {e}"),
+    }
+}
+
+#[test]
 fn the_docs_describe_the_release_set() {
     // Catches: docs/artifacts.md describing another set of files than the workflow
     // builds (the doc is what an operator verifies against), or no longer saying that
@@ -342,7 +398,7 @@ mod rules {
         );
         for job in BUILD_JOBS {
             w.push_str(&format!(
-                "  {job}:\n    runs-on: ubuntu-24.04\n    steps:\n"
+                "  {job}:\n    if: ${{{{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, '{PR_LABEL}') }}}}\n    runs-on: ubuntu-24.04\n    steps:\n"
             ));
             let platform = *job;
             let mine: Vec<&str> = ASSETS
@@ -438,6 +494,71 @@ mod rules {
                 "kbf-x for linux-arm64 is packaged but not in the pinned release set",
             ],
         );
+    }
+
+    #[test]
+    fn the_macos_condition_and_the_labeled_type_are_pinned() {
+        // Catches: the label dropped from native-macos's condition (the job never runs
+        // on a feature pull request), the base-branch gate dropped (it runs on all), a
+        // push or merge_group case lost, and `labeled` missing from the types.
+        let ci = format!(
+            "name: ci\non:\n  pull_request:\n    types: [opened, synchronize, reopened, labeled]\n  merge_group:\njobs:\n  native-macos:\n    if: {MACOS_IF}\n    runs-on: macos-latest\n"
+        );
+        assert_eq!(macos_problems(&ci).expect("readable"), Vec::<String>::new());
+        for (from, to, what) in [
+            (
+                " || contains(github.event.pull_request.labels.*.name, 'macos')",
+                "",
+                "the label",
+            ),
+            (
+                " || github.base_ref != 'feature/arch-v2'",
+                "",
+                "the base gate",
+            ),
+            (
+                "github.event_name != 'pull_request' || ",
+                "",
+                "the event case",
+            ),
+        ] {
+            let bad = ci.replacen(from, to, 1);
+            assert_ne!(bad, ci, "{what}");
+            let got = macos_problems(&bad).expect("readable");
+            assert!(
+                got.iter().any(|p| p.contains("`native-macos` has `if:")),
+                "{what}: {got:?}"
+            );
+        }
+        let bad = ci.replacen(", labeled]", "]", 1);
+        let got = macos_problems(&bad).expect("readable");
+        assert!(
+            got.iter().any(|p| p.contains("would start nothing")),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn a_build_job_runs_on_a_pull_request_only_with_the_label() {
+        // Catches: a build job left without the label condition, so every pull request
+        // queues a runner for it (the load this gate removes).
+        let w = good();
+        let line = format!(
+            "    if: ${{{{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, '{PR_LABEL}') }}}}\n"
+        );
+        assert!(w.contains(&line), "the fixture's condition");
+        let parts: Vec<&str> = w.split(&line).collect();
+        assert_eq!(parts.len(), 4, "three build jobs");
+        for (k, job) in BUILD_JOBS.iter().enumerate() {
+            let mut planted = String::new();
+            for (i, part) in parts.iter().enumerate() {
+                planted.push_str(part);
+                if i < 3 && i != k {
+                    planted.push_str(&line);
+                }
+            }
+            names(&planted, &[&format!("the build job `{job}` does not run")]);
+        }
     }
 
     #[test]
