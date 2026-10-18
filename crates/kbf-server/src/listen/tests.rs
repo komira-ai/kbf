@@ -218,3 +218,15 @@ fn the_retry_ends_when_the_waits_reach_the_budget() {
     assert_eq!(attempts, waits.len() + 1);
     assert!(waits.iter().all(|w| *w <= Duration::from_secs(2)));
 }
+
+/// Catches the production bind path losing the address's own error once it gives up:
+/// binding a documentation address (192.0.2.1, on no interface) with a small budget runs
+/// the real wait between attempts and then fails with `AddrNotAvailable`, which the
+/// frontend reports as it is. (The retry rule itself is pinned by the `retry_unavailable`
+/// tests above.) Mutant: `bind_within` returns its failure as `ErrorKind::Other`.
+#[test]
+fn a_real_bind_to_an_absent_address_waits_then_says_it_is_not_available() {
+    let absent: SocketAddr = "192.0.2.1:0".parse().expect("an address");
+    let error = bind_within(absent, Duration::from_millis(300)).expect_err("not on this host");
+    assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable, "{error}");
+}
