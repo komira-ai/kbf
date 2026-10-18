@@ -7,6 +7,11 @@ Description=kbf build farm node daemon
 Wants=network-online.target
 After=network-online.target
 
+# A failure that repeats quickly (the cold store or a disk not ready) must not use up
+# systemd's start limit of 5 starts in 10 s and leave the unit down (check-units rule
+# `restart`).
+StartLimitIntervalSec=0
+
 [Service]
 User=kbf
 Slice=kbf.slice
@@ -18,17 +23,21 @@ Delegate=yes
 MemoryMin=256M
 # Build containers get 0 back from the driver.
 OOMScoreAdjust=-900
+# systemd starts a unit at a soft open-file limit of 1024; a build burst passes that (EMFILE).
+LimitNOFILE=1048576
 CPUWeight=200
 # No MemorySwapMax=: leases may swap (the host's swapfile is for them); the
 # daemon's swap watch kills a lease that swaps at its own cap.
 Environment=XDG_RUNTIME_DIR=/run/user/1500
-# TODO: --frontend in place of --server and --cas, and --advertise-addr where
-# the bind address is not routable. (No comment goes inside the continued lines
-# below: systemd 239 and older read one into the command line.)
+# --server and --cas dial the frontend by KBF_FRONTEND_NAME, not this node's own
+# KBF_HOST_NAME. TODO(registration): --frontend=<the frontend's DNS name> in place of
+# them, and --advertise-addr where the bind address is not routable, once a daemon
+# registers with a frontend and takes the storage map it pushes. (No comment goes inside
+# the continued lines below: systemd 239 and older read one into the command line.)
 ExecStart=/usr/local/bin/kbf daemon \
     --driver=container \
-    --server=https://storage-node.example.internal:8981 \
-    --cas=https://storage-node.example.internal:8981 \
+    --server=https://frontend.example.internal:8981 \
+    --cas=https://frontend.example.internal:8981 \
     --ca-cert=/etc/kbf/ca.pem \
     --cert=/etc/kbf/node.pem \
     --key=/etc/kbf/node.key \
@@ -37,6 +46,7 @@ ExecStart=/usr/local/bin/kbf daemon \
     --actions-memory-max-gib=200 \
     --supervisor-memory-min-mib=256
 Restart=on-failure
+RestartSec=5
 # Exit 2 is a command line kbf refused (or an image it cannot parse): a restart cannot
 # fix it.
 RestartPreventExitStatus=2

@@ -5,10 +5,17 @@
 # runtime). Each comes as a tarball with a CycloneDX SBOM; one SHA256SUMS covers a
 # commit's files.
 #
+# A pull request runs none of it unless it carries the label `needs-artifacts` (add the
+# label to get the files; every build and sums job carries the same condition, so an unlabelled
+# pull request's run is skipped without queueing a runner). The merge queue and pushes
+# are unchanged.
+#
 # On a pull request or in the merge queue this is a build check: everything is built,
-# signed, packaged and summed, and nothing is attested. On a push to main or to
-# feature/arch-v2, the attest job signs build provenance for every file and an SBOM
-# attestation for every tarball, and the verify job then checks them, for the branch
+# signed, packaged and summed, and nothing is attested (a pull request into
+# feature/arch-v2 skips darwin-arm64, and so the sums, to spare the macOS runners). On a push to main or to
+# feature/arch-v2, the attest jobs sign build provenance for every file and an SBOM
+# attestation for every tarball, per platform group (Linux does not wait for the macOS
+# runners), and the verify jobs then check them, for the branch
 # that was pushed, as the planned deployment job is to. Only attest may hold `id-token:
 # write` and `attestations: write`, and only under its exact `if:` (the workflow lint,
 # crates/kbf-it/tests/workflows, requires both; crates/kbf-it/tests/release_artifacts
@@ -23,17 +30,22 @@ name: artifacts
 
 on:
   pull_request:
+    # `labeled`: adding `needs-artifacts` to an open pull request starts the build.
+    types: [opened, synchronize, reopened, labeled]
   merge_group:
   push:
     branches: [main, feature/arch-v2]
 
 permissions: {}
 
-# A pull request's newer run replaces its older one. Every commit on main gets its own
-# group, so no commit's run is cancelled or dropped while queued.
+# A pull request's newer run replaces its older one, and so does a newer push to
+# feature/arch-v2: only its head needs attested files, and a superseded push run would
+# otherwise hold a macOS runner for hours (each push had its own group, and pushes
+# queued 2-4 h behind each other for the few macOS runners). Every commit on main still
+# gets its own group, so no main commit's run is cancelled or dropped while queued.
 concurrency:
-  group: artifacts-${{ github.event_name == 'push' && github.sha || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: artifacts-${{ github.event_name }}-${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/feature/arch-v2') }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -51,6 +63,11 @@ defaults:
 
 jobs:
   darwin-arm64:
+    # Not for pull requests into feature/arch-v2: nothing is attested from a pull request,
+    # macOS runners are the scarce ones, and the push to feature/arch-v2 builds and
+    # attests darwin-arm64 for its head. Pull requests into main still build it.
+    # With the label `needs-artifacts`, like every job here.
+    if: ${{ github.event_name != 'pull_request' || (github.base_ref != 'feature/arch-v2' && contains(github.event.pull_request.labels.*.name, 'needs-artifacts')) }}
     runs-on: macos-15
     timeout-minutes: 45
     permissions:
@@ -127,6 +144,7 @@ jobs:
   # glibc: the binaries need the glibc of the runner image they were built on (Ubuntu
   # 24.04) or newer.
   linux-x86_64:
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -187,6 +205,7 @@ jobs:
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   linux-arm64:
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     permissions:
@@ -246,10 +265,75 @@ jobs:
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
-  # One SHA256SUMS over every platform's files, checked against the files (and against a
-  # copy with a flipped byte, which must fail). Runs on every event.
+  # Attestation is per platform group, so the Linux files are attested and verifiable as
+  # soon as the Linux jobs finish, however long the macOS runner queue is: Linux is
+  # sums-linux -> attest-linux -> verify-linux, macOS is sums-darwin-arm64 ->
+  # attest-darwin-arm64 -> verify-darwin-arm64. Each group has its own SHA256SUMS (artifact
+  # sha256sums-linux, sha256sums-darwin-arm64) over just its files; the subjects of every
+  # file's attestations are the same as in the one SHA256SUMS.
+
+  # SHA256SUMS over the Linux files (both architectures), as `sums` is over all.
+  sums-linux:
+    needs: [linux-x86_64, linux-arm64]
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: assets-linux-*
+          path: dist
+          merge-multiple: true
+      - run: rustup toolchain install
+      - name: Assemble SHA256SUMS
+        run: cargo xtask sums assemble dist --summary "$GITHUB_STEP_SUMMARY"
+      - run: cargo xtask verify-assets sums dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sha256sums-linux
+          path: dist/SHA256SUMS
+          retention-days: 90
+          if-no-files-found: error
+
+  # SHA256SUMS over the macOS files.
+  sums-darwin-arm64:
+    needs: [darwin-arm64]
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: assets-darwin-arm64
+          path: dist
+          merge-multiple: true
+      - run: rustup toolchain install
+      - name: Assemble SHA256SUMS
+        run: cargo xtask sums assemble dist --summary "$GITHUB_STEP_SUMMARY"
+      - run: cargo xtask verify-assets sums dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sha256sums-darwin-arm64
+          path: dist/SHA256SUMS
+          retention-days: 90
+          if-no-files-found: error
+
+  # One SHA256SUMS over every platform's files (the commit's whole set, the file a release
+  # carries), checked against the files and a flipped copy. Runs on every event, a pull request
+  # without the label excepted, once every platform is built. Nothing waits for it: attestation is per platform, below.
   sums:
     needs: [darwin-arm64, linux-x86_64, linux-arm64]
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -274,12 +358,13 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-  # Push to main or feature/arch-v2 only: build provenance for every file, and an SBOM
-  # attestation for every tarball. This job signs and does nothing else: while it holds `id-token: write`
-  # no repository code runs, and nothing is built, only the pinned actions below. The
-  # sums job checked these files against SHA256SUMS; the verify job checks what it signs.
-  attest:
-    needs: [sums]
+  # Push to main or feature/arch-v2 only: build provenance for every Linux file, and an SBOM
+  # attestation for every Linux tarball. This job signs and does nothing else: while it holds
+  # `id-token: write` no repository code runs, and nothing is built, only the pinned actions
+  # below. The Linux sums job checked these files against its SHA256SUMS; the Linux verify job
+  # checks what it signs.
+  attest-linux:
+    needs: [sums-linux]
     if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -290,28 +375,16 @@ jobs:
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: assets-*
+          pattern: assets-linux-*
           path: dist
           merge-multiple: true
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: sha256sums
+          name: sha256sums-linux
           path: dist
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-checksums: dist/SHA256SUMS
-      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
-        with:
-          subject-path: dist/kbf-daemon-${{ github.sha }}-darwin-arm64.tar.gz
-          sbom-path: dist/kbf-daemon-${{ github.sha }}-darwin-arm64.cdx.json
-      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
-        with:
-          subject-path: dist/kbf-${{ github.sha }}-darwin-arm64.tar.gz
-          sbom-path: dist/kbf-${{ github.sha }}-darwin-arm64.cdx.json
-      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
-        with:
-          subject-path: dist/kbf-deploy-${{ github.sha }}-darwin-arm64.tar.gz
-          sbom-path: dist/kbf-deploy-${{ github.sha }}-darwin-arm64.cdx.json
       - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
           subject-path: dist/kbf-daemon-${{ github.sha }}-linux-x86_64.tar.gz
@@ -345,13 +418,54 @@ jobs:
           subject-path: dist/kbf-${{ github.sha }}-linux-arm64.tar.gz
           sbom-path: dist/kbf-${{ github.sha }}-linux-arm64.cdx.json
 
-  # Push to main or feature/arch-v2 only, after attest: the checks the planned deployment
+
+  # Push to main or feature/arch-v2 only: build provenance for every macOS file, and an SBOM
+  # attestation for every macOS tarball. This job signs and does nothing else: while it holds
+  # `id-token: write` no repository code runs, and nothing is built, only the pinned actions
+  # below. The macOS sums job checked these files against its SHA256SUMS; the macOS verify job
+  # checks what it signs.
+  attest-darwin-arm64:
+    needs: [sums-darwin-arm64]
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: assets-darwin-arm64
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sha256sums-darwin-arm64
+          path: dist
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/kbf-daemon-${{ github.sha }}-darwin-arm64.tar.gz
+          sbom-path: dist/kbf-daemon-${{ github.sha }}-darwin-arm64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/kbf-${{ github.sha }}-darwin-arm64.tar.gz
+          sbom-path: dist/kbf-${{ github.sha }}-darwin-arm64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/kbf-deploy-${{ github.sha }}-darwin-arm64.tar.gz
+          sbom-path: dist/kbf-deploy-${{ github.sha }}-darwin-arm64.cdx.json
+
+  # Push to main or feature/arch-v2 only, after attest-linux: the checks the planned deployment
   # job is to make (cargo xtask verify-assets, crates/xtask/src/sums.rs), for the branch
-  # that was pushed (`--source-ref "$GITHUB_REF"`), with read-only scopes. The
-  # files are assembled again into a SHA256SUMS that must be byte for byte the one the
-  # sums job published and attest signed, then checked against it, then each verified.
-  verify:
-    needs: [attest]
+  # that was pushed (`--source-ref "$GITHUB_REF"`), with read-only scopes, on the Linux files.
+  # The files are assembled again into a SHA256SUMS that must be byte for byte the one the
+  # sums job published and the attest job signed, then checked against it, then each verified.
+  verify-linux:
+    needs: [attest-linux]
     if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -365,12 +479,48 @@ jobs:
       - run: rustup toolchain install
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: assets-*
+          pattern: assets-linux-*
           path: dist
           merge-multiple: true
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: sha256sums
+          name: sha256sums-linux
+          path: published
+      - name: Assemble SHA256SUMS, which must be the published one
+        run: cargo xtask sums assemble dist --expect published/SHA256SUMS
+      - name: Check the files against SHA256SUMS
+        run: cargo xtask verify-assets sums dist
+      - name: Verify as the planned deployment job is to
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_WORKFLOW_REF" --source-ref "$GITHUB_REF"
+
+  # Push to main or feature/arch-v2 only, after attest-darwin-arm64: the checks the planned deployment
+  # job is to make (cargo xtask verify-assets, crates/xtask/src/sums.rs), for the branch
+  # that was pushed (`--source-ref "$GITHUB_REF"`), with read-only scopes, on the macOS files.
+  # The files are assembled again into a SHA256SUMS that must be byte for byte the one the
+  # sums job published and the attest job signed, then checked against it, then each verified.
+  verify-darwin-arm64:
+    needs: [attest-darwin-arm64]
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: assets-darwin-arm64
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sha256sums-darwin-arm64
           path: published
       - name: Assemble SHA256SUMS, which must be the published one
         run: cargo xtask sums assemble dist --expect published/SHA256SUMS

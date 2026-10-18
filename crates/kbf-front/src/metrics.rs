@@ -313,7 +313,7 @@ impl Drop for Request<'_> {
 }
 
 /// The metadata commands the cache commits, as the `command` label names them.
-pub const COMMANDS: [&str; 15] = [
+pub const COMMANDS: [&str; 19] = [
     "tick",
     "alloc_epoch",
     "put_blob",
@@ -329,6 +329,10 @@ pub const COMMANDS: [&str; 15] = [
     "object_flushed",
     "flush_conflict",
     "evict_objects",
+    "set_writer",
+    "adopt_segment",
+    "rebuild_progress",
+    "rebuild_done",
 ];
 
 /// The index into [`COMMANDS`] of `command`'s label.
@@ -350,6 +354,10 @@ pub const fn command_label(command: &Command) -> usize {
         Command::ObjectFlushed { .. } => 12,
         Command::FlushConflict { .. } => 13,
         Command::EvictObjects { .. } => 14,
+        Command::SetWriter(_) => 15,
+        Command::AdoptSegment { .. } => 16,
+        Command::RebuildProgress { .. } => 17,
+        Command::RebuildDone => 18,
     }
 }
 
@@ -418,6 +426,16 @@ pub struct CacheMetrics {
     pub sched_queued: Level,
     /// Leases granted or running, as of the last scheduler input.
     pub sched_leases: Level,
+    /// Callers of a frontend that handed its work to a successor and were told UNAVAILABLE
+    /// because the state store held no trace of their operation
+    /// (`kbf_frontend_relay_lost_total`).
+    pub frontend_relay_lost: Counter,
+    /// Execute and WaitExecution calls a frontend that handed its roles over forwarded to
+    /// its successor (`kbf_handover_relayed_total`).
+    pub handover_relayed: Counter,
+    /// Relayed calls open now: each keeps the frontend alive until its action ends
+    /// (`kbf_handover_relays_open`).
+    pub handover_relays_open: Gauge,
     /// Write-tier calls queued on or running on the blocking pool.
     pub tier_in_flight: Gauge,
     /// The wait of one write-tier call for a blocking-pool thread.
@@ -465,6 +483,9 @@ impl Default for CacheMetrics {
             sched_lock_wait: Histogram::new(Unit::Seconds),
             sched_queued: Level::default(),
             sched_leases: Level::default(),
+            frontend_relay_lost: Counter::default(),
+            handover_relayed: Counter::default(),
+            handover_relays_open: Gauge::default(),
             tier_in_flight: Gauge::default(),
             tier_wait: Histogram::new(Unit::Seconds),
             tier_call: Histogram::new(Unit::Seconds),
@@ -640,6 +661,23 @@ impl CacheMetrics {
             "kbf_sched_leases",
             "Leases granted or running, as of the last scheduler input",
             self.sched_leases.get(),
+        );
+        out.counter(
+            "kbf_frontend_relay_lost_total",
+            "Callers of a frontend that handed its work over, told UNAVAILABLE because the \
+             state store held no trace of their operation",
+            self.frontend_relay_lost.get(),
+        );
+        out.counter(
+            "kbf_handover_relayed_total",
+            "Execute and WaitExecution calls forwarded to the successor of a frontend that \
+             handed its roles over",
+            self.handover_relayed.get(),
+        );
+        out.gauge(
+            "kbf_handover_relays_open",
+            "Relayed Execute and WaitExecution calls open now",
+            self.handover_relays_open.get(),
         );
         out.gauge(
             "kbf_tier_in_flight",

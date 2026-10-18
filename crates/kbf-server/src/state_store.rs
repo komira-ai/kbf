@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use kbf_state::Store;
+use kbf_state::{Fenced, Store};
 
 use crate::farm::{EpochPolicy, StateError};
 use crate::members::MembershipConfig;
@@ -87,6 +87,13 @@ impl StateStoreUri {
         }
     }
 
+    /// The file the store is.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        let Self::Sqlite(path) = self;
+        path
+    }
+
     /// Opens the store. The file is created, with its directory, if missing (directories
     /// it makes are 0700 and the file 0600: the scheduler's state is for this user alone),
     /// and held by this process alone: a second open of it (a second frontend) is
@@ -98,10 +105,30 @@ impl StateStoreUri {
     /// [`StateError::Open`]: the file is held by another process, is on a network
     /// filesystem or is not a state store.
     pub fn open(&self) -> Result<StateStore, StateError> {
+        self.open_at(None, self.epoch_policy())
+    }
+
+    /// Opens the store as the successor of the process that held generation `generation`
+    /// and has let go of it, and keeps its epoch: the daemons that reconnect keep the runs
+    /// of the leases they hold. Nothing is written unless the store is at exactly that
+    /// generation, so a file that was restored or swapped since is refused, and so is one
+    /// another writer has taken.
+    ///
+    /// # Errors
+    /// [`StateError::Open`]: as [`StateStoreUri::open`], or the store is not at
+    /// `generation`.
+    pub fn open_after_handover(&self, generation: u64) -> Result<StateStore, StateError> {
+        self.open_at(Some(generation), EpochPolicy::Keep)
+    }
+
+    fn open_at(&self, expect: Option<u64>, epoch: EpochPolicy) -> Result<StateStore, StateError> {
         let Self::Sqlite(path) = self;
+        // This process is the store's writer from here: it takes the next generation, and
+        // every write through the handle is checked against it ([`Fenced`]).
+        let fenced = Fenced::take(open_sqlite(path)?, expect).map_err(open_error)?;
         Ok(StateStore {
-            store: open_sqlite(path)?,
-            epoch: self.epoch_policy(),
+            store: Arc::new(fenced),
+            epoch,
             // The defaults; a start sets the --member-* flags (`start::with_members`).
             members: MembershipConfig::default(),
             history: None,

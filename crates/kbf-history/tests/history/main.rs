@@ -4,9 +4,12 @@
 
 mod flog;
 mod index;
+mod list;
 mod reader;
+mod rows_support;
 mod scoped;
 mod sqlite;
+mod status;
 mod support;
 mod writer;
 mod writer_bounds;

@@ -280,6 +280,75 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
         assert!(exec.queries.borrow().is_empty(), "{args:?} asked the host");
     }
 
+    // A mode's unit reaches its own install: on a host with no such user it asks for the
+    // user the frontend runs as and is refused before any step.
+    let mut exec = FakeExec::new(0);
+    let args = [base("install-units"), vec!["--mode", "frontend"]].concat();
+    let (code, _, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!(code, ExitCode::from(2));
+    assert_eq!(
+        err,
+        "REFUSED: /usr/bin/getent passwd -- kbf-server printed \"\", which is not what this kit reads\n"
+    );
+    // The converged units' MinIO restart and rollback are not a mode's.
+    for flag in ["--restart-minio", "--uninstall"] {
+        let mut exec = FakeExec::new(0);
+        let args = [base("install-units"), vec!["--mode", "storage", flag]].concat();
+        let (code, _, _) = cli(&mut exec, &no_env, &args);
+        assert_eq!(code, ExitCode::from(2), "{args:?}");
+        assert!(exec.queries.borrow().is_empty(), "{args:?} asked the host");
+    }
+    // verify-cert reaches its kit: a CA that is not there is refused; a daemon's row
+    // needs its node id.
+    let mut exec = FakeExec::new(0);
+    let args = [
+        "linux",
+        "verify-cert",
+        "--row",
+        "storage",
+        "--cert",
+        "/srv/none/storage.pem",
+        "--ca-cert",
+        "/srv/none/ca.pem",
+    ];
+    let (code, _, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!(code, ExitCode::from(2));
+    assert!(
+        err.starts_with("REFUSED: cannot read /srv/none/ca.pem"),
+        "{err}"
+    );
+    let args = [
+        "linux",
+        "verify-cert",
+        "--row",
+        "daemon",
+        "--cert",
+        "/srv/none/node.pem",
+        "--ca-cert",
+        "/srv/none/ca.pem",
+    ];
+    let (code, _, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!(code, ExitCode::from(2));
+    assert!(err.contains("--node-id"), "{err}");
+    // The frontend's REAPI certificate is not the farm CA's: no row checks it.
+    let args = [
+        "linux",
+        "verify-cert",
+        "--row",
+        "frontend-reapi",
+        "--cert",
+        "/srv/none/reapi.pem",
+        "--ca-cert",
+        "/srv/none/ca.pem",
+    ];
+    let (code, out, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""));
+    assert!(
+        err.contains("invalid value 'frontend-reapi' for '--row <ROW>'"),
+        "{err}"
+    );
+    assert!(!err.contains("REFUSED: cannot read"), "{err}");
+
     // A rollback of a host whose services are on: a dry run plans, exits 0.
     let mut exec = FakeExec::new(501);
     let (code, out, _) = cli(
@@ -776,6 +845,101 @@ fn envoy_check_exits_0_passed_1_failed_2_refused() {
     let (code, out, err) = cli(&mut exec, &no_env, &check);
     assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
     assert!(err.ends_with(": unknown key KBF_SERVER\n"), "{err}");
+}
+
+/// Catches `--topology box` not wired to the box kit (the front's files written, or the
+/// front's check run on a box config), the box render and check not agreeing through
+/// the files, a failed box check exiting other than 1 with its line on stdout, an
+/// unreadable file or a bad setting exiting other than 2, and the default topology
+/// changing (the front's tests above run without the flag).
+#[test]
+fn envoy_box_topology_renders_checks_and_refuses() {
+    let dir = kbf_host::testkit::scratch("cli-envoy-box");
+    let config = dir.join("box.local");
+    let example = include_str!("../templates/envoy/box.example");
+    std::fs::write(&config, example).expect("config");
+    let config = config.to_str().expect("utf-8").to_owned();
+    let rendered = dir.join("rendered");
+    let rendered = rendered.to_str().expect("utf-8").to_owned();
+    let mut exec = FakeExec::new(501);
+    let passed = "12 methods routed, every box check passed\n";
+
+    let (code, out, err) = cli(
+        &mut exec,
+        &no_env,
+        &["envoy", "check", "--topology", "box", "--config", &config],
+    );
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (ExitCode::SUCCESS, passed, "")
+    );
+    let check = [
+        "envoy",
+        "check",
+        "--topology",
+        "box",
+        "--config",
+        &config,
+        "--dir",
+        &rendered,
+    ];
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
+    assert!(
+        err.starts_with(&format!("REFUSED: cannot read {rendered}/envoy.json: ")),
+        "{err}"
+    );
+
+    let render = [
+        "envoy",
+        "render",
+        "--topology",
+        "box",
+        "--config",
+        &config,
+        "--out",
+        &rendered,
+    ];
+    let (code, out, err) = cli(&mut exec, &no_env, &render);
+    assert_eq!((code, err.as_str()), (ExitCode::SUCCESS, ""), "{out}");
+    assert_eq!(
+        out,
+        format!("rendered envoy.json envoy.args into {rendered}\n")
+    );
+    assert!(
+        !std::path::Path::new(&rendered)
+            .join("manifests.json")
+            .exists()
+    );
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (ExitCode::SUCCESS, passed, "")
+    );
+
+    let args = format!("{rendered}/envoy.args");
+    let text = std::fs::read_to_string(&args).expect("rendered");
+    std::fs::write(&args, text.replace("22500", "900")).expect("plant");
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!((code, err.as_str()), (ExitCode::FAILURE, ""), "{out}");
+    assert!(
+        out.starts_with("FAIL parent-shutdown: --parent-shutdown-time-s is 900, "),
+        "{out}"
+    );
+
+    let envoy = format!("{rendered}/envoy.json");
+    std::fs::write(&envoy, "{").expect("plant");
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
+    assert!(
+        err.starts_with(&format!("REFUSED: {envoy} is not JSON: ")),
+        "{err}"
+    );
+
+    std::fs::write(&config, example.replace("KBF_BOX_HOST=", "KBF_BOX_HOSTS=")).expect("plant");
+    let (code, out, err) = cli(&mut exec, &no_env, &render);
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
+    assert!(err.ends_with(": unknown key KBF_BOX_HOSTS\n"), "{err}");
 }
 
 /// Catches the `pilot` kit dropped from the merged command line (clap would exit 2 on

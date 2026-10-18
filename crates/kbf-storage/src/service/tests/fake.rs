@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt as _;
+use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream};
 use kbf_meta::{ActionRecord, ActionWriteError, Closure, Role};
 use kbf_proto::google::bytestream::byte_stream_server::{ByteStream, ByteStreamServer};
@@ -67,6 +68,14 @@ pub(crate) struct Mem {
     pub reads: AtomicUsize,
     /// What a streamed write does ([`Mem::stream`]).
     pub knobs: Arc<Knobs>,
+    /// Blobs stored by `put_streamed`.
+    pub streamed: AtomicUsize,
+    /// The most bytes `put_streamed` held at once.
+    pub streamed_most_held: AtomicUsize,
+    /// Notified for each piece `put_streamed` takes.
+    pub piece_seen: tokio::sync::Notify,
+    /// Notified when the pieces `put_streamed` takes end in an error.
+    pub pieces_failed: tokio::sync::Notify,
     active: AtomicUsize,
     pub most_active: AtomicUsize,
     pub segments: Arc<Seen>,
@@ -181,6 +190,43 @@ impl Storage for Mem {
         })
     }
 
+    /// Keeps only a hasher and a count of what it holds: the blob itself is stored
+    /// whole only so a test can read it back.
+    fn put_streamed(
+        &self,
+        size: u64,
+        mut bytes: BoxStream<'static, std::io::Result<Bytes>>,
+        claim: BoxFuture<'static, Option<Digest>>,
+    ) -> Answer<'_, Option<Digest>> {
+        Box::pin(async move {
+            self.failing()?;
+            let mut whole = Vec::new();
+            while let Some(piece) = bytes.next().await {
+                let piece = piece.map_err(|e| {
+                    self.pieces_failed.notify_one();
+                    StorageError::Internal(e.to_string())
+                })?;
+                self.streamed_most_held
+                    .fetch_max(piece.len(), Ordering::SeqCst);
+                self.piece_seen.notify_one();
+                whole.extend_from_slice(&piece);
+            }
+            let Some(claimed) = claim.await else {
+                return Ok(None);
+            };
+            let actual = sha(&whole);
+            if actual != claimed || whole.len() as u64 != size {
+                return Err(StorageError::DigestMismatch { claimed, actual });
+            }
+            self.streamed.fetch_add(1, Ordering::SeqCst);
+            self.blobs
+                .lock()
+                .expect("lock")
+                .insert(actual, whole.into());
+            Ok(Some(actual))
+        })
+    }
+
     fn segments(&self) -> Arc<dyn Segments> {
         Arc::clone(&self.segments) as Arc<dyn Segments>
     }
@@ -201,10 +247,10 @@ impl Storage for Mem {
         Box::pin(async move {
             self.failing()?;
             if result.exit_code == 99 {
-                return Err(ActionWriteError::Absent(sha(b"missing")).into());
+                return Err(ActionWriteError::Absent(vec![sha(b"missing")]).into());
             }
             if result.exit_code == 98 {
-                return Err(ActionWriteError::Unreachable(sha(b"unreadable")).into());
+                return Err(ActionWriteError::Unreachable(vec![sha(b"unreadable")]).into());
             }
             Ok(ActionRecord {
                 result: sha(&result.stdout_raw),
@@ -558,6 +604,11 @@ impl Held {
 
     /// The node learns the map of generation `generation`.
     pub(crate) fn set(&self, generation: u64) {
+        self.set_denying(generation, Vec::new());
+    }
+
+    /// The node learns the map of generation `generation` whose deny list is `denied`.
+    pub(crate) fn set_denying(&self, generation: u64, denied: Vec<kbf_map::DenyEntry>) {
         let member = kbf_map::Member {
             id: kbf_map::MemberId(1),
             addr: "127.0.0.1:1".to_owned(),
@@ -571,7 +622,7 @@ impl Held {
             kbf_map::Rule::Rendezvous,
             1,
             1,
-            Vec::new(),
+            denied,
         )
         .expect("a valid map");
         *self.0.lock().expect("lock") = Some(Arc::new(map));
