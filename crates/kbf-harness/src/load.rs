@@ -251,34 +251,64 @@ impl Load {
     }
 }
 
-/// Stops the Buck2 daemons of every loop, all at once, each for at most
-/// [`LoadConfig::kill_timeout`]: for a run that gives up on its loops, which is the run of a
-/// wedged daemon.
-pub fn kill_daemons(cfg: &LoadConfig) {
-    let kills: Vec<_> = (0..cfg.concurrency)
-        .map(|lane| {
-            let cfg = cfg.clone();
-            std::thread::spawn(move || kill_lane(&cfg, lane))
-        })
-        .collect();
-    for kill in kills {
-        let _ = kill.join();
+/// The Buck2 daemons of a load's loops, which a run kills when it gives up on its loops
+/// (and which the sentinel, [`crate::reap`], kills when the run dies without a chance to).
+#[derive(Clone, Debug)]
+pub struct Daemons {
+    pub buck2: PathBuf,
+    /// The project the daemons were started in.
+    pub project: PathBuf,
+    /// The number of loops: the daemons are `beta-0` to `beta-<lanes - 1>`.
+    pub lanes: usize,
+    /// The longest one `buck2 kill` may take ([`LoadConfig::kill_timeout`]).
+    pub kill_timeout: Duration,
+}
+
+impl Daemons {
+    /// The daemons of the loops `cfg` describes.
+    #[must_use]
+    pub fn of(cfg: &LoadConfig) -> Self {
+        Self {
+            buck2: cfg.buck2.clone(),
+            project: cfg.project.clone(),
+            lanes: cfg.concurrency,
+            kill_timeout: cfg.kill_timeout,
+        }
+    }
+
+    /// Stops every daemon, all at once, each for at most [`Daemons::kill_timeout`]: for a run
+    /// that gives up on its loops, which is the run of a wedged daemon.
+    pub fn kill_all(&self) {
+        let kills: Vec<_> = (0..self.lanes)
+            .map(|lane| {
+                let daemons = self.clone();
+                std::thread::spawn(move || daemons.kill_lane(lane))
+            })
+            .collect();
+        for kill in kills {
+            let _ = kill.join();
+        }
+    }
+
+    /// `buck2 kill` for the daemon of `lane`, given up on (the client is killed) after
+    /// [`Daemons::kill_timeout`].
+    pub(crate) fn kill_lane(&self, lane: usize) {
+        let spawned = Command::new(&self.buck2)
+            .args(["--isolation-dir", &isolation(lane), "kill"])
+            .current_dir(&self.project)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        if let Ok(mut child) = spawned {
+            let _ = wait_bounded(&mut child, self.kill_timeout);
+        }
     }
 }
 
-/// `buck2 kill` for the daemon of `lane`, given up on (the client is killed) after
-/// [`LoadConfig::kill_timeout`].
-fn kill_lane(cfg: &LoadConfig, lane: usize) {
-    let spawned = Command::new(&cfg.buck2)
-        .args(["--isolation-dir", &isolation(lane), "kill"])
-        .current_dir(&cfg.project)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    if let Ok(mut child) = spawned {
-        let _ = wait_bounded(&mut child, cfg.kill_timeout);
-    }
+/// Stops the Buck2 daemons of every loop ([`Daemons::kill_all`]).
+pub fn kill_daemons(cfg: &LoadConfig) {
+    Daemons::of(cfg).kill_all();
 }
 
 /// The kind of build `n` of loop `lane`: each loop takes the kinds in turn, and the loops
@@ -297,7 +327,7 @@ fn lane_loop(cfg: &LoadConfig, lane: usize, end: Instant, stop: &AtomicBool) -> 
         n += 1;
     }
     // This loop's daemon goes with it.
-    kill_lane(cfg, lane);
+    Daemons::of(cfg).kill_lane(lane);
     outcomes
 }
 

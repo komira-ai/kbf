@@ -275,10 +275,15 @@ the design did not know:
   range by holding a file lock named for the block (the kernel drops the lock when the holder dies), skips a block with any
   port in use, and takes every port, Envoy's and its base id included, from its block: two farms of one process or one host
   never share a port.
-- A run that is cancelled or times out must leave nothing behind. Every process leads a process group of its own, ending a
-  process ends its group, and the kernel kills a process whose harness dies (SIGKILL included). SIGTERM and SIGINT make
-  `kbf-beta` end through its normal exits: the farm is stopped within one bound, the Buck2 daemons of the loops are killed
-  (also if the run panics), and the result document ends `FAILED` with the reason. The frontend's control socket is removed.
+- A run that is cancelled or times out must leave nothing behind. Every farm process leads a process group of its own,
+  ending a process ends its group, and the kernel kills a farm process whose harness dies (SIGKILL included). SIGTERM and
+  SIGINT make `kbf-beta` end through its normal exits: the farm is stopped within one bound, the Buck2 daemons of the loops
+  are killed (also if the run panics), and the result document ends `FAILED` with the reason. The frontend's control
+  socket is removed. The Buck2 daemons are not the harness's children (each leads a session of its own, started by a
+  client that has ended), so the kernel does not kill them: before the farm starts, the harness starts a sentinel,
+  `kbf-beta reap`, in a session of its own with no parent-death signal and a pipe the harness holds as its input. A run
+  that ends tells it `done`; a run that dies by any means, SIGKILL included, closes the pipe with no `done`, and the
+  sentinel kills the daemons of the loops and removes the control socket. Only a SIGKILL of the sentinel too leaves them.
 - Keys are written mode 0600 into directories of mode 0700, and none is under `logs/`, which the workflow uploads (a test
   scans it). The stand-in `buck2` and Envoy are binaries of `kbf-harness`, not of `kbf-cli`, so no release builds them.
 

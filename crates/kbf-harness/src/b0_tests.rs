@@ -30,6 +30,7 @@ fn args() -> B0 {
         farm_hang: Duration::from_secs(1),
         require_envoy: false,
         interrupt: Interrupt::new(),
+        reaper: None,
     }
 }
 
@@ -297,4 +298,35 @@ fn a_run_ends_passed_only_if_every_gate_passed_and_it_did_not_hang() {
     assert_eq!(ending(&[], false), (Status::Failed, Ended::Failed));
     assert_eq!(ending(&green, true), (Status::TimedOut, Ended::Failed));
     assert_eq!(ending(&red, true), (Status::TimedOut, Ended::Failed));
+}
+
+#[test]
+fn the_sentinel_is_started_only_where_there_is_a_program_for_it() {
+    // Catches: a run with no program for a sentinel starting one anyway (a test binary that
+    // cannot answer `reap`), a run that has one starting none (the promise that a killed
+    // run leaves no daemon, broken silently), and a sentinel that fails to start being
+    // swallowed. The reaper's path is made absolute with the others.
+    let dir = crate::scratch("b0-sentinel");
+    let (project, logs) = (dir.join("project"), dir.join("logs"));
+    std::fs::create_dir_all(&project).expect("project");
+    let mut a = args();
+    assert!(
+        start_sentinel(&a, &project, &dir.join("farm"), &logs)
+            .expect("none")
+            .is_none()
+    );
+    a.reaper = Some(PathBuf::from("/nonexistent/kbf-beta"));
+    std::fs::create_dir_all(&logs).expect("logs");
+    assert!(start_sentinel(&a, &project, &dir.join("farm"), &logs).is_err());
+    a.reaper = Some(PathBuf::from("kbf-beta"));
+    assert!(
+        a.absolute()
+            .expect("absolute")
+            .reaper
+            .expect("reaper")
+            .is_absolute()
+    );
+    a.reaper = Some(crate::stand_in::sibling_bin("kbf-beta"));
+    let sentinel = start_sentinel(&a, &project, &dir.join("farm"), &logs).expect("started");
+    assert!(sentinel.is_some());
 }

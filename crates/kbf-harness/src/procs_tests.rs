@@ -18,7 +18,9 @@ const REPORT: &str = "KBF_HARNESS_REPORT";
 
 /// Not a test: the process the tests below run again. Without [`HELPER`] it does nothing.
 /// `deathsig` asks for the parent-death signal and says what it is set to; `orphan` starts `sleep` and exits, leaving it; `harness` starts a [`Proc`] running `sleep`
-/// and waits to be killed; `interruptible` supervises two `sleep`s until it is asked to stop,
+/// and waits to be killed; `session` makes itself the leader of a session and says which;
+/// `reaped` is a harness over the stand-in `buck2`: a sentinel and a load of two loops, which
+/// says where the project is and waits to be killed; `interruptible` supervises two `sleep`s until it is asked to stop,
 /// then stops them (SIGTERM, as `kbf-beta` does); any other role is that one.
 #[test]
 fn helper() {
@@ -47,6 +49,49 @@ fn helper() {
             die_with_the_harness().expect("prctl");
             let now = rustix::process::parent_process_death_signal().expect("prctl");
             say(format!("signal {now:?}"));
+        }
+        "session" => {
+            crate::reap::own_session().expect("setsid");
+            let sid = rustix::process::getsid(None).expect("getsid");
+            say(format!(
+                "session {} process {}",
+                sid.as_raw_pid(),
+                rustix::process::getpid().as_raw_pid()
+            ));
+        }
+        "reaped" => {
+            let (project, logs) = (dir.join("project"), dir.join("logs"));
+            std::fs::create_dir_all(&project).expect("project");
+            std::fs::create_dir_all(&logs).expect("logs");
+            std::fs::write(project.join(".fake-buck2"), "ok").expect("mode");
+            let cfg = crate::load::LoadConfig {
+                buck2: crate::stand_in::sibling_bin(crate::stand_in::FAKE_BUCK2),
+                project,
+                logs,
+                ca: PathBuf::from("ca.pem"),
+                port: 1,
+                concurrency: 2,
+                duration: Duration::from_secs(600),
+                build_timeout: Duration::from_secs(60),
+                kill_timeout: Duration::from_secs(30),
+                pause_secs: 1,
+                fill_kib: 1,
+                run_id: "reaped".to_owned(),
+            };
+            let reap = crate::reap::Reap::new(&crate::load::Daemons::of(&cfg), None);
+            let sentinel = crate::reap::Sentinel::start(
+                &crate::stand_in::sibling_bin("kbf-beta"),
+                &reap,
+                &dir.join("reaper.err"),
+            )
+            .expect("a sentinel");
+            let load = crate::load::Load::start(&cfg);
+            say(format!("project {}", cfg.project.display()));
+            // Held until the process is killed.
+            let _held = (sentinel, load);
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
         }
         "orphan" => {
             let child = Command::new("sleep")
@@ -292,4 +337,55 @@ fn the_child_asks_for_sigkill_when_its_harness_goes() {
     assert!(status.success());
     let text = std::fs::read_to_string(&report).expect("the report");
     assert_eq!(text.trim(), format!("signal {:?}", Some(Signal::KILL)));
+}
+
+#[test]
+fn the_sentinel_leads_a_session_of_its_own() {
+    // Catches: a sentinel in the harness's session and group, which a signal to the harness's
+    // group (a terminal's interrupt, a runner's kill of the job's group) takes with it before
+    // it has cleaned up. The function the sentinel runs between fork and exec is run in a
+    // process of its own (the child's counters are lost at exec), which says its session.
+    // Mutant: the function does nothing.
+    let d = crate::scratch("session");
+    let report = d.join("report");
+    let status = helper_process("session", &report)
+        .status()
+        .expect("the helper");
+    assert!(status.success());
+    let text = std::fs::read_to_string(&report).expect("the report");
+    let numbers: Vec<&str> = text.split_whitespace().collect();
+    assert_eq!(numbers.len(), 4, "{text}");
+    assert_eq!(numbers[1], numbers[3], "session leader: {text}");
+}
+
+#[test]
+fn a_harness_killed_by_sigkill_leaves_no_buck2_daemon_running() {
+    // Catches: a run killed with no chance to run a `Drop` (a runner cancelling the job)
+    // leaving the Buck2 daemon of every loop behind: each leads a session of its own, so the
+    // parent-death signal does not reach it. The helper is a harness holding a sentinel and a
+    // load of two loops over the stand-in `buck2`, which notes every `kill` it is given;
+    // nothing is killed while the harness lives, and after its SIGKILL the sentinel kills both
+    // daemons. Mutants: no sentinel is started; the sentinel's input is not a pipe the
+    // harness holds (the sentinel then cleans up at once, and the first check fails).
+    let d = crate::scratch("reaped");
+    let report = d.join("report");
+    let mut harness = helper_process("reaped", &report)
+        .spawn()
+        .expect("the helper");
+    let project = until("the helper to start its load", || {
+        let text = std::fs::read_to_string(&report).unwrap_or_default();
+        text.lines()
+            .find_map(|l| l.strip_prefix("project ").map(PathBuf::from))
+    });
+    let marker = |lane: usize| project.join(format!(".fake-buck2-killed-beta-{lane}"));
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !marker(0).exists() && !marker(1).exists(),
+        "killed too soon"
+    );
+    harness.kill().expect("kill the harness");
+    harness.wait().expect("reaped");
+    until("both daemons to be killed", || {
+        (marker(0).exists() && marker(1).exists()).then_some(())
+    });
 }

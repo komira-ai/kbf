@@ -48,6 +48,7 @@ pub mod node_support;
 pub mod pki;
 pub mod ports;
 pub mod procs;
+pub mod reap;
 pub mod result;
 pub mod scrape;
 pub mod stand_in;

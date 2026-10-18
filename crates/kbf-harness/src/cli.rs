@@ -15,6 +15,7 @@ use crate::b0::{self, B0, Ended, Mutant};
 use crate::envoy::{ENV_VAR, REQUIRE_VAR, required};
 use crate::interrupt::Interrupt;
 use crate::procs::HANG;
+use crate::reap::Reap;
 
 /// The longest one `buck2 kill` is waited for.
 const KILL_BOUND: Duration = Duration::from_secs(10);
@@ -42,47 +43,55 @@ enum MutantFlag {
 #[derive(Subcommand)]
 enum Scenario {
     /// B0, `farm_under_build_load`: the farm under Buck2 builds, no update and no kill.
-    B0 {
-        /// The directory holding `kbf` and `kbf-m2-act`.
-        #[arg(long)]
-        bin_dir: PathBuf,
-        /// The pinned buck2.
-        #[arg(long)]
-        buck2: PathBuf,
-        /// An Envoy binary to put in front of the frontend (default: `KBF_TEST_ENVOY`).
-        #[arg(long)]
-        envoy: Option<PathBuf>,
-        /// The sample project (`crates/kbf-it/beta/buck2`).
-        #[arg(long)]
-        project: PathBuf,
-        /// The run's directory (fresh): the farm, `logs/` and `beta-result.json`.
-        #[arg(long)]
-        work: PathBuf,
-        /// How long the loops start builds for, in seconds.
-        #[arg(long, default_value_t = 300)]
-        duration_secs: u64,
-        /// How long to wait after the load before the last scrape, in seconds.
-        #[arg(long, default_value_t = 20)]
-        settle_secs: u64,
-        /// Build loops running at once (each has a Buck2 daemon of its own).
-        #[arg(long, default_value_t = 4)]
-        concurrency: usize,
-        /// The longest one build may take, in seconds.
-        #[arg(long, default_value_t = 300)]
-        build_timeout_secs: u64,
-        /// How long the pause action sleeps, in seconds.
-        #[arg(long, default_value_t = 30)]
-        pause_secs: u64,
-        /// The size of each upload action's output, in KiB.
-        #[arg(long, default_value_t = 256)]
-        fill_kib: u64,
-        /// Appends the gate table here (`$GITHUB_STEP_SUMMARY`).
-        #[arg(long)]
-        summary: Option<PathBuf>,
-        /// Makes the farm worse in one way the gates must catch.
-        #[arg(long, value_enum)]
-        mutant: Option<MutantFlag>,
-    },
+    B0(B0Flags),
+    /// The sentinel ([`crate::reap`]): the harness starts it, and it cleans up if the harness
+    /// dies. Not for people.
+    #[command(hide = true)]
+    Reap(Reap),
+}
+
+/// The flags of `kbf-beta b0`.
+#[derive(clap::Args)]
+struct B0Flags {
+    /// The directory holding `kbf` and `kbf-m2-act`.
+    #[arg(long)]
+    bin_dir: PathBuf,
+    /// The pinned buck2.
+    #[arg(long)]
+    buck2: PathBuf,
+    /// An Envoy binary to put in front of the frontend (default: `KBF_TEST_ENVOY`).
+    #[arg(long)]
+    envoy: Option<PathBuf>,
+    /// The sample project (`crates/kbf-it/beta/buck2`).
+    #[arg(long)]
+    project: PathBuf,
+    /// The run's directory (fresh): the farm, `logs/` and `beta-result.json`.
+    #[arg(long)]
+    work: PathBuf,
+    /// How long the loops start builds for, in seconds.
+    #[arg(long, default_value_t = 300)]
+    duration_secs: u64,
+    /// How long to wait after the load before the last scrape, in seconds.
+    #[arg(long, default_value_t = 20)]
+    settle_secs: u64,
+    /// Build loops running at once (each has a Buck2 daemon of its own).
+    #[arg(long, default_value_t = 4)]
+    concurrency: usize,
+    /// The longest one build may take, in seconds.
+    #[arg(long, default_value_t = 300)]
+    build_timeout_secs: u64,
+    /// How long the pause action sleeps, in seconds.
+    #[arg(long, default_value_t = 30)]
+    pause_secs: u64,
+    /// The size of each upload action's output, in KiB.
+    #[arg(long, default_value_t = 256)]
+    fill_kib: u64,
+    /// Appends the gate table here (`$GITHUB_STEP_SUMMARY`).
+    #[arg(long)]
+    summary: Option<PathBuf>,
+    /// Makes the farm worse in one way the gates must catch.
+    #[arg(long, value_enum)]
+    mutant: Option<MutantFlag>,
 }
 
 impl From<MutantFlag> for Mutant {
@@ -129,7 +138,11 @@ pub fn status(
             return u8::from(e.use_stderr()) * 2;
         }
     };
-    let Scenario::B0 {
+    let flags = match cli.scenario {
+        Scenario::B0(flags) => flags,
+        Scenario::Reap(reap) => return reap.run(&mut std::io::stdin().lock()),
+    };
+    let B0Flags {
         bin_dir,
         buck2,
         envoy,
@@ -143,7 +156,7 @@ pub fn status(
         fill_kib,
         summary,
         mutant,
-    } = cli.scenario;
+    } = flags;
     let args = B0 {
         kbf: bin_dir.join("kbf"),
         act: bin_dir.join("kbf-m2-act"),
@@ -167,6 +180,7 @@ pub fn status(
         farm_hang: HANG,
         require_envoy: required(env(REQUIRE_VAR).as_deref()),
         interrupt: Interrupt::process(),
+        reaper: std::env::current_exe().ok(),
     };
     match b0::run(&args) {
         Ok(ended) => u8::from(ended == Ended::Failed),

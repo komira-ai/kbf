@@ -94,6 +94,7 @@ pub(crate) fn b0(name: &str, mode: &str, secs: u64) -> B0 {
         farm_hang: Duration::from_secs(60),
         require_envoy: false,
         interrupt: Interrupt::new(),
+        reaper: None,
     }
 }
 

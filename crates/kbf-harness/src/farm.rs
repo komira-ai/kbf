@@ -156,6 +156,14 @@ fn path_tag(dir: &Path) -> u64 {
     hasher.finish()
 }
 
+/// The control socket of the frontend of a farm in `dir`, started by this process: in the
+/// temporary directory, where a path is short enough for a socket's. The sentinel
+/// ([`crate::reap`]) removes it when the harness is killed.
+#[must_use]
+pub fn control_socket(dir: &Path) -> PathBuf {
+    std::env::temp_dir().join(format!("kbf-farm-{:x}.sock", path_tag(dir)))
+}
+
 impl Farm {
     /// Renders the units and starts a process from each, then waits for each process's
     /// start line. `dir` holds every process's directories (and must be fresh); `logs`
@@ -294,7 +302,7 @@ impl Farm {
             "",
         );
         let unit = rendered(&cfg, uid, Mode::Frontend);
-        let socket = std::env::temp_dir().join(format!("kbf-farm-{:x}.sock", path_tag(dir)));
+        let socket = control_socket(dir);
         let _ = std::fs::remove_file(&socket);
         let control = format!("--handover-socket={}", socket.display());
         farm.socket = Some(socket);

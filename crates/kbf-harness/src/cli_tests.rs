@@ -100,3 +100,35 @@ fn the_wall_bound_adds_up_and_saturates() {
     assert_eq!(wall_bound(300, u64::MAX), Duration::from_secs(u64::MAX));
     assert_eq!(wall_bound(u64::MAX - 30, 0), Duration::from_secs(u64::MAX));
 }
+
+#[test]
+fn the_sentinels_command_line_is_the_one_the_harness_writes() {
+    // Catches: the harness and the sentinel disagreeing on a flag (renamed on one side): the
+    // sentinel then refuses its command line, exits at once, and a killed harness is not
+    // cleaned up, which nothing else would show. Every flag is set, and the socket is
+    // optional. Mutant: `--kill-timeout-ms` written as `--kill-timeout`.
+    use clap::Parser as _;
+    let reap = |socket: Option<&str>| Reap {
+        buck2: PathBuf::from("/b/buck2"),
+        project: PathBuf::from("/p q"),
+        lanes: 3,
+        kill_timeout_ms: 1500,
+        socket: socket.map(PathBuf::from),
+    };
+    for r in [reap(Some("/tmp/s.sock")), reap(None)] {
+        let words = std::iter::once(OsString::from("kbf-beta")).chain(r.args());
+        match Cli::try_parse_from(words).expect("parses").scenario {
+            Scenario::Reap(parsed) => assert_eq!(parsed, r),
+            Scenario::B0(_) => panic!("the sentinel's words ran B0"),
+        }
+    }
+}
+
+#[test]
+fn the_sentinel_is_not_in_the_help() {
+    // Catches: an internal subcommand shown to the people who read `kbf-beta --help`.
+    use clap::CommandFactory as _;
+    let help = Cli::command().render_help().to_string();
+    assert!(help.contains("b0"), "{help}");
+    assert!(!help.contains("reap"), "{help}");
+}

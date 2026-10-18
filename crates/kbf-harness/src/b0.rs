@@ -29,8 +29,9 @@ use crate::envoy::{self, Found};
 use crate::farm::{Bins, Farm, Role, Topology};
 use crate::gates::{BuildResult, Evidence, Gate, all_pass};
 use crate::interrupt::Interrupt;
-use crate::load::{self, Load, LoadConfig, Outcome, wait_bounded};
+use crate::load::{self, Daemons, Load, LoadConfig, Outcome, wait_bounded};
 use crate::procs::after;
+use crate::reap::{Reap, Sentinel};
 use crate::result::{Builds, Document, Status, Writer, now};
 use crate::scrape::{self, Scraper};
 
@@ -93,6 +94,10 @@ pub struct B0 {
     /// Whether the run was asked to stop (SIGTERM, SIGINT): it then stops the farm, kills
     /// the Buck2 daemons and ends `FAILED` instead of running on.
     pub interrupt: Interrupt,
+    /// The program that runs as the sentinel (`kbf-beta`, which answers `reap`): it kills the
+    /// Buck2 daemons and removes the frontend's control socket if this run is killed with no
+    /// chance to ([`crate::reap`]). `None` runs without one.
+    pub reaper: Option<PathBuf>,
 }
 
 /// How long `buck2 --version` is waited for.
@@ -157,6 +162,26 @@ fn buck2_version(buck2: &Path, cwd: &Path, out: &Path, limit: Duration) -> Strin
     }
 }
 
+/// The sentinel of a run, if it has a program for one.
+fn start_sentinel(
+    args: &B0,
+    project: &Path,
+    farm_dir: &Path,
+    logs: &Path,
+) -> std::io::Result<Option<Sentinel>> {
+    let Some(program) = &args.reaper else {
+        return Ok(None);
+    };
+    let daemons = Daemons {
+        buck2: args.buck2.clone(),
+        project: project.to_owned(),
+        lanes: args.concurrency,
+        kill_timeout: args.kill_timeout,
+    };
+    let reap = Reap::new(&daemons, Some(crate::farm::control_socket(farm_dir)));
+    Sentinel::start(program, &reap, &logs.join("reaper.err")).map(Some)
+}
+
 impl B0 {
     /// The same with every path made absolute (the units' paths must be).
     fn absolute(&self) -> std::io::Result<B0> {
@@ -169,6 +194,7 @@ impl B0 {
             project: abs(&self.project)?,
             work: abs(&self.work)?,
             summary: self.summary.as_deref().map(abs).transpose()?,
+            reaper: self.reaper.as_deref().map(abs).transpose()?,
             ..self.clone()
         })
     }
@@ -291,6 +317,12 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
         fake_crun: None,
     };
     let farm_dir = args.work.join("farm");
+    // Before the farm, so a run killed while it starts leaves nothing either. Dropped after
+    // the farm and the load (locals drop in reverse), which have then cleaned up themselves.
+    let _sentinel = match start_sentinel(args, &project, &farm_dir, logs) {
+        Ok(sentinel) => sentinel,
+        Err(e) => return fail(result, Status::Failed, format!("the sentinel: {e}")),
+    };
     let farm = match Farm::start(logs, &farm_dir, &bins, &topology) {
         Ok(farm) => farm,
         Err(e) => return hang_or_fail(result, logs, &e.what, &e.report),

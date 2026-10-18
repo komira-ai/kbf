@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use kbf_harness::b0::{Ended, run};
-use kbf_harness::farm::{Bins, Farm, Role, Topology};
+use kbf_harness::farm::{Bins, Farm, Role, Topology, control_socket};
 
 use support::*;
 
@@ -224,7 +224,12 @@ fn a_load_that_runs_no_build_fails_the_builds_run_gate() {
 /// Catches: two farms started together in one process (parallel tests, a harness running two
 /// scenarios) told the same ports: each is given a block of ports of its own, every port its
 /// processes were told lies in it, the frontend's units name them, and the blocks do not
-/// overlap. The old probe-and-close ports could give both a port.
+/// overlap. The old probe-and-close ports could give both a port. Also, that the control socket
+/// the frontend is told is the one the sentinel removes after a SIGKILL.
+///
+/// Each farm is started on a thread of its own, which stays until the checks are done: a
+/// process dies when the thread that started it ends (the parent-death signal), so a thread
+/// that returned the farm and ended would have the roles killed under the checks.
 #[test]
 fn farms_started_together_in_one_process_are_told_ports_of_their_own() {
     let _slots = (take_slot(), take_slot());
@@ -234,25 +239,36 @@ fn farms_started_together_in_one_process_are_told_ports_of_their_own() {
             kbf: PathBuf::from(env!("CARGO_BIN_EXE_kbf")),
             fake_crun: None,
         };
-        std::thread::spawn(move || {
-            Farm::start(
+        let (farm_tx, farm_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let farm_dir = dir.join("farm");
+        let thread = std::thread::spawn(move || {
+            let farm = Farm::start(
                 &dir.join("logs"),
                 &dir.join("farm"),
                 &bins,
                 &Topology::beta(None),
             )
-            .expect("a farm starts")
-        })
+            .expect("a farm starts");
+            farm_tx.send(farm).expect("the farm is taken");
+            // Until the test is done with the farm (the sender is dropped).
+            let _ = done_rx.recv();
+        });
+        (farm_rx, farm_dir, done_tx, thread)
     };
-    let (a, b) = (start("ports-a"), start("ports-b"));
-    let (a, b) = (a.join().expect("a farm"), b.join().expect("a farm"));
+    let (a_rx, a_dir, a_done, a_thread) = start("ports-a");
+    let (b_rx, b_dir, b_done, b_thread) = start("ports-b");
+    let (a, b) = (a_rx.recv().expect("a farm"), b_rx.recv().expect("a farm"));
     let (ports_a, block_a) = a.ports().expect("a started farm has ports");
     let (ports_b, block_b) = b.ports().expect("a started farm has ports");
     assert!(
         block_a.end <= block_b.start || block_b.end <= block_a.start,
         "{block_a:?} {block_b:?}"
     );
-    for (ports, block, farm) in [(ports_a, &block_a, &a), (ports_b, &block_b, &b)] {
+    for (ports, block, farm, dir) in [
+        (ports_a, &block_a, &a, &a_dir),
+        (ports_b, &block_b, &b, &b_dir),
+    ] {
         assert!(
             ports.all().iter().all(|p| block.contains(p)),
             "{ports:?} {block:?}"
@@ -262,10 +278,22 @@ fn farms_started_together_in_one_process_are_told_ports_of_their_own() {
             frontend.contains(&format!(":{}", ports.front.0)),
             "{frontend}"
         );
+        assert!(
+            frontend.contains(&format!(
+                "--handover-socket={}",
+                control_socket(dir).display()
+            )),
+            "{frontend}"
+        );
         let node = farm.spec(Role::Node(1)).argv.join(" ");
         assert!(
             node.contains(&format!("--metrics-listen=127.0.0.1:{}", ports.metrics[0])),
             "{node}"
         );
     }
+    assert_ne!(control_socket(&a_dir), control_socket(&b_dir));
+    drop((a, b));
+    drop((a_done, b_done));
+    a_thread.join().expect("a thread");
+    b_thread.join().expect("b thread");
 }

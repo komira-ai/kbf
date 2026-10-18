@@ -224,7 +224,7 @@ fn a_kill_of_a_daemon_that_cannot_be_run_is_skipped() {
     // torn down after it failed to) panicking the teardown, which would hide the failure
     // the run is reporting.
     let c = cfg();
-    kill_lane(&c, 0);
+    Daemons::of(&c).kill_lane(0);
     kill_daemons(&c);
 }
 
