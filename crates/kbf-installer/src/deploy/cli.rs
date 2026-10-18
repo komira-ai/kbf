@@ -9,8 +9,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::api::Http;
+use super::smoke::CasSmoke;
 use super::summary::Exit;
-use super::{Check, Env, NoCheck, NoSmoke, Options, Order, SystemClock, deploy, lock};
+use super::summary::Summary;
+use super::{
+    Check, Clock, Env, NoCheck, NoSmoke, Options, Order, Smoke, SystemClock, deploy, lock, summary,
+};
 use crate::CommitId;
 
 /// Where the host says which operator API to call and where its token is, so a caller
@@ -18,13 +22,14 @@ use crate::CommitId;
 pub const CONFIG: &str = "/etc/kbf-installer/deploy.json";
 
 pub const USAGE: &str = "usage: kbf-installer deploy --commit <40hex> [--api <127.0.0.1:port>] \
-[--token-file <path>] [--config <path>] [--apply] [--json] [--bundle -|DIR] [--order nodes-first|frontend-first] \
+[--token-file <path>] [--config <path>] [--cas http://127.0.0.1:port] [--apply] [--json] [--bundle -|DIR] [--order nodes-first|frontend-first] \
 [--allow-offline <id>[,<id>...]] [--node-timeout-s N] [--handover-timeout-s N] [--smoke-timeout-s N] \
 [--lock <path>] [--platform linux-x86_64|linux-arm64|darwin-arm64]";
 
 struct Args {
     options: Options,
     api: SocketAddr,
+    cas: Option<String>,
     token_file: PathBuf,
     bundle: Option<String>,
     lock: PathBuf,
@@ -34,11 +39,19 @@ struct Args {
 /// that got here through `sudo` (a deploy account that may only run `deploy`) must not set
 /// them: root would read a file of the caller's choosing and send it to an address of the
 /// caller's choosing. Those values come from the root-owned config.
-const HOST_FLAGS: [&str; 5] = ["--api", "--token-file", "--config", "--lock", "--platform"];
+const HOST_FLAGS: [&str; 6] = [
+    "--api",
+    "--token-file",
+    "--config",
+    "--lock",
+    "--platform",
+    "--cas",
+];
 
 fn parse(args: &[String], via_sudo: bool) -> Result<Args, String> {
     let mut commit = None;
     let mut api = None;
+    let mut cas = None;
     let mut token_file = None;
     let mut bundle = None;
     let mut apply = false;
@@ -47,7 +60,7 @@ fn parse(args: &[String], via_sudo: bool) -> Result<Args, String> {
     let mut lock_path = PathBuf::from(super::LOCK);
     let mut platform = host_platform().to_owned();
     let mut config = PathBuf::from(CONFIG);
-    let mut secs = [1800u64, 900, 300];
+    let mut secs = [1800u64, 900, 60];
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         if via_sudo && HOST_FLAGS.contains(&flag.as_str()) {
@@ -62,6 +75,7 @@ fn parse(args: &[String], via_sudo: bool) -> Result<Args, String> {
             "--json" => {}
             "--commit" => commit = Some(value("--commit")?),
             "--api" => api = Some(value("--api")?),
+            "--cas" => cas = Some(value("--cas")?),
             "--token-file" => token_file = Some(PathBuf::from(value("--token-file")?)),
             "--bundle" => bundle = Some(value("--bundle")?),
             "--config" => config = PathBuf::from(value("--config")?),
@@ -93,9 +107,13 @@ fn parse(args: &[String], via_sudo: bool) -> Result<Args, String> {
     }
     // The host's config fills what the flags leave out. A missing config file is fine when
     // both flags are given.
-    let (conf_api, conf_token) = read_config(&config, api.is_none() || token_file.is_none())?;
-    let api = api.or(conf_api);
-    let token_file = token_file.or(conf_token);
+    let conf = read_config(
+        &config,
+        api.is_none() || token_file.is_none() || cas.is_none(),
+    )?;
+    let api = api.or(conf.api);
+    let token_file = token_file.or(conf.token_file);
+    let cas = cas.or(conf.cas);
     let commit = commit.ok_or("--commit is required")?;
     let commit = CommitId::new(&commit).map_err(|e| e.to_string())?;
     let api = api.ok_or("--api is required (or `api` in the config)")?;
@@ -108,6 +126,9 @@ fn parse(args: &[String], via_sudo: bool) -> Result<Args, String> {
     ) {
         return Err(format!("--platform {platform:?} is not a platform"));
     }
+    if let Some(url) = &cas {
+        CasSmoke::new(url, Duration::from_secs(secs[2])).map_err(|e| format!("--cas {e}"))?;
+    }
     let mut options = Options::new(commit, &platform);
     options.apply = apply;
     options.order = order;
@@ -118,21 +139,32 @@ fn parse(args: &[String], via_sudo: bool) -> Result<Args, String> {
     Ok(Args {
         options,
         api,
+        cas,
         token_file: token_file.ok_or("--token-file is required (or `token_file` in the config)")?,
         bundle,
         lock: lock_path,
     })
 }
 
-/// `{"api": "127.0.0.1:port", "token_file": "/path"}`. Read only when a flag is missing;
-/// it must be a regular file owned by root and writable by no one else.
-fn read_config(path: &Path, needed: bool) -> Result<(Option<String>, Option<PathBuf>), String> {
+/// What the host's config file says.
+#[derive(Default)]
+struct HostConfig {
+    api: Option<String>,
+    token_file: Option<PathBuf>,
+    /// The local REAPI listener the CAS smoke uses.
+    cas: Option<String>,
+}
+
+/// `{"api": "127.0.0.1:port", "token_file": "/path", "cas": "http://127.0.0.1:port"}`. Read
+/// only when a flag is missing; it must be a regular file owned by root and writable by no
+/// one else.
+fn read_config(path: &Path, needed: bool) -> Result<HostConfig, String> {
     if !needed {
-        return Ok((None, None));
+        return Ok(HostConfig::default());
     }
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((None, None)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HostConfig::default()),
         Err(e) => return Err(format!("config {}: {e}", path.display())),
     };
     if !meta.file_type().is_file() || meta.mode() & 0o022 != 0 {
@@ -152,7 +184,11 @@ fn read_config(path: &Path, needed: bool) -> Result<(Option<String>, Option<Path
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
     };
-    Ok((get("api"), get("token_file").map(PathBuf::from)))
+    Ok(HostConfig {
+        api: get("api"),
+        token_file: get("token_file").map(PathBuf::from),
+        cas: get("cas"),
+    })
 }
 
 fn number(name: &str, text: &str) -> Result<u64, String> {
@@ -170,6 +206,17 @@ pub fn host_platform() -> &'static str {
         ("macos", _) => "darwin-arm64",
         (_, "aarch64") => "linux-arm64",
         _ => "linux-x86_64",
+    }
+}
+
+/// The smoke a deploy ends with: against the local REAPI listener when the host names one,
+/// else none (which a deploy reports as skipped, exit 5).
+pub(super) fn smoke_for(cas: Option<&str>, timeout: Duration) -> Result<Box<dyn Smoke>, String> {
+    match cas {
+        None => Ok(Box::new(NoSmoke)),
+        Some(url) => CasSmoke::new(url, timeout)
+            .map(|s| Box::new(s) as Box<dyn Smoke>)
+            .map_err(|e| format!("--cas {e}")),
     }
 }
 
@@ -235,6 +282,11 @@ pub fn main_as(
         Ok(Some(held)) => held,
         Ok(None) => {
             let _ = writeln!(err, "kbf-installer deploy: another run holds the lock");
+            // The one line on standard output is there for every end, this one too.
+            let mut sum = Summary::new(&parsed.options.commit, SystemClock.now());
+            sum.ended = summary::utc(SystemClock.now());
+            sum.end(Exit::Busy, "lock_held", "another run holds the lock");
+            let _ = writeln!(out, "{}", sum.line());
             return Exit::Busy.code();
         }
         Err(e) => return usage(err, &format!("the lock: {e}")),
@@ -249,11 +301,15 @@ pub fn main_as(
         Some("-") => Some(stdin),
         Some(_) => return usage(err, "--bundle takes - (a tar on standard input)"),
     };
-    let (clock, smoke, check) = (SystemClock, NoSmoke, NoCheck);
+    let smoke = match smoke_for(parsed.cas.as_deref(), parsed.options.smoke_timeout) {
+        Ok(s) => s,
+        Err(why) => return usage(err, &why),
+    };
+    let (clock, check) = (SystemClock, NoCheck);
     let env = Env {
         api: &api,
         clock: &clock,
-        smoke: &smoke,
+        smoke: &*smoke,
         check: &check as &dyn Check,
     };
     let _ = writeln!(err, "kbf-installer deploy: {}", parsed.options.commit);

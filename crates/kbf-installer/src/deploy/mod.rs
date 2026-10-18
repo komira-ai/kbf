@@ -19,6 +19,9 @@ pub mod bundle;
 pub mod cli;
 mod nodes;
 mod post;
+pub mod smoke;
+#[cfg(test)]
+mod smoke_tests;
 mod summary;
 #[cfg(test)]
 mod tests;
@@ -65,7 +68,7 @@ impl Clock for SystemClock {
 pub enum SmokeResult {
     Pass,
     Fail(String),
-    /// Not run (no `kbf-cas-smoke` on the host). Never a pass.
+    /// Not run (the host names no REAPI listener, `--cas`). Never a pass.
     Skipped,
 }
 
@@ -73,7 +76,7 @@ pub trait Smoke {
     fn run(&self) -> SmokeResult;
 }
 
-/// The smoke where the binary is not built: always skipped.
+/// The smoke where the host names no listener: always skipped.
 pub struct NoSmoke;
 
 impl Smoke for NoSmoke {
@@ -129,7 +132,7 @@ impl Options {
             apply: false,
             node_timeout: Duration::from_secs(1800),
             handover_timeout: Duration::from_secs(900),
-            smoke_timeout: Duration::from_secs(300),
+            smoke_timeout: Duration::from_secs(60),
             allow_offline: Vec::new(),
             order: Order::NodesFirst,
             host_platform: host_platform.to_owned(),

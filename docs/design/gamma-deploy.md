@@ -85,10 +85,19 @@ token path and no host name.
   (or `software.os` and `software.arch`).
 - The lock is `/run/kbf-installer/lock` (`--lock`).
 
+## The CAS smoke
+
+`--cas http://127.0.0.1:port` (or `cas` in the host config, which `sudo` callers cannot override)
+names the local REAPI listener. The smoke writes 64 random bytes with `ByteStream.Write`
+(the commit must report their size), asks `FindMissingBlobs` for that blob and a random one
+nobody wrote (present, missing), reads the blob back and compares every byte, then asks the
+action cache for a random digest (must be NOT_FOUND; a hit or another status fails). One bound
+for all of it, `--smoke-timeout-s` (default 60). Without `--cas` the smoke is `skipped` and a
+deploy ends exit 5; an unreachable listener or any failed check is `postcheck_failed`, exit 1.
+The listener is plain text, instance name empty. The blob stays in the store until eviction.
+
 ## What is not built
 
-- The CAS smoke binary (`kbf-cas-smoke`). Until it exists the smoke is `skipped` and a deploy
-  ends exit 5.
 - The installer's `check` (with the Envoy range). Until it exists the summary has
   `check_skipped: true`.
 - The in-process fallback for `POST /v1/update/frontend`.

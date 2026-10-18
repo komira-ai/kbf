@@ -74,6 +74,8 @@ struct Farm {
     desired_status: u16,
     ready: bool,
     members_active_after: u64,
+    /// `/v1/members` lists no member at all.
+    no_members: bool,
     unattested: bool,
     server_commit: &'static str,
     cordoned: Option<&'static str>,
@@ -99,6 +101,7 @@ impl Farm {
             desired_status: 200,
             ready: true,
             members_active_after: 0,
+            no_members: false,
             unattested: false,
             server_commit: &TARGET[..12],
             cordoned: None,
@@ -210,10 +213,12 @@ impl Operator for Farm {
                 } else {
                     "catching_up"
                 };
-                Farm::reply(
-                    200,
-                    json!({"generation": 3, "members": [{"id": 1, "state": state}]}),
-                )
+                let members = if self.no_members {
+                    json!([])
+                } else {
+                    json!([{"id": 1, "state": state}])
+                };
+                Farm::reply(200, json!({"generation": 3, "members": members}))
             }
             ("GET", "/v1/update") => {
                 let desired = if self.desired_at.get().is_some() {
@@ -887,6 +892,80 @@ fn a_server_not_on_the_commit_fails_the_post_check() {
     assert_eq!(s.exit, 1);
 }
 
+/// Proves a members list with no member fails the post check: nothing is active, so
+/// nothing was checked. Catches `all_active` reading an empty list as "all active".
+#[test]
+fn an_empty_members_list_fails_the_post_check() {
+    let mut f = farm(two_nodes());
+    f.no_members = true;
+    let s = go(&f);
+    assert_eq!(
+        (s.exit, s.reason.as_str(), s.post.members_active),
+        (1, "postcheck_failed", Some(false))
+    );
+}
+
+/// A clock that steps back once, 1000 s, the first time a sleep brings the farm's time to
+/// `at` seconds (a step of the clock, as an NTP correction makes).
+struct StepBack {
+    farm: Rc<Cell<u64>>,
+    at: u64,
+    skew: Cell<u64>,
+}
+
+impl Clock for StepBack {
+    fn now(&self) -> u64 {
+        1_790_000_000 + self.farm.get() - self.skew.get()
+    }
+
+    fn sleep(&self, d: Duration) {
+        self.farm.set(self.farm.get() + d.as_secs());
+        if self.farm.get() >= self.at {
+            self.skew.set(1000);
+        }
+    }
+}
+
+fn with_step_back(farm: &Farm, at: u64) -> Summary {
+    let clock = StepBack {
+        farm: farm.now.clone(),
+        at,
+        skew: Cell::new(0),
+    };
+    let smoke = FixedSmoke(SmokeResult::Pass);
+    let check = FixedCheck(Ok(true));
+    let env = Env {
+        api: farm,
+        clock: &clock,
+        smoke: &smoke,
+        check: &check,
+    };
+    deploy(&env, &opts(true), None)
+}
+
+/// Proves a clock that steps back while nodes are awaited does not panic the deploy (the
+/// elapsed time reads 0). Catches `now - last` on u64 in `wait_nodes`.
+#[test]
+fn a_clock_that_steps_back_while_nodes_are_awaited_does_not_panic() {
+    let f = farm(two_nodes());
+    let s = with_step_back(&f, 10);
+    assert_eq!(s.exit, 0, "{}", s.line());
+}
+
+/// The same while the members are awaited. Catches `now - start` on u64 in `post_checks`.
+#[test]
+fn a_clock_that_steps_back_while_members_are_awaited_does_not_panic() {
+    let mut f = farm(two_nodes());
+    f.members_active_after = 100_000;
+    let s = with_step_back(&f, 230);
+    assert_eq!(
+        (s.exit, s.post.members_active),
+        (1, Some(false)),
+        "{}",
+        s.line()
+    );
+}
+
 /// Proves members get a window to catch up, and fail after it.
 #[test]
 fn members_that_are_catching_up_are_waited_for_and_then_fail() {
@@ -1043,7 +1122,7 @@ mod cli_tests {
     }
 
     /// Proves a caller that came through sudo cannot aim the deploy: each of --api,
-    /// --token-file, --config, --lock and --platform is a usage error (exit 2) before the
+    /// --token-file, --config, --lock, --platform and --cas is a usage error (exit 2) before the
     /// token is read or anything is sent, and the flags the workflow sends are not. Catches
     /// the deploy account sending a root-readable file as a bearer token to its own listener.
     #[test]
@@ -1055,6 +1134,7 @@ mod cli_tests {
             ("--config", "/home/x/deploy.json"),
             ("--lock", "/home/x/lock"),
             ("--platform", "linux-x86_64"),
+            ("--cas", "http://127.0.0.1:1"),
         ] {
             let list = args(&["--commit", &commit, flag, value]);
             let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -1181,18 +1261,19 @@ mod cli_tests {
         let (code, err) = go(argv(&[]));
         assert_eq!(code, 2);
         assert!(err.contains("--api is required"), "{err}");
-        // Both flags given: the config is not read at all.
+        // All three of --api, --token-file and --cas given: the config is not read at all.
         write(0o666, &body);
-        assert_eq!(
-            go(argv(&[
-                "--api",
-                "127.0.0.1:1",
-                "--token-file",
-                token.to_str().unwrap()
-            ]))
-            .0,
-            1
-        );
+        let flags = [
+            "--api",
+            "127.0.0.1:1",
+            "--token-file",
+            token.to_str().unwrap(),
+        ];
+        let mut with_cas = flags.to_vec();
+        with_cas.extend(["--cas", "http://127.0.0.1:1"]);
+        assert_eq!(go(argv(&with_cas)).0, 1);
+        // Without --cas the config is read for it, so a config others may write is refused.
+        assert_eq!(go(argv(&flags)).0, 2);
         // No config and no flags.
         let none = dir.join("absent.json");
         let (code, _) = go(vec![
@@ -1202,6 +1283,54 @@ mod cli_tests {
             none.to_str().unwrap().into(),
         ]);
         assert_eq!(code, 2);
+    }
+
+    /// Proves --cas is checked before anything runs: a value that is not an http:// URL is a
+    /// usage error (exit 2) that says so. Catches a bad address found only at the end of a
+    /// deploy.
+    #[test]
+    fn a_cas_address_that_is_not_an_http_url_is_a_usage_error() {
+        let commit = "a".repeat(40);
+        for bad in ["127.0.0.1:8980", "https://127.0.0.1:8980", "http://"] {
+            let (code, out, err) = run(&["--commit", &commit, "--cas", bad]);
+            assert_eq!((code, out.as_str()), (2, ""), "{bad}");
+            assert!(err.contains("--cas"), "{bad}: {err}");
+        }
+    }
+
+    /// Proves the production CLI's smoke is the real one when the host names a listener,
+    /// and the config's `cas` is read like the flag. Catches `NoSmoke` left in the path
+    /// (every real deploy then ends exit 5).
+    #[test]
+    fn the_cli_smoke_is_the_cas_smoke_when_a_listener_is_named() {
+        use super::super::SmokeResult;
+        use std::time::Duration;
+        let t = Duration::from_secs(2);
+        assert_eq!(cli::smoke_for(None, t).unwrap().run(), SmokeResult::Skipped);
+        // Nothing listens at port 1: the real smoke fails; the stand-in would skip.
+        let real = cli::smoke_for(Some("http://127.0.0.1:1"), t).unwrap();
+        assert!(matches!(real.run(), SmokeResult::Fail(_)));
+        assert!(cli::smoke_for(Some("127.0.0.1:1"), t).is_err());
+        let (_, dir) = crate::testkit::host_root("cfg-cas");
+        let conf = dir.join("deploy.json");
+        fs::write(&conf, "{\"cas\": \"http://127.0.0.1:1\"}").unwrap();
+        fs::set_permissions(&conf, fs::Permissions::from_mode(0o644)).unwrap();
+        let commit = "a".repeat(40);
+        let tok = token("cfg-cas-tok", 0o600, GOOD);
+        let (code, _, err) = run(&[
+            "--commit",
+            &commit,
+            "--config",
+            conf.to_str().unwrap(),
+            "--api",
+            "127.0.0.1:1",
+            "--token-file",
+            tok.to_str().unwrap(),
+            "--lock",
+            dir.join("run/lock").to_str().unwrap(),
+        ]);
+        // Without --apply the run stops at the plan (exit 1: nothing listens at the API).
+        assert_eq!(code, 1, "{err}");
     }
 
     #[test]
@@ -1246,7 +1375,19 @@ mod cli_tests {
             &mut err,
             false,
         );
-        assert_eq!((code, out.len()), (4, 0));
+        // Exit 4 prints the one-line summary too, as every other end does.
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!((code, out.lines().count()), (4, 1), "{out}");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            (
+                v["exit"].as_i64(),
+                v["result"].as_str(),
+                v["reason"].as_str()
+            ),
+            (Some(4), Some("busy"), Some("lock_held"))
+        );
+        assert_eq!(v["commit"], super::TARGET);
         drop(held);
 
         // A server that answers nothing useful: the plan stops at the first read.

@@ -34,7 +34,10 @@ impl Run<'_> {
                     if node.state == "confirmed"
                         && nodes::same_commit(&node.running_commit, &commit)
                     {
-                        done.insert(node.id.clone(), result(node, "confirmed", now - last));
+                        done.insert(
+                            node.id.clone(),
+                            result(node, "confirmed", now.saturating_sub(last)),
+                        );
                         last = now;
                         continue;
                     }
@@ -55,7 +58,10 @@ impl Run<'_> {
                         None
                     };
                     if let Some(state) = verdict {
-                        done.insert(node.id.clone(), result(node, state, now - last));
+                        done.insert(
+                            node.id.clone(),
+                            result(node, state, now.saturating_sub(last)),
+                        );
                         return Err(self.stop(list, done, &node.id, state));
                     }
                 }
@@ -65,13 +71,13 @@ impl Run<'_> {
                     return Ok(());
                 }
             }
-            if now - last >= self.opts.node_timeout.as_secs() {
+            if now.saturating_sub(last) >= self.opts.node_timeout.as_secs() {
                 let list = seen.unwrap_or_default();
                 // The first node, in id order, that is still waited for.
                 let stuck = list.iter().find(|n| !done.contains_key(&n.id));
                 let id = stuck.map(|n| n.id.clone()).unwrap_or_default();
                 if let Some(n) = stuck {
-                    done.insert(id.clone(), result(n, "timed_out", now - last));
+                    done.insert(id.clone(), result(n, "timed_out", now.saturating_sub(last)));
                 }
                 return Err(self.stop(&list, done, &id, "timed_out"));
             }
@@ -110,7 +116,9 @@ impl Run<'_> {
                 .get_json("/v1/members")
                 .ok()
                 .is_some_and(|m| all_active(&m));
-            if ok || self.env.clock.now() - start >= self.opts.members_timeout.as_secs() {
+            if ok
+                || self.env.clock.now().saturating_sub(start) >= self.opts.members_timeout.as_secs()
+            {
                 break ok;
             }
             self.env.clock.sleep(self.opts.poll);
