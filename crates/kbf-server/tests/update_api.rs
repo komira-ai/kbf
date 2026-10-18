@@ -28,6 +28,15 @@ use tokio::net::TcpStream;
 
 const TOKEN: &str = "kbf-test-token-0123456789abcdef0123456789";
 
+/// The tick of every server here: one that does not come within a test. The offers' poll
+/// reads `update/desired` at start and then at every tick, and the injections of
+/// [`hooked::Hooked`] (`fail_gets`, `panic_gets`, `after_get`) are met by the next read of
+/// the store, whoever makes it. The poll reads the same key through the same handle as the
+/// handler under test, so nothing tells the two reads apart; a poll between an injection
+/// and the request would meet it and the request would get a healthy store. No test here
+/// waits for a tick: they are HTTP calls against the rows.
+const TICK: Duration = Duration::from_secs(3600);
+
 struct Dir(PathBuf);
 
 impl Dir {
@@ -58,7 +67,7 @@ fn listeners() -> Listeners {
         worker_tls: None,
         heartbeat_interval: INTERVAL,
         hello_wait: HELLO_WAIT,
-        tick: Duration::from_millis(50),
+        tick: TICK,
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
@@ -502,13 +511,25 @@ async fn the_policy_row_is_shown_when_it_exists() {
 /// fails (or panics inside its blocking task) is 500 saying the rows failed, on the view, the
 /// offer and pause, and a policy read that fails after the desired read succeeded is 500
 /// too; nothing is written by the offer that could not read.
+///
+/// Each failure is armed for one read, which must be the handler's: the server's own reader
+/// of the rows (the offers' poll) looks once at start, which the test waits for, and not
+/// again within the test (`TICK`).
 #[tokio::test]
 async fn a_state_store_that_fails_is_a_500_not_an_empty_answer() {
     let dir = Dir::new();
     let store =
         Arc::new(ReleaseStore::open(&dir.0.join("releases"), Limits::default()).expect("open"));
     let hooked = hooked::Hooked::new();
+    let (looked, first_look) = tokio::sync::oneshot::channel::<()>();
+    hooked.after_get("update/desired", move || {
+        let _ = looked.send(());
+    });
     let running = start(Some(store), Some(state_over(hooked.clone())), &dir);
+    tokio::time::timeout(Duration::from_secs(30), first_look)
+        .await
+        .expect("the offers' poll read the rows at start")
+        .expect("the hook sent");
     put(&running, A, true).await;
     let fails = |n: usize| {
         hooked
