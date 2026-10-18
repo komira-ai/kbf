@@ -335,11 +335,11 @@ current frontend; the enroll wire's `NotSigner`), `503` when the state store fai
 other writers kept winning (try again), `500` for a stored row that does not decode.
 `401`, `403` and `415` are the gates'.
 
-`kbf token create|list|revoke` calls these routes from the frontend's host:
-`kbf token create --roles daemon --max-uses 3 --expires-in 24h --token-file <file>` prints
+`kbf --token=create|list|revoke` (flags only, no positional arguments) calls these routes from the frontend's host:
+`kbf --token=create --roles=daemon --max-uses=3 --expires-in=24h --token-file=<file>` prints
 the answer; with `--out <file>` the token string goes to that file alone (created new with
 mode `0600`, removed again if the call fails) and the terminal sees the token as a list
-shows it. `kbf token list` and `kbf token revoke <id>` take the same `--token-file` and
+shows it. `kbf --token=list` and `kbf --token=revoke --token-id=<id>` take the same `--token-file` and
 `--api`.
 
 ## `GET /healthz` and `GET /readyz`

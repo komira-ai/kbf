@@ -1,18 +1,18 @@
-//! `kbf token create|list|revoke`: a thin client of the frontend's enrollment API
+//! `kbf --token=create|list|revoke`: a thin client of the frontend's enrollment API
 //! (`docs/api.md`, `/v1/enroll/tokens`) on the frontend's host. Like `kbf cluster` it holds
 //! no logic of its own: each verb is one call with the operator API token, and the answer's
 //! JSON is printed as it came, except that a create given `--out` keeps the token string
 //! out of the terminal.
 //!
-//! - `kbf token create --roles daemon[,storage] [--max-uses N] [--expires-in 24h]
+//! - `kbf --token=create --roles daemon[,storage] [--max-uses N] [--expires-in 24h]
 //!   [--node-id ID] [--node-prefix P] [--names a,.b] [--replace] [--label L] [--out FILE]`:
 //!   `POST /v1/enroll/tokens`. The answer holds the token string, shown once. With `--out`
 //!   the string goes to FILE alone, created with `create_new` and mode 0600 before the call
 //!   is made (so a file that exists is refused before a token is spent), and FILE is removed
 //!   if the call fails, so no empty or partial token file is left; stdout then holds the
 //!   token as a list shows it, without the string.
-//! - `kbf token list`: `GET /v1/enroll/tokens`.
-//! - `kbf token revoke <id>`: `DELETE /v1/enroll/tokens/<id>`.
+//! - `kbf --token=list`: `GET /v1/enroll/tokens`.
+//! - `kbf --token=revoke --token-id=<id>`: `DELETE /v1/enroll/tokens/<id>`.
 //!
 //! Every call needs `--token-file`, the file the server was started with
 //! (`--api-token-file`). The routes are behind the operator gate, so this sends the bearer
@@ -34,6 +34,34 @@ use kbf_types::TokenId;
 use kbf_types::enroll_api::{TokenCreate, TokenCreated};
 
 use crate::cluster::DEFAULT_API;
+
+/// The flag that selects the token command: `kbf --token=<verb> ...`. The CLI takes no
+/// positional arguments, so the verb is this flag's value. The whole spelling lives here
+/// and in [`rewrite`]; rename it here.
+pub const FLAG: &str = "--token";
+
+/// The verb in `arg` if it is `--token=<verb>`.
+#[must_use]
+pub fn verb_of(arg: &std::ffi::OsStr) -> Option<&str> {
+    arg.to_str()?.strip_prefix(FLAG)?.strip_prefix('=')
+}
+
+/// `kbf --token=create --roles=x ...` as the argv the parser reads: the program name, the
+/// verb, then every other argument. (The verb is a clap subcommand internally; the user
+/// types only flags.)
+#[must_use]
+pub fn rewrite(args: &[std::ffi::OsString]) -> Vec<std::ffi::OsString> {
+    let mut out: Vec<std::ffi::OsString> = args.iter().take(1).cloned().collect();
+    let rest = args.iter().skip(1);
+    let verb = args
+        .iter()
+        .skip(1)
+        .find_map(|a| verb_of(a))
+        .unwrap_or_default();
+    out.push(verb.into());
+    out.extend(rest.filter(|a| verb_of(a).is_none()).cloned());
+    out
+}
 
 /// `kbf token`'s command line.
 #[derive(Args, Clone, Debug, PartialEq, Eq)]
@@ -66,7 +94,8 @@ pub enum Verb {
     /// Revoke a token: no new node enrolls with it; enrolled nodes stay.
     Revoke {
         /// The token's id, as `list` shows it.
-        id: String,
+        #[arg(long, value_name = "ID")]
+        token_id: String,
         #[command(flatten)]
         auth: Auth,
     },
@@ -190,7 +219,7 @@ impl std::fmt::Display for TokenError {
                 if let Some(id) = made {
                     write!(
                         f,
-                        "; token {id} was made but not saved: revoke it with `kbf token revoke {id}`"
+                        "; token {id} was made but not saved: revoke it with `kbf --token=revoke --token-id={id}`"
                     )?;
                 }
                 Ok(())
@@ -241,8 +270,8 @@ pub fn execute(token: &Token) -> Result<String, TokenError> {
     let client = OperatorClient::new(token.api, Some(secret));
     match &token.verb {
         Verb::List { .. } => success(client.get_gated(TOKENS)?),
-        Verb::Revoke { id, .. } => {
-            let id = TokenId::parse(id).map_err(|_| TokenError::Id)?;
+        Verb::Revoke { token_id, .. } => {
+            let id = TokenId::parse(token_id).map_err(|_| TokenError::Id)?;
             success(client.delete(&format!("{TOKENS}/{id}"))?)
         }
         Verb::Create(args) => {

@@ -177,10 +177,12 @@ pub fn command() -> Command {
     cmd.after_help(format!(
         "Not a mode: `kbf {CLUSTER} status|drain|undrain` calls a frontend's operator API \
          (`kbf {CLUSTER} --help`); `kbf {} {HANDOVER}` updates a frontend without failing a \
-         build (`kbf {} {HANDOVER} --help`); `kbf {TOKEN} create|list|revoke` makes, lists and \
-         revokes enrollment tokens (`kbf {TOKEN} --help`).",
+         build (`kbf {} {HANDOVER} --help`); `kbf {} create|list|revoke` makes, lists and \
+         revokes enrollment tokens (`kbf {}=create --help`).",
         names::FRONTEND,
         names::FRONTEND,
+        token::FLAG,
+        token::FLAG,
     ))
 }
 
@@ -188,8 +190,7 @@ pub fn command() -> Command {
 /// mode. Like [`CHECK_ARGS`] it is not in [`names::MODES`], so the mode list stays exact.
 pub const CLUSTER: &str = "cluster";
 
-/// The word after `kbf` that calls the frontend's enrollment API ([`token`]): not a mode
-/// either.
+/// The command name `kbf --token=<verb>` parses as ([`token::FLAG`] selects it).
 pub const TOKEN: &str = "token";
 
 /// The word after `kbf frontend` that starts the idle instance of the frontend's unit
@@ -235,7 +236,7 @@ pub fn cluster_command() -> Command {
 #[must_use]
 pub fn token_command() -> Command {
     let cmd = Command::new(TOKEN)
-        .bin_name(format!("kbf {TOKEN}"))
+        .bin_name(format!("kbf {}", token::FLAG))
         .about("Make, list and revoke enrollment tokens through the frontend's operator API.")
         .subcommand_required(true)
         .arg_required_else_help(true)
@@ -243,13 +244,12 @@ pub fn token_command() -> Command {
     token::Token::augment_args(cmd)
 }
 
-/// Parses `kbf token ...`; `args` is the whole command line, its first word the program's
-/// name and its second [`TOKEN`].
+/// Parses `kbf --token=<verb> ...`; `args` is the whole command line.
 ///
 /// # Errors
 /// What `clap` refuses.
 pub fn parse_token(args: &[std::ffi::OsString]) -> Result<token::Token, clap::Error> {
-    let argv = args.iter().take(1).chain(args.iter().skip(2));
+    let argv = token::rewrite(args);
     let matches = token_command().try_get_matches_from(argv)?;
     token::Token::from_arg_matches(&matches)
 }
@@ -435,7 +435,7 @@ pub fn main() -> ExitCode {
             Err(e) => e.exit(),
         };
     }
-    if args.get(1).is_some_and(|word| word == TOKEN) {
+    if args.iter().skip(1).any(|a| token::verb_of(a).is_some()) {
         return match parse_token(&args) {
             Ok(token) => token::run(&token),
             Err(e) => e.exit(),

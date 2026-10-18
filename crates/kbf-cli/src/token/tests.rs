@@ -85,8 +85,9 @@ fn serve_once(status: &'static str, body: String) -> (SocketAddr, JoinHandle<Str
 }
 
 fn parse(args: &[&str]) -> Token {
-    let mut argv: Vec<OsString> = vec!["kbf".into(), "token".into()];
-    argv.extend(args.iter().map(OsString::from));
+    // `args[0]` is the verb; the command line is `kbf --token=<verb> <flags>`.
+    let mut argv: Vec<OsString> = vec!["kbf".into(), format!("{FLAG}={}", args[0]).into()];
+    argv.extend(args[1..].iter().map(OsString::from));
     parse_token(&argv).expect("a command line")
 }
 
@@ -239,7 +240,7 @@ fn list_and_revoke_carry_the_content_type_the_gate_wants() {
     let (result, request) = against(
         "200 OK",
         r#"{"id":"aaaaaaaaaaaa"}"#.to_owned(),
-        &["revoke", "aaaaaaaaaaaa"],
+        &["revoke", "--token-id=aaaaaaaaaaaa"],
     );
     result.expect("revoked");
     assert!(
@@ -255,7 +256,12 @@ fn list_and_revoke_carry_the_content_type_the_gate_wants() {
     let dir = scratch("badid");
     let file = token_file(&dir).display().to_string();
     for id in ["../x", "AAAAAAAAAAAA", "a"] {
-        let bad = execute(&parse(&["revoke", id, "--token-file", &file]));
+        let bad = execute(&parse(&[
+            "revoke",
+            &format!("--token-id={id}"),
+            "--token-file",
+            &file,
+        ]));
         assert!(matches!(bad, Err(TokenError::Id)), "{id}");
     }
 }
@@ -409,7 +415,8 @@ fn a_failed_save_names_the_token_that_was_made() {
         "{shown}"
     );
     assert!(
-        shown.contains("aaaaaaaaaaaa") && shown.contains("kbf token revoke aaaaaaaaaaaa"),
+        shown.contains("aaaaaaaaaaaa")
+            && shown.contains("kbf --token=revoke --token-id=aaaaaaaaaaaa"),
         "{shown}"
     );
     assert!(!shown.contains("SECRETPART"), "{shown}");
@@ -424,10 +431,13 @@ fn the_credential_is_required_and_read_before_any_call() {
     assert!(matches!(err, TokenError::Client(_)));
     assert!(err.to_string().contains("/nonexistent/api-token"), "{err}");
     for argv in [
-        vec!["kbf", "token", "list"],
-        vec!["kbf", "token", "create", "--token-file", "f"],
-        vec!["kbf", "token", "revoke", "--token-file", "f"],
-        vec!["kbf", "token"],
+        vec!["kbf", "--token=list"],
+        vec!["kbf", "--token=create", "--token-file", "f"],
+        vec!["kbf", "--token=revoke", "--token-file", "f"],
+        vec!["kbf", "--token=bogus", "--token-file", "f"],
+        vec!["kbf", "--token="],
+        vec!["kbf", "--token-file", "f"],
+        vec!["kbf", "--token=list", "extra", "--token-file", "f"],
     ] {
         let argv: Vec<OsString> = argv.into_iter().map(OsString::from).collect();
         assert!(parse_token(&argv).is_err(), "{argv:?}");

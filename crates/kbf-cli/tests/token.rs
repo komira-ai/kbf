@@ -83,12 +83,10 @@ fn the_binary_writes_the_token_to_a_file_and_prints_none_of_it() {
     let out = dir.join("enroll-token");
     let (addr, request) = serve_once(CREATED);
     let result = Command::new(BIN)
-        .args(["token", "create", "--roles", "daemon", "--api"])
-        .arg(addr.to_string())
-        .arg("--token-file")
-        .arg(&api_token)
-        .arg("--out")
-        .arg(&out)
+        .args(["--token=create", "--roles=daemon"])
+        .arg(format!("--api={addr}"))
+        .arg(format!("--token-file={}", api_token.display()))
+        .arg(format!("--out={}", out.display()))
         .output()
         .expect("run kbf");
     let request = request.join().expect("the server thread");
@@ -114,7 +112,7 @@ fn the_binary_writes_the_token_to_a_file_and_prints_none_of_it() {
     let help = String::from_utf8_lossy(&help.stdout);
     assert!(help.contains("create|list|revoke"), "{help}");
     let bad = Command::new(BIN)
-        .args(["token", "list"])
+        .args(["--token=list"])
         .output()
         .expect("run kbf");
     assert_eq!(
