@@ -236,10 +236,18 @@ mod tests {
         assert!(b.window_open());
         assert!(!b.replayable());
         for f in [Failure::Connect, Failure::RefusedStream, Failure::Fenced] {
-            assert!(!may_retry("/kbf.worker.v1.Worker/Session", f, &b, 1), "{f:?}");
+            assert!(
+                !may_retry("/kbf.worker.v1.Worker/Session", f, &b, 1),
+                "{f:?}"
+            );
         }
         b.end_request();
-        assert!(may_retry("/kbf.worker.v1.Worker/Session", Failure::Fenced, &b, 1));
+        assert!(may_retry(
+            "/kbf.worker.v1.Worker/Session",
+            Failure::Fenced,
+            &b,
+            1
+        ));
     }
 
     #[test]

@@ -293,7 +293,10 @@ base_port = 18000
         ));
         // 8192 streams at 592 KiB is 4.75 GiB: the default fits its 8 GiB budget, a bigger
         // stream cap or a smaller budget does not.
-        assert_eq!(Limits::stream_ceiling_bytes(), 2 * 262_144 + 65_536 + 16_384);
+        assert_eq!(
+            Limits::stream_ceiling_bytes(),
+            2 * 262_144 + 65_536 + 16_384
+        );
         assert_eq!(Limits::default().worst_case_bytes(), 8192 * 606_208);
         assert!(limits("max_streams = 14169").is_ok());
         assert!(matches!(

@@ -9,24 +9,34 @@ publish.workspace = true
 
 # The frontend host's front door (docs/design/frontend-proxy.md, docs/design/kbf-proxy-api.md):
 # one TLS terminator that routes each HTTP/2 stream to the active child frontend over loopback.
-# This skeleton holds the decisions that are plain values (routes, auth, identity headers,
-# the per-slot permit, the hold gate, the replay buffer, the config); the I/O (accept loop,
-# hyper, upstream pools) arrives in U4b-1 to U4b-3 with the dependencies it needs.
+# The downstream side is hyper's HTTP/2 server (plaintext until U4b-2 adds TLS); the upstream
+# pool is built on h2's own client, because the child's advertised stream limit is on h2's
+# types and not on hyper's.
 [dependencies]
+bytes.workspace = true
+h2.workspace = true
 hex.workspace = true
 http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["http2", "server"] }
+hyper-util = { workspace = true, features = ["http2", "server-graceful", "tokio"] }
 kbf-peer.workspace = true
 serde.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
-# `sync` only: the hold gate's doorbell is a `watch` channel, written from a guard's drop.
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "time"] }
 toml.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
 serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "test-util"] }
+
+# The model checker, under its own cfg (see the workspace lints and tools/ci/proxy-loom.sh).
+[target.'cfg(kbf_loom)'.dependencies]
+loom.workspace = true
 
 [lints]
 workspace = true

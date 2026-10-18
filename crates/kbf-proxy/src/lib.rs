@@ -4,8 +4,8 @@
 //! certificate. The design is `docs/design/frontend-proxy.md`; this crate's API and the
 //! decisions behind it are `docs/design/kbf-proxy-api.md`.
 //!
-//! The modules that exist so far hold the decisions that are plain values, so each can be
-//! tested without a socket:
+//! The modules that hold the decisions are plain values, so each can be tested without a
+//! socket:
 //!
 //! - [`slot`]: the two child slots, the active-slot handle and the per-stream permit.
 //! - [`hold`]: the hold gate's bounds and deadline.
@@ -15,12 +15,41 @@
 //! - [`replay`]: the replay buffer and the retry rule.
 //! - [`config`]: the `[proxy]` table of `installer.toml`.
 //! - [`control`]: the update-API handler and the status the proxy reports.
+//!
+//! The I/O is [`Proxy::bind`], [`ProxyRunner::run`] and [`ProxyHandle`]: a plaintext
+//! HTTP/2 server (TLS, identity and auth are U4b-2), per-stream routing to the active child,
+//! an upstream pool per (slot, generation, target) and the hold gate.
 
+// The I/O modules are not part of the loom build (`--cfg kbf_loom`): the models cover only
+// `slot`, and tokio and hyper are not loom-aware.
 pub mod auth;
+#[cfg(not(kbf_loom))]
+mod body;
 pub mod config;
 pub mod control;
+#[cfg(not(kbf_loom))]
+mod core;
 pub mod hold;
 pub mod identity;
+#[cfg(not(kbf_loom))]
+mod metrics;
+#[cfg(not(kbf_loom))]
+mod pool;
+#[cfg(not(kbf_loom))]
+mod proxy;
 pub mod replay;
+#[cfg(not(kbf_loom))]
+mod reply;
 pub mod route;
+#[cfg(not(kbf_loom))]
+mod serve;
 pub mod slot;
+#[cfg(not(kbf_loom))]
+mod stream;
+mod sync;
+
+#[cfg(not(kbf_loom))]
+pub use proxy::{Proxy, ProxyHandle, ProxyRunner};
+
+#[cfg(all(test, not(kbf_loom)))]
+mod tests;

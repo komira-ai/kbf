@@ -165,7 +165,11 @@ impl HoldQueue {
     /// answers `UNAVAILABLE` at its next wake even if a release follows. The supervisor calls
     /// it on each poll, through `ProxyHandle::expire`.
     pub fn expire(&self, now: Instant) -> usize {
-        let cells = self.shared.cells.lock().unwrap_or_else(PoisonError::into_inner);
+        let cells = self
+            .shared
+            .cells
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let mut failed = 0;
         for cell in cells.values() {
             if now >= cell.deadline && cell.fail() {
@@ -324,7 +328,11 @@ mod tests {
         let t = admit(&q, t0);
         assert_eq!(t.wake(t0, false), Wake::Wait);
         assert_eq!(t.wake(t0 + HOLD, true), Wake::Bind, "release seen first");
-        assert_eq!(q.expired_total(), 0, "a bound stream is never counted expired");
+        assert_eq!(
+            q.expired_total(),
+            0,
+            "a bound stream is never counted expired"
+        );
         let t2 = admit(&q, t0);
         assert_eq!(t2.wake(t0, true), Wake::Bind);
         // The ticket's own timer: a stream that sees only the deadline expires, once.
@@ -339,17 +347,35 @@ mod tests {
         let q = HoldQueue::new(HoldLimits::default());
         let t0 = Instant::now();
         let early: Vec<Ticket> = (0..3).map(|_| admit(&q, t0)).collect();
-        let late = q.admit(t0 + Duration::from_secs(10), HOLD, None).expect("room");
-        assert_eq!(q.expire(t0 + Duration::from_secs(19)), 0, "nothing is past it");
+        let late = q
+            .admit(t0 + Duration::from_secs(10), HOLD, None)
+            .expect("room");
+        assert_eq!(
+            q.expire(t0 + Duration::from_secs(19)),
+            0,
+            "nothing is past it"
+        );
         assert_eq!(q.expire(t0 + HOLD), 3, "the three early streams");
-        assert_eq!(q.expire(t0 + HOLD), 0, "a second sweep counts nothing again");
+        assert_eq!(
+            q.expire(t0 + HOLD),
+            0,
+            "a second sweep counts nothing again"
+        );
         assert_eq!(q.expired_total(), 3);
         // The late stream is still within its bound and is not touched.
         assert_eq!(late.wake(t0 + HOLD, false), Wake::Wait);
         // Swept streams stay failed even if a release follows: one winner.
-        assert!(early.iter().all(|t| t.wake(t0 + HOLD, true) == Wake::Expire));
+        assert!(
+            early
+                .iter()
+                .all(|t| t.wake(t0 + HOLD, true) == Wake::Expire)
+        );
         assert_eq!(late.wake(t0 + HOLD, true), Wake::Bind);
-        assert_eq!(q.expire(t0 + Duration::from_secs(40)), 0, "a bound stream is not failed");
+        assert_eq!(
+            q.expire(t0 + Duration::from_secs(40)),
+            0,
+            "a bound stream is not failed"
+        );
         assert_eq!(q.expired_total(), 3);
         // A stream that expired by its own timer is not counted a second time by the sweep.
         let own = admit(&q, t0);
@@ -369,7 +395,11 @@ mod tests {
         let again = q
             .admit(t0 + Duration::from_secs(15), ALL_IN_ONE_HOLD, Some(since))
             .expect("room");
-        assert_eq!(again.deadline(), t0 + ALL_IN_ONE_HOLD, "since the first hold, not the second");
+        assert_eq!(
+            again.deadline(),
+            t0 + ALL_IN_ONE_HOLD,
+            "since the first hold, not the second"
+        );
         let fresh = q
             .admit(t0 + Duration::from_secs(15), ALL_IN_ONE_HOLD, None)
             .expect("room");
@@ -382,6 +412,10 @@ mod tests {
         let t0 = Instant::now();
         drop(admit(&q, t0));
         assert_eq!(q.held(), 0);
-        assert_eq!(q.expire(t0 + HOLD), 0, "a stream the client reset is not counted");
+        assert_eq!(
+            q.expire(t0 + HOLD),
+            0,
+            "a stream the client reset is not counted"
+        );
     }
 }

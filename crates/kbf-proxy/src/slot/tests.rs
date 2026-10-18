@@ -31,7 +31,11 @@ fn streams_stay_on_the_slot_they_bound_to() {
     assert_eq!(s.retire(Slot::A), Retire::Busy(200));
     drop(old);
     assert_eq!(s.retire(Slot::A), Retire::Closed);
-    assert_eq!(s.retire(Slot::A), Retire::AlreadyClosed, "only the first call signals");
+    assert_eq!(
+        s.retire(Slot::A),
+        Retire::AlreadyClosed,
+        "only the first call signals"
+    );
 }
 
 #[test]
@@ -42,7 +46,11 @@ fn the_active_slot_is_not_retired_and_a_never_opened_one_says_so() {
     s.open(Slot::B);
     assert_eq!(s.retire(Slot::B), Retire::Closed);
     assert_eq!(s.retire(Slot::B), Retire::AlreadyClosed);
-    assert_eq!(s.retire(Slot::B), Retire::AlreadyClosed, "a re-run changes nothing");
+    assert_eq!(
+        s.retire(Slot::B),
+        Retire::AlreadyClosed,
+        "a re-run changes nothing"
+    );
     // Reopened and retired again is a new child: Closed once more.
     s.open(Slot::B);
     assert_eq!(s.retire(Slot::B), Retire::Closed);
@@ -109,8 +117,13 @@ fn hold_defers_the_bind_until_the_guard_releases() {
 #[test]
 fn a_rejected_hold_does_not_rewrite_the_bound_in_force() {
     let s = live();
-    let guard = s.hold(Duration::from_secs(300)).expect("the all-in-one hold");
-    assert!(matches!(s.hold(Duration::from_secs(20)), Err(AlreadyHolding)));
+    let guard = s
+        .hold(Duration::from_secs(300))
+        .expect("the all-in-one hold");
+    assert!(matches!(
+        s.hold(Duration::from_secs(20)),
+        Err(AlreadyHolding)
+    ));
     assert!(
         matches!(s.bind(), Bind::Held { hold_max, .. } if hold_max == Duration::from_secs(300)),
         "a stray hold(20 s) must not shorten the 300 s in force"
@@ -140,7 +153,10 @@ fn a_release_after_held_is_never_missed() {
     assert_eq!(s.epoch(), epoch);
     drop(guard);
     assert_ne!(s.epoch(), epoch, "the waiter's condition is already true");
-    assert!(!s.holding(), "and the gate is open by the time the epoch moved");
+    assert!(
+        !s.holding(),
+        "and the gate is open by the time the epoch moved"
+    );
     // A second hold and a release into a slot moves it again.
     let before = s.epoch();
     let _again = s.hold(HOLD_MAX).expect("again");
@@ -158,14 +174,25 @@ fn a_dropped_guard_releases_into_nothing_and_is_counted() {
         assert_eq!(s.active(), Some(Slot::A));
     }
     assert!(!s.holding());
-    assert_eq!(s.active(), None, "not released to the active slot, nor to a default");
-    assert!(matches!(s.bind(), Bind::NoActive), "held streams fail UNAVAILABLE");
+    assert_eq!(
+        s.active(),
+        None,
+        "not released to the active slot, nor to a default"
+    );
+    assert!(
+        matches!(s.bind(), Bind::NoActive),
+        "held streams fail UNAVAILABLE"
+    );
     assert_ne!(s.epoch(), epoch, "and they were woken to find out");
     assert_eq!(s.abandoned_holds(), 1);
     // The supervisor can still set a slot afterwards.
     s.release_into(Slot::A).expect("open");
     assert_eq!(bound(&s).slot(), Slot::A);
-    assert_eq!(s.abandoned_holds(), 1, "a release into a slot is not abandonment");
+    assert_eq!(
+        s.abandoned_holds(),
+        1,
+        "a release into a slot is not abandonment"
+    );
 }
 
 #[test]
@@ -179,8 +206,15 @@ fn a_guard_dropped_on_a_panic_still_rings_the_doorbell() {
         panic!("the supervisor died mid-swap");
     }));
     assert!(unwound.is_err());
-    assert!(bell.has_changed().expect("open"), "a parked waiter would wake");
-    assert_eq!(*bell.borrow_and_update(), s.epoch(), "and the value is the epoch");
+    assert!(
+        bell.has_changed().expect("open"),
+        "a parked waiter would wake"
+    );
+    assert_eq!(
+        *bell.borrow_and_update(),
+        s.epoch(),
+        "and the value is the epoch"
+    );
     assert!(!s.holding());
     assert_eq!(s.abandoned_holds(), 1);
     // release_into rings it too, and only when a hold was in force.
@@ -189,7 +223,10 @@ fn a_guard_dropped_on_a_panic_still_rings_the_doorbell() {
     assert!(bell.has_changed().expect("open"));
     bell.borrow_and_update();
     s.release_into(Slot::A).expect("open");
-    assert!(!bell.has_changed().expect("open"), "nothing was held: nothing rung");
+    assert!(
+        !bell.has_changed().expect("open"),
+        "nothing was held: nothing rung"
+    );
 }
 
 #[test]
@@ -263,9 +300,17 @@ fn all_in_one_failed_start_restarts_old_with_new_generation() {
     // Stop the old daemon: nothing is active, and the slot is not yet retired.
     s.clear_active();
     assert!(s.holding(), "the hold survives");
-    assert_eq!(s.retire(Slot::A), Retire::Busy(1), "a stream of the dead child is draining");
+    assert_eq!(
+        s.retire(Slot::A),
+        Retire::Busy(1),
+        "a stream of the dead child is draining"
+    );
     // Without the retire a restart would reuse the dead process's generation.
-    assert_eq!(s.open(Slot::A), 1, "the trap: open on an open slot is the same child");
+    assert_eq!(
+        s.open(Slot::A),
+        1,
+        "the trap: open on an open slot is the same child"
+    );
     drop(straggler);
     assert_eq!(s.retire(Slot::A), Retire::Closed);
     assert_eq!(s.retire(Slot::A), Retire::AlreadyClosed);
@@ -286,7 +331,11 @@ fn both_children_dead_then_a_fresh_start_is_released_into() {
     s.clear_active();
     assert_eq!(s.retire(Slot::A), Retire::Closed);
     assert_eq!(s.retire(Slot::B), Retire::Closed);
-    assert_eq!(s.release_into(Slot::A), Err(SwapError::Closed), "nothing is running yet");
+    assert_eq!(
+        s.release_into(Slot::A),
+        Err(SwapError::Closed),
+        "nothing is running yet"
+    );
     assert_eq!(s.open(Slot::A), 2);
     s.release_into(Slot::A).expect("started fresh");
     assert_eq!(bound(&s).generation(), 2);
@@ -312,7 +361,10 @@ fn a_starting_proxy_holds_until_adoption_is_done() {
     let (t, guard) = ActiveSlot::starting(Duration::from_secs(300));
     t.adopt(Slot::B, Some(Slot::A));
     drop(guard);
-    assert!(matches!(t.bind(), Bind::NoActive), "an untaken startup hold fails closed");
+    assert!(
+        matches!(t.bind(), Bind::NoActive),
+        "an untaken startup hold fails closed"
+    );
     let one = ActiveSlot::new();
     one.adopt(Slot::A, None);
     assert_eq!(one.retire(Slot::B), Retire::NeverOpened);
@@ -465,4 +517,41 @@ fn open_streams_never_reads_zero_while_a_stream_lives() {
     assert_eq!(reader.0.join().expect("reader"), 0);
     drop(current);
     assert_eq!(s.open_streams(), 0);
+}
+
+#[test]
+fn the_proxy_abandons_a_startup_hold_nobody_released() {
+    let (s, guard) = ActiveSlot::starting(HOLD_MAX);
+    s.open(Slot::A);
+    assert!(s.abandon_startup(), "the startup hold was in force");
+    assert!(!s.holding());
+    assert_eq!(s.active(), None, "ended into nothing");
+    assert_eq!(s.abandoned_holds(), 1);
+    assert!(matches!(s.bind(), Bind::NoActive));
+    drop(guard);
+    assert_eq!(
+        s.abandoned_holds(),
+        1,
+        "the supervisor's late drop counts nothing more"
+    );
+    assert!(!s.abandon_startup(), "and a second abandon finds nothing");
+}
+
+#[test]
+fn abandoning_the_startup_hold_leaves_a_released_or_a_later_hold_alone() {
+    let (s, guard) = ActiveSlot::starting(HOLD_MAX);
+    s.adopt(Slot::A, None);
+    s.release_into(Slot::A).expect("A is open");
+    assert!(!s.abandon_startup(), "released already");
+    assert_eq!(s.active(), Some(Slot::A));
+    assert_eq!(s.abandoned_holds(), 0);
+    drop(guard);
+    let later = s.hold(HOLD_MAX).expect("no hold in force");
+    assert!(
+        !s.abandon_startup(),
+        "a later hold has a later sequence number"
+    );
+    assert!(s.holding());
+    assert_eq!(s.active(), Some(Slot::A));
+    drop(later);
 }

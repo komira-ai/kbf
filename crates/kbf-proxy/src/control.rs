@@ -115,7 +115,10 @@ impl UpdateReply {
     /// The proxy's own answer to a handler that passed [`UPDATE_DEADLINE`].
     #[must_use]
     pub fn timed_out() -> Self {
-        Self::json(504, br#"{"error":"the update handler did not answer"}"#.to_vec())
+        Self::json(
+            504,
+            br#"{"error":"the update handler did not answer"}"#.to_vec(),
+        )
     }
 }
 
@@ -197,10 +200,7 @@ mod tests {
             active: Some(Slot::B),
             holding: true,
             held: 3,
-            per_slot: [
-                SlotStats { open_streams: 200 },
-                SlotStats::default(),
-            ],
+            per_slot: [SlotStats { open_streams: 200 }, SlotStats::default()],
             ready: false,
             holds_abandoned: 1,
         };

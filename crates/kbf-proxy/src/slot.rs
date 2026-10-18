@@ -25,11 +25,12 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
+
+use crate::sync::Doorbell;
+use crate::sync::atomic::{AtomicU64, Ordering};
 
 /// One of the two fixed child slots. Its text form is `"a"` or `"b"`, in `FromStr`,
 /// `Display` and serde: the one spelling `update.json` and the status JSON use.
@@ -111,6 +112,8 @@ const FLAGS: u64 = CLOSED | RETIRED;
 /// a guard would need 2^24 later holds to alias).
 const HOLD: u64 = 0b100;
 const ACTIVE_MASK: u64 = 0b011;
+/// The sequence number of the hold `ActiveSlot::starting` begins with.
+const STARTUP_SEQ: u64 = 1;
 const MS_SHIFT: u32 = 8;
 const SEQ_SHIFT: u32 = 40;
 const SEQ_MASK: u64 = 0xFF_FFFF << SEQ_SHIFT;
@@ -131,7 +134,7 @@ struct Inner {
     /// Counts the ends of a hold. A held stream samples it before it binds and waits for it to move.
     epoch: AtomicU64,
     /// The doorbell: mirrors `epoch` for tasks that sleep on it. Written only by `ring`.
-    doorbell: watch::Sender<u64>,
+    doorbell: Doorbell,
     /// Holds that ended by their guard's drop: nobody released them into a slot.
     abandoned: AtomicU64,
     /// One count of every live `Pending` and every live `Permit`. A stream that holds both
@@ -145,8 +148,28 @@ impl Inner {
     /// rings the doorbell, so a task that wakes finds the new gate and a new epoch. It lives
     /// here so the guard's drop and `release_into` cannot differ.
     fn ring(&self) {
-        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        self.doorbell.send_replace(epoch);
+        // The epoch is taken inside the doorbell's lock: two rings on two threads write the
+        // doorbell in the order they took their epochs, so it never goes backwards and a
+        // waiter that sampled the older epoch is woken.
+        self.doorbell
+            .ring(|| self.epoch.fetch_add(1, Ordering::AcqRel) + 1);
+    }
+
+    /// Ends the hold `seq` into nothing, if it is still in force: no slot is active, held and
+    /// later streams fail, the abandoned count ticks and the doorbell rings. False if the hold
+    /// already ended (a release, or an earlier abandon) or `seq` is not the latest.
+    fn abandon(&self, seq: u64) -> bool {
+        let mine = self
+            .gate
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |g| {
+                (g & HOLD != 0 && seq_of(g) == seq).then_some(g & SEQ_MASK)
+            })
+            .is_ok();
+        if mine {
+            self.abandoned.fetch_add(1, Ordering::AcqRel);
+            self.ring();
+        }
+        mine
     }
 }
 
@@ -235,7 +258,7 @@ impl ActiveSlot {
                 slots: [AtomicU64::new(CLOSED), AtomicU64::new(CLOSED)],
                 generations: [AtomicU64::new(0), AtomicU64::new(0)],
                 epoch: AtomicU64::new(0),
-                doorbell: watch::channel(0).0,
+                doorbell: Doorbell::new(),
                 abandoned: AtomicU64::new(0),
                 live: AtomicU64::new(0),
             }),
@@ -249,12 +272,21 @@ impl ActiveSlot {
     /// nothing.
     #[must_use]
     pub fn starting(hold_max: Duration) -> (Self, HoldGuard) {
-        let slots = Self::with_gate(HOLD | pack_ms(hold_max) | (1 << SEQ_SHIFT));
+        let slots = Self::with_gate(HOLD | pack_ms(hold_max) | (STARTUP_SEQ << SEQ_SHIFT));
         let guard = HoldGuard {
             inner: Arc::clone(&slots.inner),
-            seq: 1,
+            seq: STARTUP_SEQ,
         };
         (slots, guard)
+    }
+
+    /// Ends the hold [`ActiveSlot::starting`] began, into nothing, if it is still in force:
+    /// the proxy's own answer to a supervisor that never arrived (the guard went to the
+    /// supervisor, so the proxy cannot drop it). A hold taken later has a later sequence
+    /// number and is not touched. Meaningless on a handle that was not built by `starting`.
+    #[cfg_attr(kbf_loom, allow(dead_code))]
+    pub(crate) fn abandon_startup(&self) -> bool {
+        self.inner.abandon(STARTUP_SEQ)
     }
 
     /// The active slot, if any.
@@ -286,7 +318,8 @@ impl ActiveSlot {
     /// `wait_for(|e| *e != sampled)` and, on every wake, re-reads [`ActiveSlot::epoch`] before
     /// it decides: the atomic is the truth, the channel only wakes the task.
     #[must_use]
-    pub fn subscribe(&self) -> watch::Receiver<u64> {
+    #[cfg(not(kbf_loom))]
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
         self.inner.doorbell.subscribe()
     }
 
@@ -537,16 +570,7 @@ pub struct HoldGuard {
 
 impl Drop for HoldGuard {
     fn drop(&mut self) {
-        let mine = self
-            .inner
-            .gate
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |g| {
-                (g & HOLD != 0 && seq_of(g) == self.seq).then_some(g & SEQ_MASK)
-            });
-        if mine.is_ok() {
-            self.inner.abandoned.fetch_add(1, Ordering::AcqRel);
-            self.inner.ring();
-        }
+        self.inner.abandon(self.seq);
     }
 }
 
@@ -604,5 +628,8 @@ impl Drop for Permit {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(kbf_loom)))]
 mod tests;
+
+#[cfg(all(test, kbf_loom))]
+mod loom_tests;
