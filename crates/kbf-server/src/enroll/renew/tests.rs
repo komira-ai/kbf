@@ -4,6 +4,7 @@
 
 use kbf_enroll_registry::{list_nodes, revoke_node};
 use kbf_proto::kbf::enroll::v1 as pb;
+use kbf_state::{Cond, Txn};
 use kbf_types::{RefusalReason, Role};
 use rcgen::{KeyPair, PublicKeyData as _};
 use x509_parser::prelude::{FromDer as _, X509Certificate};
@@ -305,6 +306,31 @@ fn a_renewal_of_a_host_the_frontend_now_serves_is_advertise_invalid() {
             RefusalReason::WrongKey
         );
     }
+}
+
+/// A renewal while the registry cannot be read is `StoreUnavailable` (the node retries), not
+/// a renewal of a host nobody could read, and records nothing.
+///
+/// Catches: the read of the stored advertise host failing open (a certificate issued with
+/// the name left out or from a guess) or told as another reason (a node that never retries
+/// an outage, or one that retries a refusal).
+#[test]
+fn a_renewal_while_the_registry_cannot_be_read_is_store_unavailable() {
+    let (farm, keys) = enrolled("renew-unreadable");
+    farm.advance(120);
+    let request = renew_request("node-01", &ROLES, &keys, farm.now());
+    farm.store
+        .txn(Txn::new().put("enroll/node/n9", [0xffu8, 0xff], Cond::Any))
+        .expect("store")
+        .expect("put");
+    assert!(
+        list_nodes(&*farm.store).is_err(),
+        "the registry no longer reads"
+    );
+    assert_eq!(
+        refused(farm.service.renew_now(&request)),
+        RefusalReason::StoreUnavailable
+    );
 }
 
 /// The refusal a node receives is one its client recognises (by code and message) and does

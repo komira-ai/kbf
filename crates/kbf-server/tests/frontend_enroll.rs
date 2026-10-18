@@ -211,3 +211,56 @@ async fn a_serving_frontend_replaces_the_enroll_listeners_certificate() {
     assert_eq!(tls.reloads().rejected, 0);
     serving.abort();
 }
+
+/// `--enroll-listen` without `--enroll-allow-unenforced-deny` is refused while deny rows
+/// are not enforced; the frontend start returns that refusal (the enroll preparation runs
+/// before any listener is bound, so nothing serves).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frontend_start_returns_the_enroll_gate_refusal() {
+    let dir = scratch("gate");
+    let f = flags(&[
+        format!("--state-store=sqlite://{}", dir.join("state.db").display()),
+        "--enroll-listen=127.0.0.1:0".to_owned(),
+        format!("--ca-dir={}", dir.join("ca").display()),
+        "--ca-dev-file-signer".to_owned(),
+        "--frontend-name=localhost".to_owned(),
+    ]);
+    let err = start_frontend(&f, || Ok(pending::<()>()))
+        .err()
+        .expect("the gate refuses")
+        .to_string();
+    assert!(
+        err.contains("--enroll-allow-unenforced-deny"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !dir.join("ca").exists(),
+        "nothing is written before the gate passes"
+    );
+}
+
+/// The enroll registry lives in the state store, so a start with an enroll listener and no
+/// state store is refused. The flag parser already requires `--state-store` with
+/// `--enroll-listen`, so the test clears it on the parsed flags: this is the start's own
+/// check, for callers that build the flags without the parser.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frontend_start_refuses_enroll_listen_without_a_state_store() {
+    let dir = scratch("nostore");
+    let mut f = flags(&[
+        format!("--state-store=sqlite://{}", dir.join("state.db").display()),
+        "--enroll-listen=127.0.0.1:0".to_owned(),
+        format!("--ca-dir={}", dir.join("ca").display()),
+        "--ca-dev-file-signer".to_owned(),
+        "--enroll-allow-unenforced-deny".to_owned(),
+        "--frontend-name=localhost".to_owned(),
+    ]);
+    f.server.state_store = None;
+    let err = start_frontend(&f, || Ok(pending::<()>()))
+        .err()
+        .expect("refused")
+        .to_string();
+    assert_eq!(
+        err,
+        "--enroll-listen needs --state-store: the registry lives in it"
+    );
+}

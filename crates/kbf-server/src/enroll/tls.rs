@@ -90,13 +90,14 @@ impl FrontendTls {
     /// failed replacement is logged and tried again in a minute; the old certificate is
     /// served until it expires.
     /// `every` replaces half the lifetime as the interval (a test seam; `None` in service).
-    pub async fn keep_fresh(
+    pub fn keep_fresh(
         self: std::sync::Arc<Self>,
         ca: std::sync::Arc<Ca>,
         every: Option<Duration>,
-    ) {
+    ) -> impl std::future::Future<Output = ()> {
+        // Returned, not awaited here: the loop never ends, so a line after an await would
+        // never run.
         self.keep_fresh_by(ca, std::sync::Arc::new(unix_now), every)
-            .await;
     }
 
     /// [`Self::keep_fresh`] with the clock the certificates are issued by given.

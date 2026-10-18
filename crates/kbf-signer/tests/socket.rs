@@ -7,6 +7,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use kbf_ca::{Algorithm, Authority, CaError, Custody, FileSigner, Policy, SignError, Signer};
 use kbf_signer::{Route, SignerError, SignerServer, SocketSigner, bind, harden};
@@ -238,19 +239,29 @@ fn the_client_distrusts_the_socket() {
     assert!(long.0.contains("signer socket"), "{long}");
 }
 
-struct Failing(Vec<u8>);
+/// The CA's key, until `offline` is set: then every signature fails. One type for all
+/// three outcomes of the test, so the one instantiation of the server it builds runs the
+/// refusal, the success and the failure arm of `sign` (coverage scores a generic by its
+/// best instantiation).
+struct Failing {
+    key: FileSigner,
+    offline: Arc<AtomicBool>,
+}
 
 impl Signer for Failing {
     fn public_key(&self) -> &[u8] {
-        &self.0
+        self.key.public_key()
     }
 
     fn custody(&self) -> Custody {
         Custody::External
     }
 
-    fn sign(&self, _: &[u8], _: Algorithm) -> Result<Vec<u8>, SignError> {
-        Err(SignError("hardware module offline".to_owned()))
+    fn sign(&self, tbs: &[u8], algorithm: Algorithm) -> Result<Vec<u8>, SignError> {
+        if self.offline.load(Ordering::SeqCst) {
+            return Err(SignError("hardware module offline".to_owned()));
+        }
+        self.key.sign(tbs, algorithm)
     }
 }
 
@@ -259,8 +270,12 @@ impl Signer for Failing {
 #[test]
 fn a_failing_key_is_a_failure_not_a_signature() {
     let ca = make_ca("failing");
+    let offline = Arc::new(AtomicBool::new(false));
     let server = SignerServer::new(
-        Failing(ca.spki.clone()),
+        Failing {
+            key: FileSigner::load(&ca.dir).expect("key"),
+            offline: Arc::clone(&offline),
+        },
         &ca.root,
         euid(),
         Policy::default(),
@@ -274,11 +289,20 @@ fn a_failing_key_is_a_failure_not_a_signature() {
         let _ = server.serve(&listener);
     });
     let client = SocketSigner::connect(&socket, Route::Node).expect("connect");
+    let tbs = support::node_tbs(&ca, Role::Daemon, None);
+    // While the key works the signature is served, not a failure.
+    let signature = client
+        .sign(&tbs, Algorithm::EcdsaP256Sha256)
+        .expect("the key signs");
+    assert!(!signature.is_empty());
+    // A request the policy refuses is a refusal whatever the key does.
+    let refusal = client
+        .sign(b"not a certificate body", Algorithm::EcdsaP256Sha256)
+        .expect_err("refused");
+    assert!(refusal.0.contains("the signer refused"), "{refusal}");
+    offline.store(true, Ordering::SeqCst);
     let err = client
-        .sign(
-            &support::node_tbs(&ca, Role::Daemon, None),
-            Algorithm::EcdsaP256Sha256,
-        )
+        .sign(&tbs, Algorithm::EcdsaP256Sha256)
         .expect_err("fails");
     assert!(
         err.0.contains("failed") && err.0.contains("hardware module offline"),
