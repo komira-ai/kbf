@@ -376,9 +376,6 @@ fn a_token_fills_the_request_fields_it_travels_in() {
 /// fields of an unknown number and wire type (a varint, a length-delimited one, a fixed
 /// 32-bit one) at the end and in the middle; each decodes, to the fields this build knows,
 /// and a generation this build has never held is just a number.
-///
-/// Mutant seen red: a `deny_unknown_fields`-style strict decode (a hand check that the
-/// re-encoded bytes equal the input).
 #[test]
 fn a_newer_frontends_store_config_answer_decodes() {
     let unknown = [0x78, 0x01, 0x72, 0x02, b'h', b'i', 0xad, 0x01, 1, 2, 3, 4];

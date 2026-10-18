@@ -192,8 +192,7 @@ async fn a_secret_that_is_not_readable_is_unavailable() {
 /// dropped, a registration that keeps the acks of the boot before it, and a stale boot's
 /// heartbeat recorded.
 ///
-/// Mutants seen red: `objstore_generation` left 0 in either answer; the ack recorded
-/// before the heartbeat is admitted; `forget` not called at the register.
+/// Mutants seen red: both answers announcing 0; `forget` not called at the register.
 #[tokio::test]
 async fn heartbeats_announce_the_generation_and_report_what_the_node_applied() {
     let source = Source::new(4);
@@ -329,7 +328,7 @@ async fn with_a_registry_an_unenrolled_node_is_refused_and_a_failing_registry_is
 /// registration generation (the state store failed): the node must keep its membership. The
 /// answer carries 0, "none or cannot say", and the map as ever.
 ///
-/// Mutant seen red: the source's error returned from `Heartbeat`.
+/// Mutant seen red: the announced number 7, not 0, when the source cannot say.
 #[tokio::test]
 async fn a_frontend_that_cannot_say_its_generation_announces_zero_and_still_answers() {
     let source = Source::new(4);
@@ -409,7 +408,7 @@ async fn the_worker_deny_list_file_applies_at_every_call() {
 /// `Heartbeat` still answer, the heartbeat's report is lost (the farm reads `pending`, the safe
 /// side), and nothing about the failure reaches the node.
 ///
-/// Mutants: the error of `record` or `forget` returned from the call.
+/// Mutant seen red: the error of `record` returned from `Heartbeat`.
 #[tokio::test]
 async fn acks_that_cannot_be_kept_do_not_fail_the_membership_calls() {
     use std::sync::atomic::Ordering;
