@@ -151,6 +151,24 @@ pub fn check_tarball(tgz: &[u8], files: &[File]) -> Vec<String> {
     problems
 }
 
+/// Reads the file at `path` back and refuses it unless it is the tarball of `files`.
+///
+/// # Errors
+/// A file that cannot be read, or one with a problem [`check_tarball`] names: every
+/// line starts with the path.
+pub fn verify_written(path: &Path, files: &[File]) -> Result<(), Error> {
+    let problems = check_tarball(&read(path)?, files);
+    if problems.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Refused(
+        problems
+            .into_iter()
+            .map(|p| format!("{}: {p}", path.display()))
+            .collect(),
+    ))
+}
+
 /// The `installer-tarball` verb: the lines to print.
 pub fn installer_tarball(
     platform: Platform,
@@ -179,15 +197,7 @@ pub fn installer_tarball(
     let tgz = tarball(&files)?;
     let path = out.join(&name);
     write_new(&path, &tgz)?;
-    let problems = check_tarball(&read(&path)?, &files);
-    if !problems.is_empty() {
-        return Err(Error::Refused(
-            problems
-                .into_iter()
-                .map(|p| format!("{}: {p}", path.display()))
-                .collect(),
-        ));
-    }
+    verify_written(&path, &files)?;
     lines.push(sums::Line {
         sha256: Sha256::of(&tgz),
         name: name.clone(),

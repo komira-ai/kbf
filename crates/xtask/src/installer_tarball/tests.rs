@@ -446,3 +446,62 @@ fn the_verb_refuses_a_mac_and_a_malformed_commit() {
     );
     assert!(!dir.join("out").exists(), "refused before writing anything");
 }
+
+#[test]
+fn a_path_that_does_not_fit_a_ustar_header_is_refused_by_name() {
+    // Catches: a payload path the tar format cannot hold being truncated or dropped
+    // (the script would then find the file missing) instead of failing the verb.
+    for path in ["x".repeat(101), "usr/../etc/passwd".to_owned()] {
+        let files = vec![File {
+            path: path.clone(),
+            mode: 0o644,
+            bytes: b"x".to_vec(),
+        }];
+        assert!(
+            matches!(tarball(&files), Err(Error::Failed(m)) if m.contains("cannot be a tar entry name") && m.contains(&path)),
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn a_gzip_stream_that_is_not_a_tar_is_named_and_the_read_stops() {
+    // Catches: a garbage archive accepted because no entry was seen to differ, and a
+    // read that keeps going after the archive is unreadable.
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), Compression::fast());
+    e.write_all(&[0xAB; 1024]).expect("gzip");
+    let tgz = e.finish().expect("gzip");
+    let problems = problems_of(&good_files(), &tgz);
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    assert!(problems[0].starts_with("not a tar: "), "{problems:?}");
+    assert!(problems[1].starts_with("entries are []"), "{problems:?}");
+}
+
+#[test]
+fn a_written_file_that_is_not_the_tarball_is_refused_with_its_path_on_every_line() {
+    // Catches: the read-back verdict dropped or reduced to a bare success, a refusal
+    // that does not say which file, and a file that cannot be read passing.
+    let dir = scratch("verify-written");
+    let files = good_files();
+    let good = dir.join("good.tar.gz");
+    std::fs::write(&good, tarball(&files).expect("tarball")).expect("write");
+    assert_eq!(verify_written(&good, &files), Ok(()));
+
+    let other = vec![File {
+        bytes: b"other".to_vec(),
+        ..files[0].clone()
+    }];
+    let Err(Error::Refused(lines)) = verify_written(&good, &other) else {
+        panic!("a tarball of other files was accepted");
+    };
+    assert!(lines.len() >= 2, "{lines:?}");
+    for l in &lines {
+        assert!(l.starts_with(&format!("{}: ", good.display())), "{l}");
+    }
+    assert!(
+        lines.iter().any(|l| l.contains("the content is not")),
+        "{lines:?}"
+    );
+
+    assert!(verify_written(&dir.join("missing"), &files).is_err());
+}

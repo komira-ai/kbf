@@ -915,3 +915,30 @@ fn the_default_release_url_is_this_repositorys_latest_release() {
         "the default release URL changed; this test names it on purpose"
     );
 }
+
+#[test]
+fn the_fake_uname_and_id_answer_only_what_the_script_asks() {
+    // Catches: a fake that answers any arguments, so that the script changing to ask
+    // something else (`uname -a`, `id -un`) is still served the canned answer and the
+    // tests above pass against a question the real tool would answer differently.
+    // Run by absolute path as well as by name: `PATH` lookup passes a bare name.
+    let dir = scratch("fake-answers");
+    for tool in ["uname", "id"] {
+        std::fs::copy(FAKE, dir.join(tool)).expect("fake");
+    }
+    let ask = |tool: &str, arg: &str| {
+        let out = std::process::Command::new(dir.join(tool))
+            .arg(arg)
+            .output()
+            .expect("run the fake");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    assert_eq!(ask("uname", "-s"), (true, "Linux\n".to_owned()));
+    assert_eq!(ask("uname", "-m"), (true, "riscv64\n".to_owned()));
+    assert_eq!(ask("uname", "-a"), (false, String::new()));
+    assert_eq!(ask("id", "-u"), (true, "1000\n".to_owned()));
+    assert_eq!(ask("id", "-un"), (false, String::new()));
+}
