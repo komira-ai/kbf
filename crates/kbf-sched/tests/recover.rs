@@ -10,8 +10,8 @@ use kbf_sched::{
     RequeueReason, Scheduler,
 };
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmFault, FarmRun, FarmTime,
-    Failure, LeaseId, LeaseKind, LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Qos,
+    ActionKey, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmFault, FarmRun,
+    FarmTime, LeaseId, LeaseKind, LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Qos,
     Resources, ResultRecord, StateMachine, WaiterId, WorkerId,
 };
 
@@ -478,12 +478,18 @@ fn an_operation_the_scheduler_holds_is_not_taken_in_again() {
         operation: OperationId(12),
         outcome: Outcome::Failed(Failure::Invalid),
     }));
-    assert!(matches!(feed(&mut s, 2, done).as_slice(), [Effect::Answer(_)]));
+    assert!(matches!(
+        feed(&mut s, 2, done).as_slice(),
+        [Effect::Answer(_)]
+    ));
     let finished = s.state(OperationId(12)).cloned();
     assert!(finished.as_ref().is_some_and(OpState::is_done));
     assert_eq!(s.twin(&request(3)), None);
 
-    assert!(!s.take_in(queued(12, request(3))), "a held operation was taken");
+    assert!(
+        !s.take_in(queued(12, request(3))),
+        "a held operation was taken"
+    );
 
     assert_eq!(s.state(OperationId(12)), finished.as_ref());
     assert_eq!(s.queued_len(), 0);
