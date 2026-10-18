@@ -1275,3 +1275,30 @@ fn an_activation_stops_before_the_fetch_when_status_cannot_be_written() {
     assert_eq!(rig.fetcher.count(), 0);
     assert_eq!(rig.current(), Some(c(A)));
 }
+
+/// Catches the second timer: an activation whose swap is on trial may come again (the pass that
+/// made the swap died before its acknowledgement was saved), and it is the same activation, not
+/// a refusal for a trial pending and not a second trial. The vetting lets it by; `activate`
+/// calls it a repeat.
+///
+/// Mutant planted: the pending trial refused whatever its activation (the repeat is refused).
+#[test]
+fn the_same_activation_again_while_on_trial_is_a_repeat() {
+    let mut rig = Rig::new("repeat");
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+    assert_eq!(rig.current(), Some(c(B)));
+    let trial = rig.state().pending_confirm.expect("on trial");
+    assert_eq!(trial.activation, "1-5");
+    let path = rig.root.join("var/lib/kbf-installer/helper.json");
+    let mut memory: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("memory")).expect("json");
+    memory["acked_order_id"] = 0.into();
+    memory["acked_epoch"] = 0.into();
+    fs::write(&path, serde_json::to_vec(&memory).expect("json")).expect("seed");
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0 + 3);
+    assert_eq!(rig.current(), Some(c(B)));
+    assert_eq!(rig.state().pending_confirm, Some(trial));
+    assert_eq!(rig.left(), 0);
+}
