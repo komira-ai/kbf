@@ -9,11 +9,14 @@ use crate::gate::{GateResult, Verdict};
 pub const SCHEMA: u32 = 1;
 
 /// Why a document is refused.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum DocError {
     /// The bytes are not a result document.
     #[error("not a result document: {0}")]
-    Malformed(String),
+    Json(#[from] serde_json::Error),
+    /// The document holds a number JSON cannot write.
+    #[error("gate `{0}` has a limit that is not a number")]
+    NotANumber(String),
     /// The document is for another format number.
     #[error("result document schema {found}, this reader knows {SCHEMA}")]
     Schema {
@@ -298,13 +301,9 @@ impl ResultDoc {
     /// The document as it is written: pretty JSON and a newline.
     pub fn to_bytes(&self) -> Result<Vec<u8>, DocError> {
         if let Some(g) = self.gates.iter().find(|g| !g.threshold.is_finite()) {
-            return Err(DocError::Malformed(format!(
-                "gate `{}` has a limit that is not a number",
-                g.name
-            )));
+            return Err(DocError::NotANumber(g.name.clone()));
         }
-        let mut bytes =
-            serde_json::to_vec_pretty(self).map_err(|e| DocError::Malformed(e.to_string()))?;
+        let mut bytes = serde_json::to_vec_pretty(self)?;
         bytes.push(b'\n');
         Ok(bytes)
     }
@@ -312,8 +311,7 @@ impl ResultDoc {
     /// Read a document, refusing a wrong schema, an unknown field, a waiver without a reason
     /// and a green status the gates do not support.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DocError> {
-        let doc: Self =
-            serde_json::from_slice(bytes).map_err(|e| DocError::Malformed(e.to_string()))?;
+        let doc: Self = serde_json::from_slice(bytes)?;
         if doc.schema != SCHEMA {
             return Err(DocError::Schema { found: doc.schema });
         }

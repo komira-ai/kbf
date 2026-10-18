@@ -106,10 +106,10 @@ fn a_green_document_with_a_red_gate_is_refused() {
     let mut d = full();
     d.gates[0] = GateResult::decide("lost-blobs", Sample::Absent, Limit::AtMost(0.0), 1, 2);
     let bytes = d.to_bytes().unwrap();
-    assert_eq!(
-        ResultDoc::from_bytes(&bytes).unwrap_err(),
-        DocError::GreenButNot("a gate is red")
-    );
+    assert!(matches!(
+        ResultDoc::from_bytes(&bytes),
+        Err(DocError::GreenButNot("a gate is red"))
+    ));
 }
 
 #[test]
@@ -132,20 +132,17 @@ fn a_green_document_with_no_gate_or_no_finish_is_refused() {
 fn an_unknown_schema_field_or_garbage_is_refused() {
     let mut d = full();
     d.schema = 2;
-    assert_eq!(
-        ResultDoc::from_bytes(&d.to_bytes().unwrap()).unwrap_err(),
-        DocError::Schema { found: 2 }
-    );
+    assert!(matches!(
+        ResultDoc::from_bytes(&d.to_bytes().unwrap()),
+        Err(DocError::Schema { found: 2 })
+    ));
     let text = String::from_utf8(full().to_bytes().unwrap()).unwrap();
     let extra = text.replacen("{\n", "{\n  \"surprise\": 1,\n", 1);
     assert!(matches!(
         ResultDoc::from_bytes(extra.as_bytes()),
-        Err(DocError::Malformed(_))
+        Err(DocError::Json(_))
     ));
-    assert!(matches!(
-        ResultDoc::from_bytes(b""),
-        Err(DocError::Malformed(_))
-    ));
+    assert!(matches!(ResultDoc::from_bytes(b""), Err(DocError::Json(_))));
 }
 
 #[test]

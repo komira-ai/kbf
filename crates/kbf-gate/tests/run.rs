@@ -261,6 +261,7 @@ fn a_document_that_will_not_serialise_is_an_error() {
     let nan = GateResult::decide("g", Sample::Value(0.0), Limit::AtMost(f64::NAN), 1, 2);
     let err = run.update(|d| d.gates.push(nan)).unwrap_err();
     assert!(matches!(err, GateError::Doc(_)), "{err}");
+    assert!(err.to_string().contains("not a number"), "{err}");
     drop(run);
 }
 
