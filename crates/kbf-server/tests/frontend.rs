@@ -1209,7 +1209,12 @@ fn state_backup_dir_needs_the_operator_api_and_the_state_store() {
     let store = "--state-store=sqlite:///var/lib/kbf/state.db";
     for args in [
         vec!["frontend", storage, "--state-backup-dir=/x", store],
-        vec!["frontend", storage, "--state-backup-dir=/x", "--api-listen=127.0.0.1:0"],
+        vec![
+            "frontend",
+            storage,
+            "--state-backup-dir=/x",
+            "--api-listen=127.0.0.1:0",
+        ],
     ] {
         let e = frontend::command()
             .try_get_matches_from(args)
@@ -1217,7 +1222,11 @@ fn state_backup_dir_needs_the_operator_api_and_the_state_store() {
         assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
     let e = kbf_server::Args::command()
-        .try_get_matches_from(["kbf-server", "--state-backup-dir=/x", "--api-listen=127.0.0.1:0"])
+        .try_get_matches_from([
+            "kbf-server",
+            "--state-backup-dir=/x",
+            "--api-listen=127.0.0.1:0",
+        ])
         .expect_err("no --state-store");
     assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     frontend::command()

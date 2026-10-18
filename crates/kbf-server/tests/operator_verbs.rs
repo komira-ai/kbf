@@ -188,13 +188,7 @@ struct Answer {
     body: String,
 }
 
-async fn request(
-    api: SocketAddr,
-    method: &str,
-    path: &str,
-    headers: &str,
-    body: &str,
-) -> Answer {
+async fn request(api: SocketAddr, method: &str, path: &str, headers: &str, body: &str) -> Answer {
     let mut stream = TcpStream::connect(api).await.expect("connect to the API");
     let length = body.len();
     let request = format!(
@@ -239,7 +233,12 @@ fn names(list: &DeniedList) -> Vec<(&str, &str)> {
 fn files_in(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .expect("read the directory")
-        .map(|e| e.expect("an entry").file_name().to_string_lossy().into_owned())
+        .map(|e| {
+            e.expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
     names.sort();
     names
@@ -261,7 +260,11 @@ async fn the_deny_list_is_read_back_with_every_kind_and_reason() {
     let answer = request(api, "GET", "/v1/denied", OPERATOR, "").await;
     assert_eq!(answer.code, 200, "{}", answer.body);
     assert_eq!(answer.body, r#"{"denied":[]}"#);
-    assert!(answer.head.contains("cache-control: no-store"), "{}", answer.head);
+    assert!(
+        answer.head.contains("cache-control: no-store"),
+        "{}",
+        answer.head
+    );
     assert!(answer.head.contains("application/json"), "{}", answer.head);
 
     deny(api, "node Mac-07", "retired").await;
@@ -320,7 +323,11 @@ async fn both_routes_pass_the_write_gate() {
             ("no content type", no_type, 415),
         ] {
             let answer = request(api, method, path, headers, "").await;
-            assert_eq!(answer.code, want, "{method} {path} with {what}: {}", answer.body);
+            assert_eq!(
+                answer.code, want,
+                "{method} {path} with {what}: {}",
+                answer.body
+            );
             assert!(
                 !answer.body.contains("denied\":["),
                 "{method} {path} with {what} listed: {}",
@@ -328,12 +335,20 @@ async fn both_routes_pass_the_write_gate() {
             );
         }
     }
-    assert_eq!(files_in(&dir), Vec::<String>::new(), "a refused backup wrote");
+    assert_eq!(
+        files_in(&dir),
+        Vec::<String>::new(),
+        "a refused backup wrote"
+    );
 
     let off = serve_routes(None, Some(live_members()), Some(backup)).await;
     for (method, path) in [("GET", "/v1/denied"), ("POST", "/v1/backups/state")] {
         let answer = request(off, method, path, OPERATOR, "").await;
-        assert_eq!(answer.code, 403, "{method} {path} with writes off: {}", answer.body);
+        assert_eq!(
+            answer.code, 403,
+            "{method} {path} with writes off: {}",
+            answer.body
+        );
     }
 }
 
@@ -383,14 +398,24 @@ async fn a_backup_is_a_readable_state_file_with_the_rows_before_it() {
 
     let answer = request(api, "POST", "/v1/backups/state", OPERATOR, "").await;
     assert_eq!(answer.code, 200, "{}", answer.body);
-    assert!(answer.head.contains("cache-control: no-store"), "{}", answer.head);
+    assert!(
+        answer.head.contains("cache-control: no-store"),
+        "{}",
+        answer.head
+    );
     let made: StateBackupMade = serde_json::from_str(&answer.body).expect("a backup answer");
     let path = PathBuf::from(&made.path);
     assert_eq!(path.parent(), Some(server.dir.as_path()), "{made:?}");
     let name = path.file_name().and_then(|n| n.to_str()).expect("a name");
-    assert!(name.starts_with("state-") && name.ends_with(".db"), "{name}");
+    assert!(
+        name.starts_with("state-") && name.ends_with(".db"),
+        "{name}"
+    );
     assert_eq!(files_in(&server.dir), [name], "only the backup is left");
-    let mode = std::fs::metadata(&path).expect("the backup").permissions().mode();
+    let mode = std::fs::metadata(&path)
+        .expect("the backup")
+        .permissions()
+        .mode();
     assert_eq!(mode & 0o777, 0o600, "the backup's mode");
 
     let summary = kbf_state::sqlite::check_backup(&path).expect("a state file");
@@ -449,7 +474,11 @@ async fn a_backup_takes_no_path_from_the_caller() {
         assert_eq!(answer.code, 400, "{body}: {}", answer.body);
     }
     assert_eq!(files_in(&elsewhere), Vec::<String>::new());
-    assert_eq!(files_in(&server.dir), Vec::<String>::new(), "a refused call wrote");
+    assert_eq!(
+        files_in(&server.dir),
+        Vec::<String>::new(),
+        "a refused call wrote"
+    );
 
     let path = format!("/v1/backups/state?path={}&dir=..", target.display());
     let answer = request(server.api, "POST", &path, OPERATOR, "").await;
@@ -500,7 +529,11 @@ async fn a_backup_directory_others_can_enter_is_refused() {
     let server = start_over(db, open.clone());
     let answer = request(server.api, "POST", "/v1/backups/state", OPERATOR, "").await;
     assert_eq!(answer.code, 500, "{}", answer.body);
-    assert_eq!(files_in(&open), Vec::<String>::new(), "written to an open directory");
+    assert_eq!(
+        files_in(&open),
+        Vec::<String>::new(),
+        "written to an open directory"
+    );
     std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o700)).expect("chmod");
     let answer = request(server.api, "POST", "/v1/backups/state", OPERATOR, "").await;
     assert_eq!(answer.code, 200, "{}", answer.body);
@@ -514,5 +547,9 @@ async fn a_backup_directory_others_can_enter_is_refused() {
     let linked = start_over(state, link);
     let answer = request(linked.api, "POST", "/v1/backups/state", OPERATOR, "").await;
     assert_eq!(answer.code, 500, "{}", answer.body);
-    assert_eq!(files_in(&real), Vec::<String>::new(), "written behind a link");
+    assert_eq!(
+        files_in(&real),
+        Vec::<String>::new(),
+        "written behind a link"
+    );
 }

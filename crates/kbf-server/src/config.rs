@@ -804,8 +804,7 @@ impl Args {
     /// The state file and the directory of its copies, when `--state-backup-dir` is given
     /// (the flag requires `--state-store`). The directory is made, 0700, if missing.
     fn state_backup(&self) -> Result<Option<crate::verbs::StateBackup>, ConfigError> {
-        let (Some(dir), Some(store)) = (self.state_backup_dir.as_deref(), &self.state_store)
-        else {
+        let (Some(dir), Some(store)) = (self.state_backup_dir.as_deref(), &self.state_store) else {
             return Ok(None);
         };
         crate::verbs::make_backup_dir(dir).map_err(|source| ConfigError::StateBackupDir {
