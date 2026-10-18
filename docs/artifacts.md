@@ -33,14 +33,14 @@ earlier run: add the labels together, before the run you want to keep. The condi
 
 ## What is built
 
-Eleven tarballs, each with its SBOM and (once the push is attested) its provenance bundle
+Fourteen tarballs, each with its SBOM and (once the push is attested) its provenance bundle
 ([below](#provenance-bundles-verifying-a-tarball-offline)), built by one job per platform:
 
 | Asset | Runner | Target |
 |---|---|---|
-| `kbf-<commit>-darwin-arm64.tar.gz`, `kbf-daemon-<commit>-darwin-arm64.tar.gz`, `kbf-deploy-<commit>-darwin-arm64.tar.gz` | `macos-15` (Apple silicon) | `aarch64-apple-darwin`, `MACOSX_DEPLOYMENT_TARGET=14.0` |
-| `kbf-<commit>-linux-x86_64.tar.gz`, `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
-| `kbf-<commit>-linux-arm64.tar.gz`, `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
+| `kbf-<commit>-darwin-arm64.tar.gz`, `kbf-daemon-<commit>-darwin-arm64.tar.gz`, `kbf-deploy-<commit>-darwin-arm64.tar.gz`, `kbf-installer-<commit>-darwin-arm64.tar.gz` | `macos-15` (Apple silicon) | `aarch64-apple-darwin`, `MACOSX_DEPLOYMENT_TARGET=14.0` |
+| `kbf-<commit>-linux-x86_64.tar.gz`, `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz`, `kbf-installer-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
+| `kbf-<commit>-linux-arm64.tar.gz`, `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz`, `kbf-installer-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
 
 `kbf` is the one binary with all five modes (`kbf --mode=daemon`, `kbf --mode=all-in-one`,
 `kbf --mode=storage`, and the two modes not built yet; [cluster.md](design/cluster.md) sections 1
@@ -48,7 +48,11 @@ and 5.1), the one a host runs. `kbf-daemon` and `kbf-server` are the separate da
 and server binaries. `kbf-deploy` is the deploy tool (its kits are listed in
 [ARCHITECTURE.md](../ARCHITECTURE.md)), shipped so an operator installs the tool the
 same way as the binaries it installs: by digest, from these attested files, not built
-on the operator's machine.
+on the operator's machine. `kbf-installer` is the one root tool that sets a host up and
+updates it ([kbf-installer.md](design/kbf-installer.md)); it is built, signed, attested
+and released like the others, so a package or an operator takes it by digest from these
+files. It is not a component of the release it installs on a host, and it does not
+update itself (the design's section 1).
 
 The set above is pinned: `crates/kbf-it/tests/release_artifacts` fails a pull request
 that drops one of these files from the workflow, packages one that is not listed, or
@@ -81,24 +85,25 @@ sums assemble`), and checks every file against it (`cargo xtask verify-assets su
 every file listed once, each matching, and a copy of the first tarball with one byte
 flipped not matching).
 
-`kbf-server` and `kbf` embed the first 12 characters of the commit they were built
-from (`kbf` through the server library it links), and `--version` prints `<binary>
-<package version>+<commit>` (so do the server's start line and the `server` field of
-`GET /v1/nodes`, [api.md](api.md#get-v1nodes)). Before packaging, each Linux job
+`kbf-server`, `kbf` and `kbf-installer` embed the first 12 characters of the commit they
+were built from (`kbf` through the server library it links), and `--version` prints
+`<binary> <package version>+<commit>` (so do the server's start line and the `server`
+field of `GET /v1/nodes`, [api.md](api.md#get-v1nodes)). Before packaging, each Linux job
 checks that `kbf-server`'s `--version` names `GITHUB_SHA` (`cargo xtask build-commit
-check`), and that `kbf`'s does too and that `kbf --version --json` (below) names the
-same commit and a release build (`build-commit check --json`); the macOS job makes
-the second check on the signed `kbf`, the bytes it packages. Those checks run on the
-binary before it is packaged. After packaging, every job opens the `kbf` tarball it
-wrote and makes the second check again on the binary inside it, with `cargo xtask
-build-commit check-asset <tarball> "$GITHUB_SHA"`: the binary's name and the commit are
-read from the tarball's file name (`<name>-<commit>-<platform>.tar.gz`, and the commit
-must be `GITHUB_SHA`), the tarball must be the one entry `package` writes, and the
-`kbf` extracted from it (to a directory under `target/` that the check removes) must
+check`), and that `kbf`'s and `kbf-installer`'s do too and that `kbf --version --json`
+and `kbf-installer --version --json` (below) name the same commit and a release build
+(`build-commit check --json`); the macOS job makes the second check on the signed `kbf`
+and `kbf-installer`, the bytes it packages. Those checks run on the binary before it is
+packaged. After packaging, every job opens the `kbf` tarball and the `kbf-installer`
+tarball it wrote and makes the second check again on the binary inside each, with `cargo
+xtask build-commit check-asset <tarball> "$GITHUB_SHA"`: the binary's name and the
+commit are read from the tarball's file name (`<name>-<commit>-<platform>.tar.gz`, and
+the commit must be `GITHUB_SHA`), the tarball must be the one entry `package` writes, and
+the binary extracted from it (to a directory under `target/` that the check removes) must
 pass `check --json`. So the bytes that ship, not only the bytes that were built, name
-the commit. `KBF_BUILD_COMMIT_OVERRIDE` replaces the
-commit in a build, for CI tests that need two stamps from one checkout; a build that
-set it here would fail that check.
+the commit. `KBF_BUILD_COMMIT_OVERRIDE` replaces the commit in a `kbf-server` build (and
+so in `kbf`), for CI tests that need two stamps from one checkout; a build that set it
+here would fail that check. `kbf-installer` takes its commit from the checkout only.
 
 The Linux binaries link glibc dynamically and need the glibc of Ubuntu 24.04 or
 newer.
@@ -126,6 +131,21 @@ sorted by name.
 `--json` without `--version` is a usage error. The fields are a contract: the test
 `version_json_reports_the_build_identity` (`crates/kbf-cli/tests/binary.rs`) fails when
 one is added, dropped or renamed.
+
+`kbf-installer --version --json` asks the installer the same question (exactly those
+two words, in either order) and answers with three of those fields, which mean what they
+mean above:
+
+```text
+{"commit":"0123456789ab","profile":"release","version":"0.1.0"}
+```
+
+It has no `protocol`, `min_protocol` or `state_schema`: those say what a kbf release
+speaks, which the installer checks of a release before it installs it, not of itself.
+`kbf-installer --version` prints `kbf-installer <package version>+<commit>`, the line
+`build-commit check` reads. The test `version_json_reports_the_build_identity`
+(`crates/kbf-installer/tests/version.rs`) fails when a field is added, dropped or
+renamed.
 
 ## When
 
@@ -178,8 +198,8 @@ gh attestation trusted-root > trusted_root.jsonl      # on a machine with networ
 gh attestation verify <tarball> \
   --bundle <tarball>.sigstore.json \
   --custom-trusted-root trusted_root.jsonl \
-  --repo komira-ai/komira-build-farm \
-  --signer-workflow komira-ai/komira-build-farm/.github/workflows/artifacts.yml \
+  --repo komira-ai/kbf \
+  --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml \
   --cert-oidc-issuer https://token.actions.githubusercontent.com \
   --source-ref refs/heads/main \
   --source-digest <commit> \
@@ -187,6 +207,14 @@ gh attestation verify <tarball> \
   --deny-self-hosted-runners
 ```
 
+- Renamed repository: the repository was `komira-ai/komira-build-farm` before it became
+  `komira-ai/kbf`, and a certificate carries the name at signing time (GitHub redirects
+  the old name for git and the API, not inside a signature). A release attested before the
+  rename verifies only with `--repo komira-ai/komira-build-farm` and
+  `--signer-workflow komira-ai/komira-build-farm/.github/workflows/artifacts.yml`.
+  `gh` offers no repository-id flag, so the name is what is pinned. The installer
+  ([`kbf-installer`](../crates/kbf-installer/src/attest.rs)) tries the new name, then
+  the old, for one release cycle; the old pair is then deleted (`FORMER_REPO`).
 - `--source-digest <commit>`: the commit the host is installing (the one in the
   tarball's name). Without it an attestation made for any commit of the branch that
   built the same bytes would verify; with it the signed commit must be the one asked for.
@@ -316,8 +344,8 @@ verifies with the same command, as its bytes are the attested ones.
 
 ```text
 gh attestation verify kbf-daemon-<commit>-darwin-arm64.tar.gz \
-  --repo komira-ai/komira-build-farm \
-  --signer-workflow komira-ai/komira-build-farm/.github/workflows/artifacts.yml \
+  --repo komira-ai/kbf \
+  --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml \
   --source-ref refs/heads/main \
   --deny-self-hosted-runners
 ```
@@ -344,20 +372,20 @@ fails.
 ## macOS signing: what ad hoc with the hardened runtime gives
 
 `cargo xtask sign-darwin` (crates/xtask/src/darwin.rs) signs each macOS binary the job
-builds (`kbf-daemon`, `kbf` and `kbf-deploy`, one step each) with `codesign --force
+builds (`kbf-daemon`, `kbf`, `kbf-deploy` and `kbf-installer`, one step each) with `codesign --force
 --sign - --options runtime`: an ad-hoc signature (no certificate) with the hardened
 runtime. That works without an Apple Developer account, and the job checks it every
 run: `codesign --verify --strict` passes, the signed binary runs (`<binary> --version`
 exits 0 with no `DYLD_*` variable set, on every runner), the code directory's flags are
 exactly `adhoc,runtime`, the signature carries exactly the entitlements the allow
-list `tools/ci/darwin-entitlements.txt` gives the binary (none for `kbf-daemon`, `kbf`
-or `kbf-deploy`; only the `kbf-vmm` stub gets one, `com.apple.security.virtualization`;
+list `tools/ci/darwin-entitlements.txt` gives the binary (none for `kbf-daemon`, `kbf`,
+`kbf-deploy` or `kbf-installer`; only the `kbf-vmm` stub gets one, `com.apple.security.virtualization`;
 [macos-vm-guests.md](design/macos-vm-guests.md) section 7), and the binary's minimum
 macOS is 14.0. After packaging, `cargo xtask darwin-asset` takes the binary back out
 of its tarball, the bytes that ship (refusing a tarball that is not exactly the one
 entry `package` writes), and checks it again: `codesign --verify --strict`, the flags,
 a run of `--version`, and the entitlements against the list. A step for each of the
-three tarballs does this, and the repository lint (`release_artifacts`) refuses a macOS
+four tarballs does this, and the repository lint (`release_artifacts`) refuses a macOS
 binary that is packaged without its own `sign-darwin` before and `darwin-asset` after.
 
 What it gives:
@@ -396,8 +424,8 @@ What it constrains:
 - **Only Apple-signed libraries load.** The hardened runtime turns on library
   validation, and with no Team ID of its own the binary may load only libraries Apple
   signed. That is fine for a binary that links and loads only system libraries, as
-  `kbf-daemon` does; `kbf` and `kbf-deploy` are signed the same way, and CI does not
-  list the libraries they load. On a Mac with System Integrity Protection on, a library it linked at start-up that
+  `kbf-daemon` does; `kbf`, `kbf-deploy` and `kbf-installer` are signed the same way,
+  and CI does not list the libraries they load. On a Mac with System Integrity Protection on, a library it linked at start-up that
   Apple did not sign would stop it from starting. CI does not show this: the hosted
   runners have SIP off and library validation off (`vm.cs_library_validation` 0), so
   the check above that runs the signed binary would pass with such a library.

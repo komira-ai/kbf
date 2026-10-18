@@ -37,6 +37,8 @@ x509-parser = { workspace = true, features = ["verify"] }
 zeroize.workspace = true
 
 [dev-dependencies]
+# Loopback ports nothing can take (kbf_testkit::port).
+kbf-testkit.workspace = true
 rcgen = { workspace = true, features = ["x509-parser"] }
 time.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
