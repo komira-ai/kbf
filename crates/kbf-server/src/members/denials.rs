@@ -1,8 +1,7 @@
-//! The deny list as the operator reads it: every entry with its reason and time, and the
-//! check that this frontend can still write (`GET /v1/denied`, `POST /v1/backups/state`).
+//! The deny list as the operator reads it: every entry with its reason and time
+//! (`GET /v1/denied`).
 
 use kbf_map::DenyEntry;
-use kbf_state::Txn;
 use prost::Message as _;
 
 use super::{DENY, DenyRow, Members, MembershipError, denied_entry};
@@ -45,19 +44,5 @@ impl Members {
                 at_ms: row.at_ms,
             })
             .collect())
-    }
-
-    /// Whether this handle can still write: a transaction that changes nothing, which a
-    /// store handle that another writer has fenced out refuses ([`kbf_state::Fenced`]
-    /// judges every transaction, an empty one included).
-    ///
-    /// # Errors
-    /// [`MembershipError::Store`], [`kbf_state::StoreError::Fenced`] among them, when it
-    /// cannot.
-    pub fn check_writer(&self) -> Result<(), MembershipError> {
-        self.store
-            .txn(Txn::new())?
-            .map(drop)
-            .map_err(|_| MembershipError::Contended)
     }
 }

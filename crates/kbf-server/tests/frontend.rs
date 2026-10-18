@@ -1198,48 +1198,6 @@ fn releases_dir_needs_the_operator_api() {
         .expect("parses");
 }
 
-/// Catches `--state-backup-dir` accepted where a backup cannot be taken or asked for: the
-/// route is on the operator API and copies the `--state-store` file, so the flag needs both
-/// `--api-listen` and `--state-store`, on `kbf frontend` and on `kbf-server`.
-///
-/// Mutant seen red: `requires_all` cut to one of the two flags.
-#[test]
-fn state_backup_dir_needs_the_operator_api_and_the_state_store() {
-    let storage = "--storage=http://127.0.0.1:1";
-    let store = "--state-store=sqlite:///var/lib/kbf/state.db";
-    for args in [
-        vec!["frontend", storage, "--state-backup-dir=/x", store],
-        vec![
-            "frontend",
-            storage,
-            "--state-backup-dir=/x",
-            "--api-listen=127.0.0.1:0",
-        ],
-    ] {
-        let e = frontend::command()
-            .try_get_matches_from(args)
-            .expect_err("a flag short");
-        assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument);
-    }
-    let e = kbf_server::Args::command()
-        .try_get_matches_from([
-            "kbf-server",
-            "--state-backup-dir=/x",
-            "--api-listen=127.0.0.1:0",
-        ])
-        .expect_err("no --state-store");
-    assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument);
-    frontend::command()
-        .try_get_matches_from([
-            "frontend",
-            storage,
-            "--state-backup-dir=/x",
-            "--api-listen=127.0.0.1:0",
-            store,
-        ])
-        .expect("parses");
-}
-
 /// Catches a frontend that takes `--releases-dir` and does not mount the release store: a
 /// tarball put on its operator API with the token comes back through `ReleaseService.Fetch`
 /// on its worker listener, and a put without the token is refused.

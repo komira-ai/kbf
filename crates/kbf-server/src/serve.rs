@@ -160,9 +160,6 @@ pub struct Api {
     /// The release store (`--releases-dir`), whose upload route is mounted here and whose
     /// `ReleaseService` the worker listener serves. `None`: the update endpoints answer 503.
     pub releases: Option<Arc<crate::release::ReleaseStore>>,
-    /// The state file and the directory `POST /v1/backups/state` copies it into
-    /// (`--state-store` with `--state-backup-dir`). `None`: that route answers 404.
-    pub state_backup: Option<crate::verbs::StateBackup>,
 }
 
 /// Why the server could not start or stopped.
@@ -678,16 +675,9 @@ where
     let reapi_incoming = Incoming::new(reapi_incoming, listeners.reapi_tls);
     let worker_incoming = Incoming::new(worker_incoming, worker_tls);
     let probe_timeout = listeners.store_probe_timeout;
-    let (api_listen, token, local, releases, state_backup) =
-        api.map_or((None, None, None, None, None), |api| {
-            (
-                Some(api.listen),
-                api.token,
-                api.local_cache,
-                api.releases,
-                api.state_backup,
-            )
-        });
+    let (api_listen, token, local, releases) = api.map_or((None, None, None, None), |api| {
+        (Some(api.listen), api.token, api.local_cache, api.releases)
+    });
     // One line: a `?` alone on its own line is a never-taken error region, a missed
     // line in the coverage ratchet (it counts lines per generic copy, best copy wins).
     let api_listener = api_listen.map(|l| bind_api(l, &binder)).transpose()?;
@@ -718,11 +708,7 @@ where
         // A server with no frontend role has no enrollment.
         None,
     )
-    .merge(crate::verbs::routes(
-        token.clone(),
-        members.clone(),
-        state_backup,
-    ))
+    .merge(crate::verbs::routes(token.clone(), members.clone()))
     .merge(crate::release::router(releases.clone(), token))
     .merge(health_routes)
     .merge(crate::metrics::router(

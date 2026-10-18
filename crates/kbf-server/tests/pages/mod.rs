@@ -89,7 +89,6 @@ impl Server {
             token: None,
             local_cache: None,
             releases: None,
-            state_backup: None,
         };
         let bound = bind_server_with_state(
             Arc::clone(&cache),

@@ -262,8 +262,8 @@ now (the map the nodes hold lags the rows by up to a beat, and holds no reasons)
 the store clock's milliseconds, Unix time on a running frontend. The list is empty
 (`{"denied": []}`) when nothing is denied. It passes the same gates as a write, the `GET`
 included, so the reasons reach only an operator, and its answer is `Cache-Control: no-store`.
-Like the other reads of the store it is not fenced: a frontend that another writer has
-taken over still answers, from the same rows. `404` on a server without a state store.
+It assumes no single writer: every frontend over the store answers from the same rows, a
+frontend that is not the newest included. `404` on a server without a state store.
 
 `DELETE /v1/denied?entry=<entry>` takes the entry off (percent-encode it, or use `+` for the
 space): `200` with the same answer, `404` if it is not listed, `400` with no `entry` or one
@@ -304,34 +304,6 @@ storage node that predates the list ignores it, and the checks at `Register` and
 are the frontend's, so a denied storage node can still register and beat through a frontend
 that predates them. A frontend that predates the list copies it forward in the map
 unchanged.
-
-## `POST /v1/backups/state`
-
-A checked copy of the frontend's state file (`--state-store`), taken while the frontend
-runs. It is SQLite's `VACUUM INTO` on a connection of its own: one read transaction, so the
-copy is one committed state and the frontend's writes go on (they are not blocked, and the
-call holds no store lock; the copy reads the whole file, so on a large file it takes time
-and disk reads, and the call answers when it is done). The call runs off the async threads,
-and a second call while one runs makes a second copy.
-
-The request takes no body, or `{}`. It names no path: the copy is written in the directory
-`--state-backup-dir` names, as `state-<UTC time>-<n>.db`, a name the server chooses, so a
-caller cannot place a file anywhere else. Any field in the body is `400`, and a query string
-is ignored. The directory is made at start, mode 0700. A directory that exists with a wider
-mode, that another user owns or that is a symbolic link is refused with `500` and nothing is
-written. The file is made mode 0600, and holds the scheduler's state and the deny list:
-treat it like the state file. Nothing prunes the directory; the operator does.
-
-The answer is `{"path": "/var/backups/kbf/state-20261018T120000Z-1.db", "epoch": E, "head": H, "keys": K}`:
-the path on the frontend's host, and what the copy holds, as its own check read it
-(single file, the state schema, `PRAGMA integrity_check` ok). The copy is not restored by
-any route: a restore needs the frontend stopped and stays a local verb (`kbf-deploy host
-state-restore`).
-
-Gates as for every write (`404` without `--state-backup-dir`, behind the gates). `409` when
-this frontend no longer holds the state store's writer role (another frontend took it): a
-deposed frontend does not copy; call the current one. `503` when the store or the copy
-fails; the failed copy is removed.
 
 ## `GET /v1/frontend/drain` and `POST /v1/frontend/drain`
 
