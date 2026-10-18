@@ -1,11 +1,13 @@
-//! The inbox entry: a directory the unprivileged `kbf` process writes and the root stage
-//! reads, so everything in it is an attacker's until it is checked.
+//! The order spool: a directory the unprivileged `kbf` process writes and the root helper
+//! reads, so everything in it is an attacker's until it is checked. (The inbox of release
+//! tarballs this module once opened is gone: no release bytes pass through `kbf`.)
 //!
 //! [`Entry::open`] opens the entry directory without following a link; every file beneath
 //! it is opened by name, relative to that open directory, with `O_NOFOLLOW` (and, on
 //! Linux, `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`,
-//! which refuses a link in any component). A name is a single path component (the offer's
-//! file names are checked before they get here), so that is every component.
+//! which refuses a link in any component). A name is a single path component (a record's
+//! name is the pair of numbers it holds, checked before it gets here), so that is every
+//! component.
 //!
 //! The file is then judged by its open descriptor, never by a path stated before:
 //! a symbolic link (ELOOP), a FIFO, socket, device or directory (not a regular file), a
@@ -65,6 +67,17 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// An entry over an open file, which is no directory: every listing of it fails. For
+    /// tests of what the caller does when the descriptor cannot be read.
+    #[cfg(test)]
+    pub(crate) fn over_file(file: &Path) -> Entry {
+        Entry {
+            dir: OwnedFd::from(File::open(file).expect("opens")),
+            mode: OpenMode::Beneath,
+            name: "not-a-directory".to_owned(),
+        }
+    }
+
     /// Open `entry_dir`, which must be a directory and not a link.
     pub fn open(entry_dir: &Path) -> Result<Entry, Refusal> {
         let name = entry_dir.display().to_string();
@@ -118,6 +131,32 @@ impl Entry {
             }
         }
         Ok(names)
+    }
+
+    /// Up to `max` of the entry's names, without `.` and `..`, and whether there were more.
+    /// Unlike [`names`](Self::names) a crowded directory is not refused: the caller decides
+    /// what to do with the excess.
+    pub fn names_up_to(&self, max: usize) -> Result<(Vec<String>, bool), Refusal> {
+        let refuse = |fault| Refusal::Inbox {
+            name: self.name.clone(),
+            fault,
+        };
+        let dir = Dir::read_from(&self.dir)
+            .map_err(unreadable)
+            .map_err(&refuse)?;
+        let mut names = Vec::new();
+        for item in dir {
+            let item = item.map_err(unreadable).map_err(&refuse)?;
+            let name = item.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            if names.len() == max {
+                return Ok((names, true));
+            }
+            names.push(String::from_utf8_lossy(name).into_owned());
+        }
+        Ok((names, false))
     }
 
     /// The directory `name` inside this entry, opened relative to it without following a
@@ -293,5 +332,5 @@ pub fn read_capped(from: &mut File, cap: u64, name: &str) -> Result<Vec<u8>, Ref
 }
 
 #[cfg(test)]
-#[path = "inbox_tests.rs"]
+#[path = "spool_tests.rs"]
 mod tests;

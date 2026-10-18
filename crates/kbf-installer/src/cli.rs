@@ -125,9 +125,12 @@ pub struct ActivationArgs {
 
 #[derive(Args)]
 pub struct RunArgs {
-    /// Root's directory: status.json goes here; `inbox/` (the service user's) is beneath it.
-    #[arg(long, default_value = "/var/lib/kbf-updater", value_parser = kbf_host::HostPath::new)]
+    /// Root's directory: status.json goes here. Root-owned, mode 0755, so the node can read it.
+    #[arg(long, default_value = "/var/lib/kbf-installer", value_parser = kbf_host::HostPath::new)]
     pub update_dir: kbf_host::HostPath,
+    /// The order spool: owned by the service user, mode 0700, inside a root-owned parent.
+    #[arg(long, default_value = "/var/lib/kbf-installer/orders", value_parser = kbf_host::HostPath::new)]
+    pub orders_dir: kbf_host::HostPath,
     /// The systemd unit to restart after a swap (Linux).
     #[arg(
         long,

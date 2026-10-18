@@ -187,6 +187,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "data-max-bytes",
             "driver",
             "image",
+            "orders-dir",
             "reconnect-max-ms",
             "reconnect-ms",
             "reserve-cpus",
