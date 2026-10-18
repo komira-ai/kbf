@@ -1,5 +1,6 @@
 //! The secret files on disk: the mode check, the refusals, the sweep.
 
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::Mutex;
 
@@ -131,10 +132,14 @@ fn the_sweep_removes_only_unreferenced_versions_and_temp_files() {
     ] {
         std::fs::write(dir.join(foreign), "x").unwrap();
     }
+    // A name that is not UTF-8 is not ours, even if it starts like a temp file's.
+    let odd = std::ffi::OsStr::from_bytes(b".tmp-\xff");
+    std::fs::write(dir.join(odd), "x").unwrap();
     assert_eq!(reg.sweep().unwrap(), 3);
     assert_eq!(
         listing(&dir),
         [
+            ".tmp-\u{fffd}",
             "Cold.0000000000000001.json",
             "a.b.0000000000000001.json",
             "cold.0000000000000001.json",

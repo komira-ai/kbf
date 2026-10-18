@@ -503,6 +503,32 @@ fn rows_under_odd_keys_or_codes_are_corrupt_not_skipped() {
     }
 }
 
+// Catches a rebind over a binding row the registry cannot read, or one that names a
+// connection that is not a name: each is reported as a corrupt bind row, not skipped or
+// taken for "no binding yet".
+#[test]
+fn a_rebind_over_an_unreadable_binding_row_is_corrupt() {
+    for planted in [
+        vec![0xff, 0xff, 0xff],
+        rows::BindRow {
+            connection: "Not A Name".into(),
+            bucket: "b".into(),
+            prefix: String::new(),
+            updated_generation: 1,
+        }
+        .encode_to_vec(),
+    ] {
+        let store = as_store(&fake());
+        let reg = open(&store, &scratch("rebind-corrupt").join("s"));
+        reg.put_connection(&name("cold"), &put("s")).unwrap();
+        plant(&store, "objstore/bind/cold", planted);
+        let err = reg
+            .put_binding(BindingRole::Cold, &bind("cold", "b"))
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::Corrupt("bind")), "{err}");
+    }
+}
+
 // Catches the audit codes drifting: each action and outcome must survive the row.
 #[test]
 fn every_audit_code_round_trips() {

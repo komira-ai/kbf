@@ -185,6 +185,36 @@ fn an_unchanged_write_also_loses_a_race() {
     assert_eq!(seqs, [2, 1]);
 }
 
+// Catches a lost race that removes the file a change KEPT: a change of the region alone
+// writes no file, so when it loses, the live version (still named by the row the winner
+// wrote) must stay.
+#[test]
+fn a_change_that_keeps_the_secret_and_loses_a_race_leaves_the_live_file() {
+    let store = as_store(&fake());
+    let dir = scratch("race-keep").join("s");
+    let loser = open(&store, &dir);
+    loser.put_connection(&name("cold"), &put("kept")).unwrap();
+    let winner = Arc::new(open_now(Arc::clone(&store), &dir, Counting::from(100)).unwrap());
+    let racer = Arc::clone(&winner);
+    loser.set_failpoint(move |at| {
+        if at == Step::CommitRow {
+            let mut other = put("kept");
+            other.region = Some("eu-2".to_owned());
+            racer.put_connection(&name("cold"), &other).unwrap();
+        }
+    });
+    let mut mine = put("kept");
+    mine.region = Some("eu-1".to_owned());
+    let err = loser.put_connection(&name("cold"), &mine).unwrap_err();
+    assert!(matches!(err, RegistryError::Conflict), "{err}");
+    assert_eq!(listing(&dir), ["cold.0000000000000001.json"]);
+    assert_eq!(winner.secret(&name("cold")).unwrap().expose(), "kept");
+    assert_eq!(
+        winner.connection(&name("cold")).unwrap().unwrap().region,
+        "eu-2"
+    );
+}
+
 /// A small deterministic generator (xorshift64*), so a failing seed replays.
 struct Rng(u64);
 
