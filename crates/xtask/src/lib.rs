@@ -132,8 +132,8 @@ enum Verb {
         /// How the download is packed (default: it is the file).
         #[arg(long, value_enum)]
         extract: Option<fetch::Format>,
-        /// The file to take out of a tar (`--extract tar.gz` or `tar.xz`): its path
-        /// inside the archive.
+        /// The file to take out of a tar or zip (`--extract tar.gz`, `tar.xz` or `zip`): its
+        /// path inside the archive.
         #[arg(long)]
         member: Option<PathBuf>,
     },
