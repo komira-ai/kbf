@@ -242,6 +242,9 @@ mod fake {
         } else {
             1
         };
+        // Real crun makes `.cache` in its root beside the container's state: not a
+        // container.
+        std::fs::create_dir_all(lease.join("crun").join(".cache")).expect("crun's cache");
         for i in 0..containers {
             std::fs::create_dir_all(lease.join("crun").join(format!("{name}-{i}")))
                 .expect("a container's state");

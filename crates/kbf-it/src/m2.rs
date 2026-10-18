@@ -674,6 +674,8 @@ impl Cell {
                 let state = self.leases.join(lease).join("crun");
                 names(&state, "")
                     .into_iter()
+                    // crun's own `.cache` in its root is not a container.
+                    .filter(|container| !container.starts_with('.'))
                     .map(move |container| format!("{lease}/{container}"))
             })
             .collect()
