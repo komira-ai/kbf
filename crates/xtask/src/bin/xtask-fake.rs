@@ -281,10 +281,9 @@ fn verify_bundle(dir: &Path, sha256: &str, file: &str, bundle: &str, rest: &[Str
             flags.push(word);
         }
     }
-    let Ok(text) = std::fs::read_to_string(bundle) else {
-        eprintln!("xtask-fake: no bundle at {bundle}");
-        return ExitCode::FAILURE;
-    };
+    // A missing bundle reads as empty: no attestation in it verifies, so the call fails
+    // below with the same "does not verify" message.
+    let text = std::fs::read_to_string(bundle).unwrap_or_default();
     let attestations: Vec<String> = serde_json::from_str::<serde_json::Value>(&text)
         .ok()
         .and_then(|v| {

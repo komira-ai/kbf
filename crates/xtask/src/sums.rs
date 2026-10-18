@@ -392,11 +392,8 @@ impl Attestations<'_> {
         if verified {
             return Ok(());
         }
-        let tail = said
-            .char_indices()
-            .rev()
-            .nth(999)
-            .map_or(said.as_str(), |(at, _)| &said[at..]);
+        let start = said.char_indices().rev().nth(999).unwrap_or((0, ' ')).0;
+        let tail = &said[start..];
         Err(Error::Failed(format!(
             "{}: its bundle {bundle_name} does not verify: {tail}",
             file.display()
