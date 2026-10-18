@@ -604,3 +604,143 @@ async fn the_writes_say_which_half_is_missing() {
         "{body}"
     );
 }
+
+/// Catches a compare-and-set that is a read and then a write: twelve operators click the same
+/// stale generation at once, on a multi-thread runtime through the real listener, and exactly
+/// one is `200`; the others are `409`. Six rounds, each from the generation the last left. The
+/// sequential tests cannot see a check and a write that are not one conditional write.
+///
+/// Mutant seen red: the row written with `Cond::Any` (several clicks win in a round).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_clicks_on_one_generation_have_one_winner() {
+    let dir = Dir::new();
+    let store =
+        Arc::new(ReleaseStore::open(&dir.0.join("releases"), Limits::default()).expect("open"));
+    let running = Arc::new(start(Some(store), Some(state()), &dir));
+    let (clicks, rounds) = (12usize, 6usize);
+    let mut generation = 0u64;
+    for round in 0..rounds {
+        let commits: Vec<String> = (0..clicks)
+            .map(|i| format!("{:040x}", 0x1000 + round * 100 + i))
+            .collect();
+        for commit in &commits {
+            put(&running, commit, true).await;
+        }
+        let mut tasks = Vec::new();
+        for commit in commits {
+            let api = running.api;
+            tasks.push(tokio::spawn(async move {
+                let body = json!({ "commit": commit, "expect_generation": generation }).to_string();
+                http(
+                    api,
+                    "POST",
+                    "/v1/update/desired",
+                    true,
+                    Some("application/json"),
+                    body.as_bytes(),
+                )
+                .await
+            }));
+        }
+        let (mut won, mut stale) = (0, 0);
+        for task in tasks {
+            match task.await.expect("a click").0 {
+                200 => won += 1,
+                409 => stale += 1,
+                other => panic!("round {round}: status {other}"),
+            }
+        }
+        assert_eq!((won, stale), (1, clicks - 1), "round {round}");
+        let (_, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
+        let now = view["desired"]["generation"]
+            .as_u64()
+            .expect("a generation");
+        assert!(now > generation, "round {round}: {now} after {generation}");
+        generation = now;
+    }
+}
+
+/// Catches a pause that needs a release or a run, one an offer undoes, and a resume that
+/// cannot undo it: a server with only a state store pauses, shows `paused` with no desired
+/// release, keeps it across the first offer (and the offer needs a release store, so it is
+/// `503` here), and pause and resume are repeatable.
+#[tokio::test]
+async fn pause_needs_only_the_state_store_and_is_repeatable() {
+    let dir = Dir::new();
+    let running = start(None, Some(state()), &dir);
+    let write = |verb: &'static str| {
+        let api = running.api;
+        async move {
+            http(api, "POST", &format!("/v1/update/{verb}"), true, None, b"")
+                .await
+                .0
+        }
+    };
+    assert_eq!(write("pause").await, 200);
+    assert_eq!(write("pause").await, 200);
+    let (code, _) = http(running.api, "GET", "/v1/update", false, None, b"").await;
+    assert_eq!(code, 503, "the view needs the release store");
+    assert_eq!(offer(&running, A).await.0, 503);
+    assert_eq!(write("resume").await, 200);
+    assert_eq!(write("resume").await, 200);
+
+    let dir = Dir::new();
+    let store =
+        Arc::new(ReleaseStore::open(&dir.0.join("releases"), Limits::default()).expect("open"));
+    let running = start(Some(store), Some(state()), &dir);
+    let (code, _) = http(running.api, "POST", "/v1/update/pause", true, None, b"").await;
+    assert_eq!(code, 200);
+    let (_, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
+    assert_eq!(
+        (view["desired"].clone(), view["paused"].clone()),
+        (Value::Null, json!(true))
+    );
+    put(&running, A, true).await;
+    assert_eq!(offer(&running, A).await.1["generation"], 1);
+    let (_, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
+    assert_eq!(view["paused"], true, "an offer leaves the pause");
+}
+
+/// Catches a pause that overwrites a policy written between its read and its write (the
+/// operator's `max_hosts_out` lost), and writers that race for ever answered as a failure
+/// with no hint. The policy is written right after `set_paused` read the row: the pause
+/// retries on the new version and both changes stand. With every write to the row
+/// conflicting, a pause is `503` with `Retry-After`.
+///
+/// Mutant seen red: `set_paused` written with `Cond::Any` (the policy comes back default).
+#[tokio::test]
+async fn a_pause_does_not_lose_a_policy_written_under_it() {
+    let dir = Dir::new();
+    let store =
+        Arc::new(ReleaseStore::open(&dir.0.join("releases"), Limits::default()).expect("open"));
+    let hooked = hooked::Hooked::new();
+    let running = start(Some(store), Some(state_over(hooked.clone())), &dir);
+    let rows = kbf_server::update::Rows::new(hooked.clone());
+    let policy = kbf_server::update::Policy {
+        max_hosts_out: 3,
+        ..kbf_server::update::Policy::default()
+    };
+    let writer = rows.clone();
+    hooked.after_get("update/policy", move || {
+        writer.set_policy(&policy).expect("the other writer");
+    });
+    rows.set_paused(true).expect("the pause");
+    let held = rows.policy().expect("read");
+    assert_eq!((held.paused, held.max_hosts_out), (true, 3));
+
+    hooked.conflict_on(Some("update/policy"));
+    let mut stream = TcpStream::connect(running.api).await.expect("connect");
+    let request = format!(
+        "POST /v1/update/pause HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\
+         Authorization: Bearer {TOKEN}\r\nContent-Length: 0\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.expect("write");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.expect("read");
+    let text = String::from_utf8_lossy(&raw).to_lowercase();
+    assert!(text.starts_with("http/1.1 503"), "{text}");
+    assert!(text.contains("retry-after: 1"), "{text}");
+    hooked.conflict_on(None);
+    let (code, _) = http(running.api, "POST", "/v1/update/pause", true, None, b"").await;
+    assert_eq!(code, 200);
+}
