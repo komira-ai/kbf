@@ -63,11 +63,12 @@ impl Store for Flaky {
             }
         }
         let read = self.inner.get(key)?;
-        if key.starts_with("lease/") && self.touch_lease.load(Ordering::SeqCst) {
-            if let Some(row) = &read {
-                let same = Txn::new().put(key, row.value.clone(), Cond::Any);
-                let _ = self.inner.txn(same)?;
-            }
+        if key.starts_with("lease/")
+            && self.touch_lease.load(Ordering::SeqCst)
+            && let Some(row) = &read
+        {
+            let same = Txn::new().put(key, row.value.clone(), Cond::Any);
+            let _ = self.inner.txn(same)?;
         }
         Ok(read)
     }
