@@ -419,8 +419,8 @@ impl Rig {
     /// `kbf-deploy host install` leaves them (the binary and `units/`), the state and the
     /// helper's memory as the deployed builds wrote them, and the daemon, the
     /// storage-and-daemon and the helper units, all running.
-    pub fn testfarm_linux() -> Rig {
-        let rig = Rig::bare("testfarm-linux", Platform::Linux);
+    pub fn testfarm_linux(name: &str) -> Rig {
+        let rig = Rig::bare(&format!("testfarm-linux-{name}"), Platform::Linux);
         rig.farm_releases("kbf");
         for (name, text) in [
             ("kbf-daemon.service", FARM_DAEMON_UNIT),

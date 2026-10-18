@@ -41,13 +41,25 @@ pub fn read(layout: &Layout, roots: &Roots, rules: &Rules) -> Result<Option<Old>
         None => State::default(),
     };
     let memory = match memory {
-        Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| MigrateError::Corrupt {
-            file: "helper.json",
-            why: e.to_string(),
-        })?,
+        Some(bytes) => parse_memory(&bytes)?,
         None => Memory::default(),
     };
     Ok(Some(Old { state, memory }))
+}
+
+/// `helper.json` as the deployed helpers wrote it. The helper of `feature/pull-updates` also
+/// kept `handled_entry`, the newest inbox entry it looked at; there is no inbox now and
+/// nothing reads it, so it is dropped before the strict parse. Every other key this
+/// build does not know is still refused.
+fn parse_memory(bytes: &[u8]) -> Result<Memory, MigrateError> {
+    let corrupt = |why: String| MigrateError::Corrupt {
+        file: "helper.json",
+        why,
+    };
+    let mut object: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(bytes).map_err(|e| corrupt(e.to_string()))?;
+    object.remove("handled_entry");
+    serde_json::from_value(serde_json::Value::Object(object)).map_err(|e| corrupt(e.to_string()))
 }
 
 /// The old tree, open: the directory of `releases/`.

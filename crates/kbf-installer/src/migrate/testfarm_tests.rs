@@ -110,7 +110,7 @@ fn assert_starts(rig: &Rig, command: &[String], commit: &str, args: &[String]) {
 /// old tree touched; the units started before the links moved.
 #[test]
 fn a_linux_test_farm_host_migrates_and_its_node_starts() {
-    let mut rig = Rig::testfarm_linux();
+    let mut rig = Rig::testfarm_linux("migrate");
     let old_tree = rig.snapshot("usr/local/kbf");
     let old_state = rig.snapshot("var/lib/kbf-deploy");
     let units = ["kbf-daemon.service", "kbf-storage-and-daemon.service"];
@@ -166,20 +166,19 @@ fn a_linux_test_farm_host_migrates_and_its_node_starts() {
     assert!(state_now.remove("MIGRATED").is_some());
     assert_eq!(state_now, old_state);
 
-    // Services: the three that ran were stopped before any link existed and the two units
-    // run again after, from the new tree; the old helper stays off.
+    // Services: the three that ran were stopped before any link existed, and the two units
+    // run again after everything was written, from the new tree; the old helper stays off.
     let events = rig.events.borrow().clone();
-    let first_start = events
-        .iter()
-        .position(|e| e.starts_with("start "))
-        .expect("started");
-    assert!(
-        events[..first_start]
-            .iter()
-            .all(|e| e.ends_with("links=false")),
-        "{events:?}"
-    );
-    assert!(events[first_start..].iter().all(|e| e.ends_with("links=true")), "{events:?}");
+    let off: Vec<usize> = (0..events.len())
+        .filter(|&i| events[i].starts_with("stop ") || events[i].starts_with("disable "))
+        .collect();
+    let on: Vec<usize> = (0..events.len())
+        .filter(|&i| events[i].starts_with("start "))
+        .collect();
+    assert_eq!((off.len(), on.len()), (4, 2), "{events:?}");
+    assert!(off.iter().all(|&i| events[i].ends_with("links=false")), "{events:?}");
+    assert!(on.iter().all(|&i| events[i].ends_with("links=true")), "{events:?}");
+    assert!(off.iter().max() < on.iter().min(), "{events:?}");
     let active = rig.active.borrow().clone();
     assert!(active.contains("kbf-daemon.service") && active.contains("kbf-storage-and-daemon.service"));
     assert!(!active.contains("kbf-helper.service"), "{active:?}");
@@ -190,7 +189,7 @@ fn a_linux_test_farm_host_migrates_and_its_node_starts() {
 /// arguments, as it did before.
 #[test]
 fn a_rolled_back_test_farm_host_starts_its_node_from_the_old_tree() {
-    let mut rig = Rig::testfarm_linux();
+    let mut rig = Rig::testfarm_linux("rollback");
     let units = ["kbf-daemon.service", "kbf-storage-and-daemon.service"];
     migrate_farm(&mut rig, &units, Mode::Apply);
     let mut m = rig.migration();

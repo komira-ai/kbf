@@ -284,6 +284,21 @@ fn damaged_files_stop_the_run_naming_the_file() {
         "{error}"
     );
 
+    // The one key the deployed helper wrote that this build dropped is forgiven, and only
+    // that one: beside another unknown key, or in a file that is no object, it still stops.
+    for (name, text) in [
+        ("memory-extra", "{\"handled_entry\": \"2-x\", \"nope\": 1}"),
+        ("memory-array", "[1]"),
+    ] {
+        let mut rig = Rig::linux(name);
+        put(&rig.at("var/lib/kbf-deploy/helper.json"), text, 0o600);
+        let error = refused(&mut rig);
+        assert!(
+            matches!(error, MigrateError::Corrupt { file: "helper.json", .. }),
+            "{name}: {error}"
+        );
+    }
+
     let mut rig = Rig::linux("old-state-bad");
     put(
         &rig.at("var/lib/kbf-deploy/state.json"),
