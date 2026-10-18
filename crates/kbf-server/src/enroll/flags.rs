@@ -49,6 +49,10 @@ pub struct EnrollFlags {
     pub allow_unenforced_deny: bool,
     /// What every node is told about the farm.
     pub settings: NodeSettings,
+    /// Test seam, not a flag (the flag's minimum is an hour): how often the listener's own
+    /// certificate is replaced; `None` is half its life.
+    #[doc(hidden)]
+    pub renew_every: Option<std::time::Duration>,
 }
 
 fn flag(id: &'static str, long: &'static str, value: &'static str, help: &'static str) -> Arg {
@@ -233,6 +237,7 @@ pub fn from_matches(m: &ArgMatches) -> Result<Option<EnrollFlags>, String> {
                 .get_one::<u16>(STORAGE_PORT)
                 .map_or(0, |port| u32::from(*port)),
         },
+        renew_every: None,
     }))
 }
 

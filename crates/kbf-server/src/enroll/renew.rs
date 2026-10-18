@@ -21,7 +21,13 @@
 //! A storage node's certificate names its advertise host as at enrollment; the host is
 //! read from the registry row before the transaction. (A re-enrollment that changed it
 //! changed the keys too, so a renewal that passes the key check cannot meet a different
-//! host.)
+//! host.) The host is judged again, against the frontend names and refusals of **this**
+//! process, as the signing step of the transaction (so only a caller who proved the node's
+//! key can learn the verdict): a node enrolled before a `--frontend-name` was added, whose
+//! host is now a name the frontend serves, is refused
+//! [`RefusalReason::AdvertiseInvalid`] and no certificate is issued. The node client
+//! matches that reason by code and message and does not retry it
+//! (`RefusalCode::InvalidArgument`); the operator re-enrolls the node on another host.
 
 use kbf_ca::parse_csr;
 use kbf_enroll_registry::{self as registry, RenewCsr, list_nodes};
@@ -30,7 +36,8 @@ use kbf_types::{NodeId, RefusalReason, Role};
 use sha2::{Digest as _, Sha256};
 
 use super::service::{
-    CONFIG_GENERATION, EnrollService, certs_of, csrs_of, registry_reason, renew_after,
+    CONFIG_GENERATION, EnrollService, advertise_refused, certs_of, csrs_of, registry_reason,
+    renew_after,
 };
 
 impl EnrollService {
@@ -66,6 +73,16 @@ impl EnrollService {
         }
         let advertise = advertise_of(self, &node_id)?;
         let mut sign = || {
+            // The frontend names and the refusals are the current ones: a node enrolled
+            // before a `--frontend-name` was added must not keep a certificate naming it.
+            // This runs inside the transaction, after the key was proved, so a caller
+            // without the node's key learns nothing about the stored host.
+            if advertise.as_deref().is_some_and(|host| {
+                keys.iter().any(|(role, _)| *role == Role::Storage)
+                    && advertise_refused(host, &core.frontend_names)
+            }) {
+                return Err(RefusalReason::AdvertiseInvalid);
+            }
             keys.iter()
                 .map(|(role, key)| {
                     let named = advertise.as_deref().filter(|_| *role == Role::Storage);

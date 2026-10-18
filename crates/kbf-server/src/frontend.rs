@@ -547,6 +547,7 @@ pub struct FrontendHandle {
     pub api: Option<SocketAddr>,
     /// Where the enroll listener is, if there is one.
     pub enroll: Option<SocketAddr>,
+    enroll_tls: Option<kbf_tls::TlsSource>,
     drain: Arc<Drain>,
     /// Completes on the second stop signal; [`FrontendHandle::serve`] then closes the
     /// drain ([`Drain::close`]).
@@ -566,6 +567,14 @@ impl FrontendHandle {
     #[must_use]
     pub fn drain(&self) -> Arc<Drain> {
         Arc::clone(&self.drain)
+    }
+
+    /// The enroll listener's TLS configuration, if there is a listener: its
+    /// `reloads().applied` counts the certificates the frontend's renewal task has put in
+    /// place (what a test observes to see that the task runs).
+    #[must_use]
+    pub fn enroll_tls(&self) -> Option<kbf_tls::TlsSource> {
+        self.enroll_tls.clone()
     }
 
     /// The line the frontend prints once it is bound:
@@ -905,12 +914,17 @@ impl<'a> Prepared<'a> {
                 prepared.serve(store)
             })
             .transpose()?;
-        let (enroll_api, enroll_serve, enroll_renewal) = match enrolled {
+        let (enroll_api, enroll_serve, enroll_renewal, enroll_tls) = match enrolled {
             Some(serving) => {
                 drain.begins().closes(serving.latch);
-                (Some(serving.api), serving.listener, Some(serving.renewal))
+                (
+                    Some(serving.api),
+                    serving.listener,
+                    Some(serving.renewal),
+                    Some(serving.tls),
+                )
             }
-            None => (None, futures::future::pending().boxed(), None),
+            None => (None, futures::future::pending().boxed(), None, None),
         };
         let api_routes = crate::api::router(
             Arc::clone(&farm),
@@ -1108,6 +1122,7 @@ impl<'a> Prepared<'a> {
             worker: worker_addr,
             api: api_addr,
             enroll: enroll_addr,
+            enroll_tls,
             drain,
             escalation: None,
             start_line: start_line(
