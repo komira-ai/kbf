@@ -175,3 +175,44 @@ async fn a_new_stream_while_draining_says_draining_and_resends_the_result() {
     next.ack_result(Some((1, 1)), true);
     assert!(h.exited(PROMPT).await);
 }
+
+/// Catches a daemon that takes a closed signal channel for a signal: with no sender
+/// left, nothing asks it to stop, so it runs on (a test harness dropping its sender, or
+/// a forwarder that ended, must not drain or stop the node).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_signal_channel_is_no_signal() {
+    let runtime = Arc::new(FakeRuntime::new(RUN));
+    let (mut h, signal) = Harness::with_drain("drain-closed", runtime, LONG).await;
+    let _peer = h.welcomed().await;
+    drop(signal);
+    assert!(!h.exited(QUIET).await, "the daemon stopped with no signal");
+}
+
+/// Catches a drain that overwrites a phase the runtime reports: a node quarantined (or
+/// switching a session) keeps saying so while it drains, since the server reads that
+/// phase to keep or fence its lease. Draining replaces serving only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draining_keeps_a_phase_the_runtime_reports() {
+    let (phase_tx, phase_rx) =
+        tokio::sync::watch::channel(kbf_types::NodePhase::Quarantined("scan dirty".to_owned()));
+    let runtime = Arc::new(FakeRuntime::new(LONG));
+    let (mut h, signal) =
+        Harness::with_drain_phase("drain-phase", runtime, LONG, Some(phase_rx)).await;
+    let mut peer = h.session().await;
+    let first = peer.hello().await;
+    peer.welcome();
+    peer.start(1, 1, "action");
+    h.started(1).await;
+    signal.send(()).expect("daemon runs");
+    assert!(
+        hello_again(&mut peer, QUIET).await.is_none(),
+        "the phase is unchanged: no new Hello"
+    );
+    assert_eq!(
+        first.phase.expect("a phase").phase,
+        Phase::Quarantined as i32
+    );
+    drop(phase_tx);
+    signal.send(()).expect("daemon runs");
+    assert!(h.exited(PROMPT).await);
+}

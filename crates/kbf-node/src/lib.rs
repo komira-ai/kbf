@@ -1984,3 +1984,46 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod signal_tests {
+    use std::time::Duration;
+
+    use tokio::signal::unix::{SignalKind, signal};
+
+    use super::forward;
+
+    fn raise(signal: libc::c_int) {
+        // SAFETY: raise(3) on this process, whose handler for `signal` the test installed.
+        assert_eq!(unsafe { libc::raise(signal) }, 0);
+    }
+
+    /// Catches a forwarder that drops a signal (the daemon would never drain), one that
+    /// reads SIGINT differently from SIGTERM, and one that outlives its receiver (a task
+    /// per stopped daemon): each SIGTERM and SIGINT is one `()`, and the task ends once
+    /// nobody listens.
+    #[tokio::test]
+    async fn each_sigterm_and_sigint_is_one_signal_and_the_task_ends_with_its_receiver() {
+        let term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        let int = signal(SignalKind::interrupt()).expect("SIGINT handler");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(forward(term, int, tx));
+        let within = Duration::from_secs(10);
+        raise(libc::SIGTERM);
+        tokio::time::timeout(within, rx.recv())
+            .await
+            .expect("SIGTERM forwarded")
+            .expect("open");
+        raise(libc::SIGINT);
+        tokio::time::timeout(within, rx.recv())
+            .await
+            .expect("SIGINT forwarded")
+            .expect("open");
+        drop(rx);
+        raise(libc::SIGTERM);
+        tokio::time::timeout(within, task)
+            .await
+            .expect("the forwarder ends")
+            .expect("no panic");
+    }
+}

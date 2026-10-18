@@ -804,6 +804,16 @@ impl<R: Runtime> Harness<R> {
         runtime: Arc<R>,
         deadline: Duration,
     ) -> (Self, mpsc::UnboundedSender<()>) {
+        Self::with_drain_phase(name, runtime, deadline, None).await
+    }
+
+    /// [`Harness::with_drain`], whose runtime reports the phase `phase` holds.
+    pub async fn with_drain_phase(
+        name: &str,
+        runtime: Arc<R>,
+        deadline: Duration,
+        phase: Option<tokio::sync::watch::Receiver<kbf_types::NodePhase>>,
+    ) -> (Self, mpsc::UnboundedSender<()>) {
         let (signals_tx, signals) = mpsc::unbounded_channel();
         let runtimes = Runtimes::new(Arc::clone(&runtime));
         let configure = |config: &mut DaemonConfig| {
@@ -817,7 +827,7 @@ impl<R: Runtime> Harness<R> {
             configure,
             None,
             None,
-            None,
+            phase,
             None,
             None,
             None,
