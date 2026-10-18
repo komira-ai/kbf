@@ -42,6 +42,12 @@ pub struct Cfg {
     /// The `kbf_reapi` cluster's hosts come from this file (EDS, `path_config_source`),
     /// so a host can be added to a running Envoy; `backends` is then ignored.
     pub eds: Option<PathBuf>,
+    /// Listener `enable_reuse_port` on every listener (`None` = Envoy's default).
+    pub reuse_port: Option<bool>,
+    /// Listener `traffic_direction` (`INBOUND`/`OUTBOUND`) on every listener.
+    pub direction: Option<&'static str>,
+    /// HCM `drain_timeout` (`None` = Envoy's 5 s).
+    pub hcm_drain: Option<&'static str>,
 }
 
 impl Cfg {
@@ -60,6 +66,9 @@ impl Cfg {
             tcp: Vec::new(),
             tcp_backends: Vec::new(),
             eds: None,
+            reuse_port: None,
+            direction: None,
+            hcm_drain: None,
         }
     }
 
@@ -157,6 +166,9 @@ impl Cfg {
         if let Some(t) = self.hcm_idle {
             hcm["stream_idle_timeout"] = t.into();
         }
+        if let Some(t) = self.hcm_drain {
+            hcm["drain_timeout"] = t.into();
+        }
         let addr = |p: u16| json!({"socket_address": {"address": "127.0.0.1", "port_value": p}});
         let mut listeners = vec![json!({
             "name": "reapi", "address": addr(self.http_port),
@@ -174,6 +186,14 @@ impl Cfg {
             }));
             clusters.push(self.cluster(name, false, *close));
         }
+        for l in &mut listeners {
+            if let Some(r) = self.reuse_port {
+                l["enable_reuse_port"] = r.into();
+            }
+            if let Some(d) = self.direction {
+                l["traffic_direction"] = d.into();
+            }
+        }
         json!({
             "node": {"id": "spike", "cluster": "spike"},
             "admin": {"address": addr(self.admin)},
@@ -189,6 +209,7 @@ impl Cfg {
 /// A running Envoy; a task owns the child and records when and how it exits.
 pub struct Envoy {
     pub admin: u16,
+    pub pid: Option<u32>,
     pub log: PathBuf,
     /// (seconds since the spike started, exit status) once the process is gone.
     pub exited: Arc<Mutex<Option<(f64, String)>>>,
@@ -202,6 +223,8 @@ pub struct Flags {
     pub epoch: u32,
     pub parent_shutdown_s: Option<u32>,
     pub drain_s: Option<u32>,
+    /// `--drain-strategy` (`gradual` or `immediate`).
+    pub drain_strategy: Option<&'static str>,
 }
 
 impl Envoy {
@@ -223,6 +246,9 @@ impl Envoy {
         if let Some(d) = f.drain_s {
             cmd.args(["--drain-time-s", &d.to_string()]);
         }
+        if let Some(d) = f.drain_strategy {
+            cmd.args(["--drain-strategy", d]);
+        }
         let out = std::fs::File::create(log).expect("log");
         let mut child = cmd
             .stdin(Stdio::null())
@@ -231,6 +257,7 @@ impl Envoy {
             .kill_on_drop(true)
             .spawn()
             .expect("spawn envoy");
+        let pid = child.id();
         let exited = Arc::new(Mutex::new(None));
         let (kill, killed) = tokio::sync::oneshot::channel::<()>();
         let slot = Arc::clone(&exited);
@@ -241,12 +268,19 @@ impl Envoy {
             };
             *slot.lock().expect("lock") = Some((crate::now(), status));
         });
-        Envoy { admin, log: log.to_owned(), exited, kill: Some(kill) }
+        Envoy { admin, pid, log: log.to_owned(), exited, kill: Some(kill) }
     }
 
     /// When and how the process exited, if it has.
     pub fn exit(&self) -> Option<(f64, String)> {
         self.exited.lock().expect("lock").clone()
+    }
+
+    /// SIGTERM, Envoy's own shutdown (what a service manager sends on stop).
+    pub async fn term(&self) {
+        if let Some(pid) = self.pid {
+            let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status().await;
+        }
     }
 
     /// Kills the process.
@@ -271,6 +305,15 @@ impl Envoy {
 
 /// `GET path` on 127.0.0.1:`port`: (status, body), or `None` when it cannot connect.
 pub async fn http_get(port: u16, path: &str) -> Option<(u16, String)> {
+    http_req("GET", port, path).await
+}
+
+/// `POST path` on 127.0.0.1:`port`.
+pub async fn http_post(port: u16, path: &str) -> Option<(u16, String)> {
+    http_req("POST", port, path).await
+}
+
+async fn http_req(method: &str, port: u16, path: &str) -> Option<(u16, String)> {
     let mut s = tokio::time::timeout(
         Duration::from_secs(2),
         tokio::net::TcpStream::connect(("127.0.0.1", port)),
@@ -278,7 +321,7 @@ pub async fn http_get(port: u16, path: &str) -> Option<(u16, String)> {
     .await
     .ok()?
     .ok()?;
-    s.write_all(format!("GET {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n").as_bytes()).await.ok()?;
+    s.write_all(format!("{method} {path} HTTP/1.1\r\nhost: x\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes()).await.ok()?;
     let mut buf = Vec::new();
     tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut buf)).await.ok()?.ok()?;
     let text = String::from_utf8_lossy(&buf).into_owned();
@@ -372,4 +415,12 @@ pub fn write_eds(path: &Path, cluster: &str, ports: &[u16], version: u32) {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, serde_json::to_vec(&doc).expect("json")).expect("write");
     std::fs::rename(&tmp, path).expect("rename");
+}
+
+/// One counter or gauge from the admin `/stats`, by exact name.
+pub async fn stat(admin: u16, name: &str) -> Option<u64> {
+    let (200, body) = http_get(admin, &format!("/stats?filter=^{}$", name.replace('.', "\\."))).await? else {
+        return None;
+    };
+    body.lines().find_map(|l| l.strip_prefix(&format!("{name}: "))?.trim().parse().ok())
 }

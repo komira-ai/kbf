@@ -37,14 +37,14 @@ pub struct Stub {
     pub lists: AtomicU64,
     /// `Watch` calls accepted.
     pub watches: AtomicU64,
-    end: watch::Sender<u64>,
+    /// One end-signal per `Watch` request `service` name ("" for a default request).
+    ends: std::sync::Mutex<HashMap<String, watch::Sender<u64>>>,
     task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Stub {
     /// Starts a stub on `port`.
     pub fn start(id: &str, port: u16) -> Arc<Stub> {
-        let (end, _) = watch::channel(0);
         let stub = Arc::new(Stub {
             id: id.to_owned(),
             port,
@@ -56,7 +56,7 @@ impl Stub {
             checks: AtomicU64::new(0),
             lists: AtomicU64::new(0),
             watches: AtomicU64::new(0),
-            end,
+            ends: std::sync::Mutex::new(HashMap::new()),
             task: std::sync::Mutex::new(None),
         });
         let service = HealthServer::new(Svc(Arc::clone(&stub)));
@@ -77,7 +77,17 @@ impl Stub {
 
     /// Ends every open `Watch` cleanly (OK trailers).
     pub fn end_watches(&self) {
-        self.end.send_modify(|n| *n += 1);
+        self.end_service("");
+    }
+
+    /// Ends every open `Watch` whose request named `service`, cleanly.
+    pub fn end_service(&self, service: &str) {
+        self.sender(service).send_modify(|n| *n += 1);
+    }
+
+    fn sender(&self, service: &str) -> watch::Sender<u64> {
+        let mut m = self.ends.lock().expect("lock");
+        m.entry(service.to_owned()).or_insert_with(|| watch::channel(0).0).clone()
     }
 
     /// Stops the listener (open connections stay until the process exits).
@@ -146,12 +156,13 @@ impl Health for Svc {
 
     async fn watch(
         &self,
-        _: Request<HealthCheckRequest>,
+        req: Request<HealthCheckRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
         let stub = Arc::clone(&self.0);
+        let service = req.into_inner().service;
         stub.watches.fetch_add(1, Ordering::SeqCst);
         stub.open.fetch_add(1, Ordering::SeqCst);
-        let mut end = stub.end.subscribe();
+        let mut end = stub.sender(&service).subscribe();
         end.mark_unchanged();
         let state = (false, end, Guard { stub, ended: false });
         let stream = futures::stream::unfold(state, |(sent, mut end, mut guard)| async move {

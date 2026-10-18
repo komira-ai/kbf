@@ -15,6 +15,10 @@ name = "spike-envoy"
 path = "src/bin/spike-envoy.rs"
 
 [[bin]]
+name = "spike-upgrade"
+path = "src/bin/spike-upgrade.rs"
+
+[[bin]]
 name = "spike-switch"
 path = "src/bin/spike-switch.rs"
 
