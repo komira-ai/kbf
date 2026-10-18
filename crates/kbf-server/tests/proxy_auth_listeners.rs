@@ -701,18 +701,43 @@ async fn the_binary_serves_behind_the_proxy_when_given_the_flag() {
 }
 
 /// Catches: a secret file others can read accepted at start (the server must exit 2 saying
-/// which flag, which file and which mode).
+/// which flag, which file and which mode, and promptly: one that starts instead is killed
+/// and fails the test rather than hanging it).
 ///
 /// Mutant seen red: `owner_only` accepting 0644.
 #[test]
 fn the_binary_refuses_a_readable_secret_file() {
+    use std::io::Read as _;
     let open = file(&SECRET, 0o644);
     let open = open.to_str().expect("UTF-8");
-    let output = binary("open", &["--proxy-auth-file", open])
-        .output()
-        .expect("run kbf-server");
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut command = binary("open", &["--proxy-auth-file", open]);
+    let mut child = Running(
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn kbf-server"),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().expect("try_wait") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "kbf-server is still running 10 s after it should have refused to start"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut stderr = String::new();
+    child
+        .0
+        .stderr
+        .take()
+        .expect("stderr")
+        .read_to_string(&mut stderr)
+        .expect("UTF-8 stderr");
+    assert_eq!(status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("--proxy-auth-file: "), "{stderr}");
     assert!(stderr.contains(open) && stderr.contains("0644"), "{stderr}");
 }
