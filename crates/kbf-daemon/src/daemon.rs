@@ -75,6 +75,7 @@ use std::time::Duration;
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use kbf_proto::google::rpc::Code;
+use kbf_proto::kbf::map::v1 as wire;
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{
     self, DaemonMessage, Heartbeat, Hello, Phase, ServerMessage, daemon_message, server_message,
@@ -83,7 +84,7 @@ use kbf_proto::worker::{
 use kbf_types::{LeaseId, NodePhase};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, timeout};
-use tonic::transport::{ClientTlsConfig, Endpoint};
+use tonic::transport::Endpoint;
 
 use crate::clock::{Clock, SystemClock};
 use crate::config::{ConfigError, DaemonConfig};
@@ -93,11 +94,13 @@ use crate::connect::{
 };
 use crate::contact::Contact;
 use crate::lease::{Done, Leases, failure, lease_id, proto_lease_id};
+use crate::map::{MapLink, map_asked};
 use crate::phases::LeasePhases;
 use crate::pressure;
 use crate::report::NodeReport;
 use crate::runtimes::Runtimes;
 use crate::status::{DriverReport, Software};
+use crate::update_link::UpdateLink;
 use crate::window::StartWindow;
 
 /// The `kbf.worker.v1` protocol version this daemon speaks.
@@ -150,6 +153,8 @@ pub enum Event {
 pub enum SessionError {
     #[error("connect: {0}")]
     Connect(#[from] tonic::transport::Error),
+    #[error("client identity: {0}")]
+    Identity(#[from] ConfigError),
     #[error("connect: no connection within {0:?}")]
     ConnectTimeout(Duration),
     #[error("stream: {0}")]
@@ -189,8 +194,6 @@ pub struct Daemon {
     config: DaemonConfig,
     /// The `--server` URLs, parsed.
     servers: Vec<Server>,
-    /// The client TLS every connection uses, before its server name is set.
-    tls: ClientTlsConfig,
     /// How server names become addresses, asked again every round.
     resolver: Arc<dyn Resolve>,
     /// Whether the current (or the last) stream got its Welcome.
@@ -216,6 +219,11 @@ pub struct Daemon {
     /// Hello carries `phase_now`, or [`NodePhase::MemoryPressure`] in its place while
     /// the node is serving and the backstop has paused it.
     pressure: Option<Backstop>,
+    /// Where the storage map of `Welcome` and `MapUpdate` goes, if the daemon routes by
+    /// one; see [`Self::with_map`].
+    map: Option<MapLink>,
+    /// The update client; see [`Self::with_update`].
+    update: UpdateLink,
     events: Option<mpsc::UnboundedSender<Event>>,
     leases: Leases,
     done: mpsc::UnboundedReceiver<Done>,
@@ -264,6 +272,8 @@ enum Wake {
     Driver,
     Phase,
     Pressure,
+    MapAsked,
+    Update,
 }
 
 impl Daemon {
@@ -290,13 +300,15 @@ impl Daemon {
         if servers.is_empty() {
             return Err(ConfigError::NoServer);
         }
-        let tls = config.tls.load()?;
+        // Read once here so that unreadable files fail the start; every connection reads
+        // them again (`endpoint`), so a certificate renewed while the daemon runs is the
+        // one the next connection presents.
+        config.tls.load()?;
         let (done_tx, done) = mpsc::unbounded_channel();
         let contact = Contact::new(config.fence_after);
         Ok(Self {
             config,
             servers,
-            tls,
             resolver: Arc::new(SystemResolver),
             welcomed: false,
             base: report.clone(),
@@ -308,6 +320,8 @@ impl Daemon {
             phase: None,
             phase_now: NodePhase::Serving,
             pressure: None,
+            map: None,
+            update: UpdateLink::off(),
             events: None,
             leases: Leases::new(runtimes, done_tx),
             done,
@@ -320,6 +334,33 @@ impl Daemon {
             instance: instance_id(),
             predecessor: String::new(),
         })
+    }
+
+    /// Puts the storage map the server sends (in `Welcome`, and in each `MapUpdate`) in
+    /// `holder`, which keeps the newest and never goes back, and asks the server for a
+    /// map when the holder is waiting for a generation it does not have
+    /// ([`kbf_mapsync::MapHolder::reach`]). Without one the daemon ignores the map.
+    #[must_use]
+    pub fn with_map(mut self, holder: Arc<kbf_mapsync::MapHolder>) -> Self {
+        self.map = Some(MapLink::new(holder));
+        self
+    }
+
+    /// Lets the update client settle its gate; when it changed, the frontend is told in a
+    /// new `Hello`. A method of its own, not lines in the session loop: the loop is one
+    /// function in every test binary and the ratchet counts the best of those binaries.
+    fn settle_update(&mut self, tx: &UnboundedSender<DaemonMessage>) {
+        if self.update.settle(tx) {
+            send(tx, daemon_message::Message::Hello(self.hello()));
+        }
+    }
+
+    /// Hands the frontend's update offers and orders to `update`, reports its status, and
+    /// takes no lease while it holds the update gate. Without one the daemon reports nothing.
+    #[must_use]
+    pub fn with_update(mut self, update: UpdateLink) -> Self {
+        self.update = update;
+        self
     }
 
     /// This daemon process's instance id (`Hello.instance_id`), drawn when it was built.
@@ -414,6 +455,9 @@ impl Daemon {
     /// The phase every Hello carries: the runtime's, or memory pressure in place of
     /// serving while the backstop has the node paused.
     fn phase(&self) -> NodePhase {
+        if let Some(why) = self.update.gate() {
+            return NodePhase::Quarantined(why);
+        }
         match &self.pressure {
             Some(backstop) if backstop.paused && self.phase_now == NodePhase::Serving => {
                 NodePhase::MemoryPressure
@@ -548,9 +592,12 @@ impl Daemon {
 
     /// The endpoint for one attempt: `target`'s address, with the URL's host as the
     /// HTTP/2 authority and, unless `--tls-server-name` names another, as the name the
-    /// server's certificate must carry; with the configured HTTP/2 keepalive.
+    /// server's certificate must carry; with the configured HTTP/2 keepalive. The
+    /// client identity is read from its files for each attempt: a node's certificate is
+    /// replaced every few days, and a connection made after that must present the new one
+    /// (a stream already up keeps the certificate it was made with).
     fn endpoint(&self, target: &Target) -> Result<Endpoint, SessionError> {
-        let mut tls = self.tls.clone();
+        let mut tls = self.config.tls.load()?;
         if self.config.tls.server_name.is_none() {
             tls = tls.domain_name(target.server.host.clone());
         }
@@ -590,7 +637,7 @@ impl Daemon {
             .offline(timeout(wait, inbound.message()))
             .await
             .map_err(|_| SessionError::WelcomeTimeout(wait))??;
-        let (interval, epoch) = self.welcome(first)?;
+        let (interval, epoch, map) = self.welcome(first)?;
         self.welcomed = true;
         self.contact.new_stream(interval);
         self.window.new_stream(hello_sent);
@@ -600,6 +647,8 @@ impl Daemon {
         self.recheck();
         // Before any Result is resent or any Start of this stream is read.
         self.new_epoch(epoch);
+        self.new_map_stream(map);
+        self.update.new_stream(epoch.unwrap_or(0), &tx);
         if self.contact.confirm(hello_sent) {
             self.emit(Event::ContactRestored);
         }
@@ -633,6 +682,8 @@ impl Daemon {
                 Some(()) = driver_changed(self.driver.as_mut()) => Wake::Driver,
                 Some(()) = phase_changed(self.phase.as_mut()) => Wake::Phase,
                 Some(()) = pressure_changed(self.pressure.as_mut()) => Wake::Pressure,
+                () = map_asked(self.map.as_mut()) => Wake::MapAsked,
+                Some(()) = self.update.changed() => Wake::Update,
             };
             // First, whatever woke the loop: the clock may have jumped over a suspend.
             self.recheck();
@@ -670,13 +721,35 @@ impl Daemon {
                         send(&tx, daemon_message::Message::Hello(self.hello()));
                     }
                 }
-                Wake::Pressure => {}
+                // The request for a map is sent below, whatever woke the loop.
+                Wake::Pressure | Wake::MapAsked | Wake::Update => {}
             }
+            self.ask_map(&tx);
+            self.settle_update(&tx);
             // Whatever woke the loop, leases may have started or ended.
             if self.take_pressure() {
                 tracing::info!(phase = self.phase().name(), "node phase changed");
                 send(&tx, daemon_message::Message::Hello(self.hello()));
             }
+        }
+    }
+
+    /// Takes the map a `Welcome` carried, the first of a new stream: the generation the
+    /// holder waits for is asked for again on this stream, by [`Self::ask_map`]. These are
+    /// methods rather than code in [`Self::session`] so that none of it is conditional
+    /// there (the session is compiled once for each test binary, and the coverage tool
+    /// counts the lines of the copy that covers most).
+    fn new_map_stream(&mut self, map: Option<wire::Map>) {
+        if let Some(link) = self.map.as_mut() {
+            link.new_stream();
+            link.take(map);
+        }
+    }
+
+    /// Sends the `MapRequest` for a generation the holder waits for, once on a stream.
+    fn ask_map(&mut self, tx: &UnboundedSender<DaemonMessage>) {
+        if let Some(request) = self.map.as_mut().and_then(MapLink::request) {
+            send(tx, daemon_message::Message::MapRequest(request));
         }
     }
 
@@ -692,12 +765,12 @@ impl Daemon {
         Ok(())
     }
 
-    /// Checks the first server message is an acceptable Welcome; returns its interval
-    /// and the lease epoch it names (`None` for 0).
+    /// Checks the first server message is an acceptable Welcome; returns its interval,
+    /// the lease epoch it names (`None` for 0) and the storage map it carries.
     fn welcome(
         &self,
         first: Option<ServerMessage>,
-    ) -> Result<(Duration, Option<u64>), SessionError> {
+    ) -> Result<(Duration, Option<u64>, Option<wire::Map>), SessionError> {
         let Some(server_message::Message::Welcome(w)) = first.and_then(|m| m.message) else {
             return Err(SessionError::Protocol(
                 "the first server message is not Welcome".into(),
@@ -717,7 +790,7 @@ impl Daemon {
                 self.contact.fence_after()
             )));
         }
-        Ok((interval, (w.epoch != 0).then_some(w.epoch)))
+        Ok((interval, (w.epoch != 0).then_some(w.epoch), w.map))
     }
 
     /// Takes the lease epoch a Welcome named. When it names one, every lease granted
@@ -801,6 +874,15 @@ impl Daemon {
             Some(server_message::Message::Welcome(_)) => {
                 tracing::warn!("a second Welcome on one stream ignored");
             }
+            Some(server_message::Message::MapUpdate(update)) => {
+                if let Some(link) = &self.map {
+                    link.take(update.map);
+                }
+            }
+            Some(server_message::Message::UpdateOffer(offer)) => self.update.offer(offer),
+            Some(server_message::Message::UpdateOrder(order)) => {
+                self.update.order(order, &self.leases, &self.unacked);
+            }
             None => tracing::warn!("an empty server message ignored"),
         }
     }
@@ -838,6 +920,10 @@ impl Daemon {
                     "contact with the server is lost; not starting",
                 )
             })
+        } else if let Some(why) = self.update.gate() {
+            start
+                .lease_id
+                .map(|id| failure(lease_id(id), Code::Unavailable, why))
         } else {
             self.leases.start(start)
         };
@@ -1025,7 +1111,7 @@ fn wire_phase(phase: &NodePhase) -> Option<worker::NodePhase> {
 
 /// Queues a message on the stream. A message for a stream that is gone is dropped: a
 /// Result stays in the daemon's unacknowledged set and is resent on the next stream.
-fn send(tx: &UnboundedSender<DaemonMessage>, message: daemon_message::Message) {
+pub(crate) fn send(tx: &UnboundedSender<DaemonMessage>, message: daemon_message::Message) {
     let _ = tx.unbounded_send(DaemonMessage {
         message: Some(message),
     });
@@ -1049,9 +1135,7 @@ mod tests {
     /// that repeats the wrapped error.
     #[tokio::test]
     async fn a_connect_error_names_its_cause() {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = closed.local_addr().expect("addr").port();
-        drop(closed);
+        let port = kbf_testkit::port::dead_addr().port();
         let endpoint = Endpoint::from_shared(format!("http://127.0.0.1:{port}")).expect("url");
         let error = SessionError::from(endpoint.connect().await.expect_err("nothing listens"));
         let text = error.with_causes();

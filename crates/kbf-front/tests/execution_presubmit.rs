@@ -1,7 +1,7 @@
 //! What an Execute does before its first stream item is measured and, when it is slow,
 //! logged: the time from the handler's start to the first `QUEUED` operation, split into
 //! the input-tree walk and the scheduler's submit, with the number of directories read
-//! (issue komira-ai/komira-build-farm#666). On the A8 cold build about 500 Executes
+//! (issue komira-ai/kbf#666). On the A8 cold build about 500 Executes
 //! stayed in this window for minutes while 40 of 88 slots were idle, and nothing in
 //! kbf's metrics or logs said so.
 //!
@@ -107,7 +107,7 @@ impl Dispatch for Queue {
     }
 }
 
-type Service = ExecutionService<MemoryMetaLog, Store, Queue>;
+type Service = ExecutionService<Queue>;
 
 struct Rig {
     cache: Arc<Cache<MemoryMetaLog, Store>>,

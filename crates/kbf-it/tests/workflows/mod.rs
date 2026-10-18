@@ -15,11 +15,11 @@
 //!   so each is refused because the lint cannot tell where it lands;
 //! - a job's `permissions` grants anything but `read` or `none`, except the two scopes
 //!   that sign build provenance ([`SIGNING_SCOPES`]: `id-token` and `attestations`),
-//!   which may be `write` only in a job whose `if:` is exactly [`MAIN_PUSH_ONLY`], and
+//!   which may be `write` only in a job whose `if:` is exactly [`SIGNING_PUSH_ONLY`], and
 //!   `contents` ([`RELEASE_SCOPES`]), which may be `write` only in a job whose `if:` is
 //!   exactly [`RELEASE_TAG_PUSH_ONLY`]. So no pull request or merge-queue run holds a
 //!   token that can sign an attestation, every attestation this repository signs names
-//!   `refs/heads/main`, and only a pushed `v*` tag runs a job that can create a release
+//!   `refs/heads/main` or `refs/heads/feature/arch-v2`, and only a pushed `v*` tag runs a job that can create a release
 //!   (or push to the repository);
 //! - a job calls a reusable workflow that is not one of this repository's linted
 //!   workflow files (its runners are not in a file this lint read);
@@ -74,6 +74,8 @@
 //! and action files before it merges. This lint keeps those files from asking for
 //! anything else, so that review has less to catch.
 
+#[cfg(test)]
+mod stages;
 mod yaml;
 
 use yaml::{Node, Value};
@@ -132,13 +134,15 @@ const ALLOWED_OWNERS: &[&str] = &["actions"];
 /// Further `owner/repository` actions the repository's Actions policy allows.
 const ALLOWED_REPOSITORIES: &[&str] = &["tailscale/github-action"];
 
-/// Token scopes a job may set to `write` when it runs only for a push to `main`: the
-/// OIDC token and the attestations API, which together sign build provenance.
+/// Token scopes a job may set to `write` when it runs only for a push to `main` or to
+/// `feature/arch-v2`: the OIDC token and the attestations API, which together sign
+/// build provenance.
 const SIGNING_SCOPES: &[&str] = &["id-token", "attestations"];
 
-/// The one `if:` spelling under which a job may hold [`SIGNING_SCOPES`] for writing.
-const MAIN_PUSH_ONLY: &str =
-    "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}";
+/// The one `if:` spelling under which a job may hold [`SIGNING_SCOPES`] for writing: a
+/// push, to `main` or to the development branch. No pull request or merge-queue run
+/// satisfies it, and every attestation signed under it names one of those two refs.
+const SIGNING_PUSH_ONLY: &str = "${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}";
 
 /// Token scopes a job may set to `write` when it runs only for a pushed release tag:
 /// the repository's contents, which creating a release and uploading its assets need.
@@ -163,17 +167,19 @@ pub fn scan_action(text: &str, repo: &Repo) -> Vec<String> {
     run(text, repo, |lint, root| lint.action(root))
 }
 
-/// One step of a job, as far as the step lints read it: its `name:`, its `run:` script
-/// and its `uses:`, each `None` when absent or not a string; its `with:` inputs whose
-/// values are strings, in file order; whether it has an `if:` or a
-/// `continue-on-error:` (either can let the job pass without the step's check); and
-/// its `if:` when that is a string.
+/// One step of a job, as far as the step lints read it: its `id:`, `name:`, its `run:`
+/// script and its `uses:`, each `None` when absent or not a string; its `with:` inputs
+/// and `env:` variables whose values are strings, in file order; whether it has an
+/// `if:` or a `continue-on-error:` (either can let the job pass without the step's
+/// check); and its `if:` when that is a string.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Step {
+    pub id: Option<String>,
     pub name: Option<String>,
     pub run: Option<String>,
     pub uses: Option<String>,
     pub with: Vec<(String, String)>,
+    pub env: Vec<(String, String)>,
     pub conditional: bool,
     pub condition: Option<String>,
 }
@@ -196,26 +202,104 @@ pub fn job_steps(text: &str, job: &str) -> Result<Vec<Step>, String> {
     let Some(Value::Seq(steps)) = get(found, "steps").map(|s| &s.value) else {
         return Err(format!("the job `{job}` has no steps list"));
     };
+    // The entries of the mapping under `key` whose keys and values are strings.
+    let strings = |m: &[(Node, Node)], key: &str| -> Vec<(String, String)> {
+        match get(m, key).map(|w| &w.value) {
+            Some(Value::Map(entries)) => entries
+                .iter()
+                .filter_map(|(k, v)| Some((k.as_str()?.to_owned(), v.as_str()?.to_owned())))
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
     Ok(steps
         .iter()
         .map(|step| match &step.value {
             Value::Map(m) => Step {
+                id: text_of(get(m, "id")),
                 name: text_of(get(m, "name")),
                 run: text_of(get(m, "run")),
                 uses: text_of(get(m, "uses")),
-                with: match get(m, "with").map(|w| &w.value) {
-                    Some(Value::Map(inputs)) => inputs
-                        .iter()
-                        .filter_map(|(k, v)| Some((k.as_str()?.to_owned(), v.as_str()?.to_owned())))
-                        .collect(),
-                    _ => Vec::new(),
-                },
+                with: strings(m, "with"),
+                env: strings(m, "env"),
                 conditional: get(m, "if").is_some() || get(m, "continue-on-error").is_some(),
                 condition: text_of(get(m, "if")),
             },
             _ => Step::default(),
         })
         .collect())
+}
+
+/// The top-level mapping of a workflow text. An error when it does not parse or is
+/// not a mapping.
+fn top_of(root: &Node) -> Result<&[(Node, Node)], String> {
+    match &root.value {
+        Value::Map(top) => Ok(top),
+        _ => Err("the workflow is not a mapping".to_owned()),
+    }
+}
+
+/// The names of the events the workflow's `on:` lists (a string, a list or a mapping),
+/// in order. An error when the text does not parse or has no `on:`.
+pub fn events(text: &str) -> Result<Vec<String>, String> {
+    let root = yaml::load(text)?;
+    let on = get(top_of(&root)?, "on").ok_or("the workflow has no `on:`")?;
+    Ok(match &on.value {
+        Value::Scalar { .. } => on.as_str().map(str::to_owned).into_iter().collect(),
+        Value::Seq(items) => items
+            .iter()
+            .filter_map(|n| n.as_str().map(str::to_owned))
+            .collect(),
+        Value::Map(entries) => entries
+            .iter()
+            .filter_map(|(k, _)| k.as_str().map(str::to_owned))
+            .collect(),
+    })
+}
+
+/// The `branches:` of the workflow's `push` trigger, in order. An error when the text
+/// does not parse, `on:` is not a mapping with a `push` mapping, or that has no
+/// `branches:` list of strings (a push of any branch would run the workflow).
+pub fn push_branches(text: &str) -> Result<Vec<String>, String> {
+    let root = yaml::load(text)?;
+    let on = get(top_of(&root)?, "on").ok_or("the workflow has no `on:`")?;
+    let Value::Map(on) = &on.value else {
+        return Err("`on:` is not a mapping".to_owned());
+    };
+    let Some(Value::Map(push)) = get(on, "push").map(|p| &p.value) else {
+        return Err("`on:` has no `push:` mapping".to_owned());
+    };
+    let Some(Value::Seq(branches)) = get(push, "branches").map(|b| &b.value) else {
+        return Err("`push:` has no `branches:` list".to_owned());
+    };
+    branches
+        .iter()
+        .map(|b| {
+            b.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "a `branches:` entry is not a string".to_owned())
+        })
+        .collect()
+}
+
+/// The job `job`'s own `if:` (its key matched ignoring ASCII case): `None` when it has
+/// none. An error when the text does not parse, has no such job, or the `if:` is not a
+/// string.
+pub fn job_condition(text: &str, job: &str) -> Result<Option<String>, String> {
+    let root = yaml::load(text)?;
+    let Some(Value::Map(jobs)) = get(top_of(&root)?, "jobs").map(|j| &j.value) else {
+        return Err("the workflow has no `jobs` mapping".to_owned());
+    };
+    let Some(Value::Map(found)) = get(jobs, job).map(|j| &j.value) else {
+        return Err(format!("the workflow has no job `{job}`"));
+    };
+    match get(found, "if") {
+        None => Ok(None),
+        Some(c) => c
+            .as_str()
+            .map(|c| Some(c.to_owned()))
+            .ok_or_else(|| format!("the `if:` of job `{job}` is not a string")),
+    }
 }
 
 /// One step with a `run:` script, in a workflow job or an action file's composite
@@ -540,7 +624,7 @@ impl Lint<'_> {
 
     /// A job may narrow its token to `read` or `none` scopes; it may not widen it, but
     /// for [`SIGNING_SCOPES`] set to `write` in a job whose `if:` (`condition`) is
-    /// exactly [`MAIN_PUSH_ONLY`], and [`RELEASE_SCOPES`] set to `write` in one whose
+    /// exactly [`SIGNING_PUSH_ONLY`], and [`RELEASE_SCOPES`] set to `write` in one whose
     /// `if:` is exactly [`RELEASE_TAG_PUSH_ONLY`]. Scope names and levels are compared
     /// exactly, so another spelling is refused (the safe side).
     fn job_permissions(&mut self, p: &Node, condition: Option<&str>) {
@@ -558,7 +642,7 @@ impl Lint<'_> {
                 continue;
             }
             let gate = if SIGNING_SCOPES.contains(&name) {
-                Some(MAIN_PUSH_ONLY)
+                Some(SIGNING_PUSH_ONLY)
             } else if RELEASE_SCOPES.contains(&name) {
                 Some(RELEASE_TAG_PUSH_ONLY)
             } else {

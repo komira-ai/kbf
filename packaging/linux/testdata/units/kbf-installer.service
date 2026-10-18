@@ -1,0 +1,11 @@
+# TEST FIXTURE, not a shipped unit: stands in for the static units of the package until
+# they land (packaging/linux/units). Gated as they are: it cannot start before
+# /etc/kbf/installer.toml exists.
+[Unit]
+Description=kbf-installer package test unit (installer)
+ConditionPathExists=/etc/kbf/installer.toml
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/kbf-installer installer

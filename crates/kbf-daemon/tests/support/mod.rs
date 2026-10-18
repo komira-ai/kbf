@@ -6,7 +6,9 @@
 #![allow(dead_code)] // Each test binary uses its own part of this module.
 
 pub mod cache_kit;
+pub mod farm;
 pub mod memory;
+pub mod storage_node;
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -18,7 +20,7 @@ use std::time::Duration;
 use futures::{Stream, StreamExt};
 use kbf_daemon::{
     Clock, Daemon, DaemonConfig, DriverReport, Event, FakeRuntime, Moment, NodeReport, Runtime,
-    Runtimes, TlsFiles,
+    Runtimes, TlsFiles, UpdateLink,
 };
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{
@@ -29,7 +31,7 @@ use kbf_proto::worker::{
 };
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose,
+    KeyPair, KeyUsagePurpose, SanType,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -54,6 +56,17 @@ pub struct Pki {
 }
 
 impl Pki {
+    /// The same for the server's worker listener (`kbf_server::WorkerTls`).
+    pub fn worker_tls(&self) -> kbf_server::TlsSource {
+        kbf_server::TlsSource::fixed(
+            "worker",
+            self.server_cert.as_bytes(),
+            self.server_key.as_bytes(),
+            Some(self.ca.as_bytes()),
+        )
+        .expect("the worker listener's TLS")
+    }
+
     /// The server half: mutual TLS that requires a client certificate from this CA.
     pub fn server_tls(&self) -> ServerTlsConfig {
         ServerTlsConfig::new()
@@ -109,6 +122,11 @@ pub fn pki(name: &str) -> Pki {
 
     let leaf = |names: Vec<String>, cn: &str, eku: ExtendedKeyUsagePurpose| {
         let mut params = CertificateParams::new(names).expect("leaf params");
+        if eku == ExtendedKeyUsagePurpose::ClientAuth {
+            // The daemon role, as a real server's worker listener requires.
+            let role = "urn:kbf:role:daemon".try_into().expect("an IA5 name");
+            params.subject_alt_names.push(SanType::URI(role));
+        }
         params.distinguished_name.push(DnType::CommonName, cn);
         params.extended_key_usages = vec![eku];
         let key = KeyPair::generate().expect("leaf key");
@@ -186,7 +204,88 @@ impl Peer {
             protocol_version: 1,
             heartbeat_interval_ms: interval.as_millis() as u64,
             epoch,
+            ..Welcome::default()
         }));
+    }
+
+    /// A message with no content, as a server newer than the daemon might send.
+    pub fn send_empty(&self) {
+        let guard = self.outbound.lock().expect("outbound lock");
+        let tx = guard.as_ref().expect("session is open");
+        tx.send(Ok(ServerMessage { message: None }))
+            .expect("the stream is open");
+    }
+
+    /// A lease offer that names no lease.
+    pub fn offer_without_lease(&self) {
+        self.send(server_message::Message::LeaseOffer(LeaseOffer {
+            lease_id: None,
+            kind: "action".to_owned(),
+            action_digest: Some(digest()),
+        }));
+    }
+
+    /// An `UpdateOffer` and an `UpdateOrder`, which a daemon without an update client
+    /// has no use for.
+    pub fn update_messages(&self) {
+        self.send(server_message::Message::UpdateOffer(
+            kbf_proto::update::UpdateOffer::default(),
+        ));
+        self.send(server_message::Message::UpdateOrder(
+            kbf_proto::update::UpdateOrder::default(),
+        ));
+    }
+
+    /// An `UpdateOffer` of `offer`.
+    pub fn update_offer(&self, offer: kbf_proto::update::UpdateOffer) {
+        self.send(server_message::Message::UpdateOffer(offer));
+    }
+
+    /// An `UpdateOrder` of `order`.
+    pub fn update_order(&self, order: kbf_proto::update::UpdateOrder) {
+        self.send(server_message::Message::UpdateOrder(order));
+    }
+
+    /// The next `UpdateStatus` that `pick` accepts, skipping others.
+    pub async fn update_status(
+        &mut self,
+        mut pick: impl FnMut(&kbf_proto::update::UpdateStatus) -> bool,
+    ) -> kbf_proto::update::UpdateStatus {
+        self.expect(PROMPT, |m| match m {
+            daemon_message::Message::UpdateStatus(s) => pick(s).then(|| s.clone()),
+            _ => None,
+        })
+        .await
+        .expect("an UpdateStatus")
+        .1
+    }
+
+    /// A Welcome that names no lease epoch and carries `map`.
+    pub fn welcome_map(&self, map: Option<kbf_proto::kbf::map::v1::Map>) {
+        self.send(server_message::Message::Welcome(Welcome {
+            protocol_version: 1,
+            heartbeat_interval_ms: INTERVAL.as_millis() as u64,
+            map,
+            ..Welcome::default()
+        }));
+    }
+
+    /// A `MapUpdate` of `map`.
+    pub fn map_update(&self, map: kbf_proto::kbf::map::v1::Map) {
+        self.send(server_message::Message::MapUpdate(
+            kbf_proto::worker::MapUpdate { map: Some(map) },
+        ));
+    }
+
+    /// The next `MapRequest` the daemon sends: the generation it asks for.
+    pub async fn map_request(&mut self) -> u64 {
+        self.expect(PROMPT, |m| match m {
+            daemon_message::Message::MapRequest(r) => Some(r.at_least),
+            _ => None,
+        })
+        .await
+        .expect("a MapRequest")
+        .1
     }
 
     pub fn offer(&self, term: u64, seq: u64) {
@@ -526,6 +625,30 @@ impl Harness<FakeRuntime> {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+
+    /// Starts a server and a daemon with the update link `update` ([`Daemon::with_update`]),
+    /// whose fake runtime takes `run_for` per lease.
+    pub async fn with_update(name: &str, run_for: Duration, update: UpdateLink) -> Self {
+        let runtime = Arc::new(FakeRuntime::new(run_for));
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        let configure = |config: &mut DaemonConfig| {
+            config.recheck_every = Duration::from_millis(20);
+        };
+        Self::build_with(
+            name,
+            runtimes,
+            runtime,
+            Duration::from_secs(40),
+            configure,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(update),
+        )
+        .await
+    }
 }
 
 impl<R: Runtime> Harness<R> {
@@ -605,6 +728,8 @@ impl<R: Runtime> Harness<R> {
             driver,
             None,
             None,
+            None,
+            None,
         )
         .await
     }
@@ -630,6 +755,8 @@ impl<R: Runtime> Harness<R> {
             None,
             None,
             Some(phase),
+            None,
+            None,
             None,
         )
         .await
@@ -660,6 +787,58 @@ impl<R: Runtime> Harness<R> {
             None,
             phase,
             Some((stall, above)),
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Starts a server and a daemon that give a stream up when its connection, its open
+    /// or its Welcome takes longer than `within`.
+    pub async fn with_welcome_timeout(name: &str, runtime: Arc<R>, within: Duration) -> Self {
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        let configure = |config: &mut DaemonConfig| {
+            config.welcome_timeout = within;
+        };
+        Self::build_with(
+            name,
+            runtimes,
+            runtime,
+            Duration::from_secs(40),
+            configure,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Starts a server and a daemon that put the storage map the server sends in
+    /// `holder` ([`Daemon::with_map`]).
+    pub async fn with_map(
+        name: &str,
+        runtime: Arc<R>,
+        holder: Arc<kbf_mapsync::MapHolder>,
+    ) -> Self {
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        let configure = |config: &mut DaemonConfig| {
+            config.recheck_every = Duration::from_millis(20);
+        };
+        Self::build_with(
+            name,
+            runtimes,
+            runtime,
+            Duration::from_secs(40),
+            configure,
+            None,
+            None,
+            None,
+            None,
+            Some(holder),
+            None,
         )
         .await
     }
@@ -675,6 +854,8 @@ impl<R: Runtime> Harness<R> {
         driver: Option<tokio::sync::watch::Receiver<DriverReport>>,
         phase: Option<tokio::sync::watch::Receiver<kbf_types::NodePhase>>,
         pressure: Option<(tokio::sync::watch::Receiver<Option<f64>>, f64)>,
+        map: Option<Arc<kbf_mapsync::MapHolder>>,
+        update: Option<UpdateLink>,
     ) -> Self {
         let pki = pki(name);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -729,6 +910,12 @@ impl<R: Runtime> Harness<R> {
         if let Some((stall, above)) = pressure {
             daemon = daemon.with_memory_backstop(stall, above);
             assert_eq!(daemon.memory_backstop(), Some(above));
+        }
+        if let Some(holder) = map {
+            daemon = daemon.with_map(holder);
+        }
+        if let Some(update) = update {
+            daemon = daemon.with_update(update);
         }
         let daemon = tokio::spawn(daemon.run(std::future::pending()));
         Self {

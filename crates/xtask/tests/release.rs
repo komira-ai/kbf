@@ -5,20 +5,26 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use sha2::Digest;
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
-const REPO: &str = "komira-ai/komira-build-farm";
+const REPO: &str = "komira-ai/kbf";
+/// The kind of attestation of a bundle a host verifies a tarball with.
+const PROVENANCE: &str = "https://slsa.dev/provenance/v1";
 const COMMIT: &str = "c0ffee0123456789c0ffee0123456789c0ffee01";
 const OTHER: &str = "badbad0123456789badbad0123456789badbad01";
 const RUN: u64 = 4242;
 const TAG: &str = "v0.1.0";
-const ARTIFACTS: [&str; 4] = [
+const ARTIFACTS: [&str; 6] = [
     "assets-darwin-arm64",
     "assets-linux-x86_64",
     "assets-linux-arm64",
     "sha256sums",
+    "bundles-darwin-arm64",
+    "bundles-linux",
 ];
 
 /// An empty directory of its own for one test, holding the fake as `gh/gh` and an
@@ -284,6 +290,7 @@ fn locate_refuses_a_run_whose_artifacts_are_gone() {
                 ("assets-darwin-arm64", true),
                 ("assets-linux-x86_64", false),
                 ("assets-linux-arm64", false),
+                ("bundles-darwin-arm64", false),
             ]),
         ],
     );
@@ -293,7 +300,8 @@ fn locate_refuses_a_run_whose_artifacts_are_gone() {
         err,
         format!(
             "xtask: run {RUN} of artifacts.yml holds no unexpired artifact assets-darwin-arm64\n\
-             run {RUN} of artifacts.yml holds no unexpired artifact sha256sums\n"
+             run {RUN} of artifacts.yml holds no unexpired artifact sha256sums\n\
+             run {RUN} of artifacts.yml holds no unexpired artifact bundles-linux\n"
         )
     );
     // No artifacts listing at all: every one is missing.
@@ -307,7 +315,37 @@ fn locate_refuses_a_run_whose_artifacts_are_gone() {
     );
     let (code, _, err) = locate(&root, COMMIT, None);
     assert_eq!(code, Some(1));
-    assert_eq!(err.lines().count(), 4, "{err}");
+    assert_eq!(err.lines().count(), 6, "{err}");
+}
+
+#[test]
+fn locate_refuses_a_run_whose_bundles_are_gone() {
+    // Catches: a run that kept the files but lost the attestation bundles (the attest
+    // job's artifact expired, or the job never ran) released anyway: a release without
+    // its bundles is a release no host can verify offline.
+    let root = scratch("locate-no-bundles");
+    let kept: Vec<(&str, bool)> = ARTIFACTS
+        .iter()
+        .filter(|a| !a.starts_with("bundles-"))
+        .map(|a| (*a, false))
+        .collect();
+    answers(
+        &root,
+        &[
+            compare(COMMIT, "behind"),
+            runs(vec![run(serde_json::json!({}))]),
+            artifacts(&kept),
+        ],
+    );
+    let (code, _, err) = locate(&root, COMMIT, None);
+    assert_eq!(code, Some(1));
+    assert_eq!(
+        err,
+        format!(
+            "xtask: run {RUN} of artifacts.yml holds no unexpired artifact bundles-darwin-arm64\n\
+             run {RUN} of artifacts.yml holds no unexpired artifact bundles-linux\n"
+        )
+    );
 }
 
 #[test]
@@ -436,8 +474,57 @@ fn main_control_fails_a_check_that_refuses_main_or_accepts_a_branch() {
     assert!(err.contains("--off-main \"abc\""), "{err}");
 }
 
+/// The SHA-256 of `text`, as `SHA256SUMS` writes it.
+fn sha_of(text: &str) -> String {
+    hex::encode(sha2::Sha256::digest(text))
+}
+
+/// A bundle file: one JSON line of the shape of a Sigstore bundle, whose DSSE envelope
+/// holds `payload` as it is (or none when it is `null`). The signature is not real:
+/// `release check` reads the shape and the subject, `gh` judges the signature.
+fn bundle_with_payload(payload: serde_json::Value) -> String {
+    let mut envelope = serde_json::json!({
+        "payloadType": "application/vnd.in-toto+json",
+        "signatures": [],
+    });
+    if !payload.is_null() {
+        envelope["payload"] = payload;
+    }
+    let bundle = serde_json::json!({
+        "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+        "verificationMaterial": {},
+        "dsseEnvelope": envelope,
+    });
+    format!("{bundle}\n")
+}
+
+/// A bundle file whose payload is the in-toto statement of an attestation of
+/// `predicate_type` over the files with the SHA-256 digests `subjects`.
+fn bundle_with(subjects: &[&str], predicate_type: &str) -> String {
+    let subject: Vec<serde_json::Value> = subjects
+        .iter()
+        .map(|sha| serde_json::json!({ "name": "asset", "digest": { "sha256": sha } }))
+        .collect();
+    let statement = serde_json::json!({
+        "_type": "https://in-toto.io/Statement/v1",
+        "subject": subject,
+        "predicateType": predicate_type,
+        "predicate": {},
+    });
+    bundle_with_payload(serde_json::Value::String(
+        STANDARD.encode(statement.to_string()),
+    ))
+}
+
+/// The bundle file of the asset whose SHA-256 is `sha256`, as the attest job leaves it:
+/// one build provenance attestation with that one subject.
+fn bundle_text(sha256: &str) -> String {
+    bundle_with(&[sha256], PROVENANCE)
+}
+
 /// The assets of `commit` as the artifacts run leaves them, in `<root>/dist`: a tarball
-/// and an SBOM per platform, and `SHA256SUMS` over them.
+/// and an SBOM per platform, `SHA256SUMS` over them, and the provenance bundle of each
+/// tarball (which `SHA256SUMS` does not list: the attestation makes it after the sums).
 fn dist(root: &Path, commit: &str) -> PathBuf {
     let dist = root.join("dist");
     std::fs::create_dir_all(&dist).expect("dist");
@@ -447,10 +534,15 @@ fn dist(root: &Path, commit: &str) -> PathBuf {
             let name = format!("kbf-daemon-{commit}-{platform}.{ext}");
             let bytes = format!("{name} bytes");
             std::fs::write(dist.join(&name), &bytes).expect("asset");
-            sums.push_str(&format!(
-                "{}  {name}\n",
-                hex::encode(sha2::Sha256::digest(&bytes))
-            ));
+            let sha = sha_of(&bytes);
+            sums.push_str(&format!("{sha}  {name}\n"));
+            if ext == "tar.gz" {
+                std::fs::write(
+                    dist.join(format!("{name}.sigstore.json")),
+                    bundle_text(&sha),
+                )
+                .expect("bundle");
+            }
         }
     }
     std::fs::write(dist.join("SHA256SUMS"), sums).expect("SHA256SUMS");
@@ -459,7 +551,9 @@ fn dist(root: &Path, commit: &str) -> PathBuf {
 
 #[test]
 fn check_passes_the_assets_of_the_commit() {
-    // Control: catches a check that refuses a correct directory.
+    // Control: catches a check that refuses a correct directory, one that counts a
+    // bundle as an unlisted file (the sums are made before the attestation, so they
+    // cannot list it), and one that does not say the bundles were checked.
     let root = scratch("check-good");
     let dist = dist(&root, COMMIT);
     let (code, out, err) = check(&dist, COMMIT);
@@ -468,8 +562,217 @@ fn check_passes_the_assets_of_the_commit() {
         out,
         format!(
             "sums: 6 files match; the flipped copy does not\n\
-             names: every listed file is an asset of {COMMIT}\n"
+             names: every listed file is an asset of {COMMIT}\n\
+             bundles: each of the 3 tarballs has one provenance bundle\n"
         )
+    );
+}
+
+/// The tarball of the platform `platform` in [`dist`].
+fn tarball(commit: &str, platform: &str) -> String {
+    format!("kbf-daemon-{commit}-{platform}.tar.gz")
+}
+
+/// The SHA-256 [`dist`] lists for the tarball of the platform `platform`.
+fn tarball_sha(commit: &str, platform: &str) -> String {
+    sha_of(&format!("{} bytes", tarball(commit, platform)))
+}
+
+#[test]
+fn check_refuses_a_tarball_with_no_bundle() {
+    // Catches: a release whose bundle is missing (the attest job's artifact lacks one
+    // tarball's) passing, which leaves a host nothing to verify that tarball with; and
+    // the message not naming the tarball and the file expected.
+    let root = scratch("check-no-bundle");
+    let dist = dist(&root, COMMIT);
+    let t = tarball(COMMIT, "linux-arm64");
+    std::fs::remove_file(dist.join(format!("{t}.sigstore.json"))).expect("remove");
+    let (code, out, err) = check(&dist, COMMIT);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        err,
+        format!("xtask: {t}: no provenance bundle {t}.sigstore.json\n")
+    );
+}
+
+#[test]
+fn check_refuses_a_bundle_no_listed_tarball_owns() {
+    // Catches: a stray bundle released with the set: one for a tarball that is not
+    // listed (another commit's, or a renamed one), one for an SBOM, one with the
+    // suffix alone, and a second copy under another name. "Exactly one per tarball" is
+    // both halves: none missing, none left over.
+    let root = scratch("check-extra-bundle");
+    let dist = dist(&root, COMMIT);
+    let sbom = format!("kbf-daemon-{COMMIT}-linux-arm64.cdx.json");
+    let strays = [
+        format!("kbf-daemon-{OTHER}-linux-arm64.tar.gz.sigstore.json"),
+        format!("{sbom}.sigstore.json"),
+        ".sigstore.json".to_owned(),
+        format!(
+            "{}.sigstore.json.bak.sigstore.json",
+            tarball(COMMIT, "linux-arm64")
+        ),
+    ];
+    for stray in &strays {
+        std::fs::write(dist.join(stray), bundle_text(&sha_of(stray))).expect("stray");
+        let (code, out, err) = check(&dist, COMMIT);
+        assert_eq!(code, Some(1), "{stray}: {out}");
+        assert_eq!(
+            err,
+            format!("xtask: {stray}: not the bundle of a listed tarball\n"),
+            "{stray}"
+        );
+        std::fs::remove_file(dist.join(stray)).expect("remove");
+    }
+    let (code, _, err) = check(&dist, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+}
+
+#[test]
+fn check_refuses_a_bundle_that_is_not_one_sigstore_bundle() {
+    // Catches: an empty or truncated file, a log, two bundles in one file, a JSON value
+    // of another kind, and a bundle over the 256 KiB the order record allows, each
+    // accepted as "the bundle" because only its name was looked at.
+    let root = scratch("check-bad-bundle");
+    let dist = dist(&root, COMMIT);
+    let t = tarball(COMMIT, "darwin-arm64");
+    let path = dist.join(format!("{t}.sigstore.json"));
+    let good = bundle_text(&sha_of(&format!("{t} bytes")));
+    let mut big = good
+        .trim_end()
+        .strip_suffix('}')
+        .expect("an object")
+        .to_owned();
+    big.push_str(&format!(",\"padding\":\"{}\"}}\n", "x".repeat(262_144)));
+    let cases: [(&str, String, &str); 7] = [
+        ("empty", String::new(), "holds 0 lines"),
+        ("log", "gh: attestation failed\n".to_owned(), "not JSON"),
+        ("twice", format!("{good}{good}"), "holds 2 lines"),
+        ("array", "[]\n".to_owned(), "not a JSON object"),
+        (
+            "no media type",
+            good.replace("mediaType", "media"),
+            "no `mediaType` of a Sigstore bundle",
+        ),
+        (
+            "no envelope",
+            good.replace("dsseEnvelope", "envelope"),
+            "no `dsseEnvelope` object",
+        ),
+        ("too big", big, "over the 262144 bytes"),
+    ];
+    for (what, text, want) in cases {
+        std::fs::write(&path, text).expect("bundle");
+        let (code, out, err) = check(&dist, COMMIT);
+        assert_eq!(code, Some(1), "{what}: {out}");
+        assert!(
+            err.starts_with(&format!("xtask: {t}.sigstore.json: ")) && err.contains(want),
+            "{what}: {err}"
+        );
+    }
+    std::fs::write(&path, good).expect("bundle");
+    let (code, _, err) = check(&dist, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+}
+
+#[test]
+fn check_refuses_a_bundle_whose_subject_is_not_its_tarball() {
+    // Catches: a bundle taken on its name and shape. Two tarballs' bundles swapped (each
+    // a whole, valid bundle, of the other file: the defect the contract's digest
+    // comparison exists for), one with two subjects (the tarball's and another's: not
+    // its own, so it would verify the file beside it too), one with none, an SBOM
+    // attestation under the tarball's bundle name, and an undecodable payload. Each is
+    // refused with the bundle named, before GitHub is asked for anything.
+    let root = scratch("check-subject");
+    let dist = dist(&root, COMMIT);
+    let (a, b) = ("darwin-arm64", "linux-arm64");
+    let (path_a, path_b) = (
+        dist.join(format!("{}.sigstore.json", tarball(COMMIT, a))),
+        dist.join(format!("{}.sigstore.json", tarball(COMMIT, b))),
+    );
+    let (sha_a, sha_b) = (tarball_sha(COMMIT, a), tarball_sha(COMMIT, b));
+    let (text_a, text_b) = (bundle_text(&sha_a), bundle_text(&sha_b));
+    let name = format!("{}.sigstore.json", tarball(COMMIT, a));
+
+    std::fs::write(&path_a, &text_b).expect("bundle");
+    std::fs::write(&path_b, &text_a).expect("bundle");
+    let (code, out, err) = check(&dist, COMMIT);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        err,
+        format!(
+            "xtask: {name}: has the subject digest sha256:{sha_b}, not the tarball's \
+             sha256:{sha_a}\n{}.sigstore.json: has the subject digest sha256:{sha_a}, not \
+             the tarball's sha256:{sha_b}\n",
+            tarball(COMMIT, b)
+        )
+    );
+    std::fs::write(&path_b, &text_b).expect("bundle");
+
+    let sbom = "https://cyclonedx.org/bom";
+    let cases = [
+        (
+            "two subjects",
+            bundle_with(&[&sha_a, &sha_b], PROVENANCE),
+            "names 2 subjects, not exactly one".to_owned(),
+        ),
+        (
+            "no subject",
+            bundle_with(&[], PROVENANCE),
+            "names 0 subjects, not exactly one".to_owned(),
+        ),
+        (
+            "an SBOM attestation",
+            bundle_with(&[&sha_a], sbom),
+            format!("has a payload of predicate type {sbom:?}, not build provenance"),
+        ),
+        (
+            "not base64",
+            bundle_with_payload(serde_json::json!("not base64!")),
+            "that is not base64".to_owned(),
+        ),
+        (
+            "no payload",
+            bundle_with_payload(serde_json::Value::Null),
+            "has no `dsseEnvelope.payload`".to_owned(),
+        ),
+    ];
+    for (what, text, want) in cases {
+        std::fs::write(&path_a, text).expect("bundle");
+        let (code, out, err) = check(&dist, COMMIT);
+        assert_eq!(code, Some(1), "{what}: {out}");
+        assert!(
+            err.starts_with(&format!("xtask: {name}: ")) && err.contains(&want),
+            "{what}: {err}"
+        );
+        assert_eq!(err.lines().count(), 1, "{what}: {err}");
+    }
+    std::fs::write(&path_a, &text_a).expect("bundle");
+    let (code, _, err) = check(&dist, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+}
+
+#[test]
+fn a_bundle_is_not_a_sums_file_entry() {
+    // Catches: the sums verification counting the bundles as files SHA256SUMS fails to
+    // list (it cannot list them: they are made after it), which would fail every real
+    // release; and its exemption swallowing a file that merely ends `.json`.
+    let root = scratch("check-sums-and-bundles");
+    let dist = dist(&root, COMMIT);
+    let out = Command::new(XTASK)
+        .args(["verify-assets", "sums", s(&dist)])
+        .output()
+        .expect("run xtask");
+    assert_eq!(out.status.code(), Some(0));
+    std::fs::write(dist.join("notes.json"), b"{}").expect("notes");
+    let out = Command::new(XTASK)
+        .args(["verify-assets", "sums", s(&dist)])
+        .output()
+        .expect("run xtask");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "xtask: not listed in SHA256SUMS: notes.json\n"
     );
 }
 
@@ -589,7 +892,7 @@ fn publish_creates_the_release_with_every_verified_file() {
     let (code, out, err) = publish(&root, None);
     assert_eq!(code, Some(0), "{err}");
     assert!(
-        out.ends_with(&format!("created release {TAG} with 7 files\n")),
+        out.ends_with(&format!("created release {TAG} with 10 files\n")),
         "{out}"
     );
     assert_eq!(released(&root), verified(&root));
@@ -615,6 +918,84 @@ fn publish_creates_the_release_with_every_verified_file() {
         )),
         "{args}"
     );
+    // And the offline command, for a tarball with the bundle released beside it: the
+    // flags a host's installer verifies with, for this release's commit.
+    assert!(
+        args.contains(&format!(
+            "gh attestation verify <asset> --bundle <asset>.sigstore.json \
+             --custom-trusted-root trusted_root.jsonl --repo {REPO} \
+             --signer-workflow {REPO}/.github/workflows/artifacts.yml \
+             --cert-oidc-issuer https://token.actions.githubusercontent.com \
+             --source-ref refs/heads/main --source-digest {COMMIT} \
+             --predicate-type https://slsa.dev/provenance/v1 --deny-self-hosted-runners"
+        )),
+        "{args}"
+    );
+}
+
+#[test]
+fn publish_releases_every_bundle_beside_its_tarball() {
+    // Catches: a release made of the listed files alone (the bundles left in the
+    // directory, not uploaded), so a host that downloads the tarball finds nothing to
+    // verify it with offline.
+    let root = scratch("publish-bundles");
+    dist(&root, COMMIT);
+    let (code, _, err) = publish(&root, None);
+    assert_eq!(code, Some(0), "{err}");
+    let names: Vec<String> = released(&root).into_iter().map(|(n, _)| n).collect();
+    for platform in ["darwin-arm64", "linux-arm64", "linux-x86_64"] {
+        let t = tarball(COMMIT, platform);
+        assert!(names.contains(&t), "{t} not released");
+        assert!(
+            names.contains(&format!("{t}.sigstore.json")),
+            "the bundle of {t} not released: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn publish_refuses_a_directory_with_a_missing_bundle_before_asking_github() {
+    // Catches: a publish that checks the sums and names but not the bundles, creating a
+    // release whose tarball cannot be verified offline (a release asset is never
+    // replaced, so the gap would stay).
+    let root = scratch("publish-no-bundle");
+    let dist = dist(&root, COMMIT);
+    let t = tarball(COMMIT, "darwin-arm64");
+    std::fs::remove_file(dist.join(format!("{t}.sigstore.json"))).expect("remove");
+    let (code, _, err) = publish(&root, None);
+    assert_eq!(code, Some(1));
+    assert_eq!(
+        err,
+        format!("xtask: {t}: no provenance bundle {t}.sigstore.json\n")
+    );
+    assert_eq!(gh_args(&root), "");
+}
+
+#[test]
+fn publish_refuses_a_bundle_of_another_tarball_before_asking_github() {
+    // Catches: a publish that checks a bundle's name and shape but not whose it is, so
+    // a bundle copied under the wrong name is released (an asset is never replaced, so
+    // the tarball would stay without a bundle a host can use).
+    let root = scratch("publish-swapped-bundle");
+    let dist = dist(&root, COMMIT);
+    let t = tarball(COMMIT, "darwin-arm64");
+    std::fs::write(
+        dist.join(format!("{t}.sigstore.json")),
+        bundle_text(&tarball_sha(COMMIT, "linux-arm64")),
+    )
+    .expect("bundle");
+    let (code, _, err) = publish(&root, None);
+    assert_eq!(code, Some(1));
+    assert_eq!(
+        err,
+        format!(
+            "xtask: {t}.sigstore.json: has the subject digest sha256:{}, not the tarball's \
+             sha256:{}\n",
+            tarball_sha(COMMIT, "linux-arm64"),
+            tarball_sha(COMMIT, "darwin-arm64")
+        )
+    );
+    assert_eq!(gh_args(&root), "");
 }
 
 #[test]
@@ -630,7 +1011,7 @@ fn a_rerun_changes_nothing() {
     assert_eq!(code, Some(0), "{err}");
     assert!(
         out.ends_with(&format!(
-            "release {TAG}: 7 files already held byte for byte, 0 uploaded\n"
+            "release {TAG}: 10 files already held byte for byte, 0 uploaded\n"
         )),
         "{out}"
     );
@@ -670,7 +1051,7 @@ fn a_rerun_uploads_only_what_the_release_lacks() {
         assert!(
             out.ends_with(&format!(
                 "release {TAG}: {keep} files already held byte for byte, {} uploaded\n",
-                7 - keep
+                10 - keep
             )),
             "{name}: {out}"
         );

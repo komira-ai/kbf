@@ -219,7 +219,7 @@ async fn prepare_refuses_outputs_that_are_not_held() {
     };
     let refused = farm.cache.prepare_action_result(&result).await;
     assert!(
-        matches!(refused, Err(CacheError::ActionWrite(ActionWriteError::Absent(d))) if d == absent.digest),
+        matches!(&refused, Err(CacheError::ActionWrite(ActionWriteError::Absent(d))) if *d == [absent.digest]),
         "{refused:?}"
     );
     let result_blob = Blob::of(&result);
@@ -239,7 +239,7 @@ async fn prepare_refuses_outputs_that_are_not_held() {
     };
     let refused = farm.cache.prepare_action_result(&result).await;
     assert!(
-        matches!(refused, Err(CacheError::ActionWrite(ActionWriteError::Unreachable(d))) if d == gone.digest),
+        matches!(&refused, Err(CacheError::ActionWrite(ActionWriteError::Unreachable(d))) if *d == [gone.digest]),
         "{refused:?}"
     );
 
@@ -273,6 +273,51 @@ async fn prepare_refuses_outputs_that_are_not_held() {
         .await
         .expect("daemon commit");
     assert_eq!(get(&farm, &action).await, Ok(result));
+}
+
+/// Catches a refused action-cache write that names only the first blob of its closure
+/// it lacks: the writer would learn of one missing output per round trip, re-upload it,
+/// and be refused again for the next. The refusal must be FAILED_PRECONDITION and name
+/// every missing blob (outputs and stdout alike), and none that is held.
+#[tokio::test]
+async fn a_write_refused_for_missing_outputs_names_every_one() {
+    let farm = Farm::start().await;
+    let held = Blob::new("an output that is held");
+    farm.upload(&[&held]).await;
+    let first = Blob::new("an output never uploaded");
+    let second = Blob::new("another output never uploaded");
+    let stdout = Blob::new("stdout never uploaded");
+    let result = ActionResult {
+        output_files: vec![
+            output_file("a", &first),
+            output_file("held", &held),
+            output_file("b", &second),
+        ],
+        stdout_digest: Some(stdout.proto.clone()),
+        ..Default::default()
+    };
+    let action = Blob::new("an action whose outputs are missing");
+    let refused = farm
+        .cache
+        .write_action_result(Role::Daemon, action.digest, &result)
+        .await
+        .expect_err("a write naming missing blobs");
+    let status = tonic::Status::from(refused);
+    assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+    for missing in [&first, &second, &stdout] {
+        assert!(
+            status.message().contains(&missing.digest.to_string()),
+            "{} not named in {:?}",
+            missing.digest,
+            status.message()
+        );
+    }
+    assert!(
+        !status.message().contains(&held.digest.to_string()),
+        "a held blob named: {:?}",
+        status.message()
+    );
+    assert_eq!(get(&farm, &action).await, Err(Code::NotFound));
 }
 
 /// Catches a hit served while the store has lost an object holding one of its blobs
@@ -322,4 +367,46 @@ async fn get_action_result_misses_when_the_store_lost_an_output_object() {
         [output.digest],
         "the lost object's blob is still reported held"
     );
+}
+
+/// Catches an entry answered without the closure it was committed with (or with the result
+/// blob in it, which the entry's owner reads itself): the closure of a hit is the output
+/// file and stdout, in digest order, read in the same step as the hit; a miss has none.
+/// Mutant: `action_entry` answers an empty closure.
+#[tokio::test]
+async fn action_entry_reports_the_closure_the_entry_was_committed_with() {
+    let farm = Farm::start().await;
+    let output = Blob::new("output bytes for the closure");
+    let stdout = Blob::new("stdout bytes for the closure");
+    farm.upload(&[&output, &stdout]).await;
+    let action = Blob::new("compile closure.c");
+    let result = ActionResult {
+        output_files: vec![output_file("closure.o", &output)],
+        stdout_digest: Some(stdout.proto.clone()),
+        ..Default::default()
+    };
+    assert!(
+        farm.cache
+            .action_entry(&action.digest)
+            .await
+            .expect("answered")
+            .is_none(),
+        "no entry, no closure"
+    );
+    farm.cache
+        .write_action_result(Role::Daemon, action.digest, &result)
+        .await
+        .expect("daemon write");
+
+    let (result_digest, got, closure) = farm
+        .cache
+        .action_entry(&action.digest)
+        .await
+        .expect("answered")
+        .expect("a hit");
+    assert_eq!(got, result);
+    assert_eq!(result_digest, Blob::of(&result).digest);
+    let mut wanted = vec![output.digest, stdout.digest];
+    wanted.sort();
+    assert_eq!(closure, wanted);
 }

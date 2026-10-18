@@ -130,6 +130,18 @@ fn each_command_has_its_own_label() {
         Command::EvictObjects {
             objects: [object].into(),
         },
+        Command::SetWriter(kbf_meta::NodeWriter::new(
+            std::num::NonZeroU64::MIN,
+            std::num::NonZeroU64::MIN,
+        )),
+        Command::AdoptSegment {
+            object,
+            entries: Vec::new(),
+        },
+        Command::RebuildProgress {
+            after: String::new(),
+        },
+        Command::RebuildDone,
     ];
     let labels: Vec<&str> = commands
         .iter()
@@ -154,11 +166,23 @@ fn every_family_is_printed_once_with_its_type() {
     metrics.execute_dir_reads.add(17);
     metrics.sched_queued.set(18);
     metrics.sched_leases.set(19);
+    metrics.frontend_relay_untraced.set(20);
+    metrics.handover_relayed.add(21);
+    let _relays = (
+        metrics.handover_relays_open.raise(),
+        metrics.handover_relays_open.raise(),
+        metrics.handover_relays_open.raise(),
+    );
     let _presubmit = metrics.execute_presubmit_in_flight.raise();
     let (_tier, _tier2) = (
         metrics.tier_in_flight.raise(),
         metrics.tier_in_flight.raise(),
     );
+    metrics.open_write_fds.set(21);
+    metrics.write_pool_direct.add(22);
+    metrics.write_pool_queue.add_one();
+    metrics.write_pool_queue.add_one();
+    metrics.write_pool_queue.add_one();
     let text = metrics.render();
     let types: Vec<&str> = lines(&text, "# TYPE ")
         .iter()
@@ -206,11 +230,19 @@ fn every_family_is_printed_once_with_its_type() {
             "kbf_input_directories_joined_total counter",
             "kbf_sched_queued gauge",
             "kbf_sched_leases gauge",
+            "kbf_frontend_relay_untraced gauge",
+            "kbf_handover_relayed_total counter",
+            "kbf_handover_relays_open gauge",
             "kbf_tier_in_flight gauge",
+            "kbf_storage_open_write_fds gauge",
+            "kbf_storage_write_pool_queue gauge",
+            "kbf_storage_write_pool_direct_total counter",
             "kbf_meta_commit_seconds histogram",
             "kbf_execute_requests_total counter",
             "kbf_execute_errors_total counter",
             "kbf_execute_in_flight gauge",
+            "kbf_front_open_executions gauge",
+            "kbf_front_executes_started_total counter",
             "kbf_execute_queued gauge",
             "kbf_execute_prepare_seconds histogram",
             "kbf_execute_dispatch_seconds histogram",
@@ -231,8 +263,14 @@ fn every_family_is_printed_once_with_its_type() {
         ("kbf_execute_dir_reads_total", 17),
         ("kbf_sched_queued", 18),
         ("kbf_sched_leases", 19),
+        ("kbf_frontend_relay_untraced", 20),
+        ("kbf_handover_relayed_total", 21),
+        ("kbf_handover_relays_open", 3),
         ("kbf_execute_presubmit_in_flight", 1),
         ("kbf_tier_in_flight", 2),
+        ("kbf_storage_open_write_fds", 21),
+        ("kbf_storage_write_pool_queue", 3),
+        ("kbf_storage_write_pool_direct_total", 22),
     ] {
         assert_eq!(
             lines(&text, &format!("{name} ")),
@@ -298,4 +336,26 @@ fn an_execute_is_recorded_however_its_stream_ends() {
     assert_eq!(metrics.dispatch.count(), 3);
     assert_eq!(metrics.queued_seconds.count(), 1);
     assert_eq!(metrics.total.count(), 3);
+}
+
+/// Catches `streaming` raising `open_executions` once per call rather than once per
+/// guard (a stream that asked twice would leave the gauge raised for ever after its one
+/// lowering), and a guard that never streamed lowering it.
+#[test]
+fn open_executions_is_raised_once_per_guard_and_only_by_a_streaming_one() {
+    let metrics = Arc::new(ExecuteMetrics::default());
+    let mut streamed = metrics.execute();
+    let plain = metrics.wait();
+    assert_eq!(metrics.open_executions.get(), 0, "not before streaming()");
+    streamed.streaming();
+    streamed.streaming();
+    assert_eq!(metrics.open_executions.get(), 1);
+    drop(plain);
+    assert_eq!(
+        metrics.open_executions.get(),
+        1,
+        "a guard that never streamed"
+    );
+    drop(streamed);
+    assert_eq!(metrics.open_executions.get(), 0);
 }

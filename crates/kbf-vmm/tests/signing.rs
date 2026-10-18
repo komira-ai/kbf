@@ -99,7 +99,7 @@ fn the_signer_applies_the_list_and_the_asset_check_accepts_it() {
     // would carry none), a signer that gives an unlisted binary the list's entitlement
     // (a lookup that ignores the name), and a check that refuses the right set, in the
     // signer or in darwin-asset.
-    for (name, want) in [("kbf-vmm", Some(VZ)), ("kbf-daemon", None)] {
+    for (name, want) in [("kbf-vmm", Some(VZ)), ("kbf", None)] {
         let binary = copy("signed", name);
         let lines = sign(&binary).unwrap_or_else(|e| panic!("sign {name}: {e}"));
         assert!(
@@ -130,17 +130,12 @@ fn the_signer_applies_the_list_and_the_asset_check_accepts_it() {
 fn wrong_signatures_are_refused() {
     // Each row: a copy named `name`, signed by hand with `keys`, and the refusal the
     // check must give. Catches a check that lets any entitlement through for an
-    // unlisted binary (kbf-daemon with the virtualization entitlement, kbf-mac-session
+    // unlisted binary (kbf with the virtualization entitlement, kbf-mac-session
     // with get-task-allow), a subset compare that accepts one more key, a check that
     // treats "no entitlements" as always fine, and a compare of the count only.
     let other = "other entitlements than the allow list gives it";
     let cases: [(&str, &str, &[&str], &str); 5] = [
-        (
-            "daemon-vz",
-            "kbf-daemon",
-            &[VZ],
-            "gives kbf-daemon no entitlements",
-        ),
+        ("daemon-vz", "kbf", &[VZ], "gives kbf no entitlements"),
         (
             "session-gta",
             "kbf-mac-session",
@@ -172,14 +167,14 @@ fn wrong_signatures_are_refused() {
 #[ignore = "signs with codesign; the native-macos job runs it with --ignored"]
 fn a_missing_list_fails_closed() {
     // Catches: a check, signer or asset check that skips itself, or reads "no list" as
-    // "no entitlements", when the file is not there: for kbf-daemon with no
+    // "no entitlements", when the file is not there: for kbf with no
     // entitlements (which would otherwise pass) and for kbf-vmm.
     let missing = Path::new(env!("CARGO_TARGET_TMPDIR")).join("no-such-list.txt");
     let want = format!(
         "the entitlement allow list {} is missing",
         missing.display()
     );
-    for (case, name) in [("missing-daemon", "kbf-daemon"), ("missing-vmm", "kbf-vmm")] {
+    for (case, name) in [("missing-daemon", "kbf"), ("missing-vmm", "kbf-vmm")] {
         let binary = copy(case, name);
         sign_with(&binary, &[]);
         assert_refused(
@@ -205,13 +200,13 @@ fn the_signer_refuses_another_minos_and_a_tarball_without_the_binary() {
     // Catches: the minimum-macOS check skipped (a binary built for another macOS
     // signed and passed), and darwin-asset checking a binary the tarball does not hold
     // under the asked name.
-    let binary = copy("minos", "kbf-daemon");
+    let binary = copy("minos", "kbf");
     assert_refused(
         darwin::sign(&binary, &allowlist(), "99.0", None),
         "want '99.0'",
         "minos",
     );
-    let tarball = package(&copy("absent", "kbf-daemon"));
+    let tarball = package(&copy("absent", "kbf"));
     assert_refused(
         darwin::asset(&tarball, "kbf-server", &allowlist()),
         "holds no kbf-server",

@@ -12,6 +12,8 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use kbf_caps::NodeCaps;
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_objstore::MemoryStore;
+use kbf_proto::update::UpdateStatus;
+use kbf_proto::update::update_status::State;
 use kbf_proto::worker::{NodeStatus, ServerMessage, XcodeState, XcodeStatus, daemon_message};
 use kbf_server::api::{DRAIN_DEADLINE, Write, write_request};
 use kbf_server::farm::NodeAction;
@@ -91,10 +93,11 @@ fn listeners() -> Listeners {
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
+        streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
-        streams: kbf_server::StreamLimits::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     }
 }
 
@@ -107,6 +110,8 @@ fn start_with(token: Option<ApiToken>) -> Server {
     let api = Api {
         listen: loopback(),
         token,
+        local_cache: None,
+        releases: None,
     };
     let bound = bind_server_with_api(cache(), listeners, Some(api), shutdown).expect("bind");
     let (reapi, worker, api) = (
@@ -298,6 +303,8 @@ async fn get_nodes_lists_each_nodes_newest_software() {
             );
         }
     }
+    // None of these daemons sent an `UpdateStatus`: never idle, and no verdict.
+    let unsupported = json!({ "state": null, "up_to_date": null, "availability": "unsupported" });
     assert_eq!(
         got,
         json!({ "server": this_build, "nodes": [
@@ -307,6 +314,7 @@ async fn get_nodes_lists_each_nodes_newest_software() {
                 "xcode_builds": [], "xcodes": [],
                 "container_images": [LINUX_IMAGE] },
               "needs_attention": [],
+              "update": unsupported,
               "placement": { "state": "serving" },
               "phase": { "state": "serving" } },
             { "node_id": "mac-1", "connected": true, "software": {
@@ -321,10 +329,12 @@ async fn get_nodes_lists_each_nodes_newest_software() {
                       "state": "ready", "reason": "", "fix": "" } ],
                 "container_images": [] },
               "needs_attention": [NOT_READY],
+              "update": unsupported,
               "placement": { "state": "serving" },
               "phase": { "state": "serving" } },
             { "node_id": "old-1", "connected": true, "software": null,
               "needs_attention": [],
+              "update": unsupported,
               "placement": { "state": "serving" },
               "phase": { "state": "serving" } },
         ] })
@@ -361,14 +371,17 @@ async fn an_api_address_in_use_is_refused() {
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
+        streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
-        streams: kbf_server::StreamLimits::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     };
     let api = Api {
         listen: addr,
         token: None,
+        local_cache: None,
+        releases: None,
     };
     let refused = bind_server_with_api(cache(), listeners, Some(api), std::future::pending());
     let Err(ServeError::Bind { addr: at, .. }) = refused else {
@@ -378,7 +391,7 @@ async fn an_api_address_in_use_is_refused() {
 }
 
 fn register(
-    farm: &Farm<MemoryMetaLog, MemoryStore>,
+    farm: &Farm,
     node: &str,
 ) -> (
     kbf_server::farm::StreamId,
@@ -427,6 +440,48 @@ async fn a_status_from_a_replaced_stream_is_ignored() {
     );
 }
 
+fn update_status(running: &str, state: State) -> UpdateStatus {
+    UpdateStatus {
+        running_commit: running.to_owned(),
+        state: state as i32,
+        ..UpdateStatus::default()
+    }
+}
+
+/// Catches (`pull-updates.md` 6.4: ignored from a replaced stream exactly as `NodeStatus`
+/// is): an `UpdateStatus` from a replaced stream overwriting the newest stream's (a host
+/// that restarted onto a new release would be shown as running the old one, and judged
+/// out of date), one kept for a node that never registered, and the answer to "was it
+/// kept" being wrong. The newest stream's report is the one the detail lists, live.
+///
+/// Mutants seen red: the stream check dropped (the old stream's report wins); the
+/// report kept for an unregistered node (a ghost host listed).
+#[tokio::test]
+async fn an_update_status_from_a_replaced_stream_is_ignored() {
+    let farm = Farm::new(
+        cache(),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
+    let node = WorkerId::new("linux-1");
+    let (old, _old_rx) = register(&farm, "linux-1");
+    let (new, _new_rx) = register(&farm, "linux-1");
+    assert!(farm.update_status(&node, new, update_status("bbbbbbbbbbbb", State::Idle)));
+    assert!(
+        !farm.update_status(&node, old, update_status("aaaaaaaaaaaa", State::Refused)),
+        "a replaced stream's report was kept"
+    );
+    let ghost = WorkerId::new("ghost");
+    assert!(!farm.update_status(&ghost, new, update_status("cccccccccccc", State::Idle)));
+    let hosts = farm.update_hosts();
+    assert_eq!(hosts.len(), 1, "{hosts:?}");
+    let host = serde_json::to_value(&hosts[0]).expect("json");
+    assert_eq!(host["node_id"], "linux-1");
+    assert_eq!(host["running_commit"], "bbbbbbbbbbbb");
+    assert_eq!(host["state"], "idle");
+    assert_eq!(host["availability"], "ok");
+}
+
 /// Catches: `connected` read from something other than the stream's response side
 /// (a node whose stream is gone listed as connected).
 #[tokio::test]
@@ -455,7 +510,7 @@ async fn two_nodes_whose_streams_ended_before_one_read_are_both_disconnected() {
     );
     let (_, first) = register(&farm, "linux-1");
     let (_, second) = register(&farm, "linux-2");
-    let connected = |farm: &Farm<MemoryMetaLog, MemoryStore>| {
+    let connected = |farm: &Farm| {
         let mut nodes: Vec<(String, bool)> = farm
             .nodes()
             .nodes

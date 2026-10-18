@@ -18,16 +18,38 @@ use futures::future::BoxFuture;
 use kbf_daemon::config::ConfigError;
 use kbf_daemon::connect::Resolve;
 use kbf_daemon::{Daemon, DaemonConfig, Event, FakeRuntime, NodeReport};
+use kbf_testkit::port::Reserved;
 use support::{PROMPT, Peer, Pki, pki, serve_unavailable, serve_worker};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 
-/// A loopback port that nothing listens on (bound, then released).
+/// A loopback port on which connecting is refused, held for the life of the test
+/// binary so that no other test can take it (see [`kbf_testkit::port`]).
 fn dead_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("addr").port()
+    kbf_testkit::port::dead_addr().port()
+}
+
+/// The held `port`, listening now: the very socket that refused until this call, so no
+/// other listener could have come between.
+fn serve_on(held: Reserved) -> TcpListener {
+    let listener = held.listen();
+    listener.set_nonblocking(true).expect("non-blocking");
+    TcpListener::from_std(listener).expect("listener")
+}
+
+/// Catches `dead_port` and `Reserved` ports being free to take: a thief binding the
+/// number succeeds (the old bind-and-drop helper), and the daemon would dial it.
+#[test]
+fn a_dead_or_held_port_cannot_be_taken_by_another_listener() {
+    let dead = dead_port();
+    assert!(kbf_testkit::port::is_taken(SocketAddr::from((
+        [127, 0, 0, 1],
+        dead
+    ))));
+    let held = Reserved::new();
+    assert!(kbf_testkit::port::is_taken(held.addr()));
 }
 
 async fn listener() -> (TcpListener, SocketAddr) {
@@ -172,8 +194,8 @@ async fn welcomed(sessions: &mut mpsc::UnboundedReceiver<Peer>, within: Duration
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_daemon_keeps_trying_until_a_server_comes_up() {
     let pki = pki("reconnect-forever");
-    let port = dead_port();
-    let url = format!("https://127.0.0.1:{port}");
+    let held = Reserved::new();
+    let url = format!("https://127.0.0.1:{}", held.port());
     let max = Duration::from_millis(40);
     let mut d = Running::start(&pki, &[url], Duration::from_millis(5), max, None, true);
 
@@ -190,10 +212,7 @@ async fn the_daemon_keeps_trying_until_a_server_comes_up() {
     assert!(waits[0] <= Duration::from_millis(5), "{waits:?}");
     assert!(waits[39] >= max / 2, "the wait grew: {waits:?}");
 
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .await
-        .expect("rebind");
-    let (mut sessions, server) = serve_worker(pki.server_tls(), listener);
+    let (mut sessions, server) = serve_worker(pki.server_tls(), serve_on(held));
     welcomed(&mut sessions, PROMPT).await;
     server.abort();
 }
@@ -287,6 +306,68 @@ async fn each_round_resolves_the_names_again() {
     server.abort();
 }
 
+/// A resolver that fails its first `failures` lookups as a resolver does when its
+/// network is not up (an error, not an empty answer), then answers `addr`.
+struct Failing {
+    failures: usize,
+    asked: AtomicUsize,
+    addr: SocketAddr,
+}
+
+impl Resolve for Failing {
+    fn resolve(&self, _: String, _: u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>> {
+        let asked = self.asked.fetch_add(1, Ordering::SeqCst);
+        let answer = if asked < self.failures {
+            Err(io::Error::other(
+                "failed to lookup address information: Temporary failure in name resolution",
+            ))
+        } else {
+            Ok(vec![self.addr])
+        };
+        Box::pin(async move { answer })
+    }
+}
+
+/// Catches: a daemon whose `--server` name fails to resolve at start (a VPN or overlay
+/// resolver that is not up yet) that ends, or counts the failure as nothing and never
+/// tries again. The first three lookups fail with an error; each is reported as a failed
+/// attempt naming the resolver's error and is followed by a wait, and the fourth round
+/// resolves and connects. Mutant: the resolver-error arm of `resolve_all` panics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_that_fails_to_resolve_is_retried_until_it_does() {
+    let pki = pki("reconnect-resolve-error");
+    let (listener, addr) = listener().await;
+    let (mut sessions, server) = serve_worker(pki.server_tls(), listener);
+    let resolver = Arc::new(Failing {
+        failures: 3,
+        asked: AtomicUsize::new(0),
+        addr,
+    });
+    let resolve: Arc<dyn Resolve> = resolver.clone();
+    let urls = ["https://farm.test:7070".to_owned()];
+    let ms = Duration::from_millis;
+    let mut d = Running::start(&pki, &urls, ms(5), ms(20), Some(resolve), true);
+    let failure = d
+        .event(PROMPT, |e| match e {
+            Event::ConnectFailed { server, reason } => Some(format!("{server}: {reason}")),
+            _ => None,
+        })
+        .await
+        .expect("a failed lookup is reported");
+    assert!(
+        failure.starts_with("https://farm.test:7070: resolve: failed to lookup address"),
+        "{failure}"
+    );
+    d.retried(2, PROMPT).await;
+    welcomed(&mut sessions, PROMPT).await;
+    assert_eq!(
+        resolver.asked.load(Ordering::SeqCst),
+        4,
+        "three failed, one answered"
+    );
+    server.abort();
+}
+
 /// Catches: a list of `--server` URLs of which only the first is dialled, and a daemon
 /// that checks the server's certificate against the address it dialled rather than
 /// the URL's host (the certificate names `localhost`; no `--tls-server-name` is
@@ -318,17 +399,14 @@ async fn a_list_of_servers_is_tried_in_turn() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_resets_the_wait() {
     let pki = pki("reconnect-reset");
-    let port = dead_port();
-    let url = format!("https://127.0.0.1:{port}");
+    let held = Reserved::new();
+    let url = format!("https://127.0.0.1:{}", held.port());
     let ms = Duration::from_millis;
     let mut d = Running::start(&pki, &[url], ms(10), ms(3000), None, true);
     let waits = d.retried(9, Duration::from_secs(10)).await;
     assert!(waits[8] >= ms(1280), "{waits:?}");
 
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .await
-        .expect("rebind");
-    let (mut sessions, server) = serve_worker(pki.server_tls(), listener);
+    let (mut sessions, server) = serve_worker(pki.server_tls(), serve_on(held));
     let first = welcomed(&mut sessions, Duration::from_secs(10)).await;
     first.close();
     d.event(PROMPT, |e| {

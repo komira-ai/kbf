@@ -75,9 +75,9 @@ impl TransferArgs {
     }
 }
 
-/// The engine over the blob service `--cas` names, over mutual TLS with the daemon's
-/// own TLS files and the daemon's HTTP/2 keepalive. Connects on first use.
-pub(crate) fn engine(cli: &Cli) -> Result<Transfers, Error> {
+/// The endpoint of the blob service `--cas` names, over mutual TLS with the daemon's own
+/// TLS files and the daemon's HTTP/2 keepalive. Nothing connects until it is used.
+pub(crate) fn endpoint(cli: &Cli) -> Result<Endpoint, Error> {
     let url = cli
         .cas
         .clone()
@@ -91,10 +91,12 @@ pub(crate) fn engine(cli: &Cli) -> Result<Transfers, Error> {
     }
     let config = DaemonConfig::from_args(&cli.daemon);
     let endpoint = Endpoint::from_shared(url)?.tls_config(config.tls.load()?)?;
-    Ok(Transfers::new(
-        config.keep_alive.apply(endpoint),
-        cli.transfer.config(),
-    ))
+    Ok(config.keep_alive.apply(endpoint))
+}
+
+/// The engine over the blob service `--cas` names ([`endpoint`]). Connects on first use.
+pub(crate) fn engine(cli: &Cli) -> Result<Transfers, Error> {
+    Ok(Transfers::new(endpoint(cli)?, cli.transfer.config()))
 }
 
 #[cfg(test)]
@@ -185,5 +187,103 @@ mod tests {
         let first = node.plane(&cli).expect("engine");
         let second = node.plane(&cli).expect("engine");
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// Catches the farm's data plane (`kbf-daemon`'s `start`) not being built from the
+    /// daemon's flags: it is made once and shared by every runtime like the engine, and
+    /// TLS files that cannot be read fail the start rather than the first storage call.
+    #[tokio::test]
+    async fn the_farm_plane_is_one_per_process_and_needs_readable_tls_files() {
+        let dir = super::super::tests::scratch("transfer-farm");
+        super::super::tests::tls_files(&dir);
+        let at = |name: &str| format!("{}", dir.join(name).display());
+        let cli = |ca: &str| {
+            Cli::try_parse_from([
+                "kbf-daemon".to_owned(),
+                "--server=https://front:7070".to_owned(),
+                format!("--ca-cert={ca}"),
+                format!("--cert={}", at("node.pem")),
+                format!("--key={}", at("node.key")),
+                "--node-id=n1".to_owned(),
+                "--driver=native".to_owned(),
+                "--cas=https://127.0.0.1:1".to_owned(),
+            ])
+            .expect("flags")
+        };
+        let maps = Arc::new(kbf_daemon::MapHolder::new());
+        let held = Arc::clone(&maps);
+        let mut node = Node::new(Box::new(move |cli| {
+            super::super::farm(cli, &held, kbf_daemon::Liveness::default()).map(|(plane, _)| plane)
+        }));
+        let cli_ok = cli(&at("ca.pem"));
+        let first = node.plane(&cli_ok).expect("farm plane");
+        let second = node.plane(&cli_ok).expect("farm plane");
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let held = Arc::clone(&maps);
+        let mut unreadable = Node::new(Box::new(move |cli| {
+            super::super::farm(cli, &held, kbf_daemon::Liveness::default()).map(|(plane, _)| plane)
+        }));
+        let why = unreadable
+            .plane(&cli(&at("no-such-ca.pem")))
+            .err()
+            .expect("no CA file")
+            .to_string();
+        assert!(why.contains("no-such-ca.pem"), "{why}");
+    }
+
+    /// Catches the storage-and-daemon plane (`kbf-daemon`'s `start_member`) not being built
+    /// from the daemon's flags: TLS files that cannot be read fail the start rather than the
+    /// first call to another member.
+    #[tokio::test]
+    async fn the_member_plane_needs_readable_tls_files() {
+        let dir = super::super::tests::scratch("transfer-member");
+        super::super::tests::tls_files(&dir);
+        let at = |name: &str| format!("{}", dir.join(name).display());
+        let cli = |ca: &str| {
+            Cli::try_parse_from([
+                "kbf-daemon".to_owned(),
+                "--server=https://front:7070".to_owned(),
+                format!("--ca-cert={ca}"),
+                format!("--cert={}", at("node.pem")),
+                format!("--key={}", at("node.key")),
+                "--node-id=n1".to_owned(),
+                "--driver=native".to_owned(),
+                format!("--data-dir={}", dir.display()),
+                format!("--xcode-apps={}", dir.join("Applications").display()),
+            ])
+            .expect("flags")
+        };
+        let argv = [
+            "storage".to_owned(),
+            "--storage-listen=127.0.0.1:0".to_owned(),
+            format!("--cold-store=file://{}", dir.join("cold").display()),
+            format!("--meta-dir={}", dir.join("meta").display()),
+        ];
+        let matches = kbf_server::storage_node::command().get_matches_from(argv);
+        let flags = kbf_server::storage_node::parse(&matches).expect("the storage flags");
+        let half = kbf_server::storage_half::start(&flags, || Ok(std::future::pending::<()>()))
+            .await
+            .expect("the storage half starts");
+        let local = kbf_daemon::LocalMember::new(half.addr.to_string(), half.in_process());
+        // `start_member` builds the plane when the native driver is set up, on a thread of
+        // its own: dropping the daemon's runtime in the test's would panic.
+        let start = |ca: String, local: kbf_daemon::LocalMember| {
+            let cli = cli(&ca);
+            tokio::task::spawn_blocking(move || {
+                super::super::start_member(&cli, local)
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            })
+        };
+        start(at("ca.pem"), local.clone())
+            .await
+            .expect("joined")
+            .expect("the member plane");
+        let why = start(at("no-such-ca.pem"), local)
+            .await
+            .expect("joined")
+            .expect_err("no CA file");
+        assert!(why.contains("no-such-ca.pem"), "{why}");
     }
 }

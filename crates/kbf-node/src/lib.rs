@@ -4,7 +4,7 @@
 //! the same functions. See the `kbf-daemon` library for what the daemon does.
 //!
 //! Configuration is by flags only (`kbf-daemon --help`). `--driver` picks how leases
-//! run: `fake` (nothing runs; for bring-up), `container` (rootless Podman; Linux) or
+//! run: `fake` (nothing runs; for bring-up), `container` (rootless containers made by `crun`; Linux) or
 //! `native` (plain processes; for Macs), and for `whole_machine` leases on a Mac
 //! `native-whole-machine` (each lease as its own user in its GUI session, through
 //! `kbf-mac-session`; see `whole_machine`). Given more than once, the daemon has one
@@ -45,16 +45,66 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use kbf_daemon::LocalMember;
 use kbf_daemon::{
-    Args, Capacity, DAEMON_VERSION, Daemon, DaemonConfig, DriverWatch, FakeRuntime, NodeReport,
-    Runtime, Runtimes,
+    Args, Capacity, DAEMON_VERSION, Daemon, DaemonConfig, DriverWatch, FakeRuntime, FarmCas,
+    Liveness, MapHolder, NodeReport, Runtime, Runtimes,
 };
 use kbf_driver_native::slots::Pool;
 use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode, xcode_watch};
 use kbf_outputs::OutputLimits;
 use kbf_threads::disk::Statvfs;
-use kbf_transfer::{Cas, Transfers};
+use kbf_transfer::Cas;
 use tokio::signal::unix::{Signal, SignalKind, signal};
+
+pub use data_dir::DEFAULT_DATA_DIR;
+pub use run::run;
+
+/// What the daemon's flags ask of its host, for a check before it starts (`kbf`'s
+/// startup self-checks read it): the files it reads and the programs it runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostNeeds {
+    /// `--ca-cert`.
+    pub ca_cert: PathBuf,
+    /// `--cert`.
+    pub cert: PathBuf,
+    /// `--key`.
+    pub key: PathBuf,
+    /// `--node-id`: the one name the certificate must carry.
+    pub node_id: String,
+    /// `--data-dir`, as the daemon resolves it.
+    pub data_dir: PathBuf,
+    /// Set when the container driver runs: what it needs.
+    pub container: Option<ContainerNeeds>,
+}
+
+/// What the container driver asks of its host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainerNeeds {
+    /// `--oci-runtime`: the program that runs the containers.
+    pub oci_runtime: PathBuf,
+}
+
+impl Cli {
+    /// What these flags ask of the host.
+    #[must_use]
+    pub fn host_needs(&self) -> HostNeeds {
+        let container = self
+            .drivers
+            .contains(&Driver::Container)
+            .then(|| ContainerNeeds {
+                oci_runtime: self.oci_runtime.clone(),
+            });
+        HostNeeds {
+            ca_cert: self.daemon.ca_cert.clone(),
+            cert: self.daemon.cert.clone(),
+            key: self.daemon.key.clone(),
+            node_id: self.daemon.node_id.clone(),
+            data_dir: self.data_dir(),
+            container,
+        }
+    }
+}
 
 /// The `kbf-daemon` command line.
 #[derive(Clone, Debug, clap::Parser)]
@@ -75,6 +125,12 @@ pub struct Cli {
     /// one connection, within the `--transfer-*` limits.
     #[arg(long)]
     cas: Option<String>,
+    /// The update directory: the daemon fetches the release the frontend offers into
+    /// its `inbox/`, over the connection `--cas` names, and reads the root helper's
+    /// `status.json` there. Left out, the node updates by hand: it says so and touches
+    /// no directory. Not taken by the all-in-one binary yet.
+    #[arg(long, value_name = "DIR")]
+    update_dir: Option<PathBuf>,
     #[command(flatten)]
     data: data_dir::DataArgs,
     #[command(flatten)]
@@ -196,21 +252,15 @@ pub struct Cli {
     require_metal_toolchain: bool,
     /// A container image this node is pinned to, as an action names it:
     /// `docker://<repo>@sha256:<digest>`, one architecture's manifest digest
-    /// (container; repeatable). At start the daemon checks each is in its user's image
-    /// store, as the prepare step of every lease does, and exits with status 2 if one
-    /// is not, or names an image index, saying the fix (`podman pull <repo>@sha256:<d>`).
-    /// The node's status lists them (`GET /v1/nodes`, `software.container_images`).
-    /// No work is placed by image yet: an action may still name another image.
+    /// (container; repeatable). At start the daemon makes sure each is in the node's
+    /// image store, as the prepare step of every lease does: it fetches the image from
+    /// its registry by that digest, checks every byte against a digest, and unpacks it
+    /// once. It exits with status 2 if one cannot be fetched, fails a check, or names an
+    /// image index. The node's status lists them (`GET /v1/nodes`,
+    /// `software.container_images`). No work is placed by image yet: an action may still
+    /// name another image.
     #[arg(long = "image", value_name = "IMAGE")]
     images: Vec<String>,
-    /// The runtime that runs each action's container (container): `podman`, the default,
-    /// runs `podman create` and `podman start` per action; `oci` runs each action in a
-    /// fresh rootless sandbox through `--oci-runtime` directly, with no Podman on the
-    /// action path (Podman only pulls and exports an image once per digest). `oci` needs
-    /// the daemon user's subordinate ids in one range, `uidmap`, and every directory down
-    /// to `--data-dir` searchable by others.
-    #[arg(long, default_value = "podman", value_parser = ["podman", "oci"], value_name = "podman|oci")]
-    container_runtime: String,
     /// Where each lease runs among the node's CPUs (container, Linux): `none`, the
     /// default, lets a lease use any CPU the daemon may; `numa-node` puts each lease on
     /// one NUMA node, its CPUs (`cpuset.cpus`) and memory (`cpuset.mems`), the node with
@@ -225,7 +275,10 @@ pub struct Cli {
     /// Where the kernel lists NUMA nodes (container). For tests of the placement only.
     #[arg(long, hide = true, default_value = "/sys/devices/system/node")]
     numa_dir: PathBuf,
-    /// The OCI runtime `--container-runtime=oci` runs actions with (container).
+    /// The OCI runtime that runs each action's container (container): `crun`, run
+    /// directly. Each action gets a fresh rootless sandbox. It needs the daemon user's
+    /// subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on
+    /// `PATH`, and every directory down to `--data-dir` searchable by others.
     #[arg(long, default_value = "/usr/bin/crun")]
     oci_runtime: PathBuf,
     /// A directory holding `passwd`, `subuid` and `subgid` that the container
@@ -256,7 +309,7 @@ pub struct Cli {
 enum Driver {
     /// Runs nothing; every action succeeds with an empty result. For bring-up only.
     Fake,
-    /// Each action in a fresh rootless Podman container (Linux).
+    /// Each action in a fresh rootless container made by `crun` (Linux).
     Container,
     /// Each action as plain processes on the node, for Macs.
     Native,
@@ -268,11 +321,11 @@ enum Driver {
 /// What stops the daemon from starting.
 pub type Error = Box<dyn std::error::Error>;
 
-/// The daemon's exit status when an `--image` cannot run on this node.
-const IMAGE_UNUSABLE: u8 = 2;
+/// The daemon's exit status when the host refuses the start ([`exit_code`]).
+const REFUSED: u8 = 2;
 
 /// An `--image` this node cannot run: missing from the image store, an index, or not
-/// an image by digest. The daemon exits with [`IMAGE_UNUSABLE`].
+/// an image by digest. The daemon exits with [`REFUSED`].
 #[derive(Debug)]
 pub struct ImageUnusable(String);
 
@@ -287,11 +340,41 @@ impl std::error::Error for ImageUnusable {}
 /// The exit status for an error that stopped the daemon from starting.
 #[must_use]
 pub fn exit_code(e: &Error) -> ExitCode {
-    if e.is::<ImageUnusable>() {
-        ExitCode::from(IMAGE_UNUSABLE)
+    if refused(e) {
+        ExitCode::from(REFUSED)
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// A start the host refuses that no driver's error type names: the daemon's own cgroup
+/// cannot be read.
+#[derive(Debug)]
+struct HostRefused(String);
+
+impl std::fmt::Display for HostRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HostRefused {}
+
+/// Whether `e` is a start the host refuses, which a restart would not change: an image
+/// that cannot be used ([`ImageUnusable`]), a daemon user without subordinate ids, a
+/// cgroup that is not delegated, or a container runtime that is missing. The units carry
+/// `RestartPreventExitStatus=2`, so systemd leaves such a daemon down for its operator
+/// instead of restarting it every `RestartSec` forever.
+fn refused(e: &Error) -> bool {
+    // The container driver is Linux's: macOS has none of these errors.
+    #[cfg(target_os = "linux")]
+    if e.is::<kbf_driver_container::SubidError>()
+        || e.is::<kbf_driver_container::DelegateError>()
+        || e.is::<kbf_driver_container::OciError>()
+    {
+        return true;
+    }
+    e.is::<ImageUnusable>() || e.is::<HostRefused>()
 }
 
 /// Runs the helper this process was started as, if it was: each run's keeper, the
@@ -307,13 +390,13 @@ pub fn dispatch_helpers() -> Option<ExitCode> {
         return Some(code);
     }
     // So is the `as-user` step an action of the lease-user pool starts through
-    // (`launchctl asuser <uid> kbf-daemon __as-user ...`).
+    // (`launchctl asuser <uid> kbf __as-user ...`).
     #[cfg(target_os = "macos")]
     if let Some(code) = kbf_driver_native::slots::dispatch() {
         return Some(code);
     }
-    // So is the container driver's `__chown-dirs` helper, which it runs inside Podman's
-    // user namespace with the input cache.
+    // So is the container driver's `__chown-dirs` helper, which it runs in a helper
+    // container.
     #[cfg(target_os = "linux")]
     if let Some(code) = kbf_driver_container::chown_dirs::dispatch() {
         return Some(ExitCode::from(code));
@@ -386,7 +469,29 @@ impl NodeHandle {
 /// checks fail ([`ImageUnusable`] among them, for which [`exit_code`] answers 2), or
 /// the node cannot be detected.
 pub fn start(cli: &Cli) -> Result<NodeHandle, Error> {
-    start_with(cli, remote)
+    // The map the frontend pushes lands in `maps`: the daemon fills it, the data plane
+    // routes by it.
+    let maps = Arc::new(MapHolder::new());
+    let held = Arc::clone(&maps);
+    start_over(cli, Some(maps), move |cli, liveness| {
+        farm(cli, &held, liveness).map(|(plane, _)| plane)
+    })
+}
+
+/// [`start`], for a daemon in the process of the storage node `local` (`kbf
+/// storage-and-daemon` with a frontend): the data plane routes every blob by the map the
+/// frontend sends, the blobs of `local` in-process and the others over TLS to their
+/// owners ([`kbf_daemon::member_cas`]). There is no `--cas` leg: with no map held a call
+/// fails UNAVAILABLE and writes nothing.
+///
+/// # Errors
+/// As [`start`].
+pub fn start_member(cli: &Cli, local: LocalMember) -> Result<NodeHandle, Error> {
+    let maps = Arc::new(MapHolder::new());
+    let held = Arc::clone(&maps);
+    start_over(cli, Some(maps), move |cli, liveness| {
+        member(cli, &held, &local, liveness)
+    })
 }
 
 /// [`start`], with every runtime reading and writing blobs through the data plane
@@ -401,6 +506,19 @@ pub fn start_with<C: Cas>(
     cli: &Cli,
     plane: impl Fn(&Cli) -> Result<Arc<C>, Error> + 'static,
 ) -> Result<NodeHandle, Error> {
+    start_over(cli, None, move |cli, _| plane(cli))
+}
+
+/// [`start_with`], and the daemon keeping the storage map its frontend pushes in `maps`
+/// (`None`: the daemon ignores the map, as a server's own process does).
+fn start_over<C: Cas>(
+    cli: &Cli,
+    maps: Option<Arc<MapHolder>>,
+    plane: impl Fn(&Cli, Liveness) -> Result<Arc<C>, Error> + 'static,
+) -> Result<NodeHandle, Error> {
+    // Refused here, before any driver is set up, though only the plane over a storage
+    // map reads the values; the plane gets the checked values, not the flags again.
+    let liveness = cli.daemon.storage_liveness()?;
     let sizes = sizes(cli)?;
     sizes.log();
     let tokio = sizes.runtime()?;
@@ -408,15 +526,76 @@ pub fn start_with<C: Cas>(
         // The CAS channel is made lazily, which needs the runtime's context.
         let _context = tokio.enter();
         let xcrun = Path::new(xcode::XCRUN);
-        let (daemon, _) = node_over(cli, || native_config(cli), xcrun, Box::new(plane))?;
+        // The update client is the frontend's daemon's alone: the in-process daemon of
+        // the all-in-one binary keeps none (its flags may not name one, so that none is
+        // silently ignored).
+        let update = match &maps {
+            Some(_) => Some(update::link(cli)?),
+            None if cli.update_dir.is_some() => {
+                return Err("--update-dir is not taken by the in-process daemon yet".into());
+            }
+            None => None,
+        };
+        let (daemon, _) = node_over(
+            cli,
+            || native_config(cli),
+            xcrun,
+            maps,
+            Box::new(move |cli| plane(cli, liveness)),
+        )?;
+        let daemon = update.into_iter().fold(daemon, Daemon::with_update);
         backstop(cli, daemon)
     };
     Ok(NodeHandle { tokio, daemon })
 }
 
 /// The data plane of a daemon whose server is elsewhere: the process's transfer engine
-/// ([`transfer::engine`]) over `--cas`.
-fn remote(cli: &Cli) -> Result<Arc<Transfers>, Error> {
+/// ([`transfer::engine`]) over `--cas`, used until the frontend sends a storage map and
+/// not after (`kbf_daemon::FarmCas`). With a map every blob goes to the storage node that
+/// owns it, verified against its own name from the map (the daemon's CA and certificate,
+/// never `--tls-server-name`, which names the frontend). A frontend that sends no map
+/// leaves the daemon on `--cas`, as before the map existed. Each change of side is
+/// logged once, by the plane.
+///
+/// Answers the plane with the liveness its storage nodes hold, read back from them: the
+/// plane keeps them as `dyn Nodes`, which has none to read, and a test must see that the
+/// flags arrived (`start` drops it).
+fn farm(
+    cli: &Cli,
+    maps: &Arc<MapHolder>,
+    liveness: Liveness,
+) -> Result<(Arc<FarmCas>, Liveness), Error> {
+    let server = Arc::new(transfer::engine(cli)?);
+    let nodes = kbf_daemon::storage_nodes(&DaemonConfig::from_args(&cli.daemon).tls, liveness)?;
+    tracing::info!(
+        "data plane: through --cas until the frontend sends a storage map, then to the \
+         storage nodes it names"
+    );
+    let held = nodes.liveness();
+    let plane = FarmCas::new(server, Arc::clone(maps), nodes, &cli.transfer.config());
+    Ok((Arc::new(plane), held))
+}
+
+/// The data plane of [`start_member`]: the daemon's CA and certificate for the members
+/// that are not `local`, each verified against its own name from the map.
+fn member(
+    cli: &Cli,
+    maps: &Arc<MapHolder>,
+    local: &LocalMember,
+    liveness: Liveness,
+) -> Result<Arc<kbf_transfer::RoutedCas>, Error> {
+    let nodes = kbf_daemon::storage_nodes(&DaemonConfig::from_args(&cli.daemon).tls, liveness)?;
+    Ok(kbf_daemon::member_cas(
+        Arc::clone(maps),
+        local.clone(),
+        nodes,
+        &cli.transfer.config(),
+    ))
+}
+
+/// The engine over `--cas` alone, for tests of the node's set-up.
+#[cfg(test)]
+fn remote(cli: &Cli) -> Result<Arc<kbf_transfer::Transfers>, Error> {
     Ok(Arc::new(transfer::engine(cli)?))
 }
 
@@ -548,11 +727,13 @@ impl<C: Cas> Node<C> {
 /// `Daemon::with_driver_report`. Its status lists every `--image`, which only the
 /// container driver runs: without it, `--image` fails the start. With a real driver, once
 /// every runtime is built, it claims the lease directory and names the claim it found
-/// as its predecessor (`instance`).
+/// as its predecessor (`instance`). With `maps`, the daemon keeps the storage map its
+/// frontend pushes there.
 fn node_over<C: Cas>(
     cli: &Cli,
     native: impl Fn() -> Result<NativeConfig, Error>,
     xcrun: &Path,
+    maps: Option<Arc<MapHolder>>,
     plane: MakePlane<C>,
 ) -> Result<(Daemon, Option<Reports>), Error> {
     if !cli.images.is_empty() && !cli.drivers.contains(&Driver::Container) {
@@ -608,6 +789,9 @@ fn node_over<C: Cas>(
     let daemon = Daemon::new(DaemonConfig::from_args(&cli.daemon), runtimes, report)?
         .with_container_images(cli.images.iter().cloned())
         .with_phase(phase);
+    // One line, not a match: this function has an instance per data plane, and an arm
+    // each instance never takes would be a line the coverage ratchet counts as missed.
+    let daemon = maps.into_iter().fold(daemon, Daemon::with_map);
     // Every runtime is built, so every sweep has run: claim the scratch directory.
     let daemon = match &plan {
         Some(plan) => instance::named(daemon, &plan.leases()),
@@ -626,7 +810,7 @@ fn node(
     native: impl Fn() -> Result<NativeConfig, Error>,
     xcrun: &Path,
 ) -> Result<(Daemon, Option<Reports>), Error> {
-    node_over(cli, native, xcrun, Box::new(remote))
+    node_over(cli, native, xcrun, None, Box::new(remote))
 }
 
 /// [`node`] with the native driver alone, its configuration `config`.
@@ -715,8 +899,8 @@ fn data_dir(cli: &Cli) -> Result<Option<data_dir::Plan>, Error> {
     // The drivers that link or clone leases' inputs from the cache.
     let cached = cli.drivers.contains(&Driver::Container)
         || (cfg!(target_os = "macos") && cli.drivers.contains(&Driver::Native));
-    // The OCI backend's container ids are not the daemon's: `leases` must be searchable.
-    let oci = cli.drivers.contains(&Driver::Container) && cli.container_runtime == "oci";
+    // The container ids are not the daemon's: `leases` must be searchable.
+    let oci = cli.drivers.contains(&Driver::Container);
     let plan = data_dir::Plan::new(&cli.data, cached, &Statvfs)?.with_open_leases(oci);
     plan.create()?;
     for line in plan.describe() {
@@ -768,8 +952,8 @@ mod container {
     use std::time::Duration;
 
     use kbf_driver_container::{
-        ContainerLimits, IdFiles, ImageRef, LeasePlacement, OutputLimits, PodmanConfig,
-        PodmanRuntime, SwapKill,
+        ContainerConfig, ContainerLimits, ContainerRuntime, IdFiles, ImageRef, LeasePlacement,
+        OutputLimits, SwapKill,
     };
 
     use super::{Cli, Error, ImageUnusable, Node, scratch};
@@ -802,8 +986,9 @@ mod container {
                 parent.clone()
             }
             None => {
-                let own = std::fs::read_to_string(&cli.self_cgroup)
-                    .map_err(|e| format!("read {}: {e}", cli.self_cgroup.display()))?;
+                let own = std::fs::read_to_string(&cli.self_cgroup).map_err(|e| {
+                    super::HostRefused(format!("read {}: {e}", cli.self_cgroup.display()))
+                })?;
                 let memory_min = cli.supervisor_memory_min_mib.saturating_mul(1 << 20);
                 let delegation =
                     kbf_driver_container::delegate(mount, &own, memory_min, memory_max)?;
@@ -847,9 +1032,8 @@ mod container {
                 kbf_driver_container::numa::start(&cli.numa_dir, mount, &parent, whole_host)?
             }
         };
-        let mut config = PodmanConfig::new(scratch, parent, cli.daemon.node_id.clone());
+        let mut config = ContainerConfig::new(scratch, parent);
         config.placer = placer;
-        config.container_runtime = cli.container_runtime.parse()?;
         config.oci.runtime = cli.oci_runtime.clone();
         config.oci.id_files = files;
         config.cgroup_root = mount.clone();
@@ -863,8 +1047,8 @@ mod container {
         config.cpu = cpu_pool(cli)?;
         config.limits = limits(cli);
         config.swap_kill = swap_kill(cli);
-        config.cache = plan.as_ref().and_then(crate::data_dir::given);
-        let runtime = PodmanRuntime::new(config, cas)?;
+        config.cache = crate::data_dir::given(plan.as_ref(), &cli.data);
+        let runtime = ContainerRuntime::new(config, cas)?;
         // From `start`, in the runtime's context but outside any task.
         tokio::runtime::Handle::current().block_on(check_images(&runtime, &cli.images))?;
         node.add(Arc::new(runtime))?;
@@ -876,7 +1060,7 @@ mod container {
     /// node's image store, one architecture's manifest. The first that is not stops the
     /// start, with its fix.
     async fn check_images<C: Cas>(
-        runtime: &PodmanRuntime<C>,
+        runtime: &ContainerRuntime<C>,
         images: &[String],
     ) -> Result<(), ImageUnusable> {
         for value in images {
@@ -931,11 +1115,15 @@ mod container {
 
 mod data_dir;
 mod instance;
+mod run;
 mod transfer;
+mod update;
 mod whole_machine;
 
 #[cfg(test)]
 mod deploy_doc_tests;
+#[cfg(test)]
+mod exit_tests;
 #[cfg(test)]
 mod instance_tests;
 #[cfg(test)]
@@ -1605,5 +1793,166 @@ mod tests {
             .expect_err("no TLS files")
             .to_string();
         assert!(why.contains("ca.pem"), "{why}");
+    }
+
+    /// The three liveness flags, each different from the others and from the defaults, so
+    /// that a default, or two values swapped, differs from what was asked.
+    const LIVENESS_FLAGS: [&str; 3] = [
+        "--storage-dial-timeout-ms=7000",
+        "--storage-ping-interval-ms=3000",
+        "--storage-ping-timeout-ms=2000",
+    ];
+
+    fn asked() -> Liveness {
+        Liveness {
+            connect: Duration::from_millis(7000),
+            keepalive_interval: Duration::from_millis(3000),
+            keepalive_timeout: Duration::from_millis(2000),
+        }
+    }
+
+    /// Catches the storage-liveness flags stopping short of the nodes the daemon dials
+    /// storage through: `start` handing its plane the defaults instead of the checked
+    /// flags, or interval and timeout swapped on the way. Both the plane factory's
+    /// argument (`start_with`'s and `start`'s path through `start_over`) and the
+    /// `TlsNodes` that `farm` builds are read back.
+    #[test]
+    fn the_storage_liveness_flags_reach_the_plane_and_its_nodes() {
+        assert_ne!(asked(), Liveness::default());
+        let dir = scratch("liveness");
+        tls_files(&dir);
+        let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
+        let mut flags = vec![
+            "kbf-daemon".to_owned(),
+            "--server=https://127.0.0.1:1".to_owned(),
+            flag("ca-cert", &dir.join("ca.pem")),
+            flag("cert", &dir.join("node.pem")),
+            flag("key", &dir.join("node.key")),
+            "--node-id=mac-1".to_owned(),
+            // A driver that moves blobs, so that the plane is made.
+            "--driver=native".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
+            flag("data-dir", &dir),
+            flag("xcode-apps", &dir.join("Applications")),
+        ];
+        flags.extend(LIVENESS_FLAGS.map(str::to_owned));
+        let cli = Cli::try_parse_from(flags).expect("flags");
+        // `farm` builds the nodes from what it is given; what it holds is read back.
+        // The lazy channel to --cas needs a runtime's context.
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        {
+            let _context = runtime.enter();
+            let (_, held) = farm(&cli, &Arc::new(MapHolder::new()), asked()).expect("the plane");
+            assert_eq!(held, asked());
+        }
+        drop(runtime);
+        // start_over checks the flags and hands the plane factory the checked values.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let record = Arc::clone(&seen);
+        let handle = start_over(&cli, None, move |cli, liveness| {
+            *record.lock().expect("lock") = Some(liveness);
+            remote(cli)
+        })
+        .expect("start");
+        drop(handle);
+        assert_eq!(*seen.lock().expect("lock"), Some(asked()));
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
+    /// The plane factory the update-dir test hands `start_over` three times: one function
+    /// item, so the three starts are one instantiation (the coverage ratchet counts the
+    /// best instantiation, which must run every arm of the match on the map and the flag).
+    fn plane(cli: &Cli, _: Liveness) -> Result<Arc<kbf_transfer::Transfers>, Error> {
+        remote(cli)
+    }
+
+    /// Catches a flag taken and ignored, and an update client left off: with a storage map
+    /// and `--update-dir` the daemon gets its update client; without a map (the in-process
+    /// daemon of the all-in-one binary) `--update-dir` is refused instead of silently doing
+    /// nothing; with neither, nothing is asked.
+    ///
+    /// Mutants seen red: the refusing arm dropped (the second start succeeds); the link
+    /// made whatever the flag says (the third start fails on the missing directory).
+    #[test]
+    fn the_update_dir_is_for_a_daemon_with_a_map_and_refused_without_one() {
+        let dir = scratch("update-dir");
+        tls_files(&dir);
+        let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
+        let base = vec![
+            "kbf-daemon".to_owned(),
+            "--server=https://127.0.0.1:1".to_owned(),
+            flag("ca-cert", &dir.join("ca.pem")),
+            flag("cert", &dir.join("node.pem")),
+            flag("key", &dir.join("node.key")),
+            "--node-id=mac-1".to_owned(),
+            "--driver=native".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
+            flag("data-dir", &dir),
+            flag("xcode-apps", &dir.join("Applications")),
+        ];
+        let mut asked = base.clone();
+        asked.push(flag("update-dir", &dir.join("update")));
+        let with_dir = Cli::try_parse_from(asked).expect("flags");
+        let base_flags = base.clone();
+        let without = Cli::try_parse_from(base).expect("flags");
+        let started = start_over(&with_dir, Some(Arc::new(MapHolder::new())), plane);
+        drop(started.expect("a daemon with a map takes an update directory"));
+        let why = start_over(&with_dir, None, plane).err().expect("refused");
+        assert!(
+            why.to_string().contains("--update-dir is not taken"),
+            "{why}"
+        );
+        drop(start_over(&without, None, plane).expect("no flag, no client"));
+        // The fourth start fails inside `node_over`: this instantiation also takes the
+        // error return of that call, so it is the one the ratchet counts as fully run.
+        let mut broken = base_flags.clone();
+        broken.push("--lease-placement=numa-node".to_owned());
+        let broken = Cli::try_parse_from(broken).expect("flags");
+        let why = start_over(&broken, None, plane).err().expect("refused");
+        assert!(why.to_string().contains("only --driver container"), "{why}");
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
+    /// Catches a daemon that starts with storage-liveness flags it cannot honour: a zero
+    /// value, or a ping timeout past the interval, is refused by `start` (and by
+    /// `start_with`, as the same check) before any driver is set up, naming the flag.
+    #[test]
+    fn start_refuses_unusable_storage_liveness_flags() {
+        for (flag, said) in [
+            (
+                "--storage-dial-timeout-ms=0",
+                "--storage-dial-timeout-ms must be at least 1",
+            ),
+            (
+                "--storage-ping-interval-ms=0",
+                "--storage-ping-interval-ms must be at least 1",
+            ),
+            (
+                "--storage-ping-timeout-ms=0",
+                "--storage-ping-timeout-ms must be at least 1",
+            ),
+            (
+                "--storage-ping-timeout-ms=10001",
+                "is longer than --storage-ping-interval-ms",
+            ),
+            (
+                "--storage-dial-timeout-ms=3600001",
+                "--storage-dial-timeout-ms must be at most 3600000",
+            ),
+            (
+                "--storage-ping-interval-ms=3600001",
+                "--storage-ping-interval-ms must be at most 3600000",
+            ),
+            (
+                "--storage-ping-timeout-ms=3600001",
+                "--storage-ping-timeout-ms must be at most 3600000",
+            ),
+        ] {
+            let cli = parse(&["--driver=fake", flag]).expect("flags parse");
+            for refused in [start(&cli).err(), start_with(&cli, remote).err()] {
+                let why = refused.expect(flag).to_string();
+                assert!(why.contains(said), "{flag}: {why}");
+            }
+        }
     }
 }

@@ -1,0 +1,33 @@
+[package]
+name = "kbf-ca"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The farm's certificate authority (docs/design/install-and-enrollment.md, sections 5.5 and
+# 6.1 to 6.4): the CA key and root, the `Signer` seam the key sits behind, CSR validation,
+# the one certificate builder, serials, the lifetime policy, and the bundles and staged
+# rotation. A library with no network and no state store: the time and the random source
+# are parameters, so a test replays exactly.
+[dependencies]
+kbf-types.workspace = true
+base64.workspace = true
+rcgen = { workspace = true, features = ["x509-parser"] }
+ring.workspace = true
+rustix = { workspace = true, features = ["fs", "process"] }
+rustls.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+x509-parser = { workspace = true, features = ["verify"] }
+
+[dev-dependencies]
+kbf-map.workspace = true
+kbf-peer.workspace = true
+kbf-proto.workspace = true
+
+[lints]
+workspace = true

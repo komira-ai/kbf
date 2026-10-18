@@ -10,6 +10,7 @@ use kbf_sched::RequeueReason;
 use kbf_types::{Digest, Failure, LeaseId, WorkerId};
 
 use crate::event::{Call, InvocationId, Listing, Metadata, Outcome, Output, Owner, WallTime};
+use crate::run::{ActionShape, Run};
 
 /// Rows one record keeps; past it, actions are counted but not rowed (section 3.3).
 pub const ROW_CAP: usize = 1_000_000;
@@ -134,6 +135,12 @@ pub struct Attempt {
     pub ended: Option<WallTime>,
     /// How it ended; `None` while it is held.
     pub end: Option<AttemptEnd>,
+    /// What its lease's report measured; `None` without a report the scheduler took.
+    pub run: Option<Box<Run>>,
+    /// The id the history writer minted for this attempt in this record, as opaque bytes
+    /// (`kbf_history::RunId::to_bytes`); `None` until the recorder's tap sets one
+    /// ([`crate::Records::set_run_id`]).
+    pub run_id: Option<[u8; 12]>,
 }
 
 /// How a lease ended.
@@ -177,6 +184,9 @@ pub struct ActionRow {
     pub outputs_truncated: bool,
     /// The Command digest, once the recorder has read it from the Action blob.
     pub command: Option<Digest>,
+    /// The shape the server read from the Command; `None` until then, and for an
+    /// action that was not queued (a cache hit).
+    pub shape: Option<Box<ActionShape>>,
 }
 
 impl ActionRow {
@@ -196,6 +206,7 @@ impl ActionRow {
             listing: None,
             outputs_truncated: false,
             command: None,
+            shape: None,
         }
     }
 
@@ -213,8 +224,8 @@ impl ActionRow {
     }
 
     /// The memory the row holds beyond its own slot in the record's row list, as the
-    /// bound of section 3.5 counts it: the bytes of its texts, its attempts and its
-    /// outputs. Every list a row holds is allocated to its length (a copy, or cut
+    /// bound of section 3.5 counts it: the bytes of its texts, its shape, its attempts
+    /// and its outputs. Every list a row holds is allocated to its length (a copy, or cut
     /// back), so lengths are its capacities.
     pub(crate) fn heap_bytes(&self) -> usize {
         let text = |t: &Option<Text>| t.as_ref().map_or(0, |t| t.value.len());
@@ -231,7 +242,18 @@ impl ActionRow {
             + attempts_bytes(&self.attempts)
             + outcome_bytes(self.outcome.as_ref())
             + outputs
+            + self.shape.as_deref().map_or(0, shape_bytes)
     }
+}
+
+/// What a row's shape takes: its box and its texts.
+pub(crate) fn shape_bytes(shape: &ActionShape) -> usize {
+    size_of::<ActionShape>() + shape.heap_bytes()
+}
+
+/// What an attempt's run takes: its box and its NUMA list.
+pub(crate) fn run_bytes(run: &Run) -> usize {
+    size_of::<Run>() + run.heap_bytes()
 }
 
 /// What a row's `attempts` take beyond the row, as [`ActionRow::heap_bytes`] counts
@@ -240,13 +262,13 @@ pub(crate) fn attempts_bytes(attempts: &[Attempt]) -> usize {
     attempts.iter().map(attempt_bytes).sum()
 }
 
-/// What one attempt takes: itself, its worker's name and its failure reason.
+/// What one attempt takes: itself, its worker's name, its failure reason and its run.
 pub(crate) fn attempt_bytes(a: &Attempt) -> usize {
     let reason = match &a.end {
         Some(AttemptEnd::Failed(_, why)) => why.len(),
         _ => 0,
     };
-    size_of::<Attempt>() + a.worker.as_str().len() + reason
+    size_of::<Attempt>() + a.worker.as_str().len() + reason + a.run.as_deref().map_or(0, run_bytes)
 }
 
 /// What an outcome's text takes.
@@ -402,6 +424,37 @@ pub struct Invocation {
     pub(crate) indexed: WallTime,
     /// Whether the memory bound stopped this record taking rows (section 3.5, step 3).
     pub(crate) rows_closed: bool,
+    /// The `last_seen` at which [`crate::Records::idle_since`] last reported the record.
+    pub(crate) idle_reported: Option<WallTime>,
+    /// Where a record read back from history ([`Invocation::restored`]) that is not
+    /// complete has a hole: the time of the last chunk written. `None` for a live
+    /// record, and for a restored one that is complete.
+    pub(crate) gap_from: Option<WallTime>,
+    /// Whether the record was read back from history, not built from events.
+    pub(crate) from_history: bool,
+}
+
+/// What a record read back from history says of its invocation as a whole, for
+/// [`Invocation::restored`]. History does not keep the first caller's owner, the tool,
+/// the correlated id or the call counters that no row shows: a restored record has none
+/// of them.
+pub struct Restored {
+    /// The record's key.
+    pub key: RecordKey,
+    /// The record's [`Invocation::serial`]: one no record the recorder made has had.
+    pub serial: u64,
+    /// The instance names its records used.
+    pub instances: BTreeSet<String>,
+    /// The first record's time.
+    pub first_seen: WallTime,
+    /// The last record's time.
+    pub last_seen: WallTime,
+    /// Whether history holds every record: it was closed and dropped none.
+    pub complete: bool,
+    /// When not complete: the time of the last chunk written, where the hole starts.
+    pub gap_from: Option<WallTime>,
+    /// Whether more records were held than `rows` has (the reader stopped at its bound).
+    pub rows_capped: bool,
 }
 
 impl Invocation {
@@ -429,7 +482,72 @@ impl Invocation {
             counted: 0,
             indexed: call.at,
             rows_closed: false,
+            idle_reported: None,
+            gap_from: None,
+            from_history: false,
         }
+    }
+
+    /// A record read back from history: `parts` and `rows`, in the order first seen.
+    /// It is not minted and holds no operation. Its counters are those the rows show:
+    /// `ran`, `cache_hit_execute` and `joined` count the rows of each `how`, `execute`
+    /// their sum, `ac_hit` the rows answered by `GetActionResult`, and `failed` the rows
+    /// whose outcome is a failure; `ac_miss`, `blobs_*` and `bytes_*` are 0, which history
+    /// does not keep. `rows` must name distinct actions.
+    #[must_use]
+    pub fn restored(parts: Restored, rows: Vec<ActionRow>) -> Self {
+        let mut counts = Counts::default();
+        for r in &rows {
+            match r.how {
+                How::CacheHit => counts.ac_hit += 1,
+                How::CacheHitExecute => counts.cache_hit_execute += 1,
+                How::Joined => counts.joined += 1,
+                How::Ran => counts.ran += 1,
+            }
+            counts.failed += u64::from(r.outcome.as_ref().is_some_and(Outcome::is_failure));
+        }
+        counts.execute = counts.ran + counts.cache_hit_execute + counts.joined;
+        let Restored {
+            key,
+            serial,
+            instances,
+            first_seen,
+            last_seen,
+            complete,
+            gap_from,
+            rows_capped,
+        } = parts;
+        let mut inv = Self {
+            key,
+            serial,
+            minted: false,
+            owner: Owner::default(),
+            tool: None,
+            tool_version: None,
+            correlated_invocations_id: None,
+            instances,
+            first_seen,
+            last_seen,
+            complete,
+            rows_capped,
+            counts,
+            collisions: Vec::new(),
+            rows: Vec::with_capacity(rows.len()),
+            by_action: BTreeMap::new(),
+            in_flight: 0,
+            row_bytes: Vec::with_capacity(rows.len()),
+            rows_bytes: 0,
+            counted: 0,
+            indexed: last_seen,
+            rows_closed: false,
+            idle_reported: None,
+            gap_from: gap_from.filter(|_| !complete),
+            from_history: true,
+        };
+        for row in rows {
+            inv.push_row(row);
+        }
+        inv
     }
 
     /// Takes what any call says about the invocation as a whole.
@@ -631,6 +749,20 @@ impl Invocation {
     /// while it was open (section 3.4).
     pub const fn mark_incomplete(&mut self) {
         self.complete = false;
+    }
+
+    /// Whether the record was read back from history ([`Invocation::restored`]) and not
+    /// built from the events of a live invocation.
+    #[must_use]
+    pub const fn from_history(&self) -> bool {
+        self.from_history
+    }
+
+    /// For a record read back from history that is not complete: the time of the last
+    /// chunk written, where its hole starts. `None` for every other record.
+    #[must_use]
+    pub const fn gap_from(&self) -> Option<WallTime> {
+        self.gap_from
     }
 
     /// Whether the record stopped taking rows.

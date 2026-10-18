@@ -1,0 +1,1152 @@
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::rc::Rc;
+
+use super::*;
+use crate::linux::host::{SS, SWAPON, SYSTEMCTL};
+use kbf_host::plan::{Mode as PlanMode, execute};
+use kbf_host::step::Step;
+use kbf_host::testkit::{ScratchHost, reply};
+use kbf_host::user::{GETENT, ID};
+
+const EXAMPLE: &str = include_str!("../../templates/linux/config.example");
+
+fn me() -> (u32, u32) {
+    (
+        rustix::process::getuid().as_raw(),
+        rustix::process::getgid().as_raw(),
+    )
+}
+
+fn runner() -> Owner {
+    let (uid, gid) = me();
+    Owner { uid, gid }
+}
+
+/// What the fake host's tools see.
+struct World {
+    users: BTreeMap<String, (u32, u32)>,
+    enabled: BTreeSet<String>,
+    active: BTreeSet<String>,
+    /// What `kbf check-args` exits with.
+    check_args: i32,
+    /// Whether `swapon --show` lists a swap area.
+    swap: bool,
+    /// What `ss -Hltn` prints.
+    listening: String,
+}
+
+fn install(mode: Mode, bin_dir: Option<&str>) -> InstallMode {
+    InstallMode {
+        config: LinuxConfig::parse(EXAMPLE).expect("valid settings"),
+        mode,
+        bin_dir: bin_dir.map(|d| HostPath::new(d).expect("path")),
+    }
+}
+
+fn write(exec: &ScratchHost, path: &str, text: &str, mode: u32) {
+    let full = exec.at(path);
+    fs::create_dir_all(full.parent().expect("parent")).expect("dirs");
+    let _ = fs::remove_file(&full);
+    fs::write(&full, text).expect("write");
+    fs::set_permissions(&full, fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+/// A scratch host that passes every check of every built mode: both users are the
+/// test's own uid, kbf is installed, every file a unit reads is there (keys 0600).
+fn host(name: &str) -> (ScratchHost, Rc<RefCell<World>>) {
+    let mut exec = ScratchHost::new(name);
+    let (uid, gid) = me();
+    let world = Rc::new(RefCell::new(World {
+        users: BTreeMap::from([
+            ("kbf".to_owned(), (uid, gid)),
+            ("kbf-server".to_owned(), (uid, gid)),
+        ]),
+        enabled: BTreeSet::new(),
+        active: BTreeSet::new(),
+        check_args: 0,
+        swap: true,
+        listening: "LISTEN 0 4096 0.0.0.0:22 0.0.0.0:*\n".to_owned(),
+    }));
+    let w = Rc::clone(&world);
+    exec.answer = Box::new(move |cmd| {
+        let mut w = w.borrow_mut();
+        let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
+        Ok(match (cmd.program.as_str(), &args[..]) {
+            (GETENT, ["passwd", "--", name]) => match w.users.get(*name) {
+                Some((u, g)) => reply(
+                    0,
+                    &format!("{name}:x:{u}:{g}::/srv/{name}:/bin/false\n"),
+                    "",
+                ),
+                None => reply(2, "", ""),
+            },
+            (ID, ["-G", "--", name]) => reply(0, &format!("{}\n", w.users[*name].1), ""),
+            (SYSTEMCTL, ["is-active", "--quiet", u]) => {
+                reply(i32::from(!w.active.contains(*u)), "", "")
+            }
+            (SYSTEMCTL, ["is-enabled", "--quiet", u]) => {
+                reply(i32::from(!w.enabled.contains(*u)), "", "")
+            }
+            (SYSTEMCTL, ["enable", u]) => {
+                w.enabled.insert((*u).to_owned());
+                reply(0, "", "")
+            }
+            (SYSTEMCTL, ["restart" | "start", u]) => {
+                w.active.insert((*u).to_owned());
+                reply(0, "", "")
+            }
+            (SWAPON, _) => reply(0, if w.swap { "/swapfile\n" } else { "" }, ""),
+            (SS, _) => reply(0, &w.listening, ""),
+            (_, ["check-args", ..]) => reply(w.check_args, "", ""),
+            _ => reply(0, "", ""),
+        })
+    });
+    write(
+        &exec,
+        "/sys/fs/cgroup/cgroup.controllers",
+        "cpuset cpu io memory pids\n",
+        0o444,
+    );
+    write(&exec, "/etc/subuid", "kbf:100000:65536\n", 0o644);
+    write(&exec, "/etc/subgid", "kbf:100000:65536\n", 0o644);
+    write(&exec, "/var/lib/systemd/linger/kbf", "", 0o644);
+    for tool in ["crun", "newuidmap", "newgidmap"] {
+        write(&exec, &format!("/usr/bin/{tool}"), "tool", 0o755);
+    }
+    write(
+        &exec,
+        "/etc/kbf/s3.env",
+        "AWS_ACCESS_KEY_ID=k\nAWS_SECRET_ACCESS_KEY=s\n",
+        0o600,
+    );
+    for key in [
+        "storage.key",
+        "api-token",
+        "reapi.key",
+        "worker.key",
+        "node.key",
+    ] {
+        write(&exec, &format!("/etc/kbf/{key}"), "secret", 0o600);
+    }
+    for public in [
+        "ca.pem",
+        "storage.pem",
+        "reapi.pem",
+        "worker.pem",
+        "node.pem",
+        "deny-list",
+    ] {
+        write(&exec, &format!("/etc/kbf/{public}"), "pem", 0o644);
+    }
+    write(&exec, "/usr/local/bin/kbf", "kbf-1", 0o755);
+    (exec, world)
+}
+
+fn plan_here(exec: &ScratchHost, a: &InstallMode) -> Result<(Plan, String), HostError> {
+    let mut out = Vec::new();
+    let p = plan_with(exec, a, runner(), &mut out)?;
+    Ok((p, String::from_utf8(out).expect("utf-8")))
+}
+
+fn steps(p: &Plan) -> Vec<String> {
+    p.steps().iter().map(ToString::to_string).collect()
+}
+
+/// The steps after the unit files: the directories and the service steps.
+fn tail(p: &Plan) -> Vec<String> {
+    let all = steps(p);
+    let at = all
+        .iter()
+        .rposition(|s| s.starts_with("write /etc/systemd/system/"))
+        .map_or(0, |i| i + 1);
+    all[at..].to_vec()
+}
+
+fn go(exec: &mut ScratchHost, a: &InstallMode, mode: PlanMode) {
+    let (p, _) = plan_here(exec, a).expect("plan");
+    execute(&p, RunAs::Root, mode, exec, &mut Vec::new()).expect("install-units --mode");
+}
+
+/// The storage node on a fresh host: the slice and its unit (the bytes
+/// `render-units --mode storage` makes), its metadata and hot store directories its
+/// user's alone, then reload, enable and restart; no `/readyz` wait (it has no operator
+/// API). A dry run changes nothing; after the apply a re-run plans nothing. Catches a
+/// unit written with other bytes, a directory left for kbf to make as the wrong user or
+/// mode, the unit started by a dry run, and a restart on every run.
+#[test]
+fn the_storage_unit_is_installed_and_a_rerun_plans_nothing() {
+    let (mut exec, world) = host("install-mode-storage");
+    let (uid, gid) = me();
+    let a = install(Mode::Storage, None);
+    let (p, _) = plan_here(&exec, &a).expect("plan");
+    let unit = modes::render(&a.config, None, Mode::Storage).expect("renders");
+    let units: Vec<&Step> = p
+        .steps()
+        .iter()
+        .filter(|s| matches!(s, Step::WriteFile { .. }))
+        .collect();
+    assert_eq!(units.len(), 2, "{:#?}", steps(&p));
+    assert!(matches!(units[1], Step::WriteFile { path, bytes, .. }
+        if path.as_str() == "/etc/systemd/system/kbf-storage.service" && *bytes == unit.as_bytes()));
+    assert_eq!(
+        tail(&p),
+        [
+            "mkdir /var/lib/kbf-server (0755)".to_owned(),
+            format!("mkdir /var/lib/kbf-server/raft (0700, owner {uid}:{gid})"),
+            "mkdir /var/lib/kbf (0755)".to_owned(),
+            format!("mkdir /var/lib/kbf/hot (0700, owner {uid}:{gid})"),
+            "run /usr/bin/systemctl daemon-reload".to_owned(),
+            "run /usr/bin/systemctl enable kbf-storage.service".to_owned(),
+            "run /usr/bin/systemctl restart kbf-storage.service".to_owned(),
+        ]
+    );
+
+    go(&mut exec, &a, PlanMode::DryRun);
+    assert!(!exec.at("/etc/systemd/system/kbf-storage.service").exists());
+    assert!(world.borrow().active.is_empty(), "a dry run started it");
+
+    go(&mut exec, &a, PlanMode::Apply);
+    assert_eq!(
+        fs::read_to_string(exec.at("/etc/systemd/system/kbf-storage.service")).expect("unit"),
+        unit
+    );
+    assert!(world.borrow().active.contains("kbf-storage.service"));
+    let (p, out) = plan_here(&exec, &a).expect("plan");
+    assert_eq!(steps(&p), Vec::<String>::new());
+    assert!(
+        out.contains("unit and binary unchanged: nothing restarted"),
+        "{out}"
+    );
+
+    // Stopped and disabled since: enabled and started again, nothing written.
+    world.borrow_mut().active.clear();
+    world.borrow_mut().enabled.clear();
+    let (p, _) = plan_here(&exec, &a).expect("plan");
+    assert_eq!(
+        steps(&p),
+        [
+            "run /usr/bin/systemctl enable kbf-storage.service",
+            "run /usr/bin/systemctl start kbf-storage.service",
+        ]
+    );
+}
+
+/// [`run`] as the verb runs it, root the owner: a dry run prints each step as a
+/// `DRY-RUN:` line, the unit's file among them, and changes nothing.
+#[test]
+fn a_dry_run_prints_the_plan_and_changes_nothing() {
+    let (mut exec, world) = host("install-mode-dry-run");
+    let mut out = Vec::new();
+    run(
+        &mut exec,
+        &install(Mode::Daemon, None),
+        PlanMode::DryRun,
+        &mut out,
+    )
+    .expect("dry run");
+    let out = String::from_utf8(out).expect("utf-8");
+    assert!(
+        out.contains("DRY-RUN: write /etc/systemd/system/kbf-daemon.service (0644, owner 0:0, "),
+        "{out}"
+    );
+    assert!(!exec.at("/etc/systemd/system/kbf-daemon.service").exists());
+    assert!(world.borrow().active.is_empty());
+}
+
+/// Catches a unit run as root (no `User=`, an empty one, `root` or uid 0, or one
+/// outside `[Service]`) installed: kbf never runs as root.
+#[test]
+fn a_unit_without_a_user_of_its_own_is_refused() {
+    for text in [
+        "[Service]\nExecStart=/usr/local/bin/kbf storage\n",
+        "[Service]\nUser=\n",
+        "[Service]\nUser=root\n",
+        "[Service]\nUser=0\n",
+        "[Unit]\nUser=kbf\n",
+    ] {
+        let unit = UnitFile::parse(text).expect("unit");
+        let e = unit_user(&unit, "kbf-storage.service").expect_err(text);
+        assert!(
+            matches!(&e, HostError::RunsAsRoot(n) if n == "kbf-storage.service"),
+            "{e}"
+        );
+    }
+    let unit = UnitFile::parse("[Service]\nUser=kbf-server\n").expect("unit");
+    assert_eq!(unit_user(&unit, "u").expect("a user"), "kbf-server");
+}
+
+/// all-in-one: its data directory before the cold store under it, and the wait for its
+/// operator API's `/readyz` after the start; with `--bin-dir` the new kbf first, the
+/// old one kept. Catches the cold store's directory planned before its parent's owner
+/// and mode, a start not waited for, a new kbf not installed, and a unit installed
+/// without the stop settings that keep its drain whole.
+#[test]
+fn the_all_in_one_unit_waits_for_readyz_and_installs_a_new_kbf() {
+    let (exec, _) = host("install-mode-aio");
+    write(&exec, "/opt/new/kbf", "kbf-2", 0o755);
+    let (uid, gid) = me();
+    let (p, _) = plan_here(&exec, &install(Mode::AllInOne, Some("/opt/new"))).expect("plan");
+    let all = steps(&p);
+    assert_eq!(
+        all[..2],
+        [
+            format!("write /usr/local/bin/kbf.previous (0755, owner {uid}:{gid}, 5 bytes)"),
+            format!("write /usr/local/bin/kbf (0755, owner {uid}:{gid}, 5 bytes)"),
+        ]
+    );
+    assert_eq!(
+        tail(&p),
+        [
+            format!("mkdir /var/lib/kbf (0755, owner {uid}:{gid})"),
+            "mkdir /var/lib/kbf-server (0755)".to_owned(),
+            format!("mkdir /var/lib/kbf-server/raft (0700, owner {uid}:{gid})"),
+            format!("mkdir /var/lib/kbf/cold (0700, owner {uid}:{gid})"),
+            "run /usr/bin/systemctl daemon-reload".to_owned(),
+            "run /usr/bin/systemctl enable kbf-all-in-one.service".to_owned(),
+            "run /usr/bin/systemctl restart kbf-all-in-one.service".to_owned(),
+            "wait up to 60s for http://127.0.0.1:8982/readyz".to_owned(),
+        ]
+    );
+    // The unit installed is the template's: stopped with SIGTERM, never killed mid-drain.
+    let unit = p
+        .steps()
+        .iter()
+        .find_map(|s| match s {
+            Step::WriteFile { path, bytes, .. }
+                if path.as_str() == "/etc/systemd/system/kbf-all-in-one.service" =>
+            {
+                Some(String::from_utf8_lossy(bytes).into_owned())
+            }
+            _ => None,
+        })
+        .expect("the unit is written");
+    assert!(
+        unit.contains("\nKillSignal=SIGTERM\nTimeoutStopSec=infinity\n"),
+        "{unit}"
+    );
+}
+
+/// The refusals, each before any step: a key file others can read or another user owns, a file the unit reads missing, a
+/// unit kbf's own parser refuses (rule `parse`), a kbf that is not there, a build node
+/// whose user does not linger, and a storage node with no S3 endpoint set.
+/// Catches each of these installed anyway.
+#[test]
+fn an_install_is_refused_before_any_step() {
+    let refused = |name: &str, mode: Mode, edit: &dyn Fn(&ScratchHost, &RefCell<World>)| {
+        let (exec, world) = host(&format!("install-mode-{name}"));
+        edit(&exec, &world);
+        match plan_here(&exec, &install(mode, None)) {
+            Ok((p, _)) => panic!("{name}: planned {:#?}", steps(&p)),
+            Err(e) => e,
+        }
+    };
+    let e = refused("readable-key", Mode::Storage, &|exec, _| {
+        write(exec, "/etc/kbf/storage.key", "secret", 0o640);
+    });
+    assert!(
+        matches!(&e, HostError::Readable { path, .. } if path.as_str() == "/etc/kbf/storage.key"),
+        "{e}"
+    );
+    let e = refused("no-cert", Mode::Storage, &|exec, _| {
+        fs::remove_file(exec.at("/etc/kbf/storage.pem")).expect("rm");
+    });
+    assert!(
+        matches!(&e, HostError::Missing(path) if path.as_str() == "/etc/kbf/storage.pem"),
+        "{e}"
+    );
+    // The daemon's bare --cert= and --key= are files too.
+    let e = refused("no-node-cert", Mode::Daemon, &|exec, _| {
+        fs::remove_file(exec.at("/etc/kbf/node.pem")).expect("rm");
+    });
+    assert!(
+        matches!(&e, HostError::Missing(path) if path.as_str() == "/etc/kbf/node.pem"),
+        "{e}"
+    );
+    let e = refused("node-key-readable", Mode::Daemon, &|exec, _| {
+        write(exec, "/etc/kbf/node.key", "secret", 0o604);
+    });
+    assert!(
+        matches!(&e, HostError::Readable { path, .. } if path.as_str() == "/etc/kbf/node.key"),
+        "{e}"
+    );
+    let e = refused("no-s3-env", Mode::Storage, &|exec, _| {
+        fs::remove_file(exec.at("/etc/kbf/s3.env")).expect("rm");
+    });
+    assert!(
+        matches!(&e, HostError::Missing(path) if path.as_str() == "/etc/kbf/s3.env"),
+        "{e}"
+    );
+    // The all-in-one runs as kbf; its keys belong to someone else here.
+    let e = refused("not-owned", Mode::AllInOne, &|_, w| {
+        let (uid, gid) = me();
+        w.borrow_mut()
+            .users
+            .insert("kbf".to_owned(), (uid + 1, gid));
+    });
+    assert!(matches!(&e, HostError::NotOwned { .. }), "{e}");
+    let e = refused("parse", Mode::Daemon, &|_, w| w.borrow_mut().check_args = 2);
+    assert!(
+        matches!(&e, HostError::Units(f) if f.iter().any(|f| f.to_string().starts_with("FAIL parse:"))),
+        "{e}"
+    );
+    let e = refused("no-kbf", Mode::Storage, &|exec, _| {
+        fs::remove_file(exec.at("/usr/local/bin/kbf")).expect("rm");
+    });
+    assert!(matches!(&e, HostError::NotExecutable(_)), "{e}");
+    let e = refused("kbf-not-executable", Mode::Storage, &|exec, _| {
+        write(exec, "/usr/local/bin/kbf", "kbf-1", 0o644);
+    });
+    assert!(matches!(&e, HostError::NotExecutable(_)), "{e}");
+    let e = refused("no-linger", Mode::Daemon, &|exec, _| {
+        fs::remove_file(exec.at("/var/lib/systemd/linger/kbf")).expect("rm");
+    });
+    assert!(matches!(&e, HostError::NoLinger { .. }), "{e}");
+    let e = refused("no-crun", Mode::Daemon, &|exec, _| {
+        fs::remove_file(exec.at("/usr/bin/crun")).expect("rm");
+    });
+    assert!(
+        matches!(
+            &e,
+            HostError::NoTool {
+                package: "crun",
+                ..
+            }
+        ),
+        "{e}"
+    );
+    // A storage node whose settings name no S3 endpoint: its unit is not rendered.
+    let (exec, _) = host("install-mode-no-endpoint");
+    let mut a = install(Mode::Storage, None);
+    a.config.minio_s3_endpoint = None;
+    let e = plan_here(&exec, &a).map(|_| ()).expect_err("refused");
+    assert!(
+        e.to_string()
+            .starts_with("MINIO_S3_ENDPOINT must be set for --mode storage"),
+        "{e}"
+    );
+}
+
+/// The preflights the converged installer made and the per-mode one keeps, in every mode:
+/// the cgroup v2 memory controller (a host without the file, or with a list that lacks
+/// `memory`, is refused; a name that only contains the word does not count), and each
+/// listener flag of the unit on a port something already listens on (the port is read
+/// from the rendered unit's flag, so a flag the check skips turns its row red). Catches
+/// an install onto a host whose units cannot get their memory settings, and one whose
+/// service cannot bind.
+#[test]
+fn a_missing_memory_controller_or_a_held_port_is_refused() {
+    for mode in Mode::ALL {
+        for (name, controllers) in [("missing", None), ("lacks", Some("cpuset cpu io pids\n"))] {
+            let (exec, _) = host(&format!("install-mode-nomem-{name}-{mode}"));
+            match controllers {
+                None => fs::remove_file(exec.at("/sys/fs/cgroup/cgroup.controllers")).expect("rm"),
+                Some(t) => write(&exec, "/sys/fs/cgroup/cgroup.controllers", t, 0o444),
+            }
+            let e = plan_here(&exec, &install(mode, None))
+                .map(|_| ())
+                .expect_err(name);
+            assert!(
+                matches!(e, HostError::NoMemoryController),
+                "{mode} {name}: {e}"
+            );
+        }
+        let (exec, _) = host(&format!("install-mode-membad-{mode}"));
+        write(
+            &exec,
+            "/sys/fs/cgroup/cgroup.controllers",
+            "cpu memory_recursiveprot\n",
+            0o444,
+        );
+        let e = plan_here(&exec, &install(mode, None))
+            .map(|_| ())
+            .expect_err("word");
+        assert!(matches!(e, HostError::NoMemoryController), "{mode}: {e}");
+
+        let a = install(mode, None);
+        let text = modes::render(&a.config, Some(1500), mode).expect("renders");
+        let rendered = UnitFile::parse(&text).expect("unit");
+        let mut ports = Vec::new();
+        for flag in LISTEN_FLAGS {
+            if let Some(port) = rendered
+                .flag(flag)
+                .and_then(|v| v.rsplit_once(':'))
+                .and_then(|(_, p)| p.parse::<u16>().ok())
+            {
+                ports.push((flag, port));
+            }
+        }
+        // The key of storage-and-daemon must be root's, which a scratch host run as a
+        // user cannot hold: its plan stops at rule `credential` before the ports.
+        if mode == Mode::StorageAndDaemon {
+            continue;
+        }
+        assert_eq!(ports.is_empty(), mode == Mode::Daemon, "{mode} listeners");
+        for (flag, port) in ports {
+            let (exec, world) = host(&format!("install-mode-port-{mode}-{flag}"));
+            world
+                .borrow_mut()
+                .listening
+                .push_str(&format!("LISTEN 0 4096 192.0.2.10:{port} 0.0.0.0:*\n"));
+            let e = plan_here(&exec, &a).map(|_| ()).expect_err("held");
+            assert!(
+                matches!(e, HostError::PortInUse(p) if p == port),
+                "{mode} --{flag}: {e}"
+            );
+        }
+        // A port that only ends in the same digits is not held.
+        let (exec, world) = host(&format!("install-mode-port-near-{mode}"));
+        world
+            .borrow_mut()
+            .listening
+            .push_str("LISTEN 0 4096 192.0.2.10:18982 0.0.0.0:*\n");
+        plan_here(&exec, &a).expect("another port");
+    }
+}
+
+/// A listener on a port that merely looks like the unit's port does not hold it. The
+/// three listeners each guard one mutant of the held-port match (`ends_with(":port")`):
+/// only `:{port}1` (e.g. `:80801` for `:8080`) catches "ends with" loosened to "contains",
+/// which would refuse an install whose port is free; `:1{port}` and `[::]:1{port}` (e.g.
+/// `:18080`) guard a mutant that drops the leading colon from the pattern.
+#[test]
+fn listeners_on_look_alike_ports_do_not_hold_the_units_port() {
+    for mode in Mode::ALL
+        .into_iter()
+        .filter(|m| *m != Mode::StorageAndDaemon && *m != Mode::Daemon)
+    {
+        let (exec, world) = host(&format!("install-mode-lookalike-{mode}"));
+        let a = install(mode, None);
+        let text = modes::render(&a.config, Some(1500), mode).expect("renders");
+        let rendered = UnitFile::parse(&text).expect("unit");
+        let mut any = false;
+        for flag in LISTEN_FLAGS {
+            if let Some(v) = rendered.flag(flag) {
+                let port = v.rsplit_once(':').expect("host:port").1;
+                let mut w = world.borrow_mut();
+                w.listening
+                    .push_str(&format!("LISTEN 0 4096 192.0.2.10:1{port} 0.0.0.0:*\n"));
+                w.listening
+                    .push_str(&format!("LISTEN 0 4096 192.0.2.10:{port}1 0.0.0.0:*\n"));
+                w.listening
+                    .push_str(&format!("LISTEN 0 4096 [::]:1{port} [::]:*\n"));
+                any = true;
+            }
+        }
+        assert!(any, "{mode} has a listener");
+        plan_here(&exec, &a).expect("look-alike ports are free");
+    }
+}
+
+/// A unit of the mode that is running keeps its ports (a re-install must not refuse
+/// itself, and `ss` is not asked), and a mode that runs builds on a host with no active
+/// swap prints the warning while the modes that cannot swap stay quiet. Catches a
+/// re-install refused by its own listeners, and the warning printed for the wrong modes
+/// or not at all.
+#[test]
+fn a_running_unit_keeps_its_ports_and_no_swap_warns_the_build_modes() {
+    // (Not storage-and-daemon: its plan stops at rule `credential` on a scratch host, whose
+    // key is not root's.)
+    for mode in Mode::ALL
+        .into_iter()
+        .filter(|m| *m != Mode::StorageAndDaemon)
+    {
+        let (exec, world) = host(&format!("install-mode-running-{mode}"));
+        world.borrow_mut().swap = false;
+        let a = install(mode, None);
+        let text = modes::render(&a.config, Some(1500), mode).expect("renders");
+        let rendered = UnitFile::parse(&text).expect("unit");
+        for flag in LISTEN_FLAGS {
+            if let Some(v) = rendered.flag(flag) {
+                let port = v.rsplit_once(':').expect("host:port").1;
+                world
+                    .borrow_mut()
+                    .listening
+                    .push_str(&format!("LISTEN 0 4096 192.0.2.10:{port} 0.0.0.0:*\n"));
+            }
+        }
+        world
+            .borrow_mut()
+            .active
+            .insert(mode.instances()[0].clone());
+        let (_, out) = plan_here(&exec, &a).expect("its ports are its own");
+        assert!(
+            exec.queries
+                .borrow()
+                .iter()
+                .all(|q| q.program.as_str() != SS),
+            "{mode}: ss was asked"
+        );
+        let warned = out.contains("WARN: no swap is active");
+        assert_eq!(warned, mode.runs_builds(), "{mode}: {out}");
+        assert!(
+            out.contains(&format!(
+                "{} is running: its ports are its own\n",
+                mode.instances()[0]
+            )),
+            "{out}"
+        );
+    }
+    let (exec, _) = host("install-mode-swap-on");
+    let (_, out) = plan_here(&exec, &install(Mode::Daemon, None)).expect("plan");
+    assert!(!out.contains("WARN"), "{out}");
+}
+
+/// The files a unit reads, read as systemd reads them: an `EnvironmentFile=` with a
+/// leading `-` is optional and an empty one resets the list (neither is looked for),
+/// and a directory where a file is named is no file. Catches an optional file
+/// required, and a directory taken for the file.
+#[test]
+fn optional_environment_files_are_not_required_and_a_directory_is_no_file() {
+    let (exec, _) = host("install-mode-files");
+    let (uid, gid) = me();
+    let user = RunUser {
+        name: "kbf".to_owned(),
+        uid,
+        gid,
+        groups: vec![gid],
+        home: "/srv/kbf".to_owned(),
+    };
+    let unit = UnitFile::parse(
+        "[Service]\nEnvironmentFile=\nEnvironmentFile=-/etc/kbf/optional.env\nExecStart=/usr/local/bin/kbf storage --storage-tls-cert=/etc/kbf/storage.pem\n",
+    )
+    .expect("unit");
+    files_read(&exec, &unit, &user).expect("the optional file is not looked for");
+    fs::create_dir_all(exec.at("/etc/kbf/dir.env")).expect("dir");
+    let unit = UnitFile::parse("[Service]\nEnvironmentFile=/etc/kbf/dir.env\n").expect("unit");
+    let e = files_read(&exec, &unit, &user).expect_err("a directory");
+    assert!(
+        matches!(&e, HostError::Missing(p) if p.as_str() == "/etc/kbf/dir.env"),
+        "{e}"
+    );
+}
+
+/// The frontend on a fresh host: its unit, then the SQLite state store's directory made
+/// the server user's alone before the unit starts, and the wait for `/readyz` on the
+/// operator API it now serves (it was refused as not built). Catches the state directory
+/// left for kbf to make (it runs as a user that cannot write under `/var/lib`), a
+/// frontend unit started with no readiness wait, and the frontend refused again.
+#[test]
+fn the_frontend_unit_is_installed_with_its_state_directory() {
+    let (exec, _) = host("install-mode-frontend");
+    let (uid, gid) = me();
+    let a = install(Mode::Frontend, None);
+    let (p, _) = plan_here(&exec, &a).expect("plan");
+    assert_eq!(
+        tail(&p),
+        [
+            "mkdir /var/lib/kbf-server (0755)".to_owned(),
+            format!("mkdir /var/lib/kbf-server/state (0700, owner {uid}:{gid})"),
+            "run /usr/bin/systemctl daemon-reload".to_owned(),
+            "run /usr/bin/systemctl enable kbf-frontend@.service".to_owned(),
+            "run /usr/bin/systemctl start kbf-frontend@a.service".to_owned(),
+            "wait up to 60s for http://127.0.0.1:8982/readyz".to_owned(),
+        ]
+    );
+}
+
+/// The frontend's unit is a template with two instances, and a serving one is never
+/// restarted: a restart drains it and every new build is refused until the next start.
+/// Catches an update that restarts (or stops) the serving instance instead of leaving the
+/// handover to `kbf frontend handover`, an install that starts the second instance beside
+/// the first (two frontends would ask each other for the listeners), a template enabled
+/// under a name systemd refuses, and a host with neither instance up left without one.
+#[test]
+fn a_serving_frontend_instance_is_not_restarted_by_an_update() {
+    let (mut exec, world) = host("install-mode-frontend-serving");
+    let a = install(Mode::Frontend, None);
+    go(&mut exec, &a, PlanMode::Apply);
+    assert!(
+        exec.at("/etc/systemd/system/kbf-frontend@.service")
+            .exists(),
+        "the template is written under its own name"
+    );
+    assert!(world.borrow().active.contains("kbf-frontend@a.service"));
+    assert!(!world.borrow().active.contains("kbf-frontend@b.service"));
+
+    // The second instance serves; the unit file differs from the host's.
+    {
+        let mut w = world.borrow_mut();
+        w.active.clear();
+        w.active.insert("kbf-frontend@b.service".to_owned());
+        w.enabled.insert("kbf-frontend@a.service".to_owned());
+    }
+    write(
+        &exec,
+        "/etc/systemd/system/kbf-frontend@.service",
+        "[Service]\n",
+        0o644,
+    );
+    let (p, out) = plan_here(&exec, &a).expect("plan");
+    let got = steps(&p);
+    assert!(
+        got.contains(&"run /usr/bin/systemctl daemon-reload".to_owned())
+            && got.contains(&"run /usr/bin/systemctl enable kbf-frontend@.service".to_owned()),
+        "{got:?}"
+    );
+    assert!(
+        !got.iter()
+            .any(|s| s.contains("restart") || s.contains(" start ") || s.contains("stop")),
+        "{got:?}"
+    );
+    assert!(
+        !got.iter().any(|s| s.starts_with("wait")),
+        "nothing was started, so there is no /readyz to wait for: {got:?}"
+    );
+    assert!(
+        out.contains(
+            "kbf-frontend@b.service is serving and is not restarted: run `kbf frontend handover`"
+        ),
+        "{out}"
+    );
+
+    // Unchanged, enabled, and one instance up: nothing at all.
+    go(&mut exec, &a, PlanMode::Apply);
+    let (p, _) = plan_here(&exec, &a).expect("plan");
+    assert_eq!(steps(&p), Vec::<String>::new());
+}
+
+/// The operator token of the frontend and the all-in-one: the host check reads the file
+/// `KBF_API_TOKEN_FILE` names (the default, or another path), refuses it missing, readable
+/// by group or other, or another user's, and install-units never makes it. Catches a unit
+/// installed whose `--api-token-file` is absent (every write answers 401), a token the
+/// check looks for at the default path after the key moved, and a token file created.
+#[test]
+fn the_operator_token_file_is_checked_where_the_key_names_it() {
+    for mode in [Mode::Frontend, Mode::AllInOne] {
+        let try_with = |name: &str, key: &str, edit: &dyn Fn(&ScratchHost, &RefCell<World>)| {
+            let (exec, world) = host(&format!("install-mode-token-{name}"));
+            edit(&exec, &world);
+            let mut a = install(mode, None);
+            let text = EXAMPLE.replace("KBF_API_TOKEN_FILE=\n", key);
+            a.config = LinuxConfig::parse(&text).expect("valid settings");
+            plan_here(&exec, &a).map(|_| ())
+        };
+        let e = try_with("missing", "KBF_API_TOKEN_FILE=\n", &|exec, _| {
+            fs::remove_file(exec.at("/etc/kbf/api-token")).expect("rm");
+        })
+        .expect_err("no token");
+        assert!(
+            matches!(&e, HostError::Missing(p) if p.as_str() == "/etc/kbf/api-token"),
+            "{mode}: {e}"
+        );
+        let e = try_with("group", "KBF_API_TOKEN_FILE=\n", &|exec, _| {
+            write(exec, "/etc/kbf/api-token", "t", 0o640);
+        })
+        .expect_err("group-readable");
+        assert!(
+            matches!(&e, HostError::Readable { path, .. } if path.as_str() == "/etc/kbf/api-token"),
+            "{mode}: {e}"
+        );
+        write_ok(&try_with("0400", "KBF_API_TOKEN_FILE=\n", &|exec, _| {
+            write(exec, "/etc/kbf/api-token", "t", 0o400);
+        }));
+        // Another path: that file is the one looked for, and the default one is not.
+        let moved = "KBF_API_TOKEN_FILE=/etc/kbf/operator.token\n";
+        let e = try_with("moved-missing", moved, &|_, _| {}).expect_err("no token there");
+        assert!(
+            matches!(&e, HostError::Missing(p) if p.as_str() == "/etc/kbf/operator.token"),
+            "{mode}: {e}"
+        );
+        write_ok(&try_with("moved", moved, &|exec, _| {
+            fs::remove_file(exec.at("/etc/kbf/api-token")).expect("rm");
+            write(exec, "/etc/kbf/operator.token", "t", 0o600);
+        }));
+        let e = try_with("moved-readable", moved, &|exec, _| {
+            write(exec, "/etc/kbf/operator.token", "t", 0o604);
+        })
+        .expect_err("other-readable");
+        assert!(
+            matches!(&e, HostError::Readable { path, .. } if path.as_str() == "/etc/kbf/operator.token"),
+            "{mode}: {e}"
+        );
+    }
+    // Another user's token is refused; the plan never writes one.
+    let (exec, world) = host("install-mode-token-owned");
+    let (uid, gid) = me();
+    world
+        .borrow_mut()
+        .users
+        .insert("kbf-server".to_owned(), (uid + 1, gid));
+    let e = plan_here(&exec, &install(Mode::Frontend, None))
+        .map(|_| ())
+        .expect_err("not the server user's");
+    assert!(matches!(&e, HostError::NotOwned { .. }), "{e}");
+    let (exec, _) = host("install-mode-token-never-made");
+    let (p, _) = plan_here(&exec, &install(Mode::Frontend, None)).expect("plan");
+    assert!(
+        !steps(&p).iter().any(|s| s.contains("api-token")),
+        "{:#?}",
+        steps(&p)
+    );
+}
+
+fn write_ok(r: &Result<(), HostError>) {
+    assert!(r.is_ok(), "{r:?}");
+}
+
+/// The directories each unit's flags make, from the rendered units: the storage-and-daemon
+/// unit's metadata log and hot store beside its data directory, the frontend's state
+/// directory (the parent of the SQLite file, from the flag), the all-in-one's none
+/// beyond its own. Catches a flag whose directory is left to kbf, which makes it as a
+/// user that may not, and a state directory taken from the wrong flag.
+#[test]
+fn the_directories_come_from_the_flags_the_units_carry() {
+    let dirs = |mode: Mode| {
+        let c = LinuxConfig::parse(EXAMPLE).expect("valid settings");
+        let text = modes::render(&c, Some(1500), mode).expect("renders");
+        directories(&UnitFile::parse(&text).expect("a unit"))
+            .expect("directories")
+            .into_iter()
+            .map(|(p, bits)| format!("{p} {bits:o}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        dirs(Mode::StorageAndDaemon),
+        [
+            "/var/lib/kbf 755",
+            "/var/lib/kbf-server/raft 700",
+            "/var/lib/kbf/hot 700",
+        ]
+    );
+    assert_eq!(dirs(Mode::Frontend), ["/var/lib/kbf-server/state 700"]);
+    assert_eq!(
+        dirs(Mode::Storage),
+        ["/var/lib/kbf-server/raft 700", "/var/lib/kbf/hot 700"]
+    );
+}
+
+/// The live failure: `storage-and-daemon` runs as `KBF_USER` and its `--hot-store` sat
+/// under `/var/lib/kbf-server`, the server account's, mode 0700. The scratch host cannot
+/// chown, so the unit's user has another uid than the test's (the owner of every
+/// directory); with the directory above the hot store 0700 the install is refused
+/// before any step, naming the directory and the user, and with it 0755 the check is
+/// silent. Catches a traverse check that is skipped, one that reads the wrong user, and
+/// a message that leaves out the path or the user.
+#[test]
+fn a_hot_store_the_unit_user_cannot_reach_is_refused() {
+    let (uid, gid) = me();
+    let other = |world: &RefCell<World>| {
+        world
+            .borrow_mut()
+            .users
+            .insert("kbf".to_owned(), (uid + 1, gid + 1));
+    };
+    let a = |hot: &str| InstallMode {
+        config: LinuxConfig::parse(&EXAMPLE.replace(
+            "KBF_HOT_DIR=/var/lib/kbf/hot",
+            &format!("KBF_HOT_DIR={hot}"),
+        ))
+        .expect("valid settings"),
+        mode: Mode::StorageAndDaemon,
+        bin_dir: None,
+    };
+    let (exec, world) = host("install-mode-hot-0700");
+    other(&world);
+    fs::set_permissions(exec.at("/"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    let parent = exec.at("/var/lib/kbf-server");
+    fs::create_dir_all(&parent).expect("dirs");
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("chmod");
+    let hot = a("/var/lib/kbf-server/hot");
+    let e = plan_here(&exec, &hot).expect_err("refused");
+    let HostError::Units(failures) = &e else {
+        panic!("{e}");
+    };
+    // The refusal prints every failure, one to a line, under its heading.
+    assert!(failures.len() >= 2, "{e}");
+    let each: Vec<String> = failures.iter().map(|f| f.to_string()).collect();
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "the rendered units break the priorities; nothing was written:\n{}",
+            each.join("\n")
+        )
+    );
+    // (The scratch host's keys are the test's uid's, so rule `credential` fails too.)
+    let traverse: Vec<_> = failures.iter().filter(|f| f.rule == "traverse").collect();
+    assert_eq!(traverse.len(), 1, "{e}");
+    let f = traverse[0];
+    assert!(
+        f.message.contains("/var/lib/kbf-server/hot")
+            && f.message.contains("/var/lib/kbf-server (mode 0700")
+            && f.message.contains("kbf"),
+        "{}",
+        f.message
+    );
+    // Another hot directory, not under it, is reached.
+    let report = |a: &InstallMode| {
+        let c = &a.config;
+        let kbf = modes::render(c, Some(uid + 1), a.mode).expect("renders");
+        let slice = shared::render_slice(c, None).expect("slice");
+        modes::check_on_host(
+            &exec,
+            c,
+            a.mode,
+            &UnitText::new(a.mode.unit_name(), kbf),
+            &UnitText::new(SLICE, slice),
+            true,
+            None,
+        )
+        .expect("checks")
+    };
+    let ok = report(&a("/var/lib/kbf/hot"));
+    assert!(
+        ok.failures.iter().all(|f| f.rule != "traverse"),
+        "{:?}",
+        ok.failures
+    );
+    // Opened to others, the same directory passes.
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let ok = report(&hot);
+    assert!(
+        ok.failures.iter().all(|f| f.rule != "traverse"),
+        "{:?}",
+        ok.failures
+    );
+    // The same refusal is check-units' on this host.
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("chmod");
+    let bad = report(&hot);
+    assert!(bad.failures.iter().any(|f| f.rule == "traverse"));
+}
+
+/// root enters every directory whatever its mode: a unit whose `User=` is uid 0 over a
+/// 0700 parent of the hot store is not a `traverse` failure. Catches a check that
+/// applies the mode bits to root.
+#[test]
+fn root_is_not_refused_a_hot_store_under_a_0700_directory() {
+    let (exec, world) = host("install-mode-hot-root");
+    world.borrow_mut().users.insert("kbf".to_owned(), (0, 0));
+    fs::set_permissions(exec.at("/"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    let parent = exec.at("/var/lib/kbf-server");
+    fs::create_dir_all(&parent).expect("dirs");
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("chmod");
+    let c = LinuxConfig::parse(&EXAMPLE.replace(
+        "KBF_HOT_DIR=/var/lib/kbf/hot",
+        "KBF_HOT_DIR=/var/lib/kbf-server/hot",
+    ))
+    .expect("valid settings");
+    let mode = Mode::StorageAndDaemon;
+    let kbf = modes::render(&c, Some(0), mode).expect("renders");
+    let slice = shared::render_slice(&c, None).expect("slice");
+    let report = modes::check_on_host(
+        &exec,
+        &c,
+        mode,
+        &UnitText::new(mode.unit_name(), kbf),
+        &UnitText::new(SLICE, slice),
+        true,
+        None,
+    )
+    .expect("checks");
+    assert!(
+        report.failures.iter().all(|f| f.rule != "traverse"),
+        "{:?}",
+        report.failures
+    );
+}
+
+/// Rule `traverse` reads the host, and says so when it cannot: each case below is the
+/// unit of `storage-and-daemon` checked on a host (or with a unit) where one step of the
+/// rule is unreadable. The rule is skipped with its note, or not applied at all, and it
+/// never turns into a failure. Catches a skip that fails the unit, one that hides its
+/// reason, and a check that runs on a unit with no `file://` hot store or no `User=`.
+#[test]
+fn rule_traverse_is_skipped_with_a_note_where_it_cannot_read() {
+    let mode = Mode::StorageAndDaemon;
+    // The 0700 parent, so that a check that did run would fail.
+    let c = LinuxConfig::parse(&EXAMPLE.replace(
+        "KBF_HOT_DIR=/var/lib/kbf/hot",
+        "KBF_HOT_DIR=/var/lib/kbf-server/x/hot",
+    ))
+    .expect("valid settings");
+    let report = |exec: &ScratchHost, edit: &dyn Fn(String) -> String| {
+        let (uid, _) = me();
+        let unit = edit(modes::render(&c, Some(uid + 1), mode).expect("renders"));
+        let slice = shared::render_slice(&c, None).expect("slice");
+        modes::check_on_host(
+            exec,
+            &c,
+            mode,
+            &UnitText::new(mode.unit_name(), unit),
+            &UnitText::new(SLICE, slice),
+            true,
+            None,
+        )
+        .expect("checks")
+    };
+    let traverse_notes = |r: &crate::linux::Report| -> Vec<String> {
+        r.notes
+            .iter()
+            .filter(|n| n.starts_with("SKIP traverse"))
+            .cloned()
+            .collect()
+    };
+    let none = |r: &crate::linux::Report| r.failures.iter().all(|f| f.rule != "traverse");
+    let (uid, gid) = me();
+    let (exec, world) = host("install-mode-hot-skips");
+    world
+        .borrow_mut()
+        .users
+        .insert("kbf".to_owned(), (uid + 1, gid + 1));
+    fs::set_permissions(exec.at("/"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    let parent = exec.at("/var/lib/kbf-server");
+    fs::create_dir_all(&parent).expect("dirs");
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("chmod");
+    let same = |s: String| s;
+
+    // Control: the same unit does fail, so the cases below skip for their own reason.
+    let r = report(&exec, &same);
+    assert!(!none(&r), "{:?}", r.failures);
+
+    // No `User=` line value: nobody to judge.
+    let r = report(&exec, &|s| s.replace("\nUser=kbf\n", "\nUser=\n"));
+    assert!(none(&r) && traverse_notes(&r).is_empty(), "{r:?}");
+    // A hot store that is not a file:// one is not a directory to walk.
+    let r = report(&exec, &|s| {
+        s.replace("--hot-store=file://", "--hot-store=s3://")
+    });
+    assert!(none(&r) && traverse_notes(&r).is_empty(), "{r:?}");
+    // A file:// path that is not an absolute one is not read either.
+    let r = report(&exec, &|s| {
+        s.replace("--hot-store=file://", "--hot-store=file://rel")
+    });
+    assert!(none(&r) && traverse_notes(&r).is_empty(), "{r:?}");
+    // A unit with no hot store at all.
+    let r = report(&exec, &|s| s.replace("--hot-store=", "--not-a-store="));
+    assert!(none(&r) && traverse_notes(&r).is_empty(), "{r:?}");
+
+    // No such user on this host.
+    world.borrow_mut().users.remove("kbf");
+    let r = report(&exec, &same);
+    assert!(none(&r), "{:?}", r.failures);
+    assert_eq!(
+        traverse_notes(&r),
+        ["SKIP traverse: no user kbf on this host, so the path to --hot-store was not read"]
+    );
+    world
+        .borrow_mut()
+        .users
+        .insert("kbf".to_owned(), (uid + 1, gid + 1));
+
+    // A directory on the way that cannot be read: the path below a regular file.
+    fs::remove_dir(&parent).expect("rmdir");
+    fs::write(&parent, "").expect("file");
+    let r = report(&exec, &same);
+    assert!(none(&r), "{:?}", r.failures);
+    let notes = traverse_notes(&r);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].starts_with("SKIP traverse: "), "{notes:?}");
+    assert!(notes[0].len() > "SKIP traverse: ".len(), "{notes:?}");
+
+    // `getent` that cannot run: the lookup's own error is the note.
+    let mut exec = exec;
+    let inner = std::mem::replace(&mut exec.answer, Box::new(|_| Ok(reply(0, "", ""))));
+    exec.answer = Box::new(move |cmd| {
+        if cmd.program.as_str() == GETENT {
+            Err(std::io::Error::other("getent missing"))
+        } else {
+            inner(cmd)
+        }
+    });
+    let r = report(&exec, &same);
+    assert!(none(&r), "{:?}", r.failures);
+    let notes = traverse_notes(&r);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("getent missing"), "{notes:?}");
+}
+
+/// A build mode runs rootless containers, so the user needs a range in `/etc/subuid` and
+/// in `/etc/subgid`, named by user name or by uid. Each file refuses on its own (the
+/// error names it), a line for another user (or a name that only starts with kbf's) is
+/// no range, a missing file is no range, and a range by uid passes. Catches a check
+/// that reads one file only, one that matches by prefix or on any line, and one that
+/// accepts only the name.
+#[test]
+fn a_build_user_with_no_subid_range_is_refused() {
+    let (uid, _) = me();
+    let refused = |name: &str, file: &str, text: Option<&str>| {
+        let (exec, _) = host(&format!("install-mode-subid-{name}"));
+        match text {
+            Some(t) => write(&exec, file, t, 0o644),
+            None => fs::remove_file(exec.at(file)).expect("rm"),
+        }
+        plan_here(&exec, &install(Mode::Daemon, None)).map(|_| ())
+    };
+    for file in ["/etc/subuid", "/etc/subgid"] {
+        let tag = file.trim_start_matches("/etc/");
+        for (name, text) in [
+            ("other-user", Some("someone:100000:65536\n")),
+            ("prefix-only", Some("kbf2:100000:65536\n")),
+            ("not-a-range", Some("kbf\n")),
+            ("empty", Some("")),
+            ("missing", None),
+        ] {
+            let e = refused(&format!("{tag}-{name}"), file, text).expect_err("refused");
+            assert!(
+                matches!(&e, HostError::NoSubIds { user, file: f } if user == "kbf" && f.as_str() == file),
+                "{file} {name}: {e}"
+            );
+            assert!(e.to_string().contains(file), "{e}");
+        }
+        // The uid names the user too, on any line of the file.
+        let by_uid = format!("someone:1:1\n{uid}:100000:65536\n");
+        refused(&format!("{tag}-uid"), file, Some(&by_uid)).expect("a range by uid passes");
+    }
+}
+
+/// A path the host cannot inspect (below a regular file) is `Inspect`, naming the path
+/// and the I/O error; a path that is not there is `None`, no error. Catches the I/O
+/// error swallowed as "absent" (a key that cannot be read looks missing) and an error
+/// that loses the path.
+#[test]
+fn an_inspect_that_fails_names_the_path_and_an_absent_one_is_none() {
+    let (exec, _) = host("install-mode-inspect-error");
+    let file = HostPath::new("/etc/kbf/ca.pem").expect("path");
+    let below = HostPath::new("/etc/kbf/ca.pem/x").expect("path");
+    let absent = HostPath::new("/etc/kbf/not-there").expect("path");
+    assert!(
+        crate::linux::host::inspect(&exec, &file)
+            .expect("inspect")
+            .is_some()
+    );
+    assert!(
+        crate::linux::host::inspect(&exec, &absent)
+            .expect("inspect")
+            .is_none()
+    );
+    let e = crate::linux::host::inspect(&exec, &below).expect_err("not a directory");
+    assert!(
+        matches!(&e, HostError::Inspect { path, .. } if path.as_str() == "/etc/kbf/ca.pem/x"),
+        "{e}"
+    );
+    assert!(e.to_string().contains("/etc/kbf/ca.pem/x"), "{e}");
+}
+
+/// A user the host does not have is refused with its name before any step: `kbf` for a
+/// mode that runs builds (the user the example settings name), the server account for
+/// the storage node (the `User=` of its unit). Catches an install that goes on with no
+/// user (a directory made for no one) and a refusal that names the wrong user.
+#[test]
+fn a_user_the_host_does_not_have_is_refused_by_name() {
+    for (mode, user) in [
+        (Mode::Daemon, "kbf"),
+        (Mode::AllInOne, "kbf"),
+        (Mode::Storage, "kbf-server"),
+    ] {
+        let (exec, world) = host(&format!("install-mode-no-user-{mode}"));
+        world.borrow_mut().users.remove(user);
+        let e = plan_here(&exec, &install(mode, None))
+            .map(|_| ())
+            .expect_err("refused");
+        assert!(
+            matches!(&e, HostError::NoUser(n) if n == user),
+            "{mode}: {e}"
+        );
+        assert!(
+            e.to_string().starts_with(&format!("no user {user}: ")),
+            "{e}"
+        );
+    }
+}
