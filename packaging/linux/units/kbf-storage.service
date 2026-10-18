@@ -23,8 +23,9 @@ ConditionPathExists=/etc/kbf/kbf.toml
 StartLimitIntervalSec=0
 
 [Service]
-# Not the daemon's user: a storage node holds the cold store's key.
-User=kbf
+# Not the daemon's user: a storage node holds the cold store's key, which the user builds
+# run as (kbf) must not be able to read.
+User=kbf-server
 Slice=kbf.slice
 # kbf's own state: /var/lib/kbf, created for the unit's user by systemd; kbf-installer never
 # touches it.

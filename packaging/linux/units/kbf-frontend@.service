@@ -47,8 +47,9 @@ RuntimeDirectory=kbf-frontend
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
 # Not the daemon's user: the frontend holds the state store and the operator token. Both
-# instances run as it (the control socket checks the peer's uid).
-User=kbf
+# instances run as it (the control socket checks the peer's uid). kbf-server, not kbf: the
+# user builds run as must not read the state store, the operator token or the keys.
+User=kbf-server
 Slice=kbf.slice
 # kbf's own state: /var/lib/kbf, created for the unit's user by systemd; kbf-installer never
 # touches it.

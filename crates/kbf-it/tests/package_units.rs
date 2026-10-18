@@ -288,9 +288,17 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     if unit.get_in("Service", "LimitNOFILE").map(trim) != Some("1048576") {
         v("nofile", "no LimitNOFILE=1048576".into());
     }
-    // Catches a user that is not `kbf`, the one runtime user the contract creates.
-    if unit.get_in("Service", "User").map(trim) != Some("kbf") {
-        v("user", "User= is not kbf".into());
+    // Catches a server half run as the user builds run as: the frontend (the state store,
+    // the operator token) and a storage node (the cold store's key) run as kbf-server, so an
+    // action (run as kbf) cannot read what they hold; the modes that run builds run as kbf.
+    // As kbf-deploy's units do today.
+    let want = if mode.is_some_and(|m| ["frontend", "storage"].contains(&m)) {
+        "kbf-server"
+    } else {
+        "kbf"
+    };
+    if unit.get_in("Service", "User").map(trim) != Some(want) {
+        v("user", format!("User= is not {want}"));
     }
     // Catches a key given to the unit any way but kbf.toml: an EnvironmentFile=, an
     // Environment= with a key, a credential, or a MinIO unit it orders after.
@@ -828,6 +836,12 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-storage.service",
+        "\nUser=kbf-server\n",
+        "\nUser=kbf\n",
+        "user",
+    ),
+    (
+        "kbf-daemon.service",
         "\nUser=kbf\n",
         "\nUser=kbf-server\n",
         "user",
