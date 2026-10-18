@@ -89,8 +89,7 @@ async fn register_answers_with_identity_interval_and_map() {
         .heartbeat(pb::HeartbeatRequest {
             member_id: 1,
             boot: 1,
-            catching_up: false,
-            have_generation: 0,
+            ..Default::default()
         })
         .await
         .expect("beats")
@@ -105,8 +104,8 @@ async fn register_answers_with_identity_interval_and_map() {
         .heartbeat(pb::HeartbeatRequest {
             member_id: 1,
             boot: 1,
-            catching_up: false,
             have_generation: map.generation(),
+            ..Default::default()
         })
         .await
         .expect("beats")
@@ -147,8 +146,7 @@ async fn every_failure_has_its_own_code() {
     let beat = |id, boot| pb::HeartbeatRequest {
         member_id: id,
         boot,
-        catching_up: false,
-        have_generation: 0,
+        ..Default::default()
     };
     let old = client.heartbeat(beat(1, 1)).await.expect_err("old boot");
     assert_eq!(old.code(), Code::FailedPrecondition);
@@ -195,11 +193,16 @@ async fn a_panic_in_the_store_fails_one_call() {
         .expect("the next call works");
 }
 
-fn leaf(role: &str) -> Vec<u8> {
+/// A certificate naming `role` and the DNS names `names`.
+fn leaf(role: &str, names: &[&str]) -> Vec<u8> {
     let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
-    params.subject_alt_names = vec![SanType::URI(
+    params.subject_alt_names = names
+        .iter()
+        .map(|name| SanType::DnsName((*name).try_into().expect("IA5")))
+        .collect();
+    params.subject_alt_names.push(SanType::URI(
         format!("{ROLE_URI_PREFIX}{role}").try_into().expect("IA5"),
-    )];
+    ));
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     let key = KeyPair::generate().expect("key");
     params.self_signed(&key).expect("cert").der().to_vec()
@@ -208,16 +211,31 @@ fn leaf(role: &str) -> Vec<u8> {
 /// Catches: registration open to the wrong role. Under mutual TLS only a certificate that
 /// names the role `storage` may register: a daemon's or a frontend's is PERMISSION_DENIED,
 /// none is UNAUTHENTICATED, bytes that are no certificate are UNAUTHENTICATED; plain text
-/// admits everyone, as the storage listener does.
+/// admits everyone, as the storage listener does. An admitted storage certificate comes
+/// back with the names it holds (the role URI is not one), none in plain text; whether
+/// they cover an instance is `Register`'s check, over the wire in `worker_roles.rs`.
 #[test]
 fn only_the_storage_role_may_register() {
     let members = Arc::new(Members::new(Hooked::new() as Arc<dyn Store>, config()));
     let certified = MembershipService::new(Arc::clone(&members), Admission::Certified);
     let open = MembershipService::new(members, Admission::Open);
-    assert!(open.admit_leaf(None).is_ok());
-    assert!(certified.admit_leaf(Some(&leaf("storage"))).is_ok());
+    assert_eq!(open.admit_leaf(None).expect("open"), None);
+    let named = certified
+        .admit_leaf(Some(&leaf("storage", &["node-a"])))
+        .expect("admitted")
+        .expect("a certified caller has a certificate");
+    let names = named.identity().names();
+    assert_eq!(names.to_string(), "node-a");
+    assert!(names.covers("node-a") && !names.covers("storage"));
+    let nameless = certified
+        .admit_leaf(Some(&leaf("storage", &[])))
+        .expect("the role is all this checks")
+        .expect("a certificate");
+    assert_eq!(nameless.identity().names().to_string(), "no DNS or IP name");
     for role in ["daemon", "frontend"] {
-        let e = certified.admit_leaf(Some(&leaf(role))).expect_err(role);
+        let e = certified
+            .admit_leaf(Some(&leaf(role, &["node-a"])))
+            .expect_err(role);
         assert_eq!(e.code(), Code::PermissionDenied, "{role}");
         assert!(e.message().contains(role), "{}", e.message());
     }
@@ -257,6 +275,55 @@ async fn the_sweeper_expires_members_by_itself() {
         tokio::time::sleep(10 * MS).await;
     }
     panic!("the sweeper never marked the silent member Down");
+}
+
+/// Catches: the wire's report not reaching the judgement, or reaching it wrong. A heartbeat
+/// that says it owes 4 is 4; one that says `debts_known = false` is "cannot say" whatever
+/// count rides with it; and a heartbeat from a node that sends neither field (an older
+/// one) is "cannot say" too, never zero.
+#[tokio::test]
+async fn a_heartbeat_carries_what_the_node_owes() {
+    let store = Hooked::new();
+    let (members, mut client) = serve(&store).await;
+    client.register(request(1)).await.expect("registers");
+    members
+        .set_state(kbf_map::MemberId(1), MemberState::Active)
+        .expect("promoted");
+    let beat = |repair_debts, debts_known| pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 1,
+        repair_debts,
+        debts_known,
+        ..Default::default()
+    };
+    client.heartbeat(beat(4, true)).await.expect("beats");
+    assert_eq!(
+        members
+            .storage_health()
+            .expect("health")
+            .under_replicated_blobs,
+        Some(4)
+    );
+
+    client.heartbeat(beat(9, false)).await.expect("beats");
+    let health = members.storage_health().expect("health");
+    assert_eq!(health.under_replicated_blobs, None);
+    assert_eq!(health.unreported, [kbf_map::MemberId(1)]);
+
+    client.heartbeat(beat(4, true)).await.expect("beats");
+    let older = pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 1,
+        ..Default::default()
+    };
+    client.heartbeat(older).await.expect("beats");
+    assert_eq!(
+        members
+            .storage_health()
+            .expect("health")
+            .under_replicated_blobs,
+        None
+    );
 }
 
 /// Catches: expired rows nobody frees (session rows, the results of finished operations

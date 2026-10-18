@@ -15,7 +15,7 @@
 //! refuses at start. Not covered: systemd itself, the held scripts and the host setup.
 //!
 //! The deviations from the rendered units are listed in [`Farm::start`]: the cold store
-//! is a directory (no MinIO), the container driver runs the stand-in `podman` over a
+//! is a directory (no MinIO), the container driver runs the stand-in `crun` over a
 //! planted cgroup tree and id files.
 
 #![cfg(target_os = "linux")]
@@ -45,19 +45,19 @@ use kbf_proto::reapi::{
     ExecuteRequest, ExecuteResponse, FileNode, GetActionResultRequest, Platform,
 };
 use kbf_transfer::{Cas as _, TransferConfig, Transfers, digest_of};
-use node::{cgroup_tree, files_holding, id_files, image_path, input_bytes, podman};
+use node::{cgroup_tree, crun, files_holding, id_files, image_path, input_bytes};
 use pki::Pki;
 use procs::{HANG, Proc, field};
 use prost::Message as _;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use units::{Rendered, config, rendered};
 
-// The stand-in `podman` runs each action as `kbf-act` beside it: a link to this test
+// The stand-in `crun` runs each action as `kbf-act` beside it: a link to this test
 // binary, which answers as `kbf-act` through it.
 kbf_testkit::act_test_hook!();
 
-/// The stand-in `podman` (`node::podman`).
-const FAKE_PODMAN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-podman");
+/// The stand-in `crun` (`node::crun`).
+const FAKE_CRUN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-crun");
 
 /// The bytes the action writes to its one output file.
 const OUTPUT: &[u8] = b"a file\n";
@@ -77,7 +77,7 @@ fn loopback(n: usize) -> String {
 
 /// A fresh directory for one test.
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+    let dir = node::scratch_root()
         .join("kbf-rehearsal")
         .join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -133,6 +133,20 @@ fn connected(api: u16) -> Option<Vec<String>> {
         .collect();
     ids.sort();
     Some(ids)
+}
+
+/// How many storage members `GET /v1/members` lists, and whether every one is `active`: a
+/// node that registered rebuilds its index first (`catching_up`), and each promotion is a
+/// new map generation, which a client that wrote meanwhile would be told is stale.
+fn members_active(api: u16) -> Option<(usize, bool)> {
+    let (code, body) = get(api, "/v1/members")?;
+    (code == 200).then_some(())?;
+    let view: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let members = view["members"].as_array()?;
+    Some((
+        members.len(),
+        members.iter().all(|m| m["state"] == "active"),
+    ))
 }
 
 /// What every process of the farm is told about the frontend.
@@ -197,11 +211,14 @@ struct Farm {
     reapi: String,
     api: u16,
     ca: Vec<u8>,
-    /// The image the actions name: what the stand-in `podman` serves.
+    /// The image the actions name: the one unpacked in each node's image store.
     image: String,
     storage_nodes: usize,
     /// The ids the frontend must list as connected, sorted.
     node_ids: Vec<String>,
+    /// The processes (by index) a test has killed: [`Farm::wait`] does not take their
+    /// exit for a crash.
+    killed: Vec<usize>,
 }
 
 impl Farm {
@@ -209,9 +226,10 @@ impl Farm {
     ///
     /// The flags a test box cannot take as rendered, and what each is changed to:
     /// - the nodes' `--cold-store=s3://...` (no MinIO here) is a `file://` directory;
-    /// - `--driver=container` stays, over the stand-in `podman`: the nodes get it on
-    ///   `PATH`, their cgroup tree (`--cgroup-root`, `--self-cgroup`) is planted and
-    ///   `--id-files` stands for `/etc/subuid`.
+    /// - `--driver=container` stays, over the stand-in `crun`: `--oci-runtime=` names it,
+    ///   the id tools are on `PATH`, their cgroup tree
+    ///   (`--cgroup-root`, `--self-cgroup`) is planted and `--id-files` stands for
+    ///   `/etc/subuid`.
     ///
     /// Every other flag is the unit's.
     fn start(name: &str, storage_nodes: usize) -> Self {
@@ -238,6 +256,7 @@ impl Farm {
             node_ids: std::iter::once(DAEMON.to_owned())
                 .chain((1..=storage_nodes).map(node_id))
                 .collect(),
+            killed: Vec::new(),
         };
 
         // The frontend: its unit as rendered, a state directory made.
@@ -273,7 +292,7 @@ impl Farm {
             let id = id.as_str();
             let root = dir.join(id);
             let bin = make_dirs(&root);
-            let image = podman(&bin, FAKE_PODMAN, &steps);
+            let image = crun(&bin, &root.join("data"), FAKE_CRUN, &steps);
             let etc = root.join("etc");
             pki.write_ca(&etc);
             pki.issue(&etc, "storage", Row::Storage, &[&host]);
@@ -289,7 +308,7 @@ impl Farm {
         let (id, host) = (DAEMON, loopback(storage_nodes + 1));
         let root = dir.join(id);
         let bin = make_dirs(&root);
-        let image = podman(&bin, FAKE_PODMAN, &steps);
+        let image = crun(&bin, &root.join("data"), FAKE_CRUN, &steps);
         let etc = root.join("etc");
         pki.write_ca(&etc);
         pki.issue(&etc, "node", Row::Daemon, &[id]);
@@ -301,15 +320,18 @@ impl Farm {
     }
 
     /// Starts the process for `unit`; those with a `bin` (the container driver's) get
-    /// the stand-in `podman` on `PATH` and the planted cgroup tree and id files.
+    /// the unit's `--oci-runtime` made the stand-in `crun`, the id tools on `PATH` and
+    /// the planted cgroup tree and id files.
     fn launch(&mut self, dir: &Path, root: &Path, name: &str, unit: Rendered, bin: Option<&Path>) {
         let (unit, cwd, mut env) = match bin {
             Some(bin) => {
                 let mut flags = cgroup_tree(bin);
                 flags.push(format!("--id-files={}", id_files(root).display()));
                 let env = vec![("PATH".to_owned(), image_path(bin))];
+                // The rendered unit names `/usr/bin/crun`: this box's is the stand-in.
+                let runtime = [format!("--oci-runtime={}", bin.join("crun").display())];
                 // The stand-in finds its state beside the link it was run through.
-                (unit.add(&flags), bin, env)
+                (unit.replace(&runtime).add(&flags), bin, env)
             }
             None => (unit, root, Vec::new()),
         };
@@ -324,7 +346,11 @@ impl Farm {
     fn wait<T>(&mut self, what: &str, mut ready: impl FnMut(&Farm) -> Option<T>) -> T {
         let deadline = Instant::now() + HANG;
         loop {
-            let ended = self.procs.iter_mut().find_map(|p| {
+            let killed = &self.killed;
+            let ended = self.procs.iter_mut().enumerate().find_map(|(i, p)| {
+                if killed.contains(&i) {
+                    return None;
+                }
                 p.exited()
                     .map(|s| format!("{} exited ({s}) while waiting for {what}", p.name))
             });
@@ -341,6 +367,12 @@ impl Farm {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// SIGKILL to process `which`, as a host losing power would take it.
+    fn kill(&mut self, which: usize) {
+        self.procs[which].kill();
+        self.killed.push(which);
     }
 
     fn logs(&self) -> String {
@@ -361,6 +393,9 @@ impl Farm {
         });
         self.wait("every node connected to the frontend", |f| {
             (connected(f.api)? == f.node_ids).then_some(())
+        });
+        self.wait("every storage member active", |f| {
+            (members_active(f.api)? == (f.storage_nodes, true)).then_some(())
         });
     }
 
@@ -423,7 +458,7 @@ async fn upload_action(cas: &Transfers, image: &str, input: &[u8]) -> Digest {
         }],
         ..Directory::default()
     };
-    // The stand-in `podman` runs its planted steps whatever the arguments are.
+    // The stand-in `crun` runs its planted steps whatever the arguments are.
     let command = ReapiCommand {
         arguments: vec!["true".to_owned()],
         output_paths: vec!["out/file.txt".to_owned()],
@@ -603,40 +638,225 @@ fn three_storage_nodes_run_an_action() {
     farm.stop();
 }
 
-/// Reads every blob back through the frontend after one storage node is killed.
+/// How many actions the kill test runs before the kill: enough that the killed node
+/// has committed some action's cache entry (it commits those of which it is the first
+/// owner not marked down, a third of them), so the miss-and-rerun path runs.
+const ACTIONS: usize = 6;
+
+/// Writes the blobs numbered `range` through `cas` and reads each back.
+async fn write_blobs(cas: &Transfers, range: std::ops::Range<usize>) -> Vec<Vec<u8>> {
+    let blobs: Vec<Vec<u8>> = range.map(blob).collect();
+    for bytes in &blobs {
+        let digest = cas
+            .put(bytes.clone())
+            .await
+            .expect("a write after the kill goes on to the blob's other owner");
+        assert_eq!(digest, digest_of(bytes));
+    }
+    for bytes in &blobs {
+        let read = cas.get(&digest_of(bytes)).await.expect("read back");
+        assert_eq!(&read, bytes);
+    }
+    blobs
+}
+
+/// Runs an action whose input is `blob(input)` and returns its digest and result.
+async fn run_action(
+    channel: &Channel,
+    cas: &Transfers,
+    image: &str,
+    input: usize,
+) -> (Digest, ActionResult) {
+    let action = upload_action(cas, image, &blob(input)).await;
+    let response = tokio::time::timeout(HANG, execute(channel.clone(), action.clone()))
+        .await
+        .expect("the action answered in time");
+    let result = response
+        .result
+        .clone()
+        .unwrap_or_else(|| panic!("no result: {response:?}"));
+    assert_eq!(result.exit_code, 0, "{response:?}");
+    let [file] = &result.output_files[..] else {
+        panic!("one output file: {response:?}");
+    };
+    assert_eq!(file.digest.as_ref(), Some(&digest_of(OUTPUT)));
+    (action, result)
+}
+
+/// What the client asks of the frontend after the kill, `round` numbering the asking
+/// (fresh blobs are numbered from it). `before` is what was written before it.
 ///
-/// NOT RUN until the real binaries wire R=2 (`with_chain` in `kbf storage-and-daemon`,
-/// the open R=2 glue change; the frontend routes by the map already, see
-/// [`three_storage_nodes_run_an_action`]): at R=1 the killed node is the only owner of
-/// its blobs, so this fails by construction. Remove the `ignore` when R=2 is in; the
-/// flags the units render are the ones R=2 reads, so it needs no other change.
+/// Every blob and the actions' output read back. Each action's cache entry either
+/// answers as it did before (`GetActionResult`, and a repeat `Execute` with
+/// `cached_result` set) or is a miss (NOT_FOUND, never another error), and the repeat
+/// `Execute` of a miss runs the action again to the same output and its entry is back.
+/// Then writes: 24 fresh blobs and a new action. Returns the fresh blobs and the number
+/// of entries that were a miss.
+async fn survivors(
+    channel: &Channel,
+    cas: &Transfers,
+    image: &str,
+    before: (&[Vec<u8>], &[(Digest, ActionResult)]),
+    round: usize,
+) -> (Vec<Vec<u8>>, usize) {
+    let (blobs, actions) = before;
+    for bytes in blobs {
+        let read = cas
+            .get(&digest_of(bytes))
+            .await
+            .expect("a blob lost with the node");
+        assert_eq!(&read, bytes);
+    }
+    let read = cas
+        .get(&digest_of(OUTPUT))
+        .await
+        .expect("the actions' output lost with the node");
+    assert_eq!(read, OUTPUT);
+    let lookup = async |action: &Digest| {
+        ActionCacheClient::new(channel.clone())
+            .get_action_result(GetActionResultRequest {
+                action_digest: Some(action.clone()),
+                ..GetActionResultRequest::default()
+            })
+            .await
+    };
+    let mut reruns = 0;
+    for (action, result) in actions {
+        let hit = match lookup(action).await {
+            Ok(entry) => Some(entry.into_inner()),
+            // A miss costs the action a rerun; any other answer is a failure of the farm.
+            Err(status) if status.code() == tonic::Code::NotFound => None,
+            Err(status) => panic!("GetActionResult after the kill: {status:?}"),
+        };
+        if let Some(entry) = &hit {
+            assert_eq!(&entry.output_files, &result.output_files);
+        }
+        let again = tokio::time::timeout(HANG, execute(channel.clone(), action.clone()))
+            .await
+            .expect("the repeat answered in time");
+        let ran = again.result.as_ref().expect("a result");
+        assert_eq!(ran.exit_code, 0, "{again:?}");
+        assert_eq!(ran.output_files, result.output_files, "{again:?}");
+        assert_eq!(again.cached_result, hit.is_some(), "{again:?}");
+        reruns += usize::from(hit.is_none());
+        // Whichever it was, the entry is there now.
+        let entry = lookup(action).await.expect("the entry after the repeat");
+        assert_eq!(entry.into_inner().output_files, result.output_files);
+    }
+    // Writes: fresh blobs, then a fresh action (its input a fresh blob too).
+    let fresh = 1000 * round;
+    let written = write_blobs(cas, fresh..fresh + 24).await;
+    run_action(channel, cas, image, fresh + 500).await;
+    (written, reruns)
+}
+
+/// No blob is lost with a storage node, and the farm keeps taking writes.
+///
+/// A frontend, three storage-and-daemon nodes and a daemon, from the rendered units
+/// (R=2: the map is the one the frontend and the nodes share). The client writes 24
+/// blobs and `Execute`s six actions (six action cache entries, each committed with its
+/// output at its owners). Once every blob is on two storage nodes, the node holding
+/// most of them is killed with SIGKILL, and the frontend is asked, with the node dead
+/// and not yet marked down anywhere the client can see:
+/// - every blob written before the kill reads back, and so does the actions' output;
+/// - each action's cache entry either answers as before (`GetActionResult` and a repeat
+///   `Execute` agree, `cached_result` set) or is a miss (NOT_FOUND), in which case the
+///   repeat `Execute` runs it again to the same output and the entry is back. An entry is
+///   committed at one owner and not replicated (the design's "AC miss, rerun"), so the
+///   entries the dead node committed are misses; a miss costs a rerun and never a wrong
+///   or failed answer;
+/// - writes after the kill succeed: 24 more blobs, whose first owner is the dead node
+///   for about a third of them, go on to the other owner, and a new action runs to a
+///   result committed at an owner that is alive;
+/// - the same holds once the frontend lists the dead node's daemon as gone (the
+///   frontend's connection list, not the map: the member's lease outlives this test, so
+///   the map still has the node up and a `Down` owner is not reached here), and then
+///   every entry is a hit: what the reruns committed is on a live node.
+///
+/// Catches a farm that writes a blob once (a primary that does not send its copy, a
+/// copy that is owed and never made: the replica check before the kill, then the read
+/// after it, fail), a frontend that fails a write because the first owner is dead
+/// instead of going on to the next, and a commit that fails because its first owner is
+/// dead. It reaches the write failover of the frontend's raw upload and of
+/// `Router::commit_with_closure`; `Router::put` and skipping a `Down` owner are covered
+/// by the `kbf-route` tests (`a_write_goes_on_to_the_next_owner_when_the_first_cannot_be_reached`,
+/// `a_write_skips_an_owner_that_is_down`), not here. Planted to see it fail: `Chain::plan` answering `Plan::Local` for the primary
+/// (no copy is written, so the blobs are on one node each).
 #[test]
-#[ignore = "needs R=2 wired in the real binaries"]
 fn a_killed_storage_node_loses_no_blob() {
     let mut farm = Farm::start("kill", 3);
     farm.wait_ready();
     let tokio = tokio::runtime::Runtime::new().expect("runtime");
-    let (cas, blobs) = tokio.block_on(async {
-        let cas = Transfers::over(farm.channel().await, TransferConfig::default());
+    let (channel, cas, blobs, actions) = tokio.block_on(async {
+        let channel = farm.channel().await;
+        let cas = Transfers::over(channel.clone(), TransferConfig::default());
         let blobs = write_and_read(&cas).await;
-        (cas, blobs)
+        let mut actions = Vec::new();
+        for input in 100..100 + ACTIONS {
+            actions.push(run_action(&channel, &cas, &farm.image, input).await);
+        }
+        (channel, cas, blobs, actions)
     });
-    // Node 2 holds some of them (and the partner's copies are in place) before it dies.
-    farm.wait("blobs on node 2", |f| {
+    // Every blob is on two storage nodes before the node dies: the primary sent the
+    // partner's copy before it answered, or owes it and the repair worker makes it.
+    farm.wait("every blob on two storage nodes", |f| {
+        blobs.iter().all(|b| f.holders(b).len() >= 2).then_some(())
+    });
+    let held = |n: usize| {
         blobs
             .iter()
-            .flat_map(|b| f.holders(b))
-            .any(|n| n == 2)
-            .then_some(())
+            .filter(|b| farm.holders(b).contains(&n))
+            .count()
+    };
+    let victim = (1..=farm.storage_nodes)
+        .max_by_key(|n| held(*n))
+        .expect("a node");
+    assert!(held(victim) > 0, "no blob on any node");
+    eprintln!("killing node {victim}, which holds {} blobs", held(victim));
+    farm.kill(victim);
+
+    let check = |farm: &Farm, round: usize| {
+        tokio.block_on(survivors(
+            &channel,
+            &cas,
+            &farm.image,
+            (&blobs, &actions),
+            round,
+        ))
+    };
+    let (first, reruns) = check(&farm, 1);
+    eprintln!("{reruns} of {ACTIONS} cache entries were gone with the node: rerun");
+    // The farm is fixed (its map, the digests, the image), so the node holding most blobs
+    // also committed at least one entry: without this a farm where the dead node
+    // committed none would pass with the commit failover never exercised.
+    assert!(
+        reruns > 0,
+        "no cache entry was committed by the killed node: the commit failover is unexercised"
+    );
+
+    // The frontend lists the killed node's daemon as gone; the same again.
+    let gone: Vec<String> = farm
+        .node_ids
+        .iter()
+        .filter(|id| **id != node_id(victim))
+        .cloned()
+        .collect();
+    farm.wait("the frontend to list the killed node as gone", |f| {
+        (connected(f.api)? == gone).then_some(())
     });
-    farm.procs[2].kill();
-    tokio.block_on(async {
-        for bytes in &blobs {
-            let read = cas
-                .get(&digest_of(bytes))
-                .await
-                .expect("a blob lost with the node");
-            assert_eq!(&read, bytes);
-        }
-    });
+    let (second, reruns) = check(&farm, 2);
+    assert_eq!(reruns, 0, "an entry rewritten after the kill is gone again");
+    // What was written after the kill is on the live nodes, whole.
+    for bytes in first.iter().chain(&second) {
+        let live = farm.holders(bytes).into_iter().filter(|n| *n != victim);
+        assert!(
+            live.count() > 0,
+            "a write after the kill is on no live node"
+        );
+    }
+    // The killed process is already gone; the others stop cleanly.
+    for i in (0..farm.procs.len()).rev().filter(|i| *i != victim) {
+        let status = farm.procs[i].term();
+        assert!(status.success(), "{status}\n{}", farm.logs());
+    }
 }

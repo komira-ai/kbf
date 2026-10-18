@@ -29,7 +29,7 @@ Linux only, the container driver only. Elsewhere the binary exits 2 and says to 
    daemon half stops once the server half has, abandoning the leases still running, and
    the process exits 0. A server half that stops serving on its own stops the daemon too,
    and the process exits 1. A start the server half refuses exits 2, as `kbf-server`
-   does; one the daemon half refuses exits as `kbf-daemon` does (1, or 2 for an
+   does; one that can pass on a later try exits 75 (`kbf_server::StartFailure`); one the daemon half refuses exits as `kbf-daemon` does (1, or 2 for an
    `--image` the node cannot run).
 
 ## `kbf storage-and-daemon`
@@ -123,7 +123,7 @@ durable store, not a cache: a `file://` cold store on the same disk holds its ow
   over a server started as `kbf-server` starts, with a write tier and without. The
   transfer engine runs the same checks in `kbf-cas-conformance`'s own tests.
 - `tests/binary.rs`: the binary end to end. One action runs on the container driver over
-  the driver's own stand-in `podman` (`kbf-fake-podman`, built from
+  the driver's own stand-in `crun` (`kbf-fake-crun`, built from
   `kbf-driver-container`'s source, which runs the action as a plain process) and a cgroup
   tree of plain directories; its output file, output directory, stdout and stderr are
   read back over REAPI; SIGTERM ends the process with 0. The binary is given no `--cas`,

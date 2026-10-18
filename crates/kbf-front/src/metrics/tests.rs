@@ -130,6 +130,18 @@ fn each_command_has_its_own_label() {
         Command::EvictObjects {
             objects: [object].into(),
         },
+        Command::SetWriter(kbf_meta::NodeWriter::new(
+            std::num::NonZeroU64::MIN,
+            std::num::NonZeroU64::MIN,
+        )),
+        Command::AdoptSegment {
+            object,
+            entries: Vec::new(),
+        },
+        Command::RebuildProgress {
+            after: String::new(),
+        },
+        Command::RebuildDone,
     ];
     let labels: Vec<&str> = commands
         .iter()
@@ -154,7 +166,13 @@ fn every_family_is_printed_once_with_its_type() {
     metrics.execute_dir_reads.add(17);
     metrics.sched_queued.set(18);
     metrics.sched_leases.set(19);
-    metrics.frontend_relay_lost.add(20);
+    metrics.frontend_relay_untraced.set(20);
+    metrics.handover_relayed.add(21);
+    let _relays = (
+        metrics.handover_relays_open.raise(),
+        metrics.handover_relays_open.raise(),
+        metrics.handover_relays_open.raise(),
+    );
     let _presubmit = metrics.execute_presubmit_in_flight.raise();
     let (_tier, _tier2) = (
         metrics.tier_in_flight.raise(),
@@ -207,7 +225,9 @@ fn every_family_is_printed_once_with_its_type() {
             "kbf_input_directories_joined_total counter",
             "kbf_sched_queued gauge",
             "kbf_sched_leases gauge",
-            "kbf_frontend_relay_lost_total counter",
+            "kbf_frontend_relay_untraced gauge",
+            "kbf_handover_relayed_total counter",
+            "kbf_handover_relays_open gauge",
             "kbf_tier_in_flight gauge",
             "kbf_meta_commit_seconds histogram",
             "kbf_execute_requests_total counter",
@@ -235,7 +255,9 @@ fn every_family_is_printed_once_with_its_type() {
         ("kbf_execute_dir_reads_total", 17),
         ("kbf_sched_queued", 18),
         ("kbf_sched_leases", 19),
-        ("kbf_frontend_relay_lost_total", 20),
+        ("kbf_frontend_relay_untraced", 20),
+        ("kbf_handover_relayed_total", 21),
+        ("kbf_handover_relays_open", 3),
         ("kbf_execute_presubmit_in_flight", 1),
         ("kbf_tier_in_flight", 2),
     ] {

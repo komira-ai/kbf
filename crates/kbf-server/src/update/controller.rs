@@ -214,16 +214,14 @@ impl Controller {
         }
         self.resumed = true;
         self.free_unheld_places(&mut pass)?;
-        let moving: Vec<WorkerId> = pass
+        let moving: Vec<HostFacts> = pass
             .rows
             .iter()
-            .filter(|(id, row)| {
-                row.value.record.phase.holds_place() && pass.facts.host(id).is_some()
-            })
-            .map(|(id, _)| id.clone())
+            .filter(|(_, row)| row.value.record.phase.holds_place())
+            .filter_map(|(id, _)| pass.facts.host(id).cloned())
             .collect();
-        for id in moving {
-            if self.advance(&mut pass, &id)? == Flow::Stop {
+        for host in moving {
+            if self.advance(&mut pass, &host)? == Flow::Stop {
                 return Ok(pass.report);
             }
         }
@@ -390,17 +388,18 @@ impl Controller {
     }
 
     /// The next move of a host in a step.
-    fn advance(&mut self, pass: &mut Pass, id: &WorkerId) -> Result<Flow, ControllerError> {
+    fn advance(&mut self, pass: &mut Pass, host: &HostFacts) -> Result<Flow, ControllerError> {
+        let id = &host.id;
         let stored = pass.rows[id].clone();
         let mut facts = pass.facts.clone();
         facts.target = stored.value.commit.clone();
-        let mut moved = decide(&facts, id, &pass.policy, pass.now)?;
+        let mut moved = decide(&facts, host, &pass.policy, pass.now);
         if moved.order.is_some() {
             // The step asked for an order id: draw one, and ask again with it. The step is
             // pure and the id is all that changed, so the second answer is the first with
             // the id drawn in place of the placeholder (`Facts::next_order`).
             facts.next_order = self.rows.mint_order(self.epoch)?;
-            moved = decide(&facts, id, &pass.policy, pass.now)?;
+            moved = decide(&facts, host, &pass.policy, pass.now);
         }
         self.apply(pass, id, &stored, &moved)
     }
