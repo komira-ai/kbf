@@ -36,7 +36,7 @@ Package-owned (root:root, no group/other write, changed by package upgrade only)
 - `/usr/share/kbf-installer/trust/`: pinned `gh`, `trusted_root.jsonl` (with `valid_until`), `installer.conf` (signer workflow, OIDC issuer, repo, allowed source refs, `deny` commit list, and the tested Envoy version range of section 5.1). Replaces `/usr/local/libexec/kbf-deploy`. Allowed source refs live **only** here; `installer.toml` may narrow them, never widen (set intersection).
 
 Installer-owned (root:root):
-- `/var/lib/kbf-installer/releases/<sha>/`: `kbf`, `kbf-daemon` where it applies, `units/`, and a `VERIFIED` marker written into the directory before it is renamed into place. Files 0755/0644; no setuid, setgid or file capabilities.
+- `/var/lib/kbf-installer/releases/<sha>/`: `kbf` (the one component on every platform, macOS included), `units/`, and a `VERIFIED` marker written into the directory before it is renamed into place. Files 0755/0644; no setuid, setgid or file capabilities.
 - `/var/lib/kbf-installer/releases/current`, `releases/previous`: relative links to `<sha>`. Frontend instances use `slots/<instance>` links (section 6).
 - `/var/lib/kbf-installer/state.json` (0600, schema 2) and `state.json.bak`; it supersedes the schema 1 `helper.json` of #1024. `status.json` (0644, section 4). `work/<sha>.partial/` (0755, extraction; `dl/` inside it 0700 holds the tarball), swept at every start. `orders/` (`kbf:kbf` 0700). Lock `/run/kbf-installer/lock`.
 - Layout constants live in `layout.rs`, one place. macOS: root-owned `/usr/local/kbf-installer` tree (not a user-owned Homebrew prefix), `/var/db/kbf-installer` for state.
@@ -175,7 +175,7 @@ Threats: A compromised `kbf`; B compromised fetch child or release host; C local
 5. Attestation bundles: stored with the release in the frontend's store and carried in the offer.
 6. `--deny-self-hosted-runners`: the build farm is self-hosted; decide whether the release workflow runs on GitHub-hosted runners (recommended, keep the flag) before P8.
 7. Package formats: deb, rpm, macOS cask/pkg; repository signing keys decided before any public channel.
-8. Mac component name `kbf-daemon` stays until a release needs the rename (later; distribution.md section 9.2 closes the same way).
+8. Mac component name: decided, the darwin component is `kbf` and the Mac runs `kbf --mode=daemon`; `kbf-mac-provision` moves to the same layout (distribution.md section 9.2).
 9. Order channel: decided, the `orders/` directory (section 12), not a socket.
 
 Edits needed: #1024 (its section 12 and its update-button text; see the Later list in section 13 here), #1021 (follows this document), #966 (`ExecStart` path and `--mode` form; gating; no `kbf enroll` pre-start; no formula for the root installer), #1020 (`--check` flag).
