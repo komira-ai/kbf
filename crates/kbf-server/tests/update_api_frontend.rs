@@ -24,7 +24,7 @@ use kbf_server::token::ApiToken;
 use kbf_server::update::{Began, FrontendState, OrderId, Release, Rows};
 use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
 use kbf_state::fake::{Fake, Flaw};
-use kbf_state::{ManualClock, Store};
+use kbf_state::{Cond, ManualClock, Store, Txn};
 use kbf_types::ReleasePlatform;
 use kbf_update::{OrderRecord, Verb};
 use serde_json::{Value, json};
@@ -289,6 +289,26 @@ impl Host {
 
     async fn get(&self, path: &str) -> (u16, Value) {
         http(self.running.api, "GET", path, false, None, b"").await
+    }
+
+    /// Store `commit` for `platform` with `attestation` as its bundle, bytes as given.
+    async fn put_bundle(&self, commit: &str, platform: &str, attestation: &[u8]) {
+        let path = format!("/v1/releases/{commit}/{platform}/kbf");
+        let api = self.running.api;
+        assert_eq!(
+            http(api, "PUT", &path, true, None, b"a tarball").await.0,
+            201
+        );
+        let at = format!("{path}.attestation");
+        assert_eq!(http(api, "PUT", &at, true, None, attestation).await.0, 201);
+    }
+
+    /// The row's bytes replaced by `bytes`, as a store that holds something else would have it.
+    fn corrupt_row(&self, bytes: &[u8]) {
+        self.store
+            .txn(Txn::new().put("update/frontend", bytes.to_vec(), Cond::Any))
+            .expect("a write")
+            .expect("no condition");
     }
 
     /// Store `commit` for `platform`, and its attestation when `attested`.
@@ -589,6 +609,108 @@ async fn an_order_that_fails_to_write_and_to_close_its_row_is_500_and_leaves_it_
         "{body}"
     );
     assert_eq!(h.row().expect("the row").state, FrontendState::Open);
+}
+
+/// Catches the installer's word shown wrong: each state word of `status.json` is shown as
+/// itself under `installer.state` (a swapped pair of words would send an operator the wrong
+/// way), a status file that is not a status is shown as an error and not as a state, and the
+/// wall clock the route reads by default is the real one.
+///
+/// Mutants planted: two state words swapped; the unreadable file shown as absent.
+#[tokio::test]
+async fn the_view_shows_each_state_word_and_an_unreadable_status_as_an_error() {
+    let h = host();
+    for word in [
+        "idle",
+        "fetching",
+        "staged",
+        "activated_unconfirmed",
+        "confirmed",
+        "reverted",
+        "refused",
+    ] {
+        h.say(word, Some(A));
+        let (code, view) = h.get("/v1/update/frontend").await;
+        assert_eq!(code, 200, "{word}");
+        assert_eq!(view["installer"]["state"], word, "{view}");
+    }
+    std::fs::write(h.status(), b"not json").expect("garbage");
+    let (_, view) = h.get("/v1/update/frontend").await;
+    assert_eq!(view["installer"]["present"], true, "{view}");
+    assert!(view["installer"]["error"].is_string(), "{view}");
+    assert!(view["installer"].get("state").is_none(), "{view}");
+
+    let real = Installer::open(&h.dir.0.join("real").join("orders"), None).expect("opens");
+    let now = (real.now_ms)();
+    assert!(now > 1_700_000_000_000, "{now} is not the wall clock");
+}
+
+/// Catches a row the store holds that is no row being answered as if it were fine: the view of
+/// the frontend update, the frontend section of `GET /v1/update`, and the order itself are each
+/// 500 `the update rows failed` (and the order writes no record), not a guess.
+///
+/// Mutant planted: a corrupt row read as no row (the order is accepted over it).
+#[tokio::test]
+async fn a_corrupt_row_is_a_500_everywhere_it_is_read() {
+    let h = host();
+    h.put(A, X86, true).await;
+    h.corrupt_row(&[0xff, 0xff, 0xff]);
+    for path in ["/v1/update/frontend", "/v1/update"] {
+        let (code, body) = h.get(path).await;
+        assert_eq!(code, 500, "{path}: {body}");
+    }
+    let (code, body) = h.post(A).await;
+    assert_eq!(code, 500, "{body}");
+    assert!(
+        h.records().is_empty(),
+        "no record over a row nobody can read"
+    );
+}
+
+/// Catches a store that cannot write the row being answered as an order: the row cannot be
+/// opened, so the answer is 500 and no record is written.
+#[tokio::test]
+async fn a_row_that_cannot_be_opened_orders_nothing() {
+    let h = host_full(
+        true,
+        true,
+        true,
+        Some(ReleasePlatform::LinuxX86_64),
+        |store| stores::Meddle::failing_writes_to(store, "update/frontend"),
+    );
+    h.put(A, X86, true).await;
+    let (code, body) = h.post(A).await;
+    assert_eq!(code, 500, "{body}");
+    assert!(h.records().is_empty());
+}
+
+/// Catches a release whose bundle the route cannot hand over being ordered anyway: a bundle that
+/// is not text and one that is a directory (the store cannot read it) are each 500 and write
+/// no record and open no row.
+///
+/// Mutants planted: a non-text bundle passed through lossily; an unreadable bundle skipped.
+#[tokio::test]
+async fn a_bundle_the_installer_could_not_take_is_500_and_orders_nothing() {
+    let h = host();
+    h.put_bundle(A, X86, &[0xff, 0xfe, 0xfd]).await;
+    let (code, body) = h.post(A).await;
+    assert_eq!(code, 500, "{body}");
+    assert!(h.records().is_empty(), "not text");
+    assert_eq!(h.row(), None, "nothing was opened");
+
+    h.put(B, X86, true).await;
+    let at = h
+        .dir
+        .0
+        .join("releases/index")
+        .join(B)
+        .join(X86)
+        .join("kbf.attestation");
+    std::fs::remove_file(&at).expect("the bundle file");
+    std::fs::create_dir(&at).expect("a directory in its place");
+    let (code, body) = h.post(B).await;
+    assert_eq!(code, 500, "{body}");
+    assert!(h.records().is_empty(), "unreadable");
 }
 
 /// Catches an answer made up for a server that cannot keep the row, hold the release or reach

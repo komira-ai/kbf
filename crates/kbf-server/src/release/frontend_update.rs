@@ -116,11 +116,25 @@ impl std::fmt::Debug for Installer {
 
 /// The platform this process runs on, as releases name it.
 fn own_platform() -> Option<ReleasePlatform> {
-    let arch = match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        other => other,
-    };
-    ReleasePlatform::from_report(std::env::consts::OS, arch)
+    ReleasePlatform::from_report(std::env::consts::OS, release_arch(std::env::consts::ARCH))
+}
+
+/// The word releases use for a CPU: Rust's `aarch64` is `arm64`.
+fn release_arch(arch: &str) -> &str {
+    if arch == "aarch64" { "arm64" } else { arch }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::release_arch;
+
+    /// Catches the arm word going wrong on the host that is not arm (the CI that measures
+    /// this runs on x86_64): `aarch64` is `arm64`, anything else is itself.
+    #[test]
+    fn rusts_aarch64_is_the_releases_arm64() {
+        assert_eq!(release_arch("aarch64"), "arm64");
+        assert_eq!(release_arch("x86_64"), "x86_64");
+    }
 }
 
 fn unix_ms() -> u64 {
@@ -209,14 +223,13 @@ pub async fn section(rows: Rows, installer: Option<Arc<Installer>>) -> Result<Va
         return Ok(json!({ "enabled": false, "row": null, "installer": null }));
     };
     let row = blocking(move || rows.frontend()).await?.value;
-    let installer = tokio::task::spawn_blocking(move || {
-        (
+    let installer = blocking(move || {
+        Ok((
             row.as_ref().map(|r| row_view(r, &installer)),
             installer_view(&installer),
-        )
+        ))
     })
-    .await
-    .map_err(|e| RowError::Store(kbf_state::StoreError::Failed(e.to_string())))?;
+    .await?;
     Ok(json!({ "enabled": true, "row": installer.0, "installer": installer.1 }))
 }
 
@@ -289,7 +302,7 @@ async fn locators(
             .attestation(&key)
             .await
             .map_err(|e| format!("attestation: {e}"))?
-            .ok_or_else(|| format!("{} lost its attestation", info.component.as_str()))?;
+            .ok_or("a component lost its attestation")?;
         found.push(Locator {
             name: info.component.as_str().to_owned(),
             sha256: info.sha256.as_str().to_owned(),
@@ -427,15 +440,12 @@ async fn begin(
         Err(e) => return row_failed(&e),
     };
     let record = record_of(&row, components);
-    let written = match record.check() {
-        Ok(()) => {
-            let (installer, record) = (Arc::clone(&installer), record);
-            tokio::task::spawn_blocking(move || installer.spool.write(&record))
-                .await
-                .unwrap_or_else(|e| Err(io::Error::other(e.to_string())))
-        }
-        Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-    };
+    // One small file in the host's own spool, written on the request's thread (there is no
+    // task to lose, so no join error to invent an answer for), after the record is checked.
+    let written = record
+        .check()
+        .map_err(io::Error::other)
+        .and_then(|()| installer.spool.write(&record));
     if let Err(e) = written {
         tracing::error!(order_id = row.order.seq, "the frontend's order record: {e}");
         let order = row.order;
