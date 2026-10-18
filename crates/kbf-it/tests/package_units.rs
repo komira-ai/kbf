@@ -72,7 +72,9 @@ const RUNTIME: [&str; 6] = [
 ];
 
 /// The rules, by the tag a violation starts with.
-const RULES: [&str; 27] = [
+const RULES: [&str; 29] = [
+    "install",
+    "network",
     "positional",
     "placeholder",
     "continuation",
@@ -232,6 +234,30 @@ fn violations(name: &str, text: &str) -> Vec<String> {
             "ExecCondition= in place of ExecStartPre=".into(),
         );
     }
+    // Catches a unit that is never started at boot once enabled: without
+    // WantedBy=multi-user.target, `systemctl enable` links it nowhere and a reboot leaves
+    // the host down (the restart drill's failure).
+    if !all(&unit, "Install", "WantedBy").contains(&"multi-user.target") {
+        v(
+            "install",
+            "no WantedBy=multi-user.target in [Install]".into(),
+        );
+    }
+    // Catches a unit that starts before the network: a listener, a peer or a name looked up
+    // before network-online.target fails the start (or binds the wrong address).
+    if !is_installer {
+        for key in ["Wants", "After"] {
+            if !all(&unit, "Unit", key)
+                .iter()
+                .any(|v| v.split_whitespace().any(|u| u == "network-online.target"))
+            {
+                v(
+                    "network",
+                    format!("no {key}=network-online.target in [Unit]"),
+                );
+            }
+        }
+    }
 
     // Every program the unit runs is the installer's: the package replaces
     // /usr/bin/kbf-installer, the installer replaces the tree. Only the two root checks
@@ -288,9 +314,17 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     if unit.get_in("Service", "LimitNOFILE").map(trim) != Some("1048576") {
         v("nofile", "no LimitNOFILE=1048576".into());
     }
-    // Catches a user that is not `kbf`, the one runtime user the contract creates.
-    if unit.get_in("Service", "User").map(trim) != Some("kbf") {
-        v("user", "User= is not kbf".into());
+    // Catches a server half run as the user builds run as: the frontend (the state store,
+    // the operator token) and a storage node (the cold store's key) run as kbf-server, so an
+    // action (run as kbf) cannot read what they hold; the modes that run builds run as kbf.
+    // As kbf-deploy's units do today.
+    let want = if mode.is_some_and(|m| ["frontend", "storage"].contains(&m)) {
+        "kbf-server"
+    } else {
+        "kbf"
+    };
+    if unit.get_in("Service", "User").map(trim) != Some(want) {
+        v("user", format!("User= is not {want}"));
     }
     // Catches a key given to the unit any way but kbf.toml: an EnvironmentFile=, an
     // Environment= with a key, a credential, or a MinIO unit it orders after.
@@ -341,6 +375,12 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         }
         if unit.get_in("Service", "RestartSec").map(trim) != Some("5") {
             v("restart", "no RestartSec=5".into());
+        }
+        if unit.get_in("Unit", "StartLimitIntervalSec").map(trim) != Some("0") {
+            v(
+                "restart-limit",
+                "no StartLimitIntervalSec=0 in [Unit]".into(),
+            );
         }
         return out;
     }
@@ -402,8 +442,16 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     }
     // Catches kbf's own state in the wrong place: /var/lib/kbf is the unit's StateDirectory=,
     // which the installer never touches.
-    if unit.get_in("Service", "StateDirectory").map(trim) != Some("kbf") {
-        v("state-dir", "no StateDirectory=kbf".into());
+    // One directory per user: systemd chowns a StateDirectory= to the unit's user at every
+    // start, so a host running a kbf-server unit and a kbf unit would hand one directory
+    // back and forth.
+    let dir = if ["frontend", "storage"].contains(&mode) {
+        "kbf-server"
+    } else {
+        "kbf"
+    };
+    if unit.get_in("Service", "StateDirectory").map(trim) != Some(dir) {
+        v("state-dir", format!("no StateDirectory={dir}"));
     }
 
     // Catches start-limit-hit on a failure that repeats quickly: every mode unit, the
@@ -512,6 +560,18 @@ fn violations(name: &str, text: &str) -> Vec<String> {
             v(
                 "notify",
                 format!("start timeout {start_timeout:?} is not finite"),
+            );
+        }
+        // Catches a start timeout shorter than the bind retry's budget plus the checks
+        // before it: kbf waits up to 90 s for a listen address (kbf#998), and systemd would
+        // kill that start mid-retry.
+        let seconds = start_timeout.and_then(|t| t.trim_end_matches('s').parse::<u64>().ok());
+        if start_timeout.is_some_and(|t| t != "infinity") && seconds.is_none_or(|s| s < 120) {
+            v(
+                "notify",
+                format!(
+                    "start timeout {start_timeout:?} is below 120 s (the 90 s bind budget and the checks)"
+                ),
             );
         }
     } else if kind == Some("notify") {
@@ -828,15 +888,45 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-storage.service",
+        "\nUser=kbf-server\n",
+        "\nUser=kbf\n",
+        "user",
+    ),
+    (
+        "kbf-daemon.service",
         "\nUser=kbf\n",
         "\nUser=kbf-server\n",
         "user",
     ),
     (
         "kbf-storage.service",
+        "StateDirectory=kbf-server\n",
         "StateDirectory=kbf\n",
-        "",
         "state-dir",
+    ),
+    (
+        "kbf-daemon.service",
+        "\nWantedBy=multi-user.target\n",
+        "\n",
+        "install",
+    ),
+    (
+        "kbf-storage.service",
+        "Wants=network-online.target\n",
+        "",
+        "network",
+    ),
+    (
+        "kbf-frontend@.service",
+        "TimeoutStartSec=120\n",
+        "TimeoutStartSec=60\n",
+        "notify",
+    ),
+    (
+        "kbf-envoy.service",
+        "StartLimitIntervalSec=0\n",
+        "",
+        "restart-limit",
     ),
     (
         "kbf-daemon.service",

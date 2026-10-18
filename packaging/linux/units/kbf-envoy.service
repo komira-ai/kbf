@@ -14,6 +14,9 @@ Wants=network-online.target
 After=network-online.target
 ConditionPathExists=/etc/kbf/kbf.toml
 ConditionPathExists=/etc/kbf/envoy/envoy.json
+# A failure that repeats quickly must not use up systemd's start limit and leave every
+# build without its front door.
+StartLimitIntervalSec=0
 
 [Service]
 User=kbf
