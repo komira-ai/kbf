@@ -16,8 +16,9 @@ state store, protocol skew, upgrade order), [worker-protocol.md](worker-protocol
 
 ## 1. The answer in ten lines
 
-1. An operator (or an auto-update rule the operator set) names a **desired release**: one commit of this
-   repository's `main`, whose build attestations are on GitHub. The frontend stores it.
+1. An **external caller** names a **desired release**: one commit of this repository's `main`, whose build attestations are on GitHub.
+   Updates are **triggered externally** through the frontend's control API; for us the caller is the gamma deployment, which calls the API
+   from our network. The frontend stores the desired release. Support is **on-prem only** for now; cloud update providers are deferred (section 12).
 2. Every host learns the desired release over the **mTLS session it already holds** with the frontend: an
    `UpdateOffer` sent after `Welcome` and at every change. No new inbound port, no SSH, no CI credential that
    reaches a host.
@@ -35,12 +36,13 @@ state store, protocol skew, upgrade order), [worker-protocol.md](worker-protocol
    installs, flips `current` and restarts.
 6. The new process registers; the frontend checks health and sends `UpdateOrder{CONFIRM}`. If confirmation does
    not arrive in the window, or the unit crash-loops, the installer reverts locally (commit-confirm).
-7. **Node updates and the frontend's own update are decoupled.** "Update ready" (the desired release, set in the UI,
-   the desktop app or the API) updates **storage and daemon nodes only**, through the drain system: **nodes update
+7. **Node updates and the frontend's own update are decoupled.** "Update ready" (the desired release, set by an external API call to the
+   frontend's control API) updates **storage and daemon nodes only**, through the drain system: **nodes update
    asynchronously, in any order, when idle or drained** (at most one storage node at a time; daemon-only hosts and Macs
    concurrently up to `max_hosts_out`, default 1; a busy Mac is deferred). The frontend is not in that rollout. Its own
-   update is a **separate action**: the Envoy swap and handover (the new instance starts on the other port, Envoy routes
-   new connections to it, the old one drains and keeps its in-flight `Execute` streams until they complete; it never
+   update is a **separate step, also triggered externally**: `kbf-installer` on the frontend host does an Envoy hot restart or an instance
+   swap plus the handover (the new instance starts on the other port, Envoy routes new connections to it, the old one relays and keeps its
+   in-flight `Execute` streams until they close; it never
    waits for `open_executions == 0` and never restarts the serving frontend). Details: split-mode-updates.md 2.5, 2.6
    and 3.3, and section 8 below for what decoupling changes.
 8. Rollback is setting the desired release back: a **higher generation** naming an older commit. The old
@@ -48,8 +50,8 @@ state store, protocol skew, upgrade order), [worker-protocol.md](worker-protocol
 9. Only the unprivileged `kbf` binary is ever pulled. `kbf-installer` (which includes the former helper), unit files, the
    sudoers entry and the pinned trust material change only by the package or a script a human runs. Root code is never
    auto-updated, and the code that downloads runs without root.
-10. The operator sees every host's version, an "update available" notification, a button to update, and an
-    optional auto-update rule. All-in-one is the same button on one machine.
+10. The operator sees every host's version (`GET /v1/nodes`). The **update banner and button, and the desktop app, are deferred** (section 12);
+    until then the trigger is the external API call of item 1.
 
 ## 2. Trust model (MVP decision)
 
@@ -64,8 +66,7 @@ commit the attestation names must be the commit the offer names.
 
 The frontend **only stores and distributes** the desired commit and the release bytes. It is **not trusted for
 integrity**, and neither is the release source or the fetch child: the root parent re-checks the tarball's SHA-256
-against the attestation's subject digest and the attestation against the pinned root, and installs nothing else. The human approval is the click (or the auto-update rule the
-operator set).
+against the attestation's subject digest and the attestation against the pinned root, and installs nothing else. The approval is the external API call that sets the desired release.
 
 | Actor | Can do | Cannot do |
 |---|---|---|
@@ -116,10 +117,10 @@ Residuals, stated plainly:
 ## 4. Components
 
 ```text
- operator / UI               frontend host                              every other host
+ external caller / API          frontend host                              every other host
  -------------               -------------                              ----------------
  /v1/update, /v1/releases -> kbf --mode=frontend                         kbf --mode=storage-and-daemon
- (click, auto rule)            release store (--releases-dir)             update client (kbf-update)
+ (gamma deployment)           release store (--releases-dir)             update client (kbf-update)
                                desired release, rules (state store)         | writes order records only
                                offers + orders over sessions                | order spool (small records only)
                                rollout controller                           v
@@ -137,7 +138,7 @@ Residuals, stated plainly:
 | Installer (fetch in a child, verify offline, install, flip, revert) | `kbf-installer`, a root unit on each host; `kbf-helper` is folded into it ([distribution.md](distribution.md) section 6) | verbs and the fetch child in section 7 |
 | Rollout controller | `kbf-server`, replaces the older record in `rollout.rs` | section 8 |
 | Release discovery | the frontend polls GitHub, read-only | proposes a desired release; never applies |
-| Fleet view | the UI, over `/v1/nodes` and `/v1/update` | section 9 |
+| Fleet view | read-only over `/v1/nodes` and `/v1/update`; the UI page is deferred | section 9 |
 
 ## 5. The wire contract (frozen)
 
@@ -241,9 +242,9 @@ state can be set as the desired release.
 
 **Who supplies what the host verifies.** The attestation bundles an offer carries are **stored by the frontend's release store** (the
 release's CI upload `PUT`s `<name>.attestation` beside each tarball, section 6.3); the frontend is a courier and not a trust anchor, since the
-installer verifies each bundle against the pinned root. **The Envoy pin** (`version`, `url`, `sha256`) is an **attested component of the
-frontend release**, uploaded and offered like any other component; only the frontend host's installer acts on it, nodes ignore it
-([kbf-installer.md](kbf-installer.md) section 5 step 7).
+installer verifies each bundle against the pinned root. **Envoy is a dependency, not part of a release**: it is installed as a prerequisite
+(a package dependency or host preparation), kbf supports a tested range of Envoy versions, nothing in a kbf release pins Envoy, and the installer
+never fetches it. Release-manifest and Envoy-component pinning, and cross-version Envoy upgrades, are deferred (section 12).
 
 **The disk index is the source of truth for bytes.** The release store on disk (`files/<sha256>` and
 `index/<commit>/<platform>/<name>`, with attestation bundles) is authoritative for what the frontend can serve. The
@@ -553,22 +554,22 @@ held and the run goes `held`; a broken host never lets another take its place.
    `deny` list, needs the local root `kbf-installer rollback` verb (section 7).
 5. **Protocol skew and state schema**: split-mode-updates.md 3.3 (order rule) and 3.4 (the state-store schema is
    expand-then-contract; a contract change is refused by the planner and takes the cold path).
-6. **The frontend updates only through Envoy, as its own action** (not as a step of the node rollout above; the operator or the
-   `auto_frontend` rule starts it). The installer on the frontend host fetches and verifies the release exactly as on a node
+6. **The frontend updates only through Envoy, as its own step** (not as a step of the node rollout above; it is triggered externally,
+   like the desired release). Envoy is already installed on the host as a prerequisite and is not touched by the update. The installer on the frontend host fetches and verifies the release exactly as on a node
    (section 7.1 and 7.2) and flips `current`
    without restarting the serving instance, then starts the other instance of `kbf-frontend@{a,b}` on its own ports. The new
    process takes the state-store writer baton from the old one over the control socket (#879's protocol without the
-   passed sockets), Envoy routes new connections to it, and the old instance fails its health check, sends GOAWAY, answers its
+   passed sockets), Envoy routes new connections to it, and the old instance relays, fails its health check, sends GOAWAY, answers its
    open `Execute` and `WaitExecution` streams from the `done/` rows, and exits when they end. The rollout **never waits for
    `open_executions == 0` and never restarts the serving frontend**; the confirm window starts when the new instance is
    serving. Steps E0 to E9, the writer options and the failure matrix are split-mode-updates.md 2.5 and 2.9.
 
 ## 9. The fleet view
 
-Every host's running and installed version (`GET /v1/nodes`), an **update available** notification (the frontend
-polls GitHub, read-only, for the newest attested artifacts run on `main` and proposes it as a release), a **button**
-that sets the desired release, and an optional **auto-update rule** (`POST /v1/update/auto`). The frontend applies a
-release only on the click or the rule. All-in-one is the same button on one machine.
+Every host's running and installed version (`GET /v1/nodes`) and the desired release (`GET /v1/update`), read-only. **Deferred:** the "update
+available" notification, the button that sets the desired release, an in-product auto-update rule, and the desktop app. The `update/policy`
+fields `auto_nodes` and `auto_frontend` are not wired to any trigger in this version; the trigger is the external API call. All-in-one is the
+same call against one machine.
 
 ## 10. Failure modes and their tests
 
@@ -623,12 +624,16 @@ Each safety property has a planted mutant that turns its test red.
 | wire and store (this contract) | `update.proto`, `ReleasePlatform`, the release store, the desired release, `/v1/update`, `/v1/releases`, update view in `/v1/nodes`, offers over the session, `ReleaseService.Fetch` |
 | node client | status reporting, refuse with live leases, relay of offers and orders as order records (no fetch, no staging) |
 | installer core | versioned directories, the fetch child (7.1), the root-side checks (7.2), offline attestation check, commit-confirm, revert, retention |
-| release source | the frontend's read-only poll of GitHub for the newest attested `main` artifacts |
+| release source | **deferred**: the frontend's read-only poll of GitHub for the newest attested `main` artifacts (the external caller names the commit) |
 | rollout controller | the slot, the per-host step, the gates, resume, pause, the frontend switch through Envoy (split-mode-updates.md) |
-| fleet view | the UI page and the auto-update rule |
+| fleet view | **deferred**: the UI page, the update banner and button, the desktop app, the auto-update rule |
 | bootstrap and rehearsal | the host-side scripts a human runs once per host; rehearsal on development nodes |
 
 ## 12. Deferred
+
+- The update banner and button, the desktop app, and the in-product auto-update rule and "update available" notification (updates are triggered by an external API call).
+- Cloud update providers (AWS, GCP, Azure): on-prem only for now.
+- Cross-version Envoy upgrades, and any pinning of Envoy or a release manifest inside kbf releases (Envoy is a prerequisite with a tested version range).
 
 - The Ed25519 release key and a signed floor (section 2).
 - Sigstore verification beyond the attested-`main` rule (a protected `main`, required reviews).
