@@ -456,7 +456,12 @@ async fn stand_down_ends_worker_streams_and_leaves_no_worker_listener() {
 /// handover socket, or a port without a state store. Loopback v4 and v6 are accepted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_admin_port_refuses_a_non_loopback_address() {
-    for bad in ["0.0.0.0:7001", "[::]:7001", "192.0.2.7:7001", "[2001:db8::1]:7001"] {
+    for bad in [
+        "0.0.0.0:7001",
+        "[::]:7001",
+        "192.0.2.7:7001",
+        "[2001:db8::1]:7001",
+    ] {
         let refused = flags(&[
             "--storage=http://127.0.0.1:1",
             "--state-store=sqlite:///x.db",
