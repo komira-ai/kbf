@@ -10,17 +10,19 @@ fn unit(mode: Mode) -> Rendered {
 }
 
 #[test]
-fn units_accept_both_mode_spellings() {
-    // Catches: a hard-coded `kbf <mode>` shape that breaks the day `kbf` takes
-    // `--mode=<name>` (the harness must then follow the unit, with no edit but this
-    // one), or a check so loose that a unit naming another mode passes.
+fn a_unit_names_its_mode_as_its_first_word_and_no_other_spelling_passes() {
+    // Catches: a check so loose that a unit naming another mode passes, or that takes
+    // `--mode=<name>` anywhere in the line (the rehearsal asserted `exec[1] == mode`; a
+    // looser check lets a unit whose first word is something else start a farm of the wrong
+    // processes). Mutant: `names_mode` also accepts `--mode=<name>` in any position.
     assert!(names_mode(&["storage", "--cold-store=x"], Mode::Storage));
-    assert!(names_mode(
+    assert!(!names_mode(&["storage", "--cold-store=x"], Mode::Daemon));
+    assert!(!names_mode(&["--mode=storage"], Mode::Storage));
+    assert!(!names_mode(
         &["--cold-store=x", "--mode=storage"],
         Mode::Storage
     ));
-    assert!(!names_mode(&["storage", "--cold-store=x"], Mode::Daemon));
-    assert!(!names_mode(&["--mode=daemon"], Mode::Storage));
+    assert!(!names_mode(&["daemon", "--mode=storage"], Mode::Storage));
     assert!(!names_mode(&[], Mode::Storage));
 }
 

@@ -69,14 +69,13 @@ pub fn rendered(config: &LinuxConfig, uid: u32, mode: Mode) -> Rendered {
     }
 }
 
-/// Whether `argv` (a unit's `ExecStart=` without the binary) names `mode`: as the first
-/// word (`kbf storage ...`, the form that runs today) or as `--mode=<name>`. This is the
-/// one place the spelling is known, so the harness follows the command line when `kbf`
-/// takes its mode as a flag.
+/// Whether `argv` (a unit's `ExecStart=` without the binary) names `mode` as its first word,
+/// `kbf storage ...`, the form every unit has today. A `--mode=<name>` anywhere else is not
+/// accepted: the day `kbf` takes its mode as a flag, the units change, and this check fails
+/// the farm loudly at that line, where the one edit is.
 #[must_use]
 pub fn names_mode(argv: &[&str], mode: Mode) -> bool {
-    let flag = format!("--mode={}", mode.name());
-    argv.first().is_some_and(|first| *first == mode.name()) || argv.iter().any(|a| *a == flag)
+    argv.first().is_some_and(|first| *first == mode.name())
 }
 
 /// The flag's name in `--name=value`.
