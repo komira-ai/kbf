@@ -417,6 +417,13 @@ impl Farm {
         self.cache.metrics().execute.open_executions.get()
     }
 
+    /// Execute and WaitExecution calls this process forwards to its successor, open now
+    /// (`kbf_handover_relays_open`): each keeps a handed-over frontend alive.
+    #[must_use]
+    pub fn relays_open(&self) -> u64 {
+        self.cache.metrics().handover_relays_open.get()
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         // Nothing under the lock panics midway through a change.
         self.state.lock().unwrap_or_else(PoisonError::into_inner)

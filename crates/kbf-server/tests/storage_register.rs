@@ -1730,6 +1730,103 @@ async fn a_failed_heartbeat_is_retried_without_registering_again() {
     );
 }
 
+/// Catches a deny list that stops short of the storage nodes: the operator's entry must
+/// end up refusing the caller at a real storage node, through the whole path (the entry in
+/// the state store, the frontend's refresh, the new generation, the node's heartbeat, the
+/// node's service). A storage node over mutual TLS registers with a frontend. Two frontend
+/// certificates call it, both admitted. The operator denies one by the hash of its public
+/// key and refreshes the map; once the node's heartbeat brings it the new generation that
+/// certificate is refused PERMISSION_DENIED (`denied: spki-sha256 ...`) on the same call,
+/// the other is still admitted; allowing the entry and refreshing admits it again.
+///
+/// Mutants seen red: `plan` building the map without the deny list; the storage handlers
+/// judging the role alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_denied_certificate_is_refused_by_a_real_storage_node_when_the_generation_turns() {
+    use sha2::{Digest as _, Sha256};
+    let pki = Pki::new();
+    let (frontend_cert, frontend_key) = pki.cert("frontend");
+    let worker_tls = WorkerTls {
+        server: TlsSource::fixed(
+            "worker",
+            frontend_cert.as_bytes(),
+            frontend_key.as_bytes(),
+            Some(pki.ca.pem().as_bytes()),
+        )
+        .expect("the worker listener's TLS"),
+        deny_list: None,
+    };
+    let f = frontend(Some(worker_tls));
+    let d = dir("denied-caller");
+    let write = |name: &str, text: String| {
+        let path = d.join(name);
+        std::fs::write(&path, text).expect("write");
+        path.display().to_string()
+    };
+    let (cert, key) = pki.cert("storage");
+    let more = [
+        format!("--frontend=https://localhost:{}", f.worker.port()),
+        format!("--storage-tls-cert={}", write("node.pem", cert)),
+        format!("--storage-tls-key={}", write("node.key", key)),
+        format!("--storage-client-ca={}", write("ca.pem", pki.ca.pem())),
+    ];
+    let node = start_storage(&flags(&d, &more).expect("flags"), never)
+        .await
+        .expect("starts");
+    let (maps, here) = (node.maps(), node.addr);
+    let _serving = tokio::spawn(node.serve());
+    until("the node to hold a map", || {
+        (maps.generation() > 0).then_some(())
+    })
+    .await;
+
+    let channel_of = |(cert, key): (String, String)| {
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(pki.ca.pem()))
+            .identity(Identity::from_pem(cert, key));
+        Endpoint::from_shared(format!("https://localhost:{}", here.port()))
+            .expect("endpoint")
+            .tls_config(tls)
+            .expect("TLS")
+            .connect_lazy()
+    };
+    let listed = pki.cert("frontend");
+    let spki = Sha256::digest(rcgen::PublicKeyData::subject_public_key_info(
+        &KeyPair::from_pem(&listed.1).expect("its key"),
+    ))
+    .iter()
+    .map(|b| format!("{b:02x}"))
+    .collect::<String>();
+    let (listed, other) = (channel_of(listed), channel_of(pki.cert("frontend")));
+    let digest = kbf_segments::sha256(b"asked of a node that has nothing");
+    let ask = |channel: &tonic::transport::Channel| {
+        let remote = RemoteStorage::new(channel.clone(), maps.generation());
+        async move { remote.find_missing(&[digest]).await }
+    };
+    ask(&listed).await.expect("admitted before the entry");
+    ask(&other).await.expect("admitted");
+
+    let entry = kbf_map::DenyEntry::SpkiSha256(spki);
+    f.members.deny(&entry, "the test").expect("deny");
+    f.members.refresh().expect("refresh");
+    let refused = until_async("the node to refuse the listed certificate", || async {
+        match ask(&listed).await {
+            Err(kbf_storage::StorageError::Invalid(why)) => Some(why),
+            _ => None,
+        }
+    })
+    .await;
+    assert_eq!(refused, format!("denied: {entry}"));
+    ask(&other).await.expect("another certificate is admitted");
+
+    assert!(f.members.allow(&entry).expect("allow"));
+    f.members.refresh().expect("refresh");
+    until_async("the node to admit the certificate again", || async {
+        ask(&listed).await.ok()
+    })
+    .await;
+}
+
 /// Starts `kbf storage` (`half` false) or the storage half of `kbf storage-and-daemon`
 /// (`half` true) over `dir` with `--frontend` at `f`, writes `text` through its listener
 /// and stops it. A previous start's background tasks may still hold the directory's locks

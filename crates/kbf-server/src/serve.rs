@@ -37,6 +37,7 @@ use crate::health::Readiness;
 use crate::http_blobs::BlobReaders;
 use crate::http_invocations::InvocationReaders;
 use crate::identity::{DenyList, Peers};
+use crate::listen::Binder;
 use crate::members::{Members, MembershipError};
 use crate::members_rpc::MembershipService;
 use crate::state_store::StateStore;
@@ -180,6 +181,9 @@ pub enum ServeError {
     /// The storage map could not be read from the state store.
     #[error("storage map: {0}")]
     Map(#[from] MembershipError),
+    /// A frontend that was handing its work to a successor could not stand down.
+    #[error("handover: {0}")]
+    Handover(String),
 }
 
 /// A server that is listening: the addresses it bound, and the future that serves
@@ -220,8 +224,11 @@ impl Drop for AbortOnDrop {
 /// unacknowledged waits for the client's delayed ACK, about 40 ms on Linux, so each
 /// sequential small call pays that. tonic's `Server::tcp_nodelay` does not apply here:
 /// `serve_with_incoming` takes the options of the incoming stream it is given.
-pub(crate) fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeError> {
-    let bound = crate::listen::bind_std(addr).and_then(|listener| {
+pub(crate) fn bind(
+    addr: SocketAddr,
+    binder: &Binder,
+) -> Result<(TcpIncoming, SocketAddr), ServeError> {
+    let bound = binder.bind(addr).and_then(|listener| {
         listener.set_nonblocking(true)?;
         let incoming = TcpIncoming::from(tokio::net::TcpListener::from_std(listener)?);
         let local = incoming.local_addr()?;
@@ -263,8 +270,9 @@ fn set_nodelay(tcp: &mut tokio::net::TcpStream) {
 
 pub(crate) fn bind_api(
     addr: SocketAddr,
+    binder: &Binder,
 ) -> Result<(tokio::net::TcpListener, SocketAddr), ServeError> {
-    let bound = crate::listen::bind_std(addr).and_then(|listener| {
+    let bound = binder.bind(addr).and_then(|listener| {
         listener.set_nonblocking(true)?;
         let listener = tokio::net::TcpListener::from_std(listener)?;
         let local = listener.local_addr()?;
@@ -637,8 +645,10 @@ where
     let members = members_of(state.as_ref());
     let map = map_of(map, members.as_ref())?;
     let farm = Arc::new(farm.with_state(state)?);
-    let (reapi_incoming, reapi) = bind(listeners.reapi)?;
-    let (worker_incoming, worker) = bind(listeners.worker)?;
+    // One start, one bind budget: the three listeners wait for a late interface together.
+    let binder = Binder::new();
+    let (reapi_incoming, reapi) = bind(listeners.reapi, &binder)?;
+    let (worker_incoming, worker) = bind(listeners.worker, &binder)?;
     let (mut worker_server, peers, worker_tls) = worker_peers(
         keepalive(
             flow_control(Server::builder(), listeners.stream_limits.worker),
@@ -658,7 +668,9 @@ where
     let (api_listen, token, local) = api.map_or((None, None, None), |api| {
         (Some(api.listen), api.token, api.local_cache)
     });
-    let api_listener = api_listen.map(bind_api).transpose()?;
+    let api_listener = api_listen
+        .map(|listen| bind_api(listen, &binder))
+        .transpose()?;
     let api = api_listener.as_ref().map(|(_, local)| *local);
     let readiness = Arc::new(Readiness::default());
     let (closer, closing) = kbf_front::closing();
@@ -961,7 +973,7 @@ impl StorageSocket {
 /// # Errors
 /// The listener cannot be bound.
 pub fn bind_storage_socket(listen: SocketAddr) -> Result<StorageSocket, ServeError> {
-    let (incoming, addr) = bind(listen)?;
+    let (incoming, addr) = bind(listen, &Binder::new())?;
     Ok(StorageSocket { incoming, addr })
 }
 

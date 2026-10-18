@@ -199,3 +199,84 @@ async fn a_frontend_applies_its_deny_list_to_storage_certificates() {
         .await
         .expect("B is not listed");
 }
+
+/// One request to the operator API of a started frontend, with its token: the status code
+/// and the body.
+async fn operator(api: SocketAddr, method: &str, path: &str, body: &str) -> (u16, String) {
+    let token = "kbf-test-token-0123456789abcdef0123456789";
+    let mut stream = TcpStream::connect(api).await.expect("connect to the API");
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: kbf\r\nContent-Length: {}\r\n\
+         Authorization: Bearer {token}\r\nContent-Type: application/json\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.expect("send");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.expect("read");
+    let (head, body) = response.split_once("\r\n\r\n").expect("a head and a body");
+    let code = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .expect("a status code");
+    (code, body.to_owned())
+}
+
+/// Catches a frontend whose operator API and membership service do not share the deny
+/// list: the routes `POST /v1/denied` and `DELETE /v1/denied` of a started frontend must
+/// write the list its worker listener's membership service reads. Storage nodes A and B
+/// register. The operator denies the node `node-a` with the token: A's `Register` and
+/// `Heartbeat` are refused PERMISSION_DENIED saying `denied: node node-a` (the call refreshed
+/// the map before it answered, so the beat sees the entry at once), B goes on. The operator
+/// takes the entry off and A registers again.
+///
+/// Mutant seen red: the frontend's API router given no members (the routes answer 404).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontends_operator_routes_write_the_list_its_membership_service_reads() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let pki = Pki::new("membership-operator");
+    let dir = scratch_dir("membership-operator");
+    let token = dir.join("api.token");
+    std::fs::write(&token, "kbf-test-token-0123456789abcdef0123456789\n").expect("write");
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let more = [format!("--api-token-file={}", token.display())];
+    let front = Front::start(&tls_flags(&pki, &dir.join("state.db"), &more)).await;
+    let mut a = storage_node(&pki, front.worker, &["node-a"]).await;
+    let mut b = storage_node(&pki, front.worker, &["node-b"]).await;
+    let joined_a = a
+        .register(register("node-a:8982", "node-a:8982"))
+        .await
+        .expect("A registers while nothing is listed")
+        .into_inner();
+    let joined_b = b
+        .register(register("node-b:8982", "node-b:8982"))
+        .await
+        .expect("B registers while nothing is listed")
+        .into_inner();
+
+    let body = r#"{"entry":"node node-a","reason":"retired"}"#;
+    let (code, said) = operator(front.api, "POST", "/v1/denied", body).await;
+    assert_eq!(code, 200, "{said}");
+    let registered = a
+        .register(register("node-a:8982", "node-a:8982"))
+        .await
+        .expect_err("A is listed");
+    let beaten = a
+        .heartbeat(beat(&joined_a, joined_a.boot))
+        .await
+        .expect_err("A is listed");
+    for status in [registered, beaten] {
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert_eq!(status.message(), "denied: node node-a");
+    }
+    b.heartbeat(beat(&joined_b, joined_b.boot))
+        .await
+        .expect("B is not listed");
+
+    let (code, said) = operator(front.api, "DELETE", "/v1/denied?entry=node%20node-a", "").await;
+    assert_eq!(code, 200, "{said}");
+    a.register(register("node-a:8982", "node-a:8982"))
+        .await
+        .expect("A is no longer listed");
+}

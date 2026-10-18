@@ -214,6 +214,13 @@ impl Checks {
     /// The checks that fail now, in the order the route lists them; empty when the
     /// server is ready. Asks each probe once.
     pub async fn failing(&self) -> Vec<Failing> {
+        self.failing_except(&[]).await
+    }
+
+    /// [`Checks::failing`] without asking the probes named in `skip`: what a caller that
+    /// does not depend on them (a frontend's `READY=1`, which does not wait on storage)
+    /// waits for.
+    pub async fn failing_except(&self, skip: &[&str]) -> Vec<Failing> {
         let mut failing = Vec::new();
         if self.readiness.is_stopping() {
             failing.push(Failing {
@@ -231,6 +238,9 @@ impl Checks {
             return failing;
         }
         for (check, probe) in &self.probes {
+            if skip.contains(check) {
+                continue;
+            }
             if let Err(reason) = probe.probe().await {
                 failing.push(Failing { check, reason });
             }
