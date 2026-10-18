@@ -66,7 +66,15 @@ fn tls(name: &str) -> PathBuf {
             .signed_by(&key, &ca)
             .expect("sign");
         std::fs::write(dir.join(format!("{name}.pem")), cert.pem()).expect("write");
-        std::fs::write(dir.join(format!("{name}.key")), key.serialize_pem()).expect("write");
+        // Private to this user: `kbf`'s startup self-checks refuse a key the group or
+        // others can read, and the default umask leaves it 0644.
+        let key_path = dir.join(format!("{name}.key"));
+        std::fs::write(&key_path, key.serialize_pem()).expect("write");
+        std::fs::set_permissions(
+            &key_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .expect("mode");
     }
     dir
 }
@@ -242,7 +250,10 @@ fn kbf_daemon_starts_as_the_units_words_start_it() {
         .expect("spawn");
     let logged = || std::fs::read_to_string(&log).unwrap_or_default();
 
-    let session = front.session(PROMPT);
+    // A daemon that refuses to start never connects: say why, from its own log, rather
+    // than only that the fake front waited out its connect.
+    let session = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| front.session(PROMPT)))
+        .unwrap_or_else(|_| panic!("the daemon did not connect; its log:\n{}", logged()));
     let hello = session.hello();
     assert_eq!(hello.node_id, "node-1", "{}", logged());
     let drivers: Vec<&str> = hello
