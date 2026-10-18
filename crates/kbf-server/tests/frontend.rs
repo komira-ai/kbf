@@ -4,12 +4,16 @@
 //! frontend presents a certificate that names its role and verifies the node's against
 //! its CA and the host in the `--storage` URL (docs/design/architecture-v2.md, section 9),
 //! over a real node (`kbf_server::storage_node`), the proxy's raw HTTP/2 path (ByteStream)
-//! and its tonic path (FindMissing, the action cache).
+//! and its tonic path (FindMissing, the action cache), and the certificate rules of the
+//! membership service on its worker listener (`frontend/membership_tls.rs`).
 
 mod support;
 
 #[path = "frontend/handover.rs"]
 mod handover;
+
+#[path = "frontend/membership_tls.rs"]
+mod membership_tls;
 
 use std::future::pending;
 use std::net::SocketAddr;
@@ -36,7 +40,7 @@ use support::{Client, Job, PROMPT, done, ran, response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 
 /// The flags of `kbf frontend` for a start on loopback ports, and these more.
 pub fn flags(more: &[&str]) -> Result<FrontendFlags, clap::Error> {
@@ -670,6 +674,7 @@ async fn the_storage_check_asks_the_owners_once_the_frontend_routes_by_the_map()
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let routed_over = |ids: &[u64], addrs: &[SocketAddr]| {
         let members = ids.iter().map(|id| member(*id)).collect();
@@ -1164,6 +1169,105 @@ async fn the_api_listener_serves_metrics_in_the_prometheus_text_format() {
     assert!(body.contains("# TYPE "), "{body}");
 }
 
+/// Catches `--releases-dir` accepted without an operator API: the store is filled by `PUT
+/// /v1/releases/...` on that API, so a store with nowhere to be written would be a silent
+/// no-op. Both `kbf frontend` and `kbf-server` refuse the flag without `--api-listen`.
+///
+/// Mutant seen red: `requires = "api_listen"` dropped from the flag.
+#[test]
+fn releases_dir_needs_the_operator_api() {
+    let refused = frontend::command().try_get_matches_from([
+        "frontend",
+        "--storage=http://127.0.0.1:1",
+        "--releases-dir=/x",
+    ]);
+    let e = refused.expect_err("no --api-listen");
+    assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    let server =
+        kbf_server::Args::command().try_get_matches_from(["kbf-server", "--releases-dir=/x"]);
+    let e = server.expect_err("no --api-listen");
+    assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    // With the API it parses.
+    frontend::command()
+        .try_get_matches_from([
+            "frontend",
+            "--storage=http://127.0.0.1:1",
+            "--api-listen=127.0.0.1:0",
+            "--releases-dir=/x",
+        ])
+        .expect("parses");
+}
+
+/// Catches a frontend that takes `--releases-dir` and does not mount the release store: a
+/// tarball put on its operator API with the token comes back through `ReleaseService.Fetch`
+/// on its worker listener, and a put without the token is refused.
+///
+/// Mutants seen red: the router not merged in `frontend.rs`; the service not added to its
+/// worker server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_with_a_releases_dir_serves_the_release_store() {
+    use kbf_proto::update::FetchRequest;
+    use kbf_proto::update::release_service_client::ReleaseServiceClient;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = scratch_dir("frontend-releases");
+    let token = "kbf-test-token-0123456789abcdef0123456789";
+    let token_file = dir.join("token");
+    std::fs::write(&token_file, format!("{token}\n")).expect("token");
+    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let node = Node::start().await;
+    let front = Front::start(
+        &flags(&[
+            &format!("--storage=http://{}", node.addr),
+            &format!("--api-token-file={}", token_file.display()),
+            &format!("--releases-dir={}", dir.join("releases").display()),
+        ])
+        .expect("parses"),
+    )
+    .await;
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let tarball = b"a tarball".to_vec();
+    let put = |auth: bool| {
+        let (api, tarball) = (front.api, tarball.clone());
+        async move {
+            let mut stream = TcpStream::connect(api).await.expect("connect");
+            let auth = if auth {
+                format!("Authorization: Bearer {token}\r\n")
+            } else {
+                String::new()
+            };
+            let head = format!(
+                "PUT /v1/releases/{commit}/linux-x86_64/kbf HTTP/1.1\r\nHost: kbf\r\n{auth}Connection: close\r\nContent-Length: {}\r\n\r\n",
+                tarball.len()
+            );
+            stream.write_all(head.as_bytes()).await.expect("write");
+            stream.write_all(&tarball).await.expect("write");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.expect("read");
+            response[9..12].parse::<u16>().expect("a status")
+        }
+    };
+    assert_eq!(put(false).await, 401);
+    assert_eq!(put(true).await, 201);
+    let mut client = ReleaseServiceClient::connect(format!("http://{}", front.worker))
+        .await
+        .expect("connect");
+    let mut stream = client
+        .fetch(FetchRequest {
+            sha256: hex::encode(Sha256::digest(&tarball)),
+        })
+        .await
+        .expect("fetch")
+        .into_inner();
+    let mut got = Vec::new();
+    while let Some(chunk) = stream.message().await.expect("chunk") {
+        got.extend_from_slice(&chunk.data);
+    }
+    assert_eq!(got, tarball);
+    std::fs::remove_dir_all(&dir).expect("clean");
+}
+
 /// Catches a `--reapi-tls-cert` and `--reapi-tls-key` that a frontend takes and does not
 /// serve (clients would find plain text where the flags promised TLS): the REAPI listener
 /// answers a health check over TLS for the certificate's name and does not answer in
@@ -1415,6 +1519,95 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
         .expect("the frontend stops")
         .unwrap()
         .expect("served");
+}
+
+/// The text of `GET path` on `api`.
+async fn get_text(api: SocketAddr, path: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(api).await.expect("connect to the API");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.expect("send");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.expect("read");
+    let (head, body) = response.split_once("\r\n\r\n").expect("a head and a body");
+    let code = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .expect("a status code");
+    (code, body.to_owned())
+}
+
+/// Catches: a frontend that keeps storage members but does not show their health (its
+/// operator API and scrape are assembled apart from the all-in-one's). A node registers
+/// with the frontend's membership service; it is CatchingUp, so the number is `null` naming
+/// it, `kbf_storage_health_known` is 0, and `kbf_under_replicated_blobs` is absent rather
+/// than 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_with_a_state_store_shows_the_storage_health() {
+    use kbf_proto::kbf::map::v1 as pb;
+    use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
+
+    let dir = scratch_dir("storage-health");
+    let flag = format!("--state-store=sqlite://{}", dir.join("state.db").display());
+    let f = flags(&["--storage=http://127.0.0.1:1", &flag]).expect("parses");
+    let handle = start_frontend(&f, || Ok(pending::<()>())).expect("starts");
+    let (api, worker) = (handle.api.expect("the operator API"), handle.worker);
+    let served = tokio::spawn(handle.serve());
+
+    let (code, body) = get(api, "/v1/storage").await;
+    assert_eq!(code, 200);
+    assert_eq!(body["members_total"], 0, "{body}");
+    assert_eq!(body["under_replicated_blobs"], Value::Null, "{body}");
+
+    let channel = Endpoint::from_shared(format!("http://{worker}"))
+        .expect("endpoint")
+        .connect_lazy();
+    MembershipClient::new(channel)
+        .register(pb::RegisterRequest {
+            role: pb::Role::Storage.into(),
+            instance_id: "node-1".to_owned(),
+            addr: "192.0.2.1:8982".to_owned(),
+            weight: 1,
+            zone: String::new(),
+            catching_up: true,
+            protocol: kbf_server::members::PROTOCOL,
+        })
+        .await
+        .expect("registers");
+    let (code, body) = get(api, "/v1/storage").await;
+    assert_eq!(code, 200);
+    assert_eq!(body["not_active"], serde_json::json!([1]), "{body}");
+    assert_eq!(body["under_replicated_blobs"], Value::Null, "{body}");
+    assert_eq!(
+        body["reasons"],
+        serde_json::json!(["member 1 not active"]),
+        "{body}"
+    );
+
+    let (code, scrape) = get_text(api, "/metrics").await;
+    assert_eq!(code, 200);
+    assert!(
+        scrape.contains("\nkbf_storage_health_known 0\n"),
+        "{scrape}"
+    );
+    assert!(!scrape.contains("kbf_under_replicated_blobs"), "{scrape}");
+    served.abort();
+}
+
+/// Catches: storage health shown by a frontend that has no state store to keep members in
+/// (it would answer a number for a farm it cannot see): `/v1/storage` is not there, and
+/// the scrape has neither family.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_without_a_state_store_has_no_storage_health() {
+    let node = Node::start().await;
+    let front =
+        Front::start(&flags(&[&format!("--storage=http://{}", node.addr)]).expect("parses")).await;
+    let (code, _) = get_text(front.api, "/v1/storage").await;
+    assert_eq!(code, 404);
+    let (code, scrape) = get_text(front.api, "/metrics").await;
+    assert_eq!(code, 200);
+    assert!(!scrape.contains("kbf_storage_health_known"), "{scrape}");
+    assert!(!scrape.contains("kbf_under_replicated_blobs"), "{scrape}");
 }
 
 /// Catches: `--history-objects` taken by a frontend and not wired (a frontend whose

@@ -267,6 +267,20 @@ fn plain_text_off_loopback_is_a_refused_start() {
     );
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("read ") && err.contains("none.pem"), "{err}");
+    // The startup self-checks name all three files at once, not the first the TLS load
+    // meets, and the refusal is about them, not the listener's address.
+    for flag in [
+        "--storage-tls-cert",
+        "--storage-tls-key",
+        "--storage-client-ca",
+    ] {
+        assert!(
+            err.lines().any(|l| l.contains(flag)
+                && l.contains("none.pem")
+                && l.contains("does not exist")),
+            "{flag}: {err}"
+        );
+    }
+    assert_eq!(err.lines().count(), 3, "{err}");
     assert!(!err.contains("--storage-listen"), "{err}");
 }

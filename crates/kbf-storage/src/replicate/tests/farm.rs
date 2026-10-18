@@ -235,6 +235,7 @@ impl Farm {
                     .iter()
                     .find(|(n, _)| *n == i)
                     .map_or(MemberState::Active, |(_, s)| *s),
+                boot: 0,
             })
             .collect();
         Arc::new(Map::new(generation, members, Rule::Rendezvous, r, 1, Vec::new()).expect("a map"))
@@ -266,6 +267,11 @@ impl Farm {
     pub(crate) fn channel(&self, node: usize) -> Channel {
         self.pki
             .lazy_client(self.nodes[node].switch.addr, "frontend")
+    }
+
+    /// A channel to node `node` as a caller of `role`.
+    pub(crate) fn channel_role(&self, node: usize, role: &str) -> Channel {
+        self.pki.lazy_client(self.nodes[node].switch.addr, role)
     }
 
     /// A channel to node `node` as another storage node (the role that sends a copy).

@@ -16,7 +16,7 @@ use kbf_invocation::{
 };
 use kbf_objstore::MemoryStore;
 use kbf_sched::RequeueReason;
-use kbf_server::{Api, Listeners, bind_server_with_policy};
+use kbf_server::{Api, Listeners, StateStore, bind_server_with_state};
 use kbf_types::{Digest, DigestFunction, LeaseId, OperationId, WorkerId};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -55,6 +55,12 @@ fn loopback() -> SocketAddr {
 impl Server {
     /// A server running `policy`, its records within `memory` bytes.
     pub fn start(policy: Policy, memory: usize) -> Self {
+        Self::start_over(policy, memory, None)
+    }
+
+    /// [`Server::start`], keeping the scheduler's state in `state` and writing the build
+    /// history it names, if any.
+    pub fn start_over(policy: Policy, memory: usize, state: Option<StateStore>) -> Self {
         let cache = Arc::new(Cache::memory());
         let listeners = Listeners {
             reapi: loopback(),
@@ -82,10 +88,17 @@ impl Server {
             listen: loopback(),
             token: None,
             local_cache: None,
+            releases: None,
         };
-        let bound =
-            bind_server_with_policy(Arc::clone(&cache), listeners, Some(api), policy, shutdown)
-                .expect("bind");
+        let bound = bind_server_with_state(
+            Arc::clone(&cache),
+            listeners,
+            Some(api),
+            policy,
+            state,
+            shutdown,
+        )
+        .expect("bind");
         let api = bound.api.expect("an API address");
         let recorder = bound.recorder.clone();
         let serving = tokio::spawn(async move { bound.serving.await.expect("serve") });
@@ -128,8 +141,14 @@ impl Server {
 
     /// One `GET` of `path` (raw: sent as given).
     pub async fn get(&self, path: &str) -> Answer {
+        self.get_with(path, "").await
+    }
+
+    /// [`Server::get`] with `headers` added to the request: lines ending in `\r\n`.
+    pub async fn get_with(&self, path: &str, headers: &str) -> Answer {
         let mut stream = TcpStream::connect(self.api).await.expect("connect");
-        let request = format!("GET {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n");
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: kbf\r\n{headers}Connection: close\r\n\r\n");
         stream.write_all(request.as_bytes()).await.expect("send");
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await.expect("read");

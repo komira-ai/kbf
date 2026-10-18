@@ -26,16 +26,20 @@
 //!     under `--advertise-addr`, or the bound address) goes in-process to the storage
 //!     half, with no socket; any other goes over mutual TLS to its owner. **No map, no
 //!     write**: until the daemon holds a map every call fails UNAVAILABLE (there is no
-//!     `--cas` leg to fall back on), and until the storage half holds one it refuses its
-//!     own member as its listener refuses every call, `no storage map yet`. The
+//!     `--cas` leg to fall back on), and until the storage half holds one its service refuses
+//!     every call, its own member's included (UNAVAILABLE, as it refuses any caller's). The
 //!     in-process plane of the one-box mode moves output files without spooling them
 //!     (`Cas::intake`); the routed plane does not yet.
 //! - **One cache**: when the hot store is a directory on `--data-dir`'s filesystem, as
 //!   in `kbf all-in-one` (`crate::one_cache`).
 //! - **Stopping**: as `kbf all-in-one`, the storage half in the server half's place.
 //!   SIGTERM or SIGINT stops the storage half; the daemon half stops after it and the
-//!   process exits 0. A start the storage half refuses exits 2; one the daemon half
-//!   refuses exits as `kbf-daemon` would; a storage half that stops serving exits 1.
+//!   process exits 0. A start the storage half refuses exits 2; one that can pass
+//!   on a later try exits 75, `EX_TEMPFAIL` (`kbf_server::StartFailure`: a metadata
+//!   directory the stopping process still holds, or a registration whose boot the log
+//!   has set already, the frontend's state store having been restored from an older
+//!   copy); one the daemon half refuses exits as `kbf-daemon` would; a storage half that
+//!   stops serving exits 1.
 //!
 //! Linux only, the container driver only, as `kbf all-in-one`.
 
@@ -165,7 +169,7 @@ fn routes_by_map(flags: &Flags) -> bool {
 #[cfg(target_os = "linux")]
 fn local_member(flags: &Flags, half: &StorageHalf) -> LocalMember {
     let addr = flags.storage.registers_as(half.addr);
-    LocalMember::new(addr, half.in_process(), half.maps())
+    LocalMember::new(addr, half.in_process())
 }
 
 /// The daemon half's start over `half` (the module docs, **The daemon half**).

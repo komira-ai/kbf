@@ -93,7 +93,8 @@ async fn a_stream_without_hello_is_ended() {
 /// Catches (issue #25): a resent `Hello` treated as a new registration (an in-flight
 /// lease the next heartbeat has not listed yet would be requeued at once and run
 /// twice); a resent `Hello` whose new capacity placement does not see; a garbled
-/// resend that ends the session; and messages without content that do.
+/// resend that ends the session; and messages without content, or an update status (not
+/// read yet), that do.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resent_hello_changes_capacity_only() {
     let cell = Cell::start().await;
@@ -109,6 +110,9 @@ async fn a_resent_hello_changes_capacity_only() {
 
     daemon.send_empty();
     daemon.send(daemon_message::Message::Offer(Offer::default()));
+    daemon.send(daemon_message::Message::UpdateStatus(
+        kbf_proto::update::UpdateStatus::default(),
+    ));
     let mut garbled = hello("node-a", 2, 8);
     garbled.capabilities.clear();
     daemon.send(daemon_message::Message::Hello(garbled));
@@ -432,6 +436,7 @@ async fn a_map_request_is_answered_with_the_map_held() {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let held = Map::new(3, vec![member], Rule::Rendezvous, 1, 1, Vec::new()).expect("a map");
     let source = Arc::new(FakeMapSource::new(held));

@@ -22,12 +22,28 @@
 //!   answers ([`Router::read_blob`]).
 //! - **FindMissing** ([`Router::find_missing`]) asks each digest's primary only, one call
 //!   per primary, and puts the answers back in the order asked.
+//! - **The closure check** (inside [`Router::action_result`]): the node that holds an
+//!   action-cache entry reports its closure with it. The entry is served only if every
+//!   blob of the closure is held by one of the blob's owners: each primary is asked in
+//!   one FindMissing (batched at the node's limit), and what a primary lacks is asked of
+//!   the replica. A blob gone from every owner makes the entry a miss, so the action runs
+//!   again. A node that reports no closure (one from before the field) is served as
+//!   before, unchecked. What was verified is remembered per blob and owner for a time
+//!   ([`DEFAULT_CLOSURE_TTL`]), and forgotten when the map's generation changes
+//!   ([`Router::with_closure_cache`], [`Router::closure_stats`]).
 //! - **Writes** ([`Router::put`], [`Router::commit_action_record`]) go to the first
-//!   write owner that is not `Down` in the map, and to that one only: the router does not
-//!   write to the others or retry on another owner (the storage side's chain replication
-//!   is av2-11). An action-cache entry is committed where its action is, and a node
-//!   checks an entry against the blobs it holds itself: [`Router::commit_with_closure`]
-//!   first copies the entry's blobs to that node, from wherever the map has them.
+//!   write owner that is not `Down` in the map, and to that one alone while it answers
+//!   (the storage side's chain replication is av2-11). An owner that **cannot be
+//!   reached** (dead, but not yet marked `Down`: that takes the member lease) is followed
+//!   by the next write owner that is not `Down`, which is sent the write whole and from
+//!   the start; only UNAVAILABLE moves on, never an answer (`Invalid`, a refused
+//!   action-cache write, `STALE_MAP`, which has its own rule below), and the router keeps
+//!   no memory of the owner that failed. (The plain [`Router::commit_action_record`] does
+//!   not fail over: the next owner lacks the entry's blobs.) An action-cache entry is committed where its
+//!   action is, and a node checks an entry against the blobs it holds itself:
+//!   [`Router::commit_with_closure`] first copies the entry's blobs to that node, from
+//!   wherever the map has them (and does it again at the next owner if the first cannot
+//!   be reached).
 //! - **`STALE_MAP`**: a node that holds a newer map answers [`StorageError::StaleMap`].
 //!   The router fetches the newer map through the [`MapSource`] and runs the call again,
 //!   once; a second answer, or a fetch that brings no newer map, is `UNAVAILABLE`.
@@ -48,6 +64,7 @@
 //! [`Liveness`] it is given (ten seconds to dial, pings every ten seconds by default), so
 //! a read fails over to the next owner instead of waiting for the operating system.
 
+mod closure;
 mod find;
 mod flights;
 mod nodes;
@@ -59,9 +76,10 @@ mod sink;
 mod source;
 mod write;
 
+pub use closure::{ClosureStats, DEFAULT_CLOSURE_ENTRIES, DEFAULT_CLOSURE_TTL};
 pub use nodes::{Liveness, Nodes, TlsNodes};
 pub use repair::{ReadRepair, RepairLimit};
 pub use resume::MAX_RESUMES;
-pub use router::{DEFAULT_COPY_BYTES, Placement, Router};
+pub use router::{DEFAULT_COPY_BYTES, MAX_MAP_REFETCHES, Placement, Router};
 pub use sink::{BlobSink, IntoError};
 pub use source::{MapSource, MapView, RefetchError};

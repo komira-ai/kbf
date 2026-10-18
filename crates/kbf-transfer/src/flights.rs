@@ -168,3 +168,7 @@ impl Drop for Waiter<'_> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "flights_tests.rs"]
+mod tests;
