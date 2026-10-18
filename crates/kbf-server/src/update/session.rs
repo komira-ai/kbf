@@ -11,6 +11,14 @@
 //! of U3 (#914), which this branch does not have: both orders are refused, and no host that
 //! has a storage half is made eligible (below).
 //!
+//! **A handed-over farm gives no order.** Once the farm is fenced ([`Handed::handed`]: a
+//! quiesce or a stand-down) a cordon, an uncordon, an activation and a confirmation are
+//! refused here, not given: [`Farm::place`] still writes the cordon row of a fenced farm and
+//! [`Farm::send_order`] still reaches the node, and the successor is the one that orders the
+//! hosts now. The check is made just before the farm is asked, for a look that was under way
+//! when the farm was fenced; the store's generation fence remains what refuses a controller
+//! whose handle was superseded.
+//!
 //! **A confirmation has an id of its own.** The node and its helper take an id once and drop
 //! the same id again as a replay, so a `CONFIRM` under the activation's id would never be
 //! acted on. The transport draws one from the store's counter ([`Rows::mint_order`]) the
@@ -37,6 +45,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use kbf_front::Handed;
 use kbf_map::MemberId;
 use kbf_proto::update::UpdateOrder;
 use kbf_proto::update::update_order::Verb;
@@ -177,23 +186,35 @@ impl SessionTransport {
             commit: release.as_str().to_owned(),
             window_s,
         };
+        self.not_handed()?;
         self.farm.send_order(host, order).map_err(failed)
+    }
+
+    /// Places `host` as the scheduler does for an operator, unless the farm is handed over.
+    fn place(&self, host: &WorkerId, action: NodeAction) -> Result<(), TransportError> {
+        self.not_handed()?;
+        self.farm.place(host, action).map(drop).map_err(failed)
+    }
+
+    /// Refuses an order once the farm is handed over: the successor orders the hosts.
+    fn not_handed(&self) -> Result<(), TransportError> {
+        if self.farm.handed() {
+            Err(failed(
+                "this farm is handed over; its successor orders the hosts",
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
 impl Transport for SessionTransport {
     fn cordon(&mut self, host: &WorkerId) -> Result<(), TransportError> {
-        self.farm
-            .place(host, NodeAction::Cordon)
-            .map(drop)
-            .map_err(failed)
+        self.place(host, NodeAction::Cordon)
     }
 
     fn uncordon(&mut self, host: &WorkerId) -> Result<(), TransportError> {
-        self.farm
-            .place(host, NodeAction::Uncordon)
-            .map(drop)
-            .map_err(failed)
+        self.place(host, NodeAction::Uncordon)
     }
 
     fn mark_down(&mut self, host: &WorkerId, _member: MemberId) -> Result<(), TransportError> {
