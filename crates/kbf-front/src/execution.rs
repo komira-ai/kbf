@@ -36,7 +36,7 @@
 //! open until its action is done. Buck2 does not recover a stream that breaks after
 //! it started: it never calls WaitExecution and never sends the Execute again, so an
 //! action whose stream is cut fails as `remote_call_error`. Ending a stream UNAVAILABLE
-//! is therefore a last resort, not a retry (komira-build-farm#791).
+//! is therefore a last resort, not a retry (kbf#791).
 //!
 //! **Progress** ([`progress`]): every open stream is sent its operation again, same
 //! name, `done` false, its current stage, once per progress interval, so a load

@@ -304,7 +304,7 @@ fn recorded_file() -> String {
 }
 
 /// The measured file CI writes for the same tree: kbf-sim-cell's branches 15 -> 12
-/// (komira-build-farm pull request 730), kbf-front's lines 47 -> 45 and the new crate
+/// (kbf pull request 730), kbf-front's lines 47 -> 45 and the new crate
 /// kbf-storage at `0 -` (pull request 757), and kbf-gone absent.
 const MEASURED: &str = "# measured\n\
                         kbf-front        45      8\n\
@@ -795,7 +795,7 @@ fn a_failure_tighten_fixes_prints_the_command_with_the_run_id() {
         "--run-id",
         "38801912372",
         "--repo",
-        "komira-ai/komira-build-farm",
+        "komira-ai/kbf",
         "--summary-file",
         summary.to_str().expect("UTF-8"),
     ];
@@ -803,7 +803,7 @@ fn a_failure_tighten_fixes_prints_the_command_with_the_run_id() {
     let o = ci_check(&root, "a 2 0\nb - -\nempty - -\n", &flags);
     assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
     let out = stdout(&o);
-    let command = "d=$(mktemp -d) && gh run download 38801912372 --repo komira-ai/komira-build-farm \
+    let command = "d=$(mktemp -d) && gh run download 38801912372 --repo komira-ai/kbf \
                    --name coverage --dir \"$d\" && cargo run -p kbf-coverage -- tighten \
                    --measured \"$d\"/coverage-baseline.measured";
     assert!(

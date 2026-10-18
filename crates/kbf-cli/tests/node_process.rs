@@ -125,11 +125,7 @@ async fn a_refused_token_exits_2_with_the_reason_on_stderr() {
 /// `Restart=on-failure` tries again), not 2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_frontend_that_is_down_exits_1() {
-    let closed = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port();
+    let closed = kbf_testkit::port::dead_addr().port();
     for word in ["enroll", "node"] {
         let root = scratch(&format!("process-down-{word}"));
         let path = config(&root, closed);

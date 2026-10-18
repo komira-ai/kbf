@@ -6,20 +6,32 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use kbf_installer::layout::Layout;
+use kbf_installer::layout::{Layout, Platform};
 use kbf_installer::state::{Locked, PendingConfirm, State};
 use kbf_installer::testkit::{A, B, c};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-installer");
 
 fn root(name: &str) -> PathBuf {
-    let (_, dir) = kbf_installer::testkit::host_root(&format!("helper-bin-{name}"));
+    // The platform the binary was built for, as the binary lays the host out.
+    let (_, dir) =
+        kbf_installer::testkit::host_root_on(&format!("helper-bin-{name}"), Platform::current());
     fs::create_dir_all(dir.join("var/lib/kbf-installer/orders")).expect("order spool");
     dir
 }
 
 fn layout(root: &Path) -> Layout {
-    Layout::linux(kbf_host::Root::new(root).expect("absolute"))
+    Layout::new(
+        kbf_host::Root::new(root).expect("absolute"),
+        Platform::current(),
+    )
+}
+
+/// A file in the state directory of this platform (`var/lib/kbf-installer` on Linux,
+/// `var/db/kbf-installer` on macOS), under `root`.
+fn in_state_dir(root: &Path, name: &str) -> PathBuf {
+    let layout = layout(root);
+    layout.join(&layout.state_dir()).join(name)
 }
 
 fn helper(root: &Path, args: &[&str]) -> Output {
@@ -191,7 +203,7 @@ fn the_boot_check_counts_the_starts_and_reverts_the_last() {
     assert_eq!(left(&root).current, Some(c(A)));
 
     // A damaged state.json is read from the backup: the pass goes on (it is not exit 5).
-    fs::write(root.join("var/lib/kbf-installer/state.json"), b"not json").expect("ruin");
+    fs::write(in_state_dir(&root, "state.json"), b"not json").expect("ruin");
     let out = helper(&root, &["boot-check"]);
     assert_ne!(
         out.status.code(),
@@ -283,12 +295,12 @@ fn passes_end_the_run_and_an_unreadable_memory_stops_it() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    fs::write(root.join("var/lib/kbf-installer/helper.json"), b"not json").expect("ruin");
+    fs::write(in_state_dir(&root, "helper.json"), b"not json").expect("ruin");
     let out = helper(&root, &two);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("helper.json"));
     // A directory the helper cannot write status.json into ends the pass with an error.
-    fs::remove_file(root.join("var/lib/kbf-installer/helper.json")).expect("remove");
+    fs::remove_file(in_state_dir(&root, "helper.json")).expect("remove");
     let mut elsewhere = two.to_vec();
     elsewhere.extend(["--update-dir", "/no/such/dir"]);
     let out = helper(&root, &elsewhere);

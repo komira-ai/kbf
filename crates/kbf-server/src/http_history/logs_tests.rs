@@ -12,7 +12,7 @@ use axum::response::Response;
 use kbf_history::records::{FlogStream, ObjRow};
 use kbf_history::{
     FlogParts, FlogStore, HistoryIndex, HistoryRoot, IndexRoot, Inline, Reader, RunId, StreamId,
-    WriterId,
+    Today, WriterId,
 };
 use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
@@ -117,7 +117,11 @@ async fn reads(stdout: &[u8]) -> (HistoryReads, Arc<Flaky>) {
         .expect("a write")
         .expect("no conflict");
     let reader = Reader::new(shared, root(), index);
-    let reads = HistoryReads::new(reader, Arc::new(RunIndex::default()));
+    let reads = HistoryReads::new(
+        reader,
+        Arc::new(RunIndex::default()),
+        Arc::new(Today::new(0)),
+    );
     (reads, objects)
 }
 

@@ -721,7 +721,8 @@ fn sum() -> Sha256 {
     Sha256::of(b"the package")
 }
 
-const URL: &str = "https://github.com/komira-ai/komira-build-farm/releases/download/v1.2.3/kbf-installer-1.2.3-macos-arm64.pkg";
+const URL: &str =
+    "https://github.com/komira-ai/kbf/releases/download/v1.2.3/kbf-installer-1.2.3-macos-arm64.pkg";
 
 #[test]
 fn the_cask_installs_the_package_and_its_uninstall_unloads_the_job_and_forgets_the_files() {

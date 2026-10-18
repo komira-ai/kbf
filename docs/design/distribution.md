@@ -228,10 +228,10 @@ shrinking per macos-end-state.md), and `kbf-mdm-gate` (keeps a credential away f
 fake systemctl, `kbf-keeper-swap`) are never shipped.
 
 Deleted when their replacement works on the test farm, not before (`kbf-deploy` is frozen, #1017, and gets no
-new work; the farm installs through it today):
+new work; the farm installs through it today). The `kbf-updater` crate and the `kbf-all-in-one` binary are
+already deleted; the all-in-one tests run `kbf all-in-one`.
 
-- the `kbf-all-in-one` binary (its tests move to `kbf --mode=all-in-one` first), the `kbf-updater` binary (by landing
-  pull-updates), `kbf-helper` (folded into `kbf-installer`), and later the `kbf-server` and `kbf-daemon`
+- `kbf-helper` (folded into `kbf-installer`), and later the `kbf-server` and `kbf-daemon`
   binaries (after the farm and the Macs run `kbf --mode=<mode>`); the old subcommand forms, which are aliases until then;
 - `kbf frontend handover` and its unit rule, once the installer performs the baton in the frontend update;
   `kbf check-args`, once `--check` exists on every mode;
