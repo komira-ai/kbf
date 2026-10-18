@@ -556,13 +556,23 @@ async fn a_stop_without_a_handover_drains_as_before() {
     drop(_stop);
     until("the drain begins", async || drain.is_draining()).await;
     assert!(drain.is_unready());
+    // The call is not taken: no operation comes back. How it fails is the transport's to
+    // choose, not the service's. UNAVAILABLE when the service refuses it; but the connection
+    // is idle, so the listener's GOAWAY and close can reach the client before or with the
+    // request: CANCELLED ("connection closed"), or INTERNAL (an h2 GOAWAY, NO_ERROR); and
+    // a channel that reconnects to the closed listener's port can find another process's
+    // HTTP server on it (the stream then ends UNIMPLEMENTED, from a 404). None of these cuts
+    // an open call: there is none. What stays fixed is that no Operation is delivered.
     let refused = client.execute_with(&job.action, false).await;
-    assert!(
-        refused
-            .as_ref()
-            .is_err_and(|e| e.code() == Code::Unavailable),
-        "{refused:?}"
-    );
+    if let Ok(mut operations) = refused {
+        let first = tokio::time::timeout(Duration::from_secs(20), operations.message())
+            .await
+            .expect("the call is answered");
+        assert!(
+            !matches!(first, Ok(Some(_))),
+            "a stopping frontend took an Execute: {first:?}"
+        );
+    }
     drop(client);
     tokio::time::timeout(Duration::from_secs(20), served)
         .await
