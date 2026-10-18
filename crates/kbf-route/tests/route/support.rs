@@ -17,7 +17,7 @@ use kbf_proto::worker::{
     PutRangeRequest, PutRangeResponse, ReadRangeRequest, ReadRangeResponse,
 };
 use kbf_route::{MapSource, MapView, Nodes, ReadRepair, RefetchError, Router};
-use kbf_storage::{Answer, PutStream, ReadStream, Storage, StorageError};
+use kbf_storage::{ActionEntry, Answer, PutStream, ReadStream, Storage, StorageError};
 use kbf_types::Digest;
 use tonic::{Request, Response, Status};
 
@@ -67,6 +67,21 @@ pub fn blobs_with_primary(map: &Map, primary: u64, count: usize) -> Vec<(Vec<u8>
             (bytes, digest)
         })
         .filter(|(_, digest)| map.write_owners(digest).first() == Some(&MemberId(primary)))
+        .take(count)
+        .collect();
+    assert_eq!(blobs.len(), count, "blobs that fit");
+    blobs
+}
+
+/// `count` different blobs that `map` writes to the members `order`, primary first.
+pub fn blobs_written_to(map: &Map, order: &[u64], count: usize) -> Vec<(Vec<u8>, Digest)> {
+    let blobs: Vec<_> = (0_u64..100_000)
+        .map(|i| format!("blob number {i}").into_bytes())
+        .map(|bytes| {
+            let digest = sha(&bytes);
+            (bytes, digest)
+        })
+        .filter(|(_, digest)| ids_of(&map.write_owners(digest)) == order)
         .take(count)
         .collect();
     assert_eq!(blobs.len(), count, "blobs that fit");
@@ -124,6 +139,9 @@ pub struct Node {
     /// how many have been produced.
     huge: Mutex<BTreeMap<Digest, (usize, Arc<AtomicUsize>)>>,
     actions: Mutex<BTreeMap<Digest, (Digest, ActionResult)>>,
+    /// The closure a node that reports one answers for an action; an action without one is
+    /// held as a node from before the closure field holds it.
+    closures: Mutex<BTreeMap<Digest, Vec<Digest>>>,
     /// The next calls other than reads fail with these.
     fail: Mutex<VecDeque<StorageError>>,
     /// The next puts fail with these, after the node's other checks pass.
@@ -160,6 +178,7 @@ impl Node {
             blobs: Mutex::default(),
             huge: Mutex::default(),
             actions: Mutex::default(),
+            closures: Mutex::default(),
             fail: Mutex::default(),
             fail_puts: Mutex::default(),
             fail_commits: Mutex::default(),
@@ -227,6 +246,26 @@ impl Node {
             .lock()
             .expect("lock")
             .insert(action, (result_blob, ActionResult::default()));
+    }
+
+    /// Holds an entry for `action` that names `closure`, as a node that reports the
+    /// closure answers it ([`Node::hold_action`] holds one that does not).
+    pub fn hold_action_with_closure(
+        &self,
+        action: Digest,
+        result_blob: Digest,
+        closure: &[Digest],
+    ) {
+        self.hold_action(action, result_blob);
+        self.closures
+            .lock()
+            .expect("lock")
+            .insert(action, closure.to_vec());
+    }
+
+    /// Forgets the blob under `digest`, as a node that lost it.
+    pub fn forget(&self, digest: &Digest) {
+        self.blobs.lock().expect("lock").remove(digest);
     }
 
     /// The next call that is not a read fails with `error`.
@@ -449,6 +488,17 @@ impl Storage for Node {
             self.action_gets.fetch_add(1, Ordering::SeqCst);
             self.check()?;
             Ok(self.actions.lock().expect("lock").get(action).cloned())
+        })
+    }
+
+    fn action_entry<'a>(&'a self, action: &'a Digest) -> Answer<'a, Option<ActionEntry>> {
+        Box::pin(async move {
+            let found = self.action_result(action).await?;
+            Ok(found.map(|(result_digest, result)| ActionEntry {
+                result_digest,
+                result,
+                closure: self.closures.lock().expect("lock").get(action).cloned(),
+            }))
         })
     }
 
