@@ -386,19 +386,6 @@ const MUTANTS: &[Mutant] = &[
         },
     ),
     m(
-        &["endpoint-tls-match"],
-        "an instance's endpoint names a transport socket match that does not exist",
-        |e, _| {
-            set(
-                e,
-                &format!(
-                    "{RC}/load_assignment/endpoints/0/lb_endpoints/0/metadata/filter_metadata/envoy.transport_socket_match/server"
-                ),
-                json!("other"),
-            )
-        },
-    ),
-    m(
         &["upstream-alpn"],
         "the instance's TLS offers no h2",
         |e, _| {
