@@ -1,0 +1,38 @@
+# Envoy in front of the frontend instances (one host's box topology): the pinned Envoy of
+# the release, with the static configuration kbf-installer rendered. The instance is the
+# Envoy's directory under /var/lib/kbf-installer/envoy/ (<version>-<sha256[:16]>), so an
+# Envoy swap starts kbf-envoy@<new> beside the old one and retires the old after its drain.
+# Static unit, installed disabled under /usr/lib/systemd/system/.
+#
+# The configuration is /etc/kbf/envoy/envoy.json (both frontend instances listed for ever:
+# a frontend update changes no Envoy file). The hot restart (the swap) is kbf-installer's;
+# `systemctl restart` must never be it: that closes every stream the old Envoy holds. So the
+# unit offers no ExecReload=.
+[Unit]
+Description=kbf build farm Envoy %i, in front of the frontend
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/kbf/kbf.toml
+ConditionPathExists=/etc/kbf/envoy/envoy.json
+
+[Service]
+User=kbf
+Slice=kbf.slice
+OOMScoreAdjust=-925
+# systemd starts a unit at a soft open-file limit of 1024; every open build is a stream.
+LimitNOFILE=1048576
+CPUWeight=300
+# Re-verifies the binary against the pin in state.json at every start, as root: Envoy is
+# never trusted for having been verified once.
+ExecStartPre=+/usr/bin/kbf-installer envoy verify
+# The hot-restart flags are the box render's (envoy.args): gradual drain, and no parent
+# expected at the first start. --parent-shutdown-time-s is the longest action plus a quarter
+# hour and so per host: kbf-installer sets it for the swap it runs.
+ExecStart=/var/lib/kbf-installer/envoy/%i/envoy -c /etc/kbf/envoy/envoy.json --drain-time-s 60 --drain-strategy gradual --skip-hot-restart-on-no-parent
+Restart=on-failure
+RestartSec=5
+# Exit 2 is a command line or configuration Envoy refused: a restart cannot fix it.
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

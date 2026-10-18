@@ -1,0 +1,35 @@
+# kbf-installer, the one root tool that sets a host up and updates it: `kbf-installer serve`
+# takes the frontend's update orders (the order socket) and the operator's (the control
+# socket), expires confirm windows and writes status. It never polls for releases and never
+# updates itself: only the package manager replaces /usr/bin/kbf-installer.
+# Static unit, installed disabled under /usr/lib/systemd/system/; kbf-installer setup
+# enables it.
+[Unit]
+Description=kbf-installer, the update service of the kbf build farm
+# Gated on its own configuration, which `setup` writes.
+ConditionPathExists=/etc/kbf/installer.toml
+# It must be up before the runtime units: they run a release it may have to revert.
+Before=kbf-frontend@.service kbf-storage.service kbf-daemon.service kbf-storage-and-daemon.service kbf-all-in-one.service kbf-envoy@.service
+
+[Service]
+Type=simple
+# `check` lists every problem with the installer config, the trust files and the path chain.
+ExecStartPre=/usr/bin/kbf-installer check
+ExecStart=/usr/bin/kbf-installer serve
+Restart=on-failure
+RestartSec=5
+# Exit 4 is busy (an activation is pending): not a failure, not a restart.
+SuccessExitStatus=4
+# Root, but only where it writes. /run/kbf-installer is made by tmpfiles.d, so the sockets
+# and the status file survive a restart and a package upgrade.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/kbf-installer /run/kbf-installer /var/cache/kbf-fetch
+PrivateTmp=yes
+ProtectHome=yes
+# What it uses: drop to the fetch uid (SETUID, SETGID), own and mode release files (CHOWN,
+# FOWNER, DAC_OVERRIDE), and signal the units' processes (KILL).
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_KILL
+
+[Install]
+WantedBy=multi-user.target
