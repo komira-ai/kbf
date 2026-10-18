@@ -23,6 +23,9 @@
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
+//! - `gamma {prepare,deploy,summary}` ([`gamma`]): the steps of `gamma.yml`, which packs a
+//!   commit's attested tarballs, streams them to the frontend host where `kbf-installer
+//!   deploy` rolls the farm, and tabulates the result without naming a node or a host.
 //! - `podman-tests [--sudo <path>] [--podman <path>] [--runtime-dir <path>]`
 //!   ([`podman_tests`]): the container driver's real-Podman tests on a hosted Linux
 //!   runner, each test target in its own `Delegate=yes` system unit.
@@ -44,6 +47,7 @@ pub mod build_commit;
 pub mod darwin;
 pub mod entitlements;
 pub mod fetch;
+pub mod gamma;
 pub mod package;
 pub mod podman_tests;
 pub mod release;
@@ -166,6 +170,9 @@ enum Verb {
     /// A GitHub release of a `main` commit's attested assets, never rebuilt.
     #[command(subcommand)]
     Release(ReleaseVerb),
+    /// The steps of `gamma.yml`: pack the commit, deploy it on the frontend host, tabulate.
+    #[command(subcommand)]
+    Gamma(GammaVerb),
     /// Run the container driver's real-Podman tests on a hosted Linux runner, each
     /// test target in its own Delegate=yes system unit as this user.
     PodmanTests {
@@ -294,6 +301,62 @@ enum ReleaseVerb {
         /// The `gh` program.
         #[arg(long, default_value = "gh")]
         gh: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum GammaVerb {
+    /// Mask the host and user, then pack the commit's tarballs with their attestations.
+    Prepare {
+        /// The commit to deploy (on Actions, the triggering run's `head_sha`).
+        #[arg(long)]
+        commit: String,
+        /// The frontend host, masked in the log.
+        #[arg(long)]
+        host: String,
+        /// The deploy user, masked in the log.
+        #[arg(long)]
+        user: String,
+        /// The repository, `<owner>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// The directory of the artifacts workflow's assets.
+        #[arg(long)]
+        dist: PathBuf,
+        /// A directory for scratch (on Actions, `RUNNER_TEMP`).
+        #[arg(long)]
+        work: PathBuf,
+        /// The tar to write.
+        #[arg(long)]
+        out: PathBuf,
+        /// The `gh` program.
+        #[arg(long, default_value = "gh")]
+        gh: PathBuf,
+    },
+    /// Run `kbf-installer deploy` on the frontend host over Tailscale SSH.
+    Deploy {
+        #[arg(long)]
+        commit: String,
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        user: String,
+        /// The tar `prepare` wrote.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Where the deploy's one-line summary goes.
+        #[arg(long)]
+        summary: PathBuf,
+        /// The `tailscale` program.
+        #[arg(long, default_value = "tailscale")]
+        tailscale: PathBuf,
+    },
+    /// Append a table of the deploy's summary to a file (`GITHUB_STEP_SUMMARY`).
+    Summary {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -449,6 +512,33 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::VerifyAssets(VerifyAssets::Sums { dir }) => {
             Ok(vec![sums::verify_sums(&dir, fetch::Sha256::of)?])
         }
+        Verb::Gamma(GammaVerb::Prepare {
+            commit,
+            host,
+            user,
+            repo,
+            dist,
+            work,
+            out,
+            gh,
+        }) => gamma::prepare(
+            &gamma::gh_download(&gh, &repo),
+            &commit,
+            &host,
+            &user,
+            &dist,
+            &work,
+            &out,
+        ),
+        Verb::Gamma(GammaVerb::Deploy {
+            commit,
+            host,
+            user,
+            bundle,
+            summary,
+            tailscale,
+        }) => gamma::deploy(&tailscale, &commit, &host, &user, &bundle, &summary),
+        Verb::Gamma(GammaVerb::Summary { file, output }) => gamma::summary(&file, &output),
         Verb::Release(ReleaseVerb::Locate {
             repo,
             commit,

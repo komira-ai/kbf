@@ -11,8 +11,10 @@ one plain daemon, a pinned Envoy in front), runs real Buck2 builds, then updates
 kills a node while a build is running. The assertions are numbers, not logs: zero failed actions, zero lost blobs, and
 under-replicated blobs back to zero.
 
-A commit that passes beta may be offered to the operator's own farm: **gamma**. The farm's pull updater applies it. The
-deploy is itself a test (no build failed because a connection was dropped), and then a 24 hour **bake** runs with the
+A commit that passes beta may be offered to the operator's own farm: **gamma**. For the operator's own farm the trigger is
+external: `gamma.yml` runs after `artifacts` succeeds for a push, streams the commit's attested files to the frontend host
+over Tailscale SSH and runs `kbf-installer deploy` there (section 5.4), which sets the desired release; the nodes then
+roll through the drain system. The deploy is itself a test (no build failed because a connection was dropped), and then a 24 hour **bake** runs with the
 operator's real usage as the canary. The bake ends in a verdict document.
 
 A commit with a passing bake can be published: **prod** is the existing attested-artifact release (tag, files, notes), gated
@@ -34,8 +36,10 @@ Four rules hold in every stage, and each is a rule that exists in the project al
 everywhere** (a new instance on other ports behind Envoy, the old one drains, in-flight `Execute` streams are kept; the
 Buck2 client never re-sends a broken `Execute`; the serving frontend is never restarted), **nodes are updated in any order
 when idle or drained, within N and N-1**, and on an upgrade the frontend goes first, only through Envoy, never waiting for
-`open_executions == 0` (the order of `split-mode-updates.md`); **the farm pulls**: no stage pushes to a host and no stage
-holds a way into the operator's network; and **hosts trust the build, not the operator**: a host verifies the GitHub
+`open_executions == 0` (the order of `split-mode-updates.md`); **the farm pulls the bytes**: a node fetches its release from the frontend and
+verifies it itself. The one push is the gamma trigger (section 5.4): it carries the commit's files and the order to deploy
+to the frontend host and nothing else, through a Tailscale identity limited to that one host and command, so no other
+stage holds a way into the operator's network; and **hosts trust the build, not the operator**: a host verifies the GitHub
 artifact attestation of what it installs, and there is no operator signing for now.
 
 ## 1. Goals and non-goals
@@ -60,7 +64,7 @@ here so this page stands alone: a release is a list of stages, each with a name,
 environment and a result document; one job per stage; the same release directory is promoted to every stage and never rebuilt
 (`build.set_hash == gamma.set_hash == prod.set_hash`); a validation job holds no identity token; `prod` needs a reviewer and
 is manual. kci's stages are build, gamma and prod, and kci's gamma is a publish channel. Here, "reuse" means vocabulary and
-shape only: kbf's build stage is `artifacts.yml`, its gamma is a pull-based farm with no Actions job, and beta is added.
+shape only: kbf's build stage is `artifacts.yml`, its gamma is a farm that pulls its release, started by one Actions job (section 5.4), and beta is added.
 
 What carries over, unchanged in meaning:
 
@@ -84,8 +88,8 @@ Where kbf differs, and why:
    operator's frontend state store, and it moves. A moving pointer is the opposite of never-overwrite, so every move bumps a
    generation that only grows, and a rollback is the older commit under a higher generation. Downgrades are allowed; the
    generation is the guard (`pull-updates.md`, `split-mode-updates.md` 2.3).
-3. **Gamma and its bake run outside Actions.** A hosted runner on a public repository must not reach the operator's farm, so
-   the farm's metrics cannot be read from a workflow. kci's farm-connected jobs are not adopted. The operator side runs the
+3. **Gamma's bake runs outside Actions.** The deploy is started from Actions (section 5.4), but a hosted runner on a public
+   repository must not read the operator's farm, so the farm's metrics cannot be read from a workflow. kci's farm-connected jobs are not adopted. The operator side runs the
    evaluator and returns a verdict (section 7).
 4. **There is a time gate.** kci has no bake, soak or metric gate, and no rollback verb. All three are new here.
 5. **Code is not shared.** kci is Mojo on Buck2; kbf is Rust with `xtask`. The stage file is plain data checked by a Rust lint.
@@ -112,7 +116,7 @@ result = "beta-result.json"
 
 [[stage]]
 name = "gamma"
-runs = "operator"         # not an Actions job: offer, deploy, bake, verdict
+runs = "actions"          # gamma.yml: the deploy trigger; the bake and verdict run outside Actions
 after = ["beta"]
 result = "gamma-verdict.json"
 
@@ -367,6 +371,31 @@ floor.
 Real usage (builds nobody scripted), real devices and hosts, systemd, the real cold store, real load shape and duration.
 Beta covers the update logic; gamma covers the environment. A defect that only the operator's environment shows becomes a
 beta scenario in the same change that fixes it (section 11).
+
+### 5.4 The gamma trigger, as built
+
+`.github/workflows/gamma.yml` (a stage row `gamma` in `release/stages.yml`, `runs: actions`, event `workflow_run`):
+
+- **Trigger.** `workflow_run` of `artifacts`, `completed`, for `main` and `feature/arch-v2`. The job runs only for a run whose
+  conclusion is `success` and whose event is `push` (`artifacts.yml` attests only on a push, so a pull request or merge-queue
+  run never deploys). The workflow lint allows `workflow_run` only in this shape: it names exactly `artifacts` and
+  `completed`, lists branches, gives every job that `if:`, checks out only the default branch (no `ref`, no `repository`),
+  and passes no event field to a `run:` script.
+- **Inert until configured.** The job's `if:` also needs the repository variables `GAMMA_HOST`, `GAMMA_USER` and `TS_TAG`; with
+  any unset the run is skipped, which is green. The OAuth client id and secret (`TS_OAUTH_CLIENT_ID`, `TS_OAUTH_SECRET`) are
+  secrets of the `gamma` environment and reach one step, after `cargo xtask` is built. The file names variables only.
+- **Steps.** Download the run's `assets-*` artifacts; `cargo xtask gamma prepare` (masks the host and user in the log, checks
+  the commit is 40 hex digits, and packs the `kbf` tarballs for `linux-x86_64` and `linux-arm64` and the `kbf-daemon`
+  tarball for `darwin-arm64`, each with its attestation bundle from `gh attestation download`); the Tailscale action with an
+  ephemeral tagged OAuth client; `cargo xtask gamma deploy` (`tailscale ssh <user>@<host> sudo kbf-installer deploy --apply
+  --json --commit <sha> --bundle -`, the tar on standard input, the JSON summary to a file, the deploy's exit status as the
+  step's); `cargo xtask gamma summary` (a table by platform and state, never a node id or a host), and the summary as a
+  workflow artifact, both even when the deploy failed.
+- **What runs on the host.** `kbf-installer deploy` (`gamma-deploy.md`): it does not verify the runner, it verifies the
+  attestations itself. One deploy at a time (`concurrency: gamma`, never cancelled mid-roll).
+- **Held, for the operator.** The Tailscale OAuth client, its ACL grant and SSH rule, the sudoers line on the host, the
+  `gamma` environment, its secrets and the variables are settings, not code; they are created by a held script outside this
+  repository.
 
 ## 6. Promotion: the frontend's desired state
 

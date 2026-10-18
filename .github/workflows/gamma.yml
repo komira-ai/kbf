@@ -1,0 +1,92 @@
+# Gamma: the operator's own farm, deployed from a push that built and attested.
+#
+# After the `artifacts` workflow succeeds for a push to main or feature/arch-v2, this packs
+# the commit's tarballs and their attestation bundles and streams them over Tailscale SSH to
+# the frontend host, where `kbf-installer deploy` stages them, sets the desired release,
+# waits for every node, updates the frontend and checks the farm (docs/design/gamma-deploy.md).
+# The host verifies the attestations itself: it trusts the build, not this runner.
+#
+# Inert until configured: with any of the repository variables GAMMA_HOST, GAMMA_USER and
+# TS_TAG unset, the job's `if:` is false and the run is skipped (a green run, not a red one).
+# The OAuth client id and secret are secrets of the `gamma` environment, which the job only
+# reaches once its `if:` holds. Nothing here names a host or a user.
+#
+# `workflow_run` runs with this repository's secrets, so this file runs no code of the
+# triggering ref. It checks out the default branch (no `ref:`) to build `cargo xtask`, before
+# the one step that holds the OAuth secrets; the commit it deploys is the event's
+# `head_sha`, passed through `env:` and checked by `xtask gamma prepare` to be 40 hex
+# digits. The workflow lint (crates/kbf-it/tests/workflows) allows `workflow_run` only in
+# this shape.
+name: gamma
+
+on:
+  workflow_run:
+    workflows: [artifacts]
+    types: [completed]
+    branches: [main, feature/arch-v2]
+
+permissions: {}
+
+# One deploy at a time; a newer push queues behind a running deploy, which is never
+# cancelled mid-roll.
+concurrency:
+  group: gamma
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && vars.GAMMA_HOST != '' && vars.GAMMA_USER != '' && vars.TS_TAG != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    environment: gamma
+    permissions:
+      contents: read
+      actions: read
+      attestations: read
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha }}
+      GAMMA_HOST: ${{ vars.GAMMA_HOST }}
+      GAMMA_USER: ${{ vars.GAMMA_USER }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      # Built before the step that holds the OAuth secrets, so no build script runs beside them.
+      - run: cargo build -p xtask --locked
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: assets-*
+          path: dist
+          merge-multiple: true
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Pack the tarballs the farm runs, each with its attestation bundle
+        run: cargo xtask gamma prepare --commit "$SHA" --host "$GAMMA_HOST" --user "$GAMMA_USER" --repo "$GITHUB_REPOSITORY" --dist dist --work "$RUNNER_TEMP" --out bundle.tar
+      - uses: tailscale/github-action@a392da0a182bba0e9613b6243ebd69529b1878aa # v4.1.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: ${{ vars.TS_TAG }}
+          use-cache: true
+      - name: Deploy on the frontend host
+        run: cargo xtask gamma deploy --commit "$SHA" --host "$GAMMA_HOST" --user "$GAMMA_USER" --bundle bundle.tar --summary summary.json
+      - name: Table of the nodes (no node or host names)
+        if: ${{ always() }}
+        run: cargo xtask gamma summary --file summary.json --output "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ always() }}
+        with:
+          name: gamma-summary
+          path: summary.json
+          if-no-files-found: warn
+          retention-days: 30

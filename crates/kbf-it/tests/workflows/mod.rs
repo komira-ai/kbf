@@ -4,9 +4,15 @@
 //! request code with repository write access. The lint parses each workflow with a
 //! YAML parser (`saphyr-parser`, through [`yaml`]) and evaluates the document. It
 //! refuses a workflow if:
-//! - `on` names the `pull_request_target` or `workflow_run` trigger (both run with
-//!   the base repository's secrets and token), in any form (a string, a list or a
-//!   mapping, block or flow);
+//! - `on` names the `pull_request_target` trigger, or the `workflow_run` trigger other
+//!   than in the one shape [`WORKFLOW_RUN_IF`] describes (both run with the base
+//!   repository's secrets and token), in any form (a string, a list or a mapping, block
+//!   or flow). A `workflow_run` is allowed only if it names exactly the workflow
+//!   `artifacts` and the type `completed`, lists the `branches` it runs for, gives every
+//!   job an `if:` that begins with [`WORKFLOW_RUN_IF`] (a successful push run), checks
+//!   out only the default branch (an `actions/checkout` step with `ref:` or `repository:`
+//!   under `with:` could run code of the triggering ref with the secrets), and puts nothing of `github.event.workflow_run` in a `run:` script (it goes through
+//!   `env:`);
 //! - a job's `runs-on` is not exactly one GitHub-hosted runner label from
 //!   [`HOSTED_LABELS`], written out literally: a string, a one-entry list, or a
 //!   mapping holding only `labels:` with such a value. A runner group, an expression
@@ -74,6 +80,8 @@
 //! and action files before it merges. This lint keeps those files from asking for
 //! anything else, so that review has less to catch.
 
+#[cfg(test)]
+mod gamma_tests;
 #[cfg(test)]
 mod stages;
 mod yaml;
@@ -154,7 +162,15 @@ const RELEASE_TAG_PUSH_ONLY: &str =
 
 /// Triggers that run with the base repository's secrets and token on behalf of code
 /// or events from outside it.
-const REFUSED_TRIGGERS: &[&str] = &["pull_request_target", "workflow_run"];
+const REFUSED_TRIGGERS: &[&str] = &["pull_request_target"];
+
+/// The only workflow a `workflow_run` trigger may name.
+const WORKFLOW_RUN_SOURCE: &str = "artifacts";
+
+/// What the `if:` of every job of a `workflow_run` workflow begins with: the run it
+/// follows succeeded and was a push (a pull request or merge-queue run attests nothing
+/// and must never deploy).
+const WORKFLOW_RUN_IF: &str = "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'";
 
 /// Parses one workflow text and returns one message per problem, each prefixed with
 /// its 1-based line number (0 for a whole-file problem).
@@ -449,7 +465,15 @@ impl Lint<'_> {
                 .push("line 0: no top-level `permissions: {}`".to_owned()),
         }
         match get(top, "on") {
-            Some(on) => self.triggers(on),
+            Some(on) => {
+                self.triggers(on);
+                if trigger_names(on)
+                    .iter()
+                    .any(|n| n.as_str().is_some_and(is_workflow_run))
+                {
+                    self.workflow_run(on, get(top, "jobs"));
+                }
+            }
             None => self.out.push("line 0: no `on:` triggers".to_owned()),
         }
         match get(top, "jobs") {
@@ -514,12 +538,110 @@ impl Lint<'_> {
         }
     }
 
-    fn triggers(&mut self, on: &Node) {
-        let names: Vec<&Node> = match &on.value {
-            Value::Scalar { .. } => vec![on],
-            Value::Seq(items) => items.iter().collect(),
-            Value::Map(entries) => entries.iter().map(|(k, _)| k).collect(),
+    /// The rules for the one allowed shape of `workflow_run` (see the module comment).
+    fn workflow_run(&mut self, on: &Node, jobs: Option<&Node>) {
+        let config = match &on.value {
+            Value::Map(entries) => entries
+                .iter()
+                .find(|(k, _)| k.as_str().is_some_and(is_workflow_run))
+                .map(|(_, v)| v),
+            _ => None,
         };
+        let Some(Node {
+            value: Value::Map(config),
+            ..
+        }) = config
+        else {
+            self.refuse(
+                on,
+                "triggers on workflow_run without its `workflows`, `types` and `branches`",
+            );
+            return;
+        };
+        let list = |key: &str| -> Option<Vec<&str>> {
+            match &get(config, key)?.value {
+                Value::Seq(items) => items.iter().map(Node::as_str).collect(),
+                _ => None,
+            }
+        };
+        if list("workflows") != Some(vec![WORKFLOW_RUN_SOURCE]) {
+            self.refuse(
+                on,
+                format_args!(
+                    "triggers on workflow_run of a workflow other than `[{WORKFLOW_RUN_SOURCE}]`"
+                ),
+            );
+        }
+        if list("types") != Some(vec!["completed"]) {
+            self.refuse(
+                on,
+                "triggers on workflow_run for types other than `[completed]`",
+            );
+        }
+        if list("branches").is_none_or(|b| b.is_empty()) {
+            self.refuse(on, "triggers on workflow_run without a `branches:` list");
+        }
+        let Some(Node {
+            value: Value::Map(jobs),
+            ..
+        }) = jobs
+        else {
+            return;
+        };
+        for (_, job) in jobs {
+            let Value::Map(job_map) = &job.value else {
+                continue;
+            };
+            let condition = get(job_map, "if").and_then(Node::as_str);
+            if !condition.is_some_and(|c| c.starts_with(WORKFLOW_RUN_IF)) {
+                self.refuse(
+                    job,
+                    format_args!(
+                        "triggers on workflow_run, so every job's `if:` must begin with `{WORKFLOW_RUN_IF}`"
+                    ),
+                );
+            }
+            let Some(Node {
+                value: Value::Seq(steps),
+                ..
+            }) = get(job_map, "steps")
+            else {
+                continue;
+            };
+            for step in steps {
+                let Value::Map(step_map) = &step.value else {
+                    continue;
+                };
+                let uses = get(step_map, "uses").and_then(Node::as_str);
+                let picks = match get(step_map, "with").map(|w| &w.value) {
+                    Some(Value::Map(with)) => {
+                        get(with, "ref").is_some() || get(with, "repository").is_some()
+                    }
+                    _ => false,
+                };
+                if uses.is_some_and(|u| u.to_ascii_lowercase().starts_with("actions/checkout"))
+                    && picks
+                {
+                    self.refuse(
+                        step,
+                        "triggers on workflow_run, so a checkout may name no `ref` or `repository` (it checks out the default branch)",
+                    );
+                }
+                let script = get(step_map, "run").and_then(Node::as_str);
+                if script
+                    .is_some_and(|r| r.to_ascii_lowercase().contains("github.event.workflow_run"))
+                {
+                    self.refuse(
+                        step,
+                        "triggers on workflow_run, so its event fields reach a `run:` script only through `env:`",
+                    );
+                }
+            }
+        }
+    }
+
+    fn triggers(&mut self, on: &Node) {
+        let names = trigger_names(on);
         if names.is_empty() {
             self.refuse(on, "`on` names no trigger");
         }
@@ -727,6 +849,19 @@ impl Lint<'_> {
             self.refuse(uses, format_args!("`{v}` needs a version comment"));
         }
     }
+}
+
+/// The trigger names under `on` (a string, a list or a mapping's keys).
+fn trigger_names(on: &Node) -> Vec<&Node> {
+    match &on.value {
+        Value::Scalar { .. } => vec![on],
+        Value::Seq(items) => items.iter().collect(),
+        Value::Map(entries) => entries.iter().map(|(k, _)| k).collect(),
+    }
+}
+
+fn is_workflow_run(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case("workflow_run")
 }
 
 /// The value under `key` (ignoring ASCII case) in a mapping's entries.

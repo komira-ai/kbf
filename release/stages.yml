@@ -28,11 +28,15 @@ stages:
     after: [build]
     result: beta-result.json
     events: [merge_group, push]
-  # The operator's own deployment follows the beta result; it is not an Actions job.
+  # gamma.yml deploys the operator's own farm after `artifacts` succeeds for a push: its job
+  # is skipped unless the repository variables are set, and otherwise streams the commit's
+  # files to the frontend host and runs `kbf-installer deploy` there. The 24 hour bake and its verdict run outside
+  # Actions. Beta is planned and has no job yet, so gamma follows build today.
   - name: gamma
-    runs: operator
-    after: [beta]
+    runs: actions
+    after: [build]
     result: gamma-verdict.json
+    events: [workflow_run]
   # release.yml publishes a pushed v* tag, or dry-runs a commit by hand.
   - name: prod
     runs: actions
@@ -62,6 +66,8 @@ jobs:
     stage: build
   - job: artifacts.yml#verify-darwin-arm64
     stage: build
+  - job: gamma.yml#deploy
+    stage: gamma
   - job: release.yml#verify
     stage: prod
   - job: release.yml#publish
