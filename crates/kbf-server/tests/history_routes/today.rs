@@ -80,20 +80,20 @@ async fn digest_runs_after_a_restart_say_partial_and_covers_from() {
 async fn node_runs_filter_by_window_class_and_instance_and_page_newest_first() {
     let world = World::new();
     let a = world.start(PAGES_ONLY);
-    let mut events = Vec::new();
+    // One run at a time, each flushed before the next is fed: a failed run goes through
+    // the tail pool before it reaches the writer, so fed together it would arrive after the
+    // runs that follow it, and the index lists runs in arrival order.
     for n in 1..=5u8 {
         let instance = if n % 2 == 0 { "main" } else { "other" };
         let exit = i32::from(n == 3);
-        events.extend(run(
+        a.feed(run(
             &format!("n{n}"),
             instance,
             shape(0xab, "c", true, None),
             n,
             exit,
-        ));
-    }
-    a.feed(events).await;
-    for n in 1..=5 {
+        ))
+        .await;
         world.flushed(&format!("n{n}"), 1).await;
     }
     let all = a.ok("/v1/runs?node=node-a").await;
