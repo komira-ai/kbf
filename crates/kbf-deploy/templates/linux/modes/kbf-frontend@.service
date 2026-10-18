@@ -1,7 +1,7 @@
 # Rendered by `kbf-deploy linux render-units --mode frontend`; installed as the template
 # unit kbf-frontend (the file name has an at sign before the dot) in /etc/systemd/system/
 # (kbf docs/design/frontend-handover.md; architecture-v2.md, sections 1 and 11).
-# `check-units --mode frontend` parses the flags below with `kbf check-args frontend`.
+# `kbf --mode=frontend --check` parses the flags below.
 #
 # A template with two instances, a and b, that run the same command line: only one serves
 # at a time. An update starts the idle one while the other still serves (`kbf frontend

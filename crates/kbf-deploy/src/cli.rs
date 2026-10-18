@@ -6,7 +6,7 @@
 //! kbf-deploy minio nodeport --kubectl PATH --kubeconfig PATH [--context NAME]
 //!                           --namespace NS --service NAME --node-port N [--remove] [--apply]
 //! kbf-deploy linux render-units --config FILE --out DIR --mode MODE [--kbf-uid UID]
-//! kbf-deploy linux check-units --config FILE --dir DIR --mode MODE [--installable] [--kbf-bin PATH]
+//! kbf-deploy linux check-units --config FILE --dir DIR --mode MODE [--installable]
 //! kbf-deploy linux install-units --config FILE --mode MODE [--bin-dir DIR] [--apply]
 //! kbf-deploy linux swap --config FILE [--kubelet-allows-swap] [--remove] [--apply]
 //! kbf-deploy linux meta-backup --meta-dir DIR [--hot-dir DIR] --out FILE [--metrics URL]
@@ -221,10 +221,6 @@ enum Linux {
         /// The mode whose unit is checked.
         #[arg(long, value_enum)]
         mode: linux::Mode,
-        /// The kbf that parses a built mode's flags (`kbf check-args`); without it the
-        /// unit's own ExecStart= binary, and the parse is skipped when that is not there.
-        #[arg(long)]
-        kbf_bin: Option<PathBuf>,
     },
     /// Install kbf.slice and the unit of one mode of the one kbf binary, and start it
     /// (as root).
@@ -564,16 +560,13 @@ fn linux_kit<E: Exec>(
             dir,
             installable,
             mode,
-            kbf_bin,
-        } => linux::check_mode_unit(exec, &config, &dir, mode, installable, kbf_bin.as_deref())
-            .map(|report| {
-                let code = u8::from(!report.failures.is_empty());
-                let mut lines: Vec<String> =
-                    report.failures.iter().map(ToString::to_string).collect();
-                lines.extend(report.notes);
-                lines.push(report.summary);
-                (lines, code)
-            }),
+        } => linux::check_mode_unit(exec, &config, &dir, mode, installable).map(|report| {
+            let code = u8::from(!report.failures.is_empty());
+            let mut lines: Vec<String> = report.failures.iter().map(ToString::to_string).collect();
+            lines.extend(report.notes);
+            lines.push(report.summary);
+            (lines, code)
+        }),
         Linux::InstallUnits {
             config,
             bin_dir,

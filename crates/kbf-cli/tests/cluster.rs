@@ -214,7 +214,7 @@ fn a_refusal_or_no_answer_exits_1_and_says_why() {
 /// Catches a command line that is accepted and means something else: `drain` with no
 /// target or with both, a deadline for the frontend (it has none), `undrain --frontend`
 /// (a frontend drain is not undone), a write with no token file, and an unknown verb,
-/// all exit 2 with clap's message, and `check-args` does not take `cluster` as a mode.
+/// all exit 2 with clap's message.
 #[test]
 fn a_command_line_that_names_no_single_call_exits_2() {
     let rows: [&[&str]; 7] = [
@@ -239,8 +239,6 @@ fn a_command_line_that_names_no_single_call_exits_2() {
         assert_eq!(code, Some(2), "{argv:?}: {err}");
         assert!(out.is_empty(), "{argv:?}: {out}");
     }
-    let (code, _, err) = kbf(&["check-args", "cluster", "status"]);
-    assert_eq!(code, Some(2), "{err}");
 }
 
 /// Catches `cluster` missing from `kbf --help` (nothing else would tell an operator it

@@ -421,7 +421,6 @@ fn on_the_node_a_copy_of_the_key_beside_the_allowed_file_is_refused() {
         &UnitText::new(Mode::StorageAndDaemon.unit_name(), unit),
         &slice,
         true,
-        None,
     )
     .expect("runs");
     let credential: Vec<String> = r

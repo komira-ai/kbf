@@ -156,21 +156,14 @@ fn a_mode_renders_and_checks_and_an_unknown_mode_is_refused() {
         "{stdout}"
     );
     let (code, stdout, _) = check("frontend");
-    // The frontend's flags are parsed by the installed kbf, or the check says it found
-    // none (a machine without kbf, such as CI): a SKIP line, then the verdict.
     assert_eq!(code, 0, "{stdout}");
+    // Other rules may note what this machine lacks (a user, a key file); none is
+    // about parsing, which kbf-cli's tests do.
     assert!(
         stdout.ends_with("UNIT OK: kbf-frontend@.service runs kbf frontend\n"),
         "{stdout}"
     );
-    assert!(
-        stdout
-            .lines()
-            .rev()
-            .skip(1)
-            .all(|l| l.starts_with("SKIP parse: ")),
-        "{stdout}"
-    );
+    assert!(!stdout.contains("parse"), "{stdout}");
 
     let unit = out.join("kbf-frontend@.service");
     let text = std::fs::read_to_string(&unit).expect("unit");

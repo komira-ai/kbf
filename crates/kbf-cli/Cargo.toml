@@ -82,8 +82,6 @@ prost.workspace = true
 # The units `kbf-deploy linux render-units --mode` writes, parsed with kbf's own
 # parser (tests/deploy_units.rs).
 kbf-deploy.workspace = true
-# The host `check-units --mode` runs `kbf check-args` on (tests/deploy_units.rs).
-kbf-host.workspace = true
 # Certificates made as the farm's issuer makes them, checked by `kbf-deploy linux
 # verify-cert` and read back with the storage node's own role check
 # (tests/deploy_units.rs), and the node's certificates (tests/storage_and_daemon.rs).

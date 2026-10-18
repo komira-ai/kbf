@@ -368,88 +368,41 @@ fn scratch(name: &str) -> std::path::PathBuf {
     dir
 }
 
-/// Catches `kbf check-args` starting the mode it checks (the daemon's start makes its
-/// `--data-dir`; here the directory must stay absent), printing anything for a command
-/// line that parses, and exiting other than 0 for one: each built mode's own flags,
-/// with a data directory that a start would make.
+/// Catches `check-args` coming back as a word of `kbf`: it was `--check`'s parse stage for
+/// `kbf-deploy`, with a deprecation note, and is retired. Now it is refused as any word
+/// that is not a mode is (exit 2, nothing on stdout, nothing started), with or without a
+/// mode after it, and `kbf --help` and `-h` do not name it.
 #[test]
-fn check_args_parses_and_starts_nothing() {
-    let dir = scratch("check_args_starts_nothing");
+fn check_args_is_not_a_word_of_kbf() {
+    let dir = scratch("check_args_retired");
     let data = dir.join("data");
     let data_flag = format!("--data-dir={}", data.display());
-    for mode in [names::DAEMON, names::ALL_IN_ONE] {
-        let (code, out, err) = run(&[
-            kbf_cli::CHECK_ARGS,
-            mode,
+    let argvs: [&[&str]; 2] = [
+        &[
+            "check-args",
+            names::DAEMON,
             "--driver=container",
             "--server=https://127.0.0.1:1",
-            "--ca-cert=/nonexistent/ca.pem",
-            "--cert=/nonexistent/node.pem",
-            "--key=/nonexistent/node.key",
+            "--ca-cert=ca.pem",
+            "--cert=node.pem",
+            "--key=node.key",
             "--node-id=n",
             &data_flag,
-        ]);
-        assert_eq!((code, out.as_str()), (Some(0), ""), "{mode}");
-        // Only the deprecation note (tests/config_process.rs).
-        assert_eq!(err.lines().count(), 1, "{mode}: {err}");
-        assert!(err.contains("deprecated"), "{mode}: {err}");
-        assert!(!data.exists(), "{mode} started: {} made", data.display());
-    }
-}
-
-/// Catches `kbf check-args` passing what a start refuses: a flag no mode has, another
-/// mode's flag (named, as the start names it), a mode not built yet (every start of it
-/// exits 2), `--help` (which prints and starts nothing), no mode, and an unknown one.
-/// Each exits 2 with the message on stderr and nothing on stdout.
-#[test]
-fn check_args_exits_2_with_the_refusal_a_start_gets() {
-    let daemon = [
-        names::DAEMON,
-        "--driver=container",
-        "--server=https://127.0.0.1:1",
-        "--ca-cert=ca.pem",
-        "--cert=node.pem",
-        "--key=node.key",
-        "--node-id=n",
+        ],
+        &["check-args"],
     ];
-    let with = |extra: &'static str| -> Vec<&'static str> {
-        std::iter::once(kbf_cli::CHECK_ARGS)
-            .chain(daemon.iter().copied())
-            .chain([extra])
-            .collect()
-    };
-    let bogus = with("--bogus-flag");
-    let cold = with("--cold-store=file:///x");
-    let help = with("--help");
-    let rows: [(&[&str], &str); 6] = [
-        (&bogus, "unexpected argument '--bogus-flag'"),
-        (&cold, "kbf daemon refuses --cold-store: "),
-        (
-            &[kbf_cli::CHECK_ARGS, names::STORAGE_AND_DAEMON],
-            "required arguments were not provided",
-        ),
-        (&help, "--help and --version print and exit 0"),
-        (&[kbf_cli::CHECK_ARGS], "Usage: kbf"),
-        (&[kbf_cli::CHECK_ARGS, "no-such-mode"], "no-such-mode"),
-    ];
-    for (argv, want) in rows {
+    for argv in argvs {
         let (code, out, err) = run(argv);
         assert_eq!(code, Some(2), "{argv:?}: {err}");
-        assert!(err.contains(want), "{argv:?}: {err}");
         assert!(out.is_empty(), "{argv:?}: {out}");
+        assert!(!err.contains("deprecated"), "{argv:?}: {err}");
+        assert!(!data.exists(), "{argv:?} started: {} made", data.display());
     }
-}
-
-/// Catches `check-args` shown to an operator as if it were a mode or a flag: neither
-/// `kbf --help` nor `kbf -h` names it anywhere (it is for `kbf-deploy`, and its
-/// absence from the help is what keeps the five-mode list exact).
-#[test]
-fn help_does_not_name_check_args() {
     for flag in ["--help", "-h"] {
         let (code, out, err) = run(&[flag]);
         assert_eq!(code, Some(0), "{flag}: {err}");
-        assert!(!out.contains(kbf_cli::CHECK_ARGS), "{flag}: {out}");
-        assert!(!err.contains(kbf_cli::CHECK_ARGS), "{flag}: {err}");
+        assert!(!out.contains("check-args"), "{flag}: {out}");
+        assert!(!err.contains("check-args"), "{flag}: {err}");
     }
 }
 

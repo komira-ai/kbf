@@ -539,8 +539,7 @@ fn the_daemon_takes_no_store_credential_or_environment_variable() {
 /// Catches a build node that can be pointed at the cold store (docs/design/architecture-v2.md,
 /// section 9: a daemon-only node holds no cold-store credential and reaches bytes only
 /// through storage): every cold-store flag of the modes that have one, the hidden sizing
-/// flags included, is refused by `kbf daemon` with the store reason, by `kbf check-args
-/// daemon` (what `kbf-deploy linux check-units --mode` runs on a unit), and as an unknown
+/// flags included, is refused by `kbf daemon` with the store reason, and as an unknown
 /// argument by the `kbf-daemon` binary's own parser. Also catches a set of cold-store
 /// flags that is empty or misses `--cold-store`, which would pass vacuously.
 #[test]
@@ -567,11 +566,6 @@ fn a_build_node_refuses_every_cold_store_flag() {
             )),
             "{flag}: {err}"
         );
-        let mut checked = vec!["kbf", CHECK_ARGS];
-        checked.extend(&DAEMON[1..]);
-        checked.push(given.as_str());
-        let e = check(&checked).expect_err("refused");
-        assert!(e.contains(&format!("refuses --{flag}")), "{flag}: {e}");
         let mut alone: Vec<&str> = vec!["kbf-daemon"];
         alone.extend(&DAEMON[2..]);
         alone.push(given.as_str());
@@ -703,52 +697,45 @@ fn a_refusal_comes_before_a_missing_required_flag() {
 }
 
 fn check(argv: &[&str]) -> Result<(), String> {
-    let args: Vec<std::ffi::OsString> = argv.iter().map(Into::into).collect();
-    check_args(&args).map_err(|e| e.to_string())
+    parse_from(argv.iter().copied())
+        .map(drop)
+        .map_err(|e| e.to_string())
 }
 
-/// Catches `check_args` reading the wrong words (the program's name or `check-args`
-/// itself as the mode), passing `--help`, and refusing a built
-/// mode's own command line. The binary's exit codes are tests/binary.rs's.
+/// Catches the parser reading the wrong words (the program's name as the mode), and
+/// refusing a built mode's own command line. The binary's exit codes are tests/binary.rs's.
 #[test]
-fn check_args_parses_the_words_after_check_args() {
-    let mut daemon = vec!["kbf", CHECK_ARGS];
+fn the_parser_takes_a_modes_own_command_line() {
+    let mut daemon = vec!["kbf"];
     daemon.extend(&DAEMON[1..]);
     assert_eq!(check(&daemon), Ok(()));
-    let mut both = vec!["kbf", CHECK_ARGS];
+    let mut both = vec!["kbf"];
     both.extend(&BOTH[1..]);
     assert_eq!(check(&both), Ok(()));
     assert_eq!(
-        check(&[
-            "kbf",
-            CHECK_ARGS,
-            names::FRONTEND,
-            "--storage=http://127.0.0.1:1"
-        ]),
+        check(&["kbf", names::FRONTEND, "--storage=http://127.0.0.1:1"]),
         Ok(())
     );
-    let e = check(&["kbf", CHECK_ARGS, names::FRONTEND]).expect_err("refused");
+    let e = check(&["kbf", names::FRONTEND]).expect_err("refused");
     assert!(e.contains("--storage"), "{e}");
     daemon.push("--bogus-flag");
     let e = check(&daemon).expect_err("refused");
     assert!(e.contains("unexpected argument '--bogus-flag'"), "{e}");
     assert_eq!(
-        check(&[
-            "kbf",
-            CHECK_ARGS,
-            names::STORAGE,
-            "--storage-listen=127.0.0.1:1"
-        ]),
+        check(&["kbf", names::STORAGE, "--storage-listen=127.0.0.1:1"]),
         Ok(())
     );
-    let mut converged = vec!["kbf", CHECK_ARGS];
+    let mut converged = vec!["kbf"];
     converged.extend(&CONVERGED[1..]);
     assert_eq!(check(&converged), Ok(()));
-    let e = check(&["kbf", CHECK_ARGS, names::STORAGE_AND_DAEMON]).expect_err("refused");
+    let e = check(&["kbf", names::STORAGE_AND_DAEMON]).expect_err("refused");
     assert!(e.contains("required arguments were not provided"), "{e}");
-    for word in ["--help", "--version"] {
-        let e = check(&["kbf", CHECK_ARGS, word]).expect_err("refused");
-        assert!(e.contains("the mode would not start"), "{word}: {e}");
+    for (word, kind) in [
+        ("--help", ErrorKind::DisplayHelp),
+        ("--version", ErrorKind::DisplayVersion),
+    ] {
+        let e = parse_from(["kbf", word]).expect_err("prints and starts nothing");
+        assert_eq!(e.kind(), kind, "{word}");
     }
 }
 
@@ -939,41 +926,38 @@ fn the_identity_is_the_libraries_own_and_both_halves_speak_one_protocol() {
     assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap(), v);
 }
 
-/// Catches `check-args` (what `check-units` runs on a unit's `ExecStart=` and
-/// `ExecStartPre=`) refusing the flag form of a mode or the file flags, accepting a
-/// start with no mode (it reads no file, so it can check nothing), or passing `--help`.
+/// Catches the parser (a unit's `ExecStart=` and `ExecStartPre=` words) refusing the flag
+/// form of a mode or the file flags, accepting a start with no mode (it reads no file, so
+/// it can check nothing), or passing `--help`.
 #[test]
-fn check_args_takes_the_mode_flag_and_the_file_flags() {
+fn the_parser_takes_the_mode_flag_and_the_file_flags() {
     for line in [
-        &["kbf", CHECK_ARGS, "--mode=daemon", "--check"][..],
-        &["kbf", CHECK_ARGS, "--mode=storage"],
+        &["kbf", "--mode=daemon", "--check"][..],
+        &["kbf", "--mode=storage"],
         &[
             "kbf",
-            CHECK_ARGS,
             "--mode=daemon",
             "--config=/etc/kbf/kbf.toml",
             "--label=a=b",
         ],
-        &["kbf", CHECK_ARGS, "storage-and-daemon", "--check"],
+        &["kbf", "storage-and-daemon", "--check"],
     ] {
         assert_eq!(check(line), Ok(()), "{line:?}");
     }
-    let mut flags = vec!["kbf", CHECK_ARGS, "--mode=daemon"];
+    let mut flags = vec!["kbf", "--mode=daemon"];
     flags.extend(&DAEMON[2..]);
     assert_eq!(check(&flags), Ok(()));
-    let e = check(&["kbf", CHECK_ARGS, "--mode=daemon", "--bogus"]).expect_err("refused");
+    let e = check(&["kbf", "--mode=daemon", "--bogus"]).expect_err("refused");
     assert!(e.contains("unexpected argument"), "{e}");
     // A flag with a file that is not there: the file is what is refused.
-    let e = check(&["kbf", CHECK_ARGS, "--mode=daemon", "--config=/x", "--bogus"])
-        .expect_err("refused");
+    let e = check(&["kbf", "--mode=daemon", "--config=/x", "--bogus"]).expect_err("refused");
     assert!(e.contains("cannot read the config file /x"), "{e}");
-    let e = check(&["kbf", CHECK_ARGS]).expect_err("no mode checks nothing");
+    let e = check(&["kbf"]).expect_err("no mode checks nothing");
     assert!(e.contains("no mode"), "{e}");
-    let e = check(&["kbf", CHECK_ARGS, "--config=/x"]).expect_err("no mode checks nothing");
+    let e = check(&["kbf", "--config=/x"]).expect_err("no mode checks nothing");
     assert!(e.contains("no mode"), "{e}");
-    let e = check(&["kbf", CHECK_ARGS, "--mode=daemon", "--help"]).expect_err("refused");
-    assert!(e.contains("the mode would not start"), "{e}");
+    check(&["kbf", "--mode=daemon", "--help"]).expect_err("help prints and starts nothing");
     for word in ["node", "enroll"] {
-        assert!(check(&["kbf", CHECK_ARGS, word]).is_err(), "{word}");
+        assert!(check(&["kbf", word]).is_err(), "{word}");
     }
 }

@@ -37,8 +37,8 @@
 //! There is no `node` mode and no `enroll` word: the host's config states what it is.
 //!
 //! And words that are not modes: `kbf cluster status|drain|undrain` ([`cluster`]), a
-//! client of the frontend's operator API that starts nothing, and `check-args`. Like it
-//! they are outside [`names::MODES`]; `kbf --help` ends with a line naming them.
+//! client of the frontend's operator API that starts nothing. It is outside
+//! [`names::MODES`]; `kbf --help` ends with a line naming it.
 //!
 //! A mode refuses the flags that belong to another mode ([`refused_by`]): the set is
 //! derived from each mode's own flag set, nothing is listed by hand, so a flag added to
@@ -52,12 +52,6 @@
 //! commit, the build profile, the protocol versions and the state schema, so a host can
 //! check what it runs.
 //!
-//! `kbf check-args <mode>|--mode=<mode> [flags...]` ([`check_args`]) parses the command
-//! line as a start would, then exits, starting nothing: 0 when the mode would start with
-//! those flags, 2 with clap's message when it would refuse them (and for a mode not
-//! built yet, which refuses every start). `kbf-deploy linux check-units --mode` runs
-//! it on a unit's `ExecStart=`. It is not a mode, so `kbf --help` does not list it.
-//!
 //! And `kbf frontend handover` ([`handover`]): starts the idle instance of the frontend's
 //! systemd template (`kbf-frontend@a`, `kbf-frontend@b`) while the other serves, so the
 //! frontend is updated without failing a build. Like `cluster` it starts no mode: `kbf
@@ -66,15 +60,13 @@
 //! Before a mode starts, [`preflight`] checks what it needs of its host (the files its
 //! flags name, its certificate's role, the S3 key pair, the container driver's programs,
 //! ...) and refuses, with every missing piece on stderr, one line each, and exit status 2
-//! (75 for a piece that heals shortly). `check-args`, `cluster` and `frontend handover`
-//! read nothing of the host and skip it.
+//! (75 for a piece that heals shortly). `cluster` and `frontend handover` read nothing of
+//! the host and skip it.
 //!
 //! Every mode also takes `--config FILE` and `--check` ([`config`]): the settings may be in
 //! `/etc/kbf/kbf.toml` (one TOML table per setting group, one key per flag, a flag on the
 //! command line overriding its key), and `--check` parses the flags and the file, runs the
 //! startup checks and exits 0, 2 or 75 without starting ([`preflight::check_only`]).
-//! `check-args` is `--check`'s parse stage only, kept for `kbf-deploy`, with a deprecation
-//! note on its last line of standard error.
 //!
 //! The `kbf-server`, `kbf-daemon` and `kbf-all-in-one` binaries are unchanged.
 
@@ -312,7 +304,7 @@ pub fn config_template(mode: &str) -> Option<String> {
 }
 
 /// The word after `kbf` that calls the operator API ([`cluster`]) instead of starting a
-/// mode. Like [`CHECK_ARGS`] it is not in [`names::MODES`], so the mode list stays exact.
+/// mode. It is not in [`names::MODES`], so the mode list stays exact.
 pub const CLUSTER: &str = "cluster";
 
 /// The word after `kbf frontend` that starts the idle instance of the frontend's unit
@@ -818,42 +810,9 @@ pub fn run(invocation: &Invocation) -> ExitCode {
     }
 }
 
-/// The word after `kbf` that checks a command line instead of starting it
-/// ([`check_args`]).
-pub const CHECK_ARGS: &str = "check-args";
-
-/// `kbf check-args <mode>|--mode=<mode> [flags...]`: parses `kbf [flags...]` as [`main`]
-/// would, and starts nothing (the parse reads no file and opens no socket). `args` is
-/// the whole command line, its first word the program's name and its second
-/// [`CHECK_ARGS`].
-///
-/// # Errors
-/// What [`parse_from`] refuses, and `--help` or `--version`, which would print and exit 0 without
-/// starting the mode.
-pub fn check_args(args: &[std::ffi::OsString]) -> Result<(), clap::Error> {
-    // `kbf <word> [flags...]`, as the start would be given.
-    let argv = args
-        .iter()
-        .take(1)
-        .chain(args.iter().skip(2))
-        .cloned()
-        .collect::<Vec<_>>();
-    let parsed = parse_from(argv).map(|_| ());
-    match parsed {
-        Err(e) if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => {
-            Err(command().error(
-                ErrorKind::ArgumentConflict,
-                "--help and --version print and exit 0: the mode would not start",
-            ))
-        }
-        other => other,
-    }
-}
-
 /// The `kbf` binary: the daemon's helper re-execs first (a keeper or a `__chown-dirs`
 /// run of this binary never reads the command line as `kbf`'s), then [`version::line`]
-/// for `kbf --version --json`, then the command line, then [`check_args`] for `kbf
-/// check-args ...`, [`cluster::run`] for `kbf cluster ...`, [`handover::run`] for `kbf frontend handover ...` or else
+/// for `kbf --version --json`, then the command line, then [`cluster::run`] for `kbf cluster ...`, [`handover::run`] for `kbf frontend handover ...` or else
 /// [`preflight::refusal`] and [`run`]. A command
 /// line that
 /// does not parse exits 2 (0 for `--help` and `--version`).
@@ -869,21 +828,6 @@ pub fn main() -> ExitCode {
     if version::asked(&args) {
         print!("{}", version::line());
         return ExitCode::SUCCESS;
-    }
-    if args.get(1).is_some_and(|word| word == CHECK_ARGS) {
-        let code = match check_args(&args) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                let _ = e.print();
-                ExitCode::from(2)
-            }
-        };
-        // After the result: `kbf-deploy` reports the first line this prints.
-        eprintln!(
-            "kbf: `check-args` is deprecated: it only parses the flags; use `kbf <mode> ... \
-             --check`, which also reads the config file and runs the startup checks"
-        );
-        return code;
     }
     if args.get(1).is_some_and(|word| word == names::FRONTEND)
         && args.get(2).is_some_and(|word| word == HANDOVER)

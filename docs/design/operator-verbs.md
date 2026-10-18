@@ -144,7 +144,7 @@ section 8) and is not an operator verb of the farm.
 | meta-backup, meta-verify | `kbf-deploy linux` **[F]** | briefly stops `kbf-server`; installer or root only |
 | install, update, roll back, confirm, revert, gc, status and check of a host | `kbf-installer` (#1048, #1051, #1082, #1083) **[V]** | root and host-local; the installer is the root tool, and `setup` mints the first token |
 | the rollout controller | `kbf-deploy rollout`, #803, #970 **[V]** | a host state machine; installer territory |
-| start a mode, `--check`, check-args | `kbf <mode>` **[F]** | the local runtime; it installs nothing |
+| start a mode, `--check` | `kbf <mode>` **[F]** | the local runtime; it installs nothing |
 | frontend handover, enroll, `kbf node` | `kbf frontend handover`, `kbf enroll`, `kbf node` **[F]** | replaced by the installer's side-by-side children (#1054, #1062) and removed by #1049 **[V]** |
 | render, check, install units, swap, verify certificate; envoy render, check, apply | `kbf-deploy` **[F]** | become installer logic and package units; root |
 | `mdm`, `minio`, `pilot`, `erase-request` | `kbf-deploy` **[F]** | leave the product (distribution.md section 8); an erase request is signed with a security key on the operator's machine |

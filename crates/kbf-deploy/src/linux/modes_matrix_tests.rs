@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 
 use kbf_host::exec::Entry;
-use kbf_host::step::{Owner, Perms};
+use kbf_host::step::{Cmd, Owner, Perms};
 use kbf_host::testkit::{FakeExec, reply};
 
 use super::*;
@@ -301,8 +301,8 @@ fn file(bits: u32, uid: u32, text: &str) -> Entry {
     }
 }
 
-/// A node with kbf installed, and a key file `key`; kbf refuses every command line
-/// (`check-args` exits 2) and `getent passwd kbf-server` is uid 990.
+/// A node with kbf installed, and a key file `key`, and `getent passwd kbf-server` is
+/// uid 990.
 fn node(key: Entry) -> FakeExec {
     let mut exec = FakeExec::new(0);
     let at = |p: &str| HostPath::new(p).expect("absolute");
@@ -325,9 +325,8 @@ fn node(key: Entry) -> FakeExec {
     exec
 }
 
-/// The rules that read the node, per mode: `parse` runs kbf for every mode;
-/// `credential` reads the key file's owner and mode only for the units that hold it
-/// (a 0640 key or one another user owns fails storage and storage-and-daemon, and no
+/// The rules that read the node, per mode: `credential` reads the key file's owner and
+/// mode only for the units that hold it (a 0640 key or one another user owns fails storage and storage-and-daemon, and no
 /// other; a key the server user owns passes storage and fails storage-and-daemon, whose
 /// key is root's alone).
 /// Catches each of these run on the wrong modes or on none.
@@ -338,8 +337,7 @@ fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
         SLICE,
         shared::render_slice(&c, Some(1500)).expect("renders"),
     );
-    let cases: [(&str, Entry, &[Mode]); 4] = [
-        ("parse", file(0o600, 0, ""), &Mode::ALL),
+    let cases: [(&str, Entry, &[Mode]); 3] = [
         (
             "credential",
             file(0o640, 0, ""),
@@ -362,18 +360,17 @@ fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
         for mode in Mode::ALL {
             let text = render(&c, Some(1500), mode).expect("renders");
             let unit = UnitText::new(mode.unit_name(), text);
-            let r = check_on_host(&exec, &c, mode, &unit, &slice, true, None).expect("runs");
+            let r = check_on_host(&exec, &c, mode, &unit, &slice, true).expect("runs");
             let hits = r.failures.iter().filter(|f| f.rule == rule).count();
             let want = usize::from(fails.contains(&mode));
             if hits != want {
                 wrong.push(format!("{rule} on {mode}: {:?}", lines(&r)));
             }
-            // No other node rule fires on the clean node (`parse` aside, which this kbf
-            // refuses).
+            // No other node rule fires on the clean node.
             let others: Vec<String> = r
                 .failures
                 .iter()
-                .filter(|f| f.rule != rule && f.rule != "parse")
+                .filter(|f| f.rule != rule)
                 .map(ToString::to_string)
                 .collect();
             if !others.is_empty() {

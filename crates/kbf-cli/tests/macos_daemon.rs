@@ -187,40 +187,33 @@ fn pid_in(file: &Path) -> i32 {
     }
 }
 
-/// `kbf check-args` on `args`: the status the unit's words get before an installer
-/// starts the unit.
-fn check_args(args: &[String]) -> (Option<i32>, String) {
-    let out = Command::new(BIN)
-        .arg("check-args")
-        .args(args)
-        .output()
-        .expect("run");
-    (
-        out.status.code(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
+/// kbf's own parser on `args` (the unit's words, the mode first), as `kbf` reads them:
+/// the exit status a start of the unit gets before it reaches the host, and what it says.
+fn parse_unit_words(args: &[String]) -> (Option<i32>, String) {
+    match kbf_cli::parse_from(std::iter::once("kbf").chain(args.iter().map(String::as_str))) {
+        Ok(_) => (Some(0), String::new()),
+        Err(e) => (Some(e.exit_code()), e.to_string()),
+    }
 }
 
-/// The unit's words are accepted by `kbf check-args daemon ...`, which is what an
-/// installer asks before it loads a unit, and a flag the daemon does not take is not:
-/// the same words with `--data-dir` spelled as another flag exit 2.
+/// The unit's words are accepted by kbf's parser for `daemon`, and a flag the daemon does
+/// not take is not: the same words with `--data-dir` spelled as another flag exit 2.
 ///
 /// Catches a `kbf daemon` that no longer takes a flag the unit passes (a flag renamed or
 /// dropped in the node's flags while the unit still writes it: launchd would restart the
-/// daemon every ten seconds, each start exiting 2), and a `check-args` that accepts
-/// everything.
+/// daemon every ten seconds, each start exiting 2), and a parser that accepts everything.
 #[test]
-fn check_args_accepts_the_units_words_and_refuses_a_renamed_flag() {
-    let dir = tls("check-args");
+fn the_units_words_parse_and_a_renamed_flag_is_refused() {
+    let dir = tls("unit-words");
     let args = unit_args(&dir, &dir.join("data"), 8981);
-    let (code, err) = check_args(&args);
+    let (code, err) = parse_unit_words(&args);
     assert_eq!(code, Some(0), "{err}");
 
     let renamed: Vec<String> = args
         .iter()
         .map(|a| if a == "--data-dir" { "--datadir" } else { a }.to_owned())
         .collect();
-    let (code, err) = check_args(&renamed);
+    let (code, err) = parse_unit_words(&renamed);
     assert_eq!(code, Some(2), "{err}");
     assert!(err.contains("--datadir"), "{err}");
 }

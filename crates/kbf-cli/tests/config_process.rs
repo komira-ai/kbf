@@ -429,51 +429,6 @@ fn check_refuses_an_unknown_flag_and_a_word_that_is_not_a_mode() {
     }
 }
 
-/// Catches `kbf check-args` changed from what `kbf-deploy` calls: it still parses the
-/// flags and exits 0, with nothing on stdout and none of the host's checks (a certificate
-/// that is not there is fine), and it says on stderr, in one line, that it is deprecated
-/// and what to use. Exit 2 is kept for flags a start refuses.
-#[test]
-fn check_args_still_parses_and_says_it_is_deprecated() {
-    let ok = run(&strings(&[
-        "check-args",
-        "daemon",
-        "--driver=container",
-        "--server=https://127.0.0.1:1",
-        "--ca-cert=/nonexistent/ca.pem",
-        "--cert=/nonexistent/node.pem",
-        "--key=/nonexistent/node.key",
-        "--node-id=n",
-    ]));
-    assert_eq!(ok.code, Some(0), "{}", ok.err);
-    assert!(ok.out.is_empty());
-    assert_eq!(ok.err.lines().count(), 1, "{}", ok.err);
-    assert!(
-        ok.err.contains("deprecated") && ok.err.contains("--check"),
-        "{}",
-        ok.err
-    );
-    let bad = run(&strings(&["check-args", "daemon", "--bogus-flag"]));
-    assert_eq!(bad.code, Some(2));
-    // The refusal is the first line, which `kbf-deploy` reports; the note is the last.
-    assert!(
-        bad.err
-            .lines()
-            .next()
-            .is_some_and(|l| l.contains("unexpected argument '--bogus-flag'")),
-        "{}",
-        bad.err
-    );
-    assert!(
-        bad.err
-            .lines()
-            .last()
-            .is_some_and(|l| l.contains("deprecated")),
-        "{}",
-        bad.err
-    );
-}
-
 /// A running `kbf storage`, killed when dropped.
 struct Node {
     child: std::process::Child,

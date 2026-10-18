@@ -65,14 +65,6 @@
 //!
 //! [`check_on_host`] adds the rules that read the host, and reads `kbf.slice`:
 //!
-//! - `parse`: a mode's flags are ones `kbf <mode>` takes, by kbf's own parser:
-//!   `<kbf> check-args <mode> <flags...>` must exit 0 (it parses as a start would and
-//!   starts nothing). `<kbf>` is `--kbf-bin` when given; else the unit's own
-//!   `ExecStart=` binary when it is there; else the rule is skipped with a `SKIP parse:`
-//!   line (rendering on a machine with no kbf installed, such as CI), which is not a
-//!   failure. A `--kbf-bin` that cannot be run is a refusal. An older kbf, without
-//!   `check-args`, fails the rule with clap's
-//!   `error: unrecognized subcommand 'check-args'` (docs/deploy/kbf-modes.md).
 //! - `cpuset`: neither the unit nor `kbf.slice` allows fewer CPUs or NUMA nodes than
 //!   the node has ([`super::cpuset`]); `delegate` also refuses a `kbf.slice` that
 //!   disables a delegated controller below it (a slice cannot delegate; systemd enables
@@ -93,12 +85,10 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::io;
 use std::path::Path;
 
 use kbf_host::exec::Exec;
 use kbf_host::path::HostPath;
-use kbf_host::step::Cmd;
 
 use super::config::{LinuxConfig, LinuxError};
 use super::shared::{Failure, Report, SLICE, angle_placeholder, values};
@@ -117,10 +107,6 @@ pub const DELEGATED: [&str; 4] = ["cpu", "cpuset", "memory", "pids"];
 /// (rule `handover`, `kbf frontend handover`). Only the first is enabled at boot
 /// (`DefaultInstance=` in the template).
 pub const FRONTEND_INSTANCES: [&str; 2] = ["a", "b"];
-
-/// The word after `kbf` that parses a command line and starts nothing (kbf-cli's
-/// `kbf_cli::CHECK_ARGS`; its tests hold the two equal).
-pub const CHECK_ARGS: &str = "check-args";
 
 /// A mode of `kbf`, as `kbf-deploy` renders its unit. The names are kbf-cli's
 /// (`kbf_cli::names`); kbf-cli's tests hold the two lists equal.
@@ -389,9 +375,7 @@ fn hot_store_reachable<E: Exec>(
 }
 
 /// [`check`] on `unit` and its drop-ins, `kbf.slice` (`slice`, with its drop-ins), and
-/// then the rules that read the host `exec` runs on: `parse` (`kbf_bin`, or the unit's
-/// own binary when `exec` shows it there, run as `<kbf> check-args <mode> <flags...>`
-/// for a mode whose `ExecStart=` passes rule `exec`), `cpuset`, and
+/// then the rules that read the host `exec` runs on: `cpuset`, and
 /// `credential`'s reading of the environment files. A rule skipped is a note.
 pub fn check_on_host<E: Exec>(
     exec: &E,
@@ -400,7 +384,6 @@ pub fn check_on_host<E: Exec>(
     unit: &UnitText,
     slice: &UnitText,
     installable: bool,
-    kbf_bin: Option<&HostPath>,
 ) -> Result<Report, ParseError> {
     let merged = unit.parse()?;
     let slice_unit = slice.parse()?;
@@ -457,21 +440,6 @@ pub fn check_on_host<E: Exec>(
         notes.extend(found.notes);
     }
     hot_store_reachable(exec, &merged, &mut failures, &mut notes);
-    let argv = merged.exec_start();
-    if runs_this_mode(config, mode, &argv) {
-        let found = match kbf_bin {
-            Some(bin) => Some(bin.clone()),
-            None => on_host(exec, argv[0]),
-        };
-        match found {
-            Some(bin) => failures.extend(parse(exec, &bin, mode, &argv[2..])?),
-            None => notes.push(format!(
-                "SKIP parse: no kbf binary at {}, so the flags of kbf {mode} were not \
-                 parsed; give --kbf-bin PATH to parse them with another",
-                argv[0]
-            )),
-        }
-    }
     let mut r = report(mode, failures);
     r.notes.extend(notes);
     Ok(r)
@@ -483,60 +451,11 @@ pub enum ParseError {
     /// A file of the unit (or of `kbf.slice`) that is not a unit file.
     #[error("{name}: {source}")]
     Unit { name: String, source: UnitError },
-    /// Rule `parse` could not run kbf.
-    #[error("cannot run {bin} {CHECK_ARGS}: {source}")]
-    Run { bin: HostPath, source: io::Error },
 }
 
 /// The cold store's key file: `<KBF_ETC>/s3.env`.
 fn key_file(config: &LinuxConfig) -> std::path::PathBuf {
     Path::new(config.etc.as_str()).join(COLD_STORE_KEY_FILE)
-}
-
-/// The unit's binary, unless `exec` shows nothing at its path or the path is not
-/// absolute.
-fn on_host<E: Exec>(exec: &E, program: &str) -> Option<HostPath> {
-    let bin = HostPath::new(program).ok()?;
-    // A path `exec` cannot look at is tried: the run says why it fails.
-    (!matches!(exec.stat(&bin), Ok(None))).then_some(bin)
-}
-
-/// Rule `parse`: `bin check-args <mode> <flags>` exits 0, or the failure with the
-/// first line it printed on stderr.
-fn parse<E: Exec>(
-    exec: &E,
-    bin: &HostPath,
-    mode: Mode,
-    flags: &[&str],
-) -> Result<Option<Failure>, ParseError> {
-    let cmd = flags.iter().fold(
-        Cmd::new(bin.clone()).arg(CHECK_ARGS).arg(mode.name()),
-        |c, f| c.arg(*f),
-    );
-    let out = exec.query(&cmd).map_err(|source| ParseError::Run {
-        bin: bin.clone(),
-        source,
-    })?;
-    if out.status.success() {
-        return Ok(None);
-    }
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let said = stderr
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("(nothing on stderr)");
-    let how = out
-        .status
-        .code()
-        .map_or_else(|| "killed by a signal".to_owned(), |c| format!("exit {c}"));
-    Ok(Some(Failure {
-        rule: "parse",
-        message: format!(
-            "kbf {mode} refuses the flags of {} ({bin} {CHECK_ARGS}: {how}): {said}",
-            mode.unit_name()
-        ),
-    }))
 }
 
 /// Whether `argv` starts `<KBF_BIN_DIR>/kbf <mode>` (rule `exec`).
