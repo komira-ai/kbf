@@ -14,14 +14,24 @@
 //! - [`own_loopback_port`]: for a port a *child process* or code that binds by itself
 //!   will bind, so no socket can be handed over.
 //!
-//! # Why a bound socket that does not listen is dead
+//! # What holds a port and refuses
 //!
-//! A TCP socket that is bound but not listening owns its port: a second `bind` of the
-//! same address fails with `EADDRINUSE` (neither this module nor `std` sets
-//! `SO_REUSEADDR` on the held one), and a connection attempt to it is answered with a
-//! reset, so `connect` fails with "connection refused". That holds on Linux and on
-//! macOS (BSD sockets); it is what `listen(2)` changes. The tests below prove it on
-//! the platform they run on.
+//! - Linux: a TCP socket that is bound and not listening owns its port (a second
+//!   `bind` fails with `EADDRINUSE`; neither this module nor `std` sets
+//!   `SO_REUSEADDR` on the held one) and a connection attempt to it is answered with a
+//!   reset: `connect` fails with "connection refused".
+//! - macOS: that socket owns its port too, but a SYN that finds it is dropped without
+//!   a reset (the socket is in the lookup tables in state CLOSED, and the stack drops
+//!   segments for a CLOSED socket), so `connect` waits out its whole timeout and
+//!   fails with "timed out". So the held socket is also connected to its own address
+//!   (a TCP simultaneous open with itself): a connected socket is found only under
+//!   its full address pair, so a SYN from anyone else finds no socket, is answered
+//!   with a reset, and the port stays owned. [`Reserved::listen`] then has to drop
+//!   that socket and bind the listener; between the two a thief would need to draw
+//!   exactly that number from the kernel's random ephemeral range within microseconds
+//!   (macOS only; on Linux the socket itself listens and there is no gap).
+//!
+//! The tests below prove the behaviour on the platform they run on, macOS included.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::os::fd::OwnedFd;
@@ -29,7 +39,8 @@ use std::sync::Mutex;
 
 use rustix::net::{self, AddressFamily, SocketType};
 
-/// A loopback port held by a socket that is bound and not listening.
+/// A loopback port held by a socket that owns it and refuses connections to it (bound
+/// and not listening on Linux; also connected to itself on macOS, see the module docs).
 ///
 /// The IPv4 loopback port is held; the same port number on `::1` is held too when the
 /// host has IPv6 loopback and the number is free there (best effort: a test that
@@ -49,10 +60,9 @@ impl Reserved {
     /// If the socket cannot be made or bound: a test cannot go on without a port.
     #[must_use]
     pub fn new() -> Self {
-        let v4 = bound_socket(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-            .expect("bind a loopback socket");
+        let v4 = new_v4();
         let port = local_port(&v4);
-        let v6 = bound_socket(SocketAddr::from((Ipv6Addr::LOCALHOST, port))).ok();
+        let v6 = held_socket(SocketAddr::from((Ipv6Addr::LOCALHOST, port))).ok();
         Self { v4, _v6: v6, port }
     }
 
@@ -75,9 +85,27 @@ impl Reserved {
     /// If `listen` fails.
     #[must_use]
     pub fn listen(self) -> TcpListener {
-        net::listen(&self.v4, 128).expect("listen");
-        TcpListener::from(self.v4)
+        #[cfg(target_os = "linux")]
+        let fd = self.v4;
+        #[cfg(not(target_os = "linux"))]
+        let fd = {
+            // A self-connected socket cannot listen: release it and bind the listener
+            // (SO_REUSEADDR for the closing connection's leftover state).
+            let addr = self.addr();
+            drop(self.v4);
+            let fd = net::socket(AddressFamily::INET, SocketType::STREAM, None).expect("socket");
+            net::sockopt::set_socket_reuseaddr(&fd, true).expect("reuseaddr");
+            net::bind(&fd, &addr).expect("bind the held port");
+            fd
+        };
+        net::listen(&fd, 128).expect("listen");
+        TcpListener::from(fd)
     }
+}
+
+/// The IPv4 half of a new [`Reserved`]: a free number on `127.0.0.1`, held.
+fn new_v4() -> OwnedFd {
+    held_socket(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("bind a loopback socket")
 }
 
 impl Default for Reserved {
@@ -96,6 +124,30 @@ fn bound_socket(addr: SocketAddr) -> rustix::io::Result<OwnedFd> {
     let fd = net::socket(family, SocketType::STREAM, None)?;
     net::bind(&fd, &addr)?;
     Ok(fd)
+}
+
+/// A socket that owns `addr` and refuses connections to it, on every platform: bound
+/// and connected to its own address (see the module docs for why macOS needs that).
+/// Only the held port of a [`Reserved`] on macOS uses it; Linux tests it too.
+#[cfg(any(not(target_os = "linux"), test))]
+fn self_connected_socket(addr: SocketAddr) -> rustix::io::Result<OwnedFd> {
+    let fd = bound_socket(addr)?;
+    // Port 0 was bound to a number: connect to that, the socket's own address.
+    let own = SocketAddr::new(addr.ip(), local_port(&fd));
+    net::connect(&fd, &own)?;
+    Ok(fd)
+}
+
+/// The socket that holds `addr`: bound only, on Linux.
+#[cfg(target_os = "linux")]
+fn held_socket(addr: SocketAddr) -> rustix::io::Result<OwnedFd> {
+    bound_socket(addr)
+}
+
+/// The socket that holds `addr`: self-connected, elsewhere.
+#[cfg(not(target_os = "linux"))]
+fn held_socket(addr: SocketAddr) -> rustix::io::Result<OwnedFd> {
+    self_connected_socket(addr)
 }
 
 fn local_port(fd: &OwnedFd) -> u16 {
@@ -219,6 +271,19 @@ mod tests {
             assert!(TcpListener::bind(addr).is_err(), "{addr} was taken");
             assert!(TcpStream::connect(addr).is_err(), "{addr} answered");
         }
+    }
+
+    /// Catches a self-connected socket (the macOS holder, run here too) that can be
+    /// taken or that does not refuse: same assertions as for the Linux holder.
+    #[test]
+    fn a_self_connected_socket_holds_its_port_and_refuses() {
+        let held = self_connected_socket(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("self-connect");
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, local_port(&held)));
+        assert!(TcpListener::bind(addr).is_err(), "a thief took the port");
+        let err = TcpStream::connect(addr).expect_err("refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused, "{err}");
+        drop(held);
     }
 
     /// Catches a probed port on the usual loopback address, which another test's
