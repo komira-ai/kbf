@@ -106,11 +106,7 @@ impl FrontendTls {
         clock: std::sync::Arc<dyn Fn() -> i64 + Send + Sync>,
         every: Option<Duration>,
     ) {
-        let half = every.unwrap_or_else(|| {
-            Duration::from_secs(
-                u64::try_from(ca.frontend().policy().lifetime_s() / 2).unwrap_or(3600),
-            )
-        });
+        let half = every.unwrap_or_else(|| half_life(&ca));
         let mut wait = half;
         loop {
             tokio::time::sleep(wait).await;
@@ -136,6 +132,12 @@ impl FrontendTls {
             };
         }
     }
+}
+
+/// Half the lifetime the CA gives the frontend's certificate: when it is replaced. (A
+/// policy's lifetime is positive, so the absolute value is the lifetime.)
+fn half_life(ca: &Ca) -> Duration {
+    Duration::from_secs(ca.frontend().policy().lifetime_s().unsigned_abs() / 2)
 }
 
 /// The unix time now, from the system clock.

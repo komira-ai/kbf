@@ -107,7 +107,9 @@ fn an_external_signer_issues_and_the_frontend_holds_no_key() {
     let (authority, _) =
         kbf_signer::ensure(&dir, policy(), START, &mut SystemEntropy).expect("ensure");
     let uid = rustix::process::geteuid().as_raw();
-    let server = SignerServer::from_dir(&dir, uid, policy()).expect("server");
+    let server = SignerServer::from_dir(&dir, uid, policy())
+        .expect("server")
+        .with_clock(|| START);
     let socket = scratch("ca-external-sock").join("signer.sock");
     let listener = bind(&socket).expect("bind");
     std::thread::spawn(move || {
@@ -154,7 +156,9 @@ fn an_external_signer_needs_the_signers_root_and_makes_nothing() {
     let dir = scratch("ca-external-bad");
     let (_, _) = kbf_signer::ensure(&dir, policy(), START, &mut SystemEntropy).expect("ensure");
     let uid = rustix::process::geteuid().as_raw();
-    let server = SignerServer::from_dir(&dir, uid, policy()).expect("server");
+    let server = SignerServer::from_dir(&dir, uid, policy())
+        .expect("server")
+        .with_clock(|| START);
     let socket = scratch("ca-external-bad-sock").join("signer.sock");
     let listener = bind(&socket).expect("bind");
     std::thread::spawn(move || {

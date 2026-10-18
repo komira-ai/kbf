@@ -77,10 +77,12 @@ impl EnrollService {
             // before a `--frontend-name` was added must not keep a certificate naming it.
             // This runs inside the transaction, after the key was proved, so a caller
             // without the node's key learns nothing about the stored host.
-            if advertise.as_deref().is_some_and(|host| {
-                keys.iter().any(|(role, _)| *role == Role::Storage)
-                    && advertise_refused(host, &core.frontend_names)
-            }) {
+            // The registry holds an advertise host for a node with the storage role only,
+            // and has checked that the request asks for the roles held.
+            if advertise
+                .as_deref()
+                .is_some_and(|host| advertise_refused(host, &core.frontend_names))
+            {
                 return Err(RefusalReason::AdvertiseInvalid);
             }
             keys.iter()

@@ -106,7 +106,7 @@ use crate::handover::{
     Ready, Released, Stand, Stop,
 };
 use crate::health::{Checks, MapProbe, Readiness, StateProbe, StorageProbe};
-use crate::listen::Socket;
+use crate::listen::{Binder, Socket};
 use crate::members::Members;
 use crate::serve::{
     AbortOnDrop, ServeError, drain_and_stop, flow_control, keepalive, log_state, map_of,
@@ -769,10 +769,28 @@ struct Prepared<'a> {
 }
 
 /// The three listening sockets.
-struct Bound {
+pub(crate) struct Bound {
     reapi: Socket,
     worker: Socket,
     api: Option<Socket>,
+}
+
+impl Bound {
+    /// Binds the listeners one after the other through `binder`, so that they share its
+    /// one retry budget: made once per start, it keeps the whole bind phase below the
+    /// unit's start timeout whatever number of addresses wait for a late interface.
+    pub(crate) fn bind(
+        reapi: SocketAddr,
+        worker: SocketAddr,
+        api: Option<SocketAddr>,
+        binder: &Binder,
+    ) -> Result<Self, ServeError> {
+        Ok(Self {
+            reapi: Socket::bind(reapi, binder)?,
+            worker: Socket::bind(worker, binder)?,
+            api: api.map(|api| Socket::bind(api, binder)).transpose()?,
+        })
+    }
 }
 
 impl<'a> Prepared<'a> {
@@ -783,19 +801,18 @@ impl<'a> Prepared<'a> {
         let policy = args.reapi_auth_policy()?;
         let api = args.api()?;
         let channel = flags.storage_endpoint()?.connect_lazy();
+        let binder = Binder::new();
         let enroll = flags
             .enroll
             .as_ref()
-            .map(enroll_start::prepare)
+            .map(|enroll| enroll_start::prepare_with(enroll, &binder))
             .transpose()?;
-        let sockets = Bound {
-            reapi: Socket::bind(listeners.reapi)?,
-            worker: Socket::bind(listeners.worker)?,
-            api: api
-                .as_ref()
-                .map(|api| Socket::bind(api.listen))
-                .transpose()?,
-        };
+        let sockets = Bound::bind(
+            listeners.reapi,
+            listeners.worker,
+            api.as_ref().map(|api| api.listen),
+            &binder,
+        )?;
         Ok(Self {
             flags,
             listeners,
@@ -856,6 +873,14 @@ impl<'a> Prepared<'a> {
             Some(routed) => Backend::routed(Arc::clone(routed), storage),
             None => Backend::remote(storage),
         };
+        // A failed run's logs are read from the storage node, under a budget of this
+        // frontend's own: it serves no blob route to share one with.
+        let history = history.map(|history| {
+            history.with_blobs(
+                Arc::new(backend.clone()),
+                crate::http_blobs::ReadBudget::default(),
+            )
+        });
 
         let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
         let recording = crate::history::install(recording, history.as_ref());
@@ -915,14 +940,15 @@ impl<'a> Prepared<'a> {
             })
             .transpose()?;
         let (enroll_api, enroll_serve, enroll_renewal, enroll_tls) = match enrolled {
-            Some(serving) => {
-                drain.begins().closes(serving.latch);
-                (
-                    Some(serving.api),
-                    serving.listener,
-                    Some(serving.renewal),
-                    Some(serving.tls),
-                )
+            Some(enroll_start::Serving {
+                api,
+                listener,
+                latch,
+                renewal,
+                tls,
+            }) => {
+                drain.begins().closes(latch);
+                (Some(api), listener, Some(renewal), Some(tls))
             }
             None => (None, futures::future::pending().boxed(), None, None),
         };

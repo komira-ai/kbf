@@ -217,6 +217,7 @@ impl Farm {
                 zone: String::new(),
                 weight: 1,
                 state: *state,
+                boot: 0,
             })
             .collect();
         Arc::new(Map::new(generation, members, Rule::Rendezvous, r, 1, Vec::new()).expect("a map"))
@@ -853,6 +854,7 @@ async fn a_farm_that_shrinks_to_one_member_is_still_routed_by_its_map() {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let alone = Map::new(2, vec![survivor], Rule::Rendezvous, 1, 1, Vec::new()).expect("a map");
     farm.cell.set(Arc::new(alone));

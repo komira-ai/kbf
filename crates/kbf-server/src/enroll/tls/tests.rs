@@ -37,6 +37,18 @@ fn the_certificate_is_renewed_into_the_served_configuration() {
     assert_eq!(tls.source().reloads().applied, 2);
 }
 
+/// The service replaces the certificate at half the CA's lifetime when no interval is
+/// given.
+///
+/// Catches: an interval that is the whole lifetime (the certificate would expire before it
+/// is replaced) or a fixed one that ignores the policy.
+#[test]
+fn the_default_interval_is_half_the_certificate_lifetime() {
+    // The test CA issues for 86 400 seconds.
+    let farm = farm("tls-half-life");
+    assert_eq!(half_life(&farm.ca), Duration::from_secs(43_200));
+}
+
 /// A renewal the CA refuses (its clock is before the build's floor) changes nothing and is
 /// an error the loop logs and retries.
 ///

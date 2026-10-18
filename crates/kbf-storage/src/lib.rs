@@ -46,6 +46,19 @@ use tonic::metadata::MetadataValue;
 /// The answer of a [`Storage`] call.
 pub type Answer<'a, T> = BoxFuture<'a, Result<T, StorageError>>;
 
+/// An action-cache hit as [`Storage::action_entry`] answers it.
+#[derive(Clone, Debug)]
+pub struct ActionEntry {
+    /// The digest of the blob the result was read from.
+    pub result_digest: Digest,
+    /// The result.
+    pub result: ActionResult,
+    /// The blobs the entry needs besides the result blob. `None`: the storage did not
+    /// report them (a node from before the field existed), so they are unchecked; `Some`
+    /// of an empty list is an entry that needs nothing else.
+    pub closure: Option<Vec<Digest>>,
+}
+
 /// The bytes of a ranged read ([`Storage::read_range`]), in order, in chunks of at most
 /// [`READ_CHUNK_BYTES`]. An item is an error if the read failed after the answer began;
 /// the stream ends after one.
@@ -178,6 +191,26 @@ pub trait Storage: Send + Sync {
         &'a self,
         action: &'a Digest,
     ) -> Answer<'a, Option<(Digest, ActionResult)>>;
+
+    /// [`Storage::action_result`] with the entry's closure: the blobs the entry needs
+    /// besides its result blob, so a caller can check each is still held where it
+    /// belongs. The default answers [`Storage::action_result`] with `closure: None`
+    /// ("not reported"), which a caller serves as it always did.
+    ///
+    /// # Errors
+    /// The store could not answer.
+    fn action_entry<'a>(&'a self, action: &'a Digest) -> Answer<'a, Option<ActionEntry>> {
+        Box::pin(async move {
+            Ok(self
+                .action_result(action)
+                .await?
+                .map(|(result_digest, result)| ActionEntry {
+                    result_digest,
+                    result,
+                    closure: None,
+                }))
+        })
+    }
 
     /// The first half of an action-cache write: the closure of `result`, every blob of
     /// it checked held, and `result` stored as a blob. The action cache is not touched.
