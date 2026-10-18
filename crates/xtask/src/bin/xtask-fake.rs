@@ -3,7 +3,8 @@
 //! without building the server, `verify-assets attestations` without GitHub, and
 //! `sudo-test` and `crun-tests` without root or systemd.
 //!
-//! - Run under any name but `kbf-server`, `gh` or `sudo`, it is cargo: it
+//! - Run under any name but `kbf-server`, `gh`, `sudo`, `uname`, `id`, `systemd-sysusers` or
+//!   `systemd-tmpfiles`, it is cargo: it
 //!   appends its arguments as one line to `target/debug/cargo-args` in its working
 //!   directory, "builds" by hard-linking itself to `target/debug/kbf-server`, and
 //!   writes the stamp that build embeds to `target/debug/kbf-server.stamp`:
@@ -45,6 +46,12 @@
 //!   --dir <dir>` copies every file of `releases/<tag>/` into `<dir>`.
 //! - Run as `sudo`, it appends `<working directory>: <arguments>` as one line to
 //!   `sudo-args` next to it, and exits 0 (the tests it was asked to run passed).
+//! - Run as `uname` (by name, from PATH, or by path), it is a host that is no platform of
+//!   ours: `-s` prints `Linux` and `-m` prints `riscv64` (or `XTASK_FAKE_MACHINE` when set). Run as `id`, `-u` prints 1000
+//!   (a user that is not root).
+//! - Run as `systemd-sysusers` or `systemd-tmpfiles` (by name, from PATH, or by path), it
+//!   appends `<name> <arguments>` as one line to `systemd-args` next to the fake's own
+//!   file and exits 0: the host's systemd, as `packaging/install.sh` calls it.
 //!
 //! `XTASK_FAKE_DEFECT` plants one defect of the real build: `ignores-override` (the
 //! build embeds the head whatever the override), `accepts-bad` (a malformed override
@@ -61,7 +68,7 @@
 //! release` command exits 1). Of sudo:
 //! `tests-fail` (it exits 101, as a failed test binary does) or `fails:<a>,<b>,...`
 //! (it exits 101 when one of its arguments is one of `<a>`, `<b>`, ..., so some units
-//! of several fail).
+//! of several fail). Of systemd: `systemd-fails` (every systemd tool exits 1).
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
@@ -430,10 +437,50 @@ fn sudo(argv0: &str, args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn systemd(name: &str, args: &[String]) -> ExitCode {
+    let exe = std::env::current_exe().expect("the fake's own path");
+    let dir = exe.parent().expect("the fake's directory");
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("systemd-args"))
+        .expect("systemd-args");
+    writeln!(log, "{name} {}", args.join(" ")).expect("systemd-args");
+    if defect("systemd-fails") {
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+/// `uname -s` and `uname -m` of a host with no platform of ours.
+fn uname(args: &[String]) -> ExitCode {
+    match args {
+        [a] if a == "-s" => println!("Linux"),
+        [a] if a == "-m" => {
+            println!(
+                "{}",
+                std::env::var("XTASK_FAKE_MACHINE").unwrap_or("riscv64".to_owned())
+            );
+        }
+        _ => return ExitCode::FAILURE,
+    }
+    ExitCode::SUCCESS
+}
+
+/// `id -u` of a user that is not root.
+fn id(args: &[String]) -> ExitCode {
+    match args {
+        [a] if a == "-u" => println!("1000"),
+        _ => return ExitCode::FAILURE,
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args();
     let argv0 = args.next().expect("argv0");
     let rest: Vec<String> = args.collect();
+    let base = argv0.rsplit('/').next().unwrap_or(&argv0);
     if argv0.ends_with("/kbf-server") {
         server(&argv0)
     } else if argv0.ends_with("/kbf") {
@@ -444,6 +491,12 @@ fn main() -> ExitCode {
         gh(&argv0, &rest)
     } else if argv0.ends_with("/sudo") {
         sudo(&argv0, &rest)
+    } else if matches!(base, "systemd-sysusers" | "systemd-tmpfiles") {
+        systemd(base, &rest)
+    } else if argv0 == "uname" || argv0.ends_with("/uname") {
+        uname(&rest)
+    } else if argv0 == "id" || argv0.ends_with("/id") {
+        id(&rest)
     } else {
         cargo(&argv0, &rest)
     }
