@@ -67,6 +67,7 @@ async fn pair(pki: &Pki, caller_role: &str) -> Pair {
             zone: String::new(),
             weight: 1,
             state: MemberState::Active,
+            boot: 0,
         })
         .collect();
     let map = Arc::new(Map::new(1, members, Rule::Rendezvous, 2, 1, Vec::new()).expect("map"));
@@ -89,6 +90,7 @@ fn payload(pair: &Pair) -> Vec<u8> {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = Map::new(
         1,
