@@ -9,7 +9,7 @@ use kbf_host::path::Root;
 
 use crate::CommitId;
 use crate::layout::Layout;
-use crate::state::{PendingConfirm, State};
+use crate::state::{EnvoyPins, PendingConfirm, State};
 
 pub const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub const B: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -42,5 +42,6 @@ pub fn full_state() -> State {
             starts_left: None,
         }),
         order_floor: 7,
+        envoy: EnvoyPins::default(),
     }
 }

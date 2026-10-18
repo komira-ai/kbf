@@ -17,6 +17,9 @@
 //!   and the expiry, and the repair of the links after an interrupted verb.
 //! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
 //!   named by.
+//! - [`envoy`]: the pinned Envoy of the frontend: `envoy fetch`, `verify`, `path` and `list`
+//!   (the manifest's `envoy` section, the download's checks, `envoy/<version>-<sha256[:16]>/`,
+//!   the pin in `state.json`).
 //!
 //! The offline check ([`stage::stage_from_inbox`] runs them in the order that matters,
 //! documented there):
@@ -41,6 +44,7 @@ pub mod archive;
 pub mod attest;
 pub mod binary;
 pub mod darwin;
+pub mod envoy;
 #[cfg(test)]
 mod fixtures;
 pub mod inbox;

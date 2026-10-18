@@ -141,6 +141,32 @@ impl Exec for Killed<'_> {
     }
 }
 
+/// Catches an activation that forgets the Envoy pin: the state it writes is built whole,
+/// and a field left out of it is lost with the swap.
+///
+/// Mutant seen red: `envoy: state.envoy.clone()` left out of the new state.
+#[test]
+fn a_swap_keeps_the_envoy_pin() {
+    let (mut exec, layout) = host("envoy-pin");
+    running(&exec, &layout, A, &[B]);
+    let pins = crate::state::EnvoyPins {
+        current: Some(crate::envoy::EnvoyId::parse("1.31.2-0123456789abcdef").expect("id")),
+        previous: Some(crate::envoy::EnvoyId::parse("1.30.0-fedcba9876543210").expect("id")),
+    };
+    let mut was = state_of(&layout);
+    was.staged = Some(c(B));
+    was.envoy = pins.clone();
+    Locked::acquire(&layout)
+        .expect("lock")
+        .write(&was)
+        .expect("w");
+    assert_eq!(
+        go(&mut exec, &layout, &order(B, "o1", 5), START),
+        Ok(Activated::Swapped)
+    );
+    assert_eq!(state_of(&layout).envoy, pins);
+}
+
 /// Catches an activation that does not install the new release on trial as the design
 /// says: `current` and `previous` both moved (a rollback target exists), the staged
 /// slot cleared, the order, the start budget and an
@@ -183,6 +209,7 @@ fn an_order_swaps_a_staged_release_in_on_trial_and_changes_no_release_file() {
                 starts_left: Some(3),
             }),
             order_floor: 0,
+            envoy: Default::default(),
         }
     );
     assert_eq!(fs::read_to_string(&old).expect("read"), A);

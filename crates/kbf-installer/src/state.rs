@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::CommitId;
+use super::envoy::EnvoyId;
 use super::layout::{self, Layout};
 
 /// The `schema` number this build writes and the only one it reads.
@@ -42,6 +43,29 @@ pub struct State {
     /// (epoch, then id), and a release may be ordered down (a rollback is the old release
     /// ordered again). Kept so that a state file written by an older build still reads.
     pub order_floor: u64,
+    /// The Envoy the frontend's `kbf-envoy@` units run, and the one before it
+    /// ([`crate::envoy`]). Left out of the file while neither is set.
+    #[serde(default, skip_serializing_if = "EnvoyPins::is_empty")]
+    pub envoy: EnvoyPins,
+}
+
+/// The pinned Envoy builds: each an [`EnvoyId`], the name of a directory under the
+/// installer tree's `envoy/`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvoyPins {
+    /// The build `envoy verify` checks and `kbf-envoy@` runs.
+    #[serde(default)]
+    pub current: Option<EnvoyId>,
+    /// The build `current` replaced; never the same as `current`.
+    #[serde(default)]
+    pub previous: Option<EnvoyId>,
+}
+
+impl EnvoyPins {
+    pub fn is_empty(&self) -> bool {
+        self.current.is_none() && self.previous.is_none()
+    }
 }
 
 /// A swap that rolls back unless it is confirmed ([`crate::activate`]).

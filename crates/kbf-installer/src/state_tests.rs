@@ -268,3 +268,66 @@ fn status_reads_the_current_link_and_matches_it_to_the_state() {
     let err = status(&root).expect_err("ENOTDIR");
     assert!(err.to_string().contains("usr/local/kbf/current"), "{err}");
 }
+
+/// Catches the Envoy pin going wrong in the file: set, it is written as `envoy` with
+/// `current` and `previous` and reads back; unset, the file has no `envoy` key at all (so
+/// a state written before Envoy was pinned is byte for byte what it was); a state with no
+/// `envoy` key reads as no pin; a pin that is not a build id, or has a field this build
+/// does not know, is refused on read.
+///
+/// Mutants seen red: `skip_serializing_if` dropped (every state grows `"envoy": {...}`);
+/// `deny_unknown_fields` dropped from the pins.
+#[test]
+fn the_envoy_pin_is_in_the_file_only_when_set_and_is_read_strictly() {
+    use crate::envoy::EnvoyId;
+    let (root, dir) = host_root("deploy-host-state-envoy");
+    let lock = Locked::acquire(&root).expect("lock");
+    let a = EnvoyId::parse("1.31.2-0123456789abcdef").expect("id");
+    let b = EnvoyId::parse("1.40.0-fedcba9876543210").expect("id");
+    let mut state = State::default();
+    lock.write(&state).expect("write");
+    let file = dir.join("var/lib/kbf-deploy/state.json");
+    assert!(!fs::read_to_string(&file).expect("file").contains("envoy"));
+    state.envoy = EnvoyPins {
+        current: Some(a.clone()),
+        previous: Some(b.clone()),
+    };
+    lock.write(&state).expect("write");
+    let text = fs::read_to_string(&file).expect("file");
+    assert!(
+        text.contains(
+            "\"envoy\": {\n    \"current\": \"1.31.2-0123456789abcdef\",\n    \
+             \"previous\": \"1.40.0-fedcba9876543210\"\n  }"
+        ),
+        "{text}"
+    );
+    assert_eq!(lock.read().expect("read"), Some(state));
+
+    let path = Path::new("/var/lib/kbf-deploy/state.json");
+    let base = "\"current\":null,\"previous\":null,\"staged\":null,\"pending_confirm\":null,\
+         \"order_floor\":0";
+    let with = |envoy: &str| format!("{{\"schema\":1,{base},\"envoy\":{envoy}}}");
+    assert_eq!(
+        parse(path, format!("{{\"schema\":1,{base}}}").as_bytes())
+            .expect("no key")
+            .envoy,
+        EnvoyPins::default()
+    );
+    assert_eq!(
+        parse(
+            path,
+            with("{\"current\":\"1.31.2-0123456789abcdef\"}").as_bytes()
+        )
+        .expect("current only")
+        .envoy
+        .previous,
+        None
+    );
+    for bad in [
+        "{\"current\":\"../../etc\"}",
+        "{\"current\":\"1.31.2-0123456789ABCDEF\"}",
+        "{\"current\":null,\"mirror\":null}",
+    ] {
+        assert!(parse(path, with(bad).as_bytes()).is_err(), "{bad}");
+    }
+}

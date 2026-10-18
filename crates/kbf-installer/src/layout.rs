@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 use kbf_host::path::{HostPath, Root};
 
 use super::CommitId;
+use super::envoy::EnvoyId;
 
 /// The directory the releases and the `current` and `previous` links are in.
 pub const KBF_DIR: &str = "/usr/local/kbf";
@@ -72,6 +73,13 @@ pub const INSTALLER_DIR: &str = "/usr/local/libexec/kbf-deploy";
 pub const GH: &str = "/usr/local/libexec/kbf-deploy/gh";
 pub const TRUSTED_ROOT: &str = "/usr/local/libexec/kbf-deploy/trusted_root.jsonl";
 pub const SETTINGS: &str = "/usr/local/libexec/kbf-deploy/installer.conf";
+
+/// The pinned Envoy builds (Linux, frontend only): one directory per build, named by
+/// [`crate::envoy::EnvoyId`], holding [`ENVOY_BINARY`] and [`ENVOY_SHA256`]. The installer
+/// tree is its own root, apart from kbf's own state.
+pub const ENVOY_DIR: &str = "/var/lib/kbf-installer/envoy";
+pub const ENVOY_BINARY: &str = "envoy";
+pub const ENVOY_SHA256: &str = "envoy.sha256";
 
 /// The names inside a release directory: its binaries, its systemd units and the
 /// manifest that lists them. A Linux release holds `kbf`; a macOS release holds
@@ -211,6 +219,17 @@ pub fn release_dir(commit: &CommitId) -> HostPath {
 /// [`RELEASE_DAEMON`], [`RELEASE_UNITS`] or [`RELEASE_MANIFEST`].
 pub fn release_file(commit: &CommitId, name: &'static str) -> HostPath {
     path_in(&format!("{RELEASES}/{commit}"), name)
+}
+
+/// `/var/lib/kbf-installer/envoy/<id>`.
+pub fn envoy_dir(id: &EnvoyId) -> HostPath {
+    path_in(ENVOY_DIR, id.as_str())
+}
+
+/// `/var/lib/kbf-installer/envoy/<id>/<name>`, for a name of [`ENVOY_BINARY`] or
+/// [`ENVOY_SHA256`].
+pub fn envoy_file(id: &EnvoyId, name: &str) -> HostPath {
+    path_in(&format!("{ENVOY_DIR}/{id}"), name)
 }
 
 /// `/etc/kbf-deploy/pins/<commit>.sha256`.

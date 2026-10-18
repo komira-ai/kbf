@@ -199,6 +199,7 @@ pub fn activate<E: Exec>(
             starts_left,
         }),
         order_floor: state.order_floor,
+        envoy: state.envoy.clone(),
     };
     lock.write(&next)?;
     converge(exec, &next, out)?;
