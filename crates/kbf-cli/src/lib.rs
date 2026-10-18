@@ -453,10 +453,7 @@ fn named_mode(split: &Split, args: &[OsString]) -> Result<Option<&'static Mode>,
                 // The word is not a mode: clap's refusal of an unknown subcommand.
                 return Err(command()
                     .try_get_matches_from(args)
-                    .err()
-                    .unwrap_or_else(|| {
-                        command().error(ErrorKind::InvalidSubcommand, "not a mode")
-                    }));
+                    .expect_err("clap refuses a first word that is no mode"));
             }
         },
         None => None,
@@ -523,7 +520,15 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString>,
 {
-    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    parse_words(args.into_iter().map(Into::into).collect(), default_config)
+}
+
+/// [`parse_with`] on the words as the one type, so that the generic wrapper is the only
+/// part of it compiled once per argument type (and coverage is measured on one body).
+fn parse_words(
+    args: Vec<OsString>,
+    default_config: Option<&std::path::Path>,
+) -> Result<Parsed, clap::Error> {
     let mut split = split(&args)?;
     let mut named = named_mode(&split, &args)?;
     let flag_named = named.is_some();
@@ -751,17 +756,17 @@ fn parse_invocation(args: &[OsString]) -> Result<Invocation, clap::Error> {
 /// The mode's command is parsed again as the root of its own command line, which is how
 /// clap gets the name it prints; an error the second parse does not repeat is left as it was.
 fn in_flag_form(args: &[OsString], error: clap::Error) -> clap::Error {
-    let Some(mode) = args
+    let again = args
         .get(1)
         .and_then(|word| MODES.iter().find(|m| word.to_str() == Some(m.name)))
-    else {
-        return error;
-    };
-    let argv = args.iter().take(1).chain(args.iter().skip(2));
-    match mode_command(mode.name, mode.entry).try_get_matches_from(argv) {
-        Err(again) if again.kind() == error.kind() => again,
-        _ => error,
-    }
+        .and_then(|mode| {
+            let argv = args.iter().take(1).chain(args.iter().skip(2));
+            mode_command(mode.name, mode.entry)
+                .try_get_matches_from(argv)
+                .err()
+        })
+        .filter(|again| again.kind() == error.kind());
+    again.unwrap_or(error)
 }
 
 /// The refusal a mode owes for `args`, if they hold a flag of another mode, found even
@@ -791,6 +796,13 @@ fn refuse_foreign_flags(mode: &str, m: &ArgMatches) -> Result<(), clap::Error> {
         )),
         None => Ok(()),
     }
+}
+
+/// Starts a parsed command line: the startup checks of the host ([`preflight::refusal`]),
+/// and, when they pass, the mode ([`run`]). Every start goes through here, the one that
+/// reads `kbf.toml` ([`node::run`]) after it has enrolled included.
+fn start(invocation: &Invocation) -> ExitCode {
+    preflight::refusal(invocation).unwrap_or_else(|| run(invocation))
 }
 
 /// Runs a parsed command line: the mode's own entry point.
@@ -892,9 +904,7 @@ pub fn main() -> ExitCode {
             invocation,
             check: true,
         }) => preflight::check_only(&invocation),
-        Ok(Parsed { invocation, .. }) => {
-            preflight::refusal(&invocation).unwrap_or_else(|| run(&invocation))
-        }
+        Ok(Parsed { invocation, .. }) => start(&invocation),
         Err(e) => e.exit(),
     }
 }

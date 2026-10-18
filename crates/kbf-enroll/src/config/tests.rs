@@ -568,3 +568,42 @@ fn hot_and_data_dirs_must_share_a_file_system() {
         );
     }
 }
+
+/// Catches a key that `kbf.toml` puts in `[daemon]` or `[tls]` and that is not enrollment's
+/// being accepted by an enrollment-only file (a typo of `trust` would start the node
+/// with the default), or reported without its table in the key, or only the first of
+/// several reported; and the same file read as a shared one (the flags' parser checks
+/// those keys) being refused.
+#[test]
+fn an_unknown_key_in_daemon_or_tls_is_refused_unless_the_file_is_shared() {
+    let text = format!("{MINIMAL}[daemon]\nbogus = 1\n[tls]\ntrsut = \"pin\"\n");
+    let got: Vec<(String, String)> = problems(&text)
+        .into_iter()
+        .map(|p| (p.key, p.message))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (
+                "daemon.bogus".to_owned(),
+                "unknown field `bogus`".to_owned()
+            ),
+            ("tls.trsut".to_owned(), "unknown field `trsut`".to_owned()),
+        ]
+    );
+    let shared = Config::parse_shared(&text, &host()).unwrap_or_else(|e| panic!("refused: {e}"));
+    assert_eq!(shared.trust, Trust::Pin);
+}
+
+/// Catches `is_own_table` answering for a table the flags also use (`daemon`, `tls`), for
+/// the top level (the empty name) or for a name that is no table of ours: the shared
+/// file's flag check would then refuse a legitimate flag or let a stray table by.
+#[test]
+fn only_a_table_wholly_enrollments_is_its_own() {
+    for own in ["frontend", "enroll", "node", "dirs", "storage"] {
+        assert!(is_own_table(own), "{own}");
+    }
+    for not_own in ["", "daemon", "tls", "no-such-table", "mode"] {
+        assert!(!is_own_table(not_own), "{not_own:?}");
+    }
+}

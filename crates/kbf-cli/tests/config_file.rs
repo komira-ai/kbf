@@ -429,3 +429,72 @@ fn check_file_names_the_file() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
     assert_eq!(config::check_file(&path), Ok(()));
 }
+
+/// Catches `file_mode` taking a `mode` that is not a string (a number, a table) for a mode
+/// or for none, or an unreadable file for a file with no mode: a non-string `mode` is
+/// refused saying it is a string naming one mode; a file whose bytes are not text is
+/// refused as unreadable, naming the file; one with no `mode` answers `None`.
+#[test]
+fn file_mode_reads_a_string_and_refuses_the_rest() {
+    let dir = scratch("file_mode");
+    let path = file(&dir, "mode = 3\n", 0o600);
+    let why = config::file_mode(&path).expect_err("not a string");
+    assert!(
+        why.contains("`mode` is a string naming one mode")
+            && why.contains(&path.display().to_string()),
+        "{why}"
+    );
+    let path = file(&dir, "mode = \"daemon\"\n", 0o600);
+    assert_eq!(config::file_mode(&path), Ok(Some("daemon".to_owned())));
+    let path = file(&dir, "[node]\nid = \"a\"\n", 0o600);
+    assert_eq!(config::file_mode(&path), Ok(None));
+
+    let path = dir.join("kbf.toml");
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, [0xff, 0xfe, 0xfd]).expect("write");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
+    let why = config::file_mode(&path).expect_err("not text");
+    assert!(
+        why.starts_with("cannot read the config file ")
+            && why.contains(&path.display().to_string()),
+        "{why}"
+    );
+    let err = kbf_cli::parse_with(argv(&["kbf", "frontend"], Some(&path)), None).expect_err("bad");
+    assert!(
+        err.to_string().contains("cannot read the config file"),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), 2);
+}
+
+/// Catches enrollment's tables (`[node]`, `[enroll]`, ...) in the shared file being passed
+/// to a mode as flags, or a key of them that enrollment does not read being let by: a
+/// known key rides along without becoming a flag, an unknown one is refused naming
+/// `table.key` and the file, and an enrollment table that is not a table is left to
+/// enrollment's own parser (this one reads no flag from it and does not refuse it).
+#[test]
+fn enrollments_tables_are_in_the_file_but_are_not_flags() {
+    let dir = scratch("own_tables");
+    let with = |extra: &str| file(&dir, &format!("{FRONTEND_FILE}{extra}"), 0o600);
+    let parse = |path: &Path| kbf_cli::parse_with(argv(&["kbf", "frontend"], Some(path)), None);
+
+    let path = with("[node]\nid = \"node-02\"\nzone = \"a\"\n[enroll]\ntoken_file = \"/t\"\n");
+    let parsed = parse(&path).expect("enrollment's known keys are let through");
+    assert_eq!(
+        frontend(&parsed.invocation).server.listen.to_string(),
+        "127.0.0.1:9980"
+    );
+
+    let path = with("[node]\nid = \"node-02\"\nbogus = 1\n");
+    let err = parse(&path).expect_err("unknown key of an enrollment table");
+    let msg = err.to_string();
+    assert!(msg.contains("unknown key `node.bogus`"), "{msg}");
+    assert!(msg.contains("enrollment's table"), "{msg}");
+    assert!(msg.contains(&path.display().to_string()), "{msg}");
+    assert_eq!(err.exit_code(), 2);
+
+    let mut text = String::from("node = 3\n");
+    text.push_str(FRONTEND_FILE);
+    let path = file(&dir, &text, 0o600);
+    parse(&path).expect("a scalar named like an enrollment table is enrollment's to refuse");
+}

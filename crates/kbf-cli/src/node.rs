@@ -58,9 +58,7 @@ use kbf_types::Role;
 use std::path::{Path, PathBuf};
 use tokio::sync::watch;
 
-use crate::enroll::{
-    DEFAULT_CONFIG, Env, Failure, Loaded, Want, anchor, enrolled, ensure_enrolled, load, report,
-};
+use crate::enroll::{Env, Failure, Loaded, Want, anchor, enrolled, ensure_enrolled, load, report};
 use crate::{Invocation, names, parse_with, preflight};
 
 /// The longest the renew loop sleeps at once, in seconds: a wall clock that jumped (a
@@ -80,19 +78,6 @@ pub struct Start {
     pub check: bool,
     /// Labels the daemon half reports to the frontend (`--label`, repeatable), `key=value`.
     pub labels: Vec<String>,
-}
-
-impl Start {
-    /// A start of `mode` (or the file's) on the default `kbf.toml`.
-    #[must_use]
-    pub fn new(mode: Option<&'static str>) -> Self {
-        Self {
-            mode,
-            config: PathBuf::from(DEFAULT_CONFIG),
-            check: false,
-            labels: Vec::new(),
-        }
-    }
 }
 
 /// How the daemon half runs its leases on this platform.
@@ -573,10 +558,7 @@ pub fn run_with(
 #[must_use]
 pub fn run(args: &Start) -> ExitCode {
     // The checks of any start, on the flags the enrollment made.
-    let launch = |invocation: &Invocation| {
-        preflight::refusal(invocation).unwrap_or_else(|| crate::run(invocation))
-    };
-    run_with(args, &Env::system(), Driver::host(), &launch)
+    run_with(args, &Env::system(), Driver::host(), &crate::start)
         .unwrap_or_else(|failure| report(&failure))
 }
 

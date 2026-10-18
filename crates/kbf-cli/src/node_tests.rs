@@ -397,3 +397,31 @@ fn a_nap_is_at_least_a_second_and_at_most_the_cap() {
         Duration::from_millis(10)
     );
 }
+
+/// Catches the system's pause that returns at once (a retry loop that spins on a down
+/// frontend), that gives up (`false` ends the start with the failure it was retrying), or
+/// a clock that is not the system's: the pause waits at least what it was given and says
+/// to go on, and the clock reads the unix time between two reads of the system's.
+#[test]
+fn the_system_env_sleeps_what_it_is_told_and_reads_the_clock() {
+    let env = Env::system();
+    let wait = Duration::from_millis(20);
+    let began = std::time::Instant::now();
+    assert!((env.pause)(wait));
+    assert!(began.elapsed() >= wait, "{:?}", began.elapsed());
+
+    let unix = |at: std::time::SystemTime| {
+        i64::try_from(
+            at.duration_since(std::time::UNIX_EPOCH)
+                .expect("after the epoch")
+                .as_secs(),
+        )
+        .expect("fits")
+    };
+    let before = unix(std::time::SystemTime::now());
+    let read = (env.now)();
+    let after = unix(std::time::SystemTime::now());
+    assert!((before..=after).contains(&read), "{before} {read} {after}");
+    assert!(!env.host.hostname.is_empty());
+    assert!(env.host.cpus >= 1);
+}

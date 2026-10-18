@@ -31,8 +31,18 @@ struct Out {
 }
 
 async fn kbf(args: Vec<String>) -> Out {
+    kbf_with_path(args, None).await
+}
+
+/// `kbf` with `PATH` set to `path` (the host's when `None`).
+async fn kbf_with_path(args: Vec<String>, path: Option<PathBuf>) -> Out {
     tokio::task::spawn_blocking(move || {
-        let out = Command::new(BIN).args(&args).output().expect("run kbf");
+        let mut command = Command::new(BIN);
+        command.args(&args);
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
+        let out = command.output().expect("run kbf");
         Out {
             code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -252,4 +262,32 @@ async fn a_flag_the_mode_refuses_exits_2_with_its_message() {
         root.join("state/pki/node.json").exists(),
         "enrolled all the same"
     );
+}
+
+/// Catches a start that, once enrolled, goes on to run the mode without the host checks (a
+/// daemon on a host with no `podman` would start and fail every lease), or whose checks
+/// are not the mode's: enrolled with the frontend, a daemon whose host has an empty `PATH`
+/// is refused by the startup self-check, exit 2 with `podman is not on PATH` on stderr,
+/// and the node's files were made all the same.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_enrolled_start_runs_the_host_checks_before_the_mode() {
+    let run = fake::start();
+    let root = scratch("process-host-checks");
+    let path = config(&root, run.enroll_addr.port(), "");
+    token(&root, &run.fake.mint(1, 1).to_line());
+    let empty = root.join("no-programs");
+    std::fs::create_dir_all(&empty).expect("empty PATH dir");
+
+    let out = kbf_with_path(args(&["--mode=daemon"], &path), Some(empty)).await;
+
+    assert_eq!(out.code, Some(2), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("podman is not on PATH"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stderr.contains("kbf daemon: "), "{}", out.stderr);
+    assert_eq!(run.fake.enrolls().len(), 1);
+    assert!(root.join("state/pki/node.json").exists());
 }
