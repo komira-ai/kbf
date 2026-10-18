@@ -96,7 +96,7 @@ pub fn is_allowed(a: [u8; 4]) -> bool {
 /// Extensions (compared ignoring ASCII case) of files that may hold a NUL byte; the
 /// scan skips such a file as binary. Any other file holding a NUL byte is refused.
 pub const BINARY_EXTENSIONS: &[&str] = &[
-    "gif", "gz", "ico", "jpeg", "jpg", "pdf", "png", "wasm", "webp", "zip", "zst",
+    "db", "gif", "gz", "ico", "jpeg", "jpg", "pdf", "png", "wasm", "webp", "zip", "zst",
 ];
 
 /// The text of the file at `path` (relative, used for its extension) to scan:
@@ -444,7 +444,12 @@ mod tests {
         for path in ["a.txt", "Makefile", "dir.png/Makefile", "a.png.txt"] {
             assert!(decode(path, bytes).is_err(), "{path}");
         }
-        for path in ["logo.png", "docs/x.PDF", "a.tar.gz"] {
+        for path in [
+            "logo.png",
+            "docs/x.PDF",
+            "a.tar.gz",
+            "tests/golden/state/v1.db",
+        ] {
             assert_eq!(decode(path, bytes), Ok(None), "{path}");
         }
         assert_eq!(decode("a.txt", b"plain"), Ok(Some("plain".to_owned())));
