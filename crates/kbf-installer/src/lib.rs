@@ -60,6 +60,7 @@ pub mod inbox;
 pub mod installer_toml;
 pub mod layout;
 pub mod offer;
+pub mod proxy;
 pub mod record;
 pub mod refusal;
 pub mod release;
