@@ -562,6 +562,46 @@ async fn a_batch_ends_at_its_byte_limit_and_at_a_stream() {
     }
 }
 
+/// Catches a batch with no count bound (one sync and one `PutStaged` listing every blob
+/// waiting, however many) or one that drops the blobs past the bound: 300 small blobs queue
+/// behind a held writer; they are written in a batch of 256 (`BATCH_BLOBS`) and one of 44, so
+/// three syncs in all with the first blob's, and every blob reads back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_ends_at_its_blob_limit() {
+    let rig = Rig::new();
+    let cache = rig.start(1, 1024).await;
+    let lead = TestBlob::new(90, 1000);
+    let record = prepare(&cache, &lead).await.expect("received");
+    rig.fs.pause();
+    let leading = tokio::spawn(record.commit());
+    until("the writer to reach the sync", || rig.fs.waiting() == 1).await;
+    let blobs = support::blobs(100, 300, 100);
+    let mut queued = Vec::new();
+    for blob in &blobs {
+        queued.push(tokio::spawn(
+            prepare(&cache, blob).await.expect("received").commit(),
+        ));
+    }
+    until("300 blobs to queue", || {
+        cache.metrics().write_pool_queue.get() == 300
+    })
+    .await;
+    rig.fs.resume();
+    leading.await.expect("join").expect("committed");
+    for done in queued {
+        done.await.expect("join").expect("committed");
+    }
+    assert_eq!(
+        rig.fs.syncs(),
+        3,
+        "the first, 256 in a batch, 44 in the next"
+    );
+    assert_eq!(rig.log.applied("put_staged"), 3);
+    for blob in &blobs {
+        reads_back(&cache, blob).await;
+    }
+}
+
 /// Catches a full queue that blocks for ever or errors, instead of sending the blob to the
 /// store: one writer held at its sync, a queue of one. The blob in the writer and the
 /// blob queued are staged once it is released. A blob opened when the queue is full goes

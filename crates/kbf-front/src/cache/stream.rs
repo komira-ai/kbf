@@ -272,9 +272,9 @@ impl<M: MetaLog, O: ObjectStore> RecordStream<M, O> {
                 // written, so the blob goes to the store from its first chunk.
                 Err(Refused::NoRoom) => {
                     let size = open.write.size();
-                    let mut to_store = ToStore::start(&self.cache, size).ok_or_else(|| {
-                        CacheError::Invalid("the cache cannot stream this blob".to_owned())
-                    })?;
+                    // The pool runs on the cache's runtime, as does an upload to the store.
+                    let none = CacheError::Invalid("the cache cannot stream this blob".to_owned());
+                    let mut to_store = ToStore::start(&self.cache, size).ok_or(none)?;
                     to_store.append(chunk)?;
                     self.target = Target::Store(to_store);
                     Ok(())

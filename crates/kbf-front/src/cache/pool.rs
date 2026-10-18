@@ -37,7 +37,7 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex, PoisonError, TryLockError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -91,12 +91,6 @@ impl PoolConfig {
     };
 }
 
-impl Default for PoolConfig {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
-
 /// What a writer is asked to do.
 enum Job {
     /// A blob held whole: batched with the others waiting.
@@ -148,6 +142,7 @@ impl WritePool {
     /// started.
     pub(super) fn start<M: MetaLog, O: ObjectStore>(
         writer: Arc<Writer<M, O>>,
+        staging: &Arc<Staging>,
         runtime: tokio::runtime::Handle,
         config: PoolConfig,
     ) -> Option<Self> {
@@ -157,6 +152,7 @@ impl WritePool {
         for n in 0..config.writers.get() {
             let worker = Worker {
                 writer: Arc::clone(&writer),
+                staging: Arc::clone(staging),
                 runtime: runtime.clone(),
                 queued: Arc::clone(&queued),
             };
@@ -180,6 +176,8 @@ impl WritePool {
 /// One writer thread.
 struct Worker<M, O> {
     writer: Arc<Writer<M, O>>,
+    /// The tier the pool writes to.
+    staging: Arc<Staging>,
     runtime: tokio::runtime::Handle,
     queued: Arc<Mutex<Receiver<Job>>>,
 }
@@ -224,10 +222,8 @@ impl<M: MetaLog, O: ObjectStore> Worker<M, O> {
     fn gather(&self, first: Whole) -> (Vec<Whole>, Option<Job>) {
         // Not waited for: a writer idle in `next` holds the lock, and then nothing is
         // queued to gather.
-        let queued = match self.queued.try_lock() {
-            Ok(queued) => queued,
-            Err(TryLockError::Poisoned(p)) => p.into_inner(),
-            Err(TryLockError::WouldBlock) => return (vec![first], None),
+        let Ok(queued) = self.queued.try_lock() else {
+            return (vec![first], None);
         };
         let mut bytes = first.bytes.len() as u64;
         let mut batch = vec![first];
@@ -249,9 +245,7 @@ impl<M: MetaLog, O: ObjectStore> Worker<M, O> {
     /// `PutStaged`, and answers every blob: staged after the commit, or, if the tier did
     /// not take the range, told to go to the store.
     fn stage(&self, batch: Vec<Whole>) {
-        let Some(staging) = self.writer.tier.get() else {
-            return self.send_to_store(batch);
-        };
+        let staging = &self.staging;
         // Equal digests in a batch are written once.
         let mut unique: BTreeMap<Digest, &Bytes> = BTreeMap::new();
         for blob in &batch {
@@ -267,7 +261,7 @@ impl<M: MetaLog, O: ObjectStore> Worker<M, O> {
                 return self.send_to_store(batch);
             }
         };
-        let committed = self.put_staged(staging, synced, listed, false);
+        let committed = self.put_staged(synced, listed, false);
         self.note_files(&*staging.tier);
         for blob in batch {
             let outcome = match &committed {
@@ -311,22 +305,19 @@ impl<M: MetaLog, O: ObjectStore> Worker<M, O> {
     /// One `PutStaged` on the cache's runtime, waited for.
     fn put_staged(
         &self,
-        staging: &Arc<Staging>,
         synced: Synced,
         blobs: Vec<(Digest, u64)>,
         seal: bool,
     ) -> Result<(), CacheError> {
         let (done, answer) = oneshot::channel();
-        let (writer, staging) = (Arc::clone(&self.writer), Arc::clone(staging));
+        let (writer, staging) = (Arc::clone(&self.writer), Arc::clone(&self.staging));
         self.runtime.spawn(async move {
             let put = writer.put_staged(&staging, synced, blobs, seal).await;
             let _ = done.send(put);
         });
-        answer.blocking_recv().unwrap_or_else(|_| {
-            Err(CacheError::Internal(
-                "the runtime stopped before a PutStaged was answered".to_owned(),
-            ))
-        })
+        // The runtime stopped before the commit was answered: nothing is committed.
+        let stopped = CacheError::Internal("the runtime stopped before a commit".to_owned());
+        answer.blocking_recv().unwrap_or(Err(stopped))
     }
 
     /// Streams one blob into the tier as its chunks arrive, holding this writer until it
@@ -338,11 +329,7 @@ impl<M: MetaLog, O: ObjectStore> Worker<M, O> {
             chunks,
             commit,
         } = job;
-        let Some(staging) = self.writer.tier.get() else {
-            self.metrics().write_pool_direct.add(1);
-            let _ = accept.send(false);
-            return;
-        };
+        let staging = &self.staging;
         let tier = &*staging.tier;
         let reserved = match tier.reserve_group(size, Instant::now()) {
             // Too large to share a block: a block of its own, sealed by its commit.
@@ -360,7 +347,7 @@ impl<M: MetaLog, O: ObjectStore> Worker<M, O> {
             }
         };
         let _ = accept.send(true);
-        self.fill(staging, reservation, own, size, chunks, commit);
+        self.fill(reservation, own, chunks, commit);
         self.note_files(tier);
     }
 
@@ -369,16 +356,14 @@ impl<M: MetaLog, O: ObjectStore> Worker<M, O> {
     /// reservation is dropped: answered as failed.
     fn fill(
         &self,
-        staging: &Arc<Staging>,
         reservation: Reservation,
         own: bool,
-        size: u64,
         chunks: Receiver<Bytes>,
         commit: oneshot::Receiver<(Digest, oneshot::Sender<Result<(), CacheError>>)>,
     ) {
         let mut at = 0;
         for chunk in chunks {
-            if let Err(e) = staging.tier.write(&reservation, at, &chunk) {
+            if let Err(e) = self.staging.tier.write(&reservation, at, &chunk) {
                 tracing::warn!(error = %e, "the write pool could not write a streamed blob");
                 return;
             }
@@ -387,29 +372,24 @@ impl<M: MetaLog, O: ObjectStore> Worker<M, O> {
         let Ok((digest, done)) = commit.blocking_recv() else {
             return;
         };
-        let answer = if at == size {
-            self.finish(staging, reservation, own, digest)
-        } else {
-            Err(CacheError::Invalid(format!(
-                "a stream of {at} bytes was committed for {size}"
-            )))
-        };
+        // `RecordStream::finish` checked that the bytes sent are as many as the digest names.
+        let answer = self.finish(reservation, own, digest);
         let _ = done.send(answer);
     }
 
     fn finish(
         &self,
-        staging: &Arc<Staging>,
         reservation: Reservation,
         own: bool,
         digest: Digest,
     ) -> Result<(), CacheError> {
-        let synced = staging
+        let synced = self
+            .staging
             .tier
             .sync(reservation)
             .map_err(|unsynced| CacheError::from(unsynced.error))?;
         let at = synced.offset();
-        self.put_staged(staging, synced, vec![(digest, at)], own)
+        self.put_staged(synced, vec![(digest, at)], own)
     }
 
     fn note_files(&self, tier: &dyn WriteTier) {
@@ -506,10 +486,9 @@ impl PoolWrite {
             Inner::Streaming { chunks, accept, .. } => {
                 let stopped = || Refused::Failed(CacheError::Invalid(STOPPED.to_owned()));
                 if let Some(accept) = accept.take() {
-                    match accept.blocking_recv() {
-                        Ok(true) => {}
-                        Ok(false) => return Err(Refused::NoRoom),
-                        Err(_) => return Err(stopped()),
+                    // A writer that went away without answering took no room either.
+                    if accept.blocking_recv() != Ok(true) {
+                        return Err(Refused::NoRoom);
                     }
                 }
                 chunks
@@ -547,11 +526,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// The pool of this cache's tier, started with the first blob; `None` without a tier
     /// or a runtime, or if no writer thread could be started.
     pub(super) fn write_pool(&self) -> Option<&WritePool> {
-        self.writer.tier.get()?;
+        let staging = self.writer.tier.get()?;
         self.pool
             .get_or_init(|| {
                 let runtime = self.runtime.clone()?;
-                WritePool::start(Arc::clone(&self.writer), runtime, self.pool_config)
+                WritePool::start(Arc::clone(&self.writer), staging, runtime, self.pool_config)
             })
             .as_ref()
     }
@@ -590,9 +569,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         match commit {
             PoolCommit::Stream { commit } => {
                 let (done, answer) = oneshot::channel();
-                let stopped = || CacheError::Invalid(STOPPED.to_owned());
-                commit.send((digest, done)).map_err(|_| stopped())?;
-                answer.await.unwrap_or_else(|_| Err(stopped()))
+                // A writer that is gone drops `done` with the message, and the answer fails.
+                let _ = commit.send((digest, done));
+                let stopped = CacheError::Invalid(STOPPED.to_owned());
+                answer.await.unwrap_or(Err(stopped))
             }
             PoolCommit::Whole { bytes, jobs } => {
                 let (done, answer) = oneshot::channel();
@@ -608,13 +588,12 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                     self.writer.metrics.write_pool_direct.add(1);
                     return self.store_whole(digest, bytes).await;
                 }
-                match answer.await {
-                    Ok(Outcome::Staged) => Ok(()),
-                    Ok(Outcome::NoRoom) => self.store_whole(digest, bytes).await,
-                    Ok(Outcome::Failed(e)) => Err(e),
-                    Err(_) => Err(CacheError::Internal(
-                        "a write pool writer ended before it answered".to_owned(),
-                    )),
+                // A writer that went away without answering stored nothing: the bytes are
+                // still here, and go to the store.
+                match answer.await.unwrap_or(Outcome::NoRoom) {
+                    Outcome::Staged => Ok(()),
+                    Outcome::NoRoom => self.store_whole(digest, bytes).await,
+                    Outcome::Failed(e) => Err(e),
                 }
             }
         }
