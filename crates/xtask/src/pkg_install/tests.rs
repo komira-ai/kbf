@@ -85,6 +85,9 @@ fn entries() -> Vec<Entry> {
         entry_file("/usr/bin/kbf-installer", 0o755, "binary"),
         entry_file("/usr/lib/systemd/system/kbf-node.service", 0o644, "node"),
         entry_file("/usr/lib/systemd/system/kbf.slice", 0o644, "slice"),
+        // A directory a package may own under the unit directory: it is not read for
+        // accounts (it has no bytes).
+        entry_dir("/usr/lib/systemd/system/kbf-node.service.d"),
         entry_dir("/usr/share/kbf-installer"),
     ]
 }
@@ -383,7 +386,11 @@ fn run_with(format: Format, defect: Defect) -> (World, Result<Vec<String>, Error
         .expect("deps")
         .join("xtask-pkg-install-unit");
     std::fs::create_dir_all(&dir).expect("dir");
-    let listing = dir.join(format!("listing-{}.txt", std::process::id()));
+    // One file per call: tests run in parallel threads of one process, and a shared
+    // path is truncated by one while another reads it (an empty listing is no entries).
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let listing = dir.join(format!("listing-{}-{call}.txt", std::process::id()));
     std::fs::write(&listing, pkg::listing(&entries())).expect("listing");
     let world = std::cell::RefCell::new(World::new(defect));
     let gates = gates();
@@ -423,6 +430,25 @@ fn a_package_that_does_everything_the_contract_says_passes_in_both_formats() {
         // Nothing the test runs starts a unit on its own: it only starts the gated ones
         // it asks to.
         assert_eq!(world.started.len(), 2);
+    }
+}
+
+/// Only a packaged unit file is read for the accounts it names: a directory under the
+/// unit directory has no `User=`, and `cat` of it only errors.
+#[test]
+fn the_unit_account_check_reads_unit_files_and_skips_directories() {
+    for format in [Format::Deb, Format::Rpm] {
+        let (world, result) = run_with(format, Defect::None);
+        result.unwrap_or_else(|e| panic!("{format:?}: {e}"));
+        let cats: Vec<&String> = world.log.iter().filter(|l| l.contains(" cat ")).collect();
+        assert_eq!(
+            cats,
+            [
+                "exec c1 cat /usr/lib/systemd/system/kbf-node.service",
+                "exec c1 cat /usr/lib/systemd/system/kbf.slice",
+            ],
+            "{format:?}"
+        );
     }
 }
 
