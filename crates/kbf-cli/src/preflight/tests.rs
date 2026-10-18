@@ -951,6 +951,18 @@ fn a_crun_whose_version_cannot_be_read_is_refused() {
 }
 
 #[test]
+fn a_crun_host_needs_neither_podman_nor_a_runtime_directory() {
+    // Catches: a self-check that still asks for the programs and directory of the
+    // runtime kbf no longer has (`podman` on PATH, a user runtime directory with linger),
+    // refusing every start on a host that has only crun.
+    let mut host = container_host()
+        .without("/usr/bin/podman")
+        .without("/run/user/1000");
+    host.vars.remove("XDG_RUNTIME_DIR");
+    assert_eq!(check(&container_needs(Some(CRUN)), &host), Report::default());
+}
+
+#[test]
 fn podman_as_the_runtime_asks_nothing_of_crun() {
     let host = container_host().without(CRUN);
     assert_eq!(check(&container_needs(None), &host), Report::default());
