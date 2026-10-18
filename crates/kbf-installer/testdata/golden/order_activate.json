@@ -1,0 +1,23 @@
+{
+  "order_id": 42,
+  "epoch": 3,
+  "generation": 17,
+  "verb": "activate",
+  "commit": "0123456789abcdef0123456789abcdef01234567",
+  "window_s": 900,
+  "components": [
+    {
+      "name": "kbf",
+      "sha256": "abababababababababababababababababababababababababababababababab",
+      "size": 52428800,
+      "attestation": "{\"mediaType\":\"application/vnd.dev.sigstore.bundle.v0.3+json\",\"verificationMaterial\":{},\"messageSignature\":{}}"
+    }
+  ],
+  "expected": {
+    "platform": "linux-x86_64",
+    "protocol": 12,
+    "min_protocol": 11,
+    "state_schema": 4,
+    "profile": "release"
+  }
+}

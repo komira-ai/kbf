@@ -2,12 +2,13 @@
 //!
 //! - [`act`]: `kbf-act STEP [; STEP]...`, a fixed set of verbs (exit, sleep, echo,
 //!   append, env, pwd, id, kill-self, spawn-child, run, setsid, alloc, upper,
-//!   rename, symlink, chmod, wait-for, mkdir, cat, mtime, pgid, leads, write-lines,
+//!   rename, symlink, chmod, wait-for, sleep-once, mkdir, cat, mtime, pgid, leads, write-lines,
 //!   copy, remove, mkfifo, truncate, zeros, ignore-signal, test, points-to, holds,
 //!   inode-links) that a test puts in an action's or a child's argv where it would
 //!   have written `sh -c`.
 //! - [`fake`]: the same binary run through a link named `xcrun`, `xcodebuild` or
 //!   `sandbox-exec` answers as that tool, from a rules file the test writes.
+//! - [`port`]: loopback ports a test can rely on (dead ones, and ones held until used).
 //! - [`m2`]: the verbs of `kbf-m2-act`, the program every action of the M2 sample
 //!   project runs (the M2 image has no shell).
 //!
@@ -32,6 +33,7 @@ use std::io::Write;
 pub mod act;
 pub mod fake;
 pub mod m2;
+pub mod port;
 
 /// Why a program here stopped short.
 #[derive(Debug, PartialEq, Eq)]

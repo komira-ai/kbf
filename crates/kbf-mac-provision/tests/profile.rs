@@ -409,7 +409,7 @@ fn an_unknown_key_is_refused() {
     assert_eq!(
         Profile::parse(edited(append("sleep=0")).as_bytes()).unwrap_err(),
         ProfileError::UnknownKey {
-            line: 42,
+            line: 43,
             key: "sleep".into()
         }
     );
@@ -422,7 +422,7 @@ fn a_repeated_key_is_refused() {
     assert_eq!(
         Profile::parse(edited(append("firewall=off")).as_bytes()).unwrap_err(),
         ProfileError::Duplicate {
-            line: 42,
+            line: 43,
             key: "firewall".into()
         }
     );
@@ -469,7 +469,7 @@ fn a_key_with_a_space_or_capital_is_refused() {
         assert_eq!(
             Profile::parse(text.as_bytes()).unwrap_err(),
             ProfileError::UnknownKey {
-                line: 42,
+                line: 43,
                 key: key.into()
             }
         );
@@ -799,24 +799,64 @@ fn args_without_node_label(p: &Profile) -> Vec<String> {
         .collect()
 }
 
-/// Catches: the profile's `kbf_data_dir` not rendered as the daemon's `--data-dir`, or
-/// rendered with the removed `--scratch` or `--cache-dir` (the daemon refuses both).
+/// Catches: the job not running `kbf daemon` (a plist that still says `kbf node`, a mode
+/// that is going away, or `kbf-daemon`, a binary that is not in the package), the flags
+/// not in the Mac kit's order (driver, server, cas, ca-cert, cert, key, node-id, data-dir,
+/// labels), two words in one argument,
+/// the profile's `kbf_data_dir` not rendered as `--data-dir`, or the removed `--scratch`
+/// and `--cache-dir` flags.
 #[test]
-fn kbf_data_dir_renders_data_dir_and_no_removed_flag() {
+fn the_job_runs_kbf_daemon_with_the_kits_flags() {
     let p = Profile::parse(edited(|_| {}).as_bytes()).unwrap();
     assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     let args = kbf_mac_provision::launchd::daemon_args(&p);
-    let at = args.iter().position(|a| a == "--data-dir").unwrap();
-    assert_eq!(args[at + 1], "/Volumes/kbf/data");
+    let label = p.node_label();
+    assert_eq!(
+        args,
+        [
+            "/usr/local/kbf-installer/releases/current/kbf",
+            "daemon",
+            "--driver",
+            "native",
+            "--server",
+            "https://farm.example.net:8981",
+            "--cas",
+            "https://farm.example.net:8981",
+            "--ca-cert",
+            "/usr/local/kbf/etc/ca.pem",
+            "--cert",
+            "/usr/local/kbf/etc/node.pem",
+            "--key",
+            "/usr/local/kbf/etc/node.key",
+            "--node-id",
+            p.get("hostname"),
+            "--data-dir",
+            "/Volumes/kbf/data",
+            "--label",
+            label.as_str(),
+            "--label",
+            "pool=mac",
+            "--label",
+            "rack=r2",
+        ]
+    );
     let plist = kbf_mac_provision::launchd::render_plist(&p);
-    for removed in ["--scratch", "--cache-dir", "--cache-", "--tree-"] {
-        assert!(!plist.contains(removed), "{removed} in\n{plist}");
+    for absent in [
+        "<string>node</string>",
+        "--config",
+        "--scratch",
+        "--cache-dir",
+        "--cache-",
+        "--tree-",
+        "current/kbf-daemon",
+    ] {
+        assert!(!plist.contains(absent), "{absent} in\n{plist}");
     }
 }
 
 /// Catches: the old key `kbf_scratch` refused (a profile written before the rename
 /// would stop provisioning), accepted without a warning, or not treated as
-/// `kbf_data_dir` (the daemon would run without `--data-dir`).
+/// `kbf_data_dir` (the data directory the profile checks would be another key's).
 #[test]
 fn the_old_key_is_accepted_with_a_warning_and_renders_the_same() {
     let new = Profile::parse(edited(|_| {}).as_bytes()).unwrap();
@@ -860,7 +900,7 @@ fn the_old_key_twice_is_a_duplicate() {
     let text = format!("{}kbf_scratch=/Volumes/kbf/x\n", with_old_key());
     assert_eq!(
         refusal(&text),
-        "profile line 42: duplicate key: kbf_scratch"
+        "profile line 43: duplicate key: kbf_scratch"
     );
 }
 

@@ -36,7 +36,7 @@ fn a_result_without_detail_that_is_no_fault_is_answered_internal() {
         memory_runs: Vec::new(),
         farm_runs: Vec::new(),
     };
-    let settled = farm.lock().settle(&answer, None);
+    let settled = farm.lock().settle(&answer);
     assert_eq!(
         settled.finished,
         failed(Code::Internal, "the farm could not run the action")

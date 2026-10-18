@@ -51,7 +51,7 @@ use tonic::{Request, Response, Status};
 
 use super::client::{lift, write_messages};
 use super::{StorageService, catch_up};
-use crate::{Answer, PutStream, ReadStream, Storage, StorageError};
+use crate::{ActionEntry, Answer, PutStream, ReadStream, Storage, StorageError};
 
 /// A node's [`StorageService`], called in-process ([`StorageService::in_process`]). Cheap
 /// to clone.
@@ -111,6 +111,27 @@ impl Called {
         self.this.service.check_map(self.generation).await?;
         Ok(&self.this.service)
     }
+
+    /// [`Storage::put`], or [`Storage::put_unowned`] if `unowned`: hashed here and run
+    /// through the service's write, the same messages a [`super::RemoteStorage`] sends.
+    fn put_as(&self, bytes: Bytes, unowned: bool) -> Answer<'_, Digest> {
+        Box::pin(async move {
+            let digest = kbf_segments::sha256(&bytes);
+            let upload = self.this.uploads.fetch_add(1, Ordering::Relaxed);
+            let name = format!(
+                "uploads/in-process-{upload}/blobs/{}/{}",
+                digest.hash_hex(),
+                digest.size_bytes
+            );
+            let messages = stream::iter(write_messages(name, bytes).map(Ok)).boxed();
+            self.this
+                .service
+                .write_in(self.generation, None, unowned, messages)
+                .await
+                .map_err(|status| lift(&status, None))?;
+            Ok(digest)
+        })
+    }
 }
 
 impl Storage for Called {
@@ -149,27 +170,14 @@ impl Storage for Called {
         })
     }
 
-    /// Hashed here and run through the service's write: the same messages a
-    /// [`super::RemoteStorage`] sends, taken in by the same code.
+    /// Run through the service's write ([`Called::put_as`]).
     fn put(&self, bytes: Bytes) -> Answer<'_, Digest> {
-        Box::pin(async move {
-            let digest = kbf_segments::sha256(&bytes);
-            let upload = self.this.uploads.fetch_add(1, Ordering::Relaxed);
-            let name = format!(
-                "uploads/in-process-{upload}/blobs/{}/{}",
-                digest.hash_hex(),
-                digest.size_bytes
-            );
-            let messages = stream::iter(write_messages(name, bytes).map(Ok)).boxed();
-            self.this
-                .service
-                .write_in(self.generation, None, messages)
-                .await
-                .map_err(|status| lift(&status, None))?;
-            Ok(digest)
-        })
+        self.put_as(bytes, false)
     }
 
+    fn put_unowned(&self, bytes: Bytes) -> Answer<'_, Digest> {
+        self.put_as(bytes, true)
+    }
     /// Always `None`, as a [`super::RemoteStorage`]'s: a streamed write is
     /// [`Storage::put`]'s messages.
     fn stream(&self, _size: u64) -> Option<Box<dyn PutStream>> {
@@ -188,9 +196,18 @@ impl Storage for Called {
         action: &'a Digest,
     ) -> Answer<'a, Option<(Digest, ActionResult)>> {
         Box::pin(async move {
+            Ok(self
+                .action_entry(action)
+                .await?
+                .map(|entry| (entry.result_digest, entry.result)))
+        })
+    }
+
+    fn action_entry<'a>(&'a self, action: &'a Digest) -> Answer<'a, Option<ActionEntry>> {
+        Box::pin(async move {
             let service = self.judged().await?;
             let catching_up = service.catching_up();
-            let entry = service.storage.action_result(action).await?;
+            let entry = service.storage.action_entry(action).await?;
             match catch_up::entry_miss(catching_up, entry.is_some(), action) {
                 Some(status) => Err(lift(&status, None)),
                 None => Ok(entry),

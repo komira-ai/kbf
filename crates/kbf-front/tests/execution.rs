@@ -409,7 +409,7 @@ async fn closing_ends_open_streams_unavailable() {
     assert_eq!(gone.code(), Code::Unavailable, "{gone:?}");
 }
 
-/// Catches (komira-build-farm#791): a drain that ends open streams (Buck2 does not
+/// Catches (kbf#791): a drain that ends open streams (Buck2 does not
 /// recover a broken Execute stream, so every action in flight would fail) instead of
 /// leaving them open until their action is done; a drain that lets a new Execute in;
 /// and a drain that refuses a WaitExecution on an operation still running. The
@@ -498,7 +498,7 @@ impl Dispatch for Gated {
 /// Catches an Execute that passed the drain check and is then refused, or ended, by a
 /// drain that began while its `submit` was running: the call was taken before the
 /// drain, so its stream is kept until its action is done, like every stream open at the
-/// drain (komira-build-farm#791: Buck2 does not recover a stream that breaks). The
+/// drain (kbf#791: Buck2 does not recover a stream that breaks). The
 /// drain begins, and the next Execute is refused, while the first is inside `submit`.
 /// Mutant: a second `closing.draining()` check after `submit` (returning UNAVAILABLE)
 /// fails the first `expect` below. `Dispatch::submit` is synchronous, so the test needs

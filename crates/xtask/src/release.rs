@@ -14,13 +14,16 @@
 //!   with the base commit and the pull request's merge commit, so a check that accepts
 //!   every commit (or none) fails there instead of at a release.
 //! - `release check <dir> --commit <sha>` ([`check`]): `<dir>` passes `verify-assets
-//!   sums`, and every file `SHA256SUMS` lists is `<binary>-<sha>-<platform>.tar.gz` or
-//!   `.cdx.json`: the assets of that commit and no other.
+//!   sums`, every file `SHA256SUMS` lists is `<binary>-<sha>-<platform>.tar.gz` or
+//!   `.cdx.json`: the assets of that commit and no other, and each tarball has exactly
+//!   one provenance bundle, `<tarball>.sigstore.json`, whose one subject is that
+//!   tarball's digest ([`bundles`]), and no bundle is there for anything else.
 //! - `release publish <dir> --repo <owner/repo> --tag <tag> --commit <sha> --run-id <id>
 //!   [--gh <program>]` ([`publish`]): `check`, then creates release `<tag>` with every
-//!   file of `<dir>`. When the release exists, every asset it holds must be one of
-//!   these files, byte for byte, or nothing is changed; the files it lacks are
-//!   uploaded. A re-run therefore creates no second release and replaces no asset.
+//!   file of `<dir>` (the bundles beside their tarballs). When the release exists,
+//!   every asset it holds must be one of these files, byte for byte, or nothing is
+//!   changed; the files it lacks are uploaded. A re-run therefore creates no second
+//!   release and replaces no asset.
 
 use std::io::Write;
 use std::path::Path;
@@ -29,7 +32,8 @@ use std::process::Command;
 use serde_json::Value;
 
 use crate::Error;
-use crate::build_commit::is_commit;
+use crate::build_commit::full_commit;
+use crate::bundles;
 use crate::fetch::Sha256;
 use crate::package::{Platform, read};
 use crate::sums::{self, SUMS};
@@ -40,23 +44,16 @@ pub const MAIN: &str = "main";
 /// The workflow whose push runs on `main` build and attest the assets.
 pub const ARTIFACTS_WORKFLOW: &str = "artifacts.yml";
 
-/// The artifacts such a run leaves, all of which a release needs.
-pub const ARTIFACTS: [&str; 4] = [
+/// The artifacts such a run leaves, all of which a release needs: the files, the sums,
+/// and the provenance bundles of each platform group's tarballs (the `attest-*` jobs').
+pub const ARTIFACTS: [&str; 6] = [
     "assets-darwin-arm64",
     "assets-linux-x86_64",
     "assets-linux-arm64",
     "sha256sums",
+    "bundles-darwin-arm64",
+    "bundles-linux",
 ];
-
-/// A full commit SHA, or a usage error naming the flag.
-fn full_commit(flag: &str, commit: &str) -> Result<(), Error> {
-    if commit.len() == 40 && is_commit(commit) {
-        return Ok(());
-    }
-    Err(Error::Usage(format!(
-        "{flag} {commit:?} is not a full commit SHA (40 lowercase hex digits)"
-    )))
-}
 
 /// `gh api <path>`: the JSON it printed, or `None` when GitHub answered 404.
 fn api(gh: &Path, path: &str) -> Result<Option<Value>, Error> {
@@ -198,7 +195,7 @@ fn is_asset_of(name: &str, commit: &str) -> bool {
 }
 
 /// The `release check` verb: the lines to print, then every file name of `dir`
-/// (`SHA256SUMS` first).
+/// (`SHA256SUMS` first, then the listed files, then the bundles).
 fn checked(dir: &Path, commit: &str) -> Result<(Vec<String>, Vec<String>), Error> {
     full_commit("--commit", commit)?;
     let sums_line = sums::verify_sums(dir, Sha256::of)?;
@@ -211,11 +208,25 @@ fn checked(dir: &Path, commit: &str) -> Result<(Vec<String>, Vec<String>), Error
     if !foreign.is_empty() {
         return Err(Error::Refused(foreign));
     }
+    let unpaired = bundles::pairing(dir, &lines)?;
+    if !unpaired.is_empty() {
+        return Err(Error::Refused(unpaired));
+    }
     let mut names = vec![SUMS.to_owned()];
-    names.extend(lines.into_iter().map(|l| l.name));
+    names.extend(lines.iter().map(|l| l.name.clone()));
+    let tarballs: Vec<&str> = lines
+        .iter()
+        .map(|l| l.name.as_str())
+        .filter(|n| n.ends_with(".tar.gz"))
+        .collect();
+    names.extend(tarballs.iter().map(|t| bundles::name_of(t)));
     let printed = vec![
         sums_line,
         format!("names: every listed file is an asset of {commit}"),
+        format!(
+            "bundles: each of the {} tarballs has one provenance bundle",
+            tarballs.len()
+        ),
     ];
     Ok((printed, names))
 }
@@ -242,7 +253,8 @@ pub struct Release<'a> {
 }
 
 impl Release<'_> {
-    /// The release's notes: where the files come from, and how to verify one.
+    /// The release's notes: where the files come from, and how to verify one, online
+    /// and (for a tarball) offline with the bundle released beside it.
     fn notes(&self) -> String {
         let repo = self.repo;
         format!(
@@ -251,9 +263,18 @@ impl Release<'_> {
              rebuilds nothing.\n\nVerify an asset before use:\n\n```text\ngh attestation \
              verify <asset> --repo {repo} --signer-workflow \
              {repo}/.github/workflows/{ARTIFACTS_WORKFLOW} --source-ref refs/heads/{MAIN} \
-             --deny-self-hosted-runners\n```\n",
+             --deny-self-hosted-runners\n```\n\nEach tarball also has its provenance bundle, \
+             `<asset>{SUFFIX}`, which verifies it with no network but a trusted root \
+             (`gh attestation trusted-root > trusted_root.jsonl`):\n\n```text\ngh attestation \
+             verify <asset> --bundle <asset>{SUFFIX} --custom-trusted-root trusted_root.jsonl \
+             --repo {repo} --signer-workflow {repo}/.github/workflows/{ARTIFACTS_WORKFLOW} \
+             --cert-oidc-issuer {ISSUER} --source-ref refs/heads/{MAIN} --source-digest \
+             {commit} --predicate-type {PROVENANCE} --deny-self-hosted-runners\n```\n",
             id = self.run_id,
             commit = self.commit,
+            SUFFIX = bundles::SUFFIX,
+            ISSUER = bundles::ISSUER,
+            PROVENANCE = bundles::PROVENANCE,
         )
     }
 }

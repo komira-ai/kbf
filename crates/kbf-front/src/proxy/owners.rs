@@ -4,7 +4,8 @@
 //! of a digest are the ones the map names for it, and the whole-blob calls
 //! ([`Owners::read_blob`], [`Owners::put`], [`Owners::find_missing`],
 //! [`Owners::action_result`]) are the router's, with its generation tag, `STALE_MAP`
-//! rule, digest check and failover. The list is the fallback while the map has fewer
+//! rule, digest check and failover (a write goes on to the blob's next write owner when the
+//! first cannot be reached; [`Owners::writer_after`] is that for the raw upload). The list is the fallback while the map has fewer
 //! than two members yet ([`Routed::active`]).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,6 +46,15 @@ impl Owner {
             storage: RemoteStorage::new(channel.clone(), generation),
             channel,
             generation,
+        }
+    }
+
+    /// The node, tagged with map `generation` from now on (on every clone of it).
+    fn tagged(&self, generation: u64) -> Self {
+        self.storage.set_map_generation(generation);
+        Self {
+            generation,
+            ..self.clone()
         }
     }
 
@@ -107,13 +117,20 @@ impl Owners {
         self.routed.as_deref().filter(|routed| routed.active())
     }
 
+    /// The fixed list, each node tagged with the generation of the map held when there is
+    /// a map to read it from: a node that holds a map refuses a call tagged 0.
     fn fixed(&self) -> Arc<[Owner]> {
-        Arc::clone(
+        let nodes = Arc::clone(
             &self
                 .nodes
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+        );
+        let Some(routed) = &self.routed else {
+            return nodes;
+        };
+        let generation = routed.bootstrap_generation();
+        nodes.iter().map(|owner| owner.tagged(generation)).collect()
     }
 
     /// The nodes that hold `digest`, in the order a read tries them: the map's, this
@@ -139,13 +156,33 @@ impl Owners {
     /// (not necessarily the first a read asks), or the first of the fixed list. UNAVAILABLE
     /// when there is none.
     pub(super) fn writer(&self, digest: &Digest) -> Result<Owner, Status> {
+        self.writer_after(digest, &[])
+    }
+
+    /// [`Owners::writer`] for an upload that has failed to reach the nodes `failed`: the
+    /// first of the map's write owners that is not down and not one of them, which is
+    /// where the router sends a write after its first owner cannot be reached
+    /// ([`kbf_route::Router::put`]). UNAVAILABLE when there is none. Only a routed farm
+    /// has a next owner: a fixed list of nodes is not a placement, and what one node of it
+    /// holds another may not.
+    pub(super) fn writer_after(
+        &self,
+        digest: &Digest,
+        failed: &[Arc<str>],
+    ) -> Result<Owner, Status> {
         let Some(routed) = self.routing() else {
-            return self.fixed().first().cloned().ok_or_else(no_storage);
+            return match failed {
+                [] => self.fixed().first().cloned().ok_or_else(no_storage),
+                _ => Err(no_storage()),
+            };
         };
         let placement = routed.place(digest)?;
         placement
-            .write
-            .and_then(|member| owner_of(routed, &member, placement.generation))
+            .writers
+            .iter()
+            .filter(|member| !failed.iter().any(|id| **id == *member.id.to_string()))
+            // A member whose address is not one is passed over, as the router's write does.
+            .find_map(|member| owner_of(routed, member, placement.generation))
             .ok_or_else(no_storage)
     }
 

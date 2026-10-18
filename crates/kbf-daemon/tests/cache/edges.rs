@@ -74,7 +74,6 @@ fn directories_the_cache_cannot_own_are_refused() {
         (Disabled::Locked, "locked"),
         (Disabled::NoBudget, "no-budget"),
         (Disabled::NativeSameUid, "native-same-uid"),
-        (Disabled::GraphDriver("fuse".into()), "graph-driver"),
     ] {
         assert_eq!(disabled.reason(), word);
         assert!(disabled.to_string().starts_with(word), "{disabled}");
@@ -345,6 +344,33 @@ fn snapshots_and_passes_repeat_on_their_intervals() {
     let started = Instant::now();
     stop(cache, &gates);
     assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// Catches a snapshot tick that starts a pass, and a loop that does not come round
+/// to wait again after a tick: with snapshots a few milliseconds apart and the next
+/// pass an hour away, the thread passes once (at the start), then writes more
+/// snapshots than the start and that pass account for (at most three), so it came
+/// round the loop at least once more with the next pass not due, and listed the
+/// directories no second time. Nothing here depends on how late a thread wakes: the
+/// pass is never due again, however slow the machine.
+#[test]
+fn a_snapshot_tick_comes_round_the_loop_without_a_pass() {
+    let dir = scratch("cache-tick-only");
+    let gates = Gates::running();
+    let mut config = config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(1000));
+    config.snapshot_every = Duration::from_millis(5);
+    config.pass_every = Duration::from_secs(3600);
+    let cache = Cache::open(config).expect("open");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    // The start's snapshot, the pass's, and at most one tick in the first round make
+    // three: a fourth is a tick in a later round.
+    while cache.stats().snapshots < 4 {
+        assert!(Instant::now() < deadline, "{:?}", cache.stats());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let listed = gates.points().iter().filter(|p| *p == "Listed(0)").count();
+    assert_eq!(listed, 1, "{:?}", gates.points());
+    stop(cache, &gates);
 }
 
 /// Catches a stop that waits for a pass's pause between directories, a second stop

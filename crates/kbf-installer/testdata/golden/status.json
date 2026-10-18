@@ -1,0 +1,29 @@
+{
+  "schema": 2,
+  "installed_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "previous_commit": "cccccccccccccccccccccccccccccccccccccccc",
+  "staged_commit": "0123456789abcdef0123456789abcdef01234567",
+  "state": "activated_unconfirmed",
+  "refusal": {
+    "word": "attestation",
+    "reason": "no valid attestation for kbf at commit 0123456789ab"
+  },
+  "acked_order_id": 41,
+  "staged": {
+    "protocol": 12,
+    "min_protocol": 11,
+    "state_schema": 4
+  },
+  "probe": {
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "platform": "linux-x86_64",
+    "protocol": 12,
+    "min_protocol": 11,
+    "state_schema": 4,
+    "profile": "release"
+  },
+  "trust_days_left": 120,
+  "unverified": [
+    "cccccccccccccccccccccccccccccccccccccccc"
+  ]
+}

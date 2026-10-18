@@ -92,13 +92,13 @@ pub(super) struct Malformed(pub(super) String);
 
 /// The failures found so far.
 #[derive(Default)]
-struct Checker {
-    failures: Vec<CheckFailure>,
+pub(super) struct Checker {
+    pub(super) failures: Vec<CheckFailure>,
 }
 
 impl Checker {
     /// Record `failure()` unless `ok`; return `ok`.
-    fn require(&mut self, ok: bool, failure: impl FnOnce() -> CheckFailure) -> bool {
+    pub(super) fn require(&mut self, ok: bool, failure: impl FnOnce() -> CheckFailure) -> bool {
         if !ok {
             self.failures.push(failure());
         }
@@ -109,12 +109,12 @@ impl Checker {
 static NULL: Value = Value::Null;
 
 /// `v` as a list; anything else is an empty one.
-fn list(v: &Value) -> &[Value] {
+pub(super) fn list(v: &Value) -> &[Value] {
     v.as_array().map_or(&[], Vec::as_slice)
 }
 
 /// `v` for a message: a string as itself, anything else as JSON.
-fn text(v: &Value) -> String {
+pub(super) fn text(v: &Value) -> String {
     v.as_str().map_or_else(|| v.to_string(), str::to_owned)
 }
 
@@ -178,7 +178,9 @@ pub(super) fn show(d: Duration) -> String {
 
 /// A name-keyed view of a list, as a Python dict built from it: the first position of
 /// each name, holding the last item with that name.
-fn by_name<'a>(items: impl Iterator<Item = (&'a Value, &'a Value)>) -> Vec<(&'a Value, &'a Value)> {
+pub(super) fn by_name<'a>(
+    items: impl Iterator<Item = (&'a Value, &'a Value)>,
+) -> Vec<(&'a Value, &'a Value)> {
     let mut out: Vec<(&Value, &Value)> = Vec::new();
     for (k, v) in items {
         match out.iter_mut().find(|(seen, _)| *seen == k) {
@@ -189,7 +191,7 @@ fn by_name<'a>(items: impl Iterator<Item = (&'a Value, &'a Value)>) -> Vec<(&'a 
     out
 }
 
-fn get<'a>(dict: &[(&Value, &'a Value)], key: &Value) -> Option<&'a Value> {
+pub(super) fn get<'a>(dict: &[(&Value, &'a Value)], key: &Value) -> Option<&'a Value> {
     dict.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
 }
 
@@ -409,7 +411,7 @@ fn check_netpol(
 
 /// A stream's whole life must not be bounded: `max_stream_duration` absent or 0 in
 /// `opts` (an HttpProtocolOptions or a RouteAction's MaxStreamDuration).
-fn unbounded(c: &mut Checker, opts: &Value, at: &str) -> Result<(), Malformed> {
+pub(super) fn unbounded(c: &mut Checker, opts: &Value, at: &str) -> Result<(), Malformed> {
     let d = &opts["max_stream_duration"];
     let ok = d.is_null() || duration(d)?.is_zero();
     c.require(ok, || CheckFailure::MaxStreamDuration {
@@ -422,7 +424,10 @@ fn unbounded(c: &mut Checker, opts: &Value, at: &str) -> Result<(), Malformed> {
 /// Envoy's route choice for a gRPC call on `path`: the first route whose match takes
 /// it. Exact for a match on `path` or `prefix` only; the route-match check refuses any
 /// other key.
-fn first_route<'a>(routes: &'a [Value], path: &str) -> Result<Option<&'a Value>, Malformed> {
+pub(super) fn first_route<'a>(
+    routes: &'a [Value],
+    path: &str,
+) -> Result<Option<&'a Value>, Malformed> {
     for r in routes {
         let m = &r["match"];
         if m["path"] == path {
@@ -487,6 +492,22 @@ fn check_envoy(
     c.require(!truthy(&chain["transport_socket"]), || {
         CheckFailure::ListenerPlaintext
     });
+    let used = check_hcm(c, hcm, &clusters)?;
+    for (name, cl) in &clusters {
+        if used.contains(&name.to_string()) {
+            check_cluster(c, cl, &text(name), ca_file)?;
+        }
+    }
+    Ok(())
+}
+
+/// The connection manager `hcm`, its routes and the stream bounds every method of
+/// [`METHODS`] meets; the names of the clusters the routes use.
+pub(super) fn check_hcm(
+    c: &mut Checker,
+    hcm: &Value,
+    clusters: &[(&Value, &Value)],
+) -> Result<BTreeSet<String>, Malformed> {
     let codec = hcm.get("codec_type");
     let h2 = codec.is_none_or(|v| *v == "AUTO" || *v == "HTTP2");
     c.require(h2, || CheckFailure::Codec {
@@ -529,7 +550,7 @@ fn check_envoy(
         };
         let action = &r["route"];
         let cluster = &action["cluster"];
-        let defined = get(&clusters, cluster).is_some();
+        let defined = get(clusters, cluster).is_some();
         if defined {
             used.insert(cluster.to_string());
         }
@@ -549,23 +570,16 @@ fn check_envoy(
             secs: show(timeout),
         });
         unbounded(c, &action["max_stream_duration"], &path)?;
-        let idle = match action.get("idle_timeout") {
-            Some(d) => duration(d)?,
-            None => idle,
-        };
+        let route_idle = action.get("idle_timeout").map(duration).transpose()?;
+        let idle = route_idle.unwrap_or(idle);
         c.require(idle.is_zero() || idle > SILENT, || {
             CheckFailure::IdleTimeout {
-                path,
+                path: path.clone(),
                 secs: show(idle),
             }
         });
     }
-    for (name, cl) in &clusters {
-        if used.contains(&name.to_string()) {
-            check_cluster(c, cl, &text(name), ca_file)?;
-        }
-    }
-    Ok(())
+    Ok(used)
 }
 
 /// A route matches on `path` or `prefix` alone, is not a catch-all, and its action
@@ -595,7 +609,7 @@ fn check_route_shape(c: &mut Checker, r: &Value) {
 /// A cluster a route uses: health-checked by grpc.health.v1 on a name kbf-server
 /// answers, never sending to an unhealthy server, HTTP/2 over TLS to the mounted CA,
 /// each server's name checked.
-fn check_cluster(
+pub(super) fn check_cluster(
     c: &mut Checker,
     cl: &Value,
     name: &str,
@@ -655,6 +669,7 @@ fn check_cluster(
         cluster: cluster(),
     });
     for e in eps {
+        // The front dials each server by the name it checks.
         let host = &e["endpoint"]["address"]["socket_address"]["address"];
         let criteria = &e["metadata"]["filter_metadata"]["envoy.transport_socket_match"];
         let m = matches
@@ -673,7 +688,13 @@ fn check_cluster(
 
 /// A transport socket of the hop to the servers: TLS that trusts the mounted CA and
 /// offers h2; for one server (`host`), its SNI and the certificate's name too.
-fn tls(c: &mut Checker, ts: &Value, at: &str, ca_file: Option<&str>, host: Option<&Value>) {
+pub(super) fn tls(
+    c: &mut Checker,
+    ts: &Value,
+    at: &str,
+    ca_file: Option<&str>,
+    host: Option<&Value>,
+) {
     let tc = &ts["typed_config"];
     if !c.require(tc["@type"] == UPSTREAM_TLS, || CheckFailure::UpstreamTls {
         at: at.to_owned(),

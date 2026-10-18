@@ -4,7 +4,7 @@
 //! CAS reads and writes, FindMissing, the action cache and the `Segments` service, over
 //! one store. Today the one implementation is `kbf-front`'s adapter over its own cache
 //! (`kbf_front::CacheStorage`), and `kbf-server`'s in-process store
-//! (`kbf_server::LocalStore`, what `kbf-all-in-one`'s daemon reads and writes through)
+//! (`kbf_server::LocalStore`, what `kbf all-in-one`'s daemon reads and writes through)
 //! holds an `Arc<dyn Storage>`. The cache's code moves into this crate later; the trait
 //! is the boundary it moves behind, so the callers do not change when it does. A storage
 //! process of its own serves one over gRPC, and [`service::RemoteStorage`] is the
@@ -45,6 +45,19 @@ use tonic::metadata::MetadataValue;
 
 /// The answer of a [`Storage`] call.
 pub type Answer<'a, T> = BoxFuture<'a, Result<T, StorageError>>;
+
+/// An action-cache hit as [`Storage::action_entry`] answers it.
+#[derive(Clone, Debug)]
+pub struct ActionEntry {
+    /// The digest of the blob the result was read from.
+    pub result_digest: Digest,
+    /// The result.
+    pub result: ActionResult,
+    /// The blobs the entry needs besides the result blob. `None`: the storage did not
+    /// report them (a node from before the field existed), so they are unchecked; `Some`
+    /// of an empty list is an entry that needs nothing else.
+    pub closure: Option<Vec<Digest>>,
+}
 
 /// The bytes of a ranged read ([`Storage::read_range`]), in order, in chunks of at most
 /// [`READ_CHUNK_BYTES`]. An item is an error if the read failed after the answer began;
@@ -115,6 +128,19 @@ pub trait Storage: Send + Sync {
     /// store failed.
     fn put(&self, bytes: Bytes) -> Answer<'_, Digest>;
 
+    /// [`Storage::put`] of a copy the caller needs on this node although the map does not
+    /// place the blob here: the blobs of an action-cache entry, which the node checks
+    /// against what it holds itself. A node that serves a chain stores the blob as one
+    /// copy (nothing is forwarded, nobody owes a replica) where [`Storage::put`] would be
+    /// refused as not the primary; a node that is one of the blob's write owners treats it
+    /// as [`Storage::put`]. The default is [`Storage::put`].
+    ///
+    /// # Errors
+    /// As [`Storage::put`].
+    fn put_unowned(&self, bytes: Bytes) -> Answer<'_, Digest> {
+        self.put(bytes)
+    }
+
     /// A stream for one blob of `size` bytes, written as its bytes arrive and never
     /// held whole in memory: [`PutStream::append`] each chunk, [`PutStream::finish`]
     /// with the digest and CRC-32C, then [`StreamedPut::commit`]. `None` only when the
@@ -165,6 +191,26 @@ pub trait Storage: Send + Sync {
         &'a self,
         action: &'a Digest,
     ) -> Answer<'a, Option<(Digest, ActionResult)>>;
+
+    /// [`Storage::action_result`] with the entry's closure: the blobs the entry needs
+    /// besides its result blob, so a caller can check each is still held where it
+    /// belongs. The default answers [`Storage::action_result`] with `closure: None`
+    /// ("not reported"), which a caller serves as it always did.
+    ///
+    /// # Errors
+    /// The store could not answer.
+    fn action_entry<'a>(&'a self, action: &'a Digest) -> Answer<'a, Option<ActionEntry>> {
+        Box::pin(async move {
+            Ok(self
+                .action_result(action)
+                .await?
+                .map(|(result_digest, result)| ActionEntry {
+                    result_digest,
+                    result,
+                    closure: None,
+                }))
+        })
+    }
 
     /// The first half of an action-cache write: the closure of `result`, every blob of
     /// it checked held, and `result` stored as a blob. The action cache is not touched.

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 /// The program (its file name) and first argument an `ExecStart=` starts when the unit
 /// runs a frontend: the server binary, the `kbf` frontend and all-in-one modes, and the
 /// pilot unit's placeholder for the server command it renders. Matched word by word, not
-/// as a substring: the storage unit's `--hot-store=file:///var/lib/kbf-server/hot`
+/// as a substring: the storage unit's `--meta-dir=/var/lib/kbf-server/raft`
 /// names `kbf-server` too.
 const FRONTENDS: [(&str, Option<&str>); 4] = [
     ("kbf-server", None),
@@ -56,7 +56,7 @@ fn starts_frontend(unit: &str) -> bool {
 /// Catches a frontend unit template (or its golden) that lets systemd kill a drain: the
 /// pilot template's `TimeoutStopSec=20`, a template with no stop timeout set (the
 /// default is 90 s), and a new frontend unit added without it. Mutants: the line removed
-/// from any of the four templates, or set to a number. The expected four also keep this
+/// from any of the templates, or set to a number. The expected four also keep this
 /// from passing with nothing to check.
 #[test]
 fn every_frontend_unit_template_waits_for_its_drain() {
@@ -91,8 +91,6 @@ fn every_frontend_unit_template_waits_for_its_drain() {
             "kbf-frontend@.service",
             "kbf-frontend@.service",
             "kbf-pilot-server.service",
-            "kbf-server.service",
-            "kbf-server.service",
         ]
     );
 }
