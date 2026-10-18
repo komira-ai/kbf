@@ -17,7 +17,7 @@ use kbf_update::{Facts, Locator, OrderRecord, Verb};
 
 use crate::frontend::pending::Instance;
 use crate::frontend::probe::HandoverProbe;
-use crate::frontend::{EnvoyGate, Frontend, FrontendConfig};
+use crate::frontend::{Frontend, FrontendConfig};
 use crate::helper::cycle::{Config, Helper};
 use crate::helper::fetcher::fake::FakeFetcher;
 use crate::helper::leases::fake::FakeLeases;
@@ -260,16 +260,6 @@ impl SimExec {
     }
 }
 
-/// An Envoy gate a test sets.
-#[derive(Clone)]
-pub struct FakeGate(pub Rc<RefCell<Result<(), String>>>);
-
-impl EnvoyGate for FakeGate {
-    fn check(&self) -> Result<(), String> {
-        self.0.borrow().clone()
-    }
-}
-
 /// A handover probe a test sets: the answer for a release's binary and for a slot's.
 #[derive(Clone)]
 pub struct FakeProbe {
@@ -330,7 +320,6 @@ pub struct World {
     pub kill_at: Rc<Cell<usize>>,
     pub fetcher: FakeFetcher,
     pub leases: FakeLeases,
-    pub gate: FakeGate,
     pub probe: FakeProbe,
 }
 
@@ -368,7 +357,6 @@ impl World {
         World {
             fetcher: FakeFetcher::new(&layout),
             leases: FakeLeases::default(),
-            gate: FakeGate(Rc::new(RefCell::new(Ok(())))),
             probe: FakeProbe {
                 new: Rc::new(RefCell::new(Ok(1))),
                 old: Rc::new(RefCell::new(Ok(1))),
@@ -407,7 +395,6 @@ impl World {
         )
         .with_frontend(Frontend::new(
             cfg(),
-            Box::new(self.gate.clone()),
             Box::new(self.probe.clone()),
         ))
     }

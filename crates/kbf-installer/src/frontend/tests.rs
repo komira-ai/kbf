@@ -449,17 +449,12 @@ fn a_record_while_one_is_in_flight_is_refused_and_does_not_disturb_it() {
 /// stable word, the record is acknowledged and gone, no unit is started, no slot moves, and
 /// no pending record is written.
 ///
-/// Mutants planted: the Envoy gate not asked; the protocol comparison dropped; the
+/// Mutants planted: the protocol comparison dropped; the
 /// systemd/hint comparison dropped; the down check dropped; the node-trial check dropped.
 #[test]
 fn a_refused_update_changes_nothing() {
     type Setup = fn(&World);
     let cases: Vec<(&str, Setup, &str)> = vec![
-        (
-            "envoy",
-            |w| *w.gate.0.borrow_mut() = Err("envoy 1.30 is below 1.38".to_owned()),
-            "envoy_range: envoy 1.30",
-        ),
         (
             "protocol",
             |w| *w.probe.new.borrow_mut() = Ok(2),
@@ -866,19 +861,6 @@ fn the_window_is_the_records_inside_the_hosts_bounds() {
             "asked {asked}"
         );
     }
-}
-
-/// Catches an Envoy gate that is not there being treated as one that passed: the gate used
-/// until the Envoy check is wired refuses, with a reason that says so.
-#[test]
-fn the_gate_that_is_not_wired_refuses() {
-    use super::EnvoyGate;
-    assert!(
-        super::NotWired
-            .check()
-            .expect_err("refuses")
-            .contains("no Envoy check")
-    );
 }
 
 /// Catches a new instance that is still coming up (`activating`) being counted as ready or

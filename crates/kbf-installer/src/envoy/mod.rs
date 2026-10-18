@@ -1,5 +1,6 @@
-//! The Envoy of a frontend host: render its two files, check them, and write them for the
-//! installer's frontend-update path to hand to `kbf-envoy@`.
+//! An example Envoy config for a frontend host: render its two files, check them, and write
+//! them, for the operator to start an Envoy from once. The load balancer is the operator's:
+//! the frontend update never calls this module and never edits, reloads or restarts one.
 //!
 //! One Envoy in front of two kbf instances, `a` and `b`, both listed for ever in a static
 //! config. [`render`] turns [`BoxSettings`] (the ports, files and limits the host already

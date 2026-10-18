@@ -137,17 +137,11 @@ fn run(root: PathBuf, args: RunArgs) -> Result<(), String> {
             looks: args.frontend_looks,
             revert_bound_s: args.frontend_revert_bound_secs,
         };
-        // The Envoy check is wired by a later change; until then a frontend update is refused
-        // (`envoy_range`) rather than started in front of an Envoy nobody looked at.
         let probe = RunnerProbe {
             runner: SystemRunner,
             platform: Platform::current(),
         };
-        helper = helper.with_frontend(Frontend::new(
-            cfg,
-            Box::new(frontend::NotWired),
-            Box::new(probe),
-        ));
+        helper = helper.with_frontend(Frontend::new(cfg, Box::new(probe)));
     }
     helper.recover().map_err(|e| e.to_string())?;
     let mut left = args.passes;

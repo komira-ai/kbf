@@ -7,11 +7,9 @@
 //! 1. one update at a time: a record is refused (`frontend_busy`) while one is in flight or
 //!    while either unit is changing or both are running (the old instance of an earlier
 //!    update is still draining), and never queued; a node release on trial refuses it too;
-//! 2. the installed Envoy must be fit ([`EnvoyGate`]; `envoy_range` otherwise); nothing is
-//!    rendered or restarted: both instances are in the rendered config already;
-//! 3. the release is fetched and verified by the [`Fetcher`] the node path uses, and its
+//! 2. the release is fetched and verified by the [`Fetcher`] the node path uses, and its
 //!    handover protocol must equal the serving instance's, or nothing is started;
-//! 4. the idle instance is the other one than the serving one, checked against systemd
+//! 3. the idle instance is the other one than the serving one, checked against systemd
 //!    (the state file is a hint, systemd is the fact; a disagreement is refused and
 //!    reported). The pending record is written first, then `slots/<idle>` is pointed at the
 //!    new release, then the idle unit is started.
@@ -31,6 +29,12 @@
 //!   (it ends its relays once the new one is gone) and started again, a cold start with a new
 //!   epoch, and waited for. If it will not stop or come back within the bound the update is
 //!   [`Progress::NeedsOperator`] and nothing is killed.
+//!
+//! The load balancer in front of the two instances is the operator's, set up once with both
+//! instances' ports and an active health check on each one's `/readyz`. This step never edits,
+//! reloads, restarts or checks it: it moves traffic by that health alone, because the old
+//! instance goes unready when it stops scheduling and the new one is ready only after the
+//! handover. The installer relies on `/readyz` for the same facts.
 //!
 //! A node `activate` never touches these units, and the order floors are kept per kind
 //! ([`crate::helper::memory::Kind`]).
@@ -79,25 +83,6 @@ impl FrontendConfig {
 
 /// The word the status gives for a refusal that is the frontend's.
 pub const BUSY: &str = "frontend_busy";
-pub const ENVOY_RANGE: &str = "envoy_range";
-
-/// Whether the installed Envoy may front an update: inside the tested range, and with both
-/// instances in the rendered config (an update never renders or restarts Envoy).
-pub trait EnvoyGate {
-    /// # Errors
-    /// The reason it may not, which the refusal carries after `envoy_range`.
-    fn check(&self) -> Result<(), String>;
-}
-
-/// The gate until the Envoy check is wired: it refuses, so a frontend update is refused
-/// rather than started in front of an Envoy nobody looked at.
-pub struct NotWired;
-
-impl EnvoyGate for NotWired {
-    fn check(&self) -> Result<(), String> {
-        Err("this installer has no Envoy check wired in".to_owned())
-    }
-}
 
 /// Why a pass could not go on: the host's own files or systemd are unusable. A refused
 /// order is not one.
@@ -154,7 +139,6 @@ impl Progress {
 /// The frontend half of the installer.
 pub struct Frontend {
     cfg: FrontendConfig,
-    envoy: Box<dyn EnvoyGate>,
     probe: Box<dyn HandoverProbe>,
 }
 
@@ -173,12 +157,8 @@ fn refused(code: &str, why: impl std::fmt::Display) -> Begun {
 
 impl Frontend {
     #[must_use]
-    pub fn new(
-        cfg: FrontendConfig,
-        envoy: Box<dyn EnvoyGate>,
-        probe: Box<dyn HandoverProbe>,
-    ) -> Frontend {
-        Frontend { cfg, envoy, probe }
+    pub fn new(cfg: FrontendConfig, probe: Box<dyn HandoverProbe>) -> Frontend {
+        Frontend { cfg, probe }
     }
 
     fn units<E: Exec>(exec: &E) -> io::Result<Units> {
@@ -254,9 +234,6 @@ impl Frontend {
                     serving.name()
                 ),
             ));
-        }
-        if let Err(why) = self.envoy.check() {
-            return Ok(refused(ENVOY_RANGE, why));
         }
         let idle = serving.other();
         let serving_slot = match slot(exec, serving) {
