@@ -257,6 +257,7 @@ pub fn load(path: &Path, env: &Env) -> Result<Loaded, Failure> {
         path: path.display().to_string(),
         source,
     })?;
+    crate::config::check_own_tables(path, &text).map_err(Failure::Settings)?;
     let config = Config::parse_shared(&text, &env.host)?;
     let problems = config.check_paths(env.euid);
     if !problems.is_empty() {

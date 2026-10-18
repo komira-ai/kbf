@@ -470,8 +470,8 @@ fn file_mode_reads_a_string_and_refuses_the_rest() {
 /// Catches enrollment's tables (`[node]`, `[enroll]`, ...) in the shared file being passed
 /// to a mode as flags, or a key of them that enrollment does not read being let by: a
 /// known key rides along without becoming a flag, an unknown one is refused naming
-/// `table.key` and the file, and an enrollment table that is not a table is left to
-/// enrollment's own parser (this one reads no flag from it and does not refuse it).
+/// `table.key` and the file (a table that is no table is refused by
+/// `a_value_where_an_enrollment_table_is_refused_naming_key_and_file`).
 #[test]
 fn enrollments_tables_are_in_the_file_but_are_not_flags() {
     let dir = scratch("own_tables");
@@ -492,11 +492,37 @@ fn enrollments_tables_are_in_the_file_but_are_not_flags() {
     assert!(msg.contains("enrollment's table"), "{msg}");
     assert!(msg.contains(&path.display().to_string()), "{msg}");
     assert_eq!(err.exit_code(), 2);
+}
 
-    let mut text = String::from("node = 3\n");
-    text.push_str(FRONTEND_FILE);
-    let path = file(&dir, &text, 0o600);
-    parse(&path).expect("a scalar named like an enrollment table is enrollment's to refuse");
+/// Catches a value where one of enrollment's tables is being skipped by the flags' check
+/// (it would reach the mode as nothing, so `storage = "http://..."` meant as the
+/// frontend's `--storage` is silently dropped): a top-level `storage`, `daemon`, `node`,
+/// `tls` as a string, number or bool is refused naming the key and the file, in the
+/// flags' parser, `--check`'s settings check and a `kbf <mode>` parse alike.
+#[test]
+fn a_value_where_an_enrollment_table_is_refused_naming_key_and_file() {
+    let dir = scratch("own_scalar");
+    for key in [
+        "storage", "daemon", "node", "tls", "enroll", "dirs", "frontend",
+    ] {
+        for value in ["\"x\"", "1", "true"] {
+            let path = file(&dir, &format!("{key} = {value}\n{FRONTEND_FILE}"), 0o600);
+            let at = path.display().to_string();
+            let err = kbf_cli::parse_with(argv(&["kbf", "frontend"], Some(&path)), None)
+                .expect_err("a value for a table");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("`{key}`")) && msg.contains(&at),
+                "{key} = {value}: {msg}"
+            );
+            assert_eq!(err.exit_code(), 2, "{key} = {value}");
+            let why = kbf_cli::check_settings("frontend", &path).expect_err("check");
+            assert!(
+                why.contains(&format!("`{key}`")) && why.contains(&at),
+                "{key} = {value}: {why}"
+            );
+        }
+    }
 }
 
 /// A command with three settings, to read files against `config::file_args` directly:

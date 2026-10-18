@@ -343,6 +343,41 @@ pub fn enrolls(path: &Path) -> bool {
         })
 }
 
+/// The refusal of `group = <value>` at the top of the file at `path` when `group` is a
+/// table of enrollment ([`kbf_enroll::config::KEYS`]): a string, number or bool there is
+/// no setting, and without this it would be dropped (`storage = "http://..."` meant as
+/// the frontend's `--storage`) or reach enrollment's parser, which names no file.
+fn value_for_table(path: &Path, group: &str, body: &toml::Value) -> Option<String> {
+    let own = !group.is_empty() && kbf_enroll::config::KEYS.iter().any(|(t, _)| *t == group);
+    (own && !body.is_table()).then(|| {
+        format!(
+            "key `{group}` in {} is a value, but [{group}] is the enrollment's table: it holds \
+             keys, not a value",
+            path.display()
+        )
+    })
+}
+
+/// Checks that no table of enrollment is a value in the file `text` read from `path`
+/// ([`value_for_table`]); text that is not TOML is left to the parser that reads it next.
+///
+/// # Errors
+/// Every such key, one per line, naming the file.
+pub fn check_own_tables(path: &Path, text: &str) -> Result<(), String> {
+    let Ok(table) = toml::from_str::<toml::Table>(text) else {
+        return Ok(());
+    };
+    let problems: Vec<String> = table
+        .iter()
+        .filter_map(|(group, body)| value_for_table(path, group, body))
+        .collect();
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("\n"))
+    }
+}
+
 /// The flags the file at `path` stands for, for the mode whose own command is `own`:
 /// `--key=value` per setting, in the file's order of tables and keys, leaving out each
 /// flag in `given` (an id of `own`: it was given on the command line, which wins).
@@ -373,7 +408,9 @@ pub fn file_args(
             continue;
         }
         if kbf_enroll::config::is_own_table(group) {
-            if let toml::Value::Table(keys) = body
+            if let Some(problem) = value_for_table(path, group, body) {
+                problems.push(problem);
+            } else if let toml::Value::Table(keys) = body
                 && let Some(key) = keys
                     .keys()
                     .find(|key| !kbf_enroll::config::is_key(group, key))

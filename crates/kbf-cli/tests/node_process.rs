@@ -291,3 +291,42 @@ async fn an_enrolled_start_runs_the_host_checks_before_the_mode() {
     assert_eq!(run.fake.enrolls().len(), 1);
     assert!(root.join("state/pki/node.json").exists());
 }
+
+/// Catches a top-level `storage = ...` or `daemon = ...` (a value where enrollment's table
+/// is) being ignored, passing `--check`, or refused with a message that names no file: for
+/// a string, a number and a bool, `--mode=<m> --check --config FILE` exits 2 and stderr
+/// names the key and the file; a `[storage]` and a `[daemon]` table in the same file stay
+/// fine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_value_where_a_table_of_the_file_is_exits_2_naming_key_and_file() {
+    let run = fake::start();
+    let root = scratch("process-scalar-table");
+    token(&root, &run.fake.mint(1, 1).to_line());
+    for mode in ["storage", "daemon"] {
+        for (key, value) in [
+            ("storage", "\"x\""),
+            ("storage", "true"),
+            ("daemon", "1"),
+            ("daemon", "true"),
+        ] {
+            let top = format!("mode = \"{mode}\"\n{key} = {value}\n");
+            let path = config(&root, run.enroll_addr.port(), &top);
+            let out = kbf(args(&[&format!("--mode={mode}"), "--check"], &path)).await;
+            let want = format!("{mode}/{key} = {value}");
+            assert_eq!(out.code, Some(2), "{want}: {}", out.stderr);
+            assert!(out.stdout.is_empty(), "{want}: {}", out.stdout);
+            assert!(
+                out.stderr.contains(&format!("`{key}`"))
+                    && out.stderr.contains(&path.display().to_string()),
+                "{want}: {}",
+                out.stderr
+            );
+        }
+    }
+    let tables = "mode = \"storage\"\n[storage]\nhot_dir = \"/var/lib/kbf/hot\"\n[daemon]\nreserve_cpus = 1\n";
+    let path = config(&root, run.enroll_addr.port(), "");
+    let text = std::fs::read_to_string(&path).expect("read");
+    write_config(&path, &format!("{tables}{text}"));
+    let out = kbf(args(&["--check"], &path)).await;
+    assert_eq!(out.code, Some(0), "{}", out.stderr);
+}
