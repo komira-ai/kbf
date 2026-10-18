@@ -78,6 +78,8 @@ pub enum PhaseView {
     },
     /// Its memory is under pressure: it takes no new lease until that falls.
     MemoryPressure,
+    /// The daemon was told to stop: it takes no new lease and finishes the ones it runs.
+    Draining,
 }
 
 impl PhaseView {
@@ -96,6 +98,7 @@ impl PhaseView {
                 reason: reason.clone(),
             },
             NodePhase::MemoryPressure => Self::MemoryPressure,
+            NodePhase::Draining => Self::Draining,
         }
     }
 }

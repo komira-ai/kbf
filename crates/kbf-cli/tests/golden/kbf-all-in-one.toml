@@ -56,6 +56,8 @@ daemon-user = "_kbf"
 # data-dir = "DIR"
 # Lowers the size the cache and the trees are budgeted from (half and a quarter of it), under the filesystem's automatic one
 # data-max-bytes = "BYTES"
+# On the first SIGTERM or SIGINT the daemon drains: it takes no new lease, lets the running ones finish and report, waits for their acknowledgements, then exits 0. A second signal, or this many seconds after the first, stops it at once and abandons the leases still running. Used by `kbf daemon`; the combined modes stop their daemon half with the other half
+drain-deadline-secs = 600
 # How leases run; once per runtime. The daemon runs each lease on the driver that serves its kind and refuses to start when two serve the same kind. The node's own driver (native or container) is set up first, whatever the order given
 # driver = []
 # A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon makes sure each is in the node's image store, as the prepare step of every lease does: it fetches the image from its registry by that digest, checks every byte against a digest, and unpacks it once. It exits with status 2 if one cannot be fetched, fails a check, or names an image index. The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image

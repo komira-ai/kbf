@@ -356,6 +356,7 @@ pub fn phase(hello: &Hello) -> Result<NodePhase, String> {
         Ok(Phase::Restoring) => NodePhase::Restoring(lease()?),
         Ok(Phase::Quarantined) => NodePhase::Quarantined(reported.reason.clone()),
         Ok(Phase::MemoryPressure) => NodePhase::MemoryPressure,
+        Ok(Phase::Draining) => NodePhase::Draining,
         Err(_) => NodePhase::Quarantined(format!(
             "the node reports phase {}, which this server does not know",
             reported.phase

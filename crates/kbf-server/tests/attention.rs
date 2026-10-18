@@ -191,6 +191,7 @@ async fn an_attention_item_is_a_warning_that_names_the_node_and_the_fix() {
             },
         ),
         (NodePhase::MemoryPressure, PhaseView::MemoryPressure),
+        (NodePhase::Draining, PhaseView::Draining),
     ] {
         farm.resize(&node, stream, reported(phase));
         assert_eq!(farm.node_view(&node).expect("registered").phase, view);

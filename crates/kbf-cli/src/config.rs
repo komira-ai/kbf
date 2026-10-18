@@ -185,6 +185,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "daemon-user",
             "data-dir",
             "data-max-bytes",
+            "drain-deadline-secs",
             "driver",
             "image",
             "reconnect-max-ms",
