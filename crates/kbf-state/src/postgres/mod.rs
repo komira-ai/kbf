@@ -754,8 +754,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ConfigError, Fail, MAX_ATTEMPTS, PostgresConfig, PostgresStore, Revision, Store,
-        StoreError, describe,
+        Cond, ConfigError, Fail, MAX_ATTEMPTS, PostgresConfig, PostgresStore, Revision, Store,
+        StoreError, Txn, describe,
     };
 
     // Catches a Unix-socket URI that parses to a TCP host (or not at all): the frontend
@@ -789,6 +789,26 @@ mod tests {
         assert_eq!(plain.pg.get_application_name(), Some("kbf-state"));
         let named = PostgresConfig::parse("postgres://h/db?application_name=mine").expect("parses");
         assert_eq!(named.pg.get_application_name(), Some("mine"));
+    }
+
+    // Catches a URL refused for the wrong reason (or accepted): each way `parse` says no
+    // is its own error, and the answers that are yes keep the URL's own settings. All
+    // here, in one test binary, so the function is covered whole by one copy.
+    #[test]
+    fn each_way_a_url_is_refused_is_its_own_error() {
+        let refused = |url: &str| PostgresConfig::parse(url).unwrap_err();
+        assert_eq!(refused(" "), ConfigError::Missing);
+        assert_eq!(refused("mysql://h/db"), ConfigError::NotPostgres);
+        assert!(matches!(
+            refused("postgres://h/db?sslmode=bogus"),
+            ConfigError::Invalid(_)
+        ));
+        assert_eq!(refused("postgres:///db"), ConfigError::NoHost);
+        assert_eq!(
+            refused("postgres://h/db?sslmode=require"),
+            ConfigError::TlsUnsupported
+        );
+        assert!(PostgresConfig::parse("postgresql://h/db?sslmode=prefer").is_ok());
     }
 
     // Catches a pool size of zero (a store that could never check a session out) and a
@@ -892,33 +912,33 @@ mod tests {
     #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn only_serialization_failures_and_deadlocks_are_run_again_and_not_for_ever() {
         let (store, mut client) = store_and_client("kbf_unit_retry");
-        for code in ["40001", "40P01"] {
-            assert!(Fail::Pg(raised(&mut client, code)).retryable(), "{code}");
-            let mut tries = 0;
-            let done = store.retrying(|| {
-                tries += 1;
-                if tries < 3 {
-                    Err(Fail::Pg(raised(&mut client, code)))
-                } else {
-                    Ok(tries)
+        // One result type throughout: the coverage of a generic function is that of its
+        // best single instantiation.
+        let tries = std::cell::Cell::new(0);
+        let mut run = |codes: &[&str]| -> Result<(), StoreError> {
+            tries.set(0);
+            store.retrying(|| {
+                tries.set(tries.get() + 1);
+                match codes.get(tries.get() - 1) {
+                    Some(code) => Err(Fail::Pg(raised(&mut client, code))),
+                    None => Ok(()),
                 }
-            });
-            assert_eq!(done, Ok(3), "{code}: run again until it works");
+            })
+        };
+        for code in ["40001", "40P01"] {
+            assert_eq!(
+                run(&[code, code]),
+                Ok(()),
+                "{code}: run again until it works"
+            );
         }
-        let mut tries = 0;
-        let refused = store.retrying(|| -> Result<(), Fail> {
-            tries += 1;
-            Err(Fail::Pg(raised(&mut client, "23505")))
-        });
-        assert_eq!(tries, 1, "a unique violation is not run again");
+        assert_eq!(tries.get(), 3, "two failures, then the run that worked");
+        let refused = run(&["23505", "40001"]);
+        assert_eq!(tries.get(), 1, "a unique violation is not run again");
         let said = format!("{refused:?}");
         assert!(said.contains("SQLSTATE 23505"), "{said}");
-        let mut tries = 0;
-        let endless = store.retrying(|| -> Result<(), Fail> {
-            tries += 1;
-            Err(Fail::Pg(raised(&mut client, "40001")))
-        });
-        assert_eq!(tries, MAX_ATTEMPTS);
+        let endless = run(&["40001"; MAX_ATTEMPTS + 1]);
+        assert_eq!(tries.get(), MAX_ATTEMPTS);
         assert_eq!(
             endless,
             Err(StoreError::Failed(format!(
@@ -993,26 +1013,85 @@ mod tests {
                 &[],
             )
             .expect("terminates");
-        while sessions(&mut client) > 0 {
+        let gone = (0..2000).any(|_| {
             std::thread::sleep(Duration::from_millis(5));
-        }
+            sessions(&mut client) == 0
+        });
+        assert!(gone, "the killed sessions go");
         assert!(store.apply_batch(Vec::new()).expect("answers").is_empty());
+        // The same call with something in it needs a session: the dead one fails the
+        // call, and the next call runs on a new connection. (Both ends of the function
+        // run in this one test binary.)
+        let put = || vec![Txn::new().put("k", "v", Cond::Any)];
+        assert!(store.apply_batch(put()).is_err());
+        assert_eq!(store.apply_batch(put()).expect("commits").len(), 1);
     }
 
-    // Catches a feed row of a kind this code does not know being read as a put or
-    // skipped (the feed would lose a change): it must fail and name the kind.
+    // Catches the feed read wrongly: each kind of row mapped to its event, a full page
+    // resuming after its last row and a short one at the head, a store with sequence
+    // revisions reading to the end of the table, and a row of a kind this code does not
+    // know being read as an event (the feed would lose a change): it must fail and name
+    // the kind.
     #[test]
     #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
-    fn a_feed_row_of_an_unknown_kind_is_an_error_naming_it() {
+    fn the_feed_maps_each_kind_pages_and_refuses_a_kind_it_does_not_know() {
+        use super::{Change, Event, Flaw};
         let (store, mut client) = store_and_client("kbf_unit_kind");
         client
             .batch_execute(
-                "INSERT INTO kbf_unit_kind.feed (rev, key, kind) VALUES (1, 'k', 9); \
-                 UPDATE kbf_unit_kind.head SET rev = 1",
+                "INSERT INTO kbf_unit_kind.feed (rev, key, kind, value) VALUES \
+                 (1, 'a', 0, 'v'), (2, 'b', 1, NULL), (3, 'c', 2, NULL); \
+                 UPDATE kbf_unit_kind.head SET rev = 5",
+            )
+            .expect("one row of each kind");
+        let all = store.changes(Revision::ZERO, 10).expect("reads");
+        assert_eq!(
+            all.rows,
+            [
+                Change {
+                    revision: Revision(1),
+                    key: "a".into(),
+                    event: Event::Put(b"v".to_vec())
+                },
+                Change {
+                    revision: Revision(2),
+                    key: "b".into(),
+                    event: Event::Delete
+                },
+                Change {
+                    revision: Revision(3),
+                    key: "c".into(),
+                    event: Event::Expire
+                },
+            ]
+        );
+        assert_eq!(
+            all.cursor,
+            Revision(5),
+            "a short page ends at the head, not its last row"
+        );
+        let first = store.changes(Revision::ZERO, 1).expect("reads");
+        assert_eq!((first.rows.len(), first.cursor), (1, Revision(1)));
+        let flawed = store.with_flaw(Flaw::SequenceRevisions);
+        assert_eq!(
+            flawed
+                .changes(Revision::ZERO, 10)
+                .expect("reads")
+                .rows
+                .len(),
+            3
+        );
+        client
+            .batch_execute(
+                "INSERT INTO kbf_unit_kind.feed (rev, key, kind) VALUES (6, 'k', 9); \
+                 UPDATE kbf_unit_kind.head SET rev = 6",
             )
             .expect("a row of a kind from the future");
         assert_eq!(
-            store.changes(Revision::ZERO, 10).unwrap_err(),
+            flawed
+                .with_flaw(Flaw::None)
+                .changes(Revision(3), 10)
+                .unwrap_err(),
             StoreError::Failed("unknown feed row kind 9".to_owned())
         );
     }
