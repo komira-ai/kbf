@@ -614,6 +614,12 @@ async fn calls_that_do_not_apply_change_nothing() {
         409,
         "takeover on an active process"
     );
+    let (code, view) = a.post("resume").await;
+    assert_eq!(
+        (code, view["role"].as_str()),
+        (200, Some("active")),
+        "a resume of a process that never quiesced is a no-op"
+    );
     assert_eq!(a.call("GET", "/v1/admin/nothing", "").await.0, 404);
     assert_eq!(a.role().await["role"], "active");
     assert_eq!(b.role().await["role"], "candidate");
