@@ -45,7 +45,7 @@ kbf-mdm                   0      0
 kbf-mdm-api               0      0
 kbf-meta                  7      1
 kbf-node                  0      0
-kbf-objstore             59     19
+kbf-objstore             51     18
 kbf-outputs               0      0
 kbf-peer                  0      0
 kbf-proto                 0      0
@@ -54,6 +54,7 @@ kbf-route                 0      0
 kbf-sched                 1      1
 kbf-segments              7      5
 kbf-server                0      0
+kbf-signer                0      0
 kbf-sim                   6      3
 kbf-sim-cell              4     12
 kbf-state                 2     13
