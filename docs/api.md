@@ -165,7 +165,10 @@ named, and nothing judges it again.
 A registered member is `joining` until something promotes it with `Members::set_state`;
 the server does not promote on its own yet, so a script that waits for `active` waits
 for that. A server without a state store keeps no members and answers `404`; a state
-store that cannot be read answers `503`.
+store that cannot be read answers `503`. The view reads the map and then the member rows
+(for `protocol`), so a stored map or a stored member row that does not decode answers
+`500` for the whole view, not a list without that member's version: the store is up and
+its content is wrong, as it is for the other readers of those rows.
 
 ## `POST /v1/nodes/{node}:cordon`, `:drain`, `:uncordon`
 

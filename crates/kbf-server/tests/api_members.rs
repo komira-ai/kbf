@@ -367,6 +367,77 @@ async fn a_row_written_before_the_field_is_unknown_and_never_the_oldest() {
     assert_eq!(view["protocol_unknown"], json!(1), "{view}");
 }
 
+/// Catches: the protocol moved to another tag, or to another wire type, of the stored
+/// row. The rows live in the store across builds, so the number one build writes is the
+/// number the next reads; only bytes spelled out by hand pin that, because a test that
+/// writes and reads through the same `Row` follows the tag wherever it goes (a row
+/// written at tag 5 round-trips, and reads as unknown to every build that has tag 4).
+/// The protocol is field 4 as a plain varint: the key byte is `4 << 3 | 0`, 0x20.
+#[test]
+fn the_protocol_is_field_four_of_the_stored_row_as_a_plain_varint() {
+    let (_clock, fake, _state) = store();
+    let frontend = other_frontend(&fake);
+    frontend.register(&speaking(1, 3)).expect("a");
+    let b = frontend.register(&speaking(2, 2)).expect("b");
+    let key = format!("member/{}", b.id.0);
+    let row = fake.get(&key).expect("store").expect("a live row");
+    let old = RowBeforeProtocol::decode(row.value.as_slice()).expect("a row");
+
+    // What a registration writes: the fields of the old layout, then field 4 holding 2.
+    let mut written = old.encode_to_vec();
+    written.extend_from_slice(&[0x20, 2]);
+    assert_eq!(row.value, written, "the protocol is not field 4 of the row");
+
+    // What a row with field 4 holding 5 is read as, whatever wrote it.
+    let mut by_hand = old.encode_to_vec();
+    by_hand.extend_from_slice(&[0x20, 5]);
+    fake.txn(Txn::new().put_ttl(&key, by_hand, TTL, Cond::Version(row.version)))
+        .expect("store")
+        .expect("no conflict");
+    let read = frontend.protocols().expect("rows");
+    assert_eq!(read.get(&b.id), Some(&Some(5)), "{read:?}");
+}
+
+/// Catches: a stored member row that does not decode skipped by the view, which would
+/// list the members and name every version it could read as if the farm were whole. A
+/// row the other readers of the rows fail on is wrong content in a store that is up:
+/// the whole view is `500`, as for a map that does not decode, and the one reading it
+/// is `200` again once the row is right.
+#[tokio::test]
+async fn a_member_row_that_does_not_decode_is_500_for_the_whole_view() {
+    let (_clock, fake, state) = store();
+    let server = start(Some(state));
+    let frontend = other_frontend(&fake);
+    frontend.register(&speaking(1, 3)).expect("a");
+    let b = frontend.register(&speaking(2, 2)).expect("b");
+    assert_eq!(
+        members(server.api).await["members"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+
+    let key = format!("member/{}", b.id.0);
+    let row = fake.get(&key).expect("store").expect("a live row");
+    fake.txn(Txn::new().put_ttl(&key, b"not a row".to_vec(), TTL, Cond::Version(row.version)))
+        .expect("store")
+        .expect("no conflict");
+    let (code, _, body) = http(server.api, "GET", "/v1/members", "").await;
+    assert_eq!(code, 500, "{body}");
+    let why = serde_json::from_str::<Value>(&body).expect("JSON")["error"]
+        .as_str()
+        .expect("an error")
+        .to_owned();
+    assert!(why.contains("member row"), "{why}");
+
+    let fixed = fake.get(&key).expect("store").expect("the bad row");
+    fake.txn(Txn::new().put_ttl(&key, row.value, TTL, Cond::Version(fixed.version)))
+        .expect("store")
+        .expect("no conflict");
+    let view = members(server.api).await;
+    assert_eq!(protocols_of(&view), json!([3, 2]), "{view}");
+}
+
 /// Catches: a member the map still holds as `down`, whose row has expired with its
 /// heartbeats, shown with a number it no longer has (a default, or the frontend's own),
 /// or left out of the unknown count: it is in the map for the dwell and may come back.
