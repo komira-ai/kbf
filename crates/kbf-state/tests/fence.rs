@@ -197,6 +197,59 @@ fn a_store_that_keeps_the_default_conditional_reap_is_not_atomic() {
     );
 }
 
+// Catches a guarded reap that judges the precondition but does not reap, or reaps but
+// does not make it durable: with the precondition met it removes the expired key and
+// writes its `Expire` row; with it unmet it removes nothing.
+#[test]
+fn a_guarded_reap_removes_what_expired_only_while_its_precondition_holds() {
+    let clock = Arc::new(ManualClock::default());
+    let store = Fake::with_flaw(clock.clone(), Flaw::None);
+    store
+        .txn(Txn::new().put("guard", "g", Cond::Any).put_ttl(
+            "t",
+            "v",
+            std::time::Duration::from_secs(5),
+            Cond::Any,
+        ))
+        .expect("s")
+        .expect("c");
+    clock.advance(std::time::Duration::from_secs(10));
+    assert!(
+        store
+            .reap_expired_if("guard", Cond::Absent)
+            .expect("s")
+            .is_err()
+    );
+    assert_eq!(store.reap_expired_if("guard", Cond::Any), Ok(Ok(1)));
+    let expired = store
+        .changes(kbf_state::Revision::ZERO, 10)
+        .expect("feed")
+        .rows
+        .iter()
+        .filter(|row| row.event == kbf_state::Event::Expire)
+        .count();
+    assert_eq!(expired, 1, "the reap wrote its Expire row once");
+}
+
+// Catches a fenced handle that does not pass the liveness calls to the store underneath:
+// both are answered by the store, for the generation asked about.
+#[test]
+fn a_fenced_handle_forwards_the_liveness_calls() {
+    let store = Arc::new(Plain(Fake::with_flaw(
+        Arc::new(ManualClock::default()),
+        Flaw::None,
+    )));
+    let held = Fenced::take(store, None).expect("take");
+    assert!(matches!(
+        held.hold_liveness(1),
+        Err(StoreError::Failed(why)) if why.contains("cannot announce")
+    ));
+    assert!(matches!(
+        held.holder_alive(1),
+        Err(StoreError::Failed(why)) if why.contains("cannot tell")
+    ));
+}
+
 // Catches a second precondition being forwarded unchecked by a fenced handle: it cannot be
 // checked in the same step as the generation, so it is refused and nothing is reaped.
 #[test]
