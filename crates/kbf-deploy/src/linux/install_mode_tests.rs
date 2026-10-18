@@ -506,10 +506,11 @@ fn a_missing_memory_controller_or_a_held_port_is_refused() {
     }
 }
 
-/// A listener on a port that merely contains the unit's port as a prefix or a suffix
-/// (`:18080`, `:80801`, IPv6 `[::]:18080` for `:8080`) does not hold it. Catches the
-/// held-port match loosened from "ends with `:port`" to "contains `:port`", which would
-/// refuse an install whose port is free.
+/// A listener on a port that merely looks like the unit's port does not hold it. The
+/// three listeners each guard one mutant of the held-port match (`ends_with(":port")`):
+/// only `:{port}1` (e.g. `:80801` for `:8080`) catches "ends with" loosened to "contains",
+/// which would refuse an install whose port is free; `:1{port}` and `[::]:1{port}` (e.g.
+/// `:18080`) guard a mutant that drops the leading colon from the pattern.
 #[test]
 fn listeners_on_look_alike_ports_do_not_hold_the_units_port() {
     for mode in Mode::ALL
