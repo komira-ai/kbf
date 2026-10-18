@@ -11,11 +11,8 @@ use kbf_host::{HostExec, HostPath, Root};
 use kbf_installer::activate;
 use kbf_installer::helper::cycle::{Config, Helper};
 use kbf_installer::helper::restart::Restart;
+use kbf_installer::helper::{fetcher, leases};
 use kbf_installer::layout::{Layout, Platform};
-use kbf_installer::release;
-use kbf_installer::run::SystemRunner;
-use kbf_installer::settings::Settings;
-use kbf_installer::stage::{Context, Limits, stage_from_inbox};
 
 #[derive(Parser)]
 #[command(name = "kbf-installer", version)]
@@ -29,7 +26,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Verb {
-    /// Poll the inbox and act on it, until stopped.
+    /// Poll the order spool and act on it, until stopped.
     Run(RunArgs),
     /// Run before each start of the service: count the start of a release on trial, and
     /// revert one that has used its starts. Exits 0 unless the host's state is unreadable.
@@ -38,9 +35,12 @@ enum Verb {
 
 #[derive(clap::Args)]
 struct RunArgs {
-    /// Root's directory: status.json goes here; `inbox/` (the service user's) is beneath it.
-    #[arg(long, default_value = "/var/lib/kbf-updater", value_parser = HostPath::new)]
+    /// Root's directory: status.json goes here. Root-owned, mode 0755, so the node can read it.
+    #[arg(long, default_value = "/var/lib/kbf-installer", value_parser = HostPath::new)]
     update_dir: HostPath,
+    /// The order spool: owned by the service user, mode 0700, inside a root-owned parent.
+    #[arg(long, default_value = "/var/lib/kbf-installer/orders", value_parser = HostPath::new)]
+    orders_dir: HostPath,
     /// The systemd unit to restart after a swap (Linux).
     #[arg(
         long,
@@ -95,31 +95,24 @@ fn run(root: PathBuf, args: RunArgs) -> Result<(), String> {
     };
     let cfg = Config {
         update_dir: args.update_dir,
+        orders_dir: args.orders_dir,
         restart,
         window_secs: args.window_secs,
         starts: args.starts,
     };
-    let mut helper = Helper::new(layout.clone(), exec, cfg);
-    let trust = HostExec::new(layout.root().clone());
-    let mut stager = move |exec: &mut HostExec, entry: &std::path::Path| {
-        let settings = Settings::load(&trust, &layout)?;
-        let mut ctx = Context {
-            host: &layout,
-            settings: &settings,
-            exec,
-            trust: &trust,
-            runner: &SystemRunner,
-            owner: release::ROOT,
-            limits: Limits::DEFAULT,
-        };
-        stage_from_inbox(&mut ctx, entry)
-    };
+    // The release fetcher and the lease source are wired by later changes; until then an
+    // activation of a release that is not installed, and every activation, is refused.
+    let mut helper = Helper::new(
+        layout,
+        exec,
+        cfg,
+        Box::new(fetcher::NotWired),
+        Box::new(leases::NotWired),
+    );
     helper.recover().map_err(|e| e.to_string())?;
     let mut left = args.passes;
     while left != Some(0) {
-        helper
-            .cycle(now(), &mut stager)
-            .map_err(|e| e.to_string())?;
+        helper.cycle(now()).map_err(|e| e.to_string())?;
         helper.drain_log(&mut std::io::stderr());
         left = left.map(|n| n - 1);
         sleep(Duration::from_secs(args.interval_secs));

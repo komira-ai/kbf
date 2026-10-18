@@ -2,6 +2,8 @@
 //! node says back. These are plain values; the wire messages become them at the edge of
 //! the daemon (`kbf-daemon`'s `update_link`), so nothing here knows protobuf.
 
+use serde::{Deserialize, Serialize};
+
 /// The most bytes one component's tarball may be.
 pub const MAX_COMPONENT_BYTES: u64 = 512 << 20;
 
@@ -10,10 +12,6 @@ pub const MAX_ATTESTATION_BYTES: usize = 256 << 10;
 
 /// The components a node installs, by name. An offer naming another is refused.
 pub const COMPONENT_NAMES: [&str; 2] = ["kbf", "kbf-daemon"];
-
-/// How many times the size of an offer the disk must have free before the client starts
-/// fetching it: the tarballs land in the inbox and the helper unpacks them beside it.
-pub const FREE_DISK_FACTOR: u64 = 3;
 
 /// One file of a release, as the offer names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,12 +40,27 @@ pub struct Offer {
     pub platform: String,
     /// What to fetch.
     pub components: Vec<Component>,
+    /// What the frontend's preflight recorded about the release (the offer's `platform`
+    /// is the platform of these facts). Claims: the installer checks the fetched binary's
+    /// own report against them. Zeros when the frontend predates the fields.
+    pub expected: Expected,
 }
 
-/// What an order asks the helper to do.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The facts a release's `kbf --version --json` is expected to declare.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Expected {
+    pub protocol: u32,
+    pub min_protocol: u32,
+    pub state_schema: u32,
+    /// The build profile, for example `release`.
+    pub profile: String,
+}
+
+/// What an order asks the installer to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Verb {
-    /// Switch to the staged release and restart.
+    /// Fetch the release if it is not installed, switch to it and restart.
     Activate,
     /// Keep the release that was switched to.
     Confirm,
@@ -74,6 +87,9 @@ pub struct Order {
     pub order_id: u64,
     /// The epoch of the frontend that sent it; the node takes only its Welcome's.
     pub epoch: u64,
+    /// The generation of the desired release the order belongs to (0: the frontend sent
+    /// none). Carried to the installer, which holds the rule on it.
+    pub generation: u64,
     /// `None` when the message named no verb.
     pub verb: Option<Verb>,
     /// The release the order is about.
@@ -85,11 +101,11 @@ pub struct Order {
 /// Where the node stands, as the frontend is told.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
-    /// Nothing offered, or an offer not yet staged by the helper.
+    /// Nothing ordered.
     Idle,
-    /// The client is fetching an offer.
+    /// The installer is pulling the release of an order.
     Fetching,
-    /// The helper has the offered release staged.
+    /// The installer holds the offered release verified, not yet switched to.
     Staged,
     /// The helper switched to a release and awaits its confirmation.
     ActivatedUnconfirmed,
