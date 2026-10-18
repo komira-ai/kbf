@@ -581,8 +581,9 @@ impl Durable {
             // Gone with the operation queued again is the farm's own give-up. Gone
             // without is another writer's doing: the result is stale.
             None => {
-                self.row(&queue_key(operation))
-                    .map_err(|_| StateError::Missing(key))?;
+                if self.store.get(&queue_key(operation))?.is_none() {
+                    return Err(StateError::Missing(key));
+                }
             }
         }
         self.commit(
