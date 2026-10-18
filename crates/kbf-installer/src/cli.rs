@@ -14,7 +14,7 @@ use crate::record::ActivationId;
 #[derive(Parser)]
 #[command(
     name = "kbf-installer",
-    version,
+    version = crate::version::VERSION,
     about = "The one root tool for setting up a kbf host and for updating it",
     long_about = "The one root tool for setting up a kbf host and for updating it.\n\n\
 Mutating verbs only say what they would do unless --apply is given. Exit codes: 0 ok, 1 failed, \
