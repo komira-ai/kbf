@@ -222,6 +222,14 @@ fn the_installer_flags_open_the_spool_and_name_the_status_file() {
     };
     assert!(matches!(e, ConfigError::Installer { .. }), "{e:?}");
     assert!(e.to_string().starts_with("--installer-orders-dir "), "{e}");
+
+    // The release store's directory is refused the same way, naming its own flag.
+    let under = format!("--releases-dir={}", blocker.join("releases").display());
+    let Err(e) = api(&[under.as_str()]) else {
+        panic!("a release store under a file is refused");
+    };
+    assert!(matches!(e, ConfigError::Releases { .. }), "{e:?}");
+    assert!(e.to_string().starts_with("--releases-dir "), "{e}");
 }
 
 /// Catches `Installer::open` defaults and its debug text: with no status file named the file

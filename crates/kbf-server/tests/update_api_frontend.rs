@@ -685,7 +685,7 @@ async fn a_row_that_cannot_be_opened_orders_nothing() {
 }
 
 /// Catches a release whose bundle the route cannot hand over being ordered anyway: a bundle that
-/// is not text and one that is a directory (the store cannot read it) are each 500 and write
+/// is not text, one that is a directory (the store cannot read it) and an index that is gone are each 500 and write
 /// no record and open no row.
 ///
 /// Mutants planted: a non-text bundle passed through lossily; an unreadable bundle skipped.
@@ -711,6 +711,12 @@ async fn a_bundle_the_installer_could_not_take_is_500_and_orders_nothing() {
     let (code, body) = h.post(B).await;
     assert_eq!(code, 500, "{body}");
     assert!(h.records().is_empty(), "unreadable");
+
+    // A release store whose index is gone cannot be listed at all.
+    std::fs::remove_dir_all(h.dir.0.join("releases/index")).expect("the index");
+    let (code, body) = h.post(A).await;
+    assert_eq!(code, 500, "{body}");
+    assert!(h.records().is_empty(), "no index");
 }
 
 /// Catches an answer made up for a server that cannot keep the row, hold the release or reach
