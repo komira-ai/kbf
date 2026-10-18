@@ -56,7 +56,7 @@ use crate::GROUP_COMMIT_WINDOW;
 use crate::clock::{Clock, StoreTime};
 use crate::store::Store;
 use crate::types::{
-    Changes, Commit, CommitStats, Conflict, Revision, ScanPage, ScanRange, StoreError, Txn,
+    Changes, Commit, CommitStats, Cond, Conflict, Revision, ScanPage, ScanRange, StoreError, Txn,
     Versioned,
 };
 use writer::{Reply, Request, Shared, Writer};
@@ -213,11 +213,17 @@ impl SqliteStore {
     }
 
     /// Queues a request for the writer and waits for its group to be on disk.
-    fn call(&self, txns: Vec<Txn>, reap: bool) -> Result<Reply, StoreError> {
+    fn call(
+        &self,
+        txns: Vec<Txn>,
+        reap: bool,
+        guard: Option<(String, Cond)>,
+    ) -> Result<Reply, StoreError> {
         let (reply, answer) = mpsc::sync_channel(1);
         let request = Request {
             txns,
             reap,
+            guard,
             queued: Instant::now(),
             reply,
         };
@@ -272,7 +278,7 @@ impl Drop for SqliteStore {
 
 impl Store for SqliteStore {
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
-        Ok(self.call(batch, false)?.commits)
+        Ok(self.call(batch, false, None)?.commits)
     }
 
     fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {
@@ -292,7 +298,16 @@ impl Store for SqliteStore {
     }
 
     fn reap_expired(&self) -> Result<usize, StoreError> {
-        Ok(self.call(Vec::new(), true)?.reaped)
+        Ok(self.call(Vec::new(), true, None)?.reaped)
+    }
+
+    fn reap_expired_if(
+        &self,
+        key: &str,
+        cond: Cond,
+    ) -> Result<Result<usize, Conflict>, StoreError> {
+        let reply = self.call(Vec::new(), true, Some((key.to_owned(), cond)))?;
+        Ok(reply.refused.map_or(Ok(reply.reaped), Err))
     }
 
     fn commit_stats(&self) -> CommitStats {

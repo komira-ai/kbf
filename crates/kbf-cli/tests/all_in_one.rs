@@ -1,6 +1,6 @@
-//! The `kbf-all-in-one` binary end to end: one action, executed through the REAPI
+//! `kbf all-in-one` end to end: one action, executed through the REAPI
 //! listener of the server half, run by the daemon half's container driver over a
-//! stand-in `crun` (`kbf-fake-crun`, which runs the action as a plain process) and a
+//! stand-in `crun` (`kbf-cli-fake-crun`, which runs the action as a plain process) and a
 //! cgroup tree of plain directories, its outputs, stdout and stderr stored through the
 //! in-process data plane and read back over REAPI. And the starts each half refuses.
 
@@ -36,10 +36,14 @@ use node::{
 // binary, which answers as `kbf-act` through it.
 kbf_testkit::act_test_hook!();
 
-const BIN: &str = env!("CARGO_BIN_EXE_kbf-all-in-one");
+/// The `kbf` binary, run as `kbf all-in-one` ([`MODE`]).
+const BIN: &str = env!("CARGO_BIN_EXE_kbf");
 
 /// The stand-in `crun` (`node::crun`).
-const FAKE_CRUN: &str = env!("CARGO_BIN_EXE_kbf-fake-crun");
+const FAKE_CRUN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-crun");
+
+/// The mode this file runs.
+const MODE: &str = "all-in-one";
 
 /// A fresh directory for one test.
 fn scratch(name: &str) -> PathBuf {
@@ -59,8 +63,8 @@ fn farm_flags(dir: &Path, worker: SocketAddr) -> Vec<String> {
     vec![
         "--listen=127.0.0.1:0".to_owned(),
         format!("--worker-listen={worker}"),
-        format!("--worker-tls-cert={}", at("server.pem")),
-        format!("--worker-tls-key={}", at("server.key")),
+        format!("--worker-tls-cert={}", at("frontend.pem")),
+        format!("--worker-tls-key={}", at("frontend.key")),
         format!("--worker-client-ca={}", at("ca.pem")),
         format!("--cold-store=file://{}", at("cold")),
         format!("--hot-store=file://{}", at("hot")),
@@ -81,6 +85,7 @@ fn farm_flags(dir: &Path, worker: SocketAddr) -> Vec<String> {
 fn farm(dir: &Path, bin: &Path, path: &str, flags: Vec<String>) -> Command {
     let mut command = Command::new(BIN);
     command
+        .arg(MODE)
         .args(flags)
         .arg(format!("--id-files={}", id_files(dir).display()))
         .args(cgroup_tree(bin))
@@ -259,7 +264,15 @@ fn refused_at(name: &str, extra: &[&str], worker: SocketAddr) -> (Option<i32>, S
     let name = |flag: &str| flag.split('=').next().unwrap_or(flag).to_owned();
     let named: Vec<String> = extra.iter().map(|flag| name(flag)).collect();
     let farm = farm_flags(&dir, worker);
+    // The self-checks `kbf` runs before a mode starts want a `crun` that answers
+    // `--version`, as the rendered unit's `/usr/bin/crun` does.
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("mkdir");
+    crun(&bin, &dir.join("data"), FAKE_CRUN, &["true"]);
     let output = Command::new(BIN)
+        .arg(MODE)
+        .env("PATH", image_path(&bin))
+        .arg(oci_runtime(&bin))
         .args(farm.iter().filter(|flag| !named.contains(&name(flag))))
         .args(extra)
         .output()

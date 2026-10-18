@@ -155,7 +155,7 @@ pub struct Api {
     pub token: Option<ApiToken>,
     /// The node's one cache, whose fill `/metrics` reports, when the process runs a
     /// daemon whose input cache shares the disk with this server's store
-    /// (`kbf-all-in-one`).
+    /// (`kbf all-in-one`).
     pub local_cache: Option<Arc<kbf_storage::local_cache::LocalCache>>,
     /// The release store (`--releases-dir`), whose upload route is mounted here and whose
     /// `ReleaseService` the worker listener serves. `None`: the update endpoints answer 503.
