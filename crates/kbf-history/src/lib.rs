@@ -19,6 +19,8 @@
 //!   queues, drop counters and re-insertion of dropped rows with no LIST.
 //! - [`Reader`]: a run id to its record; an invocation to its header and newest
 //!   summary, and to its records a bounded page of chunks at a time.
+//! - [`flog`]: failed runs' logs copied into `r30/flog` objects that outlive the CAS blobs,
+//!   and [`Reader::failure_log`] to read a range of one back.
 //! - [`Scoped`]: an object store that refuses every key outside `history/`.
 //! - [`Today`]: the runs of today in memory, bounded, by action digest and by node.
 //! - [`status`] and the shape and status rows ([`ShapeRow`], [`StatusRow`]): what a test's
@@ -33,6 +35,7 @@
 
 pub mod container;
 mod derived;
+pub mod flog;
 mod index;
 pub mod keys;
 mod listing;
@@ -48,6 +51,7 @@ mod today;
 mod writer;
 
 pub use derived::DerivedLimits;
+pub use flog::{FlogObject, FlogParts, FlogRef, FlogStore};
 pub use index::{HistoryIndex, Inline, Offload, Offloaded};
 pub use keys::{Class, Day, Family, HistoryRoot, IndexPrefixError, IndexRoot, InvKey, WriterId};
 pub use listing::{
@@ -57,8 +61,8 @@ pub use listing::{
 pub use pending::PendingLimits;
 pub use queue::{Event, EventQueue, InvRef, QueueLimits};
 pub use reader::{
-    Allow, ChunkCursor, CursorTextError, InvocationView, MAX_PAGE_CHUNKS, ReadError, Reader,
-    RecordsPage, RunView,
+    Allow, ChunkCursor, CursorTextError, FailureLog, InvocationView, MAX_PAGE_CHUNKS, ReadError,
+    Reader, RecordsPage, RunView,
 };
 pub use rows::{Mark, RingRun, ShapeKind, ShapeRow, StatusKind, StatusRow, Verdict};
 pub use run_id::{Minted, Minter, RunId, StreamId};

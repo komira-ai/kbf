@@ -76,6 +76,7 @@ fn start(state: Option<StateStore>) -> Server {
         listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         token: None,
         local_cache: None,
+        releases: None,
     };
     let bound = bind_server_with_state(
         Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory()),

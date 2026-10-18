@@ -111,6 +111,14 @@ impl ApiToken {
     }
 }
 
+#[cfg(test)]
+impl ApiToken {
+    /// The token whose text is `text`, for tests that need no file.
+    pub(crate) fn for_tests(text: &str) -> Self {
+        Self(Sha256::digest(text.as_bytes()).into())
+    }
+}
+
 /// Whether `token` is usable as a secret: at least [`MIN_TOKEN_BYTES`] bytes, all
 /// visible ASCII.
 fn usable(token: &[u8]) -> bool {

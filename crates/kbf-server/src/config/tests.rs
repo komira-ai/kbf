@@ -397,3 +397,43 @@ fn plain_text_off_loopback_checks_each_listener_through_loopback_only() {
         );
     }
 }
+
+/// Catches a `--releases-dir` that cannot be opened being passed over: the store's directory
+/// is made, and one that cannot be (here a path under a regular file) is an error naming the
+/// flag and the directory, not an API without a store. A usable one gives the API its store.
+///
+/// Mutant seen red: the open's error dropped (`.ok()`): the API starts store-less.
+#[test]
+fn a_releases_dir_that_cannot_be_made_stops_the_start_naming_it() {
+    // <target>/<profile>/deps/<test binary>: scratch beside it, in the target directory.
+    let exe = std::env::current_exe().expect("the test binary");
+    let target = exe
+        .ancestors()
+        .nth(3)
+        .expect("<target>/<profile>/deps/<binary>");
+    let base = target
+        .join("tmp")
+        .join(format!("config-releases-{}", std::process::id()));
+    std::fs::create_dir_all(&base).expect("dir");
+    let file = base.join("a-file");
+    std::fs::write(&file, b"x").expect("file");
+    let under = file.join("store");
+    let args = |dir: &std::path::Path| {
+        Args::try_parse_from([
+            "kbf-server",
+            "--api-listen=127.0.0.1:0",
+            &format!("--releases-dir={}", dir.display()),
+        ])
+        .expect("parses")
+    };
+    let why = args(&under).api().expect_err("cannot be made").to_string();
+    assert!(
+        why.contains("--releases-dir") && why.contains("a-file/store"),
+        "{why}"
+    );
+    let api = args(&base.join("releases"))
+        .api()
+        .expect("usable")
+        .expect("an API");
+    assert!(api.releases.is_some());
+}

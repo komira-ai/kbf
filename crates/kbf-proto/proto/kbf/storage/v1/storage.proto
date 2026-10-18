@@ -54,6 +54,19 @@ message Entry {
   // The digest of the blob the result was read from.
   build.bazel.remote.execution.v2.Digest result_digest = 1;
   build.bazel.remote.execution.v2.ActionResult result = 2;
+  // The blobs the entry needs besides the result blob (the stored ActionRecord's
+  // closure), so a router can check each is still held by its owners at read time.
+  //
+  // Backward compatible by presence: a node from before this field leaves it unset, and
+  // an unset closure means "not reported, unchecked": the reader serves the entry as it
+  // did before. A set closure with no digests is a real, empty closure (nothing to
+  // check). That is why this is a message and not a bare repeated field, which cannot
+  // tell unset from empty.
+  ClosureDigests closure = 3;
+}
+
+message ClosureDigests {
+  repeated build.bazel.remote.execution.v2.Digest digests = 1;
 }
 
 message PrepareRequest {

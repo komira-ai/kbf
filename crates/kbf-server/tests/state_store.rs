@@ -39,6 +39,9 @@ mod fate;
 mod floors;
 #[path = "state_store/handover.rs"]
 mod handover;
+#[path = "state_store/subject.rs"]
+mod subject;
+mod thread_log;
 
 const GIB: u64 = 1 << 30;
 
@@ -1579,6 +1582,80 @@ async fn an_answer_released_by_another_report_keeps_its_own_detail() {
         assert_eq!(status.message, "test");
     }
     assert_eq!(farm.dropped_writes(), 0);
+}
+
+/// Rows written so far, as the store's applied log prints them.
+fn writes(disk: &Disk) -> usize {
+    disk.store.applied.lock().expect("log").len()
+}
+
+/// Catches: the release of a committed record on an input that delivers no answers
+/// (a submit), in each of its three states. (a) Nothing is held: the submit's own grant
+/// is written and started by that very call, not at the next tick. (b) Batches are held
+/// (two answers the store refused): the submit's grant is held behind them, nothing is
+/// written out of order and no `Start` is sent. (c) The next input that answers (a tick)
+/// writes the held answers first, in the order they committed, and the grant after them.
+/// The order is driven by the store's refusals, never by timing.
+#[tokio::test(start_paused = true)]
+async fn a_submit_releases_its_grant_only_when_no_batch_is_held() {
+    // (a) nothing held.
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (_, mut inbox) = register(&farm);
+    submit(&farm, request(1)).expect("queued");
+    assert_eq!(
+        starts(&mut inbox).len(),
+        1,
+        "a submit with nothing held did not start its grant at once"
+    );
+
+    // (b) two answers held, then a submit.
+    let disk = Disk::new();
+    let (farm, tickets, leases) = running_two(&disk).await;
+    disk.store.set_down(true);
+    assert!(!accepted(&farm, leases[0]).await);
+    assert!(!accepted(&farm, leases[1]).await);
+    disk.store.set_down(false);
+    let (stream, mut inbox) = register(&farm);
+    let before = writes(&disk);
+    submit(&farm, request(3)).expect("queued");
+    // The submit writes its own queue row; nothing about a lease, held or new.
+    {
+        let log = disk.store.applied.lock().expect("log");
+        assert!(
+            log[before..].iter().all(|w| !w.contains("lease/")),
+            "a submit wrote a lease row past the held answers: {:?}",
+            &log[before..]
+        );
+    }
+    assert!(
+        starts(&mut inbox).is_empty(),
+        "a grant overtook the held answers"
+    );
+    for ticket in &tickets {
+        assert!(!matches!(*ticket.stage.borrow(), Stage::Done(_)));
+    }
+
+    // (c) an answering input releases them in order, the grant last.
+    assert!(farm.heartbeat(&node(), stream, 1, Vec::new()).await);
+    farm.tick().await;
+    for ticket in &tickets {
+        let _ = ended(ticket);
+    }
+    assert!(applied_at(&disk, leases[0]) < applied_at(&disk, leases[1]));
+    let started = starts(&mut inbox);
+    assert_eq!(started.len(), 1, "the held grant was not started once");
+    let grant = format!("lease/{:016x}.{:016x}", started[0].term, started[0].seq);
+    let log = disk.store.applied.lock().expect("log");
+    let put = log
+        .iter()
+        .position(|w| w.contains(&grant))
+        .expect("the grant was written");
+    drop(log);
+    assert!(
+        put > applied_at(&disk, leases[1]),
+        "the grant was written before a held answer"
+    );
 }
 
 /// Catches: a grant carried out ahead of an earlier held record (or released by an input
