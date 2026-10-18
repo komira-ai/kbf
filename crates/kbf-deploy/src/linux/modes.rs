@@ -50,6 +50,9 @@
 //! - `handover`: the frontend's unit is the template `kbf-frontend@.service` whose two
 //!   instances hand over to one another: `Type=notify`, a control socket in a preserved
 //!   `RuntimeDirectory=`, no `Conflicts=` ([`super::handover`]).
+//! - `restart`: a node unit (`storage`, `daemon`, `storage-and-daemon`) has
+//!   `RestartSec=5` and `StartLimitIntervalSec=0`, so a failure that repeats quickly
+//!   never ends in `start-limit-hit` ([`super::restart`]).
 //! - `stop`: a mode that drains on SIGTERM (every mode but `daemon`) has
 //!   `TimeoutStopSec=infinity` and `KillSignal=SIGTERM`, so systemd never kills it
 //!   mid-drain and fails the builds in flight ([`super::stop`]).
@@ -94,7 +97,7 @@ use kbf_host::step::Cmd;
 use super::check::{Failure, Report, angle_placeholder};
 use super::config::{LinuxConfig, LinuxError};
 use super::render::{SLICE, values};
-use super::{cpuset, credential, handover, runtime, stop, stores, traverse};
+use super::{cpuset, credential, handover, restart, runtime, stop, stores, traverse};
 use crate::template::{self, TemplateError, leftovers};
 use crate::unit::{UnitError, UnitFile, comments_in_continuations};
 
@@ -145,6 +148,15 @@ impl Mode {
             Mode::StorageAndDaemon => "storage-and-daemon",
             Mode::AllInOne => "all-in-one",
         }
+    }
+
+    /// Whether the mode is a node unit (rule `restart`): `storage`, `daemon` and
+    /// `storage-and-daemon` retry a repeating failure for as long as it lasts. The
+    /// frontend and `all-in-one` (which runs one) keep their own restart policy: an old
+    /// frontend that drained after a handover exits 0 and stays down.
+    #[must_use]
+    pub fn is_node(self) -> bool {
+        matches!(self, Mode::Storage | Mode::Daemon | Mode::StorageAndDaemon)
     }
 
     /// Whether the mode runs builds, and so manages its own cgroup (rule `delegate`).
@@ -726,6 +738,13 @@ fn rules(
     if mode == Mode::Frontend {
         for how in handover::check(unit) {
             fail("handover", format!("{name} {how}"));
+        }
+    }
+
+    // restart
+    if mode.is_node() {
+        for how in restart::check(unit) {
+            fail("restart", format!("{name} {how}"));
         }
     }
 

@@ -327,6 +327,73 @@ fn hard_links_share_an_inode_inside_the_root() {
     assert!(why.contains("missing"), "{why}");
 }
 
+/// Catches a directory replaced by a symlink in its own layer: the mode a directory waits
+/// for until its layer is done is not applied through the link that took its place, nor
+/// through a link that took the place of one of its parents. A file outside the root
+/// keeps its mode (and its time), and so does a directory outside.
+#[test]
+fn a_directory_replaced_by_a_symlink_does_not_chmod_its_target() {
+    let outside = scratch("unpack-dirlink-outside");
+    let victim = outside.join("victim");
+    std::fs::write(&victim, b"secret").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let victim_dir = outside.join("victim-dir");
+    std::fs::create_dir(victim_dir.clone()).unwrap();
+    std::fs::create_dir(victim_dir.join("b")).unwrap();
+    std::fs::set_permissions(victim_dir.join("b"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mtime = |p: &Path| std::fs::metadata(p).unwrap().mtime();
+    let before = (mtime(&victim), mtime(&victim_dir.join("b")));
+    let victim_path = victim.to_str().unwrap();
+    let victim_dir_path = victim_dir.to_str().unwrap();
+
+    let layer = tar(&[
+        Item::Dir {
+            path: "d",
+            mode: 0o755,
+        },
+        Item::Symlink {
+            path: "d",
+            target: victim_path,
+        },
+        Item::Dir {
+            path: "a",
+            mode: 0o755,
+        },
+        Item::Dir {
+            path: "a/b",
+            mode: 0o755,
+        },
+        Item::Symlink {
+            path: "a",
+            target: victim_dir_path,
+        },
+    ]);
+    let (root, got) = unpack("unpack-dirlink", &[layer]);
+    got.expect("unpacked");
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().mode() & 0o7777;
+    assert_eq!(mode(&victim), 0o600, "the target of a symlink was chmoded");
+    assert_eq!(
+        mode(&victim_dir.join("b")),
+        0o700,
+        "a parent link was followed"
+    );
+    assert_eq!(
+        before,
+        (mtime(&victim), mtime(&victim_dir.join("b"))),
+        "a time was set through a link"
+    );
+    assert!(
+        std::fs::symlink_metadata(root.join("d"))
+            .unwrap()
+            .is_symlink()
+    );
+    assert!(
+        std::fs::symlink_metadata(root.join("a"))
+            .unwrap()
+            .is_symlink()
+    );
+}
+
 /// Catches a path that gets out of the root: `..` anywhere in a name is refused; an
 /// absolute symlink is followed from the root, not the host's `/`; a relative one climbs
 /// no higher than the root; both are followed for the entries below them, which land

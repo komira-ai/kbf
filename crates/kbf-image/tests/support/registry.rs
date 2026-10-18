@@ -101,11 +101,19 @@ pub fn tar_of(items: &[Item<'_>], ids: (u64, u64)) -> Vec<u8> {
                 header.set_size(0);
                 put_name(&mut header, path);
                 // An empty name is left as zeros: the builder refuses to write one.
-                if !target.is_empty() {
-                    header.set_link_name(target).expect("link name");
+                if target.len() > 100 {
+                    // Too long for the header (an absolute temp path on some hosts): a GNU
+                    // long-link entry carries it.
+                    builder
+                        .append_link(&mut header, path, target)
+                        .expect("append long link");
+                } else {
+                    if !target.is_empty() {
+                        header.set_link_name(target).expect("link name");
+                    }
+                    header.set_cksum();
+                    builder.append(&header, std::io::empty()).expect("append");
                 }
-                header.set_cksum();
-                builder.append(&header, std::io::empty()).expect("append");
             }
             Item::Special { path, kind } => {
                 header.set_entry_type(*kind);

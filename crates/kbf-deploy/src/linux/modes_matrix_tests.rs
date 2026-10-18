@@ -41,6 +41,7 @@ struct Row {
 
 const ALL: &[Mode] = &Mode::ALL;
 const BUILDS: &[Mode] = &[Mode::Daemon, Mode::StorageAndDaemon, Mode::AllInOne];
+const NODES: &[Mode] = &[Mode::Storage, Mode::Daemon, Mode::StorageAndDaemon];
 const DRAINS: &[Mode] = &[
     Mode::Frontend,
     Mode::Storage,
@@ -168,6 +169,17 @@ fn rows() -> Vec<Row> {
                 }
             },
             fails: ALL,
+        },
+        // A failure that repeats quickly ends in start-limit-hit: no delay, or a limit.
+        Row {
+            rule: "restart",
+            plant: |_, t| t.replace("RestartSec=5\n", ""),
+            fails: NODES,
+        },
+        Row {
+            rule: "restart",
+            plant: |_, t| t.replace("StartLimitIntervalSec=0\n", ""),
+            fails: NODES,
         },
         // A drain cut short: a finite stop timeout, or a signal kbf does not drain on.
         Row {

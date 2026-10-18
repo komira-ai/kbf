@@ -19,13 +19,17 @@ use kbf_proto::worker::segments_client::SegmentsClient;
 use kbf_server::NodeMap;
 use kbf_server::join::{Identity as NodeIdentity, Joiner};
 use kbf_server::members::{Members, MembershipConfig};
+use kbf_server::storage_health::Debts;
 use kbf_server::storage_node::{StorageFlags, command, parse, start_storage};
 use kbf_server::{
     EpochPolicy, Listeners, StateStore, TlsSource, WorkerTls, bind_server_with_state,
 };
 use kbf_state::{Store, Versioned};
 use kbf_storage::Storage as _;
+use kbf_storage::repair::{NoLedger, Options, RepairRecord, Repairs};
 use kbf_storage::service::{CatchUp, ROLE_URI_PREFIX, RemoteStorage};
+use kbf_store::FaultFs;
+use kbf_types::{Digest, DigestFunction};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, SanType,
@@ -236,7 +240,13 @@ async fn a_node_whose_row_lapsed_registers_again() {
     // member has the id it had.
     until("the node to register again", || {
         f.members
-            .heartbeat(MemberId(1), 2, kbf_server::members::Progress::CaughtUp)
+            .heartbeat(
+                MemberId(1),
+                2,
+                kbf_server::members::Progress::CaughtUp,
+                Debts::Unknown,
+                None,
+            )
             .ok()
     })
     .await;
@@ -446,9 +456,13 @@ impl Pki {
         }
     }
 
-    /// A certificate for `localhost` naming `role`, good for serving and for calling.
+    /// A certificate for `localhost` and `127.0.0.1` (the address a node registers when it
+    /// is bound there) naming `role`, good for serving and for calling.
     fn cert(&self, role: &str) -> (String, String) {
         let mut params = CertificateParams::new(vec!["localhost".to_owned()]).expect("params");
+        params
+            .subject_alt_names
+            .push(SanType::IpAddress([127, 0, 0, 1].into()));
         params.subject_alt_names.push(SanType::URI(
             format!("{ROLE_URI_PREFIX}{role}").try_into().expect("IA5"),
         ));
@@ -522,6 +536,83 @@ async fn over_mutual_tls_only_the_storage_role_registers() {
         .await
         .expect_err("denied");
     assert_eq!(denied.code(), Code::PermissionDenied);
+}
+
+/// Catches: a registration admitted for an address the node's certificate does not
+/// name. Over mutual TLS a frontend takes a node's word for where it is dialled only if
+/// the certificate it presented names that host: with a certificate for `localhost` and
+/// `127.0.0.1`, an instance id or an address on another host is PERMISSION_DENIED (the
+/// message says which and what the certificate names), and the node's own addresses
+/// (bound IP, the name, either with a port) register, as a real node's do in the other
+/// tests of this file.
+///
+/// Mutant seen red: the address left unchecked (a registration for `192.0.2.9` with the
+/// instance id of `localhost`).
+#[tokio::test]
+async fn over_mutual_tls_a_node_registers_only_where_its_certificate_names_it() {
+    let pki = Pki::new();
+    let (frontend_cert, frontend_key) = pki.cert("frontend");
+    let worker_tls = WorkerTls {
+        server: TlsSource::fixed(
+            "worker",
+            frontend_cert.as_bytes(),
+            frontend_key.as_bytes(),
+            Some(pki.ca.pem().as_bytes()),
+        )
+        .expect("the worker listener's TLS"),
+        deny_list: None,
+    };
+    let f = frontend(Some(worker_tls));
+    let (cert, key) = pki.cert("storage");
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(pki.ca.pem()))
+        .identity(Identity::from_pem(cert, key));
+    let channel = Endpoint::from_shared(format!("https://localhost:{}", f.worker.port()))
+        .expect("endpoint")
+        .tls_config(tls)
+        .expect("TLS")
+        .connect_lazy();
+    let join = |instance: &str, addr: &str| {
+        let who = NodeIdentity {
+            instance_id: instance.to_owned(),
+            addr: addr.to_owned(),
+            zone: String::new(),
+            weight: 1,
+        };
+        Joiner::new(channel.clone(), who, 5 * MS)
+    };
+    for (instance, addr, offending) in [
+        ("192.0.2.9:1", "127.0.0.1:1", "192.0.2.9:1"),
+        ("127.0.0.1:1", "192.0.2.9:1", "192.0.2.9:1"),
+    ] {
+        let denied = join(instance, addr)
+            .register()
+            .await
+            .expect_err("another host");
+        assert_eq!(denied.code(), Code::PermissionDenied, "{instance} {addr}");
+        assert!(denied.message().contains(offending), "{}", denied.message());
+        assert!(
+            denied.message().contains("127.0.0.1"),
+            "{}",
+            denied.message()
+        );
+    }
+    assert!(
+        f.members.current_map().expect("read").is_none(),
+        "nothing was written"
+    );
+    for (want, (instance, addr)) in [
+        ("127.0.0.1:4000", "127.0.0.1:4000"),
+        ("localhost:4000", "localhost:4001"),
+        ("localhost", "127.0.0.1"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let joined = join(instance, addr).register().await.expect("named");
+        let id = u64::try_from(want).expect("small") + 1;
+        assert_eq!(joined.member_id, id, "{instance} {addr}");
+    }
 }
 
 /// Catches: a retry that does not back off (a down frontend would be hit at the base
@@ -618,6 +709,117 @@ async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
     node_serving.abort();
     drop(stop);
     serving.await.expect("joins").expect("stops");
+}
+
+fn node_x() -> NodeIdentity {
+    NodeIdentity {
+        instance_id: "node-x".to_owned(),
+        addr: "192.0.2.5:8982".to_owned(),
+        zone: String::new(),
+        weight: 1,
+    }
+}
+
+fn joiner_of(f: &Frontend) -> Joiner {
+    let channel = Endpoint::from_shared(format!("http://{}", f.worker))
+        .expect("endpoint")
+        .connect_lazy();
+    Joiner::new(channel, node_x(), 5 * MS)
+}
+
+fn owed(i: u8) -> RepairRecord {
+    RepairRecord {
+        digest: Digest::new(DigestFunction::Sha256, [i; 32], 10),
+        replica: MemberId(2),
+        generation: 1,
+    }
+}
+
+fn open_journal(fs: &FaultFs) -> Arc<Repairs> {
+    Arc::new(Repairs::open(fs.clone(), Options::default(), Arc::new(NoLedger)).expect("journal"))
+}
+
+/// The frontend's number once member 1 has been promoted to Active and has reported:
+/// polled until `want` (the node beats on its own schedule).
+async fn until_number(f: &Frontend, want: Option<u64>) {
+    until("the frontend's number", || {
+        let health = f.members.storage_health().expect("health");
+        (health.under_replicated_blobs == want && health.silent.is_empty()).then_some(())
+    })
+    .await;
+}
+
+/// Catches: a node that does not tell the frontend what its journal holds, or tells it
+/// something else. Through the real joiner and the real membership service: 2 copies owed
+/// is 2 at the frontend, a third is 3 at the next beat, and a node that restarts (its
+/// journal reopened, the process registering again) reports the debts it had, not 0 for
+/// "none since I started". Mutants: the count of debts since the journal was opened; the
+/// debts never sent; sent as unknown.
+#[tokio::test]
+async fn a_node_with_a_journal_reports_the_copies_it_owes_across_a_restart() {
+    let f = frontend(None);
+    let fs = FaultFs::new();
+    let repairs = open_journal(&fs);
+    for i in 1..=2 {
+        let _pending = repairs.owe(owed(i)).await.expect("owed");
+    }
+    let first = tokio::spawn(joiner_of(&f).with_repairs(Arc::clone(&repairs)).run());
+    until("the node to register", || row(&f, 1)).await;
+    f.members
+        .set_state(MemberId(1), MemberState::Active)
+        .expect("promoted");
+    until_number(&f, Some(2)).await;
+
+    let _pending = repairs.owe(owed(3)).await.expect("owed");
+    until_number(&f, Some(3)).await;
+
+    first.abort();
+    drop(repairs);
+    let reopened = open_journal(&fs.crash(0));
+    let second = tokio::spawn(joiner_of(&f).with_repairs(reopened).run());
+    // Boot 2 is the registration after the restart (its index is whole, so it is Active
+    // at once). A beat of boot 2 is accepted only after it, and says nothing, so the
+    // stale report of boot 1 is gone before the number is read.
+    until("the node to register again", || {
+        f.members
+            .heartbeat(
+                MemberId(1),
+                2,
+                kbf_server::members::Progress::CaughtUp,
+                Debts::Unknown,
+                None,
+            )
+            .ok()
+    })
+    .await;
+    until_number(&f, Some(3)).await;
+    second.abort();
+}
+
+/// Catches: a node with no journal saying it owes nothing. Without one it cannot say, and
+/// the frontend must read "unknown", not zero. Mutant: the joiner reports `Known(0)` when
+/// it has no journal.
+#[tokio::test]
+async fn a_node_without_a_journal_says_it_cannot_say() {
+    let f = frontend(None);
+    let joiner = tokio::spawn(joiner_of(&f).run());
+    until("the node to register", || row(&f, 1)).await;
+    f.members
+        .set_state(MemberId(1), MemberState::Active)
+        .expect("promoted");
+    until("the node to say it cannot say", || {
+        let health = f.members.storage_health().expect("health");
+        (health.unreported == [MemberId(1)]).then_some(health)
+    })
+    .await;
+    assert_eq!(
+        f.members
+            .storage_health()
+            .expect("health")
+            .under_replicated_blobs,
+        None
+    );
+    joiner.abort();
 }
 
 /// A node started with `--frontend` that the frontend admits but sends no map it can read
@@ -1454,6 +1656,103 @@ async fn a_failed_heartbeat_is_retried_without_registering_again() {
         1,
         "registered once"
     );
+}
+
+/// Catches a deny list that stops short of the storage nodes: the operator's entry must
+/// end up refusing the caller at a real storage node, through the whole path (the entry in
+/// the state store, the frontend's refresh, the new generation, the node's heartbeat, the
+/// node's service). A storage node over mutual TLS registers with a frontend. Two frontend
+/// certificates call it, both admitted. The operator denies one by the hash of its public
+/// key and refreshes the map; once the node's heartbeat brings it the new generation that
+/// certificate is refused PERMISSION_DENIED (`denied: spki-sha256 ...`) on the same call,
+/// the other is still admitted; allowing the entry and refreshing admits it again.
+///
+/// Mutants seen red: `plan` building the map without the deny list; the storage handlers
+/// judging the role alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_denied_certificate_is_refused_by_a_real_storage_node_when_the_generation_turns() {
+    use sha2::{Digest as _, Sha256};
+    let pki = Pki::new();
+    let (frontend_cert, frontend_key) = pki.cert("frontend");
+    let worker_tls = WorkerTls {
+        server: TlsSource::fixed(
+            "worker",
+            frontend_cert.as_bytes(),
+            frontend_key.as_bytes(),
+            Some(pki.ca.pem().as_bytes()),
+        )
+        .expect("the worker listener's TLS"),
+        deny_list: None,
+    };
+    let f = frontend(Some(worker_tls));
+    let d = dir("denied-caller");
+    let write = |name: &str, text: String| {
+        let path = d.join(name);
+        std::fs::write(&path, text).expect("write");
+        path.display().to_string()
+    };
+    let (cert, key) = pki.cert("storage");
+    let more = [
+        format!("--frontend=https://localhost:{}", f.worker.port()),
+        format!("--storage-tls-cert={}", write("node.pem", cert)),
+        format!("--storage-tls-key={}", write("node.key", key)),
+        format!("--storage-client-ca={}", write("ca.pem", pki.ca.pem())),
+    ];
+    let node = start_storage(&flags(&d, &more).expect("flags"), never)
+        .await
+        .expect("starts");
+    let (maps, here) = (node.maps(), node.addr);
+    let _serving = tokio::spawn(node.serve());
+    until("the node to hold a map", || {
+        (maps.generation() > 0).then_some(())
+    })
+    .await;
+
+    let channel_of = |(cert, key): (String, String)| {
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(pki.ca.pem()))
+            .identity(Identity::from_pem(cert, key));
+        Endpoint::from_shared(format!("https://localhost:{}", here.port()))
+            .expect("endpoint")
+            .tls_config(tls)
+            .expect("TLS")
+            .connect_lazy()
+    };
+    let listed = pki.cert("frontend");
+    let spki = Sha256::digest(rcgen::PublicKeyData::subject_public_key_info(
+        &KeyPair::from_pem(&listed.1).expect("its key"),
+    ))
+    .iter()
+    .map(|b| format!("{b:02x}"))
+    .collect::<String>();
+    let (listed, other) = (channel_of(listed), channel_of(pki.cert("frontend")));
+    let digest = kbf_segments::sha256(b"asked of a node that has nothing");
+    let ask = |channel: &tonic::transport::Channel| {
+        let remote = RemoteStorage::new(channel.clone(), maps.generation());
+        async move { remote.find_missing(&[digest]).await }
+    };
+    ask(&listed).await.expect("admitted before the entry");
+    ask(&other).await.expect("admitted");
+
+    let entry = kbf_map::DenyEntry::SpkiSha256(spki);
+    f.members.deny(&entry, "the test").expect("deny");
+    f.members.refresh().expect("refresh");
+    let refused = until_async("the node to refuse the listed certificate", || async {
+        match ask(&listed).await {
+            Err(kbf_storage::StorageError::Invalid(why)) => Some(why),
+            _ => None,
+        }
+    })
+    .await;
+    assert_eq!(refused, format!("denied: {entry}"));
+    ask(&other).await.expect("another certificate is admitted");
+
+    assert!(f.members.allow(&entry).expect("allow"));
+    f.members.refresh().expect("refresh");
+    until_async("the node to admit the certificate again", || async {
+        ask(&listed).await.ok()
+    })
+    .await;
 }
 
 /// Starts `kbf storage` (`half` false) or the storage half of `kbf storage-and-daemon`

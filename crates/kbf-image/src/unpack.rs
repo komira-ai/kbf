@@ -266,9 +266,32 @@ impl State {
             self.entry(&mut layer, &mut entry)?;
         }
         for dir in layer.dirs.iter().rev() {
-            set_mode(&dir.path, dir.mode)?;
-            set_time(&dir.path, dir.mtime);
+            self.finish_dir(dir)?;
         }
+        Ok(())
+    }
+
+    /// Sets the mode and time a directory waited for. The directory is opened component
+    /// by component without following a symlink: a later entry of the layer may have
+    /// replaced it, or one of its parents, with a link, and that link is left alone (the
+    /// entry that replaced the directory owns the path now).
+    fn finish_dir(&self, dir: &Pending) -> Result<(), UnpackError> {
+        let rel = dir.path.strip_prefix(&self.root.0).unwrap_or(&dir.path);
+        let Some(fd) = open_dir_nofollow(&self.root.0, rel) else {
+            return Ok(());
+        };
+        let mode = rustix::fs::Mode::from_raw_mode(dir.mode & 0o7777);
+        rustix::fs::fchmod(&fd, mode).map_err(|e| io(&dir.path)(e.into()))?;
+        let at = rustix::fs::Timespec {
+            tv_sec: i64::try_from(dir.mtime).unwrap_or(0),
+            tv_nsec: 0,
+        };
+        let times = Timestamps {
+            last_access: at,
+            last_modification: at,
+        };
+        // A best effort, like `set_time`.
+        let _ = rustix::fs::futimens(&fd, &times);
         Ok(())
     }
 
@@ -459,6 +482,22 @@ impl State {
 /// Sets the permission bits of `path` (not a symlink).
 fn set_mode(path: &Path, mode: u32) -> Result<(), UnpackError> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777)).map_err(io(path))
+}
+
+/// Opens the directory `rel` below `root`, refusing a symlink at any component (so
+/// nothing is reached through one). `None` if a component is missing, is not a
+/// directory, or cannot be opened.
+fn open_dir_nofollow(root: &Path, rel: &Path) -> Option<rustix::fd::OwnedFd> {
+    use rustix::fs::{Mode, OFlags, open, openat};
+    let flags = OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::RDONLY;
+    let mut fd = open(root, flags, Mode::empty()).ok()?;
+    for part in rel.components() {
+        let Component::Normal(name) = part else {
+            continue;
+        };
+        fd = openat(&fd, name, flags, Mode::empty()).ok()?;
+    }
+    Some(fd)
 }
 
 /// Sets the modification (and access) time of `path` itself, not what it points at: a
