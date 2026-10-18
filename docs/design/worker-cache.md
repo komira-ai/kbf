@@ -45,7 +45,7 @@ This is the design behind two lines that already promise it: `daemon.md` § Plan
 | Blob write | `CasClient::put` / `put_chunks` | One ByteStream `Write` per blob, 1 MiB per message (`WRITE_CHUNK_BYTES`). Outputs are uploaded in series (`tree.rs` `collect`; container `outputs.rs`; native `kbf-outputs`). Every output is uploaded, even one the server already holds. |
 | Worker listener | `crates/kbf-server/src/blobs.rs` | ByteStream (`WorkerBlobs`) and, since stage S1, the `ContentAddressableStorage` service (`WorkerCas`: FindMissing, Batch*, GetTree). Every call of both is admitted against the node certificate by one rule (`admit`, line 37). Under plain text every call is refused UNAUTHENTICATED. `Capabilities`, `Execution` and `ActionCache` answer UNIMPLEMENTED there. |
 | Server batch | `crates/kbf-front/src/cas.rs` `batch_read_blobs`, `kbf-front/src/cache/batch.rs` `read_blobs` | Up to 16 MiB of blob data (`MAX_BATCH_TOTAL_BYTES`, `kbf-front/src/lib.rs`); the gRPC message cap is 17 MiB (`MAX_MESSAGE_BYTES`). Since stage S1 one metadata query looks up and touches the batch, blobs back to back in one segment come from one range GET, and up to 32 GETs run at once (`storage.md` § Reads). |
-| Container lease | `crates/kbf-driver-container/src/runtime.rs:252-277`, `podman.rs` | `materialize` writes the input root `lease/root`, which becomes the **overlay lower** (`--volume=root:/kbf/root:O,upperdir=upper,workdir=work`). `prepare_outputs` **renames** every input that an output names from `root` into `upper` (`tree.rs:188`). Then `podman unshare chown -hR 1:1` runs over root, upper and work; after exit, `chown -hR 0:0` runs over the same paths (`runtime.rs:274-277,421-428`). Containers run with `--userns=nomap` (`podman.rs:136`), so the daemon's uid maps to nothing inside. |
+| Container lease | `crates/kbf-driver-container/src/runtime.rs`, `oci/lease.rs` | `materialize` writes the input root `lease/root`, which becomes the **overlay lower** (`lowerdir=root,upperdir=upper,workdir=work` at `/kbf/root`). `prepare_outputs` **renames** every input that an output names from `root` into `upper` (`tree.rs`). Then a helper container gives root, upper and work to id 1 of its user namespace (`__chown-dirs`); after exit, it gives them back to 0:0. The container's user namespace maps only the daemon user's subordinate ids, so the daemon's uid maps to nothing inside. |
 | Native lease | `crates/kbf-driver-native/src/runtime.rs`, `lib.rs` | Writes the input root into the lease directory and runs the action **as the daemon's user**. On macOS a `sandbox-exec` profile lets the action write only under its lease directory. On Linux nothing is enforced. |
 | Per-lease timing | `runtime.rs:322-341` (container), native `:487` | `input_fetch_start/completed_timestamp` cover all of prepare. Resource usage travels as an `auxiliary_metadata` Any (`kbf-daemon/src/usage.rs`). |
 | Placement | `scheduler.md` § Placement | The first live, feasible worker in name order. No locality input. `Heartbeat` (`worker.proto:251`) carries `seq`, `report_hash` and `running`. Capabilities live in the Hello and are hashed (`report.rs`). |
@@ -321,7 +321,7 @@ Lifting them is its own small PR (stage P), outside this design.
 kbf's three drivers isolate actions in three different ways, so each driver gets its
 own answer.
 
-### 5.1 Container driver (Linux, rootless Podman): hard links into the overlay lower
+### 5.1 Container driver (Linux, rootless crun): hard links into the overlay lower
 
 `lease/root` stays the overlay lower. Its **directories are fresh per lease**, created by
 `materialize` as today. Its **files become hard links to cache entries**
@@ -330,8 +330,8 @@ cached inode:
 
 1. **Overlayfs never writes the lower layer.** Any write, truncate, chmod, chown or xattr
    change on a lower file copies it up into `upper`, and the lower inode is untouched.
-2. **The owner is unmapped.** Under `--userns=nomap` the daemon's uid maps to nothing in
-   the container, so a cached file appears owned by the overflow uid (65534). The
+2. **The owner is unmapped.** In the container's user namespace the daemon's uid maps to
+   nothing, so a cached file appears owned by the overflow uid (65534). The
    container's root has no `CAP_DAC_OVERRIDE` or `CAP_FOWNER` over an inode whose owner
    it does not map, so it cannot open the file for writing or chmod it. It **can** read
    and execute it (the "other" bits are r-x). It can also unlink or rename the name,
@@ -341,12 +341,12 @@ The action never sees the cache directory itself: it is not mounted into the con
 
 Three code changes are required, or the guarantee is void:
 
-- **`chown -hR` must never touch a file in `root`.** Today `podman unshare chown -hR 1:1
-  root` would re-own every cached inode on every lease, and the hand-back would re-own
-  it again. The fix chowns **directories only** in `root`, plus all of `upper` and
-  `work` as today. `podman unshare chown` has no type filter, so this becomes
-  `podman unshare <kbf-node> chown-dirs 1:1 <root>`: a pure-Rust subcommand of the node
-  binary that walks by descriptor without following symlinks (the rules of `remove.rs`).
+- **The hand-over must never touch a file in `root`.** A recursive `chown -h 1:1 root`
+  would re-own every cached inode on every lease, and the hand-back would re-own it
+  again. The fix chowns **directories only** in `root`, plus all of `upper` and
+  `work`. `chown` has no type filter, so this becomes `<kbf-node> chown-dirs 1:1 <root>`,
+  run in the helper container: a pure-Rust subcommand of the node binary that walks by
+  descriptor without following symlinks (the rules of `remove.rs`).
   The hand-back to 0:0 does the same over `root`.
 - **No cache inode may ever be under `upper`.** Today `prepare_outputs` `rename`s each input
   that an output names from `root` into `upper`. A renamed link would still be owned by
@@ -372,13 +372,12 @@ output that is also an input stays writable, through the private copy. Open ques
 Q1 asks whether to accept this.
 
 **What C-1 must prove on the farm before C1 merges.** The overlay behaviour above is
-known for kernel overlayfs. C-1 records the graph driver (`podman info`: kernel overlay
-or fuse-overlayfs) and the mount options (`index`, `userxattr`, `metacopy`). It then
-checks both properties on that driver: the lower is never written, and a write to an
-unmapped-owner file is refused. The refusal's errno may differ from plain permission
-checks. `podman.rs:24-29` notes that writes under an unmapped-owner directory fail with
-EROFS. Any errno is acceptable if the lower is unchanged. On a graph driver C-1 has not
-passed, the daemon warns and runs uncached (`cache_disabled_reason=graph-driver`).
+known for kernel overlayfs. C-1 records the overlay's mount options (`index`, `userxattr`,
+`metacopy`). It then checks both properties: the lower is never written, and a write to
+an unmapped-owner file is refused. The refusal's errno may differ from plain permission
+checks: a write under an unmapped-owner directory fails with EROFS. Any errno is
+acceptable if the lower is unchanged. The overlay is the kernel's, mounted by `crun`
+with pinned options (`oci/spec.rs`), so there is no other graph driver to refuse.
 
 ### 5.2 Native driver
 
@@ -540,7 +539,7 @@ the cache removes), and trusting entries after a restart without a verify, and w
   its exec. If that file is renamed and executed in that window, exec fails with
   ETXTBSY. The native driver already retries a busy program for 2 s (`BUSY_WAIT`). The
   container driver maps a container that did not start to exit 126 (`program.rs`);
-  C1 adds one retry of `podman start` when crun reports ETXTBSY (test C-9).
+  C1 adds one retry of `crun run` when crun reports ETXTBSY (test C-9).
 
 ### 6.5 Sizing, eviction and the link limit
 
@@ -641,7 +640,7 @@ How it moves:
 
 ### 6.8 Crash and restart
 
-The cache persists across restarts from its first PR, C1 (komira-build-farm#527 is
+The cache persists across restarts from its first PR, C1 (kbf#527 is
 folded into it). There is no wipe-at-start stage, and the cache never waits on a scan:
 daemons restart on every deploy, and neither a cold node nor a node that runs uncached
 while it lists 400 GB of files is acceptable. The daemon keeps an **index** on disk, one
@@ -741,7 +740,7 @@ Free-space eviction `fstatat`s each candidate and skips `st_nlink > 1` (6.5).
   would run. ENOSPC on a snapshot write
   removes `index.snap.tmp`, keeps the previous snapshot, logs, and retries at the next
   interval.
-- **Cache unusable** (missing, read-only, unknown layout, locked, wrong graph driver,
+- **Cache unusable** (missing, read-only, unknown layout, locked,
   native Linux): the daemon warns, reports `cache_disabled_reason`, and runs uncached.
   A bad snapshot is not "unusable": it costs LRU order for one pass, never the cache.
 
@@ -883,7 +882,7 @@ noise once the cache exists. So placement changes **last**, and only if metrics 
 | **T1, the transfer engine** | `kbf-transfer` core and REAPI backend; one gRPC HTTP/2 connection with many streams; one in-flight limit and byte budget for the process; ByteStream reads (memory and streamed-to-file, resumable) and chunked writes; FindMissing with an UNIMPLEMENTED fallback; window and decode limits; `TransferStats` through the invocations API; the flags of 4.5. Removes stage A's per-call constants. Tests C-11, T-1, T-2, T-3. | A |
 | **S1, server** | `WorkerCas` on the worker listener: FindMissing, BatchRead, BatchUpdate, GetTree, each admitted exactly as `WorkerBlobs::admit` admits ByteStream (one admission rule). `batch_read_blobs` reads a batch's blobs concurrently (bounded, e.g. 32) and coalesces adjacent records in one segment into one range GET. Helps buck2's own batch reads with no client change. Test C-15. | nothing; in parallel with T1 |
 | **P, plain text** | Lifts the three plain-text refusals of 4.7 | nothing |
-| **C1, the first cache** (folds in komira-build-farm#527) | Container driver only, persistent from the start. `kbf-daemon::cache`: layout; the exclusive lock, taken before any startup cleanup, on a file never unlinked; `tmp/` cleared at start; fills hashed into `tmp/` and inserted with `RENAME_NOREPLACE`; the index (6.9: one snapshot file written after load, every 5 minutes, after each adopt pass and at a clean stop, discarded if malformed) loaded at start, so the cache serves at once while the evictor drains to the limit (6.8); the fill-map slot taken by fills, the evictor and the adopt pass; the rate-limited adopt pass, which deletes nothing and speeds up under free-space pressure; lazy re-hash on first use after start; the stat check; one fill per key; LRU by bytes; pins; the ENOENT retry; empty files created directly; link-limit copy; one inode per key per lease; the free-space floor that skips `nlink > 1`. `chown-dirs`. `prepare_outputs` copies instead of renaming. The ETXTBSY retry. Flags `--cache-dir`, `--cache-max-bytes`, `--cache-min-free-bytes`, `--cache-link-concurrency`. Tests C-1, C-2, C-4, C-7 to C-10, C-12, C-13, C-16 to C-20, R-1 to R-9. | T1 planned first; correct without A or T1 (see below) |
+| **C1, the first cache** (folds in kbf#527) | Container driver only, persistent from the start. `kbf-daemon::cache`: layout; the exclusive lock, taken before any startup cleanup, on a file never unlinked; `tmp/` cleared at start; fills hashed into `tmp/` and inserted with `RENAME_NOREPLACE`; the index (6.9: one snapshot file written after load, every 5 minutes, after each adopt pass and at a clean stop, discarded if malformed) loaded at start, so the cache serves at once while the evictor drains to the limit (6.8); the fill-map slot taken by fills, the evictor and the adopt pass; the rate-limited adopt pass, which deletes nothing and speeds up under free-space pressure; lazy re-hash on first use after start; the stat check; one fill per key; LRU by bytes; pins; the ENOENT retry; empty files created directly; link-limit copy; one inode per key per lease; the free-space floor that skips `nlink > 1`. `chown-dirs`. `prepare_outputs` copies instead of renaming. The ETXTBSY retry. Flags `--cache-dir`, `--cache-max-bytes`, `--cache-min-free-bytes`, `--cache-link-concurrency`. Tests C-1, C-2, C-4, C-7 to C-10, C-12, C-13, C-16 to C-20, R-1 to R-9. | T1 planned first; correct without A or T1 (see below) |
 | **T2, batching (fix 3)** | `read_many` and `upload_missing` batch small blobs (4.3); per-blob status; the limit from GetCapabilities, or `--transfer-batch-bytes` alone where it answers UNIMPLEMENTED (4.3). Test C-14. | T1, S1 deployed |
 | **C3, cache metrics** | `InputStats` and per-node cache metrics through the APIs (section 7) | C1, T1 |
 | **C2, macOS** | Native driver built (see "C2 as built"): `clonefile` per name, behind `--cache-dir`, the sandbox as the guard. The rest is decided in [macos-end-state.md](macos-end-state.md) (step 5): hard links once actions run as pool lease users, not the daemon's user. A root-owned read-only cache on a dedicated APFS volume, daemon-made input directories owned by the slot uid, `clonefile` private copies for inputs an output names, behind `--cache-dir`. Until lease users exist: `clonefile`; the sandbox check. Tests C-3, C-3b and that document's step 5 tests; Spotlight and backup exclusion; link-concurrency measurement | C1; lease users (macos-end-state.md steps 3, 4) |
@@ -925,14 +924,14 @@ Every new module stays under 1,000 lines; `cache` is split into
 ## 10. Test plan
 
 Every test names the defect it catches and the mutant that makes it go red. C-1, C-2,
-C-9, C-12 and C-18 need real rootless Podman (the M2 harness, `kbf-it`). C-3 and C-3b
+C-9, C-12 and C-18 need real rootless `crun` (the M2 harness, `kbf-it`). C-3 and C-3b
 need macOS. The rest run against `MemoryCas`, `kbf_front::routes` in process (which
 serve FindMissing and Batch today), or a counting fake CAS.
 
 | # | Test | Defect caught | Mutant |
 |---|---|---|---|
-| C-1 | Real Podman: an action tries `echo x >> in`, `truncate -s0 in`, `chmod u+w in`, `open(O_RDWR)` and `ln in in2; echo >> in2` on a cached input. A second lease reads `in`, and the entry is re-hashed. The test records the graph driver and mount options. | A cached inode that a container can write or re-own | `chown -hR 1:1` over `root`, files included |
-| C-2 | Real Podman: an output path names an input file, and the action appends to it. The output is right and the cache entry is unchanged. | A linked input moved under `upper`, then re-owned by the upper chown | Keep `prepare_outputs`' rename, with the upper chown in place |
+| C-1 | Real `crun`: an action tries `echo x >> in`, `truncate -s0 in`, `chmod u+w in`, `open(O_RDWR)` and `ln in in2; echo >> in2` on a cached input. A second lease reads `in`, and the entry is re-hashed. The test records the overlay's mount options. | A cached inode that a container can write or re-own | `chown -hR 1:1` over `root`, files included |
+| C-2 | Real `crun`: an output path names an input file, and the action appends to it. The output is right and the cache entry is unchanged. | A linked input moved under `upper`, then re-owned by the upper chown | Keep `prepare_outputs`' rename, with the upper chown in place |
 | C-3 | macOS: an action appends to, chmods and `chflags uchg`s a cloned input. The entry is unchanged, and the lease directory is still removed. | A hard link on the native driver | `linkat` instead of `clonefile` |
 | C-3b | macOS: a sandboxed action tries to `chmod u+w`, write, `chmod a-w` and `utimes` a cache entry **by its cache path**. Every step is denied, and the next lease gets the right bytes. | A sandbox profile that lets actions reach `--cache-dir` | Allow writes to `--cache-dir` in the profile |
 | C-4 | 32 concurrent leases over one tree with a counting CAS: each blob is fetched exactly once. | Fills not merged per key | Remove the fill map |
@@ -993,13 +992,12 @@ left open):
 - An input an output names is a private copy made by `materialize`; `prepare_outputs`
   still renames it into `upper`. Without `--cache-dir` the driver chowns the input root
   with `chown -hR` as before, so nothing changes for an uncached node.
-- The ETXTBSY retry (one more `podman start`) applies with or without the cache. C-9 is
-  tested against the stand-in Podman, which reports crun's ETXTBSY: the race itself
+- The ETXTBSY retry (one more `crun run`) applies with or without the cache. C-9 is
+  tested against the stand-in `crun`, which reports crun's ETXTBSY: the race itself
   cannot be timed from a test. C-12 has C1's half only (no subtree is reused yet).
 - `--cache-dir` must exist; a directory named `kbf-lease-*` or `lease-*` is refused
   (`cache_disabled_reason=lease-name`), not only warned about. Another layout version
-  `v<n>` is renamed `v<n>.moved-<unix seconds>`. Podman's storage must be the kernel's
-  `overlay` with no `mount_program` (fuse-overlayfs is refused as `graph-driver`).
+  `v<n>` is renamed `v<n>.moved-<unix seconds>`.
 - A clean stop is the last handle of the cache being dropped: the daemon's exit saves
   the index. Snapshot writers are serialised by a lock of their own.
 - **A cached input cannot be renamed or hard-linked in the container**, only read or
@@ -1010,10 +1008,8 @@ left open):
   action that renames another input fails. Decided (CEO): accept it, as Q1 accepted
   `EACCES`. An action that renames some other cached input into an output fails; Q1's
   private-copy opt-out (`kbf-writable-inputs=1`) is added only if a real build breaks.
-- Podman's storage is checked before the cache is opened: `CacheUse` carries the cache's
-  configuration, and `PodmanRuntime::new` opens it only on storage that passed. On a
-  refused graph driver the directory is untouched: no lock, no `tmp/` cleared, no drain,
-  no snapshot.
+- `CacheUse` carries the cache's configuration, and `ContainerRuntime::new` opens it; a
+  cache that cannot be opened is a warning, and the node runs uncached.
 - **Measured at 1M entries** (`crates/kbf-daemon/tests/cache/measure.rs`, an ignored test,
   so off the gate; a release build on one developer machine, an i7-14700K with an NVMe
   disk, three runs): `cache_index_load_ms` 339 to 373 ms for the 56 MB snapshot; the
@@ -1129,7 +1125,7 @@ driver, sized the same way; what it leaves out follows):
 
 | Option | Why not (now) |
 |---|---|
-| **FUSE/NFSv4 lazy input root** (Buildbarn's virtual mode, its recommended one) | Rootless Podman would need `/dev/fuse` passed through and a FUSE server per lease. macOS needs macFUSE (no longer open source) or an NFSv4 server written in Rust. Buildbarn's own notes say lazy reads need prefetching (ADR 0010) and timeout compensation to perform. It is several times the size of C1. Revisit only if actions read a small fraction of huge input roots. |
+| **FUSE/NFSv4 lazy input root** (Buildbarn's virtual mode, its recommended one) | A rootless container would need `/dev/fuse` passed through and a FUSE server per lease. macOS needs macFUSE (no longer open source) or an NFSv4 server written in Rust. Buildbarn's own notes say lazy reads need prefetching (ADR 0010) and timeout compensation to perform. It is several times the size of C1. Revisit only if actions read a small fraction of huge input roots. |
 | **Buildbarn's two layers** (a persistent block store under a volatile hard-link cache) | Two caches to size and keep consistent. kbf materializes files anyway, so the file directory *is* the store. |
 | **Copy every input from the cache** (no links) in containers | Correct, but writes the zig tree's full size to the NVMe per lease. Kept as the fallback mode. |
 | **Bind-mount the whole cache read-only into each container** | Exposes every cached blob of every build to every action, and the paths do not match the input tree. |

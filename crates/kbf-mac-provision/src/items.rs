@@ -23,6 +23,9 @@ pub(crate) const SW_VERS: &str = "/usr/bin/sw_vers";
 
 /// The software update preferences.
 pub(crate) const SOFTWARE_UPDATE: &str = "/Library/Preferences/com.apple.SoftwareUpdate";
+/// Xcode's preferences for every user of the Mac (`CFPreferences` reads this domain
+/// after the user's own), where `xcodebuild` finds `IDEPackageSupportDisableManifestSandbox`.
+pub(crate) const XCODE: &str = "/Library/Preferences/com.apple.dt.Xcode";
 /// The App Store's older preferences, which still hold its `AutoUpdate` switch.
 pub(crate) const COMMERCE: &str = "/Library/Preferences/com.apple.commerce";
 
@@ -146,6 +149,11 @@ pub const ITEMS: &[Item] = &[
     ),
     row!("updates_config_data", preferences, fix_preferences),
     row!("appstore_auto_update", preferences, fix_preferences),
+    row!(
+        "xcode_disable_manifest_sandbox",
+        xcode_manifest_sandbox,
+        fix_preferences_unrecorded
+    ),
     row!("remote_login", remote_login, fix_remote_login),
     row!(
         "ssh_password_auth",
@@ -387,6 +395,7 @@ pub(crate) fn preference_keys(key: &str) -> &'static [(&'static str, &'static st
         "updates_auto_install_macos" => &[(SOFTWARE_UPDATE, "AutomaticallyInstallMacOSUpdates")],
         "updates_auto_install_security" => &[(SOFTWARE_UPDATE, "CriticalUpdateInstall")],
         "updates_config_data" => &[(SOFTWARE_UPDATE, "ConfigDataInstall")],
+        "xcode_disable_manifest_sandbox" => &[(XCODE, "IDEPackageSupportDisableManifestSandbox")],
         _ => &[
             (SOFTWARE_UPDATE, "AutomaticallyInstallAppUpdates"),
             (COMMERCE, "AutoUpdate"),
@@ -416,25 +425,47 @@ pub(crate) fn defaults_read(c: &Ctx<'_>, domain: &str, key: &str) -> String {
 
 /// Every preference of the item holds the profile's value.
 fn preferences(c: &Ctx<'_>) -> Outcome {
+    preferences_noting(c, &format!(" ({VERIFY_27})"))
+}
+
+/// [`preferences`], with `note` after the verdict's text.
+fn preferences_noting(c: &Ctx<'_>, note: &str) -> Outcome {
     let found: Vec<(String, String)> = preference_keys(c.key)
         .iter()
         .map(|(domain, key)| (preference_name(domain, key), defaults_read(c, domain, key)))
         .collect();
     if found.iter().all(|(_, v)| v == c.value()) {
         let all: Vec<String> = found.iter().map(|(n, v)| format!("{n} = {v}")).collect();
-        pass(format!("{} ({VERIFY_27})", all.join(", ")))
+        pass(format!("{}{note}", all.join(", ")))
     } else {
         let wrong: Vec<String> = found
             .iter()
             .filter(|(_, v)| v != c.value())
             .map(|(n, v)| format!("{n} is {}", or(v, "unset")))
             .collect();
-        fail(format!(
-            "{}, want {} ({VERIFY_27})",
-            wrong.join(", "),
-            c.value()
-        ))
+        fail(format!("{}, want {}{note}", wrong.join(", "), c.value()))
     }
+}
+
+/// `xcode_disable_manifest_sandbox` (optional): `xcodebuild` resolving a Swift package
+/// runs each manifest under SwiftPM's own `sandbox-exec`, which macOS refuses inside
+/// the sandbox an action runs in (`sandbox_apply: Operation not permitted`), so a
+/// native-driver action cannot resolve one with the default on. `xcodebuild` takes
+/// the switch as a user default only; this sets it for every user of the Mac, which
+/// the lease users and the daemon's user read after their own domain. `swift build`
+/// has `--disable-sandbox` for the same. Unset: the item does not manage it.
+fn xcode_manifest_sandbox(c: &Ctx<'_>) -> Outcome {
+    if c.value().is_empty() {
+        return pass("not managed");
+    }
+    preferences_noting(c, "")
+}
+
+/// [`fix_preferences`] without the record of the values before: `revert` does not
+/// undo this item (set it to 0 and apply, to turn the default back off).
+fn fix_preferences_unrecorded(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
+    write_preferences(c, out);
+    Ok(())
 }
 
 /// `true` or `false` for a profile bit, as `defaults write -bool` takes it.
@@ -445,6 +476,12 @@ pub(crate) fn bool_word(bit: &str) -> &'static str {
 /// Keeps the record of the values before, then writes each preference that differs.
 fn fix_preferences(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
     record::keep_before(c, out)?;
+    write_preferences(c, out);
+    Ok(())
+}
+
+/// Writes each preference of the item that differs from the profile's value.
+fn write_preferences(c: &Ctx<'_>, out: &mut Lines) {
     for (domain, key) in preference_keys(c.key) {
         if defaults_read(c, domain, key) != c.value() {
             let path = c.mac.path(domain);
@@ -459,7 +496,6 @@ fn fix_preferences(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
             );
         }
     }
-    Ok(())
 }
 
 fn on_off(bit: &str) -> &'static str {

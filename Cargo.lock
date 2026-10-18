@@ -1338,7 +1338,6 @@ dependencies = [
  "kbf-segments",
  "kbf-server",
  "kbf-storage",
- "kbf-testkit",
  "kbf-threads",
  "kbf-transfer",
  "kbf-types",
@@ -1398,6 +1397,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-ca"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "kbf-map",
+ "kbf-peer",
+ "kbf-proto",
+ "kbf-types",
+ "rcgen",
+ "ring",
+ "rustix",
+ "rustls",
+ "sha2 0.11.0",
+ "thiserror",
+ "time",
+ "x509-parser",
+]
+
+[[package]]
 name = "kbf-caps"
 version = "0.1.0"
 dependencies = [
@@ -1430,13 +1448,17 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
+ "futures",
  "kbf-all-in-one",
  "kbf-cas-conformance",
  "kbf-daemon",
  "kbf-deploy",
  "kbf-driver-container",
+ "kbf-enroll",
+ "kbf-front",
  "kbf-host",
  "kbf-node",
+ "kbf-peer",
  "kbf-proto",
  "kbf-server",
  "kbf-state",
@@ -1447,9 +1469,16 @@ dependencies = [
  "prost",
  "rcgen",
  "rustix",
+ "rustls",
  "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "time",
  "tokio",
+ "toml",
  "tonic",
+ "tracing",
+ "x509-parser",
 ]
 
 [[package]]
@@ -1485,6 +1514,7 @@ dependencies = [
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
+ "kbf-update",
  "libc",
  "prost",
  "prost-types",
@@ -1509,8 +1539,10 @@ dependencies = [
  "hex",
  "httparse",
  "kbf-host",
+ "kbf-installer",
  "kbf-mdm",
  "kbf-state",
+ "kbf-testkit",
  "kbf-types",
  "plist",
  "rcgen",
@@ -1534,12 +1566,13 @@ name = "kbf-driver-container"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64 0.23.1",
  "clap",
+ "flate2",
  "futures",
  "hex",
  "kbf-daemon",
  "kbf-front",
+ "kbf-image",
  "kbf-objstore",
  "kbf-proto",
  "kbf-testkit",
@@ -1552,8 +1585,10 @@ dependencies = [
  "rustix",
  "serde_json",
  "sha2 0.11.0",
+ "tar",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tonic",
  "tracing",
  "tracing-subscriber",
@@ -1580,6 +1615,50 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "kbf-enroll"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "hex",
+ "hyper-util",
+ "kbf-peer",
+ "kbf-proto",
+ "kbf-testkit",
+ "kbf-types",
+ "libc",
+ "rcgen",
+ "rustix",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "tonic",
+ "tower-service",
+ "tracing",
+ "x509-parser",
+ "zeroize",
+]
+
+[[package]]
+name = "kbf-enroll-registry"
+version = "0.1.0"
+dependencies = [
+ "kbf-map",
+ "kbf-state",
+ "kbf-types",
+ "prost",
+ "sha2 0.11.0",
+ "subtle",
+ "thiserror",
 ]
 
 [[package]]
@@ -1659,6 +1738,57 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-image"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "flate2",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "kbf-types",
+ "rcgen",
+ "rustix",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tar",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
+name = "kbf-installer"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "clap",
+ "flate2",
+ "hex",
+ "hyper",
+ "kbf-host",
+ "kbf-installer",
+ "kbf-update",
+ "libc",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "subtle",
+ "tar",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "kbf-invocation"
 version = "0.1.0"
 dependencies = [
@@ -1674,10 +1804,12 @@ name = "kbf-it"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "futures",
  "hex",
  "kbf-daemon",
  "kbf-deploy",
  "kbf-front",
+ "kbf-installer",
  "kbf-objstore",
  "kbf-proto",
  "kbf-server",
@@ -1781,6 +1913,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "kbf-mac-session",
+ "kbf-testkit",
  "libc",
  "rcgen",
  "reqwest",
@@ -1840,10 +1973,12 @@ dependencies = [
  "kbf-threads",
  "kbf-transfer",
  "kbf-types",
+ "kbf-update",
  "libc",
  "prost",
  "rcgen",
  "serde_json",
+ "tar",
  "thiserror",
  "tokio",
  "tonic",
@@ -1863,6 +1998,7 @@ dependencies = [
  "hmac 0.13.0",
  "kbf-objstore",
  "kbf-segments",
+ "kbf-testkit",
  "kbf-threads",
  "kbf-types",
  "md-5",
@@ -1894,7 +2030,9 @@ dependencies = [
 name = "kbf-peer"
 version = "0.1.0"
 dependencies = [
+ "kbf-map",
  "rcgen",
+ "sha2 0.11.0",
  "thiserror",
  "x509-parser",
 ]
@@ -1905,6 +2043,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "kbf-map",
+ "kbf-types",
  "prost",
  "prost-types",
  "protox",
@@ -1971,8 +2110,10 @@ dependencies = [
  "form_urlencoded",
  "futures",
  "hex",
+ "hyper-util",
  "kbf-auth",
  "kbf-caps",
+ "kbf-enroll-registry",
  "kbf-front",
  "kbf-history",
  "kbf-invocation",
@@ -1982,6 +2123,7 @@ dependencies = [
  "kbf-mdm-api",
  "kbf-meta",
  "kbf-objstore",
+ "kbf-peer",
  "kbf-proto",
  "kbf-raft",
  "kbf-route",
@@ -1991,11 +2133,13 @@ dependencies = [
  "kbf-state",
  "kbf-storage",
  "kbf-store",
+ "kbf-testkit",
  "kbf-threads",
  "kbf-tier",
  "kbf-tls",
  "kbf-types",
  "kbf-ui",
+ "kbf-update",
  "libc",
  "percent-encoding",
  "prost",
@@ -2007,6 +2151,7 @@ dependencies = [
  "sha2 0.11.0",
  "subtle",
  "thiserror",
+ "time",
  "tokio",
  "tonic",
  "tonic-prost",
@@ -2014,6 +2159,22 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-subscriber",
+ "x509-parser",
+ "zeroize",
+]
+
+[[package]]
+name = "kbf-signer"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "kbf-ca",
+ "kbf-types",
+ "rcgen",
+ "rustix",
+ "rustls",
+ "thiserror",
+ "time",
  "x509-parser",
 ]
 
@@ -2160,7 +2321,10 @@ dependencies = [
 name = "kbf-types"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]
@@ -2176,20 +2340,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "kbf-updater"
+name = "kbf-update"
 version = "0.1.0"
 dependencies = [
- "base64 0.23.1",
- "clap",
+ "futures",
  "hex",
- "kbf-host",
- "libc",
- "ring",
- "rustix",
+ "kbf-proto",
+ "kbf-threads",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
+ "tokio",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]
@@ -3512,6 +3676,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_spanned"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e7523beb55eece201a2356bee0bbca0d1ab466c14c07703b2e0ee6d42cb0c2c"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3957,6 +4130,45 @@ dependencies = [
  "pin-project-lite",
  "tokio",
 ]
+
+[[package]]
+name = "toml"
+version = "1.1.8+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20489e00e4d8741d6be680764cc12e270655e375a20d1011e844a9c3379e678d"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_parser",
+ "toml_writer",
+ "winnow",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "1.1.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b86d767906c6c42421dcba507eb9d203e779497710a47782a224bb871653053"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "toml_parser"
+version = "1.1.5+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
+dependencies = [
+ "winnow",
+]
+
+[[package]]
+name = "toml_writer"
+version = "1.1.3+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06bdbd8cfc056b8d2e2e85f29b56a3bdbecb527cef81eb39e3e7b98af4652770"
 
 [[package]]
 name = "tonic"
@@ -4504,6 +4716,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
+name = "winnow"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
+
+[[package]]
 name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4537,6 +4755,7 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "clap",
  "flate2",
  "hex",
@@ -4551,6 +4770,7 @@ dependencies = [
  "tar",
  "thiserror",
  "ureq",
+ "zip",
 ]
 
 [[package]]

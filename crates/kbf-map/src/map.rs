@@ -78,6 +78,11 @@ pub struct Member {
     pub weight: u32,
     /// Its state.
     pub state: MemberState,
+    /// The boot counter of the registration this entry stands for: larger at every
+    /// registration of the member, so a restart inside the lease changes the entry (and
+    /// the map's generation) and a cache keyed by it drops what the old boot held. 0 is
+    /// "unknown": a map from a frontend that predates the field.
+    pub boot: u64,
 }
 
 /// Why a map was refused.
