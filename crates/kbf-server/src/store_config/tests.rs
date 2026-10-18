@@ -544,13 +544,27 @@ fn two_children_over_one_store_share_the_acks_and_a_lapsed_report_is_pending() {
 }
 
 /// Catches: a row written by a build that knows more than this one (a status number or a
-/// length this build does not read) failing the read: it reads as no report, `pending`.
+/// length this build does not read) failing the read: it reads as no report, `pending`. A
+/// decode that took an unknown status for a known one would converge a farm nobody heard.
 #[test]
 fn a_row_this_build_cannot_read_is_pending_not_an_error() {
     let (acks, _clock, store) = rig();
     let map = actives(1);
     store
         .txn(kbf_state::Txn::new().put("objstore/ack/1", vec![0u8; 5], kbf_state::Cond::Any))
+        .expect("write")
+        .expect("no conflict");
+    let got = judge(&acks, &map, 3);
+    assert_eq!(got.nodes[0].status, NodeStatus::Pending);
+    assert!(!got.converged);
+
+    // Four numbers, the third a status this build does not name: also no report.
+    let newer: Vec<u8> = [1u64, 3, 9, store.now().as_duration().as_secs()]
+        .iter()
+        .flat_map(|n| n.to_be_bytes())
+        .collect();
+    store
+        .txn(kbf_state::Txn::new().put("objstore/ack/1", newer, kbf_state::Cond::Any))
         .expect("write")
         .expect("no conflict");
     let got = judge(&acks, &map, 3);
