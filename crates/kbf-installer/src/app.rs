@@ -104,6 +104,35 @@ fn root_of(cli: &Cli) -> PathBuf {
     }
 }
 
+/// How a `setup` run ends. Its steps are for a person: standard output, or with `--json`
+/// (where standard output is one object) standard error. A failure prints them ahead of
+/// its own line, as text, or as the one object.
+fn finish_setup(
+    json: bool,
+    result: Result<(), setup::SetupError>,
+    steps: &[u8],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Exit {
+    let shown = String::from_utf8_lossy(steps);
+    let Err(e) = result else {
+        let _ = if json {
+            write!(err, "{shown}")
+        } else {
+            write!(out, "{shown}")
+        };
+        return Exit::Ok;
+    };
+    let _ = if json {
+        let object =
+            serde_json::json!({"verb": "setup", "error": e.code(), "message": e.to_string()});
+        writeln!(out, "{object}")
+    } else {
+        writeln!(err, "{shown}kbf-installer: setup: {e}")
+    };
+    e.exit()
+}
+
 /// Carry out `cli` as the user `euid`. A verb that fails or is not built says so: as text on
 /// `err`, or with `--json` as one object on `out`. A verb that succeeds prints nothing here.
 pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) -> Exit {
@@ -131,27 +160,9 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         Verb::Run(args) => run(root_of(cli), args),
         Verb::BootCheck(args) => boot_check(root_of(cli), args),
         Verb::Setup(args) => {
-            // The steps are for a person: standard output, or with --json (where that is one
-            // object) standard error. A failure prints them ahead of its own line.
             let mut steps = Vec::new();
-            return match setup::cli(root_of(cli), args, cli.apply, &mut steps) {
-                Ok(()) => {
-                    let _ = if cli.json {
-                        err.write_all(&steps)
-                    } else {
-                        out.write_all(&steps)
-                    };
-                    Exit::Ok
-                }
-                Err(e) => say(
-                    e.exit(),
-                    format!(
-                        "{}kbf-installer: setup: {e}",
-                        String::from_utf8_lossy(&steps)
-                    ),
-                    serde_json::json!({"verb": name, "error": e.code(), "message": e.to_string()}),
-                ),
-            };
+            let result = setup::cli(root_of(cli), args, cli.apply, &mut steps);
+            return finish_setup(cli.json, result, &steps, out, err);
         }
         other => {
             let phase = other.built_by().unwrap_or("?");

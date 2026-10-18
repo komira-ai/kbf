@@ -63,8 +63,8 @@ impl Ours<'_> {
 pub enum Decision {
     /// Make the file this text.
     Write(String),
-    /// Leave it as it is.
-    Keep { other_settings: bool },
+    /// Leave it as it is: it holds other settings, and the keys setup writes match.
+    Keep,
     /// Only a person can go on; the reason, one line.
     Refuse(String),
 }
@@ -103,9 +103,7 @@ pub fn decide(current: Option<&str>, ours: &Ours<'_>) -> Decision {
         return Decision::Write(wanted);
     };
     if text == wanted {
-        return Decision::Keep {
-            other_settings: false,
-        };
+        return Decision::Write(wanted);
     }
     let table: Table = match text.parse() {
         Ok(t) => t,
@@ -133,9 +131,7 @@ pub fn decide(current: Option<&str>, ours: &Ours<'_>) -> Decision {
         })
         .collect();
     if differ.is_empty() {
-        Decision::Keep {
-            other_settings: true,
-        }
+        Decision::Keep
     } else {
         Decision::Refuse(format!(
             "{} holds other settings and these keys differ from the flags ({}): edit them by hand",

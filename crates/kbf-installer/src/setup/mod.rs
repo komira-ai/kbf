@@ -58,7 +58,9 @@ pub enum SetupError {
     Token(String),
     #[error("{0}")]
     Unsupported(String),
-    #[error("no user {name}: the package creates it (systemd-sysusers); run it, or reinstall the package")]
+    #[error(
+        "no user {name}: the package creates it (systemd-sysusers); run it, or reinstall the package"
+    )]
     NoUser { name: &'static str },
     #[error("no room for a {0} range of 65536 ids above the existing ones")]
     SubIdSpace(&'static str),
@@ -136,7 +138,12 @@ pub trait Releases {
 pub struct NoReleases;
 
 impl Releases for NoReleases {
-    fn install_first(&self, _: &mut dyn Exec, commit: &CommitId, _: &Source) -> Result<(), SetupError> {
+    fn install_first(
+        &self,
+        _: &mut dyn Exec,
+        commit: &CommitId,
+        _: &Source,
+    ) -> Result<(), SetupError> {
         Err(SetupError::NotBuilt(format!(
             "cannot install release {commit}: fetching a release needs the fetch child (contract P7) and the verify pipeline (P8), which this build does not have; setup stopped before it wrote kbf.toml"
         )))

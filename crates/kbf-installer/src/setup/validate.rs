@@ -51,9 +51,7 @@ impl Raw {
         let name = mode_name(self.mode);
 
         let frontend_url = match (&self.frontend_url, node) {
-            (Some(u), true) => frontend_authority(u)
-                .map_err(|e| problems.push(e))
-                .ok(),
+            (Some(u), true) => frontend_authority(u).map_err(|e| problems.push(e)).ok(),
             (None, true) => {
                 problems.push(format!("--mode={name} enrolls: --frontend-url is required"));
                 None

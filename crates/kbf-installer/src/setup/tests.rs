@@ -139,7 +139,8 @@ fn settled(units: &[&str]) -> FakeOs {
     os
 }
 
-const DAEMON_TOML: &str = "# Written by `kbf-installer setup`. The mode's other settings are added below the
+const DAEMON_TOML: &str =
+    "# Written by `kbf-installer setup`. The mode's other settings are added below the
 # keys it writes; run setup again to change these.
 mode = \"daemon\"
 
@@ -150,7 +151,8 @@ url = \"https://farm.example:8443\"
 token_file = \"/etc/kbf/enroll.token\"
 ";
 
-const FRONTEND_TOML: &str = "# Written by `kbf-installer setup`. The mode's other settings are added below the
+const FRONTEND_TOML: &str =
+    "# Written by `kbf-installer setup`. The mode's other settings are added below the
 # keys it writes; run setup again to change these.
 mode = \"frontend\"
 
@@ -207,14 +209,20 @@ fn a_bare_daemon_host_gets_accounts_dirs_token_settings_config_then_units() {
     assert_eq!(text(&exec, ENROLL_TOKEN), "tok-abc123\n");
     assert_eq!(file_meta(&exec, ENROLL_TOKEN), (0o600, KBF));
     assert_eq!(text(&exec, KBF_TOML), DAEMON_TOML);
-    assert_eq!(file_meta(&exec, KBF_TOML), (0o640, Owner { uid: 0, gid: 990 }));
+    assert_eq!(
+        file_meta(&exec, KBF_TOML),
+        (0o640, Owner { uid: 0, gid: 990 })
+    );
     assert_eq!(text(&exec, INSTALLER_TOML), DAEMON_INSTALLER_TOML);
     assert_eq!(file_meta(&exec, INSTALLER_TOML), (0o644, ROOT));
     assert!(
         !exec.entries.contains_key(&hp(API_TOKEN)),
         "a node makes no operator token"
     );
-    assert!(!out.contains("tok-abc123"), "the token is never printed: {out}");
+    assert!(
+        !out.contains("tok-abc123"),
+        "the token is never printed: {out}"
+    );
 }
 
 /// Catches a config written before the token (or before the units' other files): a crash
@@ -233,7 +241,10 @@ fn kbf_toml_is_written_after_the_other_files_and_before_any_unit() {
         .log
         .iter()
         .position(|s| matches!(s, Step::Run(c) if c.to_string().contains("systemctl")));
-    assert!(toml < first_enable, "config {toml:?} before units {first_enable:?}");
+    assert!(
+        toml < first_enable,
+        "config {toml:?} before units {first_enable:?}"
+    );
 }
 
 /// Catches a setup that is not safe to interrupt: a failure while writing the token must
@@ -261,8 +272,17 @@ fn a_rerun_with_the_same_flags_is_a_no_op() {
     let mut exec = released(host(), Platform::Linux);
     go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon));
     let steps = exec.log.len();
-    let out = go_ok(&settled(&["kbf-daemon.service"]), &mut exec, &raw(Mode::Daemon));
-    assert_eq!(exec.log.len(), steps, "a step ran: {:?}", &exec.log[steps..]);
+    let out = go_ok(
+        &settled(&["kbf-daemon.service"]),
+        &mut exec,
+        &raw(Mode::Daemon),
+    );
+    assert_eq!(
+        exec.log.len(),
+        steps,
+        "a step ran: {:?}",
+        &exec.log[steps..]
+    );
     assert_eq!(out, "nothing to do\n");
 }
 
@@ -290,7 +310,10 @@ fn a_non_root_run_is_refused_before_any_step() {
     os.euid = 1000;
     let mut exec = host();
     let err = go(&os, &mut exec, &raw(Mode::Daemon), APPLY);
-    assert!(matches!(err, Err(SetupError::NotRoot { euid: 1000 })), "{err:?}");
+    assert!(
+        matches!(err, Err(SetupError::NotRoot { euid: 1000 })),
+        "{err:?}"
+    );
     assert!(exec.log.is_empty() && exec.queries.borrow().is_empty());
 }
 
@@ -303,7 +326,10 @@ fn an_untrusted_binary_is_refused_to_apply_but_not_to_look() {
     let err = go(&os, &mut host(), &raw(Mode::Daemon), APPLY);
     assert!(matches!(err, Err(SetupError::Untrusted(_))), "{err:?}");
     let mut exec = host();
-    let dry = Options { apply: false, no_start: false };
+    let dry = Options {
+        apply: false,
+        no_start: false,
+    };
     go(&os, &mut exec, &raw(Mode::Daemon), dry).expect("a dry run");
 }
 
@@ -312,12 +338,22 @@ fn an_untrusted_binary_is_refused_to_apply_but_not_to_look() {
 #[test]
 fn a_dry_run_prints_the_steps_and_changes_nothing() {
     let mut exec = host();
-    let dry = Options { apply: false, no_start: false };
+    let dry = Options {
+        apply: false,
+        no_start: false,
+    };
     let out = go(&FakeOs::linux(), &mut exec, &raw(Mode::Frontend), dry).expect("dry run");
     assert!(exec.log.is_empty(), "{:?}", exec.log);
-    assert!(out.lines().any(|l| l.starts_with("DRY-RUN: write /etc/kbf/kbf.toml")), "{out}");
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("DRY-RUN: write /etc/kbf/kbf.toml")),
+        "{out}"
+    );
     assert!(!out.contains("\n+ "), "{out}");
-    assert!(out.contains("dry run: nothing changed. Re-run with --apply."), "{out}");
+    assert!(
+        out.contains("dry run: nothing changed. Re-run with --apply."),
+        "{out}"
+    );
     assert!(!out.contains(SECRET), "{out}");
 }
 
@@ -327,12 +363,19 @@ fn a_dry_run_prints_the_steps_and_changes_nothing() {
 #[test]
 fn the_envoy_is_checked_on_a_frontend_and_an_all_in_one_host_only() {
     for mode in [Mode::Frontend, Mode::AllInOne] {
-        for says in [None, Some(ENVOY_TOO_NEW.to_owned()), Some("nonsense".to_owned())] {
+        for says in [
+            None,
+            Some(ENVOY_TOO_NEW.to_owned()),
+            Some("nonsense".to_owned()),
+        ] {
             let mut os = FakeOs::linux();
             os.envoy_says = says.clone();
             let mut exec = host();
             let err = go(&os, &mut exec, &raw(mode), APPLY).expect_err("refused");
-            assert!(matches!(err, SetupError::EnvoyRange(_)), "{mode:?} {says:?}: {err:?}");
+            assert!(
+                matches!(err, SetupError::EnvoyRange(_)),
+                "{mode:?} {says:?}: {err:?}"
+            );
             assert_eq!(err.exit(), Exit::Refused);
             assert_eq!(err.code(), "envoy_range");
             assert!(err.to_string().starts_with("envoy_range: "), "{err}");
@@ -364,7 +407,10 @@ fn a_frontend_host_gets_its_first_operator_token_once_and_it_is_not_printed() {
     assert!(exec.log.iter().all(|s| !s.to_string().contains(SECRET)));
     // The orders directory belongs to the user the frontend runs as.
     let orders = exec.entries.get(&hp("/var/lib/kbf-installer/orders"));
-    assert!(matches!(orders, Some(Entry::Dir { owner, .. }) if *owner == KBF_SERVER), "{orders:?}");
+    assert!(
+        matches!(orders, Some(Entry::Dir { owner, .. }) if *owner == KBF_SERVER),
+        "{orders:?}"
+    );
 }
 
 /// Catches a second operator token: once any token file is there, whatever it holds and
@@ -373,7 +419,13 @@ fn a_frontend_host_gets_its_first_operator_token_once_and_it_is_not_printed() {
 #[test]
 fn an_existing_operator_token_is_never_replaced() {
     let mut exec = host();
-    put(&mut exec, API_TOKEN, 0o400, ROOT, "the-operators-own-token\n");
+    put(
+        &mut exec,
+        API_TOKEN,
+        0o400,
+        ROOT,
+        "the-operators-own-token\n",
+    );
     let mut os = FakeOs::linux();
     os.random_byte = 0x11;
     let out = go_ok(&os, &mut exec, &raw(Mode::Frontend));
@@ -398,21 +450,58 @@ fn an_existing_operator_token_is_never_replaced() {
 #[test]
 fn bad_token_files_are_refused() {
     let big = "x".repeat(5000);
-    let cases: Vec<(&str, Box<dyn Fn(&mut FakeExec)>)> = vec![
-        ("lets others read", Box::new(|e| put(e, SRC, 0o644, RUNNER, "tok\n"))),
-        ("lets others read", Box::new(|e| put(e, SRC, 0o640, RUNNER, "tok\n"))),
-        ("no such file", Box::new(|e| {
-            e.entries.remove(&hp(SRC));
-        })),
+    type Plant = Box<dyn Fn(&mut FakeExec)>;
+    let cases: Vec<(&str, Plant)> = vec![
+        (
+            "lets others read",
+            Box::new(|e| put(e, SRC, 0o644, RUNNER, "tok\n")),
+        ),
+        (
+            "lets others read",
+            Box::new(|e| put(e, SRC, 0o640, RUNNER, "tok\n")),
+        ),
+        (
+            "no such file",
+            Box::new(|e| {
+                e.entries.remove(&hp(SRC));
+            }),
+        ),
         ("empty", Box::new(|e| put(e, SRC, 0o600, RUNNER, " \n"))),
-        ("more than one word", Box::new(|e| put(e, SRC, 0o600, RUNNER, "a b\n"))),
-        ("larger than 4 KiB", Box::new(move |e| put(e, SRC, 0o600, RUNNER, &big))),
-        ("not a regular file", Box::new(|e| {
-            e.entries.insert(
-                hp(SRC),
-                Entry::Dir { perms: Perms::new(0o700), owner: RUNNER },
-            );
-        })),
+        (
+            "more than one word",
+            Box::new(|e| put(e, SRC, 0o600, RUNNER, "a b\n")),
+        ),
+        (
+            "not text",
+            Box::new(|e| {
+                let (perms, owner) = (Perms::new(0o600), RUNNER);
+                let bytes = vec![0xff, 0xfe];
+                e.entries.insert(
+                    hp(SRC),
+                    Entry::File {
+                        perms,
+                        owner,
+                        bytes,
+                    },
+                );
+            }),
+        ),
+        (
+            "larger than 4 KiB",
+            Box::new(move |e| put(e, SRC, 0o600, RUNNER, &big)),
+        ),
+        (
+            "not a regular file",
+            Box::new(|e| {
+                e.entries.insert(
+                    hp(SRC),
+                    Entry::Dir {
+                        perms: Perms::new(0o700),
+                        owner: RUNNER,
+                    },
+                );
+            }),
+        ),
     ];
     for (want, plant) in cases {
         let mut exec = host();
@@ -435,7 +524,10 @@ fn a_missing_service_user_is_refused_before_any_write() {
         os.users.retain(|u| u.name != name);
         let mut exec = host();
         let err = go(&os, &mut exec, &raw(mode), APPLY);
-        assert!(matches!(&err, Err(SetupError::NoUser { name: n }) if *n == name), "{err:?}");
+        assert!(
+            matches!(&err, Err(SetupError::NoUser { name: n }) if *n == name),
+            "{err:?}"
+        );
         assert!(exec.log.is_empty());
     }
 }
@@ -446,11 +538,17 @@ fn a_missing_service_user_is_refused_before_any_write() {
 #[test]
 fn each_mode_enables_its_own_units() {
     let want: [(Mode, &[&str]); 5] = [
-        (Mode::Frontend, &["kbf-envoy.service", "kbf-frontend@a.service"]),
+        (
+            Mode::Frontend,
+            &["kbf-envoy.service", "kbf-frontend@a.service"],
+        ),
         (Mode::Storage, &["kbf-storage.service"]),
         (Mode::Daemon, &["kbf-daemon.service"]),
         (Mode::StorageAndDaemon, &["kbf-storage-and-daemon.service"]),
-        (Mode::AllInOne, &["kbf-envoy.service", "kbf-all-in-one.service"]),
+        (
+            Mode::AllInOne,
+            &["kbf-envoy.service", "kbf-all-in-one.service"],
+        ),
     ];
     for (mode, units) in want {
         let mut exec = released(host(), Platform::Linux);
@@ -487,9 +585,16 @@ fn nothing_of_the_mode_starts_without_a_release_or_with_no_start() {
     );
     assert!(out.contains("no release is installed yet"), "{out}");
     let mut exec = released(host(), Platform::Linux);
-    let none = Options { apply: true, no_start: true };
+    let none = Options {
+        apply: true,
+        no_start: true,
+    };
     let out = go(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon), none).expect("setup");
-    assert!(cmds(&exec).iter().all(|c| !c.contains("--now")), "{:?}", cmds(&exec));
+    assert!(
+        cmds(&exec).iter().all(|c| !c.contains("--now")),
+        "{:?}",
+        cmds(&exec)
+    );
     assert!(out.contains("--no-start"), "{out}");
 }
 
@@ -501,7 +606,11 @@ fn an_enabled_unit_is_left_alone() {
     let mut os = FakeOs::linux();
     os.enabled.insert("kbf-daemon.service".to_owned());
     go_ok(&os, &mut exec, &raw(Mode::Daemon));
-    assert!(cmds(&exec).iter().all(|c| !c.contains("kbf-daemon.service")));
+    assert!(
+        cmds(&exec)
+            .iter()
+            .all(|c| !c.contains("kbf-daemon.service"))
+    );
 }
 
 /// Catches a new subid range that overlaps another user's (a container escape of one
@@ -552,7 +661,10 @@ fn subid_space_exhaustion_is_a_refusal() {
     let mut os = FakeOs::linux();
     os.subuid = "x:4294900000:60000\n".to_owned();
     let err = go(&os, &mut host(), &raw(Mode::Daemon), APPLY);
-    assert!(matches!(err, Err(SetupError::SubIdSpace("subuid"))), "{err:?}");
+    assert!(
+        matches!(err, Err(SetupError::SubIdSpace("subuid"))),
+        "{err:?}"
+    );
 }
 
 // installer.toml
@@ -568,8 +680,14 @@ fn installer_toml_follows_the_mode_and_the_flags() {
     r.min_generation = Some(7);
     go_ok(&FakeOs::linux(), &mut exec, &r);
     let t = text(&exec, INSTALLER_TOML);
-    assert!(t.starts_with("release_source = \"url\"\nrelease_url = \"https://releases.example/kbf\"\n"), "{t}");
-    assert!(t.contains("min_generation = 7\n") && !t.contains("node_cert"), "{t}");
+    assert!(
+        t.starts_with("release_source = \"url\"\nrelease_url = \"https://releases.example/kbf\"\n"),
+        "{t}"
+    );
+    assert!(
+        t.contains("min_generation = 7\n") && !t.contains("node_cert"),
+        "{t}"
+    );
 
     for (mode, role) in [
         (Mode::Storage, "storage"),
@@ -579,8 +697,14 @@ fn installer_toml_follows_the_mode_and_the_flags() {
         let mut exec = host();
         go_ok(&FakeOs::linux(), &mut exec, &raw(mode));
         let t = text(&exec, INSTALLER_TOML);
-        assert!(t.contains(&format!("node_cert = \"/var/lib/kbf/pki/{role}.pem\"\n")), "{mode:?}: {t}");
-        assert!(t.contains(&format!("node_key = \"/var/lib/kbf/pki/{role}.key\"\n")), "{mode:?}: {t}");
+        assert!(
+            t.contains(&format!("node_cert = \"/var/lib/kbf/pki/{role}.pem\"\n")),
+            "{mode:?}: {t}"
+        );
+        assert!(
+            t.contains(&format!("node_key = \"/var/lib/kbf/pki/{role}.key\"\n")),
+            "{mode:?}: {t}"
+        );
     }
     // Moving a node to the url source drops the pair, which the file refuses beside it.
     let mut exec = host();
@@ -598,16 +722,24 @@ fn installer_toml_follows_the_mode_and_the_flags() {
 fn a_rerun_keeps_the_settings_it_has_no_flag_for() {
     let mut exec = host();
     go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon));
-    let tuned = text(&exec, INSTALLER_TOML).replace("confirm_window_s = 900", "confirm_window_s = 300");
+    let tuned =
+        text(&exec, INSTALLER_TOML).replace("confirm_window_s = 900", "confirm_window_s = 300");
     put(&mut exec, INSTALLER_TOML, 0o644, ROOT, &tuned);
     let steps = exec.log.len();
-    go_ok(&settled(&["kbf-daemon.service"]), &mut exec, &raw(Mode::Daemon));
+    go_ok(
+        &settled(&["kbf-daemon.service"]),
+        &mut exec,
+        &raw(Mode::Daemon),
+    );
     assert_eq!(exec.log.len(), steps, "{:?}", &exec.log[steps..]);
     let mut changed = raw(Mode::Daemon);
     changed.min_generation = Some(9);
     go_ok(&settled(&["kbf-daemon.service"]), &mut exec, &changed);
     let t = text(&exec, INSTALLER_TOML);
-    assert!(t.contains("confirm_window_s = 300\n") && t.contains("min_generation = 9\n"), "{t}");
+    assert!(
+        t.contains("confirm_window_s = 300\n") && t.contains("min_generation = 9\n"),
+        "{t}"
+    );
 }
 
 /// Catches a floor lowered by a re-run (a replay protection undone by a forgotten flag): a
@@ -635,12 +767,21 @@ fn the_generation_floor_only_goes_up() {
 #[test]
 fn an_invalid_installer_toml_is_left_for_the_operator() {
     let mut exec = host();
-    put(&mut exec, INSTALLER_TOML, 0o644, ROOT, "confirm_window_s = 5\nsurprise = 1\n");
+    put(
+        &mut exec,
+        INSTALLER_TOML,
+        0o644,
+        ROOT,
+        "confirm_window_s = 5\nsurprise = 1\n",
+    );
     let err = go(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon), APPLY).expect_err("refused");
     assert_eq!(err.exit(), Exit::NeedsOperator);
     assert!(err.to_string().contains("installer.toml"), "{err}");
     assert!(exec.log.is_empty());
-    assert_eq!(text(&exec, INSTALLER_TOML), "confirm_window_s = 5\nsurprise = 1\n");
+    assert_eq!(
+        text(&exec, INSTALLER_TOML),
+        "confirm_window_s = 5\nsurprise = 1\n"
+    );
 }
 
 // kbf.toml
@@ -661,10 +802,21 @@ fn a_kbf_toml_with_other_settings_is_kept_or_refused_never_rewritten() {
     let mut changed = raw(Mode::Daemon);
     changed.frontend_url = Some("https://other.example".to_owned());
     let mut exec = released(host(), Platform::Linux);
+    let other_mode = with_flags.replace("mode = \"daemon\"", "mode = \"storage\"");
+    put(&mut exec, KBF_TOML, 0o640, ROOT, &other_mode);
+    let err = go(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon), APPLY).expect_err("refused");
+    assert!(
+        err.to_string().contains("mode should be \"daemon\""),
+        "{err}"
+    );
     put(&mut exec, KBF_TOML, 0o640, ROOT, &with_flags);
     let err = go(&FakeOs::linux(), &mut exec, &changed, APPLY).expect_err("refused");
     assert_eq!(err.exit(), Exit::NeedsOperator);
-    assert!(err.to_string().contains("[frontend] url should be \"https://other.example\""), "{err}");
+    assert!(
+        err.to_string()
+            .contains("[frontend] url should be \"https://other.example\""),
+        "{err}"
+    );
     assert_eq!(text(&exec, KBF_TOML), with_flags);
 
     let mut exec = released(host(), Platform::Linux);
@@ -679,6 +831,51 @@ fn a_kbf_toml_with_other_settings_is_kept_or_refused_never_rewritten() {
     assert_eq!(text(&exec, KBF_TOML), DAEMON_TOML);
 }
 
+/// Catches a settings file or a config that is not a file being replaced: a directory where
+/// `installer.toml` or `kbf.toml` should be stops setup for the operator (exit 5), and
+/// setup writes nothing over it.
+#[test]
+fn a_directory_where_a_config_file_belongs_is_left_for_the_operator() {
+    for path in [INSTALLER_TOML, KBF_TOML] {
+        let mut exec = released(host(), Platform::Linux);
+        exec.entries.insert(
+            hp(path),
+            Entry::Dir {
+                perms: Perms::new(0o755),
+                owner: ROOT,
+            },
+        );
+        let err = go(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon), APPLY).expect_err("refused");
+        assert_eq!(err.exit(), Exit::NeedsOperator, "{path}");
+        assert!(
+            err.to_string()
+                .contains(&format!("{path} is not a regular file")),
+            "{err}"
+        );
+        let wrote = format!("write {path}");
+        assert!(exec.log.iter().all(|s| !s.to_string().contains(&wrote)));
+    }
+}
+
+/// Catches a config with the right text and the wrong mode being trusted: kbf.toml must be
+/// root's and 0640 for its group, so a copy that is 0644 is put right, with one step and
+/// nothing else.
+#[test]
+fn a_config_with_the_right_text_and_the_wrong_mode_is_corrected() {
+    let mut exec = released(host(), Platform::Linux);
+    go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon));
+    let owner = Owner { uid: 0, gid: 990 };
+    put(&mut exec, KBF_TOML, 0o644, owner, DAEMON_TOML);
+    let steps = exec.log.len();
+    go_ok(
+        &settled(&["kbf-daemon.service"]),
+        &mut exec,
+        &raw(Mode::Daemon),
+    );
+    assert_eq!(exec.log.len(), steps + 1, "{:?}", &exec.log[steps..]);
+    assert_eq!(file_meta(&exec, KBF_TOML), (0o640, owner));
+}
+
 // The first release
 
 struct Installs(RefCell<Vec<String>>);
@@ -690,7 +887,9 @@ impl Releases for Installs {
         commit: &CommitId,
         source: &Source,
     ) -> Result<(), SetupError> {
-        self.0.borrow_mut().push(format!("{commit} from {source:?}"));
+        self.0
+            .borrow_mut()
+            .push(format!("{commit} from {source:?}"));
         host.apply(&Step::Symlink {
             path: hp(&current_release(Platform::Linux)),
             target: PathBuf::from(commit.to_string()),
@@ -714,11 +913,19 @@ fn first_release(mode: Mode) -> Raw {
 fn the_first_release_is_installed_between_the_settings_and_the_config() {
     let installs = Installs(RefCell::default());
     let mut exec = host();
-    let out = go_with(&FakeOs::linux(), &mut exec, &installs, &first_release(Mode::Daemon), APPLY)
-        .expect("setup");
+    let out = go_with(
+        &FakeOs::linux(),
+        &mut exec,
+        &installs,
+        &first_release(Mode::Daemon),
+        APPLY,
+    )
+    .expect("setup");
     assert_eq!(
         *installs.0.borrow(),
-        [format!("{COMMIT} from Url(\"https://releases.example/kbf\")")]
+        [format!(
+            "{COMMIT} from Url(\"https://releases.example/kbf\")"
+        )]
     );
     let order: Vec<String> = exec
         .log
@@ -730,8 +937,14 @@ fn the_first_release_is_installed_between_the_settings_and_the_config() {
         })
         .collect();
     assert_eq!(order, [ENROLL_TOKEN, INSTALLER_TOML, "release", KBF_TOML]);
-    assert!(cmds(&exec).contains(&"run /usr/bin/systemctl enable --now -- kbf-daemon.service".to_owned()));
-    assert!(out.contains(&format!("+ fetch and verify release {COMMIT}")), "{out}");
+    assert!(
+        cmds(&exec)
+            .contains(&"run /usr/bin/systemctl enable --now -- kbf-daemon.service".to_owned())
+    );
+    assert!(
+        out.contains(&format!("+ fetch and verify release {COMMIT}")),
+        "{out}"
+    );
 }
 
 /// Catches a setup that says it is done when the release could not be installed: this
@@ -740,12 +953,51 @@ fn the_first_release_is_installed_between_the_settings_and_the_config() {
 #[test]
 fn a_failed_first_release_leaves_no_config_and_no_unit() {
     let mut exec = host();
-    let err = go(&FakeOs::linux(), &mut exec, &first_release(Mode::Daemon), APPLY).expect_err("fails");
+    let err = go(
+        &FakeOs::linux(),
+        &mut exec,
+        &first_release(Mode::Daemon),
+        APPLY,
+    )
+    .expect_err("fails");
     assert!(matches!(err, SetupError::NotBuilt(_)), "{err:?}");
     assert_eq!(err.exit(), Exit::Failed);
     assert!(exec.entries.contains_key(&hp(INSTALLER_TOML)));
     assert!(!exec.entries.contains_key(&hp(KBF_TOML)));
     assert!(cmds(&exec).iter().all(|c| !c.contains("systemctl")));
+}
+
+/// Catches a downloader that says it installed a release and did not: setup stops (exit 1)
+/// before it writes `kbf.toml`, since a start would have nothing to run.
+#[test]
+fn a_release_that_was_not_installed_stops_before_the_config() {
+    struct Lazy;
+    impl Releases for Lazy {
+        fn install_first(
+            &self,
+            _: &mut dyn Exec,
+            _: &CommitId,
+            _: &Source,
+        ) -> Result<(), SetupError> {
+            Ok(())
+        }
+    }
+    let mut exec = host();
+    let err = go_with(
+        &FakeOs::linux(),
+        &mut exec,
+        &Lazy,
+        &first_release(Mode::Daemon),
+        APPLY,
+    )
+    .expect_err("fails");
+    assert!(
+        err.to_string()
+            .contains("was fetched but releases/current is not there"),
+        "{err}"
+    );
+    assert_eq!(err.exit(), Exit::Failed);
+    assert!(!exec.entries.contains_key(&hp(KBF_TOML)));
 }
 
 /// Catches a release fetched twice or replaced by setup: with one installed, `--commit` is
@@ -755,18 +1007,39 @@ fn a_failed_first_release_leaves_no_config_and_no_unit() {
 fn a_release_already_installed_is_not_fetched_and_a_dry_run_only_names_the_fetch() {
     let installs = Installs(RefCell::default());
     let mut exec = released(host(), Platform::Linux);
-    let out = go_with(&FakeOs::linux(), &mut exec, &installs, &first_release(Mode::Daemon), APPLY)
-        .expect("setup");
+    let out = go_with(
+        &FakeOs::linux(),
+        &mut exec,
+        &installs,
+        &first_release(Mode::Daemon),
+        APPLY,
+    )
+    .expect("setup");
     assert!(installs.0.borrow().is_empty());
     assert!(out.contains("a release is installed already"), "{out}");
 
     let mut exec = host();
-    let dry = Options { apply: false, no_start: false };
-    let out = go_with(&FakeOs::linux(), &mut exec, &installs, &first_release(Mode::Daemon), dry)
-        .expect("dry run");
+    let dry = Options {
+        apply: false,
+        no_start: false,
+    };
+    let out = go_with(
+        &FakeOs::linux(),
+        &mut exec,
+        &installs,
+        &first_release(Mode::Daemon),
+        dry,
+    )
+    .expect("dry run");
     assert!(installs.0.borrow().is_empty());
-    assert!(out.contains(&format!("DRY-RUN: fetch and verify release {COMMIT}")), "{out}");
-    assert!(out.contains("DRY-RUN: run /usr/bin/systemctl enable --now -- kbf-daemon.service"), "{out}");
+    assert!(
+        out.contains(&format!("DRY-RUN: fetch and verify release {COMMIT}")),
+        "{out}"
+    );
+    assert!(
+        out.contains("DRY-RUN: run /usr/bin/systemctl enable --now -- kbf-daemon.service"),
+        "{out}"
+    );
 }
 
 // Flags
@@ -812,8 +1085,14 @@ fn the_modes_that_enroll_need_a_frontend_and_a_token_and_the_others_refuse_them(
         r.frontend_url = Some("https://farm.example".to_owned());
         r.token_file = Some(SRC.to_owned());
         let found = r.validate().expect_err("refused").join("; ");
-        assert!(found.contains("--frontend-url is for the modes that enroll"), "{found}");
-        assert!(found.contains("--token-file is for the modes that enroll"), "{found}");
+        assert!(
+            found.contains("--frontend-url is for the modes that enroll"),
+            "{found}"
+        );
+        assert!(
+            found.contains("--token-file is for the modes that enroll"),
+            "{found}"
+        );
         let mut r = raw(mode);
         r.release_source = Some(ReleaseSource::Frontend);
         r.release_url = None;
@@ -821,7 +1100,12 @@ fn the_modes_that_enroll_need_a_frontend_and_a_token_and_the_others_refuse_them(
         assert!(found.contains("does not enroll"), "{found}");
         let mut r = raw(mode);
         r.release_url = None;
-        assert!(r.validate().expect_err("url needed").join(";").contains("needs --release-url"));
+        assert!(
+            r.validate()
+                .expect_err("url needed")
+                .join(";")
+                .contains("needs --release-url")
+        );
     }
 }
 
@@ -851,8 +1135,14 @@ fn urls_are_https_with_nothing_hidden() {
         r.frontend_url = Some(url.to_owned());
         r.validate().expect("valid").frontend_url
     };
-    assert_eq!(ok("https://Farm.Example/").as_deref(), Some("https://farm.example"));
-    assert_eq!(ok("https://[::1]:8443").as_deref(), Some("https://[::1]:8443"));
+    assert_eq!(
+        ok("https://Farm.Example/").as_deref(),
+        Some("https://farm.example")
+    );
+    assert_eq!(
+        ok("https://[::1]:8443").as_deref(),
+        Some("https://[::1]:8443")
+    );
 }
 
 #[test]
@@ -868,8 +1158,14 @@ fn the_release_source_flags_agree() {
     assert!(check(ReleaseSource::Url, Some("http://m.example")).is_err());
     assert!(check(ReleaseSource::Url, Some("https://m.example/a/../b")).is_err());
     let ok = check(ReleaseSource::Url, Some("https://M.example:8443/releases/")).expect("valid");
-    assert_eq!(ok.source, Source::Url("https://m.example:8443/releases".to_owned()));
-    assert_eq!(check(ReleaseSource::Frontend, None).expect("valid").source, Source::Frontend);
+    assert_eq!(
+        ok.source,
+        Source::Url("https://m.example:8443/releases".to_owned())
+    );
+    assert_eq!(
+        check(ReleaseSource::Frontend, None).expect("valid").source,
+        Source::Frontend
+    );
 }
 
 /// Catches `--commit` with the frontend as source: before the host has enrolled there is
@@ -890,8 +1186,16 @@ fn each_failure_has_its_exit_code_and_word() {
         (SetupError::Invalid(vec![]), Exit::Usage, "invalid_flags"),
         (SetupError::Token("x".into()), Exit::Usage, "token_file"),
         (SetupError::NoUser { name: "kbf" }, Exit::Usage, "no_user"),
-        (SetupError::NeedsOperator("x".into()), Exit::NeedsOperator, "needs_operator"),
-        (SetupError::NotBuilt("x".into()), Exit::Failed, "not_implemented"),
+        (
+            SetupError::NeedsOperator("x".into()),
+            Exit::NeedsOperator,
+            "needs_operator",
+        ),
+        (
+            SetupError::NotBuilt("x".into()),
+            Exit::Failed,
+            "not_implemented",
+        ),
         (SetupError::NoFreeId, Exit::Failed, "no_room"),
     ];
     for (err, exit, code) in cases {
@@ -913,8 +1217,14 @@ fn a_mac_node_gets_its_fetch_account_and_launchd_jobs() {
     go_ok(&os, &mut exec, &raw(Mode::Daemon));
     let c = cmds(&exec);
     assert_eq!(c.len(), 8, "{c:?}");
-    assert_eq!(c[0], "run /usr/bin/dscl . -create /Groups/_kbf-fetch PrimaryGroupID 303");
-    assert_eq!(c[1], "run /usr/bin/dscl . -create /Users/_kbf-fetch UniqueID 303");
+    assert_eq!(
+        c[0],
+        "run /usr/bin/dscl . -create /Groups/_kbf-fetch PrimaryGroupID 303"
+    );
+    assert_eq!(
+        c[1],
+        "run /usr/bin/dscl . -create /Users/_kbf-fetch UniqueID 303"
+    );
     assert_eq!(
         c[6],
         "run /bin/launchctl bootstrap system /Library/LaunchDaemons/com.komira.kbf-installer.plist"
@@ -926,7 +1236,13 @@ fn a_mac_node_gets_its_fetch_account_and_launchd_jobs() {
     assert_eq!(file_meta(&exec, ENROLL_TOKEN), (0o600, ROOT));
     assert_eq!(file_meta(&exec, KBF_TOML), (0o640, ROOT));
     let orders = exec.entries.get(&hp("/var/db/kbf-installer/orders"));
-    assert!(matches!(orders, Some(Entry::Dir { owner: Owner { uid: 0, .. }, .. })));
+    assert!(matches!(
+        orders,
+        Some(Entry::Dir {
+            owner: Owner { uid: 0, .. },
+            ..
+        })
+    ));
     assert!(text(&exec, INSTALLER_TOML).contains("node_cert = \"/var/db/kbf/pki/daemon.pem\""));
 }
 
@@ -937,9 +1253,7 @@ fn a_mac_refuses_the_frontend_and_waits_for_a_release() {
     let mut exec = host();
     let out = go_ok(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon));
     assert!(
-        cmds(&exec)
-            .iter()
-            .all(|c| !c.contains("kbf-daemon.plist")),
+        cmds(&exec).iter().all(|c| !c.contains("kbf-daemon.plist")),
         "{:?}",
         cmds(&exec)
     );
@@ -966,7 +1280,13 @@ fn answer(exec: &mut FakeExec) {
     use kbf_host::testkit::reply;
     exec.answer = Box::new(|cmd| {
         let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
-        let program = cmd.program.as_str().rsplit('/').next().expect("a name").to_owned();
+        let program = cmd
+            .program
+            .as_str()
+            .rsplit('/')
+            .next()
+            .expect("a name")
+            .to_owned();
         Ok(match (program.as_str(), args.as_slice()) {
             ("getent", ["passwd", "--", "kbf"]) => {
                 reply(0, "kbf:x:990:990:kbf:/var/lib/kbf:/usr/sbin/nologin\n", "")
@@ -994,7 +1314,13 @@ fn the_system_os_reads_the_host_through_exec() {
     let mut exec = FakeExec::new(0);
     answer(&mut exec);
     put(&mut exec, "/etc/subuid", 0o644, ROOT, "kbf:100000:65536\n");
-    exec.entries.insert(hp("/etc/subgid"), Entry::Dir { perms: Perms::new(0o755), owner: ROOT });
+    exec.entries.insert(
+        hp("/etc/subgid"),
+        Entry::Dir {
+            perms: Perms::new(0o755),
+            owner: ROOT,
+        },
+    );
     put(&mut exec, "/var/lib/systemd/linger/kbf", 0o644, ROOT, "");
     let os = SystemOs::new(&exec, Platform::Linux);
     assert_eq!((os.euid(), os.platform()), (0, Platform::Linux));
@@ -1003,11 +1329,18 @@ fn the_system_os_reads_the_host_through_exec() {
     assert_eq!(os.user("kbf").expect("lookup").expect("a user").uid, 990);
     assert!(os.user("nobody-here").expect("lookup").is_none());
     assert_eq!(os.subuid().expect("read"), "kbf:100000:65536\n");
-    assert_eq!(os.subgid().expect("read"), "", "a directory is no subid file");
+    assert_eq!(
+        os.subgid().expect("read"),
+        "",
+        "a directory is no subid file"
+    );
     assert!(os.lingers("kbf").expect("stat"));
     assert!(!os.lingers("nobody-here").expect("stat"));
     assert!(os.unit_enabled("kbf-daemon.service").expect("query"));
-    assert!(!os.unit_enabled("kbf-envoy.service").expect("a static unit is not enabled"));
+    assert!(
+        !os.unit_enabled("kbf-envoy.service")
+            .expect("a static unit is not enabled")
+    );
     assert!(!os.unit_enabled("kbf-storage.service").expect("query"));
     assert!(os.launchd_loaded("com.komira.kbf-daemon").expect("query"));
     assert!(!os.launchd_loaded("com.komira.other").expect("query"));
@@ -1015,7 +1348,11 @@ fn the_system_os_reads_the_host_through_exec() {
     assert!(os.dscl_list("/Groups PrimaryGroupID").is_err());
     let mut exec = FakeExec::new(0);
     exec.untrusted = true;
-    assert!(SystemOs::new(&exec, Platform::MacOs).trusted_binary().is_err());
+    assert!(
+        SystemOs::new(&exec, Platform::MacOs)
+            .trusted_binary()
+            .is_err()
+    );
 }
 
 /// Catches an operator token that is not random: the real source gives the length asked, and
@@ -1025,7 +1362,10 @@ fn the_system_os_draws_random_bytes() {
     use super::os::{Os, SystemOs};
     let exec = FakeExec::new(0);
     let os = SystemOs::new(&exec, Platform::Linux);
-    let (a, b) = (os.random(32).expect("random"), os.random(32).expect("random"));
+    let (a, b) = (
+        os.random(32).expect("random"),
+        os.random(32).expect("random"),
+    );
     assert_eq!((a.len(), b.len()), (32, 32));
     assert_ne!(a, b);
     assert!(os.random(0).expect("random").is_empty());
@@ -1041,7 +1381,10 @@ fn the_system_os_asks_the_installed_envoy() {
     let os = SystemOs::new(&exec, Platform::Linux);
     let said = os.envoy().map(|v| v.to_string()).map_err(|e| e.to_string());
     assert!(
-        said.is_ok() || said.as_ref().is_err_and(|e| e.contains("/usr/bin/envoy") || e.contains("Envoy")),
+        said.is_ok()
+            || said
+                .as_ref()
+                .is_err_and(|e| e.contains("/usr/bin/envoy") || e.contains("Envoy")),
         "{said:?}"
     );
 }
@@ -1051,18 +1394,33 @@ fn the_system_os_asks_the_installed_envoy() {
 fn every_failure_reads_as_a_sentence() {
     let cases: Vec<(SetupError, &str)> = vec![
         (SetupError::NotRoot { euid: 5 }, "run it with sudo"),
-        (SetupError::Untrusted(kbf_host::Untrusted::Writable { path: "/x".into(), mode: 0o775 }), "binary"),
+        (
+            SetupError::Untrusted(kbf_host::Untrusted::Writable {
+                path: "/x".into(),
+                mode: 0o775,
+            }),
+            "binary",
+        ),
         (SetupError::Invalid(vec!["a".into(), "b".into()]), "a\nb"),
-        (SetupError::Token("/t: empty".into()), "token file /t: empty"),
+        (
+            SetupError::Token("/t: empty".into()),
+            "token file /t: empty",
+        ),
         (SetupError::Unsupported("no".into()), "no"),
         (SetupError::NoUser { name: "kbf" }, "no user kbf"),
         (SetupError::SubIdSpace("subuid"), "subuid range"),
         (SetupError::NoFreeId, "between 300 and 399"),
         (SetupError::NeedsOperator("fix it".into()), "fix it"),
         (SetupError::NotBuilt("later".into()), "later"),
-        (SetupError::Path(kbf_host::HostPath::new("rel").expect_err("relative")), "rel"),
+        (
+            SetupError::Path(kbf_host::HostPath::new("rel").expect_err("relative")),
+            "rel",
+        ),
         (SetupError::Io(std::io::Error::other("disk")), "disk"),
-        (SetupError::Host(kbf_host::HostError::IsRoot), "without sudo"),
+        (
+            SetupError::Host(kbf_host::HostError::IsRoot),
+            "without sudo",
+        ),
     ];
     for (err, want) in cases {
         assert!(err.to_string().contains(want), "{err}: want {want}");
@@ -1070,7 +1428,11 @@ fn every_failure_reads_as_a_sentence() {
         let _ = err.exit();
     }
     let err = NoReleases
-        .install_first(&mut FakeExec::new(0), &COMMIT.parse().expect("commit"), &Source::Frontend)
+        .install_first(
+            &mut FakeExec::new(0),
+            &COMMIT.parse().expect("commit"),
+            &Source::Frontend,
+        )
         .expect_err("no fetch child");
     assert!(err.to_string().contains("fetch child"), "{err}");
 }

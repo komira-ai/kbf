@@ -130,7 +130,8 @@ impl<E: Exec> Os for SystemOs<'_, E> {
             cmd = cmd.arg(word);
         }
         let out = self.exec.query(&cmd)?;
-        kbf_host::exec::succeeded(&cmd, out).map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        kbf_host::exec::succeeded(&cmd, out)
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
     }
 
     fn envoy(&self) -> Result<EnvoyVersion, VersionError> {
@@ -141,7 +142,10 @@ impl<E: Exec> Os for SystemOs<'_, E> {
         let mut bytes = vec![0u8; len];
         let mut filled = 0;
         while filled < len {
-            let n = rustix::rand::getrandom(&mut bytes[filled..], rustix::rand::GetRandomFlags::empty())?;
+            let n = rustix::rand::getrandom(
+                &mut bytes[filled..],
+                rustix::rand::GetRandomFlags::empty(),
+            )?;
             filled += n;
         }
         Ok(bytes)

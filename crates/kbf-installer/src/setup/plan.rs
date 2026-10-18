@@ -7,7 +7,7 @@
 //! Every step is added only where the host differs, so a second run with the same flags has
 //! an empty plan.
 
-use kbf_host::{Cmd, Entry, Exec, HostPath, Kind, Owner, Perms, Plan, Planner, RunUser};
+use kbf_host::{Cmd, Entry, Exec, HostPath, Owner, Perms, Plan, Planner, RunUser};
 
 use super::kbf_toml::{self, Decision, Ours};
 use super::os::{DSCL, LAUNCHCTL, Os, SYSTEMCTL};
@@ -35,6 +35,29 @@ const MAX_TOKEN_BYTES: u64 = 4096;
 
 fn hp(path: &str) -> Result<HostPath, SetupError> {
     Ok(HostPath::new(path)?)
+}
+
+/// A directory at `path`, `mode` and `owner`'s. (One line per call site, so that a failed
+/// step has a line of its own that a test runs.)
+fn dir<E: Exec>(
+    p: &mut Planner<'_, E>,
+    path: &str,
+    mode: u32,
+    owner: Owner,
+) -> Result<(), SetupError> {
+    p.dir(hp(path)?, Perms::new(mode), Some(owner))?;
+    Ok(())
+}
+
+/// A file at `path` with these bytes, `mode` and `owner`'s; whether a step was planned.
+fn file<E: Exec>(
+    p: &mut Planner<'_, E>,
+    path: &str,
+    mode: u32,
+    owner: Owner,
+    bytes: Vec<u8>,
+) -> Result<bool, SetupError> {
+    Ok(p.file(hp(path)?, Perms::new(mode), Some(owner), bytes)?)
 }
 
 /// The units a mode is run by. The names are the static unit files of the package
@@ -121,26 +144,23 @@ pub struct Outcome {
     pub notes: Vec<String>,
 }
 
-/// A token file's content as setup keeps it: one line, a newline after it.
+/// A token file's content as setup keeps it: one line, a newline after it. The file is
+/// looked at once, whole: what is checked is what is read.
 fn read_token<E: Exec>(exec: &E, file: &str) -> Result<Vec<u8>, SetupError> {
     let bad = |why: &str| SetupError::Token(format!("{file}: {why}"));
-    let path = hp(file)?;
-    let meta = exec.stat(&path)?.ok_or_else(|| bad("no such file"))?;
-    if meta.kind != Kind::File {
-        return Err(bad("not a regular file"));
-    }
-    if meta.perms.bits() & 0o077 != 0 {
+    let (perms, bytes) = match exec.inspect(&hp(file)?)? {
+        None => return Err(bad("no such file")),
+        Some(Entry::File { perms, bytes, .. }) => (perms, bytes),
+        Some(_) => return Err(bad("not a regular file")),
+    };
+    if perms.bits() & 0o077 != 0 {
         return Err(bad(&format!(
-            "mode {} lets others read the token: chmod 600 {file}",
-            meta.perms
+            "mode {perms} lets others read the token: chmod 600 {file}"
         )));
     }
-    if meta.len > MAX_TOKEN_BYTES {
+    if bytes.len() as u64 > MAX_TOKEN_BYTES {
         return Err(bad("larger than 4 KiB, which no token is"));
     }
-    let Some(Entry::File { bytes, .. }) = exec.inspect(&path)? else {
-        return Err(bad("not a regular file"));
-    };
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| bad("not text"))?
         .trim();
@@ -297,36 +317,24 @@ pub fn before_release<O: Os, E: Exec>(
     // The installer's tree is root's; `orders/` inside it is the service user's (on a Mac the
     // daemon is root, so it is root's).
     let (root, service) = (ctx.root, ctx.service_owner());
-    p.dir(hp(paths::ETC_DIR)?, Perms::new(0o755), Some(root))?;
-    p.dir(
-        hp(paths::installer_dir(platform))?,
-        Perms::new(0o755),
-        Some(root),
-    )?;
-    p.dir(
-        hp(&paths::orders_dir(platform))?,
-        Perms::new(0o700),
-        Some(service),
-    )?;
+    dir(&mut p, paths::ETC_DIR, 0o755, root)?;
+    dir(&mut p, paths::installer_dir(platform), 0o755, root)?;
+    dir(&mut p, &paths::orders_dir(platform), 0o700, service)?;
 
     // The tokens belong to the user whose process reads them: both loaders refuse a token
     // file another user owns, or one with a mode other than 0600 or 0400.
     if let Some(token) = enroll_token {
-        p.file(
-            hp(paths::ENROLL_TOKEN)?,
-            Perms::new(0o600),
-            Some(service),
-            token,
-        )?;
+        file(&mut p, paths::ENROLL_TOKEN, 0o600, service, token)?;
     }
     if serves_api(v.mode) {
         operator_token(&mut p, os, exec, service, &mut notes)?;
     }
 
-    p.file(
-        hp(paths::INSTALLER_TOML)?,
-        Perms::new(0o644),
-        Some(root),
+    file(
+        &mut p,
+        paths::INSTALLER_TOML,
+        0o644,
+        root,
         settings.into_bytes(),
     )?;
     Ok(Outcome {
@@ -344,12 +352,17 @@ fn operator_token<O: Os, E: Exec>(
     owner: Owner,
     notes: &mut Vec<String>,
 ) -> Result<(), SetupError> {
-    let path = hp(paths::API_TOKEN)?;
-    if exec.stat(&path)?.is_some() {
+    if exec.stat(&hp(paths::API_TOKEN)?)?.is_some() {
         return Ok(());
     }
     let secret = hex::encode(os.random(32)?);
-    p.file(path, Perms::new(0o600), Some(owner), format!("{secret}\n").into_bytes())?;
+    file(
+        p,
+        paths::API_TOKEN,
+        0o600,
+        owner,
+        format!("{secret}\n").into_bytes(),
+    )?;
     notes.push(format!(
         "the first operator token is in {}: read it as root and keep it; setup makes no other",
         paths::API_TOKEN
@@ -394,12 +407,7 @@ pub fn after_release<O: Os, E: Exec>(
                 uid: ctx.root.uid,
                 gid: ctx.service_owner().gid,
             };
-            let changed = p.file(
-                hp(paths::KBF_TOML)?,
-                Perms::new(0o640),
-                Some(owner),
-                text.into_bytes(),
-            )?;
+            let changed = file(&mut p, paths::KBF_TOML, 0o640, owner, text.into_bytes())?;
             if changed && existed {
                 notes.push(
                     "kbf.toml changed: a running kbf keeps the old one until it is restarted; setup does not restart it"
@@ -407,14 +415,10 @@ pub fn after_release<O: Os, E: Exec>(
                 );
             }
         }
-        Decision::Keep { other_settings } => {
-            if other_settings {
-                notes.push(
-                    "kbf.toml holds other settings and the keys setup writes already match: left as it is"
-                        .to_owned(),
-                );
-            }
-        }
+        Decision::Keep => notes.push(
+            "kbf.toml holds other settings and the keys setup writes already match: left as it is"
+                .to_owned(),
+        ),
         Decision::Refuse(why) => return Err(SetupError::NeedsOperator(why)),
     }
 

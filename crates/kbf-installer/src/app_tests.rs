@@ -80,6 +80,63 @@ fn setup_is_built_and_refuses_flags_that_do_not_make_a_host() {
     );
 }
 
+/// Catches `setup`'s ending wrong: a success prints its steps where a person reads them
+/// (standard output, or standard error under `--json`, whose standard output is one object)
+/// and exits 0; a failure prints them ahead of its own line, or as the one object, with the
+/// failure's exit code.
+#[test]
+fn setup_ends_with_its_steps_and_its_exit_code() {
+    use crate::setup::SetupError;
+    let steps = b"+ mkdir /etc/kbf\n";
+    let end = |json: bool, result: Result<(), SetupError>| {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let exit = finish_setup(json, result, steps, &mut out, &mut err);
+        (
+            exit,
+            String::from_utf8(out).expect("text"),
+            String::from_utf8(err).expect("text"),
+        )
+    };
+    assert_eq!(
+        end(false, Ok(())),
+        (Exit::Ok, "+ mkdir /etc/kbf\n".to_owned(), String::new())
+    );
+    assert_eq!(
+        end(true, Ok(())),
+        (Exit::Ok, String::new(), "+ mkdir /etc/kbf\n".to_owned())
+    );
+    let failed = || Err(SetupError::NeedsOperator("fix it".to_owned()));
+    assert_eq!(
+        end(false, failed()),
+        (
+            Exit::NeedsOperator,
+            String::new(),
+            "+ mkdir /etc/kbf\nkbf-installer: setup: fix it\n".to_owned()
+        )
+    );
+    let (exit, out, err) = end(true, failed());
+    assert_eq!((exit, err.as_str()), (Exit::NeedsOperator, ""));
+    let v: Value = serde_json::from_str(out.trim_end()).expect("one json object");
+    assert_eq!(
+        v,
+        serde_json::json!({"verb": "setup", "error": "needs_operator", "message": "fix it"})
+    );
+}
+
+/// Catches a built verb that names a phase: `run`, `boot-check` and `setup` exist, so none
+/// says which pull request builds it; every other verb does.
+#[test]
+fn only_the_built_verbs_name_no_phase() {
+    for args in [
+        vec!["run", "--unit", "kbf.service"],
+        vec!["boot-check"],
+        vec!["setup", "--mode=daemon"],
+    ] {
+        assert_eq!(parse(&args).verb.built_by(), None, "{args:?}");
+    }
+    assert_eq!(parse(&["check"]).verb.built_by(), Some("P10"));
+}
+
 /// Catches a verb that skips the root check, or one that needs root and does not need to:
 /// everything but `status` and `check` is refused as an ordinary user with
 /// exit 2, and those two get as far as their own (missing) work.
