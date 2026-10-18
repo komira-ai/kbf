@@ -137,6 +137,8 @@ syn = { version = "2.0.119", default-features = false, features = ["full", "pars
 # no extended attributes.
 tar = { version = "0.4.46", default-features = false }
 thiserror = "2.0.21"
+# `kbf.toml`, the node's config file (kbf-enroll); no datetime or display support.
+toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
 # RFC 3339 times in the MDM gate's signed messages. Already in the tree through
 # x509-parser.
 time = { version = "0.3.55", default-features = false, features = ["formatting", "macros", "parsing", "std"] }
@@ -147,6 +149,9 @@ tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 # The REAPI authentication layer (kbf-auth). Already in the tree through tonic.
 tower-layer = "0.3.3"
+# The connector kbf-enroll hands tonic to dial the frontend under a pinned CA. Already in
+# the tree through tonic.
+tower-service = "0.3.3"
 tracing = "0.1.44"
 tracing-core = "0.1.36"
 tracing-subscriber = "0.3.23"
@@ -154,10 +159,14 @@ tracing-subscriber = "0.3.23"
 # feature, so neither aws-lc-rs nor the bundled webpki roots (CDLA licence) come in;
 # the agent is given ring and the host's roots.
 ureq = { version = "3.4.2", default-features = false, features = ["rustls-no-provider"] }
-# Reads the fields of a daemon's client certificate the worker listener checks (its DNS
-# subjectAltName, serial and public key); TLS has already verified the certificate.
+# Reads the fields of a peer's client certificate the listeners check (its role URI, DNS
+# and IP subjectAltNames, serial and public key: kbf-peer, the one reader); TLS has
+# already verified the certificate.
 x509-parser = "0.18.1"
 # The zip archives kbf-deploy installs (`mdm install`): deflate only, through flate2.
+# Overwrites the object-store keys a storage node holds when they are dropped (kbf-enroll).
+# Already in the tree through rustls.
+zeroize = "1.9.1"
 zip = { version = "9.0.1", default-features = false, features = ["deflate-flate2"] }
 
 kbf-alert = { path = "crates/kbf-alert" }
@@ -169,6 +178,7 @@ kbf-daemon = { path = "crates/kbf-daemon" }
 kbf-deploy = { path = "crates/kbf-deploy" }
 kbf-driver-container = { path = "crates/kbf-driver-container" }
 kbf-driver-native = { path = "crates/kbf-driver-native" }
+kbf-enroll = { path = "crates/kbf-enroll" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
 kbf-history = { path = "crates/kbf-history" }
@@ -185,6 +195,7 @@ kbf-meta = { path = "crates/kbf-meta" }
 kbf-node = { path = "crates/kbf-node" }
 kbf-objstore = { path = "crates/kbf-objstore" }
 kbf-outputs = { path = "crates/kbf-outputs" }
+kbf-peer = { path = "crates/kbf-peer" }
 kbf-proto = { path = "crates/kbf-proto" }
 kbf-raft = { path = "crates/kbf-raft" }
 kbf-route = { path = "crates/kbf-route" }
@@ -198,9 +209,11 @@ kbf-storage = { path = "crates/kbf-storage" }
 kbf-store = { path = "crates/kbf-store" }
 kbf-testkit = { path = "crates/kbf-testkit" }
 kbf-threads = { path = "crates/kbf-threads" }
+kbf-tls = { path = "crates/kbf-tls" }
 kbf-tier = { path = "crates/kbf-tier" }
 kbf-transfer = { path = "crates/kbf-transfer" }
 kbf-types = { path = "crates/kbf-types" }
+kbf-ui = { path = "crates/kbf-ui" }
 # The CI verbs (`cargo xtask`); kbf-it reads the interpreter budget with its parser.
 xtask = { path = "crates/xtask" }
 
@@ -211,3 +224,15 @@ xtask = { path = "crates/xtask" }
 [workspace.lints.clippy]
 disallowed_methods = "allow"
 disallowed_types = "allow"
+
+# Dev and test builds: a test binary with full debug info is ~0.5 GB and a target
+# directory holds thousands of them, plus incremental state. Line tables keep panic
+# backtraces and profilers at file:line; variable-level debug info is the part dropped.
+# `test` inherits `dev`; it is spelled out so the two cannot drift. Release is untouched.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false

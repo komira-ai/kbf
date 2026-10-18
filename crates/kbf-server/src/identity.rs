@@ -2,6 +2,10 @@
 //! the deny list (issue #79). The same rules admit a worker stream and each blob call
 //! a daemon makes on that listener ([`crate::blobs`]).
 //!
+//! **The role** is checked before any of this, per method, by the listener's table
+//! ([`crate::worker_roles`]): a worker stream or a blob call reaches these rules only
+//! from a certificate naming the daemon role.
+//!
 //! **The rule.** Under mutual TLS a daemon's client certificate must carry exactly one
 //! DNS name in its subjectAltName extension, and that name must equal, byte for byte,
 //! the `node_id` of every `Hello` the stream sends. The subject's common name is not
@@ -23,8 +27,16 @@
 //! A stream whose certificate or node is listed is refused PERMISSION_DENIED at its
 //! first `Hello`, and ended at the next `Hello`, `Heartbeat` or `Result` it sends after
 //! the entry is added, and a blob call is refused PERMISSION_DENIED from the first
-//! call after it. A deny list that cannot be read or parsed refuses every check (fail
+//! call after it. A `node` entry is compared with a node id or a DNS name up to ASCII case,
+//! as DNS compares names. A deny list that cannot be read or parsed refuses every check (fail
 //! closed) until it is fixed, which ends every connected stream within one heartbeat.
+//! A storage node's `Register` and `Heartbeat` ([`crate::members_rpc`]) are checked against
+//! the same list by its certificate ([`DenyList::admit_cert`]): a listed serial or key,
+//! or any DNS name in it that is a listed node, is refused PERMISSION_DENIED, and an
+//! unusable list UNAVAILABLE. The file is this listener's only: the operator's list that
+//! the storage nodes enforce is the `deny/` rows of the state store ([`crate::members`]),
+//! carried to them in the map. Both are compared with a certificate through the one reader,
+//! `kbf_peer::identity_of` ([`PeerCert`] wraps it).
 //! Replace the file by renaming a new one over it: an in-place edit that keeps the
 //! size and lands within the filesystem's timestamp granularity may go unseen until
 //! the next change.
@@ -33,20 +45,16 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use kbf_map::{DenyEntry, normalize_serial};
-use sha2::{Digest, Sha256};
+use kbf_map::DenyEntry;
+use kbf_peer::PeerIdentity;
 use tonic::Status;
-use x509_parser::extensions::{GeneralName, ParsedExtension};
 
-/// What the server takes from a daemon's client certificate.
+/// What the server takes from a client certificate: the identity a deny entry is compared
+/// with (`kbf-peer`'s reader, which the storage service uses too) and, for a daemon, the
+/// one node it names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerCert {
-    /// Every DNS name in the certificate's subjectAltName.
-    names: Vec<String>,
-    /// The serial, lower-case hex without leading zeros.
-    serial: String,
-    /// SHA-256 of the DER SubjectPublicKeyInfo, lower-case hex.
-    spki_sha256: String,
+    identity: PeerIdentity,
 }
 
 impl PeerCert {
@@ -55,38 +63,27 @@ impl PeerCert {
     /// # Errors
     /// The bytes are not an X.509 certificate.
     pub fn from_der(der: &[u8]) -> Result<Self, String> {
-        let (_, cert) = x509_parser::parse_x509_certificate(der)
-            .map_err(|e| format!("the client certificate does not parse: {e}"))?;
-        let names = cert
-            .extensions()
-            .iter()
-            .filter_map(|e| match e.parsed_extension() {
-                ParsedExtension::SubjectAlternativeName(san) => Some(&san.general_names),
-                _ => None,
-            })
-            .flatten()
-            .filter_map(|name| match name {
-                GeneralName::DNSName(dns) => Some((*dns).to_owned()),
-                _ => None,
-            })
-            .collect();
-        Ok(Self {
-            names,
-            serial: normalize_serial(&hex(cert.raw_serial())),
-            spki_sha256: hex(&Sha256::digest(cert.public_key().raw)),
-        })
+        kbf_peer::identity_of(der)
+            .map(|identity| Self { identity })
+            .map_err(|e| e.to_string())
+    }
+
+    /// What a deny entry is compared with: the names, the serial and the key hash.
+    #[must_use]
+    pub fn identity(&self) -> &PeerIdentity {
+        &self.identity
     }
 
     /// The certificate's serial, as the deny list spells it.
     #[must_use]
     pub fn serial(&self) -> &str {
-        &self.serial
+        self.identity.serial()
     }
 
     /// The SHA-256 of its SubjectPublicKeyInfo, as the deny list spells it.
     #[must_use]
     pub fn spki_sha256(&self) -> &str {
-        &self.spki_sha256
+        self.identity.spki_sha256()
     }
 
     /// Whether this certificate names `node_id` under the rule in the module docs.
@@ -107,7 +104,7 @@ impl PeerCert {
     /// # Errors
     /// PERMISSION_DENIED: the certificate has no DNS name, or more than one.
     pub fn node(&self) -> Result<&str, Status> {
-        match self.names.as_slice() {
+        match self.identity.names().dns() {
             [only] => Ok(only),
             names => Err(Status::permission_denied(format!(
                 "the client certificate must name exactly one node as a DNS subjectAltName; \
@@ -133,8 +130,9 @@ pub enum Peers {
 }
 
 impl Peers {
-    /// The certificate of a new stream, from the chain TLS verified (`leaf` is its
-    /// first certificate; `None` in plain text).
+    /// The certificate of a new stream or blob call, from the chain TLS verified (`leaf`
+    /// is its first certificate; `None` in plain text). Its role was checked before the
+    /// call was routed ([`crate::worker_roles`]).
     ///
     /// # Errors
     /// UNAUTHENTICATED: under mutual TLS, there is no certificate or it does not parse.
@@ -164,10 +162,7 @@ impl Peers {
         else {
             return Ok(());
         };
-        let denied = deny_list.current().await.map_err(|e| {
-            tracing::error!(error = %e, "the deny list refuses every stream until it is fixed");
-            Status::unavailable(format!("the server's deny list is unusable: {e}"))
-        })?;
+        let denied = deny_list.current().await.map_err(|e| unusable(&e))?;
         match denied.refuses(peer, node_id) {
             Some(why) => Err(Status::permission_denied(format!("denied: {why}"))),
             None => Ok(()),
@@ -194,6 +189,12 @@ impl Peers {
         self.admit(Some(&peer), &node).await?;
         Ok(node)
     }
+}
+
+/// The refusal for a deny list that cannot be read: every check fails, and says so.
+fn unusable(e: &DenyListError) -> Status {
+    tracing::error!(error = %e, "the deny list refuses every check until it is fixed");
+    Status::unavailable(format!("the server's deny list is unusable: {e}"))
 }
 
 /// The deny list file. Clones share what was last read.
@@ -273,6 +274,21 @@ impl DenyList {
         }
     }
 
+    /// Whether the certificate `peer` is denied now, for a caller that speaks for every
+    /// name in it, as a storage node does when it registers and heartbeats
+    /// ([`crate::members_rpc`]): its serial or key is listed, or any DNS name in it is a
+    /// listed node.
+    ///
+    /// # Errors
+    /// PERMISSION_DENIED: it is denied. UNAVAILABLE: the file cannot be read or parsed.
+    pub async fn admit_cert(&self, peer: &PeerCert) -> Result<(), Status> {
+        let denied = self.current().await.map_err(|e| unusable(&e))?;
+        match denied.refuses_cert(peer) {
+            Some(why) => Err(Status::permission_denied(format!("denied: {why}"))),
+            None => Ok(()),
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<LastRead>> {
         self.last.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -325,24 +341,46 @@ impl Denied {
         Ok(denied)
     }
 
-    /// Why a stream with certificate `peer` speaking as `node_id` is denied, if it is.
+    /// Why a stream with certificate `peer` speaking as `node_id` is denied, if it is: a
+    /// listed node is `node_id` up to ASCII case (a DNS name is, as for the storage nodes'
+    /// map: [`kbf_peer::PeerNames::has_dns_name`]), then its serial and key.
     #[must_use]
     pub fn refuses(&self, peer: Option<&PeerCert>, node_id: &str) -> Option<String> {
-        if self.nodes.contains(node_id) {
-            return Some(format!("node {node_id}"));
+        if let Some(node) = self
+            .nodes
+            .iter()
+            .find(|node| node.eq_ignore_ascii_case(node_id))
+        {
+            return Some(format!("node {node}"));
         }
-        let peer = peer?;
-        if self.serials.contains(&peer.serial) {
-            return Some(format!("certificate serial {}", peer.serial));
+        self.refuses_key(peer?)
+    }
+
+    /// Why the certificate `peer` is denied, if it is, for a caller that speaks for every
+    /// name in it: a listed node is any of its DNS names
+    /// ([`kbf_peer::PeerNames::has_dns_name`], up to ASCII case), then its serial and key as
+    /// in [`Denied::refuses`].
+    #[must_use]
+    pub fn refuses_cert(&self, peer: &PeerCert) -> Option<String> {
+        let listed = self
+            .nodes
+            .iter()
+            .find(|node| peer.identity.names().has_dns_name(node));
+        match listed {
+            Some(node) => Some(format!("node {node}")),
+            None => self.refuses_key(peer),
+        }
+    }
+
+    /// Why `peer` is denied by its serial or its key.
+    fn refuses_key(&self, peer: &PeerCert) -> Option<String> {
+        if self.serials.contains(peer.serial()) {
+            return Some(format!("certificate serial {}", peer.serial()));
         }
         self.spkis
-            .contains(&peer.spki_sha256)
-            .then(|| format!("public key {}", peer.spki_sha256))
+            .contains(peer.spki_sha256())
+            .then(|| format!("public key {}", peer.spki_sha256()))
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The metadata a change of the deny list shows in: device, inode, size, mode, owner,

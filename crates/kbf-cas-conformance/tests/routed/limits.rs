@@ -20,7 +20,7 @@ async fn no_more_requests_than_the_limit_are_out_at_once() {
     assert_eq!(cas.in_flight(), 2);
 
     // Reads into memory and into files, of four bytes each. The files are made first, so
-    // that every read reaches the node the first time it is polled.
+    // that a read is held up by nothing but the limit and the node.
     let dir = scratch();
     let mut files = Vec::new();
     for i in 0..6_u8 {

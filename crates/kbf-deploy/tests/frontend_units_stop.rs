@@ -9,14 +9,16 @@
 
 use std::path::{Path, PathBuf};
 
-/// What an `ExecStart=` holds when the unit starts a frontend: the server binary, the
-/// `kbf` frontend and all-in-one modes, and the pilot unit's placeholder for the server
-/// command it renders.
-const FRONTENDS: [&str; 4] = [
-    "kbf-server",
-    "kbf frontend",
-    "kbf all-in-one",
-    "@EXEC_START@",
+/// The program (its file name) and first argument an `ExecStart=` starts when the unit
+/// runs a frontend: the server binary, the `kbf` frontend and all-in-one modes, and the
+/// pilot unit's placeholder for the server command it renders. Matched word by word, not
+/// as a substring: the storage unit's `--meta-dir=/var/lib/kbf-server/raft`
+/// names `kbf-server` too.
+const FRONTENDS: [(&str, Option<&str>); 4] = [
+    ("kbf-server", None),
+    ("kbf", Some("frontend")),
+    ("kbf", Some("all-in-one")),
+    ("@EXEC_START@", None),
 ];
 
 const STOP: &str = "TimeoutStopSec=infinity";
@@ -37,17 +39,18 @@ fn services(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The text of the `ExecStart=` of `unit` through its last continuation line.
-fn exec_start(unit: &str) -> String {
-    let mut out = String::new();
-    let mut lines = unit.lines().skip_while(|l| !l.starts_with("ExecStart="));
-    for line in lines.by_ref() {
-        out.push_str(line);
-        if !line.ends_with('\\') {
-            break;
-        }
-    }
-    out
+/// Whether the `ExecStart=` of `unit` starts a frontend ([`FRONTENDS`]).
+fn starts_frontend(unit: &str) -> bool {
+    let Some(start) = unit.lines().find_map(|l| l.strip_prefix("ExecStart=")) else {
+        return false;
+    };
+    let mut words = start.split_whitespace();
+    let program = words.next().unwrap_or_default();
+    let name = program.rsplit('/').next().unwrap_or(program);
+    let first = words.next();
+    FRONTENDS
+        .iter()
+        .any(|&(p, arg)| p == name && arg.is_none_or(|a| first == Some(a)))
 }
 
 /// Catches a frontend unit template (or its golden) that lets systemd kill a drain: the
@@ -63,8 +66,7 @@ fn every_frontend_unit_template_waits_for_its_drain() {
     let mut frontends = Vec::new();
     for file in files {
         let unit = std::fs::read_to_string(&file).expect("a unit");
-        let start = exec_start(&unit);
-        if !FRONTENDS.iter().any(|f| start.contains(f)) {
+        if !starts_frontend(&unit) {
             continue;
         }
         let stops: Vec<&str> = unit
@@ -86,8 +88,8 @@ fn every_frontend_unit_template_waits_for_its_drain() {
         [
             "kbf-all-in-one.service",
             "kbf-all-in-one.service",
-            "kbf-frontend.service",
-            "kbf-frontend.service",
+            "kbf-frontend@.service",
+            "kbf-frontend@.service",
             "kbf-pilot-server.service",
             "kbf-server.service",
             "kbf-server.service",

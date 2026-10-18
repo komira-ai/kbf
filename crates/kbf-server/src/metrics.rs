@@ -1,7 +1,9 @@
 //! `GET /metrics` on the operator API listener: the cache's upload-path metrics
-//! ([`kbf_front::metrics`]), the write tier's when one is attached, and the fill of the
+//! ([`kbf_front::metrics`]), the write tier's when one is attached, the lost-blob
+//! families read from the metadata state ([`kbf_front::Losses`]), and the fill of the
 //! node's one cache when the process has one (`kbf-all-in-one`,
-//! [`kbf_storage::local_cache`]), in the Prometheus text format, for a scraper or for
+//! [`kbf_storage::local_cache`]), and the storage health of a frontend with a state store
+//! ([`crate::storage_health`]), in the Prometheus text format, for a scraper or for
 //! `curl` while an upload is slow (`docs/api.md#get-metrics`).
 //!
 //! A read, open like `GET /v1/nodes` and `/readyz`: it names no blob, build or node,
@@ -19,6 +21,9 @@ use axum::routing::get;
 use kbf_front::{Cache, MetaLog};
 use kbf_objstore::ObjectStore;
 use kbf_storage::local_cache::{Fill, LocalCache};
+use kbf_tls::TlsSource;
+
+use crate::members::Members;
 
 /// The media type of the answer: the Prometheus text exposition format.
 pub const TEXT_FORMAT: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -48,6 +53,8 @@ impl Extras {
 struct Sources<M, O> {
     cache: Arc<Cache<M, O>>,
     extras: Extras,
+    members: Option<Arc<Members>>,
+    tls: Arc<[TlsSource]>,
 }
 
 impl<M, O> Clone for Sources<M, O> {
@@ -55,16 +62,21 @@ impl<M, O> Clone for Sources<M, O> {
         Self {
             cache: Arc::clone(&self.cache),
             extras: self.extras.clone(),
+            members: self.members.clone(),
+            tls: Arc::clone(&self.tls),
         }
     }
 }
 
-/// The `/metrics` route over `cache`'s metrics, `local`'s fill and, when the server keeps
-/// build history, its counters.
+/// The `/metrics` route over `cache`'s metrics, `local`'s fill, when the server keeps
+/// build history its counters, the storage health of `members` and the reloads of the
+/// listeners' `tls` files.
 pub fn router<M, O>(
     cache: Arc<Cache<M, O>>,
     local: Option<Arc<LocalCache>>,
     history: Option<Arc<crate::history::Stats>>,
+    members: Option<Arc<Members>>,
+    tls: Vec<TlsSource>,
 ) -> Router
 where
     M: MetaLog,
@@ -75,6 +87,8 @@ where
         .with_state(Sources {
             cache,
             extras: Extras { local, history },
+            members,
+            tls: tls.into(),
         })
 }
 
@@ -84,8 +98,22 @@ where
     O: ObjectStore + 'static,
 {
     let mut text = sources.cache.render_metrics();
+    // Read from the metadata state now; a log that cannot answer leaves them out of
+    // this scrape rather than failing it.
+    let losses = sources.cache.losses().await;
+    losses.iter().for_each(|l| l.render(&mut text));
     sources.extras.render(&mut text);
+    scrape_health(&mut text, sources.members.as_ref()).await;
+    kbf_tls::render_metrics(sources.tls.iter(), &mut text);
     ([(CONTENT_TYPE, TEXT_FORMAT)], text).into_response()
+}
+
+/// Appends the storage health of `members`, when there are any; not generic, so every
+/// instance of the handler shares it.
+pub(crate) async fn scrape_health(out: &mut String, members: Option<&Arc<Members>>) {
+    if let Some(members) = members {
+        crate::storage_health::scrape(out, members).await;
+    }
 }
 
 /// Appends the one cache's gauges to `out`.

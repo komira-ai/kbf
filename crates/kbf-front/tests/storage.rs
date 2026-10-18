@@ -1,7 +1,7 @@
 //! The cache through the storage boundary: [`CacheStorage`] as an `Arc<dyn Storage>`.
 //! The data plane's checks run over it in `kbf-all-in-one` (`tests/storage_seam.rs`);
 //! these cover what they do not: the action cache, and that every error answers the
-//! gRPC code and message the cache's own error answers.
+//! gRPC code and message the cache's own error answers. Streamed puts: `tests/storage_stream.rs`.
 
 mod common;
 
@@ -77,7 +77,7 @@ async fn the_action_cache_answers_through_the_trait() {
     let absent = digest_of(b"an output never stored");
     let refused = storage.prepare_action_result(&result_with(absent)).await;
     assert!(
-        matches!(refused, Err(StorageError::ActionWrite(ActionWriteError::Absent(d))) if d == absent),
+        matches!(&refused, Err(StorageError::ActionWrite(ActionWriteError::Absent(d))) if *d == [absent]),
         "{refused:?}"
     );
 
@@ -109,11 +109,93 @@ async fn the_action_cache_answers_through_the_trait() {
     );
 }
 
-/// Catches the adapter offering a stream the cache cannot take: today a caller stores
-/// a blob whole.
-#[test]
-fn the_cache_offers_no_stream_yet() {
-    assert!(storage().stream(1).is_none());
+/// Catches the adapter offering no stream where the cache has one (it streams onto the
+/// write tier or to the store), or one for an empty blob: a stream for a blob of bytes
+/// exists in a runtime, none for 0.
+#[tokio::test]
+async fn the_cache_offers_a_stream_for_a_blob() {
+    let storage = storage();
+    let offered = tokio::task::spawn_blocking(move || {
+        (storage.stream(1).is_some(), storage.stream(0).is_none())
+    })
+    .await
+    .expect("join");
+    assert_eq!(offered, (true, true));
+}
+
+/// A blob of three windows and a bit, as a body of 1 MiB pieces.
+fn pieces(data: &[u8]) -> futures::stream::BoxStream<'static, io::Result<Bytes>> {
+    let pieces: Vec<io::Result<Bytes>> = data
+        .chunks(READ_CHUNK_BYTES)
+        .map(|c| Ok(Bytes::copy_from_slice(c)))
+        .collect();
+    futures::stream::iter(pieces).boxed()
+}
+
+/// Catches a streamed put that stores what it must not or does not store what it must:
+/// a blob of more than one read window, streamed in pieces, is present afterwards and
+/// reads back byte for byte in chunks of at most [`READ_CHUNK_BYTES`] from three windows
+/// (never one buffer of it); bytes that do not hash to the claimed digest store nothing
+/// (DigestMismatch); a withdrawn claim answers `None` and stores nothing.
+#[tokio::test]
+async fn a_streamed_put_stores_a_blob_of_several_windows() {
+    let storage = storage();
+    let data = pseudo_random(3 * kbf_front::READ_WINDOW_BYTES as usize + 12_345, 4);
+    let digest = digest_of(&data);
+    let stored = storage
+        .put_streamed(
+            data.len() as u64,
+            pieces(&data),
+            Box::pin(async move { Some(digest) }),
+        )
+        .await
+        .expect("streamed");
+    assert_eq!(stored, Some(digest));
+    assert!(
+        storage
+            .find_missing(&[digest])
+            .await
+            .expect("find")
+            .is_empty()
+    );
+    let chunks = read_all(&*storage, &digest, 0, 0).await;
+    assert!(chunks.iter().all(|c| c.len() <= READ_CHUNK_BYTES));
+    assert_eq!(chunks.concat(), data);
+
+    let mut other = data.clone();
+    other[100] ^= 1;
+    let other_digest = digest_of(&other);
+    let refused = storage
+        .put_streamed(
+            other.len() as u64,
+            pieces(&data),
+            Box::pin(async move { Some(other_digest) }),
+        )
+        .await
+        .expect_err("not the claimed bytes");
+    assert!(
+        matches!(refused, StorageError::DigestMismatch { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(
+        storage.find_missing(&[other_digest]).await.expect("find"),
+        [other_digest]
+    );
+
+    let mut third = data.clone();
+    third[200] ^= 1;
+    let withdrawn = storage
+        .put_streamed(third.len() as u64, pieces(&third), Box::pin(async { None }))
+        .await
+        .expect("withdrawn");
+    assert_eq!(withdrawn, None);
+    assert_eq!(
+        storage
+            .find_missing(&[digest_of(&third)])
+            .await
+            .expect("find"),
+        [digest_of(&third)]
+    );
 }
 
 /// Catches an error that answers a caller differently through the boundary than the
@@ -131,8 +213,8 @@ fn errors_answer_as_the_cache_answers() {
         },
         CacheError::Invalid("bad".to_owned()),
         CacheError::ActionWrite(ActionWriteError::NotDaemon),
-        CacheError::ActionWrite(ActionWriteError::Absent(a)),
-        CacheError::ActionWrite(ActionWriteError::Unreachable(a)),
+        CacheError::ActionWrite(ActionWriteError::Absent(vec![a])),
+        CacheError::ActionWrite(ActionWriteError::Unreachable(vec![a])),
         CacheError::Meta(MetaLogError::Unavailable("no leader".to_owned())),
         CacheError::Store(ObjectStoreError::Unsupported("retention")),
         CacheError::Internal("torn".to_owned()),
@@ -264,8 +346,8 @@ async fn big(storage: &dyn Storage) -> (Digest, Vec<u8>) {
     (digest, data)
 }
 
-/// The memory bound a ranged read can claim: the blob is read whole, once, and sent as
-/// slices of that one buffer. Catches the blob collected into one message (a chunk over
+/// The memory bound a ranged read can claim: a window of the blob is read, once, and sent
+/// as slices of that one buffer (this blob is within one window). Catches the blob collected into one message (a chunk over
 /// [`READ_CHUNK_BYTES`]) and each chunk copied out of it (a chunk not starting where
 /// the one before ended in memory, so a second copy of the blob across the stream).
 #[tokio::test]
@@ -368,7 +450,8 @@ async fn an_offset_past_the_end_is_out_of_range() {
 
 /// A held blob whose object is gone, or whose bytes are damaged, is UNAVAILABLE as
 /// `read_blob` answers it, with its message; and a range that does not touch the damaged
-/// byte is refused too, because the blob is checked whole before any chunk. Catches
+/// byte is refused too, because the blob is checked whole before its last window, and these blobs are one
+/// window, so the failure is the call's. Catches
 /// bytes sent on a range-only check, and a damaged blob answered NOT_FOUND.
 #[tokio::test]
 async fn a_damaged_blob_fails_every_range_as_read_blob_does() {

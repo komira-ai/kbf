@@ -448,7 +448,7 @@ fn chunk_object_key(root: &HistoryRoot, inv: &InvKey, c: &Chunk) -> ObjectKey {
 /// Whether `allow` accepts every instance `header` lists, and the list is whole: an
 /// empty list (no record names an instance) or one the writer truncated cannot show
 /// that every instance is allowed, so it fails closed.
-pub(crate) fn all_allow(header: &InvocationHeader, allow: &dyn Fn(&str) -> bool) -> bool {
+pub(crate) fn all_allow(header: &InvocationHeader, allow: Allow<'_>) -> bool {
     listed_whole(header) && header.instances.iter().all(|i| allow(i))
 }
 

@@ -266,22 +266,22 @@ pub struct RunRecord {
     /// the first chunks were written: a record without it reads `false`.
     #[prost(bool, tag = "33")]
     pub test: bool,
+    /// The target label the run's shape carried (Bazel names it); empty when it had
+    /// none. Added after the first chunks were written: a record without it reads empty.
+    #[prost(string, tag = "34")]
+    pub target: String,
     /// When the operation was queued for this attempt (submitted, or queued again after
     /// the attempt before it), microseconds; 0 when not kept. `timestamps.queued_us`
     /// is the first submission, so it cannot give this. Added after the first chunks
     /// were written.
-    #[prost(uint64, tag = "34")]
+    #[prost(uint64, tag = "35")]
     pub attempt_queued_us: u64,
     /// When the attempt's worker was sent the Start, microseconds; 0: never.
-    #[prost(uint64, tag = "35")]
+    #[prost(uint64, tag = "36")]
     pub started_us: u64,
     /// When the attempt ended, microseconds; 0: it had not.
-    #[prost(uint64, tag = "36")]
+    #[prost(uint64, tag = "37")]
     pub ended_us: u64,
-    /// The target the action's own output paths name, as the server read it; empty when
-    /// they name none.
-    #[prost(string, tag = "37")]
-    pub target: String,
     /// What kind of owner `target` names: 0 none or unknown, 1 a rule's target, 2 an
     /// anonymous target, 3 a BXL function.
     #[prost(uint32, tag = "38")]
@@ -973,10 +973,10 @@ mod tests {
             target: "//a:t".into(),
             ..RunRecord::default()
         };
-        // Tag 37, length-delimited: key 298 (0xaa 0x02).
+        // Tag 34, length-delimited: key 274 (0x92 0x02).
         assert_eq!(
             run.encode_to_vec(),
-            [0xaa, 0x02, 5, b'/', b'/', b'a', b':', b't']
+            [0x92, 0x02, 5, b'/', b'/', b'a', b':', b't']
         );
         let header = InvocationHeader {
             list_ms: 5,

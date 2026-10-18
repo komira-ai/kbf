@@ -87,7 +87,7 @@ use kbf_types::ImageRef;
 
 use crate::envoy;
 use crate::https::Client;
-use crate::linux::{self, HostError, LinuxConfig, images, install, meta, swap};
+use crate::linux::{self, HostError, LinuxConfig, images, install, install_mode, meta, swap};
 use crate::log;
 use crate::mdm::dep::{Dep, Serial};
 use crate::mdm::erase::{self, EraseArgs, Made};
@@ -145,6 +145,13 @@ enum Kit {
     Log(log::LogArgs),
 }
 
+/// What the envoy kit renders and checks.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Topology {
+    Front,
+    Box,
+}
+
 #[derive(Subcommand)]
 enum Envoy {
     /// Write manifests.json (the Kubernetes objects) and envoy.json (Envoy's config)
@@ -156,6 +163,11 @@ enum Envoy {
         /// Where to write the two files.
         #[arg(long)]
         out: PathBuf,
+        /// `front` (the default): the Kubernetes front. `box`: one host's Envoy in
+        /// front of two kbf instances; writes envoy.json and envoy.args, from the box
+        /// settings (templates/envoy/box.example).
+        #[arg(long, value_enum, default_value_t = Topology::Front)]
+        topology: Topology,
     },
     /// Check a render for what the REAPI path through the front depends on: every
     /// client call routed with no bound on a stream's life, TLS to the CA naming
@@ -168,6 +180,10 @@ enum Envoy {
         /// The directory render wrote; without it, the render of --config is checked.
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// The topology --config and the render are of; see `render`. For `box`, the
+        /// rules are the long-stream, health, limit and hot-restart ones.
+        #[arg(long, value_enum, default_value_t = Topology::Front)]
+        topology: Topology,
     },
     /// Check the render and what the cluster must already hold, have the API server
     /// validate the render, and with --apply apply it (server-side, field manager
@@ -244,6 +260,10 @@ enum Linux {
         /// Roll back: stop the services and move the four files aside.
         #[arg(long, conflicts_with_all = ["bin_dir", "restart_minio"])]
         uninstall: bool,
+        /// Install kbf.slice and the unit of this mode of the one kbf binary instead
+        /// (with --bin-dir, the new kbf too), and start it.
+        #[arg(long, value_enum, conflicts_with_all = ["restart_minio", "uninstall"])]
+        mode: Option<linux::Mode>,
         /// Carry the plan out.
         #[arg(long)]
         apply: bool,
@@ -268,6 +288,10 @@ enum Linux {
     MetaBackup(meta::cli::BackupArgs),
     /// Extract a meta-backup archive into an empty directory and check every file.
     MetaVerify(meta::cli::VerifyArgs),
+    /// Check, read only, that a certificate is its row of the farm's certificate table:
+    /// its one role, its extended key usage and its chain to the CA. The frontend's
+    /// REAPI certificate is not the farm CA's and is no row.
+    VerifyCert(linux::verify_cert::VerifyArgs),
     /// Make, activate and list the build swapfile (as root).
     Swap {
         /// The kit's settings, KEY=VALUE lines.
@@ -604,12 +628,20 @@ fn linux_kit<E: Exec>(
             bin_dir,
             restart_minio,
             uninstall,
+            mode: unit_mode,
             apply,
         } => {
             let done = LinuxConfig::load(&config)
                 .map_err(HostError::from)
                 .and_then(|config| {
-                    if uninstall {
+                    if let Some(mode) = unit_mode {
+                        let a = install_mode::InstallMode {
+                            config,
+                            mode,
+                            bin_dir,
+                        };
+                        install_mode::run(exec, &a, self::mode(apply), &mut out)
+                    } else if uninstall {
                         install::run_uninstall(exec, &config, &stamp(), mode(apply), &mut out)
                     } else {
                         let a = install::Install {
@@ -644,6 +676,7 @@ fn linux_kit<E: Exec>(
             return meta::cli::backup(a, exec, &meta::metrics::http_get, out, err);
         }
         Linux::MetaVerify(a) => return meta::cli::verify(&a, out, err),
+        Linux::VerifyCert(a) => return linux::verify_cert::cli(&a, out, err),
         Linux::Swap {
             config,
             kubelet_allows_swap,
@@ -849,9 +882,25 @@ fn envoy_kit<E: Exec>(
                 }
             };
         }
-        Envoy::Render { config, out: dir } => envoy::render_files(&config, &dir),
-        Envoy::Check { config, dir } => match envoy::check_files(&config, dir.as_deref()) {
-            Ok(failures) if failures.is_empty() => Ok(envoy::check_passed()),
+        Envoy::Render {
+            config,
+            out: dir,
+            topology: Topology::Front,
+        } => envoy::render_files(&config, &dir),
+        Envoy::Render {
+            config,
+            out: dir,
+            topology: Topology::Box,
+        } => envoy::render_box_files(&config, &dir),
+        Envoy::Check {
+            config,
+            dir,
+            topology,
+        } => match envoy_check(topology, &config, dir.as_deref()) {
+            Ok(failures) if failures.is_empty() => Ok(match topology {
+                Topology::Front => envoy::check_passed(),
+                Topology::Box => envoy::check_box_passed(),
+            }),
             Ok(failures) => {
                 for f in &failures {
                     let _ = writeln!(out, "{}", f.line());
@@ -870,6 +919,18 @@ fn envoy_kit<E: Exec>(
             let _ = writeln!(err, "REFUSED: {e}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// `envoy check` of the topology's render.
+fn envoy_check(
+    topology: Topology,
+    config: &Path,
+    dir: Option<&Path>,
+) -> Result<Vec<envoy::check::CheckFailure>, envoy::Refusal> {
+    match topology {
+        Topology::Front => envoy::check_files(config, dir),
+        Topology::Box => envoy::check_box_files(config, dir),
     }
 }
 
