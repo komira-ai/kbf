@@ -204,3 +204,54 @@ fn store_failures_and_endless_conflicts_are_errors() {
         Err(RegistryError::Store(_))
     ));
 }
+
+// Catches names and a node prefix stored unchecked: a name with `@`, a trailing dot, an
+// over-long label, an address as a suffix or a prefix no node id can start with would
+// never match or would match too much. Mixed case is accepted (matching folds it).
+#[test]
+fn create_refuses_names_and_prefixes_that_are_no_hosts_or_ids() {
+    let env = fake();
+    let secret = TokenSecret::from_bytes([1; 32]);
+    let make = |names: &[&str], prefix: Option<&str>| {
+        let mut s = spec(&[Role::Storage], 1);
+        s.names = names.iter().map(|n| (*n).to_owned()).collect();
+        s.node_prefix = prefix.map(str::to_owned);
+        create_token(&*env.store, &tid(7), &secret, &s)
+    };
+    let long = "a".repeat(64);
+    for bad in [
+        "x@trusted.example.com",
+        "trusted.example.com.",
+        ".trusted.example.com.",
+        "..example",
+        ".",
+        "",
+        "a_b.example",
+        "-a.example",
+        "a b",
+        ".10.0.0.1",
+        format!("{long}.example").as_str(),
+        format!(".{long}.example").as_str(),
+    ] {
+        assert!(
+            matches!(make(&[bad], None), Err(RegistryError::Invalid(_))),
+            "{bad:?}"
+        );
+    }
+    assert!(matches!(
+        make(&["ok.example", "x@y"], None),
+        Err(RegistryError::Invalid(_))
+    ));
+    for bad in ["", "-lab", "Lab", "lab_", "a.b", "a".repeat(64).as_str()] {
+        assert!(
+            matches!(make(&[], Some(bad)), Err(RegistryError::Invalid(_))),
+            "{bad:?}"
+        );
+    }
+    assert!(list_tokens(&*env.store).expect("list").is_empty());
+    make(
+        &["Fixed.example", ".farm.test", "10.0.0.1", "localhost"],
+        Some("lab-"),
+    )
+    .expect("good names and prefix");
+}
