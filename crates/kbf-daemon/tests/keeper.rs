@@ -31,7 +31,7 @@ fn replacement(binary: &Path, at: &Path) {
 }
 
 /// Catches a keeper that cannot be started once an update has renamed a new file over
-/// the daemon's binary, kbf-updater's swap. On Linux the keeper must come from the
+/// the daemon's binary, an update's swap. On Linux the keeper must come from the
 /// file the daemon runs (`/proc/self/exe`): `current_exe` then names
 /// `<path> (deleted)`, and nothing can be started from it. On macOS it comes from the
 /// path, which names the new binary. The keeper must start (its ready line), and

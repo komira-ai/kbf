@@ -243,6 +243,12 @@ fn the_real_calls_with_the_ids_the_process_has_succeed_or_are_refused_for_a_user
     // The closure a child runs between fork and exec, run in this process (a child's
     // coverage is not written out): the same three calls, the first of which already
     // needs root.
+    // The listed way is the one every platform has (the range call is Linux's).
+    assert_eq!(
+        before_exec(Some(me()), Inherited::Listed(Vec::new()))().map_err(|e| e.kind()),
+        [Err(io::ErrorKind::PermissionDenied), Ok(())][usize::from(is_root)]
+    );
+    #[cfg(target_os = "linux")]
     assert_eq!(
         before_exec(Some(me()), Inherited::Range(HIGH_FD))().map_err(|e| e.kind()),
         [Err(io::ErrorKind::PermissionDenied), Ok(())][usize::from(is_root)]
@@ -300,9 +306,20 @@ fn cloexec_set(fd: libc::c_int) -> bool {
 
 /// Whether a real child started with `how` holds descriptor `fd` (`readlink` opens none of
 /// its own, so it finds the link only if the child inherited the descriptor).
+#[cfg(target_os = "linux")]
 fn child_holds(fd: libc::c_int, how: Inherited) -> bool {
     let link = format!("/proc/self/fd/{fd}");
     let ran = start(&spawn("/usr/bin/readlink", &[&link]), how).expect("readlink runs");
+    ran.code == Some(0)
+}
+
+/// Whether a real child started with `how` holds descriptor `fd`: macOS has no
+/// `/proc/self/fd`, but its `/dev/fd/<n>` exists only for a descriptor the process holds,
+/// and `test -e` opens none of its own.
+#[cfg(not(target_os = "linux"))]
+fn child_holds(fd: libc::c_int, how: Inherited) -> bool {
+    let path = format!("/dev/fd/{fd}");
+    let ran = start(&spawn("/bin/test", &["-e", &path]), how).expect("test runs");
     ran.code == Some(0)
 }
 
@@ -323,16 +340,40 @@ fn the_child_inherits_no_descriptor_from_the_first_up() {
     before_exec(None, Inherited::Listed(found.clone()))().expect("marks them");
     assert!(cloexec_set(fixed.first) && !cloexec_set(fixed.below));
     fixed.unmark();
-    before_exec(None, Inherited::Range(first))().expect("the range call");
-    assert!(cloexec_set(fixed.first) && !cloexec_set(fixed.below));
-    fixed.unmark();
-    // A real child, by the range way and by the listing: `first` is not inherited, below it is.
-    assert!(!child_holds(fixed.first, Inherited::Range(first)));
-    assert!(child_holds(fixed.below, Inherited::Range(first)));
+    // The range call is Linux's; macOS lists (see `macos_has_no_close_range`).
+    #[cfg(target_os = "linux")]
+    {
+        before_exec(None, Inherited::Range(first))().expect("the range call");
+        assert!(cloexec_set(fixed.first) && !cloexec_set(fixed.below));
+        fixed.unmark();
+        assert!(!child_holds(fixed.first, Inherited::Range(first)));
+        assert!(child_holds(fixed.below, Inherited::Range(first)));
+    }
+    // A real child, by the listing: `first` is not inherited, below it is.
+    assert!(child_holds(fixed.below, Inherited::Listed(found.clone())));
     assert!(!child_holds(fixed.first, Inherited::Listed(found.clone())));
     // The listing starting one higher leaves `first` alone: the boundary is `>=`.
     let higher = listed_in(Path::new(FD_DIR), first + 1).expect("lists");
     assert!(!higher.contains(&fixed.first));
+}
+
+/// Catches a platform without `close_range` taking the range way, which would fail every
+/// start: here the call is `ENOSYS` whatever it is asked, the probe falls back to the
+/// listing, and the listing finds the descriptors from the first up.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn macos_has_no_close_range_and_lists_the_descriptors() {
+    let err = range_cloexec(5, 3).expect_err("no close_range");
+    assert_eq!(err.raw_os_error(), Some(libc::ENOSYS));
+    let fixed = Fixed::new();
+    let chosen = Inherited::of(HIGH_FD).expect("chosen");
+    let Inherited::Listed(found) = chosen else {
+        panic!("the range way chosen where there is none");
+    };
+    assert!(
+        found.contains(&fixed.first) && !found.contains(&fixed.below),
+        "{found:?}"
+    );
 }
 
 /// The constant the runner starts from: 0, 1 and 2 are the program's own, 3 is the first it
@@ -354,8 +395,11 @@ fn a_failure_to_keep_descriptors_from_the_program_ends_the_start() {
         start(&spawn("/usr/bin/true", &[]), Inherited::Fails(libc::EPERM)).expect_err("fails");
     assert_eq!(err.raw_os_error(), Some(libc::EPERM));
     // The kernel refuses a range whose end is below its start.
-    let err = range_cloexec(5, 3).expect_err("EINVAL");
-    assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+    #[cfg(target_os = "linux")]
+    {
+        let err = range_cloexec(5, 3).expect_err("EINVAL");
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+    }
     let enosys = || Err(io::Error::from_raw_os_error(libc::ENOSYS));
     // The probe failed and the directory cannot be listed: the error.
     let err = Inherited::choose(3, enosys(), Path::new("/no/such/descriptor/dir")).err();
