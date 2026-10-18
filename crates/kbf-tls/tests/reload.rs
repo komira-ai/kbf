@@ -472,3 +472,52 @@ async fn a_fixed_source_serves_its_text_and_never_changes() {
     );
     assert!(with_ca.is_ok());
 }
+
+/// A fixed source takes a new certificate and key in memory: new handshakes are served the
+/// replacement, a connection open at the swap goes on under the old one, and a pair that
+/// does not match, a source that reads files and a source that checks client certificates
+/// refuse the call and leave what was served as it was.
+///
+/// Kills: a replacement that does not reach the next handshake (a frontend whose leaf
+/// expires while it runs), one that ends open connections, a mismatched pair applied, and
+/// a swap that drops a file source's reload or a client CA.
+#[tokio::test]
+async fn a_fixed_source_serves_a_replacement_to_new_handshakes() {
+    let ca = ca("replace CA");
+    let (old, new) = (server_leaf(&ca), server_leaf(&ca));
+    let source = TlsSource::fixed("test", old.cert.as_bytes(), old.key.as_bytes(), None)
+        .expect("a fixed source");
+    let server = echo(tcp(), Some(source.clone()));
+
+    let mut open = connect(server.addr, &ca.pem, None).await.expect("connect");
+    ping(&mut open).await.expect("ping");
+    assert_eq!(served(&open), old.der);
+
+    source
+        .replace(new.cert.as_bytes(), new.key.as_bytes())
+        .expect("a matching pair");
+    let mut fresh = connect(server.addr, &ca.pem, None).await.expect("connect");
+    ping(&mut fresh).await.expect("ping");
+    assert_eq!(served(&fresh), new.der);
+    ping(&mut open).await.expect("the open connection still answers");
+    assert_eq!(source.reloads().applied, 1);
+
+    let mismatch = source.replace(old.cert.as_bytes(), new.key.as_bytes());
+    assert!(matches!(mismatch, Err(TlsError::Config(_))), "{mismatch:?}");
+    let mut after = connect(server.addr, &ca.pem, None).await.expect("connect");
+    ping(&mut after).await.expect("ping");
+    assert_eq!(served(&after), new.der);
+
+    let files = Files::write(&dir("replace-files"), &old, None);
+    let watched = files.source().replace(new.cert.as_bytes(), new.key.as_bytes());
+    assert!(matches!(watched, Err(TlsError::Config(_))), "{watched:?}");
+    let with_ca = TlsSource::fixed(
+        "test",
+        old.cert.as_bytes(),
+        old.key.as_bytes(),
+        Some(ca.pem.as_bytes()),
+    )
+    .expect("a source with a client CA");
+    let guarded = with_ca.replace(new.cert.as_bytes(), new.key.as_bytes());
+    assert!(matches!(guarded, Err(TlsError::Config(_))), "{guarded:?}");
+}
