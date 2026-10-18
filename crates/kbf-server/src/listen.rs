@@ -1,5 +1,6 @@
 //! The frontend's listening sockets, bound here, and the latch that closes one.
 
+use std::cell::Cell;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -21,12 +22,12 @@ pub(crate) struct Socket {
 }
 
 impl Socket {
-    /// A listener on `addr`.
+    /// A listener on `addr`, bound through `binder`.
     ///
     /// # Errors
     /// The address cannot be bound.
-    pub fn bind(addr: SocketAddr) -> Result<Self, ServeError> {
-        let bound = bind_std(addr).and_then(|listener| {
+    pub fn bind(addr: SocketAddr, binder: &Binder) -> Result<Self, ServeError> {
+        let bound = binder.bind(addr).and_then(|listener| {
             listener.set_nonblocking(true)?;
             let local = listener.local_addr()?;
             Ok(Self { local, listener })
@@ -62,52 +63,106 @@ impl Socket {
     }
 }
 
-/// How long a bind that fails with `AddrNotAvailable` is retried before it is fatal.
+/// How long binds that fail with `AddrNotAvailable` are retried, all of them together,
+/// before the start is fatal.
 ///
 /// A listen address on a VPN or overlay interface can appear seconds after
 /// `network-online.target`, which only waits for the ordinary links. The bound is below
-/// the `TimeoutStartSec=120` of the rendered units (systemd would kill a start that
-/// waits longer, with a worse message), and a later start-up step still has its share.
+/// the `TimeoutStartSec=120` of the rendered frontend and storage units (systemd would
+/// kill a start that waits longer, with a worse message), and a later start-up step still
+/// has its share. It is one budget for the whole start ([`Binder`]), not one per bind.
 pub(crate) const BIND_BUDGET: Duration = Duration::from_secs(90);
 
 /// The first wait between two bind attempts; each wait doubles, up to [`BIND_WAIT_MAX`].
 const BIND_WAIT_FIRST: Duration = Duration::from_millis(250);
 const BIND_WAIT_MAX: Duration = Duration::from_secs(2);
 
-/// A std listener on `addr`; an address that is not on this host yet
-/// (`AddrNotAvailable`) is retried for [`BIND_BUDGET`], every other error is at once the
-/// result. Blocks the thread while it waits: it runs at start-up, before serving.
-pub(crate) fn bind_std(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
-    bind_within(addr, BIND_BUDGET)
+/// Binds the listeners of one process start, and holds the one retry budget they share.
+///
+/// A bind whose address is not on this host yet (`AddrNotAvailable`) is retried, every
+/// other error is at once the result. The waits of every bind made through the same
+/// `Binder` are taken from the same [`BIND_BUDGET`], so several listeners on a late
+/// interface wait for it together, not one after the other (three sequential waits of
+/// the whole budget would outlast the unit's start timeout). Each mode makes one
+/// `Binder` when it starts and passes it to every bind. Blocks the thread while it
+/// waits: it runs at start-up, before serving.
+pub(crate) struct Binder {
+    left: Cell<Duration>,
+    attempt: Box<dyn Fn(SocketAddr) -> io::Result<std::net::TcpListener>>,
+    sleep: Box<dyn Fn(Duration)>,
 }
 
-/// [`bind_std`] with the retry bounded by `budget` rather than [`BIND_BUDGET`].
-fn bind_within(addr: SocketAddr, budget: Duration) -> io::Result<std::net::TcpListener> {
-    let mut sleep = |wait: Duration| {
-        tracing::warn!(%addr, ?wait, "listen address not available yet, retrying the bind");
-        std::thread::sleep(wait);
-    };
-    retry_unavailable(budget, &mut sleep, &mut || {
-        std::net::TcpListener::bind(addr)
-    })
+impl Binder {
+    /// A binder with the production budget, binding for real.
+    pub fn new() -> Self {
+        Self::within(BIND_BUDGET)
+    }
+
+    /// A binder that really binds, with `budget` instead of [`BIND_BUDGET`].
+    fn within(budget: Duration) -> Self {
+        Self {
+            left: Cell::new(budget),
+            attempt: Box::new(std::net::TcpListener::bind),
+            sleep: Box::new(std::thread::sleep),
+        }
+    }
+
+    /// A binder over the given bind attempt and sleep, for the tests of the retry and
+    /// of every place that binds.
+    #[cfg(test)]
+    fn scripted(
+        budget: Duration,
+        attempt: Box<dyn Fn(SocketAddr) -> io::Result<std::net::TcpListener>>,
+        sleep: Box<dyn Fn(Duration)>,
+    ) -> Self {
+        Self {
+            left: Cell::new(budget),
+            attempt,
+            sleep,
+        }
+    }
+
+    /// A std listener on `addr`, retried for as much of the budget as is left.
+    pub fn bind(&self, addr: SocketAddr) -> io::Result<std::net::TcpListener> {
+        let before = self.left.get();
+        let mut left = before;
+        let mut retries = 0_u32;
+        let mut sleep = |wait: Duration| {
+            retries += 1;
+            if retries == 1 {
+                tracing::warn!(%addr, ?wait, "listen address not available yet, retrying the bind");
+            } else {
+                tracing::debug!(%addr, ?wait, "listen address still not available");
+            }
+            (self.sleep)(wait);
+        };
+        let got = retry_unavailable(&mut left, &mut sleep, &mut || (self.attempt)(addr));
+        self.left.set(left);
+        if let Err(e) = &got
+            && e.kind() == io::ErrorKind::AddrNotAvailable
+        {
+            tracing::warn!(%addr, waited = ?(before - left), "listen address never became available, giving up");
+        }
+        got
+    }
 }
 
-/// Runs `attempt` until it succeeds, fails with anything but `AddrNotAvailable`, or the
-/// waits already made add up to `budget`; the last error is then the result. `sleep` is
-/// called with each wait (250 ms, doubling to 2 s). Not generic: a generic function's
-/// copies count once each in the coverage ratchet.
+/// Runs `attempt` until it succeeds, fails with anything but `AddrNotAvailable`, or
+/// `left` is spent; the last error is then the result. `sleep` is called with each wait
+/// (250 ms, doubling to 2 s, the last one cut to what is left) and `left` is reduced by
+/// it. Not generic: a generic function's copies count once each in the coverage ratchet.
 pub(crate) fn retry_unavailable(
-    budget: Duration,
+    left: &mut Duration,
     sleep: &mut dyn FnMut(Duration),
     attempt: &mut dyn FnMut() -> io::Result<std::net::TcpListener>,
 ) -> io::Result<std::net::TcpListener> {
-    let mut waited = Duration::ZERO;
     let mut wait = BIND_WAIT_FIRST;
     loop {
         match attempt() {
-            Err(e) if e.kind() == io::ErrorKind::AddrNotAvailable && waited < budget => {
-                sleep(wait);
-                waited += wait;
+            Err(e) if e.kind() == io::ErrorKind::AddrNotAvailable && !left.is_zero() => {
+                let wait_now = wait.min(*left);
+                sleep(wait_now);
+                *left -= wait_now;
                 wait = (wait * 2).min(BIND_WAIT_MAX);
             }
             other => return other,
