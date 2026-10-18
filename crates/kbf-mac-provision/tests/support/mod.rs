@@ -28,6 +28,7 @@ pub const PLIST: &str = "/Library/LaunchDaemons/org.example.kbf-daemon.plist";
 pub const DROPIN: &str = "/etc/ssh/sshd_config.d/000-kbf.conf";
 pub const ERR_LOG: &str = "/Library/Logs/kbf/kbf-daemon.err.log";
 pub const SOFTWARE_UPDATE: &str = "/Library/Preferences/com.apple.SoftwareUpdate";
+pub const XCODE: &str = "/Library/Preferences/com.apple.dt.Xcode";
 pub const COMMERCE: &str = "/Library/Preferences/com.apple.commerce";
 pub const LOGINWINDOW: &str = "/Library/Preferences/com.apple.loginwindow";
 pub const INTENT: &str = "/var/db/kbf-mac-session/session-intent";
@@ -258,6 +259,7 @@ impl FakeMac {
             s.default_set(SOFTWARE_UPDATE, k, v);
         }
         s.default_set(COMMERCE, "AutoUpdate", "0");
+        s.default_set(XCODE, "IDEPackageSupportDisableManifestSandbox", "1");
         s.firewall = "1".into();
         s.time_server = "time.example.net".into();
         s.xcode_select = Some("/Applications/Xcode-27.0.app/Contents/Developer".into());
