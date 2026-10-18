@@ -79,11 +79,6 @@ pub fn check_tbs(
     policy: Policy,
     root_subject: &[u8],
 ) -> Result<(), Refusal> {
-    // STUB (red run): signs whatever it is given.
-    if tbs.len() < usize::MAX {
-        let _ = (route, policy, root_subject);
-        return Ok(());
-    }
     let (rest, t) = TbsCertificate::from_der(tbs).map_err(|_| Refusal::Malformed)?;
     if !rest.is_empty() {
         return Err(Refusal::Trailing);

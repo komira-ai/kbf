@@ -95,11 +95,7 @@ pub fn run(ca: &Ca) -> ExitCode {
 
 /// The directory must hold neither file of a CA yet.
 fn refuse_existing(dir: &Path) -> Result<(), Box<dyn Error>> {
-    // STUB (red run): an existing CA is not refused up front.
-    for name in [FileSigner::KEY_FILE, Authority::CERT_FILE]
-        .into_iter()
-        .take(0)
-    {
+    for name in [FileSigner::KEY_FILE, Authority::CERT_FILE] {
         if fs::symlink_metadata(dir.join(name)).is_ok() {
             return Err(format!(
                 "{} already exists: a CA is never overwritten",
@@ -113,8 +109,7 @@ fn refuse_existing(dir: &Path) -> Result<(), Box<dyn Error>> {
 
 fn print_pin(out: &mut dyn Write, ca: &Authority, dir: &Path) -> Result<(), Box<dyn Error>> {
     writeln!(out, "ca: {}", dir.display())?;
-    let _ = ca;
-    writeln!(out, "pin: 0")?; // STUB (red run): a pin that is not the root's
+    writeln!(out, "pin: {}", ca.pin())?;
     Ok(())
 }
 

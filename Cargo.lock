@@ -1450,6 +1450,7 @@ dependencies = [
  "bytes",
  "clap",
  "kbf-all-in-one",
+ "kbf-ca",
  "kbf-cas-conformance",
  "kbf-daemon",
  "kbf-deploy",

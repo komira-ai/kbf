@@ -29,7 +29,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn harden() -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        // STUB (red run): the dumpable flag is kept.
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)?;
         Ok(())
     }
     #[cfg(not(target_os = "linux"))]
@@ -159,8 +159,9 @@ impl<S: Signer> SignerServer<S> {
     }
 
     fn answer(&self, stream: &mut UnixStream) -> io::Result<()> {
-        // STUB (red run): SO_PEERCRED is not checked.
-        let _ = (peer_uid, self.allowed_uid);
+        if peer_uid(stream)? != self.allowed_uid {
+            return Ok(());
+        }
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
         let (kind, body) = wire::read_frame(stream)?;
