@@ -412,17 +412,19 @@ pub fn file_args(
             continue;
         }
         if kbf_enroll::config::is_own_table(group) {
-            if let Some(problem) = value_for_table(path, group, body) {
-                problems.push(problem);
-            } else if let toml::Value::Table(keys) = body
-                && let Some(key) = keys
-                    .keys()
-                    .find(|key| !kbf_enroll::config::is_key(group, key))
-            {
-                problems.push(format!(
-                    "unknown key `{group}.{key}` in {}: [{group}] is the enrollment's table and has no such key",
-                    path.display()
-                ));
+            match value_for_table(path, group, body) {
+                Some(problem) => problems.push(problem),
+                None => {
+                    if let Some(key) = body.as_table().and_then(|keys| {
+                        keys.keys()
+                            .find(|key| !kbf_enroll::config::is_key(group, key))
+                    }) {
+                        problems.push(format!(
+                            "unknown key `{group}.{key}` in {}: [{group}] is the enrollment's table and has no such key",
+                            path.display()
+                        ));
+                    }
+                }
             }
             continue;
         }
