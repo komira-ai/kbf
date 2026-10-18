@@ -51,3 +51,16 @@ staged or put a release on trial since (exit 5): use `kbf-installer rollback` th
 
 Not done by the migration: `installer.toml` (the `min_generation` to put there is printed as the
 report's value; `setup` writes the file), the users, and the `orders/` directory (`setup`).
+
+## The test farm's hosts
+
+The hosts that run the dev installer are the ones this verb exists for. Their layout is fixed
+in `crates/kbf-installer/testdata/testfarm/`: units rendered by `kbf-deploy linux render-units
+--mode` with `KBF_BIN_DIR=/usr/local/kbf/current`, `state.json` schema 1, the `helper.json` of
+the deployed helper (which also keeps `handled_entry`, a key the migration ignores), the old
+helper's unit and a Mac's daemon plist. `src/migrate/testfarm_tests.rs` migrates each and
+checks the unit the node starts from; a test in `kbf-deploy` keeps the units equal to what the
+kit renders and checks that the rewritten unit still passes the kit's rules. What those tests
+cannot do is run the node: the repository allows no script as a stand-in binary, so a start is
+shown by what it needs (the program is a regular executable file in the new tree with the
+bytes of the release that ran, the arguments are the ones the unit had), not by running it.
