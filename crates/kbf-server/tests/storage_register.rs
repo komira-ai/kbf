@@ -1731,7 +1731,16 @@ async fn a_denied_certificate_is_refused_by_a_real_storage_node_when_the_generat
         let remote = RemoteStorage::new(channel.clone(), maps.generation());
         async move { remote.find_missing(&[digest]).await }
     };
-    ask(&listed).await.expect("admitted before the entry");
+    // A node that has just started answers "catching up" while it rebuilds its index
+    // (slow under coverage); only that answer is waited out, any other refusal fails.
+    until_async("the node to answer the listed certificate", || async {
+        match ask(&listed).await {
+            Ok(_) => Some(()),
+            Err(kbf_storage::StorageError::Unavailable(_)) => None,
+            Err(other) => panic!("not admitted before the entry: {other:?}"),
+        }
+    })
+    .await;
     ask(&other).await.expect("admitted");
 
     let entry = kbf_map::DenyEntry::SpkiSha256(spki);

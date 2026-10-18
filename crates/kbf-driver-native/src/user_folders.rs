@@ -18,6 +18,14 @@
 //!   `docs/spikes/macos-p0.md` failed to build under the profile without it (the
 //!   one-file C tool `tests/user_folders.rs` builds did not). The name is Swift
 //!   Build's own random one, so it cannot be one per lease;
+//! - SwiftPM's package resolution (`xcodebuild` runs it for a Swift package with a
+//!   dependency) makes `T/TemporaryDirectory.<random>` and, with a failure to report,
+//!   `T/ResultBundle_<date>.xcresult`; the asset service stages the Metal toolchain it
+//!   mounts in `T/cryptex.personalize.<random>`. On the macOS runner (Xcode 26.5) the
+//!   sandbox log named all three as denied while `xcodebuild -scheme hello` on a
+//!   package with a local dependency ended with `permissionDenied` and the toolchain
+//!   was never mounted. `CFFIXED_USER_HOME` moves `~` for these tools but not
+//!   `confstr`'s folders, so a rule it is, like the others here;
 //! - the Metal compiler (`xcrun metal`) keeps its module cache in
 //!   `C/clang/ModuleCache/<hash>` and ignores `CLANG_MODULE_CACHE_PATH`, which moves
 //!   clang's own (issue #183; on the macOS runner, Xcode 26.6, `metal -c` failed with
@@ -27,8 +35,8 @@
 //! The sandbox profile ([`UserFolders::rules`]) lets an action write below
 //! `T/TemporaryItems` (not the folder itself: an action that could replace it with a
 //! symlink would aim the daemon's sweep anywhere), to those `xcrun` names, and to an
-//! entry named `swbuild.tmp.` and at least one more character, and what is below it
-//! (one regular expression without an end anchor), and below `C/clang/ModuleCache/`
+//! entry named by one of `MKDTEMP_PREFIXES` and at least one more character, and what
+//! is below it (one regular expression without an end anchor each), and below `C/clang/ModuleCache/`
 //! (not the folder itself, which the sweep makes, mode 0700, when it is missing), and
 //! nothing else in the two folders, the folders themselves included. The daemon finds
 //! the folders once, at start ([`UserFolders::detect`]), with every link resolved: the
@@ -66,7 +74,7 @@
 //! opens `T` and `TemporaryItems` with `O_NOFOLLOW`, takes each only when it is a
 //! directory of the daemon's user, and removes entries by name relative to it,
 //! never following a symlink at any level ([`kbf_outputs::remove_tree_at`]).
-//! A `swbuild.tmp.*` directory is not swept: Swift Build removes its own when it
+//! A directory named by `MKDTEMP_PREFIXES` is not swept: its tool removes its own when it
 //! ends, and one a running build still uses can go untouched for longer than
 //! [`LEFTOVER_AGE`] (a long build), so the age rule could remove it under the build.
 //! One a killed lease left stays: the daemon does not remove it.
@@ -95,9 +103,22 @@ const XCRUN_DB: &str = "xcrun_db";
 /// configuration, holding the `.pcm` files.
 const MODULE_CACHE: [&str; 2] = ["clang", "ModuleCache"];
 
-/// What Swift Build's scratch directory in the temporary folder is named: this, then
-/// `mkdtemp`'s random characters.
-const SWBUILD_TMP: &str = "swbuild.tmp.";
+/// The names in the temporary folder that a tool makes with `mkdtemp` (or a result
+/// path of its own), each a prefix and then the tool's random characters, and the tool
+/// that makes it:
+/// - `swbuild.tmp.`: Swift Build's scratch directory;
+/// - `TemporaryDirectory.`: SwiftPM's (and `xcodebuild`'s package resolution's)
+///   temporary directories, made with `confstr`'s temporary folder, not `TMPDIR`;
+/// - `cryptex.personalize.`: the asset service's staging while it mounts the Metal
+///   toolchain below the lease's home;
+/// - `ResultBundle_`: the `.xcresult` `xcodebuild` writes for an error (without the
+///   rule it prints "Failed saving result bundle" over the error it meant to report).
+const MKDTEMP_PREFIXES: [&str; 4] = [
+    "swbuild.tmp.",
+    "TemporaryDirectory.",
+    "cryptex.personalize.",
+    "ResultBundle_",
+];
 
 /// How the sweep opens a folder: a directory, never through a symlink.
 const FOLDER: OFlags = OFlags::RDONLY
@@ -171,17 +192,20 @@ impl UserFolders {
     }
 
     /// The sandbox profile rules that let an action write the names the module lists
-    /// (below `TemporaryItems`, never the folder itself; a `swbuild.tmp.<random>`
-    /// entry and what is below it) and nothing else in these folders; they follow the
-    /// profile's `(deny file-write*)`, which they narrow.
+    /// (below `TemporaryItems`, never the folder itself; an entry of
+    /// `MKDTEMP_PREFIXES` and what is below it) and nothing else in these folders;
+    /// they follow the profile's `(deny file-write*)`, which they narrow.
     #[must_use]
     pub fn rules(&self) -> String {
         let temp = regex_quote(&self.temp.to_string_lossy());
         let cache = regex_quote(&self.cache.to_string_lossy());
-        let swbuild = regex_quote(SWBUILD_TMP);
         let modules = MODULE_CACHE.join("/");
+        let prefixed: String = MKDTEMP_PREFIXES
+            .iter()
+            .map(|prefix| format!("  (regex #\"^{temp}/{}[^/]+\")\n", regex_quote(prefix)))
+            .collect();
         format!(
-            "(allow file-write*\n  (regex #\"^{temp}/{TEMPORARY_ITEMS}/\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\")\n  (regex #\"^{temp}/{swbuild}[^/]+\")\n  (regex #\"^{cache}/{modules}/\"))\n",
+            "(allow file-write*\n  (regex #\"^{temp}/{TEMPORARY_ITEMS}/\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\")\n{prefixed}  (regex #\"^{cache}/{modules}/\"))\n",
         )
     }
 
@@ -423,10 +447,11 @@ mod tests {
     /// `TemporaryItems` itself (an action could swap it for a symlink the daemon's
     /// sweep then follows), miss one of the names the tools write, or let a
     /// regular-expression character in the path (`+` and `.` are common in
-    /// `/var/folders` names) match other paths; and a Swift Build rule wider than one
-    /// `swbuild.tmp.<random>` entry and what is below it: a prefix without the dots
-    /// escaped (`swbuildXtmpX..`), one that takes an empty suffix (`swbuild.tmp.`
-    /// itself), or the folder whole.
+    /// `/var/folders` names) match other paths; and a rule for a `MKDTEMP_PREFIXES`
+    /// name (`swbuild.tmp.`, `TemporaryDirectory.`, `cryptex.personalize.`,
+    /// `ResultBundle_`) wider than one `<prefix><random>` entry and what is below it: a
+    /// prefix without the dots escaped (`swbuildXtmpX..`), one that takes an empty
+    /// suffix (`swbuild.tmp.` itself), or the folder whole.
     #[test]
     fn the_rules_name_only_the_few_names_the_tools_write() {
         let folders = UserFolders::new(
@@ -440,6 +465,9 @@ mod tests {
              (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/TemporaryItems/\")\n  \
              (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/xcrun_db(-[^/]*)?$\")\n  \
              (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/swbuild\\.tmp\\.[^/]+\")\n  \
+             (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/TemporaryDirectory\\.[^/]+\")\n  \
+             (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/cryptex\\.personalize\\.[^/]+\")\n  \
+             (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/ResultBundle_[^/]+\")\n  \
              (regex #\"^/private/var/folders/ab/c\\+d\\.e/C/clang/ModuleCache/\"))\n"
         );
         assert_eq!(

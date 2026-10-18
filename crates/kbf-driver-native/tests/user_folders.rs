@@ -763,6 +763,35 @@ async fn xcodebuild_builds_a_swift_package() {
     );
 }
 
+/// Has the Metal toolchain installed for the Xcode at `developer_dir`, outside any
+/// sandbox, as the user of the runner would: a hosted runner's Xcode ships without it
+/// (`xcodebuild -showComponent MetalToolchain` says `uninstalled`), and without it no
+/// volume is ever mounted, so the test below would check nothing. Panics when the
+/// download fails: that is a runner this test cannot run on, not one to skip.
+fn install_metal_toolchain(developer_dir: &Path) {
+    let xcodebuild = |component: &str| {
+        let out = std::process::Command::new(developer_dir.join("usr/bin/xcodebuild"))
+            .env("DEVELOPER_DIR", developer_dir)
+            .args([component, "MetalToolchain"])
+            .output()
+            .expect("run xcodebuild");
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    let (_, shown) = xcodebuild("-showComponent");
+    if !shown.to_lowercase().contains("uninstalled") {
+        return;
+    }
+    let (ok, downloaded) = xcodebuild("-downloadComponent");
+    assert!(ok, "the Metal toolchain cannot be installed: {downloaded}");
+}
+
 /// Catches a lease that cannot end because of what `xcodebuild` had a system service
 /// mount in its home (issue #178). Run with `CFFIXED_USER_HOME` the lease's home, as
 /// Foundation's tools need it to keep their caches in the lease (issue #179),
@@ -778,6 +807,7 @@ async fn a_toolchain_mounted_in_the_leases_home_does_not_keep_the_lease() {
         eprintln!("no Xcode on this runner: nothing to check");
         return;
     };
+    install_metal_toolchain(&developer_dir);
     let dir = scratch("toolchain-mount");
     let mut config: NativeConfig = config(&dir);
     config.xcodes = [(build.clone(), developer_dir)].into_iter().collect();
