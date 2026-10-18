@@ -525,3 +525,66 @@ async fn a_member_with_an_unknown_boot_is_never_remembered() {
         "boot known: asked once more, then cached"
     );
 }
+
+/// Catches entries surviving a spell at an unknown boot: member 1 is verified at boot 5,
+/// a caller then checks it at boot 0 (a downgraded binary), and the next check at boot 5
+/// again must ask, since the member may have restarted and lost RAM-only data in between.
+/// Mutant: boot 0 returns without dropping the member's entries.
+#[tokio::test]
+async fn a_spell_at_boot_zero_drops_what_boot_five_verified() {
+    let rig = rig();
+    let blobs = rig.blobs(2);
+    hold(&rig.cluster.node(1), &blobs);
+    let action = rig.action(0, &blobs);
+    let five = view(&map(1, 2, booted([5, 1, 1])));
+
+    rig.cell.set(five.clone());
+    assert!(rig.hit(&action).await);
+    assert!(rig.hit(&action).await);
+    assert_eq!(rig.finds(1), [2], "boot 5 is cached");
+
+    rig.cell.set(view(&map(2, 2, booted([0, 1, 1]))));
+    assert!(rig.hit(&action).await);
+
+    rig.cell.set(five);
+    let before = rig.finds(1).len();
+    assert!(rig.hit(&action).await);
+    assert_eq!(
+        rig.finds(1).len(),
+        before + 1,
+        "boot 5 again: asked, not trusted"
+    );
+}
+
+/// Catches the mixed pair (an older generation with a newer boot) being read or added:
+/// after a check at generation 2 boot 1, a caller at generation 1 boot 2 asks every time
+/// and leaves what generation 2 verified in place. Mutant: the pair compared per field.
+#[tokio::test]
+async fn a_lower_generation_with_a_higher_boot_neither_reads_nor_adds() {
+    let rig = rig();
+    let blobs = rig.blobs(2);
+    hold(&rig.cluster.node(1), &blobs);
+    let action = rig.action(0, &blobs);
+    let current = view(&map(2, 2, booted([1, 1, 1])));
+
+    rig.cell.set(current.clone());
+    assert!(rig.hit(&action).await);
+    assert_eq!(rig.finds(1), [2]);
+
+    rig.cell.set(view(&map(1, 2, booted([2, 1, 1]))));
+    assert!(rig.hit(&action).await);
+    assert!(rig.hit(&action).await);
+    assert_eq!(
+        rig.finds(1),
+        [2, 2, 2],
+        "the mixed pair is never read or added"
+    );
+
+    rig.cell.set(current);
+    assert!(rig.hit(&action).await);
+    assert_eq!(
+        rig.finds(1),
+        [2, 2, 2],
+        "generation 2 boot 1 is still cached"
+    );
+}

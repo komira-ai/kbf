@@ -121,12 +121,15 @@ impl Inner {
     /// The entries of `member` for `generation` and `boot`: those of an older generation or
     /// another boot are dropped first. `None` when the caller's view is older than what is
     /// remembered (the caller works from an old map: it neither reads nor adds), or when
-    /// `boot` is 0 (unknown: a restart could not be told, so nothing is remembered).
+    /// `boot` is 0 (unknown: a restart could not be told, so nothing is remembered, and
+    /// what the member had cached is dropped too: it may restart unseen while at boot 0
+    /// and a later known boot must not trust the old entries; dropping only costs hits).
     ///
     /// The generation orders first, the boot second; a restart normally moves both, and the
     /// boot alone catches a view that shares the generation but not the registration.
     fn owned(&mut self, member: MemberId, generation: u64, boot: u64) -> Option<&mut Owned> {
         if boot == 0 {
+            self.drop_member(member);
             return None;
         }
         let remembered = self.members.get(&member).map(|o| (o.generation, o.boot));
@@ -134,15 +137,20 @@ impl Inner {
             return None;
         }
         if remembered.is_some_and(|r| r < (generation, boot)) {
-            let dropped = self.members.remove(&member).into_iter();
-            for (_, seq) in dropped.flat_map(|o| o.blobs.into_values()) {
-                self.recency.remove(&seq);
-            }
+            self.drop_member(member);
         }
         let owned = self.members.entry(member).or_default();
         owned.generation = generation;
         owned.boot = boot;
         Some(owned)
+    }
+
+    /// Forgets every entry of `member`, freeing their `recency` places.
+    fn drop_member(&mut self, member: MemberId) {
+        let dropped = self.members.remove(&member).into_iter();
+        for (_, seq) in dropped.flat_map(|o| o.blobs.into_values()) {
+            self.recency.remove(&seq);
+        }
     }
 
     /// Gives `digest` of `member` (already in `members`) a new place at the most recently
