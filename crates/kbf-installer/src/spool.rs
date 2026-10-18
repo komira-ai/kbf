@@ -1,11 +1,13 @@
-//! The inbox entry: a directory the unprivileged `kbf` process writes and the root stage
-//! reads, so everything in it is an attacker's until it is checked.
+//! The order spool: a directory the unprivileged `kbf` process writes and the root helper
+//! reads, so everything in it is an attacker's until it is checked. (The inbox of release
+//! tarballs this module once opened is gone: no release bytes pass through `kbf`.)
 //!
 //! [`Entry::open`] opens the entry directory without following a link; every file beneath
 //! it is opened by name, relative to that open directory, with `O_NOFOLLOW` (and, on
 //! Linux, `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`,
-//! which refuses a link in any component). A name is a single path component (the offer's
-//! file names are checked before they get here), so that is every component.
+//! which refuses a link in any component). A name is a single path component (a record's
+//! name is the pair of numbers it holds, checked before it gets here), so that is every
+//! component.
 //!
 //! The file is then judged by its open descriptor, never by a path stated before:
 //! a symbolic link (ELOOP), a FIFO, socket, device or directory (not a regular file), a
@@ -118,6 +120,71 @@ impl Entry {
             }
         }
         Ok(names)
+    }
+
+    /// Up to `max` of the entry's names, without `.` and `..`, and whether there were more.
+    /// Unlike [`names`](Self::names) a crowded directory is not refused: the caller decides
+    /// what to do with the excess.
+    pub fn names_up_to(&self, max: usize) -> Result<(Vec<String>, bool), Refusal> {
+        let refuse = |fault| Refusal::Inbox {
+            name: self.name.clone(),
+            fault,
+        };
+        let dir = Dir::read_from(&self.dir)
+            .map_err(unreadable)
+            .map_err(&refuse)?;
+        let mut names = Vec::new();
+        for item in dir {
+            let item = item.map_err(unreadable).map_err(&refuse)?;
+            let name = item.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            if names.len() == max {
+                return Ok((names, true));
+            }
+            names.push(String::from_utf8_lossy(name).into_owned());
+        }
+        Ok((names, false))
+    }
+
+    /// The directory `name` inside this entry, opened relative to it without following a
+    /// link, so a link put in the writer's place of `name` is refused instead of followed
+    /// out of the entry.
+    pub fn sub(&self, name: &str) -> Result<Entry, Refusal> {
+        let refuse = |fault| Refusal::Inbox {
+            name: name.to_owned(),
+            fault,
+        };
+        if matches!(name, "" | "." | "..") || name.contains(['/', '\0']) {
+            return Err(refuse(InboxFault::BadName));
+        }
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+        let dir = rustix::fs::openat(&self.dir, name, flags, Mode::empty())
+            .map_err(|e| refuse(fault_of(e, InboxFault::NotADirectory)))?;
+        Ok(Entry {
+            dir,
+            mode: self.mode,
+            name: format!("{}/{name}", self.name),
+        })
+    }
+
+    /// Remove the file `name` from the entry, by `unlinkat` on the entry's descriptor: the
+    /// name is one component of the directory that was opened, so no link in the writer's
+    /// control can send the removal elsewhere (it removes a link itself, never its target).
+    /// A name that is not there is removed already.
+    pub fn remove_file(&self, name: &str) -> Result<(), Refusal> {
+        let refuse = |fault| Refusal::Inbox {
+            name: name.to_owned(),
+            fault,
+        };
+        if matches!(name, "" | "." | "..") || name.contains(['/', '\0']) {
+            return Err(refuse(InboxFault::BadName));
+        }
+        match rustix::fs::unlinkat(&self.dir, name, rustix::fs::AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(e) => Err(refuse(fault_of(e, InboxFault::NotRegular))),
+        }
     }
 
     /// Open the file `name` beneath the entry and judge it by its descriptor: a regular
@@ -254,5 +321,5 @@ pub fn read_capped(from: &mut File, cap: u64, name: &str) -> Result<Vec<u8>, Ref
 }
 
 #[cfg(test)]
-#[path = "inbox_tests.rs"]
+#[path = "spool_tests.rs"]
 mod tests;

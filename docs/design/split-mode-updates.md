@@ -1,7 +1,7 @@
 # Updating a split-mode farm without failing a build
 
 Status: design for the sequence. The pull updater it relies on is partly built: `kbf-installer` (merged), `kbf-update` (the node's client, #908) and
-`kbf-helper` (the root helper, #929) are built or in review; the controller, the node gates, the Envoy switch and the poller are not.
+`kbf-installer run` (the root helper, #929) are built or in review; the controller, the node gates, the Envoy switch and the poller are not.
 Planned-down (#914) is built. It is read against `feature/arch-v2` and these pull requests, fetched
 when this was written: #857, #879 and #887 (the frontend handover, open, stacked), #803 (the rollout state machine, open), #886
 (merged: a restarted node whose index is whole registers `Active`) and #860 (open: a wiped node rebuilds its index while
@@ -97,7 +97,7 @@ The frontend phase is the same on a single box, in split mode and in all-in-one 
 |---|---|---|
 | Poll for a release | frontend: update poller (6.2) | read-only access to the release source |
 | Preflight | frontend: planner (2.4) | `kbf --version --json` of each tarball; build facts of every running host |
-| Staging | each host: update client (`kbf-update`) and root helper (`kbf-helper`), offline verification | session to the frontend |
+| Staging | each host: update client (`kbf-update`) and root helper (`kbf-installer run`), offline verification | session to the frontend |
 | Slot, plan, ordering, resume | the **new** frontend: rollout controller (6.1) | `update/*` rows |
 | Start the new frontend, switch, drain | frontend host: the helper starts the idle instance on its own ports; the baton moves (#879); Envoy routes by health; the old process drains | units `kbf-frontend@{a,b}` (#887), Envoy static config naming both |
 | Cordon, lease count | scheduler (`Farm`), `cordon/<node>` rows (#879) | none new |
@@ -114,7 +114,7 @@ Inputs: the desired release (per platform: tarball and attestation in the releas
 `protocol`, `min_protocol`, `state_schema`, `profile`, `version`; **[F]** `crates/kbf-cli/src/version.rs`) plus the fields of
 3.6; and the same facts of every running host (each reports them in registration). Checks:
 
-1. **Completeness and generation**: every platform the farm runs is complete for the commit (tarball and attestation present), and the desired `generation` is higher than any the hosts have acted on. The **host** verifies the build attestation offline when it stages (pinned `gh` and trusted root, repository, workflow, `main`, source digest equal to the offered commit; `pull-updates.md` section 2); the frontend does not have to. Downgrades are allowed: a higher generation always wins, and there is no floor on commits. **As built**, the installer keeps a floor on **order ids** (`BelowFloor`); the helper passes the monotonically increasing `order_id` as the serial, so a commit downgrade is still allowed (a higher generation gives a new, higher order id).
+1. **Completeness and generation**: every platform the farm runs is complete for the commit (tarball and attestation present), and the desired `generation` is higher than any the hosts have acted on. The **host** verifies the build attestation offline when it stages (pinned `gh` and trusted root, repository, workflow, `main`, source digest equal to the offered commit; `pull-updates.md` section 2); the frontend does not have to. Downgrades are allowed: a higher generation always wins, and there is no floor on commits. **As built**, the installer keeps no floor: an order is newer than the last by (epoch, then id) in the node's client and the helper, a commit downgrade is allowed, and a rollback is the old release offered with a higher generation (which gets a new, higher order id).
 2. **Every host is known and connected.** A host that reports no build halts the plan with its name; it is never skipped.
 3. **Order** (rule in 3.3): the frontend moves first, except a downgrade across a protocol difference, where the nodes move first.
    Refused as a flag day if no order keeps every host inside the frontend's accepted range at every instant.
@@ -566,7 +566,7 @@ attempts; T1 measures it. An `Execute` queued because capacity is short keeps it
 ### 5.1 Principles
 
 - A host reverts **itself** from local state only: a binary that never becomes healthy is put back by the helper's timer or boot
-  counter (**as built**: on Linux the window starts at the new process's first start, from `kbf-helper boot-check --window-secs`, default 900, range 120 to 1800, and the order's `window_s` is ignored; on macOS there is no start hook, so the window is armed at activation and `window_s` is clamped to 120 to 1800).
+  counter (**as built**: on Linux the window starts at the new process's first start, from `kbf-installer boot-check --window-secs`, default 900, range 120 to 1800, and the order's `window_s` is ignored; on macOS there is no start hook, so the window is armed at activation and `window_s` is clamped to 120 to 1800).
 - The controller **holds** on any failure and touches nothing else. It never retries a revert by itself (a revert from a frontend
   outage and one from a bad build look alike from the host).
 - An error from the activate order counts as "swapped, maybe": revert, never retry.

@@ -1,6 +1,6 @@
 //! What the client remembers across restarts so that it never goes backwards: the newest
-//! offer generation it has completed, and the newest order id it has accepted. One file,
-//! `DIR/client.json`, replaced whole by a rename.
+//! offer generation it has completed, and the newest order (epoch, then id) it has accepted. One file,
+//! `DIR/client.json` (DIR is the order spool: the service user's only writable place), replaced whole by a rename.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -12,11 +12,14 @@ use serde::{Deserialize, Serialize};
 /// The two numbers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Floors {
-    /// The newest offer generation whose directory is complete in the inbox; 0 before
-    /// any.
+    /// The newest offer generation accepted; 0 before any.
     pub generation: u64,
     /// The newest order id accepted; 0 before any.
     pub order_id: u64,
+    /// The epoch of that order. Orders are ordered by epoch, then id: a restored store
+    /// raises the epoch and counts its ids again. 0 in a file written before this field.
+    #[serde(default)]
+    pub order_epoch: u64,
 }
 
 /// Why the file cannot be used.

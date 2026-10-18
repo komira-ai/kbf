@@ -18,10 +18,25 @@ fn refusal(r: Result<File, Refusal>) -> &'static str {
     r.expect_err("refused").code()
 }
 
+/// The way the production code opens beneath the entry on this kernel: `openat2` where
+/// Linux has it, `O_NOFOLLOW` elsewhere. A test that forced `Beneath` on macOS would fail
+/// for want of `openat2`, not for what it tests.
+fn native() -> OpenMode {
+    if cfg!(target_os = "linux") {
+        OpenMode::Beneath
+    } else {
+        OpenMode::NoFollow
+    }
+}
+
 /// Both ways of opening beneath the entry are exercised on every kernel that has
-/// `openat2` (the production choice is `Beneath` there, `NoFollow` elsewhere).
-fn modes() -> [OpenMode; 2] {
-    [OpenMode::Beneath, OpenMode::NoFollow]
+/// `openat2`; `NoFollow` alone elsewhere.
+fn modes() -> Vec<OpenMode> {
+    if cfg!(target_os = "linux") {
+        vec![OpenMode::Beneath, OpenMode::NoFollow]
+    } else {
+        vec![OpenMode::NoFollow]
+    }
 }
 
 /// Catches a regular file not read back whole: its content comes out by the descriptor.
@@ -95,7 +110,7 @@ fn a_file_the_stage_must_not_read_is_refused_by_its_kind() {
 /// kernel has no `openat2` the same calls fail for want of it.
 #[test]
 fn the_kernel_refuses_a_way_out_of_the_entry() {
-    let (dir, entry) = entry_with("inbox-beneath", OpenMode::Beneath);
+    let (dir, entry) = entry_with("inbox-beneath", native());
     fs::write(dir.join("secret"), b"not yours").expect("seed");
     symlink("../secret", dir.join("entry/link")).expect("link");
     assert!(open_beneath(&entry.dir, "../secret").is_err());
@@ -126,7 +141,7 @@ fn an_entry_that_is_a_link_or_not_a_directory_is_refused() {
 /// holding more than the most a stage takes refused before any is read.
 #[test]
 fn the_names_of_an_entry_are_listed_and_bounded() {
-    let (dir, entry) = entry_with("inbox-names", OpenMode::Beneath);
+    let (dir, entry) = entry_with("inbox-names", native());
     let e = dir.join("entry");
     assert!(entry.names().expect("lists").is_empty());
     fs::write(e.join("b"), b"1").expect("seed");
@@ -254,4 +269,64 @@ fn an_open_error_no_rule_names_is_reported_as_unreadable() {
         matches!(&fault, InboxFault::Unreadable(e) if e.kind() == io::ErrorKind::PermissionDenied),
         "{fault:?}"
     );
+}
+
+/// Catches the helper removing what a link points at instead of the link: the entry holds a
+/// link to a file outside it, and removing the link by name leaves the target. Also a name
+/// that is not a single component is refused, and a name that is gone is not an error.
+///
+/// Mutant seen red: the removal done through a path (`fs::remove_file(dir/name)`) with the
+/// name `../secret`: the BadName check dropped, the outside file goes.
+#[test]
+fn a_removal_takes_the_name_in_the_entry_and_nothing_else() {
+    let (dir, entry) = entry_with("inbox-remove", OpenMode::NoFollow);
+    let e = dir.join("entry");
+    fs::write(dir.join("secret"), b"not yours").expect("seed");
+    fs::write(e.join("order"), b"{}").expect("seed");
+    symlink(dir.join("secret"), e.join("link")).expect("link");
+    entry.remove_file("order").expect("removed");
+    entry.remove_file("link").expect("the link is removed");
+    entry.remove_file("order").expect("gone already");
+    assert!(!e.join("order").exists());
+    assert!(e.join("link").symlink_metadata().is_err());
+    assert_eq!(fs::read(dir.join("secret")).expect("kept"), b"not yours");
+    for bad in ["../secret", "a/b", "", ".", ".."] {
+        assert_eq!(
+            entry.remove_file(bad).expect_err("refused").code(),
+            "inbox-bad-name",
+            "{bad:?}"
+        );
+    }
+    assert!(dir.join("secret").exists());
+    // A directory is not a file to remove (unlinkat without REMOVEDIR): refused, kept.
+    fs::create_dir(e.join("sub")).expect("dir");
+    assert!(entry.remove_file("sub").is_err());
+    assert!(e.join("sub").is_dir());
+}
+
+/// Catches a sub-directory followed out of the entry: `orders` replaced by a link to a
+/// directory elsewhere is refused, a real one opens and lists, and a name that is not one
+/// component is refused.
+///
+/// Mutant seen red: the `NOFOLLOW` flag dropped from `sub` (the linked directory opens).
+#[test]
+fn a_sub_directory_is_opened_beneath_the_entry_and_a_link_is_refused() {
+    let (dir, entry) = entry_with("inbox-sub", OpenMode::NoFollow);
+    let e = dir.join("entry");
+    fs::create_dir(e.join("real")).expect("dir");
+    fs::write(e.join("real/a"), b"x").expect("file");
+    fs::create_dir(dir.join("elsewhere")).expect("dir");
+    symlink(dir.join("elsewhere"), e.join("linked")).expect("link");
+    assert_eq!(
+        entry.sub("real").expect("opens").names().expect("lists"),
+        ["a"]
+    );
+    assert!(entry.sub("linked").is_err());
+    assert!(entry.sub("missing").is_err());
+    for bad in ["", ".", "..", "a/b"] {
+        assert_eq!(
+            entry.sub(bad).err().expect("refused").code(),
+            "inbox-bad-name"
+        );
+    }
 }

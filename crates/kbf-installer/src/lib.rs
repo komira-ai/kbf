@@ -18,11 +18,13 @@
 //! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
 //!   named by.
 //!
-//! The offline check ([`stage::stage_from_inbox`] runs them in the order that matters,
-//! documented there):
+//! The root helper of the pull-based updates is [`helper`], run by the `kbf-installer`
+//! binary (`run`, `boot-check`).
 //!
-//! - [`inbox`] and [`offer`]: an entry the unprivileged process wrote, opened without
-//!   following a link, and the offer that names its files and their sha256.
+//! The offline checks of a release a fetch brought in:
+//!
+//! - [`spool`]: a directory the unprivileged process writes (the order spool), opened
+//!   without following a link, each file judged by its descriptor.
 //! - [`attest`]: `gh attestation verify`, pinned, offline, as an unprivileged user.
 //! - [`trust`] and [`settings`]: what the check believes without looking at its content
 //!   (`gh`, the trusted root, the host's settings) and the root-ownership check on it.
@@ -43,14 +45,13 @@ pub mod binary;
 pub mod darwin;
 #[cfg(test)]
 mod fixtures;
-pub mod inbox;
+pub mod helper;
 pub mod layout;
-pub mod offer;
 pub mod refusal;
 pub mod release;
 pub mod run;
 pub mod settings;
-pub mod stage;
+pub mod spool;
 pub mod state;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
