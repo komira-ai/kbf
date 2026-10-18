@@ -36,6 +36,9 @@ use std::time::{Duration, Instant};
 
 use xtask::pkg::sha1::cksum;
 
+mod support;
+use support::{BUSY_WAIT, output_unbusy};
+
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 /// The binary the package ships: the stub, until the real one is built.
 const INSTALLER: &str = env!("CARGO_BIN_EXE_xtask-fake");
@@ -117,6 +120,12 @@ fn scratch(name: &str) -> PathBuf {
 fn signed_installer(dir: &Path) -> PathBuf {
     let binary = dir.join("kbf-installer");
     std::fs::copy(INSTALLER, &binary).expect("the installer binary");
+    // `sign-darwin` runs the copy, and a copy this process just wrote is busy (`ETXTBSY`)
+    // while a child another test thread forked still holds the write descriptor, until
+    // that child execs. Run it plainly until it is not busy: once one exec succeeds the
+    // descriptor is closed everywhere and no later holder can appear (the file is no
+    // longer opened for writing), so `sign-darwin` cannot meet the race.
+    output_unbusy(&mut Command::new(&binary), BUSY_WAIT).expect("the copy runs once it is free");
     success(XTASK, &["sign-darwin", s(&binary), "--minos", MINOS]);
     binary
 }
