@@ -675,7 +675,7 @@ async fn a_fenced_holder_answers_its_waiting_callers_without_a_stand_down() {
 struct Stoppable {
     child: Child,
     stop: oneshot::Sender<()>,
-    ended: JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    ended: JoinHandle<Result<(), kbf_server::managed::ManagedError>>,
     line: String,
 }
 

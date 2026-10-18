@@ -59,6 +59,20 @@ use crate::state_store;
 /// and their queueing before it quiesces anyway (the handover's default).
 pub const QUIESCE_WAIT: Duration = Duration::from_secs(10);
 
+/// Why a managed process ended with an error.
+#[derive(Debug, thiserror::Error)]
+pub enum ManagedError {
+    /// A takeover took the generation and the frontend could not start.
+    #[error("{0}")]
+    Takeover(String),
+    /// The control of this process ended while it waited for a takeover.
+    #[error("the admin control ended: {0}")]
+    Control(#[from] oneshot::error::RecvError),
+    /// A listener failed while serving.
+    #[error(transparent)]
+    Serve(#[from] ServeError),
+}
+
 /// Where a managed frontend gets its state store.
 pub enum StoreSource {
     /// Opened from `--state-store`.
@@ -211,7 +225,7 @@ impl Managed {
     /// # Errors
     /// A listener fails, or a takeover took the generation and the frontend could not
     /// start.
-    pub async fn serve(mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn serve(mut self) -> Result<(), ManagedError> {
         let handle = match self.running.take() {
             Some(handle) => handle,
             None => {
@@ -220,7 +234,7 @@ impl Managed {
                     // dropped before the answer.
                     taken = &mut self.takeover => match taken? {
                         Ok(handle) => *handle,
-                        Err(why) => return Err(why.into()),
+                        Err(why) => return Err(ManagedError::Takeover(why)),
                     },
                     () = self.stop.fired() => return Ok(()),
                 }
@@ -230,7 +244,7 @@ impl Managed {
         handle.escalation = self.escalation.take();
         let served = handle.serve().await;
         self.stop.fire();
-        served.map_err(|error: ServeError| error.into())
+        Ok(served?)
     }
 }
 
