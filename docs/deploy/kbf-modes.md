@@ -12,8 +12,9 @@ kbf-deploy linux render-units --config node.conf --out units --kbf-uid 1500 --mo
 kbf-deploy linux check-units --config node.conf --dir units --installable --mode daemon
 ```
 
-Exit codes are those of the converged verbs ([storage-node.md](storage-node.md#rendering-the-converged-units)):
-0 rendered or every rule holds, 1 a rule is broken, 2 refused.
+Exit codes: 0 rendered or every rule holds, 1 a rule is broken, 2 refused (a bad setting,
+a missing `--mode`, a file that cannot be read or written), with a `REFUSED:` line on
+stderr.
 
 ## What check-units reads
 
@@ -44,6 +45,10 @@ It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/sy
 | `slice` | a unit not in `kbf.slice` |
 | `delegate` | a mode that runs builds without `cpu`, `cpuset`, `memory` and `pids` delegated, or with one of them in `DisableControllers=` (the unit's, or `kbf.slice`'s) |
 | `cpuset` | `AllowedCPUs=` or `AllowedMemoryNodes=` on a mode that runs builds, or on `kbf.slice`, narrower than the node's CPUs or NUMA nodes |
+| `caps` | a mode that runs builds (`daemon`, `storage-and-daemon`, `all-in-one`) with `MemoryMax=`, `MemoryHigh=`, `CPUQuota=` or `AllowedCPUs=` on its unit: builds are capped by the daemon's own `actions/memory.max`, and a limit on the unit caps the supervisor with them |
+| `swap` | a mode that runs builds with `MemorySwapMax=` on its unit: its leases live in the unit's cgroup and may swap |
+| `oom` | a mode that runs builds without an integer `OOMScoreAdjust=` below 0, the build containers' score (a host-wide OOM kill takes the highest score first) |
+| `meta-dir` | `storage-and-daemon` or `all-in-one` with `--meta-dir` equal to `--data-dir` or under it (compared after resolving `.` and `..`) |
 | `credential` | the cold store's key reaching a mode without a storage half (`daemon`, `all-in-one`); the `storage` unit, which holds it, run as root or as `KBF_USER` (the user builds run as), and on the node its key file readable by another user; in the `storage-and-daemon` unit, any way of giving the key but the one `EnvironmentFile=<KBF_ETC>/s3.env` (below), and on the node that file not a plain file of root's with mode 0600 |
 | `storage` | a `storage` or `storage-and-daemon` unit without `--cold-store`, `--meta-dir`, `--storage-listen` or one of the three certificate flags, or with an `s3://` cold store and no `EnvironmentFile=<KBF_ETC>/s3.env` (for `storage-and-daemon`, exactly that path: no `-`, quotes or wildcard) |
 | `state-store` | a `--state-store` that is not `sqlite:///<absolute path>`: a Postgres URI (`postgres://` or `postgresql://`; postgres is not wired yet), any other scheme, an empty or relative SQLite path, or a value that names a variable (below) |
@@ -387,12 +392,52 @@ Copy the certificate and its key to the node's `KBF_ETC` (the storage unit reads
 `worker.pem` and `worker.key` (the `frontend-worker` row, which is also its client identity
 toward storage), `ca.pem`, and the REAPI pair `KBF_REAPI_CERT` and `KBF_REAPI_KEY`.
 
+## The config file and `--check`
+
+Every mode reads its settings from `/etc/kbf/kbf.toml` (or the file `--config FILE`
+names) as well as from the command line. The file is the mode's flags and nothing else:
+
+- one TOML table per setting group (`[listener]`, `[tls]`, `[stores]`, `[identity]`, ...),
+  one key per flag, the key being the flag's long name without the dashes in front
+  (`--storage-listen` is `storage-listen = "127.0.0.1:9982"` under `[listener]`);
+- a value is what the flag takes: a string or a number, `true` for a switch, an array
+  for a flag that may be given more than once (`label = ["a=b", "c=d"]`). Names,
+  validation and defaults are the flags' own, because the file is turned into the flags
+  it stands for before clap parses the command line;
+- a flag on the command line replaces the file's key for it;
+- a key that is no flag of the mode, or sits in another group's table, is refused naming
+  the key and the file; so is a flag the mode refuses on the command line (`--cold-store`
+  for `kbf frontend`);
+- the file must be a regular file that neither group nor other can write;
+- a secret is never a value in the file: the keys that name a key, token or policy hold
+  the path of the file that holds it.
+
+When `--config` is not given, `/etc/kbf/kbf.toml` is read if it exists. A file named
+with `--config` that does not exist is refused.
+
+`tests/golden/kbf-<mode>.toml` in `crates/kbf-cli` is one full file per mode, generated
+from the mode's flag definitions: a setting with a default is a live line holding it, one
+without is a comment showing its shape. A flag added to a mode changes its golden, and
+fails a test until it has a group.
+
+`kbf <mode> --check` parses the flags and the file, runs the startup checks a start runs,
+prints each problem on standard error and exits without starting anything: 0 when nothing
+stops the start (standard output says `kbf <mode>: ok`), 2 when it is refused, 75 when it
+is not ready yet (a restart may help). `kbf check-args <mode> ...` stays for
+`kbf-deploy linux check-units`: it parses the flags only (no file, no host checks, as
+before) and prints a one-line deprecation note as the last line on standard error.
+
 ## Installing a mode's unit
 
 `kbf-deploy linux install-units --config node.conf --mode MODE [--bin-dir DIR]
 [--apply]` installs one mode's unit on the node, as root:
 
-1. It checks the host, read only: the unit's
+1. It checks the host, read only: the cgroup v2 memory controller is there
+   (`/sys/fs/cgroup/cgroup.controllers` lists `memory`); no listener of the unit
+   (`--listen`, `--worker-listen`, `--api-listen`, `--storage-listen`) is on a port
+   something else listens on (a running instance of the unit keeps its own ports); a mode
+   that runs builds on a host with no active swap prints a `WARN:` line (`linux swap`
+   makes the swapfile); the unit's
    `User=` exists and is not root; for a mode that runs builds, the kbf user has subuid
    and subgid ranges and lingers; `kbf` is an executable in `--bin-dir` (or
    `KBF_BIN_DIR`); the rendered unit passes `check-units --mode MODE --installable` on
@@ -416,7 +461,8 @@ toward storage), `ca.pem`, and the REAPI pair `KBF_REAPI_CERT` and `KBF_REAPI_KE
 
 There is no `--uninstall` for a mode's unit yet. A node moving from the converged units
 (`kbf-server.service`) to `kbf-storage.service` stops the old ones first
-(`install-units --uninstall`): both would hold the same directories.
+(`systemctl disable --now kbf-daemon.service kbf-server.service`): both would hold the
+same directories.
 
 ## Upgrade kbf before kbf-deploy
 

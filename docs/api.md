@@ -111,6 +111,7 @@ order, with its software and where it is in placement:
 | `software.xcode_builds` | the Xcode builds actions can use on it: only these route work |
 | `software.xcodes` | every installed Xcode, ready or not: `app`, `build` (empty if not known), `state` (`ready`, `license_not_accepted`, `first_launch_not_run`, `metal_toolchain_missing`, `failed`, `not_surveyed` from the daemon's start until its first survey of its Xcodes ends (never advertised; the daemon sends its status again when the survey ends), or `unknown` for a state this server does not know), `reason` (the check that failed and its answer, from the daemon's last survey that changed this Xcode's `DEVELOPER_DIR`, build or state; a survey that differs only in its reason is not sent, so when another check later fails with the same build and state, this is still the earlier check's text) and `fix` (the command an administrator runs on the node, when one is known). Empty from a daemon that predates it |
 | `software.container_images` | the container images the node was pinned to (`kbf-daemon --image`, container driver), as `docker://<repo>@sha256:<digest>`, sorted: each was in its image store, as one architecture's manifest, when the daemon started (a daemon that finds one missing does not start). Status only: no work is placed by image. Empty when none is pinned, on a Mac, and from a daemon that predates it |
+| `update` | where its update is: `{"state", "up_to_date", "availability"}` and nothing more (the commits and the refusal text are on [`GET /v1/update/hosts`](#get-v1updatehosts)). `state` is the host's step state from its newest `UpdateStatus` (`idle`, `fetching`, `staged`, `activated_unconfirmed`, `confirmed`, `reverted`, `refused`, `manual`, or `unknown` for a state this server does not know), `null` unless `availability` is `ok`. `availability`: `unsupported` if the node never sent an `UpdateStatus` (never shown as idle), `unavailable` if it sent one but its newest stream is closed or has not sent its own yet (a restarted daemon is not judged by its previous process), `ok` otherwise. `up_to_date` is `true` or `false` against the desired commit of `GET /v1/update`, and `null` whenever the server cannot judge: no desired release (or no `--state-store`, or a row that cannot be read), a host that is not `ok`, or a running commit that is not a hex prefix of 12 digits or more |
 | `needs_attention` | what an operator must do on the node, one line per item: today each installed Xcode that is not ready, as `Xcode <build> (<app>) installed but not ready: <reason>; fix: <command>`. An Xcode `not_surveyed` keeps the item the same app had in the node's previous status (as when a restarted daemon sends its first status), until a survey reports it; one with no previous item has none. The server also logs each item once at `WARN` (target `kbf_server::attention`) when it appears, and at `INFO` when a status reports it gone (its Xcode ready, changed or removed); a status that repeats an item, or lists its Xcode `not_surveyed`, logs nothing. An item is the same while its Xcode's app, build, state and fix are, so a reason that changes alone is shown here but not logged again. The previous status is kept in the server's memory: after a server restart, each item is logged again when its node reports it; kbf has no alert delivery yet (issue #189) |
 | `placement.state` | `serving`; `cordoned` (no new lease, its leases run on); `draining` (cordoned, waiting for its leases until `deadline_unix_ms`); `drained` (cordoned, no lease left: either its leases ended, or the node disconnected and, after the lease grace, its leases were given up and requeued to run elsewhere; check `connected`); `drain_paused` (the deadline passed with leases still running: they run on, and nothing proceeds until an operator acts) |
 | `placement.leases` | while draining or paused: the leases it still holds, as `term.seq` (each server process has its own term, the Raft term under the Raft metadata log: [worker-protocol.md](design/worker-protocol.md#server-restarts-and-the-lease-epoch)) |
@@ -617,7 +618,7 @@ watches.
 | `kbf_write_tier_unflushed_bytes`, `kbf_write_tier_unflushed_blocks` | gauge | acknowledged bytes, and the blocks holding them, not yet in the object store |
 | `kbf_write_tier_oldest_unflushed_seconds` | gauge | the age of the oldest of those blocks (since it was created, or since the restart that recovered it); 0 when there is none |
 
-In `kbf-all-in-one`, when the hot store is a directory on the filesystem of `--data-dir`,
+In `kbf all-in-one`, when the hot store is a directory on the filesystem of `--data-dir`,
 the daemon half's input cache and the server half's hot store are one cache
 ([architecture-v2.md](design/architecture-v2.md#10-locality)): the input cache's
 directory is the node's only local copy of a blob, the tier deletes a block once it is
@@ -787,9 +788,10 @@ copy (it passed, the log was over 16 MiB, or it had none) is `404` `no_log`; an 
 `404` `no_run`; a query string is `400`.
 
 **Across builds** (with `--history-objects`; otherwise these routes do not exist, `404` as
-any unknown path). They are read from the index rows the history writer keeps, never from
-an object, so they answer the same after a restart and cost no object read
-(`docs/design/ui-data.md` 4.3 and 6.2). They run the same policy as the build pages:
+any unknown path). The invocation list and the shape and test routes are read from the index
+rows the history writer keeps, never from an object, so they answer the same after a
+restart and cost no object read; the grid reads the run records of the chunks of the builds
+it names (`docs/design/ui-data.md` 4.3 and 6.2). They run the same policy as the build pages:
 `authenticationPolicy`, then `invocations.getAuthorizer` (`404` with `"off"` when it is not
 named). The authorizer is asked once per request about each instance the request would
 touch, and every answer holds only rows of allowed instances; an invocation is listed only
@@ -806,6 +808,23 @@ across restarts). An answer over more instances than the index reads at once (25
 | `GET /v1/tests` | the same with `kind=test` |
 | `GET /v1/shapes/{key}?instance=&cfg=` | one `(instance, cfg)` of the key, with `previous_keys: null`; with either absent, `{"shapes": [...]}` of the key's rows (paged) |
 | `GET /v1/shapes/{key}/runs?instance=&cfg=` | the last 16 runs of a test, newest first, each `{run_id, run_href, class, execution_ms, source: "run", digest16}` (`run_href` is `GET /v1/runs/{run_id}`), with `complete: false`, `covers: "recent_16"` (`"none"` for a shape that is not a test) and `needs: "day_index"`: older runs are not answered yet. Both parameters are required |
+| `GET /v1/grid?shapes=<key>,<key>&invocations=<id>,<id>` (or `last=<n>`) | the outcome of shapes in builds: `{"columns": [...], "rows": [...], "shapes": [...]}`. `shapes` is 1 to 50 keys; the builds are named by `invocations` (1 to 50 different ids) or are the newest `last` (1 to 50, of the instances the caller may read, `?instance=` narrows them). A column is `{id, href, first_seen, complete}` (`complete: false` when the build has more than 20,000 records and the read stopped); a row is one `(instance, key, cfg)` some build ran, `{instance, key, cfg, href, cells}`, with one cell for each column: `{status, run_id, run_href}` with `status` `pass`, `fail` (a failure or a timeout), `oom_killed` or `infra`, from the row's last run in that build that is a result, or `{status: "absent"}` where the build has no run of the row. A build that is not held, or that a caller may not read (any of its instances), is `404` `no_record`. `columns=commit` is `400` `needs_report`; there are no `cached_pass` cells yet |
+| `GET /v1/actions/{digest}/runs` | the runs of an action digest (`<64 hex>-<size>`) of today, newest first by end time, `?instance=`, `?class=`; each `{run_id, run_href, instance, worker, class, started, ended, shape}` |
+| `GET /v1/runs?node=&from=&to=&class=&instance=` | the runs of today that overlapped `[from, to]` on `node` (`node` is required; both times are optional), newest first by end time |
+
+The last two read the writer's index of today's runs, in memory (64 MiB, the oldest runs
+forgotten first, empty after a restart), not the day index: their answers always say
+`"partial": true` and `covers_from`, the time from which the index has every run it was
+sent. A run of an instance the caller may not read is never listed.
+
+Both list by end time, newest first; two runs that ended in the same millisecond are
+listed latest arrival first. Runs reach the index in the order the writer receives them,
+and a failed run can arrive after runs that ended later, so the order is the index's own,
+not arrival. `next_page` is a cursor, the end time and arrival number of the last run
+listed (`<ended_ms>.<seq>` in the token); the next page lists the runs that sort before it (older by that key).
+A run that arrives between two pages with an end time older than the cursor is listed on a
+later page; one with a newer end time is not listed by the pages that follow (read the
+first page again to see it). No run is listed twice or skipped by paging.
 
 A shape row is `{instance, key, cfg, kind, target, first_seen, last_seen, href, runs_href}`
 and, for a test, `status` (`passing`, `failing`, `flaky`, `oom_killed`, or `null` while the
@@ -1090,9 +1109,8 @@ node's next push makes the call succeed.
 ## `PUT /v1/releases/{commit}/{platform}/{name}` and `GET /v1/releases`
 
 The frontend's release store (`docs/design/pull-updates.md` section 6.3): the tarballs of a
-release and their build attestations, kept as uploaded. Not served by any listener until the
-frontend mounts `kbf_server::release::router`; without a store both answer `503` naming
-`--releases-dir`.
+release and their build attestations, kept as uploaded. Mounted by `--releases-dir`; without a store both answer
+`503` naming `--releases-dir`.
 
 - `commit` is 40 lowercase hex digits, `platform` is `linux-x86_64`, `linux-arm64` or
   `darwin-arm64`, `name` is `kbf` or `kbf-daemon` (the tarball) or either with the suffix
@@ -1107,14 +1125,79 @@ frontend mounts `kbf_server::release::router`; without a store both answer `503`
   `200` with the same answer, other bytes are `409` and change nothing.
 - `GET` is open and lists `{"releases": [{"commit", "platforms": [{"platform", "complete",
   "components": [{"name", "sha256", "size", "attested"}]}]}]}`: commits sorted, platforms in the
-  order above, a platform `complete` when both tarballs have their attestation. A component is
+  order above, a platform `complete` when it holds, with their attestations, the tarballs its
+  hosts need: `kbf` for a Linux platform, `kbf-daemon` for `darwin-arm64`. A component is
   listed when its tarball is stored.
 - `GET /v1/releases` and the gRPC `ReleaseService.Fetch` are unauthenticated at the router and
-  the service. `Fetch` is mounted on the worker listener behind its mutual TLS and the role
-  table (the daemon role alone may call it). `GET /v1/releases` is open to whoever reaches the
+  the service. `Fetch` is mounted on the worker listener, behind its mutual TLS and the role
+  table (the daemon role alone may call it) when TLS is configured; in plain-text worker mode
+  it is open, like every worker method. `GET /v1/releases` is open to whoever reaches the
   operator API, like `GET /v1/nodes`: it lists commits, platforms and digests, no bytes. The
   store is mounted by `--releases-dir`, which needs `--api-listen`; without the flag every
   update endpoint answers `503`.
+
+## `GET /v1/update` and `POST /v1/update/{desired,pause,resume}`
+
+The desired release (`docs/design/pull-updates.md` section 6.3), kept in the `update/desired`
+row of the state store. Without `--state-store` every answer is `503` naming it; without
+`--releases-dir`, `GET /v1/update` and `POST /v1/update/desired` are `503` naming that flag
+(`pause` and `resume` need only the state store). A write that other writers kept racing
+for the whole of its retries is `503` with `Retry-After: 1`: send it again.
+
+- `GET /v1/update` is open: `{"desired": null | {"generation", "commit", "set_at_ms"},
+  "paused": bool, "policy": null | {...}, "releases": <the body of GET /v1/releases>}`. `policy`
+  is the `update/policy` row when the operator wrote one (`paused`, `auto_nodes`,
+  `auto_frontend`, `new_work_only_to_updated`, `accept_failing_builds`, `max_hosts_out`,
+  `min_serving` and the limits in seconds), else `null`; `paused` is its flag (false without
+  a row).
+- `POST /v1/update/desired` with `{"commit": "<40 lowercase hex>"}` and, optionally,
+  `"expect_generation": N` (JSON content type, the write gates) offers the commit. With
+  `expect_generation` it is a compare-and-set: it writes only if the desired release is at
+  generation N (0 before any offer), else `409` naming both and nothing is written. `409` unless the release store holds some platform of it complete
+  (see above); `400` for a body that is not exactly that. The answer is the desired release.
+  The generation moves only when the commit differs from the desired one, so a repeated click is
+  not a new run; a rollback is the older commit offered the same way and gets a higher
+  generation. Generations increase, but may skip numbers: each write that loses a race has
+  already drawn a counter value.
+- `POST /v1/update/pause` and `/resume` (the write gates, no body) set `paused` of the policy
+  row, by compare-and-set of that field alone, and answer `{"paused": bool}`. No run is
+  needed, and an offer leaves the flag as it is: while set, no host is started.
+
+## `GET /v1/update/hosts`
+
+What each host last said about its update, for the update page and for agents
+(`docs/design/update-ui.md` section 5). **Off unless the policy names `farm.getAuthorizer`**
+([reapi-auth.md](reapi-auth.md)): the request runs the policy's authenticator and then that
+authorizer (asked with the empty instance name), and without the key or a policy file every
+request is `404` with `"off": "farm"`. It carries what the open `GET /v1/nodes` must not: the
+commits a host runs, staged and installed, and its refusal text.
+
+```json
+{ "desired": { "generation": 3, "commit": "<40 hex>", "set_at_ms": 1791370000000 },
+  "paused": false,
+  "hosts": [
+    { "node_id": "linux-1", "connected": true, "availability": "ok", "state": "refused",
+      "up_to_date": false, "desired_commit": "<40 hex>", "running_commit": "0123456789ab",
+      "installed_commit": "<40 hex>", "staged_commit": "", "refusal": "no helper",
+      "offered_generation": 3, "helper_present": false, "reported_at_unix_ms": 1791370000000 } ],
+  "next_page_token": null }
+```
+
+- `desired` is the row of `GET /v1/update` (`null` before any offer, and without `--state-store`).
+  `paused` is the policy row's `paused` (the pause lives there alone), `false` without a policy
+  row (as on `GET /v1/update`), and `null` (unknown, never `false`) if the policy object has no
+  boolean `paused`.
+- Each host has `availability`, `state` and `up_to_date` as on `GET /v1/nodes`. The rest is as
+  the host last reported, even if it is no longer `ok` (`null` for a host that never sent an
+  `UpdateStatus`): `running_commit` (12 hex digits or `unknown`), `installed_commit` and
+  `staged_commit` (`""` if none or not known), `refusal`, `offered_generation`,
+  `helper_present` and `reported_at_unix_ms` (the server's clock).
+- **Text from a host is data.** Each string is kept cut to 64 bytes (a commit) or 512 bytes
+  (`refusal`) on a character boundary, with control characters replaced by U+FFFD. A reader
+  escapes it as it would any string from outside.
+- Hosts are in node-id order. `?page_size=` (100 by default, 1 to 1000) and `?page_token=` (the
+  `next_page_token` of the page before, null on the last page); any other query key or a bad
+  page size is `400`. A state store that fails is `500`, not hosts without a desired commit.
 
 ## `UNAVAILABLE` from a storage node that is catching up
 

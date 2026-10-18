@@ -9,7 +9,7 @@
 //! has not expired; and it names a macOS build. The gate's own rules on top (pool,
 //! platform, its per-pool floor, the newest statement) are in [`crate::gate`].
 //!
-//! Encoding (the gate's; `kbf-updater` is to read the same): each signed document is a
+//! Encoding (the gate's; the signed-set verbs of the update path read the same): each signed document is a
 //! JSON envelope `{"payload", "key", "signature"}`, all base64 (standard alphabet,
 //! padded): the payload is the document's JSON bytes, the key the signer's 32-byte
 //! ed25519 public key, the signature ed25519 over the payload bytes exactly.

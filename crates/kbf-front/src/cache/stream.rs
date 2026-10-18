@@ -10,7 +10,7 @@
 //!   bytes at their offset, and `Commit` stages the range with the records the footer
 //!   declared ([`Cache::stage_range`]). What the upload holds in memory is the range
 //!   being written, not the segment.
-//! - **A record streamed by a daemon in the server's own process** (`kbf-all-in-one`'s
+//! - **A record streamed by a daemon in the server's own process** (`kbf all-in-one`'s
 //!   plane, and the storage node), whose digest is known only at its end:
 //!   [`Cache::stream`] opens a place in the pool; [`RecordStream::append`] hands each
 //!   chunk on as the caller reads it (held in memory for a small blob, written by a

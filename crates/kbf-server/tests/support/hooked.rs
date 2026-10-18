@@ -19,6 +19,7 @@ pub struct Hooked {
     pub fake: Arc<Fake>,
     pub clock: Arc<ManualClock>,
     after_get: Mutex<Option<(String, Hook)>>,
+    counts: Mutex<Vec<(String, Arc<AtomicUsize>)>>,
     conflict_on: Mutex<Option<String>>,
     /// Per batch that wrote the `map` key: whether it conflicted.
     pub map_writes: Mutex<Vec<bool>>,
@@ -41,6 +42,7 @@ impl Hooked {
             fake: Arc::new(Fake::with_flaw(Arc::clone(&clock), Flaw::None)),
             clock,
             after_get: Mutex::new(None),
+            counts: Mutex::new(Vec::new()),
             conflict_on: Mutex::new(None),
             map_writes: Mutex::new(Vec::new()),
             fail_gets: AtomicUsize::new(0),
@@ -60,6 +62,20 @@ impl Hooked {
             .unwrap_or_else(PoisonError::into_inner) = Some((prefix.to_owned(), Box::new(hook)));
     }
 
+    /// Counts, from now on, the `get`s and scans of a key that starts with `prefix` that
+    /// read their answer (one that failed or panicked first is not counted). Unlike
+    /// [`Hooked::after_get`], which one read takes, every read is counted, whichever
+    /// thread makes it: for a test that has to know the server's own readers are done
+    /// before it arms a fault meant for one request.
+    pub fn count(&self, prefix: &str) -> Arc<AtomicUsize> {
+        let count = Arc::new(AtomicUsize::new(0));
+        self.counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((prefix.to_owned(), Arc::clone(&count)));
+        count
+    }
+
     /// Makes every transaction that touches a key (or counter) starting with `prefix`
     /// conflict, until `None`.
     pub fn conflict_on(&self, prefix: Option<&str>) {
@@ -71,8 +87,13 @@ impl Hooked {
 }
 
 impl Hooked {
-    /// Runs the hook if a read of `key` is the one it waits for.
+    /// Counts a read of `key`, and runs the hook if it is the one it waits for.
     fn fire(&self, key: &str) {
+        for (prefix, count) in &*self.counts.lock().unwrap_or_else(PoisonError::into_inner) {
+            if key.starts_with(prefix) {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let hook = {
             let mut slot = self
                 .after_get
