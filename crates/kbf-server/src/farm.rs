@@ -699,8 +699,6 @@ impl Farm {
                     ),
                     // The report is kept across streams for the operator's views; the
                     // controller reads only one its node's current stream sent.
-                    // The report is kept across streams for the operator's views; the
-                    // controller reads only one its node's current stream sent.
                     update: node
                         .filter(|n| n.update_live)
                         .and_then(|n| n.update.clone()),
