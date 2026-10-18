@@ -65,7 +65,7 @@ use crate::layout::{Layout, Platform};
 use crate::refusal::{ArchiveFault, FactsFault, Refusal, TrustFault, VersionFault, WHAT_PROBE};
 use crate::run::{Runner, Spawn};
 use crate::settings::Settings;
-use crate::state::Locked;
+use crate::state::{Locked, StateError};
 
 /// The marker written into a release directory once every check has passed.
 pub const VERIFIED: &str = "VERIFIED";
@@ -695,13 +695,11 @@ impl Pipeline<'_> {
         };
 
         // `gc` keeps a staged release; the lock is the one every state change is under.
-        let lock = Locked::acquire(self.host).map_err(|e| Refusal::Install(e.into()))?;
-        let mut state = lock
-            .read()
-            .map_err(|e| Refusal::Install(e.into()))?
-            .unwrap_or_default();
+        let failed = |e: StateError| Refusal::Install(e.into());
+        let lock = Locked::acquire(self.host).map_err(failed)?;
+        let mut state = lock.read().map_err(failed)?.unwrap_or_default();
         state.staged = Some(commit.clone());
-        lock.write(&state).map_err(|e| Refusal::Install(e.into()))?;
+        lock.write(&state).map_err(failed)?;
         Ok(already)
     }
 
@@ -751,14 +749,13 @@ fn open_owned(path: &Path, owner: Owner) -> Result<File, Refusal> {
         path: path.to_owned(),
         fault,
     };
+    let unreadable = |e| untrusted(TrustFault::Unreadable(e));
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .map_err(|e| untrusted(TrustFault::Unreadable(e)))?;
-    let meta = file
-        .metadata()
-        .map_err(|e| untrusted(TrustFault::Unreadable(e)))?;
+        .map_err(unreadable)?;
+    let meta = file.metadata().map_err(unreadable)?;
     if !meta.is_file() {
         return Err(untrusted(TrustFault::Kind {
             found: "non-regular file",

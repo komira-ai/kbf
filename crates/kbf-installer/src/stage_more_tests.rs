@@ -168,7 +168,11 @@ fn every_component_of_an_order_is_attested_and_probed() {
     let runner = scripted(Fails::Gh);
     let err = activate_pair(&rig, &linux_pair(), "linux-x86_64", &runner).expect_err("gh");
     assert_eq!(err.word(), Some("attestation"), "{err}");
-    assert_eq!(programs(&runner), ["gh", "gh"], "both asked, nothing run");
+    assert_eq!(
+        programs(&runner),
+        ["gh", "gh", "gh"],
+        "the first component passes; the second is asked once per accepted signer; nothing run"
+    );
     rig.assert_nothing_installed();
 
     let rig = Rig::new("pair-probe");
@@ -295,4 +299,64 @@ fn an_installed_release_found_again_is_staged_again() {
         .expect("state")
         .expect("written");
     assert_eq!(state.staged, Some(commit()));
+}
+
+/// Catches a binary that cannot be started being read as a clean report: the stage ends with
+/// the tool-failed code (a failure of the host, so it carries no refusal word), says what
+/// could not run, and nothing is installed.
+///
+/// Mutant planted: the start error mapped to `Ok` with an empty report.
+#[test]
+fn a_binary_that_cannot_be_started_is_a_facts_refusal() {
+    let rig = Rig::new("probe-cannot-start");
+    let runner = FakeRunner::new(|s| {
+        if s.program.file_name().is_some_and(|n| n == "gh") {
+            Ok(ran(0, "", ""))
+        } else {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        }
+    });
+    let err = rig.activate(&runner).expect_err("cannot start");
+    assert_eq!(err.word(), None, "{err}");
+    assert_eq!(err.code(), "tool-failed");
+    assert!(err.to_string().contains("--version --json"), "{err}");
+    rig.assert_nothing_installed();
+}
+
+/// Catches a component of size 0 being read (the order's cap check is `0 < size <= max`): it
+/// is refused as `size` before a byte of the file is read or `gh` is run.
+///
+/// Mutant planted: the zero test dropped.
+#[test]
+fn a_component_of_size_zero_is_refused_before_it_is_read() {
+    let rig = Rig::new("size-zero");
+    let (mut locator, fetched) = rig.fetch(&tarball());
+    locator.size = 0;
+    let runner = honest();
+    let err = rig
+        .verify(
+            &runner,
+            OrderKind::Activate,
+            &[locator],
+            Some(&facts()),
+            fetched,
+        )
+        .expect_err("zero");
+    assert_eq!(err.word(), Some("size"), "{err}");
+    assert!(runner.calls().is_empty());
+}
+
+/// Catches an unusable state being worked around at the last step: with both state files
+/// damaged the release has passed every check, and the stage still refuses (install-failed)
+/// instead of recording a `staged` over a state it cannot read.
+///
+/// Mutant planted: the read error replaced by an empty state (the damaged file is overwritten).
+#[test]
+fn an_unusable_state_ends_the_install_after_the_checks() {
+    let rig = Rig::new("state-unusable");
+    for file in [rig.host.state_file(), rig.host.state_backup()] {
+        fs::write(rig.host.join(&file), b"{ not json").expect("ruin");
+    }
+    let err = rig.activate(&honest()).expect_err("unusable");
+    assert_eq!(err.code(), "install-failed", "{err}");
 }

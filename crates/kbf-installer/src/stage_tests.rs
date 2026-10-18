@@ -449,8 +449,8 @@ fn a_release_gh_does_not_accept_is_refused_and_nothing_runs() {
     assert_eq!(err.word(), Some("attestation"), "{err}");
     assert_eq!(
         programs(&runner),
-        ["gh", "gh"],
-        "each allowed ref, then stop"
+        ["gh", "gh", "gh", "gh"],
+        "each allowed ref under each accepted signer, then stop"
     );
     rig.assert_nothing_installed();
 }
@@ -545,7 +545,7 @@ fn a_binary_for_another_platform_is_refused_unrun() {
     for (name, content) in [
         ("arm", elf(0xb7, "")),
         ("macho", crate::fixtures::macho(0x0100_000c, "")),
-        ("script", b"#!/bin/sh\necho hi\n".to_vec()),
+        ("script", b"#!/usr/bin/true\necho hi\n".to_vec()),
     ] {
         let rig = Rig::new(&format!("platform-{name}"));
         let (locator, fetched) = rig.fetch(&tar_gz(&[file("kbf", &content)]));
@@ -767,7 +767,8 @@ fn the_marker_is_written_before_the_directory_is_renamed_into_place() {
 /// other bytes, or as a link is `release-differs` and left as it was. A new fetch is
 /// always fully verified first (the honest runner is asked every time).
 ///
-/// Mutants seen red: the marker not required; the bytes not compared.
+/// Mutants seen red: the marker not required; the bytes not compared; a component missing
+/// from the directory taken as the same.
 #[test]
 fn an_existing_release_directory_is_the_same_release_or_a_refusal() {
     let rig = Rig::new("existing");
@@ -796,6 +797,13 @@ fn an_existing_release_directory_is_the_same_release_or_a_refusal() {
     let err = rig.activate(&honest()).expect_err("no marker");
     assert_eq!(err.code(), "release-differs");
     assert!(!rig.release().join(VERIFIED).exists());
+
+    // The marker is there and the binary is not: still a different release.
+    let rig = Rig::new("existing-nofile");
+    fs::create_dir_all(rig.release()).expect("dir");
+    fs::write(rig.release().join(VERIFIED), b"").expect("marker");
+    let err = rig.activate(&honest()).expect_err("no binary");
+    assert_eq!(err.code(), "release-differs");
 
     let rig = Rig::new("existing-link");
     fs::create_dir_all(rig.release().parent().expect("parent")).expect("dir");
@@ -891,11 +899,11 @@ fn an_oversize_attestation_bundle_is_refused_before_gh() {
     assert!(runner.calls().is_empty());
 }
 
-/// Runs the stand-in script for the program the stage asks to run, for real (so the
+/// Runs the stand-in program for the program the stage asks to run, for real (so the
 /// bounds are the real ones), and records what was asked.
 struct Stub {
-    gh: Option<PathBuf>,
-    probe: Option<PathBuf>,
+    gh: Option<(PathBuf, Vec<String>)>,
+    probe: Option<(PathBuf, Vec<String>)>,
     seen: RefCell<Vec<Spawn>>,
 }
 
@@ -905,9 +913,9 @@ impl Runner for Stub {
         let is_gh = spawn.program.file_name().is_some_and(|n| n == "gh");
         let stub = if is_gh { &self.gh } else { &self.probe };
         match stub {
-            Some(script) => SystemRunner.run(&Spawn {
-                program: script.clone(),
-                args: Vec::new(),
+            Some((program, args)) => SystemRunner.run(&Spawn {
+                program: program.clone(),
+                args: args.iter().map(Into::into).collect(),
                 ..spawn.clone()
             }),
             None if is_gh => Ok(ran(0, "", "")),
@@ -916,31 +924,20 @@ impl Runner for Stub {
     }
 }
 
-/// A script that starts a long sleeper in its group, writes the sleeper's pid to `pid`
-/// and waits for it.
-fn hanging_script(dir: &Path, pid: &Path) -> PathBuf {
-    let script = dir.join("hang.sh");
-    fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\nsleep 300 &\necho $! > {}\nwait\n",
-            pid.display()
-        ),
-    )
-    .expect("script");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
-    script
+/// A long sleep that carries `marker` in its arguments, so that the test can tell it from
+/// every other process: a stand-in for a program that never returns.
+fn hanging_sleep(marker: &str) -> (PathBuf, Vec<String>) {
+    (PathBuf::from("/bin/sleep"), vec![format!("300.{marker}")])
 }
 
-fn gone(pid_file: &Path) -> bool {
-    let pid: i32 = fs::read_to_string(pid_file)
-        .expect("the stub started its sleeper")
-        .trim()
-        .parse()
-        .expect("pid");
+/// Whether no process is left whose arguments carry `marker` (the sleep was killed).
+fn gone(marker: &str) -> bool {
     for _ in 0..200 {
-        // SAFETY: signal 0 only asks whether the process exists.
-        if unsafe { libc::kill(pid, 0) } != 0 {
+        let found = std::process::Command::new("/usr/bin/pgrep")
+            .args(["-f", &format!("300.{marker}")])
+            .output()
+            .expect("pgrep runs");
+        if found.stdout.is_empty() {
             return true;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -951,8 +948,8 @@ fn gone(pid_file: &Path) -> bool {
 /// Catches an unbounded step: a `gh` that never returns, and a binary whose
 /// `--version --json` never returns, are killed with their whole process group at their
 /// own limit (here 300 ms in place of 120 s and 10 s), and the stage ends as `attestation`
-/// and `facts`, in seconds, installing nothing. The sleeper each stand-in left in its
-/// group is dead too.
+/// and `facts`, in seconds, installing nothing. The stand-in (a long `sleep`) is dead too;
+/// that a program's whole group is killed is `run`'s test.
 ///
 /// Mutants seen red: the policy's limit not passed to `gh`; not passed to the probe.
 #[test]
@@ -961,11 +958,15 @@ fn a_hanging_gh_and_a_hanging_binary_are_killed_at_their_limits() {
         let mut rig = Rig::new(&format!("hang-{who}"));
         rig.policy.timeouts.gh = Duration::from_millis(300);
         rig.policy.timeouts.probe = Duration::from_millis(300);
-        let pid = rig.dir.join("sleeper.pid");
-        let script = hanging_script(&rig.dir, &pid);
+        let marker = format!(
+            "{}{}",
+            std::process::id(),
+            rig.dir.display().to_string().len()
+        );
+        let stand_in = hanging_sleep(&marker);
         let stub = Stub {
-            gh: (who == "gh").then(|| script.clone()),
-            probe: (who == "probe").then_some(script),
+            gh: (who == "gh").then(|| stand_in.clone()),
+            probe: (who == "probe").then_some(stand_in),
             seen: RefCell::default(),
         };
         let started = Instant::now();
@@ -976,7 +977,7 @@ fn a_hanging_gh_and_a_hanging_binary_are_killed_at_their_limits() {
             started.elapsed() < Duration::from_secs(20),
             "{who} was bounded"
         );
-        assert!(gone(&pid), "{who}: the sleeper in its group is dead");
+        assert!(gone(&marker), "{who}: the stand-in is dead");
         rig.assert_nothing_installed();
     }
 }

@@ -66,7 +66,8 @@ impl CgroupLeases {
 impl LeaseSource for CgroupLeases {
     fn live(&self) -> Result<usize, String> {
         let actions = self.actions();
-        let listed = match fs::read_dir(&actions) {
+        let listed = match fs::read_dir(&actions).and_then(Iterator::collect::<io::Result<Vec<_>>>)
+        {
             Ok(listed) => listed,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return if self.unit.is_dir() {
@@ -79,7 +80,6 @@ impl LeaseSource for CgroupLeases {
         };
         let mut live = 0;
         for entry in listed {
-            let entry = entry.map_err(|e| format!("{}: {e}", actions.display()))?;
             let name = entry.file_name();
             if !name.to_string_lossy().starts_with(LEASE_PREFIX) {
                 continue;
