@@ -150,9 +150,8 @@ pub fn room_needed(size: u64, replaced: u64) -> u64 {
 
 /// Fail with [`FetchError::Disk`] unless `need` bytes are free on the file system holding `dir`.
 pub fn ensure_room(dir: &Path, need: u64) -> Result<(), FetchError> {
-    let stat = rustix::fs::statvfs(dir).map_err(|e| {
-        FetchError::Pipe(PipeFault::Write(io::Error::from(e)))
-    })?;
+    let stat = rustix::fs::statvfs(dir)
+        .map_err(|e| FetchError::Pipe(PipeFault::Write(io::Error::from(e))))?;
     let free = stat.f_bavail.saturating_mul(stat.f_frsize);
     if free < need {
         return Err(FetchError::Disk {
@@ -187,7 +186,9 @@ fn child_flags(
             }
         }
         Source::Frontend(f) => {
-            let fd = lend.expect("a frontend fetch lends the identity").as_raw_fd();
+            let fd = lend
+                .expect("a frontend fetch lends the identity")
+                .as_raw_fd();
             flags.extend([
                 "--kind".into(),
                 "frontend".into(),
@@ -209,14 +210,20 @@ pub fn check_source(source: &Source) -> Result<(), FetchError> {
             let clean = crate::installer_toml::https_base(base)
                 .map_err(|_| FetchError::Source(base.clone(), "not a plain https base URL"))?;
             if clean != *base {
-                return Err(FetchError::Source(base.clone(), "not in the form settings write"));
+                return Err(FetchError::Source(
+                    base.clone(),
+                    "not in the form settings write",
+                ));
             }
         }
         Source::Frontend(f) => {
             let clean = crate::installer_toml::https_base(&f.url)
                 .map_err(|_| FetchError::Source(f.url.clone(), "not a plain https URL"))?;
             if clean != f.url || f.url[8..].contains('/') {
-                return Err(FetchError::Source(f.url.clone(), "must be https://host[:port]"));
+                return Err(FetchError::Source(
+                    f.url.clone(),
+                    "must be https://host[:port]",
+                ));
             }
         }
     }
@@ -250,9 +257,7 @@ pub fn fetch_component(
     check_source(source)?;
     ensure_room(room.0, room_needed(component.size, room.1))?;
     let lent = match source {
-        Source::Frontend(f) => {
-            Some(Identity::read(&f.node_cert, &f.node_key, &f.ca_file)?.lend()?)
-        }
+        Source::Frontend(f) => Some(Identity::read(&f.node_cert, &f.node_key, &f.ca_file)?.lend()?),
         Source::Url { .. } => None,
     };
     let flags = child_flags(source, component, lent.as_ref())?;

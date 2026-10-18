@@ -121,7 +121,9 @@ impl Identity {
                 .ok_or(IdentityFault::Malformed("a length is cut short"))?;
             let len = u32::from_be_bytes(*len) as usize;
             if len == 0 || len as u64 > MAX_PEM_BYTES || len > tail.len() {
-                return Err(IdentityFault::Malformed("a section is empty, too large or cut short"));
+                return Err(IdentityFault::Malformed(
+                    "a section is empty, too large or cut short",
+                ));
             }
             let (part, tail) = tail.split_at(len);
             parts.push(part.to_vec());
@@ -140,7 +142,7 @@ impl Identity {
     /// start of the child clears that on the one descriptor it keeps); never a file on disk.
     #[cfg(target_os = "linux")]
     pub fn lend(&self) -> Result<OwnedFd, IdentityFault> {
-        use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, memfd_create, seek, SeekFrom};
+        use rustix::fs::{MemfdFlags, SealFlags, SeekFrom, fcntl_add_seals, memfd_create, seek};
         let lend = |e: rustix::io::Errno| IdentityFault::Lend(e.into());
         let fd = memfd_create(
             "kbf-fetch-identity",
@@ -185,7 +187,9 @@ impl Identity {
 pub fn adopt(fd: i32) -> Result<File, IdentityFault> {
     const FOUR: i32 = 4;
     if fd < 3 {
-        return Err(IdentityFault::Malformed("the identity descriptor is a standard stream"));
+        return Err(IdentityFault::Malformed(
+            "the identity descriptor is a standard stream",
+        ));
     }
     if fd != FOUR {
         // SAFETY: dup2 and close on descriptors of this process; at this point only 0, 1, 2
@@ -223,7 +227,11 @@ const FD_DIR: &str = "/dev/fd";
 fn open_descriptors() -> io::Result<Vec<i32>> {
     let mut listed = Vec::new();
     for entry in std::fs::read_dir(FD_DIR)? {
-        if let Some(n) = entry?.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) {
+        if let Some(n) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i32>().ok())
+        {
             listed.push(n);
         }
     }

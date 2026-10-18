@@ -100,7 +100,9 @@ fn certificates(pem: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     Ok(found)
 }
 
-fn url_roots(ca_file: Option<&PathBuf>) -> Result<Vec<ureq::tls::Certificate<'static>>, ChildFault> {
+fn url_roots(
+    ca_file: Option<&PathBuf>,
+) -> Result<Vec<ureq::tls::Certificate<'static>>, ChildFault> {
     let ders: Vec<Vec<u8>> = match ca_file {
         Some(path) => {
             let roots = |why: String| ChildFault::Roots {
@@ -204,7 +206,13 @@ fn fetch_frontend(
             let chunk = match stream.message().await {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
-                Err(s) => return Err(ChildFault::Status(format!("{:?}: {}", s.code(), s.message()))),
+                Err(s) => {
+                    return Err(ChildFault::Status(format!(
+                        "{:?}: {}",
+                        s.code(),
+                        s.message()
+                    )));
+                }
             };
             let room = usize::try_from(args.limit - written).unwrap_or(usize::MAX);
             let data = &chunk.data[..chunk.data.len().min(room)];
@@ -232,7 +240,9 @@ pub fn fetch(args: &ChildArgs, out: &mut dyn Write) -> Result<u64, ChildFault> {
         (Kind::Frontend, None) => Err(ChildFault::Flags("a frontend fetch needs --identity-fd")),
         (Kind::Frontend, Some(fd)) => {
             if args.ca_file.is_some() {
-                return Err(ChildFault::Flags("a frontend fetch trusts the pinned CA only"));
+                return Err(ChildFault::Flags(
+                    "a frontend fetch trusts the pinned CA only",
+                ));
             }
             let lent = identity::adopt(fd)?;
             let identity = Identity::decode(lent)?;

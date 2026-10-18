@@ -30,7 +30,10 @@ fn file(dir: &std::path::Path, name: &str, bytes: &[u8]) -> PathBuf {
 #[test]
 fn the_identity_survives_framing() {
     let id = sample();
-    assert_eq!(Identity::decode(id.encode().as_slice()).expect("decodes"), id);
+    assert_eq!(
+        Identity::decode(id.encode().as_slice()).expect("decodes"),
+        id
+    );
 }
 
 /// The child refuses anything that is not exactly three sections inside the caps: it reads
@@ -120,7 +123,10 @@ fn a_fifo_is_refused_without_waiting() {
 #[test]
 fn the_debug_form_leaks_nothing() {
     let shown = format!("{:?}", sample());
-    assert!(!shown.contains("PRIVATE") && !shown.contains("secret"), "{shown}");
+    assert!(
+        !shown.contains("PRIVATE") && !shown.contains("secret"),
+        "{shown}"
+    );
 }
 
 /// What is lent is what the child reads from the front, and it is sealed: the child cannot
@@ -134,7 +140,10 @@ fn the_lent_descriptor_reads_from_the_front_and_is_sealed() {
     let id = sample();
     let fd = id.lend().expect("lends");
     let mut file = File::from(fd);
-    assert!(file.write_all(b"x").is_err(), "the lent file must be sealed");
+    assert!(
+        file.write_all(b"x").is_err(),
+        "the lent file must be sealed"
+    );
     let mut blob = Vec::new();
     file.read_to_end(&mut blob).expect("reads");
     assert_eq!(Identity::decode(blob.as_slice()).expect("decodes"), id);
@@ -158,6 +167,9 @@ fn the_lent_descriptor_is_not_inherited_by_accident() {
 fn a_stray_descriptor_is_named() {
     let held = File::open("/").expect("a directory");
     let got = ensure_descriptors(&[0, 1, 2]);
-    assert!(matches!(got, Err(IdentityFault::Stray(n)) if n > 2), "{got:?}");
+    assert!(
+        matches!(got, Err(IdentityFault::Stray(n)) if n > 2),
+        "{got:?}"
+    );
     drop(held);
 }

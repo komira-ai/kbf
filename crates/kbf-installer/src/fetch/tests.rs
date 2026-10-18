@@ -62,7 +62,10 @@ fn a_digest_that_is_not_lowercase_hex_is_refused_before_anything_starts() {
         &SHA.replace('0', "g"),
     ] {
         let got = pull(&url(), bad, 10, 0);
-        assert!(matches!(got, Err(FetchError::BadDigest(_))), "{bad:?}: {got:?}");
+        assert!(
+            matches!(got, Err(FetchError::BadDigest(_))),
+            "{bad:?}: {got:?}"
+        );
         assert_eq!(got.unwrap_err().word(), "hash");
     }
 }
@@ -79,12 +82,18 @@ fn a_digest_that_is_not_lowercase_hex_is_refused_before_anything_starts() {
 fn a_size_outside_the_hosts_cap_is_refused_before_anything_starts() {
     for size in [0, (1 << 20) + 1, u64::MAX] {
         let got = pull(&url(), SHA, size, 0);
-        assert!(matches!(got, Err(FetchError::Size { .. })), "{size}: {got:?}");
+        assert!(
+            matches!(got, Err(FetchError::Size { .. })),
+            "{size}: {got:?}"
+        );
         assert_eq!(got.unwrap_err().word(), "size");
     }
     // At the cap the check passes and the (absent) program is what fails.
     let at_cap = pull(&url(), SHA, 1 << 20, 0);
-    assert!(matches!(at_cap, Err(FetchError::Pipe(PipeFault::Spawn(_)))), "{at_cap:?}");
+    assert!(
+        matches!(at_cap, Err(FetchError::Pipe(PipeFault::Spawn(_)))),
+        "{at_cap:?}"
+    );
     // A settings cap above the ceiling is held to the ceiling.
     let dir = scratch_dir("fetch-ceiling");
     let mut out = File::create(dir.join("download")).expect("file");
@@ -103,7 +112,10 @@ fn a_size_outside_the_hosts_cap_is_refused_before_anything_starts() {
         (&dir, 0),
         &mut out,
     );
-    assert!(matches!(got, Err(FetchError::Size { cap, .. }) if cap == MAX_COMPONENT_CEILING), "{got:?}");
+    assert!(
+        matches!(got, Err(FetchError::Size { cap, .. }) if cap == MAX_COMPONENT_CEILING),
+        "{got:?}"
+    );
 }
 
 /// Room is the tarball, its extraction (a gigabyte, or ten times the size if smaller) and the
@@ -156,7 +168,10 @@ fn a_source_that_is_not_a_plain_https_url_is_refused() {
             ca_file: None,
         };
         let got = pull(&source, SHA, 10, 0);
-        assert!(matches!(got, Err(FetchError::Source(..))), "{base:?}: {got:?}");
+        assert!(
+            matches!(got, Err(FetchError::Source(..))),
+            "{base:?}: {got:?}"
+        );
     }
     let frontend = |url: &str| {
         Source::Frontend(FrontendSource {
@@ -166,9 +181,16 @@ fn a_source_that_is_not_a_plain_https_url_is_refused() {
             node_key: "/x/key.pem".into(),
         })
     };
-    for url in ["http://front.example:9000", "https://front.example:9000/v1", "https://u@front.example"] {
+    for url in [
+        "http://front.example:9000",
+        "https://front.example:9000/v1",
+        "https://u@front.example",
+    ] {
         let got = pull(&frontend(url), SHA, 10, 0);
-        assert!(matches!(got, Err(FetchError::Source(..))), "{url:?}: {got:?}");
+        assert!(
+            matches!(got, Err(FetchError::Source(..))),
+            "{url:?}: {got:?}"
+        );
     }
 }
 

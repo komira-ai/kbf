@@ -211,7 +211,9 @@ enum Serve {
     Bytes(Vec<u8>),
     NotFound,
     /// The first `sent` bytes and then nothing.
-    Stall { sent: usize },
+    Stall {
+        sent: usize,
+    },
 }
 
 struct Grpc {
@@ -254,12 +256,14 @@ impl kbf_proto::update::release_service_server::ReleaseService for Svc {
             Serve::NotFound => Err(tonic::Status::not_found("no stored file has that digest")),
             Serve::Bytes(bytes) => {
                 let chunks: Vec<_> = bytes.chunks(1000).map(chunk).collect();
-                Ok(tonic::Response::new(Box::pin(futures::stream::iter(chunks))))
+                Ok(tonic::Response::new(Box::pin(futures::stream::iter(
+                    chunks,
+                ))))
             }
             Serve::Stall { sent } => {
                 let first = body(*sent);
-                let stream = futures::stream::iter(vec![chunk(&first)])
-                    .chain(futures::stream::pending());
+                let stream =
+                    futures::stream::iter(vec![chunk(&first)]).chain(futures::stream::pending());
                 Ok(tonic::Response::new(Box::pin(stream)))
             }
         }
@@ -378,7 +382,11 @@ impl Rig {
             (&self.dir, 0),
             &mut out,
         );
-        (got, fs::read(&path).expect("the download"), started.elapsed())
+        (
+            got,
+            fs::read(&path).expect("the download"),
+            started.elapsed(),
+        )
     }
 }
 
@@ -441,7 +449,11 @@ fn a_redirect_is_a_failed_fetch_and_is_not_followed() {
     assert!(short_log(&got).contains("302"), "{got:?}");
     assert!(file.is_empty());
     assert_eq!(first.hits().len(), 1);
-    assert_eq!(target.hits(), Vec::<String>::new(), "the redirect was followed");
+    assert_eq!(
+        target.hits(),
+        Vec::<String>::new(),
+        "the redirect was followed"
+    );
 }
 
 /// Any answer but 200 is a failed fetch with nothing written (a 204 or a 206 is not "the
@@ -455,7 +467,10 @@ fn only_a_200_is_a_fetch() {
         let rig = Rig::new(&format!("url-status-{code}"));
         let source = rig.url_source(&server.url(), &pki.ca_pem());
         let (got, file, _) = rig.pull(&source, &sha(&bytes), 100, LONG);
-        assert!(short_log(&got).contains(&code.to_string()), "{code}: {got:?}");
+        assert!(
+            short_log(&got).contains(&code.to_string()),
+            "{code}: {got:?}"
+        );
         assert!(file.is_empty());
     }
 }
@@ -482,7 +497,11 @@ fn a_source_that_sends_more_than_declared_is_refused() {
         matches!(got, Err(FetchError::Pipe(PipeFault::Oversize { size })) if size == declared),
         "{got:?}"
     );
-    assert!(file.len() as u64 <= declared, "{} bytes written", file.len());
+    assert!(
+        file.len() as u64 <= declared,
+        "{} bytes written",
+        file.len()
+    );
 }
 
 /// A source that sends exactly one byte more than declared is also seen (the child's limit is
@@ -495,7 +514,10 @@ fn one_byte_too_many_is_seen() {
     let rig = Rig::new("url-one-over");
     let source = rig.url_source(&server.url(), &pki.ca_pem());
     let (got, _, _) = rig.pull(&source, &sha(&bytes), 1000, LONG);
-    assert!(matches!(got, Err(FetchError::Pipe(PipeFault::Oversize { .. }))), "{got:?}");
+    assert!(
+        matches!(got, Err(FetchError::Pipe(PipeFault::Oversize { .. }))),
+        "{got:?}"
+    );
 }
 
 /// Fewer bytes than declared is a failed fetch, whatever the digest of the prefix.
@@ -503,11 +525,23 @@ fn one_byte_too_many_is_seen() {
 fn a_short_body_is_a_failed_fetch() {
     let (pki, leaf) = pki_and_server();
     let bytes = body(10_000);
-    let server = Https::start(&leaf, Plan::Short { declared: 10_000, sent: 4_000 });
+    let server = Https::start(
+        &leaf,
+        Plan::Short {
+            declared: 10_000,
+            sent: 4_000,
+        },
+    );
     let rig = Rig::new("url-short");
     let source = rig.url_source(&server.url(), &pki.ca_pem());
     let (got, file, _) = rig.pull(&source, &sha(&bytes), 10_000, LONG);
-    assert!(matches!(got, Err(FetchError::Pipe(PipeFault::Short { got: 0..=4000, .. }))), "{got:?}");
+    assert!(
+        matches!(
+            got,
+            Err(FetchError::Pipe(PipeFault::Short { got: 0..=4000, .. }))
+        ),
+        "{got:?}"
+    );
     assert!(file.len() <= 4000);
 }
 
@@ -543,12 +577,23 @@ fn bytes_of_the_right_size_and_the_wrong_digest_are_refused() {
 fn a_source_that_stalls_is_cut_off() {
     let (pki, leaf) = pki_and_server();
     let bytes = body(10_000);
-    let server = Https::start(&leaf, Plan::Stall { declared: 10_000, sent: 3_000 });
+    let server = Https::start(
+        &leaf,
+        Plan::Stall {
+            declared: 10_000,
+            sent: 3_000,
+        },
+    );
     let rig = Rig::new("url-stall");
     let source = rig.url_source(&server.url(), &pki.ca_pem());
     let (got, _, took) = rig.pull(&source, &sha(&bytes), 10_000, Duration::from_secs(3));
     assert!(
-        matches!(got, Err(FetchError::Pipe(PipeFault::Stalled { .. } | PipeFault::TimedOut { .. }))),
+        matches!(
+            got,
+            Err(FetchError::Pipe(
+                PipeFault::Stalled { .. } | PipeFault::TimedOut { .. }
+            ))
+        ),
         "{got:?}"
     );
     assert!(took < Duration::from_secs(20), "{took:?}");
@@ -567,7 +612,10 @@ fn a_server_under_another_ca_is_not_trusted() {
     let rig = Rig::new("url-bad-ca");
     let source = rig.url_source(&server.url(), &other.ca_pem());
     let (got, file, _) = rig.pull(&source, &sha(&bytes), 100, LONG);
-    assert!(matches!(got, Err(FetchError::Pipe(PipeFault::Short { .. }))), "{got:?}");
+    assert!(
+        matches!(got, Err(FetchError::Pipe(PipeFault::Short { .. }))),
+        "{got:?}"
+    );
     assert!(file.is_empty());
 }
 
@@ -581,7 +629,10 @@ fn a_server_under_another_name_is_not_trusted() {
     let rig = Rig::new("url-bad-name");
     let source = rig.url_source(&server.url(), &pki.ca_pem());
     let (got, _, _) = rig.pull(&source, &sha(&bytes), 100, LONG);
-    assert!(matches!(got, Err(FetchError::Pipe(PipeFault::Short { .. }))), "{got:?}");
+    assert!(
+        matches!(got, Err(FetchError::Pipe(PipeFault::Short { .. }))),
+        "{got:?}"
+    );
 }
 
 /// A descriptor the parent's process holds open and inheritable is not the child's: the child
@@ -647,9 +698,16 @@ fn a_node_certificate_from_another_ca_is_refused_by_the_frontend() {
     let rig = Rig::new("front-stranger");
     let source = rig.frontend(&grpc.url(), &pki.ca_pem(), &stranger.client());
     let (got, file, _) = rig.pull(&source, &sha(&bytes), 100, LONG);
-    assert!(matches!(got, Err(FetchError::Pipe(PipeFault::Short { .. }))), "{got:?}");
+    assert!(
+        matches!(got, Err(FetchError::Pipe(PipeFault::Short { .. }))),
+        "{got:?}"
+    );
     assert!(file.is_empty());
-    assert_eq!(grpc.asked.lock().expect("lock").len(), 0, "the call reached the service");
+    assert_eq!(
+        grpc.asked.lock().expect("lock").len(),
+        0,
+        "the call reached the service"
+    );
 }
 
 /// A frontend whose certificate is not signed by the pinned CA is not talked to.
@@ -667,7 +725,10 @@ fn a_frontend_under_another_ca_is_not_trusted() {
     let rig = Rig::new("front-bad-ca");
     let source = rig.frontend(&grpc.url(), &pinned.ca_pem(), &pki.client());
     let (got, _, _) = rig.pull(&source, &sha(&bytes), 100, LONG);
-    assert!(matches!(got, Err(FetchError::Pipe(PipeFault::Short { .. }))), "{got:?}");
+    assert!(
+        matches!(got, Err(FetchError::Pipe(PipeFault::Short { .. }))),
+        "{got:?}"
+    );
     assert_eq!(grpc.asked.lock().expect("lock").len(), 0);
 }
 
@@ -687,7 +748,10 @@ fn a_frontend_whose_certificate_names_another_host_is_not_trusted() {
     let rig = Rig::new("front-bad-name");
     let source = rig.frontend(&grpc.url(), &pki.ca_pem(), &pki.client());
     let (got, _, _) = rig.pull(&source, &sha(&bytes), 100, LONG);
-    assert!(matches!(got, Err(FetchError::Pipe(PipeFault::Short { .. }))), "{got:?}");
+    assert!(
+        matches!(got, Err(FetchError::Pipe(PipeFault::Short { .. }))),
+        "{got:?}"
+    );
     assert_eq!(grpc.asked.lock().expect("lock").len(), 0);
 }
 
@@ -713,7 +777,13 @@ fn a_frontend_that_sends_more_than_declared_is_refused() {
     let rig = Rig::new("front-oversize");
     let source = rig.frontend(&grpc.url(), &pki.ca_pem(), &pki.client());
     let (got, file, _) = rig.pull(&source, &sha(&bytes), 15_000, LONG);
-    assert!(matches!(got, Err(FetchError::Pipe(PipeFault::Oversize { size: 15_000 }))), "{got:?}");
+    assert!(
+        matches!(
+            got,
+            Err(FetchError::Pipe(PipeFault::Oversize { size: 15_000 }))
+        ),
+        "{got:?}"
+    );
     assert!(file.len() <= 15_000);
 }
 
@@ -737,7 +807,12 @@ fn a_frontend_that_stalls_is_cut_off() {
     let source = rig.frontend(&grpc.url(), &pki.ca_pem(), &pki.client());
     let (got, _, took) = rig.pull(&source, &sha(b"x"), 5000, Duration::from_secs(3));
     assert!(
-        matches!(got, Err(FetchError::Pipe(PipeFault::Stalled { .. } | PipeFault::TimedOut { .. }))),
+        matches!(
+            got,
+            Err(FetchError::Pipe(
+                PipeFault::Stalled { .. } | PipeFault::TimedOut { .. }
+            ))
+        ),
         "{got:?}"
     );
     assert!(took < Duration::from_secs(20), "{took:?}");
@@ -808,7 +883,10 @@ fn child_command(args: &[&str]) -> std::process::Command {
 
 fn run_child(args: &[&str]) -> (bool, String) {
     let out = child_command(args).output().expect("runs");
-    (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 /// The child checks its own arguments again, whatever the parent checked.
@@ -819,13 +897,99 @@ fn run_child(args: &[&str]) -> (bool, String) {
 fn the_child_checks_its_flags_again() {
     let good = sha(b"x");
     let cases: Vec<(Vec<&str>, &str)> = vec![
-        (vec!["--kind", "url", "--url", "https://h.example", "--sha256", "ABC", "--limit", "10"], "not a sha256"),
-        (vec!["--kind", "url", "--url", "https://h.example", "--sha256", &good, "--limit", "0"], "limit"),
-        (vec!["--kind", "url", "--url", "https://h.example", "--sha256", &good, "--limit", "9999999999"], "limit"),
-        (vec!["--kind", "url", "--url", "http://h.example", "--sha256", &good, "--limit", "10"], "not a plain https URL"),
-        (vec!["--kind", "url", "--url", "https://u@h.example", "--sha256", &good, "--limit", "10"], "not a plain https URL"),
-        (vec!["--kind", "url", "--url", "https://h.example", "--sha256", &good, "--limit", "10", "--identity-fd", "5"], "no identity"),
-        (vec!["--kind", "frontend", "--url", "https://h.example", "--sha256", &good, "--limit", "10"], "--identity-fd"),
+        (
+            vec![
+                "--kind",
+                "url",
+                "--url",
+                "https://h.example",
+                "--sha256",
+                "ABC",
+                "--limit",
+                "10",
+            ],
+            "not a sha256",
+        ),
+        (
+            vec![
+                "--kind",
+                "url",
+                "--url",
+                "https://h.example",
+                "--sha256",
+                &good,
+                "--limit",
+                "0",
+            ],
+            "limit",
+        ),
+        (
+            vec![
+                "--kind",
+                "url",
+                "--url",
+                "https://h.example",
+                "--sha256",
+                &good,
+                "--limit",
+                "9999999999",
+            ],
+            "limit",
+        ),
+        (
+            vec![
+                "--kind",
+                "url",
+                "--url",
+                "http://h.example",
+                "--sha256",
+                &good,
+                "--limit",
+                "10",
+            ],
+            "not a plain https URL",
+        ),
+        (
+            vec![
+                "--kind",
+                "url",
+                "--url",
+                "https://u@h.example",
+                "--sha256",
+                &good,
+                "--limit",
+                "10",
+            ],
+            "not a plain https URL",
+        ),
+        (
+            vec![
+                "--kind",
+                "url",
+                "--url",
+                "https://h.example",
+                "--sha256",
+                &good,
+                "--limit",
+                "10",
+                "--identity-fd",
+                "5",
+            ],
+            "no identity",
+        ),
+        (
+            vec![
+                "--kind",
+                "frontend",
+                "--url",
+                "https://h.example",
+                "--sha256",
+                &good,
+                "--limit",
+                "10",
+            ],
+            "--identity-fd",
+        ),
     ];
     for (args, said) in cases {
         let (ok, err) = run_child(&args);
@@ -842,9 +1006,11 @@ fn an_unreachable_source_is_one_line_on_standard_error() {
     };
     let good = sha(b"x");
     let url = format!("https://localhost:{port}");
-    let out = child_command(&["--kind", "url", "--url", &url, "--sha256", &good, "--limit", "10"])
-        .output()
-        .expect("runs");
+    let out = child_command(&[
+        "--kind", "url", "--url", &url, "--sha256", &good, "--limit", "10",
+    ])
+    .output()
+    .expect("runs");
     assert!(!out.status.success());
     assert!(out.stdout.is_empty());
     let err = String::from_utf8_lossy(&out.stderr);

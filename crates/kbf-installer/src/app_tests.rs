@@ -92,7 +92,16 @@ fn the_fetch_child_is_no_root_verb_and_reports_in_one_line() {
         if json {
             args.insert(0, "--json");
         }
-        args.extend(["--kind", "url", "--url", "http://h.example", "--sha256", &digest, "--limit", "10"]);
+        args.extend([
+            "--kind",
+            "url",
+            "--url",
+            "http://h.example",
+            "--sha256",
+            &digest,
+            "--limit",
+            "10",
+        ]);
         let (exit, out, err) = run_as(1000, &args);
         assert_eq!(exit, Exit::Failed, "{err}");
         assert!(out.is_empty(), "{out}");

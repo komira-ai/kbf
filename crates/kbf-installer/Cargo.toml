@@ -21,6 +21,13 @@ publish.workspace = true
 # configured service and write the world-readable status.json the node reads. There is no
 # socket and no network, and a staged binary is never run as root.
 
+# The child the pipe tests start: a program that does what a list of operations says (send these
+# bytes, flood, stall, report its limits). Built only with `test-sandbox`, so never in a release.
+[[bin]]
+name = "kbf-fetch-stub"
+path = "tests/stub/fetch_stub.rs"
+required-features = ["test-sandbox"]
+
 [features]
 # `testkit`: the scratch host and state helpers other crates' tests of the `host` verbs use.
 testkit = ["kbf-host/testkit"]

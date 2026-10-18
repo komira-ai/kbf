@@ -80,7 +80,11 @@ pub enum PipeFault {
     #[error("the child ended after {got} of the {size} bytes declared{}", log_suffix(.log))]
     Short { got: u64, size: u64, log: String },
     #[error("the child sent no byte for {} s after {got} of {size} bytes; it was killed", .after.as_secs())]
-    Stalled { got: u64, size: u64, after: Duration },
+    Stalled {
+        got: u64,
+        size: u64,
+        after: Duration,
+    },
     #[error("the fetch took more than {} s; the child was killed", .after.as_secs())]
     TimedOut { after: Duration },
 }
@@ -215,7 +219,11 @@ pub fn receive(
                 hash.update(&buf[..n]);
                 out.write_all(&buf[..n]).map_err(PipeFault::Write)?;
             }
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
             Err(e) => return Err(PipeFault::Read(e)),
         }
     }
@@ -223,7 +231,9 @@ pub fn receive(
     // The child is done, or judged on the bytes it gave: end it and what it started, then take
     // what it said.
     drop(guard);
-    let log = stderr.finish(Instant::now() + READ_GRACE).unwrap_or_default();
+    let log = stderr
+        .finish(Instant::now() + READ_GRACE)
+        .unwrap_or_default();
     let log = String::from_utf8_lossy(&log[..log.len().min(LOG_BYTES)])
         .trim()
         .to_owned();
@@ -240,7 +250,3 @@ pub fn receive(
         log,
     })
 }
-
-#[cfg(test)]
-#[path = "pipe_tests.rs"]
-mod tests;
