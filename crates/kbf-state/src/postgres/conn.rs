@@ -104,9 +104,43 @@ impl Conn {
 
 impl Drop for Conn {
     fn drop(&mut self) {
-        if let Some(client) = self.client.take() {
-            // Dropping the client drops its runtime, which panics inside another one.
-            off_runtime(move || drop(client));
-        }
+        // Dropping the client drops its runtime, which panics inside another one.
+        self.client
+            .take()
+            .into_iter()
+            .for_each(|client| off_runtime(move || drop(client)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::off_runtime;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime")
+    }
+
+    // Catches a call that runs on the runtime's own thread (the client would panic with
+    // "Cannot start a runtime from within a runtime"): inside a runtime the work moves to
+    // another thread, outside it stays.
+    #[test]
+    fn a_call_inside_a_runtime_runs_on_another_thread() {
+        let here = std::thread::current().id();
+        assert_eq!(off_runtime(|| std::thread::current().id()), here);
+        let inside = runtime().block_on(async { off_runtime(|| std::thread::current().id()) });
+        assert_ne!(inside, here);
+    }
+
+    // Catches a panic in the moved call being swallowed (the caller would carry on with
+    // a result that does not exist): it must come out in the caller, with its message.
+    #[test]
+    fn a_panic_in_a_call_moved_off_the_runtime_is_raised_in_the_caller() {
+        let caught = std::panic::catch_unwind(|| {
+            runtime().block_on(async { off_runtime(|| -> u8 { panic!("the client broke") }) })
+        });
+        let panic = caught.expect_err("the panic comes out");
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"the client broke"));
     }
 }
