@@ -76,14 +76,14 @@ impl World {
         let root = host.root.clone();
         for sub in [
             "run",
-            "var/lib/kbf-deploy",
+            "var/lib/kbf-installer",
             "var/lib/kbf-updater/inbox/orders",
-            "usr/local/kbf/releases",
+            "var/lib/kbf-installer/releases",
         ] {
             fs::create_dir_all(root.join(sub)).unwrap();
         }
         for r in [A, B] {
-            let d = root.join("usr/local/kbf/releases").join(r);
+            let d = root.join("var/lib/kbf-installer/releases").join(r);
             fs::create_dir_all(&d).unwrap();
             fs::write(d.join("kbf"), b"binary").unwrap();
         }
@@ -138,7 +138,7 @@ impl World {
             .count()
     }
     fn link(&self) -> String {
-        fs::read_link(self.root.join("usr/local/kbf/current"))
+        fs::read_link(self.root.join("var/lib/kbf-installer/releases/current"))
             .map(|p| p.display().to_string())
             .unwrap_or_default()
     }

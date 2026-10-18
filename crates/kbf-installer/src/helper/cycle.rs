@@ -13,7 +13,7 @@ use std::path::Path;
 use crate::CommitId;
 use crate::activate::{self, Activated, Arm, Confirmed, Expiry};
 use crate::inbox::{Entry, read_capped};
-use crate::layout::{self, Layout, Platform};
+use crate::layout::{Layout, Platform};
 use crate::refusal::Refusal;
 use crate::release::ReleaseError;
 use crate::stage::Staged;
@@ -170,7 +170,7 @@ impl<E: Exec> Helper<E> {
         let due = before
             .pending_confirm
             .as_ref()
-            .and_then(|p| p.deadline)
+            .and_then(|p| p.deadline_wall)
             .is_some_and(|d| now >= d);
         let prior = memory.restart_due;
         if due {
@@ -224,7 +224,7 @@ impl<E: Exec> Helper<E> {
         let state = self.state()?;
         let installed = self
             .exec
-            .stat(&layout::release_dir(&commit))
+            .stat(&self.host.release_dir(&commit))
             .ok()
             .flatten()
             .is_some();
@@ -389,7 +389,7 @@ impl<E: Exec> Helper<E> {
             .pending_confirm
             .as_ref()
             .filter(|p| p.commit == order.commit)
-            .and_then(|p| p.order_id.clone())
+            .map(|p| p.activation.clone())
             .unwrap_or_default();
         match activate::confirm(&self.host, &activation, &order.commit) {
             Ok(Confirmed::Kept | Confirmed::AlreadyKept) => Ok(Done::quiet(Event::Confirmed)),

@@ -31,7 +31,7 @@ use kbf_host::exec::{Exec, Kind};
 use kbf_host::path::{HostPath, Root};
 
 use crate::CommitId;
-use crate::layout::{self, Layout};
+use crate::layout::Layout;
 use crate::refusal::Refusal;
 use crate::run::{Ran, RunAs, Runner, Spawn};
 use crate::settings::Settings;
@@ -154,8 +154,8 @@ impl Verifier {
     pub fn pinned(host: &Layout, settings: &Settings) -> Verifier {
         Verifier {
             root: host.root().clone(),
-            gh: layout::path(layout::GH),
-            trusted_root: layout::path(layout::TRUSTED_ROOT),
+            gh: host.gh(),
+            trusted_root: host.trusted_root(),
             signers: vec![Signer::current(), Signer::former()],
             issuer: ISSUER.to_owned(),
             source_refs: settings.source_refs.clone(),

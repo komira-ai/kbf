@@ -67,7 +67,7 @@ kbf-mac-provision revert                                # root: put back the rec
   passed to `kbf daemon` as a `--label`.
 - `--keys` limits `check` and `apply` to the named items. `--root DIR` runs everything
   under DIR; only the tests use it.
-- The job runs `/usr/local/kbf/current/kbf daemon` with the flags of the Mac kit's plist, one
+- The job runs `/usr/local/kbf-installer/releases/current/kbf daemon` with the flags of the Mac kit's plist, one
   word per argument: `--driver native`, the profile's `kbf_server`, `kbf_cas`, `kbf_ca_cert`,
   `kbf_cert` and `kbf_key`,
   `--node-id` the host name, `--data-dir` the profile's `kbf_data_dir`, then the node
