@@ -48,6 +48,9 @@
 //! - `handover`: the frontend's unit is the template `kbf-frontend@.service` whose two
 //!   instances hand over to one another: `Type=notify`, a control socket in a preserved
 //!   `RuntimeDirectory=`, no `Conflicts=` ([`super::handover`]).
+//! - `restart`: a node unit (`storage`, `daemon`, `storage-and-daemon`) has
+//!   `RestartSec=5` and `StartLimitIntervalSec=0`, so a failure that repeats quickly
+//!   never ends in `start-limit-hit` ([`super::restart`]).
 //! - `stop`: a mode that drains on SIGTERM (every mode but `daemon`) has
 //!   `TimeoutStopSec=infinity` and `KillSignal=SIGTERM`, so systemd never kills it
 //!   mid-drain and fails the builds in flight ([`super::stop`]).
@@ -92,7 +95,7 @@ use kbf_host::step::Cmd;
 use super::check::{Failure, Report, angle_placeholder};
 use super::config::{LinuxConfig, LinuxError};
 use super::render::{SLICE, values};
-use super::{cpuset, credential, handover, stop, stores};
+use super::{cpuset, credential, handover, restart, stop, stores, traverse};
 use crate::template::{self, TemplateError, leftovers};
 use crate::unit::{UnitError, UnitFile, comments_in_continuations};
 
@@ -143,6 +146,15 @@ impl Mode {
             Mode::StorageAndDaemon => "storage-and-daemon",
             Mode::AllInOne => "all-in-one",
         }
+    }
+
+    /// Whether the mode is a node unit (rule `restart`): `storage`, `daemon` and
+    /// `storage-and-daemon` retry a repeating failure for as long as it lasts. The
+    /// frontend and `all-in-one` (which runs one) keep their own restart policy: an old
+    /// frontend that drained after a handover exits 0 and stays down.
+    #[must_use]
+    pub fn is_node(self) -> bool {
+        matches!(self, Mode::Storage | Mode::Daemon | Mode::StorageAndDaemon)
     }
 
     /// Whether the mode runs builds, and so manages its own cgroup (rule `delegate`).
@@ -313,6 +325,51 @@ pub fn check(
     ))
 }
 
+/// Rule `traverse`: a `file://` `--hot-store` the unit's `User=` can reach. Skipped, with
+/// a note, where the user or a directory cannot be read.
+fn hot_store_reachable<E: Exec>(
+    exec: &E,
+    unit: &UnitFile,
+    failures: &mut Vec<Failure>,
+    notes: &mut Vec<String>,
+) {
+    let Some(dir) = unit
+        .flag("hot-store")
+        .and_then(|v| v.strip_prefix("file://"))
+        .and_then(|v| HostPath::new(v).ok())
+    else {
+        return;
+    };
+    let Some(name) = unit.get_in("Service", "User").filter(|u| !u.is_empty()) else {
+        return;
+    };
+    let user = match kbf_host::user::lookup(exec, name) {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            notes.push(format!(
+                "SKIP traverse: no user {name} on this host, so the path to --hot-store was not read"
+            ));
+            return;
+        }
+        Err(e) => {
+            notes.push(format!("SKIP traverse: {e}"));
+            return;
+        }
+    };
+    // root enters every directory.
+    if user.uid == 0 {
+        return;
+    }
+    match traverse::blocked_by(&user, &dir, |p| exec.stat(p)) {
+        Ok(None) => {}
+        Ok(Some((above, meta))) => failures.push(Failure {
+            rule: "traverse",
+            message: traverse::message(&user, &dir, &above, &meta),
+        }),
+        Err(e) => notes.push(format!("SKIP traverse: {e}")),
+    }
+}
+
 /// [`check`] on `unit` and its drop-ins, `kbf.slice` (`slice`, with its drop-ins), and
 /// then the rules that read the host `exec` runs on: `parse` (`kbf_bin`, or the unit's
 /// own binary when `exec` shows it there, run as `<kbf> check-args <mode> <flags...>`
@@ -381,6 +438,7 @@ pub fn check_on_host<E: Exec>(
         }
         notes.extend(found.notes);
     }
+    hot_store_reachable(exec, &merged, &mut failures, &mut notes);
     let argv = merged.exec_start();
     if runs_this_mode(config, mode, &argv) {
         let found = match kbf_bin {
@@ -671,6 +729,13 @@ fn rules(
     if mode == Mode::Frontend {
         for how in handover::check(unit) {
             fail("handover", format!("{name} {how}"));
+        }
+    }
+
+    // restart
+    if mode.is_node() {
+        for how in restart::check(unit) {
+            fail("restart", format!("{name} {how}"));
         }
     }
 

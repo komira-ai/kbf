@@ -604,6 +604,11 @@ impl Held {
 
     /// The node learns the map of generation `generation`.
     pub(crate) fn set(&self, generation: u64) {
+        self.set_denying(generation, Vec::new());
+    }
+
+    /// The node learns the map of generation `generation` whose deny list is `denied`.
+    pub(crate) fn set_denying(&self, generation: u64, denied: Vec<kbf_map::DenyEntry>) {
         let member = kbf_map::Member {
             id: kbf_map::MemberId(1),
             addr: "127.0.0.1:1".to_owned(),
@@ -617,7 +622,7 @@ impl Held {
             kbf_map::Rule::Rendezvous,
             1,
             1,
-            Vec::new(),
+            denied,
         )
         .expect("a valid map");
         *self.0.lock().expect("lock") = Some(Arc::new(map));
