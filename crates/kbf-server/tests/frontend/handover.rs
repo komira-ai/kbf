@@ -581,6 +581,36 @@ async fn a_stop_without_a_handover_drains_as_before() {
         .expect("served without an error");
 }
 
+/// Catches: the Execute service taking a new call while the drain refuses (the staged
+/// `Drain::refuse`, with no GOAWAY): the call gets UNAVAILABLE from the service itself, on
+/// the connection that is still open, so no transport race can stand in for it (the stop
+/// test above accepts any failure). Mutant: the draining check dropped from `execute`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusing_frontend_answers_a_new_execute_unavailable() {
+    let node = Node::start().await;
+    let dir = Dir::new();
+    let old = Proc::cold(&handover_flags(&node, &dir, "a", &[])).await;
+    let client = Client::connect(old.reapi, old.worker).await;
+    let job = Job::new("refused while the frontend refuses", &[]);
+    client.upload(&job.blobs()).await;
+    assert!(old.drain.refuse(), "the first refusal");
+    assert!(!old.drain.is_draining(), "refusing sends no GOAWAY");
+    let refused = client.execute_with(&job.action, false).await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.code() == Code::Unavailable),
+        "{refused:?}"
+    );
+    drop(client);
+    drop(old._stop);
+    tokio::time::timeout(Duration::from_secs(20), old.served)
+        .await
+        .expect("the frontend ends")
+        .expect("the task")
+        .expect("served without an error");
+}
+
 /// Catches: `READY=1` sent before the frontend serves, never sent after, or sent by a
 /// frontend that cannot reach its storage node: the service manager's socket gets it
 /// only once `serve` runs and the probes pass, for a start with no predecessor and for
