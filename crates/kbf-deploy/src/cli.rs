@@ -5,10 +5,9 @@
 //!                          --mc PATH [--key-file PATH [--key-owner USER]] [--remove] [--apply]
 //! kbf-deploy minio nodeport --kubectl PATH --kubeconfig PATH [--context NAME]
 //!                           --namespace NS --service NAME --node-port N [--remove] [--apply]
-//! kbf-deploy linux render-units --config FILE --out DIR [--kbf-uid UID] [--mode MODE]
-//! kbf-deploy linux check-units --config FILE --dir DIR [--installable] [--mode MODE [--kbf-bin PATH]]
-//! kbf-deploy linux install-units --config FILE [--bin-dir DIR] [--restart-minio] [--apply]
-//! kbf-deploy linux install-units --config FILE --uninstall [--apply]
+//! kbf-deploy linux render-units --config FILE --out DIR --mode MODE [--kbf-uid UID]
+//! kbf-deploy linux check-units --config FILE --dir DIR --mode MODE [--installable] [--kbf-bin PATH]
+//! kbf-deploy linux install-units --config FILE --mode MODE [--bin-dir DIR] [--apply]
 //! kbf-deploy linux swap --config FILE [--kubelet-allows-swap] [--remove] [--apply]
 //! kbf-deploy linux meta-backup --meta-dir DIR [--hot-dir DIR] --out FILE [--metrics URL]
 //!                              [--unit NAME] [--ready-secs N] [--apply]
@@ -85,7 +84,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::envoy;
 use crate::https::Client;
-use crate::linux::{self, HostError, LinuxConfig, install, install_mode, meta, swap};
+use crate::linux::{self, HostError, LinuxConfig, install_mode, meta, swap};
 use crate::log;
 use crate::mdm::dep::{Dep, Serial};
 use crate::mdm::erase::{self, EraseArgs, Made};
@@ -123,7 +122,7 @@ enum Kit {
     /// A MinIO for kbf: its buckets and key, and a NodePort for its S3 port.
     #[command(subcommand)]
     Minio(Minio),
-    /// A converged Linux storage node: MinIO, kbf-server and kbf-daemon.
+    /// A Linux node: the systemd unit of one kbf mode, and the build swapfile.
     #[command(subcommand)]
     Linux(Linux),
     /// An Apple MDM on one Linux host: NanoHUB, the SCEP server, NanoDEP and an HTTPS
@@ -192,7 +191,7 @@ enum Envoy {
 
 #[derive(Subcommand)]
 enum Linux {
-    /// Render the node's four systemd files into a directory.
+    /// Render kbf.slice and the unit of one mode of the one kbf binary into a directory.
     RenderUnits {
         /// The kit's settings, KEY=VALUE lines.
         #[arg(long)]
@@ -200,13 +199,13 @@ enum Linux {
         /// Where to write the files, laid out as under /etc/systemd/system.
         #[arg(long)]
         out: PathBuf,
-        /// The kbf user's uid (the daemon's XDG_RUNTIME_DIR); without it the daemon's
-        /// unit keeps `<kbf uid>`, which `check-units --installable` refuses.
+        /// The kbf user's uid (the daemon's XDG_RUNTIME_DIR); without it a unit that
+        /// runs builds keeps `<kbf uid>`, which `check-units --installable` refuses.
         #[arg(long)]
         kbf_uid: Option<u32>,
-        /// Render kbf.slice and the unit of this mode of the one kbf binary instead.
+        /// The mode whose unit is rendered.
         #[arg(long, value_enum)]
-        mode: Option<linux::Mode>,
+        mode: linux::Mode,
     },
     /// Check rendered units against the host's priorities.
     CheckUnits {
@@ -219,33 +218,26 @@ enum Linux {
         /// Also refuse a `<...>` placeholder.
         #[arg(long)]
         installable: bool,
-        /// Check the unit of this mode of the one kbf binary instead.
+        /// The mode whose unit is checked.
         #[arg(long, value_enum)]
-        mode: Option<linux::Mode>,
+        mode: linux::Mode,
         /// The kbf that parses a built mode's flags (`kbf check-args`); without it the
         /// unit's own ExecStart= binary, and the parse is skipped when that is not there.
-        #[arg(long, requires = "mode")]
+        #[arg(long)]
         kbf_bin: Option<PathBuf>,
     },
-    /// Install the binaries and units, and start kbf-server and kbf-daemon (as root).
+    /// Install kbf.slice and the unit of one mode of the one kbf binary, and start it
+    /// (as root).
     InstallUnits {
         /// The kit's settings, KEY=VALUE lines.
         #[arg(long)]
         config: PathBuf,
-        /// Where new kbf-server and kbf-daemon binaries are; without it the installed
-        /// ones stay.
+        /// Where the new kbf is; without it the installed one stays.
         #[arg(long, value_parser = HostPath::new)]
         bin_dir: Option<HostPath>,
-        /// Also restart MinIO, so its new priorities take effect now.
-        #[arg(long)]
-        restart_minio: bool,
-        /// Roll back: stop the services and move the four files aside.
-        #[arg(long, conflicts_with_all = ["bin_dir", "restart_minio"])]
-        uninstall: bool,
-        /// Install kbf.slice and the unit of this mode of the one kbf binary instead
-        /// (with --bin-dir, the new kbf too), and start it.
-        #[arg(long, value_enum, conflicts_with_all = ["restart_minio", "uninstall"])]
-        mode: Option<linux::Mode>,
+        /// The mode whose unit is installed.
+        #[arg(long, value_enum)]
+        mode: linux::Mode,
         /// Carry the plan out.
         #[arg(long)]
         apply: bool,
@@ -566,58 +558,37 @@ fn linux_kit<E: Exec>(
             out: dir,
             kbf_uid,
             mode,
-        } => match mode {
-            None => linux::render_units(&config, &dir, kbf_uid),
-            Some(mode) => linux::render_mode_unit(&config, &dir, kbf_uid, mode),
-        }
-        .map(|line| (vec![line], 0)),
+        } => linux::render_mode_unit(&config, &dir, kbf_uid, mode).map(|line| (vec![line], 0)),
         Linux::CheckUnits {
             config,
             dir,
             installable,
             mode,
             kbf_bin,
-        } => match mode {
-            None => linux::check_units(&config, &dir, installable),
-            Some(mode) => {
-                linux::check_mode_unit(exec, &config, &dir, mode, installable, kbf_bin.as_deref())
-            }
-        }
-        .map(|report| {
-            let code = u8::from(!report.failures.is_empty());
-            let mut lines: Vec<String> = report.failures.iter().map(ToString::to_string).collect();
-            lines.extend(report.notes);
-            lines.push(report.summary);
-            (lines, code)
-        }),
+        } => linux::check_mode_unit(exec, &config, &dir, mode, installable, kbf_bin.as_deref())
+            .map(|report| {
+                let code = u8::from(!report.failures.is_empty());
+                let mut lines: Vec<String> =
+                    report.failures.iter().map(ToString::to_string).collect();
+                lines.extend(report.notes);
+                lines.push(report.summary);
+                (lines, code)
+            }),
         Linux::InstallUnits {
             config,
             bin_dir,
-            restart_minio,
-            uninstall,
             mode: unit_mode,
             apply,
         } => {
             let done = LinuxConfig::load(&config)
                 .map_err(HostError::from)
                 .and_then(|config| {
-                    if let Some(mode) = unit_mode {
-                        let a = install_mode::InstallMode {
-                            config,
-                            mode,
-                            bin_dir,
-                        };
-                        install_mode::run(exec, &a, self::mode(apply), &mut out)
-                    } else if uninstall {
-                        install::run_uninstall(exec, &config, &stamp(), mode(apply), &mut out)
-                    } else {
-                        let a = install::Install {
-                            config,
-                            bin_dir,
-                            restart_minio,
-                        };
-                        install::run(exec, &a, mode(apply), &mut out)
-                    }
+                    let a = install_mode::InstallMode {
+                        config,
+                        mode: unit_mode,
+                        bin_dir,
+                    };
+                    install_mode::run(exec, &a, mode(apply), &mut out)
                 });
             return host_verb(done, err);
         }

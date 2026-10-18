@@ -13,7 +13,7 @@ use kbf_host::step::{Owner, Perms};
 use kbf_host::testkit::{FakeExec, reply};
 
 use super::*;
-use crate::linux::render::{Templates, render as render_converged};
+use crate::linux::shared;
 
 const EXAMPLE: &str = include_str!("../../templates/linux/config.example");
 
@@ -68,7 +68,7 @@ fn nofile(text: &str) -> Option<u64> {
         .and_then(|v| v.parse().ok())
 }
 
-/// Catches a kbf unit, mode or converged, with no `LimitNOFILE=` (the process runs at a
+/// Catches a kbf unit with no `LimitNOFILE=` (the process runs at a
 /// soft open-file limit of 1024) or one below `MIN_NOFILE`. Mutant: the line deleted from
 /// one template turns this red for that unit.
 #[test]
@@ -80,34 +80,6 @@ fn every_kbf_unit_sets_an_open_file_limit() {
             nofile(&text).is_some_and(|n| n >= MIN_NOFILE),
             "{mode}: LimitNOFILE= is {:?}",
             nofile(&text)
-        );
-    }
-    let units = render_converged(&c, Some(1500), &Templates::BUILT_IN).expect("renders");
-    let mut seen = 0;
-    for (name, text) in units.files() {
-        if name.contains("kbf-") && name.ends_with(".service") {
-            seen += 1;
-            assert!(
-                nofile(text).is_some_and(|n| n >= MIN_NOFILE),
-                "{name}: LimitNOFILE= is {:?}",
-                nofile(text)
-            );
-        }
-    }
-    assert_eq!(seen, 2, "kbf-server's and kbf-daemon's units");
-}
-
-/// Catches a change to the units `render-units` writes without `--mode` (kbf-server's
-/// and kbf-daemon's, MinIO's drop-in and the slice): the mode units are new files and
-/// leave the converged host's units byte for byte as they were.
-#[test]
-fn the_converged_units_are_unchanged() {
-    let units = render_converged(&config(), Some(1500), &Templates::BUILT_IN).expect("renders");
-    for (name, text) in units.files() {
-        let file = name.replace('/', "_");
-        assert!(
-            text == golden("converged", &file),
-            "{name} differs from tests/golden/linux/converged/{file}:\n{text}"
         );
     }
 }
@@ -387,7 +359,7 @@ fn the_mode_verbs_write_the_slice_and_one_unit_and_read_it_back() {
     names.sort();
     assert_eq!(names, ["kbf-all-in-one.service", "kbf.slice"]);
     let slice = std::fs::read_to_string(out.join("kbf.slice")).expect("slice");
-    assert_eq!(slice, golden("converged", "kbf.slice"));
+    assert_eq!(slice, golden("modes", "kbf.slice"));
     let r =
         crate::linux::check_mode_unit(&FakeExec::new(501), &cfg, &out, Mode::AllInOne, true, None)
             .expect("checks");
@@ -470,10 +442,7 @@ fn on_host<E: Exec>(
 
 /// The rendered `kbf.slice`.
 fn slice(c: &LinuxConfig) -> UnitText {
-    let text = render_converged(c, Some(1500), &Templates::BUILT_IN)
-        .expect("renders")
-        .slice;
-    UnitText::new(SLICE, text)
+    UnitText::new(SLICE, shared::render_slice(c, Some(1500)).expect("renders"))
 }
 
 fn kbf_at(exec: &mut FakeExec, path: &str) {

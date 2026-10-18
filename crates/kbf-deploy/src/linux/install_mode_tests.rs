@@ -690,7 +690,7 @@ fn a_hot_store_the_unit_user_cannot_reach_is_refused() {
     let report = |a: &InstallMode| {
         let c = &a.config;
         let kbf = modes::render(c, Some(uid + 1), a.mode).expect("renders");
-        let slice = render(c, None, &Templates::BUILT_IN).expect("slice").slice;
+        let slice = shared::render_slice(c, None).expect("slice");
         modes::check_on_host(
             &exec,
             c,
@@ -740,7 +740,7 @@ fn root_is_not_refused_a_hot_store_under_a_0700_directory() {
     .expect("valid settings");
     let mode = Mode::StorageAndDaemon;
     let kbf = modes::render(&c, Some(0), mode).expect("renders");
-    let slice = render(&c, None, &Templates::BUILT_IN).expect("slice").slice;
+    let slice = shared::render_slice(&c, None).expect("slice");
     let report = modes::check_on_host(
         &exec,
         &c,
@@ -775,7 +775,7 @@ fn rule_traverse_is_skipped_with_a_note_where_it_cannot_read() {
     let report = |exec: &ScratchHost, edit: &dyn Fn(String) -> String| {
         let (uid, _) = me();
         let unit = edit(modes::render(&c, Some(uid + 1), mode).expect("renders"));
-        let slice = render(&c, None, &Templates::BUILT_IN).expect("slice").slice;
+        let slice = shared::render_slice(&c, None).expect("slice");
         modes::check_on_host(
             exec,
             &c,

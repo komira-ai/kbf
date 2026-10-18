@@ -1,6 +1,6 @@
-//! What the converged-node verbs and the per-mode verbs (`--mode`) share: the check
-//! result types, the slice and the values every unit template takes, and the host reads
-//! and constants `install-units` plans with.
+//! What the per-mode verbs (`--mode`) share: the check result types, the slice and the
+//! values every unit template takes, and the host reads and constants `install-units`
+//! plans with.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use super::config::{LOOPBACK_MINIO, LinuxConfig};
 use super::host::{CRUN, HostError, NEWGIDMAP, NEWUIDMAP, SYSTEMCTL, inspect, stat, tool, under};
-use crate::template::{Value, Values};
+use crate::template::{self, TemplateError, Value, Values};
 use crate::unit::UnitError;
 use kbf_host::exec::{Entry, Exec, Kind};
 use kbf_host::path::HostPath;
@@ -81,6 +81,16 @@ pub(super) fn angle_placeholder(text: &str) -> Option<&str> {
         rest = after;
     }
     None
+}
+
+/// `kbf.slice`, rendered from the template compiled in from `templates/linux/kbf.slice`;
+/// `kbf_uid` is the kbf user's uid, or `None` to leave [`UID_PLACEHOLDER`].
+pub fn render_slice(c: &LinuxConfig, kbf_uid: Option<u32>) -> Result<String, TemplateError> {
+    template::render(
+        SLICE,
+        include_str!("../../templates/linux/kbf.slice"),
+        &values(c, kbf_uid),
+    )
 }
 
 pub(super) fn values(c: &LinuxConfig, kbf_uid: Option<u32>) -> Values {

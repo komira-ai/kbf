@@ -1,35 +1,28 @@
-//! The `linux` kit: a converged storage node's systemd units (MinIO's drop-in,
-//! kbf-server, kbf-daemon and the `kbf.slice` they share; docs/deploy/storage-node.md),
-//! its build images and its swapfile.
+//! The `linux` kit: the systemd units of one mode of the one `kbf` binary (and the
+//! `kbf.slice` they share), its build images and its swapfile.
 //!
-//! - `kbf-deploy linux render-units --config FILE --out DIR [--kbf-uid N]` renders the
-//!   four files from the templates compiled in from `templates/linux/` into `DIR`, laid
-//!   out as under `/etc/systemd/system`: `kbf.slice`, `<MINIO_UNIT>.d/kbf.conf`,
-//!   `kbf-server.service`, `kbf-daemon.service`. It writes nothing else, so it needs no
-//!   `--apply`.
-//! - `kbf-deploy linux check-units --config FILE --dir DIR [--installable]` checks
-//!   them against the host's priorities ([`check`] lists the rules) and prints one
-//!   `FAIL <rule>: <reason>` line per broken rule.
-//! - With `--mode MODE`, both verbs work on one mode of the one `kbf` binary instead
-//!   ([`modes`]): `render-units` writes `kbf.slice` and `kbf-<mode>.service`, and
-//!   `check-units` checks the two, each with its drop-ins (`<name>.d/*.conf`), against
-//!   [`modes`]' rules (docs/deploy/kbf-modes.md). It also
-//!   runs `<kbf> check-args <mode> <flags...>` (`--kbf-bin PATH`, or the unit's own
-//!   binary when it is installed; a `SKIP parse:` line when it is not).
+//! - `kbf-deploy linux render-units --config FILE --out DIR --mode MODE [--kbf-uid N]`
+//!   renders `kbf.slice` and `kbf-<mode>.service` from the templates compiled in from
+//!   `templates/linux/` into `DIR`, laid out as under `/etc/systemd/system`
+//!   ([`modes`]). It writes nothing else, so it needs no `--apply`.
+//! - `kbf-deploy linux check-units --config FILE --dir DIR --mode MODE [--installable]
+//!   [--kbf-bin PATH]` checks the two, each with its drop-ins (`<name>.d/*.conf`),
+//!   against [`modes`]' rules (docs/deploy/kbf-modes.md) and prints one
+//!   `FAIL <rule>: <reason>` line per broken rule. It also runs
+//!   `<kbf> check-args <mode> <flags...>` (`--kbf-bin PATH`, or the unit's own binary
+//!   when it is installed; a `SKIP parse:` line when it is not).
 //!
 //! Exit codes: 0 rendered, or every rule holds; 1 a rule is broken; 2 refused (a bad
 //! setting, a template placeholder with no value, a file that cannot be read or
 //! written, a `--kbf-bin` that cannot be run), with a `REFUSED:` line on stderr.
 //!
-//! Three verbs change the host, as root. Each checks the host first and prints its plan
+//! Two verbs change the host, as root. Each checks the host first and prints its plan
 //! as `DRY-RUN:` lines; `--apply` carries it out, and a re-run after an apply plans
 //! nothing. They exit 0 done (or nothing to do), 1 a step or the check after an apply
 //! failed, 2 refused.
-//! - `kbf-deploy linux install-units --config FILE [--bin-dir DIR] [--restart-minio]
-//!   [--uninstall] [--apply]` ([`install`]): the binaries, the four units, the Raft and
-//!   scratch directories, and the services started.
-//!   With `--mode MODE` ([`install_mode`]): `kbf` (with `--bin-dir`), `kbf.slice` and
-//!   one built mode's unit, the directories its flags name, and the unit started.
+//! - `kbf-deploy linux install-units --config FILE --mode MODE [--bin-dir DIR]
+//!   [--apply]` ([`install_mode`]): `kbf` (with `--bin-dir`), `kbf.slice` and one built
+//!   mode's unit, the directories its flags name, and the unit started.
 //! - `kbf-deploy linux swap --config FILE [--kubelet-allows-swap] [--remove] [--apply]`
 //!   ([`swap`]): the swapfile, active and in `/etc/fstab`.
 //!
@@ -44,18 +37,15 @@
 //! The settings are a closed set of `KEY=VALUE` lines ([`config::KEYS`],
 //! `templates/linux/config.example`).
 
-pub mod check;
 pub mod config;
 pub mod cpuset;
 pub mod credential;
 mod glob;
 pub mod handover;
 pub mod host;
-pub mod install;
 pub mod install_mode;
 pub mod meta;
 pub mod modes;
-pub mod render;
 pub mod restart;
 mod runtime;
 pub mod shared;
@@ -73,7 +63,6 @@ use std::path::{Path, PathBuf};
 pub use config::{LinuxConfig, LinuxError};
 pub use host::HostError;
 pub use modes::Mode;
-pub use render::{Templates, Units};
 pub use shared::{CheckError, Failure, Report};
 
 use crate::template::TemplateError;
@@ -101,32 +90,7 @@ pub enum Refusal {
     },
 }
 
-/// `render-units`: render the built-in templates with the settings in `config` into
-/// `out`, and return the line to print.
-pub fn render_units(config: &Path, out: &Path, kbf_uid: Option<u32>) -> Result<String, Refusal> {
-    let c = LinuxConfig::load(config)?;
-    let units = render::render(&c, kbf_uid, &Templates::BUILT_IN)?;
-    let dir = out.join(&units.minio_dir);
-    std::fs::create_dir_all(&dir).map_err(|source| Refusal::Write { path: dir, source })?;
-    for (name, text) in units.files() {
-        let path = out.join(name);
-        std::fs::write(&path, text).map_err(|source| Refusal::Write { path, source })?;
-    }
-    let names = units.files().map(|(name, _)| name).join(" ");
-    Ok(format!(
-        "rendered {names} into {} (builds get {} GiB)",
-        out.display(),
-        c.actions_gib
-    ))
-}
-
-/// `check-units`: check the files in `dir` against the settings in `config`.
-pub fn check_units(config: &Path, dir: &Path, installable: bool) -> Result<Report, Refusal> {
-    let c = LinuxConfig::load(config)?;
-    Ok(check::check_dir(&c, dir, installable)?)
-}
-
-/// `render-units --mode`: `kbf.slice` and the unit of `mode`, rendered with the settings
+/// `render-units`: `kbf.slice` and the unit of `mode`, rendered with the settings
 /// in `config` into `out`, and the line to print.
 pub fn render_mode_unit(
     config: &Path,
@@ -135,7 +99,7 @@ pub fn render_mode_unit(
     mode: Mode,
 ) -> Result<String, Refusal> {
     let c = LinuxConfig::load(config)?;
-    let slice = render::render(&c, kbf_uid, &Templates::BUILT_IN)?.slice;
+    let slice = shared::render_slice(&c, kbf_uid)?;
     let unit = modes::render(&c, kbf_uid, mode)?;
     std::fs::create_dir_all(out).map_err(|source| Refusal::Write {
         path: out.to_owned(),
@@ -153,7 +117,7 @@ pub fn render_mode_unit(
     ))
 }
 
-/// `check-units --mode`: check `kbf-<mode>.service` and `kbf.slice` in `dir`, each
+/// `check-units`: check `kbf-<mode>.service` and `kbf.slice` in `dir`, each
 /// with its drop-ins (`<name>.d/*.conf`), against the settings in `config`, on the host
 /// `exec` reads: a built mode's flags with `kbf_bin` or the unit's own kbf
 /// ([`modes::check_on_host`]).

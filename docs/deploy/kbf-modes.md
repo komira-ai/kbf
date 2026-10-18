@@ -12,8 +12,9 @@ kbf-deploy linux render-units --config node.conf --out units --kbf-uid 1500 --mo
 kbf-deploy linux check-units --config node.conf --dir units --installable --mode daemon
 ```
 
-Exit codes are those of the converged verbs ([storage-node.md](storage-node.md#rendering-the-converged-units)):
-0 rendered or every rule holds, 1 a rule is broken, 2 refused.
+Exit codes: 0 rendered or every rule holds, 1 a rule is broken, 2 refused (a bad setting,
+a missing `--mode`, a file that cannot be read or written), with a `REFUSED:` line on
+stderr.
 
 ## What check-units reads
 
@@ -416,7 +417,8 @@ toward storage), `ca.pem`, and the REAPI pair `KBF_REAPI_CERT` and `KBF_REAPI_KE
 
 There is no `--uninstall` for a mode's unit yet. A node moving from the converged units
 (`kbf-server.service`) to `kbf-storage.service` stops the old ones first
-(`install-units --uninstall`): both would hold the same directories.
+(`systemctl disable --now kbf-daemon.service kbf-server.service`): both would hold the
+same directories.
 
 ## Upgrade kbf before kbf-deploy
 

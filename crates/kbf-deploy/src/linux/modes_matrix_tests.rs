@@ -10,7 +10,7 @@ use kbf_host::step::{Owner, Perms};
 use kbf_host::testkit::{FakeExec, reply};
 
 use super::*;
-use crate::linux::render::{Templates, render as render_converged};
+use crate::linux::shared;
 
 const EXAMPLE: &str = include_str!("../../templates/linux/config.example");
 
@@ -284,9 +284,7 @@ fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
     let c = config();
     let slice = UnitText::new(
         SLICE,
-        render_converged(&c, Some(1500), &Templates::BUILT_IN)
-            .expect("renders")
-            .slice,
+        shared::render_slice(&c, Some(1500)).expect("renders"),
     );
     let cases: [(&str, Entry, &[Mode]); 4] = [
         ("parse", file(0o600, 0, ""), &Mode::ALL),

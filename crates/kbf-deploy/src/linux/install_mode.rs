@@ -35,8 +35,7 @@ use std::io::Write;
 use super::LinuxConfig;
 use super::host::{self, HostError, binary, inspect, note, parents, stat, under, unit_is};
 use super::modes::{self, Mode, UnitText};
-use super::render::{Templates, render};
-use super::shared::SLICE;
+use super::shared::{self, SLICE};
 use super::shared::{READY, ROOT, UNITS, rootless, systemctl};
 use crate::unit::UnitFile;
 use kbf_host::exec::{Entry, Exec, Kind};
@@ -77,7 +76,7 @@ fn plan_with<E: Exec>(
     };
     let name = mode.unit_name();
     let text = modes::render(c, kbf_user.as_ref().map(|u| u.uid), mode)?;
-    let slice = render(c, None, &Templates::BUILT_IN)?.slice;
+    let slice = shared::render_slice(c, None)?;
     let unit = UnitFile::parse(&text)?;
     let user = host::user_named(exec, unit_user(&unit, &name)?)?;
 
