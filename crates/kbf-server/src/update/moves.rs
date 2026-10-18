@@ -18,10 +18,12 @@ pub(super) fn decide(
     policy: &Policy,
     now: FarmTime,
 ) -> Result<Transition, ControllerError> {
-    let obs = facts
-        .observe(id)
-        .ok_or_else(|| ControllerError::Invariant(format!("{id} is not in the facts")))?;
-    Ok(step(&obs, policy, now))
+    match facts.observe(id) {
+        Some(obs) => Ok(step(&obs, policy, now)),
+        None => Err(ControllerError::Invariant(format!(
+            "{id} is not in the facts"
+        ))),
+    }
 }
 
 /// The row after `moved`, made at `now` in the run `desired`: the phase and the fields the
@@ -109,9 +111,7 @@ mod tests {
         let ghost = WorkerId::new("ghost");
         let now = FarmTime::from_millis(5);
         let error = decide(&facts, &ghost, &Policy::default(), now).unwrap_err();
-        assert!(
-            matches!(&error, ControllerError::Invariant(why) if why.contains("ghost")),
-            "{error}"
-        );
+        assert!(matches!(error, ControllerError::Invariant(_)));
+        assert!(error.to_string().contains("ghost"));
     }
 }
