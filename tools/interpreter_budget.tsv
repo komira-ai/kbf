@@ -34,6 +34,7 @@ crates/kbf-driver-container/tests/podman.rs	find -exec sh -c removes sibling dir
 crates/kbf-driver-container/tests/support/mod.rs	Spec::new: the real-Podman tests' action is sh -c inside the test image (busybox), which holds no kbf binary
 crates/kbf-driver-container/tests/support/real.rs	sh(): the same action naming the image's /bin/sh by path, since the action's environment has no PATH
 crates/kbf-driver-container/tests/tree.rs	data: #!/bin/sh bytes as an executable file's content in the tree write and collect tests; nothing runs them
+crates/kbf-driver-native/src/denials.rs	data: bash as the process name in a sandbox log line a parser test reads; nothing runs it
 crates/kbf-driver-native/src/network.rs	data: /bin/sh as the program in the sandbox-exec wrapping tests; nothing runs it
 crates/kbf-driver-native/src/program.rs	data: sh as the program the REAPI PATH lookup resolves; resolved, never run
 crates/kbf-driver-native/src/xcode_tests.rs	#!/bin/sh fakes of xcodebuild, xcrun and sandbox-exec inside fake Xcode apps the survey runs by path, one of them backgrounding a child that holds the output pipe (`sleep 8 &`)

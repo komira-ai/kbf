@@ -563,19 +563,29 @@ impl<C: Cas> NativeRuntime<C> {
         if !matches!(self.config.isolation, network::Isolation::Sandbox(_)) {
             return;
         }
-        let (read, file) = (self.config.denial_log, dir.join("sandbox-log"));
-        let log = match tokio::task::spawn_blocking(move || read(&file, ran)).await {
-            Ok(Ok(log)) => log,
-            Ok(Err(why)) => {
-                tracing::warn!(%lease, %why, "the sandbox's denials could not be read");
-                return;
+        // The log can show a refusal seconds after it happened, so a read that holds none
+        // of the action's own is repeated, a window wider each time, up to
+        // `denials::RETRIES` more times. A read that fails ends the report.
+        let mut found = Found::default();
+        for attempt in 0..=denials::RETRIES {
+            let (read, file) = (self.config.denial_log, dir.join("sandbox-log"));
+            let ago = ran + denials::SETTLE * 2 * u32::try_from(attempt).unwrap_or(u32::MAX);
+            let log = match tokio::task::spawn_blocking(move || read(&file, ago)).await {
+                Ok(Ok(log)) => log,
+                Ok(Err(why)) => {
+                    tracing::warn!(%lease, %why, "the sandbox's denials could not be read");
+                    return;
+                }
+                Err(why) => {
+                    tracing::warn!(%lease, %why, "the read of the sandbox's denials did not finish");
+                    return;
+                }
+            };
+            found = Found::of(&log, &pids);
+            if !found.mine.is_empty() {
+                break;
             }
-            Err(why) => {
-                tracing::warn!(%lease, %why, "the read of the sandbox's denials did not finish");
-                return;
-            }
-        };
-        let found = Found::of(&log, &pids);
+        }
         for denial in &found.mine {
             tracing::warn!(%lease, denial = %denials::shown(denial), "the sandbox denied the action");
         }

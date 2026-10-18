@@ -34,6 +34,10 @@ pub const MAX_NOTE_BYTES: usize = 4096;
 /// The longest a target is shown, in characters.
 const MAX_TARGET: usize = 300;
 
+/// How many more times a report reads the log when a read holds none of the action's own
+/// refusals: the unified log can show a kernel-reported line seconds after it happened.
+pub const RETRIES: usize = 2;
+
 /// How long [`system_log`] waits before it reads the log: the sandbox's lines reach the
 /// unified log a moment after the refusal.
 pub const SETTLE: Duration = Duration::from_secs(1);
@@ -306,8 +310,18 @@ mod tests {
     fn a_line_the_kernel_reports_under_a_subsystem_is_a_denial() {
         let d = parse_line(KERNEL_LINE).expect("a denial");
         assert_eq!(
-            (d.pid, d.process.as_str(), d.operation.as_str(), d.target.as_str()),
-            (46466, "bash", "file-write-create", "/private/var/tmp/kbf-denied-46082")
+            (
+                d.pid,
+                d.process.as_str(),
+                d.operation.as_str(),
+                d.target.as_str()
+            ),
+            (
+                46466,
+                "bash",
+                "file-write-create",
+                "/private/var/tmp/kbf-denied-46082"
+            )
         );
         let found = Found::of(KERNEL_LINE, &BTreeSet::from([46466]));
         assert_eq!(found.mine.len(), 1);

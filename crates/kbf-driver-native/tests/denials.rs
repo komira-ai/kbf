@@ -22,6 +22,11 @@ static READS: AtomicUsize = AtomicUsize::new(0);
 /// lease directory, next to `stdout`.
 fn log_with_two(file: &Path, _: Duration) -> io::Result<String> {
     READS.fetch_add(1, Ordering::SeqCst);
+    two_denials(file)
+}
+
+/// [`log_with_two`]'s text, not counted in [`READS`].
+fn two_denials(file: &Path) -> io::Result<String> {
     let out = std::fs::read_to_string(file.with_file_name("stdout"))?;
     let pid = out.trim();
     Ok(format!(
@@ -158,6 +163,41 @@ async fn a_failed_action_gets_its_own_denials_in_its_stderr() {
     let result = run(&rt, &cas, 1, &Spec::act("exit 5")).await.expect("ran");
     assert_eq!(result.exit_code, 5);
     assert_eq!(READS.load(Ordering::SeqCst), reads);
+}
+
+static LATE_READS: AtomicUsize = AtomicUsize::new(0);
+static LATE_WINDOWS: std::sync::Mutex<Vec<Duration>> = std::sync::Mutex::new(Vec::new());
+
+/// A log that shows the action's refusal from its third read on, as the unified log
+/// does for a line the kernel reports (it reaches `log show` seconds late).
+fn log_shows_it_late(file: &Path, ago: Duration) -> io::Result<String> {
+    LATE_WINDOWS.lock().expect("windows").push(ago);
+    if LATE_READS.fetch_add(1, Ordering::SeqCst) + 1 < 3 {
+        return Ok(String::new());
+    }
+    two_denials(file)
+}
+
+/// Catches a report that reads the log once: a refusal the log shows seconds after it
+/// happened (the kernel-reported line of a slot user's denied write) never reaches
+/// stderr. Also that each read looks further back than the one before, and that
+/// reads stop at the first holding the action's own refusal.
+#[tokio::test]
+async fn a_refusal_the_log_shows_late_is_still_in_stderr() {
+    let (mut config, cas) = sandboxed("denials-late");
+    config.denial_log = log_shows_it_late;
+    let rt = runtime(config, &cas);
+    let spec = Spec::act("pgid ; echo --stderr own failure ; exit 3");
+    let result = run(&rt, &cas, 1, &spec).await.expect("ran");
+    assert_eq!(result.exit_code, 3);
+    let text = stderr(&cas, &result);
+    assert!(text.contains("file-write-create /outside/mine\n"), "{text}");
+    assert_eq!(LATE_READS.load(Ordering::SeqCst), 3);
+    let windows = LATE_WINDOWS.lock().expect("windows").clone();
+    assert!(
+        windows[0] < windows[1] && windows[1] < windows[2],
+        "{windows:?}"
+    );
 }
 
 fn config_without_sandbox(dir: &Path) -> NativeConfig {
