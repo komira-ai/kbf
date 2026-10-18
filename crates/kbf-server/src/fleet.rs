@@ -697,21 +697,23 @@ mod tests {
     }
 
     /// Catches a commit shown that is not a commit (a node's text on the open listing), and
-    /// a refusal that is not cut: at a character boundary, not inside one.
+    /// a refusal that is not cut: at a character boundary, not inside one. The refusal is
+    /// one byte and then two-byte characters, so the cap falls inside the 256th character
+    /// and the cut is a byte short of it.
     #[test]
     fn a_status_is_shown_only_in_the_shape_the_wire_gives_it() {
         let status = UpdateStatus {
             running_commit: "0123456789ab".to_owned(),
             installed_commit: "a".repeat(40),
             staged_commit: String::new(),
-            // 513 bytes: the cut at 512 falls inside the last character.
-            refusal: format!("a{}", "é".repeat(MAX_REFUSAL_BYTES / 2)),
+            refusal: format!("x{}", "é".repeat(MAX_REFUSAL_BYTES)),
             ..UpdateStatus::default()
         };
         let shown = UpdateReport::new(status);
         assert_eq!(shown.running_commit, "0123456789ab");
         assert_eq!(shown.installed_commit, "a".repeat(40));
         assert_eq!(shown.staged_commit, "");
+        assert_eq!(shown.refusal, format!("x{}", "é".repeat(255)));
         assert_eq!(shown.refusal.len(), MAX_REFUSAL_BYTES - 1);
         let bad = UpdateStatus {
             running_commit: "<script>".to_owned(),
