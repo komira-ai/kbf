@@ -1436,9 +1436,11 @@ dependencies = [
  "kbf-daemon",
  "kbf-deploy",
  "kbf-driver-container",
+ "kbf-enroll",
  "kbf-front",
  "kbf-host",
  "kbf-node",
+ "kbf-peer",
  "kbf-proto",
  "kbf-server",
  "kbf-state",
@@ -1450,8 +1452,14 @@ dependencies = [
  "rcgen",
  "rustix",
  "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "time",
  "tokio",
+ "toml",
  "tonic",
+ "tracing",
+ "x509-parser",
 ]
 
 [[package]]
