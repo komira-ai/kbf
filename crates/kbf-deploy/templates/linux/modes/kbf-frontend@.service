@@ -34,6 +34,8 @@ Slice=kbf.slice
 # A frontend answering from swap would slow every build at once.
 MemorySwapMax=0
 OOMScoreAdjust=-925
+# systemd starts a unit at a soft open-file limit of 1024; a build burst passes that (EMFILE).
+LimitNOFILE=1048576
 CPUWeight=300
 # The three listeners: the REAPI one clients dial (a certificate the farm's CA did not
 # issue, such as a `tailscale cert` pair: KBF_REAPI_CERT and KBF_REAPI_KEY name the

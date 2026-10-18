@@ -131,9 +131,12 @@ impl Router {
             .ok_or_else(|| unavailable("no storage map has arrived yet".to_owned()))
     }
 
-    /// Runs `op` against the map as it is now. If a node answers `STALE_MAP`, fetches the
-    /// newer map and runs it once more against that; a second `STALE_MAP`, or a fetch
-    /// that does not bring a newer map, is UNAVAILABLE rather than a loop.
+    /// Runs `op` against the map as it is now. Each time a node answers `STALE_MAP`, fetches
+    /// the newer map and runs it again against that: the map can move several times
+    /// during one call (every member's promotion is a new generation). It stops, with
+    /// UNAVAILABLE rather than a loop, when a fetch brings no map newer than the one just
+    /// used (the generation has stopped moving where this process can see it), or after
+    /// [`MAX_MAP_REFETCHES`] fetches in one call.
     pub(crate) async fn routed<T, Fut>(
         &self,
         op: impl Fn(MapView) -> Fut,
@@ -141,12 +144,34 @@ impl Router {
     where
         Fut: Future<Output = Result<T, StorageError>>,
     {
-        let view = self.view()?;
-        let used = view.map.generation();
-        let first = op(view).await;
-        let Err(StorageError::StaleMap { current }) = first else {
-            return first;
-        };
+        let mut view = self.view()?;
+        let mut fetches = 0;
+        loop {
+            let used = view.map.generation();
+            match op(view).await {
+                Err(StorageError::StaleMap { current }) => {
+                    view = self.newer(used, current, &mut fetches).await?;
+                }
+                done => return done,
+            }
+        }
+    }
+
+    /// The map to run a call again against after a node holding generation `current`
+    /// refused the one of generation `used`: fetched, and newer than `used`.
+    async fn newer(
+        &self,
+        used: u64,
+        current: u64,
+        fetches: &mut usize,
+    ) -> Result<MapView, StorageError> {
+        if *fetches == MAX_MAP_REFETCHES {
+            return Err(unavailable(format!(
+                "the storage map moved {fetches} times during one call; a node now holds \
+                 generation {current}"
+            )));
+        }
+        *fetches += 1;
         let fresh = self
             .maps
             .refetch(current)
@@ -158,14 +183,13 @@ impl Router {
                 fresh.map.generation()
             )));
         }
-        match op(fresh).await {
-            Err(StorageError::StaleMap { current }) => Err(unavailable(format!(
-                "a node holds map generation {current}, newer than the map just fetched"
-            ))),
-            done => done,
-        }
+        Ok(fresh)
     }
 }
+
+/// The most map fetches one routed call makes when nodes keep answering `STALE_MAP`: room
+/// for a run of promotions during one call, and a bound on a map that never settles.
+pub const MAX_MAP_REFETCHES: usize = 8;
 
 /// This generation's read order of `digest`, then the previous generation's.
 pub(crate) fn read_order<'a>(view: &'a MapView, digest: &Digest) -> Vec<&'a Member> {
