@@ -311,7 +311,7 @@ pub fn dispatch_helpers() -> Option<ExitCode> {
         return Some(code);
     }
     // So is the `as-user` step an action of the lease-user pool starts through
-    // (`launchctl asuser <uid> kbf-daemon __as-user ...`).
+    // (`launchctl asuser <uid> kbf __as-user ...`).
     #[cfg(target_os = "macos")]
     if let Some(code) = kbf_driver_native::slots::dispatch() {
         return Some(code);

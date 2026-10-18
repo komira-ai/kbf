@@ -15,7 +15,11 @@
 //!   to it.
 //! - Run as `kbf`, it prints `kbf 0.1.0+<stamp>` for `--version`, with the stamp from the
 //!   file `kbf.stamp` next to it, and for `--version --json` the contents of the file
-//!   `kbf.json` next to it (the identity a test wrote for it, to plant a bad one).
+//!   `kbf.json` next to it (the identity a test wrote for it, to plant a bad one). With
+//!   no `kbf.stamp` next to it, it reads both from a trailer on its own file (`kbf_says`
+//!   below), so a copy packaged into a tarball and extracted elsewhere says what the
+//!   tarball's bytes say. With `XTASK_FAKE_ANNOUNCE` set, it also prints the path it was
+//!   run as on stderr.
 //! - Run as `kbf-installer`, it is the STUB of the real kbf-installer, which the package
 //!   build and its macOS install test ship until the real tool is built there (one path
 //!   change in `crates/xtask/tests/pkg_macos.rs`): it prints `kbf-installer-stub` and
@@ -79,19 +83,43 @@ fn server(argv0: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `kbf --version` and `kbf --version --json`, from the files next to the fake.
+/// What follows the fake's own bytes in a copy a test packaged as `kbf`: this marker, the
+/// stamp, a line end, then what `--version --json` prints.
+const TRAILER: &[u8] = b"\nxtask-fake-kbf\n";
+
+/// The stamp and the `--version --json` output of `kbf`: the files `<argv0>.stamp` and
+/// `<argv0>.json` next to the fake when there is a stamp file; else the [`TRAILER`] at
+/// the end of its own file, for a copy taken out of a release tarball, which has no
+/// files next to it, so the tarball's bytes decide what it says.
+fn kbf_says(argv0: &str) -> (String, String) {
+    if let Ok(stamp) = std::fs::read_to_string(format!("{argv0}.stamp")) {
+        let json = std::fs::read_to_string(format!("{argv0}.json")).expect("json file");
+        return (stamp, json);
+    }
+    let bytes = std::fs::read(argv0).expect("the fake's own file");
+    // The last one: the fake's own code holds the marker too.
+    let at = bytes
+        .windows(TRAILER.len())
+        .rposition(|w| w == TRAILER)
+        .expect("a stamp file next to the fake, or a trailer on it");
+    let text = String::from_utf8(bytes[at + TRAILER.len()..].to_vec()).expect("utf-8 trailer");
+    let (stamp, json) = text.split_once('\n').expect("a stamp line in the trailer");
+    (stamp.to_owned(), json.to_owned())
+}
+
+/// `kbf --version` and `kbf --version --json`, as [`kbf_says`] has them.
 fn kbf(argv0: &str, args: &[String]) -> ExitCode {
+    // Where a test sees which file was run.
+    if std::env::var_os("XTASK_FAKE_ANNOUNCE").is_some() {
+        eprintln!("xtask-fake: kbf runs as {argv0}");
+    }
     if args == ["--version", "--json"] {
         if defect("json-fails") {
             return ExitCode::FAILURE;
         }
-        print!(
-            "{}",
-            std::fs::read_to_string(format!("{argv0}.json")).expect("json file")
-        );
+        print!("{}", kbf_says(argv0).1);
     } else {
-        let stamp = std::fs::read_to_string(format!("{argv0}.stamp")).expect("stamp file");
-        println!("kbf 0.1.0+{stamp}");
+        println!("kbf 0.1.0+{}", kbf_says(argv0).0);
     }
     ExitCode::SUCCESS
 }
