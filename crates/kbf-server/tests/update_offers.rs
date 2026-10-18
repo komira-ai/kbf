@@ -487,6 +487,20 @@ async fn an_unknown_or_incomplete_platform_is_offered_nothing() {
     }
 }
 
+/// Catches tasks that outlive their frontend: the polling of the table and the sending task of
+/// each session end when the offers are gone (a stopped frontend). Nothing shows from outside;
+/// the tasks end or the process leaks them, and the instrumented run sees which.
+#[tokio::test]
+async fn a_stopped_frontend_ends_its_offer_tasks() {
+    let front = start();
+    linux(&front, A).await;
+    front.desire(A).await;
+    let mut node = linux_node(&front, "n1").await;
+    assert_eq!(offer(&mut node).await.generation, 1);
+    drop(front);
+    tokio::time::sleep(QUIET).await;
+}
+
 /// Catches an `UpdateStatus` that is not read, and a node that never sent one listed as
 /// anything but `unsupported`: node `new` reports and is listed with its commits, state and
 /// helper facts (a state this server does not know is `unknown`); the newest status replaces
