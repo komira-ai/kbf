@@ -287,7 +287,7 @@ fn run_in(name: &str, files: Release, args: &[&str], extra_path: Option<&Path>, 
 ///
 /// The copy leaves `to` open for writing in any child another test thread forked
 /// meanwhile, until that child execs; exec of such a file is `ETXTBSY` (komira-ai/
-/// komira-build-farm#1073). Callers here do not exec it themselves: `install.sh` does,
+/// kbf#1073). Callers here do not exec it themselves: `install.sh` does,
 /// in a child this test cannot retry. So wait here, once, with a harmless call (the
 /// fake run as `uname -s`, by `arg0`). One successful exec means no holder of the write
 /// descriptor is left, and none can appear later, since a fork after the copy returned
@@ -965,9 +965,7 @@ fn the_default_release_url_is_this_repositorys_latest_release() {
     // default is not fetched here: no test downloads from the internet.)
     let script = std::fs::read_to_string(SCRIPT).expect("script");
     assert!(
-        script.contains(
-            "release_url=https://github.com/komira-ai/komira-build-farm/releases/latest/download\n"
-        ),
+        script.contains("release_url=https://github.com/komira-ai/kbf/releases/latest/download\n"),
         "the default release URL changed; this test names it on purpose"
     );
 }

@@ -1,6 +1,6 @@
 //! `kbf-all-in-one`: the farm server and a worker daemon in one process, for a one-node
 //! Linux farm (the README says what it does today and what it does not do yet; the
-//! design is komira-build-farm#657). The daemon's blobs move through calls into
+//! design is kbf#657). The daemon's blobs move through calls into
 //! the server's cache ([`LocalDataPlane`]), not over the network; its control plane
 //! (`Hello`, leases, heartbeats, results) is the remote daemon's, over mutual TLS to the
 //! server half's worker listener on loopback.

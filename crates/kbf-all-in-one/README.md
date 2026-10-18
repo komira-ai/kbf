@@ -3,7 +3,7 @@
 The farm server and a worker daemon in one process, for a one-node Linux farm. The
 daemon's blobs move through calls into the server's cache instead of over the network;
 everything else is what `kbf-server` and `kbf-daemon` do on one host today. The design
-is in komira-build-farm#657.
+is in kbf#657.
 
 Linux only, the container driver only. Elsewhere the binary exits 2 and says to run
 `kbf-server` and `kbf-daemon`.

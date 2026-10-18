@@ -178,8 +178,8 @@ gh attestation trusted-root > trusted_root.jsonl      # on a machine with networ
 gh attestation verify <tarball> \
   --bundle <tarball>.sigstore.json \
   --custom-trusted-root trusted_root.jsonl \
-  --repo komira-ai/komira-build-farm \
-  --signer-workflow komira-ai/komira-build-farm/.github/workflows/artifacts.yml \
+  --repo komira-ai/kbf \
+  --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml \
   --cert-oidc-issuer https://token.actions.githubusercontent.com \
   --source-ref refs/heads/main \
   --source-digest <commit> \
@@ -187,6 +187,14 @@ gh attestation verify <tarball> \
   --deny-self-hosted-runners
 ```
 
+- Renamed repository: the repository was `komira-ai/komira-build-farm` before it became
+  `komira-ai/kbf`, and a certificate carries the name at signing time (GitHub redirects
+  the old name for git and the API, not inside a signature). A release attested before the
+  rename verifies only with `--repo komira-ai/komira-build-farm` and
+  `--signer-workflow komira-ai/komira-build-farm/.github/workflows/artifacts.yml`.
+  `gh` offers no repository-id flag, so the name is what is pinned. The installer
+  ([`kbf-installer`](../crates/kbf-installer/src/attest.rs)) tries the new name, then
+  the old, for one release cycle; the old pair is then deleted (`FORMER_REPO`).
 - `--source-digest <commit>`: the commit the host is installing (the one in the
   tarball's name). Without it an attestation made for any commit of the branch that
   built the same bytes would verify; with it the signed commit must be the one asked for.
@@ -316,8 +324,8 @@ verifies with the same command, as its bytes are the attested ones.
 
 ```text
 gh attestation verify kbf-daemon-<commit>-darwin-arm64.tar.gz \
-  --repo komira-ai/komira-build-farm \
-  --signer-workflow komira-ai/komira-build-farm/.github/workflows/artifacts.yml \
+  --repo komira-ai/kbf \
+  --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml \
   --source-ref refs/heads/main \
   --deny-self-hosted-runners
 ```
