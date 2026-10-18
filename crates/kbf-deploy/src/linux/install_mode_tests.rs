@@ -506,6 +506,39 @@ fn a_missing_memory_controller_or_a_held_port_is_refused() {
     }
 }
 
+/// A listener on a port that merely contains the unit's port as a prefix or a suffix
+/// (`:18080`, `:80801`, IPv6 `[::]:18080` for `:8080`) does not hold it. Catches the
+/// held-port match loosened from "ends with `:port`" to "contains `:port`", which would
+/// refuse an install whose port is free.
+#[test]
+fn listeners_on_look_alike_ports_do_not_hold_the_units_port() {
+    for mode in Mode::ALL
+        .into_iter()
+        .filter(|m| *m != Mode::StorageAndDaemon && *m != Mode::Daemon)
+    {
+        let (exec, world) = host(&format!("install-mode-lookalike-{mode}"));
+        let a = install(mode, None);
+        let text = modes::render(&a.config, Some(1500), mode).expect("renders");
+        let rendered = UnitFile::parse(&text).expect("unit");
+        let mut any = false;
+        for flag in LISTEN_FLAGS {
+            if let Some(v) = rendered.flag(flag) {
+                let port = v.rsplit_once(':').expect("host:port").1;
+                let mut w = world.borrow_mut();
+                w.listening
+                    .push_str(&format!("LISTEN 0 4096 192.0.2.10:1{port} 0.0.0.0:*\n"));
+                w.listening
+                    .push_str(&format!("LISTEN 0 4096 192.0.2.10:{port}1 0.0.0.0:*\n"));
+                w.listening
+                    .push_str(&format!("LISTEN 0 4096 [::]:1{port} [::]:*\n"));
+                any = true;
+            }
+        }
+        assert!(any, "{mode} has a listener");
+        plan_here(&exec, &a).expect("look-alike ports are free");
+    }
+}
+
 /// A unit of the mode that is running keeps its ports (a re-install must not refuse
 /// itself, and `ss` is not asked), and a mode that runs builds on a host with no active
 /// swap prints the warning while the modes that cannot swap stay quiet. Catches a
