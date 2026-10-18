@@ -93,7 +93,7 @@ pub use kbf_route::Liveness;
 #[cfg(target_os = "linux")]
 pub use local::{LOCAL_DRIVER, LocalRuntime};
 pub use map::{HeldMaps, REFETCH_WITHIN};
-pub use plane::{FarmCas, FarmLease, LocalMember, member_cas, storage_nodes};
+pub use plane::{FarmCas, FarmLease, LocalMember, StorageNodes, member_cas, storage_nodes};
 pub use report::{Capacity, NodeReport};
 pub use runtime::{FakeRuntime, Runtime, RuntimeError, UPLOAD_DEADLINE, Work, upload_within};
 pub use runtimes::{KindServedTwice, Runtimes};
