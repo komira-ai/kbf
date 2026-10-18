@@ -533,10 +533,22 @@ fn a_write_through_the_proxy_needs_the_token_and_the_secret() {
 
 // ---- the HTTP layer ----------------------------------------------------------------
 
-/// A router whose one route answers with the trust its handler was given.
+/// A router whose one route answers with the trust its handler was given, the peer address,
+/// and the `x-kbf-*` headers it can still see (sorted, comma separated).
 fn echo(proxy: Option<Arc<ProxySecret>>, layered: bool) -> Router {
-    async fn handler(caller: Caller) -> String {
-        format!("{:?} {}", caller.trust, caller.addr)
+    async fn handler(caller: Caller, headers: HeaderMap) -> String {
+        let mut reserved: Vec<&str> = headers
+            .keys()
+            .map(HeaderName::as_str)
+            .filter(|name| name.starts_with("x-kbf-"))
+            .collect();
+        reserved.sort_unstable();
+        format!(
+            "{:?} {} [{}]",
+            caller.trust,
+            caller.addr,
+            reserved.join(",")
+        )
     }
     let router = Router::new().route("/", get(handler));
     if layered {
@@ -573,13 +585,14 @@ async fn the_http_layer_applies_the_decision() {
     let (code, body) = call(&mut proxied, Some(LOOPBACK), &proxied_headers()).await;
     assert_eq!(code, StatusCode::OK);
     assert!(
-        body.starts_with("Proxied(Identity { node_id: Some(\"node-a\"), role: Some(Daemon) })"),
+        body.starts_with("Proxied(Identity { node_id: Some(\"node-a\"), role: Some(Daemon) })")
+            && body.ends_with(" []"),
         "{body}"
     );
     let (code, body) = call(&mut proxied, Some(LOOPBACK), &headers(&[(NODE_ID, "n")])).await;
     assert_eq!(
         (code, body.as_str()),
-        (StatusCode::OK, "Unverified 127.0.0.1:4000")
+        (StatusCode::OK, "Unverified 127.0.0.1:4000 []")
     );
     for peer in [Some(REMOTE), None] {
         let (code, body) = call(&mut proxied, peer, &proxied_headers()).await;
@@ -595,14 +608,18 @@ async fn the_http_layer_applies_the_decision() {
     let (code, body) = call(&mut direct, Some(REMOTE), &proxied_headers()).await;
     assert_eq!(
         (code, body.as_str()),
-        (StatusCode::OK, "Direct 192.0.2.10:4000")
+        (StatusCode::OK, "Direct 192.0.2.10:4000 []")
     );
 
     let mut bare = echo(None, false);
     let (code, body) = call(&mut bare, Some(LOOPBACK), &proxied_headers()).await;
     assert_eq!(
         (code, body.as_str()),
-        (StatusCode::OK, "Direct 127.0.0.1:4000")
+        (
+            StatusCode::OK,
+            "Direct 127.0.0.1:4000 [x-kbf-node-id,x-kbf-proxy-auth,x-kbf-role]"
+        ),
+        "with no layer the headers are still there: the layer is what removes them"
     );
     let (code, _) = call(&mut bare, None, &HeaderMap::new()).await;
     assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
