@@ -216,7 +216,7 @@ impl State {
     /// Forgets the oldest entries, from every index they are in, until the rest fit in
     /// `limit` bytes.
     fn trim(&mut self, limit: usize) {
-        let (mut freed, mut count) = (0, 0);
+        let (mut freed, mut count) = (0, 0_usize);
         for entry in &self.runs {
             if self.bytes - freed <= limit {
                 break;

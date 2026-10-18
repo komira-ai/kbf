@@ -67,5 +67,7 @@ pub use reader::{
 pub use rows::{Mark, RingRun, ShapeKind, ShapeRow, StatusKind, StatusRow, Verdict};
 pub use run_id::{Minted, Minter, RunId, StreamId};
 pub use scoped::Scoped;
-pub use today::{ActionKey, MAX_EXAMINED, TODAY_BYTES, Today, TodayCursor, TodayPage, TodayQuery, TodayRun};
+pub use today::{
+    ActionKey, MAX_EXAMINED, TODAY_BYTES, Today, TodayCursor, TodayPage, TodayQuery, TodayRun,
+};
 pub use writer::{Drops, Limits, SLOWEST, Writer};
