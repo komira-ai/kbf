@@ -20,6 +20,8 @@ serde.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
+# `sync` only: the hold gate's doorbell is a `watch` channel, written from a guard's drop.
+tokio = { workspace = true, features = ["sync"] }
 toml.workspace = true
 
 [dev-dependencies]

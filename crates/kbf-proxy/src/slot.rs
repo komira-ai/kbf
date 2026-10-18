@@ -13,13 +13,23 @@
 //! may then hold and quiesce that slot, and the stream may dispatch afterwards (a pool-queued
 //! stream does this routinely). That case is expected. Its safety net is the fenced answer and
 //! the retry that re-enters [`ActiveSlot::bind`] (see [`crate::replay`]).
+//!
+//! **One gate word.** The active slot, the hold flag, the hold's bound and a hold sequence
+//! number are bits of one `AtomicU64`, and every change is one compare-and-swap on it, so a
+//! stream reads them together and a rejected [`ActiveSlot::hold`] cannot touch a hold in force.
+//!
+//! **How a hold ends.** [`ActiveSlot::release_into`] ends it into a named slot, atomically.
+//! Dropping the [`HoldGuard`] ends it into nothing: the held streams fail `UNAVAILABLE`,
+//! because a supervisor that vanished mid-swap cannot say which child is right. Neither
+//! guesses a default slot.
 
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 /// One of the two fixed child slots. Its text form is `"a"` or `"b"`, in `FromStr`,
 /// `Display` and serde: the one spelling `update.json` and the status JSON use.
@@ -82,7 +92,7 @@ impl Slot {
         }
     }
 
-    const fn gate_bits(self) -> u8 {
+    const fn gate_bits(self) -> u64 {
         match self {
             Self::A => 1,
             Self::B => 2,
@@ -95,21 +105,49 @@ impl Slot {
 const CLOSED: u64 = 1 << 63;
 const RETIRED: u64 = 1 << 62;
 const FLAGS: u64 = CLOSED | RETIRED;
-/// Gate word: bits 0-1 name the active slot (0 none, 1 A, 2 B), bit 2 is the hold flag.
-const HOLD: u8 = 0b100;
-const ACTIVE_MASK: u8 = 0b011;
+/// Gate word: bits 0-1 name the active slot (0 none, 1 A, 2 B), bit 2 is the hold flag, bits
+/// 8-39 the bound of the hold in force in milliseconds (0 when not holding), bits 40-63 the
+/// sequence number of the latest hold (kept after it ends; a guard acts only on its own, and
+/// a guard would need 2^24 later holds to alias).
+const HOLD: u64 = 0b100;
+const ACTIVE_MASK: u64 = 0b011;
+const MS_SHIFT: u32 = 8;
+const SEQ_SHIFT: u32 = 40;
+const SEQ_MASK: u64 = 0xFF_FFFF << SEQ_SHIFT;
+
+fn pack_ms(hold_max: Duration) -> u64 {
+    u64::from(u32::try_from(hold_max.as_millis()).unwrap_or(u32::MAX)) << MS_SHIFT
+}
+
+const fn seq_of(gate: u64) -> u64 {
+    gate >> SEQ_SHIFT
+}
 
 struct Inner {
-    gate: AtomicU8,
+    gate: AtomicU64,
     slots: [AtomicU64; 2],
     /// Counts the opens of each slot: the key of that slot's upstream connections.
     generations: [AtomicU64; 2],
-    /// Counts releases. A held stream samples it before it binds and waits for it to move.
+    /// Counts the ends of a hold. A held stream samples it before it binds and waits for it to move.
     epoch: AtomicU64,
-    /// The bound of the hold in force, in milliseconds.
-    hold_max_ms: AtomicU64,
-    /// Streams accepted and not yet bound, plus streams that never bind (update API, probes).
-    pending: AtomicU64,
+    /// The doorbell: mirrors `epoch` for tasks that sleep on it. Written only by `ring`.
+    doorbell: watch::Sender<u64>,
+    /// Holds that ended by their guard's drop: nobody released them into a slot.
+    abandoned: AtomicU64,
+    /// One count of every live `Pending` and every live `Permit`. A stream that holds both
+    /// counts twice for an instant; the point is that the count is one word, so a stream that
+    /// hands over from one to the other (accept to bind, or a retry) is never missed.
+    live: AtomicU64,
+}
+
+impl Inner {
+    /// Called after the gate changed, by every path that ends a hold: moves the epoch, then
+    /// rings the doorbell, so a task that wakes finds the new gate and a new epoch. It lives
+    /// here so the guard's drop and `release_into` cannot differ.
+    fn ring(&self) {
+        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.doorbell.send_replace(epoch);
+    }
 }
 
 /// The outcome of [`ActiveSlot::bind`].
@@ -134,8 +172,12 @@ pub enum Bind {
 /// The outcome of [`ActiveSlot::retire`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Retire {
-    /// The slot was retired (now or before); no stream is bound to it and none can bind.
+    /// This call retired the slot: no stream is bound to it and none can bind. The only
+    /// answer a supervisor acts on (it signals the child).
     Closed,
+    /// An earlier call retired it and it has not been opened since: nothing to do, signal no
+    /// one (a re-run of the retire step after an actor restart lands here).
+    AlreadyClosed,
     /// The slot was never opened: nothing to retire, and not proof that a child is gone.
     NeverOpened,
     /// The slot is the active one; swap first.
@@ -183,32 +225,34 @@ impl ActiveSlot {
     /// A handle with both slots closed, nothing active and no hold.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_gate(0, 0)
+        Self::with_gate(0)
     }
 
-    fn with_gate(gate: u8, hold_max_ms: u64) -> Self {
+    fn with_gate(gate: u64) -> Self {
         Self {
             inner: Arc::new(Inner {
-                gate: AtomicU8::new(gate),
+                gate: AtomicU64::new(gate),
                 slots: [AtomicU64::new(CLOSED), AtomicU64::new(CLOSED)],
                 generations: [AtomicU64::new(0), AtomicU64::new(0)],
                 epoch: AtomicU64::new(0),
-                hold_max_ms: AtomicU64::new(hold_max_ms),
-                pending: AtomicU64::new(0),
+                doorbell: watch::channel(0).0,
+                abandoned: AtomicU64::new(0),
+                live: AtomicU64::new(0),
             }),
         }
     }
 
     /// A handle that is holding from its first instant, for a proxy that starts and must
     /// adopt running children before it serves: streams accepted meanwhile wait up to
-    /// `hold_max` instead of failing with `NoActive`. The supervisor ends the hold by
-    /// releasing the guard once adoption is done.
+    /// `hold_max` instead of failing with `NoActive`. The supervisor ends the hold with
+    /// [`ActiveSlot::release_into`] once adoption is done; the guard dropped first ends it into
+    /// nothing.
     #[must_use]
     pub fn starting(hold_max: Duration) -> (Self, HoldGuard) {
-        let ms = u64::try_from(hold_max.as_millis()).unwrap_or(u64::MAX);
-        let slots = Self::with_gate(HOLD, ms);
+        let slots = Self::with_gate(HOLD | pack_ms(hold_max) | (1 << SEQ_SHIFT));
         let guard = HoldGuard {
             inner: Arc::clone(&slots.inner),
+            seq: 1,
         };
         (slots, guard)
     }
@@ -219,7 +263,7 @@ impl ActiveSlot {
         Self::decode(self.inner.gate.load(Ordering::Acquire))
     }
 
-    fn decode(gate: u8) -> Option<Slot> {
+    fn decode(gate: u64) -> Option<Slot> {
         Slot::ALL
             .into_iter()
             .find(|slot| gate & ACTIVE_MASK == slot.gate_bits())
@@ -231,16 +275,37 @@ impl ActiveSlot {
         self.inner.gate.load(Ordering::Acquire) & HOLD != 0
     }
 
-    /// The release epoch: moves on every release.
+    /// The release epoch: moves each time a hold ends, whichever way.
     #[must_use]
     pub fn epoch(&self) -> u64 {
         self.inner.epoch.load(Ordering::Acquire)
+    }
+
+    /// The doorbell a held stream sleeps on: the receiver's value is the epoch, written by the
+    /// same code that ends the hold (including a guard's drop on a panic). A waiter parks on
+    /// `wait_for(|e| *e != sampled)` and, on every wake, re-reads [`ActiveSlot::epoch`] before
+    /// it decides: the atomic is the truth, the channel only wakes the task.
+    #[must_use]
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.inner.doorbell.subscribe()
+    }
+
+    /// Holds that ended by a guard's drop instead of a release into a slot
+    /// (`kbf_proxy_hold_abandoned_total`): a supervisor that panicked or was cancelled.
+    #[must_use]
+    pub fn abandoned_holds(&self) -> u64 {
+        self.inner.abandoned.load(Ordering::Acquire)
     }
 
     /// Opens `slot` for binds (its child is ready) and returns its generation. A slot that
     /// is open already keeps its generation; opening a closed or retired slot starts a new
     /// one, so the upstream connections of the previous child are never reused. A retired
     /// slot can be opened again: slots are reused (A, B, A).
+    ///
+    /// Respawning a child in an open slot (the slot is not closed) is not an open: the caller
+    /// stops the child, `clear_active`s the slot if it is active, polls [`ActiveSlot::retire`]
+    /// to `Closed`, and only then opens it again. Skipping the retire leaves the old generation,
+    /// and with it the pool of the dead process.
     pub fn open(&self, slot: Slot) -> u64 {
         let word = &self.inner.slots[slot.index()];
         let generation = &self.inner.generations[slot.index()];
@@ -283,35 +348,69 @@ impl ActiveSlot {
             .inner
             .gate
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |g| {
-                Some((g & HOLD) | slot.gate_bits())
+                Some((g & !ACTIVE_MASK) | slot.gate_bits())
             });
         Ok(())
     }
 
-    /// Makes no slot active, keeping the hold flag: the old child was stopped and the
-    /// candidate failed, so a release must answer `NoActive` at once rather than bind
-    /// streams to a dead child and let them wait out the connect timeout.
+    /// Makes no slot active, keeping the hold (and its bound) in force: the child was stopped,
+    /// so a release must answer `NoActive` at once rather than bind streams to a dead child
+    /// and let them wait out the connect timeout. Also the first step of a respawn.
     pub fn clear_active(&self) {
-        self.inner.gate.fetch_and(HOLD, Ordering::AcqRel);
+        self.inner.gate.fetch_and(!ACTIVE_MASK, Ordering::AcqRel);
     }
 
-    /// Starts holding new streams for at most `hold_max`. The hold ends when the returned
-    /// guard is released or dropped, so a supervisor that panics or is cancelled between the
-    /// hold and its release does not leave the gate held. Single writer (the supervisor).
+    /// Makes `slot` the active one and ends the hold, in one compare-and-swap: a stream sees
+    /// the old gate (held) or the new one (bound to `slot`), never a mix, and every held
+    /// stream then binds into `slot`. With nothing held it only sets the active slot and rings
+    /// nothing. It works on any hold, a guard's or an adopted one (`starting`), and into the
+    /// old slot after a rollback. A guard of the ended hold becomes inert: its drop does
+    /// nothing. Single writer (the supervisor).
     ///
     /// # Errors
-    /// [`AlreadyHolding`]: a hold is in force.
-    pub fn hold(&self, hold_max: Duration) -> Result<HoldGuard, AlreadyHolding> {
-        let ms = u64::try_from(hold_max.as_millis()).unwrap_or(u64::MAX);
-        self.inner.hold_max_ms.store(ms, Ordering::Release);
-        self.inner
+    /// [`SwapError::Closed`]: the slot is closed; the gate is unchanged and a hold stays in
+    /// force.
+    pub fn release_into(&self, slot: Slot) -> Result<(), SwapError> {
+        if self.inner.slots[slot.index()].load(Ordering::Acquire) & CLOSED != 0 {
+            return Err(SwapError::Closed);
+        }
+        let before = self
+            .inner
             .gate
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |g| {
-                (g & HOLD == 0).then_some(g | HOLD)
+                Some((g & SEQ_MASK) | slot.gate_bits())
+            })
+            .unwrap_or_else(|g| g);
+        if before & HOLD != 0 {
+            self.inner.ring();
+        }
+        Ok(())
+    }
+
+    /// Starts holding new streams to the backends for at most `hold_max` (the update API and
+    /// the probes bypass it; see `route::bypasses_hold`). The bound is stored in the same word
+    /// and the same compare-and-swap as the hold flag. Dropping the returned guard before
+    /// [`ActiveSlot::release_into`] ends the hold into nothing. Single writer (the supervisor).
+    ///
+    /// # Errors
+    /// [`AlreadyHolding`]: a hold is in force. Nothing changes: the hold in force keeps its
+    /// bound and its guard.
+    pub fn hold(&self, hold_max: Duration) -> Result<HoldGuard, AlreadyHolding> {
+        let before = self
+            .inner
+            .gate
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |g| {
+                (g & HOLD == 0).then_some(
+                    (g & ACTIVE_MASK)
+                        | HOLD
+                        | pack_ms(hold_max)
+                        | (((seq_of(g) + 1) << SEQ_SHIFT) & SEQ_MASK),
+                )
             })
             .map_err(|_| AlreadyHolding)?;
         Ok(HoldGuard {
             inner: Arc::clone(&self.inner),
+            seq: (seq_of(before) + 1) & (SEQ_MASK >> SEQ_SHIFT),
         })
     }
 
@@ -320,20 +419,25 @@ impl ActiveSlot {
     /// that never binds. [`ActiveSlot::open_streams`] includes it.
     #[must_use]
     pub fn begin_stream(&self) -> Pending {
-        self.inner.pending.fetch_add(1, Ordering::AcqRel);
+        self.inner.live.fetch_add(1, Ordering::AcqRel);
         Pending {
             inner: Arc::clone(&self.inner),
         }
     }
 
-    /// Streams in flight: both slots' permits plus the pending ones. A hint for
-    /// restart-on-idle, not a barrier: a connection still in its handshake is not counted,
-    /// and the restart race is accepted. Only [`ActiveSlot::retire`] is authoritative.
+    /// Whether any stream is in flight, as a count: the live `Pending` guards plus the live
+    /// permits. A hint for restart-on-idle, not a barrier: a connection still in its handshake
+    /// is not counted, and the restart race is accepted. Only [`ActiveSlot::retire`] is
+    /// authoritative.
+    ///
+    /// Read it for `== 0`, not as an exact number: a stream holding a `Pending` and a permit
+    /// counts twice. It is one word, and a stream takes its permit before it drops its
+    /// `Pending`, and a retry calls [`ActiveSlot::begin_stream`] before it drops its old permit,
+    /// so it never reads 0 while a stream lives. (Summing the two slot words and a separate
+    /// pending count cannot give that: either read order misses one of the two hand-overs.)
     #[must_use]
     pub fn open_streams(&self) -> u64 {
-        self.open_permits(Slot::A)
-            + self.open_permits(Slot::B)
-            + self.inner.pending.load(Ordering::Acquire)
+        self.inner.live.load(Ordering::Acquire)
     }
 
     /// Binds a stream whose headers just arrived.
@@ -346,7 +450,7 @@ impl ActiveSlot {
             if gate & HOLD != 0 {
                 return Bind::Held {
                     epoch,
-                    hold_max: Duration::from_millis(self.inner.hold_max_ms.load(Ordering::Acquire)),
+                    hold_max: Duration::from_millis((gate >> MS_SHIFT) & 0xFFFF_FFFF),
                 };
             }
             let Some(slot) = Self::decode(gate) else {
@@ -370,10 +474,14 @@ impl ActiveSlot {
                 (s & CLOSED == 0).then_some(s + 1)
             })
             .ok()
-            .map(|_| Permit {
-                inner: Arc::clone(&self.inner),
-                slot,
-                generation: self.generation(slot),
+            .map(|_| {
+                // After the permit exists, so no instant has a permit that `live` does not see.
+                self.inner.live.fetch_add(1, Ordering::AcqRel);
+                Permit {
+                    inner: Arc::clone(&self.inner),
+                    slot,
+                    generation: self.generation(slot),
+                }
             })
     }
 
@@ -392,7 +500,9 @@ impl ActiveSlot {
 
     /// Closes `slot` if it is not active and has no permit. This is the commit, called after
     /// bake and only then: it is necessary but not sufficient, since the supervisor must also
-    /// see the child's own `open_streams` and `open_sessions` at 0. Call from one task (the
+    /// see the child's own `open_streams` and `open_sessions` at 0. A stopped child needs no
+    /// bake: poll this until `Closed`, since its sockets are gone and the permits drain.
+    /// Call from one task (the
     /// supervisor): a concurrent `set_active` to the same slot is not supported.
     #[must_use]
     pub fn retire(&self, slot: Slot) -> Retire {
@@ -407,31 +517,36 @@ impl ActiveSlot {
         ) {
             Ok(_) => Retire::Closed,
             Err(s) if s == CLOSED => Retire::NeverOpened,
-            Err(s) if s & CLOSED != 0 => Retire::Closed,
+            Err(s) if s & CLOSED != 0 => Retire::AlreadyClosed,
             Err(s) => Retire::Busy(s),
         }
     }
 }
 
-/// A hold in force. Releasing or dropping it clears the hold flag, then moves the release
-/// epoch (in that order: a waiter that wakes on the epoch must find the gate open).
+/// A hold in force. Dropping it while the hold is still in force ends the hold **into
+/// nothing**: no slot is active, every held stream and every later one gets `UNAVAILABLE`
+/// until the supervisor sets one, and [`ActiveSlot::abandoned_holds`] ticks. The supervisor
+/// that wants a slot calls [`ActiveSlot::release_into`] first, which makes the drop inert.
+/// This is the consumer's call (U7b), not a default: a guard that released to the active slot
+/// on a panic would bind streams to a quiesced child.
 #[derive(Debug)]
 pub struct HoldGuard {
     inner: Arc<Inner>,
-}
-
-impl HoldGuard {
-    /// Ends the hold now. The held streams then bind, each through [`ActiveSlot::bind`], to
-    /// whichever slot is active.
-    pub fn release(self) {
-        drop(self);
-    }
+    seq: u64,
 }
 
 impl Drop for HoldGuard {
     fn drop(&mut self) {
-        self.inner.gate.fetch_and(!HOLD, Ordering::AcqRel);
-        self.inner.epoch.fetch_add(1, Ordering::AcqRel);
+        let mine = self
+            .inner
+            .gate
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |g| {
+                (g & HOLD != 0 && seq_of(g) == self.seq).then_some(g & SEQ_MASK)
+            });
+        if mine.is_ok() {
+            self.inner.abandoned.fetch_add(1, Ordering::AcqRel);
+            self.inner.ring();
+        }
     }
 }
 
@@ -443,7 +558,7 @@ pub struct Pending {
 
 impl Drop for Pending {
     fn drop(&mut self) {
-        self.inner.pending.fetch_sub(1, Ordering::AcqRel);
+        self.inner.live.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -485,273 +600,9 @@ impl std::fmt::Debug for Inner {
 impl Drop for Permit {
     fn drop(&mut self) {
         self.inner.slots[self.slot.index()].fetch_sub(1, Ordering::AcqRel);
+        self.inner.live.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::AtomicBool;
-
-    const HOLD_MAX: Duration = Duration::from_secs(20);
-
-    fn live() -> ActiveSlot {
-        let s = ActiveSlot::new();
-        s.open(Slot::A);
-        s.set_active(Slot::A).expect("A is open");
-        s
-    }
-
-    fn bound(s: &ActiveSlot) -> Permit {
-        match s.bind() {
-            Bind::Bound(p) => p,
-            other => panic!("expected a permit, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn streams_stay_on_the_slot_they_bound_to() {
-        let s = live();
-        let old: Vec<Permit> = (0..200).map(|_| bound(&s)).collect();
-        s.open(Slot::B);
-        s.set_active(Slot::B).expect("B is open");
-        assert_eq!(bound(&s).slot(), Slot::B);
-        assert!(old.iter().all(|p| p.slot() == Slot::A));
-        assert_eq!(s.open_permits(Slot::A), 200);
-        assert_eq!(s.retire(Slot::A), Retire::Busy(200));
-        drop(old);
-        assert_eq!(s.retire(Slot::A), Retire::Closed);
-        assert_eq!(s.retire(Slot::A), Retire::Closed);
-    }
-
-    #[test]
-    fn the_active_slot_is_not_retired_and_a_never_opened_one_says_so() {
-        let s = live();
-        assert_eq!(s.retire(Slot::A), Retire::Current);
-        assert_eq!(s.retire(Slot::B), Retire::NeverOpened);
-        s.open(Slot::B);
-        assert_eq!(s.retire(Slot::B), Retire::Closed);
-        assert_eq!(s.retire(Slot::B), Retire::Closed);
-    }
-
-    #[test]
-    fn can_retire_is_a_probe_that_latches_nothing() {
-        let s = live();
-        s.open(Slot::B);
-        assert!(!s.can_retire(Slot::A), "active");
-        assert!(s.can_retire(Slot::B));
-        assert!(s.can_retire(Slot::B), "asking twice changes nothing");
-        // Still open: a rollback can make it active.
-        s.set_active(Slot::B).expect("still open");
-        let held = bound(&s);
-        assert!(!s.can_retire(Slot::B), "active and busy");
-        s.set_active(Slot::A).expect("A is open");
-        assert!(!s.can_retire(Slot::B), "a permit is open");
-        drop(held);
-        assert!(s.can_retire(Slot::B));
-        assert!(!ActiveSlot::new().can_retire(Slot::A), "never opened");
-        assert_eq!(s.retire(Slot::B), Retire::Closed);
-        assert!(!s.can_retire(Slot::B), "closed already");
-    }
-
-    #[test]
-    fn a_closed_slot_cannot_become_active_or_bind() {
-        let s = ActiveSlot::new();
-        assert_eq!(s.set_active(Slot::B), Err(SwapError::Closed));
-        assert!(matches!(s.bind(), Bind::NoActive));
-        let t = live();
-        t.open(Slot::B);
-        t.set_active(Slot::B).expect("open");
-        assert_eq!(t.retire(Slot::A), Retire::Closed);
-        assert_eq!(t.set_active(Slot::A), Err(SwapError::Closed));
-        // A stale active pointer at a closed slot is NoActive, not a spin.
-        t.inner.gate.store(Slot::A.gate_bits(), Ordering::Release);
-        assert!(matches!(t.bind(), Bind::NoActive));
-    }
-
-    #[test]
-    fn hold_defers_the_bind_until_the_guard_releases() {
-        let s = live();
-        let guard = s.hold(HOLD_MAX).expect("first hold");
-        assert!(s.holding());
-        assert!(matches!(s.hold(HOLD_MAX), Err(AlreadyHolding)));
-        assert_eq!(AlreadyHolding.to_string(), "the gate is already holding");
-        assert!(matches!(
-            s.bind(),
-            Bind::Held { hold_max, .. } if hold_max == HOLD_MAX
-        ));
-        s.open(Slot::B);
-        s.set_active(Slot::B).expect("open");
-        assert!(s.holding());
-        guard.release();
-        assert!(!s.holding());
-        assert_eq!(bound(&s).slot(), Slot::B);
-        assert_eq!(Slot::A.other(), Slot::B);
-        assert!(format!("{s:?}").contains("ActiveSlot"));
-        assert!(format!("{:?}", bound(&s)).contains("Permit"));
-        assert_eq!(ActiveSlot::default().active(), None);
-    }
-
-    #[test]
-    fn a_release_after_held_is_never_missed() {
-        let s = live();
-        let guard = s.hold(HOLD_MAX).expect("hold");
-        let Bind::Held { epoch, .. } = s.bind() else {
-            panic!("holding");
-        };
-        // The release lands after the stream saw Held and before it parks.
-        assert_eq!(s.epoch(), epoch);
-        drop(guard);
-        assert_ne!(s.epoch(), epoch, "the waiter's condition is already true");
-        assert!(!s.holding(), "and the gate is open by the time the epoch moved");
-        // A second hold and release moves it again.
-        let before = s.epoch();
-        s.hold(HOLD_MAX).expect("again").release();
-        assert_ne!(s.epoch(), before);
-    }
-
-    #[test]
-    fn a_dropped_guard_releases_the_gate() {
-        let s = live();
-        {
-            let _guard = s.hold(HOLD_MAX).expect("hold");
-            assert!(s.holding());
-        }
-        assert!(!s.holding());
-        assert_eq!(bound(&s).slot(), Slot::A);
-    }
-
-    #[test]
-    fn a_starting_proxy_holds_until_adoption_is_done() {
-        let (s, guard) = ActiveSlot::starting(Duration::from_secs(300));
-        assert!(matches!(
-            s.bind(),
-            Bind::Held { hold_max, .. } if hold_max == Duration::from_secs(300)
-        ));
-        s.adopt(Slot::B, Some(Slot::A));
-        assert_eq!(s.active(), Some(Slot::B));
-        assert!(s.holding(), "adoption does not end the hold");
-        assert!(s.can_retire(Slot::A), "the other child is open");
-        guard.release();
-        assert_eq!(bound(&s).slot(), Slot::B);
-        let one = ActiveSlot::new();
-        one.adopt(Slot::A, None);
-        assert_eq!(one.retire(Slot::B), Retire::NeverOpened);
-        assert_eq!(bound(&one).slot(), Slot::A);
-    }
-
-    #[test]
-    fn clearing_the_active_slot_makes_a_release_answer_at_once() {
-        let s = live();
-        let guard = s.hold(HOLD_MAX).expect("hold");
-        s.clear_active();
-        assert_eq!(s.active(), None);
-        assert!(s.holding(), "the hold survives");
-        guard.release();
-        assert!(matches!(s.bind(), Bind::NoActive));
-    }
-
-    #[test]
-    fn a_reopened_slot_gets_a_new_generation_and_its_permits_carry_it() {
-        let s = ActiveSlot::new();
-        assert_eq!(s.generation(Slot::A), 0);
-        assert_eq!(s.open(Slot::A), 1);
-        assert_eq!(s.open(Slot::A), 1, "already open: same child");
-        s.set_active(Slot::A).expect("open");
-        let first = bound(&s);
-        assert_eq!(first.generation(), 1);
-        s.open(Slot::B);
-        s.set_active(Slot::B).expect("open");
-        drop(first);
-        assert_eq!(s.retire(Slot::A), Retire::Closed);
-        // A runs a new child: the pool of generation 1 must not be reused.
-        assert_eq!(s.open(Slot::A), 2);
-        s.set_active(Slot::A).expect("reopened after a retire");
-        assert_eq!(bound(&s).generation(), 2);
-        assert_eq!(s.generation(Slot::B), 1);
-    }
-
-    #[test]
-    fn open_streams_counts_both_slots_and_the_pending() {
-        let s = live();
-        s.open(Slot::B);
-        assert_eq!(s.open_streams(), 0);
-        let accepted = s.begin_stream();
-        assert_eq!(s.open_streams(), 1, "counted from accept, before any bind");
-        let a = bound(&s);
-        drop(accepted);
-        assert_eq!(s.open_streams(), 1, "the permit takes over");
-        s.set_active(Slot::B).expect("open");
-        let _b = bound(&s);
-        let bypass = s.begin_stream();
-        assert_eq!(s.open_streams(), 3, "both slots and a bypass stream");
-        drop(a);
-        assert_eq!(s.open_streams(), 2);
-        assert!(format!("{bypass:?}").contains("Pending"));
-    }
-
-    #[test]
-    fn a_slot_has_one_text_form() {
-        assert_eq!(Slot::A.name(), "a");
-        assert_eq!(Slot::B.to_string(), "b");
-        assert_eq!("a".parse::<Slot>(), Ok(Slot::A));
-        assert_eq!("b".parse::<Slot>(), Ok(Slot::B));
-        for bad in ["A", "B", "0", "", "ab", " a"] {
-            assert_eq!(bad.parse::<Slot>(), Err(SlotParseError), "{bad:?}");
-        }
-        assert_eq!(SlotParseError.to_string(), "a slot is \"a\" or \"b\"");
-        assert_eq!(serde_json::to_string(&Slot::A).expect("ser"), "\"a\"");
-        assert_eq!(serde_json::from_str::<Slot>("\"b\"").expect("de"), Slot::B);
-        assert!(serde_json::from_str::<Slot>("\"A\"").is_err());
-        assert!(serde_json::from_str::<Slot>("0").is_err());
-    }
-
-    #[test]
-    fn a_racing_flip_and_retire_never_put_a_permit_on_a_closed_slot() {
-        for _ in 0..200 {
-            let s = live();
-            s.open(Slot::B);
-            // Set by the supervisor thread once `retire(A)` has returned `Closed`.
-            let closed = Arc::new(AtomicBool::new(false));
-            let binder = {
-                let (s, closed) = (s.clone(), Arc::clone(&closed));
-                std::thread::spawn(move || {
-                    let mut late_on_a = 0_u32;
-                    for _ in 0..2000 {
-                        // Read the flag before the bind: a bind that starts after the
-                        // retire completed must never land on A.
-                        let was_closed = closed.load(Ordering::Acquire);
-                        if let Bind::Bound(p) = s.bind() {
-                            late_on_a += u32::from(was_closed && p.slot() == Slot::A);
-                        }
-                        std::thread::yield_now();
-                    }
-                    late_on_a
-                })
-            };
-            s.set_active(Slot::B).expect("open");
-            while s.retire(Slot::A) != Retire::Closed {
-                std::thread::yield_now();
-            }
-            closed.store(true, Ordering::Release);
-            assert_eq!(binder.join().expect("binder"), 0);
-            assert_eq!(s.open_permits(Slot::A), 0);
-            assert_eq!(bound(&s).slot(), Slot::B);
-        }
-    }
-
-    #[test]
-    fn a_retry_rebinds_through_the_gate_and_waits_for_the_new_child() {
-        // A stream bound to A before the hold; the supervisor then held and quiesced A.
-        let s = live();
-        s.open(Slot::B);
-        let first = bound(&s);
-        let guard = s.hold(HOLD_MAX).expect("hold");
-        // The fenced answer arrives: the retry drops the old permit, then binds again.
-        drop(first);
-        assert!(matches!(s.bind(), Bind::Held { .. }), "not back onto A");
-        s.set_active(Slot::B).expect("open");
-        guard.release();
-        assert_eq!(bound(&s).slot(), Slot::B);
-    }
-}
+mod tests;

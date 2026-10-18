@@ -32,8 +32,9 @@ pub const FENCED_VALUE: &str = "nothing-committed";
 /// the window closed) retries by itself, which is correct because nothing committed.
 pub const FENCED_GRPC_STATUS: &str = "14";
 
-/// The request bytes kept for a re-dispatch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The request bytes kept for a re-dispatch. Not `Copy`: it is a state machine, and a copy
+/// would fork it silently (U4b-1 also gives it `Bytes`).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplayBuffer {
     cap: usize,
     len: usize,

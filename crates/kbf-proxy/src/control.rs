@@ -17,8 +17,6 @@ use crate::slot::Slot;
 pub struct SlotStats {
     /// Streams bound to the slot, held-then-released and queued ones included.
     pub open_streams: u64,
-    /// Age of the oldest of them, worker sessions included.
-    pub oldest_stream_age: Duration,
 }
 
 /// One read of everything `GET /v1/update/frontend` reports. The fields are read one after
@@ -36,6 +34,8 @@ pub struct ProxySnapshot {
     pub per_slot: [SlotStats; 2],
     /// Whether `/readyz` would answer 200 (an active child and a poll that passed).
     pub ready: bool,
+    /// Holds that ended by a guard's drop, nobody having released them into a slot.
+    pub holds_abandoned: u64,
 }
 
 impl ProxySnapshot {
@@ -53,7 +53,8 @@ impl ProxySnapshot {
 /// proxy ([`UpdateReply::payload_too_large`]) without calling the handler.
 pub const MAX_UPDATE_BODY: usize = 4096;
 /// How long the proxy waits for the handler; after that it answers 504
-/// ([`UpdateReply::timed_out`]) and drops the handler's future.
+/// ([`UpdateReply::timed_out`]) to the client and lets the handler finish: the proxy runs the
+/// handler in its own task, so a command a client gave up on is neither cut short nor run twice.
 pub const UPDATE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// A request to `/v1/update/frontend*`, after the proxy authenticated and rate limited it.
@@ -123,6 +124,10 @@ impl UpdateReply {
 /// rate limits, enforces [`MAX_UPDATE_BODY`] and [`UPDATE_DEADLINE`], and then calls this.
 /// The handler owns no state machine: it asks U7a's actor (a trait in `kbf-installer`) for
 /// `abort`, `rollback` and `force-retire`, and U7a alone writes `update.json`.
+///
+/// A client that got a 504 or lost its connection retries, so every command must be
+/// idempotent and the handler must answer a repeat of a command in flight with the state of the
+/// first, not start a second.
 pub trait UpdateHandler: Send + Sync {
     /// Handles one request.
     fn handle(&self, request: UpdateRequest) -> impl Future<Output = UpdateReply> + Send;
@@ -193,13 +198,11 @@ mod tests {
             holding: true,
             held: 3,
             per_slot: [
-                SlotStats {
-                    open_streams: 200,
-                    oldest_stream_age: Duration::from_secs(9),
-                },
+                SlotStats { open_streams: 200 },
                 SlotStats::default(),
             ],
             ready: false,
+            holds_abandoned: 1,
         };
         assert_eq!(snap.stats(Slot::A).open_streams, 200);
         assert_eq!(snap.stats(Slot::B), SlotStats::default());

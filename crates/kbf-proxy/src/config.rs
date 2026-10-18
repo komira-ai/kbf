@@ -9,6 +9,8 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::auth::Buck2Auth;
+use crate::hold::{HEADER_BYTES, STREAM_WINDOW_BYTES};
+use crate::replay::REPLAY_BYTES;
 use crate::route::Target;
 use crate::slot::Slot;
 
@@ -72,6 +74,10 @@ pub struct Limits {
     /// Most streams in flight across all connections (bound, held and dialing); one more
     /// is refused at header time. Memory is bounded by this times the stream windows.
     pub max_streams: usize,
+    /// The memory the proxy may need at the worst: [`Limits::max_streams`] times
+    /// [`Limits::stream_ceiling_bytes`] must fit in it, or the config is refused at start. The
+    /// default assumes a host of 16 GiB or more with the proxy at half.
+    pub memory_budget_mib: u64,
     /// Most header-list bytes per request.
     pub max_header_list_bytes: u32,
     /// Interval of the downstream PING that finds dead peers, in seconds.
@@ -87,6 +93,7 @@ impl Default for Limits {
             max_connections: 50_000,
             max_connections_per_ip: 2_000,
             max_streams: 8_192,
+            memory_budget_mib: 8_192,
             max_header_list_bytes: 16 * 1024,
             keepalive_interval_s: 30,
             keepalive_ack_s: 20,
@@ -95,6 +102,19 @@ impl Default for Limits {
 }
 
 impl Limits {
+    /// The most memory one stream can pin: its window in each direction, the replay buffer
+    /// (it keeps the first bytes after their window credit was returned) and the header list.
+    #[must_use]
+    pub const fn stream_ceiling_bytes() -> u64 {
+        2 * STREAM_WINDOW_BYTES as u64 + REPLAY_BYTES as u64 + HEADER_BYTES
+    }
+
+    /// `max_streams` streams at their ceiling.
+    #[must_use]
+    pub const fn worst_case_bytes(&self) -> u64 {
+        self.max_streams as u64 * Self::stream_ceiling_bytes()
+    }
+
     /// The pre-stream timeout.
     #[must_use]
     pub const fn pre_stream_timeout(&self) -> Duration {
@@ -189,6 +209,11 @@ impl ProxyConfig {
         if l.max_streams == 0 {
             return Err(ConfigError::Invalid("limits.max_streams must be above 0"));
         }
+        if l.worst_case_bytes() > l.memory_budget_mib.saturating_mul(1 << 20) {
+            return Err(ConfigError::Invalid(
+                "limits.max_streams times the per-stream ceiling exceeds limits.memory_budget_mib",
+            ));
+        }
         if self.hold_max_s == 0 {
             return Err(ConfigError::Invalid("hold_max_s must be above 0"));
         }
@@ -266,6 +291,20 @@ base_port = 18000
             limits("max_streams = 0"),
             Err(ConfigError::Invalid(_))
         ));
+        // 8192 streams at 592 KiB is 4.75 GiB: the default fits its 8 GiB budget, a bigger
+        // stream cap or a smaller budget does not.
+        assert_eq!(Limits::stream_ceiling_bytes(), 2 * 262_144 + 65_536 + 16_384);
+        assert_eq!(Limits::default().worst_case_bytes(), 8192 * 606_208);
+        assert!(limits("max_streams = 14169").is_ok());
+        assert!(matches!(
+            limits("max_streams = 14170"),
+            Err(ConfigError::Invalid(_))
+        ));
+        assert!(matches!(
+            limits("memory_budget_mib = 4096"),
+            Err(ConfigError::Invalid(_))
+        ));
+        assert!(limits("memory_budget_mib = 4800").is_ok());
         assert!(matches!(
             limits("max_connections_per_ip = 0"),
             Err(ConfigError::Invalid(_))

@@ -134,14 +134,13 @@ pub const fn auth_class(route: Route) -> Option<AuthClass> {
     }
 }
 
-/// Whether the hold gate lets the route through while it holds: the update API (so `abort`
-/// cannot deadlock) and the probes.
+/// Whether the hold gate lets the route through while it holds. Only a stream going to a
+/// backend is held; everything the proxy answers itself bypasses: the update API (so `abort`
+/// cannot deadlock), the probes, the metrics, and a path outside the table (answered 404 or
+/// `UNIMPLEMENTED` at once, never forwarded).
 #[must_use]
 pub const fn bypasses_hold(route: Route) -> bool {
-    matches!(
-        route,
-        Route::Update | Route::Health | Route::Ready | Route::Metrics
-    )
+    !matches!(route, Route::Child(_))
 }
 
 /// The idle timeout of `path`. Execute and WaitExecution are matched by their full method
@@ -240,6 +239,8 @@ mod tests {
             ("/healthz", true),
             ("/readyz", true),
             ("/metrics", true),
+            ("/not/in/the/table", true),
+            ("/v1/update/frontendx", false),
             ("/v1/nodes", false),
             ("/kbf.worker.v1.Worker/Session", false),
             ("/google.bytestream.ByteStream/Read", false),
