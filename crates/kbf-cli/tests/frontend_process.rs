@@ -247,3 +247,56 @@ fn a_frontend_process_with_a_sqlite_state_store_is_ready_and_holds_the_file() {
     assert!(second.stdout.is_empty());
     assert!(front.stop().is_some_and(|status| status.success()));
 }
+
+/// Catches a frontend process that takes `--admin-listen` and does not serve it: one
+/// started with it is the active writer (`GET /v1/admin/role`, which names the version
+/// protocol the proxy reads), one started with `--await-takeover` over another state file
+/// is a candidate that holds no generation, and both exit 0 on SIGTERM (a candidate
+/// would otherwise hold its ports for ever).
+#[test]
+fn a_frontend_process_serves_the_admin_calls_as_active_or_as_candidate() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("frontend-admin-{}", std::process::id()));
+    let node = node(&dir);
+    let storage = format!("--storage=http://{}", node.field("storage="));
+    let start = |state: &str, more: &[&str]| {
+        let state = format!("--state-store=sqlite://{}", dir.join(state).display());
+        let mut args = vec![
+            "frontend",
+            "--listen=127.0.0.1:0",
+            "--worker-listen=127.0.0.1:0",
+            "--api-listen=127.0.0.1:0",
+            "--admin-listen=127.0.0.1:0",
+            storage.as_str(),
+            state.as_str(),
+        ];
+        args.extend_from_slice(more);
+        Proc::start(&args)
+    };
+    let mut active = start("active.db", &[]);
+    assert!(
+        active.line.starts_with("kbf-frontend-admin "),
+        "{}",
+        active.line
+    );
+    let (code, body) = get(&active.field("admin="), "/v1/admin/role");
+    assert_eq!(code, 200, "{body}");
+    let role: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(role["role"], "active", "{body}");
+    assert_eq!(role["held_generation"], 1, "{body}");
+    assert_eq!(role["admin_protocol"], kbf_server::managed::ADMIN_PROTOCOL);
+
+    let mut candidate = start("waiting.db", &["--await-takeover"]);
+    assert!(
+        candidate.line.contains("role=candidate"),
+        "{}",
+        candidate.line
+    );
+    let (code, body) = get(&candidate.field("admin="), "/v1/admin/role");
+    assert_eq!(code, 200, "{body}");
+    let role: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(role["role"], "candidate", "{body}");
+    assert_eq!(role["held_generation"], serde_json::Value::Null, "{body}");
+    assert!(candidate.stop().is_some_and(|status| status.success()));
+    assert!(active.stop().is_some_and(|status| status.success()));
+}

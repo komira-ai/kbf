@@ -30,8 +30,8 @@ use crate::listen::{Binder, Socket};
 use crate::serve::serve_api;
 use crate::state_store;
 
-/// How long [`Candidate::retire`] lets open connections finish before it cuts them. A
-/// health `Watch` stream never finishes by itself.
+/// How long [`Candidate::retire`] waits for open connections to finish (the listeners
+/// sent GOAWAY, so none opens a stream after that).
 const GRACE: Duration = Duration::from_secs(2);
 
 /// The bound listeners of a candidate, handed to the real servers.
@@ -57,6 +57,8 @@ pub(crate) struct Candidate {
     pub reapi: SocketAddr,
     pub api: Option<SocketAddr>,
     stop: Stop,
+    /// Stopped by `retire`: an open health `Watch` ends.
+    readiness: Arc<Readiness>,
     tasks: Tasks,
 }
 
@@ -96,8 +98,9 @@ impl Candidate {
             flags.storage_endpoint()?.connect_lazy(),
             0,
         ));
+        let readiness = Arc::new(Readiness::default());
         let checks = Arc::new(crate::frontend::checks(
-            Arc::new(Readiness::default()),
+            Arc::clone(&readiness),
             storage,
             None,
             Some(store.reader()),
@@ -124,10 +127,9 @@ impl Candidate {
         let served = Server::builder()
             .add_routes(routes)
             .serve_with_incoming_shutdown(incoming, either(&stop, global));
+        // A listener that fails shows as probes that are refused.
         tasks.0.push(tokio::spawn(async move {
-            if let Err(error) = served.await {
-                tracing::warn!(%error, "the candidate's REAPI listener failed");
-            }
+            let _ = served.await;
         }));
         if let Some(socket) = &api {
             let listener = socket.try_clone()?.http()?;
@@ -137,9 +139,7 @@ impl Candidate {
                 either(&stop, global),
             );
             tasks.0.push(tokio::spawn(async move {
-                if let Err(error) = served.await {
-                    tracing::warn!(%error, "the candidate's operator API listener failed");
-                }
+                let _ = served.await;
             }));
         }
         Ok(Self {
@@ -148,28 +148,29 @@ impl Candidate {
             api: api.as_ref().map(|socket| socket.local),
             sockets: Sockets { reapi, api },
             stop,
+            readiness,
             tasks,
         })
     }
 
-    /// Stops the stand-ins (open connections finish for [`GRACE`], then are cut) and
-    /// returns the sockets they served, free of them, and the store handle. A stand-in
-    /// must be gone before the real server accepts, so that no connection is answered
-    /// by it.
+    /// Stops the stand-ins and returns the sockets they served, free of them, and the
+    /// store handle. The stand-ins go not ready first, which ends an open health `Watch`
+    /// (UNAVAILABLE), then their listeners are told to stop (GOAWAY) and are waited for up
+    /// to [`GRACE`]. A stand-in must be gone before the real server accepts, so that no
+    /// connection is answered by it.
     pub async fn retire(self) -> (Sockets, state_store::Candidate) {
         let Self {
             store,
             sockets,
             stop,
+            readiness,
             mut tasks,
             ..
         } = self;
+        readiness.stop();
         stop.fire();
-        for mut task in std::mem::take(&mut tasks.0) {
-            if tokio::time::timeout(GRACE, &mut task).await.is_err() {
-                task.abort();
-                let _ = task.await;
-            }
+        for task in std::mem::take(&mut tasks.0) {
+            let _ = tokio::time::timeout(GRACE, task).await;
         }
         (sockets, store)
     }

@@ -182,22 +182,19 @@ impl Candidate {
 
     /// Takes the generation, which must be exactly `expect`, and keeps the epoch: the
     /// daemons that reconnect keep the runs of their leases. Nothing is written when the
-    /// store is at another generation. Returns the store the caller now writes through
-    /// and the generation it holds.
+    /// store is at another generation. Returns the store the caller now writes through.
     ///
     /// # Errors
     /// [`StateError::Open`]: the store is not at `expect`, or another writer took the
     /// generation first.
-    pub fn take_over(&self, expect: u64) -> Result<(StateStore, u64), StateError> {
+    pub fn take_over(&self, expect: u64) -> Result<StateStore, StateError> {
         let fenced = Fenced::take(Arc::clone(&self.inner), Some(expect)).map_err(open_error)?;
-        let held = fenced.generation();
-        let state = StateStore {
+        Ok(StateStore {
             store: Arc::new(fenced),
             epoch: EpochPolicy::Keep,
             members: MembershipConfig::default(),
             history: None,
-        };
-        Ok((state, held))
+        })
     }
 }
 

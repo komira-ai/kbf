@@ -312,12 +312,61 @@ fn a_candidate_reads_writes_nothing_and_takes_exactly_the_generation_it_expects(
     assert!(refused.to_string().contains("generation 1"), "{refused}");
     assert_eq!(candidate.generation().expect("read"), 1);
 
-    let (state, held) = candidate.take_over(1).expect("takes generation 1");
-    assert_eq!((held, state.epoch), (2, EpochPolicy::Keep));
+    let state = candidate.take_over(1).expect("takes generation 1");
+    assert_eq!(state.epoch, EpochPolicy::Keep);
     assert_eq!(candidate.generation().expect("read"), 2);
     let stale = Txn::new().put("probe", b"x".to_vec(), Cond::Any);
     assert!(
         matches!(holder.txn(stale), Err(StoreError::Fenced)),
         "the old holder was not fenced"
+    );
+}
+
+/// Catches: a reader that answers from nothing (every read of the candidate's handle is
+/// the store's), a store with no generation reported as anything but 0, a generation row
+/// that is not a number taken for one, and a candidate over a SQLite file that makes the
+/// file anything but held (a second open is refused) and unwritten (the generation stays
+/// 0, no writer took one).
+#[test]
+fn a_candidate_reader_passes_reads_through_and_a_sqlite_candidate_holds_the_file() {
+    use kbf_state::{Cond, Revision, ScanRange, Txn};
+    let inner = fake();
+    let candidate = Candidate::over(Arc::clone(&inner));
+    assert_eq!(candidate.generation().expect("read"), 0, "no writer yet");
+    inner
+        .txn(Txn::new().put("a/1", b"x".to_vec(), Cond::Any))
+        .expect("write")
+        .expect("applied");
+    let reader = candidate.reader();
+    assert_eq!(reader.scan_prefix("a/").expect("scan").len(), 1);
+    let page = reader
+        .scan_range(ScanRange::new(
+            "a/",
+            std::num::NonZeroUsize::new(10).expect("nonzero"),
+        ))
+        .expect("a range");
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(reader.changes(Revision(0), 10).expect("feed").rows.len(), 1);
+    assert_eq!(reader.commit_stats(), inner.commit_stats());
+    assert_eq!(reader.now(), inner.now());
+    inner
+        .txn(Txn::new().put(GENERATION, b"abc".to_vec(), Cond::Any))
+        .expect("write")
+        .expect("applied");
+    let corrupt = candidate.generation().expect_err("not eight bytes");
+    assert!(matches!(corrupt, StateError::Corrupt { .. }), "{corrupt:?}");
+
+    let dir = scratch("candidate");
+    let uri = StateStoreUri::Sqlite(dir.join("state.db"));
+    let waiting = uri.open_candidate().expect("opened");
+    assert_eq!(
+        waiting.generation().expect("read"),
+        0,
+        "a candidate took one"
+    );
+    let refused = uri.open().err().expect("held by the candidate");
+    assert!(
+        matches!(&refused, StateError::Open(why) if why.contains("another kbf process")),
+        "{refused:?}"
     );
 }

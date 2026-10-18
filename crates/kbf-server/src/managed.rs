@@ -46,7 +46,7 @@ use crate::handover::Stop;
 use crate::listen::Binder;
 use crate::serve::{AbortOnDrop, ServeError, bind_api, serve_api};
 use crate::start::Escalation;
-use crate::state_store::{self, generation_of};
+use crate::state_store;
 
 /// How long a frontend run under the admin port waits for the calls between their request
 /// and their queueing before it quiesces anyway (the handover's default).
@@ -67,7 +67,7 @@ pub struct Managed {
     stop: Stop,
     admin: SocketAddr,
     running: Option<FrontendHandle>,
-    takeover: oneshot::Receiver<Result<FrontendHandle, String>>,
+    takeover: oneshot::Receiver<Result<Box<FrontendHandle>, String>>,
     escalation: Option<Escalation>,
     notify: Option<std::ffi::OsString>,
     _admin_task: AbortOnDrop,
@@ -132,19 +132,15 @@ impl Managed {
                     crate::frontend::start_over(flags, state, &stop)?
                 }
             };
-            let held = match handle.stand() {
-                Some(stand) => generation_of(stand.store.as_ref())?,
-                None => 0,
-            };
-            control.set_running(&handle, held);
+            control.set_running(&handle);
             running = Some(handle);
         }
         let routes = http::router(Arc::clone(&control));
         let stopped = stop.fired();
         let served = tokio::spawn(async move {
-            if let Err(error) = serve_api(Some(listener), routes, stopped).await {
-                tracing::error!(%error, "the admin port failed");
-            }
+            // The admin port ends with the process; a listener that fails shows as calls
+            // that are refused.
+            let _ = serve_api(Some(listener), routes, stopped).await;
         });
         // The forwarder ends with the signal; it holds nothing else.
         drop(forwarding);
@@ -177,17 +173,21 @@ impl Managed {
     pub fn start_line(&self) -> String {
         let view = self.view();
         format!(
-            "kbf-frontend-admin {} instance={} role={:?} admin_protocol={}",
-            self.admin, view.instance_id, view.role, view.admin_protocol
+            "kbf-frontend-admin admin={} instance={} role={} admin_protocol={}",
+            self.admin,
+            view.instance_id,
+            serde_json::to_string(&view.role)
+                .unwrap_or_default()
+                .trim_matches('"'),
+            view.admin_protocol
         )
-        .to_lowercase()
     }
 
     /// With the escalation (the second stop signal) the served frontend closes its
     /// streams on.
     #[must_use]
-    pub(crate) fn escalating(mut self, second: Escalation) -> Self {
-        self.escalation = Some(second);
+    pub fn escalating(mut self, second: impl Future<Output = ()> + Send + 'static) -> Self {
+        self.escalation = Some(Box::pin(second));
         self
     }
 
@@ -209,10 +209,11 @@ impl Managed {
             Some(handle) => handle,
             None => {
                 tokio::select! {
-                    taken = &mut self.takeover => match taken {
-                        Ok(Ok(handle)) => handle,
-                        Ok(Err(why)) => return Err(why.into()),
-                        Err(_) => return Err("the admin port ended".into()),
+                    // The sender lives in the control this process holds: it is never
+                    // dropped before the answer.
+                    taken = &mut self.takeover => match taken? {
+                        Ok(handle) => *handle,
+                        Err(why) => return Err(why.into()),
                     },
                     () = self.stop.fired() => return Ok(()),
                 }

@@ -86,17 +86,22 @@ pub enum Refusal {
     Failed(String),
 }
 
+/// What the process serves the real frontend through: the handle a takeover built, or why
+/// it could not.
+pub(crate) type Handoff = oneshot::Sender<Result<Box<FrontendHandle>, String>>;
+
 struct Running {
-    role: Role,
     stand: Stand,
+    /// The generation this process took.
     held: u64,
-    worker: Option<SocketAddr>,
 }
 
 struct Inner {
+    role: Role,
     candidate: Option<Candidate>,
     running: Option<Running>,
     reapi: Option<SocketAddr>,
+    worker: Option<SocketAddr>,
     api: Option<SocketAddr>,
 }
 
@@ -111,24 +116,21 @@ pub struct Control {
     /// and the first refused write starts it.
     following: Arc<AtomicBool>,
     /// Where the handle of the real frontend goes once a takeover has built it.
-    handoff: Mutex<Option<oneshot::Sender<Result<FrontendHandle, String>>>>,
+    handoff: Mutex<Option<Handoff>>,
 }
 
 impl Control {
-    pub(crate) fn new(
-        id: String,
-        flags: FrontendFlags,
-        stop: Stop,
-        handoff: oneshot::Sender<Result<FrontendHandle, String>>,
-    ) -> Self {
+    pub(crate) fn new(id: String, flags: FrontendFlags, stop: Stop, handoff: Handoff) -> Self {
         Self {
             id,
             flags,
             stop,
             inner: Mutex::new(Inner {
+                role: Role::Candidate,
                 candidate: None,
                 running: None,
                 reapi: None,
+                worker: None,
                 api: None,
             }),
             moving: tokio::sync::Mutex::new(()),
@@ -148,44 +150,42 @@ impl Control {
         inner.candidate = Some(candidate);
     }
 
-    /// This process serves as the writer, through `handle`, at generation `held`.
-    pub(crate) fn set_running(&self, handle: &FrontendHandle, held: u64) {
+    /// This process serves as the writer, through `handle`: it holds the generation the
+    /// store is at.
+    pub(crate) fn set_running(&self, handle: &FrontendHandle) {
         let mut inner = self.inner();
+        inner.role = Role::Active;
         inner.reapi = Some(handle.reapi);
+        inner.worker = Some(handle.worker);
         inner.api = handle.api;
-        inner.running = handle.stand().cloned().map(|stand| Running {
-            role: Role::Active,
-            stand,
-            held,
-            worker: Some(handle.worker),
+        inner.running = handle.stand().cloned().map(|stand| {
+            watch(Arc::clone(&stand.farm), Arc::clone(&self.following));
+            // A store that cannot be read now is a held generation of 0, which no store
+            // is at: a resume is refused.
+            let held = generation_of(stand.store.as_ref()).unwrap_or(0);
+            Running { stand, held }
         });
-        if let Some(run) = &inner.running {
-            watch(Arc::clone(&run.stand.farm), Arc::clone(&self.following));
-        }
     }
 
     /// The role, as of now.
     #[must_use]
     pub fn view(&self) -> RoleView {
         let inner = self.inner();
-        let (role, held, generation, farm) = match (&inner.running, &inner.candidate) {
-            (Some(run), _) => (
-                run.role,
+        let candidate = inner.candidate.as_ref();
+        let (held, generation, farm) = match &inner.running {
+            Some(run) => (
                 Some(run.held),
                 generation_of(run.stand.store.as_ref()).ok(),
                 Some(Arc::clone(&run.stand.farm)),
             ),
-            (None, Some(candidate)) => (
-                Role::Candidate,
+            None => (
                 None,
-                candidate.store.generation().ok(),
+                candidate.and_then(|candidate| candidate.store.generation().ok()),
                 None,
             ),
-            // Before the first start finishes: nothing is served yet.
-            (None, None) => (Role::Candidate, None, None, None),
         };
         RoleView {
-            role,
+            role: inner.role,
             instance_id: self.id.clone(),
             admin_protocol: ADMIN_PROTOCOL,
             generation,
@@ -194,7 +194,7 @@ impl Control {
             open_streams: farm.as_ref().map_or(0, |farm| farm.open_executions()),
             open_sessions: farm.as_ref().map_or(0, |farm| farm.open_sessions()),
             reapi: inner.reapi,
-            worker: inner.running.as_ref().and_then(|run| run.worker),
+            worker: inner.worker,
             api: inner.api,
         }
     }
@@ -203,21 +203,20 @@ impl Control {
         Refusal::Role(Box::new(self.view()), wanted)
     }
 
-    /// The running state, if its role is one of `roles`.
+    /// The running state, if the role is one of `roles`.
     fn running_in(&self, roles: &[Role]) -> Option<(Role, Stand, u64)> {
         let inner = self.inner();
         let run = inner.running.as_ref()?;
         roles
-            .contains(&run.role)
-            .then(|| (run.role, run.stand.clone(), run.held))
+            .contains(&inner.role)
+            .then(|| (inner.role, run.stand.clone(), run.held))
     }
 
     fn set_role(&self, role: Role) {
-        if let Some(run) = self.inner().running.as_mut() {
-            run.role = role;
-            if role == Role::StoodDown {
-                run.worker = None;
-            }
+        let mut inner = self.inner();
+        inner.role = role;
+        if role == Role::StoodDown {
+            inner.worker = None;
         }
     }
 
@@ -239,31 +238,28 @@ impl Control {
     }
 
     /// Puts a quiesced process back to work, after a takeover that did not happen: only
-    /// while the store is still at the generation this process took, and it has refused
-    /// no write of this process. The farm fed the scheduler nothing while it was
-    /// quiesced, so its memory is the store's as of the quiesce.
+    /// while the store is still at the generation this process took. The farm fed the
+    /// scheduler nothing while it was quiesced, so its memory is the store's as of the
+    /// quiesce.
     ///
     /// # Errors
     /// [`Refusal::Role`]: not quiesced or active. [`Refusal::Generation`]: another writer
-    /// holds the generation now; this process can only stand down.
+    /// holds the generation now; this process can only stand down. [`Refusal::Failed`]:
+    /// the store cannot be read.
     pub async fn resume(&self) -> Result<RoleView, Refusal> {
         let _moving = self.moving.lock().await;
         let Some((role, stand, held)) = self.running_in(&[Role::Active, Role::Quiesced]) else {
             return Err(self.wrong("quiesced or active"));
         };
         if role == Role::Quiesced {
-            let now = generation_of(stand.store.as_ref())
-                .map_err(|error| Refusal::Failed(error.to_string()))?;
+            let now = generation_of(stand.store.as_ref()).map_err(Refusal::failed)?;
             if now != held {
                 return Err(Refusal::Generation(format!(
                     "the store is at generation {now}, not the {held} this process took: \
                      another writer holds it, stand down"
                 )));
             }
-            stand
-                .farm
-                .resume()
-                .map_err(|error| Refusal::Generation(error.to_string()))?;
+            stand.farm.resume();
             self.set_role(Role::Active);
         }
         Ok(self.view())
@@ -300,21 +296,19 @@ impl Control {
     /// taken and the frontend could not start; the process ends.
     pub async fn takeover(&self, expect: u64) -> Result<RoleView, Refusal> {
         let _moving = self.moving.lock().await;
-        let taken = {
-            let inner = self.inner();
-            let Some(candidate) = &inner.candidate else {
+        let (state, candidate) = {
+            let mut inner = self.inner();
+            let Some(candidate) = inner.candidate.take() else {
                 drop(inner);
                 return Err(self.wrong("candidate"));
             };
-            candidate
-                .store
-                .take_over(expect)
-                .map_err(|error| Refusal::Generation(error.to_string()))?
-        };
-        let (state, held) = taken;
-        let candidate = self.inner().candidate.take();
-        let Some(candidate) = candidate else {
-            return Err(Refusal::Failed("the candidate vanished".to_owned()));
+            match candidate.store.take_over(expect) {
+                Ok(state) => (state, candidate),
+                Err(error) => {
+                    inner.candidate = Some(candidate);
+                    return Err(Refusal::Generation(error.to_string()));
+                }
+            }
         };
         let (sockets, _store) = candidate.retire().await;
         let started =
@@ -326,21 +320,23 @@ impl Control {
             .take();
         match started {
             Ok(handle) => {
-                self.set_running(&handle, held);
-                if let Some(handoff) = handoff {
-                    let _ = handoff.send(Ok(handle));
-                }
+                self.set_running(&handle);
+                let _ = handoff.map(|handoff| handoff.send(Ok(Box::new(handle))));
                 Ok(self.view())
             }
             Err(error) => {
                 let why = error.to_string();
                 tracing::error!(error = %why, "the generation was taken and the frontend did not start");
-                if let Some(handoff) = handoff {
-                    let _ = handoff.send(Err(why.clone()));
-                }
+                let _ = handoff.map(|handoff| handoff.send(Err(why.clone())));
                 Err(Refusal::Failed(why))
             }
         }
+    }
+}
+
+impl Refusal {
+    fn failed(error: impl std::fmt::Display) -> Self {
+        Self::Failed(error.to_string())
     }
 }
 
@@ -355,9 +351,9 @@ fn follow(farm: Arc<crate::farm::Farm>, started: &AtomicBool) {
         let mut look = tokio::time::interval(FOLLOW_EVERY);
         loop {
             look.tick().await;
-            if let Err(error) = farm.follow() {
-                tracing::warn!(%error, "the results of the kept calls could not be read");
-            }
+            // A store that cannot be read is looked at again at the next look; the farm
+            // reports what it finds no trace of (`kbf_frontend_relay_untraced`).
+            let _ = farm.follow();
         }
     });
 }

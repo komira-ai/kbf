@@ -66,7 +66,7 @@ mod phase;
 mod record;
 
 pub use durable::{DONE_FLOOR, EpochPolicy, SESSION_RENEWAL, StateError};
-pub use handover::{Superseded, UNTRACED_LOOKS};
+pub use handover::UNTRACED_LOOKS;
 pub use phase::Reported;
 
 use self::durable::Durable;
