@@ -244,9 +244,9 @@ impl World {
     }
 
     fn stat(&self, path: &str) -> Out {
-        if pkg::TMPFILES_DIRS.contains(&path) {
+        if let Some((_, mode)) = pkg::TMPFILES_DIRS.iter().find(|(p, _)| *p == path) {
             return if self.users_made && !self.is(Defect::DirNotMade) {
-                ok("root:root:755:directory")
+                ok(&format!("root:root:{mode}:directory"))
             } else {
                 fail("no such file")
             };

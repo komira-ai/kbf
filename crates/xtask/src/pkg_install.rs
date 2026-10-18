@@ -381,9 +381,9 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
             "/usr/sbin/nologin",
         );
     }
-    for path in pkg::TMPFILES_DIRS {
+    for (path, mode) in pkg::TMPFILES_DIRS {
         let got = c.say(&["stat", "-c", "%U:%G:%a:%F", path])?;
-        eq(&mut problems, path, &got, "root:root:755:directory");
+        eq(&mut problems, path, &got, &format!("root:root:{mode}:directory"));
     }
     for g in gates {
         gate(c, g, &mut problems)?;
@@ -393,6 +393,7 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
         "writing the installer state",
         &[
             "install",
+            "-D",
             "-m",
             "0600",
             "/dev/null",

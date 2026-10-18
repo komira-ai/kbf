@@ -27,6 +27,8 @@ pub const NAME: &str = "kbf-installer";
 pub const BINARY_PATH: &str = "/usr/bin/kbf-installer";
 /// Where the unit files go.
 pub const UNIT_DIR: &str = "/usr/lib/systemd/system";
+/// The one packaged unit that is not a `kbf-*.service`: the slice the units run in.
+pub const SLICE: &str = "kbf.slice";
 /// The directory the package owns, holding [`TRUST_DIR`].
 pub const SHARE_DIR: &str = "/usr/share/kbf-installer";
 /// Where the trust files go.
@@ -37,8 +39,9 @@ pub const SYSUSERS_PATH: &str = "/usr/lib/sysusers.d/kbf-installer.conf";
 pub const TMPFILES_PATH: &str = "/usr/lib/tmpfiles.d/kbf-installer.conf";
 /// The directory `setup` fills and the package never removes.
 pub const STATE_DIR: &str = "/var/lib/kbf-installer";
-/// The directories `tmpfiles.d` makes (all `root:root` 0755).
-pub const TMPFILES_DIRS: [&str; 3] = [STATE_DIR, "/run/kbf-installer", "/var/cache/kbf-fetch"];
+/// The directories `tmpfiles.d` makes, with their modes (all `root:root`). The file is
+/// the unit author's, packaged unchanged; `STATE_DIR` is made by `kbf-installer setup`.
+pub const TMPFILES_DIRS: [(&str, &str); 2] = [("/run/kbf-installer", "755"), ("/var/cache/kbf-fetch", "711")];
 /// The users `sysusers.d` makes.
 pub const USERS: [&str; 3] = ["kbf", "kbf-fetch", "kbf-verify"];
 /// The `Depends` of the deb.
@@ -170,8 +173,10 @@ pub fn plan(i: &Inputs) -> Result<Vec<Entry>, Error> {
         problems.push(format!("no unit files in {}", i.units.display()));
     }
     for (name, src) in units {
-        if !(name.starts_with("kbf-") && name.ends_with(".service")) {
-            problems.push(format!("{name}: a package unit is named kbf-*.service"));
+        if !(name == SLICE || (name.starts_with("kbf-") && name.ends_with(".service"))) {
+            problems.push(format!(
+                "{name}: a package unit is named kbf-*.service (or is {SLICE})"
+            ));
         }
         entries.push(file(
             format!("{UNIT_DIR}/{name}"),

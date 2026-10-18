@@ -364,18 +364,18 @@ fn the_real_sysusers_and_tmpfiles_files_say_what_the_contract_says() {
         })
         .collect();
     assert_eq!(users, USERS);
-    let dirs: Vec<String> = lines("tmpfiles.d/kbf-installer.conf")
+    let dirs: Vec<(String, String)> = lines("tmpfiles.d/kbf-installer.conf")
         .into_iter()
         .map(|f| {
-            assert_eq!(
-                [&f[0], &f[2], &f[3], &f[4]],
-                ["d", "0755", "root", "root"],
-                "{f:?}"
-            );
-            f[1].clone()
+            assert_eq!([&f[0], &f[3], &f[4]], ["d", "root", "root"], "{f:?}");
+            (f[1].clone(), f[2].trim_start_matches('0').to_owned())
         })
         .collect();
-    assert_eq!(dirs, TMPFILES_DIRS);
+    let want: Vec<(String, String)> = TMPFILES_DIRS
+        .iter()
+        .map(|(p, m)| ((*p).to_owned(), (*m).to_owned()))
+        .collect();
+    assert_eq!(dirs, want);
 }
 
 #[test]
@@ -618,4 +618,59 @@ fn the_nfpm_process_gets_the_given_environment_and_nothing_else() {
     assert!(err.to_string().contains("/nonexistent/nfpm"), "{err}");
     let mut fails = nfpm_process(Path::new("/usr/bin/false"));
     assert!(!fails(&[], &[]).expect("false").ok);
+}
+
+/// The package ships exactly what `packaging/linux/units` holds: a unit added there is
+/// packaged, and nothing else is (catches a hand-kept list that drifts from the directory).
+#[test]
+fn the_package_ships_exactly_the_units_directory() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux");
+    let held = |dir: &str| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(root.join(dir))
+            .expect("units directory")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    let units = held("units");
+    assert!(units.iter().any(|n| n == "kbf-installer.service"), "{units:?}");
+    let plan = plan(&Inputs {
+        binary: &root.join("units/kbf-installer.service"),
+        units: &root.join("units"),
+        trust: &root.join("testdata/trust"),
+        sysusers: &root.join("sysusers.d/kbf-installer.conf"),
+        tmpfiles: &root.join("tmpfiles.d/kbf-installer.conf"),
+        platform: Platform::LinuxX86_64,
+        version: "0.0.0+ci",
+    })
+    .expect("the real units are a plan");
+    let mut shipped: Vec<String> = plan
+        .iter()
+        .filter_map(|e| e.dst.strip_prefix(&format!("{UNIT_DIR}/")))
+        .map(str::to_owned)
+        .collect();
+    shipped.sort();
+    assert_eq!(shipped, units);
+}
+
+/// The kbf-installer package depends on no Envoy: Envoy runs on frontend hosts only, and a
+/// hard dependency would put it on every node.
+#[test]
+fn no_dependency_of_either_package_names_envoy() {
+    for dep in DEB_DEPENDS.iter().chain(RPM_DEPENDS.iter()) {
+        assert!(!dep.to_lowercase().contains("envoy"), "{dep}");
+    }
+}
+
+/// The slice is the one non-`.service` unit; any other name is still refused.
+#[test]
+fn a_unit_that_is_neither_a_service_nor_the_slice_is_refused() {
+    let t = Tree::new("slice");
+    t.put("units/kbf.slice", "[Slice]");
+    assert!(plan(&t.inputs()).is_ok(), "the slice is packaged");
+    t.put("units/kbf-x.timer", "[Timer]");
+    let got = refused(plan(&t.inputs()));
+    assert!(got.contains("kbf-x.timer"), "{got}");
+    assert!(!got.contains("kbf.slice:"), "{got}");
 }
