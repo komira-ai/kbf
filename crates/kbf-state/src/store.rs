@@ -6,9 +6,51 @@ use std::ops::Bound;
 
 use crate::clock::StoreTime;
 use crate::types::{
-    Changes, Commit, CommitStats, Conflict, ResumeToken, Revision, ScanPage, ScanRange, StoreError,
-    Txn, Versioned,
+    Changes, Commit, CommitStats, Cond, Conflict, ResumeToken, Revision, ScanPage, ScanRange,
+    StoreError, Txn, Versioned,
 };
+
+/// Keeps a holder's liveness announcement ([`Store::hold_liveness`]) up. Dropping it
+/// takes the announcement down; so does the death of the process that owns it.
+#[must_use = "dropping the guard ends the liveness announcement at once"]
+pub struct LivenessGuard {
+    held: Box<dyn Announcement>,
+}
+
+/// What a backend keeps up to announce a holder (for Postgres, the dedicated connection
+/// that owns the advisory lock). Dropping it takes the announcement down.
+pub trait Announcement: Send + Sync {
+    /// Whether the announcement is still up, by a cheap check of the thing that holds it
+    /// (not of the store as a whole).
+    fn is_held(&self) -> bool;
+}
+
+impl LivenessGuard {
+    /// A guard that keeps `held` alive; dropping the guard drops it.
+    pub fn new(held: impl Announcement + 'static) -> LivenessGuard {
+        LivenessGuard {
+            held: Box::new(held),
+        }
+    }
+
+    /// Whether the announcement is still up. It is a round trip on the connection that
+    /// holds it, so it is cheap but not free: poll it, do not call it per write. `false`
+    /// means the announcement is gone (the server ended the connection: a network
+    /// failure, an idle-session timeout, a terminate): other sessions already see the
+    /// holder as dead, so the holder must stop acting as one (self-fence). `true` is
+    /// proof only up to the moment of the check; the connection can still be lost the
+    /// next instant, which is why the check is repeated.
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        self.held.is_held()
+    }
+}
+
+impl std::fmt::Debug for LivenessGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LivenessGuard")
+    }
+}
 
 /// A durable, ordered key-value store with transactions, counters, time-to-live keys and
 /// a change feed. The contract is clauses C1 to C8 of the architecture design; the
@@ -83,6 +125,81 @@ pub trait Store: Send + Sync {
     /// # Errors
     /// [`StoreError`] when the backend fails.
     fn reap_expired(&self) -> Result<usize, StoreError>;
+
+    /// [`Store::reap_expired`], but only if `key` meets `cond` at the moment the keys are
+    /// removed: the check and the removal are one atomic step of the backend, so a write
+    /// to `key` cannot land between them. A failed check removes nothing and is the
+    /// [`Conflict`] a transaction on the same precondition would give (index 0).
+    /// [`crate::Fenced`] reaps through this, with its generation as the precondition.
+    ///
+    /// The default reads `key`, then calls [`Store::reap_expired`]: **not atomic**, a
+    /// write can land between the two. It is there so a wrapper that forwards only the
+    /// other methods (a test double) still compiles. **Any `Store` used in production, or
+    /// under a [`crate::Fenced`] handle that must fence, must override it**, and a
+    /// wrapper over a real backend must forward it, not inherit the default.
+    ///
+    /// The fake and SQLite are atomic by construction, which stands in for an in-backend
+    /// race test (no interleaving point exists to test): the fake judges and reaps under
+    /// one held mutex, and SQLite applies the check and the reap in one step of its single
+    /// writer thread. Postgres judges and reaps in one transaction after the commit-head
+    /// lock; its race is tested on a server with a take held open.
+    ///
+    /// # Errors
+    /// [`StoreError`] when the backend fails.
+    fn reap_expired_if(
+        &self,
+        key: &str,
+        cond: Cond,
+    ) -> Result<Result<usize, Conflict>, StoreError> {
+        let live = self.get(key)?;
+        let met = match cond {
+            Cond::Any => true,
+            Cond::Absent => live.is_none(),
+            Cond::Version(version) => live.is_some_and(|row| row.version == version),
+        };
+        if !met {
+            return Ok(Err(Conflict {
+                index: 0,
+                key: key.to_owned(),
+            }));
+        }
+        self.reap_expired().map(Ok)
+    }
+
+    /// Announces that the holder of `generation` is alive, for as long as the returned
+    /// guard lives or the process does: whoever asks [`Store::holder_alive`] for that
+    /// generation, from any session, is told yes. The announcement is released when the
+    /// guard is dropped, and by the backend itself when the process or its connection
+    /// dies, so "the holder is dead" is never a guess from a pid. The guard owns its own
+    /// connection to the backend, outside any pool, and nothing else uses it.
+    ///
+    /// The server can end that connection while the holder runs; the holder cannot see it
+    /// happen, and others then see it dead. [`LivenessGuard::is_held`] is how it finds
+    /// out. Announcing a generation that is being probed at that instant is retried
+    /// briefly (a probe holds the key for one statement; a real holder holds it
+    /// indefinitely) before it is refused.
+    ///
+    /// # Errors
+    /// [`StoreError`] when the backend cannot announce (the default: only Postgres can,
+    /// with a session advisory lock), or when `generation` already has a live holder.
+    fn hold_liveness(&self, generation: u64) -> Result<LivenessGuard, StoreError> {
+        let _ = generation;
+        Err(StoreError::Failed(
+            "this backend cannot announce a holder's liveness".to_owned(),
+        ))
+    }
+
+    /// Whether the holder of `generation` is alive: whether some session holds the
+    /// announcement of [`Store::hold_liveness`] for it right now.
+    ///
+    /// # Errors
+    /// [`StoreError`] when the backend cannot tell (the default) or fails.
+    fn holder_alive(&self, generation: u64) -> Result<bool, StoreError> {
+        let _ = generation;
+        Err(StoreError::Failed(
+            "this backend cannot tell whether a holder is alive".to_owned(),
+        ))
+    }
 
     /// The commit counters.
     fn commit_stats(&self) -> CommitStats;

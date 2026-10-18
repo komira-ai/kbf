@@ -33,6 +33,13 @@ pub struct Policy {
     /// because the route serves build outputs and logs. The route is also off
     /// without [`Self::invocations_get`].
     pub blobs_get: Option<Arc<dyn Authorizer>>,
+    /// `farm.getAuthorizer` (the `farm.get` authority): asked, with the empty instance
+    /// name (farm state names no build), by the operator API's per-host update detail
+    /// (`GET /v1/update/hosts`), which runs [`Self::authenticator`] too. `None`, when
+    /// the file names no such key or there is no file, turns that route off: unlike
+    /// every other authorizer, a missing one does not allow, because the route serves
+    /// the commits each host runs and why it refused an update.
+    pub farm_get: Option<Arc<dyn Authorizer>>,
 }
 
 impl fmt::Debug for Policy {
@@ -78,6 +85,7 @@ impl Policy {
             authorizers: Authorizers::allow_all(),
             invocations_get: None,
             blobs_get: None,
+            farm_get: None,
         }
     }
 
@@ -104,6 +112,7 @@ impl Policy {
                 "executeAuthorizer",
                 "invocations",
                 "blobs",
+                "farm",
             ],
         )?;
         let authenticator = match top.get("authenticationPolicy") {
@@ -151,11 +160,13 @@ impl Policy {
         }
         let invocations_get = off_unless_named(top, &path, "invocations", "invocation pages")?;
         let blobs_get = off_unless_named(top, &path, "blobs", "blob reads over HTTP")?;
+        let farm_get = off_unless_named(top, &path, "farm", "farm reads")?;
         Ok(Self {
             authenticator,
             authorizers,
             invocations_get,
             blobs_get,
+            farm_get,
         })
     }
 }

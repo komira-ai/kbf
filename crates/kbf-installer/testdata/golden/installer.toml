@@ -1,0 +1,10 @@
+release_source = "url"
+release_url = "https://releases.example.com/kbf"
+source_refs = ["refs/heads/main", "refs/tags/v1"]
+confirm_window_s = 600
+confirm_window_max_s = 1200
+min_generation = 17
+min_protocol = 11
+fetch_timeout_s = 1200
+max_component_bytes = 268435456
+min_activation_interval_s = 120

@@ -299,6 +299,9 @@ jobs:
         image: postgres@sha256:2a0d0fe14825b0939f78a8cad5cd4e6aa68bf94d0e5dd96e24b6d23af4315545
         env:
           POSTGRES_PASSWORD: kbf-ci-throwaway
+          # The frontend process test reaches the server with no password, as the flag
+          # requires; the container lives only for this job.
+          POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
         options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
@@ -347,7 +350,18 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # The same throwaway server as the state-postgres job, so the Postgres tests count.
+    services:
+      postgres:
+        image: postgres@sha256:2a0d0fe14825b0939f78a8cad5cd4e6aa68bf94d0e5dd96e24b6d23af4315545
+        env:
+          POSTGRES_PASSWORD: kbf-ci-throwaway
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
     env:
+      KBF_TEST_POSTGRES_URL: postgres://postgres:kbf-ci-throwaway@127.0.0.1:5432/postgres
       RUSTFLAGS: ""
       COVERAGE_TOOLCHAIN: nightly-2026-10-01
       LLVM_COV_VERSION: 0.9.1
@@ -379,7 +393,15 @@ jobs:
       - name: Run the workspace tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --workspace --locked --branch --lcov --output-path target/coverage/lcov.info
+        run: |
+          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --workspace --locked --branch --no-report
+          # The tests that need the server, as the state-postgres job runs them; their
+          # counters join the workspace run's in the report below.
+          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-state --features postgres -- --include-ignored
+          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-server --test state_store_postgres -- --include-ignored
+          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-server --test state_store -- --include-ignored over_postgres
+          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-cli --test frontend_process -- --include-ignored postgres_state_store
+          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov report --branch --lcov --output-path target/coverage/lcov.info
       # When every failure is coverage that improved, the step prints (and puts in the
       # job summary) the `kbf-coverage tighten` command that downloads this run's
       # `coverage` artifact and lowers coverage-baseline; --artifact must name the
@@ -444,7 +466,7 @@ jobs:
   native-macos:
     if: ${{ github.event_name != 'pull_request' || github.base_ref != 'feature/arch-v2' || contains(github.event.pull_request.labels.*.name, 'macos') }}
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
     env:
