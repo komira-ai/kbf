@@ -115,7 +115,8 @@ pub use crate::recorder::{
     ActionLabel, DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording,
     Tap, listing, owner, wall_now,
 };
-pub use crate::relay::{Handed, Relay};
+pub use crate::relay::{Handed, Relay, Successor};
+
 pub use crate::request_metadata::{
     CallMetadata, HEADER as REQUEST_METADATA_HEADER, Invalid, InvocationId, MAX_HEADER_BYTES,
     MAX_ID_BYTES, MAX_TEXT_BYTES, Read, ReadRequestMetadata, RequestMetadataLayer, Text,
@@ -294,15 +295,94 @@ pub fn routes_proxied<D>(
 where
     D: Dispatch,
 {
-    let OpenStreams { closing, progress } = streams;
-    let execution = ExecutionServer::new(
-        ExecutionService::with_authorizers(backend, dispatch, closing, Arc::clone(&authorizers))
-            .recording(recorder.clone())
-            .with_progress(progress)
-            .with_default_memory(default_memory),
+    proxied(
+        proxy,
+        backend.into(),
+        dispatch,
+        streams,
+        authorizers,
+        recorder,
+        default_memory,
+        |execution, _, _| execution,
     )
-    .max_decoding_message_size(MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(MAX_MESSAGE_BYTES);
+}
+
+/// What a frontend that may hand its roles to a successor forwards its `Execute` and
+/// `WaitExecution` calls with once it has ([`Relay`]).
+pub struct Relaying {
+    /// Whether the frontend has handed its roles over.
+    pub farm: Arc<dyn Handed>,
+    /// The successor's channel, named when the successor says who it is.
+    pub successor: Successor,
+    /// How often a relay that fell back to the state store looks in it.
+    pub follow_every: std::time::Duration,
+}
+
+/// [`routes_proxied`] with the `Execution` service behind a [`Relay`]: calls are the
+/// wrapped service's until `relaying.farm` has handed over, and the successor's after.
+#[allow(clippy::too_many_arguments)] // `routes_proxied`'s seven, and the relay's.
+pub fn routes_relayed<D>(
+    proxy: &Proxy,
+    backend: impl Into<Backend>,
+    dispatch: Arc<D>,
+    streams: OpenStreams,
+    authorizers: Arc<Authorizers>,
+    recorder: &Recorder,
+    default_memory: u64,
+    relaying: Relaying,
+) -> Routes
+where
+    D: Dispatch,
+{
+    let backend = backend.into();
+    let counted = backend.clone();
+    proxied(
+        proxy,
+        backend,
+        dispatch,
+        streams,
+        authorizers,
+        recorder,
+        default_memory,
+        move |execution, closing, progress| {
+            let streams = OpenStreams { closing, progress };
+            Relay::new(execution, relaying.farm, relaying.successor, counted)
+                .with_streams(streams)
+                .following_every(relaying.follow_every)
+        },
+    )
+}
+
+/// The routes of [`routes_proxied`], the `Execution` service made by `wrap` from the
+/// service and the two halves of the open streams' wiring.
+#[allow(clippy::too_many_arguments)] // `routes_proxied`'s seven, and the wrap.
+fn proxied<D, E>(
+    proxy: &Proxy,
+    backend: Backend,
+    dispatch: Arc<D>,
+    streams: OpenStreams,
+    authorizers: Arc<Authorizers>,
+    recorder: &Recorder,
+    default_memory: u64,
+    wrap: impl FnOnce(ExecutionService<D>, Closing, Progress) -> E,
+) -> Routes
+where
+    D: Dispatch,
+    E: kbf_proto::reapi::execution_server::Execution,
+{
+    let OpenStreams { closing, progress } = streams;
+    let service = ExecutionService::with_authorizers(
+        backend,
+        dispatch,
+        closing.clone(),
+        Arc::clone(&authorizers),
+    )
+    .recording(recorder.clone())
+    .with_progress(progress.clone())
+    .with_default_memory(default_memory);
+    let execution = ExecutionServer::new(wrap(service, closing, progress))
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let capabilities = CapabilitiesService::new(true, authorizers);
     proxy
         .routes()

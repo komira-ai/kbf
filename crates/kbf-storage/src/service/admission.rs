@@ -12,18 +12,28 @@
 //! here is it with the refusal as a gRPC status, and `kbf-server`'s worker listener asks
 //! it too.
 //!
-//! **Names** are `kbf-peer`'s as well ([`names_of`]): the DNS and IP subjectAltNames, which
+//! **Names** are `kbf-peer`'s as well ([`PeerNames`]): the DNS and IP subjectAltNames, which
 //! `kbf-server`'s `Membership` service checks against a storage node's instance id and
-//! address at `Register` and `Heartbeat`. The storage endpoints here check the role only.
-//! Not here, and planned in section 9 and phase P7: the deny list and node-name checks
-//! on these endpoints (the worker listener's `Membership` calls apply its deny list and
-//! its node-name rule already), and the signed storage-access grant.
+//! address at `Register` and `Heartbeat`. The storage endpoints do not check them.
+//!
+//! **The deny list** is the storage map's `denied` ([`kbf_map::Map::denied`], which the
+//! frontend writes from the operator's entries and every node is sent with the map).
+//! [`Admission::guard`] is the one check every endpoint makes: the role first, then, under
+//! mutual TLS, whether any entry names the caller's certificate (its serial, the hash of its
+//! public key, or a DNS name that is a listed node, up to ASCII case), which is
+//! PERMISSION_DENIED on every endpoint, [`Endpoint::WriteLeg`] included. The map is read at
+//! each call, so an entry takes effect from the first call after the node holds the
+//! generation that carries it. A node that holds no map enforces nothing: one with a map
+//! source serves nothing until it has a map (`service`'s module docs), one with none (a
+//! standalone node) serves every call and enforces no entry. Not here, and planned in
+//! section 9: the signed storage-access grant.
 //!
 //! Plain text ([`Admission::Open`]) has no identity to read, so it admits every call but a
 //! copy from another storage node ([`Endpoint::WriteLeg`]), which only a certified storage
 //! caller may send: for
 //! tests and trials on one machine, as the worker listener's `Peers::Unauthenticated`.
 
+use kbf_map::DenyEntry;
 use kbf_peer::RoleError;
 pub use kbf_peer::{PeerNames, PeerRole, ROLE_URI_PREFIX, host_of};
 use tonic::{Request, Status};
@@ -99,14 +109,48 @@ pub enum Admission {
 }
 
 impl Admission {
-    /// Admits the call `request` is to `endpoint`, or says why not.
+    /// Admits the call `request` is to `endpoint`, or says why not: the caller's role
+    /// first ([`Admission::check_leaf`]), then, under mutual TLS, whether an entry of
+    /// `denied` names its certificate. Every endpoint makes this check and no other.
     ///
     /// # Errors
-    /// See [`Admission::check_leaf`].
-    pub fn check<T>(&self, request: &Request<T>, endpoint: Endpoint) -> Result<(), Status> {
+    /// See [`Admission::guard_leaf`].
+    pub fn guard<T>(
+        &self,
+        request: &Request<T>,
+        endpoint: Endpoint,
+        denied: &[DenyEntry],
+    ) -> Result<(), Status> {
         let certs = kbf_tls::peer_certs(request);
         let leaf = certs.as_deref().and_then(|chain| chain.first());
-        self.check_leaf(leaf.map(AsRef::as_ref), endpoint)
+        self.guard_leaf(leaf.map(AsRef::as_ref), endpoint, denied)
+    }
+
+    /// [`Admission::guard`] for a caller whose verified chain starts with `leaf`.
+    ///
+    /// # Errors
+    /// Those of [`Admission::check_leaf`]; then, under [`Admission::Certified`],
+    /// PERMISSION_DENIED if an entry of `denied` names the certificate (the message gives
+    /// the entry, in the spelling a deny list takes). An empty `denied` reads nothing more
+    /// of the certificate.
+    pub fn guard_leaf(
+        &self,
+        leaf: Option<&[u8]>,
+        endpoint: Endpoint,
+        denied: &[DenyEntry],
+    ) -> Result<(), Status> {
+        self.check_leaf(leaf, endpoint)?;
+        if *self == Self::Open || denied.is_empty() {
+            return Ok(());
+        }
+        // `check_leaf` refused a missing or unreadable certificate above. Were one to get
+        // here all the same, it is judged denied (by the first entry), never admitted.
+        let identity = leaf.map(kbf_peer::identity_of).and_then(Result::ok);
+        let Some(entry) = identity.map_or(denied.first(), |i| i.denied_by(denied)) else {
+            return Ok(());
+        };
+        tracing::warn!(%entry, ?endpoint, "storage call refused: the caller is denied");
+        Err(Status::permission_denied(format!("denied: {entry}")))
     }
 
     /// Whether the caller of `request` may mark a write as an unowned copy
@@ -131,7 +175,8 @@ impl Admission {
         }
     }
 
-    /// [`Admission::check`] for a caller whose verified chain starts with `leaf`.
+    /// Admits the call to `endpoint` of a caller whose verified chain starts with `leaf` by
+    /// its role alone (the first half of [`Admission::guard`]).
     ///
     /// # Errors
     /// UNAUTHENTICATED for [`Endpoint::WriteLeg`] under [`Admission::Open`]. Under
@@ -168,15 +213,6 @@ impl Admission {
 /// role or several, or a name that is no role.
 pub fn role_of(der: &[u8]) -> Result<PeerRole, Status> {
     kbf_peer::role_of(der).map_err(|e| refusal(&e))
-}
-
-/// The DNS and IP names a DER certificate carries (`kbf_peer::names_of`), a refusal as
-/// the status every listener that takes a client certificate answers it.
-///
-/// # Errors
-/// UNAUTHENTICATED: the bytes are not a certificate.
-pub fn names_of(der: &[u8]) -> Result<PeerNames, Status> {
-    kbf_peer::names_of(der).map_err(|e| refusal(&e))
 }
 
 /// The status a certificate that gives no identity is answered with.

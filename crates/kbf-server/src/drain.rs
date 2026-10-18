@@ -129,6 +129,12 @@ impl Drain {
         self.readiness.stop()
     }
 
+    /// Whether `/readyz` and the health service answer not ready.
+    #[must_use]
+    pub fn is_unready(&self) -> bool {
+        self.readiness.is_stopping()
+    }
+
     /// Sends the REAPI listener GOAWAY: it stops accepting and the serving future
     /// returns once its connections have closed. Returns whether this call was the
     /// first; [`Drain::is_draining`] is true from then on.

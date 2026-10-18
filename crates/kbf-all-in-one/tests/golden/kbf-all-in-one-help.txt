@@ -93,7 +93,7 @@ Options:
 
           Possible values:
           - fake:                 Runs nothing; every action succeeds with an empty result. For bring-up only
-          - container:            Each action in a fresh rootless Podman container (Linux)
+          - container:            Each action in a fresh rootless container made by `crun` (Linux)
           - native:               Each action as plain processes on the node, for Macs
           - native-whole-machine: Each whole-machine lease as its own user in its GUI session, through `kbf-mac-session` (macOS)
 
@@ -108,32 +108,30 @@ Options:
       --reapi-tls-cert <REAPI_TLS_CERT>
           PEM certificate (chain) of the REAPI listener. With `--reapi-tls-key` it serves TLS with this server certificate only; clients present no certificate. It is meant for a certificate from the farm's own internal CA, trusted by the front's proxy (its hop to this server) and by clients that dial this server directly; TLS for the farm's client-facing name still ends at the front. `--reapi-auth-policy` applies over TLS as over plain text
 
+      --reapi-tls-key <REAPI_TLS_KEY>
+          PEM private key of the REAPI listener; it must match `--reapi-tls-cert`, or the server refuses to start
+
+      --update-dir <DIR>
+          The update directory: the daemon fetches the release the frontend offers into its `inbox/`, over the connection `--cas` names, and reads the root helper's `status.json` there. Left out, the node updates by hand: it says so and touches no directory. Not taken by the all-in-one binary yet
+
       --data-dir <DIR>
           The directory the daemon keeps everything in, on a local disk: `leases/` (lease directories, the container and native drivers), and under the container driver (and the native driver on macOS) `cache/` (the input cache, `docs/design/worker-cache.md`) and `trees/` (shared read-only input trees, `docs/design/fast-sandbox.md#4-shared-trees`). Made if missing; absolute. The cache and trees are on, sized from the filesystem: half and a quarter of its size less what it keeps free (5%, at least 1 GiB), and the cache evicts entries no running lease links to keep that much free. A directory another daemon owns, or that cannot be used, is left alone: the daemon warns and runs uncached.
           
           Default `/var/lib/kbf`. A daemon with the fake driver alone touches no directory unless this is given.
 
-      --reapi-tls-key <REAPI_TLS_KEY>
-          PEM private key of the REAPI listener; it must match `--reapi-tls-cert`, or the server refuses to start
+      --reapi-auth-policy <REAPI_AUTH_POLICY>
+          A JSON file with the REAPI listener's authentication policy and authorizers (`docs/reapi-auth.md`), read once at start; a file that is not a valid policy stops the server. Without it every REAPI call is accepted and allowed. The worker listener does not read it; on the operator API only the build pages and the blob route do, and they are off unless it names their authorizers
 
       --data-max-bytes <BYTES>
           Lowers the size the cache and the trees are budgeted from (half and a quarter of it), under the filesystem's automatic one
 
-      --reapi-auth-policy <REAPI_AUTH_POLICY>
-          A JSON file with the REAPI listener's authentication policy and authorizers (`docs/reapi-auth.md`), read once at start; a file that is not a valid policy stops the server. Without it every REAPI call is accepted and allowed. The worker listener does not read it; on the operator API only the build pages and the blob route do, and they are off unless it names their authorizers
+      --storage <URL>
+          Proxy mode (`docs/design/architecture-v2.md`, section 7): the URL of a storage node (`kbf storage`), such as `http://127.0.0.1:8990`. The REAPI listener then answers a client's CAS, ByteStream and action-cache calls from that node, passing ByteStream through without holding a blob. The local stores are still opened: Execution and the worker listener use them (`kbf frontend` is this mode without them: Execution reads the node too). Plain text (`http://`) only here; `kbf frontend` takes the flags of the mutual TLS to the node. Without it, the server answers those calls itself
 
       --output-max-depth <MAX_DEPTH>
           The deepest directory an output directory may hold, in levels below it (its own entries are level 1)
           
           [default: 512]
-
-      --storage <URL>
-          Proxy mode (`docs/design/architecture-v2.md`, section 7): the URL of a storage node (`kbf storage`), such as `http://127.0.0.1:8990`. The REAPI listener then answers a client's CAS, ByteStream and action-cache calls from that node, passing ByteStream through without holding a blob. The local stores are still opened: Execution and the worker listener use them (`kbf frontend` is this mode without them: Execution reads the node too). Plain text (`http://`) only here; `kbf frontend` takes the flags of the mutual TLS to the node. Without it, the server answers those calls itself
-
-      --output-max-entries <MAX_ENTRIES>
-          The most entries (files, directories, symlinks and anything else) one action's outputs may hold together, the declared outputs included
-          
-          [default: 1000000]
 
       --worker-listen <WORKER_LISTEN>
           The `kbf.worker.v1` listener. Without mutual TLS (`--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca`) it serves plain text, on any address; off loopback the start line carries a warning
@@ -143,18 +141,26 @@ Options:
       --api-listen <API_LISTEN>
           The operator API listener (HTTP/JSON under `/v1`). Off unless given. Reads are open to whoever reaches it: bind it where only operators do
 
+      --output-max-entries <MAX_ENTRIES>
+          The most entries (files, directories, symlinks and anything else) one action's outputs may hold together, the declared outputs included
+          
+          [default: 1000000]
+
+      --api-token-file <API_TOKEN_FILE>
+          A file holding the token operator API writes (cordon, drain, uncordon) must present as `Authorization: Bearer <token>`. It must be owned by the server's user with mode 0600 or 0400, or the server refuses to start; run the server as a user other than the daemon's, whose builds could read it. Without it, writes are refused
+
       --output-max-bytes <MAX_BYTES>
           The most bytes one action's output files may hold together
           
           [default: 17179869184]
 
-      --api-token-file <API_TOKEN_FILE>
-          A file holding the token operator API writes (cordon, drain, uncordon) must present as `Authorization: Bearer <token>`. It must be owned by the server's user with mode 0600 or 0400, or the server refuses to start; run the server as a user other than the daemon's, whose builds could read it. Without it, writes are refused
-
       --output-max-stdio-bytes <MAX_STDIO_BYTES>
           The most bytes each of the action's stdout and stderr may hold
           
           [default: 1073741824]
+
+      --releases-dir <DIR>
+          The release store (`docs/design/pull-updates.md`, section 6): a directory where the tarballs of a release and their build attestations are kept, uploaded with `PUT /v1/releases/{commit}/{platform}/{name}` on the operator API (which needs the token) and fetched by the nodes through `ReleaseService.Fetch` on the worker listener, behind its mutual TLS. Made if missing. Without it every update endpoint answers 503 saying so
 
       --invocations-open
           Serves the build pages (`GET /v1/invocations/{id}` and below) and the blob route (`GET /v1/blobs/{digest}`) on the operator API to every caller the REAPI policy accepts, with no `invocations` or `blobs` key in the policy file (`docs/design/invocations.md` section 4.3): it fills in `allow` for whichever of the two keys the file leaves out. Without it, and without the keys, those routes answer 404. Pages and blobs hold build outputs and logs: give it only for a listener that only trusted people reach
@@ -377,6 +383,16 @@ Options:
           
           [default: 4]
 
+      --store-put-attempts <STORE_PUT_ATTEMPTS>
+          How many times a segment PUT is tried. Only a PUT that did not complete (connect, reset, timeout) or that the store answered 5xx is tried again, after 100 ms and then four times longer each time, under a new object key; if every attempt fails, the segment's blobs are answered UNAVAILABLE
+          
+          [default: 3]
+
+      --input-tree-cache-entries <INPUT_TREE_CACHE_ENTRIES>
+          The most decoded Directories an Execute's input check keeps in memory (`docs/design/storage.md#input-tree-check`). Least recently used go first
+          
+          [default: 1048576]
+
       --write-pool-writers <WRITE_POOL_WRITERS>
           The writers of the write pool: the ByteStream and storage `Write`s of a node with a write tier are appended to shared segment files by this many writers, each holding one range open, so the node keeps at most this many block files (plus the open grouped block) open for writing for those blobs, however many uploads are in flight. At least 1
           
@@ -386,6 +402,11 @@ Options:
           How often each lease's `max` events and swap are sampled, in milliseconds (container)
           
           [default: 1000]
+
+      --input-tree-cache-bytes <INPUT_TREE_CACHE_BYTES>
+          The most bytes of decoded Directories the input check keeps (each costs its digests, 40 bytes apiece, and 160 bytes)
+          
+          [default: 268435456]
 
       --write-pool-queue <WRITE_POOL_QUEUE>
           The most blobs waiting for a write-pool writer. A blob that finds the queue full goes straight to the object store, as one does when the write tier has no room. At least 1
@@ -397,6 +418,11 @@ Options:
           
           [default: 150]
 
+      --input-tree-reads-in-flight <INPUT_TREE_READS_IN_FLIGHT>
+          The most Directory blobs the input check reads from the store at once, across all Executes
+          
+          [default: 64]
+
       --write-pool-stream-idle <WRITE_POOL_STREAM_IDLE>
           How long, in seconds, a streamed blob may go without sending a chunk before its write-pool writer is taken back and the upload fails UNAVAILABLE (the client sends it again). Without it, a stalled but connected large upload would hold a writer for ever, and with all writers held every other blob would wait. It limits stalls only: an upload that sends a chunk more often than this (a trickle) can still hold a writer. At least 1
           
@@ -407,35 +433,25 @@ Options:
           
           [default: 512]
 
-      --store-put-attempts <STORE_PUT_ATTEMPTS>
-          How many times a segment PUT is tried. Only a PUT that did not complete (connect, reset, timeout) or that the store answered 5xx is tried again, after 100 ms and then four times longer each time, under a new object key; if every attempt fails, the segment's blobs are answered UNAVAILABLE
-          
-          [default: 3]
-
-      --input-tree-cache-entries <INPUT_TREE_CACHE_ENTRIES>
-          The most decoded Directories an Execute's input check keeps in memory (`docs/design/storage.md#input-tree-check`). Least recently used go first
-          
-          [default: 1048576]
-
       --memory-poll-ms <MEMORY_POLL_MS>
           How often a lease's memory is measured, in milliseconds (native)
           
           [default: 250]
 
-      --input-tree-cache-bytes <INPUT_TREE_CACHE_BYTES>
-          The most bytes of decoded Directories the input check keeps (each costs its digests, 40 bytes apiece, and 160 bytes)
+      --member-ttl-secs <SECONDS>
+          How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
           
-          [default: 268435456]
+          [default: 15]
 
       --xcode-apps <XCODE_APPS>
           The directory searched for `Xcode*.app` (native). Each Xcode whose own `xcodebuild` answers `-version`, `-license check` and `-checkFirstLaunchStatus`, and for which `xcrun --find clang` does (each within a minute, under the actions' sandbox), is ready: it is reported as an `xcode` entry, and an action that names its build runs with it as `DEVELOPER_DIR`. One that is not is listed in the node's status with why and the command that fixes it, and logged at WARN. The daemon says Hello without waiting for its first survey, which runs in the background: until it ends, each Xcode is listed as not surveyed yet and none is reported
           
           [default: /Applications]
 
-      --input-tree-reads-in-flight <INPUT_TREE_READS_IN_FLIGHT>
-          The most Directory blobs the input check reads from the store at once, across all Executes
+      --member-dwell-secs <SECONDS>
+          How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners
           
-          [default: 64]
+          [default: 300]
 
       --xcode-recheck-secs <XCODE_RECHECK_SECS>
           How often, in seconds, the Xcodes are asked again (native), so one fixed while the daemon runs becomes ready without a restart
@@ -446,23 +462,7 @@ Options:
           This node's actions use Metal (native): an Xcode whose Metal toolchain is not installed (`xcodebuild -showComponent MetalToolchain`) is not ready
 
       --image <IMAGE>
-          A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon checks each is in its user's image store, as the prepare step of every lease does, and exits with status 2 if one is not, or names an image index, saying the fix (`podman pull <repo>@sha256:<d>`). The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
-
-      --member-ttl-secs <SECONDS>
-          How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
-          
-          [default: 15]
-
-      --container-runtime <podman|oci>
-          The runtime that runs each action's container (container): `podman`, the default, runs `podman create` and `podman start` per action; `oci` runs each action in a fresh rootless sandbox through `--oci-runtime` directly, with no Podman on the action path (Podman only pulls and exports an image once per digest). `oci` needs the daemon user's subordinate ids in one range, `uidmap`, and every directory down to `--data-dir` searchable by others
-          
-          [default: podman]
-          [possible values: podman, oci]
-
-      --member-dwell-secs <SECONDS>
-          How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners
-          
-          [default: 300]
+          A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon makes sure each is in the node's image store, as the prepare step of every lease does: it fetches the image from its registry by that digest, checks every byte against a digest, and unpacks it once. It exits with status 2 if one cannot be fetched, fails a check, or names an image index. The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
 
       --lease-placement <none|numa-node>
           Where each lease runs among the node's CPUs (container, Linux): `none`, the default, lets a lease use any CPU the daemon may; `numa-node` puts each lease on one NUMA node, its CPUs (`cpuset.cpus`) and memory (`cpuset.mems`), the node with the least CPU booked by running leases (the lowest id on a tie). `--reserve-cpus` is a quota on all leases together, so it still applies; it removes no CPU from a node. Needs the `cpuset` controller delegated to the daemon (the start fails and says how when it is not); a host with fewer than two NUMA nodes that hold CPUs runs as `none`, which the start logs. Refused with a driver other than `container` (macOS has no such driver)
@@ -471,7 +471,7 @@ Options:
           [possible values: none, numa-node]
 
       --oci-runtime <OCI_RUNTIME>
-          The OCI runtime `--container-runtime=oci` runs actions with (container)
+          The OCI runtime that runs each action's container (container): `crun`, run directly. Each action gets a fresh rootless sandbox. It needs the daemon user's subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on `PATH`, and every directory down to `--data-dir` searchable by others
           
           [default: /usr/bin/crun]
 

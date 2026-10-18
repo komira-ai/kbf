@@ -21,7 +21,11 @@
 //! state store by its action (the successor's operation name does not carry the operation
 //! id; the unfinished row names the request, so this is done while the first operation
 //! arrives) and follows it as [`Handed::look`] says, from the `done/` rows, until it ends:
-//! the same follower a frontend runs for the streams it kept open. A stream that has
+//! the same follower a frontend runs for the streams it kept open. The followed stream
+//! has no timeout: it ends when the operation's `done/` row is read, when the caller
+//! cancels (the stream is dropped), or when the process stops. Rows that cannot be read,
+//! or an operation with no trace in them, are looked at again at the next interval.
+//! A stream that has
 //! sent nothing yet, or whose operation could not be found, ends with the status it broke
 //! with: nothing is known that could answer it.
 //!
@@ -34,7 +38,7 @@
 //! as long as its action runs.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures::stream;
@@ -78,19 +82,52 @@ pub trait Handed: Send + Sync + 'static {
         action: &Digest,
     ) -> Result<Option<OperationId>, String>;
 
-    /// One look at `operation` in the state store: the stage to show now (executing,
-    /// done, or lost after the follower's looks), or `None` when nothing changes.
+    /// One look at `operation` in the state store: the stage to show now (executing or
+    /// done), or `None` when nothing changes. An operation the store has no trace of is
+    /// `None` too: it is reported by the farm, never answered. A followed stream ends only
+    /// with the operation's `done/` row.
     ///
     /// # Errors
-    /// The state store cannot be read.
+    /// The state store cannot be read. The relay looks again at its next interval.
     fn look(&self, operation: OperationId) -> Result<Option<Stage>, String>;
+
+    /// The relay is no longer following `operation` (its stream ended or the caller
+    /// cancelled): the farm forgets what it reported about it.
+    fn release(&self, operation: OperationId);
+}
+
+/// Where a relay sends its calls: the successor's channel, which a frontend that does not
+/// know its successor when it starts is given once the successor says who it is
+/// ([`Successor::set`]). Clones share the one channel.
+#[derive(Clone, Debug, Default)]
+pub struct Successor(Arc<OnceLock<Channel>>);
+
+impl Successor {
+    /// A successor not known yet: a relay with no channel refuses a call UNAVAILABLE.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self::default()
+    }
+
+    /// Names the successor's channel. Returns whether it did: a successor is named once.
+    pub fn set(&self, channel: Channel) -> bool {
+        self.0.set(channel).is_ok()
+    }
+}
+
+impl From<Channel> for Successor {
+    fn from(channel: Channel) -> Self {
+        let successor = Self::unknown();
+        successor.set(channel);
+        successor
+    }
 }
 
 /// The `Execution` service `E`, and the calls it forwards once its farm has handed over.
 pub struct Relay<E> {
     inner: E,
     farm: Arc<dyn Handed>,
-    successor: Channel,
+    successor: Successor,
     backend: Backend,
     closing: Closing,
     progress: Progress,
@@ -108,11 +145,16 @@ impl<E> Relay<E> {
     /// `backend` is what counts them. Streams are never closed and never re-sent until
     /// [`Relay::with_streams`] says so.
     #[must_use]
-    pub fn new(inner: E, farm: Arc<dyn Handed>, successor: Channel, backend: Backend) -> Self {
+    pub fn new(
+        inner: E,
+        farm: Arc<dyn Handed>,
+        successor: impl Into<Successor>,
+        backend: Backend,
+    ) -> Self {
         Self {
             inner,
             farm,
-            successor,
+            successor: successor.into(),
             backend,
             closing: closing().1,
             progress: Progress::off(),
@@ -137,10 +179,15 @@ impl<E> Relay<E> {
         self
     }
 
-    fn client(&self) -> ExecutionClient<Channel> {
-        ExecutionClient::new(self.successor.clone())
+    /// A client of the successor, or UNAVAILABLE while the successor is not known.
+    fn client(&self) -> Result<ExecutionClient<Channel>, Status> {
+        let channel = self.successor.0.get().cloned();
+        let channel = channel.ok_or_else(|| {
+            Status::unavailable("this frontend has no successor to answer the call")
+        })?;
+        Ok(ExecutionClient::new(channel)
             .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(crate::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::MAX_MESSAGE_BYTES))
     }
 
     /// Counts a call that is being relayed, until the guard drops.
@@ -167,6 +214,7 @@ impl<E> Relay<E> {
             closing: self.closing.clone(),
             progress: self.progress.clone(),
             every: self.follow_every,
+            unreadable: false,
             _open: open,
         };
         Box::pin(stream::unfold(Some(relayed), |state| async move {
@@ -191,9 +239,10 @@ where
             return self.inner.execute(request).await;
         }
         let instance = request.get_ref().instance_name.clone();
+        let mut client = self.client()?;
         let (call, deadline) = forwarded(request);
         let open = self.begin();
-        let live = opened(deadline, self.client().execute(call)).await?;
+        let live = opened(deadline, client.execute(call)).await?;
         Ok(Response::new(self.relayed(
             live.into_inner(),
             Some(instance),
@@ -208,9 +257,10 @@ where
         if !self.farm.handed() {
             return self.inner.wait_execution(request).await;
         }
+        let mut client = self.client()?;
         let (call, deadline) = forwarded(request);
         let open = self.begin();
-        let live = opened(deadline, self.client().wait_execution(call)).await?;
+        let live = opened(deadline, client.wait_execution(call)).await?;
         Ok(Response::new(self.relayed(live.into_inner(), None, open)))
     }
 }
@@ -312,7 +362,17 @@ struct Relayed {
     closing: Closing,
     progress: Progress,
     every: Duration,
+    /// Whether the last look could not read the rows (logged once per run of failures).
+    unreadable: bool,
     _open: Open,
+}
+
+impl Drop for Relayed {
+    fn drop(&mut self) {
+        if let Leg::Follow(tracked) = &self.leg {
+            self.farm.release(tracked.operation);
+        }
+    }
 }
 
 fn shutting_down() -> Status {
@@ -350,11 +410,17 @@ impl Relayed {
                         () = tokio::time::sleep(self.every) => false,
                     };
                     let stage = match self.farm.look(tracked.operation) {
-                        Ok(stage) => stage.filter(|stage| *stage != self.shown),
+                        Ok(stage) => {
+                            self.unreadable = false;
+                            stage.filter(|stage| *stage != self.shown)
+                        }
                         Err(why) => {
-                            let name = &tracked.name;
-                            let why = format!("operation {name} could not be followed: {why}");
-                            return Some((Err(Status::unavailable(why)), None));
+                            // The rows are the only answer there is: look again.
+                            if !std::mem::replace(&mut self.unreadable, true) {
+                                let name = &tracked.name;
+                                tracing::warn!(%name, %why, "relayed operation could not be followed; looking again");
+                            }
+                            None
                         }
                     };
                     let changed = stage.is_some();

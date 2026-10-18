@@ -35,8 +35,13 @@ use tonic::{Code, Status};
 mod budgets;
 #[path = "state_store/fate.rs"]
 mod fate;
+#[path = "state_store/floors.rs"]
+mod floors;
 #[path = "state_store/handover.rs"]
 mod handover;
+#[path = "state_store/subject.rs"]
+mod subject;
+mod thread_log;
 
 const GIB: u64 = 1 << 30;
 
@@ -61,6 +66,8 @@ struct Flaky {
     lie_lease: AtomicBool,
     /// How many more writes of a `done/` row are refused before they apply.
     refuse_done: AtomicI64,
+    /// How many more reads of a `queue/` row fail before they succeed.
+    fail_queue_get: AtomicI64,
     /// The writes that applied, oldest first, as the transaction prints.
     applied: std::sync::Mutex<Vec<String>>,
 }
@@ -156,6 +163,7 @@ impl Flaky {
             lie_done: AtomicBool::new(false),
             lie_lease: AtomicBool::new(false),
             refuse_done: AtomicI64::new(0),
+            fail_queue_get: AtomicI64::new(0),
             applied: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -235,6 +243,10 @@ impl Store for Flaky {
     }
 
     fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {
+        if key.starts_with("queue/") && self.fail_queue_get.load(Ordering::SeqCst) > 0 {
+            self.fail_queue_get.fetch_sub(1, Ordering::SeqCst);
+            return Err(StoreError::Failed("the read failed".to_owned()));
+        }
         self.inner.store().get(key)
     }
 
@@ -314,6 +326,11 @@ impl Disk {
     /// process started over the file does ([`kbf_state::Fenced`]): once another farm takes
     /// the next one, every write of this farm fails and none lands.
     fn generation_farm(&self) -> TestFarm {
+        self.generation_farm_bounded(kbf_sched::MEMORY_FLOORS)
+    }
+
+    /// [`Disk::generation_farm`], keeping at most `bound` memory floors.
+    fn generation_farm_bounded(&self, bound: usize) -> TestFarm {
         let store: Arc<dyn Store> = self.store.clone();
         let fenced = Fenced::take(store, None).expect("the next generation");
         Farm::new(
@@ -321,6 +338,7 @@ impl Disk {
             kbf_sched::UNSERVABLE_WAIT,
             kbf_sched::FINISHED_RETENTION,
         )
+        .with_memory_floors(bound)
         .with_state(Some(StateStore {
             store: Arc::new(fenced),
             epoch: EpochPolicy::Keep,
@@ -1566,6 +1584,80 @@ async fn an_answer_released_by_another_report_keeps_its_own_detail() {
     assert_eq!(farm.dropped_writes(), 0);
 }
 
+/// Rows written so far, as the store's applied log prints them.
+fn writes(disk: &Disk) -> usize {
+    disk.store.applied.lock().expect("log").len()
+}
+
+/// Catches: the release of a committed record on an input that delivers no answers
+/// (a submit), in each of its three states. (a) Nothing is held: the submit's own grant
+/// is written and started by that very call, not at the next tick. (b) Batches are held
+/// (two answers the store refused): the submit's grant is held behind them, nothing is
+/// written out of order and no `Start` is sent. (c) The next input that answers (a tick)
+/// writes the held answers first, in the order they committed, and the grant after them.
+/// The order is driven by the store's refusals, never by timing.
+#[tokio::test(start_paused = true)]
+async fn a_submit_releases_its_grant_only_when_no_batch_is_held() {
+    // (a) nothing held.
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (_, mut inbox) = register(&farm);
+    submit(&farm, request(1)).expect("queued");
+    assert_eq!(
+        starts(&mut inbox).len(),
+        1,
+        "a submit with nothing held did not start its grant at once"
+    );
+
+    // (b) two answers held, then a submit.
+    let disk = Disk::new();
+    let (farm, tickets, leases) = running_two(&disk).await;
+    disk.store.set_down(true);
+    assert!(!accepted(&farm, leases[0]).await);
+    assert!(!accepted(&farm, leases[1]).await);
+    disk.store.set_down(false);
+    let (stream, mut inbox) = register(&farm);
+    let before = writes(&disk);
+    submit(&farm, request(3)).expect("queued");
+    // The submit writes its own queue row; nothing about a lease, held or new.
+    {
+        let log = disk.store.applied.lock().expect("log");
+        assert!(
+            log[before..].iter().all(|w| !w.contains("lease/")),
+            "a submit wrote a lease row past the held answers: {:?}",
+            &log[before..]
+        );
+    }
+    assert!(
+        starts(&mut inbox).is_empty(),
+        "a grant overtook the held answers"
+    );
+    for ticket in &tickets {
+        assert!(!matches!(*ticket.stage.borrow(), Stage::Done(_)));
+    }
+
+    // (c) an answering input releases them in order, the grant last.
+    assert!(farm.heartbeat(&node(), stream, 1, Vec::new()).await);
+    farm.tick().await;
+    for ticket in &tickets {
+        let _ = ended(ticket);
+    }
+    assert!(applied_at(&disk, leases[0]) < applied_at(&disk, leases[1]));
+    let started = starts(&mut inbox);
+    assert_eq!(started.len(), 1, "the held grant was not started once");
+    let grant = format!("lease/{:016x}.{:016x}", started[0].term, started[0].seq);
+    let log = disk.store.applied.lock().expect("log");
+    let put = log
+        .iter()
+        .position(|w| w.contains(&grant))
+        .expect("the grant was written");
+    drop(log);
+    assert!(
+        put > applied_at(&disk, leases[1]),
+        "the grant was written before a held answer"
+    );
+}
+
 /// Catches: a grant carried out ahead of an earlier held record (or released by an input
 /// that delivers no answers), and a held `Start` written after the scheduler gave its
 /// lease up (it would put the lease back in the store over the requeue): the grant waits
@@ -1630,6 +1722,91 @@ async fn a_stale_refusal_of_a_never_tried_effect_drops_it() {
     );
     assert!(farm.dropped_writes() >= 1);
     drop(starts(&mut inbox));
+}
+
+/// Catches: a report that lands in the feed that expires its lease, with a healthy
+/// store. The scheduler lets the worker's result decide the operation, but the farm's own
+/// requeue had already deleted the lease row, so the answer's write read "row is gone" as
+/// stale: the caller was never answered and the op and queue rows stayed behind, for a
+/// restart to run the finished operation again. The caller is answered and no row is left.
+#[tokio::test(start_paused = true)]
+async fn a_report_in_the_feed_that_expires_its_lease_is_answered_and_leaves_no_rows() {
+    let disk = Disk::new();
+    let (farm, ticket, lease) = running(&disk).await;
+    tokio::time::advance(kbf_sched::fence::LEASE_GRACE + Duration::from_secs(1)).await;
+    assert!(accepted(&farm, lease).await);
+    let Finished::Failed(status) = ended(&ticket) else {
+        panic!("the caller was not answered");
+    };
+    assert_eq!(status.message, "test");
+    assert_eq!(farm.dropped_writes(), 0);
+    assert_eq!(
+        (disk.rows("lease/"), disk.rows("op/"), disk.rows("queue/")),
+        (0, 0, 0),
+        "rows of a finished operation were left"
+    );
+}
+
+/// Catches: the same report with the store down, so its answer is held and the requeue
+/// is written first when the store returns: the retry read "row is gone" as its work
+/// done and delivered the answer without writing it, leaving the op and queue rows (the
+/// operation runs again after a restart). The answer is written for real: the caller is
+/// answered once, from the original report, no second `Start` goes out, no row is left.
+#[tokio::test(start_paused = true)]
+async fn a_held_answer_for_a_lease_the_farm_gave_up_is_written_and_delivered_once() {
+    let disk = Disk::new();
+    let (farm, ticket, lease) = running(&disk).await;
+    let (stream, mut inbox) = register(&farm);
+    tokio::time::advance(kbf_sched::fence::LEASE_GRACE + Duration::from_secs(1)).await;
+    disk.store.set_down(true);
+    assert!(!accepted(&farm, lease).await);
+    assert!(
+        !matches!(*ticket.stage.borrow(), Stage::Done(_)),
+        "answered before the store took the result"
+    );
+    disk.store.set_down(false);
+    for _ in 0..3 {
+        farm.tick().await;
+    }
+    assert!(farm.heartbeat(&node(), stream, 1, Vec::new()).await);
+    farm.tick().await;
+    let Finished::Failed(status) = ended(&ticket) else {
+        panic!("the caller was not answered");
+    };
+    assert_eq!(status.message, "test", "not the original report");
+    assert!(starts(&mut inbox).is_empty(), "the operation was run again");
+    assert_eq!(farm.dropped_writes(), 0);
+    assert_eq!(
+        (disk.rows("lease/"), disk.rows("op/"), disk.rows("queue/")),
+        (0, 0, 0),
+        "rows of a finished operation were left"
+    );
+    assert_eq!(disk.rows("done/"), 1);
+}
+
+/// Catches: a failed read of the queue row, made while judging an answer whose lease row
+/// the farm's own give-up deleted, taken for "the row is gone": the answer was dropped as
+/// stale and the caller never answered. A read that fails is the store being unreachable:
+/// the answer is held and written when the read works, the caller answered once.
+#[tokio::test(start_paused = true)]
+async fn a_failed_read_while_judging_an_answer_holds_it_and_does_not_drop_it() {
+    let disk = Disk::new();
+    let (farm, ticket, lease) = running(&disk).await;
+    tokio::time::advance(kbf_sched::fence::LEASE_GRACE + Duration::from_secs(1)).await;
+    disk.store.fail_queue_get.store(1, Ordering::SeqCst);
+    assert!(!accepted(&farm, lease).await);
+    for _ in 0..3 {
+        farm.tick().await;
+    }
+    let Finished::Failed(status) = ended(&ticket) else {
+        panic!("the caller was not answered");
+    };
+    assert_eq!(status.message, "test");
+    assert_eq!(farm.dropped_writes(), 0, "the answer was dropped as stale");
+    assert_eq!(
+        (disk.rows("lease/"), disk.rows("op/"), disk.rows("queue/")),
+        (0, 0, 0)
+    );
 }
 
 /// Catches: an unbounded list of refused `done/` rows: past the cap a new one is

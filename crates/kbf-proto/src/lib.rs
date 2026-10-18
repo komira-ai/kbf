@@ -1,6 +1,7 @@
 //! Generated protocol code: the Remote Execution API v2, the `kbf.worker.v1`
 //! server-daemon protocol, the `kbf.log.v1` replicated-log entries, the `kbf.map.v1`
-//! storage map (with its conversions to `kbf_map` types: `MapDecodeError`) and the gRPC health
+//! storage map (with its conversions to `kbf_map` types: `MapDecodeError`), the `kbf.enroll.v1`
+//! enrollment protocol, the `kbf.update.v1` self-update messages and release fetch, and the gRPC health
 //! checking protocol (`grpc.health.v1`), compiled from `.proto` files by `build.rs`.
 //!
 //! Modules mirror the proto packages, because generated code names other packages by
@@ -53,6 +54,12 @@ pub mod grpc {
 
 /// `kbf.*`: kbf's own protocols.
 pub mod kbf {
+    pub mod enroll {
+        /// How a node enrolls and renews its certificates, and the cold-store keys call.
+        pub mod v1 {
+            tonic::include_proto!("kbf.enroll.v1");
+        }
+    }
     pub mod log {
         /// The payload of a command entry in the replicated log. The conversions to and
         /// from the domain values are in `kbf-log`.
@@ -71,6 +78,13 @@ pub mod kbf {
             tonic::include_proto!("kbf.storage.v1");
         }
     }
+    pub mod update {
+        /// Pull-based self-update: the offer, the order, the host's status and the
+        /// release fetch (`docs/design/pull-updates.md`).
+        pub mod v1 {
+            tonic::include_proto!("kbf.update.v1");
+        }
+    }
     pub mod worker {
         /// The protocol between `kbf-daemon` and `kbf-server`.
         pub mod v1 {
@@ -83,6 +97,8 @@ pub mod kbf {
 pub use build::bazel::remote::execution::v2 as reapi;
 /// The `kbf.storage.v1` protocol, under a short name.
 pub use kbf::storage::v1 as storage;
+/// The `kbf.update.v1` protocol, under a short name.
+pub use kbf::update::v1 as update;
 /// The `kbf.worker.v1` protocol, under a short name.
 pub use kbf::worker::v1 as worker;
 

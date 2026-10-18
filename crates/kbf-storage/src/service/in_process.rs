@@ -51,7 +51,7 @@ use tonic::{Request, Response, Status};
 
 use super::client::{lift, write_messages};
 use super::{StorageService, catch_up};
-use crate::{Answer, PutStream, ReadStream, Storage, StorageError};
+use crate::{ActionEntry, Answer, PutStream, ReadStream, Storage, StorageError};
 
 /// A node's [`StorageService`], called in-process ([`StorageService::in_process`]). Cheap
 /// to clone.
@@ -196,9 +196,18 @@ impl Storage for Called {
         action: &'a Digest,
     ) -> Answer<'a, Option<(Digest, ActionResult)>> {
         Box::pin(async move {
+            Ok(self
+                .action_entry(action)
+                .await?
+                .map(|entry| (entry.result_digest, entry.result)))
+        })
+    }
+
+    fn action_entry<'a>(&'a self, action: &'a Digest) -> Answer<'a, Option<ActionEntry>> {
+        Box::pin(async move {
             let service = self.judged().await?;
             let catching_up = service.catching_up();
-            let entry = service.storage.action_result(action).await?;
+            let entry = service.storage.action_entry(action).await?;
             match catch_up::entry_miss(catching_up, entry.is_some(), action) {
                 Some(status) => Err(lift(&status, None)),
                 None => Ok(entry),

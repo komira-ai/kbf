@@ -1,10 +1,29 @@
 # Updating the frontend without failing a build
 
-`kbf frontend handover` starts a new frontend beside the serving one, the new one takes the
-listeners, the state store and the daemons over, and the old one finishes the builds it
-holds and exits. This page says what each party sees. The protocol between the two
-processes is `kbf_server::handover` (`architecture-v2.md`, sections 11 and 12); the unit
-and the command are here.
+`kbf frontend handover` starts a new frontend beside the serving one, behind Envoy. The new
+one binds listeners of its own, takes the state store and the daemons over, and serves;
+Envoy sends new streams to it once it is ready; the old one goes not ready, forwards the
+calls Envoy still sends it, finishes the builds it holds and exits. This page says what
+each party sees. The protocol between the two processes is `kbf_server::handover`
+(`architecture-v2.md`, sections 11 and 12; the design is `aio-handover.md`); the unit and
+the command are here.
+
+## The two instances and their ports
+
+Both instances run the same command line but for `--instance=a|b`. Instance a listens where
+`--listen`, `--worker-listen` and `--api-listen` say; instance b listens ten ports above each
+(port 0, which the system chooses, stays 0), so the two blocks are `base+0..2` and `base+10..12`,
+the ones Envoy's configuration (`kbf-deploy envoy render --topology box`) names. A handover
+goes to the other instance. The two REAPI listeners must be on loopback, since the old one
+forwards the calls that still reach it to the new one. If the REAPI listener has a
+certificate, `--handover-peer-name` (the DNS name the other instance's certificate carries) and
+`--storage-ca` let the old one verify the new one; without them it refuses a handover.
+A frontend without `--instance` refuses every handover.
+
+Envoy's health-check settings are flags (`--envoy-check-interval-ms`, `--envoy-check-timeout-ms`,
+`--envoy-unhealthy-threshold`, defaults 1000, 1000 and 2, the box render's), because the old
+instance derives from them how long Envoy takes to see the new one healthy and to stop choosing
+the old one: `interval x threshold + timeout + interval`, four seconds by default.
 
 ## The unit: `kbf-frontend@.service`
 
@@ -15,13 +34,22 @@ instance is up. A serving instance is never restarted by an install: the plan sa
 the handover instead. What the unit has, and why (check-units rule `handover`; rule `stop`
 still asks for `TimeoutStopSec=infinity` and `KillSignal=SIGTERM`):
 
-- `Type=notify`: kbf sends `READY=1` once it serves and its probes pass, so
-  `systemctl start` of the idle instance returns when the new frontend can take builds, and
-  fails when it could not.
+- `Type=notify`: kbf sends `READY=1` once it serves and its state store and map probes
+  pass, so `systemctl start` of the idle instance returns when the new frontend can take
+  builds, and fails when it could not. It does not wait for the `--storage` node: at a cold
+  power-up the node may come up after the frontend, and a frontend that waited would be
+  killed at `TimeoutStartSec` and restart with a new epoch, in a loop. The successor of a
+  handover likewise tells its predecessor it serves without the storage probe. `/readyz`
+  still fails with `storage` listed until the node answers: Envoy sends nothing to a
+  frontend that would fail every blob call, and the frontend keeps its listeners and its
+  state, so it is in rotation again as soon as the node is back (no restart, no new epoch).
 - `TimeoutStartSec=120`, finite: a new instance that never says ready fails the start.
 - `--handover-socket=/run/kbf-frontend/control.sock`, in `RuntimeDirectory=kbf-frontend`
   with `RuntimeDirectoryPreserve=yes`: the socket's directory outlives the instance that
   stops. Both instances run as the same user (the socket checks the peer's uid).
+- `--instance=%i` and the per-instance port block are not in the template yet: the unit
+  changes that carry them are separate from the frontend's behaviour described here, and
+  until they land a handover is refused ("started without --instance").
 - No `Conflicts=` between the instances: starting one must never stop the other, which is
   the one draining.
 
@@ -52,37 +80,75 @@ The only verbs it runs are `show` and `start`: it never stops, restarts or kills
 ## What each party sees
 
 **Buck2 builds in flight (open `Execute` and `WaitExecution` streams).** They stay open and
-are not told to go away. The old frontend answers each from the `done/` row the new one
-writes when the action finishes, so Buck2 receives the result of its action as it would
-have from one process. While the action is leased the stream shows it executing; while it
-is queued it shows what it showed. If the store has no trace of an operation (neither a
-`done/`, an `op/` nor a queue row) for three looks in a row, which is the new frontend
-having lost it, the stream ends UNAVAILABLE and `kbf_frontend_relay_lost_total` counts it:
-a stream is never left waiting for ever. Buck2 does not recover a stream that breaks, so
-that count is the number of builds that failed because of a handover; it is zero unless the
-new frontend died between two writes.
+are not told to go away: no GOAWAY is sent in an update, and Envoy keeps the connection. The
+old frontend relays each until it closes, with no timeout: it answers from the `done/` row the
+new one writes when the action finishes, or from the new one's own stream, so Buck2 receives
+the result of its action as it would have from one process. While the action is leased the
+stream shows it executing; while it is queued it shows what it showed. A stream ends only when
+its operation finishes (its result or refusal is in a `done/` row, or the new frontend's
+stream sent the final response), when the client cancels it, or when the old process stops
+(a kill, which is not a timeout; the crash matrix covers it). No count of looks and no timer
+ends one, and the old frontend never answers UNAVAILABLE for an operation it cannot see. A
+read of the rows that fails is logged once and tried again at the next look.
 
-**New Buck2 calls.** Until the old frontend stands down they are served by it. From then
-on it sends GOAWAY on its REAPI connections, so a client opens a new connection to the
-same address. The listening socket is the same one, so the connection waits in its backlog
-until the new frontend serves it; a call that raced the GOAWAY on an old connection gets
-UNAVAILABLE at open, which Buck2 asks again. Nothing is refused for lack of a listener.
+Can the store have no trace of an operation the old frontend accepted? A queued operation is
+an `op/` row and a `queue/` row written before the call is queued (a call refused before that
+is refused at open, UNAVAILABLE, and is never followed); a leased one keeps its `op/` row; a
+successor that starts cold, with the epoch raised, reruns the leases of the old epoch from
+those same rows, so the operation is queued again, not gone. The writer ends an operation in
+two transactions: the first deletes its `op/` row, the second writes its `done/` row, kept for
+at least `DONE_FLOOR` (600 s) of the store's clock from the write. A look between them finds
+nothing, and the next finds the result. Because every look reads `done/` first and the
+follower looks every second, a row is read within a second of being written and expires
+unread only if the old frontend could not read the store for ten minutes. The one durable gap
+is a successor killed between the two transactions: the result is then in no row. The old
+frontend does not end that stream on a timer either. After two looks in a row with no trace
+it logs a WARN naming the operation and raises `kbf_frontend_relay_untraced`, and the stream
+stays open; it ends when the client cancels (Buck2 does on its own timeouts, interrupts and
+exit; an Envoy or connection drop cancels it too) or the operator stops the old instance. A
+cancelled stream no longer counts as a waiting caller, so the old process can exit once the
+rest have ended. `kbf_frontend_relay_untraced` is 0 unless that gap happened: it replaces
+`kbf_frontend_relay_lost_total`, which counted builds ended by the old three-look rule.
 
-**Daemons.** The old frontend ends their streams; each dials the same worker address again
-and reaches the new frontend. The epoch is kept, so a daemon keeps the runs of its leases
-and sends again the results the old frontend did not acknowledge. No scheduling happens
-between the old frontend's stand-down and the new one serving (normally well under a
-second; the wait for calls between their request and their queueing is bounded by
-`--handover-quiesce-secs`, 10 s by default).
+`WaitExecution`, which Buck2 never calls but other clients may, follows the same rule: a
+stream opened before the handover is answered from the same channel as the `Execute` it
+names, and one that reaches the old frontend after the handover is relayed to the new one and,
+if that stream breaks, followed from the rows, with no timeout. If a relayed stream breaks
+before the old frontend can name its operation in the store (the successor's operation name
+does not carry the id; the old frontend finds it by the action's `op/` row), it ends with the
+status the stream broke with, as before: there is nothing to follow.
 
-**The operator API (`kbf cluster`).** Its listener stops on the old frontend and the same
-socket serves from the new one; a call in the gap waits in the backlog. A cordon or a
-drain an operator set is a row in the state store, so the new frontend still holds it (a
-drain's deadline is wall-clock time).
+**New Buck2 calls.** Envoy sends them to the old frontend until it sees the new one healthy
+and the old one goes not ready. A call that reaches the old one after it has handed over is
+forwarded to the new one (`Execute` and `WaitExecution`: the same message and metadata, which
+the new one authorizes again) and answered from there to its end; it waits inside its own
+open call while the new one takes the store, and nothing is queued or refused. Each is
+counted: `kbf_handover_relayed_total` and `kbf_handover_relays_open`. Storage calls (CAS,
+ByteStream, action cache) go to the storage nodes from either frontend. A call that raced the
+fence itself (between its request and its queueing) gets UNAVAILABLE at open, which Buck2
+asks again.
 
-**`/readyz` and metrics.** The instances share the ports, so `/readyz` answers from the
-new frontend once it serves. The old one's own state is only systemd's: `active` until it
-has answered its last stream, then it exits.
+**Daemons.** The old frontend ends their streams and stops its worker listener; each dials
+the same worker address again, which is Envoy's, and reaches the new frontend. The epoch is
+kept, so a daemon keeps the runs of its leases and sends again the results the old frontend
+did not acknowledge. No scheduling happens between the old frontend's stand-down and the new
+one serving (normally well under a second; the wait for calls between their request and their
+queueing is bounded by `--handover-quiesce-secs`, 10 s by default).
+
+**The operator API (`kbf cluster`).** Each instance's API listener is on its own port. The old
+one keeps answering `/readyz` (and its reads), but its farm is fenced: write calls (cordon,
+drain) go to the new instance. A cordon or a drain an operator set is a row in the state store,
+so the new frontend still holds it (a drain's deadline is wall-clock time).
+
+**`/readyz`, the health service and Envoy.** The old frontend stays ready through the stand-down
+(its readiness stops asking the stores it gave up). The new one says ready once its probes pass,
+and tells the old one it serves. The old one then waits Envoy's settle and goes not ready: Envoy
+has seen the new one and sends the old one nothing new. At every moment at least one frontend
+that can answer a call is ready. If the new one dies after the old one let go, or is alive and
+never serves within `--handover-watchdog-secs` (15 s), the old one goes not ready by itself, so
+Envoy answers with a clean error instead of choosing a frontend that can start nothing.
+The old one exits when it holds no stream, no relay and no caller and has been out of Envoy's
+rotation for the settle.
 
 ## What a handover carries and what it does not
 
@@ -129,10 +195,11 @@ lease it was granted, or no result. An issue is to be filed for it.
 
 | What happens | What clients see | What the operator does |
 |---|---|---|
-| The new instance fails flags, certificates or probes, or is stopped, before `ready` | Nothing: the old frontend serves | Read `journalctl -u kbf-frontend@<new>`, fix, run the command again |
-| The new instance dies after the old one released the store | Callers of the old one still get their results from the rows; the new instance is started again by systemd (`Restart=on-failure`) as a cold start, which bumps the epoch: the daemons run their leases again | Check `journalctl`; builds are not failed, actions rerun |
+| The new instance fails flags, certificates or probes, or is stopped, before `ready` | Nothing: the old frontend serves, ready | Read `journalctl -u kbf-frontend@<new>`, fix, run the command again |
+| The new instance dies after the old one released the store | The old one goes not ready as soon as the control connection closes; callers of the old one still get their results from the rows; the new instance is started again by systemd (`Restart=on-failure`) as a cold start, which bumps the epoch: the daemons run their leases again | Check `journalctl`; builds are not failed, actions rerun |
+| The new instance is alive and never serves | The old one goes not ready after `--handover-watchdog-secs` | Check `journalctl -u kbf-frontend@<new>` |
 | The old frontend dies mid-handover | Its open streams end, as for any crash | The new one proceeds (the kernel released the file lock) |
-| A different `--listen`, `--worker-listen`, `--api-listen` or state file in the new unit | The handover is refused with the reason and the old frontend serves | A change of address is a cold restart: `systemctl stop` the serving instance (it drains) and start the other |
+| The same instance, another state file, or a REAPI address that is not loopback in the new unit | The handover is refused with the reason and the old frontend serves | Fix the unit; a change of state file is a cold restart: `systemctl stop` the serving instance (it drains) and start the other |
 | Both instances active | The command refuses | Wait for the old one to exit |
 
 A handover moves a process, not a machine: the two instances run on one host, on one

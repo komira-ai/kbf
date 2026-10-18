@@ -127,6 +127,11 @@ fn the_deny_list_parses_every_entry_or_names_the_bad_line() {
         Some("node mac-07".to_owned())
     );
     assert_eq!(denied.refuses(None, "mac-08"), None);
+    assert_eq!(
+        denied.refuses(None, "MAC-07"),
+        Some("node mac-07".to_owned()),
+        "a node id is compared up to ASCII case"
+    );
     let other = peer(vec![dns("node-a")]);
     assert_eq!(denied.refuses(Some(&other), "node-a"), None);
 
@@ -163,11 +168,11 @@ fn the_deny_list_parses_every_entry_or_names_the_bad_line() {
 
 /// Catches: a storage node's certificate judged by one name only, or by none. A storage
 /// certificate carries several names, and a `node` entry denies it when any DNS name in
-/// it is listed (an IP name is no node id, and a listed name that is only a prefix or in
-/// another case is not that node); its serial and key are judged as for a daemon, a
-/// listed node being reported before them.
+/// it is listed, up to ASCII case (an IP name is no node id, and a listed name that is only
+/// a prefix is not that node); its serial and key are judged as for a daemon, a listed node
+/// being reported before them.
 ///
-/// Mutant seen red: only the first DNS name looked at.
+/// Mutants seen red: only the first DNS name looked at; names compared with `==`.
 #[test]
 fn a_storage_certificate_is_denied_by_any_of_its_names_its_serial_or_its_key() {
     let several = PeerCert::from_der(&cert(
@@ -190,19 +195,18 @@ fn a_storage_certificate_is_denied_by_any_of_its_names_its_serial_or_its_key() {
         denied("node node-a").refuses_cert(&several),
         Some("node node-a".to_owned())
     );
-    for not_listed in [
-        "node node-b",
-        "node node-",
-        "node NODE-A",
-        "node 192.0.2.1",
-        "",
-    ] {
+    for not_listed in ["node node-b", "node node-", "node 192.0.2.1", ""] {
         assert_eq!(
             denied(not_listed).refuses_cert(&several),
             None,
             "{not_listed}"
         );
     }
+    assert_eq!(
+        denied("node NODE-A.Farm.Example").refuses_cert(&several),
+        Some("node NODE-A.Farm.Example".to_owned()),
+        "up to ASCII case, and the entry is reported as listed"
+    );
     assert_eq!(
         denied("serial 0A").refuses_cert(&several),
         Some("certificate serial a".to_owned())
