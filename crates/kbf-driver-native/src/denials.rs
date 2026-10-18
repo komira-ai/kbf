@@ -13,6 +13,11 @@
 //! between two polls is not seen. Its lines, and those of other leases' processes,
 //! are counted as "other" and listed in the daemon's log only, never in this lease's
 //! result: a result must not carry another lease's paths.
+//!
+//! A refusal cannot be attributed by uid instead: the log line names the process and
+//! its pid and nothing else (the entry holds no uid, and its process is the kernel), and
+//! the process may be gone when the log is read. [`Found::unwatched`] says, in the node's
+//! log, which pids a log named when none was watched.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -151,6 +156,24 @@ impl Found {
             note.push_str("...\n");
         }
         Some(note)
+    }
+
+    /// For the node's log, when the log holds refusals but none is the action's own: the
+    /// pids it named and the pids the driver watched, so an operator can tell a refusal
+    /// of another lease from one of this lease's processes that no poll saw (the log
+    /// names a pid and nothing else: no uid, no parent). `None` when the action has a
+    /// refusal of its own, or the log holds none.
+    #[must_use]
+    pub fn unwatched(&self, watched: &BTreeSet<i32>) -> Option<String> {
+        if !self.mine.is_empty() || self.other.is_empty() {
+            return None;
+        }
+        let named: BTreeSet<i32> = self.other.iter().map(|d| d.pid).collect();
+        Some(format!(
+            "the log holds {} denial(s) by pids {named:?}, none by the {} pid(s) watched {watched:?}",
+            self.other.len(),
+            watched.len()
+        ))
     }
 
     /// The refusals of other processes, for the node's log, capped.
@@ -370,6 +393,25 @@ mod tests {
             shown_target < MAX_TARGET + 40,
             "a target is cut: {shown_target}"
         );
+    }
+
+    /// Catches a diagnostic that names no pids, or that speaks when the action has a
+    /// denial of its own (or the log none): it is the line that tells an unwatched pid
+    /// from a log that never got the denial.
+    #[test]
+    fn unwatched_denials_name_the_pids_on_both_sides() {
+        let other = LINE.replace("(123)", "(999)");
+        let watched = BTreeSet::from([5, 6]);
+        let said = Found::of(&other, &watched)
+            .unwatched(&watched)
+            .expect("said");
+        assert_eq!(
+            said,
+            "the log holds 1 denial(s) by pids {999}, none by the 2 pid(s) watched {5, 6}"
+        );
+        let own = Found::of(&format!("{LINE}\n{other}"), &BTreeSet::from([123]));
+        assert_eq!(own.unwatched(&BTreeSet::from([123])), None);
+        assert_eq!(Found::of("noise", &watched).unwatched(&watched), None);
     }
 
     /// Catches a log reader off macOS that claims to read something.

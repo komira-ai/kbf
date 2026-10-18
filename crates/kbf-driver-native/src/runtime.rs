@@ -565,6 +565,9 @@ impl<C: Cas> NativeRuntime<C> {
         for denial in &found.mine {
             tracing::warn!(%lease, denial = %denials::shown(denial), "the sandbox denied the action");
         }
+        if let Some(why) = found.unwatched(&pids) {
+            tracing::warn!(%lease, "no sandbox denial is the action's own: {why}");
+        }
         for line in found.other_lines() {
             tracing::info!(%lease, denial = %line, "the sandbox denied a process this lease did not watch");
         }
