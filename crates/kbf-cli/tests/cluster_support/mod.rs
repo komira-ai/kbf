@@ -124,4 +124,3 @@ pub fn cluster_stdin(
     let (code, out, err) = kbf_stdin(&argv, stdin);
     (code, out, err, request.join().expect("the server thread"))
 }
-

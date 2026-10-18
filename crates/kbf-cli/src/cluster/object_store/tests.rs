@@ -112,7 +112,10 @@ fn a_secret_file_is_a_private_regular_file() {
     let err = read(&dir).expect_err("directory").to_string();
     assert!(err.ends_with("it is not a regular file"), "{err}");
     let err = read(&dir.join("absent")).expect_err("absent").to_string();
-    assert!(err.starts_with("secret file ") && err.contains("absent"), "{err}");
+    assert!(
+        err.starts_with("secret file ") && err.contains("absent"),
+        "{err}"
+    );
 }
 
 /// Catches a body this client sends that the server would refuse or read differently:
@@ -152,7 +155,12 @@ fn the_connection_body_is_what_the_server_parses() {
     });
     let put: ConnectionPut = serde_json::from_str(least.as_str()).expect("parses");
     assert_eq!(
-        (put.region, put.conditional_put, put.min_put_rate, put.verify),
+        (
+            put.region,
+            put.conditional_put,
+            put.min_put_rate,
+            put.verify
+        ),
         (None, None, None, None)
     );
     assert!(!least.as_str().contains("null"), "{}", least.as_str());

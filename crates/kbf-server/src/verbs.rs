@@ -18,9 +18,14 @@ use axum::routing::get;
 use kbf_state::StoreError;
 use kbf_types::operator_api::{DeniedEntry, DeniedList};
 
-use crate::api::{DENIED, error, gate, json, no_members};
+use crate::api::{error, gate, json, no_members};
 use crate::members::{Members, MembershipError};
 use crate::token::ApiToken;
+
+/// The path of the route: `crate::api::DENIED`, spelled out because the drift guard
+/// (`tests/route_docs.rs`) resolves a route's path from a literal or a const of the same
+/// file. A test below pins the two equal.
+const PATH: &str = "/v1/denied";
 
 /// What the handler shares: the token the gate checks (`None`: writes are off) and the
 /// storage members (`None`: no state store).
@@ -34,7 +39,7 @@ struct Verbs {
 /// with it, the `GET` joining the `POST` and `DELETE` of the same path.
 pub fn routes(token: Option<ApiToken>, members: Option<Arc<Members>>) -> Router {
     Router::new()
-        .route(DENIED, get(list_denied))
+        .route(PATH, get(list_denied))
         .with_state(Arc::new(Verbs { token, members }))
 }
 
@@ -94,5 +99,15 @@ async fn list_denied(
             StatusCode::INTERNAL_SERVER_ERROR,
             "the listing task failed",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Catches the two spellings of the path drifting apart: the POST and DELETE of
+    /// `crate::api::DENIED` and this GET must merge into one route.
+    #[test]
+    fn the_route_is_the_denied_path() {
+        assert_eq!(super::PATH, crate::api::DENIED);
     }
 }

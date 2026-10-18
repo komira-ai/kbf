@@ -57,7 +57,14 @@ fn each_read_verb_sends_a_gated_get_and_prints_the_answer() {
             "GET /v1/object-stores/audit HTTP/1.1",
         ),
         (
-            &["object-store", "audit", "--limit", "7", "--token-file", &token],
+            &[
+                "object-store",
+                "audit",
+                "--limit",
+                "7",
+                "--token-file",
+                &token,
+            ],
             "GET /v1/object-stores/audit?limit=7 HTTP/1.1",
         ),
         (
@@ -172,7 +179,14 @@ fn each_write_verb_sends_its_method_path_and_body() {
             }),
         ),
         (
-            &["object-store", "connection", "delete", "main", "--token-file", &token],
+            &[
+                "object-store",
+                "connection",
+                "delete",
+                "main",
+                "--token-file",
+                &token,
+            ],
             "DELETE /v1/object-stores/connections/main HTTP/1.1",
             serde_json::Value::Null,
         ),
@@ -303,10 +317,7 @@ fn the_secret_comes_from_stdin_or_a_private_file_without_its_line_ending() {
             .expect("a string")
             .to_owned()
     };
-    assert_eq!(
-        put(&["--secret-stdin"], &format!("{SENTINEL}\n")),
-        SENTINEL
-    );
+    assert_eq!(put(&["--secret-stdin"], &format!("{SENTINEL}\n")), SENTINEL);
     assert_eq!(
         put(&["--secret-stdin"], &format!("{SENTINEL}\r\n")),
         SENTINEL
@@ -517,8 +528,24 @@ fn a_command_line_that_names_no_single_call_exits_2() {
         &["connection", "show", "a/b"][..],
         &["connection", "delete", "A"],
         &["verify", "a:b"],
-        &["bind", "--role", "history", "--connection", "m", "--bucket", "b"],
-        &["bind", "--role", "backup", "--connection", "m", "--bucket", "b"],
+        &[
+            "bind",
+            "--role",
+            "history",
+            "--connection",
+            "m",
+            "--bucket",
+            "b",
+        ],
+        &[
+            "bind",
+            "--role",
+            "backup",
+            "--connection",
+            "m",
+            "--bucket",
+            "b",
+        ],
         &["bind", "--role", "x", "--connection", "m", "--bucket", "b"],
         &["bind", "--connection", "a/b", "--bucket", "b"],
         &["bind", "--connection", "m"],
@@ -568,7 +595,14 @@ fn a_refusal_or_no_answer_exits_1_and_says_why() {
     let (code, out, err, _) = cluster(
         "409 Conflict",
         r#"{"error":"a binding names it","code":"in_use"}"#,
-        &["object-store", "connection", "delete", "main", "--token-file", &token],
+        &[
+            "object-store",
+            "connection",
+            "delete",
+            "main",
+            "--token-file",
+            &token,
+        ],
     );
     assert_eq!(code, Some(1), "{err}");
     assert!(out.is_empty(), "{out}");
@@ -588,12 +622,7 @@ fn a_refusal_or_no_answer_exits_1_and_says_why() {
     assert!(out.is_empty(), "{out}");
     assert!(err.contains(&gone), "{err}");
 
-    let (code, _, err) = kbf(&[
-        "cluster",
-        "denied",
-        "--token-file",
-        "/nonexistent/token",
-    ]);
+    let (code, _, err) = kbf(&["cluster", "denied", "--token-file", "/nonexistent/token"]);
     assert_eq!(code, Some(1), "{err}");
     assert!(err.contains("/nonexistent/token"), "{err}");
 }

@@ -354,7 +354,9 @@ the drain, and the unit templates in `kbf-deploy` set it.
 --frontend --token-file F` and `kbf cluster undrain <node> --token-file F` (the API's
 `:uncordon`). It prints the answer's JSON, exits 0 on a 2xx and 1 otherwise, and takes
 `--api` for the listener (default `127.0.0.1:8982`). A frontend drain has no undrain:
-restart it.
+restart it. `kbf cluster member <id> --state active|draining --token-file F` calls
+`POST /v1/members/{id}`, and `kbf cluster denied --token-file F` calls `GET /v1/denied`.
+`kbf cluster object-store ...` calls the `/v1/object-stores/...` routes (below).
 
 ## `/v1/enroll/tokens` and `/v1/enroll/nodes`
 
@@ -632,6 +634,36 @@ curl -X PUT -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
   --data '{"connection":"cold","bucket":"farm-cold","prefix":"cold/"}' \
   $API/v1/object-stores/bindings/cold
 curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' $API/v1/object-stores
+```
+
+**`kbf cluster object-store`** is a client of these routes on the frontend's host, one call a
+verb, printing the answer's JSON (exit 0 on a 2xx, 1 on anything else, 2 for a command line
+that does not parse). Every verb needs `--token-file F`, a read included, because every route
+passes the whole gate; `--api ADDR` names the listener (default `127.0.0.1:8982`).
+
+| Verb | Call |
+|---|---|
+| `object-store status` | `GET /v1/object-stores` |
+| `object-store audit [--limit N]` | `GET /v1/object-stores/audit[?limit=N]` |
+| `object-store connection list` | `GET /v1/object-stores/connections` |
+| `object-store connection show NAME` | `GET /v1/object-stores/connections/NAME` |
+| `object-store connection put NAME --endpoint URL --access-key-id ID (--secret-file F \| --secret-stdin) [--region R] [--conditional-put] [--min-put-rate BYTES] [--expect-generation N] [--no-verify]` | `PUT /v1/object-stores/connections/NAME` |
+| `object-store connection delete NAME` | `DELETE /v1/object-stores/connections/NAME` |
+| `object-store bind --connection NAME --bucket B [--role cold] [--prefix P] [--expect-generation N] [--no-verify]` | `PUT /v1/object-stores/bindings/cold` |
+| `object-store unbind [--role cold]` | `DELETE /v1/object-stores/bindings/cold` |
+| `object-store verify NAME [--bucket B] [--prefix P]` | `POST /v1/object-stores/connections/NAME:verify` |
+
+The secret key is never a flag or an environment variable: `connection put` reads it from
+standard input (`--secret-stdin`) or from a file (`--secret-file F`) that must be a regular
+file whose mode gives its group and others no access (0600 or 0400), else it exits 1 and
+calls nothing. Only the final line ending is cut. Names and the role are checked before any
+call (`bind --role history` exits 2). The key is in none of the command's output or errors.
+
+```sh
+kbf cluster object-store connection put cold --endpoint http://127.0.0.1:9000 \
+  --access-key-id AKID --secret-file key.txt --token-file T   # key.txt is mode 0600
+kbf cluster object-store bind --connection cold --bucket farm-cold --prefix cold/ --token-file T
+kbf cluster object-store status --token-file T
 ```
 
 The request body is read into memory and parsed; the buffers are not zeroized, so the
