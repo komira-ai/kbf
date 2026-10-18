@@ -1,40 +1,32 @@
 //! The node's update client, set up from `--update-dir`: the daemon's end of a pull-based
 //! update (`kbf_update`). The client learns the release the frontend wants over the
-//! session, fetches it over the daemon's mutual-TLS channel to `--cas` (the worker
-//! listener, which also serves releases) and leaves it in the update directory's inbox
-//! for the root helper. Without `--update-dir` the node updates by hand: it says so and
-//! touches no directory.
-
-use std::sync::Arc;
+//! session and writes the frontend's orders into the order spool for the root
+//! `kbf-installer`, which fetches the release itself. No release bytes pass through the
+//! node. Without `--update-dir` the node updates by hand: it says so and touches no
+//! directory.
 
 use kbf_daemon::{BUILD_COMMIT, NodeReport, UpdateLink};
 use kbf_types::ReleasePlatform;
-use kbf_update::{Config, ReleaseClient};
+use kbf_update::Config;
 
-use super::{Cli, Error, transfer};
+use super::{Cli, Error};
 
 /// The update link of the node `cli` describes. With `--update-dir`, the client is
 /// started and its worker spawned on the current tokio runtime (the caller has entered
-/// it); the channel to `--cas` connects when the first release is fetched.
+/// it).
 ///
 /// # Errors
-/// `--update-dir` without `--cas`, a node no release is built for, an update directory
-/// that cannot be opened, or TLS files that cannot be read.
+/// A node no release is built for, or an update directory that cannot be opened.
 pub(crate) fn link(cli: &Cli) -> Result<UpdateLink, Error> {
     let Some(dir) = &cli.update_dir else {
         return Ok(UpdateLink::manual(BUILD_COMMIT));
     };
-    if cli.cas.is_none() {
-        return Err(
-            "--update-dir needs --cas: releases are fetched from the server's worker \
-                    listener it names"
-                .into(),
-        );
-    }
     let platform = platform(&NodeReport::detect(&[])?)?;
-    let source = ReleaseClient::new(transfer::endpoint(cli)?.connect_lazy());
-    let config = Config::new(dir.clone(), platform.to_string(), BUILD_COMMIT.to_owned());
-    let (handle, worker) = kbf_update::start(config, Arc::new(source))?;
+    let mut config = Config::new(dir.clone(), platform.to_string(), BUILD_COMMIT.to_owned());
+    if let Some(orders) = &cli.orders_dir {
+        config.orders_dir = orders.clone();
+    }
+    let (handle, worker) = kbf_update::start(config)?;
     tokio::spawn(worker.run());
     Ok(UpdateLink::new(handle))
 }
@@ -109,34 +101,26 @@ mod tests {
         assert_eq!(std::fs::read_dir(&dir).expect("dir").count(), before);
     }
 
-    /// Catches: `--update-dir` accepted without `--cas` (the client would have no
-    /// release service to fetch from and would fail on the first offer, long after
-    /// the start).
-    #[tokio::test]
-    async fn an_update_directory_needs_cas() {
-        let dir = scratch("update-no-cas");
-        tls_files(&dir);
-        let cli = parse(&dir, &[format!("--update-dir={}", dir.join("u").display())]);
-        let why = link(&cli).err().expect("refused").to_string();
-        assert!(why.contains("--update-dir needs --cas"), "{why}");
-        assert!(!dir.join("u").exists(), "nothing was created");
-    }
-
-    /// Catches: the client not started from the flags (no inbox under the directory),
+    /// Catches: the client not started from the flags (no order spool under the directory),
     /// and a worker spawned outside the runtime.
     #[tokio::test]
-    async fn an_update_directory_starts_the_client_with_its_inbox() {
+    async fn an_update_directory_starts_the_client_with_its_spool() {
         let dir = scratch("update-dir");
         tls_files(&dir);
         let updates = dir.join("u");
+        let cli = parse(&dir, &[format!("--update-dir={}", updates.display())]);
+        let _link = link(&cli).expect("link");
+        assert!(updates.join("orders").is_dir());
+        // The spool can be elsewhere: the installer's parent is root's, the spool the node's.
+        let elsewhere = dir.join("spool");
         let cli = parse(
             &dir,
             &[
-                "--cas=https://127.0.0.1:1".to_owned(),
                 format!("--update-dir={}", updates.display()),
+                format!("--orders-dir={}", elsewhere.display()),
             ],
         );
         let _link = link(&cli).expect("link");
-        assert!(updates.join("inbox").is_dir());
+        assert!(elsewhere.is_dir());
     }
 }

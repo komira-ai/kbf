@@ -365,7 +365,10 @@ fn a_new_child_that_lost_the_generation_after_it_served_is_retired_not_killed() 
         st.procs[1].state = RoleState::StoodDown;
     }
     let (end, _) = restart(&w);
-    assert_eq!(end, Ok(Phase::RolledBack), "{:#?}", w.log());
+    // A switch that did not hold after a restart ends `failed` at `switch`, not
+    // `rolled_back`, which is the operator's answer.
+    assert_eq!(end, Ok(Phase::Failed), "{:#?}", w.log());
+    assert_eq!(failed_at(&w), Some(Step::Switch));
     assert_eq!(w.count("kill"), 0);
     assert_eq!(w.count("terminate pid 101"), 1);
     assert_eq!(w.holders(), vec![Slot::A]);
