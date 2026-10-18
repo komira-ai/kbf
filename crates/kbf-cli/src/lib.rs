@@ -1,27 +1,44 @@
 //! `kbf`: one binary with five modes (docs/design/cluster.md, sections 1 and 5.1), named
 //! and mapped to what they run in one table, [`names::MODES`].
 //!
-//! - `kbf daemon`: the build node. Takes exactly the flags `kbf-daemon` takes
+//! **The mode is a flag, never a word.** `kbf --mode=frontend|storage|daemon|storage-and-daemon|all-in-one`,
+//! or `mode = "..."` in `kbf.toml` (`kbf` alone reads it); a flag overrides the file and the
+//! start says so. The old subcommand forms (`kbf frontend`, `kbf storage`, ...) are hidden
+//! aliases that run exactly as before, kept until the units and the test farm move
+//! (they are the table's rows, so `kbf --help` lists the modes once, under `--mode`).
+//! Every other word after `kbf` is refused.
+//!
+//! - `daemon`: the build node. Takes exactly the flags `kbf-daemon` takes
 //!   ([`kbf_node::Cli`]) and refuses, by name, every flag of another mode.
-//! - `kbf all-in-one`: the server and the daemon in one process, as `kbf-all-in-one`
+//! - `all-in-one`: the server and the daemon in one process, as `kbf-all-in-one`
 //!   runs them today. Takes exactly the flags `kbf-all-in-one` takes
 //!   ([`kbf_all_in_one::cli`]).
-//! - `kbf storage`: the storage node ([`kbf_server::storage_node`]). Takes
+//! - `storage`: the storage node ([`kbf_server::storage_node`]). Takes
 //!   `kbf-server`'s store, write and log flags and its own listener flags, and refuses
 //!   every other flag of `kbf-server` (and so any state-store flag: a storage node
 //!   reaches the state store only through a frontend).
-//! - `kbf frontend`: the REAPI front end ([`kbf_server::frontend`]). Takes `kbf-server`'s
+//! - `frontend`: the REAPI front end ([`kbf_server::frontend`]). Takes `kbf-server`'s
 //!   listener, scheduler, state-store and log flags, requires `--storage` and takes the
 //!   flags of its mutual TLS to the storage node; refuses every other flag of
-//!   `kbf-server` (a frontend holds no stores).
-//! - `kbf storage-and-daemon`: the storage node and the daemon in one process, the
+//!   `kbf-server` (a frontend holds no stores). It takes `--instance`.
+//! - `storage-and-daemon`: the storage node and the daemon in one process, the
 //!   daemon reading and writing the node's storage in-process
-//!   ([`kbf_all_in_one::storage_and_daemon`]). Takes `kbf storage`'s flags and
+//!   ([`kbf_all_in_one::storage_and_daemon`]). Takes `storage`'s flags and
 //!   `kbf-daemon`'s.
 //!
-//! And one word that is not a mode: `kbf cluster status|drain|undrain` ([`cluster`]), a
-//! client of the frontend's operator API that starts nothing. Like `check-args` it is
-//! outside [`names::MODES`]; `kbf --help` ends with a line naming it.
+//! **A start with no mode flags reads `kbf.toml`** ([`node`]): `kbf --mode=storage`,
+//! `daemon` or `storage-and-daemon` with at most `--config FILE` (default where the
+//! packages put it) and `--label`, or `kbf` alone. The start enrolls the host on its first
+//! run when the token file is there, for exactly the roles the mode needs, renews without
+//! the token on later runs, and runs the mode on the configuration the frontend sent
+//! ([`node`], [`enroll`]). `--check` checks that host and exits, starting nothing: 0 for
+//! a configured host that is not yet enrolled, 2 for a config, token or enrollment that
+//! cannot work. A start that gives mode flags runs on them and does not read the file.
+//! There is no `node` mode and no `enroll` word: the host's config states what it is.
+//!
+//! And words that are not modes: `kbf cluster status|drain|undrain` ([`cluster`]), a
+//! client of the frontend's operator API that starts nothing, and `check-args`. Like it
+//! they are outside [`names::MODES`]; `kbf --help` ends with a line naming them.
 //!
 //! A mode refuses the flags that belong to another mode ([`refused_by`]): the set is
 //! derived from each mode's own flag set, nothing is listed by hand, so a flag added to
@@ -35,8 +52,8 @@
 //! commit, the build profile, the protocol versions and the state schema, so a host can
 //! check what it runs.
 //!
-//! `kbf check-args <mode> [flags...]` ([`check_args`]) parses `kbf <mode> [flags...]`
-//! as a start would, then exits, starting nothing: 0 when the mode would start with
+//! `kbf check-args <mode>|--mode=<mode> [flags...]` ([`check_args`]) parses the command
+//! line as a start would, then exits, starting nothing: 0 when the mode would start with
 //! those flags, 2 with clap's message when it would refuse them (and for a mode not
 //! built yet, which refuses every start). `kbf-deploy linux check-units --mode` runs
 //! it on a unit's `ExecStart=`. It is not a mode, so `kbf --help` does not list it.
@@ -45,14 +62,6 @@
 //! systemd template (`kbf-frontend@a`, `kbf-frontend@b`) while the other serves, so the
 //! frontend is updated without failing a build. Like `cluster` it starts no mode: `kbf
 //! frontend` takes only flags, and the word `handover` after it is this command's.
-//!
-//! And the product's two words for a node ([`node`], [`enroll`]): `kbf enroll` enrolls the
-//! node with the frontend its `kbf.toml` names (one token, one key per role, a certificate
-//! from the frontend's CA) and exits; `kbf node` does that if the node is not enrolled,
-//! then runs the mode its granted roles name (`storage`, `daemon` or `storage-and-daemon`)
-//! and renews the certificates while it runs. Like `cluster` they are outside
-//! [`names::MODES`]; `kbf check-args node ...` and `kbf check-args enroll ...` accept
-//! their flags.
 //!
 //! The `kbf-server`, `kbf-daemon` and `kbf-all-in-one` binaries are unchanged.
 
@@ -68,10 +77,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
 use std::sync::OnceLock;
 
-use clap::builder::Resettable;
+use std::ffi::OsString;
+use std::path::PathBuf;
+
+use clap::builder::PossibleValuesParser;
 use clap::error::ErrorKind;
-use clap::{Arg, ArgMatches, Args as _, Command, CommandFactory as _, FromArgMatches as _};
-use names::{Entry, MODES};
+use clap::{
+    Arg, ArgAction, ArgMatches, Args as _, Command, CommandFactory as _, FromArgMatches as _,
+};
+use names::{Entry, MODES, Mode};
 
 /// A parsed command line. The flags are boxed: the variants differ a lot in size.
 #[derive(Clone, Debug)]
@@ -86,6 +100,9 @@ pub enum Invocation {
     StorageAndDaemon(Box<kbf_all_in_one::storage_and_daemon::Flags>),
     /// `kbf frontend`.
     Frontend(Box<kbf_server::frontend::FrontendFlags>),
+    /// A start that reads `kbf.toml` ([`node`]): `--mode` (or the file's mode) with no
+    /// other mode flag.
+    Registered(Box<node::Start>),
 }
 
 fn longs(cmd: &Command) -> BTreeSet<String> {
@@ -157,9 +174,11 @@ fn mode_command(name: &'static str, entry: Entry) -> Command {
         | Entry::Storage
         | Entry::StorageAndDaemon
         | Entry::Frontend => {
+            // The alias word is hidden: the help of a mode shows the flag form.
             let mut cmd = own_command(entry)
                 .name(name)
-                .bin_name(Resettable::<String>::Reset);
+                .bin_name(format!("kbf --mode={name}"))
+                .hide(true);
             for flag in refused_by(name) {
                 // The id is the flag's own name: no argument of either has a hyphen in its id.
                 cmd = cmd.arg(Arg::new(*flag).long(*flag).num_args(0..=1).hide(true));
@@ -169,28 +188,63 @@ fn mode_command(name: &'static str, entry: Entry) -> Command {
     }
 }
 
-/// The whole command line: `kbf <mode> ...`, the modes of [`names::MODES`].
+/// The whole command line: `kbf --mode=<mode> ...`, the modes of [`names::MODES`]. The
+/// modes are also its hidden subcommands (the old forms, `kbf <mode> ...`).
 #[must_use]
 pub fn command() -> Command {
+    let modes: Vec<&'static str> = MODES.iter().map(|m| m.name).collect();
     let mut cmd = Command::new("kbf")
         .version(kbf_server::SERVER_VERSION)
         .about("The kbf build farm.")
-        .subcommand_required(true)
-        .arg_required_else_help(true)
-        .disable_help_subcommand(true);
+        .disable_help_subcommand(true)
+        .arg(
+            Arg::new("mode")
+                .long("mode")
+                .value_name("MODE")
+                .value_parser(PossibleValuesParser::new(modes))
+                .help(
+                    "What this process is: `frontend` (the REAPI front end), `storage` (a \
+                     storage node), `daemon` (a build node), `storage-and-daemon` (both in \
+                     one process) or `all-in-one` (all three). Without it the mode is \
+                     `mode` in kbf.toml. `kbf --mode=<mode> --help` lists the mode's flags",
+                ),
+        )
+        .arg(
+            Arg::new("config")
+                .long("config")
+                .value_name("FILE")
+                .help(format!(
+                    "The host's config file, read by a storage, daemon or storage-and-daemon \
+                     start that is given no other flag of its mode [default: {}]",
+                    enroll::DEFAULT_CONFIG
+                )),
+        )
+        .arg(
+            Arg::new("check")
+                .long("check")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "Check the host for the mode (kbf.toml, the token file or the enrollment) \
+                     and exit: 0 when it can start, 2 when a restart cannot fix it; \
+                     starts and enrolls nothing",
+                ),
+        )
+        .arg(
+            Arg::new("label")
+                .long("label")
+                .value_name("KEY=VALUE")
+                .action(ArgAction::Append)
+                .help("A label the daemon half reports to the frontend (repeatable)"),
+        );
     for mode in MODES {
         cmd = cmd.subcommand(mode_command(mode.name, mode.entry));
     }
     cmd.after_help(format!(
         "Not a mode: `kbf {CLUSTER} status|drain|undrain` calls a frontend's operator API \
          (`kbf {CLUSTER} --help`); `kbf {} {HANDOVER}` updates a frontend without failing a \
-         build (`kbf {} {HANDOVER} --help`); `kbf {NODE}` enrolls this machine and runs \
-         the mode its granted roles name (`kbf {NODE} --help`); `kbf {ENROLL}` only enrolls \
-         (`kbf {ENROLL} --help`).",
+         build (`kbf {} {HANDOVER} --help`).",
         names::FRONTEND,
         names::FRONTEND,
-        NODE = names::NODE,
-        ENROLL = names::ENROLL,
     ))
 }
 
@@ -225,49 +279,6 @@ pub fn parse_handover(args: &[std::ffi::OsString]) -> Result<handover::Handover,
     handover::Handover::from_arg_matches(&matches)
 }
 
-/// `kbf node ...`'s command line.
-#[must_use]
-pub fn node_command() -> Command {
-    let cmd = Command::new(names::NODE)
-        .bin_name(format!("kbf {}", names::NODE))
-        .about(
-            "Enroll this machine with its frontend if it is not enrolled, run the mode its \
-             granted roles name (storage, daemon, or both) and renew its certificates.",
-        );
-    node::Node::augment_args(cmd)
-}
-
-/// Parses `kbf node ...`; `args` is the whole command line, its second word
-/// [`names::NODE`].
-///
-/// # Errors
-/// What `clap` refuses.
-pub fn parse_node(args: &[std::ffi::OsString]) -> Result<node::Node, clap::Error> {
-    let argv = args.iter().take(1).chain(args.iter().skip(2));
-    let matches = node_command().try_get_matches_from(argv)?;
-    node::Node::from_arg_matches(&matches)
-}
-
-/// `kbf enroll ...`'s command line.
-#[must_use]
-pub fn enroll_command() -> Command {
-    let cmd = Command::new(names::ENROLL)
-        .bin_name(format!("kbf {}", names::ENROLL))
-        .about("Enroll this machine with its frontend, once, and exit.");
-    enroll::Enroll::augment_args(cmd)
-}
-
-/// Parses `kbf enroll ...`; `args` is the whole command line, its second word
-/// [`names::ENROLL`].
-///
-/// # Errors
-/// What `clap` refuses.
-pub fn parse_enroll(args: &[std::ffi::OsString]) -> Result<enroll::Enroll, clap::Error> {
-    let argv = args.iter().take(1).chain(args.iter().skip(2));
-    let matches = enroll_command().try_get_matches_from(argv)?;
-    enroll::Enroll::from_arg_matches(&matches)
-}
-
 /// `kbf cluster ...`'s command line.
 #[must_use]
 pub fn cluster_command() -> Command {
@@ -291,16 +302,200 @@ pub fn parse_cluster(args: &[std::ffi::OsString]) -> Result<cluster::Cluster, cl
     cluster::Cluster::from_arg_matches(&matches)
 }
 
-/// Parses a command line (its first word is the program's name).
+/// What the words of a command line say before any mode parses its flags: the mode
+/// (`--mode`, or the hidden alias word), `kbf.toml`'s path, `--check` and the labels, and
+/// every other word, untouched.
+#[derive(Default)]
+struct Split {
+    alias: Option<OsString>,
+    mode: Option<OsString>,
+    config: Option<PathBuf>,
+    check: bool,
+    labels: Vec<OsString>,
+    rest: Vec<OsString>,
+}
+
+/// A flag that takes a value, as `--name value` or `--name=value`; `None` for another word.
+fn value_of<'a>(
+    name: &str,
+    arg: &str,
+    more: &mut impl Iterator<Item = &'a OsString>,
+) -> Result<Option<OsString>, clap::Error> {
+    let Some(tail) = arg.strip_prefix("--").and_then(|a| a.strip_prefix(name)) else {
+        return Ok(None);
+    };
+    if let Some(value) = tail.strip_prefix('=') {
+        return Ok(Some(value.into()));
+    }
+    if !tail.is_empty() {
+        return Ok(None);
+    }
+    more.next().cloned().map(Some).ok_or_else(|| {
+        command().error(
+            ErrorKind::InvalidValue,
+            format!("a value is required for '--{name}' but none was supplied"),
+        )
+    })
+}
+
+fn split(args: &[OsString]) -> Result<Split, clap::Error> {
+    let mut out = Split::default();
+    let mut words = args.iter().skip(1);
+    let mut first = true;
+    while let Some(arg) = words.next() {
+        let at_start = std::mem::take(&mut first);
+        let Some(text) = arg.to_str() else {
+            out.rest.push(arg.clone());
+            continue;
+        };
+        if text == "--" {
+            out.rest.push(arg.clone());
+            out.rest.extend(words.cloned());
+            break;
+        } else if at_start && !text.starts_with('-') {
+            out.alias = Some(arg.clone());
+        } else if text == "--check" {
+            out.check = true;
+        } else if let Some(value) = value_of("mode", text, &mut words)? {
+            out.mode = Some(value);
+        } else if let Some(value) = value_of("config", text, &mut words)? {
+            out.config = Some(PathBuf::from(value));
+        } else if let Some(value) = value_of("label", text, &mut words)? {
+            out.labels.push(value);
+        } else {
+            out.rest.push(arg.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// The mode a command line names, by `--mode` or by the hidden alias word.
+fn named_mode(split: &Split, args: &[OsString]) -> Result<Option<&'static Mode>, clap::Error> {
+    let by_flag = match &split.mode {
+        // clap's own refusal, listing the possible values.
+        Some(value) => {
+            command().try_get_matches_from([
+                OsString::from("kbf"),
+                "--mode".into(),
+                value.clone(),
+            ])?;
+            MODES.iter().find(|m| value.to_str() == Some(m.name))
+        }
+        None => None,
+    };
+    let by_alias = match &split.alias {
+        Some(word) => match MODES.iter().find(|m| word.to_str() == Some(m.name)) {
+            Some(mode) => Some(mode),
+            None => {
+                // The word is not a mode: clap's refusal of an unknown subcommand.
+                return Err(command()
+                    .try_get_matches_from(args)
+                    .err()
+                    .unwrap_or_else(|| {
+                        command().error(ErrorKind::InvalidSubcommand, "not a mode")
+                    }));
+            }
+        },
+        None => None,
+    };
+    if let (Some(flag), Some(alias)) = (by_flag, by_alias) {
+        return Err(command().error(
+            ErrorKind::ArgumentConflict,
+            format!(
+                "the mode is given twice: --mode={} and the word {}; give --mode only",
+                flag.name, alias.name
+            ),
+        ));
+    }
+    Ok(by_flag.or(by_alias))
+}
+
+/// Parses a command line (its first word is the program's name): `kbf --mode=<mode>
+/// [flags...]`, or the hidden alias `kbf <mode> [flags...]`, or a start that reads
+/// `kbf.toml` ([`Invocation::Registered`]). Reads no file.
 ///
 /// # Errors
 /// What `clap` refuses, and any flag of another mode, which the error names.
 pub fn parse_from<I, T>(args: I) -> Result<Invocation, clap::Error>
 where
     I: IntoIterator<Item = T>,
-    T: Into<std::ffi::OsString>,
+    T: Into<OsString>,
 {
-    let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let mut split = split(&args)?;
+    let named = named_mode(&split, &args)?;
+    let reads_file = split.check || split.config.is_some();
+    let node_mode = named.is_none_or(|m| names::is_registered(m.name));
+    if reads_file && !node_mode {
+        let flag = if split.check { "--check" } else { "--config" };
+        return Err(command().error(
+            ErrorKind::ArgumentConflict,
+            format!(
+                "kbf --mode={} refuses {flag}: only the storage, daemon and storage-and-daemon \
+                 modes read kbf.toml and have a --check so far; the others take their configuration \
+                 as flags",
+                named.map_or("", |m| m.name)
+            ),
+        ));
+    }
+    // The flag form with no flag of a mode, or an alias given a flag of the file: a start
+    // that reads kbf.toml. The alias alone is the old start on the mode's own flags.
+    let registered = split.rest.is_empty() && (reads_file || (split.alias.is_none() && node_mode));
+    if registered {
+        return Ok(Invocation::Registered(Box::new(node::Start {
+            mode: named.map(|m| m.name),
+            config: split
+                .config
+                .unwrap_or_else(|| PathBuf::from(enroll::DEFAULT_CONFIG)),
+            check: split.check,
+            labels: split
+                .labels
+                .iter()
+                .map(|l| l.to_string_lossy().into_owned())
+                .collect(),
+        })));
+    }
+    if reads_file {
+        let flag = if split.check { "--check" } else { "--config" };
+        return Err(command().error(
+            ErrorKind::ArgumentConflict,
+            format!(
+                "{flag} reads kbf.toml, which replaces the flags of the mode; \
+                 drop {} or drop {flag}",
+                split.rest[0].to_string_lossy()
+            ),
+        ));
+    }
+    let Some(mode) = named else {
+        // Flags and no mode: the help and the version are clap's to print.
+        let argv = std::iter::once(args[0].clone()).chain(split.rest.iter().cloned());
+        if let Err(e) = command().try_get_matches_from(argv)
+            && matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion)
+        {
+            return Err(e);
+        }
+        return Err(command().error(
+            ErrorKind::MissingRequiredArgument,
+            "no mode: flags of a mode need --mode=<mode> (frontend, storage, daemon, \
+             storage-and-daemon or all-in-one)",
+        ));
+    };
+    // The mode's own flags, with the labels the split took out put back.
+    let labels = split.labels.drain(..).map(|mut l| {
+        let mut flag = OsString::from("--label=");
+        flag.push(std::mem::take(&mut l));
+        flag
+    });
+    let argv: Vec<OsString> = [args[0].clone(), mode.name.into()]
+        .into_iter()
+        .chain(labels)
+        .chain(split.rest)
+        .collect();
+    parse_mode(argv)
+}
+
+/// Parses `kbf <mode> [flags...]`, the mode's own flags.
+fn parse_mode(args: Vec<OsString>) -> Result<Invocation, clap::Error> {
     let matches = match command().try_get_matches_from(&args) {
         Ok(matches) => matches,
         Err(e) => return Err(refusal_in(&args).unwrap_or(e)),
@@ -382,6 +577,7 @@ pub fn run(invocation: &Invocation) -> ExitCode {
         Invocation::Storage(flags) => kbf_server::storage_node::run(flags),
         Invocation::StorageAndDaemon(flags) => kbf_all_in_one::storage_and_daemon::run(flags),
         Invocation::Frontend(flags) => kbf_server::frontend::run(flags),
+        Invocation::Registered(start) => node::run(start),
     }
 }
 
@@ -389,7 +585,7 @@ pub fn run(invocation: &Invocation) -> ExitCode {
 /// ([`check_args`]).
 pub const CHECK_ARGS: &str = "check-args";
 
-/// `kbf check-args <mode> [flags...]`: parses `kbf <mode> [flags...]` as [`main`]
+/// `kbf check-args <mode>|--mode=<mode> [flags...]`: parses `kbf [flags...]` as [`main`]
 /// would, and starts nothing (the parse reads no file and opens no socket). `args` is
 /// the whole command line, its first word the program's name and its second
 /// [`CHECK_ARGS`].
@@ -405,11 +601,15 @@ pub fn check_args(args: &[std::ffi::OsString]) -> Result<(), clap::Error> {
         .chain(args.iter().skip(2))
         .cloned()
         .collect::<Vec<_>>();
-    let parsed = match argv.get(1).and_then(|word| word.to_str()) {
-        Some(names::NODE) => parse_node(&argv).map(drop),
-        Some(names::ENROLL) => parse_enroll(&argv).map(drop),
-        _ => parse_from(argv).map(drop),
-    };
+    let parsed = parse_from(argv).and_then(|parsed| match parsed {
+        // The mode of a start that reads kbf.toml is in a file this parse does not read; a
+        // check of arguments with no mode at all has checked nothing.
+        Invocation::Registered(start) if start.mode.is_none() => Err(command().error(
+            ErrorKind::MissingRequiredArgument,
+            "no mode: check-args needs --mode=<mode> (it reads no file)",
+        )),
+        _ => Ok(()),
+    });
     match parsed {
         Err(e) if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => {
             Err(command().error(
@@ -454,18 +654,6 @@ pub fn main() -> ExitCode {
     {
         return match parse_handover(&args) {
             Ok(h) => handover::run(&h),
-            Err(e) => e.exit(),
-        };
-    }
-    if args.get(1).is_some_and(|word| word == names::NODE) {
-        return match parse_node(&args) {
-            Ok(node) => node::run(&node),
-            Err(e) => e.exit(),
-        };
-    }
-    if args.get(1).is_some_and(|word| word == names::ENROLL) {
-        return match parse_enroll(&args) {
-            Ok(enroll) => enroll::run(&enroll),
             Err(e) => e.exit(),
         };
     }

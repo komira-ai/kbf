@@ -1454,7 +1454,6 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
- "toml",
  "tonic",
  "tracing",
  "x509-parser",

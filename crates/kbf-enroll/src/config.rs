@@ -45,6 +45,7 @@ const HTTPS_PORT: u16 = 443;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Raw {
+    mode: Option<Spanned<String>>,
     frontend: Option<RawFrontend>,
     enroll: Option<RawEnroll>,
     node: Option<RawNode>,
@@ -196,6 +197,10 @@ pub enum Trust {
 /// A validated `kbf.toml`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
+    /// `mode`: the mode this host runs (`storage`, `daemon`, `storage-and-daemon`, ...), as
+    /// the file spells it; `kbf --mode` overrides it. The names are the caller's to check:
+    /// this crate does not know the modes.
+    pub mode: Option<String>,
     /// `frontend.url`.
     pub frontend: FrontendUrl,
     /// `enroll.token_file`.
@@ -433,6 +438,14 @@ impl Config {
             problems: Vec::new(),
         };
 
+        let mode = check.value("mode", raw.mode.as_ref(), |t| {
+            if !t.is_empty() && t.bytes().all(|c| c.is_ascii_lowercase() || c == b'-') {
+                Ok(t.to_owned())
+            } else {
+                Err("a mode is a name of a-z and - (for example \"storage\")".to_owned())
+            }
+        });
+
         let url_raw = raw.frontend.as_ref().and_then(|f| f.url.as_ref());
         let frontend = if url_raw.is_some() {
             check.value("frontend.url", url_raw, parse_url)
@@ -538,6 +551,7 @@ impl Config {
 
         match (frontend, node_id) {
             (Some(frontend), Some(node_id)) if check.problems.is_empty() => Ok(Self {
+                mode,
                 frontend,
                 token_file,
                 node_id,

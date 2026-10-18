@@ -50,6 +50,30 @@ fn the_two_required_values_make_a_config_with_every_default() {
     assert_eq!(c.data_dir, Path::new(DEFAULT_STATE_DIR).join("data"));
     assert_eq!(c.reserve_cpus, None);
     assert_eq!(c.trust, Trust::Pin, "pin unless public is written down");
+    assert_eq!(
+        c.mode, None,
+        "the mode is the command line's unless written"
+    );
+}
+
+/// Catches a `mode` key that is refused (the file could not say what the host is), read
+/// from the wrong table, or accepted as anything: it is a top-level name of lower-case
+/// letters and hyphens, and the line of a bad one is reported.
+#[test]
+fn the_mode_is_a_top_level_name() {
+    let c = ok(&format!("mode = \"storage-and-daemon\"\n{MINIMAL}"));
+    assert_eq!(c.mode.as_deref(), Some("storage-and-daemon"));
+    let got = one(&format!("mode = \"Storage\"\n{MINIMAL}"));
+    assert!(got.starts_with("mode@1: a mode is a name"), "{got}");
+    let got = one(&format!("mode = \"\"\n{MINIMAL}"));
+    assert!(got.starts_with("mode@1: "), "{got}");
+    let got = one(&format!("mode = 3\n{MINIMAL}"));
+    assert!(
+        got.starts_with("mode@1: ") || got.contains("invalid type"),
+        "{got}"
+    );
+    let got = one(&format!("{MINIMAL}[node]\nmode = \"daemon\"\n"));
+    assert!(got.contains("unknown field `mode`"), "{got}");
 }
 
 #[test]

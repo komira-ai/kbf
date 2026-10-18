@@ -1,30 +1,34 @@
-//! `kbf enroll`: one enrollment, then exit (`docs/design/install-and-enrollment.md`,
-//! sections 4.4 and 5).
+//! Enrollment, as the start of a node mode runs it (`docs/design/install-and-enrollment.md`,
+//! sections 4.4 and 5): the library [`crate::node`] calls, not a verb.
 //!
-//! Reads `kbf.toml` (`--config`), and if the node is not enrolled yet (no `node.json` in
-//! its state directory) reads the token file, dials the frontend under the pin the token
-//! carries, sends one key's request per role and installs what comes back
-//! ([`kbf_enroll::client::enroll`]). A node that is enrolled is left alone and the verb
-//! exits 0 at once, so a unit can run it before every start (`ExecStartPre=`).
+//! The start reads `kbf.toml` ([`load`]); if the node is not enrolled yet (no `node.json`
+//! in its state directory) it reads the token file, dials the frontend under the pin the
+//! token carries, sends one key's request per role the **mode** needs and installs what
+//! comes back ([`kbf_enroll::client::enroll`]). A node that is enrolled is left alone and
+//! its token file is not read again.
 //!
-//! **Which roles it asks for.** The token, not the node, decides what a node may be, and
-//! a request for a role the token lacks is refused whole. The node asks for the roles
-//! `kbf.toml` names: a `[storage]` table asks for `storage`, a `[daemon]` table for
-//! `daemon` (an empty table is enough). A file that names neither, or both, asks for both
-//! non-frontend roles, so the common token (`storage` and `daemon`) needs no table, and a
-//! token that grants one role needs the matching table, which the refusal says.
+//! **Which roles it asks for.** The mode, not the tables of `kbf.toml`, decides
+//! ([`Want::of`]): `storage` asks for the storage role, `daemon` for the daemon role,
+//! `storage-and-daemon` for both. The token decides what a host may be, and a request
+//! for a role the token lacks is refused whole by the frontend (a typed reason, exit 2:
+//! a restart cannot fix it). `[storage]` and `[daemon]` are settings only.
 //!
-//! **Exit codes.** 0 enrolled (now, or before). 2 for what a restart cannot fix: a file
-//! that is not right (config, token), a frontend that was refused (a typed reason is
-//! printed: expired, used up, role not granted, ...), a certificate that is not the
-//! pinned CA's, an answer that was refused. 1 for what may pass: the frontend is down,
-//! unavailable or rate-limiting, or the node's clock is off.
+//! **A node that is enrolled** must hold a certificate for every role of the mode. One
+//! whose `node.json` does not (the mode was changed after enrollment) is refused with exit 2
+//! naming both; it is never enrolled again behind the operator's back.
+//!
+//! **Exit codes.** 2 for what a restart cannot fix: a file that is not right (config,
+//! token), a frontend that refused (a typed reason is printed: expired, used up, role not
+//! granted, ...), a certificate that is not the pinned CA's, an answer that was refused, a
+//! mode the enrollment does not cover. 1 for what may pass: the frontend is down,
+//! unavailable or rate-limiting, or the node's clock is off; [`crate::node`] retries
+//! those with a backoff.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
-use clap::Args;
 use kbf_enroll::answer::AnswerError;
 use kbf_enroll::client::{ConnectError, EnrollError, Enrollment, Frontend, connect, enroll};
 use kbf_enroll::config::{Config, Host, Problem, Problems, Trust};
@@ -34,6 +38,8 @@ use kbf_enroll::token::{self, TokenFileError};
 use kbf_proto::kbf::enroll::v1::NodeFacts;
 use kbf_types::{CaPin, Role, RoleSet, RoleSetError};
 
+use crate::names;
+
 /// `kbf.toml` when `--config` is not given: where the packages put it.
 pub const DEFAULT_CONFIG: &str = if cfg!(target_os = "macos") {
     "/usr/local/etc/kbf/kbf.toml"
@@ -41,16 +47,8 @@ pub const DEFAULT_CONFIG: &str = if cfg!(target_os = "macos") {
     "/etc/kbf/kbf.toml"
 };
 
-/// `kbf enroll`'s command line.
-#[derive(Args, Clone, Debug, PartialEq, Eq)]
-pub struct Enroll {
-    /// The node's config file.
-    #[arg(long, value_name = "FILE", default_value = DEFAULT_CONFIG)]
-    pub config: PathBuf,
-}
-
-/// What the verbs need to know about the machine and the time, passed in so a test can
-/// give them a scratch host and a clock of its own.
+/// What a start needs to know about the machine and the time, passed in so a test can
+/// give them a scratch host, a clock and a wait of its own.
 #[derive(Clone)]
 pub struct Env {
     /// The host name and CPU count `kbf.toml`'s defaults and limits read.
@@ -59,6 +57,9 @@ pub struct Env {
     pub euid: u32,
     /// This node's unix time.
     pub now: Arc<dyn Fn() -> i64 + Send + Sync>,
+    /// Waits for the given time before a start tries again; false gives up (the start
+    /// then fails with the failure it was retrying). The system's sleeps and says true.
+    pub pause: Arc<dyn Fn(Duration) -> bool + Send + Sync>,
 }
 
 impl Env {
@@ -78,6 +79,10 @@ impl Env {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+            }),
+            pause: Arc::new(|wait| {
+                std::thread::sleep(wait);
+                true
             }),
         }
     }
@@ -123,6 +128,47 @@ pub enum Failure {
         /// The id in `kbf.toml`.
         configured: String,
     },
+    /// This node enrolled for roles that do not cover the mode it is now configured to run.
+    #[error(
+        "this node is enrolled for {enrolled}, but mode {mode} needs {needs}; the mode \
+         changed after enrollment, and a node is not enrolled again by itself: set the mode \
+         back, or enroll this host anew (erase its state directory and give it a token \
+         that grants {needs})"
+    )]
+    NotCovered {
+        /// The mode.
+        mode: String,
+        /// The roles the mode needs.
+        needs: String,
+        /// The roles `node.json` holds certificates for.
+        enrolled: String,
+    },
+    /// No mode: neither the command line nor `kbf.toml` names one.
+    #[error("no mode: give --mode=<{modes}> or set mode = \"...\" in {path} ({detail})")]
+    NoMode {
+        /// The names of the modes.
+        modes: String,
+        /// The config file.
+        path: String,
+        /// Why the file names none.
+        detail: String,
+    },
+    /// `mode` in `kbf.toml` is not a mode.
+    #[error("{path}: mode = {value:?} is not a mode (one of {modes})")]
+    BadMode {
+        /// The config file.
+        path: String,
+        /// What it says.
+        value: String,
+        /// The names of the modes.
+        modes: String,
+    },
+    /// The mode takes its configuration from flags, not from `kbf.toml`.
+    #[error(
+        "mode {0} takes its configuration from flags, not from kbf.toml; start it as \
+         `kbf --mode={0} <flags>`"
+    )]
+    FlagsOnly(String),
     /// A set of roles that cannot be (none, or one twice).
     #[error("roles: {0}")]
     Roles(#[from] RoleSetError),
@@ -166,18 +212,39 @@ pub struct Loaded {
     pub config: Config,
     /// The state directory.
     pub store: Store,
-    /// The roles the node asks for (the module docs).
+}
+
+/// The mode a start runs and the roles it needs ([`Want::of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Want {
+    /// The mode's name.
+    pub mode: &'static str,
+    /// The roles whose certificates the mode needs.
     pub roles: RoleSet,
 }
 
-/// The roles `text` (a `kbf.toml` that has been validated) asks for.
-fn requested_roles(text: &str) -> Result<RoleSet, RoleSetError> {
-    let tables = text.parse::<toml::Table>().unwrap_or_default();
-    let named: Vec<Role> = Role::ALL
-        .into_iter()
-        .filter(|role| tables.contains_key(role.name()))
-        .collect();
-    RoleSet::new(named).or_else(|_| RoleSet::new(Role::ALL))
+impl Want {
+    /// What `mode` needs: `storage` the storage role, `daemon` the daemon role,
+    /// `storage-and-daemon` both; `None` for a mode that holds no certificate from
+    /// enrollment (the frontend and all-in-one take their files as flags).
+    #[must_use]
+    pub fn of(mode: &str) -> Option<Self> {
+        let (mode, roles): (&'static str, &[Role]) = match mode {
+            names::STORAGE => (names::STORAGE, &[Role::Storage]),
+            names::DAEMON => (names::DAEMON, &[Role::Daemon]),
+            names::STORAGE_AND_DAEMON => (names::STORAGE_AND_DAEMON, &Role::ALL),
+            _ => return None,
+        };
+        Some(Self {
+            mode,
+            roles: RoleSet::new(roles.iter().copied()).ok()?,
+        })
+    }
+}
+
+fn role_list(roles: impl IntoIterator<Item = Role>) -> String {
+    let names: Vec<&str> = roles.into_iter().map(Role::name).collect();
+    format!("[{}]", names.join(", "))
 }
 
 /// Reads and validates `kbf.toml`, checks the directories it names and opens the state
@@ -197,11 +264,7 @@ pub fn load(path: &Path, env: &Env) -> Result<Loaded, Failure> {
         return Err(Failure::Paths(problems));
     }
     let store = Store::open(&config.state_dir)?;
-    Ok(Loaded {
-        roles: requested_roles(&text)?,
-        config,
-        store,
-    })
+    Ok(Loaded { config, store })
 }
 
 /// How the enroll listener is verified: by the pin (`tls.trust = "pin"`) or by the
@@ -232,20 +295,41 @@ pub struct Outcome {
     pub fresh: bool,
 }
 
-/// The node as it is enrolled, enrolling it first if it is not.
+/// The enrolled node, if there is one, checked against this start: it is the node
+/// `kbf.toml` names, and it holds a certificate for every role of the mode.
+///
+/// # Errors
+/// [`Failure::Store`] for a `node.json` that cannot be read, [`Failure::RenamedNode`],
+/// [`Failure::NotCovered`].
+pub fn enrolled(loaded: &Loaded, want: Want) -> Result<Option<Enrolled>, Failure> {
+    let Some(node) = loaded.store.recover()? else {
+        return Ok(None);
+    };
+    if node.node_id != loaded.config.node_id.as_str() {
+        return Err(Failure::RenamedNode {
+            enrolled: node.node_id,
+            configured: loaded.config.node_id.to_string(),
+        });
+    }
+    let held = node.roles();
+    if want.roles.iter().any(|role| !held.contains(&role)) {
+        return Err(Failure::NotCovered {
+            mode: want.mode.to_owned(),
+            needs: role_list(want.roles.iter()),
+            enrolled: role_list(held),
+        });
+    }
+    Ok(Some(node))
+}
+
+/// The node as it is enrolled, enrolling it first if it is not, for the roles of `want`.
 ///
 /// # Errors
 /// [`Failure`]; for an enrollment that failed nothing was installed and the token file
 /// is untouched.
-pub fn ensure_enrolled(loaded: &Loaded, env: &Env) -> Result<Outcome, Failure> {
+pub fn ensure_enrolled(loaded: &Loaded, want: Want, env: &Env) -> Result<Outcome, Failure> {
     let config = &loaded.config;
-    if let Some(node) = loaded.store.recover()? {
-        if node.node_id != config.node_id.as_str() {
-            return Err(Failure::RenamedNode {
-                enrolled: node.node_id,
-                configured: config.node_id.to_string(),
-            });
-        }
+    if let Some(node) = enrolled(loaded, want)? {
         return Ok(Outcome { node, fresh: false });
     }
     let token = token::read(&config.token_file, env.euid)?;
@@ -258,7 +342,7 @@ pub fn ensure_enrolled(loaded: &Loaded, env: &Env) -> Result<Outcome, Failure> {
         let attempt = Enrollment {
             config,
             token: &token,
-            roles: loaded.roles,
+            roles: want.roles,
             facts: facts(),
             now: (env.now)(),
         };
@@ -270,44 +354,13 @@ pub fn ensure_enrolled(loaded: &Loaded, env: &Env) -> Result<Outcome, Failure> {
     Ok(Outcome { node, fresh: true })
 }
 
-/// Runs `kbf enroll`: [`ensure_enrolled`], printing what happened.
-///
-/// # Errors
-/// [`Failure`].
-pub fn enroll_with(args: &Enroll, env: &Env) -> Result<Outcome, Failure> {
-    let loaded = load(&args.config, env)?;
-    ensure_enrolled(&loaded, env)
-}
-
-/// Prints a failure as `kbf <verb>: ...` and returns its exit status.
-pub(crate) fn report(verb: &str, failure: &Failure) -> ExitCode {
+/// Prints a failure as `kbf: ...` and returns its exit status.
+pub(crate) fn report(failure: &Failure) -> ExitCode {
     match failure {
         Failure::Mode(error) => {
             let _ = error.print();
         }
-        other => eprintln!("kbf {verb}: {other}"),
+        other => eprintln!("kbf: {other}"),
     }
     ExitCode::from(failure.exit_code())
-}
-
-/// Runs `kbf enroll`.
-#[must_use]
-pub fn run(args: &Enroll) -> ExitCode {
-    match enroll_with(args, &Env::system()) {
-        Ok(done) => {
-            let roles: Vec<&str> = done.node.certs.iter().map(|c| c.role.as_str()).collect();
-            let how = if done.fresh {
-                "enrolled"
-            } else {
-                "already enrolled"
-            };
-            println!(
-                "kbf enroll: {how} as {} ({})",
-                done.node.node_id,
-                roles.join(", ")
-            );
-            ExitCode::SUCCESS
-        }
-        Err(failure) => report("enroll", &failure),
-    }
 }

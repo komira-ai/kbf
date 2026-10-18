@@ -137,31 +137,96 @@ fn an_unknown_flag_is_a_usage_error_2() {
     }
 }
 
-/// Catches a help that is not printed, lists a mode more or less than the table's, or a
-/// bare `kbf` that does not exit 2, and an unknown mode or `state` that is accepted.
+/// Catches a help that is not printed, lists a mode more or less than the table's (they
+/// are the values of `--mode`, in the table's order), lists the old words as commands,
+/// or a bare `kbf` with no config that does not exit 2 naming both places a mode comes
+/// from; and an unknown mode, a word, or `state` that is accepted.
 #[test]
 fn help_lists_the_five_modes_and_unknown_modes_exit_2() {
     let (code, out, _) = run(&["--help"]);
     assert_eq!(code, Some(0));
-    let listed: Vec<&str> = out
-        .lines()
-        .skip_while(|l| !l.starts_with("Commands:"))
-        .skip(1)
-        .take_while(|l| l.starts_with("  "))
-        .filter_map(|l| l.split_whitespace().next())
-        .collect();
+    assert!(!out.contains("Commands:"), "{out}");
     let want: Vec<&str> = names::MODES.iter().map(|m| m.name).collect();
-    assert_eq!(listed, want, "{out}");
-    assert_eq!(listed.len(), 5);
-    for argv in [&[][..], &["state"], &["no-such-mode"]] {
+    assert!(
+        out.contains(&format!("[possible values: {}]", want.join(", "))),
+        "{out}"
+    );
+    for mode in &want {
+        assert!(
+            !out.lines().any(|l| l.starts_with(&format!("  {mode} "))),
+            "{mode} is listed as a command: {out}"
+        );
+    }
+    for argv in [
+        &["state"][..],
+        &["no-such-mode"],
+        &["--mode=state"],
+        &["--mode", "no-such-mode"],
+    ] {
         let (code, _, err) = run(argv);
         assert_eq!(code, Some(2), "{argv:?}: {err}");
     }
+    let (code, out, err) = run(&["--config", "/nonexistent/kbf.toml"]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(
+        err.contains("--mode=<")
+            && err.contains("mode = ")
+            && err.contains("/nonexistent/kbf.toml"),
+        "{err}"
+    );
+}
+
+/// Catches an alias that stops working or shows in the help, and a mode flag that does not
+/// reach the same mode: for each mode `kbf <mode> --help` and `kbf --mode=<mode> --help`
+/// print the same page (exit 0, usage in the flag form), and `kbf --help` lists no alias.
+#[test]
+fn each_alias_works_hidden_and_the_flag_form_is_the_same_page() {
+    let (_, top, _) = run(&["--help"]);
+    for mode in names::MODES {
+        let (code, alias, err) = run(&[mode.name, "--help"]);
+        assert_eq!(code, Some(0), "{}: {err}", mode.name);
+        let (code, flag, err) = run(&[&format!("--mode={}", mode.name), "--help"]);
+        assert_eq!(code, Some(0), "{}: {err}", mode.name);
+        assert_eq!(alias, flag, "{}", mode.name);
+        assert!(
+            flag.contains(&format!("Usage: kbf --mode={}", mode.name)),
+            "{flag}"
+        );
+        assert!(
+            !top.lines()
+                .any(|l| l.trim_start().starts_with(&format!("{} ", mode.name))
+                    && !l.contains("--mode")),
+            "{} is listed in the help: {top}",
+            mode.name
+        );
+    }
+}
+
+/// Catches a positional argument other than the hidden aliases being accepted: the words
+/// `node` and `enroll` (removed), a word after the mode flag, and a second mode.
+#[test]
+fn positional_words_are_refused_with_exit_2() {
+    for argv in [
+        &["node"][..],
+        &["enroll"],
+        &["--mode=daemon", "extra"],
+        &["--mode=daemon", "node"],
+        &["--mode=storage", "daemon"],
+        &["storage", "daemon"],
+    ] {
+        let (code, out, err) = run(argv);
+        assert_eq!(code, Some(2), "{argv:?}: {err}");
+        assert!(out.is_empty(), "{out}");
+        assert!(!err.is_empty(), "{argv:?}");
+    }
+    let (_, _, err) = run(&["node"]);
+    assert!(err.contains("unrecognized subcommand 'node'"), "{err}");
 }
 
 /// The smoke test the README names: the command line in backticks after `Smoke test:`
 /// in README.md. Catches a README that stops naming a command `kbf` runs, and a
-/// `kbf all-in-one --help` that does not exit 0.
+/// `kbf --mode=all-in-one --help` that does not exit 0.
 #[test]
 fn the_readmes_smoke_test_runs() {
     let readme = include_str!("../../../README.md");
@@ -170,11 +235,11 @@ fn the_readmes_smoke_test_runs() {
         .find(|l| l.starts_with("Smoke test: `kbf "))
         .expect("the README has a smoke-test line");
     let cmd = line.split('`').nth(1).expect("a command in backticks");
-    assert_eq!(cmd, "kbf all-in-one --help");
+    assert_eq!(cmd, "kbf --mode=all-in-one --help");
     let args: Vec<&str> = cmd.split_whitespace().skip(1).collect();
     let (code, out, err) = run(&args);
     assert_eq!(code, Some(0), "{err}");
-    assert!(out.contains("Usage: kbf all-in-one"), "{out}");
+    assert!(out.contains("Usage: kbf --mode=all-in-one"), "{out}");
 }
 
 #[cfg(target_os = "linux")]

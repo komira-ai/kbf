@@ -107,26 +107,30 @@ fn the_table_has_exactly_five_modes_and_their_entries() {
     assert_eq!(listed, named);
 }
 
-/// Catches a bare `kbf`, an unknown mode, a mode named `state`, the old binary names or
-/// the old subcommand names taken as modes, or a `help` subcommand that would make a
-/// sixth word.
+/// Catches an unknown mode, a mode named `state`, the old binary names or the old
+/// subcommand names taken as modes, or a `help` subcommand that would make a sixth word:
+/// every word after `kbf` that is not a mode (or `--mode`'s value) is refused, exit 2.
 #[test]
-fn a_mode_is_required_and_an_unknown_one_is_rejected() {
+fn an_unknown_word_is_rejected() {
     for argv in [
-        vec!["kbf"],
         vec!["kbf", "serve"],
         vec!["kbf", "state"],
         vec!["kbf", "server"],
         vec!["kbf", "kbf-daemon"],
         vec!["kbf", "help"],
+        vec!["kbf", "node"],
+        vec!["kbf", "enroll"],
+        vec!["kbf", "--mode=node"],
+        vec!["kbf", "--mode=enroll", "--check"],
+        vec!["kbf", "--mode", "serve"],
+        vec!["kbf", "--mode=daemon", "node"],
+        vec!["kbf", "--mode=storage", "daemon"],
     ] {
         let err = parse_from(argv.clone()).expect_err("rejected");
         assert!(
             matches!(
                 err.kind(),
-                ErrorKind::InvalidSubcommand
-                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-                    | ErrorKind::UnknownArgument
+                ErrorKind::InvalidSubcommand | ErrorKind::InvalidValue | ErrorKind::UnknownArgument
             ),
             "{argv:?}: {err}"
         );
@@ -134,21 +138,166 @@ fn a_mode_is_required_and_an_unknown_one_is_rejected() {
     }
 }
 
-/// Catches a `--help` that lists a sixth word (`help`, an old name) or misses a mode:
-/// the words under `Commands:` are exactly the table's.
+/// Catches a mode flag that does not name each mode of the table, that parses to another
+/// mode than it names, that is given twice or with an alias without being refused, or a
+/// `--mode` with no value; and the flag form of every mode giving the same parse as the
+/// hidden alias form, wherever the flag stands among the mode's own flags.
 #[test]
-fn help_lists_exactly_the_five_modes() {
+fn the_mode_flag_names_every_mode_like_the_alias_does() {
+    for argv in [DAEMON, BOTH, STORAGE, CONVERGED, FRONTEND] {
+        let alias = parse_from(argv.iter().map(|w| (*w).to_owned())).expect("alias form");
+        let mode = argv[1];
+        let flags: Vec<String> = argv[2..].iter().map(|f| (*f).to_owned()).collect();
+        for form in [
+            vec![format!("--mode={mode}")],
+            vec!["--mode".to_owned(), mode.to_owned()],
+        ] {
+            let mut before = vec!["kbf".to_owned()];
+            before.extend(form.iter().cloned());
+            before.extend(flags.iter().cloned());
+            let mut after = vec!["kbf".to_owned()];
+            after.extend(flags.iter().cloned());
+            after.extend(form.iter().cloned());
+            for argv in [before, after] {
+                if argv.len() == 2 && mode == names::STORAGE {
+                    continue; // `kbf --mode=storage` alone reads kbf.toml (below)
+                }
+                let got = parse_from(argv.clone()).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                assert_eq!(format!("{got:?}"), format!("{alias:?}"), "{argv:?}");
+            }
+        }
+    }
+    let twice = error(vec!["kbf".into(), "--mode=daemon".into(), "storage".into()]);
+    assert!(twice.contains("given twice"), "{twice}");
+    let none = error(vec!["kbf".into(), "--mode".into()]);
+    assert!(none.contains("--mode"), "{none}");
+    let flags_without_mode = error(vec!["kbf".into(), "--node-id=n".into()]);
+    assert!(
+        flags_without_mode.contains("--mode=<mode>"),
+        "{flags_without_mode}"
+    );
+}
+
+/// Catches the alias word reading `kbf.toml` when it is given nothing (the old units run
+/// `kbf storage` on their own flags and must go on doing so), and a flag-form start that
+/// carries no flag of its mode not reading it: `--mode=storage` alone, `--mode=daemon
+/// --label`, a bare `kbf` and the alias with `--config` or `--check` are starts that read
+/// the file; a start that gives mode flags is never one.
+#[test]
+fn a_start_reads_kbf_toml_only_when_it_gives_no_flags_of_its_mode() {
+    let registered = |argv: &[&str]| match parse_from(argv.iter().copied()) {
+        Ok(Invocation::Registered(start)) => Some(*start),
+        _ => None,
+    };
+    let start = registered(&["kbf", "--mode=storage"]).expect("flag alone");
+    assert_eq!(start.mode, Some(names::STORAGE));
+    assert_eq!(
+        start.config,
+        std::path::PathBuf::from(enroll::DEFAULT_CONFIG)
+    );
+    assert!(!start.check && start.labels.is_empty());
+    let start = registered(&[
+        "kbf",
+        "--mode=daemon",
+        "--config",
+        "/x/kbf.toml",
+        "--label=pool=mac",
+        "--label",
+        "rack=r2",
+    ])
+    .expect("config and labels");
+    assert_eq!(start.config, std::path::PathBuf::from("/x/kbf.toml"));
+    assert_eq!(start.labels, ["pool=mac", "rack=r2"]);
+    let start = registered(&["kbf"]).expect("bare");
+    assert_eq!(start.mode, None, "the mode is the file's");
+    let start = registered(&["kbf", "--config=/y.toml"]).expect("config alone");
+    assert_eq!((start.mode, start.config.to_str()), (None, Some("/y.toml")));
+    let start = registered(&["kbf", "storage-and-daemon", "--check"]).expect("alias check");
+    assert_eq!(
+        (start.mode, start.check),
+        (Some(names::STORAGE_AND_DAEMON), true)
+    );
+
+    // The old units: the alias on its own flags, or on none, is the old start.
+    assert!(registered(&["kbf", "storage"]).is_none());
+    assert!(matches!(
+        parse_from(["kbf", "storage"]),
+        Ok(Invocation::Storage(_))
+    ));
+    assert!(registered(&["kbf", "daemon", "--label=a=b"]).is_none());
+    // Flags of the mode: the flags are the configuration.
+    assert!(registered(&["kbf", "--mode=storage", "--storage-listen=127.0.0.1:1"]).is_none());
+    let both = error(vec![
+        "kbf".into(),
+        "--mode=storage".into(),
+        "--config=/x".into(),
+        "--storage-listen=127.0.0.1:1".into(),
+    ]);
+    assert!(
+        both.contains("--config reads kbf.toml") && both.contains("--storage-listen"),
+        "{both}"
+    );
+    let both = error(vec![
+        "kbf".into(),
+        "--mode=daemon".into(),
+        "--check".into(),
+        "--node-id=n".into(),
+    ]);
+    assert!(both.contains("--check reads kbf.toml"), "{both}");
+    // The modes that take flags only do not read the file.
+    for mode in [names::FRONTEND, names::ALL_IN_ONE] {
+        for flag in ["--check", "--config=/x"] {
+            let msg = error(vec!["kbf".into(), format!("--mode={mode}"), flag.into()]);
+            assert!(
+                msg.contains("only the storage, daemon"),
+                "{mode} {flag}: {msg}"
+            );
+        }
+        assert!(
+            registered(&["kbf", &format!("--mode={mode}")]).is_none(),
+            "{mode}"
+        );
+    }
+}
+
+/// Catches `--help` that lists the old words as commands, or misses a mode: the five
+/// modes are the possible values of `--mode`, the hidden aliases are no `Commands:`
+/// section, and `--config`, `--check` and `--label` are listed.
+#[test]
+fn help_lists_the_modes_under_the_mode_flag_and_no_commands() {
     let help = command().render_long_help().to_string();
-    let listed: Vec<&str> = help
-        .lines()
-        .skip_while(|l| !l.starts_with("Commands:"))
-        .skip(1)
-        .take_while(|l| l.starts_with("  "))
-        .filter_map(|l| l.split_whitespace().next())
-        .collect();
+    assert!(!help.contains("Commands:"), "{help}");
+    for flag in [
+        "--mode <MODE>",
+        "--config <FILE>",
+        "--check",
+        "--label <KEY=VALUE>",
+    ] {
+        assert!(help.contains(flag), "{flag}: {help}");
+    }
     let named: Vec<&str> = MODES.iter().map(|m| m.name).collect();
-    assert_eq!(listed, named, "{help}");
-    assert_eq!(listed.len(), 5);
+    let cmd = command();
+    let values = cmd
+        .get_arguments()
+        .find(|a| a.get_id() == "mode")
+        .expect("--mode")
+        .get_possible_values()
+        .iter()
+        .map(|v| v.get_name().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(values, named);
+    assert!(help.contains("kbf cluster"), "{help}");
+    // A mode's own help is reached by the flag form and shows it.
+    let e = parse_from(["kbf", "--mode=storage", "--help"]).expect_err("help");
+    assert_eq!(e.kind(), ErrorKind::DisplayHelp);
+    assert!(e.to_string().contains("kbf --mode=storage"), "{e}");
+    let e = parse_from(["kbf", "--help"]).expect_err("help");
+    assert_eq!(e.kind(), ErrorKind::DisplayHelp);
+    // The hidden aliases are listed by nothing.
+    assert!(
+        cmd.get_subcommands().all(clap::Command::is_hide_set),
+        "an alias shows in the help"
+    );
 }
 
 /// Catches a mode that accepts a flag of the other (`--driver` is the daemon's, so the
@@ -775,75 +924,45 @@ fn the_identity_is_the_libraries_own_and_both_halves_speak_one_protocol() {
     assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap(), v);
 }
 
-/// Catches `kbf node` and `kbf enroll` taking a flag they should not, or not the ones the
-/// units carry: `--config` (with the default where the packages put the file) and, for
-/// the node, repeatable `--label`.
-#[test]
-fn node_and_enroll_take_a_config_and_the_node_takes_labels() {
-    let words = |line: &[&str]| os(line);
-    let node = parse_node(&words(&["kbf", "node"])).expect("defaults");
-    assert_eq!(
-        node.config,
-        std::path::PathBuf::from(crate::enroll::DEFAULT_CONFIG)
-    );
-    assert!(node.labels.is_empty());
-    let node = parse_node(&words(&[
-        "kbf",
-        "node",
-        "--config",
-        "/x/kbf.toml",
-        "--label=pool=mac",
-        "--label",
-        "rack=r2",
-    ]))
-    .expect("flags");
-    assert_eq!(node.config, std::path::PathBuf::from("/x/kbf.toml"));
-    assert_eq!(node.labels, ["pool=mac", "rack=r2"]);
-
-    let enroll = parse_enroll(&words(&["kbf", "enroll", "--config=/y.toml"])).expect("flags");
-    assert_eq!(enroll.config, std::path::PathBuf::from("/y.toml"));
-    assert!(parse_enroll(&words(&["kbf", "enroll", "--label=a=b"])).is_err());
-    assert!(parse_node(&words(&["kbf", "node", "--bogus"])).is_err());
-    assert!(parse_enroll(&words(&["kbf", "enroll", "--config"])).is_err());
-}
-
 /// Catches `check-args` (what `check-units` runs on a unit's `ExecStart=` and
-/// `ExecStartPre=`) refusing the node's and enroll's flags, accepting one they do not
-/// have, or passing `--help`, and the two words appearing in the table of modes (which
-/// would make the other modes refuse `--config` and `--label`).
+/// `ExecStartPre=`) refusing the flag form of a mode or the file flags, accepting a
+/// start with no mode (it reads no file, so it can check nothing), or passing `--help`.
 #[test]
-fn check_args_takes_the_node_and_enroll_words() {
+fn check_args_takes_the_mode_flag_and_the_file_flags() {
     for line in [
-        &["kbf", CHECK_ARGS, "node"][..],
+        &["kbf", CHECK_ARGS, "--mode=daemon", "--check"][..],
+        &["kbf", CHECK_ARGS, "--mode=storage"],
         &[
             "kbf",
             CHECK_ARGS,
-            "node",
+            "--mode=daemon",
             "--config=/etc/kbf/kbf.toml",
             "--label=a=b",
         ],
-        &["kbf", CHECK_ARGS, "enroll", "--config", "/etc/kbf/kbf.toml"],
+        &["kbf", CHECK_ARGS, "storage-and-daemon", "--check"],
     ] {
         assert_eq!(check(line), Ok(()), "{line:?}");
     }
+    let mut flags = vec!["kbf", CHECK_ARGS, "--mode=daemon"];
+    flags.extend(&DAEMON[2..]);
+    assert_eq!(check(&flags), Ok(()));
     for line in [
-        &["kbf", CHECK_ARGS, "node", "--bogus"][..],
-        &["kbf", CHECK_ARGS, "enroll", "--label=a=b"],
+        &["kbf", CHECK_ARGS, "--mode=daemon", "--bogus"][..],
+        &["kbf", CHECK_ARGS, "--mode=daemon", "--config=/x", "--bogus"],
     ] {
         let e = check(line).expect_err("refused");
-        assert!(e.contains("unexpected argument"), "{line:?}: {e}");
+        assert!(
+            e.contains("unexpected argument") || e.contains("reads kbf.toml"),
+            "{line:?}: {e}"
+        );
     }
+    let e = check(&["kbf", CHECK_ARGS]).expect_err("no mode checks nothing");
+    assert!(e.contains("no mode"), "{e}");
+    let e = check(&["kbf", CHECK_ARGS, "--config=/x"]).expect_err("no mode checks nothing");
+    assert!(e.contains("no mode"), "{e}");
+    let e = check(&["kbf", CHECK_ARGS, "--mode=daemon", "--help"]).expect_err("refused");
+    assert!(e.contains("the mode would not start"), "{e}");
     for word in ["node", "enroll"] {
-        let e = check(&["kbf", CHECK_ARGS, word, "--help"]).expect_err("refused");
-        assert!(e.contains("the mode would not start"), "{word}: {e}");
+        assert!(check(&["kbf", CHECK_ARGS, word]).is_err(), "{word}");
     }
-    let named: Vec<&str> = MODES.iter().map(|m| m.name).collect();
-    assert!(!named.contains(&names::NODE) && !named.contains(&names::ENROLL));
-    assert!(command().find_subcommand(names::NODE).is_none());
-    assert!(
-        command()
-            .render_long_help()
-            .to_string()
-            .contains("`kbf node`")
-    );
 }

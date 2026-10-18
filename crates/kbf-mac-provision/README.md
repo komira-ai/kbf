@@ -64,11 +64,11 @@ kbf-mac-provision revert                                # root: put back the rec
   erase or a restore is the remedy for macOS and for simulator runtimes; FileVault and
   the administrator are the operator's.
 - The node label is `profile=<profile>@<first 12 hex digits of the profile's SHA-256>`,
-  passed to `kbf node` as a `--label`.
+  passed to `kbf --mode=daemon` as a `--label`.
 - `--keys` limits `check` and `apply` to the named items. `--root DIR` runs everything
   under DIR; only the tests use it.
-- The job runs `/usr/local/kbf/current/kbf node --config /usr/local/etc/kbf/kbf.toml`
-  with the node label and the profile's labels. `kbf node` enrolls with the frontend that
+- The job runs `/usr/local/kbf/current/kbf --mode=daemon --config /usr/local/etc/kbf/kbf.toml`
+  with the node label and the profile's labels. The start enrolls with the frontend that
   file names and runs the daemon with the certificates the frontend issued, so the
   profile's `kbf_server`, `kbf_cas`, `kbf_ca_cert`, `kbf_cert` and `kbf_key` are not
   arguments of the job any more (the profile still requires them, and `kbf_key` is still
@@ -108,7 +108,7 @@ letters and `_` only.
 | `default_developer_dir` | a pinned Xcode's path | `xcode-select -p` | `xcode-select -s` |
 | `probe` (`expect_probe`) | `KEY:/PATH:SHA256`; `KEY:XCODE_BUILD=VALUE` | each probe script's SHA-256 | check only. `expect_probe` lines are validated (a known probe, a pinned Xcode, once each) and printed |
 | `simulator_runtimes` | none | `/Library/Developer/CoreSimulator`: `Images/*.dmg`, `Profiles/Runtimes/*.simruntime`, `Volumes/*` | check only: runtimes live in VM images |
-| `launchd_label` (`kbf_labels`, `role_user`, and the profile's own SHA-256 in the node label) | label | `/Library/LaunchDaemons/<label>.plist` equals the one the profile renders (section 5.3: `UserName`/`GroupName` the role account, `ProcessType` `Interactive`, `ExitTimeOut` 30, `kbf node --config` and the labels), root-owned, mode 644; `/Library/Logs/kbf` root's, mode 755; the error log in it a regular file with one link, the role account's, mode 644; the job loaded | makes the directory root's, replaces anything else at the error log's path (unlinked, never followed) with a new file of the role account, writes the plist, then restarts the job: `launchctl bootout`, the error log truncated while it is stopped, `launchctl bootstrap`. `restart` refuses, before it stops anything, when the error log is not such a file, so a link the role account plants is never emptied as root |
+| `launchd_label` (`kbf_labels`, `role_user`, and the profile's own SHA-256 in the node label) | label | `/Library/LaunchDaemons/<label>.plist` equals the one the profile renders (section 5.3: `UserName`/`GroupName` the role account, `ProcessType` `Interactive`, `ExitTimeOut` 30, `kbf --mode=daemon --config` and the labels), root-owned, mode 644; `/Library/Logs/kbf` root's, mode 755; the error log in it a regular file with one link, the role account's, mode 644; the job loaded | makes the directory root's, replaces anything else at the error log's path (unlinked, never followed) with a new file of the role account, writes the plist, then restarts the job: `launchctl bootout`, the error log truncated while it is stopped, `launchctl bootstrap`. `restart` refuses, before it stops anything, when the error log is not such a file, so a link the role account plants is never emptied as root |
 
 ## Tests
 

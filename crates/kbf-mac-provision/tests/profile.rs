@@ -799,13 +799,13 @@ fn args_without_node_label(p: &Profile) -> Vec<String> {
         .collect()
 }
 
-/// Catches: the job not running `kbf node` with the config file and the labels (a plist
+/// Catches: the job not running `kbf --mode=daemon` with the config file and the labels (a plist
 /// that still names `kbf-daemon` and the profile's server and certificates would skip
 /// enrollment), the profile's server, certificates, node id and data directory still
-/// rendered as arguments (`kbf node` takes them from `kbf.toml` and the frontend), or the
+/// rendered as arguments (the start takes them from `kbf.toml` and the frontend), the word `node` (removed) back, or the
 /// removed `--scratch` and `--cache-dir` flags.
 #[test]
-fn the_job_runs_kbf_node_with_its_config_and_the_labels() {
+fn the_job_runs_the_daemon_mode_with_its_config_and_the_labels() {
     let p = Profile::parse(edited(|_| {}).as_bytes()).unwrap();
     assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     let args = kbf_mac_provision::launchd::daemon_args(&p);
@@ -814,7 +814,7 @@ fn the_job_runs_kbf_node_with_its_config_and_the_labels() {
         args,
         [
             "/usr/local/kbf/current/kbf",
-            "node",
+            "--mode=daemon",
             "--config",
             "/usr/local/etc/kbf/kbf.toml",
             "--label",

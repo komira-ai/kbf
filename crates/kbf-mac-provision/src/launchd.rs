@@ -1,4 +1,4 @@
-//! The LaunchDaemon that runs `kbf node` (docs/design/mac-node-provisioning.md,
+//! The LaunchDaemon that runs `kbf --mode=daemon` (docs/design/mac-node-provisioning.md,
 //! section 5.3; docs/design/install-and-enrollment.md, section 4.4): its property list,
 //! rendered from the profile; the check that the
 //! installed one is that file, root's, with a safe error log and the job loaded; the
@@ -19,8 +19,8 @@ use crate::profile::{DaemonUser, Profile};
 
 const LAUNCHCTL: &str = "/bin/launchctl";
 pub const KBF_BIN: &str = "/usr/local/kbf/current/kbf";
-/// The node's config file, where the macOS package puts it (`kbf node`'s default
-/// `--config` on macOS): the frontend's URL, the node id and the directories. The
+/// The node's config file, where the macOS package puts it (the default `--config` of
+/// a `kbf` start on macOS): the frontend's URL, the node id and the directories. The
 /// operator writes it; this tool does not.
 pub const NODE_CONFIG: &str = "/usr/local/etc/kbf/kbf.toml";
 pub const LOG_DIR: &str = "/Library/Logs/kbf";
@@ -35,12 +35,12 @@ pub fn plist_path(profile: &Profile) -> String {
     format!("{LAUNCH_DAEMONS}/{}.plist", profile.get("launchd_label"))
 }
 
-/// `kbf node`'s arguments: the config file and the node label and the profile's labels.
-/// The server, the certificates, the node id and the directories are not arguments: the
-/// node reads its config file, enrolls with the frontend it names and runs the daemon with
-/// the certificates the frontend issued it.
+/// `kbf --mode=daemon`'s arguments: the config file and the node label and the profile's
+/// labels. The server, the certificates, the node id and the directories are not
+/// arguments: the start reads its config file, enrolls with the frontend it names (for the
+/// daemon role) and runs the daemon with the certificates the frontend issued it.
 pub fn daemon_args(profile: &Profile) -> Vec<String> {
-    let mut args: Vec<String> = [KBF_BIN, "node", "--config", NODE_CONFIG, "--label"]
+    let mut args: Vec<String> = [KBF_BIN, "--mode=daemon", "--config", NODE_CONFIG, "--label"]
         .into_iter()
         .map(str::to_owned)
         .collect();

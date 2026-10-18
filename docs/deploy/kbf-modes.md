@@ -15,6 +15,33 @@ kbf-deploy linux check-units --config node.conf --dir units --installable --mode
 Exit codes are those of the converged verbs ([storage-node.md](storage-node.md#rendering-the-converged-units)):
 0 rendered or every rule holds, 1 a rule is broken, 2 refused.
 
+## Choosing the mode: `--mode`, `kbf.toml`, enrollment
+
+A `kbf` process takes its mode from a flag, never from a word: `kbf --mode=frontend|storage|daemon|storage-and-daemon|all-in-one`,
+or `mode = "..."` in `/etc/kbf/kbf.toml` (`kbf` alone reads it). The flag wins over the file and
+the start says so on stderr; with neither the start exits 2 naming both. `kbf --mode=<mode> --help`
+lists the mode's flags. There is no `node` mode and no `enroll` word.
+
+- **Flags.** A start that gives flags of its mode (`--cold-store`, `--server`, ...) runs on them
+  and does not read the file. The units that `render-units` writes still run the old subcommand
+  forms (`kbf storage ...`, `kbf daemon ...`): they are hidden aliases of the same modes, kept
+  until the units move.
+- **`kbf.toml`.** `kbf --mode=storage|daemon|storage-and-daemon` with at most `--config FILE` and
+  `--label` reads the host's file. On the first start, with the token file `enroll.token_file`
+  names, it makes its keys, sends the token and a request for the roles the mode needs
+  (`storage` the storage role, `daemon` the daemon role, `storage-and-daemon` both) and writes
+  `node.json`; later starts renew the certificates without the token. `[storage]` and `[daemon]`
+  in the file are settings only.
+- **Exit 2** (a restart cannot fix it): a bad `kbf.toml`, a missing or open token file, a token
+  that does not grant a role the mode needs (the frontend's typed reason is printed), and a
+  `node.json` whose roles do not cover the mode (the mode changed after enrollment; the node is
+  never enrolled again on its own). **Exit 1** (may pass): the frontend is down or busy, the
+  clock is off; the start waits 5 seconds, doubling to 5 minutes, and tries again.
+- **`--check`** (`storage`, `daemon`, `storage-and-daemon`): checks the host and exits without
+  starting or enrolling anything. 0 for a valid `kbf.toml` with its token file and no `node.json`
+  yet, or an enrolled node that covers the mode; 2 for a bad config, a missing token file or a
+  `node.json` that does not cover the mode.
+
 ## What check-units reads
 
 - `kbf-<mode>.service` and `kbf.slice` in `--dir`, and their drop-ins: every `*.conf`
