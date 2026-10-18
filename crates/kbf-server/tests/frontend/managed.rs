@@ -585,3 +585,48 @@ async fn calls_that_do_not_apply_change_nothing() {
     assert_eq!(a.role().await["role"], "active");
     assert_eq!(b.role().await["role"], "candidate");
 }
+
+/// Catches: an old holder that is fenced by a takeover and is never told to stand down
+/// (the supervisor died, or the call was lost) leaving its callers hanging: a caller that
+/// waits on Execute at A is answered once B writes the `done/` row, though A was only
+/// found fenced by a refused write of its own (a cordon). Mutant: nothing follows the
+/// `done/` rows of a process found superseded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fenced_holder_answers_its_waiting_callers_without_a_stand_down() {
+    let node = Node::start().await;
+    let store = shared();
+    let token = std::env::temp_dir().join(format!("kbf-managed-fenced-{}", std::process::id()));
+    std::fs::write(&token, "a-token-that-is-long-enough-for-a-test\n").expect("token file");
+    std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .expect("mode");
+    let token_flag = format!("--api-token-file={}", token.display());
+    let a = Child::start(&managed_flags(&node, &[&token_flag]), &store).await;
+    let b = Child::start(&managed_flags(&node, &["--await-takeover"]), &store).await;
+    let a_worker = Child::worker_of(&a.role().await).expect("a worker listener");
+    let client = Client::connect(a.reapi, a_worker).await;
+    let mut daemon = client.daemon("node-a", 4, 8).await;
+    let job = Job::new("a build whose holder is fenced", &[]);
+    client.upload(&job.blobs()).await;
+    let mut ops = client.execute(&job.action).await;
+    let lease = daemon.start().await.lease_id.expect("a lease id");
+    let (held, _) = generation(&store);
+
+    // B takes the generation with no quiesce and no stand-down on A.
+    assert_eq!(b.takeover(held).await.0, 200);
+    assert_eq!(a.role().await["superseded"], false, "A has not written yet");
+    assert_eq!(get_post(a.api, "/v1/nodes/node-a:cordon").await, 200);
+    until("A finds it is fenced", async || {
+        a.role().await["superseded"] == true
+    })
+    .await;
+    assert_eq!(a.role().await["role"], "active", "no stand-down was made");
+
+    let b_worker = Child::worker_of(&b.role().await).expect("worker");
+    let reached = Client::connect(b.reapi, b_worker).await;
+    let mut daemon = reached.daemon("node-a", 4, 8).await;
+    assert!(daemon.heartbeat(&[lease]).await);
+    let result = support::output(&reached, "a build whose holder is fenced", 0).await;
+    assert!(daemon.report(ran(Some(lease), &result)).await.accepted);
+    let last = done(&mut ops).await;
+    assert_eq!(response(&last).result, Some(result));
+}

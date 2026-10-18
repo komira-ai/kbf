@@ -531,7 +531,9 @@ after a takeover elsewhere. It ends the worker streams with `UNAVAILABLE` ("conn
 again"), stops the worker listener, goes not ready (`/readyz`, the health service) and
 answers the Execute and WaitExecution streams it kept from the `done/` rows the new
 holder writes, with no GOAWAY and no timeout. It does not give up the state store. It is
-not undone. The process exits only when told to (`open_streams` and `open_sessions` say
+not undone. A process that is never told to stand down but finds it is fenced (the store
+refused a write of its own: `superseded` turns true) fences its farm and answers its kept
+calls from the `done/` rows the same way. The process exits only when told to (`open_streams` and `open_sessions` say
 when it holds nothing).
 
 **A candidate** (`--await-takeover`, which needs `--admin-listen`) opens the state store

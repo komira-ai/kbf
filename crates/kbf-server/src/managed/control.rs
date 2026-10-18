@@ -10,6 +10,7 @@
 //! for one.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -106,6 +107,9 @@ pub struct Control {
     stop: Stop,
     inner: Mutex<Inner>,
     moving: tokio::sync::Mutex<()>,
+    /// The follower of the kept calls runs ([`follow`]): once, whichever of a stand-down
+    /// and the first refused write starts it.
+    following: Arc<AtomicBool>,
     /// Where the handle of the real frontend goes once a takeover has built it.
     handoff: Mutex<Option<oneshot::Sender<Result<FrontendHandle, String>>>>,
 }
@@ -128,6 +132,7 @@ impl Control {
                 api: None,
             }),
             moving: tokio::sync::Mutex::new(()),
+            following: Arc::new(AtomicBool::new(false)),
             handoff: Mutex::new(Some(handoff)),
         }
     }
@@ -154,6 +159,9 @@ impl Control {
             held,
             worker: Some(handle.worker),
         });
+        if let Some(run) = &inner.running {
+            watch(Arc::clone(&run.stand.farm), Arc::clone(&self.following));
+        }
     }
 
     /// The role, as of now.
@@ -277,16 +285,7 @@ impl Control {
         if role != Role::StoodDown {
             stand.release().await;
             self.set_role(Role::StoodDown);
-            let farm = Arc::clone(&stand.farm);
-            tokio::spawn(async move {
-                let mut look = tokio::time::interval(FOLLOW_EVERY);
-                loop {
-                    look.tick().await;
-                    if let Err(error) = farm.follow() {
-                        tracing::warn!(%error, "the results of the kept calls could not be read");
-                    }
-                }
-            });
+            follow(Arc::clone(&stand.farm), &self.following);
         }
         Ok(self.view())
     }
@@ -343,4 +342,39 @@ impl Control {
             }
         }
     }
+}
+
+/// Answers the calls a farm kept from the `done/` rows another writer makes
+/// ([`crate::farm::Farm::follow`]), every [`FOLLOW_EVERY`], for as long as the process
+/// lives; started once per process.
+fn follow(farm: Arc<crate::farm::Farm>, started: &AtomicBool) {
+    if started.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut look = tokio::time::interval(FOLLOW_EVERY);
+        loop {
+            look.tick().await;
+            if let Err(error) = farm.follow() {
+                tracing::warn!(%error, "the results of the kept calls could not be read");
+            }
+        }
+    });
+}
+
+/// Waits for the state store to refuse a write of `farm` because another writer holds the
+/// generation, and then does what a stand-down does for the calls it holds: fences the
+/// farm (nothing more is fed to the scheduler) and follows the `done/` rows, so a caller
+/// waiting on Execute or WaitExecution is answered by the new writer's result instead of
+/// hanging. A process that stands down first has the follower already.
+fn watch(farm: Arc<crate::farm::Farm>, started: Arc<AtomicBool>) {
+    tokio::spawn(async move {
+        let mut look = tokio::time::interval(FOLLOW_EVERY);
+        while !farm.superseded() {
+            look.tick().await;
+        }
+        tracing::warn!("the state store has a newer writer: following its results");
+        farm.fence();
+        follow(farm, &started);
+    });
 }
