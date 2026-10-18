@@ -73,7 +73,9 @@ use crate::start::{AbortOnDrop, open_cold_file};
 use crate::startup_pass::StartPass;
 use crate::stores::{FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
-use crate::{Args, ConfigError, RaftMetaLog, SERVER_VERSION, interrupted, s3_store, sizes_on};
+use crate::{
+    Args, ConfigError, RaftMetaLog, SERVER_VERSION, StartFailure, interrupted, s3_store, sizes_on,
+};
 
 /// The flags of [`Args`] a storage node takes, besides the thread flags
 /// ([`kbf_threads::PoolArgs`]): where its bytes are and how they are written.
@@ -96,6 +98,9 @@ pub const ALLOWED: &[&str] = &[
     "write_bytes_in_flight",
     "tls_reload_interval_secs",
     "write_puts_in_flight",
+    "write_pool_writers",
+    "write_pool_queue",
+    "write_pool_stream_idle",
     "store_put_attempts",
 ];
 
@@ -536,7 +541,9 @@ where
 {
     let socket = bind_storage_socket(listener.listen)?;
     let (cache, registered) = open_cache(flags, socket, (meta, store, prefix, log)).await?;
-    let cache = cache.with_writes(flags.server.write_config());
+    let cache = cache
+        .with_writes(flags.server.write_config())
+        .with_write_pool(flags.server.write_pool_config());
     let (cache, tier) = crate::write_tier::attach(cache, hot).await?;
     let cache = Arc::new(cache);
     let _flusher = tier.map(|_| {
@@ -694,15 +701,16 @@ fn one_voter(voters: usize) -> Result<(), String> {
 }
 
 /// `kbf storage`: the logs, a runtime the thread flags size, the node's start line on
-/// stdout, and serving until SIGINT or SIGTERM. Exit 2 for a start the node refuses.
+/// stdout, and serving until SIGINT or SIGTERM. Exit 2 for a start the node refuses, 75
+/// for one that can succeed on a later try ([`crate::StartFailure`]).
 #[must_use]
 pub fn run(flags: &StorageFlags) -> ExitCode {
     crate::log_file::init(&flags.server);
     match serve(flags) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("kbf storage: {e}");
-            ExitCode::from(2)
+            eprint!("{}", crate::start_said("kbf storage", e.as_ref()));
+            StartFailure::of(e.as_ref()).code()
         }
     }
 }

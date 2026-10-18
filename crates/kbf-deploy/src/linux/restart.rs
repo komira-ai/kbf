@@ -1,5 +1,5 @@
 //! Rule `restart` of [`super::modes`]: a node unit (`storage`, `daemon`,
-//! `storage-and-daemon`) keeps retrying a failure that repeats quickly.
+//! `storage-and-daemon`, `all-in-one`) keeps retrying a failure that repeats quickly.
 //!
 //! systemd's defaults are `RestartSec=100ms` and a start limit of 5 starts in 10 s. A
 //! failure that repeats at once (the cold store or a disk not ready yet) uses up the 5
@@ -10,8 +10,9 @@
 //!   reads it;
 //! - `StartLimitIntervalSec=0` in `[Unit]`, which turns the start limit off.
 //!
-//! Not for `frontend` and `all-in-one`: after a handover the old frontend drains and
-//! exits 0 and must stay down, and the frontend keeps its own restart policy.
+//! Not for `frontend`, which keeps its own restart policy. (`all-in-one` is a node here:
+//! its start exits 75 when it can pass on a later try, and `Restart=on-failure` never
+//! restarts the clean exit 0 of a process that drained after a handover.)
 //!
 //! What it cannot see: a drop-in that sets either key (rule `stop` reads drop-ins on the
 //! node; this rule reads the unit file alone), and a value systemd ignores because it
