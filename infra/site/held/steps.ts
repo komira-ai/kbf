@@ -88,16 +88,30 @@ function prepare(t: Tools): void {
   t.stream('npm', ['test']);
 }
 
-/** Read-only `gh api repos/<repo>`: the immutable numeric ids the OIDC subject needs. */
-export function repoIds(t: Tools, repo: string): { repoId: string; ownerId: string } {
+/**
+ * Read-only `gh api repos/<repo>`: the immutable numeric ids the OIDC subject needs. Refuses unless GitHub's `full_name`
+ * equals the --repo given (case-insensitive), so a typo that names a real repository of another owner cannot yield a
+ * role that trusts it, and prints all three values so the operator sees what the role will trust.
+ */
+export function repoIds(t: Tools, repo: string): { repoId: string; ownerId: string; fullName: string } {
   const j = JSON.parse(t.capture('gh', ['api', `repos/${repo}`]));
-  return { repoId: String(j.id), ownerId: String(j.owner.id) };
+  const fullName = String(j.full_name ?? '');
+  if (fullName.toLowerCase() !== repo.toLowerCase()) {
+    throw new Refused(`--repo ${repo} resolves to '${fullName}' on GitHub; pass the exact owner/name (nothing was changed)`);
+  }
+  const ids = { repoId: String(j.id), ownerId: String(j.owner.id), fullName };
+  t.log(`# repository ${fullName}: repo id ${ids.repoId}, owner id ${ids.ownerId} (the role will trust exactly this)`);
+  return ids;
 }
+
+/** Quote a value for a POSIX shell word: single quotes, each embedded quote written as '\''. */
+export const shellQuote = (v: string) => `'${v.replace(/'/g, "'\\''")}'`;
 
 export const OIDC_KEYS = ['repo', 'context', 'job_workflow_ref'];
 
 export function github(t: Tools, o: Options): void {
   const repo = o.repo!;
+  repoIds(t, repo); // read-only; refuses a --repo that is not the repository's exact name
   const act = (args: string[]) => {
     if (o.apply) {
       t.log(`+ gh ${args.join(' ')}`);
@@ -157,10 +171,10 @@ export function site(t: Tools, o: Options): void {
     t.capture('aws', aws(o, 'route53', 'list-hosted-zones-by-name', '--dns-name', o.domain, '--max-items', '1', '--output', 'json')),
   ).HostedZones as { Name: string }[];
   if (!zones.some((z) => z.Name === `${o.domain}.`)) throw new Refused(`no ${o.domain} hosted zone in this account; run dns --apply first`);
-  const { repoId, ownerId } = repoIds(t, o.repo!);
+  const { repoId, ownerId, fullName } = repoIds(t, o.repo!);
   prepare(t);
   const ctx = [
-    '-c', `account=${o.account}`, '-c', `domain=${o.domain}`, '-c', `githubRepo=${o.repo}`,
+    '-c', `account=${o.account}`, '-c', `domain=${o.domain}`, '-c', `githubRepo=${fullName}`, // GitHub's own spelling: the sub claim uses it
     '-c', `githubRepoId=${repoId}`, '-c', `githubOwnerId=${ownerId}`, '-c', `oidcProviderArn=${arn}`,
   ];
   if (o.apply) {
@@ -216,7 +230,7 @@ export function vars(t: Tools, o: Options): void {
   ];
   if (rows.some(([, v]) => !v)) throw new Refused('stack kbf-prod-site has no outputs; run site --apply first');
   t.log(`# Environment prod of ${o.repo} is as expected. Run:`);
-  for (const [k, v] of rows) t.log(`gh variable set ${k} --env prod --repo ${o.repo} --body '${v}'`);
+  for (const [k, v] of rows) t.log(`gh variable set ${k} --env prod --repo ${o.repo} --body ${shellQuote(v!)}`);
   t.log(`# Region is always ${REGION}.`);
 }
 

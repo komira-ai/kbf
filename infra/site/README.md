@@ -13,6 +13,11 @@ deploy to) and their own `gh` login. Each step is a dry run unless `--apply` is 
 unless the AWS profile's account equals the `--account` you pass. Nothing here writes an account id, an organization
 name or a repository id to a file: they are flags and CDK context.
 
+Dry runs: `dns` and `site` make AWS read calls even without `--apply` (the caller identity, and `cdk diff` and its
+lookups); `github`'s dry run makes no AWS call and no change (it reads the repository from GitHub). `site` and `github`
+refuse a `--repo` whose GitHub `full_name` is not exactly the name given (case-insensitive), and print the repository
+name and the two numeric ids the role will trust before any write or `cdk` call.
+
 The held steps are one small CLI, `held/main.ts`, run as `npm run held -- <command> [flags]` from this directory (the
 repository allows no shell scripts). It calls `aws`, `gh` and `cdk` with argument arrays, and its tests drive it with a
 fake so they can see which commands a dry run does and does not run.
@@ -98,8 +103,8 @@ environment `prod`. It is a reusable workflow; this directory does not contain i
 - set `permissions: id-token: write` on a job that declares `environment: prod`, inside that file;
 - be called with `uses: <owner>/<name>/.github/workflows/site-publish.yml@refs/heads/main` (a branch ref, not a SHA);
 - read the three variables from step 4, assume the role (1 h session), `aws s3 sync` the site build with
-  `--delete --exclude 'releases/*'`, upload release files with `aws s3api put-object --if-none-match '*'`, and create
-  an invalidation of `/*`.
+  `--delete --exclude 'releases/*'`, upload each release file as ONE `aws s3api put-object --if-none-match '*'` (see
+  Permissions: no multipart), and create an invalidation of `/*`.
 
 ## The OIDC `sub`
 
@@ -131,10 +136,15 @@ Nothing beyond this: no managed policies, no IAM, no CDK bootstrap roles.
 - `cloudfront:CreateInvalidation` on the one distribution.
 
 `aws s3 sync` of the site must exclude `releases/` (the deny would fail the sync otherwise). The role cannot wait on an
-invalidation (no `GetInvalidation`). Multipart uploads work: CreateMultipartUpload, UploadPart and
-CompleteMultipartUpload are covered by `s3:PutObject` (with the write-once deny, the conditional header goes on the final
-complete/put). Only `AbortMultipartUpload` and `ListMultipartUploadParts` are not granted; the 7-day lifecycle rule
-cleans up incomplete uploads.
+invalidation (no `GetInvalidation`).
+
+**Release files cannot be uploaded in multiple parts.** CreateMultipartUpload and UploadPart are `s3:PutObject` calls
+without an `if-none-match` header, so the write-once deny refuses them under `releases/<version>/`; the deny is not
+loosened for them. Upload each release file with a single `aws s3api put-object --if-none-match '*' --body <file> ...`
+(`aws s3 cp` switches to multipart above its threshold, so do not use it for releases). One `PutObject` is limited to
+5 GB per object, which is far above any package here. Outside `releases/` (site pages and assets) multipart works;
+`AbortMultipartUpload` and `ListMultipartUploadParts` are not granted, and the 7-day lifecycle rule cleans up
+incomplete uploads.
 
 ## Serving
 

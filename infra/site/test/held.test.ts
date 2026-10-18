@@ -1,4 +1,4 @@
-import { Refused, Tools, checkGithub, main, parse } from '../held/steps';
+import { Refused, Tools, checkGithub, main, parse, shellQuote } from '../held/steps';
 
 const ACCOUNT = '123456789012';
 const REPO = 'example-org/example-repo';
@@ -42,7 +42,7 @@ const answers = (over: Record<string, string | Error> = {}) => ({
   'oidc/customization/sub': GOOD_TMPL,
   'describe-stacks': STACK,
   'list-hosted-zones-by-name': JSON.stringify({ HostedZones: [{ Name: 'kbf.dev.' }] }),
-  [`api repos/${REPO}`]: JSON.stringify({ id: 222, owner: { id: 111 } }),
+  [`api repos/${REPO}`]: JSON.stringify({ full_name: REPO, id: 222, owner: { id: 111 } }),
   ...over,
 });
 
@@ -78,7 +78,8 @@ describe('dry run', () => {
   test('github prints the gh commands and executes none', () => {
     const f = fake(answers());
     main(['github', '--repo', REPO], f.t);
-    expect(f.calls).toHaveLength(0);
+    expect(f.calls.filter((c) => c.kind === 'stream')).toHaveLength(0);
+    expect(f.calls.every((c) => c.cmd === 'gh' && c.args[0] === 'api' && !c.args.includes('-X'))).toBe(true);
     expect(f.text()).toContain(`DRY-RUN: gh api -X PUT repos/${REPO}/environments/prod`);
     expect(f.text()).toContain('custom_branch_policies]=true');
     expect(f.text()).toContain('name=main');
@@ -126,6 +127,43 @@ describe('site', () => {
     const f = fake(answers());
     main(['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO, '--apply'], f.t);
     expect(f.ran('create-open-id-connect-provider')).toBe(false);
+  });
+});
+
+describe('--repo cross-check', () => {
+  const other = JSON.stringify({ full_name: 'other-owner/example-repo', id: 999, owner: { id: 888 } });
+  test.each([['github', []], ['site', ['--account', ACCOUNT, '--profile', 'p']]] as [string, string[]][])(
+    '%s refuses a --repo whose GitHub full_name differs, before any write or cdk call',
+    (cmd, extra) => {
+      const f = fake(answers({ [`api repos/${REPO}`]: other }));
+      expect(() => main([cmd, '--repo', REPO, ...extra, '--apply'], f.t)).toThrow(/resolves to 'other-owner\/example-repo'/);
+      expect(f.calls.filter((c) => c.kind === 'stream')).toHaveLength(0);
+    },
+  );
+  test('the comparison ignores case, and the three values are printed before cdk runs', () => {
+    const f = fake(answers({ [`api repos/${REPO.toUpperCase()}`]: JSON.stringify({ full_name: REPO, id: 222, owner: { id: 111 } }) }));
+    main(['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO.toUpperCase()], f.t);
+    expect(f.ran(`-c githubRepo=${REPO} `)).toBe(true); // GitHub's spelling reaches the trust policy
+    const shown = f.lines.findIndex((l) => l.includes('repo id 222, owner id 111'));
+    expect(f.lines[shown]).toContain(REPO);
+    expect(shown).toBeGreaterThanOrEqual(0);
+    expect(f.ran('cdk diff')).toBe(true);
+  });
+});
+
+describe('quoting', () => {
+  test('shellQuote escapes single quotes', () => {
+    expect(shellQuote("a'b")).toBe(`'a'\\''b'`);
+    expect(shellQuote('plain')).toBe("'plain'");
+  });
+  test('vars prints a value with a single quote as one safe word', () => {
+    const f = fake(answers({ 'describe-stacks': JSON.stringify([
+      { OutputKey: 'BucketName', OutputValue: "b'; echo pwned; '" },
+      { OutputKey: 'DistributionId', OutputValue: 'E1' },
+      { OutputKey: 'PublishRoleArn', OutputValue: 'arn:x' },
+    ]) }));
+    main(['vars', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO], f.t);
+    expect(f.lines.find((l) => l.includes('KBF_SITE_BUCKET'))).toContain(`--body 'b'\\''; echo pwned; '\\'''`);
   });
 });
 

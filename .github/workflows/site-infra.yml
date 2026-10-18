@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  test:
+  site-infra:
     runs-on: ubuntu-latest
     permissions:
       contents: read
