@@ -393,6 +393,14 @@ fn parse_operation(key: &str, prefix: &str) -> Result<OperationId, StateError> {
     Ok(OperationId(id))
 }
 
+/// The grant a `lease/` row holds.
+fn lease_row(key: &str, row: &Versioned) -> Result<LeaseGrant, StateError> {
+    match decode(key, &row.value)? {
+        FarmInput::Committed(ControlRecord::Lease(grant)) => Ok(grant),
+        _ => Err(corrupt(key, "not a lease grant")),
+    }
+}
+
 /// The request an `op/` row holds.
 fn request_row(key: &str, row: &Versioned) -> Result<Request, StateError> {
     match decode(key, &row.value)? {
@@ -452,10 +460,7 @@ impl Durable {
     pub(super) fn load(&self) -> Result<Stored, StateError> {
         let mut leases = std::collections::BTreeMap::new();
         for (key, row) in self.store.scan_prefix("lease/")? {
-            let FarmInput::Committed(ControlRecord::Lease(grant)) = decode(&key, &row.value)?
-            else {
-                return Err(corrupt(&key, "not a lease grant"));
-            };
+            let grant = lease_row(&key, &row)?;
             leases.insert(grant.operation, grant);
         }
         let mut losses = std::collections::BTreeMap::new();

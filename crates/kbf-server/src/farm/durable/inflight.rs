@@ -102,9 +102,8 @@ impl Durable {
         let request = request_row(&key, &row)?;
         let mut lease = None;
         for (key, row) in self.store.scan_prefix("lease/")? {
-            if let FarmInput::Committed(ControlRecord::Lease(grant)) = decode(&key, &row.value)?
-                && grant.operation == operation
-            {
+            let grant = lease_row(&key, &row)?;
+            if grant.operation == operation {
                 lease = Some(grant);
             }
         }

@@ -382,11 +382,31 @@ fn a_joined_operation_keeps_its_lease() {
         device: None,
     };
     other.persist(&[Effect::Start(start)], None).expect("grant");
+    // Another action's operation holds a lease too; it is not this one's.
+    assert!(
+        other
+            .submit(OperationId(1), &request(2), &subject())
+            .is_ok()
+    );
+    let beside = kbf_types::StartLease {
+        worker: kbf_types::WorkerId::new("node-b"),
+        lease: kbf_types::LeaseId::new(5, 1),
+        operation: OperationId(1),
+        key: request(2).key,
+        kind: LeaseKind::Action,
+        resources: Resources::new(1_000, 1 << 30),
+        fence: kbf_types::FencePolicy::RunOn,
+        device: None,
+    };
+    other
+        .persist(&[Effect::Start(beside)], None)
+        .expect("grant");
 
     assert!(submit(&farm, 1).is_ok());
 
     let state = farm.lock();
     assert!(state.machine.sent(kbf_types::LeaseId::new(5, 0)).is_some());
+    assert!(state.machine.sent(kbf_types::LeaseId::new(5, 1)).is_none());
     assert!(!state.sched.queued().any(|op| op == OperationId(0)));
 }
 
