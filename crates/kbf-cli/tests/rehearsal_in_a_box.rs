@@ -17,11 +17,11 @@
 //! The farm itself is `kbf_harness::farm::Farm`, which the beta scenarios share: this file
 //! holds the REAPI client and the tests. The deviations from the rendered units are listed
 //! in `Farm::start`: the cold store is a directory (no MinIO), the container driver runs
-//! the stand-in `podman` over a planted cgroup tree and id files.
+//! the stand-in `crun` over a planted cgroup tree and id files.
 
 #![cfg(target_os = "linux")]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use kbf_harness::api::connected;
 use kbf_harness::farm::{Bins, Farm, Role, Topology, node_id};
@@ -39,7 +39,7 @@ use kbf_transfer::{Cas as _, TransferConfig, Transfers, digest_of};
 use prost::Message as _;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
-// The stand-in `podman` runs each action as `kbf-act` beside it: a link to this test
+// The stand-in `crun` runs each action as `kbf-act` beside it: a link to this test
 // binary, which answers as `kbf-act` through it.
 kbf_testkit::act_test_hook!();
 
@@ -48,7 +48,7 @@ const OUTPUT: &[u8] = b"a file\n";
 
 /// A fresh directory for one test.
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+    let dir = kbf_harness::node_support::scratch_root(PathBuf::from(env!("CARGO_TARGET_TMPDIR")))
         .join("kbf-rehearsal")
         .join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -57,12 +57,12 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 /// The rehearsal's farm of `storage_nodes` nodes and a daemon, started from the units
-/// `kbf-deploy` renders, over the stand-in `podman`.
+/// `kbf-deploy` renders, over the stand-in `crun`.
 fn start(name: &str, storage_nodes: usize) -> Farm {
     let dir = scratch(name);
     let bins = Bins {
         kbf: PathBuf::from(env!("CARGO_BIN_EXE_kbf")),
-        fake_podman: Some(PathBuf::from(env!("CARGO_BIN_EXE_kbf-cli-fake-podman"))),
+        fake_crun: Some(PathBuf::from(env!("CARGO_BIN_EXE_kbf-cli-fake-crun"))),
     };
     Farm::start(&dir, &dir, &bins, &Topology::rehearsal(storage_nodes))
         .unwrap_or_else(|e| panic!("{e}"))
@@ -112,7 +112,7 @@ async fn upload_action(cas: &Transfers, image: &str, input: &[u8]) -> Digest {
         }],
         ..Directory::default()
     };
-    // The stand-in `podman` runs its planted steps whatever the arguments are.
+    // The stand-in `crun` runs its planted steps whatever the arguments are.
     let command = ReapiCommand {
         arguments: vec!["true".to_owned()],
         output_paths: vec!["out/file.txt".to_owned()],

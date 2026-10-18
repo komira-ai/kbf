@@ -17,7 +17,7 @@ use super::workflows;
 
 /// What `cargo xtask package` names an asset, `<binary>-<commit>-<platform>`, with the
 /// commit as the attest job spells it.
-fn stem(name: &str, platform: &str) -> String {
+pub fn stem(name: &str, platform: &str) -> String {
     format!("{name}-${{{{ github.sha }}}}-{platform}")
 }
 

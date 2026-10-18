@@ -14,8 +14,8 @@ use crate::interrupt::Interrupt;
 pub struct Bins {
     /// `kbf`.
     pub kbf: PathBuf,
-    /// The stand-in `podman`, for [`Driver::StandInContainer`].
-    pub fake_podman: Option<PathBuf>,
+    /// The stand-in `crun`, for [`Driver::StandInContainer`].
+    pub fake_crun: Option<PathBuf>,
 }
 
 /// What runs the actions on the daemons.
@@ -24,7 +24,7 @@ pub enum Driver {
     /// `--driver=native`: each action is a plain process in its lease directory. No
     /// container path is exercised; any argv a build sends runs as sent.
     Native,
-    /// `--driver=container` as rendered, over the stand-in `podman` (which runs one
+    /// `--driver=container` as rendered, over the stand-in `crun` (which runs one
     /// planted argv whatever the lease asks for), a planted cgroup tree and id files.
     StandInContainer,
 }

@@ -1,5 +1,5 @@
 //! What the tests that run a node binary share: its certificates, the stand-in
-//! `podman` and cgroup tree its container driver runs over, and the checks of what is
+//! `crun` and cgroup tree its container driver runs over, and the checks of what is
 //! on its disk. Used by this crate's tests/binary.rs and by kbf-cli's
 //! tests/storage_and_daemon.rs (through `#[path]`: a test can run only its own
 //! package's binaries, so each package that runs a node has a test of its own).
@@ -14,15 +14,35 @@ use std::time::Duration;
 
 use rcgen::{CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair, SanType};
 
-// The stand-in `podman`, the planted cgroup tree and id files, the disk scan and the large
+// The stand-in `crun`, the planted cgroup tree and id files, the disk scan and the large
 // input live in kbf-harness, which the rehearsal farm uses too.
 #[allow(unused_imports)] // Each test binary uses its own part.
 pub(crate) use kbf_harness::node_support::{
-    MANIFEST, cgroup_tree, files_holding, id_files, image_path, input_bytes, podman,
+    MANIFEST, cgroup_tree, crun, files_holding, id_files, image_path, input_bytes, oci_runtime,
+    podman_ran,
 };
 
 /// How long the test waits for what should happen promptly.
 pub(crate) const PROMPT: Duration = Duration::from_secs(60);
+
+/// Where tests that run a container daemon put their directories: Cargo's per-target
+/// temporary directory, unless an ancestor of it is closed to other users (a home
+/// directory often is), which the container driver refuses (its containers' ids are not
+/// the daemon's, and must be able to search down to the data directory); then the
+/// system's temporary directory.
+pub(crate) fn scratch_root() -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let target = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let searchable = std::fs::canonicalize(&target).is_ok_and(|real| {
+        real.ancestors()
+            .all(|a| std::fs::metadata(a).is_ok_and(|m| m.permissions().mode() & 0o001 != 0))
+    });
+    if searchable {
+        target
+    } else {
+        std::env::temp_dir()
+    }
+}
 
 /// A CA, the node's certificate (`node-1`, its one DNS name, the daemon role its worker
 /// session needs on the worker listener, and clientAuth, the daemon row of the farm's

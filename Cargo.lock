@@ -1346,6 +1346,7 @@ dependencies = [
  "prost",
  "rcgen",
  "rustix",
+ "serde_json",
  "tokio",
  "tonic",
  "tracing",
@@ -1568,10 +1569,12 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "clap",
+ "flate2",
  "futures",
  "hex",
  "kbf-daemon",
  "kbf-front",
+ "kbf-image",
  "kbf-objstore",
  "kbf-proto",
  "kbf-testkit",
@@ -1584,8 +1587,10 @@ dependencies = [
  "rustix",
  "serde_json",
  "sha2 0.11.0",
+ "tar",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tonic",
  "tracing",
  "tracing-subscriber",
@@ -1715,7 +1720,6 @@ dependencies = [
  "clap",
  "flate2",
  "kbf-deploy",
- "kbf-driver-container",
  "kbf-it",
  "kbf-testkit",
  "kbf-transfer",
@@ -1751,6 +1755,30 @@ dependencies = [
  "libc",
  "rustix",
  "thiserror",
+]
+
+[[package]]
+name = "kbf-image"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "flate2",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "kbf-types",
+ "rcgen",
+ "rustix",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tar",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
@@ -1939,6 +1967,7 @@ dependencies = [
  "prost",
  "rcgen",
  "serde_json",
+ "tar",
  "thiserror",
  "tokio",
  "tonic",
@@ -4694,6 +4723,7 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "clap",
  "flate2",
  "hex",

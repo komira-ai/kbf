@@ -288,7 +288,7 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
     };
     let bins = Bins {
         kbf: args.kbf.clone(),
-        fake_podman: None,
+        fake_crun: None,
     };
     let farm_dir = args.work.join("farm");
     let farm = match Farm::start(logs, &farm_dir, &bins, &topology) {

@@ -232,7 +232,7 @@ fn farms_started_together_in_one_process_are_told_ports_of_their_own() {
         let dir = scratch(name);
         let bins = Bins {
             kbf: PathBuf::from(env!("CARGO_BIN_EXE_kbf")),
-            fake_podman: None,
+            fake_crun: None,
         };
         std::thread::spawn(move || {
             Farm::start(

@@ -19,7 +19,9 @@ use kbf_deploy::linux::verify_cert::Row;
 use crate::api;
 use crate::envoy::{self, BoxPorts};
 use crate::interrupt::Interrupt;
-use crate::node_support::{cgroup_tree, files_holding, id_files, image_path, podman};
+use crate::node_support::{
+    cgroup_tree, crun, files_holding, id_files, image_path, oci_runtime, podman_ran,
+};
 use crate::pki::Pki;
 use crate::ports::{Claim, Ports};
 use crate::procs::{HANG, Proc, Spec, after, field};
@@ -63,7 +65,7 @@ pub struct Farm {
     client_port: u16,
     api: u16,
     ca: Vec<u8>,
-    /// The image the actions name: what the stand-in `podman` serves.
+    /// The image the actions name: the one unpacked in each node's image store.
     image: String,
     storage_nodes: usize,
     /// The port of each storage node's `/metrics` (`--metrics-listen`, on loopback), node 1
@@ -136,9 +138,13 @@ fn settings(
 /// The directories a process's unit expects to exist (the installer makes them on a
 /// host).
 fn make_dirs(root: &Path) -> PathBuf {
-    // Private to this user: `etc` holds the keys, and a shared runner has other users.
-    for name in ["etc", "data", "meta", "hot", "state", "cold", "bin"] {
-        crate::pki::private_dir(&root.join(name));
+    // `etc` holds the keys, and a shared runner has other users: private to this one. The rest
+    // is as made: the OCI backend refuses a data directory (and its parents) that others
+    // cannot search.
+    std::fs::create_dir_all(root).expect("mkdir");
+    crate::pki::private_dir(&root.join("etc"));
+    for name in ["data", "meta", "hot", "state", "cold", "bin"] {
+        std::fs::create_dir_all(root.join(name)).expect("mkdir");
     }
     root.join("bin")
 }
@@ -167,8 +173,10 @@ impl Farm {
     ///   nothing to a frontend that is not ready: through Envoy no node could register at
     ///   a cold start);
     /// - with [`Driver::StandInContainer`], `--driver=container` stays, over the stand-in
-    ///   `podman`: the daemons get it on `PATH`, their cgroup tree (`--cgroup-root`,
-    ///   `--self-cgroup`) is planted and `--id-files` stands for `/etc/subuid`;
+    ///   `crun`: `--oci-runtime=` names it (the unit names `/usr/bin/crun`), the id tools
+    ///   and a failing `podman` are on the daemons' `PATH`, their cgroup tree
+    ///   (`--cgroup-root`, `--self-cgroup`) is planted and `--id-files` stands for
+    ///   `/etc/subuid`;
     /// - with [`Driver::Native`], `--driver=native` replaces it and `KBF_IMAGES` is empty
     ///   (only the container driver takes `--image`);
     /// - the frontend's control socket is in the temporary directory (a `RuntimeDirectory=`
@@ -247,18 +255,19 @@ impl Farm {
             unit.set(&flags)
         };
         let fake = || {
-            bins.fake_podman
+            bins.fake_crun
                 .as_ref()
-                .expect("Bins::fake_podman for the stand-in container driver")
+                .expect("Bins::fake_crun for the stand-in container driver")
                 .display()
                 .to_string()
         };
-        // The stand-in `podman`'s store in `bin`, and the image it serves, bare.
+        // The stand-in `crun` in `bin`, the image it names unpacked under the node's
+        // `data` directory beside it, and that image, bare.
         let stand_in = |farm: &mut Farm, bin: &Path| {
             if native {
                 return String::new();
             }
-            let image = podman(bin, &fake(), &steps);
+            let image = crun(bin, &bin.with_file_name("data"), &fake(), &steps);
             let bare = image
                 .strip_prefix("docker://")
                 .expect("docker://")
@@ -439,20 +448,18 @@ impl Farm {
     }
 
     /// Starts the process for `unit`; those with a `bin` (the container driver's) get
-    /// the stand-in `podman` on `PATH` and the planted cgroup tree and id files.
+    /// the unit's `--oci-runtime` made the stand-in `crun`, the id tools and a failing
+    /// `podman` on `PATH`, and the planted cgroup tree and id files.
     fn launch(&mut self, kbf: &Path, role: Role, root: &Path, unit: Rendered, bin: Option<&Path>) {
         let (unit, cwd, mut env) = match bin {
             Some(bin) => {
                 let mut flags = cgroup_tree(bin);
                 flags.push(format!("--id-files={}", id_files(root).display()));
-                // Rootless Podman's runtime directory, which the startup self-checks look
-                // for: `bin` exists and is this user's.
-                let env = vec![
-                    ("PATH".to_owned(), image_path(bin)),
-                    ("XDG_RUNTIME_DIR".to_owned(), bin.display().to_string()),
-                ];
-                // The stand-in finds its state beside the link it was run through.
-                (unit.append(&flags), bin, env)
+                let env = vec![("PATH".to_owned(), image_path(bin))];
+                // The rendered unit names `/usr/bin/crun`: this box's is the stand-in,
+                // which finds its state beside the link it was run through.
+                let runtime = [oci_runtime(bin)];
+                (unit.replace(&runtime).append(&flags), bin, env)
             }
             None => (unit, root, Vec::new()),
         };
@@ -745,7 +752,8 @@ impl Farm {
         &self.ca
     }
 
-    /// The image the actions name (the stand-in `podman`'s); empty with the native driver.
+    /// The image the actions name (the one unpacked in each node's image store); empty
+    /// with the native driver.
     #[must_use]
     pub fn image(&self) -> &str {
         &self.image
@@ -834,12 +842,17 @@ impl Farm {
         }
     }
 
-    /// [`Farm::stop_all`], and every process must have exited 0.
+    /// [`Farm::stop_all`], and every process must have exited 0. The `podman` first on
+    /// each container node's `PATH` fails and records that it ran: `kbf` never starts it.
     ///
     /// # Panics
-    /// When one did not.
+    /// When one did not exit 0, or a `podman` ran.
     pub fn stop(mut self) {
         let ended = self.stop_all();
+        for m in &self.members {
+            let ran = podman_ran(&m.root.join("bin"));
+            assert_eq!(ran, "", "podman ran on {}", m.root.display());
+        }
         for (role, how) in ended {
             assert_eq!(how, "exit 0", "{role}\n{}", self.logs());
         }

@@ -38,7 +38,6 @@ test = false
 clap.workspace = true
 flate2.workspace = true
 kbf-deploy.workspace = true
-kbf-driver-container.workspace = true
 # The Buck2 summary line parser (`Commands: N (cached: N, remote: N, local: N)`).
 kbf-it.workspace = true
 kbf-testkit.workspace = true
