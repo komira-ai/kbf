@@ -7,7 +7,7 @@ mod hooked;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hooked::Hooked;
@@ -19,13 +19,17 @@ use kbf_proto::worker::segments_client::SegmentsClient;
 use kbf_server::NodeMap;
 use kbf_server::join::{Identity as NodeIdentity, Joiner};
 use kbf_server::members::{Members, MembershipConfig};
+use kbf_server::storage_health::Debts;
 use kbf_server::storage_node::{StorageFlags, command, parse, start_storage};
 use kbf_server::{
     EpochPolicy, Listeners, StateStore, TlsSource, WorkerTls, bind_server_with_state,
 };
 use kbf_state::{Store, Versioned};
 use kbf_storage::Storage as _;
+use kbf_storage::repair::{NoLedger, Options, RepairRecord, Repairs};
 use kbf_storage::service::{CatchUp, ROLE_URI_PREFIX, RemoteStorage};
+use kbf_store::FaultFs;
+use kbf_types::{Digest, DigestFunction};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, SanType,
@@ -35,6 +39,9 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 const MS: Duration = Duration::from_millis(1);
 
+/// An empty directory for `name`. Emptied first: each test's frontend is new, so its
+/// state store hands out boot 1 again, which a metadata directory a previous run left
+/// has set already (a registered node refuses to start over it).
 fn dir(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("storage-register")
@@ -159,13 +166,20 @@ fn member(f: &Frontend, id: u64) -> Option<kbf_map::Member> {
     map.member(MemberId(id)).cloned()
 }
 
+/// Whether a registered node's state is one a fresh node is in: `CatchingUp` while it
+/// rebuilds its index from the store, `Active` after its first beat that says it is done.
+fn rebuilt_or_rebuilding(state: Option<MemberState>) -> bool {
+    matches!(state, Some(MemberState::CatchingUp | MemberState::Active))
+}
+
 fn state(f: &Frontend, id: u64) -> Option<MemberState> {
     member(f, id).map(|m| m.state)
 }
 
 /// Catches: a node that registers but does not keep its row alive, a frontend that never
 /// expires a node that stops, and a registration that tells the frontend something other
-/// than what the node is. The node registers on start (its bound address, Active); the
+/// than what the node is. The node registers on start (its bound address; CatchingUp while
+/// it rebuilds its index, Active once its first beat after that says so); the
 /// store's clock then moves 45 ms (TTL 60 ms) after each beat it sees, six times, which is
 /// four TTLs and which the row survives only because the node beats; when the node stops,
 /// 61 ms are enough for the frontend's own timer to mark it Down.
@@ -181,17 +195,19 @@ async fn a_storage_node_registers_and_heartbeats_across_several_ttls() {
 
     let mut seen = until("the node to register", || row(&f, 1)).await.version;
     let me = until("the node in the map", || member(&f, 1)).await;
-    assert_eq!(
-        (me.addr.clone(), me.state),
-        (addr.to_string(), MemberState::Active)
-    );
+    assert_eq!(me.addr, addr.to_string());
+    assert!(rebuilt_or_rebuilding(Some(me.state)), "{:?}", me.state);
     for round in 1..=6 {
         f.store.clock.advance(45 * MS);
         seen = until("a heartbeat", || {
             row(&f, 1).filter(|r| r.version != seen).map(|r| r.version)
         })
         .await;
-        assert_eq!(state(&f, 1), Some(MemberState::Active), "round {round}");
+        assert!(
+            rebuilt_or_rebuilding(state(&f, 1)),
+            "round {round}: {:?}",
+            state(&f, 1)
+        );
     }
 
     serving.abort();
@@ -213,15 +229,24 @@ async fn a_node_whose_row_lapsed_registers_again() {
     let node = start_storage(&flags(&dir("lapse"), &[url]).expect("flags"), never)
         .await
         .expect("starts");
+    let caught_up = node.catch_up();
     let _serving = tokio::spawn(node.serve());
     let first = until("the node to register", || row(&f, 1)).await.version;
     until("a beat", || row(&f, 1).filter(|r| r.version != first)).await;
+    // Registers again as a node whose index is whole: Active, not CatchingUp.
+    caught_up.finished().await;
     f.store.clock.advance(61 * MS);
     // Boot 2 is the registration after the lapse: a beat of boot 2 is accepted, and the
     // member has the id it had.
     until("the node to register again", || {
         f.members
-            .heartbeat(MemberId(1), 2, kbf_server::members::Progress::CaughtUp)
+            .heartbeat(
+                MemberId(1),
+                2,
+                kbf_server::members::Progress::CaughtUp,
+                Debts::Unknown,
+                None,
+            )
             .ok()
     })
     .await;
@@ -262,7 +287,11 @@ async fn a_node_retries_through_failures_and_keeps_its_boot() {
     f.store
         .fail_gets
         .store(3, std::sync::atomic::Ordering::SeqCst);
-    let joiner = tokio::spawn(Joiner::new(channel, who, 5 * MS).run());
+    let mut joiner = Joiner::new(channel, who, 5 * MS);
+    let joiner = tokio::spawn(async move {
+        let joined = joiner.join().await;
+        joiner.keep(joined).await;
+    });
     let first = until("the node to register", || row(&f, 1)).await.version;
     f.store
         .fail_gets
@@ -279,6 +308,78 @@ async fn a_node_retries_through_failures_and_keeps_its_boot() {
         "one member, registered once"
     );
     joiner.abort();
+}
+
+/// A connector that fails its first `failures` dials as a name lookup that found nothing
+/// does (the error a resolver gives before any socket exists), then dials `to`.
+struct Resolving {
+    failures: usize,
+    dials: Arc<std::sync::atomic::AtomicUsize>,
+    to: SocketAddr,
+}
+
+impl tonic::codegen::Service<tonic::codegen::http::Uri> for Resolving {
+    type Response = hyper_util::rt::TokioIo<tokio::net::TcpStream>;
+    type Error = std::io::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<Self::Response>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _: tonic::codegen::http::Uri) -> Self::Future {
+        let dial = self.dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (lookup_fails, to) = (dial < self.failures, self.to);
+        Box::pin(async move {
+            if lookup_fails {
+                return Err(std::io::Error::other(
+                    "dns error: failed to lookup address information: Name or service not known",
+                ));
+            }
+            Ok(hyper_util::rt::TokioIo::new(
+                tokio::net::TcpStream::connect(to).await?,
+            ))
+        })
+    }
+}
+
+/// Catches: a node whose frontend name does not resolve at start (a VPN or overlay
+/// resolver that is not up yet) that ends instead of waiting: the `--frontend` channel is
+/// lazy, so a failed lookup is the first registration's failure, and the join loop must
+/// wait and try again like any other failed registration. The first three dials fail as a
+/// lookup does; the node then registers once, as boot 1, and the lookup was tried four
+/// times. Mutant: [`Joiner::join`] ends (panics) on a failed registration; the node is
+/// never registered and the wait times out.
+#[tokio::test]
+async fn a_frontend_name_that_does_not_resolve_yet_is_retried() {
+    let f = frontend(None);
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let connector = Resolving {
+        failures: 3,
+        dials: Arc::clone(&dials),
+        to: f.worker,
+    };
+    let channel = Endpoint::from_shared("http://frontend.invalid:8981")
+        .expect("endpoint")
+        .connect_with_connector_lazy(connector);
+    let who = NodeIdentity {
+        instance_id: "node-dns".to_owned(),
+        addr: "192.0.2.7:8982".to_owned(),
+        zone: String::new(),
+        weight: 1,
+    };
+    let mut joiner = Joiner::new(channel, who, 5 * MS);
+    let joiner = tokio::spawn(async move { joiner.join().await });
+    until("the node to register", || row(&f, 1)).await;
+    let joined = joiner.await.expect("the join did not end the task");
+    assert_eq!((joined.member_id, joined.boot), (1, 1));
+    assert!(dials.load(std::sync::atomic::Ordering::SeqCst) >= 4);
+    assert_eq!(f.store.fake.scan_prefix("member/").expect("scan").len(), 1);
 }
 
 /// Catches: a rebuilding node that enters the map as anything but CatchingUp, a report of
@@ -385,6 +486,18 @@ async fn the_registration_flags_are_carried_or_refused() {
         none.expect("no error").is_none(),
         "no --frontend, no registration"
     );
+    // Without --frontend the node starts at once, registered nowhere: its cache writes
+    // in an epoch of its own log.
+    let node = start_storage(&alone, never)
+        .await
+        .expect("starts without a frontend");
+    assert!(
+        node.start_line().starts_with("kbf-storage "),
+        "{}",
+        node.start_line()
+    );
+    drop(node);
+    assert_eq!(f.store.fake.scan_prefix("member/").expect("scan").len(), 1);
     let help = command().render_help().to_string();
     for flag in [
         "--frontend",
@@ -415,9 +528,13 @@ impl Pki {
         }
     }
 
-    /// A certificate for `localhost` naming `role`, good for serving and for calling.
+    /// A certificate for `localhost` and `127.0.0.1` (the address a node registers when it
+    /// is bound there) naming `role`, good for serving and for calling.
     fn cert(&self, role: &str) -> (String, String) {
         let mut params = CertificateParams::new(vec!["localhost".to_owned()]).expect("params");
+        params
+            .subject_alt_names
+            .push(SanType::IpAddress([127, 0, 0, 1].into()));
         params.subject_alt_names.push(SanType::URI(
             format!("{ROLE_URI_PREFIX}{role}").try_into().expect("IA5"),
         ));
@@ -493,6 +610,83 @@ async fn over_mutual_tls_only_the_storage_role_registers() {
     assert_eq!(denied.code(), Code::PermissionDenied);
 }
 
+/// Catches: a registration admitted for an address the node's certificate does not
+/// name. Over mutual TLS a frontend takes a node's word for where it is dialled only if
+/// the certificate it presented names that host: with a certificate for `localhost` and
+/// `127.0.0.1`, an instance id or an address on another host is PERMISSION_DENIED (the
+/// message says which and what the certificate names), and the node's own addresses
+/// (bound IP, the name, either with a port) register, as a real node's do in the other
+/// tests of this file.
+///
+/// Mutant seen red: the address left unchecked (a registration for `192.0.2.9` with the
+/// instance id of `localhost`).
+#[tokio::test]
+async fn over_mutual_tls_a_node_registers_only_where_its_certificate_names_it() {
+    let pki = Pki::new();
+    let (frontend_cert, frontend_key) = pki.cert("frontend");
+    let worker_tls = WorkerTls {
+        server: TlsSource::fixed(
+            "worker",
+            frontend_cert.as_bytes(),
+            frontend_key.as_bytes(),
+            Some(pki.ca.pem().as_bytes()),
+        )
+        .expect("the worker listener's TLS"),
+        deny_list: None,
+    };
+    let f = frontend(Some(worker_tls));
+    let (cert, key) = pki.cert("storage");
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(pki.ca.pem()))
+        .identity(Identity::from_pem(cert, key));
+    let channel = Endpoint::from_shared(format!("https://localhost:{}", f.worker.port()))
+        .expect("endpoint")
+        .tls_config(tls)
+        .expect("TLS")
+        .connect_lazy();
+    let join = |instance: &str, addr: &str| {
+        let who = NodeIdentity {
+            instance_id: instance.to_owned(),
+            addr: addr.to_owned(),
+            zone: String::new(),
+            weight: 1,
+        };
+        Joiner::new(channel.clone(), who, 5 * MS)
+    };
+    for (instance, addr, offending) in [
+        ("192.0.2.9:1", "127.0.0.1:1", "192.0.2.9:1"),
+        ("127.0.0.1:1", "192.0.2.9:1", "192.0.2.9:1"),
+    ] {
+        let denied = join(instance, addr)
+            .register()
+            .await
+            .expect_err("another host");
+        assert_eq!(denied.code(), Code::PermissionDenied, "{instance} {addr}");
+        assert!(denied.message().contains(offending), "{}", denied.message());
+        assert!(
+            denied.message().contains("127.0.0.1"),
+            "{}",
+            denied.message()
+        );
+    }
+    assert!(
+        f.members.current_map().expect("read").is_none(),
+        "nothing was written"
+    );
+    for (want, (instance, addr)) in [
+        ("127.0.0.1:4000", "127.0.0.1:4000"),
+        ("localhost:4000", "localhost:4001"),
+        ("localhost", "127.0.0.1"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let joined = join(instance, addr).register().await.expect("named");
+        let id = u64::try_from(want).expect("small") + 1;
+        assert_eq!(joined.member_id, id, "{instance} {addr}");
+    }
+}
+
 /// Catches: a retry that does not back off (a down frontend would be hit at the base
 /// rate), one that grows without bound, and one that overflows after many failures: the
 /// wait doubles from the base to 30 s and stays there, however many failures.
@@ -513,8 +707,8 @@ fn the_wait_after_failures_doubles_to_a_cap() {
 /// (`start_frontend`, SQLite state store, `--member-ttl-secs` and `--member-dwell-secs`)
 /// and a real node register; a second registrant re-registers until the map the
 /// frontend answers with (published by the refresh that follows a registration) holds the
-/// node at its bound address, `Active` (the first member of a fresh cluster is promoted on
-/// arrival). The wait is bounded only to fail a hang.
+/// node at its bound address, `CatchingUp` or `Active` (a node that registered rebuilds its
+/// index first). The wait is bounded only to fail a hang.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
     let d = dir("frontend-mode");
@@ -575,14 +769,150 @@ async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
         }
     })
     .await;
-    assert_eq!(found.state, pb::MemberState::Active as i32);
+    assert!(
+        [
+            pb::MemberState::CatchingUp as i32,
+            pb::MemberState::Active as i32
+        ]
+        .contains(&found.state),
+        "{}",
+        found.state
+    );
     node_serving.abort();
     drop(stop);
     serving.await.expect("joins").expect("stops");
 }
 
-/// A node started with `--frontend` that the frontend cannot yet admit (its store fails),
-/// listening, and a client of its storage service.
+fn node_x() -> NodeIdentity {
+    NodeIdentity {
+        instance_id: "node-x".to_owned(),
+        addr: "192.0.2.5:8982".to_owned(),
+        zone: String::new(),
+        weight: 1,
+    }
+}
+
+fn joiner_of(f: &Frontend) -> Joiner {
+    let channel = Endpoint::from_shared(format!("http://{}", f.worker))
+        .expect("endpoint")
+        .connect_lazy();
+    Joiner::new(channel, node_x(), 5 * MS)
+}
+
+fn owed(i: u8) -> RepairRecord {
+    RepairRecord {
+        digest: Digest::new(DigestFunction::Sha256, [i; 32], 10),
+        replica: MemberId(2),
+        generation: 1,
+    }
+}
+
+fn open_journal(fs: &FaultFs) -> Arc<Repairs> {
+    Arc::new(Repairs::open(fs.clone(), Options::default(), Arc::new(NoLedger)).expect("journal"))
+}
+
+/// The frontend's number once member 1 has been promoted to Active and has reported:
+/// polled until `want` (the node beats on its own schedule).
+async fn until_number(f: &Frontend, want: Option<u64>) {
+    until("the frontend's number", || {
+        let health = f.members.storage_health().expect("health");
+        (health.under_replicated_blobs == want && health.silent.is_empty()).then_some(())
+    })
+    .await;
+}
+
+/// Catches: a node that does not tell the frontend what its journal holds, or tells it
+/// something else. Through the real joiner and the real membership service: 2 copies owed
+/// is 2 at the frontend, a third is 3 at the next beat, and a node that restarts (its
+/// journal reopened, the process registering again) reports the debts it had, not 0 for
+/// "none since I started". Mutants: the count of debts since the journal was opened; the
+/// debts never sent; sent as unknown.
+#[tokio::test]
+async fn a_node_with_a_journal_reports_the_copies_it_owes_across_a_restart() {
+    let f = frontend(None);
+    let fs = FaultFs::new();
+    let repairs = open_journal(&fs);
+    for i in 1..=2 {
+        let _pending = repairs.owe(owed(i)).await.expect("owed");
+    }
+    let first = tokio::spawn(joiner_of(&f).with_repairs(Arc::clone(&repairs)).run());
+    until("the node to register", || row(&f, 1)).await;
+    f.members
+        .set_state(MemberId(1), MemberState::Active)
+        .expect("promoted");
+    until_number(&f, Some(2)).await;
+
+    let _pending = repairs.owe(owed(3)).await.expect("owed");
+    until_number(&f, Some(3)).await;
+
+    first.abort();
+    drop(repairs);
+    let reopened = open_journal(&fs.crash(0));
+    let second = tokio::spawn(joiner_of(&f).with_repairs(reopened).run());
+    // Boot 2 is the registration after the restart (its index is whole, so it is Active
+    // at once). A beat of boot 2 is accepted only after it, and says nothing, so the
+    // stale report of boot 1 is gone before the number is read.
+    until("the node to register again", || {
+        f.members
+            .heartbeat(
+                MemberId(1),
+                2,
+                kbf_server::members::Progress::CaughtUp,
+                Debts::Unknown,
+                None,
+            )
+            .ok()
+    })
+    .await;
+    until_number(&f, Some(3)).await;
+    second.abort();
+}
+
+/// Catches: a node with no journal saying it owes nothing. Without one it cannot say, and
+/// the frontend must read "unknown", not zero. Mutant: the joiner reports `Known(0)` when
+/// it has no journal.
+#[tokio::test]
+async fn a_node_without_a_journal_says_it_cannot_say() {
+    let f = frontend(None);
+    let joiner = tokio::spawn(joiner_of(&f).run());
+    until("the node to register", || row(&f, 1)).await;
+    f.members
+        .set_state(MemberId(1), MemberState::Active)
+        .expect("promoted");
+    until("the node to say it cannot say", || {
+        let health = f.members.storage_health().expect("health");
+        (health.unreported == [MemberId(1)]).then_some(health)
+    })
+    .await;
+    assert_eq!(
+        f.members
+            .storage_health()
+            .expect("health")
+            .under_replicated_blobs,
+        None
+    );
+    joiner.abort();
+}
+
+/// A node started with `--frontend` that the frontend admits but sends no map it can read
+/// (`map` is what the frontend sends, which a test replaces), listening, and a client of
+/// its storage service.
+async fn unmapped_node(
+    map: &Arc<Mutex<pb::Map>>,
+    name: &str,
+) -> (kbf_server::storage_node::StorageHandle, RemoteStorage) {
+    let url = format!("--frontend=http://{}", serve_membership(map));
+    let node = start_storage(&flags(&dir(name), &[url]).expect("flags"), never)
+        .await
+        .expect("starts");
+    let channel = Endpoint::from_shared(format!("http://{}", node.addr))
+        .expect("endpoint")
+        .connect_lazy();
+    (node, RemoteStorage::new(channel, 0))
+}
+
+/// A node started with `--frontend` at `f`, listening, and a client of its storage
+/// service.
 async fn waiting_node(
     f: &Frontend,
     name: &str,
@@ -597,21 +927,34 @@ async fn waiting_node(
     (node, RemoteStorage::new(channel, 0))
 }
 
-/// Catches: a node in a multi-member farm that serves before it knows the farm. While the
-/// frontend cannot admit it (its store fails, so there is no map) every kind of call is
-/// refused UNAVAILABLE "has not been given a map", not answered as an empty cache (a
-/// FindMissing that says every blob is missing, a write taken that the map places
-/// elsewhere); once the registration lands, and the caller routes by the map the node
-/// holds, the same calls are served. The refusal is the storage service's own check, the
-/// only one. Mutant: a service given no map source (every call is served at once).
+/// A map of one active member, which a node can read.
+fn readable_map() -> pb::Map {
+    let member = kbf_map::Member {
+        id: MemberId(1),
+        addr: "192.0.2.5:1".to_owned(),
+        zone: String::new(),
+        weight: 1,
+        state: MemberState::Active,
+        boot: 0,
+    };
+    let map = kbf_map::Map::new(4, vec![member], kbf_map::Rule::Rendezvous, 1, 1, Vec::new())
+        .expect("a map");
+    pb::Map::from(&map)
+}
+
+/// Catches: a node in a multi-member farm that serves before it knows the farm. The
+/// frontend admits the node (it registers, and opens its cache) but sends a map the node
+/// cannot read, so it has none: every kind of call is refused UNAVAILABLE "has not been
+/// given a map", not answered as an empty cache (a FindMissing that says every blob is
+/// missing, a write taken that the map places elsewhere); once a heartbeat brings a map,
+/// and the caller routes by the map the node holds, the same calls are served. The refusal
+/// is the storage service's own check, the only one. Mutant: a service given no map source
+/// (every call is served at once).
 #[tokio::test]
 async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
-    let f = frontend(None);
-    f.store
-        .fail_gets
-        .store(1_000_000, std::sync::atomic::Ordering::SeqCst);
-    let (node, client) = waiting_node(&f, "gate").await;
-    let maps = node.maps();
+    let sent = Arc::new(Mutex::new(pb::Map::default()));
+    let (node, client) = unmapped_node(&sent, "gate").await;
+    let (maps, catch_up) = (node.maps(), node.catch_up());
     let mut segments = SegmentsClient::new(
         Endpoint::from_shared(format!("http://{}", node.addr))
             .expect("endpoint")
@@ -656,14 +999,14 @@ async fn a_node_with_a_frontend_serves_nothing_until_it_holds_a_map() {
     assert_eq!(refused_status(begun.expect_err("refused")), want);
     assert_eq!(maps.generation(), 0, "the node has no map");
 
-    f.store
-        .fail_gets
-        .store(0, std::sync::atomic::Ordering::SeqCst);
+    *sent.lock().expect("lock") = readable_map();
     until("the node to hold a map", || {
         (maps.generation() > 0).then_some(())
     })
     .await;
     client.set_map_generation(maps.generation());
+    // A new node over an empty store rebuilds its index first, and says so until done.
+    catch_up.finished().await;
     assert_eq!(
         client.find_missing(&[digest]).await.expect("served"),
         [digest]
@@ -700,7 +1043,18 @@ async fn a_heartbeat_brings_a_node_the_map_it_missed() {
         maps.current().filter(|m| m.members().len() == 1)
     })
     .await;
-    assert_eq!(maps.generation(), 1);
+    // A node that rebuilt its index is promoted by its first beat after: a new map. Wait
+    // until the node holds that one, so the generations below are the second member's.
+    until("the node to be promoted", || {
+        (state(&f, 1) == Some(MemberState::Active)).then_some(())
+    })
+    .await;
+    let settled = until("the node to hold the promoted map", || {
+        let current = f.members.current_map().expect("read")?.generation();
+        maps.current().filter(|m| m.generation() == current)
+    })
+    .await
+    .generation();
 
     f.members
         .register(&kbf_server::members::Registrant {
@@ -716,11 +1070,18 @@ async fn a_heartbeat_brings_a_node_the_map_it_missed() {
         maps.current().filter(|m| m.members().len() == 2)
     })
     .await;
-    assert_eq!(learned.generation(), 2);
+    assert_eq!(learned.generation(), settled + 1);
 }
 
-/// A membership service that answers every call with the map it holds (a garbled one, or a valid one).
-struct Garbled(pb::Map);
+/// A membership service that answers every call with the map it holds (a garbled one, or a
+/// valid one), which a test replaces.
+struct Garbled(Arc<Mutex<pb::Map>>);
+
+impl Garbled {
+    fn map(&self) -> pb::Map {
+        self.0.lock().expect("lock").clone()
+    }
+}
 
 #[tonic::async_trait]
 impl kbf_proto::kbf::map::v1::membership_server::Membership for Garbled {
@@ -732,7 +1093,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for Garbled {
             member_id: 1,
             boot: 1,
             heartbeat_interval_ms: 1,
-            map: Some(self.0.clone()),
+            map: Some(self.map()),
         }))
     }
 
@@ -742,7 +1103,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for Garbled {
     ) -> Result<tonic::Response<pb::HeartbeatResponse>, tonic::Status> {
         Ok(tonic::Response::new(pb::HeartbeatResponse {
             map_generation: 9,
-            map: Some(self.0.clone()),
+            map: Some(self.map()),
         }))
     }
 }
@@ -768,6 +1129,7 @@ async fn a_map_that_is_not_newer_changes_nothing() {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = kbf_map::Map::new(4, vec![member], kbf_map::Rule::Rendezvous, 1, 1, Vec::new())
         .expect("a map");
@@ -779,6 +1141,24 @@ async fn a_map_that_is_not_newer_changes_nothing() {
     );
 }
 
+/// A membership service on a port of its own that admits every node as member 1 at boot 1
+/// and answers with whatever `map` holds, at each call.
+fn serve_membership(map: &Arc<Mutex<pb::Map>>) -> SocketAddr {
+    let incoming =
+        tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = incoming.local_addr().expect("address");
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(
+                kbf_proto::kbf::map::v1::membership_server::MembershipServer::new(Garbled(
+                    Arc::clone(map),
+                )),
+            )
+            .serve_with_incoming(incoming),
+    );
+    addr
+}
+
 /// A node that registers and beats once with a frontend that answers with `map` both
 /// times; the maps it holds after.
 async fn joined_by(map: pb::Map) -> Arc<kbf_mapsync::MapHolder> {
@@ -787,16 +1167,7 @@ async fn joined_by(map: pb::Map) -> Arc<kbf_mapsync::MapHolder> {
 
 /// The node of [`joined_by`]: its registration was answered with member id 1.
 async fn joined_node(map: pb::Map) -> Arc<NodeMap> {
-    let incoming =
-        tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
-    let addr = incoming.local_addr().expect("address");
-    tokio::spawn(
-        tonic::transport::Server::builder()
-            .add_service(
-                kbf_proto::kbf::map::v1::membership_server::MembershipServer::new(Garbled(map)),
-            )
-            .serve_with_incoming(incoming),
-    );
+    let addr = serve_membership(&Arc::new(Mutex::new(map)));
     let channel = Endpoint::from_shared(format!("http://{addr}"))
         .expect("endpoint")
         .connect_lazy();
@@ -834,6 +1205,7 @@ async fn the_node_map_is_the_holders_and_knows_the_member_the_registration_named
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = |generation| {
         kbf_map::Map::new(
@@ -928,10 +1300,11 @@ async fn a_node_over_mutual_tls_keeps_a_repair_journal_and_a_worker_settles_it()
 /// Catches a `kbf storage-and-daemon` whose in-process view is not the node's own service:
 /// one built over a separate storage with no map and no chain would answer every write at
 /// once, as one copy nobody owes. The real half (`storage_half::start`, mutual TLS, a
-/// frontend) is called through `in_process()`. While the frontend cannot admit it the write
-/// is refused UNAVAILABLE "has not been given a map"; once it holds a map in which it and a
-/// partner that is not listening both own the blob, the same call is answered, the blob is
-/// in this node's store, and the repair journal owes it to the partner. Mutant: `bind_node`
+/// frontend) is called through `in_process()`. Once it holds a map in which it and a
+/// partner that is not listening both own the blob, the call is answered, the blob is in
+/// this node's store, and the repair journal owes it to the partner. (The half registers
+/// before it opens its cache, so there is no start that lacks a map to refuse from; that
+/// refusal is `a_node_with_a_frontend_serves_nothing_until_it_holds_a_map`'s.) Mutant: `bind_node`
 /// handing `in_process` a service made over another, unmapped, chainless storage.
 #[tokio::test]
 async fn a_write_through_the_halfs_in_process_view_is_judged_by_the_map_and_owes_the_partner() {
@@ -948,9 +1321,6 @@ async fn a_write_through_the_halfs_in_process_view_is_judged_by_the_map_and_owes
         deny_list: None,
     };
     let f = frontend(Some(worker_tls));
-    f.store
-        .fail_gets
-        .store(1_000_000, std::sync::atomic::Ordering::SeqCst);
     let d = dir("half-in-process");
     let write = |name: &str, text: String| {
         let path = d.join(name);
@@ -976,21 +1346,6 @@ async fn a_write_through_the_halfs_in_process_view_is_judged_by_the_map_and_owes
     let here = half.addr;
     let _serving = tokio::spawn(half.serve());
 
-    let refused = in_process
-        .at(0)
-        .put(bytes::Bytes::from_static(b"before any map"))
-        .await
-        .expect_err("no map yet");
-    let refused = tonic::Status::from(refused);
-    assert_eq!(refused.code(), Code::Unavailable);
-    assert!(
-        refused.message().contains("has not been given a map"),
-        "{refused}"
-    );
-
-    f.store
-        .fail_gets
-        .store(0, std::sync::atomic::Ordering::SeqCst);
     until("the node to register", || row(&f, 1)).await;
     until("the node to hold a map", || {
         (maps.generation() > 0).then_some(())
@@ -1008,6 +1363,7 @@ async fn a_write_through_the_halfs_in_process_view_is_judged_by_the_map_and_owes
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = kbf_map::Map::new(
         1_000,
@@ -1096,6 +1452,7 @@ async fn the_frontends_unowned_copy_is_stored_through_the_real_listener() {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = kbf_map::Map::new(
         1_000,
@@ -1197,6 +1554,7 @@ fn a_map(generation: u64) -> pb::Map {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = kbf_map::Map::new(
         generation,
@@ -1376,4 +1734,265 @@ async fn a_failed_heartbeat_is_retried_without_registering_again() {
         1,
         "registered once"
     );
+}
+
+/// Catches a deny list that stops short of the storage nodes: the operator's entry must
+/// end up refusing the caller at a real storage node, through the whole path (the entry in
+/// the state store, the frontend's refresh, the new generation, the node's heartbeat, the
+/// node's service). A storage node over mutual TLS registers with a frontend. Two frontend
+/// certificates call it, both admitted. The operator denies one by the hash of its public
+/// key and refreshes the map; once the node's heartbeat brings it the new generation that
+/// certificate is refused PERMISSION_DENIED (`denied: spki-sha256 ...`) on the same call,
+/// the other is still admitted; allowing the entry and refreshing admits it again.
+///
+/// Mutants seen red: `plan` building the map without the deny list; the storage handlers
+/// judging the role alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_denied_certificate_is_refused_by_a_real_storage_node_when_the_generation_turns() {
+    use sha2::{Digest as _, Sha256};
+    let pki = Pki::new();
+    let (frontend_cert, frontend_key) = pki.cert("frontend");
+    let worker_tls = WorkerTls {
+        server: TlsSource::fixed(
+            "worker",
+            frontend_cert.as_bytes(),
+            frontend_key.as_bytes(),
+            Some(pki.ca.pem().as_bytes()),
+        )
+        .expect("the worker listener's TLS"),
+        deny_list: None,
+    };
+    let f = frontend(Some(worker_tls));
+    let d = dir("denied-caller");
+    let write = |name: &str, text: String| {
+        let path = d.join(name);
+        std::fs::write(&path, text).expect("write");
+        path.display().to_string()
+    };
+    let (cert, key) = pki.cert("storage");
+    let more = [
+        format!("--frontend=https://localhost:{}", f.worker.port()),
+        format!("--storage-tls-cert={}", write("node.pem", cert)),
+        format!("--storage-tls-key={}", write("node.key", key)),
+        format!("--storage-client-ca={}", write("ca.pem", pki.ca.pem())),
+    ];
+    let node = start_storage(&flags(&d, &more).expect("flags"), never)
+        .await
+        .expect("starts");
+    let (maps, here) = (node.maps(), node.addr);
+    let _serving = tokio::spawn(node.serve());
+    until("the node to hold a map", || {
+        (maps.generation() > 0).then_some(())
+    })
+    .await;
+
+    let channel_of = |(cert, key): (String, String)| {
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(pki.ca.pem()))
+            .identity(Identity::from_pem(cert, key));
+        Endpoint::from_shared(format!("https://localhost:{}", here.port()))
+            .expect("endpoint")
+            .tls_config(tls)
+            .expect("TLS")
+            .connect_lazy()
+    };
+    let listed = pki.cert("frontend");
+    let spki = Sha256::digest(rcgen::PublicKeyData::subject_public_key_info(
+        &KeyPair::from_pem(&listed.1).expect("its key"),
+    ))
+    .iter()
+    .map(|b| format!("{b:02x}"))
+    .collect::<String>();
+    let (listed, other) = (channel_of(listed), channel_of(pki.cert("frontend")));
+    let digest = kbf_segments::sha256(b"asked of a node that has nothing");
+    // The node's map turns while the test runs (its own promotion out of catching up is a
+    // new generation), so a call made with the generation read just before it can be
+    // answered STALE_MAP. Each ask then reads the generation again and asks again, as a
+    // client that refetches would, a bounded number of times; any other answer is kept.
+    let maps = &maps;
+    let ask = |channel: &tonic::transport::Channel| {
+        let channel = channel.clone();
+        async move {
+            let mut tries = 0;
+            loop {
+                let remote = RemoteStorage::new(channel.clone(), maps.generation());
+                match remote.find_missing(&[digest]).await {
+                    Err(kbf_storage::StorageError::StaleMap { .. }) if tries < 200 => {
+                        tries += 1;
+                        tokio::time::sleep(5 * MS).await;
+                    }
+                    answer => break answer,
+                }
+            }
+        }
+    };
+    // A node that has just started answers "catching up" while it rebuilds its index
+    // (slow under coverage); only that answer is waited out, until a deadline, then the
+    // test fails with the last answer. Any other refusal fails at once.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match ask(&listed).await {
+            Ok(_) => break,
+            Err(kbf_storage::StorageError::Unavailable(why)) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the node still answers unavailable after 30s: {why:?}"
+                );
+                tokio::time::sleep(5 * MS).await;
+            }
+            Err(other) => panic!("not admitted before the entry: {other:?}"),
+        }
+    }
+    ask(&other).await.expect("admitted");
+
+    let entry = kbf_map::DenyEntry::SpkiSha256(spki);
+    f.members.deny(&entry, "the test").expect("deny");
+    f.members.refresh().expect("refresh");
+    let refused = until_async("the node to refuse the listed certificate", || async {
+        match ask(&listed).await {
+            Err(kbf_storage::StorageError::Invalid(why)) => Some(why),
+            _ => None,
+        }
+    })
+    .await;
+    assert_eq!(refused, format!("denied: {entry}"));
+    ask(&other).await.expect("another certificate is admitted");
+
+    assert!(f.members.allow(&entry).expect("allow"));
+    f.members.refresh().expect("refresh");
+    until_async("the node to admit the certificate again", || async {
+        ask(&listed).await.ok()
+    })
+    .await;
+}
+
+/// Starts `kbf storage` (`half` false) or the storage half of `kbf storage-and-daemon`
+/// (`half` true) over `dir` with `--frontend` at `f`, writes `text` through its listener
+/// and stops it. A previous start's background tasks may still hold the directory's locks
+/// as it stops; the start is retried while they do.
+async fn write_as_registered(
+    f: &Frontend,
+    dir: &Path,
+    half: bool,
+    text: &str,
+) -> kbf_types::Digest {
+    let url = format!("--frontend=http://{}", f.worker);
+    let flags = flags(dir, &[url]).expect("flags");
+    let (addr, maps, serving) = 'start: {
+        for _ in 0..500 {
+            let started = if half {
+                kbf_server::storage_half::start(&flags, never)
+                    .await
+                    .map(|n| {
+                        (
+                            n.addr,
+                            n.maps(),
+                            tokio::spawn(async move { n.serve().await }),
+                        )
+                    })
+            } else {
+                start_storage(&flags, never).await.map(|n| {
+                    (
+                        n.addr,
+                        n.maps(),
+                        tokio::spawn(async move { n.serve().await }),
+                    )
+                })
+            };
+            match started {
+                Ok(node) => break 'start node,
+                Err(e) if e.to_string().contains("Locked") => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("starts: {e}"),
+            }
+        }
+        panic!("the previous start never released its directory");
+    };
+    let channel = Endpoint::from_shared(format!("http://{addr}"))
+        .expect("endpoint")
+        .connect_lazy();
+    // The registration brought the map, so the node is ready to be written to as the map
+    // says.
+    let client = RemoteStorage::new(channel, 0);
+    client.set_map_generation(maps.generation());
+    let digest = client
+        .put(bytes::Bytes::from(text.to_owned()))
+        .await
+        .expect("a write is taken");
+    serving.abort();
+    let _ = serving.await;
+    digest
+}
+
+/// Who the node's metadata log, reopened from `dir` after the node stopped, says wrote
+/// the object that holds `digest`: `Some((member, boot))` for a node writer, `None` for
+/// an epoch writer.
+async fn written_by(dir: &Path, digest: &kbf_types::Digest) -> Option<(u64, u64)> {
+    use kbf_front::MetaLog as _;
+    let meta = 'open: {
+        for _ in 0..500 {
+            match kbf_server::RaftMetaLog::open_dir(
+                &dir.join("meta"),
+                kbf_meta::Retention::default(),
+                "kbf/",
+            )
+            .await
+            {
+                Ok(meta) => break 'open meta,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        panic!("the node never released its metadata directory");
+    };
+    let digest = *digest;
+    let answer = meta
+        .query(move |state| state.blob(&digest))
+        .await
+        .expect("query");
+    let kbf_meta::BlobAnswer::Present { location, .. } = answer else {
+        panic!("the log does not hold the blob: {answer:?}");
+    };
+    match location.object.writer() {
+        kbf_meta::Writer::Node(w) => Some((w.member().get(), w.boot().get())),
+        kbf_meta::Writer::Epoch(_) | kbf_meta::Writer::Legacy(_) => None,
+    }
+}
+
+/// Catches: a registered node that names its objects in an epoch of its own log (mutant:
+/// `Cache::open_under` taken under `--frontend` in `assemble`, or `Cache::open` in the
+/// storage half), which a wiped node would then name again. A node of each kind
+/// registers with a frontend and writes: its metadata log says the object was written by
+/// the node writer of that registration (member and boot), not an epoch. The log can only
+/// say so if it committed `SetWriter` for that member and boot.
+#[tokio::test]
+async fn a_registered_node_writes_objects_named_by_member_and_boot() {
+    for (half, name) in [(false, "keys-node"), (true, "keys-half")] {
+        let (f, dir) = (frontend(None), dir(name));
+        let digest = write_as_registered(&f, &dir, half, "a registered node's blob").await;
+        let by = written_by(&dir, &digest).await;
+        assert!(by.is_some_and(|(m, b)| m > 0 && b > 0), "{name}: {by:?}");
+    }
+}
+
+/// Catches: a storage node that loses its metadata directory and names new objects as
+/// the old ones (the storage half of `kbf storage-and-daemon` opened its cache before it
+/// registered, as an epoch writer of its own log). Each kind of node writes, loses its
+/// metadata directory (the cold store stays), registers again at the same frontend and
+/// writes: both blobs are node-named, by pairs of `(member, boot)` that differ.
+#[tokio::test]
+async fn a_wiped_node_of_either_kind_never_reuses_its_keys() {
+    for (half, name) in [(false, "wipe-node"), (true, "wipe-half")] {
+        let (f, dir) = (frontend(None), dir(name));
+        let first = write_as_registered(&f, &dir, half, "before the wipe").await;
+        let before = written_by(&dir, &first).await;
+        std::fs::remove_dir_all(dir.join("meta")).expect("wipe");
+        let second = write_as_registered(&f, &dir, half, "after the wipe").await;
+        let after = written_by(&dir, &second).await;
+        assert!(
+            before.is_some() && after.is_some(),
+            "{name}: {before:?} {after:?}"
+        );
+        assert_ne!(before, after, "{name}: the wiped node is the same writer");
+    }
 }

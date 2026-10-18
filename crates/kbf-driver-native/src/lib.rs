@@ -8,8 +8,8 @@
 //! - a fresh lease directory under the configured scratch root, the input root written
 //!   into it, the working directory and each output's parent made (REAPI);
 //! - its own home, temporary and cache directories inside the lease directory, named by
-//!   `HOME`, `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH` (`home`); so a
-//!   tool's `~` and module caches go with the lease;
+//!   `HOME`, `CFFIXED_USER_HOME`, `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`
+//!   (`home`); so a tool's `~` and module caches go with the lease;
 //! - its `arguments` run with those variables and the Command's environment (which wins
 //!   where both name a variable) and nothing else, stdin from `/dev/null`, stdout and
 //!   stderr captured to files, as the leader of a new process group;
@@ -24,6 +24,9 @@
 //!   action's `network` platform property is `off` or `none` (absent means on);
 //!   elsewhere nothing is enforced,
 //!   and the node reports which in its `network_isolation` capability;
+//! - on macOS, for an action that failed under the sandbox, the sandbox's refusals of its
+//!   processes, read from the unified log and added to the end of its stderr and to the
+//!   node's log, capped ([`denials`]): otherwise a refused write is only `EPERM`;
 //! - the Xcode its `xcode` platform property names, as `DEVELOPER_DIR` ([`xcode`]: the
 //!   driver advertises every ready Xcode build, reports every installed Xcode with why
 //!   one is not ready and how to fix it, and asks again every few minutes,
@@ -129,8 +132,10 @@
 
 mod cas;
 mod config;
+pub mod denials;
 pub mod home;
 mod keeper;
+pub mod mounts;
 pub mod network;
 pub mod procs;
 mod program;

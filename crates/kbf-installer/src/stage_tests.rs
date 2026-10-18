@@ -326,14 +326,12 @@ fn an_inbox_entry_with_a_link_fifo_hard_link_or_stranger_is_refused() {
         }),
         ("fifo", "inbox-not-regular", |rig| {
             fs::remove_file(rig.entry.join("kbf.tar.gz")).expect("remove");
-            rustix::fs::mknodat(
-                rustix::fs::CWD,
-                rig.entry.join("kbf.tar.gz"),
-                rustix::fs::FileType::Fifo,
-                rustix::fs::Mode::from_raw_mode(0o600),
-                0,
-            )
-            .expect("a fifo");
+            // `mkfifo(1)`: rustix has no `mknodat` on macOS.
+            let made = std::process::Command::new("mkfifo")
+                .arg(rig.entry.join("kbf.tar.gz"))
+                .status()
+                .expect("run mkfifo");
+            assert!(made.success(), "a fifo");
         }),
         ("directory", "inbox-not-regular", |rig| {
             fs::remove_file(rig.entry.join("kbf.tar.gz")).expect("remove");
