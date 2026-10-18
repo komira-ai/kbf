@@ -226,7 +226,7 @@ fn every_clause_of_the_url_check_can_refuse() {
             "https://[2001:db8::1]:8443/r",
         ),
         ("https://[::1]", "https://[::1]"),
-        ("https://10.0.0.7:8443", "https://10.0.0.7:8443"),
+        ("https://192.0.2.7:8443", "https://192.0.2.7:8443"),
         (
             "https://m.example/a-b_c.d~e/f",
             "https://m.example/a-b_c.d~e/f",
