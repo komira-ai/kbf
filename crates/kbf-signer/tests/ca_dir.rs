@@ -91,8 +91,16 @@ fn a_half_or_foreign_directory_is_refused_and_nothing_is_written() {
 #[test]
 fn two_files_that_are_not_a_ca_and_one_foreign_file_are_refused_untouched() {
     for (name, files, listed) in [
-        ("ensure_nokey", ["ca.pem", "notes.txt"], "holds ca.pem, notes.txt:"),
-        ("ensure_nocert", ["ca.key", "notes.txt"], "holds ca.key, notes.txt:"),
+        (
+            "ensure_nokey",
+            ["ca.pem", "notes.txt"],
+            "holds ca.pem, notes.txt:",
+        ),
+        (
+            "ensure_nocert",
+            ["ca.key", "notes.txt"],
+            "holds ca.key, notes.txt:",
+        ),
     ] {
         let dir = scratch(name).join("ca");
         std::fs::create_dir_all(&dir).expect("mkdir");
