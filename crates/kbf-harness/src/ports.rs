@@ -9,8 +9,9 @@
 //! every port of the farm from it. The lock is held as long as the [`Claim`] lives, and the
 //! kernel drops it when the holder dies (a harness killed with SIGKILL leaves nothing
 //! stale). Two farms of one process, of two processes, or of two users sharing a temporary
-//! directory never hold one block; a block with any port in use now (by a program outside
-//! the harness) is skipped.
+//! directory never hold one block (the directory and its files are open to every user, whatever
+//! the umask; a file a user cannot open is a block that user skips, never one it shares); a block
+//! with any port in use now (by a program outside the harness) is skipped.
 //!
 //! What it does not cover: a program that binds a port inside a block that no farm holds,
 //! between the probe and the farm's process binding it. The blocks are below the kernel's
@@ -18,7 +19,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::net::TcpListener;
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::PathBuf;
 
 use rustix::fs::{FlockOperation, flock};
@@ -84,6 +85,15 @@ fn lock_dir() -> PathBuf {
     std::env::temp_dir().join("kbf-harness-ports")
 }
 
+/// Makes the lock directory, open to every user like the temporary directory it is in (sticky:
+/// one user cannot remove another's lock). The umask does not apply, and a directory
+/// another user made keeps its mode.
+fn make_lock_dir() {
+    let dir = lock_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777));
+}
+
 impl Claim {
     /// A block no other farm holds, searching from a place of this process's own (its id)
     /// so that processes starting together do not all look at the same blocks first.
@@ -105,7 +115,7 @@ impl Claim {
             .map_or(EPHEMERAL, |text| ephemeral_floor(&text));
         let count = blocks(floor);
         assert!(count > 0, "no room for a block of ports below {floor}");
-        let _ = std::fs::create_dir_all(lock_dir());
+        make_lock_dir();
         search(count, start, Self::try_block).unwrap_or_else(|| exhausted(count))
     }
 
@@ -118,6 +128,8 @@ impl Claim {
             .mode(0o666)
             .open(lock_dir().join(format!("block-{index}.lock")))
             .ok()?;
+        // `mode` is cut by the umask; another user must be able to open the file to lock it.
+        let _ = lock.set_permissions(std::fs::Permissions::from_mode(0o666));
         flock(&lock, FlockOperation::NonBlockingLockExclusive).ok()?;
         let base = FIRST + u16::try_from(index).ok()? * BLOCK;
         // Any listener on a port of the block, on any loopback address, makes the bind on

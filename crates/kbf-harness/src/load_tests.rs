@@ -186,7 +186,8 @@ fn a_build_that_cannot_be_started_is_a_failure_with_a_reason() {
     let mut c = cfg();
     c.logs = dir.clone();
     c.project = dir;
-    let o = build(&c, 0, 0, Kind::Compile);
+    let (o, started) = build(&c, 0, 0, Kind::Compile);
+    assert!(!started, "Buck2 was not started");
     assert!(!o.ok());
     assert_eq!(o.exit, None);
     assert!(
@@ -330,4 +331,43 @@ fn a_load_that_is_stopped_starts_no_more_builds() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(load.join().len() <= 1);
+}
+
+#[test]
+fn a_loop_that_cannot_start_buck2_ends_with_the_one_failed_build() {
+    // Catches: a loop whose builds cannot be started (the program is not there) spinning for
+    // the whole load, which is 300 seconds in CI, pushing an outcome per turn: it filled a
+    // box's memory (tens of GB) in minutes. Each loop ends with the one failed build; one that
+    // went on would have thousands by the end of the load's three seconds. Mutant: the loop
+    // goes on after a build that was not started.
+    let mut c = cfg();
+    c.concurrency = 2;
+    c.duration = Duration::from_secs(3);
+    let dir = crate::scratch("load-unstartable");
+    c.logs = dir.clone();
+    c.project = dir;
+    let outcomes = Load::start(&c).join();
+    assert_eq!(outcomes.len(), 2, "one failed build per loop");
+    assert!(outcomes.iter().all(|o| !o.ok() && o.exit.is_none()));
+}
+
+#[test]
+fn a_loop_goes_on_after_a_build_that_ran() {
+    // Catches: the end of the loop for a build that was started (the check on the build
+    // turned the wrong way round): a load of ten minutes that ended after its first build.
+    // Waits (bounded) for the second build of loop 0 to have begun, which writes its console
+    // file, then stops the load.
+    let c = stand_in_load("load-goes-on", "ok", 1, 600);
+    let load = Load::start(&c);
+    let second = c.logs.join("buck2-0-1.log");
+    let until = Instant::now() + Duration::from_secs(60);
+    while !second.exists() {
+        assert!(
+            Instant::now() < until,
+            "the loop never began a second build"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    load.stop();
+    assert!(load.join().len() >= 2);
 }

@@ -190,6 +190,11 @@ impl Farm {
     ///
     /// Every other flag is the unit's.
     ///
+    /// Call it from a thread that lives as long as the farm (the main thread, a test's own): the
+    /// kernel kills a process when the thread that started it ends ([`crate::procs::Proc::start`]), so a
+    /// farm started on a worker thread that returns is a farm of killed processes. The same
+    /// goes for [`Farm::restart`].
+    ///
     /// # Errors
     /// A process that exits, or does not print its start line within [`HANG`].
     ///

@@ -358,6 +358,17 @@ fn the_sentinel_leads_a_session_of_its_own() {
     assert_eq!(numbers[1], numbers[3], "session leader: {text}");
 }
 
+/// A helper that is killed (and reaped) when the test ends, however it ends: a test that
+/// failed must not leave a harness running its load.
+struct Killed(std::process::Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn a_harness_killed_by_sigkill_leaves_no_buck2_daemon_running() {
     // Catches: a run killed with no chance to run a `Drop` (a runner cancelling the job)
@@ -369,9 +380,11 @@ fn a_harness_killed_by_sigkill_leaves_no_buck2_daemon_running() {
     // harness holds (the sentinel then cleans up at once, and the first check fails).
     let d = crate::scratch("reaped");
     let report = d.join("report");
-    let mut harness = helper_process("reaped", &report)
-        .spawn()
-        .expect("the helper");
+    let mut harness = Killed(
+        helper_process("reaped", &report)
+            .spawn()
+            .expect("the helper"),
+    );
     let project = until("the helper to start its load", || {
         let text = std::fs::read_to_string(&report).unwrap_or_default();
         text.lines()
@@ -383,8 +396,8 @@ fn a_harness_killed_by_sigkill_leaves_no_buck2_daemon_running() {
         !marker(0).exists() && !marker(1).exists(),
         "killed too soon"
     );
-    harness.kill().expect("kill the harness");
-    harness.wait().expect("reaped");
+    harness.0.kill().expect("kill the harness");
+    harness.0.wait().expect("reaped");
     until("both daemons to be killed", || {
         (marker(0).exists() && marker(1).exists()).then_some(())
     });

@@ -323,7 +323,14 @@ fn lane_loop(cfg: &LoadConfig, lane: usize, end: Instant, stop: &AtomicBool) -> 
     let mut n = 0;
     while Instant::now() < end && !stop.load(Ordering::Relaxed) {
         let kind = kind_for(lane, n);
-        outcomes.push(build(cfg, lane, n, kind));
+        let (outcome, started) = build(cfg, lane, n, kind);
+        outcomes.push(outcome);
+        // A build that cannot be started (no such program) cannot be started the next time
+        // either: a loop that went on would spin, keeping an outcome per turn in memory, for
+        // the whole load. The failed build is the loop's result.
+        if !started {
+            break;
+        }
         n += 1;
     }
     // This loop's daemon goes with it.
@@ -370,7 +377,8 @@ pub fn build_args(
     args
 }
 
-fn build(cfg: &LoadConfig, lane: usize, n: usize, kind: Kind) -> Outcome {
+/// One build, and whether Buck2 could be started for it.
+fn build(cfg: &LoadConfig, lane: usize, n: usize, kind: Kind) -> (Outcome, bool) {
     let event_log = cfg.logs.join(format!("buck2-{lane}-{n}.json-lines.gz"));
     let console = cfg.logs.join(format!("buck2-{lane}-{n}.log"));
     let started = Instant::now();
@@ -386,7 +394,7 @@ fn build(cfg: &LoadConfig, lane: usize, n: usize, kind: Kind) -> Outcome {
     let (exit, timed_out) = match spawned {
         Err(e) => {
             let why = format!("spawn {}: {e}", cfg.buck2.display());
-            return Outcome {
+            let outcome = Outcome {
                 kind,
                 lane,
                 n,
@@ -396,11 +404,12 @@ fn build(cfg: &LoadConfig, lane: usize, n: usize, kind: Kind) -> Outcome {
                 spawns: Err(why.clone()),
                 failed_actions: Err(why),
             };
+            return (outcome, false);
         }
         Ok(mut child) => wait_bounded(&mut child, cfg.build_timeout),
     };
     let text = std::fs::read_to_string(&console).unwrap_or_default();
-    Outcome {
+    let outcome = Outcome {
         kind,
         lane,
         n,
@@ -409,7 +418,8 @@ fn build(cfg: &LoadConfig, lane: usize, n: usize, kind: Kind) -> Outcome {
         secs: started.elapsed().as_secs_f64(),
         spawns: parse(Tool::Buck2, &text).map_err(|e| e.to_string()),
         failed_actions: eventlog::failed_actions(&event_log),
-    }
+    };
+    (outcome, true)
 }
 
 /// Waits for `child` for at most `limit`: its exit code, or killed and `timed_out`.

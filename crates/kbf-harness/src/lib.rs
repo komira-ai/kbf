@@ -59,11 +59,33 @@ pub mod units;
 /// (`CARGO_TARGET_TMPDIR` is for integration tests only).
 #[cfg(test)]
 pub(crate) fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir()
-        .join("kbf-harness-tests")
-        .join(format!("{name}-{}", std::process::id()));
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+    let root = std::env::temp_dir().join("kbf-harness-tests");
+    // The directories of runs that are over: one per test per run would pile up for ever.
+    SWEEP.call_once(|| sweep_dead(&root, &alive));
+    let dir = root.join(format!("{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch");
     dir
+}
+
+/// Removes the directories of `root` named `<name>-<pid>` whose process is not `running`
+/// (those of earlier runs of the tests); anything else in `root` is left.
+#[cfg(test)]
+pub(crate) fn sweep_dead(root: &std::path::Path, running: &dyn Fn(u32) -> bool) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let pid = name
+            .to_str()
+            .and_then(|n| n.rsplit_once('-'))
+            .and_then(|(_, pid)| pid.parse::<u32>().ok());
+        if pid.is_some_and(|pid| !running(pid)) {
+            // A file is not removed by this: `remove_dir_all` is for directories.
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Whether process `pid` is running (a zombie, ended and not yet reaped, is not).
@@ -74,3 +96,7 @@ pub(crate) fn alive(pid: u32) -> bool {
             .is_some_and(|(_, state)| !state.trim_start().starts_with('Z'))
     })
 }
+
+#[cfg(test)]
+#[path = "lib_tests.rs"]
+mod tests;
