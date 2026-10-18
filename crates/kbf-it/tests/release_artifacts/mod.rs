@@ -451,13 +451,13 @@ mod rules {
         // Catches: a build job left without the label condition, so every pull request
         // queues a runner for it (the load this gate removes).
         let w = good();
-        let line = "    if: ${ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }\n"
-            .replace("${ ", "${{ ")
-            .replace(" }\n", " }}\n");
+        let line = format!(
+            "    if: ${{{{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, '{PR_LABEL}') }}}}\n"
+        );
         assert!(w.contains(&line), "the fixture's condition");
         let parts: Vec<&str> = w.split(&line).collect();
         assert_eq!(parts.len(), 4, "three build jobs");
-        for k in 0..3 {
+        for (k, job) in BUILD_JOBS.iter().enumerate() {
             let mut planted = String::new();
             for (i, part) in parts.iter().enumerate() {
                 planted.push_str(part);
@@ -465,10 +465,7 @@ mod rules {
                     planted.push_str(&line);
                 }
             }
-            names(
-                &planted,
-                &[&format!("the build job `{}` does not run", BUILD_JOBS[k])],
-            );
+            names(&planted, &[&format!("the build job `{job}` does not run")]);
         }
     }
 
