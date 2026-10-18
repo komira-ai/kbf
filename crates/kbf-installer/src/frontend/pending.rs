@@ -79,8 +79,10 @@ pub enum Phase {
 /// The one frontend update in flight.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrontendPending {
-    /// The order's `<epoch>-<id>`, so a record read twice is one update.
-    pub order_id: String,
+    /// The order's (`epoch`, `order_id`), so a record read twice is one update, and so
+    /// `status.json` can name the order an outcome belongs to.
+    pub epoch: u64,
+    pub order_id: u64,
     pub commit: CommitId,
     /// The instance the update starts: the one that was idle.
     pub idle: Instance,
@@ -97,6 +99,31 @@ pub struct FrontendPending {
     pub why: String,
 }
 
+/// How the last frontend order ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum End {
+    /// The new instance serves (also: the serving instance already ran that release).
+    Confirmed,
+    /// The update was undone.
+    Reverted,
+    /// The order was refused before anything moved.
+    Refused,
+}
+
+/// The last frontend order that ended, written in the same save that ends its pending
+/// record, so `status.json` can name the order an outcome belongs to even after a reboot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontendEnd {
+    pub epoch: u64,
+    pub order_id: u64,
+    pub commit: CommitId,
+    pub end: End,
+    /// Why it was undone or refused; empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub why: String,
+}
+
 /// `frontend.json`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -107,6 +134,9 @@ pub struct FrontendFile {
     pub serving_instance: Option<Instance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontend_pending: Option<FrontendPending>,
+    /// How the newest frontend order ended (a pending record is the newer word while one exists).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<FrontendEnd>,
 }
 
 /// Why `frontend.json` could not be read or written.

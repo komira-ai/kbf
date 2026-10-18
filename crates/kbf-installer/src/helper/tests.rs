@@ -874,7 +874,8 @@ fn fetched_facts_are_shown_only_for_the_current_or_staged_release() {
             ..State::default()
         };
         let json: serde_json::Value =
-            serde_json::from_slice(&crate::helper::status::render(&state, &memory)).expect("json");
+            serde_json::from_slice(&crate::helper::status::render(&state, &memory, None))
+                .expect("json");
         json
     };
     assert_eq!(render(A, Some(B))["staged"]["protocol"], 7);

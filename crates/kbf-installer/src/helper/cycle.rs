@@ -13,6 +13,7 @@ use std::io::Write;
 
 use crate::CommitId;
 use crate::activate::{self, Activated, Arm, Confirmed, Expiry};
+use crate::frontend::pending::End;
 use crate::frontend::{Begun, Frontend, FrontendError, Progress};
 use crate::layout::{Layout, Platform};
 use crate::release::ReleaseError;
@@ -552,13 +553,17 @@ impl<E: Exec> Helper<E> {
             return self.save(memory);
         };
         match frontend.begin(&mut self.exec, &self.host, &*self.fetcher, order, now)? {
-            Begun::Refused(why) => refuse(memory, &why),
+            Begun::Refused(why) => {
+                crate::frontend::record_end(&mut self.exec, &self.host, order, End::Refused, &why)?;
+                refuse(memory, &why);
+            }
             Begun::Started => {
                 self.frontend_in_flight = true;
                 memory.event = Event::Idle;
                 memory.refusal = String::new();
             }
             Begun::AlreadyRunning => {
+                crate::frontend::record_end(&mut self.exec, &self.host, order, End::Confirmed, "")?;
                 memory.event = Event::Idle;
                 memory.refusal = format!("{} already runs on the frontend", order.commit);
             }
@@ -598,7 +603,13 @@ impl<E: Exec> Helper<E> {
         let mut memory = memory.clone();
         memory.frontend_pending = self.frontend_in_flight;
         let memory = &memory;
-        let bytes = status::render(&self.state()?, memory);
+        let frontend = match &self.frontend {
+            Some(_) => {
+                Some(crate::frontend::pending::load(&self.host).map_err(FrontendError::from)?)
+            }
+            None => None,
+        };
+        let bytes = status::render(&self.state()?, memory, frontend.as_ref());
         if bytes == self.written {
             return Ok(());
         }

@@ -53,7 +53,7 @@ fn a_frontend_update_starts_the_idle_instance_and_keeps_it_once_the_old_stood_do
     assert_eq!(w.slot(A_), Some(to(A)));
     let p = pending(&w).expect("pending");
     assert_eq!((p.idle, p.old, p.commit.as_str()), (B_, A_, B));
-    assert_eq!(p.order_id, "1-5");
+    assert_eq!((p.epoch, p.order_id), (1, 5));
     assert_eq!(p.prior_slot, Some(to(A)));
     assert_eq!(p.deadline_s, T0 + 600);
     assert_eq!(p.phase, Phase::Confirming { looks: 0 });
@@ -482,6 +482,7 @@ fn a_refused_update_changes_nothing() {
                 let file = FrontendFile {
                     serving_instance: Some(B_),
                     frontend_pending: None,
+                    last: None,
                 };
                 super::pending::save(h.exec_mut(), &w.layout, &file).expect("save");
             },

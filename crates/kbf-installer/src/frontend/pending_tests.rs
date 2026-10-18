@@ -4,7 +4,8 @@ use kbf_host::testkit::FakeExec;
 
 fn pending(phase: Phase) -> FrontendPending {
     FrontendPending {
-        order_id: "2-9".to_owned(),
+        epoch: 2,
+        order_id: 9,
         commit: c(B),
         idle: Instance::B,
         old: Instance::A,
@@ -24,6 +25,7 @@ fn the_record_is_spelled_as_the_state_schema_will_spell_it() {
     let file = FrontendFile {
         serving_instance: Some(Instance::A),
         frontend_pending: Some(pending(Phase::Confirming { looks: 2 })),
+        last: None,
     };
     let json = serde_json::to_value(&file).expect("json");
     assert_eq!(
@@ -31,7 +33,8 @@ fn the_record_is_spelled_as_the_state_schema_will_spell_it() {
         serde_json::json!({
             "serving_instance": "a",
             "frontend_pending": {
-                "order_id": "2-9",
+                "epoch": 2,
+                "order_id": 9,
                 "commit": B,
                 "idle": "b",
                 "old": "a",
@@ -57,6 +60,7 @@ fn the_record_is_spelled_as_the_state_schema_will_spell_it() {
         let file = FrontendFile {
             serving_instance: None,
             frontend_pending: Some(p),
+            last: None,
         };
         let back: FrontendFile =
             serde_json::from_slice(&serde_json::to_vec(&file).expect("bytes")).expect("back");
@@ -87,6 +91,7 @@ fn a_missing_file_is_empty_an_unknown_key_is_refused_and_save_then_load_agree() 
     let file = FrontendFile {
         serving_instance: Some(Instance::B),
         frontend_pending: None,
+        last: None,
     };
     save(&mut exec, &layout, &file).expect("save");
     let Step::WriteFile {

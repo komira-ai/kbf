@@ -50,7 +50,7 @@ use crate::helper::fetcher::{Fetcher, InstalledRelease, ReleaseLocator};
 use crate::helper::order::Order;
 use crate::layout::{self, Layout};
 use crate::state::{Locked, StateError};
-use pending::{FileError, FrontendFile, FrontendPending, Instance, Phase};
+use pending::{End, FileError, FrontendEnd, FrontendFile, FrontendPending, Instance, Phase};
 use probe::HandoverProbe;
 use units::UnitState;
 
@@ -205,11 +205,11 @@ impl Frontend {
         now: u64,
     ) -> Result<Begun, FrontendError> {
         let mut file = pending::load(host)?;
-        let this = format!("{}-{}", order.epoch, order.id);
+        let this = (order.epoch, order.id);
         if let Some(p) = &file.frontend_pending {
             // The same record read again (the pass that wrote the record died before it was
             // acknowledged) is the update already in flight.
-            return Ok(if p.order_id == this {
+            return Ok(if (p.epoch, p.order_id) == this {
                 Begun::Started
             } else {
                 refused(
@@ -292,7 +292,8 @@ impl Frontend {
         // the host shows.
         file.serving_instance.get_or_insert(serving);
         file.frontend_pending = Some(FrontendPending {
-            order_id: this,
+            epoch: order.epoch,
+            order_id: order.id,
             commit: order.commit.clone(),
             idle,
             old: serving,
@@ -453,6 +454,7 @@ impl Frontend {
         activate::reconcile(exec, host, out)?;
         file.serving_instance = Some(p.idle);
         file.frontend_pending = None;
+        file.last = Some(ended(p, End::Confirmed, String::new()));
         pending::save(exec, host, &file)?;
         Ok(Progress::Confirmed(p.commit.clone()))
     }
@@ -553,6 +555,7 @@ impl Frontend {
             })?,
         }
         file.frontend_pending = None;
+        file.last = Some(ended(&p, End::Reverted, p.why.clone()));
         pending::save(exec, host, &file)?;
         Ok(Progress::Reverted(p.why))
     }
@@ -584,6 +587,43 @@ impl Frontend {
         pending::save(exec, host, &file)?;
         Ok(Progress::NeedsOperator(reason))
     }
+}
+
+fn ended(p: &FrontendPending, end: End, why: String) -> FrontendEnd {
+    FrontendEnd {
+        epoch: p.epoch,
+        order_id: p.order_id,
+        commit: p.commit.clone(),
+        end,
+        why,
+    }
+}
+
+/// Record that `order` ended without a pending record: refused before anything moved, or
+/// already running. A pending update of another order is left alone.
+///
+/// # Errors
+/// The host's files could not be used.
+pub fn record_end<E: Exec>(
+    exec: &mut E,
+    host: &Layout,
+    order: &Order,
+    end: End,
+    why: &str,
+) -> Result<(), FrontendError> {
+    let mut file = pending::load(host)?;
+    if file.frontend_pending.is_some() {
+        return Ok(());
+    }
+    file.last = Some(FrontendEnd {
+        epoch: order.epoch,
+        order_id: order.id,
+        commit: order.commit.clone(),
+        end,
+        why: why.to_owned(),
+    });
+    pending::save(exec, host, &file)?;
+    Ok(())
 }
 
 /// The text of the link `slots/<instance>`: `Ok(None)` when there is no link, and why not
@@ -619,5 +659,7 @@ fn matches_order(got: &InstalledRelease, order: &Order) -> Result<(), String> {
 mod crash_tests;
 #[cfg(test)]
 mod sim;
+#[cfg(test)]
+mod status_tests;
 #[cfg(test)]
 mod tests;

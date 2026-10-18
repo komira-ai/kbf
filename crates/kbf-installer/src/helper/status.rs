@@ -3,6 +3,7 @@
 //! `kbf-update`'s client reads (`helper.rs`).
 
 use crate::CommitId;
+use crate::frontend::pending::{End, FrontendFile, Phase};
 use crate::state::State;
 use serde::Serialize;
 
@@ -25,6 +26,23 @@ struct Envoy {
     previous: Option<String>,
 }
 
+/// The frontend's own update, apart from the node fields (each kind has its own floor):
+/// the newest `frontend_update` order, by the id the frontend gave it, and where it stands.
+/// Absent until this host has acted on one, and on an installer that predates it, so a
+/// reader treats a missing section as "no word", never as an outcome.
+///
+/// `state`: `pending` (in flight), `needs_operator` (an operator must look; `refusal` says
+/// why), then the terminal words `confirmed`, `reverted`, `refused`.
+#[derive(Serialize)]
+struct Frontend<'a> {
+    order_id: u64,
+    epoch: u64,
+    commit: &'a CommitId,
+    state: &'static str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    refusal: &'a str,
+}
+
 #[derive(Serialize)]
 struct File<'a> {
     schema: u64,
@@ -36,6 +54,36 @@ struct File<'a> {
     acked_order_id: u64,
     staged: Option<Staged>,
     envoy: Envoy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frontend: Option<Frontend<'a>>,
+}
+
+/// The frontend section: the update in flight if there is one, else how the last ended.
+fn frontend_section(file: &FrontendFile) -> Option<Frontend<'_>> {
+    if let Some(p) = &file.frontend_pending {
+        let (state, refusal) = match &p.phase {
+            Phase::NeedsOperator { reason } => ("needs_operator", reason.as_str()),
+            _ => ("pending", ""),
+        };
+        return Some(Frontend {
+            order_id: p.order_id,
+            epoch: p.epoch,
+            commit: &p.commit,
+            state,
+            refusal,
+        });
+    }
+    file.last.as_ref().map(|e| Frontend {
+        order_id: e.order_id,
+        epoch: e.epoch,
+        commit: &e.commit,
+        state: match e.end {
+            End::Confirmed => "confirmed",
+            End::Reverted => "reverted",
+            End::Refused => "refused",
+        },
+        refusal: &e.why,
+    })
 }
 
 /// The word for what the host is doing. A swap on trial outranks everything; then a
@@ -60,7 +108,7 @@ fn word(state: &State, memory: &Memory) -> &'static str {
 
 /// The bytes of `status.json` for a host in `state` that remembers `memory`. The facts of
 /// the newest fetched release are shown while it is staged or current.
-pub fn render(state: &State, memory: &Memory) -> Vec<u8> {
+pub fn render(state: &State, memory: &Memory, frontend: Option<&FrontendFile>) -> Vec<u8> {
     let staged = memory
         .staged
         .as_ref()
@@ -85,6 +133,7 @@ pub fn render(state: &State, memory: &Memory) -> Vec<u8> {
             current: None,
             previous: None,
         },
+        frontend: frontend.and_then(frontend_section),
     };
     let mut bytes = serde_json::to_vec(&file).expect("plain fields serialize");
     bytes.push(b'\n');
