@@ -37,6 +37,10 @@ pub struct Memory {
     /// its id is higher; ids come from one counter in the store, not from this host, so
     /// no gap between them is a reason to refuse.
     pub acked_epoch: u64,
+    /// The same pair for `frontend_update` records. Each kind has its own floor: a frontend
+    /// order never advances or blocks the node's, and the reverse.
+    pub frontend_order_id: u64,
+    pub frontend_epoch: u64,
     pub event: Event,
     /// Why the last order was refused, or what was reverted.
     pub refusal: String,

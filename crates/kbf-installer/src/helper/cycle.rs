@@ -350,10 +350,17 @@ impl<E: Exec> Helper<E> {
         now: u64,
         memory: &mut Memory,
     ) -> Result<(), HelperError> {
+        // Each kind of order is ordered against its own floor.
+        let floor = |o: &Order, memory: &Memory| match o.verb {
+            Verb::FrontendUpdate => (memory.frontend_epoch, memory.frontend_order_id),
+            Verb::Activate | Verb::Confirm | Verb::Revert => {
+                (memory.acked_epoch, memory.acked_order_id)
+            }
+        };
         match parsed {
             Ok(o)
-                if memory.acked_epoch != 0
-                    && o.epoch > memory.acked_epoch.saturating_add(order::MAX_EPOCH_JUMP) =>
+                if floor(&o, memory).0 != 0
+                    && o.epoch > floor(&o, memory).0.saturating_add(order::MAX_EPOCH_JUMP) =>
             {
                 refuse(
                     memory,
@@ -363,21 +370,30 @@ impl<E: Exec> Helper<E> {
                         o.id,
                         o.epoch,
                         order::MAX_EPOCH_JUMP,
-                        memory.acked_epoch
+                        floor(&o, memory).0
                     ),
                 );
             }
-            Ok(o) if o.epoch < memory.acked_epoch => {
+            Ok(o) if o.epoch < floor(&o, memory).0 => {
                 refuse(
                     memory,
                     &format!(
                         "order {} is from epoch {}, older than the last acted on ({})",
-                        o.id, o.epoch, memory.acked_epoch
+                        o.id,
+                        o.epoch,
+                        floor(&o, memory).0
                     ),
                 );
             }
             // The same epoch and an id not above the last: a replay, dropped silently.
-            Ok(o) if o.epoch == memory.acked_epoch && o.id <= memory.acked_order_id => {}
+            Ok(o) if o.epoch == floor(&o, memory).0 && o.id <= floor(&o, memory).1 => {}
+            // The frontend swap is a later change (P13). It is refused here with that reason
+            // and, like any refusal of a record, does not move its floor (nor the node's):
+            // the next real order still runs.
+            Ok(o) if o.verb == Verb::FrontendUpdate => refuse(
+                memory,
+                &format!("order {}: frontend_update is not implemented (P13)", o.id),
+            ),
             Ok(o) => {
                 self.act(&o, now, memory)?;
                 memory.acked_order_id = o.id;
@@ -410,6 +426,7 @@ impl<E: Exec> Helper<E> {
             Verb::Activate => self.activate(order, now),
             Verb::Confirm => self.confirm(order, &before),
             Verb::Revert => self.revert(),
+            Verb::FrontendUpdate => Err("frontend_update is not implemented (P13)".to_owned()),
         };
         let moved = self.moved(&before)?;
         match result {
