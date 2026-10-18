@@ -60,6 +60,7 @@ pub mod install_mode;
 pub mod meta;
 pub mod modes;
 pub mod render;
+pub mod restart;
 pub mod stop;
 pub mod stores;
 pub mod swap;
