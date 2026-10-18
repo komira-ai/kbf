@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
+mod support;
+use support::{BUSY_WAIT, output_unbusy};
+
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
 const PLIST: &str = "../../packaging/macos/com.komira.kbf-installer.plist";
@@ -22,28 +25,6 @@ fn scratch(name: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).expect("scratch");
     std::fs::copy(FAKE, dir.join("kbf-installer")).expect("the stub");
     dir
-}
-
-/// How long [`output_unbusy`] keeps starting a busy program in the tests below.
-const BUSY_WAIT: Duration = Duration::from_secs(5);
-/// The pause between two tries of a busy program.
-const BUSY_POLL: Duration = Duration::from_millis(2);
-
-/// `command.output()`, started again while the program is busy until `wait` is up, then
-/// the last error. A file this process wrote a moment ago is briefly open for writing in
-/// a child that another test thread forked before it execs it (`O_CLOEXEC` closes the
-/// descriptor at that exec, not before), and exec of a file open for writing is
-/// `ETXTBSY`. Closing the file first does not close that window; waiting does.
-fn output_unbusy(command: &mut Command, wait: Duration) -> io::Result<Output> {
-    let give_up = Instant::now() + wait;
-    loop {
-        match command.output() {
-            Err(e) if e.kind() == io::ErrorKind::ExecutableFileBusy && Instant::now() < give_up => {
-                std::thread::sleep(BUSY_POLL);
-            }
-            done => return done,
-        }
-    }
 }
 
 fn plist() -> PathBuf {
@@ -128,6 +109,22 @@ fn a_busy_stub_runs_once_the_descriptor_closes() {
     );
     assert_eq!(out.stdout, b"kbf-installer-stub late\n");
     closer.join().expect("closer");
+}
+
+#[test]
+fn an_error_that_is_not_busy_is_returned_at_once() {
+    // Catches: a retry on any error (a missing program would be started again for the
+    // whole wait instead of failing), which only the busy case may do.
+    let missing = scratch("not-busy").join("no-such-program");
+    let started = Instant::now();
+    let err = output_unbusy(&mut Command::new(&missing), Duration::from_secs(3))
+        .expect_err("no such program");
+    assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "retried a program that is not busy: {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
