@@ -305,6 +305,12 @@ fn tail(text: &str) -> String {
     lines[lines.len().saturating_sub(40)..].join("\n")
 }
 
+/// The first lines of `text`: a tool that rejects its command line says why there
+/// (`xcodebuild: error: ...`), before the usage text that [`tail`] shows.
+fn head(text: &str) -> String {
+    text.lines().take(10).collect::<Vec<_>>().join("\n")
+}
+
 /// How many times [`SHIMS`] times each compiler, one call at a time.
 const CALLS: usize = 7;
 
@@ -730,9 +736,11 @@ fn package_with_a_local_dependency() -> Vec<(String, Vec<u8>)> {
 /// dependency (derived data, package cache and cloned sources in the lease): SwiftPM
 /// writes its manifest cache in `~/Library/Caches/org.swift.swiftpm`, which it finds
 /// through the user database, not `HOME` (issue #179). SwiftPM's own sandbox for
-/// manifests is off (`-IDEPackageSupportDisableManifestSandbox YES`, what `swift build
-/// --disable-sandbox` is above): `sandbox-exec` cannot nest in the action's sandbox
-/// ("sandbox_apply: Operation not permitted").
+/// manifests is off (the user default `IDEPackageSupportDisableManifestSandbox`, what
+/// `swift build --disable-sandbox` is above), written to the lease's home through
+/// `CFFIXED_USER_HOME` and not passed as an argument: `xcodebuild` 26 answers
+/// `-IDEPackageSupportDisableManifestSandbox YES` with its usage text. `sandbox-exec`
+/// cannot nest in the action's sandbox ("sandbox_apply: Operation not permitted").
 #[tokio::test]
 async fn xcodebuild_builds_a_swift_package() {
     let _tools = DEVELOPER_TOOLS.read().await;
@@ -746,8 +754,9 @@ async fn xcodebuild_builds_a_swift_package() {
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config, &cas);
     let mut spec = Spec::sh(
-        "xcodebuild -scheme hello -destination 'platform=macOS' \
-         -IDEPackageSupportDisableManifestSandbox YES \
+        "export CFFIXED_USER_HOME=\"$HOME\"; \
+         defaults write com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox -bool YES \
+         && xcodebuild -scheme hello -destination 'platform=macOS' \
          -derivedDataPath \"$TMPDIR/dd\" -packageCachePath \"$TMPDIR/pc\" \
          -clonedSourcePackagesDirPath \"$TMPDIR/sp\" build \
          && \"$TMPDIR/dd/Build/Products/Debug/hello\"",
@@ -760,8 +769,10 @@ async fn xcodebuild_builds_a_swift_package() {
     assert_eq!(
         (result.exit_code, out.lines().last()),
         (0, Some("hello")),
-        "{}\n{}\n{}",
+        "{}\n...\n{}\n{}\n...\n{}\n{}",
+        head(&out),
         tail(&out),
+        head(&stderr(&cas, &result)),
         tail(&stderr(&cas, &result)),
         sandbox_denials()
     );
