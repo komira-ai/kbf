@@ -1,8 +1,8 @@
-//! The daemon's helper re-execs, run through `kbf-all-in-one` (the design,
+//! The daemon's helper re-execs, run through the `kbf` binary (the design,
 //! komira-build-farm#657, sections 3 and 7.3): the binary answers each helper mode
 //! before it reads a flag, runs the helper, and exits with the helper's status; a
 //! helper binds no listener, opens no server directory and starts no async runtime.
-//! (The native driver's `slots` helper is macOS's, where this binary does not run.)
+//! (The native driver's `slots` helper is macOS's, where `kbf all-in-one` does not run.)
 
 #![cfg(target_os = "linux")]
 
@@ -10,12 +10,12 @@ use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-const BIN: &str = env!("CARGO_BIN_EXE_kbf-all-in-one");
+const BIN: &str = env!("CARGO_BIN_EXE_kbf");
 
 /// A fresh directory for one test.
 fn scratch(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-all-in-one-helpers")
+        .join("kbf-helpers")
         .join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch");

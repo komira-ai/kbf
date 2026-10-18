@@ -608,7 +608,7 @@ watches.
 | `kbf_write_tier_unflushed_bytes`, `kbf_write_tier_unflushed_blocks` | gauge | acknowledged bytes, and the blocks holding them, not yet in the object store |
 | `kbf_write_tier_oldest_unflushed_seconds` | gauge | the age of the oldest of those blocks (since it was created, or since the restart that recovered it); 0 when there is none |
 
-In `kbf-all-in-one`, when the hot store is a directory on the filesystem of `--data-dir`,
+In `kbf all-in-one`, when the hot store is a directory on the filesystem of `--data-dir`,
 the daemon half's input cache and the server half's hot store are one cache
 ([architecture-v2.md](design/architecture-v2.md#10-locality)): the input cache's
 directory is the node's only local copy of a blob, the tier deletes a block once it is

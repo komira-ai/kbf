@@ -1,6 +1,6 @@
 The kbf farm server and a worker daemon in one process (Linux, the container driver only).
 
-Usage: kbf-all-in-one [OPTIONS] --server <SERVERS> --ca-cert <CA_CERT> --cert <CERT> --key <KEY> --node-id <NODE_ID> --driver <DRIVERS>
+Usage: kbf all-in-one [OPTIONS] --server <SERVERS> --ca-cert <CA_CERT> --cert <CERT> --key <KEY> --node-id <NODE_ID> --driver <DRIVERS>
 
 Options:
       --role <ROLE>
