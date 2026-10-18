@@ -54,8 +54,10 @@ pub const SIGNING_IF: &str = "${{ github.event_name == 'push' && (github.ref == 
 
 /// The jobs that build on one platform, named by it, and the signing and verifying jobs.
 const BUILD_JOBS: &[&str] = &["darwin-arm64", "linux-x86_64", "linux-arm64"];
-const ATTEST_JOB: &str = "attest";
-const VERIFY_JOB: &str = "verify";
+/// The signing and verifying jobs, one pair per platform group, so the Linux files are
+/// attested without waiting for the macOS build.
+pub const ATTEST_JOBS: &[&str] = &["attest-linux", "attest-darwin-arm64"];
+const VERIFY_JOBS: &[&str] = &["verify-linux", "verify-darwin-arm64"];
 const DARWIN_JOB: &str = "darwin-arm64";
 
 /// The lines of a step's script, leading blanks dropped.
@@ -104,6 +106,49 @@ pub fn problems(workflow: &str) -> Result<Vec<String>, String> {
     signing(workflow, &mut out)?;
     identity(workflow, &mut out)?;
     darwin(workflow, &mut out)?;
+    pull_request_gate(workflow, &mut out)?;
+    Ok(out)
+}
+
+/// A pull request builds nothing unless it carries [`PR_LABEL`]: each build job's `if:`
+/// names the label, so an unlabelled pull request's run is skipped without a runner.
+const PR_LABEL: &str = "needs-artifacts";
+
+fn pull_request_gate(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
+    for job in BUILD_JOBS {
+        let condition = workflows::job_condition(workflow, job)?.unwrap_or_default();
+        if !condition.contains(&format!("labels.*.name, '{PR_LABEL}'")) {
+            out.push(format!(
+                "the build job `{job}` does not run on a pull request only with the label `{PR_LABEL}`: its `if:` is `{condition}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The one `if:` of ci.yml's `native-macos` job: skipped for a pull request into
+/// feature/arch-v2 unless it carries the label `macos`, as before for every other event.
+pub const MACOS_IF: &str = "${{ github.event_name != 'pull_request' || github.base_ref != 'feature/arch-v2' || contains(github.event.pull_request.labels.*.name, 'macos') }}";
+
+/// What differs between ci.yml's `native-macos` condition and [`MACOS_IF`], and whether
+/// ci.yml runs on `labeled` pull request events (without which the label starts nothing).
+pub fn macos_problems(ci: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let condition = workflows::job_condition(ci, "native-macos")?;
+    if condition.as_deref() != Some(MACOS_IF) {
+        out.push(format!(
+            "the job `native-macos` has `if: {}`, not exactly `{MACOS_IF}`",
+            condition.as_deref().unwrap_or("(none)")
+        ));
+    }
+    let header: String = ci
+        .lines()
+        .take_while(|l| !l.starts_with("jobs:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !header.contains("types: [opened, synchronize, reopened, labeled]") {
+        out.push("ci.yml's `pull_request` does not list the types `opened, synchronize, reopened, labeled`: adding the label `macos` would start nothing".to_owned());
+    }
     Ok(out)
 }
 
@@ -139,7 +184,7 @@ fn signing(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
             "`push` runs the workflow for {branches:?}, not exactly {PUSH_BRANCHES:?}"
         ));
     }
-    for job in [ATTEST_JOB, VERIFY_JOB] {
+    for job in ATTEST_JOBS.iter().chain(VERIFY_JOBS) {
         let condition = workflows::job_condition(workflow, job)?;
         if condition.as_deref() != Some(SIGNING_IF) {
             out.push(format!(
@@ -148,53 +193,58 @@ fn signing(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
             ));
         }
     }
-    let attest = workflows::job_steps(workflow, ATTEST_JOB)?;
-    let provenance = attest.iter().find(|s| {
-        s.uses
-            .as_deref()
-            .is_some_and(|u| u.starts_with("actions/attest-build-provenance@"))
-    });
-    match provenance {
-        None => out.push(format!(
-            "the job `{ATTEST_JOB}` has no actions/attest-build-provenance step"
-        )),
-        Some(step) => {
-            let subjects = step
-                .with
-                .iter()
-                .find(|(k, _)| k == "subject-checksums")
-                .map(|(_, v)| v.as_str());
-            if subjects != Some("dist/SHA256SUMS") {
-                out.push(format!(
-                    "the provenance step of `{ATTEST_JOB}` does not cover `dist/SHA256SUMS`, but {subjects:?}"
-                ));
-            }
-            if step.conditional {
-                out.push(format!(
-                    "the provenance step of `{ATTEST_JOB}` is under `if:` or `continue-on-error:`"
-                ));
+    for attest_job in ATTEST_JOBS {
+        let attest = workflows::job_steps(workflow, attest_job)?;
+        let provenance = attest.iter().find(|s| {
+            s.uses
+                .as_deref()
+                .is_some_and(|u| u.starts_with("actions/attest-build-provenance@"))
+        });
+        match provenance {
+            None => out.push(format!(
+                "the job `{attest_job}` has no actions/attest-build-provenance step"
+            )),
+            Some(step) => {
+                let subjects = step
+                    .with
+                    .iter()
+                    .find(|(k, _)| k == "subject-checksums")
+                    .map(|(_, v)| v.as_str());
+                if subjects != Some("dist/SHA256SUMS") {
+                    out.push(format!(
+                        "the provenance step of `{attest_job}` does not cover `dist/SHA256SUMS`, but {subjects:?}"
+                    ));
+                }
+                if step.conditional {
+                    out.push(format!(
+                        "the provenance step of `{attest_job}` is under `if:` or `continue-on-error:`"
+                    ));
+                }
             }
         }
     }
-    let verify = workflows::job_steps(workflow, VERIFY_JOB)?;
-    let verifying = verify.iter().find_map(|s| {
-        lines(s).find_map(|l| args(l, "cargo xtask verify-assets attestations ").map(|a| (s, a)))
-    });
-    match verifying {
-        None => out.push(format!(
-            "the job `{VERIFY_JOB}` does not run `cargo xtask verify-assets attestations`"
-        )),
-        Some((step, words)) => {
-            let at = words.iter().position(|w| *w == "--source-ref");
-            if at.and_then(|i| words.get(i + 1)) != Some(&"$GITHUB_REF") {
-                out.push(format!(
-                    "the job `{VERIFY_JOB}` verifies attestations without `--source-ref \"$GITHUB_REF\"`, so a push to a branch other than main would be checked as main (or any branch as any)"
-                ));
-            }
-            if step.conditional {
-                out.push(format!(
-                    "the attestation check of `{VERIFY_JOB}` is under `if:` or `continue-on-error:`"
-                ));
+    for verify_job in VERIFY_JOBS {
+        let verify = workflows::job_steps(workflow, verify_job)?;
+        let verifying = verify.iter().find_map(|s| {
+            lines(s)
+                .find_map(|l| args(l, "cargo xtask verify-assets attestations ").map(|a| (s, a)))
+        });
+        match verifying {
+            None => out.push(format!(
+                "the job `{verify_job}` does not run `cargo xtask verify-assets attestations`"
+            )),
+            Some((step, words)) => {
+                let at = words.iter().position(|w| *w == "--source-ref");
+                if at.and_then(|i| words.get(i + 1)) != Some(&"$GITHUB_REF") {
+                    out.push(format!(
+                        "the job `{verify_job}` verifies attestations without `--source-ref \"$GITHUB_REF\"`, so a push to a branch other than main would be checked as main (or any branch as any)"
+                    ));
+                }
+                if step.conditional {
+                    out.push(format!(
+                        "the attestation check of `{verify_job}` is under `if:` or `continue-on-error:`"
+                    ));
+                }
             }
         }
     }
@@ -296,6 +346,19 @@ fn the_workflow_builds_signs_checks_and_attests_what_the_release_set_says() {
 }
 
 #[test]
+fn native_macos_runs_for_a_feature_pull_request_only_with_the_label() {
+    // Catches: ci.yml's native-macos condition drifting (the label no longer starting
+    // it, or the job running on every feature pull request again), or `labeled` dropped
+    // from the pull_request types so that adding the label does nothing.
+    let path = ".github/workflows/ci.yml";
+    let text = std::fs::read_to_string(super::repo_root().join(path)).expect(path);
+    match macos_problems(&text) {
+        Ok(found) => assert!(found.is_empty(), "{path}:\n{}", found.join("\n")),
+        Err(e) => panic!("{path}: {e}"),
+    }
+}
+
+#[test]
 fn the_docs_describe_the_release_set() {
     // Catches: docs/artifacts.md describing another set of files than the workflow
     // builds (the doc is what an operator verifies against), or no longer saying that
@@ -335,7 +398,7 @@ mod rules {
         );
         for job in BUILD_JOBS {
             w.push_str(&format!(
-                "  {job}:\n    runs-on: ubuntu-24.04\n    steps:\n"
+                "  {job}:\n    if: ${{{{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, '{PR_LABEL}') }}}}\n    runs-on: ubuntu-24.04\n    steps:\n"
             ));
             let platform = *job;
             let mine: Vec<&str> = ASSETS
@@ -371,12 +434,16 @@ mod rules {
                 }
             }
         }
-        w.push_str(&format!(
-            "  attest:\n    if: {SIGNING_IF}\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/attest-build-provenance@0123 # v4\n        with:\n          subject-checksums: dist/SHA256SUMS\n"
-        ));
-        w.push_str(&format!(
-            "  verify:\n    if: {SIGNING_IF}\n    runs-on: ubuntu-24.04\n    steps:\n      - run: cargo xtask verify-assets attestations dist --repo \"$GITHUB_REPOSITORY\" --workflow-ref \"$GITHUB_WORKFLOW_REF\" --source-ref \"$GITHUB_REF\"\n"
-        ));
+        for platform in ["linux", "darwin-arm64"] {
+            w.push_str(&format!(
+                "  attest-{platform}:\n    if: {SIGNING_IF}\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/attest-build-provenance@0123 # v4\n        with:\n          subject-checksums: dist/SHA256SUMS\n"
+            ));
+        }
+        for platform in ["linux", "darwin-arm64"] {
+            w.push_str(&format!(
+                "  verify-{platform}:\n    if: {SIGNING_IF}\n    runs-on: ubuntu-24.04\n    steps:\n      - run: cargo xtask verify-assets attestations dist --repo \"$GITHUB_REPOSITORY\" --workflow-ref \"$GITHUB_WORKFLOW_REF\" --source-ref \"$GITHUB_REF\"\n"
+            ));
+        }
         w
     }
 
@@ -430,12 +497,77 @@ mod rules {
     }
 
     #[test]
+    fn the_macos_condition_and_the_labeled_type_are_pinned() {
+        // Catches: the label dropped from native-macos's condition (the job never runs
+        // on a feature pull request), the base-branch gate dropped (it runs on all), a
+        // push or merge_group case lost, and `labeled` missing from the types.
+        let ci = format!(
+            "name: ci\non:\n  pull_request:\n    types: [opened, synchronize, reopened, labeled]\n  merge_group:\njobs:\n  native-macos:\n    if: {MACOS_IF}\n    runs-on: macos-latest\n"
+        );
+        assert_eq!(macos_problems(&ci).expect("readable"), Vec::<String>::new());
+        for (from, to, what) in [
+            (
+                " || contains(github.event.pull_request.labels.*.name, 'macos')",
+                "",
+                "the label",
+            ),
+            (
+                " || github.base_ref != 'feature/arch-v2'",
+                "",
+                "the base gate",
+            ),
+            (
+                "github.event_name != 'pull_request' || ",
+                "",
+                "the event case",
+            ),
+        ] {
+            let bad = ci.replacen(from, to, 1);
+            assert_ne!(bad, ci, "{what}");
+            let got = macos_problems(&bad).expect("readable");
+            assert!(
+                got.iter().any(|p| p.contains("`native-macos` has `if:")),
+                "{what}: {got:?}"
+            );
+        }
+        let bad = ci.replacen(", labeled]", "]", 1);
+        let got = macos_problems(&bad).expect("readable");
+        assert!(
+            got.iter().any(|p| p.contains("would start nothing")),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn a_build_job_runs_on_a_pull_request_only_with_the_label() {
+        // Catches: a build job left without the label condition, so every pull request
+        // queues a runner for it (the load this gate removes).
+        let w = good();
+        let line = format!(
+            "    if: ${{{{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, '{PR_LABEL}') }}}}\n"
+        );
+        assert!(w.contains(&line), "the fixture's condition");
+        let parts: Vec<&str> = w.split(&line).collect();
+        assert_eq!(parts.len(), 4, "three build jobs");
+        for (k, job) in BUILD_JOBS.iter().enumerate() {
+            let mut planted = String::new();
+            for (i, part) in parts.iter().enumerate() {
+                planted.push_str(part);
+                if i < 3 && i != k {
+                    planted.push_str(&line);
+                }
+            }
+            names(&planted, &[&format!("the build job `{job}` does not run")]);
+        }
+    }
+
+    #[test]
     fn the_signing_jobs_run_only_for_a_push_to_a_listed_branch() {
         // Catches: attest or verify opened to every event or every push (a pull request
         // would sign), narrowed to main (the development branch unattested), or left
         // without an `if:`; and a push trigger of other branches than the pinned two.
         let line = format!("    if: {SIGNING_IF}\n");
-        for (k, job) in ["attest", "verify"].into_iter().enumerate() {
+        for (k, job) in ATTEST_JOBS.iter().chain(VERIFY_JOBS).enumerate() {
             for to in [
                 "if: ${{ github.event_name == 'push' }}",
                 "if: ${{ github.ref == 'refs/heads/main' }}",
@@ -445,11 +577,15 @@ mod rules {
                 // The k-th `if:` of the signing jobs, replaced.
                 let w = good();
                 let parts: Vec<&str> = w.split(&line).collect();
-                assert_eq!(parts.len(), 3, "attest and verify");
+                assert_eq!(
+                    parts.len(),
+                    5,
+                    "the attest and verify jobs of both platform groups"
+                );
                 let mut planted = String::new();
                 for (i, part) in parts.iter().enumerate() {
                     planted.push_str(part);
-                    if i < 2 {
+                    if i < 4 {
                         planted.push_str(&if i == k {
                             format!("    {to}\n")
                         } else {
@@ -498,7 +634,7 @@ mod rules {
                 "      - uses: actions/attest-build-provenance@0123 # v4\n",
                 "      - if: always()\n        uses: actions/attest-build-provenance@0123 # v4\n",
             ),
-            &["provenance step of `attest` is under `if:`"],
+            &["provenance step of `attest-linux` is under `if:`"],
         );
     }
 
@@ -519,7 +655,7 @@ mod rules {
                 "      - run: cargo xtask verify-assets attestations",
                 "      - if: always()\n        run: cargo xtask verify-assets attestations",
             ),
-            &["attestation check of `verify` is under `if:`"],
+            &["attestation check of `verify-linux` is under `if:`"],
         );
         names(
             &broken("verify-assets attestations", "verify-assets sums"),
