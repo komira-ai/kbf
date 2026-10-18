@@ -27,7 +27,7 @@ use std::time::SystemTime;
 use kbf_types::{ActionKey, Digest, LeaseId, LeaseKind, OperationId, WaiterId, WorkerId};
 
 use crate::action_usage::Subject;
-use crate::fleet::SoftwareView;
+use crate::fleet::{SoftwareView, UpdateReport};
 use crate::stamp::Stamp;
 
 /// The REAPI name of the operation `waiter` waits on, in the process of `term`:
@@ -91,6 +91,8 @@ pub struct Node {
     pub connected: bool,
     /// The newest `NodeStatus` it sent, on any of its streams; `None` before the first.
     pub status: Option<SoftwareView>,
+    /// The newest `UpdateStatus` it sent, on any of its streams; `None` before the first.
+    pub update: Option<UpdateReport>,
 }
 
 /// The waiter records, the started table and the node registry of one farm (see the
@@ -182,6 +184,7 @@ impl FarmMachine {
         let node = self.nodes.entry(worker.clone()).or_insert(Node {
             connected: true,
             status: None,
+            update: None,
         });
         node.connected = true;
     }
@@ -197,6 +200,13 @@ impl FarmMachine {
     pub fn report_status(&mut self, worker: &WorkerId, status: SoftwareView) {
         if let Some(node) = self.nodes.get_mut(worker) {
             node.status = Some(status);
+        }
+    }
+
+    /// Keeps `update` as the newest of `worker`, if it has registered.
+    pub fn report_update(&mut self, worker: &WorkerId, update: UpdateReport) {
+        if let Some(node) = self.nodes.get_mut(worker) {
+            node.update = Some(update);
         }
     }
 
@@ -298,6 +308,22 @@ mod tests {
         }
     }
 
+    fn update(n: u8) -> UpdateReport {
+        UpdateReport {
+            state: "idle",
+            running_commit: "0123456789ab".to_owned(),
+            installed_commit: String::new(),
+            staged_commit: String::new(),
+            offered_generation: u64::from(n),
+            acked_order_id: 0,
+            refusal: String::new(),
+            helper_present: false,
+            staged_protocol: 0,
+            staged_min_protocol: 0,
+            staged_state_schema: 0,
+        }
+    }
+
     fn sent(operation: u64, n: u8) -> Sent {
         Sent {
             operation: OperationId(operation),
@@ -313,13 +339,14 @@ mod tests {
     /// is drawn from `rng` too, so a seed names exactly one call sequence.
     fn step(machine: &mut FarmMachine, rng: &mut SimRng) {
         let small = |rng: &mut SimRng| u8::try_from(rng.below(32)).unwrap_or_default();
-        match rng.below(8) {
+        match rng.below(9) {
             0 | 1 => {
                 machine.submit(waiter(small(rng)));
             }
             5 => machine.register(&node(rng.below(32))),
             6 => machine.disconnect(&node(rng.below(32))),
             7 => machine.report_status(&node(rng.below(32)), status(small(rng))),
+            8 => machine.report_update(&node(rng.below(32)), update(small(rng))),
             2 => {
                 let lease = LeaseId::new(rng.between(1, 3), rng.below(64));
                 machine.start(lease, sent(rng.below(8), small(rng)));
@@ -389,7 +416,7 @@ mod tests {
         base.report_status(&node(1), status(1));
         let lease = LeaseId::new(1, 7);
         type Change = fn(&mut FarmMachine);
-        let changes: [(&str, Change); 18] = [
+        let changes: [(&str, Change); 19] = [
             ("term", |m| m.term += 1),
             ("next_waiter", |m| m.next_waiter += 1),
             ("waiters: one more", |m| {
@@ -441,6 +468,7 @@ mod tests {
             ("nodes: one more", |m| m.register(&node(2))),
             ("node.connected", |m| m.disconnect(&node(1))),
             ("node.status", |m| m.report_status(&node(1), status(2))),
+            ("node.update", |m| m.report_update(&node(1), update(2))),
         ];
         for (field, change) in changes {
             let mut changed = base.clone();
@@ -460,20 +488,24 @@ mod tests {
         let mut m = FarmMachine::new(TERM);
         m.disconnect(&node(1));
         m.report_status(&node(1), status(1));
+        m.report_update(&node(1), update(1));
         assert_eq!(m.node(&node(1)), None);
         assert_eq!(m.nodes().count(), 0);
         m.register(&node(1));
         m.report_status(&node(1), status(1));
+        m.report_update(&node(1), update(1));
         m.disconnect(&node(1));
         let left = Node {
             connected: false,
             status: Some(status(1)),
+            update: Some(update(1)),
         };
         assert_eq!(m.node(&node(1)), Some(&left));
         m.register(&node(1));
         let back = Node {
             connected: true,
             status: Some(status(1)),
+            update: Some(update(1)),
         };
         assert_eq!(m.node(&node(1)), Some(&back));
         assert_eq!(m.nodes().collect::<Vec<_>>(), vec![&node(1)]);

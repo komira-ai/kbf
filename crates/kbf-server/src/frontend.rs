@@ -807,6 +807,11 @@ impl<'a> Prepared<'a> {
         worker_stop.closes(worker_latch);
         let api_listener = api_socket.map(Socket::http).transpose()?;
         let (token, releases) = api.map_or((None, None), |api| (api.token, api.releases));
+        let offers = crate::release::offers::offers_of(
+            releases.clone(),
+            state_store.clone().map(crate::update::Rows::new),
+            listeners.tick,
+        );
         let api_routes = crate::api::router(
             Arc::clone(&farm),
             token.clone(),
@@ -839,6 +844,9 @@ impl<'a> Prepared<'a> {
         );
         // Daemons are sent the members' map: Welcome.map and a MapUpdate at each bump.
         let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
+        let sessions = offers
+            .into_iter()
+            .fold(sessions, WorkerService::with_offers);
         let worker_service = WorkerServer::new(sessions)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);

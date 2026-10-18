@@ -42,6 +42,7 @@ use kbf_front::{Backend, Dispatch, Finished, Recorder, Stage, Submission, Ticket
 use kbf_meta::ActionRecord;
 use kbf_proto::google::rpc;
 use kbf_proto::reapi::ActionResult;
+use kbf_proto::update::UpdateStatus;
 use kbf_proto::worker::{
     self, LeaseOffer, NodeStatus, ResultAck, ServerMessage, Start, server_message,
 };
@@ -72,7 +73,8 @@ use self::durable::Durable;
 use crate::action_usage::{self, Measured, Shapes};
 use crate::fault;
 use crate::fleet::{
-    NodeView, NodesView, PhaseView, PlacementView, SoftwareView, attention_changes, needs_attention,
+    NodeView, NodesView, PhaseView, PlacementView, SoftwareView, UpdateReport, UpdateView,
+    attention_changes, needs_attention,
 };
 use crate::machine::{FarmMachine, Sent, Waiter};
 use crate::memory;
@@ -491,6 +493,17 @@ impl Farm {
         changes
     }
 
+    /// An `UpdateStatus` on `stream`: kept as the worker's newest, unless `stream` was
+    /// replaced (a newer stream sends its own after its `Welcome`).
+    pub fn update_status(&self, worker: &WorkerId, stream: StreamId, status: UpdateStatus) {
+        let mut state = self.lock();
+        if state.is_current(worker, stream) {
+            state
+                .machine
+                .report_update(worker, UpdateReport::new(status));
+        }
+    }
+
     /// This build, and every node registered since this farm started, in node-id order.
     pub fn nodes(&self) -> NodesView {
         let mut state = self.lock();
@@ -573,6 +586,9 @@ impl Farm {
             software,
             placement,
             phase: PhaseView::new(&phase),
+            update: node
+                .and_then(|n| n.update.clone())
+                .map_or(UpdateView::Unsupported, UpdateView::Ok),
         }
     }
 

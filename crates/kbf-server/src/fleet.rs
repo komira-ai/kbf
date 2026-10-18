@@ -26,6 +26,8 @@
 //! again. The previous status is the one this server process received last: after a
 //! server restart, an item is raised again when its node's survey reports it.
 
+use kbf_proto::update::UpdateStatus;
+use kbf_proto::update::update_status::State as UpdateState;
 use kbf_proto::worker::{NodeStatus, XcodeState, XcodeStatus};
 use kbf_sched::NodePhase;
 use serde::Serialize;
@@ -47,6 +49,80 @@ pub struct NodeView {
     pub placement: PlacementView,
     /// What its newest `Hello` says it is doing besides running leases.
     pub phase: PhaseView,
+    /// What its update client reported last ([`UpdateView`]).
+    pub update: UpdateView,
+}
+
+/// A node's update client, as `GET /v1/nodes` lists it
+/// (`docs/design/pull-updates.md` sections 5 and 6.3). Serialized with `availability` as a
+/// tag. The newest `UpdateStatus` it sent is kept per node from its current stream only, in
+/// memory, like [`SoftwareView`]; each daemon sends it again after its next `Welcome`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+pub enum UpdateView {
+    /// It never sent an `UpdateStatus`: a daemon that predates pull-based updates. A
+    /// rollout halts at it.
+    Unsupported,
+    /// It sends them.
+    Ok(UpdateReport),
+}
+
+/// An `UpdateStatus` as the operator API shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct UpdateReport {
+    /// `idle`, `fetching`, `staged`, `activated_unconfirmed`, `confirmed`, `reverted`,
+    /// `refused`, `manual`, or `unknown` for a state this server does not know.
+    pub state: &'static str,
+    /// The commit of the running process (12 hex or `unknown`).
+    pub running_commit: String,
+    /// The commit its helper installed (40 hex; empty if not known).
+    pub installed_commit: String,
+    /// The commit its helper staged (40 hex; empty if nothing is).
+    pub staged_commit: String,
+    /// The newest offer generation it saw.
+    pub offered_generation: u64,
+    /// The newest order id it acted on.
+    pub acked_order_id: u64,
+    /// Why it refused, when `state` is `refused`.
+    pub refusal: String,
+    /// Whether the privileged helper is on the host.
+    pub helper_present: bool,
+    /// What the staged release declares in `kbf --version --json` (0 when nothing is
+    /// staged): its protocol, the oldest protocol it speaks, and its state schema.
+    pub staged_protocol: u32,
+    pub staged_min_protocol: u32,
+    pub staged_state_schema: u32,
+}
+
+impl UpdateReport {
+    /// `status` as shown.
+    #[must_use]
+    pub fn new(status: UpdateStatus) -> Self {
+        let state = match UpdateState::try_from(status.state) {
+            Ok(UpdateState::Idle) => "idle",
+            Ok(UpdateState::Fetching) => "fetching",
+            Ok(UpdateState::Staged) => "staged",
+            Ok(UpdateState::ActivatedUnconfirmed) => "activated_unconfirmed",
+            Ok(UpdateState::Confirmed) => "confirmed",
+            Ok(UpdateState::Reverted) => "reverted",
+            Ok(UpdateState::Refused) => "refused",
+            Ok(UpdateState::Manual) => "manual",
+            Ok(UpdateState::Unspecified) | Err(_) => "unknown",
+        };
+        Self {
+            state,
+            running_commit: status.running_commit,
+            installed_commit: status.installed_commit,
+            staged_commit: status.staged_commit,
+            offered_generation: status.offered_generation,
+            acked_order_id: status.acked_order_id,
+            refusal: status.refusal,
+            helper_present: status.helper_present,
+            staged_protocol: status.staged_protocol,
+            staged_min_protocol: status.staged_min_protocol,
+            staged_state_schema: status.staged_state_schema,
+        }
+    }
 }
 
 /// A node's phase (`kbf_sched::NodePhase`). Serialized with its `state` as a tag.

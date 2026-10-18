@@ -311,7 +311,8 @@ async fn get_nodes_lists_each_nodes_newest_software() {
                 "container_images": [LINUX_IMAGE] },
               "needs_attention": [],
               "placement": { "state": "serving" },
-              "phase": { "state": "serving" } },
+              "phase": { "state": "serving" },
+              "update": { "availability": "unsupported" } },
             { "node_id": "mac-1", "connected": true, "software": {
                 "os_name": "macOS", "os_version": "15.1", "os_build": "24B83",
                 "kernel": "", "daemon_version": "0.1.0",
@@ -325,11 +326,13 @@ async fn get_nodes_lists_each_nodes_newest_software() {
                 "container_images": [] },
               "needs_attention": [NOT_READY],
               "placement": { "state": "serving" },
-              "phase": { "state": "serving" } },
+              "phase": { "state": "serving" },
+              "update": { "availability": "unsupported" } },
             { "node_id": "old-1", "connected": true, "software": null,
               "needs_attention": [],
               "placement": { "state": "serving" },
-              "phase": { "state": "serving" } },
+              "phase": { "state": "serving" },
+              "update": { "availability": "unsupported" } },
         ] })
     );
 

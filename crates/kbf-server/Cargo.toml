@@ -54,6 +54,8 @@ x509-parser.workspace = true
 
 [dev-dependencies]
 kbf-segments.workspace = true
+# The node's update client the offer tests hand the offers to (tests/update_offers.rs).
+kbf-update.workspace = true
 # The deterministic simulation kernel's seeded random stream (tests/sim_rollout.rs).
 kbf-sim.workspace = true
 # The in-memory state store (src/start.rs, src/frontend, src/farm/durable and tests/).
