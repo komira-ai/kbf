@@ -176,6 +176,9 @@ impl SessionTransport {
             verb: verb as i32,
             commit: release.as_str().to_owned(),
             window_s,
+            // The generation of the desired release is sent by a later change (0 is a
+            // frontend that predates the field).
+            ..UpdateOrder::default()
         };
         self.farm.send_order(host, order).map_err(failed)
     }
