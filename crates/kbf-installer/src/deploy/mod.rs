@@ -323,11 +323,7 @@ impl Run<'_> {
         // A reply with no `nodes` array, or an empty one, is a farm nobody confirmed anything
         // on: refuse it rather than let an empty list read as a pass.
         if nodes::list(&nodes).is_empty() {
-            return Err(fail(
-                Exit::Refused,
-                "no_nodes",
-                "/v1/nodes lists no node",
-            ));
+            return Err(fail(Exit::Refused, "no_nodes", "/v1/nodes lists no node"));
         }
         let mut wanted = BTreeSet::from([self.opts.host_platform.clone()]);
         let mut unknown = Vec::new();

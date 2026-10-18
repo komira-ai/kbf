@@ -1218,7 +1218,13 @@ mod cli_tests {
             .map(str::to_owned)
         };
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = cli::main_as(&common("127.0.0.1:1"), &mut &b""[..], &mut out, &mut err, false);
+        let code = cli::main_as(
+            &common("127.0.0.1:1"),
+            &mut &b""[..],
+            &mut out,
+            &mut err,
+            false,
+        );
         assert_eq!((code, out.len()), (4, 0));
         drop(held);
 
