@@ -10,7 +10,9 @@ use http::HeaderValue;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use super::kit::{CAPS, Rig, Script, WRITE, finish, grpc_ok, read_all, script, tagged, until};
+use super::kit::{
+    CAPS, Rig, Script, WRITE, finish, grpc_ok, next_of, read_all, script, tagged, until,
+};
 use crate::slot::Slot;
 
 const HOLD: Duration = Duration::from_secs(20);
@@ -60,8 +62,7 @@ async fn flip_200_streams_complete_on_a() {
 
     gate.add_permits(200);
     let mut done = 0;
-    while let Some(reply) = open.join_next().await {
-        let reply = reply.expect("a client task");
+    while let Some(reply) = next_of(&mut open).await {
         assert!(
             reply.error.is_none(),
             "no RST_STREAM and no GOAWAY: {:?}",
@@ -424,8 +425,8 @@ async fn the_pool_grows_instead_of_queueing_behind_the_childs_stream_limit() {
     until(|| rig.a.state.dispatches() == 6).await;
     assert!(rig.a.state.conns_total.load(Ordering::Acquire) >= 3);
     gate.add_permits(6);
-    while let Some(reply) = open.join_next().await {
-        assert_eq!(reply.expect("client").text(), "a");
+    while let Some(reply) = next_of(&mut open).await {
+        assert_eq!(reply.text(), "a");
     }
 }
 
@@ -454,8 +455,8 @@ async fn a_stream_beyond_the_connection_cap_waits_and_keeps_its_permit() {
     gate.add_permits(1);
     until(|| rig.a.state.dispatches() == 257).await;
     gate.add_permits(300);
-    while let Some(reply) = open.join_next().await {
-        assert_eq!(reply.expect("client").text(), "a");
+    while let Some(reply) = next_of(&mut open).await {
+        assert_eq!(reply.text(), "a");
     }
     until(|| rig.core.slots.open_permits(Slot::A) == 0).await;
 }

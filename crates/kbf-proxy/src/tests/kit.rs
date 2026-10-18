@@ -16,7 +16,7 @@ use http::{HeaderMap, HeaderValue, Request};
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::config::{Limits, UpstreamTable};
 use crate::control::{NoUpdates, UpdateHandler};
@@ -656,6 +656,14 @@ impl Rig {
     pub(super) fn shutdown(&self) {
         self.stop.send_replace(true);
     }
+}
+
+/// The next finished stream of `set`. A stream not answered within a virtual second of the
+/// clock reaching its bound fails the test at once instead of hanging it.
+pub(super) async fn next_of(set: &mut JoinSet<Reply>) -> Option<Reply> {
+    let next = tokio::time::timeout(std::time::Duration::from_secs(1), set.join_next()).await;
+    next.expect("a stream was not answered in time")
+        .map(|reply| reply.expect("a client task"))
 }
 
 /// Lets the runtime run until `done` holds: every wait is a yield, so under paused time it

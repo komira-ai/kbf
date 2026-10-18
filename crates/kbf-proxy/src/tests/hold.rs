@@ -9,7 +9,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::task::JoinSet;
 
-use super::kit::{CAPS, Reply, Rig, finish, grpc_ok, read_all, script, tagged, until};
+use super::kit::{CAPS, Reply, Rig, finish, grpc_ok, next_of, read_all, script, tagged, until};
 use crate::hold::STREAM_WINDOW_BYTES;
 use crate::slot::Slot;
 
@@ -47,8 +47,8 @@ async fn hold_1000_streams_bounded_and_expire() {
 
     tokio::time::advance(HOLD).await;
     let mut failed = 0;
-    while let Some(reply) = streams.join_next().await {
-        assert!(unavailable(&reply.expect("a client task")));
+    while let Some(reply) = next_of(&mut streams).await {
+        assert!(unavailable(&reply));
         failed += 1;
     }
     assert_eq!(failed, 1000);
@@ -85,8 +85,8 @@ async fn the_sweep_fails_each_stream_once_and_a_late_release_cannot_bind_it() {
     assert_eq!(rig.core.queue.expire(crate::core::now()), 5);
     // A release now cannot bind a stream the sweep already failed.
     rig.core.slots.release_into(Slot::A).expect("A is open");
-    while let Some(reply) = streams.join_next().await {
-        assert!(unavailable(&reply.expect("a client task")));
+    while let Some(reply) = next_of(&mut streams).await {
+        assert!(unavailable(&reply));
     }
     assert_eq!(
         rig.core.queue.expired_total(),
@@ -115,8 +115,8 @@ async fn a_release_binds_every_held_stream_into_the_slot_it_names() {
     assert_eq!(client.plain("GET", "/healthz", b"").await.text(), "ok");
     rig.core.slots.release_into(Slot::B).expect("B is open");
     drop(guard);
-    while let Some(reply) = streams.join_next().await {
-        assert_eq!(reply.expect("a client task").text(), "b");
+    while let Some(reply) = next_of(&mut streams).await {
+        assert_eq!(reply.text(), "b");
     }
     assert_eq!(rig.b.state.dispatches(), 30);
     assert_eq!(rig.a.state.dispatches(), 0);
@@ -194,8 +194,8 @@ async fn a_full_queue_refuses_at_once() {
     assert_eq!(rig.core.metrics.hold_rejected.load(Ordering::Acquire), 1);
     assert_eq!(rig.core.queue.held(), 2048);
     tokio::time::advance(HOLD).await;
-    while let Some(reply) = streams.join_next().await {
-        assert!(unavailable(&reply.expect("a client task")));
+    while let Some(reply) = next_of(&mut streams).await {
+        assert!(unavailable(&reply));
     }
     drop(guard);
 }
