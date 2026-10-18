@@ -1,7 +1,7 @@
 //! Unpacking a component's tarball: exactly one regular file, with the component's name.
 //!
 //! A release artifact is `kbf-<commit>-<platform>.tar.gz`, which holds one file named for
-//! the binary (`kbf` or `kbf-daemon`), with no directory in front of it. This is only
+//! the binary (`kbf`, or on Linux `kbf-daemon`), with no directory in front of it. This is only
 //! ever done to a tarball the attestation already accepted, and still refuses anything
 //! else: a second entry, a path (`./kbf`, `../kbf`, `bin/kbf`), a link, a directory, a
 //! device, a sparse file or an entry larger than the cap. Nothing is written until the

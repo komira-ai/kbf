@@ -8,7 +8,7 @@ updates the host pulled: both call the `kbf-installer` crate, so a host has **on
 file and one layout**, on Linux and on macOS.
 
 ```text
-/var/lib/kbf-installer/releases/<commit>/   one release: kbf (Linux) or kbf-daemon (macOS), units/
+/var/lib/kbf-installer/releases/<commit>/   one release: kbf (all a macOS release has; a Linux one may add kbf-daemon), units/
 /var/lib/kbf-installer/releases/.stage-<commit>.<rand>/   a release being installed, renamed to <commit>
 /var/lib/kbf-installer/releases/current     link to <commit>, the release that runs
 /var/lib/kbf-installer/releases/previous    link to <commit>, the one before it
@@ -40,9 +40,9 @@ directories it lacks, root-owned and 0755; a `/usr/local` that is there is not t
 `<commit>` is always the full 40-character lowercase commit id. The links sit beside the
 releases and name their release relative to themselves (`<commit>`). A release directory,
 its `units/` and its binaries are root's and 0755 (units 0644), so the user a service runs
-as cannot replace its own binary. A Linux release holds `kbf`; a macOS release holds
-`kbf-daemon`, which is what the Mac's LaunchDaemon runs
-(`/usr/local/kbf-installer/releases/current/kbf-daemon`). A release may hold both.
+as cannot replace its own binary. A macOS release holds `kbf`, which is what the Mac's LaunchDaemon runs
+(`/usr/local/kbf-installer/releases/current/kbf`); a Linux release holds `kbf` and may add
+`kbf-daemon`.
 
 **How a host is written** (the order is the crash story):
 
