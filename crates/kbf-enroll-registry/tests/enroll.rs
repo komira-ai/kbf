@@ -488,7 +488,7 @@ fn an_advertise_host_must_be_a_dns_name_or_an_address() {
     open.names = Vec::new();
     make_token(&env, 2, &open);
     for (n, good) in [
-        "10.0.0.7",
+        "203.0.113.7",
         "localhost",
         format!("{}.example", "a".repeat(63)).as_str(),
     ]
