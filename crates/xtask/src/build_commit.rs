@@ -75,6 +75,16 @@ pub fn is_commit(text: &str) -> bool {
     (12..=40).contains(&text.len()) && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// A full commit SHA (40 lowercase hex digits), or a usage error naming the flag.
+pub(crate) fn full_commit(flag: &str, commit: &str) -> Result<(), Error> {
+    if commit.len() == 40 && is_commit(commit) {
+        return Ok(());
+    }
+    Err(Error::Usage(format!(
+        "{flag} {commit:?} is not a full commit SHA (40 lowercase hex digits)"
+    )))
+}
+
 /// `check` on a `--version` line, with the comparison `names` given (the real one is
 /// [`names`]; tests pass a broken one to see the control refuse it).
 ///

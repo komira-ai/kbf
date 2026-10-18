@@ -20,6 +20,11 @@
 //!   to `gh-args` next to it, and verifies the file when `attested` next to it holds
 //!   the line `<SHA-256 of the file> <flags>`: the store of attestations, each the file
 //!   it covers and the exact flags it verifies under.
+//! - Run as `gh attestation verify <file> --bundle <bundle> [--custom-trusted-root
+//!   <root>] <flags>`, it verifies the file when the JSON object in `<bundle>` lists, in
+//!   `fakeAttestations`, the line `<SHA-256 of the file> <flags>` (the flags without the
+//!   two that name files). It appends one line to `gh-env` next to it: the proxy and
+//!   no-proxy variables it ran under (`NAME=value`, empty when unset).
 //! - Run as `gh api <path>`, it prints the value under the key `<path>` of the JSON
 //!   object in `gh-api.json` next to it, or `gh: Not Found (HTTP 404)` on stderr and
 //!   exits 1 when there is none: the GitHub API, as a test wrote it.
@@ -45,7 +50,9 @@
 //! fails), `vanish` (the build stamped `b2b2b2b2b2b2` deletes the fake cargo, so the
 //! next build cannot start) or `version-fails` (`kbf-server` exits 1). Of the
 //! attestation store: `accepts-all` (every file verifies, whatever the flags) or
-//! `ignores-bytes` (a file verifies when any attestation has its flags). Of the API:
+//! `ignores-bytes` (a file verifies when any attestation has its flags). Of a bundle:
+//! `bundle-any-file` (a bundle verifies any file whose flags it lists) or
+//! `bundle-any-commit` (`--source-digest` is not compared). Of the API:
 //! `api-fails` (every `gh api` exits 1 with an HTTP 502) or `api-garbage` (every `gh
 //! api` prints something that is not JSON). Of releases: `release-fails` (every `gh
 //! release` command exits 1). Of sudo:
@@ -164,6 +171,9 @@ fn gh(argv0: &str, args: &[String]) -> ExitCode {
         .filter(|_| args[..2] == ["attestation", "verify"])
         .expect("gh attestation verify <file> ...");
     let sha256 = hex::encode(sha2::Sha256::digest(std::fs::read(file).expect("the file")));
+    if let Some(at) = args.iter().position(|a| a == "--bundle") {
+        return verify_bundle(dir, &sha256, file, &args[at + 1], &args[3..]);
+    }
     let flags = args[3..].join(" ");
     let store = std::fs::read_to_string(dir.join("attested")).unwrap_or_default();
     let by_bytes = !defect("ignores-bytes");
@@ -175,6 +185,99 @@ fn gh(argv0: &str, args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     eprintln!("xtask-fake: no attestation of {file} verifies with {flags}");
+    ExitCode::FAILURE
+}
+
+/// `flags` as one string, without the pair `--source-digest <commit>`.
+fn without_source_digest(flags: &[&str]) -> String {
+    let mut kept = Vec::new();
+    let mut words = flags.iter();
+    while let Some(word) = words.next() {
+        if *word == "--source-digest" {
+            words.next();
+        } else {
+            kept.push(*word);
+        }
+    }
+    kept.join(" ")
+}
+
+/// `gh attestation verify <file> --bundle <bundle> [--custom-trusted-root <root>]
+/// <flags>`: the verification a host makes with the bundle it was given. The bundle is
+/// a JSON object whose `fakeAttestations` list holds the lines `<SHA-256 of the file it
+/// covers> <flags it verifies under>`, as the file `attested` does for the attestations
+/// GitHub stores. The proxy the call ran under is appended to `gh-env`, so a test sees
+/// whether the verification was made with no way to reach the network.
+fn verify_bundle(dir: &Path, sha256: &str, file: &str, bundle: &str, rest: &[String]) -> ExitCode {
+    let mut env_log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("gh-env"))
+        .expect("gh-env");
+    // Every variable a Go program reads to choose a proxy or to bypass one, empty when
+    // unset (the program treats the two alike).
+    let seen: Vec<String> = [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ]
+    .iter()
+    .map(|name| format!("{name}={}", std::env::var(name).unwrap_or_default()))
+    .collect();
+    writeln!(env_log, "{}", seen.join(" ")).expect("gh-env");
+    // The flags, without the two that name files.
+    let mut flags: Vec<&str> = Vec::new();
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        if matches!(word.as_str(), "--bundle" | "--custom-trusted-root") {
+            words.next();
+        } else {
+            flags.push(word);
+        }
+    }
+    let Ok(text) = std::fs::read_to_string(bundle) else {
+        eprintln!("xtask-fake: no bundle at {bundle}");
+        return ExitCode::FAILURE;
+    };
+    let attestations: Vec<String> = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| {
+            v["fakeAttestations"].as_array().map(|list| {
+                list.iter()
+                    .filter_map(|l| l.as_str().map(str::to_owned))
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    let by_commit = !defect("bundle-any-commit");
+    let by_bytes = !defect("bundle-any-file");
+    let wanted = if by_commit {
+        flags.join(" ")
+    } else {
+        without_source_digest(&flags)
+    };
+    let verified = attestations.iter().any(|line| {
+        line.split_once(' ').is_some_and(|(sha, f)| {
+            let f = if by_commit {
+                f.to_owned()
+            } else {
+                without_source_digest(&f.split(' ').collect::<Vec<_>>())
+            };
+            ((sha == sha256) | !by_bytes) & (f == wanted)
+        })
+    });
+    if verified | defect("accepts-all") {
+        return ExitCode::SUCCESS;
+    }
+    eprintln!(
+        "xtask-fake: bundle {bundle} does not verify {file} with {}",
+        flags.join(" ")
+    );
     ExitCode::FAILURE
 }
 

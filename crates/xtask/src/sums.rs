@@ -11,18 +11,28 @@
 //!   byte that file (the published one); `--summary` appends the result to a file (the
 //!   job summary).
 //! - `verify-assets sums <dir>` ([`verify_sums`]): `<dir>/SHA256SUMS` lists every other
-//!   file in `<dir>`, each once, and each matches its line. Control: a copy of the
-//!   first tarball with its last byte flipped must not match that line, so a check that
-//!   accepts anything fails instead of passing.
-//! - `verify-assets attestations <dir> --repo <owner/repo> --workflow-ref <ref>
-//!   [--source-ref refs/heads/<branch>] [--gh <program>]` ([`verify_attestations`]):
-//!   every listed tarball and SBOM has build provenance signed by the workflow
-//!   `--workflow-ref` names, for the branch `--source-ref` names (default
-//!   `refs/heads/main`; a value that is not `refs/heads/<branch>` is a usage error),
-//!   on a GitHub-hosted runner, and every tarball has an SBOM attestation from the same
-//!   workflow: the `gh attestation verify` commands docs/artifacts.md gives. Controls:
-//!   the first tarball must not verify as signed by `ci.yml`, and the flipped copy must
-//!   not verify.
+//!   file in `<dir>` (but the provenance bundles, which are made after the sums and so
+//!   cannot be listed: [`crate::bundles`]), each once, and each matches its line.
+//!   Control: a copy of the first tarball with its last byte flipped must not match
+//!   that line, so a check that accepts anything fails instead of passing.
+//! - `verify-assets attestations <dir> --repo <owner/repo> --workflow-ref <ref> --commit
+//!   <sha> [--source-ref refs/heads/<branch>] [--trusted-root <file>] [--gh <program>]`
+//!   ([`verify_attestations`]): every listed tarball and SBOM has build provenance
+//!   signed by the workflow `--workflow-ref` names, for the branch `--source-ref` names
+//!   (default `refs/heads/main`; a value that is not `refs/heads/<branch>` is a usage
+//!   error), on a GitHub-hosted runner, and every tarball has an SBOM attestation from
+//!   the same workflow: the `gh attestation verify` commands docs/artifacts.md gives.
+//!   First, before `gh` is run, `<dir>` holds exactly one bundle per listed tarball and
+//!   no other, each the bundle of that tarball ([`bundles::pairing`]). Every tarball
+//!   also verifies against its own bundle, as a host's installer does it (`--bundle`,
+//!   with `--cert-oidc-issuer`, `--source-digest <sha>`, `--predicate-type` and the
+//!   flags above); with `--trusted-root` (`gh attestation trusted-root`) that check
+//!   runs under a proxy nothing listens on and with no bypass list (`NO_PROXY` removed),
+//!   so it cannot have used the network.
+//!   Controls: the first tarball must not verify as signed by `ci.yml`, the flipped
+//!   copy must not verify, the second tarball's bundle must not verify the first (a
+//!   bundle is one tarball's own), the first's bundle must not verify for another
+//!   commit, and the flipped copy must not verify against its bundle.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -30,6 +40,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::Error;
+use crate::build_commit::full_commit;
+use crate::bundles;
 use crate::fetch::Sha256;
 use crate::package::{Platform, read, write_new};
 
@@ -103,7 +115,7 @@ pub fn duplicates(lines: &[Line]) -> Vec<&str> {
 }
 
 /// The names of the regular files in `dir`, sorted.
-fn files_in(dir: &Path) -> Result<Vec<String>, Error> {
+pub(crate) fn files_in(dir: &Path) -> Result<Vec<String>, Error> {
     let listing = || format!("list {}", dir.display());
     let mut names = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(Error::spawn(listing()))? {
@@ -221,7 +233,12 @@ pub fn verify_sums(dir: &Path, digest: fn(&[u8]) -> Sha256) -> Result<String, Er
         .iter()
         .map(|n| format!("listed twice: {n}"))
         .collect();
-    let present: Vec<String> = files_in(dir)?.into_iter().filter(|n| n != SUMS).collect();
+    // A bundle is made after the sums (the attestation signs their files), so the sums
+    // cannot list it; `release check` holds the bundles to one per tarball.
+    let present: Vec<String> = files_in(dir)?
+        .into_iter()
+        .filter(|n| n != SUMS && !bundles::is_bundle(n))
+        .collect();
     for l in &lines {
         if !present.contains(&l.name) {
             problems.push(format!("listed, but not in {}: {}", dir.display(), l.name));
@@ -261,6 +278,13 @@ pub struct Attestations<'a> {
     /// attestation names it. A deployment of what a push to `main` built passes
     /// `refs/heads/main`.
     pub source_ref: &'a str,
+    /// The commit the files were built from, a full SHA (on Actions, `GITHUB_SHA`):
+    /// each tarball's bundle must attest this commit (`--source-digest`).
+    pub commit: &'a str,
+    /// A `trusted_root.jsonl` (`gh attestation trusted-root`) to verify the bundles
+    /// with. With it the verification runs under a proxy nothing listens on, as a
+    /// host's does; without it `gh` fetches the root itself.
+    pub trusted_root: Option<&'a Path>,
     /// The `gh` program.
     pub gh: &'a Path,
     /// An empty directory for the flipped copy.
@@ -300,6 +324,122 @@ impl Attestations<'_> {
             file.display()
         )))
     }
+
+    /// Runs `gh attestation verify` on `file` against `bundle` for `commit`, with the
+    /// flags a host's installer passes, in its order:
+    ///
+    /// ```text
+    /// attestation verify <file> --bundle <bundle> [--custom-trusted-root <root>]
+    ///   --repo R --signer-workflow S --cert-oidc-issuer I --source-ref REF
+    ///   --source-digest <commit> --predicate-type P --deny-self-hosted-runners
+    /// ```
+    ///
+    /// Returns whether it accepted the file, and what it printed on stderr. With a
+    /// trusted root, the proxies point at nothing, so an acceptance used no network.
+    /// An error when `gh` cannot be run.
+    fn bundle_run(
+        &self,
+        file: &Path,
+        bundle: &Path,
+        signer: &str,
+        commit: &str,
+    ) -> Result<(bool, String), Error> {
+        let mut gh = Command::new(self.gh);
+        gh.args(["attestation", "verify"])
+            .arg(file)
+            .arg("--bundle")
+            .arg(bundle);
+        if let Some(root) = self.trusted_root {
+            gh.arg("--custom-trusted-root").arg(root);
+            // Both spellings of each variable (a Go program reads the upper case first),
+            // and the bypass lists gone: a `NO_PROXY` the runner's environment holds
+            // would let the call past the proxy to the network.
+            for proxy in [
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ] {
+                gh.env(proxy, bundles::DEAD_PROXY);
+            }
+            gh.env_remove("NO_PROXY").env_remove("no_proxy");
+            gh.env("GH_NO_UPDATE_NOTIFIER", "1");
+        }
+        gh.args(["--repo", self.repo, "--signer-workflow", signer])
+            .args(["--cert-oidc-issuer", bundles::ISSUER])
+            .args(["--source-ref", self.source_ref])
+            .args(["--source-digest", commit])
+            .args(["--predicate-type", bundles::PROVENANCE])
+            .arg("--deny-self-hosted-runners");
+        let out = gh
+            .output()
+            .map_err(Error::spawn(self.gh.display().to_string()))?;
+        let said = String::from_utf8_lossy(&out.stderr).trim_end().to_owned();
+        Ok((out.status.success(), said))
+    }
+
+    /// `bundle_run` on the tarball `name` of `dir` and its own bundle (which
+    /// [`bundles::pairing`] has found there), as a requirement: the error names the
+    /// tarball and its bundle, and holds what `gh` said (the tail of it: the reason is
+    /// last).
+    fn require_bundle(&self, dir: &Path, name: &str, signer: &str) -> Result<(), Error> {
+        let bundle_name = bundles::name_of(name);
+        let bundle = dir.join(&bundle_name);
+        let file = dir.join(name);
+        let (verified, said) = self.bundle_run(&file, &bundle, signer, self.commit)?;
+        if verified {
+            return Ok(());
+        }
+        let tail = said
+            .char_indices()
+            .rev()
+            .nth(999)
+            .map_or(said.as_str(), |(at, _)| &said[at..]);
+        Err(Error::Failed(format!(
+            "{}: its bundle {bundle_name} does not verify: {tail}",
+            file.display()
+        )))
+    }
+
+    /// The controls on the bundle check, each a verification that must be refused:
+    /// the tarball `first` against the bundle of the tarball `second` (when there is
+    /// one: a bundle is one tarball's own), against its own for another commit, and
+    /// the copy `flipped` of it (one byte changed) against its own.
+    fn bundle_controls(
+        &self,
+        dir: &Path,
+        first: &str,
+        second: Option<&str>,
+        flipped: &Path,
+        signer: &str,
+    ) -> Result<(), Error> {
+        let file = dir.join(first);
+        let own = dir.join(bundles::name_of(first));
+        if let Some(second) = second {
+            let theirs = dir.join(bundles::name_of(second));
+            if self.bundle_run(&file, &theirs, signer, self.commit)?.0 {
+                return Err(Error::Failed(format!(
+                    "control failed: the bundle of {second} verified {first}: a bundle is to \
+                     attest its own tarball only"
+                )));
+            }
+        }
+        let other = bundles::other_commit(self.commit);
+        if self.bundle_run(&file, &own, signer, &other)?.0 {
+            return Err(Error::Failed(format!(
+                "control failed: the bundle of {first} verified for commit {other}, not the \
+                 commit it attests"
+            )));
+        }
+        if self.bundle_run(flipped, &own, signer, self.commit)?.0 {
+            return Err(Error::Failed(format!(
+                "control failed: a flipped byte in {first} still verified against its bundle"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// The `verify-assets attestations` verb: the lines to print.
@@ -324,14 +464,23 @@ pub fn verify_attestations(dir: &Path, a: &Attestations) -> Result<Vec<String>, 
             a.workflow_ref, a.repo
         )));
     }
+    full_commit("--commit", a.commit)?;
     let lines = read_sums(&dir.join(SUMS))?;
+    // One bundle per tarball and no other, each its tarball's: found here, before any
+    // call to gh, as `release check` finds it (a stray bundle is otherwise a failure of
+    // the release alone).
+    let unpaired = bundles::pairing(dir, &lines)?;
+    if !unpaired.is_empty() {
+        return Err(Error::Refused(unpaired));
+    }
     let mut printed = Vec::new();
     for l in &lines {
         let file = dir.join(&l.name);
         if l.name.ends_with(".tar.gz") {
             a.require(&file, workflow, None)?;
             a.require(&file, workflow, Some(SBOM_PREDICATE))?;
-            printed.push(format!("verified: {} (provenance, SBOM)", l.name));
+            a.require_bundle(dir, &l.name, workflow)?;
+            printed.push(format!("verified: {} (provenance, SBOM, bundle)", l.name));
         } else if l.name.ends_with(".cdx.json") {
             a.require(&file, workflow, None)?;
             printed.push(format!("verified: {} (provenance)", l.name));
@@ -358,8 +507,15 @@ pub fn verify_attestations(dir: &Path, a: &Attestations) -> Result<Vec<String>, 
             first.name
         )));
     }
+    let second = lines
+        .iter()
+        .filter(|l| l.name.ends_with(".tar.gz"))
+        .nth(1)
+        .map(|l| l.name.as_str());
+    a.bundle_controls(dir, &first.name, second, &flipped_path, workflow)?;
     printed.push(
-        "attestations: every asset verifies; another signer workflow and a flipped byte do not"
+        "attestations: every asset verifies; another signer workflow, another tarball's \
+         bundle, another commit and a flipped byte do not"
             .to_owned(),
     );
     Ok(printed)

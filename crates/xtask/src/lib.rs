@@ -19,6 +19,11 @@
 //! - `sums assemble <dir>` and `verify-assets {sums,attestations} <dir>` ([`sums`]): the
 //!   one `SHA256SUMS` over every platform's assets, and the checks the attest job and
 //!   a deployment make of it, each with a control that must fail.
+//! - Each tarball's provenance bundle, `<tarball>.sigstore.json` ([`bundles`]): the
+//!   attestation a host verifies the tarball with offline. `verify-assets
+//!   attestations` and `release check` hold a directory to one bundle per tarball,
+//!   each that tarball's (its one subject is the tarball's digest); `verify-assets
+//!   attestations` also has `gh` verify each tarball against its bundle.
 //! - `release {locate,main-control,check,publish}` ([`release`]): a GitHub release of
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
@@ -41,6 +46,7 @@ use clap::{Parser, Subcommand};
 
 pub mod budget;
 pub mod build_commit;
+pub mod bundles;
 pub mod darwin;
 pub mod entitlements;
 pub mod fetch;
@@ -213,9 +219,11 @@ enum Sums {
 
 #[derive(Subcommand)]
 enum VerifyAssets {
-    /// `<dir>/SHA256SUMS` lists every other file in `<dir>` once, and each matches.
+    /// `<dir>/SHA256SUMS` lists every other file in `<dir>` once, and each matches
+    /// (a provenance bundle is not listed: it is made after the sums).
     Sums { dir: PathBuf },
-    /// Every asset `<dir>/SHA256SUMS` lists has the attestations a deployment checks.
+    /// Every asset `<dir>/SHA256SUMS` lists has the attestations a deployment checks,
+    /// and every tarball verifies against its own bundle as a host does.
     Attestations {
         dir: PathBuf,
         /// The repository, `<owner>/<repo>` (on Actions, `GITHUB_REPOSITORY`).
@@ -229,6 +237,14 @@ enum VerifyAssets {
         /// `GITHUB_REF`). The default is main's: a release verifies as main.
         #[arg(long, default_value = "refs/heads/main")]
         source_ref: String,
+        /// The commit the files were built from, a full SHA (on Actions, `GITHUB_SHA`;
+        /// a release passes the tag's commit): each tarball's bundle must attest it.
+        #[arg(long)]
+        commit: String,
+        /// A `trusted_root.jsonl` from `gh attestation trusted-root`. With it the bundles
+        /// are verified with no network, as a host's installer does.
+        #[arg(long)]
+        trusted_root: Option<PathBuf>,
         /// The `gh` program.
         #[arg(long, default_value = "gh")]
         gh: PathBuf,
@@ -268,7 +284,8 @@ enum ReleaseVerb {
         #[arg(long, default_value = "gh")]
         gh: PathBuf,
     },
-    /// `<dir>` passes `verify-assets sums` and lists only assets of `--commit`.
+    /// `<dir>` passes `verify-assets sums`, lists only assets of `--commit`, and holds
+    /// exactly one provenance bundle (`<tarball>.sigstore.json`) per tarball.
     Check {
         dir: PathBuf,
         /// The commit the assets were built from, a full SHA.
@@ -495,6 +512,8 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             repo,
             workflow_ref,
             source_ref,
+            commit,
+            trusted_root,
             gh,
         }) => {
             // The flipped copy's directory, of this process alone.
@@ -505,6 +524,8 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 repo: &repo,
                 workflow_ref: &workflow_ref,
                 source_ref: &source_ref,
+                commit: &commit,
+                trusted_root: trusted_root.as_deref(),
                 gh: &gh,
                 scratch: &scratch,
             };
