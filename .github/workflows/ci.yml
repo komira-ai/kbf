@@ -393,15 +393,29 @@ jobs:
       - name: Run the workspace tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: |
-          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --workspace --locked --branch --no-report
-          # The tests that need the server, as the state-postgres job runs them; their
-          # counters join the workspace run's in the report below.
-          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-state --features postgres -- --include-ignored
-          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-server --test state_store_postgres -- --include-ignored
-          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-server --test state_store -- --include-ignored over_postgres
-          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-cli --test frontend_process -- --include-ignored postgres_state_store
-          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov report --branch --lcov --output-path target/coverage/lcov.info
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --workspace --locked --branch --no-report
+      # The tests that need the server, as the state-postgres job runs them; their
+      # counters join the workspace run's in the report below.
+      - name: Run the Postgres tests of kbf-state under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-state --features postgres -- --include-ignored
+      - name: Run the server's Postgres tests under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-server --test state_store_postgres -- --include-ignored
+      - name: Run the server's restart tests over Postgres under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-server --test state_store -- --include-ignored over_postgres
+      - name: Run the frontend process test over Postgres under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-cli --test frontend_process -- --include-ignored postgres_state_store
+      - name: Report
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov report --branch --lcov --output-path target/coverage/lcov.info
       # When every failure is coverage that improved, the step prints (and puts in the
       # job summary) the `kbf-coverage tighten` command that downloads this run's
       # `coverage` artifact and lowers coverage-baseline; --artifact must name the
