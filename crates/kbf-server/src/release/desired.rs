@@ -167,11 +167,11 @@ async fn view(State(update): State<Arc<Update>>) -> Response {
     };
     // Without a policy row nothing is paused (the defaults).
     let paused = policy.as_ref().is_some_and(|p| p.paused);
-    let frontend = match super::frontend_update::section(frontend_rows, update.installer.clone()).await
-    {
-        Ok(section) => section,
-        Err(e) => return row_failed(&e),
-    };
+    let frontend =
+        match super::frontend_update::section(frontend_rows, update.installer.clone()).await {
+            Ok(section) => section,
+            Err(e) => return row_failed(&e),
+        };
     let releases = match store.list().await {
         Ok(listing) => super::http::listing_view(&listing),
         Err(e) => {
