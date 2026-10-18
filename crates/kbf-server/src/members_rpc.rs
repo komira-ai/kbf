@@ -33,6 +33,7 @@ use tonic::{Request, Response, Status};
 
 use crate::identity::{DenyList, PeerCert};
 use crate::members::{Members, MembershipError, Progress, Registrant};
+use crate::storage_health::Debts;
 
 /// The service over `members`, admitting callers as `admission` says.
 pub struct MembershipService {
@@ -192,6 +193,7 @@ impl Membership for MembershipService {
         let id = kbf_map::MemberId(req.member_id);
         let have = req.have_generation;
         let progress = Progress::from_wire(req.catching_up);
+        let debts = Debts::from_wire(req.debts_known, req.repair_debts);
         let (map_generation, map) = blocking(move || {
             // In plain text there are no names, and any caller holds any member.
             let holds = |addr: &str| {
@@ -199,7 +201,7 @@ impl Membership for MembershipService {
                     .as_ref()
                     .is_none_or(|names| names.covers(host_of(addr)))
             };
-            let generation = members.heartbeat(id, req.boot, progress, Some(&holds))?;
+            let generation = members.heartbeat(id, req.boot, progress, debts, Some(&holds))?;
             // Read only for a node that is behind: most beats carry no map.
             let newer = if generation > have {
                 members.current_map()?.filter(|map| map.generation() > have)
