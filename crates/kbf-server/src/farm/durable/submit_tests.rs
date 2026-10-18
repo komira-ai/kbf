@@ -649,3 +649,48 @@ fn a_submit_takes_three_conflicts_and_is_refused_at_the_fourth() {
         assert_eq!(rows(&store, "op/"), landed as usize + usize::from(taken));
     }
 }
+
+/// Catches: a request that joins an operation the scheduler finished while the store still
+/// holds its rows (the finish is held back): it would take the finished operation up
+/// again and run the action twice. The scheduler finishes the queued operation (a
+/// committed refusal, no store write), the rows stay, and the request is refused
+/// UNAVAILABLE with nothing queued and no waiter attached. Once the rows go it queues a
+/// fresh operation. This runs in the crate's own test binary, which also covers the rest
+/// of `queue`, so that function's lines are all covered by one copy of it.
+#[test]
+fn a_request_for_an_operation_the_scheduler_finished_is_refused_until_the_rows_go() {
+    let store = LostAck::new();
+    let farm = farm_over(&store);
+    assert!(submit(&farm, 1).is_ok());
+    let refusal = kbf_types::ControlRecord::Refusal(kbf_types::RefusalRecord {
+        operation: OperationId(0),
+        reason: "no worker".to_owned(),
+    });
+    let input = kbf_sched::Input::new(
+        kbf_types::FarmTime::from_millis(0),
+        kbf_sched::Event::Committed(refusal),
+    );
+    let effects = kbf_types::StateMachine::apply(&mut farm.lock().sched, input);
+    assert_eq!(effects.len(), 1, "the refusal was not taken");
+    assert!(unfinished(&farm).is_empty());
+    assert_eq!((rows(&store, "op/"), rows(&store, "inflight/")), (1, 1));
+
+    let refused = submit(&farm, 1);
+
+    assert_eq!(refused.map(|_| ()).unwrap_err().code(), Code::Unavailable);
+    assert!(
+        unfinished(&farm).is_empty(),
+        "the finished operation came back"
+    );
+    let waiters = farm.lock().sched.waiters(OperationId(0)).map(<[_]>::len);
+    assert_eq!(waiters, Some(1), "a waiter joined a finished operation");
+    assert_eq!(rows(&store, "op/"), 1);
+
+    let gone = Txn::new()
+        .delete("op/0000000000000000", Cond::Any)
+        .delete("queue/0000000000000000", Cond::Any)
+        .delete("subject/0000000000000000", Cond::Any);
+    store.txn(gone).expect("store").expect("delete");
+    assert!(submit(&farm, 1).is_ok(), "the retry after the rows went");
+    assert_eq!(unfinished(&farm), [OperationId(1)]);
+}
