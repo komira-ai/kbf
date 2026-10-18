@@ -446,3 +446,16 @@ fn replace_file_stops_on_a_leftover_it_cannot_remove() {
     assert!(error.to_string().contains(".out.new"), "{error}");
     assert_eq!(fs::read(root.join("d/out")).expect("kept"), b"old");
 }
+
+/// Catches a removal that takes a name with a NUL in it for another name: the name cannot
+/// be passed to the system at all, and that is an error, not a removal of what comes
+/// before the NUL.
+#[test]
+fn a_name_with_a_nul_is_not_removed() {
+    let root = scratch("remove-nul");
+    put(&root.join("d/a"), b"x", 0o644);
+    let d = open(&root.join("d"));
+    let error = remove_tree(&d, "a\0b").expect_err("no such name");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(root.join("d/a").exists());
+}

@@ -318,10 +318,8 @@ impl Rig {
                     out.insert(name, "dir".to_owned());
                     walk(base, &path, out);
                 } else {
-                    out.insert(
-                        name,
-                        fs::read_to_string(&path).unwrap_or_else(|_| "<binary>".to_owned()),
-                    );
+                    let bytes = fs::read(&path).unwrap_or_default();
+                    out.insert(name, String::from_utf8_lossy(&bytes).into_owned());
                 }
             }
         }
@@ -332,10 +330,7 @@ impl Rig {
     }
 
     pub fn json(&self, path: &Path) -> serde_json::Value {
-        serde_json::from_slice(
-            &fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
-        )
-        .expect("json")
+        serde_json::from_slice(&fs::read(path).expect("a file")).expect("json")
     }
 }
 

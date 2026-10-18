@@ -127,3 +127,19 @@ fn refusals_exit_with_the_contract_codes() {
     assert!(!root.join("var/lib/kbf-installer").exists());
     assert!(!root.join("var/lib/kbf-deploy/MIGRATED").exists());
 }
+
+/// Catches a `--root` that is not a path from `/` being accepted: it is exit 1 with the
+/// reason, before any host is read.
+#[test]
+fn a_root_that_is_not_absolute_is_a_failure() {
+    let out = Command::new(BIN)
+        .args(["--root", "relative/path", "migrate", "--fetch-user", &me()])
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).starts_with("kbf-installer: "),
+        "{}",
+        text(&out.stderr)
+    );
+}

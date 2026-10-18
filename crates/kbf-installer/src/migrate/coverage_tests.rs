@@ -267,3 +267,17 @@ fn the_rigs_snapshot_of_a_missing_directory_is_empty() {
     let rig = Rig::linux("rig-snapshot");
     assert!(rig.snapshot("no/such/directory").is_empty());
 }
+
+/// Catches a host with a state file and no helper memory being refused: a host whose helper
+/// never ran has no `helper.json`, and its replay memory is the empty one (the floor then
+/// comes from the flag alone).
+#[test]
+fn a_host_whose_helper_never_ran_has_the_empty_memory() {
+    let mut rig = Rig::linux("no-memory");
+    fs::remove_file(rig.at("var/lib/kbf-deploy/helper.json")).expect("rm");
+    let report = run_migrate(&mut rig, &never(), Mode::Apply).expect("migrates");
+    assert_eq!(report.outcome, Outcome::Migrated);
+    let state = rig.json(&rig.new_state_dir().join("state.json"));
+    assert_eq!(state["floor"]["order_id"], 0);
+    assert_eq!(state["floor"]["generation"], 17);
+}
