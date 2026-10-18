@@ -64,13 +64,23 @@ kbf-mac-provision revert                                # root: put back the rec
   erase or a restore is the remedy for macOS and for simulator runtimes; FileVault and
   the administrator are the operator's.
 - The node label is `profile=<profile>@<first 12 hex digits of the profile's SHA-256>`,
-  passed to `kbf-daemon` as a `--label`.
+  passed to `kbf node` as a `--label`.
 - `--keys` limits `check` and `apply` to the named items. `--root DIR` runs everything
   under DIR; only the tests use it.
-- `kbf_data_dir` is kbf-daemon's `--data-dir` (it keeps `leases/`, `cache/` and `trees/`
+- The job runs `/usr/local/kbf/current/kbf node --config /usr/local/etc/kbf/kbf.toml`
+  with the node label and the profile's labels. `kbf node` enrolls with the frontend that
+  file names and runs the daemon with the certificates the frontend issued, so the
+  profile's `kbf_server`, `kbf_cas`, `kbf_ca_cert`, `kbf_cert` and `kbf_key` are not
+  arguments of the job any more (the profile still requires them, and `kbf_key` is still
+  the file the `daemon_user=root` check reads, until a later change retires them), and
+  neither is the node id. The operator writes `kbf.toml` and delivers the token; this tool
+  writes neither.
+- `kbf_data_dir` is the daemon's data directory (it keeps `leases/`, `cache/` and `trees/`
   under it; the profile has no size key, so the daemon sizes the directory from the
-  filesystem). The old name `kbf_scratch` is still accepted, as `kbf_data_dir`, with one
-  warning line on stderr; a profile that sets both keys is refused.
+  filesystem). This tool checks the directory; the daemon is given it by `kbf.toml`'s
+  `[daemon] data_dir`, which must say the same. The old name `kbf_scratch` is still
+  accepted, as `kbf_data_dir`, with one warning line on stderr; a profile that sets both
+  keys is refused.
 - An example profile, with placeholder values, is [example.profile](example.profile).
 
 ## Items
@@ -98,7 +108,7 @@ letters and `_` only.
 | `default_developer_dir` | a pinned Xcode's path | `xcode-select -p` | `xcode-select -s` |
 | `probe` (`expect_probe`) | `KEY:/PATH:SHA256`; `KEY:XCODE_BUILD=VALUE` | each probe script's SHA-256 | check only. `expect_probe` lines are validated (a known probe, a pinned Xcode, once each) and printed |
 | `simulator_runtimes` | none | `/Library/Developer/CoreSimulator`: `Images/*.dmg`, `Profiles/Runtimes/*.simruntime`, `Volumes/*` | check only: runtimes live in VM images |
-| `launchd_label` (`kbf_server`, `kbf_cas`, `kbf_ca_cert`, `kbf_cert`, `kbf_key`, `kbf_data_dir`, `kbf_labels`, `hostname`, `role_user`) | label | `/Library/LaunchDaemons/<label>.plist` equals the one the profile renders (section 5.3: `UserName`/`GroupName` the role account, `ProcessType` `Interactive`, `ExitTimeOut` 30, the daemon's flags), root-owned, mode 644; `/Library/Logs/kbf` root's, mode 755; the error log in it a regular file with one link, the role account's, mode 644; the job loaded | makes the directory root's, replaces anything else at the error log's path (unlinked, never followed) with a new file of the role account, writes the plist, then restarts the job: `launchctl bootout`, the error log truncated while it is stopped, `launchctl bootstrap`. `restart` refuses, before it stops anything, when the error log is not such a file, so a link the role account plants is never emptied as root |
+| `launchd_label` (`kbf_labels`, `role_user`, and the profile's own SHA-256 in the node label) | label | `/Library/LaunchDaemons/<label>.plist` equals the one the profile renders (section 5.3: `UserName`/`GroupName` the role account, `ProcessType` `Interactive`, `ExitTimeOut` 30, `kbf node --config` and the labels), root-owned, mode 644; `/Library/Logs/kbf` root's, mode 755; the error log in it a regular file with one link, the role account's, mode 644; the job loaded | makes the directory root's, replaces anything else at the error log's path (unlinked, never followed) with a new file of the role account, writes the plist, then restarts the job: `launchctl bootout`, the error log truncated while it is stopped, `launchctl bootstrap`. `restart` refuses, before it stops anything, when the error log is not such a file, so a link the role account plants is never emptied as root |
 
 ## Tests
 
