@@ -3,9 +3,8 @@
 //!
 //! - `kbf daemon`: the build node. Takes exactly the flags `kbf-daemon` takes
 //!   ([`kbf_node::Cli`]) and refuses, by name, every flag of another mode.
-//! - `kbf all-in-one`: the server and the daemon in one process, as `kbf-all-in-one`
-//!   runs them today. Takes exactly the flags `kbf-all-in-one` takes
-//!   ([`kbf_all_in_one::cli`]).
+//! - `kbf all-in-one`: the server and the daemon in one process. Takes the flags of
+//!   both `kbf-server` and `kbf-daemon` ([`kbf_all_in_one::cli`]).
 //! - `kbf storage`: the storage node ([`kbf_server::storage_node`]). Takes
 //!   `kbf-server`'s store, write and log flags and its own listener flags, and refuses
 //!   every other flag of `kbf-server` (and so any state-store flag: a storage node
@@ -28,7 +27,7 @@
 //! one mode is refused by the others with no edit here.
 //!
 //! `kbf --version` prints `kbf <package version>+<commit>`: the commit stamp is
-//! `kbf-server`'s ([`kbf_server::SERVER_VERSION`]), which `kbf-all-in-one` links
+//! `kbf-server`'s ([`kbf_server::SERVER_VERSION`]), which `kbf all-in-one` links
 //! anyway, so the artifacts workflow can check `kbf` as it checks `kbf-server`.
 //!
 //! `kbf --version --json` ([`version`]) prints one JSON object on one line naming the
@@ -67,7 +66,7 @@
 //! [`names::MODES`]; `kbf check-args node ...` and `kbf check-args enroll ...` accept
 //! their flags.
 //!
-//! The `kbf-server`, `kbf-daemon` and `kbf-all-in-one` binaries are unchanged.
+//! The `kbf-server` and `kbf-daemon` binaries are unchanged.
 
 pub mod cluster;
 pub mod config;

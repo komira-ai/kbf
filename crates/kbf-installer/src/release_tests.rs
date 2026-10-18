@@ -578,6 +578,20 @@ fn every_verb_refuses_while_a_deploy_is_pending() {
     }
 }
 
+/// Catches a unit name that is not UTF-8 being used (it could not be named in a plan
+/// line): the check refuses it, whatever the filesystem can hold.
+#[test]
+fn a_name_that_is_not_utf8_is_refused() {
+    let full = Path::new("/src/units").join(OsStr::from_bytes(b"bad\xff.service"));
+    let name = full.file_name().expect("a name");
+    let err = utf8(name, &full).expect_err("not utf-8");
+    assert_eq!(err.to_string(), format!("{full:?} is not a UTF-8 name"));
+    assert_eq!(
+        utf8(OsStr::new("a.service"), &full).expect("utf-8"),
+        "a.service"
+    );
+}
+
 /// Catches errors passed over or misnamed: a source without `kbf`, with `units` a file,
 /// with a unit whose name is not UTF-8 (it could not be named in a plan line), a state
 /// file that cannot be parsed, a `current` that is a directory, and a layout directory
@@ -598,14 +612,18 @@ fn errors_name_what_is_wrong() {
         "cannot read {}",
         units_file.join("units").display()
     )));
-    let odd = source("errors-odd", "A", Some(&[]));
-    let name = OsStr::from_bytes(b"bad\xff.service");
-    fs::write(odd.join("units").join(name), "x").expect("seed");
-    let err = install_on(&mut exec, &root, A, &odd, Mode::DryRun).expect_err("not utf-8");
-    assert_eq!(
-        err.to_string(),
-        format!("{:?} is not a UTF-8 name", odd.join("units").join(name))
-    );
+    // APFS refuses to create a name that is not UTF-8 (EILSEQ), so only Linux can seed one;
+    // `a_name_that_is_not_utf8_is_refused` pins the check itself on every platform.
+    if cfg!(target_os = "linux") {
+        let odd = source("errors-odd", "A", Some(&[]));
+        let name = OsStr::from_bytes(b"bad\xff.service");
+        fs::write(odd.join("units").join(name), "x").expect("seed");
+        let err = install_on(&mut exec, &root, A, &odd, Mode::DryRun).expect_err("not utf-8");
+        assert_eq!(
+            err.to_string(),
+            format!("{:?} is not a UTF-8 name", odd.join("units").join(name))
+        );
+    }
 
     let ok = source("errors-ok", "A", None);
     fs::create_dir_all(exec.at("/usr/local/kbf/current")).expect("a directory");

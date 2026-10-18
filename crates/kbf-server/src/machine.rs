@@ -325,6 +325,8 @@ mod tests {
             refusal: String::new(),
             offered_generation: u64::from(n),
             helper_present: false,
+            acked_order_id: 0,
+            kind: kbf_proto::update::update_status::State::Idle,
             received_at_unix_ms: u64::from(n),
         }
     }

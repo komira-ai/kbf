@@ -187,7 +187,7 @@ Why network-on waits: a NAT guest reaches whatever the host reaches, the host it
 and the rest of the farm's network included **[A]**. Keeping a guest off the farm's
 own services needs packet-filter rules on the host, which need root **[A]**, and
 guest-to-guest isolation is not designed either. The planned egress cache (draft PR
-[#192](https://github.com/komira-ai/komira-build-farm/pull/192)) is the natural way out
+[#192](https://github.com/komira-ai/kbf/pull/192)) is the natural way out
 for a UI test that needs a backend; network-on VM leases are designed with it, not
 before. Probe P3 records what a network-off guest has (expected: `lo0` only) and what a
 NAT guest can reach.

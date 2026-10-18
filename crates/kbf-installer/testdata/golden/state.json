@@ -1,0 +1,47 @@
+{
+  "schema": 2,
+  "current": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "previous": "cccccccccccccccccccccccccccccccccccccccc",
+  "staged": "0123456789abcdef0123456789abcdef01234567",
+  "pending_confirm": {
+    "activation": "3-42",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "previous": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "deadline_wall": 1792000000,
+    "deadline_mono_s": 86400,
+    "starts_left": 2
+  },
+  "floor": {
+    "epoch": 3,
+    "order_id": 42,
+    "generation": 17
+  },
+  "serving_instance": "a",
+  "last_acked_order_id": 41,
+  "unacked": {
+    "order": {
+      "order_id": 42,
+      "epoch": 3,
+      "generation": 17,
+      "verb": "activate",
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "window_s": 900,
+      "components": [
+        {
+          "name": "kbf",
+          "sha256": "abababababababababababababababababababababababababababababababab",
+          "size": 52428800,
+          "attestation": "{\"mediaType\":\"application/vnd.dev.sigstore.bundle.v0.3+json\",\"verificationMaterial\":{},\"messageSignature\":{}}"
+        }
+      ],
+      "expected": {
+        "platform": "linux-x86_64",
+        "protocol": 12,
+        "min_protocol": 11,
+        "state_schema": 4,
+        "profile": "release"
+      }
+    },
+    "first_seen": 1791999000
+  }
+}

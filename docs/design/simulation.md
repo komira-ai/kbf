@@ -39,7 +39,7 @@ What the existing sims do not cover:
   `Cancel`, never suspends and never sends a `Hello` from a stale session out of order.
 - **Server restarts.** No sim replaces the leader's state; the scheduler's state is
   in memory and a restart loses it (issue
-  [#137](https://github.com/komira-ai/komira-build-farm/issues/137) was found while
+  [#137](https://github.com/komira-ai/kbf/issues/137) was found while
   writing this catalog).
 - **Platform and cordon together**, and **rollouts**: no sim drives `RolloutDriver`.
 - **Scale.** At most three workers and 40 operations.
@@ -74,7 +74,7 @@ carry it out:
 
 **Planned, so not simulated** (a scenario for any of these waits for the code): the
 infra retry budget (issue
-[#22](https://github.com/komira-ai/komira-build-farm/issues/22)), placement scoring and
+[#22](https://github.com/komira-ai/kbf/issues/22)), placement scoring and
 best fit, learned sizes, protected floors, reclaimed room and preemption of `batch`,
 fair turns within a QoS level, drivers in placement, `RUN_ON` on the wire (today the
 daemon self-fences every lease), a `Started` message from the daemon, re-adopting runs
