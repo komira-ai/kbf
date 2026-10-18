@@ -19,7 +19,8 @@ publish.workspace = true
 # `boot-check`) are the root half of the pull-based updates: they read the order spool the
 # unprivileged `kbf` writes, stage and swap releases through this crate, restart the one
 # configured service and write the world-readable status.json the node reads. There is no
-# socket and no network, and a staged binary is never run as root.
+# socket and no network, and a staged binary is never run as root. The `migrate` module (and
+# verb) adopts a host that runs the old layout into the installer's tree.
 
 [features]
 # `testkit`: the scratch host and state helpers other crates' tests of the `host` verbs use.

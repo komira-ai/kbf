@@ -199,7 +199,7 @@ fn read_file(path: &Path) -> Result<Option<State>, StateError> {
 
 /// A state file's bytes: refused unless its `schema` is [`SCHEMA`] and every other
 /// field is one of [`State`]'s.
-fn parse(path: &Path, bytes: &[u8]) -> Result<State, StateError> {
+pub(crate) fn parse(path: &Path, bytes: &[u8]) -> Result<State, StateError> {
     let fail = |source| StateError::Parse {
         path: path.to_owned(),
         source,

@@ -47,6 +47,7 @@ pub mod darwin;
 mod fixtures;
 pub mod helper;
 pub mod layout;
+pub mod migrate;
 pub mod refusal;
 pub mod release;
 pub mod run;
