@@ -42,6 +42,7 @@ use kbf_front::{Backend, Dispatch, Finished, Recorder, Stage, Submission, Ticket
 use kbf_meta::ActionRecord;
 use kbf_proto::google::rpc;
 use kbf_proto::reapi::ActionResult;
+use kbf_proto::update::UpdateStatus;
 use kbf_proto::worker::{
     self, LeaseOffer, NodeStatus, ResultAck, ServerMessage, Start, server_message,
 };
@@ -79,6 +80,7 @@ use crate::memory;
 use crate::missing;
 use crate::run_record;
 use crate::stamp::Stamp;
+use crate::update_status::{HostUpdate, UpdateReport, UpdateSummary};
 
 /// The scheduler term of a new single-node server process: the wall-clock time of its
 /// start in milliseconds since the Unix epoch, times 2^16, plus 16 random bits.
@@ -563,6 +565,40 @@ impl Farm {
         changes
     }
 
+    /// An `UpdateStatus` on `stream`: kept as the worker's newest, unless `stream` was
+    /// replaced (a newer stream sends its own), exactly as [`Self::node_status`] keeps a
+    /// `NodeStatus`. Returns whether it was kept.
+    pub fn update_status(&self, worker: &WorkerId, stream: StreamId, status: UpdateStatus) -> bool {
+        let report = UpdateReport::new(status, unix_ms());
+        let mut state = self.lock();
+        if !state.is_current(worker, stream) {
+            return false;
+        }
+        state.machine.report_update(worker, report);
+        true
+    }
+
+    /// Every node registered since this farm started, in node-id order, with what each
+    /// last said about its update (`GET /v1/update/hosts`); judged against no desired
+    /// commit ([`HostUpdate::judge`]).
+    pub fn update_hosts(&self) -> Vec<HostUpdate> {
+        let mut state = self.lock();
+        state.note_closed_streams();
+        state
+            .machine
+            .nodes()
+            .filter_map(|worker| {
+                let node = state.machine.node(worker)?;
+                Some(HostUpdate::new(
+                    worker.as_str().to_owned(),
+                    node.connected,
+                    node.update_live,
+                    node.update.clone(),
+                ))
+            })
+            .collect()
+    }
+
     /// This build, and every node registered since this farm started, in node-id order.
     pub fn nodes(&self) -> NodesView {
         let mut state = self.lock();
@@ -638,11 +674,17 @@ impl Farm {
         let node = state.machine.node(worker);
         let software = node.and_then(|n| n.status.clone());
         let phase = state.sched.phase(worker).cloned().unwrap_or_default();
+        let connected = node.is_some_and(|n| n.connected);
         NodeView {
             node_id: worker.as_str().to_owned(),
-            connected: node.is_some_and(|n| n.connected),
+            connected,
             needs_attention: needs_attention(software.as_ref(), &phase),
             software,
+            update: UpdateSummary::new(
+                node.and_then(|n| n.update.as_ref()),
+                connected,
+                node.is_some_and(|n| n.update_live),
+            ),
             placement,
             phase: PhaseView::new(&phase),
         }
