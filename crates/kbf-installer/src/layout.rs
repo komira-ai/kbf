@@ -19,7 +19,7 @@
 //! macOS differs in four paths ([`Platform`]): the installer tree is root's
 //! `/usr/local/kbf-installer` (never a user-owned Homebrew prefix), the state is in
 //! `/var/db/kbf-installer` (with `work/`), the lock is `/var/run/kbf-installer/lock`, and the
-//! trust directory is `/usr/local/share/kbf-installer/trust`.
+//! trust directory is `/usr/local/kbf-installer/trust` (the pkg's PREFIX/trust).
 //!
 //! Nothing else is named anywhere else: `kbf-deploy host ...`, the helper and the tests ask a
 //! [`Layout`]. The kbf runtime's own state, `/var/lib/kbf`, is not here and is never touched.
@@ -42,7 +42,7 @@ const MACOS_STATE_DIR: &str = "/var/db/kbf-installer";
 const LINUX_LOCK: &str = "/run/kbf-installer/lock";
 const MACOS_LOCK: &str = "/var/run/kbf-installer/lock";
 const LINUX_TRUST: &str = "/usr/share/kbf-installer/trust";
-const MACOS_TRUST: &str = "/usr/local/share/kbf-installer/trust";
+const MACOS_TRUST: &str = "/usr/local/kbf-installer/trust";
 
 /// The files of the trust directory.
 pub const GH: &str = "gh";

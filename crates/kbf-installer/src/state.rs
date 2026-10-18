@@ -128,6 +128,8 @@ pub enum StateError {
     },
     #[error("{path} has schema {found}; this kbf-installer reads only schema {SCHEMA}")]
     Schema { path: PathBuf, found: String },
+    #[error("{path} is not an installer state: it has no schema")]
+    NoSchema { path: PathBuf },
     #[error("cannot write {path}: {source}")]
     Write { path: PathBuf, source: io::Error },
     /// Neither `state.json` nor `state.json.bak` is usable on a host that was provisioned.
@@ -360,7 +362,13 @@ fn parse(path: &Path, bytes: &[u8]) -> Result<State, StateError> {
     };
     let mut object: serde_json::Map<String, serde_json::Value> =
         serde_json::from_slice(bytes).map_err(fail)?;
-    let schema = object.remove("schema").unwrap_or(serde_json::Value::Null);
+    // Valid JSON with no `schema` at all is a damaged file (`{}`), not another schema: the
+    // backup is tried. Only an explicit other value is a migration's business.
+    let Some(schema) = object.remove("schema") else {
+        return Err(StateError::NoSchema {
+            path: path.to_owned(),
+        });
+    };
     if schema != SCHEMA {
         return Err(StateError::Schema {
             path: path.to_owned(),

@@ -143,10 +143,10 @@ fn the_platforms_differ_in_the_tree_the_state_the_lock_and_the_trust_directory()
             "/var/db/kbf-installer/state.json.bak",
             "/var/run/kbf-installer/lock",
             "/var/db/kbf-installer/work",
-            "/usr/local/share/kbf-installer/trust",
-            "/usr/local/share/kbf-installer/trust/gh",
-            "/usr/local/share/kbf-installer/trust/trusted_root.jsonl",
-            "/usr/local/share/kbf-installer/trust/installer.conf",
+            "/usr/local/kbf-installer/trust",
+            "/usr/local/kbf-installer/trust/gh",
+            "/usr/local/kbf-installer/trust/trusted_root.jsonl",
+            "/usr/local/kbf-installer/trust/installer.conf",
         ]
     );
     assert_eq!(

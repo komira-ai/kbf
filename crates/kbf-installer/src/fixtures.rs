@@ -106,8 +106,7 @@ pub fn trusted_host() -> FakeExec {
     trusted_host_on(Platform::Linux)
 }
 
-/// [`trusted_host`] for a host of `platform`: its trust directory (a Mac's is under
-/// `/usr/local/share`).
+/// [`trusted_host`] for a host of `platform`: its trust directory (a Mac's is the pkg's `/usr/local/kbf-installer/trust`).
 pub fn trusted_host_on(platform: Platform) -> FakeExec {
     let (parents, dir, gh, root_file): (&[&str], &str, String, String) = match platform {
         Platform::Linux => (
@@ -117,15 +116,10 @@ pub fn trusted_host_on(platform: Platform) -> FakeExec {
             TRUSTED_ROOT_PATH.to_owned(),
         ),
         Platform::MacOs => (
-            &[
-                "/usr",
-                "/usr/local",
-                "/usr/local/share",
-                "/usr/local/share/kbf-installer",
-            ],
-            "/usr/local/share/kbf-installer/trust",
-            "/usr/local/share/kbf-installer/trust/gh".to_owned(),
-            "/usr/local/share/kbf-installer/trust/trusted_root.jsonl".to_owned(),
+            &["/usr", "/usr/local", "/usr/local/kbf-installer"],
+            "/usr/local/kbf-installer/trust",
+            "/usr/local/kbf-installer/trust/gh".to_owned(),
+            "/usr/local/kbf-installer/trust/trusted_root.jsonl".to_owned(),
         ),
     };
     let mut exec = FakeExec::new(0);

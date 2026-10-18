@@ -25,7 +25,7 @@ The paths are in one place, `kbf_installer::layout`
 | installer tree | `/var/lib/kbf-installer` | `/usr/local/kbf-installer` |
 | state dir | the installer tree | `/var/db/kbf-installer` |
 | lock | `/run/kbf-installer/lock` | `/var/run/kbf-installer/lock` |
-| trust dir | `/usr/share/kbf-installer/trust` | `/usr/local/share/kbf-installer/trust` |
+| trust dir | `/usr/share/kbf-installer/trust` | `/usr/local/kbf-installer/trust` |
 
 This replaces the earlier `/usr/local/kbf`, `/var/lib/kbf-deploy` and
 `/usr/local/libexec/kbf-deploy` (a path change made together in `kbf-deploy` and the

@@ -282,6 +282,9 @@ pub fn install<E: Exec>(
 ) -> Result<(), ReleaseError> {
     let source = Source::read(&a.from)?;
     let (lock, state) = begin(host, mode)?;
+    if lock.is_some() {
+        sweep_stages(host)?;
+    }
     copy_release(exec, host, owner, &a.commit, &source, mode, out)?;
     // Installing the current release again keeps its previous one.
     let previous = if state.current.as_ref() == Some(&a.commit) {
@@ -303,14 +306,23 @@ pub fn stage<E: Exec>(
     out: &mut dyn Write,
 ) -> Result<(), ReleaseError> {
     let source = Source::read(&a.from)?;
-    // Held through the copy, so a `gc` cannot remove the release between the two.
+    // Held through the copy, so a `gc` cannot remove the release between the two. The state
+    // is read before anything is published: one that is unusable stops the verb with the
+    // releases directory as it was (S21).
     let lock = match mode {
         Mode::Apply => Some(Locked::acquire(host)?),
         Mode::DryRun => None,
     };
+    let state = match &lock {
+        Some(lock) => {
+            let state = lock.read()?.unwrap_or_default();
+            sweep_stages(host)?;
+            Some(state)
+        }
+        None => None,
+    };
     copy_release(exec, host, owner, &a.commit, &source, mode, out)?;
-    if let Some(lock) = lock {
-        let state = lock.read()?.unwrap_or_default();
+    if let (Some(lock), Some(state)) = (lock, state) {
         lock.write(&State {
             staged: Some(a.commit.clone()),
             ..state
@@ -391,12 +403,43 @@ fn target_file(dir: &HostPath, name: &str) -> HostPath {
     child(dir, name)
 }
 
-/// A name no other run of this program is using: the pid and the clock, in hex.
+/// A name no other run of this program, and no other call in this run, is using: the pid, the
+/// clock and a counter, in hex.
 fn unique() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    format!("{:x}{:x}", std::process::id(), nanos)
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{:x}{:x}{:x}", std::process::id(), nanos, n)
+}
+
+/// Remove the `.stage-` directories of `releases/` that a run killed between making a release
+/// and renaming it left behind. Called with the lock held, so no run is making one.
+fn sweep_stages(host: &Layout) -> Result<(), ReleaseError> {
+    let dir = host.join(&host.releases());
+    let items = match fs::read_dir(&dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        listed => listed.map_err(read_failed(&dir))?,
+    };
+    for item in items {
+        let item = item.map_err(read_failed(&dir))?;
+        let path = item.path();
+        if !item
+            .file_name()
+            .to_string_lossy()
+            .starts_with(layout::STAGE_PREFIX)
+        {
+            continue;
+        }
+        let gone = if item.file_type().map_err(read_failed(&path))?.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        gone.map_err(read_failed(&path))?;
+    }
+    Ok(())
 }
 
 /// Sync every file and directory of the release made at `stage`, rename it to `final_dir`
@@ -496,12 +539,15 @@ fn plan_copy<E: Exec>(
     if let Some(usr_local) = missing_usr_local(exec, host)? {
         dirs.push(usr_local);
     }
-    for d in [
-        host.state_dir(),
-        host.install_root(),
-        host.releases(),
-        dir.clone(),
-    ] {
+    // The state directory and the install root are the package's or the host's: made only when
+    // missing, never chmod-ed (a 0700 `/var/db/kbf-installer` stays 0700). `releases/` and the
+    // release are this program's own.
+    for d in [host.state_dir(), host.install_root()] {
+        if inspect(exec, &d)?.is_none() && !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    for d in [host.releases(), dir.clone()] {
         if !dirs.contains(&d) {
             dirs.push(d);
         }
@@ -587,6 +633,9 @@ pub fn gc<E: Exec>(
 ) -> Result<(), ReleaseError> {
     // Held through the removals, so an install cannot make a release current meanwhile.
     let (_lock, state) = begin(host, mode)?;
+    if _lock.is_some() {
+        sweep_stages(host)?;
+    }
     let mut kept: BTreeSet<CommitId> = [state.current, state.previous, state.staged]
         .into_iter()
         .flatten()

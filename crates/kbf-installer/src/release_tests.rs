@@ -643,11 +643,12 @@ fn errors_name_what_is_wrong() {
     fs::create_dir_all(exec.at("/var/lib/kbf-installer")).expect("seed");
     fs::write(exec.at("/var/lib/kbf-installer/releases"), "a file").expect("seed");
     let err = gc_on(&mut exec, &root, 0).expect_err("unreadable");
-    assert!(
-        err.to_string()
-            .starts_with("cannot read /var/lib/kbf-installer/releases/current: "),
-        "{err}"
+    // The sweep of stage directories lists `releases/` first and cannot.
+    let want = format!(
+        "cannot read {}: ",
+        exec.at("/var/lib/kbf-installer/releases").display()
     );
+    assert!(err.to_string().starts_with(&want), "{err}");
 }
 
 /// A scratch Mac: the directories every macOS has above the layout (`/var/run`,
@@ -1101,6 +1102,8 @@ struct Watch {
     host: ScratchHost,
     layout: Layout,
     seen: std::cell::RefCell<Vec<Glance>>,
+    /// The path of each link step, in the order the steps were applied.
+    links: std::cell::RefCell<Vec<String>>,
     fail_links: bool,
 }
 
@@ -1111,6 +1114,7 @@ impl Watch {
             host,
             layout,
             seen: std::cell::RefCell::new(Vec::new()),
+            links: std::cell::RefCell::new(Vec::new()),
             fail_links: false,
         }
     }
@@ -1158,7 +1162,8 @@ impl Exec for Watch {
     fn apply(&mut self, step: &Step) -> io::Result<()> {
         match step {
             Step::WriteFile { .. } => self.glance("file"),
-            Step::Symlink { .. } => {
+            Step::Symlink { path, .. } => {
+                self.links.borrow_mut().push(path.to_string());
                 self.glance("link");
                 if self.fail_links {
                     return Err(io::Error::other("the host died before the link moved"));
@@ -1308,4 +1313,224 @@ fn a_dry_run_makes_no_stage_and_a_reinstall_is_in_place() {
     let again = install_on(&mut exec, &root, A, &from, Mode::Apply).expect("again");
     assert!(!again.contains(".stage-"), "{again}");
     assert_eq!(releases_left(&exec), [A.to_owned(), "current".to_owned()]);
+}
+
+/// Every file under `dir` with its bytes, and every directory, by relative name.
+fn snapshot(dir: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
+    fn walk(root: &Path, at: &Path, out: &mut BTreeMap<String, Option<Vec<u8>>>) {
+        for item in fs::read_dir(at).expect("list") {
+            let path = item.expect("entry").path();
+            let name = path
+                .strip_prefix(root)
+                .expect("below")
+                .display()
+                .to_string();
+            let meta = fs::symlink_metadata(&path).expect("stat");
+            if meta.is_dir() {
+                out.insert(name, None);
+                walk(root, &path, out);
+            } else if meta.is_file() {
+                out.insert(name, Some(fs::read(&path).expect("read")));
+            } else {
+                out.insert(
+                    name,
+                    Some(
+                        fs::read_link(&path)
+                            .expect("link")
+                            .display()
+                            .to_string()
+                            .into_bytes(),
+                    ),
+                );
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// S21: `stage` and `install` read the state before they publish anything. With the state
+/// unusable (both files damaged, host activated) they stop with the releases directory
+/// byte for byte as it was: no release, no stage directory.
+///
+/// Catches `stage` copying the release first and only then finding the state unusable, which
+/// left a published release behind an error that said "nothing was changed".
+///
+/// Mutant seen red: the state read in `stage` moved after `copy_release`.
+#[test]
+fn stage_and_install_on_an_unusable_state_publish_nothing() {
+    let (mut exec, root) = host("s21-stage");
+    let a = source("s21-stage-a", "kbf A", None);
+    let b = source("s21-stage-b", "kbf B", None);
+    install_on(&mut exec, &root, A, &a, Mode::Apply).expect("install A");
+    install_on(&mut exec, &root, B, &a, Mode::Apply).expect("install B");
+    let dir = exec.at("/var/lib/kbf-installer");
+    fs::write(dir.join("state.json"), "{ not json").expect("ruin");
+    fs::write(dir.join("state.json.bak"), "{ not json").expect("ruin");
+    let before = snapshot(&dir);
+
+    let mut out = Vec::new();
+    let a2 = Install {
+        commit: c(C),
+        from: b.clone(),
+    };
+    let err = stage(&mut exec, &root, me(), &a2, Mode::Apply, &mut out).expect_err("stage");
+    assert!(
+        matches!(&err, ReleaseError::State(s) if s.needs_operator()),
+        "{err}"
+    );
+    let err = install(&mut exec, &root, me(), &a2, Mode::Apply, &mut out).expect_err("install");
+    assert!(
+        matches!(&err, ReleaseError::State(s) if s.needs_operator()),
+        "{err}"
+    );
+    assert_eq!(snapshot(&dir), before, "a refused verb changed the host");
+}
+
+/// S19: a `.stage-` directory a killed run left (between making the release and renaming
+/// it) is removed, under the lock, at the start of `install`, `stage` and `gc`; a dry run
+/// removes nothing; a real release is never touched.
+///
+/// Catches stage directories piling up for ever (each is a whole release), and a sweep that
+/// takes a published release for a stage.
+///
+/// Mutant seen red: the sweep call left out of `install`.
+#[test]
+fn a_stage_directory_a_killed_run_left_is_swept_by_install_stage_and_gc() {
+    let (mut exec, root) = host("s19-sweep");
+    let a = source("s19-sweep-a", "kbf A", None);
+    install_on(&mut exec, &root, A, &a, Mode::Apply).expect("install A");
+    let leftover = exec.at(&format!("/var/lib/kbf-installer/releases/.stage-{B}.dead"));
+    let plant = || {
+        fs::create_dir_all(leftover.join("units")).expect("stage");
+        fs::write(leftover.join("kbf"), "half").expect("file");
+    };
+    plant();
+    install_on(&mut exec, &root, A, &a, Mode::DryRun).expect("dry");
+    assert!(leftover.exists(), "a dry run removed something");
+    install_on(&mut exec, &root, A, &a, Mode::Apply).expect("install");
+    assert!(!leftover.exists(), "install left the stage");
+    plant();
+    let st = Install {
+        commit: c(B),
+        from: source("s19-sweep-b", "kbf B", None),
+    };
+    stage(&mut exec, &root, me(), &st, Mode::Apply, &mut Vec::new()).expect("stage");
+    assert!(!leftover.exists(), "stage left the stage");
+    plant();
+    gc_on(&mut exec, &root, 5).expect("gc");
+    assert!(!leftover.exists(), "gc left the stage");
+    assert!(
+        exec.at(&format!("/var/lib/kbf-installer/releases/{A}/kbf"))
+            .exists()
+    );
+    assert!(
+        exec.at(&format!("/var/lib/kbf-installer/releases/{B}/kbf"))
+            .exists()
+    );
+}
+
+/// The state directory and the install root are the package's: made when missing, never
+/// chmod-ed when there. A 0700 `/var/db/kbf-installer` (macOS) and a 0750 install root stay
+/// as they are; the ones the install makes are 0755.
+///
+/// Catches an install that widens a directory the package made private.
+///
+/// Mutant seen red: the "only when missing" test dropped (both always planned).
+#[test]
+fn an_existing_state_directory_and_install_root_keep_their_mode() {
+    let (mut exec, layout) = mac("s5-modes");
+    for (dir, mode) in [
+        ("/var/db/kbf-installer", 0o700),
+        ("/usr/local/kbf-installer", 0o750),
+    ] {
+        fs::create_dir_all(exec.at(dir)).expect("pkg dir");
+        fs::set_permissions(exec.at(dir), fs::Permissions::from_mode(mode)).expect("mode");
+    }
+    let from = mac_source("s5-modes-src", "daemon A");
+    install_on(&mut exec, &layout, A, &from, Mode::Apply).expect("install");
+    assert_eq!(mode_of(&exec, "/var/db/kbf-installer"), 0o700);
+    assert_eq!(mode_of(&exec, "/usr/local/kbf-installer"), 0o750);
+    assert_eq!(mode_of(&exec, "/usr/local/kbf-installer/releases"), 0o755);
+
+    let (mut exec, root) = host("s5-modes-linux");
+    fs::create_dir_all(exec.at("/var/lib/kbf-installer")).expect("dir");
+    fs::set_permissions(
+        exec.at("/var/lib/kbf-installer"),
+        fs::Permissions::from_mode(0o750),
+    )
+    .expect("mode");
+    let from = source("s5-modes-linux-src", "kbf A", None);
+    install_on(&mut exec, &root, A, &from, Mode::Apply).expect("install");
+    assert_eq!(mode_of(&exec, "/var/lib/kbf-installer"), 0o750);
+}
+
+/// The links move `previous` first, then `current`: until `current` moves, both name whole
+/// releases. Checked for `install` (the second install has both) and for `reconcile`.
+///
+/// Catches the order swapped, which would for an instant point `current` at the new release
+/// with `previous` still on the one before it, and lose `previous` on a crash between.
+///
+/// Mutants seen red: `previous` and `current` swapped in `switch`; the same in `converge`.
+#[test]
+fn the_links_move_previous_before_current() {
+    let mut w = Watch::new("m7-order");
+    let layout = w.layout.clone();
+    let a = source("m7-a", "kbf A", None);
+    let b = source("m7-b", "kbf B", None);
+    let inst = |commit: &str, from: &Path| Install {
+        commit: c(commit),
+        from: from.to_owned(),
+    };
+    install(
+        &mut w,
+        &layout,
+        me(),
+        &inst(A, &a),
+        Mode::Apply,
+        &mut Vec::new(),
+    )
+    .expect("A");
+    w.links.borrow_mut().clear();
+    install(
+        &mut w,
+        &layout,
+        me(),
+        &inst(B, &b),
+        Mode::Apply,
+        &mut Vec::new(),
+    )
+    .expect("B");
+    let names: Vec<String> = w
+        .links
+        .borrow()
+        .iter()
+        .map(|p| p.rsplit('/').next().expect("name").to_owned())
+        .collect();
+    assert_eq!(names, ["previous", "current"]);
+
+    // The same for the repair of the links after an interrupted verb.
+    fs::remove_file(w.host.at("/var/lib/kbf-installer/releases/previous")).expect("rm");
+    fs::remove_file(w.host.at("/var/lib/kbf-installer/releases/current")).expect("rm");
+    w.links.borrow_mut().clear();
+    crate::activate::reconcile(&mut w, &layout, &mut Vec::new()).expect("reconcile");
+    let names: Vec<String> = w
+        .links
+        .borrow()
+        .iter()
+        .map(|p| p.rsplit('/').next().expect("name").to_owned())
+        .collect();
+    assert_eq!(names, ["previous", "current"]);
+}
+
+/// Stage names do not repeat within a run (nor across runs: the pid and the clock are in them).
+///
+/// Catches two stages of one process landing in one directory.
+///
+/// Mutant seen red: `unique` returning a constant.
+#[test]
+fn stage_names_are_unique() {
+    let names: std::collections::BTreeSet<String> = (0..2_000).map(|_| unique()).collect();
+    assert_eq!(names.len(), 2_000);
 }

@@ -157,7 +157,6 @@ fn a_state_this_build_does_not_know_is_refused() {
     );
     let schemas = [
         (format!("{{\"schema\":1,{full}}}"), "1"),
-        (format!("{{{full}}}"), "null"),
         (format!("{{\"schema\":\"2\",{full}}}"), "\"2\""),
     ];
     for (text, found) in schemas {
@@ -187,12 +186,17 @@ fn a_state_this_build_does_not_know_is_refused() {
             ),
             "unknown field",
         ),
+        (format!("{{{full}}}"), "has no schema"),
+        ("{}".to_owned(), "has no schema"),
         ("[1]".to_owned(), "is not an installer state"),
         ("{".to_owned(), "is not an installer state"),
     ];
     for (text, why) in refused {
         let err = parse(path, text.as_bytes()).expect_err(&text);
-        assert!(matches!(err, StateError::Parse { .. }), "{text}: {err:?}");
+        assert!(
+            matches!(err, StateError::Parse { .. } | StateError::NoSchema { .. }),
+            "{text}: {err:?}"
+        );
         assert!(err.to_string().contains(why), "{text}: {err}");
     }
 }
@@ -512,4 +516,73 @@ fn another_schema_is_refused_and_the_backup_is_not_tried() {
     let err = lock.load().expect_err("refused");
     assert!(matches!(err, StateError::Schema { .. }), "{err:?}");
     assert!(!err.needs_operator());
+}
+
+/// Valid JSON with no `schema` at all (`{}`) is a damaged file: the backup is tried. Only an
+/// explicit other schema number skips it (see `another_schema_is_refused_and_the_backup_is_not_tried`).
+///
+/// Catches a truncated or emptied file being reported as "another schema", which would stop a
+/// host that has a good backup.
+///
+/// Mutant seen red: a missing `schema` read as `null` and refused as a schema.
+#[test]
+fn json_without_a_schema_is_damaged_so_the_backup_is_tried() {
+    let (root, dir) = host_root("state-no-schema");
+    let lock = Locked::acquire(&root).expect("lock");
+    lock.write(&other_state()).expect("first");
+    lock.write(&full_state()).expect("second");
+    fs::write(state_dir(&dir).join("state.json"), "{}").expect("emptied");
+    let loaded = lock.load().expect("falls back");
+    assert_eq!(
+        loaded,
+        Loaded {
+            state: Some(other_state()),
+            from_backup: true
+        }
+    );
+}
+
+/// Make `<dir>/<name>` a directory so that replacing the file fails at its temporary name.
+fn block(dir: &Path, name: &str) {
+    fs::create_dir_all(state_dir(dir).join(name).join("x")).expect("block");
+}
+
+/// The order of a write is the backup, then the state. A write that dies after the backup
+/// (here: the state cannot be replaced) leaves `state.json` as it was and a backup equal to it;
+/// one that dies before (the backup cannot be written) leaves both untouched.
+///
+/// Catches the order reversed: a death between the two would then leave a new state with a
+/// backup two writes old (or none), and a damaged new file would fall back to the wrong state.
+///
+/// Mutant seen red: the backup written after the state.
+#[test]
+fn a_write_that_dies_between_the_backup_and_the_state_loses_nothing() {
+    let (root, dir) = host_root("state-write-order");
+    let lock = Locked::acquire(&root).expect("lock");
+    lock.write(&other_state()).expect("first");
+    lock.write(&full_state()).expect("second");
+    let (file, bak) = (
+        state_dir(&dir).join("state.json"),
+        state_dir(&dir).join("state.json.bak"),
+    );
+    let (state_before, bak_before) = (fs::read(&file).expect("f"), fs::read(&bak).expect("b"));
+
+    // The backup cannot be written: nothing changes.
+    block(&dir, ".state.json.bak.tmp");
+    lock.write(&State::default()).expect_err("no backup");
+    assert_eq!(
+        (fs::read(&file).expect("f"), fs::read(&bak).expect("b")),
+        (state_before.clone(), bak_before)
+    );
+    fs::remove_dir_all(state_dir(&dir).join(".state.json.bak.tmp")).expect("unblock");
+
+    // The state cannot be written: the backup already holds the state that stays.
+    block(&dir, ".state.json.tmp");
+    lock.write(&State::default()).expect_err("no state");
+    assert_eq!(fs::read(&file).expect("f"), state_before);
+    assert_eq!(
+        fs::read(&bak).expect("b"),
+        state_before,
+        "the backup was not made first"
+    );
 }
