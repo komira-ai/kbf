@@ -158,7 +158,7 @@ async fn drain_status(State(api): State<Arc<ApiState>>) -> Response {
 /// The body a frontend drain may carry: none, or `{}`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct NoBody {}
+struct NoBody {}
 
 async fn begin_drain(
     State(api): State<Arc<ApiState>>,

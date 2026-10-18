@@ -19,7 +19,7 @@ use kbf_server::token::ApiToken;
 use kbf_server::verbs::routes;
 use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
 use kbf_state::fake::{Fake, Flaw};
-use kbf_state::{ManualClock, Store};
+use kbf_state::{Cond, ManualClock, Store, Txn};
 use kbf_types::operator_api::DeniedList;
 use support::{HELLO_WAIT, INTERVAL};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -320,4 +320,63 @@ async fn two_frontends_over_one_store_list_each_others_entries() {
             [("node one", "by a"), ("node two", "by b")]
         );
     }
+}
+
+/// Catches a listing that answers a store that cannot be read with something other than a
+/// fixed status and text: a store that fails is 503, a row that is no entry or does not
+/// decode is 500 (the list is never guessed at), and a store call that panics is 500, each
+/// without the store's own message or the row's bytes in the answer.
+///
+/// Mutants seen red: the store's error text echoed (`injected` in the body); a corrupt row
+/// skipped instead of refused (200 with the other entries); the panic left to drop the
+/// connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listing_that_cannot_read_the_store_says_so_in_fixed_words() {
+    use std::sync::atomic::Ordering;
+    let store = hooked::Hooked::new();
+    let members = Arc::new(Members::new(Arc::clone(&store) as Arc<dyn Store>, config()));
+    let api = serve_routes(Some(token()), Some(members)).await;
+
+    store.fail_scans.store(1, Ordering::SeqCst);
+    let answer = request(api, "GET", "/v1/denied", OPERATOR, "").await;
+    assert_eq!(answer.code, 503, "{}", answer.body);
+    assert!(
+        answer.body.contains("the state store failed"),
+        "{}",
+        answer.body
+    );
+    assert!(!answer.body.contains("injected"), "{}", answer.body);
+
+    store.panic_scans.store(1, Ordering::SeqCst);
+    let answer = request(api, "GET", "/v1/denied", OPERATOR, "").await;
+    assert_eq!(answer.code, 500, "{}", answer.body);
+    assert!(
+        answer.body.contains("the listing task failed"),
+        "{}",
+        answer.body
+    );
+
+    for (key, value) in [
+        ("deny/node/mac-07", &b"\xff\xff-SECRET-ROW"[..]),
+        ("deny/not-an-entry", &b""[..]),
+    ] {
+        store
+            .fake
+            .txn(Txn::new().put(key, value, Cond::Any))
+            .expect("store")
+            .expect("commit");
+        let answer = request(api, "GET", "/v1/denied", OPERATOR, "").await;
+        assert_eq!(answer.code, 500, "{key}: {}", answer.body);
+        assert!(
+            answer.body.contains("a stored row is unreadable") && !answer.body.contains("SECRET"),
+            "{key}: {}",
+            answer.body
+        );
+        store
+            .fake
+            .txn(Txn::new().delete(key, Cond::Any))
+            .expect("store")
+            .expect("commit");
+    }
+    assert_eq!(listed(api).await, DeniedList::default());
 }
