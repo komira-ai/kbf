@@ -375,11 +375,15 @@ impl std::error::Error for HostRefused {}
 /// `RestartPreventExitStatus=2`, so systemd leaves such a daemon down for its operator
 /// instead of restarting it every `RestartSec` forever.
 fn refused(e: &Error) -> bool {
-    e.is::<ImageUnusable>()
-        || e.is::<HostRefused>()
-        || e.is::<kbf_driver_container::SubidError>()
+    // The container driver is Linux's: macOS has none of these errors.
+    #[cfg(target_os = "linux")]
+    if e.is::<kbf_driver_container::SubidError>()
         || e.is::<kbf_driver_container::DelegateError>()
         || e.is::<kbf_driver_container::OciError>()
+    {
+        return true;
+    }
+    e.is::<ImageUnusable>() || e.is::<HostRefused>()
 }
 
 /// Runs the helper this process was started as, if it was: each run's keeper, the
