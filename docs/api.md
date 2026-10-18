@@ -867,9 +867,11 @@ an update is in flight; `500` if the record cannot be written (the row is closed
 was ordered); else `202 {"order_id", "epoch", "generation", "commit"}`.
 
 - The row is written before the record, by compare-and-set, so one update is in flight at a
-  time. It is closed when the record has left the spool and the installer, in no update of its
-  own, reports the commit installed, or `reverted` or `refused`; and after 3600 s whatever the
-  installer says, so a dead installer cannot hold the route for ever. The generation is the
+  time. It is closed when the installer's `status.json` has a `frontend` section whose `order_id`
+  and `epoch` equal the row's and whose `state` is terminal (`confirmed`, `reverted` or
+  `refused`); and after 3600 s whatever the installer says, so a dead installer (or an older one
+  that writes no `frontend` section) cannot hold the route for ever. The row is checked, and
+  closed, on the next `POST`. The generation is the
   last update's plus one: a rollback is an older commit under a higher generation.
 - `GET /v1/update/frontend` is open and read-only: `{"enabled": true, "row": null | {"order_id",
   "epoch", "generation", "commit", "state": "open" | "closed", "written_at_ms",
