@@ -15,8 +15,13 @@
 //!   nothing is written. `GET` also shows the `policy` row when the operator wrote one.
 //! - `POST /v1/update/pause` and `resume` set `paused` of the policy row (a compare-and-set of
 //!   that one field): while set, no host is started. It needs no run, and survives the next offer.
-//! - Without a release store (`--releases-dir`) or without a state store (`--state-store`:
-//!   the row has nowhere to live) every answer is `503` saying which is missing.
+//! - Without a state store (`--state-store`: the rows have nowhere to live) every answer is
+//!   `503` saying so. Without a release store (`--releases-dir`) `GET /v1/update` and `POST
+//!   /v1/update/desired` are `503` saying so; `pause` and `resume` touch only the policy row
+//!   and work.
+//! - A write that other writers kept racing for all of its retries is `503` with
+//!   `Retry-After: 1`. Generations increase and may skip numbers (a write that loses a race
+//!   has drawn a counter value).
 //!
 //! Serve the router with `into_make_service_with_connect_info`, as the API's.
 
@@ -26,8 +31,8 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, State};
-use axum::http::header::CONTENT_TYPE;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::{CONTENT_TYPE, RETRY_AFTER};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
 use serde::Deserialize;
@@ -76,6 +81,16 @@ fn unavailable(what: &str, flag: &str) -> Response {
 }
 
 fn row_failed(e: &RowError) -> Response {
+    if matches!(e, RowError::Contended(_)) {
+        tracing::warn!("update rows: {e}");
+        let mut busy = error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the update rows are busy: send it again",
+        );
+        busy.headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        return busy;
+    }
     tracing::error!("update rows: {e}");
     error(StatusCode::INTERNAL_SERVER_ERROR, "the update rows failed")
 }

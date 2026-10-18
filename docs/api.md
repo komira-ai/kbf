@@ -828,7 +828,9 @@ release and their build attestations, kept as uploaded. Mounted by `--releases-d
 
 The desired release (`docs/design/pull-updates.md` section 6.3), kept in the `update/desired`
 row of the state store. Without `--state-store` every answer is `503` naming it; without
-`--releases-dir`, naming that.
+`--releases-dir`, `GET /v1/update` and `POST /v1/update/desired` are `503` naming that flag
+(`pause` and `resume` need only the state store). A write that other writers kept racing
+for the whole of its retries is `503` with `Retry-After: 1`: send it again.
 
 - `GET /v1/update` is open: `{"desired": null | {"generation", "commit", "set_at_ms"},
   "paused": bool, "policy": null | {...}, "releases": <the body of GET /v1/releases>}`. `policy`
@@ -843,7 +845,8 @@ row of the state store. Without `--state-store` every answer is `503` naming it;
   (see above); `400` for a body that is not exactly that. The answer is the desired release.
   The generation moves only when the commit differs from the desired one, so a repeated click is
   not a new run; a rollback is the older commit offered the same way and gets a higher
-  generation.
+  generation. Generations increase, but may skip numbers: each write that loses a race has
+  already drawn a counter value.
 - `POST /v1/update/pause` and `/resume` (the write gates, no body) set `paused` of the policy
   row, by compare-and-set of that field alone, and answer `{"paused": bool}`. No run is
   needed, and an offer leaves the flag as it is: while set, no host is started.
