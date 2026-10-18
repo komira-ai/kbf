@@ -1987,6 +1987,7 @@ dependencies = [
  "hex",
  "kbf-auth",
  "kbf-caps",
+ "kbf-enroll-registry",
  "kbf-front",
  "kbf-history",
  "kbf-invocation",
@@ -2174,6 +2175,8 @@ dependencies = [
 name = "kbf-types"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

@@ -170,6 +170,7 @@ kbf-daemon = { path = "crates/kbf-daemon" }
 kbf-deploy = { path = "crates/kbf-deploy" }
 kbf-driver-container = { path = "crates/kbf-driver-container" }
 kbf-driver-native = { path = "crates/kbf-driver-native" }
+kbf-enroll-registry = { path = "crates/kbf-enroll-registry" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
 kbf-history = { path = "crates/kbf-history" }
