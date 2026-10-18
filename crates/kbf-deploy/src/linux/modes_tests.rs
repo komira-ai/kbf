@@ -895,7 +895,10 @@ fn the_test_farms_units_are_the_kits_output_and_stay_valid_after_the_installers_
 
     let farm = |bin: &str| {
         let text = EXAMPLE.replace("KBF_BIN_DIR=/usr/local/bin", &format!("KBF_BIN_DIR={bin}"));
-        assert!(text.contains(&format!("KBF_BIN_DIR={bin}")), "the example sets KBF_BIN_DIR");
+        assert!(
+            text.contains(&format!("KBF_BIN_DIR={bin}")),
+            "the example sets KBF_BIN_DIR"
+        );
         LinuxConfig::parse(&text).expect("valid settings")
     };
     let new_bin = "/var/lib/kbf-installer/releases/current";
@@ -911,10 +914,18 @@ fn the_test_farms_units_are_the_kits_output_and_stay_valid_after_the_installers_
             "{mode}: the kit renders something other than the installer's fixture:\n{text}"
         );
         let r = check(&old, mode, &text, true).expect("a unit");
-        assert_eq!(lines(&r), Vec::<String>::new(), "{mode} as the farm runs it");
+        assert_eq!(
+            lines(&r),
+            Vec::<String>::new(),
+            "{mode} as the farm runs it"
+        );
         let migrated = rewrite_text(Kind::Systemd, &text, new_bin).expect("the path changes");
         let r = check(&new, mode, &migrated, true).expect("a unit");
-        assert_eq!(lines(&r), Vec::<String>::new(), "{mode} after the migration");
+        assert_eq!(
+            lines(&r),
+            Vec::<String>::new(),
+            "{mode} after the migration"
+        );
         // The rules would have caught the old path left behind.
         let stale = check(&new, mode, &text, true).expect("a unit");
         assert!(
