@@ -7,7 +7,7 @@
 //! | key | value | lives |
 //! |---|---|---|
 //! | `instance/<instance id>` | the member id | for ever: a node that returns keeps its id |
-//! | `member/<id>` | the member (address, zone, weight, admin state) and its boot counter | `ttl` after the last heartbeat |
+//! | `member/<id>` | the member (address, zone, weight, admin state), its boot counter and its newest debts report | `ttl` after the last heartbeat |
 //! | `down/<id>` | nothing | `dwell` from the moment the member went `Down` |
 //! | `map` | the current `kbf.map.v1.Map` | for ever; a change is one compare-and-set |
 //! | `meta/members_formed` | nothing | for ever: the cluster has had an `Active` member |
@@ -26,6 +26,11 @@
 //! if its index is whole, `CatchingUp` if not, and its `down/<id>` mark is deleted. The
 //! last member never leaves: a map needs one member, so it stays `Down` in the map.
 //!
+//! **Debts.** A storage heartbeat says how many copies the node owes ([`Debts`]); the row
+//! keeps the newest report with the store's clock at its receipt, so it dies with the row
+//! and a registration (which rewrites the row) starts without one. A promotion keeps it.
+//! [`Members::storage_health`] judges the rows ([`crate::storage_health`]).
+//!
 //! **The map** is a function of the rows: [`Members::refresh`] reads `map`, `member/` and
 //! the `down/` marks, builds the next member list, and if it differs commits generation
 //! `g + 1` with the compare-and-set on `map`'s version and a check on every row it read,
@@ -43,6 +48,11 @@
 //! handoff and the operator call); a heartbeat changes no other state: a `Joining` member
 //! waits for the handoff, and a member that is `Draining`, `Active` or `Down` stays so
 //! whatever it reports.
+//!
+//! **Who may beat.** The row keeps the member's address, and a heartbeat names the member by
+//! its (public, sequential) id and boot, so the caller says whether it is the holder of the
+//! address ([`Members::heartbeat`]); the rpc layer answers that with the caller's
+//! certificate. The row is read, the holder asked and only then the boot compared.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -51,9 +61,11 @@ use std::time::Duration;
 use kbf_map::{Map, MapError, Member, MemberId, MemberState, Rule};
 use kbf_mapsync::MapSource;
 use kbf_proto::kbf::map::v1 as pb;
-use kbf_state::{Cond, Store, StoreError, Txn, Version, Versioned};
+use kbf_state::{Cond, Store, StoreError, StoreTime, Txn, Version, Versioned};
 use prost::Message as _;
 use tokio::sync::watch;
+
+use crate::storage_health::{Debts, MemberReport, Report, StorageHealth, storage_health};
 
 const MAP_KEY: &str = "map";
 const MEMBERS: &str = "member/";
@@ -95,6 +107,13 @@ impl MembershipConfig {
     #[must_use]
     pub fn beat(&self) -> Duration {
         self.ttl / 3
+    }
+
+    /// How old a debts report may be and still count: two beats, so one lost heartbeat is
+    /// forgiven and two are not.
+    #[must_use]
+    pub fn freshness(&self) -> Duration {
+        self.beat() * 2
     }
 }
 
@@ -154,6 +173,10 @@ pub enum MembershipError {
     /// The state store failed.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// The caller is not at the member's address: its certificate names no host of it
+    /// (see [`Members::heartbeat`]). The message gives no more than the member id.
+    #[error("member {0} is not at an address the caller's certificate names")]
+    NotHolder(MemberId),
     /// The registration is malformed.
     #[error("invalid registration: {0}")]
     Invalid(&'static str),
@@ -196,19 +219,55 @@ pub enum MembershipError {
     Map(#[from] MapError),
 }
 
-/// A stored member row: the member as the map will hold it, and its boot counter.
+/// A stored member row: the member as the map will hold it, its boot counter and the
+/// newest debts report.
 #[derive(Clone, PartialEq, prost::Message)]
 struct Row {
     #[prost(message, optional, tag = "1")]
     member: Option<pb::Member>,
     #[prost(uint64, tag = "2")]
     boot: u64,
+    #[prost(message, optional, tag = "3")]
+    report: Option<StoredReport>,
+}
+
+/// [`Report`] as stored.
+#[derive(Clone, PartialEq, prost::Message)]
+struct StoredReport {
+    #[prost(bool, tag = "1")]
+    known: bool,
+    #[prost(uint64, tag = "2")]
+    debts: u64,
+    /// The store's clock at receipt, in nanoseconds.
+    #[prost(uint64, tag = "3")]
+    at_nanos: u64,
+}
+
+impl From<&Report> for StoredReport {
+    fn from(report: &Report) -> Self {
+        let (known, debts) = report.debts.to_wire();
+        Self {
+            known,
+            debts,
+            at_nanos: u64::try_from(report.at.as_duration().as_nanos()).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+impl From<&StoredReport> for Report {
+    fn from(stored: &StoredReport) -> Self {
+        Self {
+            debts: Debts::from_wire(stored.known, stored.debts),
+            at: StoreTime::from_duration(Duration::from_nanos(stored.at_nanos)),
+        }
+    }
 }
 
 /// A decoded row and the version it was read at.
 struct Live {
     member: Member,
     boot: u64,
+    report: Option<Report>,
     version: Version,
 }
 
@@ -220,14 +279,16 @@ fn decode_row(stored: &Versioned) -> Result<Live, MembershipError> {
     Ok(Live {
         member,
         boot: row.boot,
+        report: row.report.as_ref().map(Report::from),
         version: stored.version,
     })
 }
 
-fn encode_row(member: &Member, boot: u64) -> Vec<u8> {
+fn encode_row(member: &Member, boot: u64, report: Option<&Report>) -> Vec<u8> {
     Row {
         member: Some(pb::Member::from(member)),
         boot,
+        report: report.map(StoredReport::from),
     }
     .encode_to_vec()
 }
@@ -321,8 +382,9 @@ fn plan(
 /// How a row is rewritten in place.
 #[derive(Clone, Copy)]
 enum Touch {
-    /// A heartbeat of this boot, and what it reports: a whole time to live more.
-    Beat(u64, Progress),
+    /// A heartbeat of this boot, what it reports and what it says it owes: a whole time to
+    /// live more, and the debts report replaced.
+    Beat(u64, Progress, Debts),
     /// An administrator's state change: the time to live it had.
     State(MemberState),
 }
@@ -487,7 +549,7 @@ impl Members {
                 txn = txn.put(FORMED, Vec::new(), Cond::Any);
             }
             let txn = txn
-                .put_ttl(&key, encode_row(member, boot), self.config.ttl, cond)
+                .put_ttl(&key, encode_row(member, boot, None), self.config.ttl, cond)
                 .delete(down_key(member.id), Cond::Any);
             if self.store.txn(txn)?.is_ok() {
                 return Ok(());
@@ -496,20 +558,31 @@ impl Members {
         Err(MembershipError::Contended)
     }
 
-    /// Restarts the time to live of `id`'s row and, if the member is `CatchingUp` and
-    /// `progress` says it is done, makes it `Active` and rebuilds the map. Returns the
-    /// generation of the current map.
+    /// Restarts the time to live of `id`'s row, keeps what the node says it owes (with the
+    /// store's clock) and, if the member is `CatchingUp` and `progress` says it is done,
+    /// makes it `Active` and rebuilds the map. Returns the generation of the current map.
+    ///
+    /// `holder` says whether the caller may speak for a member at an address (its
+    /// certificate names the address's host): it is asked of the address on the row,
+    /// before the boot is compared and in the same pass as the rewrite, so a caller that
+    /// is not the holder learns nothing of the row's boot or state, not even that its boot
+    /// is wrong (it can tell a row that lapsed, `NotRegistered`, from a live one it does
+    /// not hold, `NotHolder`, and member ids and states are in the map every node gets
+    /// anyway), and promotes nothing. `None` asks no one.
     ///
     /// # Errors
     /// [`MembershipError::NotRegistered`] if the row expired (register again);
+    /// [`MembershipError::NotHolder`] if `holder` refuses the row's address;
     /// [`MembershipError::Superseded`] if `boot` is not the row's; the store failing.
     pub fn heartbeat(
         &self,
         id: MemberId,
         boot: u64,
         progress: Progress,
+        debts: Debts,
+        holder: Option<&dyn Fn(&str) -> bool>,
     ) -> Result<u64, MembershipError> {
-        if self.touch(id, Touch::Beat(boot, progress))? {
+        if self.touch(id, Touch::Beat(boot, progress, debts), holder)? {
             return Ok(self.refresh()?.map_or(0, |map| map.generation()));
         }
         Ok(self.current_map()?.map_or(0, |map| map.generation()))
@@ -525,12 +598,18 @@ impl Members {
         if state == MemberState::Down {
             return Err(MembershipError::NotSettable(state));
         }
-        self.touch(id, Touch::State(state))?;
+        self.touch(id, Touch::State(state), None)?;
         self.refresh()?.ok_or(MembershipError::NoMap)
     }
 
-    /// Rewrites `id`'s row as `how` says; whether its state changed.
-    fn touch(&self, id: MemberId, how: Touch) -> Result<bool, MembershipError> {
+    /// Rewrites `id`'s row as `how` says; whether its state changed. `holder` is
+    /// [`Members::heartbeat`]'s.
+    fn touch(
+        &self,
+        id: MemberId,
+        how: Touch,
+        holder: Option<&dyn Fn(&str) -> bool>,
+    ) -> Result<bool, MembershipError> {
         let key = member_key(id);
         for _ in 0..ATTEMPTS {
             let stored = self
@@ -538,16 +617,24 @@ impl Members {
                 .get(&key)?
                 .ok_or(MembershipError::NotRegistered(id))?;
             let mut live = decode_row(&stored)?;
+            // Before anything the caller said is compared with the row.
+            if holder.is_some_and(|holds| !holds(&live.member.addr)) {
+                return Err(MembershipError::NotHolder(id));
+            }
             let before = live.member.state;
             let ttl = match how {
-                Touch::Beat(boot, _) if boot != live.boot => {
+                Touch::Beat(boot, _, _) if boot != live.boot => {
                     return Err(MembershipError::Superseded {
                         id,
                         boot,
                         current: live.boot,
                     });
                 }
-                Touch::Beat(_, progress) => {
+                Touch::Beat(_, progress, debts) => {
+                    live.report = Some(Report {
+                        debts,
+                        at: self.store.now(),
+                    });
                     if before == MemberState::CatchingUp && progress == Progress::CaughtUp {
                         live.member.state = MemberState::Active;
                     }
@@ -562,7 +649,7 @@ impl Members {
             };
             let mut put = Txn::new().put_ttl(
                 &key,
-                encode_row(&live.member, live.boot),
+                encode_row(&live.member, live.boot, live.report.as_ref()),
                 ttl,
                 Cond::Version(stored.version),
             );
@@ -629,6 +716,41 @@ impl Members {
             }
         }
         Err(MembershipError::Contended)
+    }
+
+    /// The judgement of [`crate::storage_health::storage_health`] over the members the map
+    /// holds and the rows that are live: a member in the map with no row (`Down`, or a row
+    /// that expired a moment ago) counts as it is in the map, with no report; a row the map
+    /// does not hold yet counts as the row says.
+    ///
+    /// # Errors
+    /// The store failing; a stored value not decoding.
+    pub fn storage_health(&self) -> Result<StorageHealth, MembershipError> {
+        let mut members: BTreeMap<MemberId, MemberReport> = BTreeMap::new();
+        for member in self.current_map()?.as_ref().map_or(&[][..], Map::members) {
+            members.insert(
+                member.id,
+                MemberReport {
+                    id: member.id,
+                    state: member.state,
+                    report: None,
+                },
+            );
+        }
+        for (id, live) in self.read_rows()? {
+            members.insert(
+                id,
+                MemberReport {
+                    id,
+                    state: live.member.state,
+                    report: live.report,
+                },
+            );
+        }
+        // After the reads, so a report is judged no fresher than the clock then was.
+        let now = self.store.now();
+        let members: Vec<MemberReport> = members.into_values().collect();
+        Ok(storage_health(&members, now, self.config.freshness()))
     }
 
     fn read_rows(&self) -> Result<BTreeMap<MemberId, Live>, MembershipError> {

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use kbf_map::{Map, MemberId};
+use kbf_map::{Map, MemberId, MemberState};
 use kbf_mapsync::MapHolder;
 use kbf_server::NodeMap;
 use kbf_server::frontend::{self, FrontendHandle, start_frontend};
@@ -461,12 +461,17 @@ pub async fn eventually<T, F: std::future::Future<Output = Option<T>>>(
     found.unwrap_or_else(|_| panic!("never happened: {what}"))
 }
 
-/// The map in `holder` once it has `members` members.
+/// The map in `holder` once it has `members` members, every one `Active`: a node that
+/// registered rebuilds its index first (`CatchingUp`), and the map ranks a member by its
+/// state, so the owner of a blob is settled only when every member has been promoted.
 pub async fn map_of(who: &str, holder: &MapHolder, members: usize) -> Arc<Map> {
     let mut changes = holder.changes();
     let arrived = timeout(HANG, async {
         loop {
-            if let Some(map) = holder.current().filter(|m| m.members().len() == members) {
+            if let Some(map) = holder.current().filter(|m| {
+                m.members().len() == members
+                    && m.members().iter().all(|x| x.state == MemberState::Active)
+            }) {
                 return map;
             }
             changes.changed().await.expect("the holder is open");
