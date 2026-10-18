@@ -338,12 +338,11 @@ impl Source {
                 };
                 // The window is closed by bytes (`REPLAY_BYTES`) and by frames: a flood of
                 // tiny frames would otherwise grow the list, and pin the read buffers the
-                // frames were cut from, far past the byte bound. An empty DATA frame carries
-                // nothing to replay.
-                let keep = !matches!(&kept, Kept::Data(data) if data.is_empty());
-                if keep && state.kept.len() >= MAX_KEPT_FRAMES {
+                // frames were cut from, far past the byte bound. (h2 drops an empty DATA
+                // frame that does not end the stream before the body sees it.)
+                if state.kept.len() >= MAX_KEPT_FRAMES {
                     state.buffer.close();
-                } else if keep && state.buffer.push(len) {
+                } else if state.buffer.push(len) {
                     state.kept.push(kept.clone());
                     *cursor += 1;
                 }

@@ -538,7 +538,12 @@ async fn a_burst_dials_at_most_16_at_once_and_opens_at_most_256_connections() {
     rig.a.state.max_concurrent.store(1, Ordering::Release);
     rig.net.delay_connects(Duration::from_millis(500));
     let mut client = rig.client().await;
-    let mut open = start_many(&mut client, 300).await;
+    // One stream first, so the waves of 16 dials do not line up with the 256 cap: the last
+    // wave has room for 15 only, and a dial count that forgot the dials in flight sends 16.
+    let mut open = start_many(&mut client, 1).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(rig.a.state.dispatches(), 1);
+    let mut rest = start_many(&mut client, 299).await;
     // 256 connections at 16 per half second take 8 s; the clock runs ahead only when idle.
     tokio::time::sleep(Duration::from_secs(30)).await;
     assert_eq!(rig.a.state.dispatches(), 256);
@@ -554,6 +559,9 @@ async fn a_burst_dials_at_most_16_at_once_and_opens_at_most_256_connections() {
     );
     gate.add_permits(400);
     while let Some(reply) = next_of(&mut open).await {
+        assert_eq!(reply.text(), "a");
+    }
+    while let Some(reply) = next_of(&mut rest).await {
         assert_eq!(reply.text(), "a");
     }
 }
@@ -632,20 +640,32 @@ async fn a_request_of_many_tiny_frames_is_not_kept_for_a_replay() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn empty_frames_cost_the_replay_window_nothing() {
-    let rig = Rig::start(refusing(1, "second"), tagged("b")).await;
-    let mut client = rig.client().await;
-    let response = send_frames(&mut client, 90, 0).await;
-    let reply = finish(response).await;
-    assert_eq!(reply.text(), "second", "{reply:?}");
-    assert_eq!(rig.core.metrics.retries.load(Ordering::Acquire), 1);
-}
-
-#[tokio::test(start_paused = true)]
 async fn a_few_small_frames_are_replayed_whole() {
     let rig = Rig::start(refusing(1, "second"), tagged("b")).await;
     let mut client = rig.client().await;
     let response = send_frames(&mut client, 40, 1).await;
     let reply = finish(response).await;
     assert_eq!(reply.text(), "second", "{reply:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_response_that_ends_with_its_data_ends_without_trailers() {
+    let a = script(|mut call| async move {
+        read_all(&mut call.body).await;
+        let response = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/grpc")
+            .body(())
+            .expect("a response");
+        let mut send = call.respond.send_response(response, false).expect("head");
+        send.send_data(Bytes::from_static(b"whole"), true)
+            .expect("data and END_STREAM");
+    });
+    let rig = Rig::start(a, tagged("b")).await;
+    let reply = rig.client().await.unary(CAPS).await;
+    assert_eq!(reply.text(), "whole", "{reply:?}");
+    assert!(
+        reply.trailers.is_none(),
+        "no status was invented: {reply:?}"
+    );
 }
