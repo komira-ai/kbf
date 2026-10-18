@@ -64,6 +64,7 @@ fn the_document_has_the_designs_fields() {
             "run_id",
             "runtime",
             "scenario",
+            "schema_version",
             "set_hash",
             "stage",
             "started",
@@ -75,6 +76,26 @@ fn the_document_has_the_designs_fields() {
     assert_eq!(value["run_id"], "42");
     assert_eq!(value["attempt"], "2");
     assert_eq!(value["set_hash"], serde_json::Value::Null);
+    // Catches: a layout change a reader cannot tell from the old one.
+    assert_eq!(value["schema_version"], SCHEMA_VERSION);
+    assert_eq!(SCHEMA_VERSION, 1);
+}
+
+#[test]
+fn the_harness_commit_is_its_own_when_it_is_given_and_the_commit_under_test_otherwise() {
+    // Catches: two fields that cannot differ (the attested beta runs released bytes with the
+    // harness of another checkout, and the document must say which is which), and a harness
+    // commit that is lost when it is given. Mutant: `harness_commit` always the commit.
+    let both = Document::running("s", |key| match key {
+        "GITHUB_SHA" => Some("aaa".to_owned()),
+        "KBF_HARNESS_COMMIT" => Some("bbb".to_owned()),
+        _ => None,
+    });
+    assert_eq!(
+        (both.commit.as_str(), both.harness_commit.as_str()),
+        ("aaa", "bbb")
+    );
+    assert_eq!(doc().harness_commit, "0123abc");
 }
 
 #[test]
@@ -169,6 +190,37 @@ fn the_summary_is_a_table_of_the_gates() {
     assert!(text.contains("unattested"), "{text}");
     assert!(text.contains("envoy: absent: not set"), "{text}");
     assert!(text.contains("duration: 412 s"), "{text}");
+}
+
+#[test]
+fn the_summary_spells_the_status_as_the_document_does_and_keeps_a_pipe_in_its_cell() {
+    // Catches: `Passed` in the summary where the JSON says `PASSED` (a reader greps one for
+    // the other), and a `|` in a measured value or detail ending its cell, which shifts every
+    // column after it. Mutants: `{:?}` for the status; no escape in `cell`.
+    let mut d = doc();
+    d.status = Status::Passed;
+    let mut g = gate("lost_blobs_gauge", Verdict::Pass);
+    g.measured = serde_json::json!("a|b");
+    g.threshold = "x | y".to_owned();
+    d.gates = vec![g];
+    let text = d.summary();
+    assert!(
+        text.starts_with("## Beta `farm_under_build_load`: PASSED\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("| lost_blobs_gauge | \"a\\|b\" | x \\| y | PASS |"),
+        "{text}"
+    );
+    for status in [
+        Status::Running,
+        Status::Passed,
+        Status::Failed,
+        Status::TimedOut,
+    ] {
+        let json = serde_json::to_value(status).expect("json");
+        assert_eq!(json, status.as_str());
+    }
 }
 
 #[test]

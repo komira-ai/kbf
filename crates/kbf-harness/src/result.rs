@@ -19,6 +19,14 @@ use crate::gates::{Gate, Verdict};
 /// The stage the document belongs to (`release/stages.yml`).
 pub const STAGE: &str = "beta";
 
+/// The document's layout, counted up when a field changes meaning, so a reader (the offer to
+/// gamma, a dashboard) can refuse a document it does not know.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// The variable that names the commit of the harness itself, when it is not the commit
+/// under test (the attested beta runs the released bytes with the harness of a checkout).
+pub const HARNESS_COMMIT_VAR: &str = "KBF_HARNESS_COMMIT";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum Status {
     #[serde(rename = "RUNNING")]
@@ -29,6 +37,19 @@ pub enum Status {
     Failed,
     #[serde(rename = "TIMED_OUT")]
     TimedOut,
+}
+
+impl Status {
+    /// The status as the document spells it (`PASSED`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::Running => "RUNNING",
+            Status::Passed => "PASSED",
+            Status::Failed => "FAILED",
+            Status::TimedOut => "TIMED_OUT",
+        }
+    }
 }
 
 /// What the run used, so the document says what was and was not exercised.
@@ -57,6 +78,8 @@ pub struct Builds {
 /// `beta-result.json`.
 #[derive(Clone, Debug, Serialize)]
 pub struct Document {
+    /// [`SCHEMA_VERSION`].
+    pub schema_version: u32,
     pub stage: &'static str,
     pub scenario: String,
     pub commit: String,
@@ -103,9 +126,10 @@ impl Document {
         let get = |key: &str| env(key).unwrap_or_else(|| "local".to_owned());
         let commit = get("GITHUB_SHA");
         Self {
+            schema_version: SCHEMA_VERSION,
             stage: STAGE,
             scenario: scenario.to_owned(),
-            harness_commit: commit.clone(),
+            harness_commit: env(HARNESS_COMMIT_VAR).unwrap_or_else(|| commit.clone()),
             commit,
             set_hash: None,
             run_id: get("GITHUB_RUN_ID"),
@@ -137,8 +161,10 @@ impl Document {
     #[must_use]
     pub fn summary(&self) -> String {
         let mut out = format!(
-            "## Beta `{}`: {:?}\n\n{}\n\n| gate | measured | threshold | verdict |\n|---|---|---|---|\n",
-            self.scenario, self.status, self.note
+            "## Beta `{}`: {}\n\n{}\n\n| gate | measured | threshold | verdict |\n|---|---|---|---|\n",
+            self.scenario,
+            self.status.as_str(),
+            self.note
         );
         for g in &self.gates {
             let verdict = match g.verdict {
@@ -147,7 +173,10 @@ impl Document {
             };
             out.push_str(&format!(
                 "| {} | {} | {} | {} |\n",
-                g.name, g.measured, g.threshold, verdict
+                cell(&g.name),
+                cell(&g.measured.to_string()),
+                cell(&g.threshold),
+                verdict
             ));
         }
         if let Some(error) = &self.error {
@@ -165,6 +194,11 @@ impl Document {
         }
         out
     }
+}
+
+/// `text` as a cell of a Markdown table: a `|` in it would end the cell.
+fn cell(text: &str) -> String {
+    text.replace('|', "\\|")
 }
 
 /// The document being written to `path`: [`Writer::write`] saves its current state; its
