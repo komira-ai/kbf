@@ -16,6 +16,7 @@ fn hello() -> Message {
         instance: Some(crate::handover::Instance::B),
         reapi: "127.0.0.1:1".parse().expect("address"),
         state: PathBuf::from("/state.db"),
+        enroll: None,
     }
 }
 

@@ -30,6 +30,9 @@ pub(crate) struct Facts {
     /// Which instance this is; `None` if it was started without `--instance`.
     pub instance: Option<Instance>,
     pub state: PathBuf,
+    /// What its enrollment flags say (`EnrollFlags::handover_key`); `None` without
+    /// `--enroll-listen`.
+    pub enroll: Option<String>,
 }
 
 /// Everything a holder stops to let go, in the order it stops it.
@@ -80,6 +83,14 @@ impl Stand {
             tokio::time::sleep(QUIET_LOOK).await;
         }
     }
+}
+
+/// How a refusal says what a frontend's enrollment flags are (their key, on one line).
+fn describe(key: Option<&str>) -> String {
+    key.map_or_else(
+        || "has no enroll listener".to_owned(),
+        |key| format!("has [{}]", key.replace('\n', ", ")),
+    )
 }
 
 /// The channel to a successor whose REAPI listener is at an address, or why it cannot be
@@ -236,6 +247,7 @@ impl Holder {
             instance,
             reapi,
             state,
+            enroll,
         } = hello
         else {
             return Err("the first message must be hello".to_owned());
@@ -260,6 +272,15 @@ impl Holder {
         }
         if *state != facts.state {
             return Err("the successor's --state-store is not this frontend's".to_owned());
+        }
+        if *enroll != facts.enroll {
+            return Err(format!(
+                "the successor's enrollment is not this frontend's (--enroll-listen, --ca-dir, \
+                 --ca-signer, --ca-dev-file-signer and --enroll-allow-unenforced-deny must be \
+                 the same, or all absent): this frontend {}, the successor {}",
+                describe(facts.enroll.as_deref()),
+                describe(enroll.as_deref()),
+            ));
         }
         if !reapi.ip().is_loopback() {
             return Err(format!(

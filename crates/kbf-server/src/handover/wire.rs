@@ -1,7 +1,7 @@
 //! The handover's wire: one line per message on the control socket.
 //!
 //! ```text
-//! successor -> holder   hello <version> <instance a|b|-> <reapi> <state path, hex>
+//! successor -> holder   hello <version> <instance a|b|-> <reapi> <state path, hex> <enroll flags, hex|->
 //! holder -> successor   offer <generation>
 //!                       refused <why>
 //! successor -> holder   ready
@@ -23,19 +23,21 @@ use tokio::net::UnixStream;
 use super::Instance;
 
 /// The protocol version a hello names.
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 
 /// One message of the handover.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
     /// The successor asks to take over: its protocol, the instance it is, the REAPI
-    /// address it bound (where the holder forwards the calls that still reach it) and its
-    /// state file.
+    /// address it bound (where the holder forwards the calls that still reach it), its
+    /// state file and, if it serves enrollment, what must agree between the two
+    /// (`EnrollFlags::handover_key`).
     Hello {
         version: u32,
         instance: Option<Instance>,
         reapi: SocketAddr,
         state: PathBuf,
+        enroll: Option<String>,
     },
     /// The holder agrees, and says the generation the successor must find the state
     /// store at.
@@ -63,10 +65,12 @@ impl Message {
                 instance,
                 reapi,
                 state,
+                enroll,
             } => {
                 let instance = instance.map_or('-', Instance::letter);
                 let state = hex::encode(state.as_os_str().as_bytes());
-                format!("hello {version} {instance} {reapi} {state}")
+                let enroll = enroll.as_ref().map_or_else(|| "-".to_owned(), hex::encode);
+                format!("hello {version} {instance} {reapi} {state} {enroll}")
             }
             Self::Offer { generation } => format!("offer {generation}"),
             Self::Refused(why) => format!("refused {}", one_line(why)),
@@ -110,11 +114,16 @@ fn hello(rest: &str) -> Option<Message> {
     };
     let reapi = fields.next()?.parse().ok()?;
     let state = PathBuf::from(OsString::from_vec(hex::decode(fields.next()?).ok()?));
+    let enroll = match fields.next()? {
+        "-" => None,
+        text => Some(String::from_utf8(hex::decode(text).ok()?).ok()?),
+    };
     Some(Message::Hello {
         version,
         instance,
         reapi,
         state,
+        enroll,
     })
 }
 

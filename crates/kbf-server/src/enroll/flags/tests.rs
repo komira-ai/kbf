@@ -232,3 +232,60 @@ fn instance_b_moves_the_enroll_listener_with_the_others() {
     assert_eq!(a.enroll.expect("enroll").listen.port(), 18983);
     assert_eq!(b.enroll.expect("enroll").listen.port(), 18993);
 }
+
+/// What a handover compares is the same for the two instances of one command line, and
+/// differs for each flag that decides the CA or the address.
+///
+/// Catches: a key built from the shifted port (the pair never agree, so no handover
+/// happens), or a key that leaves out the listener's address, the CA directory, the
+/// signer or the deny-row switch (a successor serving another CA is let through).
+#[test]
+fn the_handover_key_is_the_same_for_both_instances_and_differs_by_each_ca_flag() {
+    let key = |extra: &[&str]| {
+        let mut all = vec!["--handover-socket=/run/kbf/control.sock"];
+        all.extend_from_slice(extra);
+        let parsed = flags(&with(&all)).expect("flags");
+        parsed
+            .enroll
+            .expect("enroll")
+            .handover_key(parsed.handover.and_then(|h| h.instance))
+    };
+    let a = key(&["--ca-dev-file-signer", "--instance=a"]);
+    assert_eq!(a, key(&["--ca-dev-file-signer", "--instance=b"]));
+    let others = [
+        key(&["--ca-signer=/run/kbf/signer.sock", "--instance=a"]),
+        key(&[
+            "--ca-dev-file-signer",
+            "--enroll-allow-unenforced-deny",
+            "--instance=a",
+        ]),
+    ];
+    for other in &others {
+        assert_ne!(&a, other);
+    }
+    assert_ne!(others[0], others[1]);
+    let mut elsewhere = with(&[
+        "--handover-socket=/run/kbf/control.sock",
+        "--ca-dev-file-signer",
+        "--instance=a",
+    ]);
+    elsewhere[0] = "--enroll-listen=127.0.0.2:18983";
+    let moved = flags(&elsewhere).expect("flags");
+    assert_ne!(
+        a,
+        moved
+            .enroll
+            .expect("enroll")
+            .handover_key(moved.handover.and_then(|h| h.instance))
+    );
+    elsewhere[0] = "--enroll-listen=127.0.0.1:18983";
+    elsewhere[2] = "--ca-dir=/var/lib/kbf/other";
+    let other_ca = flags(&elsewhere).expect("flags");
+    assert_ne!(
+        a,
+        other_ca
+            .enroll
+            .expect("enroll")
+            .handover_key(other_ca.handover.and_then(|h| h.instance))
+    );
+}

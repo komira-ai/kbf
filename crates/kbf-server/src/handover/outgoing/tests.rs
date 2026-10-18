@@ -24,6 +24,7 @@ fn hello(change: impl FnOnce(&mut Message)) -> Message {
         instance: Some(Instance::B),
         reapi: SUCCESSOR_REAPI.parse().expect("address"),
         state: PathBuf::from("/var/lib/kbf/state.db"),
+        enroll: None,
     };
     change(&mut hello);
     hello
@@ -186,7 +187,7 @@ async fn a_successor_started_with_other_flags_is_refused_and_nothing_changes() {
                     *version = 1;
                 }
             }),
-            "protocol 2, not 1",
+            "protocol 3, not 1",
         ),
         (
             hello(|h| {
@@ -219,6 +220,14 @@ async fn a_successor_started_with_other_flags_is_refused_and_nothing_changes() {
                 }
             }),
             "--state-store",
+        ),
+        (
+            hello(|h| {
+                if let Message::Hello { enroll, .. } = h {
+                    *enroll = Some("enroll-listen 127.0.0.1:9\nca-dir /ca".to_owned());
+                }
+            }),
+            "--enroll-listen, --ca-dir",
         ),
         (Message::Ready, "must be hello"),
     ];

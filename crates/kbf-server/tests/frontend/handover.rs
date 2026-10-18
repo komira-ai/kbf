@@ -75,6 +75,8 @@ struct Proc {
     reapi: SocketAddr,
     worker: SocketAddr,
     api: SocketAddr,
+    /// The enroll listener, if the flags gave `--enroll-listen`.
+    enroll: Option<SocketAddr>,
     drain: Arc<Drain>,
     /// Dropped to stop the frontend.
     _stop: oneshot::Sender<()>,
@@ -89,6 +91,7 @@ impl Proc {
             reapi,
             worker,
             api: api.expect("the operator API"),
+            enroll: handle.enroll,
             drain,
             _stop: stop,
             served: tokio::spawn(handle.serve()),
@@ -723,4 +726,254 @@ async fn a_control_socket_that_cannot_be_made_fails_the_start() {
         .err()
         .expect("no control socket");
     assert!(error.to_string().contains("No such file"), "{error}");
+}
+
+/// The enroll listener across a handover (`--enroll-listen` and its companions): each
+/// instance binds an enroll listener of its own, in its port block, over the one CA
+/// directory and the one state file.
+mod enrolled {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use kbf_enroll::client::{CallError, EnrollError, Enrollment, connect, enroll};
+    use kbf_enroll::config::{Config, Host};
+    use kbf_enroll::pin::Anchor;
+    use kbf_enroll::store::Store as NodeStore;
+    use kbf_proto::kbf::enroll::v1::NodeFacts;
+    use kbf_server::api_client::OperatorClient;
+    use kbf_server::enroll::api::{NODES, TOKENS};
+    use kbf_types::enroll_api::{NodeList, TokenCreated};
+    use kbf_types::{RefusalReason, Role, RoleSet, Token};
+
+    use super::*;
+
+    const API_TOKEN: &str = "kbf-test-token-0123456789abcdef0123456789";
+
+    /// The flags that turn enrollment on, with the CA in `ca` under the test's directory.
+    fn on(dir: &Dir, ca: &str) -> Vec<String> {
+        let file = dir.0.join("api.token");
+        std::fs::write(&file, format!("{API_TOKEN}\n")).expect("token file");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        vec![
+            format!("--api-token-file={}", file.display()),
+            "--enroll-listen=127.0.0.1:0".to_owned(),
+            format!("--ca-dir={}/{ca}", dir.0.display()),
+            "--ca-dev-file-signer".to_owned(),
+            "--enroll-allow-unenforced-deny".to_owned(),
+            "--frontend-name=localhost".to_owned(),
+        ]
+    }
+
+    fn flags_with(node: &Node, dir: &Dir, instance: &str, more: &[String]) -> FrontendFlags {
+        let more: Vec<&str> = more.iter().map(String::as_str).collect();
+        handover_flags(node, dir, instance, &more)
+    }
+
+    /// A one-use token for a daemon, made through the operator API at `api`.
+    async fn token(api: SocketAddr) -> Token {
+        let created = tokio::task::spawn_blocking(move || {
+            let client = OperatorClient::new(api, Some(API_TOKEN.to_owned()));
+            let reply = client
+                .post(TOKENS, r#"{"roles":["daemon"],"max_uses":1}"#)
+                .expect("create");
+            assert_eq!(reply.status, 200, "{}", reply.body);
+            serde_json::from_str::<TokenCreated>(&reply.body).expect("a created token")
+        })
+        .await
+        .expect("join");
+        created.token.parse().expect("a token")
+    }
+
+    /// The ids of the nodes the operator API at `api` lists.
+    async fn nodes(api: SocketAddr) -> Vec<String> {
+        tokio::task::spawn_blocking(move || {
+            let client = OperatorClient::new(api, Some(API_TOKEN.to_owned()));
+            let reply = client.get_gated(NODES).expect("list");
+            assert_eq!(reply.status, 200, "{}", reply.body);
+            let list = serde_json::from_str::<NodeList>(&reply.body).expect("a list");
+            list.nodes.into_iter().map(|n| n.id).collect()
+        })
+        .await
+        .expect("join")
+    }
+
+    /// Enrolls node `id` with `token` at the enroll listener `at`, in a node directory of
+    /// its own under `dir`.
+    async fn enroll_at(
+        dir: &Dir,
+        at: SocketAddr,
+        token: &Token,
+        id: &str,
+    ) -> Result<kbf_enroll::store::Node, EnrollError> {
+        let root = dir.0.join(format!("node-{id}"));
+        let text = format!(
+            "[frontend]\nurl = \"https://localhost:{}\"\n[node]\nid = \"{id}\"\n[enroll]\ntoken_file = \"{}\"\n[dirs]\nstate = \"{}\"\n",
+            at.port(),
+            root.join("enroll.token").display(),
+            root.join("state").display(),
+        );
+        let config = Config::parse(
+            &text,
+            &Host {
+                hostname: id.to_owned(),
+                cpus: 4,
+            },
+        )
+        .unwrap_or_else(|e| panic!("config: {e}"));
+        std::fs::create_dir_all(&root).expect("node dir");
+        std::fs::write(&config.token_file, token.to_line()).expect("token file");
+        std::fs::set_permissions(&config.token_file, std::fs::Permissions::from_mode(0o600))
+            .expect("mode");
+        let store = NodeStore::open(&config.state_dir).expect("store");
+        let frontend = connect(&config.frontend, Anchor::Pin(*token.pin()))
+            .await
+            .expect("the listener's certificate is the CA the token names");
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_secs(),
+        )
+        .expect("time");
+        enroll(
+            &frontend,
+            &store,
+            &Enrollment {
+                config: &config,
+                token,
+                roles: RoleSet::new([Role::Daemon]).expect("roles"),
+                facts: NodeFacts {
+                    os: "linux".to_owned(),
+                    arch: "x86_64".to_owned(),
+                    commit: "abc".to_owned(),
+                    protocol: 1,
+                    package_version: "0.0.0".to_owned(),
+                },
+                now,
+            },
+        )
+        .await
+    }
+
+    /// The reason a start was refused by the frontend serving, or the error as text.
+    async fn refused(flags: &FrontendFlags) -> String {
+        let (_stop, stopped) = oneshot::channel::<()>();
+        taking_over(flags, stopped)
+            .await
+            .err()
+            .expect("the handover is refused")
+            .to_string()
+    }
+
+    /// Catches: an enroll port that goes dark at a handover, or a successor that serves a
+    /// different CA than the frontend it replaces. Instance a serves Enroll and makes a
+    /// token; instance b takes over, binds the enroll listener of its block, and a node
+    /// enrolls there with the token a made (the registry is in the shared state file) and
+    /// pins the CA the token names (so b's listener certificate is issued by the CA a
+    /// served). A token b makes carries the same pin. Mutants: a successor that does not
+    /// start the enroll listener (the node cannot enrol); one that loads another CA
+    /// directory (the pin differs, the node refuses the certificate).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_enrolls_at_the_successor_and_the_ca_pin_is_unchanged() {
+        let node = Node::start().await;
+        let dir = Dir::new();
+        let more = on(&dir, "ca");
+        let old = Proc::cold(&flags_with(&node, &dir, "a", &more)).await;
+        let before = token(old.api).await;
+        let spare = token(old.api).await;
+        assert_eq!(before.pin(), spare.pin());
+
+        let new = Proc::taking_over(&flags_with(&node, &dir, "b", &more)).await;
+        let at = new.enroll.expect("the successor's enroll listener");
+        assert_ne!(
+            Some(at),
+            old.enroll,
+            "each instance has a listener of its own"
+        );
+        let after = token(new.api).await;
+        assert_eq!(after.pin(), before.pin(), "the same CA");
+
+        let installed = enroll_at(&dir, at, &before, "node-07")
+            .await
+            .expect("enrolled at the successor");
+        assert_eq!(installed.pin().expect("pin"), *before.pin());
+        assert_eq!(nodes(new.api).await, ["node-07"]);
+        old.ended().await;
+    }
+
+    /// Catches: a successor that serves enrollment differently from the frontend it
+    /// replaces being let through: another `--enroll-listen` (its address, not its
+    /// instance's port shift), another `--ca-dir` (another CA: every outstanding token's
+    /// pin is wrong), enrollment left out, or enrollment where there was none. The holder
+    /// refuses each, naming the enroll flags, and keeps serving. Mutants: the enroll part
+    /// of `hello` dropped from the comparison.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_successor_with_other_enroll_flags_is_refused() {
+        let node = Node::start().await;
+        let dir = Dir::new();
+        let more = on(&dir, "ca");
+        let old = Proc::cold(&flags_with(&node, &dir, "a", &more)).await;
+
+        let mut elsewhere = more.clone();
+        elsewhere[1] = "--enroll-listen=127.0.0.2:0".to_owned();
+        let mut other_ca = more.clone();
+        other_ca[2] = format!("--ca-dir={}/other-ca", dir.0.display());
+        let without = vec![more[0].clone()];
+        for (why, flags) in [
+            ("--enroll-listen", elsewhere),
+            ("--ca-dir", other_ca),
+            ("enroll", without),
+        ] {
+            let error = refused(&flags_with(&node, &dir, "b", &flags)).await;
+            assert!(error.contains("refused the handover"), "{why}: {error}");
+            assert!(error.contains(why), "{why}: {error}");
+            meanwhile().await;
+            assert!(!old.drain.is_unready() && !old.drain.is_draining());
+        }
+
+        let plain = Dir::new();
+        let _plain_old = Proc::cold(&handover_flags(&node, &plain, "a", &[])).await;
+        let error = refused(&flags_with(&node, &plain, "b", &on(&plain, "ca"))).await;
+        assert!(error.contains("enroll"), "{error}");
+    }
+
+    /// Catches: an enrollment committed by the frontend after it has handed over. The
+    /// holder keeps its enroll listener open (Envoy-side callers still reach it, like the
+    /// REAPI and API listeners) until it exits, and answers `NotSigner`, since its store
+    /// handle is fenced; nothing is written (the node is not listed and the one-use token
+    /// is whole: it enrolls the node at the successor). Mutant: the holder's service over
+    /// a store that is not fenced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_frontend_that_handed_over_commits_no_enrollment() {
+        let node = Node::start().await;
+        let dir = Dir::new();
+        let more = on(&dir, "ca");
+        let old = Proc::cold(&flags_with(&node, &dir, "a", &more)).await;
+        let granted = token(old.api).await;
+        // A caller with an Execute open keeps the holder alive past the handover.
+        let client = Client::connect(old.reapi, old.worker).await;
+        let job = Job::new("holds the first frontend", &[]);
+        client.upload(&job.blobs()).await;
+        let _ops = client.execute(&job.action).await;
+
+        let new = Proc::taking_over(&flags_with(&node, &dir, "b", &more)).await;
+        let late = enroll_at(
+            &dir,
+            old.enroll.expect("the holder's enroll listener"),
+            &granted,
+            "node-late",
+        )
+        .await;
+        match late {
+            Err(EnrollError::Call(CallError::Refused(RefusalReason::NotSigner))) => {}
+            other => panic!(
+                "the fenced frontend answered {:?}",
+                other.map(|n| n.node_id)
+            ),
+        }
+        assert!(nodes(new.api).await.is_empty(), "nothing was written");
+        enroll_at(&dir, new.enroll.expect("enroll"), &granted, "node-late")
+            .await
+            .expect("the token is whole: the successor enrolls the node");
+        assert_eq!(nodes(new.api).await, ["node-late"]);
+    }
 }

@@ -14,6 +14,7 @@ fn hello(instance: Option<Instance>, reapi: &str, state: PathBuf) -> Message {
         instance,
         reapi: addr(reapi),
         state,
+        enroll: None,
     }
 }
 
@@ -32,6 +33,13 @@ fn every_message_is_one_line_that_parses_back() {
         ),
         hello(Some(Instance::A), "[::1]:3000", odd),
         hello(Some(Instance::B), "127.0.0.1:3010", PathBuf::from("/s")),
+        Message::Hello {
+            version: PROTOCOL,
+            instance: Some(Instance::B),
+            reapi: addr("127.0.0.1:3010"),
+            state: PathBuf::from("/s"),
+            enroll: Some("enroll-listen 127.0.0.1:3002\nca-dir /a b\n\u{e9}".to_owned()),
+        },
         Message::Offer { generation: 7 },
         Message::Offer { generation: 0 },
         Message::Serving,
@@ -68,12 +76,13 @@ fn a_line_that_is_not_a_message_is_none() {
         "",
         "launch",
         "hello",
-        "hello x a 127.0.0.1:1 00",
-        "hello 2 c 127.0.0.1:1 00",
-        "hello 2 a 127.0.0.1 00",
-        "hello 2 a nowhere 00",
-        "hello 2 a 127.0.0.1:1",
-        "hello 2 a 127.0.0.1:1 zz",
+        "hello x a 127.0.0.1:1 00 -",
+        "hello 3 c 127.0.0.1:1 00 -",
+        "hello 3 a 127.0.0.1 00 -",
+        "hello 3 a nowhere 00 -",
+        "hello 3 a 127.0.0.1:1 00",
+        "hello 3 a 127.0.0.1:1 00 zz",
+        "hello 3 a 127.0.0.1:1 zz -",
         "offer",
         "offer seven",
     ] {

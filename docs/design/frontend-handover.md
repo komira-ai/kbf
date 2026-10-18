@@ -112,6 +112,15 @@ one keeps answering `/readyz` (and its reads), but its farm is fenced: write cal
 drain) go to the new instance. A cordon or a drain an operator set is a row in the state store,
 so the new frontend still holds it (a drain's deadline is wall-clock time).
 
+**The enroll listener (`--enroll-listen`).** Like the other listeners it is not passed on: each
+instance binds its own (instance b ten ports above), and both open the one `--ca-dir`, so the
+successor serves the same CA and a token's pin stays right. The hello carries the enroll flags
+that decide that (`--enroll-listen` less the instance's shift, `--ca-dir`, `--ca-signer` or
+`--ca-dev-file-signer`, `--enroll-allow-unenforced-deny`); the old frontend refuses a successor
+whose flags differ, or that has enrollment where it has none, or the reverse. The old frontend
+keeps its enroll listener until it exits, and answers every call `NotSigner`: its store handle is
+fenced, so it commits no enrollment after the stand-down. A node retries against the new one.
+
 **`/readyz`, the health service and Envoy.** The old frontend stays ready through the stand-down
 (its readiness stops asking the stores it gave up). The new one says ready once its probes pass,
 and tells the old one it serves. The old one then waits Envoy's settle and goes not ready: Envoy
