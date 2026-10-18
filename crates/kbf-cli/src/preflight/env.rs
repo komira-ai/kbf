@@ -1,4 +1,4 @@
-//! What the environment gives the process: the S3 key pair, the directories apart, the
+//! What the environment gives the process: the S3 key pair, the
 //! container driver's runtime (`crun`), the open-file limit.
 
 use std::io;
@@ -10,9 +10,6 @@ use super::{CRUN_MINIMUM, Host, NOFILE_FLOOR, Needs, Report, files::class_of};
 pub(super) fn check(needs: &Needs, host: &dyn Host, report: &mut Report) {
     if needs.s3 {
         s3(host, report);
-    }
-    if let Some((meta, data)) = &needs.meta_and_data {
-        meta_and_data(meta, data, report);
     }
     if let Some(container) = &needs.container {
         crun(&container.oci_runtime, host, report);
@@ -33,21 +30,6 @@ fn s3(host: &dyn Host, report: &mut Report) {
             format!(
                 "set {name} in the unit's EnvironmentFile (a file only the service user can read)"
             ),
-        );
-    }
-}
-
-fn meta_and_data(meta: &Path, data: &Path, report: &mut Report) {
-    if meta.starts_with(data) {
-        report.refuse(
-            format!(
-                "--meta-dir {} is inside --data-dir {}",
-                meta.display(),
-                data.display()
-            ),
-            "the data directory is the daemon's cache and lease space, sized to the free space \
-             of its file system; the metadata log must not live in it",
-            "put --meta-dir on local disk outside --data-dir".to_owned(),
         );
     }
 }
