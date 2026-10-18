@@ -333,12 +333,10 @@ impl<M: MetaLog, O: ObjectStore + 'static> Cache<M, O> {
             let (mut stream, mut hasher) = writing;
             let write = move || {
                 hasher.update(&piece);
-                stream.append(&piece).map(|()| (stream, hasher))
+                Ok(stream.append(&piece).map(|()| (stream, hasher)))
             };
-            let _in_flight = self.writer.metrics.tier_in_flight.raise();
-            let joined = tokio::task::spawn_blocking(write).await;
-            writing =
-                joined.map_err(|e| CacheError::Internal(format!("a stream write: {e}")))??;
+            // Counted and timed as every tier call is.
+            writing = blocking(&self.writer.metrics, Box::new(write)).await??;
         }
         let (stream, hasher) = writing;
         let (actual, crc32c) = hasher.finish();
