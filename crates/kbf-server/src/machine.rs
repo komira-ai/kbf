@@ -27,8 +27,9 @@ use std::time::SystemTime;
 use kbf_types::{ActionKey, Digest, LeaseId, LeaseKind, OperationId, WaiterId, WorkerId};
 
 use crate::action_usage::Subject;
-use crate::fleet::{SoftwareView, UpdateReport};
+use crate::fleet::SoftwareView;
 use crate::stamp::Stamp;
+use crate::update_status::UpdateReport;
 
 /// The REAPI name of the operation `waiter` waits on, in the process of `term`:
 /// `operations/{term}-{waiter}`.
@@ -93,6 +94,9 @@ pub struct Node {
     pub status: Option<SoftwareView>,
     /// The newest `UpdateStatus` it sent, on any of its streams; `None` before the first.
     pub update: Option<UpdateReport>,
+    /// Whether `update` came on the node's newest stream: a stream that registers
+    /// clears it until that stream sends its own.
+    pub update_live: bool,
 }
 
 /// The waiter records, the started table and the node registry of one farm (see the
@@ -178,18 +182,17 @@ impl FarmMachine {
         self.started.retain(|_, sent| sent.operation != operation);
     }
 
-    /// Records that `worker` registered on a new stream: it is connected, and keeps the
-    /// software status it sent on an earlier one. Its update status is dropped: a daemon
-    /// that restarted onto a build that predates pull-based updates sends none, and must
-    /// not be shown with the last one the old build sent.
+    /// Records that `worker` registered on a new stream: it is connected, and keeps
+    /// the status it sent on an earlier one.
     pub fn register(&mut self, worker: &WorkerId) {
         let node = self.nodes.entry(worker.clone()).or_insert(Node {
             connected: true,
             status: None,
             update: None,
+            update_live: false,
         });
         node.connected = true;
-        node.update = None;
+        node.update_live = false;
     }
 
     /// Records that the newest stream of `worker` has closed. The node stays listed.
@@ -206,10 +209,12 @@ impl FarmMachine {
         }
     }
 
-    /// Keeps `update` as the newest of `worker`, if it has registered.
-    pub fn report_update(&mut self, worker: &WorkerId, update: UpdateReport) {
+    /// Keeps `report` as the newest update status of `worker`, from its newest stream, if
+    /// it has registered.
+    pub fn report_update(&mut self, worker: &WorkerId, report: UpdateReport) {
         if let Some(node) = self.nodes.get_mut(worker) {
-            node.update = Some(update);
+            node.update = Some(report);
+            node.update_live = true;
         }
     }
 
@@ -314,16 +319,13 @@ mod tests {
     fn update(n: u8) -> UpdateReport {
         UpdateReport {
             state: "idle",
-            running_commit: "0123456789ab".to_owned(),
+            running_commit: format!("{n:012x}"),
             installed_commit: String::new(),
             staged_commit: String::new(),
-            offered_generation: u64::from(n),
-            acked_order_id: 0,
             refusal: String::new(),
+            offered_generation: u64::from(n),
             helper_present: false,
-            staged_protocol: 0,
-            staged_min_protocol: 0,
-            staged_state_schema: 0,
+            received_at_unix_ms: u64::from(n),
         }
     }
 
@@ -417,9 +419,10 @@ mod tests {
         base.start(LeaseId::new(1, 7), sent(4, 9));
         base.register(&node(1));
         base.report_status(&node(1), status(1));
+        base.report_update(&node(1), update(1));
         let lease = LeaseId::new(1, 7);
         type Change = fn(&mut FarmMachine);
-        let changes: [(&str, Change); 19] = [
+        let changes: [(&str, Change); 20] = [
             ("term", |m| m.term += 1),
             ("next_waiter", |m| m.next_waiter += 1),
             ("waiters: one more", |m| {
@@ -472,6 +475,7 @@ mod tests {
             ("node.connected", |m| m.disconnect(&node(1))),
             ("node.status", |m| m.report_status(&node(1), status(2))),
             ("node.update", |m| m.report_update(&node(1), update(2))),
+            ("node.update_live", |m| m.register(&node(1))),
         ];
         for (field, change) in changes {
             let mut changed = base.clone();
@@ -482,8 +486,10 @@ mod tests {
     }
 
     /// Catches a registry that forgets a node whose stream closed (#235: it stays
-    /// listed, not connected), one that drops a node's status when it registers again
-    /// (the status is kept across streams), one whose registering again leaves it
+    /// listed, not connected), one that drops a node's status or update report when it
+    /// registers again (both are kept across streams), one that leaves the report live
+    /// for a stream that has sent none (a host that restarted onto another release
+    /// would be judged by its previous process), one whose registering again leaves it
     /// not connected, and one that lists a node that never registered because a
     /// status or a closed stream named it.
     #[test]
@@ -502,13 +508,16 @@ mod tests {
             connected: false,
             status: Some(status(1)),
             update: Some(update(1)),
+            update_live: true,
         };
         assert_eq!(m.node(&node(1)), Some(&left));
         m.register(&node(1));
+        // The report is kept, but no longer live: the new stream has not sent its own.
         let back = Node {
             connected: true,
             status: Some(status(1)),
-            update: None,
+            update: Some(update(1)),
+            update_live: false,
         };
         assert_eq!(m.node(&node(1)), Some(&back));
         assert_eq!(m.nodes().collect::<Vec<_>>(), vec![&node(1)]);

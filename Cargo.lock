@@ -1338,14 +1338,12 @@ dependencies = [
  "kbf-segments",
  "kbf-server",
  "kbf-storage",
- "kbf-testkit",
  "kbf-threads",
  "kbf-transfer",
  "kbf-types",
  "prost",
  "rcgen",
  "rustix",
- "serde_json",
  "tokio",
  "tonic",
  "tracing",
@@ -1713,21 +1711,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kbf-helper"
-version = "0.1.0"
-dependencies = [
- "clap",
- "kbf-host",
- "kbf-installer",
- "kbf-update",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "thiserror",
- "tokio",
-]
-
-[[package]]
 name = "kbf-history"
 version = "0.1.0"
 dependencies = [
@@ -1780,9 +1763,12 @@ dependencies = [
 name = "kbf-installer"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "flate2",
  "hex",
  "kbf-host",
+ "kbf-installer",
+ "kbf-update",
  "libc",
  "rustix",
  "serde",
@@ -1790,6 +1776,8 @@ dependencies = [
  "sha2 0.11.0",
  "tar",
  "thiserror",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -2353,22 +2341,6 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
-]
-
-[[package]]
-name = "kbf-updater"
-version = "0.1.0"
-dependencies = [
- "base64 0.23.1",
- "hex",
- "kbf-host",
- "libc",
- "ring",
- "rustix",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "thiserror",
 ]
 
 [[package]]

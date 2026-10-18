@@ -35,10 +35,11 @@
 //! - after the server ends a stream, nothing more is read from it;
 //! - a `MapRequest` is answered with a `MapUpdate` of the storage map the server holds
 //!   now, when it holds one (the `map_push` module);
-//! - an `UpdateStatus` the deny list now refuses ends the stream. Otherwise it is kept as
-//!   the node's newest update status, unless a newer stream of the node has registered
-//!   since (`GET /v1/nodes` shows it as `update`);
-//! - an `Offer` is not read yet.
+//! - an `UpdateStatus` the deny list now refuses ends the stream. Otherwise it is kept
+//!   as the node's newest update status, unless a newer stream of the node has
+//!   registered since ([`Farm::update_status`]); the operator API serves it
+//!   ([`crate::update_status`]);
+//! - an `Offer` from a daemon is not read: offers go the other way.
 //!
 //! A server given a [`MapSource`] ([`WorkerService::with_map`]) names its map in
 //! `Welcome`, and sends a `MapUpdate` each time the source's map changes. A server given
@@ -315,10 +316,12 @@ impl Session {
                 self.peers
                     .admit(self.peer.as_ref(), worker.as_str())
                     .await?;
-                farm.update_status(worker, stream, status);
+                // Kept as the node's newest, unless a newer stream of the node has
+                // registered since.
+                let _ = farm.update_status(worker, stream, status);
                 None
             }
-            // A daemon's lease `Offer` is not read.
+            // The frontend sends offers; one from a daemon is not read.
             Some(daemon_message::Message::Offer(_)) => None,
             None => {
                 tracing::warn!(%worker, "an empty daemon message ignored");

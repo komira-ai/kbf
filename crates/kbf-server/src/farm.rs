@@ -73,14 +73,14 @@ use self::durable::Durable;
 use crate::action_usage::{self, Measured, Shapes};
 use crate::fault;
 use crate::fleet::{
-    NodeView, NodesView, PhaseView, PlacementView, SoftwareView, UpdateReport, UpdateView,
-    attention_changes, needs_attention,
+    NodeView, NodesView, PhaseView, PlacementView, SoftwareView, attention_changes, needs_attention,
 };
 use crate::machine::{FarmMachine, Sent, Waiter};
 use crate::memory;
 use crate::missing;
 use crate::run_record;
 use crate::stamp::Stamp;
+use crate::update_status::{HostUpdate, UpdateReport, UpdateSummary};
 
 /// The scheduler term of a new single-node server process: the wall-clock time of its
 /// start in milliseconds since the Unix epoch, times 2^16, plus 16 random bits.
@@ -566,14 +566,37 @@ impl Farm {
     }
 
     /// An `UpdateStatus` on `stream`: kept as the worker's newest, unless `stream` was
-    /// replaced (a newer stream sends its own after its `Welcome`).
-    pub fn update_status(&self, worker: &WorkerId, stream: StreamId, status: UpdateStatus) {
+    /// replaced (a newer stream sends its own), exactly as [`Self::node_status`] keeps a
+    /// `NodeStatus`. Returns whether it was kept.
+    pub fn update_status(&self, worker: &WorkerId, stream: StreamId, status: UpdateStatus) -> bool {
+        let report = UpdateReport::new(status, unix_ms());
         let mut state = self.lock();
-        if state.is_current(worker, stream) {
-            state
-                .machine
-                .report_update(worker, UpdateReport::new(status));
+        if !state.is_current(worker, stream) {
+            return false;
         }
+        state.machine.report_update(worker, report);
+        true
+    }
+
+    /// Every node registered since this farm started, in node-id order, with what each
+    /// last said about its update (`GET /v1/update/hosts`); judged against no desired
+    /// commit ([`HostUpdate::judge`]).
+    pub fn update_hosts(&self) -> Vec<HostUpdate> {
+        let mut state = self.lock();
+        state.note_closed_streams();
+        state
+            .machine
+            .nodes()
+            .filter_map(|worker| {
+                let node = state.machine.node(worker)?;
+                Some(HostUpdate::new(
+                    worker.as_str().to_owned(),
+                    node.connected,
+                    node.update_live,
+                    node.update.clone(),
+                ))
+            })
+            .collect()
     }
 
     /// This build, and every node registered since this farm started, in node-id order.
@@ -651,16 +674,19 @@ impl Farm {
         let node = state.machine.node(worker);
         let software = node.and_then(|n| n.status.clone());
         let phase = state.sched.phase(worker).cloned().unwrap_or_default();
+        let connected = node.is_some_and(|n| n.connected);
         NodeView {
             node_id: worker.as_str().to_owned(),
-            connected: node.is_some_and(|n| n.connected),
+            connected,
             needs_attention: needs_attention(software.as_ref(), &phase),
             software,
+            update: UpdateSummary::new(
+                node.and_then(|n| n.update.as_ref()),
+                connected,
+                node.is_some_and(|n| n.update_live),
+            ),
             placement,
             phase: PhaseView::new(&phase),
-            update: node
-                .and_then(|n| n.update.clone())
-                .map_or(UpdateView::Unsupported, UpdateView::Ok),
         }
     }
 
