@@ -415,3 +415,99 @@ fn a_pin_that_lands_after_the_look_is_not_written_over() {
     let ids: Vec<_> = unfinished(&farm).iter().map(|op| op.0).collect();
     assert_eq!(ids, [5]);
 }
+
+/// Catches: a pin that names an operation of another action being joined (the caller
+/// would wait on the wrong run and be handed its result), and a row of the operation
+/// that cannot be read being taken up as if it were whole: each is refused as corrupt.
+#[test]
+fn a_pin_or_row_that_cannot_be_trusted_is_refused() {
+    let store = LostAck::new();
+    let durable = durable_over(&store);
+    assert!(
+        durable
+            .submit(OperationId(0), &request(2), &subject())
+            .is_ok()
+    );
+    let pin = Txn::new().put(
+        format!("inflight/6d61696e/{}", request(1).key.action),
+        0_u64.to_be_bytes(),
+        Cond::Absent,
+    );
+    store.txn(pin).expect("store").expect("put");
+    let refused = durable.submit(OperationId(1), &request(1), &subject());
+    assert!(
+        matches!(refused, Err(StateError::Corrupt { .. })),
+        "{refused:?}"
+    );
+
+    let bad_rows = [
+        ("loss/0000000000000000", vec![1, 2, 3]),
+        (
+            "loss/0000000000000000",
+            (1_u64 << 32).to_be_bytes().to_vec(),
+        ),
+        ("fate/0000000000000000", vec![255]),
+        ("subject/0000000000000000", vec![255]),
+    ];
+    for (key, value) in bad_rows {
+        let put = Txn::new().put(key, value, Cond::Any);
+        store.txn(put).expect("store").expect("put");
+        let refused = durable.submit(OperationId(1), &request(2), &subject());
+        assert!(
+            matches!(refused, Err(StateError::Corrupt { .. })),
+            "{key}: {refused:?}"
+        );
+        let gone = Txn::new().delete(key, Cond::Any);
+        store.txn(gone).expect("store").expect("delete");
+    }
+}
+
+/// Catches: an operation that was queued and then requeued with losses and a fate being
+/// joined without them (the joiner's farm would give it a fresh budget), and one with
+/// none being refused.
+#[test]
+fn a_joined_operation_keeps_its_losses_and_fate() {
+    let store = LostAck::new();
+    let farm = farm_over(&store);
+    let other = durable_over(&store);
+    assert!(
+        other
+            .submit(OperationId(0), &request(1), &subject())
+            .is_ok()
+    );
+    let requeue = kbf_sched::Requeue {
+        operation: OperationId(0),
+        lease: kbf_types::LeaseId::new(5, 0),
+        worker: kbf_types::WorkerId::new("node-a"),
+        reason: kbf_sched::RequeueReason::Silent,
+    };
+    let fate = kbf_sched::Fate {
+        booked_bytes: 1 << 30,
+        not_started: 2,
+        ..kbf_sched::Fate::default()
+    };
+    other
+        .requeued(&requeue, Some(3), Some(&fate), &FloorChange::default())
+        .expect("requeue");
+    store
+        .txn(Txn::new().delete("subject/0000000000000000", Cond::Any))
+        .expect("store")
+        .expect("delete");
+
+    assert!(submit(&farm, 1).is_ok());
+
+    let state = farm.lock();
+    assert_eq!(state.sched.losses(OperationId(0)), Some(3));
+    assert_eq!(state.sched.fate(OperationId(0)), Some(fate));
+}
+
+/// Catches: a finish of an operation whose rows are gone (a retry of a finish that
+/// landed) failing for want of a pin to look up.
+#[test]
+fn finishing_an_operation_with_no_rows_writes_its_result_alone() {
+    let store = LostAck::new();
+    let durable = durable_over(&store);
+    refuse(&durable, 7);
+    assert_eq!(rows(&store, "inflight/"), 0);
+    assert_eq!(rows(&store, "done/"), 1);
+}

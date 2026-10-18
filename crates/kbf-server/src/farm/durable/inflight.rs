@@ -99,9 +99,7 @@ impl Durable {
         let Some(row) = self.store.get(&key)? else {
             return Ok(None);
         };
-        let FarmInput::Submit(request) = decode(&key, &row.value)? else {
-            return Err(corrupt(&key, "not a request"));
-        };
+        let request = request_row(&key, &row)?;
         let mut lease = None;
         for (key, row) in self.store.scan_prefix("lease/")? {
             if let FarmInput::Committed(ControlRecord::Lease(grant)) = decode(&key, &row.value)?
@@ -144,9 +142,7 @@ impl Durable {
         let Some(row) = self.store.get(&key)? else {
             return Ok(txn);
         };
-        let FarmInput::Submit(request) = decode(&key, &row.value)? else {
-            return Err(corrupt(&key, "not a request"));
-        };
+        let request = request_row(&key, &row)?;
         let pin = inflight_key(&request.key);
         Ok(match self.store.get(&pin)? {
             Some(row) if number(&pin, &row)? == operation.0 => {

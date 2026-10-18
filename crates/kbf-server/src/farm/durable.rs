@@ -393,6 +393,14 @@ fn parse_operation(key: &str, prefix: &str) -> Result<OperationId, StateError> {
     Ok(OperationId(id))
 }
 
+/// The request an `op/` row holds.
+fn request_row(key: &str, row: &Versioned) -> Result<Request, StateError> {
+    match decode(key, &row.value)? {
+        FarmInput::Submit(request) => Ok(request),
+        _ => Err(corrupt(key, "not a request")),
+    }
+}
+
 fn number(key: &str, row: &Versioned) -> Result<u64, StateError> {
     let bytes = <[u8; 8]>::try_from(row.value.as_slice())
         .map_err(|_| corrupt(key, "not an 8-byte number"))?;
@@ -483,9 +491,7 @@ impl Durable {
         }
         let mut operations = Vec::new();
         for (key, row) in self.store.scan_prefix("op/")? {
-            let FarmInput::Submit(request) = decode(&key, &row.value)? else {
-                return Err(corrupt(&key, "not a request"));
-            };
+            let request = request_row(&key, &row)?;
             let operation = parse_operation(&key, "op/")?;
             let lease = leases.remove(&operation);
             operations.push(StoredOperation {
@@ -540,9 +546,7 @@ impl Durable {
     ) -> Result<Vec<OperationId>, StateError> {
         let mut found = Vec::new();
         for (key, row) in self.store.scan_prefix("op/")? {
-            let FarmInput::Submit(request) = decode(&key, &row.value)? else {
-                return Err(corrupt(&key, "not a request"));
-            };
+            let request = request_row(&key, &row)?;
             let named = instance.is_none_or(|instance| request.key.instance == instance);
             if named && request.key.action == *action {
                 found.push(parse_operation(&key, "op/")?);
