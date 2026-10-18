@@ -526,13 +526,6 @@ fn violations(name: &str, text: &str) -> Vec<String> {
                 "DisableControllers= disables a controller".into(),
             );
         }
-        // The rootless Podman of the user: %U is the uid of User=, never a literal.
-        if unit.get_in("Service", "Environment").map(trim) != Some("XDG_RUNTIME_DIR=/run/user/%U") {
-            v(
-                "delegate",
-                "no Environment=XDG_RUNTIME_DIR=/run/user/%U".into(),
-            );
-        }
     }
 
     // Catches a storage node or frontend that may swap (it would slow every build at once).

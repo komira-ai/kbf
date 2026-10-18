@@ -39,8 +39,6 @@ LimitNOFILE=1048576
 CPUWeight=200
 # No MemorySwapMax=: leases may swap (the host's swapfile is for them); the
 # daemon's swap watch kills a lease that swaps at its own cap.
-# %U is the uid of User=: rootless Podman's runtime directory.
-Environment=XDG_RUNTIME_DIR=/run/user/%U
 ExecStartPre=+/usr/bin/kbf-installer boot-check
 # `--check` validates kbf.toml and what a restart cannot change (a file, a user, a flag)
 # and exits 2 for those. Anything that can become ready later (a listen address, a peer,
