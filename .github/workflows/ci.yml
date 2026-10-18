@@ -299,6 +299,9 @@ jobs:
         image: postgres@sha256:2a0d0fe14825b0939f78a8cad5cd4e6aa68bf94d0e5dd96e24b6d23af4315545
         env:
           POSTGRES_PASSWORD: kbf-ci-throwaway
+          # The frontend process test reaches the server with no password, as the flag
+          # requires; the container lives only for this job.
+          POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
         options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
