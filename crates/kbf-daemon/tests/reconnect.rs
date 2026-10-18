@@ -303,6 +303,68 @@ async fn each_round_resolves_the_names_again() {
     server.abort();
 }
 
+/// A resolver that fails its first `failures` lookups as a resolver does when its
+/// network is not up (an error, not an empty answer), then answers `addr`.
+struct Failing {
+    failures: usize,
+    asked: AtomicUsize,
+    addr: SocketAddr,
+}
+
+impl Resolve for Failing {
+    fn resolve(&self, _: String, _: u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>> {
+        let asked = self.asked.fetch_add(1, Ordering::SeqCst);
+        let answer = if asked < self.failures {
+            Err(io::Error::other(
+                "failed to lookup address information: Temporary failure in name resolution",
+            ))
+        } else {
+            Ok(vec![self.addr])
+        };
+        Box::pin(async move { answer })
+    }
+}
+
+/// Catches: a daemon whose `--server` name fails to resolve at start (a VPN or overlay
+/// resolver that is not up yet) that ends, or counts the failure as nothing and never
+/// tries again. The first three lookups fail with an error; each is reported as a failed
+/// attempt naming the resolver's error and is followed by a wait, and the fourth round
+/// resolves and connects. Mutant: the resolver-error arm of `resolve_all` panics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_that_fails_to_resolve_is_retried_until_it_does() {
+    let pki = pki("reconnect-resolve-error");
+    let (listener, addr) = listener().await;
+    let (mut sessions, server) = serve_worker(pki.server_tls(), listener);
+    let resolver = Arc::new(Failing {
+        failures: 3,
+        asked: AtomicUsize::new(0),
+        addr,
+    });
+    let resolve: Arc<dyn Resolve> = resolver.clone();
+    let urls = ["https://farm.test:7070".to_owned()];
+    let ms = Duration::from_millis;
+    let mut d = Running::start(&pki, &urls, ms(5), ms(20), Some(resolve), true);
+    let failure = d
+        .event(PROMPT, |e| match e {
+            Event::ConnectFailed { server, reason } => Some(format!("{server}: {reason}")),
+            _ => None,
+        })
+        .await
+        .expect("a failed lookup is reported");
+    assert!(
+        failure.starts_with("https://farm.test:7070: resolve: failed to lookup address"),
+        "{failure}"
+    );
+    d.retried(2, PROMPT).await;
+    welcomed(&mut sessions, PROMPT).await;
+    assert_eq!(
+        resolver.asked.load(Ordering::SeqCst),
+        4,
+        "three failed, one answered"
+    );
+    server.abort();
+}
+
 /// Catches: a list of `--server` URLs of which only the first is dialled, and a daemon
 /// that checks the server's certificate against the address it dialled rather than
 /// the URL's host (the certificate names `localhost`; no `--tls-server-name` is

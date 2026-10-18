@@ -4,14 +4,14 @@
 use std::fs;
 use std::path::Path;
 
-use kbf_installer::inbox::{Entry, read_capped};
-use kbf_installer::offer::{OFFER_FILE, Offer as Read};
-use kbf_installer::testkit::A;
+use crate::inbox::{Entry, read_capped};
+use crate::offer::{OFFER_FILE, Offer as Read};
+use crate::testkit::A;
 use kbf_update::inbox::Inbox;
 use kbf_update::{Component, Offer, Order, Verb};
 use sha2::{Digest, Sha256};
 
-use crate::order;
+use crate::helper::order;
 
 fn sha(bytes: &[u8]) -> String {
     Sha256::digest(bytes)

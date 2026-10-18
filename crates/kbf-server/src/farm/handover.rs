@@ -19,9 +19,10 @@ use super::{Farm, NodeAction, State, unix_ms};
 
 /// How many looks in a row at the state store may find an operation neither unfinished
 /// nor ended before it is reported as untraced (a WARN, and `kbf_frontend_relay_untraced`).
-/// A writer ends an operation in two transactions, the second moments after the first, so
-/// one look can fall between them; a successor that died between them leaves the
-/// operation like that for good. Only a report: an untraced operation's callers are not
+/// A writer ends an operation in one transaction (its rows removed, its result put), so a
+/// look finds one or the other; a store that a release ending operations in two
+/// transactions wrote can hold neither for good, and a result past its retention is also
+/// gone. Only a report: an untraced operation's callers are not
 /// answered, they keep waiting (see [`Farm::follow`]).
 pub const UNTRACED_LOOKS: u32 = 2;
 
