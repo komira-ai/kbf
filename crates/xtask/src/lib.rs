@@ -33,6 +33,9 @@
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
+//! - `image-check --image <ref> [--summary <file>]` ([`image_check`]): the frontend
+//!   container image runs as the manifests' uid, starts, and refuses to run without a
+//!   config.
 //! - `crun-tests [--sudo <path>]` ([`crun_tests`]): the container driver's real-`crun`
 //!   tests on a hosted Linux runner, each test target in its own `Delegate=yes` system
 //!   unit.
@@ -56,6 +59,7 @@ pub mod crun_tests;
 pub mod darwin;
 pub mod entitlements;
 pub mod fetch;
+pub mod image_check;
 pub mod package;
 pub mod pkg;
 pub mod release;
@@ -187,6 +191,18 @@ enum Verb {
         /// The sudo program; it is run with `-n`, so it never prompts.
         #[arg(long, default_value = "sudo")]
         sudo: PathBuf,
+    },
+    /// Check the frontend container image: non-root, starts, refuses without a config.
+    ImageCheck {
+        /// The image, in the local Docker daemon.
+        #[arg(long)]
+        image: String,
+        /// Append the image id to this file (on Actions, `GITHUB_STEP_SUMMARY`).
+        #[arg(long)]
+        summary: Option<PathBuf>,
+        /// The docker program.
+        #[arg(long, default_value = "docker")]
+        docker: PathBuf,
     },
     /// Build one integration test target, then run its ignored tests as root.
     SudoTest {
@@ -460,6 +476,11 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             test: &test,
             args: &args,
         }),
+        Verb::ImageCheck {
+            image,
+            summary,
+            docker,
+        } => image_check::run(&docker, &image, summary.as_ref()),
         Verb::CrunTests { sudo } => crun_tests::run(&crun_tests::CrunTests {
             cargo: &cargo_program(),
             sudo: &sudo,

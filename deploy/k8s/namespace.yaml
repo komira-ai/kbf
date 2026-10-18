@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kbf
+  labels:
+    # Pods here run on the host network and mount host paths: the privileged profile is
+    # what this namespace needs, and it is stated rather than left to a cluster default.
+    pod-security.kubernetes.io/enforce: privileged

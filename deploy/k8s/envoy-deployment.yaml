@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kbf-envoy
+  namespace: kbf
+  labels:
+    app.kubernetes.io/name: kbf-envoy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kbf-envoy
+  # Envoy binds the REAPI port on the host: the new pod cannot start before the old one
+  # lets go of it.
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kbf-envoy
+    spec:
+      # Envoy keeps Buck2's long-lived HTTP/2 connection and routes each call to the
+      # frontend instance that serves (a plain Service is L4 and would pin the connection
+      # to the old pod). It is the same Envoy and configuration as the single-box
+      # install (`kbf-deploy envoy render --topology box`), with Kubernetes as supervisor.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      automountServiceAccountToken: false
+      nodeSelector:
+        kbf/frontend-host: "true"
+      # Long enough for the connections it holds to end; the config has no stream idle
+      # timeout, so this is not a cut-off a build should reach.
+      terminationGracePeriodSeconds: 3600
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: envoy
+          image: envoy
+          args:
+            - -c
+            - /etc/kbf/envoy/envoy.json
+            - --drain-time-s
+            - "60"
+            - --drain-strategy
+            - gradual
+            - --skip-hot-restart-on-no-parent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            # envoy.json, rendered on the host by `kbf-deploy envoy render`.
+            - name: envoy-config
+              mountPath: /etc/kbf/envoy
+              readOnly: true
+      volumes:
+        - name: envoy-config
+          hostPath:
+            path: /etc/kbf/envoy
+            type: Directory

@@ -1,0 +1,118 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kbf-frontend
+  namespace: kbf
+  labels:
+    app.kubernetes.io/name: kbf-frontend
+spec:
+  # One frontend: SQLite has one writer (flock on the state file).
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kbf-frontend
+  # Recreate until `--instance=auto` and `--after-handover=hold` exist in kbf (README,
+  # "The rolling shape"). The old pod gets SIGTERM, drains and relays its open builds, and
+  # only then does the new pod start: builds that open in between fail, and the new pod
+  # bumps the epoch (a cold start). RollingUpdate with this pod spec would start a second
+  # `--instance=a` that cannot bind.
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kbf-frontend
+    spec:
+      serviceAccountName: kbf-frontend
+      automountServiceAccountToken: true
+      # The host's own network: both frontend instances and Envoy share its loopback (the
+      # handover refuses a non-loopback successor address, the operator API takes writes
+      # only from loopback), and clients, nodes and the certificates see the host's name.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # The state directory is on this host: the label is put on the node by the install
+      # script, not by name here.
+      nodeSelector:
+        kbf/frontend-host: "true"
+      # Kubernetes has no infinite grace period. kbf drains on SIGTERM by itself and its
+      # open builds run to their end, with no deadline (Buck2 does not recover a broken
+      # stream); this is 30 days.
+      terminationGracePeriodSeconds: 2592000
+      securityContext:
+        # Every pod of the frontend runs as one uid: the handover socket accepts a peer of
+        # the same uid only. The host paths below are owned by it.
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kbf
+          image: kbf-frontend
+          args:
+            - --mode=frontend
+            - --instance=a
+            - --handover-socket=/run/kbf-frontend/control.sock
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # Requests equal limits: Guaranteed QoS. The memory is a first guess to size
+          # from the running unit.
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          # No liveness probe: killing a busy frontend fails its builds. No preStop hook:
+          # kbf drains on SIGTERM itself and a hook would only use up the grace period.
+          readinessProbe:
+            httpGet:
+              host: 127.0.0.1
+              port: 8982
+              path: /readyz
+            periodSeconds: 5
+            failureThreshold: 3
+          # A start can wait for a handover to quiesce and for storage to answer.
+          startupProbe:
+            httpGet:
+              host: 127.0.0.1
+              port: 8982
+              path: /readyz
+            periodSeconds: 5
+            failureThreshold: 120
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/kbf-server
+            - name: control
+              mountPath: /run/kbf-frontend
+            - name: etc-kbf
+              mountPath: /etc/kbf
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # SQLite and its lock file: a local file system, never NFS, and the file is never
+        # copied or hard-linked. `type: Directory` so a missing directory fails the pod
+        # instead of kubelet creating one with the wrong owner or mode.
+        - name: state
+          hostPath:
+            path: /var/lib/kbf-server
+            type: Directory
+        # The handover control socket, mode 0700, shared by both frontend pods.
+        - name: control
+          hostPath:
+            path: /run/kbf-frontend
+            type: Directory
+        # kbf.toml, the certificates and keys, ca.pem and the API token. Nothing here is a
+        # Secret: a renewal rewrites the files in place and the pod sees it.
+        - name: etc-kbf
+          hostPath:
+            path: /etc/kbf
+            type: Directory
+        - name: tmp
+          emptyDir: {}

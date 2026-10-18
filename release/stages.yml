@@ -48,6 +48,8 @@ jobs:
     stage: build
   - job: artifacts.yml#sums-linux
     stage: build
+  - job: artifacts.yml#frontend-image
+    stage: build
   - job: artifacts.yml#sums-darwin-arm64
     stage: build
   - job: artifacts.yml#sums

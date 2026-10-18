@@ -1,0 +1,12 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kbf-frontend-self-update
+  namespace: kbf
+rules:
+  # The frontend sets its own Deployment's image (POST /v1/update/frontend) and nothing
+  # else: get and patch on the one Deployment, no list, watch or create, no other resource.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["kbf-frontend"]
+    verbs: ["get", "patch"]

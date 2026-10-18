@@ -1,0 +1,13 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kbf-frontend-self-update
+  namespace: kbf
+subjects:
+  - kind: ServiceAccount
+    name: kbf-frontend
+    namespace: kbf
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kbf-frontend-self-update

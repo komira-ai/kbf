@@ -306,6 +306,54 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
+  # The frontend container image (deploy/k8s/image/Dockerfile): the linux-x86_64 `kbf`
+  # tarball, checked against the sums sums-linux assembled (the bytes attest-linux signs on a
+  # push), on a distroless non-root base. Built here, never on a developer box. It is
+  # tested (it runs as non-root, `kbf --version` runs; with no /etc/kbf/kbf.toml the frontend mode
+  # refuses to start, exit 2: `cargo xtask image-check`) and saved as a `docker save` archive
+  # artifact, with its image id in the summary. Nothing is pushed or signed: the
+  # workflow lint grants no `packages: write`, and where the image is published and
+  # attested is an open decision (deploy/k8s/README.md).
+  frontend-image:
+    needs: [sums-linux]
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: assets-linux-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sha256sums-linux
+          path: published
+      - name: The files are the ones SHA256SUMS expects
+        run: cargo xtask sums assemble dist --expect published/SHA256SUMS
+      - name: The files match SHA256SUMS
+        run: cargo xtask verify-assets sums dist
+      - name: Put the kbf binary in the build context
+        run: tar -xzf "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" -C deploy/k8s/image kbf
+      - name: Build the image
+        run: docker build --tag kbf-frontend:ci deploy/k8s/image
+      - name: The image runs as the manifests' uid, starts, and refuses to run without a config
+        run: cargo xtask image-check --image kbf-frontend:ci --summary "$GITHUB_STEP_SUMMARY"
+      - name: Write the image as an archive
+        run: docker save --output kbf-frontend.tar kbf-frontend:ci
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: frontend-image
+          path: kbf-frontend.tar
+          retention-days: 90
+          if-no-files-found: error
+
   # SHA256SUMS over the macOS files.
   sums-darwin-arm64:
     needs: [darwin-arm64]

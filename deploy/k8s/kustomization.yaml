@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: kbf
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - role.yaml
+  - rolebinding.yaml
+  - frontend-deployment.yaml
+  - envoy-deployment.yaml
+# Images are named by digest, never by tag. The frontend's is a placeholder: the install
+# script sets it (`kustomize edit set image`) from the digest the `frontend-image` job of
+# artifacts.yml prints, and the registry or import it was loaded from. The Envoy image is
+# the upstream distroless build at its index digest.
+images:
+  - name: kbf-frontend
+    newName: REGISTRY/kbf-frontend
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  - name: envoy
+    newName: envoyproxy/envoy
+    digest: sha256:7369b033550a14997e5d698677b7b51f0210a80754f5d084c5caa1a78268267b
