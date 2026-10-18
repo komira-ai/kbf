@@ -70,3 +70,67 @@ fn no_mode_takes_config_or_check_itself() {
         }
     }
 }
+
+/// Catches the file template depending on the shape of a flag: a bare setting (no help,
+/// no value name) is a commented line holding its own upper-cased name; help is a comment
+/// per line, a hidden flag says so; a switch is live with `false`; a repeated flag with
+/// defaults is a list; a number, an integer or a float, is written as itself, and a
+/// default that only parses as a non-finite float (`inf`) is a string, since TOML has no
+/// such number. One command holds them all so a single test binary reaches both sides of
+/// every branch of the entry.
+#[test]
+fn the_template_shows_each_shape_of_flag() {
+    use clap::{Arg, ArgAction};
+    let own = clap::Command::new("t")
+        .arg(Arg::new("listen").long("listen"))
+        .arg(
+            Arg::new("storage")
+                .long("storage")
+                .help("first line\nsecond line")
+                .default_value("1.5"),
+        )
+        .arg(
+            Arg::new("heartbeat-interval-ms")
+                .long("heartbeat-interval-ms")
+                .hide(true)
+                .default_value("inf"),
+        )
+        .arg(
+            Arg::new("worker-listen")
+                .long("worker-listen")
+                .value_name("ADDR")
+                .default_value("7"),
+        )
+        .arg(
+            Arg::new("state-store")
+                .long("state-store")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("worker-deny-list")
+                .long("worker-deny-list")
+                .action(ArgAction::Append)
+                .default_values(["a", "b\"c"]),
+        );
+    let text = template("t", &own, &BTreeSet::new());
+    for line in [
+        "# listen = \"LISTEN\"\n",
+        "# first line\n# second line\nstorage = 1.5\n",
+        "# (not in --help)\nheartbeat-interval-ms = \"inf\"\n",
+        "worker-listen = 7\n",
+        "state-store = false\n",
+        "worker-deny-list = [\"a\", \"b\\\"c\"]\n",
+    ] {
+        assert!(text.contains(line), "{line:?} missing from\n{text}");
+    }
+}
+
+/// Catches a flag in no group being given a quiet default table: the template of a command
+/// holding a flag `GROUPS` does not place panics, naming the flag (the unit tests above
+/// keep that from reaching a real mode).
+#[test]
+#[should_panic(expected = "--zz-ungrouped is in no group")]
+fn the_template_refuses_a_flag_in_no_group() {
+    let own = clap::Command::new("t").arg(clap::Arg::new("zz-ungrouped").long("zz-ungrouped"));
+    let _ = template("t", &own, &BTreeSet::new());
+}

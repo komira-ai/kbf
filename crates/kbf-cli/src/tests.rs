@@ -776,3 +776,76 @@ fn the_identity_is_the_libraries_own_and_both_halves_speak_one_protocol() {
     );
     assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap(), v);
 }
+
+/// Catches `kbf node` and `kbf enroll` taking a flag they should not, or not the ones the
+/// units carry: `--config` (with the default where the packages put the file) and, for
+/// the node, repeatable `--label`.
+#[test]
+fn node_and_enroll_take_a_config_and_the_node_takes_labels() {
+    let words = |line: &[&str]| os(line);
+    let node = parse_node(&words(&["kbf", "node"])).expect("defaults");
+    assert_eq!(
+        node.config,
+        std::path::PathBuf::from(crate::enroll::DEFAULT_CONFIG)
+    );
+    assert!(node.labels.is_empty());
+    let node = parse_node(&words(&[
+        "kbf",
+        "node",
+        "--config",
+        "/x/kbf.toml",
+        "--label=pool=mac",
+        "--label",
+        "rack=r2",
+    ]))
+    .expect("flags");
+    assert_eq!(node.config, std::path::PathBuf::from("/x/kbf.toml"));
+    assert_eq!(node.labels, ["pool=mac", "rack=r2"]);
+
+    let enroll = parse_enroll(&words(&["kbf", "enroll", "--config=/y.toml"])).expect("flags");
+    assert_eq!(enroll.config, std::path::PathBuf::from("/y.toml"));
+    assert!(parse_enroll(&words(&["kbf", "enroll", "--label=a=b"])).is_err());
+    assert!(parse_node(&words(&["kbf", "node", "--bogus"])).is_err());
+    assert!(parse_enroll(&words(&["kbf", "enroll", "--config"])).is_err());
+}
+
+/// Catches `check-args` (what `check-units` runs on a unit's `ExecStart=` and
+/// `ExecStartPre=`) refusing the node's and enroll's flags, accepting one they do not
+/// have, or passing `--help`, and the two words appearing in the table of modes (which
+/// would make the other modes refuse `--config` and `--label`).
+#[test]
+fn check_args_takes_the_node_and_enroll_words() {
+    for line in [
+        &["kbf", CHECK_ARGS, "node"][..],
+        &[
+            "kbf",
+            CHECK_ARGS,
+            "node",
+            "--config=/etc/kbf/kbf.toml",
+            "--label=a=b",
+        ],
+        &["kbf", CHECK_ARGS, "enroll", "--config", "/etc/kbf/kbf.toml"],
+    ] {
+        assert_eq!(check(line), Ok(()), "{line:?}");
+    }
+    for line in [
+        &["kbf", CHECK_ARGS, "node", "--bogus"][..],
+        &["kbf", CHECK_ARGS, "enroll", "--label=a=b"],
+    ] {
+        let e = check(line).expect_err("refused");
+        assert!(e.contains("unexpected argument"), "{line:?}: {e}");
+    }
+    for word in ["node", "enroll"] {
+        let e = check(&["kbf", CHECK_ARGS, word, "--help"]).expect_err("refused");
+        assert!(e.contains("the mode would not start"), "{word}: {e}");
+    }
+    let named: Vec<&str> = MODES.iter().map(|m| m.name).collect();
+    assert!(!named.contains(&names::NODE) && !named.contains(&names::ENROLL));
+    assert!(command().find_subcommand(names::NODE).is_none());
+    assert!(
+        command()
+            .render_long_help()
+            .to_string()
+            .contains("`kbf node`")
+    );
+}

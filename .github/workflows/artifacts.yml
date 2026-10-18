@@ -5,6 +5,11 @@
 # runtime). Each comes as a tarball with a CycloneDX SBOM; one SHA256SUMS covers a
 # commit's files.
 #
+# A pull request runs none of it unless it carries the label `needs-artifacts` (add the
+# label to get the files; every build and sums job carries the same condition, so an unlabelled
+# pull request's run is skipped without queueing a runner). The merge queue and pushes
+# are unchanged.
+#
 # On a pull request or in the merge queue this is a build check: everything is built,
 # signed, packaged and summed, and nothing is attested (a pull request into
 # feature/arch-v2 skips darwin-arm64, and so the sums, to spare the macOS runners). On a push to main or to
@@ -25,6 +30,8 @@ name: artifacts
 
 on:
   pull_request:
+    # `labeled`: adding `needs-artifacts` to an open pull request starts the build.
+    types: [opened, synchronize, reopened, labeled]
   merge_group:
   push:
     branches: [main, feature/arch-v2]
@@ -59,7 +66,8 @@ jobs:
     # Not for pull requests into feature/arch-v2: nothing is attested from a pull request,
     # macOS runners are the scarce ones, and the push to feature/arch-v2 builds and
     # attests darwin-arm64 for its head. Pull requests into main still build it.
-    if: ${{ github.event_name != 'pull_request' || github.base_ref != 'feature/arch-v2' }}
+    # With the label `needs-artifacts`, like every job here.
+    if: ${{ github.event_name != 'pull_request' || (github.base_ref != 'feature/arch-v2' && contains(github.event.pull_request.labels.*.name, 'needs-artifacts')) }}
     runs-on: macos-15
     timeout-minutes: 45
     permissions:
@@ -118,6 +126,8 @@ jobs:
         run: cargo xtask darwin-asset "dist/kbf-$GITHUB_SHA-darwin-arm64.tar.gz" kbf
       - name: Check the packaged kbf-deploy's signature, and run it
         run: cargo xtask darwin-asset "dist/kbf-deploy-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-deploy
+      - name: The packaged kbf names the commit and a release build
+        run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-darwin-arm64.tar.gz" "$GITHUB_SHA"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-darwin-arm64
@@ -136,6 +146,7 @@ jobs:
   # glibc: the binaries need the glibc of the runner image they were built on (Ubuntu
   # 24.04) or newer.
   linux-x86_64:
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -180,6 +191,8 @@ jobs:
         run: cargo xtask package --binary "target/$TARGET/release/kbf-deploy" --sbom crates/kbf-deploy/kbf-deploy_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf
         run: cargo xtask package --binary "target/$TARGET/release/kbf" --sbom crates/kbf-cli/kbf_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
+      - name: The packaged kbf names the commit and a release build
+        run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" "$GITHUB_SHA"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-x86_64
@@ -196,6 +209,7 @@ jobs:
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   linux-arm64:
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     permissions:
@@ -240,6 +254,8 @@ jobs:
         run: cargo xtask package --binary "target/$TARGET/release/kbf-deploy" --sbom crates/kbf-deploy/kbf-deploy_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf
         run: cargo xtask package --binary "target/$TARGET/release/kbf" --sbom crates/kbf-cli/kbf_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
+      - name: The packaged kbf names the commit and a release build
+        run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" "$GITHUB_SHA"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-arm64
@@ -265,6 +281,7 @@ jobs:
   # SHA256SUMS over the Linux files (both architectures), as `sums` is over all.
   sums-linux:
     needs: [linux-x86_64, linux-arm64]
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -292,6 +309,7 @@ jobs:
   # SHA256SUMS over the macOS files.
   sums-darwin-arm64:
     needs: [darwin-arm64]
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -317,10 +335,11 @@ jobs:
           if-no-files-found: error
 
   # One SHA256SUMS over every platform's files (the commit's whole set, the file a release
-  # carries), checked against the files and a flipped copy. Runs on every event, once
-  # every platform is built. Nothing waits for it: attestation is per platform, below.
+  # carries), checked against the files and a flipped copy. Runs on every event, a pull request
+  # without the label excepted, once every platform is built. Nothing waits for it: attestation is per platform, below.
   sums:
     needs: [darwin-arm64, linux-x86_64, linux-arm64]
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

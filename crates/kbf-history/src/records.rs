@@ -5,6 +5,9 @@
 //! instances its caller may see. Field numbers are the wire format: a field is added
 //! under a new number and never renumbered.
 
+pub use crate::flog::{
+    FLOG_STREAM_BYTES, FlogOmitted, FlogRecord, FlogStream, FlogSummary, ObjRow, flog_key,
+};
 use crate::run_id::RunId;
 
 /// The longest tail kept of one log stream, after redaction.
@@ -143,6 +146,10 @@ pub struct Cgroup {
     /// Memory per NUMA node, bytes, by node number.
     #[prost(uint64, repeated, tag = "8")]
     pub numa_bytes: Vec<u64>,
+    /// Wall time from the action's start to its exit, microseconds. Added after the
+    /// first chunks were written: a record without it reads 0.
+    #[prost(uint64, tag = "9")]
+    pub wall_us: u64,
 }
 
 /// One output of a run.
@@ -266,6 +273,22 @@ pub struct RunRecord {
     /// none. Added after the first chunks were written: a record without it reads empty.
     #[prost(string, tag = "34")]
     pub target: String,
+    /// When the operation was queued for this attempt (submitted, or queued again after
+    /// the attempt before it), microseconds; 0 when not kept. `timestamps.queued_us`
+    /// is the first submission, so it cannot give this. Added after the first chunks
+    /// were written.
+    #[prost(uint64, tag = "35")]
+    pub attempt_queued_us: u64,
+    /// When the attempt's worker was sent the Start, microseconds; 0: never.
+    #[prost(uint64, tag = "36")]
+    pub started_us: u64,
+    /// When the attempt ended, microseconds; 0: it had not.
+    #[prost(uint64, tag = "37")]
+    pub ended_us: u64,
+    /// What kind of owner `target` names: 0 none or unknown, 1 a rule's target, 2 an
+    /// anonymous target, 3 a BXL function.
+    #[prost(uint32, tag = "38")]
+    pub target_kind: u32,
 }
 
 impl RunRecord {
@@ -350,6 +373,9 @@ pub enum TailOmitted {
     TooLarge = 1,
     /// The log could not be read.
     Unreadable = 2,
+    /// The read budget was not free in time (the read is not retried: the tail is left
+    /// out rather than the run held).
+    Busy = 3,
 }
 
 /// The last bytes of one log stream of a failed run, after redaction.
@@ -442,6 +468,9 @@ pub struct FailedRun {
     /// The command rendering.
     #[prost(message, optional, tag = "5")]
     pub command: Option<CommandRendering>,
+    /// Why some log of the run was not copied into its failure-log object.
+    #[prost(enumeration = "FlogOmitted", tag = "6")]
+    pub flog_omitted: i32,
 }
 
 /// A test outcome's status.

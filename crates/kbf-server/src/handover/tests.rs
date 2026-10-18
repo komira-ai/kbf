@@ -330,7 +330,7 @@ async fn a_stop_completes_for_every_waiter_once_it_is_fired() {
 async fn a_stop_closes_the_listeners_registered_with_it_when_it_is_given() {
     let any = || "127.0.0.1:0".parse().expect("address");
     let stop = Stop::new();
-    let socket = crate::listen::Socket::bind(any()).expect("bind");
+    let socket = crate::listen::Socket::bind(any(), &crate::listen::Binder::new()).expect("bind");
     let addr = socket.local;
     let (incoming, latch) = socket.grpc(None).expect("registered");
     stop.closes(latch);
@@ -346,7 +346,7 @@ async fn a_stop_closes_the_listeners_registered_with_it_when_it_is_given() {
     drop(incoming);
 
     // Registered after the stop was given: closed at once.
-    let socket = crate::listen::Socket::bind(any()).expect("bind");
+    let socket = crate::listen::Socket::bind(any(), &crate::listen::Binder::new()).expect("bind");
     let addr = socket.local;
     let (_incoming, latch) = socket.grpc(None).expect("registered");
     stop.closes(latch);

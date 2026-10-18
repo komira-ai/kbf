@@ -10,6 +10,10 @@ name: ci
 
 on:
   pull_request:
+    # `labeled`: adding `macos` to an open pull request starts native-macos. Adding any
+    # label starts a whole run (the newer run replaces the older one); nothing here can
+    # tell the labels apart before the jobs start.
+    types: [opened, synchronize, reopened, labeled]
   merge_group:
   push:
     branches: [main, feature/arch-v2]
@@ -396,9 +400,10 @@ jobs:
   # enforced); the daemon binary is built and started with each driver, which
   # detects the node through sysctl.
   # Not run for a pull request into feature/arch-v2 (the macOS pool is small and a feature
-  # merge does not wait on it); it runs on pushes to feature/arch-v2 and on all else.
+  # merge does not wait on it) unless the pull request carries the label `macos`; it runs
+  # on pushes to feature/arch-v2 and on all else.
   native-macos:
-    if: ${{ github.event_name != 'pull_request' || github.base_ref != 'feature/arch-v2' }}
+    if: ${{ github.event_name != 'pull_request' || github.base_ref != 'feature/arch-v2' || contains(github.event.pull_request.labels.*.name, 'macos') }}
     runs-on: macos-latest
     timeout-minutes: 30
     permissions:
@@ -422,6 +427,11 @@ jobs:
       - run: sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
       - run: cargo build -p kbf-node --bin kbf-daemon --locked
       - run: cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node -p kbf-testkit --locked
+      # `kbf daemon --driver native` started with the words the Mac's launchd unit
+      # writes, against a fake front, and the helpers it re-runs itself as (each action's
+      # keeper, the lease-user pool's `as-user` step) through the `kbf` binary
+      # (crates/kbf-cli/tests/macos_daemon.rs).
+      - run: cargo test -p kbf-cli --test macos_daemon --locked
       # A lease's own simulator, made, booted and deleted for real under the actions'
       # sandbox; one a killed daemon left deleted at the next start; and xcodebuild
       # finding a device of the default set but not one of another set
@@ -460,6 +470,53 @@ jobs:
       # crates/kbf-mac-provision/tests/as_root.rs lists what it applies, asserts and
       # only reads). Last, because it changes this runner's settings.
       - run: cargo xtask sudo-test -p kbf-mac-provision --test as_root -- --test-threads=1 --nocapture
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  # kbf-installer on a Mac as a user gets it (contract docs/design/kbf-installer.md section
+  # 7): the `.pkg` built by `cargo xtask pkg build` (a stub stands in for the binary until
+  # kbf-installer builds), opened by pkgutil and lsbom, installed by Installer and checked
+  # file by file and owner by owner (a root-owned /usr/local/kbf-installer tree, a 0700
+  # /var/db/kbf-installer); its LaunchDaemon not loaded and not running without
+  # /usr/local/etc/kbf/installer.toml, running with it; `check` refusing a user-owned prefix
+  # (skipped, and said so, while the binary is the stub); the Homebrew cask installing the
+  # package and its uninstall removing the package's files
+  # (crates/xtask/tests/pkg_macos.rs). Run on the same terms as native-macos: a pull
+  # request into feature/arch-v2 needs the label `macos`.
+  pkg-macos:
+    if: ${{ github.event_name != 'pull_request' || github.base_ref != 'feature/arch-v2' || contains(github.event.pull_request.labels.*.name, 'macos') }}
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      # The oldest macOS the binaries support (the test signs with `--minos 14.0`).
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      - run: sw_vers
+      - run: brew --version
+      # The package as root through Installer, then the cask as this user.
+      - run: cargo xtask sudo-test -p xtask --test pkg_macos -- installer
+      - run: cargo test -p xtask --test pkg_macos --locked -- --ignored homebrew
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:

@@ -10,7 +10,8 @@ line then ends with ` api=<addr>`. The listener speaks HTTP/1.1, and HTTP/2 in c
 text (h2c, with prior knowledge); every rule below holds for both.
 
 Reads answer anyone who reaches the address: bind it where only operators do. The
-exceptions are the build pages, [`GET /v1/invocations/{id}`](#get-v1invocationsid-and-below)
+exceptions are the [enrollment routes](#v1enrolltokens-and-v1enrollnodes), which pass every
+gate of a write even to be read, and the build pages, [`GET /v1/invocations/{id}`](#get-v1invocationsid-and-below)
 and below, and [`GET /v1/blobs`](#get-v1blobsdigest), which run the REAPI policy and are
 off without it. Writes need a token (see [Who may write](#who-may-write)). The roles of
 [fleet-updates-security.md](design/fleet-updates-security.md) section S9 (`admin` for
@@ -345,6 +346,82 @@ the drain, and the unit templates in `kbf-deploy` set it.
 `--api` for the listener (default `127.0.0.1:8982`). A frontend drain has no undrain:
 restart it.
 
+## `/v1/enroll/tokens` and `/v1/enroll/nodes`
+
+The operator's side of enrollment (`design/install-and-enrollment.md`):
+the tokens a node enrolls with, and the registry of nodes that did. They live in the state
+store, so a frontend that has no enrollment (until the enroll service lands, every
+frontend) answers every one of these routes with `404` once the call passes the gates.
+
+**Every route here, a GET included, passes every gate of [Who may write](#who-may-write):**
+a loopback peer, no `Origin` header, the bearer token, and `Content-Type: application/json`
+(send it on a GET and a DELETE too, with no body). The list of tokens and nodes is the farm's
+door, so unlike `GET /v1/nodes` it is not open to whoever reaches the address. A refused
+call changes nothing. Every answer carries `Cache-Control: no-store`.
+
+| Route | Does | Answer |
+|---|---|---|
+| `POST /v1/enroll/tokens` | makes a token | the token, **with its secret and string, once** |
+| `GET /v1/enroll/tokens` | lists the tokens | `{"tokens": [...]}`, never a secret, hash or string |
+| `DELETE /v1/enroll/tokens/{id}` | revokes a token | `{"id": "..."}` |
+| `GET /v1/enroll/nodes` | lists the nodes | `{"nodes": [...]}` |
+| `POST /v1/enroll/nodes/{id}/revoke` | revokes a node | `{"id": "...", "denied": [...]}` |
+
+**Create.** The body is `{"roles": ["daemon"], "max_uses": 1, "expires_in": 86400,
+"node_id": "n1", "node_prefix": "rack-", "names": [".example"], "replace": false,
+"label": "rack 4"}`; only `roles` is required (`storage` and `daemon`, one to two, no
+repeat). `max_uses` is 1 to 1000 (default 1); `expires_in` is seconds, at least 1 and at
+most 30 days (default a day); `node_id` and `node_prefix` restrict the node ids the token
+enrolls; `names` restricts the hosts a storage node may advertise (a host, or a suffix that
+starts with `.`; empty allows any); `replace` lets it re-enroll an id that exists. An
+unknown field is a `400`. The answer is
+
+```json
+{"token": "kbft1.<id>.<secret>.<pin>", "secret": "<base64url>", "info": {"id": "...", ...}}
+```
+
+`token` is what a node is given (the pin is the SHA-256 of the root CA certificate, which
+the node checks the frontend against at first contact). **This is the only answer that
+holds `token` or `secret`:** the state store keeps a hash of the secret, and no list
+returns the hash, the secret or the string. Lose it and revoke the token. A token whose
+string cannot be built (the frontend has no CA pin, `503`; the random source fails, `500`)
+is not stored.
+
+`info` and each element of `tokens` are `{id, roles, max_uses, uses, expires_at,
+created_at, revoked_at, node_id, node_prefix, names, replace, label, created_by}`; times
+are seconds on the state store's clock. **Revoke** stops new enrollments with the token;
+nodes it enrolled stay enrolled, and revoking a revoked token is a `200`. `404` for an
+unknown or malformed id.
+
+Each element of `nodes` is `{id, roles, state, advertise, zone, token_id, token_label,
+created_at, last_renewed_at, not_after, revoked_at}`, with `state` `active` or `revoked`
+and no certificate or key. **Revoking a node** takes no body (or `{}`), marks it `revoked`
+(its id is burned: no token enrolls that id again) and writes the deny rows for the node,
+each unexpired serial it holds or held and each of its keys, in one transaction; `denied`
+lists them as the deny list spells them (`node n1`, `serial ...`, `spki-sha256 ...`). `400`
+for a node already revoked, `404` for an unknown or malformed id.
+
+**Failures.** `400` for a body or value the registry refuses, `404` (above), `409` when
+this frontend is not the signer (it lost the writer role: nothing was written, call the
+current frontend; the enroll wire's `NotSigner`), `503` when the state store failed or
+other writers kept winning (try again), `500` for a stored row that does not decode.
+`401`, `403` and `415` are the gates'.
+
+There is no `kbf` verb for this: `kbf` only runs, and operator actions are calls to this
+API. From the frontend's host, with the file `--api-token-file` names:
+
+```sh
+T=$(cat <token file>); API=http://127.0.0.1:<port>
+curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  -d '{"roles": ["daemon"], "max_uses": 3, "expires_in": 86400, "label": "rack 4"}' \
+  $API/v1/enroll/tokens                       # the token string is in this answer only
+curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' $API/v1/enroll/tokens
+curl -X DELETE -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  $API/v1/enroll/tokens/<id>
+```
+
+A UI comes later.
+
 ## `GET /v1/storage`
 
 Whether every blob is known to have its copies elsewhere: the number a rollout asks
@@ -634,6 +711,100 @@ record of another caller of the same id ([invocations.md](design/invocations.md#
 It is matched as the bytes of the path: a percent-encoded character (`%3C`, `%6F`) is
 `404`, as is anything else.
 
+**With `--history-objects`** a record the in-memory records do not hold (the server
+restarted, or the record was removed at the bound) is read back from build history
+(`docs/design/ui-data.md` 5.5), and every route above answers from it as it does from a
+live record: filters, `sort=` and page tokens included. Without the flag nothing below
+applies and the routes are as described above.
+
+- **Authorized on every instance, in two steps.** The invocation's instance names are read
+  from its header and each is asked of `invocations.getAuthorizer`; the records are then
+  read and checked against exactly those names. An instance added in between is `503`
+  (send the request again). A header whose instance list is empty or was cut at its bound
+  cannot be checked whole, so the invocation answers `no_record` to every caller.
+- **What a restored record says.** `"restored": true` on the invocation, and, when history
+  has a hole (the invocation was never closed, or records were dropped), `"complete":
+  false` and `"gap_from"`: the time the last chunk that did land was written, from which
+  on records may be missing. `first_seen` and `last_seen` are those of the first and last
+  record, not of the first and last call.
+- **What it does not keep.** `tool`, `tool_version`, `correlated_invocations_id` and
+  `collisions` are empty; the counters are those the rows show (`ac_miss`, `blobs_*` and
+  `bytes_*` are 0); a row has no `target`, `mnemonic`, `configuration`, `action_id` or
+  `operation` of its own (the `shape` has the target the server read), no `usage` in its
+  action answer, an output's `executable` is `false`, and a cache hit has no listing. An
+  attempt's end and the row's outcome are read from the run's class: a failed run's gRPC
+  status code and a lost run's cause are not kept (see `restore.rs`). A cgroup counter the
+  daemon could not read is 0.
+- **Pages.** A page token made for a record the recorder held answers `no_record` once
+  the record is read back instead, and so does one made for a restored record that has
+  since left the 64 MiB cache of restored records. At most 50,000 records are read for one
+  invocation; past that the record is `rows_capped` and not complete.
+
+**`GET /v1/runs/{run_id}`** (with `--history-objects`; otherwise `404` as any unknown
+route) is one attempt: the instance, `lease` (`term.seq`), `worker`, `queued`, `granted`,
+`started` and `ended`, `class` (`ok`, `failed`, `timed_out`, `memory_killed`, `infra`,
+`lost`), `exit_code` for a run that exited, the memory kill and the booking, cap, raised
+booking, memory used and limit of a killed run, the REAPI times and cgroup `usage` the
+daemon reported, the digests of the action, command, result and logs, and the `shape`
+(its key, `cfg`, target and whether it is a test). A key the record has no value for is
+left out. The run is read from the in-memory record while it is held and from history
+after, in one rendering: the answer is the same before and after a restart. The run's one
+instance is asked of `invocations.getAuthorizer` before anything is answered. `{run_id}`
+is 24 lowercase hex digits, which the attempts of the build pages give as `run_id` and
+`run_href` (only with `--history-objects`). Not here yet: the `envelope`, `end` and
+transfer counters.
+
+A run that has logs also has `logs`: for each of `stdout`, `stderr` and `result` that it
+has, the `digest`, whether the blob is still held (`available`), an `href`, and for
+`stdout` and `stderr` of a failed run the `tail` history kept (the last 16 KiB, as text),
+its `total_bytes`, `tail: null` with `tail_omitted` (`too_large` over 64 MiB, `unreadable`,
+`busy` when the read budget was not free in time) and `tail_redacted: false`: no
+redaction exists, the tail is as the run wrote it. The `href` is the blob route while the
+blob is held and the log route below once it is not and history holds a copy; `null`
+otherwise. A failed run's `command_rendering` (argv, environment variable names only,
+working directory, output paths, at most 4 KiB, `redacted: false`) is shown beside them.
+
+**`GET /v1/runs/{run_id}/logs/{stdout|stderr|result}`** (with `--history-objects`) is the
+copy of a failed run's log that history kept, which outlives the blob it was copied from
+(30 days, `r30`). It is raw bytes, `application/octet-stream` as an attachment, with
+`X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox` on every answer.
+The run's instance is asked of `invocations.getAuthorizer` before the copy is read, and the
+copy is read for that instance only. One `Range: bytes=...` is honoured (`206`, or `416`),
+and only the blocks that hold the range are read; several ranges are ignored. The bytes of
+an answer count against the same read budget as `/v1/blobs`, and a read waits for it at
+most 10 seconds, then is `503` with `Retry-After` and `"busy": true`. A run with no such
+copy (it passed, the log was over 16 MiB, or it had none) is `404` `no_log`; an unknown run
+`404` `no_run`; a query string is `400`.
+
+**Across builds** (with `--history-objects`; otherwise these routes do not exist, `404` as
+any unknown path). They are read from the index rows the history writer keeps, never from
+an object, so they answer the same after a restart and cost no object read
+(`docs/design/ui-data.md` 4.3 and 6.2). They run the same policy as the build pages:
+`authenticationPolicy`, then `invocations.getAuthorizer` (`404` with `"off"` when it is not
+named). The authorizer is asked once per request about each instance the request would
+touch, and every answer holds only rows of allowed instances; an invocation is listed only
+when every instance it used is allowed. `?instance=` names one instance; one the caller
+may not read is `403`. Lists are paged as above (`page_size` 1 to 200, 100 by default;
+`next_page` is the link to follow; a token names its route and filters and stays valid
+across restarts). An answer over more instances than the index reads at once (256) says
+`"partial": true`. Times are RFC 3339 and a `+` in an offset is `%2B` in a query.
+
+| Route | Answers |
+|---|---|
+| `GET /v1/invocations` | `{"invocations": [...]}`, newest first by the time of the first record; `?instance=`, `?since=`, `?until=`, `?state=open\|closed`. Each item: `id`, `first_seen`, `last_seen`, `state`, `complete`, `counts` (`ran`, `hits`, `failed`), `instances`, `href`. `?commit=` is `400` `needs_report` (no commit is kept before the client report), `?tool=` is `400` `unsupported_filter` |
+| `GET /v1/shapes` | `{"shapes": [...]}`, by instance then shape key; `?kind=test\|other`, `?status=passing\|failing\|flaky\|oom_killed`, `?instance=`. `?status=slower` is `400` `unsupported_status` (it needs the day-close fold) and `?target=`, `?program=` are `400` `unsupported_filter` (the catalog keeps no body yet) |
+| `GET /v1/tests` | the same with `kind=test` |
+| `GET /v1/shapes/{key}?instance=&cfg=` | one `(instance, cfg)` of the key, with `previous_keys: null`; with either absent, `{"shapes": [...]}` of the key's rows (paged) |
+| `GET /v1/shapes/{key}/runs?instance=&cfg=` | the last 16 runs of a test, newest first, each `{run_id, run_href, class, execution_ms, source: "run", digest16}` (`run_href` is `GET /v1/runs/{run_id}`), with `complete: false`, `covers: "recent_16"` (`"none"` for a shape that is not a test) and `needs: "day_index"`: older runs are not answered yet. Both parameters are required |
+
+A shape row is `{instance, key, cfg, kind, target, first_seen, last_seen, href, runs_href}`
+and, for a test, `status` (`passing`, `failing`, `flaky`, `oom_killed`, or `null` while the
+runs seen were all infrastructure), `flaky` (`{proven, proof_digest, since}`: the first 16
+hex digits of the action digest seen both passing and failing, and the run that completed
+the proof), `last_pass` and `first_fail` (`{at, run_id, run_href}`, `null` for none). `key`
+is 16 lowercase hex digits. A key no instance the caller may read has is `404`
+`{"error": "no_shape"}`.
+
 **The invocation:**
 
 ```json
@@ -769,8 +940,8 @@ ran out are listed with the rest, failed or not.
 | `400` | a parameter the route does not take, one given twice, a `page_size` outside 1 to 1000, a filter value not listed above, or a page token that does not decode, was made for another route or another filter, or names a position past the rows |
 | `401` | the policy's `authenticationPolicy` refuses the request |
 | `403` | `invocations.getAuthorizer` refuses one of the invocation's instance names: each one its calls used and each one a row holds, on every route |
-| `404` | the routes are off: `{"error": "<why>", "off": "invocations"}`; no such record is held (never made, removed at the memory bound, or lost at a restart), a page token's included even if a record has been made since under the same key: `{"error": "no_record", "id": "<id>", "records_since": "<time>"}` (below); no such route, `{id}` is not an id or `<id>~<n>`, or no row for the action: `{"error": "<why>"}` |
-| `503` | the record gained an instance name while it was read: send the request again |
+| `404` | the routes are off: `{"error": "<why>", "off": "invocations"}`; no such record is held (never made, removed at the memory bound, or lost at a restart; with `--history-objects`, and not in history either), a page token's included even if a record has been made since under the same key: `{"error": "no_record", "id": "<id>", "records_since": "<time>"}` (below); no such route, `{id}` is not an id or `<id>~<n>`, or no row for the action: `{"error": "<why>"}` |
+| `503` | the record gained an instance name while it was read: send the request again; with `--history-objects`, history could not be read (`{"error": "build history cannot be read right now"}`) |
 
 **A record that is not held** answers `{"error": "no_record", "id": "<id>",
 "records_since": "<time>"}` ([invocations-api.md](design/invocations-api.md#410-a-record-that-is-gone)).
