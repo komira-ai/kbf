@@ -16,6 +16,7 @@ kbf-all-in-one            0      0
 kbf-auth                  0      0
 kbf-baseline              0      0
 kbf-bench                 0      0
+kbf-ca                    0      0
 kbf-caps                  2      1
 kbf-cas-conformance       0      -
 kbf-cli                   0      0
@@ -25,12 +26,14 @@ kbf-deploy                0      0
 kbf-driver-container      0      0
 kbf-driver-native         0      0
 kbf-enroll                0      0
+kbf-enroll-registry       0      0
 kbf-estimator             -      -
 kbf-front                35      7
 kbf-guest                15      6
 kbf-helper                0      0
 kbf-history               0      0
 kbf-host                  0      0
+kbf-image                 0      0
 kbf-installer             0      0
 kbf-invocation            0      0
 kbf-it                    2      1

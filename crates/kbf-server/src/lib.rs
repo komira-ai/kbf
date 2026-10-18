@@ -75,6 +75,7 @@ pub mod blobs;
 mod build_commit;
 pub mod config;
 pub mod drain;
+pub mod enroll;
 pub mod farm;
 mod fault;
 mod flag_set;
