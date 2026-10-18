@@ -21,10 +21,14 @@ mod front;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use kbf_daemon::keeper::{self, Mode};
-use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+use kbf_deploy::linux::verify_cert::{CLIENT_AUTH, ROLE_URI_PREFIX, Row, verify};
+use rcgen::{
+    CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+    SanType,
+};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf");
 
@@ -49,6 +53,15 @@ impl Drop for Guarded {
 
 /// A scratch directory for one test, with a CA, a node certificate and the fake
 /// front's certificate (for `localhost`) in it.
+///
+/// The node certificate is a daemon's as the farm's issuer makes one, because `kbf`'s
+/// startup self-checks refuse any other: the node id `node-1` as its DNS name, the role
+/// URI `urn:kbf:role:daemon`, and the `clientAuth` extended key usage (the rows of
+/// `kbf-deploy linux verify-cert`). It is checked by that function here, so a certificate
+/// the daemon would refuse fails the test at issue with the reason, not as a daemon that
+/// never says `Hello`. The front's certificate is a plain TLS server's: the fake front
+/// checks the client's certificate against the CA only, not its role. Both keys are
+/// private to this user (0600), as the self-checks require.
 fn tls(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("kbf-macos-daemon")
@@ -57,14 +70,42 @@ fn tls(name: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).expect("scratch");
     let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("key")).expect("CA");
     std::fs::write(dir.join("ca.pem"), ca.pem()).expect("write");
     for (name, dns) in [("node", "node-1"), ("server", "localhost")] {
         let key = KeyPair::generate().expect("key");
-        let cert = CertificateParams::new(vec![dns.to_owned()])
-            .expect("params")
-            .signed_by(&key, &ca)
-            .expect("sign");
+        let mut params = CertificateParams::new(vec![dns.to_owned()]).expect("params");
+        if name == "node" {
+            params.subject_alt_names.push(SanType::URI(
+                format!("{ROLE_URI_PREFIX}{}", Row::Daemon.role())
+                    .try_into()
+                    .expect("IA5"),
+            ));
+            params.is_ca = IsCa::ExplicitNoCa;
+            params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+            params.extended_key_usages = Row::Daemon
+                .ekus()
+                .iter()
+                .map(|e| {
+                    assert_eq!(*e, CLIENT_AUTH, "the daemon row asks for clientAuth only");
+                    ExtendedKeyUsagePurpose::ClientAuth
+                })
+                .collect();
+            params.use_authority_key_identifier_extension = true;
+        }
+        let cert = params.signed_by(&key, &ca).expect("sign");
+        if name == "node" {
+            let failures = verify(
+                ca.pem().as_bytes(),
+                cert.pem().as_bytes(),
+                Row::Daemon,
+                Some("node-1"),
+                SystemTime::now(),
+            )
+            .expect("verify-cert checks the node certificate");
+            assert!(failures.is_empty(), "node.pem is no daemon's: {failures:?}");
+        }
         std::fs::write(dir.join(format!("{name}.pem")), cert.pem()).expect("write");
         // Private to this user: `kbf`'s startup self-checks refuse a key the group or
         // others can read, and the default umask leaves it 0644.
