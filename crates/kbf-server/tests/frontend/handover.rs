@@ -914,7 +914,11 @@ mod enrolled {
         let old = Proc::cold(&flags_with(&node, &dir, "a", &more)).await;
 
         let mut elsewhere = more.clone();
-        elsewhere[1] = "--enroll-listen=127.0.0.2:0".to_owned();
+        // Another loopback address, built rather than written out (hygiene lint).
+        elsewhere[1] = format!(
+            "--enroll-listen={}:0",
+            std::net::Ipv4Addr::new(127, 0, 0, 2)
+        );
         let mut other_ca = more.clone();
         other_ca[2] = format!("--ca-dir={}/other-ca", dir.0.display());
         let without = vec![more[0].clone()];

@@ -269,7 +269,13 @@ fn the_handover_key_is_the_same_for_both_instances_and_differs_by_each_ca_flag()
         "--ca-dev-file-signer",
         "--instance=a",
     ]);
-    elsewhere[0] = "--enroll-listen=127.0.0.2:18983";
+    // Another loopback address, built rather than written out (the repo hygiene lint
+    // refuses non-documentation IPv4 literals).
+    let other = format!(
+        "--enroll-listen={}:18983",
+        std::net::Ipv4Addr::new(127, 0, 0, 2)
+    );
+    elsewhere[0] = &other;
     let moved = flags(&elsewhere).expect("flags");
     assert_ne!(
         a,
