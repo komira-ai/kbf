@@ -21,23 +21,10 @@ pub fn golden_plist_as(sha12: &str, user: Option<&str>) -> String {
 	<string>org.example.kbf-daemon</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/local/kbf/current/kbf-daemon</string>
-		<string>--driver</string>
-		<string>native</string>
-		<string>--server</string>
-		<string>https://farm.example.net:8981</string>
-		<string>--cas</string>
-		<string>https://farm.example.net:8981</string>
-		<string>--ca-cert</string>
-		<string>/usr/local/kbf/etc/ca.pem</string>
-		<string>--cert</string>
-		<string>/usr/local/kbf/etc/node.pem</string>
-		<string>--key</string>
-		<string>/usr/local/kbf/etc/node.key</string>
-		<string>--node-id</string>
-		<string>kbf-mac-07</string>
-		<string>--data-dir</string>
-		<string>/Volumes/kbf/data</string>
+		<string>/usr/local/kbf/current/kbf</string>
+		<string>node</string>
+		<string>--config</string>
+		<string>/usr/local/etc/kbf/kbf.toml</string>
 		<string>--label</string>
 		<string>profile=mac-arm64-test@{sha12}</string>
 		<string>--label</string>
