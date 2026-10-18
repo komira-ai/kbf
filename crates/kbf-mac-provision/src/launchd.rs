@@ -1,6 +1,7 @@
 //! The LaunchDaemon that runs `kbf --mode=daemon` (docs/design/mac-node-provisioning.md,
-//! section 5.3; docs/design/install-and-enrollment.md, section 4.4): its property list,
-//! rendered from the profile; the check that the
+//! section 5.3; docs/design/install-and-enrollment.md, section 4.4): the node's `kbf.toml`
+//! (every setting of the daemon) and its property list (which names that file and nothing
+//! else), both rendered from the profile; the check that the
 //! installed one is that file, root's, with a safe error log and the job loaded; the
 //! fix that makes it so; and the restart.
 //!
@@ -20,9 +21,11 @@ use crate::profile::{DaemonUser, Profile};
 const LAUNCHCTL: &str = "/bin/launchctl";
 pub const KBF_BIN: &str = "/usr/local/kbf/current/kbf";
 /// The node's config file, where the macOS package puts it (the default `--config` of
-/// a `kbf` start on macOS): the frontend's URL, the node id and the directories. The
-/// operator writes it; this tool does not.
+/// a `kbf` start on macOS). This tool writes it from the profile ([`render_config`]): it
+/// is the one source of the daemon's settings, and the job's arguments name only it.
 pub const NODE_CONFIG: &str = "/usr/local/etc/kbf/kbf.toml";
+/// The directory of [`NODE_CONFIG`]: root's, so the daemon account cannot replace it.
+const CONFIG_DIR: &str = "/usr/local/etc/kbf";
 pub const LOG_DIR: &str = "/Library/Logs/kbf";
 pub const ERR_LOG: &str = "/Library/Logs/kbf/kbf-daemon.err.log";
 const ROOT_FILE: &str = "-rw-r--r-- 0 0";
@@ -35,21 +38,54 @@ pub fn plist_path(profile: &Profile) -> String {
     format!("{LAUNCH_DAEMONS}/{}.plist", profile.get("launchd_label"))
 }
 
-/// `kbf --mode=daemon`'s arguments: the config file and the node label and the profile's
-/// labels. The server, the certificates, the node id and the directories are not
-/// arguments: the start reads its config file, enrolls with the frontend it names (for the
-/// daemon role) and runs the daemon with the certificates the frontend issued it.
-pub fn daemon_args(profile: &Profile) -> Vec<String> {
-    let mut args: Vec<String> = [KBF_BIN, "--mode=daemon", "--config", NODE_CONFIG, "--label"]
+/// `kbf --mode=daemon`'s arguments: the binary, the mode and the config file, and nothing
+/// else. Every setting is a key of that file ([`render_config`]), so the job has one
+/// source of truth and a flag after `--config` could not be told from the file's.
+pub fn daemon_args(_profile: &Profile) -> Vec<String> {
+    [KBF_BIN, "--mode=daemon", "--config", NODE_CONFIG]
         .into_iter()
         .map(str::to_owned)
+        .collect()
+}
+
+/// The node's `kbf.toml`, which `apply` writes at [`NODE_CONFIG`] and `kbf --mode=daemon
+/// --config` reads: the mode, and the flags the profile carries (the native driver, the
+/// server and the CAS URL, the CA, certificate and key paths, the node id, the data
+/// directory and the labels), one TOML table per flag group, a key per flag long name. The
+/// tables are the ones of `GROUPS` in kbf-cli's `config.rs` (`identity` and `daemon`);
+/// `tests/node_config.rs` loads the file with that crate's loader. A flag that may repeat
+/// (`driver`, `label`) is an array. No value needs TOML escaping: the profile's patterns
+/// admit no `"`, `\` or control character.
+pub fn render_config(profile: &Profile) -> String {
+    let strings = |items: &[&str]| {
+        let quoted: Vec<String> = items.iter().map(|i| format!("\"{i}\"")).collect();
+        format!("[{}]", quoted.join(", "))
+    };
+    let node_label = profile.node_label();
+    let labels: Vec<&str> = std::iter::once(node_label.as_str())
+        .chain(profile.labels.iter().map(String::as_str))
         .collect();
-    args.push(profile.node_label());
-    for label in &profile.labels {
-        args.push("--label".into());
-        args.push(label.clone());
+    let mut out = String::from(concat!(
+        "# Written by kbf-mac-provision from its profile; `apply` puts it back if it is edited.\n",
+        "# One table per flag group, one key per flag long name (kbf-cli, config.rs).\n",
+        "mode = \"daemon\"\n",
+        "\n[identity]\n",
+    ));
+    for (key, value) in [
+        ("server", "kbf_server"),
+        ("cas", "kbf_cas"),
+        ("ca-cert", "kbf_ca_cert"),
+        ("cert", "kbf_cert"),
+        ("key", "kbf_key"),
+        ("node-id", "hostname"),
+    ] {
+        out.push_str(&format!("{key} = \"{}\"\n", profile.get(value)));
     }
-    args
+    out.push_str(&format!("label = {}\n", strings(&labels)));
+    out.push_str("\n[daemon]\n");
+    out.push_str(&format!("driver = {}\n", strings(&["native"])));
+    out.push_str(&format!("data-dir = \"{}\"\n", profile.get("kbf_data_dir")));
+    out
 }
 
 /// The account the job runs as, and its uid (also its gid).
@@ -123,7 +159,19 @@ pub(crate) fn launchd_label(c: &Ctx<'_>) -> Outcome {
     let plist_owner = c.mac.ls(&plist);
     let dir_owner = c.mac.ls(LOG_DIR);
     let log_owner = c.mac.ls(ERR_LOG);
-    if c.mac.read(&plist).as_deref() != Some(render_plist(c.profile).as_bytes()) {
+    let config_owner = c.mac.ls(NODE_CONFIG);
+    let config_dir_owner = c.mac.ls(CONFIG_DIR);
+    if c.mac.read(NODE_CONFIG).as_deref() != Some(render_config(c.profile).as_bytes()) {
+        fail(format!(
+            "{NODE_CONFIG} is missing or differs from the profile"
+        ))
+    } else if config_owner != ROOT_FILE {
+        fail(format!("{NODE_CONFIG} is {config_owner}, want {ROOT_FILE}"))
+    } else if config_dir_owner != ROOT_DIR {
+        fail(format!(
+            "{CONFIG_DIR} is {config_dir_owner}, want {ROOT_DIR}"
+        ))
+    } else if c.mac.read(&plist).as_deref() != Some(render_plist(c.profile).as_bytes()) {
         fail(format!("{plist} is missing or differs from the profile"))
     } else if plist_owner != ROOT_FILE {
         fail(format!("{plist} is {plist_owner}, want {ROOT_FILE}"))
@@ -212,6 +260,19 @@ pub(crate) fn fix_launchd_label(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> 
         c.mac.new_file(ERR_LOG, id, id, 0o644)?;
     }
     c.mac.chmod(ERR_LOG, 0o644)?;
+    c.mac.dir(CONFIG_DIR, 0, 0, 0o755)?;
+    if c.mac.read(NODE_CONFIG).as_deref() != Some(render_config(c.profile).as_bytes())
+        || c.mac.ls(NODE_CONFIG) != ROOT_FILE
+    {
+        c.mac.replace(
+            NODE_CONFIG,
+            render_config(c.profile).as_bytes(),
+            0,
+            0,
+            0o644,
+        )?;
+        out.change(c.key, format!("wrote {NODE_CONFIG}, root's, mode 644"));
+    }
     let plist = plist_path(c.profile);
     c.mac.mkdir(LAUNCH_DAEMONS)?;
     c.mac
