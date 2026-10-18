@@ -353,3 +353,29 @@ async fn a_client_reset_while_held_drops_the_ticket_at_once() {
     );
     drop(guard);
 }
+
+#[tokio::test(start_paused = true)]
+async fn chained_holds_do_not_keep_one_stream_longer_than_one_bound() {
+    let rig = Rig::start(tagged("a"), tagged("b")).await;
+    let first = rig.core.slots.hold(HOLD).expect("hold");
+    let start = tokio::time::Instant::now();
+    let mut client = rig.client().await;
+    let (response, mut body) = client.start(CAPS, false).await;
+    body.send_data(Bytes::from_static(b"p"), true)
+        .expect("body");
+    let waiting = tokio::spawn(finish(response));
+    until(|| rig.core.queue.held() == 1).await;
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    // The first hold ends into nothing for A, and a second begins at once.
+    rig.core.slots.release_into(Slot::A).expect("A is open");
+    drop(first);
+    let second = rig.core.slots.hold(HOLD).expect("second hold");
+    let reply = waiting.await.expect("client");
+    assert!(unavailable(&reply), "{reply:?}");
+    assert!(
+        start.elapsed() <= HOLD + Duration::from_secs(1),
+        "cut at the first hold's bound, not a second one later: {:?}",
+        start.elapsed()
+    );
+    drop(second);
+}

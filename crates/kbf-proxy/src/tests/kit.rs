@@ -5,7 +5,7 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
@@ -59,6 +59,12 @@ pub(super) struct ChildState {
     /// Set: the next connection is served by hand, and answers the first stream it is sent
     /// with a GOAWAY that names stream 0 as the last it took.
     pub raw_goaway_first: AtomicBool,
+    /// Set: the next connection is served by hand, and answers the first stream it is sent
+    /// with a DATA frame on stream 0, a protocol error of the connection that the proxy's h2
+    /// library detects itself.
+    pub raw_garbage_first: AtomicBool,
+    /// Set: the next connection is served by hand, sends its SETTINGS and never answers a PING.
+    pub raw_mute_first: AtomicBool,
     pub dispatches: AtomicUsize,
     pub conns_open: AtomicUsize,
     pub conns_total: AtomicUsize,
@@ -93,6 +99,28 @@ pub(super) struct MemNet {
     listeners: Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<DuplexStream>>>,
     /// Addresses where a connect neither succeeds nor fails.
     blackholes: Mutex<Vec<SocketAddr>>,
+    /// Milliseconds every connect takes (virtual), 0 for none.
+    delay_ms: AtomicU64,
+    /// Connects in flight now, and the most there ever were at once.
+    connecting: AtomicUsize,
+    peak_connecting: AtomicUsize,
+}
+
+/// One connect in flight, counted until it ends or its future is dropped.
+struct Connecting(Arc<MemNet>);
+
+impl Connecting {
+    fn begin(net: &Arc<MemNet>) -> Self {
+        let now = net.connecting.fetch_add(1, Ordering::AcqRel) + 1;
+        net.peak_connecting.fetch_max(now, Ordering::AcqRel);
+        Self(Arc::clone(net))
+    }
+}
+
+impl Drop for Connecting {
+    fn drop(&mut self) {
+        self.0.connecting.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 const PIPE_BYTES: usize = 1 << 20;
@@ -105,6 +133,18 @@ impl MemNet {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(addr, tx);
         rx
+    }
+
+    /// Makes every connect take `delay` of virtual time, so a burst of streams has its dials
+    /// in flight together.
+    pub(super) fn delay_connects(&self, delay: std::time::Duration) {
+        let ms = u64::try_from(delay.as_millis()).expect("a short delay");
+        self.delay_ms.store(ms, Ordering::Release);
+    }
+
+    /// The most connects that were ever in flight at once.
+    pub(super) fn peak_connects(&self) -> usize {
+        self.peak_connecting.load(Ordering::Acquire)
     }
 
     /// Makes a connect to `addr` hang for ever.
@@ -128,6 +168,9 @@ impl MemNet {
         Arc::new(move |addr| {
             let net = Arc::clone(&net);
             Box::pin(async move {
+                let _counted = Connecting::begin(&net);
+                let delay = net.delay_ms.load(Ordering::Acquire);
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 let hole = net
                     .blackholes
                     .lock()
@@ -252,14 +295,21 @@ fn frame(kind: u8, flags: u8, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Speaks just enough h2 to answer the first HEADERS with `GOAWAY(last_stream_id = 0)`, then
-/// keeps the connection open and reads until the proxy closes it.
-async fn raw_goaway(mut io: impl AsyncRead + AsyncWrite + Unpin + Send) {
-    let _ = raw_goaway_frames(&mut io).await;
+/// Speaks just enough h2 to take the proxy's SETTINGS and answer the first HEADERS with
+/// `on_headers` (a frame), and PINGs if `pong`; then keeps the connection open and reads until
+/// the proxy closes it.
+async fn raw_child(
+    mut io: impl AsyncRead + AsyncWrite + Unpin + Send,
+    on_headers: Vec<u8>,
+    pong: bool,
+) {
+    let _ = raw_frames(&mut io, &on_headers, pong).await;
 }
 
-async fn raw_goaway_frames(
+async fn raw_frames(
     io: &mut (impl AsyncRead + AsyncWrite + Unpin + Send),
+    on_headers: &[u8],
+    pong: bool,
 ) -> io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     io.read_exact(&mut [0_u8; 24]).await?;
@@ -271,8 +321,8 @@ async fn raw_goaway_frames(
         io.read_exact(&mut payload).await?;
         match (head[3], head[4] & 1) {
             (4, 0) => io.write_all(&frame(4, 1, &[])).await?,
-            (6, 0) => io.write_all(&frame(6, 1, &payload)).await?,
-            (1, _) => io.write_all(&frame(7, 0, &[0; 8])).await?,
+            (6, 0) if pong => io.write_all(&frame(6, 1, &payload)).await?,
+            (1, _) => io.write_all(on_headers).await?,
             _ => {}
         }
     }
@@ -284,7 +334,13 @@ async fn connection(
     script: Script,
 ) {
     if state.raw_goaway_first.swap(false, Ordering::AcqRel) {
-        return raw_goaway(io).await;
+        return raw_child(io, frame(7, 0, &[0; 8]), true).await;
+    }
+    if state.raw_garbage_first.swap(false, Ordering::AcqRel) {
+        return raw_child(io, frame(0, 0, &[1, 2, 3]), true).await;
+    }
+    if state.raw_mute_first.swap(false, Ordering::AcqRel) {
+        return raw_child(io, Vec::new(), false).await;
     }
     let mut builder = h2::server::Builder::new();
     builder

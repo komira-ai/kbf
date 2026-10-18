@@ -152,23 +152,32 @@ impl Down {
         {
             return Poll::Ready(self.fail());
         }
-        match ready!(self.recv.poll_data(cx)) {
-            Some(Ok(data)) => {
+        // Data while there is data, then the trailers if there are any. One error arm serves
+        // both reads: a failure at either is a failed stream.
+        let next = match ready!(self.recv.poll_data(cx)) {
+            Some(data) => data.map(|d| Some(Item::Data(d))),
+            None => ready!(self.recv.poll_trailers(cx)).map(|t| t.map(Item::Trailers)),
+        };
+        Poll::Ready(match next {
+            Ok(Some(Item::Data(data))) => {
                 let _ = self.recv.flow_control().release_capacity(data.len());
                 self.activity.touch();
-                Poll::Ready(Some(Ok(Frame::data(data))))
+                Some(Ok(Frame::data(data)))
             }
-            Some(Err(_)) => Poll::Ready(self.fail()),
-            None => {
-                // After the data ended, trailers cannot fail: the stream is closed.
-                let trailers = ready!(self.recv.poll_trailers(cx)).ok().flatten();
-                Poll::Ready(trailers.map(|mut t| {
-                    strip_reserved(&mut t);
-                    Ok(Frame::trailers(t))
-                }))
+            Ok(Some(Item::Trailers(mut trailers))) => {
+                strip_reserved(&mut trailers);
+                Some(Ok(Frame::trailers(trailers)))
             }
-        }
+            Ok(None) => None,
+            Err(_) => self.fail(),
+        })
     }
+}
+
+/// What the upstream response gave next.
+enum Item {
+    Data(Bytes),
+    Trailers(HeaderMap),
 }
 
 /// A body of the proxy's own answers, or an upstream response being proxied.
@@ -219,6 +228,9 @@ enum Kept {
     Data(Bytes),
     Trailers(HeaderMap),
 }
+
+/// The most frames kept for a replay. A request that has more is not replayed.
+const MAX_KEPT_FRAMES: usize = 64;
 
 /// What the pump does next.
 enum Next {
@@ -324,7 +336,14 @@ impl Source {
                     Kept::Data(data) => data.len(),
                     Kept::Trailers(_) => 0,
                 };
-                if state.buffer.push(len) {
+                // The window is closed by bytes (`REPLAY_BYTES`) and by frames: a flood of
+                // tiny frames would otherwise grow the list, and pin the read buffers the
+                // frames were cut from, far past the byte bound. An empty DATA frame carries
+                // nothing to replay.
+                let keep = !matches!(&kept, Kept::Data(data) if data.is_empty());
+                if keep && state.kept.len() >= MAX_KEPT_FRAMES {
+                    state.buffer.close();
+                } else if keep && state.buffer.push(len) {
                     state.kept.push(kept.clone());
                     *cursor += 1;
                 }
@@ -362,8 +381,23 @@ pub(crate) async fn pump(
             () = life.cancel.notified() => Next::Failed,
             next = source.next(&mut cursor) => next,
         };
-        let sent = match next {
-            Next::Frame(Kept::Data(data)) => send_chunk(&mut send, data).await.is_ok(),
+        match next {
+            Next::Frame(Kept::Data(data)) => {
+                // The response half's `cancel` also ends a pump parked on a full window.
+                let cancelled = tokio::select! {
+                    () = life.cancel.notified() => true,
+                    sent = send_chunk(&mut send, data) => {
+                        if sent.is_err() {
+                            return;
+                        }
+                        false
+                    }
+                };
+                if cancelled {
+                    send.send_reset(Reason::CANCEL);
+                    return;
+                }
+            }
             Next::Frame(Kept::Trailers(trailers)) => {
                 let _ = send.send_trailers(trailers);
                 return;
@@ -376,9 +410,6 @@ pub(crate) async fn pump(
                 send.send_reset(Reason::CANCEL);
                 return;
             }
-        };
-        if !sent {
-            return;
         }
         activity.touch();
     }

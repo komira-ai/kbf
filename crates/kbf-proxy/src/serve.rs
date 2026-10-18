@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 
 use crate::body::ProxyBody;
 use crate::control::{MAX_UPDATE_BODY, UPDATE_DEADLINE, UpdateHandler, UpdateReply, UpdateRequest};
-use crate::core::{CONNECTION_STREAMS, Core};
+use crate::core::{Core, DOWNSTREAM_CONNECTION_STREAMS};
 use crate::hold::STREAM_WINDOW_BYTES;
 use crate::metrics::Metrics;
 use crate::pool::BoxIo;
@@ -206,13 +206,15 @@ impl Drop for ConnPermit {
 }
 
 /// The downstream h2 server's settings. One window for every stream, and a connection window
-/// of [`CONNECTION_STREAMS`] of them, so held bodies cannot use up a connection's credit.
+/// of [`DOWNSTREAM_CONNECTION_STREAMS`] of them, so held bodies cannot use up a connection's credit.
 fn http_builder(core: &Core) -> http2::Builder<TokioExecutor> {
     let mut http = http2::Builder::new(TokioExecutor::new());
     http.initial_stream_window_size(STREAM_WINDOW_BYTES)
-        .initial_connection_window_size(STREAM_WINDOW_BYTES.saturating_mul(CONNECTION_STREAMS))
+        .initial_connection_window_size(
+            STREAM_WINDOW_BYTES.saturating_mul(DOWNSTREAM_CONNECTION_STREAMS),
+        )
         .adaptive_window(false)
-        .max_concurrent_streams(CONNECTION_STREAMS)
+        .max_concurrent_streams(DOWNSTREAM_CONNECTION_STREAMS)
         .max_header_list_size(core.limits.max_header_list_bytes);
     http
 }

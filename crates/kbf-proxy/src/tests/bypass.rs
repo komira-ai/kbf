@@ -440,3 +440,49 @@ async fn an_accept_that_keeps_failing_backs_off_and_shutdown_still_ends_it() {
     stop.send_replace(true);
     serving.await.expect("the serve task ends");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_refusal_of_a_grpc_call_is_a_grpc_response() {
+    let rig = Rig::start(tagged("a"), tagged("b")).await;
+    drop(rig.core.slots.hold(Duration::from_secs(20)).expect("hold"));
+    // The hold ended into nothing: no frontend is active.
+    let reply = rig.client().await.unary(CAPS).await;
+    assert_eq!(reply.grpc_status().as_deref(), Some("14"), "{reply:?}");
+    assert_eq!(
+        reply
+            .headers
+            .get("content-type")
+            .map(|v| v.to_str().expect("text")),
+        Some("application/grpc"),
+        "a client that cannot read the answer sees a malformed response, not UNAVAILABLE"
+    );
+}
+
+fn closed_config(extra: &str) -> ProxyConfig {
+    ProxyConfig::from_toml_str(&format!(
+        "operator_token_file = \"/etc/kbf/operator.token\"\n\
+         server_cert_file = \"/etc/kbf/tls/server.pem\"\n\
+         server_key_file = \"/etc/kbf/tls/server.key\"\n\
+         client_ca_file = \"/etc/kbf/tls/ca.pem\"\n\
+         {extra}\n\
+         [upstream]\nbase_port = 20000\n"
+    ))
+    .expect("a valid table")
+}
+
+#[test]
+fn bind_refuses_an_authentication_mode_it_cannot_enforce_yet() {
+    for mode in ["bearer", "mtls"] {
+        let extra = format!("buck2_auth = \"{mode}\"\nbuck2_token_file = \"/etc/kbf/buck2.token\"");
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let error = Proxy::bind(closed_config(&extra), OwnedFd::from(listener))
+            .expect_err("served open instead");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported, "{mode}");
+    }
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    Proxy::bind(
+        closed_config("buck2_auth = \"none\""),
+        OwnedFd::from(listener),
+    )
+    .expect("none is the mode that is built");
+}

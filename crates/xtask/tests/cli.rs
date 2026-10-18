@@ -569,13 +569,32 @@ fn budget_diff_defaults_to_this_repository() {
 #[test]
 fn proxy_loom_passes_when_cargo_passes_and_fails_when_it_fails() {
     let root = scratch("proxy-loom");
-    // `true` and `false` stand in for cargo: the verb's own work is the command it builds
-    // (tested in the library) and the status it reports.
+    // Stand-ins for cargo: the verb's own work is the command it builds (tested in the
+    // library) and what it reports of the run. One prints cargo's result line; `true` prints
+    // nothing, which is a gate that ran no model.
+    let fake = root.join("fake-cargo");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\necho 'test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'\n",
+    )
+    .expect("write the stand-in");
+    let mut mode = std::fs::metadata(&fake).expect("stat").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+    std::fs::set_permissions(&fake, mode).expect("chmod");
     let mut passing = xtask(&root, &["proxy-loom"]);
-    passing.env("CARGO", "true");
+    passing.env("CARGO", &fake);
     let (code, out, err) = outcome(passing.output().expect("run xtask"));
     assert_eq!(code, Some(0), "stderr:\n{err}");
-    assert!(out.contains("the kbf-proxy loom models passed"), "{out}");
+    assert!(
+        out.contains("the kbf-proxy loom models passed (5 ran)"),
+        "{out}"
+    );
+
+    let mut silent = xtask(&root, &["proxy-loom"]);
+    silent.env("CARGO", "true");
+    let (code, _, err) = outcome(silent.output().expect("run xtask"));
+    assert_eq!(code, Some(1));
+    assert!(err.contains("ran 0 tests"), "{err}");
 
     let mut failing = xtask(&root, &["proxy-loom"]);
     failing.env("CARGO", "false");
