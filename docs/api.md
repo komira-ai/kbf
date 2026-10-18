@@ -1141,8 +1141,9 @@ The frontend's own update (`docs/design/pull-updates.md`), kept in the `update/f
 field) writes a `frontend_update` order record into the root installer's order spool **on the
 frontend's own host** (`--installer-orders-dir`; `--installer-status-file` names the installer's
 `status.json`, by default the one beside the spool's directory). The installer there pulls and
-verifies the release, starts the new instance behind the installed Envoy, waits for `/readyz`
-and hands over. Answers: `503` naming `--state-store`, `--releases-dir` or
+verifies the release, starts the other frontend instance, waits for its `/readyz` and hands
+over; the operator's load balancer, which health-checks each instance's `/readyz`, moves new
+connections by that health alone, and the installer never edits or restarts it. Answers: `503` naming `--state-store`, `--releases-dir` or
 `--installer-orders-dir` when it is missing; `400` for a commit that is not 40 lowercase hex or
 a body with another field; `409` unless the release store holds the commit complete (tarball
 and attestation) for **this host's own platform**; `409` with `"error": "frontend_busy"` while

@@ -4,9 +4,10 @@
 //!
 //! The frontend writes a `frontend_update` order record into **its own host's** order spool,
 //! with the same [`kbf_update::spool::Spool`] the nodes write theirs with. The root
-//! `kbf-installer` on that host pulls the release, verifies it, starts the new instance behind
-//! the installed Envoy, waits for `/readyz` and hands over. This route does none of that: it
-//! orders it and shows what the installer says.
+//! `kbf-installer` on that host pulls the release, verifies it, starts the new instance, waits
+//! for its `/readyz` and hands over. The operator's load balancer moves traffic by `/readyz`
+//! health alone; the installer never touches it. This route does none of that: it orders the
+//! update and shows what the installer says.
 //!
 //! - `POST` passes the gates of every `/v1` write ([`crate::api::operator_gate`]) and wants a
 //!   JSON body with no other field. `503` without `--state-store`, `--releases-dir` or

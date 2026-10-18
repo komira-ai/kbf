@@ -1,7 +1,6 @@
 # Pull-based updates: hosts update themselves over the session they already hold
 
-Status: design; the wire contract (section 5) is frozen. Built or in review: `kbf-installer` (merged), `kbf-update` (the node client, #908) and `kbf-helper` (the root helper, #929). The rest is built in the units of section 11.
-**Revised for two rulings:** (1) node updates and the frontend's own update are decoupled (section 1 item 7, section 8); (2) the host's root tool pulls the release itself, in an unprivileged child, on the frontend's order, and kbf no longer stages release bytes into an inbox (sections 1, 2, 4, 5, 7 and 10). Where a built crate (`kbf-update`, `kbf-helper`) still has the inbox, this text is the target and section 7.5 lists what is removed. The root tool is `kbf-installer` as [distribution.md](distribution.md) section 6 describes; `kbf-helper` is folded into it. Where later text still says "the helper" (the as-built order rules, `helper.json`, `kbf-helper boot-check`), it means the root side of `kbf-installer`.
+Status: design; the wire contract (section 5) is frozen. Built or in review: `kbf-installer` (merged), `kbf-update` (the node client, #908) and the root helper (#929, now the `helper` module and the `run` and `boot-check` verbs of the `kbf-installer` binary). The rest is built in the units of section 11.
 Adapted from the pull-update design study; labels: **[F]** read in code at the time of writing,
 **[D]** a design decision, **[V]** verify before building on it.
 
@@ -82,7 +81,7 @@ Residuals, stated plainly:
   host accepts when the frontend offers it. The attestation proves *where a binary was built*, not *that a
   reviewer approved the source*.
 - **A hostile frontend can offer any older attested build.** Downgrades are allowed on purpose: a rollback is the
-  desired release set to an older commit. The guard is the **desired-state generation**; the installer keeps a floor of (epoch, then generation) in `state.json` plus the operator floor in `installer.toml` (section 7), a commit downgrade is allowed, and a rollback is the old release offered again with a higher generation, which gets a new, higher order id. A host
+  desired release set to an older commit. The guard is the **desired-state generation**; **as built**, the installer keeps no floor of its own: orders are ordered by (epoch, then id) in the node's client and the helper (see UpdateOrder), a commit downgrade is allowed, and a rollback is the old release offered again with a higher generation, which gets a new, higher order id. A host
   acts on the highest generation it has seen, a higher generation always wins, and an order carries the store epoch so
   a restored store cannot replay one. A host refuses "older" only below the operator-set floor (`min_generation`, `min_protocol`).
 - **Test-farm switch.** The held installer for the test farm temporarily runs with attestation verification off (to be
@@ -101,7 +100,7 @@ Residuals, stated plainly:
   min_protocol, protocol, profile, state_schema, version}`. A release is verified, not rebuilt.
 - **Versioned host layout** [F]: `/usr/local/kbf/releases/<commit>/`, `current` and `previous` symlinks, a
   `state.json` with a pending confirm (and an order-floor field kept only so an older state file reads); `kbf-deploy host install|rollback|gc`. The units run
-  `<KBF_BIN_DIR>/kbf --mode=<mode>`, so pointing `KBF_BIN_DIR` at `current` needs no new unit shape.
+  `<KBF_BIN_DIR>/kbf <mode>`, so pointing `KBF_BIN_DIR` at `current` needs no new unit shape.
 - **Rollout state machine** [F]: a blocking engine (gate, stage, drain, wait idle, swap, wait healthy, wait
   repaired, confirm, undrain; rollback on failure; pause; fleet lock) over a `Transport` trait, with a fake fleet
   and planted-fault tests. It had no real `Transport`; this design supplies one over sessions.
@@ -134,8 +133,8 @@ Residuals, stated plainly:
 | Wire messages | `crates/kbf-proto/proto/kbf/update/v1/update.proto` | messages and one service; frozen (section 5) |
 | Platform names | `kbf_types::ReleasePlatform` | `linux-x86_64`, `linux-arm64`, `darwin-arm64`; from a node's `os` and `arch` report entries |
 | Release store, desired release, offers, `ReleaseService` | `kbf-server` | section 6 |
-| Update client | `kbf-update` (the node's side, unprivileged) | relays offers and orders, writes `activate`, `confirm` and `revert` order records to the spool (and refuses any wire order that names another verb), reports status, refuses an order while a lease is live. It fetches nothing and stages nothing |
-| Installer (fetch in a child, verify offline, install, flip, revert) | `kbf-installer`, a root unit on each host; `kbf-helper` is folded into it ([distribution.md](distribution.md) section 6) | verbs and the fetch child in section 7 |
+| Update client | `kbf-update` (the node's side), `kbf-installer run` (root), `kbf-installer` (layout, verbs) | fetch, inbox, status, refuse an order while a lease is live |
+| Helper (verify offline, install, flip, revert) | a root unit on each host, one shared installer library | verbs in section 7 |
 | Rollout controller | `kbf-server`, replaces the older record in `rollout.rs` | section 8 |
 | Fleet view | read-only over `/v1/nodes` and `/v1/update`; the UI page is deferred | section 9 |
 
@@ -169,15 +168,16 @@ platform is **complete** for a commit when the frontend holds every component it
 `Welcome` epoch, which moves only when a store is restored (a handover keeps it). Orders are ordered by **(epoch, then
 id)**, by the node's client and again by the helper, which acts on each pair once: a higher epoch is newer whatever its
 id (a restored store counts ids again), an older epoch is refused whatever its id, the same epoch with a higher id is
-newer however large the gap (the counter is the store's, not the host's), and the same pair again is a replay. A rollback is the old release ordered again with a higher generation. The installer's floor is
-(epoch, generation), compared lexicographically (section 7), together with the operator floor in `installer.toml`. The helper names an activation `<epoch>-<id>`, so the same id in two epochs is two
+newer however large the gap (the counter is the store's, not the host's), and the same pair again is a replay. There is
+no floor on the installer's side: a rollback is the old release ordered again, and the order of orders is the
+client's and the helper's alone. The helper names an activation `<epoch>-<id>`, so the same id in two epochs is two
 activations. An epoch more than 1000 above the last acted on is refused with the reason in `status.json` and not
 acknowledged. This is best effort: it blunts a typo or a stray huge epoch, but an order forged at acked+1, or a first
-order at a huge epoch, is taken and wedges the installer until root clears `state.json`'s floor (the schema 1 state file of the as-built helper, which P3 migrates into `state.json` schema 2); the first order a host
+order at a huge epoch, is taken and wedges the helper until root clears `helper.json`; the first order a host
 acts on is measured from nothing and is taken at any epoch. A compromised service user can still write a first order
 with a huge epoch: an availability limit, the same exposure as ordering an activation early (section 7.3 of the
 design study). `window_s` is the confirm window of `ACTIVATE`, **per platform as built**: on Linux the helper ignores it, and the window starts at the new
-process's first start (`kbf-helper boot-check --window-secs`, default 900, range 120 to 1800); on macOS there is no start hook, so the window is
+process's first start (`kbf-installer boot-check --window-secs`, default 900, range 120 to 1800); on macOS there is no start hook, so the window is
 armed at activation and `window_s` is clamped to 120 to 1800. Either way a compromised frontend cannot set a year.
 
 **UpdateStatus.** Sent after `Welcome` and on every change. `running_commit` is the process's own build commit
@@ -206,12 +206,10 @@ the offers and orders, never sends a status, and is listed `unsupported`.
 
 ### Contracts owned by the node client and the installer
 
-Two small things cross from the unprivileged `kbf` to the root `kbf-installer`, and both are specified by the
-`kbf-update` and installer units and frozen with them: the **order record** (section 7: one file per order in the
-installer's order spool, a few hundred bytes of JSON) and the world-readable `status.json` the installer writes. This
-document does not restate their fields so that there is one source. **There is no inbox**: no offer directory, no
-tarball, no attestation bundle is written by `kbf`, and no entry the unprivileged process creates names a path, a
-URL or a unit.
+The inbox directory the unprivileged `kbf` writes and the root helper reads, and the world-readable `status.json`
+the helper writes, are specified by the update-client and helper units (`kbf-update`, `kbf-installer`) and frozen with them. This document
+does not restate them so that there is one source. In short: an entry directory per offer (`<generation>-<commit>/` with `offer.json`, the
+tarballs and the attestation bundle) and, in `orders/`, one file per order.
 
 ## 6. The frontend
 
@@ -310,62 +308,15 @@ still run unprivileged there, so a fault in them is not root.
 
 | Command | Does |
 |---|---|
-| `kbf-installer run` | every 5 seconds (a fixed constant, not a key), each pass: finish a restart it owes; revert a swap whose confirm window ran out; sweep leftover scratch (7.3); act on order records from `orders/` in (epoch, id) order, once each. For `activate`: refuse it while a trial is pending (a release activated and not yet confirmed or reverted: there is one confirm window at a time, never two timers), check the order (below), **fetch, verify and install the release for the commit (7.1, 7.2)**, write `pending_confirm`, flip `previous` then `current`, restart the one configured service; `confirm`: keep it; `revert`: flip back and restart; write `status.json` |
-| `kbf-installer confirm`, `revert`, `rollback`, `update --frontend` | the operator verbs: **inline root CLI runs under the installer's lock** (exit 4 while a `run` pass holds it); no socket, and `kbf` cannot run them. `confirm` and `revert` name the activation; `rollback` is the only verb below the floor. `update --commit SHA --frontend` is the local fallback of the `frontend_update` order (section 6.5) |
+| `kbf-installer run` | each pass: finish a restart it owes; revert a swap whose confirm window ran out; **stage the newest inbox entry itself** (through `kbf-installer`: SHA-256 and attestation verified offline, the tarball holds one file `<name>`, `--version --json` of it names the offered commit, run as the service user with an empty environment; install into `releases/<commit>/`, do not activate); act on orders from `inbox/orders/<id>.json` (`{order_id, epoch, verb, commit, window_s}`) in id order, once each (`activate`: write `pending_confirm` first, flip `previous` then `current`, restart the one configured service; `confirm`: keep it; `revert`: flip back and restart); write `status.json` |
 | `kbf-installer boot-check` | `ExecStartPre` on Linux: count the starts of a release on trial and revert one that keeps failing before it starts again; start the confirm window at the first start |
 
-**The order spool.** `orders/` is owned by `kbf` with mode 0700. Root opens it with `openat` and `O_NOFOLLOW` relative to a
-descriptor it holds, takes an entry only if `fstat` says a regular file with one link, reads it **once into memory** and
-parses from that copy (never re-reads a path); the file is then removed by name through the same descriptor. At most 64 records
-are held and a record older than the confirm-window maximum (1800 s), **measured from root's first-seen time** (recorded in memory and in
-`state.json` when root first reads it, never the file's mtime, which the writer controls), is expired and removed, so a stuck or hostile writer cannot
-grow the directory or replay a stale order after a restart. `kbf-update` writes each record to a temporary name starting with `.` and renames it into place; **the installer ignores dot names**,
-so it never reads a half-written record. A record is at most 1 MiB; a larger, unparsable, symlinked or
-non-regular record is refused and removed.
+Orders carry the verbs `activate`, `confirm` and `revert`; they are not helper subcommands. **The helper must not run on the frontend host until the
+frontend-host `activate` of split-mode-updates.md (unit U5) exists**: as built it restarts the one configured service, which for the frontend is the
+restart this design forbids.
 
-An order record is `{order_id, epoch, generation, verb, commit, window_s}` (`verb` is `activate`, `confirm`, `revert` or `frontend_update`, the contract's record, [kbf-installer.md](kbf-installer.md) section 4) plus, for `activate`, the offer's components
-for the host's platform (`name`, `sha256`, `size`, `attestation`: the same bytes the offer carried, at most 256 KiB each) and the
-**expected facts about the release**: `platform`, `protocol`, `min_protocol`, `state_schema` and `profile`, as the frontend's
-preflight recorded them. These are **locators and claims, not trust**: section 7.2 re-derives every one that matters, and the
-expected facts are the claim that 7.2 step 5 checks the binary against *before* the flip. Before fetching, the installer refuses
-(and says why in `status.json`) an order that is a replay or older by the (epoch, id) rule of section 5, a commit that is not 40
-lowercase hex, a component set that is not exactly what the host's platform needs, a size over the cap (7.1), a pending trial,
-or a host with a live lease. The installer observes leases itself and reads nothing the daemon or `kbf` writes: **on Linux** it
-observes the lease processes' cgroup (membership of the systemd scope or unit that runs actions); **on macOS** it observes the
-launchd job and the processes by uid (the lease users). The record's claim is never used.
-
-**Generation and floor.** The (epoch, id) rule orders orders but cannot tell an old order from a replay of one. The installer
-therefore also compares **(epoch, generation) lexicographically**, mirroring the order rule: a higher epoch wins whatever its generation,
-an older epoch is refused, and within one epoch the generation must be at or above the highest acted on (a rollback is a higher
-generation naming an older commit, so monotonic holds) and at most **1000 above it per order** (best effort, like the epoch guard:
-it blunts a stray huge value, it does not stop a forger who steps by 1000). `UpdateOrder.generation` is the additive field of
-section 5. **This check stops a replay, not a forgery.** Against a compromised `kbf` (which writes the record) the only defence is
-the **operator floor** in root-owned `/etc/kbf/installer.toml`, `min_generation` and `min_protocol`, below which no order is taken. The
-intended end state is a frontend-signed grant on each order, verified before any fetch against a pinned key; that key and its
-rotation are not designed here, so v1 is the monotonic check plus the floor.
-
-Orders carry the verbs `activate`, `confirm` and `revert`; they are not installer subcommands. **A `confirm` is accepted only if** it names
-the pending activation (`<epoch>-<id>`), the unit is active, `/proc/<MainPID>/exe` resolves inside `releases/<current>`, and the first
-`boot-check` of that release has run; otherwise it is refused and the window keeps running. **The verb selects the dispatch.** An `activate` record is the node sequence of section 8 item 2 and **never touches `kbf-frontend@*` or the host's own
-frontend mode**. A `frontend_update` record is accepted only on a host whose `kbf.toml` mode is `frontend` or `all-in-one`, and only from `orders/`
-(or the root CLI); it is subject to the same ordering, floors and refusals as `activate`, and is dispatched to the frontend update: verify as for a
-node (7.1, 7.2), check the installed Envoy is in the tested range, point the idle slot at the release, start the other `kbf-frontend@` instance, wait for
-its `/readyz`, hand over, then confirm ([kbf-installer.md](kbf-installer.md) section 6). A second one while one is in flight is refused `frontend_busy`. The installer must have the
-frontend-host activation of split-mode-updates.md (unit U5) before it takes a `frontend_update` order.
-
-**Who may write which verb (trust consequence).** `orders/` belongs to `kbf`, so **any process running as `kbf` on a frontend or all-in-one host can
-request a frontend swap by writing a `frontend_update` record**; on an all-in-one host that includes the node daemon. This is accepted: both run as `kbf`,
-and the release must still pass every verification of 7.2, so the swap can only move to an attested commit within the floors (`min_generation`,
-`min_protocol`, the generation rule and the deny list). A compromised `kbf` could already order a node update; the new power is to start the frontend
-handover, an availability exposure bounded by the single in-flight rule, not an integrity one. **A wire order received over a node session never
-becomes a `frontend_update` record**: the wire `UpdateOrder` verb enum has `activate`, `confirm` and `revert` only, `kbf-update` maps those and nothing
-else, writes no other verb from any input, and refuses an order that names anything else. Only the frontend process, writing for its own host from
-section 6.5, writes `frontend_update`.
-
-- The installer **never executes the new binary as root**. The `--version --json` probe runs as `kbf-fetch` (no credentials, no
-  network, no file of its own; the `kbf` user holds the cold-store credential and the node key and is not used), with an empty
-  environment, the rlimits of 7.1 and the bounds of 7.2.
-- Order of writes: `pending_confirm` before the flip, the flip before the restart; on start the installer reconciles
+- The helper **never executes the new binary as root**.
+- Order of writes: `pending_confirm` before the flip, the flip before the restart; on start the helper reconciles
   its state against the links, resolving to the state that keeps `previous` intact.
 - Linux: an `ExecStartPre` boot check decrements a start counter while `current` is unconfirmed, so a crash loop
   reverts in seconds with no timer. macOS: a LaunchDaemon; the revert timer is the only trigger.
