@@ -45,7 +45,7 @@ fn the_farms_own_certificates_are_accepted_on_their_routes() {
     }
     assert_eq!(
         check(
-            &support::node_tbs(ca, Role::Storage, Some("10.1.2.3")),
+            &support::node_tbs(ca, Role::Storage, Some("192.0.2.3")),
             Route::Node
         ),
         Ok(())
