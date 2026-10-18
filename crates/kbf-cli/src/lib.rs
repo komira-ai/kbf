@@ -3,9 +3,8 @@
 //!
 //! - `kbf daemon`: the build node. Takes exactly the flags `kbf-daemon` takes
 //!   ([`kbf_node::Cli`]) and refuses, by name, every flag of another mode.
-//! - `kbf all-in-one`: the server and the daemon in one process, as `kbf-all-in-one`
-//!   runs them today. Takes exactly the flags `kbf-all-in-one` takes
-//!   ([`kbf_all_in_one::cli`]).
+//! - `kbf all-in-one`: the server and the daemon in one process. Takes the flags of
+//!   both `kbf-server` and `kbf-daemon` ([`kbf_all_in_one::cli`]).
 //! - `kbf storage`: the storage node ([`kbf_server::storage_node`]). Takes
 //!   `kbf-server`'s store, write and log flags and its own listener flags, and refuses
 //!   every other flag of `kbf-server` (and so any state-store flag: a storage node
@@ -28,7 +27,7 @@
 //! one mode is refused by the others with no edit here.
 //!
 //! `kbf --version` prints `kbf <package version>+<commit>`: the commit stamp is
-//! `kbf-server`'s ([`kbf_server::SERVER_VERSION`]), which `kbf-all-in-one` links
+//! `kbf-server`'s ([`kbf_server::SERVER_VERSION`]), which `kbf all-in-one` links
 //! anyway, so the artifacts workflow can check `kbf` as it checks `kbf-server`.
 //!
 //! `kbf --version --json` ([`version`]) prints one JSON object on one line naming the
@@ -52,6 +51,13 @@
 //! (75 for a piece that heals shortly). `check-args`, `cluster` and `frontend handover`
 //! read nothing of the host and skip it.
 //!
+//! Every mode also takes `--config FILE` and `--check` ([`config`]): the settings may be in
+//! `/etc/kbf/kbf.toml` (one TOML table per setting group, one key per flag, a flag on the
+//! command line overriding its key), and `--check` parses the flags and the file, runs the
+//! startup checks and exits 0, 2 or 75 without starting ([`preflight::check_only`]).
+//! `check-args` is `--check`'s parse stage only, kept for `kbf-deploy`, with a deprecation
+//! note on its last line of standard error.
+//!
 //! And the product's two words for a node ([`node`], [`enroll`]): `kbf enroll` enrolls the
 //! node with the frontend its `kbf.toml` names (one token, one key per role, a certificate
 //! from the frontend's CA) and exits; `kbf node` does that if the node is not enrolled,
@@ -60,9 +66,10 @@
 //! [`names::MODES`]; `kbf check-args node ...` and `kbf check-args enroll ...` accept
 //! their flags.
 //!
-//! The `kbf-server`, `kbf-daemon` and `kbf-all-in-one` binaries are unchanged.
+//! The `kbf-server` and `kbf-daemon` binaries are unchanged.
 
 pub mod cluster;
+pub mod config;
 pub mod enroll;
 pub mod handover;
 pub mod names;
@@ -109,6 +116,25 @@ fn own_command(entry: Entry) -> Command {
         Entry::Storage => kbf_server::storage_node::command(),
         Entry::StorageAndDaemon => kbf_all_in_one::storage_and_daemon::command(),
         Entry::Frontend => kbf_server::frontend::command(),
+    }
+}
+
+/// The flags a mode's own command carries only so that it can refuse them by name (the
+/// flags of `kbf-server` that `kbf storage` and `kbf frontend` do not take): they are
+/// no settings.
+fn refused_own(entry: Entry) -> BTreeSet<String> {
+    match entry {
+        Entry::Frontend => kbf_server::frontend::refused_flags(),
+        Entry::Storage => kbf_server::storage_node::refused_flags(),
+        // The daemon's flags are its own whatever they are called.
+        Entry::StorageAndDaemon => {
+            let daemon = longs(&kbf_node::Cli::command());
+            kbf_server::storage_node::refused_flags()
+                .into_iter()
+                .filter(|flag| !daemon.contains(flag))
+                .collect()
+        }
+        Entry::Daemon | Entry::AllInOne => BTreeSet::new(),
     }
 }
 
@@ -171,7 +197,26 @@ fn mode_command(name: &'static str, entry: Entry) -> Command {
                 // The id is the flag's own name: no argument of either has a hyphen in its id.
                 cmd = cmd.arg(Arg::new(*flag).long(*flag).num_args(0..=1).hide(true));
             }
-            cmd
+            cmd.arg(
+                Arg::new(CONFIG)
+                    .long(CONFIG)
+                    .value_name("FILE")
+                    .value_parser(clap::value_parser!(std::path::PathBuf))
+                    .help(format!(
+                        "Read the mode's settings from this TOML file (default {} when it \
+                         exists); a flag on the command line overrides its key",
+                        config::DEFAULT_PATH
+                    )),
+            )
+            .arg(
+                Arg::new(CHECK)
+                    .long(CHECK)
+                    .action(clap::ArgAction::SetTrue)
+                    .help(
+                        "Parse the flags and the file, run the startup checks, print each \
+                         problem and exit (0 fine, 2 refused, 75 not ready) without starting",
+                    ),
+            )
         }
     }
 }
@@ -199,6 +244,16 @@ pub fn command() -> Command {
         NODE = names::NODE,
         ENROLL = names::ENROLL,
     ))
+}
+
+/// The whole `kbf.toml` of mode `mode`, every setting in its group's table
+/// ([`config::template`]); `None` for a word that is not a mode.
+#[must_use]
+pub fn config_template(mode: &str) -> Option<String> {
+    MODES
+        .iter()
+        .find(|m| m.name == mode)
+        .map(|m| config::template(m.name, &own_command(m.entry), &refused_own(m.entry)))
 }
 
 /// The word after `kbf` that calls the operator API ([`cluster`]) instead of starting a
@@ -307,10 +362,81 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString>,
 {
-    let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
-    let matches = match command().try_get_matches_from(&args) {
+    parse_with(args, None).map(|parsed| parsed.invocation)
+}
+
+/// The flag that names the settings file.
+pub const CONFIG: &str = "config";
+
+/// The flag that checks a start instead of making it.
+pub const CHECK: &str = "check";
+
+/// A command line parsed with its settings file.
+#[derive(Clone, Debug)]
+pub struct Parsed {
+    /// The mode and its flags: the command line's, then the file's for those it did not give.
+    pub invocation: Invocation,
+    /// `--check` was given: print the problems and exit, start nothing.
+    pub check: bool,
+}
+
+/// Parses a command line (its first word is the program's name) and the settings file it
+/// names with `--config`, else `default_config` when that file exists
+/// ([`config::DEFAULT_PATH`] for `kbf <mode>`): [`parse_from`] reads no file unless
+/// `--config` names one.
+///
+/// # Errors
+/// What [`parse_from`] refuses, and what is wrong with the file ([`config::file_args`]),
+/// as an error that exits 2.
+pub fn parse_with<I, T>(
+    args: I,
+    default_config: Option<&std::path::Path>,
+) -> Result<Parsed, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString>,
+{
+    let mut args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+    let mut check = false;
+    if let Some((mode, entry, m)) = lenient(&args) {
+        check = m.get_flag(CHECK);
+        let path = m
+            .get_one::<std::path::PathBuf>(CONFIG)
+            .cloned()
+            .or_else(|| default_config.filter(|p| p.exists()).map(Into::into));
+        if let Some(path) = path {
+            let own = own_command(entry);
+            let given = own
+                .get_arguments()
+                .map(|a| a.get_id().as_str())
+                .filter(|id| m.value_source(id) == Some(clap::parser::ValueSource::CommandLine))
+                .map(str::to_owned)
+                .collect();
+            let extra = config::file_args(&own, &refused_own(entry), &path, &given)
+                .map_err(|why| command().error(ErrorKind::Io, format!("kbf {mode}: {why}")))?;
+            args.extend(extra);
+        }
+    }
+    parse_invocation(&args).map(|invocation| Parsed { invocation, check })
+}
+
+/// The mode of `args` and what a lenient parse of its flags found, when `args` name a
+/// mode.
+fn lenient(args: &[std::ffi::OsString]) -> Option<(&'static str, Entry, ArgMatches)> {
+    let mut lenient = command().ignore_errors(true);
+    for mode in MODES {
+        lenient = lenient.mut_subcommand(mode.name, |sub| sub.ignore_errors(true));
+    }
+    let matches = lenient.try_get_matches_from(args).ok()?;
+    let (name, m) = matches.subcommand()?;
+    let mode = MODES.iter().find(|mode| mode.name == name)?;
+    Some((mode.name, mode.entry, m.clone()))
+}
+
+fn parse_invocation(args: &[std::ffi::OsString]) -> Result<Invocation, clap::Error> {
+    let matches = match command().try_get_matches_from(args) {
         Ok(matches) => matches,
-        Err(e) => return Err(refusal_in(&args).unwrap_or(e)),
+        Err(e) => return Err(refusal_in(args).unwrap_or(e)),
     };
     let (name, m) = matches.subcommand().expect("a subcommand is required");
     let mode = MODES
@@ -449,13 +575,19 @@ pub fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if args.get(1).is_some_and(|word| word == CHECK_ARGS) {
-        return match check_args(&args) {
+        let code = match check_args(&args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 let _ = e.print();
                 ExitCode::from(2)
             }
         };
+        // After the result: `kbf-deploy` reports the first line this prints.
+        eprintln!(
+            "kbf: `check-args` is deprecated: it only parses the flags; use `kbf <mode> ... \
+             --check`, which also reads the config file and runs the startup checks"
+        );
+        return code;
     }
     if args.get(1).is_some_and(|word| word == names::FRONTEND)
         && args.get(2).is_some_and(|word| word == HANDOVER)
@@ -483,8 +615,14 @@ pub fn main() -> ExitCode {
             Err(e) => e.exit(),
         };
     }
-    match parse_from(args) {
-        Ok(invocation) => preflight::refusal(&invocation).unwrap_or_else(|| run(&invocation)),
+    match parse_with(args, Some(std::path::Path::new(config::DEFAULT_PATH))) {
+        Ok(Parsed {
+            invocation,
+            check: true,
+        }) => preflight::check_only(&invocation),
+        Ok(Parsed { invocation, .. }) => {
+            preflight::refusal(&invocation).unwrap_or_else(|| run(&invocation))
+        }
         Err(e) => e.exit(),
     }
 }

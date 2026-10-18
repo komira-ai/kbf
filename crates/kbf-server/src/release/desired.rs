@@ -80,7 +80,7 @@ fn unavailable(what: &str, flag: &str) -> Response {
     )
 }
 
-fn row_failed(e: &RowError) -> Response {
+pub(crate) fn row_failed(e: &RowError) -> Response {
     if matches!(e, RowError::Contended(_)) {
         tracing::warn!("update rows: {e}");
         let mut busy = error(
@@ -95,7 +95,7 @@ fn row_failed(e: &RowError) -> Response {
     error(StatusCode::INTERNAL_SERVER_ERROR, "the update rows failed")
 }
 
-fn desired_view(desired: Option<&Desired>) -> serde_json::Value {
+pub(crate) fn desired_view(desired: Option<&Desired>) -> serde_json::Value {
     desired.map_or(serde_json::Value::Null, |d| {
         json!({
             "generation": d.generation.0,
@@ -106,7 +106,7 @@ fn desired_view(desired: Option<&Desired>) -> serde_json::Value {
 }
 
 /// The policy row as the operator sees it: durations in seconds.
-fn policy_view(p: &Policy) -> serde_json::Value {
+pub(crate) fn policy_view(p: &Policy) -> serde_json::Value {
     let secs = |d: std::time::Duration| d.as_secs();
     json!({
         "paused": p.paused,
@@ -130,7 +130,7 @@ fn policy_view(p: &Policy) -> serde_json::Value {
 
 /// Runs a blocking call on the store (the rows block on it). A call that panics fails the
 /// request as a store error does.
-pub(super) async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     call: impl FnOnce() -> Result<T, RowError> + Send + 'static,
 ) -> Result<T, RowError> {
     let joined = tokio::task::spawn_blocking(call).await;

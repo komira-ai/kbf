@@ -1,7 +1,7 @@
-//! Offers and update statuses over the worker session (`docs/design/pull-updates.md`
-//! sections 5 and 6.4), end to end: a real frontend over loopback with a release store and a
-//! state store, daemons that speak the session, and the node's own update client
-//! (`kbf-update`) taking the offers.
+//! Offers over the worker session (`docs/design/pull-updates.md` sections 5 and 6.4), end to
+//! end: a real frontend over loopback with a release store and a state store, daemons that
+//! speak the session, and the node's own update client (`kbf-update`) taking the offers. What
+//! the server keeps of the statuses the nodes send is `tests/update_hosts.rs`.
 
 #[path = "support/hooked.rs"]
 mod hooked;
@@ -16,8 +16,7 @@ use std::time::Duration;
 
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_objstore::MemoryStore;
-use kbf_proto::update::update_status::State;
-use kbf_proto::update::{UpdateOffer, UpdateStatus};
+use kbf_proto::update::UpdateOffer;
 use kbf_proto::worker::{daemon_message, server_message};
 use kbf_server::members::MembershipConfig;
 use kbf_server::release::{Limits, ReleaseStore};
@@ -121,11 +120,16 @@ fn start_with(releases: bool, state: bool) -> Frontend {
         releases,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    // Allows everything, and names `farm.getAuthorizer`, which turns `GET /v1/update/hosts` on.
+    let policy = kbf_auth::Policy::from_json(
+        r#"{"authenticationPolicy": {"allow": {}}, "farm": {"getAuthorizer": {"allow": {}}}}"#,
+    )
+    .expect("a policy");
     let bound = bind_server_with_state(
         Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory()),
         listeners(),
         Some(api),
-        kbf_auth::Policy::allow_all(),
+        policy,
         state,
         async move {
             let _ = stopped.await;
@@ -214,25 +218,21 @@ impl Frontend {
         desired["generation"].as_u64().expect("a generation")
     }
 
-    async fn nodes(&self) -> Value {
-        http(self.api, "GET", "/v1/nodes", false, None, b"").await.1
-    }
-
-    /// The `update` object of `node` once `ready` accepts it.
-    async fn update_until(&self, node: &str, ready: impl Fn(&Value) -> bool) -> Value {
+    /// The entry of `node` in `GET /v1/update/hosts` once `ready` accepts it.
+    async fn host_until(&self, node: &str, ready: impl Fn(&Value) -> bool) -> Value {
         let deadline = tokio::time::Instant::now() + PROMPT;
         loop {
-            let nodes = self.nodes().await;
-            let listed = nodes["nodes"]
+            let (code, hosts) = http(self.api, "GET", "/v1/update/hosts", false, None, b"").await;
+            assert_eq!(code, 200, "{hosts}");
+            let listed = hosts["hosts"]
                 .as_array()
-                .and_then(|all| all.iter().find(|n| n["node_id"] == node))
-                .map(|n| n["update"].clone());
-            if let Some(update) = listed.filter(|u| ready(u)) {
-                return update;
+                .and_then(|all| all.iter().find(|h| h["node_id"] == node));
+            if let Some(host) = listed.filter(|h| ready(h)) {
+                return host.clone();
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "no matching update for {node}: {nodes}"
+                "no matching host {node}: {hosts}"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -285,21 +285,12 @@ async fn mac_node(front: &Frontend, name: &str, arch: &str) -> FakeDaemon {
         .expect("registered")
 }
 
-fn status(commit: &str, state: State, offered: u64) -> daemon_message::Message {
-    daemon_message::Message::UpdateStatus(UpdateStatus {
-        running_commit: commit.to_owned(),
-        state: state as i32,
-        offered_generation: offered,
-        helper_present: true,
-        ..UpdateStatus::default()
-    })
-}
-
 /// Catches an offer that is not sent after `Welcome`, one built from the wrong parts, and
 /// one the node's own client cannot take. The Linux release also holds a `kbf-daemon`
 /// tarball, which a Linux host must not be told about. The node is a real `kbf-update`
 /// client: it fetches the offered tarball through `ReleaseService.Fetch` on the worker
-/// listener into its inbox, and the status it then reports is what `/v1/nodes` lists.
+/// listener into its inbox, and the status it then reports is what `/v1/update/hosts` and
+/// `/v1/nodes` list.
 ///
 /// Mutants seen red: no offer after `Welcome`; every stored component offered, not the
 /// platform's; the digest, the size or the attestation taken from another component.
@@ -362,13 +353,20 @@ async fn a_node_is_offered_the_desired_release_after_welcome_and_its_client_take
     node.send(daemon_message::Message::UpdateStatus(
         kbf_proto::update::UpdateStatus::from(&reported),
     ));
-    let update = front
-        .update_until("n1", |u| u["offered_generation"] == 1)
+    let host = front
+        .host_until("n1", |h| h["offered_generation"] == 1)
         .await;
-    assert_eq!(update["availability"], "ok");
-    assert_eq!(update["running_commit"], "0123456789ab");
-    assert_eq!(update["state"], "manual", "no helper reports on this host");
-    assert_eq!(update["helper_present"], false);
+    assert_eq!(host["availability"], "ok");
+    assert_eq!(host["running_commit"], "0123456789ab");
+    assert_eq!(host["state"], "manual", "no helper reports on this host");
+    assert_eq!(host["helper_present"], false);
+    // It runs the prefix of the desired commit, as the open listing says too.
+    assert_eq!(host["up_to_date"], true, "{host}");
+    let (_, nodes) = http(front.api, "GET", "/v1/nodes", false, None, b"").await;
+    assert_eq!(
+        nodes["nodes"][0]["update"],
+        json!({ "state": "manual", "up_to_date": true, "availability": "ok" })
+    );
     running.abort();
 }
 
@@ -524,77 +522,6 @@ async fn a_stopped_frontend_ends_its_offer_tasks() {
     }
 }
 
-/// Catches an `UpdateStatus` that is not read, and a node that never sent one listed as
-/// anything but `unsupported`: node `new` reports and is listed with its commits, state and
-/// helper facts (a state this server does not know is `unknown`); the newest status replaces
-/// the one before; node `old` sent none.
-///
-/// Mutant seen red: the status message ignored (as before this change).
-#[tokio::test]
-async fn a_nodes_update_status_is_listed_and_one_that_sent_none_is_unsupported() {
-    let front = start();
-    let new = linux_node(&front, "new").await;
-    let _old = linux_node(&front, "old").await;
-    new.send(daemon_message::Message::UpdateStatus(UpdateStatus {
-        running_commit: "0123456789ab".to_owned(),
-        installed_commit: A.to_owned(),
-        staged_commit: B.to_owned(),
-        state: State::Staged as i32,
-        refusal: String::new(),
-        acked_order_id: 7,
-        offered_generation: 4,
-        helper_present: true,
-        staged_protocol: 3,
-        staged_min_protocol: 2,
-        staged_state_schema: 5,
-    }));
-    let listed = front.update_until("new", |u| u["state"] == "staged").await;
-    assert_eq!(
-        listed,
-        json!({
-            "availability": "ok", "state": "staged", "running_commit": "0123456789ab",
-            "installed_commit": A, "staged_commit": B, "offered_generation": 4,
-            "acked_order_id": 7, "refusal": "", "helper_present": true,
-            "staged_protocol": 3, "staged_min_protocol": 2, "staged_state_schema": 5,
-        })
-    );
-    let old = front.update_until("old", |_| true).await;
-    assert_eq!(old, json!({ "availability": "unsupported" }));
-    new.send(status("0123456789ab", State::Confirmed, 4));
-    front
-        .update_until("new", |u| u["state"] == "confirmed")
-        .await;
-    new.send(daemon_message::Message::UpdateStatus(UpdateStatus {
-        state: 99,
-        ..UpdateStatus::default()
-    }));
-    front.update_until("new", |u| u["state"] == "unknown").await;
-}
-
-/// Catches a status accepted from a stream the node has replaced (a daemon still talking on
-/// its old stream after a restart would overwrite what the new process reports). The node
-/// reconnects; the new stream reports `confirmed`; the old stream then reports `refused` and
-/// the listing stays `confirmed`.
-///
-/// Mutant seen red: the current-stream check dropped from `Farm::update_status`.
-#[tokio::test]
-async fn a_replaced_streams_status_is_ignored() {
-    let front = start();
-    let old = linux_node(&front, "n1").await;
-    let new = linux_node(&front, "n1").await;
-    new.send(status("0123456789ab", State::Confirmed, 1));
-    front
-        .update_until("n1", |u| u["state"] == "confirmed")
-        .await;
-    old.send(status("0123456789ab", State::Refused, 9));
-    tokio::time::sleep(QUIET).await;
-    let kept = front.update_until("n1", |_| true).await;
-    assert_eq!(
-        (kept["state"].clone(), kept["offered_generation"].clone()),
-        (json!("confirmed"), json!(1))
-    );
-}
-
 /// Catches a look that fails turning into offers that vanish, or into a table that is wrong:
 /// while every read of the state store fails the node is sent nothing new and the table is
 /// kept; once the store answers again the next change is offered.
@@ -625,52 +552,4 @@ async fn a_frontend_without_a_release_store_or_a_state_store_offers_nothing() {
         let mut node = linux_node(&front, "n1").await;
         assert!(offer_within(&mut node, QUIET).await.is_none());
     }
-}
-
-/// Catches a status shown after the stream that sent it is gone: a daemon that restarts onto
-/// a build that sends no `UpdateStatus` is `unsupported` again, not listed with the last
-/// state its old build reported.
-#[tokio::test]
-async fn a_new_stream_starts_without_a_status() {
-    let front = start();
-    let old = linux_node(&front, "n1").await;
-    old.send(status("0123456789ab", State::Confirmed, 1));
-    front
-        .update_until("n1", |u| u["state"] == "confirmed")
-        .await;
-    let _new = linux_node(&front, "n1").await;
-    let after = front
-        .update_until("n1", |u| u["availability"] == "unsupported")
-        .await;
-    assert_eq!(after, json!({ "availability": "unsupported" }));
-}
-
-/// Catches text a node chose served as it came on the open listing: a commit that is not hex
-/// is shown as unknown or empty, and a long refusal is cut; one whose 512th byte falls
-/// inside a character (a byte and then two-byte characters) is cut before that character,
-/// not inside it and not after it.
-#[tokio::test]
-async fn what_a_node_says_is_cut_to_its_shape() {
-    let front = start();
-    let node = linux_node(&front, "n1").await;
-    node.send(daemon_message::Message::UpdateStatus(UpdateStatus {
-        running_commit: "<b>".to_owned(),
-        installed_commit: "x".repeat(40),
-        refusal: "r".repeat(100_000),
-        state: State::Refused as i32,
-        ..UpdateStatus::default()
-    }));
-    let shown = front.update_until("n1", |u| u["state"] == "refused").await;
-    assert_eq!(shown["running_commit"], "unknown");
-    assert_eq!(shown["installed_commit"], "");
-    assert_eq!(shown["refusal"].as_str().map(str::len), Some(512));
-
-    let wide = linux_node(&front, "n2").await;
-    wide.send(daemon_message::Message::UpdateStatus(UpdateStatus {
-        refusal: format!("r{}", "é".repeat(1000)),
-        state: State::Refused as i32,
-        ..UpdateStatus::default()
-    }));
-    let shown = front.update_until("n2", |u| u["state"] == "refused").await;
-    assert_eq!(shown["refusal"], format!("r{}", "é".repeat(255)));
 }

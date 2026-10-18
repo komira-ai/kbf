@@ -29,7 +29,8 @@
 //! no member: the picker never starts it. What the node reports comes from its newest
 //! `UpdateStatus` of its current stream (a stream that replaced it has none until it sends
 //! one): the release it runs is the desired release when the 12 digits of its running commit
-//! begin the desired commit, else its own commit; the helper's report is its state and the
+//! begin the desired commit, else its own commit (none, if that is not 12 lowercase hex
+//! digits: the report keeps what a host sent); the helper's report is its state and the
 //! order it acted on. `Work` is read from the scheduler: a lease on the node, else an empty
 //! queue.
 
@@ -290,9 +291,14 @@ pub struct FarmFacts {
 }
 
 /// The release a host runs, given the one desired: its own commit, which the desired one
-/// stands for when it begins with it.
+/// stands for when it begins with it. A running commit that is not 12 lowercase hex digits
+/// (`unknown`, or any text a host chose: the report keeps its bytes as data) names no
+/// release.
 fn running(commit: &str, target: Option<&Release>) -> Option<Release> {
-    if commit.len() != 12 {
+    let hex = commit
+        .bytes()
+        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if commit.len() != 12 || !hex {
         return None;
     }
     match target {

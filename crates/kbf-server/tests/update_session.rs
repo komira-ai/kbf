@@ -454,6 +454,22 @@ fn the_ports_read_every_state_and_refuse_the_marks() {
         .find(|h| h.id.as_str() == "mac")
         .expect("listed");
     assert_eq!(seen.release, None);
+    // Nor does a process whose text is the right length and no commit (a host chooses the
+    // bytes; the report keeps them as data): the controller must not take it for a release
+    // other than the desired one and move the host.
+    for text in ["not-a-commit", "0123456789AB"] {
+        let odd = UpdateStatus {
+            running_commit: text.to_owned(),
+            ..UpdateStatus::default()
+        };
+        farm.update_status(&WorkerId::new("mac"), mac, odd);
+        let hosts = source.look(FarmTime::from_millis(0)).expect("a look").hosts;
+        let seen = hosts
+            .iter()
+            .find(|h| h.id.as_str() == "mac")
+            .expect("listed");
+        assert_eq!(seen.release, None, "{text}");
+    }
     let hosts = source.look(FarmTime::from_millis(0)).expect("a look").hosts;
     let ids: Vec<&str> = hosts.iter().map(|h| h.id.as_str()).collect();
     assert_eq!(ids, ["linux", "mac"], "freebsd is not an updatable host");
