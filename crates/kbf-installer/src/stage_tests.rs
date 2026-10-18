@@ -743,8 +743,10 @@ fn a_mac_stage_uses_the_mac_layout_and_makes_its_missing_parents() {
         macho(MACHO_ARM, "daemon")
     );
     assert!(
-        !rig.at(&format!("/usr/local/kbf-installer/releases/{COMMIT}/kbf-daemon"))
-            .exists()
+        !rig.at(&format!(
+            "/usr/local/kbf-installer/releases/{COMMIT}/kbf-daemon"
+        ))
+        .exists()
     );
     assert_eq!(
         rig.state()
