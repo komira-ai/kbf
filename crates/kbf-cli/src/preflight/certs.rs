@@ -11,9 +11,10 @@ use rustls::RootCertStore;
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::ServerCertVerifier as _;
 use rustls::pki_types::pem::PemObject as _;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::WebPkiClientVerifier;
-use rustls::{CertificateError, Error};
+use rustls::sign::CertifiedKey;
+use rustls::{CertificateError, Error, InconsistentKeys};
 
 use super::{CertNeed, Class, Host, Needs, Report, Row};
 
@@ -134,8 +135,54 @@ fn one(c: &CertNeed, host: &dyn Host, report: &mut Report) {
         );
     }
 
+    if let Some((key_flag, key_path)) = &c.key {
+        pair(c, (key_flag, key_path), &leaf, host, report);
+    }
+
     if let Some((ca_flag, ca_path)) = &c.ca {
         chains(c, (ca_flag, ca_path), (&leaf, &chain, &names), host, report);
+    }
+}
+
+/// Checks the private key is PEM, one TLS can sign with, and the key of the leaf. A
+/// mismatch or an unparseable key would otherwise fail where the mode loads its TLS
+/// configuration, which exits 1 and is restarted every `RestartSec` for good.
+fn pair(
+    c: &CertNeed,
+    (key_flag, key_path): (&str, &Path),
+    leaf: &CertificateDer<'static>,
+    host: &dyn Host,
+    report: &mut Report,
+) {
+    // A file that cannot be read was reported with the files.
+    let Ok(pem) = host.read(key_path) else { return };
+    let (flag, at, key_at) = (c.flag, c.path.display(), key_path.display());
+    let write = format!("write the PEM private key the farm's issuer made for {flag} to {key_at}");
+    let Ok(der) = PrivateKeyDer::from_pem_slice(&pem) else {
+        report.refuse(
+            format!("{key_flag} {key_at} holds no PEM private key"),
+            "TLS cannot start without it",
+            write,
+        );
+        return;
+    };
+    let Ok(signer) = rustls::crypto::ring::sign::any_supported_type(&der) else {
+        report.refuse(
+            format!("{key_flag} {key_at} holds a private key TLS cannot sign with"),
+            "TLS cannot start without it",
+            write,
+        );
+        return;
+    };
+    let certified = CertifiedKey::new(vec![leaf.clone()], signer);
+    if let Err(Error::InconsistentKeys(InconsistentKeys::KeyMismatch)) = certified.keys_match() {
+        report.refuse(
+            format!("{key_flag} {key_at} is not the private key of {flag} {at}"),
+            "a certificate presented with another key fails every handshake",
+            format!(
+                "point {key_flag} at the key made with {flag} {at}, or {flag} at its certificate"
+            ),
+        );
     }
 }
 

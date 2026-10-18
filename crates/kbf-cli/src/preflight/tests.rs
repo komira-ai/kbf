@@ -61,6 +61,14 @@ impl Fake {
         self
     }
 
+    /// Changes the owner and mode of a file already there, keeping its bytes.
+    fn chmod(mut self, path: &str, uid: u32, mode: u32) -> Self {
+        let (stat, _) = self.files.get_mut(Path::new(path)).expect("file there");
+        stat.uid = uid;
+        stat.mode = mode;
+        self
+    }
+
     fn without(mut self, path: &str) -> Self {
         self.files.remove(Path::new(path));
         self
@@ -68,11 +76,11 @@ impl Fake {
 
     /// A host a daemon with the container driver passes on: its certificate files, Podman
     /// and crun, the user's runtime directory.
-    fn healthy(cert_pem: &str, ca_pem: &str) -> Self {
+    fn healthy(cert_pem: &str, key_pem: &str, ca_pem: &str) -> Self {
         let mut f = Self::empty()
             .file(CA, 0o644, ca_pem.as_bytes())
             .file(CERT, 0o644, cert_pem.as_bytes())
-            .file(KEY, 0o600, b"key")
+            .file(KEY, 0o600, key_pem.as_bytes())
             .file("/usr/bin/podman", 0o755, b"")
             .file(CRUN, 0o755, b"")
             .put("/run/user/1000", Kind::Dir, ME, 0o700, b"")
@@ -167,7 +175,8 @@ impl Leaf {
         }
     }
 
-    fn pem(&self, ca: &Ca) -> String {
+    /// The certificate and its private key, both PEM.
+    fn issue(&self, ca: &Ca) -> (String, String) {
         let mut params = rcgen::CertificateParams::new(
             self.dns.iter().map(|d| (*d).to_owned()).collect::<Vec<_>>(),
         )
@@ -185,10 +194,9 @@ impl Leaf {
             params.not_before = rcgen::date_time_ymd(from.0, from.1, from.2);
             params.not_after = rcgen::date_time_ymd(to.0, to.1, to.2);
         }
-        params
-            .signed_by(&rcgen::KeyPair::generate().expect("key"), ca)
-            .expect("signed")
-            .pem()
+        let key = rcgen::KeyPair::generate().expect("key");
+        let cert = params.signed_by(&key, ca).expect("signed").pem();
+        (cert, key.serialize_pem())
     }
 }
 
@@ -214,6 +222,7 @@ fn daemon_needs() -> Needs {
             flag: "--cert",
             path: PathBuf::from(CERT),
             row: Row::Daemon,
+            key: Some(("--key", PathBuf::from(KEY))),
             ca: Some(("--ca-cert", PathBuf::from(CA))),
             node_id: Some("node-1".to_owned()),
         }],
@@ -227,8 +236,8 @@ fn daemon_needs() -> Needs {
 
 fn healthy() -> (Needs, Fake) {
     let ca = ca();
-    let cert = Leaf::daemon().pem(&ca);
-    (daemon_needs(), Fake::healthy(&cert, &ca.pem()))
+    let (cert, key) = Leaf::daemon().issue(&ca);
+    (daemon_needs(), Fake::healthy(&cert, &key, &ca.pem()))
 }
 
 /// The one problem `report` holds, which must say each of `words`.
@@ -285,7 +294,7 @@ fn a_directory_where_a_file_belongs_is_refused() {
 #[test]
 fn a_key_group_readable_is_refused_with_the_chmod_that_fixes_it() {
     let (needs, host) = healthy();
-    let host = host.file(KEY, 0o640, b"key");
+    let host = host.chmod(KEY, ME, 0o640);
     only(
         &check(&needs, &host),
         Class::Refused,
@@ -296,7 +305,7 @@ fn a_key_group_readable_is_refused_with_the_chmod_that_fixes_it() {
 #[test]
 fn a_key_world_readable_is_refused() {
     let (needs, host) = healthy();
-    let host = host.file(KEY, 0o604, b"key");
+    let host = host.chmod(KEY, ME, 0o604);
     only(&check(&needs, &host), Class::Refused, &["0604"]);
 }
 
@@ -304,7 +313,7 @@ fn a_key_world_readable_is_refused() {
 fn a_key_owner_only_passes_at_0600_and_at_0400() {
     for mode in [0o600, 0o400] {
         let (needs, host) = healthy();
-        let host = host.file(KEY, mode, b"key");
+        let host = host.chmod(KEY, ME, mode);
         assert_eq!(check(&needs, &host), Report::default(), "{mode:o}");
     }
 }
@@ -312,7 +321,7 @@ fn a_key_owner_only_passes_at_0600_and_at_0400() {
 #[test]
 fn a_key_owned_by_another_user_is_refused_with_the_chown_that_fixes_it() {
     let (needs, host) = healthy();
-    let host = host.put(KEY, Kind::File, 0, 0o600, b"key");
+    let host = host.chmod(KEY, 0, 0o600);
     only(
         &check(&needs, &host),
         Class::Refused,
@@ -357,7 +366,8 @@ fn a_file_that_cannot_be_statted_for_permission_is_refused() {
 fn with_cert(leaf: &Leaf) -> (Needs, Fake) {
     let ca = ca();
     let (needs, _) = healthy();
-    (needs, Fake::healthy(&leaf.pem(&ca), &ca.pem()))
+    let (cert, key) = leaf.issue(&ca);
+    (needs, Fake::healthy(&cert, &key, &ca.pem()))
 }
 
 #[test]
@@ -421,10 +431,12 @@ fn a_storage_certificate_must_carry_both_server_and_client_auth() {
     needs.mode = "storage";
     needs.certs[0].row = Row::Storage;
     needs.certs[0].node_id = None;
-    let host = Fake::healthy(&leaf.pem(&ca), &ca.pem());
+    let (cert, key) = leaf.issue(&ca);
+    let host = Fake::healthy(&cert, &key, &ca.pem());
     assert_eq!(check(&needs, &host), Report::default());
     leaf.ekus = vec![Eku::ServerAuth];
-    let host = Fake::healthy(&leaf.pem(&ca), &ca.pem());
+    let (cert, key) = leaf.issue(&ca);
+    let host = Fake::healthy(&cert, &key, &ca.pem());
     only(
         &check(&needs, &host),
         Class::Refused,
@@ -461,12 +473,58 @@ fn a_certificate_from_another_ca_is_refused() {
     let leaf = Leaf::daemon();
     let other = ca();
     let (needs, host) = healthy();
-    let host = host.file(CERT, 0o644, leaf.pem(&other).as_bytes());
+    let (cert, key) = leaf.issue(&other);
+    let host = host
+        .file(CERT, 0o644, cert.as_bytes())
+        .file(KEY, 0o600, key.as_bytes());
     only(
         &check(&needs, &host),
         Class::Refused,
         &["--cert", "--ca-cert", "does not chain"],
     );
+}
+
+#[test]
+fn a_key_that_is_not_the_certificates_is_refused_naming_both_flags() {
+    let (needs, host) = healthy();
+    let other = Leaf::daemon().issue(&ca()).1;
+    let host = host.file(KEY, 0o600, other.as_bytes());
+    only(
+        &check(&needs, &host),
+        Class::Refused,
+        &["--key", "--cert", "is not the private key"],
+    );
+}
+
+#[test]
+fn a_key_file_that_is_not_pem_is_refused() {
+    let (needs, host) = healthy();
+    let host = host.file(KEY, 0o600, b"key");
+    only(
+        &check(&needs, &host),
+        Class::Refused,
+        &["--key", "no PEM private key"],
+    );
+}
+
+#[test]
+fn a_pem_private_key_of_a_kind_tls_cannot_sign_with_is_refused() {
+    let (needs, host) = healthy();
+    let bogus = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
+    let host = host.file(KEY, 0o600, bogus.as_bytes());
+    only(
+        &check(&needs, &host),
+        Class::Refused,
+        &["--key", "cannot sign with"],
+    );
+}
+
+#[test]
+fn a_certificate_naming_no_key_is_not_paired() {
+    let (mut needs, host) = healthy();
+    needs.certs[0].key = None;
+    let host = host.file(KEY, 0o600, b"key");
+    assert_eq!(check(&needs, &host), Report::default());
 }
 
 #[test]
@@ -513,7 +571,10 @@ fn a_certificate_without_a_ca_to_chain_to_is_checked_for_role_and_key_usage_only
     let other = ca();
     let (mut needs, host) = healthy();
     needs.certs[0].ca = None;
-    let host = host.file(CERT, 0o644, leaf.pem(&other).as_bytes());
+    let (cert, key) = leaf.issue(&other);
+    let host = host
+        .file(CERT, 0o644, cert.as_bytes())
+        .file(KEY, 0o600, key.as_bytes());
     only(
         &check(&needs, &host),
         Class::Refused,
@@ -804,7 +865,7 @@ fn every_failure_is_reported_together_one_line_each_and_the_start_is_refused() {
         PathBuf::from("/var/lib/kbf"),
     ));
     let host = host
-        .file(KEY, 0o644, b"key")
+        .chmod(KEY, ME, 0o644)
         .without(CA)
         .without("/usr/bin/podman")
         .without(CRUN);
@@ -835,7 +896,7 @@ fn a_not_ready_problem_beside_a_refused_one_exits_refused() {
     let (needs, mut host) = healthy();
     host.stat_errors
         .insert(PathBuf::from(CA), io::ErrorKind::TimedOut);
-    let host = host.file(KEY, 0o644, b"key");
+    let host = host.chmod(KEY, ME, 0o644);
     let report = check(&needs, &host);
     assert_eq!(report.problems.len(), 2, "{report:#?}");
     assert_eq!(report.exit_status(), Some(REFUSED));
@@ -904,6 +965,7 @@ mod wiring {
         let c = cert(&n, "--cert");
         assert_eq!(c.row, Row::Daemon);
         assert_eq!(c.node_id.as_deref(), Some("node-1"));
+        assert_eq!(c.key, Some(("--key", PathBuf::from("/c/node.key"))));
         assert_eq!(c.ca, Some(("--ca-cert", PathBuf::from("/c/ca.pem"))));
         assert_eq!(
             n.container.expect("container").oci_runtime,
@@ -948,6 +1010,10 @@ mod wiring {
         let n = with("storage", &STORAGE, &[]);
         let c = cert(&n, "--storage-tls-cert");
         assert_eq!(c.row, Row::Storage);
+        assert_eq!(
+            c.key,
+            Some(("--storage-tls-key", PathBuf::from("/c/storage.key")))
+        );
         assert_eq!(
             c.ca,
             Some(("--storage-client-ca", PathBuf::from("/c/ca.pem")))
@@ -1038,7 +1104,15 @@ mod wiring {
             worker.ca,
             Some(("--worker-client-ca", PathBuf::from("/c/ca.pem")))
         );
+        assert_eq!(
+            worker.key,
+            Some(("--worker-tls-key", PathBuf::from("/c/worker.key")))
+        );
         assert_eq!(cert(&n, "--storage-client-cert").ca, None);
+        assert_eq!(
+            cert(&n, "--storage-client-cert").key,
+            Some(("--storage-client-key", PathBuf::from("/c/fe.key")))
+        );
         // The REAPI certificate is the public name's, not a row of the farm's table.
         assert!(n.certs.iter().all(|c| c.flag != "--reapi-tls-cert"));
         assert!(n.files.iter().any(|f| f.flag == "--reapi-tls-cert"));

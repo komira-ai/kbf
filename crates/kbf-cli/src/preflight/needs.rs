@@ -27,7 +27,13 @@ pub fn needs(invocation: &Invocation) -> Needs {
             let mut n = Needs::new("frontend");
             server_files(&mut n, &flags.server);
             if let Some([cert, key, ca]) = &flags.tls {
-                n.cert("--storage-client-cert", cert, Row::Frontend, None, None);
+                n.cert(
+                    ("--storage-client-cert", cert),
+                    Some(("--storage-client-key", key)),
+                    Row::Frontend,
+                    None,
+                    None,
+                );
                 n.secret("--storage-client-key", key);
                 n.file("--storage-ca", ca);
             }
@@ -92,8 +98,8 @@ impl Needs {
     /// chains to, where that is the farm CA the mode holds.
     fn cert(
         &mut self,
-        flag: &'static str,
-        path: &Path,
+        (flag, path): (&'static str, &Path),
+        key: Option<(&'static str, &Path)>,
         row: Row,
         ca: Option<(&'static str, &Path)>,
         node_id: Option<&str>,
@@ -103,6 +109,7 @@ impl Needs {
             flag,
             path: path.to_owned(),
             row,
+            key: key.map(|(flag, path)| (flag, path.to_owned())),
             ca: ca.map(|(flag, path)| (flag, path.to_owned())),
             node_id: node_id.map(str::to_owned),
         });
@@ -134,8 +141,10 @@ fn server_files(n: &mut Needs, a: &Args) {
     if let Some(cert) = &a.worker_tls_cert {
         let ca = a.worker_client_ca.as_deref();
         n.cert(
-            "--worker-tls-cert",
-            cert,
+            ("--worker-tls-cert", cert),
+            a.worker_tls_key
+                .as_deref()
+                .map(|key| ("--worker-tls-key", key)),
             Row::Frontend,
             ca.map(|ca| ("--worker-client-ca", ca)),
             None,
@@ -156,8 +165,8 @@ fn storage(n: &mut Needs, flags: &kbf_server::storage_node::StorageFlags) {
     n.s3 = s3(&flags.server);
     if let Some([cert, key, ca]) = &flags.tls {
         n.cert(
-            "--storage-tls-cert",
-            cert,
+            ("--storage-tls-cert", cert),
+            Some(("--storage-tls-key", key)),
             Row::Storage,
             Some(("--storage-client-ca", ca)),
             None,
@@ -170,8 +179,8 @@ fn storage(n: &mut Needs, flags: &kbf_server::storage_node::StorageFlags) {
 fn daemon(n: &mut Needs, cli: &kbf_node::Cli) {
     let d = cli.host_needs();
     n.cert(
-        "--cert",
-        &d.cert,
+        ("--cert", &d.cert),
+        Some(("--key", &d.key)),
         Row::Daemon,
         Some(("--ca-cert", &d.ca_cert)),
         Some(&d.node_id),

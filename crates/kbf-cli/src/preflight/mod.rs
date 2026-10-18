@@ -17,6 +17,8 @@
 //! - certificates: the certificate a mode presents names the role and carries the
 //!   extended key usage its row of the farm's table says, a daemon's names exactly its
 //!   `--node-id`, and it chains to its CA now ([`certs`]);
+//! - each certificate's private key is PEM, of a kind TLS can sign with, and the pair of the
+//!   certificate's public key ([`certs`]);
 //! - the cold store's S3 key pair is in the environment ([`env`]);
 //! - `--meta-dir` is not inside `--data-dir` ([`env`]);
 //! - the container driver's `podman`, `crun` and the user's runtime directory ([`env`]);
@@ -167,6 +169,9 @@ pub struct CertNeed {
     pub path: PathBuf,
     /// The row of the farm's table it must be.
     pub row: Row,
+    /// The private key it is presented with, and the flag that names it; `None` where the
+    /// mode names no key for it. The key must be PEM and the certificate's own.
+    pub key: Option<(&'static str, PathBuf)>,
     /// The CA it must chain to, and the flag that names it; `None` where the CA the
     /// mode holds is not the one that issued this certificate.
     pub ca: Option<(&'static str, PathBuf)>,
