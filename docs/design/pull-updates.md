@@ -235,6 +235,12 @@ saying which is missing; nothing answers an empty 200.
 | `update/available/<commit>` | the release source's proposal and its preflight result; metadata only (split-mode-updates.md 6.2) |
 | `update/policy` | `{auto_nodes (bool), auto_frontend (bool), paused (bool), auto_frontend, idle_wait, min_serving, max_hosts_out (default 1), mac_force_after, new_work_only_to_updated, accept_failing_builds}`; replaces the older `update/auto {enabled}`, whose flag is `auto_nodes` |
 
+**A release upload triggers its preflight.** The `PUT` of a release's last needed component starts the preflight for the commit and
+writes the `update/available/<commit>` row (metadata, the declared `protocol`, `min_protocol`, `state_schema`, `profile`, and the
+result). **Until the row exists the frontend sends no offer for that commit**, since the offer's expected facts (section 5) come from it.
+The operator sees the release as "preflight pending" until the row is written, and "preflight failed" with the reason if it fails; neither
+state can be set as the desired release.
+
 **The disk index is the source of truth for bytes.** The release store on disk (`files/<sha256>` and
 `index/<commit>/<platform>/<name>`, with attestation bundles) is authoritative for what the frontend can serve. The
 `update/release/...` rows are metadata over it (digest, size, attestation present); a lost or stale row is rebuilt from
@@ -308,8 +314,9 @@ preflight recorded them. These are **locators and claims, not trust**: section 7
 expected facts are the claim that 7.2 step 5 checks the binary against *before* the flip. Before fetching, the installer refuses
 (and says why in `status.json`) an order that is a replay or older by the (epoch, id) rule of section 5, a commit that is not 40
 lowercase hex, a component set that is not exactly what the host's platform needs, a size over the cap (7.1), a pending trial,
-or a host with a live lease (read by the installer from a lease source **that root owns** (a root-written file the daemon updates through the existing
-root-readable path, not a file `kbf` can write), never from the record).
+or a host with a live lease. The installer observes leases itself and reads nothing the daemon or `kbf` writes: **on Linux** it
+observes the lease processes' cgroup (membership of the systemd scope or unit that runs actions); **on macOS** it observes the
+launchd job and the processes by uid (the lease users). The record's claim is never used.
 
 **Generation and floor.** The (epoch, id) rule orders orders but cannot tell an old order from a replay of one. The installer
 therefore also compares **(epoch, generation) lexicographically**, mirroring the order rule: a higher epoch wins whatever its generation,
@@ -466,11 +473,31 @@ namespace or a sandbox profile is the hardening of the same list as seccomp, sec
 ### 7.4 Adoption of an existing host
 
 A host installed by the earlier layout (`/usr/local/kbf`, with `current`, `previous` and `state.json`) moves to
-`/var/lib/kbf-installer` in `kbf-installer setup`: setup re-fetches the **running commit** through the fetch child and verifies it by
-7.2, installing it as `releases/<commit>/` with `VERIFIED`, and points `current` at it; the old `previous` is treated the same way
-if its commit can be fetched. If the fetch or verification fails (no source reachable, the commit no longer served), setup adopts
-the running directory **as unverified**: it is copied in without `VERIFIED`, `status.json` flags it, rollback to it is refused, and
-setup prints it. It is never adopted silently and never marked verified without the procedure.
+`/var/lib/kbf-installer` in `kbf-installer setup`. The steps, in this order:
+
+1. **Name the running commit from the probe only.** Run `--version --json` of the installed binary as `kbf-fetch`, under the probe
+   bounds of 7.2. The commit is never taken from `state.json`, a symlink name or anything `kbf` can write.
+2. **Ask the configured source for the offer metadata of that commit**: `sha256`, `size`, the attestation and the expected facts
+   (`protocol`, `min_protocol`, `state_schema`, `profile`, platform). All of it is an **untrusted claim** that 7.2 re-derives; none is
+   believed. Fetch the tarball through the fetch child and run 7.2 on it. On success install it as `releases/<commit>/` with `VERIFIED`.
+   If the source cannot give the facts (or the tarball), setup says so and adopts the running release **as unverified** (step 4).
+   The old `previous` is handled the same way if its commit can be fetched.
+3. **Seed the replay memory and the floor.** With `source = "frontend"`, fetch the frontend's current (epoch, generation) for the
+   desired release over the same source and write it into `state.json` as the highest acted on and into `min_generation`. With
+   `source = "url"`, seed from the operator's `--min-generation` flag; without the flag setup warns plainly that replay memory starts
+   from zero.
+4. **Copy and repoint.** Unverified adoption copies the running directory into the new tree by descriptor: `openat` with
+   `O_NOFOLLOW` for every component, `fstat` to accept only regular files and directories with one link, owner root, no setuid; no
+   path is re-resolved. The copy has no `VERIFIED`, `status.json` flags "unverified: rollback to it refused", and setup prints it. It
+   is never adopted silently and never marked verified without 7.2.
+5. **Stop the service, repoint `current` and `previous`, rewrite the unit's `KBF_BIN_DIR`, start the service.** The service is
+   stopped before the links move, so no process runs from a tree being replaced.
+
+**Re-run rule.** Every step is idempotent and keyed by the commit: step 1 is a read; step 2 finds `releases/<commit>/VERIFIED` and
+skips; step 3 only raises the memory and floor, never lowers it; step 4 skips a destination that exists with the same content, and
+removes a half-copied one (no `VERIFIED`, not referenced); step 5 compares the links and units to the target and does what is
+missing. A setup that crashed at any point is safe to run again; it never starts a service from a half-written tree, because the
+service is only started after step 5 completes.
 
 ### 7.5 What is removed
 
@@ -562,7 +589,7 @@ Each safety property has a planted mutant that turns its test red.
     killed within its limit, whole process group, order refused; mutant: no wall clock.
   - The probe runs as `kbf-fetch` and cannot read `/etc/kbf` or the key; mutant: run as `kbf` or root.
   - Redirect: any 3xx fails the fetch; mutant: follow same-origin redirects.
-  - Lease source: a record claiming no leases while the root-owned source shows one is refused; mutant: trust the record.
+  - Lease source: a record claiming no leases while root's own observation (cgroup or launchd and uid) shows a live lease is refused; mutant: trust the record.
 - **Capacity**: two hosts ordered at once (the slot admits one storage holder and at most `max_hosts_out` others); storage under-replicated or the metric absent (no
   order); a host with live leases (order withheld, and the node refuses it too).
 - **Bad binary**: starts and exits at once (the counter reverts, Linux); runs but never registers (the window
