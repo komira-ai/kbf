@@ -245,5 +245,8 @@ fn a_members_boot_round_trips_and_an_older_map_without_it_reads_as_zero() {
 
     // The field is number 6, a varint: an older reader skips it as an unknown field.
     let with_boot = pb::Member::from(&m).encode_to_vec();
-    assert!(with_boot.windows(2).any(|w| w == [0x30, 0x07]), "field 6 on the wire");
+    assert!(
+        with_boot.windows(2).any(|w| w == [0x30, 0x07]),
+        "field 6 on the wire"
+    );
 }

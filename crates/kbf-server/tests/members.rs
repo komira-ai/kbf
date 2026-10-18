@@ -860,7 +860,11 @@ fn a_member_restarted_within_its_lease_bumps_the_generation_and_carries_its_new_
     let m = members(&s, config(30, 120));
     let a = m.register(&node(1)).expect("a");
     let b = m.register(&node(2)).expect("b");
-    assert_eq!(boot_of(&b.map, a.id), Some(a.boot), "first boot is published");
+    assert_eq!(
+        boot_of(&b.map, a.id),
+        Some(a.boot),
+        "first boot is published"
+    );
     assert_eq!(boot_of(&b.map, b.id), Some(b.boot));
     let g = b.map.generation();
 
@@ -868,7 +872,11 @@ fn a_member_restarted_within_its_lease_bumps_the_generation_and_carries_its_new_
     let quick = m.register(&node(1)).expect("restart inside the lease");
     assert_eq!(quick.boot, a.boot + 1);
     assert_eq!(state(&quick.map, a.id), Some(MemberState::Active));
-    assert_eq!(quick.map.generation(), g + 1, "a new boot moves the generation");
+    assert_eq!(
+        quick.map.generation(),
+        g + 1,
+        "a new boot moves the generation"
+    );
     assert_eq!(boot_of(&quick.map, a.id), Some(quick.boot));
     assert_eq!(boot_of(&quick.map, b.id), Some(b.boot), "b did not restart");
     assert_eq!(
@@ -917,7 +925,11 @@ fn heartbeats_of_the_same_boot_do_not_bump_the_generation() {
     let map = m
         .set_state(b.id, MemberState::Active)
         .expect("the state b has");
-    assert_eq!(map.generation(), g, "setting the state it has changes nothing");
+    assert_eq!(
+        map.generation(),
+        g,
+        "setting the state it has changes nothing"
+    );
 }
 
 /// Catches: a member whose boot is lost when it goes Down and comes back, or a Down entry
