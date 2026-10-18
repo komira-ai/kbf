@@ -509,10 +509,10 @@ fn serve_held(held: kbf_testkit::port::Reserved) -> TcpListener {
 
 /// Catches a held port that is free to take (the old bind-and-drop helper): a thief
 /// binding the number succeeds, and the store would be the thief.
-#[tokio::test]
-async fn a_held_port_cannot_be_taken_by_another_listener() {
+#[test]
+fn a_held_port_cannot_be_taken_by_another_listener() {
     let held = held_port();
-    assert!(TcpListener::bind(held.addr()).await.is_err());
+    assert!(kbf_testkit::port::is_taken(held.addr()));
 }
 
 /// Catches: `wait_answering` returning before the store answers (no wait at all, or a

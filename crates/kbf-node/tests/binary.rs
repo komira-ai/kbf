@@ -209,7 +209,10 @@ fn dead_port() -> u16 {
 #[test]
 fn a_dead_port_cannot_be_taken_by_another_listener() {
     let port = dead_port();
-    assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_err());
+    assert!(kbf_testkit::port::is_taken(std::net::SocketAddr::from((
+        [127, 0, 0, 1],
+        port
+    ))));
 }
 
 /// The flags every run here shares: a front on a port nothing listens on.

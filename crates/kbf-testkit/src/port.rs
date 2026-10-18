@@ -27,11 +27,15 @@
 //!   this process (a listener on a port of its own, whose accepted connection is
 //!   kept): a connected socket is found only under its full address pair, so a SYN
 //!   from anyone else finds no socket, is answered with a reset, and the port stays
-//!   owned. (Connecting the socket to its own address, which would need no peer, is
-//!   refused by macOS with `EINVAL`.) [`Reserved::listen`] then has to drop
-//!   that socket (and its peer) and bind the listener; between the two a thief would need to draw
-//!   exactly that number from the kernel's random ephemeral range within microseconds
-//!   (macOS only; on Linux the socket itself listens and there is no gap).
+//!   owned: the kernel skips a port that is in use when it picks one (a bind of
+//!   port 0, a connection's source port), and a bind without `SO_REUSEADDR` fails
+//!   with `EADDRINUSE`. A bind of exactly that number *with* `SO_REUSEADDR` (what
+//!   `std` does) succeeds on macOS, so a test that probes by hand uses [`is_taken`].
+//!   (Connecting the socket to its own address, which would need no peer, is
+//!   refused by macOS with `EINVAL`.) [`Reserved::listen`] has to drop that socket
+//!   and its peer and bind the listener; between the two a thief would need to draw
+//!   exactly that number from the kernel's random ephemeral range within
+//!   microseconds (on Linux the socket itself listens and there is no gap).
 //!
 //! The tests below prove the behaviour on the platform they run on, macOS included.
 
@@ -173,6 +177,24 @@ fn local_port(fd: &OwnedFd) -> u16 {
     SocketAddr::try_from(addr).expect("an inet address").port()
 }
 
+/// Whether another socket cannot bind `addr` because its port is owned: the check the
+/// tests of held ports make instead of binding by hand.
+///
+/// On Linux the other socket sets `SO_REUSEADDR`, as `std` does (the strictest thief).
+/// On macOS a socket with `SO_REUSEADDR` can bind a port whose owner is a connected
+/// socket (the owner of a [`Reserved`] there), so the check is a bind without it,
+/// which fails with `EADDRINUSE`; what keeps the other binders away on macOS is that
+/// the kernel does not give an owned port to a bind of port 0 or to a connection's
+/// source port.
+#[must_use]
+pub fn is_taken(addr: SocketAddr) -> bool {
+    if cfg!(target_os = "linux") {
+        TcpListener::bind(addr).is_err()
+    } else {
+        matches!(bound_socket(addr), Err(rustix::io::Errno::ADDRINUSE))
+    }
+}
+
 /// An address on `127.0.0.1` on which connecting is refused until the test binary
 /// exits: its port is held by a socket kept in a process-wide list. See the module
 /// docs for why that port is dead and cannot be taken.
@@ -248,8 +270,7 @@ mod tests {
     #[test]
     fn a_held_port_cannot_be_taken_and_refuses_connections() {
         let held = Reserved::new();
-        let thief = TcpListener::bind(held.addr());
-        assert!(thief.is_err(), "a thief took the held port");
+        assert!(is_taken(held.addr()), "a thief took the held port");
         let err = TcpStream::connect(held.addr()).expect_err("refused");
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused, "{err}");
     }
@@ -261,7 +282,7 @@ mod tests {
     fn a_held_port_becomes_the_listener_on_the_same_address() {
         let held = Reserved::new();
         let addr = held.addr();
-        assert!(TcpListener::bind(addr).is_err(), "a thief took the port");
+        assert!(is_taken(addr), "a thief took the port");
         assert!(TcpStream::connect(addr).is_err());
         let listener = held.listen();
         assert_eq!(listener.local_addr().expect("addr"), addr);
@@ -274,7 +295,7 @@ mod tests {
     fn the_default_value_holds_a_port() {
         let held = Reserved::default();
         assert_ne!(held.port(), 0);
-        assert!(TcpListener::bind(held.addr()).is_err(), "a thief took it");
+        assert!(is_taken(held.addr()), "a thief took it");
         let err = TcpStream::connect(held.addr()).expect_err("refused");
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused, "{err}");
     }
@@ -286,7 +307,7 @@ mod tests {
         let (a, b) = (dead_addr(), dead_addr());
         assert_ne!(a, b);
         for addr in [a, b] {
-            assert!(TcpListener::bind(addr).is_err(), "{addr} was taken");
+            assert!(is_taken(addr), "{addr} was taken");
             assert!(TcpStream::connect(addr).is_err(), "{addr} answered");
         }
     }
@@ -298,7 +319,7 @@ mod tests {
         let held = connected_socket(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .expect("connect to a peer");
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, local_port(&held.fd)));
-        assert!(TcpListener::bind(addr).is_err(), "a thief took the port");
+        assert!(is_taken(addr), "a thief took the port");
         let err = TcpStream::connect(addr).expect_err("refused");
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused, "{err}");
         drop(held);

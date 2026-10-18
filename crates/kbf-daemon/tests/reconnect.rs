@@ -44,9 +44,12 @@ fn serve_on(held: Reserved) -> TcpListener {
 #[test]
 fn a_dead_or_held_port_cannot_be_taken_by_another_listener() {
     let dead = dead_port();
-    assert!(std::net::TcpListener::bind(("127.0.0.1", dead)).is_err());
+    assert!(kbf_testkit::port::is_taken(SocketAddr::from((
+        [127, 0, 0, 1],
+        dead
+    ))));
     let held = Reserved::new();
-    assert!(std::net::TcpListener::bind(held.addr()).is_err());
+    assert!(kbf_testkit::port::is_taken(held.addr()));
 }
 
 async fn listener() -> (TcpListener, SocketAddr) {
