@@ -854,6 +854,16 @@ fn a_hot_store_the_unit_user_cannot_reach_is_refused() {
     let HostError::Units(failures) = &e else {
         panic!("{e}");
     };
+    // The refusal prints every failure, one to a line, under its heading.
+    assert!(failures.len() >= 2, "{e}");
+    let each: Vec<String> = failures.iter().map(|f| f.to_string()).collect();
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "the rendered units break the priorities; nothing was written:\n{}",
+            each.join("\n")
+        )
+    );
     // (The scratch host's keys are the test's uid's, so rule `credential` fails too.)
     let traverse: Vec<_> = failures.iter().filter(|f| f.rule == "traverse").collect();
     assert_eq!(traverse.len(), 1, "{e}");
@@ -1045,4 +1055,98 @@ fn rule_traverse_is_skipped_with_a_note_where_it_cannot_read() {
     let notes = traverse_notes(&r);
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(notes[0].contains("getent missing"), "{notes:?}");
+}
+
+/// A build mode runs rootless containers, so the user needs a range in `/etc/subuid` and
+/// in `/etc/subgid`, named by user name or by uid. Each file refuses on its own (the
+/// error names it), a line for another user (or a name that only starts with kbf's) is
+/// no range, a missing file is no range, and a range by uid passes. Catches a check
+/// that reads one file only, one that matches by prefix or on any line, and one that
+/// accepts only the name.
+#[test]
+fn a_build_user_with_no_subid_range_is_refused() {
+    let (uid, _) = me();
+    let refused = |name: &str, file: &str, text: Option<&str>| {
+        let (exec, _) = host(&format!("install-mode-subid-{name}"));
+        match text {
+            Some(t) => write(&exec, file, t, 0o644),
+            None => fs::remove_file(exec.at(file)).expect("rm"),
+        }
+        plan_here(&exec, &install(Mode::Daemon, None)).map(|_| ())
+    };
+    for file in ["/etc/subuid", "/etc/subgid"] {
+        let tag = file.trim_start_matches("/etc/");
+        for (name, text) in [
+            ("other-user", Some("someone:100000:65536\n")),
+            ("prefix-only", Some("kbf2:100000:65536\n")),
+            ("not-a-range", Some("kbf\n")),
+            ("empty", Some("")),
+            ("missing", None),
+        ] {
+            let e = refused(&format!("{tag}-{name}"), file, text).expect_err("refused");
+            assert!(
+                matches!(&e, HostError::NoSubIds { user, file: f } if user == "kbf" && f.as_str() == file),
+                "{file} {name}: {e}"
+            );
+            assert!(e.to_string().contains(file), "{e}");
+        }
+        // The uid names the user too, on any line of the file.
+        let by_uid = format!("someone:1:1\n{uid}:100000:65536\n");
+        refused(&format!("{tag}-uid"), file, Some(&by_uid)).expect("a range by uid passes");
+    }
+}
+
+/// A path the host cannot inspect (below a regular file) is `Inspect`, naming the path
+/// and the I/O error; a path that is not there is `None`, no error. Catches the I/O
+/// error swallowed as "absent" (a key that cannot be read looks missing) and an error
+/// that loses the path.
+#[test]
+fn an_inspect_that_fails_names_the_path_and_an_absent_one_is_none() {
+    let (exec, _) = host("install-mode-inspect-error");
+    let file = HostPath::new("/etc/kbf/ca.pem").expect("path");
+    let below = HostPath::new("/etc/kbf/ca.pem/x").expect("path");
+    let absent = HostPath::new("/etc/kbf/not-there").expect("path");
+    assert!(
+        crate::linux::host::inspect(&exec, &file)
+            .expect("inspect")
+            .is_some()
+    );
+    assert!(
+        crate::linux::host::inspect(&exec, &absent)
+            .expect("inspect")
+            .is_none()
+    );
+    let e = crate::linux::host::inspect(&exec, &below).expect_err("not a directory");
+    assert!(
+        matches!(&e, HostError::Inspect { path, .. } if path.as_str() == "/etc/kbf/ca.pem/x"),
+        "{e}"
+    );
+    assert!(e.to_string().contains("/etc/kbf/ca.pem/x"), "{e}");
+}
+
+/// A user the host does not have is refused with its name before any step: `kbf` for a
+/// mode that runs builds (the user the example settings name), the server account for
+/// the storage node (the `User=` of its unit). Catches an install that goes on with no
+/// user (a directory made for no one) and a refusal that names the wrong user.
+#[test]
+fn a_user_the_host_does_not_have_is_refused_by_name() {
+    for (mode, user) in [
+        (Mode::Daemon, "kbf"),
+        (Mode::AllInOne, "kbf"),
+        (Mode::Storage, "kbf-server"),
+    ] {
+        let (exec, world) = host(&format!("install-mode-no-user-{mode}"));
+        world.borrow_mut().users.remove(user);
+        let e = plan_here(&exec, &install(mode, None))
+            .map(|_| ())
+            .expect_err("refused");
+        assert!(
+            matches!(&e, HostError::NoUser(n) if n == user),
+            "{mode}: {e}"
+        );
+        assert!(
+            e.to_string().starts_with(&format!("no user {user}: ")),
+            "{e}"
+        );
+    }
 }

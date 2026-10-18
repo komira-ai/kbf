@@ -946,3 +946,30 @@ fn the_storage_mode_needs_its_s3_endpoint_set() {
     let set = render(&config(), Some(1500), Mode::Storage).expect("renders");
     assert!(set.contains("?endpoint=http://127.0.0.1:9000&"), "{set}");
 }
+
+/// A listen address with a colon is an IPv6 address and goes into a `--listen=` flag in
+/// brackets (`[2001:db8::10]:8080`); an IPv4 one goes in bare. Catches an IPv6 address
+/// rendered bare (`2001:db8::10:8080`, which kbf cannot split into host and port) and a
+/// bracket put round an IPv4 one.
+#[test]
+fn an_ipv6_listen_address_is_bracketed_in_the_flags_and_an_ipv4_one_is_not() {
+    let mut c = config();
+    assert_eq!(c.listen_host(), c.listen_address, "an IPv4 address is bare");
+    let v4 = render(&c, Some(1500), Mode::Frontend).expect("renders");
+    assert!(
+        v4.contains(&format!("--listen={}:{}", c.listen_address, c.reapi_port)),
+        "{v4}"
+    );
+    c.listen_address = "2001:db8::10".to_owned();
+    assert_eq!(c.listen_host(), "[2001:db8::10]");
+    let v6 = render(&c, Some(1500), Mode::Frontend).expect("renders");
+    assert!(
+        v6.contains(&format!("--listen=[2001:db8::10]:{}", c.reapi_port)),
+        "{v6}"
+    );
+    assert!(
+        v6.contains(&format!("--worker-listen=[2001:db8::10]:{}", c.worker_port)),
+        "{v6}"
+    );
+    assert!(!v6.contains("--listen=2001"), "{v6}");
+}

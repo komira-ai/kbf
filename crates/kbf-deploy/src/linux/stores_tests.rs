@@ -282,6 +282,13 @@ fn the_meta_dir_is_not_under_the_data_dir() {
         ),
         ("--meta-dir=/var/lib/kbf/raft", "--verbose", 0),
         ("--verbose", "--data-dir=/var/lib/kbf", 0),
+        // A relative path is left to rules `storage` and the parser: compared lexically
+        // it would be "under" `.` or under a relative twin, and refused here for the
+        // wrong reason.
+        ("--meta-dir=var/lib/kbf/raft", "--data-dir=var/lib/kbf", 0),
+        ("--meta-dir=raft", "--data-dir=.", 0),
+        ("--meta-dir=/var/lib/kbf/raft", "--data-dir=var/lib/kbf", 0),
+        ("--meta-dir=var/lib/kbf/raft", "--data-dir=/var/lib/kbf", 0),
     ];
     for (meta, data, want) in rows {
         assert_eq!(under(&unit(meta, data)), want, "{meta} {data}");

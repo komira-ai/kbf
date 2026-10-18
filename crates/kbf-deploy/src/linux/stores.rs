@@ -135,13 +135,14 @@ pub(super) fn meta_dir(unit: &UnitFile) -> Vec<String> {
     }
 }
 
-/// `path` with `.` and `..` resolved lexically.
+/// The absolute `path` with `..` resolved lexically (`components` already drops a `.`
+/// in the middle of a path; a leading one only a relative path has, and the caller
+/// refuses those).
 fn normal(path: &str) -> std::path::PathBuf {
     use std::path::Component;
     let mut out = std::path::PathBuf::new();
     for c in std::path::Path::new(path).components() {
         match c {
-            Component::CurDir => {}
             Component::ParentDir => {
                 out.pop();
             }
