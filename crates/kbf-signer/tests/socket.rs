@@ -239,9 +239,10 @@ fn the_client_distrusts_the_socket() {
     assert!(long.0.contains("signer socket"), "{long}");
 }
 
-/// The CA's key, until `offline` is set: then every signature fails. One type for both
-/// halves of the test, so the one instantiation of the server it builds runs the success
-/// and the failure arm of `sign` (coverage scores a generic by its best instantiation).
+/// The CA's key, until `offline` is set: then every signature fails. One type for all
+/// three outcomes of the test, so the one instantiation of the server it builds runs the
+/// refusal, the success and the failure arm of `sign` (coverage scores a generic by its
+/// best instantiation).
 struct Failing {
     key: FileSigner,
     offline: Arc<AtomicBool>,
@@ -294,6 +295,11 @@ fn a_failing_key_is_a_failure_not_a_signature() {
         .sign(&tbs, Algorithm::EcdsaP256Sha256)
         .expect("the key signs");
     assert!(!signature.is_empty());
+    // A request the policy refuses is a refusal whatever the key does.
+    let refusal = client
+        .sign(b"not a certificate body", Algorithm::EcdsaP256Sha256)
+        .expect_err("refused");
+    assert!(refusal.0.contains("the signer refused"), "{refusal}");
     offline.store(true, Ordering::SeqCst);
     let err = client
         .sign(&tbs, Algorithm::EcdsaP256Sha256)
