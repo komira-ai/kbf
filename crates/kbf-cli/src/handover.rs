@@ -10,8 +10,8 @@
 //!    an instance `activating`, `reloading` or `deactivating` is changing: either is
 //!    refused (exit 1), starting nothing.
 //! 2. It runs `systemctl start` on the idle instance. The unit is `Type=notify`: the start
-//!    returns when the new frontend has taken the listeners, the state store and the
-//!    daemons over and said `READY=1`, and fails when it could not. A failed start leaves
+//!    returns when the new frontend has taken the state store and the daemons over, is
+//!    serving on its own listeners and said `READY=1`, and fails when it could not. A failed start leaves
 //!    the old instance serving whenever the new one failed before it was ready (the old
 //!    one then does not stand down), and the command says what it finds the old one to be.
 //! 3. It prints that the new instance serves and that the old drains its open builds and

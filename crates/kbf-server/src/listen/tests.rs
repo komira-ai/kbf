@@ -1,7 +1,6 @@
 //! Sockets bound, adopted and stopped.
 
 use std::net::TcpStream;
-use std::os::fd::OwnedFd;
 
 use futures::{FutureExt as _, StreamExt as _};
 
@@ -11,67 +10,18 @@ fn any() -> SocketAddr {
     "127.0.0.1:0".parse().expect("address")
 }
 
-/// Catches: a spare handle where none was asked for (a drain would leave the socket
-/// accepting into a backlog nobody serves), none where one was (a handover has nothing to
-/// offer), a spare that is another socket (the successor would serve elsewhere), and an
-/// address already in use bound anyway or reported without the address.
+/// Catches: a socket that reports an address other than the one it listens on (port 0
+/// must come back as the port the system chose), and an address already in use bound
+/// anyway or reported without the address.
 #[test]
-fn a_socket_has_a_spare_handle_on_itself_only_when_asked() {
-    let plain = Socket::bind(any(), false).expect("bind");
-    assert!(plain.spare.is_none());
-    let with = Socket::bind(any(), true).expect("bind");
-    let spare = with.spare.as_ref().expect("a spare handle");
-    let same = TcpListener::from(spare.try_clone().expect("a copy"));
-    assert_eq!(same.local_addr().expect("address"), with.local);
-
-    let taken = Socket::bind(with.local, false).err().expect("in use");
+fn a_socket_reports_where_it_listens_and_refuses_an_address_in_use() {
+    let bound = Socket::bind(any()).expect("bind");
+    assert_ne!(bound.local.port(), 0);
+    let taken = Socket::bind(bound.local).err().expect("in use");
     assert!(
-        taken.to_string().contains(&with.local.to_string()),
+        taken.to_string().contains(&bound.local.to_string()),
         "{taken}"
     );
-}
-
-use std::net::TcpListener;
-
-/// Catches: a socket adopted that listens elsewhere than the flags say (a successor would
-/// serve an address the checks on its flags never saw), one that is not a socket at all,
-/// and an adopted socket that cannot hand itself on again (the successor of the successor
-/// would find nothing to take).
-#[test]
-fn an_adopted_socket_must_listen_where_the_flags_say() {
-    let listener = TcpListener::bind(any()).expect("bind");
-    let local = listener.local_addr().expect("address");
-    let adopted = Socket::adopt(
-        OwnedFd::from(listener.try_clone().expect("copy")),
-        local,
-        true,
-    )
-    .expect("a socket on the right address");
-    assert_eq!(adopted.local, local);
-    assert!(adopted.spare.is_some());
-    let plain = Socket::adopt(
-        OwnedFd::from(listener.try_clone().expect("copy")),
-        local,
-        false,
-    )
-    .expect("a socket on the right address");
-    assert!(plain.spare.is_none());
-
-    let wrong: SocketAddr = "127.0.0.1:9".parse().expect("address");
-    let error = Socket::adopt(OwnedFd::from(listener), wrong, false)
-        .err()
-        .expect("wrong address");
-    let said = error.to_string();
-    assert!(
-        said.contains("bind 127.0.0.1:9") && said.contains(&local.to_string()),
-        "{said}"
-    );
-
-    let (not_a_socket, _) = std::os::unix::net::UnixStream::pair().expect("a pair");
-    let error = Socket::adopt(OwnedFd::from(not_a_socket), wrong, false)
-        .err()
-        .expect("not TCP");
-    assert!(error.to_string().starts_with("bind 127.0.0.1:9"), "{error}");
 }
 
 /// Catches: a gRPC listener that does not serve connections, one that serves them with
@@ -82,7 +32,7 @@ fn an_adopted_socket_must_listen_where_the_flags_say() {
 /// does closing a listener nobody waits on.
 #[tokio::test]
 async fn a_grpc_listener_accepts_until_latched_and_then_closes_its_socket() {
-    let socket = Socket::bind(any(), false).expect("bind");
+    let socket = Socket::bind(any()).expect("bind");
     let addr = socket.local;
     let (mut incoming, latch) = socket.grpc(None).expect("registered");
     assert!(
@@ -113,7 +63,7 @@ async fn a_grpc_listener_accepts_until_latched_and_then_closes_its_socket() {
     );
     latch.close();
 
-    let socket = Socket::bind(any(), false).expect("bind");
+    let socket = Socket::bind(any()).expect("bind");
     let (incoming, latch) = socket.grpc(None).expect("registered");
     latch.close();
     drop(incoming);
@@ -123,7 +73,7 @@ async fn a_grpc_listener_accepts_until_latched_and_then_closes_its_socket() {
 /// by a signal that outlives the server) still exists: the address must be free again.
 #[tokio::test]
 async fn dropping_a_grpc_listener_closes_its_socket_whoever_holds_the_latch() {
-    let socket = Socket::bind(any(), false).expect("bind");
+    let socket = Socket::bind(any()).expect("bind");
     let addr = socket.local;
     let (incoming, _latch) = socket.grpc(None).expect("registered");
     assert!(TcpStream::connect(addr).is_ok());
@@ -138,7 +88,7 @@ async fn dropping_a_grpc_listener_closes_its_socket_whoever_holds_the_latch() {
 /// address the socket has.
 #[tokio::test]
 async fn an_http_listener_is_the_socket_bound() {
-    let socket = Socket::bind(any(), false).expect("bind");
+    let socket = Socket::bind(any()).expect("bind");
     let addr = socket.local;
     let listener = socket.http().expect("registered");
     assert_eq!(listener.local_addr().expect("address"), addr);

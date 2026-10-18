@@ -47,11 +47,16 @@
 //! loaded today: [`crate::health::MapProbe`]). The storage check asks the `--storage`
 //! node until the frontend routes by the map, and then the owners the map names for a
 //! probe digest (it passes when one answers), so a farm that has lost its `--storage`
-//! node is ready while its other members are.
+//! node is ready while its other members are. `READY=1` to the service manager, and the
+//! successor's "serving" to its predecessor, do not wait for this check
+//! (`handover::Ready`); `/readyz` stays failing until storage answers.
 //!
-//! **Handing over** (`--handover-socket`, [`crate::handover`]): a frontend started while
-//! another serves on the same state file takes over its listeners, its state store and its
-//! daemons without failing a build; [`start_or_take_over`] is its start.
+//! **Handing over** (`--handover-socket` with `--instance`, [`crate::handover`]): behind
+//! Envoy, a frontend started while another serves on the same state file binds its own
+//! listeners (instance b's ports are [`Instance::SECOND_OFFSET`] above a's), takes the
+//! other's state store and daemons, and serves; the other goes not ready once Envoy has
+//! seen it, forwards the calls Envoy still sends it ([`kbf_front::Relay`]) and exits when
+//! it holds nothing, without failing a build; [`start_or_take_over`] is its start.
 //!
 //! **Not served here:** the worker listener's `ByteStream`, CAS and `Segments` (a
 //! daemon's blob traffic; daemons reach storage directly once the map reaches them,
@@ -77,8 +82,8 @@ use futures::FutureExt as _;
 use futures::future::{AbortHandle, Abortable, BoxFuture};
 use kbf_auth::AuthenticateLayer;
 use kbf_front::{
-    Backend, MAX_MESSAGE_BYTES, Owner, Owners, Proxy, RECORDER_CHANNEL, Recorder,
-    RequestMetadataLayer, Routed,
+    Backend, Handed, MAX_MESSAGE_BYTES, Owner, Owners, Proxy, RECORDER_CHANNEL, Recorder, Relaying,
+    RequestMetadataLayer, Routed, Successor,
 };
 use kbf_proto::grpc::health::v1::health_server::HealthServer;
 use kbf_proto::worker::worker_server::WorkerServer;
@@ -95,7 +100,8 @@ use crate::farm::Farm;
 use crate::front_maps::FrontMaps;
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::handover::{
-    self, Facts, Handover, HandoverError, Holder, Message, Ready, Sockets, Stand, Stop,
+    self, EnvoyCheck, Facts, Handover, HandoverError, Holder, Instance, Leave, Message, Peer,
+    Ready, Released, Stand, Stop,
 };
 use crate::health::{Checks, MapProbe, Readiness, StateProbe, StorageProbe};
 use crate::listen::Socket;
@@ -160,9 +166,24 @@ const HANDOVER: [&str; 3] = [
     "handover_follow_interval_ms",
 ];
 
-/// The defaults of the last two.
+/// The ids of the flags that say which instance this is, how long a holder waits for its
+/// successor to serve, the name the successor's certificate carries, and Envoy's check
+/// settings (interval, timeout, unhealthy threshold).
+const INSTANCE: &str = "instance";
+const WATCHDOG: &str = "handover_watchdog_secs";
+const PEER_NAME: &str = "handover_peer_name";
+const CHECK: [&str; 3] = [
+    "envoy_check_interval_ms",
+    "envoy_check_timeout_ms",
+    "envoy_unhealthy_threshold",
+];
+
+/// The defaults of the timings: the quiesce wait and follow interval, the watchdog, and
+/// Envoy's check (the box render's: `kbf-deploy envoy render --topology box`).
 const QUIESCE_SECS: &str = "10";
 const FOLLOW_INTERVAL_MS: &str = "200";
+const WATCHDOG_SECS: &str = "15";
+const CHECK_DEFAULTS: [&str; 3] = ["1000", "1000", "2"];
 
 /// The frontend's flags, from one command line.
 #[derive(Clone, Debug)]
@@ -229,10 +250,24 @@ pub fn command() -> Command {
             .help(
                 "The control socket of a handover (mode 0600, this user only). A frontend \
                  serving binds it; one started while another serves on the same \
-                 --state-store asks the other to hand over its listeners, its scheduler \
-                 state and its daemons, and takes them without failing a build. The \
-                 --listen, --worker-listen and --api-listen addresses must be the same, \
-                 and fixed (not port 0).",
+                 --state-store (and the other --instance) binds its own listeners, asks the \
+                 other to hand over its scheduler state and its daemons, and takes them \
+                 without failing a build. The other goes not ready once Envoy has seen the \
+                 new one, forwards the calls Envoy still sends it, and exits when it holds \
+                 nothing.",
+            ),
+    )
+    .arg(
+        Arg::new(INSTANCE)
+            .long("instance")
+            .value_name("a|b")
+            .value_parser(clap::value_parser!(Instance))
+            .requires(HANDOVER[0])
+            .help(
+                "Which of the two instances this is. Instance a listens where --listen, \
+                 --worker-listen and --api-listen say, instance b ten ports above each (port \
+                 0 stays 0): the two blocks Envoy's configuration names. A handover goes \
+                 to the other instance; without --instance a frontend refuses one.",
             ),
     )
     .arg(
@@ -260,6 +295,47 @@ pub fn command() -> Command {
                  the results of the Execute and WaitExecution streams it kept open.",
             ),
     )
+    .arg(
+        Arg::new(WATCHDOG)
+            .long("handover-watchdog-secs")
+            .value_name("SECONDS")
+            .value_parser(clap::value_parser!(u64).range(1..))
+            .default_value(WATCHDOG_SECS)
+            .requires(HANDOVER[0])
+            .help(
+                "How long after it has handed over a frontend waits for its successor to \
+                 serve. If the successor does not (or its control connection closes), the \
+                 frontend goes not ready itself, so Envoy answers cleanly instead of choosing \
+                 a frontend that can start nothing new.",
+            ),
+    )
+    .arg(
+        Arg::new(PEER_NAME)
+            .long("handover-peer-name")
+            .value_name("DNS_NAME")
+            .requires(HANDOVER[0])
+            .help(
+                "The DNS name the REAPI certificate of the other instance carries. A frontend \
+                 whose REAPI listener has a certificate forwards the calls it still receives \
+                 after a handover over TLS to the successor, verified against --storage-ca \
+                 and this name; without it such a frontend refuses a handover.",
+            ),
+    )
+    .arg(check_arg(0, "envoy-check-interval-ms", "MILLISECONDS", "The time between two of Envoy's health checks of a frontend (the cluster's `interval`)."))
+    .arg(check_arg(1, "envoy-check-timeout-ms", "MILLISECONDS", "How long Envoy's health check waits for an answer (the cluster's `timeout`)."))
+    .arg(check_arg(2, "envoy-unhealthy-threshold", "N", "How many of Envoy's checks in a row must fail before it stops choosing a frontend (`unhealthy_threshold`). The three give the settle: a frontend waits interval x threshold + timeout + interval before it goes not ready (Envoy has then seen the successor) and again before it exits (Envoy then sends it nothing)."))
+}
+
+/// One of the three flags of Envoy's check settings: a positive number, with the box
+/// render's value as its default.
+fn check_arg(n: usize, long: &'static str, value_name: &'static str, help: &'static str) -> Arg {
+    Arg::new(CHECK[n])
+        .long(long)
+        .value_name(value_name)
+        .value_parser(clap::value_parser!(u64).range(1..=3_600_000))
+        .default_value(CHECK_DEFAULTS[n])
+        .requires(HANDOVER[0])
+        .help(help)
 }
 
 /// The flags `m`, matched by [`command`], make.
@@ -279,7 +355,11 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
              (docs/design/architecture-v2.md, section 2)"
         )));
     }
-    let server = Args::from_arg_matches(m)?;
+    let mut server = Args::from_arg_matches(m)?;
+    let instance = m.get_one::<Instance>(INSTANCE).copied();
+    if let Some(instance) = instance {
+        place(&mut server, instance).map_err(refuse)?;
+    }
     let storage = server
         .storage()
         .map_err(|e| refuse(e.to_string()))?
@@ -293,8 +373,12 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
     transport(&storage, tls.is_some()).map_err(refuse)?;
     let handover = m.get_one::<PathBuf>(HANDOVER[0]).map(|socket| Handover {
         socket: socket.clone(),
+        instance,
         quiesce: Duration::from_secs(m.get_one::<u64>(HANDOVER[1]).map_or(0, |secs| *secs)),
         follow_interval: Duration::from_millis(m.get_one::<u64>(HANDOVER[2]).map_or(0, |ms| *ms)),
+        watchdog: Duration::from_secs(m.get_one::<u64>(WATCHDOG).map_or(0, |secs| *secs)),
+        envoy: envoy_check(m),
+        peer_name: m.get_one::<String>(PEER_NAME).cloned(),
     });
     Ok(FrontendFlags {
         server,
@@ -302,6 +386,43 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         tls,
         handover,
     })
+}
+
+/// Envoy's check settings the flags give (their defaults when `m` has none).
+fn envoy_check(m: &ArgMatches) -> EnvoyCheck {
+    let number = |n: usize| m.get_one::<u64>(CHECK[n]).copied().unwrap_or(0);
+    EnvoyCheck {
+        interval: Duration::from_millis(number(0)),
+        timeout: Duration::from_millis(number(1)),
+        unhealthy_threshold: u32::try_from(number(2)).unwrap_or(u32::MAX),
+    }
+}
+
+/// Moves the listeners of `server` to the port block of `instance`: the flags' for a, ten
+/// ports above for b ([`Instance::port`]).
+///
+/// # Errors
+/// A port of instance b would run past 65535.
+fn place(server: &mut Args, instance: Instance) -> Result<(), String> {
+    let shift = |flag: &str, addr: SocketAddr| {
+        instance
+            .port(addr.port())
+            .map(|port| SocketAddr::new(addr.ip(), port))
+            .ok_or_else(|| {
+                format!(
+                    "--instance b listens {offset} ports above --{flag}, and {addr} leaves no \
+                     room below 65535",
+                    offset = Instance::SECOND_OFFSET
+                )
+            })
+    };
+    server.listen = shift("listen", server.listen)?;
+    server.worker_listen = shift("worker-listen", server.worker_listen)?;
+    server.api_listen = server
+        .api_listen
+        .map(|addr| shift("api-listen", addr))
+        .transpose()?;
+    Ok(())
 }
 
 /// Whether `url` and the presence of the TLS flags go together: mutual TLS to an
@@ -532,30 +653,30 @@ fn bind_frontend(
     flags: &FrontendFlags,
     shutdown: Shutdown,
 ) -> Result<FrontendHandle, Box<dyn Error>> {
-    let prepared = Prepared::new(flags, None)?;
+    let prepared = Prepared::new(flags)?;
     let state = flags
         .server
         .state_store
         .as_ref()
         .map(crate::StateStoreUri::open)
         .transpose()?;
-    prepared.start(state, shutdown)
+    prepared.start(state, shutdown, None)
 }
 
 /// Starts the frontend the flags describe, taking over from the one serving on
-/// `--handover-socket`, if there is one (see [`crate::handover`]): it adopts that
-/// frontend's listeners, waits for it to stand down, and opens the state store at the
-/// generation it held. Without the flag, or with no frontend on the socket, this is
-/// [`start_frontend`].
+/// `--handover-socket`, if there is one (see [`crate::handover`]): it binds its own
+/// listeners, tells that frontend where it listens, waits for it to stand down, and opens
+/// the state store at the generation it held. Without the flag, or with no frontend on the
+/// socket, this is [`start_frontend`].
 ///
 /// `shutdown` is called first. A stop before the serving frontend is told this one is
 /// ready leaves it serving, untouched.
 ///
 /// # Errors
-/// As [`start_frontend`]; the frontend serving refuses the handover (other listen
-/// addresses or another state store than this one's), or fails to stand down; the state
-/// store is not at the generation the serving frontend held; or `shutdown` completes
-/// before the handover is agreed.
+/// As [`start_frontend`]; the frontend serving refuses the handover (the same instance,
+/// another state file or a REAPI address that is not loopback), or fails to stand down;
+/// the state store is not at the generation the serving frontend held; or `shutdown`
+/// completes before the handover is agreed.
 pub async fn start_or_take_over<S, F>(
     flags: &FrontendFlags,
     shutdown: S,
@@ -567,15 +688,6 @@ where
     take_over(flags, boxed(shutdown)).await
 }
 
-/// What asking for a handover found.
-enum Asked<'a> {
-    /// Nobody serves: a start with no predecessor.
-    Nobody,
-    /// A frontend serves and offered to hand over; this is everything that does not
-    /// need the state store, built from what it offered.
-    Offered(handover::Offer, Box<Prepared<'a>>),
-}
-
 /// [`start_or_take_over`], not generic.
 async fn take_over(
     flags: &FrontendFlags,
@@ -585,30 +697,28 @@ async fn take_over(
     let Some(handover) = &flags.handover else {
         return bind_frontend(flags, Box::new(move || Ok(stopping)));
     };
-    // Until the serving frontend is told this one is ready, a stop leaves it untouched.
+    // Everything that does not need the state store is built, and the listeners are
+    // bound, before the serving frontend is asked: a start that fails here has changed
+    // nothing, and until it is told this one is ready a stop leaves it untouched.
+    let prepared = Prepared::new(flags)?;
     let asked = async {
-        let hello = hello(flags)?;
-        let Some((offer, sockets)) = handover::knock(&handover.socket, &hello).await? else {
-            return Ok::<_, Box<dyn Error>>(Asked::Nobody);
-        };
-        Ok(Asked::Offered(
-            offer,
-            Box::new(Prepared::new(flags, Some(sockets))?),
-        ))
+        let hello = prepared.hello()?;
+        Ok::<_, Box<dyn Error>>(handover::knock(&handover.socket, &hello).await?)
     };
     let asked = tokio::select! {
         biased;
         () = &mut stopping => return Err("stopped before the handover was agreed".into()),
         asked = asked => asked?,
     };
-    let (offer, prepared) = match asked {
-        Asked::Nobody => return bind_frontend(flags, Box::new(move || Ok(stopping))),
-        Asked::Offered(offer, prepared) => (offer, prepared),
+    let Some(offer) = asked else {
+        // Nobody serves: a start with no predecessor.
+        let state = state_uri(flags)?.open()?;
+        return prepared.start(Some(state), Box::new(move || Ok(stopping)), None);
     };
     let generation = offer.generation;
-    offer.ready().await?;
+    let released = offer.ready().await?;
     let state = state_uri(flags)?.open_after_handover(generation)?;
-    prepared.start(Some(state), Box::new(move || Ok(stopping)))
+    prepared.start(Some(state), Box::new(move || Ok(stopping)), Some(released))
 }
 
 /// The `--state-store` of a frontend that hands over (the flag requires it).
@@ -620,102 +730,67 @@ fn state_uri(flags: &FrontendFlags) -> Result<&crate::StateStoreUri, HandoverErr
         .ok_or(HandoverError::NoState)
 }
 
-/// What this frontend tells the one serving, to be allowed to take over.
-fn hello(flags: &FrontendFlags) -> Result<Message, Box<dyn Error>> {
-    let listeners = flags.server.listeners()?;
-    let api = flags.server.api()?;
-    Ok(Message::Hello {
-        version: handover::wire::PROTOCOL,
-        reapi: listeners.reapi,
-        worker: listeners.worker,
-        api: api.map(|api| api.listen),
-        state: state_uri(flags)?.path().to_owned(),
-    })
-}
-
 /// A frontend's start up to the state store: everything the flags decide that needs
-/// neither the store nor the sockets bound, and the sockets adopted from a frontend that
-/// is handing over.
+/// neither the store nor the handover, and the listening sockets, bound.
 struct Prepared<'a> {
     flags: &'a FrontendFlags,
     listeners: crate::serve::Listeners,
     policy: kbf_auth::Policy,
     api: Option<crate::serve::Api>,
     channel: tonic::transport::Channel,
-    /// The sockets of the frontend handing over, checked against the flags.
-    adopted: Option<Trio>,
-}
-
-/// The sockets to serve on: those adopted, or new ones bound.
-fn sockets(
-    adopted: Option<Trio>,
-    listeners: &crate::serve::Listeners,
-    api: Option<&crate::serve::Api>,
-    spare: bool,
-) -> Result<Trio, ServeError> {
-    let bound = || {
-        Ok(Trio {
-            reapi: Socket::bind(listeners.reapi, spare)?,
-            worker: Socket::bind(listeners.worker, spare)?,
-            api: api.map(|api| Socket::bind(api.listen, spare)).transpose()?,
-        })
-    };
-    adopted.map_or_else(bound, Ok)
+    sockets: Bound,
 }
 
 /// The three listening sockets.
-struct Trio {
+struct Bound {
     reapi: Socket,
     worker: Socket,
     api: Option<Socket>,
 }
 
-impl Trio {
-    /// The sockets of a frontend handing over, each checked to listen where the flags say.
-    fn adopt(
-        sockets: Sockets,
-        listeners: &crate::serve::Listeners,
-        api: Option<&crate::serve::Api>,
-        spare: bool,
-    ) -> Result<Self, ServeError> {
-        let reapi = Socket::adopt(sockets.reapi, listeners.reapi, spare)?;
-        let worker = Socket::adopt(sockets.worker, listeners.worker, spare)?;
-        let api = sockets
-            .api
-            .zip(api)
-            .map(|(fd, api)| Socket::adopt(fd, api.listen, spare));
-        let api = api.transpose()?;
-        Ok(Self { reapi, worker, api })
-    }
-}
-
 impl<'a> Prepared<'a> {
-    /// Reads the flags, and adopts `inherited` if given: each socket must listen where
-    /// the flags say.
-    fn new(flags: &'a FrontendFlags, inherited: Option<Sockets>) -> Result<Self, Box<dyn Error>> {
+    /// Reads the flags and binds the listeners.
+    fn new(flags: &'a FrontendFlags) -> Result<Self, Box<dyn Error>> {
         let args = &flags.server;
         let listeners = args.listeners()?;
         let policy = args.reapi_auth_policy()?;
         let api = args.api()?;
         let channel = flags.storage_endpoint()?.connect_lazy();
-        let spare = flags.handover.is_some();
-        let adopted = inherited.map(|s| Trio::adopt(s, &listeners, api.as_ref(), spare));
-        let adopted = adopted.transpose()?;
+        let sockets = Bound {
+            reapi: Socket::bind(listeners.reapi)?,
+            worker: Socket::bind(listeners.worker)?,
+            api: api
+                .as_ref()
+                .map(|api| Socket::bind(api.listen))
+                .transpose()?,
+        };
         Ok(Self {
             flags,
             listeners,
             policy,
             api,
             channel,
-            adopted,
+            sockets,
         })
     }
 
-    /// Opens everything over `state` and binds (or takes) the listeners.
+    /// What this frontend tells the one serving, to be allowed to take over.
+    fn hello(&self) -> Result<Message, HandoverError> {
+        Ok(Message::Hello {
+            version: handover::wire::PROTOCOL,
+            instance: self.flags.handover.as_ref().and_then(|h| h.instance),
+            reapi: self.sockets.reapi.local,
+            state: state_uri(self.flags)?.path().to_owned(),
+        })
+    }
+
+    /// Opens everything over `state` and serves on the listeners bound. `predecessor` is
+    /// the frontend this one took over from, to be told when this one serves.
     fn start(
         self,
         state: Option<crate::StateStore>,
         shutdown: Shutdown,
+        predecessor: Option<Released>,
     ) -> Result<FrontendHandle, Box<dyn Error>> {
         let Self {
             flags,
@@ -723,7 +798,7 @@ impl<'a> Prepared<'a> {
             policy,
             api,
             channel,
-            adopted,
+            sockets,
         } = self;
         let args = &flags.server;
         let state = crate::start::with_members(state, args.members());
@@ -762,8 +837,6 @@ impl<'a> Prepared<'a> {
         let farm = Arc::new(farm.with_state(state)?);
         log_state(durable, farm.term(), farm.lease_epoch());
 
-        let sockets = sockets(adopted, &listeners, api.as_ref(), flags.handover.is_some())?;
-        let peers_certified = listeners.worker_tls.is_some();
         let (mut worker_server, peers, worker_tls) = worker_peers(
             keepalive(
                 flow_control(Server::builder(), listeners.stream_limits.worker),
@@ -780,24 +853,14 @@ impl<'a> Prepared<'a> {
         let (closer, closing) = kbf_front::closing();
         let (drain, goaway) = Drain::new(closer, Arc::clone(&readiness));
         let drain = Arc::new(drain);
-        let (worker_stop, api_stop) = (Stop::new(), Stop::new());
-        let Trio {
-            mut reapi,
-            mut worker,
-            api: mut api_socket,
+        let worker_stop = Stop::new();
+        let Bound {
+            reapi,
+            worker,
+            api: api_socket,
         } = sockets;
         let (reapi_addr, worker_addr) = (reapi.local, worker.local);
         let api_addr = api_socket.as_ref().map(|socket| socket.local);
-        // What a successor is offered, if this frontend hands over.
-        let spares = reapi
-            .spare
-            .take()
-            .zip(worker.spare.take())
-            .map(|(reapi, worker)| Sockets {
-                reapi,
-                worker,
-                api: api_socket.as_mut().and_then(|socket| socket.spare.take()),
-            });
         // Both listeners are closed the moment the drain begins and the worker listener
         // is stopped, whatever the transport is doing then.
         let (reapi_incoming, reapi_latch) = reapi.grpc(listeners.reapi_tls)?;
@@ -818,13 +881,19 @@ impl<'a> Prepared<'a> {
         .merge(metrics_route(
             backend.clone(),
             history.as_ref().map(crate::history::History::stats),
+            members.clone(),
             tls_sources,
         ));
+        // The storage health, if there are members.
+        let api_routes = members.iter().fold(api_routes, |routes, members| {
+            routes.merge(crate::storage_health::router(Arc::clone(members)))
+        });
 
         let mut reapi_server = keepalive(
             flow_control(Server::builder(), listeners.stream_limits.reapi),
             listeners.streams,
         );
+        let membership = membership(members.clone(), &peers);
         let sessions = WorkerService::new(
             Arc::clone(&farm),
             peers,
@@ -837,7 +906,6 @@ impl<'a> Prepared<'a> {
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
 
-        let membership = membership(members.clone(), peers_certified);
         let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
         let authorizers = Arc::new(policy.authorizers);
         let bootstrap = Owner::new(&flags.storage.uri().to_string(), channel);
@@ -846,15 +914,35 @@ impl<'a> Prepared<'a> {
             None => Owners::single(bootstrap),
         };
         let proxy = Proxy::new(owners, Arc::clone(&authorizers));
-        let reapi_routes = kbf_front::routes_proxied(
-            &proxy,
-            backend,
-            Arc::clone(&farm),
-            kbf_front::OpenStreams { closing, progress },
-            authorizers,
-            &recorder,
-            default_memory,
-        );
+        let streams = kbf_front::OpenStreams { closing, progress };
+        // With a handover configured, Execute and WaitExecution are forwarded to the
+        // successor once this frontend has handed its roles over.
+        let successor = Successor::unknown();
+        let reapi_routes = match &flags.handover {
+            Some(handover) => kbf_front::routes_relayed(
+                &proxy,
+                backend,
+                Arc::clone(&farm),
+                streams,
+                authorizers,
+                &recorder,
+                default_memory,
+                Relaying {
+                    farm: Arc::clone(&farm) as Arc<dyn Handed>,
+                    successor: successor.clone(),
+                    follow_every: handover.follow_interval,
+                },
+            ),
+            None => kbf_front::routes_proxied(
+                &proxy,
+                backend,
+                Arc::clone(&farm),
+                streams,
+                authorizers,
+                &recorder,
+                default_memory,
+            ),
+        };
         let reapi_routes = Routes::from(
             reapi_routes
                 .into_axum_router()
@@ -874,15 +962,16 @@ impl<'a> Prepared<'a> {
                 .map(drop)
                 .boxed(),
         ];
+        // Told by the control socket's task when a handed-over frontend holds nothing and
+        // may exit, or could not stand down.
+        let (departing, departed) = tokio::sync::oneshot::channel::<Result<(), String>>();
         let holder = flags
             .handover
             .as_ref()
-            .zip(state_store.zip(spares))
-            .map(|(handover, (store, spares))| {
+            .zip(state_store)
+            .map(|(handover, store)| {
                 let facts = Facts {
-                    reapi: reapi_addr,
-                    worker: worker_addr,
-                    api: api_addr,
+                    instance: handover.instance,
                     state: args
                         .state_store
                         .as_ref()
@@ -892,17 +981,22 @@ impl<'a> Prepared<'a> {
                     drain: Arc::clone(&drain),
                     farm: Arc::clone(&farm),
                     worker: worker_stop.clone(),
-                    api: api_stop.clone(),
                     sweeper: sweeper.clone(),
                     store,
                     wait: handover.quiesce,
                 };
+                let peer = Peer {
+                    successor,
+                    dial: dial_of(flags)?,
+                };
+                let leave = Leave {
+                    watchdog: handover.watchdog,
+                    settle: handover.envoy.settle(),
+                    every: handover.follow_interval,
+                };
                 let uid = rustix::process::geteuid().as_raw();
-                Holder::bind(&handover.socket, uid, facts, spares, stand).map(|holder| {
-                    holder
-                        .run(Arc::clone(&farm), handover.follow_interval)
-                        .boxed()
-                })
+                let holder = Holder::bind(&handover.socket, uid, facts, stand, peer, leave)?;
+                Ok::<_, Box<dyn Error>>(holder.run(departing).boxed())
             })
             .transpose();
         background.extend(holder?);
@@ -922,11 +1016,10 @@ impl<'a> Prepared<'a> {
                 .add_service(worker_service)
                 .add_optional_service(membership)
                 .serve_with_incoming_shutdown(worker_incoming, worker_stopped);
-            // Told when the REAPI listener is done (see `serve::stop_api`), or by a handover.
+            // Told when the REAPI listener is done (see `serve::stop_api`).
             let (api_stop_when_done, api_stopped) = tokio::sync::oneshot::channel::<()>();
-            let api_stopped_by_handover = api_stop.fired();
             let api_serve = serve_api(api_listener, api_routes, async {
-                let _ = futures::future::select(api_stopped, api_stopped_by_handover).await;
+                let _ = api_stopped.await;
             })
             .fuse();
             tokio::pin!(api_serve);
@@ -944,8 +1037,8 @@ impl<'a> Prepared<'a> {
             };
             let mut reapi_done = false;
             // A listener that ends without an error does not end the frontend: the worker
-            // and operator API listeners end when a handover stops them, and the frontend
-            // goes on answering the callers it kept until its REAPI listener is done.
+            // listener ends when a handover stops it, and the frontend goes on answering
+            // the callers it kept until it holds nothing (`departed`).
             let outcome = tokio::select! {
                 served = reapi_serve => {
                     reapi_done = true;
@@ -956,6 +1049,7 @@ impl<'a> Prepared<'a> {
                 () = ticking => Ok(()),
                 () = ticker.run() => Ok(()),
                 () = stopping => Ok(()),
+                Ok(departure) = departed => departure.map_err(ServeError::Handover),
             };
             if reapi_done {
                 stop_api(api_stop_when_done, api_serve).await;
@@ -982,9 +1076,49 @@ impl<'a> Prepared<'a> {
             ready: Ready {
                 checks,
                 notify: None,
+                predecessor,
             },
         })
     }
+}
+
+/// How a frontend that has handed over reaches its successor: the channel to a REAPI
+/// listener at an address, plain text when this frontend's REAPI listener has no
+/// certificate, and otherwise TLS verified against `--storage-ca` and
+/// `--handover-peer-name`. A frontend without them cannot reach a TLS successor, and
+/// refuses the handover (the reason is the `Err`) instead of forwarding calls nowhere.
+///
+/// # Errors
+/// The CA file cannot be read.
+fn dial_of(flags: &FrontendFlags) -> Result<crate::handover::Dial, ConfigError> {
+    let tls = flags.server.reapi_tls_cert.is_some();
+    let ca = match flags.storage_identity()? {
+        Some((ca, _)) if tls => Some(ca),
+        _ => None,
+    };
+    let name = flags.handover.as_ref().and_then(|h| h.peer_name.clone());
+    Ok(Box::new(move |addr| {
+        let channel = if tls {
+            let (Some(ca), Some(name)) = (ca.clone(), name.clone()) else {
+                return Err(
+                    "this frontend's REAPI listener has a certificate, so the calls it forwards \
+                     to its successor go over TLS: it needs --handover-peer-name (the name the \
+                     successor's certificate carries) and the --storage-* flags (the CA)"
+                        .into(),
+                );
+            };
+            let config = ClientTlsConfig::new().ca_certificate(ca).domain_name(name);
+            Endpoint::from_shared(format!("https://{addr}"))
+                .and_then(|endpoint| endpoint.tls_config(config))
+        } else {
+            Endpoint::from_shared(format!("http://{addr}"))
+        };
+        // An address always makes a valid URI, and a CA tonic cannot use is only found when
+        // the channel connects: the error here is the transport's own.
+        channel
+            .map(|endpoint| endpoint.connect_lazy())
+            .map_err(Into::into)
+    }))
 }
 
 /// The store `/readyz` probes: the open state store's, if there is one.
@@ -993,21 +1127,24 @@ fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Stor
 }
 
 /// `GET /metrics`: what the service counts, in the Prometheus text format, history's
-/// counters when it keeps history, and the reloads of the listeners' `tls` files.
+/// counters when it keeps history, the storage health of `members` when there are any, and
+/// the reloads of the listeners' `tls` files.
 fn metrics_route(
     backend: Backend,
     history: Option<Arc<crate::history::Stats>>,
+    members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
 ) -> axum::Router {
     let tls = Arc::new(tls);
     let render = move || {
-        let (backend, tls) = (backend.clone(), Arc::clone(&tls));
+        let (backend, members, tls) = (backend.clone(), members.clone(), Arc::clone(&tls));
         let history = history.clone();
         async move {
             let mut text = backend.render_metrics();
             if let Some(history) = history {
                 history.render(&mut text);
             }
+            crate::metrics::scrape_health(&mut text, members.as_ref()).await;
             kbf_tls::render_metrics(tls.iter(), &mut text);
             ([(CONTENT_TYPE, crate::metrics::TEXT_FORMAT)], text)
         }

@@ -7,6 +7,7 @@
 //! no [`RemoteStorage`] would is refused with the code the protocol names.
 
 mod catch_up;
+mod denied;
 mod every_call;
 pub(crate) mod fake;
 mod generation;
