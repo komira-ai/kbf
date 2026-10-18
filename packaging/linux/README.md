@@ -10,7 +10,7 @@ inputs, and `crates/xtask/src/pkg.rs` is the one place that says what goes in.
 
 | path | what |
 |---|---|
-| `sysusers.d/kbf-installer.conf` | the users `kbf`, `kbf-fetch`, `kbf-verify` (no login); installed to `/usr/lib/sysusers.d` |
+| `sysusers.d/kbf-installer.conf` | the users `kbf`, `kbf-server`, `kbf-fetch`, `kbf-verify` (no login); installed to `/usr/lib/sysusers.d` |
 | `tmpfiles.d/kbf-installer.conf` | `/run/kbf-installer` (0755), `/var/cache/kbf-fetch` (0711); the units author's file, packaged unchanged; installed to `/usr/lib/tmpfiles.d` |
 | `units/` | the unit files (`kbf-*.service`, `kbf.slice`), installed to `/usr/lib/systemd/system`; `testdata/units` is the fixture for the unit tests only |
 | `testdata/` | fixtures for the install test only: two gated units and three stand-in trust files |

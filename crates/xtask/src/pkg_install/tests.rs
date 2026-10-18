@@ -19,6 +19,7 @@ enum Defect {
     UnitMissing,
     UnitActive,
     UserWithShell,
+    UnitNamesMissingUser,
     DirNotMade,
     GateIgnored,
     GateRunsWithoutFile,
@@ -176,7 +177,13 @@ impl World {
                 self.users_made = true;
                 ok("")
             }
+            ["cat", path] if path.ends_with(".service") => ok(if self.is(Defect::UnitNamesMissingUser) {
+                "[Service]\nUser=kbf-ghost\n"
+            } else {
+                "[Service]\nUser=kbf-server\nGroup=kbf\n"
+            }),
             ["getent", "passwd", user] => self.getent(user),
+            ["getent", "group", group] => self.getent(group),
             ["rm", "-f", path] => {
                 self.files.remove(*path);
                 ok("")
@@ -306,6 +313,9 @@ impl World {
         if !self.users_made {
             return fail("");
         }
+        if user == "kbf-ghost" {
+            return fail("");
+        }
         let shell = if self.is(Defect::UserWithShell) && user == "kbf-verify" {
             "/opt/shell"
         } else {
@@ -380,7 +390,7 @@ fn a_package_that_does_everything_the_contract_says_passes_in_both_formats() {
 
 #[test]
 fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
-    let cases: [(Format, Defect, &str); 17] = [
+    let cases: [(Format, Defect, &str); 18] = [
         (
             Format::Deb,
             Defect::NotInstalled,
@@ -427,6 +437,11 @@ fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
             Format::Deb,
             Defect::UserWithShell,
             "kbf-verify's login shell: \"/opt/shell\"",
+        ),
+        (
+            Format::Deb,
+            Defect::UnitNamesMissingUser,
+            "/usr/lib/systemd/system/kbf-node.service names User=kbf-ghost, which does not exist",
         ),
         (Format::Deb, Defect::DirNotMade, "/run/kbf-installer"),
         (

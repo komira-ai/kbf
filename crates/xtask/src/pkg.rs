@@ -43,7 +43,23 @@ pub const STATE_DIR: &str = "/var/lib/kbf-installer";
 /// the unit author's, packaged unchanged; `STATE_DIR` is made by `kbf-installer setup`.
 pub const TMPFILES_DIRS: [(&str, &str); 2] = [("/run/kbf-installer", "755"), ("/var/cache/kbf-fetch", "711")];
 /// The users `sysusers.d` makes.
-pub const USERS: [&str; 3] = ["kbf", "kbf-fetch", "kbf-verify"];
+pub const USERS: [&str; 4] = ["kbf", "kbf-server", "kbf-fetch", "kbf-verify"];
+/// The `User=` and `Group=` names a unit's text sets, as `("User" | "Group", name)`, in
+/// order. Comments and empty values (which reset the setting) are skipped.
+pub fn unit_accounts(text: &str) -> Vec<(&'static str, String)> {
+    let mut found = Vec::new();
+    for line in text.lines() {
+        for key in ["User", "Group"] {
+            if let Some(name) = line.strip_prefix(key).and_then(|r| r.strip_prefix('=')) {
+                let name = name.trim();
+                if !name.is_empty() {
+                    found.push((key, name.to_owned()));
+                }
+            }
+        }
+    }
+    found
+}
 /// The `Depends` of the deb.
 pub const DEB_DEPENDS: [&str; 4] = ["crun", "uidmap", "systemd", "ca-certificates"];
 /// The `Requires` of the rpm: Fedora's `uidmap` is `shadow-utils`.

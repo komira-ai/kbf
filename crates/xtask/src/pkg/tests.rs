@@ -674,3 +674,27 @@ fn a_unit_that_is_neither_a_service_nor_the_slice_is_refused() {
     assert!(got.contains("kbf-x.timer"), "{got}");
     assert!(!got.contains("kbf.slice:"), "{got}");
 }
+
+#[test]
+fn unit_accounts_reads_user_and_group_lines_only() {
+    let text = "# User=commented\n[Service]\nUser=kbf-server\nGroup=kbf\nUser=\nExecStart=/bin/x User=no\nSupplementaryGroups=other\n";
+    assert_eq!(
+        unit_accounts(text),
+        [("User", "kbf-server".to_owned()), ("Group", "kbf".to_owned())]
+    );
+}
+
+#[test]
+fn every_user_and_group_a_packaged_unit_names_is_made_by_sysusers() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux");
+    let mut seen = 0;
+    for e in std::fs::read_dir(root.join("units")).expect("units") {
+        let path = e.expect("entry").path();
+        let text = std::fs::read_to_string(&path).expect("unit");
+        for (_, account) in unit_accounts(&text) {
+            seen += 1;
+            assert!(USERS.contains(&account.as_str()), "{}: {account}", path.display());
+        }
+    }
+    assert!(seen > 0);
+}

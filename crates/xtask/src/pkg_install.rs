@@ -381,6 +381,18 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
             "/usr/sbin/nologin",
         );
     }
+    // Every account a packaged unit runs as exists once sysusers has run.
+    for e in entries {
+        if !e.dst.starts_with(pkg::UNIT_DIR) || e.sha256.is_none() {
+            continue;
+        }
+        for (key, name) in pkg::unit_accounts(&c.say(&["cat", &e.dst])?) {
+            let database = if key == "User" { "passwd" } else { "group" };
+            if !c.ok(&["getent", database, &name])? {
+                problems.push(format!("{} names {key}={name}, which does not exist", e.dst));
+            }
+        }
+    }
     for (path, mode) in pkg::TMPFILES_DIRS {
         let got = c.say(&["stat", "-c", "%U:%G:%a:%F", path])?;
         eq(&mut problems, path, &got, &format!("root:root:{mode}:directory"));
