@@ -53,6 +53,7 @@ pub mod helper;
 pub mod inbox;
 pub mod layout;
 pub mod offer;
+pub mod proxy;
 pub mod refusal;
 pub mod release;
 pub mod run;
