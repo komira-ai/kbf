@@ -60,6 +60,8 @@ pub struct Source {
     custom: Mutex<Option<StoreConfig>>,
     /// While true a snapshot waits (a node's fetch is held half way).
     held: (Mutex<bool>, Condvar),
+    /// The registration is gone from the snapshots, though the generation still names it.
+    taken_back: AtomicBool,
 }
 
 impl Source {
@@ -70,6 +72,7 @@ impl Source {
             mute: AtomicBool::new(false),
             custom: Mutex::new(None),
             held: (Mutex::new(false), Condvar::new()),
+            taken_back: AtomicBool::new(false),
         })
     }
 
@@ -81,6 +84,13 @@ impl Source {
     /// Makes every snapshot wait until [`Source::release`].
     pub fn hold(&self) {
         *self.held.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+    }
+
+    /// From now on a snapshot says nothing is registered, while `generation()` still names
+    /// the registration: what a node sees when it is taken back between its registration
+    /// and its fetch.
+    pub fn take_back(&self) {
+        self.taken_back.store(true, Ordering::SeqCst);
     }
 
     pub fn release(&self) {
@@ -132,6 +142,12 @@ impl StoreConfigSource for Source {
         drop(held);
         if self.broken.load(Ordering::SeqCst) {
             return Err(SourceError::SecretUnavailable);
+        }
+        if self.taken_back.load(Ordering::SeqCst) {
+            return Ok(Snapshot {
+                generation: 0,
+                config: None,
+            });
         }
         let generation = self.read();
         let custom = self

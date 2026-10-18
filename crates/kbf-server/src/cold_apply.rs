@@ -42,12 +42,13 @@ use std::error::Error;
 use std::future::Future;
 use std::io;
 use std::num::NonZeroU64;
+use std::pin::Pin;
 use std::time::Duration;
 
 use kbf_objstore::probe::{ProbeStep, probe};
 use kbf_objstore::s3::{Credentials, S3Store};
 use kbf_objstore::{KeyPrefix, ObjectStore};
-use kbf_proto::kbf::enroll::v1::StoreConfig;
+use kbf_proto::kbf::enroll::v1::{GetStoreConfigResponse, StoreConfig};
 use kbf_proto::kbf::map::v1::ApplyStatus;
 use tonic::{Code, Status};
 
@@ -161,7 +162,7 @@ pub enum ColdApplyError {
     Refused(Code),
     /// Core dumps could not be turned off, and the node may hold keys.
     #[error("turning off core dumps: {0}")]
-    Harden(#[source] io::Error),
+    Harden(#[from] io::Error),
 }
 
 /// Whether `code` is worth another try: the frontend or the path to it, not the node's
@@ -179,21 +180,21 @@ fn retriable(code: Code) -> bool {
     )
 }
 
+/// One call for the registered store.
+pub type Fetch<'a> = Pin<Box<dyn Future<Output = Result<GetStoreConfigResponse, Status>> + 'a>>;
+
 /// Calls `call` until it answers, waiting `pause(failures)` after each failure that is
 /// worth another try. `attempts` bounds the calls; `None` goes on for ever. A refusal
-/// that waiting does not change (the node is denied) ends it at once.
+/// that waiting does not change (the node is denied) ends it at once. Not generic, so
+/// that the lines of the loop are one copy in every test binary.
 ///
 /// # Errors
 /// The last status, when it is not worth another try or the attempts are spent.
-pub async fn fetch_with<T, F, Fut>(
-    mut call: F,
-    pause: impl Fn(u32) -> Duration,
+pub async fn fetch_with<'a>(
+    call: &mut dyn FnMut() -> Fetch<'a>,
+    pause: &dyn Fn(u32) -> Duration,
     attempts: Option<u32>,
-) -> Result<T, Status>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, Status>>,
-{
+) -> Result<GetStoreConfigResponse, Status> {
     let mut failures = 0_u32;
     loop {
         let status = match call().await {
@@ -205,7 +206,7 @@ where
         if attempts.is_some_and(|spent| failures >= spent) {
             return Err(status);
         }
-        tracing::warn!(code = ?status.code(), "fetching the registered cold store; trying again");
+        tracing::warn!("fetching the registered cold store failed; trying again");
         tokio::time::sleep(pause(failures - 1)).await;
     }
 }
@@ -234,6 +235,14 @@ fn prefix_of(prefix: &str) -> String {
 enum Unusable {
     Probe(ProbeStep),
     Config,
+}
+
+/// What a node with no key pair of its own is told when the registered keys were not used.
+fn refusal(why: Unusable) -> ColdApplyError {
+    match why {
+        Unusable::Probe(step) => ColdApplyError::Probe(step),
+        Unusable::Config => ColdApplyError::Unusable,
+    }
 }
 
 /// The store `config` names with its keys, probed as `nonce`.
@@ -315,15 +324,13 @@ pub(crate) struct Registrable {
 }
 
 impl Registrable {
-    /// The flag's store, with the key pair `env` gives.
+    /// The flag's store, with the key pair `env` gives. Not generic over `env`, so that the
+    /// three ways it ends are one copy in every test binary.
     ///
     /// # Errors
     /// The flag's configuration is refused (a missing key pair is not an error yet: the
     /// registration may supply it).
-    pub(crate) fn new(
-        uri: &S3Uri,
-        env: impl Fn(&str) -> Option<String>,
-    ) -> Result<Self, ConfigError> {
+    pub(crate) fn new(uri: &S3Uri, env: fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let own = match crate::s3_store(uri, env) {
             Ok(store) => Ok(store),
             Err(ConfigError::MissingEnv(name)) => Err(name),
@@ -372,15 +379,15 @@ impl ColdPick for Registrable {
         }
         let attempts = self.own.is_ok().then_some(FALLBACK_ATTEMPTS);
         let fetched = fetch_with(
-            || joiner.fetch_store_config(0),
-            |failures| joiner.pause(failures),
+            &mut || Box::pin(joiner.fetch_store_config(0)),
+            &|failures| joiner.pause(failures),
             attempts,
         )
         .await;
         let reply = match fetched {
             Ok(reply) => reply,
             Err(status) => {
-                tracing::warn!(code = ?status.code(), "the registered cold store was not fetched");
+                tracing::warn!("the registered cold store was not fetched");
                 let refused = ColdApplyError::Refused(status.code());
                 return self.keep_or(Applied::kept(announced, ApplyStatus::Pending), refused);
             }
@@ -391,10 +398,7 @@ impl ColdPick for Registrable {
             return self.keep(Applied::nothing());
         };
         if !same_store(&self.flag, config) {
-            tracing::warn!(
-                generation,
-                "the registered cold store is not the one --cold-store names; keeping the flag's"
-            );
+            tracing::warn!("the registered cold store differs from --cold-store");
             let mismatch = Applied::kept(generation, ApplyStatus::IdentityMismatch);
             return self.keep_or(mismatch, ColdApplyError::MismatchNoKeys);
         }
@@ -402,17 +406,9 @@ impl ColdPick for Registrable {
         match registered_store(&self.flag, config, &nonce).await {
             Ok(store) => Ok((store, Applied::running(generation))),
             Err(why) => {
-                tracing::warn!(
-                    generation,
-                    ?why,
-                    "the registered cold store's keys were not used"
-                );
+                tracing::warn!("the registered cold store's keys were not used");
                 let failed = Applied::kept(generation, ApplyStatus::ProbeFailed);
-                let error = match why {
-                    Unusable::Probe(step) => ColdApplyError::Probe(step),
-                    Unusable::Config => ColdApplyError::Unusable,
-                };
-                self.keep_or(failed, error)
+                self.keep_or(failed, refusal(why))
             }
         }
     }
@@ -432,10 +428,10 @@ pub fn harden_process() -> Result<(), ColdApplyError> {
             maximum: Some(0),
         },
     )
-    .map_err(|e| ColdApplyError::Harden(e.into()))?;
+    .map_err(io::Error::from)?;
     #[cfg(target_os = "linux")]
     rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
-        .map_err(|e| ColdApplyError::Harden(e.into()))?;
+        .map_err(io::Error::from)?;
     Ok(())
 }
 

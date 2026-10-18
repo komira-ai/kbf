@@ -1,5 +1,9 @@
 //! The probe a node runs on a registered key pair before it opens its cache on it: a
 //! write, a read-back and a delete of one object under `.kbf-probe/`.
+//!
+//! Every test probes the same store type, [`Tampered`] over an [`S3Store`] on the loopback
+//! S3 service: the probe is generic over the store, and the coverage ratchet counts the
+//! best single copy of it, which has to run every line.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -9,7 +13,7 @@ use kbf_objstore::probe::{PROBE_DIR, ProbeStep, probe};
 use kbf_objstore::s3::fake::FakeS3;
 use kbf_objstore::s3::{Credentials, S3Config, S3Store};
 use kbf_objstore::{
-    ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
+    ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
 
@@ -37,76 +41,29 @@ fn store(fake: &FakeS3, id: &str, secret: &str) -> S3Store {
     .unwrap()
 }
 
-/// A bucket that holds the fake's key pair.
+/// A bucket that holds one key pair.
 async fn guarded() -> FakeS3 {
     let fake = FakeS3::start().await;
     fake.require_credentials("AKIAOK", "right-secret");
     fake
 }
 
-/// Catches a probe that leaves its object behind (mutant: the delete is skipped) and
-/// one that writes anywhere but under `.kbf-probe/` (mutant: the key drops `PROBE_DIR`).
-#[tokio::test]
-async fn a_working_key_pair_passes_and_leaves_nothing() {
-    let fake = guarded().await;
-    probe(&store(&fake, "AKIAOK", "right-secret"), &root(), "n-1")
-        .await
-        .expect("a probe on the right keys");
-    assert_eq!(
-        fake.keys(),
-        Vec::<String>::new(),
-        "the probe object is gone"
-    );
-    let key = format!("/kbf-fake/{ROOT}{PROBE_DIR}n-1?");
-    assert_eq!(
-        fake.requests(),
-        [
-            format!("PUT {key}"),
-            format!("GET {key}"),
-            format!("DELETE {key}")
-        ],
-        "one write, one read, one delete, all under the probe directory"
-    );
-}
-
-/// Catches a probe that treats a refused write as success (mutant: the put error is
-/// dropped) and a fake that accepts any signature (mutant: `signed_with` returns true):
-/// a wrong secret and a wrong key id both fail at the write and write nothing.
-#[tokio::test]
-async fn a_wrong_key_pair_fails_at_the_write() {
-    let fake = guarded().await;
-    for (id, secret) in [("AKIAOK", "wrong-secret"), ("AKIAXX", "right-secret")] {
-        let failed = probe(&store(&fake, id, secret), &root(), "n-2").await;
-        assert_eq!(failed, Err(ProbeStep::Put), "{id}");
-    }
-    assert!(fake.keys().is_empty());
-}
-
-/// A store over memory that misbehaves on request.
+/// A store that misbehaves on request.
 struct Tampered {
-    inner: MemoryStore,
+    inner: S3Store,
     wrong_bytes: AtomicBool,
     fail_get: AtomicBool,
     fail_delete: AtomicBool,
 }
 
 impl Tampered {
-    fn new() -> Self {
+    fn over(inner: S3Store) -> Self {
         Self {
-            inner: MemoryStore::new(Capabilities::default()),
+            inner,
             wrong_bytes: AtomicBool::new(false),
             fail_get: AtomicBool::new(false),
             fail_delete: AtomicBool::new(false),
         }
-    }
-
-    async fn held(&self) -> usize {
-        let all = KeyPrefix::new("").unwrap();
-        let page = self
-            .inner
-            .list(&all, None, PageSize::new(100).unwrap())
-            .await;
-        page.unwrap().objects.len()
     }
 }
 
@@ -165,13 +122,110 @@ impl ObjectStore for Tampered {
     }
 }
 
+/// Catches a probe that leaves its object behind (mutant: the delete is skipped) and
+/// one that writes anywhere but under `.kbf-probe/` (mutant: the key drops `PROBE_DIR`).
+#[tokio::test]
+async fn a_working_key_pair_passes_and_leaves_nothing() {
+    let fake = guarded().await;
+    let store = Tampered::over(store(&fake, "AKIAOK", "right-secret"));
+    probe(&store, &root(), "n-1")
+        .await
+        .expect("a probe on the right keys");
+    assert_eq!(
+        fake.keys(),
+        Vec::<String>::new(),
+        "the probe object is gone"
+    );
+    let key = format!("/kbf-fake/{ROOT}{PROBE_DIR}n-1?");
+    assert_eq!(
+        fake.requests(),
+        [
+            format!("PUT {key}"),
+            format!("GET {key}"),
+            format!("DELETE {key}")
+        ],
+        "one write, one read, one delete, all under the probe directory"
+    );
+    assert_eq!(
+        fake.regions(),
+        ["us-east-1"],
+        "signed in the store's region"
+    );
+}
+
+/// Catches a fake that refuses a correctly signed request with a query string (mutant:
+/// the query is signed as it arrived, escapes and all, so the signature differs): a
+/// listing, which carries `list-type`, `prefix` and `max-keys`, is not answered 403.
+#[tokio::test]
+async fn a_signed_request_with_a_query_is_not_refused() {
+    let fake = guarded().await;
+    let store = store(&fake, "AKIAOK", "right-secret");
+    let page = PageSize::new(10).unwrap();
+    let listed = store.list(&root(), None, page).await;
+    if let Err(ObjectStoreError::Service { status, .. }) = listed {
+        assert_ne!(status, 403, "the signature of a request with a query");
+    }
+    assert!(
+        fake.requests().iter().any(|r| r.contains("list-type=2")),
+        "{:?}",
+        fake.requests()
+    );
+}
+
+/// Catches a fake that serves a request nobody signed or whose `Authorization` it cannot
+/// read, once it was told which key pair to accept (mutant: `signed_with` true for a
+/// missing or unreadable header): each is refused 403. (Here, not in the fake's own unit
+/// tests: the coverage ratchet counts the best single copy of `signed_with`, and the copy
+/// the integration tests share has to run its refusals as well as its acceptance.)
+#[tokio::test]
+async fn a_request_with_no_readable_signature_is_refused_when_a_key_pair_is_required() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let fake = guarded().await;
+    let addr = fake.endpoint().trim_start_matches("http://").to_owned();
+    let status = |head: String| {
+        let addr = addr.clone();
+        async move {
+            let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            sock.write_all(head.as_bytes()).await.expect("write");
+            let mut answer = vec![0u8; 64];
+            let n = sock.read(&mut answer).await.expect("read");
+            String::from_utf8_lossy(&answer[..n]).into_owned()
+        }
+    };
+    let line =
+        |extra: &str| format!("GET /bkt/k HTTP/1.1\r\nhost: x\r\nrange: bytes=0-1\r\n{extra}\r\n");
+    for extra in [
+        "",
+        "authorization: nonsense\r\n",
+        "authorization: AWS4-HMAC-SHA256 Credential=AKIAOK/20260101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=00\r\n",
+    ] {
+        let answer = status(line(extra)).await;
+        assert!(answer.starts_with("HTTP/1.1 403"), "{extra:?}: {answer}");
+    }
+}
+
+/// Catches a probe that treats a refused write as success (mutant: the put error is
+/// dropped) and a fake that accepts any signature (mutant: `signed_with` returns true):
+/// a wrong secret and a wrong key id both fail at the write and write nothing.
+#[tokio::test]
+async fn a_wrong_key_pair_fails_at_the_write() {
+    let fake = guarded().await;
+    for (id, secret) in [("AKIAOK", "wrong-secret"), ("AKIAXX", "right-secret")] {
+        let store = Tampered::over(store(&fake, id, secret));
+        let failed = probe(&store, &root(), "n-2").await;
+        assert_eq!(failed, Err(ProbeStep::Put), "{id}");
+    }
+    assert!(fake.keys().is_empty());
+}
+
 /// Catches a probe that trusts a read that returns other bytes than were written
 /// (mutant: the comparison is dropped), and one that gives up on a failed read without
 /// deleting (mutant: `?` on the read before the delete).
 #[tokio::test]
 async fn a_read_that_fails_or_differs_fails_the_probe_and_still_cleans_up() {
     for (wrong, fails) in [(true, false), (false, true)] {
-        let store = Tampered::new();
+        let fake = guarded().await;
+        let store = Tampered::over(store(&fake, "AKIAOK", "right-secret"));
         store.wrong_bytes.store(wrong, Ordering::SeqCst);
         store.fail_get.store(fails, Ordering::SeqCst);
         assert_eq!(
@@ -179,7 +233,7 @@ async fn a_read_that_fails_or_differs_fails_the_probe_and_still_cleans_up() {
             Err(ProbeStep::Get),
             "wrong bytes {wrong}, failing read {fails}"
         );
-        assert_eq!(store.held().await, 0, "the object was deleted anyway");
+        assert!(fake.keys().is_empty(), "the object was deleted anyway");
     }
 }
 
@@ -187,11 +241,12 @@ async fn a_read_that_fails_or_differs_fails_the_probe_and_still_cleans_up() {
 /// result is ignored): the step names the delete.
 #[tokio::test]
 async fn a_delete_that_fails_fails_the_probe() {
-    let store = Tampered::new();
+    let fake = guarded().await;
+    let store = Tampered::over(store(&fake, "AKIAOK", "right-secret"));
     store.fail_delete.store(true, Ordering::SeqCst);
     assert_eq!(probe(&store, &root(), "n-4").await, Err(ProbeStep::Delete));
     assert_eq!(
-        store.held().await,
+        fake.keys().len(),
         1,
         "the object stays and the probe says so"
     );
@@ -201,12 +256,13 @@ async fn a_delete_that_fails_fails_the_probe() {
 /// that is not a key gives the `Key` step, and nothing is written.
 #[tokio::test]
 async fn a_nonce_that_is_not_a_key_is_refused_before_any_write() {
-    let store = Tampered::new();
+    let fake = guarded().await;
+    let store = Tampered::over(store(&fake, "AKIAOK", "right-secret"));
     assert_eq!(
         probe(&store, &root(), "a b/../c").await,
         Err(ProbeStep::Key)
     );
-    assert_eq!(store.held().await, 0);
+    assert!(fake.requests().is_empty());
 }
 
 /// The text of each step names the step and no more.
@@ -224,4 +280,5 @@ fn each_step_has_its_own_text() {
     sorted.sort();
     sorted.dedup();
     assert_eq!(sorted.len(), 4, "{texts:?}");
+    assert!(texts.iter().all(|text| !text.contains("SENTINEL")));
 }

@@ -6,7 +6,10 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use kbf_objstore::{Capabilities, MemoryStore};
+use kbf_objstore::s3::fake::FakeS3;
+use kbf_objstore::{ByteRange, Capabilities, MemoryStore, ObjectKey};
+use kbf_proto::kbf::enroll::v1::GetStoreConfigRequest;
+use kbf_proto::kbf::enroll::v1::cold_store_server::{ColdStore, ColdStoreServer};
 use tokio::time::Instant;
 use tonic::codegen::http::Uri;
 use tonic::transport::Endpoint;
@@ -138,6 +141,13 @@ fn doubling(failures: u32) -> Duration {
     Duration::from_secs(1 << failures)
 }
 
+fn answer(generation: u64) -> GetStoreConfigResponse {
+    GetStoreConfigResponse {
+        generation,
+        config: None,
+    }
+}
+
 /// Catches a fetch that hammers a frontend that is down (mutant: no sleep between
 /// tries: every gap is zero), one that tries the wrong number of times (mutants: one too
 /// few or too many), and one that forgets how many tries it has had (the waits double
@@ -146,18 +156,18 @@ fn doubling(failures: u32) -> Duration {
 async fn a_fetch_waits_between_tries_and_stops_when_the_tries_are_spent() {
     let at = Arc::new(Mutex::new(Vec::<Instant>::new()));
     let seen = Arc::clone(&at);
-    let answer: Result<(), Status> = fetch_with(
-        || {
+    let got = fetch_with(
+        &mut || {
             seen.lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(Instant::now());
-            async { Err(Status::unavailable("down")) }
+            Box::pin(async { Err(Status::unavailable("down")) })
         },
-        doubling,
+        &doubling,
         Some(4),
     )
     .await;
-    assert_eq!(answer.expect_err("spent").code(), Code::Unavailable);
+    assert_eq!(got.expect_err("spent").code(), Code::Unavailable);
     let at = at.lock().unwrap_or_else(PoisonError::into_inner).clone();
     let gaps: Vec<Duration> = at.windows(2).map(|w| w[1] - w[0]).collect();
     assert_eq!(
@@ -175,16 +185,16 @@ async fn a_refusal_ends_the_fetch_at_once() {
     let calls = Arc::new(Mutex::new(0_u32));
     let counted = Arc::clone(&calls);
     let before = Instant::now();
-    let answer: Result<(), Status> = fetch_with(
-        || {
+    let got = fetch_with(
+        &mut || {
             *counted.lock().unwrap_or_else(PoisonError::into_inner) += 1;
-            async { Err(Status::permission_denied("no")) }
+            Box::pin(async { Err(Status::permission_denied("no")) })
         },
-        doubling,
+        &doubling,
         None,
     )
     .await;
-    assert_eq!(answer.expect_err("refused").code(), Code::PermissionDenied);
+    assert_eq!(got.expect_err("refused").code(), Code::PermissionDenied);
     assert_eq!(*calls.lock().unwrap_or_else(PoisonError::into_inner), 1);
     assert_eq!(Instant::now(), before);
 }
@@ -196,24 +206,24 @@ async fn a_refusal_ends_the_fetch_at_once() {
 async fn a_fetch_with_no_limit_goes_on_until_the_frontend_answers() {
     let calls = Arc::new(Mutex::new(0_u32));
     let counted = Arc::clone(&calls);
-    let answer = fetch_with(
-        || {
+    let got = fetch_with(
+        &mut || {
             let mut calls = counted.lock().unwrap_or_else(PoisonError::into_inner);
             *calls += 1;
             let ready = *calls > 9;
-            async move {
+            Box::pin(async move {
                 if ready {
-                    Ok(42)
+                    Ok(answer(42))
                 } else {
                     Err(Status::unavailable("down"))
                 }
-            }
+            })
         },
-        |_| Duration::from_secs(1),
+        &|_| Duration::from_secs(1),
         None,
     )
     .await;
-    assert_eq!(answer.expect("answered"), 42);
+    assert_eq!(got.expect("answered").generation, 42);
     assert_eq!(*calls.lock().unwrap_or_else(PoisonError::into_inner), 10);
 }
 
@@ -418,4 +428,245 @@ async fn a_directory_store_is_never_a_registration() {
             .unwrap_or_else(PoisonError::into_inner)
             .is_empty()
     );
+}
+
+/// Catches registered keys that cannot be built into a store being called a failed probe
+/// (mutant: `Config` mapped to `Probe`), a store address the client refuses (https) or a
+/// prefix that is not a key passing as usable, and the refusal a node with no key pair
+/// of its own is given changing with the reason.
+#[tokio::test]
+async fn a_store_that_cannot_be_built_is_its_own_reason() {
+    let flag = flag();
+    for (bad, what) in [
+        (
+            config("bkt", "kbf/", "https://s3.example"),
+            "an https endpoint",
+        ),
+        (
+            config("bkt", "kb f/", "http://127.0.0.1:9"),
+            "a prefix that is not a key",
+        ),
+    ] {
+        let got = registered_store(&flag, &bad, "n-1").await;
+        assert!(matches!(got, Err(Unusable::Config)), "{what}: {got:?}");
+    }
+    assert!(matches!(
+        refusal(Unusable::Config),
+        ColdApplyError::Unusable
+    ));
+    assert!(matches!(
+        refusal(Unusable::Probe(ProbeStep::Get)),
+        ColdApplyError::Probe(ProbeStep::Get)
+    ));
+}
+
+/// A frontend's `ColdStore` that answers what a test says, over loopback plain text (the
+/// real service refuses plain text; the node's call does not care who answers).
+struct Canned(Result<GetStoreConfigResponse, Code>);
+
+#[tonic::async_trait]
+impl ColdStore for Canned {
+    async fn get_store_config(
+        &self,
+        _: tonic::Request<GetStoreConfigRequest>,
+    ) -> Result<tonic::Response<GetStoreConfigResponse>, Status> {
+        match &self.0 {
+            Ok(reply) => Ok(tonic::Response::new(GetStoreConfigResponse {
+                generation: reply.generation,
+                config: reply.config.clone(),
+            })),
+            Err(code) => Err(Status::new(*code, "canned")),
+        }
+    }
+}
+
+/// A joiner whose frontend answers `reply` to every fetch.
+async fn answering(reply: Result<GetStoreConfigResponse, Code>) -> Joiner {
+    let incoming =
+        tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().expect("addr"))
+            .expect("bind");
+    let addr = incoming.local_addr().expect("addr");
+    let server = tonic::transport::Server::builder()
+        .add_service(ColdStoreServer::new(Canned(reply)))
+        .serve_with_incoming(incoming);
+    tokio::spawn(server);
+    let channel = Endpoint::from_shared(format!("http://{addr}"))
+        .expect("endpoint")
+        .connect_lazy();
+    let who = Identity {
+        instance_id: "node".to_owned(),
+        addr: "192.0.2.1:8982".to_owned(),
+        zone: String::new(),
+        weight: 1,
+    };
+    Joiner::new(channel, who, RETRY_BASE)
+}
+
+const ID: &str = "AKIAOK";
+const SECRET: &str = "right-secret";
+
+/// The registered store of generation `generation` on `s3`, with this key pair.
+fn registered(s3: &FakeS3, generation: u64, secret: &str) -> GetStoreConfigResponse {
+    GetStoreConfigResponse {
+        generation,
+        config: Some(StoreConfig {
+            connection: "main".to_owned(),
+            role: "cold".to_owned(),
+            endpoint: s3.endpoint().to_owned(),
+            region: "us-east-1".to_owned(),
+            bucket: "bkt".to_owned(),
+            prefix: "kbf/".to_owned(),
+            conditional_put: true,
+            min_put_rate: 0,
+            access_key_id: ID.to_owned(),
+            secret_access_key: secret.to_owned(),
+            secret_version: generation,
+        }),
+    }
+}
+
+/// The node's flag: the store of the fake, and `keys` of its own or none.
+fn flagged(s3: &FakeS3, keys: bool) -> Registrable {
+    let flag = uri("bkt", "kbf/", s3.endpoint());
+    Registrable::new(&flag, if keys { own } else { no_keys }).expect("a store")
+}
+
+fn own(name: &str) -> Option<String> {
+    Some(format!("own-{name}"))
+}
+
+async fn s3() -> FakeS3 {
+    let s3 = FakeS3::start().await;
+    s3.require_credentials(ID, SECRET);
+    s3
+}
+
+/// Whether the store takes a write signed with the registered pair (and so is the
+/// registered store, not the node's own, whose pair the service refuses).
+async fn takes_registered_writes(store: &S3Store, name: &str) -> bool {
+    let key = ObjectKey::new(format!("kbf/cas/{name}")).expect("a key");
+    let range = ByteRange::new(0, 1).expect("a range");
+    store
+        .put_new(&key, bytes::Bytes::from_static(b"x"), None)
+        .await
+        .is_ok()
+        && store.get_range(&key, range).await.is_ok()
+}
+
+/// Catches a node that opens its cache on the registered keys without having probed
+/// them (mutant: the probe left out of `registered_store`), reports a generation other
+/// than the snapshot's (mutant: the announced one), or keeps its own store (mutant:
+/// `registered` returns `self.own`): the returned store takes writes signed with the
+/// registered pair and the node says it runs on it.
+#[tokio::test]
+async fn registered_keys_that_pass_the_probe_are_the_store_the_node_runs_on() {
+    let s3 = s3().await;
+    let joiner = answering(Ok(registered(&s3, 7, SECRET))).await;
+    for keys in [false, true] {
+        let (store, applied) = flagged(&s3, keys)
+            .registered(&joiner, &joined(6))
+            .await
+            .expect("opens on the registration");
+        assert_eq!(applied.for_beat(7), (7, ApplyStatus::Ok), "own keys {keys}");
+        assert!(
+            takes_registered_writes(&store, &format!("keys-{keys}")).await,
+            "own keys {keys}"
+        );
+    }
+}
+
+/// Catches keys that fail the probe being used or reported ok (mutant: the failure arm
+/// returns the registered store; `Applied::running`): a node with a pair of its own keeps
+/// that store, which the service refuses here, and says `probe_failed` with nothing
+/// applied; one without ends with the probe's step.
+#[tokio::test]
+async fn registered_keys_that_fail_the_probe_leave_the_node_on_its_own_or_stop_it() {
+    let s3 = s3().await;
+    let joiner = answering(Ok(registered(&s3, 7, "wrong-secret"))).await;
+    let (store, applied) = flagged(&s3, true)
+        .registered(&joiner, &joined(7))
+        .await
+        .expect("keeps its own store");
+    assert_eq!(applied.for_beat(7), (0, ApplyStatus::ProbeFailed));
+    assert!(
+        !takes_registered_writes(&store, "own").await,
+        "the node's own pair is refused here"
+    );
+    let Err(error) = flagged(&s3, false).registered(&joiner, &joined(7)).await else {
+        panic!("a node with nothing that works starts");
+    };
+    assert!(matches!(
+        error.downcast_ref::<ColdApplyError>(),
+        Some(ColdApplyError::Probe(ProbeStep::Put))
+    ));
+}
+
+/// Catches a registration for another store being opened (mutant: `same_store` true):
+/// the node keeps its flag's store, says `identity_mismatch`, and with no pair of its own
+/// has nothing to run on.
+#[tokio::test]
+async fn a_registration_for_another_bucket_leaves_the_node_on_its_flag_or_stops_it() {
+    let s3 = s3().await;
+    let mut other = registered(&s3, 7, SECRET);
+    other.config.as_mut().expect("a config").bucket = "other".to_owned();
+    let joiner = answering(Ok(other)).await;
+    let (_store, applied) = flagged(&s3, true)
+        .registered(&joiner, &joined(7))
+        .await
+        .expect("keeps its flag's store");
+    assert_eq!(applied.for_beat(7), (0, ApplyStatus::IdentityMismatch));
+    let Err(error) = flagged(&s3, false).registered(&joiner, &joined(7)).await else {
+        panic!("a node with nothing to run on starts");
+    };
+    assert!(matches!(
+        error.downcast_ref::<ColdApplyError>(),
+        Some(ColdApplyError::MismatchNoKeys)
+    ));
+    assert!(
+        s3.requests().is_empty(),
+        "the other store was never touched"
+    );
+}
+
+/// Catches a registration taken back before the fetch being treated as one (mutant: the
+/// empty answer opens the registered store): the node runs on its flags and says it
+/// applied none of the announced generation; with no pair of its own it says which
+/// variable is missing.
+#[tokio::test]
+async fn a_registration_taken_back_leaves_the_node_on_its_flag_or_stops_it() {
+    let s3 = s3().await;
+    let joiner = answering(Ok(answer(0))).await;
+    let (_store, applied) = flagged(&s3, true)
+        .registered(&joiner, &joined(7))
+        .await
+        .expect("keeps its flag's store");
+    assert_eq!(applied.for_beat(7), (0, ApplyStatus::Pending));
+    let Err(error) = flagged(&s3, false).registered(&joiner, &joined(7)).await else {
+        panic!("a node with nothing starts");
+    };
+    assert!(matches!(
+        error.downcast_ref::<ColdApplyError>(),
+        Some(ColdApplyError::MissingKeys("AWS_ACCESS_KEY_ID"))
+    ));
+}
+
+/// Catches a node denied by the frontend retrying for ever, or starting as if it had the
+/// registration (mutant: a refusal treated as a retry): with a pair of its own it starts
+/// on that and says `pending`; without one the refusal ends the start.
+#[tokio::test]
+async fn a_frontend_that_refuses_the_node_leaves_it_on_its_own_keys_or_stops_it() {
+    let s3 = s3().await;
+    let joiner = answering(Err(Code::PermissionDenied)).await;
+    let (_store, applied) = flagged(&s3, true)
+        .registered(&joiner, &joined(7))
+        .await
+        .expect("keeps its flag's store");
+    assert_eq!(applied.for_beat(7), (0, ApplyStatus::Pending));
+    let Err(error) = flagged(&s3, false).registered(&joiner, &joined(7)).await else {
+        panic!("a refused node with nothing starts");
+    };
+    assert!(matches!(
+        error.downcast_ref::<ColdApplyError>(),
+        Some(ColdApplyError::Refused(Code::PermissionDenied))
+    ));
 }

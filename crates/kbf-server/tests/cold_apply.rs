@@ -371,3 +371,57 @@ fn scan(dir: &Path, needle: &[u8], found: &mut Vec<PathBuf>) {
         }
     }
 }
+
+/// Catches a registered region that is not the one the requests are signed in (mutant:
+/// the flag's region always used), and an empty one that is used as it is (mutant: the
+/// fallback to the flag's region removed): the registration names `eu-west-1` and the
+/// service sees only that; a registration with no region leaves the flag's `us-east-1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_registered_region_signs_and_an_empty_one_takes_the_flags() {
+    for (region, signed_in) in [("eu-west-1", "eu-west-1"), ("", "us-east-1")] {
+        let rig = rig(3, |s3| {
+            let mut config = registered(s3, "bkt", ID, SECRET);
+            config.region = region.to_owned();
+            config
+        })
+        .await;
+        let half = started(&flags(&rig, "region", &bucket(&rig), no_keys))
+            .await
+            .expect("starts on the registration");
+        round_trip(&half, "written in the registered region").await;
+        assert_eq!(
+            rig.s3.regions(),
+            [signed_in],
+            "registered region {region:?}"
+        );
+    }
+}
+
+/// Catches a node that fails, or claims a generation, when the registration is taken back
+/// between the frontend's announcement and the fetch (mutant: the empty answer treated as
+/// a registration): with a key pair of its own it runs on that and says the announced
+/// generation is pending (it applied none of it); with none it says which variable is
+/// missing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registration_taken_back_before_the_fetch_leaves_the_node_on_its_own_keys() {
+    let rig = rig(9, |s3| registered(s3, "bkt", ID, SECRET)).await;
+    rig.source.take_back();
+    let half = started(&flags(&rig, "taken-back", &bucket(&rig), own_keys))
+        .await
+        .expect("starts on its own store");
+    round_trip(&half, "written on the node's own keys").await;
+    let _serving = tokio::spawn(half.serve());
+    let got = reported(&rig, 9).await;
+    assert_eq!(got.nodes[0].applied_generation, Some(0));
+    // The frontend still announces 9 and the node runs on none of it: pending, not ok.
+    assert_eq!(reported_status(&rig, 1), Some(2));
+    assert!(rig.s3.requests().iter().all(|r| !r.contains(".kbf-probe")));
+
+    let Err(error) = started(&flags(&rig, "taken-back-none", &bucket(&rig), no_keys)).await else {
+        panic!("a node with nothing starts");
+    };
+    assert!(matches!(
+        error.downcast_ref::<ColdApplyError>(),
+        Some(ColdApplyError::MissingKeys("AWS_ACCESS_KEY_ID"))
+    ));
+}

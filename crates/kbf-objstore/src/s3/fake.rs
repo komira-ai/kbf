@@ -153,6 +153,8 @@ struct State {
     requests: Vec<String>,
     /// The only key pair a request may be signed with, when a test set one.
     credentials: Option<(String, String)>,
+    /// The signing regions of the requests so far.
+    regions: std::collections::BTreeSet<String>,
 }
 
 /// An S3 service on loopback (module docs). It serves until the runtime it was
@@ -219,6 +221,12 @@ impl FakeS3 {
     /// makes, recomputed here over the request as received.
     pub fn require_credentials(&self, access_key_id: &str, secret_access_key: &str) {
         self.lock().credentials = Some((access_key_id.to_owned(), secret_access_key.to_owned()));
+    }
+
+    /// The signing regions the requests so far named, sorted.
+    #[must_use]
+    pub fn regions(&self) -> Vec<String> {
+        self.lock().regions.iter().cloned().collect()
     }
 
     /// Every object key held, in order.
@@ -358,6 +366,13 @@ fn handle(state: &mut State, request: &Request) -> Vec<u8> {
         .collect();
     let line = format!("{} {}?{}", request.method, request.path, query.join("&"));
     state.requests.push(line);
+    let signed_region = request
+        .headers
+        .get("authorization")
+        .and_then(|authorization| credential_region(authorization));
+    if let Some(region) = signed_region {
+        state.regions.insert(region.to_owned());
+    }
     let body_len = request.body.len() as u64;
     state.stats.largest_body = state.stats.largest_body.max(body_len);
     // `/bucket/key`: the key is everything after the bucket.
@@ -432,6 +447,12 @@ fn handle(state: &mut State, request: &Request) -> Vec<u8> {
     }
 }
 
+/// The region in `AWS4-HMAC-SHA256 Credential=<id>/<date>/<region>/s3/aws4_request, ..`.
+fn credential_region(authorization: &str) -> Option<&str> {
+    let scope = authorization.split("Credential=").nth(1)?;
+    scope.split('/').nth(2)
+}
+
 /// Whether `request` carries the `Authorization` that `access_key_id` and
 /// `secret_access_key` make for it: the signature is computed again from the request as
 /// received, with the signer the store signs with.
@@ -440,11 +461,7 @@ fn signed_with(request: &Request, access_key_id: &str, secret_access_key: &str) 
     let Some(authorization) = header("authorization") else {
         return false;
     };
-    // `AWS4-HMAC-SHA256 Credential=<id>/<date>/<region>/s3/aws4_request, SignedHeaders=..`
-    let region = authorization
-        .split("Credential=")
-        .nth(1)
-        .and_then(|rest| rest.split('/').nth(2));
+    let region = credential_region(authorization);
     let signed_names = authorization
         .split("SignedHeaders=")
         .nth(1)
