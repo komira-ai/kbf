@@ -16,9 +16,10 @@ use kbf_installer::release;
 use kbf_installer::run::SystemRunner;
 use kbf_installer::settings::Settings;
 use kbf_installer::stage::{Context, Limits, stage_from_inbox};
+use kbf_installer::version;
 
 #[derive(Parser)]
-#[command(name = "kbf-installer", version)]
+#[command(name = "kbf-installer", version = version::VERSION)]
 struct Cli {
     /// The directory the host's paths are under (for a rehearsal; a host's is `/`).
     #[arg(long, global = true, default_value = "/")]
@@ -142,6 +143,13 @@ fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    // `--version --json` is answered before the command line is parsed: it is not a verb's
+    // flag (`--version` ends clap's parse by itself).
+    let args: Vec<_> = std::env::args_os().collect();
+    if version::asked(&args) {
+        print!("{}", version::line());
+        return ExitCode::SUCCESS;
+    }
     let cli = Cli::parse();
     let result = match cli.verb {
         Verb::Run(args) => run(cli.root, args),

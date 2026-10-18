@@ -19,7 +19,8 @@
 //!   named by.
 //!
 //! The root helper of the pull-based updates is [`helper`], run by the `kbf-installer`
-//! binary (`run`, `boot-check`).
+//! binary (`run`, `boot-check`). The binary says what it is in [`version`]: `--version`
+//! and `--version --json` name the commit and the profile it was built with.
 //!
 //! The offline check ([`stage::stage_from_inbox`] runs them in the order that matters,
 //! documented there):
@@ -62,6 +63,7 @@ pub mod state;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod trust;
+pub mod version;
 
 use std::fmt;
 
