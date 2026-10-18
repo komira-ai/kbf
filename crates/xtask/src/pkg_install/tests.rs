@@ -20,6 +20,7 @@ enum Defect {
     UnitActive,
     UserWithShell,
     UnitNamesMissingUser,
+    UnitNamesMissingGroup,
     DirNotMade,
     GateIgnored,
     GateRunsWithoutFile,
@@ -83,6 +84,7 @@ fn entries() -> Vec<Entry> {
     vec![
         entry_file("/usr/bin/kbf-installer", 0o755, "binary"),
         entry_file("/usr/lib/systemd/system/kbf-node.service", 0o644, "node"),
+        entry_file("/usr/lib/systemd/system/kbf.slice", 0o644, "slice"),
         entry_dir("/usr/share/kbf-installer"),
     ]
 }
@@ -162,7 +164,7 @@ impl World {
                 };
                 ok(&format!("{sha}  {path}\n"))
             }
-            ["systemctl", "list-unit-files", ..] => self.unit_files(),
+            ["systemctl", "list-unit-files", pattern, ..] => self.unit_files(pattern),
             ["systemctl", "list-units", ..] => ok(if self.is(Defect::UnitActive) {
                 "kbf-node.service loaded active running\n"
             } else {
@@ -177,13 +179,16 @@ impl World {
                 self.users_made = true;
                 ok("")
             }
-            ["cat", path] if path.ends_with(".service") => ok(if self.is(Defect::UnitNamesMissingUser) {
-                "[Service]\nUser=kbf-ghost\n"
-            } else {
-                "[Service]\nUser=kbf-server\nGroup=kbf\n"
-            }),
-            ["getent", "passwd", user] => self.getent(user),
-            ["getent", "group", group] => self.getent(group),
+            ["cat", path] if path.ends_with(".service") => {
+                ok(if self.is(Defect::UnitNamesMissingUser) {
+                    "[Service]\nUser=kbf-ghost\n"
+                } else if self.is(Defect::UnitNamesMissingGroup) {
+                    "[Service]\nUser=kbf-server\nGroup=kbf-ghostgroup\n"
+                } else {
+                    "[Service]\nUser=kbf-server\nGroup=kbf-builders\n"
+                })
+            }
+            ["getent", database @ ("passwd" | "group"), name] => self.getent(database, name),
             ["rm", "-f", path] => {
                 self.files.remove(*path);
                 ok("")
@@ -276,16 +281,39 @@ impl World {
         }
     }
 
-    fn unit_files(&self) -> Out {
+    /// `systemctl list-unit-files <pattern>`: the packaged units the glob matches (a
+    /// single `*`, as systemd takes it). A service is disabled; the slice has no
+    /// `[Install]`, so it is static.
+    fn unit_files(&self, pattern: &str) -> Out {
         if self.is(Defect::UnitMissing) {
             return ok("");
         }
-        let state = if self.is(Defect::UnitEnabled) {
-            "enabled"
-        } else {
-            "disabled"
-        };
-        ok(&format!("kbf-node.service     {state} enabled\n"))
+        let (head, tail) = pattern.split_once('*').unwrap_or((pattern, ""));
+        let mut text = String::new();
+        for e in &self.entries {
+            let Some(unit) = e
+                .dst
+                .strip_prefix(pkg::UNIT_DIR)
+                .and_then(|u| u.strip_prefix('/'))
+            else {
+                continue;
+            };
+            let globbed = unit.len() >= head.len() + tail.len()
+                && unit.starts_with(head)
+                && unit.ends_with(tail);
+            if !globbed {
+                continue;
+            }
+            let state = if unit.ends_with(".slice") {
+                "static"
+            } else if self.is(Defect::UnitEnabled) {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            text.push_str(&format!("{unit}     {state} -\n"));
+        }
+        ok(&text)
     }
 
     fn show(&self, unit: &str) -> Out {
@@ -309,19 +337,29 @@ impl World {
         ))
     }
 
-    fn getent(&self, user: &str) -> Out {
+    /// `getent <database> <name>`: the accounts sysusers makes are in `passwd` (the
+    /// groups are `kbf` and `kbf-builders`, which are not accounts, and no account is a
+    /// group), so a lookup in the wrong database finds nothing.
+    fn getent(&self, database: &str, name: &str) -> Out {
         if !self.users_made {
             return fail("");
         }
-        if user == "kbf-ghost" {
+        if database == "group" {
+            return if matches!(name, "kbf" | "kbf-builders") {
+                ok(&format!("{name}:x:999:\n"))
+            } else {
+                fail("")
+            };
+        }
+        if !pkg::USERS.contains(&name) {
             return fail("");
         }
-        let shell = if self.is(Defect::UserWithShell) && user == "kbf-verify" {
+        let shell = if self.is(Defect::UserWithShell) && name == "kbf-verify" {
             "/opt/shell"
         } else {
             "/usr/sbin/nologin"
         };
-        ok(&format!("{user}:x:999:999:{user}:/nonexistent:{shell}\n"))
+        ok(&format!("{name}:x:999:999:{name}:/nonexistent:{shell}\n"))
     }
 }
 
@@ -390,7 +428,7 @@ fn a_package_that_does_everything_the_contract_says_passes_in_both_formats() {
 
 #[test]
 fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
-    let cases: [(Format, Defect, &str); 18] = [
+    let cases: [(Format, Defect, &str); 19] = [
         (
             Format::Deb,
             Defect::NotInstalled,
@@ -442,6 +480,11 @@ fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
             Format::Deb,
             Defect::UnitNamesMissingUser,
             "/usr/lib/systemd/system/kbf-node.service names User=kbf-ghost, which does not exist",
+        ),
+        (
+            Format::Deb,
+            Defect::UnitNamesMissingGroup,
+            "/usr/lib/systemd/system/kbf-node.service names Group=kbf-ghostgroup, which does not exist",
         ),
         (Format::Deb, Defect::DirNotMade, "/run/kbf-installer"),
         (

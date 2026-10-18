@@ -332,7 +332,8 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
     for e in entries {
         entry(c, e, &mut problems)?;
     }
-    let known = c.say(&["systemctl", "list-unit-files", "kbf-*", "--no-legend"])?;
+    // `kbf*`, not `kbf-*`: the slice is `kbf.slice`, which the hyphen glob does not match.
+    let known = c.say(&["systemctl", "list-unit-files", "kbf*", "--no-legend"])?;
     let states: BTreeMap<&str, &str> = known
         .lines()
         .filter_map(|l| l.split_once(' '))
@@ -389,13 +390,21 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
         for (key, name) in pkg::unit_accounts(&c.say(&["cat", &e.dst])?) {
             let database = if key == "User" { "passwd" } else { "group" };
             if !c.ok(&["getent", database, &name])? {
-                problems.push(format!("{} names {key}={name}, which does not exist", e.dst));
+                problems.push(format!(
+                    "{} names {key}={name}, which does not exist",
+                    e.dst
+                ));
             }
         }
     }
     for (path, mode) in pkg::TMPFILES_DIRS {
         let got = c.say(&["stat", "-c", "%U:%G:%a:%F", path])?;
-        eq(&mut problems, path, &got, &format!("root:root:{mode}:directory"));
+        eq(
+            &mut problems,
+            path,
+            &got,
+            &format!("root:root:{mode}:directory"),
+        );
     }
     for g in gates {
         gate(c, g, &mut problems)?;
