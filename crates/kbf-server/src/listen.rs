@@ -117,11 +117,16 @@ const BIND_WAIT_MAX: Duration = Duration::from_secs(2);
 /// (`AddrNotAvailable`) is retried for [`BIND_BUDGET`], every other error is at once the
 /// result. Blocks the thread while it waits: it runs at start-up, before serving.
 pub(crate) fn bind_std(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
+    bind_within(addr, BIND_BUDGET)
+}
+
+/// [`bind_std`] with the retry bounded by `budget` rather than [`BIND_BUDGET`].
+fn bind_within(addr: SocketAddr, budget: Duration) -> io::Result<std::net::TcpListener> {
     let mut sleep = |wait: Duration| {
         tracing::warn!(%addr, ?wait, "listen address not available yet, retrying the bind");
         std::thread::sleep(wait);
     };
-    retry_unavailable(BIND_BUDGET, &mut sleep, &mut || {
+    retry_unavailable(budget, &mut sleep, &mut || {
         std::net::TcpListener::bind(addr)
     })
 }
