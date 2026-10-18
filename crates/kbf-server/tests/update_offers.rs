@@ -288,8 +288,8 @@ async fn mac_node(front: &Frontend, name: &str, arch: &str) -> FakeDaemon {
 /// Catches an offer that is not sent after `Welcome`, one built from the wrong parts, and
 /// one the node's own client cannot take. The Linux release also holds a `kbf-daemon`
 /// tarball, which a Linux host must not be told about. The node is a real `kbf-update`
-/// client: it fetches the offered tarball through `ReleaseService.Fetch` on the worker
-/// listener into its inbox, and the status it then reports is what `/v1/update/hosts` and
+/// client: it takes the offer (it fetches nothing: the root installer pulls the release
+/// itself on an order), and the status it then reports is what `/v1/update/hosts` and
 /// `/v1/nodes` list.
 ///
 /// Mutants seen red: no offer after `Welcome`; every stored component offered, not the
@@ -318,37 +318,39 @@ async fn a_node_is_offered_the_desired_release_after_welcome_and_its_client_take
                 size: kbf.len() as u64,
                 attestation: attestation(A, "kbf"),
             }],
+            // The release facts are sent by the preflight, a later change.
+            ..UpdateOffer::default()
         }
     );
 
     let client_dir = front.dir.0.join("client");
-    let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", front.worker))
-        .expect("endpoint")
-        .connect_lazy();
     let config = kbf_update::Config::new(
         client_dir.clone(),
         "linux-x86_64".to_owned(),
         "0123456789ab".to_owned(),
     );
-    let (handle, worker) =
-        kbf_update::start(config, Arc::new(kbf_update::ReleaseClient::new(channel)))
-            .expect("the client starts");
+    let (handle, worker) = kbf_update::start(config).expect("the client starts");
     let running = tokio::spawn(worker.run());
-    handle.offer(kbf_update::Offer::from(offered));
+    // The server does not send the release facts yet; the client refuses an offer without
+    // them, so the test gives the client what a preflight will.
+    let complete = UpdateOffer {
+        protocol: 7,
+        min_protocol: 6,
+        state_schema: 3,
+        profile: "release".to_owned(),
+        ..offered
+    };
+    handle.offer(kbf_update::Offer::from(complete));
     let mut changes = handle.status();
-    let reported = tokio::time::timeout(
-        PROMPT,
-        changes.wait_for(|s| s.offered_generation == 1 && s.state != kbf_update::State::Fetching),
-    )
-    .await
-    .expect("the client settles in time")
-    .expect("the client runs")
-    .clone();
-    let staged = client_dir
-        .join("inbox")
-        .join(kbf_update::inbox::dir_name(1, A))
-        .join(format!("kbf-{A}-linux-x86_64.tar.gz"));
-    assert_eq!(std::fs::read(staged).expect("the fetched tarball"), kbf);
+    let reported = tokio::time::timeout(PROMPT, changes.wait_for(|s| s.offered_generation == 1))
+        .await
+        .expect("the client takes the offer in time")
+        .expect("the client runs")
+        .clone();
+    assert!(
+        !client_dir.join("inbox").exists(),
+        "no release bytes pass through the node"
+    );
 
     node.send(daemon_message::Message::UpdateStatus(
         kbf_proto::update::UpdateStatus::from(&reported),

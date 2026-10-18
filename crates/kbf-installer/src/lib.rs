@@ -22,11 +22,10 @@
 //! binary (`run`, `boot-check`). The binary says what it is in [`version`]: `--version`
 //! and `--version --json` name the commit and the profile it was built with.
 //!
-//! The offline check ([`stage::stage_from_inbox`] runs them in the order that matters,
-//! documented there):
+//! The offline checks of a release a fetch brought in:
 //!
-//! - [`inbox`] and [`offer`]: an entry the unprivileged process wrote, opened without
-//!   following a link, and the offer that names its files and their sha256.
+//! - [`spool`]: a directory the unprivileged process writes (the order spool), opened
+//!   without following a link, each file judged by its descriptor.
 //! - [`attest`]: `gh attestation verify`, pinned, offline, as an unprivileged user.
 //! - [`trust`] and [`settings`]: what the check believes without looking at its content
 //!   (`gh`, the trusted root, the host's settings) and the root-ownership check on it.
@@ -59,17 +58,15 @@ mod fixtures;
 #[cfg(any(test, feature = "testkit"))]
 pub mod golden;
 pub mod helper;
-pub mod inbox;
 pub mod installer_toml;
 pub mod layout;
-pub mod offer;
 pub mod proxy;
 pub mod record;
 pub mod refusal;
 pub mod release;
 pub mod run;
 pub mod settings;
-pub mod stage;
+pub mod spool;
 pub mod state;
 pub mod state_v2;
 pub mod status_v2;

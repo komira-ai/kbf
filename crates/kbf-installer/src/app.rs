@@ -2,7 +2,7 @@
 //! pull request builds say so (`not implemented (P<n>)`, exit 1) after the checks every verb
 //! shares (root, `--json`, `--apply`).
 //!
-//! `run` and `boot-check` are the helper's, folded in unchanged; `P5` replaces them.
+//! `run` and `boot-check` are the helper's; `P5` replaces them.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -16,11 +16,9 @@ use crate::cli::{BootArgs, Cli, RunArgs, Verb};
 use crate::exit::Exit;
 use crate::helper::cycle::{Config, Helper, HelperError};
 use crate::helper::restart::Restart;
+use crate::helper::{fetcher, leases};
 use crate::layout::{Layout, Platform};
-use crate::release::{self, ReleaseError};
-use crate::run::SystemRunner;
-use crate::settings::Settings;
-use crate::stage::{Context, Limits, stage_from_inbox};
+use crate::release::ReleaseError;
 
 /// Why a verb failed and the exit it ends with: `Failed`, or `NeedsOperator` when only an
 /// operator can go on (the state files are both unusable).
@@ -90,29 +88,24 @@ fn run(root: PathBuf, args: &RunArgs) -> Result<(), Failure> {
     };
     let cfg = Config {
         update_dir: args.update_dir.clone(),
+        orders_dir: args.orders_dir.clone(),
         restart,
         window_secs: args.window_secs,
         starts: args.starts,
     };
-    let mut helper = Helper::new(layout.clone(), exec, cfg);
-    let trust = HostExec::new(layout.root().clone());
-    let mut stager = move |exec: &mut HostExec, entry: &std::path::Path| {
-        let settings = Settings::load(&trust, &layout)?;
-        let mut ctx = Context {
-            host: &layout,
-            settings: &settings,
-            exec,
-            trust: &trust,
-            runner: &SystemRunner,
-            owner: release::ROOT,
-            limits: Limits::DEFAULT,
-        };
-        stage_from_inbox(&mut ctx, entry)
-    };
+    // The release fetcher and the lease source are wired by later changes; until then an
+    // activation of a release that is not installed, and every activation, is refused.
+    let mut helper = Helper::new(
+        layout,
+        exec,
+        cfg,
+        Box::new(fetcher::NotWired),
+        Box::new(leases::NotWired),
+    );
     helper.recover()?;
     let mut left = args.passes;
     while left != Some(0) {
-        helper.cycle(now(), &mut stager)?;
+        helper.cycle(now())?;
         helper.drain_log(&mut std::io::stderr());
         left = left.map(|n| n - 1);
         sleep(Duration::from_secs(args.interval_secs));

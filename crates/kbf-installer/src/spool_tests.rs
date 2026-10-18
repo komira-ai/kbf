@@ -18,17 +18,25 @@ fn refusal(r: Result<File, Refusal>) -> &'static str {
     r.expect_err("refused").code()
 }
 
-/// Both ways of opening beneath the entry are exercised on Linux, where `openat2` is
-/// (the production choice is `Beneath` there); macOS has no `openat2`, so only the way
-/// it uses is exercised there.
-#[cfg(target_os = "linux")]
-fn modes() -> Vec<OpenMode> {
-    vec![OpenMode::Beneath, OpenMode::NoFollow]
+/// The way the production code opens beneath the entry on this kernel: `openat2` where
+/// Linux has it, `O_NOFOLLOW` elsewhere. A test that forced `Beneath` on macOS would fail
+/// for want of `openat2`, not for what it tests.
+fn native() -> OpenMode {
+    if cfg!(target_os = "linux") {
+        OpenMode::Beneath
+    } else {
+        OpenMode::NoFollow
+    }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Both ways of opening beneath the entry are exercised on every kernel that has
+/// `openat2`; `NoFollow` alone elsewhere.
 fn modes() -> Vec<OpenMode> {
-    vec![OpenMode::NoFollow]
+    if cfg!(target_os = "linux") {
+        vec![OpenMode::Beneath, OpenMode::NoFollow]
+    } else {
+        vec![OpenMode::NoFollow]
+    }
 }
 
 /// Catches a regular file not read back whole: its content comes out by the descriptor.
@@ -102,7 +110,7 @@ fn a_file_the_stage_must_not_read_is_refused_by_its_kind() {
 /// kernel has no `openat2` the same calls fail for want of it.
 #[test]
 fn the_kernel_refuses_a_way_out_of_the_entry() {
-    let (dir, entry) = entry_with("inbox-beneath", OpenMode::Beneath);
+    let (dir, entry) = entry_with("inbox-beneath", native());
     fs::write(dir.join("secret"), b"not yours").expect("seed");
     symlink("../secret", dir.join("entry/link")).expect("link");
     assert!(open_beneath(&entry.dir, "../secret").is_err());
@@ -133,7 +141,7 @@ fn an_entry_that_is_a_link_or_not_a_directory_is_refused() {
 /// holding more than the most a stage takes refused before any is read.
 #[test]
 fn the_names_of_an_entry_are_listed_and_bounded() {
-    let (dir, entry) = entry_with("inbox-names", OpenMode::Beneath);
+    let (dir, entry) = entry_with("inbox-names", native());
     let e = dir.join("entry");
     assert!(entry.names().expect("lists").is_empty());
     fs::write(e.join("b"), b"1").expect("seed");
