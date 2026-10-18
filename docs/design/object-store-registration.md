@@ -2,7 +2,8 @@
 
 Status: proposed; accepted when merged. Every decision in section 4 is an **engineering default**
 that stands until the owner answers the question beside it (section 14). Nothing here is built:
-this page and [operator-verbs.md](operator-verbs.md) are the whole of the first change.
+this page and [operator-verbs.md](operator-verbs.md) are the whole of the first change. The
+drift guard of section 17 is deferred to its own change, not part of this one.
 
 Labels, as in the other design pages: **[F]** read in code on this branch, **[D]** a decision
 this page makes, **[V]** verify before building on it. A claim with none of them is a
@@ -36,7 +37,8 @@ Related: [operator-verbs.md](operator-verbs.md) (every operator verb and its rou
    `ColdStore.GetStoreConfig(have_generation)` on the worker listener, over its mutual TLS
    identity. The answer is one atomic snapshot and is the only place the secret crosses a wire.
 5. The node probes the store, opens it, and reports the generation it applied and a closed
-   status code on its next heartbeat. The frontend's acknowledgements live in memory only.
+   status code on its next heartbeat. The frontend keeps that acknowledgement as a short-TTL
+   row in the state store (section 6), so it survives a restart and a proxy switch.
 6. `GET /v1/object-stores` shows the desired state and whether every node that should have
    applied it has. It never claims convergence the frontend does not know.
 7. Keys are held in memory on the node. A node restarted while the frontend is down serves its
@@ -179,6 +181,16 @@ applied, unsupported, nodes: [{id, state, applied_generation, status, last_seen_
 - `objstore/gen`.
 - `objstore/audit/{seq}`: the outcome, the name, the generation, the time. No body field and
   no secret. The actor is "the API token"; no finer identity exists to record **[D]**.
+- `objstore/ack/{member}`: a node's applied generation and closed status, a short-TTL row
+  (15 s, refreshed by each heartbeat) written with compare-and-set. The unit D code
+  implements this; the plan had it in memory.
+
+**Schema rule (CEO ruling, section 18).** These are rows in the existing `kbf-state` key/row
+store: `objstore/conn`, `bind`, `gen`, `audit` and `ack` are key prefixes, not tables, and
+this work adds no table and no column. `kbf-installer` creates and migrates the schema; `kbf`
+creates or alters nothing at start and refuses a schema version it does not support. Should a
+unit truly need a schema change, it ships as a `kbf-installer` forward migration, expand-first,
+that the old frontend child running beside the new one tolerates, and the lead is told first.
 
 One atomic multi-key transaction per mutation covers the row, the generation bump and the
 audit row, compare-and-set on the generation. A PUT that changes nothing writes an audit row
@@ -206,12 +218,15 @@ not prove fsync durability, which only a power cut shows; this ADR does not clai
 failpoint mechanism, if it is a dependency or a feature, is named in the storage unit and
 cleared with `deny.toml` there.
 
-**Backups.** The secret is not in the state store, so `state-backup` carries no credentials.
-A filesystem backup of the host or the installer must exclude `<secrets dir>`; the operator
+**Backups.** The secret is not in the state store, so a backup of Postgres carries no
+credentials; the installer backs Postgres up, and this work adds no backup route or flag. A
+filesystem backup of the host or the installer must exclude `<secrets dir>`; the operator
 documentation names the exclusion, and the installer's backup list is checked for it **[V]**.
 
-**Acks** live in memory only, fed by heartbeats. A frontend restart empties them, so
-`converged` is false until nodes beat again: never a false converged.
+**Acks** are the `objstore/ack/{member}` rows above: short-TTL rows in the existing store,
+written by heartbeats with compare-and-set. They survive a frontend restart and a proxy switch
+to the other child, so a switch does not reset convergence. An expired row is "not heard from",
+so `converged` is false until the node beats again: never a false converged.
 
 ## 7. Delivery
 
@@ -226,7 +241,7 @@ documentation names the exclusion, and the installer's backup list is checked fo
   gets `PERMISSION_DENIED` on its next call even on a live session. With no enrollment
   (`None`) a denied node is still denied.
 - **Direction of a generation.** A node refetches on any generation that **differs** from the
-  one it holds, not only a higher one. A restored `state-backup` or a swapped state database
+  one it holds, not only a higher one. A restored Postgres backup or a swapped state database
   can lower `objstore/gen`, and a node that ignored the lower number would never converge. A
   snapshot also carries a store epoch **[D]**, so "lower" and "different" are told apart in
   logs.
@@ -240,10 +255,17 @@ documentation names the exclusion, and the installer's backup list is checked fo
   matches, the registration supplies the keys only.
 - **A bad credential** reaching a node reports `probe_failed`; a node that already had a store
   keeps it.
-- **No fence.** Old and new frontend children serve the API and `GetStoreConfig` at once; there
-  is no writer role to lose. Generation bumps are compare-and-set in Postgres, and a secret
+- **No fence.** The proxy forwards every stream to the active child, so registration writes and
+  `GetStoreConfig` reach that child only; the old child is read-only for scheduling and may
+  write its own metadata. There is no writer role to lose, and a child that is not active
+  holds no state the active one lacks. Generation bumps are compare-and-set in Postgres, and a secret
   file is written whole under a new versioned name, so a reader in the other child never sees
   a partial file.
+- **Who is calling.** The proxy terminates TLS and verifies mutual TLS, so a node's identity
+  (node id and role) may arrive from the proxy and not from the child's own TLS peer (#1095).
+  The per-call check above therefore sits behind one function, "who is calling", and nothing
+  else parses a peer certificate. Units D and E build to that rule, so #1095 swaps the source
+  in one place.
 - **A newer frontend.** The frontend updates first, so a node meets an N+1 frontend. The node
   ignores unknown fields in `GetStoreConfig` and heartbeat answers, and a generation or
   status it does not understand is reported (`unsupported`), never a crash.
@@ -294,7 +316,6 @@ Configuration is flags **[D]**. Names are defaults pending the code:
 - `--object-store-secrets-dir <path>` names the secrets directory. Setting it switches the
   feature on; without it every `/v1/object-stores/*` route answers 404 behind the gate. One
   flag, not a boolean beside a path that could disagree.
-- `--backup-dir <path>` names where `POST /v1/backups/state` writes (the verbs unit).
 
 The frontend handover compares enrollment flags between holder and successor (#1064). These
 flags join that comparison, and the successor must be able to read the secrets directory: a
@@ -305,14 +326,14 @@ handover whose successor lacks it is refused, tested.
 | Failure | Behaviour |
 |---|---|
 | node offline during a registration | `pending`, `converged: false`, with `last_seen_secs`; it reconciles at its next heartbeat; no frontend queue exists to lose |
-| frontend restart | rows are durable, acks are empty: `converged: false` until heartbeats repopulate |
+| frontend restart or proxy switch | rows and acks are durable (acks are short-TTL rows): `converged` stays right; an ack that expired reads as not heard from, so `converged: false` until the node beats |
 | frontend crash between file and row | an orphan file, swept; the live secret untouched |
 | frontend down at node boot | the node cannot open a registered store (keys are memory-only); it retries with backoff and serves hot only |
 | bad credential reaching a node | `probe_failed`; a node that had a store keeps it |
 | revoked or denied node | `PERMISSION_DENIED` on its next call; keys it already holds are not recalled, so the operator rotates after revoking |
-| two frontend children at once | both serve; Postgres compare-and-set arbitrates the generation; versioned secret files are never partial |
+| two frontend children at once | the proxy forwards to the active child, which takes registration writes; Postgres compare-and-set arbitrates the generation; versioned secret files are never partial |
 | concurrent operators | `expect_generation` compare-and-set; otherwise last writer wins and both are audited |
-| state restored from an older backup | generation lower than a node's: the node refetches on a difference (section 7) |
+| Postgres restored from an older backup | generation lower than a node's: the node refetches on a difference (section 7) |
 | a node on an older build | `unsupported`, counted separately |
 | the secret file missing or wider than 0600 | the routes answer `secret_missing`; `GetStoreConfig` answers `UNAVAILABLE` |
 
@@ -407,17 +428,18 @@ tightens `coverage-baseline`.
 | A | this ADR, [operator-verbs.md](operator-verbs.md), the planned stanza in `docs/api.md`, the correction in `distribution.md` | |
 | B | DTOs with `Secret`, the `objstore/` rows, the generation compare-and-set, audit rows, the versioned secret-file store with its start-up sweep | |
 | C | the control API: connections, bindings, `:verify`, status and audit | B |
-| D | the wire: `GetStoreConfig` replaces `GetKeys`, generation fields, the storage-only role row, the in-memory ack map | B |
+| D | the wire: `GetStoreConfig` replaces `GetKeys`, generation fields, the storage-only role row, the ack rows (`objstore/ack/{member}`, TTL, compare-and-set) | B |
 | E | the node applies at start: fetch, probe, open, report, identity guard | D |
-| F | `GET /v1/denied`, `POST /v1/backups/state` | |
+| F | `GET /v1/denied` only: the backup route was dropped with SQLite (#1094) | |
 | G1 | thin `kbf cluster` verbs for these routes | C, F |
 | G2 | end-to-end failure scenarios in `kbf-it` | E |
 
 The drift guard (every route of the operator router appears in `docs/api.md` and in
-[operator-verbs.md](operator-verbs.md)) is a repository test that runs against the real
-`api::router()` and the routers merged with it, not a test router. It is not in unit A: it is
-the first follow-up, and until it lands the verbs table is checked by hand against the
-`.route(` calls (the reading is in the pull request description).
+[operator-verbs.md](operator-verbs.md), method and path) is the test
+`crates/kbf-server/tests/route_docs.rs`. It reads the `.route(` calls of the sources of
+`kbf-server`, which are the merged routers, not a test router, and a planted undocumented
+route or method turns it red. It does not check the gate column of the verbs table, which
+lives in the handlers.
 
 ## 18. CEO ruling on the frontend architecture (overrides earlier text of this page)
 
@@ -425,9 +447,16 @@ the first follow-up, and until it lands the verbs table is checked by hand again
   the all-in-one. Rows, generation and audit go through the `kbf-state` store on Postgres;
   tests use its fake or Postgres. Every "state store" above means that.
 - **No writer baton.** The old and new frontend children share one Postgres under the proxy
-  bundled in `kbf-installer`, and both serve the object-store routes. `not_writer` and any
+  bundled in `kbf-installer`, and the proxy forwards to the active child. `not_writer` and any
   fence gating of these routes are removed. The secret file is host-local and readable by both
   children; writes are atomic with versioned names.
 - **The frontend updates first**, then triggers node updates, so nodes accept an N+1 frontend
   (section 7).
 - **No Envoy.** Earlier mentions of the proxy mean the installer's.
+- **The proxy forwards to the active child.** Registration writes reach that child only, and
+  the old child is read-only for scheduling (it may write its own metadata). Acks are rows in
+  the shared store, so a switch keeps convergence. The word "both serve" in earlier sections
+  means "either may be the one the proxy picks", not that two children take writes at once.
+- **Schema.** Rows in the existing store only; see the schema rule in section 6.
+- **Identity.** One "who is calling" function, whose source may be the proxy (section 7).
+- **No state migration:** a fresh Postgres. **A second update is rejected while one runs.**

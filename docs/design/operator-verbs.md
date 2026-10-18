@@ -1,7 +1,8 @@
 # Operator verbs: every verb, the route that does it, or why it stays local
 
-Status: a reference table, kept by hand until the drift guard named in
-[object-store-registration.md](object-store-registration.md) section 17 lands. The authority for
+Status: a reference table. Every route of `kbf-server` must have a row here by method and
+path: `crates/kbf-server/tests/route_docs.rs` fails otherwise (it does not check the gate
+column). The authority for
 a built route is [../api.md](../api.md); for an open pull request, that pull request. This page
 is the index: the verb an operator means, the one route that does it, and the gate it passes.
 
@@ -46,7 +47,6 @@ http_invocations,http_history,enroll/api}.rs` and `frontend.rs`, where they are 
 | frontend drain status | `GET /v1/frontend/drain` | [F] | open |
 | begin the frontend's drain | `POST /v1/frontend/drain` | [F] | write |
 | storage health (under-replicated blobs) | `GET /v1/storage` | [F] | open |
-| back up the frontend's state | `POST /v1/backups/state` | [N] unit F | write |
 
 There is no rebalance verb: handoff of data between members is not built, and none is invented
 here **[D]**.
@@ -140,7 +140,7 @@ section 8) and is not an operator verb of the farm.
 |---|---|---|
 | apply a registered object store on a storage node | the node's reconcile at start (unit E) | no operator verb: the node reconciles by itself; in v1 a rotation reaches a running node at its restart |
 | restart a node so it picks up a rotation | the installer (`kbf-installer`, #1048, #1051) | kbf never restarts itself; the installer verb for it does not exist yet, so a rotation ends with the operator waiting on `pending` (a cluster write, held) |
-| back up the frontend's state from the host (the route in section 1 is the remote form), restore it | `kbf-deploy host state-backup`, `state-restore` **[F]** | restore needs the frontend stopped |
+| frontend state backup | none: Postgres is backed up by the installer | no route and no flag |
 | meta-backup, meta-verify | `kbf-deploy linux` **[F]** | briefly stops `kbf-server`; installer or root only |
 | install, update, roll back, confirm, revert, gc, status and check of a host | `kbf-installer` (#1048, #1051, #1082, #1083) **[V]** | root and host-local; the installer is the root tool, and `setup` mints the first token |
 | the rollout controller | `kbf-deploy rollout`, #803, #970 **[V]** | a host state machine; installer territory |
