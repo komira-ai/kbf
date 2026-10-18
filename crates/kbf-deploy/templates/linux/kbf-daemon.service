@@ -23,6 +23,7 @@ CPUWeight=200
 Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@
 ExecStart=@KBF_BIN_DIR@/kbf-daemon \
     --driver=container \
+    --oci-runtime=/usr/bin/crun \
     --server=https://@KBF_HOST_NAME@:@KBF_WORKER_PORT@ \
     --cas=https://@KBF_HOST_NAME@:@KBF_WORKER_PORT@ \
     --ca-cert=@KBF_ETC@/ca.pem \

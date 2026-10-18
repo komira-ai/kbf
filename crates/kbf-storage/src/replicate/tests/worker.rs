@@ -370,6 +370,7 @@ async fn an_owner_that_cannot_be_dialled_is_waited_for() {
             zone: String::new(),
             weight: 1,
             state: MemberState::Active,
+            boot: 0,
         })
         .collect();
     let map = Arc::new(
@@ -705,6 +706,44 @@ impl Storage for CommitsAfterTheRead {
     ) -> Answer<'_, ()> {
         self.inner.commit_action_record(role, action, record)
     }
+}
+
+/// Catches a storage that does not report closures (any [`Storage`] that only has
+/// `action_result`) answering a hit without its result or digest, or an empty closure that
+/// would pass for a real one: the default `action_entry` is the result with `closure:
+/// None` ("unchecked"), and a miss stays a miss.
+#[tokio::test]
+async fn a_storage_without_its_own_action_entry_reports_no_closure() {
+    let farm = Farm::start(2, ChainConfig::default()).await;
+    let mem = Arc::clone(&farm.nodes[0].mem);
+    let action = sha(b"an action");
+    let record = mem
+        .prepare_action_result(&kbf_proto::reapi::ActionResult {
+            stdout_raw: b"out".to_vec(),
+            exit_code: 2,
+            ..Default::default()
+        })
+        .await
+        .expect("prepared");
+    mem.commit_action_record(kbf_meta::Role::Daemon, action, record)
+        .await
+        .expect("committed");
+    let storage = CommitsAfterTheRead {
+        inner: mem,
+        farm_repairs: Arc::clone(&farm.nodes[0].repairs),
+        first: std::sync::atomic::AtomicBool::new(false),
+    };
+
+    let entry = storage
+        .action_entry(&action)
+        .await
+        .expect("answered")
+        .expect("a hit");
+    assert_eq!(entry.result_digest, sha(b"out"));
+    assert_eq!(entry.result.exit_code, 2);
+    assert_eq!(entry.closure, None);
+    let none = storage.action_entry(&sha(b"none")).await.expect("answered");
+    assert!(none.is_none());
 }
 
 /// Catches a debt dropped for an absent blob that is present by the time it is dropped: the
