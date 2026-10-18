@@ -21,6 +21,10 @@ use super::service::EnrollService;
 use super::tls::{FrontendTls, unix_now};
 use crate::listen::{Latch, Socket};
 
+/// What the start says when the CA key is a file in this process.
+const DEV_SIGNER_WARNING: &str =
+    "the CA key is a file in this process (--ca-dev-file-signer): development only";
+
 /// What a frontend holds of enrollment before its state store is open: the socket bound,
 /// the CA opened, the listener's certificate issued.
 pub struct Prepared {
@@ -75,9 +79,7 @@ pub fn prepare(flags: &EnrollFlags) -> Result<Prepared, Box<dyn Error>> {
         &mut SystemEntropy,
     )?;
     if flags.signer == SignerChoice::DevFile {
-        tracing::warn!(
-            "the CA key is a file in this process (--ca-dev-file-signer): development only"
-        );
+        tracing::warn!("{DEV_SIGNER_WARNING}");
     }
     if ca.started() == Started::Created {
         tracing::info!(dir = %flags.ca_dir.display(), "made a new CA");

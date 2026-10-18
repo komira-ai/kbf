@@ -14,7 +14,6 @@
 //! before it reaches the service, and a request that takes longer than [`CALL_TIMEOUT`] is
 //! ended. The TLS handshake has the deadline `kbf_tls::HANDSHAKE_TIMEOUT`.
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use futures::FutureExt as _;
@@ -54,12 +53,6 @@ impl EnrollListener {
             tls,
             limits,
         }
-    }
-
-    /// Where it listens.
-    #[must_use]
-    pub fn local(&self) -> SocketAddr {
-        self.socket.local
     }
 
     /// The future that serves until the latch closes the socket, and that latch. Must be

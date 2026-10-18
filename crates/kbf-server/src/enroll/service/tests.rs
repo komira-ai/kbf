@@ -328,6 +328,16 @@ async fn an_advertise_host_the_frontend_will_not_certify_is_refused() {
         // hygiene lint refuses non-documentation IPv4 literals in source.
         format!("{}:8983", std::net::Ipv4Addr::new(169, 254, 1, 1)),
         format!("{}:8983", std::net::Ipv4Addr::new(224, 0, 0, 1)),
+        "x.localhost:8983".to_owned(),
+        // IPv6 loopback, link-local and unspecified, and the IPv4 ones in their
+        // IPv4-mapped spelling, which name the same hosts.
+        "::1:8983".to_owned(),
+        "fe80::1:8983".to_owned(),
+        format!("::ffff:{}:8983", std::net::Ipv4Addr::LOCALHOST),
+        format!("::ffff:{}:8983", std::net::Ipv4Addr::new(169, 254, 1, 1)),
+        format!("::ffff:{}:8983", std::net::Ipv4Addr::UNSPECIFIED),
+        format!("::ffff:{}:8983", std::net::Ipv4Addr::new(224, 0, 0, 1)),
+        "ff02::1:8983".to_owned(),
     ];
     for (bits, host) in (10..).zip(&hosts) {
         let tok = token(&farm, bits, &spec(&[Role::Storage]));
@@ -366,6 +376,11 @@ async fn a_malformed_request_is_refused_before_the_store_is_read() {
         (
             "zone",
             ask(&|r| r.zone = "z".repeat(64)),
+            RefusalReason::MalformedRequest,
+        ),
+        (
+            "advertise",
+            ask(&|r| r.advertise = "a".repeat(261)),
             RefusalReason::MalformedRequest,
         ),
         (
@@ -459,4 +474,72 @@ fn renew_after_is_half_way_to_the_earliest_expiry() {
     };
     assert_eq!(renew_after(1000, &[cert(3000), cert(2000)]), 1500);
     assert_eq!(renew_after(1000, &[cert(500)]), 1000);
+}
+
+/// A frontend that serves an IP address is not certified for storage in any spelling of
+/// that address: zero-compressed or padded IPv6, or the IPv4-mapped form of an IPv4
+/// name. Addresses are compared as addresses, not as text.
+///
+/// Catches: a storage token minting a serverAuth certificate for the frontend's own IP by
+/// writing it differently from the `--frontend-name` flag (the node then impersonates the
+/// frontend to any client that trusts the CA), and an unrelated address wrongly refused.
+#[test]
+fn a_frontend_ip_name_is_refused_in_every_spelling_of_it() {
+    let v4 = std::net::Ipv4Addr::new(192, 0, 2, 5);
+    let names = vec!["2001:db8::1".to_owned(), v4.to_string()];
+    for spelling in [
+        "2001:db8::1".to_owned(),
+        "2001:db8:0::1".to_owned(),
+        "2001:0db8::1".to_owned(),
+        "2001:0db8:0000:0000:0000:0000:0000:0001".to_owned(),
+        v4.to_string(),
+        format!("::ffff:{v4}"),
+        "::ffff:c000:205".to_owned(),
+    ] {
+        assert!(advertise_refused(&spelling, &names), "{spelling}");
+    }
+    for fine in [
+        "2001:db8::2",
+        "::ffff:192.0.2.6",
+        "192.0.2.6",
+        "s1.nodes.test",
+    ] {
+        assert!(!advertise_refused(fine, &names), "{fine}");
+    }
+}
+
+/// The service has a `Debug` form that names the type and holds nothing of the CA or the
+/// store.
+///
+/// Catches: a derived `Debug` that prints the registry or the CA into a log line.
+#[test]
+fn the_service_debug_form_shows_no_state() {
+    let farm = farm("enroll-debug");
+    assert_eq!(format!("{:?}", farm.service), "EnrollService { .. }");
+}
+
+/// A daemon certificate never carries an advertise host, and a host that is no name is
+/// not certified: the CA's refusals are told as `AdvertiseInvalid`, not as a signer fault
+/// the node would retry.
+///
+/// Catches: a CA refusal of the request's own content mapped to `NotSigner`.
+#[test]
+fn an_advertise_host_on_a_daemon_certificate_is_advertise_invalid() {
+    let farm = farm("enroll-daemon-advertise");
+    let id: NodeId = "node-01".parse().expect("id");
+    let public = PublicKey::from_spki(&key().subject_public_key_info()).expect("spki");
+    let error = farm
+        .service
+        .core
+        .issue(&id, Role::Daemon, &public, Some("s1.nodes.test"))
+        .map(|_| ())
+        .expect_err("refused");
+    assert_eq!(error, RefusalReason::AdvertiseInvalid);
+    let error = farm
+        .service
+        .core
+        .issue(&id, Role::Storage, &public, Some("not a host"))
+        .map(|_| ())
+        .expect_err("refused");
+    assert_eq!(error, RefusalReason::AdvertiseInvalid);
 }

@@ -90,15 +90,28 @@ impl FrontendTls {
     /// failed replacement is logged and tried again in a minute; the old certificate is
     /// served until it expires.
     pub async fn keep_fresh(self: std::sync::Arc<Self>, ca: std::sync::Arc<Ca>) {
+        self.keep_fresh_by(ca, std::sync::Arc::new(unix_now)).await;
+    }
+
+    /// [`Self::keep_fresh`] with the clock the certificates are issued by given.
+    async fn keep_fresh_by(
+        self: std::sync::Arc<Self>,
+        ca: std::sync::Arc<Ca>,
+        clock: std::sync::Arc<dyn Fn() -> i64 + Send + Sync>,
+    ) {
         let half = Duration::from_secs(
             u64::try_from(ca.frontend().policy().lifetime_s() / 2).unwrap_or(3600),
         );
         let mut wait = half;
         loop {
             tokio::time::sleep(wait).await;
-            let (this, authority) = (std::sync::Arc::clone(&self), std::sync::Arc::clone(&ca));
+            let (this, authority, now) = (
+                std::sync::Arc::clone(&self),
+                std::sync::Arc::clone(&ca),
+                std::sync::Arc::clone(&clock),
+            );
             let renewed = tokio::task::spawn_blocking(move || {
-                this.renew(&authority, unix_now(), &mut SystemEntropy)
+                this.renew(&authority, now(), &mut SystemEntropy)
             })
             .await;
             wait = match renewed {

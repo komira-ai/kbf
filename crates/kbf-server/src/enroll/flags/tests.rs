@@ -146,6 +146,24 @@ fn bad_names_and_out_of_range_numbers_are_refused() {
     ] {
         assert!(flags(&with(&[dev[0], bad])).is_err(), "{bad}");
     }
+    let long_label = format!("--frontend-name={}.test", "a".repeat(64));
+    let long_name = format!("--frontend-name={}", ["abcdefghi"; 28].join("."));
+    for bad in [
+        "--frontend-name=a..test",
+        "--frontend-name=-a.test",
+        "--frontend-name=a-.test",
+        "--frontend-name=",
+        &long_label,
+        &long_name,
+    ] {
+        let said = error(&with(&[dev[0], bad]));
+        assert!(said.contains("--frontend-name"), "{bad}: {said}");
+    }
+    let edge = format!("--frontend-name={}.test", "a".repeat(63));
+    assert!(
+        flags(&with(&[dev[0], &edge])).is_ok(),
+        "a 63-character label"
+    );
     assert!(
         flags(&with(&[
             dev[0],

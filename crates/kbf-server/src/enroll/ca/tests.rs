@@ -183,3 +183,33 @@ fn an_external_signer_needs_the_signers_root_and_makes_nothing() {
         Ca::open(&swapped, &external, policy(), START, &mut SystemEntropy).expect_err("wrong root");
     assert!(matches!(err, CaOpenError::Ca(_)), "{err}");
 }
+
+/// The CA's `Debug` form says whether the start made it and shows nothing else.
+///
+/// Catches: a derived `Debug` that prints the authorities (and with them key handles) into
+/// a log line.
+#[test]
+fn the_ca_debug_form_names_the_start_and_nothing_more() {
+    let dir = scratch("ca-debug");
+    let ca = open_dev(&dir, START).expect("made");
+    let text = format!("{ca:?}");
+    assert!(text.starts_with("Ca { started: Created"), "{text}");
+    assert!(
+        !text.contains("node") && !text.contains("frontend"),
+        "{text}"
+    );
+}
+
+/// A `ca.pem` that cannot be read (here a directory) is a read error naming the
+/// directory, not "no root", which would tell the operator to copy a file that is there.
+///
+/// Catches: every read failure folded into `NoRoot`, and the failure swallowed.
+#[test]
+fn an_unreadable_root_is_a_read_error_not_a_missing_one() {
+    let dir = scratch("ca-root-unreadable");
+    std::fs::create_dir_all(dir.join("ca.pem")).expect("a directory in the file's place");
+    let external = SignerChoice::External(dir.join("no-such.sock"));
+    let err = Ca::open(&dir, &external, policy(), START, &mut SystemEntropy).expect_err("refused");
+    assert!(matches!(err, CaOpenError::Read { .. }), "{err}");
+    assert!(err.to_string().contains("--ca-dir"), "{err}");
+}

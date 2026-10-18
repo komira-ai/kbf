@@ -468,3 +468,41 @@ async fn a_restart_loads_the_ca_it_made_and_does_not_overwrite_it() {
     assert_eq!(files("ca.key"), key);
     assert_eq!(files("ca.pem"), root);
 }
+
+/// With `--ca-signer` the frontend starts from the signer's public root alone: it
+/// serves under the signer's pin and holds no key.
+///
+/// Catches: a production start that makes a CA key of its own when told the key lives
+/// elsewhere (the pin tokens carry would then be a different CA's), and one that cannot
+/// start against a signer at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_external_signer_start_uses_the_signers_root_and_makes_no_key() {
+    use kbf_ca::{Policy, SystemEntropy};
+    use kbf_signer::{SignerServer, bind, ensure};
+
+    let signer_dir = scratch("external-signer");
+    std::fs::set_permissions(&signer_dir, std::fs::Permissions::from_mode(0o700)).expect("mode");
+    let policy = Policy::new(86_400).expect("policy");
+    let (authority, _) = ensure(&signer_dir, policy, unix_now(), &mut SystemEntropy).expect("CA");
+    let server = SignerServer::from_dir(&signer_dir, rustix::process::geteuid().as_raw(), policy)
+        .expect("server");
+    let socket_dir = scratch("external-signer-sock");
+    std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700)).expect("mode");
+    let socket = socket_dir.join("signer.sock");
+    let listener = bind(&socket).expect("bind");
+    std::thread::spawn(move || {
+        let _ = server.serve(&listener);
+    });
+
+    let ca_dir = scratch("external-frontend").join("ca");
+    std::fs::create_dir_all(&ca_dir).expect("dir");
+    std::fs::copy(signer_dir.join("ca.pem"), ca_dir.join("ca.pem")).expect("root");
+    let mut f = flags(ca_dir.clone(), Limits::DEFAULT, true);
+    f.signer = SignerChoice::External(socket);
+    let prepared = tokio::task::spawn_blocking(move || prepare(&f).map_err(|e| e.to_string()))
+        .await
+        .expect("join")
+        .expect("prepared against the signer");
+    assert_eq!(prepared.ca().pin(), authority.pin());
+    assert!(!ca_dir.join("ca.key").exists(), "the frontend holds no key");
+}

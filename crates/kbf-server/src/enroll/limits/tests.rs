@@ -262,3 +262,35 @@ fn the_request_cap_is_sixteen_kib() {
     assert_eq!(MAX_REQUEST_BYTES, 16 * 1024);
     const { assert!(MAX_REQUEST_BYTES > 2 * kbf_ca::MAX_CSR_LEN + 1024) };
 }
+
+/// An inner service that is never ready.
+#[derive(Clone)]
+struct Busy;
+
+impl tonic::codegen::Service<http::Request<()>> for Busy {
+    type Response = http::Response<String>;
+    type Error = std::convert::Infallible;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Pending
+    }
+
+    fn call(&mut self, _: http::Request<()>) -> Self::Future {
+        unreachable!("a service that is not ready is not called")
+    }
+}
+
+/// The guard is ready exactly when the service behind it is.
+///
+/// Catches: a guard that reports ready over a busy service, so the server calls a service
+/// that has not said it can take the call.
+#[test]
+fn the_guard_is_ready_when_the_service_behind_it_is() {
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut busy = GuardLayer::new(&Limits::DEFAULT).layer(Busy);
+    assert!(busy.poll_ready(&mut cx).is_pending());
+    let mut ready = guard_with("0");
+    assert!(matches!(ready.poll_ready(&mut cx), Poll::Ready(Ok(()))));
+}

@@ -128,16 +128,23 @@ pub(super) fn csrs_of(csrs: &[pb::RoleCsr]) -> Result<Vec<(Role, &[u8])>, Refusa
 
 /// Whether `host` is a name the frontend will not certify for a storage node: a name it
 /// serves (or one under it), `localhost`, or an address that is loopback, unspecified,
-/// link-local or multicast.
+/// link-local or multicast, or one it serves.
+///
+/// An address is judged as an address: any spelling of it (zero-compressed or padded IPv6,
+/// the IPv4-mapped form of an IPv4 address) is the same host, so it is compared
+/// and classified in its canonical form. Other names are compared as lower-case text.
 fn advertise_refused(host: &str, frontend_names: &[String]) -> bool {
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    let address = |text: &str| text.parse::<IpAddr>().ok().map(|ip| ip.to_canonical());
+    if let Some(ip) = address(host) {
         let link_local = match ip {
             IpAddr::V4(v4) => v4.is_link_local(),
             IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
         };
-        if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || link_local {
-            return true;
-        }
+        return ip.is_loopback()
+            || ip.is_unspecified()
+            || ip.is_multicast()
+            || link_local
+            || frontend_names.iter().any(|name| address(name) == Some(ip));
     }
     host == "localhost"
         || host.ends_with(".localhost")

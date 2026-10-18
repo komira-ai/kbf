@@ -160,10 +160,17 @@ pub fn csr_bad_signature(key: &KeyPair) -> Vec<u8> {
 
 fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
     let mut out = vec![tag];
-    match content.len() {
-        n if n < 0x80 => out.push(u8::try_from(n).expect("short")),
-        n if n < 0x100 => out.extend([0x81, u8::try_from(n).expect("one byte")]),
-        n => out.extend([0x82, u8::try_from(n >> 8).expect("hi"), (n & 0xff) as u8]),
+    let n = content.len();
+    if n < 0x80 {
+        out.push(u8::try_from(n).expect("short"));
+    } else {
+        let digits: Vec<u8> = n
+            .to_be_bytes()
+            .into_iter()
+            .skip_while(|b| *b == 0)
+            .collect();
+        out.push(0x80 | u8::try_from(digits.len()).expect("a length of few bytes"));
+        out.extend(digits);
     }
     out.extend_from_slice(content);
     out
