@@ -578,8 +578,10 @@ impl Members {
     /// ([`next_floor`]: the stored map's, lifted to this build's oldest), so what the store
     /// holds decides, not the build's constants. The map is read first, then the node's
     /// protocol compared, and only then is an identity assigned: a refused node leaves no
-    /// row. The read and the commit are not one transaction: a floor another frontend raises
-    /// between them is not applied to this call.
+    /// row. The read is [`Members::current_map`], so it also publishes the stored map to
+    /// [`Members::view`] and [`MapSource::changes`], refused or not, and a registration costs
+    /// one more store read than it did. The read and the commit are not one transaction: a
+    /// floor another frontend raises between them is not applied to this call.
     ///
     /// # Errors
     /// [`MembershipError::Invalid`] for a bad request; the store failing (the map is read
