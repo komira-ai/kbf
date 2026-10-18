@@ -9,7 +9,7 @@ use kbf_host::path::Root;
 
 use crate::CommitId;
 use crate::layout::Layout;
-use crate::state::{PendingConfirm, State};
+use crate::state::{Floor, PendingConfirm, State, Unacked};
 
 pub const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub const B: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -23,7 +23,7 @@ pub fn c(id: &str) -> CommitId {
 /// state directory and `/usr/local/kbf`; and the root's path.
 pub fn host_root(name: &str) -> (Layout, PathBuf) {
     let dir = kbf_host::testkit::scratch(name);
-    for sub in ["run", "var/lib/kbf-deploy", "usr/local/kbf"] {
+    for sub in ["run", "var/lib/kbf-installer/releases"] {
         fs::create_dir_all(dir.join(sub)).expect("seed");
     }
     (Layout::linux(Root::new(&dir).expect("absolute")), dir)
@@ -35,12 +35,25 @@ pub fn full_state() -> State {
         previous: Some(c(B)),
         staged: Some(c(C)),
         pending_confirm: Some(PendingConfirm {
+            activation: "3-9".to_owned(),
             commit: c(A),
             previous: Some(c(B)),
-            deadline: Some(1_800_000_000),
-            order_id: None,
-            starts_left: None,
+            deadline_wall: Some(1_800_000_000),
+            deadline_mono_s: Some(86_400),
+            starts_left: Some(2),
         }),
-        order_floor: 7,
+        floor: Floor {
+            epoch: 3,
+            order_id: 9,
+            generation: 7,
+        },
+        serving_instance: Some("a".to_owned()),
+        last_acked_order_id: 9,
+        unacked: vec![Unacked {
+            epoch: 3,
+            order_id: 10,
+            first_seen: 1_700_000_000,
+            record: "{}".to_owned(),
+        }],
     }
 }

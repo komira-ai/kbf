@@ -60,7 +60,7 @@ const SCRATCH: &str = "/private/tmp/kbf-mac-provision-as-root";
 const LABEL: &str = "org.example.kbf-daemon";
 const LOG_DIR: &str = "/Library/Logs/kbf";
 const ERR_LOG: &str = "/Library/Logs/kbf/kbf-daemon.err.log";
-const DAEMON_BIN: &str = "/usr/local/kbf/current/kbf-daemon";
+const DAEMON_BIN: &str = "/usr/local/kbf-installer/releases/current/kbf-daemon";
 const SOFTWARE_UPDATE: &str = "/Library/Preferences/com.apple.SoftwareUpdate";
 /// The items applied and asserted: none can break the job running the tests.
 const SAFE: &str = "hostname,role_user,updates_auto_download,updates_auto_install_macos,\

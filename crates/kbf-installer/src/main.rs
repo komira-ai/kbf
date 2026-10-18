@@ -9,10 +9,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::{Parser, Subcommand};
 use kbf_host::{HostExec, HostPath, Root};
 use kbf_installer::activate;
-use kbf_installer::helper::cycle::{Config, Helper};
+use kbf_installer::helper::cycle::{Config, Helper, HelperError};
 use kbf_installer::helper::restart::Restart;
 use kbf_installer::layout::{Layout, Platform};
-use kbf_installer::release;
+use kbf_installer::release::{self, ReleaseError};
 use kbf_installer::run::SystemRunner;
 use kbf_installer::settings::Settings;
 use kbf_installer::stage::{Context, Limits, stage_from_inbox};
@@ -77,6 +77,42 @@ fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Why a verb failed, and the exit code for it: 1, or 5 when only an operator can go on (the
+/// state files are both unusable).
+struct Failure {
+    code: u8,
+    why: String,
+}
+
+impl From<String> for Failure {
+    fn from(why: String) -> Failure {
+        Failure { code: 1, why }
+    }
+}
+
+impl From<HelperError> for Failure {
+    fn from(e: HelperError) -> Failure {
+        let operator = matches!(&e, HelperError::State(s) if s.needs_operator());
+        Failure {
+            code: if operator { EXIT_NEEDS_OPERATOR } else { 1 },
+            why: e.to_string(),
+        }
+    }
+}
+
+impl From<ReleaseError> for Failure {
+    fn from(e: ReleaseError) -> Failure {
+        let operator = matches!(&e, ReleaseError::State(s) if s.needs_operator());
+        Failure {
+            code: if operator { EXIT_NEEDS_OPERATOR } else { 1 },
+            why: e.to_string(),
+        }
+    }
+}
+
+/// Exit code 5: needs an operator (`docs/design/kbf-installer.md`, section 2).
+const EXIT_NEEDS_OPERATOR: u8 = 5;
+
 fn host(root: PathBuf) -> Result<(Layout, HostExec), String> {
     let root = Root::new(root).map_err(|e| e.to_string())?;
     Ok((
@@ -85,7 +121,7 @@ fn host(root: PathBuf) -> Result<(Layout, HostExec), String> {
     ))
 }
 
-fn run(root: PathBuf, args: RunArgs) -> Result<(), String> {
+fn run(root: PathBuf, args: RunArgs) -> Result<(), Failure> {
     let (layout, exec) = host(root)?;
     // clap makes exactly one of the two flags present (`required_unless_present`,
     // `conflicts_with`), so the label is there whenever the unit is not.
@@ -114,12 +150,10 @@ fn run(root: PathBuf, args: RunArgs) -> Result<(), String> {
         };
         stage_from_inbox(&mut ctx, entry)
     };
-    helper.recover().map_err(|e| e.to_string())?;
+    helper.recover()?;
     let mut left = args.passes;
     while left != Some(0) {
-        helper
-            .cycle(now(), &mut stager)
-            .map_err(|e| e.to_string())?;
+        helper.cycle(now(), &mut stager)?;
         helper.drain_log(&mut std::io::stderr());
         left = left.map(|n| n - 1);
         sleep(Duration::from_secs(args.interval_secs));
@@ -127,7 +161,7 @@ fn run(root: PathBuf, args: RunArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), String> {
+fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), Failure> {
     let (layout, mut exec) = host(root)?;
     let mut out = Vec::new();
     let result = activate::boot_check(&mut exec, &layout, now(), args.window_secs, &mut out);
@@ -137,7 +171,7 @@ fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), String> {
             eprintln!("kbf-installer: boot check: {decision:?}");
             Ok(())
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -149,9 +183,9 @@ fn main() -> ExitCode {
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(why) => {
+        Err(Failure { code, why }) => {
             eprintln!("kbf-installer: {why}");
-            ExitCode::FAILURE
+            ExitCode::from(code)
         }
     }
 }

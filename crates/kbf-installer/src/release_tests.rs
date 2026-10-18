@@ -86,7 +86,10 @@ fn gc_on(exec: &mut ScratchHost, root: &Layout, keep: usize) -> Result<String, R
 
 /// Where a link under `/usr/local/kbf` points; `None` when there is no link.
 fn link(exec: &ScratchHost, name: &str) -> Option<String> {
-    let target = fs::read_link(exec.at(&format!("/usr/local/kbf/{name}"))).ok()?;
+    // A Linux host's tree, else a Mac's.
+    let linux = exec.at(&format!("/var/lib/kbf-installer/releases/{name}"));
+    let mac = exec.at(&format!("/usr/local/kbf-installer/releases/{name}"));
+    let target = fs::read_link(linux).or_else(|_| fs::read_link(mac)).ok()?;
     Some(target.display().to_string())
 }
 
@@ -120,9 +123,9 @@ fn install_twice_then_roll_back_and_refuse_a_second_rollback() {
         out.ends_with("then check `kbf-deploy host status`\n"),
         "{out}"
     );
-    assert_eq!(link(&exec, "current"), Some(format!("releases/{A}")));
+    assert_eq!(link(&exec, "current"), Some(A.to_owned()));
     assert_eq!(link(&exec, "previous"), None);
-    let rel = format!("/usr/local/kbf/releases/{A}");
+    let rel = format!("/var/lib/kbf-installer/releases/{A}");
     assert_eq!(
         fs::read_to_string(exec.at(&format!("{rel}/kbf"))).expect("kbf"),
         "kbf A"
@@ -130,8 +133,8 @@ fn install_twice_then_roll_back_and_refuse_a_second_rollback() {
     let unit = fs::read_to_string(exec.at(&format!("{rel}/units/kbf.slice"))).expect("unit");
     assert_eq!(unit, "[Slice]\n");
     let modes = [
-        ("/usr/local/kbf", 0o755),
-        ("/usr/local/kbf/releases", 0o755),
+        ("/var/lib/kbf-installer", 0o755),
+        ("/var/lib/kbf-installer/releases", 0o755),
         (rel.as_str(), 0o755),
         (&format!("{rel}/kbf"), 0o755),
         (&format!("{rel}/units"), 0o755),
@@ -149,8 +152,8 @@ fn install_twice_then_roll_back_and_refuse_a_second_rollback() {
         )),
         "{out}"
     );
-    assert_eq!(link(&exec, "current"), Some(format!("releases/{B}")));
-    assert_eq!(link(&exec, "previous"), Some(format!("releases/{A}")));
+    assert_eq!(link(&exec, "current"), Some(B.to_owned()));
+    assert_eq!(link(&exec, "previous"), Some(A.to_owned()));
     let s = state_of(&root);
     assert_eq!((s.current, s.previous), (Some(c(B)), Some(c(A))));
 
@@ -161,14 +164,14 @@ fn install_twice_then_roll_back_and_refuse_a_second_rollback() {
         )),
         "{out}"
     );
-    assert_eq!(link(&exec, "current"), Some(format!("releases/{A}")));
+    assert_eq!(link(&exec, "current"), Some(A.to_owned()));
     assert_eq!(link(&exec, "previous"), None);
     let s = state_of(&root);
     assert_eq!((s.current, s.previous), (Some(c(A)), None));
 
     let err = rollback_on(&mut exec, &root, Mode::Apply).expect_err("no previous");
     assert_eq!(err.to_string(), "no previous release to roll back to");
-    assert_eq!(link(&exec, "current"), Some(format!("releases/{A}")));
+    assert_eq!(link(&exec, "current"), Some(A.to_owned()));
     assert_eq!(state_of(&root).current, Some(c(A)));
 }
 
@@ -193,13 +196,13 @@ fn a_rollback_onto_a_release_that_is_gone_is_refused() {
         Mode::Apply,
     )
     .expect("B");
-    fs::remove_file(exec.at(&format!("/usr/local/kbf/releases/{A}/kbf"))).expect("remove");
+    fs::remove_file(exec.at(&format!("/var/lib/kbf-installer/releases/{A}/kbf"))).expect("remove");
     let err = rollback_on(&mut exec, &root, Mode::Apply).expect_err("gone");
     assert_eq!(
         err.to_string(),
         format!("the previous release {A} is gone (no binary at its directory)")
     );
-    assert_eq!(link(&exec, "current"), Some(format!("releases/{B}")));
+    assert_eq!(link(&exec, "current"), Some(B.to_owned()));
 }
 
 /// Catches an install that replaces a release directory already there with other
@@ -212,7 +215,7 @@ fn a_release_directory_with_other_content_is_refused() {
     let (mut exec, root) = host("differs");
     let a = source("differs-a", "kbf A", Some(UNITS));
     install_on(&mut exec, &root, A, &a, Mode::Apply).expect("install A");
-    let rel = format!("/usr/local/kbf/releases/{A}");
+    let rel = format!("/var/lib/kbf-installer/releases/{A}");
     let other_binary = source("differs-bin", "kbf X", Some(UNITS));
     let other_unit = source("differs-unit", "kbf A", Some(&[("kbf.slice", "[Other]\n")]));
     let new_unit = source("differs-new", "kbf A", Some(&[("new.service", "[Unit]\n")]));
@@ -237,11 +240,15 @@ fn a_release_directory_with_other_content_is_refused() {
     let s = state_of(&root);
     assert_eq!((s.current, s.previous), (Some(c(A)), None));
 
-    fs::write(exec.at(&format!("/usr/local/kbf/releases/{B}")), "a file").expect("seed");
+    fs::write(
+        exec.at(&format!("/var/lib/kbf-installer/releases/{B}")),
+        "a file",
+    )
+    .expect("seed");
     let err = install_on(&mut exec, &root, B, &a, Mode::Apply).expect_err("a file");
     assert_eq!(
         err.to_string(),
-        format!("/usr/local/kbf/releases/{B} is there and is not a directory")
+        format!("/var/lib/kbf-installer/releases/{B} is there and is not a directory")
     );
     assert_eq!(state_of(&root).current, Some(c(A)));
 }
@@ -317,11 +324,13 @@ fn a_copy_whose_sha256_differs_is_refused_before_the_switch() {
         };
         let err = install(&mut exec, &root, me(), &a, Mode::Apply, &mut Vec::new())
             .expect_err("a bad copy");
-        let path = format!("/usr/local/kbf/releases/{A}/kbf");
-        assert_eq!(
-            err.to_string(),
-            format!("the copy at {path} has sha256 {got}; the source has {want}")
+        // The copy is read back where it was made: under the stage name, before any rename.
+        let (head, tail) = (
+            format!("the copy at /var/lib/kbf-installer/releases/.stage-{A}."),
+            format!("/kbf has sha256 {got}; the source has {want}"),
         );
+        let text = err.to_string();
+        assert!(text.starts_with(&head) && text.ends_with(&tail), "{text}");
         assert_eq!(link(&exec.host, "current"), None);
         assert_eq!(state::read_unlocked(&root).expect("read"), None);
     }
@@ -353,11 +362,12 @@ fn every_binary_of_a_release_is_read_back_not_only_the_first() {
         let err = install(&mut exec, &root, me(), &a, Mode::Apply, &mut Vec::new())
             .expect_err("a bad copy of the second binary");
         let want = sha256(b"daemon A");
-        let path = format!("/usr/local/kbf/releases/{A}/kbf-daemon");
-        assert_eq!(
-            err.to_string(),
-            format!("the copy at {path} has sha256 {got}; the source has {want}")
+        let (head, tail) = (
+            format!("the copy at /var/lib/kbf-installer/releases/.stage-{A}."),
+            format!("/kbf-daemon has sha256 {got}; the source has {want}"),
         );
+        let text = err.to_string();
+        assert!(text.starts_with(&head) && text.ends_with(&tail), "{text}");
         assert_eq!(link(&exec.host, "current"), None);
         assert_eq!(state::read_unlocked(&root).expect("read"), None);
     }
@@ -397,7 +407,7 @@ fn a_dry_run_writes_nothing() {
     let before = tree(&exec.root);
     let out = install_on(&mut exec, &root, A, &a, Mode::DryRun).expect("dry install");
     assert!(
-        out.contains("DRY-RUN: write /usr/local/kbf/releases/"),
+        out.contains("DRY-RUN: write /var/lib/kbf-installer/releases/"),
         "{out}"
     );
     assert!(!out.contains("next, by hand"), "{out}");
@@ -408,7 +418,7 @@ fn a_dry_run_writes_nothing() {
         "keeping: none; removing: none\nnothing to do\n"
     );
     assert_eq!(tree(&exec.root), before);
-    assert!(!exec.at("/run/kbf-deploy.lock").exists());
+    assert!(!exec.at("/run/kbf-installer/lock").exists());
 
     install_on(&mut exec, &root, A, &a, Mode::Apply).expect("A");
     install_on(
@@ -419,7 +429,7 @@ fn a_dry_run_writes_nothing() {
         Mode::Apply,
     )
     .expect("B");
-    fs::create_dir(exec.at(&format!("/usr/local/kbf/releases/{C}"))).expect("seed");
+    fs::create_dir(exec.at(&format!("/var/lib/kbf-installer/releases/{C}"))).expect("seed");
     let before = tree(&exec.root);
     let out = install_on(
         &mut exec,
@@ -440,7 +450,7 @@ fn a_dry_run_writes_nothing() {
     let out = rollback_on(&mut exec, &root, Mode::DryRun).expect("dry rollback");
     assert!(
         out.contains(&format!(
-            "DRY-RUN: link /usr/local/kbf/current -> releases/{A}"
+            "DRY-RUN: link /var/lib/kbf-installer/releases/current -> {A}"
         )),
         "{out}"
     );
@@ -448,7 +458,9 @@ fn a_dry_run_writes_nothing() {
     gc(&mut exec, &root, 0, Mode::DryRun, &mut out).expect("dry gc");
     let out = String::from_utf8(out).expect("utf-8");
     assert!(
-        out.contains(&format!("DRY-RUN: remove /usr/local/kbf/releases/{C}\n")),
+        out.contains(&format!(
+            "DRY-RUN: remove /var/lib/kbf-installer/releases/{C}\n"
+        )),
         "{out}"
     );
     assert_eq!(tree(&exec.root), before);
@@ -457,7 +469,7 @@ fn a_dry_run_writes_nothing() {
 /// A release directory made by hand: `kbf`, `units/a.service`, and a link out of it
 /// to `escape` (removed, never followed), modified at `secs` after the epoch.
 fn seed_release(exec: &ScratchHost, commit: &str, secs: u64) {
-    let dir = exec.at(&format!("/usr/local/kbf/releases/{commit}"));
+    let dir = exec.at(&format!("/var/lib/kbf-installer/releases/{commit}"));
     fs::create_dir_all(dir.join("units")).expect("dirs");
     fs::write(dir.join("kbf"), commit).expect("kbf");
     fs::write(dir.join("units/a.service"), "[Unit]\n").expect("unit");
@@ -470,10 +482,13 @@ fn seed_release(exec: &ScratchHost, commit: &str, secs: u64) {
 }
 
 fn releases_left(exec: &ScratchHost) -> Vec<String> {
-    let mut names: Vec<String> = fs::read_dir(exec.at("/usr/local/kbf/releases"))
-        .expect("list")
-        .map(|i| i.expect("entry").file_name().to_string_lossy().into_owned())
-        .collect();
+    // Nothing yet when the directory was never made (a dry run makes none).
+    let mut names: Vec<String> = fs::read_dir(exec.at("/var/lib/kbf-installer/releases"))
+        .map(|d| {
+            d.map(|i| i.expect("entry").file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
     names.sort();
     names
 }
@@ -494,7 +509,7 @@ fn gc_keeps_current_previous_staged_and_the_newest() {
     for (i, commit) in [A, B, C, D, E, S].into_iter().enumerate() {
         seed_release(&exec, commit, 1_000 + i as u64);
     }
-    let releases = exec.at("/usr/local/kbf/releases");
+    let releases = exec.at("/var/lib/kbf-installer/releases");
     fs::write(releases.join("notes.txt"), "x").expect("stray");
     fs::create_dir(releases.join("tmp")).expect("stray");
     fs::write(releases.join(D.replace('d', "9")), "x").expect("a file named as a commit");
@@ -504,7 +519,7 @@ fn gc_keeps_current_previous_staged_and_the_newest() {
         staged: Some(c(S)),
         ..State::default()
     };
-    fs::create_dir(exec.at("/var/lib/kbf-deploy")).expect("state dir");
+    fs::create_dir_all(exec.at("/var/lib/kbf-installer")).expect("state dir");
     Locked::acquire(&root)
         .expect("lock")
         .write(&state)
@@ -533,10 +548,10 @@ fn gc_keeps_current_previous_staged_and_the_newest() {
         .expect("lock")
         .write(&State::default())
         .expect("write");
-    symlink(format!("releases/{E}"), exec.at("/usr/local/kbf/current")).expect("link");
-    symlink(format!("releases/{S}"), exec.at("/usr/local/kbf/previous")).expect("link");
+    symlink(E, exec.at("/var/lib/kbf-installer/releases/current")).expect("link");
+    symlink(S, exec.at("/var/lib/kbf-installer/releases/previous")).expect("link");
     gc_on(&mut exec, &root, 0).expect("gc");
-    let mut want = vec![E, S, "notes.txt", "tmp"]
+    let mut want = vec![E, S, "current", "previous", "notes.txt", "tmp"]
         .into_iter()
         .map(String::from)
         .collect::<Vec<_>>();
@@ -554,13 +569,14 @@ fn every_verb_refuses_while_a_deploy_is_pending() {
         pending_confirm: Some(PendingConfirm {
             commit: c(C),
             previous: None,
-            deadline: Some(1),
-            order_id: None,
+            activation: "1-1".to_owned(),
+            deadline_wall: Some(1),
+            deadline_mono_s: None,
             starts_left: None,
         }),
         ..State::default()
     };
-    fs::create_dir(exec.at("/var/lib/kbf-deploy")).expect("state dir");
+    fs::create_dir_all(exec.at("/var/lib/kbf-installer")).expect("state dir");
     Locked::acquire(&root)
         .expect("lock")
         .write(&state)
@@ -608,34 +624,30 @@ fn errors_name_what_is_wrong() {
     );
 
     let ok = source("errors-ok", "A", None);
-    fs::create_dir_all(exec.at("/usr/local/kbf/current")).expect("a directory");
+    fs::create_dir_all(exec.at("/var/lib/kbf-installer/releases/current")).expect("a directory");
     let err = install_on(&mut exec, &root, A, &ok, Mode::DryRun).expect_err("not a link");
     assert_eq!(
         err.to_string(),
-        "refusing to replace /usr/local/kbf/current with a symbolic link: it is not one"
+        "refusing to replace /var/lib/kbf-installer/releases/current with a symbolic link: it is not one"
     );
-    fs::create_dir_all(exec.at("/var/lib/kbf-deploy")).expect("dir");
-    fs::write(exec.at("/var/lib/kbf-deploy/state.json"), "{").expect("seed");
+    fs::create_dir_all(exec.at("/var/lib/kbf-installer")).expect("dir");
+    fs::write(exec.at("/var/lib/kbf-installer/state.json"), "{").expect("seed");
     let err = rollback_on(&mut exec, &root, Mode::DryRun).expect_err("broken state");
-    assert!(err.to_string().contains("is not a deploy state"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("the state is unusable and nothing was changed"),
+        "{err}"
+    );
 
     let (mut exec, root) = host("errors-unreadable");
-    fs::write(exec.at("/usr/local/kbf"), "a file").expect("seed");
+    fs::create_dir_all(exec.at("/var/lib/kbf-installer")).expect("seed");
+    fs::write(exec.at("/var/lib/kbf-installer/releases"), "a file").expect("seed");
     let err = gc_on(&mut exec, &root, 0).expect_err("unreadable");
     assert!(
         err.to_string()
-            .starts_with("cannot read /usr/local/kbf/current: "),
+            .starts_with("cannot read /var/lib/kbf-installer/releases/current: "),
         "{err}"
     );
-    fs::remove_file(exec.at("/usr/local/kbf")).expect("remove");
-    fs::create_dir(exec.at("/usr/local/kbf")).expect("dir");
-    fs::write(exec.at("/usr/local/kbf/releases"), "a file").expect("seed");
-    let err = gc_on(&mut exec, &root, 0).expect_err("releases is a file");
-    let want = format!(
-        "cannot read {}: ",
-        exec.at("/usr/local/kbf/releases").display()
-    );
-    assert!(err.to_string().starts_with(&want), "{err}");
 }
 
 /// A scratch Mac: the directories every macOS has above the layout (`/var/run`,
@@ -669,11 +681,11 @@ fn a_release_of_two_binaries_is_installed_whole_and_reported() {
     fs::write(from.join("kbf-daemon"), "daemon A").expect("daemon");
     let out = install_on(&mut exec, &root, A, &from, Mode::Apply).expect("install");
     for (file, text) in [("kbf", "kbf A"), ("kbf-daemon", "daemon A")] {
-        let path = format!("/usr/local/kbf/releases/{A}/{file}");
+        let path = format!("/var/lib/kbf-installer/releases/{A}/{file}");
         assert_eq!(fs::read_to_string(exec.at(&path)).expect(file), text);
         assert_eq!(mode_of(&exec, &path), 0o755);
     }
-    let r = format!("/usr/local/kbf/releases/{A}");
+    let r = format!("/var/lib/kbf-installer/releases/{A}");
     assert!(
         out.starts_with(&format!(
             "release {A}: {r} (5 bytes, sha256 {}), 0 unit(s)\nalso kbf-daemon (8 bytes, sha256 {})\n",
@@ -717,7 +729,7 @@ fn a_source_needs_one_binary_and_a_daemon_alone_will_do() {
 }
 
 /// Catches the macOS layout not being used: an install on a Mac puts the state under
-/// `/var/db/kbf-deploy` and takes the lock at `/var/run/kbf-deploy.lock`, never at
+/// `/var/db/kbf-installer` and takes the lock at `/var/run/kbf-installer/lock`, never at
 /// `/var/lib` or `/run`; it makes the `/usr/local` a fresh Mac lacks (root's, 0755) and
 /// the state directory; the links point at the release; the next-steps line names the
 /// daemon and `launchctl`, not `kbf` and `systemctl`.
@@ -732,25 +744,29 @@ fn a_mac_install_uses_the_mac_layout_and_makes_its_missing_parents() {
     let out = install_on(&mut exec, &layout, A, &a, Mode::Apply).expect("install A");
     install_on(&mut exec, &layout, B, &b, Mode::Apply).expect("install B");
     assert!(
-        out.contains("state: written to /var/db/kbf-deploy/state.json\n"),
+        out.contains("state: written to /var/db/kbf-installer/state.json\n"),
         "{out}"
     );
     assert!(
-        out.contains("restart the units that run /usr/local/kbf/current/kbf-daemon (launchctl kickstart -k system/<label>)"),
+        out.contains("restart the units that run /usr/local/kbf-installer/releases/current/kbf-daemon (launchctl kickstart -k system/<label>)"),
         "{out}"
     );
-    assert!(exec.at("/var/db/kbf-deploy/state.json").is_file());
-    assert!(exec.at("/var/run/kbf-deploy.lock").is_file());
+    assert!(exec.at("/var/db/kbf-installer/state.json").is_file());
+    assert!(exec.at("/var/run/kbf-installer/lock").is_file());
     assert!(!exec.at("/var/lib").exists() && !exec.at("/run").exists());
-    for dir in ["/usr/local", "/var/db/kbf-deploy", "/usr/local/kbf"] {
+    for dir in [
+        "/usr/local",
+        "/var/db/kbf-installer",
+        "/usr/local/kbf-installer",
+    ] {
         assert_eq!(mode_of(&exec, dir), 0o755, "{dir}");
     }
-    assert_eq!(link(&exec, "current"), Some(format!("releases/{B}")));
-    assert_eq!(link(&exec, "previous"), Some(format!("releases/{A}")));
+    assert_eq!(link(&exec, "current"), Some(B.to_owned()));
+    assert_eq!(link(&exec, "previous"), Some(A.to_owned()));
     assert_eq!(state_of(&layout).current, Some(c(B)));
     assert!(
         !exec
-            .at(&format!("/usr/local/kbf/releases/{A}/kbf"))
+            .at(&format!("/usr/local/kbf-installer/releases/{A}/kbf"))
             .exists()
     );
 
@@ -760,7 +776,7 @@ fn a_mac_install_uses_the_mac_layout_and_makes_its_missing_parents() {
         out.contains(&format!("links: current {B} -> {A}, previous {A} -> none")),
         "{out}"
     );
-    assert_eq!(link(&exec, "current"), Some(format!("releases/{A}")));
+    assert_eq!(link(&exec, "current"), Some(A.to_owned()));
 }
 
 /// Catches `/usr/local` being touched when the host has one: a Mac (or any host) whose
@@ -771,15 +787,16 @@ fn a_mac_install_uses_the_mac_layout_and_makes_its_missing_parents() {
 /// Mutant seen red: `/usr/local` always planned (the 0775 becomes 0755).
 #[test]
 fn usr_local_is_made_when_missing_and_left_alone_when_there() {
-    let (mut exec, root) = host("usr-local");
+    // The installer tree is under `/usr/local` on a Mac only.
+    let (mut exec, root) = mac("usr-local");
+    fs::create_dir(exec.at("/usr/local")).expect("seed");
     fs::set_permissions(exec.at("/usr/local"), fs::Permissions::from_mode(0o775)).expect("mode");
-    let from = source("usr-local-src", "kbf A", None);
+    let from = mac_source("usr-local-src", "daemon A");
     let out = install_on(&mut exec, &root, A, &from, Mode::Apply).expect("install");
     assert!(!out.contains("/usr/local ("), "{out}");
     assert_eq!(mode_of(&exec, "/usr/local"), 0o775);
 
-    let (mut exec, root) = host("usr-local-missing");
-    fs::remove_dir(exec.at("/usr/local")).expect("remove");
+    let (mut exec, root) = mac("usr-local-missing");
     let out = install_on(&mut exec, &root, A, &from, Mode::DryRun).expect("dry run");
     let first_step = out
         .lines()
@@ -795,6 +812,12 @@ fn usr_local_is_made_when_missing_and_left_alone_when_there() {
     );
     install_on(&mut exec, &root, A, &from, Mode::Apply).expect("install");
     assert_eq!(mode_of(&exec, "/usr/local"), 0o755);
+
+    // A Linux host's tree is not under it: no step for `/usr/local` at all.
+    let (mut exec, root) = host("usr-local-linux");
+    let linux = source("usr-local-linux-src", "kbf A", None);
+    let out = install_on(&mut exec, &root, A, &linux, Mode::DryRun).expect("dry run");
+    assert!(!out.contains("/usr/local"), "{out}");
 }
 
 /// Catches `stage` doing what `install` does: it must copy and check the release, record
@@ -816,8 +839,9 @@ fn stage_copies_and_records_the_release_and_moves_no_link() {
             pending_confirm: Some(PendingConfirm {
                 commit: c(A),
                 previous: None,
-                deadline: Some(1),
-                order_id: None,
+                activation: "1-1".to_owned(),
+                deadline_wall: Some(1),
+                deadline_mono_s: None,
                 starts_left: None,
             }),
             ..state_of(&root)
@@ -861,13 +885,14 @@ fn stage_copies_and_records_the_release_and_moves_no_link() {
     let out = String::from_utf8(out).expect("utf-8");
     assert!(out.ends_with(&format!("state: {B} staged\n")), "{out}");
     assert_eq!(
-        fs::read_to_string(exec.at(&format!("/usr/local/kbf/releases/{B}/kbf"))).expect("copied"),
+        fs::read_to_string(exec.at(&format!("/var/lib/kbf-installer/releases/{B}/kbf")))
+            .expect("copied"),
         "kbf B"
     );
     let s = state_of(&root);
     assert_eq!((s.current, s.staged), (Some(c(A)), Some(c(B))));
     assert_eq!(s.pending_confirm.map(|p| p.commit), Some(c(A)));
-    assert_eq!(link(&exec, "current"), Some(format!("releases/{A}")));
+    assert_eq!(link(&exec, "current"), Some(A.to_owned()));
     assert_eq!(link(&exec, "previous"), None);
 
     // The staged release survives a gc that removes everything else.
@@ -880,7 +905,7 @@ fn stage_copies_and_records_the_release_and_moves_no_link() {
         .expect("clear");
     gc_on(&mut exec, &root, 0).expect("gc");
     assert!(
-        exec.at(&format!("/usr/local/kbf/releases/{B}/kbf"))
+        exec.at(&format!("/var/lib/kbf-installer/releases/{B}/kbf"))
             .exists()
     );
 }
@@ -917,7 +942,8 @@ fn stage_never_replaces_a_release() {
     .expect_err("other bytes");
     assert!(matches!(err, ReleaseError::Differs { .. }), "{err}");
     assert_eq!(
-        fs::read_to_string(exec.at(&format!("/usr/local/kbf/releases/{A}/kbf"))).expect("kept"),
+        fs::read_to_string(exec.at(&format!("/var/lib/kbf-installer/releases/{A}/kbf")))
+            .expect("kept"),
         "kbf A"
     );
     let empty = scratch("deploy-release-src-stage-empty");
@@ -989,7 +1015,7 @@ fn a_stage_that_fills_the_disk_leaves_no_partial_release_and_can_be_retried() {
     let (mut exec, root) = host("disk-full");
     let from = source("disk-full", "kbf B", Some(UNITS));
     fs::write(from.join("kbf-daemon"), "daemon B").expect("a second binary");
-    let dir = exec.at(&format!("/usr/local/kbf/releases/{B}"));
+    let dir = exec.at(&format!("/var/lib/kbf-installer/releases/{B}"));
     let want = Install {
         commit: c(B),
         from: from.clone(),
@@ -1052,4 +1078,234 @@ fn a_stage_that_fills_the_disk_leaves_no_partial_release_and_can_be_retried() {
     .expect_err("the disk is full again");
     assert_eq!(fs::read_to_string(dir.join("kbf")).expect("kbf"), "kbf B");
     assert!(dir.join("units").join("kbf.slice").exists());
+}
+
+/// One look at the host, taken just before a step was applied.
+#[derive(Debug, Clone)]
+struct Glance {
+    /// `file` or `link`.
+    step: &'static str,
+    /// Whether `releases/<A>` exists under its final name.
+    published: bool,
+    /// The `.stage-` directories in `releases/`.
+    stages: Vec<String>,
+    /// Whether the stage (or final) directory already holds `kbf`.
+    kbf_there: bool,
+    /// What `state.json` names as `current`, as the state is on disk at this moment.
+    state_current: Option<CommitId>,
+}
+
+/// A [`ScratchHost`] that looks at the disk before every file and link step, and can refuse
+/// the link steps (a host that dies between the state and the links).
+struct Watch {
+    host: ScratchHost,
+    layout: Layout,
+    seen: std::cell::RefCell<Vec<Glance>>,
+    fail_links: bool,
+}
+
+impl Watch {
+    fn new(name: &str) -> Watch {
+        let (host, layout) = host(name);
+        Watch {
+            host,
+            layout,
+            seen: std::cell::RefCell::new(Vec::new()),
+            fail_links: false,
+        }
+    }
+
+    fn glance(&self, step: &'static str) {
+        let releases = self.host.at("/var/lib/kbf-installer/releases");
+        let stages: Vec<String> = fs::read_dir(&releases)
+            .map(|d| {
+                d.map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with(".stage-"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let kbf_there = releases.join(A).join("kbf").exists()
+            || stages.iter().any(|s| releases.join(s).join("kbf").exists());
+        self.seen.borrow_mut().push(Glance {
+            step,
+            published: releases.join(A).exists(),
+            stages,
+            kbf_there,
+            state_current: state::read_unlocked(&self.layout)
+                .ok()
+                .flatten()
+                .and_then(|s| s.current),
+        });
+    }
+}
+
+impl Exec for Watch {
+    fn euid(&self) -> u32 {
+        self.host.euid()
+    }
+    fn inspect(&self, path: &HostPath) -> io::Result<Option<Entry>> {
+        self.host.inspect(path)
+    }
+    fn stat(&self, path: &HostPath) -> io::Result<Option<Meta>> {
+        self.host.stat(path)
+    }
+    fn query(&self, cmd: &Cmd) -> io::Result<Output> {
+        self.host.query(cmd)
+    }
+    fn http_status(&self, url: &HttpUrl) -> io::Result<u16> {
+        self.host.http_status(url)
+    }
+    fn apply(&mut self, step: &Step) -> io::Result<()> {
+        match step {
+            Step::WriteFile { .. } => self.glance("file"),
+            Step::Symlink { .. } => {
+                self.glance("link");
+                if self.fail_links {
+                    return Err(io::Error::other("the host died before the link moved"));
+                }
+            }
+            _ => {}
+        }
+        self.host.apply(step)
+    }
+    fn check_binary(&self) -> Result<(), Untrusted> {
+        self.host.check_binary()
+    }
+}
+
+/// S19: a new release is made apart and appears under its name whole. At every file the
+/// install writes, `releases/<A>` does not exist and a `.stage-` directory does; when it is
+/// done the name holds the release, the stage is gone, and only then are the links moved
+/// (so at the first link the release is complete under its name).
+///
+/// Catches a release written in place: a crash (or a reader such as `gc`) in the middle would
+/// find `releases/<A>` half written, and the next install would refuse it as "there with
+/// other content" for ever.
+///
+/// Mutant seen red: `staged` set to `None` in `copy_release` (files written at the final name).
+#[test]
+fn a_new_release_is_made_apart_and_appears_whole_under_its_name() {
+    let mut w = Watch::new("s19-apart");
+    let a = source("s19-apart-src", "kbf A", Some(UNITS));
+    let layout = w.layout.clone();
+    let mut out = Vec::new();
+    let install_a = Install {
+        commit: c(A),
+        from: a,
+    };
+    install(&mut w, &layout, me(), &install_a, Mode::Apply, &mut out).expect("install");
+    let seen = w.seen.borrow().clone();
+    let files: Vec<_> = seen.iter().filter(|g| g.step == "file").collect();
+    assert_eq!(files.len(), 3, "kbf and two units: {seen:?}");
+    for g in &files {
+        assert!(
+            !g.published,
+            "a file was written under the final name: {g:?}"
+        );
+        assert_eq!(g.stages.len(), 1, "{g:?}");
+    }
+    let first_link = seen.iter().find(|g| g.step == "link").expect("a link");
+    assert!(
+        first_link.published && first_link.kbf_there,
+        "{first_link:?}"
+    );
+    assert!(
+        first_link.stages.is_empty(),
+        "the stage is gone: {first_link:?}"
+    );
+    assert_eq!(releases_left(&w.host), [A.to_owned(), "current".to_owned()]);
+    assert_eq!(
+        fs::read_to_string(
+            w.host
+                .at(&format!("/var/lib/kbf-installer/releases/{A}/kbf"))
+        )
+        .expect("kbf"),
+        "kbf A"
+    );
+}
+
+/// S19 and S23: the state is the truth and is written after the release is whole and before
+/// any link moves. At the first link the state already names the new release; if the host
+/// dies there (the link step refused here), the state says `current` is A, the link is
+/// absent, and `reconcile` carries the swap out.
+///
+/// Catches links moved before the state is written (a crash would leave a link the state does
+/// not know, and `reconcile` would move it back to the old release), and a state written
+/// before the release is whole.
+///
+/// Mutant seen red: `switch` writing the state after `execute` of the links.
+#[test]
+fn the_state_is_written_before_the_links_and_reconcile_finishes_a_swap_that_died() {
+    let mut w = Watch::new("s23-state-first");
+    w.fail_links = true;
+    let a = source("s23-state-first-src", "kbf A", None);
+    let layout = w.layout.clone();
+    let err = install_on_watch(&mut w, &layout, &a).expect_err("the link step is refused");
+    assert!(err.to_string().contains("died"), "{err}");
+    let seen = w.seen.borrow().clone();
+    let at_link = seen.iter().find(|g| g.step == "link").expect("a link step");
+    assert_eq!(
+        at_link.state_current,
+        Some(c(A)),
+        "the state came after the links"
+    );
+    assert!(
+        at_link.published,
+        "the release was not whole under its name yet"
+    );
+    assert_eq!(state_of(&layout).current, Some(c(A)));
+    assert_eq!(link(&w.host, "current"), None, "no link moved");
+
+    w.fail_links = false;
+    let mut log = Vec::new();
+    assert!(crate::activate::reconcile(&mut w, &layout, &mut log).expect("reconcile"));
+    assert_eq!(link(&w.host, "current"), Some(A.to_owned()));
+}
+
+fn install_on_watch(w: &mut Watch, layout: &Layout, from: &Path) -> Result<(), ReleaseError> {
+    let a = Install {
+        commit: c(A),
+        from: from.to_owned(),
+    };
+    install(w, layout, me(), &a, Mode::Apply, &mut Vec::new())
+}
+
+/// S19: a copy that fails leaves nothing under the release's name and no stage directory, and
+/// a retry then works (the old code left a half directory the retry refused).
+///
+/// Catches a stage directory left behind by a failed copy, and a name taken by a partial.
+#[test]
+fn a_failed_copy_leaves_no_stage_and_nothing_under_the_name() {
+    let from = source("s19-failed", "kbf A", None);
+    let (host, root) = host("s19-failed");
+    let mut exec = BadCopy {
+        host,
+        skip: false,
+        hit: "/kbf",
+    };
+    let a = Install {
+        commit: c(A),
+        from: from.clone(),
+    };
+    install(&mut exec, &root, me(), &a, Mode::Apply, &mut Vec::new()).expect_err("bad copy");
+    assert_eq!(releases_left(&exec.host), Vec::<String>::new());
+    let mut good = exec.host;
+    install(&mut good, &root, me(), &a, Mode::Apply, &mut Vec::new()).expect("retry");
+    assert_eq!(releases_left(&good), [A.to_owned(), "current".to_owned()]);
+}
+
+/// S19: a dry run prints the plan against the final names and makes nothing, no stage
+/// directory included; a re-install of the release that is there is done in place (no stage,
+/// no rename), as it always was.
+#[test]
+fn a_dry_run_makes_no_stage_and_a_reinstall_is_in_place() {
+    let (mut exec, root) = host("s19-dry");
+    let from = source("s19-dry-src", "kbf A", None);
+    let out = install_on(&mut exec, &root, A, &from, Mode::DryRun).expect("dry");
+    assert!(!out.contains(".stage-"), "{out}");
+    assert_eq!(releases_left(&exec), Vec::<String>::new());
+    install_on(&mut exec, &root, A, &from, Mode::Apply).expect("install");
+    let again = install_on(&mut exec, &root, A, &from, Mode::Apply).expect("again");
+    assert!(!again.contains(".stage-"), "{again}");
+    assert_eq!(releases_left(&exec), [A.to_owned(), "current".to_owned()]);
 }

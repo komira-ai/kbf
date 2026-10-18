@@ -12,8 +12,14 @@ use kbf_host::step::{Owner, Perms};
 use kbf_host::testkit::FakeExec;
 use sha2::{Digest, Sha256};
 
-use crate::layout::{self, Layout, Platform};
+use crate::layout::{Layout, Platform};
 use crate::run::{Ran, RunAs, Runner, Spawn};
+
+/// The trust directory of a Linux host, and the files in it.
+pub const TRUST_DIR: &str = "/usr/share/kbf-installer/trust";
+pub const GH_PATH: &str = "/usr/share/kbf-installer/trust/gh";
+pub const TRUSTED_ROOT_PATH: &str = "/usr/share/kbf-installer/trust/trusted_root.jsonl";
+pub const SETTINGS_PATH: &str = "/usr/share/kbf-installer/trust/installer.conf";
 
 pub const COMMIT: &str = "0f4a3825305cc79733ef098eae9725948eb5d6db";
 pub const OTHER: &str = "1111111111111111111111111111111111111111";
@@ -97,14 +103,34 @@ pub fn play(spawn: &Spawn, commit: &str, profile: &str) -> Ran {
 /// The paths of the trust list and every directory above them, as a bootstrap leaves
 /// them: root's, 0755 (files 0755 and 0644).
 pub fn trusted_host() -> FakeExec {
+    trusted_host_on(Platform::Linux)
+}
+
+/// [`trusted_host`] for a host of `platform`: its trust directory (a Mac's is under
+/// `/usr/local/share`).
+pub fn trusted_host_on(platform: Platform) -> FakeExec {
+    let (parents, dir, gh, root_file): (&[&str], &str, String, String) = match platform {
+        Platform::Linux => (
+            &["/usr", "/usr/share", "/usr/share/kbf-installer"],
+            TRUST_DIR,
+            GH_PATH.to_owned(),
+            TRUSTED_ROOT_PATH.to_owned(),
+        ),
+        Platform::MacOs => (
+            &[
+                "/usr",
+                "/usr/local",
+                "/usr/local/share",
+                "/usr/local/share/kbf-installer",
+            ],
+            "/usr/local/share/kbf-installer/trust",
+            "/usr/local/share/kbf-installer/trust/gh".to_owned(),
+            "/usr/local/share/kbf-installer/trust/trusted_root.jsonl".to_owned(),
+        ),
+    };
     let mut exec = FakeExec::new(0);
     let root = Owner { uid: 0, gid: 0 };
-    for dir in [
-        "/usr",
-        "/usr/local",
-        "/usr/local/libexec",
-        layout::INSTALLER_DIR,
-    ] {
+    for dir in parents.iter().copied().chain([dir]) {
         exec.entries.insert(
             HostPath::new(dir).expect("a path"),
             Entry::Dir {
@@ -113,7 +139,7 @@ pub fn trusted_host() -> FakeExec {
             },
         );
     }
-    for (file, mode) in [(layout::GH, 0o755), (layout::TRUSTED_ROOT, 0o644)] {
+    for (file, mode) in [(gh.as_str(), 0o755), (root_file.as_str(), 0o644)] {
         exec.entries.insert(
             HostPath::new(file).expect("a path"),
             Entry::File {

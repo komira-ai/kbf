@@ -15,7 +15,10 @@
 //!   `current` at the new one and writes the state. Only the files the source names are
 //!   compared: a file the release directory has beyond them is not noticed. A release
 //!   holds the binaries its source directory has: `kbf` (a Linux release), `kbf-daemon`
-//!   (a macOS one) or both.
+//!   (a macOS one) or both. A new release is made in `releases/.stage-<commit>.<rand>/`,
+//!   its files and directories synced, then renamed to `releases/<commit>/` and the parent
+//!   synced (S19): the final name never holds a half-written release, and the state is
+//!   written only after all of it.
 //! - `stage` does the copy and the checks of `install` and no more: no link moves, and
 //!   the state's `staged` names the release, which `gc` then keeps. It is what a
 //!   release that was verified elsewhere ([`crate::stage`]) goes through, and it
@@ -44,7 +47,7 @@ use kbf_host::step::{Owner, Perms};
 use sha2::{Digest, Sha256};
 
 use super::CommitId;
-use super::layout::{self, Layout, Platform, path};
+use super::layout::{self, Layout, Platform};
 use super::state::{self, Locked, State, StateError};
 
 /// Who owns a release: root, so only root can replace what a service runs.
@@ -210,10 +213,10 @@ fn switch<E: Exec>(
 ) -> Result<(), ReleaseError> {
     let mut planner = Planner::new(&*exec);
     match &previous {
-        Some(c) => planner.symlink(path(layout::PREVIOUS), layout::release_link(c))?,
-        None => planner.absent(path(layout::PREVIOUS))?,
+        Some(c) => planner.symlink(host.previous(), layout::release_link(c))?,
+        None => planner.absent(host.previous())?,
     };
-    planner.symlink(path(layout::CURRENT), layout::release_link(&current))?;
+    planner.symlink(host.current(), layout::release_link(&current))?;
     let plan = planner.finish();
     let _ = writeln!(
         out,
@@ -227,15 +230,19 @@ fn switch<E: Exec>(
     } else {
         Mode::DryRun
     };
-    execute(&plan, RunAs::Root, mode, exec, &mut &mut *out)?;
-    if let Some(lock) = lock {
+    // The state is the truth and goes first: a crash before the links move leaves a state the
+    // next run's reconcile carries out, never links the state does not know (S23).
+    if let Some(lock) = &lock {
         let next = State {
-            current: Some(current),
-            previous,
+            current: Some(current.clone()),
+            previous: previous.clone(),
             ..was.clone()
         };
         lock.write(&next)?;
         let _ = writeln!(out, "state: written to {}", host.state_file());
+    }
+    execute(&plan, RunAs::Root, mode, exec, &mut &mut *out)?;
+    if lock.is_some() {
         // SEAM(unit install): no verb here installs a release's units or restarts a
         // service; `linux install-units` does both. When it takes a release directory,
         // the restart goes here, after the switch.
@@ -250,7 +257,7 @@ fn switch<E: Exec>(
             out,
             "next, by hand: restart the units that run {}/{binary} ({restart}), \
              then check `kbf-deploy host status`",
-            layout::CURRENT,
+            host.current(),
         );
     }
     Ok(())
@@ -313,8 +320,10 @@ pub fn stage<E: Exec>(
     Ok(())
 }
 
-/// The plan of the release's directories and files, printed and (with `Mode::Apply`)
-/// carried out, and then each binary read back from the host and compared with the source.
+/// The release made on the host: under a stage name and renamed into place when it is new
+/// (S19), in place when `releases/<commit>/` is already there (then nothing is created, only
+/// the modes and owner are set again). A dry run prints the plan against the final names.
+/// Afterwards each binary is read back from the host and compared with the source.
 fn copy_release<E: Exec>(
     exec: &mut E,
     host: &Layout,
@@ -324,9 +333,12 @@ fn copy_release<E: Exec>(
     mode: Mode,
     out: &mut dyn Write,
 ) -> Result<(), ReleaseError> {
-    let copy = plan_copy(exec, host, owner, commit, source)?;
-    let dir = layout::release_dir(commit);
-    let existed = inspect(exec, &dir)?.is_some();
+    let final_dir = host.release_dir(commit);
+    let existed = inspect(exec, &final_dir)?.is_some();
+    // A new release is made apart and renamed; the plan of a dry run names the final paths.
+    let staged = (!existed && mode == Mode::Apply).then(|| host.stage_dir(commit, &unique()));
+    let target = staged.clone().unwrap_or_else(|| final_dir.clone());
+    let copy = plan_copy(exec, host, owner, commit, &target, source)?;
     // The first binary is named in the line, as it was when a release held only `kbf`;
     // each other one gets a line of its own.
     let ((_, first), others) = source
@@ -335,8 +347,7 @@ fn copy_release<E: Exec>(
         .expect("a source holds at least one binary");
     let _ = writeln!(
         out,
-        "release {commit}: {} ({} bytes, sha256 {}), {} unit(s)",
-        layout::release_dir(commit),
+        "release {commit}: {final_dir} ({} bytes, sha256 {}), {} unit(s)",
         first.len(),
         sha256(first),
         source.units.len()
@@ -354,18 +365,65 @@ fn copy_release<E: Exec>(
         .and_then(|()| {
             if mode == Mode::Apply {
                 for (name, bytes) in &source.binaries {
-                    let bin = layout::release_file(commit, name);
+                    let bin = target_file(&target, name);
                     verify(inspect(exec, &bin)?, bin, bytes)?;
                 }
             }
             Ok(())
+        })
+        .and_then(|()| match &staged {
+            Some(stage) => publish(host, stage, &final_dir),
+            None => Ok(()),
         });
-    // A dry run changes nothing, so a failed copy is always an apply.
-    if copied.is_err() && !existed {
+    // A dry run changes nothing, so a failed copy is always an apply. What was made apart
+    // goes; a release that was there already is left as it was.
+    if copied.is_err()
+        && let Some(stage) = &staged
+    {
         // Best effort: the error returned is the copy's.
-        let _ = remove_partial(exec, host, &dir);
+        let _ = remove_partial(exec, host, stage);
     }
     copied
+}
+
+/// `dir/name` for a binary or `units`, in the release being made at `dir`.
+fn target_file(dir: &HostPath, name: &str) -> HostPath {
+    child(dir, name)
+}
+
+/// A name no other run of this program is using: the pid and the clock, in hex.
+fn unique() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("{:x}{:x}", std::process::id(), nanos)
+}
+
+/// Sync every file and directory of the release made at `stage`, rename it to `final_dir`
+/// and sync the directory that holds the name (S19): after this returns the release is whole
+/// on disk under its name, and before it nothing is under that name.
+fn publish(host: &Layout, stage: &HostPath, final_dir: &HostPath) -> Result<(), ReleaseError> {
+    let (from, to) = (host.join(stage), host.join(final_dir));
+    sync_tree(&from).map_err(read_failed(&from))?;
+    fs::rename(&from, &to).map_err(read_failed(&to))?;
+    let parent = to.parent().expect("a release is in releases/");
+    fs::File::open(parent)
+        .and_then(|d| d.sync_all())
+        .map_err(read_failed(parent))
+}
+
+/// `fsync` every file under `dir`, then every directory in it, deepest first, then `dir`.
+fn sync_tree(dir: &Path) -> io::Result<()> {
+    for item in fs::read_dir(dir)? {
+        let item = item?;
+        let path = item.path();
+        if item.file_type()?.is_dir() {
+            sync_tree(&path)?;
+        } else {
+            fs::File::open(&path)?.sync_all()?;
+        }
+    }
+    fs::File::open(dir)?.sync_all()
 }
 
 /// Remove the release directory a failed copy made (a full disk is the usual cause), so
@@ -393,54 +451,61 @@ fn remove_partial<E: Exec>(
     Ok(())
 }
 
-/// The directories and files of the release, root's; a release directory already there
-/// must hold the same files (its modes and owner are then set again, nothing else).
-/// `/usr/local` is made when the host has none, and left as it is when it has.
+/// The directories and files of the release at `dir` (its final name, or the stage name),
+/// root's; a release directory already there must hold the same files (its modes and owner
+/// are then set again, nothing else). The directories above it are made when the host has
+/// none, and left as they are when it has.
 fn plan_copy<E: Exec>(
     exec: &E,
     host: &Layout,
     owner: Owner,
     commit: &CommitId,
+    dir: &HostPath,
     source: &Source,
 ) -> Result<Plan, ReleaseError> {
-    let dir = layout::release_dir(commit);
-    let units = layout::release_file(commit, layout::RELEASE_UNITS);
+    let units = child(dir, layout::RELEASE_UNITS);
     let mut files = Vec::new();
     for (name, bytes) in &source.binaries {
-        files.push((layout::release_file(commit, name), BINARY, bytes));
+        files.push((child(dir, name), BINARY, bytes));
     }
     for (name, bytes) in &source.units {
         files.push((child(&units, name), UNIT, bytes));
     }
-    match inspect(exec, &dir)? {
-        None => {}
-        Some(Entry::Dir { .. }) => {
-            for (path, _, want) in &files {
-                let same = match inspect(exec, path)? {
-                    Some(Entry::File { bytes, .. }) => bytes == **want,
-                    _ => false,
-                };
-                if !same {
-                    return Err(ReleaseError::Differs { path: path.clone() });
+    let final_dir = host.release_dir(commit);
+    if *dir == final_dir {
+        match inspect(exec, dir)? {
+            None => {}
+            Some(Entry::Dir { .. }) => {
+                for (path, _, want) in &files {
+                    let same = match inspect(exec, path)? {
+                        Some(Entry::File { bytes, .. }) => bytes == **want,
+                        _ => false,
+                    };
+                    if !same {
+                        return Err(ReleaseError::Differs { path: path.clone() });
+                    }
                 }
             }
+            Some(_) => return Err(ReleaseError::NotADirectory(dir.clone())),
         }
-        Some(_) => return Err(ReleaseError::NotADirectory(dir)),
     }
     let mut planner = Planner::new(exec);
     let mut dirs = Vec::new();
     // A fresh macOS has no `/usr/local`. An existing one is not touched: its owner and
     // mode are the host's, and the trust check (crate::trust) refuses one others write to.
-    let usr_local = path(layout::USR_LOCAL);
-    if inspect(exec, &usr_local)?.is_none() {
+    if let Some(usr_local) = missing_usr_local(exec, host)? {
         dirs.push(usr_local);
     }
-    dirs.extend([
+    for d in [
         host.state_dir(),
-        path(layout::KBF_DIR),
-        path(layout::RELEASES),
-        dir,
-    ]);
+        host.install_root(),
+        host.releases(),
+        dir.clone(),
+    ] {
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
     if !source.units.is_empty() {
         dirs.push(units);
     }
@@ -451,6 +516,15 @@ fn plan_copy<E: Exec>(
         planner.file(path, perms, Some(owner), bytes.clone())?;
     }
     Ok(planner.finish())
+}
+
+/// `/usr/local` when the installer tree is under it and the host has none.
+fn missing_usr_local<E: Exec>(exec: &E, host: &Layout) -> Result<Option<HostPath>, ReleaseError> {
+    let usr_local = HostPath::new("/usr/local").expect("a path");
+    if !host.install_root().as_str().starts_with("/usr/local/") {
+        return Ok(None);
+    }
+    Ok(inspect(exec, &usr_local)?.is_none().then_some(usr_local))
 }
 
 /// The copied binary at `path` (`copied`, read back from the host after the copy and
@@ -479,7 +553,7 @@ pub fn rollback<E: Exec>(
     let Some(previous) = state.previous.clone() else {
         return Err(ReleaseError::NoPrevious);
     };
-    if !has_binary(exec, &previous) {
+    if !has_binary(exec, host, &previous) {
         return Err(ReleaseError::PreviousGone(previous));
     }
     // The state records no release before the previous one, so `previous` goes.
@@ -488,10 +562,10 @@ pub fn rollback<E: Exec>(
 
 /// Whether the release `commit` has a binary in its directory. Any will do: a Linux
 /// release holds `kbf`, a macOS one `kbf-daemon`.
-pub(crate) fn has_binary<E: Exec>(exec: &E, commit: &CommitId) -> bool {
+pub(crate) fn has_binary<E: Exec>(exec: &E, host: &Layout, commit: &CommitId) -> bool {
     layout::RELEASE_BINARIES.iter().any(|name| {
         matches!(
-            exec.stat(&layout::release_file(commit, name)),
+            exec.stat(&host.release_file(commit, name)),
             Ok(Some(Meta {
                 kind: Kind::File,
                 ..
@@ -517,8 +591,8 @@ pub fn gc<E: Exec>(
         .into_iter()
         .flatten()
         .collect();
-    for link in [layout::CURRENT, layout::PREVIOUS] {
-        if let Some(Entry::Link { target }) = inspect(exec, &path(link))? {
+    for link in [host.current(), host.previous()] {
+        if let Some(Entry::Link { target }) = inspect(exec, &link)? {
             kept.extend(linked(&target));
         }
     }
@@ -533,7 +607,7 @@ pub fn gc<E: Exec>(
     let gone: Vec<CommitId> = old.into_iter().skip(keep).map(|(_, c)| c).collect();
     let mut paths = Vec::new();
     for commit in &gone {
-        let dir = layout::release_dir(commit);
+        let dir = host.release_dir(commit);
         contents(host, &dir, &mut paths)?;
         paths.push(dir);
     }
@@ -559,10 +633,10 @@ fn list(items: &[String]) -> String {
     }
 }
 
-/// The commit a link target `releases/<commit>` names.
+/// The commit a link target `<commit>` names (the last component, so a link written as
+/// `releases/<commit>` by an older build names it too).
 fn linked(target: &Path) -> Option<CommitId> {
-    let name = target.strip_prefix("releases").ok()?.to_str()?;
-    CommitId::new(name).ok()
+    CommitId::new(target.file_name()?.to_str()?).ok()
 }
 
 /// Each directory in `releases/` named by a commit id, with its modification time.
@@ -570,7 +644,7 @@ fn releases(
     host: &Layout,
     out: &mut dyn Write,
 ) -> Result<Vec<(CommitId, SystemTime)>, ReleaseError> {
-    let dir = host.join(&path(layout::RELEASES));
+    let dir = host.join(&host.releases());
     let items = match fs::read_dir(&dir) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
         listed => listed
