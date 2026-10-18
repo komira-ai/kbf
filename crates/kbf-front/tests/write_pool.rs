@@ -1011,6 +1011,36 @@ async fn a_shared_block_is_flushed_as_one_object() {
     }
 }
 
+/// The text logged so far by the process's one global subscriber, installed on first use.
+/// Global, not per-thread: the pool's writer threads log, not the test's.
+fn captured_log() -> &'static Mutex<Vec<u8>> {
+    static LOG: std::sync::OnceLock<&'static Mutex<Vec<u8>>> = std::sync::OnceLock::new();
+    struct Sink(&'static Mutex<Vec<u8>>);
+    impl io::Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    LOG.get_or_init(|| {
+        let log: &'static Mutex<Vec<u8>> = Box::leak(Box::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || Sink(log))
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("the only subscriber");
+        log
+    })
+}
+
 /// The idle bound is measured from the last chunk, not from the job's start: a stream
 /// whose chunks come every 0.6 x idle (never a stall) for over 2 x idle in all commits and
 /// reads back. Catches a total-lifetime timeout, which would kill every healthy upload
@@ -1059,9 +1089,13 @@ fn a_slow_but_steady_stream_outlives_the_idle_time() {
 /// the head-of-line blocking), is then acknowledged and on the tier, once the idle time
 /// (300 ms) has passed, and not much later; the stalled upload's next call fails
 /// UNAVAILABLE (retryable, not INVALID_ARGUMENT); and its block of its own is closed (only
-/// the grouped block the small blob went to is open).
+/// the grouped block the small blob went to is open). It also pins what an operator sees:
+/// exactly one WARN, "a streamed blob sent no chunk in time; its writer is freed", with
+/// `received` the bytes sent before the stall (1 MiB). The warning is logged on a writer
+/// thread, so the capture is a global subscriber (a thread-local one would see nothing).
 #[test]
 fn a_stalled_stream_loses_its_writer_and_fails_retryably() {
+    let log = captured_log();
     bounded(
         "a_stalled_stream_loses_its_writer_and_fails_retryably",
         async {
@@ -1124,4 +1158,18 @@ fn a_stalled_stream_loses_its_writer_and_fails_retryably() {
             open_files_settle_at(&rig, &cache, 1).await;
         },
     );
+    let text = String::from_utf8(log.lock().unwrap_or_else(PoisonError::into_inner).clone())
+        .expect("utf-8");
+    let freed: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("a streamed blob sent no chunk in time; its writer is freed"))
+        .collect();
+    assert_eq!(freed.len(), 1, "one warning per freed writer: {text}");
+    assert!(freed[0].contains("WARN"), "{}", freed[0]);
+    assert!(
+        freed[0].contains(&format!("received={MIB}")),
+        "the bytes received before the stall: {}",
+        freed[0]
+    );
+    assert!(freed[0].contains("idle=300ms"), "{}", freed[0]);
 }
