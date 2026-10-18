@@ -10,7 +10,9 @@
 //!    link and read once, and acts on them in (epoch, id) order, once each: `activate`
 //!    checks the order, has the [`fetcher::Fetcher`] pull and verify the release if its
 //!    directory is not there, swaps it in on trial and restarts the one configured
-//!    service; `confirm` keeps it; `revert` goes back;
+//!    service; `confirm` keeps it; `revert` goes back; `frontend_update` starts the
+//!    frontend's new release as the idle instance and keeps or undoes it itself
+//!    ([`crate::frontend`]), never touching the node's service;
 //! 3. writes `status.json` (root's, world-readable) for the node to report.
 //!
 //! `kbf-installer boot-check` runs as the service's `ExecStartPre` on Linux: it counts the

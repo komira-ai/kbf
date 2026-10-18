@@ -81,11 +81,13 @@ words, in either order): one JSON object on one line of stdout, exit 0, the fiel
 sorted by name.
 
 ```text
-{"commit":"0123456789ab","min_protocol":1,"profile":"release","protocol":1,"state_schema":1,"version":"0.1.0"}
+{"commit":"0123456789ab","handover_protocol":1,"min_protocol":1,"profile":"release","protocol":1,"state_schema":1,"version":"0.1.0"}
 ```
 
 - `commit`: the first 12 hex digits of the commit built (`unknown` for a build with no
   git checkout); compare it with the first 12 of the commit in the asset's name.
+- `handover_protocol`: the version of the frontend handover the binary speaks; a
+  frontend update starts the new release beside the old only when the two are equal.
 - `profile`: `release` for every asset here (the workflow refuses a `debug` one).
 - `protocol` and `min_protocol`: the newest and the oldest `kbf.worker.v1` version the
   binary speaks. The daemon half speaks exactly `protocol`; the server half accepts

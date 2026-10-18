@@ -43,7 +43,7 @@ struct File<'a> {
 fn word(state: &State, memory: &Memory) -> &'static str {
     if memory.fetching {
         "fetching"
-    } else if state.pending_confirm.is_some() {
+    } else if state.pending_confirm.is_some() | memory.frontend_pending {
         "activated_unconfirmed"
     } else if memory.event == Event::Refused {
         "refused"

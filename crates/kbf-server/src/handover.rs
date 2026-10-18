@@ -57,6 +57,11 @@ pub(crate) use outgoing::{Facts, Holder, Stand};
 pub(crate) use ready::Ready;
 pub use wire::Message;
 
+/// The protocol version a hello names: what `kbf --version --json` reports as
+/// `handover_protocol`, so a host can tell before it starts an instance whether the two
+/// frontends can hand over.
+pub const HANDOVER_PROTOCOL: u32 = wire::PROTOCOL;
+
 use crate::farm::StateError;
 
 /// `kbf frontend`'s flags for handing over.

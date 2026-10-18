@@ -1,15 +1,17 @@
 //! An order record: what the unprivileged `kbf` leaves in the order spool after the
-//! frontend ordered this host to activate, confirm or revert a release.
+//! frontend ordered this host to activate, confirm or revert a release, or to update the
+//! frontend itself.
 //!
 //! The format is `kbf_update::OrderRecord`, which the writer builds and this side reads, in
 //! a file named `<epoch:020>-<order_id:020>.json`. The writer is the service user, so the
-//! record is untrusted: the name must be the pair inside, the verb one of three words, the
+//! record is untrusted: the name must be the pair inside, the verb one of four words, the
 //! commit a full commit, an activation's claims complete, and no other or repeated key is
 //! accepted.
 
 use kbf_update::{Locator, OrderRecord, RecordError, Verb as RecordVerb};
 
 use crate::CommitId;
+use crate::helper::memory::Kind;
 
 /// How far above the last acted-on epoch an order's may be. Epochs move only when a store is
 /// restored (a handover keeps it), so a jump of more than this is a mistake or an attack;
@@ -26,13 +28,25 @@ pub enum Verb {
     Activate,
     Confirm,
     Revert,
+    /// The frontend's own update (its host's `kbf-frontend@` units), not a node's.
+    FrontendUpdate,
+}
+
+impl Verb {
+    /// Whose sequence of orders it belongs to: the floors are kept per kind.
+    #[must_use]
+    pub fn kind(self) -> Kind {
+        match self {
+            Verb::FrontendUpdate => Kind::Frontend,
+            Verb::Activate | Verb::Confirm | Verb::Revert => Kind::Node,
+        }
+    }
 }
 
 /// What an activation says the release is and where it is, from the record: claims, not
 /// trust.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Claims {
-    pub components: Vec<Locator>,
     pub platform: String,
     pub protocol: u32,
     pub min_protocol: u32,
@@ -52,7 +66,10 @@ pub struct Order {
     pub commit: CommitId,
     /// The confirm window the frontend asks for; the helper clamps it.
     pub window_s: u32,
-    /// For an activation.
+    /// Where an activation's or a frontend update's release is.
+    pub components: Vec<Locator>,
+    /// For an activation: the facts the frontend preflighted. A frontend update may have
+    /// none (its release store keeps no preflight facts).
     pub claims: Option<Claims>,
 }
 
@@ -96,9 +113,10 @@ pub fn parse(epoch: u64, id: u64, bytes: &[u8]) -> Result<Order, OrderFault> {
         RecordVerb::Activate => Verb::Activate,
         RecordVerb::Confirm => Verb::Confirm,
         RecordVerb::Revert => Verb::Revert,
+        RecordVerb::FrontendUpdate => Verb::FrontendUpdate,
     };
+    let components = record.components;
     let claims = record.expected.map(|f| Claims {
-        components: record.components,
         platform: f.platform,
         protocol: f.protocol,
         min_protocol: f.min_protocol,
@@ -112,6 +130,7 @@ pub fn parse(epoch: u64, id: u64, bytes: &[u8]) -> Result<Order, OrderFault> {
         verb,
         commit,
         window_s: record.window_s,
+        components,
         claims,
     })
 }

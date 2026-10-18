@@ -1,0 +1,35 @@
+# The frontend's template unit, two instances, a and b (docs/design/frontend-handover.md).
+# Only one serves at a time. An update by kbf-installer points slots/<idle> at the new
+# release and starts the idle instance while the other serves; the old one stands down,
+# relays its open streams until they close, and exits by itself.
+#
+# The command runs through slots/%i, never releases/current: a crash restart of the
+# serving instance must not pick up a release that is only being tried. `current` moves
+# when kbf-installer confirms the update.
+[Unit]
+Description=kbf build farm frontend, instance %i
+ConditionPathExists=/etc/kbf/kbf.toml
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# kbf sends READY=1 once it serves and its probes pass, so `systemctl start` of the idle
+# instance returns only when it can take the builds.
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=120
+RuntimeDirectory=kbf-frontend
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+User=kbf
+ExecStart=/usr/local/kbf/slots/%i/kbf --mode=frontend --instance=%i --config /etc/kbf/kbf.toml
+# The instance that handed over drains: open streams run until their action is done, with
+# no deadline, so systemd never kills it for taking long. kbf-installer never stops it.
+KillSignal=SIGTERM
+TimeoutStopSec=infinity
+Restart=on-failure
+RestartPreventExitStatus=2
+
+[Install]
+DefaultInstance=a
+WantedBy=multi-user.target

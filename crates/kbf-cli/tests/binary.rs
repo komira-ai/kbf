@@ -85,6 +85,7 @@ fn version_json_reports_the_build_identity() {
             fields,
             [
                 "commit",
+                "handover_protocol",
                 "min_protocol",
                 "profile",
                 "protocol",
@@ -102,6 +103,10 @@ fn version_json_reports_the_build_identity() {
         };
         assert_eq!(v["profile"], profile);
         assert_eq!(v["protocol"], kbf_server::worker::PROTOCOL_VERSION);
+        assert_eq!(
+            v["handover_protocol"],
+            kbf_server::handover::HANDOVER_PROTOCOL
+        );
         assert_eq!(
             v["min_protocol"],
             kbf_server::worker::OLDEST_PROTOCOL_VERSION

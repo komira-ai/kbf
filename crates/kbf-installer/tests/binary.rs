@@ -268,3 +268,53 @@ fn passes_end_the_run_and_an_unreadable_memory_stops_it() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("kbf-installer:"));
 }
+
+/// Catches the frontend flags half given or aimed off the host: instance a's `/readyz`
+/// without b's (or the reverse) and a URL that is not a numeric loopback are usage errors
+/// (exit 2) that name the flag, and a valid pair runs a pass like any other.
+#[test]
+fn the_frontend_flags_come_as_a_pair_and_stay_on_loopback() {
+    let root = root("frontend-flags");
+    let base = [
+        "run",
+        "--passes",
+        "1",
+        "--interval-secs",
+        "0",
+        "--unit",
+        "kbf.service",
+    ];
+    let with = |extra: &[&str]| {
+        let mut args = base.to_vec();
+        args.extend_from_slice(extra);
+        helper(&root, &args)
+    };
+    for extra in [
+        ["--frontend-readyz-a", "http://127.0.0.1:1/readyz"],
+        ["--frontend-readyz-b", "http://127.0.0.1:2/readyz"],
+    ] {
+        let out = with(&extra);
+        assert_eq!(out.status.code(), Some(2), "{extra:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("--frontend-readyz-"), "{err}");
+    }
+    let out = with(&[
+        "--frontend-readyz-a",
+        "http://192.0.2.1:1/readyz",
+        "--frontend-readyz-b",
+        "http://127.0.0.1:2/readyz",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("loopback"));
+    let out = with(&[
+        "--frontend-readyz-a",
+        "http://127.0.0.1:1/readyz",
+        "--frontend-readyz-b",
+        "http://[::1]:2/readyz",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

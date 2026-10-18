@@ -690,12 +690,12 @@ fn the_record_kbf_update_writes_is_the_order_this_side_reads() {
     assert_eq!((read.id, read.epoch, read.generation), (5, 2, 9));
     assert_eq!(read.verb, OrderVerb::Activate);
     assert_eq!(read.commit, c(B));
+    assert_eq!(read.components[0].sha256, "ab".repeat(32));
     let claims = read.claims.expect("claims");
     assert_eq!(
         (claims.protocol, claims.min_protocol, claims.state_schema),
         (7, 6, 3)
     );
-    assert_eq!(claims.components[0].sha256, "ab".repeat(32));
     // The name must be the pair inside.
     assert!(order::parse(2, 6, &bytes).is_err());
     assert!(order::parse(3, 5, &bytes).is_err());

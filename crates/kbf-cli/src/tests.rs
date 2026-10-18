@@ -760,6 +760,10 @@ fn the_identity_is_the_libraries_own_and_both_halves_speak_one_protocol() {
         v["min_protocol"],
         kbf_server::worker::OLDEST_PROTOCOL_VERSION
     );
+    assert_eq!(
+        v["handover_protocol"],
+        kbf_server::handover::HANDOVER_PROTOCOL
+    );
     assert_eq!(v["state_schema"], kbf_state::sqlite::SCHEMA_VERSION);
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
     assert!(

@@ -7,12 +7,15 @@ use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use kbf_host::{HostExec, HostPath, Root};
+use kbf_host::{HostExec, HostPath, HttpUrl, Root};
 use kbf_installer::activate;
+use kbf_installer::frontend::probe::RunnerProbe;
+use kbf_installer::frontend::{self, Frontend, FrontendConfig};
 use kbf_installer::helper::cycle::{Config, Helper};
 use kbf_installer::helper::restart::Restart;
 use kbf_installer::helper::{fetcher, leases};
 use kbf_installer::layout::{Layout, Platform};
+use kbf_installer::run::SystemRunner;
 
 #[derive(Parser)]
 #[command(name = "kbf-installer", version)]
@@ -60,6 +63,23 @@ struct RunArgs {
     /// The starts a release on trial gets before it is reverted (Linux).
     #[arg(long, default_value_t = 3)]
     starts: u32,
+    /// Instance a's `/readyz` on loopback. With instance b's, this host updates its frontend
+    /// (`frontend_update` records); without them such a record is refused.
+    #[arg(long, value_parser = frontend::probe::loopback, requires = "frontend_readyz_b")]
+    frontend_readyz_a: Option<HttpUrl>,
+    /// Instance b's `/readyz`.
+    #[arg(long, value_parser = frontend::probe::loopback, requires = "frontend_readyz_a")]
+    frontend_readyz_b: Option<HttpUrl>,
+    /// The confirm window a frontend update gets (120 to 1800).
+    #[arg(long, default_value_t = 900)]
+    frontend_window_secs: u64,
+    /// The passes in a row the new frontend instance must be ready before it is kept.
+    #[arg(long, default_value_t = 3)]
+    frontend_looks: u32,
+    /// The longest undoing a frontend update waits for the old instance to stop and come back
+    /// before an operator is asked.
+    #[arg(long, default_value_t = 300)]
+    frontend_revert_bound_secs: u64,
     /// Stop after this many passes (a rehearsal or a test); without it, run until stopped.
     #[arg(long)]
     passes: Option<u64>,
@@ -109,6 +129,26 @@ fn run(root: PathBuf, args: RunArgs) -> Result<(), String> {
         Box::new(fetcher::NotWired),
         Box::new(leases::NotWired),
     );
+    if let (Some(a), Some(b)) = (args.frontend_readyz_a, args.frontend_readyz_b) {
+        let cfg = FrontendConfig {
+            readyz_a: a,
+            readyz_b: b,
+            window_s: args.frontend_window_secs,
+            looks: args.frontend_looks,
+            revert_bound_s: args.frontend_revert_bound_secs,
+        };
+        // The Envoy check is wired by a later change; until then a frontend update is refused
+        // (`envoy_range`) rather than started in front of an Envoy nobody looked at.
+        let probe = RunnerProbe {
+            runner: SystemRunner,
+            platform: Platform::current(),
+        };
+        helper = helper.with_frontend(Frontend::new(
+            cfg,
+            Box::new(frontend::NotWired),
+            Box::new(probe),
+        ));
+    }
     helper.recover().map_err(|e| e.to_string())?;
     let mut left = args.passes;
     while left != Some(0) {

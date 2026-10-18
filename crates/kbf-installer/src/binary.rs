@@ -114,6 +114,9 @@ impl BinaryKind {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Version {
     pub commit: String,
+    /// The frontend handover protocol; releases from before it was reported have none.
+    #[serde(default)]
+    pub handover_protocol: Option<u64>,
     pub min_protocol: u64,
     pub protocol: u64,
     pub profile: String,

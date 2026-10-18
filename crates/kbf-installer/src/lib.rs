@@ -18,6 +18,9 @@
 //! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
 //!   named by.
 //!
+//! The frontend's own update (the idle instance of `kbf-frontend@.service`, started beside
+//! the serving one and kept or undone by the installer) is [`frontend`].
+//!
 //! The root helper of the pull-based updates is [`helper`], run by the `kbf-installer`
 //! binary (`run`, `boot-check`).
 //!
@@ -45,6 +48,7 @@ pub mod binary;
 pub mod darwin;
 #[cfg(test)]
 mod fixtures;
+pub mod frontend;
 pub mod helper;
 pub mod layout;
 pub mod refusal;

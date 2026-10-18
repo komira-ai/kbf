@@ -13,6 +13,8 @@ use std::io::Write;
 
 use crate::CommitId;
 use crate::activate::{self, Activated, Arm, Confirmed, Expiry};
+use crate::frontend::pending::{self, FileError};
+use crate::frontend::{Begun, Frontend, FrontendError, Progress};
 use crate::layout::{Layout, Platform};
 use crate::release::ReleaseError;
 use crate::spool::{Entry, read_capped};
@@ -53,6 +55,14 @@ pub enum HelperError {
     Io(#[from] std::io::Error),
     #[error("helper.json: {0}")]
     Memory(String),
+    #[error("the frontend update: {0}")]
+    Frontend(#[from] FrontendError),
+}
+
+impl From<FileError> for HelperError {
+    fn from(e: FileError) -> HelperError {
+        HelperError::Frontend(e.into())
+    }
 }
 
 /// A host's helper: its layout, how it is changed, and its flags.
@@ -66,6 +76,8 @@ pub struct Helper<E: Exec> {
     written: Vec<u8>,
     fetcher: Box<dyn Fetcher>,
     leases: Box<dyn LeaseSource>,
+    /// The frontend's update, when this host was set up for one.
+    frontend: Option<Frontend>,
 }
 
 fn memory_path(host: &Layout) -> HostPath {
@@ -89,7 +101,16 @@ impl<E: Exec> Helper<E> {
             written: Vec::new(),
             fetcher,
             leases,
+            frontend: None,
         }
+    }
+
+    /// Set the host up to update its frontend: a `frontend_update` record is acted on, and
+    /// a pending one is moved on every pass. Without it such a record is refused.
+    #[must_use]
+    pub fn with_frontend(mut self, frontend: Frontend) -> Helper<E> {
+        self.frontend = Some(frontend);
+        self
     }
 
     /// The host's executor, for a test to read what was done.
@@ -153,6 +174,7 @@ impl<E: Exec> Helper<E> {
         let mut memory = self.load()?;
         self.restart_if_owed(&mut memory)?;
         self.expire(now, &mut memory)?;
+        self.advance_frontend(now, &mut memory)?;
         self.orders(now, &mut memory)?;
         self.restart_if_owed(&mut memory)?;
         self.report(&memory)
@@ -287,6 +309,8 @@ impl<E: Exec> Helper<E> {
     }
 
     /// Decide what to do with one record read: act on it, drop it as a replay, or refuse it.
+    /// The floor it is held to is its kind's: a node's orders and the frontend's own update
+    /// are separate sequences.
     fn take(
         &mut self,
         parsed: Result<Order, String>,
@@ -295,37 +319,35 @@ impl<E: Exec> Helper<E> {
         memory: &mut Memory,
     ) -> Result<(), HelperError> {
         match parsed {
-            Ok(o)
-                if memory.acked_epoch != 0
-                    && o.epoch > memory.acked_epoch.saturating_add(order::MAX_EPOCH_JUMP) =>
-            {
-                refuse(
-                    memory,
-                    &format!(
-                        "order {} is from epoch {}, more than {} above the last acted on ({}): \
-                         not acted on",
-                        o.id,
-                        o.epoch,
-                        order::MAX_EPOCH_JUMP,
-                        memory.acked_epoch
-                    ),
-                );
-            }
-            Ok(o) if o.epoch < memory.acked_epoch => {
-                refuse(
-                    memory,
-                    &format!(
-                        "order {} is from epoch {}, older than the last acted on ({})",
-                        o.id, o.epoch, memory.acked_epoch
-                    ),
-                );
-            }
-            // The same epoch and an id not above the last: a replay, dropped silently.
-            Ok(o) if o.epoch == memory.acked_epoch && o.id <= memory.acked_order_id => {}
             Ok(o) => {
-                self.act(&o, now, memory)?;
-                memory.acked_order_id = o.id;
-                memory.acked_epoch = o.epoch;
+                let kind = o.verb.kind();
+                let (acked_epoch, acked_id) = memory.floor(kind);
+                if acked_epoch != 0 && o.epoch > acked_epoch.saturating_add(order::MAX_EPOCH_JUMP) {
+                    refuse(
+                        memory,
+                        &format!(
+                            "order {} is from epoch {}, more than {} above the last acted on ({}): \
+                             not acted on",
+                            o.id,
+                            o.epoch,
+                            order::MAX_EPOCH_JUMP,
+                            acked_epoch
+                        ),
+                    );
+                } else if o.epoch < acked_epoch {
+                    refuse(
+                        memory,
+                        &format!(
+                            "order {} is from epoch {}, older than the last acted on ({})",
+                            o.id, o.epoch, acked_epoch
+                        ),
+                    );
+                } else if o.epoch == acked_epoch && o.id <= acked_id {
+                    // The same epoch and an id not above the last: a replay, dropped silently.
+                } else {
+                    self.act(&o, now, memory)?;
+                    memory.acknowledge(kind, o.epoch, o.id);
+                }
             }
             // Not acknowledged: a garbage file must not move the floor.
             Err(why) => refuse(memory, &format!("order file {name}: {why}")),
@@ -338,6 +360,9 @@ impl<E: Exec> Helper<E> {
     /// revert then moves the links, so the restart is owed (and saved) before the verb runs;
     /// a kill between the links and the next save then leaves the restart for the next pass.
     fn act(&mut self, order: &Order, now: u64, memory: &mut Memory) -> Result<(), HelperError> {
+        if order.verb == Verb::FrontendUpdate {
+            return self.frontend_update(order, now, memory);
+        }
         let before = self.state()?;
         if order.verb == Verb::Activate
             && let Err(why) = self.prepare(order, &before, memory)
@@ -354,6 +379,7 @@ impl<E: Exec> Helper<E> {
             Verb::Activate => self.activate(order, now),
             Verb::Confirm => self.confirm(order, &before),
             Verb::Revert => self.revert(),
+            Verb::FrontendUpdate => unreachable!("taken above"),
         };
         let moved = self.moved(&before)?;
         match result {
@@ -396,12 +422,22 @@ impl<E: Exec> Helper<E> {
                 claims.platform
             ));
         }
-        let mut names: Vec<&str> = claims.components.iter().map(|c| c.name.as_str()).collect();
+        let mut names: Vec<&str> = order.components.iter().map(|c| c.name.as_str()).collect();
         names.sort_unstable();
         if names != needs {
             return Err(format!(
                 "order {id} names components {names:?}; this platform needs exactly {needs:?}"
             ));
+        }
+        // A frontend update moves `current` when it is confirmed: not while one is in flight.
+        match pending::load(&self.host) {
+            Ok(file) if file.frontend_pending.is_none() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "order {id}: a frontend update is in flight; not activating"
+                ));
+            }
+            Err(e) => return Err(format!("order {id}: {e}")),
         }
         // One confirm window at a time, never two timers. The same order again (a pass
         // that died after the swap) is the repeat `activate` recognises.
@@ -428,7 +464,7 @@ impl<E: Exec> Helper<E> {
         // pulls it or finds it.
         let rec = ReleaseLocator {
             commit: order.commit.clone(),
-            components: claims.components.clone(),
+            components: order.components.clone(),
         };
         // The node is told a fetch is under way; it may take minutes.
         memory.fetching = true;
@@ -507,7 +543,64 @@ impl<E: Exec> Helper<E> {
         }
     }
 
+    /// A `frontend_update` order: handed to the frontend step, which writes its own record and
+    /// owes no restart of the node's service. Refused when this host has no frontend set up.
+    fn frontend_update(
+        &mut self,
+        order: &Order,
+        now: u64,
+        memory: &mut Memory,
+    ) -> Result<(), HelperError> {
+        let Some(frontend) = &self.frontend else {
+            refuse(
+                memory,
+                "frontend_update: this installer was not set up to update a frontend",
+            );
+            return self.save(memory);
+        };
+        match frontend.begin(&mut self.exec, &self.host, &*self.fetcher, order, now)? {
+            Begun::Refused(why) => refuse(memory, &why),
+            Begun::Started => {
+                memory.event = Event::Idle;
+                memory.refusal = String::new();
+            }
+            Begun::AlreadyRunning => {
+                memory.event = Event::Idle;
+                memory.refusal = format!("{} already runs on the frontend", order.commit);
+            }
+        }
+        self.save(memory)
+    }
+
+    /// Move a pending frontend update one step, and say what came of it.
+    fn advance_frontend(&mut self, now: u64, memory: &mut Memory) -> Result<(), HelperError> {
+        let Some(frontend) = &self.frontend else {
+            return Ok(());
+        };
+        let before = memory.clone();
+        match frontend.advance(&mut self.exec, &self.host, now, &mut self.log)? {
+            Progress::Idle | Progress::Waiting => return Ok(()),
+            Progress::Confirmed(_) => {
+                memory.event = Event::Confirmed;
+                memory.refusal = String::new();
+            }
+            Progress::Reverted(why) => {
+                memory.event = Event::Reverted;
+                memory.refusal = format!("the frontend update was undone: {why}");
+            }
+            Progress::NeedsOperator(why) => refuse(memory, &format!("needs_operator: {why}")),
+        }
+        // Said once, not rewritten every pass while an operator is awaited.
+        if *memory == before {
+            return Ok(());
+        }
+        self.save(memory)
+    }
+
     fn report(&mut self, memory: &Memory) -> Result<(), HelperError> {
+        let mut memory = memory.clone();
+        memory.frontend_pending = pending::load(&self.host)?.frontend_pending.is_some();
+        let memory = &memory;
         let bytes = status::render(&self.state()?, memory);
         if bytes == self.written {
             return Ok(());
@@ -567,7 +660,11 @@ fn short(c: &Option<CommitId>) -> String {
 }
 
 /// Whether the release the fetcher installed is the one the order named and expected.
-fn matches_claims(got: &InstalledRelease, order: &Order, claims: &Claims) -> Result<(), String> {
+pub(crate) fn matches_claims(
+    got: &InstalledRelease,
+    order: &Order,
+    claims: &Claims,
+) -> Result<(), String> {
     if got.commit != order.commit {
         return Err(format!("it is commit {}", got.commit.as_str()));
     }

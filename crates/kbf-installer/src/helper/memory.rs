@@ -27,6 +27,15 @@ pub struct StagedFacts {
     pub state_schema: u32,
 }
 
+/// Whose sequence an order belongs to. A node's orders and the frontend's own update are
+/// numbered by different counters (the frontend's is its own), so each has its own floor:
+/// on a host that is both, one floor would drop whichever count is behind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Node,
+    Frontend,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Memory {
@@ -37,6 +46,10 @@ pub struct Memory {
     /// its id is higher; ids come from one counter in the store, not from this host, so
     /// no gap between them is a reason to refuse.
     pub acked_epoch: u64,
+    /// The same pair for the frontend's own updates: a separate sequence, so a node order
+    /// of a higher id never makes a frontend update a replay, or the reverse.
+    pub acked_frontend_order_id: u64,
+    pub acked_frontend_epoch: u64,
     pub event: Event,
     /// Why the last order was refused, or what was reverted.
     pub refusal: String,
@@ -51,4 +64,28 @@ pub struct Memory {
     /// leave it set).
     #[serde(skip)]
     pub fetching: bool,
+    /// A frontend update is in flight (read from its own record each pass; never stored).
+    #[serde(skip)]
+    pub frontend_pending: bool,
+}
+
+impl Memory {
+    /// The (epoch, id) of the newest order of `kind` acted on.
+    #[must_use]
+    pub fn floor(&self, kind: Kind) -> (u64, u64) {
+        match kind {
+            Kind::Node => (self.acked_epoch, self.acked_order_id),
+            Kind::Frontend => (self.acked_frontend_epoch, self.acked_frontend_order_id),
+        }
+    }
+
+    /// Record that the order (`epoch`, `id`) of `kind` was acted on.
+    pub fn acknowledge(&mut self, kind: Kind, epoch: u64, id: u64) {
+        match kind {
+            Kind::Node => (self.acked_epoch, self.acked_order_id) = (epoch, id),
+            Kind::Frontend => {
+                (self.acked_frontend_epoch, self.acked_frontend_order_id) = (epoch, id);
+            }
+        }
+    }
 }

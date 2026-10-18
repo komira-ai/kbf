@@ -4,6 +4,7 @@
 //! /usr/local/kbf/releases/<commit>/   one release: its binaries, units/, manifest.json
 //! /usr/local/kbf/current              link to releases/<commit>, the release that runs
 //! /usr/local/kbf/previous             link to releases/<commit>, the one before it
+//! /usr/local/kbf/slots/<a|b>          link to ../releases/<commit>, what a frontend instance runs
 //! <state dir>/incoming/               releases being received, not yet verified
 //! <state dir>/staged/                 releases verified and ready to swap in
 //! <state dir>/deployed/               a record of each release swapped in
@@ -49,6 +50,8 @@ pub const KBF_DIR: &str = "/usr/local/kbf";
 pub const RELEASES: &str = "/usr/local/kbf/releases";
 pub const CURRENT: &str = "/usr/local/kbf/current";
 pub const PREVIOUS: &str = "/usr/local/kbf/previous";
+/// The frontend instances' links: `slots/<instance>` names the release that instance runs.
+pub const SLOTS: &str = "/usr/local/kbf/slots";
 /// The Linux state directory, and the paths in it (see [`Layout`] for a platform's).
 pub const STATE_DIR: &str = "/var/lib/kbf-deploy";
 pub const INCOMING: &str = "/var/lib/kbf-deploy/incoming";
@@ -219,6 +222,22 @@ pub fn pin_file(commit: &CommitId) -> HostPath {
 }
 
 /// What `current` and `previous` point to for `commit`: `releases/<commit>`.
+/// The directory of the frontend instances' links.
+pub fn slots_dir() -> HostPath {
+    path(SLOTS)
+}
+
+/// `slots/<instance>`, the link the instance's unit runs `kbf` through. The instance is `a`
+/// or `b`, never text from a record.
+pub fn slot_link(instance: &str) -> HostPath {
+    path_in(SLOTS, instance)
+}
+
+/// What a slot's link names: the release, relative to the slots directory.
+pub fn slot_target(commit: &CommitId) -> PathBuf {
+    Path::new("..").join(release_link(commit))
+}
+
 pub fn release_link(commit: &CommitId) -> PathBuf {
     Path::new("releases").join(commit.as_str())
 }

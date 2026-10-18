@@ -96,12 +96,22 @@ fn the_version_object_is_read_by_its_fields() {
         v,
         Version {
             commit: COMMIT[..12].to_owned(),
+            handover_protocol: None,
             min_protocol: 3,
             protocol: 4,
             profile: "release".to_owned(),
             state_schema: 7,
             version: "0.1.0".to_owned(),
         }
+    );
+    // A release that reports its handover protocol: read as a number; one that does not has
+    // none (a frontend update then refuses to hand over to or from it).
+    let with = version_json(COMMIT, "release").replace('{', "{\"handover_protocol\":1,");
+    assert_eq!(
+        Version::parse(with.as_bytes())
+            .expect("parses")
+            .handover_protocol,
+        Some(1)
     );
     let more = version_json(COMMIT, "release").replace('}', ",\"future\":true}");
     assert_eq!(Version::parse(more.as_bytes()).expect("parses"), v);

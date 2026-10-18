@@ -6,6 +6,9 @@
 //!
 //! - `commit`: the first 12 hex digits of the commit built, or `unknown` for a build
 //!   with no git checkout ([`kbf_server::BUILD_COMMIT`]);
+//! - `handover_protocol`: the version of the frontend handover this binary speaks
+//!   ([`kbf_server::handover::HANDOVER_PROTOCOL`]); two frontends hand over only when it
+//!   is equal;
 //! - `min_protocol` and `protocol`: the oldest and the newest `kbf.worker.v1` protocol
 //!   version this binary speaks ([`kbf_server::worker`]); the daemon half speaks exactly
 //!   `protocol` (a test pins the two halves equal);
@@ -37,6 +40,10 @@ pub fn identity() -> Value {
     // Inserted in the order they print: sorted, whatever map `serde_json` is built with.
     let mut fields = Map::new();
     fields.insert("commit".to_owned(), kbf_server::BUILD_COMMIT.into());
+    fields.insert(
+        "handover_protocol".to_owned(),
+        kbf_server::handover::HANDOVER_PROTOCOL.into(),
+    );
     fields.insert(
         "min_protocol".to_owned(),
         kbf_server::worker::OLDEST_PROTOCOL_VERSION.into(),
