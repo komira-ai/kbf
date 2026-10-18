@@ -598,7 +598,8 @@ fn the_spool_holds_at_most_64_records_and_the_excess_is_deleted() {
 /// one root saw 1801 s ago and which is still there is deleted unread.
 ///
 /// Mutants planted: expiry by the file's mtime (the ancient-mtime record is dropped and the
-/// stale one acted on); first-seen reset every pass (the stale record is acted on).
+/// stale one acted on); first-seen reset every pass (the stale record is acted on); the bound
+/// `>` made `>=` (the record exactly 1800 s old is dropped).
 #[test]
 fn a_record_expires_by_roots_first_seen_time_not_the_files() {
     let mut rig = Rig::new("expiry");
@@ -629,6 +630,17 @@ fn a_record_expires_by_roots_first_seen_time_not_the_files() {
     assert_eq!(rig.fetcher.count(), 0);
     assert!(rig.refusal().contains("expired"), "{}", rig.refusal());
     assert_eq!(rig.left(), 0, "and deleted");
+
+    // Exactly 1800 s is still good: a record expires when it is *more than* that old.
+    let mut rig = Rig::new("expiry-edge");
+    rig.put(&rig.rec(5, 1, 1, Verb::Activate, B));
+    let memory_path = rig.root.join("var/lib/kbf-deploy/helper.json");
+    let mut memory: serde_json::Value =
+        serde_json::from_slice(&fs::read(&memory_path).expect("memory")).expect("json");
+    memory["first_seen"] = serde_json::json!({ file_name(1, 5): T0 - 1800 });
+    fs::write(&memory_path, serde_json::to_vec(&memory).expect("json")).expect("seed");
+    rig.cycle(T0);
+    assert_eq!(rig.current(), Some(c(B)), "1800 s old is not expired");
 }
 
 /// Catches an activation for another platform than this host's: the record claims a macOS
