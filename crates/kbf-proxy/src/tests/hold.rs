@@ -330,3 +330,26 @@ async fn a_stream_refused_at_the_stream_limit_is_answered_at_once() {
     until(|| rig.core.slots.open_streams() == 0).await;
     assert_eq!(client.unary(CAPS).await.text(), "late");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_client_reset_while_held_drops_the_ticket_at_once() {
+    let rig = Rig::start(tagged("a"), tagged("b")).await;
+    let guard = rig.core.slots.hold(HOLD).expect("no hold in force");
+    let mut client = rig.client().await;
+    let (response, mut body) = client.start(CAPS, false).await;
+    body.send_data(Bytes::from_static(b"x"), false)
+        .expect("body");
+    until(|| rig.core.queue.held() == 1).await;
+    body.send_reset(h2::Reason::CANCEL);
+    drop(response);
+    // Long before the bound, with the hold still in force: the place in the queue is free.
+    until(|| rig.core.queue.held() == 0).await;
+    assert!(rig.core.slots.holding());
+    until(|| rig.core.slots.open_streams() == 0).await;
+    assert_eq!(
+        rig.core.queue.expired_total(),
+        0,
+        "a reset is not an expiry"
+    );
+    drop(guard);
+}
