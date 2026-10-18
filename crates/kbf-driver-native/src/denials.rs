@@ -26,7 +26,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::Duration;
 
@@ -69,8 +69,9 @@ impl Schedule {
 /// output is looked at.
 #[cfg(target_os = "macos")]
 const READ_WITHIN: Duration = Duration::from_secs(30);
-#[cfg(target_os = "macos")]
-const READ_BYTES: u64 = 4 << 20;
+
+/// The most of a read's output that is looked at, counted from its end.
+pub const READ_BYTES: u64 = 4 << 20;
 
 /// The `log show` predicate that selects the sandbox's lines. Where the line is
 /// logged from differs by macOS release and by profile: sender `Sandbox`, or the
@@ -354,14 +355,13 @@ pub(crate) fn shown(d: &Denial) -> String {
 
 /// The sandbox's lines of the last `window` from the system's unified log, through
 /// `/usr/bin/log show` ([`query_args`]; the full path: over ssh, zsh's builtin `log`
-/// shadows it), its output in `file`, read at most [`READ_BYTES`] and given up after
+/// shadows it), its output in `file`, the last [`READ_BYTES`] of it read ([`read_tail`]) and given up after
 /// [`READ_WITHIN`].
 ///
 /// # Errors
 /// `log` could not run or did not end in time; always off macOS.
 #[cfg(target_os = "macos")]
 pub fn system_log(file: &Path, window: Duration) -> io::Result<String> {
-    use std::io::Read as _;
     use std::process::{Command, Stdio};
     use std::time::Instant;
 
@@ -388,17 +388,40 @@ pub fn system_log(file: &Path, window: Duration) -> io::Result<String> {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let mut text = String::new();
-    let read = std::fs::File::open(file)?
-        .take(READ_BYTES)
-        .read_to_string(&mut text);
+    let tail = std::fs::File::open(file).and_then(|f| read_tail(f, READ_BYTES));
     let _ = std::fs::remove_file(file);
-    read?;
+    let text = tail?;
     if status.success() {
         Ok(text)
     } else {
         Err(io::Error::other(format!("log show: {status}")))
     }
+}
+
+/// The last `cap` bytes of `source` as text. `log show` prints oldest first, so when the
+/// output is longer than `cap` the newest lines, the denial among them, are the ones to
+/// keep. The cut falls anywhere: the partial first line is dropped, and bytes that are not
+/// UTF-8 (a character split by the cut, or anything else) become U+FFFD instead of
+/// failing the read. Output of `cap` bytes or fewer is returned whole.
+///
+/// # Errors
+/// `source` could not be read.
+pub fn read_tail(mut source: impl Read + Seek, cap: u64) -> io::Result<String> {
+    let len = source.seek(SeekFrom::End(0))?;
+    // One byte before the last `cap`, so a cut at a line start is known to be one.
+    let from = len.saturating_sub(cap.saturating_add(1));
+    source.seek(SeekFrom::Start(from))?;
+    let mut bytes = Vec::new();
+    source.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
+    let mut kept = bytes.as_slice();
+    if len > cap {
+        // Whatever precedes the first newline is a line the cut may have split.
+        kept = kept
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(&[][..], |i| &kept[i + 1..]);
+    }
+    Ok(String::from_utf8_lossy(kept).into_owned())
 }
 
 /// The sandbox's lines of the last `window`: macOS only.
@@ -500,7 +523,15 @@ mod tests {
         shown_from: usize,
         others: bool,
         cost: Duration,
+        /// Text every read holds after the lines above.
+        noise: &'static str,
+        /// Every read fails with this.
+        broken: Option<&'static str>,
     }
+
+    /// The most reads a [`Fake`] serves: a report that never stops fails on this, by
+    /// assertion, instead of looping until the test runner's timeout.
+    const MOST_READS: usize = 100;
 
     impl Fake {
         fn new(shown_from: usize) -> Self {
@@ -511,6 +542,8 @@ mod tests {
                 shown_from,
                 others: false,
                 cost: Duration::ZERO,
+                noise: "",
+                broken: None,
             }
         }
 
@@ -523,6 +556,13 @@ mod tests {
                 |window| {
                     let mut f = me.borrow_mut();
                     f.reads.push(window);
+                    assert!(
+                        f.reads.len() <= MOST_READS,
+                        "more than {MOST_READS} reads: the report does not stop"
+                    );
+                    if let Some(why) = f.broken {
+                        return Err(io::Error::other(why));
+                    }
                     let cost = f.cost;
                     f.clock += cost;
                     let n = f.reads.len();
@@ -534,6 +574,7 @@ mod tests {
                     if n >= f.shown_from {
                         log.push_str(LINE);
                     }
+                    log.push_str(f.noise);
                     Ok(log)
                 },
                 || me.borrow().clock,
@@ -592,6 +633,30 @@ mod tests {
         assert_eq!(at, [0, 650]);
     }
 
+    /// Catches a report with no bound that holds with the default schedule and a source
+    /// that never yields the action's line: it must give up within `give_up` (the last read
+    /// starts at or before it, and the clock never passes it by more than one pause), by
+    /// assertion on the fake clock and not by hanging.
+    #[test]
+    fn a_source_that_never_yields_is_given_up_within_the_schedule() {
+        let mut fake = Fake::new(usize::MAX);
+        let report = fake.run(Duration::from_secs(5), Schedule::DEFAULT);
+        let last = report.attempts.last().expect("a read").at;
+        assert!(last <= Schedule::DEFAULT.give_up, "{last:?}");
+        assert!(
+            fake.clock <= Schedule::DEFAULT.give_up,
+            "the clock ran to {:?}",
+            fake.clock
+        );
+        assert_eq!(
+            fake.reads.len(),
+            41,
+            "a read every 250 ms for 10 s, ends included"
+        );
+        assert!(report.found.mine.is_empty());
+        assert_eq!(report.failed, None);
+    }
+
     /// Catches a log that holds only other processes' denials ending the reads (those
     /// are not the action's own and the action's line may follow).
     #[test]
@@ -608,21 +673,13 @@ mod tests {
     /// say it failed.
     #[test]
     fn a_failed_read_ends_the_report_and_says_why() {
-        let mut reads = 0;
-        let report = collect(
-            &BTreeSet::from([1]),
-            Duration::ZERO,
-            Schedule::DEFAULT,
-            |_| {
-                reads += 1;
-                Err(io::Error::other("log is down"))
-            },
-            || Duration::ZERO,
-            |_| panic!("no pause after a failed read"),
-        );
-        assert_eq!(reads, 1);
+        let mut fake = Fake::new(1);
+        fake.broken = Some("log is down");
+        let report = fake.run(Duration::ZERO, Schedule::DEFAULT);
+        assert_eq!(fake.reads.len(), 1);
+        assert!(fake.pauses.is_empty(), "no pause after a failed read");
         assert_eq!(report.failed.as_deref(), Some("log is down"));
-        let said = report.explain(&BTreeSet::from([1]));
+        let said = report.explain(&BTreeSet::from([123]));
         assert!(said.contains("the last read failed: log is down"), "{said}");
     }
 
@@ -669,24 +726,17 @@ mod tests {
     /// that lists hundreds of reads.
     #[test]
     fn an_empty_report_explains_the_query_and_why_each_line_was_rejected() {
-        let log = format!(
-            "{}\nSandbox: odd deny file-write-data /x\nnoise\n",
-            LINE.replace("(123)", "(999)")
-        );
-        let report = collect(
-            &BTreeSet::from([5, 6]),
-            Duration::from_secs(1),
-            schedule(0),
-            |_| Ok(log.clone()),
-            || Duration::ZERO,
-            |_| {},
-        );
-        let said = report.explain(&BTreeSet::from([5, 6]));
-        assert!(said.contains("watched pid(s) {5, 6}"), "{said}");
+        let mut one = Fake::new(usize::MAX);
+        one.others = true;
+        one.noise = "Sandbox: odd deny file-write-data /x\nnoise\n";
+        let report = one.run(Duration::from_secs(1), schedule(0));
+        let bytes = report.attempts[0].bytes;
+        let said = report.explain(&BTreeSet::from([123, 6]));
+        assert!(said.contains("watched pid(s) {6, 123}"), "{said}");
         assert!(said.contains("1 read(s)"), "{said}");
         assert!(said.contains("--last 120s --predicate"), "{said}");
         assert!(said.contains(PREDICATE), "{said}");
-        assert!(said.contains(&format!("{} byte(s)", log.len())), "{said}");
+        assert!(said.contains(&format!("{bytes} byte(s)")), "{said}");
         assert!(said.contains("3 line(s)"), "{said}");
         assert!(said.contains("1 denial(s) read"), "{said}");
         assert!(said.contains("1 line(s) with a verdict not read"), "{said}");
@@ -806,6 +856,88 @@ mod tests {
             shown_target < MAX_TARGET + 40,
             "a target is cut: {shown_target}"
         );
+    }
+
+    /// Lines of the log, oldest first, ending in the denial.
+    fn long_log(lines: usize) -> String {
+        let mut log = String::new();
+        for i in 0..lines {
+            log.push_str(&format!("2026-10-17 10:00:00.1 Df noise line {i}\n"));
+        }
+        log.push_str(LINE);
+        log.push('\n');
+        log
+    }
+
+    /// Catches a read that keeps the first `cap` bytes of output longer than that (the
+    /// newest line, the denial, is the last `log show` prints), one that keeps a partial
+    /// first line, one that returns more than `cap`, and a short output not returned whole.
+    #[test]
+    fn output_over_the_cap_keeps_its_end_from_a_whole_line() {
+        let log = long_log(500);
+        let cap = 1000;
+        assert!(log.len() as u64 > 10 * cap);
+        let tail = read_tail(io::Cursor::new(log.as_bytes()), cap).expect("read");
+        assert!(tail.len() as u64 <= cap, "{}", tail.len());
+        assert!(tail.ends_with(&format!("{LINE}\n")), "{tail}");
+        assert!(log.ends_with(&tail));
+        assert!(
+            tail.starts_with("2026-10-17 10:00:00.1 Df noise line "),
+            "{tail}"
+        );
+        assert!(
+            Found::of(&tail, &BTreeSet::from([123])).note().is_some(),
+            "the denial is kept"
+        );
+        // A cut exactly at a line start keeps that line; output of `cap` bytes is whole.
+        let two = format!("first\n{LINE}\n");
+        let cap = (LINE.len() + 1) as u64;
+        assert_eq!(
+            read_tail(io::Cursor::new(two.as_bytes()), cap).expect("read"),
+            format!("{LINE}\n")
+        );
+        assert_eq!(
+            read_tail(io::Cursor::new(two.as_bytes()), two.len() as u64).expect("read"),
+            two
+        );
+        assert_eq!(read_tail(io::Cursor::new(&b""[..]), 10).expect("read"), "");
+    }
+
+    /// Catches a read that fails when the cut falls inside a multibyte character (the
+    /// report would end with no denial), and one that keeps the damaged first line.
+    #[test]
+    fn a_character_split_by_the_cut_does_not_fail_the_read() {
+        let log = format!("{}\n{LINE}\n", "\u{e9}".repeat(10));
+        // Two bytes short of the whole: the window (one byte more than the cap) starts inside
+        // the first e-acute.
+        let cap = (log.len() - 2) as u64;
+        assert!(std::str::from_utf8(&log.as_bytes()[log.len() - cap as usize - 1..]).is_err());
+        let tail = read_tail(io::Cursor::new(log.as_bytes()), cap).expect("read");
+        assert_eq!(tail, format!("{LINE}\n"));
+        // Bytes that are not UTF-8 anywhere become replacement characters, and the rest stays.
+        let mut raw = format!("{LINE}\n").into_bytes();
+        raw.insert(0, 0xff);
+        raw.push(b'\n');
+        let all = read_tail(io::Cursor::new(raw), 1 << 20).expect("read");
+        assert!(all.starts_with('\u{fffd}'), "{all}");
+        assert!(all.contains(LINE), "{all}");
+    }
+
+    /// Catches a reader error swallowed into an empty log.
+    #[test]
+    fn a_source_that_cannot_be_read_is_an_error() {
+        struct Bad;
+        impl Read for Bad {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("disk"))
+            }
+        }
+        impl Seek for Bad {
+            fn seek(&mut self, _: io::SeekFrom) -> io::Result<u64> {
+                Ok(100)
+            }
+        }
+        assert_eq!(read_tail(Bad, 10).expect_err("fails").to_string(), "disk");
     }
 
     /// Catches a log reader off macOS that claims to read something.
