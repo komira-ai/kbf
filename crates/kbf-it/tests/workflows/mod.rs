@@ -294,6 +294,38 @@ pub fn job_condition(text: &str, job: &str) -> Result<Option<String>, String> {
     }
 }
 
+/// The `env:` entries of the job `job` (its key matched ignoring ASCII case) whose values
+/// are strings, in file order. An error when the text does not parse or has no such job.
+pub fn job_env(text: &str, job: &str) -> Result<Vec<(String, String)>, String> {
+    let root = yaml::load(text)?;
+    let Some(Value::Map(jobs)) = get(top_of(&root)?, "jobs").map(|j| &j.value) else {
+        return Err("the workflow has no `jobs` mapping".to_owned());
+    };
+    let Some(Value::Map(found)) = get(jobs, job).map(|j| &j.value) else {
+        return Err(format!("the workflow has no job `{job}`"));
+    };
+    Ok(match get(found, "env").map(|e| &e.value) {
+        Some(Value::Map(env)) => env
+            .iter()
+            .filter_map(|(k, v)| Some((k.as_str()?.to_owned(), v.as_str()?.to_owned())))
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// The names of the jobs of a workflow text, in file order. An error when the text does not
+/// parse or has no `jobs` mapping.
+pub fn job_names(text: &str) -> Result<Vec<String>, String> {
+    let root = yaml::load(text)?;
+    let Some(Value::Map(jobs)) = get(top_of(&root)?, "jobs").map(|j| &j.value) else {
+        return Err("the workflow has no `jobs` mapping".to_owned());
+    };
+    Ok(jobs
+        .iter()
+        .filter_map(|(k, _)| k.as_str().map(str::to_owned))
+        .collect())
+}
+
 /// One step with a `run:` script, in a workflow job or an action file's composite
 /// steps, as the interpreter budget reads it.
 #[derive(Debug, PartialEq, Eq)]
