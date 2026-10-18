@@ -13,7 +13,9 @@
 //!
 //! A second word, `kill-hangs`, makes `kill` slow (as a wedged daemon makes the real one):
 //! it sleeps for twenty seconds and then leaves `.fake-buck2-kill-survived` in the directory
-//! it runs in, which a `kill` that is given up on never does.
+//! it runs in, which a `kill` that is given up on never does. Every `kill` adds a line to
+//! `.fake-buck2-killed-<isolation dir>` there first, so a test can tell which daemons were
+//! killed, and how many times. The word `version-hangs` makes `--version` sleep for thirty seconds.
 
 use std::io::Write as _;
 use std::time::Duration;
@@ -36,15 +38,23 @@ fn action_line(n: usize, failed: bool) -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let words = std::fs::read_to_string(".fake-buck2").unwrap_or_default();
+    let words: Vec<&str> = words.split_whitespace().collect();
     if args.first().map(String::as_str) == Some("--version") {
+        if words.contains(&"version-hangs") {
+            std::thread::sleep(Duration::from_secs(30));
+        }
         println!("buck2 fake");
         return;
     }
     // `--isolation-dir <dir>` precedes the subcommand.
     let rest: Vec<&String> = args.iter().skip(2).collect();
-    let words = std::fs::read_to_string(".fake-buck2").unwrap_or_default();
-    let words: Vec<&str> = words.split_whitespace().collect();
     if rest.first().map(|s| s.as_str()) == Some("kill") {
+        let marker = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!(".fake-buck2-killed-{}", args[1]));
+        let _ = marker.and_then(|mut file| writeln!(file, "kill"));
         if words.contains(&"kill-hangs") {
             std::thread::sleep(Duration::from_secs(20));
             let _ = std::fs::write(".fake-buck2-kill-survived", "");

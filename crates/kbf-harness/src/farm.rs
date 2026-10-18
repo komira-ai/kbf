@@ -10,186 +10,24 @@
 //! (a rolling update) changes it in one place. The deviations from the rendered units
 //! are listed in [`Farm::start`].
 
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kbf_deploy::linux::Mode;
 use kbf_deploy::linux::verify_cert::Row;
-use serde::Serialize;
 
 use crate::api;
 use crate::envoy::{self, BoxPorts};
+use crate::interrupt::Interrupt;
 use crate::node_support::{cgroup_tree, files_holding, id_files, image_path, podman};
 use crate::pki::Pki;
-use crate::procs::{HANG, Proc, Spec, field};
+use crate::ports::{Claim, Ports};
+use crate::procs::{HANG, Proc, Spec, after, field};
 use crate::units::{Rendered, config, rendered};
 
-/// The binaries a farm runs, by path (a library cannot use `CARGO_BIN_EXE_*`).
-#[derive(Clone, Debug)]
-pub struct Bins {
-    /// `kbf`.
-    pub kbf: PathBuf,
-    /// The stand-in `podman`, for [`Driver::StandInContainer`].
-    pub fake_podman: Option<PathBuf>,
-}
-
-/// What runs the actions on the daemons.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub enum Driver {
-    /// `--driver=native`: each action is a plain process in its lease directory. No
-    /// container path is exercised; any argv a build sends runs as sent.
-    Native,
-    /// `--driver=container` as rendered, over the stand-in `podman` (which runs one
-    /// planted argv whatever the lease asks for), a planted cgroup tree and id files.
-    StandInContainer,
-}
-
-/// A role of the farm.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
-pub enum Role {
-    Frontend,
-    /// A storage node (with its daemon, in a [`NodeMode::StorageAndDaemon`] farm),
-    /// numbered from 1.
-    Node(usize),
-    /// A plain daemon, numbered from 1.
-    Daemon(usize),
-    Envoy,
-}
-
-impl std::fmt::Display for Role {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Role::Frontend => f.write_str("frontend"),
-            Role::Node(n) => write!(f, "node-{n}"),
-            Role::Daemon(n) => f.write_str(&daemon_id(*n)),
-            Role::Envoy => f.write_str("envoy"),
-        }
-    }
-}
-
-/// The node id of plain daemon `n` (from 1).
-#[must_use]
-pub fn daemon_id(n: usize) -> String {
-    format!("daemon-{n}")
-}
-
-/// What a storage node runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NodeMode {
-    /// `kbf storage`: storage alone. Its actions run on the plain daemons.
-    Storage,
-    /// `kbf storage-and-daemon`: storage and a daemon in one process. The daemon half
-    /// runs the container driver only.
-    StorageAndDaemon,
-}
-
-/// The ceilings that keep the farm small enough for a hosted runner (about 4 vCPU and
-/// 16 GB), as extra flags per kind of process, given to the unit's own flags with
-/// [`Rendered::set`] (so they replace a rendered value and are added when there is none).
-#[derive(Clone, Debug, Default)]
-pub struct Limits {
-    pub frontend: Vec<String>,
-    pub node: Vec<String>,
-    pub daemon: Vec<String>,
-}
-
-impl Limits {
-    /// No limits: the unit's flags and the binaries' defaults.
-    #[must_use]
-    pub fn none() -> Self {
-        Self::default()
-    }
-
-    /// The limits of a hosted runner: a small hot tier and a small write buffer on each
-    /// storage node (the stores and the write tier are a storage node's: a frontend refuses
-    /// these flags), and one CPU kept by each daemon.
-    #[must_use]
-    pub fn small() -> Self {
-        Self {
-            frontend: Vec::new(),
-            node: vec![
-                format!("--hot-store-max-bytes={}", 256 << 20),
-                format!("--write-bytes-in-flight={}", 128 << 20),
-            ],
-            // A daemon keeps 8 CPUs for the farm's processes unless told otherwise, and
-            // leases the rest: none on a runner of 4.
-            daemon: vec!["--reserve-cpus=1".to_owned()],
-        }
-    }
-}
-
-/// What a farm is made of.
-#[derive(Clone, Debug)]
-pub struct Topology {
-    /// How many storage nodes there are (the farm's replication needs two).
-    pub storage_nodes: usize,
-    pub node_mode: NodeMode,
-    /// How many plain daemons there are.
-    pub daemons: usize,
-    pub driver: Driver,
-    pub limits: Limits,
-    /// An Envoy to put in front of the frontend (the `box` topology, the frontend as
-    /// instance `a`): the binary's path. `None` runs the frontend alone.
-    pub envoy: Option<PathBuf>,
-    /// Flags to set on one role after everything else (a mutant's, or a test's).
-    pub overrides: Vec<(Role, Vec<String>)>,
-}
-
-impl Topology {
-    /// The rehearsal's: `storage_nodes` storage-and-daemon nodes and a daemon, the
-    /// stand-in container driver, no limits, no Envoy.
-    #[must_use]
-    pub fn rehearsal(storage_nodes: usize) -> Self {
-        Self {
-            storage_nodes,
-            node_mode: NodeMode::StorageAndDaemon,
-            daemons: 1,
-            driver: Driver::StandInContainer,
-            limits: Limits::none(),
-            envoy: None,
-            overrides: Vec::new(),
-        }
-    }
-
-    /// The beta farm's: three storage nodes, two plain daemons running actions as plain
-    /// processes (the native driver, which only a plain daemon takes), a hosted runner's
-    /// limits, and the Envoy given.
-    #[must_use]
-    pub fn beta(envoy: Option<PathBuf>) -> Self {
-        Self {
-            storage_nodes: 3,
-            node_mode: NodeMode::Storage,
-            daemons: 2,
-            driver: Driver::Native,
-            limits: Limits::small(),
-            envoy,
-            overrides: Vec::new(),
-        }
-    }
-}
-
-/// Why a farm did not start or become ready: what was waited for, and every process's
-/// state and output.
-#[derive(Debug, thiserror::Error)]
-#[error("{what}\n{report}")]
-pub struct FarmError {
-    pub what: String,
-    pub report: String,
-}
-
-/// One start of one role, for the result document: the stand-in for a boot counter.
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct ProcRecord {
-    pub role: String,
-    pub pid: u32,
-    /// 0 for the first start of the role, 1 for the first restart.
-    pub generation: usize,
-    /// Seconds since the Unix epoch.
-    pub started: u64,
-    /// How it ended (`exit 0`, `signal 9`, ...); `None` while it runs.
-    pub ended: Option<String>,
-}
+pub use crate::topology::{
+    Bins, Driver, FarmError, Limits, NodeMode, ProcRecord, Role, Topology, daemon_id, node_id,
+};
 
 struct Member {
     role: Role,
@@ -237,44 +75,19 @@ pub struct Farm {
     envoy_ports: Option<BoxPorts>,
     /// How long [`Farm::try_wait`] and [`Farm::stop_all`] wait before giving up.
     hang: Duration,
-}
-
-/// The node id of storage-and-daemon node `n` (from 1).
-#[must_use]
-pub fn node_id(n: usize) -> String {
-    format!("node-{n}")
+    /// Whether the run was asked to stop.
+    interrupt: Interrupt,
+    /// The frontend's control socket, removed when the farm stops.
+    socket: Option<PathBuf>,
+    /// The block of ports the farm's processes bind, held while the farm lives, and the
+    /// ports of it that the processes were told.
+    claim: Option<(Claim, Ports)>,
 }
 
 /// A loopback address of its own for each process (the whole of `127/8` is loopback on
 /// Linux): the frontend's, then each node's, then the plain daemon's.
 fn loopback(n: usize) -> String {
     format!("127.0.0.{}", n + 1)
-}
-
-/// `n` distinct ports nothing listens on now.
-fn ports(n: usize) -> Vec<u16> {
-    let held: Vec<TcpListener> = (0..n)
-        .map(|_| TcpListener::bind("127.0.0.1:0").expect("bind"))
-        .collect();
-    held.iter()
-        .map(|l| l.local_addr().expect("addr").port())
-        .collect()
-}
-
-/// A base port such that the box topology's six instance ports (`base..base+3` and
-/// `base+10..base+13`) are free on loopback now, below the range the kernel hands out
-/// to connections.
-fn backend_base() -> u16 {
-    let first = 12_000 + u16::try_from(std::process::id() % 4000).expect("fits") * 4;
-    let free = |base: u16| {
-        [0_u16, 1, 2, 10, 11, 12]
-            .iter()
-            .all(|k| TcpListener::bind(("127.0.0.1", base + k)).is_ok())
-    };
-    (0..200)
-        .map(|i| first + 20 * i)
-        .find(|base| free(*base))
-        .expect("no free run of ports for the box instances")
 }
 
 fn unix_now() -> u64 {
@@ -323,8 +136,9 @@ fn settings(
 /// The directories a process's unit expects to exist (the installer makes them on a
 /// host).
 fn make_dirs(root: &Path) -> PathBuf {
+    // Private to this user: `etc` holds the keys, and a shared runner has other users.
     for name in ["etc", "data", "meta", "hot", "state", "cold", "bin"] {
-        std::fs::create_dir_all(root.join(name)).expect("mkdir");
+        crate::pki::private_dir(&root.join(name));
     }
     root.join("bin")
 }
@@ -383,24 +197,14 @@ impl Farm {
         );
         let uid = rustix::process::getuid().as_raw();
         let nodes = topo.storage_nodes;
-        let p = ports(2 * nodes + 1);
-        let (storage, spare, metrics) = (&p[..nodes], p[nodes], &p[nodes + 1..]);
-        let box_ports = topo.envoy.is_some().then(|| {
-            let p = ports(3);
-            BoxPorts {
-                base: backend_base(),
-                reapi: p[0],
-                worker: p[1],
-                admin: p[2],
-            }
-        });
-        let front = match &box_ports {
-            Some(b) => (b.base, b.base + 1, b.base + 2),
-            None => {
-                let p = ports(3);
-                (p[0], p[1], p[2])
-            }
-        };
+        // Every port is the farm's own, from a block no other farm of the host holds.
+        let claim = Claim::new();
+        // Envoy's base id is the block's number: no two live farms have one.
+        let envoy_id = claim.index();
+        let ports = Ports::of(&claim, nodes, topo.envoy.is_some());
+        let (storage, spare, metrics) = (&ports.storage, ports.spare, &ports.metrics);
+        let front = ports.front;
+        let box_ports = ports.envoy;
         let wiring = Wiring {
             reapi: front.0,
             worker: front.1,
@@ -425,10 +229,13 @@ impl Farm {
             ca: Vec::new(),
             image: String::new(),
             storage_nodes: nodes,
-            metrics_ports: metrics.to_vec(),
+            metrics_ports: metrics.clone(),
             node_ids,
             envoy_ports: None,
             hang: HANG,
+            interrupt: topo.interrupt.clone(),
+            socket: None,
+            claim: Some((claim, ports.clone())),
         };
         let overrides = |role: Role, unit: Rendered| {
             let flags: Vec<String> = topo
@@ -469,10 +276,7 @@ impl Farm {
         pki.issue_reapi(&etc, &["localhost"]);
         // The unit names `--api-token-file <etc>/api-token`; the harness's API calls only read.
         let token = etc.join("api-token");
-        std::fs::write(&token, "rehearsal-api-token-of-32-or-more-visible-chars\n")
-            .expect("write the API token");
-        std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-            .expect("the API token's mode");
+        crate::pki::write_private(&token, b"rehearsal-api-token-of-32-or-more-visible-chars\n");
         farm.ca = std::fs::read(etc.join("ca.pem")).expect("ca");
         let cfg = settings(
             &root,
@@ -487,6 +291,7 @@ impl Farm {
         let socket = std::env::temp_dir().join(format!("kbf-farm-{:x}.sock", path_tag(dir)));
         let _ = std::fs::remove_file(&socket);
         let control = format!("--handover-socket={}", socket.display());
+        farm.socket = Some(socket);
         let unit = overrides(
             Role::Frontend,
             unit.replace(&[control]).set(&topo.limits.frontend),
@@ -499,7 +304,7 @@ impl Farm {
         if let (Some(binary), Some(ports)) = (&topo.envoy, &box_ports) {
             let eroot = dir.join("envoy");
             std::fs::create_dir_all(&eroot).expect("mkdir");
-            let spec = envoy::launch(binary, &eroot, &frontend_etc(dir), ports);
+            let spec = envoy::launch(binary, &eroot, &frontend_etc(dir), ports, envoy_id);
             farm.launch_spec(Role::Envoy, &eroot, spec);
             farm.envoy_ports = Some(*ports);
             let admin = ports.admin;
@@ -605,6 +410,9 @@ impl Farm {
             node_ids: Vec::new(),
             envoy_ports: None,
             hang: HANG,
+            interrupt: Interrupt::new(),
+            socket: None,
+            claim: None,
         };
         for (role, spec) in specs {
             let root = spec.cwd.clone();
@@ -709,8 +517,14 @@ impl Farm {
         what: &str,
         mut ready: impl FnMut(&Farm) -> Option<T>,
     ) -> Result<T, FarmError> {
-        let deadline = Instant::now() + self.hang;
+        let deadline = after(self.hang);
         loop {
+            if self.interrupt.is_set() {
+                return Err(FarmError {
+                    what: format!("interrupted by a signal while waiting for {what}"),
+                    report: self.logs(),
+                });
+            }
             let ended = self.members.iter_mut().find_map(|m| {
                 if m.killed {
                     return None;
@@ -898,6 +712,14 @@ impl Farm {
         text
     }
 
+    /// The ports the processes were told and the block they were taken from (a farm of
+    /// [`Farm::start`]; none for a supervised one).
+    #[must_use]
+    pub fn ports(&self) -> Option<(&Ports, std::ops::Range<u16>)> {
+        let (claim, ports) = self.claim.as_ref()?;
+        Some((ports, claim.base()..claim.base() + crate::ports::BLOCK))
+    }
+
     /// The frontend's operator API port (on loopback).
     #[must_use]
     pub fn api_port(&self) -> u16 {
@@ -960,22 +782,34 @@ impl Farm {
 
     /// SIGTERM to each process still running, last started first (the daemons and nodes,
     /// then Envoy, before the frontend, which waits for open streams); each role and how it
-    /// ended, a role that had ended on its own before its turn included (with its status
-    /// then). A process still running after [`HANG`] is killed and reported as such; a role
-    /// the harness killed is not reported.
+    /// ended. A role that had ended on its own before its turn is reported as that, with its
+    /// status (`exited before the stop: exit 0`), which is never a clean stop: a crash
+    /// must not be absent from the evidence, and a role that left with 0 on its own was
+    /// still not stopped by the harness. A process still running after the farm's wait is
+    /// killed and reported as such; a role the harness killed is not reported. The whole
+    /// stop takes about [`Farm::with_hang`]'s wait at most.
     pub fn stop_all(&mut self) -> Vec<(Role, String)> {
+        self.stop_all_within(self.hang)
+    }
+
+    /// [`Farm::stop_all`] in `total` at most: each role is waited for what is left of it
+    /// (and for no more than the farm's wait), and a role that has not drained by then is
+    /// killed. Also removes the frontend's control socket.
+    pub fn stop_all_within(&mut self, total: Duration) -> Vec<(Role, String)> {
         let mut ended = Vec::new();
-        let hang = self.hang;
+        let (hang, end) = (self.hang, after(total));
         // A role the harness killed is not stopped (the harness knows how it ended).
         for m in self.members.iter_mut().rev().filter(|m| !m.killed) {
-            // One that ended on its own before its turn is reported as it ended: the stop's
-            // evidence is every role, and a crash must not be absent from it.
             if let Some(status) = m.proc.exited() {
                 m.killed = true;
-                ended.push((m.role, ended_text(status)));
+                ended.push((
+                    m.role,
+                    format!("exited before the stop: {}", ended_text(status)),
+                ));
                 continue;
             }
-            let status = m.proc.term_within(hang);
+            let wait = hang.min(end.saturating_duration_since(Instant::now()));
+            let status = m.proc.term_within(wait);
             if status.is_none() {
                 m.proc.kill();
             }
@@ -988,7 +822,16 @@ impl Farm {
                 ),
             ));
         }
+        self.remove_socket();
         ended
+    }
+
+    /// Removes the frontend's control socket, which the process leaves behind when it is
+    /// killed, and which would otherwise stay in the temporary directory.
+    fn remove_socket(&mut self) {
+        if let Some(socket) = self.socket.take() {
+            let _ = std::fs::remove_file(socket);
+        }
     }
 
     /// [`Farm::stop_all`], and every process must have exited 0.
@@ -1000,6 +843,14 @@ impl Farm {
         for (role, how) in ended {
             assert_eq!(how, "exit 0", "{role}\n{}", self.logs());
         }
+    }
+}
+
+impl Drop for Farm {
+    /// Every process is killed with its group (each [`Proc`] does it as it drops); the
+    /// control socket goes too.
+    fn drop(&mut self) {
+        self.remove_socket();
     }
 }
 

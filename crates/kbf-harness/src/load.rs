@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use kbf_it::summary::{Spawns, Tool, parse};
 
 use crate::eventlog;
+use crate::procs::after;
 
 /// The kinds of build, in the order a loop takes them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -177,10 +178,28 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The load while it runs.
+/// The load while it runs. Dropped before [`Load::join`], it stops the loops and kills their
+/// Buck2 daemons: a daemon outlives its client (it leads a session of its own), so a run
+/// that panics or returns early would otherwise leave a daemon per loop behind.
 pub struct Load {
-    stop: Arc<AtomicBool>,
+    guard: Guard,
     lanes: Vec<std::thread::JoinHandle<Vec<Outcome>>>,
+}
+
+/// What a load that is dropped before it is joined must undo.
+struct Guard {
+    cfg: LoadConfig,
+    stop: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.stop.store(true, Ordering::Relaxed);
+            kill_daemons(&self.cfg);
+        }
+    }
 }
 
 impl Load {
@@ -188,14 +207,21 @@ impl Load {
     #[must_use]
     pub fn start(cfg: &LoadConfig) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let end = Instant::now() + cfg.duration;
+        let end = after(cfg.duration);
         let lanes = (0..cfg.concurrency)
             .map(|lane| {
                 let (cfg, stop) = (cfg.clone(), Arc::clone(&stop));
                 std::thread::spawn(move || lane_loop(&cfg, lane, end, &stop))
             })
             .collect();
-        Self { stop, lanes }
+        Self {
+            guard: Guard {
+                cfg: cfg.clone(),
+                stop,
+                armed: true,
+            },
+            lanes,
+        }
     }
 
     /// Whether every loop has ended.
@@ -207,15 +233,17 @@ impl Load {
     /// Asks the loops to start no more builds (a build under way runs to its end or its
     /// bound).
     pub fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.guard.stop.store(true, Ordering::Relaxed);
     }
 
-    /// Waits for the loops and returns every build, in the order of the loops.
+    /// Waits for the loops and returns every build, in the order of the loops. Each loop
+    /// kills its own daemon as it ends, so there is nothing left for a drop to undo.
     ///
     /// # Panics
     /// When a loop's thread panicked.
     #[must_use]
-    pub fn join(self) -> Vec<Outcome> {
+    pub fn join(mut self) -> Vec<Outcome> {
+        self.guard.armed = false;
         self.lanes
             .into_iter()
             .flat_map(|lane| lane.join().expect("a load loop"))
@@ -355,8 +383,11 @@ fn build(cfg: &LoadConfig, lane: usize, n: usize, kind: Kind) -> Outcome {
 }
 
 /// Waits for `child` for at most `limit`: its exit code, or killed and `timed_out`.
-fn wait_bounded(child: &mut std::process::Child, limit: Duration) -> (Option<i32>, bool) {
-    let deadline = Instant::now() + limit;
+pub(crate) fn wait_bounded(
+    child: &mut std::process::Child,
+    limit: Duration,
+) -> (Option<i32>, bool) {
+    let deadline = after(limit);
     loop {
         if let Some(status) = child.try_wait().ok().flatten() {
             return (status.code(), false);

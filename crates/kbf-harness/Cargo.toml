@@ -20,6 +20,20 @@ publish.workspace = true
 name = "kbf-beta"
 path = "src/bin/kbf-beta.rs"
 
+# The stand-ins of beta scenario B0's tests (kbf-cli's tests/beta_b0.rs finds them beside the
+# test binary, `cargo test --workspace` builds them), in Rust like the stand-in `podman`: a
+# `buck2` that answers as Buck2 prints and logs, and an Envoy that serves its admin page and
+# forwards to the first instance. Test tools of this package, not of anything shipped.
+[[bin]]
+name = "kbf-harness-fake-buck2"
+path = "tests/bin/fake_buck2.rs"
+test = false
+
+[[bin]]
+name = "kbf-harness-fake-envoy"
+path = "tests/bin/fake_envoy.rs"
+test = false
+
 [dependencies]
 clap.workspace = true
 flate2.workspace = true
@@ -29,8 +43,9 @@ kbf-driver-container.workspace = true
 kbf-it.workspace = true
 kbf-testkit.workspace = true
 kbf-transfer.workspace = true
+libc.workspace = true
 rcgen = { workspace = true, features = ["x509-parser"] }
-rustix = { workspace = true, features = ["process"] }
+rustix = { workspace = true, features = ["fs", "process"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

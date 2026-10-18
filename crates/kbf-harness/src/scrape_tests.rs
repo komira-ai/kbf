@@ -213,3 +213,24 @@ fn a_scraper_with_nothing_to_scrape_counts_failures_and_stops() {
         Some("no answer from /metrics")
     );
 }
+
+#[test]
+fn a_scraper_that_is_dropped_is_told_to_stop() {
+    // Catches: a run that panics after the scrapers started leaving their threads scraping
+    // a farm that is gone (for the rest of the process's life, and with the series file
+    // open). The thread is taken out of the scraper so it can be waited for: dropping the
+    // flag must end it. A liveness guard, not a measure of time. Mutant: the flag's drop
+    // does not set it.
+    let dir = crate::scratch("scraper-drop");
+    let Scraper { stop, handle } =
+        Scraper::start(1, Duration::from_millis(20), &dir.join("s.jsonl"));
+    drop(stop);
+    let until = Instant::now() + Duration::from_secs(60);
+    while !handle.is_finished() {
+        assert!(Instant::now() < until, "the scraper never stopped");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let scrapes = handle.join().expect("the thread");
+    // Nothing listens on port 1: every scrape failed, and the last one was still taken.
+    assert!(scrapes.failed >= 1);
+}

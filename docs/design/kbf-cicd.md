@@ -270,6 +270,17 @@ the design did not know:
   fail closed when any node's series is absent or the node does not answer.
 - Buck2 reads the remote execution client's address and CA when its daemon starts and ignores them on a command line, and
   refuses a `grpcs://` address: the harness appends them to the copy of the project's `.buckconfig`.
+- A farm's processes bind their own ports, so the harness cannot hold the sockets, and a port found by binding port 0 and
+  closing is free only until another program takes it. Each farm claims a block of 64 ports below the kernel's ephemeral
+  range by holding a file lock named for the block (the kernel drops the lock when the holder dies), skips a block with any
+  port in use, and takes every port, Envoy's and its base id included, from its block: two farms of one process or one host
+  never share a port.
+- A run that is cancelled or times out must leave nothing behind. Every process leads a process group of its own, ending a
+  process ends its group, and the kernel kills a process whose harness dies (SIGKILL included). SIGTERM and SIGINT make
+  `kbf-beta` end through its normal exits: the farm is stopped within one bound, the Buck2 daemons of the loops are killed
+  (also if the run panics), and the result document ends `FAILED` with the reason. The frontend's control socket is removed.
+- Keys are written mode 0600 into directories of mode 0700, and none is under `logs/`, which the workflow uploads (a test
+  scans it). The stand-in `buck2` and Envoy are binaries of `kbf-harness`, not of `kbf-cli`, so no release builds them.
 
 ### 4.4 Scenarios and gates
 

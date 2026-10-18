@@ -89,3 +89,14 @@ fn the_exit_code_wraps_the_status() {
     let code = run(args(&["--help"]), none);
     assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
 }
+
+#[test]
+fn the_wall_bound_adds_up_and_saturates() {
+    // Catches: `duration + build timeout + 60` overflowing (a panic in a debug build and a
+    // bound of a few seconds in a release one) on a command line with absurd seconds.
+    // Mutant: plain `+`.
+    assert_eq!(wall_bound(300, 300), Duration::from_secs(660));
+    assert_eq!(wall_bound(u64::MAX, 300), Duration::from_secs(u64::MAX));
+    assert_eq!(wall_bound(300, u64::MAX), Duration::from_secs(u64::MAX));
+    assert_eq!(wall_bound(u64::MAX - 30, 0), Duration::from_secs(u64::MAX));
+}

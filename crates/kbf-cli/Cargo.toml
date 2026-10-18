@@ -31,19 +31,6 @@ name = "kbf-cli-fake-systemctl"
 path = "tests/bin/fake_systemctl.rs"
 test = false
 
-# The stand-ins of beta scenario B0's tests (tests/beta_b0.rs), in Rust like the stand-in
-# `podman`: a `buck2` that answers as Buck2 prints and logs, and an Envoy that serves its admin
-# page and forwards to the first instance. Not shipped.
-[[bin]]
-name = "kbf-cli-fake-buck2"
-path = "../kbf-harness/tests/bin/fake_buck2.rs"
-test = false
-
-[[bin]]
-name = "kbf-cli-fake-envoy"
-path = "../kbf-harness/tests/bin/fake_envoy.rs"
-test = false
-
 [dependencies]
 clap.workspace = true
 kbf-all-in-one.workspace = true
@@ -63,7 +50,7 @@ thiserror.workspace = true
 # `kbf.toml` read once more for the roles its tables name (src/enroll.rs).
 toml.workspace = true
 # The renewal loop beside the running mode (src/node.rs).
-tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tracing.workspace = true
 # The stand-in `podman`'s (kbf-cli-fake-podman); the effective uid and the host name that
 # `kbf node` and `kbf enroll` read.

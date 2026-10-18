@@ -1719,6 +1719,7 @@ dependencies = [
  "kbf-it",
  "kbf-testkit",
  "kbf-transfer",
+ "libc",
  "rcgen",
  "rustix",
  "serde",

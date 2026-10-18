@@ -88,8 +88,15 @@ fn the_launch_runs_envoy_over_the_render() {
         &d,
         Path::new("/etc/farm"),
         &ports(),
+        7,
     );
     assert_eq!(spec.program, PathBuf::from("/opt/envoy"));
+    // Catches: two farms sharing Envoy's shared-memory region (the base id is the one given,
+    // which is the farm's block number), and an Envoy that hot restarts and leaves files in
+    // `/dev/shm`. Mutant: the id is derived from the process id again, or the flag is dropped.
+    let at = spec.argv.iter().position(|a| a == "--base-id").expect("id");
+    assert_eq!(spec.argv[at + 1], "7");
+    assert!(spec.argv.contains(&"--disable-hot-restart".to_owned()));
     let at = spec
         .argv
         .iter()

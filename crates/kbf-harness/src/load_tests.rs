@@ -258,3 +258,76 @@ fn the_project_is_copied_with_its_tool_and_without_build_output() {
     let again = prepare(&source, &work, &act).expect_err("a project is there");
     assert!(again.to_string().contains("exists"), "{again}");
 }
+
+/// A load over the stand-in `buck2` (`mode` in its `.fake-buck2`), `concurrency` loops for
+/// `secs` seconds, in a fresh project directory.
+fn stand_in_load(name: &str, mode: &str, concurrency: usize, secs: u64) -> LoadConfig {
+    let dir = crate::scratch(name);
+    let (project, logs) = (dir.join("project"), dir.join("logs"));
+    std::fs::create_dir_all(&project).expect("project");
+    std::fs::create_dir_all(&logs).expect("logs");
+    std::fs::write(project.join(".fake-buck2"), mode).expect("mode");
+    LoadConfig {
+        buck2: crate::stand_in::sibling_bin(crate::stand_in::FAKE_BUCK2),
+        project,
+        logs,
+        concurrency,
+        duration: Duration::from_secs(secs),
+        ..cfg()
+    }
+}
+
+/// How many times the stand-in `buck2` was told to `kill` the daemon of loop `lane`.
+fn kills(c: &LoadConfig, lane: usize) -> usize {
+    std::fs::read_to_string(c.project.join(format!(".fake-buck2-killed-beta-{lane}")))
+        .map_or(0, |text| text.lines().count())
+}
+
+#[test]
+fn a_load_that_is_dropped_kills_the_daemon_of_every_loop() {
+    // Catches: a run that panics (or returns early) after the load started leaving a Buck2
+    // daemon per loop behind: the daemon leads a session of its own and outlives its client,
+    // holding the farm's connection and a port, and a runner's next job meets it. The load
+    // here is ten minutes long and the stand-in's builds take a moment, so no loop has ended
+    // by itself when it is dropped in a panic. Mutant: no `Drop` on the load's guard.
+    let c = stand_in_load("load-drop", "ok", 2, 600);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _load = Load::start(&c);
+        panic!("a failed assertion after the load started");
+    }));
+    assert!(unwound.is_err());
+    // At least one `buck2 kill` per loop: a loop that was in a build then ends and kills its
+    // own daemon too, so the count may be two; with no drop it is zero.
+    assert!(
+        kills(&c, 0) >= 1 && kills(&c, 1) >= 1,
+        "{} {}",
+        kills(&c, 0),
+        kills(&c, 1)
+    );
+}
+
+#[test]
+fn a_load_that_was_joined_is_not_killed_again() {
+    // Catches: the drop's kill running after a normal end as well, where each loop has
+    // already killed its own daemon (a second `buck2 kill` per loop, and with a wedged daemon
+    // a second wait on it). Mutant: the guard is armed after `join`.
+    let c = stand_in_load("load-joined", "ok", 1, 1);
+    let outcomes = Load::start(&c).join();
+    assert!(!outcomes.is_empty());
+    assert_eq!(kills(&c, 0), 1);
+}
+
+#[test]
+fn a_load_that_is_stopped_starts_no_more_builds() {
+    // Catches: `stop` that does not stop (the run that found a dead process would go on
+    // loading a farm it already failed).
+    let c = stand_in_load("load-stop", "ok", 1, 600);
+    let load = Load::start(&c);
+    load.stop();
+    let until = Instant::now() + Duration::from_secs(60);
+    while !load.finished() {
+        assert!(Instant::now() < until, "the loop never ended");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(load.join().len() <= 1);
+}

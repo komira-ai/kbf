@@ -247,8 +247,8 @@ fn a_role_that_ended_before_its_turn_is_reported_with_how() {
         ended,
         vec![
             (Role::Daemon(1), "signal 15".to_owned()),
-            (Role::Node(2), "exit 0".to_owned()),
-            (Role::Node(1), "exit 1".to_owned()),
+            (Role::Node(2), "exited before the stop: exit 0".to_owned()),
+            (Role::Node(1), "exited before the stop: exit 1".to_owned()),
         ]
     );
 }
@@ -498,4 +498,101 @@ fn a_farm_that_lost_a_node_a_member_or_its_frontend_is_not_whole() {
     let silent = farm_with_api("not-whole-silent", Vec::new());
     let why = silent.whole().expect_err("no /v1/nodes");
     assert!(why.contains("/v1/nodes does not answer"), "{why}");
+}
+
+#[test]
+fn the_control_socket_is_removed_when_the_farm_stops_and_when_it_is_dropped() {
+    // Catches: the frontend's control socket left in the temporary directory by every run
+    // (a killed process cannot remove its own), one more per run on a long-lived host.
+    // Mutant: `stop_all_within` or `Drop for Farm` does not remove it.
+    let d = dir("socket");
+    let socket = d.join("kbf-farm.sock");
+    std::fs::write(&socket, b"").expect("socket");
+    let mut farm = Farm::supervise(&d, vec![sleeper(Role::Frontend, &d)]);
+    farm.socket = Some(socket.clone());
+    let _ = farm.stop_all();
+    assert!(!socket.exists(), "removed by the stop");
+    std::fs::write(&socket, b"").expect("socket");
+    let mut farm = Farm::supervise(&d, vec![sleeper(Role::Frontend, &d)]);
+    farm.socket = Some(socket.clone());
+    drop(farm);
+    assert!(!socket.exists(), "removed by the drop");
+}
+
+#[test]
+fn a_farm_that_is_dropped_leaves_no_process_running() {
+    // Catches: a run that panics or returns early (the farm goes out of scope with no stop)
+    // leaving its processes running. Mutant: `Proc` has no `Drop`.
+    let d = dir("dropped");
+    let farm = Farm::supervise(
+        &d,
+        vec![sleeper(Role::Node(1), &d), sleeper(Role::Node(2), &d)],
+    );
+    let pids: Vec<u32> = farm
+        .process_list()
+        .lines()
+        .filter_map(|l| l.split(" pid ").nth(1)?.split(' ').next()?.parse().ok())
+        .collect();
+    assert_eq!(pids.len(), 2);
+    assert!(pids.iter().all(|p| crate::alive(*p)));
+    drop(farm);
+    for pid in pids {
+        assert!(!crate::alive(pid), "{pid} still runs");
+    }
+}
+
+#[test]
+fn a_stop_is_bounded_as_a_whole_not_per_role() {
+    // Catches: a stop that gives every role the farm's whole wait in turn (sixty seconds
+    // each, so minutes for a farm of seven that will not drain), and with it a run that
+    // outlasts its job's timeout while "stopping". Three processes that ignore SIGTERM are
+    // stopped within a budget of nothing: each is killed at once. The farm's own wait is an
+    // hour, so a stop that ignored the budget would not return in the minute the thread is
+    // given (a liveness guard, not a measure of time). Mutant: `stop_all_within` waits
+    // `hang` for each role.
+    let d = dir("stop-bound");
+    let stubborn = |role| spec(role, "env", &["--ignore-signal=TERM", "sleep", "300"], &d);
+    let roles = [Role::Node(1), Role::Node(2), Role::Node(3)];
+    let mut farm = Farm::supervise(&d, roles.iter().map(|r| stubborn(*r)).collect())
+        .with_hang(Duration::from_secs(3600));
+    for pid in farm.process_table().iter().map(|p| p.pid) {
+        wait_until_running(pid, "sleep");
+    }
+    let (done, result) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let ended = farm.stop_all_within(Duration::ZERO);
+        let _ = done.send(ended);
+    });
+    let ended = result
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the stop returned: its budget bounds it");
+    assert_eq!(ended.len(), 3);
+    assert!(
+        ended
+            .iter()
+            .all(|(_, how)| how == "still running after SIGTERM: killed"),
+        "{ended:?}"
+    );
+}
+
+#[test]
+fn a_wait_ends_at_once_when_the_run_is_asked_to_stop() {
+    // Catches: a run that has been sent SIGTERM going on waiting for a farm to become ready
+    // (up to the farm's whole wait) before it notices. Mutant: `try_wait` does not look at
+    // the flag.
+    let d = dir("interrupted");
+    let mut farm =
+        Farm::supervise(&d, vec![sleeper(Role::Node(1), &d)]).with_hang(Duration::from_secs(3600));
+    farm.interrupt.set();
+    let error = farm
+        .try_wait("never", |_| None::<()>)
+        .expect_err("a wait that is interrupted fails");
+    assert!(
+        error
+            .what
+            .starts_with("interrupted by a signal while waiting for never"),
+        "{}",
+        error.what
+    );
+    assert!(error.report.contains("--- processes ---"));
 }

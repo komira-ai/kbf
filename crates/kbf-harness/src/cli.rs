@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::b0::{self, B0, Ended, Mutant};
 use crate::envoy::{ENV_VAR, REQUIRE_VAR, required};
+use crate::interrupt::Interrupt;
 use crate::procs::HANG;
 
 /// The longest one `buck2 kill` is waited for.
@@ -94,6 +95,17 @@ impl From<MutantFlag> for Mutant {
     }
 }
 
+/// The longest a run may take: the load and the build under way at its end, and a minute to
+/// start and stop it. Saturating: a command line with absurd seconds is a bound far away, not
+/// an overflow.
+fn wall_bound(duration_secs: u64, build_timeout_secs: u64) -> Duration {
+    Duration::from_secs(
+        duration_secs
+            .saturating_add(build_timeout_secs)
+            .saturating_add(60),
+    )
+}
+
 /// Runs `kbf-beta` on `args` (the first is the program's name), with `env` the lookup of
 /// an environment variable.
 pub fn run(
@@ -145,8 +157,7 @@ pub fn status(
         concurrency,
         build_timeout: Duration::from_secs(build_timeout_secs),
         kill_timeout: KILL_BOUND,
-        // The load and the build under way at its end, and a minute to start and stop it.
-        wall_bound: Duration::from_secs(duration_secs + build_timeout_secs + 60),
+        wall_bound: wall_bound(duration_secs, build_timeout_secs),
         pause_secs,
         fill_kib,
         scrape_every: Duration::from_secs(1),
@@ -155,6 +166,7 @@ pub fn status(
         extra_flags: Vec::new(),
         farm_hang: HANG,
         require_envoy: required(env(REQUIRE_VAR).as_deref()),
+        interrupt: Interrupt::process(),
     };
     match b0::run(&args) {
         Ok(ended) => u8::from(ended == Ended::Failed),

@@ -105,10 +105,20 @@ pub struct Scrapes {
     pub last_error: Option<String>,
 }
 
-/// A scraper thread. [`Scraper::stop`] ends it and returns what it read.
+/// A scraper thread. [`Scraper::stop`] ends it and returns what it read; a scraper that is
+/// dropped instead is told to stop (its thread ends after its last scrape).
 pub struct Scraper {
-    stop: Arc<AtomicBool>,
+    stop: StopOnDrop,
     handle: std::thread::JoinHandle<Scrapes>,
+}
+
+/// The scraper's stop flag, set when it is dropped.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Scraper {
@@ -119,8 +129,8 @@ impl Scraper {
     /// When `file` cannot be created.
     #[must_use]
     pub fn start(api: u16, every: Duration, file: &Path) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&stop);
+        let stop = StopOnDrop(Arc::new(AtomicBool::new(false)));
+        let flag = Arc::clone(&stop.0);
         let mut out = std::fs::File::create(file).expect("the series file");
         let handle = std::thread::spawn(move || {
             let begun = Instant::now();
@@ -164,7 +174,7 @@ impl Scraper {
     /// When the thread panicked.
     #[must_use]
     pub fn stop(self) -> Scrapes {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.0.store(true, Ordering::Relaxed);
         self.handle.join().expect("the scraper thread")
     }
 }

@@ -29,6 +29,7 @@ fn args() -> B0 {
         extra_flags: Vec::new(),
         farm_hang: Duration::from_secs(1),
         require_envoy: false,
+        interrupt: Interrupt::new(),
     }
 }
 
@@ -109,15 +110,43 @@ fn the_cap_mutants_change_flags_on_the_nodes_they_name() {
     assert!(every.iter().all(|(_, f)| *f == flags));
 }
 
+/// `buck2 --version` of `program` in a scratch directory, waiting at most `limit`.
+fn version_of(name: &str, program: &Path, limit: Duration) -> String {
+    let d = crate::scratch(name);
+    buck2_version(program, &d, &d.join("version.txt"), limit)
+}
+
 #[test]
 fn the_version_is_the_first_line_or_the_reason_there_is_none() {
     // Catches: a version that is lost when the program fails (the document would say
     // nothing of which Buck2 ran), or a failure taken for a version.
+    let limit = Duration::from_secs(60);
     // GNU `sleep --version` prints a version line and succeeds.
-    assert!(buck2_version(Path::new("sleep")).starts_with("sleep "));
-    let missing = buck2_version(Path::new("/nonexistent/buck2"));
+    assert!(version_of("version-ok", Path::new("sleep"), limit).starts_with("sleep "));
+    let missing = version_of("version-missing", Path::new("/nonexistent/buck2"), limit);
     assert!(missing.starts_with("failed: "), "{missing}");
-    assert_eq!(buck2_version(Path::new("false")), "failed: exit status: 1");
+    assert_eq!(
+        version_of("version-false", Path::new("false"), limit),
+        "failed: exit Some(1)"
+    );
+    // The output file cannot be made: a directory is in its place.
+    let d = crate::scratch("version-nofile");
+    let in_the_way = d.join("version.txt");
+    std::fs::create_dir_all(&in_the_way).expect("dir");
+    let refused = buck2_version(Path::new("sleep"), &d, &in_the_way, limit);
+    assert!(refused.starts_with("failed: "), "{refused}");
+}
+
+#[test]
+fn a_version_that_is_never_answered_is_given_up_on() {
+    // Catches: `buck2 --version` without a bound: a wedged Buck2 client would hold the run
+    // before it started anything, with no gate and no document to say why (the stand-in
+    // sleeps thirty seconds when told to). Mutant: the wait has no deadline.
+    let d = crate::scratch("version-hangs");
+    std::fs::write(d.join(".fake-buck2"), "version-hangs").expect("mode");
+    let fake = crate::stand_in::sibling_bin(crate::stand_in::FAKE_BUCK2);
+    let said = buck2_version(&fake, &d, &d.join("version.txt"), Duration::from_secs(1));
+    assert_eq!(said, "failed: no answer in 1 s");
 }
 
 #[test]
@@ -173,18 +202,31 @@ fn a_role_that_left_before_the_stop_is_a_liveness_failure_and_an_unclean_stop() 
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut exited = Vec::new();
-    let stopped = stop_farm(&mut gone, &mut exited);
+    let stopped = stop_farm(&mut gone, &mut exited, Duration::from_secs(60));
     assert_eq!(exited, [("node-1".to_owned(), "exit 0".to_owned())]);
-    assert_eq!(stopped, [("node-1".to_owned(), "exit 0".to_owned())]);
+    // Not "exit 0": the harness did not stop it, so the stop is not clean.
+    assert_eq!(
+        stopped,
+        [(
+            "node-1".to_owned(),
+            "exited before the stop: exit 0".to_owned()
+        )]
+    );
     let mut crashed = sleeper_farm("b0-crashed", "false");
     while crashed.process_table()[0].ended.is_none() {
         assert!(Instant::now() < until, "false never exited");
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut exited = Vec::new();
-    let stopped = stop_farm(&mut crashed, &mut exited);
-    assert_eq!(stopped, [("node-1".to_owned(), "exit 1".to_owned())]);
-    assert_eq!(exited, stopped);
+    let stopped = stop_farm(&mut crashed, &mut exited, Duration::from_secs(60));
+    assert_eq!(
+        stopped,
+        [(
+            "node-1".to_owned(),
+            "exited before the stop: exit 1".to_owned()
+        )]
+    );
+    assert_eq!(exited, [("node-1".to_owned(), "exit 1".to_owned())]);
 }
 
 fn writer(name: &str) -> (Writer, PathBuf) {

@@ -27,7 +27,7 @@ pub const REQUIRE_VAR: &str = "KBF_BETA_REQUIRE_ENVOY";
 
 /// The ports of the box: instance `a`'s first loopback port (`b`'s is ten above), and
 /// the three Envoy binds.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BoxPorts {
     pub base: u16,
     /// Envoy's public REAPI port.
@@ -143,21 +143,22 @@ pub fn check(config: &Path, dir: &Path) -> Result<(), String> {
 }
 
 /// The command that runs Envoy over the box render in `root` (rendered and checked here),
-/// its certificates from `etc`.
+/// its certificates from `etc`. `base_id` is Envoy's `--base-id`, which names its shared
+/// memory region: one per live farm (the farm's block of ports gives one), and Envoy is
+/// told not to hot restart at all, so it leaves nothing in `/dev/shm`.
 ///
 /// # Panics
 /// When the render is refused: a defect of the harness.
 #[must_use]
-pub fn launch(binary: &Path, root: &Path, etc: &Path, ports: &BoxPorts) -> Spec {
+pub fn launch(binary: &Path, root: &Path, etc: &Path, ports: &BoxPorts, base_id: u32) -> Spec {
     render(ports, etc, root).unwrap_or_else(|e| panic!("{e}"));
     let args = std::fs::read_to_string(root.join(ENVOY_ARGS)).expect("envoy.args");
     let mut argv = vec![
         "--config-path".to_owned(),
         root.join(ENVOY).display().to_string(),
-        // One base id per farm, so two farms on a host do not share Envoy's hot-restart
-        // memory.
         "--base-id".to_owned(),
-        (u32::from(ports.base) * 8 + std::process::id() % 8).to_string(),
+        base_id.to_string(),
+        "--disable-hot-restart".to_owned(),
         "--concurrency".to_owned(),
         "2".to_owned(),
         "--log-level".to_owned(),

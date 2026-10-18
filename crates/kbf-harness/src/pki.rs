@@ -89,13 +89,49 @@ impl Pki {
         let key = KeyPair::generate().expect("key");
         let cert = leaf.signed_by(&key, &self.ca).expect("sign");
         std::fs::write(etc.join(format!("{stem}.pem")), cert.pem()).expect("write");
-        // Private to this user, as the startup self-checks want every key.
-        let key_path = etc.join(format!("{stem}.key"));
-        std::fs::write(&key_path, key.serialize_pem()).expect("write");
-        std::fs::set_permissions(
-            &key_path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o600),
-        )
-        .expect("mode");
+        // Private to this user from the first byte, as the startup self-checks want every
+        // key (and a shared runner's other users would otherwise read it).
+        write_private(
+            &etc.join(format!("{stem}.key")),
+            key.serialize_pem().as_bytes(),
+        );
     }
 }
+
+/// Writes `bytes` to `path`, a file only this user can read: made with mode 0600, never
+/// written first with a wider one.
+///
+/// # Panics
+/// When the file cannot be written.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut file| file.write_all(bytes))
+        .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+}
+
+/// Makes `path` and the directories above it that are missing, each a directory only this
+/// user can enter (mode 0700): where keys are kept.
+///
+/// # Panics
+/// When a directory cannot be made.
+pub(crate) fn private_dir(path: &Path) {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+        .unwrap_or_else(|e| panic!("mkdir {}: {e}", path.display()));
+}
+
+#[cfg(test)]
+#[path = "pki_tests.rs"]
+mod tests;

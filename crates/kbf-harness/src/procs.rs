@@ -1,12 +1,29 @@
 //! A real process, its output in files so a failed run can say why.
+//!
+//! Each process leads a process group of its own and asks the kernel to kill it if the
+//! harness dies, so a harness that is killed (a CI job cancelled, a timeout) leaves no
+//! frontend, node, daemon or Envoy behind; a process that is ended takes its group (what it
+//! started, such as the actions of a native daemon) with it.
 
 use std::fs::File;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+use rustix::process::{Pid, Signal};
+
 /// How long a run waits for what should happen promptly: it ends a hang only.
 pub const HANG: Duration = Duration::from_secs(60);
+
+/// The instant `d` from now; far in the future, not a panic, when `d` is too long for an
+/// `Instant` (a bound a caller computed from a command line).
+#[must_use]
+pub fn after(d: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(d)
+        .unwrap_or_else(|| now + Duration::from_secs(10 * 365 * 24 * 3600))
+}
 
 /// What starts one process: the program, its arguments and environment, and the
 /// directory it runs in. A [`Spec`] is kept so a role can be started again with the
@@ -24,6 +41,8 @@ pub struct Spec {
 pub struct Proc {
     pub name: String,
     child: Child,
+    /// How it ended, once it was found ended (and its group swept).
+    status: Option<ExitStatus>,
     out: PathBuf,
     err: PathBuf,
 }
@@ -45,7 +64,9 @@ pub fn log_files(logs: &Path, name: &str, generation: usize) -> (PathBuf, PathBu
 }
 
 impl Proc {
-    /// Starts `spec`, its stdout and stderr in the files [`log_files`] names.
+    /// Starts `spec`, its stdout and stderr in the files [`log_files`] names, as the leader of
+    /// a process group of its own that the kernel kills with SIGKILL when the harness
+    /// thread that started it ends.
     ///
     /// # Panics
     /// When the log files cannot be made or the program cannot be spawned: a harness
@@ -53,17 +74,32 @@ impl Proc {
     #[must_use]
     pub fn start(spec: &Spec, logs: &Path, generation: usize) -> Self {
         let (out, err) = log_files(logs, &spec.name, generation);
-        let child = Command::new(&spec.program)
+        let mut command = Command::new(&spec.program);
+        command
             .args(&spec.argv)
             .envs(spec.env.iter().map(|(k, v)| (k, v)))
             .current_dir(&spec.cwd)
+            .stdin(Stdio::null())
             .stdout(Stdio::from(File::create(&out).expect("stdout file")))
             .stderr(Stdio::from(File::create(&err).expect("stderr file")))
+            .process_group(0);
+        // SAFETY: the closure runs in the child between fork and exec and makes one system
+        // call (prctl), which is async-signal-safe; it allocates nothing. The kernel then
+        // kills the child if the thread that started it ends, which a harness killed by
+        // SIGKILL (no Drop runs) does.
+        unsafe {
+            command.pre_exec(|| {
+                rustix::process::set_parent_process_death_signal(Some(Signal::KILL))
+                    .map_err(Into::into)
+            });
+        }
+        let child = command
             .spawn()
             .unwrap_or_else(|e| panic!("spawn {}: {e}", spec.program.display()));
         Self {
             name: spec.name.clone(),
             child,
+            status: None,
             out,
             err,
         }
@@ -88,12 +124,29 @@ impl Proc {
         )
     }
 
-    /// Its exit status, if it has ended.
-    ///
-    /// # Panics
-    /// When the operating system cannot say.
+    /// The process's id, which is its process group's too.
+    fn pid_as_group(&self) -> Pid {
+        Pid::from_child(&self.child)
+    }
+
+    /// SIGKILL to the process group. Sent while the leader is not yet reaped (so its id is
+    /// still its own: a zombie keeps it) or in the moment after it was, when only a member
+    /// still alive could keep the group's id; an error (no such group) is the point.
+    fn sweep(&self) {
+        let _ = rustix::process::kill_process_group(self.pid_as_group(), Signal::KILL);
+    }
+
+    /// Its exit status, if it has ended. The first time it is found ended, what it left
+    /// running in its group is killed. If the operating system cannot say, it has not
+    /// ended: a run that waits for it ends at its deadline.
     pub fn exited(&mut self) -> Option<ExitStatus> {
-        self.child.try_wait().expect("wait")
+        if self.status.is_none()
+            && let Ok(Some(status)) = self.child.try_wait()
+        {
+            self.status = Some(status);
+            self.sweep();
+        }
+        self.status
     }
 
     /// The first stdout line that starts with `prefix`, once the process printed it.
@@ -105,14 +158,17 @@ impl Proc {
             .map(str::to_owned)
     }
 
-    /// SIGTERM, and the exit status if the process has drained within `limit`.
-    ///
-    /// # Panics
-    /// When the signal cannot be sent.
+    /// SIGTERM, and the exit status if the process has drained within `limit`. A process
+    /// that has ended already is reported as it ended, not signalled: until it is reaped
+    /// its id is its own, and afterwards it is not signalled at all.
     pub fn term_within(&mut self, limit: Duration) -> Option<ExitStatus> {
-        let pid = rustix::process::Pid::from_child(&self.child);
-        rustix::process::kill_process(pid, rustix::process::Signal::TERM).expect("SIGTERM");
-        let deadline = Instant::now() + limit;
+        if let Some(status) = self.exited() {
+            return Some(status);
+        }
+        // Not reaped, so the id is still this process's (a zombie keeps it); a signal
+        // that finds the process gone is no error.
+        let _ = rustix::process::kill_process(self.pid_as_group(), Signal::TERM);
+        let deadline = after(limit);
         loop {
             if let Some(status) = self.exited() {
                 return Some(status);
@@ -124,10 +180,15 @@ impl Proc {
         }
     }
 
-    /// SIGKILL: the process is gone, as a host losing power would take it.
+    /// SIGKILL to the process and its group: the process is gone, as a host losing power
+    /// would take it, and so is what it started.
     pub fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if self.status.is_none() {
+            self.sweep();
+            // The leader too, should the group have been refused the signal.
+            let _ = self.child.kill();
+            self.status = self.child.wait().ok();
+        }
     }
 }
 
@@ -147,3 +208,7 @@ pub fn field<'a>(line: &'a str, key: &str) -> &'a str {
         .find_map(|word| word.strip_prefix(key))
         .unwrap_or_else(|| panic!("no {key} in {line:?}"))
 }
+
+#[cfg(test)]
+#[path = "procs_tests.rs"]
+mod tests;

@@ -28,7 +28,9 @@ use serde_json::json;
 use crate::envoy::{self, Found};
 use crate::farm::{Bins, Farm, Role, Topology};
 use crate::gates::{BuildResult, Evidence, Gate, all_pass};
-use crate::load::{self, Load, LoadConfig, Outcome};
+use crate::interrupt::Interrupt;
+use crate::load::{self, Load, LoadConfig, Outcome, wait_bounded};
+use crate::procs::after;
 use crate::result::{Builds, Document, Status, Writer, now};
 use crate::scrape::{self, Scraper};
 
@@ -88,7 +90,13 @@ pub struct B0 {
     pub farm_hang: Duration,
     /// A missing Envoy is a failure (the CI setting), not a skip.
     pub require_envoy: bool,
+    /// Whether the run was asked to stop (SIGTERM, SIGINT): it then stops the farm, kills
+    /// the Buck2 daemons and ends `FAILED` instead of running on.
+    pub interrupt: Interrupt,
 }
+
+/// How long `buck2 --version` is waited for.
+const VERSION_BOUND: Duration = Duration::from_secs(30);
 
 /// How a run ended, for the process's exit code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,17 +132,28 @@ fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
-/// `buck2 --version`'s first line.
-fn buck2_version(buck2: &Path) -> String {
-    let out = std::process::Command::new(buck2).arg("--version").output();
-    match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+/// `buck2 --version`'s first line (its output kept in `out`), or why there is none: it did not
+/// start, did not answer within `limit`, or failed. Run in `cwd`, the project.
+fn buck2_version(buck2: &Path, cwd: &Path, out: &Path, limit: Duration) -> String {
+    let spawned = std::fs::File::create(out).and_then(|file| {
+        std::process::Command::new(buck2)
+            .arg("--version")
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(file)
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    });
+    match spawned.map(|mut child| wait_bounded(&mut child, limit)) {
+        Err(e) => format!("failed: {e}"),
+        Ok((_, true)) => format!("failed: no answer in {} s", limit.as_secs()),
+        Ok((Some(0), false)) => std::fs::read_to_string(out)
+            .unwrap_or_default()
             .lines()
             .next()
             .unwrap_or_default()
             .to_owned(),
-        Ok(o) => format!("failed: {}", o.status),
-        Err(e) => format!("failed: {e}"),
+        Ok((code, false)) => format!("failed: exit {code:?}"),
     }
 }
 
@@ -245,7 +264,6 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
     };
     result.doc.runtime.driver = "native".to_owned();
     result.doc.runtime.container = "none (native driver)".to_owned();
-    result.doc.runtime.buck2_version = buck2_version(&args.buck2);
     result.doc.builds.concurrency = args.concurrency;
     result.write();
 
@@ -254,10 +272,18 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
         Ok(project) => project,
         Err(e) => return fail(result, Status::Failed, format!("the sample project: {e}")),
     };
+    result.doc.runtime.buck2_version = buck2_version(
+        &args.buck2,
+        &project,
+        &logs.join("buck2-version.txt"),
+        VERSION_BOUND,
+    );
+    result.write();
     let mut flags = overrides(args.mutant);
     flags.extend(args.extra_flags.iter().cloned());
     let topology = Topology {
         overrides: flags,
+        interrupt: args.interrupt.clone(),
         ..Topology::beta(envoy_bin)
     };
     let bins = Bins {
@@ -317,9 +343,9 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
     let load = Load::start(&cfg);
     let mut exited: Vec<(String, String)> = Vec::new();
     let mut hung = false;
-    let bound = Instant::now() + args.wall_bound;
-    let midway = Instant::now() + args.duration / 2;
-    let mut killed = false;
+    let bound = after(args.wall_bound);
+    let midway = after(args.duration / 2);
+    let (mut killed, mut interrupted) = (false, false);
     while !load.finished() {
         if args.mutant == Some(Mutant::KillNodeMidway) && !killed && Instant::now() >= midway {
             farm.kill(Role::Node(2));
@@ -333,21 +359,35 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
             // A farm that lost a process stops loading itself: the run is red already.
             load.stop();
         }
+        if args.interrupt.is_set() {
+            interrupted = true;
+            break;
+        }
         if Instant::now() >= bound {
             hung = true;
-            load.stop();
-            load::kill_daemons(&cfg);
             break;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    let outcomes: Vec<Outcome> = if hung { Vec::new() } else { load.join() };
+    // A load that is dropped, not joined, stops its loops and kills their daemons.
+    let outcomes: Vec<Outcome> = if hung || interrupted {
+        drop(load);
+        Vec::new()
+    } else {
+        load.join()
+    };
+    if interrupted {
+        return interrupted_end(result, &mut farm, logs, &mut exited, args.wall_bound);
+    }
     let load_finished = now();
     let load_secs = args.duration.as_secs_f64();
 
     // What is still in flight is counted, and the processes are watched meanwhile.
-    let settle_until = Instant::now() + args.settle;
+    let settle_until = after(args.settle);
     while Instant::now() < settle_until {
+        if args.interrupt.is_set() {
+            return interrupted_end(result, &mut farm, logs, &mut exited, args.wall_bound);
+        }
         note_exits(&mut farm, &mut exited);
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -359,7 +399,7 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
         .map(|(name, scraper)| (name, scraper.stop()))
         .collect();
     let stop_started = now();
-    let stopped = stop_farm(&mut farm, &mut exited);
+    let stopped = stop_farm(&mut farm, &mut exited, args.wall_bound);
     let stop_finished = now();
     // Which process was which, for the logs beside it.
     let _ = std::fs::write(logs.join("processes.txt"), farm.process_list());
@@ -432,12 +472,43 @@ fn ending(gates: &[Gate], hung: bool) -> (Status, Ended) {
     (status, ended)
 }
 
+/// The end of a run that was asked to stop: the farm is stopped (within `within`), the
+/// process list and table are kept, and the run is `FAILED` with the reason; the buck2
+/// daemons were killed with the load, and the scrapers stop as they go out of scope.
+fn interrupted_end(
+    result: &mut Writer,
+    farm: &mut Farm,
+    logs: &Path,
+    exited: &mut Vec<(String, String)>,
+    within: Duration,
+) -> Ended {
+    let stopped = stop_farm(farm, exited, within);
+    let _ = std::fs::write(logs.join("processes.txt"), farm.process_list());
+    result.doc.processes = farm.process_table();
+    fail(
+        result,
+        Status::Failed,
+        format!(
+            "interrupted by a signal: the farm was stopped ({})",
+            stopped
+                .iter()
+                .map(|(role, how)| format!("{role}: {how}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+}
+
 /// Stops the farm. A role that left since the last poll (the final scrape can take seconds)
 /// is noted in `exited` first, so that `processes_alive` sees it; and the stop reports every
 /// role, one that had already ended included, so that `clean_stop` sees how it ended.
-fn stop_farm(farm: &mut Farm, exited: &mut Vec<(String, String)>) -> Vec<(String, String)> {
+fn stop_farm(
+    farm: &mut Farm,
+    exited: &mut Vec<(String, String)>,
+    within: Duration,
+) -> Vec<(String, String)> {
     note_exits(farm, exited);
-    farm.stop_all()
+    farm.stop_all_within(within)
         .into_iter()
         .map(|(role, how)| (role.to_string(), how))
         .collect()

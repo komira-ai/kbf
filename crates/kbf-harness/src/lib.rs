@@ -42,12 +42,16 @@ pub mod envoy;
 pub mod eventlog;
 pub mod farm;
 pub mod gates;
+pub mod interrupt;
 pub mod load;
 pub mod node_support;
 pub mod pki;
+pub mod ports;
 pub mod procs;
 pub mod result;
 pub mod scrape;
+pub mod stand_in;
+pub mod topology;
 pub mod units;
 
 /// A fresh directory for one unit test, under the temporary directory, named for the test
@@ -59,4 +63,13 @@ pub(crate) fn scratch(name: &str) -> std::path::PathBuf {
         .join(format!("{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch");
     dir
+}
+
+/// Whether process `pid` is running (a zombie, ended and not yet reaped, is not).
+#[cfg(test)]
+pub(crate) fn alive(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(')')
+            .is_some_and(|(_, state)| !state.trim_start().starts_with('Z'))
+    })
 }

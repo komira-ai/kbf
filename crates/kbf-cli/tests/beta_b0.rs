@@ -11,144 +11,17 @@
 
 #![cfg(target_os = "linux")]
 
-use std::cell::RefCell;
-use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex, PoisonError};
+#[path = "beta_support/mod.rs"]
+mod support;
+
+use std::path::PathBuf;
 use std::time::Duration;
 
 use kbf_harness::b0::{B0, Ended, Mutant, run};
 use kbf_harness::farm::Role;
+use kbf_harness::stand_in::{FAKE_ENVOY, sibling_bin};
 
-/// How many farms these tests run at once. Each is seven processes, and a test runs as many
-/// at a time as the machine has CPUs: on a big machine, under coverage, a farm that is starved
-/// of CPU outlasts its waits. The tests queue for a slot instead.
-const FARMS_AT_ONCE: usize = 3;
-
-static SLOTS: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
-
-/// A place for one farm; given back when dropped.
-struct Slot;
-
-fn take_slot() -> Slot {
-    let (farms, free) = &SLOTS;
-    let mut running = farms.lock().unwrap_or_else(PoisonError::into_inner);
-    while *running >= FARMS_AT_ONCE {
-        running = free.wait(running).unwrap_or_else(PoisonError::into_inner);
-    }
-    *running += 1;
-    Slot
-}
-
-impl Drop for Slot {
-    fn drop(&mut self) {
-        let (farms, free) = &SLOTS;
-        *farms.lock().unwrap_or_else(PoisonError::into_inner) -= 1;
-        free.notify_one();
-    }
-}
-
-thread_local! {
-    /// The slot of the test running on this thread, held until the test ends.
-    static HELD: RefCell<Option<Slot>> = const { RefCell::new(None) };
-}
-
-/// A fresh directory for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-beta")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
-}
-
-/// B0 over the stand-in `buck2` that does `mode` in each build, for about `secs` seconds.
-fn b0(name: &str, mode: &str, secs: u64) -> B0 {
-    // A slot for this test's farm, kept until its thread ends; one a test held before (for a
-    // second run) is given back first, so no test waits for a slot while holding one.
-    HELD.with(|held| held.borrow_mut().take());
-    let slot = take_slot();
-    HELD.with(|held| *held.borrow_mut() = Some(slot));
-    let dir = scratch(name);
-    let project = dir.join("project");
-    std::fs::create_dir_all(&project).expect("project");
-    std::fs::write(project.join(".fake-buck2"), mode).expect("mode");
-    let fake = PathBuf::from(env!("CARGO_BIN_EXE_kbf-cli-fake-buck2"));
-    B0 {
-        kbf: PathBuf::from(env!("CARGO_BIN_EXE_kbf")),
-        // Any file: the stand-in build runs no action.
-        act: fake.clone(),
-        buck2: fake,
-        envoy: None,
-        envoy_var: "KBF_TEST_NO_SUCH_ENVOY".to_owned(),
-        project,
-        work: dir.join("work"),
-        duration: Duration::from_secs(secs),
-        settle: Duration::from_secs(1),
-        concurrency: 2,
-        build_timeout: Duration::from_secs(60),
-        kill_timeout: Duration::from_secs(30),
-        wall_bound: Duration::from_secs(secs + 120),
-        pause_secs: 1,
-        fill_kib: 4,
-        scrape_every: Duration::from_secs(1),
-        summary: Some(dir.join("summary.md")),
-        mutant: None,
-        extra_flags: Vec::new(),
-        farm_hang: Duration::from_secs(60),
-        require_envoy: false,
-    }
-}
-
-/// SIGKILL to node-3 of the run in `work`, once the load has started (its scraper has made
-/// its series file): the process is found by its working directory. A bounded wait, which
-/// guards against a run that never starts, and asserts nothing about time.
-fn kill_node_3_under_load(work: &Path) {
-    let until = std::time::Instant::now() + Duration::from_secs(120);
-    let (series, dir) = (work.join("logs/metrics.jsonl"), work.join("farm/node-3"));
-    while !series.exists() {
-        assert!(std::time::Instant::now() < until, "the load never started");
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let found = std::fs::read_dir("/proc")
-        .expect("proc")
-        .flatten()
-        .find_map(|entry| {
-            let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
-            (std::fs::read_link(entry.path().join("cwd")).ok()? == dir).then_some(pid)
-        });
-    let pid = rustix::process::Pid::from_raw(found.expect("node-3 runs")).expect("a pid");
-    rustix::process::kill_process(pid, rustix::process::Signal::KILL).expect("SIGKILL");
-}
-
-/// The result document of a run.
-fn document(args: &B0) -> serde_json::Value {
-    let text = std::fs::read_to_string(args.work.join("beta-result.json")).expect("the result");
-    serde_json::from_str(&text).expect("JSON")
-}
-
-/// The verdict of gate `name` in `doc`.
-fn verdict<'a>(doc: &'a serde_json::Value, name: &str) -> &'a str {
-    let gate = doc["gates"]
-        .as_array()
-        .expect("gates")
-        .iter()
-        .find(|g| g["name"] == name);
-    gate.unwrap_or_else(|| panic!("no gate {name} in {doc}"))["verdict"]
-        .as_str()
-        .expect("verdict")
-}
-
-/// The names of the gates that failed.
-fn failed(doc: &serde_json::Value) -> Vec<String> {
-    doc["gates"]
-        .as_array()
-        .expect("gates")
-        .iter()
-        .filter(|g| g["verdict"] == "FAIL")
-        .map(|g| g["name"].as_str().expect("name").to_owned())
-        .collect()
-}
+use support::*;
 
 /// Catches: a harness that fails on a healthy farm, and one that does not use the parts it
 /// reports using. A frontend, three storage nodes and two daemons start from their rendered
@@ -161,7 +34,7 @@ fn failed(doc: &serde_json::Value) -> Vec<String> {
 #[test]
 fn a_healthy_farm_passes_every_gate_behind_envoy() {
     let mut args = b0("healthy", "ok", 6);
-    args.envoy = Some(PathBuf::from(env!("CARGO_BIN_EXE_kbf-cli-fake-envoy")));
+    args.envoy = Some(sibling_bin(FAKE_ENVOY));
     assert_eq!(run(&args).expect("a run"), Ended::Passed);
     let doc = document(&args);
     assert_eq!(failed(&doc), Vec::<String>::new(), "{doc}");
@@ -172,10 +45,12 @@ fn a_healthy_farm_passes_every_gate_behind_envoy() {
     assert_eq!(doc["runtime"]["container"], "none (native driver)");
     assert_eq!(
         doc["runtime"]["envoy"],
-        env!("CARGO_BIN_EXE_kbf-cli-fake-envoy")
+        sibling_bin(FAKE_ENVOY).display().to_string()
     );
     assert!(doc["builds"]["run"].as_u64().expect("builds") >= 2, "{doc}");
     assert_eq!(doc["builds"]["failed"], 0);
+    assert_every_gate_has_a_scenario(&doc);
+    assert_keys_are_private(&args);
     // One start of each of frontend, envoy, three nodes and two daemons, none restarted.
     let table = doc["processes"].as_array().expect("processes");
     let mut roles: Vec<&str> = table
@@ -394,7 +269,7 @@ fn a_node_that_dies_on_its_own_fails_the_liveness_gate() {
         .find(|g| g["name"] == "clean_stop");
     let stop = stop.expect("gate");
     assert_eq!(stop["verdict"], "FAIL", "{stop}");
-    assert_eq!(stop["detail"], "node-3: signal 9");
+    assert_eq!(stop["detail"], "node-3: exited before the stop: signal 9");
     let took = doc["duration_secs"].as_f64().expect("a duration");
     assert!(
         took < 90.0,
