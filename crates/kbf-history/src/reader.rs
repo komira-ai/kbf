@@ -19,9 +19,9 @@
 //! Index calls go through the [`HistoryIndex`]'s offload, so the reader's `async fn`s
 //! may be awaited on a runtime worker.
 //!
-//! TODO: read the index with a bounded range scan once the `kbf-state` trait has one
-//! (suite clause C8, added by a sibling change); until then both lookups use
-//! `scan_prefix`, which returns every row under the prefix.
+//! The two lookups above (a stream's rows, an invocation's chunk rows) still use
+//! `scan_prefix`: each prefix holds one stream's or one invocation's rows, a few. The
+//! lists across builds (`listing`) read bounded ranges (suite clause C8).
 
 use std::fmt;
 use std::str::FromStr;
@@ -32,14 +32,20 @@ use kbf_state::StoreError;
 use prost::Message;
 
 use crate::container::{self, BlockEntry, Footer, FormatError};
+use crate::flog::PIECE_BYTES;
 use crate::index::HistoryIndex;
 use crate::keys::{Day, HistoryRoot, IndexRoot, InvKey, WriterId};
 use crate::records::{
-    ChunkBody, ChunkRecord, ChunkRow, ChunkSummary, FailedRun, HitRecord, InvState,
-    InvocationHeader, RunRecord, SECTION_FAILED, SECTION_RUN, StreamRow, chunk_key,
+    ChunkBody, ChunkRecord, ChunkRow, ChunkSummary, FailedRun, FlogRecord, FlogStream, FlogSummary,
+    HitRecord, InvState, InvocationHeader, ObjRow, RunRecord, SECTION_FAILED, SECTION_RUN,
+    StreamRow, chunk_key, flog_key,
 };
 use crate::run_id::RunId;
 use crate::scoped::Scoped;
+
+/// The test an instance name must pass for a read to answer with its records. `Sync`, so
+/// that a read's future is `Send` and can be awaited on a runtime worker.
+pub type Allow<'a> = &'a (dyn Fn(&str) -> bool + Sync);
 
 /// Why a read failed (as opposed to finding nothing).
 #[derive(Debug, thiserror::Error)]
@@ -94,6 +100,46 @@ pub struct InvocationView {
     /// invocation has no chunk.
     pub newest: Option<ChunkSummary>,
 }
+
+/// One log of a failed run, found in its failure-log object: where it is and how long it
+/// is, from the object's footer. [`Reader::read_log`] reads a range of it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FailureLog {
+    key: ObjectKey,
+    footer: Footer,
+    stream: FlogStream,
+    len: u64,
+    instance: String,
+}
+
+impl FailureLog {
+    /// The log's length in bytes.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the log is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The instance the run was asked under.
+    #[must_use]
+    pub fn instance(&self) -> &str {
+        &self.instance
+    }
+
+    /// Which log it is.
+    #[must_use]
+    pub fn stream(&self) -> FlogStream {
+        self.stream
+    }
+}
+
+/// Blocks a range of a log reads at once: 32 GETs in parallel at most.
+const LOG_READS_AT_ONCE: usize = 32;
 
 /// Where a page of an invocation's records starts: after this chunk, named by its
 /// writer and sequence (the order of `ichunk` rows). Opaque to callers, who pass back
@@ -177,7 +223,9 @@ struct Located {
 pub struct Reader<O> {
     objects: Scoped<O>,
     root: HistoryRoot,
-    index: HistoryIndex,
+    pub(crate) index: HistoryIndex,
+    /// Index rows one list page scans at most.
+    pub(crate) scan_budget: usize,
 }
 
 impl<O: ObjectStore> Reader<O> {
@@ -188,7 +236,16 @@ impl<O: ObjectStore> Reader<O> {
             objects: Scoped::history(objects, &root),
             root,
             index,
+            scan_budget: crate::listing::MAX_SCAN,
         }
+    }
+
+    /// The same reader, scanning at most `rows` (at least 1) index rows for one page of
+    /// a list, where the default is [`MAX_SCAN`](crate::MAX_SCAN).
+    #[must_use]
+    pub fn scanning_at_most(mut self, rows: usize) -> Reader<O> {
+        self.scan_budget = rows.max(1);
+        self
     }
 
     /// The run `id`, if history holds it and its instance is allowed.
@@ -196,15 +253,11 @@ impl<O: ObjectStore> Reader<O> {
     /// # Errors
     /// [`ReadError`] when the index or the object store fails, or a row or object does
     /// not decode.
-    pub async fn run(
-        &self,
-        id: RunId,
-        allow: &dyn Fn(&str) -> bool,
-    ) -> Result<Option<RunView>, ReadError> {
+    pub async fn run(&self, id: RunId, allow: Allow<'_>) -> Result<Option<RunView>, ReadError> {
         // Events reach the writer out of order, so two chunks' sequence ranges may
         // overlap: try each chunk whose range holds the run, in order (one or two).
         for at in self.locate(id).await? {
-            let range = footer_range(&at.row)?;
+            let range = footer_range(at.row.footer_offset, at.row.footer_len)?;
             let footer = decode_tail(&self.objects.get_range(&at.key, range).await?)?;
             let run_key = chunk_key(SECTION_RUN, id.seq());
             let block = self.block(&at.key, &footer, &run_key).await?;
@@ -213,6 +266,103 @@ impl<O: ObjectStore> Reader<O> {
             }
         }
         Ok(None)
+    }
+
+    /// The copy of run `id`'s `stream` log in its failure-log object, if there is one, it
+    /// holds that log and `allow` accepts the run's instance: one index row and one range
+    /// read (the footer). No byte of the log is read here, so a caller refused answers
+    /// like a log that is not held.
+    ///
+    /// # Errors
+    /// [`ReadError`] when the index or the object store fails, or a row or object does
+    /// not decode, or the object is not the run's.
+    pub async fn failure_log(
+        &self,
+        id: RunId,
+        stream: FlogStream,
+        allow: Allow<'_>,
+    ) -> Result<Option<FailureLog>, ReadError> {
+        let key = self.index.root().obj_flog(id);
+        let Some(row) = self.index.get(key.clone()).await? else {
+            return Ok(None);
+        };
+        let row = decode_row::<ObjRow>(&key, &row.value)?;
+        let range = footer_range(row.footer_offset, row.footer_len)?;
+        let object = self.root.flog(id);
+        let (_, footer) = container::decode_footer(&self.objects.get_range(&object, range).await?)?;
+        let summary = FlogSummary::decode(footer.summary.as_slice())
+            .map_err(|e| FormatError::decode("failure-log summary", &e))?;
+        // The row's key names the run; the object it points to must be that run's.
+        if summary.run_id != id.to_bytes() {
+            return Err(FormatError::Mismatch("failure-log run").into());
+        }
+        // An object that names no instance cannot show that `allow` accepts it.
+        let allowed = !summary.instance.is_empty() && allow(&summary.instance);
+        let Some(len) = summary.len_of(stream).filter(|_| allowed) else {
+            return Ok(None);
+        };
+        Ok(Some(FailureLog {
+            key: object,
+            footer,
+            stream,
+            len,
+            instance: summary.instance,
+        }))
+    }
+
+    /// Bytes `first..=last` of `log` (`last` is clamped to its end), read from the blocks
+    /// that hold them: no more than a block's worth past each end. Empty when `first` is
+    /// at or past the end.
+    ///
+    /// # Errors
+    /// [`ReadError`] when the object store fails or the object's blocks do not hold the
+    /// range its footer says.
+    pub async fn read_log(
+        &self,
+        log: &FailureLog,
+        first: u64,
+        last: u64,
+    ) -> Result<Bytes, ReadError> {
+        if first >= log.len || first > last {
+            return Ok(Bytes::new());
+        }
+        let last = last.min(log.len - 1);
+        let piece = PIECE_BYTES as u64;
+        // The blocks of the pieces the range touches, once each, in order.
+        let mut entries: Vec<BlockEntry> = Vec::new();
+        for at in (first / piece..=last / piece).map(|n| n * piece) {
+            let entry = log
+                .footer
+                .block_for(&flog_key(log.stream, at))
+                .cloned()
+                .unwrap_or_default();
+            if entries.last().is_none_or(|e| e.offset != entry.offset) {
+                entries.push(entry);
+            }
+        }
+        let mut out = Vec::with_capacity((last - first + 1) as usize);
+        let mut next = first;
+        for group in entries.chunks(LOG_READS_AT_ONCE) {
+            let reads = group.iter().map(|entry| async move {
+                let range = block_range(entry)?;
+                let stored = self.objects.get_range(&log.key, range).await?;
+                Ok::<_, ReadError>(container::decode_block(entry, &stored)?)
+            });
+            for records in futures::future::try_join_all(reads).await? {
+                for record in records {
+                    let piece = FlogRecord::decode(record.as_slice())
+                        .map_err(|e| FormatError::decode("failure-log record", &e))?;
+                    if piece.stream != i32::from(log.stream) {
+                        continue;
+                    }
+                    take_piece(&mut out, &mut next, last, &piece)?;
+                }
+            }
+        }
+        if next <= last {
+            return Err(FormatError::Truncated("failure log").into());
+        }
+        Ok(Bytes::from(out))
     }
 
     /// `run`, found in chunk `at` whose footer is `footer`, with its failed-run section.
@@ -245,7 +395,7 @@ impl<O: ObjectStore> Reader<O> {
     pub async fn invocation(
         &self,
         inv: &InvKey,
-        allow: &dyn Fn(&str) -> bool,
+        allow: Allow<'_>,
     ) -> Result<Option<InvocationView>, ReadError> {
         let Some(header) = self.header(inv, allow).await? else {
             return Ok(None);
@@ -260,7 +410,10 @@ impl<O: ObjectStore> Reader<O> {
                 let object = chunk_object_key(&self.root, inv, c);
                 let tail = self
                     .objects
-                    .get_range(&object, footer_range(&c.row)?)
+                    .get_range(
+                        &object,
+                        footer_range(c.row.footer_offset, c.row.footer_len)?,
+                    )
                     .await?;
                 let summary = ChunkSummary::decode(decode_tail(&tail)?.summary.as_slice())
                     .map_err(|e| FormatError::decode("chunk summary", &e))?;
@@ -284,6 +437,27 @@ impl<O: ObjectStore> Reader<O> {
         }))
     }
 
+    /// The instance names invocation `inv`'s header lists, one index row and no object
+    /// read: the names a caller must be allowed on before [`Reader::invocation`] or
+    /// [`Reader::records`] is given an `allow` built from them. `None` when history
+    /// holds no such invocation, and, failing closed, when the list is empty or the
+    /// writer truncated it: no set of allowed names covers such an invocation, so it
+    /// is answered as not held, to every caller alike.
+    ///
+    /// # Errors
+    /// As [`Reader::run`].
+    pub async fn invocation_instances(
+        &self,
+        inv: &InvKey,
+    ) -> Result<Option<Vec<String>>, ReadError> {
+        let key = self.index.root().invid(inv);
+        let Some(row) = self.index.get(key.clone()).await? else {
+            return Ok(None);
+        };
+        let header = decode_row::<InvocationHeader>(&key, &row.value)?;
+        Ok(listed_whole(&header).then_some(header.instances))
+    }
+
     /// A page of invocation `inv`'s records: up to `chunks` chunks (at least 1, at most
     /// [`MAX_PAGE_CHUNKS`]) after `after`, read all at once, if history holds the
     /// invocation and `allow` accepts every instance it lists. Records of instances
@@ -296,7 +470,7 @@ impl<O: ObjectStore> Reader<O> {
         inv: &InvKey,
         after: Option<&ChunkCursor>,
         chunks: usize,
-        allow: &dyn Fn(&str) -> bool,
+        allow: Allow<'_>,
     ) -> Result<Option<RecordsPage>, ReadError> {
         if self.header(inv, allow).await?.is_none() {
             return Ok(None);
@@ -326,7 +500,7 @@ impl<O: ObjectStore> Reader<O> {
     async fn header(
         &self,
         inv: &InvKey,
-        allow: &dyn Fn(&str) -> bool,
+        allow: Allow<'_>,
     ) -> Result<Option<InvocationHeader>, ReadError> {
         let key = self.index.root().invid(inv);
         let Some(row) = self.index.get(key.clone()).await? else {
@@ -416,15 +590,19 @@ fn chunk_object_key(root: &HistoryRoot, inv: &InvKey, c: &Chunk) -> ObjectKey {
 /// Whether `allow` accepts every instance `header` lists, and the list is whole: an
 /// empty list (no record names an instance) or one the writer truncated cannot show
 /// that every instance is allowed, so it fails closed.
-fn all_allow(header: &InvocationHeader, allow: &dyn Fn(&str) -> bool) -> bool {
-    !header.instances.is_empty()
-        && !header.instances_truncated
-        && header.instances.iter().all(|i| allow(i))
+pub(crate) fn all_allow(header: &InvocationHeader, allow: Allow<'_>) -> bool {
+    listed_whole(header) && header.instances.iter().all(|i| allow(i))
 }
 
-fn footer_range(row: &ChunkRow) -> Result<ByteRange, FormatError> {
+/// Whether `header` lists every instance its invocation used: the list is not empty
+/// and the writer did not truncate it.
+fn listed_whole(header: &InvocationHeader) -> bool {
+    !header.instances.is_empty() && !header.instances_truncated
+}
+
+fn footer_range(offset: u64, len: u32) -> Result<ByteRange, FormatError> {
     // A footer range of zero length (a broken row) reads one byte and fails to decode.
-    let range = ByteRange::new(row.footer_offset, u64::from(row.footer_len).max(1));
+    let range = ByteRange::new(offset, u64::from(len).max(1));
     range.ok_or(FormatError::Truncated("footer range"))
 }
 
@@ -436,7 +614,7 @@ fn decode_tail(tail: &Bytes) -> Result<Footer, ReadError> {
     Ok(container::decode_footer(tail)?.1)
 }
 
-fn decode_row<M: Message + Default>(key: &str, value: &[u8]) -> Result<M, ReadError> {
+pub(crate) fn decode_row<M: Message + Default>(key: &str, value: &[u8]) -> Result<M, ReadError> {
     M::decode(value).map_err(|e| ReadError::Row {
         key: key.to_owned(),
         message: e.to_string(),
@@ -461,7 +639,31 @@ fn decode_record(bytes: &[u8]) -> Result<ChunkBody, ReadError> {
     })?)
 }
 
-fn find_run(block: &[ChunkBody], id: RunId, allow: &dyn Fn(&str) -> bool) -> Option<RunRecord> {
+/// Appends to `out` the part of `piece` that is in `next..=last`, and moves `next` past
+/// it. Pieces come in order, so one that starts after `next` leaves a hole: a broken
+/// object.
+fn take_piece(
+    out: &mut Vec<u8>,
+    next: &mut u64,
+    last: u64,
+    piece: &FlogRecord,
+) -> Result<(), FormatError> {
+    let end = piece.offset + piece.bytes.len() as u64;
+    if end <= *next || piece.offset > last {
+        return Ok(());
+    }
+    if piece.offset > *next {
+        return Err(FormatError::Mismatch("failure-log pieces"));
+    }
+    // Both bounds are inside the piece, which is in memory.
+    let from = (*next - piece.offset) as usize;
+    let to = (end.min(last + 1) - piece.offset) as usize;
+    out.extend_from_slice(&piece.bytes[from..to]);
+    *next = piece.offset + to as u64;
+    Ok(())
+}
+
+fn find_run(block: &[ChunkBody], id: RunId, allow: Allow<'_>) -> Option<RunRecord> {
     block.iter().find_map(|b| match b {
         ChunkBody::Run(r) if r.run_id() == id && allow(&r.instance) => Some(r.clone()),
         _ => None,
@@ -476,11 +678,7 @@ fn find_failed(block: &[ChunkBody], seq: u32) -> Option<FailedRun> {
 }
 
 /// Adds the allowed records of one whole chunk to `view`.
-fn add_records(
-    view: &mut RecordsPage,
-    object: &[u8],
-    allow: &dyn Fn(&str) -> bool,
-) -> Result<(), ReadError> {
+fn add_records(view: &mut RecordsPage, object: &[u8], allow: Allow<'_>) -> Result<(), ReadError> {
     let decoded = container::decode(object)?;
     for record in &decoded.records {
         let body = decode_record(record)?;

@@ -38,6 +38,7 @@ async fn a_stop_gives_up_on_a_last_step_that_never_ends() {
     let running = Running {
         handle: Abort(handle),
         stop,
+        workers: Vec::new(),
     };
     let begun = Instant::now();
     finish(Some(running)).await;
@@ -63,6 +64,7 @@ async fn a_stop_returns_as_soon_as_the_last_step_ends_and_nothing_stops_at_once(
     finish(Some(Running {
         handle: Abort(handle),
         stop,
+        workers: Vec::new(),
     }))
     .await;
     assert!(begun.elapsed() < FINAL_STEP, "{:?}", begun.elapsed());
@@ -84,6 +86,7 @@ async fn dropping_a_running_writer_aborts_it_and_nothing_stops_at_once() {
     drop(Running {
         handle: Abort(handle),
         stop,
+        workers: Vec::new(),
     });
     for _ in 0..10 {
         tokio::task::yield_now().await;
@@ -98,8 +101,16 @@ async fn dropping_a_running_writer_aborts_it_and_nothing_stops_at_once() {
 /// Catches: a writer id that is not the start's time (two starts would share one, and
 /// their objects would collide on a key), and a step cadence that is not the one the index's transaction budget assumes.
 #[test]
+#[expect(
+    clippy::clone_on_copy,
+    reason = "the derived clone is the code the coverage ratchet counts, and is called here"
+)]
 fn a_start_is_named_by_its_time_and_steps_twice_a_second() {
     let a = Options::default();
+    // Options are copied and shown as what they are.
+    let copy = a.clone();
+    assert_eq!(copy.writer, a.writer);
+    assert!(format!("{copy:?}").contains("step_every"));
     assert_ne!(a.writer.0, 0, "microseconds since the epoch");
     assert_eq!(a.step_every, STEP_EVERY);
     assert_eq!(STEP_EVERY, std::time::Duration::from_millis(500));
