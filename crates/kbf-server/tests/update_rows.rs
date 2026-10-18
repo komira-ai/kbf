@@ -78,12 +78,11 @@ fn the_bytes_of_every_row_are_frozen() {
         let cell = Cell::new(backing, "frozen");
         let rows = Rows::new(cell.store());
 
-        // update/desired {generation, commit, set_at}: generation 1, "v2", set at 1000 ms,
-        // and the pause (beyond the agreed fields), last.
+        // update/desired {generation, commit, set_at}: generation 1, "v2", set at 1000 ms.
+        // (The pause is in update/policy, below.)
         let now = FarmTime::from_millis(1000);
         rows.offer(&Release::new("v2"), now).expect("an offer");
-        rows.set_paused(true).expect("a pause");
-        assert_eq!(raw(&cell, "update/desired"), "08011202763218e8072001");
+        assert_eq!(raw(&cell, "update/desired"), "08011202763218e807");
 
         // update/host/<id> {phase, order_id, generation, since, boot_before}: Held (13),
         // order number 9, generation 3, entered at 5000 ms, boot counter 10 at the mark;
@@ -127,11 +126,14 @@ fn the_bytes_of_every_row_are_frozen() {
         };
         rows.set_policy(&policy).expect("a policy");
         assert_eq!(raw(&cell, "update/policy"), "2001280330c0ee6d");
-        // Every agreed field set (the eight, in the design's order, 1 to 8), and then two
-        // of the node step's limits (the write limit is 13, the rebuild limit 16).
+        // Every agreed field set (the first eight, in the design's order of the time, 1 to
+        // 8), then two of the node step's limits (the write limit is 13, the rebuild limit
+        // 16), and the pause, which came later and is 18: a varint key of two bytes
+        // (18 << 3 = 144 = 0x90 0x01) and the value 1.
         let all = Policy {
             auto_nodes: true,
             auto_frontend: true,
+            paused: true,
             idle_wait: Duration::from_secs(30),
             min_serving: 2,
             max_hosts_out: 4,
@@ -155,6 +157,7 @@ fn the_bytes_of_every_row_are_frozen() {
                 + "4001"
                 + "6890bf05"
                 + "8001a0f736"
+                + "900101"
         );
         assert_eq!(rows.policy().expect("a read"), all);
     }
@@ -302,6 +305,11 @@ fn a_row_this_build_cannot_read_is_refused_not_guessed() {
     assert!(matches!(rows.slot(), Err(RowError::Corrupt { .. })));
     put_raw(&cell, "update/slot", &[0x0a, 0x02, 0x10, 0x01]);
     assert!(matches!(rows.slot(), Err(RowError::Corrupt { .. })));
+    // Bytes that are no message at all, for the two rows the host loop above did not try.
+    put_raw(&cell, "update/slot", &[0xff]);
+    assert!(matches!(rows.slot(), Err(RowError::Corrupt { .. })));
+    put_raw(&cell, "update/desired", &[0xff]);
+    assert!(matches!(rows.desired(), Err(RowError::Corrupt { .. })));
 
     // A run with no commit, and one with no generation (generation 0 is what a host no run
     // has touched carries, so a run of it would read every host as having finished it).
@@ -333,16 +341,19 @@ fn a_field_added_later_is_skipped() {
 
 // The rows.
 
-/// Catches: an offer that reuses a generation or forgets the pause; a rollback that is not
-/// an offer; an offer with no release. A generation only grows (the first is 1), the pause
-/// and the clock are kept as asked, and the same on both backends.
+/// Catches: an offer that reuses a generation or touches the pause; a rollback that is not an
+/// offer; an offer with no release. A generation only grows (the first is 1), the clock is
+/// kept as asked, and a pause (which is in `update/policy`, needs no run and is not an
+/// offer's to clear) stands across offers; the same on both backends.
 #[test]
-fn offers_grow_the_generation_and_keep_the_pause() {
+fn offers_grow_the_generation_and_leave_the_pause_alone() {
     for backing in BACKINGS {
         let cell = Cell::new(backing, "offer");
         let rows = Rows::new(cell.store());
         assert_eq!(rows.desired().unwrap().value, None);
-        assert!(!rows.set_paused(true).unwrap(), "no run to pause");
+        rows.set_paused(true).unwrap();
+        assert!(rows.policy().unwrap().paused, "a pause needs no run");
+        assert_eq!(rows.desired().unwrap().value, None, "and starts none");
         let at = FarmTime::from_millis(42);
         let first = rows.offer(&Release::new("v2"), at).unwrap();
         assert_eq!(
@@ -351,17 +362,19 @@ fn offers_grow_the_generation_and_keep_the_pause() {
                 generation: Generation(1),
                 commit: Release::new("v2"),
                 set_at: at,
-                paused: false,
             }
         );
-        assert!(rows.set_paused(true).unwrap());
+        assert!(
+            rows.policy().unwrap().paused,
+            "an offer does not resume a paused run"
+        );
         let back = rows
             .offer(&Release::new("v1"), FarmTime::from_millis(50))
             .unwrap();
         assert_eq!(back.generation, Generation(2));
-        assert!(back.paused, "an offer does not resume a paused run");
-        assert!(rows.set_paused(false).unwrap());
-        assert!(!rows.desired().unwrap().value.unwrap().paused);
+        assert!(rows.policy().unwrap().paused);
+        rows.set_paused(false).unwrap();
+        assert!(!rows.policy().unwrap().paused);
         assert_eq!(
             rows.offer(&Release::new(""), at),
             Err(RowError::NoRelease),
@@ -411,7 +424,6 @@ fn the_commit_already_desired_keeps_its_generation_and_a_generation_is_always_ab
             generation: Generation(90),
             commit: Release::new("x"),
             set_at: FarmTime::from_millis(1),
-            paused: false,
         };
         put_raw(
             &cell,
@@ -464,9 +476,56 @@ fn the_policy_is_the_defaults_until_written_and_is_checked_when_written() {
     }
 }
 
+/// Catches: a pause that rewrites the policy it sits in (the other settings back at their
+/// defaults after a pause), a resume that does not clear it, and a policy write that leaves
+/// an old pause standing: the pause is one field of `update/policy`, changed alone by
+/// `set_paused` and stated whole by `set_policy`. On an empty store a pause is the defaults
+/// with `paused` set.
+#[test]
+fn a_pause_changes_only_the_pause_and_a_policy_write_states_it() {
+    for backing in BACKINGS {
+        let cell = Cell::new(backing, "pause");
+        let rows = Rows::new(cell.store());
+        rows.set_paused(true).unwrap();
+        let paused_defaults = Policy {
+            paused: true,
+            ..Policy::default()
+        };
+        assert_eq!(rows.policy().unwrap(), paused_defaults);
+        rows.set_paused(false).unwrap();
+        assert_eq!(rows.policy().unwrap(), Policy::default());
+
+        let every = Policy {
+            auto_nodes: true,
+            min_serving: 2,
+            max_hosts_out: 4,
+            rebuild_limit: Some(Duration::from_secs(900)),
+            mac_force_after: Some(Duration::from_secs(60)),
+            ..Policy::default()
+        };
+        rows.set_policy(&every).unwrap();
+        rows.set_paused(true).unwrap();
+        let paused = Policy {
+            paused: true,
+            ..every.clone()
+        };
+        assert_eq!(rows.policy().unwrap(), paused);
+        rows.set_paused(false).unwrap();
+        assert_eq!(rows.policy().unwrap(), every);
+
+        rows.set_paused(true).unwrap();
+        rows.set_policy(&every).unwrap();
+        assert!(
+            !rows.policy().unwrap().paused,
+            "a policy states the pause with the rest"
+        );
+    }
+}
+
 /// Catches: the storage place and the places for other hosts mixed; a claim granted when
 /// the kind is full; a claim that is not repeatable; a release of a place not held that
-/// changes the slot; a slot that loses its holders' claims.
+/// changes the slot; a slot that loses its holders' claims; a count of places held that
+/// names the wrong kind.
 #[test]
 fn places_are_claimed_and_released_by_kind() {
     for backing in BACKINGS {
@@ -492,9 +551,12 @@ fn places_are_claimed_and_released_by_kind() {
         let again = claim(SlotClass::Host, "d1", 9, 2).expect("held");
         assert_eq!(again.hosts[0].order, OrderId::new(1, 3));
         assert_eq!(rows.slot().unwrap().value, again);
+        let held = |slot: &Slot| (slot.held(SlotClass::Storage), slot.held(SlotClass::Host));
+        assert_eq!(held(&again), (1, 2), "one storage place, two for hosts");
 
         let freed = rows.release(&id("s1")).unwrap();
         assert!(freed.storage.is_none() && freed.hosts.len() == 2);
+        assert_eq!(held(&freed), (0, 2), "the count follows the kind freed");
         assert_eq!(rows.release(&id("nobody")).unwrap(), freed);
         let freed = rows.release(&id("d1")).unwrap();
         assert_eq!(freed.hosts.len(), 1);

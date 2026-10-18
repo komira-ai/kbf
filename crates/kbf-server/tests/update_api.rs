@@ -242,7 +242,6 @@ async fn a_complete_commit_is_offered_a_repeat_keeps_the_generation_a_rollback_o
     let (code, first) = offer(&running, B).await;
     assert_eq!((code, first["generation"].clone()), (200, json!(1)));
     assert_eq!(first["commit"], B);
-    assert_eq!(first["paused"], false);
     assert_eq!(
         offer(&running, B).await.1["generation"],
         1,
@@ -323,11 +322,13 @@ async fn the_desired_release_is_a_gated_json_write() {
     );
 }
 
-/// Catches pause and resume: a run that does not exist cannot be paused (409), a paused run
-/// says so in `GET /v1/update`, a new offer keeps it paused, and resume clears it; both need
-/// the token.
+/// Catches pause and resume: they set `paused` of the policy row (no run is needed, and a
+/// new offer leaves it set), `GET /v1/update` shows it at the top and in the policy, resume
+/// clears it, and both need the token.
+///
+/// Mutant seen red: pause written to nothing (the view still says false).
 #[tokio::test]
-async fn pause_and_resume_set_the_run_flag() {
+async fn pause_and_resume_set_the_policy_flag() {
     let dir = Dir::new();
     let store =
         Arc::new(ReleaseStore::open(&dir.0.join("releases"), Limits::default()).expect("open"));
@@ -336,17 +337,29 @@ async fn pause_and_resume_set_the_run_flag() {
         let api = running.api;
         async move { http(api, "POST", &format!("/v1/update/{which}"), auth, None, b"").await }
     };
-    assert_eq!(pause(true, "pause").await.0, 409, "no run yet");
-    put(&running, A, true).await;
-    assert_eq!(offer(&running, A).await.0, 200);
+    let view = || async {
+        http(running.api, "GET", "/v1/update", false, None, b"")
+            .await
+            .1
+    };
+    assert_eq!(view().await["paused"], false);
+    assert_eq!(view().await["policy"], Value::Null);
     assert_eq!(pause(false, "pause").await.0, 401);
     assert_eq!(pause(true, "pause").await, (200, json!({ "paused": true })));
-    let (_, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
-    assert_eq!(view["desired"]["paused"], true);
+    let paused = view().await;
+    assert_eq!(
+        (paused["paused"].clone(), paused["policy"]["paused"].clone()),
+        (json!(true), json!(true))
+    );
+    // An offer made while paused leaves it paused.
+    put(&running, A, true).await;
+    assert_eq!(offer(&running, A).await.0, 200);
+    assert_eq!(view().await["paused"], true);
     assert_eq!(
         pause(true, "resume").await,
         (200, json!({ "paused": false }))
     );
+    assert_eq!(view().await["paused"], false);
 }
 
 /// Catches an answer made up for a server that cannot keep the row or hold the releases:

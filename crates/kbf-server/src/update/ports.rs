@@ -92,10 +92,18 @@ pub trait Transport: Send {
     ) -> Result<(), TransportError>;
 
     /// Orders `CONFIRM` of the activation `order`: the helper cancels its revert timer.
+    /// `release` is the release that activation flipped the host to, the commit on the
+    /// host's row, as for [`Transport::activate`]; a helper confirms an activation only for
+    /// the release it flipped to.
     ///
     /// # Errors
     /// As [`Transport::cordon`].
-    fn confirm(&mut self, host: &WorkerId, order: OrderId) -> Result<(), TransportError>;
+    fn confirm(
+        &mut self,
+        host: &WorkerId,
+        order: OrderId,
+        release: &Release,
+    ) -> Result<(), TransportError>;
 
     /// Tells people. The controller sends one alert once per phase of a host; an error is
     /// not given again until the host's row moves or the controller restarts.

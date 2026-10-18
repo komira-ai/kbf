@@ -57,7 +57,7 @@ fn gave(w: &Inner, host: &str, wanted: &Gave) -> usize {
 }
 
 fn is_confirm(g: &Gave) -> bool {
-    matches!(g, Gave::Confirm(_))
+    matches!(g, Gave::Confirm(..))
 }
 
 fn is_undown(g: &Gave) -> bool {
@@ -150,7 +150,7 @@ fn a_repair_wait_hold_confirms_the_healthy_binary_before_its_row_says_held() {
             );
         }
         let w = rig.world.lock();
-        let confirm = Gave::Confirm(row.record.order);
+        let confirm = Gave::Confirm(row.record.order, NEW.to_owned());
         assert_eq!(gave(&w, "s1", &confirm), 1, "outage={outage}");
         assert_eq!(
             gave(&w, "s1", &Gave::Uncordon),
