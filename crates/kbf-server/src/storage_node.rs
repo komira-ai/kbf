@@ -98,6 +98,9 @@ pub const ALLOWED: &[&str] = &[
     "write_bytes_in_flight",
     "tls_reload_interval_secs",
     "write_puts_in_flight",
+    "write_pool_writers",
+    "write_pool_queue",
+    "write_pool_stream_idle",
     "store_put_attempts",
 ];
 
@@ -538,7 +541,9 @@ where
 {
     let socket = bind_storage_socket(listener.listen)?;
     let (cache, registered) = open_cache(flags, socket, (meta, store, prefix, log)).await?;
-    let cache = cache.with_writes(flags.server.write_config());
+    let cache = cache
+        .with_writes(flags.server.write_config())
+        .with_write_pool(flags.server.write_pool_config());
     let (cache, tier) = crate::write_tier::attach(cache, hot).await?;
     let cache = Arc::new(cache);
     let _flusher = tier.map(|_| {
