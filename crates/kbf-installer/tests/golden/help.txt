@@ -16,7 +16,6 @@ Commands:
   gc          Remove releases beyond current, previous and one more
   boot-check  Run before each start of a release on trial; counts the start
   quiesce     For maintainer scripts: take the lock; exit 5 while a swap is pending
-  envoy       The pinned Envoy of a frontend host
   check       Validate the installer's configuration, trust files and path chain
   help        Print this message or the help of the given subcommand(s)
 
@@ -42,7 +41,7 @@ Options:
       --json
           Print the result as one JSON object on standard output
       --mode <MODE>
-          The kbf mode this host runs [possible values: frontend, storage, daemon, storage-and-daemon, node, all-in-one]
+          The kbf mode this host runs (`kbf --mode=...`) [possible values: frontend, storage, daemon, storage-and-daemon, all-in-one]
       --apply
           Do what the verb says. Without it a mutating verb is a dry run
       --release-source <RELEASE_SOURCE>
@@ -154,43 +153,6 @@ Options:
 For maintainer scripts: take the lock; exit 5 while a swap is pending
 
 Usage: kbf-installer quiesce [OPTIONS]
-
-Options:
-      --json   Print the result as one JSON object on standard output
-      --apply  Do what the verb says. Without it a mutating verb is a dry run
-  -h, --help   Print help
-
-=== kbf-installer envoy --help ===
-The pinned Envoy of a frontend host
-
-Usage: kbf-installer envoy [OPTIONS] <COMMAND>
-
-Commands:
-  fetch   Fetch the Envoy the release pins
-  verify  Verify the installed Envoy against the pin
-  path    Print the path of the Envoy to run
-  list    List the installed Envoys
-  help    Print this message or the help of the given subcommand(s)
-
-Options:
-      --json   Print the result as one JSON object on standard output
-      --apply  Do what the verb says. Without it a mutating verb is a dry run
-  -h, --help   Print help
-
-=== kbf-installer envoy fetch --help ===
-Fetch the Envoy the release pins
-
-Usage: kbf-installer envoy fetch [OPTIONS]
-
-Options:
-      --json   Print the result as one JSON object on standard output
-      --apply  Do what the verb says. Without it a mutating verb is a dry run
-  -h, --help   Print help
-
-=== kbf-installer envoy list --help ===
-List the installed Envoys
-
-Usage: kbf-installer envoy list [OPTIONS]
 
 Options:
       --json   Print the result as one JSON object on standard output

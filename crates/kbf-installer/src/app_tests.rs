@@ -37,10 +37,6 @@ fn stubs() -> Vec<(Vec<&'static str>, &'static str, &'static str)> {
         (vec!["rollback"], "rollback", "P5"),
         (vec!["gc"], "gc", "P5"),
         (vec!["quiesce"], "quiesce", "P5"),
-        (vec!["envoy", "fetch"], "envoy fetch", "P9"),
-        (vec!["envoy", "verify"], "envoy verify", "P9"),
-        (vec!["envoy", "path"], "envoy path", "P9"),
-        (vec!["envoy", "list"], "envoy list", "P9"),
         (vec!["check"], "check", "P10"),
         (vec!["stage"], "stage", "P8"),
         (vec!["activate"], "activate", "P5"),
@@ -65,13 +61,13 @@ fn every_unbuilt_verb_says_which_pull_request_builds_it() {
 }
 
 /// Catches a verb that skips the root check, or one that needs root and does not need to:
-/// everything but `status`, `check` and `envoy list` is refused as an ordinary user with
-/// exit 2, and those three get as far as their own (missing) work.
+/// everything but `status` and `check` is refused as an ordinary user with
+/// exit 2, and those two get as far as their own (missing) work.
 #[test]
-fn only_status_check_and_envoy_list_run_without_root() {
+fn only_status_and_check_run_without_root() {
     for (args, name, _) in stubs() {
         let (exit, _, err) = run_as(1000, &args);
-        if ["status", "check", "envoy list"].contains(&name) {
+        if ["status", "check"].contains(&name) {
             assert_eq!(exit, Exit::Failed, "{name}: {err}");
         } else {
             assert_eq!(exit, Exit::Usage, "{name}");
@@ -152,7 +148,6 @@ fn the_visible_verbs_are_the_contracts() {
             "gc",
             "boot-check",
             "quiesce",
-            "envoy",
             "check"
         ]
     );
@@ -176,7 +171,7 @@ fn flags_are_required_and_checked_by_the_parser() {
         &["confirm"],
         &["confirm", "--id", "42"],
         &["setup"],
-        &["setup", "--mode=queen"],
+        &["setup", "--mode=node"],
         &["setup", "--mode=daemon", "--release-source=ftp"],
         &["confirm", "3-42"],
     ];
@@ -190,6 +185,6 @@ fn flags_are_required_and_checked_by_the_parser() {
 /// `--apply` and `--json` are global: they may come after the verb.
 #[test]
 fn global_flags_may_follow_the_verb() {
-    let cli = parse(&["setup", "--mode=node", "--apply", "--json"]);
+    let cli = parse(&["setup", "--mode=all-in-one", "--apply", "--json"]);
     assert!(cli.apply && cli.json);
 }

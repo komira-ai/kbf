@@ -103,16 +103,14 @@ fn root_of(cli: &Cli) -> PathBuf {
     }
 }
 
-/// Carry out `cli` as the user `euid`; what is printed for the person or `--json` goes to
-/// `out`, what went wrong to `err`.
+/// Carry out `cli` as the user `euid`. A verb that fails or is not built says so: as text on
+/// `err`, or with `--json` as one object on `out`. A verb that succeeds prints nothing here.
 pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) -> Exit {
     let name = cli.verb.name();
     let mut say = |code: Exit, text: String, json: serde_json::Value| {
         // A closed pipe is the reader's business; the exit code still tells.
         let _ = if cli.json {
             writeln!(out, "{json}")
-        } else if code == Exit::Ok {
-            writeln!(out, "{text}")
         } else {
             writeln!(err, "{text}")
         };

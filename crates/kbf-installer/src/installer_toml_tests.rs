@@ -185,3 +185,103 @@ fn a_file_over_the_cap_is_refused() {
         Err(ConfigError::TooLarge(_))
     ));
 }
+
+fn url_problem(url: &str) -> String {
+    problems(&format!(
+        "release_source = \"url\"\nrelease_url = \"{url}\""
+    ))
+}
+
+/// Catches each clause of the URL check on its own: a path with a character, an empty part,
+/// a `.` part; a port that is not digits, too big or zero; a host that is empty, too long,
+/// has an empty or long label, a label with a leading or trailing dash or a character outside
+/// `[a-z0-9-]`, or a bracketed address that is not IPv6. And the forms that must pass.
+#[test]
+fn every_clause_of_the_url_check_can_refuse() {
+    let label64 = "a".repeat(64);
+    let host254 = format!("{}.com", vec!["a".repeat(60); 5].join("."));
+    for (url, want) in [
+        ("https://m.example/a b", "path"),
+        ("https://m.example/a%20b", "path"),
+        ("https://m.example/a//b", "path"),
+        ("https://m.example/a/./b", "path"),
+        ("https://m.example:80a", "port"),
+        ("https://m.example:70000", "port"),
+        ("https://m.example:", "port"),
+        ("https://:443", "host"),
+        ("https://a..b", "host"),
+        ("https://m-.example", "host"),
+        ("https://m_x.example", "host"),
+        ("https://[::g]", "host"),
+        ("https://[not-an-address]", "host"),
+    ] {
+        assert!(url_problem(url).contains(want), "{url}");
+    }
+    for url in [format!("https://{label64}"), format!("https://{host254}")] {
+        assert!(url_problem(&url).contains("host"), "{url}");
+    }
+    for (url, want) in [
+        (
+            "https://[2001:db8::1]:8443/r",
+            "https://[2001:db8::1]:8443/r",
+        ),
+        ("https://[::1]", "https://[::1]"),
+        ("https://10.0.0.7:8443", "https://10.0.0.7:8443"),
+        (
+            "https://m.example/a-b_c.d~e/f",
+            "https://m.example/a-b_c.d~e/f",
+        ),
+    ] {
+        let toml = format!("release_source = \"url\"\nrelease_url = \"{url}\"");
+        assert_eq!(
+            InstallerToml::parse(&toml).expect("parses").source,
+            Source::Url(want.to_owned())
+        );
+    }
+}
+
+/// Catches each clause of the ref check: not under `refs/`, too long, a character outside
+/// the set, a `..`; and the refs that must pass.
+#[test]
+fn every_clause_of_the_ref_check_can_refuse() {
+    for bad in [
+        "heads/main".to_owned(),
+        format!("refs/{}", "a".repeat(200)),
+        "refs/a b".to_owned(),
+        "refs/a..b".to_owned(),
+        "refs/a~b".to_owned(),
+    ] {
+        let text = format!("source_refs = [\"{bad}\"]");
+        assert!(problems(&text).contains("source_refs"), "{bad}");
+    }
+    let ok = InstallerToml::parse("source_refs = [\"refs/heads/release-1.2_x\", \"refs/tags/v1\"]")
+        .expect("parses");
+    assert_eq!(ok.source_refs.len(), 2);
+}
+
+/// Catches each clause of the path check for the node identity: a space or control
+/// character, a backslash, a quote, no leading slash, an empty or dot part.
+#[test]
+fn every_clause_of_the_path_check_can_refuse() {
+    for bad in [
+        "/a b", "/a\\\\b", "/a\\\"b", "a/b", "//a", "/a/./b", "/a/", "/",
+    ] {
+        let text = format!("node_cert = \"{bad}\"\nnode_key = \"/k\"");
+        assert!(
+            matches!(InstallerToml::parse(&text), Err(ConfigError::Invalid(_))),
+            "{bad}"
+        );
+    }
+}
+
+/// A key alone is as wrong as a cert alone, and either is wrong with a URL source.
+#[test]
+fn the_identity_pair_and_the_source_agree() {
+    assert!(problems("node_key = \"/k\"").contains("come together"));
+    let url = "release_source = \"url\"\nrelease_url = \"https://m.example\"\n";
+    assert!(problems(&format!("{url}node_key = \"/k\"")).contains("release_source"));
+    let ok = InstallerToml::parse(
+        "release_source = \"frontend\"\nnode_cert = \"/c\"\nnode_key = \"/k\"",
+    );
+    assert!(ok.is_ok());
+}

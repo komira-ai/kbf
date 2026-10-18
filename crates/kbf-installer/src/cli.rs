@@ -58,8 +58,6 @@ pub enum Verb {
     BootCheck(BootArgs),
     /// For maintainer scripts: take the lock; exit 5 while a swap is pending.
     Quiesce,
-    /// The pinned Envoy of a frontend host.
-    Envoy(EnvoyArgs),
     /// Validate the installer's configuration, trust files and path chain.
     Check,
     #[command(hide = true)]
@@ -70,14 +68,13 @@ pub enum Verb {
     FetchChild,
 }
 
-/// The `kbf` modes a host can be set up for.
+/// The `kbf` modes a host can be set up for. There is no `node` mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Mode {
     Frontend,
     Storage,
     Daemon,
     StorageAndDaemon,
-    Node,
     AllInOne,
 }
 
@@ -89,7 +86,7 @@ pub enum ReleaseSource {
 
 #[derive(Args)]
 pub struct SetupArgs {
-    /// The kbf mode this host runs.
+    /// The kbf mode this host runs (`kbf --mode=...`).
     #[arg(long, value_enum)]
     pub mode: Mode,
     /// Where releases are fetched from.
@@ -124,24 +121,6 @@ pub struct ActivationArgs {
     /// The activation: `<epoch>-<order id>`.
     #[arg(long)]
     pub id: ActivationId,
-}
-
-#[derive(Args)]
-pub struct EnvoyArgs {
-    #[command(subcommand)]
-    pub verb: EnvoyVerb,
-}
-
-#[derive(Subcommand)]
-pub enum EnvoyVerb {
-    /// Fetch the Envoy the release pins.
-    Fetch,
-    /// Verify the installed Envoy against the pin.
-    Verify,
-    /// Print the path of the Envoy to run.
-    Path,
-    /// List the installed Envoys.
-    List,
 }
 
 #[derive(Args)]
@@ -180,7 +159,7 @@ pub struct BootArgs {
 }
 
 impl Verb {
-    /// The verb as typed (`envoy list` for the nested ones).
+    /// The verb as typed.
     pub fn name(&self) -> &'static str {
         match self {
             Verb::Setup(_) => "setup",
@@ -193,12 +172,6 @@ impl Verb {
             Verb::Gc => "gc",
             Verb::BootCheck(_) => "boot-check",
             Verb::Quiesce => "quiesce",
-            Verb::Envoy(e) => match e.verb {
-                EnvoyVerb::Fetch => "envoy fetch",
-                EnvoyVerb::Verify => "envoy verify",
-                EnvoyVerb::Path => "envoy path",
-                EnvoyVerb::List => "envoy list",
-            },
             Verb::Check => "check",
             Verb::Stage => "stage",
             Verb::Activate => "activate",
@@ -206,16 +179,9 @@ impl Verb {
         }
     }
 
-    /// Every verb but `status`, `check` and `envoy list` needs root.
+    /// Every verb but `status` and `check` needs root.
     pub fn needs_root(&self) -> bool {
-        !matches!(
-            self,
-            Verb::Status
-                | Verb::Check
-                | Verb::Envoy(EnvoyArgs {
-                    verb: EnvoyVerb::List
-                })
-        )
+        !matches!(self, Verb::Status | Verb::Check)
     }
 
     /// The pull request of the contract (section 9) that builds the verb, `None` for the
@@ -230,7 +196,6 @@ impl Verb {
                 Some("P5")
             }
             Verb::Activate => Some("P5"),
-            Verb::Envoy(_) => Some("P9"),
             Verb::Stage => Some("P8"),
             Verb::FetchChild => Some("P7"),
         }

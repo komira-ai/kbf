@@ -8,9 +8,7 @@ use crate::installer_toml::{InstallerToml, Source};
 use crate::record::{
     ActivationId, Component, Expected, OrderRecord, OrderVerb, Sha256Hex, TargetPlatform,
 };
-use crate::state_v2::{
-    EnvoyId, EnvoyPins, Floor, Instance, PendingConfirm, SCHEMA as STATE_SCHEMA, StateV2, Unacked,
-};
+use crate::state_v2::{Floor, Instance, PendingConfirm, SCHEMA as STATE_SCHEMA, StateV2, Unacked};
 use crate::status_v2::{
     Phase, ProbeFacts, Refusal, RefusalNote, SCHEMA as STATUS_SCHEMA, StagedFacts, StatusV2,
 };
@@ -18,6 +16,9 @@ use crate::testkit::{A, B, C, c};
 
 pub const ORDER_ACTIVATE: &str = include_str!("../testdata/golden/order_activate.json");
 pub const ORDER_CONFIRM: &str = include_str!("../testdata/golden/order_confirm.json");
+pub const ORDER_REVERT: &str = include_str!("../testdata/golden/order_revert.json");
+pub const ORDER_FRONTEND_UPDATE: &str =
+    include_str!("../testdata/golden/order_frontend_update.json");
 pub const STATE: &str = include_str!("../testdata/golden/state.json");
 pub const STATUS: &str = include_str!("../testdata/golden/status.json");
 pub const INSTALLER_TOML_URL: &str = include_str!("../testdata/golden/installer.toml");
@@ -52,6 +53,25 @@ pub fn order_activate() -> OrderRecord {
     }
 }
 
+pub fn order_revert() -> OrderRecord {
+    OrderRecord {
+        order_id: 44,
+        verb: OrderVerb::Revert,
+        ..order_confirm()
+    }
+}
+
+/// The frontend's own update: the same components and facts as an `activate`, a later order.
+pub fn order_frontend_update() -> OrderRecord {
+    OrderRecord {
+        order_id: 45,
+        epoch: 3,
+        generation: 18,
+        verb: OrderVerb::FrontendUpdate,
+        ..order_activate()
+    }
+}
+
 pub fn order_confirm() -> OrderRecord {
     OrderRecord {
         order_id: 43,
@@ -62,13 +82,6 @@ pub fn order_confirm() -> OrderRecord {
         window_s: 900,
         components: Vec::new(),
         expected: None,
-    }
-}
-
-fn envoy_pins(previous: Option<&str>) -> EnvoyPins {
-    EnvoyPins {
-        current: Some(EnvoyId::try_from("1.34.2-0123456789abcdef".to_owned()).expect("an id")),
-        previous: previous.map(|p| EnvoyId::try_from(p.to_owned()).expect("an id")),
     }
 }
 
@@ -89,7 +102,6 @@ pub fn state() -> StateV2 {
             deadline_mono_s: Some(86_400),
             starts_left: Some(2),
         }),
-        envoy: envoy_pins(Some("1.33.0-fedcba9876543210")),
         floor: Floor {
             epoch: 3,
             order_id: 42,
@@ -121,7 +133,6 @@ pub fn status() -> StatusV2 {
             min_protocol: 11,
             state_schema: 4,
         }),
-        envoy: envoy_pins(None),
         probe: Some(ProbeFacts {
             commit: commit(B),
             platform: "linux-x86_64".to_owned(),

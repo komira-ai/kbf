@@ -14,54 +14,10 @@ use crate::record::{ActivationId, OrderRecord};
 
 pub const SCHEMA: u64 = 2;
 
-/// The directory name of an installed Envoy: `<version>-<first 16 hex of its sha256>`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct EnvoyId(String);
-
-impl EnvoyId {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<String> for EnvoyId {
-    type Error = String;
-
-    fn try_from(s: String) -> Result<Self, String> {
-        let ok = s.rsplit_once('-').is_some_and(|(version, sum)| {
-            !version.is_empty()
-                && version.len() <= 32
-                && version
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
-                && sum.len() == 16
-                && sum.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        });
-        if ok {
-            Ok(EnvoyId(s))
-        } else {
-            Err(format!("{s:?} is not <version>-<16 hex>"))
-        }
-    }
-}
-
-impl From<EnvoyId> for String {
-    fn from(id: EnvoyId) -> String {
-        id.0
-    }
-}
-
 /// A frontend instance name (`a`, `b`): `[a-z0-9]`, at most 16 characters.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Instance(String);
-
-impl Instance {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
 
 impl TryFrom<String> for Instance {
     type Error = String;
@@ -82,13 +38,6 @@ impl From<Instance> for String {
     fn from(i: Instance) -> String {
         i.0
     }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EnvoyPins {
-    pub current: Option<EnvoyId>,
-    pub previous: Option<EnvoyId>,
 }
 
 /// The highest order acted on: (epoch, order id) and the generation within the epoch.
@@ -133,7 +82,6 @@ pub struct StateV2 {
     pub previous: Option<CommitId>,
     pub staged: Option<CommitId>,
     pub pending_confirm: Option<PendingConfirm>,
-    pub envoy: EnvoyPins,
     pub floor: Floor,
     /// The frontend instance that serves (frontend hosts).
     pub serving_instance: Option<Instance>,
@@ -159,7 +107,6 @@ impl StateV2 {
             previous: None,
             staged: None,
             pending_confirm: None,
-            envoy: EnvoyPins::default(),
             floor: Floor::default(),
             serving_instance: None,
             last_acked_order_id: 0,

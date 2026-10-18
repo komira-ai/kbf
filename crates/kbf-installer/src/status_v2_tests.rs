@@ -50,6 +50,8 @@ fn the_refusal_words_are_the_contracts() {
             "pending",
             "lease",
             "denied",
+            "envoy_range",
+            "frontend_busy",
         ]
     );
 }

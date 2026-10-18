@@ -9,8 +9,8 @@
 //!
 //! Unknown keys and duplicate keys are refused (serde's derived parser does both), a record
 //! larger than [`MAX_RECORD_BYTES`] is refused before it is parsed, and the key set a verb
-//! carries is checked: `activate` has components and the expected facts, `confirm` and
-//! `revert` have neither.
+//! carries is checked: `activate` and `frontend_update` have components and the expected facts,
+//! `confirm` and `revert` have neither.
 
 use std::fmt;
 use std::str::FromStr;
@@ -28,11 +28,15 @@ pub const MAX_COMPONENTS: usize = 4;
 
 /// What a record asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum OrderVerb {
     Activate,
     Confirm,
     Revert,
+    /// The frontend host's own update: accepted only on a frontend host, from `orders/`, and
+    /// carries components and expected facts like `activate` (built from the frontend's own
+    /// release store).
+    FrontendUpdate,
 }
 
 /// The platforms a release is built for.
@@ -50,12 +54,6 @@ pub enum TargetPlatform {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Sha256Hex(String);
-
-impl Sha256Hex {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
 
 impl TryFrom<String> for Sha256Hex {
     type Error = String;
@@ -175,10 +173,10 @@ pub enum RecordError {
     Shape(String),
 }
 
-fn name_ok(s: &str, max: usize, dot_first: bool) -> bool {
+fn name_ok(s: &str, max: usize) -> bool {
     !s.is_empty()
         && s.len() <= max
-        && (dot_first || !s.starts_with('.'))
+        && !s.starts_with('.')
         && s.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
 }
@@ -213,22 +211,25 @@ impl OrderRecord {
                 }
                 return Ok(());
             }
-            OrderVerb::Activate => {}
+            OrderVerb::Activate | OrderVerb::FrontendUpdate => {}
         }
         if self.components.is_empty() || self.components.len() > MAX_COMPONENTS {
             return Err(format!(
-                "an activate record carries 1 to {MAX_COMPONENTS} components, not {}",
+                "a {:?} record carries 1 to {MAX_COMPONENTS} components, not {}",
+                self.verb,
                 self.components.len()
             ));
         }
         let Some(expected) = &self.expected else {
-            return Err("an activate record carries the expected facts".to_owned());
+            return Err(
+                "an activate or frontend_update record carries the expected facts".to_owned(),
+            );
         };
-        if !name_ok(&expected.profile, 32, false) || expected.profile.contains('.') {
+        if !name_ok(&expected.profile, 32) || expected.profile.contains('.') {
             return Err(format!("profile {:?} is not [a-z0-9_-]", expected.profile));
         }
         for (i, c) in self.components.iter().enumerate() {
-            if !name_ok(&c.name, 64, false) {
+            if !name_ok(&c.name, 64) {
                 return Err(format!(
                     "component name {:?} is not a plain file name",
                     c.name

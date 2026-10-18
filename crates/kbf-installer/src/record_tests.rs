@@ -3,7 +3,10 @@ use serde_json::{Value, json};
 type Edit = Box<dyn Fn(&mut Value)>;
 
 use super::*;
-use crate::golden::{ORDER_ACTIVATE, ORDER_CONFIRM, order_activate, order_confirm};
+use crate::golden::{
+    ORDER_ACTIVATE, ORDER_CONFIRM, ORDER_FRONTEND_UPDATE, ORDER_REVERT, order_activate,
+    order_confirm, order_frontend_update, order_revert,
+};
 
 fn edit(fixture: &str, f: impl FnOnce(&mut Value)) -> Vec<u8> {
     let mut v: Value = serde_json::from_str(fixture).expect("json");
@@ -23,6 +26,8 @@ fn the_golden_records_decode_and_encode_to_themselves() {
     for (text, want) in [
         (ORDER_ACTIVATE, order_activate()),
         (ORDER_CONFIRM, order_confirm()),
+        (ORDER_REVERT, order_revert()),
+        (ORDER_FRONTEND_UPDATE, order_frontend_update()),
     ] {
         assert_eq!(OrderRecord::parse(text.as_bytes()).expect("parses"), want);
         let mut again = serde_json::to_string_pretty(&want).expect("encodes");
@@ -204,4 +209,82 @@ fn activation_ids_are_two_decimal_numbers() {
     ] {
         assert!(bad.parse::<ActivationId>().is_err(), "{bad:?}");
     }
+}
+
+/// Catches a name check that lets through what a path, a unit or a shell would treat
+/// specially: each clause of the check on its own (empty, long, a leading dot, a character
+/// outside `[a-z0-9._-]`), for a component's file name and for the profile.
+#[test]
+fn names_and_profiles_are_plain() {
+    let long = |n: usize| "x".repeat(n);
+    let names = ["", ".kbf", "KBF", "kb f", "kbf/x"];
+    for name in names.iter().map(|s| (*s).to_owned()).chain([long(65)]) {
+        let err = shape_error(&edit(ORDER_ACTIVATE, |v| {
+            v["components"][0]["name"] = json!(name)
+        }));
+        assert!(err.contains("plain file name"), "{name:?}: {err}");
+    }
+    for profile in names
+        .iter()
+        .map(|s| (*s).to_owned())
+        .chain([long(33), "rel.ease".to_owned()])
+    {
+        let err = shape_error(&edit(ORDER_ACTIVATE, |v| {
+            v["expected"]["profile"] = json!(profile)
+        }));
+        assert!(err.contains("profile"), "{profile:?}: {err}");
+    }
+    for ok in ["kbf-daemon", "k_b.f2", long(64).as_str()] {
+        let record = edit(ORDER_ACTIVATE, |v| v["components"][0]["name"] = json!(ok));
+        assert!(OrderRecord::parse(&record).is_ok(), "{ok}");
+    }
+    let record = edit(ORDER_ACTIVATE, |v| {
+        v["expected"]["profile"] = json!("rel_ease-2")
+    });
+    assert!(OrderRecord::parse(&record).is_ok());
+}
+
+/// Catches a `confirm` that smuggles only the expected facts (the components-only case is in
+/// `each_verb_carries_exactly_its_keys`), and `revert` held to the same rule.
+#[test]
+fn confirm_and_revert_carry_no_facts_either() {
+    let facts = serde_json::to_value(order_activate().expected).expect("value");
+    for verb in ["confirm", "revert"] {
+        let record = edit(ORDER_CONFIRM, |v| {
+            v["verb"] = json!(verb);
+            v["expected"] = facts.clone();
+        });
+        assert!(shape_error(&record).contains("no components"), "{verb}");
+    }
+    let revert = edit(ORDER_CONFIRM, |v| v["verb"] = json!("revert"));
+    assert_eq!(
+        OrderRecord::parse(&revert).expect("parses").verb,
+        OrderVerb::Revert
+    );
+}
+
+/// Catches a `frontend_update` record held to a weaker rule than `activate` (it too starts a
+/// release, so it too must carry its files and the facts to check them against), and a verb
+/// spelled with a hyphen or in capitals.
+#[test]
+fn a_frontend_update_is_checked_like_an_activate() {
+    let no_facts = edit(ORDER_FRONTEND_UPDATE, |v| {
+        v.as_object_mut().expect("o").remove("expected");
+    });
+    assert!(shape_error(&no_facts).contains("expected facts"));
+    let no_files = edit(ORDER_FRONTEND_UPDATE, |v| v["components"] = json!([]));
+    assert!(shape_error(&no_files).contains("FrontendUpdate"));
+    for spelling in ["frontend-update", "FrontendUpdate", "frontend_Update"] {
+        let bytes = edit(ORDER_FRONTEND_UPDATE, |v| v["verb"] = json!(spelling));
+        assert!(
+            shape_error(&bytes).contains("unknown variant"),
+            "{spelling}"
+        );
+    }
+    assert_eq!(
+        OrderRecord::parse(ORDER_FRONTEND_UPDATE.as_bytes())
+            .expect("parses")
+            .verb,
+        OrderVerb::FrontendUpdate
+    );
 }

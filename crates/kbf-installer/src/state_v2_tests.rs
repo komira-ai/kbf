@@ -26,11 +26,10 @@ fn the_golden_state_decodes_and_encodes_to_itself() {
 /// the next write), at the top and in each nested record.
 #[test]
 fn an_unknown_key_is_refused_at_every_level() {
-    let cases: [Edit; 5] = [
+    let cases: [Edit; 4] = [
         Box::new(|v| v["order_floor"] = json!(7)),
         Box::new(|v| v["floor"]["x"] = json!(1)),
         Box::new(|v| v["pending_confirm"]["x"] = json!(1)),
-        Box::new(|v| v["envoy"]["x"] = json!(1)),
         Box::new(|v| v["unacked"]["x"] = json!(1)),
     ];
     for (i, f) in cases.into_iter().enumerate() {
@@ -49,15 +48,11 @@ fn another_schema_is_refused() {
 }
 
 /// Catches ids that name something other than what they should: an activation that is not
-/// `<epoch>-<id>`, an Envoy directory name without its digest prefix or with a path in it,
-/// an instance that is not a plain unit-name part.
+/// `<epoch>-<id>`, an instance that is not a plain unit-name part.
 #[test]
 fn named_values_are_checked() {
-    let cases: [Edit; 6] = [
+    let cases: [Edit; 3] = [
         Box::new(|v| v["pending_confirm"]["activation"] = json!("42")),
-        Box::new(|v| v["envoy"]["current"] = json!("1.34.2")),
-        Box::new(|v| v["envoy"]["current"] = json!("../x-0123456789abcdef")),
-        Box::new(|v| v["envoy"]["current"] = json!("1.34.2-0123456789ABCDEF")),
         Box::new(|v| v["serving_instance"] = json!("a/../b")),
         Box::new(|v| v["serving_instance"] = json!("")),
     ];
@@ -74,4 +69,25 @@ fn named_values_are_checked() {
 fn a_new_state_round_trips() {
     let bytes = StateV2::new().render().expect("encodes");
     assert_eq!(StateV2::parse(&bytes), Ok(StateV2::new()));
+}
+
+fn instance(name: &str) -> Result<Instance, String> {
+    Instance::try_from(name.to_owned())
+}
+
+/// Catches each clause of the instance name check: empty, over 16, upper case, a symbol;
+/// digits and letters are accepted.
+#[test]
+fn an_instance_is_lower_case_letters_and_digits() {
+    for bad in ["", "abcdefghijklmnopq", "A", "a-b", "a b"] {
+        assert!(instance(bad).is_err(), "{bad:?}");
+    }
+    for ok in ["a", "7", "b2", "abcdefghijklmnop"] {
+        assert_eq!(instance(ok).map(String::from), Ok(ok.to_owned()));
+    }
+}
+
+#[test]
+fn the_default_state_is_the_new_state() {
+    assert_eq!(StateV2::default(), StateV2::new());
 }

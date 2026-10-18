@@ -8,7 +8,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::CommitId;
-use crate::state_v2::EnvoyPins;
 
 pub const SCHEMA: u64 = 2;
 
@@ -45,10 +44,14 @@ pub enum Refusal {
     Pending,
     Lease,
     Denied,
+    /// Frontend update only: the installed Envoy is outside the tested range.
+    EnvoyRange,
+    /// Frontend update only: a second `frontend_update` order while one is in flight.
+    FrontendBusy,
 }
 
 impl Refusal {
-    pub const ALL: [Refusal; 16] = [
+    pub const ALL: [Refusal; 18] = [
         Refusal::TrustChain,
         Refusal::Hash,
         Refusal::Attestation,
@@ -65,6 +68,8 @@ impl Refusal {
         Refusal::Pending,
         Refusal::Lease,
         Refusal::Denied,
+        Refusal::EnvoyRange,
+        Refusal::FrontendBusy,
     ];
 }
 
@@ -108,7 +113,6 @@ pub struct StatusV2 {
     pub refusal: Option<RefusalNote>,
     pub acked_order_id: u64,
     pub staged: Option<StagedFacts>,
-    pub envoy: EnvoyPins,
     pub probe: Option<ProbeFacts>,
     /// Days until the trust root expires; negative once it has.
     pub trust_days_left: Option<i64>,
