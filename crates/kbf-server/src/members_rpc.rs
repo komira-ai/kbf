@@ -131,6 +131,7 @@ fn status(e: MembershipError) -> Status {
         MembershipError::Contended => Status::aborted(message),
         MembershipError::Store(_) => Status::unavailable(message),
         MembershipError::NotSettable(_)
+        | MembershipError::NotActive { .. }
         | MembershipError::NoMap
         | MembershipError::Corrupt(_)
         | MembershipError::Map(_) => Status::internal(message),
