@@ -164,6 +164,7 @@ zip = { version = "9.0.1", default-features = false, features = ["deflate-flate2
 kbf-alert = { path = "crates/kbf-alert" }
 kbf-all-in-one = { path = "crates/kbf-all-in-one" }
 kbf-auth = { path = "crates/kbf-auth" }
+kbf-ca = { path = "crates/kbf-ca" }
 kbf-caps = { path = "crates/kbf-caps" }
 kbf-cas-conformance = { path = "crates/kbf-cas-conformance" }
 kbf-daemon = { path = "crates/kbf-daemon" }
