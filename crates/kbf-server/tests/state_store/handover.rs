@@ -209,25 +209,25 @@ async fn a_fenced_farm_answers_its_callers_from_what_the_successor_wrote() {
     assert!(done(&queued).is_none() && done(&vanishes).is_none() && done(&flickers).is_none());
     assert_eq!(untraced(), 2, "both are reported");
 
-    // One shows up again (leased: shown executing); it leaves the report.
+    // Operation 3 shows up again (leased: shown executing); it leaves the report.
     let back = Txn::new().put(key("op/", 3), flicker_row.value, Cond::Any);
     disk.store.txn(back).expect("store").expect("back");
     assert_eq!(old.follow().expect("follow"), 3);
     assert_eq!(untraced(), 1);
-    assert!(matches!(&*vanishes.stage.borrow(), Stage::Executing));
+    assert!(matches!(&*flickers.stage.borrow(), Stage::Executing));
 
     // The caller of the other one cancels: it is no longer waiting, nor reported.
-    drop(queued);
+    drop(vanishes);
     assert_eq!(old.follow().expect("follow"), 2);
     assert_eq!(untraced(), 0);
 
-    // Lost again, and the callers still wait; the last two cancel and nothing is held.
+    // Lost again, and its caller still waits; it cancels and nothing is reported.
     erase(3);
     for _ in 0..200 {
         assert_eq!(old.follow().expect("follow"), 2);
     }
     assert_eq!(untraced(), 1);
-    drop(vanishes);
+    drop(flickers);
     assert_eq!(old.follow().expect("follow"), 1);
     assert_eq!(untraced(), 0);
 }

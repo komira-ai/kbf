@@ -249,11 +249,13 @@ struct State {
     /// A handover took the work from this farm ([`Farm::fence`]): it feeds the scheduler
     /// nothing and queues nothing.
     fenced: bool,
-    /// For each operation a successor is followed on ([`Farm::follow`], or a relay's
-    /// [`kbf_front::Handed::look`]) that the last looks found neither unfinished nor
-    /// ended, how many looks in a row. Only reported (`kbf_frontend_relay_untraced`):
-    /// no look count ends a caller's wait.
-    untraced: BTreeMap<OperationId, u32>,
+    /// For each operation this farm's callers wait on ([`Farm::follow`]) that the last
+    /// looks found neither unfinished nor ended, how many looks in a row. Only reported
+    /// (`kbf_frontend_relay_untraced`): no look count ends a caller's wait.
+    untraced_kept: BTreeMap<OperationId, u32>,
+    /// The same for the operations relays follow ([`kbf_front::Handed::look`]), until
+    /// the relay lets go of them.
+    untraced_relayed: BTreeMap<OperationId, u32>,
 }
 
 /// How many committed records the farm holds for a state store that refuses them.
@@ -323,7 +325,8 @@ impl Farm {
                 store_down: false,
                 renewed: BTreeMap::new(),
                 fenced: false,
-                untraced: BTreeMap::new(),
+                untraced_kept: BTreeMap::new(),
+                untraced_relayed: BTreeMap::new(),
             }),
         }
     }

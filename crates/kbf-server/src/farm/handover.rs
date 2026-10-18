@@ -4,6 +4,7 @@
 //! what the successor writes to the state store ([`Farm::follow`]), and keeps an
 //! operator's cordons across the change.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -234,16 +235,17 @@ impl State {
         let mut looked = Vec::new();
         for operation in self.sched.unfinished() {
             let callers = self.callers_waiting(operation);
-            if callers.is_empty() {
-                // Nobody waits on it: it has nothing to report.
-                self.untraced.remove(&operation);
-            } else {
+            if !callers.is_empty() {
                 looked.push((operation, callers, durable.progress(operation)?));
             }
         }
+        // An operation nobody waits on any more (its callers cancelled) has nothing to
+        // report.
+        self.untraced_kept
+            .retain(|operation, _| looked.iter().any(|(looked, ..)| looked == operation));
         let mut waiting = 0;
         for (operation, callers, progress) in looked {
-            let stage = self.looked_at(operation, progress);
+            let stage = note(&mut self.untraced_kept, operation, &progress);
             let ended = matches!(stage, Some(Stage::Done(_)));
             waiting += callers.len() * usize::from(!ended);
             if let Some(stage) = stage {
@@ -255,34 +257,12 @@ impl State {
         Ok(waiting)
     }
 
-    /// One look at `operation`: what its callers are shown now (`None` leaves them as they
-    /// are). An operation the store has no trace of is shown nothing: it is counted, and
-    /// reported once it has been untraced for [`UNTRACED_LOOKS`] looks in a row, and its
-    /// callers go on waiting. A look that finds it starts the count over.
-    fn looked_at(&mut self, operation: OperationId, progress: Progress) -> Option<Stage> {
-        if progress.is_gone() {
-            let looks = self.untraced.entry(operation).or_default();
-            *looks = looks.saturating_add(1);
-            if *looks == UNTRACED_LOOKS {
-                tracing::warn!(
-                    %operation,
-                    "the state store has no trace of an operation its callers wait on: \
-                     they keep waiting until it appears, they cancel, or this process stops"
-                );
-            }
-        } else {
-            self.untraced.remove(&operation);
-        }
-        progress.stage()
-    }
-
     /// How many operations the last looks found no trace of, [`UNTRACED_LOOKS`] times in
-    /// a row.
+    /// a row, among the ones this farm's callers wait on and the ones relays follow.
     pub(super) fn untraced(&self) -> usize {
-        self.untraced
-            .values()
-            .filter(|looks| **looks >= UNTRACED_LOOKS)
-            .count()
+        let reported = |looks: &&u32| **looks >= UNTRACED_LOOKS;
+        let kept = self.untraced_kept.values().filter(reported).count();
+        kept + self.untraced_relayed.values().filter(reported).count()
     }
 
     /// Takes up the cordons of the nodes an operator placed before this process started,
@@ -308,13 +288,38 @@ impl State {
 impl Progress {
     /// What the callers of an operation at this point are shown: `None` leaves them as
     /// they are (queued, or no trace: they wait).
-    fn stage(self) -> Option<Stage> {
+    fn stage(&self) -> Option<Stage> {
         match self {
-            Self::Ended(finished) => Some(Stage::Done(finished)),
+            Self::Ended(finished) => Some(Stage::Done(finished.clone())),
             Self::Running => Some(Stage::Executing),
             Self::Queued | Self::Gone => None,
         }
     }
+}
+
+/// One look at `operation`, whose callers wait: what they are shown now (`None` leaves
+/// them as they are). An operation the store has no trace of is shown nothing: it is
+/// counted in `untraced`, reported once it has been untraced for [`UNTRACED_LOOKS`] looks
+/// in a row, and its callers go on waiting. A look that finds it starts the count over.
+fn note(
+    untraced: &mut BTreeMap<OperationId, u32>,
+    operation: OperationId,
+    progress: &Progress,
+) -> Option<Stage> {
+    if progress.is_gone() {
+        let looks = untraced.entry(operation).or_default();
+        *looks = looks.saturating_add(1);
+        if *looks == UNTRACED_LOOKS {
+            tracing::warn!(
+                %operation,
+                "the state store has no trace of an operation its callers wait on: \
+                 they keep waiting until it appears, they cancel, or this process stops"
+            );
+        }
+    } else {
+        untraced.remove(&operation);
+    }
+    progress.stage()
 }
 
 /// Shows `stage` on `channel`, waking its watchers only if it changed.
@@ -364,14 +369,14 @@ impl Handed for Farm {
         let progress = durable
             .progress(operation)
             .map_err(|error| error.to_string())?;
-        let stage = state.looked_at(operation, progress);
+        let stage = note(&mut state.untraced_relayed, operation, &progress);
         drop(state);
         self.report_untraced();
         Ok(stage)
     }
 
     fn release(&self, operation: OperationId) {
-        self.lock().untraced.remove(&operation);
+        self.lock().untraced_relayed.remove(&operation);
         self.report_untraced();
     }
 }
