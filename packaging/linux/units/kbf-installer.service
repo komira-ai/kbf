@@ -9,7 +9,7 @@ Description=kbf-installer, the update service of the kbf build farm
 # Gated on its own configuration, which `setup` writes.
 ConditionPathExists=/etc/kbf/installer.toml
 # It must be up before the runtime units: they run a release it may have to revert.
-Before=kbf-frontend@.service kbf-storage.service kbf-daemon.service kbf-storage-and-daemon.service kbf-all-in-one.service kbf-envoy@.service
+Before=kbf-frontend@.service kbf-storage.service kbf-daemon.service kbf-storage-and-daemon.service kbf-all-in-one.service kbf-envoy.service
 
 [Service]
 Type=simple

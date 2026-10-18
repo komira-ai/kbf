@@ -39,7 +39,7 @@ const CURRENT: &str = "/var/lib/kbf-installer/current/";
 /// A frontend instance's slot: the release it runs, until a confirm flips `current`.
 const SLOT: &str = "/var/lib/kbf-installer/slots/%i/";
 /// The pinned Envoy of instance `%i`.
-const ENVOY_BIN: &str = "/var/lib/kbf-installer/envoy/%i/envoy";
+const ENVOY_BIN: &str = "/usr/bin/envoy";
 /// The installer binary the units call.
 const INSTALLER: &str = "/usr/bin/kbf-installer";
 /// The configuration every runtime unit is gated on and every mode reads.
@@ -53,7 +53,7 @@ const ENVOY_CONFIG: &str = "/etc/kbf/envoy/envoy.json";
 const FILES: [&str; 8] = [
     "kbf-all-in-one.service",
     "kbf-daemon.service",
-    "kbf-envoy@.service",
+    "kbf-envoy.service",
     "kbf-frontend@.service",
     "kbf-installer.service",
     "kbf-storage-and-daemon.service",
@@ -65,7 +65,7 @@ const FILES: [&str; 8] = [
 const RUNTIME: [&str; 6] = [
     "kbf-all-in-one.service",
     "kbf-daemon.service",
-    "kbf-envoy@.service",
+    "kbf-envoy.service",
     "kbf-frontend@.service",
     "kbf-storage-and-daemon.service",
     "kbf-storage.service",
@@ -203,7 +203,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         return out;
     }
     let unit = UnitFile::parse(text).unwrap_or_else(|e| panic!("{name}: {e}"));
-    let is_envoy = name == "kbf-envoy@.service";
+    let is_envoy = name == "kbf-envoy.service";
     let is_installer = name == "kbf-installer.service";
     let mode = mode_of(name);
 
@@ -243,8 +243,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         .map(|d| (d.key.as_str(), trim(&d.value)))
         .collect();
     for (key, value) in &execs {
-        let plus_ok = value.starts_with(&format!("+{INSTALLER} boot-check"))
-            || value.starts_with(&format!("+{INSTALLER} envoy verify"));
+        let plus_ok = value.starts_with(&format!("+{INSTALLER} boot-check"));
         if value.starts_with(['-', '!', '@', ':']) || (value.starts_with('+') && !plus_ok) {
             v("exec-prefix", format!("{key}={value}"));
         }
@@ -253,7 +252,12 @@ fn violations(name: &str, text: &str) -> Vec<String> {
             .split_whitespace()
             .next()
             .unwrap_or("");
-        if !(program.starts_with(TREE) || program == INSTALLER) || program.contains("..") {
+        // Envoy is the host's prerequisite (installed by the host's packages, not part of a
+        // kbf release), so its unit alone runs a binary outside the installer's tree; the
+        // `envoy` rule pins which one.
+        let allowed =
+            program.starts_with(TREE) || program == INSTALLER || (is_envoy && program == ENVOY_BIN);
+        if !allowed || program.contains("..") {
             v(
                 "exec",
                 format!("{key} runs {program}, not a file under {TREE}"),
@@ -322,11 +326,11 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     }
 
     if is_envoy {
-        // Catches an Envoy that is not the verified one: re-verified as root at every
-        // start, the binary of its own instance directory, the rendered configuration.
-        let want = format!("+{INSTALLER} envoy verify");
-        if pre != [want.as_str()] {
-            v("envoy", format!("ExecStartPre= is {pre:?}, not [{want}]"));
+        // Catches an Envoy that is not the host's prerequisite one (a binary of kbf's or the
+        // installer's tree: Envoy is not part of a kbf release), or another configuration,
+        // or a start that runs something before it.
+        if !pre.is_empty() {
+            v("envoy", format!("ExecStartPre= is {pre:?}, not none"));
         }
         if start.first() != Some(&ENVOY_BIN) || !start.windows(2).any(|w| w == ["-c", ENVOY_CONFIG])
         {
@@ -679,10 +683,14 @@ fn every_service_is_gated_on_its_config_and_its_checks() {
             all(&unit, "Unit", "ConditionPathExists").contains(&config),
             "{name}: no ConditionPathExists={config}"
         );
-        assert!(
-            !all(&unit, "Service", "ExecStartPre").is_empty(),
-            "{name}: no ExecStartPre= check"
-        );
+        // Envoy is the host's own (no kbf check of it at start yet: the supported version
+        // range is checked by host preparation); every kbf unit runs its checks first.
+        if *name != "kbf-envoy.service" {
+            assert!(
+                !all(&unit, "Service", "ExecStartPre").is_empty(),
+                "{name}: no ExecStartPre= check"
+            );
+        }
         n += 1;
     }
     assert_eq!(n, 7, "a unit was not checked");
@@ -891,9 +899,15 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "conflicts",
     ),
     (
-        "kbf-envoy@.service",
+        "kbf-envoy.service",
         "ConditionPathExists=/etc/kbf/envoy/envoy.json\n",
         "",
+        "envoy",
+    ),
+    (
+        "kbf-envoy.service",
+        "ExecStart=/usr/bin/envoy ",
+        "ExecStart=/var/lib/kbf-installer/current/envoy ",
         "envoy",
     ),
     (
@@ -903,9 +917,9 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "memory",
     ),
     (
-        "kbf-envoy@.service",
+        "kbf-envoy.service",
         "\nRestart=on-failure\n",
-        "\nRestart=on-failure\nExecReload=/usr/bin/systemctl restart kbf-envoy@a\n",
+        "\nRestart=on-failure\nExecReload=/usr/bin/systemctl restart kbf-envoy\n",
         "reload",
     ),
     (
