@@ -169,6 +169,58 @@ fn every_case() -> Vec<(&'static str, Refusal)> {
             "archive-oversize",
             archive(ArchiveFault::Oversize { cap: 10 }),
         ),
+        ("archive-trailing", archive(ArchiveFault::TrailingData)),
+        ("archive-timeout", archive(ArchiveFault::TimedOut)),
+        (
+            "size-mismatch",
+            Refusal::Size {
+                name: "kbf".into(),
+                want: 10,
+                got: 9,
+                max: 100,
+            },
+        ),
+        (
+            "components",
+            Refusal::Components("kbf was not fetched".into()),
+        ),
+        (
+            "facts-missing",
+            Refusal::Facts {
+                component: "kbf".into(),
+                fault: FactsFault::Missing,
+            },
+        ),
+        (
+            "facts-differ",
+            Refusal::Facts {
+                component: "kbf".into(),
+                fault: FactsFault::Differs {
+                    field: "protocol",
+                    want: "4".into(),
+                    got: "5".into(),
+                },
+            },
+        ),
+        (
+            "installer-too-old",
+            Refusal::InstallerTooOld {
+                component: "kbf".into(),
+                what: "protocol 9".into(),
+            },
+        ),
+        (
+            "below-floor",
+            Refusal::Floor {
+                component: "kbf".into(),
+                what: "protocol 1".into(),
+            },
+        ),
+        ("lease-live", Refusal::Lease("1 leases are live".into())),
+        (
+            "version-oversize",
+            version(VersionFault::Oversize { cap: 4096 }),
+        ),
         (
             "wrong-platform",
             Refusal::WrongPlatform {
@@ -279,4 +331,59 @@ fn a_release_that_differs_is_its_own_refusal_and_other_errors_keep_their_cause()
         other.to_string(),
         "cannot install the release: no previous release to roll back to"
     );
+}
+
+/// Catches a refusal reported to the operator under the wrong contract word (the words
+/// are read by programs: `status.json`, the frontend's rollout), or a failure that is not
+/// a verdict on the release (a tool that would not start) reported as one. Every case is
+/// listed with its word; a case with `None` is a failure, exit 1, not a refusal, exit 3.
+///
+/// Mutant seen red: `attestation` and `hash` swapped.
+#[test]
+fn every_refusal_is_reported_under_the_word_of_the_contract() {
+    let expected = [
+        ("untrusted-missing", Some("trust_chain")),
+        ("hash-mismatch", Some("hash")),
+        ("not-attested", Some("attestation")),
+        ("archive-malformed", Some("shape")),
+        ("archive-entries", Some("shape")),
+        ("archive-oversize", Some("size")),
+        ("archive-trailing", Some("shape")),
+        ("archive-timeout", Some("shape")),
+        ("size-mismatch", Some("size")),
+        ("components", Some("fetch")),
+        ("facts-missing", Some("facts")),
+        ("facts-differ", Some("facts")),
+        ("installer-too-old", Some("installer_too_old")),
+        ("below-floor", Some("floor")),
+        ("lease-live", Some("lease")),
+        ("wrong-platform", Some("platform")),
+        ("quarantined", Some("shape")),
+        ("signature-invalid", Some("shape")),
+        ("version-failed", Some("facts")),
+        ("version-unreadable", Some("facts")),
+        ("version-commit", Some("commit_or_ref")),
+        ("version-profile", Some("facts")),
+        ("version-oversize", Some("facts")),
+        ("settings-syntax", None),
+        ("offer-malformed", None),
+        ("inbox-missing", None),
+        ("release-differs", None),
+        ("install-failed", None),
+        ("tool-failed", None),
+        ("work-dir", None),
+    ];
+    let cases = every_case();
+    for (code, want) in expected {
+        let (_, refusal) = cases
+            .iter()
+            .find(|(c, _)| *c == code)
+            .unwrap_or_else(|| panic!("{code} is a case"));
+        assert_eq!(refusal.word(), want, "{code}");
+    }
+    // The two programs the stage bounds are told apart; any other program is a shape check.
+    let timed = |what| Refusal::TimedOut { what }.word();
+    assert_eq!(timed(WHAT_GH), Some("attestation"));
+    assert_eq!(timed(WHAT_PROBE), Some("facts"));
+    assert_eq!(timed("codesign"), Some("shape"));
 }
