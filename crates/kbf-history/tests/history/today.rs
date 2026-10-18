@@ -340,3 +340,124 @@ fn the_writer_feeds_today_from_the_runs_it_drains() {
     let by_action = today.of_action(&(vec![1; 32], 1), &q, &all).runs;
     assert_eq!(by_action, got);
 }
+
+/// A run `n` that ended at `ended` on node `a`, of action 1, started 5 before.
+fn on_a(n: u8, ended: u64, outcome: RunOutcome) -> TodayRun {
+    TodayRun {
+        outcome,
+        action: Some(action(1)),
+        ..run(n, "main", "a", ended)
+    }
+}
+
+#[test]
+fn runs_are_listed_by_end_time_whatever_order_they_reach_the_index() {
+    // Catches: an index that lists runs in the order the writer received them. A failed
+    // run reaches the writer late (its logs are copied first), so a failed run that
+    // ended at 10,000 arriving after a passed run that ended at 10,050 was listed first
+    // on `GET /v1/runs?node=` and `/v1/actions/{digest}/runs`, which promise newest
+    // first. Also: a cursor that moves with arrival, not with time (a late run that sorts
+    // before the cursor lost, or one that sorts after it listed twice), and a window
+    // search that stops early on the wrong end.
+    let today = Today::new(usize::MAX);
+    today.begin(0);
+    today.push(on_a(1, 10_050, RunOutcome::Ok));
+    today.push(on_a(2, 10_000, RunOutcome::Failed));
+    today.push(on_a(3, 10_100, RunOutcome::Ok));
+    // Two runs that ended in the same millisecond: the one that arrived later is newer.
+    today.push(on_a(4, 10_050, RunOutcome::Ok));
+    let q = TodayQuery::newest(100);
+    let want = [3, 4, 1, 2];
+    assert_eq!(ids(&today.on_node("a", &q, &all).runs), want);
+    assert_eq!(ids(&today.of_action(&action(1), &q, &all).runs), want);
+    let window = TodayQuery {
+        from_ms: 10_020,
+        ..q
+    };
+    assert_eq!(ids(&today.on_node("a", &window, &all).runs), [3, 4, 1]);
+    let failed = TodayQuery {
+        class: Some(RunOutcome::Failed),
+        ..q
+    };
+    assert_eq!(ids(&today.on_node("a", &failed, &all).runs), [2]);
+
+    // Pages of one cross the boundary where the late run sits.
+    let mut got = Vec::new();
+    let mut after = None;
+    while got.len() < 10 {
+        let page = today.on_node("a", &TodayQuery { limit: 1, after, ..q }, &all);
+        got.extend(ids(&page.runs));
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(got, want, "pages in time order, no run twice, none skipped");
+}
+
+#[test]
+fn a_cursor_names_a_place_in_time_and_late_runs_land_on_either_side() {
+    // Catches: a cursor that is a position in arrival order. Between two pages a run
+    // that sorts before the cursor (older than the last row read) must be on a later page
+    // and one that sorts after it (newer) must not repeat a row or shift the next page.
+    let today = Today::new(usize::MAX);
+    today.begin(0);
+    for (n, ended) in [(1, 1_000), (2, 3_000), (3, 5_000), (4, 7_000)] {
+        today.push(on_a(n, ended, RunOutcome::Ok));
+    }
+    let q = TodayQuery::newest(2);
+    let first = today.on_node("a", &q, &all);
+    assert_eq!(ids(&first.runs), [4, 3]);
+    let after = first.next;
+    assert!(after.is_some());
+    // A run that ended at 6,000 (newer than the cursor) and one at 4,000 (older), both late.
+    today.push(on_a(5, 6_000, RunOutcome::Failed));
+    today.push(on_a(6, 4_000, RunOutcome::Failed));
+    let second = today.on_node("a", &TodayQuery { after, ..q }, &all);
+    assert_eq!(
+        ids(&second.runs),
+        [6, 2],
+        "the run older than the cursor is listed, the newer one is not"
+    );
+    let third = today.on_node(
+        "a",
+        &TodayQuery {
+            after: second.next,
+            ..q
+        },
+        &all,
+    );
+    assert_eq!(ids(&third.runs), [1]);
+    assert_eq!(third.next, None);
+}
+
+#[test]
+fn eviction_and_coverage_follow_end_time_not_arrival() {
+    // Catches: eviction by arrival order, which forgets a run that ended recently and
+    // keeps an older one that arrived late, and a start of coverage taken from the first
+    // arrival, not the oldest run held (an answer claiming a completeness it lost).
+    let probe = Today::new(usize::MAX);
+    probe.push(on_a(1, 1_000, RunOutcome::Ok));
+    let one = probe.bytes();
+    let today = Today::new(3 * one + one / 2);
+    today.begin(100);
+    for (n, ended) in [(1, 3_000), (2, 4_000), (3, 2_000)] {
+        today.push(on_a(n, ended, RunOutcome::Ok));
+    }
+    assert_eq!(today.len(), 3);
+    assert_eq!(today.covers_from_ms(), Some(100), "nothing forgotten yet");
+    today.push(on_a(4, 5_000, RunOutcome::Ok));
+    let q = TodayQuery::newest(10);
+    assert_eq!(
+        ids(&today.on_node("a", &q, &all).runs),
+        [4, 2, 1],
+        "the run that ended first is forgotten, though it arrived third"
+    );
+    assert!(today.of_action(&action(1), &q, &all).runs.len() == 3);
+    assert_eq!(today.covers_from_ms(), Some(3_000), "the oldest end held");
+    // A run that ended before everything forgotten is not claimed to be covered: it is
+    // forgotten at once, and coverage does not move back.
+    today.push(on_a(5, 1_500, RunOutcome::Ok));
+    assert_eq!(ids(&today.on_node("a", &q, &all).runs), [4, 2, 1]);
+    assert_eq!(today.covers_from_ms(), Some(3_000));
+}
