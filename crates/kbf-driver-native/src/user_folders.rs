@@ -676,6 +676,27 @@ mod tests {
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
+    /// Catches a sweep that makes the cache folder itself when it is missing (the rule
+    /// opens only what is below it, and the daemon never makes the folders `confstr`
+    /// names), or that stops sweeping the temporary folder because the cache folder
+    /// cannot be opened.
+    #[test]
+    fn a_missing_cache_folder_is_left_missing_and_the_temporary_folder_is_swept() {
+        let dir = scratch("no-cache");
+        let f = folders(&dir);
+        std::fs::remove_dir(f.cache()).expect("remove C");
+        let old = LEFTOVER_AGE + Duration::from_secs(60);
+        let leftover = made("old-file", &f.temp().join(TEMPORARY_ITEMS), old);
+        f.sweep(
+            LEFTOVER_AGE,
+            SystemTime::now(),
+            &kbf_outputs::remove_tree_at,
+        );
+        assert!(!leftover.exists(), "the temporary folder was not swept");
+        assert!(!f.cache().exists(), "the cache folder was made");
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
     /// Catches a last change read wrongly from the file's times (seconds or
     /// nanoseconds), a time before the epoch or out of range taken as anything but
     /// the epoch, and an age that counts only one way: a change as far in the future

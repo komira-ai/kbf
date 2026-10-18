@@ -729,7 +729,10 @@ fn package_with_a_local_dependency() -> Vec<(String, Vec<u8>)> {
 /// Catches a sandbox under which `xcodebuild` cannot build a Swift package with a
 /// dependency (derived data, package cache and cloned sources in the lease): SwiftPM
 /// writes its manifest cache in `~/Library/Caches/org.swift.swiftpm`, which it finds
-/// through the user database, not `HOME` (issue #179).
+/// through the user database, not `HOME` (issue #179). SwiftPM's own sandbox for
+/// manifests is off (`-IDEPackageSupportDisableManifestSandbox YES`, what `swift build
+/// --disable-sandbox` is above): `sandbox-exec` cannot nest in the action's sandbox
+/// ("sandbox_apply: Operation not permitted").
 #[tokio::test]
 async fn xcodebuild_builds_a_swift_package() {
     let _tools = DEVELOPER_TOOLS.read().await;
@@ -744,6 +747,7 @@ async fn xcodebuild_builds_a_swift_package() {
     let rt = runtime(config, &cas);
     let mut spec = Spec::sh(
         "xcodebuild -scheme hello -destination 'platform=macOS' \
+         -IDEPackageSupportDisableManifestSandbox YES \
          -derivedDataPath \"$TMPDIR/dd\" -packageCachePath \"$TMPDIR/pc\" \
          -clonedSourcePackagesDirPath \"$TMPDIR/sp\" build \
          && \"$TMPDIR/dd/Build/Products/Debug/hello\"",
