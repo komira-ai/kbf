@@ -18,6 +18,7 @@ mod worker;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 pub use journal::{JOURNAL, JOURNAL_TMP, Journal, JournalError, Options};
 use kbf_map::MemberId;
@@ -45,6 +46,7 @@ trait Debts: Send {
     fn owed(&mut self, record: RepairRecord) -> Result<(), JournalError>;
     fn done(&mut self, digest: &Digest) -> Result<(), JournalError>;
     fn records(&self) -> Vec<RepairRecord>;
+    fn count(&self) -> usize;
 }
 
 impl<F: Fs + Send> Debts for Journal<F>
@@ -62,6 +64,17 @@ where
     fn records(&self) -> Vec<RepairRecord> {
         Journal::records(self).copied().collect()
     }
+
+    fn count(&self) -> usize {
+        Journal::len(self)
+    }
+}
+
+/// This node's own store did not say whether it holds a blob.
+#[derive(Debug, thiserror::Error)]
+#[error("the store did not say whether it holds the blob within {after:?}")]
+struct StoreNoAnswer {
+    after: Duration,
 }
 
 /// The writes whose debt is journalled and whose blob is not yet committed here.
@@ -131,8 +144,9 @@ pub struct Repairs {
     /// Held by [`Repairs::owe`] while it journals, and by [`Repairs::settle_evicted`] from
     /// its look at the in-flight writes to the debt it drops: no debt is added between the
     /// two, so a debt is dropped only on what the store held after every write that had
-    /// finished committing.
-    gate: tokio::sync::Mutex<()>,
+    /// finished committing. The guard that goes to the journal call is the blocking call's
+    /// own, so it is held until the call has written even if the settle is cancelled.
+    gate: Arc<tokio::sync::Mutex<()>>,
     ledger: Arc<dyn RepairLedger>,
 }
 
@@ -154,7 +168,7 @@ impl Repairs {
         Ok(Self {
             debts: Arc::new(Mutex::new(Box::new(journal))),
             in_flight: Arc::default(),
-            gate: tokio::sync::Mutex::new(()),
+            gate: Arc::default(),
             ledger,
         })
     }
@@ -197,6 +211,12 @@ impl Repairs {
         in_flight(&self.in_flight).digests.contains_key(digest)
     }
 
+    /// Whether the gate is held now.
+    #[cfg(test)]
+    pub(crate) fn gate_is_held(&self) -> bool {
+        self.gate.try_lock().is_err()
+    }
+
     /// Records that `digest` is no longer owed because `storage` no longer holds it, unless
     /// a write of it is between its debt and its commit, any write began owing since `begun`
     /// was read (before the store was), or `storage` holds it now. The first two mean the
@@ -206,33 +226,55 @@ impl Repairs {
     /// meanwhile (`gate`), so a write that is no longer in flight has already committed
     /// and shows. Whether the debt was dropped.
     ///
+    /// The store is asked under the gate, so it is given `probe` to answer: every write that
+    /// owes waits behind the gate, and a store that hangs must not stall them. The debt is
+    /// dropped by a journal call that holds the gate to its end, so cancelling this future
+    /// (a worker that is stopped) cannot let a new write's debt be journalled and then erased
+    /// by the late call.
+    ///
     /// # Errors
-    /// [`StorageError::Unavailable`] if the journal could not write it (the debt stays); the
-    /// store's own error if it could not say whether it holds the blob (the debt stays).
+    /// [`StorageError::Unavailable`] if the journal could not write it, or the store did not
+    /// answer within `probe` (the debt stays); the store's own error if it could not say
+    /// whether it holds the blob (the debt stays).
     pub(crate) async fn settle_evicted(
         &self,
         digest: &Digest,
         begun: u64,
         storage: &dyn Storage,
+        probe: Duration,
     ) -> Result<bool, StorageError> {
-        let _gate = self.gate.lock().await;
+        let gate = Arc::clone(&self.gate).lock_owned().await;
         {
             let flight = in_flight(&self.in_flight);
             if flight.begun != begun || flight.digests.contains_key(digest) {
                 return Ok(false);
             }
         }
-        if storage.find_missing(&[*digest]).await?.is_empty() {
+        // Bounded: the gate is held, and every write that owes waits for it.
+        let missing = tokio::time::timeout(probe, storage.find_missing(&[*digest]))
+            .await
+            .map_err(|_| StorageError::Unavailable(Arc::new(StoreNoAnswer { after: probe })))??;
+        if missing.is_empty() {
             return Ok(false);
         }
+        // From here the debt is dropped whatever becomes of this future. The journal call
+        // cannot be cancelled once it is queued, so the gate goes into it: dropped with this
+        // future, the gate would let a new write of the digest journal its debt and the
+        // late `done` erase it, leaving a blob with one copy and no debt. The ledger is told
+        // from there too, so a journal that forgot the debt is not one the frontend keeps.
         let debts = Arc::clone(&self.debts);
-        let settled = *digest;
-        tokio::task::spawn_blocking(move || Self::lock(&debts).done(&settled))
-            .await
-            .map_err(|e| StorageError::Internal(format!("the repair journal: {e}")))?
-            .map_err(|e| StorageError::Unavailable(Arc::new(e)))?;
         let ledger = Arc::clone(&self.ledger);
-        tokio::spawn(async move { ledger.settled(&settled).await });
+        let runtime = tokio::runtime::Handle::current();
+        let settled = *digest;
+        tokio::task::spawn_blocking(move || {
+            let _gate = gate;
+            Self::lock(&debts).done(&settled)?;
+            runtime.spawn(async move { ledger.settled(&settled).await });
+            Ok::<(), JournalError>(())
+        })
+        .await
+        .map_err(|e| StorageError::Internal(format!("the repair journal: {e}")))?
+        .map_err(|e| StorageError::Unavailable(Arc::new(e)))?;
         Ok(true)
     }
 
@@ -264,6 +306,15 @@ impl Repairs {
                 ledger.owed(&record).await;
             }
         });
+    }
+
+    /// How many copies are owed now: the open records of the journal, which has been read
+    /// in full by [`Repairs::open`], so a node that restarted counts the debts it had. Not
+    /// the writes in flight: a write counts from the moment its record is durable. Blocks
+    /// while a write that owes is syncing the journal.
+    #[must_use]
+    pub fn open_debt_count(&self) -> u64 {
+        u64::try_from(Self::lock(&self.debts).count()).unwrap_or(u64::MAX)
     }
 
     /// Every copy owed now, in digest order.

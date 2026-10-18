@@ -1,6 +1,8 @@
 //! The scheduler's read-only view: what it knows of an operation, a worker and the
 //! queue, for the caller that carries out its effects.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use kbf_types::{FarmRun, LeaseId, NodePhase, OperationId, Qos, Resources, WaiterId, WorkerId};
 
 use super::{OpState, Scheduler};
@@ -29,6 +31,17 @@ impl Scheduler {
         self.ops.get(&operation).map(|op| op.farm_runs.as_slice())
     }
 
+    /// The workers placement skips for each operation that has any: the ones its runs
+    /// ended on as the farm's fault, and the ones that dropped its `Start`.
+    #[must_use]
+    pub fn avoided(&self) -> BTreeMap<OperationId, BTreeSet<WorkerId>> {
+        self.ops
+            .iter()
+            .filter(|(_, op)| !op.avoid.is_empty())
+            .map(|(id, op)| (*id, op.avoid.clone()))
+            .collect()
+    }
+
     /// The operation in flight that a submission of `request` would join: its
     /// running twin, if `request` may join one.
     #[must_use]
@@ -43,6 +56,15 @@ impl Scheduler {
     #[must_use]
     pub const fn next_operation(&self) -> OperationId {
         OperationId(self.next_op)
+    }
+
+    /// Every operation not finished, in id order: the ones a successor process takes
+    /// over, and the ones whose callers are still waiting.
+    pub fn unfinished(&self) -> impl Iterator<Item = OperationId> + '_ {
+        self.ops
+            .iter()
+            .filter(|(_, op)| !op.state.is_done())
+            .map(|(id, _)| *id)
     }
 
     /// The waiters attached to `operation`, in attach order.

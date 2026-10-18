@@ -7,6 +7,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
@@ -14,15 +15,20 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt as _;
+use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream};
 use http_body::Frame;
 use kbf_auth::{AuthenticateLayer, Authenticator, Authorizers};
-use kbf_front::{Owner, Owners, Proxy};
+use kbf_front::{Channels, Owner, Owners, Proxy, Routed};
+use kbf_map::{Map, Member, MemberId};
 use kbf_proto::google::bytestream::byte_stream_server::{ByteStream, ByteStreamServer};
 use kbf_proto::google::bytestream::{
     QueryWriteStatusRequest, QueryWriteStatusResponse, ReadRequest, ReadResponse, WriteRequest,
     WriteResponse,
 };
+use kbf_route::{MapSource, MapView, Nodes, RefetchError};
+use kbf_storage::service::RemoteStorage;
+use kbf_storage::{Storage, StorageError};
 use tonic::metadata::MetadataMap;
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
@@ -104,6 +110,10 @@ pub struct Fake {
     pub slow: bool,
     /// Treats every Read as a blob of this kind, whatever its name says.
     pub force: Option<char>,
+    /// Answers every Write with this status at once, reading none of it.
+    pub refuse_writes: Option<tonic::Code>,
+    /// Answers a Write UNAVAILABLE after reading this many of its messages.
+    pub fail_writes_after: Option<usize>,
 }
 
 struct DropFlag(Arc<AtomicBool>);
@@ -132,6 +142,22 @@ impl Fake {
     pub fn forcing(kind: char) -> Arc<Self> {
         Arc::new(Self {
             force: Some(kind),
+            ..Self::default()
+        })
+    }
+
+    /// A node that answers every Write with `code` before it reads a byte of it.
+    pub fn refusing_writes(code: tonic::Code) -> Arc<Self> {
+        Arc::new(Self {
+            refuse_writes: Some(code),
+            ..Self::default()
+        })
+    }
+
+    /// A node that reads `messages` messages of a Write and then answers UNAVAILABLE.
+    pub fn failing_writes_after(messages: usize) -> Arc<Self> {
+        Arc::new(Self {
+            fail_writes_after: Some(messages),
             ..Self::default()
         })
     }
@@ -206,11 +232,18 @@ impl ByteStream for Fake {
         r: Request<Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
         let metadata = r.metadata().clone();
+        if let Some(code) = self.refuse_writes {
+            self.note("Write", "", &metadata);
+            return Err(Status::new(code, "refused"));
+        }
         let mut s = r.into_inner();
         let (mut i, mut total) = (0usize, 0i64);
         while let Some(m) = s.message().await? {
             if i == 0 {
                 self.note("Write", &m.resource_name, &metadata);
+            }
+            if self.fail_writes_after == Some(i) {
+                return Err(Status::unavailable("going away mid-upload"));
             }
             // The first, middle and last byte of the message stand for all of it.
             let at = [0, m.data.len() / 2, m.data.len().saturating_sub(1)];
@@ -312,7 +345,15 @@ pub async fn front(
     authorizers: Authorizers,
     authenticator: Option<Arc<dyn Authenticator>>,
 ) -> Front {
-    let owners = Owners::ranked(owners);
+    front_over(Owners::ranked(owners), authorizers, authenticator).await
+}
+
+/// [`front`] to these `owners`, however they route.
+pub async fn front_over(
+    owners: Owners,
+    authorizers: Authorizers,
+    authenticator: Option<Arc<dyn Authenticator>>,
+) -> Front {
     let proxy = Proxy::new(owners.clone(), Arc::new(authorizers));
     let routes = match authenticator {
         Some(a) => Routes::from(
@@ -411,4 +452,93 @@ pub fn collecting(node: SocketAddr) -> Routes {
     }
 
     Routes::new(Collecting(channel(node)))
+}
+
+/// A map the frontend holds that never changes.
+struct Held(Arc<Map>);
+
+impl MapSource for Held {
+    fn current(&self) -> Option<MapView> {
+        Some(MapView {
+            map: Arc::clone(&self.0),
+            previous: None,
+        })
+    }
+
+    fn refetch(&self, at_least: u64) -> BoxFuture<'_, Result<MapView, RefetchError>> {
+        Box::pin(async move {
+            Err(RefetchError {
+                at_least,
+                reason: "nothing newer".to_owned(),
+            })
+        })
+    }
+}
+
+/// The plain-text connection to each member's fake node.
+struct Wires(BTreeMap<MemberId, Channel>);
+
+impl Wires {
+    fn to(&self, member: &Member) -> Result<Channel, StorageError> {
+        self.0
+            .get(&member.id)
+            .cloned()
+            .ok_or_else(|| StorageError::Internal(format!("no node {}", member.id)))
+    }
+}
+
+impl Nodes for Wires {
+    fn node(&self, member: &Member, generation: u64) -> Result<Arc<dyn Storage>, StorageError> {
+        Ok(Arc::new(RemoteStorage::new(self.to(member)?, generation)))
+    }
+}
+
+impl Channels for Wires {
+    fn channel(&self, member: &Member) -> Result<Channel, StorageError> {
+        self.to(member)
+    }
+}
+
+/// Owners routed by `map`, whose members are the fake nodes at `addrs` (member 1 first),
+/// and whose `--storage` node is nobody.
+pub fn routed_owners(map: &Arc<Map>, addrs: &[SocketAddr]) -> Owners {
+    routed_owners_over(Arc::new(Held(Arc::clone(map))), addrs)
+}
+
+/// [`routed_owners`] by a map source of the test's.
+pub fn routed_owners_over(maps: Arc<dyn MapSource>, addrs: &[SocketAddr]) -> Owners {
+    let wires = Arc::new(Wires(
+        addrs
+            .iter()
+            .zip(1..)
+            .map(|(addr, id)| (MemberId(id), channel(*addr)))
+            .collect(),
+    ));
+    Owners::routed(Arc::new(Routed::new(maps, wires.clone(), wires)), down())
+}
+
+/// A map that is there for one look and gone for the next, and so on: a frontend whose
+/// map is lost between deciding to route and routing.
+pub struct Flicker {
+    pub map: Arc<Map>,
+    pub looks: AtomicUsize,
+}
+
+impl MapSource for Flicker {
+    fn current(&self) -> Option<MapView> {
+        let look = self.looks.fetch_add(1, SeqCst);
+        look.is_multiple_of(2).then(|| MapView {
+            map: Arc::clone(&self.map),
+            previous: None,
+        })
+    }
+
+    fn refetch(&self, at_least: u64) -> BoxFuture<'_, Result<MapView, RefetchError>> {
+        Box::pin(async move {
+            Err(RefetchError {
+                at_least,
+                reason: "nothing newer".to_owned(),
+            })
+        })
+    }
 }

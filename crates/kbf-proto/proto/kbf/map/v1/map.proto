@@ -77,10 +77,11 @@ enum Rule {
 service Membership {
   // Joins, or joins again. The store assigns the member id and the boot counter; the same
   // instance_id gets the same id and a larger boot counter every time. The member starts
-  // as JOINING.
+  // as JOINING, or CATCHING_UP when the request says it is rebuilding its index.
   rpc Register(RegisterRequest) returns (RegisterResponse);
-  // Keeps the member's row alive. NOT_FOUND means the row expired (or never was): register
-  // again.
+  // Keeps the member's row alive, and carries the end of a rebuild (CATCHING_UP to
+  // ACTIVE). NOT_FOUND means the row expired (or never was): register again. Under mutual
+  // TLS PERMISSION_DENIED means the caller's certificate does not name the member's address.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }
 
@@ -91,15 +92,22 @@ enum Role {
 
 message RegisterRequest {
   Role role = 1;
-  // Stable across restarts of one node; the key of its member id.
+  // Stable across restarts of one node; the key of its member id. Under mutual TLS the
+  // host of it (`host` or `host:port`) must be one of the DNS or IP names in the caller's
+  // certificate, or the registration is PERMISSION_DENIED.
   string instance_id = 2;
-  // The address callers dial.
+  // The address callers dial. Under mutual TLS its host must be named by the caller's
+  // certificate the same way, and a Heartbeat for the member must come from a
+  // certificate that names it.
   string addr = 3;
   // Relative capacity: its share of the digests, at least 1.
   uint32 weight = 4;
   string zone = 5;
   // The newest protocol version this node speaks; refused below the map's min_protocol.
   uint32 protocol = 6;
+  // The node is rebuilding its index: it enters the map as CATCHING_UP, not JOINING, and
+  // answers what it cannot find UNAVAILABLE until a heartbeat reports the rebuild done.
+  bool catching_up = 7;
 }
 
 message RegisterResponse {
@@ -117,6 +125,17 @@ message HeartbeatRequest {
   // The generation of the map the node holds (0: none). Absent from an older node, which
   // reads as 0 and is sent the map every beat.
   uint64 have_generation = 3;
+  // Whether the node is still rebuilding its index. A member that is CATCHING_UP becomes
+  // ACTIVE at the first heartbeat that says false; no other state is changed by it.
+  bool catching_up = 4;
+  // The copies this node owes: blobs it holds that a second owner does not, its open
+  // repair-journal records. Read only when debts_known is true.
+  uint64 repair_debts = 5;
+  // Whether this node has read its repair journal since it started. False says "I cannot
+  // say", never "none": an older node, which sends neither field, reads as false, and so
+  // does a node that has no journal. The frontend sums repair_debts over the members to
+  // judge the farm's under-replicated blobs (docs/design/architecture-v2.md, section 11).
+  bool debts_known = 6;
 }
 
 message HeartbeatResponse {

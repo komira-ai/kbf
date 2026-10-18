@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use futures::executor::block_on as run;
 use kbf_history::records::{InvState, InvocationHeader, RunOutcome};
 use kbf_history::{
-    InvRef, Limits, ListQuery, MAX_PAGE, PageCursor, PendingLimits, Reader, StatusKind,
+    Allow, InvRef, Limits, ListQuery, MAX_PAGE, PageCursor, PendingLimits, Reader, StatusKind,
 };
 use kbf_state::{Cond, Txn};
 use prost::Message;
@@ -17,7 +17,7 @@ use crate::support::{Index, Life, Objects, T, all};
 fn page(
     reader: &Reader<Objects>,
     q: &ListQuery<'_>,
-    allow: kbf_history::Allow<'_>,
+    allow: Allow<'_>,
 ) -> (Vec<kbf_history::InvKey>, Option<PageCursor>) {
     let page = futures::executor::block_on(reader.list_invocations(q, allow)).unwrap();
     (page.items.into_iter().map(|i| i.inv).collect(), page.next)
@@ -132,9 +132,7 @@ fn list_hides_what_the_caller_may_not_read() {
     );
     assert_eq!(page(&reader, &q, &only("other")).0, keys(&["solo-other"]));
 
-    let names = |allow: kbf_history::Allow<'_>| {
-        futures::executor::block_on(reader.instances(allow)).unwrap()
-    };
+    let names = |allow: Allow<'_>| futures::executor::block_on(reader.instances(allow)).unwrap();
     let got = names(&all);
     assert_eq!(got.names, ["main", "other", "third"]);
     assert!(!got.truncated);

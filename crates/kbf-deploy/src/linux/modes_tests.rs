@@ -46,7 +46,7 @@ fn each_mode_renders_a_unit_that_passes_every_rule_and_matches_its_golden() {
         assert_eq!(lines(&r), Vec::<String>::new(), "{mode}");
         assert_eq!(
             r.summary,
-            format!("UNIT OK: kbf-{mode}.service runs kbf {mode}")
+            format!("UNIT OK: {} runs kbf {mode}", mode.unit_name())
         );
         assert!(
             text == golden("modes", &mode.unit_name()),
@@ -54,6 +54,47 @@ fn each_mode_renders_a_unit_that_passes_every_rule_and_matches_its_golden() {
             mode.unit_name()
         );
     }
+}
+
+/// The smallest `LimitNOFILE=` a kbf unit may set. systemd starts a unit that sets none at
+/// a soft limit of 1024, and a storage node under a build's burst of uploads (a file per
+/// open write-tier block, a socket per peer, client and cold-store request) hit EMFILE
+/// there ("sync_dir ...: Too many open files").
+const MIN_NOFILE: u64 = 65536;
+
+fn nofile(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("LimitNOFILE="))
+        .and_then(|v| v.parse().ok())
+}
+
+/// Catches a kbf unit, mode or converged, with no `LimitNOFILE=` (the process runs at a
+/// soft open-file limit of 1024) or one below `MIN_NOFILE`. Mutant: the line deleted from
+/// one template turns this red for that unit.
+#[test]
+fn every_kbf_unit_sets_an_open_file_limit() {
+    let c = config();
+    for mode in Mode::ALL {
+        let text = render(&c, Some(1500), mode).expect("renders");
+        assert!(
+            nofile(&text).is_some_and(|n| n >= MIN_NOFILE),
+            "{mode}: LimitNOFILE= is {:?}",
+            nofile(&text)
+        );
+    }
+    let units = render_converged(&c, Some(1500), &Templates::BUILT_IN).expect("renders");
+    let mut seen = 0;
+    for (name, text) in units.files() {
+        if name.contains("kbf-") && name.ends_with(".service") {
+            seen += 1;
+            assert!(
+                nofile(text).is_some_and(|n| n >= MIN_NOFILE),
+                "{name}: LimitNOFILE= is {:?}",
+                nofile(text)
+            );
+        }
+    }
+    assert_eq!(seen, 2, "kbf-server's and kbf-daemon's units");
 }
 
 /// Catches a change to the units `render-units` writes without `--mode` (kbf-server's
@@ -71,35 +112,49 @@ fn the_converged_units_are_unchanged() {
     }
 }
 
-/// Catches an unbuilt mode marked built (its unit's flags would go unchecked by kbf's
-/// parser, which takes anything there) and a mode that runs builds without its cgroup
-/// delegated.
+/// Catches a mode that runs builds without its cgroup delegated, a mode left out of the
+/// credential rule's two sets (it would be checked by neither), and a unit name that is
+/// not `kbf-<mode>.service`.
 #[test]
-fn every_mode_but_the_frontend_is_built() {
-    let built: Vec<_> = Mode::ALL.iter().filter(|m| m.is_built()).collect();
-    assert_eq!(
-        built,
-        [
-            &Mode::Storage,
-            &Mode::Daemon,
-            &Mode::StorageAndDaemon,
-            &Mode::AllInOne
-        ]
-    );
+fn the_modes_are_listed_with_the_sets_the_rules_use() {
     let builds: Vec<_> = Mode::ALL.iter().filter(|m| m.runs_builds()).collect();
     assert_eq!(
         builds,
         [&Mode::Daemon, &Mode::StorageAndDaemon, &Mode::AllInOne]
     );
+    let no_key: Vec<_> = Mode::ALL.iter().filter(|m| m.holds_no_key()).collect();
+    assert_eq!(no_key, [&Mode::Daemon, &Mode::AllInOne]);
+    let beside: Vec<_> = Mode::ALL
+        .iter()
+        .filter(|m| m.holds_key_beside_builds())
+        .collect();
+    assert_eq!(beside, [&Mode::StorageAndDaemon]);
     let names: Vec<_> = Mode::ALL.iter().map(|m| m.unit_name()).collect();
     assert_eq!(
         names,
         [
-            "kbf-frontend.service",
+            "kbf-frontend@.service",
             "kbf-storage.service",
             "kbf-daemon.service",
             "kbf-storage-and-daemon.service",
             "kbf-all-in-one.service"
+        ]
+    );
+}
+
+/// Catches rule `stop` skipped for a mode that drains (a storage node finishes its large
+/// Writes at stop; systemd's 90 s default would cut them) or applied to the daemon,
+/// which abandons its leases on SIGTERM.
+#[test]
+fn every_mode_but_the_daemon_drains() {
+    let drains: Vec<_> = Mode::ALL.iter().filter(|m| m.drains()).collect();
+    assert_eq!(
+        drains,
+        [
+            &Mode::Frontend,
+            &Mode::Storage,
+            &Mode::StorageAndDaemon,
+            &Mode::AllInOne
         ]
     );
 }
@@ -109,7 +164,55 @@ fn every_mode_but_the_frontend_is_built() {
 #[test]
 fn each_planted_defect_turns_its_rule_red() {
     let c = config();
-    let rows: [(Mode, &str, &str, &str); 14] = [
+    let rows: [(Mode, &str, &str, &str); 24] = [
+        (
+            Mode::Daemon,
+            "RestartSec=5\n",
+            "",
+            "FAIL restart: kbf-daemon.service gives no RestartSec=5: systemd restarts after 100 ms, and a failure that repeats quickly ends in start-limit-hit with the unit down",
+        ),
+        (
+            Mode::Storage,
+            "StartLimitIntervalSec=0\n",
+            "StartLimitIntervalSec=10\n",
+            "FAIL restart: kbf-storage.service has StartLimitIntervalSec=10, not StartLimitIntervalSec=0: five starts in that interval end in start-limit-hit with the unit down",
+        ),
+        (
+            Mode::StorageAndDaemon,
+            "RestartSec=5\n",
+            "RestartSec=100ms\n",
+            "FAIL restart: kbf-storage-and-daemon.service has RestartSec=100ms, not RestartSec=5: a failure that repeats quickly must not use up the start limit",
+        ),
+        (
+            Mode::Frontend,
+            "TimeoutStopSec=infinity\n",
+            "TimeoutStopSec=90s\n",
+            "FAIL stop: kbf-frontend@.service has TimeoutStopSec=90s, not TimeoutStopSec=infinity: systemd kills kbf when it runs out, before the drain ends, and every build in flight fails",
+        ),
+        (
+            Mode::AllInOne,
+            "KillSignal=SIGTERM\n",
+            "KillSignal=SIGINT\n",
+            "FAIL stop: kbf-all-in-one.service has KillSignal=SIGINT, not KillSignal=SIGTERM: kbf drains on SIGTERM",
+        ),
+        (
+            Mode::Storage,
+            "TimeoutStopSec=infinity\n",
+            "",
+            "FAIL stop: kbf-storage.service gives no TimeoutStopSec=infinity: systemd kills kbf after its default 90 s, before the drain ends, and every build in flight fails",
+        ),
+        (
+            Mode::StorageAndDaemon,
+            "KillSignal=SIGTERM\n",
+            "KillSignal=SIGINT\n",
+            "FAIL stop: kbf-storage-and-daemon.service has KillSignal=SIGINT, not KillSignal=SIGTERM: kbf drains on SIGTERM",
+        ),
+        (
+            Mode::AllInOne,
+            "--api-listen=127.0.0.1:@KBF_API_PORT@",
+            "--api-listen=127.0.0.1:@KBF_WORKER_PORT@",
+            "FAIL ports: kbf-all-in-one.service: --worker-listen and --api-listen are both on port 8981: give each listener its own (KBF_REAPI_PORT, KBF_WORKER_PORT, KBF_API_PORT, KBF_STORAGE_PORT)",
+        ),
         (
             Mode::Daemon,
             "Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@\n",
@@ -160,9 +263,21 @@ fn each_planted_defect_turns_its_rule_red() {
         ),
         (
             Mode::Frontend,
-            "/kbf frontend\n",
-            "/kbf frontend --node-id=n1\n",
-            "FAIL flags: kbf frontend is not built yet and takes no flag kbf can check, but kbf-frontend.service gives '--node-id=n1'",
+            "--state-store=sqlite://@KBF_STATE_DIR@/state.db",
+            "--state-store=postgres://db.example/kbf",
+            "FAIL state-store: kbf-frontend@.service: --state-store is a postgres URI: postgres is not wired yet; the state store is sqlite:///<absolute path>",
+        ),
+        (
+            Mode::StorageAndDaemon,
+            "EnvironmentFile=@KBF_ETC@/s3.env\n",
+            "",
+            "FAIL storage: kbf-storage-and-daemon.service has an s3:// cold store and no EnvironmentFile=/etc/kbf/s3.env: kbf storage starts without the bucket's key pair and refuses",
+        ),
+        (
+            Mode::StorageAndDaemon,
+            "Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@\n",
+            "Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@\nEnvironmentFile=@KBF_ETC@/*.env\n",
+            "FAIL credential: kbf-storage-and-daemon.service gives a build node the cold store's key (EnvironmentFile=/etc/kbf/*.env): a build node holds no credential, and its builds run as its user",
         ),
         (
             Mode::Daemon,
@@ -186,7 +301,7 @@ fn each_planted_defect_turns_its_rule_red() {
             Mode::Frontend,
             "Slice=kbf.slice\n",
             "Slice=system.slice\n",
-            "FAIL slice: kbf-frontend.service is not in kbf.slice",
+            "FAIL slice: kbf-frontend@.service is not in kbf.slice",
         ),
         (
             Mode::Daemon,
@@ -216,19 +331,33 @@ fn each_planted_defect_turns_its_rule_red() {
     }
     let left = check(
         &c,
-        Mode::Storage,
-        "[Service]\nSlice=kbf.slice\nExecStart=/usr/local/bin/kbf storage\nUser=@KBF_USER@\n",
+        Mode::Frontend,
+        "[Service]\nSlice=kbf.slice\nUser=@KBF_USER@\nTimeoutStopSec=infinity\nKillSignal=SIGTERM\n\
+         Type=notify\nRuntimeDirectory=kbf-frontend\nRuntimeDirectoryPreserve=yes\n\
+         ExecStart=/usr/local/bin/kbf frontend --handover-socket=/run/kbf-frontend/control.sock\n",
         false,
     )
     .expect("a unit");
     assert_eq!(
         lines(&left),
-        ["FAIL render: kbf-storage.service keeps the placeholder @KBF_USER@"]
+        ["FAIL render: kbf-frontend@.service keeps the placeholder @KBF_USER@"]
     );
-    let none = check(&c, Mode::Storage, "[Service]\nSlice=kbf.slice\n", false).expect("a unit");
-    assert_eq!(
-        lines(&none),
-        ["FAIL exec: kbf-storage.service starts '', want '/usr/local/bin/kbf storage ...'"]
+    let none = check(
+        &c,
+        Mode::Frontend,
+        "[Service]\nSlice=kbf.slice\nTimeoutStopSec=infinity\nKillSignal=SIGTERM\n",
+        false,
+    )
+    .expect("a unit");
+    // The rule `handover` fails the unit with no command line too; the others pass.
+    let exec = "FAIL exec: kbf-frontend@.service starts '', want '/usr/local/bin/kbf frontend ...'";
+    assert_eq!(lines(&none)[0], exec);
+    assert!(
+        lines(&none)[1..]
+            .iter()
+            .all(|l| l.starts_with("FAIL handover: ")),
+        "{:?}",
+        lines(&none)
     );
 }
 
@@ -410,22 +539,12 @@ fn the_parse_rule_runs_kbf_check_args_on_a_built_modes_flags() {
         ]
     );
 
-    // A mode not built yet, and a unit that starts an old binary: kbf is not asked.
-    for (mode, text) in [
-        (
-            Mode::Frontend,
-            render(&c, Some(1500), Mode::Frontend).expect("renders"),
-        ),
-        (
-            Mode::Daemon,
-            text.replace("/kbf daemon \\", "/kbf-daemon \\"),
-        ),
-    ] {
-        let (exec, asked) = host(Ok(reply(2, "", "never asked")));
-        let r = on_host(&exec, &c, mode, &text, Some(&given)).expect("runs");
-        assert_eq!(r.notes.len(), 0, "{mode}");
-        assert!(asked.borrow().is_empty(), "{mode}");
-    }
+    // A unit that starts an old binary: kbf is not asked.
+    let old = text.replace("/kbf daemon \\", "/kbf-daemon \\");
+    let (exec, asked) = host(Ok(reply(2, "", "never asked")));
+    let r = on_host(&exec, &c, Mode::Daemon, &old, Some(&given)).expect("runs");
+    assert_eq!(r.notes.len(), 0);
+    assert!(asked.borrow().is_empty());
 }
 
 /// Catches a missing kbf binary read as a failure or a pass with no word (the operator
@@ -512,14 +631,18 @@ fn delegate_is_read_as_systemd_reads_it() {
 /// Catches the rule `credential` looking for another file than the one the storage
 /// modes' units read the key from (a rename of `s3.env` in one place), refusing every
 /// environment file (or one whose directory, not its name, says `s3.env`), and flagging
-/// a mode that holds the storage half's key today.
+/// the two modes that hold the storage half's key (the second by this one file).
 #[test]
 fn the_credential_rule_names_the_file_the_storage_units_read() {
     let c = config();
     let line = format!("EnvironmentFile=@KBF_ETC@/{COLD_STORE_KEY_FILE}\n");
     for mode in Mode::ALL {
         let has = mode.template().contains(&line);
-        assert_eq!(has, matches!(mode, Mode::Storage), "{mode}");
+        assert_eq!(
+            has,
+            matches!(mode, Mode::Storage | Mode::StorageAndDaemon),
+            "{mode}"
+        );
         if has {
             let r = check(
                 &c,
@@ -541,10 +664,7 @@ fn the_credential_rule_names_the_file_the_storage_units_read() {
     let r = check(&c, Mode::Daemon, &own, true).expect("a unit");
     assert_eq!(lines(&r), Vec::<String>::new());
     let holds: Vec<_> = Mode::ALL.iter().filter(|m| m.holds_no_key()).collect();
-    assert_eq!(
-        holds,
-        [&Mode::Daemon, &Mode::StorageAndDaemon, &Mode::AllInOne]
-    );
+    assert_eq!(holds, [&Mode::Daemon, &Mode::AllInOne]);
 }
 
 /// Catches a comment inside a continued `ExecStart=` passed: systemd 239 and older
@@ -725,7 +845,7 @@ fn a_build_modes_unit_and_slice_keep_every_cpu_of_the_node() {
     );
     let frontend = render(&c, Some(1500), Mode::Frontend).expect("renders");
     let f = UnitText::new(Mode::Frontend.unit_name(), frontend).with_drop_in(
-        "kbf-frontend.service.d/cpus.conf",
+        "kbf-frontend@.service.d/cpus.conf",
         "[Service]\nAllowedCPUs=0\n",
     );
     let r = check_on_host(&exec, &c, Mode::Frontend, &f, &wide_slice, true, None).expect("runs");
@@ -761,4 +881,63 @@ fn on_the_node_an_environment_file_holding_the_key_fails_rule_credential() {
         };
         assert_eq!(lines(&r), want, "{mode}");
     }
+}
+
+/// Catches rule `stop` reading the unit file alone: a drop-in's `TimeoutSec=` (which
+/// sets the stop timeout too) or `KillSignal=` passed because the unit has the right
+/// lines, and a later drop-in that restores them not read.
+#[test]
+fn rule_stop_reads_the_drop_ins() {
+    let c = config();
+    let text = render(&c, Some(1500), Mode::AllInOne).expect("renders");
+    let exec = FakeExec::new(0);
+    let fails = |unit: &UnitText| -> Vec<String> {
+        lines(
+            &check_on_host(&exec, &c, Mode::AllInOne, unit, &slice(&c), true, None).expect("runs"),
+        )
+    };
+    let unit = UnitText::new(Mode::AllInOne.unit_name(), text);
+    assert_eq!(fails(&unit), Vec::<String>::new());
+    let cut = unit.clone().with_drop_in(
+        "kbf-all-in-one.service.d/10.conf",
+        "[Service]\nTimeoutSec=5min\nKillSignal=SIGKILL\n",
+    );
+    assert_eq!(
+        fails(&cut),
+        [
+            "FAIL stop: kbf-all-in-one.service has TimeoutSec=5min, not TimeoutStopSec=infinity: systemd kills kbf when it runs out, before the drain ends, and every build in flight fails",
+            "FAIL stop: kbf-all-in-one.service has KillSignal=SIGKILL, not KillSignal=SIGTERM: kbf drains on SIGTERM",
+        ]
+    );
+    let restored = cut.with_drop_in(
+        "kbf-all-in-one.service.d/20.conf",
+        "[Service]\nTimeoutStopSec=infinity\nKillSignal=TERM\n",
+    );
+    assert_eq!(fails(&restored), Vec::<String>::new());
+}
+
+/// Catches a storage unit rendered with the converged units' loopback MinIO when the
+/// settings name no `MINIO_S3_ENDPOINT` (a storage node's bucket is elsewhere), and the
+/// refusal applied to a mode whose unit has no S3 cold store.
+#[test]
+fn the_storage_mode_needs_its_s3_endpoint_set() {
+    let text: String = EXAMPLE
+        .lines()
+        .filter(|l| !l.starts_with("MINIO_S3_ENDPOINT="))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let c = LinuxConfig::parse(&text).expect("valid settings");
+    assert_eq!(
+        render(&c, Some(1500), Mode::Storage).map_err(|e| e.to_string()),
+        Err("MINIO_S3_ENDPOINT must be set for --mode storage: the storage node's cold store is the bucket at that endpoint, and no MinIO runs beside it to default to".to_owned())
+    );
+    for mode in Mode::ALL.into_iter().filter(|m| *m != Mode::Storage) {
+        assert_eq!(
+            render(&c, Some(1500), mode).expect("renders"),
+            render(&config(), Some(1500), mode).expect("renders"),
+            "{mode}"
+        );
+    }
+    let set = render(&config(), Some(1500), Mode::Storage).expect("renders");
+    assert!(set.contains("?endpoint=http://127.0.0.1:9000&"), "{set}");
 }

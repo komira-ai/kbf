@@ -30,7 +30,8 @@ pub struct Versioned {
     pub value: Vec<u8>,
     /// The version of this value.
     pub version: Version,
-    /// When the store's clock expires the key, if it has a time to live.
+    /// When the store's clock expires the key, if it has a time to live. The key is live
+    /// until the clock reads this and expired from that reading on.
     pub expires_at: Option<StoreTime>,
 }
 
@@ -209,6 +210,11 @@ pub enum StoreError {
     /// The backend could not complete the call; the text says why.
     #[error("state store failure: {0}")]
     Failed(String),
+    /// This handle is no longer the store's writer: a newer one took the generation
+    /// ([`crate::Fenced`]), or the backend gave up the writer role
+    /// ([`crate::Store::demote`]). Nothing was written; no retry on this handle can succeed.
+    #[error("state store fenced: this handle is no longer the writer")]
+    Fenced,
 }
 
 /// What happened to a key.

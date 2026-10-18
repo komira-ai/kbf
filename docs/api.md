@@ -23,7 +23,7 @@ reports again after its next `Welcome`.
 
 ## Who may write
 
-A write (cordon, drain, uncordon) can take every node in the fleet out of service, so
+A write (cordon, drain, uncordon, a member's state, a deny list entry) can take every node in the fleet out of service, so
 it must come from an operator. Where a request comes from does not show that:
 
 - **Every server host is also a worker.** Build actions run on it, and they can reach
@@ -114,6 +114,36 @@ order, with its software and where it is in placement:
 | `placement.state` | `serving`; `cordoned` (no new lease, its leases run on); `draining` (cordoned, waiting for its leases until `deadline_unix_ms`); `drained` (cordoned, no lease left: either its leases ended, or the node disconnected and, after the lease grace, its leases were given up and requeued to run elsewhere; check `connected`); `drain_paused` (the deadline passed with leases still running: they run on, and nothing proceeds until an operator acts) |
 | `placement.leases` | while draining or paused: the leases it still holds, as `term.seq` (each server process has its own term, the Raft term under the Raft metadata log: [worker-protocol.md](design/worker-protocol.md#server-restarts-and-the-lease-epoch)) |
 
+## `GET /v1/members`
+
+The storage members of the current map, as the `Membership` service keeps them
+(`kbf.map.v1.Membership`; [architecture-v2.md](design/architecture-v2.md) section 6),
+in the map's order. A read, open like `GET /v1/nodes`; it takes no write. Storage
+members are not the daemon nodes of `/v1/nodes`: a storage node registers with a
+frontend, a daemon opens a worker stream.
+
+```json
+{ "generation": 7,
+  "members": [
+    { "id": 1, "addr": "192.0.2.11:8982", "state": "active", "weight": 1 },
+    { "id": 2, "addr": "192.0.2.12:8982", "state": "draining", "weight": 1 },
+    { "id": 3, "addr": "192.0.2.13:8982", "state": "down", "weight": 2 }
+] }
+```
+
+| Field | Meaning |
+|---|---|
+| `generation` | the map's generation; `0` with an empty `members` before the first member has registered |
+| `id` | the member id the store assigned at registration (the `member_id` of `RegisterResponse`) |
+| `addr` | the address callers dial |
+| `state` | `joining` (registered, a write owner, read last), `catching_up`, `active` (a full owner), `draining` (takes no new writes) or `down` (its lease lapsed; kept in the map for the dwell, then it leaves the list) |
+| `weight` | its share of the digests relative to the others |
+
+A registered member is `joining` until something promotes it with `Members::set_state`;
+the server does not promote on its own yet, so a script that waits for `active` waits
+for that. A server without a state store keeps no members and answers `404`; a state
+store that cannot be read answers `503`.
+
 ## `POST /v1/nodes/{node}:cordon`, `:drain`, `:uncordon`
 
 An operator takes a node out of placement, drains it, or returns it
@@ -143,6 +173,127 @@ or not, could run, and the time spent waiting for a cordon does not count toward
 A server restart forgets every cordon, as it forgets the rest of the scheduler's
 state, and every start logs a warning that says so. The protocol has no drain
 message yet: the daemon is not told, and the server simply sends it no new `Start`.
+
+## `POST /v1/members/{id}`
+
+An operator sets a storage member's state. The body is `{"state": "active"}` or
+`{"state": "draining"}`; the answer is `{"id": N, "state": "...", "generation": G}`,
+the map's generation after the change. `down` is the store's verdict, `catching_up` is what a registration says and `joining` is
+the join handoff's, so none of them is accepted (`400`, as is
+any other body). `404` for an id that has no live row (it expired, or never
+registered) or is not a number, or on a server without a state store; `503` when the
+state store cannot be written; `401`, `403` or `415` from the gates of
+[Who may write](#who-may-write), the same gates as the node writes. Nothing is changed
+by a refused request.
+
+When a member becomes `active` the cluster also records that it has formed (see below),
+in the same transaction.
+
+**When a member is `active` without this call.** A registration that says the node's
+index is whole enters `active`, in a fresh cluster and in a formed one alike: it is the
+first start of a cluster, or a restart of a node whose meta log already has its rebuild,
+so a rolling restart leaves every member `active`. The registration also writes the
+`meta/members_formed` mark. A registration that says the node is rebuilding its index
+enters `catching_up` and becomes `active` by its own first beat that says it is done. No
+registration writes `joining`; that state is set by the join handoff in code
+(`Members::set_state`), and a `joining` member is promoted by this call.
+
+**The risk of promoting a joiner.** `active` makes the member a settled owner: it
+takes the rank-1 slots of the digests it wins in the rendezvous order, and it is read
+in rank order. Nothing here copies the blobs of that slice to it (the join handoff,
+`architecture-v2.md` section 8.4, is not built). What the router does about it, from
+`kbf-route`'s read walk and `kbf-map`'s `read_order_with_previous`:
+
+- A read that gets `NotFound` from an owner goes on to the next owner in the read
+  order, and the answer is `NotFound` only if every owner said so. So a promoted
+  joiner that lacks a blob costs one extra round trip per read of it, not a failed
+  read.
+- That holds only while an owner that has the blob is still in the list. The list is
+  this generation's top `r` settled owners, then the write owners not yet listed, then
+  the previous generation's list: one generation back, no more. A joiner that wins a
+  digest's top `r` pushes an old copy-holder out of it, and once the map moves on
+  again (any member change bumps the generation) that holder is in no list: the blob
+  is read as missing, and the action is rebuilt or the upload repeated.
+- Writes of that slice go to the joiner as primary (the chain head and the
+  `FindMissing` target): it reports every blob it has not seen as missing, so
+  uploads that were deduplicated are sent again until the slice fills.
+
+So promote a joiner when its slice is expected to be empty or its blobs are cheap to
+rebuild (a new cluster, a cache), or have it hold the slice first; and promote one
+member at a time. `draining` is the reverse: the member takes no new writes, its
+successor takes its slot at once, and it is read first.
+
+## `POST /v1/denied` and `DELETE /v1/denied`
+
+An operator adds an entry to the storage deny list, or takes one off. A denied
+certificate is refused by every storage node on every method, and by the membership
+service ([architecture-v2.md](design/architecture-v2.md) section 9 and section 6,
+Admission). An entry names:
+
+| Entry | Names |
+|---|---|
+| `serial <hex>` | the certificate with that serial (colons, case and leading zeros ignored) |
+| `spki-sha256 <64 hex>` | every certificate with that public key, whatever its serial (`openssl x509 -noout -pubkey \| openssl pkey -pubin -outform DER \| sha256sum`) |
+| `node <id>` | every certificate that carries `<id>` as a DNS name, compared up to ASCII case |
+
+A `node` entry names DNS names only. A certificate's IP names are never compared with it,
+nor is a name with a trailing dot or a port, so a `node` entry that holds an IP address or a
+colon (an IPv6 address, or a member's `host:port`) is `400`: list that certificate by
+`serial` or `spki-sha256`, which also name a certificate that has no DNS name.
+
+`POST /v1/denied` takes `{"entry": "node mac-07", "reason": "retired"}`. Both fields are
+required (an empty reason is `400`: a deny is never anonymous), and any other field is `400`. The
+entry is spelled as a line of the deny list file is; it is stored in its canonical form (a
+serial in lower case without colons or leading zeros, a node id in lower case), so one entry
+is one row whatever it was typed as (`node Mac-07` and `node mac-07` are one entry, and
+either spelling takes it off). The reason is at most 512 bytes and the entry's value at most
+253, with no control character in it; the list
+holds at most 4096 entries (`400` past any of them: take one off first). The answer is
+`{"entry": "serial a1b", "generation": G}`: the entry as stored, and the generation of the
+map that holds it, which the call builds before it answers (`0` before any member has
+registered; the entry is in the first map then). An entry that is listed already answers
+`200` and keeps its first reason.
+
+`DELETE /v1/denied?entry=<entry>` takes the entry off (percent-encode it, or use `+` for the
+space): `200` with the same answer, `404` if it is not listed, `400` with no `entry` or one
+that is not an entry.
+
+Both need a token, a loopback peer, no `Origin` and `Content-Type: application/json` (a
+`DELETE` sends the header and no body), as every write does ([Who may
+write](#who-may-write)); `404` on a server without a state store; `503` when the state
+store cannot be written. A `503` that comes after the row was written leaves the row, and
+the map follows at the next beat.
+
+**When it takes effect.** On the storage nodes, from the first call after a node holds the
+generation the answer names: a node learns a new generation with its next heartbeat
+(a third of the member time to live, 5 s by default). A node that has no map enforces
+nothing: one that takes a map from a frontend (`--frontend`) serves nothing until it has one,
+but a standalone storage node, which has no map source, serves every call and enforces no
+entry. At the membership service, a `Register` counts the entry at once, and a
+`Heartbeat` from the first call after the map holds it; a denied node's row is not renewed,
+so the member is `down` after the time to live and leaves the map after the dwell. Until
+then the frontends still route to it, and the other nodes already refuse its copies, so a
+write it is the primary for fails in that window. The entries are in the map every node
+receives, which `GET /v1/members` does not show.
+
+**What it does not cut.** The entry is applied to the storage nodes and to the membership
+service, not to the worker listener: a daemon whose certificate is denied here loses its
+storage access but keeps its work stream, and goes on receiving actions (their commands,
+environments and input digests), and its blob calls on that listener are served, until it
+is listed in `--worker-deny-list`, the file that listener reads
+([worker-protocol.md](design/worker-protocol.md)). To take a daemon off the farm, list it in
+both. There is no `GET /v1/denied` either: the reasons are kept in the store, and the list
+itself is in the map.
+
+**Locking yourself out.** An entry that names the frontend's own certificate (by serial or
+key, or a `node` that is the name in it) makes every storage node refuse the frontend. The
+way back is `DELETE /v1/denied`, which goes through this API and not through a certificate.
+
+**Upgrading.** Upgrade every storage node and every frontend before relying on an entry. A
+storage node that predates the list ignores it, and the checks at `Register` and `Heartbeat`
+are the frontend's, so a denied storage node can still register and beat through a frontend
+that predates them. A frontend that predates the list copies it forward in the map
+unchanged.
 
 ## `GET /v1/frontend/drain` and `POST /v1/frontend/drain`
 
@@ -193,6 +344,44 @@ the drain, and the unit templates in `kbf-deploy` set it.
 `:uncordon`). It prints the answer's JSON, exits 0 on a 2xx and 1 otherwise, and takes
 `--api` for the listener (default `127.0.0.1:8982`). A frontend drain has no undrain:
 restart it.
+
+## `GET /v1/storage`
+
+Whether every blob is known to have its copies elsewhere: the number a rollout asks
+before it takes a storage node down. A read, open like `GET /v1/nodes`, served by a
+frontend with a state store (without one there are no storage members, and the route is
+`404`). The definition, which is also the help text of the metric below:
+
+`under_replicated_blobs` is the sum, over all registered storage members, of the blobs
+each owes a second copy (the open records of the member's repair journal, which each
+storage heartbeat reports). It is **known** only when every registered member is `ACTIVE`
+and has reported within the freshness window (two heartbeat intervals); otherwise it is
+**unknown**, because a member that is down, joining, catching up, draining or silent may
+hold blobs that nobody counts. A member that has not read its journal since it started, or
+has none, reports that it cannot say; that is unknown too, never zero. So is a farm with
+no registered member.
+
+```json
+{ "members_total": 3, "members_active": 3, "not_active": [], "silent": [],
+  "unreported": [], "debts_total": 3, "under_replicated_blobs": 3,
+  "reasons": ["3 blobs owed"] }
+```
+
+- `under_replicated_blobs`: the number, or `null` while unknown. A gate treats `null` as
+  not zero.
+- `debts_total`: the debts of the `ACTIVE` members that reported within the window and
+  said, summed even when the total is unknown.
+- `not_active`, `silent`, `unreported`: member ids that make the number unknown: members
+  that are not `ACTIVE`; `ACTIVE` members with no report within the window; `ACTIVE`
+  members whose report says they cannot say.
+- `reasons`: why the number is not zero, in that order, as a rollout would say it
+  (`member 3 not active`, `member 2 silent`, `5 blobs owed`); empty when it is known to be
+  zero.
+
+The number is as old as the newest heartbeat. A copy owed since then is not in it, so
+whoever acts on a zero keeps new writes away from the node first (drains it), then reads
+again. A member that left the map (a `DOWN` member leaves after the dwell) is not counted.
+`503` with `{"error": ...}` when the membership cannot be read.
 
 ## `GET /healthz` and `GET /readyz`
 
@@ -288,6 +477,8 @@ caller goes away before the answer counts as an error.
 | `kbf_find_missing_requests_total`, `_errors_total`, `_in_flight`, `_seconds` | as above | FindMissingBlobs calls; `kbf_find_missing_digests_total` the digests asked about, `kbf_find_missing_missing_total` those answered missing |
 | `kbf_execute_requests_total`, `_errors_total` | counter | Execute calls ended, and those that ended in an error status or were dropped by their caller before the done operation (an operation that finished with a failed `ExecuteResponse` is not one) |
 | `kbf_execute_in_flight` | gauge | Execute and WaitExecution streams open |
+| `kbf_under_replicated_blobs` | gauge | the sum over all registered storage members of the blobs each owes a second copy, exported **only while it is known** (every registered member `ACTIVE` and reporting within the window); absent otherwise, never 0. Frontends with a state store. [`GET /v1/storage`](#get-v1storage) says why it is unknown |
+| `kbf_storage_health_known` | gauge | 1 when `kbf_under_replicated_blobs` is exported, 0 when it is unknown (including a membership that cannot be read). Frontends with a state store |
 | `kbf_front_open_executions` | gauge | Execute and WaitExecution operation streams alive: raised when the stream is made (before its first item is read), lowered when it ends or its caller drops it. A call still being authorized or prepared, and one answered from the action cache, is not in it. `GET /v1/frontend/drain` reports it |
 | `kbf_front_executes_started_total` | counter | Execute calls the front took (not refused because it is draining), cache hits included |
 | `kbf_execute_queued` | gauge | Execute streams the scheduler accepted whose operation has not left `QUEUED` |
@@ -298,6 +489,8 @@ caller goes away before the answer counts as an error.
 | `kbf_store_blobs_seconds` | histogram | one store of verified blobs (a Write's, or a batch's): the query for blobs already held, their touch, and the wait until every segment holding its blobs is written: the linger, the wait for a PUT slot, each PUT attempt with the backoff between attempts, the footer read, and the commit with any wait behind commits queued ahead of it |
 | `kbf_segment_put_seconds` | histogram | one PUT attempt of a segment's object; a PUT tried again is observed once per attempt |
 | `kbf_segment_footer_read_seconds` | histogram | one segment's footer read back after its PUT: two range GETs, the trailer and then the footer |
+| `kbf_tls_reloads_total{listener,outcome}` | counter | looks at a TLS listener's files (`reapi`, `worker`; [renewal](deploy/tls-renewal.md)): `applied` (new files now serve new handshakes), `rejected` (changed but unusable: the previous files keep serving; the reason is in the log) and `unchanged`; only for a listener with TLS |
+| `kbf_tls_leaf_not_after_seconds{listener}` | gauge | when the certificate the listener serves stops being valid, in seconds since the epoch; alert on it well before it passes |
 | `kbf_segment_commit_seconds` | histogram | one segment's `PutBlobs` commit to the metadata log, including any wait behind commits queued ahead of it |
 | `kbf_segment_blobs`, `kbf_segment_bytes` | histogram | blobs, and bytes (footer included), per segment written |
 | `kbf_object_get_seconds` | histogram | one range GET of a blob being read (ByteStream Read, GetActionResult, a BatchReadBlobs run); footer reads are not in it |
@@ -312,6 +505,7 @@ caller goes away before the answer counts as an error.
 | `kbf_input_directories_cached_total` | counter | Directories the input check took from the decoded-directory cache: the blob is touched and its presence checked, nothing is read |
 | `kbf_input_directories_skipped_total` | counter | Directories skipped with everything under them: an earlier check verified them and the retention guarantee of that check still runs |
 | `kbf_input_directories_joined_total` | counter | Directories found being checked for another request, and waited for |
+| `kbf_cache_lost_blobs`, `kbf_cache_blob_losses_total` | gauge, counter | blobs whose only copy was in a block on a write tier that is gone before the flusher put it in the store (the tier abandoned with `--hot-store-abandon`, the block missing or short at a start, or its bytes failing their digest): lost now, and ever. A lost blob is `UNAVAILABLE`, FindMissingBlobs lists it, an action-cache entry naming it is a miss, and a re-upload takes it off the gauge ([architecture-v2.md](design/architecture-v2.md#8-storage), Loss marks). Read from the metadata state at the scrape; left out of a scrape the metadata log cannot answer |
 
 Latency buckets run from 1 ms to 60 s; size buckets from 1 KiB to 1 GiB by fours;
 the blobs-per-segment buckets from 1 to 16384 by fours.
@@ -707,12 +901,16 @@ quote, a `;` or a line break in it can never end the value or add a parameter. W
 `filename*`), for a blob of at most 4 MiB (4194304 bytes); a larger one is `400`, and
 still downloads without `inline`.
 
-**Memory.** Like a ByteStream Read, a read holds the whole blob in memory, because the
-cache keeps one digest per blob and can check only all of it; a second read to stream
-from would send bytes nobody checked. So the route keeps a budget: the blobs of all the
-answers it is reading or still sending hold at most 1 GiB (1073741824 bytes, the largest
-blob the cache accepts) at once. An answer gives its share back when its bytes have
-been sent or dropped (the client went away), and a failed read gives it back at once.
+**Memory.** Like a ByteStream Read, a read holds one window of its blob at a time
+(8 MiB, `READ_WINDOW_BYTES`; a smaller blob, its size). Every byte of the blob is
+hashed, the bytes before a range and after it too, and the last window is sent only
+once the digest checked: a blob of one window is checked whole before a byte is sent,
+and one that fails is an error answer; a larger blob whose bytes fail ends its body
+early (the connection is cut), and the client must not take what it got for the blob.
+The route keeps a budget: the windows of all the answers it is reading or still sending
+hold at most 1 GiB (1073741824 bytes) at once. An answer gives its share back when its
+body has been sent or dropped (the client went away), and a failed read gives it back at
+once.
 
 - **Waiting.** A read whose blob does not fit in what is left waits in line, first come
   first served, before a byte is read: a large read at the head of the line is not
@@ -720,9 +918,8 @@ been sent or dropped (the client went away), and a failed read gives it back at 
   they wait while it does). A read still waiting after 10 seconds is `503` with
   `Retry-After: 1` and the body `{"error": "<why>", "busy": true}`; a blob that cannot
   be read is `503` without either, so a client can tell busy from broken.
-- **Too large.** A digest that claims more than 1 GiB is `404` at once, with the limit
-  in the error: the cache refuses such a blob on write, so it never holds one, and no
-  retry can change that. ByteStream Read answers the same digest `NOT_FOUND`.
+- **Any size.** No blob is too large to read. A blob not held is `404` before it waits,
+  whatever size its digest claims.
 - **Slow clients.** A client holds its blob's share until its answer is sent or it goes
   away; the listener has no write timeout.
 
@@ -743,7 +940,7 @@ ignored, as RFC 9110 allows, and the whole blob is sent. Every `200` and `206` s
 | `400` | a malformed digest or query, or `inline=text` for a blob over 4 MiB |
 | `401` | the authentication policy refuses the request |
 | `403` | `blobs.getAuthorizer` refuses the instance name |
-| `404` | the route is off, the blob is not held, or the digest claims more than 1 GiB |
+| `404` | the route is off, or the blob is not held |
 | `416` | the range starts past the end |
 | `503` | busy: the blob's share of the memory budget was not free within 10 seconds (`Retry-After: 1`, `"busy": true`); or the blob is held but its bytes cannot be read (missing from the store, or failing their digest), or the store or the metadata log does not answer |
 | `500` | the cache's own records disagree |
@@ -789,6 +986,26 @@ runs the call again, once. A second `STALE_MAP`, or a fetch that brings no newer
 treated as `UNAVAILABLE`. `UNAVAILABLE` for a caller ahead of the node is the node's
 lost push: the caller's map may be the right one, so the caller tries again, and the
 node's next push makes the call succeed.
+
+## `UNAVAILABLE` from a storage node that is catching up
+
+Also gRPC, not HTTP. A storage node that is rebuilding its index (it registered with
+`catching_up` set in `kbf.map.v1.RegisterRequest`, and is `CATCHING_UP` in the map) may
+hold a blob it has not indexed yet, so it never answers that something is missing:
+
+| call | while catching up |
+|---|---|
+| `ByteStream.Read` of a blob it does not find | `UNAVAILABLE`, not `NOT_FOUND` |
+| `FindMissingBlobs` with any digest it does not find | the whole call `UNAVAILABLE` (an answer naming fewer digests would say the rest are held) |
+| `ActionStore.Get` with no entry | `UNAVAILABLE`, not an empty answer |
+| `ActionStore.Prepare` or `Commit` refused for a closure blob it does not find | `UNAVAILABLE`, not the `ABSENT` refusal |
+
+Every other answer is the usual one: hits are served, writes are taken, and the other
+refusals stand. The message begins `catching up:`; it is words for a log and is never
+matched. A caller treats the node as an owner that could not say, and asks the next owner
+(a router answers `NOT_FOUND` only if every owner did). The node stops at the first
+heartbeat after its rebuild that sends `catching_up` false: the frontend makes it `ACTIVE`
+in the next map generation.
 
 ## Planned
 

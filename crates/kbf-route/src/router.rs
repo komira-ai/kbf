@@ -6,11 +6,18 @@ use std::sync::Arc;
 use kbf_map::{Map, Member, MemberState};
 use kbf_storage::StorageError;
 use kbf_types::Digest;
+use tokio::sync::Semaphore;
 
 use crate::flights::Flights;
 use crate::nodes::Nodes;
 use crate::repair::{Limiter, ReadRepair, RepairLimit};
 use crate::source::{MapSource, MapView};
+
+/// What [`Router::commit_with_closure`] holds in memory, across all its calls, unless
+/// [`Router::with_copy_budget`] says otherwise: 256 MiB.
+pub const DEFAULT_COPY_BYTES: u64 = 256 << 20;
+
+const DEFAULT_COPY_KIB: u32 = (DEFAULT_COPY_BYTES / 1024) as u32;
 
 /// Calls to the storage nodes of a farm, routed by the storage map.
 ///
@@ -23,6 +30,10 @@ pub struct Router {
     pub(crate) nodes: Arc<dyn Nodes>,
     pub(crate) repair: Option<Arc<Repair>>,
     pub(crate) flights: Arc<Flights>,
+    /// The bytes of blobs that [`Router::commit_with_closure`] holds in memory to copy, in
+    /// KiB, shared by every clone.
+    pub(crate) copying: Arc<Semaphore>,
+    pub(crate) copy_kib: u32,
 }
 
 /// The read-repair hook and its limit.
@@ -44,6 +55,11 @@ pub struct Placement {
     /// The member a write goes to: the first owner that is not down. `None` when every
     /// owner is down.
     pub write: Option<Member>,
+    /// Every owner a write may go to, in the order [`Router::put`] tries them: this
+    /// generation's write owners that are not down, primary first (so `write` is the first
+    /// of them). A caller that passes a write through itself and wants to do what the
+    /// router does when the primary fails goes on to the next of these.
+    pub writers: Vec<Member>,
 }
 
 impl Router {
@@ -55,7 +71,21 @@ impl Router {
             nodes,
             repair: None,
             flights: Arc::default(),
+            copying: Arc::new(Semaphore::new(DEFAULT_COPY_KIB as usize)),
+            copy_kib: DEFAULT_COPY_KIB,
         }
+    }
+
+    /// The same router, holding at most `bytes` of blobs in memory at once (counted in
+    /// KiB, at least one) across every [`Router::commit_with_closure`] on it and its
+    /// clones. A blob larger than that is copied alone. The default is
+    /// [`DEFAULT_COPY_BYTES`].
+    #[must_use]
+    pub fn with_copy_budget(mut self, bytes: u64) -> Self {
+        let kib = u32::try_from(bytes / 1024).unwrap_or(u32::MAX).max(1);
+        self.copying = Arc::new(Semaphore::new(kib as usize));
+        self.copy_kib = kib;
+        self
     }
 
     /// The same router, telling `hook` about a blob a read found away from where it
@@ -75,10 +105,15 @@ impl Router {
     /// No map has arrived yet.
     pub fn place(&self, digest: &Digest) -> Result<Placement, StorageError> {
         let view = self.view()?;
+        let writers: Vec<Member> = write_order(&view.map, digest)
+            .into_iter()
+            .cloned()
+            .collect();
         Ok(Placement {
             generation: view.map.generation(),
             read: read_order(&view, digest).into_iter().cloned().collect(),
-            write: write_order(&view.map, digest).first().map(|m| (*m).clone()),
+            write: writers.first().cloned(),
+            writers,
         })
     }
 
@@ -96,9 +131,12 @@ impl Router {
             .ok_or_else(|| unavailable("no storage map has arrived yet".to_owned()))
     }
 
-    /// Runs `op` against the map as it is now. If a node answers `STALE_MAP`, fetches the
-    /// newer map and runs it once more against that; a second `STALE_MAP`, or a fetch
-    /// that does not bring a newer map, is UNAVAILABLE rather than a loop.
+    /// Runs `op` against the map as it is now. Each time a node answers `STALE_MAP`, fetches
+    /// the newer map and runs it again against that: the map can move several times
+    /// during one call (every member's promotion is a new generation). It stops, with
+    /// UNAVAILABLE rather than a loop, when a fetch brings no map newer than the one just
+    /// used (the generation has stopped moving where this process can see it), or after
+    /// [`MAX_MAP_REFETCHES`] fetches in one call.
     pub(crate) async fn routed<T, Fut>(
         &self,
         op: impl Fn(MapView) -> Fut,
@@ -106,12 +144,34 @@ impl Router {
     where
         Fut: Future<Output = Result<T, StorageError>>,
     {
-        let view = self.view()?;
-        let used = view.map.generation();
-        let first = op(view).await;
-        let Err(StorageError::StaleMap { current }) = first else {
-            return first;
-        };
+        let mut view = self.view()?;
+        let mut fetches = 0;
+        loop {
+            let used = view.map.generation();
+            match op(view).await {
+                Err(StorageError::StaleMap { current }) => {
+                    view = self.newer(used, current, &mut fetches).await?;
+                }
+                done => return done,
+            }
+        }
+    }
+
+    /// The map to run a call again against after a node holding generation `current`
+    /// refused the one of generation `used`: fetched, and newer than `used`.
+    async fn newer(
+        &self,
+        used: u64,
+        current: u64,
+        fetches: &mut usize,
+    ) -> Result<MapView, StorageError> {
+        if *fetches == MAX_MAP_REFETCHES {
+            return Err(unavailable(format!(
+                "the storage map moved {fetches} times during one call; a node now holds \
+                 generation {current}"
+            )));
+        }
+        *fetches += 1;
         let fresh = self
             .maps
             .refetch(current)
@@ -123,14 +183,13 @@ impl Router {
                 fresh.map.generation()
             )));
         }
-        match op(fresh).await {
-            Err(StorageError::StaleMap { current }) => Err(unavailable(format!(
-                "a node holds map generation {current}, newer than the map just fetched"
-            ))),
-            done => done,
-        }
+        Ok(fresh)
     }
 }
+
+/// The most map fetches one routed call makes when nodes keep answering `STALE_MAP`: room
+/// for a run of promotions during one call, and a bound on a map that never settles.
+pub const MAX_MAP_REFETCHES: usize = 8;
 
 /// This generation's read order of `digest`, then the previous generation's.
 pub(crate) fn read_order<'a>(view: &'a MapView, digest: &Digest) -> Vec<&'a Member> {

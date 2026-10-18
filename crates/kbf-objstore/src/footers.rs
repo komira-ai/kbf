@@ -14,7 +14,7 @@
 use std::num::{NonZeroU64, NonZeroUsize};
 
 use bytes::{Bytes, BytesMut};
-use futures::{Stream, TryStreamExt as _, stream};
+use futures::{Stream, TryStreamExt as _};
 use kbf_segments::layout::TRAILER_LEN;
 use kbf_segments::{Footer, MAX_SEGMENT_BYTES, SegmentError};
 
@@ -136,33 +136,23 @@ impl Totals {
     }
 }
 
-/// Every object under `prefix` with its footer read ([`FooterRead`]), in no particular
-/// order, at most [`FooterReads::concurrency`] reads at a time. The stream ends after
-/// the last page, or with the error of a listing call that failed.
+/// Every object under `prefix` with its footer read ([`FooterRead`]), in ascending key
+/// order, starting where `from` says (or at the first key): at most
+/// [`FooterReads::concurrency`] reads run at a time, and a slow read holds back the
+/// results after it, so that when the stream has yielded an object, every object before
+/// it has been yielded too. A caller that stops after a key resumes with
+/// [`ListToken::after`] that key, as [`listing::objects`](crate::listing::objects) says.
+/// The stream ends after the last page, or with the error of a listing call that failed
+/// (or of a listing that broke the order that function checks).
 pub fn read_footers<'a, S: ObjectStore>(
     store: &'a S,
     prefix: &'a KeyPrefix,
+    from: Option<ListToken>,
     reads: FooterReads,
 ) -> impl Stream<Item = Result<FooterRead, ObjectStoreError>> + Send + 'a {
-    enum Pages {
-        First,
-        After(ListToken),
-        Done,
-    }
-    let listed = stream::try_unfold(Pages::First, move |pages| async move {
-        let after = match pages {
-            Pages::First => None,
-            Pages::After(token) => Some(token),
-            Pages::Done => return Ok(None),
-        };
-        let page = store.list(prefix, after.as_ref(), reads.page).await?;
-        let next = page.next.map_or(Pages::Done, Pages::After);
-        Ok(Some((stream::iter(page.objects.into_iter().map(Ok)), next)))
-    })
-    .try_flatten();
-    listed
+    crate::listing::objects(store, prefix, from, reads.page)
         .map_ok(move |object| async move { Ok(read_one(store, object, reads.tail).await) })
-        .try_buffer_unordered(reads.concurrency.get())
+        .try_buffered(reads.concurrency.get())
 }
 
 /// Reads the footer of `object`.

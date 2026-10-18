@@ -1,12 +1,17 @@
 //! The service and its client, end to end over a loopback connection to an in-memory
-//! store ([`fake::Mem`]); the roles are in [`roles`].
+//! store ([`fake::Mem`]); the roles are in [`roles`], the map generation in
+//! [`generation`].
 //!
 //! Everything here is about the wire: what a caller of [`RemoteStorage`] sees must be
 //! what a caller of the store itself would see, and what a raw REAPI client sends that
 //! no [`RemoteStorage`] would is refused with the code the protocol names.
 
+mod catch_up;
+mod denied;
 mod every_call;
 pub(crate) mod fake;
+mod generation;
+mod in_process;
 pub(crate) mod roles;
 mod stale_map;
 
@@ -15,7 +20,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
-use fake::{Mem, pair, patterned, serve, serve_odd, serve_spied, sha};
+use fake::{Mem, pair, patterned, serve, serve_odd, sha};
 use futures::{StreamExt as _, stream};
 use kbf_meta::{ActionRecord, ActionWriteError, Role};
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
@@ -30,18 +35,12 @@ use kbf_proto::reapi::{
 };
 use kbf_proto::storage::action_store_client::ActionStoreClient;
 use kbf_proto::storage::{CommitRequest, PrepareRequest, Record, Writer, refusal};
-use kbf_proto::worker::{
-    BeginRequest, CommitRequest as SegmentsCommit, LocateRequest, PutRangeRequest, ReadRangeRequest,
-};
 use kbf_types::Digest;
 use tonic::transport::Channel;
-use tonic::{Code, Request, Status};
+use tonic::{Code, Status};
 
 use super::wire::{self, to_proto};
-use super::{
-    MAP_GENERATION_HEADER, MAX_BLOB_BYTES, MAX_FIND_MISSING_DIGESTS, MAX_MESSAGE_BYTES,
-    RemoteStorage,
-};
+use super::{MAX_FIND_MISSING_DIGESTS, MAX_MESSAGE_BYTES, RemoteStorage, STREAM_FROM_BYTES};
 use crate::{READ_CHUNK_BYTES, Storage, StorageError};
 
 /// Collects a read: the sizes of its chunks and its bytes.
@@ -316,62 +315,6 @@ fn a_status_becomes_the_error_a_store_would_give() {
     }
 }
 
-/// Catches a STALE_MAP the client does not recognise (it would be retried as an outage,
-/// against the same stale owners), one it recognises from the code alone (any
-/// FAILED_PRECONDITION, such as a refused action-cache write, would send the caller to
-/// refetch the map), one it reads without checking the code, and a generation it
-/// misreads.
-#[test]
-fn a_stale_map_status_is_lifted_with_the_nodes_generation() {
-    use super::client::lift;
-    use tonic::metadata::MetadataValue;
-    let with = |code: Code, generation: &str| {
-        let mut status = Status::new(code, "STALE_MAP");
-        status.metadata_mut().insert(
-            MAP_GENERATION_HEADER,
-            MetadataValue::try_from(generation).expect("ASCII"),
-        );
-        status
-    };
-    assert!(matches!(
-        lift(&with(Code::FailedPrecondition, "9"), None),
-        StorageError::StaleMap { current: 9 }
-    ));
-    // The same words without the entry, with an entry that is not a generation, and on
-    // another code, are not a stale map.
-    for status in [
-        Status::failed_precondition("STALE_MAP"),
-        with(Code::FailedPrecondition, "nine"),
-        with(Code::Unavailable, "9"),
-    ] {
-        assert!(
-            !matches!(lift(&status, None), StorageError::StaleMap { .. }),
-            "{status:?}"
-        );
-    }
-}
-
-/// Catches a STALE_MAP that does not cross the wire as itself: over a real connection a
-/// node's answer reaches the caller as `StaleMap` with the generation, on a blob call
-/// and on an action-cache call, and is not NOT_FOUND, an outage or a refusal.
-#[tokio::test]
-async fn a_stale_map_crosses_the_wire() {
-    let (mem, remote, _) = pair().await;
-    *mem.fail.lock().expect("lock") = Some(StorageError::StaleMap { current: 12 });
-    let digest = sha(b"x");
-    let errors = [
-        remote.find_missing(&[digest]).await.expect_err("stale"),
-        remote.read_range(&digest, 0, 0).await.err().expect("stale"),
-        remote.action_result(&digest).await.expect_err("stale"),
-    ];
-    for error in errors {
-        assert!(
-            matches!(error, StorageError::StaleMap { current: 12 }),
-            "{error:?}"
-        );
-    }
-}
-
 /// Catches FindMissing answering in another order than asked, dropping a held-but-empty
 /// blob into the missing, passing a malformed digest or another digest function, and a
 /// batch call answered when the node does not serve it.
@@ -448,7 +391,7 @@ async fn find_missing_answers_in_order_and_refuses_what_it_cannot() {
 }
 
 /// Catches a Write that accepts what it must not: no message, a name that is no upload,
-/// a blob over the largest, more bytes than the digest names, a stream that stops
+/// more bytes than the digest names, a stream that stops
 /// without `finish_write`, fewer bytes than named, other bytes than named (all
 /// INVALID_ARGUMENT, and nothing stored); and one that does not accept what it must: a
 /// correct write is acknowledged with the blob's size.
@@ -458,19 +401,10 @@ async fn a_write_is_checked_against_its_digest() {
     let blob = b"twelve bytes";
     let digest = sha(blob);
     let name = upload_name(&digest);
-    let too_big = Digest::new(
-        kbf_types::DigestFunction::Sha256,
-        [3; 32],
-        MAX_BLOB_BYTES + 1,
-    );
     let wrong = [b'x'; 12];
     let cases = [
         ("no message", Vec::new()),
         ("not an upload", write_of("blobs/x", &[(blob, true)])),
-        (
-            "over the largest",
-            write_of(&upload_name(&too_big), &[(b"", true)]),
-        ),
         (
             "more than named",
             write_of(&name, &[(blob, false), (b"!", true)]),
@@ -495,6 +429,40 @@ async fn a_write_is_checked_against_its_digest() {
         mem.blobs.lock().expect("lock").get(&digest).map(Bytes::len),
         Some(12)
     );
+}
+
+/// Catches a Write whose stream ends early that is answered with anything but
+/// INVALID_ARGUMENT naming how it ended: a stream with no message at all, and one that
+/// stops before `finish_write` (after one message, and after two). Nothing is stored, and
+/// the same blob written whole afterwards is.
+#[tokio::test]
+async fn a_write_that_ends_early_says_how() {
+    let (mem, _remote, channel) = pair().await;
+    let blob = b"twelve bytes";
+    let digest = sha(blob);
+    let name = upload_name(&digest);
+    let cases = [
+        ("empty stream", Vec::new(), "write stream sent no message"),
+        (
+            "one message",
+            write_of(&name, &[(&blob[..5], false)]),
+            "write stream ended without finish_write",
+        ),
+        (
+            "two messages",
+            write_of(&name, &[(&blob[..5], false), (&blob[5..8], false)]),
+            "write stream ended without finish_write",
+        ),
+    ];
+    for (what, requests, text) in cases {
+        let status = raw_write(&channel, requests).await.expect_err(what);
+        assert_eq!(status.code(), Code::InvalidArgument, "{what}: {status}");
+        assert_eq!(status.message(), text, "{what}");
+    }
+    assert_eq!(mem.puts.load(Ordering::SeqCst), 0, "something was stored");
+    assert!(mem.blobs.lock().expect("lock").is_empty());
+    let whole = raw_write(&channel, write_of(&name, &[(blob, true)])).await;
+    assert_eq!(whole.expect("a whole write").committed_size, 12);
 }
 
 /// Catches a Write that reads and stores a blob the node already holds (the cheapest
@@ -616,10 +584,10 @@ async fn the_action_cache_round_trips() {
             .expect_err("refused");
         match (expected, error) {
             ("absent", StorageError::ActionWrite(ActionWriteError::Absent(d))) => {
-                assert_eq!(d, sha(b"missing"));
+                assert_eq!(d, [sha(b"missing")]);
             }
             ("unreachable", StorageError::ActionWrite(ActionWriteError::Unreachable(d))) => {
-                assert_eq!(d, sha(b"unreadable"));
+                assert_eq!(d, [sha(b"unreadable")]);
             }
             (_, other) => panic!("{expected}: {other:?}"),
         }
@@ -706,44 +674,6 @@ async fn an_action_cache_failure_is_a_status() {
     }
 }
 
-/// Catches `Segments` calls dropped, answered locally, or sent without the map
-/// generation: all five reach the store's own handlers, each carrying generation 5.
-#[tokio::test]
-async fn segments_are_forwarded_with_the_map_generation() {
-    let (mem, remote, _) = pair().await;
-    let segments = remote.segments();
-    let begun = segments
-        .begin(Request::new(BeginRequest::default()))
-        .await
-        .expect("begin");
-    assert_eq!(begun.into_inner().upload, 7);
-    segments
-        .put_range(Request::new(PutRangeRequest::default()))
-        .await
-        .expect("put_range");
-    let committed = segments
-        .commit(Request::new(SegmentsCommit::default()))
-        .await
-        .expect("commit");
-    assert_eq!(committed.into_inner().committed.len(), 1);
-    segments
-        .locate(Request::new(LocateRequest::default()))
-        .await
-        .expect("locate");
-    let read = segments
-        .read_range(Request::new(ReadRangeRequest::default()))
-        .await
-        .expect("read");
-    assert_eq!(read.into_inner().bytes, [1, 2]);
-    let seen = mem.segments.calls.lock().expect("lock").clone();
-    let five = Some("5".to_owned());
-    let expected: Vec<_> = ["begin", "put_range", "commit", "locate", "read_range"]
-        .into_iter()
-        .map(|call| (call, five.clone()))
-        .collect();
-    assert_eq!(seen, expected);
-}
-
 /// Catches an action-store request sent without the map generation in its field (section
 /// 6's STALE_MAP could not work), and a client that believes a node that contradicts
 /// itself: a result digest or record that is not a digest, an empty answer to Prepare, a
@@ -811,28 +741,47 @@ async fn a_client_does_not_trust_a_node_that_contradicts_itself() {
 }
 
 /// Catches a refusal the client cannot read becoming a success or a wrong error, and a
-/// refusal that lost its blob.
+/// refusal that lost any of its blobs.
 #[test]
 fn a_refusal_is_read_back_as_it_was_made() {
     use super::client::refused;
     use super::wire::refusal_of;
-    let blob = sha(b"b");
+    let (blob, other) = (sha(b"b"), sha(b"c"));
     for error in [
         ActionWriteError::NotDaemon,
-        ActionWriteError::Absent(blob),
-        ActionWriteError::Unreachable(blob),
+        ActionWriteError::Absent(vec![blob]),
+        ActionWriteError::Absent(vec![blob, other]),
+        ActionWriteError::Unreachable(vec![blob]),
+        ActionWriteError::Unreachable(vec![other, blob]),
     ] {
         let back = refused(&refusal_of(&error));
-        assert_eq!(back.to_string(), StorageError::from(error).to_string());
+        assert!(
+            matches!(&back, StorageError::ActionWrite(e) if *e == error),
+            "{error:?} read back as {back:?}"
+        );
     }
     let unreadable = refused(&kbf_proto::storage::Refusal {
         kind: refusal::Kind::Absent as i32,
         blob: None,
+        more: Vec::new(),
     });
     assert!(matches!(unreadable, StorageError::Internal(_)));
+    let bad_more = refused(&kbf_proto::storage::Refusal {
+        kind: refusal::Kind::Absent as i32,
+        blob: Some(super::wire::to_proto(&blob)),
+        more: vec![kbf_proto::reapi::Digest {
+            hash: "not hex".to_owned(),
+            size_bytes: 1,
+        }],
+    });
+    assert!(
+        matches!(bad_more, StorageError::Internal(_)),
+        "{bad_more:?}"
+    );
     let unknown = refused(&kbf_proto::storage::Refusal {
         kind: 99,
         blob: None,
+        more: Vec::new(),
     });
     assert!(matches!(unknown, StorageError::Internal(_)));
 }
@@ -976,139 +925,210 @@ async fn find_missing_refuses_a_call_over_the_digest_limit() {
     );
 }
 
-/// Catches a map generation that cannot change after the client is built, or that does
-/// not reach every call: the header arrives at the server on every service the client
-/// calls (FindMissing, ByteStream Read and Write, the action store, all five Segments
-/// calls), as 5 for the first of each and as 6 for each after `set_map_generation`,
-/// whichever clone made the update. (`RemoteStorage` makes no `QueryWriteStatus` call;
-/// the last call here is a raw one that carries the header, to see that service's
-/// handler is behind the same stack.)
+/// Catches a client that claims a streamed put it cannot make: the service has no
+/// streamed write to the object store, so `put_streamed` is refused as invalid (the
+/// caller then stores the blob with `put`), and nothing is stored.
 #[tokio::test]
-async fn the_map_generation_reaches_every_service_and_can_be_updated() {
-    let mem = Arc::new(Mem::default());
-    let (seen, channel) = serve_spied(&mem).await;
-    let remote = RemoteStorage::new(channel.clone(), 5);
-    let held = remote.put(Bytes::from_static(b"abc")).await.expect("write");
-    remote.find_missing(&[held]).await.expect("find_missing");
-    remote.read_blob(&held).await.expect("read");
-    let action = sha(b"action");
-    remote.action_result(&action).await.expect("get");
-    remote
-        .prepare_action_result(&ActionResult::default())
+async fn a_streamed_put_is_refused_over_the_wire() {
+    let (_mem, remote, _) = pair().await;
+    let digest = sha(b"abc");
+    let bytes = stream::iter([Ok(Bytes::from_static(b"abc"))]).boxed();
+    let claim = Box::pin(async move { Some(digest) });
+    let refused = remote
+        .put_streamed(3, bytes, claim)
         .await
-        .expect("prepare");
-    let record = ActionRecord {
-        result: held,
-        closure: kbf_meta::Closure::new(),
-    };
-    remote
-        .commit_action_record(Role::Daemon, action, record)
-        .await
-        .expect("commit");
-    let segments = remote.segments();
-    segments
-        .begin(Request::new(BeginRequest::default()))
-        .await
-        .expect("begin");
-    segments
-        .put_range(Request::new(PutRangeRequest::default()))
-        .await
-        .expect("put_range");
-    segments
-        .commit(Request::new(SegmentsCommit::default()))
-        .await
-        .expect("commit");
-    segments
-        .locate(Request::new(LocateRequest::default()))
-        .await
-        .expect("locate");
-    segments
-        .read_range(Request::new(ReadRangeRequest::default()))
-        .await
-        .expect("read_range");
-    let mut raw = Request::new(QueryWriteStatusRequest {
-        resource_name: upload_name(&held),
-    });
-    raw.metadata_mut()
-        .insert(MAP_GENERATION_HEADER, 5u64.into());
-    ByteStreamClient::new(channel)
-        .query_write_status(raw)
-        .await
-        .expect("query_write_status");
-
-    let services = [
-        "bytestream",
-        "cas",
-        "bytestream",
-        "actions",
-        "actions",
-        "actions",
-        "segments",
-        "segments",
-        "segments",
-        "segments",
-        "segments",
-        "bytestream",
-    ];
-    let first: Vec<_> = std::mem::take(&mut *seen.lock().expect("lock"));
-    let want: Vec<_> = services
-        .into_iter()
-        .map(|service| (service, Some("5".to_owned())))
-        .collect();
-    assert_eq!(first, want);
-
-    // An update through a clone, and the original (and its Segments handle) call again.
-    remote.clone().set_map_generation(6);
-    remote.find_missing(&[held]).await.expect("find_missing");
-    remote.read_blob(&held).await.expect("read");
-    remote.action_result(&action).await.expect("get");
-    segments
-        .begin(Request::new(BeginRequest::default()))
-        .await
-        .expect("begin");
-    let second = seen.lock().expect("lock").clone();
-    let want: Vec<_> = ["cas", "bytestream", "actions", "segments"]
-        .into_iter()
-        .map(|service| (service, Some("6".to_owned())))
-        .collect();
-    assert_eq!(second, want);
-}
-
-/// Catches an action-store call that keeps the generation the client was built with:
-/// the message's field, which section 6's STALE_MAP reads, is the updated one on `Get`,
-/// `Prepare` and `Commit`, and is the one the header carries (see above).
-#[tokio::test]
-async fn an_updated_generation_is_in_the_action_store_field() {
-    let (odd, channel) = serve_odd().await;
-    let remote = RemoteStorage::new(channel, 9);
-    let record = || ActionRecord {
-        result: sha(b"r"),
-        closure: kbf_meta::Closure::new(),
-    };
-    let calls = |remote: &RemoteStorage| {
-        let remote = remote.clone();
-        async move {
-            let _ = remote.action_result(&sha(b"a")).await;
-            let _ = remote.prepare_action_result(&ActionResult::default()).await;
-            remote
-                .commit_action_record(Role::Daemon, sha(b"a"), record())
-                .await
-                .expect("commit");
-        }
-    };
-    calls(&remote).await;
-    remote.set_map_generation(10);
-    calls(&remote).await;
+        .expect_err("no streamed put");
+    assert!(matches!(refused, StorageError::Invalid(_)), "{refused:?}");
     assert_eq!(
-        *odd.generations.lock().expect("lock"),
-        [9, 9, 9, 10, 10, 10]
+        remote.find_missing(&[digest]).await.expect("find"),
+        [digest]
     );
 }
 
 /// Catches a limit that drifted from the front's (a test in kbf-server pins the front's
-/// to these): a full 16 MiB batch has to fit.
+/// to these): a full 16 MiB batch has to fit, and a blob is streamed from the same size.
 #[test]
 fn the_limits_hold_a_full_batch() {
     assert_eq!(MAX_MESSAGE_BYTES, (16 << 20) + (1 << 20));
-    assert_eq!(MAX_BLOB_BYTES, 1 << 30);
+    assert_eq!(STREAM_FROM_BYTES, 16 << 20);
+}
+
+/// `len` bytes of a blob as `Write` messages of at most 1 MiB, the last one finishing
+/// the write, with the first named `name`.
+fn blob_messages(name: &str, bytes: &[u8]) -> Vec<WriteRequest> {
+    let count = bytes.len().div_ceil(READ_CHUNK_BYTES);
+    (0..count)
+        .map(|i| WriteRequest {
+            resource_name: if i == 0 {
+                name.to_owned()
+            } else {
+                String::new()
+            },
+            write_offset: (i * READ_CHUNK_BYTES) as i64,
+            finish_write: i + 1 == count,
+            data: bytes[i * READ_CHUNK_BYTES..bytes.len().min((i + 1) * READ_CHUNK_BYTES)].to_vec(),
+        })
+        .collect()
+}
+
+/// Catches a Write of a blob past `STREAM_FROM_BYTES` that is gathered whole (the store's
+/// `put` called instead of `put_streamed`, or the blob held in one buffer), and one that
+/// is streamed but stored wrong: the blob is stored, byte for byte, by `put_streamed`
+/// alone, from pieces of at most one message; one `STREAM_FROM_BYTES` long is still
+/// gathered and put.
+#[tokio::test]
+async fn a_large_write_is_streamed_to_the_store() {
+    let (mem, _remote, channel) = pair().await;
+    let large = patterned(STREAM_FROM_BYTES as usize + 1);
+    let digest = sha(&large);
+    let answer = raw_write(&channel, blob_messages(&upload_name(&digest), &large))
+        .await
+        .expect("written");
+    assert_eq!(answer.committed_size, large.len() as i64);
+    assert_eq!(mem.streamed.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(mem.puts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(
+        mem.streamed_most_held
+            .load(std::sync::atomic::Ordering::SeqCst)
+            <= READ_CHUNK_BYTES
+    );
+    assert_eq!(
+        mem.blobs.lock().expect("lock")[&digest].as_ref(),
+        &large[..]
+    );
+    let edge = patterned(STREAM_FROM_BYTES as usize);
+    let edge_digest = sha(&edge);
+    raw_write(&channel, blob_messages(&upload_name(&edge_digest), &edge))
+        .await
+        .expect("written");
+    assert_eq!(mem.puts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(mem.streamed.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// Catches a streamed Write that stores what it must not or answers the wrong code: other
+/// bytes than the digest names, more or fewer bytes than it names, a stream that stops
+/// without `finish_write`, are all INVALID_ARGUMENT and store nothing; and a blob is not
+/// refused for its size (a digest naming 5 GiB gets as far as its bytes, which fall
+/// short).
+#[tokio::test]
+async fn a_streamed_write_is_checked_against_its_digest() {
+    let (mem, _remote, channel) = pair().await;
+    let large = patterned(STREAM_FROM_BYTES as usize + 1);
+    let digest = sha(&large);
+    let name = upload_name(&digest);
+    let mut wrong = large.clone();
+    wrong[7] ^= 1;
+    let mut more = large.clone();
+    more.push(1);
+    let mut no_finish = blob_messages(&name, &large);
+    no_finish.last_mut().expect("messages").finish_write = false;
+    let fewer = blob_messages(&name, &large[..large.len() - 1]);
+    let huge = Digest::new(kbf_types::DigestFunction::Sha256, [3; 32], 5 << 30);
+    let cases = [
+        ("other bytes", blob_messages(&name, &wrong)),
+        ("more than named", blob_messages(&name, &more)),
+        ("no finish", no_finish),
+        ("fewer than named", fewer),
+        (
+            "5 GiB named",
+            write_of(&upload_name(&huge), &[(b"short", true)]),
+        ),
+    ];
+    for (what, requests) in cases {
+        let status = raw_write(&channel, requests).await.expect_err(what);
+        assert_eq!(status.code(), Code::InvalidArgument, "{what}: {status}");
+        assert!(!status.message().contains("largest"), "{what}: {status}");
+    }
+    assert!(mem.blobs.lock().expect("lock").is_empty());
+}
+
+/// Catches a streamed Write whose last message carries no bytes: the blob is complete
+/// before it, and `finish_write` alone ends the write, as a sender that does not know
+/// which message is its last would send it. The blob is stored whole, once.
+#[tokio::test]
+async fn a_streamed_write_may_finish_with_an_empty_message() {
+    let (mem, _remote, channel) = pair().await;
+    let large = patterned(STREAM_FROM_BYTES as usize + 1);
+    let digest = sha(&large);
+    let mut messages = blob_messages(&upload_name(&digest), &large);
+    messages.last_mut().expect("messages").finish_write = false;
+    messages.push(WriteRequest {
+        write_offset: large.len() as i64,
+        finish_write: true,
+        ..WriteRequest::default()
+    });
+    let answer = raw_write(&channel, messages).await.expect("written");
+    assert_eq!(answer.committed_size, large.len() as i64);
+    assert_eq!(mem.streamed.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        mem.blobs.lock().expect("lock")[&digest].as_ref(),
+        &large[..]
+    );
+}
+
+/// Catches a streamed Write whose sender goes away mid-stream (its connection closed after
+/// the store took a piece) that stores a partial blob or leaves the
+/// store waiting: the store's pieces end in an error and nothing is stored.
+#[tokio::test]
+async fn a_streamed_write_whose_sender_goes_away_stores_nothing() {
+    let mem = Arc::new(Mem::default());
+    let channel = serve(&mem, 1 << 30).await;
+    let large = patterned(STREAM_FROM_BYTES as usize + 1);
+    let digest = sha(&large);
+    let mut messages = blob_messages(&upload_name(&digest), &large);
+    messages.pop();
+    let mut client = ByteStreamClient::new(channel);
+    {
+        let call = client.write(stream::iter(messages).chain(stream::pending()));
+        tokio::pin!(call);
+        tokio::select! {
+            answer = &mut call => panic!("answered a write that never finished: {answer:?}"),
+            () = mem.piece_seen.notified() => {}
+        }
+    }
+    drop(client);
+    mem.pieces_failed.notified().await;
+    assert!(mem.blobs.lock().expect("lock").is_empty());
+    assert_eq!(mem.streamed.load(Ordering::SeqCst), 0);
+}
+
+/// Catches a streamed Write whose second message the server cannot decode (it is larger
+/// than the largest message): the broken stream is the sender's fault, answered with the
+/// decoder's status, not INTERNAL, and nothing is stored.
+#[tokio::test]
+async fn a_streamed_write_with_an_oversized_message_stores_nothing() {
+    let (mem, _remote, channel) = pair().await;
+    let large = patterned(STREAM_FROM_BYTES as usize + 1);
+    let digest = sha(&large);
+    let mut messages = blob_messages(&upload_name(&digest), &large);
+    messages.truncate(1);
+    messages[0].finish_write = false;
+    messages.push(WriteRequest {
+        write_offset: messages[0].data.len() as i64,
+        data: vec![0; super::MAX_MESSAGE_BYTES + 1],
+        ..WriteRequest::default()
+    });
+    let status = raw_write(&channel, messages).await.expect_err("refused");
+    assert_eq!(status.code(), Code::OutOfRange, "{status}");
+    assert!(mem.blobs.lock().expect("lock").is_empty());
+    assert_eq!(mem.streamed.load(Ordering::SeqCst), 0);
+}
+
+/// Catches a remote storage that gathers a streamed put or answers it as if stored: it
+/// takes none (it writes a blob through `put`), and says so as `Invalid`, consuming
+/// nothing.
+#[tokio::test]
+async fn a_remote_storage_takes_no_streamed_put() {
+    let (mem, remote, _) = pair().await;
+    let bytes = patterned(100);
+    let digest = sha(&bytes);
+    let body = stream::iter([Ok(Bytes::from(bytes))]).boxed();
+    let refused = remote
+        .put_streamed(100, body, Box::pin(async move { Some(digest) }))
+        .await;
+    assert!(
+        matches!(refused, Err(StorageError::Invalid(_))),
+        "{refused:?}"
+    );
+    assert!(mem.blobs.lock().expect("lock").is_empty());
 }
