@@ -553,3 +553,22 @@ pub fn ensure_paths(rootfs: &Path, dirs: &[&str], files: &[&str]) -> Result<(), 
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches: a `.` component refusing to open or being walked as a name, a `..`
+    /// climbing out of the root (it is dropped, so `a/../b` is `a/b`), and a missing
+    /// component opening.
+    #[test]
+    fn dot_and_dot_dot_components_are_dropped_and_a_missing_one_opens_nothing() {
+        let root = std::env::temp_dir().join(format!("kbf-image-open-dir-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("a/b")).expect("mkdir");
+        assert!(open_dir_nofollow(&root, Path::new("./a/./b")).is_some());
+        assert!(open_dir_nofollow(&root, Path::new("a/missing")).is_none());
+        assert!(open_dir_nofollow(&root, Path::new("a/../b")).is_some());
+        assert!(open_dir_nofollow(&root, Path::new("a/../a")).is_none());
+        std::fs::remove_dir_all(&root).expect("clean");
+    }
+}
