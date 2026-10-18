@@ -206,6 +206,14 @@ pub struct Args {
     /// answers 503 saying so.
     #[arg(long, value_name = "DIR", requires = "api_listen")]
     pub releases_dir: Option<PathBuf>,
+    /// Where `POST /v1/backups/state` puts its copies of the `--state-store` file: a
+    /// directory only this user can enter (made, mode 0700, if missing; one that exists
+    /// with a wider mode, or that another user owns, makes the route refuse). Each call
+    /// writes one new file there, `state-<UTC time>-<n>.db`, mode 0600, named by the server:
+    /// the request takes no path. Nothing deletes the copies. Without it that route answers
+    /// 404.
+    #[arg(long, value_name = "DIR", requires_all = ["api_listen", "state_store"])]
+    pub state_backup_dir: Option<PathBuf>,
     /// Serves the build pages (`GET /v1/invocations/{id}` and below) and the blob route
     /// (`GET /v1/blobs/{digest}`) on the operator API to every caller the REAPI policy
     /// accepts, with no `invocations` or `blobs` key in the policy file
@@ -523,6 +531,13 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    /// The state backup directory cannot be made.
+    #[error("--state-backup-dir {dir}: {source}", dir = dir.display())]
+    StateBackupDir {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     /// The REAPI policy file cannot be read.
     #[error("--reapi-auth-policy: read {path}: {source}")]
     PolicyRead {
@@ -776,11 +791,30 @@ impl Args {
                 source,
             })?
             .map(Arc::new);
+        let state_backup = self.state_backup()?;
         Ok(Some(Api {
             listen,
             token,
             local_cache,
             releases,
+            state_backup,
+        }))
+    }
+
+    /// The state file and the directory of its copies, when `--state-backup-dir` is given
+    /// (the flag requires `--state-store`). The directory is made, 0700, if missing.
+    fn state_backup(&self) -> Result<Option<crate::verbs::StateBackup>, ConfigError> {
+        let (Some(dir), Some(store)) = (self.state_backup_dir.as_deref(), &self.state_store)
+        else {
+            return Ok(None);
+        };
+        crate::verbs::make_backup_dir(dir).map_err(|source| ConfigError::StateBackupDir {
+            dir: dir.to_owned(),
+            source,
+        })?;
+        Ok(Some(crate::verbs::StateBackup {
+            db: store.path().to_owned(),
+            dir: dir.to_owned(),
         }))
     }
 

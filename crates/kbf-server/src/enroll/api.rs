@@ -163,7 +163,7 @@ pub fn routes(token: Option<ApiToken>, enroll: Option<Arc<EnrollApi>>) -> Router
 }
 
 /// `value` as a JSON body that no cache keeps.
-fn reply(code: StatusCode, value: &impl Serialize) -> Response {
+pub(crate) fn reply(code: StatusCode, value: &impl Serialize) -> Response {
     let mut answer = json(code, value);
     answer
         .headers_mut()

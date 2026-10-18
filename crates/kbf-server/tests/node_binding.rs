@@ -661,6 +661,7 @@ async fn a_revoked_daemon_cannot_report_its_status() {
         token: None,
         local_cache: None,
         releases: None,
+        state_backup: None,
     };
     let bound = bind_server_with_api(Arc::new(Cache::memory()), listeners, Some(api), pending())
         .expect("bind");

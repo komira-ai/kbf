@@ -126,6 +126,7 @@ pub const ALLOWED: &[&str] = &[
     "api_listen",
     "api_token_file",
     "releases_dir",
+    "state_backup_dir",
     "readyz_store_timeout_ms",
     "worker_tls_cert",
     "worker_tls_key",
@@ -893,7 +894,9 @@ impl<'a> Prepared<'a> {
         let (worker_incoming, worker_latch) = worker.grpc(worker_tls)?;
         worker_stop.closes(worker_latch);
         let api_listener = api_socket.map(Socket::http).transpose()?;
-        let (token, releases) = api.map_or((None, None), |api| (api.token, api.releases));
+        let (token, releases, state_backup) = api.map_or((None, None, None), |api| {
+            (api.token, api.releases, api.state_backup)
+        });
         let api_routes = crate::api::router(
             Arc::clone(&farm),
             token.clone(),
@@ -903,6 +906,11 @@ impl<'a> Prepared<'a> {
             // enroll listener; until it exists, the enrollment routes answer 404.
             None,
         )
+        .merge(crate::verbs::routes(
+            token.clone(),
+            members.clone(),
+            state_backup,
+        ))
         .merge(crate::release::router(releases.clone(), token))
         .merge(crate::health::router_of(Arc::clone(&checks)))
         .merge(metrics_route(

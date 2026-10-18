@@ -17,6 +17,7 @@ mod enroll;
 pub mod enroll_api;
 mod image;
 mod lease;
+pub mod operator_api;
 mod phase;
 mod platform;
 mod qos;

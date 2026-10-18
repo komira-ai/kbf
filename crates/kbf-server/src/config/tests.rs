@@ -473,3 +473,66 @@ fn a_releases_dir_that_cannot_be_made_stops_the_start_naming_it() {
         .expect("an API");
     assert!(api.releases.is_some());
 }
+
+/// Catches `--state-backup-dir` giving the API a backup route that is wrong in one of three
+/// ways: the directory not made (or made wider than 0700), the state file taken from
+/// anything but `--state-store`, or the route configured without the flag. A directory that
+/// cannot be made stops the start naming the flag; without the flag there is no backup.
+///
+/// Mutants seen red: the directory made with the default mode (0755); `db` taken from the
+/// backup directory; the backup configured when the flag is absent.
+#[test]
+fn a_state_backup_dir_is_made_private_and_pairs_with_the_state_store() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let exe = std::env::current_exe().expect("the test binary");
+    let target = exe
+        .ancestors()
+        .nth(3)
+        .expect("<target>/<profile>/deps/<binary>");
+    let base = target
+        .join("tmp")
+        .join(format!("config-state-backup-{}", std::process::id()));
+    std::fs::create_dir_all(&base).expect("dir");
+    let args = |dir: &std::path::Path| {
+        Args::try_parse_from([
+            "kbf-server",
+            "--api-listen=127.0.0.1:0",
+            "--state-store=sqlite:///var/lib/kbf/state.db",
+            &format!("--state-backup-dir={}", dir.display()),
+        ])
+        .expect("parses")
+    };
+    let dir = base.join("made").join("backups");
+    let backup = args(&dir)
+        .api()
+        .expect("usable")
+        .expect("an API")
+        .state_backup
+        .expect("a backup");
+    assert_eq!(backup.dir, dir);
+    assert_eq!(backup.db, std::path::Path::new("/var/lib/kbf/state.db"));
+    let mode = std::fs::metadata(&dir).expect("made").permissions().mode();
+    assert_eq!(mode & 0o777, 0o700);
+
+    let file = base.join("a-file");
+    std::fs::write(&file, b"x").expect("file");
+    let why = args(&file.join("backups"))
+        .api()
+        .expect_err("cannot be made")
+        .to_string();
+    assert!(
+        why.contains("--state-backup-dir") && why.contains("a-file/backups"),
+        "{why}"
+    );
+
+    let without = Args::try_parse_from([
+        "kbf-server",
+        "--api-listen=127.0.0.1:0",
+        "--state-store=sqlite:///var/lib/kbf/state.db",
+    ])
+    .expect("parses")
+    .api()
+    .expect("usable")
+    .expect("an API");
+    assert!(without.state_backup.is_none());
+}
