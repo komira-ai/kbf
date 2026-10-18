@@ -1017,40 +1017,40 @@ async fn a_shared_block_is_flushed_as_one_object() {
 /// longer than the idle time.
 #[test]
 fn a_slow_but_steady_stream_outlives_the_idle_time() {
-    bounded(
-        "a_slow_but_steady_stream_outlives_the_idle_time",
-        async {
-            let rig = Rig::new();
-            let idle = Duration::from_millis(300);
-            let config = PoolConfig {
-                stream_idle: idle,
-                ..pool(1, 16)
-            };
-            let cache = rig.start_on(&rig.fs, small_blocks(), config).await.0;
-            let blob = TestBlob::new(42, 5 * MIB);
-            let started = std::time::Instant::now();
-            let upload = {
-                let (cache, blob) = (Arc::clone(&cache), blob.clone());
-                tokio::task::spawn_blocking(move || {
-                    let mut stream = cache.stream(blob.bytes.len() as u64).expect("a stream");
-                    for piece in blob.bytes.chunks(MIB) {
-                        stream.append(piece)?;
-                        std::thread::sleep(idle.mul_f64(0.6));
-                    }
-                    stream.finish(blob.digest, kbf_segments::crc32c(&blob.bytes))
-                })
-            };
-            let prepared = upload.await.expect("join").expect("a steady stream is not a stall");
-            assert!(
-                started.elapsed() > idle * 2,
-                "the stream did not outlast twice the idle time: {:?}",
-                started.elapsed()
-            );
-            prepared.commit().await.expect("committed");
-            assert!(rig.on_tier(&blob.digest));
-            reads_back(&cache, &blob).await;
-        },
-    );
+    bounded("a_slow_but_steady_stream_outlives_the_idle_time", async {
+        let rig = Rig::new();
+        let idle = Duration::from_millis(300);
+        let config = PoolConfig {
+            stream_idle: idle,
+            ..pool(1, 16)
+        };
+        let cache = rig.start_on(&rig.fs, small_blocks(), config).await.0;
+        let blob = TestBlob::new(42, 5 * MIB);
+        let started = std::time::Instant::now();
+        let upload = {
+            let (cache, blob) = (Arc::clone(&cache), blob.clone());
+            tokio::task::spawn_blocking(move || {
+                let mut stream = cache.stream(blob.bytes.len() as u64).expect("a stream");
+                for piece in blob.bytes.chunks(MIB) {
+                    stream.append(piece)?;
+                    std::thread::sleep(idle.mul_f64(0.6));
+                }
+                stream.finish(blob.digest, kbf_segments::crc32c(&blob.bytes))
+            })
+        };
+        let prepared = upload
+            .await
+            .expect("join")
+            .expect("a steady stream is not a stall");
+        assert!(
+            started.elapsed() > idle * 2,
+            "the stream did not outlast twice the idle time: {:?}",
+            started.elapsed()
+        );
+        prepared.commit().await.expect("committed");
+        assert!(rig.on_tier(&blob.digest));
+        reads_back(&cache, &blob).await;
+    });
 }
 
 /// Catches a stalled but connected upload holding a writer for ever: with one writer, a
