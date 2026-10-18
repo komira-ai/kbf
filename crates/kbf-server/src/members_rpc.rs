@@ -10,29 +10,63 @@
 //! a connected node is the next change (it can ride `Heartbeat`'s answer).
 //!
 //! **Who may call.** Under mutual TLS ([`Admission::Certified`]) the caller's certificate
-//! must name the role `storage`; without TLS every call is admitted, as on the storage
-//! listener.
+//! must name the role `storage`, and must not be on the deny list if the server has one
+//! ([`MembershipService::with_deny_list`]: the worker listener's, read again at every
+//! call, an unreadable one refusing every call UNAVAILABLE). Without TLS every call is
+//! admitted, as on the storage listener.
+//!
+//! **Who is denied.** The operator's deny list, the `deny/` rows ([`Members::deny`]), is
+//! checked beside the file's. `Register` reads the rows themselves, so an entry counts from
+//! the moment it is written; `Heartbeat` reads the map's list, before it touches the row,
+//! so a refused beat does not renew it: the node goes `Down` after the time to live and
+//! leaves the write order, as a node that stopped beating would. Both refuse PERMISSION_DENIED,
+//! saying the entry.
+//!
+//! **Whose instance and address.** A storage certificate speaks for the hosts it names, its
+//! DNS and IP subjectAltNames ([`PeerNames`]). `Register` is refused PERMISSION_DENIED
+//! unless they cover the host of the `instance_id` and of the `addr` (`host` or
+//! `host:port`: [`host_of`]), so one node's certificate cannot register another's
+//! instance, which would take over its member id and supersede its heartbeats, nor
+//! advertise another's address. `Heartbeat` is checked the same way against the address
+//! on the member's row ([`Members::heartbeat`]), before the boot is looked at. Plain text
+//! binds nothing.
 
 use std::sync::Arc;
 
+use kbf_map::{DenyEntry, Map};
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_server::{Membership, MembershipServer};
-use kbf_storage::service::{Admission, PeerRole, role_of};
+use kbf_storage::service::{Admission, PeerNames, PeerRole, host_of, role_of};
 use tonic::{Request, Response, Status};
 
+use crate::identity::{DenyList, PeerCert};
 use crate::members::{Members, MembershipError, Progress, Registrant};
+use crate::storage_health::Debts;
 
 /// The service over `members`, admitting callers as `admission` says.
 pub struct MembershipService {
     members: Arc<Members>,
     admission: Admission,
+    deny_list: Option<DenyList>,
 }
 
 impl MembershipService {
-    /// The service over `members`.
+    /// The service over `members`, with no deny list.
     #[must_use]
     pub fn new(members: Arc<Members>, admission: Admission) -> Self {
-        Self { members, admission }
+        Self {
+            members,
+            admission,
+            deny_list: None,
+        }
+    }
+
+    /// The service refusing the certificates and nodes `deny_list` lists, if there is one
+    /// (it applies under mutual TLS only: plain text has no certificate to list).
+    #[must_use]
+    pub fn with_deny_list(mut self, deny_list: Option<DenyList>) -> Self {
+        self.deny_list = deny_list;
+        self
     }
 
     /// The service as a tonic server, ready to add to a listener.
@@ -41,24 +75,39 @@ impl MembershipService {
         MembershipServer::new(self)
     }
 
-    fn admit<T>(&self, request: &Request<T>) -> Result<(), Status> {
+    /// Admits the caller of `request`: its role and the deny list file, and the certificate
+    /// that gives its names and what the operator's deny list is compared with (`None` in
+    /// plain text).
+    async fn admit<T>(&self, request: &Request<T>) -> Result<Option<PeerCert>, Status> {
         let certs = kbf_tls::peer_certs(request);
-        let leaf = certs.as_deref().and_then(|chain| chain.first());
-        self.admit_leaf(leaf.map(AsRef::as_ref))
+        let leaf = certs
+            .as_deref()
+            .and_then(|chain| chain.first())
+            .map(AsRef::as_ref);
+        let Some(peer) = self.admit_leaf(leaf)? else {
+            return Ok(None);
+        };
+        if let Some(deny_list) = &self.deny_list {
+            deny_list.admit_cert(&peer).await?;
+        }
+        Ok(Some(peer))
     }
 
-    /// Admits a caller whose verified chain starts with `leaf`.
+    /// Admits a caller whose verified chain starts with `leaf`; its certificate, or `None`
+    /// without mutual TLS.
     ///
     /// # Errors
-    /// Under mutual TLS, UNAUTHENTICATED without a certificate; PERMISSION_DENIED for any
-    /// role but `storage` (see [`role_of`]).
-    pub fn admit_leaf(&self, leaf: Option<&[u8]>) -> Result<(), Status> {
+    /// Under mutual TLS, UNAUTHENTICATED without a certificate or with one that does not
+    /// parse; PERMISSION_DENIED for any role but `storage` (see [`role_of`]).
+    pub fn admit_leaf(&self, leaf: Option<&[u8]>) -> Result<Option<PeerCert>, Status> {
         if self.admission == Admission::Open {
-            return Ok(());
+            return Ok(None);
         }
         let der = leaf.ok_or_else(|| Status::unauthenticated("no client certificate"))?;
         match role_of(der)? {
-            PeerRole::Storage => Ok(()),
+            PeerRole::Storage => PeerCert::from_der(der)
+                .map(Some)
+                .map_err(Status::unauthenticated),
             other => Err(Status::permission_denied(format!(
                 "role {} may not register as a storage node",
                 other.name()
@@ -67,10 +116,38 @@ impl MembershipService {
     }
 }
 
+/// Refuses a caller whose certificate an entry of `denied` names.
+///
+/// # Errors
+/// [`MembershipError::Denied`], with the entry.
+fn refuse_denied(peer: &PeerCert, denied: &[DenyEntry]) -> Result<(), MembershipError> {
+    match peer.identity().denied_by(denied) {
+        Some(entry) => Err(MembershipError::Denied(entry.clone())),
+        None => Ok(()),
+    }
+}
+
+/// Whether `names` cover the host of `value`, the `field` of a registration.
+///
+/// # Errors
+/// PERMISSION_DENIED: they do not, saying what the certificate names and what to do.
+fn covered(names: &PeerNames, field: &str, value: &str) -> Result<(), Status> {
+    if names.covers(host_of(value)) {
+        return Ok(());
+    }
+    Err(Status::permission_denied(format!(
+        "the storage certificate's names ({names}) do not cover {field} {value:?}; \
+         reissue it with the node's DNS or IP names"
+    )))
+}
+
 /// The gRPC answer for a membership failure.
 fn status(e: MembershipError) -> Status {
     let message = e.to_string();
     match e {
+        MembershipError::NotHolder(_) | MembershipError::Denied(_) => {
+            Status::permission_denied(message)
+        }
         MembershipError::Invalid(_) => Status::invalid_argument(message),
         MembershipError::Protocol { .. } | MembershipError::Superseded { .. } => {
             Status::failed_precondition(message)
@@ -101,12 +178,17 @@ impl Membership for MembershipService {
         &self,
         request: Request<pb::RegisterRequest>,
     ) -> Result<Response<pb::RegisterResponse>, Status> {
-        self.admit(&request)?;
+        let peer = self.admit(&request).await?;
         let req = request.into_inner();
         if pb::Role::try_from(req.role) != Ok(pb::Role::Storage) {
             return Err(Status::invalid_argument(
                 "role must be ROLE_STORAGE: only storage nodes register",
             ));
+        }
+        if let Some(peer) = &peer {
+            let names = peer.identity().names();
+            covered(names, "instance_id", &req.instance_id)?;
+            covered(names, "addr", &req.addr)?;
         }
         let who = Registrant {
             instance_id: req.instance_id,
@@ -117,7 +199,15 @@ impl Membership for MembershipService {
             progress: Progress::from_wire(req.catching_up),
         };
         let members = Arc::clone(&self.members);
-        let joined = blocking(move || members.register(&who)).await?;
+        let joined = blocking(move || {
+            // The rows, not the map: an entry counts from the moment it is written, and a
+            // refusal comes before the member is assigned an id or a boot.
+            if let Some(peer) = &peer {
+                refuse_denied(peer, &members.denied()?)?;
+            }
+            members.register(&who)
+        })
+        .await?;
         let beat = self.members.config().beat();
         Ok(Response::new(pb::RegisterResponse {
             member_id: joined.id.0,
@@ -131,14 +221,26 @@ impl Membership for MembershipService {
         &self,
         request: Request<pb::HeartbeatRequest>,
     ) -> Result<Response<pb::HeartbeatResponse>, Status> {
-        self.admit(&request)?;
+        let peer = self.admit(&request).await?;
         let req = request.into_inner();
         let members = Arc::clone(&self.members);
         let id = kbf_map::MemberId(req.member_id);
         let have = req.have_generation;
         let progress = Progress::from_wire(req.catching_up);
+        let debts = Debts::from_wire(req.debts_known, req.repair_debts);
         let (map_generation, map) = blocking(move || {
-            let generation = members.heartbeat(id, req.boot, progress)?;
+            if let Some(peer) = &peer {
+                // The map's list, read before the row is touched: a refused beat must not
+                // renew the row, or a denied node would never lapse.
+                let map = members.current_map()?;
+                refuse_denied(peer, map.as_ref().map_or(&[][..], Map::denied))?;
+            }
+            // In plain text there are no names, and any caller holds any member.
+            let holds = |addr: &str| {
+                peer.as_ref()
+                    .is_none_or(|peer| peer.identity().names().covers(host_of(addr)))
+            };
+            let generation = members.heartbeat(id, req.boot, progress, debts, Some(&holds))?;
             // Read only for a node that is behind: most beats carry no map.
             let newer = if generation > have {
                 members.current_map()?.filter(|map| map.generation() > have)

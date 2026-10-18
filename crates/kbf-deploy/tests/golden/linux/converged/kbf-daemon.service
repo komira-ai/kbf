@@ -15,12 +15,15 @@ Delegate=yes
 MemoryMin=256M
 # Above the server's -925; build containers get 0 back from the driver.
 OOMScoreAdjust=-900
+# systemd starts a unit at a soft open-file limit of 1024; a build burst passes that (EMFILE).
+LimitNOFILE=1048576
 CPUWeight=200
 # No MemorySwapMax=: leases may swap (the host's swapfile is for them); the
 # daemon's swap watch kills a lease that swaps at its own cap.
 Environment=XDG_RUNTIME_DIR=/run/user/1500
 ExecStart=/usr/local/bin/kbf-daemon \
     --driver=container \
+    --oci-runtime=/usr/bin/crun \
     --server=https://storage-node.example.internal:8981 \
     --cas=https://storage-node.example.internal:8981 \
     --ca-cert=/etc/kbf/ca.pem \
