@@ -12,9 +12,28 @@ fn rules() -> Rules {
     Rules::release(me())
 }
 
-fn scratch(name: &str) -> PathBuf {
+/// A scratch directory that is removed when the test ends. The files these tests plant are
+/// executable, and the coverage tool takes any executable file under `target/` for a
+/// program to read and fails on one that is not.
+struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch(name: &str) -> Scratch {
     crate::migrate::rig::root_umask();
-    kbf_host::testkit::scratch(&format!("migrate-tree-{name}"))
+    Scratch(kbf_host::testkit::scratch(&format!("migrate-tree-{name}")))
 }
 
 fn put(path: &Path, bytes: &[u8], mode: u32) {

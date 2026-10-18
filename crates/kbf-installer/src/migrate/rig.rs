@@ -467,7 +467,11 @@ impl Rig {
             let dir = old.join("releases").join(commit);
             put(&dir.join(binary), &farm_binary(commit), 0o755);
             if binary == "kbf" {
-                put(&dir.join("units/kbf-daemon.service"), FARM_DAEMON_UNIT, 0o644);
+                put(
+                    &dir.join("units/kbf-daemon.service"),
+                    FARM_DAEMON_UNIT,
+                    0o644,
+                );
             }
         }
         std::os::unix::fs::symlink(format!("releases/{FARM_X}"), old.join("current"))

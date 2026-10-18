@@ -87,7 +87,11 @@ fn assert_starts(rig: &Rig, command: &[String], commit: &str, args: &[String]) {
     let program = rig.at(command[0].trim_start_matches('/'));
     let meta = fs::metadata(&program).expect("the program the unit names is there");
     assert!(meta.is_file(), "{}", program.display());
-    assert_eq!(meta.mode() & 0o111, 0o111, "executable for all, as a release's are");
+    assert_eq!(
+        meta.mode() & 0o111,
+        0o111,
+        "executable for all, as a release's are"
+    );
     assert_eq!(meta.mode() & 0o022, 0, "not writable by group or others");
     assert_eq!(meta.uid(), me());
     assert_eq!(
@@ -176,11 +180,19 @@ fn a_linux_test_farm_host_migrates_and_its_node_starts() {
         .filter(|&i| events[i].starts_with("start "))
         .collect();
     assert_eq!((off.len(), on.len()), (4, 2), "{events:?}");
-    assert!(off.iter().all(|&i| events[i].ends_with("links=false")), "{events:?}");
-    assert!(on.iter().all(|&i| events[i].ends_with("links=true")), "{events:?}");
+    assert!(
+        off.iter().all(|&i| events[i].ends_with("links=false")),
+        "{events:?}"
+    );
+    assert!(
+        on.iter().all(|&i| events[i].ends_with("links=true")),
+        "{events:?}"
+    );
     assert!(off.iter().max() < on.iter().min(), "{events:?}");
     let active = rig.active.borrow().clone();
-    assert!(active.contains("kbf-daemon.service") && active.contains("kbf-storage-and-daemon.service"));
+    assert!(
+        active.contains("kbf-daemon.service") && active.contains("kbf-storage-and-daemon.service")
+    );
     assert!(!active.contains("kbf-helper.service"), "{active:?}");
 }
 

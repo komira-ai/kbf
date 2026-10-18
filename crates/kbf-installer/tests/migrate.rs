@@ -34,7 +34,7 @@ fn old_host(name: &str) -> PathBuf {
         let dir = root.join("usr/local/kbf/releases").join(commit);
         fs::create_dir_all(&dir).expect("release");
         fs::write(dir.join("kbf"), format!("kbf {commit}\n")).expect("binary");
-        fs::set_permissions(dir.join("kbf"), fs::Permissions::from_mode(0o755)).expect("mode");
+        fs::set_permissions(dir.join("kbf"), fs::Permissions::from_mode(0o644)).expect("mode");
     }
     let tree = root.join("usr/local/kbf");
     std::os::unix::fs::symlink(format!("releases/{A}"), tree.join("current")).expect("link");
@@ -74,7 +74,12 @@ fn a_host_with_no_old_layout_has_nothing_to_migrate_and_nothing_to_roll_back() {
     fs::remove_file(root.join("var/lib/kbf-deploy/state.json")).expect("rm");
     for args in [&[][..], &["--apply"], &["--min-generation", "5", "--apply"]] {
         let out = migrate(&root, args);
-        assert_eq!(out.status.code(), Some(0), "{args:?}: {}", text(&out.stderr));
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
         assert!(
             text(&out.stdout).contains("nothing to migrate"),
             "{args:?}: {}",

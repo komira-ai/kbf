@@ -114,7 +114,8 @@ fn the_commit_comes_from_the_binary_and_a_failed_probe_refuses() {
     assert_eq!(error.exit_code(), 3);
     assert_eq!(rig.snapshot(""), before);
 
-    let cases: [(&str, fn() -> std::io::Result<crate::run::Ran>); 5] = [
+    type Answer = fn() -> std::io::Result<crate::run::Ran>;
+    let cases: [(&str, Answer); 5] = [
         ("entity not found", || {
             Err(std::io::Error::from(std::io::ErrorKind::NotFound))
         }),
@@ -294,7 +295,13 @@ fn damaged_files_stop_the_run_naming_the_file() {
         put(&rig.at("var/lib/kbf-deploy/helper.json"), text, 0o600);
         let error = refused(&mut rig);
         assert!(
-            matches!(error, MigrateError::Corrupt { file: "helper.json", .. }),
+            matches!(
+                error,
+                MigrateError::Corrupt {
+                    file: "helper.json",
+                    ..
+                }
+            ),
             "{name}: {error}"
         );
     }

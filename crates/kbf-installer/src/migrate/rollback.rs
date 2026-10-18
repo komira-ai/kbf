@@ -71,17 +71,16 @@ pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Repo
         exec,
         roots: &m.roots,
     };
-    if let Some(installer) = &m.installer_unit {
-        if svc
+    if let Some(installer) = &m.installer_unit
+        && svc
             .is_active(installer)
             .map_err(MigrateError::io(installer.as_str()))?
-        {
-            svc.stop(installer)
-                .map_err(MigrateError::io(installer.as_str()))?;
-            svc.disable(installer)
-                .map_err(MigrateError::io(installer.as_str()))?;
-            report.line(mode, format!("stopped and disabled {installer}"));
-        }
+    {
+        svc.stop(installer)
+            .map_err(MigrateError::io(installer.as_str()))?;
+        svc.disable(installer)
+            .map_err(MigrateError::io(installer.as_str()))?;
+        report.line(mode, format!("stopped and disabled {installer}"));
     }
     for unit in &journal.units {
         if svc
