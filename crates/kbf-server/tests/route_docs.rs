@@ -320,6 +320,34 @@ fn every_route_is_in_the_api_doc() {
     check("docs/api.md");
 }
 
+/// Headings (outside code fences) that appear more than once, with their `##` level kept.
+fn duplicate_headings(text: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut dup = Vec::new();
+    let mut fenced = false;
+    for line in text.lines() {
+        if line.starts_with("```") {
+            fenced = !fenced;
+        } else if !fenced && line.starts_with("## ") && !seen.insert(line.to_string()) {
+            dup.push(line.to_string());
+        }
+    }
+    dup
+}
+
+#[test]
+fn the_api_doc_names_each_section_once() {
+    let text = fs::read_to_string(root().join("docs/api.md")).unwrap();
+    let dup = duplicate_headings(&text);
+    assert!(dup.is_empty(), "docs/api.md repeats these sections: {dup:?}");
+}
+
+#[test]
+fn a_repeated_section_heading_is_reported() {
+    let text = "## A\ntext\n```\n## A\n```\n## B\n## A (planned)\n## B\n";
+    assert_eq!(duplicate_headings(text), vec!["## B".to_string()]);
+}
+
 #[test]
 fn every_route_is_in_the_verbs_table() {
     check("docs/design/operator-verbs.md");

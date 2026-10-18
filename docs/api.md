@@ -434,29 +434,6 @@ curl -X DELETE -H "Authorization: Bearer $T" -H 'Content-Type: application/json'
 
 A UI comes later.
 
-## `/v1/object-stores/...` (**planned**)
-
-**Not built: every route here answers 404 today.** The routes register the farm's object
-store with the frontend, which keeps it as durable desired state and lets the storage nodes
-fetch it ([the design](design/object-store-registration.md)). Planned, each passing every
-gate of [Who may write](#who-may-write) on a GET too, with `Cache-Control: no-store`, and off
-(404) unless the frontend has a secrets directory:
-
-| Route | Does |
-|---|---|
-| `PUT /v1/object-stores/connections/{name}` | create or replace a connection (an endpoint and a key pair); idempotent |
-| `GET /v1/object-stores/connections` | list the connections, never a secret |
-| `GET /v1/object-stores/connections/{name}` | one connection, never a secret |
-| `DELETE /v1/object-stores/connections/{name}` | delete; `409 in_use` while bound |
-| `POST /v1/object-stores/connections/{name}:verify` | probe the store, change nothing |
-| `PUT /v1/object-stores/bindings/{role}` | bind the role `cold` to a connection, a bucket and a prefix |
-| `DELETE /v1/object-stores/bindings/{role}` | unbind; `409 in_use` once a node has applied it |
-| `GET /v1/object-stores` | the desired state, and which storage nodes have applied it |
-| `GET /v1/object-stores/audit?limit=` | the audit rows |
-
-The design page has the bodies, the error codes and the rotation runbook. Every verb of the
-API, built, open or planned, is in [the verbs table](design/operator-verbs.md).
-
 ## `GET /v1/storage`
 
 Whether every blob is known to have its copies elsewhere: the number a rollout asks
@@ -503,6 +480,8 @@ with a generation. A
 connection, a bucket and a prefix. The only role is `cold`, today's `--cold-store`; `history`
 and `backup` answer `422 role_not_supported` until something consumes them. A role here is
 neither an IAM role nor an enrollment role.
+Every verb of the API is in [the verbs table](design/operator-verbs.md); the bodies, the error
+codes and the rotation runbook are in [the design](design/object-store-registration.md).
 
 The routes exist when the frontend is started with `--object-store-secrets-dir DIR` (which
 needs `--api-listen`, `--api-token-file` and `--state-store`). `DIR` holds one file of mode
