@@ -549,6 +549,24 @@ fn gate(
     peer: SocketAddr,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, String)> {
+    operator_gate(token, peer, headers)?;
+    let content_type = headers.get(CONTENT_TYPE).map(|v| v.as_bytes());
+    if !content_type.is_some_and(is_json) {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            format!("a write is sent as Content-Type: {JSON}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Gates 1 to 4 of [`gate`]: who may write. A write whose body is not JSON (a release
+/// tarball) passes these and answers for its own content type.
+pub(crate) fn operator_gate(
+    token: Option<&ApiToken>,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, String)> {
     if !peer.ip().to_canonical().is_loopback() {
         return Err((
             StatusCode::FORBIDDEN,
@@ -572,13 +590,6 @@ fn gate(
         return Err((
             StatusCode::UNAUTHORIZED,
             "a write needs Authorization: Bearer <the --api-token-file token>".to_owned(),
-        ));
-    }
-    let content_type = headers.get(CONTENT_TYPE).map(|v| v.as_bytes());
-    if !content_type.is_some_and(is_json) {
-        return Err((
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            format!("a write is sent as Content-Type: {JSON}"),
         ));
     }
     Ok(())
