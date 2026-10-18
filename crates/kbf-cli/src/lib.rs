@@ -46,11 +46,29 @@
 //! frontend is updated without failing a build. Like `cluster` it starts no mode: `kbf
 //! frontend` takes only flags, and the word `handover` after it is this command's.
 //!
+//! Before a mode starts, [`preflight`] checks what it needs of its host (the files its
+//! flags name, its certificate's role, the S3 key pair, the container driver's programs,
+//! ...) and refuses, with every missing piece on stderr, one line each, and exit status 2
+//! (75 for a piece that heals shortly). `check-args`, `cluster` and `frontend handover`
+//! read nothing of the host and skip it.
+//!
+//! And the product's two words for a node ([`node`], [`enroll`]): `kbf enroll` enrolls the
+//! node with the frontend its `kbf.toml` names (one token, one key per role, a certificate
+//! from the frontend's CA) and exits; `kbf node` does that if the node is not enrolled,
+//! then runs the mode its granted roles name (`storage`, `daemon` or `storage-and-daemon`)
+//! and renews the certificates while it runs. Like `cluster` they are outside
+//! [`names::MODES`]; `kbf check-args node ...` and `kbf check-args enroll ...` accept
+//! their flags.
+//!
 //! The `kbf-server`, `kbf-daemon` and `kbf-all-in-one` binaries are unchanged.
 
 pub mod cluster;
+pub mod enroll;
 pub mod handover;
 pub mod names;
+pub mod node;
+pub mod nofile;
+pub mod preflight;
 pub mod version;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -173,9 +191,13 @@ pub fn command() -> Command {
     cmd.after_help(format!(
         "Not a mode: `kbf {CLUSTER} status|drain|undrain` calls a frontend's operator API \
          (`kbf {CLUSTER} --help`); `kbf {} {HANDOVER}` updates a frontend without failing a \
-         build (`kbf {} {HANDOVER} --help`).",
+         build (`kbf {} {HANDOVER} --help`); `kbf {NODE}` enrolls this machine and runs \
+         the mode its granted roles name (`kbf {NODE} --help`); `kbf {ENROLL}` only enrolls \
+         (`kbf {ENROLL} --help`).",
         names::FRONTEND,
         names::FRONTEND,
+        NODE = names::NODE,
+        ENROLL = names::ENROLL,
     ))
 }
 
@@ -208,6 +230,49 @@ pub fn parse_handover(args: &[std::ffi::OsString]) -> Result<handover::Handover,
     let argv = args.iter().take(1).chain(args.iter().skip(3));
     let matches = handover_command().try_get_matches_from(argv)?;
     handover::Handover::from_arg_matches(&matches)
+}
+
+/// `kbf node ...`'s command line.
+#[must_use]
+pub fn node_command() -> Command {
+    let cmd = Command::new(names::NODE)
+        .bin_name(format!("kbf {}", names::NODE))
+        .about(
+            "Enroll this machine with its frontend if it is not enrolled, run the mode its \
+             granted roles name (storage, daemon, or both) and renew its certificates.",
+        );
+    node::Node::augment_args(cmd)
+}
+
+/// Parses `kbf node ...`; `args` is the whole command line, its second word
+/// [`names::NODE`].
+///
+/// # Errors
+/// What `clap` refuses.
+pub fn parse_node(args: &[std::ffi::OsString]) -> Result<node::Node, clap::Error> {
+    let argv = args.iter().take(1).chain(args.iter().skip(2));
+    let matches = node_command().try_get_matches_from(argv)?;
+    node::Node::from_arg_matches(&matches)
+}
+
+/// `kbf enroll ...`'s command line.
+#[must_use]
+pub fn enroll_command() -> Command {
+    let cmd = Command::new(names::ENROLL)
+        .bin_name(format!("kbf {}", names::ENROLL))
+        .about("Enroll this machine with its frontend, once, and exit.");
+    enroll::Enroll::augment_args(cmd)
+}
+
+/// Parses `kbf enroll ...`; `args` is the whole command line, its second word
+/// [`names::ENROLL`].
+///
+/// # Errors
+/// What `clap` refuses.
+pub fn parse_enroll(args: &[std::ffi::OsString]) -> Result<enroll::Enroll, clap::Error> {
+    let argv = args.iter().take(1).chain(args.iter().skip(2));
+    let matches = enroll_command().try_get_matches_from(argv)?;
+    enroll::Enroll::from_arg_matches(&matches)
 }
 
 /// `kbf cluster ...`'s command line.
@@ -340,34 +405,34 @@ pub const CHECK_ARGS: &str = "check-args";
 /// What [`parse_from`] refuses, and `--help` or `--version`, which would print and exit 0 without
 /// starting the mode.
 pub fn check_args(args: &[std::ffi::OsString]) -> Result<(), clap::Error> {
+    // `kbf <word> [flags...]`, as the start would be given.
     let argv = args
         .iter()
         .take(1)
         .chain(args.iter().skip(2))
         .cloned()
         .collect::<Vec<_>>();
-    match parse_from(argv) {
-        Ok(
-            Invocation::Daemon(_)
-            | Invocation::AllInOne(_)
-            | Invocation::Storage(_)
-            | Invocation::StorageAndDaemon(_)
-            | Invocation::Frontend(_),
-        ) => Ok(()),
+    let parsed = match argv.get(1).and_then(|word| word.to_str()) {
+        Some(names::NODE) => parse_node(&argv).map(drop),
+        Some(names::ENROLL) => parse_enroll(&argv).map(drop),
+        _ => parse_from(argv).map(drop),
+    };
+    match parsed {
         Err(e) if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => {
             Err(command().error(
                 ErrorKind::ArgumentConflict,
                 "--help and --version print and exit 0: the mode would not start",
             ))
         }
-        Err(e) => Err(e),
+        other => other,
     }
 }
 
 /// The `kbf` binary: the daemon's helper re-execs first (a keeper or a `__chown-dirs`
 /// run of this binary never reads the command line as `kbf`'s), then [`version::line`]
 /// for `kbf --version --json`, then the command line, then [`check_args`] for `kbf
-/// check-args ...`, [`cluster::run`] for `kbf cluster ...`, [`handover::run`] for `kbf frontend handover ...` or else [`run`]. A command
+/// check-args ...`, [`cluster::run`] for `kbf cluster ...`, [`handover::run`] for `kbf frontend handover ...` or else
+/// [`preflight::refusal`] and [`run`]. A command
 /// line that
 /// does not parse exits 2 (0 for `--help` and `--version`).
 #[must_use]
@@ -375,6 +440,9 @@ pub fn main() -> ExitCode {
     if let Some(code) = kbf_node::dispatch_helpers() {
         return code;
     }
+    // A failure leaves the limit as it was: the process still starts, and the first
+    // EMFILE names the cause.
+    let _ = nofile::raise();
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if version::asked(&args) {
         print!("{}", version::line());
@@ -397,6 +465,18 @@ pub fn main() -> ExitCode {
             Err(e) => e.exit(),
         };
     }
+    if args.get(1).is_some_and(|word| word == names::NODE) {
+        return match parse_node(&args) {
+            Ok(node) => node::run(&node),
+            Err(e) => e.exit(),
+        };
+    }
+    if args.get(1).is_some_and(|word| word == names::ENROLL) {
+        return match parse_enroll(&args) {
+            Ok(enroll) => enroll::run(&enroll),
+            Err(e) => e.exit(),
+        };
+    }
     if args.get(1).is_some_and(|word| word == CLUSTER) {
         return match parse_cluster(&args) {
             Ok(cluster) => cluster::run(&cluster),
@@ -404,7 +484,7 @@ pub fn main() -> ExitCode {
         };
     }
     match parse_from(args) {
-        Ok(invocation) => run(&invocation),
+        Ok(invocation) => preflight::refusal(&invocation).unwrap_or_else(|| run(&invocation)),
         Err(e) => e.exit(),
     }
 }

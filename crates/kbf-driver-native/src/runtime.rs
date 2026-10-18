@@ -1,7 +1,7 @@
 //! [`NativeRuntime`]: one action, one lease directory, one process tree, all of it gone
 //! when the lease ends. See the crate documentation for what a lease gets.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,7 @@ use tokio::time::Instant;
 
 use crate::cas::CasStore;
 use crate::config::NativeConfig;
+use crate::denials;
 use crate::network::{self, Network, network_of};
 use crate::procs::{self, Proc, Tracker};
 use crate::program::{Refused, Resolved, resolve};
@@ -75,6 +76,8 @@ pub struct NativeRuntime<C> {
     warm_up: Mutex<Option<WarmUp>>,
     /// How the simulators of the leases that ask for one are made and deleted.
     simctl: Arc<Simctl>,
+    /// The sweep of the simulators a killed daemon left, started by the start.
+    sweeping: simulator::Background,
     /// The slots of a root daemon's lease-user pool, one lease each.
     #[cfg(target_os = "macos")]
     slots: Option<crate::slots::macos::Slots>,
@@ -148,19 +151,16 @@ impl<C: Cas> NativeRuntime<C> {
             xcrun: config.xcrun.clone(),
             isolation: config.isolation.clone(),
             rules: rules.clone(),
-            within: simulator::ANSWER_WITHIN,
+            within: config.simulator_answer,
             listing: config.simulator_listing,
+            live: Mutex::default(),
         });
-        // The first lease directory a killed daemon left that may hold a simulator:
-        // the simulators every lease left are deleted from it before it is removed.
-        let swept = std::cell::Cell::new(false);
+        // A lease directory a killed daemon left that may hold a simulator is the only
+        // record of it: the start owes the sweep of the devices before it removes one.
+        // The sweep itself runs after the start, on a thread of its own.
         let remove_left = |path: &Path| {
-            if simulator::marked(path) && !swept.replace(true) {
-                // One that cannot be named by its real path cannot be removed either.
-                let real = std::fs::canonicalize(path)?;
-                if let Err(why) = simctl.sweep(&real) {
-                    tracing::error!(dir = %path.display(), "simulators left behind: {why}");
-                }
+            if simulator::marked(path) {
+                simulator::owe(&config.scratch)?;
             }
             remove(path)
         };
@@ -170,6 +170,10 @@ impl<C: Cas> NativeRuntime<C> {
             config.kill_wait,
             &crate::sweep::SYSTEM,
         )?;
+        let sweeping = simulator::Background::default();
+        if simulator::pending(&config.scratch) {
+            sweeping.start(&simctl, &config.scratch, config.simulator_retry);
+        }
         // After the sweep, which sets aside a `runs` that is not the daemon's directory.
         let mut runs = std::fs::DirBuilder::new();
         std::os::unix::fs::DirBuilderExt::mode(runs.recursive(true), 0o700)
@@ -177,6 +181,7 @@ impl<C: Cas> NativeRuntime<C> {
         make_spool_dir(&config.scratch.join(SPOOL))?;
         let runtime = Self {
             simctl,
+            sweeping,
             xcodes: RwLock::new(config.xcodes.clone()),
             config,
             cas,
@@ -188,6 +193,16 @@ impl<C: Cas> NativeRuntime<C> {
         };
         sweep_user_folders(&runtime.config);
         Ok(runtime)
+    }
+
+    /// Waits until the start's sweep of the simulators a killed daemon left has ended,
+    /// at most `within`; whether it has. It has when it ended clean, when it ran out
+    /// of tries (it left the work to the next start), and when the start found none to
+    /// sweep. Nothing needs this to run a lease; it is what a test or a status line
+    /// waits on.
+    #[must_use]
+    pub fn wait_for_simulator_sweep(&self, within: Duration) -> bool {
+        self.sweeping.wait(within)
     }
 
     /// Starts the `xcrun` warm-up for the node's own Xcode and the Xcodes actions may
@@ -480,6 +495,7 @@ impl<C: Cas> NativeRuntime<C> {
             .process_group(0)
             .kill_on_drop(true);
         let record = crate::record::path(&self.config.scratch, &lease_name(work.lease_id));
+        let started = Instant::now();
         let Spawned {
             mut child,
             pid: leader,
@@ -517,6 +533,17 @@ impl<C: Cas> NativeRuntime<C> {
             }
         };
         watch.end(&mut child, self.config.kill_wait).await?;
+        let did_fail = match &ended {
+            Ended::Exited(status) => status.as_ref().is_ok_and(|s| !s.success()),
+            Ended::TimedOut => true,
+            Ended::Killed | Ended::OutOfMemory { .. } => false,
+        };
+        if did_fail {
+            let ran = started.elapsed();
+            let mut pids = watch.pids();
+            pids.insert(leader);
+            self.report_denials(work.lease_id, dir, pids, ran).await;
+        }
         match ended {
             Ended::Exited(status) => Ok(exit_code(status.map_err(failed(&program))?)),
             Ended::TimedOut => Err(self.timed_out(cas, work.lease_id, dir).await),
@@ -525,6 +552,74 @@ impl<C: Cas> NativeRuntime<C> {
                 tracing::warn!(lease = %work.lease_id, used, limit, "killed past its memory limit");
                 Err(RuntimeError::OutOfMemory { used, limit })
             }
+        }
+    }
+
+    /// For an action that failed under the sandbox: reads what the sandbox refused its
+    /// processes ([`crate::denials`]), adds it to the end of its stderr file and to the
+    /// node's log. Reading the log can fail or find nothing; the action's own result
+    /// stands either way.
+    async fn report_denials(&self, lease: LeaseId, dir: &Path, pids: BTreeSet<i32>, ran: Duration) {
+        if !matches!(self.config.isolation, network::Isolation::Sandbox(_)) {
+            return;
+        }
+        // The log can show a refusal seconds after it happened, so the read is repeated
+        // until it holds one of the action's own or the schedule is spent
+        // ([`denials::collect`]). A read that fails ends the report.
+        let (read, file) = (self.config.denial_log, dir.join("sandbox-log"));
+        let (schedule, watched) = (self.config.denial_schedule, pids.clone());
+        let collected = tokio::task::spawn_blocking(move || {
+            let ended = std::time::Instant::now();
+            denials::collect(
+                &watched,
+                ran,
+                schedule,
+                |window| read(&file, window),
+                || ended.elapsed(),
+                std::thread::sleep,
+            )
+        })
+        .await;
+        let report = match collected {
+            Ok(report) => report,
+            Err(why) => {
+                tracing::warn!(%lease, %why, "the read of the sandbox's denials did not finish");
+                return;
+            }
+        };
+        if report.found.mine.is_empty() {
+            let why = report.explain(&pids);
+            tracing::warn!(%lease, "no sandbox denial is the action's own: {why}");
+            if let Some(record) = &self.config.denial_record {
+                record.lock().expect("record").push(why);
+            }
+        }
+        let found = report.found;
+        for denial in &found.mine {
+            tracing::warn!(%lease, denial = %denials::shown(denial), "the sandbox denied the action");
+        }
+        for line in found.other_lines() {
+            tracing::info!(%lease, denial = %line, "the sandbox denied a process this lease did not watch");
+        }
+        let Some(note) = found.note() else {
+            return;
+        };
+        let stderr = dir.join("stderr");
+        // The note must not push the action's own stderr past the stdio limit, which
+        // would drop all of it: it stays in the node's log then.
+        let max = self.config.outputs.max_stdio_bytes;
+        let size = std::fs::metadata(&stderr).map_or(u64::MAX, |m| m.len());
+        let note_len = u64::try_from(note.len()).unwrap_or(u64::MAX);
+        if size.saturating_add(note_len) > max {
+            tracing::warn!(%lease, size, max, "the sandbox's denials do not fit in stderr; they are in the node's log");
+            return;
+        }
+        let written = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&stderr)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, note.as_bytes()));
+        if let Err(why) = written {
+            tracing::warn!(%lease, %why, "the sandbox's denials could not be added to stderr");
         }
     }
 
@@ -758,6 +853,7 @@ async fn create_simulator(
         name: format!("{}{}-{}", simulator::NAME_PREFIX, lease.term, lease.seq),
         udid: None,
     };
+    simctl.hold(&made.name);
     *made_in(slot) = Some(made.clone());
     let marker = prepared.lease.join(simulator::MARKER);
     tokio::fs::write(&marker, b"")
@@ -867,6 +963,15 @@ impl Watch {
             Self::Tree(group) => group.measure().await,
             #[cfg(target_os = "macos")]
             Self::Uid(uid) => uid.measure().await,
+        }
+    }
+
+    /// Every pid seen belonging to the action so far.
+    fn pids(&self) -> BTreeSet<i32> {
+        match self {
+            Self::Tree(group) => lock(&group.tracker).seen().clone(),
+            #[cfg(target_os = "macos")]
+            Self::Uid(uid) => uid.seen(),
         }
     }
 

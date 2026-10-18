@@ -93,7 +93,7 @@ Options:
 
           Possible values:
           - fake:                 Runs nothing; every action succeeds with an empty result. For bring-up only
-          - container:            Each action in a fresh rootless Podman container (Linux)
+          - container:            Each action in a fresh rootless container made by `crun` (Linux)
           - native:               Each action as plain processes on the node, for Macs
           - native-whole-machine: Each whole-machine lease as its own user in its GUI session, through `kbf-mac-session` (macOS)
 
@@ -192,13 +192,13 @@ Options:
           The most threads the runtime's blocking pool runs at once, for calls that wait on a disk or a process (a thread is made when a call needs one and ends when idle). Default: 512 (tokio's) for the server, 64 for the daemon
 
       --worker-client-ca <WORKER_CLIENT_CA>
-          PEM CA that client certificates must chain to. Each must also name the role the method it calls takes: the daemon role (`urn:kbf:role:daemon`) for the worker session and blob calls, the storage role (`urn:kbf:role:storage`) for `kbf.map.v1.Membership`; a frontend certificate may call nothing here
+          PEM CA that client certificates must chain to. Each must also name the role the method it calls takes: the daemon role (`urn:kbf:role:daemon`) for the worker session and blob calls, the storage role (`urn:kbf:role:storage`) for `kbf.map.v1.Membership`, with DNS or IP names that cover the host of the instance id and of the address it registers; a frontend certificate may call nothing here
 
       --cpu-threads <N>
           Threads for CPU-bound work, such as hashing, which never waits and so is held to the CPUs. Default: every CPU the process may use on the server; `max(2, reserve/2)`, at most the physical cores, on the daemon
 
       --worker-deny-list <WORKER_DENY_LIST>
-          The worker listener's deny list: certificate serials, public keys and node ids it refuses (format in the `identity` module docs). Read at start, then again at every `Hello` and `Heartbeat`, so an edit takes effect without a restart. Needs mutual TLS
+          The worker listener's deny list: certificate serials, public keys and node ids it refuses (format in the `identity` module docs). Read at start, then again at every check (a daemon's `Hello`, `Heartbeat`, `Result`, `NodeStatus` and blob calls, a storage node's `Register` and `Heartbeat`), so an edit takes effect without a restart. A `node` entry also refuses a storage certificate with that DNS name. A list that cannot be read after start refuses all of those calls. Needs mutual TLS
 
       --output-upload-deadline-secs <OUTPUT_UPLOAD_DEADLINE_SECS>
           How long one lease's whole output upload (its output files, stdout and stderr) may take, in seconds, before the lease fails with a reason naming the upload and the time it ran (container and native drivers). Without it, a store that stops answering holds the lease, and its slot, with no error
@@ -450,13 +450,7 @@ Options:
           This node's actions use Metal (native): an Xcode whose Metal toolchain is not installed (`xcodebuild -showComponent MetalToolchain`) is not ready
 
       --image <IMAGE>
-          A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon checks each is in its user's image store, as the prepare step of every lease does, and exits with status 2 if one is not, or names an image index, saying the fix (`podman pull <repo>@sha256:<d>`). The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
-
-      --container-runtime <podman|oci>
-          The runtime that runs each action's container (container): `podman`, the default, runs `podman create` and `podman start` per action; `oci` runs each action in a fresh rootless sandbox through `--oci-runtime` directly, with no Podman on the action path (Podman only pulls and exports an image once per digest). `oci` needs the daemon user's subordinate ids in one range, `uidmap`, and every directory down to `--data-dir` searchable by others
-          
-          [default: podman]
-          [possible values: podman, oci]
+          A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon makes sure each is in the node's image store, as the prepare step of every lease does: it fetches the image from its registry by that digest, checks every byte against a digest, and unpacks it once. It exits with status 2 if one cannot be fetched, fails a check, or names an image index. The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
 
       --lease-placement <none|numa-node>
           Where each lease runs among the node's CPUs (container, Linux): `none`, the default, lets a lease use any CPU the daemon may; `numa-node` puts each lease on one NUMA node, its CPUs (`cpuset.cpus`) and memory (`cpuset.mems`), the node with the least CPU booked by running leases (the lowest id on a tie). `--reserve-cpus` is a quota on all leases together, so it still applies; it removes no CPU from a node. Needs the `cpuset` controller delegated to the daemon (the start fails and says how when it is not); a host with fewer than two NUMA nodes that hold CPUs runs as `none`, which the start logs. Refused with a driver other than `container` (macOS has no such driver)
@@ -465,7 +459,7 @@ Options:
           [possible values: none, numa-node]
 
       --oci-runtime <OCI_RUNTIME>
-          The OCI runtime `--container-runtime=oci` runs actions with (container)
+          The OCI runtime that runs each action's container (container): `crun`, run directly. Each action gets a fresh rootless sandbox. It needs the daemon user's subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on `PATH`, and every directory down to `--data-dir` searchable by others
           
           [default: /usr/bin/crun]
 
