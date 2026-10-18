@@ -335,9 +335,10 @@ pub fn read_secret(
                 origin: origin.clone(),
                 why,
             };
-            let mut file = std::fs::File::open(path).map_err(|e| fail(e.to_string()))?;
             // The mode of the file that was opened, not of what the path names now.
-            let meta = file.metadata().map_err(|e| fail(e.to_string()))?;
+            let (mut file, meta) = std::fs::File::open(path)
+                .and_then(|file| file.metadata().map(|meta| (file, meta)))
+                .map_err(|e| fail(e.to_string()))?;
             if !meta.is_file() {
                 return Err(fail("it is not a regular file".to_owned()));
             }
