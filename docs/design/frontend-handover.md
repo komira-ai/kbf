@@ -34,9 +34,15 @@ instance is up. A serving instance is never restarted by an install: the plan sa
 the handover instead. What the unit has, and why (check-units rule `handover`; rule `stop`
 still asks for `TimeoutStopSec=infinity` and `KillSignal=SIGTERM`):
 
-- `Type=notify`: kbf sends `READY=1` once it serves and its probes pass, so
-  `systemctl start` of the idle instance returns when the new frontend can take builds, and
-  fails when it could not.
+- `Type=notify`: kbf sends `READY=1` once it serves and its state store and map probes
+  pass, so `systemctl start` of the idle instance returns when the new frontend can take
+  builds, and fails when it could not. It does not wait for the `--storage` node: at a cold
+  power-up the node may come up after the frontend, and a frontend that waited would be
+  killed at `TimeoutStartSec` and restart with a new epoch, in a loop. The successor of a
+  handover likewise tells its predecessor it serves without the storage probe. `/readyz`
+  still fails with `storage` listed until the node answers: Envoy sends nothing to a
+  frontend that would fail every blob call, and the frontend keeps its listeners and its
+  state, so it is in rotation again as soon as the node is back (no restart, no new epoch).
 - `TimeoutStartSec=120`, finite: a new instance that never says ready fails the start.
 - `--handover-socket=/run/kbf-frontend/control.sock`, in `RuntimeDirectory=kbf-frontend`
   with `RuntimeDirectoryPreserve=yes`: the socket's directory outlives the instance that

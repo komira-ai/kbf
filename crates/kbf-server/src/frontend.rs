@@ -47,7 +47,9 @@
 //! loaded today: [`crate::health::MapProbe`]). The storage check asks the `--storage`
 //! node until the frontend routes by the map, and then the owners the map names for a
 //! probe digest (it passes when one answers), so a farm that has lost its `--storage`
-//! node is ready while its other members are.
+//! node is ready while its other members are. `READY=1` to the service manager, and the
+//! successor's "serving" to its predecessor, do not wait for this check
+//! ([`crate::handover::Ready`]); `/readyz` stays failing until storage answers.
 //!
 //! **Handing over** (`--handover-socket` with `--instance`, [`crate::handover`]): behind
 //! Envoy, a frontend started while another serves on the same state file binds its own

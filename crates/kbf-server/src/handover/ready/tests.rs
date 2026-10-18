@@ -120,3 +120,57 @@ async fn the_predecessor_is_told_once_the_probes_pass() {
     .run()
     .await;
 }
+
+/// Catches: the frontend waiting on the `storage` probe for `READY=1` and for the
+/// predecessor's "serving": with only the storage probe failing both are sent; with
+/// another probe (the state store) failing neither is, until it passes. Mutant: `run`
+/// asks `failing` (every probe) again.
+#[tokio::test]
+async fn ready_does_not_wait_for_storage_but_waits_for_the_rest() {
+    let dir = Scratch::new();
+    let path = dir.0.join("notify");
+    let manager = UnixDatagram::bind(&path).expect("a datagram socket");
+    manager.set_nonblocking(true).expect("nonblocking");
+    let state_up = Arc::new(AtomicBool::new(false));
+    let asked = Arc::new(AtomicUsize::new(0));
+    let checks = Arc::new(
+        Checks::new(Arc::new(Readiness::default()))
+            .probing(
+                "storage",
+                Arc::new(Dependency {
+                    up: Arc::new(AtomicBool::new(false)),
+                    asked: Arc::new(AtomicUsize::new(0)),
+                }),
+            )
+            .probing(
+                "state_store",
+                Arc::new(Dependency {
+                    up: Arc::clone(&state_up),
+                    asked: Arc::clone(&asked),
+                }),
+            ),
+    );
+    let task = tokio::spawn(
+        Ready {
+            checks,
+            notify: Some(path.into_os_string()),
+            predecessor: None,
+        }
+        .run(),
+    );
+    while asked.load(Ordering::SeqCst) < 2 {
+        tokio::task::yield_now().await;
+    }
+    let mut buffer = [0_u8; 32];
+    assert!(
+        manager.recv(&mut buffer).is_err(),
+        "ready sent with the state store down"
+    );
+    state_up.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("ready waited on the storage probe")
+        .expect("ready ends with storage still down");
+    let got = manager.recv(&mut buffer).expect("READY=1");
+    assert_eq!(&buffer[..got], b"READY=1");
+}
