@@ -154,7 +154,11 @@ pub fn revoke_node(
         row.state = STATE_REVOKED;
         row.revoked_at = Some(now);
         row.revoked_by = by.to_owned();
-        let txn = Txn::new().put(&key, row.encode_to_vec(), Cond::Version(read.version));
+        let mut txn = Txn::new().put(&key, row.encode_to_vec(), Cond::Version(read.version));
+        // The id stays burned, the address does not: another node may take it.
+        if !row.advertise.is_empty() {
+            txn = txn.delete(rows::advertise_key(&row.advertise), Cond::Any);
+        }
         let txn = with_deny_rows(txn, &keys, now, by, "revoked");
         if store.txn(txn)?.is_ok() {
             return keys.iter().map(|k| Ok(entry_of(k)?)).collect();

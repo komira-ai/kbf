@@ -28,10 +28,11 @@
 //! that has lost the writer role ([`kbf_state::Fenced`]) changes nothing: its writes fail
 //! and the call answers [`kbf_types::RefusalReason::NotSigner`].
 //!
-//! **The secret.** The row holds `SHA-256` of the 32 secret bytes. A presented secret is
-//! hashed before any row is read and the two 32-byte digests are compared with
-//! [`subtle::ConstantTimeEq`]; an unknown id is compared against a fixed digest, so it and
-//! a wrong secret do the same work and give the same answer.
+//! **The secret.** The row holds `SHA-256` of the 32 secret bytes. The enroll
+//! transaction reads the token row, then hashes the presented secret whether or not the
+//! row exists, and compares the two 32-byte digests with [`subtle::ConstantTimeEq`]; an
+//! unknown id is compared against a fixed digest, so it and a wrong secret do the same
+//! work and give the same answer.
 //!
 //! **TODO(P0 amendment, plan default 3):** the `issued_at` attribute OID the CA reads and
 //! the frontend checks belongs in `kbf-types`; this crate takes `issued_at` as a number and
@@ -39,6 +40,7 @@
 
 mod enroll;
 mod error;
+mod host;
 mod nodes;
 mod renew;
 mod rows;

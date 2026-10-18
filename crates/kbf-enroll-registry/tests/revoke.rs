@@ -150,7 +150,12 @@ fn a_revoke_denies_unexpired_serials_current_and_earlier_and_not_expired_ones() 
                 csrs: &csrs,
                 issued_at: now,
             },
-            &mut || Ok(issue(&[Daemon], seed, now)),
+            &mut || {
+                // Key continuity: the serial is new, the key is the enrolled one.
+                let mut certs = issue(&[Daemon], seed, now);
+                certs[0].spki_sha256 = issue(&[Daemon], 1, 1000)[0].spki_sha256;
+                Ok(certs)
+            },
         )
         .expect("renew");
     };

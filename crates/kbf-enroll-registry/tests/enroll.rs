@@ -436,6 +436,72 @@ fn an_advertised_address_belongs_to_one_node() {
     assert_eq!(list_nodes(&*env.store).expect("nodes").len(), 1);
 }
 
+// Catches an advertise host that is only "non-empty": `x@trusted.example.com` would pass a
+// suffix rule, a trailing dot or an over-long label is no name the CA signs for. Each is
+// refused before the signer runs; a upper-case host is stored lower-cased; addresses and
+// edge-sized names go through.
+#[test]
+fn an_advertise_host_must_be_a_dns_name_or_an_address() {
+    let env = fake();
+    let mut names = spec(&[Storage], 9);
+    names.names = vec![".trusted.example.com".to_owned()];
+    make_token(&env, 1, &names);
+    let long_label = "a".repeat(64);
+    let long_name = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(62)
+    );
+    assert_eq!(long_name.len(), 254);
+    for bad in [
+        "x@trusted.example.com".to_owned(),
+        "trusted.example.com.".to_owned(),
+        "a_b.trusted.example.com".to_owned(),
+        "-a.trusted.example.com".to_owned(),
+        "a-.trusted.example.com".to_owned(),
+        "a..trusted.example.com".to_owned(),
+        ".trusted.example.com".to_owned(),
+        format!("{long_label}.trusted.example.com"),
+        long_name,
+        "1.2.3.4.5".to_owned(),
+        "caf\u{e9}.trusted.example.com".to_owned(),
+    ] {
+        let mut r = Req::new(1, "n1", &[Storage]);
+        r.advertise = format!("{bad}:7000");
+        assert_eq!(
+            r.run(&*env.store, &mut never_signs()),
+            Err(R::MalformedRequest),
+            "{bad:?}"
+        );
+    }
+    nothing_landed(&env);
+    let mut upper = Req::new(1, "n1", &[Storage]);
+    upper.advertise = "A.Trusted.EXAMPLE.com:7000".to_owned();
+    upper.enroll(&env, 1).expect("upper case is folded");
+    assert_eq!(
+        list_nodes(&*env.store).expect("nodes")[0].advertise,
+        "a.trusted.example.com:7000"
+    );
+    let mut open = spec(&[Storage], 9);
+    open.names = Vec::new();
+    make_token(&env, 2, &open);
+    for (n, good) in [
+        "203.0.113.7",
+        "localhost",
+        format!("{}.example", "a".repeat(63)).as_str(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut r = Req::new(2, &format!("g{n}"), &[Storage]);
+        r.advertise = format!("{good}:7000");
+        r.csrs[0].1 = vec![n as u8];
+        r.enroll(&env, 10 + n as u8).expect(good);
+    }
+}
+
 // Catches a registry that lets a node id be enrolled twice, or a revoked id come back by
 // any path (revoked ids are burned, replace token or not).
 #[test]
@@ -888,4 +954,29 @@ fn a_key_registered_by_a_rival_during_the_commit_is_not_overwritten() {
     assert_eq!(nodes.len(), 1);
     assert_eq!(nodes[0].id, node("rival"));
     assert_eq!(token(&env, 1).uses, 0);
+}
+
+// Catches a revoked node keeping its advertise row: the id is burned on purpose, the
+// address is not, so another node can take it.
+#[test]
+fn a_revoked_nodes_address_can_be_taken_by_another_node() {
+    let env = fake();
+    make_token(&env, 1, &spec(&[Storage], 9));
+    Req::new(1, "n1", &[Storage])
+        .enroll(&env, 1)
+        .expect("enroll");
+    let mut taker = Req::new(1, "n2", &[Storage]);
+    taker.advertise = "n1.example:7000".to_owned();
+    assert_eq!(
+        taker.run(&*env.store, &mut never_signs()),
+        Err(R::AdvertiseInUse)
+    );
+    revoke_node(&*env.store, &node("n1"), "op").expect("revoke");
+    taker.enroll(&env, 2).expect("the address is free");
+    assert!(
+        env.store
+            .get("enroll/adv/n1.example:7000")
+            .expect("get")
+            .is_some()
+    );
 }

@@ -9,6 +9,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::ATTEMPTS;
 use crate::error::{Corrupt, RegistryError};
+use crate::host::{is_name_rule, is_node_prefix};
 use crate::rows::{self, TOKEN_PREFIX, TokenRow};
 
 /// The longest a token lives.
@@ -101,7 +102,8 @@ pub(crate) fn info(id: &TokenId, row: &TokenRow) -> Result<TokenInfo, Corrupt> {
 /// CSPRNG and keeps the secret to show once; the store keeps its hash.
 ///
 /// # Errors
-/// [`RegistryError::Invalid`] for a spec out of range or an id already in use; the store
+/// [`RegistryError::Invalid`] for a spec out of range (`names` that are no host names, a
+/// `node_prefix` no node id can start with included) or an id already in use; the store
 /// failing.
 pub fn create_token(
     store: &dyn Store,
@@ -111,6 +113,16 @@ pub fn create_token(
 ) -> Result<TokenInfo, RegistryError> {
     if !(1..=MAX_USES).contains(&spec.max_uses) {
         return Err(RegistryError::Invalid("max_uses must be 1 to 1000"));
+    }
+    if !spec.names.iter().all(|name| is_name_rule(name)) {
+        return Err(RegistryError::Invalid(
+            "names must be host names, addresses or .suffixes",
+        ));
+    }
+    if !spec.node_prefix.as_deref().is_none_or(is_node_prefix) {
+        return Err(RegistryError::Invalid(
+            "node_prefix must be 1 to 63 of a-z, 0-9 and -, not starting with -",
+        ));
     }
     let ttl = spec.ttl.unwrap_or(DEFAULT_TTL);
     if ttl < Duration::from_secs(1) || ttl > MAX_TTL {

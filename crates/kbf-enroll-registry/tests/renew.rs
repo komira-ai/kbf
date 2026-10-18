@@ -20,6 +20,16 @@ fn spki(seed: u8, role: Role) -> [u8; 32] {
     issue(&[role], seed, 1000)[0].spki_sha256
 }
 
+/// What a signer returns for a renewal: the serials of `serial_seed`, the keys the node
+/// enrolled with (`key_seed`), as key continuity requires.
+fn renewed(roles: &[Role], key_seed: u8, serial_seed: u8, now: u64) -> Vec<IssuedRole> {
+    let mut out = issue(roles, serial_seed, now);
+    for cert in &mut out {
+        cert.spki_sha256 = spki(key_seed, cert.role);
+    }
+    out
+}
+
 /// Renews node `name` (enrolled under `old_seed`) as `roles`, signing with `new_seed`.
 fn renew_at(
     env: &Env,
@@ -38,7 +48,7 @@ fn renew_at(
         roles,
         issued_at,
         tag,
-        &mut || Ok(issue(roles, new_seed, env.now())),
+        &mut || Ok(renewed(roles, old_seed, new_seed, env.now())),
     )
 }
 
@@ -169,18 +179,39 @@ fn a_renewal_records_new_serials_and_supersedes_the_old() {
     );
 }
 
-// Catches a renewal that adopts the key the signer returns instead of the one the registry
-// holds (key continuity): the node's key hashes must not change.
+// Catches a renewal that stores a certificate for a key other than the one the registry
+// holds (cert_der would disagree with spki_sha256), or adopts it: refused as WrongKey (the
+// P0 text is "request not signed by the node's key", the closest meaning for a key that
+// is not the node's), the node row and every other row unchanged.
 #[test]
-fn the_registry_keeps_its_key_whatever_the_signer_returns() {
+fn a_certificate_for_another_key_is_refused_and_writes_nothing() {
     let env = fake();
-    enrolled(&env, "n1", 1, &[Daemon]);
+    enrolled(&env, "n1", 1, &[Storage, Daemon]);
     env.advance(DAY);
-    let out = renew_at(&env, "n1", 1, &[Daemon], 2, env.now(), "a").expect("renew");
-    assert_eq!(out.certs[0].spki_sha256, spki(1, Daemon));
-    assert_eq!(out.certs[0].serial, serial_of(2, Daemon));
-    // A renewal for a role the signer did not return a certificate for keeps nothing odd.
-    assert_eq!(list_nodes(&*env.store).expect("nodes").len(), 1);
+    let before = env.store.scan_prefix("").expect("scan");
+    let both = [Storage, Daemon];
+    // Seed 2's keys, whole or for one of the two roles.
+    let mut one = renewed(&both, 1, 2, env.now());
+    one[1].spki_sha256 = spki(2, Daemon);
+    for issued in [issue(&both, 2, env.now()), one] {
+        assert_eq!(
+            renew_with(
+                &*env.store,
+                &env,
+                "n1",
+                1,
+                &both,
+                env.now(),
+                "a",
+                &mut || Ok(issued.clone())
+            ),
+            Err(R::WrongKey)
+        );
+    }
+    assert_eq!(env.store.scan_prefix("").expect("scan"), before);
+    let out = renew_at(&env, "n1", 1, &[Storage, Daemon], 2, env.now(), "a").expect("renew");
+    assert_eq!(out.certs[0].spki_sha256, spki(1, Storage));
+    assert_eq!(out.certs[0].serial, serial_of(2, Storage));
 }
 
 // Catches each renewal check being missing or reversed: unknown node, revoked node, roles
@@ -376,7 +407,7 @@ fn a_revoke_racing_a_renewal_wins() {
     let now = env.now();
     let out = renew_with(&wrap, &env, "n1", 1, &[Daemon], now, "a", &mut || {
         signed.fetch_add(1, Ordering::SeqCst);
-        Ok(issue(&[Daemon], 2, now))
+        Ok(renewed(&[Daemon], 1, 2, now))
     });
     assert_eq!(out, Err(R::NodeRevoked));
     assert_eq!(
@@ -416,7 +447,7 @@ fn trouble_in_the_store_is_unavailable_and_a_fenced_handle_is_not_the_signer() {
     enrolled(&env, "n1", 1, &[Daemon]);
     env.advance(DAY);
     let now = env.now();
-    let mut sign = || Ok(issue(&[Daemon], 2, now));
+    let mut sign = || Ok(renewed(&[Daemon], 1, 2, now));
     assert_eq!(
         renew_with(&stale, &env, "n1", 1, &[Daemon], now, "a", &mut sign),
         Err(R::NotSigner)

@@ -1,6 +1,5 @@
 //! The renew transaction (design section 5.8).
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use kbf_state::{Cond, Store, Txn};
@@ -11,7 +10,7 @@ use crate::ATTEMPTS;
 use crate::enroll::{Enrolled, IssuedRole, cert_row, check_issued, request_hash, stored_certs};
 use crate::error::Fail;
 use crate::nodes::{NodeState, state_of};
-use crate::rows::{self, CertRow, NodeRow, PriorRow, SerialRow};
+use crate::rows::{self, NodeRow, PriorRow, SerialRow};
 
 /// How far a request's `issued_at` may be from the store's clock.
 pub const ISSUED_AT_WINDOW: u64 = 5 * 60;
@@ -48,9 +47,9 @@ pub struct RenewRequest<'a> {
 /// the roles it holds with the key the registry holds for each, and be within the time
 /// rules; the new serials are recorded with the old ones' `superseded_at`, in one
 /// transaction that carries the node row's version, so a revocation that lands meanwhile
-/// makes it fail and the decision is made again (and refused). The registry keeps the key
-/// it holds whatever `sign` returns. `sign` is called, with no store access, only after
-/// every check.
+/// makes it fail and the decision is made again (and refused). A certificate `sign`
+/// returns for any key but the one held is refused as [`RefusalReason::WrongKey`]. `sign`
+/// is called, with no store access, only after every check.
 ///
 /// # Errors
 /// The [`RefusalReason`] the frontend sends, mapped as for [`crate::enroll_txn`].
@@ -111,17 +110,17 @@ fn attempt(
         let issued = sign()?;
         check_issued(roles, &issued)?;
 
-        let keys: BTreeMap<Role, [u8; 32]> = held.iter().map(|h| (h.role, h.spki_sha256)).collect();
+        // Key continuity: a certificate for any key but the one held is refused, so the row
+        // never holds a cert_der that disagrees with its spki_sha256.
+        let kept = issued.iter().all(|i| {
+            held.iter()
+                .any(|h| h.role == i.role && h.spki_sha256 == i.spki_sha256)
+        });
+        if !kept {
+            return Err(RefusalReason::WrongKey.into());
+        }
         let mut row = node.row.clone();
-        row.certs = issued
-            .iter()
-            .map(|i| CertRow {
-                // Key continuity: the registry's key, whatever the signer says. (The
-                // roles were checked equal, so every role has one.)
-                spki_sha256: keys.get(&i.role).map(|k| k.to_vec()).unwrap_or_default(),
-                ..cert_row(i)
-            })
-            .collect();
+        row.certs = issued.iter().map(cert_row).collect();
         let mut txn = Txn::new();
         for old in &held {
             txn = txn.put(

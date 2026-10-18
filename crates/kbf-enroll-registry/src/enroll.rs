@@ -1,6 +1,7 @@
 //! The enroll transaction (design sections 5.6 and 5.10).
 //!
-//! Order of decisions, once the request has the right shape: the secret is verified; a
+//! Order of decisions, once the request has the right shape: the token row is read and the
+//! secret verified (hashed whether or not the row exists); a
 //! request this token already served is answered from the stored node (no second use, no
 //! recheck of the token); then the token's policy (revoked, expired, used up, roles, node id,
 //! names), the node id and advertise host, and the keys; the signer is called; one
@@ -19,6 +20,7 @@ use subtle::{Choice, ConstantTimeEq as _};
 
 use crate::ATTEMPTS;
 use crate::error::Fail;
+use crate::host::is_host;
 use crate::nodes::{NodeState, deny_keys, state_of, with_deny_rows};
 use crate::rows::{self, CertRow, NodeRow, OwnerRow, Read, STATE_ACTIVE, SerialRow, TokenRow};
 use crate::tokens::secret_digest;
@@ -157,7 +159,8 @@ pub(crate) fn cert_row(i: &IssuedRole) -> CertRow {
     }
 }
 
-/// The `host:port` a storage node advertises, lower-cased, or `None` for a node with no
+/// The `host:port` a storage node advertises, lower-cased (the host is a DNS name or an
+/// IP address, as the CA's check takes it), or `None` for a node with no
 /// storage role. A storage node must name one; any other must not.
 fn advertise_of(roles: RoleSet, text: &str) -> Result<Option<String>, Fail> {
     if !roles.contains(Role::Storage) {
@@ -170,7 +173,7 @@ fn advertise_of(roles: RoleSet, text: &str) -> Result<Option<String>, Fail> {
     let text = text.to_ascii_lowercase();
     let well_formed = text
         .rsplit_once(':')
-        .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0));
+        .is_some_and(|(host, port)| is_host(host) && port.parse::<u16>().is_ok_and(|p| p > 0));
     if well_formed {
         Ok(Some(text))
     } else {
