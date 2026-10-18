@@ -1007,7 +1007,9 @@ restarts!(
     after_a_kill_running_leases_are_rebound_and_undelivered_ones_requeued,
     the_epoch_follows_the_policy_and_names_the_leases,
     a_bumped_epoch_requeues_the_old_term_leases_the_daemon_killed,
-    lost_leases_are_counted_across_a_restart_and_the_third_is_refused
+    lost_leases_are_counted_across_a_restart_and_the_third_is_refused,
+    a_crash_at_any_write_of_a_finish_leaves_the_operation_or_its_result,
+    a_crash_at_any_write_of_a_refusal_leaves_the_operation_or_its_refusal
 );
 
 /// A state store opened as a start opens it: from the flag, over `dir`.
@@ -1238,10 +1240,9 @@ fn standing(disk: &Disk) -> (usize, bool) {
 /// `op/` row is gone) nor finds the result. The store takes `writes` writes of the
 /// finishing report and then the process dies: whatever the cut, the store holds exactly
 /// one of the operation's unfinished rows and its result.
-#[tokio::test(start_paused = true)]
-async fn a_crash_at_any_write_of_a_finish_leaves_the_operation_or_its_result() {
+async fn a_crash_at_any_write_of_a_finish_leaves_the_operation_or_its_result(backing: Backing) {
     for writes in 0..4 {
-        let mut disk = Disk::new();
+        let mut disk = Disk::over(backing);
         let (farm, _ticket, lease) = running(&disk).await;
         disk.store.fail_after(writes);
         let _ = accepted(&farm, lease).await;
@@ -1259,10 +1260,9 @@ async fn a_crash_at_any_write_of_a_finish_leaves_the_operation_or_its_result() {
 /// Catches: the same two-transaction gap for a refusal (the operation's rows removed, then
 /// the `done/` row): whatever write the process dies at, the store holds the operation or
 /// its refusal.
-#[tokio::test(start_paused = true)]
-async fn a_crash_at_any_write_of_a_refusal_leaves_the_operation_or_its_refusal() {
+async fn a_crash_at_any_write_of_a_refusal_leaves_the_operation_or_its_refusal(backing: Backing) {
     for writes in 0..4 {
-        let mut disk = Disk::new();
+        let mut disk = Disk::over(backing);
         let (farm, _ticket, _lease) = running(&disk).await;
         for _ in 0..2 {
             let (_, mut inbox) = lose_lease(&farm).await;
@@ -1344,9 +1344,10 @@ async fn a_committed_result_the_store_refused_is_written_and_answered_when_it_re
         "the result's rows were never written again"
     );
     assert_eq!(disk.rows("done/"), 1);
-    assert!(
-        farm.ended(OperationId(0)).expect("read").is_some(),
-        "no result row for the operation"
+    assert_eq!(
+        farm.ended(OperationId(0)).expect("read"),
+        Some(Finished::Failed(status)),
+        "the row is not what the caller was sent"
     );
 }
 
@@ -1426,11 +1427,14 @@ async fn an_answer_the_store_applied_but_did_not_acknowledge_is_still_delivered(
     for _ in 0..3 {
         farm.tick().await;
     }
-    let Finished::Failed(status) = ended(&ticket) else {
-        panic!("the caller was not answered");
-    };
-    assert_eq!(status.message, "test");
+    let sent = ended(&ticket);
+    assert!(matches!(&sent, Finished::Failed(s) if s.message == "test"));
     assert_eq!(disk.rows("done/"), 1);
+    assert_eq!(
+        farm.ended(OperationId(0)).expect("read"),
+        Some(sent),
+        "the row is not what the caller was sent"
+    );
     assert_eq!(farm.dropped_writes(), 0);
 }
 
@@ -1571,6 +1575,28 @@ async fn a_stale_record_in_the_feed_does_not_drop_a_written_answers_detail() {
     assert_eq!(row, Finished::Failed(status), "the row is what was sent");
 }
 
+/// Catches: a finish written past the generation fence: the farm that a successor has
+/// fenced takes the worker's result, and its transaction (the operation's rows removed,
+/// the result put) must be refused as a whole. The store keeps the operation's lease and
+/// op rows and no result; the successor's recovery owns them.
+#[tokio::test(start_paused = true)]
+async fn a_fenced_farm_cannot_finish_an_operation() {
+    let disk = Disk::new();
+    let old = disk.generation_farm();
+    let (_, mut inbox) = register(&old);
+    submit(&old, request(1)).expect("submitted");
+    let [lease] = starts(&mut inbox)[..] else {
+        panic!("one lease expected");
+    };
+    let _successor = disk.generation_farm();
+    assert!(
+        !accepted(&old, lease).await,
+        "a fenced farm took the result"
+    );
+    assert_eq!(disk.rows("done/"), 0, "a result landed past the fence");
+    assert_eq!((disk.rows("lease/"), disk.rows("op/")), (1, 1));
+}
+
 /// Catches: a grant carried out ahead of an earlier held record (or released by an input
 /// that delivers no answers), and a held `Start` written after the scheduler gave its
 /// lease up (it would put the lease back in the store over the requeue): the grant waits
@@ -1683,10 +1709,11 @@ async fn a_held_answer_for_a_lease_the_farm_gave_up_is_written_and_delivered_onc
     }
     assert!(farm.heartbeat(&node(), stream, 1, Vec::new()).await);
     farm.tick().await;
-    let Finished::Failed(status) = ended(&ticket) else {
-        panic!("the caller was not answered");
-    };
-    assert_eq!(status.message, "test", "not the original report");
+    let sent = ended(&ticket);
+    assert!(
+        matches!(&sent, Finished::Failed(s) if s.message == "test"),
+        "not the original report"
+    );
     assert!(starts(&mut inbox).is_empty(), "the operation was run again");
     assert_eq!(farm.dropped_writes(), 0);
     assert_eq!(
@@ -1694,7 +1721,11 @@ async fn a_held_answer_for_a_lease_the_farm_gave_up_is_written_and_delivered_onc
         (0, 0, 0),
         "rows of a finished operation were left"
     );
-    assert_eq!(disk.rows("done/"), 1);
+    assert_eq!(
+        farm.ended(OperationId(0)).expect("read"),
+        Some(sent),
+        "the row is not what the caller was sent"
+    );
 }
 
 /// Catches: a failed read of the queue row, made while judging an answer whose lease row

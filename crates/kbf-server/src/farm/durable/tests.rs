@@ -24,6 +24,11 @@ use crate::action_usage::{ShapeKey, Target, TargetKind};
 struct Flaky {
     inner: Fake,
     down: AtomicBool,
+    /// Another writer rewrites a `lease/` row just after the farm reads it.
+    touch_lease: AtomicBool,
+    /// Applied just before the next read of an `op/` row: a write landing between two
+    /// reads of one look.
+    before_op_read: std::sync::Mutex<Option<Txn>>,
 }
 
 impl Flaky {
@@ -32,6 +37,8 @@ impl Flaky {
         Arc::new(Self {
             inner,
             down: AtomicBool::new(false),
+            touch_lease: AtomicBool::new(false),
+            before_op_read: std::sync::Mutex::new(None),
         })
     }
 
@@ -49,7 +56,20 @@ impl Store for Flaky {
     }
 
     fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {
-        self.inner.get(key)
+        if key.starts_with("op/") {
+            let landing = self.before_op_read.lock().expect("lock").take();
+            if let Some(txn) = landing {
+                let _ = self.inner.txn(txn)?;
+            }
+        }
+        let read = self.inner.get(key)?;
+        if key.starts_with("lease/") && self.touch_lease.load(Ordering::SeqCst) {
+            if let Some(row) = &read {
+                let same = Txn::new().put(key, row.value.clone(), Cond::Any);
+                let _ = self.inner.txn(same)?;
+            }
+        }
+        Ok(read)
     }
 
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
@@ -356,6 +376,55 @@ fn an_operation_ends_in_one_transaction_that_puts_its_result() {
     );
     assert_eq!(
         durable.progress(OperationId(4)).expect("progress"),
+        Progress::Ended(ended().finished)
+    );
+}
+
+/// Catches: a finish that does not compare-and-set on the lease row it read (a result
+/// accepted for a lease another writer has changed since): the write is refused and the
+/// operation keeps its rows and gets no result.
+#[test]
+fn a_finish_is_refused_when_the_lease_row_changed_under_it() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .submitted(OperationId(4), &request(1), &a_subject())
+        .expect("submit");
+    durable
+        .persist(&[Effect::Start(start(4, 0))], None)
+        .expect("grant");
+    store.touch_lease.store(true, Ordering::SeqCst);
+    let rows = keys(&store);
+    let refused = durable.persist(&[Effect::Answer(answer(4, 0))], Some(&ended()));
+    assert!(
+        matches!(refused, Err(StateError::Conflict(_))),
+        "{refused:?}"
+    );
+    assert_eq!(keys(&store), rows, "a changed lease was finished over");
+}
+
+/// Catches: a look that reads `done/` (nothing yet), then finds the operation's rows
+/// gone because the finish landed between the two reads, and calls the operation lost.
+/// The finish is one transaction, so the look reads `done/` again and finds the result.
+#[test]
+fn a_finish_landing_between_the_reads_of_a_look_is_not_gone() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    let operation = OperationId(4);
+    durable
+        .submitted(operation, &request(1), &a_subject())
+        .expect("submit");
+    durable
+        .persist(&[Effect::Start(start(4, 0))], None)
+        .expect("grant");
+    let finish = Ending::settle(
+        &ended(),
+        Txn::new().delete(lease_key(LeaseId::new(5, 0)), Cond::Any),
+        operation,
+    );
+    *store.before_op_read.lock().expect("lock") = Some(finish);
+    assert_eq!(
+        durable.progress(operation).expect("progress"),
         Progress::Ended(ended().finished)
     );
 }

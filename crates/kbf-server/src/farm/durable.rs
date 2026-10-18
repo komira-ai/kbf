@@ -548,7 +548,9 @@ impl Durable {
         Ok(found)
     }
 
-    /// Where `operation` stands.
+    /// Where `operation` stands. The reads are separate, so a finish may land between
+    /// them: `done/` is read again when the operation's rows are gone, and a finish (one
+    /// transaction) leaves its result by then.
     pub(super) fn progress(&self, operation: OperationId) -> Result<Progress, StateError> {
         if let Some(finished) = self.ended(operation)? {
             return Ok(Progress::Ended(finished));
@@ -556,7 +558,9 @@ impl Durable {
         let unfinished = self.store.get(&op_key(operation))?.is_some();
         let queued = self.store.get(&queue_key(operation))?.is_some();
         Ok(match (unfinished, queued) {
-            (false, _) => Progress::Gone,
+            (false, _) => self
+                .ended(operation)?
+                .map_or(Progress::Gone, Progress::Ended),
             (true, true) => Progress::Queued,
             (true, false) => Progress::Running,
         })
@@ -706,6 +710,9 @@ impl Durable {
     /// returns `Ok`. `ending` is how the operation an `Answer` or a `Refuse` finishes
     /// ended: its row is written with the operation's rows removed, in one transaction
     /// (an effect that ends an operation and has none is `Missing`, and writes nothing).
+    /// The farm passes one effect at a time (the held queue's front); `ending` is the
+    /// result of the one effect among `effects` that ends an operation, so a slice with
+    /// two endings is not a use of it.
     pub(super) fn persist(
         &self,
         effects: &[Effect],
@@ -908,8 +915,11 @@ impl State {
                     self.write_drops += held as u64;
                     tracing::error!(held, "a newer writer holds the store: held effects dropped");
                 }
-                self.unwritten.clear();
-                self.parked.clear();
+                // Only the held answers' details go: an answer already written and in
+                // `ready` is settled with its own after this returns.
+                for batch in std::mem::take(&mut self.unwritten) {
+                    self.forget_details(batch);
+                }
                 self.retrying = None;
                 return ready;
             }
@@ -947,9 +957,21 @@ impl State {
                     self.retrying = None;
                     self.write_drops += 1;
                     tracing::error!("a committed record's remaining effects were dropped");
-                    self.unwritten.pop_front();
-                    self.forget_parked();
+                    if let Some(batch) = self.unwritten.pop_front() {
+                        self.forget_details(batch);
+                    }
                 }
+            }
+        }
+    }
+
+    /// Forgets the details parked for the answers among `dropped` effects, which will
+    /// never be written. The details of answers the store has taken stay: they are
+    /// settled after this feed's writes, whatever a later record does.
+    fn forget_details(&mut self, dropped: VecDeque<Effect>) {
+        for effect in dropped {
+            if let Effect::Answer(answer) = effect {
+                self.parked.remove(&answer.lease);
             }
         }
     }
