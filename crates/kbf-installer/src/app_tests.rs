@@ -2,7 +2,12 @@ use clap::{CommandFactory, Parser};
 use serde_json::Value;
 
 use super::*;
-use crate::testkit::B;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::layout::Layout;
+use crate::state::{Locked, PendingConfirm, State};
+use crate::testkit::{A, B, c, host_root};
 
 fn parse(args: &[&str]) -> Cli {
     let mut full = vec!["kbf-installer"];
@@ -186,5 +191,114 @@ fn flags_are_required_and_checked_by_the_parser() {
 #[test]
 fn global_flags_may_follow_the_verb() {
     let cli = parse(&["setup", "--mode=all-in-one", "--apply", "--json"]);
-    assert!(cli.apply && cli.json);
+    assert_eq!((cli.apply, cli.json), (true, true));
+}
+
+/// A host root with release A current and its inbox in place, as the installer finds a host.
+fn seeded(name: &str) -> (Layout, PathBuf) {
+    let (layout, root) = host_root(&format!("app-{name}"));
+    fs::create_dir_all(root.join("var/lib/kbf-updater/inbox/orders")).expect("inbox");
+    let release = root.join("usr/local/kbf/releases").join(A);
+    fs::create_dir_all(&release).expect("release");
+    fs::write(release.join("kbf"), b"x").expect("binary");
+    Locked::acquire(&layout)
+        .expect("lock")
+        .write(&State {
+            current: Some(c(A)),
+            ..State::default()
+        })
+        .expect("state");
+    (layout, root)
+}
+
+fn on(root: &Path, args: &[&str]) -> (Exit, String) {
+    let mut full = vec!["--root", root.to_str().expect("text")];
+    full.extend_from_slice(args);
+    let (exit, _, err) = run_as(1000, &full);
+    (exit, err)
+}
+
+const RUN: [&str; 7] = [
+    "run",
+    "--passes",
+    "1",
+    "--interval-secs",
+    "0",
+    "--unit",
+    "kbf.service",
+];
+
+/// Catches `run` not doing a pass in this build of the crate (the real binary does; this is
+/// the same code run in the unit tests, so a change to it is seen by both): a pass on a host
+/// reports and exits 0 even as an ordinary user, with an inbox entry the stage refuses the
+/// pass still ends, an unreadable state stops it before any pass (exit 1), and a memory file
+/// it cannot read stops the loop with the file named.
+///
+/// Mutants planted: the pass count ignored (the test would hang); `recover` errors dropped
+/// (the ruined state is then not an exit 1); the cycle error dropped (helper.json is then not
+/// reported).
+#[test]
+fn run_does_its_passes_and_stops_on_a_state_it_cannot_read() {
+    let (_, root) = seeded("run");
+    let (exit, err) = on(&root, &RUN);
+    assert_eq!(exit, Exit::Ok, "{err}");
+    let status = fs::read(root.join("var/lib/kbf-updater/status.json")).expect("status.json");
+    let status: Value = serde_json::from_slice(&status).expect("json");
+    assert_eq!(status["state"], "refused", "not root: the pass says so");
+    fs::create_dir(root.join(format!("var/lib/kbf-updater/inbox/{:020}-{B}", 2))).expect("entry");
+    let (exit, err) = on(&root, &RUN);
+    assert_eq!(exit, Exit::Ok, "{err}");
+    fs::write(root.join("var/lib/kbf-deploy/helper.json"), b"not json").expect("ruin");
+    let (exit, err) = on(&root, &RUN);
+    assert_eq!(exit, Exit::Failed);
+    assert!(err.contains("helper.json"), "{err}");
+    fs::remove_file(root.join("var/lib/kbf-deploy/helper.json")).expect("remove");
+    fs::write(root.join("var/lib/kbf-deploy/state.json"), b"not json").expect("ruin");
+    let (exit, err) = on(&root, &RUN);
+    assert_eq!(exit, Exit::Failed);
+    assert!(err.starts_with("kbf-installer:"), "{err}");
+}
+
+/// Catches a boot check that does not count a start or that guesses on a state it cannot
+/// read: with a swap on trial the first start is counted (exit 0), the last start's revert
+/// needs root and so refuses an ordinary user (exit 1), a ruined state refuses (exit 1), and
+/// a relative root is refused for both verbs before anything is read.
+///
+/// Mutant planted: the decision printed but the error arm returning `Ok` (the refusals
+/// above are then exit 0).
+#[test]
+fn boot_check_counts_a_start_and_refuses_what_it_cannot_read() {
+    let (layout, root) = seeded("boot");
+    let release = root.join("usr/local/kbf/releases").join(B);
+    fs::create_dir_all(&release).expect("release");
+    fs::write(release.join("kbf"), b"x").expect("binary");
+    let lock = Locked::acquire(&layout).expect("lock");
+    lock.write(&State {
+        current: Some(c(B)),
+        previous: Some(c(A)),
+        pending_confirm: Some(PendingConfirm {
+            commit: c(B),
+            previous: Some(c(A)),
+            deadline: None,
+            order_id: Some("5".to_owned()),
+            starts_left: Some(1),
+        }),
+        ..State::default()
+    })
+    .expect("state");
+    drop(lock);
+    let (exit, err) = on(&root, &["boot-check", "--window-secs", "600"]);
+    assert_eq!(exit, Exit::Ok, "{err}");
+    let (exit, err) = on(&root, &["boot-check"]);
+    assert_eq!(exit, Exit::Failed);
+    assert!(err.contains("as root"), "{err}");
+    fs::write(root.join("var/lib/kbf-deploy/state.json"), b"not json").expect("ruin");
+    let (exit, err) = on(&root, &["boot-check"]);
+    assert_eq!(exit, Exit::Failed, "{err}");
+    for verb in [&RUN[..], &["boot-check"][..]] {
+        let mut full = vec!["--root", "relative"];
+        full.extend_from_slice(verb);
+        let (exit, _, _) = run_as(1000, &full);
+        assert_eq!(exit, Exit::Failed, "{verb:?}");
+    }
 }
