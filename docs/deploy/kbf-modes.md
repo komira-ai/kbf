@@ -45,6 +45,10 @@ It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/sy
 | `slice` | a unit not in `kbf.slice` |
 | `delegate` | a mode that runs builds without `cpu`, `cpuset`, `memory` and `pids` delegated, or with one of them in `DisableControllers=` (the unit's, or `kbf.slice`'s) |
 | `cpuset` | `AllowedCPUs=` or `AllowedMemoryNodes=` on a mode that runs builds, or on `kbf.slice`, narrower than the node's CPUs or NUMA nodes |
+| `caps` | a mode that runs builds (`daemon`, `storage-and-daemon`, `all-in-one`) with `MemoryMax=`, `MemoryHigh=`, `CPUQuota=` or `AllowedCPUs=` on its unit: builds are capped by the daemon's own `actions/memory.max`, and a limit on the unit caps the supervisor with them |
+| `swap` | a mode that runs builds with `MemorySwapMax=` on its unit: its leases live in the unit's cgroup and may swap |
+| `oom` | a mode that runs builds without an integer `OOMScoreAdjust=` below 0, the build containers' score (a host-wide OOM kill takes the highest score first) |
+| `meta-dir` | `storage-and-daemon` or `all-in-one` with `--meta-dir` equal to `--data-dir` or under it (compared after resolving `.` and `..`) |
 | `credential` | the cold store's key reaching a mode without a storage half (`daemon`, `all-in-one`); the `storage` unit, which holds it, run as root or as `KBF_USER` (the user builds run as), and on the node its key file readable by another user; in the `storage-and-daemon` unit, any way of giving the key but the one `EnvironmentFile=<KBF_ETC>/s3.env` (below), and on the node that file not a plain file of root's with mode 0600 |
 | `storage` | a `storage` or `storage-and-daemon` unit without `--cold-store`, `--meta-dir`, `--storage-listen` or one of the three certificate flags, or with an `s3://` cold store and no `EnvironmentFile=<KBF_ETC>/s3.env` (for `storage-and-daemon`, exactly that path: no `-`, quotes or wildcard) |
 | `state-store` | a `--state-store` that is not `sqlite:///<absolute path>`: a Postgres URI (`postgres://` or `postgresql://`; postgres is not wired yet), any other scheme, an empty or relative SQLite path, or a value that names a variable (below) |
@@ -428,7 +432,12 @@ before) and prints a one-line deprecation note as the last line on standard erro
 `kbf-deploy linux install-units --config node.conf --mode MODE [--bin-dir DIR]
 [--apply]` installs one mode's unit on the node, as root:
 
-1. It checks the host, read only: the unit's
+1. It checks the host, read only: the cgroup v2 memory controller is there
+   (`/sys/fs/cgroup/cgroup.controllers` lists `memory`); no listener of the unit
+   (`--listen`, `--worker-listen`, `--api-listen`, `--storage-listen`) is on a port
+   something else listens on (a running instance of the unit keeps its own ports); a mode
+   that runs builds on a host with no active swap prints a `WARN:` line (`linux swap`
+   makes the swapfile); the unit's
    `User=` exists and is not root; for a mode that runs builds, the kbf user has subuid
    and subgid ranges and lingers; `kbf` is an executable in `--bin-dir` (or
    `KBF_BIN_DIR`); the rendered unit passes `check-units --mode MODE --installable` on

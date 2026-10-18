@@ -865,8 +865,8 @@ fn host_verb(done: Result<(), HostError>, err: &mut dyn Write) -> ExitCode {
     }
 }
 
-/// The directory name `install-units --uninstall` moves the files into: seconds since
-/// the Unix epoch.
+/// The directory name `mdm install --uninstall` and `pilot server-install --uninstall`
+/// move the files into: seconds since the Unix epoch.
 pub(crate) fn stamp() -> String {
     stamp_secs().to_string()
 }

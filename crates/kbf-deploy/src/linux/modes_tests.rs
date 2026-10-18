@@ -1,6 +1,5 @@
 //! The mode units: each renders from the example settings into a unit that passes
-//! every rule and matches its golden, each planted defect turns its rule red, and the
-//! converged units `render-units` writes without `--mode` are unchanged.
+//! every rule and matches its golden, and each planted defect turns its rule red.
 
 use std::cell::RefCell;
 use std::os::unix::process::ExitStatusExt as _;
@@ -53,6 +52,42 @@ fn each_mode_renders_a_unit_that_passes_every_rule_and_matches_its_golden() {
             "{mode}: the render differs from tests/golden/linux/modes/{}:\n{text}",
             mode.unit_name()
         );
+    }
+}
+
+/// The images a unit that runs builds passes: one `--image=docker://<repo>@sha256:<digest>`
+/// per `KBF_IMAGES` entry, in order (kbf's `--image` parser takes that form only, and
+/// exits 2 at start on a bare one), none in a mode that runs no builds. Catches the
+/// `docker://` prefix dropped or doubled in the rendering, an entry lost or reordered,
+/// and an image flag in a unit of a mode that has no containers.
+#[test]
+fn a_build_units_images_are_passed_in_the_docker_form() {
+    let first = format!("gcr.io/distroless/base-debian12@sha256:{}", "a".repeat(64));
+    let second = format!("registry.example/kbf/ci@sha256:{}", "b".repeat(64));
+    let text = EXAMPLE.replacen(
+        "KBF_IMAGES=\n",
+        &format!("KBF_IMAGES={first} {second}\n"),
+        1,
+    );
+    assert_ne!(text, EXAMPLE, "the example has a KBF_IMAGES= line to set");
+    let c = LinuxConfig::parse(&text).expect("valid settings");
+    let want = [format!("docker://{first}"), format!("docker://{second}")];
+    for mode in Mode::ALL {
+        let rendered = render(&c, Some(1500), mode).expect("renders");
+        let unit = UnitFile::parse(&rendered).expect("a unit");
+        let got: Vec<&str> = unit.flag_values("image");
+        if mode.runs_builds() {
+            assert_eq!(got, want, "{mode}");
+            assert!(
+                rendered.contains(&format!(
+                    "    --image={} \\\n    --image={} \\\n",
+                    want[0], want[1]
+                )),
+                "{mode}: {rendered}"
+            );
+        } else {
+            assert_eq!(got, Vec::<&str>::new(), "{mode}");
+        }
     }
 }
 
@@ -334,8 +369,7 @@ fn each_planted_defect_turns_its_rule_red() {
 }
 
 /// Catches `--mode` rendering into another directory than `--out`, writing other files
-/// than the slice and the mode's unit (the converged units would be installed beside
-/// it), check reading another file than render wrote, and a garbled or missing unit
+/// than the slice and the mode's unit, check reading another file than render wrote, and a garbled or missing unit
 /// checked as if it were empty.
 #[test]
 fn the_mode_verbs_write_the_slice_and_one_unit_and_read_it_back() {
@@ -800,8 +834,10 @@ fn a_build_modes_unit_and_slice_keep_every_cpu_of_the_node() {
         "[Service]\nAllowedCPUs=0-3\n",
     );
     let r = check_on_host(&exec, &c, Mode::Daemon, &narrow, &slice(&c), true, None).expect("runs");
-    assert_eq!(r.failures.len(), 1, "{:?}", lines(&r));
-    assert_eq!(r.failures[0].rule, "cpuset");
+    // `caps` refuses any AllowedCPUs= without reading the node; `cpuset` is the one that
+    // reads it (a list of every CPU is no cap, and only this rule can tell).
+    let rules: Vec<&str> = r.failures.iter().map(|f| f.rule).collect();
+    assert_eq!(rules, ["caps", "cpuset"], "{:?}", lines(&r));
     let wide_slice =
         slice(&c).with_drop_in("kbf.slice.d/n.conf", "[Slice]\nAllowedMemoryNodes=1\n");
     let unit = UnitText::new(Mode::Daemon.unit_name(), daemon.as_str());
@@ -885,7 +921,7 @@ fn rule_stop_reads_the_drop_ins() {
     assert_eq!(fails(&restored), Vec::<String>::new());
 }
 
-/// Catches a storage unit rendered with the converged units' loopback MinIO when the
+/// Catches a storage unit rendered with the loopback MinIO when the
 /// settings name no `MINIO_S3_ENDPOINT` (a storage node's bucket is elsewhere), and the
 /// refusal applied to a mode whose unit has no S3 cold store.
 #[test]

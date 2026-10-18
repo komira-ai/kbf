@@ -111,6 +111,46 @@ pub(super) fn storage(unit: &UnitFile, key: &std::path::Path, exact: bool) -> Ve
     out
 }
 
+/// Rule `meta-dir`: the unit's `--meta-dir` is not `--data-dir` or under it. The metadata
+/// log is the index of what the store holds (lose it and the blobs are unreachable),
+/// and `--data-dir` is the daemon's, which holds the builds' leases and cache. Paths are compared
+/// lexically after resolving `.` and `..`; a unit that gives either flag relative is
+/// left to rule `storage`'s and the parser's own refusals.
+pub(super) fn meta_dir(unit: &UnitFile) -> Vec<String> {
+    let words = exec_words(unit);
+    let (Some(meta), Some(data)) = (flag(&words, "meta-dir"), flag(&words, "data-dir")) else {
+        return Vec::new();
+    };
+    if !meta.starts_with('/') || !data.starts_with('/') {
+        return Vec::new();
+    }
+    if normal(meta).starts_with(normal(data)) {
+        vec![format!(
+            "has --meta-dir={meta} under --data-dir={data}: --data-dir is the \
+             daemon's, and the metadata log, the index of what the store holds, is not \
+             kept there"
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+/// `path` with `.` and `..` resolved lexically.
+fn normal(path: &str) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for c in std::path::Path::new(path).components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// The variable a `--state-store` value names: `${VAR}` or `$VAR` anywhere in it.
 fn variable(value: &str) -> Option<&str> {
     let after = &value[value.find('$')? + 1..];

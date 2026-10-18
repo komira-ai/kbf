@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::rc::Rc;
 
 use super::*;
-use crate::linux::host::SYSTEMCTL;
+use crate::linux::host::{SS, SWAPON, SYSTEMCTL};
 use kbf_host::plan::{Mode as PlanMode, execute};
 use kbf_host::step::Step;
 use kbf_host::testkit::{ScratchHost, reply};
@@ -32,6 +32,10 @@ struct World {
     active: BTreeSet<String>,
     /// What `kbf check-args` exits with.
     check_args: i32,
+    /// Whether `swapon --show` lists a swap area.
+    swap: bool,
+    /// What `ss -Hltn` prints.
+    listening: String,
 }
 
 fn install(mode: Mode, bin_dir: Option<&str>) -> InstallMode {
@@ -63,6 +67,8 @@ fn host(name: &str) -> (ScratchHost, Rc<RefCell<World>>) {
         enabled: BTreeSet::new(),
         active: BTreeSet::new(),
         check_args: 0,
+        swap: true,
+        listening: "LISTEN 0 4096 0.0.0.0:22 0.0.0.0:*\n".to_owned(),
     }));
     let w = Rc::clone(&world);
     exec.answer = Box::new(move |cmd| {
@@ -92,10 +98,18 @@ fn host(name: &str) -> (ScratchHost, Rc<RefCell<World>>) {
                 w.active.insert((*u).to_owned());
                 reply(0, "", "")
             }
+            (SWAPON, _) => reply(0, if w.swap { "/swapfile\n" } else { "" }, ""),
+            (SS, _) => reply(0, &w.listening, ""),
             (_, ["check-args", ..]) => reply(w.check_args, "", ""),
             _ => reply(0, "", ""),
         })
     });
+    write(
+        &exec,
+        "/sys/fs/cgroup/cgroup.controllers",
+        "cpuset cpu io memory pids\n",
+        0o444,
+    );
     write(&exec, "/etc/subuid", "kbf:100000:65536\n", 0o644);
     write(&exec, "/etc/subgid", "kbf:100000:65536\n", 0o644);
     write(&exec, "/var/lib/systemd/linger/kbf", "", 0o644);
@@ -413,6 +427,137 @@ fn an_install_is_refused_before_any_step() {
             .starts_with("MINIO_S3_ENDPOINT must be set for --mode storage"),
         "{e}"
     );
+}
+
+/// The preflights the converged installer made and the per-mode one keeps, in every mode:
+/// the cgroup v2 memory controller (a host without the file, or with a list that lacks
+/// `memory`, is refused; a name that only contains the word does not count), and each
+/// listener flag of the unit on a port something already listens on (the port is read
+/// from the rendered unit's flag, so a flag the check skips turns its row red). Catches
+/// an install onto a host whose units cannot get their memory settings, and one whose
+/// service cannot bind.
+#[test]
+fn a_missing_memory_controller_or_a_held_port_is_refused() {
+    for mode in Mode::ALL {
+        for (name, controllers) in [("missing", None), ("lacks", Some("cpuset cpu io pids\n"))] {
+            let (exec, _) = host(&format!("install-mode-nomem-{name}-{mode}"));
+            match controllers {
+                None => fs::remove_file(exec.at("/sys/fs/cgroup/cgroup.controllers")).expect("rm"),
+                Some(t) => write(&exec, "/sys/fs/cgroup/cgroup.controllers", t, 0o444),
+            }
+            let e = plan_here(&exec, &install(mode, None))
+                .map(|_| ())
+                .expect_err(name);
+            assert!(
+                matches!(e, HostError::NoMemoryController),
+                "{mode} {name}: {e}"
+            );
+        }
+        let (exec, _) = host(&format!("install-mode-membad-{mode}"));
+        write(
+            &exec,
+            "/sys/fs/cgroup/cgroup.controllers",
+            "cpu memory_recursiveprot\n",
+            0o444,
+        );
+        let e = plan_here(&exec, &install(mode, None))
+            .map(|_| ())
+            .expect_err("word");
+        assert!(matches!(e, HostError::NoMemoryController), "{mode}: {e}");
+
+        let a = install(mode, None);
+        let text = modes::render(&a.config, Some(1500), mode).expect("renders");
+        let rendered = UnitFile::parse(&text).expect("unit");
+        let mut ports = Vec::new();
+        for flag in LISTEN_FLAGS {
+            if let Some(port) = rendered
+                .flag(flag)
+                .and_then(|v| v.rsplit_once(':'))
+                .and_then(|(_, p)| p.parse::<u16>().ok())
+            {
+                ports.push((flag, port));
+            }
+        }
+        // The key of storage-and-daemon must be root's, which a scratch host run as a
+        // user cannot hold: its plan stops at rule `credential` before the ports.
+        if mode == Mode::StorageAndDaemon {
+            continue;
+        }
+        assert_eq!(ports.is_empty(), mode == Mode::Daemon, "{mode} listeners");
+        for (flag, port) in ports {
+            let (exec, world) = host(&format!("install-mode-port-{mode}-{flag}"));
+            world
+                .borrow_mut()
+                .listening
+                .push_str(&format!("LISTEN 0 4096 192.0.2.10:{port} 0.0.0.0:*\n"));
+            let e = plan_here(&exec, &a).map(|_| ()).expect_err("held");
+            assert!(
+                matches!(e, HostError::PortInUse(p) if p == port),
+                "{mode} --{flag}: {e}"
+            );
+        }
+        // A port that only ends in the same digits is not held.
+        let (exec, world) = host(&format!("install-mode-port-near-{mode}"));
+        world
+            .borrow_mut()
+            .listening
+            .push_str("LISTEN 0 4096 192.0.2.10:18982 0.0.0.0:*\n");
+        plan_here(&exec, &a).expect("another port");
+    }
+}
+
+/// A unit of the mode that is running keeps its ports (a re-install must not refuse
+/// itself, and `ss` is not asked), and a mode that runs builds on a host with no active
+/// swap prints the warning while the modes that cannot swap stay quiet. Catches a
+/// re-install refused by its own listeners, and the warning printed for the wrong modes
+/// or not at all.
+#[test]
+fn a_running_unit_keeps_its_ports_and_no_swap_warns_the_build_modes() {
+    // (Not storage-and-daemon: its plan stops at rule `credential` on a scratch host, whose
+    // key is not root's.)
+    for mode in Mode::ALL
+        .into_iter()
+        .filter(|m| *m != Mode::StorageAndDaemon)
+    {
+        let (exec, world) = host(&format!("install-mode-running-{mode}"));
+        world.borrow_mut().swap = false;
+        let a = install(mode, None);
+        let text = modes::render(&a.config, Some(1500), mode).expect("renders");
+        let rendered = UnitFile::parse(&text).expect("unit");
+        for flag in LISTEN_FLAGS {
+            if let Some(v) = rendered.flag(flag) {
+                let port = v.rsplit_once(':').expect("host:port").1;
+                world
+                    .borrow_mut()
+                    .listening
+                    .push_str(&format!("LISTEN 0 4096 192.0.2.10:{port} 0.0.0.0:*\n"));
+            }
+        }
+        world
+            .borrow_mut()
+            .active
+            .insert(mode.instances()[0].clone());
+        let (_, out) = plan_here(&exec, &a).expect("its ports are its own");
+        assert!(
+            exec.queries
+                .borrow()
+                .iter()
+                .all(|q| q.program.as_str() != SS),
+            "{mode}: ss was asked"
+        );
+        let warned = out.contains("WARN: no swap is active");
+        assert_eq!(warned, mode.runs_builds(), "{mode}: {out}");
+        assert!(
+            out.contains(&format!(
+                "{} is running: its ports are its own\n",
+                mode.instances()[0]
+            )),
+            "{out}"
+        );
+    }
+    let (exec, _) = host("install-mode-swap-on");
+    let (_, out) = plan_here(&exec, &install(Mode::Daemon, None)).expect("plan");
+    assert!(!out.contains("WARN"), "{out}");
 }
 
 /// The files a unit reads, read as systemd reads them: an `EnvironmentFile=` with a

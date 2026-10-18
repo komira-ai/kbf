@@ -231,6 +231,19 @@ fn no_env(_: &str) -> Option<OsString> {
     None
 }
 
+/// A host with the cgroup v2 memory controller, which `install-units` reads first.
+fn with_memory_controller(mut exec: FakeExec) -> FakeExec {
+    exec.entries.insert(
+        HostPath::new("/sys/fs/cgroup/cgroup.controllers").expect("absolute"),
+        kbf_host::exec::Entry::File {
+            perms: kbf_host::step::Perms::new(0o444),
+            owner: kbf_host::step::Owner { uid: 0, gid: 0 },
+            bytes: b"cpuset cpu io memory pids\n".to_vec(),
+        },
+    );
+    exec
+}
+
 /// Catches a host-changing `linux` verb whose refusal does not exit 2 with a
 /// `REFUSED:` line, whose failed step does not exit 1, or whose dry run does not exit
 /// 0; and flags that conflict (a rollback with an install's flags) being taken.
@@ -253,7 +266,7 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
         ),
     ];
     for (args, want) in refused {
-        let mut exec = FakeExec::new(501);
+        let mut exec = with_memory_controller(FakeExec::new(501));
         let (code, _, err) = cli(&mut exec, &no_env, &args);
         assert_eq!(code, ExitCode::from(2), "{args:?}");
         assert!(
@@ -272,7 +285,7 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
 
     // A mode's unit reaches its own install: on a host with no such user it asks for the
     // user the frontend runs as and is refused before any step.
-    let mut exec = FakeExec::new(0);
+    let mut exec = with_memory_controller(FakeExec::new(0));
     let args = [base("install-units"), vec!["--mode", "frontend"]].concat();
     let (code, _, err) = cli(&mut exec, &no_env, &args);
     assert_eq!(code, ExitCode::from(2));
@@ -287,6 +300,21 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
         let (code, _, _) = cli(&mut exec, &no_env, &args);
         assert_eq!(code, ExitCode::from(2), "{args:?}");
         assert!(exec.queries.borrow().is_empty(), "{args:?} asked the host");
+    }
+    // install-units without --mode is a usage error like render-units and check-units:
+    // clap's exit 2 naming the flag, and nothing asked of the host or written, with or
+    // without --apply (a default mode would install a unit nobody asked for).
+    for apply in [false, true] {
+        let mut exec = FakeExec::new(0);
+        let mut args = base("install-units");
+        if apply {
+            args.push("--apply");
+        }
+        let (code, _, err) = cli(&mut exec, &no_env, &args);
+        assert_eq!(code, ExitCode::from(2), "{args:?}: {err}");
+        assert!(err.contains("--mode"), "{args:?}: {err}");
+        assert!(exec.queries.borrow().is_empty(), "{args:?} asked the host");
+        assert!(exec.log.is_empty(), "{args:?} changed the host");
     }
     // verify-cert reaches its kit: a CA that is not there is refused; a daemon's row
     // needs its node id.

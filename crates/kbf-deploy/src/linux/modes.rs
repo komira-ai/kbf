@@ -32,6 +32,12 @@
 //!   (`yes` sets the whole set, `no` clears it), a list adds its controllers to what
 //!   earlier lines gave (so `Delegate=yes` then `Delegate=memory` still delegates all),
 //!   an empty value starts over with none.
+//! - `caps`, `swap`, `oom`: a mode that runs builds sets no `MemoryMax=`, `MemoryHigh=`,
+//!   `CPUQuota=` or `AllowedCPUs=` and no `MemorySwapMax=` on its unit (its leases live in
+//!   the unit's cgroup), and an `OOMScoreAdjust=` below 0, the containers' score
+//!   ([`super::limits`]).
+//! - `meta-dir`: the metadata directory of `storage-and-daemon` and `all-in-one` is not
+//!   under `--data-dir` ([`super::stores`]).
 //! - `credential`: the units of a mode without a storage half (`daemon`, `all-in-one`)
 //!   do not give it the cold store's key; [`super::credential`] says what the rule reads
 //!   and what it cannot see. The unit that holds the key (`storage`) runs as a user of
@@ -96,7 +102,7 @@ use kbf_host::step::Cmd;
 
 use super::config::{LinuxConfig, LinuxError};
 use super::shared::{Failure, Report, SLICE, angle_placeholder, values};
-use super::{cpuset, credential, handover, restart, runtime, stop, stores, traverse};
+use super::{cpuset, credential, handover, limits, restart, runtime, stop, stores, traverse};
 use crate::template::{self, TemplateError, leftovers};
 use crate::unit::{UnitError, UnitFile, comments_in_continuations};
 
@@ -196,6 +202,13 @@ impl Mode {
     #[must_use]
     pub fn holds_key(self) -> bool {
         self == Mode::Storage
+    }
+
+    /// Whether the mode's unit gives both a metadata directory and the daemon's data
+    /// directory (rule `meta-dir`).
+    #[must_use]
+    pub fn has_meta_and_data(self) -> bool {
+        matches!(self, Mode::StorageAndDaemon | Mode::AllInOne)
     }
 
     /// The unit's file name: `kbf-<mode>.service`, and for the frontend the template
@@ -708,6 +721,13 @@ fn rules(
         );
     }
 
+    // caps, swap, oom
+    if mode.runs_builds() {
+        for (rule, how) in limits::check(unit) {
+            fail(rule, format!("{name} {how}"));
+        }
+    }
+
     // credential
     if mode.holds_no_key() || mode.holds_key_beside_builds() {
         let allowed = mode.holds_key_beside_builds();
@@ -724,6 +744,13 @@ fn rules(
         let exact = mode.holds_key_beside_builds();
         for how in stores::storage(unit, &key_file(config), exact) {
             fail("storage", format!("{name} {how}"));
+        }
+    }
+
+    // meta-dir
+    if mode.has_meta_and_data() {
+        for how in stores::meta_dir(unit) {
+            fail("meta-dir", format!("{name} {how}"));
         }
     }
 
