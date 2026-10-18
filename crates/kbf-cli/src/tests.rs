@@ -268,6 +268,8 @@ fn all_in_one_takes_exactly_what_kbf_all_in_one_takes() {
     for flag in refused_by(mode.name) {
         assert!(new.remove(*flag), "{flag}");
     }
+    // And the two flags every mode takes besides (`--config`, `--check`).
+    assert!(new.remove(CONFIG) && new.remove(CHECK));
     assert_eq!(longs(&kbf_all_in_one::cli::command()), new);
 }
 

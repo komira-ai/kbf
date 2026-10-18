@@ -47,6 +47,8 @@ rustix = { workspace = true, features = ["process"] }
 kbf-state.workspace = true
 # The identity `kbf --version --json` prints (src/version.rs).
 serde_json.workspace = true
+# The settings file (src/config.rs).
+toml.workspace = true
 
 [dev-dependencies]
 # The REAPI conformance suite, run against a `kbf storage` process (tests/storage_process.rs):

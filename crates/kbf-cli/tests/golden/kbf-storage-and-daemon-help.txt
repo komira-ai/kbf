@@ -269,6 +269,12 @@ Options:
       --pool-first-uid <POOL_FIRST_UID>
           The uid of `kbf-pool-0`, and the group id of all the pool users (`pool_first_uid` in kbf-mac-provision's profile); at least 600
 
+      --config <FILE>
+          Read the mode's settings from this TOML file (default /etc/kbf/kbf.toml when it exists); a flag on the command line overrides its key
+
+      --check
+          Parse the flags and the file, run the startup checks, print each problem and exit (0 fine, 2 refused, 75 not ready) without starting
+
   -h, --help
           Print help (see a summary with '-h')
 

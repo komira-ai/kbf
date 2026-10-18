@@ -141,6 +141,8 @@ thiserror = "2.0.21"
 # x509-parser.
 time = { version = "0.3.55", default-features = false, features = ["formatting", "macros", "parsing", "std"] }
 tokio = "1.53.2"
+# The settings file of `kbf <mode>` (kbf-cli): TOML parsed to a table, no writer.
+toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
 tonic = "0.14.6"
 tonic-prost = "0.14.6"

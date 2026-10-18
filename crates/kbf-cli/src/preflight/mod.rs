@@ -222,3 +222,21 @@ pub fn refusal(invocation: &Invocation) -> Option<ExitCode> {
     eprint!("{}", report.render(needs.mode));
     report.exit_status().map(ExitCode::from)
 }
+
+/// `kbf <mode> --check`: the checks of a start, printed, and nothing started. Standard
+/// output says `ok` when nothing stops the start (warnings and problems go to standard
+/// error, as a start prints them); the exit status is the one a start would exit with:
+/// 0, [`REFUSED`] or [`NOT_READY`].
+#[must_use]
+pub fn check_only(invocation: &Invocation) -> ExitCode {
+    let needs = needs(invocation);
+    let report = check(&needs, &System);
+    eprint!("{}", report.render(needs.mode));
+    match report.exit_status() {
+        Some(code) => ExitCode::from(code),
+        None => {
+            println!("kbf {}: ok", needs.mode);
+            ExitCode::SUCCESS
+        }
+    }
+}
