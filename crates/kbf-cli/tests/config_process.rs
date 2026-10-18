@@ -16,6 +16,8 @@ use rcgen::{
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf");
+/// The stand-in `crun` the container driver's check runs `--version` on.
+const FAKE_CRUN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-crun");
 
 fn scratch(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("config-process-{name}"));
@@ -167,13 +169,11 @@ impl Pki {
     }
 }
 
-/// The environment of a host with what the container driver looks for: a `podman` on
-/// `PATH` and a private runtime directory (the stand-in is an empty file: `--check`
-/// starts nothing).
+/// The environment of a host with what the container driver looks for: a private
+/// runtime directory (`--oci-runtime` names the stand-in `crun`, in `settings`).
 fn host_env(dir: &Path) -> Vec<(String, String)> {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).expect("bin");
-    write(&bin.join("podman"), "", 0o755);
     let xdg = dir.join("xdg");
     std::fs::create_dir_all(&xdg).expect("xdg");
     std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o700)).expect("mode");
@@ -210,6 +210,7 @@ fn settings(mode: &str, dir: &Path, pki: &Pki, host: Host) -> Settings {
         };
         s.extend([
             ("driver", "container".to_owned()),
+            ("oci-runtime", FAKE_CRUN.to_owned()),
             ("server", "https://127.0.0.1:1".to_owned()),
             ("ca-cert", ca),
             ("cert", p("node.pem")),

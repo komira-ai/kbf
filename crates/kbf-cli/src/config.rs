@@ -58,6 +58,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "http2-keepalive-timeout-secs",
             "listen",
             "reapi-max-streams",
+            "releases-dir",
             "shutdown-timeout-secs",
             "storage-listen",
             "tls-reload-interval-secs",
@@ -188,6 +189,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "reserve-cpus",
             "reserve-share",
             "role",
+            "update-dir",
         ],
     ),
     (
@@ -199,7 +201,6 @@ const GROUPS: &[(&str, &[&str])] = &[
             "container-nofile",
             "container-nproc",
             "container-pids-limit",
-            "container-runtime",
             "container-shm-mib",
             "id-files",
             "lease-placement",
