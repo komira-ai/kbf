@@ -1332,12 +1332,12 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
                 crate::managed::Managed::start(flags, crate::managed::StoreSource::Flags, first)
                     .await?;
             println!("{}", managed.start_line());
-            return managed
+            managed
                 .escalating(second)
                 .notifying(std::env::var_os("NOTIFY_SOCKET"))
                 .serve()
-                .await
-                .map_err(|error| -> Box<dyn Error> { error });
+                .await?;
+            return Ok(());
         }
         let mut frontend = start_or_take_over(flags, move || Ok(first)).await?;
         frontend.escalation = Some(second);

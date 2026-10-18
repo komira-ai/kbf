@@ -947,3 +947,33 @@ async fn a_managed_process_opens_the_store_its_flags_name() {
     assert_eq!(cold.stopped().await, Ok(()));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Catches: a candidate that needs an operator API (a REAPI-only deployment would not
+/// start), a start from the flags with no state store that panics or starts over nothing
+/// (it is refused naming the flag).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_candidate_serves_without_an_operator_api_and_the_flags_need_a_store() {
+    let node = Node::start().await;
+    let mut flags = managed_flags(&node, &["--await-takeover"]);
+    flags.server.api_listen = None;
+    let managed = Managed::start(
+        &flags,
+        StoreSource::Shared(shared()),
+        std::future::pending::<()>(),
+    )
+    .await
+    .expect("starts with no operator API");
+    let view = managed.view();
+    assert!(view.api.is_none());
+    capabilities(view.reapi.expect("a REAPI listener"))
+        .await
+        .expect("GetCapabilities");
+
+    let mut none = managed_flags(&node, &["--await-takeover"]);
+    none.server.state_store = None;
+    let error = Managed::start(&none, StoreSource::Flags, std::future::pending::<()>())
+        .await
+        .err()
+        .expect("no store to open");
+    assert!(error.to_string().contains("--state-store"), "{error}");
+}
