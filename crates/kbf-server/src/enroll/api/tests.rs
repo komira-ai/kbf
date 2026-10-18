@@ -89,7 +89,14 @@ fn state_with(token: Option<ApiToken>, api: Option<EnrollApi>) -> Arc<EnrollStat
 }
 
 fn state_over(store: Arc<dyn Store>) -> Arc<EnrollState> {
-    let api = api(store, Arc::new(Counting(AtomicU8::new(0))), Ok(ca_pin()));
+    state_over_from(store, 0)
+}
+
+/// As `state_over`, with the random source's counter starting at `start`: two frontends
+/// over one store must not draw the same token id, which the registry refuses as a
+/// duplicate before the fence is reached.
+fn state_over_from(store: Arc<dyn Store>, start: u8) -> Arc<EnrollState> {
+    let api = api(store, Arc::new(Counting(AtomicU8::new(start))), Ok(ca_pin()));
     state_with(Some(ApiToken::for_tests(BEARER)), Some(api))
 }
 
@@ -514,14 +521,16 @@ async fn a_node_revoke_writes_deny_rows_and_burns_the_id() {
 // Catches a write that does not go through the fenced handle (a demoted or stale frontend
 // signing a token the new signer does not know about) or that answers the fence as a 500
 // or as success: a stale handle's create, DELETE and revoke land nothing and answer 409;
-// the current handle's calls, the control, succeed; reads are not fenced.
+// the current handle's calls, the control, succeed; reads are not fenced. The two
+// frontends draw from different random streams (see `state_over_from`): with the same
+// stream the stale create would collide with the current one's token id and answer 400.
 #[tokio::test]
 async fn a_stale_frontend_cannot_write() {
     let inner = fake();
     let as_store = || -> Arc<dyn Store> { inner.clone() };
     let stale: Arc<dyn Store> = Arc::new(Fenced::take(as_store(), None).expect("first"));
     let newer: Arc<dyn Store> = Arc::new(Fenced::take(as_store(), None).expect("second"));
-    let (old_state, new_state) = (state_over(stale), state_over(newer.clone()));
+    let (old_state, new_state) = (state_over_from(stale, 100), state_over(newer.clone()));
 
     let created = make(&new_state, r#"{"roles":["daemon"]}"#).await;
     enroll(&*newer, &created, "n1").expect("enroll through the current writer");
