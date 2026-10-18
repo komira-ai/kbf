@@ -45,7 +45,7 @@ Options:
           A stable name for this node, unique within the cell
 
       --state-store <URI>
-          Where the scheduler keeps its state, written before each change is acknowledged and replayed at start: `sqlite:///absolute/path`, a file on a local disk that this process owns (created, with its directory, if missing; the file is 0600 and a directory it makes 0700; every start is a new epoch, so the daemon kills the runs of the leases it held before). Left out, it is `<data-dir>/state.db`. Any other value, `postgres://` included, is refused (Postgres is not wired yet)
+          Where the scheduler keeps its state, written before each change is acknowledged and replayed at start: `postgres:///kbf?host=/run/postgresql`, the database `kbf` on a local Unix socket, reached as this process's own user (peer authentication; a URL with a password is refused, and the server must flush commits before it acknowledges them, `synchronous_commit` on, or the start is refused), or `sqlite:///absolute/path`, a file on a local disk that this process owns (created, with its directory, if missing; the file is 0600 and a directory it makes 0700). Every start is a new epoch, so the daemon kills the runs of the leases it held before. Left out, it is `postgres:///kbf?host=/run/postgresql`
 
       --reconnect-ms <RECONNECT_MS>
           The wait, in milliseconds, after a session ends and after the first round of connection attempts that all failed. It doubles with each further failed round

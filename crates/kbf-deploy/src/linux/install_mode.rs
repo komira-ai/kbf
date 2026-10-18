@@ -276,7 +276,12 @@ fn directories(unit: &UnitFile) -> Result<Vec<(HostPath, u32)>, HostError> {
     {
         let file = HostPath::new(file)?;
         let dir = file.as_str().rsplit_once('/').map_or("", |(dir, _)| dir);
-        dirs.push((HostPath::new(dir)?, 0o700));
+        let dir = HostPath::new(dir)?;
+        // The all-in-one unit keeps its state file in `--data-dir`: that directory is
+        // made once, with the data directory's mode, not made again as 0700.
+        if !dirs.iter().any(|(made, _)| *made == dir) {
+            dirs.push((dir, 0o700));
+        }
     }
     Ok(dirs)
 }

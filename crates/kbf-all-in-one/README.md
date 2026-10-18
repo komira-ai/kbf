@@ -181,8 +181,10 @@ durable store, not a cache: a `file://` cold store on the same disk holds its ow
 
 ## Not done yet
 
-- **Production use.** The scheduler's state is a SQLite file, `<data-dir>/state.db` (or
-  the `--state-store=sqlite:///...` given), so a restart keeps queued operations and
+- **Production use.** The scheduler's state is Postgres on the host's socket,
+  `postgres:///kbf?host=/run/postgresql` (or the `--state-store` given; the server must
+  have `synchronous_commit` on and the role and database `kbf` must exist, which the
+  installer's `setup` will create), so a restart keeps queued operations and
   every start is a new epoch: the daemon half kills the runs of the leases the earlier
   start granted, and they are queued again. The trust warning below still stands, so
   all-in-one is a development and single-box shape.

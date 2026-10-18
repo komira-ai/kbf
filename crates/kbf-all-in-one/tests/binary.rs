@@ -73,6 +73,8 @@ fn farm_flags(dir: &Path, worker: SocketAddr) -> Vec<String> {
         "--reconnect-ms=50".to_owned(),
         "--driver=container".to_owned(),
         format!("--data-dir={}", at("data")),
+        // The default is Postgres on the host's socket; these tests need no server.
+        format!("--state-store=sqlite://{}", at("state.db")),
     ]
 }
 

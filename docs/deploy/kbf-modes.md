@@ -252,7 +252,8 @@ its registration put it in the frontend's map; calls routed to it fail.
 
 ### The state store: SQLite only
 
-The only state store kbf opens today is a SQLite file; Postgres is a later backend. Rule
+kbf opens a SQLite file or Postgres (`postgres:///kbf?host=/run/postgresql`), but no unit
+is rendered for Postgres yet: that comes with the cutover. Rule
 `state-store` fails a `--state-store` that is not `sqlite:///<absolute path>`: a
 `postgres://` or `postgresql://` URI (postgres is not wired yet), any other scheme, a
 SQLite path that is empty, relative or not normal, and a `--state-store=${VAR}`
@@ -334,9 +335,11 @@ WARN trusted: kbf all-in-one runs builds beside the farm's state and its cold st
 
 Its cold store is `file://<KBF_DATA_DIR>/cold`, the single box's shape (section 11), so
 the unit holds no cold-store key and rule `credential` applies to it. Its scheduler
-state is the SQLite file `<KBF_DATA_DIR>/state.db`, the default of `kbf all-in-one` (a
-`--state-store=sqlite:///...` names another; any other value is refused), so the unit
-gives no state store flag.
+state is the SQLite file `<KBF_DATA_DIR>/state.db`, which the unit names with
+`--state-store=sqlite://<KBF_DATA_DIR>/state.db`. The default of `kbf all-in-one` is
+now Postgres on the host's socket (`postgres:///kbf?host=/run/postgresql`), so a unit that
+left the flag out would change store when its binary is replaced; the move to Postgres is
+the farm cutover, a held script run with the owner's go.
 
 ## A node's certificate
 

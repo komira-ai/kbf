@@ -203,7 +203,7 @@ fn a_refused_frontend_start_exits_2() {
                 "--storage=http://127.0.0.1:1",
                 "--state-store=postgres://user:hunter2@db.example/kbf",
             ][..],
-            "only sqlite:///",
+            "must carry no password",
         ),
     ] {
         let out = run(args);

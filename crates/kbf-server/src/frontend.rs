@@ -729,13 +729,17 @@ async fn take_over(
     prepared.start(Some(state), Box::new(move || Ok(stopping)), Some(released))
 }
 
-/// The `--state-store` of a frontend that hands over (the flag requires it).
+/// The `--state-store` of a frontend that hands over (the flag requires it). A Postgres
+/// store cannot be handed over yet: it has no way to give up its writer role
+/// (`Store::demote`), and the takeover that replaces the handover comes with side-by-side
+/// Postgres (`docs/design/frontend-proxy.md`, section 8), so the combination is refused
+/// before the frontend serving is asked anything.
 fn state_uri(flags: &FrontendFlags) -> Result<&crate::StateStoreUri, HandoverError> {
-    flags
-        .server
-        .state_store
-        .as_ref()
-        .ok_or(HandoverError::NoState)
+    match flags.server.state_store.as_ref() {
+        None => Err(HandoverError::NoState),
+        Some(crate::StateStoreUri::Postgres(_)) => Err(HandoverError::PostgresStore),
+        Some(uri) => Ok(uri),
+    }
 }
 
 /// A frontend's start up to the state store: everything the flags decide that needs
@@ -804,7 +808,7 @@ impl<'a> Prepared<'a> {
             version: handover::wire::PROTOCOL,
             instance: self.flags.handover.as_ref().and_then(|h| h.instance),
             reapi: self.sockets.reapi.local,
-            state: state_uri(self.flags)?.path().to_owned(),
+            state: state_uri(self.flags)?.identity(),
         })
     }
 
@@ -1009,7 +1013,7 @@ impl<'a> Prepared<'a> {
                     state: args
                         .state_store
                         .as_ref()
-                        .map_or_else(PathBuf::new, |uri| uri.path().to_owned()),
+                        .map_or_else(PathBuf::new, crate::StateStoreUri::identity),
                 };
                 let stand = Stand {
                     drain: Arc::clone(&drain),

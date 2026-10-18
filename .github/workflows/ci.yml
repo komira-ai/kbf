@@ -285,9 +285,11 @@ jobs:
   # The state store's Postgres backend against a real server in a service container,
   # pinned by digest (postgres 17.9): the conformance suite C1 to C8, the defects it must
   # reject, the startup refusal of a server that does not flush commits, and the claim
-  # path (crates/kbf-state/tests/postgres_conformance.rs). The feature is off in the
-  # workspace jobs, so this job also lints it. The password is a throwaway for this
-  # container, which lives only for this job.
+  # path (crates/kbf-state/tests/postgres_conformance.rs), then the server over it
+  # (crates/kbf-server/tests/state_store_postgres.rs and the `over_postgres` restart tests).
+  # kbf-server enables the feature, so the workspace jobs build and lint it too; they run
+  # none of the tests that need a server. The password is a throwaway for this container,
+  # which lives only for this job.
   state-postgres:
     runs-on: ubuntu-latest
     permissions:
@@ -318,6 +320,10 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - run: cargo clippy -p kbf-state --features postgres --all-targets --locked -- -D warnings
       - run: cargo test -p kbf-state --features postgres --locked -- --include-ignored
+      # The server over Postgres: the flag opens it (tests/state_store_postgres.rs), and the
+      # farm's restart tests run on a schema of their own (`over_postgres` in tests/state_store.rs).
+      - run: cargo test -p kbf-server --locked --test state_store_postgres -- --include-ignored
+      - run: cargo test -p kbf-server --locked --test state_store -- --include-ignored over_postgres
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:

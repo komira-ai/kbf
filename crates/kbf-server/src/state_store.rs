@@ -11,12 +11,59 @@ use kbf_state::{Fenced, Store};
 use crate::farm::{EpochPolicy, StateError};
 use crate::members::MembershipConfig;
 
-/// A `--state-store` value. Only SQLite is wired; a Postgres store plugs in behind the
-/// [`Store`] trait of `kbf-state` when it is.
+/// A `--state-store` value: Postgres (`docs/design/frontend-proxy.md`, section 11) or,
+/// until it is deleted, SQLite.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StateStoreUri {
     /// `sqlite:///absolute/path`: a database file on a local disk, owned by one process.
     Sqlite(PathBuf),
+    /// `postgres:///kbf?host=/run/postgresql`: a database on a Unix socket, reached as the
+    /// process's own user (peer authentication). Several processes may open it; the
+    /// generation fence ([`Fenced`]) lets one write at a time.
+    Postgres(PostgresUrl),
+}
+
+/// The URL of a Postgres state store. It is not printed: `Debug` leaves it out, as a
+/// URL may hold a password (the flag refuses one, see [`StateStoreParser`]; a value
+/// built by [`FromStr`] may).
+#[derive(Clone, PartialEq, Eq)]
+pub struct PostgresUrl(String);
+
+impl fmt::Debug for PostgresUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PostgresUrl(..)")
+    }
+}
+
+impl PostgresUrl {
+    /// The URL without user information or a `password` parameter: what two processes
+    /// compare to know they mean the same database.
+    fn identity(&self) -> String {
+        let text = self.0.as_str();
+        let (scheme, rest) = text.split_once("://").unwrap_or(("postgres", text));
+        let (authority_and_path, query) = rest.split_once('?').map_or((rest, ""), |(a, q)| (a, q));
+        let host_end = authority_and_path
+            .find('/')
+            .unwrap_or(authority_and_path.len());
+        let (authority, path) = authority_and_path.split_at(host_end);
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        let query: Vec<&str> = query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .filter(|pair| {
+                let key = pair.split_once('=').map_or(*pair, |(key, _)| key);
+                !key.eq_ignore_ascii_case("password")
+            })
+            .collect();
+        let mut out = format!("{scheme}://{host}{path}");
+        if !query.is_empty() {
+            out.push('?');
+            out.push_str(&query.join("&"));
+        }
+        out
+    }
 }
 
 /// Why a `--state-store` value is refused. No message carries any part of the value: a
@@ -24,9 +71,26 @@ pub enum StateStoreUri {
 /// and logged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum StateStoreUriError {
-    /// Any value that is not `sqlite://` followed by a path.
-    #[error("only sqlite:///<absolute path> is supported (postgres is not wired yet)")]
+    /// Any value that is not `sqlite://` followed by a path or a `postgres://` URL.
+    #[error(
+        "only postgres:///<database>?host=<socket directory> or sqlite:///<absolute path> is \
+         supported"
+    )]
     Unsupported,
+    /// A `postgres://` or `postgresql://` value that is not a URL this client can use: it
+    /// names no host, asks for TLS or does not parse.
+    #[error(
+        "postgres:// needs a URL with a host and no TLS, as in \
+         postgres:///kbf?host=/run/postgresql"
+    )]
+    PostgresUrl,
+    /// A `postgres://` value that carries a password. The command line is
+    /// world-readable: the socket URL is reached by peer authentication and needs none.
+    #[error(
+        "postgres:// must carry no password (the command line is world-readable); use the \
+         Unix socket with peer authentication, as in postgres:///kbf?host=/run/postgresql"
+    )]
+    PostgresPassword,
     /// A `sqlite://` value that does not name a file by an absolute path.
     #[error("sqlite:// needs an absolute file path, as in sqlite:///var/lib/kbf/state.db")]
     SqlitePath,
@@ -36,6 +100,12 @@ impl FromStr for StateStoreUri {
     type Err = StateStoreUriError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.starts_with("postgres://") || s.starts_with("postgresql://") {
+            // The parser's own messages may quote the value; none is kept.
+            kbf_state::postgres::PostgresConfig::parse(s)
+                .map_err(|_| StateStoreUriError::PostgresUrl)?;
+            return Ok(Self::Postgres(PostgresUrl(s.to_owned())));
+        }
         let path = s
             .strip_prefix("sqlite://")
             .ok_or(StateStoreUriError::Unsupported)?;
@@ -72,26 +142,54 @@ impl clap::builder::TypedValueParser for StateStoreParser {
             .to_str()
             .ok_or(StateStoreUriError::Unsupported)
             .and_then(|text| text.parse::<StateStoreUri>())
+            .and_then(|uri| match &uri {
+                StateStoreUri::Postgres(url) if has_password(url) => {
+                    Err(StateStoreUriError::PostgresPassword)
+                }
+                _ => Ok(uri),
+            })
             .map_err(refuse)
     }
 }
 
+/// The Postgres store of a host that runs it beside kbf: the database and role `kbf` on
+/// the OS package's socket directory, reached by peer authentication.
+const LOCAL_POSTGRES: &str = "postgres:///kbf?host=/run/postgresql";
+
+fn has_password(url: &PostgresUrl) -> bool {
+    // The value parsed already; a parse that now fails has no password to refuse.
+    kbf_state::postgres::PostgresConfig::parse(&url.0).is_ok_and(|config| config.has_password())
+}
+
 impl StateStoreUri {
-    /// What a start does with the store's epoch. A SQLite file is the process's own, so
-    /// every start is a new incarnation: a restored or swapped file can never resume
-    /// leases an earlier one granted.
+    /// What an [`open`](Self::open) does with the store's epoch: a new one. An open is a
+    /// cold start (no live holder hands the store over; that is
+    /// [`open_after_handover`](Self::open_after_handover), which keeps it), so a restored
+    /// or swapped file, or a Postgres database restored from a backup, can never resume
+    /// leases an earlier incarnation granted. A fresh store has no epoch to bump: it is
+    /// given a first one no other store's is likely to equal (`Durable::open`).
     #[must_use]
     pub const fn epoch_policy(&self) -> EpochPolicy {
         match self {
-            Self::Sqlite(_) => EpochPolicy::Bump,
+            Self::Sqlite(_) | Self::Postgres(_) => EpochPolicy::Bump,
         }
     }
 
-    /// The file the store is.
+    /// The Postgres store on this host's own socket (`postgres:///kbf?host=/run/postgresql`):
+    /// what `kbf all-in-one` opens when `--state-store` is left out.
     #[must_use]
-    pub fn path(&self) -> &Path {
-        let Self::Sqlite(path) = self;
-        path
+    pub fn local_postgres() -> Self {
+        Self::Postgres(PostgresUrl(LOCAL_POSTGRES.to_owned()))
+    }
+
+    /// What names the store, for two processes to agree they mean the same one (the
+    /// handover): a SQLite store's file, a Postgres store's URL without a password.
+    #[must_use]
+    pub fn identity(&self) -> PathBuf {
+        match self {
+            Self::Sqlite(path) => path.clone(),
+            Self::Postgres(url) => PathBuf::from(url.identity()),
+        }
     }
 
     /// Opens the store. The file is created, with its directory, if missing (directories
@@ -122,10 +220,13 @@ impl StateStoreUri {
     }
 
     fn open_at(&self, expect: Option<u64>, epoch: EpochPolicy) -> Result<StateStore, StateError> {
-        let Self::Sqlite(path) = self;
+        let inner = match self {
+            Self::Sqlite(path) => open_sqlite(path)?,
+            Self::Postgres(url) => open_postgres(url)?,
+        };
         // This process is the store's writer from here: it takes the next generation, and
         // every write through the handle is checked against it ([`Fenced`]).
-        let fenced = Fenced::take(open_sqlite(path)?, expect).map_err(open_error)?;
+        let fenced = Fenced::take(inner, expect).map_err(open_error)?;
         Ok(StateStore {
             store: Arc::new(fenced),
             epoch,
@@ -152,6 +253,19 @@ impl crate::Args {
 
 fn open_error(why: impl fmt::Display) -> StateError {
     StateError::Open(why.to_string())
+}
+
+/// Connects, refuses a server that does not flush commits before it acknowledges them
+/// (`synchronous_commit` is not on: `PostgresStore::open` checks every connection), and
+/// creates the tables if they are not there. The errors name the setting or the failed
+/// step, never the URL.
+fn open_postgres(url: &PostgresUrl) -> Result<Arc<dyn Store>, StateError> {
+    use kbf_state::postgres::{PostgresConfig, PostgresStore};
+    let config = PostgresConfig::parse(&url.0)
+        .map_err(|_| open_error("the postgres state store URL is not valid"))?
+        .with_application_name("kbf-server");
+    let store = PostgresStore::open(&config).map_err(open_error)?;
+    Ok(Arc::new(store))
 }
 
 fn open_sqlite(path: &Path) -> Result<Arc<dyn Store>, StateError> {

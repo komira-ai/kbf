@@ -187,6 +187,12 @@ impl PostgresConfig {
         self
     }
 
+    /// Whether the URL carries a password (user information or a `password` parameter).
+    #[must_use]
+    pub fn has_password(&self) -> bool {
+        self.pg.get_password().is_some()
+    }
+
     /// The schema the store's tables are in.
     #[must_use]
     pub fn schema(&self) -> &str {
