@@ -25,6 +25,8 @@ Delegate=yes
 # kbf-server's peak use (KBF_SERVER_RESERVATION_GIB).
 MemoryMin=@SERVER_MEMORY_MIN@
 OOMScoreAdjust=-925
+# systemd starts a unit at a soft open-file limit of 1024; a build burst passes that (EMFILE).
+LimitNOFILE=1048576
 CPUWeight=300
 # No MemorySwapMax=: leases may swap, and they live in this unit's cgroup.
 Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@

@@ -9,6 +9,11 @@ Wants=network-online.target
 After=network-online.target @MINIO_UNIT@
 @KBF_LISTEN_AFTER_LINES@
 
+# A failure that repeats quickly (the cold store or a disk not ready) must not use up
+# systemd's start limit of 5 starts in 10 s and leave the unit down (check-units rule
+# `restart`).
+StartLimitIntervalSec=0
+
 [Service]
 # Not the daemon's user: a storage node holds the cold store's key.
 User=@KBF_SERVER_USER@
@@ -18,6 +23,8 @@ MemoryMin=@SERVER_MEMORY_MIN@
 # A storage node answering from swap would slow every build at once.
 MemorySwapMax=0
 OOMScoreAdjust=-925
+# systemd starts a unit at a soft open-file limit of 1024; a build burst passes that (EMFILE).
+LimitNOFILE=1048576
 CPUWeight=300
 # AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY of the bucket's MinIO service account:
 # a secret never goes on the command line. The file is the server user's, mode 0600, so
@@ -48,6 +55,7 @@ ExecStart=@KBF_BIN_DIR@/kbf storage \
 KillSignal=SIGTERM
 TimeoutStopSec=infinity
 Restart=on-failure
+RestartSec=5
 # Exit 2 is a command line kbf refused: a restart cannot fix it.
 RestartPreventExitStatus=2
 
