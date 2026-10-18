@@ -51,6 +51,7 @@
 pub mod cluster;
 pub mod handover;
 pub mod names;
+pub mod nofile;
 pub mod version;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -375,6 +376,9 @@ pub fn main() -> ExitCode {
     if let Some(code) = kbf_node::dispatch_helpers() {
         return code;
     }
+    // A failure leaves the limit as it was: the process still starts, and the first
+    // EMFILE names the cause.
+    let _ = nofile::raise();
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if version::asked(&args) {
         print!("{}", version::line());
