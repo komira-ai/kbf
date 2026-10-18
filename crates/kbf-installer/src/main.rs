@@ -174,21 +174,26 @@ fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), String> {
     }
 }
 
+/// The user that must own every file the migration reads and writes. On a host every file
+/// belongs to root. Under `--root` (a rehearsal, a test) the tree is the caller's own, so
+/// the owner to expect is the caller: nobody gains anything by it, since root and a
+/// stranger alike only reach what they already could.
+fn owner_uid(rehearsal: bool, euid: u32) -> u32 {
+    if rehearsal { euid } else { 0 }
+}
+
+/// The user the version probe runs as: the exit code and the reason it failed with when the
+/// host cannot say (1) or has no such user (2).
+fn probe_user<E: kbf_host::Exec>(exec: &E, name: &str) -> Result<kbf_host::RunUser, (u8, String)> {
+    let found = kbf_host::user::lookup(exec, name).map_err(|e| (1, e.to_string()))?;
+    found.ok_or_else(|| (2, format!("no user {name:?} to run the version probe as")))
+}
+
 /// `kbf-installer migrate`: the exit code and the reason it failed with.
 fn migrate_verb(root: PathBuf, args: MigrateArgs) -> Result<(), (u8, String)> {
-    // On a host every file belongs to root. Under `--root` (a rehearsal, a test) the tree is
-    // the caller's own, so the owner to expect is the caller: nobody gains anything by it,
-    // since root and a stranger alike only reach what they already could.
     let rehearsal = root != Path::new("/");
     let (layout, mut exec) = host(root).map_err(|e| (1, e))?;
-    let user = kbf_host::user::lookup(&exec, &args.fetch_user)
-        .map_err(|e| (1, e.to_string()))?
-        .ok_or_else(|| {
-            (
-                2,
-                format!("no user {:?} to run the version probe as", args.fetch_user),
-            )
-        })?;
+    let user = probe_user(&exec, &args.fetch_user)?;
     let m = migrate::Migration {
         roots: migrate::Roots::new(layout.platform()),
         layout,
@@ -196,11 +201,7 @@ fn migrate_verb(root: PathBuf, args: MigrateArgs) -> Result<(), (u8, String)> {
             uid: user.uid,
             gid: user.gid,
         },
-        owner_uid: if rehearsal {
-            rustix::process::geteuid().as_raw()
-        } else {
-            0
-        },
+        owner_uid: owner_uid(rehearsal, rustix::process::geteuid().as_raw()),
         units: args.units,
         helper_unit: args.helper_unit,
         installer_unit: args.installer_unit,
@@ -255,5 +256,45 @@ fn main() -> ExitCode {
             eprintln!("kbf-installer: {why}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kbf_host::testkit::{FakeExec, reply};
+
+    use super::*;
+
+    /// Catches the owner a migration trusts being root's only by accident: on a host it is
+    /// uid 0 whoever runs the verb; under `--root` it is the caller, who owns the rehearsal.
+    #[test]
+    fn the_owner_is_root_on_a_host_and_the_caller_in_a_rehearsal() {
+        assert_eq!(owner_uid(false, 1000), 0);
+        assert_eq!(owner_uid(true, 1000), 1000);
+    }
+
+    /// Catches the probe user's lookup failing quietly: a host that cannot answer is exit 1
+    /// with the reason, an unknown user exit 2 naming the user, a known one its ids.
+    #[test]
+    fn the_probe_user_is_looked_up_with_the_exit_codes_of_the_contract() {
+        let mut exec = FakeExec::new(0);
+        exec.answer = Box::new(|cmd| {
+            let who = cmd.args.last().map(String::as_str);
+            Ok(match (cmd.program.as_str().ends_with("getent"), who) {
+                (true, Some("kbf-fetch")) => {
+                    reply(0, "kbf-fetch:x:991:991::/nonexistent:/sbin/nologin\n", "")
+                }
+                (true, Some("broken")) => reply(1, "", "getent: no such service"),
+                (true, _) => reply(2, "", ""),
+                (false, _) => reply(0, "991\n", ""),
+            })
+        });
+        assert_eq!(probe_user(&exec, "kbf-fetch").expect("found").uid, 991);
+        let (code, why) = probe_user(&exec, "nobody-here").expect_err("unknown");
+        assert_eq!(code, 2);
+        assert!(why.contains("nobody-here"), "{why}");
+        let (code, why) = probe_user(&exec, "broken").expect_err("broken");
+        assert_eq!(code, 1);
+        assert!(why.contains("getent"), "{why}");
     }
 }

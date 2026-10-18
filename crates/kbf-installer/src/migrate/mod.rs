@@ -190,6 +190,8 @@ pub fn guard(m: &Migration) -> Result<(), MigrateError> {
 }
 
 #[cfg(test)]
+mod coverage_tests;
+#[cfg(test)]
 mod floor_tests;
 #[cfg(test)]
 mod refusal_tests;

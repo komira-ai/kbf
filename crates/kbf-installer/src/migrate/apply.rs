@@ -395,8 +395,7 @@ pub(super) fn note_old_state(m: &Migration) -> Result<(), MigrateError> {
 pub(super) fn remove_note(m: &Migration) -> Result<(), MigrateError> {
     let dir = tree::open_root(&m.layout.join(&m.roots.old_state))
         .map_err(MigrateError::io(m.roots.old_state.to_string()))?;
-    match rustix::fs::unlinkat(&dir, MARKER, rustix::fs::AtFlags::empty()) {
-        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
-        Err(e) => Err(MigrateError::io(MARKER)(e.into())),
-    }
+    let gone = rustix::fs::unlinkat(&dir, MARKER, rustix::fs::AtFlags::empty());
+    tree::except(gone, rustix::io::Errno::NOENT).map_err(MigrateError::io(MARKER))?;
+    Ok(())
 }

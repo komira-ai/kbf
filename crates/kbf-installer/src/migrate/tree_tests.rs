@@ -361,3 +361,88 @@ fn remove_tree_does_not_follow_links() {
     assert!(remove_tree(&d, "deep").is_err());
     assert!(remove_tree(&d, "absent").is_err());
 }
+
+/// Catches the two error sorters mis-sorting: `absent` turns exactly "not found" into
+/// `None` (for an `io::Error` and for an `Errno`) and passes every other error on;
+/// `except` counts exactly the named errno as done-already and passes the rest on.
+#[test]
+fn absent_and_except_sort_their_errors() {
+    use std::io::{Error, ErrorKind};
+
+    assert_eq!(absent(Ok::<_, Error>(7)).expect("ok"), Some(7));
+    assert_eq!(
+        absent(Err::<u8, _>(Error::from(ErrorKind::NotFound))).expect("none"),
+        None
+    );
+    assert_eq!(absent(Err::<u8, _>(Errno::NOENT)).expect("none"), None);
+    let other = absent(Err::<u8, _>(Error::from(ErrorKind::PermissionDenied)));
+    assert_eq!(
+        other.expect_err("passed on").kind(),
+        ErrorKind::PermissionDenied
+    );
+    let other = absent(Err::<u8, _>(Errno::ACCESS));
+    assert_eq!(
+        other.expect_err("passed on").kind(),
+        ErrorKind::PermissionDenied
+    );
+
+    assert!(except(Ok(()), Errno::EXIST).expect("did it"));
+    assert!(!except(Err(Errno::EXIST), Errno::EXIST).expect("was there"));
+    let other = except(Err(Errno::ACCESS), Errno::EXIST);
+    assert_eq!(
+        other.expect_err("passed on").kind(),
+        ErrorKind::PermissionDenied
+    );
+}
+
+/// Catches a check that takes a file for a directory: `expect_dir` and a digest of a plain
+/// file are refused as "not a directory".
+#[test]
+fn a_file_is_not_a_directory() {
+    let root = scratch("notdir");
+    put(&root.join("f"), b"x", 0o644);
+    let parent = open(&root);
+    let file = rustix::fs::openat(
+        &parent,
+        "f",
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .expect("open");
+    let error = expect_dir(&rules(), &file, "f").expect_err("a file");
+    assert!(error.to_string().contains("not a directory"), "{error}");
+    let error = refused(digest(&rules(), &file));
+    assert!(error.contains("not a directory"), "{error}");
+}
+
+/// Catches an extended-attribute probe that reads every failure as "no capabilities": only
+/// "no such attribute" and "not supported" mean none; a descriptor the call cannot use (one
+/// opened for the path alone) is an error.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_attribute_probe_that_fails_for_another_reason_is_an_error() {
+    let root = scratch("xattr-fd");
+    put(&root.join("f"), b"x", 0o644);
+    let parent = open(&root);
+    let path_only = rustix::fs::openat(
+        &parent,
+        "f",
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .expect("open");
+    assert!(has_xattr(&path_only, "security.capability").is_err());
+}
+
+/// Catches a replacement that goes ahead over a leftover it cannot remove: a non-empty
+/// directory where the new name goes is an error naming it, and the file is not touched.
+#[test]
+fn replace_file_stops_on_a_leftover_it_cannot_remove() {
+    let root = scratch("replace-stuck");
+    put(&root.join("d/out"), b"old", 0o600);
+    put(&root.join("d/.out.new/inner"), b"x", 0o600);
+    let d = open(&root.join("d"));
+    let error = replace_file(&d, "out", 0o600, b"new").expect_err("stuck");
+    assert!(error.to_string().contains(".out.new"), "{error}");
+    assert_eq!(fs::read(root.join("d/out")).expect("kept"), b"old");
+}

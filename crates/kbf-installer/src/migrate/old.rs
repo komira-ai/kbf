@@ -4,8 +4,6 @@
 
 use std::os::fd::OwnedFd;
 
-use rustix::io::Errno;
-
 use super::error::MigrateError;
 use super::roots::Roots;
 use super::tree::{self, Rules};
@@ -26,10 +24,9 @@ pub struct Old {
 /// Read the old state; `None` when the old layout has neither file (not an old host).
 pub fn read(layout: &Layout, roots: &Roots, rules: &Rules) -> Result<Option<Old>, MigrateError> {
     let path = layout.join(&roots.old_state);
-    let dir = match tree::open_root(&path) {
-        Ok(dir) => dir,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(MigrateError::io(roots.old_state.to_string())(e)),
+    let opened = tree::absent(tree::open_root(&path));
+    let Some(dir) = opened.map_err(MigrateError::io(roots.old_state.to_string()))? else {
+        return Ok(None);
     };
     let state = tree::read_file(rules, &dir, "state.json", FILE_CAP)?;
     let memory = tree::read_file(rules, &dir, "helper.json", FILE_CAP)?;
@@ -79,11 +76,11 @@ impl OldTree {
     /// The release a link (`current` or `previous`) names, which must be exactly
     /// `releases/<40 hex>`; `None` when there is no such link.
     pub fn linked(&self, link: &'static str) -> Result<Option<CommitId>, MigrateError> {
-        let target = match rustix::fs::readlinkat(&self.tree, link, Vec::new()) {
-            Ok(target) => target.to_string_lossy().into_owned(),
-            Err(Errno::NOENT) => return Ok(None),
-            Err(e) => return Err(MigrateError::io(link)(e.into())),
+        let read = tree::absent(rustix::fs::readlinkat(&self.tree, link, Vec::new()));
+        let Some(target) = read.map_err(MigrateError::io(link))? else {
+            return Ok(None);
         };
+        let target = target.to_string_lossy().into_owned();
         target
             .strip_prefix("releases/")
             .and_then(|name| CommitId::new(name).ok())

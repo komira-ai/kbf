@@ -60,9 +60,12 @@ pub enum MigrateError {
 }
 
 impl MigrateError {
-    pub fn io(what: impl Into<String>) -> impl FnOnce(io::Error) -> MigrateError {
+    pub fn io<E: Into<io::Error>>(what: impl Into<String>) -> impl FnOnce(E) -> MigrateError {
         let what = what.into();
-        move |source| MigrateError::Io { what, source }
+        move |source| MigrateError::Io {
+            what,
+            source: source.into(),
+        }
     }
 
     pub fn exit_code(&self) -> u8 {

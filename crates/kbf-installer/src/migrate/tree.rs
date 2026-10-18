@@ -89,6 +89,31 @@ impl<T, E: Into<io::Error>> At<T> for Result<T, E> {
     }
 }
 
+/// `result`, with a missing file or directory as `None` instead of an error.
+pub fn absent<T, E: Into<io::Error>>(result: Result<T, E>) -> io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(e) => {
+            let e = e.into();
+            if e.kind() == io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// `result`, with the error `ignored` (the thing is there already) counted as done.
+/// Whether the call did anything.
+pub fn except(result: Result<(), Errno>, ignored: Errno) -> io::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(e) if e == ignored => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Open `dir` itself (a path chosen by root, not by an untrusted writer).
 pub fn open_root(dir: &Path) -> io::Result<OwnedFd> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
@@ -265,6 +290,7 @@ impl Walk<'_> {
         };
         let mut input = File::from(fd).take(self.rules.max_file_bytes + 1);
         io::copy(&mut input, &mut tee).at(path)?;
+        tee.flush().at(path)?;
         let (total, out) = (tee.total, tee.out);
         if total > self.rules.max_file_bytes {
             return Err(refuse(path, "bigger than the file size cap"));

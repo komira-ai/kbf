@@ -57,10 +57,9 @@ fn dir(
                 .map_err(MigrateError::io(what()))?;
         }
     }
-    let fd = match tree::open_root(&real) {
-        Ok(fd) => fd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !create => return Ok(None),
-        Err(e) => return Err(MigrateError::io(what())(e)),
+    // A directory just made is there; one that is not is a directory of nothing.
+    let Some(fd) = tree::absent(tree::open_root(&real)).map_err(MigrateError::io(what()))? else {
+        return Ok(None);
     };
     tree::expect_dir(rules, &fd, &what())?;
     Ok(Some(fd))
@@ -68,15 +67,11 @@ fn dir(
 
 /// The directory `name` of `parent`, made (0755) when it is not there.
 fn sub(rules: &Rules, parent: &OwnedFd, name: &str) -> Result<OwnedFd, MigrateError> {
-    let made = match rustix::fs::mkdirat(parent, name, Mode::from_raw_mode(0o755)) {
-        Ok(()) => true,
-        Err(Errno::EXIST) => false,
-        Err(e) => return Err(MigrateError::io(name)(e.into())),
-    };
+    let made = rustix::fs::mkdirat(parent, name, Mode::from_raw_mode(0o755));
+    let made = tree::except(made, Errno::EXIST).map_err(MigrateError::io(name))?;
     let fd = tree::open_dir(parent, name).map_err(MigrateError::io(name))?;
     if made {
-        rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o755))
-            .map_err(|e| MigrateError::io(name)(e.into()))?;
+        rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o755)).map_err(MigrateError::io(name))?;
     }
     tree::expect_dir(rules, &fd, name)?;
     Ok(fd)
@@ -142,10 +137,8 @@ impl StateDir {
     /// The directory the first originals of the units are kept in (0700, root's).
     pub fn unit_backup(&self) -> Result<OwnedFd, MigrateError> {
         let name = "migration-units";
-        match rustix::fs::mkdirat(&self.fd, name, Mode::from_raw_mode(0o700)) {
-            Ok(()) | Err(Errno::EXIST) => {}
-            Err(e) => return Err(MigrateError::io(name)(e.into())),
-        }
+        let made = rustix::fs::mkdirat(&self.fd, name, Mode::from_raw_mode(0o700));
+        tree::except(made, Errno::EXIST).map_err(MigrateError::io(name))?;
         let fd = tree::open_dir(&self.fd, name).map_err(MigrateError::io(name))?;
         tree::expect_dir(&self.rules, &fd, name)?;
         Ok(fd)
@@ -169,11 +162,8 @@ impl NewTree {
     }
 
     fn release(&self, commit: &CommitId) -> Result<Option<OwnedFd>, MigrateError> {
-        match tree::open_dir(&self.releases, commit.as_str()) {
-            Ok(fd) => Ok(Some(fd)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(MigrateError::io(commit.as_str())(e)),
-        }
+        tree::absent(tree::open_dir(&self.releases, commit.as_str()))
+            .map_err(MigrateError::io(commit.as_str()))
     }
 
     /// Whether `releases/<commit>` is there and carries `VERIFIED`.
@@ -200,11 +190,10 @@ impl NewTree {
 
     /// Remove what an interrupted copy left in `work/`.
     pub fn sweep_work(&self) -> Result<(), MigrateError> {
-        let entries = rustix::fs::Dir::read_from(&self.work)
-            .map_err(|e| MigrateError::io("work")(e.into()))?;
+        let entries = rustix::fs::Dir::read_from(&self.work).map_err(MigrateError::io("work"))?;
         for item in entries {
             let name = item
-                .map_err(|e| MigrateError::io("work")(e.into()))?
+                .map_err(MigrateError::io("work"))?
                 .file_name()
                 .to_owned();
             if name.to_bytes().starts_with(b"adopt-") {
@@ -221,32 +210,29 @@ impl NewTree {
     pub fn copy_in(&self, commit: &CommitId, src: &OwnedFd) -> Result<(), MigrateError> {
         let partial = format!("adopt-{commit}.partial");
         rustix::fs::mkdirat(&self.work, &partial, Mode::from_raw_mode(0o755))
-            .map_err(|e| MigrateError::io(partial.as_str())(e.into()))?;
+            .map_err(MigrateError::io(partial.as_str()))?;
         let result = self.fill(&partial, src);
         if result.is_err() {
             let _ = tree::remove_tree(&self.work, &partial);
             return result;
         }
         rustix::fs::renameat(&self.work, &partial, &self.releases, commit.as_str())
-            .map_err(|e| MigrateError::io(commit.as_str())(e.into()))?;
-        rustix::fs::fsync(&self.releases).map_err(|e| MigrateError::io("releases")(e.into()))
+            .map_err(MigrateError::io(commit.as_str()))?;
+        rustix::fs::fsync(&self.releases).map_err(MigrateError::io("releases"))
     }
 
     fn fill(&self, partial: &str, src: &OwnedFd) -> Result<(), MigrateError> {
         let dst = tree::open_dir(&self.work, partial).map_err(MigrateError::io(partial))?;
-        rustix::fs::fchmod(&dst, Mode::from_raw_mode(0o755))
-            .map_err(|e| MigrateError::io(partial)(e.into()))?;
+        rustix::fs::fchmod(&dst, Mode::from_raw_mode(0o755)).map_err(MigrateError::io(partial))?;
         tree::copy(&self.rules, src, &dst)?;
-        rustix::fs::fsync(&dst).map_err(|e| MigrateError::io(partial)(e.into()))
+        rustix::fs::fsync(&dst).map_err(MigrateError::io(partial))
     }
 
     /// What `releases/<name>` is (a link's target as written), or `None`.
     pub fn link_target(&self, name: &str) -> Result<Option<String>, MigrateError> {
-        match rustix::fs::readlinkat(&self.releases, name, Vec::new()) {
-            Ok(target) => Ok(Some(target.to_string_lossy().into_owned())),
-            Err(Errno::NOENT) => Ok(None),
-            Err(e) => Err(MigrateError::io(name)(e.into())),
-        }
+        let read = tree::absent(rustix::fs::readlinkat(&self.releases, name, Vec::new()));
+        let target = read.map_err(MigrateError::io(name))?;
+        Ok(target.map(|t| t.to_string_lossy().into_owned()))
     }
 
     /// Make `releases/<name>` point at `target` (the sibling directory of that name), or
@@ -259,22 +245,20 @@ impl NewTree {
                 return Ok(false);
             }
             rustix::fs::unlinkat(&self.releases, name, AtFlags::empty())
-                .map_err(|e| MigrateError::io(name)(e.into()))?;
+                .map_err(MigrateError::io(name))?;
             return Ok(true);
         };
         if have.as_deref() == Some(target.as_str()) {
             return Ok(false);
         }
         let temp = format!("{name}.new");
-        match rustix::fs::unlinkat(&self.releases, &temp, AtFlags::empty()) {
-            Ok(()) | Err(Errno::NOENT) => {}
-            Err(e) => return Err(MigrateError::io(temp.as_str())(e.into())),
-        }
+        let old = rustix::fs::unlinkat(&self.releases, &temp, AtFlags::empty());
+        tree::except(old, Errno::NOENT).map_err(MigrateError::io(temp.as_str()))?;
         rustix::fs::symlinkat(target.as_str(), &self.releases, &temp)
-            .map_err(|e| MigrateError::io(temp.as_str())(e.into()))?;
+            .map_err(MigrateError::io(temp.as_str()))?;
         rustix::fs::renameat(&self.releases, &temp, &self.releases, name)
-            .map_err(|e| MigrateError::io(name)(e.into()))?;
-        rustix::fs::fsync(&self.releases).map_err(|e| MigrateError::io("releases")(e.into()))?;
+            .map_err(MigrateError::io(name))?;
+        rustix::fs::fsync(&self.releases).map_err(MigrateError::io("releases"))?;
         Ok(true)
     }
 }
