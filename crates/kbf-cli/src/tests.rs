@@ -159,7 +159,7 @@ fn the_mode_flag_names_every_mode_like_the_alias_does() {
             after.extend(flags.iter().cloned());
             after.extend(form.iter().cloned());
             for argv in [before, after] {
-                if argv.len() == 2 && mode == names::STORAGE {
+                if flags.is_empty() && mode == names::STORAGE {
                     continue; // `kbf --mode=storage` alone reads kbf.toml (below)
                 }
                 let got = parse_from(argv.clone()).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
@@ -167,13 +167,16 @@ fn the_mode_flag_names_every_mode_like_the_alias_does() {
             }
         }
     }
-    let twice = error(vec!["kbf".into(), "--mode=daemon".into(), "storage".into()]);
+    // The mode given twice: by the flag and by the alias word first, or a word after the flag.
+    let twice = error(vec!["kbf".into(), "storage".into(), "--mode=daemon".into()]);
     assert!(twice.contains("given twice"), "{twice}");
+    let word = error(vec!["kbf".into(), "--mode=daemon".into(), "storage".into()]);
+    assert!(word.contains("unexpected argument 'storage'"), "{word}");
     let none = error(vec!["kbf".into(), "--mode".into()]);
     assert!(none.contains("--mode"), "{none}");
     let flags_without_mode = error(vec!["kbf".into(), "--node-id=n".into()]);
     assert!(
-        flags_without_mode.contains("--mode=<mode>"),
+        flags_without_mode.contains("give --mode=<") && flags_without_mode.contains("kbf.toml"),
         "{flags_without_mode}"
     );
 }
@@ -208,10 +211,30 @@ fn a_start_reads_kbf_toml_only_when_it_gives_no_flags_of_its_mode() {
     .expect("config and labels");
     assert_eq!(start.config, std::path::PathBuf::from("/x/kbf.toml"));
     assert_eq!(start.labels, ["pool=mac", "rack=r2"]);
-    let start = registered(&["kbf"]).expect("bare");
-    assert_eq!(start.mode, None, "the mode is the file's");
-    let start = registered(&["kbf", "--config=/y.toml"]).expect("config alone");
-    assert_eq!((start.mode, start.config.to_str()), (None, Some("/y.toml")));
+    // No mode named: the file's `mode`, and with no file, or none in it, a refusal naming
+    // both places.
+    let e = error(vec!["kbf".into()]);
+    assert!(e.contains("no mode") && e.contains("--mode=<"), "{e}");
+    let dir = std::env::temp_dir().join(format!("kbf-cli-lib-mode-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch");
+    let file = dir.join("kbf.toml");
+    std::fs::write(
+        &file,
+        "mode = \"daemon\"\n[frontend]\nurl = \"https://f.example\"\n",
+    )
+    .expect("kbf.toml");
+    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+        .expect("mode");
+    let path = file.display().to_string();
+    let start =
+        registered(&["kbf", "--config", path.as_str()]).expect("config alone: the file's mode");
+    assert_eq!(
+        (start.mode, start.config),
+        (Some(names::DAEMON), file.clone())
+    );
+    let start = registered(&["kbf", "--mode=storage", "--config", path.as_str()])
+        .expect("the flag wins over the file");
+    assert_eq!(start.mode, Some(names::STORAGE));
     let start = registered(&["kbf", "storage-and-daemon", "--check"]).expect("alias check");
     assert_eq!(
         (start.mode, start.check),
@@ -227,36 +250,26 @@ fn a_start_reads_kbf_toml_only_when_it_gives_no_flags_of_its_mode() {
     assert!(registered(&["kbf", "daemon", "--label=a=b"]).is_none());
     // Flags of the mode: the flags are the configuration.
     assert!(registered(&["kbf", "--mode=storage", "--storage-listen=127.0.0.1:1"]).is_none());
+    // Flags and a file together are one start: the flags win over the file's keys, so
+    // `--config` with a flag of the mode is the flags path, and the file is read there.
     let both = error(vec![
         "kbf".into(),
         "--mode=storage".into(),
         "--config=/x".into(),
         "--storage-listen=127.0.0.1:1".into(),
     ]);
-    assert!(
-        both.contains("--config reads kbf.toml") && both.contains("--storage-listen"),
-        "{both}"
-    );
-    let both = error(vec![
-        "kbf".into(),
-        "--mode=daemon".into(),
-        "--check".into(),
-        "--node-id=n".into(),
-    ]);
-    assert!(both.contains("--check reads kbf.toml"), "{both}");
-    // The modes that take flags only do not read the file.
+    assert!(both.contains("cannot read the config file /x"), "{both}");
+    // The modes that take flags only start on their flags (and their file, as any mode's);
+    // they never enroll, so no start of theirs is a `Registered` one.
     for mode in [names::FRONTEND, names::ALL_IN_ONE] {
-        for flag in ["--check", "--config=/x"] {
-            let msg = error(vec!["kbf".into(), format!("--mode={mode}"), flag.into()]);
+        for flags in [vec![], vec!["--check"], vec!["--config=/x"]] {
+            let mut argv = vec!["kbf".to_owned(), format!("--mode={mode}")];
+            argv.extend(flags.iter().map(|f| (*f).to_owned()));
             assert!(
-                msg.contains("only the storage, daemon"),
-                "{mode} {flag}: {msg}"
+                !matches!(parse_from(argv.clone()), Ok(Invocation::Registered(_))),
+                "{argv:?}"
             );
         }
-        assert!(
-            registered(&["kbf", &format!("--mode={mode}")]).is_none(),
-            "{mode}"
-        );
     }
 }
 
@@ -417,6 +430,8 @@ fn all_in_one_takes_exactly_what_kbf_all_in_one_takes() {
     for flag in refused_by(mode.name) {
         assert!(new.remove(*flag), "{flag}");
     }
+    // And the two flags every mode takes besides (`--config`, `--check`).
+    assert!(new.remove(CONFIG) && new.remove(CHECK));
     assert_eq!(longs(&kbf_all_in_one::cli::command()), new);
 }
 
@@ -946,16 +961,12 @@ fn check_args_takes_the_mode_flag_and_the_file_flags() {
     let mut flags = vec!["kbf", CHECK_ARGS, "--mode=daemon"];
     flags.extend(&DAEMON[2..]);
     assert_eq!(check(&flags), Ok(()));
-    for line in [
-        &["kbf", CHECK_ARGS, "--mode=daemon", "--bogus"][..],
-        &["kbf", CHECK_ARGS, "--mode=daemon", "--config=/x", "--bogus"],
-    ] {
-        let e = check(line).expect_err("refused");
-        assert!(
-            e.contains("unexpected argument") || e.contains("reads kbf.toml"),
-            "{line:?}: {e}"
-        );
-    }
+    let e = check(&["kbf", CHECK_ARGS, "--mode=daemon", "--bogus"]).expect_err("refused");
+    assert!(e.contains("unexpected argument"), "{e}");
+    // A flag with a file that is not there: the file is what is refused.
+    let e = check(&["kbf", CHECK_ARGS, "--mode=daemon", "--config=/x", "--bogus"])
+        .expect_err("refused");
+    assert!(e.contains("cannot read the config file /x"), "{e}");
     let e = check(&["kbf", CHECK_ARGS]).expect_err("no mode checks nothing");
     assert!(e.contains("no mode"), "{e}");
     let e = check(&["kbf", CHECK_ARGS, "--config=/x"]).expect_err("no mode checks nothing");

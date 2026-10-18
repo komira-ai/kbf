@@ -1,10 +1,10 @@
-//! `kbf storage-and-daemon --help` against its golden file,
+//! `kbf --mode=storage-and-daemon --help` against its golden file,
 //! `tests/golden/kbf-storage-and-daemon-help.txt`, byte for byte: the mode's command line
 //! is public (it is `kbf storage`'s flags and `kbf-daemon`'s), so a change to its flags or
 //! their help shows up here as a diff to review.
 //!
 //! To rewrite the golden after an intended change:
-//! `kbf storage-and-daemon --help > crates/kbf-cli/tests/golden/kbf-storage-and-daemon-help.txt`
+//! `kbf --mode=storage-and-daemon --help > crates/kbf-cli/tests/golden/kbf-storage-and-daemon-help.txt`
 
 use std::process::Command;
 
@@ -14,7 +14,7 @@ use std::process::Command;
 #[test]
 fn storage_and_daemon_help_matches_the_golden_file() {
     let out = Command::new(env!("CARGO_BIN_EXE_kbf"))
-        .args(["storage-and-daemon", "--help"])
+        .args(["--mode=storage-and-daemon", "--help"])
         .output()
         .expect("spawn");
     assert!(out.status.success(), "exit {}", out.status);
@@ -22,6 +22,6 @@ fn storage_and_daemon_help_matches_the_golden_file() {
     let golden = include_str!("golden/kbf-storage-and-daemon-help.txt");
     assert!(
         actual == golden,
-        "kbf storage-and-daemon --help differs from tests/golden/kbf-storage-and-daemon-help.txt; actual:\n{actual}"
+        "kbf --mode=storage-and-daemon --help differs from tests/golden/kbf-storage-and-daemon-help.txt; actual:\n{actual}"
     );
 }

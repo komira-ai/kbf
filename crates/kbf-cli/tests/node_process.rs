@@ -15,6 +15,13 @@ use kbf_types::RefusalReason;
 use support::fake;
 use support::scratch;
 
+/// Writes a `kbf.toml` that a start accepts whatever the umask of the test run is: the
+/// file may not be writable by group or other.
+fn write_config(path: &Path, text: &str) {
+    std::fs::write(path, text).expect("kbf.toml");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).expect("mode");
+}
+
 const BIN: &str = env!("CARGO_BIN_EXE_kbf");
 
 struct Out {
@@ -46,7 +53,7 @@ fn config(root: &Path, port: u16, top: &str) -> PathBuf {
         root.join("enroll.token").display(),
         root.join("state").display(),
     );
-    std::fs::write(&path, text).expect("kbf.toml");
+    write_config(&path, &text);
     path
 }
 
@@ -192,7 +199,8 @@ async fn a_refused_token_exits_2_with_the_reason_on_stderr() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_flag_that_is_not_known_exits_2() {
     let root = scratch("process-usage");
-    let none = root.join("none.toml");
+    // A file that exists and is the mode's: the flags are parsed with it.
+    let none = config(&root, 1, "");
     let out = kbf(args(&["--mode=daemon", "--bogus"], &none)).await;
     assert_eq!(out.code, Some(2), "{}", out.stderr);
     assert!(out.stderr.contains("--bogus"), "{}", out.stderr);
@@ -200,7 +208,7 @@ async fn a_flag_that_is_not_known_exits_2() {
     let out = kbf(args(&["--mode=daemon", "--cold-store=s3://b"], &none)).await;
     assert_eq!(out.code, Some(2), "{}", out.stderr);
     assert!(
-        out.stderr.contains("--config reads kbf.toml") && out.stderr.contains("--cold-store"),
+        out.stderr.contains("kbf daemon refuses --cold-store"),
         "{}",
         out.stderr
     );

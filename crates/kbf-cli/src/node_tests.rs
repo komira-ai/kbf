@@ -8,6 +8,7 @@ use kbf_enroll::store::{Node as Enrolled, Store, StoredCert, StoredConfig};
 use crate::enroll::Want;
 
 use super::*;
+use crate::parse_from;
 
 const FRONTEND: &str = "https://farm.example:8990";
 

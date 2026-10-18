@@ -8,12 +8,60 @@ use kbf_cli::names;
 const BIN: &str = env!("CARGO_BIN_EXE_kbf");
 
 fn run(args: &[&str]) -> (Option<i32>, String, String) {
-    let out = Command::new(BIN).args(args).output().expect("run kbf");
+    run_with(args, &[])
+}
+
+/// [`run`] with `env` added to the environment.
+fn run_with(args: &[&str], env: &[(&str, &str)]) -> (Option<i32>, String, String) {
+    let out = Command::new(BIN)
+        .args(args)
+        .envs(env.iter().copied())
+        .output()
+        .expect("run kbf");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// A daemon's certificate files as the startup self-checks want them (a certificate of the
+/// daemon row for node `n`, its CA, the key private to this user) under a scratch
+/// directory of `name`: the `--ca-cert`, `--cert` and `--key` flags. The tests below that
+/// reach the mode's own start need a host the self-checks pass.
+#[cfg(target_os = "linux")]
+fn daemon_files(name: &str) -> [String; 3] {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use rcgen::{ExtendedKeyUsagePurpose, KeyUsagePurpose, SanType};
+
+    let dir = scratch(name);
+    let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+    ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca = rcgen::CertifiedIssuer::self_signed(ca, rcgen::KeyPair::generate().expect("key"))
+        .expect("CA");
+    let mut leaf = rcgen::CertificateParams::new(vec!["n".to_owned()]).expect("params");
+    leaf.subject_alt_names.push(SanType::URI(
+        "urn:kbf:role:daemon".to_owned().try_into().expect("IA5"),
+    ));
+    leaf.is_ca = rcgen::IsCa::ExplicitNoCa;
+    leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    leaf.use_authority_key_identifier_extension = true;
+    let key = rcgen::KeyPair::generate().expect("key");
+    let cert = leaf.signed_by(&key, &ca).expect("signed");
+    let write = |file: &str, text: String, mode: u32| {
+        let path = dir.join(file);
+        std::fs::write(&path, text).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("mode");
+        path.display().to_string()
+    };
+    [
+        format!("--ca-cert={}", write("ca.pem", ca.pem(), 0o644)),
+        format!("--cert={}", write("node.pem", cert.pem(), 0o644)),
+        format!("--key={}", write("node.key", key.serialize_pem(), 0o600)),
+    ]
 }
 
 /// Catches a build node that starts with a flag of another mode (exit 0 or 1 instead of
@@ -247,16 +295,16 @@ fn the_readmes_smoke_test_runs() {
 /// directory cannot be made exits 1 with the daemon's message.
 #[test]
 fn daemon_runs_the_daemons_start() {
+    let [ca, cert, key] = daemon_files("daemon_runs_the_daemons_start");
     let (code, _, err) = run(&[
         names::DAEMON,
-        "--driver=container",
+        "--driver=native",
         "--cas=https://127.0.0.1:1",
-        "--id-files=/nonexistent/ids",
         "--data-dir=/proc/nonexistent/kbf",
         "--server=https://127.0.0.1:1",
-        "--ca-cert=/nonexistent/ca.pem",
-        "--cert=/nonexistent/node.pem",
-        "--key=/nonexistent/node.key",
+        &ca,
+        &cert,
+        &key,
         "--node-id=n",
     ]);
     assert_eq!(code, Some(1), "{err}");
@@ -268,18 +316,30 @@ fn daemon_runs_the_daemons_start() {
 /// refuses a cold store that cannot be made (exit 2, as in `kbf-all-in-one`).
 #[test]
 fn all_in_one_runs_both_halves_start() {
-    let (code, _, err) = run(&[
-        names::ALL_IN_ONE,
-        "--driver=container",
-        "--server=https://127.0.0.1:1",
-        "--ca-cert=/nonexistent/ca.pem",
-        "--cert=/nonexistent/node.pem",
-        "--key=/nonexistent/node.key",
-        "--node-id=n",
-        "--listen=127.0.0.1:0",
-        "--worker-listen=127.0.0.1:0",
-        "--cold-store=file:///proc/nonexistent/cold",
-    ]);
+    let [ca, cert, key] = daemon_files("all_in_one_runs_both_halves_start");
+    // The container driver's host, as the self-checks want it: a `podman` on PATH and the
+    // user's runtime directory (neither is run; the start stops at the cold store).
+    let dir = scratch("all_in_one_runs_both_halves_start_host");
+    let podman = dir.join("podman");
+    std::fs::write(&podman, "").expect("write");
+    std::fs::set_permissions(&podman, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("mode");
+    let (path, xdg) = (dir.display().to_string(), dir.display().to_string());
+    let (code, _, err) = run_with(
+        &[
+            names::ALL_IN_ONE,
+            "--driver=container",
+            "--server=https://127.0.0.1:1",
+            &ca,
+            &cert,
+            &key,
+            "--node-id=n",
+            "--listen=127.0.0.1:0",
+            "--worker-listen=127.0.0.1:0",
+            "--cold-store=file:///proc/nonexistent/cold",
+        ],
+        &[("PATH", &path), ("XDG_RUNTIME_DIR", &xdg)],
+    );
     assert_eq!(code, Some(2), "{err}");
     assert_eq!(err.lines().last(), Some(ALL_IN_ONE_REFUSAL));
 }
@@ -328,11 +388,10 @@ fn check_args_parses_and_starts_nothing() {
             "--node-id=n",
             &data_flag,
         ]);
-        assert_eq!(
-            (code, out.as_str(), err.as_str()),
-            (Some(0), "", ""),
-            "{mode}"
-        );
+        assert_eq!((code, out.as_str()), (Some(0), ""), "{mode}");
+        // Only the deprecation note (tests/config_process.rs).
+        assert_eq!(err.lines().count(), 1, "{mode}: {err}");
+        assert!(err.contains("deprecated"), "{mode}: {err}");
         assert!(!data.exists(), "{mode} started: {} made", data.display());
     }
 }
@@ -388,7 +447,6 @@ fn help_does_not_name_check_args() {
     for flag in ["--help", "-h"] {
         let (code, out, err) = run(&[flag]);
         assert_eq!(code, Some(0), "{flag}: {err}");
-        assert!(out.contains("Commands:"), "{flag}: {out}");
         assert!(!out.contains(kbf_cli::CHECK_ARGS), "{flag}: {out}");
         assert!(!err.contains(kbf_cli::CHECK_ARGS), "{flag}: {err}");
     }

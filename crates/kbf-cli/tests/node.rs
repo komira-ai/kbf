@@ -32,6 +32,13 @@ use support::scratch;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
+/// Writes a `kbf.toml` that a start accepts whatever the umask of the test run is: the
+/// file may not be writable by group or other.
+fn write_config(path: &Path, text: &str) {
+    std::fs::write(path, text).expect("kbf.toml");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).expect("mode");
+}
+
 struct Harness {
     run: Running,
     root: PathBuf,
@@ -40,8 +47,11 @@ struct Harness {
     /// How many waits are honoured (the start then tries again); the next one gives up.
     patience: Arc<Mutex<usize>>,
     /// Runs on every wait that is honoured, before the start tries again.
-    on_wait: Arc<Mutex<Option<Box<dyn Fn() + Send>>>>,
+    on_wait: Arc<Mutex<Option<Hook>>>,
 }
+
+/// What runs on a wait that is honoured.
+type Hook = Box<dyn Fn() + Send>;
 
 impl Harness {
     fn new(name: &str) -> Self {
@@ -84,7 +94,7 @@ impl Harness {
             self.token_path().display(),
             self.state().display(),
         );
-        std::fs::write(self.config_path(), text).expect("kbf.toml");
+        write_config(&self.config_path(), &text);
     }
 
     /// The fake's own frontend, a one-use token, and the files a start reads.
@@ -143,7 +153,7 @@ impl Harness {
     /// Writes `mode = "..."` at the top of `kbf.toml`.
     fn file_says(&self, mode: &str) {
         let text = std::fs::read_to_string(self.config_path()).expect("kbf.toml");
-        std::fs::write(self.config_path(), format!("mode = \"{mode}\"\n{text}")).expect("rewrite");
+        write_config(&self.config_path(), &format!("mode = \"{mode}\"\n{text}"));
     }
 
     /// The roles the frontend was asked for, one list per `Enroll` call.
@@ -403,7 +413,7 @@ async fn files_that_are_not_right_stop_the_start() {
 
     h.ready("[daemon]\nbogus = 1\n");
     let failure = start(&h, &launches, || {}).await.expect_err("bad config");
-    assert!(matches!(failure, Failure::Config(_)), "{failure:?}");
+    assert!(matches!(failure, Failure::Settings(_)), "{failure:?}");
     assert!(failure.to_string().contains("bogus"), "{failure}");
 
     h.ready("[daemon]\n");
@@ -445,7 +455,7 @@ async fn a_node_id_that_changed_since_enrollment_is_refused() {
     start(&h, &launches, || {}).await.expect("first start");
 
     let text = std::fs::read_to_string(h.config_path()).expect("kbf.toml");
-    std::fs::write(h.config_path(), text.replace("node-02", "node-03")).expect("rewrite");
+    write_config(&h.config_path(), &text.replace("node-02", "node-03"));
     let failure = start(&h, &launches, || {}).await.expect_err("renamed");
     assert!(
         matches!(&failure, Failure::RenamedNode { enrolled, configured }
@@ -503,7 +513,11 @@ async fn the_first_start_of_each_mode_enrolls_for_exactly_its_roles() {
             .await
             .unwrap_or_else(|e| panic!("{mode} with {extra:?}: {e}"));
         assert_eq!(launches.seen(), [mode], "{mode} with {extra:?}");
-        assert_eq!(h.asked(), [want.clone()], "{mode} with {extra:?}");
+        assert_eq!(
+            h.asked(),
+            std::slice::from_ref(&want),
+            "{mode} with {extra:?}"
+        );
         let on_disk: Vec<String> = ["storage", "daemon"]
             .into_iter()
             .filter(|r| h.state().join("pki").join(format!("{r}.pem")).exists())
@@ -911,7 +925,10 @@ async fn a_later_start_of_each_mode_renews_without_the_token() {
         let launches = Arc::new(Launches::default());
         start_mode(&h, mode, &launches).await.expect("first start");
         assert_eq!(h.fake().enrolls().len(), 1, "{mode}");
-        std::fs::remove_file(h.token_path()).expect("the token file is no longer needed");
+        assert!(
+            !h.token_path().exists(),
+            "{mode}: enrolling removes the token file, so the second start has none"
+        );
         h.fake().set_now(h.fake().now() + LIFE_S / 2 + 10);
 
         let fake = Arc::clone(h.fake());
@@ -1202,7 +1219,7 @@ async fn check_exits_2_for_a_host_that_cannot_start() {
     let failure = start_with(&h, checking(&h, Some(names::DAEMON)), &launches, || {})
         .await
         .expect_err("bad config");
-    assert!(matches!(failure, Failure::Config(_)), "{failure:?}");
+    assert!(matches!(failure, Failure::Settings(_)), "{failure:?}");
     assert!(failure.to_string().contains("bogus"), "{failure}");
     assert_eq!(failure.exit_code(), 2);
 
@@ -1246,7 +1263,7 @@ async fn check_exits_2_for_a_host_that_cannot_start() {
         assert_eq!(failure.exit_code(), 2);
     }
     let text = std::fs::read_to_string(h.config_path()).expect("kbf.toml");
-    std::fs::write(h.config_path(), text.replace("node-02", "node-03")).expect("rewrite");
+    write_config(&h.config_path(), &text.replace("node-02", "node-03"));
     let failure = start_with(&h, checking(&h, Some(names::DAEMON)), &launches, || {})
         .await
         .expect_err("renamed");

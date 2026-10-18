@@ -45,6 +45,11 @@ thiserror.workspace = true
 # The renewal loop beside the running mode (src/node.rs).
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tracing.workspace = true
+# The startup self-checks (src/preflight): the role a certificate names, and a
+# certificate's chain, extended key usage and names, read as the farm's issuer made them.
+kbf-peer.workspace = true
+rustls.workspace = true
+x509-parser.workspace = true
 # The stand-in `podman`'s (kbf-cli-fake-podman); the effective uid and the host name that
 # a start that enrolls reads.
 rustix = { workspace = true, features = ["process", "system"] }
@@ -52,6 +57,8 @@ rustix = { workspace = true, features = ["process", "system"] }
 kbf-state.workspace = true
 # The identity `kbf --version --json` prints (src/version.rs).
 serde_json.workspace = true
+# The settings file (src/config.rs).
+toml.workspace = true
 
 [dev-dependencies]
 # The REAPI conformance suite, run against a `kbf storage` process (tests/storage_process.rs):
@@ -81,8 +88,7 @@ kbf-host.workspace = true
 # (tests/deploy_units.rs), and the node's certificates (tests/storage_and_daemon.rs).
 rcgen = { workspace = true, features = ["x509-parser"] }
 # The in-process frontend of kbf-enroll's tests (tests/node.rs includes it): its
-# certificate authority and the role check of its worker listener.
-kbf-peer.workspace = true
+# certificate authority (the role check of its worker listener is kbf-peer's, above).
 sha2.workspace = true
 time.workspace = true
 x509-parser = { workspace = true, features = ["verify"] }

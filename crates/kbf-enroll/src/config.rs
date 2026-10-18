@@ -9,6 +9,7 @@
 //! one-filesystem rule) are [`Config::check_paths`], separate so that parsing a file is
 //! a pure function of its text and the [`Host`] it is read on.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr};
 use std::os::unix::fs::MetadataExt;
@@ -41,9 +42,38 @@ const MAX_ZONE_LEN: usize = 63;
 /// The port of an `https` URL that names none.
 const HTTPS_PORT: u16 = 443;
 
-/// The tables and keys of the file. Any other key is an error.
+/// The keys of the file that are enrollment's: the top-level `mode` and, per table, the
+/// keys [`Config`] reads. The rest of a shared `kbf.toml` is the mode's flags, one table
+/// per group ([`Config::parse_shared`]); `kbf-cli` leaves these out of the flags.
+pub const KEYS: &[(&str, &[&str])] = &[
+    ("", &["mode"]),
+    ("frontend", &["url"]),
+    ("enroll", &["token_file"]),
+    ("node", &["id", "advertise", "zone"]),
+    ("dirs", &["state"]),
+    ("storage", &["hot_dir", "meta_dir"]),
+    ("daemon", &["data_dir", "reserve_cpus"]),
+    ("tls", &["trust"]),
+];
+
+/// Whether `table.key` (`table` empty for a top-level key) is a key of [`KEYS`].
+#[must_use]
+pub fn is_key(table: &str, key: &str) -> bool {
+    KEYS.iter()
+        .any(|(t, keys)| *t == table && keys.contains(&key))
+}
+
+/// Whether `table` is a table of [`KEYS`] whose every key is enrollment's: the file may
+/// not put a flag in it.
+#[must_use]
+pub fn is_own_table(table: &str) -> bool {
+    !table.is_empty() && !matches!(table, "daemon" | "tls") && KEYS.iter().any(|(t, _)| *t == table)
+}
+
+/// The tables and keys of the file. In a shared file the tables of the mode's flags are
+/// let through (`other`), and in the tables `daemon` and `tls`, which flags also use, the
+/// keys that are not enrollment's.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Raw {
     mode: Option<Spanned<String>>,
     frontend: Option<RawFrontend>,
@@ -53,6 +83,8 @@ struct Raw {
     storage: Option<RawStorage>,
     daemon: Option<RawDaemon>,
     tls: Option<RawTls>,
+    #[serde(flatten)]
+    other: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -89,16 +121,18 @@ struct RawStorage {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawDaemon {
     data_dir: Option<Spanned<String>>,
     reserve_cpus: Option<Spanned<i64>>,
+    #[serde(flatten)]
+    other: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawTls {
     trust: Option<Spanned<String>>,
+    #[serde(flatten)]
+    other: BTreeMap<String, toml::Value>,
 }
 
 /// What a node knows about the machine it runs on, passed in so parsing reads nothing.
@@ -256,6 +290,45 @@ impl Check<'_> {
             Err(message) => {
                 self.fail(key, Some(raw.span().start), message);
                 None
+            }
+        }
+    }
+}
+
+impl Check<'_> {
+    /// A key of a table that only flags may add, or a table of none of ours: unknown to a
+    /// file that is only enrollment's.
+    fn unknown(&mut self, raw: &Raw) {
+        for table in raw.other.keys() {
+            let line = self
+                .text
+                .lines()
+                .position(|l| {
+                    let l = l.trim_start();
+                    l.strip_prefix('[').is_some_and(|r| {
+                        r.trim_start_matches('[')
+                            .trim_start()
+                            .starts_with(table.as_str())
+                    }) || l.split_once('=').is_some_and(|(k, _)| k.trim() == table)
+                })
+                .map(|i| i + 1);
+            self.problems.push(Problem {
+                key: String::new(),
+                line,
+                message: format!("unknown field `{table}`"),
+            });
+        }
+        let in_tables = [
+            ("daemon", raw.daemon.as_ref().map(|d| &d.other)),
+            ("tls", raw.tls.as_ref().map(|t| &t.other)),
+        ];
+        for (table, other) in in_tables {
+            for key in other.into_iter().flat_map(BTreeMap::keys) {
+                self.problems.push(Problem {
+                    key: format!("{table}.{key}"),
+                    line: None,
+                    message: format!("unknown field `{key}`"),
+                });
             }
         }
     }
@@ -431,12 +504,30 @@ impl Config {
     /// unknown key or a wrong type reports that one problem, because nothing else in it
     /// can be trusted.
     pub fn parse(text: &str, host: &Host) -> Result<Self, Problems> {
+        Self::read(text, host, false)
+    }
+
+    /// Reads `text` as the enrollment's part of a `kbf.toml` that also holds the mode's
+    /// flags: the tables of the flags, and the keys of them in `[daemon]` and `[tls]`,
+    /// are let through here and are the flags' parser's to check. Every key of
+    /// [`KEYS`] is checked as in [`Config::parse`].
+    ///
+    /// # Errors
+    /// As [`Config::parse`].
+    pub fn parse_shared(text: &str, host: &Host) -> Result<Self, Problems> {
+        Self::read(text, host, true)
+    }
+
+    fn read(text: &str, host: &Host, shared: bool) -> Result<Self, Problems> {
         let raw: Raw =
             toml::from_str(text).map_err(|error| Problems(vec![parse_problem(text, &error)]))?;
         let mut check = Check {
             text,
             problems: Vec::new(),
         };
+        if !shared {
+            check.unknown(&raw);
+        }
 
         let mode = check.value("mode", raw.mode.as_ref(), |t| {
             if !t.is_empty() && t.bytes().all(|c| c.is_ascii_lowercase() || c == b'-') {

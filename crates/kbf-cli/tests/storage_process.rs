@@ -154,7 +154,15 @@ async fn the_storage_client_reads_what_it_wrote_in_another_process() {
 #[test]
 fn a_refused_start_exits_2_and_a_state_store_is_refused() {
     let run = |args: &[&str]| Command::new(BIN).args(args).output().expect("run kbf");
-    let out = run(&["storage"]);
+    // Given none of its flags a node reads the host's file; named and missing, that is the
+    // refusal (exit 2, the file named).
+    let out = run(&["storage", "--config", "/nonexistent/kbf.toml"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("/nonexistent/kbf.toml"), "{err}");
+    assert!(out.stdout.is_empty());
+    // Given flags, they are the start, and it names the one it lacks.
+    let out = run(&["storage", "--storage-listen=127.0.0.1:0"]);
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -267,6 +275,20 @@ fn plain_text_off_loopback_is_a_refused_start() {
     );
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("read ") && err.contains("none.pem"), "{err}");
+    // The startup self-checks name all three files at once, not the first the TLS load
+    // meets, and the refusal is about them, not the listener's address.
+    for flag in [
+        "--storage-tls-cert",
+        "--storage-tls-key",
+        "--storage-client-ca",
+    ] {
+        assert!(
+            err.lines().any(|l| l.contains(flag)
+                && l.contains("none.pem")
+                && l.contains("does not exist")),
+            "{flag}: {err}"
+        );
+    }
+    assert_eq!(err.lines().count(), 3, "{err}");
     assert!(!err.contains("--storage-listen"), "{err}");
 }

@@ -63,14 +63,29 @@
 //! frontend is updated without failing a build. Like `cluster` it starts no mode: `kbf
 //! frontend` takes only flags, and the word `handover` after it is this command's.
 //!
+//! Before a mode starts, [`preflight`] checks what it needs of its host (the files its
+//! flags name, its certificate's role, the S3 key pair, the container driver's programs,
+//! ...) and refuses, with every missing piece on stderr, one line each, and exit status 2
+//! (75 for a piece that heals shortly). `check-args`, `cluster` and `frontend handover`
+//! read nothing of the host and skip it.
+//!
+//! Every mode also takes `--config FILE` and `--check` ([`config`]): the settings may be in
+//! `/etc/kbf/kbf.toml` (one TOML table per setting group, one key per flag, a flag on the
+//! command line overriding its key), and `--check` parses the flags and the file, runs the
+//! startup checks and exits 0, 2 or 75 without starting ([`preflight::check_only`]).
+//! `check-args` is `--check`'s parse stage only, kept for `kbf-deploy`, with a deprecation
+//! note on its last line of standard error.
+//!
 //! The `kbf-server`, `kbf-daemon` and `kbf-all-in-one` binaries are unchanged.
 
 pub mod cluster;
+pub mod config;
 pub mod enroll;
 pub mod handover;
 pub mod names;
 pub mod node;
 pub mod nofile;
+pub mod preflight;
 pub mod version;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -119,6 +134,25 @@ fn own_command(entry: Entry) -> Command {
         Entry::Storage => kbf_server::storage_node::command(),
         Entry::StorageAndDaemon => kbf_all_in_one::storage_and_daemon::command(),
         Entry::Frontend => kbf_server::frontend::command(),
+    }
+}
+
+/// The flags a mode's own command carries only so that it can refuse them by name (the
+/// flags of `kbf-server` that `kbf storage` and `kbf frontend` do not take): they are
+/// no settings.
+fn refused_own(entry: Entry) -> BTreeSet<String> {
+    match entry {
+        Entry::Frontend => kbf_server::frontend::refused_flags(),
+        Entry::Storage => kbf_server::storage_node::refused_flags(),
+        // The daemon's flags are its own whatever they are called.
+        Entry::StorageAndDaemon => {
+            let daemon = longs(&kbf_node::Cli::command());
+            kbf_server::storage_node::refused_flags()
+                .into_iter()
+                .filter(|flag| !daemon.contains(flag))
+                .collect()
+        }
+        Entry::Daemon | Entry::AllInOne => BTreeSet::new(),
     }
 }
 
@@ -183,7 +217,26 @@ fn mode_command(name: &'static str, entry: Entry) -> Command {
                 // The id is the flag's own name: no argument of either has a hyphen in its id.
                 cmd = cmd.arg(Arg::new(*flag).long(*flag).num_args(0..=1).hide(true));
             }
-            cmd
+            cmd.arg(
+                Arg::new(CONFIG)
+                    .long(CONFIG)
+                    .value_name("FILE")
+                    .value_parser(clap::value_parser!(std::path::PathBuf))
+                    .help(format!(
+                        "Read the mode's settings from this TOML file (default {} when it \
+                         exists); a flag on the command line overrides its key",
+                        config::DEFAULT_PATH
+                    )),
+            )
+            .arg(
+                Arg::new(CHECK)
+                    .long(CHECK)
+                    .action(clap::ArgAction::SetTrue)
+                    .help(
+                        "Parse the flags and the file, run the startup checks, print each \
+                         problem and exit (0 fine, 2 refused, 75 not ready) without starting",
+                    ),
+            )
         }
     }
 }
@@ -216,7 +269,7 @@ pub fn command() -> Command {
                 .help(format!(
                     "The host's config file, read by a storage, daemon or storage-and-daemon \
                      start that is given no other flag of its mode [default: {}]",
-                    enroll::DEFAULT_CONFIG
+                    config::DEFAULT_PATH
                 )),
         )
         .arg(
@@ -246,6 +299,16 @@ pub fn command() -> Command {
         names::FRONTEND,
         names::FRONTEND,
     ))
+}
+
+/// The whole `kbf.toml` of mode `mode`, every setting in its group's table
+/// ([`config::template`]); `None` for a word that is not a mode.
+#[must_use]
+pub fn config_template(mode: &str) -> Option<String> {
+    MODES
+        .iter()
+        .find(|m| m.name == mode)
+        .map(|m| config::template(m.name, &own_command(m.entry), &refused_own(m.entry)))
 }
 
 /// The word after `kbf` that calls the operator API ([`cluster`]) instead of starting a
@@ -410,95 +473,239 @@ fn named_mode(split: &Split, args: &[OsString]) -> Result<Option<&'static Mode>,
     Ok(by_flag.or(by_alias))
 }
 
-/// Parses a command line (its first word is the program's name): `kbf --mode=<mode>
-/// [flags...]`, or the hidden alias `kbf <mode> [flags...]`, or a start that reads
-/// `kbf.toml` ([`Invocation::Registered`]). Reads no file.
+/// Parses a command line (its first word is the program's name) and reads no file unless
+/// `--config` names one: [`parse_with`] without a default file.
 ///
 /// # Errors
-/// What `clap` refuses, and any flag of another mode, which the error names.
+/// What [`parse_with`] refuses.
 pub fn parse_from<I, T>(args: I) -> Result<Invocation, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    parse_with(args, None).map(|parsed| parsed.invocation)
+}
+
+/// The flag that names the settings file.
+pub const CONFIG: &str = "config";
+
+/// The flag that checks a start instead of making it.
+pub const CHECK: &str = "check";
+
+/// A command line parsed with its settings file.
+#[derive(Clone, Debug)]
+pub struct Parsed {
+    /// The mode and its flags: the command line's, then the file's for those it did not give.
+    pub invocation: Invocation,
+    /// `--check` was given: print the problems and exit, start nothing. Always false for
+    /// [`Invocation::Registered`], which carries its own ([`node::Start::check`]).
+    pub check: bool,
+}
+
+/// Parses a command line (its first word is the program's name): `kbf --mode=<mode>
+/// [flags...]`, or the hidden alias `kbf <mode> [flags...]`, or `kbf` alone with `mode`
+/// in the settings file. The settings file is the one `--config` names, else
+/// `default_config` when that file exists ([`config::DEFAULT_PATH`] for `kbf`); a flag on
+/// the command line overrides the file's key for it.
+///
+/// A storage, daemon or storage-and-daemon start given no flag of its mode, on a file
+/// that holds enrollment's tables, is [`Invocation::Registered`]: the file and the
+/// enrollment make its flags ([`node`]).
+///
+/// # Errors
+/// What `clap` refuses, any flag of another mode (which the error names), no mode, and
+/// what is wrong with the file ([`config::file_args`]), as an error that exits 2.
+pub fn parse_with<I, T>(
+    args: I,
+    default_config: Option<&std::path::Path>,
+) -> Result<Parsed, clap::Error>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString>,
 {
     let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
     let mut split = split(&args)?;
-    let named = named_mode(&split, &args)?;
-    let reads_file = split.check || split.config.is_some();
-    let node_mode = named.is_none_or(|m| names::is_registered(m.name));
-    if reads_file && !node_mode {
-        let flag = if split.check { "--check" } else { "--config" };
-        return Err(command().error(
-            ErrorKind::ArgumentConflict,
-            format!(
-                "kbf --mode={} refuses {flag}: only the storage, daemon and storage-and-daemon \
-                 modes read kbf.toml and have a --check so far; the others take their configuration \
-                 as flags",
-                named.map_or("", |m| m.name)
-            ),
-        ));
-    }
-    // The flag form with no flag of a mode, or an alias given a flag of the file: a start
-    // that reads kbf.toml. The alias alone is the old start on the mode's own flags.
-    let registered = split.rest.is_empty() && (reads_file || (split.alias.is_none() && node_mode));
-    if registered {
-        return Ok(Invocation::Registered(Box::new(node::Start {
-            mode: named.map(|m| m.name),
-            config: split
-                .config
-                .unwrap_or_else(|| PathBuf::from(enroll::DEFAULT_CONFIG)),
-            check: split.check,
-            labels: split
-                .labels
-                .iter()
-                .map(|l| l.to_string_lossy().into_owned())
-                .collect(),
-        })));
-    }
-    if reads_file {
-        let flag = if split.check { "--check" } else { "--config" };
-        return Err(command().error(
-            ErrorKind::ArgumentConflict,
-            format!(
-                "{flag} reads kbf.toml, which replaces the flags of the mode; \
-                 drop {} or drop {flag}",
-                split.rest[0].to_string_lossy()
-            ),
-        ));
-    }
-    let Some(mode) = named else {
+    let mut named = named_mode(&split, &args)?;
+    let flag_named = named.is_some();
+    let path = split
+        .config
+        .clone()
+        .or_else(|| default_config.filter(|p| p.exists()).map(Into::into));
+    if named.is_none() {
         // Flags and no mode: the help and the version are clap's to print.
         let argv = std::iter::once(args[0].clone()).chain(split.rest.iter().cloned());
-        if let Err(e) = command().try_get_matches_from(argv)
-            && matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion)
-        {
-            return Err(e);
+        if let Err(e) = command().try_get_matches_from(argv) {
+            let own_flag = |flag: &str| {
+                MODES
+                    .iter()
+                    .any(|m| longs(&own_command(m.entry)).contains(flag))
+            };
+            let unknown = split.rest.iter().filter_map(|w| w.to_str()).any(|w| {
+                w.strip_prefix("--")
+                    .map(|f| f.split('=').next().unwrap_or(f))
+                    .is_some_and(|f| !f.is_empty() && !own_flag(f))
+            });
+            // A flag of no mode is clap's to refuse, naming it; the flags of a mode with
+            // no mode named are answered by "no mode" below.
+            if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) || unknown {
+                return Err(e);
+            }
         }
-        return Err(command().error(
-            ErrorKind::MissingRequiredArgument,
-            "no mode: flags of a mode need --mode=<mode> (frontend, storage, daemon, \
-             storage-and-daemon or all-in-one)",
-        ));
-    };
-    // The mode's own flags, with the labels the split took out put back.
+        named = Some(mode_of_file(path.as_deref(), default_config)?);
+    }
+    let mode = named.expect("a mode was named or read from the file");
+    // A start that gives no flag of its mode reads the host's file; one whose file is not
+    // there is refused by that start, naming the file, not by a list of missing flags. A
+    // file that exists and has none of enrollment's tables is the mode's flags alone.
+    // The old alias word with no `--config` and no `--check` (a `--label` is a flag of the
+    // old start) is the old start and wants its flags.
+    let bare_alias = split.alias.is_some() && split.config.is_none() && !split.check;
+    if split.rest.is_empty()
+        && !bare_alias
+        && names::is_registered(mode.name)
+        && path
+            .as_deref()
+            .is_none_or(|p| !p.exists() || config::enrolls(p))
+    {
+        return Ok(Parsed {
+            invocation: Invocation::Registered(Box::new(node::Start {
+                mode: Some(mode.name),
+                config: path.unwrap_or_else(|| PathBuf::from(config::DEFAULT_PATH)),
+                check: split.check,
+                labels: split
+                    .labels
+                    .iter()
+                    .map(|l| l.to_string_lossy().into_owned())
+                    .collect(),
+            })),
+            check: false,
+        });
+    }
+    // The flag wins over the file's `mode`; say so (a start that reads the file says it
+    // itself, in `node::run_with`).
+    if flag_named
+        && let Some(path) = &path
+        && let Ok(Some(file)) = config::file_mode(path)
+        && file != mode.name
+    {
+        eprintln!(
+            "kbf: --mode={} overrides mode = {file:?} in {}",
+            mode.name,
+            path.display()
+        );
+    }
+    // The mode's own flags: its subcommand word, the labels the split took out put back.
     let labels = split.labels.drain(..).map(|mut l| {
         let mut flag = OsString::from("--label=");
         flag.push(std::mem::take(&mut l));
         flag
     });
+    let config = path.as_ref().map(|path| {
+        let mut flag = OsString::from("--config=");
+        flag.push(path);
+        flag
+    });
     let argv: Vec<OsString> = [args[0].clone(), mode.name.into()]
         .into_iter()
+        .chain(config)
+        .chain(split.check.then(|| OsString::from("--check")))
         .chain(labels)
         .chain(split.rest)
         .collect();
-    parse_mode(argv)
+    let check = split.check;
+    parse_with_file(argv).map(|invocation| Parsed { invocation, check })
 }
 
-/// Parses `kbf <mode> [flags...]`, the mode's own flags.
-fn parse_mode(args: Vec<OsString>) -> Result<Invocation, clap::Error> {
-    let matches = match command().try_get_matches_from(&args) {
+/// The mode a command line that names none gets from the settings file.
+fn mode_of_file(
+    path: Option<&std::path::Path>,
+    default_config: Option<&std::path::Path>,
+) -> Result<&'static Mode, clap::Error> {
+    let modes = MODES.map(|m| m.name).join("|");
+    let where_ = path.map_or_else(
+        || {
+            default_config.map_or_else(
+                || config::DEFAULT_PATH.to_owned(),
+                |p| p.display().to_string(),
+            )
+        },
+        |p| p.display().to_string(),
+    );
+    let no_mode = |detail: &str| {
+        command().error(
+            ErrorKind::MissingRequiredArgument,
+            format!("no mode: give --mode=<{modes}> or set mode = \"...\" in {where_} ({detail})"),
+        )
+    };
+    let Some(path) = path.filter(|p| p.exists()) else {
+        return Err(no_mode("there is no such file"));
+    };
+    let file = config::file_mode(path).map_err(|why| command().error(ErrorKind::Io, why))?;
+    let Some(file) = file else {
+        return Err(no_mode("it sets none"));
+    };
+    MODES.iter().find(|m| m.name == file).ok_or_else(|| {
+        command().error(
+            ErrorKind::InvalidValue,
+            format!("mode = {file:?} in {where_} is not a mode (one of {modes})"),
+        )
+    })
+}
+
+/// The mode of `args` and what a lenient parse of its flags found, when `args` name a
+/// mode.
+fn lenient(args: &[OsString]) -> Option<(&'static str, Entry, ArgMatches)> {
+    let mut lenient = command().ignore_errors(true);
+    for mode in MODES {
+        lenient = lenient.mut_subcommand(mode.name, |sub| sub.ignore_errors(true));
+    }
+    let matches = lenient.try_get_matches_from(args).ok()?;
+    let (name, m) = matches.subcommand()?;
+    let mode = MODES.iter().find(|mode| mode.name == name)?;
+    Some((mode.name, mode.entry, m.clone()))
+}
+
+/// Checks that every key of the file at `path` is a setting of `mode` (or enrollment's),
+/// and that each value is what its flag takes; the flags themselves are not parsed.
+///
+/// # Errors
+/// Every problem of the file, one per line.
+pub fn check_settings(mode: &str, path: &std::path::Path) -> Result<(), String> {
+    let Some(m) = MODES.iter().find(|m| m.name == mode) else {
+        return Err(format!("{mode} is not a mode"));
+    };
+    config::file_args(
+        &own_command(m.entry),
+        &refused_own(m.entry),
+        path,
+        &BTreeSet::new(),
+    )
+    .map(|_| ())
+}
+
+/// Parses `kbf <mode> [flags...]` and the settings file `--config` names in it, if any.
+fn parse_with_file(mut args: Vec<OsString>) -> Result<Invocation, clap::Error> {
+    if let Some((mode, entry, m)) = lenient(&args)
+        && let Some(path) = m.get_one::<PathBuf>(CONFIG).cloned()
+    {
+        let own = own_command(entry);
+        let given = own
+            .get_arguments()
+            .map(|a| a.get_id().as_str())
+            .filter(|id| m.value_source(id) == Some(clap::parser::ValueSource::CommandLine))
+            .map(str::to_owned)
+            .collect();
+        let extra = config::file_args(&own, &refused_own(entry), &path, &given)
+            .map_err(|why| command().error(ErrorKind::Io, format!("kbf {mode}: {why}")))?;
+        args.extend(extra);
+    }
+    parse_invocation(&args)
+}
+
+fn parse_invocation(args: &[OsString]) -> Result<Invocation, clap::Error> {
+    let matches = match command().try_get_matches_from(args) {
         Ok(matches) => matches,
-        Err(e) => return Err(refusal_in(&args).unwrap_or(e)),
+        Err(e) => return Err(refusal_in(args).unwrap_or_else(|| in_flag_form(args, e))),
     };
     let (name, m) = matches.subcommand().expect("a subcommand is required");
     let mode = MODES
@@ -536,6 +743,24 @@ fn parse_mode(args: Vec<OsString>) -> Result<Invocation, clap::Error> {
                 m,
             )?)))
         }
+    }
+}
+
+/// `error`, which parsing `kbf <mode> ...` gave, as the flag form says it: the usage line
+/// of the mode's help and of its errors names `kbf --mode=<mode>`, not the hidden alias.
+/// The mode's command is parsed again as the root of its own command line, which is how
+/// clap gets the name it prints; an error the second parse does not repeat is left as it was.
+fn in_flag_form(args: &[OsString], error: clap::Error) -> clap::Error {
+    let Some(mode) = args
+        .get(1)
+        .and_then(|word| MODES.iter().find(|m| word.to_str() == Some(m.name)))
+    else {
+        return error;
+    };
+    let argv = args.iter().take(1).chain(args.iter().skip(2));
+    match mode_command(mode.name, mode.entry).try_get_matches_from(argv) {
+        Err(again) if again.kind() == error.kind() => again,
+        _ => error,
     }
 }
 
@@ -601,15 +826,7 @@ pub fn check_args(args: &[std::ffi::OsString]) -> Result<(), clap::Error> {
         .chain(args.iter().skip(2))
         .cloned()
         .collect::<Vec<_>>();
-    let parsed = parse_from(argv).and_then(|parsed| match parsed {
-        // The mode of a start that reads kbf.toml is in a file this parse does not read; a
-        // check of arguments with no mode at all has checked nothing.
-        Invocation::Registered(start) if start.mode.is_none() => Err(command().error(
-            ErrorKind::MissingRequiredArgument,
-            "no mode: check-args needs --mode=<mode> (it reads no file)",
-        )),
-        _ => Ok(()),
-    });
+    let parsed = parse_from(argv).map(|_| ());
     match parsed {
         Err(e) if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => {
             Err(command().error(
@@ -624,7 +841,8 @@ pub fn check_args(args: &[std::ffi::OsString]) -> Result<(), clap::Error> {
 /// The `kbf` binary: the daemon's helper re-execs first (a keeper or a `__chown-dirs`
 /// run of this binary never reads the command line as `kbf`'s), then [`version::line`]
 /// for `kbf --version --json`, then the command line, then [`check_args`] for `kbf
-/// check-args ...`, [`cluster::run`] for `kbf cluster ...`, [`handover::run`] for `kbf frontend handover ...` or else [`run`]. A command
+/// check-args ...`, [`cluster::run`] for `kbf cluster ...`, [`handover::run`] for `kbf frontend handover ...` or else
+/// [`preflight::refusal`] and [`run`]. A command
 /// line that
 /// does not parse exits 2 (0 for `--help` and `--version`).
 #[must_use]
@@ -641,13 +859,19 @@ pub fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if args.get(1).is_some_and(|word| word == CHECK_ARGS) {
-        return match check_args(&args) {
+        let code = match check_args(&args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 let _ = e.print();
                 ExitCode::from(2)
             }
         };
+        // After the result: `kbf-deploy` reports the first line this prints.
+        eprintln!(
+            "kbf: `check-args` is deprecated: it only parses the flags; use `kbf <mode> ... \
+             --check`, which also reads the config file and runs the startup checks"
+        );
+        return code;
     }
     if args.get(1).is_some_and(|word| word == names::FRONTEND)
         && args.get(2).is_some_and(|word| word == HANDOVER)
@@ -663,8 +887,14 @@ pub fn main() -> ExitCode {
             Err(e) => e.exit(),
         };
     }
-    match parse_from(args) {
-        Ok(invocation) => run(&invocation),
+    match parse_with(args, Some(std::path::Path::new(config::DEFAULT_PATH))) {
+        Ok(Parsed {
+            invocation,
+            check: true,
+        }) => preflight::check_only(&invocation),
+        Ok(Parsed { invocation, .. }) => {
+            preflight::refusal(&invocation).unwrap_or_else(|| run(&invocation))
+        }
         Err(e) => e.exit(),
     }
 }

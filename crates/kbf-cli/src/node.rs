@@ -54,14 +54,14 @@ use kbf_enroll::renew::{Backoff, RenewError, first_attempt, near_expiry, renew};
 use kbf_enroll::store::{Node as Enrolled, Store, StoreError, StoredConfig};
 use kbf_enroll::token;
 use kbf_proto::kbf::enroll::v1::CredentialMode;
-use kbf_types::{Role, RoleSet};
+use kbf_types::Role;
 use std::path::{Path, PathBuf};
 use tokio::sync::watch;
 
 use crate::enroll::{
     DEFAULT_CONFIG, Env, Failure, Loaded, Want, anchor, enrolled, ensure_enrolled, load, report,
 };
-use crate::{Invocation, names, parse_from};
+use crate::{Invocation, names, parse_with, preflight};
 
 /// The longest the renew loop sleeps at once, in seconds: a wall clock that jumped (a
 /// machine that slept) is noticed within this.
@@ -245,6 +245,13 @@ pub fn plan(
         ));
     }
     Ok(argv)
+}
+
+/// Parses the mode's command line `argv` together with the settings of `kbf.toml`: the
+/// flags of the tables, for those `argv` does not give (the enrollment's win).
+fn parse_planned(argv: Vec<OsString>, path: &Path) -> Result<Invocation, clap::Error> {
+    let argv = argv.into_iter().chain([flag("config", path)]);
+    parse_with(argv, None).map(|parsed| parsed.invocation)
 }
 
 /// Why a renewal attempt failed; logged, never fatal.
@@ -461,13 +468,18 @@ pub fn resolve_mode(
 }
 
 /// `--check`: what this start would find, without starting, enrolling or dialing anything.
+/// A node that is not enrolled yet is checked for what it will enroll with (`kbf.toml`
+/// and its token file); an enrolled one gets the checks of any start
+/// ([`preflight::check_only`]) on the flags its enrollment makes.
 fn check(
     loaded: &Loaded,
+    path: &Path,
     want: Want,
     env: &Env,
     driver: Driver,
     labels: &[String],
-) -> Result<(), Failure> {
+) -> Result<ExitCode, Failure> {
+    crate::check_settings(want.mode, path).map_err(Failure::Settings)?;
     let Some(node) = enrolled(loaded, want)? else {
         // Not enrolled yet: the token must be there to enroll with (and be a token).
         token::read(&loaded.config.token_file, env.euid)?;
@@ -481,15 +493,15 @@ fn check(
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     };
     let argv = plan(&loaded.config, &node, &loaded.store, driver, labels, want)?;
-    parse_from(argv).map_err(Failure::Mode)?;
+    let invocation = parse_planned(argv, path).map_err(Failure::Mode)?;
     println!(
         "kbf: --check: mode {} is configured and this node is enrolled as {}",
         want.mode, node.node_id
     );
-    Ok(())
+    Ok(preflight::check_only(&invocation))
 }
 
 /// Runs a start: resolves the mode, enrolls if needed, runs the mode through `launch`
@@ -519,9 +531,11 @@ pub fn run_with(
         eprintln!("kbf: {note}");
     }
     if args.check {
-        check(&loaded, want, env, driver, &args.labels)?;
-        return Ok(ExitCode::SUCCESS);
+        return check(&loaded, &args.config, want, env, driver, &args.labels);
     }
+    // Before the token is spent: a table that is no setting of the mode would be found
+    // only after the node had enrolled.
+    crate::check_settings(want.mode, &args.config).map_err(Failure::Settings)?;
     let outcome = enroll_with_retry(&loaded, want, env)?;
     let node = outcome.node;
     if wants_keys(&node.config) {
@@ -538,7 +552,7 @@ pub fn run_with(
         &args.labels,
         want,
     )?;
-    let invocation = parse_from(argv).map_err(Failure::Mode)?;
+    let invocation = parse_planned(argv, &args.config).map_err(Failure::Mode)?;
 
     let renewer = Renewer::new(&loaded, &node, env, jitter());
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -558,7 +572,11 @@ pub fn run_with(
 /// Runs a start that reads `kbf.toml`.
 #[must_use]
 pub fn run(args: &Start) -> ExitCode {
-    run_with(args, &Env::system(), Driver::host(), &crate::run)
+    // The checks of any start, on the flags the enrollment made.
+    let launch = |invocation: &Invocation| {
+        preflight::refusal(invocation).unwrap_or_else(|| crate::run(invocation))
+    };
+    run_with(args, &Env::system(), Driver::host(), &launch)
         .unwrap_or_else(|failure| report(&failure))
 }
 

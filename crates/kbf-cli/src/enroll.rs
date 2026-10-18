@@ -41,11 +41,7 @@ use kbf_types::{CaPin, Role, RoleSet, RoleSetError};
 use crate::names;
 
 /// `kbf.toml` when `--config` is not given: where the packages put it.
-pub const DEFAULT_CONFIG: &str = if cfg!(target_os = "macos") {
-    "/usr/local/etc/kbf/kbf.toml"
-} else {
-    "/etc/kbf/kbf.toml"
-};
+pub const DEFAULT_CONFIG: &str = crate::config::DEFAULT_PATH;
 
 /// What a start needs to know about the machine and the time, passed in so a test can
 /// give them a scratch host, a clock and a wait of its own.
@@ -178,6 +174,9 @@ pub enum Failure {
     /// The flags a mode was built from were refused by the mode's own parser.
     #[error("{0}")]
     Mode(clap::Error),
+    /// The flag tables of `kbf.toml` are not settings of the mode.
+    #[error("{0}")]
+    Settings(String),
     /// A runtime or a thread could not be made.
     #[error("cannot start: {0}")]
     Runtime(#[from] std::io::Error),
@@ -258,7 +257,7 @@ pub fn load(path: &Path, env: &Env) -> Result<Loaded, Failure> {
         path: path.display().to_string(),
         source,
     })?;
-    let config = Config::parse(&text, &env.host)?;
+    let config = Config::parse_shared(&text, &env.host)?;
     let problems = config.check_paths(env.euid);
     if !problems.is_empty() {
         return Err(Failure::Paths(problems));

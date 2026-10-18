@@ -83,6 +83,9 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
                     ))
                 );
             }
+            Invocation::Registered(_) => {
+                panic!("{mode}: a rendered unit gives flags, so it is not a start that enrolls")
+            }
             Invocation::Storage(flags) => {
                 assert_eq!(mode, Mode::Storage);
                 // The unit's certificate flags are read as the paths they spell (not
