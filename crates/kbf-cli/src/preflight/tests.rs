@@ -1065,14 +1065,13 @@ mod wiring {
             .unwrap_or_else(|| panic!("no certificate {flag} in {:?}", n.certs))
     }
 
-    const DAEMON: [&str; 9] = [
+    const DAEMON: [&str; 8] = [
         "--server=https://front:7070",
         "--ca-cert=/c/ca.pem",
         "--cert=/c/node.pem",
         "--key=/c/node.key",
         "--node-id=node-1",
         "--driver=container",
-        "--container-runtime=oci",
         "--oci-runtime=/opt/crun",
         "--data-dir=/var/lib/kbf",
     ];

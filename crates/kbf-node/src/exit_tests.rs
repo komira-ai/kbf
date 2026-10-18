@@ -67,7 +67,7 @@ fn cli(extra: &[&str]) -> Cli {
 
 /// Catches the host needs reading the wrong flag: the files, the node id, the data
 /// directory (the default when not given) and, for the container driver alone, the
-/// OCI runtime only when `--container-runtime=oci` runs the containers.
+/// OCI runtime.
 #[test]
 fn the_flags_say_what_the_daemon_asks_of_its_host() {
     let n = cli(&["--driver=fake"]).host_needs();
@@ -89,12 +89,7 @@ fn the_flags_say_what_the_daemon_asks_of_its_host() {
         })
     );
 
-    let n = cli(&[
-        "--driver=container",
-        "--container-runtime=oci",
-        "--oci-runtime=/opt/crun",
-    ])
-    .host_needs();
+    let n = cli(&["--driver=container", "--oci-runtime=/opt/crun"]).host_needs();
     assert_eq!(
         n.container,
         Some(ContainerNeeds {

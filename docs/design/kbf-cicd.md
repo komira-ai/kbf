@@ -217,7 +217,7 @@ B-0, not the 20 of T5, which is a likely memory risk. The cost that matters is w
 merge path. Record job duration in the result document so a creeping beta shows in the numbers.
 
 **Container runtime [V].** The project runs containers with crun only. The harness today uses a stand-in runtime over a planted cgroup tree.
-Real crun needs cgroup v2 delegation and a systemd scope; the podman jobs in `ci.yml` arrange that with a `Delegate=yes`
+Real crun needs cgroup v2 delegation and a systemd scope; the crun jobs in `ci.yml` arrange that with a `Delegate=yes`
 unit, and the same approach is to be tried for crun on `ubuntu-24.04`. Until that is shown to work (#936), **B-0 uses the
 stand-in**, and the page says what that weakens: the `//:pause` and compile loads run through no real container path, so
 beta proves the update and failure paths and not container execution (covered by the existing real-runtime jobs). The
@@ -257,7 +257,7 @@ render, and `kbf-beta b0`, which runs scenario B0 and writes `beta-result.json`.
 the merge queue and on a push; it builds its own binaries, so the result says it is unattested. Running it showed what
 the design did not know:
 
-- `kbf storage-and-daemon` runs the container driver only, and the stand-in `podman` runs one planted argv whatever a
+- `kbf storage-and-daemon` runs the container driver only, and the stand-in `crun` runs one planted argv whatever a
   build sends, so B0 runs three `kbf storage` nodes and two plain `kbf daemon` processes with `--driver=native` (the
   result says no container path was exercised). The rehearsal keeps the stand-in over storage-and-daemon nodes.
 - The `kbf storage` unit renders neither `--frontend` nor `--advertise-addr`, so the harness adds both. It registers the

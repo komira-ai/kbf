@@ -19,7 +19,6 @@ use rcgen::{CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, K
 #[allow(unused_imports)] // Each test binary uses its own part.
 pub(crate) use kbf_harness::node_support::{
     MANIFEST, cgroup_tree, crun, files_holding, id_files, image_path, input_bytes, oci_runtime,
-    podman_ran,
 };
 
 /// How long the test waits for what should happen promptly.

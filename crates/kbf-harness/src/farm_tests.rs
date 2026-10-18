@@ -596,16 +596,3 @@ fn a_wait_ends_at_once_when_the_run_is_asked_to_stop() {
     );
     assert!(error.report.contains("--- processes ---"));
 }
-
-#[test]
-#[should_panic(expected = "podman ran on")]
-fn a_stop_refuses_a_farm_on_which_podman_ran() {
-    // Catches: kbf starting `podman` (the container driver is crun only: the `podman` first on
-    // a node's `PATH` fails and records that it ran) without anyone noticing. Mutant:
-    // `Farm::stop` does not look.
-    let d = dir("podman-ran");
-    std::fs::create_dir_all(d.join("bin")).expect("bin");
-    std::fs::write(d.join("bin/podman-ran"), "podman pull\n").expect("record");
-    let farm = Farm::supervise(&d, vec![sleeper(Role::Node(1), &d)]);
-    farm.stop();
-}

@@ -6,11 +6,10 @@ use std::os::unix::fs::PermissionsExt as _;
 use super::*;
 
 #[test]
-fn the_stand_in_crun_is_set_up_with_its_id_tools_a_failing_podman_and_the_image_unpacked() {
+fn the_stand_in_crun_is_set_up_with_its_id_tools_and_the_image_unpacked() {
     // Catches: a node whose start-up finds no `crun`, no setuid id tools or no unpacked image
-    // (it would refuse to start, or pull an image no registry serves), and a `podman` that is
-    // not the recorder (kbf starting it would go unseen). Mutant: `crun` makes the id tools
-    // mode 0755, or unpacks the image under another digest.
+    // (it would refuse to start, or pull an image no registry serves). Mutant: `crun` makes
+    // the id tools mode 0755, or unpacks the image under another digest.
     let root = crate::scratch("node-support-crun");
     let (bin, data) = (root.join("bin"), root.join("data"));
     std::fs::create_dir_all(&bin).expect("bin");
@@ -26,12 +25,10 @@ fn the_stand_in_crun_is_set_up_with_its_id_tools_a_failing_podman_and_the_image_
             .join("rootfs/kbf/root")
             .is_dir()
     );
-    for link in ["crun", "podman"] {
-        assert_eq!(
-            std::fs::read_link(bin.join(link)).expect("a link"),
-            PathBuf::from("/the/stand-in")
-        );
-    }
+    assert_eq!(
+        std::fs::read_link(bin.join("crun")).expect("a link"),
+        PathBuf::from("/the/stand-in")
+    );
     for tool in ["newuidmap", "newgidmap"] {
         let mode = std::fs::metadata(bin.join(tool))
             .expect("tool")
@@ -45,9 +42,6 @@ fn the_stand_in_crun_is_set_up_with_its_id_tools_a_failing_podman_and_the_image_
         oci_runtime(&bin),
         format!("--oci-runtime={}/crun", bin.display())
     );
-    assert_eq!(podman_ran(&bin), "", "nothing ran");
-    std::fs::write(bin.join("podman-ran"), "podman pull\n").expect("record");
-    assert_eq!(podman_ran(&bin), "podman pull\n");
 }
 
 #[test]

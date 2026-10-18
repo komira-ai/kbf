@@ -21,7 +21,7 @@ name = "kbf-beta"
 path = "src/bin/kbf-beta.rs"
 
 # The stand-ins of beta scenario B0's tests (kbf-cli's tests/beta_b0.rs finds them beside the
-# test binary, `cargo test --workspace` builds them), in Rust like the stand-in `podman`: a
+# test binary, `cargo test --workspace` builds them), in Rust like the stand-in `crun`: a
 # `buck2` that answers as Buck2 prints and logs, and an Envoy that serves its admin page and
 # forwards to the first instance. Test tools of this package, not of anything shipped.
 [[bin]]

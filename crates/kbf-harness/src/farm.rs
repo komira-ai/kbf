@@ -19,9 +19,7 @@ use kbf_deploy::linux::verify_cert::Row;
 use crate::api;
 use crate::envoy::{self, BoxPorts};
 use crate::interrupt::Interrupt;
-use crate::node_support::{
-    cgroup_tree, crun, files_holding, id_files, image_path, oci_runtime, podman_ran,
-};
+use crate::node_support::{cgroup_tree, crun, files_holding, id_files, image_path, oci_runtime};
 use crate::pki::Pki;
 use crate::ports::{Claim, Ports};
 use crate::procs::{HANG, Proc, Spec, after, field};
@@ -174,9 +172,8 @@ impl Farm {
     ///   a cold start);
     /// - with [`Driver::StandInContainer`], `--driver=container` stays, over the stand-in
     ///   `crun`: `--oci-runtime=` names it (the unit names `/usr/bin/crun`), the id tools
-    ///   and a failing `podman` are on the daemons' `PATH`, their cgroup tree
-    ///   (`--cgroup-root`, `--self-cgroup`) is planted and `--id-files` stands for
-    ///   `/etc/subuid`;
+    ///   are on the daemons' `PATH`, their cgroup tree (`--cgroup-root`, `--self-cgroup`)
+    ///   is planted and `--id-files` stands for `/etc/subuid`;
     /// - with [`Driver::Native`], `--driver=native` replaces it and `KBF_IMAGES` is empty
     ///   (only the container driver takes `--image`);
     /// - the frontend's control socket is in the temporary directory (a `RuntimeDirectory=`
@@ -448,8 +445,8 @@ impl Farm {
     }
 
     /// Starts the process for `unit`; those with a `bin` (the container driver's) get
-    /// the unit's `--oci-runtime` made the stand-in `crun`, the id tools and a failing
-    /// `podman` on `PATH`, and the planted cgroup tree and id files.
+    /// the unit's `--oci-runtime` made the stand-in `crun`, the id tools on `PATH`, and the
+    /// planted cgroup tree and id files.
     fn launch(&mut self, kbf: &Path, role: Role, root: &Path, unit: Rendered, bin: Option<&Path>) {
         let (unit, cwd, mut env) = match bin {
             Some(bin) => {
@@ -842,17 +839,12 @@ impl Farm {
         }
     }
 
-    /// [`Farm::stop_all`], and every process must have exited 0. The `podman` first on
-    /// each container node's `PATH` fails and records that it ran: `kbf` never starts it.
+    /// [`Farm::stop_all`], and every process must have exited 0.
     ///
     /// # Panics
-    /// When one did not exit 0, or a `podman` ran.
+    /// When one did not.
     pub fn stop(mut self) {
         let ended = self.stop_all();
-        for m in &self.members {
-            let ran = podman_ran(&m.root.join("bin"));
-            assert_eq!(ran, "", "podman ran on {}", m.root.display());
-        }
         for (role, how) in ended {
             assert_eq!(how, "exit 0", "{role}\n{}", self.logs());
         }
