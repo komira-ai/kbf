@@ -23,6 +23,9 @@ fn a_unit_names_its_mode_as_its_first_word_and_no_other_spelling_passes() {
         Mode::Storage
     ));
     assert!(!names_mode(&["daemon", "--mode=storage"], Mode::Storage));
+    // Mutant: the mode name is accepted as any word, not the first.
+    assert!(!names_mode(&["--cold-store=x", "storage"], Mode::Storage));
+    assert!(!names_mode(&["daemon", "storage"], Mode::Storage));
     assert!(!names_mode(&[], Mode::Storage));
 }
 
