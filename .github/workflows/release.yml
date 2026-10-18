@@ -7,10 +7,11 @@
 # read-only scopes, refuses a commit that is not on main and one with no successful
 # main push run of artifacts.yml (cargo xtask release locate, crates/xtask/src/release.rs),
 # downloads that run's artifacts, checks them against SHA256SUMS, refuses a file that is
-# not an asset of the commit (cargo xtask release check), and verifies every attestation
-# as a deployment does (cargo xtask verify-assets attestations). Only then does the
-# publish job create the release with those files, or add the ones an existing release
-# lacks. It is the one job that may write: `contents: write`, under the exact tag-push
+# not an asset of the commit, or a tarball without its provenance bundle (cargo xtask
+# release check), and verifies every attestation as a deployment does and every bundle
+# offline for the commit as a host does (cargo xtask verify-assets attestations). Only
+# then does the publish job create the release with those files and the bundles, or add
+# the ones an existing release lacks. It is the one job that may write: `contents: write`, under the exact tag-push
 # `if:` the workflow lint (crates/kbf-it/tests/workflows) requires for that scope. A
 # re-run creates no second release and replaces no asset: every asset the release
 # already holds must be one of the verified files, byte for byte, or the run fails and
@@ -83,15 +84,28 @@ jobs:
           path: dist
           run-id: ${{ steps.locate.outputs.run-id }}
           github-token: ${{ github.token }}
+      # The provenance bundle of each tarball (`<tarball>.sigstore.json`), which the sums do
+      # not list: the attestation that made it signed the files they list.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bundles-*
+          path: dist
+          merge-multiple: true
+          run-id: ${{ steps.locate.outputs.run-id }}
+          github-token: ${{ github.token }}
       - name: Check the files against SHA256SUMS
         working-directory: dist
         run: sha256sum --check --strict SHA256SUMS
-      - name: Every file is listed once, matches, and is an asset of this commit
+      - name: Every file is listed once, matches, and is an asset of this commit, with its bundle
         run: cargo xtask release check dist --commit "$COMMIT"
-      - name: Verify every attestation as a deployment does
+      - name: Fetch the Sigstore trusted root, for the offline check of the bundles
         env:
           GH_TOKEN: ${{ github.token }}
-        run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_REPOSITORY/.github/workflows/artifacts.yml"
+        run: gh attestation trusted-root > "$RUNNER_TEMP/trusted_root.jsonl"
+      - name: Verify every attestation as a deployment does, and every bundle as a host does
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_REPOSITORY/.github/workflows/artifacts.yml" --commit "$COMMIT" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-assets

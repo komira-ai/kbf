@@ -32,6 +32,7 @@ kbf-front                35      7
 kbf-guest                15      6
 kbf-history               0      0
 kbf-host                  0      0
+kbf-image                 0      0
 kbf-invocation            0      0
 kbf-it                    2      1
 kbf-log                   3      0
@@ -52,6 +53,7 @@ kbf-route                 0      0
 kbf-sched                 1      1
 kbf-segments              7      5
 kbf-server                0      0
+kbf-signer                0      0
 kbf-sim                   6      3
 kbf-sim-cell              4     12
 kbf-state                 2     13
