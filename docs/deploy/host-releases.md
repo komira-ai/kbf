@@ -1,5 +1,7 @@
 # Host releases: the layout and the manual verbs
 
+> **Note:** the layout below is the current one. The design of record ([../design/distribution.md](../design/distribution.md)) moves releases to `/var/lib/kbf/releases/<sha>` and replaces the `kbf-deploy host` verbs with `kbf-installer`; `/usr/local/kbf` is retired when that works on the test farm. There is no separate setup command.
+
 A host keeps each kbf release in its own directory and points two links at them.
 `kbf-deploy host` reads and changes that layout. This layout is **Linux-only**: its lock
 lives in `/run`, which macOS does not have, so the macOS install path will choose a
