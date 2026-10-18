@@ -100,7 +100,7 @@ fn a_readiness_url_must_be_numeric_loopback() {
     for ok in [
         "http://127.0.0.1:8081/readyz",
         "http://[::1]:8081/readyz",
-        "http://127.0.0.2:1/",
+        "http://127.0.0.1:1/",
     ] {
         assert!(loopback(ok).is_ok(), "{ok}");
     }
