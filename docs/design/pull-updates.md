@@ -71,8 +71,8 @@ operator set).
 |---|---|---|
 | GitHub / CI | build, attest, publish | reach a host, push to the frontend |
 | Compromised **frontend** (or a mirror named as the release source) | choose when and in what order; withhold; serve any bytes or any older attested build; deny service | make a host install a binary that lacks a valid `main` attestation of this workflow; run anything as root |
-| Compromised **fetch child** (a parser or TLS bug while bytes arrive) | write bytes to its pipe; use the node's mTLS identity it was lent; stall until the time cap | write any file, reach any file of `kbf` or root, make the parent install bytes that fail the checks of section 7.2 |
-| Compromised **service user** (or an action under the native driver) | write an order record to the spool (an early or stale activation of a release that is attested, or a refused record); stop relaying | install an unattested binary; put bytes on the install path (there is no inbox); touch the versions directory, the installer or the units |
+| Compromised **fetch child** (a parser or TLS bug while bytes arrive) | write bytes to its pipe; **steal the node key it was lent** (accepted residual in v1: seven-day certificate; follow-up is a fetch-scoped certificate, 7.1); stall until the time cap | write any file, reach any file of `kbf` or root, make the parent install bytes that fail the checks of section 7.2 |
+| Compromised **service user** (or an action under the native driver); **on macOS `kbf` runs as root, so a compromise of it there is a compromise of root** | write an order record to the spool (an early or stale activation of a release that is attested, or a refused record); stop relaying | install an unattested binary; put bytes on the install path (there is no inbox); touch the versions directory, the installer or the units |
 | Anyone who can push to `main` | get an attested build | (see residuals) |
 
 Residuals, stated plainly:
@@ -192,10 +192,11 @@ hex digits and nothing else; an unknown digest is `NOT_FOUND`. The server never 
 validated digest. Chunks are at most 1 MiB. **The caller is the installer's fetch child (section 7.1), not the `kbf` process.**
 
 **The order, as the node relays it.** `UpdateOrder` is unchanged and carries `order_id`, `epoch`, `verb`, `commit` and
-`window_s`. The "update to commit `<hash>`" order is `VERB_ACTIVATE`. It has no `generation` field; the node adds the
-generation of the offer it holds for that commit when it writes the order record (section 7), and refuses (`STATE_REFUSED`,
-"no offer for this commit") an `ACTIVATE` for a commit it holds no offer for. An additive `generation` field on
-`UpdateOrder` is the alternative; the frame is compatible either way and the choice is open (section 12).
+`window_s`. The "update to commit `<hash>`" order is `VERB_ACTIVATE`. It gains one additive field, `uint64 generation = 6`
+(proto3, compatible both ways: an older server leaves it 0 and an installer treats 0 as "refuse `activate`"; an older node ignores
+it). The installer checks the generation is monotonic and above the operator floor (section 7), which the (epoch, id) rule alone
+cannot give it. The offer's components, attestation and expected facts reach the installer in the order record the node writes from
+the offer it holds for that commit; a node holding no offer for the commit refuses (`STATE_REFUSED`, "no offer for this commit").
 
 **Compatibility.** A server that predates these fields ignores `update_status`; a node that predates them ignores
 the offers and orders, never sends a status, and is listed `unsupported`.
@@ -258,37 +259,65 @@ node and ignored from a replaced stream, exactly as `NodeStatus` is.
 ## 7. The host
 
 ```text
-/var/lib/kbf/releases/<commit>/kbf            root:root 0755, never modified after install
-/var/lib/kbf/releases/current  -> <commit>    the running one (units run releases/current/kbf)
-/var/lib/kbf/releases/previous -> <commit>
-/var/lib/kbf/releases/<commit>.partial/       root-owned scratch of one fetch; swept at start (7.3)
-/var/lib/kbf/orders/<epoch>-<id>.json         order records written by the service user; no release bytes
+/var/lib/kbf-installer/                         root:root 0755; the installer's own tree (not kbf's StateDirectory)
+  releases/<commit>/kbf                         root:root 0755, never modified after install
+  releases/<commit>/VERIFIED                    written by root after 7.2 passes; "installed" means this exists
+  releases/current  -> <commit>                 the running one (units run releases/current/kbf)
+  releases/previous -> <commit>
+  work/<commit>.partial/                        root:root 0755, extraction of one fetch; swept at start (7.3)
+  work/<commit>.partial/dl/                     root:root 0700, the downloaded tarball only
+  state.json, helper.json, status.json          root-owned
+  orders/                                       kbf:kbf 0700; order records written by the service user; no release bytes
 ```
 
-The layout is [distribution.md](distribution.md) section 1 (`/var/lib/kbf/releases`, which replaces `/usr/local/kbf`).
-Retention: the running, the previous and one more directory. Only `kbf-installer` writes the releases tree.
+Everything the root side reads as authority lives in a root-owned tree that `kbf` cannot write. The earlier layout put
+`releases/`, `state.json` and `helper.json` under `/var/lib/kbf`, which is `kbf`'s `StateDirectory`; the service user would
+then own the directory that holds the links and the state, whatever the files' modes. The install root is
+`/var/lib/kbf-installer` and [distribution.md](distribution.md) section 1 (which names `/var/lib/kbf/releases`) must follow.
+Retention: the running, the previous and one more directory. Only `kbf-installer` writes the tree except `orders/`.
 
 `kbf-installer` runs as a root unit with no listening socket (the former `kbf-helper` is folded into it). Its service
 loop has two commands, with no free-form arguments (its flags name the unit and the directories; nothing in an order
-record is a path, a URL, a command or a unit; the platform is the host's own, read by the installer):
+record is a path, a URL, a command or a unit; the platform is the host's own, read by the installer). **On macOS `kbf daemon`
+runs as root (macos-end-state.md), so there a compromise of `kbf` is a compromise of root; the order spool and the fetch child
+do not change that, and this section's separation of `kbf` from root holds on Linux only.** The probe and the fetch child below
+still run unprivileged there, so a fault in them is not root.
 
 | Command | Does |
 |---|---|
-| `kbf-installer run` | each pass: finish a restart it owes; revert a swap whose confirm window ran out; sweep leftover scratch (7.3); act on order records from `orders/` in (epoch, id) order, once each. For `activate`: check the order (below), **fetch, verify and install the release for the commit (7.1, 7.2)**, write `pending_confirm`, flip `previous` then `current`, restart the one configured service; `confirm`: keep it; `revert`: flip back and restart; write `status.json` |
+| `kbf-installer run` | each pass: finish a restart it owes; revert a swap whose confirm window ran out; sweep leftover scratch (7.3); act on order records from `orders/` in (epoch, id) order, once each. For `activate`: refuse it while a trial is pending (a release activated and not yet confirmed or reverted: there is one confirm window at a time, never two timers), check the order (below), **fetch, verify and install the release for the commit (7.1, 7.2)**, write `pending_confirm`, flip `previous` then `current`, restart the one configured service; `confirm`: keep it; `revert`: flip back and restart; write `status.json` |
 | `kbf-installer boot-check` | `ExecStartPre` on Linux: count the starts of a release on trial and revert one that keeps failing before it starts again; start the confirm window at the first start |
 
+**The order spool.** `orders/` is owned by `kbf` with mode 0700. Root opens it with `openat` and `O_NOFOLLOW` relative to a
+descriptor it holds, takes an entry only if `fstat` says a regular file with one link, reads it **once into memory** and
+parses from that copy (never re-reads a path); the file is then removed by name through the same descriptor. At most 64 records
+are held and a record older than the confirm-window maximum (1800 s) is expired and removed, so a stuck or hostile writer cannot
+grow the directory or replay a stale order after a restart. A record is at most 1 MiB; a larger, unparsable, symlinked or
+non-regular record is refused and removed.
+
 An order record is `{order_id, epoch, generation, verb, commit, window_s}` plus, for `activate`, the offer's components
-for the host's platform (`name`, `sha256`, `size`, `attestation`: the same bytes the offer carried, at most 256 KiB each). It is at most 1 MiB; a
-larger, unparsable, symlinked or non-regular record is refused and removed. These are **locators and claims, not trust**:
-section 7.2 re-derives every one that matters. Before fetching, the installer refuses (and says why in `status.json`) an order
-that is a replay or older by the (epoch, id) rule of section 5, a commit that is not 40 lowercase hex, a component set that is not
-exactly what the host's platform needs, a size over the cap (7.1), or a host with a live lease.
+for the host's platform (`name`, `sha256`, `size`, `attestation`: the same bytes the offer carried, at most 256 KiB each) and the
+**expected facts about the release**: `platform`, `protocol`, `min_protocol`, `state_schema` and `profile`, as the frontend's
+preflight recorded them. These are **locators and claims, not trust**: section 7.2 re-derives every one that matters, and the
+expected facts are the claim that 7.2 step 5 checks the binary against *before* the flip. Before fetching, the installer refuses
+(and says why in `status.json`) an order that is a replay or older by the (epoch, id) rule of section 5, a commit that is not 40
+lowercase hex, a component set that is not exactly what the host's platform needs, a size over the cap (7.1), a pending trial,
+or a host with a live lease (read by the installer from the same lease source the node client uses, not from the record).
+
+**Generation and floor.** The (epoch, id) rule orders orders but does not stop a replayed or forged older order from naming an old
+attested commit. So the installer also requires the order's **generation** to be at or above the highest it has acted on
+(an additive `UpdateOrder.generation` field, section 5; a rollback is a higher generation naming an older commit, so monotonic
+holds), and an **operator floor** in root-owned `kbf.toml`: `[update] min_generation` and `min_protocol`, below which no order is
+taken. The intended end state is a frontend-signed grant on each order, verified before any fetch against a pinned
+key; that key and its rotation are not designed here, so v1 is the generation check plus the floor.
 
 Orders carry the verbs `activate`, `confirm` and `revert`; they are not installer subcommands. **The installer must not
 restart the serving frontend**: the frontend's own update is the separate Envoy swap (section 8 item 6, split-mode-updates.md
 2.5), and the frontend-host `activate` of split-mode-updates.md (unit U5) must exist before the installer runs on a frontend host.
 
-- The installer **never executes the new binary as root** (the `--version --json` check runs as the service user with an empty environment).
+- The installer **never executes the new binary as root**. The `--version --json` probe runs as `kbf-fetch` (no credentials, no
+  network, no file of its own; the `kbf` user holds the cold-store credential and the node key and is not used), with an empty
+  environment, the rlimits of 7.1 and the bounds of 7.2.
 - Order of writes: `pending_confirm` before the flip, the flip before the restart; on start the installer reconciles
   its state against the links, resolving to the state that keeps `previous` intact.
 - Linux: an `ExecStartPre` boot check decrements a start counter while `current` is unconfirmed, so a crash loop
@@ -315,7 +344,10 @@ max_component_bytes = 536870912   # 512 MiB, the store's own cap; at most 1 GiB
 `setup` takes `--release-source frontend|url` and `--release-url`. `frontend` derives the endpoint from the frontend address
 and the pinned CA that enrollment already wrote (the worker listener, `ReleaseService.Fetch`, mutual TLS). `url` is a plain
 HTTPS file server that serves the release store's layout, `files/<sha256>`; setup refuses anything but `https`, a URL with
-user information, a query or a fragment, and the child follows no redirect that leaves the configured scheme, host and port. No
+user information, a query or a fragment, and **the child follows no redirect at all** (any 3xx is a failed fetch). A `frontend`
+source authenticates the server with the pinned CA and checks the frontend's name against the certificate's SAN; a `url` source
+uses the system trust roots, which the doc names as the trust anchor of the transport only (the bytes are trusted by 7.2, not by
+TLS). No
 other source is ever contacted: an order or an offer cannot redirect a fetch, and neither can the frontend (a compromised
 frontend can only serve bytes from the source, which 7.2 refuses). A missing `[update]` table means `frontend`.
 
@@ -326,7 +358,7 @@ parser should not reach them.
 
 **How it starts.** The root parent re-executes its own binary as `kbf-installer fetch-child` (no separate binary to ship),
 after: `setgroups(0)`, `setgid`, `setuid` to `kbf-fetch` (checked by reading the ids back), `no_new_privs`, `chdir /`, an
-empty environment, every descriptor closed except 0 (closed), 1 (the byte pipe), 2 (a log pipe) and 4 (the lent identity),
+empty environment, every descriptor closed except 0 (open on `/dev/null`), 1 (the byte pipe), 2 (a log pipe) and 4 (the lent identity),
 `RLIMIT_FSIZE` 0 (it cannot create a file), `RLIMIT_CORE` 0, `RLIMIT_NOFILE` 16, `RLIMIT_AS` 1 GiB, a small `RLIMIT_NPROC`,
 and on Linux `PR_SET_PDEATHSIG` SIGKILL. The arguments are fixed flags the parent validated: source kind, URL, the 64-hex
 digest, the byte limit. A seccomp filter and (macOS) a `sandbox_init` profile are a hardening that does not change this
@@ -337,17 +369,26 @@ reads it, hashes it as it arrives and writes it to a file it created itself in a
 (`releases/<commit>.partial/`). The child has no writable file system object at all, so there is nothing for it to swap, link or
 modify after the parent has looked (the TOCTOU and symlink exposure of a directory owned by the fetch user is exactly what the
 inbox had). One child per component; the attestation is not fetched (it came in the order record and is self-authenticating,
-7.2). Standard error is read by the parent up to 4 KiB for the log and is never parsed.
+7.2). Standard error is read by the parent up to 4 KiB for the log and is never parsed; bytes beyond 4 KiB are drained and
+dropped so a chatty child cannot block on a full pipe. The parent reads both pipes with `poll` and non-blocking reads, so a
+stall on one cannot hold the other or the parent. On macOS, where `PDEATHSIG` does not exist, the parent closes the pipe and
+the child's death is the timeout and a `SIGKILL` of its process group.
 
 **The node's identity.** For `source = "frontend"` the child needs the node's client certificate and key for the mutual TLS
-of `Fetch`. The parent (root) reads them from the paths in `kbf.toml` and lends them over descriptor 4 (an anonymous
-in-memory file, closed when the child exits); the child never has a path to the key directory. This lends the node's own identity,
-as `kbf` already holds, to a short-lived process for one fetch; it is the cost of keeping the release store on the authenticated
-listener, and the alternative (a separate download credential) is not designed. With `source = "url"` nothing is lent.
+of `Fetch`. The parent (root) reads them from the paths in `kbf.toml` and lends them over descriptor 4 (on Linux an anonymous
+in-memory file; on macOS a socketpair, so the key is never written to disk), closed when the child exits; the child never has a
+path to the key directory. **A compromised fetch child can steal the node key.** That is an accepted residual in v1: the
+certificate lives seven days, the exposure is the one the `kbf` process already has, and it is the price of serving releases
+on the authenticated listener. The follow-up is a fetch-scoped client certificate (a distinct extended key usage the frontend
+accepts only for `ReleaseService.Fetch`), so a stolen fetch identity cannot open a worker session. With `source = "url"` nothing is lent.
+
+**Setup uses the same child.** `kbf-installer setup` downloads the first release through `fetch-child` and checks it with 7.2,
+exactly as an update does, so the bootstrap path is not a second, unconfined downloader.
 
 **Size and time caps.** The component's size is read from the order record; it must be at most `max_component_bytes`, and the
-host must have three times that size free under `/var/lib/kbf` (the tarball, its extraction and slack), else the order is refused
-before anything is opened. The parent reads at most `size` bytes: one byte more ends the child with SIGKILL and the order is
+host must have free space under `/var/lib/kbf-installer` for the tarball (`size`), its extraction (the decompressed cap, 1 GiB, or
+the declared size times ten if smaller), and a retained release being replaced: that sum is computed from the record before anything
+is opened, and the order is refused if it does not fit. The parent reads at most `size` bytes: one byte more ends the child with SIGKILL and the order is
 refused; fewer than `size` bytes at end of stream is a failed fetch. Time: connect 30 s; no byte for 60 s kills the child; the
 whole component `fetch_timeout_s`. Range requests and resumption are not used.
 
@@ -356,23 +397,34 @@ whole component `fetch_timeout_s`. Range requests and resumption are not used.
 The parent does not trust the child, the source, the order record, or the files it has just written. In this order, on
 files it opened itself (`O_NOFOLLOW`, then `fstat` to confirm a regular file it owns):
 
+**Every step root runs is bounded**: a wall-clock limit, the process group killed on expiry, output read up to 4 KiB and
+parsed strictly (anything else is a failure), `gh` run with an empty environment and an empty `HOME`. The limits are 120 s for
+`gh`, 120 s for extraction and 10 s for the probe.
+
 1. **Count**: exactly the declared `size` bytes arrived, and the declared size is within the cap.
 2. **Digest**: the SHA-256 the parent computed while reading equals the `sha256` of the record **and** the subject digest of the
    attestation bundle (the record's digest is only a locator; the attestation's is the trusted one).
 3. **Attestation**, offline, with the pinned `gh` and the pinned trusted root and the exact flags of section 2: repository,
    signer workflow, issuer, `refs/heads/main`, predicate type, and `--source-digest` equal to the **commit of the order**. The
-   bundle is the record's; if it fails, nothing from the child is read further.
+   bundle is the record's; if it fails, nothing from the child is read further. The pinned `trusted_root.jsonl` expires: the
+   installer reports the days left in `status.json`, and the frontend raises an alert when fewer than 30 remain.
 4. **Shape**: gzip and tar with exactly one regular file named `<name>` (no link, device, directory, absolute path or `..`),
-   decompressed output at most 1 GiB, extracted by the parent into `releases/<commit>.partial/` with mode 0755 and owner root.
-5. **The binary names itself**: `<name> --version --json`, run as the service user with an empty environment, reports the order's
-   commit (12 hex prefix) and a `protocol`, `min_protocol` and `state_schema` that the installer records in `status.json`. The
-   frontend compares them with the preflight values (section 5, UpdateStatus). macOS: quarantine and `codesign --verify --strict`.
-6. **Only now** does the parent `rename` the directory to `releases/<commit>/` and `fsync` the parent directory. Before this
-   rename no link, no unit and no path a service looks at has changed.
+   decompressed output at most 1 GiB, extracted by the parent into `work/<commit>.partial/` (not into `dl/`) with mode 0755 and
+   owner root. The tarball stays in `dl/` (0700, root), which the probe never needs to traverse.
+5. **The binary names itself, and must match the order, before the flip**: `<name> --version --json`, run as `kbf-fetch` with an
+   empty environment, reports the order's commit (12 hex prefix) and a `protocol`, `min_protocol`, `state_schema`, `profile` and
+   `platform` that must **equal the expected facts in the order record**, and must satisfy the operator floor. A mismatch refuses
+   the order **before** anything is renamed or flipped. If the record carries no expected facts (the frontend had no preflight
+   row), the order is refused: fail closed. The values are also written to `status.json`; the frontend compares them with its own
+   preflight (section 5, UpdateStatus). macOS: quarantine and `codesign --verify --strict`.
+6. **Only now** does the parent write `VERIFIED` into the directory, `rename` it to `releases/<commit>/` and `fsync` the parent
+   directory. Before this rename no link, no unit and no path a service looks at has changed.
 
 The child's exit status, its output and its log are not inputs to any of this: a child that "succeeds" with other bytes fails
-at 1 or 2, and one that fails after delivering all the bytes is judged on the bytes. If the commit is already installed (a
-rollback), steps 1 to 5 are skipped and no fetch happens.
+at 1 or 2, and one that fails after delivering all the bytes is judged on the bytes. **A release counts as already installed only
+if `releases/<commit>/VERIFIED` exists**, written by this procedure; a rollback to such a directory skips steps 1 to 4 (it re-runs
+5 and the floor) and no fetch happens. A directory without the marker is treated as absent and removed. Directories made by the
+test-farm switch (§2, attestation off) never carry the marker and so never count as verified.
 
 ### 7.3 A crash in the middle
 
@@ -380,14 +432,20 @@ rollback), steps 1 to 5 are skipped and no fetch happens.
   sets `STATE_REFUSED` with the reason (`fetch: short read`, `fetch: timeout`, `fetch: source unreachable`) and does **not**
   retry. Nothing but scratch has changed. The frontend's controller treats it as a failure before the swap: the host is
   uncordoned, the run goes `held`, and a person re-issues the update (a new order id).
-- **Parent or host dies during the fetch**: `releases/*.partial` and the order's scratch are left. The installer deletes every
-  `*.partial` at the start of each run; a partial file is never resumed or trusted, since its bytes were not verified. The child
-  has `PDEATHSIG` and a closed pipe, so it does not outlive the parent. The order record is still in `orders/` and not
-  acknowledged, so the same order runs again from the beginning (nothing was flipped, so repeating it is safe).
+- **Parent or host dies during the fetch**: `work/*.partial` is left. The installer deletes every
+  entry under `work/` and every `releases/` directory without `VERIFIED` at the start of each run; a partial file is never resumed or trusted, since its bytes were not verified. The child
+  has `PDEATHSIG` (Linux) or is killed by process group (macOS), and a closed pipe, so it does not outlive the parent. A
+  record is removed from the spool only after it was read into memory, but the order is acknowledged only after the flip, so the
+  installer keeps its own copy (`state.json`, root-owned) of the unacknowledged order and runs it again from the beginning
+  (nothing was flipped, so repeating it is safe), unless it has expired (7.1 spool rule).
 - **Between the verified rename and the flip**: the release directory exists and is verified; `current` is unchanged. A repeat
-  of the order finds the directory and goes straight to the flip. The flip itself is the existing `activate` crash story
+  of the order finds the directory with its `VERIFIED` marker and goes to the flip. The flip itself is the existing `activate` crash story
   (section 10).
 - **Disk full**: the free-space check refuses first; if it still fills, the write fails and the scratch is removed.
+
+**Residuals, stated.** Two nodes can be a release apart while a rollout is held (node-to-node skew is within N/N-1 by section 8). A
+host's local revert (its own timer or boot check) is not seen by the frontend until the host next reports, so the controller can
+briefly hold a stale phase. Neither is new; the fetch makes neither worse.
 
 ### 7.4 What is removed
 
@@ -396,6 +454,7 @@ rollback), steps 1 to 5 are skipped and no fetch happens.
 - **`kbf-update`'s staging role**: it no longer calls `ReleaseService.Fetch`, no longer writes tarballs, and no longer reports
   `staged` after a download. Its remaining job: relay offers and orders from the session, write order records, report status,
   refuse an order while a lease is live.
+- **Staging under `/var/lib/kbf`**: the install tree moves to the root-owned `/var/lib/kbf-installer`.
 - **The helper's staging pass** ("stage the newest inbox entry itself") and its no-network rule: the root tool now has a
   network path, confined to the fetch child.
 - **The inbox tests** (symlink, FIFO and oversized entries): replaced by the fetch tests of section 10.
@@ -488,9 +547,9 @@ Each safety property has a planted mutant that turns its test red.
 
 - The Ed25519 release key and a signed floor (section 2).
 - Sigstore verification beyond the attested-`main` rule (a protected `main`, required reviews).
-- A frontend-signed grant on each order, closing the early-order gap of an order-record writer under the native driver.
+- Closing the early-order gap of an order-record writer under the native driver (the signed grant above does).
 - Pre-fetching a release into `releases/<commit>/` while the host still serves (it needs a second, non-activating order verb, and the same verification).
-- A `generation` field on `UpdateOrder` (section 5 has the node add it from its held offer).
+- A frontend-signed grant on each order, verified before any fetch (section 7); its key and rotation are undesigned.
 - A seccomp filter and a macOS sandbox profile for the fetch child; a separate download credential in place of the lent node identity.
 - Maintenance windows, percentage waves, tracks beyond canary plus stable.
 - Several frontends on a shared database (Postgres). A zero-impact update of one frontend does not need it: it is the Envoy switch of section 8.
