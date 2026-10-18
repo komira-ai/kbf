@@ -35,7 +35,6 @@ test = false
 clap.workspace = true
 kbf-all-in-one.workspace = true
 kbf-node.workspace = true
-kbf-types.workspace = true
 kbf-server.workspace = true
 # The stand-in `podman`'s (kbf-cli-fake-podman).
 rustix = { workspace = true, features = ["process"] }
@@ -51,6 +50,7 @@ bytes.workspace = true
 kbf-cas-conformance.workspace = true
 kbf-storage.workspace = true
 kbf-transfer.workspace = true
+kbf-types.workspace = true
 # The protocol the daemon half speaks, which `kbf --version --json` reports as the
 # server's (src/tests.rs pins them equal).
 kbf-daemon.workspace = true

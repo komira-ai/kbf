@@ -335,12 +335,20 @@ current frontend; the enroll wire's `NotSigner`), `503` when the state store fai
 other writers kept winning (try again), `500` for a stored row that does not decode.
 `401`, `403` and `415` are the gates'.
 
-`kbf --token=create|list|revoke` (flags only, no positional arguments) calls these routes from the frontend's host:
-`kbf --token=create --roles=daemon --max-uses=3 --expires-in=24h --token-file=<file>` prints
-the answer; with `--out <file>` the token string goes to that file alone (created new with
-mode `0600`, removed again if the call fails) and the terminal sees the token as a list
-shows it. `kbf --token=list` and `kbf --token=revoke --token-id=<id>` take the same `--token-file` and
-`--api`.
+There is no `kbf` verb for this: `kbf` only runs, and operator actions are calls to this
+API. From the frontend's host, with the file `--api-token-file` names:
+
+```sh
+T=$(cat <token file>); API=http://127.0.0.1:<port>
+curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  -d '{"roles": ["daemon"], "max_uses": 3, "expires_in": 86400, "label": "rack 4"}' \
+  $API/v1/enroll/tokens                       # the token string is in this answer only
+curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' $API/v1/enroll/tokens
+curl -X DELETE -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  $API/v1/enroll/tokens/<id>
+```
+
+A UI comes later.
 
 ## `GET /healthz` and `GET /readyz`
 

@@ -19,9 +19,6 @@
 //!   ([`kbf_all_in_one::storage_and_daemon`]). Takes `kbf storage`'s flags and
 //!   `kbf-daemon`'s.
 //!
-//! And `kbf token create|list|revoke` ([`token`]), a client of the same API's enrollment
-//! routes. It starts nothing and is outside [`names::MODES`] too.
-//!
 //! And one word that is not a mode: `kbf cluster status|drain|undrain` ([`cluster`]), a
 //! client of the frontend's operator API that starts nothing. Like `check-args` it is
 //! outside [`names::MODES`]; `kbf --help` ends with a line naming it.
@@ -54,7 +51,6 @@
 pub mod cluster;
 pub mod handover;
 pub mod names;
-pub mod token;
 pub mod version;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -177,21 +173,15 @@ pub fn command() -> Command {
     cmd.after_help(format!(
         "Not a mode: `kbf {CLUSTER} status|drain|undrain` calls a frontend's operator API \
          (`kbf {CLUSTER} --help`); `kbf {} {HANDOVER}` updates a frontend without failing a \
-         build (`kbf {} {HANDOVER} --help`); `kbf {} create|list|revoke` makes, lists and \
-         revokes enrollment tokens (`kbf {}=create --help`).",
+         build (`kbf {} {HANDOVER} --help`).",
         names::FRONTEND,
         names::FRONTEND,
-        token::FLAG,
-        token::FLAG,
     ))
 }
 
 /// The word after `kbf` that calls the operator API ([`cluster`]) instead of starting a
 /// mode. Like [`CHECK_ARGS`] it is not in [`names::MODES`], so the mode list stays exact.
 pub const CLUSTER: &str = "cluster";
-
-/// The command name `kbf --token=<verb>` parses as ([`token::FLAG`] selects it).
-pub const TOKEN: &str = "token";
 
 /// The word after `kbf frontend` that starts the idle instance of the frontend's unit
 /// instead of the mode ([`handover`]).
@@ -230,28 +220,6 @@ pub fn cluster_command() -> Command {
         .arg_required_else_help(true)
         .disable_help_subcommand(true);
     cluster::Cluster::augment_args(cmd)
-}
-
-/// `kbf token ...`'s command line.
-#[must_use]
-pub fn token_command() -> Command {
-    let cmd = Command::new(TOKEN)
-        .bin_name(format!("kbf {}", token::FLAG))
-        .about("Make, list and revoke enrollment tokens through the frontend's operator API.")
-        .subcommand_required(true)
-        .arg_required_else_help(true)
-        .disable_help_subcommand(true);
-    token::Token::augment_args(cmd)
-}
-
-/// Parses `kbf --token=<verb> ...`; `args` is the whole command line.
-///
-/// # Errors
-/// What `clap` refuses.
-pub fn parse_token(args: &[std::ffi::OsString]) -> Result<token::Token, clap::Error> {
-    let argv = token::rewrite(args);
-    let matches = token_command().try_get_matches_from(argv)?;
-    token::Token::from_arg_matches(&matches)
 }
 
 /// Parses `kbf cluster ...`; `args` is the whole command line, its first word the
@@ -432,12 +400,6 @@ pub fn main() -> ExitCode {
     if args.get(1).is_some_and(|word| word == CLUSTER) {
         return match parse_cluster(&args) {
             Ok(cluster) => cluster::run(&cluster),
-            Err(e) => e.exit(),
-        };
-    }
-    if args.iter().skip(1).any(|a| token::verb_of(a).is_some()) {
-        return match parse_token(&args) {
-            Ok(token) => token::run(&token),
             Err(e) => e.exit(),
         };
     }
