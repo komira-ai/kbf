@@ -29,7 +29,7 @@ Linux only, the container driver only. Elsewhere the binary exits 2 and says to 
    daemon half stops once the server half has, abandoning the leases still running, and
    the process exits 0. A server half that stops serving on its own stops the daemon too,
    and the process exits 1. A start the server half refuses exits 2, as `kbf-server`
-   does; one the daemon half refuses exits as `kbf-daemon` does (1, or 2 for an
+   does; one that can pass on a later try exits 75 (`kbf_server::StartFailure`); one the daemon half refuses exits as `kbf-daemon` does (1, or 2 for an
    `--image` the node cannot run).
 
 ## `kbf storage-and-daemon`

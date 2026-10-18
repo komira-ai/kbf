@@ -2112,6 +2112,7 @@ dependencies = [
  "form_urlencoded",
  "futures",
  "hex",
+ "hyper-util",
  "kbf-auth",
  "kbf-caps",
  "kbf-enroll-registry",
