@@ -116,7 +116,8 @@ fn desired_fits(update: &UpdateDoc, node: &Node) -> bool {
         .iter()
         .filter(|r| r.commit == d.commit)
         .flat_map(|r| &r.platforms)
-        .any(|p| p.complete && p.platform.starts_with(os))
+        .filter(|p| p.complete)
+        .any(|p| p.platform.starts_with(os))
 }
 
 /// A host has an update available when it is judged behind (`up_to_date == false`) and
@@ -264,7 +265,7 @@ fn release_component(platform: &str) -> &'static str {
 /// reported software.
 fn node_platform(node: &Node) -> Option<(&'static str, &'static str)> {
     let os = node.software.as_ref()?.os_name.to_ascii_lowercase();
-    Some(if os == "macos" || os == "darwin" {
+    Some(if matches!(os.as_str(), "macos" | "darwin") {
         ("darwin", "kbf-daemon")
     } else {
         ("linux", "kbf")

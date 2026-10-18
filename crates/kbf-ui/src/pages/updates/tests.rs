@@ -617,3 +617,21 @@ fn node_ids_differing_only_in_case_keep_their_own_detail() {
         "{html}"
     );
 }
+
+/// Catches: a host whose OS name is `Darwin` (not `macOS`) taken for linux, so its
+/// update would be judged against a linux platform. Mutant: only `macos` recognised.
+#[test]
+fn a_darwin_os_name_is_a_darwin_host() {
+    let behind = json!({"state": "refused", "up_to_date": false, "availability": "ok"});
+    let nodes = json!({"server": {"version": "0", "commit": COMMIT_B}, "nodes": [
+        node("d-1", Some("Darwin"), &behind)]});
+    let fake = Fake::default()
+        .json("/v1/update", &update_doc())
+        .json("/v1/nodes", &nodes)
+        .json(HOSTS_URL, &hosts_doc());
+    let (_, html) = page(&fake);
+    assert!(
+        html.contains("<td>d-1</td><td>darwin (kbf-daemon)</td>"),
+        "{html}"
+    );
+}
