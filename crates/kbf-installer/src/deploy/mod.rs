@@ -153,6 +153,10 @@ pub struct Lock(#[allow(dead_code)] std::fs::File);
 
 /// Take the lock without waiting; `None` when another run holds it.
 pub fn lock(path: &Path) -> std::io::Result<Option<Lock>> {
+    // `/run` is a tmpfs: the directory is gone after a reboot.
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     let file = OpenOptions::new()
         .read(true)
         .write(true)

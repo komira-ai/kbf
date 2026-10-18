@@ -859,7 +859,10 @@ fn a_second_deploy_cannot_take_the_lock() {
     assert!(lock(&path).unwrap().is_none());
     drop(first);
     assert!(lock(&path).unwrap().is_some());
-    assert!(lock(&dir.join("no/such/dir/lock")).is_err());
+    // The lock's directory is made when missing (`/run` is a tmpfs), but not under a file.
+    assert!(lock(&dir.join("new/dir/lock")).unwrap().is_some());
+    std::fs::write(dir.join("plain"), "x").unwrap();
+    assert!(lock(&dir.join("plain/lock")).is_err());
 }
 
 // ---- the client ------------------------------------------------------------------------
