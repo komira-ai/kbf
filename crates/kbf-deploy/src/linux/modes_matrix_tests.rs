@@ -41,7 +41,12 @@ struct Row {
 
 const ALL: &[Mode] = &Mode::ALL;
 const BUILDS: &[Mode] = &[Mode::Daemon, Mode::StorageAndDaemon, Mode::AllInOne];
-const NODES: &[Mode] = &[Mode::Storage, Mode::Daemon, Mode::StorageAndDaemon];
+const NODES: &[Mode] = &[
+    Mode::Storage,
+    Mode::Daemon,
+    Mode::StorageAndDaemon,
+    Mode::AllInOne,
+];
 const DRAINS: &[Mode] = &[
     Mode::Frontend,
     Mode::Storage,

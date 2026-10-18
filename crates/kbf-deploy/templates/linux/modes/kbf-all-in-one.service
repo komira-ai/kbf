@@ -14,6 +14,11 @@ Wants=network-online.target
 After=network-online.target
 @KBF_LISTEN_AFTER_LINES@
 
+# A failure that repeats quickly (the cold store or a disk not ready) must not use up
+# systemd's start limit of 5 starts in 10 s and leave the unit down (check-units rule
+# `restart`).
+StartLimitIntervalSec=0
+
 [Service]
 # The daemon half runs rootless Podman as the kbf user.
 User=@KBF_USER@
@@ -70,6 +75,7 @@ ExecStart=@KBF_BIN_DIR@/kbf all-in-one \
 KillSignal=SIGTERM
 TimeoutStopSec=infinity
 Restart=on-failure
+RestartSec=5
 # Exit 2 is a start kbf refused (a flag, a file, a directory that is not a log): a
 # restart cannot fix it. Exit 75 is a start that can pass on a later try (the data
 # directory still held by the process that is stopping): restarted after RestartSec.

@@ -148,13 +148,17 @@ impl Mode {
         }
     }
 
-    /// Whether the mode is a node unit (rule `restart`): `storage`, `daemon` and
-    /// `storage-and-daemon` retry a repeating failure for as long as it lasts. The
-    /// frontend and `all-in-one` (which runs one) keep their own restart policy: an old
-    /// frontend that drained after a handover exits 0 and stays down.
+    /// Whether the mode's unit retries a repeating failure for as long as it lasts (rule
+    /// `restart`): `storage`, `daemon`, `storage-and-daemon` and `all-in-one`, whose
+    /// starts can fail with exit 75 until the environment is ready. The frontend keeps
+    /// its own policy. (`Restart=on-failure` never restarts a clean exit, so an old
+    /// process that drained after a handover and exited 0 stays down either way.)
     #[must_use]
     pub fn is_node(self) -> bool {
-        matches!(self, Mode::Storage | Mode::Daemon | Mode::StorageAndDaemon)
+        matches!(
+            self,
+            Mode::Storage | Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne
+        )
     }
 
     /// Whether the mode runs builds, and so manages its own cgroup (rule `delegate`).
