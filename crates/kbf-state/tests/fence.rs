@@ -55,6 +55,84 @@ on_each_backend!(
     f8_a_reap_superseded_before_it_runs_is_fenced,
 );
 
+/// A store that forwards the required methods only, so `reap_expired_if` is the default.
+struct Plain(Fake);
+
+impl Store for Plain {
+    fn apply_batch(
+        &self,
+        batch: Vec<Txn>,
+    ) -> Result<Vec<Result<kbf_state::Commit, kbf_state::Conflict>>, StoreError> {
+        self.0.apply_batch(batch)
+    }
+    fn get(&self, key: &str) -> Result<Option<kbf_state::Versioned>, StoreError> {
+        self.0.get(key)
+    }
+    fn scan_prefix(&self, p: &str) -> Result<Vec<(String, kbf_state::Versioned)>, StoreError> {
+        self.0.scan_prefix(p)
+    }
+    fn scan_range(&self, s: kbf_state::ScanRange<'_>) -> Result<kbf_state::ScanPage, StoreError> {
+        self.0.scan_range(s)
+    }
+    fn changes(
+        &self,
+        after: kbf_state::Revision,
+        limit: usize,
+    ) -> Result<kbf_state::Changes, StoreError> {
+        self.0.changes(after, limit)
+    }
+    fn reap_expired(&self) -> Result<usize, StoreError> {
+        self.0.reap_expired()
+    }
+    fn commit_stats(&self) -> kbf_state::CommitStats {
+        self.0.commit_stats()
+    }
+    fn now(&self) -> kbf_state::StoreTime {
+        self.0.now()
+    }
+}
+
+// Catches the default conditional reap judging a precondition wrongly: each kind of
+// precondition, met and unmet, reaps (or refuses) as the transaction rule says.
+#[test]
+fn the_default_conditional_reap_judges_each_precondition() {
+    let clock = Arc::new(ManualClock::default());
+    let store = Plain(Fake::with_flaw(clock, Flaw::None));
+    let revision = store
+        .txn(Txn::new().put("k", "v", Cond::Any))
+        .expect("s")
+        .expect("c")
+        .revision;
+    let version = kbf_state::Version(revision.0);
+    let refused = [
+        ("k", Cond::Absent),
+        ("k", Cond::Version(kbf_state::Version(version.0 + 1))),
+        ("none", Cond::Version(version)),
+    ];
+    for (key, cond) in refused {
+        let conflict = store.reap_expired_if(key, cond).expect("s").unwrap_err();
+        assert_eq!((conflict.index, conflict.key.as_str()), (0, key));
+    }
+    for (key, cond) in [
+        ("k", Cond::Any),
+        ("k", Cond::Version(version)),
+        ("none", Cond::Absent),
+    ] {
+        assert_eq!(store.reap_expired_if(key, cond), Ok(Ok(0)));
+    }
+}
+
+// Catches a second precondition being forwarded unchecked by a fenced handle: it cannot be
+// checked in the same step as the generation, so it is refused and nothing is reaped.
+#[test]
+fn a_fenced_handle_refuses_a_second_reap_precondition() {
+    let held = Fenced::take(fake(), None).expect("take");
+    assert!(matches!(
+        held.reap_expired_if("k", Cond::Any),
+        Err(StoreError::Failed(_))
+    ));
+}
+
 // Catches a fake that grows a writer role it does not have: the fake cannot demote.
 #[test]
 fn the_fake_has_no_writer_role_to_give_up() {

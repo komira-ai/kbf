@@ -51,7 +51,7 @@ use tx::{Level, Row, Tx, micros};
 use crate::clock::{Clock, StoreTime};
 use crate::store::{Span, Store, page_of};
 use crate::{
-    Change, Changes, Commit, CommitStats, Conflict, Direction, Event, Revision, ScanPage,
+    Change, Changes, Commit, CommitStats, Cond, Conflict, Direction, Event, Revision, ScanPage,
     ScanRange, StoreError, Txn, Version, Versioned,
 };
 
@@ -594,6 +594,30 @@ impl Store for PostgresStore {
                 self.syncs.fetch_add(1, Ordering::Relaxed);
             }
             Ok(reaped)
+        })
+    }
+
+    /// The check is the first statement after the commit-head lock, in the transaction
+    /// that reaps: a take that holds the head waits it out and the check then sees the
+    /// new generation.
+    fn reap_expired_if(
+        &self,
+        key: &str,
+        cond: Cond,
+    ) -> Result<Result<usize, Conflict>, StoreError> {
+        let check = Txn::new().check(key, cond);
+        self.retrying(|| {
+            let mut tx = self.start(Level::Serializable)?;
+            let verdict = match tx.apply(&check)? {
+                Ok(_) => Ok(tx.reap()?),
+                Err(conflict) => Err(conflict),
+            };
+            let wrote = tx.dirty();
+            tx.commit()?;
+            if wrote {
+                self.syncs.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(verdict)
         })
     }
 

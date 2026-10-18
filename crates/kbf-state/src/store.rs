@@ -6,8 +6,8 @@ use std::ops::Bound;
 
 use crate::clock::StoreTime;
 use crate::types::{
-    Changes, Commit, CommitStats, Conflict, ResumeToken, Revision, ScanPage, ScanRange, StoreError,
-    Txn, Versioned,
+    Changes, Commit, CommitStats, Cond, Conflict, ResumeToken, Revision, ScanPage, ScanRange,
+    StoreError, Txn, Versioned,
 };
 
 /// A durable, ordered key-value store with transactions, counters, time-to-live keys and
@@ -83,6 +83,39 @@ pub trait Store: Send + Sync {
     /// # Errors
     /// [`StoreError`] when the backend fails.
     fn reap_expired(&self) -> Result<usize, StoreError>;
+
+    /// [`Store::reap_expired`], but only if `key` meets `cond` at the moment the keys are
+    /// removed: the check and the removal are one atomic step of the backend, so a write
+    /// to `key` cannot land between them. A failed check removes nothing and is the
+    /// [`Conflict`] a transaction on the same precondition would give (index 0).
+    /// [`crate::Fenced`] reaps through this, with its generation as the precondition.
+    ///
+    /// The default reads `key`, then calls [`Store::reap_expired`]: **not atomic**, a
+    /// write can land between the two. It is there so a wrapper that forwards only the
+    /// other methods still works; every backend in this crate overrides it, and a backend
+    /// that is fenced for real must too.
+    ///
+    /// # Errors
+    /// [`StoreError`] when the backend fails.
+    fn reap_expired_if(
+        &self,
+        key: &str,
+        cond: Cond,
+    ) -> Result<Result<usize, Conflict>, StoreError> {
+        let live = self.get(key)?;
+        let met = match cond {
+            Cond::Any => true,
+            Cond::Absent => live.is_none(),
+            Cond::Version(version) => live.is_some_and(|row| row.version == version),
+        };
+        if !met {
+            return Ok(Err(Conflict {
+                index: 0,
+                key: key.to_owned(),
+            }));
+        }
+        self.reap_expired().map(Ok)
+    }
 
     /// The commit counters.
     fn commit_stats(&self) -> CommitStats;

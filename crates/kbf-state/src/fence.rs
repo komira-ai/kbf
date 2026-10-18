@@ -92,13 +92,6 @@ impl Fenced {
     pub fn generation(&self) -> u64 {
         self.generation
     }
-
-    fn fenced(&self) -> Result<(), StoreError> {
-        match self.inner.get(GENERATION)? {
-            Some(row) if row.version == self.version => Ok(()),
-            _ => Err(StoreError::Fenced),
-        }
-    }
 }
 
 impl Store for Fenced {
@@ -135,8 +128,23 @@ impl Store for Fenced {
     }
 
     fn reap_expired(&self) -> Result<usize, StoreError> {
-        self.fenced()?;
-        self.inner.reap_expired()
+        // The generation is checked by the backend in the step that reaps, not by a read
+        // of ours before it: a take between the two would let a superseded handle reap.
+        self.inner
+            .reap_expired_if(GENERATION, Cond::Version(self.version))?
+            .map_err(|_| StoreError::Fenced)
+    }
+
+    /// A fenced handle already reaps under its generation as the one precondition; a
+    /// second one cannot be checked in the same step, so it is refused.
+    fn reap_expired_if(
+        &self,
+        _key: &str,
+        _cond: Cond,
+    ) -> Result<Result<usize, Conflict>, StoreError> {
+        Err(StoreError::Failed(
+            "a fenced handle reaps with reap_expired, under its generation".to_owned(),
+        ))
     }
 
     fn commit_stats(&self) -> CommitStats {

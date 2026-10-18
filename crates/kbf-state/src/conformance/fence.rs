@@ -84,6 +84,15 @@ impl Store for Interpose {
         self.inner.reap_expired()
     }
 
+    fn reap_expired_if(
+        &self,
+        key: &str,
+        cond: Cond,
+    ) -> Result<Result<usize, Conflict>, StoreError> {
+        self.fire();
+        self.inner.reap_expired_if(key, cond)
+    }
+
     fn commit_stats(&self) -> CommitStats {
         self.inner.commit_stats()
     }
@@ -243,7 +252,9 @@ where
     B::Store: 'static,
 {
     let (store, _) = open(backend);
-    let held = Fenced::take(Arc::clone(&store), None).expect("take");
+    // Through a plain forwarding layer too, so a layer that drops a read is caught here.
+    let layer: Arc<dyn Store> = Arc::new(Interpose::new(Arc::clone(&store)));
+    let held = Fenced::take(layer, None).expect("take");
     held.txn(
         Txn::new()
             .put("p/a", "1", Cond::Any)
@@ -332,5 +343,10 @@ where
             .unwrap_or_else(PoisonError::into_inner)
             .is_some(),
         "F8 the hook ran"
+    );
+    assert_eq!(
+        between.reap_expired(),
+        Ok(0),
+        "F8 an unguarded reap forwards"
     );
 }
