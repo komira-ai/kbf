@@ -130,6 +130,15 @@ pub fn dead_addr() -> SocketAddr {
 /// same address. Elsewhere (macOS has only `127.0.0.1`) this is a probed port on
 /// `127.0.0.1` and the window stays; there, prefer [`Reserved::listen`].
 ///
+/// # What the address guarantees (Linux)
+/// The address is per process and per call: it is derived from the process id and a
+/// counter of this process's calls (`pid * 16 + call`, kept to 23 bits). Two calls in
+/// one process never share an address. Two concurrent test processes can share one
+/// only if their pids are congruent modulo 2^19 (524288) and they are at the same call
+/// number; with the counter under 15 no other pair of inputs gives the same address.
+/// On other platforms every call returns `127.0.0.1` with a probed port, so nothing
+/// above holds there.
+///
 /// # Panics
 /// After 15 calls in one process, or if no socket can be bound.
 #[must_use]

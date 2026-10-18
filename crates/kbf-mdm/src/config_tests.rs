@@ -350,6 +350,9 @@ fn main_exits_2_on_bad_flags_or_a_failed_start_and_0_on_sigterm() {
     // on 127.0.0.1 here (the thief) before `main` starts: `main` must still listen,
     // not fail with "Address already in use".
     let port = kbf_testkit::port::own_loopback_port();
+    // Only Linux has the per-call loopback address; elsewhere the port is probed on
+    // 127.0.0.1 itself, and binding it here would make `main` fail for real.
+    #[cfg(target_os = "linux")]
     let _thief = std::net::TcpListener::bind(("127.0.0.1", port.port()));
     cli.listen = port;
     let killer = std::thread::spawn(move || {
