@@ -45,7 +45,7 @@
 //! one mode is refused by the others with no edit here.
 //!
 //! `kbf --version` prints `kbf <package version>+<commit>`: the commit stamp is
-//! `kbf-server`'s ([`kbf_server::SERVER_VERSION`]), which `kbf-all-in-one` links
+//! `kbf-server`'s ([`kbf_server::SERVER_VERSION`]), which `kbf all-in-one` links
 //! anyway, so the artifacts workflow can check `kbf` as it checks `kbf-server`.
 //!
 //! `kbf --version --json` ([`version`]) prints one JSON object on one line naming the

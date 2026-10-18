@@ -30,7 +30,7 @@ pub enum Entry {
     /// The worker daemon: `kbf_node::run`, the flags of `kbf-daemon`.
     Daemon,
     /// The server and the daemon in one process: `kbf_all_in_one::run`, the flags of
-    /// `kbf-all-in-one`.
+    /// `kbf-server` and of `kbf-daemon`.
     AllInOne,
     /// The storage node: `kbf_server::storage_node::run`, `kbf-server`'s store, write and
     /// log flags and its own listener flags.
