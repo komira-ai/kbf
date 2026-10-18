@@ -226,6 +226,37 @@ fn a_node_that_does_not_report_is_unsupported_and_named() {
     }
 }
 
+/// Catches: a member that cannot count (down, draining, or denied by a `node` entry) held
+/// against the farm for what it reported: a dead or denied node that once sent status 0
+/// would keep the farm unconverged for ever. It is shown `unsupported` on its own line, but
+/// it is not listed in `unsupported` and does not block `converged`.
+#[test]
+fn an_unsupported_report_from_a_member_that_does_not_count_blocks_nothing() {
+    let silent = beat(0, ApplyStatus::Unspecified);
+    let cases = [
+        (MemberState::Down, Vec::new()),
+        (MemberState::Draining, Vec::new()),
+        (
+            MemberState::Active,
+            vec![DenyEntry::Node("node-1".to_owned())],
+        ),
+    ];
+    for (state, denied) in cases {
+        let (acks, _clock, _store) = rig();
+        let map = map_of(
+            vec![member(1, state), member(2, MemberState::Active)],
+            denied,
+        );
+        record(&acks, 1, 1, &silent);
+        record(&acks, 2, 1, &beat(5, ApplyStatus::Ok));
+        let got = judge(&acks, &map, 5);
+        assert!(got.unsupported.is_empty(), "{state:?}: {got:?}");
+        assert_eq!((got.expected, got.applied), (1, 1), "{state:?}");
+        assert!(got.converged, "{state:?}: {got:?}");
+        assert_eq!(got.nodes[0].status, NodeStatus::Unsupported);
+    }
+}
+
 /// Catches: a node's failed probe or identity guard shown as ok or pending, and a status
 /// code spelling that drifts from the operator API's closed set.
 #[test]
@@ -433,7 +464,8 @@ fn certified(source: Arc<dyn StoreConfigSource>) -> ColdStoreService {
 
 /// Catches: a role other than storage let in, and the certificate checks the service
 /// repeats behind the listener's table: no certificate is UNAUTHENTICATED, a daemon, a
-/// frontend, no role and a role that is not one are PERMISSION_DENIED; plain text admits.
+/// frontend, no role and a role that is not one are PERMISSION_DENIED; plain text refuses, with a
+/// certificate or without (the secret is never served unauthenticated).
 #[tokio::test]
 async fn only_a_storage_certificate_is_admitted() {
     let service = certified(fixed(1));
@@ -458,7 +490,14 @@ async fn only_a_storage_certificate_is_admitted() {
         assert_eq!(refused.code(), Code::PermissionDenied, "{role:?}");
     }
     let plain = ColdStoreService::new(fixed(1), Admission::Open);
-    assert!(plain.admit_leaf(None).await.expect("plain text").is_none());
+    for leaf in [None, Some(ok.as_slice())] {
+        let refused = plain.admit_leaf(leaf).await.expect_err("plain text");
+        assert_eq!(refused.code(), Code::PermissionDenied);
+        assert_eq!(
+            refused.message(),
+            "the cold store is served over mutual TLS only"
+        );
+    }
 }
 
 /// Catches: a denied or revoked node served because it was admitted once: the `deny/` rows

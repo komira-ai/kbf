@@ -512,7 +512,7 @@ async fn acks_that_cannot_be_kept_do_not_fail_the_membership_calls() {
 
 /// Catches: the service's own checks, which the listener's table hides on the wire (it refuses
 /// a daemon, and a handshake without a certificate never reaches the service): called
-/// directly, plain text admits without a certificate, mutual TLS without one is
+/// directly, plain text is PERMISSION_DENIED with or without a certificate, mutual TLS without one is
 /// UNAUTHENTICATED, a daemon certificate is PERMISSION_DENIED saying so, and a storage
 /// certificate is admitted with the names it carries.
 #[tokio::test]
@@ -520,7 +520,11 @@ async fn the_service_refuses_a_daemon_and_a_missing_certificate_itself() {
     use kbf_server::store_config::service::ColdStoreService;
     use kbf_storage::service::Admission;
     let plain = ColdStoreService::new(Source::new(1), Admission::Open);
-    assert!(plain.admit_leaf(None).await.expect("plain text").is_none());
+    let storage_der = der(Some("storage"), &["node-a"]);
+    for leaf in [None, Some(storage_der.as_slice())] {
+        let refused = plain.admit_leaf(leaf).await.expect_err("plain text");
+        assert_eq!(refused.code(), Code::PermissionDenied);
+    }
 
     let certified = ColdStoreService::new(Source::new(1), Admission::Certified);
     let none = certified

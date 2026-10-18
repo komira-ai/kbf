@@ -13,8 +13,10 @@
 //!   DNS name, the node id enrollment gives it) is an `Active` row in it.
 //!
 //! Without the registry only the first two apply, so a frontend that does not run
-//! enrollment still refuses a denied node. Plain text (no certificate) admits, as
-//! everywhere on this listener.
+//! enrollment still refuses a denied node. **Plain text refuses**: under
+//! [`Admission::Open`] (no worker TLS) the listener's role table lets every call through
+//! and a caller has no role, so the one RPC that carries the cold store's secret is
+//! PERMISSION_DENIED with fixed text rather than served in clear to whoever reaches the port.
 //!
 //! **What it answers.** One [`Snapshot`] of the registration. If the node already holds
 //! the snapshot's generation (`have_generation` equals it), or nothing is registered, the
@@ -98,11 +100,13 @@ impl ColdStoreService {
     ///
     /// # Errors
     /// UNAUTHENTICATED: under mutual TLS, no certificate or one that does not parse.
-    /// PERMISSION_DENIED: not the storage role, denied, or not an active node of the
+    /// PERMISSION_DENIED: plain text ([`Admission::Open`]), not the storage role, denied, or not an active node of the
     /// registry. UNAVAILABLE: the deny list or a state store cannot be read.
     pub async fn admit_leaf(&self, leaf: Option<&[u8]>) -> Result<Option<PeerCert>, Status> {
         if self.admission == Admission::Open {
-            return Ok(None);
+            return Err(Status::permission_denied(
+                "the cold store is served over mutual TLS only",
+            ));
         }
         let der = leaf.ok_or_else(|| Status::unauthenticated("no client certificate"))?;
         let peer = match role_of(der)? {
