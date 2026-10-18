@@ -6,13 +6,13 @@
 //!
 //! # Signing
 //!
-//! The helper, like `kbf-daemon`, must be signed with the hardened runtime
+//! The helper, like `kbf`, must be signed with the hardened runtime
 //! (`codesign --options runtime`) and without the `get-task-allow` or
 //! `disable-library-validation` entitlements: the hardened runtime turns on library
 //! validation, so `DYLD_INSERT_LIBRARIES` and a debugger cannot reach a process that
 //! runs as root (S4.3). An ad-hoc signature (`codesign -s -`) carries no team, so
 //! library validation then admits only the system's own libraries, which is all the
-//! helper links. The caller check relies on the same for `kbf-daemon`: a requirement
+//! helper links. The caller check relies on the same for `kbf`: a requirement
 //! pinned by cdhash names exactly the installed daemon binary.
 
 pub mod admin;

@@ -676,3 +676,16 @@ fn a_wait_that_fails_is_reported() {
         }
     );
 }
+
+/// Catches: the macOS refusal naming a binary no Mac installs any more (`kbf-daemon`;
+/// a Mac runs `kbf daemon`), so the log of a refused caller sends the operator to a
+/// file that is not there; and a refusal that loses the caller or the reason.
+#[test]
+fn a_refused_caller_is_not_the_installed_kbf() {
+    let text = caller(7).not_the_installed_binary("code failed to satisfy");
+    assert_eq!(
+        text,
+        "pid 7 version 1 is not the installed kbf: code failed to satisfy"
+    );
+    assert!(!text.contains("kbf-daemon"), "{text}");
+}

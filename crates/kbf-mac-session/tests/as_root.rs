@@ -8,7 +8,7 @@
 //! checks). The caller is this test binary: copied, signed ad hoc with the hardened
 //! runtime and named [`CLIENT`], it answers as the client in `as_root/client.rs`, and
 //! the helper is started with that copy's cdhash as the daemon requirement, so it stands
-//! in for `kbf-daemon`. A copy signed under another identifier (so another cdhash) and
+//! in for `kbf`. A copy signed under another identifier (so another cdhash) and
 //! named [`IMPOSTOR`] is the impostor. The client runs as the user sudo was run by, who
 //! reaches the socket through the `admin` group. A third copy, named `kbf-act`, is the
 //! program the tests' actions run: kbf-testkit's act steps (`kbf_testkit::act`), so no

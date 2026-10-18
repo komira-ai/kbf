@@ -4,7 +4,7 @@
 //! dedicated group (never `staff`, which every macOS user is in); the socket itself is
 //! mode 0660. That keeps every other uid out, lease users included. Each connection's
 //! caller is then checked by a [`CallerCheck`] (on macOS: the caller's code signature,
-//! by audit token, against the pinned `kbf-daemon` requirement):
+//! by audit token, against the pinned requirement of the installed `kbf`):
 //!
 //! 1. As soon as the connection is accepted, before a byte is read, the process at the
 //!    other end is identified and checked; a refused caller is told so and its
@@ -57,6 +57,15 @@ pub struct Caller {
 impl std::fmt::Display for Caller {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "pid {} version {}", self.pid, self.version)
+    }
+}
+
+impl Caller {
+    /// The refusal for a caller whose code does not satisfy the pinned requirement. A Mac
+    /// runs `kbf daemon`, so the installed software is the `kbf` binary.
+    #[must_use]
+    pub fn not_the_installed_binary(&self, why: impl std::fmt::Display) -> String {
+        format!("{self} is not the installed kbf: {why}")
     }
 }
 
