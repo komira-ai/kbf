@@ -70,6 +70,12 @@ Options:
       --api-token-file <API_TOKEN_FILE>
           A file holding the token operator API writes (cordon, drain, uncordon) must present as `Authorization: Bearer <token>`. It must be owned by the server's user with mode 0600 or 0400, or the server refuses to start; run the server as a user other than the daemon's, whose builds could read it. Without it, writes are refused
 
+      --remote-operator-listen <REMOTE_OPERATOR_LISTEN>
+          The remote operator listener (`docs/design/frontend-on-k8s.md` section 3): two routes, `POST /v1/update/desired` and `POST /v1/update/frontend`, for a CI job that presents a GitHub OIDC token the allow-list of `--remote-operator-config` accepts. Off unless given. It serves nothing else, and the loopback-only operator API is not changed by it
+
+      --remote-operator-config <REMOTE_OPERATOR_CONFIG>
+          The TOML file whose `[remote_operator]` table holds the allow-list (issuer, audience, repository_id, job_workflow_ref, refs or environments, ...); `kbf.toml` may hold it
+
       --invocations-open
           Serves the build pages (`GET /v1/invocations/{id}` and below) and the blob route (`GET /v1/blobs/{digest}`) on the operator API to every caller the REAPI policy accepts, with no `invocations` or `blobs` key in the policy file (`docs/design/invocations.md` section 4.3): it fills in `allow` for whichever of the two keys the file leaves out. Without it, and without the keys, those routes answer 404. Pages and blobs hold build outputs and logs: give it only for a listener that only trusted people reach
 

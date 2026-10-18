@@ -69,6 +69,53 @@ writes: forward the `Authorization` header unchanged, and expose only what the
 operators' network should reach. A proxy that adds an `Origin` header to every
 request turns writes off.
 
+## The remote operator listener (`POST /v1/update/desired`, `POST /v1/update/frontend`)
+
+Off unless the frontend is started with `--remote-operator-listen <addr>` and
+`--remote-operator-config <file>` (both or neither), and it needs `--state-store`. It is a
+listener of its own: the operator API above, its loopback-only write gate and its token are not
+changed, and this listener serves **no other route** (every other path is 404, a GET of these
+two is 405, there are no reads and no `admin` writes). Design:
+[frontend-on-k8s.md](design/frontend-on-k8s.md) sections 3 and 4.
+
+A request carries `Authorization: Bearer <GitHub Actions OIDC token>` and
+`Content-Type: application/json`, and no `Origin` header. The token is checked against the
+`[remote_operator]` table of the config file (TOML; `kbf.toml` may hold it, other tables are
+ignored). Required: `issuer` (https, no trailing slash), `audience`, `repository_id` (digits, as
+a string), `job_workflow_ref` (a list; each entry is `owner/repo/.github/workflows/f.yml@<ref>`,
+compared exactly) and at least one of `refs` and `environments` (when both are listed, both must
+match). Optional: `repository`, `event_names` (default `push`, `workflow_dispatch`; a
+`pull_request*` event is refused at load), `runner_environment` (default `github-hosted`),
+`max_token_lifetime_secs` (default 600, at most 3600) and `frontend_image_repository`
+(`registry/path`, no tag).
+
+The token must verify in this order: well formed and at most 8 KiB; `alg` is `RS256` (anything
+else, `none` and HMAC included, is refused) and the header has no `jku`, `x5u`, `jwk`, `x5c` or
+`crit`; the signature holds under the issuer's key for the `kid` (keys come from the issuer's
+discovery document's `jwks_uri`, on the issuer's own origin, over HTTPS; an unknown `kid` makes
+one refetch at most every 30 s; a failed fetch keeps the keys held, and with none held answers
+503); `iss`, `aud` (one string, or a list of exactly that one); `exp`, `nbf` and `iat` with a 60 s
+leeway, and `exp - iat` within the limit; `repository_id`; `job_workflow_ref`; `ref` and
+`environment` as configured; `event_name`; `runner_environment`; and a `jti` not used before.
+The `jti`s are kept in memory until the token's `exp` plus the leeway (up to 10,000; a full cache
+refuses), so a restart forgets them.
+
+| Status | Because |
+|---|---|
+| `413` | the body is over 4096 bytes |
+| `403` | an `Origin` header |
+| `401` | no bearer token, or the token is refused; the body names the check (`token refused: audience`), never a claim value |
+| `503` | the issuer's keys cannot be fetched and none are held; or the store cannot take the write |
+| `415` | not `application/json` |
+| `400` | the body has any field but the one below (a `strategy`, for one, is refused), or its value is malformed |
+| `501` | `POST /v1/update/frontend` while nothing applies a frontend image, or `frontend_image_repository` is unset |
+
+`POST /v1/update/desired` takes `{"commit": "<40 or 64 lowercase hex>"}` and offers that release
+to the node update; answers `{"status": "applied"}`, or `{"status": "unchanged"}` when it is
+already the desired one. `POST /v1/update/frontend` takes
+`{"image_digest": "sha256:<64 lowercase hex>"}`; the image is `frontend_image_repository@<digest>`.
+A verified token is spent even if its body is then refused.
+
 ## `GET /v1/nodes`
 
 The server that answers, then every node registered since it started, in node-id

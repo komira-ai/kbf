@@ -130,6 +130,9 @@ sha2 = "0.11.0"
 # OpenSSH signatures (`ssh-keygen -Y sign`) on operator erase requests (kbf-mdm): the
 # SSHSIG envelope and security-key (`sk-`) signature verification.
 ssh-key = { version = "0.6.7", default-features = false, features = ["alloc", "ed25519", "p256", "std"] }
+# Test keys only (kbf-server): the fake OIDC issuer generates its RSA keys. Already in the
+# tree; MIT OR Apache-2.0.
+rsa = { version = "0.9.10", default-features = false, features = ["std", "getrandom"] }
 # Constant-time comparison of the operator API token (kbf-server). Already in the tree
 # through rustls.
 subtle = "2.6.1"

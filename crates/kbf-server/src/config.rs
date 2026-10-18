@@ -198,6 +198,17 @@ pub struct Args {
     /// are refused.
     #[arg(long, requires = "api_listen")]
     pub api_token_file: Option<PathBuf>,
+    /// The remote operator listener (`docs/design/frontend-on-k8s.md` section 3): two
+    /// routes, `POST /v1/update/desired` and `POST /v1/update/frontend`, for a CI job that
+    /// presents a GitHub OIDC token the allow-list of `--remote-operator-config` accepts.
+    /// Off unless given. It serves nothing else, and the loopback-only operator API is
+    /// not changed by it.
+    #[arg(long, requires = "remote_operator_config")]
+    pub remote_operator_listen: Option<SocketAddr>,
+    /// The TOML file whose `[remote_operator]` table holds the allow-list (issuer, audience,
+    /// repository_id, job_workflow_ref, refs or environments, ...); `kbf.toml` may hold it.
+    #[arg(long, requires = "remote_operator_listen")]
+    pub remote_operator_config: Option<PathBuf>,
     /// Serves the build pages (`GET /v1/invocations/{id}` and below) and the blob route
     /// (`GET /v1/blobs/{digest}`) on the operator API to every caller the REAPI policy
     /// accepts, with no `invocations` or `blobs` key in the policy file

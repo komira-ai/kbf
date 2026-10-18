@@ -630,7 +630,7 @@ pub fn write_request(
 
 /// Whether a `Content-Type` value is `application/json`, in any case, with or without
 /// parameters (`; charset=utf-8`).
-fn is_json(value: &[u8]) -> bool {
+pub(crate) fn is_json(value: &[u8]) -> bool {
     let essence = value.split(|&b| b == b';').next().unwrap_or_default();
     essence.trim_ascii().eq_ignore_ascii_case(JSON.as_bytes())
 }

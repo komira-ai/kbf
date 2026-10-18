@@ -397,3 +397,29 @@ fn plain_text_off_loopback_checks_each_listener_through_loopback_only() {
         );
     }
 }
+
+/// The remote operator listener is off unless asked for, and the two flags come together:
+/// a listener without its allow-list, or an allow-list without a listener, is refused at
+/// parse time. Mutant: `requires` dropped from either flag.
+#[test]
+fn the_remote_operator_is_off_unless_both_flags_are_given() {
+    let none = Args::try_parse_from(["kbf-server"]).expect("defaults");
+    assert_eq!(none.remote_operator_listen, None);
+    assert_eq!(none.remote_operator_config, None);
+    assert!(
+        Args::try_parse_from(["kbf-server", "--remote-operator-listen", "127.0.0.1:9"]).is_err()
+    );
+    assert!(Args::try_parse_from(["kbf-server", "--remote-operator-config", "/c"]).is_err());
+    let both = Args::try_parse_from([
+        "kbf-server",
+        "--remote-operator-listen",
+        "127.0.0.1:9",
+        "--remote-operator-config",
+        "/c",
+    ])
+    .expect("both");
+    assert_eq!(
+        both.remote_operator_listen,
+        Some("127.0.0.1:9".parse().expect("addr"))
+    );
+}

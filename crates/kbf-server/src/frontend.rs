@@ -125,6 +125,8 @@ pub const ALLOWED: &[&str] = &[
     "worker_listen",
     "api_listen",
     "api_token_file",
+    "remote_operator_listen",
+    "remote_operator_config",
     "readyz_store_timeout_ms",
     "worker_tls_cert",
     "worker_tls_key",
@@ -421,6 +423,10 @@ fn place(server: &mut Args, instance: Instance) -> Result<(), String> {
     server.api_listen = server
         .api_listen
         .map(|addr| shift("api-listen", addr))
+        .transpose()?;
+    server.remote_operator_listen = server
+        .remote_operator_listen
+        .map(|addr| shift("remote-operator-listen", addr))
         .transpose()?;
     Ok(())
 }
@@ -739,6 +745,44 @@ struct Prepared<'a> {
     api: Option<crate::serve::Api>,
     channel: tonic::transport::Channel,
     sockets: Bound,
+    remote: Option<RemoteOperator>,
+}
+
+/// The remote operator listener (`crate::remote`): its socket, bound with the others, and
+/// the verifier of the allow-list `--remote-operator-config` names.
+struct RemoteOperator {
+    socket: Socket,
+    verifier: Arc<crate::oidc::Verifier>,
+}
+
+/// How long the verifier waits before it fetches the issuer's keys again for an unknown `kid`.
+const KEY_REFETCH: Duration = Duration::from_secs(30);
+
+/// How long fetching the issuer's discovery document or keys may take.
+const KEY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+impl RemoteOperator {
+    fn new(args: &Args) -> Result<Option<Self>, Box<dyn Error>> {
+        let (Some(listen), Some(file)) =
+            (args.remote_operator_listen, &args.remote_operator_config)
+        else {
+            return Ok(None);
+        };
+        let config = crate::oidc::OidcConfig::from_file(file)?;
+        let keys = crate::oidc::HttpsKeys::new(
+            &config.issuer,
+            crate::oidc::Roots::System,
+            KEY_FETCH_TIMEOUT,
+        )?;
+        let verifier = Arc::new(crate::oidc::Verifier::new(
+            config,
+            Arc::new(keys),
+            KEY_REFETCH,
+            crate::oidc::system_clock(),
+        ));
+        let socket = Socket::bind(listen, &Binder::new())?;
+        Ok(Some(Self { socket, verifier }))
+    }
 }
 
 /// The three listening sockets.
@@ -780,6 +824,7 @@ impl<'a> Prepared<'a> {
             api.as_ref().map(|api| api.listen),
             &Binder::new(),
         )?;
+        let remote = RemoteOperator::new(args)?;
         Ok(Self {
             flags,
             listeners,
@@ -787,6 +832,7 @@ impl<'a> Prepared<'a> {
             api,
             channel,
             sockets,
+            remote,
         })
     }
 
@@ -815,6 +861,7 @@ impl<'a> Prepared<'a> {
             api,
             channel,
             sockets,
+            remote,
         } = self;
         let args = &flags.server;
         let state = crate::start::with_members(state, args.members());
@@ -992,7 +1039,7 @@ impl<'a> Prepared<'a> {
         let holder = flags
             .handover
             .as_ref()
-            .zip(state_store)
+            .zip(state_store.clone())
             .map(|(handover, store)| {
                 let facts = Facts {
                     instance: handover.instance,
@@ -1027,6 +1074,24 @@ impl<'a> Prepared<'a> {
 
         let shutdown = shutdown()?;
         let stopper = Arc::clone(&drain);
+        let remote_routes = remote
+            .map(|remote| {
+                let store = state_store.clone().ok_or(
+                    "--remote-operator-listen needs --state-store: it offers releases to the update rows",
+                )?;
+                let farm = Arc::clone(&farm);
+                let sink = crate::remote::StoreSink::new(store, Arc::new(move || farm.now()));
+                let listener = remote.socket.http()?;
+                Ok::<_, Box<dyn Error>>((
+                    listener,
+                    crate::remote::router(remote.verifier, Arc::new(sink)),
+                ))
+            })
+            .transpose()?;
+        let (remote_listener, remote_routes) = match remote_routes {
+            Some((listener, routes)) => (Some(listener), routes),
+            None => (None, axum::Router::new()),
+        };
         let serving = async move {
             let history = crate::history::spawn(history);
             let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
@@ -1047,6 +1112,9 @@ impl<'a> Prepared<'a> {
             })
             .fuse();
             tokio::pin!(api_serve);
+            // The remote listener ends with the frontend; it has no stop of its own.
+            let remote_serve = serve_api(remote_listener, remote_routes, std::future::pending());
+            tokio::pin!(remote_serve);
             let ticking = async {
                 let mut tick = tokio::time::interval(listeners.tick);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1070,6 +1138,7 @@ impl<'a> Prepared<'a> {
                 }
                 Err(e) = worker_serve => Err(ServeError::from(e)),
                 Err(e) = &mut api_serve => Err(ServeError::Api(e)),
+                Err(e) = &mut remote_serve => Err(ServeError::Api(e)),
                 () = ticking => Ok(()),
                 () = ticker.run() => Ok(()),
                 () = stopping => Ok(()),
