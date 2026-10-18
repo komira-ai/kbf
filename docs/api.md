@@ -225,7 +225,7 @@ rebuild (a new cluster, a cache), or have it hold the slice first; and promote o
 member at a time. `draining` is the reverse: the member takes no new writes, its
 successor takes its slot at once, and it is read first.
 
-## `POST /v1/denied` and `DELETE /v1/denied`
+## `GET /v1/denied`, `POST /v1/denied` and `DELETE /v1/denied`
 
 An operator adds an entry to the storage deny list, or takes one off. A denied
 certificate is refused by every storage node on every method, and by the membership
@@ -256,6 +256,16 @@ map that holds it, which the call builds before it answers (`0` before any membe
 registered; the entry is in the first map then). An entry that is listed already answers
 `200` and keeps its first reason.
 
+`GET /v1/denied` lists the entries with the reasons they were added with:
+`{"denied": [{"entry": "serial a1b", "reason": "a lost laptop", "at_ms": 1791371800000}, ...]}`,
+serials first, then key hashes, then node ids, each in order, as the store's rows hold them
+now (the map the nodes hold lags the rows by up to a beat, and holds no reasons). `at_ms` is
+the store clock's milliseconds, Unix time on a running frontend. The list is empty
+(`{"denied": []}`) when nothing is denied. It passes the same gates as a write, the `GET`
+included, so the reasons reach only an operator, and its answer is `Cache-Control: no-store`.
+It assumes no single writer: every frontend over the store answers from the same rows, a
+frontend that is not the newest included. `404` on a server without a state store.
+
 `DELETE /v1/denied?entry=<entry>` takes the entry off (percent-encode it, or use `+` for the
 space): `200` with the same answer, `404` if it is not listed, `400` with no `entry` or one
 that is not an entry.
@@ -284,8 +294,7 @@ storage access but keeps its work stream, and goes on receiving actions (their c
 environments and input digests), and its blob calls on that listener are served, until it
 is listed in `--worker-deny-list`, the file that listener reads
 ([worker-protocol.md](design/worker-protocol.md)). To take a daemon off the farm, list it in
-both. There is no `GET /v1/denied` either: the reasons are kept in the store, and the list
-itself is in the map.
+both. `GET /v1/denied` shows the list; `GET /v1/members` does not.
 
 **Locking yourself out.** An entry that names the frontend's own certificate (by serial or
 key, or a `node` that is the name in it) makes every storage node refuse the frontend. The

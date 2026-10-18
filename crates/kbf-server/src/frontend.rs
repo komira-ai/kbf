@@ -948,6 +948,7 @@ impl<'a> Prepared<'a> {
             // enroll listener; until it exists, the enrollment routes answer 404.
             None,
         )
+        .merge(crate::verbs::routes(token.clone(), members.clone()))
         .merge(crate::release::router(releases.clone(), token.clone()))
         .merge(crate::object_store::api::routes(
             token.clone(),
