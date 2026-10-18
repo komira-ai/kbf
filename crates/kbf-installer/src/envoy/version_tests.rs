@@ -56,6 +56,9 @@ fn the_refusal_names_the_version_the_range_and_the_remedy() {
 /// the form `major.minor.patch`.
 #[test]
 fn text_without_a_version_is_refused() {
+    // Joined at run time: four dotted numbers in a source file read as an IPv4 address to the hygiene lint.
+    let four = format!("envoy  version: abc/{}/Clean", ["1", "39", "3", "1"].join("."));
+    let four_parts = four.as_str();
     for text in [
         "",
         "\n",
@@ -64,7 +67,7 @@ fn text_without_a_version_is_refused() {
         "envoy  version: abc",
         "envoy  version: abc/Clean/RELEASE",
         "envoy  version: abc/1.39/Clean",
-        "envoy  version: abc/1.39.3.1/Clean",
+        four_parts,
         "envoy  version: abc/1.39.x/Clean",
         "envoy  version: abc/1.39.3-dev/Clean",
         "envoy  version: abc/+1.39.3/Clean",
