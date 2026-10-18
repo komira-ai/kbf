@@ -278,3 +278,24 @@ fn settings_that_are_not_roots_refuse_the_stage() {
         "{why}"
     );
 }
+
+/// Catches the gate in front of the verbs being absent from the shipped binary (the unit tests
+/// run the same code, but the binary is what a host runs): an ordinary user is refused every
+/// verb that needs root with exit 2 and the reason, `--json` puts one object on standard
+/// output, and a verb that needs no root and is not built yet says which pull request builds it.
+///
+/// Mutant planted: the root check skipped (`gc` then reaches "not implemented", exit 1).
+#[test]
+fn the_shipped_binary_refuses_a_verb_that_needs_root_and_names_the_unbuilt_ones() {
+    let root = root("gate");
+    let out = helper(&root, &["gc"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("gc needs root"));
+    let out = helper(&root, &["--json", "gc"]);
+    assert_eq!(out.status.code(), Some(2));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one object");
+    assert_eq!(v["error"], "needs_root");
+    let out = helper(&root, &["status"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("status: not implemented (P4)"));
+}
