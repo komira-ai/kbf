@@ -71,7 +71,7 @@ async fn write_segments<S: ObjectStore>(
 
 /// Reads every footer under `p`, failing on a listing error.
 async fn read_all<S: ObjectStore>(store: &S, p: &KeyPrefix, reads: FooterReads) -> Vec<FooterRead> {
-    read_footers(store, p, reads)
+    read_footers(store, p, None, reads)
         .try_collect()
         .await
         .expect("listing")
@@ -483,7 +483,7 @@ async fn gone_objects_failed_reads_and_failed_listings_are_told_apart() {
 
     store.fail_list_after_first.store(true, Ordering::SeqCst);
     let cas = prefix("cas/");
-    let mut stream = std::pin::pin!(read_footers(&*store, &cas, reads(1, 2, 1024)));
+    let mut stream = std::pin::pin!(read_footers(&*store, &cas, None, reads(1, 2, 1024)));
     let mut items = Vec::new();
     while let Some(item) = futures::StreamExt::next(&mut stream).await {
         items.push(item);
@@ -493,5 +493,90 @@ async fn gone_objects_failed_reads_and_failed_listings_are_told_apart() {
             .iter()
             .any(|i| matches!(i, Err(ObjectStoreError::Protocol(_)))),
         "{items:?}"
+    );
+}
+
+/// A store whose reads of the first segment give way to the others many times first, so
+/// with concurrency the first segment's footer is the last one ready.
+struct SlowFirst(MemoryStore);
+
+impl ObjectStore for SlowFirst {
+    fn capabilities(&self) -> Capabilities {
+        self.0.capabilities()
+    }
+
+    async fn put_new(
+        &self,
+        key: &ObjectKey,
+        body: Bytes,
+        retain_until: Option<std::time::SystemTime>,
+    ) -> Result<(), ObjectStoreError> {
+        self.0.put_new(key, body, retain_until).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &ObjectKey,
+        range: ByteRange,
+    ) -> Result<Bytes, ObjectStoreError> {
+        if key.as_str().ends_with("0000") {
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+        }
+        self.0.get_range(key, range).await
+    }
+
+    async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
+        self.0.delete(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &KeyPrefix,
+        after: Option<&ListToken>,
+        max_keys: PageSize,
+    ) -> Result<ListPage, ObjectStoreError> {
+        self.0.list(prefix, after, max_keys).await
+    }
+}
+
+/// Catches: a reader that yields objects out of key order (a caller that records "handled
+/// up to key K" after the K-th result would then skip an object still being read), and one
+/// that does not resume: a read from `ListToken::after` the last key handled yields
+/// exactly the objects after it, the same as a read that was never stopped. Segments of
+/// different sizes with a concurrency of 4, so the reads finish out of order unless the
+/// stream orders them.
+#[tokio::test]
+async fn footers_come_in_key_order_and_resume_after_a_key() {
+    let store = SlowFirst(MemoryStore::new(Capabilities::default()));
+    write_segments(&store, "cas/", 24, |s| 1 + s % 5, 200).await;
+    let cas = prefix("cas/");
+    let all = read_all(&store, &cas, reads(4, 5, 2048)).await;
+    let keys: Vec<String> = all
+        .iter()
+        .map(|r| match r {
+            FooterRead::Segment(s) => s.key.as_str().to_owned(),
+            FooterRead::Skipped(s) => s.key.as_str().to_owned(),
+        })
+        .collect();
+    assert_eq!(keys.len(), 24);
+    assert!(keys.windows(2).all(|w| w[0] < w[1]), "{keys:?}");
+
+    let after = ListToken::after(&key(&keys[9]));
+    let rest: Vec<FooterRead> = read_footers(&store, &cas, Some(after), reads(4, 5, 2048))
+        .try_collect()
+        .await
+        .expect("listing");
+    let resumed: Vec<&str> = rest
+        .iter()
+        .map(|r| match r {
+            FooterRead::Segment(s) => s.key.as_str(),
+            FooterRead::Skipped(s) => s.key.as_str(),
+        })
+        .collect();
+    assert_eq!(
+        resumed,
+        keys[10..].iter().map(String::as_str).collect::<Vec<_>>()
     );
 }
