@@ -1,5 +1,7 @@
 # Host releases: the layout and the manual verbs
 
+> **Note:** the layout below is the current one. The design of record ([../design/distribution.md](../design/distribution.md)) moves releases to `/var/lib/kbf-installer/releases/<sha>` and replaces the `kbf-deploy host` verbs with `kbf-installer`; `/usr/local/kbf` is retired when that works on the test farm. There is no separate setup command.
+
 A host keeps each kbf release in its own directory and points two links at them.
 `kbf-deploy host` reads and changes that layout, and so does the root helper that applies
 updates the host pulled: both call the `kbf-installer` crate, so a host has **one state
@@ -148,7 +150,7 @@ written once, so the process running the old release keeps its file, and only th
 
 | Call | Does |
 |---|---|
-| `activate` | an order names a staged release, a serial and an order id. The state is written first (`current` = the new release, `previous` = the one that ran, `staged` cleared, the floor raised to the serial, a pending record naming the order), then `previous` and `current` move, each by an atomic rename. The caller restarts the service. A repeat of the order, or an order for the release already current, changes nothing; an order below the floor is refused. |
+| `activate` | an order names a staged release and an order id (the helper names it `<epoch>-<id>`). The state is written first (`current` = the new release, `previous` = the one that ran, `staged` cleared, a pending record naming the order), then `previous` and `current` move, each by an atomic rename. The caller restarts the service. A repeat of the order, or an order for the release already current, changes nothing. The installer keeps no floor; the order of orders is the node's client and the helper's (epoch, then id). |
 | `confirm` | the new release came up: the pending record is cleared. It must name the order that made the swap. |
 | `revert` | `current` goes back to the release that ran before; the state is written first. If that release's files are gone nothing changes and the swap stays pending. |
 | `boot_check` | run before every start of the service. The first start after a swap starts the confirm window (not the swap: the frontend's own update can wait hours between the two); with a start budget, a release started that many times without a confirm is reverted before it starts again. |

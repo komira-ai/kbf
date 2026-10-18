@@ -92,7 +92,7 @@ the OS:
 
 The 4 to 8 GiB is the same headroom as on a build host
 ([linux-build-host.md](linux-build-host.md#headroom---actions-memory-max-gib)): the
-kernel, systemd, sshd, the daemon itself and Podman's processes. A reservation is what
+kernel, systemd, sshd, the daemon itself and the containers' runtime processes. A reservation is what
 the process uses at its peak, and the same figure as its `MemoryMin=` above. The daemon
 writes the result to `actions/memory.max` and reports the lower of it and the host's
 memory as `mem_gib`, so the scheduler books no more than builds may use.
@@ -104,7 +104,7 @@ memory as `mem_gib`, so the scheduler books no more than builds may use.
 | RAM | 256 |
 | minus MinIO's reservation | 32 |
 | minus `kbf-server`'s reservation | 16 |
-| minus the OS, systemd, sshd, the daemon and Podman | 8 |
+| minus the OS, systemd, sshd, the daemon and the containers' runtime | 8 |
 | `--actions-memory-max-gib` | 200 |
 
 ## Server-only units
@@ -195,8 +195,10 @@ What each group of flags does:
   The proxy health-checks the server with `grpc.health.v1` on this listener
   ([api.md](../api.md#grpchealthv1-on-the-reapi-listener)).
 - **The worker listener** serves daemons over mutual TLS: their certificates must
-  chain to `--worker-client-ca`, and the deny list is read again at every `Hello` and
-  `Heartbeat` ([worker-protocol.md](../design/worker-protocol.md)).
+  chain to `--worker-client-ca`, and the deny list is read again at every check: a
+  daemon's `Hello`, `Heartbeat` and other calls, and a storage node's `Register` and
+  `Heartbeat`, so a deny list that cannot be read refuses the storage nodes too
+  ([worker-protocol.md](../design/worker-protocol.md)).
 - **The operator API** (`/v1`, `/healthz`, `/readyz`) answers reads to whoever reaches
   it, so it is bound to loopback; writes need the token in `--api-token-file`, owned
   by `kbf-server` with mode 0600 or 0400 ([api.md](../api.md)).
@@ -213,7 +215,7 @@ sudo systemctl enable --now kbf-server.service
 
 A converged host runs the server-only units above with this slice in place of theirs,
 and a daemon set up as on a build host
-([linux-build-host.md](linux-build-host.md): rootless Podman, the `kbf` user, swap),
+([linux-build-host.md](linux-build-host.md): `crun` and `uidmap`, the `kbf` user, swap),
 in the same slice, with this unit.
 
 `/etc/systemd/system/kbf.slice`:
@@ -246,6 +248,7 @@ CPUWeight=200
 Environment=XDG_RUNTIME_DIR=/run/user/<kbf uid>
 ExecStart=/usr/local/bin/kbf-daemon \
     --driver=container \
+    --oci-runtime=/usr/bin/crun \
     --server=https://<storage host name>:8981 \
     --cas=https://<storage host name>:8981 \
     --ca-cert=/etc/kbf/ca.pem \
@@ -295,10 +298,15 @@ kbf-server \
   modification time, never its bytes) at about 1000 files a second, or as fast as it
   can while the disk is under the free-space floor, and then:
   - keeps each file of an object the index names (staged on the write tier
-    included) or of this process's own writer epoch;
+    included) or of this process's own writer (its writer epoch, or for a node
+    registered with `--frontend` its member and boot);
   - deletes each file of an earlier epoch under this log's prefix that the index does
-    not name: an orphan, such as an upload that failed before its commit;
-  - keeps and counts a file under another prefix, and leaves a file without a header;
+    not name, while the process writes in an epoch: an orphan, such as an upload that
+    failed before its commit;
+  - keeps and counts as foreign every other file: under another prefix, or of another
+    writer (another node's, an earlier boot of this node's own member included, whose
+    metadata directory may have been wiped; or an epoch's, once the node writes as a
+    member and boot). It leaves a file without a header;
   - then forgets each indexed object, not staged, that has no file: its blobs leave
     the index, with every action-cache entry that needs one of them, so
     `FindMissingBlobs` reports them and the client uploads them again. Forgetting
@@ -319,6 +327,27 @@ kbf-server \
   version 3, objects held back by the guard, the bytes held and how long it took. A
   pass that fails is logged and runs again at the next start; until then nothing is
   evicted.
+- The rebuild of the index (a node registered with `--frontend`, over either kind of cold
+  store): a metadata log that has not finished one (a new or wiped directory, or an
+  upgrade of a node that has run before) makes the node register as catching up, serve
+  from the start, and rebuild in the background. It lists every object under the root
+  the keys of all writers share (a node's `cas/<member>/<boot>/<seq>`, and an epoch of
+  any log's `<log id>/cas/<epoch>/<seq>`, the old server's keys included), reads each
+  object's footer (its last bytes, never the records), and indexes the records that are
+  not indexed yet. Objects the node itself is writing are left to its own writes. An
+  object that is not a whole segment (too short, a torn tail, foreign bytes), or whose
+  key is none of these, is counted and logged, not indexed. Meanwhile a read or
+  `FindMissingBlobs` that finds nothing answers `UNAVAILABLE` and never `NOT_FOUND`: a
+  router asks the next owner; hits and writes are served. The log keeps the last key
+  handled, so a restart resumes after it, and that the rebuild is done, so a later start
+  does not list again; the first heartbeat after it makes the node active. A failed
+  attempt (the store cannot be listed or read) is logged and tried again after a
+  back-off; the node stays catching up. The start-up pass above and the evictor begin
+  once the rebuild is done. The action cache is not rebuilt: its entries live only in the
+  log, so a wiped node answers a miss and the action runs again. A node without
+  `--frontend` has no rebuild. The rebuild's line in the log gives the objects listed,
+  segments and records adopted, records already held, the node's own segments, objects
+  skipped, objects with no name of this node's, objects gone and how long it took.
 - Until the pass reaches it, or for a file lost while the server runs, a blob whose
   file was lost, damaged or left empty is still reported present by
   `FindMissingBlobs` until a read of it fails: that read answers `UNAVAILABLE` and
@@ -489,7 +518,7 @@ with a `REFUSED:` line on stderr.
 
 ## Installing on the host
 
-Three verbs change the host. Each runs as root, reads the host first, prints its plan
+Two verbs change the host. Each runs as root, reads the host first, prints its plan
 as `DRY-RUN:` lines and changes nothing; `--apply` carries the plan out, stopping at
 the first step that fails. A re-run after an apply plans nothing. Exit codes: 0 done
 (or nothing to do), 1 a step or the check after an apply failed, 2 refused
@@ -498,7 +527,6 @@ the first step that fails. A re-run after an apply plans nothing. Exit codes: 0 
 
 ```text
 sudo kbf-deploy linux swap --config node.conf [--kubelet-allows-swap] [--remove] [--apply]
-sudo kbf-deploy linux image-pull --config node.conf [--image REF]... [--apply]
 sudo kbf-deploy linux install-units --config node.conf [--bin-dir DIR] [--restart-minio] [--apply]
 sudo kbf-deploy linux install-units --config node.conf --uninstall [--apply]
 ```
@@ -510,13 +538,6 @@ sudo kbf-deploy linux install-units --config node.conf --uninstall [--apply]
   is active, since kubelet's default `failSwapOn` would take the node out of its
   cluster at its next restart; `--kubelet-allows-swap` says its config sets
   `failSwapOn: false`. `--remove` turns it off, drops the line and removes the file.
-- `image-pull` pulls each of `KBF_IMAGES` (or `--image`) missing from the kbf user's
-  rootless Podman store, as that user: its uid, its gid and all its groups (as
-  `sudo -u` gives them), `HOME` and `XDG_RUNTIME_DIR=/run/user/<uid>`. Each image in
-  the store must have its pinned digest and be `--platform` (`linux/amd64`); after an
-  apply each pulled image is checked the same way, and one still missing or not the
-  pin exits 1 with a `FAIL` line (the pulls ran, so it is not a refusal). Even a dry
-  run needs root, since it reads the store as the kbf user.
 - `install-units` checks the host (a cgroup v2 memory controller, `MINIO_UNIT` is a
   systemd unit, both users, the kbf user's subuid and subgid ranges, each a line
   keyed by its name or its uid, and linger, each key file in `KBF_ETC` its service's
@@ -625,7 +646,7 @@ backup.
   assignment that breaks the order, a slice minimum that is not the sum, a key on the
   command line, a bare `--image`) and require that rule's `FAIL` line; they
   also refuse each bad setting and a placeholder with no value. The host verbs'
-  tests (`src/linux/install_tests.rs`, `images_tests.rs`, `swap_tests.rs`) apply each
+  tests (`src/linux/install_tests.rs`, `swap_tests.rs`) apply each
   plan into a scratch directory with the tools played by a fake, check what landed,
   and require a re-run to plan nothing; each missing prerequisite is a row that must
   be refused with its own refusal. `src/user_tests.rs` runs `id` as another user

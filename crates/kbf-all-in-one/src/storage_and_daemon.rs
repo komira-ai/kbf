@@ -34,8 +34,12 @@
 //!   in `kbf all-in-one` (`crate::one_cache`).
 //! - **Stopping**: as `kbf all-in-one`, the storage half in the server half's place.
 //!   SIGTERM or SIGINT stops the storage half; the daemon half stops after it and the
-//!   process exits 0. A start the storage half refuses exits 2; one the daemon half
-//!   refuses exits as `kbf-daemon` would; a storage half that stops serving exits 1.
+//!   process exits 0. A start the storage half refuses exits 2; one that can pass
+//!   on a later try exits 75, `EX_TEMPFAIL` (`kbf_server::StartFailure`: a metadata
+//!   directory the stopping process still holds, or a registration whose boot the log
+//!   has set already, the frontend's state store having been restored from an older
+//!   copy); one the daemon half refuses exits as `kbf-daemon` would; a storage half that
+//!   stops serving exits 1.
 //!
 //! Linux only, the container driver only, as `kbf all-in-one`.
 

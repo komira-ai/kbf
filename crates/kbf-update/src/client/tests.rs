@@ -2,6 +2,8 @@
 //! names the defect it catches; the planted mutant for each is listed in the pull request.
 
 use std::fs;
+
+use sha2::Digest;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -302,27 +304,32 @@ async fn the_inbox_directory_has_the_frozen_layout() {
     let expected = vec![
         format!("kbf-{c}-{PLATFORM}.tar.gz"),
         format!("kbf-daemon-{c}-{PLATFORM}.tar.gz"),
-        "kbf-daemon.provenance.jsonl".to_owned(),
-        "kbf.provenance.jsonl".to_owned(),
         "offer.json".to_owned(),
+        "provenance.jsonl".to_owned(),
     ];
     assert_eq!(files, expected);
     assert_eq!(
         fs::read(dir.join(format!("kbf-{c}-{PLATFORM}.tar.gz"))).expect("tarball"),
         data
     );
+    // One bundle: each component's attestation on a line of its own.
+    let mut bundle = Vec::new();
+    for component in &offer.components {
+        bundle.extend_from_slice(&component.attestation);
+        if bundle.last() != Some(&b'\n') {
+            bundle.push(b'\n');
+        }
+    }
     assert_eq!(
-        fs::read(dir.join("kbf.provenance.jsonl")).expect("attestation"),
-        offer.components[0].attestation
+        fs::read(dir.join("provenance.jsonl")).expect("bundle"),
+        bundle
     );
+    let bundle_sha = hex::encode(sha2::Sha256::digest(&bundle));
     let sha = &offer.components[0].sha256;
-    let one = |n: &str, t: &str| {
-        format!(
-            "{{\"name\":\"{n}\",\"sha256\":\"{sha}\",\"size\":450,\"tarball\":\"{t}\",\"attestation\":\"{n}.provenance.jsonl\"}}"
-        )
-    };
+    let one =
+        |n: &str, t: &str| format!("{{\"name\":\"{n}\",\"file\":\"{t}\",\"sha256\":\"{sha}\"}}");
     let want = format!(
-        "{{\"generation\":3,\"commit\":\"{c}\",\"platform\":\"{PLATFORM}\",\"components\":[{},{}]}}",
+        "{{\"schema\":1,\"commit\":\"{c}\",\"bundle\":{{\"file\":\"provenance.jsonl\",\"sha256\":\"{bundle_sha}\"}},\"components\":[{},{}]}}",
         one("kbf", &format!("kbf-{c}-{PLATFORM}.tar.gz")),
         one("kbf-daemon", &format!("kbf-daemon-{c}-{PLATFORM}.tar.gz")),
     );

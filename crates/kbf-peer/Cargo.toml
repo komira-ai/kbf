@@ -10,8 +10,13 @@ publish.workspace = true
 # The role a peer's certificate names (docs/design/architecture-v2.md, section 9): the one
 # reader of `urn:kbf:role:<name>`, for every listener that takes a client certificate (the
 # storage service, the worker listener) and for tools that check a certificate before it
-# is installed. No gRPC: each caller says which status a refusal is.
+# is installed; the DNS and IP names it carries (the storage node's membership checks
+# them against its instance id and address); and its serial and public-key hash, which a
+# deny entry (`kbf-map`) is compared with. No gRPC: each caller says which status a
+# refusal is.
 [dependencies]
+kbf-map.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 x509-parser.workspace = true
 

@@ -3,9 +3,9 @@
 //!
 //! ```text
 //! DIR/inbox/<generation:020>-<commit>/   one directory per offer, mode 0750
-//!     offer.json                         what the offer named
+//!     offer.json                         what the offer names (the installer's schema 1)
 //!     <name>-<commit>-<platform>.tar.gz  each component's tarball
-//!     <name>.provenance.jsonl            each component's attestation
+//!     provenance.jsonl                   every component's attestation, one per line
 //! DIR/inbox/orders/<order_id:020>.json   one file per accepted order
 //! ```
 //!
@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::types::{Component, Offer, Order, is_hex};
 
@@ -62,11 +63,9 @@ pub fn tarball_name(offer: &Offer, component: &Component) -> String {
     )
 }
 
-/// The file a component's attestation is written to.
-#[must_use]
-pub fn attestation_name(component: &Component) -> String {
-    format!("{}.provenance.jsonl", component.name)
-}
+/// The file the attestations of an offer's components are written to, one per line: the
+/// bundle the installer's `gh attestation verify --bundle` reads.
+pub const BUNDLE: &str = "provenance.jsonl";
 
 /// A name no other call (or process) draws: 16 hex digits.
 fn unique() -> String {
@@ -94,20 +93,27 @@ fn sync_dir(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
+/// The schema of `offer.json`, which the installer (`kbf-installer`'s `offer`) reads.
+const OFFER_SCHEMA: u64 = 1;
+
+#[derive(Serialize)]
+struct FileRef<'a> {
+    file: &'a str,
+    sha256: &'a str,
+}
+
 #[derive(Serialize)]
 struct ComponentFile<'a> {
     name: &'a str,
+    file: String,
     sha256: &'a str,
-    size: u64,
-    tarball: String,
-    attestation: String,
 }
 
 #[derive(Serialize)]
 struct OfferFile<'a> {
-    generation: u64,
+    schema: u64,
     commit: &'a str,
-    platform: &'a str,
+    bundle: FileRef<'a>,
     components: Vec<ComponentFile<'a>>,
 }
 
@@ -270,22 +276,31 @@ impl Staging {
     /// # Errors
     /// A file cannot be written, the rename fails, or the inbox cannot be pruned.
     pub fn finish(&self, offer: &Offer) -> io::Result<()> {
-        let mut components = Vec::new();
+        let mut bundle = Vec::new();
         for c in &offer.components {
-            let attestation = attestation_name(c);
-            write_new(&self.partial.join(&attestation), &c.attestation)?;
-            components.push(ComponentFile {
-                name: &c.name,
-                sha256: &c.sha256,
-                size: c.size,
-                tarball: tarball_name(offer, c),
-                attestation,
-            });
+            bundle.extend_from_slice(&c.attestation);
+            if bundle.last() != Some(&b'\n') {
+                bundle.push(b'\n');
+            }
         }
+        write_new(&self.partial.join(BUNDLE), &bundle)?;
+        let bundle_sha = hex::encode(Sha256::digest(&bundle));
+        let components = offer
+            .components
+            .iter()
+            .map(|c| ComponentFile {
+                name: &c.name,
+                file: tarball_name(offer, c),
+                sha256: &c.sha256,
+            })
+            .collect();
         let body = OfferFile {
-            generation: offer.generation,
+            schema: OFFER_SCHEMA,
             commit: &offer.commit,
-            platform: &offer.platform,
+            bundle: FileRef {
+                file: BUNDLE,
+                sha256: &bundle_sha,
+            },
             components,
         };
         write_new(&self.partial.join("offer.json"), &json(&body)?)?;

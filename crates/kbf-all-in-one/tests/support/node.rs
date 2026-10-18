@@ -1,28 +1,52 @@
 //! What the tests that run a node binary share: its certificates, the stand-in
-//! `podman` and cgroup tree its container driver runs over, and the checks of what is
+//! `crun` and cgroup tree its container driver runs over, and the checks of what is
 //! on its disk. Used by this crate's tests/binary.rs and by kbf-cli's
 //! tests/storage_and_daemon.rs (through `#[path]`: a test can run only its own
 //! package's binaries, so each package that runs a node has a test of its own).
 
 #![allow(dead_code)] // Each test binary uses its own part of this module.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair, SanType};
+use rcgen::{CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair, SanType};
 
 /// How long the test waits for what should happen promptly.
 pub(crate) const PROMPT: Duration = Duration::from_secs(60);
 
-/// The per-architecture manifest the stand-in image store holds.
+/// The per-architecture manifest whose digest names the image the node's store holds.
 pub(crate) const MANIFEST: &[u8] =
     br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
 
-/// A CA, the node's certificate (`node-1`, its one DNS name, and the daemon role its
-/// worker session needs on the worker listener), the server's (`localhost`), and a
-/// storage client's (`client.pem`, naming the role `frontend` as a storage listener
-/// under mutual TLS requires), written into `dir`.
+/// Where tests that run a container daemon put their directories: Cargo's per-target
+/// temporary directory, unless an ancestor of it is closed to other users (a home
+/// directory often is), which the container driver refuses (its containers' ids are not
+/// the daemon's, and must be able to search down to the data directory); then the
+/// system's temporary directory.
+pub(crate) fn scratch_root() -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let target = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let searchable = std::fs::canonicalize(&target).is_ok_and(|real| {
+        real.ancestors()
+            .all(|a| std::fs::metadata(a).is_ok_and(|m| m.permissions().mode() & 0o001 != 0))
+    });
+    if searchable {
+        target
+    } else {
+        std::env::temp_dir()
+    }
+}
+
+/// A CA, the node's certificate (`node-1`, its one DNS name, the daemon role its worker
+/// session needs on the worker listener, and clientAuth, the daemon row of the farm's
+/// table), the server's (`localhost`: role `storage` and both key usages, the storage row,
+/// which is also what the in-process scheduler presents as a TLS server), and a storage
+/// client's (`client.pem`, naming the role `frontend` as a storage listener under mutual
+/// TLS requires), written into `dir`; every key private to this user, as `kbf`'s startup
+/// self-checks want them.
 pub(crate) fn pki(dir: &Path) {
     let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -31,15 +55,31 @@ pub(crate) fn pki(dir: &Path) {
     for (name, dns) in [("node", "node-1"), ("server", "localhost")] {
         let key = KeyPair::generate().expect("key");
         let mut params = CertificateParams::new(vec![dns.to_owned()]).expect("params");
-        if name == "node" {
-            let role = format!("{}daemon", kbf_storage::service::ROLE_URI_PREFIX);
-            params
-                .subject_alt_names
-                .push(SanType::URI(role.try_into().expect("IA5")));
-        }
+        let (role, ekus) = if name == "node" {
+            ("daemon", vec![ExtendedKeyUsagePurpose::ClientAuth])
+        } else {
+            (
+                "storage",
+                vec![
+                    ExtendedKeyUsagePurpose::ServerAuth,
+                    ExtendedKeyUsagePurpose::ClientAuth,
+                ],
+            )
+        };
+        let role = format!("{}{role}", kbf_storage::service::ROLE_URI_PREFIX);
+        params
+            .subject_alt_names
+            .push(SanType::URI(role.try_into().expect("IA5")));
+        params.extended_key_usages = ekus;
         let cert = params.signed_by(&key, &ca).expect("sign");
         std::fs::write(dir.join(format!("{name}.pem")), cert.pem()).expect("write");
-        std::fs::write(dir.join(format!("{name}.key")), key.serialize_pem()).expect("write");
+        let key_path = dir.join(format!("{name}.key"));
+        std::fs::write(&key_path, key.serialize_pem()).expect("write");
+        std::fs::set_permissions(
+            &key_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .expect("mode");
     }
     let mut client = CertificateParams::new(Vec::<String>::new()).expect("params");
     let role = format!("{}frontend", kbf_storage::service::ROLE_URI_PREFIX);
@@ -66,28 +106,38 @@ pub(crate) fn id_files(dir: &Path) -> PathBuf {
     ids
 }
 
-/// The stand-in `podman` in `bin` (a link to `fake`, the package's build of
-/// crates/kbf-driver-container/tests/bin/fake_podman.rs), and `kbf-act` beside it, with
-/// an image store holding [`MANIFEST`] as image `img1`; the stand-in runs `steps` as each
-/// action. Returns the image as an action names it.
-pub(crate) fn podman(bin: &Path, fake: &str, steps: &[&str]) -> String {
-    let state = bin.join("state");
+/// The stand-in `crun` in `bin` (a link to `fake`, the package's build of
+/// crates/kbf-driver-container/tests/bin/fake_crun.rs), `kbf-act` beside it, the id tools
+/// the container driver's start-up looks for on `PATH` (setuid files, as `uidmap` installs
+/// them), with the image [`MANIFEST`] names already unpacked in the
+/// node's image store under `data` (the node's `--data-dir`); the stand-in runs `steps`
+/// as each action. Returns the image as an action names it.
+pub(crate) fn crun(bin: &Path, data: &Path, fake: &str, steps: &[&str]) -> String {
+    use std::os::unix::fs::PermissionsExt as _;
+    let state = bin.join("crun-state");
     std::fs::create_dir_all(&state).expect("mkdir");
-    std::os::unix::fs::symlink(fake, bin.join("podman")).expect("link podman");
+    std::os::unix::fs::symlink(fake, bin.join("crun")).expect("link crun");
+    for tool in ["newuidmap", "newgidmap"] {
+        let path = bin.join(tool);
+        std::fs::write(&path, b"").expect("write the tool");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4755)).expect("chmod");
+    }
     kbf_testkit::act::link_self(&bin.join(kbf_testkit::act::NAME)).expect("link kbf-act");
-    std::fs::write(state.join("image-id"), "img1\n").expect("image id");
     std::fs::write(state.join("nonce"), format!("{}:", std::process::id())).expect("nonce");
     let knob: String = steps.iter().map(|s| format!("{s}\n")).collect();
     std::fs::write(state.join("action"), knob).expect("action");
-    let digest = format!("sha256:{}", kbf_transfer::digest_of(MANIFEST).hash);
-    let store = state.join("store/fake-images/img1");
-    std::fs::create_dir_all(&store).expect("mkdir store");
-    let file = kbf_driver_container::image::manifest_file(&digest);
-    std::fs::write(store.join(file), MANIFEST).expect("manifest");
-    format!("docker://registry.test/tools/busybox@{digest}")
+    let hex = kbf_transfer::digest_of(MANIFEST).hash;
+    let rootfs = data.join("leases/oci-images").join(&hex).join("rootfs");
+    std::fs::create_dir_all(rootfs.join("kbf/root")).expect("an unpacked image");
+    format!("docker://registry.test/tools/busybox@sha256:{hex}")
 }
 
-/// A cgroup v2 mount of plain directories at `bin/cgroup`, where the stand-in `podman`
+/// The flag that points the daemon at the stand-in `crun` [`crun`] put in `bin`.
+pub(crate) fn oci_runtime(bin: &Path) -> String {
+    format!("--oci-runtime={}", bin.join("crun").display())
+}
+
+/// A cgroup v2 mount of plain directories at `bin/cgroup`, where the stand-in `crun`
 /// looks, holding the daemon's unit; the flags that point the daemon at it.
 pub(crate) fn cgroup_tree(bin: &Path) -> Vec<String> {
     let root = bin.join("cgroup");
@@ -109,16 +159,32 @@ pub(crate) fn cgroup_tree(bin: &Path) -> Vec<String> {
     ]
 }
 
-/// A port nothing listens on now.
-pub(crate) fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
+/// An address nothing listens on now, for a worker listener the binary binds itself,
+/// that no other test or process is likely to take before the binary does. The port
+/// cannot be left to the binary (the daemon half dials it by the `--server` flag), and a
+/// port number probed on `127.0.0.1` is free only until a test binding `127.0.0.1:0`, or
+/// a connection's source port, takes it. So the address is a loopback address of this
+/// call's own (127 and three more bytes; the whole loopback block is the host's own on
+/// Linux) that nothing else binds, with a port probed on it: the one thing that could
+/// take it is a process that chose the same address.
+pub(crate) fn worker_addr() -> SocketAddr {
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
+    assert!(call < 15, "more addresses than one process can tell apart");
+    // 23 bits of process and call number under a leading 1 bit: the second byte is never
+    // 0, so never the usual loopback address, and with a call number under 15 the three
+    // bytes are never all ones (the block's broadcast address).
+    let host = ((std::process::id().wrapping_mul(16) + call) & 0x7F_FFFF) | 0x80_0000;
+    let [_, a, b, c] = host.to_be_bytes();
+    let port = std::net::TcpListener::bind(SocketAddr::from(([127, a, b, c], 0)))
         .expect("bind")
         .local_addr()
         .expect("addr")
-        .port()
+        .port();
+    SocketAddr::from(([127, a, b, c], port))
 }
 
-/// `PATH` with `bin`, where [`podman`] put the stand-in, first.
+/// `PATH` with `bin`, where [`crun`] put the id tools, first.
 pub(crate) fn image_path(bin: &Path) -> String {
     format!(
         "{}:{}",
