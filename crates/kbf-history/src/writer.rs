@@ -47,20 +47,21 @@ use kbf_objstore::{ByteRange, ObjectKey, ObjectStore, ObjectStoreError};
 use kbf_state::{Cond, Txn, Versioned};
 use prost::Message;
 
-use crate::container::{self, Encoded, Header};
+use crate::container::{self, Encoded, Footer, Header};
 use crate::derived::{Derived, DerivedLimits, TestId};
 use crate::index::HistoryIndex;
 use crate::keys::{Day, Family, HistoryRoot, InvKey, WriterId};
 use crate::pending::{Also, Kept, KeptObject, Pending, PendingLimits, Row};
 use crate::queue::{Event, EventQueue, InvRef};
 use crate::records::{
-    ChunkBody, ChunkRecord, ChunkRow, ChunkSummary, DigestRow, FailedRun, HitRecord, InvState,
-    InvocationHeader, MAX_INSTANCES, RunRecord, Slow, StreamRow,
+    ChunkBody, ChunkRecord, ChunkRow, ChunkSummary, DigestRow, FailedRun, FlogSummary, HitRecord,
+    InvState, InvocationHeader, MAX_INSTANCES, ObjRow, RunRecord, Slow, StreamRow,
 };
 use crate::rows::{ShapeKind, ShapeRow};
-use crate::run_id::{Minter, StreamId};
+use crate::run_id::{Minter, RunId, StreamId};
 use crate::scoped::Scoped;
 use crate::status::{self, Observed};
+use crate::today::{TODAY_BYTES, Today, TodayRun};
 
 const MS_PER_DAY: u64 = 86_400_000;
 
@@ -99,6 +100,9 @@ pub struct Limits {
     pub header_reads_per_step: usize,
     /// The shape and status rows' bounds.
     pub derived: DerivedLimits,
+    /// Bytes of today's runs held in memory at most ([`Today`]); the oldest are
+    /// forgotten first.
+    pub today_bytes: usize,
 }
 
 impl Default for Limits {
@@ -116,6 +120,7 @@ impl Default for Limits {
             invocations: 4096,
             header_reads_per_step: 256,
             derived: DerivedLimits::default(),
+            today_bytes: TODAY_BYTES,
         }
     }
 }
@@ -228,6 +233,7 @@ struct Core {
     pending: Pending,
     kept: Kept,
     derived: Derived,
+    today: Arc<Today>,
     drops: Drops,
     /// An index transaction failed this step: the index is not draining.
     index_failed: bool,
@@ -265,6 +271,7 @@ impl<O: ObjectStore> Writer<O> {
                 pending: Pending::new(limits.pending),
                 kept: Kept::new(limits.kept),
                 derived: Derived::new(limits.derived),
+                today: Arc::new(Today::new(limits.today_bytes)),
                 drops: Drops::default(),
                 index_failed: false,
                 refill_failed: false,
@@ -419,6 +426,13 @@ impl<O: ObjectStore> Writer<O> {
         self.objects.get_range(&object.key, range).await
     }
 
+    /// Today's runs, which the writer feeds from the events it drains. The reads that
+    /// have no day index yet hold this handle.
+    #[must_use]
+    pub fn today(&self) -> Arc<Today> {
+        Arc::clone(&self.core.today)
+    }
+
     /// The writer's drop counts.
     #[must_use]
     pub fn drops(&self) -> Drops {
@@ -462,6 +476,7 @@ impl Core {
     /// Takes the queued events into the invocations' chunks.
     fn take_events(&mut self, now_ms: u64) {
         self.minter.forget_before(Day::from_ms(now_ms));
+        self.today.begin(now_ms);
         for event in self.queue.drain() {
             self.ingest(event, now_ms);
         }
@@ -756,10 +771,10 @@ impl Core {
     }
 
     fn ingest(&mut self, event: Event, now_ms: u64) {
-        let inv = match &event {
-            Event::Run { inv, .. } | Event::Hit { inv, .. } | Event::Close { inv } => inv,
-        };
-        if !self.open(inv) {
+        // A failure-log row belongs to no invocation: only the others open one.
+        if let Some(inv) = event.inv()
+            && !self.open(inv)
+        {
             self.drops.invocations += 1;
             return;
         }
@@ -773,6 +788,7 @@ impl Core {
                 let day = Day::from_ms(record.time_ms);
                 self.break_if(&inv, day, Some(record.stream), now_ms);
                 self.observe(&inv, &record);
+                self.today.push(TodayRun::of(&record));
                 let state = self.state(&inv.key);
                 note(&mut state.header, &record.instance, record.time_ms);
                 state.header.runs += 1;
@@ -806,6 +822,22 @@ impl Core {
                 let size = record.encoded_len();
                 b.hits.push(record);
                 self.grew(&inv.key, size, now_ms);
+            }
+            Event::Flog(flog) => {
+                // The object is written already: queue its row, restored from the object
+                // if it is dropped.
+                let origin = KeptObject {
+                    key: flog.key.clone(),
+                    footer_offset: flog.footer_offset,
+                    footer_len: flog.footer_len,
+                };
+                let row = ObjRow {
+                    footer_offset: flog.footer_offset,
+                    footer_len: flog.footer_len,
+                    bytes: flog.bytes,
+                };
+                let key = self.index.root().obj_flog(flog.run);
+                self.queue_row(key, row.encode_to_vec(), Cond::Absent, Some(origin));
             }
             Event::Close { inv } => {
                 self.minter.close(&inv.key);
@@ -1044,15 +1076,41 @@ impl Core {
             self.kept.push(object);
             return false;
         };
-        let parsed = container::decode_footer(&bytes)
+        match container::decode_footer(&bytes) {
+            Ok((Family::InvocationChunk, footer)) => self.restore_chunk(object, &footer),
+            Ok((Family::FailureLog, footer)) => self.restore_flog(&object, &footer),
+            Err(_) => {}
+        }
+        true
+    }
+
+    /// Queues again the `ui/obj` row of a failure-log object, from its footer's summary.
+    fn restore_flog(&mut self, object: &KeptObject, footer: &Footer) {
+        let Ok(summary) = FlogSummary::decode(footer.summary.as_slice()) else {
+            return;
+        };
+        let Ok(id) = <[u8; 12]>::try_from(summary.run_id.as_slice()) else {
+            return;
+        };
+        let row = ObjRow {
+            footer_offset: object.footer_offset,
+            footer_len: object.footer_len,
+            bytes: object.footer_offset + u64::from(object.footer_len),
+        };
+        let key = self.index.root().obj_flog(RunId::from_bytes(id));
+        self.queue_row(key, row.encode_to_vec(), Cond::Absent, Some(object.clone()));
+    }
+
+    /// Queues again the rows of a chunk, from its footer's summary.
+    fn restore_chunk(&mut self, object: KeptObject, footer: &Footer) {
+        let parsed = ChunkSummary::decode(footer.summary.as_slice())
             .ok()
-            .and_then(|(_, footer)| ChunkSummary::decode(footer.summary.as_slice()).ok())
             .and_then(|s| {
                 let inv = InvKey::parse(&s.inv_key).ok();
                 inv.zip(s.row.clone()).map(|(inv, row)| (inv, row, s))
             });
         let Some((inv, mut row, summary)) = parsed else {
-            return true;
+            return;
         };
         // The summary was written before the object's length and footer position were
         // known; the footer and trailer run to the object's end.
@@ -1080,7 +1138,6 @@ impl Core {
             let key = rows.stream(day, StreamId(row.stream), summary.stream_first_ms);
             self.queue_row(key, value.encode_to_vec(), Cond::Absent, Some(object));
         }
-        true
     }
 }
 

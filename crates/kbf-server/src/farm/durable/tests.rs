@@ -4,6 +4,7 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kbf_caps::NodeCaps;
+use kbf_front::ActionLabel;
 use kbf_log::{Bootstrap, FarmLogId};
 use kbf_sched::RequeueReason;
 use kbf_state::fake::{Fake, Flaw};
@@ -17,11 +18,17 @@ use kbf_types::{
 };
 
 use super::*;
+use crate::action_usage::{ShapeKey, Target, TargetKind};
 
 /// A store whose writes can be made to fail.
 struct Flaky {
     inner: Fake,
     down: AtomicBool,
+    /// Another writer rewrites a `lease/` row just after the farm reads it.
+    touch_lease: AtomicBool,
+    /// Applied just before the next read of an `op/` row: a write landing between two
+    /// reads of one look.
+    before_op_read: std::sync::Mutex<Option<Txn>>,
 }
 
 impl Flaky {
@@ -30,6 +37,8 @@ impl Flaky {
         Arc::new(Self {
             inner,
             down: AtomicBool::new(false),
+            touch_lease: AtomicBool::new(false),
+            before_op_read: std::sync::Mutex::new(None),
         })
     }
 
@@ -47,7 +56,21 @@ impl Store for Flaky {
     }
 
     fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {
-        self.inner.get(key)
+        if key.starts_with("op/") {
+            let landing = self.before_op_read.lock().expect("lock").take();
+            if let Some(txn) = landing {
+                let _ = self.inner.txn(txn)?;
+            }
+        }
+        let read = self.inner.get(key)?;
+        if key.starts_with("lease/")
+            && self.touch_lease.load(Ordering::SeqCst)
+            && let Some(row) = &read
+        {
+            let same = Txn::new().put(key, row.value.clone(), Cond::Any);
+            let _ = self.inner.txn(same)?;
+        }
+        Ok(read)
     }
 
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
@@ -123,6 +146,18 @@ fn requeue(operation: u64, seq: u64) -> Requeue {
     }
 }
 
+/// How an operation ended, for the tests that do not look at the row.
+fn ended() -> Ending {
+    Ending {
+        finished: Finished::Failed(kbf_proto::google::rpc::Status {
+            code: 3,
+            message: "ended".to_owned(),
+            details: Vec::new(),
+        }),
+        retention: Duration::from_secs(1),
+    }
+}
+
 fn open(store: &Arc<Flaky>) -> Durable {
     let store: Arc<dyn Store> = store.clone();
     Durable::open(store, EpochPolicy::Keep, 100)
@@ -168,7 +203,7 @@ fn a_submitted_operation_is_loaded_queued() {
     let store = Flaky::new();
     let durable = open(&store);
     durable
-        .submitted(OperationId(4), &request(1))
+        .submitted(OperationId(4), &request(1), &a_subject())
         .expect("submit");
     let stored = durable.load().expect("load");
     assert_eq!(
@@ -182,12 +217,13 @@ fn a_submitted_operation_is_loaded_queued() {
                 lease: None,
                 losses: 0,
                 fate: None,
+                subject: Some(a_subject()),
             }],
             floors: Vec::new(),
             cordons: Vec::new(),
         }
     );
-    let again = durable.submitted(OperationId(4), &request(2));
+    let again = durable.submitted(OperationId(4), &request(2), &a_subject());
     assert!(matches!(again, Err(StateError::Conflict(_))), "{again:?}");
 }
 
@@ -200,10 +236,10 @@ fn a_grant_holds_the_lease_and_leaves_the_queue() {
     let store = Flaky::new();
     let durable = open(&store);
     durable
-        .submitted(OperationId(4), &request(1))
+        .submitted(OperationId(4), &request(1), &a_subject())
         .expect("submit");
     durable
-        .persist(&[Effect::Start(start(4, 7))])
+        .persist(&[Effect::Start(start(4, 7))], None)
         .expect("grant");
     let stored = durable.load().expect("load");
     assert_eq!(stored.next_seq, 8);
@@ -223,12 +259,12 @@ fn an_operation_never_holds_two_leases() {
     let store = Flaky::new();
     let durable = open(&store);
     durable
-        .submitted(OperationId(4), &request(1))
+        .submitted(OperationId(4), &request(1), &a_subject())
         .expect("submit");
     durable
-        .persist(&[Effect::Start(start(4, 0))])
+        .persist(&[Effect::Start(start(4, 0))], None)
         .expect("grant");
-    let second = durable.persist(&[Effect::Start(start(4, 1))]);
+    let second = durable.persist(&[Effect::Start(start(4, 1))], None);
     assert!(matches!(second, Err(StateError::Missing(_))), "{second:?}");
     let stored = durable.load().expect("load");
     let lease = stored.operations[0].lease.as_ref().map(|g| g.lease);
@@ -243,19 +279,19 @@ fn a_stale_complete_is_rejected() {
     let store = Flaky::new();
     let durable = open(&store);
     durable
-        .submitted(OperationId(4), &request(1))
+        .submitted(OperationId(4), &request(1), &a_subject())
         .expect("submit");
     durable
-        .persist(&[Effect::Start(start(4, 0))])
+        .persist(&[Effect::Start(start(4, 0))], None)
         .expect("first grant");
     durable
         .requeued(&requeue(4, 0), None, None, &FloorChange::default())
         .expect("given up");
     durable
-        .persist(&[Effect::Start(start(4, 1))])
+        .persist(&[Effect::Start(start(4, 1))], None)
         .expect("second grant");
 
-    let stale = durable.persist(&[Effect::Answer(answer(4, 0))]);
+    let stale = durable.persist(&[Effect::Answer(answer(4, 0))], Some(&ended()));
     assert!(matches!(stale, Err(StateError::Missing(_))), "{stale:?}");
     let stored = durable.load().expect("load");
     let held = stored.operations[0].lease.as_ref().map(|g| g.lease);
@@ -266,7 +302,7 @@ fn a_stale_complete_is_rejected() {
     );
 
     durable
-        .persist(&[Effect::Answer(answer(4, 1))])
+        .persist(&[Effect::Answer(answer(4, 1))], Some(&ended()))
         .expect("the current lease's result");
     let stored = durable.load().expect("load");
     assert!(stored.operations.is_empty());
@@ -276,8 +312,145 @@ fn a_stale_complete_is_rejected() {
     );
     assert_eq!(
         keys(&store),
-        ["meta/epoch", "meta/next_op", "meta/next_seq"]
+        [
+            "done/0000000000000004",
+            "meta/epoch",
+            "meta/next_op",
+            "meta/next_seq"
+        ],
+        "a finished operation leaves its result and nothing else"
     );
+}
+
+/// Catches: an operation ended in two transactions (its rows removed, then its result
+/// put): a crash between them leaves neither. One transaction takes the removal of the
+/// `op/`, `lease/` and `queue/` rows and the put of the `done/` row, for a result and
+/// for a refusal alike; a store that refuses it keeps the operation's rows and no result;
+/// and a stale finish puts no result.
+#[test]
+fn an_operation_ends_in_one_transaction_that_puts_its_result() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    for operation in [4, 5] {
+        durable
+            .submitted(OperationId(operation), &request(1), &a_subject())
+            .expect("submit");
+    }
+    durable
+        .persist(&[Effect::Start(start(4, 0))], None)
+        .expect("grant");
+    let rows = keys(&store);
+
+    store.set_down(true);
+    let refused = durable.persist(&[Effect::Answer(answer(4, 0))], Some(&ended()));
+    assert!(matches!(refused, Err(StateError::Store(_))), "{refused:?}");
+    store.set_down(false);
+    assert_eq!(keys(&store), rows, "a refused finish wrote something");
+
+    let stale = durable.persist(&[Effect::Answer(answer(4, 9))], Some(&ended()));
+    assert!(matches!(stale, Err(StateError::Missing(_))), "{stale:?}");
+    assert_eq!(keys(&store), rows, "a stale finish wrote something");
+
+    let before = store.commit_stats().txns;
+    durable
+        .persist(&[Effect::Answer(answer(4, 0))], Some(&ended()))
+        .expect("finish");
+    assert_eq!(store.commit_stats().txns, before + 1, "one transaction");
+    let refusal = Refusal {
+        operation: OperationId(5),
+        waiters: Vec::new(),
+        reason: "no worker".to_owned(),
+    };
+    durable
+        .persist(&[Effect::Refuse(refusal)], Some(&ended()))
+        .expect("refuse");
+    assert_eq!(store.commit_stats().txns, before + 2, "one transaction");
+    assert_eq!(
+        keys(&store),
+        [
+            "done/0000000000000004",
+            "done/0000000000000005",
+            "meta/epoch",
+            "meta/next_op",
+            "meta/next_seq"
+        ]
+    );
+    assert_eq!(
+        durable.progress(OperationId(4)).expect("progress"),
+        Progress::Ended(ended().finished)
+    );
+}
+
+/// Catches: a finish that does not compare-and-set on the lease row it read (a result
+/// accepted for a lease another writer has changed since): the write is refused and the
+/// operation keeps its rows and gets no result.
+#[test]
+fn a_finish_is_refused_when_the_lease_row_changed_under_it() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .submitted(OperationId(4), &request(1), &a_subject())
+        .expect("submit");
+    durable
+        .persist(&[Effect::Start(start(4, 0))], None)
+        .expect("grant");
+    store.touch_lease.store(true, Ordering::SeqCst);
+    let rows = keys(&store);
+    let refused = durable.persist(&[Effect::Answer(answer(4, 0))], Some(&ended()));
+    assert!(
+        matches!(refused, Err(StateError::Conflict(_))),
+        "{refused:?}"
+    );
+    assert_eq!(keys(&store), rows, "a changed lease was finished over");
+}
+
+/// Catches: a look that reads `done/` (nothing yet), then finds the operation's rows
+/// gone because the finish landed between the two reads, and calls the operation lost.
+/// The finish is one transaction, so the look reads `done/` again and finds the result.
+#[test]
+fn a_finish_landing_between_the_reads_of_a_look_is_not_gone() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    let operation = OperationId(4);
+    durable
+        .submitted(operation, &request(1), &a_subject())
+        .expect("submit");
+    durable
+        .persist(&[Effect::Start(start(4, 0))], None)
+        .expect("grant");
+    let finish = Ending::settle(
+        &ended(),
+        Txn::new().delete(lease_key(LeaseId::new(5, 0)), Cond::Any),
+        operation,
+    );
+    *store.before_op_read.lock().expect("lock") = Some(finish);
+    assert_eq!(
+        durable.progress(operation).expect("progress"),
+        Progress::Ended(ended().finished)
+    );
+}
+
+/// Catches: an effect that ends an operation, written with no result to put: it would
+/// remove the operation's rows and leave nothing. It writes nothing.
+#[test]
+fn an_ending_with_no_result_writes_nothing() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .submitted(OperationId(4), &request(1), &a_subject())
+        .expect("submit");
+    let rows = keys(&store);
+    let refusal = Refusal {
+        operation: OperationId(4),
+        waiters: Vec::new(),
+        reason: String::new(),
+    };
+    let refused = durable.persist(&[Effect::Refuse(refusal)], None);
+    assert!(
+        matches!(refused, Err(StateError::Missing(_))),
+        "{refused:?}"
+    );
+    assert_eq!(keys(&store), rows);
 }
 
 /// Catches: a lease given up that stays in the store (a restart re-binds a run nobody
@@ -289,10 +462,10 @@ fn a_given_up_lease_requeues_its_operation_once() {
     let store = Flaky::new();
     let durable = open(&store);
     durable
-        .submitted(OperationId(4), &request(1))
+        .submitted(OperationId(4), &request(1), &a_subject())
         .expect("submit");
     durable
-        .persist(&[Effect::Start(start(4, 0))])
+        .persist(&[Effect::Start(start(4, 0))], None)
         .expect("grant");
     durable
         .requeued(&requeue(4, 0), None, None, &FloorChange::default())
@@ -306,11 +479,14 @@ fn a_given_up_lease_requeues_its_operation_once() {
     let again = durable.load().expect("load");
     assert_eq!(again, stored);
     durable
-        .persist(&[Effect::Refuse(Refusal {
-            operation: OperationId(4),
-            waiters: Vec::new(),
-            reason: String::new(),
-        })])
+        .persist(
+            &[Effect::Refuse(Refusal {
+                operation: OperationId(4),
+                waiters: Vec::new(),
+                reason: String::new(),
+            })],
+            Some(&ended()),
+        )
         .expect("refused");
     durable
         .requeued(&requeue(4, 0), None, None, &FloorChange::default())
@@ -326,7 +502,7 @@ fn a_refusal_removes_the_operation_and_other_effects_write_nothing() {
     let store = Flaky::new();
     let durable = open(&store);
     durable
-        .submitted(OperationId(4), &request(1))
+        .submitted(OperationId(4), &request(1), &a_subject())
         .expect("submit");
     let before = store.commit_stats().txns;
     let unsettled = [
@@ -339,7 +515,7 @@ fn a_refusal_removes_the_operation_and_other_effects_write_nothing() {
             reason: "no worker".to_owned(),
         })),
     ];
-    durable.persist(&unsettled).expect("nothing to write");
+    durable.persist(&unsettled, None).expect("nothing to write");
     assert_eq!(store.commit_stats().txns, before);
     assert_eq!(durable.load().expect("load").operations.len(), 1);
 
@@ -349,10 +525,13 @@ fn a_refusal_removes_the_operation_and_other_effects_write_nothing() {
         reason: "no worker".to_owned(),
     };
     durable
-        .persist(&[Effect::Refuse(refusal)])
+        .persist(&[Effect::Refuse(refusal)], Some(&ended()))
         .expect("refused");
     assert!(durable.load().expect("load").operations.is_empty());
-    assert_eq!(keys(&store), ["meta/epoch", "meta/next_op"]);
+    assert_eq!(
+        keys(&store),
+        ["done/0000000000000004", "meta/epoch", "meta/next_op"]
+    );
 }
 
 /// Catches: a loss count that is not written with the give-up that made it (a restart
@@ -363,27 +542,27 @@ fn a_loss_count_lives_with_its_operation() {
     let store = Flaky::new();
     let durable = open(&store);
     durable
-        .submitted(OperationId(4), &request(1))
+        .submitted(OperationId(4), &request(1), &a_subject())
         .expect("submit");
     durable
-        .persist(&[Effect::Start(start(4, 0))])
+        .persist(&[Effect::Start(start(4, 0))], None)
         .expect("grant");
     durable
         .requeued(&requeue(4, 0), Some(2), None, &FloorChange::default())
         .expect("a lost lease");
     assert_eq!(durable.load().expect("load").operations[0].losses, 2);
     durable
-        .persist(&[Effect::Start(start(4, 1))])
+        .persist(&[Effect::Start(start(4, 1))], None)
         .expect("grant");
     durable
         .requeued(&requeue(4, 1), None, None, &FloorChange::default())
         .expect("not a lost lease");
     assert_eq!(durable.load().expect("load").operations[0].losses, 2);
     durable
-        .persist(&[Effect::Start(start(4, 2))])
+        .persist(&[Effect::Start(start(4, 2))], None)
         .expect("grant");
     durable
-        .persist(&[Effect::Answer(answer(4, 2))])
+        .persist(&[Effect::Answer(answer(4, 2))], Some(&ended()))
         .expect("finished");
     assert!(!keys(&store).iter().any(|k| k.starts_with("loss/")));
 }
@@ -394,10 +573,10 @@ fn a_refusal_removes_the_loss_count() {
     let store = Flaky::new();
     let durable = open(&store);
     durable
-        .submitted(OperationId(4), &request(1))
+        .submitted(OperationId(4), &request(1), &a_subject())
         .expect("submit");
     durable
-        .persist(&[Effect::Start(start(4, 0))])
+        .persist(&[Effect::Start(start(4, 0))], None)
         .expect("grant");
     durable
         .requeued(&requeue(4, 0), Some(3), None, &FloorChange::default())
@@ -408,7 +587,7 @@ fn a_refusal_removes_the_loss_count() {
         reason: "lost".to_owned(),
     };
     durable
-        .persist(&[Effect::Refuse(refusal)])
+        .persist(&[Effect::Refuse(refusal)], Some(&ended()))
         .expect("refused");
     assert!(!keys(&store).iter().any(|k| k.starts_with("loss/")));
 }
@@ -538,14 +717,14 @@ fn a_failing_store_fails_the_write() {
     let store = Flaky::new();
     let durable = open(&store);
     store.set_down(true);
-    let submit = durable.submitted(OperationId(1), &request(1));
+    let submit = durable.submitted(OperationId(1), &request(1), &a_subject());
     assert!(matches!(submit, Err(StateError::Store(_))), "{submit:?}");
     let dyn_store: Arc<dyn Store> = store.clone();
     let opened = Durable::open(dyn_store, EpochPolicy::Bump, 1);
     assert!(matches!(opened, Err(StateError::Store(_))));
     store.set_down(false);
     durable
-        .submitted(OperationId(1), &request(1))
+        .submitted(OperationId(1), &request(1), &a_subject())
         .expect("up again");
 }
 
@@ -557,7 +736,7 @@ fn the_flaky_store_reads_through_and_the_handle_prints() {
     let store = Flaky::new();
     let durable = open(&store);
     durable
-        .submitted(OperationId(1), &request(1))
+        .submitted(OperationId(1), &request(1), &a_subject())
         .expect("submit");
     assert_eq!(store.reap_expired(), Ok(0));
     assert!(
@@ -591,12 +770,24 @@ fn a_result_row_is_kept_for_the_longer_of_the_retention_and_the_floor() {
     });
     let short = OperationId(1);
     let long = OperationId(2);
-    durable
-        .done(short, &finished, Duration::from_secs(1))
-        .expect("short");
-    durable
-        .done(long, &finished, Duration::from_secs(3600))
-        .expect("long");
+    for (operation, retention) in [(short, 1), (long, 3600)] {
+        let ending = Ending {
+            finished: finished.clone(),
+            retention: Duration::from_secs(retention),
+        };
+        durable
+            .submitted(operation, &request(1), &a_subject())
+            .expect("submit");
+        durable
+            .persist(&[Effect::Start(start(operation.0, operation.0))], None)
+            .expect("grant");
+        durable
+            .persist(
+                &[Effect::Answer(answer(operation.0, operation.0))],
+                Some(&ending),
+            )
+            .expect("finish");
+    }
     let seconds = |n| Duration::from_secs(n);
     clock.advance(DONE_FLOOR - seconds(1));
     assert_eq!(durable.ended(short).expect("read"), Some(finished.clone()));
@@ -706,13 +897,15 @@ fn an_operation_is_ended_queued_running_or_gone() {
     );
     assert!(Progress::Gone.is_gone());
     assert!(!Progress::Queued.is_gone());
-    durable.submitted(operation, &request(1)).expect("submit");
+    durable
+        .submitted(operation, &request(1), &a_subject())
+        .expect("submit");
     assert_eq!(
         durable.progress(operation).expect("progress"),
         Progress::Queued
     );
     durable
-        .persist(&[Effect::Start(start(4, 0))])
+        .persist(&[Effect::Start(start(4, 0))], None)
         .expect("grant");
     assert_eq!(
         durable.progress(operation).expect("progress"),
@@ -723,9 +916,7 @@ fn an_operation_is_ended_queued_running_or_gone() {
         message: "invalid".to_owned(),
         details: Vec::new(),
     });
-    durable
-        .done(operation, &finished, Duration::from_secs(1))
-        .expect("done");
+    put(&store, &done_key(operation), finished.to_row());
     assert_eq!(
         durable.progress(operation).expect("progress"),
         Progress::Ended(finished),
@@ -794,10 +985,14 @@ fn a_fate_lives_and_dies_with_its_operation() {
     let durable = open(&store);
     for operation in [4, 5] {
         durable
-            .submitted(OperationId(operation), &request(1 + operation as u8))
+            .submitted(
+                OperationId(operation),
+                &request(1 + operation as u8),
+                &a_subject(),
+            )
             .expect("submit");
         durable
-            .persist(&[Effect::Start(start(operation, 0))])
+            .persist(&[Effect::Start(start(operation, 0))], None)
             .expect("grant");
         durable
             .requeued(
@@ -820,17 +1015,20 @@ fn a_fate_lives_and_dies_with_its_operation() {
 
     // Finished by a result, and refused: neither leaves the row.
     durable
-        .persist(&[Effect::Start(start(4, 1))])
+        .persist(&[Effect::Start(start(4, 1))], None)
         .expect("grant");
     durable
-        .persist(&[Effect::Answer(answer(4, 1))])
+        .persist(&[Effect::Answer(answer(4, 1))], Some(&ended()))
         .expect("finished");
     durable
-        .persist(&[Effect::Refuse(Refusal {
-            operation: OperationId(5),
-            waiters: Vec::new(),
-            reason: "no worker".to_owned(),
-        })])
+        .persist(
+            &[Effect::Refuse(Refusal {
+                operation: OperationId(5),
+                waiters: Vec::new(),
+                reason: "no worker".to_owned(),
+            })],
+            Some(&ended()),
+        )
         .expect("refused");
     assert_eq!(
         keys(&store)
@@ -953,10 +1151,10 @@ fn a_floor_is_written_with_the_requeue_and_outlives_its_operation() {
     for tag in [1, 2] {
         let operation = u64::from(tag);
         durable
-            .submitted(OperationId(operation), &request(tag))
+            .submitted(OperationId(operation), &request(tag), &a_subject())
             .expect("submit");
         durable
-            .persist(&[Effect::Start(start(operation, operation * 10))])
+            .persist(&[Effect::Start(start(operation, operation * 10))], None)
             .expect("grant");
     }
     durable
@@ -967,7 +1165,7 @@ fn a_floor_is_written_with_the_requeue_and_outlives_its_operation() {
 
     // Raised again under a later stamp: the same row. A second action: a second row.
     durable
-        .persist(&[Effect::Start(start(1, 11))])
+        .persist(&[Effect::Start(start(1, 11))], None)
         .expect("grant");
     durable
         .requeued(&killed(1, 11), None, None, &raising(1, 2, &[]))
@@ -989,17 +1187,20 @@ fn a_floor_is_written_with_the_requeue_and_outlives_its_operation() {
 
     // Neither ending an operation nor refusing it takes a floor.
     durable
-        .persist(&[Effect::Refuse(Refusal {
-            operation: OperationId(2),
-            waiters: Vec::new(),
-            reason: "no worker".to_owned(),
-        })])
+        .persist(
+            &[Effect::Refuse(Refusal {
+                operation: OperationId(2),
+                waiters: Vec::new(),
+                reason: "no worker".to_owned(),
+            })],
+            Some(&ended()),
+        )
         .expect("refused");
     durable
-        .persist(&[Effect::Start(start(1, 12))])
+        .persist(&[Effect::Start(start(1, 12))], None)
         .expect("grant");
     durable
-        .persist(&[Effect::Answer(answer(1, 12))])
+        .persist(&[Effect::Answer(answer(1, 12))], Some(&ended()))
         .expect("finished");
     assert_eq!(floor_rows(&store), 2);
 }
@@ -1169,6 +1370,174 @@ fn a_version_1_fate_row_still_loads() {
     );
 }
 
+fn a_subject() -> Subject {
+    Subject {
+        key: ShapeKey::from_bytes([1, 2, 3, 4, 5, 6, 7, 8]),
+        cfg: Some("0123456789abcdef-fedcba9876543210".to_owned()),
+        target: Some(Target {
+            kind: TargetKind::Anon,
+            label: "root//pkg:t".to_owned(),
+        }),
+        test: true,
+        label: ActionLabel {
+            mnemonic: Some("CxxCompile".to_owned()),
+            target: Some("root//pkg:hint".to_owned()),
+        },
+    }
+}
+
+fn rows_under(store: &Flaky, prefix: &str) -> usize {
+    keys(store).iter().filter(|k| k.starts_with(prefix)).count()
+}
+
+/// Catches: a subject written apart from the submission (a crash between the rows
+/// leaves an operation that logs the empty shape, or a subject for an operation that
+/// does not exist), a second submission of one operation overwriting the first's
+/// subject, a subject the load does not return with its operation (including the
+/// `ActionShape` the invocation record keeps), and one that outlives its operation's
+/// end by a finish or by a refusal.
+#[test]
+fn a_subject_lives_and_dies_with_its_operation() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    for operation in [4, 5] {
+        durable
+            .submitted(
+                OperationId(operation),
+                &request(1 + operation as u8),
+                &a_subject(),
+            )
+            .expect("submit");
+    }
+    assert_eq!(rows_under(&store, "subject/"), 2);
+    let other = Subject {
+        label: ActionLabel::default(),
+        ..a_subject()
+    };
+    let again = durable.submitted(OperationId(4), &request(9), &other);
+    assert!(matches!(again, Err(StateError::Conflict(_))), "{again:?}");
+
+    let stored = durable.load().expect("load");
+    for op in &stored.operations {
+        let subject = op.subject.as_ref().expect("a subject");
+        assert_eq!(subject, &a_subject());
+        assert_eq!(subject.recorded(), a_subject().recorded());
+    }
+
+    durable
+        .persist(&[Effect::Start(start(4, 1))], None)
+        .expect("grant");
+    durable
+        .persist(&[Effect::Answer(answer(4, 1))], Some(&ended()))
+        .expect("finished");
+    assert_eq!(rows_under(&store, "subject/"), 1, "a finish left the row");
+    durable
+        .persist(
+            &[Effect::Refuse(Refusal {
+                operation: OperationId(5),
+                waiters: Vec::new(),
+                reason: "no worker".to_owned(),
+            })],
+            Some(&ended()),
+        )
+        .expect("refused");
+    assert_eq!(rows_under(&store, "subject/"), 0, "a refusal left the row");
+}
+
+/// Catches: an operation whose writer recorded no subject (an older build) failing the
+/// load instead of loading with none.
+#[test]
+fn an_operation_without_a_subject_loads_with_none() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .submitted(OperationId(4), &request(1), &a_subject())
+        .expect("submit");
+    store
+        .inner
+        .apply_batch(vec![
+            Txn::new().delete("subject/0000000000000004", Cond::Any),
+        ])
+        .expect("applied");
+    let stored = durable.load().expect("load");
+    assert_eq!(stored.operations[0].subject, None);
+}
+
+/// Catches: a subject read as anything but what was written, for each shape of absence
+/// (no cfg, no target, no label) and each kind of target; and one read from a bad row:
+/// another version, a row cut short at every length, bytes after the label, an unknown
+/// kind or presence byte, text that is not UTF-8. A load refuses a bad row, naming it.
+#[test]
+fn a_subject_row_that_is_not_one_is_refused() {
+    let bare = Subject {
+        cfg: None,
+        target: None,
+        test: false,
+        label: ActionLabel::default(),
+        ..a_subject()
+    };
+    for kind in [TargetKind::Target, TargetKind::Anon, TargetKind::Bxl] {
+        let mut subject = a_subject();
+        subject.target.as_mut().expect("a target").kind = kind;
+        assert_eq!(subject::decode(&subject::encode(&subject)), Ok(subject));
+    }
+    assert_eq!(subject::decode(&subject::encode(&bare)), Ok(bare));
+
+    let row = subject::encode(&a_subject());
+    let mut other = row.clone();
+    other[0] = 2;
+    let mut longer = row.clone();
+    longer.push(0);
+    // Offsets: version 1, key 8, cfg presence 1 + length 4 + 33 bytes, target presence
+    // at 47, its kind at 48.
+    assert_eq!(row[47], 1);
+    let mut kind = row.clone();
+    kind[48] = 9;
+    let mut presence = row.clone();
+    presence[47] = 7;
+    let mut utf8 = row.clone();
+    utf8[10 + 4] = 0xff;
+    // The configuration hash's presence byte (9) and the mnemonic's, after the target:
+    // version 1, key 8, cfg 38, target presence 1, kind 1, label 4 + 11 bytes; then the
+    // test flag, then the mnemonic's presence byte.
+    let mut cfg_presence = row.clone();
+    cfg_presence[9] = 7;
+    let mut label_presence = row.clone();
+    label_presence[49 + 4 + 11 + 1] = 7;
+    let mut flag = row.clone();
+    flag[49 + 4 + 11] = 2;
+    for (bad, why) in [
+        (other, "not a version 1 subject"),
+        (longer, "bytes after the label"),
+        (kind, "not a kind of target"),
+        (presence, "not a presence byte"),
+        (utf8, "a text is not UTF-8"),
+        (flag, "not a test flag"),
+        (cfg_presence, "not a presence byte"),
+        (label_presence, "not a presence byte"),
+    ] {
+        assert_eq!(subject::decode(&bad), Err(why));
+    }
+    for len in 0..row.len() {
+        assert_eq!(
+            subject::decode(&row[..len]),
+            Err("the row ends early"),
+            "cut at {len}"
+        );
+    }
+
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .submitted(OperationId(4), &request(1), &a_subject())
+        .expect("submit");
+    put(&store, "subject/0000000000000004", vec![9]);
+    let Err(StateError::Corrupt { key, .. }) = durable.load() else {
+        panic!("a bad subject row loaded");
+    };
+    assert_eq!(key, "subject/0000000000000004");
+}
+
 /// Catches: a fate row with a worker name that is not text accepted, a fate too large to
 /// write encoded anyway (a truncated length), a requeue whose fate cannot be written
 /// reported as success, and a load that skips a fate row it cannot read instead of
@@ -1187,10 +1556,10 @@ fn a_fate_that_cannot_be_written_or_read_is_refused() {
     let store = Flaky::new();
     let durable = open(&store);
     durable
-        .submitted(OperationId(4), &request(5))
+        .submitted(OperationId(4), &request(5), &a_subject())
         .expect("submit");
     durable
-        .persist(&[Effect::Start(start(4, 0))])
+        .persist(&[Effect::Start(start(4, 0))], None)
         .expect("grant");
     let error = durable
         .requeued(&killed(4, 0), None, Some(&huge), &FloorChange::default())

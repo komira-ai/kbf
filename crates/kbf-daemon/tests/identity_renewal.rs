@@ -185,6 +185,7 @@ fn member(addr: String) -> Member {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     }
 }
 

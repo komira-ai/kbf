@@ -290,9 +290,10 @@ fn a_racing_refresh_gives_one_winner_and_one_retry() {
 
 /// Catches: a refresh that decides on a row it no longer holds: member a's row has
 /// expired, so this frontend plans to mark it Down; before it commits, a registers again
-/// (its own refresh finds the map already says Active and bumps nothing). The map's
-/// version has not moved, so only the check on a's row stops this frontend from marking a
-/// Down beside its live row. The commit conflicts and the retry sees the row.
+/// (its own refresh finds the map already says Active, and bumps the generation once for
+/// the new boot). This frontend's commit is against the map it read, so it conflicts on the
+/// map's version; the check on a's row is what stops the retry's plan from marking a Down
+/// beside its live row. The retry sees the row and changes nothing.
 #[test]
 fn a_refresh_does_not_down_a_member_that_registered_meanwhile() {
     let s = Hooked::new();
@@ -309,7 +310,7 @@ fn a_refresh_does_not_down_a_member_that_registered_meanwhile() {
     let map = m.refresh().expect("refresh").expect("map");
 
     assert_eq!(state(&map, a.id), Some(MemberState::Active));
-    assert_eq!(map.generation(), 1);
+    assert_eq!(map.generation(), 2, "the rival's new boot, once");
     assert_eq!(s.fake.get("down/1").expect("read"), None);
     assert_eq!(*s.map_writes.lock().expect("lock"), vec![true]);
 }
@@ -617,8 +618,8 @@ fn the_map_clamps_replication_and_reports_its_generation() {
 
 /// Catches: values in the store that the code cannot read being treated as empty or
 /// panicking: a member row that is not a message, a row without a member, a map that is
-/// not a message, a map the domain refuses, and an instance entry that is not an id. Each
-/// is an error that names it.
+/// not a message, a map the domain refuses (also for a registration, which reads the map
+/// for its floor), and an instance entry that is not an id. Each is an error that names it.
 #[test]
 fn unreadable_rows_are_errors_not_defaults() {
     let put = |s: &Arc<Hooked>, key: &str, value: Vec<u8>| {
@@ -646,6 +647,18 @@ fn unreadable_rows_are_errors_not_defaults() {
     put(&s, "map", pb::Map::default().encode_to_vec());
     assert!(corrupt(m.current_map().expect_err("generation 0")).starts_with("map"));
 
+    // A registration is judged by the map's floor, so a map that does not read refuses it
+    // (a floor is never guessed) before it is given an identity.
+    let e = m.register(&node(1)).expect_err("unreadable map");
+    assert!(corrupt(e).starts_with("map"));
+    assert_eq!(
+        s.fake.get("instance/node-1").expect("read"),
+        None,
+        "a registration refused for its map was given an identity"
+    );
+
+    let s = Hooked::new();
+    let m = members(&s, config(30, 120));
     put(&s, "instance/node-1", b"abc".to_vec());
     let e = m.register(&node(1)).expect_err("bad id");
     assert!(corrupt(e).contains("instance"));
@@ -823,7 +836,11 @@ fn a_restarted_active_member_is_active_again() {
     let quick = m.register(&node(1)).expect("quick restart");
     assert_eq!((quick.id, quick.boot), (a.id, a.boot + 1));
     assert_eq!(state(&quick.map, a.id), Some(MemberState::Active));
-    assert_eq!(quick.map.generation(), g, "nothing changed in the map");
+    assert_eq!(
+        quick.map.generation(),
+        g + 1,
+        "the new boot is a change (see the boot tests below)"
+    );
 
     s.clock.advance(20 * SECOND);
     m.heartbeat(b.id, b.boot, Progress::CaughtUp, Debts::Unknown, None)
@@ -835,6 +852,118 @@ fn a_restarted_active_member_is_active_again() {
     assert_eq!((back.id, back.boot), (a.id, quick.boot + 1));
     assert_eq!(state(&back.map, a.id), Some(MemberState::Active));
     assert_eq!(back.map.generation(), down.generation() + 1);
+}
+
+fn boot_of(map: &Map, id: MemberId) -> Option<u64> {
+    map.member(id).map(|m| m.boot)
+}
+
+/// Catches: a storage node that restarts inside its lease (same instance, a larger boot
+/// counter, its row never lapsed) leaving the map's generation where it was. Anything a
+/// reader cached against the generation (a "this blob is present" answer from the node)
+/// would then outlive a restart that lost the node's RAM-only data. The restarted member
+/// must change the published generation, by one, and the map must carry the boot it
+/// registered with; a second restart does the same again, and the other member's entry
+/// keeps its own boot. Mutant seen red: `register` leaves `Member::boot` at 0, so the
+/// restart changes nothing the map holds and the generation stays.
+#[test]
+fn a_member_restarted_within_its_lease_bumps_the_generation_and_carries_its_new_boot() {
+    let s = Hooked::new();
+    let m = members(&s, config(30, 120));
+    let a = m.register(&node(1)).expect("a");
+    let b = m.register(&node(2)).expect("b");
+    assert_eq!(
+        boot_of(&b.map, a.id),
+        Some(a.boot),
+        "first boot is published"
+    );
+    assert_eq!(boot_of(&b.map, b.id), Some(b.boot));
+    let g = b.map.generation();
+
+    s.clock.advance(5 * SECOND);
+    let quick = m.register(&node(1)).expect("restart inside the lease");
+    assert_eq!(quick.boot, a.boot + 1);
+    assert_eq!(state(&quick.map, a.id), Some(MemberState::Active));
+    assert_eq!(
+        quick.map.generation(),
+        g + 1,
+        "a new boot moves the generation"
+    );
+    assert_eq!(boot_of(&quick.map, a.id), Some(quick.boot));
+    assert_eq!(boot_of(&quick.map, b.id), Some(b.boot), "b did not restart");
+    assert_eq!(
+        m.current_map().expect("read"),
+        Some(quick.map.clone()),
+        "the stored map is the one returned"
+    );
+
+    // Through another frontend, which holds no state of its own, and a second restart.
+    let again = other_frontend(&s, config(30, 120))
+        .register(&node(1))
+        .expect("second restart");
+    assert_eq!(again.map.generation(), g + 2);
+    assert_eq!(boot_of(&again.map, a.id), Some(a.boot + 2));
+}
+
+/// Catches: churn. A generation bump makes every reader of the map drop what it cached
+/// against it, so a bump that is not caused by a new boot (every heartbeat, a refresh, an
+/// administrator setting the state a member already has, a second frontend's refresh)
+/// would empty those caches for nothing. Ten rounds of heartbeats of the same boot, with
+/// refreshes through two frontends and a no-op `set_state`, leave the generation and the
+/// published boots as they were. Mutant seen red: `touch` bumping the boot (or the
+/// generation) on a beat.
+#[test]
+fn heartbeats_of_the_same_boot_do_not_bump_the_generation() {
+    let s = Hooked::new();
+    let m = members(&s, config(30, 120));
+    let other = other_frontend(&s, config(30, 120));
+    m.register(&node(1)).expect("a");
+    let b = m.register(&node(2)).expect("b");
+    let restarted = m.register(&node(1)).expect("a restarts");
+    let g = restarted.map.generation();
+    for round in 0..10 {
+        s.clock.advance(10 * SECOND);
+        for r in [&restarted, &b] {
+            m.heartbeat(r.id, r.boot, Progress::CaughtUp, Debts::Unknown, None)
+                .expect("beat");
+        }
+        for frontend in [&m, &other] {
+            let map = frontend.refresh().expect("refresh").expect("map");
+            assert_eq!(map.generation(), g, "round {round}");
+            assert_eq!(boot_of(&map, restarted.id), Some(restarted.boot));
+            assert_eq!(boot_of(&map, b.id), Some(b.boot));
+        }
+    }
+    let map = m
+        .set_state(b.id, MemberState::Active)
+        .expect("the state b has");
+    assert_eq!(
+        map.generation(),
+        g,
+        "setting the state it has changes nothing"
+    );
+}
+
+/// Catches: a member whose boot is lost when it goes Down and comes back, or a Down entry
+/// that keeps a stale boot after the node registered again: the lapsed member stays in
+/// the map as Down with the boot it had (nothing newer exists yet), and its return
+/// publishes the new one.
+#[test]
+fn a_down_member_keeps_its_boot_and_a_return_publishes_the_next() {
+    let s = Hooked::new();
+    let m = members(&s, config(30, 120));
+    let a = m.register(&node(1)).expect("a");
+    let b = m.register(&node(2)).expect("b");
+    s.clock.advance(20 * SECOND);
+    m.heartbeat(b.id, b.boot, Progress::CaughtUp, Debts::Unknown, None)
+        .expect("b");
+    s.clock.advance(11 * SECOND);
+    let down = m.refresh().expect("refresh").expect("map");
+    assert_eq!(state(&down, a.id), Some(MemberState::Down));
+    assert_eq!(boot_of(&down, a.id), Some(a.boot));
+    let back = m.register(&node(1)).expect("back");
+    assert_eq!(boot_of(&back.map, a.id), Some(back.boot));
+    assert_eq!(back.boot, a.boot + 1);
 }
 
 /// Catches: a rolling restart that leaves members Joining: three members register, then

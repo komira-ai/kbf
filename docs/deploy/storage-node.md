@@ -92,7 +92,7 @@ the OS:
 
 The 4 to 8 GiB is the same headroom as on a build host
 ([linux-build-host.md](linux-build-host.md#headroom---actions-memory-max-gib)): the
-kernel, systemd, sshd, the daemon itself and Podman's processes. A reservation is what
+kernel, systemd, sshd, the daemon itself and the containers' runtime processes. A reservation is what
 the process uses at its peak, and the same figure as its `MemoryMin=` above. The daemon
 writes the result to `actions/memory.max` and reports the lower of it and the host's
 memory as `mem_gib`, so the scheduler books no more than builds may use.
@@ -104,7 +104,7 @@ memory as `mem_gib`, so the scheduler books no more than builds may use.
 | RAM | 256 |
 | minus MinIO's reservation | 32 |
 | minus `kbf-server`'s reservation | 16 |
-| minus the OS, systemd, sshd, the daemon and Podman | 8 |
+| minus the OS, systemd, sshd, the daemon and the containers' runtime | 8 |
 | `--actions-memory-max-gib` | 200 |
 
 ## Server-only units
@@ -215,7 +215,7 @@ sudo systemctl enable --now kbf-server.service
 
 A converged host runs the server-only units above with this slice in place of theirs,
 and a daemon set up as on a build host
-([linux-build-host.md](linux-build-host.md): rootless Podman, the `kbf` user, swap),
+([linux-build-host.md](linux-build-host.md): `crun` and `uidmap`, the `kbf` user, swap),
 in the same slice, with this unit.
 
 `/etc/systemd/system/kbf.slice`:
@@ -248,6 +248,7 @@ CPUWeight=200
 Environment=XDG_RUNTIME_DIR=/run/user/<kbf uid>
 ExecStart=/usr/local/bin/kbf-daemon \
     --driver=container \
+    --oci-runtime=/usr/bin/crun \
     --server=https://<storage host name>:8981 \
     --cas=https://<storage host name>:8981 \
     --ca-cert=/etc/kbf/ca.pem \
@@ -493,77 +494,39 @@ At start the daemon logs the data directory, the leases directory, and the cache
 tree budgets it resolved; the server logs its cold store, hot store (with its budget) and
 metadata directory.
 
-## Rendering the converged units
+## Rendering and installing a mode's units
 
-`kbf-deploy linux render-units` writes the converged host's four files from templates
-compiled into the binary (`crates/kbf-deploy/templates/linux/`) and a settings file
-(`crates/kbf-deploy/templates/linux/config.example` documents each key; an unknown or
-repeated key is refused). `kbf-deploy linux check-units` then checks them against the
-[priorities](#priorities) and the memory split, one `FAIL <rule>: <reason>` line per
-broken rule:
+`kbf-deploy linux render-units --mode MODE`, `check-units --mode MODE` and, as root,
+`install-units --mode MODE` work on one mode of the one `kbf` binary: its unit and
+`kbf.slice`, from templates compiled into the binary
+(`crates/kbf-deploy/templates/linux/`) and a settings file (`config.example` documents
+each key; an unknown or repeated key is refused). They are described, with every rule
+`check-units` applies, in [kbf-modes.md](kbf-modes.md). The converged form of these
+verbs (no `--mode`: four files for MinIO, `kbf-server` and `kbf-daemon`, with
+`--restart-minio` and `--uninstall`) is gone; the units above remain the hand-written
+example of that layout. A node that still runs `kbf-server.service` and
+`kbf-daemon.service` stops and disables them (`systemctl disable --now`) before it
+installs a mode's unit: both would hold the same directories.
 
-```text
-kbf-deploy linux render-units --config node.conf --out units --kbf-uid 1500
-kbf-deploy linux check-units --config node.conf --dir units --installable
-```
+## The build swapfile
 
-`--out` is laid out as `/etc/systemd/system`: `kbf.slice`, `<MINIO_UNIT>.d/kbf.conf`,
-`kbf-server.service`, `kbf-daemon.service`. Rendering writes nothing else, so it needs
-no `--apply`. A template placeholder (`@KEY@`) with no value is refused rather than
-written, and `check-units` fails a file that still holds one; without `--kbf-uid` the
-daemon's unit keeps `<kbf uid>`, which `--installable` fails. Exit codes: 0 rendered or
-every rule holds, 1 a rule is broken, 2 refused (a bad setting or an unreadable file),
-with a `REFUSED:` line on stderr.
-
-## Installing on the host
-
-Three verbs change the host. Each runs as root, reads the host first, prints its plan
-as `DRY-RUN:` lines and changes nothing; `--apply` carries the plan out, stopping at
-the first step that fails. A re-run after an apply plans nothing. Exit codes: 0 done
-(or nothing to do), 1 a step or the check after an apply failed, 2 refused
-(`REFUSED:` on stderr, with the fix). They take the same `--config` file as
-`render-units`.
+`kbf-deploy linux swap`, as root, reads the host first, prints its plan as `DRY-RUN:`
+lines and changes nothing; `--apply` carries the plan out, stopping at the first step
+that fails. A re-run after an apply plans nothing. Exit codes: 0 done (or nothing to do),
+1 a step failed, 2 refused (`REFUSED:` on stderr, with the fix). It takes the same
+`--config` file as `render-units`.
 
 ```text
 sudo kbf-deploy linux swap --config node.conf [--kubelet-allows-swap] [--remove] [--apply]
-sudo kbf-deploy linux image-pull --config node.conf [--image REF]... [--apply]
-sudo kbf-deploy linux install-units --config node.conf [--bin-dir DIR] [--restart-minio] [--apply]
-sudo kbf-deploy linux install-units --config node.conf --uninstall [--apply]
 ```
 
-- `swap` makes `KBF_SWAP_SIZE` at `KBF_SWAP_FILE` (`fallocate`, `chmod 600`, `mkswap`,
-  on ext4 or xfs with 16 GiB to spare), turns it on and adds its `/etc/fstab` line,
-  each only if the host lacks it. A file of another size is refused, never resized. It
-  refuses while a kubelet (`kubelet`, `k3s`, `k3s-agent`, `rke2-server`, `rke2-agent`)
-  is active, since kubelet's default `failSwapOn` would take the node out of its
-  cluster at its next restart; `--kubelet-allows-swap` says its config sets
-  `failSwapOn: false`. `--remove` turns it off, drops the line and removes the file.
-- `image-pull` pulls each of `KBF_IMAGES` (or `--image`) missing from the kbf user's
-  rootless Podman store, as that user: its uid, its gid and all its groups (as
-  `sudo -u` gives them), `HOME` and `XDG_RUNTIME_DIR=/run/user/<uid>`. Each image in
-  the store must have its pinned digest and be `--platform` (`linux/amd64`); after an
-  apply each pulled image is checked the same way, and one still missing or not the
-  pin exits 1 with a `FAIL` line (the pulls ran, so it is not a refusal). Even a dry
-  run needs root, since it reads the store as the kbf user.
-- `install-units` checks the host (a cgroup v2 memory controller, `MINIO_UNIT` is a
-  systemd unit, both users, the kbf user's subuid and subgid ranges, each a line
-  keyed by its name or its uid, and linger, each key file in `KBF_ETC` its service's
-  alone, the certificates, the deny list and `s3.env`'s key pair, and the three ports
-  free unless kbf-server runs), renders the units with the kbf user's uid and refuses
-  them unless `check-units --installable` passes, and refuses a binary whose `--help`
-  lacks a flag its unit passes. It then installs, each only if it differs: the
-  binaries from `--bin-dir` (keeping the replaced one as `<name>.previous`), the four
-  files under `/etc/systemd/system`, and the metadata directory (0700, the server's user) and the data directory
-  (0755, the daemon's user). The binaries, the `.previous` copies and the four files are root's
-  (uid and gid 0): one with the right bytes and mode that another user owns is
-  replaced. After a change it runs `daemon-reload` and enables and restarts
-  kbf-server and kbf-daemon; otherwise it only enables or starts one that is not.
-  After any start or restart it waits up to 60 s for kbf-server's `/readyz`; a run
-  that starts nothing does not wait. MinIO restarts only with `--restart-minio`: its
-  new priorities take effect at its next start. `--uninstall` stops and disables both
-  services when either is enabled or running, and moves the four files to
-  `/var/lib/kbf-linux/removed/<unix seconds>/`; the binaries, the metadata log, the
-  data directory, the bucket and the swapfile stay.
+`swap` makes `KBF_SWAP_SIZE` at `KBF_SWAP_FILE` (`fallocate`, `chmod 600`, `mkswap`, on
+ext4 or xfs with 16 GiB to spare), turns it on and adds its `/etc/fstab` line, each only
+if the host lacks it. A file of another size is refused, never resized. It refuses while
+a kubelet (`kubelet`, `k3s`, `k3s-agent`, `rke2-server`, `rke2-agent`) is active, since
+kubelet's default `failSwapOn` would take the node out of its cluster at its next
+restart; `--kubelet-allows-swap` says its config sets `failSwapOn: false`. `--remove`
+turns it off, drops the line and removes the file.
 
 ## Metadata backup and restore
 
@@ -644,23 +607,18 @@ backup.
 - `crates/kbf-it/tests/deploy_units.rs` runs `kbf-server`'s flag parser over the
   `ExecStart=` of every server unit in `docs/deploy/`, checks that the planned flag
   above is still refused, that the worked example adds up and matches the converged
-  daemon's `--actions-memory-max-gib`, and that the units keep the
+  daemon unit's `--actions-memory-max-gib`, and that the units keep the
   [priority](#priorities) order.
 - `kbf-node`'s tests (`src/deploy_doc_tests.rs`) run `kbf-daemon`'s flag parser over
   every daemon unit in `docs/deploy/`.
-- `kbf-deploy`'s tests (`src/linux/tests.rs`) plant one defect per rule in the
-  templates (a swap limit dropped, an OOM score at the containers' 0, a later
-  assignment that breaks the order, a slice minimum that is not the sum, a key on the
-  command line, a bare `--image`) and require that rule's `FAIL` line; they
-  also refuse each bad setting and a placeholder with no value. The host verbs'
-  tests (`src/linux/install_tests.rs`, `images_tests.rs`, `swap_tests.rs`) apply each
-  plan into a scratch directory with the tools played by a fake, check what landed,
-  and require a re-run to plan nothing; each missing prerequisite is a row that must
-  be refused with its own refusal. `src/user_tests.rs` runs `id` as another user
-  through `sudo` (CI has passwordless sudo) and requires that user's uid, gid and
-  supplementary groups in the child. The rendered units'
-  `ExecStart=` lines go through `kbf-server`'s parser (`kbf-it`) and `kbf-daemon`'s
-  (`kbf-node`) too.
+- `kbf-deploy`'s tests (`src/linux/tests.rs`) refuse each bad setting and check that an
+  unset key takes the default `config.example` shows. The mode verbs' rules and host
+  verbs are tested as [kbf-modes.md](kbf-modes.md) says; the swap verb's tests
+  (`src/linux/swap_tests.rs`) apply each plan into a scratch directory with the tools
+  played by a fake, check what landed, and require a re-run to plan nothing; each
+  missing prerequisite is a row that must be refused with its own refusal.
+  `src/user_tests.rs` runs `id` as another user through `sudo` (CI has passwordless
+  sudo) and requires that user's uid, gid and supplementary groups in the child.
 - `kbf-deploy`'s `src/linux/meta/tests.rs` and `archive_tests.rs` refuse a backup on
   each write-tier reading (unflushed bytes, blocks, conflicts, an unreadable answer)
   before any step, require the unit started again after every failure that follows the

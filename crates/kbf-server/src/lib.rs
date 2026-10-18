@@ -75,6 +75,7 @@ pub mod blobs;
 mod build_commit;
 pub mod config;
 pub mod drain;
+pub mod enroll;
 pub mod farm;
 mod fault;
 mod flag_set;
@@ -102,6 +103,7 @@ mod memory;
 pub mod metrics;
 mod missing;
 pub mod node_map;
+pub mod object_store;
 pub mod raft_log;
 mod rebuild;
 pub mod release;
@@ -111,6 +113,7 @@ mod run_record;
 pub mod serve;
 pub mod stamp;
 mod start;
+mod start_exit;
 mod startup_pass;
 pub mod state_store;
 pub mod storage_half;
@@ -121,6 +124,8 @@ pub mod streams;
 mod timeout;
 pub mod token;
 pub mod update;
+pub mod update_hosts;
+pub mod update_status;
 pub mod worker;
 pub mod worker_roles;
 pub mod write_tier;
@@ -142,6 +147,9 @@ pub use serve::{
     bind_storage,
 };
 pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_interruptible};
+pub use start_exit::{
+    NOT_READY, REFUSED, STALE_WRITER_HINT, StartFailure, hint as start_hint, said as start_said,
+};
 pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};
 pub use streams::{StreamArgs, StreamLimits};
 pub use worker::WorkerService;

@@ -1,9 +1,9 @@
-# The binaries nodes and servers run, and the deploy tool that installs them, built once
-# per commit (docs/artifacts.md): kbf (all five modes, `kbf --version --json` says what
-# it is), kbf-daemon, kbf-server and kbf-deploy for linux-x86_64 and linux-arm64, and
-# kbf, kbf-daemon and kbf-deploy for darwin-arm64 (each signed ad hoc with the hardened
-# runtime). Each comes as a tarball with a CycloneDX SBOM; one SHA256SUMS covers a
-# commit's files.
+# The binaries nodes and servers run, the deploy tool, and the installer that puts them on
+# a host, built once per commit (docs/artifacts.md): kbf (all five modes, `kbf --version
+# --json` says what it is), kbf-daemon, kbf-server, kbf-deploy and kbf-installer for
+# linux-x86_64 and linux-arm64, and kbf, kbf-deploy and kbf-installer for darwin-arm64
+# (each signed ad hoc with the hardened runtime; a Mac runs `kbf daemon`). Each comes as a
+# tarball with a CycloneDX SBOM; one SHA256SUMS covers a commit's files.
 #
 # A pull request runs none of it unless it carries the label `needs-artifacts` (add the
 # label to get the files; every build and sums job carries the same condition, so an unlabelled
@@ -101,31 +101,37 @@ jobs:
       - run: uname -m
       - run: xcodebuild -version
       - run: cargo cyclonedx --version
-      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-cli -p kbf-deploy --bin kbf-daemon --bin kbf --bin kbf-deploy
-      - name: Sign kbf-daemon ad hoc with the hardened runtime, and check it
-        run: cargo xtask sign-darwin "target/$TARGET/release/kbf-daemon" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-cli -p kbf-deploy -p kbf-installer --bin kbf --bin kbf-deploy --bin kbf-installer
       - name: Sign kbf ad hoc with the hardened runtime, and check it
         run: cargo xtask sign-darwin "target/$TARGET/release/kbf" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
       - name: Sign kbf-deploy ad hoc with the hardened runtime, and check it
         run: cargo xtask sign-darwin "target/$TARGET/release/kbf-deploy" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
+      - name: Sign kbf-installer ad hoc with the hardened runtime, and check it
+        run: cargo xtask sign-darwin "target/$TARGET/release/kbf-installer" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
       - name: The signed kbf names the commit and a release build
         run: cargo xtask build-commit check --json "target/$TARGET/release/kbf" "$GITHUB_SHA"
+      - name: The signed kbf-installer names the commit and a release build
+        run: cargo xtask build-commit check --json "target/$TARGET/release/kbf-installer" "$GITHUB_SHA"
       - name: SBOM
         run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET"
       - name: The SBOM step left Cargo.lock unchanged
         run: git diff --exit-code -- Cargo.lock
-      - name: Package kbf-daemon
-        run: cargo xtask package --binary "target/$TARGET/release/kbf-daemon" --sbom crates/kbf-node/kbf-daemon_bin.cdx.json --platform darwin-arm64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf
         run: cargo xtask package --binary "target/$TARGET/release/kbf" --sbom crates/kbf-cli/kbf_bin.cdx.json --platform darwin-arm64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf-deploy
         run: cargo xtask package --binary "target/$TARGET/release/kbf-deploy" --sbom crates/kbf-deploy/kbf-deploy_bin.cdx.json --platform darwin-arm64 --commit "$GITHUB_SHA" --out dist
-      - name: Check the packaged kbf-daemon's signature, and run it
-        run: cargo xtask darwin-asset "dist/kbf-daemon-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-daemon
+      - name: Package kbf-installer
+        run: cargo xtask package --binary "target/$TARGET/release/kbf-installer" --sbom crates/kbf-installer/kbf-installer_bin.cdx.json --platform darwin-arm64 --commit "$GITHUB_SHA" --out dist
       - name: Check the packaged kbf's signature, and run it
         run: cargo xtask darwin-asset "dist/kbf-$GITHUB_SHA-darwin-arm64.tar.gz" kbf
       - name: Check the packaged kbf-deploy's signature, and run it
         run: cargo xtask darwin-asset "dist/kbf-deploy-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-deploy
+      - name: Check the packaged kbf-installer's signature, and run it
+        run: cargo xtask darwin-asset "dist/kbf-installer-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-installer
+      - name: The packaged kbf names the commit and a release build
+        run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-darwin-arm64.tar.gz" "$GITHUB_SHA"
+      - name: The packaged kbf-installer names the commit and a release build
+        run: cargo xtask build-commit check-asset "dist/kbf-installer-$GITHUB_SHA-darwin-arm64.tar.gz" "$GITHUB_SHA"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-darwin-arm64
@@ -173,10 +179,12 @@ jobs:
       - name: Install cargo-cyclonedx (pinned version and checksum)
         run: cargo xtask fetch --url "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz" --sha256 "$CYCLONEDX_SHA256_X86_64_LINUX" --out "$HOME/.cargo/bin/cargo-cyclonedx" --extract tar.xz --member "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
       - run: cargo cyclonedx --version
-      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-deploy -p kbf-cli --bins
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-deploy -p kbf-cli -p kbf-installer --bins
       - run: cargo xtask build-commit check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
       - name: kbf names the commit and a release build
         run: cargo xtask build-commit check --json "target/$TARGET/release/kbf" "$GITHUB_SHA"
+      - name: kbf-installer names the commit and a release build
+        run: cargo xtask build-commit check --json "target/$TARGET/release/kbf-installer" "$GITHUB_SHA"
       - name: SBOM
         run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET"
       - name: The SBOM step left Cargo.lock unchanged
@@ -189,6 +197,12 @@ jobs:
         run: cargo xtask package --binary "target/$TARGET/release/kbf-deploy" --sbom crates/kbf-deploy/kbf-deploy_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf
         run: cargo xtask package --binary "target/$TARGET/release/kbf" --sbom crates/kbf-cli/kbf_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
+      - name: Package kbf-installer
+        run: cargo xtask package --binary "target/$TARGET/release/kbf-installer" --sbom crates/kbf-installer/kbf-installer_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
+      - name: The packaged kbf names the commit and a release build
+        run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" "$GITHUB_SHA"
+      - name: The packaged kbf-installer names the commit and a release build
+        run: cargo xtask build-commit check-asset "dist/kbf-installer-$GITHUB_SHA-linux-x86_64.tar.gz" "$GITHUB_SHA"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-x86_64
@@ -234,10 +248,12 @@ jobs:
       - name: Install cargo-cyclonedx (pinned version and checksum)
         run: cargo xtask fetch --url "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz" --sha256 "$CYCLONEDX_SHA256_AARCH64_LINUX" --out "$HOME/.cargo/bin/cargo-cyclonedx" --extract tar.xz --member "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
       - run: cargo cyclonedx --version
-      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-deploy -p kbf-cli --bins
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-deploy -p kbf-cli -p kbf-installer --bins
       - run: cargo xtask build-commit check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
       - name: kbf names the commit and a release build
         run: cargo xtask build-commit check --json "target/$TARGET/release/kbf" "$GITHUB_SHA"
+      - name: kbf-installer names the commit and a release build
+        run: cargo xtask build-commit check --json "target/$TARGET/release/kbf-installer" "$GITHUB_SHA"
       - name: SBOM
         run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET"
       - name: The SBOM step left Cargo.lock unchanged
@@ -250,6 +266,12 @@ jobs:
         run: cargo xtask package --binary "target/$TARGET/release/kbf-deploy" --sbom crates/kbf-deploy/kbf-deploy_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf
         run: cargo xtask package --binary "target/$TARGET/release/kbf" --sbom crates/kbf-cli/kbf_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
+      - name: Package kbf-installer
+        run: cargo xtask package --binary "target/$TARGET/release/kbf-installer" --sbom crates/kbf-installer/kbf-installer_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
+      - name: The packaged kbf names the commit and a release build
+        run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" "$GITHUB_SHA"
+      - name: The packaged kbf-installer names the commit and a release build
+        run: cargo xtask build-commit check-asset "dist/kbf-installer-$GITHUB_SHA-linux-arm64.tar.gz" "$GITHUB_SHA"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-arm64
@@ -358,11 +380,12 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-  # Push to main or feature/arch-v2 only: build provenance for every Linux file, and an SBOM
-  # attestation for every Linux tarball. This job signs and does nothing else: while it holds
-  # `id-token: write` no repository code runs, and nothing is built, only the pinned actions
-  # below. The Linux sums job checked these files against its SHA256SUMS; the Linux verify job
-  # checks what it signs.
+  # Push to main or feature/arch-v2 only: build provenance for every Linux file, an SBOM
+  # attestation for every Linux tarball, and a provenance attestation (and its bundle) of each
+  # tarball alone. This job signs and does nothing else: while it holds `id-token: write` no
+  # repository code runs, and nothing is built, only the pinned actions below and a `cp` that
+  # names each bundle. The Linux sums job checked these files against its SHA256SUMS; the Linux
+  # verify job checks what it signs.
   attest-linux:
     needs: [sums-linux]
     if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}
@@ -403,6 +426,10 @@ jobs:
           sbom-path: dist/kbf-${{ github.sha }}-linux-x86_64.cdx.json
       - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
+          subject-path: dist/kbf-installer-${{ github.sha }}-linux-x86_64.tar.gz
+          sbom-path: dist/kbf-installer-${{ github.sha }}-linux-x86_64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
           subject-path: dist/kbf-daemon-${{ github.sha }}-linux-arm64.tar.gz
           sbom-path: dist/kbf-daemon-${{ github.sha }}-linux-arm64.cdx.json
       - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
@@ -417,13 +444,106 @@ jobs:
         with:
           subject-path: dist/kbf-${{ github.sha }}-linux-arm64.tar.gz
           sbom-path: dist/kbf-${{ github.sha }}-linux-arm64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/kbf-installer-${{ github.sha }}-linux-arm64.tar.gz
+          sbom-path: dist/kbf-installer-${{ github.sha }}-linux-arm64.cdx.json
+      # Each tarball is also attested as its own subject, and the bundle of that attestation
+      # (the file `gh attestation verify --bundle` takes offline) is copied beside the tarball
+      # as `<tarball>.sigstore.json`, for the release and for a host that verifies without GitHub.
+      - id: provenance-kbf-daemon-linux-x86_64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-daemon-${{ github.sha }}-linux-x86_64.tar.gz
+      - name: Name the bundle of kbf-daemon for linux-x86_64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-daemon-linux-x86_64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-daemon-${GITHUB_SHA}-linux-x86_64.tar.gz.sigstore.json"
+      - id: provenance-kbf-server-linux-x86_64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-server-${{ github.sha }}-linux-x86_64.tar.gz
+      - name: Name the bundle of kbf-server for linux-x86_64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-server-linux-x86_64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-server-${GITHUB_SHA}-linux-x86_64.tar.gz.sigstore.json"
+      - id: provenance-kbf-deploy-linux-x86_64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-deploy-${{ github.sha }}-linux-x86_64.tar.gz
+      - name: Name the bundle of kbf-deploy for linux-x86_64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-deploy-linux-x86_64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-deploy-${GITHUB_SHA}-linux-x86_64.tar.gz.sigstore.json"
+      - id: provenance-kbf-linux-x86_64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-${{ github.sha }}-linux-x86_64.tar.gz
+      - name: Name the bundle of kbf for linux-x86_64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-linux-x86_64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-${GITHUB_SHA}-linux-x86_64.tar.gz.sigstore.json"
+      - id: provenance-kbf-installer-linux-x86_64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-installer-${{ github.sha }}-linux-x86_64.tar.gz
+      - name: Name the bundle of kbf-installer for linux-x86_64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-installer-linux-x86_64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-installer-${GITHUB_SHA}-linux-x86_64.tar.gz.sigstore.json"
+      - id: provenance-kbf-daemon-linux-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-daemon-${{ github.sha }}-linux-arm64.tar.gz
+      - name: Name the bundle of kbf-daemon for linux-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-daemon-linux-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-daemon-${GITHUB_SHA}-linux-arm64.tar.gz.sigstore.json"
+      - id: provenance-kbf-server-linux-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-server-${{ github.sha }}-linux-arm64.tar.gz
+      - name: Name the bundle of kbf-server for linux-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-server-linux-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-server-${GITHUB_SHA}-linux-arm64.tar.gz.sigstore.json"
+      - id: provenance-kbf-deploy-linux-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-deploy-${{ github.sha }}-linux-arm64.tar.gz
+      - name: Name the bundle of kbf-deploy for linux-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-deploy-linux-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-deploy-${GITHUB_SHA}-linux-arm64.tar.gz.sigstore.json"
+      - id: provenance-kbf-linux-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-${{ github.sha }}-linux-arm64.tar.gz
+      - name: Name the bundle of kbf for linux-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-linux-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-${GITHUB_SHA}-linux-arm64.tar.gz.sigstore.json"
+      - id: provenance-kbf-installer-linux-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-installer-${{ github.sha }}-linux-arm64.tar.gz
+      - name: Name the bundle of kbf-installer for linux-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-installer-linux-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-installer-${GITHUB_SHA}-linux-arm64.tar.gz.sigstore.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bundles-linux
+          path: dist/*.sigstore.json
+          retention-days: 90
+          if-no-files-found: error
 
-
-  # Push to main or feature/arch-v2 only: build provenance for every macOS file, and an SBOM
-  # attestation for every macOS tarball. This job signs and does nothing else: while it holds
-  # `id-token: write` no repository code runs, and nothing is built, only the pinned actions
-  # below. The macOS sums job checked these files against its SHA256SUMS; the macOS verify job
-  # checks what it signs.
+  # Push to main or feature/arch-v2 only: build provenance for every macOS file, an SBOM
+  # attestation for every macOS tarball, and a provenance attestation (and its bundle) of each
+  # tarball alone. This job signs and does nothing else: while it holds `id-token: write` no
+  # repository code runs, and nothing is built, only the pinned actions below and a `cp` that
+  # names each bundle. The macOS sums job checked these files against its SHA256SUMS; the macOS
+  # verify job checks what it signs.
   attest-darwin-arm64:
     needs: [sums-darwin-arm64]
     if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}
@@ -448,22 +568,55 @@ jobs:
           subject-checksums: dist/SHA256SUMS
       - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
-          subject-path: dist/kbf-daemon-${{ github.sha }}-darwin-arm64.tar.gz
-          sbom-path: dist/kbf-daemon-${{ github.sha }}-darwin-arm64.cdx.json
-      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
-        with:
           subject-path: dist/kbf-${{ github.sha }}-darwin-arm64.tar.gz
           sbom-path: dist/kbf-${{ github.sha }}-darwin-arm64.cdx.json
       - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
           subject-path: dist/kbf-deploy-${{ github.sha }}-darwin-arm64.tar.gz
           sbom-path: dist/kbf-deploy-${{ github.sha }}-darwin-arm64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/kbf-installer-${{ github.sha }}-darwin-arm64.tar.gz
+          sbom-path: dist/kbf-installer-${{ github.sha }}-darwin-arm64.cdx.json
+      # Each tarball is also attested as its own subject; see attest-linux.
+      - id: provenance-kbf-darwin-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-${{ github.sha }}-darwin-arm64.tar.gz
+      - name: Name the bundle of kbf for darwin-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-darwin-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-${GITHUB_SHA}-darwin-arm64.tar.gz.sigstore.json"
+      - id: provenance-kbf-deploy-darwin-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-deploy-${{ github.sha }}-darwin-arm64.tar.gz
+      - name: Name the bundle of kbf-deploy for darwin-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-deploy-darwin-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-deploy-${GITHUB_SHA}-darwin-arm64.tar.gz.sigstore.json"
+      - id: provenance-kbf-installer-darwin-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-installer-${{ github.sha }}-darwin-arm64.tar.gz
+      - name: Name the bundle of kbf-installer for darwin-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-installer-darwin-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-installer-${GITHUB_SHA}-darwin-arm64.tar.gz.sigstore.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bundles-darwin-arm64
+          path: dist/*.sigstore.json
+          retention-days: 90
+          if-no-files-found: error
 
   # Push to main or feature/arch-v2 only, after attest-linux: the checks the planned deployment
   # job is to make (cargo xtask verify-assets, crates/xtask/src/sums.rs), for the branch
   # that was pushed (`--source-ref "$GITHUB_REF"`), with read-only scopes, on the Linux files.
   # The files are assembled again into a SHA256SUMS that must be byte for byte the one the
   # sums job published and the attest job signed, then checked against it, then each verified.
+  # Each tarball is also verified against its own bundle, offline and for the commit
+  # (`--commit "$GITHUB_SHA"`), with the flags a host's installer uses.
   verify-linux:
     needs: [attest-linux]
     if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}
@@ -486,20 +639,31 @@ jobs:
         with:
           name: sha256sums-linux
           path: published
+      # The bundles go in beside the files; the sums do not list them (the attestation that
+      # made them signed the files the sums list), and the check below holds them to one per tarball.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bundles-linux
+          path: dist
       - name: Assemble SHA256SUMS, which must be the published one
         run: cargo xtask sums assemble dist --expect published/SHA256SUMS
       - name: Check the files against SHA256SUMS
         run: cargo xtask verify-assets sums dist
+      - name: Fetch the Sigstore trusted root, for the offline check of the bundles
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh attestation trusted-root > "$RUNNER_TEMP/trusted_root.jsonl"
       - name: Verify as the planned deployment job is to
         env:
           GH_TOKEN: ${{ github.token }}
-        run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_WORKFLOW_REF" --source-ref "$GITHUB_REF"
+        run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_WORKFLOW_REF" --source-ref "$GITHUB_REF" --commit "$GITHUB_SHA" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl"
 
   # Push to main or feature/arch-v2 only, after attest-darwin-arm64: the checks the planned deployment
   # job is to make (cargo xtask verify-assets, crates/xtask/src/sums.rs), for the branch
   # that was pushed (`--source-ref "$GITHUB_REF"`), with read-only scopes, on the macOS files.
   # The files are assembled again into a SHA256SUMS that must be byte for byte the one the
   # sums job published and the attest job signed, then checked against it, then each verified.
+  # Each tarball is also verified against its own bundle; see verify-linux.
   verify-darwin-arm64:
     needs: [attest-darwin-arm64]
     if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}
@@ -522,11 +686,20 @@ jobs:
         with:
           name: sha256sums-darwin-arm64
           path: published
+      # The bundles go in beside the files; see verify-linux.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bundles-darwin-arm64
+          path: dist
       - name: Assemble SHA256SUMS, which must be the published one
         run: cargo xtask sums assemble dist --expect published/SHA256SUMS
       - name: Check the files against SHA256SUMS
         run: cargo xtask verify-assets sums dist
+      - name: Fetch the Sigstore trusted root, for the offline check of the bundles
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh attestation trusted-root > "$RUNNER_TEMP/trusted_root.jsonl"
       - name: Verify as the planned deployment job is to
         env:
           GH_TOKEN: ${{ github.token }}
-        run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_WORKFLOW_REF" --source-ref "$GITHUB_REF"
+        run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_WORKFLOW_REF" --source-ref "$GITHUB_REF" --commit "$GITHUB_SHA" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl"

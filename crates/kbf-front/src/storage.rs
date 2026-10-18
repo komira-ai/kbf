@@ -15,7 +15,8 @@ use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::segments_server::Segments;
 use kbf_segments::RecordHasher;
 use kbf_storage::{
-    Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError, StreamedPut,
+    ActionEntry, Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError,
+    StreamedPut,
 };
 use kbf_types::Digest;
 
@@ -144,6 +145,20 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
         Box::pin(async move { Ok(self.cache.action_result(action).await?) })
     }
 
+    fn action_entry<'a>(&'a self, action: &'a Digest) -> Answer<'a, Option<ActionEntry>> {
+        Box::pin(async move {
+            Ok(self
+                .cache
+                .action_entry(action)
+                .await?
+                .map(|(result_digest, result, closure)| ActionEntry {
+                    result_digest,
+                    result,
+                    closure: Some(closure),
+                }))
+        })
+    }
+
     fn prepare_action_result<'a>(&'a self, result: &'a ActionResult) -> Answer<'a, ActionRecord> {
         Box::pin(async move { Ok(self.cache.prepare_action_result(result).await?) })
     }
@@ -258,9 +273,10 @@ impl From<CacheError> for StorageError {
             | CacheError::Pack(_)
             | CacheError::Key(_)
             | CacheError::StaleWriter(_)) => Self::Internal(e.to_string()),
-            e @ (CacheError::Meta(_) | CacheError::Store(_) | CacheError::Tier(_)) => {
-                Self::Unavailable(Arc::new(e))
-            }
+            e @ (CacheError::Meta(_)
+            | CacheError::Store(_)
+            | CacheError::Tier(_)
+            | CacheError::Stalled(_)) => Self::Unavailable(Arc::new(e)),
         }
     }
 }

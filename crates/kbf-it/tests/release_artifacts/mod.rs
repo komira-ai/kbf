@@ -8,9 +8,11 @@
 //! to the same set.
 //!
 //! - **The release set.** The `cargo xtask package` lines of the workflow name exactly
-//!   [`ASSETS`] (binary and platform): `kbf` for the three platforms, `kbf-daemon`,
-//!   `kbf-server` and `kbf-deploy` for Linux, `kbf-daemon` and `kbf-deploy` for macOS.
-//!   Each one's SBOM attestation is [`crate::attested_assets`]' business.
+//!   [`ASSETS`] (binary and platform): `kbf` and `kbf-installer` for the three platforms,
+//!   `kbf-daemon`, `kbf-server` and `kbf-deploy` for Linux, `kbf-deploy` for macOS (a Mac
+//!   runs `kbf daemon`; there is no darwin `kbf-daemon`). Each one's SBOM attestation is
+//!   [`crate::attested_assets`]' business, and its provenance bundle
+//!   [`crate::attested_bundles`]'.
 //! - **Who signs, and when.** The workflow runs for pull requests and the merge queue
 //!   (builds only) and for pushes to exactly [`PUSH_BRANCHES`]. The `attest` and `verify`
 //!   jobs run under the one `if:` [`SIGNING_IF`], which no pull request satisfies, and
@@ -19,31 +21,48 @@
 //!   workflow lint, `workflows/mod.rs`.)
 //! - **What the verify job checks.** It names the branch it is verifying: `--source-ref
 //!   "$GITHUB_REF"`, so the development branch's attestations verify as that branch's and
-//!   a release (which verifies as `refs/heads/main`) never accepts them.
-//! - **The binaries identify themselves.** Every job that packages `kbf` first runs
-//!   `cargo xtask build-commit check --json` on it, so `kbf --version --json` of the
-//!   shipped bytes names the commit and a release build.
+//!   a release (which verifies as `refs/heads/main`) never accepts them. It also names
+//!   the commit, `--commit "$GITHUB_SHA"`, and the trusted root it fetched first
+//!   (`--trusted-root`), so each tarball's bundle is verified offline for the commit it
+//!   was built from, as a host does ([`crate::attested_bundles`] holds the bundles
+//!   themselves to the workflow).
+//! - **The binaries identify themselves.** Every job that packages one of [`IDENTIFIED`]
+//!   (`kbf`, the runtime, and `kbf-installer`, the root tool that installs it) first runs
+//!   `cargo xtask build-commit check --json` on it, so `<binary> --version --json` of the
+//!   binary built names the commit and a release build, and then, in a later step that
+//!   cannot be skipped, `cargo xtask build-commit check-asset` on the tarball it
+//!   packaged (`dist/<binary>-$GITHUB_SHA-<platform>.tar.gz`), which opens that file and
+//!   makes the same check on the binary inside: the bytes that ship, not only the bytes
+//!   built.
 //! - **macOS.** Every binary the darwin job packages is signed by `cargo xtask
 //!   sign-darwin` before it is packaged and checked by `cargo xtask darwin-asset` on
 //!   the tarball after, each in a step that cannot be skipped.
 
-use super::{attested_assets, workflows};
+use super::{attested_assets, attested_bundles, workflows};
 
 /// Every (binary, platform) the workflow packages, in the order docs/artifacts.md lists
 /// them.
 pub const ASSETS: &[(&str, &str)] = &[
     ("kbf", "darwin-arm64"),
-    ("kbf-daemon", "darwin-arm64"),
     ("kbf-deploy", "darwin-arm64"),
+    ("kbf-installer", "darwin-arm64"),
     ("kbf", "linux-x86_64"),
     ("kbf-daemon", "linux-x86_64"),
     ("kbf-server", "linux-x86_64"),
     ("kbf-deploy", "linux-x86_64"),
+    ("kbf-installer", "linux-x86_64"),
     ("kbf", "linux-arm64"),
     ("kbf-daemon", "linux-arm64"),
     ("kbf-server", "linux-arm64"),
     ("kbf-deploy", "linux-arm64"),
+    ("kbf-installer", "linux-arm64"),
 ];
+
+/// The binaries of [`ASSETS`] that name the commit they were built from (`<binary>
+/// --version` prints `<binary> <package version>+<12 hex>`, and `--version --json` says
+/// `commit` and `profile`): the runtime and the root tool that installs it. A job that
+/// packages one checks it before and after packaging, as [`problems`] says.
+pub const IDENTIFIED: &[&str] = &["kbf", "kbf-installer"];
 
 /// The branches whose pushes run the workflow: the ones a host's verification may name
 /// as `--source-ref` (`refs/heads/<branch>`).
@@ -195,14 +214,17 @@ fn signing(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
     }
     for attest_job in ATTEST_JOBS {
         let attest = workflows::job_steps(workflow, attest_job)?;
+        // The step over the sums; the steps over one tarball each are
+        // `attested_bundles`' business.
         let provenance = attest.iter().find(|s| {
             s.uses
                 .as_deref()
                 .is_some_and(|u| u.starts_with("actions/attest-build-provenance@"))
+                && s.with.iter().any(|(k, _)| k == "subject-checksums")
         });
         match provenance {
             None => out.push(format!(
-                "the job `{attest_job}` has no actions/attest-build-provenance step"
+                "the job `{attest_job}` has no actions/attest-build-provenance step with `subject-checksums`"
             )),
             Some(step) => {
                 let subjects = step
@@ -245,6 +267,12 @@ fn signing(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
                         "the attestation check of `{verify_job}` is under `if:` or `continue-on-error:`"
                     ));
                 }
+                attested_bundles::offline_verification(
+                    &format!("the job `{verify_job}`"),
+                    &verify,
+                    "$GITHUB_SHA",
+                    out,
+                );
             }
         }
     }
@@ -254,31 +282,68 @@ fn signing(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
 fn identity(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
     for job in BUILD_JOBS {
         let steps = workflows::job_steps(workflow, job)?;
-        let packages_kbf = |l: &str| {
-            args(l, "cargo xtask package ").is_some_and(|a| {
-                let at = a.iter().position(|w| *w == "--binary");
-                at.and_then(|i| a.get(i + 1))
-                    .is_some_and(|b| base(b) == "kbf")
-            })
-        };
-        let Some((package, _)) = first(&steps, 0, packages_kbf) else {
-            continue;
-        };
-        let checks_kbf = |l: &str| {
-            args(l, "cargo xtask build-commit check --json ")
-                .is_some_and(|a| a.len() == 2 && base(a[0]) == "kbf" && a[1] == "$GITHUB_SHA")
-        };
-        match first(&steps, 0, checks_kbf) {
-            Some((at, step)) if at < package && !step.conditional => {}
-            Some((at, _)) if at < package => out.push(format!(
-                "`{job}` checks `kbf --version --json` under `if:` or `continue-on-error:`"
-            )),
-            _ => out.push(format!(
-                "`{job}` packages kbf without `cargo xtask build-commit check --json <kbf> \"$GITHUB_SHA\"` before"
-            )),
+        for name in IDENTIFIED {
+            let packages = |l: &str| {
+                args(l, "cargo xtask package ").is_some_and(|a| {
+                    let at = a.iter().position(|w| *w == "--binary");
+                    at.and_then(|i| a.get(i + 1))
+                        .is_some_and(|b| base(b) == *name)
+                })
+            };
+            let Some((package, _)) = first(&steps, 0, packages) else {
+                continue;
+            };
+            let checks = |l: &str| {
+                args(l, "cargo xtask build-commit check --json ")
+                    .is_some_and(|a| a.len() == 2 && base(a[0]) == *name && a[1] == "$GITHUB_SHA")
+            };
+            match first(&steps, 0, checks) {
+                Some((at, step)) if at < package && !step.conditional => {}
+                Some((at, _)) if at < package => out.push(format!(
+                    "`{job}` checks `{name} --version --json` under `if:` or `continue-on-error:`"
+                )),
+                _ => out.push(format!(
+                    "`{job}` packages {name} without `cargo xtask build-commit check --json <{name}> \"$GITHUB_SHA\"` before"
+                )),
+            }
+            shipped_tarball(job, name, &steps, package, out);
         }
     }
     Ok(())
+}
+
+/// The tarball `job` packaged (step `package`) is opened again, in a later step that
+/// cannot be skipped: `cargo xtask build-commit check-asset` of this job's tarball of
+/// `name` and `"$GITHUB_SHA"`. The check before packaging is of the binary built; this
+/// one is of the bytes that ship. (The job is named by its platform, and packages into
+/// `dist`.)
+fn shipped_tarball(
+    job: &str,
+    name: &str,
+    steps: &[workflows::Step],
+    package: usize,
+    out: &mut Vec<String>,
+) {
+    let tarball = format!("dist/{name}-$GITHUB_SHA-{job}.tar.gz");
+    let checks_tarball = |l: &str| {
+        args(l, "cargo xtask build-commit check-asset ")
+            .is_some_and(|a| a.len() == 2 && a[0] == tarball && a[1] == "$GITHUB_SHA")
+    };
+    let checks: Vec<&workflows::Step> = steps
+        .iter()
+        .skip(package + 1)
+        .filter(|s| lines(s).any(&checks_tarball))
+        .collect();
+    if checks.iter().any(|s| !s.conditional) {
+        return;
+    }
+    out.push(if checks.is_empty() {
+        format!(
+            "`{job}` packages {name} without `cargo xtask build-commit check-asset \"{tarball}\" \"$GITHUB_SHA\"` in a step after"
+        )
+    } else {
+        format!("`{job}` checks the packaged {name} tarball under `if:` or `continue-on-error:`")
+    });
 }
 
 fn darwin(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
@@ -362,7 +427,8 @@ fn native_macos_runs_for_a_feature_pull_request_only_with_the_label() {
 fn the_docs_describe_the_release_set() {
     // Catches: docs/artifacts.md describing another set of files than the workflow
     // builds (the doc is what an operator verifies against), or no longer saying that
-    // pushes to the development branch are attested and what `--version --json` is.
+    // pushes to the development branch are attested, what `--version --json` is, and
+    // how a tarball is verified offline with its bundle.
     let doc = std::fs::read_to_string(super::repo_root().join("docs/artifacts.md"))
         .expect("docs/artifacts.md");
     let mut missing = Vec::new();
@@ -378,7 +444,14 @@ fn the_docs_describe_the_release_set() {
             missing.push(format!("docs/artifacts.md does not name {named}"));
         }
     }
-    for phrase in ["kbf --version --json", "`--source-ref \"$GITHUB_REF\"`"] {
+    for phrase in [
+        "kbf --version --json",
+        "kbf-installer --version --json",
+        "`--source-ref \"$GITHUB_REF\"`",
+        "`<tarball>.sigstore.json`",
+        "--bundle <tarball>.sigstore.json",
+        "--source-digest <commit>",
+    ] {
         if !doc.contains(phrase) {
             missing.push(format!("docs/artifacts.md does not mention {phrase}"));
         }
@@ -390,6 +463,20 @@ fn the_docs_describe_the_release_set() {
 /// then broken one way at a time.
 mod rules {
     use super::*;
+
+    /// The step that re-opens `platform`'s packaged `name` tarball and checks its identity.
+    fn check_asset_step(name: &str, platform: &str) -> String {
+        format!(
+            "      - name: The packaged {name} names the commit\n        run: cargo xtask build-commit check-asset \"dist/{name}-$GITHUB_SHA-{platform}.tar.gz\" \"$GITHUB_SHA\"\n"
+        )
+    }
+
+    /// The step that checks `name --version --json` of the binary built.
+    fn identity_step(name: &str) -> String {
+        format!(
+            "      - run: cargo xtask build-commit check --json \"target/$TARGET/release/{name}\" \"$GITHUB_SHA\"\n"
+        )
+    }
 
     /// A workflow of the shape the rules read, meeting every one.
     fn good() -> String {
@@ -406,11 +493,14 @@ mod rules {
                 .filter(|(_, p)| *p == platform)
                 .map(|(n, _)| *n)
                 .collect();
-            if mine.contains(&"kbf") {
-                if platform == "darwin-arm64" {
-                    // Darwin signs first, so the check names the signed bytes.
-                } else {
-                    w.push_str("      - run: cargo xtask build-commit check --json \"target/$TARGET/release/kbf\" \"$GITHUB_SHA\"\n");
+            let identified: Vec<&str> = IDENTIFIED
+                .iter()
+                .copied()
+                .filter(|n| mine.contains(n))
+                .collect();
+            if platform != "darwin-arm64" {
+                for name in &identified {
+                    w.push_str(&identity_step(name));
                 }
             }
             for name in &mine {
@@ -421,7 +511,10 @@ mod rules {
                 }
             }
             if platform == "darwin-arm64" {
-                w.push_str("      - run: cargo xtask build-commit check --json \"target/$TARGET/release/kbf\" \"$GITHUB_SHA\"\n");
+                // Darwin signs first, so the check names the signed bytes.
+                for name in &identified {
+                    w.push_str(&identity_step(name));
+                }
             }
             for name in &mine {
                 w.push_str(&format!(
@@ -432,6 +525,9 @@ mod rules {
                         "      - name: Check {name}\n        run: cargo xtask darwin-asset \"dist/{name}-$GITHUB_SHA-darwin-arm64.tar.gz\" {name}\n"
                     ));
                 }
+                if identified.contains(name) {
+                    w.push_str(&check_asset_step(name, platform));
+                }
             }
         }
         for platform in ["linux", "darwin-arm64"] {
@@ -441,7 +537,7 @@ mod rules {
         }
         for platform in ["linux", "darwin-arm64"] {
             w.push_str(&format!(
-                "  verify-{platform}:\n    if: {SIGNING_IF}\n    runs-on: ubuntu-24.04\n    steps:\n      - run: cargo xtask verify-assets attestations dist --repo \"$GITHUB_REPOSITORY\" --workflow-ref \"$GITHUB_WORKFLOW_REF\" --source-ref \"$GITHUB_REF\"\n"
+                "  verify-{platform}:\n    if: {SIGNING_IF}\n    runs-on: ubuntu-24.04\n    steps:\n      - run: gh attestation trusted-root > \"$RUNNER_TEMP/trusted_root.jsonl\"\n      - run: cargo xtask verify-assets attestations dist --repo \"$GITHUB_REPOSITORY\" --workflow-ref \"$GITHUB_WORKFLOW_REF\" --source-ref \"$GITHUB_REF\" --commit \"$GITHUB_SHA\" --trusted-root \"$RUNNER_TEMP/trusted_root.jsonl\"\n"
             ));
         }
         w
@@ -471,7 +567,6 @@ mod rules {
     }
 
     const KBF_ARM: &str = "release/kbf\" --sbom s.json --platform linux-arm64";
-    const SHA_CHECK: &str = "cargo xtask build-commit check --json";
 
     #[test]
     fn a_workflow_meeting_every_rule_passes() {
@@ -664,45 +759,266 @@ mod rules {
     }
 
     #[test]
+    fn the_verify_job_checks_the_bundles_offline_for_the_commit_it_verifies() {
+        // Catches: the bundles verified for no commit, or for another variable than the
+        // job's own `$GITHUB_SHA` (an attestation of any commit of the branch would
+        // pass), with no trusted root or one other than the file fetched (gh would
+        // reach for it itself: not the check a host makes), or with no root fetched.
+        let fetch =
+            "      - run: gh attestation trusted-root > \"$RUNNER_TEMP/trusted_root.jsonl\"\n";
+        let cases = [
+            // (The package lines of the build jobs have a `--commit "$GITHUB_SHA"` too,
+            // so each plant names what follows it.)
+            (
+                " --commit \"$GITHUB_SHA\" --trusted-root",
+                " --trusted-root",
+                "verifies attestations without `--commit \"$GITHUB_SHA\"`",
+            ),
+            (
+                "--commit \"$GITHUB_SHA\" --trusted-root",
+                "--commit \"$COMMIT\" --trusted-root",
+                "verifies attestations without `--commit \"$GITHUB_SHA\"`",
+            ),
+            (
+                " --trusted-root \"$RUNNER_TEMP/trusted_root.jsonl\"",
+                "",
+                "does not verify offline",
+            ),
+            (
+                "--trusted-root \"$RUNNER_TEMP/trusted_root.jsonl\"",
+                "--trusted-root elsewhere.jsonl",
+                "does not verify offline",
+            ),
+            (fetch, "", "does not fetch the trusted root"),
+        ];
+        for (from, to, wanted) in cases {
+            names(
+                &broken(from, to),
+                &[&format!("the job `verify-linux` {wanted}")],
+            );
+        }
+    }
+
+    #[test]
     fn every_job_that_packages_kbf_checks_its_identity_first() {
         // Catches: `kbf --version --json` of the shipped bytes unchecked (a debug build
         // or another commit could ship), the plain `--version` check standing in for
         // it, the check of another binary or another commit, the check after packaging
-        // (the tarball already made) or one that cannot fail the job.
-        for to in [
-            "cargo xtask build-commit check",
-            "cargo xtask build-commit check --json \"target/$TARGET/release/kbf-daemon\" \"$GITHUB_SHA\" #",
-            "cargo xtask build-commit check --json \"target/$TARGET/release/kbf\" abc #",
-        ] {
-            // Linux x86_64's check is the second of the file; darwin's is the first.
-            let w = good().replacen(
-                &format!("{SHA_CHECK} \"target/$TARGET/release/kbf\" \"$GITHUB_SHA\""),
-                to,
-                2,
+        // (the tarball already made) or one that cannot fail the job. Each of the
+        // identified binaries is held to it (`kbf-installer` is the second).
+        for name in IDENTIFIED {
+            let step = identity_step(name);
+            let the_check = step
+                .trim_start_matches("      - run: ")
+                .trim_end()
+                .to_owned();
+            // The other identified binary's check standing in for this one's.
+            let peer = IDENTIFIED.iter().find(|n| *n != name).expect("a peer");
+            for to in [
+                "cargo xtask build-commit check".to_owned(),
+                identity_step("kbf-daemon").replace("      - run: ", ""),
+                identity_step("kbf-deploy").replace("\"$GITHUB_SHA\"", "abc"),
+                identity_step(peer),
+            ] {
+                // The step's text is a script line: one `run:` step of the fixture.
+                let to = to.trim_start_matches("      - run: ").trim_end();
+                // Linux x86_64's check is the second of the file; darwin's is the first.
+                let w = good().replacen(&the_check, to, 2);
+                assert_ne!(w, good(), "{name}: the check is in the planted workflow");
+                names(
+                    &w,
+                    &[&format!(
+                        "packages {name} without `cargo xtask build-commit check --json"
+                    )],
+                );
+            }
+            let conditional = broken(
+                step.trim_end(),
+                &step
+                    .trim_end()
+                    .replace("      - run:", "      - if: always()\n        run:"),
             );
             names(
-                &w,
-                &["packages kbf without `cargo xtask build-commit check --json"],
+                &conditional,
+                &[&format!("checks `{name} --version --json` under `if:`")],
             );
         }
-        let conditional = broken(
-            "      - run: cargo xtask build-commit check --json",
-            "      - if: always()\n        run: cargo xtask build-commit check --json",
-        );
-        names(&conditional, &["checks `kbf --version --json` under `if:`"]);
+    }
+
+    /// `w` without the `k`-th (from 0) occurrence of `step`.
+    fn without_nth(w: &str, step: &str, k: usize) -> String {
+        let at = w
+            .match_indices(step)
+            .map(|(i, _)| i)
+            .nth(k)
+            .unwrap_or_else(|| panic!("occurrence {k} of {step:?} is not in the workflow"));
+        format!("{}{}", &w[..at], &w[at + step.len()..])
+    }
+
+    #[test]
+    fn one_binarys_check_does_not_stand_in_for_the_other() {
+        // Catches: an identity rule that is satisfied by any `build-commit check --json`
+        // (or `check-asset`) in the job, so the installer ships unchecked as long as
+        // `kbf` is checked: each binary's step removed alone is named for that binary,
+        // in every job, and for it only.
+        for name in IDENTIFIED {
+            for (k, job) in BUILD_JOBS.iter().enumerate() {
+                let w = good();
+                let check = format!(
+                    "`{job}` packages {name} without `cargo xtask build-commit check --json <{name}> \"$GITHUB_SHA\"` before"
+                );
+                assert_eq!(
+                    found(&without_nth(&w, &identity_step(name), k)),
+                    vec![check],
+                    "{job}: {name}'s check removed"
+                );
+                let asset = format!(
+                    "`{job}` packages {name} without `cargo xtask build-commit check-asset \"dist/{name}-$GITHUB_SHA-{job}.tar.gz\" \"$GITHUB_SHA\"` in a step after"
+                );
+                assert_eq!(
+                    found(&without_nth(&w, &check_asset_step(name, job), 0)),
+                    vec![asset],
+                    "{job}: {name}'s check-asset removed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_job_that_packages_kbf_re_opens_the_tarball_after() {
+        // Catches: the identity checked only on the binary before it is packaged, so the
+        // tarball that ships is never opened again; the re-check missing from one job
+        // while the others have it, naming another platform's tarball or another
+        // binary's, checking another commit, commented out, followed by `|| true` (or
+        // `; true`), run before the tarball exists, or skippable by `if:`. For each of the
+        // identified binaries, `kbf-installer` included.
+        for name in IDENTIFIED {
+            re_opens_the_tarball(name);
+        }
+    }
+
+    fn re_opens_the_tarball(name: &str) {
+        let package = format!("      - name: Package {name}\n");
+        // The other identified binary: its re-check standing in for this one's.
+        let peer = IDENTIFIED.iter().find(|n| **n != name).expect("a peer");
+        for (k, job) in BUILD_JOBS.iter().enumerate() {
+            let step = check_asset_step(name, job);
+            let missing = format!(
+                "`{job}` packages {name} without `cargo xtask build-commit check-asset \"dist/{name}-$GITHUB_SHA-{job}.tar.gz\" \"$GITHUB_SHA\"` in a step after"
+            );
+            let skippable = format!(
+                "`{job}` checks the packaged {name} tarball under `if:` or `continue-on-error:`"
+            );
+            let other = BUILD_JOBS[(k + 1) % BUILD_JOBS.len()];
+            let without = good().replacen(&step, "", 1);
+            assert_ne!(without, good(), "{job}: the step is in the fixture");
+            // The step moved to just before this job's `Package <name>`.
+            let at = without
+                .match_indices(&package)
+                .nth(k)
+                .map(|(i, _)| i)
+                .expect("this job's package step");
+            let moved = format!("{}{step}{}", &without[..at], &without[at..]);
+            let tarball = format!("dist/{name}-");
+            let variants = [
+                ("removed", without.clone(), &missing),
+                (
+                    "another platform's tarball",
+                    good().replacen(&step, &step.replace(job, other), 1),
+                    &missing,
+                ),
+                (
+                    "another binary's tarball",
+                    good().replacen(&step, &step.replace(&tarball, "dist/kbf-daemon-"), 1),
+                    &missing,
+                ),
+                (
+                    "the other identified binary's tarball",
+                    good().replacen(&step, &step.replace(&tarball, &format!("dist/{peer}-")), 1),
+                    &missing,
+                ),
+                (
+                    "another commit",
+                    good().replacen(&step, &step.replace("\" \"$GITHUB_SHA\"\n", "\" abc\n"), 1),
+                    &missing,
+                ),
+                (
+                    "a comment",
+                    good().replacen(&step, &step.replace("run: cargo", "run: echo cargo"), 1),
+                    &missing,
+                ),
+                // A failure of the check swallowed by the shell: the step cannot fail.
+                (
+                    "a trailing || true",
+                    good().replacen(
+                        &step,
+                        &step.replace("\"$GITHUB_SHA\"\n", "\"$GITHUB_SHA\" || true\n"),
+                        1,
+                    ),
+                    &missing,
+                ),
+                (
+                    "a trailing ; true",
+                    good().replacen(
+                        &step,
+                        &step.replace("\"$GITHUB_SHA\"\n", "\"$GITHUB_SHA\"; true\n"),
+                        1,
+                    ),
+                    &missing,
+                ),
+                ("before the package step", moved, &missing),
+                (
+                    "under if:",
+                    good().replacen(
+                        &step,
+                        &step.replace("\n        run:", "\n        if: always()\n        run:"),
+                        1,
+                    ),
+                    &skippable,
+                ),
+                (
+                    "continue-on-error",
+                    good().replacen(
+                        &step,
+                        &step.replace(
+                            "\n        run:",
+                            "\n        continue-on-error: true\n        run:",
+                        ),
+                        1,
+                    ),
+                    &skippable,
+                ),
+            ];
+            for (what, planted, want) in variants {
+                assert_eq!(found(&planted), vec![want.clone()], "{job}: {what}");
+            }
+        }
     }
 
     #[test]
     fn every_darwin_binary_is_signed_before_and_checked_after_packaging() {
-        // Catches: a darwin binary (kbf-deploy was the new one) packaged unsigned, a
-        // tarball never run through `darwin-asset`, the check of another binary's
-        // tarball standing in, and either step skippable.
+        // Catches: a darwin binary (kbf-deploy and kbf-installer were the new ones)
+        // packaged unsigned, a tarball never run through `darwin-asset`, the check of
+        // another binary's tarball standing in, and either step skippable.
+        for new in ["kbf-deploy", "kbf-installer"] {
+            names(
+                &broken(
+                    &format!("cargo xtask sign-darwin \"target/$TARGET/release/{new}\""),
+                    "cargo xtask sign-darwin \"target/$TARGET/release/kbf\"",
+                ),
+                &[&format!(
+                    "packages {new} without a `cargo xtask sign-darwin`"
+                )],
+            );
+        }
+        // The darwin `kbf-daemon` tarball is gone from the release set: packaging it
+        // again (a revert of the rename, half done) is named, not waved through.
         names(
             &broken(
-                "cargo xtask sign-darwin \"target/$TARGET/release/kbf-deploy\"",
-                "cargo xtask sign-darwin \"target/$TARGET/release/kbf-daemon\"",
+                "      - name: Package kbf-deploy\n",
+                "      - name: Package kbf-daemon\n        run: cargo xtask package --binary \"target/$TARGET/release/kbf-daemon\" --sbom s.json --platform darwin-arm64 --commit \"$GITHUB_SHA\" --out dist\n      - name: Package kbf-deploy\n",
             ),
-            &["packages kbf-deploy without a `cargo xtask sign-darwin`"],
+            &["kbf-daemon for darwin-arm64 is packaged but not in the pinned release set"],
         );
         // The check as a comment, as an echo, or as the shell script it replaced.
         for planted in [
@@ -720,30 +1036,39 @@ mod rules {
         }
         names(
             &broken(
-                "cargo xtask darwin-asset \"dist/kbf-daemon-$GITHUB_SHA-darwin-arm64.tar.gz\" kbf-daemon",
-                "cargo xtask darwin-asset \"dist/kbf-$GITHUB_SHA-darwin-arm64.tar.gz\" kbf-daemon",
+                "cargo xtask darwin-asset \"dist/kbf-deploy-$GITHUB_SHA-darwin-arm64.tar.gz\" kbf-deploy",
+                "cargo xtask darwin-asset \"dist/kbf-$GITHUB_SHA-darwin-arm64.tar.gz\" kbf-deploy",
             ),
-            &["packages kbf-daemon without a `cargo xtask darwin-asset`"],
-        );
-        for step in ["Sign kbf-deploy", "Check kbf-deploy"] {
-            names(
-                &broken(
-                    &format!("      - name: {step}\n"),
-                    &format!("      - name: {step}\n        continue-on-error: true\n"),
-                ),
-                &["packages kbf-deploy without"],
-            );
-        }
-        // A check that comes before the packaging does not check the tarball.
-        let w = good();
-        let check = "      - name: Check kbf-deploy\n        run: cargo xtask darwin-asset \"dist/kbf-deploy-$GITHUB_SHA-darwin-arm64.tar.gz\" kbf-deploy\n";
-        let package = "      - name: Package kbf-deploy\n";
-        let moved = w
-            .replacen(check, "", 1)
-            .replacen(package, &format!("{check}{package}"), 1);
-        names(
-            &moved,
             &["packages kbf-deploy without a `cargo xtask darwin-asset`"],
         );
+        for new in ["kbf-deploy", "kbf-installer"] {
+            for step in [format!("Sign {new}"), format!("Check {new}")] {
+                names(
+                    &broken(
+                        &format!("      - name: {step}\n"),
+                        &format!("      - name: {step}\n        continue-on-error: true\n"),
+                    ),
+                    &[&format!("packages {new} without")],
+                );
+            }
+            // A check that comes before the packaging does not check the tarball.
+            let w = good();
+            let check = format!(
+                "      - name: Check {new}\n        run: cargo xtask darwin-asset \"dist/{new}-$GITHUB_SHA-darwin-arm64.tar.gz\" {new}\n"
+            );
+            let package = format!("      - name: Package {new}\n");
+            let moved =
+                w.replacen(&check, "", 1)
+                    .replacen(&package, &format!("{check}{package}"), 1);
+            names(
+                &moved,
+                &[&format!(
+                    "packages {new} without a `cargo xtask darwin-asset`"
+                )],
+            );
+        }
     }
 }
+
+#[cfg(test)]
+mod installer;

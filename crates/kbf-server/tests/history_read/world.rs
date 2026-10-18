@@ -48,6 +48,7 @@ pub struct ObjectsInner {
     /// Reads that start at the first byte (a whole chunk) fail.
     fail_chunk_reads: AtomicBool,
     puts: AtomicU64,
+    gets: AtomicU64,
 }
 
 impl Objects {
@@ -61,6 +62,7 @@ impl Objects {
             fail_gets: AtomicBool::new(false),
             fail_chunk_reads: AtomicBool::new(false),
             puts: AtomicU64::new(0),
+            gets: AtomicU64::new(0),
         }))
     }
 
@@ -79,6 +81,11 @@ impl Objects {
     /// Writes that succeeded.
     pub fn puts(&self) -> u64 {
         self.0.puts.load(Ordering::SeqCst)
+    }
+
+    /// Reads asked of the store, whatever they answered.
+    pub fn gets(&self) -> u64 {
+        self.0.gets.load(Ordering::SeqCst)
     }
 }
 
@@ -108,6 +115,7 @@ impl ObjectStore for Objects {
         key: &ObjectKey,
         range: ByteRange,
     ) -> Result<Bytes, ObjectStoreError> {
+        self.0.gets.fetch_add(1, Ordering::SeqCst);
         let chunk = range.offset() == 0 && self.0.fail_chunk_reads.load(Ordering::SeqCst);
         if chunk || self.0.fail_gets.load(Ordering::SeqCst) {
             return Err(ObjectStoreError::Protocol("planted cause".into()));
@@ -279,6 +287,19 @@ pub fn measured(t: u64) -> Run {
 /// The events of action `n` of invocation `id` on `instance`: queued as operation
 /// `op`, run on a node and finished with `exit_code`.
 pub fn ran(id: &str, instance: &str, n: u8, op: u64, exit_code: i32) -> Vec<Event> {
+    ran_action(id, instance, n, n, op, exit_code)
+}
+
+/// [`ran`] for the action whose digest is that of `action`, at the time of `n`: the same
+/// action run again, later.
+pub fn ran_action(
+    id: &str,
+    instance: &str,
+    action: u8,
+    n: u8,
+    op: u64,
+    exit_code: i32,
+) -> Vec<Event> {
     let t = u64::from(n) * 1_000;
     let l = listing(
         digest(100 + u64::from(n)),
@@ -287,7 +308,7 @@ pub fn ran(id: &str, instance: &str, n: u8, op: u64, exit_code: i32) -> Vec<Even
         (Some(digest(140 + u64::from(n))), None),
     );
     vec![
-        queued(id, instance, later(t), digest(u64::from(n)), op),
+        queued(id, instance, later(t), digest(u64::from(action)), op),
         granted(op, 1, "node-a", later(t + 10)),
         started(op, 1, later(t + 12)),
         Event::Ran {

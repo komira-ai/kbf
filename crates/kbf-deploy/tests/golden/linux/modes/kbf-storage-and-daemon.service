@@ -5,7 +5,12 @@
 [Unit]
 Description=kbf build farm storage node and node daemon
 Wants=network-online.target
-After=network-online.target minio.service
+After=network-online.target
+# No ordering on a MinIO unit: the cold store need not be on this host. Order the unit
+# after a local MinIO's, or the frontend name's resolver (a VPN or overlay service), in a
+# systemd drop-in on the host:
+# /etc/systemd/system/kbf-storage-and-daemon.service.d/after.conf
+# with After= and Wants=.
 
 # A failure that repeats quickly (the cold store or a disk not ready) must not use up
 # systemd's start limit of 5 starts in 10 s and leave the unit down (check-units rule
@@ -52,6 +57,7 @@ ExecStart=/usr/local/bin/kbf storage-and-daemon \
     --frontend=https://frontend.example.internal:8981 \
     --advertise-addr=storage-node.example.internal:8983 \
     --driver=container \
+    --oci-runtime=/usr/bin/crun \
     --server=https://frontend.example.internal:8981 \
     --ca-cert=/etc/kbf/ca.pem \
     --cert=/etc/kbf/node.pem \
@@ -68,7 +74,10 @@ KillSignal=SIGTERM
 TimeoutStopSec=infinity
 Restart=on-failure
 RestartSec=5
-# Exit 2 is a command line kbf refused: a restart cannot fix it.
+# Exit 2 is a start kbf refused (a flag, a file, a directory that is not a log): a
+# restart cannot fix it. Exit 75 is a start that can pass on a later try (the data
+# directory still held by the process that is stopping, a boot the frontend handed out
+# again after its state store was restored): restarted after RestartSec.
 RestartPreventExitStatus=2
 
 [Install]

@@ -85,7 +85,7 @@ every lease an older leader granted. A single server's leases live and die with 
 process, so each process picks its own term at start: its start time in milliseconds
 on the wall clock, times 2^16, plus 16 random bits (`kbf_server::farm::process_term`).
 A restarted server therefore never grants a lease id its predecessor granted (issue
-[#137](https://github.com/komira-ai/komira-build-farm/issues/137)), and its terms
+[#137](https://github.com/komira-ai/kbf/issues/137)), and its terms
 order after its predecessor's while the wall clock does not step back across the
 restart. The replicated log's term replaces this once it is wired.
 

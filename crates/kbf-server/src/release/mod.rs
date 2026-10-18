@@ -7,17 +7,24 @@
 //! - The router, [`http::router`], serves `PUT /v1/releases/{commit}/{platform}/{name}` and
 //!   `GET /v1/releases`.
 //! - The service, [`grpc::service`], is `ReleaseService.Fetch`.
+//! - The desired release, [`desired::router`]: `GET /v1/update`, `POST /v1/update/desired`,
+//!   `pause` and `resume`, over the `update/desired` row.
 //!
 //! `GET /v1/releases` and `Fetch` carry no authentication of their own: the wiring puts `Fetch`
 //! behind the worker listener's mutual TLS.
 //!
-//! Not mounted anywhere yet: the frontend adds the router to its operator API and the
-//! service to its worker listener where it starts. Trust is the host's: the store neither
-//! opens a tarball nor checks an attestation.
+//! - The offers, [`offers::Offers`]: the `UpdateOffer` each platform is to be sent over its
+//!   nodes' sessions, built from the desired release and what the store holds.
+//!
+//! The frontend mounts the routers on its operator API and the service on its worker
+//! listener where it starts. Trust is the host's: the store neither opens a tarball nor
+//! checks an attestation.
 
+pub mod desired;
 pub mod grpc;
 pub mod http;
 pub mod key;
+pub mod offers;
 pub mod store;
 
 pub use grpc::service;

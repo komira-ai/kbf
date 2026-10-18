@@ -31,16 +31,24 @@ use kbf_host::exec::{Exec, Kind};
 use kbf_host::path::{HostPath, Root};
 
 use crate::CommitId;
-use crate::layout::{self, Layout};
+use crate::layout::Layout;
 use crate::refusal::Refusal;
 use crate::run::{Ran, RunAs, Runner, Spawn};
 use crate::settings::Settings;
 use crate::trust::trusted_chain;
 
 /// The repository whose workflow's attestation is accepted.
-pub const REPO: &str = "komira-ai/komira-build-farm";
+pub const REPO: &str = "komira-ai/kbf";
 /// The workflow that builds and attests the release artifacts.
-pub const SIGNER_WORKFLOW: &str = "komira-ai/komira-build-farm/.github/workflows/artifacts.yml";
+pub const SIGNER_WORKFLOW: &str = "komira-ai/kbf/.github/workflows/artifacts.yml";
+/// The repository's name before the rename. A certificate carries the repository's name
+/// at signing time, so releases attested before the rename name this one. Accepted for
+/// one release cycle (the transition); delete this pair, [`Signer::former`] and its
+/// entry in [`Verifier::pinned`] once no release under the old name is still installable.
+pub const FORMER_REPO: &str = "komira-ai/komira-build-farm";
+/// The workflow of [`FORMER_REPO`].
+pub const FORMER_SIGNER_WORKFLOW: &str =
+    "komira-ai/komira-build-farm/.github/workflows/artifacts.yml";
 /// The OIDC issuer of GitHub Actions, which signs the attestation's certificate.
 pub const ISSUER: &str = "https://token.actions.githubusercontent.com";
 /// The kind of attestation `gh` is asked for: SLSA build provenance.
@@ -88,6 +96,33 @@ pub struct Verified {
     pub source_ref: SourceRef,
 }
 
+/// One repository and workflow whose attestation is accepted. `gh` is asked for both in
+/// one call, so an attestation must name this pair, never the repository of one and the
+/// workflow of another.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Signer {
+    pub repo: String,
+    pub workflow: String,
+}
+
+impl Signer {
+    /// The repository under its current name.
+    pub fn current() -> Signer {
+        Signer {
+            repo: REPO.to_owned(),
+            workflow: SIGNER_WORKFLOW.to_owned(),
+        }
+    }
+
+    /// The repository under its name before the rename (see [`FORMER_REPO`]).
+    pub fn former() -> Signer {
+        Signer {
+            repo: FORMER_REPO.to_owned(),
+            workflow: FORMER_SIGNER_WORKFLOW.to_owned(),
+        }
+    }
+}
+
 /// What `gh attestation verify` is asked, and how it is run.
 #[derive(Clone, Debug)]
 pub struct Verifier {
@@ -97,8 +132,8 @@ pub struct Verifier {
     pub gh: HostPath,
     /// The Sigstore trusted root, as `gh attestation trusted-root` prints it.
     pub trusted_root: HostPath,
-    pub repo: String,
-    pub signer_workflow: String,
+    /// The signers an attestation may name, tried in order.
+    pub signers: Vec<Signer>,
     pub issuer: String,
     /// The branches the attestation may name, tried in order.
     pub source_refs: Vec<SourceRef>,
@@ -119,10 +154,9 @@ impl Verifier {
     pub fn pinned(host: &Layout, settings: &Settings) -> Verifier {
         Verifier {
             root: host.root().clone(),
-            gh: layout::path(layout::GH),
-            trusted_root: layout::path(layout::TRUSTED_ROOT),
-            repo: REPO.to_owned(),
-            signer_workflow: SIGNER_WORKFLOW.to_owned(),
+            gh: host.gh(),
+            trusted_root: host.trusted_root(),
+            signers: vec![Signer::current(), Signer::former()],
             issuer: ISSUER.to_owned(),
             source_refs: settings.source_refs.clone(),
             run_as: settings.run_as,
@@ -136,7 +170,8 @@ impl Verifier {
         trusted_chain(trust, &self.trusted_root, Kind::File)
     }
 
-    /// The argument list of `gh` for `tarball` and its `bundle`, for one allowed ref:
+    /// The argument list of `gh` for `tarball` and its `bundle`, for one signer and one
+    /// allowed ref:
     ///
     /// ```text
     /// attestation verify <tarball> --bundle <bundle> --custom-trusted-root <root>
@@ -148,6 +183,7 @@ impl Verifier {
         tarball: &Path,
         bundle: &Path,
         commit: &CommitId,
+        signer: &Signer,
         source_ref: &SourceRef,
     ) -> Vec<OsString> {
         let mut args: Vec<OsString> = ["attestation", "verify"].map(OsString::from).to_vec();
@@ -157,8 +193,8 @@ impl Verifier {
         args.push("--custom-trusted-root".into());
         args.push(self.root.join(&self.trusted_root).into());
         for (flag, value) in [
-            ("--repo", self.repo.as_str()),
-            ("--signer-workflow", self.signer_workflow.as_str()),
+            ("--repo", signer.repo.as_str()),
+            ("--signer-workflow", signer.workflow.as_str()),
             ("--cert-oidc-issuer", self.issuer.as_str()),
             ("--source-ref", source_ref.as_str()),
             ("--source-digest", commit.as_str()),
@@ -192,10 +228,10 @@ impl Verifier {
     }
 
     /// Accept `tarball` only if `gh` finds `bundle` a valid attestation of it for
-    /// `commit` on one of the allowed refs. `home` is a directory `run_as` owns, which
+    /// `commit` on one of the allowed refs, from one of the accepted signers. `home` is a directory `run_as` owns, which
     /// `gh` runs in. `tarball` and `bundle` are the stage's own copies.
     ///
-    /// A `gh` that exits non-zero for every ref is [`Refusal::NotAttested`]; one that
+    /// A `gh` that exits non-zero for every signer and ref is [`Refusal::NotAttested`]; one that
     /// cannot be started, or is killed at the timeout, is its own refusal. A trust list
     /// that is not root's alone is refused first, naming the path ([`Refusal::Untrusted`]).
     pub fn verify(
@@ -211,14 +247,22 @@ impl Verifier {
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         let mut last = None;
-        for source_ref in &self.source_refs {
-            let ran = self.run_gh(tools.runner, home, tarball, bundle, commit, source_ref)?;
-            if ran.code == Some(0) {
-                return Ok(Verified {
-                    source_ref: source_ref.clone(),
-                });
+        for signer in &self.signers {
+            for source_ref in &self.source_refs {
+                let ran = self.run_gh(
+                    tools.runner,
+                    home,
+                    (tarball, bundle),
+                    commit,
+                    (signer, source_ref),
+                )?;
+                if ran.code == Some(0) {
+                    return Ok(Verified {
+                        source_ref: source_ref.clone(),
+                    });
+                }
+                last = Some(ran);
             }
-            last = Some(ran);
         }
         Err(Refusal::NotAttested {
             subject,
@@ -230,14 +274,13 @@ impl Verifier {
         &self,
         runner: &dyn Runner,
         home: &Path,
-        tarball: &Path,
-        bundle: &Path,
+        (tarball, bundle): (&Path, &Path),
         commit: &CommitId,
-        source_ref: &SourceRef,
+        (signer, source_ref): (&Signer, &SourceRef),
     ) -> Result<Ran, Refusal> {
         let spawn = Spawn {
             program: self.root.join(&self.gh),
-            args: self.args(tarball, bundle, commit, source_ref),
+            args: self.args(tarball, bundle, commit, signer, source_ref),
             env: self.env(home),
             cwd: PathBuf::from(home),
             run_as: Some(self.run_as),

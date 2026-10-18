@@ -96,6 +96,7 @@ fn each_mode_renders_its_full_flag_set() {
             "--frontend=https://front.example.internal:8981",
             "--advertise-addr=storage-node.example.internal:8983",
             "--driver=container",
+            "--oci-runtime=/usr/bin/crun",
             "--server=https://front.example.internal:8981",
             "--ca-cert=/etc/kbf/ca.pem",
             "--cert=/etc/kbf/node.pem",
@@ -112,6 +113,7 @@ fn each_mode_renders_its_full_flag_set() {
         flags(&c, Mode::Daemon),
         words(&[
             "--driver=container",
+            "--oci-runtime=/usr/bin/crun",
             "--server=https://front.example.internal:8981",
             "--cas=https://front.example.internal:8981",
             "--ca-cert=/etc/kbf/ca.pem",
@@ -393,9 +395,7 @@ fn on_the_node_a_copy_of_the_key_beside_the_allowed_file_is_refused() {
         );
     let slice = UnitText::new(
         SLICE,
-        crate::linux::render::render(&c, Some(1500), &crate::linux::render::Templates::BUILT_IN)
-            .expect("renders")
-            .slice,
+        crate::linux::shared::render_slice(&c, Some(1500)).expect("renders"),
     );
     let mut exec = FakeExec::new(0);
     let file = |bits: u32, uid: u32, text: &str| Entry::File {
@@ -436,4 +436,21 @@ fn on_the_node_a_copy_of_the_key_beside_the_allowed_file_is_refused() {
             "FAIL credential: kbf-storage-and-daemon.service gives a build node the cold store's key (EnvironmentFile=/etc/kbf/copy.env, which sets AWS_SECRET_ACCESS_KEY): a build node holds no credential, and its builds run as its user"
         ]
     );
+}
+
+/// Catches a `storage` or `storage-and-daemon` unit ordered after `MINIO_UNIT`, a unit
+/// that does not exist on a host whose cold store is an external S3 endpoint (the
+/// ordering is a no-op there). With `MINIO_UNIT` set to a name nothing else in the
+/// settings uses, the rendered units never carry it.
+#[test]
+fn a_storage_unit_is_not_ordered_after_the_minio_unit() {
+    let c = config_with(&[("MINIO_UNIT", "minio-kbf.service")]);
+    for mode in [Mode::Storage, Mode::StorageAndDaemon] {
+        let text = render(&c, Some(1500), mode).expect("renders");
+        assert!(!text.contains("minio-kbf"), "{mode}:\n{text}");
+        assert!(
+            text.contains("\nAfter=network-online.target\n"),
+            "{mode}:\n{text}"
+        );
+    }
 }

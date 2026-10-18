@@ -130,8 +130,9 @@ no job; the lint instead checks that `release.yml` verifies the verdict (section
 
 ## 3. The artifact every stage consumes
 
-`artifacts.yml` is the build stage and is not changed in kind. **[F]** It builds `kbf`, `kbf-daemon`, `kbf-server` and
-`kbf-deploy` for linux x86_64, linux arm64 and darwin arm64, deterministic tarballs, SBOMs, `SHA256SUMS`; on a push to main
+`artifacts.yml` is the build stage and is not changed in kind. **[F]** It builds `kbf`, `kbf-daemon`, `kbf-server`,
+`kbf-deploy` and `kbf-installer` for linux x86_64, linux arm64 and darwin arm64 (docs/artifacts.md lists which binary for
+which platform), deterministic tarballs, SBOMs, `SHA256SUMS`; on a push to main
 or feature/arch-v2 `attest` adds provenance and SBOM attestations and `verify` checks them. An attestation names its ref,
 so a feature/arch-v2 asset does not verify as main's.
 
@@ -217,7 +218,7 @@ B-0, not the 20 of T5, which is a likely memory risk. The cost that matters is w
 merge path. Record job duration in the result document so a creeping beta shows in the numbers.
 
 **Container runtime [V].** The project runs containers with crun only. The harness today uses a stand-in runtime over a planted cgroup tree.
-Real crun needs cgroup v2 delegation and a systemd scope; the podman jobs in `ci.yml` arrange that with a `Delegate=yes`
+Real crun needs cgroup v2 delegation and a systemd scope; the crun jobs in `ci.yml` arrange that with a `Delegate=yes`
 unit, and the same approach is to be tried for crun on `ubuntu-24.04`. Until that is shown to work (#936), **B-0 uses the
 stand-in**, and the page says what that weakens: the `//:pause` and compile loads run through no real container path, so
 beta proves the update and failure paths and not container execution (covered by the existing real-runtime jobs). The
@@ -276,10 +277,10 @@ The gate expressions common to B1 to B6, B8 and B10, read from the scraped metri
 - **0 failed actions.** Every action of every build in the load ended with its own exit code, none with a farm-class
   failure. The measure: the builds' event logs, and `kbf_execute_errors_total` delta equal to the number of actions the
   scenario failed on purpose (zero here). Today that counter has no cause label, so a dropped connection cannot be
-  told from a client abort except through `kbf_frontend_relay_lost_total`. **[F]** A failed-actions-by-class counter is a
+  told from a client abort except through `kbf_frontend_relay_untraced`. **[F]** A failed-actions-by-class counter is a
   missing piece (section 12, M10); until it exists the gate is: event logs show zero failed actions **and**
   `kbf_execute_errors_total` delta is zero.
-- **0 builds lost to a handover**: `kbf_frontend_relay_lost_total` delta is 0.
+- **0 builds lost to a handover**: `kbf_frontend_relay_untraced` is 0 at every scrape.
 - **0 lost blobs**: `kbf_cache_lost_blobs` is 0 at every scrape, and the delta of `kbf_cache_blob_losses_total` (a counter
   that never falls) is 0 over the scenario. The gauge alone can fall back to 0 after a loss.
 - **Under-replicated blobs back to 0**: `under_replicated_blobs` is 0 within the settle window after each node step
@@ -342,7 +343,7 @@ Offering is dry-run by default (`--plan`): it prints what would change and which
 The pull updater, the node steps and the frontend handover in the order of `split-mode-updates.md` run on the real farm
 with real builds in flight. The deploy is a test because it is checked as one:
 
-- **No build failed from a dropped connection**: `kbf_frontend_relay_lost_total` delta is 0 over the deploy, and every
+- **No build failed from a dropped connection**: `kbf_frontend_relay_untraced` is 0 at every scrape of the deploy, and every
   build that was in flight at any point of the deploy (the evaluator records the invocation ids at deploy start and at every
   step) finished without a farm-class failure (`failure-classes.md`: a farm problem never reaches the client as an action
   exit code). The invocations record carries the failure class **[F: `crates/kbf-invocation`]**.
@@ -416,7 +417,7 @@ Gates, evaluated continuously (a hard gate failing ends the bake red at once) an
 | no infra-attributed failures | farm-class failed actions (the failed-actions-by-class counter, M10) | 0 over the bake | yes |
 | lost blobs | `kbf_cache_lost_blobs` at every scrape; `kbf_cache_blob_losses_total` delta | gauge 0; delta 0 | yes |
 | under-replicated | `under_replicated_blobs` | 0 at the end and 0 after the post-deploy settle window; above 0 for more than **[P]** 10 minutes outside a node step is a failure | yes |
-| handover losses | `kbf_frontend_relay_lost_total` delta | 0 | yes |
+| handover losses | `kbf_frontend_relay_untraced` at every scrape | 0 | yes |
 | error rate | `kbf_execute_errors_total` / `kbf_execute_requests_total`, excluding client aborts once M11 exists | at most the larger of twice the baseline and the baseline plus **[P]** 0.5 percentage points | yes |
 | latency | `Execute` queue-to-start p99 (`kbf_execute_queued_seconds`, a histogram **[F]**) against the baseline | not above **[P]** 1.5 times the baseline | no, reported; yes if above 3 times |
 | write tier | flush failures, unflushed bytes, corrupt, `kbf_tier_flush_digest_mismatch_total` | no new failures or mismatches | yes |
@@ -538,7 +539,7 @@ does not skip the check: the beta is red ("not run" is not "passed").
 ## 11. Metrics the stages read
 
 Exist **[F]**: `kbf_cache_lost_blobs`, `kbf_cache_blob_losses_total`, `kbf_execute_requests_total`, `kbf_execute_errors_total`,
-`kbf_execute_in_flight`, `kbf_execute_queued_seconds` (histogram), `kbf_frontend_relay_lost_total`, the write-tier series.
+`kbf_execute_in_flight`, `kbf_execute_queued_seconds` (histogram), `kbf_frontend_relay_untraced`, the write-tier series.
 Open pull requests **[open]**: `under_replicated_blobs`, open writes, repair debt, planned-down (#912, #913, #914).
 **[missing]**: failed actions by class (M10), execute errors by cause (M11), a process boot counter and a membership-state
 gauge (M13), a `FindMissingBlobs` latency histogram (M14).

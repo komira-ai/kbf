@@ -81,6 +81,10 @@ pub enum CacheError {
     /// already ([`Cache::open_node`]): two processes would name the same keys.
     #[error(transparent)]
     StaleWriter(#[from] StaleWriter),
+    /// A streamed upload sent no chunk for `--write-pool-stream-idle`, so the write pool
+    /// freed its writer. The client may send the blob again: UNAVAILABLE.
+    #[error("{0}")]
+    Stalled(String),
     /// The cache's own records disagree (a segment read back without a blob just
     /// packed into it, an index entry with no readable range, a log answering with
     /// the wrong outcome). A bug or a broken backend, never the client's fault.
@@ -112,6 +116,7 @@ impl From<CacheError> for Status {
             | CacheError::Unreachable(_)
             | CacheError::Meta(_)
             | CacheError::Store(_)
+            | CacheError::Stalled(_)
             | CacheError::Tier(_) => Status::unavailable(message),
             CacheError::Segment(_)
             | CacheError::Pack(_)
@@ -196,6 +201,12 @@ pub struct Cache<M, O> {
     runtime: Option<tokio::runtime::Handle>,
     /// Which digests this node flushes ([`Cache::with_flush_gate`]); none: all.
     gate: Option<Arc<dyn FlushGate>>,
+    /// How many writers the write pool has and how many blobs may wait for one
+    /// ([`Cache::with_write_pool`]).
+    pool_config: PoolConfig,
+    /// The write pool, started with the first blob a tier takes; `None` inside if it
+    /// cannot run (no runtime).
+    pool: std::sync::OnceLock<Option<WritePool>>,
 }
 
 impl<M, O> Drop for Cache<M, O> {
@@ -255,7 +266,19 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             trees: Arc::new(InputTrees::new(InputTreeConfig::DEFAULT)),
             runtime: tokio::runtime::Handle::try_current().ok(),
             gate: None,
+            pool_config: PoolConfig::DEFAULT,
+            pool: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The same cache, with the write pool sized as `config` says instead of
+    /// [`PoolConfig::DEFAULT`]: the blobs of ByteStream and storage writes are appended to
+    /// the write tier by `config.writers` writers, at most `config.queue` waiting for one.
+    /// Call it before the cache stores anything.
+    #[must_use]
+    pub fn with_write_pool(mut self, config: PoolConfig) -> Self {
+        self.pool_config = config;
+        self
     }
 
     /// The same cache, flushing only the staged objects that hold a digest `gate` says
@@ -540,15 +563,31 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self,
         action: &Digest,
     ) -> Result<Option<(Digest, reapi::ActionResult)>, CacheError> {
+        Ok(self
+            .action_entry(action)
+            .await?
+            .map(|(digest, result, _)| (digest, result)))
+    }
+
+    /// [`Cache::action_result`], and the entry's closure (the blobs it needs besides its
+    /// result blob), read in the same step as the hit so the two agree.
+    ///
+    /// # Errors
+    /// The metadata log or the store is unavailable.
+    pub async fn action_entry(
+        &self,
+        action: &Digest,
+    ) -> Result<Option<(Digest, reapi::ActionResult, Vec<Digest>)>, CacheError> {
         let answer = self
             .touched(|s| match s.action(action) {
-                ActionAnswer::Hit { result, touch } => {
-                    (Ok((result, s.stored_objects(action))), touch)
-                }
+                ActionAnswer::Hit { result, touch } => (
+                    Ok((result, s.stored_objects(action), s.action_closure(action))),
+                    touch,
+                ),
                 ActionAnswer::Miss(miss) => (Err(miss), Touch::default()),
             })
             .await?;
-        let (result, objects) = match answer {
+        let (result, objects, closure) = match answer {
             Ok(hit) => hit,
             Err(miss) => {
                 tracing::debug!(%action, ?miss, "action cache miss");
@@ -565,7 +604,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             Err(e) => return Err(e),
         };
         match reapi::ActionResult::decode(bytes) {
-            Ok(r) => Ok(Some((result, r))),
+            Ok(r) => Ok(Some((result, r, closure))),
             Err(e) => {
                 tracing::warn!(%action, %result, error = %e, "stored ActionResult does not decode");
                 Ok(None)
@@ -756,6 +795,7 @@ mod direct;
 mod evict;
 mod flush;
 mod losses;
+mod pool;
 mod read;
 mod rebuild;
 mod stream;
@@ -775,6 +815,8 @@ pub use flush::{
     FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound,
 };
 pub use losses::Losses;
+use pool::WritePool;
+pub use pool::{BATCH_BLOBS, BATCH_BYTES, BUFFERED_BLOB_BYTES, PoolConfig};
 pub use read::{BlobRead, MAX_DECODED_BLOB_BYTES, READ_WINDOW_BYTES};
 pub use rebuild::{ADOPT_RECORDS, RebuildConfig, RebuildReport};
 pub(crate) use stream::TierRange;

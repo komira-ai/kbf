@@ -15,17 +15,18 @@ publish.workspace = true
 name = "kbf"
 path = "src/main.rs"
 
-# The container driver's stand-in `podman`, which runs each action as a plain process,
-# for tests/storage_and_daemon.rs: the program kbf-all-in-one's tests run, built here
-# because a test can run only its own package's binaries, under a name of its own so a
-# workspace build does not write two binaries to one path. Not shipped.
+# The container driver's stand-in `crun`, which runs each action as a plain process,
+# for tests/all_in_one.rs, tests/storage_and_daemon.rs and tests/rehearsal_in_a_box.rs:
+# the program the driver's own tests run, built here because a test can run only its own
+# package's binaries, under a name of its own so a workspace build does not write two
+# binaries to one path. Not shipped.
 [[bin]]
-name = "kbf-cli-fake-podman"
-path = "../kbf-driver-container/tests/bin/fake_podman.rs"
+name = "kbf-cli-fake-crun"
+path = "../kbf-driver-container/tests/bin/fake_crun.rs"
 test = false
 
 # The stand-in `systemctl` for tests/frontend_handover.rs: `kbf frontend handover` run
-# against it, in Rust like the stand-in `podman` (no shell in test code). Not shipped.
+# against it, in Rust like the stand-in `crun` (no shell in test code). Not shipped.
 [[bin]]
 name = "kbf-cli-fake-systemctl"
 path = "tests/bin/fake_systemctl.rs"
@@ -36,19 +37,24 @@ clap.workspace = true
 kbf-all-in-one.workspace = true
 kbf-node.workspace = true
 kbf-server.workspace = true
-# `kbf node` and `kbf enroll`: the node's side of enrollment, and the types and wire it
-# speaks (src/enroll.rs, src/node.rs).
+# The startup self-checks (src/preflight): the role a certificate names, and a
+# certificate's chain, extended key usage and names, read as the farm's issuer made them.
+kbf-peer.workspace = true
+rustls.workspace = true
+x509-parser.workspace = true
+# The start of the storage, daemon and storage-and-daemon modes enrolls the host: the
+# node's side of enrollment, and the types and wire it speaks (src/enroll.rs, src/node.rs).
 kbf-enroll.workspace = true
 kbf-proto.workspace = true
 kbf-types.workspace = true
 thiserror.workspace = true
-# `kbf.toml` read once more for the roles its tables name (src/enroll.rs).
+# The settings file of every mode (src/config.rs).
 toml.workspace = true
 # The renewal loop beside the running mode (src/node.rs).
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tracing.workspace = true
-# The stand-in `podman`'s (kbf-cli-fake-podman); the effective uid and the host name that
-# `kbf node` and `kbf enroll` read.
+# The stand-in `crun`'s (kbf-cli-fake-crun); the effective uid and the host name that
+# a start that enrolls reads.
 rustix = { workspace = true, features = ["process", "system"] }
 # The schema version of the SQLite state file, which `kbf --version --json` reports.
 kbf-state.workspace = true
@@ -65,12 +71,12 @@ kbf-transfer.workspace = true
 # The protocol the daemon half speaks, which `kbf --version --json` reports as the
 # server's (src/tests.rs pins them equal).
 kbf-daemon.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tonic.workspace = true
-# `kbf storage-and-daemon` running an action (tests/storage_and_daemon.rs): the image
-# store layout the stand-in `podman` reads, the act steps it runs through this test
-# binary, the REAPI messages (the node's certificates are made with rcgen, below).
-kbf-driver-container.workspace = true
+# `kbf storage-and-daemon` running an action (tests/storage_and_daemon.rs): the act steps
+# it runs through this test binary, the REAPI messages (the node's certificates are made
+# with rcgen, below); the image store layout the stand-in `crun` runs over is
+# kbf-driver-container's, under the Linux-only section at the end.
 kbf-testkit.workspace = true
 prost.workspace = true
 # The units `kbf-deploy linux render-units --mode` writes, parsed with kbf's own
@@ -83,11 +89,19 @@ kbf-host.workspace = true
 # (tests/deploy_units.rs), and the node's certificates (tests/storage_and_daemon.rs).
 rcgen = { workspace = true, features = ["x509-parser"] }
 # The in-process frontend of kbf-enroll's tests (tests/node.rs includes it): its
-# certificate authority and the role check of its worker listener.
-kbf-peer.workspace = true
+# certificate authority (the role check of its worker listener is kbf-peer's, above).
 sha2.workspace = true
 time.workspace = true
 x509-parser = { workspace = true, features = ["verify"] }
+# The fake front `kbf daemon` says Hello to on macOS (tests/macos_daemon.rs, which
+# includes kbf-node's tests/front/mod.rs): its async streams and the CAS it serves.
+futures.workspace = true
+kbf-front.workspace = true
+
+# The container driver builds on Linux only, and so does the one test that reads its
+# image store layout; the macOS tests of this package (tests/macos_daemon.rs) build without it.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+kbf-driver-container.workspace = true
 
 [lints]
 workspace = true

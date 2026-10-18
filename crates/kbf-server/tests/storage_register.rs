@@ -310,6 +310,78 @@ async fn a_node_retries_through_failures_and_keeps_its_boot() {
     joiner.abort();
 }
 
+/// A connector that fails its first `failures` dials as a name lookup that found nothing
+/// does (the error a resolver gives before any socket exists), then dials `to`.
+struct Resolving {
+    failures: usize,
+    dials: Arc<std::sync::atomic::AtomicUsize>,
+    to: SocketAddr,
+}
+
+impl tonic::codegen::Service<tonic::codegen::http::Uri> for Resolving {
+    type Response = hyper_util::rt::TokioIo<tokio::net::TcpStream>;
+    type Error = std::io::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<Self::Response>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _: tonic::codegen::http::Uri) -> Self::Future {
+        let dial = self.dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (lookup_fails, to) = (dial < self.failures, self.to);
+        Box::pin(async move {
+            if lookup_fails {
+                return Err(std::io::Error::other(
+                    "dns error: failed to lookup address information: Name or service not known",
+                ));
+            }
+            Ok(hyper_util::rt::TokioIo::new(
+                tokio::net::TcpStream::connect(to).await?,
+            ))
+        })
+    }
+}
+
+/// Catches: a node whose frontend name does not resolve at start (a VPN or overlay
+/// resolver that is not up yet) that ends instead of waiting: the `--frontend` channel is
+/// lazy, so a failed lookup is the first registration's failure, and the join loop must
+/// wait and try again like any other failed registration. The first three dials fail as a
+/// lookup does; the node then registers once, as boot 1, and the lookup was tried four
+/// times. Mutant: [`Joiner::join`] ends (panics) on a failed registration; the node is
+/// never registered and the wait times out.
+#[tokio::test]
+async fn a_frontend_name_that_does_not_resolve_yet_is_retried() {
+    let f = frontend(None);
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let connector = Resolving {
+        failures: 3,
+        dials: Arc::clone(&dials),
+        to: f.worker,
+    };
+    let channel = Endpoint::from_shared("http://frontend.invalid:8981")
+        .expect("endpoint")
+        .connect_with_connector_lazy(connector);
+    let who = NodeIdentity {
+        instance_id: "node-dns".to_owned(),
+        addr: "192.0.2.7:8982".to_owned(),
+        zone: String::new(),
+        weight: 1,
+    };
+    let mut joiner = Joiner::new(channel, who, 5 * MS);
+    let joiner = tokio::spawn(async move { joiner.join().await });
+    until("the node to register", || row(&f, 1)).await;
+    let joined = joiner.await.expect("the join did not end the task");
+    assert_eq!((joined.member_id, joined.boot), (1, 1));
+    assert!(dials.load(std::sync::atomic::Ordering::SeqCst) >= 4);
+    assert_eq!(f.store.fake.scan_prefix("member/").expect("scan").len(), 1);
+}
+
 /// Catches: a rebuilding node that enters the map as anything but CatchingUp, a report of
 /// "still rebuilding" that promotes it, and a report of "done" that does not. A joiner
 /// whose [`CatchUp`] says it is rebuilding registers through the frontend's membership
@@ -863,6 +935,7 @@ fn readable_map() -> pb::Map {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = kbf_map::Map::new(4, vec![member], kbf_map::Rule::Rendezvous, 1, 1, Vec::new())
         .expect("a map");
@@ -1056,6 +1129,7 @@ async fn a_map_that_is_not_newer_changes_nothing() {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = kbf_map::Map::new(4, vec![member], kbf_map::Rule::Rendezvous, 1, 1, Vec::new())
         .expect("a map");
@@ -1131,6 +1205,7 @@ async fn the_node_map_is_the_holders_and_knows_the_member_the_registration_named
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = |generation| {
         kbf_map::Map::new(
@@ -1278,16 +1353,14 @@ async fn a_write_through_the_halfs_in_process_view_is_judged_by_the_map_and_owes
     .await;
 
     // The partner: a member whose address nothing listens on.
-    let gone = {
-        let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        socket.local_addr().expect("address")
-    };
+    let gone = kbf_testkit::port::dead_addr();
     let member = |id, addr: SocketAddr| kbf_map::Member {
         id: MemberId(id),
         addr: addr.to_string(),
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = kbf_map::Map::new(
         1_000,
@@ -1376,6 +1449,7 @@ async fn the_frontends_unowned_copy_is_stored_through_the_real_listener() {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = kbf_map::Map::new(
         1_000,
@@ -1477,6 +1551,7 @@ fn a_map(generation: u64) -> pb::Map {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = kbf_map::Map::new(
         generation,
@@ -1727,11 +1802,44 @@ async fn a_denied_certificate_is_refused_by_a_real_storage_node_when_the_generat
     .collect::<String>();
     let (listed, other) = (channel_of(listed), channel_of(pki.cert("frontend")));
     let digest = kbf_segments::sha256(b"asked of a node that has nothing");
+    // The node's map turns while the test runs (its own promotion out of catching up is a
+    // new generation), so a call made with the generation read just before it can be
+    // answered STALE_MAP. Each ask then reads the generation again and asks again, as a
+    // client that refetches would, a bounded number of times; any other answer is kept.
+    let maps = &maps;
     let ask = |channel: &tonic::transport::Channel| {
-        let remote = RemoteStorage::new(channel.clone(), maps.generation());
-        async move { remote.find_missing(&[digest]).await }
+        let channel = channel.clone();
+        async move {
+            let mut tries = 0;
+            loop {
+                let remote = RemoteStorage::new(channel.clone(), maps.generation());
+                match remote.find_missing(&[digest]).await {
+                    Err(kbf_storage::StorageError::StaleMap { .. }) if tries < 200 => {
+                        tries += 1;
+                        tokio::time::sleep(5 * MS).await;
+                    }
+                    answer => break answer,
+                }
+            }
+        }
     };
-    ask(&listed).await.expect("admitted before the entry");
+    // A node that has just started answers "catching up" while it rebuilds its index
+    // (slow under coverage); only that answer is waited out, until a deadline, then the
+    // test fails with the last answer. Any other refusal fails at once.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match ask(&listed).await {
+            Ok(_) => break,
+            Err(kbf_storage::StorageError::Unavailable(why)) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the node still answers unavailable after 30s: {why:?}"
+                );
+                tokio::time::sleep(5 * MS).await;
+            }
+            Err(other) => panic!("not admitted before the entry: {other:?}"),
+        }
+    }
     ask(&other).await.expect("admitted");
 
     let entry = kbf_map::DenyEntry::SpkiSha256(spki);

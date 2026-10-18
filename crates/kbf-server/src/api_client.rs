@@ -97,6 +97,25 @@ impl OperatorClient {
         self.call("GET", path, None)
     }
 
+    /// `GET path` as a call the operator gate admits: with the bearer and
+    /// `Content-Type: application/json`, which the plain [`OperatorClient::get`] does not
+    /// send. The `/v1/enroll/...` reads need it.
+    ///
+    /// # Errors
+    /// As [`OperatorClient::get`].
+    pub fn get_gated(&self, path: &str) -> Result<Reply, ClientError> {
+        self.call("GET", path, Some(""))
+    }
+
+    /// `DELETE path`, with `Content-Type: application/json` and an empty body: the gate
+    /// wants the content type of every write, a body or not.
+    ///
+    /// # Errors
+    /// As [`OperatorClient::get`].
+    pub fn delete(&self, path: &str) -> Result<Reply, ClientError> {
+        self.call("DELETE", path, Some(""))
+    }
+
     /// `POST path` with `body` (empty for none), sent as JSON.
     ///
     /// # Errors
@@ -233,10 +252,7 @@ mod tests {
             .expect_err("garbage");
         assert!(matches!(err, ClientError::Malformed { .. }), "{err:?}");
 
-        let gone = {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-            listener.local_addr().expect("addr")
-        };
+        let gone = kbf_testkit::port::dead_addr();
         let err = OperatorClient::new(gone, None)
             .get("/")
             .expect_err("nothing there");

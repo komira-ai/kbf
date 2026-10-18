@@ -64,21 +64,40 @@ kbf-mac-provision revert                                # root: put back the rec
   erase or a restore is the remedy for macOS and for simulator runtimes; FileVault and
   the administrator are the operator's.
 - The node label is `profile=<profile>@<first 12 hex digits of the profile's SHA-256>`,
-  passed to `kbf node` as a `--label`.
+  passed to `kbf --mode=daemon` as a `--label`.
 - `--keys` limits `check` and `apply` to the named items. `--root DIR` runs everything
   under DIR; only the tests use it.
-- The job runs `/usr/local/kbf/current/kbf node --config /usr/local/etc/kbf/kbf.toml`
-  with the node label and the profile's labels. `kbf node` enrolls with the frontend that
-  file names and runs the daemon with the certificates the frontend issued, so the
-  profile's `kbf_server`, `kbf_cas`, `kbf_ca_cert`, `kbf_cert` and `kbf_key` are not
-  arguments of the job any more (the profile still requires them, and `kbf_key` is still
-  the file the `daemon_user=root` check reads, until a later change retires them), and
-  neither is the node id. The operator writes `kbf.toml` and delivers the token; this tool
-  writes neither.
+- The job runs `/usr/local/kbf-installer/releases/current/kbf --mode=daemon --config /usr/local/etc/kbf/kbf.toml`
+  and nothing after `--config`: `kbf.toml` is the one source of the daemon's settings. The
+  `launchd_label` item renders it from the profile at that path (root's, mode 644, in a
+  root's 755 directory, so the daemon account reads it and cannot replace it), and checks and
+  fixes it beside the property list: `check` fails when the file is missing, differs from
+  what the profile renders, or has another owner or mode; `apply` writes it, then the
+  property list, then restarts the job. The file is not in `revert`'s record, which holds
+  the power and update settings only, and `revert` leaves it (as it leaves the property
+  list). The node label and the profile's labels are the `label` key. The file holds only
+  flag tables and `mode`, so `kbf` runs the daemon on those flags (a file with `[enroll]`,
+  `[frontend]` or `[node]` tables is the enrolling start instead; this tool writes none).
+  Each profile key goes to the table kbf-cli's `GROUPS` puts its flag in:
+
+  | Flag `kbf --mode=daemon` took | Profile key | `kbf.toml` table | Key |
+  |---|---|---|---|
+  | (the mode) | | top level | `mode = "daemon"` |
+  | `--driver native` | | `[daemon]` | `driver = ["native"]` |
+  | `--server` | `kbf_server` | `[identity]` | `server` |
+  | `--cas` | `kbf_cas` | `[identity]` | `cas` |
+  | `--ca-cert` | `kbf_ca_cert` | `[identity]` | `ca-cert` |
+  | `--cert` | `kbf_cert` | `[identity]` | `cert` |
+  | `--key` | `kbf_key` | `[identity]` | `key` |
+  | `--node-id` | `hostname` | `[identity]` | `node-id` |
+  | `--data-dir` | `kbf_data_dir` | `[daemon]` | `data-dir` |
+  | `--label` (the node label, then each of `kbf_labels`) | `kbf_labels` | `[identity]` | `label = [...]` |
+
+  The profile has no size key, so `--data-max-bytes` (`[daemon]`, `data-max-bytes`) is not
+  rendered; the daemon sizes the data directory from the filesystem.
 - `kbf_data_dir` is the daemon's data directory (it keeps `leases/`, `cache/` and `trees/`
   under it; the profile has no size key, so the daemon sizes the directory from the
-  filesystem). This tool checks the directory; the daemon is given it by `kbf.toml`'s
-  `[daemon] data_dir`, which must say the same. The old name `kbf_scratch` is still
+  filesystem). It is the `data-dir` key of `kbf.toml`. The old name `kbf_scratch` is still
   accepted, as `kbf_data_dir`, with one warning line on stderr; a profile that sets both
   keys is refused.
 - An example profile, with placeholder values, is [example.profile](example.profile).
@@ -97,6 +116,7 @@ letters and `_` only.
 | `role_user` (`role_id`) | `_name`, id 200-499 | `dscl`: user and group with that id, shell `/usr/bin/false`, home `/var/empty`, hidden, no password (`Password` is `*` and there is no `AuthenticationAuthority`); no other user and no other group holds the id | `dscl . -create`, and `-delete` of `AuthenticationAuthority` (refused if the id is taken) |
 | `power_sleep`, `power_standby`, `power_powernap`, `power_autorestart`, `power_womp` | numbers | `pmset -g` | `pmset -a` |
 | `updates_auto_download`, `updates_auto_install_macos`, `updates_auto_install_security`, `updates_config_data`, `appstore_auto_update` | 0 or 1 | `defaults read /Library/Preferences/com.apple.SoftwareUpdate` `AutomaticDownload`, `AutomaticallyInstallMacOSUpdates`, `CriticalUpdateInstall`, `ConfigDataInstall`, `AutomaticallyInstallAppUpdates` | `defaults write ... -bool`. **Verify on the pinned version:** the SoftwareUpdate payload is removed in macOS 27, and whether these local preferences are still honoured is not known; every line says so |
+| `xcode_disable_manifest_sandbox` (optional) | 0 or 1 | `defaults read /Library/Preferences/com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox`; left out, the item passes as "not managed" | `defaults write ... -bool`. It is not in the revert record. `xcodebuild` resolving a Swift package runs each manifest under SwiftPM's own `sandbox-exec`, which macOS refuses inside the native driver's sandbox (`sandbox_apply: Operation not permitted`); `xcodebuild` takes the switch only as a user default, and this system-domain value is read by every user after their own. `swift build` has `--disable-sandbox` instead. Unverified until a macOS runner shows `xcodebuild` honouring the system domain |
 | `remote_login` | 0 or 1 | `systemsetup -getremotelogin` | `systemsetup -f -setremotelogin` |
 | `ssh_password_auth` | 0 or 1 | `/etc/ssh/sshd_config.d/000-kbf.conf` holds `PasswordAuthentication`, `KbdInteractiveAuthentication` and `PermitRootLogin no`, root-owned, mode 644; `sshd_config` includes the directory. What sshd uses: no file in `sshd_config.d` sorts before the drop-in, `sshd_config` sets none of `PasswordAuthentication`, `KbdInteractiveAuthentication`, `ChallengeResponseAuthentication`, `PermitRootLogin` before its `Include` line, and, as root, `sshd -T` reports the drop-in's three values (as another user the line says `sshd -T` was not run) | writes the drop-in (`000-` sorts first, and sshd keeps the first value it reads). It never removes an earlier drop-in or edits `sshd_config`: those stay FAIL for the operator |
 | `firewall` | on, off | `socketfilterfw --getglobalstate` | `socketfilterfw --setglobalstate` |
@@ -108,7 +128,7 @@ letters and `_` only.
 | `default_developer_dir` | a pinned Xcode's path | `xcode-select -p` | `xcode-select -s` |
 | `probe` (`expect_probe`) | `KEY:/PATH:SHA256`; `KEY:XCODE_BUILD=VALUE` | each probe script's SHA-256 | check only. `expect_probe` lines are validated (a known probe, a pinned Xcode, once each) and printed |
 | `simulator_runtimes` | none | `/Library/Developer/CoreSimulator`: `Images/*.dmg`, `Profiles/Runtimes/*.simruntime`, `Volumes/*` | check only: runtimes live in VM images |
-| `launchd_label` (`kbf_labels`, `role_user`, and the profile's own SHA-256 in the node label) | label | `/Library/LaunchDaemons/<label>.plist` equals the one the profile renders (section 5.3: `UserName`/`GroupName` the role account, `ProcessType` `Interactive`, `ExitTimeOut` 30, `kbf node --config` and the labels), root-owned, mode 644; `/Library/Logs/kbf` root's, mode 755; the error log in it a regular file with one link, the role account's, mode 644; the job loaded | makes the directory root's, replaces anything else at the error log's path (unlinked, never followed) with a new file of the role account, writes the plist, then restarts the job: `launchctl bootout`, the error log truncated while it is stopped, `launchctl bootstrap`. `restart` refuses, before it stops anything, when the error log is not such a file, so a link the role account plants is never emptied as root |
+| `launchd_label` (`kbf_labels`, `role_user`, and the profile's own SHA-256 in the node label) | label | `/usr/local/etc/kbf/kbf.toml` equals the one the profile renders, root-owned, mode 644, in a root's 755 directory; `/Library/LaunchDaemons/<label>.plist` equals the one the profile renders (section 5.3: `UserName`/`GroupName` the role account, `ProcessType` `Interactive`, `ExitTimeOut` 30, `kbf --mode=daemon --config <kbf.toml>` and nothing else), root-owned, mode 644; `/Library/Logs/kbf` root's, mode 755; the error log in it a regular file with one link, the role account's, mode 644; the job loaded | writes `kbf.toml` (and its directory, root's, mode 755), makes the log directory root's, replaces anything else at the error log's path (unlinked, never followed) with a new file of the role account, writes the plist, then restarts the job: `launchctl bootout`, the error log truncated while it is stopped, `launchctl bootstrap`. `restart` refuses, before it stops anything, when the error log is not such a file, so a link the role account plants is never emptied as root |
 
 ## Tests
 
