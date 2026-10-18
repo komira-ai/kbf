@@ -86,7 +86,15 @@ from (`kbf` through the server library it links), and `--version` prints `<binar
 checks that `kbf-server`'s `--version` names `GITHUB_SHA` (`cargo xtask build-commit
 check`), and that `kbf`'s does too and that `kbf --version --json` (below) names the
 same commit and a release build (`build-commit check --json`); the macOS job makes
-the second check on the signed `kbf`, the bytes it packages. `KBF_BUILD_COMMIT_OVERRIDE` replaces the
+the second check on the signed `kbf`, the bytes it packages. Those checks run on the
+binary before it is packaged. After packaging, every job opens the `kbf` tarball it
+wrote and makes the second check again on the binary inside it, with `cargo xtask
+build-commit check-asset <tarball> "$GITHUB_SHA"`: the binary's name and the commit are
+read from the tarball's file name (`<name>-<commit>-<platform>.tar.gz`, and the commit
+must be `GITHUB_SHA`), the tarball must be the one entry `package` writes, and the
+`kbf` extracted from it (to a directory under `target/` that the check removes) must
+pass `check --json`. So the bytes that ship, not only the bytes that were built, name
+the commit. `KBF_BUILD_COMMIT_OVERRIDE` replaces the
 commit in a build, for CI tests that need two stamps from one checkout; a build that
 set it here would fail that check.
 
