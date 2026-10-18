@@ -62,8 +62,9 @@ pub const STATE_FILE: &str = "state.json";
 pub const STATE_BACKUP: &str = "state.json.bak";
 
 /// The names inside a release directory: its binaries, its systemd units and the
-/// manifest that lists them. A Linux release holds `kbf`; a macOS release holds
-/// `kbf-daemon` (the LaunchDaemon runs `current/kbf-daemon`).
+/// manifest that lists them. Both platforms' releases hold `kbf`; it is the only binary
+/// a macOS release holds (the LaunchDaemon runs `current/kbf daemon`). A Linux release
+/// may also hold `kbf-daemon`, the separate daemon binary only Linux is built with.
 pub const RELEASE_BINARY: &str = "kbf";
 pub const RELEASE_DAEMON: &str = "kbf-daemon";
 pub const RELEASE_UNITS: &str = "units";

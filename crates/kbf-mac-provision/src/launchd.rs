@@ -1,5 +1,5 @@
-//! The LaunchDaemon that runs `kbf node` (docs/design/mac-node-provisioning.md,
-//! section 5.3; docs/design/install-and-enrollment.md, section 4.4): its property list,
+//! The LaunchDaemon that runs `kbf daemon` (docs/design/mac-node-provisioning.md,
+//! section 5.3): its property list,
 //! rendered from the profile; the check that the
 //! installed one is that file, root's, with a safe error log and the job loaded; the
 //! fix that makes it so; and the restart.
@@ -19,10 +19,6 @@ use crate::profile::{DaemonUser, Profile};
 
 const LAUNCHCTL: &str = "/bin/launchctl";
 pub const KBF_BIN: &str = "/usr/local/kbf-installer/releases/current/kbf";
-/// The node's config file, where the macOS package puts it (`kbf node`'s default
-/// `--config` on macOS): the frontend's URL, the node id and the directories. The
-/// operator writes it; this tool does not.
-pub const NODE_CONFIG: &str = "/usr/local/etc/kbf/kbf.toml";
 pub const LOG_DIR: &str = "/Library/Logs/kbf";
 pub const ERR_LOG: &str = "/Library/Logs/kbf/kbf-daemon.err.log";
 const ROOT_FILE: &str = "-rw-r--r-- 0 0";
@@ -35,15 +31,35 @@ pub fn plist_path(profile: &Profile) -> String {
     format!("{LAUNCH_DAEMONS}/{}.plist", profile.get("launchd_label"))
 }
 
-/// `kbf node`'s arguments: the config file and the node label and the profile's labels.
-/// The server, the certificates, the node id and the directories are not arguments: the
-/// node reads its config file, enrolls with the frontend it names and runs the daemon with
-/// the certificates the frontend issued it.
+/// `kbf daemon`'s arguments, in the order and shape of the Mac kit's plist: the native
+/// driver, the server, its certificates, the node id (the host name), the data directory,
+/// the node label and the profile's labels, one word per argument. The CLI's `--mode=daemon` flag replaces
+/// the `daemon` word when it lands.
 pub fn daemon_args(profile: &Profile) -> Vec<String> {
-    let mut args: Vec<String> = [KBF_BIN, "node", "--config", NODE_CONFIG, "--label"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    let mut args: Vec<String> = [
+        KBF_BIN,
+        "daemon",
+        "--driver",
+        "native",
+        "--server",
+        profile.get("kbf_server"),
+        "--cas",
+        profile.get("kbf_cas"),
+        "--ca-cert",
+        profile.get("kbf_ca_cert"),
+        "--cert",
+        profile.get("kbf_cert"),
+        "--key",
+        profile.get("kbf_key"),
+        "--node-id",
+        profile.get("hostname"),
+        "--data-dir",
+        profile.get("kbf_data_dir"),
+        "--label",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
     args.push(profile.node_label());
     for label in &profile.labels {
         args.push("--label".into());
