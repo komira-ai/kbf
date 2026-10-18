@@ -265,16 +265,23 @@ async fn a_flag_the_mode_refuses_exits_2_with_its_message() {
 }
 
 /// Catches a start that, once enrolled, goes on to run the mode without the host checks (a
-/// daemon on a host with no `podman` would start and fail every lease), or whose checks
+/// daemon on a host with no `crun` would start and fail every lease), or whose checks
 /// are not the mode's: enrolled with the frontend, a daemon whose host has an empty `PATH`
-/// is refused by the startup self-check, exit 2 with `podman is not on PATH` on stderr,
+/// is refused by the startup self-check, exit 2 with `(--oci-runtime) does not exist` on stderr,
 /// and the node's files were made all the same.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_enrolled_start_runs_the_host_checks_before_the_mode() {
     let run = fake::start();
     let root = scratch("process-host-checks");
-    let path = config(&root, run.enroll_addr.port(), "");
+    // The runtime is a path now, not a PATH lookup: name one that is not there, so the test
+    // does not depend on whether this host has /usr/bin/crun.
+    let missing = root.join("no-programs/crun");
+    let path = config(
+        &root,
+        run.enroll_addr.port(),
+        &format!("[containers]\noci-runtime = \"{}\"\n", missing.display()),
+    );
     token(&root, &run.fake.mint(1, 1).to_line());
     let empty = root.join("no-programs");
     std::fs::create_dir_all(&empty).expect("empty PATH dir");
@@ -283,7 +290,7 @@ async fn an_enrolled_start_runs_the_host_checks_before_the_mode() {
 
     assert_eq!(out.code, Some(2), "{}", out.stderr);
     assert!(
-        out.stderr.contains("podman is not on PATH"),
+        out.stderr.contains("(--oci-runtime) does not exist"),
         "{}",
         out.stderr
     );
