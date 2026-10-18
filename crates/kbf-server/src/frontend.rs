@@ -180,7 +180,7 @@ const CHECK: [&str; 3] = [
 ];
 
 /// The defaults of the timings: the quiesce wait and follow interval, the watchdog, and
-/// Envoy's check (the box render's: `kbf-deploy envoy render --topology box`).
+/// Envoy's check (the installer's box render).
 const QUIESCE_SECS: &str = "10";
 const FOLLOW_INTERVAL_MS: &str = "200";
 const WATCHDOG_SECS: &str = "15";
