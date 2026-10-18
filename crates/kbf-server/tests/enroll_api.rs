@@ -78,7 +78,7 @@ async fn the_client_reaches_every_route_through_the_gate() {
         let listed = client.get_gated(TOKENS).expect("list");
         assert_eq!(listed.status, 200, "{}", listed.body);
         let listed: TokenList = serde_json::from_str(&listed.body).expect("a list");
-        assert_eq!(listed.tokens, [created.info.clone()]);
+        assert_eq!(listed.tokens, std::slice::from_ref(&created.info));
         assert!(!listed.tokens[0].id.is_empty());
 
         for path in [TOKENS, NODES] {
