@@ -300,6 +300,13 @@ async fn every_call_is_judged_by_the_generation_the_caller_names() {
         .await
         .expect("commit");
     assert!(current.action_result(&action).await.expect("get").is_some());
+    // The in-process caller gets the closure too, not an entry "unchecked".
+    let entry = current
+        .action_entry(&action)
+        .await
+        .expect("get")
+        .expect("an entry");
+    assert!(entry.closure.is_some(), "the closure is reported");
     assert!(current.stream(8).is_none());
 }
 

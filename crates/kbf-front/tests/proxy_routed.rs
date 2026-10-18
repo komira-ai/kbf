@@ -36,6 +36,7 @@ fn map(states: [MemberState; 3]) -> Arc<Map> {
             zone: String::new(),
             weight: 1,
             state: *state,
+            boot: 0,
         })
         .collect();
     Arc::new(Map::new(GENERATION, members, Rule::Rendezvous, 2, 1, Vec::new()).expect("a map"))

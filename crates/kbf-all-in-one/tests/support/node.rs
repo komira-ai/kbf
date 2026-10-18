@@ -12,7 +12,7 @@ use std::process::Child;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair, SanType};
+use rcgen::{CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair, SanType};
 
 // The stand-in `podman`, the planted cgroup tree and id files, the disk scan and the large
 // input live in kbf-harness, which the rehearsal farm uses too.
@@ -24,10 +24,13 @@ pub(crate) use kbf_harness::node_support::{
 /// How long the test waits for what should happen promptly.
 pub(crate) const PROMPT: Duration = Duration::from_secs(60);
 
-/// A CA, the node's certificate (`node-1`, its one DNS name, and the daemon role its
-/// worker session needs on the worker listener), the server's (`localhost`), and a
-/// storage client's (`client.pem`, naming the role `frontend` as a storage listener
-/// under mutual TLS requires), written into `dir`.
+/// A CA, the node's certificate (`node-1`, its one DNS name, the daemon role its worker
+/// session needs on the worker listener, and clientAuth, the daemon row of the farm's
+/// table), the server's (`localhost`: role `storage` and both key usages, the storage row,
+/// which is also what the in-process scheduler presents as a TLS server), and a storage
+/// client's (`client.pem`, naming the role `frontend` as a storage listener under mutual
+/// TLS requires), written into `dir`; every key private to this user, as `kbf`'s startup
+/// self-checks want them.
 pub(crate) fn pki(dir: &Path) {
     let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -36,15 +39,31 @@ pub(crate) fn pki(dir: &Path) {
     for (name, dns) in [("node", "node-1"), ("server", "localhost")] {
         let key = KeyPair::generate().expect("key");
         let mut params = CertificateParams::new(vec![dns.to_owned()]).expect("params");
-        if name == "node" {
-            let role = format!("{}daemon", kbf_storage::service::ROLE_URI_PREFIX);
-            params
-                .subject_alt_names
-                .push(SanType::URI(role.try_into().expect("IA5")));
-        }
+        let (role, ekus) = if name == "node" {
+            ("daemon", vec![ExtendedKeyUsagePurpose::ClientAuth])
+        } else {
+            (
+                "storage",
+                vec![
+                    ExtendedKeyUsagePurpose::ServerAuth,
+                    ExtendedKeyUsagePurpose::ClientAuth,
+                ],
+            )
+        };
+        let role = format!("{}{role}", kbf_storage::service::ROLE_URI_PREFIX);
+        params
+            .subject_alt_names
+            .push(SanType::URI(role.try_into().expect("IA5")));
+        params.extended_key_usages = ekus;
         let cert = params.signed_by(&key, &ca).expect("sign");
         std::fs::write(dir.join(format!("{name}.pem")), cert.pem()).expect("write");
-        std::fs::write(dir.join(format!("{name}.key")), key.serialize_pem()).expect("write");
+        let key_path = dir.join(format!("{name}.key"));
+        std::fs::write(&key_path, key.serialize_pem()).expect("write");
+        std::fs::set_permissions(
+            &key_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .expect("mode");
     }
     let mut client = CertificateParams::new(Vec::<String>::new()).expect("params");
     let role = format!("{}frontend", kbf_storage::service::ROLE_URI_PREFIX);

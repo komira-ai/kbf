@@ -4,6 +4,7 @@
 //! what the successor writes to the state store ([`Farm::follow`]), and keeps an
 //! operator's cordons across the change.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -11,16 +12,18 @@ use kbf_front::{Handed, Stage};
 use kbf_sched::{Event, Input};
 use kbf_types::{Answer, Digest, FarmTime, OperationId, StateMachine as _, WaiterId, WorkerId};
 use tokio::sync::watch;
-use tonic::{Code, Status};
+use tonic::Status;
 
 use super::durable::{Durable, Progress, StateError, StoredCordon};
-use super::{Farm, NodeAction, State, failed, unix_ms};
+use super::{Farm, NodeAction, State, unix_ms};
 
 /// How many looks in a row at the state store may find an operation neither unfinished
-/// nor ended before its callers are told the result is lost. A writer ends an operation
-/// in two transactions, the second moments after the first, so one look can fall between
-/// them; a successor that died between them leaves the operation like that for good.
-pub const LOST_LOOKS: u8 = 3;
+/// nor ended before it is reported as untraced (a WARN, and `kbf_frontend_relay_untraced`).
+/// A writer ends an operation in two transactions, the second moments after the first, so
+/// one look can fall between them; a successor that died between them leaves the
+/// operation like that for good. Only a report: an untraced operation's callers are not
+/// answered, they keep waiting (see [`Farm::follow`]).
+pub const UNTRACED_LOOKS: u32 = 2;
 
 /// Why a request that raced the handover is refused (UNAVAILABLE: Buck2 asks again, and
 /// the successor answers).
@@ -28,9 +31,6 @@ const HANDING_OVER: &str = "this frontend is handing its work to its successor";
 
 /// How often [`Farm::flush_unsettled`] writes again what the state store refused.
 const FLUSH_LOOK: Duration = Duration::from_millis(10);
-
-/// What the callers of an operation the successor lost are told.
-const LOST: &str = "the result of the action was lost in a frontend handover";
 
 /// One `Result` being taken, counted until dropped.
 pub(super) struct Taking<'a>(&'a AtomicUsize);
@@ -136,16 +136,28 @@ impl Farm {
 
     /// Answers, from the state store, the callers this fenced farm still holds: an
     /// operation the successor finished gets its result from the `done/` row, one it has
-    /// leased is shown executing, and one the store has no trace of for [`LOST_LOOKS`]
-    /// looks in a row is answered UNAVAILABLE (never left to wait for ever). Call it
-    /// every so often; returns how many callers are still waiting.
+    /// leased is shown executing. A caller waits until its operation finishes, it cancels
+    /// (its stream is dropped), or this process is killed: no look count or timer ends
+    /// it. An operation the store has no trace of keeps its callers waiting; it is
+    /// reported ([`UNTRACED_LOOKS`], `kbf_frontend_relay_untraced`) so an operator sees
+    /// it. Call it every so often; returns how many callers are still waiting.
     ///
     /// # Errors
     /// The state store cannot be read.
     pub fn follow(&self) -> Result<usize, StateError> {
-        let (waiting, lost) = self.lock().follow()?;
-        self.cache.metrics().frontend_relay_lost.add(lost as u64);
+        let waiting = self.lock().follow()?;
+        self.report_untraced();
         Ok(waiting)
+    }
+
+    /// Sets `kbf_frontend_relay_untraced` to the operations the last looks found no trace
+    /// of.
+    fn report_untraced(&self) {
+        let untraced = self.lock().untraced();
+        self.cache
+            .metrics()
+            .frontend_relay_untraced
+            .set(untraced as u64);
     }
 }
 
@@ -195,28 +207,34 @@ impl State {
     ///
     /// # Errors
     /// UNAVAILABLE if the farm is fenced or the store did not take it.
-    pub(super) fn admit(&self, request: &kbf_sched::Request) -> Result<(), Status> {
+    pub(super) fn admit(
+        &self,
+        request: &kbf_sched::Request,
+        subject: &crate::action_usage::Subject,
+    ) -> Result<(), Status> {
         if self.fenced {
             return Err(Status::unavailable(HANDING_OVER));
         }
-        self.queue(request)
+        self.queue(request, subject)
     }
 
-    /// The callers of `operation` that have not been answered.
+    /// The callers of `operation` still waiting: not answered, and with a stream open
+    /// (a caller that cancelled has dropped its end of the channel).
     fn callers_waiting(&self, operation: OperationId) -> Vec<WaiterId> {
-        let unanswered = |caller: &WaiterId| {
+        let waiting = |caller: &WaiterId| {
             let stage = self.stages.get(caller);
-            stage.is_some_and(|stage| !matches!(*stage.borrow(), Stage::Done(_)))
+            stage.is_some_and(|stage| {
+                !stage.is_closed() && !matches!(*stage.borrow(), Stage::Done(_))
+            })
         };
         let callers = self.sched.waiters(operation).unwrap_or_default();
-        callers.iter().copied().filter(unanswered).collect()
+        callers.iter().copied().filter(waiting).collect()
     }
 
-    /// [`Farm::follow`] under the lock: how many callers still wait, and how many of the
-    /// ones answered this time were told their result is lost.
-    pub(super) fn follow(&mut self) -> Result<(usize, usize), StateError> {
+    /// [`Farm::follow`] under the lock: how many callers still wait.
+    pub(super) fn follow(&mut self) -> Result<usize, StateError> {
         let Some(durable) = &self.durable else {
-            return Ok((0, 0));
+            return Ok(0);
         };
         let mut looked = Vec::new();
         for operation in self.sched.unfinished() {
@@ -225,32 +243,30 @@ impl State {
                 looked.push((operation, callers, durable.progress(operation)?));
             }
         }
-        let (mut waiting, mut lost) = (0, 0);
+        // An operation nobody waits on any more (its callers cancelled) has nothing to
+        // report.
+        self.untraced_kept
+            .retain(|operation, _| looked.iter().any(|(looked, ..)| looked == operation));
+        let mut waiting = 0;
         for (operation, callers, progress) in looked {
-            let (stage, gone_for_good) = self.looked_at(operation, progress);
+            let stage = note(&mut self.untraced_kept, operation, &progress);
             let ended = matches!(stage, Some(Stage::Done(_)));
             waiting += callers.len() * usize::from(!ended);
-            lost += callers.len() * usize::from(ended) * usize::from(gone_for_good);
             if let Some(stage) = stage {
                 for channel in callers.iter().filter_map(|caller| self.stages.get(caller)) {
                     show(channel, stage.clone());
                 }
             }
         }
-        if lost > 0 {
-            tracing::warn!(lost, "operations the successor lost: answered UNAVAILABLE");
-        }
-        Ok((waiting, lost))
+        Ok(waiting)
     }
 
-    /// One look at `operation`: what its callers are shown now (`None` leaves them as they
-    /// are), and whether the store has had no trace of it for [`LOST_LOOKS`] looks in a
-    /// row. The count is the operation's: a look that finds it starts it over.
-    fn looked_at(&mut self, operation: OperationId, progress: Progress) -> (Option<Stage>, bool) {
-        let looks = self.looks.entry(operation).or_default();
-        *looks = looks.saturating_add(1) * u8::from(progress.is_gone());
-        let gone_for_good = *looks >= LOST_LOOKS;
-        (progress.stage(gone_for_good), gone_for_good)
+    /// How many operations the last looks found no trace of, [`UNTRACED_LOOKS`] times in
+    /// a row, among the ones this farm's callers wait on and the ones relays follow.
+    pub(super) fn untraced(&self) -> usize {
+        let reported = |looks: &&u32| **looks >= UNTRACED_LOOKS;
+        let kept = self.untraced_kept.values().filter(reported).count();
+        kept + self.untraced_relayed.values().filter(reported).count()
     }
 
     /// Takes up the cordons of the nodes an operator placed before this process started,
@@ -275,15 +291,35 @@ impl State {
 
 impl Progress {
     /// What the callers of an operation at this point are shown: `None` leaves them as
-    /// they are. `lost` is whether the store has had no trace of it for good.
-    fn stage(self, lost: bool) -> Option<Stage> {
+    /// they are (queued, or no trace: they wait).
+    fn stage(&self) -> Option<Stage> {
         match self {
-            Self::Ended(finished) => Some(Stage::Done(finished)),
+            Self::Ended(finished) => Some(Stage::Done(finished.clone())),
             Self::Running => Some(Stage::Executing),
-            Self::Queued => None,
-            Self::Gone => lost.then(|| Stage::Done(failed(Code::Unavailable, LOST))),
+            Self::Queued | Self::Gone => None,
         }
     }
+}
+
+/// One look at `operation`, whose callers wait: what they are shown now (`None` leaves
+/// them as they are). An operation the store has no trace of is shown nothing: it is
+/// counted in `untraced`, reported once it has been untraced for [`UNTRACED_LOOKS`] looks
+/// in a row, and its callers go on waiting. A look that finds it starts the count over.
+fn note(
+    untraced: &mut BTreeMap<OperationId, u32>,
+    operation: OperationId,
+    progress: &Progress,
+) -> Option<Stage> {
+    if progress.is_gone() {
+        let looks = untraced.entry(operation).or_default();
+        *looks = looks.saturating_add(1);
+        if *looks == UNTRACED_LOOKS {
+            tracing::warn!(%operation, "no trace in the state store: callers keep waiting");
+        }
+    } else {
+        untraced.remove(&operation);
+    }
+    progress.stage()
 }
 
 /// Shows `stage` on `channel`, waking its watchers only if it changed.
@@ -323,8 +359,8 @@ impl Handed for Farm {
     }
 
     /// The follower ([`Farm::follow`]) for one operation this farm's scheduler never
-    /// held: the same looks, the same three-look rule for an operation the store has no
-    /// trace of, counted in `kbf_frontend_relay_lost_total` when it is answered lost.
+    /// held: the same looks, and the same rule for an operation the store has no trace of
+    /// (nothing is shown, it is reported, the call keeps waiting).
     fn look(&self, operation: OperationId) -> Result<Option<Stage>, String> {
         let mut state = self.lock();
         let Some(durable) = &state.durable else {
@@ -333,12 +369,14 @@ impl Handed for Farm {
         let progress = durable
             .progress(operation)
             .map_err(|error| error.to_string())?;
-        let (stage, lost) = state.looked_at(operation, progress);
+        let stage = note(&mut state.untraced_relayed, operation, &progress);
         drop(state);
-        self.cache
-            .metrics()
-            .frontend_relay_lost
-            .add(u64::from(lost));
+        self.report_untraced();
         Ok(stage)
+    }
+
+    fn release(&self, operation: OperationId) {
+        self.lock().untraced_relayed.remove(&operation);
+        self.report_untraced();
     }
 }

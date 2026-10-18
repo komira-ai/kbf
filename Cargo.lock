@@ -1399,6 +1399,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-ca"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "kbf-map",
+ "kbf-peer",
+ "kbf-proto",
+ "kbf-types",
+ "rcgen",
+ "ring",
+ "rustix",
+ "rustls",
+ "sha2 0.11.0",
+ "thiserror",
+ "time",
+ "x509-parser",
+]
+
+[[package]]
 name = "kbf-caps"
 version = "0.1.0"
 dependencies = [
@@ -1431,12 +1450,14 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
+ "futures",
  "kbf-all-in-one",
  "kbf-cas-conformance",
  "kbf-daemon",
  "kbf-deploy",
  "kbf-driver-container",
  "kbf-enroll",
+ "kbf-front",
  "kbf-harness",
  "kbf-host",
  "kbf-node",
@@ -1451,6 +1472,7 @@ dependencies = [
  "prost",
  "rcgen",
  "rustix",
+ "rustls",
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
@@ -1620,6 +1642,19 @@ dependencies = [
  "tracing",
  "x509-parser",
  "zeroize",
+]
+
+[[package]]
+name = "kbf-enroll-registry"
+version = "0.1.0"
+dependencies = [
+ "kbf-map",
+ "kbf-state",
+ "kbf-types",
+ "prost",
+ "sha2 0.11.0",
+ "subtle",
+ "thiserror",
 ]
 
 [[package]]
@@ -2035,6 +2070,7 @@ dependencies = [
  "hex",
  "kbf-auth",
  "kbf-caps",
+ "kbf-enroll-registry",
  "kbf-front",
  "kbf-history",
  "kbf-invocation",
@@ -2224,6 +2260,8 @@ dependencies = [
 name = "kbf-types"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

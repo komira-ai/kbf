@@ -31,9 +31,12 @@
 //!   sent GOAWAY, open streams run until their action is done, and the server exits
 //!   when they have. It is not undone: a drained frontend is restarted.
 //!
-//! Reads answer anyone who reaches the listener. A write must pass every gate of
-//! [`write_request`], because a loopback peer is not an operator: every server host is
-//! also a worker whose build actions can reach loopback, a reverse proxy on the host
+//! - `/v1/enroll/...`: the enrollment tokens and the node registry ([`crate::enroll::api`]).
+//!   Every one of these routes, a GET included, passes the gates below.
+//!
+//! Reads answer anyone who reaches the listener, except the enrollment routes. A write
+//! must pass every gate of [`write_request`], because a loopback peer is not an operator:
+//! every server host is also a worker whose build actions can reach loopback, a reverse proxy on the host
 //! makes remote callers loopback, and a browser on the host can POST to it from any
 //! page. The gates: a loopback peer, no `Origin` header (no browser page), the bearer
 //! token of `--api-token-file` ([`ApiToken`]; without one, writes are off), and a JSON
@@ -55,6 +58,7 @@ use kbf_types::WorkerId;
 use serde::{Deserialize, Serialize};
 
 use crate::drain::{Drain, DrainStatus};
+use crate::enroll::api::EnrollApi;
 use crate::farm::{Farm, NodeAction};
 use crate::members::{Members, MembershipError};
 use crate::token::ApiToken;
@@ -109,7 +113,9 @@ struct ApiState {
 /// The API's routes over `farm`; writes need `token`, and without one are refused.
 /// `drain` is what `POST /v1/frontend/drain` begins; `members` is what
 /// `GET /v1/members` reads and `POST /v1/members/{id}` changes (the same value the
-/// `Membership` service registers into).
+/// `Membership` service registers into). `enroll` is what the `/v1/enroll/...` routes
+/// call ([`crate::enroll::api`]); `None` when this server has no enrollment, which those
+/// routes answer, behind the gate, with 404.
 /// Writes read the peer address from
 /// [`ConnectInfo`]: serve them with `into_make_service_with_connect_info`.
 pub fn router(
@@ -117,7 +123,9 @@ pub fn router(
     token: Option<ApiToken>,
     drain: Arc<Drain>,
     members: Option<Arc<Members>>,
+    enroll: Option<Arc<EnrollApi>>,
 ) -> Router {
+    let enrollment = crate::enroll::api::routes(token.clone(), enroll);
     Router::new()
         .route(NODES, get(nodes))
         .route(MEMBERS, get(members_view))
@@ -131,6 +139,7 @@ pub fn router(
             drain,
             members,
         }))
+        .merge(enrollment)
 }
 
 /// The drain as it is now.
@@ -544,7 +553,7 @@ struct DrainBody {
 /// 4. `Authorization: Bearer <token>`, compared in constant time: else 401;
 /// 5. `Content-Type: application/json` (parameters allowed), which a browser cannot
 ///    send cross-origin without a preflight the API never answers: else 415.
-fn gate(
+pub(crate) fn gate(
     token: Option<&ApiToken>,
     peer: SocketAddr,
     headers: &HeaderMap,
@@ -657,6 +666,7 @@ mod tests {
             zone: String::new(),
             weight: 1,
             state: MemberState::Active,
+            boot: 0,
         };
         Map::new(9, vec![member], Rule::Rendezvous, 1, 1, Vec::new()).expect("a map")
     }
