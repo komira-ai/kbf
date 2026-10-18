@@ -265,7 +265,8 @@ fn a_failing_key_is_a_failure_not_a_signature() {
         euid(),
         Policy::default(),
     )
-    .expect("server");
+    .expect("server")
+    .with_clock(|| NOW);
     assert_eq!(format!("{server:?}"), "SignerServer", "no key in Debug");
     let socket = ca.scratch.join("f").join("sock");
     let listener = bind(&socket).expect("bind");
@@ -361,6 +362,55 @@ fn the_socket_is_closed_to_others() {
     ));
 }
 
+// Catches: a second signer taking over a live one's socket (bind unlinked whatever socket
+// was there: the first signer keeps running but nobody reaches it, and the second signs
+// with whatever key it was given). A live socket is refused and the first keeps serving;
+// the refusal leaves its file alone.
+#[test]
+fn a_second_signer_does_not_take_over_a_live_socket() {
+    let ca = make_ca("live_socket");
+    let socket = serve(&ca, euid());
+    let before = std::fs::metadata(&socket).expect("socket");
+    let err = bind(&socket).expect_err("a live signer is serving");
+    assert!(matches!(err, SignerError::AlreadyServing(_)), "{err}");
+    assert!(
+        err.to_string().starts_with("a signer is already serving ")
+            && err.to_string().contains(support::path_str(&socket)),
+        "{err}"
+    );
+    let after = std::fs::metadata(&socket).expect("socket still there");
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&before),
+        std::os::unix::fs::MetadataExt::ino(&after)
+    );
+    let client = SocketSigner::connect(&socket, Route::Node).expect("the first still serves");
+    assert_eq!(client.public_key(), ca.spki.as_slice());
+}
+
+// Catches: a server that signs by a clock other than its own (a validator handed 0 or a
+// constant): a server whose clock reads a month after the certificate was issued refuses
+// it as ended, and one reading a day before refuses it as not yet valid.
+#[test]
+fn the_server_judges_the_validity_by_its_own_clock() {
+    let ca = make_ca("server_clock");
+    let tbs = support::node_tbs(&ca, Role::Daemon, None);
+    for (clock, why) in [(NOW + 30 * 86_400, "ended"), (NOW - 86_400, "starts later")] {
+        let server = SignerServer::from_dir(&ca.dir, euid(), Policy::default())
+            .expect("server")
+            .with_clock(move || clock);
+        let socket = ca.scratch.join(format!("clock-{why}")).join("sock");
+        let listener = bind(&socket).expect("bind");
+        std::thread::spawn(move || {
+            let _ = server.serve(&listener);
+        });
+        let client = SocketSigner::connect(&socket, Route::Node).expect("connect");
+        let err = client
+            .sign(&tbs, Algorithm::EcdsaP256Sha256)
+            .expect_err("refused");
+        assert!(err.0.contains("refused") && err.0.contains(why), "{err}");
+    }
+}
+
 // Catches: a process that keeps its dumpable flag (the key readable through ptrace by
 // any process of the account, or in a core file).
 #[test]
@@ -370,4 +420,96 @@ fn harden_clears_the_dumpable_flag() {
         rustix::process::dumpable_behavior().expect("read the flag"),
         rustix::process::DumpableBehavior::NotDumpable
     );
+}
+
+// Catches: a socket whose liveness is judged only by the lock: a signer that does not hold
+// the lock (an older one, or any listener) and answers on the path is still not taken
+// over.
+#[test]
+fn a_live_socket_without_the_lock_is_not_taken_over() {
+    let scratch = scratch("live_unlocked");
+    let socket = scratch.join("run").join("sock");
+    std::fs::create_dir(socket.parent().expect("dir")).expect("dir");
+    std::fs::set_permissions(
+        socket.parent().expect("dir"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("chmod");
+    let listener = UnixListener::bind(&socket).expect("a listener outside bind");
+    let err = bind(&socket).expect_err("it answers");
+    assert!(matches!(err, SignerError::AlreadyServing(_)), "{err}");
+    drop(listener);
+    bind(&socket).expect("once nobody listens it is stale and replaced");
+}
+
+// Catches: a lock that does not outlive the bind (taken, then closed on return: a second
+// starter gets in while the first serves), and a lock file followed through a symlink
+// (O_NOFOLLOW: a planted link must not redirect the lock to another file).
+#[test]
+fn the_lock_is_held_while_the_bound_socket_lives_and_is_not_followed_through_a_link() {
+    let scratch = scratch("lock_held");
+    let socket = scratch.join("run").join("sock");
+    let first = bind(&socket).expect("bind");
+    let lock = scratch.join("run").join("sock.lock");
+    assert_eq!(mode(&lock), 0o600);
+    // The first still holds listener and lock; dropping it frees both.
+    assert!(matches!(bind(&socket), Err(SignerError::AlreadyServing(_))));
+    drop(first);
+    drop(bind(&socket).expect("freed with the Bound"));
+
+    std::fs::remove_file(&lock).expect("rm lock");
+    let target = scratch.join("elsewhere");
+    std::fs::write(&target, b"x").expect("write");
+    symlink(&target, &lock).expect("symlink");
+    let err = bind(&socket).expect_err("a linked lock file is refused");
+    assert!(matches!(err, SignerError::Io(_)), "{err}");
+}
+
+// Catches: a connect error other than "refused" read as stale and the socket removed (or
+// ignored). A socket file nobody may connect to (mode 000, as non-root EACCES) is neither
+// live nor provably stale: bind fails with an i/o error and leaves the file.
+// Skipped as root: root connects regardless of the mode, so the error never arises.
+#[test]
+fn a_socket_that_cannot_be_judged_is_left_alone() {
+    if euid() == 0 {
+        eprintln!("skipped: root connects to a mode 000 socket, so EACCES cannot arise");
+        return;
+    }
+    let scratch = scratch("unjudged");
+    let socket = scratch.join("run").join("sock");
+    drop(bind(&socket).expect("bind"));
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let err = bind(&socket).expect_err("cannot be judged");
+    assert!(matches!(err, SignerError::Io(_)), "{err}");
+    assert!(socket.exists());
+}
+
+// Catches: a production clock that is wrong or fixed (every other test sets one): a server
+// built without `with_clock` signs a certificate valid now and refuses one that starts a
+// day ahead.
+#[test]
+fn the_system_clock_is_the_default_clock() {
+    let now = support::real_now();
+    let ca = support::make_ca_at("system_clock", now);
+    let server = SignerServer::from_dir(&ca.dir, euid(), Policy::default()).expect("server");
+    let socket = ca.scratch.join("run").join("sock");
+    let listener = bind(&socket).expect("bind");
+    std::thread::spawn(move || {
+        let _ = server.serve(&listener);
+    });
+    let client = SocketSigner::connect(&socket, Route::Node).expect("connect");
+    let signed = client
+        .sign(
+            &support::node_tbs_at(&ca, Role::Daemon, None, now),
+            Algorithm::EcdsaP256Sha256,
+        )
+        .expect("valid now");
+    assert!(!signed.is_empty());
+    let err = client
+        .sign(
+            &support::node_tbs_at(&ca, Role::Daemon, None, now + 86_400),
+            Algorithm::EcdsaP256Sha256,
+        )
+        .expect_err("starts later than the system clock");
+    assert!(err.0.contains("starts later"), "{err}");
 }

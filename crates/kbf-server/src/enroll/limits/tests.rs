@@ -180,6 +180,59 @@ async fn a_call_over_the_burst_is_rate_limited_and_never_reaches_the_service() {
     assert_eq!(refused.body(), "", "not the service's body");
 }
 
+/// Log lines written by the test's subscriber on this thread.
+#[derive(Clone, Default)]
+struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Lines {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("lock").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A refused call leaves one line saying why, so an operator who sees nodes failing to
+/// enrol can tell a flood from a fault.
+///
+/// Catches: a refusal that is silent, or logged under another reason.
+#[tokio::test]
+async fn a_rate_limited_call_is_logged_with_its_reason() {
+    let lines = Lines::default();
+    let writer = lines.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let _installed = tracing::subscriber::set_default(subscriber);
+    let mut guard = guard(
+        Limits {
+            per_minute: 1,
+            burst: 1,
+            in_flight: 8,
+        },
+        Inner {
+            gate: None,
+            status: "0",
+        },
+    );
+    guard.call(http::Request::new(())).await.expect("answer");
+    assert_eq!(
+        String::from_utf8(lines.0.lock().expect("lock").clone()).expect("UTF-8"),
+        "",
+        "an admitted call logs nothing"
+    );
+    guard.call(http::Request::new(())).await.expect("answer");
+    let text = String::from_utf8(lines.0.lock().expect("lock").clone()).expect("UTF-8");
+    assert!(
+        text.contains("enrollment call refused") && text.contains("reason=\"rate_limited\""),
+        "{text}"
+    );
+}
+
 /// At most `in_flight` calls run at once; a slot is given back when its call ends, also
 /// when the caller goes away mid-call.
 ///

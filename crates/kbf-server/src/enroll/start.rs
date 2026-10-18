@@ -20,7 +20,7 @@ use super::gate::start_gate;
 use super::listener::EnrollListener;
 use super::service::EnrollService;
 use super::tls::{FrontendTls, unix_now};
-use crate::listen::{Latch, Socket};
+use crate::listen::{Binder, Latch, Socket};
 
 /// What the start says when the CA key is a file in this process.
 const DEV_SIGNER_WARNING: &str =
@@ -72,8 +72,20 @@ impl Prepared {
 /// The gate refuses ([`super::gate::DenyNotEnforced`]), the address cannot be bound, the
 /// CA cannot be opened, or its certificate cannot be issued.
 pub fn prepare(flags: &EnrollFlags) -> Result<Prepared, Box<dyn Error>> {
+    prepare_with(flags, &Binder::new())
+}
+
+/// [`prepare`] binding through `binder`, whose retry budget the frontend's other
+/// listeners share.
+///
+/// # Errors
+/// As [`prepare`].
+pub(crate) fn prepare_with(
+    flags: &EnrollFlags,
+    binder: &Binder,
+) -> Result<Prepared, Box<dyn Error>> {
     start_gate(flags.allow_unenforced_deny)?;
-    let socket = Socket::bind(flags.listen)?;
+    let socket = Socket::bind(flags.listen, binder)?;
     let policy = Policy::new(flags.cert_lifetime_secs)?;
     let now = unix_now();
     let ca = Ca::open(

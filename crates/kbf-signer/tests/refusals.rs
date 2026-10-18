@@ -21,7 +21,7 @@ fn ca() -> &'static Ca {
 }
 
 fn check(tbs: &[u8], route: Route) -> Result<(), Refusal> {
-    check_tbs(tbs, route, Policy::default(), &ca().root_subject)
+    check_tbs(tbs, route, Policy::default(), &ca().root_subject, NOW)
 }
 
 fn node(tweak: impl FnOnce(&mut Evil<'static>)) -> Result<(), Refusal> {
@@ -193,9 +193,40 @@ fn the_lifetime_is_the_policys_and_not_a_second_more() {
     let tbs = Evil::new(ca()).tbs();
     let short = Policy::new(Policy::MIN_LIFETIME_S).expect("policy");
     assert_eq!(
-        check_tbs(&tbs, Route::Node, short, &ca().root_subject),
+        check_tbs(&tbs, Route::Node, short, &ca().root_subject, NOW),
         Err(Refusal::Lifetime)
     );
+}
+
+// Catches: a compromised frontend pre-minting certificates that start in the future (a
+// day ahead, or one second past the backdate allowance), and one already expired by the
+// signer's own clock. The boundaries are accepted, so the rule is not stricter than the
+// allowance (the builder backdates by that much).
+#[test]
+fn the_validity_is_checked_against_the_signers_clock() {
+    let week = time::Duration::seconds(Policy::DEFAULT_LIFETIME_S);
+    let at = |t: i64| time::OffsetDateTime::from_unix_timestamp(t).expect("time");
+    let starting = |t: i64| {
+        node(|e| {
+            e.params.not_before = at(t);
+            e.params.not_after = at(t) + week;
+        })
+    };
+    assert_eq!(starting(NOW + 86_400), Err(Refusal::NotYetValid));
+    assert_eq!(
+        starting(NOW + Policy::BACKDATE_S + 1),
+        Err(Refusal::NotYetValid)
+    );
+    assert_eq!(starting(NOW + Policy::BACKDATE_S), Ok(()));
+    let ending = |t: i64| {
+        node(|e| {
+            e.params.not_before = at(t - 3_600);
+            e.params.not_after = at(t);
+        })
+    };
+    assert_eq!(ending(NOW - 1), Err(Refusal::Expired));
+    assert_eq!(ending(NOW), Err(Refusal::Expired));
+    assert_eq!(ending(NOW + 1), Ok(()));
 }
 
 // Catches: key usages outside the table (keyCertSign on a leaf, or any other bit), and a

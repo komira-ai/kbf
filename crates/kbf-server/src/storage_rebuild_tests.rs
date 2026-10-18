@@ -84,6 +84,7 @@ impl Frontend {
             zone: String::new(),
             weight: 1,
             state: kbf_map::MemberState::Active,
+            boot: 0,
         };
         let map = kbf_map::Map::new(4, vec![member], kbf_map::Rule::Rendezvous, 1, 1, Vec::new())
             .expect("a map");

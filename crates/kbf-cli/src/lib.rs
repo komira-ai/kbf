@@ -46,6 +46,12 @@
 //! frontend is updated without failing a build. Like `cluster` it starts no mode: `kbf
 //! frontend` takes only flags, and the word `handover` after it is this command's.
 //!
+//! Before a mode starts, [`preflight`] checks what it needs of its host (the files its
+//! flags name, its certificate's role, the S3 key pair, the container driver's programs,
+//! ...) and refuses, with every missing piece on stderr, one line each, and exit status 2
+//! (75 for a piece that heals shortly). `check-args`, `cluster` and `frontend handover`
+//! read nothing of the host and skip it.
+//!
 //! And the product's two words for a node ([`node`], [`enroll`]): `kbf enroll` enrolls the
 //! node with the frontend its `kbf.toml` names (one token, one key per role, a certificate
 //! from the frontend's CA) and exits; `kbf node` does that if the node is not enrolled,
@@ -62,6 +68,7 @@ pub mod handover;
 pub mod names;
 pub mod node;
 pub mod nofile;
+pub mod preflight;
 pub mod version;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -424,7 +431,8 @@ pub fn check_args(args: &[std::ffi::OsString]) -> Result<(), clap::Error> {
 /// The `kbf` binary: the daemon's helper re-execs first (a keeper or a `__chown-dirs`
 /// run of this binary never reads the command line as `kbf`'s), then [`version::line`]
 /// for `kbf --version --json`, then the command line, then [`check_args`] for `kbf
-/// check-args ...`, [`cluster::run`] for `kbf cluster ...`, [`handover::run`] for `kbf frontend handover ...` or else [`run`]. A command
+/// check-args ...`, [`cluster::run`] for `kbf cluster ...`, [`handover::run`] for `kbf frontend handover ...` or else
+/// [`preflight::refusal`] and [`run`]. A command
 /// line that
 /// does not parse exits 2 (0 for `--help` and `--version`).
 #[must_use]
@@ -476,7 +484,7 @@ pub fn main() -> ExitCode {
         };
     }
     match parse_from(args) {
-        Ok(invocation) => run(&invocation),
+        Ok(invocation) => preflight::refusal(&invocation).unwrap_or_else(|| run(&invocation)),
         Err(e) => e.exit(),
     }
 }
