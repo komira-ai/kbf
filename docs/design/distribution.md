@@ -18,8 +18,8 @@ Scope: on-prem only for now. What is deferred is listed in section 10.
 | Thing | What it is | What it does | What it never does |
 |---|---|---|---|
 | `kbf` | The runtime only. One binary: `kbf --mode=frontend\|storage\|daemon\|storage-and-daemon\|all-in-one`, or `mode = "..."` in `/etc/kbf/kbf.toml` (a flag overrides the file). `--config`, `--check` and `--instance` are flags. No positional arguments, no `node` mode; the old subcommand forms are aliases until the test farm has moved, then are removed | Runs the mode. At start it checks its host and refuses with one clear line per missing piece. Enrollment runs inside the start of the `storage`, `daemon` and `storage-and-daemon` modes; the token limits which roles a host may hold. The frontend creates its CA on first start into an empty `--ca-dir` | Install, download or configure anything. It has no `enroll`, `ca` or `token` command: tokens are operator-API routes |
-| `kbf-installer` | THE package, and the one root tool for setup and updates of kbf | Setup: writes `kbf.toml` and the enrollment token, pulls the `kbf` release itself (an unprivileged fetch child, the configured source only, verified before anything is root-owned), places and enables units. Then runs as a service: reads orders from the kbf-owned `orders/` directory (dot-temp name, then rename), keeps its state under the root-owned `/var/lib/kbf-installer`, reads settings from `/etc/kbf/installer.toml` | Update itself (only the package manager replaces it), fetch or pin Envoy, decide to update |
-| The package | The way `kbf-installer` reaches a host | Ships the `kbf-installer` binary, unit files (installed disabled, gated), and the trust files. Depends on Envoy on a frontend host (section 5) | Start a service, own anything under `/var/lib/kbf-installer/releases` |
+| `kbf-installer` | THE package, and the one root tool for setup and updates of kbf | Setup: writes `kbf.toml` (mode, frontend URL) and places the enrollment token from `--token-file` (0600 root:kbf), pulls the `kbf` release itself (an unprivileged fetch child, the configured source only, verified before anything is root-owned), places and enables units. Then runs as a service: reads orders from the kbf-owned `orders/` directory (dot-temp name, then rename), keeps its state under the root-owned `/var/lib/kbf-installer`, reads settings from `/etc/kbf/installer.toml` | Update itself (only the package manager replaces it), fetch or pin Envoy, decide to update |
+| The package | The way `kbf-installer` reaches a host | Ships the `kbf-installer` binary, unit files (installed disabled, gated), and the trust files. Has no package `Depends:` on Envoy: setup and `check` test the installed Envoy on a frontend host (section 5) | Start a service, own anything under `/var/lib/kbf-installer/releases` |
 
 **kbf refuses, it does not repair.** The start-up checks are the preflight of PR #1020 (branch
 `startup/self-checks`): each missing piece (a directory, a user, a subuid range, a runtime, a token file) is
@@ -62,7 +62,6 @@ verbs (`kbf cluster status|drain|undrain|member` is the model) are clients of it
 |---|---|---|---|---|
 | apt `.deb` | `kbf-installer`, units (disabled), trust files | Never at install. After configuration (section 4) | `sudo kbf-installer setup`, or the control API from a host that already has a frontend | `kbf-installer` pulls and applies releases when the externally set desired release reaches the host. `apt upgrade` replaces only `kbf-installer`, units and trust files |
 | rpm / apk | Same payload and file list as the deb | Gating **not researched [U]**; Fedora and RHEL presets enable nothing by default [L] | Same | Same |
-| Homebrew formula | `kbf-installer` only. No daemon | `brew services` is not used | `sudo kbf-installer setup` | `brew upgrade` replaces `kbf-installer` only; releases follow the installer |
 | Homebrew cask and signed `.pkg` | `kbf-installer`, the launchd plist, trust files (macOS, nodes only: section 7) | Not at install. `kbf-installer setup` bootstraps the plist after the config validates | `sudo kbf-installer setup` | Same installer, signature preserved per release |
 | `curl \| sh` tarball | The script unpacks the same payload as the package and runs the same placement code as the package build | Never by the script; it prints the next step | `sudo kbf-installer setup` | Same installer |
 | Frontend container image | `kbf`, no installer | By the container runtime. The entrypoint exits non-zero unless `kbf.toml` and the token are mounted | Mounted `kbf.toml`, then the API | A new image tag. No installer and no Envoy in the image: it runs behind the orchestrator's own proxy |
@@ -75,8 +74,8 @@ Notes:
   script first, a hosted repository when a second operator exists.
 - The `kbf` command on `PATH` is a link the installer maintains to `/var/lib/kbf-installer/releases/current/kbf` (in `/usr/local/bin`,
   which no package lists). The package never ships a file the installer replaces.
-- A formula install step runs as the user and cannot install a daemon. `sudo brew services start` would write
-  a root LaunchDaemon [V, brew manpage], which is why the formula carries the installer and nothing else.
+- There is no Homebrew formula for the root installer: a formula install step runs as the user and cannot place
+  a root LaunchDaemon [V, brew manpage]. macOS uses the cask or the signed `.pkg`.
 
 ## 3. File ownership and skew
 
@@ -142,23 +141,29 @@ RestartPreventExitStatus=2
   renames them into place with the config last, then runs `systemctl enable --now`. A crash between steps
   leaves no config that passes the condition.
 - Not `policy-rc.d`: that file is a local administrator and image tool [V].
-- Rootless containers: the daemon runs as `User=kbf` with `Delegate=yes`; rootless Podman runs in the `kbf`
-  user's own manager kept alive by lingering. `--userns=nomap` needs a subuid and subgid range for `kbf`
+- Rootless containers: the daemon runs as `User=kbf` with `Delegate=yes`, and `crun` is the only container
+  runtime; it runs in the `kbf` user's own manager kept alive by lingering. `--userns=nomap` needs a subuid and subgid range for `kbf`
   (`usermod --add-subuids` is the documented fix). `DynamicUser=` is not used: the daemon needs a fixed
   user that owns subid ranges, and `crun` runs `newuidmap` [V, `daemon.md`]. Creating the `kbf` user is
   sysusers (package); the subid range and lingering are done by `kbf-installer setup` as root, because
   `systemd-sysusers` allocates no subid ranges [L].
+- Signer: the key that signs certificates and grants lives under its own uid. The package adds the user
+  `kbf-signer` and the unit `kbf-signer.service` (frontend and all-in-one hosts only); the signer binary ships as
+  a release component, and the frontend talks to it over a local socket. Until that is built, the frontend uses
+  its in-process file signer (#966 [V]). Details: kbf-installer.md sections 3 and 7.
 
-## 5. Envoy is an installed dependency
+## 5. Envoy is a host prerequisite the installer checks
 
 Envoy is the frontend's update path: the new frontend instance starts beside the old one behind Envoy, Envoy
 sends new connections to it, and the old instance stops scheduling and relays its open `Execute` streams until
 they close ([kbf-installer.md](kbf-installer.md) section 6, [frontend-handover.md](frontend-handover.md)).
 
-- Envoy is **not** part of a kbf release, **not** pinned in a manifest and **not** fetched by `kbf-installer`.
-  It is a dependency of the package on a frontend host (or of host preparation), with a version range the farm
-  has tested; the range lives in the package's `installer.conf`. `kbf-installer check` and the frontend update
-  refuse an Envoy outside it. Nodes need no Envoy.
+- Envoy is **not** part of a kbf release, **not** pinned in a manifest and **not** fetched by `kbf-installer`,
+  and it is **not** a package `Depends:` (one `.deb` serves every host, and a dependency cannot apply per host).
+  Host preparation installs it, on frontend and all-in-one hosts only. `kbf-installer setup
+  --mode=frontend|all-in-one`, `check` and the frontend update compare the installed Envoy with the range the
+  farm has tested (`installer.conf`) and refuse with one line naming the problem and the fix. There is no
+  separate frontend package. Storage and daemon hosts need no Envoy.
 - The installer renders kbf's Envoy configuration from the frontend's own ports and instances (the renderer
   leaves `kbf-deploy` with its golden tests) and asks the installed Envoy to reload it. Envoy's service unit
   is its own package's.
@@ -184,6 +189,10 @@ sections 4 and 5):
   scheduling and relays its open `Execute` streams until they close, with no timeout (OSS Buck2 never calls
   `WaitExecution`). One frontend on SQLite now; Postgres and several frontends later.
 - **Node drain and restart** as part of the per-host step.
+- **Fetch identity.** With the `frontend` release source the installer fetches with the host's enrolled node
+  certificate. A storage-and-daemon host holds two role pairs: `installer.toml` points at the daemon pair if
+  present, else the storage pair, and `ReleaseService.Fetch` admits any enrolled role. An all-in-one host does
+  not enroll (it has no remote roles) and takes its first release from the `url` source or a release given to `setup`.
 
 It grows from the existing `kbf-installer` and `kbf-helper` crates on `feature/pull-updates` [V]: the layout and
 verbs of the former, the root half of an update from the latter. The result is one root binary; there is no
@@ -215,7 +224,7 @@ One `kbf` binary with five modes, selected by `--mode`. These stay separate proc
 `kbf-vmm` (its own entitlement; ship only when it does something), `kbf-mac-session` (macOS GUI session,
 shrinking per macos-end-state.md), and `kbf-mdm-gate` (keeps a credential away from the frontend; a mode of
 `kbf` on the MDM host is the alternative, a decision of its own). The hidden re-exec modes `__keeper`,
-`__as-user` and `__chown-dirs` stay inside `kbf`. Test-only binaries (the three copies of the fake podman, the
+`__as-user` and `__chown-dirs` stay inside `kbf`. Test-only binaries (the fake container runtimes, the
 fake systemctl, `kbf-keeper-swap`) are never shipped.
 
 Deleted when their replacement works on the test farm, not before (`kbf-deploy` is frozen, #1017, and gets no
@@ -245,17 +254,18 @@ Order:
 
 1. **First-token bootstrap and remote control-API access.** An API that needs a token cannot mint the first one,
    and the loopback write gate makes remote `curl` against a remote frontend awkward.
-   There is no `kbf token` command; tokens are operator-API routes. Recommendation: a local-only first-token
-   path run as root on the frontend host (`kbf-installer` writes a 0600 operator token file, prints no secret,
-   refuses once any operator token exists), plus an authenticated remote mode (token and TLS on a separate
+   There is no `kbf token` command; tokens are operator-API routes. Decided (engineering): the first operator
+   token is created by `kbf-installer setup --mode=frontend`, run as root on the frontend host. It writes the
+   token once to a root-only file and prints the file's path, never the secret; it creates none once any
+   operator token exists. Open: an authenticated remote mode (token and TLS on a separate
    operator listener) with its own threat model, before any remote client is built.
-2. **The darwin component rename.** The pull-updates wire names the Mac component `kbf-daemon`, and the wire
-   contract is frozen. Moving Macs to `kbf --mode=daemon` means a component named `kbf`. Recommendation: rename it in
-   one coordinated change with the signing allow-list (`tools/ci/darwin-entitlements.txt`, `sign-darwin`),
-   accepted by an explicit version bump of the contract, and do it before the `kbf-daemon` binary is deleted.
-3. **How a frontend host gets Envoy.** A package dependency with the tested version range
-   (recommended: one mechanism on every channel), or host preparation outside the package. The release never
-   carries it and the installer never fetches it.
+2. **The darwin component rename.** Decided: later. The Mac component stays `kbf-daemon` (wire frozen) until a
+   release needs the rename; then it is one coordinated change with the signing allow-list
+   (`tools/ci/darwin-entitlements.txt`, `sign-darwin`) and an explicit contract version bump, before the
+   `kbf-daemon` binary is deleted.
+3. **How a frontend host gets Envoy.** Decided: host preparation installs it (frontend and all-in-one hosts
+   only); setup checks it against the tested range (section 5). The release never carries it and the installer
+   never fetches it.
 
 ## 10. Later
 
@@ -266,7 +276,7 @@ providers; cross-version Envoy upgrades; a managed build service; Postgres and s
 
 Debian: `dh_installsystemd`, `deb-systemd-helper(1p)`, `policy-rc.d`, Debian Policy 9.1.2 and 10.7.3, FHS 3.0
 section 5.8, `debsums(1)`. systemd: `systemd.unit(5)`, `systemd.service(5)`, `systemd.exec(5)`,
-`sysusers.d(5)`, `tmpfiles.d(5)`; cited from memory, not fetched. Homebrew: `services` manpage. Repo: `kbf-installer.md`, `docs/api.md`, `daemon.md`, `pull-updates.md`,
+`sysusers.d(5)`, `tmpfiles.d(5)`; cited from memory, not fetched. Repo: `kbf-installer.md`, `docs/api.md`, `daemon.md`, `pull-updates.md`,
 `split-mode-updates.md`, `frontend-handover.md`, `macos-end-state.md`, `mac-node-provisioning.md`,
 `../deploy/host-releases.md`, `../deploy/linux-build-host.md`; the kbf crates on `feature/pull-updates` and
 `startup/self-checks`.
