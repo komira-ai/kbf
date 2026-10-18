@@ -100,7 +100,7 @@ Residuals, stated plainly:
   min_protocol, protocol, profile, state_schema, version}`. A release is verified, not rebuilt.
 - **Versioned host layout** [F]: `/usr/local/kbf/releases/<commit>/`, `current` and `previous` symlinks, a
   `state.json` with a pending confirm (and an order-floor field kept only so an older state file reads); `kbf-deploy host install|rollback|gc`. The units run
-  `<KBF_BIN_DIR>/kbf <mode>`, so pointing `KBF_BIN_DIR` at `current` needs no new unit shape.
+  `<KBF_BIN_DIR>/kbf --mode=<mode>`, so pointing `KBF_BIN_DIR` at `current` needs no new unit shape.
 - **Rollout state machine** [F]: a blocking engine (gate, stage, drain, wait idle, swap, wait healthy, wait
   repaired, confirm, undrain; rollback on failure; pause; fleet lock) over a `Transport` trait, with a fake fleet
   and planted-fault tests. It had no real `Transport`; this design supplies one over sessions.
@@ -118,7 +118,7 @@ Residuals, stated plainly:
 ```text
  operator / UI               frontend host                              every other host
  -------------               -------------                              ----------------
- /v1/update, /v1/releases -> kbf frontend                               kbf (daemon / storage-and-daemon)
+ /v1/update, /v1/releases -> kbf --mode=frontend                         kbf --mode=node
  (click, auto rule)            release store (--releases-dir)             update client (kbf-update)
                                desired release, rules (state store)         | writes order records only
                                offers + orders over sessions                | order spool (small records only)
@@ -294,7 +294,7 @@ Retention: the running, the previous and one more directory. Only `kbf-installer
 
 `kbf-installer` runs as a root unit with no listening socket (the former `kbf-helper` is folded into it). Its service
 loop has two commands, with no free-form arguments (its flags name the unit and the directories; nothing in an order
-record is a path, a URL, a command or a unit; the platform is the host's own, read by the installer). **On macOS `kbf daemon`
+record is a path, a URL, a command or a unit; the platform is the host's own, read by the installer). **On macOS `kbf --mode=node`
 runs as root (macos-end-state.md), so there a compromise of `kbf` is a compromise of root; the order spool and the fetch child
 do not change that, and this section's separation of `kbf` from root holds on Linux only.** The probe and the fetch child below
 still run unprivileged there, so a fault in them is not root.
