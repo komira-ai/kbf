@@ -350,6 +350,25 @@ fn api_listen_serves_the_operator_api() {
     interrupt(child);
 }
 
+/// The remote operator flags belong to `kbf frontend`. A combined server given them would
+/// otherwise start with the CI route silently off. Mutant: the check in `start::assemble`
+/// removed (the server then starts and this test sees no refusal).
+#[test]
+fn the_combined_server_refuses_the_remote_operator_flags() {
+    let mut c = server(&[
+        "--api-listen",
+        "127.0.0.1:0",
+        "--remote-operator-listen",
+        "127.0.0.1:0",
+        "--remote-operator-config",
+        "/nonexistent",
+    ]);
+    c.args(ANY_PORT);
+    let (code, stderr) = fails(with_keys(c));
+    assert_ne!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("served by `kbf frontend` only"), "{stderr}");
+}
+
 /// A token file holding `content` with `mode`, under `name`.
 #[cfg(unix)]
 fn token_file(name: &str, content: &str, mode: u32) -> std::path::PathBuf {

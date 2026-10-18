@@ -503,6 +503,12 @@ pub enum ConfigError {
     /// The operator API token file is refused.
     #[error("--api-token-file: {0}")]
     ApiToken(#[from] TokenFileError),
+    /// A flag only `kbf frontend` serves was given to a server that would ignore it.
+    #[error(
+        "--remote-operator-listen is served by `kbf frontend` only, and this server would \
+         ignore it: it would look as if the CI route were on when it is not"
+    )]
+    RemoteOperatorFrontendOnly,
     /// The release store's directory cannot be made.
     #[error("--releases-dir {dir}: {source}", dir = dir.display())]
     Releases {

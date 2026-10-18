@@ -283,6 +283,9 @@ where
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
+    if args.remote_operator_listen.is_some() {
+        return Err(crate::ConfigError::RemoteOperatorFrontendOnly.into());
+    }
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
     let state = with_members(
