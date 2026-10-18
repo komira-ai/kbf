@@ -1435,8 +1435,10 @@ dependencies = [
  "kbf-daemon",
  "kbf-deploy",
  "kbf-driver-container",
+ "kbf-enroll",
  "kbf-host",
  "kbf-node",
+ "kbf-peer",
  "kbf-proto",
  "kbf-server",
  "kbf-state",
@@ -1448,8 +1450,14 @@ dependencies = [
  "rcgen",
  "rustix",
  "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "time",
  "tokio",
+ "toml",
  "tonic",
+ "tracing",
+ "x509-parser",
 ]
 
 [[package]]
@@ -1610,6 +1618,19 @@ dependencies = [
  "tracing",
  "x509-parser",
  "zeroize",
+]
+
+[[package]]
+name = "kbf-enroll-registry"
+version = "0.1.0"
+dependencies = [
+ "kbf-map",
+ "kbf-state",
+ "kbf-types",
+ "prost",
+ "sha2 0.11.0",
+ "subtle",
+ "thiserror",
 ]
 
 [[package]]
@@ -2041,6 +2062,7 @@ dependencies = [
  "sha2 0.11.0",
  "subtle",
  "thiserror",
+ "time",
  "tokio",
  "tonic",
  "tonic-prost",

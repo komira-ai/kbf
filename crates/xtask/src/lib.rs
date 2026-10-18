@@ -1,8 +1,9 @@
 //! `cargo xtask <verb>`: kbf's CI logic, in Rust with tests, so each workflow step is one
 //! command (the alias is in `.cargo/config.toml`).
 //!
-//! - `build-commit check <binary> <commit>` and `build-commit stamps <commit>`
-//!   ([`build_commit`]): kbf-server names the commit it was built from.
+//! - `build-commit check <binary> <commit>`, `build-commit check-asset <tarball>
+//!   <commit>` and `build-commit stamps <commit>` ([`build_commit`]): kbf-server names the
+//!   commit it was built from, and `kbf` does in the tarball that ships.
 //! - `budget-diff --base <rev>` ([`budget`]): the interpreter budget may only shrink; a
 //!   row the working tree's budget file has and `<rev>`'s does not is refused. CI runs
 //!   it on pull requests, with the base branch as `<rev>`.
@@ -308,6 +309,10 @@ enum BuildCommit {
         #[arg(long)]
         json: bool,
     },
+    /// The `kbf` in the release tarball `<tarball>` (`<name>-<commit>-<platform>.tar.gz`)
+    /// names `<commit>` and a release build, as `check --json` finds, run on the bytes
+    /// that ship.
+    CheckAsset { tarball: PathBuf, commit: String },
     /// A plain build, two override stamps and a malformed override, from the checkout.
     Stamps { commit: String },
 }
@@ -376,6 +381,14 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             commit,
             json,
         }) => Ok(vec![build_commit::check(&binary, &commit, json)?]),
+        Verb::BuildCommit(BuildCommit::CheckAsset { tarball, commit }) => {
+            let scratch_in = root.join("target");
+            Ok(vec![build_commit::check_asset(
+                &scratch_in,
+                &tarball,
+                &commit,
+            )?])
+        }
         Verb::BuildCommit(BuildCommit::Stamps { commit }) => {
             build_commit::stamps(&cargo_program(), &root, &commit)
         }

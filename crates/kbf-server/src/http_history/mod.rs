@@ -22,9 +22,12 @@
 //!   instance, and answers only after: nothing is read in between that could change it.
 
 mod cache;
+mod cross;
 mod logs;
+mod query;
 mod restore;
 mod run;
+mod scope;
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,6 +48,7 @@ use crate::http_blobs::{error, refusal};
 use crate::http_invocations::{Bad, Draft, Request, answer};
 use crate::http_invocations::{CALL, InvocationReaders, bad_answer};
 
+pub(crate) use cross::router as cross_router;
 pub(crate) use run::router as run_router;
 
 /// Which blobs the cache holds, with the cache's type erased: a run's links to its logs
