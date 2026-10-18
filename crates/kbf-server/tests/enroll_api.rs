@@ -29,7 +29,12 @@ fn token_file() -> ApiToken {
     use std::os::unix::fs::PermissionsExt;
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-enroll-api");
     std::fs::create_dir_all(&dir).expect("a token directory");
-    let path = dir.join(format!("token-{}", std::process::id()));
+    // One file per call: tests in this binary run in parallel in one process, so a
+    // name keyed by the process id alone let one test truncate the file while another
+    // read it ("a usable token: Content").
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!("token-{}-{n}", std::process::id()));
     std::fs::write(&path, format!("{TOKEN}\n")).expect("write the token");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     ApiToken::from_file(&path).expect("a usable token")
