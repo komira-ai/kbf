@@ -434,7 +434,12 @@ impl Facts {
     /// What the node step reads about host `id`; `None` if the run does not have it.
     #[must_use]
     pub fn observe(&self, id: &WorkerId) -> Option<Observations<'_>> {
-        self.host(id).map(|host| Observations { facts: self, host })
+        self.host(id).map(|host| self.observe_host(host))
+    }
+
+    /// What the node step reads of `host`, a host the caller already holds.
+    pub(crate) const fn observe_host<'a>(&'a self, host: &'a HostFacts) -> Observations<'a> {
+        Observations { facts: self, host }
     }
 }
 
