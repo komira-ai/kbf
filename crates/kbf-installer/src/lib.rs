@@ -34,6 +34,9 @@
 //!   `--version --json`, and on macOS the quarantine attribute and the code signature.
 //! - [`envoy`]: the Envoy of a frontend host, rendered from settings and checked (a library
 //!   for the frontend-update path, with no command line).
+//! - [`proxy`]: the frontend proxy's update machinery, against traits (no socket, no child):
+//!   the swap orchestrator, and in `proxy::api` the update API (routes, bearer-token check,
+//!   the actor that owns one update, idempotent request ids).
 //! - [`run`]: the one place a process is started, behind a trait a test plays.
 //! - [`refusal`]: every way a stage is refused, one enum with a stable code per case.
 //!
@@ -60,6 +63,7 @@ pub mod inbox;
 pub mod installer_toml;
 pub mod layout;
 pub mod offer;
+pub mod proxy;
 pub mod record;
 pub mod refusal;
 pub mod release;

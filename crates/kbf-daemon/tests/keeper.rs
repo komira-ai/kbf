@@ -2,6 +2,7 @@
 //! the running one, through `kbf-keeper-swap` (`tests/bin/keeper_swap.rs`), and a program
 //! that is no keeper.
 
+use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -90,4 +91,41 @@ fn a_program_that_is_no_keeper_is_refused() {
     let mut child = Command::new("/usr/bin/true").spawn().expect("spawn");
     assert!(keeper::started(&mut child).is_err());
     child.wait().expect("reap");
+}
+
+/// Catches a `group` keeper that does not end its group when its stdin reaches
+/// end-of-file, or ends it with a signal that can be caught (the keeper is the leader
+/// of its own group here, as the native driver's is a member of its action's): it must
+/// stay up while the pipe is open, and die of SIGKILL, with the group's other member,
+/// once it closes. The kill takes the keeper's counters with it, so this test cannot
+/// show the lines run; the unit test of the arm does.
+#[test]
+fn a_group_keeper_kills_its_group_when_stdin_closes() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_kbf-keeper-swap"));
+    let mut keeper = keeper::command(binary, &Mode::Group)
+        .process_group(0)
+        .spawn()
+        .expect("spawn the keeper");
+    keeper::started(&mut keeper).expect("the keeper is ready");
+    assert!(
+        keeper.try_wait().expect("poll").is_none(),
+        "the keeper ended with its stdin open"
+    );
+    let group = i32::try_from(keeper.id()).expect("a pid");
+    // A second member of the keeper's group, which only the group kill can end.
+    let mut member = Command::new("/bin/sleep")
+        .arg("3600")
+        .process_group(group)
+        .spawn()
+        .expect("spawn a member");
+    drop(keeper.stdin.take());
+    let status = keeper.wait().expect("reap the keeper");
+    if status.signal() != Some(libc::SIGKILL) {
+        // Do not leave the member running for the hour.
+        member.kill().expect("kill the member");
+        member.wait().expect("reap the member");
+        panic!("the keeper did not die of SIGKILL: {status}");
+    }
+    let status = member.wait().expect("reap the member");
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "{status}");
 }

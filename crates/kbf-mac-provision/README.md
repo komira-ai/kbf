@@ -77,8 +77,7 @@ kbf-mac-provision revert                                # root: put back the rec
   writes neither.
 - `kbf_data_dir` is the daemon's data directory (it keeps `leases/`, `cache/` and `trees/`
   under it; the profile has no size key, so the daemon sizes the directory from the
-  filesystem). This tool checks the directory; the daemon is given it by `kbf.toml`'s
-  `[daemon] data_dir`, which must say the same. The old name `kbf_scratch` is still
+  filesystem). The job passes it as `--data-dir`. The old name `kbf_scratch` is still
   accepted, as `kbf_data_dir`, with one warning line on stderr; a profile that sets both
   keys is refused.
 - An example profile, with placeholder values, is [example.profile](example.profile).

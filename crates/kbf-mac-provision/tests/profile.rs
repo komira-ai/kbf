@@ -827,6 +827,7 @@ fn the_job_runs_the_daemon_mode_with_its_config_and_the_labels() {
     );
     let plist = kbf_mac_provision::launchd::render_plist(&p);
     for absent in [
+        "<string>node</string>",
         "--scratch",
         "--cache-dir",
         "--cache-",

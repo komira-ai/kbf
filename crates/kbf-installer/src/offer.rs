@@ -17,7 +17,7 @@
 //!
 //! `bundle` is the attestation bundle for the release (one file whose attestations cover
 //! every tarball); each `components` entry is a tarball holding one binary named like the
-//! component (`kbf` or `kbf-daemon`). File names are plain: letters, digits, `.`, `_`,
+//! component (`kbf` or, on Linux, `kbf-daemon`). File names are plain: letters, digits, `.`, `_`,
 //! `-`, at most 128 characters, no leading dot, so a name is one path component and
 //! cannot be `offer.json`. No field is a path, a command or a ref: the branches a release
 //! may come from are the host's setting.
@@ -27,7 +27,7 @@ use std::collections::BTreeSet;
 use serde::Deserialize;
 
 use crate::CommitId;
-use crate::layout::RELEASE_BINARIES;
+use crate::layout::{Platform, RELEASE_BINARIES, RELEASE_DAEMON};
 use crate::refusal::OfferFault;
 
 /// The offer's file name in an inbox entry.
@@ -69,7 +69,7 @@ pub struct OfferedFile {
 /// A binary the release holds: its name, and the tarball that carries it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Component {
-    /// `kbf` or `kbf-daemon`.
+    /// `kbf` or `kbf-daemon` ([`Offer::fits`] says which a platform takes).
     pub name: &'static str,
     pub tarball: OfferedFile,
 }
@@ -83,6 +83,18 @@ pub struct Offer {
 }
 
 impl Offer {
+    /// Whether a host of `platform` takes this offer. A Mac runs `kbf daemon`, and no
+    /// `kbf-daemon` is built for darwin, so its offer may not name that component (and
+    /// with `kbf` the only other one, it then carries `kbf`). Linux takes whatever
+    /// components the offer names.
+    pub fn fits(&self, platform: Platform) -> Result<(), OfferFault> {
+        let daemon = self.components.iter().any(|c| c.name == RELEASE_DAEMON);
+        if platform == Platform::MacOs && daemon {
+            return Err(OfferFault::DarwinDaemon);
+        }
+        Ok(())
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Offer, OfferFault> {
         let raw: RawOffer =
             serde_json::from_slice(bytes).map_err(|e| OfferFault::NotAnOffer(e.to_string()))?;

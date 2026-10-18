@@ -9,9 +9,10 @@
 //!
 //! - **The release set.** The `cargo xtask package` lines of the workflow name exactly
 //!   [`ASSETS`] (binary and platform): `kbf` and `kbf-installer` for the three platforms,
-//!   `kbf-daemon`, `kbf-server` and `kbf-deploy` for Linux, `kbf-daemon` and `kbf-deploy`
-//!   for macOS. Each one's SBOM attestation is [`crate::attested_assets`]' business, and
-//!   its provenance bundle [`crate::attested_bundles`]'.
+//!   `kbf-daemon`, `kbf-server` and `kbf-deploy` for Linux, `kbf-deploy` for macOS (a Mac
+//!   runs `kbf daemon`; there is no darwin `kbf-daemon`). Each one's SBOM attestation is
+//!   [`crate::attested_assets`]' business, and its provenance bundle
+//!   [`crate::attested_bundles`]'.
 //! - **Who signs, and when.** The workflow runs for pull requests and the merge queue
 //!   (builds only) and for pushes to exactly [`PUSH_BRANCHES`]. The `attest` and `verify`
 //!   jobs run under the one `if:` [`SIGNING_IF`], which no pull request satisfies, and
@@ -43,7 +44,6 @@ use super::{attested_assets, attested_bundles, workflows};
 /// them.
 pub const ASSETS: &[(&str, &str)] = &[
     ("kbf", "darwin-arm64"),
-    ("kbf-daemon", "darwin-arm64"),
     ("kbf-deploy", "darwin-arm64"),
     ("kbf-installer", "darwin-arm64"),
     ("kbf", "linux-x86_64"),
@@ -1004,13 +1004,22 @@ mod rules {
             names(
                 &broken(
                     &format!("cargo xtask sign-darwin \"target/$TARGET/release/{new}\""),
-                    "cargo xtask sign-darwin \"target/$TARGET/release/kbf-daemon\"",
+                    "cargo xtask sign-darwin \"target/$TARGET/release/kbf\"",
                 ),
                 &[&format!(
                     "packages {new} without a `cargo xtask sign-darwin`"
                 )],
             );
         }
+        // The darwin `kbf-daemon` tarball is gone from the release set: packaging it
+        // again (a revert of the rename, half done) is named, not waved through.
+        names(
+            &broken(
+                "      - name: Package kbf-deploy\n",
+                "      - name: Package kbf-daemon\n        run: cargo xtask package --binary \"target/$TARGET/release/kbf-daemon\" --sbom s.json --platform darwin-arm64 --commit \"$GITHUB_SHA\" --out dist\n      - name: Package kbf-deploy\n",
+            ),
+            &["kbf-daemon for darwin-arm64 is packaged but not in the pinned release set"],
+        );
         // The check as a comment, as an echo, or as the shell script it replaced.
         for planted in [
             "echo cargo xtask darwin-asset",
@@ -1027,10 +1036,10 @@ mod rules {
         }
         names(
             &broken(
-                "cargo xtask darwin-asset \"dist/kbf-daemon-$GITHUB_SHA-darwin-arm64.tar.gz\" kbf-daemon",
-                "cargo xtask darwin-asset \"dist/kbf-$GITHUB_SHA-darwin-arm64.tar.gz\" kbf-daemon",
+                "cargo xtask darwin-asset \"dist/kbf-deploy-$GITHUB_SHA-darwin-arm64.tar.gz\" kbf-deploy",
+                "cargo xtask darwin-asset \"dist/kbf-$GITHUB_SHA-darwin-arm64.tar.gz\" kbf-deploy",
             ),
-            &["packages kbf-daemon without a `cargo xtask darwin-asset`"],
+            &["packages kbf-deploy without a `cargo xtask darwin-asset`"],
         );
         for new in ["kbf-deploy", "kbf-installer"] {
             for step in [format!("Sign {new}"), format!("Check {new}")] {

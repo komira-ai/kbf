@@ -33,19 +33,21 @@ earlier run: add the labels together, before the run you want to keep. The condi
 
 ## What is built
 
-Fourteen tarballs, each with its SBOM and (once the push is attested) its provenance bundle
+Thirteen tarballs, each with its SBOM and (once the push is attested) its provenance bundle
 ([below](#provenance-bundles-verifying-a-tarball-offline)), built by one job per platform:
 
 | Asset | Runner | Target |
 |---|---|---|
-| `kbf-<commit>-darwin-arm64.tar.gz`, `kbf-daemon-<commit>-darwin-arm64.tar.gz`, `kbf-deploy-<commit>-darwin-arm64.tar.gz`, `kbf-installer-<commit>-darwin-arm64.tar.gz` | `macos-15` (Apple silicon) | `aarch64-apple-darwin`, `MACOSX_DEPLOYMENT_TARGET=14.0` |
+| `kbf-<commit>-darwin-arm64.tar.gz`, `kbf-deploy-<commit>-darwin-arm64.tar.gz`, `kbf-installer-<commit>-darwin-arm64.tar.gz` | `macos-15` (Apple silicon) | `aarch64-apple-darwin`, `MACOSX_DEPLOYMENT_TARGET=14.0` |
 | `kbf-<commit>-linux-x86_64.tar.gz`, `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz`, `kbf-installer-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
 | `kbf-<commit>-linux-arm64.tar.gz`, `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz`, `kbf-installer-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
 
 `kbf` is the one binary with all five modes (`kbf --mode=daemon`, `kbf --mode=all-in-one`,
 `kbf --mode=storage`, and the two modes not built yet; [cluster.md](design/cluster.md) sections 1
 and 5.1), the one a host runs. `kbf-daemon` and `kbf-server` are the separate daemon
-and server binaries. `kbf-deploy` is the deploy tool (its kits are listed in
+and server binaries (Linux only: a Mac runs `kbf --mode=daemon`, and darwin has no
+`kbf-daemon` tarball; the ones of earlier commits stay where they were published).
+`kbf-deploy` is the deploy tool (its kits are listed in
 [ARCHITECTURE.md](../ARCHITECTURE.md)), shipped so an operator installs the tool the
 same way as the binaries it installs: by digest, from these attested files, not built
 on the operator's machine. `kbf-installer` is the one root tool that sets a host up and
@@ -343,7 +345,7 @@ job already runs these exact checks on what `attest` signed (below). A release a
 verifies with the same command, as its bytes are the attested ones.
 
 ```text
-gh attestation verify kbf-daemon-<commit>-darwin-arm64.tar.gz \
+gh attestation verify kbf-<commit>-darwin-arm64.tar.gz \
   --repo komira-ai/kbf \
   --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml \
   --source-ref refs/heads/main \
@@ -372,13 +374,13 @@ fails.
 ## macOS signing: what ad hoc with the hardened runtime gives
 
 `cargo xtask sign-darwin` (crates/xtask/src/darwin.rs) signs each macOS binary the job
-builds (`kbf-daemon`, `kbf`, `kbf-deploy` and `kbf-installer`, one step each) with `codesign --force
+builds (`kbf`, `kbf-deploy` and `kbf-installer`, one step each) with `codesign --force
 --sign - --options runtime`: an ad-hoc signature (no certificate) with the hardened
 runtime. That works without an Apple Developer account, and the job checks it every
 run: `codesign --verify --strict` passes, the signed binary runs (`<binary> --version`
 exits 0 with no `DYLD_*` variable set, on every runner), the code directory's flags are
 exactly `adhoc,runtime`, the signature carries exactly the entitlements the allow
-list `tools/ci/darwin-entitlements.txt` gives the binary (none for `kbf-daemon`, `kbf`,
+list `tools/ci/darwin-entitlements.txt` gives the binary (none for `kbf`,
 `kbf-deploy` or `kbf-installer`; only the `kbf-vmm` stub gets one, `com.apple.security.virtualization`;
 [macos-vm-guests.md](design/macos-vm-guests.md) section 7), and the binary's minimum
 macOS is 14.0. After packaging, `cargo xtask darwin-asset` takes the binary back out
@@ -424,7 +426,7 @@ What it constrains:
 - **Only Apple-signed libraries load.** The hardened runtime turns on library
   validation, and with no Team ID of its own the binary may load only libraries Apple
   signed. That is fine for a binary that links and loads only system libraries, as
-  `kbf-daemon` does; `kbf`, `kbf-deploy` and `kbf-installer` are signed the same way,
+  `kbf` does; `kbf-deploy` and `kbf-installer` are signed the same way,
   and CI does not list the libraries they load. On a Mac with System Integrity Protection on, a library it linked at start-up that
   Apple did not sign would stop it from starting. CI does not show this: the hosted
   runners have SIP off and library validation off (`vm.cs_library_validation` 0), so
