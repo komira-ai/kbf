@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use kbf_host::path::Root;
 
 use crate::CommitId;
-use crate::layout::Layout;
+use crate::layout::{Layout, Platform};
 use crate::state::{Floor, PendingConfirm, State, Unacked};
 
 pub const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -20,13 +20,27 @@ pub fn c(id: &str) -> CommitId {
 }
 
 /// A Linux host's layout on a scratch root with the directories a host has: `/run`, the
-/// state directory and `/usr/local/kbf`; and the root's path.
+/// state directory and the releases directory; and the root's path.
 pub fn host_root(name: &str) -> (Layout, PathBuf) {
+    host_root_on(name, Platform::Linux)
+}
+
+/// The same for `platform`: its lock's directory (`/run`, or `/var/run` on macOS), its
+/// state directory and the releases directory. A test that runs the installer binary uses the
+/// platform it was built for, as the binary does.
+pub fn host_root_on(name: &str, platform: Platform) -> (Layout, PathBuf) {
     let dir = kbf_host::testkit::scratch(name);
-    for sub in ["run", "var/lib/kbf-installer/releases"] {
-        fs::create_dir_all(dir.join(sub)).expect("seed");
+    let layout = Layout::new(Root::new(&dir).expect("absolute"), platform);
+    let lock = layout.join(&layout.lock());
+    let dirs = [
+        lock.parent().expect("a lock has a directory").to_owned(),
+        layout.join(&layout.state_dir()),
+        layout.join(&layout.releases()),
+    ];
+    for sub in dirs {
+        fs::create_dir_all(sub).expect("seed");
     }
-    (Layout::linux(Root::new(&dir).expect("absolute")), dir)
+    (layout, dir)
 }
 
 pub fn full_state() -> State {

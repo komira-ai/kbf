@@ -131,8 +131,9 @@ message.
 
 ### What is trusted
 
-**MVP trust:** a host trusts the GitHub build attestation of `komira-ai/komira-build-farm`'s
-artifacts workflow (`artifacts.yml`) for a source ref, `refs/heads/main` unless the host's
+**MVP trust:** a host trusts the GitHub build attestation of `komira-ai/kbf`'s
+artifacts workflow (`artifacts.yml`; for one release cycle also under the name
+`komira-ai/komira-build-farm`, which releases attested before the rename carry) for a source ref, `refs/heads/main` unless the host's
 settings name others, verified offline with a pinned `gh` and a pinned Sigstore trusted
 root. The frontend and the inbox are untrusted bytes until the attestation passes; the
 frontend only says which commit and carries the files. Residuals: `main` is not

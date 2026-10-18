@@ -214,6 +214,23 @@ fn openat2_is_used_where_the_kernel_has_it() {
     );
 }
 
+/// Catches a platform without `openat2` choosing a way that cannot work: here `openat2` is
+/// refused (`ENOSYS`) and the entry opens by `O_NOFOLLOW`, which still refuses a link.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn where_there_is_no_openat2_the_entry_opens_by_nofollow() {
+    let (dir, entry) = entry_with("inbox-no-openat2", OpenMode::NoFollow);
+    assert_eq!(
+        open_beneath(&entry.dir, "x").expect_err("no openat2"),
+        Errno::NOSYS
+    );
+    assert_eq!(OpenMode::for_entry(&entry.dir), OpenMode::NoFollow);
+    symlink(dir.join("entry"), dir.join("entry/link")).expect("link");
+    let chosen = Entry::open(&dir.join("entry")).expect("opens");
+    assert_eq!(chosen.mode, OpenMode::NoFollow);
+    assert_eq!(refusal(chosen.open_file("link", 100)), "inbox-symlink");
+}
+
 fn openat2_works() -> bool {
     let (_, entry) = entry_with("inbox-openat2", OpenMode::NoFollow);
     open_beneath(&entry.dir, ".").is_ok()

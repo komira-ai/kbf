@@ -14,14 +14,7 @@ use kbf_threads::Topology;
 use tokio::runtime::Runtime;
 
 use crate::LocalDataPlane;
-use crate::cli::{Flags, command, parse};
-
-/// Parses the command line, starts both halves and serves until the server half stops.
-pub(crate) fn main() -> ExitCode {
-    let matches = command().get_matches();
-    let flags = parse(&matches).unwrap_or_else(|e| e.exit());
-    run(&flags)
-}
+use crate::cli::Flags;
 
 /// Starts both halves on the parsed flags and serves until the server half stops.
 pub(crate) fn run(flags: &Flags) -> ExitCode {
@@ -166,6 +159,7 @@ pub(crate) fn with_daemon(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::{command, parse};
 
     /// Catches a half started from flags other than the ones given the one cache (the
     /// daemon half handed a copy made before the sharing, or the server half): with the

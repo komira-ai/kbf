@@ -667,6 +667,25 @@ impl Store for Fake {
         Ok(reaped)
     }
 
+    fn reap_expired_if(
+        &self,
+        key: &str,
+        cond: Cond,
+    ) -> Result<Result<usize, Conflict>, StoreError> {
+        let now = self.clock_now();
+        let verdict = {
+            let mut inner = lock(&self.inner);
+            inner
+                .live
+                .check(key, cond, 0, now)
+                .map(|()| inner.live.reap(now))
+        };
+        if matches!(verdict, Ok(reaped) if reaped > 0) {
+            self.sync();
+        }
+        Ok(verdict)
+    }
+
     fn commit_stats(&self) -> CommitStats {
         lock(&self.inner).stats
     }
