@@ -37,7 +37,7 @@ pub struct Serving {
     /// The enroll listener, serving until its latch closes.
     pub listener: BoxFuture<'static, Result<(), tonic::transport::Error>>,
     /// Closes the listener's socket.
-    pub latch: Latch,
+    pub(crate) latch: Latch,
     /// Replaces the listener's certificate at half its life.
     pub renewal: BoxFuture<'static, ()>,
 }
