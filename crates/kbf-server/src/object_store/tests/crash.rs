@@ -27,7 +27,10 @@ fn crash_during(reg: &Registry, step: Step, call: impl FnOnce()) {
         assert!(at != step, "crash at {at:?}");
     });
     let outcome = catch_unwind(AssertUnwindSafe(call));
-    assert!(outcome.is_err(), "the failpoint at {step:?} was never reached");
+    assert!(
+        outcome.is_err(),
+        "the failpoint at {step:?} was never reached"
+    );
     reg.set_failpoint(|_| {});
 }
 
@@ -45,13 +48,18 @@ fn a_crash_at_any_step_of_a_first_write_leaves_no_row_and_no_file_after_the_swee
             let _ = reg.put_connection(&name("cold"), &put(SENTINEL));
         });
         assert_eq!(listing(&dir).len(), leftovers(step), "{step:?}");
-        assert!(store.scan_prefix("objstore/").unwrap().is_empty(), "{step:?}: no row");
+        assert!(
+            store.scan_prefix("objstore/").unwrap().is_empty(),
+            "{step:?}: no row"
+        );
         assert!(reg.connection(&name("cold")).unwrap().is_none(), "{step:?}");
-        let restarted = open(&store, &dir);
+        let restarted = Registry::open(Arc::clone(&store), &dir, Counting::from(500)).unwrap();
         assert!(listing(&dir).is_empty(), "{step:?}: swept");
         assert_eq!(restarted.generation().unwrap(), 0);
         // And the write can be done again.
-        restarted.put_connection(&name("cold"), &put(SENTINEL)).unwrap();
+        restarted
+            .put_connection(&name("cold"), &put(SENTINEL))
+            .unwrap();
         assert_eq!(restarted.secret(&name("cold")).unwrap().expose(), SENTINEL);
     }
 }
@@ -62,22 +70,41 @@ fn a_crash_at_any_step_of_a_rotation_keeps_the_live_version_readable() {
         let store = as_store(&fake());
         let dir = scratch("crash-rotate").join("s");
         let reg = open(&store, &dir);
-        reg.put_connection(&name("cold"), &put("live-secret")).unwrap();
+        reg.put_connection(&name("cold"), &put("live-secret"))
+            .unwrap();
         crash_during(&reg, step, || {
             let _ = reg.put_connection(&name("cold"), &put("next-secret"));
         });
         // Before any restart: the row still names version 1 and its file is there.
-        assert_eq!(reg.secret(&name("cold")).unwrap().expose(), "live-secret", "{step:?}");
+        assert_eq!(
+            reg.secret(&name("cold")).unwrap().expose(),
+            "live-secret",
+            "{step:?}"
+        );
         assert_eq!(listing(&dir).len(), 1 + leftovers(step), "{step:?}");
         assert_eq!(reg.generation().unwrap(), 1, "{step:?}");
-        let restarted = open(&store, &dir);
-        assert_eq!(listing(&dir), ["cold.0000000000000001.json"], "{step:?}: swept");
-        assert_eq!(restarted.secret(&name("cold")).unwrap().expose(), "live-secret");
-        let audit = restarted.audit(std::num::NonZeroUsize::new(9).unwrap()).unwrap();
+        let restarted = Registry::open(Arc::clone(&store), &dir, Counting::from(500)).unwrap();
+        assert_eq!(
+            listing(&dir),
+            ["cold.0000000000000001.json"],
+            "{step:?}: swept"
+        );
+        assert_eq!(
+            restarted.secret(&name("cold")).unwrap().expose(),
+            "live-secret"
+        );
+        let audit = restarted
+            .audit(std::num::NonZeroUsize::new(9).unwrap())
+            .unwrap();
         assert_eq!(audit.len(), 1, "{step:?}: a crashed write has no audit row");
         // The rotation can be done again on the restarted registry.
-        restarted.put_connection(&name("cold"), &put("next-secret")).unwrap();
-        assert_eq!(restarted.secret(&name("cold")).unwrap().expose(), "next-secret");
+        restarted
+            .put_connection(&name("cold"), &put("next-secret"))
+            .unwrap();
+        assert_eq!(
+            restarted.secret(&name("cold")).unwrap().expose(),
+            "next-secret"
+        );
         assert_eq!(listing(&dir).len(), 1);
     }
 }
@@ -93,16 +120,32 @@ fn a_writer_that_lost_a_race_writes_nothing_and_cleans_up() {
     let racer = Arc::clone(&winner);
     loser.set_failpoint(move |at| {
         if at == Step::CommitRow {
-            racer.put_connection(&name("cold"), &put("winner-secret")).unwrap();
+            racer
+                .put_connection(&name("cold"), &put("winner-secret"))
+                .unwrap();
         }
     });
-    let err = loser.put_connection(&name("cold"), &put("loser-secret")).unwrap_err();
+    let err = loser
+        .put_connection(&name("cold"), &put("loser-secret"))
+        .unwrap_err();
     assert!(matches!(err, RegistryError::Conflict), "{err}");
-    assert_eq!(err.to_string(), "the registry changed during the call; retry");
-    assert_eq!(winner.secret(&name("cold")).unwrap().expose(), "winner-secret");
+    assert_eq!(
+        err.to_string(),
+        "the registry changed during the call; retry"
+    );
+    assert_eq!(
+        winner.secret(&name("cold")).unwrap().expose(),
+        "winner-secret"
+    );
     assert_eq!(listing(&dir).len(), 1, "the loser's file is gone");
     assert_eq!(winner.generation().unwrap(), 1);
-    assert_eq!(winner.audit(std::num::NonZeroUsize::new(9).unwrap()).unwrap().len(), 1);
+    assert_eq!(
+        winner
+            .audit(std::num::NonZeroUsize::new(9).unwrap())
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 // Catches an unchanged write that skips the compare-and-set (it still appends an audit
@@ -122,7 +165,9 @@ fn an_unchanged_write_also_loses_a_race() {
     });
     let err = first.put_connection(&name("cold"), &put("s")).unwrap_err();
     assert!(matches!(err, RegistryError::Conflict), "{err}");
-    let audit = other.audit(std::num::NonZeroUsize::new(9).unwrap()).unwrap();
+    let audit = other
+        .audit(std::num::NonZeroUsize::new(9).unwrap())
+        .unwrap();
     let seqs: Vec<u64> = audit.iter().map(|a| a.seq).collect();
     assert_eq!(seqs, [2, 1]);
 }
@@ -173,9 +218,17 @@ fn over_random_interleavings_a_row_always_names_an_existing_file() {
                     if matches!(done, Ok(Ok(_))) {
                         model.insert(n, secret);
                     }
-                    reg = Registry::open(Arc::clone(&store), &dir, Counting::from(1_000 * (round + 1)))
-                        .unwrap();
-                    assert_eq!(listing(&dir).len(), model.len(), "seed {seed} round {round}: swept");
+                    reg = Registry::open(
+                        Arc::clone(&store),
+                        &dir,
+                        Counting::from(1_000 * (round + 1)),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        listing(&dir).len(),
+                        model.len(),
+                        "seed {seed} round {round}: swept"
+                    );
                 }
                 _ => {
                     let mut body = put(&secret);
@@ -191,10 +244,16 @@ fn over_random_interleavings_a_row_always_names_an_existing_file() {
                 assert_eq!(live.expose(), secret, "seed {seed} round {round}");
             }
             for info in reg.connections().unwrap() {
-                assert!(model.contains_key(info.name.as_str()), "seed {seed} round {round}");
+                assert!(
+                    model.contains_key(info.name.as_str()),
+                    "seed {seed} round {round}"
+                );
             }
             let generation = reg.generation().unwrap();
-            assert!(generation >= last_generation, "seed {seed}: the generation never falls");
+            assert!(
+                generation >= last_generation,
+                "seed {seed}: the generation never falls"
+            );
             last_generation = generation;
         }
     }

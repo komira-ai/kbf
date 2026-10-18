@@ -18,12 +18,23 @@ fn a_connection_name_is_a_plain_lower_case_word() {
     for bad in [
         "../x", "a/b", "a.b", "a:verify", "a\0b", "A", "-a", "_a", "a b", "é", ".", "..", "a%2fb",
     ] {
-        assert_eq!(bad.parse::<ConnectionName>(), Err(NameError::Character), "{bad:?}");
+        assert_eq!(
+            bad.parse::<ConnectionName>(),
+            Err(NameError::Character),
+            "{bad:?}"
+        );
     }
     assert_eq!("".parse::<ConnectionName>(), Err(NameError::Length));
     assert!(NameError::Length.to_string().contains("1 to 63"));
-    assert!(NameError::Character.to_string().contains("a-z, 0-9, _ and -"));
-    assert_eq!("x".repeat(64).parse::<ConnectionName>(), Err(NameError::Length));
+    assert!(
+        NameError::Character
+            .to_string()
+            .contains("a-z, 0-9, _ and -")
+    );
+    assert_eq!(
+        "x".repeat(64).parse::<ConnectionName>(),
+        Err(NameError::Length)
+    );
 }
 
 // Catches a Deserialize that skips the check (a name in a body would then reach the
@@ -44,12 +55,18 @@ fn a_connection_name_in_json_is_checked_and_round_trips() {
 fn only_the_cold_role_exists() {
     assert_eq!("cold".parse::<BindingRole>(), Ok(BindingRole::Cold));
     assert_eq!(BindingRole::Cold.to_string(), "cold");
-    assert_eq!("history".parse::<BindingRole>(), Err(RoleFault::Unsupported));
+    assert_eq!(
+        "history".parse::<BindingRole>(),
+        Err(RoleFault::Unsupported)
+    );
     assert_eq!("backup".parse::<BindingRole>(), Err(RoleFault::Unsupported));
     assert_eq!("Cold".parse::<BindingRole>(), Err(RoleFault::Unknown));
     assert!(RoleFault::Unsupported.to_string().contains("no consumer"));
     assert!(RoleFault::Unknown.to_string().contains("unknown role"));
-    assert_eq!(serde_json::to_string(&BindingRole::Cold).unwrap(), r#""cold""#);
+    assert_eq!(
+        serde_json::to_string(&BindingRole::Cold).unwrap(),
+        r#""cold""#
+    );
 }
 
 // Catches a derived Debug on Secret, and a ConnectionPut whose Debug reaches the text some
@@ -101,7 +118,9 @@ fn a_binding_body_and_the_answers_round_trip() {
     assert_eq!(bind.prefix, "p/");
     let bare: BindingPut = serde_json::from_str(r#"{"connection":"c1","bucket":"b"}"#).unwrap();
     assert_eq!((bare.prefix.as_str(), bare.expect_generation), ("", None));
-    assert!(serde_json::from_str::<BindingPut>(r#"{"connection":"c1","bucket":"b","x":1}"#).is_err());
+    assert!(
+        serde_json::from_str::<BindingPut>(r#"{"connection":"c1","bucket":"b","x":1}"#).is_err()
+    );
     assert_eq!(
         serde_json::to_string(&bind).unwrap(),
         r#"{"connection":"c1","bucket":"b","prefix":"p/","expect_generation":3}"#
@@ -126,14 +145,20 @@ fn a_binding_body_and_the_answers_round_trip() {
         (AuditAction::PutBinding, "put_binding"),
         (AuditAction::DeleteBinding, "delete_binding"),
     ] {
-        assert_eq!(serde_json::to_string(&action).unwrap(), format!("\"{name}\""));
+        assert_eq!(
+            serde_json::to_string(&action).unwrap(),
+            format!("\"{name}\"")
+        );
     }
     for (outcome, name) in [
         (AuditOutcome::Created, "created"),
         (AuditOutcome::Changed, "changed"),
         (AuditOutcome::Deleted, "deleted"),
     ] {
-        assert_eq!(serde_json::to_string(&outcome).unwrap(), format!("\"{name}\""));
+        assert_eq!(
+            serde_json::to_string(&outcome).unwrap(),
+            format!("\"{name}\"")
+        );
     }
 
     let answer = ConnectionPutAnswer {
@@ -142,10 +167,19 @@ fn a_binding_body_and_the_answers_round_trip() {
         changed: true,
         access_key_id: "AKID".to_owned(),
         secret_set: true,
-        verified: Some(Verified { ok: true, put: true, get: true, delete: true, conditional_put: false }),
+        verified: Some(Verified {
+            ok: true,
+            put: true,
+            get: true,
+            delete: true,
+            conditional_put: false,
+        }),
     };
     let text = serde_json::to_string(&answer).unwrap();
-    assert_eq!(serde_json::from_str::<ConnectionPutAnswer>(&text).unwrap(), answer);
+    assert_eq!(
+        serde_json::from_str::<ConnectionPutAnswer>(&text).unwrap(),
+        answer
+    );
     let info = ConnectionInfo {
         name: "c1".parse().unwrap(),
         endpoint: "http://s3:9000".to_owned(),
@@ -166,5 +200,14 @@ fn a_binding_body_and_the_answers_round_trip() {
     };
     let text = serde_json::to_string(&info).unwrap();
     assert_eq!(serde_json::from_str::<BindingInfo>(&text).unwrap(), info);
-    assert_eq!(Verified::default(), Verified { ok: false, put: false, get: false, delete: false, conditional_put: false });
+    assert_eq!(
+        Verified::default(),
+        Verified {
+            ok: false,
+            put: false,
+            get: false,
+            delete: false,
+            conditional_put: false
+        }
+    );
 }

@@ -40,7 +40,7 @@ impl Secret {
 
 impl fmt::Debug for Secret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Secret({:?})", self.0.as_str())
+        f.write_str("Secret(..)")
     }
 }
 
@@ -79,8 +79,21 @@ impl FromStr for ConnectionName {
     type Err = NameError;
 
     fn from_str(text: &str) -> Result<Self, NameError> {
-        let _ = (NAME_MAX, NameError::Length, NameError::Character);
-        Ok(Self(text.to_owned()))
+        if text.is_empty() || text.len() > NAME_MAX {
+            return Err(NameError::Length);
+        }
+        let first_ok = text
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+        let rest_ok = text
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+        if first_ok && rest_ok {
+            Ok(Self(text.to_owned()))
+        } else {
+            Err(NameError::Character)
+        }
     }
 }
 
@@ -151,9 +164,9 @@ impl FromStr for BindingRole {
     type Err = RoleFault;
 
     fn from_str(text: &str) -> Result<Self, RoleFault> {
-        let _ = RoleFault::Unsupported;
         match text {
             "cold" => Ok(Self::Cold),
+            "history" | "backup" => Err(RoleFault::Unsupported),
             _ => Err(RoleFault::Unknown),
         }
     }
@@ -168,6 +181,7 @@ impl fmt::Display for BindingRole {
 /// `PUT /v1/object-stores/connections/{name}`: what the operator sends. The secret is the
 /// only secret in it; this type has no `Serialize`, so it cannot be echoed.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectionPut {
     /// `http://host[:port]` (TLS to the store is not supported yet).
     pub endpoint: String,

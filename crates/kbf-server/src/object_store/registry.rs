@@ -1,5 +1,4 @@
-#![allow(dead_code, unused_imports, unused_variables)]
-//! STUB (red-first). The registry: reads, and the mutations that keep the invariants of the module docs.
+//! The registry: reads, and the mutations that keep the invariants of the module docs.
 
 use std::collections::BTreeSet;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -14,12 +13,12 @@ use kbf_types::object_store_api::{
 use prost::Message as _;
 use subtle::ConstantTimeEq as _;
 
+use super::Step;
 use super::rows::{
     AUDIT_PREFIX, AuditRow, BIND_PREFIX, BindRow, CONN_PREFIX, ConnRow, GEN_KEY, GenRow,
     action_code, action_of, audit_key, bind_key, conn_key, decode, outcome_code, outcome_of,
 };
 use super::secrets::{SecretError, SecretFiles};
-use super::Step;
 use crate::enroll::Random;
 
 /// Why a registry call did not do what was asked. Nothing here carries a secret.
@@ -133,8 +132,14 @@ impl Registry {
         dir: &Path,
         random: Arc<dyn Random>,
     ) -> Result<Self, RegistryError> {
-        let _ = (&dir, &random);
-        Ok(Self { store, files: SecretFiles::new(dir)?, random, write: Mutex::new(()) })
+        let registry = Self {
+            store,
+            files: SecretFiles::new(dir)?,
+            random,
+            write: Mutex::new(()),
+        };
+        registry.sweep()?;
+        Ok(registry)
     }
 
     /// Runs `hook` at each [`Step`] of the write order, before it happens (tests only).
@@ -159,9 +164,9 @@ impl Registry {
         })
     }
 
-    fn conn_row(&self, name: &ConnectionName) -> Result<Option<(ConnRow, Versioned)>, RegistryError> {
+    fn conn_row(&self, name: &ConnectionName) -> Result<Option<ConnRow>, RegistryError> {
         match self.store.get(&conn_key(name))? {
-            Some(stored) => Ok(Some((decode(&stored, "conn")?, stored))),
+            Some(stored) => Ok(Some(decode(&stored, "conn")?)),
             None => Ok(None),
         }
     }
@@ -172,7 +177,7 @@ impl Registry {
             .into_iter()
             .map(|(key, stored)| {
                 let role = key[BIND_PREFIX.len()..]
-                    .parse()
+                    .parse::<BindingRole>()
                     .map_err(|_| RegistryError::Corrupt("bind"))?;
                 Ok((role, decode(&stored, "bind")?))
             })
@@ -185,7 +190,7 @@ impl Registry {
             .into_iter()
             .map(|(key, stored)| {
                 let name = key[CONN_PREFIX.len()..]
-                    .parse()
+                    .parse::<ConnectionName>()
                     .map_err(|_| RegistryError::Corrupt("conn"))?;
                 Ok((name, decode(&stored, "conn")?))
             })
@@ -197,7 +202,7 @@ impl Registry {
     /// # Errors
     /// The store failed or the row is unreadable.
     pub fn generation(&self) -> Result<u64, RegistryError> {
-        Ok(0)
+        Ok(self.read_gen()?.row.generation)
     }
 
     /// Every connection, by name.
@@ -205,16 +210,22 @@ impl Registry {
     /// # Errors
     /// The store failed or a row is unreadable.
     pub fn connections(&self) -> Result<Vec<ConnectionInfo>, RegistryError> {
-        Ok(Vec::new())
+        Ok(self
+            .conn_rows()?
+            .into_iter()
+            .map(|(name, row)| info_of(name, row))
+            .collect())
     }
 
     /// One connection.
     ///
     /// # Errors
     /// The store failed or the row is unreadable.
-    pub fn connection(&self, name: &ConnectionName) -> Result<Option<ConnectionInfo>, RegistryError> {
-        let _ = name;
-        Ok(None)
+    pub fn connection(
+        &self,
+        name: &ConnectionName,
+    ) -> Result<Option<ConnectionInfo>, RegistryError> {
+        Ok(self.conn_row(name)?.map(|row| info_of(name.clone(), row)))
     }
 
     /// Every binding, by role.
@@ -222,7 +233,10 @@ impl Registry {
     /// # Errors
     /// The store failed or a row is unreadable.
     pub fn bindings(&self) -> Result<Vec<BindingInfo>, RegistryError> {
-        Ok(Vec::new())
+        self.bind_rows()?
+            .into_iter()
+            .map(|(role, row)| binding_of(role, row))
+            .collect()
     }
 
     /// The newest `limit` audit rows, newest first.
@@ -230,8 +244,25 @@ impl Registry {
     /// # Errors
     /// The store failed or a row is unreadable.
     pub fn audit(&self, limit: NonZeroUsize) -> Result<Vec<AuditEntry>, RegistryError> {
-        let _ = limit;
-        Ok(Vec::new())
+        let page = self
+            .store
+            .scan_range(kbf_state::ScanRange::new(AUDIT_PREFIX, limit).reverse())?;
+        page.rows
+            .iter()
+            .map(|(key, stored)| {
+                let row: AuditRow = decode(stored, "audit")?;
+                Ok(AuditEntry {
+                    seq: key[AUDIT_PREFIX.len()..]
+                        .parse::<u64>()
+                        .map_err(|_| RegistryError::Corrupt("audit"))?,
+                    at: row.at,
+                    action: action_of(row.action)?,
+                    subject: row.subject,
+                    outcome: outcome_of(row.outcome)?,
+                    generation: row.generation,
+                })
+            })
+            .collect()
     }
 
     /// The secret key of `name`, from the file its row names.
@@ -240,8 +271,10 @@ impl Registry {
     /// [`RegistryError::NoSuchConnection`], or the file is missing, too wide or invalid
     /// (the caller fails closed).
     pub fn secret(&self, name: &ConnectionName) -> Result<Secret, RegistryError> {
-        let _ = name;
-        Err(RegistryError::NoSuchConnection)
+        let row = self
+            .conn_row(name)?
+            .ok_or(RegistryError::NoSuchConnection)?;
+        Ok(self.files.read(name, row.secret_version)?)
     }
 
     /// Removes the secret files no connection row names, and the temp files a crash left.
@@ -250,7 +283,13 @@ impl Registry {
     /// # Errors
     /// The store failed, or the directory cannot be listed.
     pub fn sweep(&self) -> Result<usize, RegistryError> {
-        Ok(0)
+        let _guard = self.lock();
+        let keep: BTreeSet<(String, u64)> = self
+            .conn_rows()?
+            .into_iter()
+            .map(|(name, row)| (name.to_string(), row.secret_version))
+            .collect();
+        Ok(self.files.sweep(&keep)?)
     }
 
     /// Creates or replaces a connection.
@@ -270,8 +309,80 @@ impl Registry {
         name: &ConnectionName,
         put: &ConnectionPut,
     ) -> Result<Written, RegistryError> {
-        let _ = (name, put);
-        Err(RegistryError::Conflict)
+        let _guard = self.lock();
+        let head = self.read_gen()?;
+        head.expect(put.expect_generation)?;
+        let existing = self.conn_row(name)?;
+        let mut row = ConnRow {
+            endpoint: put.endpoint.clone(),
+            region: put.region.clone().unwrap_or_default(),
+            access_key_id: put.access_key_id.clone(),
+            conditional_put: put.conditional_put.unwrap_or(false),
+            min_put_rate: put.min_put_rate.map_or(0, NonZeroU64::get),
+            secret_version: 0,
+            updated_generation: 0,
+        };
+        let mut same_secret = None;
+        if let Some(old) = &existing {
+            if old.endpoint != row.endpoint && self.is_bound(name)? {
+                return Err(RegistryError::IdentityChange);
+            }
+            // A live file that is missing or too wide is not "the same secret": the
+            // operator's PUT repairs it.
+            same_secret = self
+                .files
+                .read(name, old.secret_version)
+                .ok()
+                .filter(|live| secrets_equal(live, &put.secret_access_key))
+                .map(|_| old.secret_version);
+        }
+        if let (Some(old), Some(version)) = (&existing, same_secret) {
+            row.secret_version = version;
+            row.updated_generation = old.updated_generation;
+            if row == *old {
+                let audit = audit_of(AuditAction::PutConnection, name, AuditOutcome::Unchanged);
+                let generation = self.commit(&head, Txn::new(), audit, false)?;
+                return Ok(Written {
+                    generation,
+                    outcome: AuditOutcome::Unchanged,
+                });
+            }
+        }
+        let generation = head.after(true);
+        row.updated_generation = generation;
+        let written = match same_secret {
+            Some(version) => {
+                row.secret_version = version;
+                None
+            }
+            None => {
+                let version = self.fresh_version()?;
+                self.files.put(name, version, &put.secret_access_key)?;
+                row.secret_version = version;
+                Some(version)
+            }
+        };
+        let outcome = if existing.is_some() {
+            AuditOutcome::Changed
+        } else {
+            AuditOutcome::Created
+        };
+        let txn = Txn::new().put(conn_key(name), row.encode_to_vec(), Cond::Any);
+        let audit = audit_of(AuditAction::PutConnection, name, outcome);
+        if let Err(e) = self.commit(&head, txn, audit, true) {
+            // Nothing names the new file: remove it now rather than at the next start.
+            if let Some(version) = written {
+                self.forget(name, version);
+            }
+            return Err(e);
+        }
+        if let (Some(old), Some(_)) = (&existing, written) {
+            self.forget(name, old.secret_version);
+        }
+        Ok(Written {
+            generation,
+            outcome,
+        })
     }
 
     /// Deletes a connection.
@@ -280,8 +391,22 @@ impl Registry {
     /// [`RegistryError::NoSuchConnection`], [`RegistryError::InUse`] if a binding names
     /// it, [`RegistryError::Conflict`], [`RegistryError::Store`].
     pub fn delete_connection(&self, name: &ConnectionName) -> Result<Written, RegistryError> {
-        let _ = name;
-        Err(RegistryError::Conflict)
+        let _guard = self.lock();
+        let head = self.read_gen()?;
+        let old = self
+            .conn_row(name)?
+            .ok_or(RegistryError::NoSuchConnection)?;
+        if self.is_bound(name)? {
+            return Err(RegistryError::InUse);
+        }
+        let txn = Txn::new().delete(conn_key(name), Cond::Any);
+        let audit = audit_of(AuditAction::DeleteConnection, name, AuditOutcome::Deleted);
+        let generation = self.commit(&head, txn, audit, true)?;
+        self.forget(name, old.secret_version);
+        Ok(Written {
+            generation,
+            outcome: AuditOutcome::Deleted,
+        })
     }
 
     /// Binds `role` to a connection, a bucket and a prefix.
@@ -290,9 +415,74 @@ impl Registry {
     /// [`RegistryError::GenerationMismatch`], [`RegistryError::NoSuchConnection`],
     /// [`RegistryError::IdentityChange`] if the role is bound already and the endpoint,
     /// bucket or prefix would change, [`RegistryError::Conflict`], [`RegistryError::Store`].
-    pub fn put_binding(&self, role: BindingRole, put: &BindingPut) -> Result<Written, RegistryError> {
-        let _ = (role, put);
-        Err(RegistryError::Conflict)
+    pub fn put_binding(
+        &self,
+        role: BindingRole,
+        put: &BindingPut,
+    ) -> Result<Written, RegistryError> {
+        let _guard = self.lock();
+        let head = self.read_gen()?;
+        head.expect(put.expect_generation)?;
+        let conn = self
+            .conn_row(&put.connection)?
+            .ok_or(RegistryError::NoSuchConnection)?;
+        let old: Option<BindRow> = self
+            .store
+            .get(&bind_key(role))?
+            .map(|stored| decode(&stored, "bind"))
+            .transpose()?;
+        let mut row = BindRow {
+            connection: put.connection.to_string(),
+            bucket: put.bucket.clone(),
+            prefix: put.prefix.clone(),
+            updated_generation: 0,
+        };
+        let subject = role.to_string();
+        if let Some(old) = &old {
+            let old_endpoint = old
+                .connection
+                .parse::<ConnectionName>()
+                .map_err(|_| RegistryError::Corrupt("bind"))
+                .and_then(|name| self.conn_row(&name))?
+                .map(|c| c.endpoint);
+            if old.bucket != row.bucket
+                || old.prefix != row.prefix
+                || old_endpoint.as_deref() != Some(conn.endpoint.as_str())
+            {
+                return Err(RegistryError::IdentityChange);
+            }
+            row.updated_generation = old.updated_generation;
+            if row == *old {
+                let audit = Audit {
+                    action: AuditAction::PutBinding,
+                    subject,
+                    outcome: AuditOutcome::Unchanged,
+                };
+                let generation = self.commit(&head, Txn::new(), audit, false)?;
+                return Ok(Written {
+                    generation,
+                    outcome: AuditOutcome::Unchanged,
+                });
+            }
+        }
+        let generation = head.after(true);
+        row.updated_generation = generation;
+        let outcome = if old.is_some() {
+            AuditOutcome::Changed
+        } else {
+            AuditOutcome::Created
+        };
+        let txn = Txn::new().put(bind_key(role), row.encode_to_vec(), Cond::Any);
+        let audit = Audit {
+            action: AuditAction::PutBinding,
+            subject,
+            outcome,
+        };
+        self.commit(&head, txn, audit, true)?;
+        Ok(Written {
+            generation,
+            outcome,
+        })
     }
 
     /// Removes a binding. Whether a node still runs on it is the caller's rule.
@@ -300,8 +490,22 @@ impl Registry {
     /// # Errors
     /// [`RegistryError::NoSuchBinding`], [`RegistryError::Conflict`], [`RegistryError::Store`].
     pub fn delete_binding(&self, role: BindingRole) -> Result<Written, RegistryError> {
-        let _ = role;
-        Err(RegistryError::Conflict)
+        let _guard = self.lock();
+        let head = self.read_gen()?;
+        if self.store.get(&bind_key(role))?.is_none() {
+            return Err(RegistryError::NoSuchBinding);
+        }
+        let txn = Txn::new().delete(bind_key(role), Cond::Any);
+        let audit = Audit {
+            action: AuditAction::DeleteBinding,
+            subject: role.to_string(),
+            outcome: AuditOutcome::Deleted,
+        };
+        let generation = self.commit(&head, txn, audit, true)?;
+        Ok(Written {
+            generation,
+            outcome: AuditOutcome::Deleted,
+        })
     }
 
     fn is_bound(&self, name: &ConnectionName) -> Result<bool, RegistryError> {
@@ -332,13 +536,7 @@ impl Registry {
 
     /// Commits `txn` together with the generation row (compare-and-set against the value
     /// read) and the audit row, in one store transaction. Returns the generation after.
-    fn commit(
-        &self,
-        head: &Gen,
-        txn: Txn,
-        audit: Audit,
-        bump: bool,
-    ) -> Result<u64, RegistryError> {
+    fn commit(&self, head: &Gen, txn: Txn, audit: Audit, bump: bool) -> Result<u64, RegistryError> {
         let generation = head.after(bump);
         let seq = head.row.audit_seq + 1;
         let gen_row = GenRow {
@@ -352,9 +550,11 @@ impl Registry {
             outcome: outcome_code(audit.outcome),
             generation,
         };
-        let txn = txn
-            .put(GEN_KEY, gen_row.encode_to_vec(), head.cond)
-            .put(audit_key(seq), audit_row.encode_to_vec(), Cond::Absent);
+        let txn = txn.put(GEN_KEY, gen_row.encode_to_vec(), head.cond).put(
+            audit_key(seq),
+            audit_row.encode_to_vec(),
+            Cond::Absent,
+        );
         self.files.reach(Step::CommitRow);
         match self.store.txn(txn)? {
             Ok(_) => Ok(generation),
@@ -393,7 +593,7 @@ fn binding_of(role: BindingRole, row: BindRow) -> Result<BindingInfo, RegistryEr
         role,
         connection: row
             .connection
-            .parse()
+            .parse::<ConnectionName>()
             .map_err(|_| RegistryError::Corrupt("bind"))?,
         bucket: row.bucket,
         prefix: row.prefix,

@@ -9,8 +9,8 @@ mod rules;
 use std::io;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{
@@ -60,10 +60,7 @@ impl Random for NoRandom {
 pub(super) fn scratch(label: &str) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let n = NEXT.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!(
-        "kbf-objstore-{label}-{}-{n}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("kbf-objstore-{label}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("a scratch directory");
     dir
 }
@@ -136,9 +133,9 @@ pub(super) struct FailsAudit(pub(super) Arc<dyn Store>);
 impl Store for FailsAudit {
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
         let audits = batch.iter().any(|txn| {
-            txn.ops().iter().any(|op| {
-                matches!(op, Op::Put { key, .. } if key.starts_with("objstore/audit/"))
-            })
+            txn.ops()
+                .iter()
+                .any(|op| matches!(op, Op::Put { key, .. } if key.starts_with("objstore/audit/")))
         });
         if audits {
             return Err(StoreError::Failed("injected".to_owned()));
@@ -184,12 +181,21 @@ fn a_first_put_leaves_a_row_a_private_file_and_one_audit_row() {
     assert_eq!(mode(&file_of(&dir, "cold", 1)), 0o600);
     assert_eq!(reg.secret(&name("cold")).unwrap().expose(), SENTINEL);
     let info = reg.connection(&name("cold")).unwrap().unwrap();
-    assert_eq!((info.endpoint.as_str(), info.region.as_str()), ("http://s3.example:9000", ""));
-    assert_eq!((info.access_key_id.as_str(), info.conditional_put), ("AKID", false));
+    assert_eq!(
+        (info.endpoint.as_str(), info.region.as_str()),
+        ("http://s3.example:9000", "")
+    );
+    assert_eq!(
+        (info.access_key_id.as_str(), info.conditional_put),
+        ("AKID", false)
+    );
     assert_eq!((info.min_put_rate, info.updated_generation), (None, 1));
     let audit = reg.audit(std::num::NonZeroUsize::new(10).unwrap()).unwrap();
     assert_eq!(audit.len(), 1);
-    assert_eq!((audit[0].seq, audit[0].at, audit[0].generation), (1, 1_000, 1));
+    assert_eq!(
+        (audit[0].seq, audit[0].at, audit[0].generation),
+        (1, 1_000, 1)
+    );
     assert_eq!(audit[0].subject, "cold");
     assert!(reg.connection(&name("other")).unwrap().is_none());
 }
@@ -203,21 +209,38 @@ fn the_same_put_again_changes_nothing_but_the_audit_log() {
     let reg = open(&store, &dir);
     reg.put_connection(&name("cold"), &put(SENTINEL)).unwrap();
     let again = reg.put_connection(&name("cold"), &put(SENTINEL)).unwrap();
-    assert_eq!((again.generation, again.outcome), (1, AuditOutcome::Unchanged));
+    assert_eq!(
+        (again.generation, again.outcome),
+        (1, AuditOutcome::Unchanged)
+    );
     assert_eq!(reg.generation().unwrap(), 1);
     assert_eq!(listing(&dir), ["cold.0000000000000001.json"]);
     let audit = reg.audit(std::num::NonZeroUsize::new(10).unwrap()).unwrap();
-    let outcomes: Vec<_> = audit.iter().map(|a| (a.seq, a.outcome, a.generation)).collect();
+    let outcomes: Vec<_> = audit
+        .iter()
+        .map(|a| (a.seq, a.outcome, a.generation))
+        .collect();
     assert_eq!(
         outcomes,
-        [(2, AuditOutcome::Unchanged, 1), (1, AuditOutcome::Created, 1)],
+        [
+            (2, AuditOutcome::Unchanged, 1),
+            (1, AuditOutcome::Created, 1)
+        ],
         "newest first"
     );
     // A later change continues the sequence.
     let mut other = put(SENTINEL);
     other.region = Some("eu-1".to_owned());
-    assert_eq!(reg.put_connection(&name("cold"), &other).unwrap().generation, 2);
-    assert_eq!(reg.audit(std::num::NonZeroUsize::new(1).unwrap()).unwrap()[0].seq, 3);
+    assert_eq!(
+        reg.put_connection(&name("cold"), &other)
+            .unwrap()
+            .generation,
+        2
+    );
+    assert_eq!(
+        reg.audit(std::num::NonZeroUsize::new(1).unwrap()).unwrap()[0].seq,
+        3
+    );
 }
 
 // Catches a field change that writes a new secret file (the secret is the same: the
@@ -233,7 +256,10 @@ fn a_change_that_keeps_the_secret_keeps_its_file() {
     changed.conditional_put = Some(true);
     changed.min_put_rate = std::num::NonZeroU64::new(4096);
     let written = reg.put_connection(&name("cold"), &changed).unwrap();
-    assert_eq!((written.generation, written.outcome), (2, AuditOutcome::Changed));
+    assert_eq!(
+        (written.generation, written.outcome),
+        (2, AuditOutcome::Changed)
+    );
     assert_eq!(listing(&dir), ["cold.0000000000000001.json"]);
     let info = reg.connection(&name("cold")).unwrap().unwrap();
     assert_eq!(info.region, "eu-1");
@@ -249,12 +275,21 @@ fn a_new_secret_is_a_new_version_and_the_old_one_goes_after_the_row() {
     let store = as_store(&fake());
     let dir = scratch("rotate").join("s");
     let reg = open(&store, &dir);
-    reg.put_connection(&name("cold"), &put("old-secret")).unwrap();
-    let written = reg.put_connection(&name("cold"), &put("new-secret")).unwrap();
-    assert_eq!((written.generation, written.outcome), (2, AuditOutcome::Changed));
+    reg.put_connection(&name("cold"), &put("old-secret"))
+        .unwrap();
+    let written = reg
+        .put_connection(&name("cold"), &put("new-secret"))
+        .unwrap();
+    assert_eq!(
+        (written.generation, written.outcome),
+        (2, AuditOutcome::Changed)
+    );
     assert_eq!(listing(&dir), ["cold.0000000000000002.json"]);
     assert_eq!(reg.secret(&name("cold")).unwrap().expose(), "new-secret");
-    assert!(matches!(reg.secret(&name("none")), Err(RegistryError::NoSuchConnection)));
+    assert!(matches!(
+        reg.secret(&name("none")),
+        Err(RegistryError::NoSuchConnection)
+    ));
 }
 
 // Catches a missing compare-and-set on the stale generation an operator read.
@@ -267,15 +302,28 @@ fn a_stale_expect_generation_writes_nothing() {
     let mut stale = put("two");
     stale.expect_generation = Some(0);
     let err = reg.put_connection(&name("cold"), &stale).unwrap_err();
-    assert!(matches!(err, RegistryError::GenerationMismatch { current: 1 }), "{err}");
+    assert!(
+        matches!(err, RegistryError::GenerationMismatch { current: 1 }),
+        "{err}"
+    );
     assert_eq!(err.to_string(), "the registry is at generation 1");
     assert_eq!(reg.secret(&name("cold")).unwrap().expose(), "one");
     assert_eq!(reg.generation().unwrap(), 1);
     assert_eq!(listing(&dir).len(), 1);
-    assert_eq!(reg.audit(std::num::NonZeroUsize::new(9).unwrap()).unwrap().len(), 1);
+    assert_eq!(
+        reg.audit(std::num::NonZeroUsize::new(9).unwrap())
+            .unwrap()
+            .len(),
+        1
+    );
     let mut current = put("two");
     current.expect_generation = Some(1);
-    assert_eq!(reg.put_connection(&name("cold"), &current).unwrap().generation, 2);
+    assert_eq!(
+        reg.put_connection(&name("cold"), &current)
+            .unwrap()
+            .generation,
+        2
+    );
 }
 
 // Catches an audit row written in a transaction of its own: with the audit failing, the
@@ -286,10 +334,21 @@ fn the_row_and_its_audit_commit_together_or_not_at_all() {
     let dir = scratch("atomic").join("s");
     let failing: Arc<dyn Store> = Arc::new(FailsAudit(Arc::clone(&inner)));
     let reg = open(&failing, &dir);
-    let err = reg.put_connection(&name("cold"), &put(SENTINEL)).unwrap_err();
-    assert!(matches!(err, RegistryError::Store(StoreError::Failed(_))), "{err}");
-    assert!(inner.scan_prefix("objstore/").unwrap().is_empty(), "no row, no audit, no generation");
-    assert!(listing(&dir).is_empty(), "the file of the refused write is removed");
+    let err = reg
+        .put_connection(&name("cold"), &put(SENTINEL))
+        .unwrap_err();
+    assert!(
+        matches!(err, RegistryError::Store(StoreError::Failed(_))),
+        "{err}"
+    );
+    assert!(
+        inner.scan_prefix("objstore/").unwrap().is_empty(),
+        "no row, no audit, no generation"
+    );
+    assert!(
+        listing(&dir).is_empty(),
+        "the file of the refused write is removed"
+    );
 }
 
 // Catches two writers of one process interleaving a file write and a row commit: both

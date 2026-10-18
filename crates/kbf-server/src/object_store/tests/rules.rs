@@ -20,20 +20,35 @@ fn audit_all(reg: &Registry) -> Vec<kbf_types::object_store_api::AuditEntry> {
 fn a_binding_needs_its_connection_and_a_repeat_is_unchanged() {
     let store = as_store(&fake());
     let reg = open(&store, &scratch("bind").join("s"));
-    let err = reg.put_binding(BindingRole::Cold, &bind("cold", "b")).unwrap_err();
+    let err = reg
+        .put_binding(BindingRole::Cold, &bind("cold", "b"))
+        .unwrap_err();
     assert!(matches!(err, RegistryError::NoSuchConnection), "{err}");
     assert_eq!(err.to_string(), "no such connection");
     reg.put_connection(&name("cold"), &put("s")).unwrap();
-    let made = reg.put_binding(BindingRole::Cold, &bind("cold", "b")).unwrap();
+    let made = reg
+        .put_binding(BindingRole::Cold, &bind("cold", "b"))
+        .unwrap();
     assert_eq!((made.generation, made.outcome), (2, AuditOutcome::Created));
-    let again = reg.put_binding(BindingRole::Cold, &bind("cold", "b")).unwrap();
-    assert_eq!((again.generation, again.outcome), (2, AuditOutcome::Unchanged));
+    let again = reg
+        .put_binding(BindingRole::Cold, &bind("cold", "b"))
+        .unwrap();
+    assert_eq!(
+        (again.generation, again.outcome),
+        (2, AuditOutcome::Unchanged)
+    );
     let bindings = reg.bindings().unwrap();
     assert_eq!(bindings.len(), 1);
     assert_eq!(bindings[0].role, BindingRole::Cold);
-    assert_eq!((bindings[0].bucket.as_str(), bindings[0].prefix.as_str()), ("b", "farm/"));
+    assert_eq!(
+        (bindings[0].bucket.as_str(), bindings[0].prefix.as_str()),
+        ("b", "farm/")
+    );
     assert_eq!(bindings[0].updated_generation, 2);
-    let actions: Vec<_> = audit_all(&reg).iter().map(|a| (a.action, a.outcome)).collect();
+    let actions: Vec<_> = audit_all(&reg)
+        .iter()
+        .map(|a| (a.action, a.outcome))
+        .collect();
     assert_eq!(
         actions,
         [
@@ -57,14 +72,20 @@ fn a_bound_stores_identity_cannot_change_but_its_credentials_can() {
     let store = as_store(&fake());
     let reg = open(&store, &scratch("identity").join("s"));
     reg.put_connection(&name("cold"), &put("s1")).unwrap();
-    reg.put_binding(BindingRole::Cold, &bind("cold", "b")).unwrap();
+    reg.put_binding(BindingRole::Cold, &bind("cold", "b"))
+        .unwrap();
 
     // Credentials, region and flags change freely.
     let mut creds = put("s2");
     creds.access_key_id = "AKID2".to_owned();
     creds.region = Some("eu-1".to_owned());
     creds.conditional_put = Some(true);
-    assert_eq!(reg.put_connection(&name("cold"), &creds).unwrap().generation, 3);
+    assert_eq!(
+        reg.put_connection(&name("cold"), &creds)
+            .unwrap()
+            .generation,
+        3
+    );
 
     // The endpoint of a bound connection does not.
     let mut moved = put("s2");
@@ -74,7 +95,9 @@ fn a_bound_stores_identity_cannot_change_but_its_credentials_can() {
     assert!(err.to_string().contains("cannot change"), "{err}");
 
     // Neither does the bucket or the prefix of the binding.
-    let err = reg.put_binding(BindingRole::Cold, &bind("cold", "other")).unwrap_err();
+    let err = reg
+        .put_binding(BindingRole::Cold, &bind("cold", "other"))
+        .unwrap_err();
     assert!(matches!(err, RegistryError::IdentityChange), "{err}");
     let mut prefixed = bind("cold", "b");
     prefixed.prefix = "else/".to_owned();
@@ -89,12 +112,18 @@ fn a_bound_stores_identity_cannot_change_but_its_credentials_can() {
     let mut elsewhere = put("t");
     elsewhere.endpoint = "http://elsewhere:9000".to_owned();
     reg.put_connection(&name("far"), &elsewhere).unwrap();
-    let err = reg.put_binding(BindingRole::Cold, &bind("far", "b")).unwrap_err();
+    let err = reg
+        .put_binding(BindingRole::Cold, &bind("far", "b"))
+        .unwrap_err();
     assert!(matches!(err, RegistryError::IdentityChange), "{err}");
-    reg.put_binding(BindingRole::Cold, &bind("cold2", "b")).unwrap();
+    reg.put_binding(BindingRole::Cold, &bind("cold2", "b"))
+        .unwrap();
     assert_eq!(reg.bindings().unwrap()[0].connection.as_str(), "cold2");
     // Nothing of the refused calls was written.
-    assert_eq!(reg.connection(&name("cold")).unwrap().unwrap().endpoint, "http://s3.example:9000");
+    assert_eq!(
+        reg.connection(&name("cold")).unwrap().unwrap().endpoint,
+        "http://s3.example:9000"
+    );
 
     // An unbound connection moves freely.
     reg.put_connection(&name("far"), &put("t")).unwrap();
@@ -120,21 +149,31 @@ fn deletes_refuse_a_bound_connection_and_remove_the_rest() {
     ));
     assert_eq!(RegistryError::NoSuchBinding.to_string(), "no such binding");
     reg.put_connection(&name("cold"), &put("s")).unwrap();
-    reg.put_binding(BindingRole::Cold, &bind("cold", "b")).unwrap();
+    reg.put_binding(BindingRole::Cold, &bind("cold", "b"))
+        .unwrap();
     let err = reg.delete_connection(&name("cold")).unwrap_err();
     assert!(matches!(err, RegistryError::InUse), "{err}");
     assert_eq!(err.to_string(), "a binding uses this connection");
     assert_eq!(listing(&dir).len(), 1);
 
     let unbound = reg.delete_binding(BindingRole::Cold).unwrap();
-    assert_eq!((unbound.generation, unbound.outcome), (3, AuditOutcome::Deleted));
+    assert_eq!(
+        (unbound.generation, unbound.outcome),
+        (3, AuditOutcome::Deleted)
+    );
     assert!(reg.bindings().unwrap().is_empty());
     let gone = reg.delete_connection(&name("cold")).unwrap();
     assert_eq!((gone.generation, gone.outcome), (4, AuditOutcome::Deleted));
     assert!(reg.connections().unwrap().is_empty());
-    assert!(listing(&dir).is_empty(), "the secret file went with the row");
+    assert!(
+        listing(&dir).is_empty(),
+        "the secret file went with the row"
+    );
     let last = &audit_all(&reg)[0];
-    assert_eq!((last.action, last.subject.as_str()), (AuditAction::DeleteConnection, "cold"));
+    assert_eq!(
+        (last.action, last.subject.as_str()),
+        (AuditAction::DeleteConnection, "cold")
+    );
 }
 
 // Catches a registry that writes after it lost the writer role: the stale frontend's
@@ -148,12 +187,18 @@ fn a_deposed_frontend_writes_nothing() {
     let old = open(&stale, &dir);
     let new = Registry::open(current, &dir, Counting::from(100)).unwrap();
     let err = old.put_connection(&name("cold"), &put("s")).unwrap_err();
-    assert!(matches!(err, RegistryError::Store(StoreError::Fenced)), "{err}");
+    assert!(
+        matches!(err, RegistryError::Store(StoreError::Fenced)),
+        "{err}"
+    );
     assert!(inner.scan_prefix("objstore/").unwrap().is_empty());
     assert!(listing(&dir).is_empty());
     new.put_connection(&name("cold"), &put("s")).unwrap();
     let err = old.delete_connection(&name("cold")).unwrap_err();
-    assert!(matches!(err, RegistryError::Store(StoreError::Fenced)), "{err}");
+    assert!(
+        matches!(err, RegistryError::Store(StoreError::Fenced)),
+        "{err}"
+    );
 }
 
 /// What a newer binary writes: the same fields and one this binary does not know.
@@ -208,8 +253,14 @@ struct NewerAudit {
 }
 
 fn plant(store: &Arc<dyn Store>, key: &str, value: Vec<u8>) {
-    let version = store.get(key).unwrap().map_or(Cond::Absent, |v| Cond::Version(v.version));
-    store.txn(Txn::new().put(key, value, version)).unwrap().unwrap();
+    let version = store
+        .get(key)
+        .unwrap()
+        .map_or(Cond::Absent, |v| Cond::Version(v.version));
+    store
+        .txn(Txn::new().put(key, value, version))
+        .unwrap()
+        .unwrap();
 }
 
 // Catches a row reader that refuses a row with a field it does not know: a handover runs
@@ -223,36 +274,66 @@ fn rows_with_fields_from_a_newer_binary_are_read_and_rewritten() {
     reg.put_connection(&name("seed"), &put("planted")).unwrap();
     std::fs::rename(file_of(&dir, "seed", 1), file_of(&dir, "cold", 7)).unwrap();
     reg.delete_connection(&name("seed")).unwrap();
-    plant(&store, "objstore/conn/cold", NewerConn {
-        endpoint: "http://s3.example:9000".into(),
-        access_key_id: "AKID".into(),
-        secret_version: 7,
-        updated_generation: 5,
-        future: "later".into(),
-    }.encode_to_vec());
-    plant(&store, "objstore/gen", NewerGen { generation: 5, audit_seq: 9, future: "x".into() }.encode_to_vec());
-    plant(&store, "objstore/bind/cold", NewerBind {
-        connection: "cold".into(),
-        bucket: "b".into(),
-        future: "y".into(),
-    }.encode_to_vec());
-    plant(&store, &rows::audit_key(9), NewerAudit {
-        at: 3,
-        action: 3,
-        subject: "cold".into(),
-        outcome: 1,
-        generation: 5,
-        future: "z".into(),
-    }.encode_to_vec());
+    plant(
+        &store,
+        "objstore/conn/cold",
+        NewerConn {
+            endpoint: "http://s3.example:9000".into(),
+            access_key_id: "AKID".into(),
+            secret_version: 7,
+            updated_generation: 5,
+            future: "later".into(),
+        }
+        .encode_to_vec(),
+    );
+    plant(
+        &store,
+        "objstore/gen",
+        NewerGen {
+            generation: 5,
+            audit_seq: 9,
+            future: "x".into(),
+        }
+        .encode_to_vec(),
+    );
+    plant(
+        &store,
+        "objstore/bind/cold",
+        NewerBind {
+            connection: "cold".into(),
+            bucket: "b".into(),
+            future: "y".into(),
+        }
+        .encode_to_vec(),
+    );
+    plant(
+        &store,
+        &rows::audit_key(9),
+        NewerAudit {
+            at: 3,
+            action: 3,
+            subject: "cold".into(),
+            outcome: 1,
+            generation: 5,
+            future: "z".into(),
+        }
+        .encode_to_vec(),
+    );
 
     let reg = open(&store, &dir);
     assert_eq!(reg.generation().unwrap(), 5);
     let info = reg.connection(&name("cold")).unwrap().unwrap();
-    assert_eq!((info.updated_generation, info.endpoint.as_str()), (5, "http://s3.example:9000"));
+    assert_eq!(
+        (info.updated_generation, info.endpoint.as_str()),
+        (5, "http://s3.example:9000")
+    );
     assert_eq!(reg.bindings().unwrap()[0].bucket, "b");
     assert_eq!(reg.secret(&name("cold")).unwrap().expose(), "planted");
     let newest = &audit_all(&reg)[0];
-    assert_eq!((newest.seq, newest.at, newest.action), (9, 3, AuditAction::PutBinding));
+    assert_eq!(
+        (newest.seq, newest.at, newest.action),
+        (9, 3, AuditAction::PutBinding)
+    );
     // And a write on top of them goes through.
     let mut changed = put("planted");
     changed.region = Some("eu-1".to_owned());
@@ -276,7 +357,8 @@ fn unreadable_rows_are_reported_by_family() {
         let store = as_store(&fake());
         let reg = open(&store, &scratch("corrupt").join("s"));
         reg.put_connection(&name("cold"), &put("s")).unwrap();
-        reg.put_binding(BindingRole::Cold, &bind("cold", "b")).unwrap();
+        reg.put_binding(BindingRole::Cold, &bind("cold", "b"))
+            .unwrap();
         plant(&store, key, garbage.clone());
         let results = [
             reg.generation().map(|_| ()),
@@ -293,7 +375,10 @@ fn unreadable_rows_are_reported_by_family() {
             .collect();
         assert!(reported.contains(&family), "{key}: {reported:?}");
     }
-    assert_eq!(RegistryError::Corrupt("conn").to_string(), "the conn rows are not readable");
+    assert_eq!(
+        RegistryError::Corrupt("conn").to_string(),
+        "the conn rows are not readable"
+    );
 }
 
 // Catches keys and codes the registry would read as something else: a connection key that
@@ -301,14 +386,16 @@ fn unreadable_rows_are_reported_by_family() {
 // audit row with an action or outcome this binary does not know.
 #[test]
 fn rows_under_odd_keys_or_codes_are_corrupt_not_skipped() {
-    let ok_audit = |action, outcome| rows::AuditRow {
-        at: 1,
-        action,
-        subject: "x".into(),
-        outcome,
-        generation: 1,
-    }
-    .encode_to_vec();
+    let ok_audit = |action, outcome| {
+        rows::AuditRow {
+            at: 1,
+            action,
+            subject: "x".into(),
+            outcome,
+            generation: 1,
+        }
+        .encode_to_vec()
+    };
     let ok_conn = rows::ConnRow {
         endpoint: "http://h".into(),
         region: String::new(),
@@ -319,20 +406,30 @@ fn rows_under_odd_keys_or_codes_are_corrupt_not_skipped() {
         updated_generation: 1,
     }
     .encode_to_vec();
-    let ok_bind = |connection: &str| rows::BindRow {
-        connection: connection.into(),
-        bucket: "b".into(),
-        prefix: String::new(),
-        updated_generation: 1,
-    }
-    .encode_to_vec();
+    let ok_bind = |connection: &str| {
+        rows::BindRow {
+            connection: connection.into(),
+            bucket: "b".into(),
+            prefix: String::new(),
+            updated_generation: 1,
+        }
+        .encode_to_vec()
+    };
     let cases: Vec<(&str, Vec<u8>, &str)> = vec![
         ("objstore/conn/Bad Name", ok_conn, "conn"),
         ("objstore/bind/history", ok_bind("cold"), "bind"),
         ("objstore/bind/cold", ok_bind("Not A Name"), "bind"),
         ("objstore/audit/not-a-number", ok_audit(1, 1), "audit"),
-        ("objstore/audit/00000000000000000001", ok_audit(9, 1), "audit"),
-        ("objstore/audit/00000000000000000001", ok_audit(1, 9), "audit"),
+        (
+            "objstore/audit/00000000000000000001",
+            ok_audit(9, 1),
+            "audit",
+        ),
+        (
+            "objstore/audit/00000000000000000001",
+            ok_audit(1, 9),
+            "audit",
+        ),
     ];
     for (key, value, family) in cases {
         let store = as_store(&fake());
@@ -345,7 +442,10 @@ fn rows_under_odd_keys_or_codes_are_corrupt_not_skipped() {
         } else {
             reg.audit(NonZeroUsize::new(5).unwrap()).unwrap_err()
         };
-        assert!(matches!(err, RegistryError::Corrupt(f) if f == family), "{key}: {err}");
+        assert!(
+            matches!(err, RegistryError::Corrupt(f) if f == family),
+            "{key}: {err}"
+        );
     }
 }
 
@@ -366,7 +466,10 @@ fn every_audit_code_round_trips() {
         AuditOutcome::Unchanged,
         AuditOutcome::Deleted,
     ] {
-        assert_eq!(rows::outcome_of(rows::outcome_code(outcome)).unwrap(), outcome);
+        assert_eq!(
+            rows::outcome_of(rows::outcome_code(outcome)).unwrap(),
+            outcome
+        );
     }
 }
 
