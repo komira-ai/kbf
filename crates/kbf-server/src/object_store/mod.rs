@@ -3,8 +3,9 @@
 //! prefix) and an audit log, kept in the frontend's state store, with each connection's
 //! secret key in a versioned file beside it.
 //!
-//! This module is storage only. It has no routes, no wire and no node side; the control API
-//! (`/v1/object-stores`) and the storage nodes' fetch are built on [`Registry`].
+//! [`Registry`] is storage only: no routes, no wire and no node side. The control API
+//! (`/v1/object-stores`, [`api`]) and the probe it runs before a write ([`probe`]) are built
+//! on it; the storage nodes' fetch is built on it too, elsewhere.
 //!
 //! # What lives where
 //!
@@ -48,6 +49,8 @@
 //! Callers validate what the types cannot: endpoint syntax, `https` (refused until the S3
 //! client speaks TLS), bucket and prefix, and that a probe of the store passed.
 
+pub mod api;
+pub mod probe;
 mod registry;
 mod rows;
 mod secrets;

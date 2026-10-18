@@ -116,6 +116,14 @@ impl OperatorClient {
         self.call("DELETE", path, Some(""))
     }
 
+    /// `PUT path` with `body`, sent as JSON.
+    ///
+    /// # Errors
+    /// As [`OperatorClient::post`].
+    pub fn put(&self, path: &str, body: &str) -> Result<Reply, ClientError> {
+        self.call("PUT", path, Some(body))
+    }
+
     /// `POST path` with `body` (empty for none), sent as JSON.
     ///
     /// # Errors
