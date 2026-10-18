@@ -22,6 +22,7 @@ use crate::helper::fetcher::FetchError;
 use crate::helper::fetcher::fake::FakeFetcher;
 use crate::helper::leases::fake::FakeLeases;
 use crate::helper::restart::Restart;
+use crate::helper::service::fake::ServiceRecorder;
 
 const UNIT: &str = "kbf.service";
 const T0: u64 = 1_800_000_000;
@@ -36,6 +37,8 @@ struct Rig {
     /// The restarts the start-up made (the links were missing and were made).
     base: usize,
     platform: Platform,
+    /// The service manager and the process table.
+    service: ServiceRecorder,
 }
 
 /// The record `kbf-update` would write for `verb` on `commit`.
@@ -91,6 +94,11 @@ impl Rig {
 
     /// The same host on `platform`: macOS keeps its state and lock elsewhere.
     fn on(name: &str, platform: Platform) -> Rig {
+        Rig::build(name, platform, 0)
+    }
+
+    /// The same host with `min_activation_interval_secs` set.
+    fn build(name: &str, platform: Platform, min_interval: u64) -> Rig {
         let mut host = ScratchHost::new(&format!("helper-{name}"));
         let root = host.root.clone();
         for sub in [
@@ -106,7 +114,11 @@ impl Rig {
         let dir = root.join("usr/local/kbf/releases").join(A);
         fs::create_dir_all(&dir).expect("release");
         fs::write(dir.join("kbf"), b"binary").expect("binary");
-        host.answer = Box::new(|_| Ok(reply(0, "", "")));
+        let service = ServiceRecorder::running(
+            4242,
+            root.join("usr/local/kbf/releases").join(A).join("kbf"),
+        );
+        host.answer = service.answer();
         let layout = Layout::new(Root::new(&root).expect("absolute"), platform);
         Locked::acquire(&layout)
             .expect("lock")
@@ -121,6 +133,7 @@ impl Rig {
             restart: Restart::Systemd(UNIT.to_owned()),
             window_secs: 600,
             starts: 3,
+            min_activation_interval_secs: min_interval,
         };
         let fetcher = FakeFetcher::new(&layout);
         let leases = FakeLeases::default();
@@ -130,6 +143,7 @@ impl Rig {
             cfg,
             Box::new(fetcher.clone()),
             Box::new(leases.clone()),
+            Box::new(service.clone()),
         );
         helper.recover().expect("recover");
         let mut rig = Rig {
@@ -140,6 +154,7 @@ impl Rig {
             leases,
             base: 0,
             platform,
+            service,
         };
         rig.cycle(T0 - 100);
         rig.base = rig.restarts();
@@ -203,6 +218,22 @@ impl Rig {
             .filter(|s| matches!(s, Step::Run(cmd) if cmd.args == ["restart", "--", UNIT]))
             .count()
             - self.base
+    }
+
+    /// The service starts `commit`: the Linux boot check runs (the window starts), and the
+    /// unit's main process runs a file of that release.
+    fn first_start(&mut self, commit: &str, now: u64) {
+        let layout = self.layout.clone();
+        let mut out = Vec::new();
+        activate::boot_check(self.helper.exec_mut(), &layout, now, 600, &mut out)
+            .expect("boot check");
+        self.service.0.borrow_mut().exes = vec![(
+            4242,
+            self.root
+                .join("usr/local/kbf/releases")
+                .join(commit)
+                .join("kbf"),
+        )];
     }
 
     fn cycle(&mut self, now: u64) {
@@ -418,6 +449,7 @@ fn a_confirm_order_keeps_the_swap_and_a_revert_order_goes_back() {
     let mut rig = Rig::new("confirm");
     rig.order(5, Verb::Activate, B);
     rig.cycle(T0);
+    rig.first_start(B, T0 + 1);
     rig.order(6, Verb::Confirm, B);
     rig.cycle(T0 + 3);
     assert_eq!(rig.state().pending_confirm, None);
@@ -1035,4 +1067,175 @@ fn a_revert_with_nothing_to_go_back_to_is_refused() {
     assert_eq!(rig.status()["acked_order_id"], 5);
     assert_eq!(rig.state().current, Some(c(A)));
     assert_eq!(rig.restarts(), 0);
+}
+
+/// Catches two swaps in quick succession (S13): with a 60 s minimum, an activation 10 s
+/// after the last one is refused before the fetch and moves nothing, and one 61 s after it
+/// goes through.
+///
+/// Mutants planted: the interval check removed (the second swap goes through at +10);
+/// `last_activation_at` never recorded (same); `<` turned into `>` (the +61 swap refused).
+#[test]
+fn a_second_activation_inside_the_minimum_interval_is_refused() {
+    let mut rig = Rig::build("interval", Platform::Linux, 60);
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+    rig.first_start(B, T0 + 1);
+    rig.order(6, Verb::Confirm, B);
+    rig.cycle(T0 + 3);
+    assert_eq!(rig.state().pending_confirm, None);
+    let fetched = rig.fetcher.count();
+
+    rig.put(&rig.rec(7, 1, 2, Verb::Activate, C));
+    rig.cycle(T0 + 10);
+    assert_eq!(rig.fetcher.count(), fetched, "nothing fetched");
+    assert_eq!(rig.current(), Some(c(B)));
+    assert!(
+        rig.refusal().contains("at least 60 s between activations"),
+        "{}",
+        rig.refusal()
+    );
+
+    rig.put(&rig.rec(8, 1, 3, Verb::Activate, C));
+    rig.cycle(T0 + 61);
+    assert_eq!(rig.current(), Some(c(C)));
+}
+
+/// Catches a confirm kept on the service user's word alone: a confirm order is refused
+/// while the unit's main process still runs the old release, and while the first boot
+/// check has not run; it is kept once the new release runs.
+///
+/// Mutants planted: `accept_confirm` not called; the executable compared with the old
+/// release's directory; the boot-check condition dropped (the not-started confirm is kept).
+#[test]
+fn a_confirm_order_is_kept_only_when_the_new_release_runs() {
+    let mut rig = Rig::new("confirm-accept");
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+
+    // Not started yet: no boot check has run.
+    rig.order(6, Verb::Confirm, B);
+    rig.cycle(T0 + 3);
+    assert!(rig.state().pending_confirm.is_some());
+    assert!(
+        rig.refusal().contains("first boot check has not run"),
+        "{}",
+        rig.refusal()
+    );
+
+    // Started by the boot check, but the main process still runs the old release.
+    let layout = rig.layout.clone();
+    let mut out = Vec::new();
+    activate::boot_check(rig.helper.exec_mut(), &layout, T0 + 4, 600, &mut out).expect("boot");
+    rig.order(7, Verb::Confirm, B);
+    rig.cycle(T0 + 6);
+    assert!(rig.state().pending_confirm.is_some());
+    assert!(rig.refusal().contains("not a file in"), "{}", rig.refusal());
+
+    // The unit is not active.
+    rig.service.0.borrow_mut().active = "failed".to_owned();
+    rig.order(8, Verb::Confirm, B);
+    rig.cycle(T0 + 9);
+    assert!(rig.state().pending_confirm.is_some());
+    assert!(rig.refusal().contains("not active"), "{}", rig.refusal());
+
+    // The new release runs.
+    rig.service.0.borrow_mut().active = "active".to_owned();
+    rig.first_start(B, T0 + 10);
+    rig.order(9, Verb::Confirm, B);
+    rig.cycle(T0 + 12);
+    assert_eq!(rig.state().pending_confirm, None);
+}
+
+/// Catches `gc` removing what must stay: after a confirm the releases nothing needs go,
+/// and current, previous, the newest other and every release a process executes from stay.
+/// A confirm that is refused collects nothing.
+///
+/// Mutants planted: the in-use set ignored (the oldest release, run by a process, is
+/// removed); `gc_due` set by a refused confirm; previous not kept.
+#[test]
+fn a_confirm_collects_old_releases_but_not_one_a_process_runs() {
+    let mut rig = Rig::new("gc-after-confirm");
+    let others = [
+        "1111111111111111111111111111111111111111",
+        "2222222222222222222222222222222222222222",
+        "3333333333333333333333333333333333333333",
+        "4444444444444444444444444444444444444444",
+    ];
+    for o in others {
+        rig.install(o);
+    }
+    // The first is the oldest by far, and a stray process runs it.
+    let old = rig.root.join("usr/local/kbf/releases").join(others[0]);
+    let epoch = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+    fs::File::open(&old)
+        .expect("dir")
+        .set_modified(epoch)
+        .expect("mtime");
+    rig.service
+        .0
+        .borrow_mut()
+        .exes
+        .push((77, old.join("kbf")));
+
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+    let releases = rig.root.join("usr/local/kbf/releases");
+    let there = |c: &str| releases.join(c).exists();
+    assert!(there(others[1]), "nothing is collected before the confirm");
+
+    rig.first_start(B, T0 + 1);
+    rig.service
+        .0
+        .borrow_mut()
+        .exes
+        .push((77, old.join("kbf")));
+    rig.order(6, Verb::Confirm, B);
+    rig.cycle(T0 + 3);
+    assert!(there(A) && there(B), "previous and current stay");
+    assert!(there(others[0]), "a release a process runs stays");
+    let left = others[1..].iter().filter(|o| there(o)).count();
+    assert_eq!(left, 1, "only the newest other stays");
+}
+
+struct Flag(std::rc::Rc<std::cell::Cell<bool>>);
+
+impl crate::helper::serve::BinaryWatch for Flag {
+    fn replaced(&self) -> bool {
+        self.0.get()
+    }
+}
+
+/// Catches a replaced program going unnoticed and a pass made by the old code after it:
+/// while the file is the one that started, a turn makes a pass and acts on the order; once
+/// replaced, the turn says re-exec and the next order is left in the spool for the new
+/// program.
+///
+/// Mutants planted: the watch consulted after the pass (the order is acted on);
+/// `Flow::Reexec` never returned.
+#[test]
+fn a_replaced_binary_is_re_executed_before_the_next_order_is_read() {
+    use crate::helper::serve::{Flow, Serve};
+    let rig = Rig::new("serve");
+    let replaced = std::rc::Rc::new(std::cell::Cell::new(false));
+    rig.order(5, Verb::Activate, B);
+    let orders = rig.orders();
+    let root = rig.root.clone();
+    let layout = rig.layout.clone();
+    let Rig { helper, .. } = rig;
+    let mut serve = Serve::new(helper, Box::new(Flag(replaced.clone())));
+    assert_eq!(serve.turn(T0).expect("a pass"), Flow::Continue);
+    assert_eq!(fs::read_dir(&orders).expect("dir").count(), 0, "acted on");
+    let first = crate::state::read_unlocked(&layout).expect("reads").expect("there");
+    assert_eq!(first.current, Some(c(B)));
+
+    replaced.set(true);
+    fs::write(
+        orders.join(kbf_update::record::file_name(1, 6)),
+        serde_json::to_vec(&record(6, 1, 2, Verb::Confirm, B, Platform::Linux)).expect("json"),
+    )
+    .expect("record");
+    assert_eq!(serve.turn(T0 + 5).expect("no pass"), Flow::Reexec);
+    assert_eq!(fs::read_dir(&orders).expect("dir").count(), 1, "left for the new program");
+    drop(root);
 }

@@ -24,8 +24,11 @@ pub mod cycle;
 pub mod fetcher;
 pub mod leases;
 pub mod memory;
+pub mod operator;
 pub mod order;
 pub mod restart;
+pub mod serve;
+pub mod service;
 pub mod status;
 
 #[cfg(test)]

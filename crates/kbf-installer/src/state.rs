@@ -12,10 +12,11 @@
 //! after the write returned keeps the new one. That is also why [`status`] and a dry run
 //! ([`read_unlocked`]), which only read, need no lock.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +74,9 @@ pub struct PendingConfirm {
 pub enum StateError {
     #[error("cannot lock {path}: {source}")]
     Lock { path: PathBuf, source: io::Error },
+    /// Another run holds the lock and did not let go within the time given.
+    #[error("{path} is held by another run")]
+    Busy { path: PathBuf },
     #[error("cannot read {path}: {source}")]
     Read { path: PathBuf, source: io::Error },
     #[error("{path} is not a deploy state: {source}")]
@@ -113,6 +117,40 @@ impl Locked {
             .open(&path)
             .map_err(fail)?;
         lock.lock().map_err(fail)?;
+        Ok(Locked {
+            _lock: lock,
+            file: state_file(host),
+        })
+    }
+
+    /// Like [`Locked::acquire`], but gives up with [`StateError::Busy`] if another run still
+    /// holds the lock after `wait`: for the operator's verbs, which report "busy" (exit 4)
+    /// rather than queue behind a pass.
+    pub fn acquire_within(host: &Layout, wait: Duration) -> Result<Locked, StateError> {
+        let path = host.join(&host.lock());
+        let fail = |source| StateError::Lock {
+            path: path.clone(),
+            source,
+        };
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .map_err(fail)?;
+        let end = Instant::now() + wait;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::Error(e)) => return Err(fail(e)),
+                Err(TryLockError::WouldBlock) if Instant::now() >= end => {
+                    return Err(StateError::Busy { path });
+                }
+                Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
         Ok(Locked {
             _lock: lock,
             file: state_file(host),

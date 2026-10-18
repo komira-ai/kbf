@@ -213,6 +213,17 @@ pub fn confirm(
     commit: &CommitId,
 ) -> Result<Confirmed, ReleaseError> {
     let (lock, state) = open(host)?;
+    confirm_in(&lock, state, order_id, commit)
+}
+
+/// [`confirm`] with the lock held and the state read: for a caller that has more to check
+/// under the same lock.
+pub(crate) fn confirm_in(
+    lock: &Locked,
+    state: State,
+    order_id: &str,
+    commit: &CommitId,
+) -> Result<Confirmed, ReleaseError> {
     let Some(p) = &state.pending_confirm else {
         return if state.current.as_ref() == Some(commit) {
             Ok(Confirmed::AlreadyKept)
@@ -245,12 +256,13 @@ pub fn revert<E: Exec>(
     out: &mut dyn Write,
 ) -> Result<Reverted, ReleaseError> {
     let (lock, state) = open(host)?;
-    revert_in(exec, lock, state, out)
+    revert_in(exec, &lock, state, out)
 }
 
-fn revert_in<E: Exec>(
+/// [`revert`] with the lock held and the state read.
+pub(crate) fn revert_in<E: Exec>(
     exec: &mut E,
-    lock: Locked,
+    lock: &Locked,
     state: State,
     out: &mut dyn Write,
 ) -> Result<Reverted, ReleaseError> {
@@ -276,6 +288,42 @@ fn revert_in<E: Exec>(
     Ok(Reverted { from, to })
 }
 
+/// `current` back to `previous`, with no window: the operator's `rollback`. `previous` is
+/// only ever a confirmed release, and the rolled-back-from release is not kept as one, so
+/// it is dropped. Refused while a swap is pending (that is a [`revert`]). The state is
+/// written first, then the links, as for every verb.
+pub(crate) fn rollback_in<E: Exec>(
+    exec: &mut E,
+    lock: &Locked,
+    state: State,
+    out: &mut dyn Write,
+) -> Result<Reverted, ReleaseError> {
+    let to = rollback_target(exec, &state)?;
+    let from = state.current.clone();
+    let next = State {
+        current: Some(to.clone()),
+        previous: None,
+        ..state
+    };
+    lock.write(&next)?;
+    converge(exec, &next, out)?;
+    Ok(Reverted { from, to })
+}
+
+/// The release a rollback goes to, or why it cannot.
+pub(crate) fn rollback_target<E: Exec>(exec: &E, state: &State) -> Result<CommitId, ReleaseError> {
+    if let Some(p) = &state.pending_confirm {
+        return Err(ReleaseError::Pending(p.commit.clone()));
+    }
+    let Some(to) = state.previous.clone() else {
+        return Err(ReleaseError::NoPrevious);
+    };
+    if !has_binary(exec, &to) {
+        return Err(ReleaseError::PreviousGone(to));
+    }
+    Ok(to)
+}
+
 /// Run before every start of the service (see the module docs). `window_secs` is the
 /// host's window, within [`WINDOW_MIN_SECS`] and [`WINDOW_MAX_SECS`].
 pub fn boot_check<E: Exec>(
@@ -291,7 +339,7 @@ pub fn boot_check<E: Exec>(
         return Ok(Boot::Nothing);
     };
     if p.starts_left == Some(0) || p.deadline.is_some_and(|d| now >= d) {
-        return Ok(Boot::Reverted(revert_in(exec, lock, state, out)?));
+        return Ok(Boot::Reverted(revert_in(exec, &lock, state, out)?));
     }
     let starts_left = p.starts_left.map(|n| n - 1);
     lock.write(&State {
@@ -319,7 +367,7 @@ pub fn expire<E: Exec>(
     match p.deadline {
         None => Ok(Expiry::NotStarted),
         Some(d) if now < d => Ok(Expiry::Waiting { secs_left: d - now }),
-        Some(_) => Ok(Expiry::Reverted(revert_in(exec, lock, state, out)?)),
+        Some(_) => Ok(Expiry::Reverted(revert_in(exec, &lock, state, out)?)),
     }
 }
 
