@@ -137,9 +137,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    # The Envoy release the envoy kit's image runs (templates/envoy/config.example),
-    # for Envoy's own validation of the kit's render. The sha256 is the release's
-    # checksums.txt.asc entry.
+    # The Envoy release the real-Envoy tests run (CI only: kbf releases pin and fetch no Envoy;
+    # Envoy is a prerequisite checked against crates/kbf-installer/src/envoy/version.rs) and
+    # the installer's box render is held to, for Envoy's own validation of both renders
+    # and the real-Envoy tests of the box. The sha256 is the release's checksums.txt.asc
+    # entry.
     env:
       ENVOY_VERSION: 1.39.3
       ENVOY_SHA256: f61653fb5f7645129d3092a82f21ce3e6f70d0a75fe2e861b0e7417790f2c200
@@ -174,6 +176,20 @@ jobs:
       # field (crates/kbf-deploy/tests/envoy_validate.rs).
       - name: Envoy validates the envoy kit's render
         run: cargo test -p kbf-deploy --test envoy_validate --locked -- --ignored
+        env:
+          KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
+      # Envoy accepts the installer's box render and refuses a control with an unknown
+      # field (crates/kbf-it/tests/envoy_validate.rs).
+      - name: Envoy validates the installer's box render
+        run: cargo test -p kbf-it --test envoy_validate --locked -- --ignored
+        env:
+          KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
+      # The installer's box render run by the pinned Envoy in front of two stub instances:
+      # long silent streams, an instance turning not ready, the ceiling of open streams and
+      # a hot restart, each with a control that plants the defect and sees it
+      # (crates/kbf-it/tests/envoy_box). About half a minute.
+      - name: Envoy runs the installer's box render (long streams, health, ceiling, hot restart)
+        run: cargo test -p kbf-it --test envoy_box --locked -- --ignored
         env:
           KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
       # The pinned gh accepts a real build attestation offline and refuses a subject
