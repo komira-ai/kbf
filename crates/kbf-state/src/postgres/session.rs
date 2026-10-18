@@ -377,15 +377,18 @@ impl DerefMut for Pooled<'_> {
 
 impl Drop for Pooled<'_> {
     fn drop(&mut self) {
-        if let Some(session) = self.session.take() {
-            self.pool.give_back(session);
-        }
+        // Taken here and nowhere else: the session is present for the whole loan.
+        self.session
+            .take()
+            .into_iter()
+            .for_each(|session| self.pool.give_back(session));
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::RangeShape;
+    use super::{Pool, RangeShape};
+    use crate::postgres::PostgresConfig;
 
     // Catches an index that does not invert the order of the prepared statements, which
     // would run a scan on another shape's statement (wrong bounds or direction), and a
@@ -395,5 +398,31 @@ mod tests {
         for (place, shape) in RangeShape::ALL.iter().enumerate() {
             assert_eq!(shape.index(), place, "{shape:?}");
         }
+    }
+
+    // Catches a checkout that hands out a session that is already broken or closed, and
+    // a pool that does not give a returned session out again: the one connection a pool of
+    // one holds is the same one for the second loan.
+    #[test]
+    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+    fn a_loan_is_a_working_session_and_comes_back_to_the_pool() {
+        let url = std::env::var("KBF_TEST_POSTGRES_URL")
+            .expect("KBF_TEST_POSTGRES_URL names a database the tests may create schemas in");
+        let config = PostgresConfig::parse(&url).expect("a usable URL");
+        let pool = Pool::open(config.pg.clone(), "kbf_unit_pool".to_owned(), 1).expect("opens");
+        let pid = |pooled: &mut super::Pooled<'_>| -> i32 {
+            pooled
+                .client
+                .query_one("SELECT pg_backend_pid()", &[])
+                .expect("pid")
+                .get(0)
+        };
+        let mut first = pool.checkout().expect("a session");
+        assert!(!first.broken);
+        assert!(!first.client.is_closed());
+        let first_pid = pid(&mut first);
+        drop(first);
+        let mut second = pool.checkout().expect("the same session again");
+        assert_eq!(pid(&mut second), first_pid);
     }
 }

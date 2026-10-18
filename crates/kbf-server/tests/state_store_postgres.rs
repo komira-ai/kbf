@@ -61,6 +61,18 @@ fn a_flag_opened_postgres_store_takes_generations_and_epochs_as_sqlite_does() {
     assert_eq!(uri.epoch_policy(), EpochPolicy::Bump);
 
     let first = uri.open().expect("a first start on a fresh database");
+    let named: i64 = postgres::Client::connect(&url(), postgres::NoTls)
+        .expect("connect")
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'kbf-server'",
+            &[],
+        )
+        .expect("the activity view")
+        .get(0);
+    assert!(
+        named >= 1,
+        "the server's connections are named kbf-server in pg_stat_activity"
+    );
     assert_eq!(first.epoch, EpochPolicy::Bump);
     assert_eq!(
         generation(&first),

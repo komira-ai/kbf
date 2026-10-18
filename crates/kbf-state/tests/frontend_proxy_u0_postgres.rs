@@ -115,9 +115,11 @@ fn no_write_of_the_old_handle_commits_after_the_takeover() {
     let old = Arc::new(Fenced::take(Arc::clone(&store) as Arc<dyn Store>, None).expect("gen 1"));
     let written = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
+    let fenced = Arc::new(AtomicU64::new(0));
     let writers: Vec<_> = (0..4)
         .map(|w| {
             let (old, written, stop) = (Arc::clone(&old), Arc::clone(&written), Arc::clone(&stop));
+            let fenced = Arc::clone(&fenced);
             thread::spawn(move || {
                 let mut n = 0_u64;
                 let mut refused = 0_u64;
@@ -126,7 +128,10 @@ fn no_write_of_the_old_handle_commits_after_the_takeover() {
                         Ok(Ok(_)) => {
                             written.fetch_add(1, Ordering::SeqCst);
                         }
-                        Err(StoreError::Fenced) => refused += 1,
+                        Err(StoreError::Fenced) => {
+                            refused += 1;
+                            fenced.fetch_add(1, Ordering::SeqCst);
+                        }
                         other => panic!("neither committed nor fenced: {other:?}"),
                     }
                     n += 1;
@@ -139,7 +144,11 @@ fn no_write_of_the_old_handle_commits_after_the_takeover() {
         thread::yield_now();
     }
     let _new = Fenced::take(Arc::clone(&store) as Arc<dyn Store>, Some(1)).expect("B takes");
-    // Give every writer time to hit the fence, by count, not by clock.
+    // Give the writers time to hit the fence, by count, not by clock: stopping them as
+    // soon as B has the generation could end them all before one saw it.
+    while fenced.load(Ordering::SeqCst) == 0 {
+        thread::yield_now();
+    }
     let taken = store.get(GENERATION).expect("read").expect("row").version;
     let mut refused = 0;
     stop.store(true, Ordering::SeqCst);

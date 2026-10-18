@@ -26,8 +26,21 @@ pub enum StateStoreUri {
 /// The URL of a Postgres state store. It is not printed: `Debug` leaves it out, as a
 /// URL may hold a password (the flag refuses one, see [`StateStoreParser`]; a value
 /// built by [`FromStr`] may).
-#[derive(Clone, PartialEq, Eq)]
-pub struct PostgresUrl(String);
+#[derive(Clone)]
+pub struct PostgresUrl {
+    text: String,
+    // Boxed: a config is large next to the SQLite variant's path.
+    config: Box<kbf_state::postgres::PostgresConfig>,
+}
+
+// The parsed config follows from the text, so the text decides.
+impl PartialEq for PostgresUrl {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+}
+
+impl Eq for PostgresUrl {}
 
 impl fmt::Debug for PostgresUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -39,7 +52,7 @@ impl PostgresUrl {
     /// The URL without user information or a `password` parameter: what two processes
     /// compare to know they mean the same database.
     fn identity(&self) -> String {
-        let text = self.0.as_str();
+        let text = self.text.as_str();
         let (scheme, rest) = text.split_once("://").unwrap_or(("postgres", text));
         let (authority_and_path, query) = rest.split_once('?').map_or((rest, ""), |(a, q)| (a, q));
         let host_end = authority_and_path
@@ -102,9 +115,13 @@ impl FromStr for StateStoreUri {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s.starts_with("postgres://") || s.starts_with("postgresql://") {
             // The parser's own messages may quote the value; none is kept.
-            kbf_state::postgres::PostgresConfig::parse(s)
-                .map_err(|_| StateStoreUriError::PostgresUrl)?;
-            return Ok(Self::Postgres(PostgresUrl(s.to_owned())));
+            let config = kbf_state::postgres::PostgresConfig::parse(s)
+                .map_err(|_| StateStoreUriError::PostgresUrl)?
+                .with_application_name("kbf-server");
+            return Ok(Self::Postgres(PostgresUrl {
+                text: s.to_owned(),
+                config: Box::new(config),
+            }));
         }
         let path = s
             .strip_prefix("sqlite://")
@@ -157,8 +174,7 @@ impl clap::builder::TypedValueParser for StateStoreParser {
 const LOCAL_POSTGRES: &str = "postgres:///kbf?host=/run/postgresql";
 
 fn has_password(url: &PostgresUrl) -> bool {
-    // The value parsed already; a parse that now fails has no password to refuse.
-    kbf_state::postgres::PostgresConfig::parse(&url.0).is_ok_and(|config| config.has_password())
+    url.config.has_password()
 }
 
 impl StateStoreUri {
@@ -179,7 +195,9 @@ impl StateStoreUri {
     /// what `kbf all-in-one` opens when `--state-store` is left out.
     #[must_use]
     pub fn local_postgres() -> Self {
-        Self::Postgres(PostgresUrl(LOCAL_POSTGRES.to_owned()))
+        LOCAL_POSTGRES
+            .parse()
+            .expect("LOCAL_POSTGRES is a socket URL the parser accepts")
     }
 
     /// What names the store, for two processes to agree they mean the same one (the
@@ -260,11 +278,7 @@ fn open_error(why: impl fmt::Display) -> StateError {
 /// creates the tables if they are not there. The errors name the setting or the failed
 /// step, never the URL.
 fn open_postgres(url: &PostgresUrl) -> Result<Arc<dyn Store>, StateError> {
-    use kbf_state::postgres::{PostgresConfig, PostgresStore};
-    let config = PostgresConfig::parse(&url.0)
-        .map_err(|_| open_error("the postgres state store URL is not valid"))?
-        .with_application_name("kbf-server");
-    let store = PostgresStore::open(&config).map_err(open_error)?;
+    let store = kbf_state::postgres::PostgresStore::open(&url.config).map_err(open_error)?;
     Ok(Arc::new(store))
 }
 

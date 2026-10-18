@@ -24,33 +24,36 @@ static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
 
 /// Opens stores on one Postgres database, one schema each.
 pub struct PostgresBackend {
-    url: String,
+    base: PostgresConfig,
     flaw: Flaw,
     schemas: Mutex<Vec<String>>,
 }
 
 impl PostgresBackend {
     /// A backend on the database at `url`, whose stores carry `flaw`.
+    ///
+    /// # Panics
+    /// When the URL does not parse.
     #[must_use]
     pub fn new(url: &str, flaw: Flaw) -> PostgresBackend {
         PostgresBackend {
-            url: url.to_owned(),
+            base: PostgresConfig::parse(url)
+                .expect("the test database URL is a usable postgres:// URL"),
             flaw,
             schemas: Mutex::new(Vec::new()),
         }
     }
 
     /// A configuration for a new schema, recorded for dropping.
-    ///
-    /// # Panics
-    /// When the URL does not parse.
     #[must_use]
     pub fn fresh_config(&self) -> PostgresConfig {
         let n = NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed);
         let schema = format!("kbf_t{}_{n}", process::id());
-        let config = PostgresConfig::parse(&self.url)
-            .and_then(|config| config.with_schema(&schema))
-            .expect("the test database URL is a usable postgres:// URL")
+        let config = self
+            .base
+            .clone()
+            .with_schema(&schema)
+            .expect("the generated schema name is plain")
             .with_application_name(&schema);
         self.schemas
             .lock()
@@ -81,16 +84,12 @@ impl Drop for PostgresBackend {
             .schemas
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner);
-        let Ok(config) = PostgresConfig::parse(&self.url) else {
-            return;
-        };
-        let Ok(mut client) = Conn::connect(&config.pg) else {
-            return;
-        };
-        for schema in schemas.iter() {
-            // Best effort: a schema left behind is only clutter in a throwaway database.
-            let _ = client.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"));
-        }
+        // Best effort: a schema left behind is only clutter in a throwaway database.
+        let _ = Conn::connect(&self.base.pg).map(|mut client| {
+            for schema in schemas.iter() {
+                let _ = client.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"));
+            }
+        });
     }
 }
 
@@ -129,15 +128,14 @@ impl Backend for PostgresBackend {
         } else {
             thread::scope(|scope| {
                 let late = scope.spawn(|| store.txn(second));
-                let mut polls = 0;
-                while Self::waiting(store) == 0 {
-                    polls += 1;
-                    assert!(
-                        polls < WAIT_POLLS,
-                        "the second transaction never queued behind the first"
-                    );
+                let queued = (0..WAIT_POLLS).any(|_| {
                     thread::sleep(Duration::from_millis(5));
-                }
+                    Self::waiting(store) > 0
+                });
+                assert!(
+                    queued,
+                    "the second transaction never queued behind the first"
+                );
                 between();
                 let first_results = pending.commit().expect("the first transaction commits");
                 let second_result = late
