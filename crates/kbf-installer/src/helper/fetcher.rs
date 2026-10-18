@@ -74,7 +74,7 @@ pub(crate) mod fake {
     use std::sync::{Arc, Mutex};
 
     use super::{FetchError, Fetcher, InstalledRelease, ReleaseLocator};
-    use crate::layout::{Layout, release_dir};
+    use crate::layout::Layout;
 
     /// A change a test makes to the report of the release it installs.
     pub type Tamper = fn(&mut InstalledRelease);
@@ -122,7 +122,7 @@ pub(crate) mod fake {
             if let Some(e) = self.fail.lock().expect("lock").take() {
                 return Err(e);
             }
-            let dir = self.layout.join(&release_dir(&rec.commit));
+            let dir = self.layout.join(&self.layout.release_dir(&rec.commit));
             fs::create_dir_all(&dir).expect("release dir");
             fs::write(dir.join("kbf"), b"binary").expect("binary");
             let mut report = honest(rec);

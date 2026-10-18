@@ -1,0 +1,172 @@
+=== kbf-installer --help ===
+The one root tool for setting up a kbf host and for updating it.
+
+Mutating verbs only say what they would do unless --apply is given. Exit codes: 0 ok, 1 failed, 2 usage or a missing prerequisite, 3 refused (verification or policy), 4 busy (another run holds the lock), 5 needs an operator.
+
+Usage: kbf-installer [OPTIONS] <COMMAND>
+
+Commands:
+  setup       First install: accounts, directories, installer.toml, the first release
+  status      What is installed, staged and pending, and the last refusal
+  run         Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swap
+  update      Order an update of this host's own frontend (root, inline)
+  confirm     Keep the pending swap, naming its activation
+  revert      Undo the pending swap, naming its activation
+  rollback    Point `current` at `previous`, with no confirm window
+  gc          Remove releases beyond current, previous and one more
+  boot-check  Run before each start of a release on trial; counts the start
+  quiesce     For maintainer scripts: take the lock; exit 5 while a swap is pending
+  check       Validate the installer's configuration, trust files and path chain
+  help        Print this message or the help of the given subcommand(s)
+
+Options:
+      --json
+          Print the result as one JSON object on standard output
+
+      --apply
+          Do what the verb says. Without it a mutating verb is a dry run
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+=== kbf-installer setup --help ===
+First install: accounts, directories, installer.toml, the first release
+
+Usage: kbf-installer setup [OPTIONS] --mode <MODE>
+
+Options:
+      --json
+          Print the result as one JSON object on standard output
+      --mode <MODE>
+          The kbf mode this host runs (`kbf --mode=...`) [possible values: frontend, storage, daemon, storage-and-daemon, all-in-one]
+      --apply
+          Do what the verb says. Without it a mutating verb is a dry run
+      --release-source <RELEASE_SOURCE>
+          Where releases are fetched from [default: frontend] [possible values: url, frontend]
+      --release-url <RELEASE_URL>
+          The https base URL of the file server, for --release-source url
+      --min-generation <MIN_GENERATION>
+          Refuse orders below this generation
+      --commit <COMMIT>
+          The first release to install (40 hex characters)
+      --no-start
+          Enable the units without starting them
+  -h, --help
+          Print help
+
+=== kbf-installer status --help ===
+What is installed, staged and pending, and the last refusal
+
+Usage: kbf-installer status [OPTIONS]
+
+Options:
+      --json   Print the result as one JSON object on standard output
+      --apply  Do what the verb says. Without it a mutating verb is a dry run
+  -h, --help   Print help
+
+=== kbf-installer run --help ===
+Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swap
+
+Usage: kbf-installer run [OPTIONS]
+
+Options:
+      --json                           Print the result as one JSON object on standard output
+      --update-dir <UPDATE_DIR>        Root's directory: status.json goes here. Root-owned, mode 0755, so the node can read it [default: /var/lib/kbf-installer]
+      --apply                          Do what the verb says. Without it a mutating verb is a dry run
+      --orders-dir <ORDERS_DIR>        The order spool: owned by the service user, mode 0700, inside a root-owned parent [default: /var/lib/kbf-installer/orders]
+      --unit <UNIT>                    The systemd unit to restart after a swap (Linux)
+      --launchd-label <LAUNCHD_LABEL>  The launchd label to kickstart after a swap (macOS)
+      --interval-secs <INTERVAL_SECS>  Seconds between passes [default: 3]
+      --window-secs <WINDOW_SECS>      The confirm window the boot check gives a release on trial (120 to 1800) [default: 900]
+      --starts <STARTS>                The starts a release on trial gets before it is reverted (Linux) [default: 3]
+      --passes <PASSES>                Stop after this many passes (a rehearsal or a test); without it, run until stopped
+  -h, --help                           Print help
+
+=== kbf-installer update --help ===
+Order an update of this host's own frontend (root, inline)
+
+Usage: kbf-installer update [OPTIONS] --commit <COMMIT> --frontend
+
+Options:
+      --commit <COMMIT>  The release to update to (40 hex characters)
+      --json             Print the result as one JSON object on standard output
+      --apply            Do what the verb says. Without it a mutating verb is a dry run
+      --frontend         Update this host's frontend. Node updates come on the frontend's order, not from here
+  -h, --help             Print help
+
+=== kbf-installer confirm --help ===
+Keep the pending swap, naming its activation
+
+Usage: kbf-installer confirm [OPTIONS] --id <ID>
+
+Options:
+      --id <ID>  The activation: `<epoch>-<order id>`
+      --json     Print the result as one JSON object on standard output
+      --apply    Do what the verb says. Without it a mutating verb is a dry run
+  -h, --help     Print help
+
+=== kbf-installer revert --help ===
+Undo the pending swap, naming its activation
+
+Usage: kbf-installer revert [OPTIONS] --id <ID>
+
+Options:
+      --id <ID>  The activation: `<epoch>-<order id>`
+      --json     Print the result as one JSON object on standard output
+      --apply    Do what the verb says. Without it a mutating verb is a dry run
+  -h, --help     Print help
+
+=== kbf-installer rollback --help ===
+Point `current` at `previous`, with no confirm window
+
+Usage: kbf-installer rollback [OPTIONS]
+
+Options:
+      --json   Print the result as one JSON object on standard output
+      --apply  Do what the verb says. Without it a mutating verb is a dry run
+  -h, --help   Print help
+
+=== kbf-installer gc --help ===
+Remove releases beyond current, previous and one more
+
+Usage: kbf-installer gc [OPTIONS]
+
+Options:
+      --json   Print the result as one JSON object on standard output
+      --apply  Do what the verb says. Without it a mutating verb is a dry run
+  -h, --help   Print help
+
+=== kbf-installer boot-check --help ===
+Run before each start of a release on trial; counts the start
+
+Usage: kbf-installer boot-check [OPTIONS]
+
+Options:
+      --json                       Print the result as one JSON object on standard output
+      --window-secs <WINDOW_SECS>  [default: 900]
+      --apply                      Do what the verb says. Without it a mutating verb is a dry run
+  -h, --help                       Print help
+
+=== kbf-installer quiesce --help ===
+For maintainer scripts: take the lock; exit 5 while a swap is pending
+
+Usage: kbf-installer quiesce [OPTIONS]
+
+Options:
+      --json   Print the result as one JSON object on standard output
+      --apply  Do what the verb says. Without it a mutating verb is a dry run
+  -h, --help   Print help
+
+=== kbf-installer check --help ===
+Validate the installer's configuration, trust files and path chain
+
+Usage: kbf-installer check [OPTIONS]
+
+Options:
+      --json   Print the result as one JSON object on standard output
+      --apply  Do what the verb says. Without it a mutating verb is a dry run
+  -h, --help   Print help
+

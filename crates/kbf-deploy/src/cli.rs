@@ -116,8 +116,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Kit {
-    /// The host side of a commit-confirm deploy: the releases under /usr/local/kbf and
-    /// the deploy state.
+    /// The host side of a commit-confirm deploy: the releases under the installer's tree
+    /// (/var/lib/kbf-installer on Linux) and the state.
     #[command(subcommand)]
     Host(crate::host::Host),
     /// A MinIO for kbf: its buckets and key, and a NodePort for its S3 port.

@@ -813,7 +813,7 @@ fn the_job_runs_kbf_node_with_its_config_and_the_labels() {
     assert_eq!(
         args,
         [
-            "/usr/local/kbf/current/kbf",
+            "/usr/local/kbf-installer/releases/current/kbf",
             "node",
             "--config",
             "/usr/local/etc/kbf/kbf.toml",

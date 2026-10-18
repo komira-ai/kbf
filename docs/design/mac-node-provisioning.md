@@ -493,8 +493,8 @@ job is written so that adding it is one step, which runs when the signing secret
 
 - The deployment job's input names a commit. The job verifies that commit's asset
   (4.2), then runs on each node, one at a time.
-- The binary is installed at `/usr/local/kbf/<commit>/kbf-daemon`.
-  `/usr/local/kbf/current` is a symlink to the one in use, and the launchd job runs
+- The binary is installed at `/usr/local/kbf-installer/releases/<commit>/kbf-daemon`.
+  `/usr/local/kbf-installer/releases/current` is a symlink to the one in use, and the launchd job runs
   `current/kbf-daemon`. A small file, `/usr/local/kbf/deployed`, records the commit and
   SHA-256 the job installed.
 - An upgrade:
@@ -603,7 +603,7 @@ daemon starts at boot with nobody logged in
 
 ```xml
 <key>Label</key>             <string>org.example.kbf-daemon</string>
-<key>ProgramArguments</key>  <array><string>/usr/local/kbf/current/kbf-daemon</string> <!-- flags from the profile --></array>
+<key>ProgramArguments</key>  <array><string>/usr/local/kbf-installer/releases/current/kbf-daemon</string> <!-- flags from the profile --></array>
 <key>UserName</key>          <string>_kbf</string>
 <key>GroupName</key>         <string>_kbf</string>
 <key>RunAtLoad</key>         <true/>

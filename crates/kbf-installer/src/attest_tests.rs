@@ -63,7 +63,7 @@ fn gh_is_asked_for_exactly_the_pinned_attestation() {
     let call = &calls[0];
     assert_eq!(
         call.program,
-        PathBuf::from("/usr/local/libexec/kbf-deploy/gh")
+        PathBuf::from("/usr/share/kbf-installer/trust/gh")
     );
     assert_eq!(
         strings(&call.args),
@@ -74,7 +74,7 @@ fn gh_is_asked_for_exactly_the_pinned_attestation() {
             "--bundle",
             "/work/in/provenance.jsonl",
             "--custom-trusted-root",
-            "/usr/local/libexec/kbf-deploy/trusted_root.jsonl",
+            "/usr/share/kbf-installer/trust/trusted_root.jsonl",
             "--repo",
             "komira-ai/komira-build-farm",
             "--signer-workflow",
@@ -217,7 +217,7 @@ fn an_untrusted_gh_is_refused_before_it_runs() {
     let runner = FakeRunner::new(|_| Ok(ran(0, "", "")));
     let mut trust = trusted_host();
     trust.entries.insert(
-        HostPath::new(layout::INSTALLER_DIR).expect("path"),
+        HostPath::new(crate::fixtures::TRUST_DIR).expect("path"),
         kbf_host::exec::Entry::Dir {
             perms: kbf_host::step::Perms::new(0o777),
             owner: kbf_host::step::Owner { uid: 0, gid: 0 },
@@ -237,13 +237,16 @@ fn an_untrusted_gh_is_refused_before_it_runs() {
         )
         .expect_err("refused");
     assert_eq!(err.code(), "untrusted-writable");
-    assert!(err.to_string().starts_with(layout::INSTALLER_DIR), "{err}");
+    assert!(
+        err.to_string().starts_with(crate::fixtures::TRUST_DIR),
+        "{err}"
+    );
     assert!(runner.calls().is_empty());
 
     // The trusted root alone being wrong is refused too.
     let mut trust = trusted_host();
     trust.entries.insert(
-        HostPath::new(layout::TRUSTED_ROOT).expect("path"),
+        HostPath::new(crate::fixtures::TRUSTED_ROOT_PATH).expect("path"),
         kbf_host::exec::Entry::File {
             perms: kbf_host::step::Perms::new(0o644),
             owner: kbf_host::step::Owner { uid: 501, gid: 0 },
@@ -254,7 +257,11 @@ fn an_untrusted_gh_is_refused_before_it_runs() {
         .check_trust(&trust)
         .expect_err("refused");
     assert_eq!(err.code(), "untrusted-owner");
-    assert!(err.to_string().starts_with(layout::TRUSTED_ROOT), "{err}");
+    assert!(
+        err.to_string()
+            .starts_with(crate::fixtures::TRUSTED_ROOT_PATH),
+        "{err}"
+    );
 }
 
 /// Catches a ref that is not a branch ref reaching `gh` as an argument: an option, a

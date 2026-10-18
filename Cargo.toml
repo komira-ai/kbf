@@ -140,7 +140,7 @@ syn = { version = "2.0.119", default-features = false, features = ["full", "pars
 # no extended attributes.
 tar = { version = "0.4.46", default-features = false }
 thiserror = "2.0.21"
-# `kbf.toml`, the node's config file (kbf-enroll); no datetime or display support.
+# `kbf.toml`, the node's config file (kbf-enroll), and `installer.toml`, the installer's settings (kbf-installer); no datetime or display support.
 toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
 # RFC 3339 times in the MDM gate's signed messages. Already in the tree through
 # x509-parser.

@@ -51,9 +51,11 @@ fn one_pass_reports_the_host_and_a_refused_order() {
             ..State::default()
         })
         .expect("state");
-    fs::create_dir_all(root.join("usr/local/kbf/releases").join(A)).expect("release");
+    fs::create_dir_all(root.join("var/lib/kbf-installer/releases").join(A)).expect("release");
     fs::write(
-        root.join("usr/local/kbf/releases").join(A).join("kbf"),
+        root.join("var/lib/kbf-installer/releases")
+            .join(A)
+            .join("kbf"),
         b"x",
     )
     .expect("binary");
@@ -144,7 +146,7 @@ fn the_boot_check_counts_the_starts_and_reverts_the_last() {
     let root = root("boot");
     let host = layout(&root);
     for commit in [A, B] {
-        let dir = root.join("usr/local/kbf/releases").join(commit);
+        let dir = root.join("var/lib/kbf-installer/releases").join(commit);
         fs::create_dir_all(&dir).expect("release");
         fs::write(dir.join("kbf"), b"x").expect("binary");
     }
@@ -155,8 +157,9 @@ fn the_boot_check_counts_the_starts_and_reverts_the_last() {
         pending_confirm: Some(PendingConfirm {
             commit: c(B),
             previous: Some(c(A)),
-            deadline: None,
-            order_id: Some("5".to_owned()),
+            activation: "5".to_owned(),
+            deadline_wall: None,
+            deadline_mono_s: None,
             starts_left: Some(1),
         }),
         ..State::default()
@@ -187,10 +190,34 @@ fn the_boot_check_counts_the_starts_and_reverts_the_last() {
     // already back on A in the state.
     assert_eq!(left(&root).current, Some(c(A)));
 
-    fs::write(root.join("var/lib/kbf-deploy/state.json"), b"not json").expect("ruin");
+    // A damaged state.json is read from the backup: the pass goes on (it is not exit 5).
+    fs::write(root.join("var/lib/kbf-installer/state.json"), b"not json").expect("ruin");
     let out = helper(&root, &["boot-check"]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("kbf-installer:"));
+    assert_ne!(
+        out.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // With the backup damaged too, nobody can say what the host runs: exit 5, needs an
+    // operator, and nothing is written.
+    fs::write(root.join("var/lib/kbf-installer/state.json"), b"not json").expect("ruin");
+    fs::write(
+        root.join("var/lib/kbf-installer/state.json.bak"),
+        b"not json",
+    )
+    .expect("ruin");
+    let out = helper(&root, &["boot-check"]);
+    assert_eq!(out.status.code(), Some(5));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("kbf-installer:") && err.contains("unusable"),
+        "{err}"
+    );
+    assert_eq!(
+        fs::read(root.join("var/lib/kbf-installer/state.json")).expect("kept"),
+        b"not json"
+    );
 }
 
 /// Catches a helper that starts without being told what to restart: neither flag is a
@@ -256,15 +283,36 @@ fn passes_end_the_run_and_an_unreadable_memory_stops_it() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    fs::write(root.join("var/lib/kbf-deploy/helper.json"), b"not json").expect("ruin");
+    fs::write(root.join("var/lib/kbf-installer/helper.json"), b"not json").expect("ruin");
     let out = helper(&root, &two);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("helper.json"));
     // A directory the helper cannot write status.json into ends the pass with an error.
-    fs::remove_file(root.join("var/lib/kbf-deploy/helper.json")).expect("remove");
+    fs::remove_file(root.join("var/lib/kbf-installer/helper.json")).expect("remove");
     let mut elsewhere = two.to_vec();
     elsewhere.extend(["--update-dir", "/no/such/dir"]);
     let out = helper(&root, &elsewhere);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("kbf-installer:"));
+}
+
+/// Catches the gate in front of the verbs being absent from the shipped binary (the unit tests
+/// run the same code, but the binary is what a host runs): an ordinary user is refused every
+/// verb that needs root with exit 2 and the reason, `--json` puts one object on standard
+/// output, and a verb that needs no root and is not built yet says which pull request builds it.
+///
+/// Mutant planted: the root check skipped (`gc` then reaches "not implemented", exit 1).
+#[test]
+fn the_shipped_binary_refuses_a_verb_that_needs_root_and_names_the_unbuilt_ones() {
+    let root = root("gate");
+    let out = helper(&root, &["gc"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("gc needs root"));
+    let out = helper(&root, &["--json", "gc"]);
+    assert_eq!(out.status.code(), Some(2));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one object");
+    assert_eq!(v["error"], "needs_root");
+    let out = helper(&root, &["status"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("status: not implemented (P4)"));
 }
