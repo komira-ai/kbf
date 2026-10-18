@@ -109,6 +109,7 @@ fn hold_defers_the_bind_until_the_guard_releases() {
     assert!(!s.holding());
     assert_eq!(bound(&s).slot(), Slot::B);
     assert_eq!(Slot::A.other(), Slot::B);
+    assert_eq!(Slot::B.other(), Slot::A);
     assert!(format!("{s:?}").contains("ActiveSlot"));
     assert!(format!("{:?}", bound(&s)).contains("Permit"));
     assert_eq!(ActiveSlot::default().active(), None);
@@ -554,4 +555,26 @@ fn abandoning_the_startup_hold_leaves_a_released_or_a_later_hold_alone() {
     assert!(s.holding());
     assert_eq!(s.active(), Some(Slot::A));
     drop(later);
+}
+
+#[test]
+fn a_bind_that_loses_its_slot_to_a_flip_follows_the_gate() {
+    let s = live();
+    s.open(Slot::B);
+    // A is the active slot in the gate and closes under the bind (a flip and a retire that
+    // landed between the bind's two reads): the permit on A fails, the gate then names B.
+    s.inner.slots[Slot::A.index()].store(CLOSED, Ordering::Release);
+    let flipped = s.clone();
+    let got = s.bind_with(&mut || flipped.set_active(Slot::B).expect("B is open"));
+    match got {
+        Bind::Bound(p) => assert_eq!(p.slot(), Slot::B, "the bind followed the gate"),
+        other => panic!("expected a permit on B, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_closed_active_slot_that_never_moves_is_no_active_not_a_spin() {
+    let s = live();
+    s.inner.slots[Slot::A.index()].store(CLOSED, Ordering::Release);
+    assert!(matches!(s.bind(), Bind::NoActive));
 }

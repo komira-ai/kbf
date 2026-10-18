@@ -113,14 +113,45 @@ fn refusing(refusals: usize, then: &'static str) -> Script {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_refused_unary_stream_is_dispatched_once_more() {
-    let rig = Rig::start(refusing(1, "second"), tagged("b")).await;
+async fn a_refused_unary_stream_is_dispatched_once_more_with_its_whole_body() {
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let a = {
+        let bodies = Arc::clone(&bodies);
+        script(move |mut call| {
+            let bodies = Arc::clone(&bodies);
+            async move {
+                let body = read_all(&mut call.body).await;
+                bodies.lock().expect("lock").push(body);
+                if call.nth == 1 {
+                    call.respond.send_reset(Reason::REFUSED_STREAM);
+                } else {
+                    grpc_ok(&mut call.respond, "second");
+                }
+            }
+        })
+    };
+    let rig = Rig::start(a, tagged("b")).await;
     let reply = rig.client().await.unary(CAPS).await;
     assert_eq!(reply.text(), "second");
     assert_eq!(reply.grpc_status().as_deref(), Some("0"));
     assert_eq!(rig.a.state.dispatches(), 2);
     assert_eq!(rig.core.metrics.retries.load(Ordering::Acquire), 1);
+    assert_eq!(
+        *bodies.lock().expect("lock"),
+        vec![b"ping".to_vec(), b"ping".to_vec()],
+        "the second dispatch carries the same request, replayed from the buffer"
+    );
     until(|| rig.core.slots.open_streams() == 0).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_request_without_a_body_is_dispatched_once_more() {
+    let rig = Rig::start(refusing(1, "second"), tagged("b")).await;
+    let mut client = rig.client().await;
+    let (response, _body) = client.start(CAPS, true).await;
+    let reply = finish(response).await;
+    assert_eq!(reply.text(), "second");
+    assert_eq!(rig.a.state.dispatches(), 2);
 }
 
 #[tokio::test(start_paused = true)]
@@ -354,4 +385,105 @@ async fn inbound_identity_headers_never_reach_the_child() {
     let trailers = reply.trailers.expect("trailers");
     assert!(trailers.keys().all(|k| !k.as_str().starts_with("x-kbf-")));
     assert_eq!(reply.body, b"ok");
+}
+
+/// A child that holds every stream until `gate` has a permit for it.
+fn gated(gate: &Arc<Semaphore>) -> Script {
+    let gate = Arc::clone(gate);
+    script(move |mut call| {
+        let gate = Arc::clone(&gate);
+        async move {
+            read_all(&mut call.body).await;
+            gate.acquire().await.expect("open").forget();
+            grpc_ok(&mut call.respond, "a");
+        }
+    })
+}
+
+/// Starts `n` unary requests on `client` without waiting for their answers.
+async fn start_many(client: &mut super::kit::Client, n: usize) -> JoinSet<super::kit::Reply> {
+    let mut open = JoinSet::new();
+    for _ in 0..n {
+        let (response, mut body) = client.start(CAPS, false).await;
+        body.send_data(Bytes::from_static(b"x"), true)
+            .expect("body");
+        open.spawn(finish(response));
+    }
+    open
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_pool_grows_instead_of_queueing_behind_the_childs_stream_limit() {
+    let gate = Arc::new(Semaphore::new(0));
+    let rig = Rig::start(gated(&gate), tagged("b")).await;
+    // The child takes two streams per connection.
+    rig.a.state.max_concurrent.store(2, Ordering::Release);
+    let mut client = rig.client().await;
+    let mut open = start_many(&mut client, 6).await;
+    // All six are in the child at once, on at least three connections, not two at a time on one.
+    until(|| rig.a.state.dispatches() == 6).await;
+    assert!(rig.a.state.conns_total.load(Ordering::Acquire) >= 3);
+    gate.add_permits(6);
+    while let Some(reply) = open.join_next().await {
+        assert_eq!(reply.expect("client").text(), "a");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stream_beyond_the_connection_cap_waits_and_keeps_its_permit() {
+    let gate = Arc::new(Semaphore::new(0));
+    let rig = Rig::start(gated(&gate), tagged("b")).await;
+    // One stream per connection, so 256 connections (the cap) carry 256 streams.
+    rig.a.state.max_concurrent.store(1, Ordering::Release);
+    let mut client = rig.client().await;
+    let mut open = start_many(&mut client, 257).await;
+    until(|| rig.a.state.dispatches() == 256).await;
+    assert_eq!(rig.a.state.conns_total.load(Ordering::Acquire), 256);
+    assert_eq!(
+        rig.core.slots.open_permits(Slot::A),
+        257,
+        "the waiting one keeps its permit"
+    );
+    // Nothing more reaches the child until a stream finishes and frees its place.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        rig.a.state.dispatches(),
+        256,
+        "the 257th waits for a free stream"
+    );
+    gate.add_permits(1);
+    until(|| rig.a.state.dispatches() == 257).await;
+    gate.add_permits(300);
+    while let Some(reply) = open.join_next().await {
+        assert_eq!(reply.expect("client").text(), "a");
+    }
+    until(|| rig.core.slots.open_permits(Slot::A) == 0).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn goaway_below_last_stream_id_retries_the_in_flight_stream() {
+    let rig = Rig::start(tagged("a"), tagged("b")).await;
+    // The first connection the child takes answers the first stream with GOAWAY(last = 0):
+    // the stream is above it, so the child provably did not process it.
+    rig.a.state.raw_goaway_first.store(true, Ordering::Release);
+    let mut client = rig.client().await;
+    let reply = client.unary(CAPS).await;
+    assert_eq!(reply.text(), "a", "dispatched again, on a new connection");
+    assert_eq!(reply.grpc_status().as_deref(), Some("0"));
+    assert_eq!(rig.core.metrics.retries.load(Ordering::Acquire), 1);
+    assert_eq!(
+        rig.a.state.conns_total.load(Ordering::Acquire),
+        1,
+        "only the second is a real child"
+    );
+    assert!(
+        client.alive(),
+        "the child's GOAWAY did not reach the client"
+    );
+    client
+        .send
+        .clone()
+        .ready()
+        .await
+        .expect("the client got no GOAWAY");
 }

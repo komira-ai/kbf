@@ -241,3 +241,107 @@ async fn a_request_with_trailers_reaches_the_child_with_them() {
     assert_eq!(got.0, b"data");
     assert_eq!(got.1.expect("trailers").get("x-sum").expect("x-sum"), "4");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_response_that_goes_silent_is_ended_at_the_idle_bound() {
+    let a = script(|mut call| async move {
+        read_all(&mut call.body).await;
+        let response = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/grpc")
+            .body(())
+            .expect("response");
+        let mut send = call
+            .respond
+            .send_response(response, false)
+            .expect("headers");
+        send.send_data(Bytes::from_static(b"m"), false)
+            .expect("data");
+        // Then nothing, for 3 hours, with the stream open.
+        tokio::time::sleep(3 * HOUR).await;
+        drop(send);
+    });
+    let rig = Rig::start(a, tagged("b")).await;
+    let start = Instant::now();
+    let reply = rig.client().await.unary(CAPS).await;
+    assert_eq!(
+        reply.body, b"m",
+        "what came before the silence is delivered"
+    );
+    assert_eq!(
+        reply.grpc_status().as_deref(),
+        Some("14"),
+        "and the stream ends non-OK"
+    );
+    let waited = start.elapsed();
+    assert!(
+        waited >= 2 * HOUR && waited < 2 * HOUR + Duration::from_secs(5),
+        "{waited:?}"
+    );
+    until(|| rig.core.slots.open_permits(Slot::A) == 0).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_child_that_answers_early_and_stops_the_upload_ends_the_pump() {
+    let a = script(|mut call| async move {
+        let _ = call.body.data().await;
+        grpc_ok(&mut call.respond, "early");
+        // After the proxy has taken the answer in, the child stops the upload.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        call.respond.send_reset(Reason::NO_ERROR);
+    });
+    let rig = Rig::start(a, tagged("b")).await;
+    let mut client = rig.client().await;
+    let (response, mut body) = client.start(EXECUTE, false).await;
+    body.send_data(Bytes::from_static(b"first"), false)
+        .expect("body");
+    assert_eq!(finish(response).await.text(), "early");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // The client has more to upload; the child has stopped listening.
+    body.reserve_capacity(100_000);
+    let granted = std::future::poll_fn(|cx| body.poll_capacity(cx)).await;
+    assert!(granted.is_some());
+    let _ = body.send_data(Bytes::from(vec![9_u8; 100_000]), false);
+    until(|| rig.core.slots.open_permits(Slot::A) == 0).await;
+    assert_eq!(rig.core.slots.open_streams(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_operator_stream_that_cannot_be_served_gets_a_503() {
+    let rig = Rig::start(tagged("a"), tagged("b")).await;
+    let guard = rig
+        .core
+        .slots
+        .hold(Duration::from_secs(20))
+        .expect("no hold");
+    let reply = rig.client().await.plain("GET", OPERATOR, b"").await;
+    assert_eq!(reply.status, Some(503), "no gRPC trailer on an HTTP route");
+    assert!(reply.grpc_status().is_none());
+    assert_eq!(rig.a.state.dispatches(), 0);
+    drop(guard);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_child_that_never_accepts_fails_the_stream_at_the_connect_timeout() {
+    let rig = Rig::start(tagged("a"), tagged("b")).await;
+    rig.net.blackhole(super::kit::addr_of(
+        rig.table,
+        Slot::A,
+        crate::route::Target::Reapi,
+    ));
+    let start = Instant::now();
+    let reply = rig.client().await.unary(CAPS).await;
+    assert_eq!(reply.grpc_status().as_deref(), Some("14"));
+    let waited = start.elapsed();
+    assert!(
+        waited >= Duration::from_secs(3) && waited < Duration::from_secs(4),
+        "{waited:?}"
+    );
+    assert_eq!(
+        rig.core
+            .metrics
+            .upstream_dial_failed
+            .load(Ordering::Acquire),
+        1
+    );
+}

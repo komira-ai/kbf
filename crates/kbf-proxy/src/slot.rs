@@ -476,6 +476,13 @@ impl ActiveSlot {
     /// Binds a stream whose headers just arrived.
     #[must_use]
     pub fn bind(&self) -> Bind {
+        self.bind_with(&mut || {})
+    }
+
+    /// [`ActiveSlot::bind`], calling `after_failed_permit` between a permit that failed (the slot
+    /// closed under the bind) and the reload of the gate: the one place a test can move the
+    /// gate to stand for a supervisor that flipped meanwhile.
+    fn bind_with(&self, after_failed_permit: &mut dyn FnMut()) -> Bind {
         // Before the gate, so a release after the gate read moves the epoch past this one.
         let epoch = self.inner.epoch.load(Ordering::Acquire);
         let mut gate = self.inner.gate.load(Ordering::Acquire);
@@ -493,6 +500,7 @@ impl ActiveSlot {
                 return Bind::Bound(permit);
             }
             // The slot closed under us: the active slot has moved, or never will.
+            after_failed_permit();
             let next = self.inner.gate.load(Ordering::Acquire);
             if next == gate {
                 return Bind::NoActive;

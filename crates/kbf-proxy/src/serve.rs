@@ -48,6 +48,9 @@ impl Listen for TcpListener {
 /// How long a shutdown waits for open streams to finish before the connections are dropped.
 pub(crate) const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
+/// How long the accept loop waits after an accept failed.
+pub(crate) const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
 /// A stream that panicked: hyper resets that one stream (`INTERNAL_ERROR`), nothing else.
 #[derive(Debug, thiserror::Error)]
 #[error("the stream panicked")]
@@ -193,11 +196,11 @@ impl Drop for ConnPermit {
             .per_ip
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(held) = per_ip.get_mut(&self.ip) {
-            *held -= 1;
-            if *held == 0 {
-                per_ip.remove(&self.ip);
-            }
+        // The entry exists: `admit` made it for this permit.
+        let held = per_ip.entry(self.ip).or_insert(1);
+        *held -= 1;
+        if *held == 0 {
+            per_ip.remove(&self.ip);
         }
     }
 }
@@ -212,6 +215,12 @@ fn http_builder(core: &Core) -> http2::Builder<TokioExecutor> {
         .max_concurrent_streams(CONNECTION_STREAMS)
         .max_header_list_size(core.limits.max_header_list_bytes);
     http
+}
+
+/// Resolves when the shutdown flag is set, or its sender is gone.
+async fn stopped(shutdown: &mut watch::Receiver<bool>) {
+    // A closed channel is a shutdown too: nobody is left to send one.
+    let _ = shutdown.wait_for(|stop| *stop).await;
 }
 
 /// Accepts connections on `listener` until `shutdown` turns true (or its sender is gone),
@@ -233,24 +242,25 @@ pub(crate) async fn serve<U: UpdateHandler + 'static>(
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                // An accept that fails (a connection reset before it was taken) is skipped, and
-                // so is a connection over a limit: it is dropped, which closes it.
-                if let Ok((io, peer)) = accepted
-                    && let Some(permit) = limits.admit(peer)
-                {
-                    let service = Arc::clone(&service);
-                    let connection = http.serve_connection(
-                        TokioIo::new(io),
-                        service_fn(move |request| Arc::clone(&service).call(request)),
-                    );
-                    let watched = graceful.watch(connection);
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        let _ = watched.await;
-                    });
+                match accepted {
+                    // A connection over a limit is dropped, which closes it.
+                    Ok((io, peer)) => if let Some(permit) = limits.admit(peer) {
+                        let service = Arc::clone(&service);
+                        let connection = http.serve_connection(
+                            TokioIo::new(io),
+                            service_fn(move |request| Arc::clone(&service).call(request)),
+                        );
+                        let watched = graceful.watch(connection);
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let _ = watched.await;
+                        });
+                    },
+                    // Out of descriptors, say: back off instead of spinning on the error.
+                    Err(_) => tokio::time::sleep(ACCEPT_BACKOFF).await,
                 }
             }
-            _ = shutdown.wait_for(|stop| *stop) => break,
+            () = stopped(&mut shutdown) => break,
         }
     }
     drop(listener);

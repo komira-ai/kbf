@@ -421,3 +421,22 @@ async fn shutdown_sends_the_one_goaway_and_lets_a_stream_finish() {
     rig.serving.await.expect("the serve task ends");
     until(|| !client.alive()).await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_accept_that_keeps_failing_backs_off_and_shutdown_still_ends_it() {
+    let table = UpstreamTable { base_port: 18_000 };
+    let net = Arc::new(super::kit::MemNet::default());
+    let core = crate::core::Core::new(table, Limits::default(), ActiveSlot::new(), net.connector());
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let serving = tokio::spawn(crate::serve::serve(
+        core,
+        NoUpdates,
+        super::kit::failing_listener(),
+        stopped,
+    ));
+    // A busy loop would never let this virtual second pass; a backed-off one does.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!serving.is_finished());
+    stop.send_replace(true);
+    serving.await.expect("the serve task ends");
+}

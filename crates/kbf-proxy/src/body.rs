@@ -108,7 +108,6 @@ pub(crate) struct Down {
     activity: Arc<Activity>,
     idle: Option<Idling>,
     grpc: bool,
-    done: bool,
 }
 
 impl Down {
@@ -127,7 +126,6 @@ impl Down {
             activity,
             idle: idling,
             grpc,
-            done: false,
         }
     }
 
@@ -135,7 +133,6 @@ impl Down {
     /// non-OK trailer (never by a short OK message), anything else by a reset. The request
     /// half is cancelled too.
     fn fail(&mut self) -> Option<Result<Frame<Bytes>, BodyError>> {
-        self.done = true;
         self.life.cancel.notify_one();
         Some(if self.grpc {
             Ok(Frame::trailers(unavailable_trailers(
@@ -150,9 +147,6 @@ impl Down {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
-        if self.done {
-            return Poll::Ready(None);
-        }
         if let Some(idle) = self.idle.as_mut()
             && idle.as_mut().poll(cx).is_ready()
         {
@@ -166,7 +160,6 @@ impl Down {
             }
             Some(Err(_)) => Poll::Ready(self.fail()),
             None => {
-                self.done = true;
                 // After the data ended, trailers cannot fail: the stream is closed.
                 let trailers = ready!(self.recv.poll_trailers(cx)).ok().flatten();
                 Poll::Ready(trailers.map(|mut t| {
@@ -215,8 +208,7 @@ impl Body for ProxyBody {
     fn size_hint(&self) -> SizeHint {
         match self {
             Self::Full(Some(bytes)) => SizeHint::with_exact(bytes.len() as u64),
-            Self::Full(None) => SizeHint::with_exact(0),
-            Self::Up(_) => SizeHint::default(),
+            _ => SizeHint::default(),
         }
     }
 }
@@ -278,9 +270,12 @@ impl Source {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Whether the client's whole request has been read: the request needs no more bytes.
-    pub(crate) fn ended(&self) -> bool {
-        self.state().ended
+    /// Whether the request has no body at all (headers only): the one case that is sent as
+    /// END_STREAM on the headers. A request that was read to its end and has frames to
+    /// replay is not empty.
+    pub(crate) fn bodiless(&self) -> bool {
+        let state = self.state();
+        state.ended && state.kept.is_empty()
     }
 
     /// Whether a failed dispatch may be repeated (see [`may_retry`]).

@@ -134,7 +134,7 @@ impl Stream {
             Err(failure) => return Err((failure, carry())),
         };
         let life = Lifetime::new(permit, reservation, Arc::clone(&self.count));
-        let ended = self.source.ended();
+        let ended = self.source.bodiless();
         let mut upstream = Request::new(());
         *upstream.method_mut() = self.method.clone();
         *upstream.uri_mut() = self.uri.clone();

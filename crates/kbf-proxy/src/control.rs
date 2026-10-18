@@ -149,24 +149,16 @@ impl UpdateHandler for NoUpdates {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::pin::pin;
-    use std::task::{Context, Poll, Waker};
 
-    fn ready<F: Future>(f: F) -> F::Output {
-        let mut f = pin!(f);
-        match f.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-            Poll::Ready(v) => v,
-            Poll::Pending => panic!("the future is not ready"),
-        }
-    }
-
-    #[test]
-    fn until_u8_the_update_api_answers_503() {
-        let reply = ready(NoUpdates.handle(UpdateRequest {
-            method: "GET".into(),
-            path: "/v1/update/frontend".into(),
-            body: Vec::new(),
-        }));
+    #[tokio::test]
+    async fn until_u8_the_update_api_answers_503() {
+        let reply = NoUpdates
+            .handle(UpdateRequest {
+                method: "GET".into(),
+                path: "/v1/update/frontend".into(),
+                body: Vec::new(),
+            })
+            .await;
         assert_eq!(reply.status, 503);
         assert!(reply.headers.is_empty());
         assert!(reply.body.starts_with(b"{"));

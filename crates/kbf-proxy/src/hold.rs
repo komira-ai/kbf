@@ -240,9 +240,11 @@ impl Ticket {
         if state.load(Ordering::Acquire) == EXPIRED {
             Wake::Expire
         } else if self.expired(now) {
-            if self.cell.fail() {
-                self.shared.expired_total.fetch_add(1, Ordering::AcqRel);
-            }
+            // Counted only if this call is the one that failed it (the sweep may have).
+            let failed = u64::from(self.cell.fail());
+            self.shared
+                .expired_total
+                .fetch_add(failed, Ordering::AcqRel);
             Wake::Expire
         } else {
             Wake::Wait

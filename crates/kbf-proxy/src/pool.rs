@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::future::OptionFuture;
 use h2::client::SendRequest;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -177,7 +178,7 @@ impl TargetPool {
 
     async fn dial(self: &Arc<Self>) -> Result<Arc<Conn>, Failure> {
         Metrics::inc(&self.metrics.upstream_dials);
-        let Some((send, connection)) = connect(&self.connector, self.addr).await else {
+        let Some((send, mut connection)) = connect(&self.connector, self.addr).await else {
             Metrics::inc(&self.metrics.upstream_dial_failed);
             return Err(Failure::Connect);
         };
@@ -188,6 +189,7 @@ impl TargetPool {
             dead: Arc::clone(&dead),
         });
         let pool = Arc::downgrade(self);
+        let ping = connection.ping_pong();
         tokio::spawn(async move {
             // The connection ends when the child closes it, or every handle is dropped.
             let _ = connection.await;
@@ -196,6 +198,12 @@ impl TargetPool {
                 pool.notify.notify_waiters();
             }
         });
+        // Until the child's SETTINGS arrive h2 assumes 100 streams, so a burst of streams could
+        // all be reserved on this connection against a limit of 2. The child sends its SETTINGS
+        // before it answers a PING, so one round trip makes the advertised limit the real one.
+        let ponged =
+            OptionFuture::from(ping.map(|mut p| async move { p.ping(h2::Ping::opaque()).await }));
+        let _ = tokio::time::timeout(CONNECT_TIMEOUT, ponged).await;
         Ok(conn)
     }
 

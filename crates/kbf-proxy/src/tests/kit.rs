@@ -5,7 +5,7 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
@@ -54,6 +54,11 @@ where
 
 #[derive(Default)]
 pub(super) struct ChildState {
+    /// The `MAX_CONCURRENT_STREAMS` this child advertises per connection; 0 leaves it unset.
+    pub max_concurrent: AtomicUsize,
+    /// Set: the next connection is served by hand, and answers the first stream it is sent
+    /// with a GOAWAY that names stream 0 as the last it took.
+    pub raw_goaway_first: AtomicBool,
     pub dispatches: AtomicUsize,
     pub conns_open: AtomicUsize,
     pub conns_total: AtomicUsize,
@@ -86,6 +91,8 @@ impl ChildState {
 #[derive(Default)]
 pub(super) struct MemNet {
     listeners: Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<DuplexStream>>>,
+    /// Addresses where a connect neither succeeds nor fails.
+    blackholes: Mutex<Vec<SocketAddr>>,
 }
 
 const PIPE_BYTES: usize = 1 << 20;
@@ -98,6 +105,14 @@ impl MemNet {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(addr, tx);
         rx
+    }
+
+    /// Makes a connect to `addr` hang for ever.
+    pub(super) fn blackhole(&self, addr: SocketAddr) {
+        self.blackholes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(addr);
     }
 
     fn unlisten(&self, addr: SocketAddr) {
@@ -113,6 +128,14 @@ impl MemNet {
         Arc::new(move |addr| {
             let net = Arc::clone(&net);
             Box::pin(async move {
+                let hole = net
+                    .blackholes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .contains(&addr);
+                if hole {
+                    std::future::pending::<()>().await;
+                }
                 let listeners = net.listeners.lock().unwrap_or_else(PoisonError::into_inner);
                 let tx = listeners
                     .get(&addr)
@@ -140,6 +163,13 @@ impl Listen for MemListen {
             .ok_or_else(|| io::Error::from(io::ErrorKind::ConnectionAborted))?;
         Ok((Box::new(io), peer))
     }
+}
+
+/// A listener whose every accept fails: nothing will ever connect.
+pub(super) fn failing_listener() -> MemListen {
+    let (feed, rx) = mpsc::unbounded_channel();
+    drop(feed);
+    MemListen { rx }
 }
 
 /// One slot's fake child: a listener on each of its addresses, one set of counters.
@@ -212,17 +242,59 @@ pub(super) fn start_child_on(listeners: Vec<std::net::TcpListener>, script: Scri
     }
 }
 
+/// An h2 frame by hand.
+fn frame(kind: u8, flags: u8, payload: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(payload.len())
+        .expect("a small frame")
+        .to_be_bytes();
+    let mut out = vec![len[1], len[2], len[3], kind, flags, 0, 0, 0, 0];
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Speaks just enough h2 to answer the first HEADERS with `GOAWAY(last_stream_id = 0)`, then
+/// keeps the connection open and reads until the proxy closes it.
+async fn raw_goaway(mut io: impl AsyncRead + AsyncWrite + Unpin + Send) {
+    let _ = raw_goaway_frames(&mut io).await;
+}
+
+async fn raw_goaway_frames(
+    io: &mut (impl AsyncRead + AsyncWrite + Unpin + Send),
+) -> io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    io.read_exact(&mut [0_u8; 24]).await?;
+    io.write_all(&frame(4, 0, &[])).await?;
+    loop {
+        let mut head = [0_u8; 9];
+        io.read_exact(&mut head).await?;
+        let mut payload = vec![0_u8; u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize];
+        io.read_exact(&mut payload).await?;
+        match (head[3], head[4] & 1) {
+            (4, 0) => io.write_all(&frame(4, 1, &[])).await?,
+            (6, 0) => io.write_all(&frame(6, 1, &payload)).await?,
+            (1, _) => io.write_all(&frame(7, 0, &[0; 8])).await?,
+            _ => {}
+        }
+    }
+}
+
 async fn connection(
     io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     state: Arc<ChildState>,
     script: Script,
 ) {
-    let Ok(mut conn) = h2::server::Builder::new()
+    if state.raw_goaway_first.swap(false, Ordering::AcqRel) {
+        return raw_goaway(io).await;
+    }
+    let mut builder = h2::server::Builder::new();
+    builder
         .initial_window_size(4 << 20)
-        .initial_connection_window_size(64 << 20)
-        .handshake::<_, Bytes>(io)
-        .await
-    else {
+        .initial_connection_window_size(64 << 20);
+    let max = state.max_concurrent.load(Ordering::Acquire);
+    if max > 0 {
+        builder.max_concurrent_streams(u32::try_from(max).expect("a small limit"));
+    }
+    let Ok(mut conn) = builder.handshake::<_, Bytes>(io).await else {
         return;
     };
     state.conns_open.fetch_add(1, Ordering::AcqRel);
@@ -266,19 +338,20 @@ pub(super) async fn read_all(body: &mut RecvStream) -> Vec<u8> {
     all
 }
 
-/// A gRPC answer: headers, one message, `grpc-status: 0`.
+/// A gRPC answer: headers, one message, `grpc-status: 0`. A stream the proxy already reset
+/// has nowhere to send it, and that is not the child's problem.
 pub(super) fn grpc_ok(respond: &mut SendResponse<Bytes>, message: &'static str) {
     let response = http::Response::builder()
         .status(200)
         .header("content-type", "application/grpc")
         .body(())
         .expect("a response");
-    let mut send = respond.send_response(response, false).expect("headers");
-    send.send_data(Bytes::from_static(message.as_bytes()), false)
-        .expect("data");
     let mut trailers = HeaderMap::new();
     trailers.insert("grpc-status", HeaderValue::from_static("0"));
-    send.send_trailers(trailers).expect("trailers");
+    let _ = respond.send_response(response, false).and_then(|mut send| {
+        send.send_data(Bytes::from_static(message.as_bytes()), false)?;
+        send.send_trailers(trailers)
+    });
 }
 
 /// A child that reads the request and answers `tag`.
@@ -456,7 +529,7 @@ impl Client {
 }
 
 /// The address a slot's target listens on.
-fn addr_of(table: UpstreamTable, slot: Slot, target: Target) -> SocketAddr {
+pub(super) fn addr_of(table: UpstreamTable, slot: Slot, target: Target) -> SocketAddr {
     upstream_addr(table, slot, target)
 }
 

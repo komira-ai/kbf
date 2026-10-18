@@ -283,10 +283,16 @@ base_port = 18000
             Err(ConfigError::Invalid(_))
         ));
         let limits = |l: &str| ProxyConfig::from_toml_str(&format!("{MIN}\n[limits]\n{l}\n"));
-        assert!(matches!(
-            limits("keepalive_ack_s = 0"),
-            Err(ConfigError::Invalid(_))
-        ));
+        for zero in [
+            "keepalive_ack_s",
+            "keepalive_interval_s",
+            "pre_stream_timeout_s",
+        ] {
+            assert!(
+                matches!(limits(&format!("{zero} = 0")), Err(ConfigError::Invalid(_))),
+                "{zero}"
+            );
+        }
         assert!(matches!(
             limits("max_streams = 0"),
             Err(ConfigError::Invalid(_))
