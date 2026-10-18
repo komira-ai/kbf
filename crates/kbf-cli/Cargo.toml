@@ -54,12 +54,12 @@ kbf-types.workspace = true
 # The protocol the daemon half speaks, which `kbf --version --json` reports as the
 # server's (src/tests.rs pins them equal).
 kbf-daemon.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tonic.workspace = true
-# `kbf storage-and-daemon` running an action (tests/storage_and_daemon.rs): the image
-# store layout the stand-in `podman` reads, the act steps it runs through this test
-# binary, the REAPI messages (the node's certificates are made with rcgen, below).
-kbf-driver-container.workspace = true
+# `kbf storage-and-daemon` running an action (tests/storage_and_daemon.rs): the act steps
+# it runs through this test binary, the REAPI messages (the node's certificates are made
+# with rcgen, below); the image store layout the stand-in `podman` reads is
+# kbf-driver-container's, under the Linux-only section at the end.
 kbf-proto.workspace = true
 kbf-testkit.workspace = true
 prost.workspace = true
@@ -72,6 +72,15 @@ kbf-host.workspace = true
 # verify-cert` and read back with the storage node's own role check
 # (tests/deploy_units.rs), and the node's certificates (tests/storage_and_daemon.rs).
 rcgen.workspace = true
+# The fake front `kbf daemon` says Hello to on macOS (tests/macos_daemon.rs, which
+# includes kbf-node's tests/front/mod.rs): its async streams and the CAS it serves.
+futures.workspace = true
+kbf-front.workspace = true
+
+# The container driver builds on Linux only, and so does the one test that reads its
+# image store layout; the macOS tests of this package (tests/macos_daemon.rs) build without it.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+kbf-driver-container.workspace = true
 
 [lints]
 workspace = true

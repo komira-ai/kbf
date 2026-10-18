@@ -1430,11 +1430,13 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
+ "futures",
  "kbf-all-in-one",
  "kbf-cas-conformance",
  "kbf-daemon",
  "kbf-deploy",
  "kbf-driver-container",
+ "kbf-front",
  "kbf-host",
  "kbf-node",
  "kbf-proto",

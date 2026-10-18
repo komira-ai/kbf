@@ -427,6 +427,11 @@ jobs:
       - run: sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
       - run: cargo build -p kbf-node --bin kbf-daemon --locked
       - run: cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node -p kbf-testkit --locked
+      # `kbf daemon --driver native` started with the words the Mac's launchd unit
+      # writes, against a fake front, and the helpers it re-runs itself as (each action's
+      # keeper, the lease-user pool's `as-user` step) through the `kbf` binary
+      # (crates/kbf-cli/tests/macos_daemon.rs).
+      - run: cargo test -p kbf-cli --test macos_daemon --locked
       # A lease's own simulator, made, booted and deleted for real under the actions'
       # sandbox; one a killed daemon left deleted at the next start; and xcodebuild
       # finding a device of the default set but not one of another set
