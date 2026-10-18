@@ -12,7 +12,7 @@ use futures::StreamExt as _;
 use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
-    ByteStreamService, Cache, CasService, Connections, MAX_MESSAGE_BYTES, MetaLog,
+    Backend, ByteStreamService, Cache, CasService, Connections, MAX_MESSAGE_BYTES, MetaLog,
     RECORDER_CHANNEL, Recorder, RequestMetadataLayer, SegmentsConfig, SegmentsService,
 };
 use kbf_objstore::ObjectStore;
@@ -34,7 +34,7 @@ use crate::drain::Drain;
 use crate::farm::{Farm, StateError};
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::Readiness;
-use crate::http_blobs::BlobReaders;
+use crate::http_blobs::{BlobReaders, ReadBudget};
 use crate::http_invocations::InvocationReaders;
 use crate::identity::{DenyList, Peers};
 use crate::members::{Members, MembershipError};
@@ -624,6 +624,13 @@ where
 {
     let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
     let (state, history) = crate::history::take(state);
+    // One read budget for every reader of blobs and logs in this process: the blob route,
+    // the failure-log route and the history writer's tail reads.
+    let budget = ReadBudget::default();
+    let history = history.map(|history| {
+        let blobs = Arc::new(Backend::from(Arc::clone(&cache)));
+        history.with_blobs(blobs, budget.clone())
+    });
     let recording = crate::history::install(recording, history.as_ref());
     let default_memory = listeners.memory_ladder.first();
     let farm = Farm::new(
@@ -667,19 +674,25 @@ where
     let drain = Arc::new(drain);
     let health_routes =
         crate::health::router(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
-    let blob_routes =
-        crate::http_blobs::router(Arc::clone(&cache), BlobReaders::from_policy(&policy));
+    let blob_routes = crate::http_blobs::router(
+        Arc::clone(&cache),
+        BlobReaders::from_policy(&policy),
+        budget.clone(),
+    );
     let page_routes = crate::http_invocations::router(
         recorder.clone(),
         Arc::clone(&cache),
         InvocationReaders::from_policy(&policy),
         history.as_ref().map(crate::history::History::reads),
+        budget,
     );
     let api_routes = crate::api::router(
         Arc::clone(&farm),
         token,
         Arc::clone(&drain),
         members.clone(),
+        // A server with no frontend role has no enrollment.
+        None,
     )
     .merge(health_routes)
     .merge(crate::metrics::router(

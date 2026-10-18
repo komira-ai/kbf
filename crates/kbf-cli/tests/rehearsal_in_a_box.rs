@@ -325,7 +325,12 @@ impl Farm {
             Some(bin) => {
                 let mut flags = cgroup_tree(bin);
                 flags.push(format!("--id-files={}", id_files(root).display()));
-                let env = vec![("PATH".to_owned(), image_path(bin))];
+                // Rootless Podman's runtime directory, which the startup self-checks look
+                // for: `bin` exists and is this user's.
+                let env = vec![
+                    ("PATH".to_owned(), image_path(bin)),
+                    ("XDG_RUNTIME_DIR".to_owned(), bin.display().to_string()),
+                ];
                 // The stand-in finds its state beside the link it was run through.
                 (unit.add(&flags), bin, env)
             }

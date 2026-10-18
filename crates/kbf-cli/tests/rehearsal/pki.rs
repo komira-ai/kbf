@@ -89,6 +89,13 @@ impl Pki {
         let key = KeyPair::generate().expect("key");
         let cert = leaf.signed_by(&key, &self.ca).expect("sign");
         std::fs::write(etc.join(format!("{stem}.pem")), cert.pem()).expect("write");
-        std::fs::write(etc.join(format!("{stem}.key")), key.serialize_pem()).expect("write");
+        // Private to this user, as the startup self-checks want every key.
+        let key_path = etc.join(format!("{stem}.key"));
+        std::fs::write(&key_path, key.serialize_pem()).expect("write");
+        std::fs::set_permissions(
+            &key_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .expect("mode");
     }
 }

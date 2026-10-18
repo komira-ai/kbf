@@ -17,6 +17,10 @@
 //! - `package --binary <path> --sbom <path> --platform <platform> --commit <sha> --out
 //!   <dir>` ([`package`]): one binary as a release asset, a tarball that is the same
 //!   bytes on every runner, and its SBOM, with their lines in `SHA256SUMS.<platform>`.
+//! - `pkg build --binary <path> --launchd-plist <path> [--trust <path>]... --version <v>
+//!   --out <dir>` and `pkg cask` ([`pkg`]): kbf-installer for a Mac, a `.pkg` that is
+//!   the same bytes on every host and installs a root-owned tree and a LaunchDaemon that
+//!   is not loaded, and the Homebrew cask for it (no formula: contract section 7).
 //! - `sums assemble <dir>` and `verify-assets {sums,attestations} <dir>` ([`sums`]): the
 //!   one `SHA256SUMS` over every platform's assets, and the checks the attest job and
 //!   a deployment make of it, each with a control that must fail.
@@ -46,6 +50,7 @@ pub mod darwin;
 pub mod entitlements;
 pub mod fetch;
 pub mod package;
+pub mod pkg;
 pub mod podman_tests;
 pub mod release;
 pub mod sudo_test;
@@ -144,6 +149,9 @@ enum Verb {
         #[arg(long)]
         out: PathBuf,
     },
+    /// kbf-installer for a Mac: its `.pkg`, and the Homebrew cask.
+    #[command(subcommand)]
+    Pkg(PkgVerb),
     /// Sign a macOS binary in place, ad hoc with the hardened runtime and the
     /// entitlements the allow list gives its file name, and check it (macOS only).
     SignDarwin {
@@ -195,6 +203,43 @@ enum Verb {
         /// Arguments for the test binary (after `--`), such as a test name.
         #[arg(last = true)]
         args: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PkgVerb {
+    /// Write `kbf-installer-<version>-macos-arm64.pkg` in `--out`.
+    Build {
+        /// The kbf-installer binary, signed ad hoc.
+        #[arg(long)]
+        binary: PathBuf,
+        /// The LaunchDaemon property list; refused unless the job is gated on the
+        /// configuration file.
+        #[arg(long)]
+        launchd_plist: PathBuf,
+        /// A trust file to install in /usr/local/kbf-installer/trust (repeatable).
+        #[arg(long)]
+        trust: Vec<PathBuf>,
+        /// The release's version: letters, digits and `. _ + -`.
+        #[arg(long)]
+        version: String,
+        /// The directory the package goes in; created when missing.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Write the Homebrew cask that installs a package `pkg build` wrote.
+    Cask {
+        /// The package, named as `pkg build` names it.
+        #[arg(long)]
+        pkg: PathBuf,
+        #[arg(long)]
+        version: String,
+        /// Where Homebrew downloads the package from (https:// or file:///).
+        #[arg(long)]
+        url: String,
+        /// The cask file to write; it must not exist.
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -435,6 +480,25 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             commit,
             out,
         } => package::package(&binary, &sbom, platform, &commit, &out),
+        Verb::Pkg(PkgVerb::Build {
+            binary,
+            launchd_plist,
+            trust,
+            version,
+            out,
+        }) => pkg::build(&pkg::Build {
+            binary: &binary,
+            plist: &launchd_plist,
+            trust: &trust,
+            version: &version,
+            out: &out,
+        }),
+        Verb::Pkg(PkgVerb::Cask {
+            pkg,
+            version,
+            url,
+            out,
+        }) => pkg::cask(&pkg, &version, &url, &out),
         #[cfg(target_os = "macos")]
         Verb::SignDarwin {
             binary,
