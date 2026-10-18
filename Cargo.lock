@@ -1765,9 +1765,12 @@ dependencies = [
 name = "kbf-installer"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "clap",
  "flate2",
  "hex",
+ "hyper",
  "kbf-host",
  "kbf-installer",
  "kbf-update",
@@ -1776,9 +1779,12 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "subtle",
  "tar",
  "thiserror",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

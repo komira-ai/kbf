@@ -1,0 +1,79 @@
+//! The update API of the frontend proxy (`docs/design/frontend-proxy.md` section 4, unit
+//! U8a): the routes, the bearer-token check, the single actor that owns the state of the
+//! update, and the idempotent request ids.
+//!
+//! Nothing here binds a socket, starts a process or touches the filesystem beyond the
+//! proxy's state directory. Everything U8a needs from the rest of the system is a trait
+//! in [`traits`], because none of it is on the feature branch yet: [`traits::OrderWriter`]
+//! (the `frontend_update`/`revert` records), [`traits::StatusReader`] (`status.json`),
+//! [`traits::Supervisor`] (the U7 swap), [`traits::CompatGate`] (R1/R4, a stub until U9)
+//! and [`traits::Forwarder`] (the operator port). U7b and U8b supply the real ones.
+//!
+//! # How an update moves
+//!
+//! `POST` checks the request (409 and 422 cases), saves its `request_id`, writes a
+//! `frontend_update` order (a locator; the root half fetches, verifies and stages without
+//! flipping, FP section 2) and answers 202 with phase `accepted`. From then on the API
+//! reads `status.json` on every status read and on [`actor::Api::tick`]:
+//!
+//! - `state: fetching` is phase `fetching`;
+//! - `state: refused` for an order at or after ours is phase `failed` with the refusal
+//!   word as `failure.reason` ([`refusal`]); no child is started;
+//! - `staged_commit` equal to ours with `staged{}` facts runs the compatibility gate, and
+//!   a compatible release is handed to the [`traits::Supervisor`], which owns every later
+//!   phase; an incompatible one fails the update and a `revert` order drops the staged
+//!   release.
+//!
+//! The phase `verifying` is never reported by the API: `status.json` has no state between
+//! `fetching` and `staged`.
+//!
+//! # Assumptions on open questions (each lives in one place)
+//!
+//! - **Order ids (Q1).** `order_id`, `epoch` and `generation` come from the
+//!   [`traits::OrderWriter`]; the API does not know where their counter lives.
+//! - **Which refusal is ours (Q1).** `status.json` has one `refusal` string and
+//!   `acked_order_id`; a `refused` state whose `acked_order_id` is at least our order's id
+//!   is ours ([`core::Core::advance`]). A stale refusal has a lower id.
+//! - **Compatibility before the fetch (Q1, U9).** `POST` asks the gate with no facts, so
+//!   a 409 `incompatible` or 422 at `POST` time is possible only for what U9 can know
+//!   without the release; the verdict on the staged facts arrives as `failed` /
+//!   `step: compat` ([`traits::CompatGate`]).
+//! - **Request map (Q5).** `requests.json` in the proxy state directory is this module's
+//!   own file ([`idempotency`]); `update.json` (the swap's intent) is U7's.
+//! - **Restart marker (FP section 10).** The path of the postinst marker is not fixed by
+//!   the design; [`traits::RestartMarker`] takes it from the caller.
+//! - **The confirm window** the orders ask for is [`core::Config::window_s`].
+//! - **Operator port forwards.** `/v1/update/pause` and `/v1/update/resume` are the paths
+//!   of the two forwarded verbs (FP names `/pause`, `/resume` under `/v1/update`).
+//! - **Who runs the forward Postgres migration, and with which credential, is still open
+//!   and is not touched here:** it belongs behind the `Migrator` trait of the update
+//!   driver (U7b), before a candidate child starts, and the API only sees its effect as a
+//!   `failed` phase from the supervisor.
+//!
+//! # What U7b and U8b wire
+//!
+//! U7b implements [`traits::Supervisor`] over the real children and the `confirm`
+//! order; U8b implements [`traits::OrderWriter`] over `orders/` and the counter,
+//! [`traits::Forwarder`] over the operator port, a hyper listener that builds
+//! `Request<Bytes>` (with a [`auth::PeerKey`] extension) and calls [`router::Router::call`],
+//! the timer that calls [`actor::Api::tick`], and the OIDC [`auth::Authorize`] (#1088).
+
+pub mod actor;
+pub mod auth;
+pub mod core;
+pub mod idempotency;
+pub mod model;
+pub mod refusal;
+pub mod router;
+pub mod traits;
+
+#[cfg(test)]
+mod auth_tests;
+#[cfg(test)]
+mod fakes;
+#[cfg(test)]
+mod idempotency_tests;
+#[cfg(test)]
+mod router_tests;
+#[cfg(test)]
+mod tests;

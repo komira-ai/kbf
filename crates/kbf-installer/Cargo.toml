@@ -26,23 +26,30 @@ publish.workspace = true
 testkit = ["kbf-host/testkit"]
 
 [dependencies]
+async-trait.workspace = true
+bytes.workspace = true
 clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
+hyper.workspace = true
 kbf-host.workspace = true
 libc.workspace = true
 rustix = { workspace = true, features = ["fs", "process"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+subtle.workspace = true
 tar.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+tracing.workspace = true
 
 [dev-dependencies]
 kbf-host = { workspace = true, features = ["testkit"] }
 kbf-installer = { workspace = true, features = ["testkit"] }
 kbf-update.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
