@@ -251,6 +251,10 @@ impl Control {
         let Some((role, stand, held)) = self.running_in(&[Role::Active, Role::Quiesced]) else {
             return Err(self.wrong("quiesced or active"));
         };
+        // A takeover can begin between this read and `resume` below: the writes of this
+        // process are then refused (`Fenced`), the farm notes it, and `watch` fences it
+        // again and follows the new writer's rows, so the process ends up stood down in
+        // effect even though this call answered 200.
         if role == Role::Quiesced {
             let now = generation_of(stand.store.as_ref()).map_err(Refusal::failed)?;
             if now != held {
@@ -281,7 +285,7 @@ impl Control {
         if role != Role::StoodDown {
             stand.release().await;
             self.set_role(Role::StoodDown);
-            follow(Arc::clone(&stand.farm), &self.following);
+            let _ = follow(Arc::clone(&stand.farm), &self.following);
         }
         Ok(self.view())
     }
@@ -342,10 +346,10 @@ impl Refusal {
 
 /// Answers the calls a farm kept from the `done/` rows another writer makes
 /// ([`crate::farm::Farm::follow`]), every [`FOLLOW_EVERY`], for as long as the process
-/// lives; started once per process.
-fn follow(farm: Arc<crate::farm::Farm>, started: &AtomicBool) {
+/// lives; started once per process. Whether this call started it.
+fn follow(farm: Arc<crate::farm::Farm>, started: &AtomicBool) -> bool {
     if started.swap(true, Ordering::SeqCst) {
-        return;
+        return false;
     }
     tokio::spawn(async move {
         let mut look = tokio::time::interval(FOLLOW_EVERY);
@@ -356,6 +360,7 @@ fn follow(farm: Arc<crate::farm::Farm>, started: &AtomicBool) {
             let _ = farm.follow();
         }
     });
+    true
 }
 
 /// Waits for the state store to refuse a write of `farm` because another writer holds the
@@ -371,6 +376,9 @@ fn watch(farm: Arc<crate::farm::Farm>, started: Arc<AtomicBool>) {
         }
         tracing::warn!("the state store has a newer writer: following its results");
         farm.fence();
-        follow(farm, &started);
+        let _ = follow(farm, &started);
     });
 }
+
+#[cfg(test)]
+mod tests;

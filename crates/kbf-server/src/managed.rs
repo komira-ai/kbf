@@ -14,9 +14,16 @@
 //! scheduler, the reconciler and the worker listener start, on the sockets the candidate
 //! already bound. A start with no `--await-takeover` is a cold start and bumps the epoch.
 //!
+//! **A SQLite state file** is held by one process (an exclusive file lock), so a candidate
+//! cannot be opened beside the process that holds it: running side by side needs the
+//! Postgres store.
+//!
 //! **`quiesce`** fences the farm ([`crate::farm::Farm::fence`]): it feeds the scheduler
 //! nothing, so nothing is granted, assigned or requeued, and a call that would queue is
-//! refused `UNAVAILABLE`. **`resume`** undoes it while the store is still at the
+//! refused `UNAVAILABLE`. A heartbeat or result that reaches a quiesced farm is not applied
+//! either, so a quiesce is meant to last seconds (the takeover's limit is 10): one longer
+//! than the leases' expiry lets the scheduler expire the leases of work that is still
+//! running when the farm resumes, and requeue it. Nothing bounds it. **`resume`** undoes it while the store is still at the
 //! generation this process took. **`stand-down`** is the old holder's last step: it ends
 //! the worker streams, stops the worker listener, goes not ready and answers the calls it
 //! kept from `done/` rows ([`crate::farm::Farm::follow`]), with no GOAWAY. It never

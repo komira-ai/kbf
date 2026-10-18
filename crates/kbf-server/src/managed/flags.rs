@@ -42,7 +42,9 @@ pub(crate) fn args() -> [Arg; 2] {
                 "Open the state store without taking its generation, bump no epoch and run no \
                  scheduler, reconciler or worker listener: serve /readyz, the health service \
                  and GetCapabilities until `POST takeover` makes this process the writer. \
-                 Needs --admin-listen.",
+                 Needs --admin-listen. A SQLite state file is held by one process (an \
+                 exclusive lock), so a candidate cannot run beside the process that holds \
+                 it: side by side needs the Postgres store.",
             ),
     ]
 }

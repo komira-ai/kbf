@@ -512,7 +512,10 @@ Execute calls between their request and their queueing and the results being tak
 fences the farm: it feeds the scheduler nothing, so nothing is granted, assigned or
 requeued, a call that would queue is refused `UNAVAILABLE`, and a worker's result or
 heartbeat is not applied. It writes the requeues the store refused. Idempotent. Open
-streams and worker sessions stay open.
+streams and worker sessions stay open. While quiesced, a worker's heartbeat or result is not
+applied, so a quiesce is meant to last seconds (a takeover's limit is 10): one longer than
+the leases' expiry lets the scheduler expire the leases of work still running and requeue it
+when the process resumes. Nothing bounds it.
 
 **`POST /v1/admin/resume`** (quiesced or active): undoes a quiesce, for a takeover that did
 not happen. Refused with `409` when the store is no longer at `held_generation` or the
@@ -541,6 +544,8 @@ when it holds nothing).
 without taking the generation, touches no epoch and writes nothing; it serves `/readyz`,
 `grpc.health.v1` and `GetCapabilities`, and no other REAPI call (`UNIMPLEMENTED`). It runs
 no scheduler or reconciler and binds no worker listener. It makes and changes no schema.
+A SQLite state file is held by one process (an exclusive file lock), so a candidate cannot
+run beside the process that holds the file: side by side needs the Postgres store.
 A start without `--await-takeover` takes the next generation and bumps the epoch, as any
 start does.
 

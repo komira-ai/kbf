@@ -30,10 +30,23 @@ impl Proc {
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn kbf");
-        let mut line = String::new();
-        BufReader::new(child.stdout.take().expect("stdout"))
-            .read_line(&mut line)
-            .expect("a start line");
+        // Read on a thread so that a child that never prints its start line fails the
+        // test instead of hanging it.
+        let stdout = child.stdout.take().expect("stdout");
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = BufReader::new(stdout).read_line(&mut line);
+            let _ = sent.send(line);
+        });
+        let line = match received.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(line) => line,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("kbf {args:?} printed no start line within 60 seconds");
+            }
+        };
         Self { child, line }
     }
 
@@ -143,6 +156,9 @@ kbf_cas_conformance::tests!(Through::new());
 /// One `GET` on the operator API: the status code and the body.
 fn get(api: &str, path: &str) -> (u16, String) {
     let mut stream = std::net::TcpStream::connect(api).expect("connect to the API");
+    let bound = Some(std::time::Duration::from_secs(30));
+    stream.set_read_timeout(bound).expect("a read timeout");
+    stream.set_write_timeout(bound).expect("a write timeout");
     write!(
         stream,
         "GET {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n"

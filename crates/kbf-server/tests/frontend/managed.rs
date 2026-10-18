@@ -86,20 +86,11 @@ impl Child {
     }
 
     async fn call(&self, method: &str, path: &str, body: &str) -> (u16, Value) {
-        let mut stream = TcpStream::connect(self.admin).await.expect("connect");
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
-        stream.write_all(request.as_bytes()).await.expect("send");
-        let mut response = String::new();
-        stream.read_to_string(&mut response).await.expect("read");
-        let (head, body) = response.split_once("\r\n\r\n").expect("a head and a body");
-        let code = head.split_whitespace().nth(1).and_then(|c| c.parse().ok());
-        (
-            code.expect("a status code"),
-            serde_json::from_str(body).unwrap_or(Value::Null),
-        )
+        exchange(self.admin, &request).await
     }
 
     async fn role(&self) -> Value {
@@ -123,6 +114,56 @@ impl Child {
             .map(|a| a.parse().expect("an address"))
     }
 }
+
+/// One request and its answer, bounded: a process that never answers fails the test
+/// instead of hanging it.
+async fn exchange(addr: SocketAddr, request: &str) -> (u16, Value) {
+    let exchanged = async {
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("send");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        response
+    };
+    let response = tokio::time::timeout(Duration::from_secs(30), exchanged)
+        .await
+        .unwrap_or_else(|_| panic!("{addr} did not answer within 30 seconds"));
+    let (head, body) = response.split_once("\r\n\r\n").expect("a head and a body");
+    let code = head.split_whitespace().nth(1).and_then(|c| c.parse().ok());
+    (
+        code.expect("a status code"),
+        serde_json::from_str(body).unwrap_or(Value::Null),
+    )
+}
+
+/// A scratch directory of the test's own, removed when dropped.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("kbf-managed-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        Self(dir)
+    }
+
+    /// The `--api-token-file` flag for a token file of this directory, 0600.
+    fn token_flag(&self) -> String {
+        let file = self.0.join("token");
+        std::fs::write(&file, format!("{TOKEN}\n")).expect("token file");
+        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .expect("mode");
+        format!("--api-token-file={}", file.display())
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+const TOKEN: &str = "a-token-that-is-long-enough-for-a-test";
 
 fn generation(store: &Arc<Fake>) -> (u64, kbf_state::Version) {
     let row = store.get(GENERATION).expect("read").expect("a generation");
@@ -297,11 +338,8 @@ async fn role_answers_truthfully_in_each_state() {
 async fn a_takeover_after_a_quiesce_fences_the_old_holder_which_finishes_its_open_calls() {
     let node = Node::start().await;
     let store = shared();
-    let token = std::env::temp_dir().join(format!("kbf-managed-token-{}", std::process::id()));
-    std::fs::write(&token, "a-token-that-is-long-enough-for-a-test\n").expect("token file");
-    std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-        .expect("mode");
-    let token_flag = format!("--api-token-file={}", token.display());
+    let scratch = Scratch::new("token");
+    let token_flag = scratch.token_flag();
     let a = Child::start(&managed_flags(&node, &[&token_flag]), &store).await;
     let b = Child::start(&managed_flags(&node, &["--await-takeover"]), &store).await;
     let a_worker = Child::worker_of(&a.role().await).expect("a worker listener");
@@ -357,18 +395,10 @@ async fn a_takeover_after_a_quiesce_fences_the_old_holder_which_finishes_its_ope
 }
 
 async fn get_post(api: SocketAddr, path: &str) -> u16 {
-    let mut stream = TcpStream::connect(api).await.expect("connect");
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\nContent-Type: application/json\r\nAuthorization: Bearer a-token-that-is-long-enough-for-a-test\r\nContent-Length: 0\r\n\r\n"
+        "POST {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\nContent-Type: application/json\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: 0\r\n\r\n"
     );
-    stream.write_all(request.as_bytes()).await.expect("send");
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await.expect("read");
-    response
-        .split_whitespace()
-        .nth(1)
-        .and_then(|c| c.parse().ok())
-        .expect("a status")
+    exchange(api, &request).await.0
 }
 
 /// Catches: a quiesce that does not stop scheduling (an Execute is accepted and the daemon
@@ -598,11 +628,8 @@ async fn calls_that_do_not_apply_change_nothing() {
 async fn a_fenced_holder_answers_its_waiting_callers_without_a_stand_down() {
     let node = Node::start().await;
     let store = shared();
-    let token = std::env::temp_dir().join(format!("kbf-managed-fenced-{}", std::process::id()));
-    std::fs::write(&token, "a-token-that-is-long-enough-for-a-test\n").expect("token file");
-    std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-        .expect("mode");
-    let token_flag = format!("--api-token-file={}", token.display());
+    let scratch = Scratch::new("fenced");
+    let token_flag = scratch.token_flag();
     let a = Child::start(&managed_flags(&node, &[&token_flag]), &store).await;
     let b = Child::start(&managed_flags(&node, &["--await-takeover"]), &store).await;
     let a_worker = Child::worker_of(&a.role().await).expect("a worker listener");
@@ -623,6 +650,16 @@ async fn a_fenced_holder_answers_its_waiting_callers_without_a_stand_down() {
     })
     .await;
     assert_eq!(a.role().await["role"], "active", "no stand-down was made");
+    // A found it is fenced and fenced its farm: a call that would queue is refused
+    // UNAVAILABLE ("handing over"), not as the store's refusal of a write
+    // (FAILED_PRECONDITION), which is what an unfenced farm that knows only its store is
+    // superseded answers.
+    let other = Job::new("work for a fenced holder", &[]);
+    client.upload(&other.blobs()).await;
+    until("the farm of a holder found fenced is fenced", async || {
+        execute_refused(&client, &other).await == Some(Code::Unavailable)
+    })
+    .await;
 
     let b_worker = Child::worker_of(&b.role().await).expect("worker");
     let reached = Client::connect(b.reapi, b_worker).await;
