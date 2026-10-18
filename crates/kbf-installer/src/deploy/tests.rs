@@ -75,6 +75,10 @@ struct Farm {
     unattested: bool,
     server_commit: &'static str,
     cordoned: Option<&'static str>,
+    /// `/v1/nodes` has no `nodes` key at all.
+    nodes_key_missing: bool,
+    /// `/v1/nodes` lists no node once the desired release is set.
+    empty_after_desired: bool,
 }
 
 impl Farm {
@@ -96,6 +100,8 @@ impl Farm {
             unattested: false,
             server_commit: &TARGET[..12],
             cordoned: None,
+            nodes_key_missing: false,
+            empty_after_desired: false,
         }
     }
 
@@ -168,7 +174,15 @@ impl Operator for Farm {
         match (r.method, r.path.as_str()) {
             ("PUT", _) => Farm::reply(self.upload_status, json!({"sha256": "x", "size": 1})),
             ("GET", "/v1/nodes") => {
-                let nodes: Vec<Value> = self.nodes.iter().map(|n| self.node_json(n)).collect();
+                if self.nodes_key_missing {
+                    return Farm::reply(200, json!({"server": {"commit": self.server_commit}}));
+                }
+                let vanished = self.empty_after_desired && self.desired_at.get().is_some();
+                let nodes: Vec<Value> = if vanished {
+                    Vec::new()
+                } else {
+                    self.nodes.iter().map(|n| self.node_json(n)).collect()
+                };
                 Farm::reply(
                     200,
                     json!({"server": {"commit": self.server_commit}, "nodes": nodes}),
@@ -545,6 +559,42 @@ fn a_node_with_no_known_platform_is_refused() {
     f.nodes.push(node("c-odd", "plan9-mips", Fate::Never));
     let s = go(&f);
     assert_eq!((s.exit, s.reason.as_str()), (3, "node_platform_unknown"));
+}
+
+/// Proves a farm that lists no node, or whose `/v1/nodes` has no `nodes` array, is refused
+/// before anything is set: an empty list must not read as "every node is fine". Catches a
+/// renamed or broken field giving a green deploy that never confirmed a node.
+#[test]
+fn a_farm_that_reports_no_nodes_is_refused_before_anything_is_set() {
+    let f = farm(Vec::new());
+    let s = go(&f);
+    assert_eq!((s.exit, s.reason.as_str()), (3, "no_nodes"));
+    assert_eq!(f.requests("POST"), 0);
+    let mut f = farm(two_nodes());
+    f.nodes_key_missing = true;
+    let s = go(&f);
+    assert_eq!((s.exit, s.reason.as_str()), (3, "no_nodes"));
+    assert_eq!(f.requests("POST"), 0);
+}
+
+/// Proves the wait does not finish on an empty node list (the list read after the desired
+/// release is set), and times out instead. Catches `all()` on an empty list passing.
+#[test]
+fn an_empty_node_list_while_waiting_is_not_every_node_confirmed() {
+    let mut f = farm(two_nodes());
+    f.empty_after_desired = true;
+    let s = go(&f);
+    assert_eq!((s.exit, s.reason.as_str()), (1, "node_not_confirmed"));
+    assert_eq!(f.requests("POST /v1/update/frontend"), 0);
+}
+
+/// Proves the post check needs at least one node on the commit.
+#[test]
+fn the_post_check_needs_a_node() {
+    let v = json!({"server": {"commit": &TARGET[..12]}, "nodes": []});
+    assert!(!super::post::nodes_on_commit(&v, TARGET));
+    let v = json!({"server": {"commit": &TARGET[..12]}});
+    assert!(!super::post::nodes_on_commit(&v, TARGET));
 }
 
 /// Proves an offline node fails the deploy before anything is set, and that listing it in
@@ -955,7 +1005,7 @@ mod cli_tests {
 
     fn run(list: &[&str]) -> (i32, String, String) {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = cli::main(&args(list), &mut &b""[..], &mut out, &mut err);
+        let code = cli::main_as(&args(list), &mut &b""[..], &mut out, &mut err, false);
         (
             code,
             String::from_utf8(out).unwrap(),
@@ -969,6 +1019,36 @@ mod cli_tests {
         fs::write(&path, body).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
         path
+    }
+
+    /// Proves a caller that came through sudo cannot aim the deploy: each of --api,
+    /// --token-file, --config, --lock and --platform is a usage error (exit 2) before the
+    /// token is read or anything is sent, and the flags the workflow sends are not. Catches
+    /// the deploy account sending a root-readable file as a bearer token to its own listener.
+    #[test]
+    fn through_sudo_the_host_flags_are_refused() {
+        let commit = "a".repeat(40);
+        for (flag, value) in [
+            ("--api", "127.0.0.1:1"),
+            ("--token-file", "/etc/shadow"),
+            ("--config", "/home/x/deploy.json"),
+            ("--lock", "/home/x/lock"),
+            ("--platform", "linux-x86_64"),
+        ] {
+            let list = args(&["--commit", &commit, flag, value]);
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = cli::main_as(&list, &mut &b""[..], &mut out, &mut err, true);
+            let err = String::from_utf8(err).unwrap();
+            assert_eq!(code, 2, "{flag}");
+            assert!(out.is_empty(), "{flag}");
+            assert!(err.contains("not accepted through sudo"), "{flag}: {err}");
+        }
+        // The argv the workflow sends gets past the flag check (it stops later, for want of
+        // a config on this machine, with a different message).
+        let list = args(&["--apply", "--json", "--commit", &commit, "--bundle", "-"]);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        cli::main_as(&list, &mut &b""[..], &mut out, &mut err, true);
+        assert!(!String::from_utf8(err).unwrap().contains("through sudo"));
     }
 
     const GOOD: &str = "0123456789abcdef0123456789abcdef0123456789abcdef\n";
@@ -1064,7 +1144,7 @@ mod cli_tests {
         };
         let go = |a: Vec<String>| {
             let (mut out, mut err) = (Vec::new(), Vec::new());
-            let code = cli::main(&a, &mut &b""[..], &mut out, &mut err);
+            let code = cli::main_as(&a, &mut &b""[..], &mut out, &mut err, false);
             (code, String::from_utf8(err).unwrap())
         };
         write(0o644, &body);
@@ -1138,7 +1218,7 @@ mod cli_tests {
             .map(str::to_owned)
         };
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = cli::main(&common("127.0.0.1:1"), &mut &b""[..], &mut out, &mut err);
+        let code = cli::main_as(&common("127.0.0.1:1"), &mut &b""[..], &mut out, &mut err, false);
         assert_eq!((code, out.len()), (4, 0));
         drop(held);
 
@@ -1155,7 +1235,7 @@ mod cli_tests {
             }
         });
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = cli::main(&common(&addr), &mut &b""[..], &mut out, &mut err);
+        let code = cli::main_as(&common(&addr), &mut &b""[..], &mut out, &mut err, false);
         let out = String::from_utf8(out).unwrap();
         assert_eq!(code, 1);
         assert_eq!(out.lines().count(), 1);

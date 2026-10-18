@@ -30,7 +30,13 @@ struct Args {
     lock: PathBuf,
 }
 
-fn parse(args: &[String]) -> Result<Args, String> {
+/// Flags that point the deploy at a different API, token, config, lock or platform. A caller
+/// that got here through `sudo` (a deploy account that may only run `deploy`) must not set
+/// them: root would read a file of the caller's choosing and send it to an address of the
+/// caller's choosing. Those values come from the root-owned config.
+const HOST_FLAGS: [&str; 5] = ["--api", "--token-file", "--config", "--lock", "--platform"];
+
+fn parse(args: &[String], via_sudo: bool) -> Result<Args, String> {
     let mut commit = None;
     let mut api = None;
     let mut token_file = None;
@@ -44,6 +50,11 @@ fn parse(args: &[String]) -> Result<Args, String> {
     let mut secs = [1800u64, 900, 300];
     let mut it = args.iter();
     while let Some(flag) = it.next() {
+        if via_sudo && HOST_FLAGS.contains(&flag.as_str()) {
+            return Err(format!(
+                "{flag} is not accepted through sudo; the host's config sets it"
+            ));
+        }
         let mut value = |name: &str| it.next().cloned().ok_or(format!("{name} needs a value"));
         match flag.as_str() {
             "--apply" => apply = true,
@@ -192,11 +203,24 @@ pub fn main(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
+    // sudo sets SUDO_UID to the caller's uid and a caller cannot unset it for the command.
+    let via_sudo = std::env::var_os("SUDO_UID").is_some_and(|u| u != "0");
+    main_as(args, stdin, out, err, via_sudo)
+}
+
+/// [`main`], told whether the caller came through `sudo`.
+pub fn main_as(
+    args: &[String],
+    stdin: &mut dyn Read,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    via_sudo: bool,
+) -> i32 {
     let usage = |err: &mut dyn Write, why: &str| {
         let _ = writeln!(err, "kbf-installer deploy: {why}\n{USAGE}");
         Exit::Usage.code()
     };
-    let parsed = match parse(args) {
+    let parsed = match parse(args, via_sudo) {
         Ok(p) => p,
         Err(why) => return usage(err, &why),
     };

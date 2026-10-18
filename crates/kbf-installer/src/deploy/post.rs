@@ -59,7 +59,8 @@ impl Run<'_> {
                         return Err(self.stop(list, done, &node.id, state));
                     }
                 }
-                if list.iter().all(|n| done.contains_key(&n.id)) {
+                // An empty list confirms nothing.
+                if !list.is_empty() && list.iter().all(|n| done.contains_key(&n.id)) {
                     self.sum.nodes = done.into_values().collect();
                     return Ok(());
                 }
@@ -173,14 +174,16 @@ fn all_active(members: &Value) -> bool {
         })
 }
 
-/// Every node connected, serving, up to date and on the commit; the server on it too.
-fn nodes_on_commit(v: &Value, commit: &str) -> bool {
+/// At least one node, and every node connected, serving, up to date and on the commit; the server on it too.
+pub(super) fn nodes_on_commit(v: &Value, commit: &str) -> bool {
     let server = v
         .pointer("/server/commit")
         .and_then(Value::as_str)
         .is_some_and(|c| nodes::same_commit(c, commit));
+    let list = nodes::list(v);
     server
-        && nodes::list(v).iter().all(|n| {
+        && !list.is_empty()
+        && list.iter().all(|n| {
             n.connected
                 && n.serving
                 && n.up_to_date == Some(true)

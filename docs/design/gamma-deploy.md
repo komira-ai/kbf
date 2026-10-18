@@ -12,9 +12,16 @@ drain system rolls the nodes, one storage node at a time.
 `/etc/kbf-installer/deploy.json` (`--config`), so a caller that may only run `deploy` names
 neither. The config must be a regular file nobody else may write (and root-owned); it is not
 read when both flags are given. The token file must be a regular file, mode 0600 or 0400.
-The address must be loopback. A sudoers rule that lets a user run `deploy *` also lets that
-user pass `--api` and `--token-file`, so it can point the token at a listener it controls on
-loopback; scope the rule to a wrapper if that matters.
+The address must be loopback. Run through `sudo` (the environment carries `SUDO_UID`, set to the
+caller's uid), `deploy` refuses `--api`, `--token-file`, `--config`, `--lock` and `--platform`
+with exit 2: the caller would choose where root sends the token and which file it reads. Those
+values then come only from the root-owned config. Scope the sudoers rule to the exact argument
+list too, with no wildcard: `deploy --apply --json --commit` followed by forty `[0-9a-f]`
+classes, then `--bundle -`.
+
+A farm whose `/v1/nodes` lists no node (an empty list, or no `nodes` array) is refused in
+preflight (exit 3, `no_nodes`); the wait for nodes and the post check each need at least one
+node, so an empty list never reads as "every node confirmed".
 
 ## Steps
 
