@@ -101,11 +101,12 @@ fn s(p: &Path) -> &str {
     p.to_str().expect("utf-8 path")
 }
 
-/// An empty directory of its own for one test.
+/// An empty directory of its own for one test. One directory per test directly under
+/// the target's tmp dir, not a shared parent: the `installer` test runs as root first
+/// (`cargo xtask sudo-test`) and a shared parent it created would be root's, so the
+/// `homebrew` test, run as the runner's user after it, could not create its own.
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("xtask-pkg-macos")
-        .join(name);
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("xtask-pkg-macos-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch");
     dir
