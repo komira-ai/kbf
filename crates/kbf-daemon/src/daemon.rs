@@ -601,10 +601,7 @@ impl Daemon {
             if signals.recv().await.is_none() {
                 std::future::pending::<()>().await;
             }
-            tracing::info!(
-                ?deadline,
-                "draining: no new leases; finishing the running ones"
-            );
+            tracing::info!(?deadline, "draining: no new leases; running ones finish");
             begin.send_replace(true);
             tokio::select! {
                 _ = signals.recv() => tracing::warn!("second signal: stopping at once"),
