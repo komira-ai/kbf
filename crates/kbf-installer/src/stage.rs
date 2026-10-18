@@ -533,7 +533,7 @@ impl Pipeline<'_> {
             component: name.to_owned(),
             fault,
         })?;
-        let platform = platform_of(found);
+        let platform = platform_of(self.host.platform(), self.settings.arch);
         self.facts(name, &said, &platform, order)?;
         Ok((said, platform))
     }
@@ -733,16 +733,15 @@ impl Pipeline<'_> {
     }
 }
 
-/// The platform a verified header says a release is for, as an order spells it.
-fn platform_of(kind: BinaryKind) -> String {
-    match kind {
-        BinaryKind::Elf(Arch::X86_64) => "linux-x86_64",
-        BinaryKind::Elf(Arch::Aarch64) => "linux-arm64",
-        BinaryKind::MachO(Arch::Aarch64) => "darwin-arm64",
-        BinaryKind::MachO(Arch::X86_64) => "darwin-x86_64",
-        BinaryKind::Other => "unknown",
-    }
-    .to_owned()
+/// The platform an order spells for a host of `host` on `arch`. The header was already
+/// checked to be the executable this host runs ([`BinaryKind::wanted`]), so the header
+/// and the host agree on it.
+fn platform_of(host: Platform, arch: Arch) -> String {
+    let os = match host {
+        Platform::Linux => "linux",
+        Platform::MacOs => "darwin",
+    };
+    format!("{os}-{arch}")
 }
 
 /// Open `path` without following a link and accept it only as a regular file owned by

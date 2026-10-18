@@ -106,6 +106,10 @@ struct Rig {
 impl Rig {
     fn new(name: &str) -> Rig {
         let (host, dir) = host_root(&format!("stage-{name}"));
+        Rig::on(host, dir)
+    }
+
+    fn on(host: Layout, dir: PathBuf) -> Rig {
         let mut settings = Settings::defaults(&host);
         settings.run_as = me();
         settings.arch = Arch::X86_64;
@@ -188,7 +192,7 @@ impl Rig {
     }
 
     fn work(&self) -> PathBuf {
-        self.dir.join("var/lib/kbf-deploy/work")
+        self.host.join(&self.host.work_dir())
     }
 
     /// Nothing of the stage is left: no release directory, no scratch.
@@ -200,6 +204,17 @@ impl Rig {
         assert!(left.is_empty(), "scratch left behind: {left:?}");
     }
 }
+
+/// The scratch root holds an executable (the installed release), which `cargo llvm-cov`
+/// would scan as an object: it goes with the rig.
+impl Drop for Rig {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[path = "stage_more_tests.rs"]
+mod more;
 
 /// Catches a stage that does not do the whole job, in order: the honest release is checked
 /// by `gh` (with the unprivileged user, a scratch home and the order's commit) and then
