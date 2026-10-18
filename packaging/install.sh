@@ -31,7 +31,7 @@
 # Every refusal is exit 1 with a line starting `install.sh: `, before a file is placed.
 set -eu
 
-release_url=https://github.com/komira-ai/komira-build-farm/releases/latest/download
+release_url=https://github.com/komira-ai/kbf/releases/latest/download
 root=/
 unset platform
 

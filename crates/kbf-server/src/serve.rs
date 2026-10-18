@@ -107,7 +107,7 @@ pub struct Listeners {
 
 /// What keeps a long-lived stream from looking idle to a load balancer, a proxy or the
 /// peer: Buck2 sends one Execute per action and never reconnects a broken one, so an
-/// idle-timeout cut fails the action (komira-build-farm#791). Zero turns each off.
+/// idle-timeout cut fails the action (kbf#791). Zero turns each off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamTiming {
     /// How often every open Execute and WaitExecution stream is sent its operation
@@ -492,7 +492,7 @@ where
 /// are refused UNAVAILABLE, which Buck2 retries when it opens the call; and the REAPI
 /// listener stops accepting and every connection on it is sent GOAWAY. Open Execute and
 /// WaitExecution streams are kept until their action is done: Buck2 does not recover a
-/// stream that breaks (komira-build-farm#791), so ending one fails its action. The
+/// stream that breaks (kbf#791), so ending one fails its action. The
 /// serving future returns once the REAPI connections have closed. Only
 /// `listeners.shutdown_timeout` (when it is not [`Duration::MAX`]) or [`Drain::close`]
 /// (a second stop signal) ends the streams that are not done, UNAVAILABLE, after which
