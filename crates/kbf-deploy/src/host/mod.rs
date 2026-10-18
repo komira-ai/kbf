@@ -54,6 +54,7 @@ use clap::{Args, Subcommand};
 use kbf_host::exec::HostExec;
 use kbf_host::path::Root;
 use kbf_host::plan::Mode;
+use kbf_installer::helper::service;
 use kbf_installer::layout::{Layout, Platform};
 
 use state::{CurrentLink, Status};
@@ -183,13 +184,22 @@ pub fn run(verb: Host, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
         }
         Host::Gc(a) => {
             let host = a.apply.layout();
-            release::gc(
-                &mut HostExec::new(host.root().clone()),
-                &host,
-                a.keep,
-                a.apply.mode(),
-                out,
-            )
+            // A release a process executes from stays (S22); where that cannot be told,
+            // nothing is removed.
+            match service::in_use(&service::HostProcs::new(host.platform()), &host) {
+                Ok(in_use) => release::gc(
+                    &mut HostExec::new(host.root().clone()),
+                    &host,
+                    a.keep,
+                    &in_use,
+                    a.apply.mode(),
+                    out,
+                ),
+                Err(e) => {
+                    let _ = writeln!(err, "kbf-deploy: cannot tell which releases run: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
         }
     };
     match done {

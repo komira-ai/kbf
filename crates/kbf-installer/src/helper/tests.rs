@@ -1172,11 +1172,7 @@ fn a_confirm_collects_old_releases_but_not_one_a_process_runs() {
         .expect("dir")
         .set_modified(epoch)
         .expect("mtime");
-    rig.service
-        .0
-        .borrow_mut()
-        .exes
-        .push((77, old.join("kbf")));
+    rig.service.0.borrow_mut().exes.push((77, old.join("kbf")));
 
     rig.order(5, Verb::Activate, B);
     rig.cycle(T0);
@@ -1185,11 +1181,7 @@ fn a_confirm_collects_old_releases_but_not_one_a_process_runs() {
     assert!(there(others[1]), "nothing is collected before the confirm");
 
     rig.first_start(B, T0 + 1);
-    rig.service
-        .0
-        .borrow_mut()
-        .exes
-        .push((77, old.join("kbf")));
+    rig.service.0.borrow_mut().exes.push((77, old.join("kbf")));
     rig.order(6, Verb::Confirm, B);
     rig.cycle(T0 + 3);
     assert!(there(A) && there(B), "previous and current stay");
@@ -1220,13 +1212,14 @@ fn a_replaced_binary_is_re_executed_before_the_next_order_is_read() {
     let replaced = std::rc::Rc::new(std::cell::Cell::new(false));
     rig.order(5, Verb::Activate, B);
     let orders = rig.orders();
-    let root = rig.root.clone();
     let layout = rig.layout.clone();
     let Rig { helper, .. } = rig;
     let mut serve = Serve::new(helper, Box::new(Flag(replaced.clone())));
     assert_eq!(serve.turn(T0).expect("a pass"), Flow::Continue);
     assert_eq!(fs::read_dir(&orders).expect("dir").count(), 0, "acted on");
-    let first = crate::state::read_unlocked(&layout).expect("reads").expect("there");
+    let first = crate::state::read_unlocked(&layout)
+        .expect("reads")
+        .expect("there");
     assert_eq!(first.current, Some(c(B)));
 
     replaced.set(true);
@@ -1236,8 +1229,12 @@ fn a_replaced_binary_is_re_executed_before_the_next_order_is_read() {
     )
     .expect("record");
     assert_eq!(serve.turn(T0 + 5).expect("no pass"), Flow::Reexec);
-    assert_eq!(fs::read_dir(&orders).expect("dir").count(), 1, "left for the new program");
-    drop(root);
+    assert_eq!(
+        fs::read_dir(&orders).expect("dir").count(),
+        1,
+        "left for the new program"
+    );
+}
 
 /// Catches a frontend update crashing the reader or moving the floor: the record parses (it
 /// carries claims like an activation), is refused in status.json with "not implemented

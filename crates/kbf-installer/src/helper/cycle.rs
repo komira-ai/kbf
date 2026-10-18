@@ -584,7 +584,11 @@ impl<E: Exec> Helper<E> {
             .unwrap_or_default();
         // The new release must be what runs before it is kept: a record saying so is the
         // service user's word, and the service user may be the one that is broken.
-        if let Some(p) = state.pending_confirm.as_ref().filter(|p| p.commit == order.commit) {
+        if let Some(p) = state
+            .pending_confirm
+            .as_ref()
+            .filter(|p| p.commit == order.commit)
+        {
             service::accept_confirm(&self.exec, &*self.procs, &self.host, &self.cfg.restart, p)?;
         }
         match activate::confirm(&self.host, &activation, &order.commit) {

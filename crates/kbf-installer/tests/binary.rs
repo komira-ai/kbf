@@ -58,15 +58,7 @@ fn one_pass_reports_the_host_and_a_refused_order() {
     )
     .expect("binary");
 
-    let run = [
-        "run",
-        "--passes",
-        "1",
-        "--interval-secs",
-        "0",
-        "--unit",
-        "kbf.service",
-    ];
+    let run = ["run", "--passes", "1", "--unit", "kbf.service"];
     let out = helper(&root, &run);
     assert!(
         out.status.success(),
@@ -241,15 +233,7 @@ fn passes_end_the_run_and_an_unreadable_memory_stops_it() {
             ..State::default()
         })
         .expect("state");
-    let two = [
-        "run",
-        "--passes",
-        "2",
-        "--interval-secs",
-        "0",
-        "--launchd-label",
-        "com.example.kbf",
-    ];
+    let two = ["run", "--passes", "2", "--launchd-label", "com.example.kbf"];
     let out = helper(&root, &two);
     assert!(
         out.status.success(),
@@ -267,4 +251,70 @@ fn passes_end_the_run_and_an_unreadable_memory_stops_it() {
     let out = helper(&root, &elsewhere);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("kbf-installer:"));
+}
+
+/// Catches the operator verbs' exit codes (contract section 2) going wrong or a verb run
+/// without `--apply` changing the host: with nothing on trial, `confirm`, `revert` and
+/// `rollback` need the operator (exit 5), `quiesce` is at rest (0); with a swap on trial
+/// `quiesce` is exit 5 and a dry-run `revert` leaves the state alone; `gc` without
+/// `--apply` removes nothing.
+///
+/// Mutants planted: `Failure::exit_code` returning 1 for every case; `quiesce` not reading
+/// the pending swap.
+#[test]
+fn the_operator_verbs_exit_by_the_contract() {
+    let root = root("verbs");
+    let host = layout(&root);
+    let service = ["--unit", "kbf.service"];
+    let state = |pending| State {
+        current: Some(c(B)),
+        previous: Some(c(A)),
+        pending_confirm: pending,
+        ..State::default()
+    };
+    Locked::acquire(&host)
+        .expect("lock")
+        .write(&state(None))
+        .expect("state");
+    for dir in [A, B] {
+        let d = root.join("usr/local/kbf/releases").join(dir);
+        fs::create_dir_all(&d).expect("release");
+        fs::write(d.join("kbf"), b"x").expect("binary");
+    }
+    let code = |verb: &[&str]| helper(&root, verb).status.code();
+    let with = |verb: &str, extra: &[&str]| {
+        let mut v = vec![verb];
+        v.extend(extra);
+        v.extend(service);
+        v.iter().map(ToString::to_string).collect::<Vec<_>>()
+    };
+    let run = |args: Vec<String>| {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        code(&refs)
+    };
+    assert_eq!(run(with("confirm", &["--activation", "1-5"])), Some(5));
+    assert_eq!(run(with("revert", &["--activation", "1-5"])), Some(5));
+    assert_eq!(code(&["quiesce"]), Some(0));
+
+    let pending = PendingConfirm {
+        commit: c(B),
+        previous: Some(c(A)),
+        deadline: Some(2_000_000_000),
+        order_id: Some("1-5".to_owned()),
+        starts_left: Some(3),
+    };
+    Locked::acquire(&host)
+        .expect("lock")
+        .write(&state(Some(pending)))
+        .expect("state");
+    assert_eq!(code(&["quiesce"]), Some(5));
+    assert_eq!(run(with("rollback", &[])), Some(5), "a swap is on trial");
+    assert_eq!(run(with("revert", &["--activation", "1-9"])), Some(3));
+    assert_eq!(run(with("revert", &["--activation", "1-5"])), Some(0));
+    let kept = kbf_installer::state::read_unlocked(&host)
+        .expect("reads")
+        .expect("there");
+    assert_eq!(kept.current, Some(c(B)), "a dry run moves nothing");
+    assert_eq!(code(&["gc"]), Some(0));
+    assert!(root.join("usr/local/kbf/releases").join(A).exists());
 }

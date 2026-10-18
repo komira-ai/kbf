@@ -10,6 +10,7 @@ use kbf_host::Root;
 use kbf_host::testkit::{ScratchHost, reply};
 
 use super::*;
+use crate::helper::operator;
 use crate::helper::service::fake::ServiceRecorder;
 use crate::layout::Layout;
 use crate::state::PendingConfirm;
@@ -38,7 +39,7 @@ impl Rig {
     /// service is running B's file as process 4242.
     fn new(name: &str, pending: bool) -> Rig {
         let mut exec = ScratchHost::new(&format!("operator-{name}"));
-        for sub in ["run", "var/lib/kbf-installer"] {
+        for sub in ["run", "var/lib/kbf-deploy"] {
             fs::create_dir_all(exec.root.join(sub)).expect("seed");
         }
         release(&exec.root, A);
@@ -132,25 +133,42 @@ fn confirm_names_the_pending_activation_and_needs_the_new_release_running() {
 
     rig.service.0.borrow_mut().exes = vec![(
         4242,
-        rig.exec.root.join("usr/local/kbf/releases").join(A).join("kbf"),
+        rig.exec
+            .root
+            .join("usr/local/kbf/releases")
+            .join(A)
+            .join("kbf"),
     )];
-    let err = rig.op(true).confirm(ACTIVATION).expect_err("old release runs");
+    let err = rig
+        .op(true)
+        .confirm(ACTIVATION)
+        .expect_err("old release runs");
     assert_eq!(err.exit_code(), 3, "{err}");
     assert!(rig.state().pending_confirm.is_some());
 
     rig.service.0.borrow_mut().exes = vec![(
         4242,
-        rig.exec.root.join("usr/local/kbf/releases").join(B).join("kbf"),
+        rig.exec
+            .root
+            .join("usr/local/kbf/releases")
+            .join(B)
+            .join("kbf"),
     )];
     rig.op(false).confirm(ACTIVATION).expect("dry run");
-    assert!(rig.state().pending_confirm.is_some(), "a dry run keeps nothing");
+    assert!(
+        rig.state().pending_confirm.is_some(),
+        "a dry run keeps nothing"
+    );
     assert!(rig.said().contains("would confirm"), "{}", rig.said());
 
     rig.op(true).confirm(ACTIVATION).expect("confirmed");
     assert_eq!(rig.state().pending_confirm, None);
     assert_eq!(rig.state().current, Some(c(B)));
 
-    let err = rig.op(true).confirm(ACTIVATION).expect_err("nothing pending");
+    let err = rig
+        .op(true)
+        .confirm(ACTIVATION)
+        .expect_err("nothing pending");
     assert_eq!(err.exit_code(), 5, "{err}");
 }
 
@@ -236,9 +254,16 @@ fn gc_keeps_what_runs_and_removes_nothing_when_it_cannot_tell() {
     let stray = release(&rig.exec.root, "dddddddddddddddddddddddddddddddddddddddd");
     let epoch = std::time::UNIX_EPOCH + Duration::from_secs(1000);
     for d in [&running, &stray] {
-        fs::File::open(d).expect("dir").set_modified(epoch).expect("mtime");
+        fs::File::open(d)
+            .expect("dir")
+            .set_modified(epoch)
+            .expect("mtime");
     }
-    rig.service.0.borrow_mut().exes.push((9, running.join("kbf")));
+    rig.service
+        .0
+        .borrow_mut()
+        .exes
+        .push((9, running.join("kbf")));
 
     let mut out = Vec::new();
     operator::gc(&mut rig.exec, &rig.layout, &rig.service, 0, false, &mut out).expect("dry run");

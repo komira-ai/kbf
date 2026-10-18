@@ -292,12 +292,14 @@ pub(crate) mod fake {
                 let line = format!("{} {}", cmd.program.as_str(), cmd.args.join(" "));
                 let mut w = world.borrow_mut();
                 w.asked.push(line);
-                if cmd.program.as_str().ends_with("systemctl") && cmd.args.first().map(String::as_str) == Some("show")
+                if cmd.program.as_str().ends_with("systemctl")
+                    && cmd.args.first().map(String::as_str) == Some("show")
                 {
                     let text = format!("ActiveState={}\nMainPID={}\n", w.active, w.main_pid);
                     return Ok(reply(0, &text, ""));
                 }
-                if cmd.program.as_str().ends_with("launchctl") && cmd.args.first().map(String::as_str) == Some("print")
+                if cmd.program.as_str().ends_with("launchctl")
+                    && cmd.args.first().map(String::as_str) == Some("print")
                 {
                     if !w.loaded {
                         return Ok(reply(113, "", "not found"));
@@ -307,7 +309,11 @@ pub(crate) mod fake {
                     } else {
                         format!("\tpid = {}\n", w.main_pid)
                     };
-                    return Ok(reply(0, &format!("system/x = {{\n\tstate = running\n{pid}}}\n"), ""));
+                    return Ok(reply(
+                        0,
+                        &format!("system/x = {{\n\tstate = running\n{pid}}}\n"),
+                        "",
+                    ));
                 }
                 Ok(reply(0, "", ""))
             })

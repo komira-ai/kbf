@@ -99,10 +99,7 @@ impl<E: Exec> Operator<'_, E> {
     }
 
     /// The swap on trial, if it is the one `activation` names.
-    fn pending(
-        state: &State,
-        activation: &str,
-    ) -> Result<crate::state::PendingConfirm, Failure> {
+    fn pending(state: &State, activation: &str) -> Result<crate::state::PendingConfirm, Failure> {
         let Some(p) = &state.pending_confirm else {
             return Err(Failure::NeedsOperator("no swap is pending".to_owned()));
         };
@@ -193,9 +190,11 @@ impl<E: Exec> Operator<'_, E> {
                 return Err(e.into());
             }
         };
-        self.exec
-            .apply(&self.restart.step())
-            .map_err(|e| Failure::Failed(format!("the restart failed; the service's next pass retries it: {e}")))?;
+        self.exec.apply(&self.restart.step()).map_err(|e| {
+            Failure::Failed(format!(
+                "the restart failed; the service's next pass retries it: {e}"
+            ))
+        })?;
         self.exec
             .apply(&Step::Remove { path: marker })
             .map_err(|e| Failure::Failed(format!("cannot remove the restart marker: {e}")))?;

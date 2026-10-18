@@ -11,7 +11,17 @@
 //!    checks the order, has the [`fetcher::Fetcher`] pull and verify the release if its
 //!    directory is not there, swaps it in on trial and restarts the one configured
 //!    service; `confirm` keeps it; `revert` goes back;
-//! 3. writes `status.json` (root's, world-readable) for the node to report.
+//! 3. collects the releases nothing needs once a swap was confirmed (`gc` keeps current,
+//!    previous, staged, the swap on trial and any release a process executes from, and
+//!    takes the lock);
+//! 4. writes `status.json` (root's, world-readable) for the node to report.
+//!
+//! The loop ([`serve`]) makes a pass every five seconds (fixed) and, between passes,
+//! starts the new program in place of itself if its own file was replaced. A confirm is
+//! kept only if the new release is what runs ([`service::accept_confirm`]); one activation
+//! is on trial at a time and activations are `min_activation_interval_s` apart. The
+//! operator's `confirm`, `revert`, `rollback`, `gc` and `quiesce` ([`operator`]) run inline
+//! as root under the same lock.
 //!
 //! `kbf-installer boot-check` runs as the service's `ExecStartPre` on Linux: it counts the
 //! starts of a release on trial and reverts one that keeps failing before it starts again,

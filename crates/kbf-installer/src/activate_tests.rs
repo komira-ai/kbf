@@ -761,7 +761,15 @@ fn retention_keeps_the_running_the_previous_and_one_more() {
         (at(C), at(B))
     );
 
-    release::gc(&mut exec, &layout, 1, &Default::default(), Mode::Apply, &mut Vec::new()).expect("gc");
+    release::gc(
+        &mut exec,
+        &layout,
+        1,
+        &Default::default(),
+        Mode::Apply,
+        &mut Vec::new(),
+    )
+    .expect("gc");
     let mut left: Vec<String> = fs::read_dir(exec.at("/usr/local/kbf/releases"))
         .expect("list")
         .map(|i| i.expect("entry").file_name().to_string_lossy().into_owned())

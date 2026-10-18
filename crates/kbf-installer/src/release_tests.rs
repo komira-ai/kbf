@@ -402,7 +402,15 @@ fn a_dry_run_writes_nothing() {
     );
     assert!(!out.contains("next, by hand"), "{out}");
     let mut out = Vec::new();
-    gc(&mut exec, &root, 0, &BTreeSet::new(), Mode::DryRun, &mut out).expect("dry gc");
+    gc(
+        &mut exec,
+        &root,
+        0,
+        &BTreeSet::new(),
+        Mode::DryRun,
+        &mut out,
+    )
+    .expect("dry gc");
     assert_eq!(
         String::from_utf8(out).expect("utf-8"),
         "keeping: none; removing: none\nnothing to do\n"
@@ -445,7 +453,15 @@ fn a_dry_run_writes_nothing() {
         "{out}"
     );
     let mut out = Vec::new();
-    gc(&mut exec, &root, 0, &BTreeSet::new(), Mode::DryRun, &mut out).expect("dry gc");
+    gc(
+        &mut exec,
+        &root,
+        0,
+        &BTreeSet::new(),
+        Mode::DryRun,
+        &mut out,
+    )
+    .expect("dry gc");
     let out = String::from_utf8(out).expect("utf-8");
     assert!(
         out.contains(&format!("DRY-RUN: remove /usr/local/kbf/releases/{C}\n")),
@@ -602,7 +618,10 @@ fn gc_keeps_the_swap_on_trial_and_what_runs() {
         ..State::default()
     };
     fs::create_dir(exec.at("/var/lib/kbf-deploy")).expect("state dir");
-    Locked::acquire(&root).expect("lock").write(&state).expect("write");
+    Locked::acquire(&root)
+        .expect("lock")
+        .write(&state)
+        .expect("write");
     let running: BTreeSet<_> = [c(&q)].into();
     let mut out = Vec::new();
     gc(&mut exec, &root, 0, &running, Mode::Apply, &mut out).expect("gc");

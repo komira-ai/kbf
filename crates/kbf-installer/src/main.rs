@@ -226,7 +226,14 @@ fn operate(
 fn gc(root: PathBuf, apply: bool, keep: usize) -> Result<(), Failure> {
     let (layout, mut exec) = host(root).map_err(Failure::Failed)?;
     let procs = HostProcs::new(layout.platform());
-    operator::gc(&mut exec, &layout, &procs, keep, apply, &mut std::io::stderr())
+    operator::gc(
+        &mut exec,
+        &layout,
+        &procs,
+        keep,
+        apply,
+        &mut std::io::stderr(),
+    )
 }
 
 fn main() -> ExitCode {
@@ -238,7 +245,9 @@ fn main() -> ExitCode {
         Verb::Confirm(n) => operate(root, apply, n.service.restart(), |o| {
             o.confirm(&n.activation)
         }),
-        Verb::Revert(n) => operate(root, apply, n.service.restart(), |o| o.revert(&n.activation)),
+        Verb::Revert(n) => operate(root, apply, n.service.restart(), |o| {
+            o.revert(&n.activation)
+        }),
         Verb::Rollback(w) => operate(root, apply, w.restart(), |o| o.rollback()),
         Verb::Gc(g) => gc(root, apply, g.keep),
         Verb::Quiesce => host(root)

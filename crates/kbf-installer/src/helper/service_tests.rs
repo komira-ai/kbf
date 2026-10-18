@@ -27,7 +27,15 @@ fn pending(commit: &str, deadline: Option<u64>) -> PendingConfirm {
 }
 
 /// A scratch host whose service runs `exe` (relative to the root), and its executor.
-fn world(name: &str, exe: &str) -> (Layout, PathBuf, ServiceRecorder, kbf_host::testkit::ScratchHost) {
+fn world(
+    name: &str,
+    exe: &str,
+) -> (
+    Layout,
+    PathBuf,
+    ServiceRecorder,
+    kbf_host::testkit::ScratchHost,
+) {
     let (layout, dir) = host_root(name);
     let svc = ServiceRecorder::running(77, dir.join(exe));
     let mut host = kbf_host::testkit::ScratchHost::new(&format!("{name}-exec"));
@@ -111,9 +119,17 @@ fn an_answer_that_does_not_say_active_is_no() {
     );
 
     let launchd = Restart::Launchd("com.example.kbf".to_owned());
-    answer(&mut host, "system/com.example.kbf = {\n\tstate = running\n\tpid = 812\n}\n", 0);
+    answer(
+        &mut host,
+        "system/com.example.kbf = {\n\tstate = running\n\tpid = 812\n}\n",
+        0,
+    );
     assert_eq!(main_pid(&host, &launchd), Ok(812));
-    answer(&mut host, "system/com.example.kbf = {\n\tstate = waiting\n}\n", 0);
+    answer(
+        &mut host,
+        "system/com.example.kbf = {\n\tstate = waiting\n}\n",
+        0,
+    );
     assert_eq!(
         main_pid(&host, &launchd),
         Err("com.example.kbf is loaded and not running".to_owned())
@@ -158,7 +174,10 @@ fn a_confirm_needs_the_new_release_running_and_started_once() {
 
     for (exe, why) in [
         (format!("usr/local/kbf/releases/{A}/kbf"), "another release"),
-        (format!("usr/local/kbf/releases/{B}0/kbf"), "a sibling directory"),
+        (
+            format!("usr/local/kbf/releases/{B}0/kbf"),
+            "a sibling directory",
+        ),
         (
             format!("usr/local/kbf/releases/{B}/kbf (deleted)"),
             "a deleted file",
@@ -194,10 +213,7 @@ fn paths_are_compared_resolved() {
     let release = dir.join(format!("usr/local/kbf/releases/{B}"));
     fs::create_dir_all(&release).unwrap();
     fs::write(release.join("kbf"), b"x").unwrap();
-    let svc = ServiceRecorder::running(
-        77,
-        via.join(format!("usr/local/kbf/releases/{B}/kbf")),
-    );
+    let svc = ServiceRecorder::running(77, via.join(format!("usr/local/kbf/releases/{B}/kbf")));
     let mut host = kbf_host::testkit::ScratchHost::new("svc-resolved-exec");
     host.answer = svc.answer();
     assert_eq!(
@@ -242,7 +258,11 @@ fn releases_in_use_are_the_ones_processes_execute_from() {
 fn the_macos_table_comes_from_ps() {
     let runner = FakeRunner::new(|spawn| {
         Ok(match spawn.args[0].to_str().unwrap() {
-            "-ax" => ran(0, "/sbin/launchd\nkernel_task\n/usr/local/kbf/releases/x/kbf-daemon\n", ""),
+            "-ax" => ran(
+                0,
+                "/sbin/launchd\nkernel_task\n/usr/local/kbf/releases/x/kbf-daemon\n",
+                "",
+            ),
             "-p" => ran(0, "/usr/local/kbf/releases/x/kbf-daemon\n", ""),
             other => panic!("unexpected ps {other}"),
         })
@@ -276,10 +296,7 @@ fn a_failed_or_hung_ps_is_an_error() {
     // A process that is gone has no executable.
     let runner = FakeRunner::new(|_| Ok(ran(0, "", "")));
     let procs = HostProcs::with_runner(Platform::MacOs, Box::new(runner));
-    assert_eq!(
-        procs.exe_of(1).unwrap_err().kind(),
-        io::ErrorKind::NotFound
-    );
+    assert_eq!(procs.exe_of(1).unwrap_err().kind(), io::ErrorKind::NotFound);
 }
 
 /// Catches the Linux process table being read from the wrong place: this test process's own
