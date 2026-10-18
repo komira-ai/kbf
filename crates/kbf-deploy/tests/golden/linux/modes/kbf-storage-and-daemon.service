@@ -7,6 +7,11 @@ Description=kbf build farm storage node and node daemon
 Wants=network-online.target
 After=network-online.target minio.service
 
+# A failure that repeats quickly (the cold store or a disk not ready) must not use up
+# systemd's start limit of 5 starts in 10 s and leave the unit down (check-units rule
+# `restart`).
+StartLimitIntervalSec=0
+
 [Service]
 User=kbf
 Slice=kbf.slice
@@ -17,6 +22,8 @@ Delegate=yes
 # kbf-server's and the daemon's reservations today.
 MemoryMin=16G
 OOMScoreAdjust=-925
+# systemd starts a unit at a soft open-file limit of 1024; a build burst passes that (EMFILE).
+LimitNOFILE=1048576
 CPUWeight=300
 # No MemorySwapMax=: leases may swap, and they live in this unit's cgroup.
 Environment=XDG_RUNTIME_DIR=/run/user/1500
@@ -62,6 +69,7 @@ ExecStart=/usr/local/bin/kbf storage-and-daemon \
 KillSignal=SIGTERM
 TimeoutStopSec=infinity
 Restart=on-failure
+RestartSec=5
 # Exit 2 is a command line kbf refused: a restart cannot fix it.
 RestartPreventExitStatus=2
 

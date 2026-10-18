@@ -27,7 +27,7 @@ fn record_of(record: Option<&Record>) -> Result<ActionRecord, Status> {
 #[tonic::async_trait]
 impl ActionStore for StorageService {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
-        self.admission.check(&request, Endpoint::ActionGet)?;
+        self.guard(&request, Endpoint::ActionGet)?;
         let request = request.into_inner();
         self.check_map(request.map_generation).await?;
         let action = wire::digest(request.action.as_ref())?;
@@ -48,7 +48,7 @@ impl ActionStore for StorageService {
         &self,
         request: Request<PrepareRequest>,
     ) -> Result<Response<PrepareResponse>, Status> {
-        self.admission.check(&request, Endpoint::ActionPrepare)?;
+        self.guard(&request, Endpoint::ActionPrepare)?;
         let request = request.into_inner();
         self.check_map(request.map_generation).await?;
         let result = request
@@ -77,7 +77,7 @@ impl ActionStore for StorageService {
         &self,
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
-        self.admission.check(&request, Endpoint::ActionCommit)?;
+        self.guard(&request, Endpoint::ActionCommit)?;
         let request = request.into_inner();
         self.check_map(request.map_generation).await?;
         let role = match Writer::try_from(request.writer) {

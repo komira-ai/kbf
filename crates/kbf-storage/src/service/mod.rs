@@ -38,8 +38,8 @@
 //! NOT_FOUND or FAILED_PRECONDITION. Hits and writes are served.
 //!
 //! **Who may call** is [`Admission`]: the role in the caller's certificate against the
-//! endpoint's table, the role read by `kbf-peer`; the module docs of [`admission`] say
-//! what is checked and what is planned.
+//! endpoint's table, the role read by `kbf-peer`, and then the map's deny list against the
+//! certificate; the module docs of [`admission`] say what is checked and what is planned.
 //!
 //! **How `Write` takes a blob in.** Where the store offers a [`crate::PutStream`]
 //! ([`Storage::stream`]), each message is appended to it as it arrives and the blob is
@@ -75,7 +75,7 @@ use tonic::service::Routes;
 use crate::replicate::{self, Chain, MapSource};
 use crate::{Storage, StorageError};
 
-pub use admission::{Admission, Endpoint, PeerRole, ROLE_URI_PREFIX, role_of};
+pub use admission::{Admission, Endpoint, PeerNames, PeerRole, ROLE_URI_PREFIX, host_of, role_of};
 pub use catch_up::CatchUp;
 pub use client::RemoteStorage;
 pub(crate) use client::lift;
@@ -193,6 +193,20 @@ impl StorageService {
     pub const fn with_refetch_wait(mut self, wait: Duration) -> Self {
         self.refetch_wait = wait;
         self
+    }
+
+    /// Admits the call `request` is to `endpoint`, or says why not: the one check every
+    /// handler makes first ([`Admission::guard`]). The caller's role is judged, then its
+    /// certificate against the `denied` list of the map the node holds now (read at each
+    /// call; a node with no map source, or none yet, has no list and enforces nothing).
+    fn guard<T>(
+        &self,
+        request: &tonic::Request<T>,
+        endpoint: Endpoint,
+    ) -> Result<(), tonic::Status> {
+        let map = self.map.as_ref().and_then(|source| source.current());
+        let denied = map.as_deref().map_or(&[][..], kbf_map::Map::denied);
+        self.admission.guard(request, endpoint, denied)
     }
 
     /// Whether a call routed by map generation `requested` may be served now: always, for
