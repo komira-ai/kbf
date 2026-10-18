@@ -55,8 +55,8 @@ pub use listing::{
 pub use pending::PendingLimits;
 pub use queue::{Event, EventQueue, InvRef, QueueLimits};
 pub use reader::{
-    ChunkCursor, CursorTextError, InvocationView, MAX_PAGE_CHUNKS, ReadError, Reader, RecordsPage,
-    RunView,
+    Allow, ChunkCursor, CursorTextError, InvocationView, MAX_PAGE_CHUNKS, ReadError, Reader,
+    RecordsPage, RunView,
 };
 pub use rows::{Mark, RingRun, ShapeKind, ShapeRow, StatusKind, StatusRow, Verdict};
 pub use run_id::{Minted, Minter, RunId, StreamId};
