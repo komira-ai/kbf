@@ -17,6 +17,37 @@ fn refused(output: &str) -> String {
     check_output(output).expect_err("refused").to_string()
 }
 
+/// Catches a parser that wants the first word to be `envoy`: Envoy prints the path it was
+/// run by (CI's run printed `<runner temp>/tools/envoy  version: ...`).
+#[test]
+fn the_program_name_in_front_may_be_a_path() {
+    let sha = "6eb0d2d97489ec1b4e1584a004f5de443d97a41b";
+    for name in ["envoy", "/home/runner/_temp/tools/envoy", "./envoy-static"] {
+        let text = format!("{name}  version: {sha}/1.39.3/Clean/RELEASE/BoringSSL\n");
+        assert_eq!(
+            check_output(&text).expect("supported").to_string(),
+            "1.39.3"
+        );
+    }
+}
+
+/// Catches a parser that takes any `version:` line with a slash in it: another program's
+/// (`nginx version: nginx/1.39.3`) or a revision that is not hexadecimal names no Envoy.
+#[test]
+fn a_revision_that_is_not_hex_names_no_envoy() {
+    for text in [
+        "nginx version: nginx/1.39.3\n",
+        "envoy  version: nginx/1.39.3/Clean\n",
+        "envoy  version: abc/1.39.3/Clean\n",
+        "envoy  version: 6eb0d2d97489ec1b4e1584a004f5de443d97a41g/1.39.3/Clean\n",
+    ] {
+        assert!(
+            matches!(check_output(text), Err(VersionError::Unparsable { .. })),
+            "{text:?}"
+        );
+    }
+}
+
 /// Catches a range with an edge moved: the first and last supported releases are taken,
 /// the one before and the one after are not. Mutants: a minimum of 1.39.0 or 1.37.0, a
 /// bound of 1.39.0 or 1.41.0.
@@ -58,7 +89,7 @@ fn the_refusal_names_the_version_the_range_and_the_remedy() {
 fn text_without_a_version_is_refused() {
     // Joined at run time: four dotted numbers in a source file read as an IPv4 address to the hygiene lint.
     let four = format!(
-        "envoy  version: abc/{}/Clean",
+        "envoy  version: 5d3b7a1e0f9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c/{}/Clean",
         ["1", "39", "3", "1"].join(".")
     );
     let four_parts = four.as_str();
@@ -68,18 +99,17 @@ fn text_without_a_version_is_refused() {
         "envoy",
         "envoy  version: ",
         "envoy  version: abc",
-        "envoy  version: abc/Clean/RELEASE",
-        "envoy  version: abc/1.39/Clean",
+        "envoy  version: 5d3b7a1e0f9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c/Clean/RELEASE",
+        "envoy  version: 5d3b7a1e0f9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c/1.39/Clean",
         four_parts,
-        "envoy  version: abc/1.39.x/Clean",
-        "envoy  version: abc/1..3/Clean",
-        "envoy  version: abc/1.39./Clean",
-        "envoy  version: abc/99999999999.1.1/Clean",
-        "envoy  version: abc/1.39.3-dev/Clean",
-        "envoy  version: abc/+1.39.3/Clean",
-        "envoy  version: abc/ 1.39.3/Clean",
-        "version: abc/1.39.3/Clean",
-        "nginx version: nginx/1.39.3",
+        "envoy  version: 5d3b7a1e0f9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c/1.39.x/Clean",
+        "envoy  version: 5d3b7a1e0f9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c/1..3/Clean",
+        "envoy  version: 5d3b7a1e0f9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c/1.39./Clean",
+        "envoy  version: 5d3b7a1e0f9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c/99999999999.1.1/Clean",
+        "envoy  version: 5d3b7a1e0f9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c/1.39.3-dev/Clean",
+        "envoy  version: 5d3b7a1e0f9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c/+1.39.3/Clean",
+        "envoy  version: 5d3b7a1e0f9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c/ 1.39.3/Clean",
+        "version: 5d3b7a1e0f9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c/1.39.3/Clean",
         "1.39.3",
     ] {
         assert!(

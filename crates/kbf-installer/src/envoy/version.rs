@@ -70,15 +70,20 @@ pub enum VersionError {
     },
 }
 
-/// The version `envoy --version` printed: the second `/`-separated field of its
-/// `version:` line, three plain numbers (a `-dev` or any other suffix is refused).
+/// The version `envoy --version` printed: a line `<argv0>  version: <sha>/<version>/...`
+/// (Envoy prints the path it was run by, so the first word is not always `envoy`); the
+/// version is the second `/`-separated field after `version:`, three plain numbers (a
+/// `-dev` or any other suffix is refused), and the first field a hexadecimal revision.
 fn parse(output: &str) -> Option<EnvoyVersion> {
-    let line = output
+    let rest = output
         .lines()
-        .find_map(|l| l.trim_start().strip_prefix("envoy"))?;
-    let rest = line.trim_start().strip_prefix("version:")?;
-    let field = rest.trim().split('/').nth(1)?;
-    let mut parts = field.split('.');
+        .find_map(|l| l.split_once("  version:").map(|(_, rest)| rest))?;
+    let mut fields = rest.trim().split('/');
+    let sha = fields.next()?;
+    if sha.len() < 7 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut parts = fields.next()?.split('.');
     let mut number = || {
         let p = parts.next()?;
         (!p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
