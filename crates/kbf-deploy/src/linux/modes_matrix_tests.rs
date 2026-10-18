@@ -87,6 +87,23 @@ fn rows() -> Vec<Row> {
             plant: |_, t| t.replace("Slice=kbf.slice", "Slice=system.slice"),
             fails: ALL,
         },
+        // A runtime flag the daemon no longer has, and the runtime program left out:
+        // each turns the rule red for the modes that run builds only.
+        Row {
+            rule: "runtime",
+            plant: |_, t| {
+                t.replace(
+                    "    --driver=container \\\n",
+                    "    --driver=container \\\n    --container-runtime=oci \\\n",
+                )
+            },
+            fails: BUILDS,
+        },
+        Row {
+            rule: "runtime",
+            plant: |_, t| t.replace("    --oci-runtime=/usr/bin/crun \\\n", ""),
+            fails: BUILDS,
+        },
         Row {
             rule: "delegate",
             plant: |_, t| first_in_service(t, "DisableControllers=cpuset"),

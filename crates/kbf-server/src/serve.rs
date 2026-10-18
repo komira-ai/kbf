@@ -12,7 +12,7 @@ use futures::StreamExt as _;
 use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
-    ByteStreamService, Cache, CasService, Connections, MAX_MESSAGE_BYTES, MetaLog,
+    Backend, ByteStreamService, Cache, CasService, Connections, MAX_MESSAGE_BYTES, MetaLog,
     RECORDER_CHANNEL, Recorder, RequestMetadataLayer, SegmentsConfig, SegmentsService,
 };
 use kbf_objstore::ObjectStore;
@@ -34,7 +34,7 @@ use crate::drain::Drain;
 use crate::farm::{Farm, StateError};
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::Readiness;
-use crate::http_blobs::BlobReaders;
+use crate::http_blobs::{BlobReaders, ReadBudget};
 use crate::http_invocations::InvocationReaders;
 use crate::identity::{DenyList, Peers};
 use crate::listen::Binder;
@@ -157,6 +157,9 @@ pub struct Api {
     /// daemon whose input cache shares the disk with this server's store
     /// (`kbf-all-in-one`).
     pub local_cache: Option<Arc<kbf_storage::local_cache::LocalCache>>,
+    /// The release store (`--releases-dir`), whose upload route is mounted here and whose
+    /// `ReleaseService` the worker listener serves. `None`: the update endpoints answer 503.
+    pub releases: Option<Arc<crate::release::ReleaseStore>>,
 }
 
 /// Why the server could not start or stopped.
@@ -631,6 +634,13 @@ where
 {
     let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
     let (state, history) = crate::history::take(state);
+    // One read budget for every reader of blobs and logs in this process: the blob route,
+    // the failure-log route and the history writer's tail reads.
+    let budget = ReadBudget::default();
+    let history = history.map(|history| {
+        let blobs = Arc::new(Backend::from(Arc::clone(&cache)));
+        history.with_blobs(blobs, budget.clone())
+    });
     let recording = crate::history::install(recording, history.as_ref());
     let default_memory = listeners.memory_ladder.first();
     let farm = Farm::new(
@@ -665,8 +675,8 @@ where
     let reapi_incoming = Incoming::new(reapi_incoming, listeners.reapi_tls);
     let worker_incoming = Incoming::new(worker_incoming, worker_tls);
     let probe_timeout = listeners.store_probe_timeout;
-    let (api_listen, token, local) = api.map_or((None, None, None), |api| {
-        (Some(api.listen), api.token, api.local_cache)
+    let (api_listen, token, local, releases) = api.map_or((None, None, None, None), |api| {
+        (Some(api.listen), api.token, api.local_cache, api.releases)
     });
     // One line: a `?` alone on its own line is a never-taken error region, a missed
     // line in the coverage ratchet (it counts lines per generic copy, best copy wins).
@@ -678,20 +688,27 @@ where
     let drain = Arc::new(drain);
     let health_routes =
         crate::health::router(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
-    let blob_routes =
-        crate::http_blobs::router(Arc::clone(&cache), BlobReaders::from_policy(&policy));
+    let blob_routes = crate::http_blobs::router(
+        Arc::clone(&cache),
+        BlobReaders::from_policy(&policy),
+        budget.clone(),
+    );
     let page_routes = crate::http_invocations::router(
         recorder.clone(),
         Arc::clone(&cache),
         InvocationReaders::from_policy(&policy),
         history.as_ref().map(crate::history::History::reads),
+        budget,
     );
     let api_routes = crate::api::router(
         Arc::clone(&farm),
-        token,
+        token.clone(),
         Arc::clone(&drain),
         members.clone(),
+        // A server with no frontend role has no enrollment.
+        None,
     )
+    .merge(crate::release::router(releases.clone(), token))
     .merge(health_routes)
     .merge(crate::metrics::router(
         Arc::clone(&cache),
@@ -806,6 +823,7 @@ where
             });
         let worker_serve = worker_server
             .add_service(worker_service)
+            .add_service(crate::release::service(releases))
             .add_service(worker_blobs)
             .add_service(worker_cas)
             .add_service(worker_segments)

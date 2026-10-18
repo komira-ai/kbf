@@ -522,6 +522,7 @@ pub fn failed_section(instance: &str) -> FailedRun {
             env_names: vec!["PATH".into()],
             ..CommandRendering::default()
         }),
+        flog_omitted: 0,
     }
 }
 

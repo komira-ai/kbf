@@ -10,7 +10,8 @@ line then ends with ` api=<addr>`. The listener speaks HTTP/1.1, and HTTP/2 in c
 text (h2c, with prior knowledge); every rule below holds for both.
 
 Reads answer anyone who reaches the address: bind it where only operators do. The
-exceptions are the build pages, [`GET /v1/invocations/{id}`](#get-v1invocationsid-and-below)
+exceptions are the [enrollment routes](#v1enrolltokens-and-v1enrollnodes), which pass every
+gate of a write even to be read, and the build pages, [`GET /v1/invocations/{id}`](#get-v1invocationsid-and-below)
 and below, and [`GET /v1/blobs`](#get-v1blobsdigest), which run the REAPI policy and are
 off without it. Writes need a token (see [Who may write](#who-may-write)). The roles of
 [fleet-updates-security.md](design/fleet-updates-security.md) section S9 (`admin` for
@@ -345,6 +346,82 @@ the drain, and the unit templates in `kbf-deploy` set it.
 `--api` for the listener (default `127.0.0.1:8982`). A frontend drain has no undrain:
 restart it.
 
+## `/v1/enroll/tokens` and `/v1/enroll/nodes`
+
+The operator's side of enrollment (`design/install-and-enrollment.md`):
+the tokens a node enrolls with, and the registry of nodes that did. They live in the state
+store, so a frontend that has no enrollment (until the enroll service lands, every
+frontend) answers every one of these routes with `404` once the call passes the gates.
+
+**Every route here, a GET included, passes every gate of [Who may write](#who-may-write):**
+a loopback peer, no `Origin` header, the bearer token, and `Content-Type: application/json`
+(send it on a GET and a DELETE too, with no body). The list of tokens and nodes is the farm's
+door, so unlike `GET /v1/nodes` it is not open to whoever reaches the address. A refused
+call changes nothing. Every answer carries `Cache-Control: no-store`.
+
+| Route | Does | Answer |
+|---|---|---|
+| `POST /v1/enroll/tokens` | makes a token | the token, **with its secret and string, once** |
+| `GET /v1/enroll/tokens` | lists the tokens | `{"tokens": [...]}`, never a secret, hash or string |
+| `DELETE /v1/enroll/tokens/{id}` | revokes a token | `{"id": "..."}` |
+| `GET /v1/enroll/nodes` | lists the nodes | `{"nodes": [...]}` |
+| `POST /v1/enroll/nodes/{id}/revoke` | revokes a node | `{"id": "...", "denied": [...]}` |
+
+**Create.** The body is `{"roles": ["daemon"], "max_uses": 1, "expires_in": 86400,
+"node_id": "n1", "node_prefix": "rack-", "names": [".example"], "replace": false,
+"label": "rack 4"}`; only `roles` is required (`storage` and `daemon`, one to two, no
+repeat). `max_uses` is 1 to 1000 (default 1); `expires_in` is seconds, at least 1 and at
+most 30 days (default a day); `node_id` and `node_prefix` restrict the node ids the token
+enrolls; `names` restricts the hosts a storage node may advertise (a host, or a suffix that
+starts with `.`; empty allows any); `replace` lets it re-enroll an id that exists. An
+unknown field is a `400`. The answer is
+
+```json
+{"token": "kbft1.<id>.<secret>.<pin>", "secret": "<base64url>", "info": {"id": "...", ...}}
+```
+
+`token` is what a node is given (the pin is the SHA-256 of the root CA certificate, which
+the node checks the frontend against at first contact). **This is the only answer that
+holds `token` or `secret`:** the state store keeps a hash of the secret, and no list
+returns the hash, the secret or the string. Lose it and revoke the token. A token whose
+string cannot be built (the frontend has no CA pin, `503`; the random source fails, `500`)
+is not stored.
+
+`info` and each element of `tokens` are `{id, roles, max_uses, uses, expires_at,
+created_at, revoked_at, node_id, node_prefix, names, replace, label, created_by}`; times
+are seconds on the state store's clock. **Revoke** stops new enrollments with the token;
+nodes it enrolled stay enrolled, and revoking a revoked token is a `200`. `404` for an
+unknown or malformed id.
+
+Each element of `nodes` is `{id, roles, state, advertise, zone, token_id, token_label,
+created_at, last_renewed_at, not_after, revoked_at}`, with `state` `active` or `revoked`
+and no certificate or key. **Revoking a node** takes no body (or `{}`), marks it `revoked`
+(its id is burned: no token enrolls that id again) and writes the deny rows for the node,
+each unexpired serial it holds or held and each of its keys, in one transaction; `denied`
+lists them as the deny list spells them (`node n1`, `serial ...`, `spki-sha256 ...`). `400`
+for a node already revoked, `404` for an unknown or malformed id.
+
+**Failures.** `400` for a body or value the registry refuses, `404` (above), `409` when
+this frontend is not the signer (it lost the writer role: nothing was written, call the
+current frontend; the enroll wire's `NotSigner`), `503` when the state store failed or
+other writers kept winning (try again), `500` for a stored row that does not decode.
+`401`, `403` and `415` are the gates'.
+
+There is no `kbf` verb for this: `kbf` only runs, and operator actions are calls to this
+API. From the frontend's host, with the file `--api-token-file` names:
+
+```sh
+T=$(cat <token file>); API=http://127.0.0.1:<port>
+curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  -d '{"roles": ["daemon"], "max_uses": 3, "expires_in": 86400, "label": "rack 4"}' \
+  $API/v1/enroll/tokens                       # the token string is in this answer only
+curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' $API/v1/enroll/tokens
+curl -X DELETE -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  $API/v1/enroll/tokens/<id>
+```
+
+A UI comes later.
+
 ## `GET /v1/storage`
 
 Whether every blob is known to have its copies elsewhere: the number a rollout asks
@@ -674,8 +751,30 @@ left out. The run is read from the in-memory record while it is held and from hi
 after, in one rendering: the answer is the same before and after a restart. The run's one
 instance is asked of `invocations.getAuthorizer` before anything is answered. `{run_id}`
 is 24 lowercase hex digits, which the attempts of the build pages give as `run_id` and
-`run_href` (only with `--history-objects`). Not here yet: the `envelope`, `end`, tails and
+`run_href` (only with `--history-objects`). Not here yet: the `envelope`, `end` and
 transfer counters.
+
+A run that has logs also has `logs`: for each of `stdout`, `stderr` and `result` that it
+has, the `digest`, whether the blob is still held (`available`), an `href`, and for
+`stdout` and `stderr` of a failed run the `tail` history kept (the last 16 KiB, as text),
+its `total_bytes`, `tail: null` with `tail_omitted` (`too_large` over 64 MiB, `unreadable`,
+`busy` when the read budget was not free in time) and `tail_redacted: false`: no
+redaction exists, the tail is as the run wrote it. The `href` is the blob route while the
+blob is held and the log route below once it is not and history holds a copy; `null`
+otherwise. A failed run's `command_rendering` (argv, environment variable names only,
+working directory, output paths, at most 4 KiB, `redacted: false`) is shown beside them.
+
+**`GET /v1/runs/{run_id}/logs/{stdout|stderr|result}`** (with `--history-objects`) is the
+copy of a failed run's log that history kept, which outlives the blob it was copied from
+(30 days, `r30`). It is raw bytes, `application/octet-stream` as an attachment, with
+`X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox` on every answer.
+The run's instance is asked of `invocations.getAuthorizer` before the copy is read, and the
+copy is read for that instance only. One `Range: bytes=...` is honoured (`206`, or `416`),
+and only the blocks that hold the range are read; several ranges are ignored. The bytes of
+an answer count against the same read budget as `/v1/blobs`, and a read waits for it at
+most 10 seconds, then is `503` with `Retry-After` and `"busy": true`. A run with no such
+copy (it passed, the log was over 16 MiB, or it had none) is `404` `no_log`; an unknown run
+`404` `no_run`; a query string is `400`.
 
 **Across builds** (with `--history-objects`; otherwise these routes do not exist, `404` as
 any unknown path). They are read from the index rows the history writer keeps, never from
@@ -977,6 +1076,35 @@ runs the call again, once. A second `STALE_MAP`, or a fetch that brings no newer
 treated as `UNAVAILABLE`. `UNAVAILABLE` for a caller ahead of the node is the node's
 lost push: the caller's map may be the right one, so the caller tries again, and the
 node's next push makes the call succeed.
+
+## `PUT /v1/releases/{commit}/{platform}/{name}` and `GET /v1/releases`
+
+The frontend's release store (`docs/design/pull-updates.md` section 6.3): the tarballs of a
+release and their build attestations, kept as uploaded. Not served by any listener until the
+frontend mounts `kbf_server::release::router`; without a store both answer `503` naming
+`--releases-dir`.
+
+- `commit` is 40 lowercase hex digits, `platform` is `linux-x86_64`, `linux-arm64` or
+  `darwin-arm64`, `name` is `kbf` or `kbf-daemon` (the tarball) or either with the suffix
+  `.attestation` (its build attestation bundle). Anything else is `400`; no segment is ever joined
+  into a path as it arrived.
+- `PUT` takes the file as the body, with the write gates of the section "Who may write" except
+  the JSON content type (loopback peer, no `Origin`, the bearer token). A tarball is at most
+  512 MiB (`413` past it), a bundle at most 256 KiB; an empty body is `400`. The body is written to
+  a `.partial` file, synced, and renamed into place, so an interrupted upload leaves nothing
+  visible.
+- `201` `{"sha256", "size"}` for a new key. A release is immutable: the same bytes again are
+  `200` with the same answer, other bytes are `409` and change nothing.
+- `GET` is open and lists `{"releases": [{"commit", "platforms": [{"platform", "complete",
+  "components": [{"name", "sha256", "size", "attested"}]}]}]}`: commits sorted, platforms in the
+  order above, a platform `complete` when both tarballs have their attestation. A component is
+  listed when its tarball is stored.
+- `GET /v1/releases` and the gRPC `ReleaseService.Fetch` are unauthenticated at the router and
+  the service. `Fetch` is mounted on the worker listener behind its mutual TLS and the role
+  table (the daemon role alone may call it). `GET /v1/releases` is open to whoever reaches the
+  operator API, like `GET /v1/nodes`: it lists commits, platforms and digests, no bytes. The
+  store is mounted by `--releases-dir`, which needs `--api-listen`; without the flag every
+  update endpoint answers `503`.
 
 ## `UNAVAILABLE` from a storage node that is catching up
 

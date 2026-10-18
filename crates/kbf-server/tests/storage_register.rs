@@ -935,6 +935,7 @@ fn readable_map() -> pb::Map {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = kbf_map::Map::new(4, vec![member], kbf_map::Rule::Rendezvous, 1, 1, Vec::new())
         .expect("a map");
@@ -1128,6 +1129,7 @@ async fn a_map_that_is_not_newer_changes_nothing() {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = kbf_map::Map::new(4, vec![member], kbf_map::Rule::Rendezvous, 1, 1, Vec::new())
         .expect("a map");
@@ -1203,6 +1205,7 @@ async fn the_node_map_is_the_holders_and_knows_the_member_the_registration_named
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = |generation| {
         kbf_map::Map::new(
@@ -1360,6 +1363,7 @@ async fn a_write_through_the_halfs_in_process_view_is_judged_by_the_map_and_owes
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = kbf_map::Map::new(
         1_000,
@@ -1448,6 +1452,7 @@ async fn the_frontends_unowned_copy_is_stored_through_the_real_listener() {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = kbf_map::Map::new(
         1_000,
@@ -1549,6 +1554,7 @@ fn a_map(generation: u64) -> pb::Map {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = kbf_map::Map::new(
         generation,
@@ -1799,9 +1805,26 @@ async fn a_denied_certificate_is_refused_by_a_real_storage_node_when_the_generat
     .collect::<String>();
     let (listed, other) = (channel_of(listed), channel_of(pki.cert("frontend")));
     let digest = kbf_segments::sha256(b"asked of a node that has nothing");
+    // The node's map turns while the test runs (its own promotion out of catching up is a
+    // new generation), so a call made with the generation read just before it can be
+    // answered STALE_MAP. Each ask then reads the generation again and asks again, as a
+    // client that refetches would, a bounded number of times; any other answer is kept.
+    let maps = &maps;
     let ask = |channel: &tonic::transport::Channel| {
-        let remote = RemoteStorage::new(channel.clone(), maps.generation());
-        async move { remote.find_missing(&[digest]).await }
+        let channel = channel.clone();
+        async move {
+            let mut tries = 0;
+            loop {
+                let remote = RemoteStorage::new(channel.clone(), maps.generation());
+                match remote.find_missing(&[digest]).await {
+                    Err(kbf_storage::StorageError::StaleMap { .. }) if tries < 200 => {
+                        tries += 1;
+                        tokio::time::sleep(5 * MS).await;
+                    }
+                    answer => break answer,
+                }
+            }
+        }
     };
     // A node that has just started answers "catching up" while it rebuilds its index
     // (slow under coverage); only that answer is waited out, until a deadline, then the

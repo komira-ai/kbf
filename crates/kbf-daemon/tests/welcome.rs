@@ -83,7 +83,8 @@ async fn a_server_that_never_welcomes_is_given_up_on() {
 }
 
 /// Catches a daemon that ends its stream on messages it has no use for: a second Welcome
-/// on the stream, a message with no content, and an offer that names no lease. It goes on
+/// on the stream, a message with no content, an update offer and an update order (it has
+/// no update client yet), and an offer that names no lease. It goes on
 /// heartbeating, and the offer after them is still handled (events come in order, so the
 /// first `Offered` is the lease the offer after them names).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -92,6 +93,7 @@ async fn messages_the_daemon_has_no_use_for_leave_the_stream_up() {
     let mut peer = h.welcomed().await;
     peer.welcome();
     peer.send_empty();
+    peer.update_messages();
     peer.offer_without_lease();
     peer.offer(1, 1);
     let offered = h

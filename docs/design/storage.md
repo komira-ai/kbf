@@ -102,6 +102,16 @@ The same check guards writes: `PutAction` is refused unless its role is `Daemon`
 every blob in the record is present and reachable. Clients cannot reach this path at
 all; `UpdateActionResult` answers `PERMISSION_DENIED` before reading the request.
 
+The router does not repeat the check blob by blob. What a FindMissing showed present at
+an owner is remembered per (blob, owner), shared by every action, for a short time to
+live and within an entry bound (least recently used out first). An entry is trusted only
+while the owner's map generation and published boot (`Member.boot`) are those it was
+verified under: a restarted owner may have lost blobs it held only in RAM, so a new boot
+drops its entries even when the generation did not move, and a caller on an older map
+neither reads nor adds. An owner whose boot is 0 (unknown, a node from before the field)
+is never remembered, because without a boot a restart cannot be told: every check asks
+it.
+
 ### Retention and touches
 
 `Retention` holds three durations, in farm time:

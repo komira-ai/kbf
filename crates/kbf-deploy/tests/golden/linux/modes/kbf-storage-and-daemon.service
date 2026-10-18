@@ -57,6 +57,7 @@ ExecStart=/usr/local/bin/kbf storage-and-daemon \
     --frontend=https://frontend.example.internal:8981 \
     --advertise-addr=storage-node.example.internal:8983 \
     --driver=container \
+    --oci-runtime=/usr/bin/crun \
     --server=https://frontend.example.internal:8981 \
     --ca-cert=/etc/kbf/ca.pem \
     --cert=/etc/kbf/node.pem \
