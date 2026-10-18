@@ -24,7 +24,7 @@
 //!    most [`UID_WITHIN`]): the native driver's keeper of an action it runs as a pool
 //!    user, which is in no group of the action's.
 //!
-//! **The program after an update.** kbf-updater replaces the binary by renaming a new
+//! **The program after an update.** An update replaces the binary by renaming a new
 //! file over it while the daemon runs. On Linux [`program`] is `/proc/self/exe`, which
 //! names the file the daemon was started from even after a rename replaced it. On
 //! macOS, which has no such name, it is [`std::env::current_exe`], which there names
