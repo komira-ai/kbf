@@ -41,6 +41,7 @@ struct Row {
 
 const ALL: &[Mode] = &Mode::ALL;
 const BUILDS: &[Mode] = &[Mode::Daemon, Mode::StorageAndDaemon, Mode::AllInOne];
+const NODES: &[Mode] = &[Mode::Storage, Mode::Daemon, Mode::StorageAndDaemon];
 const DRAINS: &[Mode] = &[
     Mode::Frontend,
     Mode::Storage,
@@ -80,6 +81,23 @@ fn rows() -> Vec<Row> {
             rule: "slice",
             plant: |_, t| t.replace("Slice=kbf.slice", "Slice=system.slice"),
             fails: ALL,
+        },
+        // A runtime flag the daemon no longer has, and the runtime program left out:
+        // each turns the rule red for the modes that run builds only.
+        Row {
+            rule: "runtime",
+            plant: |_, t| {
+                t.replace(
+                    "    --driver=container \\\n",
+                    "    --driver=container \\\n    --container-runtime=oci \\\n",
+                )
+            },
+            fails: BUILDS,
+        },
+        Row {
+            rule: "runtime",
+            plant: |_, t| t.replace("    --oci-runtime=/usr/bin/crun \\\n", ""),
+            fails: BUILDS,
         },
         Row {
             rule: "delegate",
@@ -151,6 +169,17 @@ fn rows() -> Vec<Row> {
                 }
             },
             fails: ALL,
+        },
+        // A failure that repeats quickly ends in start-limit-hit: no delay, or a limit.
+        Row {
+            rule: "restart",
+            plant: |_, t| t.replace("RestartSec=5\n", ""),
+            fails: NODES,
+        },
+        Row {
+            rule: "restart",
+            plant: |_, t| t.replace("StartLimitIntervalSec=0\n", ""),
+            fails: NODES,
         },
         // A drain cut short: a finite stop timeout, or a signal kbf does not drain on.
         Row {

@@ -128,6 +128,73 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
     }
 }
 
+/// A host where every path exists as a file and a directory alike, empty and mode 0600.
+struct EverythingExists;
+
+impl kbf_cli::preflight::Host for EverythingExists {
+    fn stat(&self, _: &std::path::Path) -> std::io::Result<kbf_cli::preflight::host::Stat> {
+        Ok(kbf_cli::preflight::host::Stat {
+            kind: kbf_cli::preflight::host::Kind::File,
+            uid: 0,
+            mode: 0o600,
+        })
+    }
+    fn read(&self, _: &std::path::Path) -> std::io::Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+    fn var(&self, _: &str) -> Option<String> {
+        Some("x".to_owned())
+    }
+    fn euid(&self) -> u32 {
+        0
+    }
+    fn nofile(&self) -> u64 {
+        1 << 20
+    }
+    fn run(
+        &self,
+        _: &std::path::Path,
+        _: &[&str],
+    ) -> std::io::Result<kbf_cli::preflight::host::Output> {
+        Ok(kbf_cli::preflight::host::Output {
+            success: true,
+            stdout: "crun version 1.14.0\n".to_owned(),
+        })
+    }
+    fn now(&self) -> std::time::SystemTime {
+        std::time::SystemTime::now()
+    }
+}
+
+/// Catches a startup preflight rule refusing a layout `kbf-deploy` renders: every mode
+/// unit, with the settings' default metadata directory and with the test farm's (the
+/// metadata log under the node's own data root), is read by `kbf <mode>`'s own parser and
+/// checked against a host where every file exists. The files may still fail their own
+/// checks (these are empty); no problem may be about the two directories.
+#[test]
+fn no_rendered_mode_unit_is_refused_over_where_its_directories_are() {
+    let farm = EXAMPLE.replace(
+        "KBF_META_DIR=/var/lib/kbf-server/raft",
+        "KBF_META_DIR=/var/lib/kbf/av2-meta",
+    );
+    assert_ne!(farm, EXAMPLE, "config.example moved KBF_META_DIR");
+    for text in [EXAMPLE.to_owned(), farm] {
+        let c = LinuxConfig::parse(&text).expect("valid settings");
+        for mode in Mode::ALL {
+            let unit = render(&c, Some(1500), mode).expect("renders");
+            let unit = UnitFile::parse(&unit).expect("a unit");
+            let invocation = parse_from(unit.exec_start().iter().copied()).expect("parses");
+            let needs = kbf_cli::preflight::needs(&invocation);
+            let report = kbf_cli::preflight::check(&needs, &EverythingExists);
+            let text = report.render(needs.mode);
+            assert!(
+                !text.contains("--meta-dir") && !text.contains("--data-dir"),
+                "{mode}: {text}"
+            );
+        }
+    }
+}
+
 /// The all-in-one unit gives no `--state-store`, and kbf all-in-one, parsing the rendered
 /// command line, takes the SQLite file `state.db` in the unit's `--data-dir`: the state
 /// the template's comment promises, and one rule `state-store` passes. Catches the unit
@@ -339,11 +406,12 @@ fn check_units_parses_a_modes_flags_with_this_kbf() {
             ],
             _ => Vec::new(),
         };
-        assert_eq!(
-            check_units(&format!("clean_{mode}"), mode, &text),
-            (Vec::new(), notes),
-            "{mode}"
-        );
+        // Rule `traverse` reads this machine's accounts: it notes a SKIP where the unit's
+        // user is absent (a CI runner) and is silent where it exists, so that note is not
+        // compared here (traverse_tests and install_mode_tests cover the rule).
+        let (failures, mut said) = check_units(&format!("clean_{mode}"), mode, &text);
+        said.retain(|n| !n.starts_with("SKIP traverse: no user "));
+        assert_eq!((failures, said), (Vec::new(), notes), "{mode}");
     }
     let bin = env!("CARGO_BIN_EXE_kbf");
     let text = render(&c, Some(1500), Mode::Daemon).expect("renders");

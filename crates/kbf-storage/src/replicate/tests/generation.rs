@@ -13,6 +13,7 @@ fn behind_is_stale_equal_is_served_ahead_is_unavailable() {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = Map::new(7, vec![member], Rule::Rendezvous, 1, 1, Vec::new()).expect("map");
     for behind in [0, 1, 6] {
