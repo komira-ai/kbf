@@ -33,7 +33,7 @@ use kbf_host::path::{HostPath, Root};
 use kbf_host::step::{Owner, Perms};
 use kbf_host::testkit::FakeExec;
 use kbf_installer::CommitId;
-use kbf_installer::attest::{SourceRef, Tools, Verifier};
+use kbf_installer::attest::{GhCheck, SourceRef, Tools};
 use kbf_installer::run::{RunAs, SystemRunner};
 
 /// The commit the fixture attests, and the branch it was built on.
@@ -118,9 +118,9 @@ fn verify(
     file: &Path,
     commit: &str,
     refs: &[&str],
-    change: impl FnOnce(&mut Verifier),
+    change: impl FnOnce(&mut GhCheck),
 ) -> Result<kbf_installer::attest::Verified, kbf_installer::refusal::Refusal> {
-    let mut verifier = Verifier {
+    let mut verifier = GhCheck {
         root: Root::host(),
         gh: host_path(&gh()),
         trusted_root: host_path(&testdata("trusted_root.jsonl")),

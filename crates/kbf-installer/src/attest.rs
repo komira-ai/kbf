@@ -1,6 +1,6 @@
 //! The offline check that a release is the one the build farm's workflow built.
 //!
-//! A [`Verifier`] runs the pinned `gh` (`gh attestation verify`, a Sigstore verification
+//! A [`GhCheck`] runs the pinned `gh` (`gh attestation verify`, a Sigstore verification
 //! that needs no network when it is given the bundle and a trusted root) on a file and
 //! the attestation bundle for it, and accepts the file only if the attestation
 //!
@@ -32,7 +32,7 @@ use kbf_host::path::{HostPath, Root};
 
 use crate::CommitId;
 use crate::layout::{self, Layout};
-use crate::refusal::Refusal;
+use crate::refusal::{Refusal, WHAT_GH};
 use crate::run::{Ran, RunAs, Runner, Spawn};
 use crate::settings::Settings;
 use crate::trust::trusted_chain;
@@ -90,7 +90,7 @@ pub struct Verified {
 
 /// What `gh attestation verify` is asked, and how it is run.
 #[derive(Clone, Debug)]
-pub struct Verifier {
+pub struct GhCheck {
     /// The directory the paths below are under (`/` on a host).
     pub root: Root,
     /// The pinned `gh`.
@@ -113,11 +113,11 @@ pub struct Tools<'a> {
     pub runner: &'a dyn Runner,
 }
 
-impl Verifier {
+impl GhCheck {
     /// The verifier of a host: the pinned repository, workflow and issuer, with the
     /// host's settings.
-    pub fn pinned(host: &Layout, settings: &Settings) -> Verifier {
-        Verifier {
+    pub fn pinned(host: &Layout, settings: &Settings) -> GhCheck {
+        GhCheck {
             root: host.root().clone(),
             gh: layout::path(layout::GH),
             trusted_root: layout::path(layout::TRUSTED_ROOT),
@@ -244,13 +244,11 @@ impl Verifier {
             timeout: self.timeout,
         };
         let ran = runner.run(&spawn).map_err(|source| Refusal::Tool {
-            what: "gh attestation verify",
+            what: WHAT_GH,
             source,
         })?;
         if ran.timed_out {
-            return Err(Refusal::TimedOut {
-                what: "gh attestation verify",
-            });
+            return Err(Refusal::TimedOut { what: WHAT_GH });
         }
         Ok(ran)
     }
