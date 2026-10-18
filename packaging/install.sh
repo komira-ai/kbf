@@ -15,10 +15,14 @@
 # (a version in the range the release notes name) from its own package first; storage and
 # daemon hosts do not need it.
 #
-# The payload (`cargo xtask installer-tarball`) holds usr/bin/kbf-installer,
-# usr/lib/systemd/system/* and usr/share/kbf-installer/trust/*, and no kbf release:
-# `sudo kbf-installer setup` installs the first one. macOS has no payload: nodes there
-# get the .pkg.
+# The payload (`cargo xtask installer-tarball`) is the Debian package's file list, made
+# from the same Rust list: usr/bin/kbf-installer, usr/lib/systemd/system/kbf-*.service
+# and kbf.slice, usr/share/kbf-installer/trust/{gh,installer.conf,trusted_root.jsonl},
+# usr/lib/sysusers.d/kbf-installer.conf and usr/lib/tmpfiles.d/kbf-installer.conf, and
+# no kbf release: `sudo kbf-installer setup` installs the first one. After placing, the
+# script makes the users and directories from those two files (systemd-sysusers and
+# systemd-tmpfiles, on those files only); a host without systemd is refused before
+# anything is placed. macOS has no payload: nodes there get the .pkg.
 #
 # SHA256SUMS comes from the same place as the payload, so the check catches a damaged or
 # mixed-up download, not a hostile server: use an https URL, and verify the release's
@@ -43,7 +47,8 @@ usage: install.sh [--release-url URL] [--platform linux-x86_64|linux-arm64] [--r
   --release-url URL  where SHA256SUMS and the payload are (default: the latest release)
   --platform P       default: this host
   --root DIR         place the files under DIR, not /, and do not require root
-Places kbf-installer, its units and trust files after a sha256 check; starts nothing.
+Places kbf-installer, its units and trust files after a sha256 check, then makes its
+users and directories (systemd-sysusers, systemd-tmpfiles); starts nothing.
 Envoy is not installed here and is not in the payload: a frontend host installs Envoy
 (a version in the range the release notes name) from its own package first.
 EOF
@@ -86,6 +91,12 @@ case $platform in
   linux-x86_64 | linux-arm64) ;;
   *) die "unsupported platform '$platform' (linux-x86_64 and linux-arm64 are built)" ;;
 esac
+
+# The users and directories are made by systemd's tools from the two files in the
+# payload; without them the package cannot be installed, so say so before placing.
+for tool in systemd-sysusers systemd-tmpfiles; do
+  command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed: this needs a host with systemd"
+done
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -137,7 +148,11 @@ tar -tvzf "$tmp/$name" >"$tmp/types" || die "$name is not a tar.gz"
 while read -r entry; do
   case $entry in
     /* | ../* | */../* | */..) die "$name holds the path '$entry'" ;;
-    usr/bin/kbf-installer | usr/lib/systemd/system/?* | usr/share/kbf-installer/trust/?*) ;;
+    usr/lib/systemd/system/*/*) die "$name holds '$entry', which the package does not" ;;
+    usr/bin/kbf-installer | usr/lib/systemd/system/kbf-?*.service | usr/lib/systemd/system/kbf.slice) ;;
+    usr/share/kbf-installer/trust/gh | usr/share/kbf-installer/trust/installer.conf) ;;
+    usr/share/kbf-installer/trust/trusted_root.jsonl) ;;
+    usr/lib/sysusers.d/kbf-installer.conf | usr/lib/tmpfiles.d/kbf-installer.conf) ;;
     *) die "$name holds '$entry', which the package does not" ;;
   esac
 done <"$tmp/names"
@@ -150,6 +165,14 @@ done <"$tmp/types"
 
 umask 022
 tar -xzf "$tmp/$name" -C "$root" || die "cannot place $name under $root"
+
+# Only the package's two files. systemd reads a file named on the command line as given,
+# not below `--root`, so the name carries the root (empty for `/`).
+prefix=${root%/}
+systemd-sysusers "--root=$root" "$prefix/usr/lib/sysusers.d/kbf-installer.conf" \
+  || die "systemd-sysusers failed on the placed sysusers.d file (the files are placed)"
+systemd-tmpfiles "--root=$root" --create "$prefix/usr/lib/tmpfiles.d/kbf-installer.conf" \
+  || die "systemd-tmpfiles failed on the placed tmpfiles.d file (the files are placed)"
 
 echo "install.sh: placed $name under $root; nothing is started or enabled."
 echo "install.sh: next: sudo kbf-installer setup"

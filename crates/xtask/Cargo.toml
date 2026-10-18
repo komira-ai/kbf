@@ -16,6 +16,13 @@ name = "xtask-fake"
 path = "src/bin/xtask-fake.rs"
 test = false
 
+# `kbf-installer-stub`, a TEST-ONLY stand-in for the kbf-installer binary: what the
+# package build and install test package until the real binary lands.
+[[bin]]
+name = "kbf-installer-stub"
+path = "src/bin/kbf-installer-stub.rs"
+test = false
+
 [dependencies]
 clap.workspace = true
 flate2.workspace = true

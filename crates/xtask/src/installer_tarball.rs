@@ -1,12 +1,15 @@
-//! `installer-tarball --binary <path> --platform <platform> --commit <sha> [--units
-//! <dir>].. [--trust <dir>].. --out <dir>`: the payload `packaging/install.sh` places,
-//! the same files at the same paths the Debian package ships
-//! (docs/design/kbf-installer.md section 3):
+//! `installer-tarball --binary <path> --platform <platform> --commit <sha> --units <dir>
+//! --trust <dir> --sysusers <file> --tmpfiles <file> --out <dir>`: the payload
+//! `packaging/install.sh` places: the files of the Debian package, at the same paths
+//! with the same modes, because it is made from the same list ([`crate::pkg::files`],
+//! which the deb and the rpm are made from too) and cannot drift from it:
 //!
-//! - `usr/bin/kbf-installer` (mode 0755): the binary;
-//! - `usr/lib/systemd/system/<file>` (0644): each file of each `--units` directory;
-//! - `usr/share/kbf-installer/trust/<file>` (0644): each file of each `--trust`
-//!   directory.
+//! - `usr/bin/kbf-installer` (0755);
+//! - `usr/lib/systemd/system/<file>` (0644): `kbf-*.service` and `kbf.slice` only;
+//! - `usr/share/kbf-installer/trust/<file>`: exactly the three trust files, the pinned
+//!   `gh` 0755 and the two data files 0644;
+//! - `usr/lib/sysusers.d/kbf-installer.conf` and `usr/lib/tmpfiles.d/kbf-installer.conf`
+//!   (0644), which `install.sh` applies after placing.
 //!
 //! It writes `<out>/kbf-installer-payload-<commit>-<platform>.tar.gz` and appends its
 //! line to `<out>/SHA256SUMS.<platform>` ([`crate::sums`]). The name differs from the
@@ -23,30 +26,21 @@
 //! neither does this; the payload is Linux only (a Mac gets the `.pkg`).
 
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use flate2::Compression;
 
 use crate::fetch::Sha256;
 use crate::package::{Platform, open_sums, read, write_new, write_sums};
-use crate::{Error, build_commit, sums};
+use crate::{Error, build_commit, pkg, sums};
 
-/// Where the binary goes, relative to the root the payload is extracted in.
-pub const BINARY_PATH: &str = "usr/bin/kbf-installer";
-/// Where unit files go.
-pub const UNIT_DIR: &str = "usr/lib/systemd/system";
-/// Where trust files go.
-pub const TRUST_DIR: &str = "usr/share/kbf-installer/trust";
 /// The first part of the tarball's name.
 pub const NAME: &str = "kbf-installer-payload";
-
-const EXECUTABLE: u32 = 0o755;
-const PLAIN: u32 = 0o644;
 
 /// One file of the payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct File {
-    /// Relative, such as [`BINARY_PATH`].
+    /// Relative to the root the payload is extracted in, such as `usr/bin/kbf-installer`.
     pub path: String,
     pub mode: u32,
     pub bytes: Vec<u8>,
@@ -57,79 +51,22 @@ pub fn file_name(commit: &str, platform: Platform) -> String {
     format!("{NAME}-{commit}-{}.tar.gz", platform.name())
 }
 
-/// A file name a unit or trust file may have: letters, digits and `._@-`, not starting
-/// with a dot.
-fn is_file_name(name: &str) -> bool {
-    !name.starts_with('.')
-        && !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() | matches!(b, b'.' | b'_' | b'@' | b'-'))
-}
-
-/// The regular files of `dir` as payload files under `target`, mode [`PLAIN`].
-fn files_of(dir: &Path, target: &str) -> Result<Vec<File>, Error> {
-    let what = format!("read {}", dir.display());
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(Error::spawn(what.clone()))? {
-        let entry = entry.map_err(Error::spawn(what.clone()))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        // `metadata` follows links: a link to a file is that file's bytes.
-        let meta = std::fs::metadata(entry.path()).map_err(Error::spawn(what.clone()))?;
-        if !meta.is_file() {
-            return Err(Error::Failed(format!(
-                "{}: {name} is not a regular file",
-                dir.display()
-            )));
-        }
-        if !is_file_name(&name) {
-            return Err(Error::Failed(format!(
-                "{}: {name:?} is not a file name a payload may hold",
-                dir.display()
-            )));
-        }
-        files.push(File {
-            path: format!("{target}/{name}"),
-            mode: PLAIN,
-            bytes: read(&entry.path())?,
-        });
-    }
-    Ok(files)
-}
-
-/// The payload of `binary` and the files of the `units` and `trust` directories,
-/// sorted by path.
+/// The regular files of the package's list `entries` as payload files, sorted by path.
+/// The package's directories are not in it: extracting would reset the mode of `usr/bin`
+/// on the host, and `tar` makes the missing ones itself.
 ///
 /// # Errors
-/// A path in two directories, or no unit file or no trust file at all (a glob that
-/// matched nothing would otherwise ship a payload that starts and trusts nothing).
-pub fn payload(binary: &[u8], units: &[PathBuf], trust: &[PathBuf]) -> Result<Vec<File>, Error> {
-    let mut files = vec![File {
-        path: BINARY_PATH.to_owned(),
-        mode: EXECUTABLE,
-        bytes: binary.to_vec(),
-    }];
-    let before = files.len();
-    for dir in units {
-        files.extend(files_of(dir, UNIT_DIR)?);
-    }
-    if files.len() == before {
-        return Err(Error::Failed("no unit file in --units".to_owned()));
-    }
-    let before = files.len();
-    for dir in trust {
-        files.extend(files_of(dir, TRUST_DIR)?);
-    }
-    if files.len() == before {
-        return Err(Error::Failed("no trust file in --trust".to_owned()));
+/// A file that cannot be read.
+pub fn payload(entries: &[pkg::Entry]) -> Result<Vec<File>, Error> {
+    let mut files = Vec::new();
+    for e in entries.iter().filter(|e| e.sha256.is_some()) {
+        files.push(File {
+            path: e.dst.trim_start_matches('/').to_owned(),
+            mode: e.mode,
+            bytes: read(&e.src)?,
+        });
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
-    if let Some(pair) = files.windows(2).find(|w| w[0].path == w[1].path) {
-        return Err(Error::Failed(format!(
-            "{} is in two directories",
-            pair[0].path
-        )));
-    }
     Ok(files)
 }
 
@@ -216,11 +153,9 @@ pub fn check_tarball(tgz: &[u8], files: &[File]) -> Vec<String> {
 
 /// The `installer-tarball` verb: the lines to print.
 pub fn installer_tarball(
-    binary: &Path,
     platform: Platform,
     commit: &str,
-    units: &[PathBuf],
-    trust: &[PathBuf],
+    sources: &pkg::Sources,
     out: &Path,
 ) -> Result<Vec<String>, Error> {
     if !build_commit::is_commit(commit) {
@@ -231,7 +166,7 @@ pub fn installer_tarball(
             "--platform darwin-arm64: the payload is for Linux; a Mac gets the .pkg".to_owned(),
         ));
     }
-    let files = payload(&read(binary)?, units, trust)?;
+    let files = payload(&pkg::files(sources)?)?;
     let name = file_name(commit, platform);
     let (sums_path, mut lines) = open_sums(out, platform)?;
     if let Some(l) = lines.iter().find(|l| l.name == name) {

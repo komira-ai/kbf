@@ -40,6 +40,9 @@
 //!   prints a version line, `manifest inspect` prints the file `podman-index.json` next
 //!   to it (the image index a test wrote for it), and anything else (`pull`) prints
 //!   nothing.
+//! - Run as `systemd-sysusers` or `systemd-tmpfiles` (by name, from PATH, or by path), it
+//!   appends `<name> <arguments>` as one line to `systemd-args` next to the fake's own
+//!   file and exits 0: the host's systemd, as `packaging/install.sh` calls it.
 //!
 //! `XTASK_FAKE_DEFECT` plants one defect of the real build: `ignores-override` (the
 //! build embeds the head whatever the override), `accepts-bad` (a malformed override
@@ -54,7 +57,8 @@
 //! release` command exits 1). Of sudo:
 //! `tests-fail` (it exits 101, as a failed test binary does) or `fails:<a>,<b>,...`
 //! (it exits 101 when one of its arguments is one of `<a>`, `<b>`, ..., so some units
-//! of several fail). Of podman: `podman-fails` (every podman command exits 125).
+//! of several fail). Of podman: `podman-fails` (every podman command exits 125). Of systemd:
+//! `systemd-fails` (every systemd tool exits 1).
 use std::io::Write;
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
@@ -297,6 +301,21 @@ fn sudo(argv0: &str, args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn systemd(name: &str, args: &[String]) -> ExitCode {
+    let exe = std::env::current_exe().expect("the fake's own path");
+    let dir = exe.parent().expect("the fake's directory");
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("systemd-args"))
+        .expect("systemd-args");
+    writeln!(log, "{name} {}", args.join(" ")).expect("systemd-args");
+    if defect("systemd-fails") {
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
 fn podman(argv0: &str, args: &[String]) -> ExitCode {
     let dir = Path::new(argv0).parent().expect("the fake's directory");
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
@@ -349,6 +368,7 @@ fn main() -> ExitCode {
     let mut args = std::env::args();
     let argv0 = args.next().expect("argv0");
     let rest: Vec<String> = args.collect();
+    let base = argv0.rsplit('/').next().unwrap_or(&argv0);
     if argv0.ends_with("/kbf-server") {
         server(&argv0)
     } else if argv0.ends_with("/kbf") {
@@ -359,6 +379,8 @@ fn main() -> ExitCode {
         sudo(&argv0, &rest)
     } else if argv0.ends_with("/podman") {
         podman(&argv0, &rest)
+    } else if matches!(base, "systemd-sysusers" | "systemd-tmpfiles") {
+        systemd(base, &rest)
     } else if argv0 == "uname" || argv0.ends_with("/uname") {
         uname(&rest)
     } else if argv0 == "id" || argv0.ends_with("/id") {

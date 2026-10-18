@@ -20,6 +20,27 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+/// The source paths of one package.
+struct Inputs {
+    binary: PathBuf,
+    units: PathBuf,
+    trust: PathBuf,
+    sysusers: PathBuf,
+    tmpfiles: PathBuf,
+}
+
+impl Inputs {
+    fn sources(&self) -> pkg::Sources<'_> {
+        pkg::Sources {
+            binary: &self.binary,
+            units: &self.units,
+            trust: &self.trust,
+            sysusers: &self.sysusers,
+            tmpfiles: &self.tmpfiles,
+        }
+    }
+}
+
 /// `dir/<sub>/<file>` for each file, and the directory.
 fn dir_of(dir: &Path, sub: &str, files: &[(&str, &str)]) -> PathBuf {
     let d = dir.join(sub);
@@ -30,8 +51,8 @@ fn dir_of(dir: &Path, sub: &str, files: &[(&str, &str)]) -> PathBuf {
     d
 }
 
-/// Inputs: a binary, one unit directory and one trust directory.
-fn inputs(dir: &Path) -> (PathBuf, Vec<PathBuf>, Vec<PathBuf>) {
+/// A binary, two units, the three trust files, and the two systemd files, in `dir`.
+fn inputs(dir: &Path) -> Inputs {
     let binary = dir.join("kbf-installer");
     std::fs::write(&binary, b"the installer").expect("binary");
     let units = dir_of(
@@ -40,18 +61,33 @@ fn inputs(dir: &Path) -> (PathBuf, Vec<PathBuf>, Vec<PathBuf>) {
         &[
             ("kbf-installer.service", "[Unit]\n"),
             ("kbf-frontend@.service", "[Unit]\n"),
+            ("kbf.slice", "[Slice]\n"),
         ],
     );
     let trust = dir_of(
         dir,
         "trust",
-        &[("installer.conf", "repo\n"), ("trusted_root.jsonl", "{}\n")],
+        &[
+            ("gh", "gh\n"),
+            ("installer.conf", "repo\n"),
+            ("trusted_root.jsonl", "{}\n"),
+        ],
     );
-    (binary, vec![units], vec![trust])
+    let sysusers = dir.join("sysusers.conf");
+    std::fs::write(&sysusers, "u kbf\n").expect("sysusers");
+    let tmpfiles = dir.join("tmpfiles.conf");
+    std::fs::write(&tmpfiles, "d /x\n").expect("tmpfiles");
+    Inputs {
+        binary,
+        units,
+        trust,
+        sysusers,
+        tmpfiles,
+    }
 }
 
-fn paths(files: &[File]) -> Vec<&str> {
-    files.iter().map(|f| f.path.as_str()).collect()
+fn payload_of(i: &Inputs) -> Result<Vec<File>, Error> {
+    payload(&pkg::files(&i.sources())?)
 }
 
 fn problems_of(files: &[File], tgz: &[u8]) -> Vec<String> {
@@ -59,25 +95,67 @@ fn problems_of(files: &[File], tgz: &[u8]) -> Vec<String> {
 }
 
 #[test]
-fn the_payload_is_the_packages_files_at_the_packages_paths_sorted() {
-    // Catches: a payload at other paths than the .deb's (the two channels would
-    // diverge), modes taken from the source files, or an order that depends on the
-    // directory listing.
+fn the_payload_is_the_packages_files_at_the_packages_paths_and_modes_sorted() {
+    // Catches: a payload at other paths or modes than the .deb's (the pinned gh is
+    // 0755 there, a payload giving every trust file 0644 would leave the installer
+    // unable to run it), a missing sysusers.d or tmpfiles.d file, or an order that
+    // depends on the directory listing.
     let dir = scratch("payload");
-    let (binary, units, trust) = inputs(&dir);
-    let files = payload(&std::fs::read(binary).expect("binary"), &units, &trust).expect("payload");
+    let files = payload_of(&inputs(&dir)).expect("payload");
+    let got: Vec<(&str, u32)> = files.iter().map(|f| (f.path.as_str(), f.mode)).collect();
     assert_eq!(
-        paths(&files),
+        got,
         [
-            "usr/bin/kbf-installer",
-            "usr/lib/systemd/system/kbf-frontend@.service",
-            "usr/lib/systemd/system/kbf-installer.service",
-            "usr/share/kbf-installer/trust/installer.conf",
-            "usr/share/kbf-installer/trust/trusted_root.jsonl",
+            ("usr/bin/kbf-installer", 0o755),
+            ("usr/lib/systemd/system/kbf-frontend@.service", 0o644),
+            ("usr/lib/systemd/system/kbf-installer.service", 0o644),
+            ("usr/lib/systemd/system/kbf.slice", 0o644),
+            ("usr/lib/sysusers.d/kbf-installer.conf", 0o644),
+            ("usr/lib/tmpfiles.d/kbf-installer.conf", 0o644),
+            ("usr/share/kbf-installer/trust/gh", 0o755),
+            ("usr/share/kbf-installer/trust/installer.conf", 0o644),
+            ("usr/share/kbf-installer/trust/trusted_root.jsonl", 0o644),
         ]
     );
-    let modes: Vec<u32> = files.iter().map(|f| f.mode).collect();
-    assert_eq!(modes, [0o755, 0o644, 0o644, 0o644, 0o644]);
+}
+
+#[test]
+fn the_payload_is_exactly_the_debs_files_with_the_debs_modes_and_bytes() {
+    // Catches: the payload and the package drifting apart again: both are read from the
+    // real packaging/linux sources here, and the payload's (path, mode, sha256) must be
+    // the deb's listing without its directories. A second list of files in the tarball
+    // code, or a different mode rule, goes red.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux");
+    let dir = scratch("same-as-deb");
+    let binary = dir.join("kbf-installer");
+    std::fs::write(&binary, b"the installer").expect("binary");
+    let sources = pkg::Sources {
+        binary: &binary,
+        units: &root.join("units"),
+        trust: &root.join("testdata/trust"),
+        sysusers: &root.join("sysusers.d/kbf-installer.conf"),
+        tmpfiles: &root.join("tmpfiles.d/kbf-installer.conf"),
+    };
+    let deb: Vec<String> = pkg::listing(&pkg::files(&sources).expect("deb"))
+        .lines()
+        .filter(|l| l.starts_with("file "))
+        .map(str::to_owned)
+        .collect();
+    let tar: Vec<String> = payload(&pkg::files(&sources).expect("deb"))
+        .expect("payload")
+        .iter()
+        .map(|f| format!("file {:04o} /{} {}", f.mode, f.path, Sha256::of(&f.bytes)))
+        .collect();
+    assert_eq!(tar, deb);
+    // The tarball itself, read back, holds those paths and modes.
+    let files = payload(&pkg::files(&sources).expect("deb")).expect("payload");
+    let tgz = tarball(&files).expect("tarball");
+    assert_eq!(problems_of(&files, &tgz), Vec::<String>::new());
+    let trust_gh = files
+        .iter()
+        .find(|f| f.path.ends_with("trust/gh"))
+        .expect("gh");
+    assert_eq!(trust_gh.mode, 0o755);
 }
 
 #[test]
@@ -86,90 +164,121 @@ fn the_same_inputs_are_the_same_bytes_whatever_their_times_and_order() {
     // the directories were read in (deterministic output, contract section 9 P11).
     let a = scratch("same-a");
     let b = scratch("same-b");
-    let (bin_a, units_a, trust_a) = inputs(&a);
-    let (bin_b, units_b, trust_b) = inputs(&b);
+    let in_a = inputs(&a);
+    let in_b = inputs(&b);
     let old = std::fs::File::options()
         .write(true)
-        .open(&bin_b)
+        .open(&in_b.binary)
         .expect("open");
     old.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(86_400))
         .expect("mtime");
-    let one = payload(&std::fs::read(bin_a).expect("a"), &units_a, &trust_a).expect("a");
-    let two = payload(&std::fs::read(bin_b).expect("b"), &units_b, &trust_b).expect("b");
+    let one = payload_of(&in_a).expect("a");
+    let two = payload_of(&in_b).expect("b");
     assert_eq!(tarball(&one).expect("a"), tarball(&two).expect("b"));
-    // Two directories, in either order.
-    let more = dir_of(&a, "more", &[("kbf-envoy@.service", "[Unit]\n")]);
-    let ab = payload(b"x", &[units_a[0].clone(), more.clone()], &trust_a).expect("ab");
-    let ba = payload(b"x", &[more, units_a[0].clone()], &trust_a).expect("ba");
-    assert_eq!(ab, ba);
 }
 
 #[test]
-fn a_payload_with_no_unit_or_no_trust_file_or_a_repeated_path_is_refused() {
+fn a_payload_that_is_not_the_contracts_is_refused() {
     // Catches: a glob that matched nothing shipping a payload that starts or trusts
-    // nothing, and a file of one directory silently replacing another's.
+    // nothing, a unit that is not kbf-*.service or kbf.slice, a fourth or a missing
+    // trust file, and a sub-directory in a unit directory reaching the host.
     let dir = scratch("refuse");
-    let (_, units, trust) = inputs(&dir);
+    let i = inputs(&dir);
+    let refused = |what: &str, s: pkg::Sources, why: &str| match pkg::files(&s) {
+        Err(Error::Refused(p)) => assert!(
+            p.iter().any(|l| l.contains(why)),
+            "{what}: {p:?} lacks {why:?}"
+        ),
+        other => panic!("{what}: {other:?}"),
+    };
     let empty = dir_of(&dir, "empty", &[]);
-    assert_eq!(
-        payload(b"x", &[], &trust),
-        Err(Error::Failed("no unit file in --units".to_owned()))
+    refused(
+        "no units",
+        pkg::Sources {
+            units: &empty,
+            ..i.sources()
+        },
+        "no unit files",
     );
-    assert_eq!(
-        payload(b"x", std::slice::from_ref(&empty), &trust),
-        Err(Error::Failed("no unit file in --units".to_owned()))
+    let odd = dir_of(
+        &dir,
+        "odd",
+        &[("evil.service", "x"), ("kbf-ok.service", "x")],
     );
-    assert_eq!(
-        payload(b"x", &units, &[empty]),
-        Err(Error::Failed("no trust file in --trust".to_owned()))
+    refused(
+        "odd unit",
+        pkg::Sources {
+            units: &odd,
+            ..i.sources()
+        },
+        "evil.service",
     );
-    let again = dir_of(&dir, "again", &[("kbf-installer.service", "other\n")]);
-    assert_eq!(
-        payload(b"x", &[units[0].clone(), again], &trust),
-        Err(Error::Failed(
-            "usr/lib/systemd/system/kbf-installer.service is in two directories".to_owned()
-        ))
+    let odd = dir_of(&dir, "odd2", &[("kbf-a.timer", "x")]);
+    refused(
+        "timer",
+        pkg::Sources {
+            units: &odd,
+            ..i.sources()
+        },
+        "kbf-a.timer",
     );
-}
-
-#[test]
-fn only_regular_files_with_plain_names_are_taken() {
-    // Catches: a subdirectory or a name with a space or a leading dot reaching the
-    // host's unit directory.
-    let dir = scratch("names");
-    let (_, _, trust) = inputs(&dir);
-    for (label, name) in [
-        ("hidden", ".hidden"),
-        ("space", "a b.service"),
-        ("slash-ish", "a$b"),
-    ] {
-        let units = dir_of(&dir, &format!("units-{label}"), &[(name, "x")]);
-        let got = payload(b"x", std::slice::from_ref(&units), &trust);
-        assert!(
-            matches!(&got, Err(Error::Failed(m)) if m.contains("not a file name")),
-            "{name:?}: {got:?}"
-        );
-    }
-    let units = dir_of(&dir, "units-sub", &[("ok.service", "x")]);
-    std::fs::create_dir(units.join("sub")).expect("sub");
-    let got = payload(b"x", &[units], &trust);
-    assert!(
-        matches!(&got, Err(Error::Failed(m)) if m.contains("not a regular file")),
-        "{got:?}"
+    let four = dir_of(
+        &dir,
+        "four",
+        &[
+            ("gh", "x"),
+            ("installer.conf", "x"),
+            ("trusted_root.jsonl", "x"),
+            ("extra", "x"),
+        ],
     );
-    let got = payload(b"x", &[dir.join("missing")], &trust);
-    assert!(matches!(got, Err(Error::Spawn { .. })), "{got:?}");
+    refused(
+        "four",
+        pkg::Sources {
+            trust: &four,
+            ..i.sources()
+        },
+        "extra",
+    );
+    let two = dir_of(&dir, "two", &[("gh", "x"), ("installer.conf", "x")]);
+    refused(
+        "two",
+        pkg::Sources {
+            trust: &two,
+            ..i.sources()
+        },
+        "trusted_root.jsonl is missing",
+    );
+    let sub = dir_of(&dir, "sub", &[("kbf-a.service", "x")]);
+    std::fs::create_dir(sub.join("dir")).expect("sub");
+    refused(
+        "subdir",
+        pkg::Sources {
+            units: &sub,
+            ..i.sources()
+        },
+        "not a regular file",
+    );
+    let missing = dir.join("missing");
+    refused(
+        "no binary",
+        pkg::Sources {
+            binary: &missing,
+            ..i.sources()
+        },
+        "missing",
+    );
 }
 
 fn good_files() -> Vec<File> {
     vec![
         File {
-            path: BINARY_PATH.to_owned(),
+            path: "usr/bin/kbf-installer".to_owned(),
             mode: 0o755,
             bytes: b"bin".to_vec(),
         },
         File {
-            path: format!("{UNIT_DIR}/a.service"),
+            path: "usr/lib/systemd/system/a.service".to_owned(),
             mode: 0o644,
             bytes: b"unit".to_vec(),
         },
@@ -210,7 +319,7 @@ fn check_tarball_names_each_way_a_tarball_differs_from_its_files() {
     // Catches: a read-back that cannot fail. One defect per case; each must be named.
     let files = good_files();
     let reg = tar::EntryType::Regular;
-    let bin = (BINARY_PATH, reg, 0o755, 0, &b"bin"[..]);
+    let bin = ("usr/bin/kbf-installer", reg, 0o755, 0, &b"bin"[..]);
     let unit = (
         "usr/lib/systemd/system/a.service",
         reg,
@@ -296,8 +405,8 @@ fn check_tarball_names_each_way_a_tarball_differs_from_its_files() {
 }
 
 fn run_verb(dir: &Path, platform: Platform, commit: &str) -> Result<Vec<String>, Error> {
-    let (binary, units, trust) = inputs(dir);
-    installer_tarball(&binary, platform, commit, &units, &trust, &dir.join("out"))
+    let t = inputs(dir);
+    installer_tarball(platform, commit, &t.sources(), &dir.join("out"))
 }
 
 #[test]

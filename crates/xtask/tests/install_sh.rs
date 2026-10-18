@@ -6,7 +6,10 @@
 //! The installer in the payload is the STUB (`xtask-fake`, which only has to be an
 //! executable with known bytes). The real `kbf-installer` is W3's; the one place that
 //! names the stub is [`installer_binary`], so swapping the real binary in is that path.
-//! The unit and trust files are stubs too until the packaging/linux/units files land.
+//! The unit, trust, sysusers.d and tmpfiles.d files are stubs too (the real ones are
+//! checked against the package's list in `installer_tarball/tests.rs`). The host's
+//! `systemd-sysusers` and `systemd-tmpfiles` are the fakes of `xtask-fake`, which log
+//! their arguments.
 //!
 //! The script is run by its own path, so its mode and its `#!` line are under test too.
 
@@ -26,13 +29,27 @@ const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
 const COMMIT: &str = "c0ffee0123456789c0ffee0123456789c0ffee01";
 const SCRIPT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../packaging/install.sh");
 /// Where the package puts things, and so the payload.
-const PAYLOAD: [&str; 5] = [
+const PAYLOAD: [&str; 9] = [
     "usr/bin/kbf-installer",
     "usr/lib/systemd/system/kbf-frontend@.service",
     "usr/lib/systemd/system/kbf-installer.service",
+    "usr/lib/systemd/system/kbf.slice",
+    "usr/lib/sysusers.d/kbf-installer.conf",
+    "usr/lib/tmpfiles.d/kbf-installer.conf",
+    "usr/share/kbf-installer/trust/gh",
     "usr/share/kbf-installer/trust/installer.conf",
     "usr/share/kbf-installer/trust/trusted_root.jsonl",
 ];
+
+/// The mode the deb gives `path`: the installer and the pinned `gh` execute, the rest
+/// are 0644.
+fn package_mode(path: &str) -> u32 {
+    if path == PAYLOAD[0] || path == "usr/share/kbf-installer/trust/gh" {
+        0o755
+    } else {
+        0o644
+    }
+}
 
 /// The installer the payload holds: the stub today.
 fn installer_binary() -> &'static str {
@@ -79,11 +96,17 @@ fn release() -> &'static Release {
         for (d, name) in [
             (&units, "kbf-installer.service"),
             (&units, "kbf-frontend@.service"),
+            (&units, "kbf.slice"),
+            (&trust, "gh"),
             (&trust, "installer.conf"),
             (&trust, "trusted_root.jsonl"),
         ] {
             std::fs::write(d.join(name), format!("stub {name}\n")).expect("stub file");
         }
+        let sysusers = dir.join("sysusers.conf");
+        let tmpfiles = dir.join("tmpfiles.conf");
+        std::fs::write(&sysusers, "stub sysusers\n").expect("sysusers");
+        std::fs::write(&tmpfiles, "stub tmpfiles\n").expect("tmpfiles");
         let out = dir.join("out");
         for p in [Platform::LinuxX86_64, Platform::LinuxArm64] {
             xtask(&[
@@ -98,6 +121,10 @@ fn release() -> &'static Release {
                 utf8(&units),
                 "--trust",
                 utf8(&trust),
+                "--sysusers",
+                utf8(&sysusers),
+                "--tmpfiles",
+                utf8(&tmpfiles),
                 "--out",
                 utf8(&out),
             ]);
@@ -195,6 +222,8 @@ struct Run {
     leftovers: Vec<String>,
     /// The `--root` the script was given.
     root: PathBuf,
+    /// The lines the fake `systemd-sysusers` and `systemd-tmpfiles` logged.
+    systemd: Vec<String>,
 }
 
 /// Every path under `dir` with its mode, directories with a trailing `/`.
@@ -243,15 +272,40 @@ impl Run {
 
 /// Runs the script against `files` with `--root` an empty directory of its own, after
 /// `--release-url` and with `args` next; `extra_path` (a directory) first on PATH when
-/// given; `umask` for the script's caller.
+/// given, then a directory of the fake systemd tools, then the real PATH.
 fn run_in(name: &str, files: Release, args: &[&str], extra_path: Option<&Path>, root: bool) -> Run {
     let dir = scratch(name);
+    let path = path_with_fake_systemd(&dir);
+    run_with_path(&dir, files, args, extra_path, root, path)
+}
+
+/// PATH with `dir/fakes` first, holding the fake `systemd-sysusers` and `systemd-tmpfiles`.
+fn path_with_fake_systemd(dir: &Path) -> std::ffi::OsString {
+    let fakes = dir.join("fakes");
+    std::fs::create_dir_all(&fakes).expect("fakes");
+    for tool in ["systemd-sysusers", "systemd-tmpfiles"] {
+        std::fs::copy(FAKE, fakes.join(tool)).expect("fake systemd tool");
+    }
+    let mut path = fakes.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    path
+}
+
+/// [`run_in`] with the whole PATH given (before `extra_path`).
+fn run_with_path(
+    dir: &Path,
+    files: Release,
+    args: &[&str],
+    extra_path: Option<&Path>,
+    root: bool,
+    mut path: std::ffi::OsString,
+) -> Run {
     let tmp = dir.join("tmp");
     let root_dir = dir.join("root");
     std::fs::create_dir_all(&tmp).expect("tmp");
     std::fs::create_dir_all(&root_dir).expect("root");
     let (url, seen) = serve(files);
-    let mut path = std::env::var_os("PATH").unwrap_or_default();
     if let Some(p) = extra_path {
         let mut joined = p.as_os_str().to_owned();
         joined.push(":");
@@ -282,6 +336,11 @@ fn run_in(name: &str, files: Release, args: &[&str], extra_path: Option<&Path>, 
         requests,
         leftovers,
         root: root_dir,
+        systemd: std::fs::read_to_string(dir.join("fakes/systemd-args"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect(),
     }
 }
 
@@ -313,8 +372,8 @@ fn with_tarball(p: Platform, tgz: Vec<u8>) -> Release {
 #[test]
 fn the_host_payload_is_placed_where_the_package_puts_it_and_nothing_else() {
     // Catches: a script that picks the wrong platform's payload, places a file at
-    // another path or mode than the .deb (binary 0755, units and trust files 0644,
-    // directories made 0755), places a file the payload does not have, enables or
+    // another path or mode than the .deb (binary and pinned gh 0755, units, data
+    // files, sysusers.d and tmpfiles.d 0644, directories made 0755), places a file the payload does not have, enables or
     // starts a unit, or leaves its temporary directory behind.
     let Some(p) = host() else {
         // A host that is no platform of ours is refused (the detection's other arm).
@@ -334,6 +393,8 @@ fn the_host_payload_is_placed_where_the_package_puts_it_and_nothing_else() {
         "usr/lib/",
         "usr/lib/systemd/",
         "usr/lib/systemd/system/",
+        "usr/lib/sysusers.d/",
+        "usr/lib/tmpfiles.d/",
         "usr/share/",
         "usr/share/kbf-installer/",
         "usr/share/kbf-installer/trust/",
@@ -341,7 +402,7 @@ fn the_host_payload_is_placed_where_the_package_puts_it_and_nothing_else() {
         want.insert(dir.to_owned(), 0o755);
     }
     for f in PAYLOAD {
-        want.insert(f.to_owned(), if f == PAYLOAD[0] { 0o755 } else { 0o644 });
+        want.insert(f.to_owned(), package_mode(f));
     }
     assert_eq!(tree(&r.root), want);
     assert_eq!(
@@ -358,6 +419,86 @@ fn the_host_payload_is_placed_where_the_package_puts_it_and_nothing_else() {
         r.stdout
     );
     assert_eq!(r.leftovers, Vec::<String>::new(), "temporary files left");
+}
+
+#[test]
+fn the_users_and_directories_are_made_from_the_placed_files_only_and_after_placing() {
+    // Catches: a script that does not apply the two systemd files (a host with units
+    // but no `kbf-fetch` user), applies them to anything else, runs them before the
+    // files exist (the fakes log what the root held at the time), or loses `--root`.
+    let Some(_) = host() else { return };
+    let r = good("systemd-calls", &[]);
+    assert_eq!(r.code, Some(0), "stderr: {}", r.stderr);
+    let root = r.root.display();
+    assert_eq!(
+        r.systemd,
+        [
+            format!("systemd-sysusers --root={root} {root}/usr/lib/sysusers.d/kbf-installer.conf"),
+            format!(
+                "systemd-tmpfiles --root={root} --create {root}/usr/lib/tmpfiles.d/kbf-installer.conf"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_host_without_systemd_tools_is_refused_before_anything_is_placed() {
+    // Catches: placing units on a host that cannot make their users (the services would
+    // fail at start with "no such user"). PATH is a directory of links to the tools the
+    // script needs and none of systemd's.
+    let Some(_) = host() else { return };
+    let dir = scratch("no-systemd");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("bin");
+    let real = std::env::var_os("PATH").unwrap_or_default();
+    for tool in [
+        "curl",
+        "tar",
+        "sha256sum",
+        "mktemp",
+        "uname",
+        "id",
+        "rm",
+        "cat",
+    ] {
+        let found = std::env::split_paths(&real)
+            .map(|d| d.join(tool))
+            .find(|p| p.exists())
+            .unwrap_or_else(|| panic!("{tool} is not on PATH"));
+        std::os::unix::fs::symlink(found, bin.join(tool)).expect("link");
+    }
+    let r = run_with_path(
+        &dir,
+        release().clone(),
+        &[],
+        None,
+        true,
+        bin.into_os_string(),
+    );
+    r.assert_refused("systemd-sysusers is not installed");
+    assert_eq!(r.requests, Vec::<String>::new());
+}
+
+#[test]
+fn a_failing_systemd_tool_fails_the_install() {
+    // Catches: a script that ignores the exit status of the user and directory step
+    // and prints "placed" over a host whose users were not made.
+    let Some(_) = host() else { return };
+    let dir = scratch("fake-defect");
+    let (url, _) = serve(release().clone());
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).expect("root");
+    let out = Command::new(SCRIPT)
+        .env("XTASK_FAKE_DEFECT", "systemd-fails")
+        .env("PATH", path_with_fake_systemd(&dir))
+        .args(["--release-url", &url, "--root"])
+        .arg(&root)
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("install.sh: systemd-sysusers failed"), "{err}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("placed"));
 }
 
 #[test]
@@ -391,10 +532,10 @@ fn a_restrictive_umask_does_not_narrow_the_directories_it_makes() {
     rustix::process::umask(before);
     assert_eq!(r.code, Some(0), "stderr: {}", r.stderr);
     for (path, mode) in tree(&r.root) {
-        let want = if path == PAYLOAD[0] || path.ends_with('/') {
+        let want = if path.ends_with('/') {
             0o755
         } else {
-            0o644
+            package_mode(&path)
         };
         assert_eq!(mode, want, "{path}");
     }
@@ -414,6 +555,7 @@ fn an_upgrade_replaces_the_files_and_leaves_the_directories_alone() {
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o750)).expect("chmod");
     let (url, _) = serve(release().clone());
     let out = Command::new(SCRIPT)
+        .env("PATH", path_with_fake_systemd(&dir))
         .args(["--release-url", &url, "--root"])
         .arg(&root)
         .output()
@@ -615,7 +757,7 @@ fn a_payload_with_a_file_outside_the_packages_paths_is_refused_and_places_nothin
     let p = other_than_host();
     let reg = tar::EntryType::Regular;
     let good = (PAYLOAD[0], reg, &b"x"[..]);
-    let cases: [(&str, Vec<Entry>, &str); 8] = [
+    let cases: [(&str, Vec<Entry>, &str); 14] = [
         (
             "dotdot",
             vec![good, ("../escape", reg, b"x")],
@@ -651,7 +793,7 @@ fn a_payload_with_a_file_outside_the_packages_paths_is_refused_and_places_nothin
             vec![
                 good,
                 (
-                    "usr/lib/systemd/system/a.service",
+                    "usr/lib/systemd/system/kbf-a.service",
                     tar::EntryType::Symlink,
                     b"",
                 ),
@@ -668,7 +810,40 @@ fn a_payload_with_a_file_outside_the_packages_paths_is_refused_and_places_nothin
                     b"",
                 ),
             ],
-            "not a regular file",
+            "which the package does not",
+        ),
+        (
+            "other-unit",
+            vec![good, ("usr/lib/systemd/system/evil.service", reg, b"x")],
+            "which the package does not",
+        ),
+        (
+            "timer",
+            vec![good, ("usr/lib/systemd/system/kbf-a.timer", reg, b"x")],
+            "which the package does not",
+        ),
+        (
+            "nested-unit",
+            vec![
+                good,
+                ("usr/lib/systemd/system/kbf-sub/a.service", reg, b"x"),
+            ],
+            "which the package does not",
+        ),
+        (
+            "fourth-trust-file",
+            vec![good, ("usr/share/kbf-installer/trust/extra", reg, b"x")],
+            "which the package does not",
+        ),
+        (
+            "other-sysusers",
+            vec![good, ("usr/lib/sysusers.d/evil.conf", reg, b"x")],
+            "which the package does not",
+        ),
+        (
+            "other-tmpfiles",
+            vec![good, ("usr/lib/tmpfiles.d/evil.conf", reg, b"x")],
+            "which the package does not",
         ),
     ];
     for (label, entries, why) in cases {
