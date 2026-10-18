@@ -181,7 +181,7 @@ impl Frontend {
         Frontend { cfg, envoy, probe }
     }
 
-    fn units<E: Exec>(exec: &E) -> Result<Units, FrontendError> {
+    fn units<E: Exec>(exec: &E) -> io::Result<Units> {
         let a = units::state(exec, Instance::A)?;
         let b = units::state(exec, Instance::B)?;
         Ok(match (a, b) {
@@ -241,10 +241,7 @@ impl Frontend {
                     "neither instance runs, so there is nothing to hand over from",
                 ));
             }
-            Err(FrontendError::Io(e)) => {
-                return Ok(refused("units", format!("cannot read the units: {e}")));
-            }
-            Err(e) => return Err(e),
+            Err(e) => return Ok(refused("units", format!("cannot read the units: {e}"))),
         };
         if let Some(hint) = file.serving_instance
             && hint != serving
@@ -261,17 +258,18 @@ impl Frontend {
         if let Err(why) = self.envoy.check() {
             return Ok(refused(ENVOY_RANGE, why));
         }
-        let serving_slot = read_slot(exec, serving)?;
+        let idle = serving.other();
+        let serving_slot = match slot(exec, serving) {
+            Ok(target) => target,
+            Err(why) => return Ok(refused("slot", why)),
+        };
+        let prior_slot = match slot(exec, idle) {
+            Ok(target) => target,
+            Err(why) => return Ok(refused("slot", why)),
+        };
         if serving_slot.as_deref() == Some(slot_text(&order.commit).as_str()) {
             return Ok(Begun::AlreadyRunning);
         }
-        let idle = serving.other();
-        let Some(prior_slot) = read_slot_checked(exec, idle) else {
-            return Ok(refused(
-                "slot",
-                format!("slots/{} is there and is not a link", idle.name()),
-            ));
-        };
         let got = match fetcher.fetch(&ReleaseLocator {
             commit: order.commit.clone(),
             components: order.components.clone(),
@@ -375,7 +373,10 @@ impl Frontend {
         match p.phase.clone() {
             Phase::Confirming { looks } => self.confirming(exec, host, file, p, looks, now, out),
             Phase::Flipping => self.flip(exec, host, file, &p, out),
-            Phase::Reverting { .. } => self.reverting(exec, host, file, p, now),
+            Phase::Reverting {
+                deadline,
+                old_started,
+            } => self.reverting(exec, host, file, p, (deadline, old_started), now),
             Phase::NeedsOperator { reason } => Ok(Progress::NeedsOperator(reason)),
         }
     }
@@ -440,12 +441,13 @@ impl Frontend {
             let lock = Locked::acquire(host)?;
             let state = lock.read()?.unwrap_or_default();
             if state.current.as_ref() != Some(&p.commit) {
-                lock.write(&crate::state::State {
+                let next = crate::state::State {
                     previous: state.current.clone(),
                     current: Some(p.commit.clone()),
                     staged: state.staged.clone().filter(|c| *c != p.commit),
                     ..state
-                })?;
+                };
+                lock.write(&next)?;
             }
         }
         activate::reconcile(exec, host, out)?;
@@ -464,14 +466,15 @@ impl Frontend {
         now: u64,
         why: &str,
     ) -> Result<Progress, FrontendError> {
+        let bound = (now + self.cfg.revert_bound_s, false);
         p.phase = Phase::Reverting {
-            deadline: now + self.cfg.revert_bound_s,
-            old_started: false,
+            deadline: bound.0,
+            old_started: bound.1,
         };
         why.clone_into(&mut p.why);
         file.frontend_pending = Some(p.clone());
         pending::save(exec, host, &file)?;
-        self.reverting(exec, host, file, p, now)
+        self.reverting(exec, host, file, p, bound, now)
     }
 
     /// One step back, from what the units show: stop the new instance; then the old one is
@@ -483,15 +486,9 @@ impl Frontend {
         host: &Layout,
         file: FrontendFile,
         p: FrontendPending,
+        (deadline, old_started): (u64, bool),
         now: u64,
     ) -> Result<Progress, FrontendError> {
-        let Phase::Reverting {
-            deadline,
-            old_started,
-        } = p.phase
-        else {
-            unreachable!("only a reverting update is stepped back")
-        };
         let waiting = Progress::Waiting;
         let Ok(new) = units::state(exec, p.idle) else {
             return Ok(waiting);
@@ -589,23 +586,16 @@ impl Frontend {
     }
 }
 
-/// The text of the link `slots/<instance>`; `None` when it has none.
-fn read_slot<E: Exec>(exec: &E, instance: Instance) -> io::Result<Option<String>> {
-    Ok(match exec.inspect(&layout::slot_link(instance.name()))? {
-        Some(kbf_host::Entry::Link { target }) => Some(target.to_string_lossy().into_owned()),
-        _ => None,
-    })
-}
-
-/// The text of the link `slots/<instance>`: `Some(None)` when there is no link, `None` when
-/// something else is there.
-fn read_slot_checked<E: Exec>(exec: &E, instance: Instance) -> Option<Option<String>> {
-    match exec.inspect(&layout::slot_link(instance.name())) {
-        Ok(None) => Some(None),
+/// The text of the link `slots/<instance>`: `Ok(None)` when there is no link, and why not
+/// when something else is there or it cannot be read.
+fn slot<E: Exec>(exec: &E, instance: Instance) -> Result<Option<String>, String> {
+    let name = instance.name();
+    match exec.inspect(&layout::slot_link(name)) {
+        Ok(None) => Ok(None),
         Ok(Some(kbf_host::Entry::Link { target })) => {
-            Some(Some(target.to_string_lossy().into_owned()))
+            Ok(Some(target.to_string_lossy().into_owned()))
         }
-        _ => None,
+        Ok(Some(_)) | Err(_) => Err(format!("slots/{name} is not a link that can be read")),
     }
 }
 

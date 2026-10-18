@@ -13,7 +13,6 @@ use std::io::Write;
 
 use crate::CommitId;
 use crate::activate::{self, Activated, Arm, Confirmed, Expiry};
-use crate::frontend::pending::{self, FileError};
 use crate::frontend::{Begun, Frontend, FrontendError, Progress};
 use crate::layout::{Layout, Platform};
 use crate::release::ReleaseError;
@@ -59,12 +58,6 @@ pub enum HelperError {
     Frontend(#[from] FrontendError),
 }
 
-impl From<FileError> for HelperError {
-    fn from(e: FileError) -> HelperError {
-        HelperError::Frontend(e.into())
-    }
-}
-
 /// A host's helper: its layout, how it is changed, and its flags.
 pub struct Helper<E: Exec> {
     host: Layout,
@@ -78,6 +71,10 @@ pub struct Helper<E: Exec> {
     leases: Box<dyn LeaseSource>,
     /// The frontend's update, when this host was set up for one.
     frontend: Option<Frontend>,
+    /// A frontend update is in flight: read at the start of every pass, before any order is
+    /// acted on, and set when this pass begins one. A node `activate` waits for it (the
+    /// update's flip moves `current`).
+    frontend_in_flight: bool,
 }
 
 fn memory_path(host: &Layout) -> HostPath {
@@ -102,6 +99,7 @@ impl<E: Exec> Helper<E> {
             fetcher,
             leases,
             frontend: None,
+            frontend_in_flight: false,
         }
     }
 
@@ -346,10 +344,8 @@ impl<E: Exec> Helper<E> {
                     // The same epoch and an id not above the last: a replay, dropped silently.
                 } else {
                     self.act(&o, now, memory)?;
-                    // A frontend update refused because this host has no frontend set up
-                    // is not taken: like any refusal of a record by the reader, it moves no
-                    // floor, so the next real order still runs.
-                    if o.verb != Verb::FrontendUpdate || self.frontend.is_some() {
+                    // (see `moves_floor` for the one order that does not)
+                    if moves_floor(o.verb, self.frontend.is_some()) {
                         memory.acknowledge(kind, o.epoch, o.id);
                     }
                 }
@@ -435,15 +431,7 @@ impl<E: Exec> Helper<E> {
             ));
         }
         // A frontend update moves `current` when it is confirmed: not while one is in flight.
-        match pending::load(&self.host) {
-            Ok(file) if file.frontend_pending.is_none() => {}
-            Ok(_) => {
-                return Err(format!(
-                    "order {id}: a frontend update is in flight; not activating"
-                ));
-            }
-            Err(e) => return Err(format!("order {id}: {e}")),
-        }
+        node_waits_for_frontend(self.frontend_in_flight, id)?;
         // One confirm window at a time, never two timers. The same order again (a pass
         // that died after the swap) is the repeat `activate` recognises.
         let this = format!("{}-{}", order.epoch, order.id);
@@ -566,6 +554,7 @@ impl<E: Exec> Helper<E> {
         match frontend.begin(&mut self.exec, &self.host, &*self.fetcher, order, now)? {
             Begun::Refused(why) => refuse(memory, &why),
             Begun::Started => {
+                self.frontend_in_flight = true;
                 memory.event = Event::Idle;
                 memory.refusal = String::new();
             }
@@ -583,7 +572,10 @@ impl<E: Exec> Helper<E> {
             return Ok(());
         };
         let before = memory.clone();
-        match frontend.advance(&mut self.exec, &self.host, now, &mut self.log)? {
+        let progress = frontend.advance(&mut self.exec, &self.host, now, &mut self.log)?;
+        self.frontend_in_flight =
+            matches!(progress, Progress::Waiting | Progress::NeedsOperator(_));
+        match progress {
             Progress::Idle | Progress::Waiting => return Ok(()),
             Progress::Confirmed(_) => {
                 memory.event = Event::Confirmed;
@@ -604,7 +596,7 @@ impl<E: Exec> Helper<E> {
 
     fn report(&mut self, memory: &Memory) -> Result<(), HelperError> {
         let mut memory = memory.clone();
-        memory.frontend_pending = pending::load(&self.host)?.frontend_pending.is_some();
+        memory.frontend_pending = self.frontend_in_flight;
         let memory = &memory;
         let bytes = status::render(&self.state()?, memory);
         if bytes == self.written {
@@ -645,6 +637,25 @@ impl Done {
             note: String::new(),
             restart: false,
         }
+    }
+}
+
+/// Whether acting on an order of `verb` moves its kind's floor. All do, but a frontend update
+/// on an installer with no frontend set up: refused like any record the reader does not take,
+/// it moves no floor, so the next real order still runs.
+fn moves_floor(verb: Verb, frontend_set_up: bool) -> bool {
+    verb != Verb::FrontendUpdate || frontend_set_up
+}
+
+/// A node `activate` waits while a frontend update is in flight: the update's flip moves
+/// `current`.
+fn node_waits_for_frontend(in_flight: bool, id: u64) -> Result<(), String> {
+    if in_flight {
+        Err(format!(
+            "order {id}: a frontend update is in flight; not activating"
+        ))
+    } else {
+        Ok(())
     }
 }
 

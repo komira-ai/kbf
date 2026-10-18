@@ -30,7 +30,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Verb {
     /// Poll the order spool and act on it, until stopped.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Run before each start of the service: count the start of a release on trial, and
     /// revert one that has used its starts. Exits 0 unless the host's state is unreadable.
     BootCheck(BootArgs),
@@ -177,7 +177,7 @@ fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), String> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.verb {
-        Verb::Run(args) => run(cli.root, args),
+        Verb::Run(args) => run(cli.root, *args),
         Verb::BootCheck(args) => boot_check(cli.root, &args),
     };
     match result {

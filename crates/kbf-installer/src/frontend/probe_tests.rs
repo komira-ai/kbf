@@ -11,7 +11,7 @@ fn url() -> HttpUrl {
 /// Catches readiness decided by anything but a 2xx answer: 200 and 204 are ready; a 503
 /// (up and not ready), a redirect, and a connection that fails are not.
 ///
-/// MUTANT-TODO: `status != 503` (a refused connection, or a 404, read as ready).
+/// Mutant planted: `status != 503` (a refused connection, or a 404, read as ready).
 #[test]
 fn only_a_2xx_answer_is_ready() {
     let mut exec = FakeExec::new(0);
@@ -43,6 +43,8 @@ const JSON: &str = "{\"commit\":\"0123456789ab\",\"handover_protocol\":1,\"min_p
 /// Catches the binary being run as root or with the caller's environment, or without its
 /// time bound: it is `--version --json` by absolute path, as the unprivileged user, in `/`,
 /// with an empty environment and ten seconds; and what it reports is read as the protocol.
+///
+/// Mutant planted: no `run_as` (the probe would run as root).
 #[test]
 fn the_binary_is_run_unprivileged_with_an_empty_environment_and_names_its_protocol() {
     let p = probe(|_| Ok(ran(0, JSON, "")));
@@ -63,7 +65,7 @@ fn the_binary_is_run_unprivileged_with_an_empty_environment_and_names_its_protoc
 /// identity with no `handover_protocol` (a release from before it was reported) is an error,
 /// so the update is refused before anything starts.
 ///
-/// MUTANT-TODO: a missing field defaulted to the current protocol.
+/// Mutant planted: a non-zero exit accepted.
 #[test]
 fn a_binary_that_cannot_name_its_protocol_is_an_error() {
     let old = JSON.replace("\"handover_protocol\":1,", "");
@@ -92,7 +94,7 @@ fn a_binary_that_cannot_name_its_protocol_is_an_error() {
 /// address is taken (IPv4 or IPv6), and a name, another address, a missing port or `https`
 /// is refused with the text it was given.
 ///
-/// MUTANT-TODO: the loopback test dropped.
+/// Mutant planted: the loopback test dropped.
 #[test]
 fn a_readiness_url_must_be_numeric_loopback() {
     for ok in [

@@ -45,9 +45,8 @@ fn run(w: &World, kill_at: usize, before: &dyn Fn(&World, u64)) -> usize {
 /// old instance is never stopped or started, the node's service is never restarted, and
 /// the end is the one an unkilled run reaches.
 ///
-/// Mutants planted: the pending record written after the slot moved (a kill between them
-/// leaves a slot nobody remembers); the flip's link move before the state write; the
-/// record's removal before the acknowledgement.
+/// (The pending record written after the slot moved is caught by the cold-revert test
+/// below, where the slot it restores is wrong.)
 #[test]
 fn a_kill_at_any_step_of_an_update_still_ends_with_it_kept_once() {
     let total = run(&World::new("crash-happy-count", A_), 0, &|_, _| {});
@@ -85,8 +84,8 @@ fn a_kill_at_any_step_of_an_update_still_ends_with_it_kept_once() {
 /// back on its prior release and the record is gone. When `b` was never started (the kill
 /// came first) `a` was never asked to stop.
 ///
-/// Mutants planted: `a` restarted before `b` is down; the slot restored before `a` is
-/// ready; the revert phase written after the stop of `b`.
+/// Mutant planted: the pending record written after the slot moved (a kill between the two
+/// leaves a slot nobody remembers, so the revert puts back the wrong release).
 #[test]
 fn a_kill_at_any_step_of_a_cold_revert_still_brings_the_old_instance_back() {
     // `b` dies the first time it is seen running, whichever pass that is.

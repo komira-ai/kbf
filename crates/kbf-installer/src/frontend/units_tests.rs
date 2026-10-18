@@ -12,7 +12,7 @@ fn said(word: &'static str) -> FakeExec {
 /// one this does not know) is a unit in motion, which is never started over or counted as
 /// stopped.
 ///
-/// MUTANT-TODO: `failed` read as changing (a crashed instance could never be started).
+/// Mutant planted: `failed` read as changing (a crashed instance could never be started).
 #[test]
 fn an_active_state_word_is_read_as_running_stopped_or_changing() {
     for (word, want) in [
@@ -64,7 +64,7 @@ fn the_state_is_asked_of_the_instances_own_unit_and_a_failing_tool_is_an_error()
 /// without `--no-block` the installer would sit as long as a build runs), a start that
 /// names no unit, and a unit that is not the instance's.
 ///
-/// MUTANT-TODO: `--no-block` dropped.
+/// Mutant planted: `--no-block` dropped.
 #[test]
 fn start_waits_for_ready_and_stop_never_blocks() {
     let mut exec = FakeExec::new(0);
@@ -103,8 +103,8 @@ fn the_two_instances_are_each_others_other() {
 /// `Conflicts=` between the instances (starting one must never stop the other), and a
 /// command line `kbf` refuses is not retried.
 ///
-/// MUTANT-TODO: `slots/%i` replaced by `current`; `Conflicts=kbf-frontend@%i.service`
-/// added; `TimeoutStopSec=90`.
+/// Mutants planted: `slots/%i` replaced by `releases/current`;
+/// `Conflicts=kbf-frontend@%i.service` added; `TimeoutStopSec=90`.
 #[test]
 fn the_unit_runs_each_instance_through_its_own_slot_and_never_follows_current() {
     // What the unit says, not what its comments say about what it does not.

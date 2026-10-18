@@ -59,8 +59,8 @@ pub struct Sim {
     /// Starting an instance ready makes the other stand down: still `active`, not ready,
     /// as a holder that handed over is.
     pub stands_down: bool,
-    /// `systemctl show` fails (the bus is unreachable).
-    pub unreadable: bool,
+    /// `systemctl show` of the instance fails (the bus is unreachable).
+    pub unreadable: [bool; 2],
     /// Every command, as `systemctl` words, so a test can see that nothing else ran.
     pub other_runs: Vec<String>,
 }
@@ -90,7 +90,7 @@ impl Sim {
             start: [Start::Ready; 2],
             stop_hangs: [false; 2],
             stands_down: true,
-            unreadable: false,
+            unreadable: [false; 2],
             other_runs: Vec::new(),
         };
         sim.units[at(serving)] = Unit {
@@ -188,11 +188,9 @@ impl Exec for SimExec {
     fn query(&self, cmd: &Cmd) -> io::Result<Output> {
         // `systemctl show --property=ActiveState --value -- <unit>`
         let unit = cmd.args.last().map(String::as_str).unwrap_or_default();
-        let Some(i) = instance_of(unit) else {
-            return Ok(reply(1, "", "no such unit"));
-        };
+        let i = instance_of(unit).expect("a frontend unit");
         let mut sim = self.sim.borrow_mut();
-        if sim.unreadable {
+        if sim.unreadable[at(i)] {
             return Ok(reply(1, "", "no bus"));
         }
         let state = sim.unit(i).state;
@@ -200,20 +198,18 @@ impl Exec for SimExec {
     }
 
     fn http_status(&self, url: &HttpUrl) -> io::Result<u16> {
-        let i = match url.port() {
-            PORT_A => Instance::A,
-            PORT_B => Instance::B,
-            _ => return Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
-        };
-        let mut sim = self.sim.borrow_mut();
-        let unit = sim.unit(i);
-        if unit.state == "active" && unit.ready {
-            Ok(200)
-        } else if unit.state == "active" {
-            Ok(503)
+        let i = if url.port() == PORT_A {
+            Instance::A
         } else {
-            Err(io::Error::from(io::ErrorKind::ConnectionRefused))
-        }
+            Instance::B
+        };
+        // What the instance's own `/readyz` says: only a running one answers, and the model
+        // keeps `ready` false for one that is not.
+        Ok(if self.sim.borrow_mut().unit(i).ready {
+            200
+        } else {
+            503
+        })
     }
 
     fn apply(&mut self, step: &Step) -> io::Result<()> {
@@ -342,7 +338,7 @@ pub const UPDATE: &str = "var/lib/kbf-installer";
 
 impl World {
     pub fn new(name: &str, serving: Instance) -> World {
-        let mut host = ScratchHost::new(&format!("frontend-{name}"));
+        let host = ScratchHost::new(&format!("frontend-{name}"));
         let root = host.root.clone();
         for sub in [
             "run",
@@ -361,7 +357,6 @@ impl World {
         let to_a = format!("../releases/{A}");
         std::os::unix::fs::symlink(&to_a, slots.join(serving.name())).expect("slot");
         std::os::unix::fs::symlink(&to_a, slots.join(serving.other().name())).expect("slot");
-        host.answer = Box::new(|_| Ok(reply(0, "", "")));
         let layout = Layout::linux(Root::new(&root).expect("absolute"));
         Locked::acquire(&layout)
             .expect("lock")

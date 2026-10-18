@@ -20,6 +20,14 @@ fn pass(h: &mut crate::helper::cycle::Helper<super::sim::SimExec>, n: u64) {
     h.cycle(T0 + 3 * n).expect("a pass");
 }
 
+/// The host has `commit` staged, as a node's `stage` leaves it.
+fn staged(w: &World, commit: &str) {
+    let lock = crate::state::Locked::acquire(&w.layout).expect("lock");
+    let mut state = lock.read().expect("reads").expect("there");
+    state.staged = Some(c(commit));
+    lock.write(&state).expect("writes");
+}
+
 fn pending(w: &World) -> Option<super::pending::FrontendPending> {
     w.file().frontend_pending
 }
@@ -31,12 +39,12 @@ fn pending(w: &World) -> Option<super::pending::FrontendPending> {
 /// never restarted, `a` is never stopped and its slot never moves.
 ///
 /// Mutants planted: the slot pointed at `current` instead of the new release; `a` stopped at
-/// confirmation; the flip skipped (current stays); the node restart owed for this verb;
-/// `serving_instance` not moved.
+/// confirmation; the flip skipped (current stays); `serving_instance` not moved.
 #[test]
 fn a_frontend_update_starts_the_idle_instance_and_keeps_it_once_the_old_stood_down() {
     let w = World::new("happy", A_);
     let mut h = w.helper();
+    staged(&w, B);
     w.put(&record(5, 1, 1, B));
     pass(&mut h, 0);
 
@@ -75,6 +83,7 @@ fn a_frontend_update_starts_the_idle_instance_and_keeps_it_once_the_old_stood_do
     let state = w.state();
     assert_eq!((state.current, state.previous), (Some(c(B)), Some(c(A))));
     assert_eq!(state.pending_confirm, None);
+    assert_eq!(state.staged, None, "what was staged is now current");
     let file = w.file();
     assert_eq!(file.serving_instance, Some(B_));
     assert_eq!(file.frontend_pending, None);
@@ -110,6 +119,7 @@ fn a_frontend_update_starts_the_idle_instance_and_keeps_it_once_the_old_stood_do
 fn the_looks_must_follow_one_another() {
     let w = World::new("looks", A_);
     let mut h = w.helper();
+    staged(&w, C);
     w.put(&record(5, 1, 1, B));
     pass(&mut h, 0);
     pass(&mut h, 1);
@@ -130,6 +140,11 @@ fn the_looks_must_follow_one_another() {
     assert!(pending(&w).is_some(), "two looks since the flap");
     pass(&mut h, 6);
     assert_eq!(w.file().serving_instance, Some(B_));
+    assert_eq!(
+        w.state().staged,
+        Some(c(C)),
+        "another staged release stays staged"
+    );
 }
 
 /// Catches an update kept while the old instance still serves: the new one is ready for
@@ -137,8 +152,8 @@ fn the_looks_must_follow_one_another() {
 /// update is undone the cheap way: `b` is stopped, its slot restored, and `a` is never
 /// touched (no stop, no start).
 ///
-/// Mutants planted: the stood-down condition dropped (flipped on three looks); `a` stopped
-/// in the revert; the window check dropped (waits for ever).
+/// Mutants planted: the stood-down condition dropped (flipped on three looks); the window
+/// check dropped (waits for ever).
 #[test]
 fn an_update_is_not_kept_while_the_old_instance_serves_and_is_undone_when_the_window_ends() {
     let w = World::new("old-serves", A_);
@@ -176,8 +191,7 @@ fn an_update_is_not_kept_while_the_old_instance_serves_and_is_undone_when_the_wi
 /// serves, so the only change is the slot going back. A slot that did not exist before is
 /// removed, not left pointing at the release that failed. The old instance gets no command.
 ///
-/// Mutants planted: the slot not restored; the slot restored to the new release; a prior
-/// absence restored as a link; `a` stopped.
+/// Mutants planted: the slot restored to the new release; a prior absence not removed.
 #[test]
 fn a_start_that_fails_with_the_old_still_serving_only_puts_the_slot_back() {
     for (name, prior_link) in [("a-prior", true), ("a-none", false)] {
@@ -232,8 +246,7 @@ fn a_new_instance_that_never_answers_is_stopped_and_the_slot_goes_back() {
 /// again, and `serving_instance` stays `a`. `current` never moved.
 ///
 /// Mutants planted: `a` not restarted (the host is left with no frontend); the slot restored
-/// before `a` is ready; `a` started while it is still running; `a` stopped when it already
-/// serves.
+/// before `a` is ready.
 #[test]
 fn a_new_instance_that_dies_after_the_old_stood_down_restarts_the_old_and_waits_for_it() {
     let w = World::new("cold", A_);
@@ -314,8 +327,7 @@ fn an_old_instance_that_is_coming_back_is_waited_for_not_stopped_again() {
 /// a one-shot run is 5. Nothing is killed: the only commands ever asked are start and a
 /// `--no-block` stop.
 ///
-/// Mutants planted: the bound not checked (waits for ever); the record cleared at the bound
-/// (the host believes the update ended); a kill sent.
+/// Mutant planted: the bound not checked (waits for ever).
 #[test]
 fn an_old_instance_that_will_not_stop_needs_an_operator_and_is_never_killed() {
     let w = World::new("needs-operator", A_);
@@ -365,8 +377,7 @@ fn an_old_instance_that_will_not_stop_needs_an_operator_and_is_never_killed() {
 /// exits a third is taken, with `a` now the idle instance and `slots/a` moved to the new
 /// release.
 ///
-/// Mutants planted: the busy check dropped; a refused record kept in the spool (queued);
-/// the idle instance fixed at `b`.
+/// Mutant planted: the busy check dropped (both instances running read as `a` serving).
 #[test]
 fn a_second_update_while_the_old_instance_drains_is_busy_and_not_queued() {
     let w = World::new("busy", A_);
@@ -515,13 +526,27 @@ fn a_refused_update_changes_nothing() {
             "fetch: fetch: down",
         ),
         (
+            "units-unreadable",
+            |w| w.sim.borrow_mut().unreadable = [true; 2],
+            "units: cannot read the units: ",
+        ),
+        (
+            "serving-slot-not-a-link",
+            |w| {
+                let slot = w.root.join("usr/local/kbf/slots/a");
+                fs::remove_file(&slot).expect("rm");
+                fs::write(&slot, b"x").expect("file");
+            },
+            "slot: slots/a is not a link that can be read",
+        ),
+        (
             "slot-not-a-link",
             |w| {
                 let slot = w.root.join("usr/local/kbf/slots/b");
                 fs::remove_file(&slot).expect("rm");
                 fs::write(&slot, b"x").expect("file");
             },
-            "slot: slots/b is there and is not a link",
+            "slot: slots/b is not a link that can be read",
         ),
     ];
     for (name, setup, want) in cases {
@@ -534,7 +559,7 @@ fn a_refused_update_changes_nothing() {
         assert_eq!(w.left(), 0, "{name}");
         assert!(w.asked().is_empty(), "{name}: {:?}", w.asked());
         assert_eq!(pending(&w), None, "{name}");
-        if name != "slot-not-a-link" {
+        if !name.ends_with("not-a-link") {
             assert_eq!(w.slot(B_), Some(to(A)), "{name}");
         }
         assert_eq!(
@@ -661,8 +686,7 @@ fn an_installer_without_a_frontend_refuses_the_record() {
 /// update is in flight a node `activate` is refused (it would move `current` under the
 /// update's flip).
 ///
-/// Mutants planted: the node activation restarting a frontend unit; the in-flight check
-/// dropped from the node path.
+/// Mutant planted: the in-flight check dropped from the node path.
 #[test]
 fn a_node_activation_never_touches_the_frontend_units_and_waits_for_a_frontend_update() {
     let w = World::new("node-vs-frontend", A_);
@@ -775,13 +799,13 @@ fn an_unreadable_unit_is_not_evidence_of_anything() {
     w.put(&record(5, 1, 1, B));
     pass(&mut h, 0);
     let before = pending(&w);
-    w.sim.borrow_mut().unreadable = true;
+    w.sim.borrow_mut().unreadable = [true; 2];
     for n in 1..6 {
         pass(&mut h, n);
     }
     assert_eq!(pending(&w), before);
     assert_eq!(w.asked(), ["start b"]);
-    w.sim.borrow_mut().unreadable = false;
+    w.sim.borrow_mut().unreadable = [false; 2];
     for n in 6..10 {
         pass(&mut h, n);
     }
@@ -818,4 +842,150 @@ fn a_frontend_update_record_reads_as_a_frontend_order() {
     for verb in [Verb::Activate, Verb::Confirm, Verb::Revert] {
         assert_eq!(verb.kind(), Kind::Node);
     }
+}
+
+/// Catches the confirm window being the record's own, unclamped: `window_s` is taken as
+/// asked inside the host's bounds, 0 means the host's flag, and a record asking for less or
+/// more than the bounds (120 s to 1800 s) gets the bound, so a compromised writer cannot ask
+/// for a window of a year or of none.
+///
+/// Mutant planted: the clamp dropped (a window of 5 s and of 100000 s as asked).
+#[test]
+fn the_window_is_the_records_inside_the_hosts_bounds() {
+    for (asked, want) in [(0u32, 600u64), (5, 120), (900, 900), (100_000, 1800)] {
+        let w = World::new(&format!("window-{asked}"), A_);
+        let mut h = w.helper();
+        let mut r = record(5, 1, 1, B);
+        r.window_s = asked;
+        w.put(&r);
+        pass(&mut h, 0);
+        assert_eq!(
+            pending(&w).expect("p").deadline_s,
+            T0 + want,
+            "asked {asked}"
+        );
+    }
+}
+
+/// Catches an Envoy gate that is not there being treated as one that passed: the gate used
+/// until the Envoy check is wired refuses, with a reason that says so.
+#[test]
+fn the_gate_that_is_not_wired_refuses() {
+    use super::EnvoyGate;
+    assert!(
+        super::NotWired
+            .check()
+            .expect_err("refuses")
+            .contains("no Envoy check")
+    );
+}
+
+/// Catches a new instance that is still coming up (`activating`) being counted as ready or
+/// as stopped: it is neither, so the looks stay at zero and the update is neither kept nor
+/// undone until it is up.
+#[test]
+fn a_new_instance_that_is_still_activating_is_waited_for() {
+    let w = World::new("activating", A_);
+    let mut h = w.helper();
+    w.put(&record(5, 1, 1, B));
+    pass(&mut h, 0);
+    *w.sim.borrow_mut().unit(B_) = super::sim::Unit {
+        state: "activating",
+        ready: false,
+    };
+    for n in 1..5 {
+        pass(&mut h, n);
+    }
+    assert_eq!(
+        pending(&w).expect("p").phase,
+        Phase::Confirming { looks: 0 }
+    );
+    assert_eq!(w.asked(), ["start b"]);
+    *w.sim.borrow_mut().unit(B_) = super::sim::Unit {
+        state: "active",
+        ready: true,
+    };
+    for n in 5..9 {
+        pass(&mut h, n);
+    }
+    assert_eq!(w.state().current, Some(c(B)));
+}
+
+/// Catches an old instance that already exited (`inactive`, not only not ready) holding up
+/// the update: a draining instance that closed its last stream inside the window is as
+/// stood down as one that is merely not ready.
+#[test]
+fn an_old_instance_that_exited_inside_the_window_lets_the_update_be_kept() {
+    let w = World::new("old-exited", A_);
+    let mut h = w.helper();
+    w.put(&record(5, 1, 1, B));
+    pass(&mut h, 0);
+    pass(&mut h, 1);
+    w.sim.borrow_mut().exits(A_);
+    pass(&mut h, 2);
+    pass(&mut h, 3);
+    assert_eq!(w.state().current, Some(c(B)));
+    assert_eq!(w.file().serving_instance, Some(B_));
+}
+
+/// Catches an unreadable unit in the middle of a revert being taken for a state: with the
+/// new instance unreadable, then the old, nothing is asked and nothing moves; once systemd
+/// answers the revert carries on and ends with the old instance serving.
+///
+/// Mutant planted: an unreadable old instance read as stopped (it would be started while it
+/// may be running).
+#[test]
+fn a_revert_waits_while_a_unit_cannot_be_read() {
+    let w = World::new("revert-unreadable", A_);
+    let mut h = w.helper();
+    w.put(&record(5, 1, 1, B));
+    pass(&mut h, 0);
+    w.sim.borrow_mut().die(B_);
+    pass(&mut h, 1);
+    assert_eq!(w.asked(), ["start b", "stop a"]);
+    w.sim.borrow_mut().unreadable = [false, true];
+    pass(&mut h, 2);
+    w.sim.borrow_mut().unreadable = [true, false];
+    pass(&mut h, 3);
+    assert_eq!(w.asked(), ["start b", "stop a"], "nothing is asked blind");
+    w.sim.borrow_mut().unreadable = [false; 2];
+    pass(&mut h, 4);
+    pass(&mut h, 5);
+    assert_eq!(pending(&w), None);
+    assert_eq!(w.asked(), ["start b", "stop a", "start a"]);
+}
+
+/// Catches a new instance that will not stop being given up on silently or its old instance
+/// being touched: `b` never answers and will not stop, so the revert waits on it, then needs
+/// an operator at the bound, and `a`, which still serves, gets no command.
+///
+/// Mutant planted: the revert moving on to the old instance while the new one is still
+/// stopping.
+#[test]
+fn a_new_instance_that_will_not_stop_needs_an_operator_and_the_old_is_left_alone() {
+    let w = World::new("new-hangs", A_);
+    {
+        let mut sim = w.sim.borrow_mut();
+        sim.start[1] = Start::NeverReady;
+        sim.stands_down = false;
+        sim.stop_hangs[1] = true;
+    }
+    let mut h = w.helper();
+    w.put(&record(5, 1, 1, B));
+    pass(&mut h, 0);
+    h.cycle(T0 + 601).expect("window over");
+    assert_eq!(w.asked(), ["start b", "stop b"]);
+    for n in 1..50 {
+        h.cycle(T0 + 601 + 3 * n).expect("waiting");
+    }
+    assert!(matches!(
+        pending(&w).expect("p").phase,
+        Phase::Reverting { .. }
+    ));
+    h.cycle(T0 + 601 + 300).expect("at the bound");
+    assert!(matches!(
+        pending(&w).expect("p").phase,
+        Phase::NeedsOperator { .. }
+    ));
+    assert_eq!(w.asked(), ["start b", "stop b"], "a was never touched");
 }
