@@ -1,6 +1,5 @@
 //! The caller check on macOS (S4.3): the connecting process's code signature, found
-//! by its audit token, must satisfy the pinned requirement of the installed `kbf`, the binary a Mac
-//! runs as `kbf daemon`.
+//! by its audit token, must satisfy the pinned `kbf-daemon` requirement.
 //!
 //! The audit token (`LOCAL_PEERTOKEN`) names a process by pid and pid version, so a
 //! later process that reuses the pid is not taken for it. The server identifies the
@@ -61,7 +60,7 @@ impl CallerCheck for CodeSignatureCheck {
         let code = SecCode::copy_guest_with_attribues(None, &attributes, Flags::NONE)
             .map_err(|why| format!("no running code for {caller}: {why}"))?;
         code.check_validity(Flags::NONE, &requirement)
-            .map_err(|why| caller.not_the_installed_binary(why))
+            .map_err(|why| format!("{caller} is not the installed kbf-daemon: {why}"))
     }
 }
 

@@ -51,7 +51,7 @@ pub struct Args {
     /// Where lease users' home folders are made.
     #[arg(long, default_value = "/Users")]
     pub homes: PathBuf,
-    /// The code requirement a caller must satisfy: the installed `kbf`'s, as
+    /// The code requirement a caller must satisfy: the installed `kbf-daemon`'s, as
     /// the installed software set pins it (for example `cdhash H"..."`).
     #[arg(long)]
     pub daemon_requirement: String,

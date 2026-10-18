@@ -1,6 +1,6 @@
 //! The caller of `kbf-mac-session` the root tests run (`tests/as_root.rs`): the test
 //! binary answers as this client when it runs through a signed copy named
-//! [`super::CLIENT`] or [`super::IMPOSTOR`]. It stands in for `kbf`: the helper
+//! [`super::CLIENT`] or [`super::IMPOSTOR`]. It stands in for `kbf-daemon`: the helper
 //! is started with the client copy's cdhash as the daemon requirement.
 //!
 //! The verbs, by the copy's name (`client` below):
