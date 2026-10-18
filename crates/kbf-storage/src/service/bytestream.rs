@@ -24,7 +24,7 @@ impl ByteStream for StorageService {
         &self,
         request: Request<ReadRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
-        self.admission.check(&request, Endpoint::Read)?;
+        self.guard(&request, Endpoint::Read)?;
         self.check_map(generation::requested(&request)?).await?;
         let request = request.into_inner();
         let digest = wire::read_resource(&request.resource_name)?;
@@ -83,7 +83,7 @@ impl ByteStream for StorageService {
         } else {
             Endpoint::Write
         };
-        self.admission.check(&request, endpoint)?;
+        self.guard(&request, endpoint)?;
         let requested = generation::requested(&request)?;
         let stream = request.into_inner();
         let size = self
@@ -97,7 +97,7 @@ impl ByteStream for StorageService {
         &self,
         request: Request<QueryWriteStatusRequest>,
     ) -> Result<Response<QueryWriteStatusResponse>, Status> {
-        self.admission.check(&request, Endpoint::QueryWriteStatus)?;
+        self.guard(&request, Endpoint::QueryWriteStatus)?;
         self.check_map(generation::requested(&request)?).await?;
         let digest = wire::write_resource(&request.into_inner().resource_name)?;
         let complete = self.storage.find_missing(&[digest]).await?.is_empty();

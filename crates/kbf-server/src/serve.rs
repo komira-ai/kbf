@@ -180,6 +180,9 @@ pub enum ServeError {
     /// The storage map could not be read from the state store.
     #[error("storage map: {0}")]
     Map(#[from] MembershipError),
+    /// A frontend that was handing its work to a successor could not stand down.
+    #[error("handover: {0}")]
+    Handover(String),
 }
 
 /// A server that is listening: the addresses it bound, and the future that serves
