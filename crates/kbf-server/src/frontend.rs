@@ -1209,9 +1209,7 @@ fn start_line(
     plain: &[&str],
 ) -> String {
     let api = api.map(|a| format!(" api={a}")).unwrap_or_default();
-    let enroll = enroll
-        .map(|a| format!(" enroll={a}"))
-        .unwrap_or_default();
+    let enroll = enroll.map(|a| format!(" enroll={a}")).unwrap_or_default();
     let warning = if plain.is_empty() {
         String::new()
     } else {

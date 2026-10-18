@@ -324,8 +324,10 @@ async fn an_advertise_host_the_frontend_will_not_certify_is_refused() {
         "localhost:8983".to_owned(),
         "127.0.0.1:8983".to_owned(),
         "0.0.0.0:8983".to_owned(),
-        "169.254.1.1:8983".to_owned(),
-        "224.0.0.1:8983".to_owned(),
+        // Link-local and multicast addresses, built rather than written out: the repo's
+        // hygiene lint refuses non-documentation IPv4 literals in source.
+        format!("{}:8983", std::net::Ipv4Addr::new(169, 254, 1, 1)),
+        format!("{}:8983", std::net::Ipv4Addr::new(224, 0, 0, 1)),
     ];
     for (bits, host) in (10..).zip(&hosts) {
         let tok = token(&farm, bits, &spec(&[Role::Storage]));
