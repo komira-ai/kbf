@@ -8,7 +8,7 @@ use kbf_host::path::HostPath;
 use kbf_host::testkit::FakeExec;
 
 use super::*;
-use crate::fixtures::{COMMIT, FakeRunner, OTHER, elf, file, me, ran, tar_gz, trusted_host};
+use crate::fixtures::{COMMIT, FakeRunner, OTHER, elf, file, me, ran, tar_gz, trusted_host_on};
 use crate::fixtures::{Item, version_json};
 use crate::helper::leases::fake::FakeLeases;
 use crate::run::{Ran, SystemRunner};
@@ -113,11 +113,12 @@ impl Rig {
         let mut settings = Settings::defaults(&host);
         settings.run_as = me();
         settings.arch = Arch::X86_64;
+        let trust = trusted_host_on(host.platform());
         Rig {
             host,
             dir,
             settings,
-            trust: trusted_host(),
+            trust,
             policy: policy(),
             leases: FakeLeases::default(),
         }
@@ -188,7 +189,7 @@ impl Rig {
     }
 
     fn release(&self) -> PathBuf {
-        self.dir.join(format!("usr/local/kbf/releases/{COMMIT}"))
+        self.host.join(&self.host.release_dir(&commit()))
     }
 
     fn work(&self) -> PathBuf {
@@ -860,7 +861,7 @@ fn the_files_fetched_must_be_the_components_ordered() {
 #[test]
 fn an_untrusted_gh_ends_the_stage_first() {
     let mut rig = Rig::new("trust");
-    let gh = HostPath::new(layout::GH).expect("path");
+    let gh = HostPath::new(crate::fixtures::GH_PATH).expect("path");
     if let Some(kbf_host::exec::Entry::File { perms, .. }) = rig.trust.entries.get_mut(&gh) {
         *perms = kbf_host::step::Perms::new(0o775);
     }

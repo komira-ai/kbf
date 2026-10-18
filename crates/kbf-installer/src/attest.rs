@@ -31,7 +31,7 @@ use kbf_host::exec::{Exec, Kind};
 use kbf_host::path::{HostPath, Root};
 
 use crate::CommitId;
-use crate::layout::{self, Layout};
+use crate::layout::Layout;
 use crate::refusal::{Refusal, WHAT_GH};
 use crate::run::{Ran, RunAs, Runner, Spawn};
 use crate::settings::Settings;
@@ -119,8 +119,8 @@ impl GhCheck {
     pub fn pinned(host: &Layout, settings: &Settings) -> GhCheck {
         GhCheck {
             root: host.root().clone(),
-            gh: layout::path(layout::GH),
-            trusted_root: layout::path(layout::TRUSTED_ROOT),
+            gh: host.gh(),
+            trusted_root: host.trusted_root(),
             repo: REPO.to_owned(),
             signer_workflow: SIGNER_WORKFLOW.to_owned(),
             issuer: ISSUER.to_owned(),

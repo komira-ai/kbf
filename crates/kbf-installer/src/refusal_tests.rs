@@ -12,7 +12,7 @@ fn io_error() -> io::Error {
 /// One of every case, by its expected code.
 fn every_case() -> Vec<(&'static str, Refusal)> {
     let untrusted = |fault| Refusal::Untrusted {
-        path: "/usr/local/libexec/kbf-deploy/gh".into(),
+        path: "/usr/share/kbf-installer/trust/gh".into(),
         fault,
     };
     let settings = |fault| Refusal::Settings {
@@ -261,7 +261,7 @@ fn every_case() -> Vec<(&'static str, Refusal)> {
         (
             "release-differs",
             Refusal::Differs {
-                path: "/usr/local/kbf/releases/x/kbf".into(),
+                path: "/var/lib/kbf-installer/releases/x/kbf".into(),
             },
         ),
         ("install-failed", Refusal::Install(ReleaseError::NoPrevious)),
@@ -316,14 +316,14 @@ fn every_refusal_has_its_own_stable_code_and_a_one_line_message() {
 #[test]
 fn a_release_that_differs_is_its_own_refusal_and_other_errors_keep_their_cause() {
     let differs = ReleaseError::Differs {
-        path: HostPath::new("/usr/local/kbf/releases/a/kbf").expect("path"),
+        path: HostPath::new("/var/lib/kbf-installer/releases/a/kbf").expect("path"),
     };
     let refusal = Refusal::from(differs);
     assert_eq!(refusal.code(), "release-differs");
     assert!(
         refusal
             .to_string()
-            .starts_with("/usr/local/kbf/releases/a/kbf differs")
+            .starts_with("/var/lib/kbf-installer/releases/a/kbf differs")
     );
     let other = Refusal::from(ReleaseError::NoPrevious);
     assert_eq!(other.code(), "install-failed");

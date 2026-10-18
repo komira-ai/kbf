@@ -61,7 +61,7 @@ use crate::binary::{Arch, BinaryKind, Version};
 use crate::darwin;
 use crate::helper::fetcher::InstalledRelease;
 use crate::helper::leases::LeaseSource;
-use crate::layout::{self, Layout, Platform};
+use crate::layout::{Layout, Platform};
 use crate::refusal::{ArchiveFault, FactsFault, Refusal, TrustFault, VersionFault, WHAT_PROBE};
 use crate::run::{Runner, Spawn};
 use crate::settings::Settings;
@@ -672,7 +672,7 @@ impl Pipeline<'_> {
         }
         sync_dir(&dir)?;
 
-        let target = self.host.join(&layout::release_dir(commit));
+        let target = self.host.join(&self.host.release_dir(commit));
         let releases = target
             .parent()
             .expect("a release directory has a parent")

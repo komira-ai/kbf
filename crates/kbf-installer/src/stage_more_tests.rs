@@ -17,10 +17,10 @@ fn rig_on(name: &str, platform: Platform, arch: Arch) -> Rig {
     let dir = kbf_host::testkit::scratch(&format!("stage-{name}"));
     for sub in [
         "run",
-        "var/lib/kbf-deploy",
-        "var/db/kbf-deploy",
+        "var/lib/kbf-installer",
+        "var/db/kbf-installer",
         "var/run",
-        "usr/local/kbf",
+        "usr/local/kbf-installer",
     ] {
         fs::create_dir_all(dir.join(sub)).expect("seed");
     }
@@ -266,7 +266,7 @@ fn a_release_directory_that_cannot_be_examined_is_an_error() {
         return; // root reads a closed directory
     }
     let rig = Rig::new("unexaminable");
-    let releases = rig.dir.join("usr/local/kbf/releases");
+    let releases = rig.host.join(&rig.host.releases());
     fs::create_dir_all(&releases).expect("releases");
     fs::set_permissions(&releases, fs::Permissions::from_mode(0o000)).expect("close");
     let err = rig.activate(&honest());

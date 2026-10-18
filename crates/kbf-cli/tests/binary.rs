@@ -324,11 +324,10 @@ fn check_args_parses_and_starts_nothing() {
             "--node-id=n",
             &data_flag,
         ]);
-        assert_eq!(
-            (code, out.as_str(), err.as_str()),
-            (Some(0), "", ""),
-            "{mode}"
-        );
+        assert_eq!((code, out.as_str()), (Some(0), ""), "{mode}");
+        // Only the deprecation note (tests/config_process.rs).
+        assert_eq!(err.lines().count(), 1, "{mode}: {err}");
+        assert!(err.contains("deprecated"), "{mode}: {err}");
         assert!(!data.exists(), "{mode} started: {} made", data.display());
     }
 }

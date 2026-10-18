@@ -18,7 +18,7 @@ use crate::pool::{self, ROOT_DIR};
 use crate::profile::{DaemonUser, Profile};
 
 const LAUNCHCTL: &str = "/bin/launchctl";
-pub const KBF_BIN: &str = "/usr/local/kbf/current/kbf";
+pub const KBF_BIN: &str = "/usr/local/kbf-installer/releases/current/kbf";
 /// The node's config file, where the macOS package puts it (`kbf node`'s default
 /// `--config` on macOS): the frontend's URL, the node id and the directories. The
 /// operator writes it; this tool does not.

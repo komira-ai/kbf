@@ -80,15 +80,15 @@ impl World {
         let root = host.root.clone();
         for sub in [
             "run",
-            "var/lib/kbf-deploy",
+            "var/lib/kbf-installer",
             "var/lib/kbf-installer/orders",
-            "usr/local/kbf/releases",
+            "var/lib/kbf-installer/releases",
         ] {
             fs::create_dir_all(root.join(sub)).unwrap();
         }
         // A is running; B is on the host already except where a scenario has it fetched.
         for r in [A, B] {
-            let d = root.join("usr/local/kbf/releases").join(r);
+            let d = root.join("var/lib/kbf-installer/releases").join(r);
             fs::create_dir_all(&d).unwrap();
             fs::write(d.join("kbf"), b"binary").unwrap();
         }
@@ -183,7 +183,7 @@ impl World {
             .count()
     }
     fn link(&self) -> String {
-        fs::read_link(self.root.join("usr/local/kbf/current"))
+        fs::read_link(self.root.join("var/lib/kbf-installer/releases/current"))
             .map(|p| p.display().to_string())
             .unwrap_or_default()
     }
@@ -231,7 +231,7 @@ fn prep(scn: &str, tag: &str) -> World {
         // B is not on the host: the fetcher installs it, and the pass can die on either
         // side of that.
         "activate_fetching" => {
-            fs::remove_dir_all(w.root.join("usr/local/kbf/releases").join(B)).unwrap();
+            fs::remove_dir_all(w.root.join("var/lib/kbf-installer/releases").join(B)).unwrap();
             w.order(5, "activate", B);
         }
         "revert" => {
