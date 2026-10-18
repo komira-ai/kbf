@@ -232,7 +232,11 @@ fn two_sequential_binds_of_an_absent_address_share_one_budget() {
 #[test]
 fn a_bind_waits_only_for_what_an_earlier_bind_left() {
     let (binder, slept, _) = flaky(Duration::from_secs(3), 2);
-    assert!(binder.bind("192.0.2.10:1".parse().expect("address")).is_ok());
+    assert!(
+        binder
+            .bind("192.0.2.10:1".parse().expect("address"))
+            .is_ok()
+    );
     assert_eq!(slept.borrow().len(), 2);
     let before = slept.borrow().iter().sum::<Duration>();
     assert_eq!(before, Duration::from_millis(750));
