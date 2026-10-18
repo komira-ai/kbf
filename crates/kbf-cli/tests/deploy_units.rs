@@ -456,6 +456,63 @@ fn check_units_parses_a_modes_flags_with_this_kbf() {
     );
 }
 
+/// Catches `kbf` taking a flag an operator added to a rendered unit that it refuses: an
+/// unknown flag, a store flag in the daemon's unit (a build node holds no store), and
+/// another mode's flag in the storage unit. The unit's `ExecStart=` words with that flag
+/// are refused by kbf's own parser, in-process, with the message `kbf <mode> --check`
+/// prints; the unedited words parse. `kbf-deploy linux check-units --mode` used to ask
+/// this of `kbf check-args` on the host.
+#[test]
+fn a_rendered_unit_edited_with_a_flag_kbf_refuses_is_refused_by_its_parser() {
+    let c = config();
+    let exec_start = |mode: Mode, edit: &dyn Fn(&str) -> String| -> Vec<String> {
+        let text = render(&c, Some(1500), mode).expect("renders");
+        let edited = edit(&text);
+        let unit = UnitFile::parse(&edited).expect("a unit");
+        unit.exec_start().iter().map(|w| (*w).to_owned()).collect()
+    };
+    let same = |t: &str| t.to_owned();
+    for mode in Mode::ALL {
+        let argv = exec_start(mode, &same);
+        parse_from(&argv).unwrap_or_else(|e| panic!("{mode}: {e}"));
+    }
+    let daemon = |flag: &'static str| {
+        move |t: &str| {
+            let edited = t.replace("--driver=container", &format!("--driver=container {flag}"));
+            assert_ne!(edited, t);
+            edited
+        }
+    };
+    let e = parse_from(exec_start(Mode::Daemon, &daemon("--bogus-flag")))
+        .expect_err("an unknown flag is refused");
+    assert!(
+        e.to_string().contains("unexpected argument '--bogus-flag'"),
+        "{e}"
+    );
+    assert_eq!(e.exit_code(), 2);
+    let e = parse_from(exec_start(Mode::Daemon, &daemon("--cold-store=file:///x")))
+        .expect_err("a build node holds no store");
+    assert!(
+        e.to_string().contains("kbf daemon refuses --cold-store"),
+        "{e}"
+    );
+    assert_eq!(e.exit_code(), 2);
+    let worker = |t: &str| {
+        let edited = t.replace(
+            "--meta-dir=",
+            "--worker-listen=192.0.2.10:8981 \\\n    --meta-dir=",
+        );
+        assert_ne!(edited, t);
+        edited
+    };
+    let e = parse_from(exec_start(Mode::Storage, &worker)).expect_err("refused by name");
+    assert!(
+        e.to_string()
+            .contains("kbf storage refuses --worker-listen"),
+        "{e}"
+    );
+}
+
 /// What a `kbf` without `check-args` answers to `cmd`: clap's refusal, exit 2.
 fn old_kbf(cmd: &Cmd) -> std::process::Output {
     use std::os::unix::process::ExitStatusExt as _;
