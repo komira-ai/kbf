@@ -15,6 +15,7 @@
 
 # Files by extension or `#!` line. Key: the path.
 [files]
+packaging/install.sh	the curl|sh entry of kbf-installer, the one shell file the distribution keeps (CEO: the only shell is the curl|sh one-shot entry script): detect the platform, download the payload tarball and SHA256SUMS, refuse on any sha256 mismatch or any entry outside the package's paths, place the files; a user's machine has no Rust toolchain or kbf binary to do it with before this runs. Tested by crates/xtask/tests/install_sh.rs; the only row budget-diff lets a change add (crates/xtask/src/budget.rs SANCTIONED)
 
 # Production Rust under crates/*/src/ that names a shell and a `-c` flag. Key: the path.
 [src-sh-c]
