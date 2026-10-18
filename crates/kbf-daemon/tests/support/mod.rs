@@ -831,7 +831,30 @@ impl<R: Runtime> Harness<R> {
             None,
             None,
             None,
-            Some((signals, deadline)),
+            Some((signals, Some(deadline))),
+        )
+        .await;
+        (h, signals_tx)
+    }
+
+    /// Starts a server and a daemon run by [`Daemon::run`] with a shutdown that completes
+    /// at the first `()` sent on the returned sender.
+    pub async fn with_shutdown(name: &str, runtime: Arc<R>) -> (Self, mpsc::UnboundedSender<()>) {
+        let (signals_tx, signals) = mpsc::unbounded_channel();
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        let h = Self::build_with(
+            name,
+            runtimes,
+            runtime,
+            Duration::from_secs(40),
+            |_| {},
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some((signals, None)),
         )
         .await;
         (h, signals_tx)
@@ -907,7 +930,7 @@ impl<R: Runtime> Harness<R> {
         pressure: Option<(tokio::sync::watch::Receiver<Option<f64>>, f64)>,
         map: Option<Arc<kbf_mapsync::MapHolder>>,
         update: Option<UpdateLink>,
-        drain: Option<(mpsc::UnboundedReceiver<()>, Duration)>,
+        drain: Option<(mpsc::UnboundedReceiver<()>, Option<Duration>)>,
     ) -> Self {
         let pki = pki(name);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -970,7 +993,10 @@ impl<R: Runtime> Harness<R> {
             daemon = daemon.with_update(update);
         }
         let daemon = match drain {
-            Some((signals, deadline)) => tokio::spawn(daemon.run_draining(signals, deadline)),
+            Some((signals, Some(deadline))) => tokio::spawn(daemon.run_draining(signals, deadline)),
+            Some((mut signals, None)) => tokio::spawn(daemon.run(async move {
+                signals.recv().await;
+            })),
             None => tokio::spawn(daemon.run(std::future::pending())),
         };
         Self {

@@ -216,3 +216,18 @@ async fn draining_keeps_a_phase_the_runtime_reports() {
     signal.send(()).expect("daemon runs");
     assert!(h.exited(PROMPT).await);
 }
+
+/// Catches `Daemon::run` (the immediate stop the combined modes still use) that ignores
+/// its shutdown future: it returns when the future completes, with a lease still
+/// running, which is abandoned, not waited for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_stops_at_once_when_its_shutdown_completes() {
+    let runtime = Arc::new(FakeRuntime::new(LONG));
+    let (mut h, stop) = Harness::with_shutdown("run-shutdown", runtime).await;
+    let peer = h.welcomed().await;
+    peer.start(1, 1, "action");
+    h.started(1).await;
+    assert!(!h.exited(QUIET).await, "it stopped before its shutdown");
+    stop.send(()).expect("daemon runs");
+    assert!(h.exited(PROMPT).await, "a running lease held it back");
+}
