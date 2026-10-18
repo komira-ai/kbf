@@ -15,6 +15,9 @@ mod handover;
 #[path = "frontend/membership_tls.rs"]
 mod membership_tls;
 
+#[path = "frontend/proxy_auth.rs"]
+mod proxy_auth;
+
 use std::future::pending;
 use std::net::SocketAddr;
 use std::sync::Arc;

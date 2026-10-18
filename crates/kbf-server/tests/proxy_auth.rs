@@ -28,6 +28,7 @@ use kbf_server::proxy_auth::{
 };
 use kbf_server::token::{ApiToken, TokenFileError};
 use kbf_server::{Args, ConfigError};
+use kbf_storage::service::Admission;
 use tonic::Code;
 use tonic::codegen::http::{self, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use tonic::codegen::{Service, http::Extensions};
@@ -690,4 +691,49 @@ fn the_deny_list_applies_behind_the_proxy() {
         args(&["--worker-deny-list", list]).listeners(),
         Err(ConfigError::DenyListWithoutIdentity)
     ));
+}
+
+/// Catches the proxy arm of the role table: a proxied call is judged by the role the proxy
+/// forwarded (a daemon may open a session, a storage node may not, a call with no role is
+/// UNAUTHENTICATED), under no admission only the path is checked, and a method the listener
+/// does not serve is refused for a proxy as for a certificate.
+///
+/// Mutants seen red: the unserved-path check dropped for a proxied call; the open
+/// admission not honoured for one.
+#[test]
+fn the_role_table_judges_a_proxied_call_by_its_forwarded_role() {
+    use kbf_server::worker_roles::admit_presented;
+    let session = "/kbf.worker.v1.Worker/Session";
+    let unserved = "/kbf.worker.v1.Worker/Unknown";
+    let by = |role: Option<PeerRole>| {
+        Presented::Proxy(Identity {
+            node_id: Some("n".to_owned()),
+            role,
+        })
+    };
+    let certified = |path, role| admit_presented(Admission::Certified, path, &by(role));
+    assert!(certified(session, Some(PeerRole::Daemon)).is_ok());
+    assert_eq!(
+        certified(session, Some(PeerRole::Storage))
+            .expect_err("storage")
+            .code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        certified(session, None).expect_err("no role").code(),
+        Code::Unauthenticated
+    );
+    assert_eq!(
+        certified(unserved, Some(PeerRole::Daemon))
+            .expect_err("unserved")
+            .code(),
+        Code::PermissionDenied
+    );
+    assert!(admit_presented(Admission::Open, session, &by(None)).is_ok());
+    assert_eq!(
+        admit_presented(Admission::Open, unserved, &by(None))
+            .expect_err("unserved")
+            .code(),
+        Code::PermissionDenied
+    );
 }
