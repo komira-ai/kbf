@@ -31,7 +31,7 @@ use kbf_server::members::{Members, MembershipConfig, PROTOCOL};
 use kbf_server::members_rpc::MembershipService;
 use kbf_server::proxy_auth::{Identity, NODE_ID, PROXY_AUTH, ProxyAuthLayer, ProxySecret, ROLE};
 use kbf_server::token::ApiToken;
-use kbf_server::{Api, Behind, DenyList, Listeners, bind_server_with_api};
+use kbf_server::{Api, Behind, DenyList, Listeners, bind_server_with_options};
 use kbf_state::Store;
 use kbf_storage::service::Admission;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -97,10 +97,6 @@ fn start_denying(with_proxy: bool, deny_list: Option<DenyList>) -> Server_ {
         worker: loopback,
         reapi_tls: None,
         worker_tls: None,
-        proxy: with_proxy.then(|| Behind {
-            secret: secret(),
-            deny_list,
-        }),
         heartbeat_interval: Duration::from_millis(100),
         hello_wait: Duration::from_millis(300),
         tick: Duration::from_millis(50),
@@ -122,9 +118,23 @@ fn start_denying(with_proxy: bool, deny_list: Option<DenyList>) -> Server_ {
         releases: None,
     };
     let cache: Arc<MemoryCache> = Arc::new(Cache::memory());
-    let bound = bind_server_with_api(cache, listeners, Some(api), async move {
-        let _ = stopped.await;
-    })
+    let proxy = with_proxy.then(|| Behind {
+        secret: secret(),
+        deny_list,
+    });
+    let bound = bind_server_with_options(
+        cache,
+        listeners,
+        Some(api),
+        kbf_auth::Policy::allow_all(),
+        None,
+        None,
+        None,
+        proxy,
+        async move {
+            let _ = stopped.await;
+        },
+    )
     .expect("bind");
     let (reapi, worker, api) = (
         bound.reapi,

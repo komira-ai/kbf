@@ -615,6 +615,28 @@ impl Args {
         .resolve(space)
     }
 
+    /// The proxy in front of every listener, if `--proxy-auth-file` names its secret
+    /// ([`Behind`]; `None`: the server is reached directly).
+    ///
+    /// # Errors
+    /// The secret file or the `--worker-deny-list` file cannot be read, or the secret is
+    /// not one the proxy can present ([`ProxySecret::from_file`]).
+    pub fn proxy(&self) -> Result<Option<Behind>, ConfigError> {
+        let Some(path) = self.proxy_auth_file.as_deref() else {
+            return Ok(None);
+        };
+        let secret = ProxySecret::from_file(path)?;
+        let deny_list = self
+            .worker_deny_list
+            .as_deref()
+            .map(DenyList::open)
+            .transpose()?;
+        Ok(Some(Behind {
+            secret: Arc::new(secret),
+            deny_list,
+        }))
+    }
+
     /// The listeners these flags describe.
     ///
     /// # Errors
@@ -628,15 +650,6 @@ impl Args {
             .as_deref()
             .map(DenyList::open)
             .transpose()?;
-        let proxy = self
-            .proxy_auth_file
-            .as_deref()
-            .map(ProxySecret::from_file)
-            .transpose()?
-            .map(|secret| Behind {
-                secret: Arc::new(secret),
-                deny_list: deny_list.clone(),
-            });
         let worker_tls = match (
             &self.worker_tls_cert,
             &self.worker_tls_key,
@@ -656,7 +669,7 @@ impl Args {
             }),
             _ => None,
         };
-        if deny_list.is_some() && worker_tls.is_none() && proxy.is_none() {
+        if deny_list.is_some() && worker_tls.is_none() && self.proxy_auth_file.is_none() {
             return Err(ConfigError::DenyListWithoutIdentity);
         }
         let reapi_tls = match (&self.reapi_tls_cert, &self.reapi_tls_key) {
@@ -676,7 +689,6 @@ impl Args {
             reapi_tls,
             worker: self.worker_listen,
             worker_tls,
-            proxy,
             heartbeat_interval: Duration::from_millis(self.heartbeat_interval_ms),
             hello_wait: Duration::from_secs(10),
             tick: Duration::from_secs(1),

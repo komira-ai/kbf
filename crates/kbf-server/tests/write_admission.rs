@@ -104,7 +104,6 @@ fn listeners() -> Listeners {
         worker: SocketAddr::from(([127, 0, 0, 1], 0)),
         reapi_tls: None,
         worker_tls: None,
-        proxy: None,
         heartbeat_interval: Duration::from_secs(1),
         hello_wait: Duration::from_secs(10),
         tick: Duration::from_millis(50),

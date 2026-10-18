@@ -66,9 +66,6 @@ pub struct Listeners {
     /// Mutual TLS for the worker listener; `None` serves it in plain text, where no
     /// node is bound to a certificate and every blob call is refused.
     pub worker_tls: Option<WorkerTls>,
-    /// A TLS-terminating proxy in front of every listener (`--proxy-auth-file`,
-    /// [`crate::proxy_auth`]); `None`: the server is reached directly.
-    pub proxy: Option<Behind>,
     /// The heartbeat interval `Welcome` names.
     pub heartbeat_interval: Duration,
     /// How long a new worker stream may take to send its `Hello`.
@@ -581,7 +578,9 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, None, None, None, shutdown)
+    bind_server_with_options(
+        cache, listeners, api, policy, None, None, None, None, shutdown,
+    )
 }
 
 /// [`bind_server_with_policy`], with the scheduler's state kept in `state` if given
@@ -601,7 +600,9 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, state, None, None, shutdown)
+    bind_server_with_options(
+        cache, listeners, api, policy, state, None, None, None, shutdown,
+    )
 }
 
 /// [`bind_server_with_state`], sending daemons the storage map `map` holds if given: in
@@ -622,7 +623,9 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, state, None, map, shutdown)
+    bind_server_with_options(
+        cache, listeners, api, policy, state, None, map, None, shutdown,
+    )
 }
 
 /// [`bind_server_with_policy`], and with a `storage` node (`--storage`) the REAPI
@@ -643,13 +646,17 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, None, storage, None, shutdown)
+    bind_server_with_options(
+        cache, listeners, api, policy, None, storage, None, None, shutdown,
+    )
 }
 
 /// [`bind_server_with_policy`] with all of its options: the scheduler's state in
 /// `state` ([`bind_server_with_state`]), the client's CAS, ByteStream and
 /// action-cache calls proxied to a `storage` node ([`bind_server_with_storage`]), and
-/// the storage map `map` sent to daemons ([`bind_server_with_map`]).
+/// the storage map `map` sent to daemons ([`bind_server_with_map`]), and a TLS-terminating
+/// `proxy` in front of every listener (`--proxy-auth-file`, [`crate::proxy_auth`]; `None`:
+/// the server is reached directly).
 ///
 /// # Errors
 /// As [`bind_server_with_state`].
@@ -665,6 +672,7 @@ pub fn bind_server_with_options<M, O>(
     state: Option<StateStore>,
     storage: Option<tonic::transport::Endpoint>,
     map: Option<Arc<dyn MapSource>>,
+    proxy: Option<Behind>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
 where
@@ -708,7 +716,7 @@ where
             listeners.streams,
         ),
         listeners.worker_tls,
-        listeners.proxy.as_ref(),
+        proxy.as_ref(),
     );
     let tls_sources: Vec<TlsSource> = listeners
         .reapi_tls
@@ -783,10 +791,7 @@ where
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     log_state(durable, term, epoch);
 
-    let proxy_secret = listeners
-        .proxy
-        .as_ref()
-        .map(|behind| Arc::clone(&behind.secret));
+    let proxy_secret = proxy.as_ref().map(|behind| Arc::clone(&behind.secret));
     let mut reapi_server = keepalive(
         flow_control(Server::builder(), listeners.stream_limits.reapi),
         listeners.streams,

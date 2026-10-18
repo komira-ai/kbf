@@ -62,7 +62,6 @@ impl Farm {
                 server: pki.worker_tls(),
                 deny_list: None,
             }),
-            proxy: None,
             heartbeat_interval: Duration::from_millis(100),
             hello_wait: Duration::from_secs(2),
             tick: Duration::from_millis(50),

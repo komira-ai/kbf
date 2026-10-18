@@ -1073,7 +1073,6 @@ fn listeners() -> Listeners {
         worker: loopback,
         reapi_tls: None,
         worker_tls: None,
-        proxy: None,
         heartbeat_interval: Duration::from_secs(1),
         hello_wait: Duration::from_secs(1),
         tick: Duration::from_millis(50),

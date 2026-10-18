@@ -745,6 +745,7 @@ fn state_uri(flags: &FrontendFlags) -> Result<&crate::StateStoreUri, HandoverErr
 struct Prepared<'a> {
     flags: &'a FrontendFlags,
     listeners: crate::serve::Listeners,
+    proxy: Option<crate::serve::Behind>,
     policy: kbf_auth::Policy,
     api: Option<crate::serve::Api>,
     channel: tonic::transport::Channel,
@@ -781,6 +782,7 @@ impl<'a> Prepared<'a> {
     fn new(flags: &'a FrontendFlags) -> Result<Self, Box<dyn Error>> {
         let args = &flags.server;
         let listeners = args.listeners()?;
+        let proxy = args.proxy()?;
         let policy = args.reapi_auth_policy()?;
         let api = args.api()?;
         let channel = flags.storage_endpoint()?.connect_lazy();
@@ -793,6 +795,7 @@ impl<'a> Prepared<'a> {
         Ok(Self {
             flags,
             listeners,
+            proxy,
             policy,
             api,
             channel,
@@ -821,6 +824,7 @@ impl<'a> Prepared<'a> {
         let Self {
             flags,
             listeners,
+            proxy,
             policy,
             api,
             channel,
@@ -877,7 +881,7 @@ impl<'a> Prepared<'a> {
                 listeners.streams,
             ),
             listeners.worker_tls,
-            listeners.proxy.as_ref(),
+            proxy.as_ref(),
         );
         let tls_sources: Vec<TlsSource> = listeners
             .reapi_tls
@@ -939,10 +943,7 @@ impl<'a> Prepared<'a> {
             routes.merge(crate::storage_health::router(Arc::clone(members)))
         });
 
-        let proxy_secret = listeners
-            .proxy
-            .as_ref()
-            .map(|behind| Arc::clone(&behind.secret));
+        let proxy_secret = proxy.as_ref().map(|behind| Arc::clone(&behind.secret));
         let mut reapi_server = keepalive(
             flow_control(Server::builder(), listeners.stream_limits.reapi),
             listeners.streams,
