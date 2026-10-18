@@ -68,6 +68,8 @@ pub struct Proc {
     pub state: RoleState,
     pub holder: bool,
     pub quiesce_at: Option<Duration>,
+    /// A resumed child reports `Active` from this time on (it holds the generation at once).
+    pub active_at: Option<Duration>,
     pub executions: Until,
     pub queued: Until,
 }
@@ -92,6 +94,21 @@ pub struct State {
     /// One of the three readiness checks (0 readyz, 1 health, 2 capabilities) stays false.
     pub ready_gap: Option<u8>,
     pub staged: Option<CommitId>,
+    /// `status.json` cannot be read.
+    pub staged_err: bool,
+    /// How long a resumed child takes to report `Active`.
+    pub resume_lag: Duration,
+    /// Each call is refused (the process is gone, the root half is down, ...).
+    pub terminate_err: bool,
+    pub kill_err: bool,
+    pub stand_down_err: bool,
+    pub revert_err: bool,
+    pub release_err: bool,
+    /// The nth spawn (1 is the first) into a slot fails.
+    pub spawn_fail_nth: Vec<(Slot, u32)>,
+    pub spawn_counts: BTreeMap<Slot, u32>,
+    /// The first this many polls for an operator request find none.
+    pub quiet_polls: u32,
     pub permits: BTreeMap<Slot, Until>,
     pub held: Vec<Duration>,
     pub hold_max: Duration,
@@ -140,6 +157,16 @@ impl World {
                 holds: 0,
                 ready_gap: None,
                 staged: Some(c(B)),
+                staged_err: false,
+                resume_lag: Duration::ZERO,
+                terminate_err: false,
+                kill_err: false,
+                stand_down_err: false,
+                revert_err: false,
+                release_err: false,
+                spawn_fail_nth: Vec::new(),
+                spawn_counts: BTreeMap::new(),
+                quiet_polls: 0,
                 permits: BTreeMap::new(),
                 held: Vec::new(),
                 hold_max: secs(15),
@@ -186,6 +213,7 @@ impl World {
             state: RoleState::Candidate,
             holder: false,
             quiesce_at: None,
+            active_at: None,
             executions: Until(0, None),
             queued: Until(0, None),
         });
@@ -302,18 +330,12 @@ impl World {
     }
 
     pub fn kill_pid(&self, pid: u32) {
-        let mut st = self.st.borrow_mut();
-        if let Some(p) = st.procs.get_mut(pid as usize - 100) {
-            p.alive = false;
-        }
+        self.st.borrow_mut().procs[pid as usize - 100].alive = false;
     }
 
     /// The pid now belongs to another process.
     pub fn recycle(&self, pid: u32) {
-        let mut st = self.st.borrow_mut();
-        if let Some(p) = st.procs.get_mut(pid as usize - 100) {
-            p.start_time += 1;
-        }
+        self.st.borrow_mut().procs[pid as usize - 100].start_time += 1;
     }
 
     pub fn holders(&self) -> Vec<Slot> {
@@ -408,6 +430,17 @@ fn gone(slot: Slot) -> PortError {
 
 impl Child for World {
     fn spawn(&self, slot: Slot, release: &CommitId) -> Result<ProcIdent, PortError> {
+        let failing = {
+            let mut st = self.st.borrow_mut();
+            let n = st.spawn_counts.entry(slot).or_insert(0);
+            *n += 1;
+            let n = *n;
+            st.spawn_fail_nth.contains(&(slot, n))
+        };
+        if failing {
+            self.log_event(format!("spawn {slot:?} refused"));
+            return Err(PortError("exec failed".into()));
+        }
         let script = self.st.borrow_mut().scripts.pop_front().unwrap_or_default();
         let ident = self.push(slot, release.clone(), script);
         self.log_event(format!(
@@ -451,9 +484,11 @@ impl Child for World {
         } else {
             let now = self.now.get();
             let mut st = self.st.borrow_mut();
-            if let Some(p) = st.procs.get_mut(ident.pid as usize - 100) {
-                p.script.exit_after = Some(now - p.spawned_at + takes);
-            }
+            let p = &mut st.procs[ident.pid as usize - 100];
+            p.script.exit_after = Some(now - p.spawned_at + takes);
+        }
+        if self.st.borrow().terminate_err {
+            return Err(PortError("no such process".into()));
         }
         Ok(())
     }
@@ -461,6 +496,9 @@ impl Child for World {
     fn kill_unserved(&self, ident: &ProcIdent) -> Result<(), PortError> {
         self.log_event(format!("kill pid {}", ident.pid));
         self.kill_pid(ident.pid);
+        if self.st.borrow().kill_err {
+            return Err(PortError("no such process".into()));
+        }
         Ok(())
     }
 }
@@ -472,6 +510,10 @@ impl ChildAdmin for World {
         self.with_slot(slot, |p, now| {
             if p.state == RoleState::Quiescing && p.quiesce_at.is_some_and(|t| now >= t + takes) {
                 p.state = RoleState::Quiesced;
+            }
+            if p.active_at.is_some_and(|t| now >= t) {
+                p.state = RoleState::Active;
+                p.active_at = None;
             }
             RoleInfo {
                 holder: p.holder,
@@ -523,6 +565,9 @@ impl ChildAdmin for World {
 
     fn stand_down(&self, slot: Slot) -> Result<(), PortError> {
         self.log_event(format!("admin:stand_down {slot:?}"));
+        if self.st.borrow().stand_down_err {
+            return Err(PortError("stand-down refused".into()));
+        }
         self.with_slot(slot, |p, _| p.state = RoleState::StoodDown)
             .ok_or_else(|| gone(slot))
     }
@@ -533,7 +578,9 @@ impl ChildAdmin for World {
             return Err(PortError("resume refused".into()));
         }
         self.refresh();
+        let now = self.now.get();
         let mut st = self.st.borrow_mut();
+        let lag = st.resume_lag;
         // Re-take the generation only if the holder is dead or has stood down (agrees).
         let blocked = st
             .procs
@@ -551,7 +598,11 @@ impl ChildAdmin for World {
             .find(|p| p.slot == slot && p.alive)
         {
             Some(p) => {
-                p.state = RoleState::Active;
+                if lag.is_zero() {
+                    p.state = RoleState::Active;
+                } else {
+                    p.active_at = Some(now + lag);
+                }
                 p.quiesce_at = None;
                 p.holder = p.holder || !blocked;
                 Ok(())
@@ -610,6 +661,9 @@ impl Gate for World {
     }
 
     fn release_into(&self, slot: Slot) -> Result<(), PortError> {
+        if self.st.borrow().release_err {
+            return Err(PortError("release refused".into()));
+        }
         let n = {
             let mut st = self.st.borrow_mut();
             let n = st.held.len();
@@ -689,6 +743,9 @@ impl RootOrders for World {
     }
 
     fn staged(&self) -> Result<Option<StagedFacts>, PortError> {
+        if self.st.borrow().staged_err {
+            return Err(PortError("status.json unreadable".into()));
+        }
         Ok(self.st.borrow().staged.clone().map(|commit| StagedFacts {
             commit,
             protocol: 7,
@@ -710,6 +767,9 @@ impl RootOrders for World {
 
     fn revert(&self, commit: &CommitId) -> Result<(), PortError> {
         self.log_event(format!("order revert {}", &commit.as_str()[..4]));
+        if self.st.borrow().revert_err {
+            return Err(PortError("revert refused".into()));
+        }
         Ok(())
     }
 }
@@ -732,6 +792,10 @@ impl Requests for World {
     fn next(&self) -> Option<Request> {
         let now = self.now.get();
         let mut st = self.st.borrow_mut();
+        if st.quiet_polls > 0 {
+            st.quiet_polls -= 1;
+            return None;
+        }
         let i = st.requests.iter().position(|(t, _)| now >= *t)?;
         Some(st.requests.remove(i).1)
     }
