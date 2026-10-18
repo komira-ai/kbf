@@ -14,6 +14,26 @@ fn audit_all(reg: &Registry) -> Vec<kbf_types::object_store_api::AuditEntry> {
     reg.audit(NonZeroUsize::new(100).unwrap()).unwrap()
 }
 
+/// The newest audit row is exactly this action, subject, outcome and generation.
+fn newest_is(
+    reg: &Registry,
+    action: AuditAction,
+    subject: &str,
+    outcome: AuditOutcome,
+    generation: u64,
+) {
+    let last = &audit_all(reg)[0];
+    assert_eq!(
+        (
+            last.action,
+            last.subject.as_str(),
+            last.outcome,
+            last.generation
+        ),
+        (action, subject, outcome, generation)
+    );
+}
+
 // Catches a binding to a connection that does not exist, a first bind that is not
 // created, a repeat that bumps the generation, and a bind that loses its audit row.
 #[test]
@@ -148,9 +168,24 @@ fn deletes_refuse_a_bound_connection_and_remove_the_rest() {
         Err(RegistryError::NoSuchBinding)
     ));
     assert_eq!(RegistryError::NoSuchBinding.to_string(), "no such binding");
-    reg.put_connection(&name("cold"), &put("s")).unwrap();
-    reg.put_binding(BindingRole::Cold, &bind("cold", "b"))
+    let made = reg.put_connection(&name("cold"), &put("s")).unwrap();
+    newest_is(
+        &reg,
+        AuditAction::PutConnection,
+        "cold",
+        made.outcome,
+        made.generation,
+    );
+    let bound = reg
+        .put_binding(BindingRole::Cold, &bind("cold", "b"))
         .unwrap();
+    newest_is(
+        &reg,
+        AuditAction::PutBinding,
+        "cold",
+        bound.outcome,
+        bound.generation,
+    );
     let err = reg.delete_connection(&name("cold")).unwrap_err();
     assert!(matches!(err, RegistryError::InUse), "{err}");
     assert_eq!(err.to_string(), "a binding uses this connection");
@@ -161,18 +196,27 @@ fn deletes_refuse_a_bound_connection_and_remove_the_rest() {
         (unbound.generation, unbound.outcome),
         (3, AuditOutcome::Deleted)
     );
+    newest_is(
+        &reg,
+        AuditAction::DeleteBinding,
+        "cold",
+        AuditOutcome::Deleted,
+        3,
+    );
     assert!(reg.bindings().unwrap().is_empty());
     let gone = reg.delete_connection(&name("cold")).unwrap();
     assert_eq!((gone.generation, gone.outcome), (4, AuditOutcome::Deleted));
+    newest_is(
+        &reg,
+        AuditAction::DeleteConnection,
+        "cold",
+        AuditOutcome::Deleted,
+        4,
+    );
     assert!(reg.connections().unwrap().is_empty());
     assert!(
         listing(&dir).is_empty(),
         "the secret file went with the row"
-    );
-    let last = &audit_all(&reg)[0];
-    assert_eq!(
-        (last.action, last.subject.as_str()),
-        (AuditAction::DeleteConnection, "cold")
     );
 }
 
