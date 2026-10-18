@@ -15,7 +15,13 @@ fn policy() -> Policy {
 }
 
 fn open_dev(dir: &Path, now: i64) -> Result<Ca, CaOpenError> {
-    Ca::open(dir, &SignerChoice::DevFile, policy(), now, &mut SystemEntropy)
+    Ca::open(
+        dir,
+        &SignerChoice::DevFile,
+        policy(),
+        now,
+        &mut SystemEntropy,
+    )
 }
 
 fn bytes(dir: &Path, name: &str) -> Vec<u8> {
@@ -35,7 +41,11 @@ fn an_empty_ca_dir_makes_a_ca_and_a_filled_one_is_loaded_untouched() {
     assert_eq!(made.started(), Started::Created);
     let (key, root) = (bytes(&dir, "ca.key"), bytes(&dir, "ca.pem"));
     assert_eq!(
-        std::fs::metadata(dir.join("ca.key")).expect("meta").permissions().mode() & 0o777,
+        std::fs::metadata(dir.join("ca.key"))
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777,
         0o600
     );
 
@@ -66,7 +76,10 @@ fn a_directory_that_is_not_a_ca_is_refused_and_left_alone() {
     std::fs::create_dir_all(&half).expect("dir");
     std::fs::copy(source.join("ca.pem"), half.join("ca.pem")).expect("copy");
     assert!(matches!(open_dev(&half, START), Err(CaOpenError::Dir(_))));
-    assert!(!half.join("ca.key").exists(), "a key was not made beside a root");
+    assert!(
+        !half.join("ca.key").exists(),
+        "a key was not made beside a root"
+    );
 }
 
 /// A token's pin is the root's pin.
@@ -91,7 +104,8 @@ fn the_pin_source_gives_the_roots_pin() {
 #[test]
 fn an_external_signer_issues_and_the_frontend_holds_no_key() {
     let dir = scratch("ca-external");
-    let (authority, _) = kbf_signer::ensure(&dir, policy(), START, &mut SystemEntropy).expect("ensure");
+    let (authority, _) =
+        kbf_signer::ensure(&dir, policy(), START, &mut SystemEntropy).expect("ensure");
     let uid = rustix::process::geteuid().as_raw();
     let server = SignerServer::from_dir(&dir, uid, policy()).expect("server");
     let socket = scratch("ca-external-sock").join("signer.sock");
@@ -111,7 +125,8 @@ fn an_external_signer_issues_and_the_frontend_holds_no_key() {
     assert_eq!(ca.pin(), authority.pin());
     assert_eq!(ca.started(), Started::Loaded);
     let key = rcgen::KeyPair::generate().expect("key");
-    let public = kbf_ca::PublicKey::from_spki(&rcgen::PublicKeyData::subject_public_key_info(&key)).expect("spki");
+    let public = kbf_ca::PublicKey::from_spki(&rcgen::PublicKeyData::subject_public_key_info(&key))
+        .expect("spki");
     let id: kbf_types::NodeId = "node-01".parse().expect("id");
     let issued = ca
         .node()
@@ -149,16 +164,22 @@ fn an_external_signer_needs_the_signers_root_and_makes_nothing() {
 
     let empty = scratch("ca-external-empty");
     std::fs::create_dir_all(&empty).expect("dir");
-    let err = Ca::open(&empty, &external, policy(), START, &mut SystemEntropy).expect_err("no root");
+    let err =
+        Ca::open(&empty, &external, policy(), START, &mut SystemEntropy).expect_err("no root");
     assert!(matches!(err, CaOpenError::NoRoot { .. }), "{err}");
     assert!(err.to_string().contains("kbf-signer"));
-    assert_eq!(std::fs::read_dir(&empty).expect("dir").count(), 0, "nothing was made");
+    assert_eq!(
+        std::fs::read_dir(&empty).expect("dir").count(),
+        0,
+        "nothing was made"
+    );
 
     let other = scratch("ca-external-other");
     open_dev(&other, START).expect("another CA");
     let swapped = scratch("ca-external-swapped");
     std::fs::create_dir_all(&swapped).expect("dir");
     std::fs::copy(other.join("ca.pem"), swapped.join("ca.pem")).expect("copy");
-    let err = Ca::open(&swapped, &external, policy(), START, &mut SystemEntropy).expect_err("wrong root");
+    let err =
+        Ca::open(&swapped, &external, policy(), START, &mut SystemEntropy).expect_err("wrong root");
     assert!(matches!(err, CaOpenError::Ca(_)), "{err}");
 }

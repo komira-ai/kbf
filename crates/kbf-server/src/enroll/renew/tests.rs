@@ -53,17 +53,30 @@ fn a_renewal_issues_new_certificates_for_the_same_keys() {
         let (_, parsed) = X509Certificate::from_der(&cert.leaf_der).expect("x509");
         assert_eq!(parsed.public_key().raw, key.subject_public_key_info());
         assert_eq!(parsed.validity().not_before.timestamp(), cert.not_before);
-        assert!(cert.not_before >= START + 120 - 600, "issued now, not at enrollment");
+        assert!(
+            cert.not_before >= START + 120 - 600,
+            "issued now, not at enrollment"
+        );
     }
-    let storage = X509Certificate::from_der(&answer.certs[0].leaf_der).expect("x509").1;
+    let storage = X509Certificate::from_der(&answer.certs[0].leaf_der)
+        .expect("x509")
+        .1;
     let san = format!("{:?}", storage.subject_alternative_name().expect("san"));
     assert!(san.contains("s1.nodes.test"), "{san}");
-    assert_eq!(answer.renew_after, START + 120 + (answer.certs[0].not_after - START - 120) / 2);
+    assert_eq!(
+        answer.renew_after,
+        START + 120 + (answer.certs[0].not_after - START - 120) / 2
+    );
 
     let after = list_nodes(&*farm.store).expect("nodes");
-    assert_eq!(after[0].last_renewed_at, Some(u64::try_from(START + 120).expect("t")));
+    assert_eq!(
+        after[0].last_renewed_at,
+        Some(u64::try_from(START + 120).expect("t"))
+    );
     assert!(after[0].not_after >= before[0].not_after);
-    let again = farm.service.renew_now(&renew_request("node-01", &ROLES, &keys, farm.now()));
+    let again = farm
+        .service
+        .renew_now(&renew_request("node-01", &ROLES, &keys, farm.now()));
     assert_eq!(refused(again), RefusalReason::RenewTooSoon);
 }
 
@@ -91,7 +104,9 @@ fn a_renewal_under_another_key_is_wrong_key() {
     let (farm, mut keys) = enrolled("renew-wrongkey");
     farm.advance(120);
     keys[1] = key();
-    let result = farm.service.renew_now(&renew_request("node-01", &ROLES, &keys, farm.now()));
+    let result = farm
+        .service
+        .renew_now(&renew_request("node-01", &ROLES, &keys, farm.now()));
     assert_eq!(refused(result), RefusalReason::WrongKey);
 }
 
@@ -103,7 +118,9 @@ fn a_revoked_node_is_refused_node_revoked() {
     let (farm, keys) = enrolled("renew-revoked");
     revoke_node(&*farm.store, &node("node-01"), "test").expect("revoked");
     farm.advance(120);
-    let result = farm.service.renew_now(&renew_request("node-01", &ROLES, &keys, farm.now()));
+    let result = farm
+        .service
+        .renew_now(&renew_request("node-01", &ROLES, &keys, farm.now()));
     assert_eq!(refused(result), RefusalReason::NodeRevoked);
 }
 
@@ -118,10 +135,16 @@ fn an_issued_at_outside_the_window_is_stale() {
     farm.advance(120);
     for offset in [-3600, 3600] {
         let request = renew_request("node-01", &ROLES, &keys, farm.now() + offset);
-        assert_eq!(refused(farm.service.renew_now(&request)), RefusalReason::StaleIssuedAt);
+        assert_eq!(
+            refused(farm.service.renew_now(&request)),
+            RefusalReason::StaleIssuedAt
+        );
     }
     let request = renew_request("node-01", &ROLES, &keys, -5);
-    assert_eq!(refused(farm.service.renew_now(&request)), RefusalReason::StaleIssuedAt);
+    assert_eq!(
+        refused(farm.service.renew_now(&request)),
+        RefusalReason::StaleIssuedAt
+    );
 }
 
 /// The time in the request must be the one the CSR signed.
@@ -136,11 +159,17 @@ fn the_requests_issued_at_must_equal_the_csrs() {
     let now = farm.now();
     let mut replayed = renew_request("node-01", &ROLES, &keys, now - 3600);
     replayed.issued_at = now;
-    assert_eq!(refused(farm.service.renew_now(&replayed)), RefusalReason::MalformedRequest);
+    assert_eq!(
+        refused(farm.service.renew_now(&replayed)),
+        RefusalReason::MalformedRequest
+    );
 
     let mut unsigned = renew_request("node-01", &ROLES, &keys, now);
     unsigned.csrs[0].csr_der = csr(&keys[0], None);
-    assert_eq!(refused(farm.service.renew_now(&unsigned)), RefusalReason::MalformedRequest);
+    assert_eq!(
+        refused(farm.service.renew_now(&unsigned)),
+        RefusalReason::MalformedRequest
+    );
 }
 
 /// A repeated CSR and a second renewal inside the spacing are `RenewTooSoon`.
@@ -154,9 +183,15 @@ fn a_repeated_renewal_is_too_soon() {
     let request = renew_request("node-01", &ROLES, &keys, farm.now());
     farm.service.renew_now(&request).expect("renewed");
     farm.advance(5);
-    assert_eq!(refused(farm.service.renew_now(&request)), RefusalReason::RenewTooSoon);
+    assert_eq!(
+        refused(farm.service.renew_now(&request)),
+        RefusalReason::RenewTooSoon
+    );
     let fresh = renew_request("node-01", &ROLES, &keys, farm.now());
-    assert_eq!(refused(farm.service.renew_now(&fresh)), RefusalReason::RenewTooSoon);
+    assert_eq!(
+        refused(farm.service.renew_now(&fresh)),
+        RefusalReason::RenewTooSoon
+    );
     farm.advance(120);
     let later = renew_request("node-01", &ROLES, &keys, farm.now());
     farm.service.renew_now(&later).expect("after the spacing");
@@ -173,11 +208,19 @@ fn an_unknown_node_a_different_role_set_and_a_bad_csr_are_refused() {
     farm.advance(120);
     let now = farm.now();
     assert_eq!(
-        refused(farm.service.renew_now(&renew_request("node-77", &ROLES, &keys, now))),
+        refused(
+            farm.service
+                .renew_now(&renew_request("node-77", &ROLES, &keys, now))
+        ),
         RefusalReason::UnknownNode
     );
     assert_eq!(
-        refused(farm.service.renew_now(&renew_request("node-01", &[Role::Daemon], &keys[1..], now))),
+        refused(farm.service.renew_now(&renew_request(
+            "node-01",
+            &[Role::Daemon],
+            &keys[1..],
+            now
+        ))),
         RefusalReason::BadRoles
     );
     let mut bad = renew_request("node-01", &ROLES, &keys, now);
@@ -185,7 +228,10 @@ fn an_unknown_node_a_different_role_set_and_a_bad_csr_are_refused() {
     assert_eq!(refused(farm.service.renew_now(&bad)), RefusalReason::BadCsr);
     let mut malformed = renew_request("node-01", &ROLES, &keys, now);
     malformed.node_id = "Not A Node".to_owned();
-    assert_eq!(refused(farm.service.renew_now(&malformed)), RefusalReason::MalformedRequest);
+    assert_eq!(
+        refused(farm.service.renew_now(&malformed)),
+        RefusalReason::MalformedRequest
+    );
     let after = list_nodes(&*farm.store).expect("nodes");
     assert_eq!(after[0].last_renewed_at, None);
 }
@@ -198,6 +244,8 @@ fn an_unknown_node_a_different_role_set_and_a_bad_csr_are_refused() {
 fn a_node_expired_beyond_the_grace_must_enroll_again() {
     let (farm, keys) = enrolled("renew-expired");
     farm.advance(86_400 * 40);
-    let result = farm.service.renew_now(&renew_request("node-01", &ROLES, &keys, farm.now()));
+    let result = farm
+        .service
+        .renew_now(&renew_request("node-01", &ROLES, &keys, farm.now()));
     assert_eq!(refused(result), RefusalReason::RenewalExpired);
 }

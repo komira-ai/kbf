@@ -499,7 +499,9 @@ async fn a_fixed_source_serves_a_replacement_to_new_handshakes() {
     let mut fresh = connect(server.addr, &ca.pem, None).await.expect("connect");
     ping(&mut fresh).await.expect("ping");
     assert_eq!(served(&fresh), new.der);
-    ping(&mut open).await.expect("the open connection still answers");
+    ping(&mut open)
+        .await
+        .expect("the open connection still answers");
     assert_eq!(source.reloads().applied, 1);
 
     let mismatch = source.replace(old.cert.as_bytes(), new.key.as_bytes());
@@ -509,7 +511,9 @@ async fn a_fixed_source_serves_a_replacement_to_new_handshakes() {
     assert_eq!(served(&after), new.der);
 
     let files = Files::write(&dir("replace-files"), &old, None);
-    let watched = files.source().replace(new.cert.as_bytes(), new.key.as_bytes());
+    let watched = files
+        .source()
+        .replace(new.cert.as_bytes(), new.key.as_bytes());
     assert!(matches!(watched, Err(TlsError::Config(_))), "{watched:?}");
     let with_ca = TlsSource::fixed(
         "test",

@@ -120,7 +120,9 @@ impl FrontendTls {
 pub(super) fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        })
 }
 
 /// The PEM chain (the new leaf, then the root) and the PEM key for a new certificate.

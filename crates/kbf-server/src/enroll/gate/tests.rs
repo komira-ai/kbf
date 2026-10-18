@@ -23,7 +23,7 @@ fn the_gate_opens_only_for_enforcement_or_an_explicit_acceptance() {
 /// operator what to do.
 #[test]
 fn this_build_refuses_enroll_listen_without_the_acceptance() {
-    assert!(!DENY_ENFORCED, "B3c flips this and changes this test");
+    const { assert!(!DENY_ENFORCED, "B3c flips this and changes this test") };
     let refused = start_gate(false).expect_err("refused");
     let text = refused.to_string();
     assert!(text.contains("--enroll-allow-unenforced-deny"), "{text}");

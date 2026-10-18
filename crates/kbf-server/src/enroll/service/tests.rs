@@ -12,8 +12,8 @@ use x509_parser::prelude::{FromDer as _, X509Certificate};
 
 use super::*;
 use crate::enroll::testkit::{
-    Farm, FRONTEND, START, csr_bad_signature, csr_oversized, csr_rsa, enroll_request, farm, farm_at, key,
-    node, spec, token,
+    FRONTEND, Farm, START, csr_bad_signature, csr_oversized, csr_rsa, enroll_request, farm,
+    farm_at, key, node, spec, token,
 };
 
 const ADVERTISE: &str = "s1.nodes.test:8983";
@@ -37,7 +37,12 @@ fn assert_is(status: &Status, reason: RefusalReason) {
         "{}: code",
         reason.name()
     );
-    assert_eq!(status.message(), reason.message(), "{}: message", reason.name());
+    assert_eq!(
+        status.message(),
+        reason.message(),
+        "{}: message",
+        reason.name()
+    );
 }
 
 fn uses(farm: &Farm) -> u32 {
@@ -89,7 +94,8 @@ fn a_fenced_store_is_not_signer_and_any_other_store_failure_is_store_unavailable
 async fn an_enrollment_answers_a_certificate_per_key_with_the_bundle_and_the_clock() {
     let farm = farm("enroll-ok");
     let tok = token(&farm, 1, &spec(&[Role::Storage, Role::Daemon]));
-    let (request, keys) = enroll_request(&tok, "node-01", &[Role::Storage, Role::Daemon], ADVERTISE);
+    let (request, keys) =
+        enroll_request(&tok, "node-01", &[Role::Storage, Role::Daemon], ADVERTISE);
     let answer = call(&farm, request).await.expect("enrolled");
 
     assert_eq!(answer.server_time, START);
@@ -104,7 +110,10 @@ async fn an_enrollment_answers_a_certificate_per_key_with_the_bundle_and_the_clo
         assert!(!cert.serial.is_empty());
     }
     assert!(answer.certs[0].not_after > START);
-    assert_eq!(answer.renew_after, START + (answer.certs[0].not_after - START) / 2);
+    assert_eq!(
+        answer.renew_after,
+        START + (answer.certs[0].not_after - START) / 2
+    );
     let config = answer.config.expect("config");
     assert_eq!(config.generation, CONFIG_GENERATION);
     assert_eq!(config.roles, ["storage", "daemon"]);
@@ -177,12 +186,18 @@ async fn the_secret_is_checked_before_the_csr_and_before_the_policy() {
     let (mut request, _) = enroll_request(&tok, "node-01", &[Role::Storage], ADVERTISE);
     request.token_secret = vec![0xee; 32];
     request.csrs[0].csr_der = csr_rsa();
-    assert_is(&refused(call(&farm, request.clone()).await), RefusalReason::TokenRefused);
+    assert_is(
+        &refused(call(&farm, request.clone()).await),
+        RefusalReason::TokenRefused,
+    );
 
     // With the right secret the same request is refused for its role, which is the policy,
     // before its CSR is read.
     request.token_secret = tok.1.as_bytes().to_vec();
-    assert_is(&refused(call(&farm, request).await), RefusalReason::RoleNotGranted);
+    assert_is(
+        &refused(call(&farm, request).await),
+        RefusalReason::RoleNotGranted,
+    );
 }
 
 /// A role the token does not grant is refused, and nothing is recorded or spent.
@@ -194,13 +209,18 @@ async fn a_role_outside_the_token_is_refused_and_nothing_is_recorded() {
     let farm = farm("enroll-roles");
     let tok = token(&farm, 1, &spec(&[Role::Daemon]));
     let (request, _) = enroll_request(&tok, "node-01", &[Role::Daemon, Role::Storage], ADVERTISE);
-    assert_is(&refused(call(&farm, request).await), RefusalReason::RoleNotGranted);
+    assert_is(
+        &refused(call(&farm, request).await),
+        RefusalReason::RoleNotGranted,
+    );
     assert!(list_nodes(&*farm.store).expect("nodes").is_empty());
     assert_eq!(uses(&farm), 0);
 
     // The subset is fine.
     let (request, _) = enroll_request(&tok, "node-01", &[Role::Daemon], "");
-    call(&farm, request).await.expect("a subset of the token's roles");
+    call(&farm, request)
+        .await
+        .expect("a subset of the token's roles");
 }
 
 /// An RSA key, an oversized CSR and a CSR whose signature does not verify are refused
@@ -224,7 +244,11 @@ async fn an_rsa_an_oversized_and_a_badly_signed_csr_are_refused_bad_csr() {
         let (mut request, _) = enroll_request(&tok, "node-01", &[Role::Daemon], "");
         request.csrs[0].csr_der = der;
         let status = refused(call(&farm, request).await);
-        assert_eq!(status.code(), Code::from_i32(RefusalReason::BadCsr.code().number()), "{name}");
+        assert_eq!(
+            status.code(),
+            Code::from_i32(RefusalReason::BadCsr.code().number()),
+            "{name}"
+        );
         assert_is(&status, RefusalReason::BadCsr);
     }
     assert_eq!(uses(&farm), 0, "a refused request spends nothing");
@@ -245,7 +269,11 @@ async fn the_same_request_again_is_the_same_answer_and_one_use() {
     let second = call(&farm, request).await.expect("second");
     assert_eq!(first.certs, second.certs);
     assert_eq!(uses(&farm), 1);
-    assert_eq!(second.server_time, START + 5, "the clock is read for each answer");
+    assert_eq!(
+        second.server_time,
+        START + 5,
+        "the clock is read for each answer"
+    );
 }
 
 /// A token's use is its limit: a second node with a one-use token is refused.
@@ -258,18 +286,27 @@ async fn a_used_up_revoked_or_wrong_node_token_is_refused_with_its_reason() {
     let (first, _) = enroll_request(&one, "node-01", &[Role::Daemon], "");
     call(&farm, first).await.expect("first node");
     let (second, _) = enroll_request(&one, "node-02", &[Role::Daemon], "");
-    assert_is(&refused(call(&farm, second).await), RefusalReason::TokenUsedUp);
+    assert_is(
+        &refused(call(&farm, second).await),
+        RefusalReason::TokenUsedUp,
+    );
 
     let revoked = token(&farm, 2, &spec(&[Role::Daemon]));
     kbf_enroll_registry::revoke_token(&*farm.store, &revoked.0).expect("revoke");
     let (request, _) = enroll_request(&revoked, "node-03", &[Role::Daemon], "");
-    assert_is(&refused(call(&farm, request).await), RefusalReason::TokenRevoked);
+    assert_is(
+        &refused(call(&farm, request).await),
+        RefusalReason::TokenRevoked,
+    );
 
     let mut exact = spec(&[Role::Daemon]);
     exact.node_id = Some(node("node-09"));
     let exact = token(&farm, 3, &exact);
     let (request, _) = enroll_request(&exact, "node-04", &[Role::Daemon], "");
-    assert_is(&refused(call(&farm, request).await), RefusalReason::NodeIdNotAllowed);
+    assert_is(
+        &refused(call(&farm, request).await),
+        RefusalReason::NodeIdNotAllowed,
+    );
 }
 
 /// The advertise host of a storage node may not be a name the frontend serves, loopback or
@@ -314,10 +351,26 @@ async fn a_malformed_request_is_refused_before_the_store_is_read() {
         request
     };
     let cases: Vec<(&str, pb::EnrollRequest, RefusalReason)> = vec![
-        ("node id", ask(&|r| r.node_id = "Node 01".to_owned()), RefusalReason::MalformedRequest),
-        ("token id", ask(&|r| r.token_id = "nope".to_owned()), RefusalReason::MalformedRequest),
-        ("zone", ask(&|r| r.zone = "z".repeat(64)), RefusalReason::MalformedRequest),
-        ("no roles", ask(&|r| r.csrs.clear()), RefusalReason::BadRoles),
+        (
+            "node id",
+            ask(&|r| r.node_id = "Node 01".to_owned()),
+            RefusalReason::MalformedRequest,
+        ),
+        (
+            "token id",
+            ask(&|r| r.token_id = "nope".to_owned()),
+            RefusalReason::MalformedRequest,
+        ),
+        (
+            "zone",
+            ask(&|r| r.zone = "z".repeat(64)),
+            RefusalReason::MalformedRequest,
+        ),
+        (
+            "no roles",
+            ask(&|r| r.csrs.clear()),
+            RefusalReason::BadRoles,
+        ),
         (
             "twice",
             ask(&|r| r.csrs.push(r.csrs[0].clone())),
@@ -350,7 +403,12 @@ async fn a_fenced_frontend_answers_not_signer() {
     let service = crate::enroll::testkit::service_over(&stale, &farm.ca);
     let tok = token(&farm, 1, &spec(&[Role::Daemon]));
     let (request, _) = enroll_request(&tok, "node-01", &[Role::Daemon], "");
-    let status = refused(service.enroll(Request::new(request)).await.map(tonic::Response::into_inner));
+    let status = refused(
+        service
+            .enroll(Request::new(request))
+            .await
+            .map(tonic::Response::into_inner),
+    );
     assert_is(&status, RefusalReason::NotSigner);
     assert!(list_nodes(&*farm.store).expect("nodes").is_empty());
 }
@@ -365,7 +423,10 @@ async fn a_ca_that_cannot_sign_answers_not_signer_and_records_nothing() {
     let farm = farm_at("enroll-clock", 1_000_000);
     let tok = token(&farm, 1, &spec(&[Role::Daemon]));
     let (request, _) = enroll_request(&tok, "node-01", &[Role::Daemon], "");
-    assert_is(&refused(call(&farm, request).await), RefusalReason::NotSigner);
+    assert_is(
+        &refused(call(&farm, request).await),
+        RefusalReason::NotSigner,
+    );
     assert!(list_nodes(&*farm.store).expect("nodes").is_empty());
     assert_eq!(uses(&farm), 0);
 }

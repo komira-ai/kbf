@@ -39,7 +39,6 @@ pub struct Farm {
     pub store: Arc<dyn Store>,
     pub ca: Arc<Ca>,
     pub service: EnrollService,
-    pub dir: PathBuf,
 }
 
 /// A farm whose store clock reads `start` (unix seconds) and whose CA, made in a new
@@ -51,7 +50,14 @@ pub fn farm_at(name: &str, start: i64) -> Farm {
     let dir = scratch(name);
     let policy = Policy::new(86_400).expect("policy");
     let ca = Arc::new(
-        Ca::open(&dir, &SignerChoice::DevFile, policy, START, &mut SystemEntropy).expect("a CA"),
+        Ca::open(
+            &dir,
+            &SignerChoice::DevFile,
+            policy,
+            START,
+            &mut SystemEntropy,
+        )
+        .expect("a CA"),
     );
     let service = service_over(&store, &ca);
     Farm {
@@ -59,7 +65,6 @@ pub fn farm_at(name: &str, start: i64) -> Farm {
         store,
         ca,
         service,
-        dir,
     }
 }
 
@@ -168,24 +173,30 @@ fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
 /// signature is not one): what the CA must refuse because of the key type, before it
 /// looks at anything else.
 pub fn csr_rsa() -> Vec<u8> {
-    let rsa_oid = [0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+    let rsa_oid = [
+        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+    ];
     let algorithm = tlv(0x30, &[rsa_oid.as_slice(), &[0x05, 0x00]].concat());
-    let key = tlv(0x03, &[&[0u8][..], &[0x30, 0x06, 0x02, 0x01, 0x03, 0x02, 0x01, 0x03][..]].concat());
+    let key = tlv(
+        0x03,
+        &[
+            &[0u8][..],
+            &[0x30, 0x06, 0x02, 0x01, 0x03, 0x02, 0x01, 0x03][..],
+        ]
+        .concat(),
+    );
     let spki = tlv(0x30, &[algorithm.clone(), key].concat());
     let cri = tlv(
         0x30,
-        &[
-            tlv(0x02, &[0]),
-            tlv(0x30, &[]),
-            spki,
-            tlv(0xa0, &[]),
-        ]
-        .concat(),
+        &[tlv(0x02, &[0]), tlv(0x30, &[]), spki, tlv(0xa0, &[])].concat(),
     );
     let sha256_rsa = tlv(
         0x30,
         &[
-            [0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b].as_slice(),
+            [
+                0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b,
+            ]
+            .as_slice(),
             &[0x05, 0x00],
         ]
         .concat(),

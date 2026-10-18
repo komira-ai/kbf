@@ -195,9 +195,13 @@ impl EnrollService {
     ///
     /// # Errors
     /// The [`RefusalReason`] the frontend sends.
-    pub fn enroll_now(&self, request: &pb::EnrollRequest) -> Result<pb::EnrollResponse, RefusalReason> {
+    pub fn enroll_now(
+        &self,
+        request: &pb::EnrollRequest,
+    ) -> Result<pb::EnrollResponse, RefusalReason> {
         let core = &*self.core;
-        let token_id = TokenId::parse(&request.token_id).map_err(|_| RefusalReason::MalformedRequest)?;
+        let token_id =
+            TokenId::parse(&request.token_id).map_err(|_| RefusalReason::MalformedRequest)?;
         let node_id: NodeId = request
             .node_id
             .parse()

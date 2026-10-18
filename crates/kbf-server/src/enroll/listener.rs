@@ -17,8 +17,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use futures::future::BoxFuture;
 use futures::FutureExt as _;
+use futures::future::BoxFuture;
 use kbf_proto::kbf::enroll::v1::enroll_server::EnrollServer;
 use tonic::transport::Server;
 
@@ -69,7 +69,13 @@ impl EnrollListener {
     /// The runtime cannot register the socket.
     pub(crate) fn serve(
         self,
-    ) -> Result<(BoxFuture<'static, Result<(), tonic::transport::Error>>, Latch), ServeError> {
+    ) -> Result<
+        (
+            BoxFuture<'static, Result<(), tonic::transport::Error>>,
+            Latch,
+        ),
+        ServeError,
+    > {
         let (incoming, latch) = self.socket.grpc(Some(self.tls.source()))?;
         let service = EnrollServer::new(self.service).max_decoding_message_size(MAX_REQUEST_BYTES);
         let serving = Server::builder()

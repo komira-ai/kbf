@@ -38,7 +38,10 @@ impl EnrollService {
     ///
     /// # Errors
     /// The [`RefusalReason`] the frontend sends.
-    pub fn renew_now(&self, request: &pb::RenewRequest) -> Result<pb::RenewResponse, RefusalReason> {
+    pub fn renew_now(
+        &self,
+        request: &pb::RenewRequest,
+    ) -> Result<pb::RenewResponse, RefusalReason> {
         let core = &*self.core;
         let node_id: NodeId = request
             .node_id
@@ -83,8 +86,7 @@ impl EnrollService {
         Ok(pb::RenewResponse {
             certs: certs_of(&renewed.certs),
             ca_bundle_pem: core.ca.bundle_pem().into_bytes(),
-            config: (request.config_generation != CONFIG_GENERATION)
-                .then(|| core.config(&renewed)),
+            config: (request.config_generation != CONFIG_GENERATION).then(|| core.config(&renewed)),
             server_time: now,
             renew_after: renew_after(now, &renewed.certs),
         })

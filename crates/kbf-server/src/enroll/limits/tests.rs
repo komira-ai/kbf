@@ -36,11 +36,17 @@ fn a_source_gets_its_burst_then_the_refill_rate_and_no_more() {
     assert!([0, 0, 0].iter().all(|_| limiter.admit(a, t0)));
     assert!(!limiter.admit(a, t0), "the fourth call at once");
     assert!(!limiter.admit(a, t0 + Duration::from_millis(900)));
-    assert!(limiter.admit(a, t0 + Duration::from_secs(1)), "one token per second");
+    assert!(
+        limiter.admit(a, t0 + Duration::from_secs(1)),
+        "one token per second"
+    );
     assert!(!limiter.admit(a, t0 + Duration::from_secs(1)));
     let later = t0 + Duration::from_secs(3600);
     assert!([0, 0, 0].iter().all(|_| limiter.admit(a, later)));
-    assert!(!limiter.admit(a, later), "an idle hour buys the burst and no more");
+    assert!(
+        !limiter.admit(a, later),
+        "an idle hour buys the burst and no more"
+    );
 }
 
 /// Each source has its own bucket; an IPv6 source is its /64, an IPv4-mapped IPv6 address
@@ -80,10 +86,16 @@ fn the_table_is_bounded_and_forgets_sources_that_are_idle() {
         assert!(limiter.admit(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + n)), t0));
     }
     assert_eq!(limiter.tracked(), MAX_SOURCES);
-    assert!(!limiter.admit(ip("192.0.2.9"), t0), "every slot is spending");
+    assert!(
+        !limiter.admit(ip("192.0.2.9"), t0),
+        "every slot is spending"
+    );
     assert_eq!(limiter.tracked(), MAX_SOURCES);
     let later = t0 + Duration::from_secs(10);
-    assert!(limiter.admit(ip("192.0.2.9"), later), "the idle ones were forgotten");
+    assert!(
+        limiter.admit(ip("192.0.2.9"), later),
+        "the idle ones were forgotten"
+    );
     assert_eq!(limiter.tracked(), 1);
 }
 
@@ -190,7 +202,11 @@ async fn calls_in_flight_are_capped_and_the_slot_comes_back() {
     let first = tokio::spawn(guard.call(http::Request::new(())));
     tokio::task::yield_now().await;
     let second = guard.call(http::Request::new(())).await.expect("answer");
-    assert_eq!(grpc_status(&second), rate_limited(), "one in flight already");
+    assert_eq!(
+        grpc_status(&second),
+        rate_limited(),
+        "one in flight already"
+    );
 
     gate.notify_one();
     let done = first.await.expect("task").expect("answer");
@@ -244,5 +260,5 @@ fn guard_with(status: &'static str) -> Guard<Inner> {
 #[test]
 fn the_request_cap_is_sixteen_kib() {
     assert_eq!(MAX_REQUEST_BYTES, 16 * 1024);
-    assert!(MAX_REQUEST_BYTES > 2 * kbf_ca::MAX_CSR_LEN + 1024, "two CSRs and a token fit");
+    const { assert!(MAX_REQUEST_BYTES > 2 * kbf_ca::MAX_CSR_LEN + 1024) };
 }

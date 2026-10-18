@@ -72,7 +72,9 @@ fn flags(ca_dir: PathBuf, limits: Limits, allow_unenforced_deny: bool) -> Enroll
 
 async fn start(name: &str, limits: Limits) -> Farm {
     let clock = Arc::new(ManualClock::default());
-    clock.advance(Duration::from_secs(u64::try_from(unix_now()).expect("time")));
+    clock.advance(Duration::from_secs(
+        u64::try_from(unix_now()).expect("time"),
+    ));
     let store: Arc<dyn Store> = Arc::new(Fake::with_flaw(Arc::clone(&clock), Flaw::None));
     let ca_dir = scratch(name).join("ca");
     let flags = flags(ca_dir.clone(), limits, true);
@@ -129,7 +131,11 @@ struct Node {
 /// A node's files. A storage node says where it can be reached; a node with no storage
 /// role must not (the registry refuses an advertise address it has no use for).
 fn node(name: &str, farm: &Farm, token: &Token, storage: bool) -> Node {
-    let advertise = if storage { "advertise = \"node-02.nodes.test:8983\"\n" } else { "" };
+    let advertise = if storage {
+        "advertise = \"node-02.nodes.test:8983\"\n"
+    } else {
+        ""
+    };
     let root = scratch(name);
     let text = format!(
         "[frontend]\nurl = \"https://localhost:{}\"\n[node]\nid = \"node-02\"\n{advertise}[enroll]\ntoken_file = \"{}\"\n[dirs]\nstate = \"{}\"\n",
@@ -241,9 +247,14 @@ async fn a_node_renews_and_a_revoked_node_is_refused_node_revoked() {
     let frontend = dial(&node, &token).await;
 
     farm.advance(120);
-    let renewed = renew(&frontend, &node.store, unix_now() + 120).await.expect("renewed");
+    let renewed = renew(&frontend, &node.store, unix_now() + 120)
+        .await
+        .expect("renewed");
     assert_eq!(renewed.roles(), first.roles());
-    assert_ne!(renewed.certs[0].serial, first.certs[0].serial, "new certificates");
+    assert_ne!(
+        renewed.certs[0].serial, first.certs[0].serial,
+        "new certificates"
+    );
     assert!(renewed.earliest_not_after() > first.earliest_not_after());
 
     revoke_node(&*farm.store, &"node-02".parse().expect("id"), "e2e").expect("revoked");
@@ -252,7 +263,10 @@ async fn a_node_renews_and_a_revoked_node_is_refused_node_revoked() {
         .await
         .expect_err("revoked");
     assert!(
-        matches!(error, RenewError::Call(CallError::Refused(RefusalReason::NodeRevoked))),
+        matches!(
+            error,
+            RenewError::Call(CallError::Refused(RefusalReason::NodeRevoked))
+        ),
         "{error:?}"
     );
 }
@@ -269,20 +283,44 @@ async fn refusals_reach_the_client_as_exactly_the_reason() {
     let farm = start("refusals", Limits::DEFAULT).await;
     let token = farm.token(0x3333, &[Role::Daemon], 1);
 
-    let wrong = Token::new(token.id().clone(), TokenSecret::from_bytes([0xee; 32]), farm.pin);
+    let wrong = Token::new(
+        token.id().clone(),
+        TokenSecret::from_bytes([0xee; 32]),
+        farm.pin,
+    );
     let node_a = node("refusals-a", &farm, &wrong, false);
-    let error = enroll_with(&node_a, &wrong, &[Role::Daemon]).await.expect_err("refused");
-    assert_eq!(refused(&error), Some(RefusalReason::TokenRefused), "{error:?}");
+    let error = enroll_with(&node_a, &wrong, &[Role::Daemon])
+        .await
+        .expect_err("refused");
+    assert_eq!(
+        refused(&error),
+        Some(RefusalReason::TokenRefused),
+        "{error:?}"
+    );
 
     let node_b = node("refusals-b", &farm, &token, true);
-    let error = enroll_with(&node_b, &token, &[Role::Storage]).await.expect_err("refused");
-    assert_eq!(refused(&error), Some(RefusalReason::RoleNotGranted), "{error:?}");
+    let error = enroll_with(&node_b, &token, &[Role::Storage])
+        .await
+        .expect_err("refused");
+    assert_eq!(
+        refused(&error),
+        Some(RefusalReason::RoleNotGranted),
+        "{error:?}"
+    );
 
     let node_d = node("refusals-d", &farm, &token, false);
-    enroll_with(&node_d, &token, &[Role::Daemon]).await.expect("enrolled");
+    enroll_with(&node_d, &token, &[Role::Daemon])
+        .await
+        .expect("enrolled");
     let node_c = node("refusals-c", &farm, &token, false);
-    let error = enroll_with(&node_c, &token, &[Role::Daemon]).await.expect_err("refused");
-    assert_eq!(refused(&error), Some(RefusalReason::TokenUsedUp), "{error:?}");
+    let error = enroll_with(&node_c, &token, &[Role::Daemon])
+        .await
+        .expect_err("refused");
+    assert_eq!(
+        refused(&error),
+        Some(RefusalReason::TokenUsedUp),
+        "{error:?}"
+    );
 }
 
 /// A node that pins another CA does not talk to this frontend.
@@ -325,10 +363,22 @@ async fn a_request_over_sixteen_kib_is_malformed_and_one_under_it_is_read() {
         }],
         ..Default::default()
     };
-    let under = frontend.enroll(request(3 * 1024)).await.expect_err("refused");
-    assert!(matches!(under, CallError::Refused(RefusalReason::BadCsr)), "{under:?}");
-    let over = frontend.enroll(request(17 * 1024)).await.expect_err("refused");
-    assert!(matches!(over, CallError::Refused(RefusalReason::MalformedRequest)), "{over:?}");
+    let under = frontend
+        .enroll(request(3 * 1024))
+        .await
+        .expect_err("refused");
+    assert!(
+        matches!(under, CallError::Refused(RefusalReason::BadCsr)),
+        "{under:?}"
+    );
+    let over = frontend
+        .enroll(request(17 * 1024))
+        .await
+        .expect_err("refused");
+    assert!(
+        matches!(over, CallError::Refused(RefusalReason::MalformedRequest)),
+        "{over:?}"
+    );
 }
 
 /// A source over its burst is `RateLimited` on the wire, and the limit does not spend the

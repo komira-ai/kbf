@@ -49,10 +49,13 @@ fn enrollment_is_off_unless_asked_for() {
 /// listener that does not carry the names it was given.
 #[test]
 fn the_dev_signer_parses_with_the_documented_defaults() {
-    let parsed = flags(&with(&["--ca-dev-file-signer", "--frontend-name=Front2.Test"]))
-        .expect("flags")
-        .enroll
-        .expect("enroll");
+    let parsed = flags(&with(&[
+        "--ca-dev-file-signer",
+        "--frontend-name=Front2.Test",
+    ]))
+    .expect("flags")
+    .enroll
+    .expect("enroll");
     assert_eq!(parsed.listen, "127.0.0.1:18983".parse().expect("addr"));
     assert_eq!(parsed.signer, SignerChoice::DevFile);
     assert_eq!(parsed.frontend_names, ["front.test", "front2.test"]);
@@ -80,8 +83,14 @@ fn production_needs_a_signer_socket_and_the_file_signer_is_explicit() {
         SignerChoice::External(PathBuf::from("/run/kbf/signer.sock"))
     );
 
-    let both = error(&with(&["--ca-signer=/run/kbf/signer.sock", "--ca-dev-file-signer"]));
-    assert!(both.contains("--ca-signer") && both.contains("--ca-dev-file-signer"), "{both}");
+    let both = error(&with(&[
+        "--ca-signer=/run/kbf/signer.sock",
+        "--ca-dev-file-signer",
+    ]));
+    assert!(
+        both.contains("--ca-signer") && both.contains("--ca-dev-file-signer"),
+        "{both}"
+    );
 }
 
 /// `--enroll-listen` needs the state store, a CA directory and a frontend name, and every
@@ -98,7 +107,10 @@ fn the_listener_needs_its_companions_and_they_need_it() {
             .filter(|arg| !arg.starts_with(missing))
             .collect();
         let text = error(&args);
-        assert!(text.contains(&missing[2..].replace('-', "_")) || text.contains(missing), "{missing}: {text}");
+        assert!(
+            text.contains(&missing[2..].replace('-', "_")) || text.contains(missing),
+            "{missing}: {text}"
+        );
     }
     for companion in [
         "--ca-dir=/x",
@@ -134,8 +146,22 @@ fn bad_names_and_out_of_range_numbers_are_refused() {
     ] {
         assert!(flags(&with(&[dev[0], bad])).is_err(), "{bad}");
     }
-    assert!(flags(&with(&[dev[0], "--frontend-name=192.0.2.7", "--frontend-name=[::1]"])).is_err());
-    assert!(flags(&with(&[dev[0], "--frontend-name=192.0.2.7", "--frontend-name=2001:db8::1"])).is_ok());
+    assert!(
+        flags(&with(&[
+            dev[0],
+            "--frontend-name=192.0.2.7",
+            "--frontend-name=[::1]"
+        ]))
+        .is_err()
+    );
+    assert!(
+        flags(&with(&[
+            dev[0],
+            "--frontend-name=192.0.2.7",
+            "--frontend-name=2001:db8::1"
+        ]))
+        .is_ok()
+    );
 }
 
 /// The numbers a node is told are the flags'.
@@ -160,7 +186,14 @@ fn what_nodes_are_told_comes_from_the_flags() {
     assert_eq!(parsed.settings.worker_endpoint, "https://front.test:7443");
     assert_eq!(parsed.settings.cas_endpoint, "https://front.test:7444");
     assert_eq!(parsed.settings.storage_port, 9000);
-    assert_eq!(parsed.limits, Limits { per_minute: 5, burst: 7, in_flight: 3 });
+    assert_eq!(
+        parsed.limits,
+        Limits {
+            per_minute: 5,
+            burst: 7,
+            in_flight: 3
+        }
+    );
     assert!(parsed.allow_unenforced_deny);
     assert_eq!(parsed.cert_lifetime_secs, 7200);
 }
@@ -172,7 +205,10 @@ fn what_nodes_are_told_comes_from_the_flags() {
 /// not start), or an enroll listener left out of the port block.
 #[test]
 fn instance_b_moves_the_enroll_listener_with_the_others() {
-    let handover = ["--handover-socket=/run/kbf/control.sock", "--ca-dev-file-signer"];
+    let handover = [
+        "--handover-socket=/run/kbf/control.sock",
+        "--ca-dev-file-signer",
+    ];
     let a = flags(&with(&[handover[0], handover[1], "--instance=a"])).expect("flags");
     let b = flags(&with(&[handover[0], handover[1], "--instance=b"])).expect("flags");
     assert_eq!(a.enroll.expect("enroll").listen.port(), 18983);

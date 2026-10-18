@@ -27,9 +27,11 @@ fn the_certificate_is_renewed_into_the_served_configuration() {
     let farm = farm("tls-renew");
     let tls = FrontendTls::start(&farm.ca, &names(), now(), &mut SystemEntropy).expect("tls");
     assert_eq!(tls.source().reloads().applied, 0);
-    tls.renew(&farm.ca, now() + 60, &mut SystemEntropy).expect("renewed");
+    tls.renew(&farm.ca, now() + 60, &mut SystemEntropy)
+        .expect("renewed");
     assert_eq!(tls.source().reloads().applied, 1);
-    tls.renew(&farm.ca, now() + 120, &mut SystemEntropy).expect("renewed");
+    tls.renew(&farm.ca, now() + 120, &mut SystemEntropy)
+        .expect("renewed");
     assert_eq!(tls.source().reloads().applied, 2);
 }
 
@@ -43,7 +45,10 @@ fn a_renewal_the_ca_refuses_leaves_the_served_certificate_alone() {
     let farm = farm("tls-refused");
     let tls = FrontendTls::start(&farm.ca, &names(), now(), &mut SystemEntropy).expect("tls");
     let refused = tls.renew(&farm.ca, 1_000, &mut SystemEntropy);
-    assert!(matches!(refused, Err(TlsIdentityError::Ca(_))), "{refused:?}");
+    assert!(
+        matches!(refused, Err(TlsIdentityError::Ca(_))),
+        "{refused:?}"
+    );
     assert_eq!(tls.source().reloads().applied, 0);
 }
 

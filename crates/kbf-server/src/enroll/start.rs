@@ -11,6 +11,7 @@ use kbf_ca::{Policy, SystemEntropy};
 use kbf_signer::Started;
 use kbf_state::Store;
 
+use super::OsRandom;
 use super::api::EnrollApi;
 use super::ca::{Ca, CaPins, SignerChoice};
 use super::flags::EnrollFlags;
@@ -18,7 +19,6 @@ use super::gate::start_gate;
 use super::listener::EnrollListener;
 use super::service::EnrollService;
 use super::tls::{FrontendTls, unix_now};
-use super::OsRandom;
 use crate::listen::{Latch, Socket};
 
 /// What a frontend holds of enrollment before its state store is open: the socket bound,
@@ -67,7 +67,13 @@ pub fn prepare(flags: &EnrollFlags) -> Result<Prepared, Box<dyn Error>> {
     let socket = Socket::bind(flags.listen)?;
     let policy = Policy::new(flags.cert_lifetime_secs)?;
     let now = unix_now();
-    let ca = Ca::open(&flags.ca_dir, &flags.signer, policy, now, &mut SystemEntropy)?;
+    let ca = Ca::open(
+        &flags.ca_dir,
+        &flags.signer,
+        policy,
+        now,
+        &mut SystemEntropy,
+    )?;
     if flags.signer == SignerChoice::DevFile {
         tracing::warn!(
             "the CA key is a file in this process (--ca-dev-file-signer): development only"
