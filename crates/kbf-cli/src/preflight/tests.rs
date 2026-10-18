@@ -26,6 +26,7 @@ const CRUN: &str = "/usr/bin/crun";
 struct Fake {
     files: BTreeMap<PathBuf, (Stat, Vec<u8>)>,
     stat_errors: BTreeMap<PathBuf, io::ErrorKind>,
+    read_errors: BTreeMap<PathBuf, io::ErrorKind>,
     vars: BTreeMap<String, String>,
     euid: u32,
     nofile: u64,
@@ -37,6 +38,7 @@ impl Fake {
         Self {
             files: BTreeMap::new(),
             stat_errors: BTreeMap::new(),
+            read_errors: BTreeMap::new(),
             vars: BTreeMap::new(),
             euid: ME,
             nofile: 1 << 20,
@@ -106,6 +108,9 @@ impl Host for Fake {
     }
 
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        if let Some(kind) = self.read_errors.get(path) {
+            return Err(io::Error::from(*kind));
+        }
         if self.stat(path)?.kind != Kind::File {
             // As `read` of a directory fails.
             return Err(io::Error::other("is a directory"));
@@ -359,6 +364,42 @@ fn a_file_that_cannot_be_statted_for_permission_is_refused() {
         Class::Refused,
         &[KEY, "permission denied"],
     );
+}
+
+#[test]
+fn a_certificate_ca_or_key_that_stats_but_cannot_be_read_is_refused() {
+    // A root-owned 0600 file after a root-run renewal: stat answers, read does not.
+    for (path, flag) in [(CERT, "--cert"), (CA, "--ca-cert"), (KEY, "--key")] {
+        let (needs, mut host) = healthy();
+        host.read_errors
+            .insert(PathBuf::from(path), io::ErrorKind::PermissionDenied);
+        only(
+            &check(&needs, &host),
+            Class::Refused,
+            &[flag, path, "cannot be read", "permission denied"],
+        );
+    }
+}
+
+#[test]
+fn an_unreadable_file_on_a_busy_file_system_is_not_ready() {
+    let (needs, mut host) = healthy();
+    host.read_errors
+        .insert(PathBuf::from(CERT), io::ErrorKind::TimedOut);
+    only(&check(&needs, &host), Class::NotReady, &["--cert", CERT]);
+}
+
+#[test]
+fn a_secret_the_owner_cannot_read_is_refused_once() {
+    for mode in [0o000, 0o200] {
+        let (needs, host) = healthy();
+        let host = host.chmod(KEY, ME, mode);
+        only(
+            &check(&needs, &host),
+            Class::Refused,
+            &["--key", KEY, "cannot read", "chmod 600"],
+        );
+    }
 }
 
 // ---- certificates -------------------------------------------------------------------------

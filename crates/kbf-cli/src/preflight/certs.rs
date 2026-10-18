@@ -16,7 +16,7 @@ use rustls::server::WebPkiClientVerifier;
 use rustls::sign::CertifiedKey;
 use rustls::{CertificateError, Error, InconsistentKeys};
 
-use super::{CertNeed, Class, Host, Needs, Report, Row};
+use super::{CertNeed, Class, Host, Needs, Report, Row, files};
 
 const SERVER_AUTH: &str = "serverAuth";
 const CLIENT_AUTH: &str = "clientAuth";
@@ -51,8 +51,10 @@ fn certificates(pem: &[u8]) -> Vec<CertificateDer<'static>> {
 }
 
 fn one(c: &CertNeed, host: &dyn Host, report: &mut Report) {
-    // A file that cannot be read was reported with the files.
-    let Ok(pem) = host.read(&c.path) else { return };
+    let Some(pem) = files::read(host, c.flag, &c.path, "TLS cannot start without it", report)
+    else {
+        return;
+    };
     let mut chain = certificates(&pem);
     let flag = c.flag;
     let at = c.path.display();
@@ -154,9 +156,16 @@ fn pair(
     host: &dyn Host,
     report: &mut Report,
 ) {
-    // A file that cannot be read was reported with the files.
-    let Ok(pem) = host.read(key_path) else { return };
     let (flag, at, key_at) = (c.flag, c.path.display(), key_path.display());
+    let Some(pem) = files::read(
+        host,
+        key_flag,
+        key_path,
+        "TLS cannot start without it",
+        report,
+    ) else {
+        return;
+    };
     let write = format!("write the PEM private key the farm's issuer made for {flag} to {key_at}");
     let Ok(der) = PrivateKeyDer::from_pem_slice(&pem) else {
         report.refuse(
@@ -223,7 +232,13 @@ fn chains(
     host: &dyn Host,
     report: &mut Report,
 ) {
-    let Ok(ca_pem) = host.read(ca_path) else {
+    let Some(ca_pem) = files::read(
+        host,
+        ca_flag,
+        ca_path,
+        "the node's certificate is checked against it",
+        report,
+    ) else {
         return;
     };
     let mut roots = RootCertStore::empty();

@@ -1,6 +1,7 @@
 //! The files the flags name: there, regular, and the secrets private.
 
 use std::io;
+use std::path::Path;
 
 use super::host::Kind;
 use super::{Class, FileNeed, Host, Needs, Report};
@@ -79,6 +80,17 @@ fn one(f: &FileNeed, host: &dyn Host, report: &mut Report) {
             format!("chown {me} {path_text}"),
         );
     }
+    if stat.mode & 0o400 == 0 {
+        report.refuse(
+            format!(
+                "{flag} {path_text} has mode {:04o}, which the user kbf runs as cannot read",
+                stat.mode
+            ),
+            why,
+            format!("chmod 600 {path_text}"),
+        );
+        return;
+    }
     if stat.mode & 0o077 != 0 {
         report.refuse(
             format!("{flag} {path_text} has mode {:04o}", stat.mode),
@@ -86,4 +98,33 @@ fn one(f: &FileNeed, host: &dyn Host, report: &mut Report) {
             format!("chmod 600 {path_text}"),
         );
     }
+}
+
+/// The bytes of the file `flag` names, or `None` with the read error in `report`: a file
+/// that stats fine can still refuse the read (a root-owned 0600 file after a root-run
+/// renewal), and the mode would then fail at its TLS load and be restarted for good. An
+/// error on a path the files check already reported is not reported twice.
+pub(super) fn read(
+    host: &dyn Host,
+    flag: &str,
+    path: &Path,
+    why: &str,
+    report: &mut Report,
+) -> Option<Vec<u8>> {
+    let e = match host.read(path) {
+        Ok(bytes) => return Some(bytes),
+        Err(e) => e,
+    };
+    let at = path.display().to_string();
+    if !report.problems.iter().any(|p| p.what.contains(&at)) {
+        report.push(
+            class_of(&e),
+            format!("{flag} {at} cannot be read: {e}"),
+            why,
+            "give the user kbf runs read access to the file (a file renewed by root is \
+             root's: chown it back)"
+                .to_owned(),
+        );
+    }
+    None
 }
