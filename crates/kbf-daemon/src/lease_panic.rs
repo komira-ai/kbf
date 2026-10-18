@@ -1,5 +1,5 @@
 //! A lease's run with its driver's panics contained (the all-in-one design,
-//! komira-build-farm#657, section 7.3).
+//! kbf#657, section 7.3).
 
 use std::any::Any;
 use std::panic::AssertUnwindSafe;

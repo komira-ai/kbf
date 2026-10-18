@@ -187,6 +187,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "data-max-bytes",
             "driver",
             "image",
+            "orders-dir",
             "reconnect-max-ms",
             "reconnect-ms",
             "reserve-cpus",
@@ -311,6 +312,77 @@ pub fn check_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The top-level `mode` of the file at `path`: `None` when it sets none.
+///
+/// # Errors
+/// The file may not be read ([`check_file`]), is not TOML, or `mode` is not a string.
+pub fn file_mode(path: &Path) -> Result<Option<String>, String> {
+    check_file(path)?;
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read the config file {}: {e}", path.display()))?;
+    let table: toml::Table = toml::from_str(&text)
+        .map_err(|e| format!("the config file {} is not valid TOML: {e}", path.display()))?;
+    match table.get("mode") {
+        None => Ok(None),
+        Some(toml::Value::String(mode)) => Ok(Some(mode.clone())),
+        Some(_) => Err(format!(
+            "the config file {}: `mode` is a string naming one mode",
+            path.display()
+        )),
+    }
+}
+
+/// Whether the file at `path` holds enrollment's tables (`[enroll]`, `[frontend]` or
+/// `[node]`: a node that gets its certificates and its settings from a frontend), as
+/// against a file of the mode's flags alone. A file that cannot be read or parsed does
+/// not: the flags' parser reports it.
+#[must_use]
+pub fn enrolls(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+        .is_some_and(|table| {
+            ["enroll", "frontend", "node"]
+                .iter()
+                .any(|t| table.get(*t).is_some_and(toml::Value::is_table))
+        })
+}
+
+/// The refusal of `group = <value>` at the top of the file at `path` when `group` is a
+/// table of enrollment ([`kbf_enroll::config::KEYS`]): a string, number or bool there is
+/// no setting, and without this it would be dropped (`storage = "http://..."` meant as
+/// the frontend's `--storage`) or reach enrollment's parser, which names no file.
+fn value_for_table(path: &Path, group: &str, body: &toml::Value) -> Option<String> {
+    let own = !group.is_empty() && kbf_enroll::config::KEYS.iter().any(|(t, _)| *t == group);
+    (own && !body.is_table()).then(|| {
+        format!(
+            "key `{group}` in {} is a value, but [{group}] is the enrollment's table: it holds \
+             keys, not a value",
+            path.display()
+        )
+    })
+}
+
+/// Checks that no table of enrollment is a value in the file `text` read from `path`
+/// ([`value_for_table`]); text that is not TOML is left to the parser that reads it next.
+///
+/// # Errors
+/// Every such key, one per line, naming the file.
+pub fn check_own_tables(path: &Path, text: &str) -> Result<(), String> {
+    let Ok(table) = toml::from_str::<toml::Table>(text) else {
+        return Ok(());
+    };
+    let problems: Vec<String> = table
+        .iter()
+        .filter_map(|(group, body)| value_for_table(path, group, body))
+        .collect();
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("\n"))
+    }
+}
+
 /// The flags the file at `path` stands for, for the mode whose own command is `own`:
 /// `--key=value` per setting, in the file's order of tables and keys, leaving out each
 /// flag in `given` (an id of `own`: it was given on the command line, which wins).
@@ -334,6 +406,29 @@ pub fn file_args(
     let mut args = Vec::new();
     let mut problems = Vec::new();
     for (group, body) in &table {
+        // Enrollment's own keys share the file (`kbf_enroll::config::KEYS`): the top-level
+        // `mode`, and the tables of `[enroll]`, `[frontend]`, `[node]`, `[dirs]` and
+        // `[storage]`, which hold no flag; `[daemon]` and `[tls]` hold both.
+        if kbf_enroll::config::is_key("", group) {
+            continue;
+        }
+        if kbf_enroll::config::is_own_table(group) {
+            match value_for_table(path, group, body) {
+                Some(problem) => problems.push(problem),
+                None => {
+                    if let Some(key) = body.as_table().and_then(|keys| {
+                        keys.keys()
+                            .find(|key| !kbf_enroll::config::is_key(group, key))
+                    }) {
+                        problems.push(format!(
+                            "unknown key `{group}.{key}` in {}: [{group}] is the enrollment's table and has no such key",
+                            path.display()
+                        ));
+                    }
+                }
+            }
+            continue;
+        }
         let toml::Value::Table(keys) = body else {
             problems.push(match group_of(group) {
                 Some(g) if known.contains_key(group.as_str()) => format!(
@@ -348,6 +443,9 @@ pub fn file_args(
             continue;
         };
         for (key, value) in keys {
+            if kbf_enroll::config::is_key(group, key) {
+                continue;
+            }
             let Some(arg) = known.get(key.as_str()) else {
                 problems.push(format!(
                     "unknown key `{group}.{key}` in {}: kbf has no flag --{key} in this mode",

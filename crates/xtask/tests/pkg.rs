@@ -12,7 +12,7 @@ use support::{BUSY_WAIT, output_unbusy};
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
 const PLIST: &str = "../../packaging/macos/com.komira.kbf-installer.plist";
-const URL: &str = "https://github.com/komira-ai/komira-build-farm/releases/download/v1/x";
+const URL: &str = "https://github.com/komira-ai/kbf/releases/download/v1/x";
 
 /// An empty directory of its own for one test, holding the stub as `kbf-installer`.
 fn scratch(name: &str) -> PathBuf {

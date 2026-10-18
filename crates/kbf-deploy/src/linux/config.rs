@@ -47,8 +47,8 @@ pub const KEYS: &[&str] = &[
     "KBF_LEASE_PLACEMENT",
 ];
 
-/// The converged units' S3 endpoint when `MINIO_S3_ENDPOINT` is not set: the host's own
-/// MinIO.
+/// The `@MINIO_S3_ENDPOINT@` value of a unit when `MINIO_S3_ENDPOINT` is not set: the
+/// host's own MinIO. (`--mode storage` refuses to render without the setting.)
 pub const LOOPBACK_MINIO: &str = "http://127.0.0.1:9000";
 
 /// Where a daemon puts each lease among the node's CPUs: kbf-daemon's `--lease-placement`
@@ -101,12 +101,12 @@ pub struct LinuxConfig {
     pub daemon_memory_min_mib: u64,
     /// RAM minus what MinIO, kbf-server and the OS keep: the daemon's
     /// `--actions-memory-max-gib` (docs/deploy/storage-node.md, "Memory on a converged
-    /// host"). At least 1.
+    /// host", a node that runs the storage half beside its builds). At least 1.
     pub actions_gib: u64,
     pub minio_unit: String,
-    /// The S3 endpoint of the bucket, when `MINIO_S3_ENDPOINT` is set. The converged
-    /// units default to the host's own MinIO ([`LOOPBACK_MINIO`]); `--mode storage`
-    /// refuses without it ([`LinuxConfig::for_mode`]).
+    /// The S3 endpoint of the bucket, when `MINIO_S3_ENDPOINT` is set. Unset, a
+    /// unit that names the endpoint gets the host's own MinIO ([`LOOPBACK_MINIO`]);
+    /// `--mode storage` refuses without it ([`LinuxConfig::for_mode`]).
     pub minio_s3_endpoint: Option<String>,
     pub s3_bucket: String,
     /// The key prefix in the bucket, empty (kbf's own default, `kbf/`) or `a/b/` with a
@@ -348,8 +348,8 @@ impl LinuxConfig {
     }
 
     /// Refuse settings that leave out a key `mode`'s unit needs: `MINIO_S3_ENDPOINT` for
-    /// `storage`, whose cold store is a bucket on MinIO elsewhere (the converged units'
-    /// default, the host's own MinIO, is a guess there).
+    /// `storage`, whose cold store is a bucket on MinIO elsewhere (the host's own MinIO,
+    /// the default of [`LOOPBACK_MINIO`], is a guess there).
     ///
     /// # Errors
     /// [`LinuxError::Required`] for the first key left out.

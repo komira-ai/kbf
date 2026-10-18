@@ -525,9 +525,21 @@ fn url(host: HostName, port: u16) -> FrontendUrl {
     FrontendUrl { host, port }
 }
 
+/// A port on which connecting is refused, and which no other test can take meanwhile
+/// (see [`kbf_testkit::port`]): a port bound and released is free only until another
+/// test's `127.0.0.1:0` bind takes it, and a TLS server there answers "certificate
+/// refused" where "unreachable" was meant.
 fn closed_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("addr").port()
+    kbf_testkit::port::dead_addr().port()
+}
+
+/// Catches `closed_port` handing out a number that is free to take (the old
+/// bind-and-drop helper): a thief binding it succeeds.
+#[test]
+fn a_closed_port_cannot_be_taken_by_another_listener() {
+    let port = closed_port();
+    let thief = std::net::TcpListener::bind(("127.0.0.1", port));
+    assert!(thief.is_err(), "a thief took the closed port {port}");
 }
 
 #[tokio::test]

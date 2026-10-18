@@ -55,14 +55,20 @@ tonic = { workspace = true, features = ["tls-ring"] }
 tower-layer.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# The wipe of a secret file's bytes after they are read or written (object_store/secrets.rs).
+zeroize.workspace = true
 
 [dev-dependencies]
+# Loopback ports nothing can take (kbf_testkit::port).
+kbf-testkit.workspace = true
 # A connector that fails its first lookups, under a lazy channel (tests/storage_register.rs),
 # and the TLS reload tests' connector that dials once per attempt (tests/tls_reload.rs).
 hyper-util = { workspace = true, features = ["tokio"] }
 # A test certificate's public-key hash and names, read independently of kbf-peer.
 x509-parser.workspace = true
 kbf-segments.workspace = true
+# The node's update client the offer tests hand the offers to (tests/update_offers.rs).
+kbf-update.workspace = true
 # The deterministic simulation kernel's seeded random stream (tests/sim_rollout.rs).
 kbf-sim.workspace = true
 # The in-memory state store (src/start.rs, src/frontend, src/farm/durable and tests/).

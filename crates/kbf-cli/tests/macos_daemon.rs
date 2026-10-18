@@ -330,3 +330,67 @@ fn kbf_daemon_starts_as_the_units_words_start_it() {
         logged()
     );
 }
+
+/// The `kbf.toml` the Mac's provisioning tool renders (`kbf-mac-provision`'s
+/// `render_config`), written by hand here in the same shape: the mode, then `[identity]`
+/// and `[daemon]`, for a front on `port` of `localhost`, the node's files in `dir`, and
+/// `data` as the data directory. Not made by that crate, so that this test fails if the
+/// shape the daemon reads and the shape the tool writes ever differ by one of them moving.
+fn rendered_config(dir: &Path, data: &Path, port: u16) -> PathBuf {
+    let at = |name: &str| dir.join(name).display().to_string();
+    let url = format!("https://localhost:{port}");
+    let text = format!(
+        "mode = \"daemon\"\n\n[identity]\nserver = \"{url}\"\ncas = \"{url}\"\nca-cert = \"{}\"\n\
+         cert = \"{}\"\nkey = \"{}\"\nnode-id = \"node-1\"\nlabel = [\"pool=darwin-sized\", \"os=macos\"]\n\n\
+         [daemon]\ndriver = [\"native\"]\ndata-dir = \"{}\"\n",
+        at("ca.pem"),
+        at("node.pem"),
+        at("node.key"),
+        data.display(),
+    );
+    let path = dir.join("kbf.toml");
+    std::fs::write(&path, text).expect("write");
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+        .expect("mode");
+    path
+}
+
+/// `kbf --mode=daemon --config <kbf.toml>`, the words and the only words of the Mac
+/// LaunchDaemon's `ProgramArguments`, with every setting in the file: the daemon starts,
+/// connects to the front and says `Hello` as node `node-1` offering the native driver.
+///
+/// Catches a file the daemon does not accept as the unit's one source of settings (a key
+/// in a table the loader refuses, a flag the file cannot carry, the mode not read from
+/// it): the daemon would exit 2 and launchd restart it every ten seconds, with no node
+/// ever connecting; and a daemon that reports another node or driver than the file names.
+#[test]
+fn kbf_daemon_starts_from_the_config_file_the_unit_names() {
+    let dir = tls("config");
+    let data = dir.join("data");
+    let front = front::Front::start(&dir);
+    let config = rendered_config(&dir, &data, front.worker.port());
+    let log = dir.join("daemon.log");
+    let daemon = Command::new(BIN)
+        .args(["--mode=daemon", "--config"])
+        .arg(&config)
+        .current_dir(&dir)
+        .env("HOME", &dir)
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log).expect("log file"))
+        .spawn()
+        .map(Guarded)
+        .expect("spawn");
+    let logged = || std::fs::read_to_string(&log).unwrap_or_default();
+    let session = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| front.session(PROMPT)))
+        .unwrap_or_else(|_| panic!("the daemon did not connect; its log:\n{}", logged()));
+    let hello = session.hello();
+    assert_eq!(hello.node_id, "node-1", "{}", logged());
+    let drivers: Vec<&str> = hello
+        .capabilities
+        .iter()
+        .filter(|c| c.key == "drivers")
+        .map(|c| c.value.as_str())
+        .collect();
+    assert_eq!(drivers, ["native"], "{}", logged());
+    drop(daemon);
+}

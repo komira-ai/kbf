@@ -34,6 +34,34 @@ fn store(backend: &PostgresBackend) -> (Arc<PostgresStore>, String) {
     (Arc::new(store), schema)
 }
 
+/// Writer threads that are stopped and joined when this goes out of scope, so a failed
+/// assertion in the test body reports itself and does not unwind into dropping the schema
+/// (and the tables) under writers that are still running.
+struct Writers {
+    stop: Arc<AtomicBool>,
+    handles: Vec<thread::JoinHandle<u64>>,
+}
+
+impl Writers {
+    /// Stops the writers and returns how many writes each saw refused, summed.
+    fn finish(&mut self) -> u64 {
+        self.stop.store(true, Ordering::SeqCst);
+        self.handles
+            .drain(..)
+            .map(|writer| writer.join().expect("no panic"))
+            .sum()
+    }
+}
+
+impl Drop for Writers {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        for writer in self.handles.drain(..) {
+            let _ = writer.join();
+        }
+    }
+}
+
 /// Writers of the schema's connections that are blocked on a lock right now.
 fn waiting(schema: &str) -> i64 {
     let mut client = Client::connect(&url(), NoTls).expect("a monitoring connection");
@@ -115,11 +143,9 @@ fn no_write_of_the_old_handle_commits_after_the_takeover() {
     let old = Arc::new(Fenced::take(Arc::clone(&store) as Arc<dyn Store>, None).expect("gen 1"));
     let written = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    let fenced = Arc::new(AtomicU64::new(0));
-    let writers: Vec<_> = (0..4)
+    let handles: Vec<_> = (0..4)
         .map(|w| {
             let (old, written, stop) = (Arc::clone(&old), Arc::clone(&written), Arc::clone(&stop));
-            let fenced = Arc::clone(&fenced);
             thread::spawn(move || {
                 let mut n = 0_u64;
                 let mut refused = 0_u64;
@@ -128,10 +154,7 @@ fn no_write_of_the_old_handle_commits_after_the_takeover() {
                         Ok(Ok(_)) => {
                             written.fetch_add(1, Ordering::SeqCst);
                         }
-                        Err(StoreError::Fenced) => {
-                            refused += 1;
-                            fenced.fetch_add(1, Ordering::SeqCst);
-                        }
+                        Err(StoreError::Fenced) => refused += 1,
                         other => panic!("neither committed nor fenced: {other:?}"),
                     }
                     n += 1;
@@ -140,21 +163,17 @@ fn no_write_of_the_old_handle_commits_after_the_takeover() {
             })
         })
         .collect();
+    let mut writers = Writers {
+        stop: Arc::clone(&stop),
+        handles,
+    };
     while written.load(Ordering::SeqCst) < 50 {
         thread::yield_now();
     }
     let _new = Fenced::take(Arc::clone(&store) as Arc<dyn Store>, Some(1)).expect("B takes");
-    // Give the writers time to hit the fence, by count, not by clock: stopping them as
-    // soon as B has the generation could end them all before one saw it.
-    while fenced.load(Ordering::SeqCst) == 0 {
-        thread::yield_now();
-    }
+    // Give every writer time to hit the fence, by count, not by clock.
     let taken = store.get(GENERATION).expect("read").expect("row").version;
-    let mut refused = 0;
-    stop.store(true, Ordering::SeqCst);
-    for writer in writers {
-        refused += writer.join().expect("no panic");
-    }
+    let refused = writers.finish();
     assert!(refused > 0, "no writer ever saw the fence");
     let rows = store.scan_prefix("a/").expect("scan");
     assert!(!rows.is_empty());

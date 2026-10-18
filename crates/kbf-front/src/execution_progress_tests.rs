@@ -32,7 +32,7 @@ fn ticket_named(stage: Stage, name: &str) -> (watch::Sender<Stage>, Ticket) {
     (tx, ticket)
 }
 
-/// Catches (komira-build-farm#791): an open stream that sends nothing while its action
+/// Catches (kbf#791): an open stream that sends nothing while its action
 /// runs, so a load balancer's idle timeout cuts it and Buck2 (which never reconnects)
 /// fails the action. An action that runs for ten intervals gets ten progress
 /// operations after the first one, each the same operation, not done, at its current
