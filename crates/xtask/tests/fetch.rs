@@ -249,9 +249,10 @@ fn flags_that_do_not_fit_together_exit_2() {
         ),
         (
             &["--sha256", PIN, "--extract", "zst", "--member", "a"][..],
-            "needs --extract tar.gz",
+            "needs --extract tar.gz, tar.xz or zip",
         ),
-        (&["--sha256", PIN, "--extract", "zip"][..], "invalid value"),
+        (&["--sha256", PIN, "--extract", "zip"][..], "need --member"),
+        (&["--sha256", PIN, "--extract", "rar"][..], "invalid value"),
     ] {
         let mut args = vec!["--url", url, "--out", out];
         args.extend_from_slice(extra);

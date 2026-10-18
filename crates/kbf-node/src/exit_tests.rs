@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser as _;
-use kbf_driver_container::{DelegateError, IdFiles, OciError, check_daemon_user};
 
 use super::{Cli, ContainerNeeds, Error, HostRefused, ImageUnusable, exit_code};
 
@@ -21,22 +20,27 @@ fn code(e: Error) -> String {
 fn a_start_the_host_refuses_exits_2_and_any_other_failure_exits_1() {
     let two = format!("{:?}", ExitCode::from(2));
     let one = format!("{:?}", ExitCode::FAILURE);
-    // No subordinate ids to read: the daemon user's range is missing.
-    let subids = check_daemon_user(&IdFiles::in_dir(Path::new("/nonexistent/ids")))
-        .expect_err("no id files");
-    assert_eq!(code(Box::new(subids)), two, "subuid/subgid");
-    assert_eq!(
-        code(Box::new(DelegateError::RootCgroup)),
-        two,
-        "cgroup delegation"
-    );
-    assert_eq!(
-        code(Box::new(OciError::NoRuntime(PathBuf::from(
-            "/usr/bin/crun"
-        )))),
-        two,
-        "crun"
-    );
+    // The container driver is Linux's: macOS has none of these errors.
+    #[cfg(target_os = "linux")]
+    {
+        use kbf_driver_container::{DelegateError, IdFiles, OciError, check_daemon_user};
+        // No subordinate ids to read: the daemon user's range is missing.
+        let subids = check_daemon_user(&IdFiles::in_dir(Path::new("/nonexistent/ids")))
+            .expect_err("no id files");
+        assert_eq!(code(Box::new(subids)), two, "subuid/subgid");
+        assert_eq!(
+            code(Box::new(DelegateError::RootCgroup)),
+            two,
+            "cgroup delegation"
+        );
+        assert_eq!(
+            code(Box::new(OciError::NoRuntime(PathBuf::from(
+                "/usr/bin/crun"
+            )))),
+            two,
+            "crun"
+        );
+    }
     assert_eq!(
         code(Box::new(HostRefused(
             "read /proc/self/cgroup: gone".to_owned()
@@ -63,7 +67,7 @@ fn cli(extra: &[&str]) -> Cli {
 
 /// Catches the host needs reading the wrong flag: the files, the node id, the data
 /// directory (the default when not given) and, for the container driver alone, the
-/// OCI runtime only when `--container-runtime=oci` runs the containers.
+/// OCI runtime.
 #[test]
 fn the_flags_say_what_the_daemon_asks_of_its_host() {
     let n = cli(&["--driver=fake"]).host_needs();
@@ -78,18 +82,18 @@ fn the_flags_say_what_the_daemon_asks_of_its_host() {
     assert_eq!((n.container, n.data_dir.as_path()), (None, Path::new("/d")));
 
     let n = cli(&["--driver=container"]).host_needs();
-    assert_eq!(n.container, Some(ContainerNeeds { oci_runtime: None }));
-
-    let n = cli(&[
-        "--driver=container",
-        "--container-runtime=oci",
-        "--oci-runtime=/opt/crun",
-    ])
-    .host_needs();
     assert_eq!(
         n.container,
         Some(ContainerNeeds {
-            oci_runtime: Some(PathBuf::from("/opt/crun"))
+            oci_runtime: PathBuf::from("/usr/bin/crun")
+        })
+    );
+
+    let n = cli(&["--driver=container", "--oci-runtime=/opt/crun"]).host_needs();
+    assert_eq!(
+        n.container,
+        Some(ContainerNeeds {
+            oci_runtime: PathBuf::from("/opt/crun")
         })
     );
 }

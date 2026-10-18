@@ -6,8 +6,8 @@
 //! none (kbf-deploy's `linux/modes_tests.rs`), and the layering keeps the object-store
 //! client out of the daemon crates (kbf-it's tests/layering.rs); this file keeps it off
 //! the wire's schema: no message of any service in a package the daemon has clients for
-//! (`DAEMON_PACKAGES`: the work stream and segments, storage's action store, ByteStream
-//! and the REAPI services), and no message of the storage map (which `Welcome` and
+//! (`DAEMON_PACKAGES`: the work stream and segments, storage's action store, ByteStream,
+//! the REAPI services and the release fetch of self-update), and no message of the storage map (which `Welcome` and
 //! `MapUpdate` are to carry), has a field or a type named for a cold store or its
 //! credential, at any depth.
 //!
@@ -40,10 +40,12 @@ use prost_types::{DescriptorProto, FileDescriptorSet};
 
 /// The packages a daemon has clients for: every service in them is walked. The work
 /// stream and segments (`kbf.worker.v1`), storage's action store (`kbf.storage.v1`),
-/// and the REAPI ByteStream and CAS it fetches inputs and uploads outputs with.
+/// the REAPI ByteStream and CAS it fetches inputs and uploads outputs with, and the
+/// release fetch of self-update (`kbf.update.v1`, whose messages also ride the work stream).
 const DAEMON_PACKAGES: &[&str] = &[
     "kbf.worker.v1",
     "kbf.storage.v1",
+    "kbf.update.v1",
     "google.bytestream",
     "build.bazel.remote.execution.v2",
 ];
@@ -54,6 +56,7 @@ const DAEMON_SERVICES: &[&str] = &[
     ".kbf.worker.v1.Worker",
     ".kbf.worker.v1.Segments",
     ".kbf.storage.v1.ActionStore",
+    ".kbf.update.v1.ReleaseService",
     ".google.bytestream.ByteStream",
     ".build.bazel.remote.execution.v2.ContentAddressableStorage",
 ];
@@ -122,6 +125,7 @@ fn descriptors() -> FileDescriptorSet {
             "kbf/worker/v1/segments.proto",
             "kbf/storage/v1/storage.proto",
             "kbf/map/v1/map.proto",
+            "kbf/update/v1/update.proto",
             "google/bytestream/bytestream.proto",
             "build/bazel/remote/execution/v2/remote_execution.proto",
         ],
@@ -268,6 +272,9 @@ fn the_daemon_wire_has_no_cold_store_field() {
         ".kbf.map.v1.Map",
         ".kbf.map.v1.Member",
         ".kbf.worker.v1.ReadRangeResponse",
+        ".kbf.update.v1.UpdateOffer",
+        ".kbf.update.v1.Component",
+        ".kbf.update.v1.FetchChunk",
         ".kbf.storage.v1.GetResponse",
         ".google.bytestream.WriteRequest",
         ".build.bazel.remote.execution.v2.BatchUpdateBlobsRequest",

@@ -36,6 +36,7 @@ Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@
 # the continued lines below: systemd 239 and older read one into the command line.)
 ExecStart=@KBF_BIN_DIR@/kbf daemon \
     --driver=container \
+    --oci-runtime=/usr/bin/crun \
     --server=https://@KBF_FRONTEND_NAME@:@KBF_WORKER_PORT@ \
     --cas=https://@KBF_FRONTEND_NAME@:@KBF_WORKER_PORT@ \
     --ca-cert=@KBF_ETC@/ca.pem \

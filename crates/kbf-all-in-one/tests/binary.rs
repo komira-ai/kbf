@@ -1,6 +1,6 @@
 //! The `kbf-all-in-one` binary end to end: one action, executed through the REAPI
 //! listener of the server half, run by the daemon half's container driver over a
-//! stand-in `podman` (`kbf-fake-podman`, which runs the action as a plain process) and a
+//! stand-in `crun` (`kbf-fake-crun`, which runs the action as a plain process) and a
 //! cgroup tree of plain directories, its outputs, stdout and stderr stored through the
 //! in-process data plane and read back over REAPI. And the starts each half refuses.
 
@@ -28,22 +28,22 @@ use tonic::transport::{Channel, Endpoint};
 mod node;
 
 use node::{
-    PROMPT, Running, cgroup_tree, files_holding, id_files, image_path, input_bytes, pki, podman,
-    worker_addr,
+    PROMPT, Running, cgroup_tree, crun, files_holding, id_files, image_path, input_bytes,
+    oci_runtime, pki, worker_addr,
 };
 
-// The stand-in `podman` runs each action as `kbf-act` beside it: a link to this test
+// The stand-in `crun` runs each action as `kbf-act` beside it: a link to this test
 // binary, which answers as `kbf-act` through it.
 kbf_testkit::act_test_hook!();
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-all-in-one");
 
-/// The stand-in `podman` (`node::podman`).
-const FAKE_PODMAN: &str = env!("CARGO_BIN_EXE_kbf-fake-podman");
+/// The stand-in `crun` (`node::crun`).
+const FAKE_CRUN: &str = env!("CARGO_BIN_EXE_kbf-fake-crun");
 
 /// A fresh directory for one test.
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+    let dir = node::scratch_root()
         .join("kbf-all-in-one")
         .join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -77,16 +77,15 @@ fn farm_flags(dir: &Path, worker: SocketAddr) -> Vec<String> {
 }
 
 /// The binary with `flags` (a one-node farm in `dir`, [`farm_flags`]) whose container
-/// driver runs the stand-in `podman` in `bin`, found through `path`.
+/// driver runs the stand-in `crun` in `bin`, with the id tools found through `path`.
 fn farm(dir: &Path, bin: &Path, path: &str, flags: Vec<String>) -> Command {
     let mut command = Command::new(BIN);
     command
         .args(flags)
         .arg(format!("--id-files={}", id_files(dir).display()))
         .args(cgroup_tree(bin))
+        .arg(oci_runtime(bin))
         .env("PATH", path)
-        // The stand-in finds its state beside the link it was run through, which the
-        // driver runs by the name `PATH` finds (argv0 `podman`): from here.
         .current_dir(bin);
     command
 }
@@ -125,7 +124,7 @@ async fn execute(reapi: Channel, action: Digest) -> ActionResult {
 /// half wired to the transfer engine refuses to start), the helper re-execs not
 /// dispatched before the flags are read (each action's keeper is this binary, run with
 /// arguments the command line refuses), and SIGTERM not stopping both halves with exit
-/// 0. One action, run by the container driver over the stand-in `podman`, writes a file,
+/// 0. One action, run by the container driver over the stand-in `crun`, writes a file,
 /// a directory holding a file, stdout and stderr; each is read back over REAPI and is
 /// what the action wrote.
 #[test]
@@ -153,7 +152,7 @@ fn an_actions_outputs_go_through_the_in_process_plane() {
         "--stderr",
         "to stderr",
     ];
-    let image = podman(&bin, FAKE_PODMAN, &steps);
+    let image = crun(&bin, &dir.join("data"), FAKE_CRUN, &steps);
     let flags = farm_flags(&dir, worker_addr());
     let mut child = farm(&dir, &bin, &image_path(&bin), flags)
         .stdout(Stdio::piped())
@@ -322,7 +321,7 @@ fn the_start_up_pass_and_the_evictor_run_over_a_file_cold_store() {
     pki(&dir);
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).expect("mkdir");
-    podman(&bin, FAKE_PODMAN, &["true"]);
+    crun(&bin, &dir.join("data"), FAKE_CRUN, &["true"]);
     let mut flags: Vec<String> = farm_flags(&dir, worker_addr())
         .into_iter()
         .filter(|flag| !flag.starts_with("--hot-store="))
@@ -545,7 +544,7 @@ fn an_input_is_on_the_nodes_disk_once() {
     pki(&dir);
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).expect("mkdir");
-    let image = podman(&bin, FAKE_PODMAN, &["echo", "ran"]);
+    let image = crun(&bin, &dir.join("data"), FAKE_CRUN, &["echo", "ran"]);
     let mut flags = farm_flags(&dir, worker_addr());
     flags.extend([
         "--api-listen=127.0.0.1:0".to_owned(),
