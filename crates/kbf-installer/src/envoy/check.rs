@@ -83,6 +83,15 @@ fn check_envoy(c: &mut Checker, envoy: &Value, spec: &Spec) -> Result<(), Malfor
     c.require(ok, || CheckFailure::Listeners {
         got: json!(names).to_string(),
     });
+    for (name, l) in [("REAPI", reapi), ("worker", worker)] {
+        if let Some(l) = l {
+            // Explicit even though Linux's default is on: it is what lets a new Envoy
+            // bind the same ports while the old one drains (the installer's swap).
+            c.require(l["enable_reuse_port"] == true, || CheckFailure::ReusePort {
+                listener: name.to_owned(),
+            });
+        }
+    }
     if let Some(l) = reapi {
         check_reapi_listener(c, l, &clusters)?;
     }

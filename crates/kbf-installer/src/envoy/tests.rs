@@ -18,6 +18,9 @@ use super::{ENVOY, ENVOY_ARGS, EnvoyError, check, check_dir, render, write_files
 
 const GOLDEN_ENVOY: &str = include_str!("../../tests/golden/envoy/box/envoy.json");
 const GOLDEN_ARGS: &str = include_str!("../../tests/golden/envoy/box/envoy.args");
+/// The bytes `kbf-deploy envoy render --topology box` wrote (#925), kept verbatim.
+const GOLDEN_925_ENVOY: &str = include_str!("../../tests/golden/envoy/box-925/envoy.json");
+const GOLDEN_925_ARGS: &str = include_str!("../../tests/golden/envoy/box-925/envoy.args");
 
 /// The example with one field changed.
 fn with(change: impl FnOnce(&mut BoxSettings)) -> BoxSettings {
@@ -44,6 +47,18 @@ fn the_example_renders_the_golden_bytes() {
     let r = rendered(&example());
     assert_eq!(r.envoy, GOLDEN_ENVOY);
     assert_eq!(r.args, GOLDEN_ARGS);
+}
+
+/// Catches a render that drifts from #925's from anywhere but the two listener lines this
+/// port adds: with the two `enable_reuse_port` lines taken out, the render is #925's
+/// golden byte for byte (both files), and with them it is the golden above.
+#[test]
+fn the_render_is_925s_bytes_plus_the_two_reuse_port_lines() {
+    let r = rendered(&example());
+    let line = "        \"enable_reuse_port\": true,\n";
+    assert_eq!(r.envoy.matches(line).count(), 2, "one per listener");
+    assert_eq!(r.envoy.replace(line, ""), GOLDEN_925_ENVOY);
+    assert_eq!(r.args, GOLDEN_925_ARGS);
 }
 
 /// Catches a render that hard-codes a number the settings give: every port, the SNI name,
@@ -529,6 +544,16 @@ const MUTANTS: &[Mutant] = &[
         );
         push(e, "/static_resources/listeners", extra);
     }),
+    m(
+        "reuse-port",
+        "the REAPI listener with enable_reuse_port false",
+        |e, _| set(e, &format!("{REAPI}/enable_reuse_port"), json!(false)),
+    ),
+    m(
+        "reuse-port",
+        "the worker listener without enable_reuse_port (Envoy's own default)",
+        |e, _| remove(e, WORKER, "enable_reuse_port"),
+    ),
     m(
         "listener-tls",
         "the REAPI listener in plain text",

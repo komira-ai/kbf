@@ -133,7 +133,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    # The Envoy release the envoy kit's image runs (templates/envoy/config.example) and
+    # The Envoy release the real-Envoy tests run (CI only: kbf releases pin and fetch no Envoy;
+    # Envoy is a prerequisite checked against crates/kbf-installer/src/envoy/version.rs) and
     # the installer's box render is held to, for Envoy's own validation of both renders
     # and the real-Envoy tests of the box. The sha256 is the release's checksums.txt.asc
     # entry.

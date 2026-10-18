@@ -228,6 +228,7 @@
             "port_value": 8980
           }
         },
+        "enable_reuse_port": true,
         "filter_chains": [
           {
             "filters": [
@@ -376,6 +377,7 @@
             "port_value": 8981
           }
         },
+        "enable_reuse_port": true,
         "filter_chains": [
           {
             "filters": [

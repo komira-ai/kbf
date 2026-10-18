@@ -268,6 +268,7 @@ fn reapi_listener(c: &BoxSettings) -> Json {
     ]);
     Json::object([
         ("name", "reapi".into()),
+        ("enable_reuse_port", true.into()),
         (
             "address",
             socket_address("0.0.0.0", i64::from(c.reapi_port)),
@@ -303,6 +304,7 @@ fn worker_listener(c: &BoxSettings) -> Json {
     ]);
     Json::object([
         ("name", "worker".into()),
+        ("enable_reuse_port", true.into()),
         (
             "address",
             socket_address("0.0.0.0", i64::from(c.worker_port)),

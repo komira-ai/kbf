@@ -5,7 +5,7 @@
 //! a field Envoy does not know.
 //!
 //! Ignored in the plain test run: the binary is not in the repository. CI's test-x86 job
-//! fetches the pinned release (`cargo xtask fetch`, sha256) and runs these with
+//! fetches the pinned release (a CI-only pin: kbf releases pin and fetch no Envoy) (`cargo xtask fetch`, sha256) and runs these with
 //! `--ignored`, naming the binary in `KBF_TEST_ENVOY`. Run without it, each test fails
 //! rather than passes.
 //!
@@ -15,7 +15,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use kbf_installer::envoy::{BoxSettings, check, render};
+use kbf_installer::envoy::{BoxSettings, SUPPORTED, check, check_installed, render};
+use kbf_installer::run::SystemRunner;
 use kbf_it::pki;
 
 /// The pinned Envoy binary CI fetched.
@@ -105,4 +106,15 @@ fn envoy_refuses_an_unknown_box_field() {
         out.contains("close_connections_on_host_health_failur"),
         "refused for another reason:\n{out}"
     );
+}
+
+/// Catches a CI Envoy outside the range the installer supports (a pin bumped past
+/// [`SUPPORTED`], or a range cut under the pin): the tests above would then run a version
+/// the installer's own check refuses, and the range would claim what no test ran.
+#[test]
+#[ignore = "needs the pinned Envoy binary: CI's test-x86 job passes it in KBF_TEST_ENVOY"]
+fn the_ci_envoy_is_in_the_supported_range() {
+    let found = check_installed(&SystemRunner, &envoy_binary())
+        .unwrap_or_else(|e| panic!("the installer's version check refuses CI's Envoy: {e}"));
+    assert!(SUPPORTED.0 <= found && found < SUPPORTED.1, "{found}");
 }

@@ -79,6 +79,10 @@ pub enum CheckFailure {
     #[error("the box config has {got} listeners, not the REAPI one and the worker one")]
     Listeners { got: String },
     #[error(
+        "the {listener} listener does not have enable_reuse_port true: a second Envoy cannot bind its port beside the first, so the swap to a new Envoy has no overlap"
+    )]
+    ReusePort { listener: String },
+    #[error(
         "the REAPI listener has no TLS with a certificate and h2: REAPI clients dial it with TLS"
     )]
     ListenerTls,
@@ -135,7 +139,7 @@ pub enum CheckFailure {
 impl CheckFailure {
     /// Every check's name, in the order [`check`](super::check::check) can report them:
     /// the connection manager's, routes' and clusters' rules first, the box's own after.
-    pub const NAMES: [&'static str; 44] = [
+    pub const NAMES: [&'static str; 45] = [
         "envoy-shape",
         "hcm",
         "codec",
@@ -164,6 +168,7 @@ impl CheckFailure {
         "endpoints",
         "endpoint-tls-match",
         "listeners",
+        "reuse-port",
         "listener-tls",
         "execute-idle-off",
         "retry-routes",
@@ -213,6 +218,7 @@ impl CheckFailure {
             CheckFailure::Endpoints { .. } => "endpoints",
             CheckFailure::EndpointTlsMatch { .. } => "endpoint-tls-match",
             CheckFailure::Listeners { .. } => "listeners",
+            CheckFailure::ReusePort { .. } => "reuse-port",
             CheckFailure::ListenerTls => "listener-tls",
             CheckFailure::ExecuteIdle { .. } => "execute-idle-off",
             CheckFailure::RetryRoutes { .. } => "retry-routes",

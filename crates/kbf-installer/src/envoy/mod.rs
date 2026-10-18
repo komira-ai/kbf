@@ -8,12 +8,13 @@
 //! route timeout 0, no `max_stream_duration`, `Execute` and `WaitExecution` idle timeout
 //! 0, breakers sized from `max_concurrent_streams`, a health failure that leaves open
 //! streams alone, no retry on ByteStream or on `unavailable`, and a parent shutdown at
-//! least as long as the longest action ([`CheckFailure::NAMES`] lists every check).
+//! least as long as the longest action, listeners with `enable_reuse_port` true so a new
+//! Envoy can bind beside the old ([`CheckFailure::NAMES`] lists every check).
 //!
 //! This is a library with no command line. The settings come from the caller; no file or
-//! environment variable is read, and nothing but [`write_files`] writes. Which Envoy
-//! binary runs the files is the pin the installer's `envoy fetch|verify|path`
-//! verbs keep under its own tree, not decided here.
+//! environment variable is read, and nothing but [`write_files`] writes. Envoy itself is a
+//! prerequisite the operator installs: [`check_installed`] refuses one outside
+//! [`SUPPORTED`], and nothing here fetches or pins a binary.
 //!
 //! Both files are JSON printed byte for byte as Python's `json.dumps(indent=2, sort_keys=True)`, so the same settings always give
 //! the same bytes.
@@ -28,11 +29,14 @@ mod failure;
 mod json;
 mod render;
 mod rules;
+mod version;
 
 #[cfg(test)]
 mod check_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod version_tests;
 
 use std::path::{Path, PathBuf};
 
@@ -40,6 +44,7 @@ pub use config::{BoxSettings, Instance, SettingsError};
 pub use failure::CheckFailure;
 pub use render::{DRAIN_SECS, REAPI_CLUSTER, Rendered, WORKER_CLUSTER, render};
 pub use rules::{HEALTH_SERVICES, METHODS};
+pub use version::{EnvoyVersion, SUPPORTED, VersionError, check_installed, check_output};
 
 /// The Envoy bootstrap file.
 pub const ENVOY: &str = "envoy.json";
