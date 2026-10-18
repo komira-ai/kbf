@@ -1778,11 +1778,15 @@ dependencies = [
 name = "kbf-installer"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "flate2",
+ "h2",
  "hex",
+ "http",
  "kbf-host",
  "kbf-installer",
+ "kbf-proxy",
  "kbf-update",
  "libc",
  "rustix",
@@ -1810,15 +1814,20 @@ dependencies = [
 name = "kbf-it"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "futures",
+ "h2",
  "hex",
+ "http",
+ "kbf-cli",
  "kbf-daemon",
  "kbf-deploy",
  "kbf-front",
  "kbf-installer",
  "kbf-objstore",
  "kbf-proto",
+ "kbf-proxy",
  "kbf-server",
  "kbf-testkit",
  "kbf-threads",

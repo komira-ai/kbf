@@ -19,6 +19,8 @@
 //! The I/O is [`Proxy::bind`], [`ProxyRunner::run`] and [`ProxyHandle`]: a plaintext
 //! HTTP/2 server (TLS, identity and auth are U4b-2), per-stream routing to the active child,
 //! an upstream pool per (slot, generation, target) and the hold gate.
+//! `/readyz` is the proxy's own answer: it polls the active child's operator listener
+//! (`GET /readyz`, once a second) and is 200 only while the last poll of that child passed.
 
 // The I/O modules are not part of the loom build (`--cfg kbf_loom`): the models cover only
 // `slot`, and tokio and hyper are not loom-aware.
@@ -35,6 +37,8 @@ pub mod identity;
 mod metrics;
 #[cfg(not(kbf_loom))]
 mod pool;
+#[cfg(not(kbf_loom))]
+mod probe;
 #[cfg(not(kbf_loom))]
 mod proxy;
 pub mod replay;

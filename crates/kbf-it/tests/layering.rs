@@ -42,7 +42,12 @@
 //!   which links `kbf-server` and `kbf-objstore` for its other modes (`JOINERS`). For
 //!   that binary the protection is that it is given no credential: its unit loads no
 //!   environment file or systemd credential (kbf-deploy's `linux/modes_tests.rs`), and no
-//!   daemon flag names a store or reads an environment variable (kbf-cli's tests).
+//!   daemon flag names a store or reads an environment variable (kbf-cli's tests);
+//! - the front-door proxy library (`kbf-proxy`) depending, directly or through another crate,
+//!   on a child's, the installer's or the runtime's crates (`PROXY_MUST_NOT_REACH`); and any
+//!   file of `kbf-installer/src` outside `MAY_NAME_THE_PROXY`, the root helper first of all,
+//!   naming `kbf_proxy`: the root half shares the installer's binary with the proxy verb and
+//!   nothing else.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -413,5 +418,113 @@ fn route_reaches_neither_the_frontend_nor_the_daemon() {
         violations.is_empty(),
         "kbf-route reaches a frontend or daemon crate:\n{}",
         violations.join("\n")
+    );
+}
+
+/// What the front-door proxy library's normal dependencies must not reach
+/// (docs/design/kbf-proxy-api.md, sections 1 and 11). The proxy routes bytes: it never
+/// decodes a child's protocol (`kbf-proto`), runs none of the frontend, storage or node code
+/// (`kbf-server`, `kbf-front`, `kbf-storage`, `kbf-node`, `kbf-daemon`, the binaries
+/// `kbf-cli` and `kbf-all-in-one`), and does not know the installer, its host plan or its
+/// update types (`kbf-installer`, `kbf-host`, `kbf-update`, `kbf-deploy`): the calls to a
+/// child are the installer's, through a trait that lives there, and the installer depends on
+/// the proxy, not the other way round.
+const PROXY_MUST_NOT_REACH: &[&str] = &[
+    "kbf-installer",
+    "kbf-host",
+    "kbf-update",
+    "kbf-deploy",
+    "kbf-server",
+    "kbf-front",
+    "kbf-storage",
+    "kbf-node",
+    "kbf-daemon",
+    "kbf-cli",
+    "kbf-all-in-one",
+    "kbf-proto",
+];
+
+#[test]
+fn the_proxy_reaches_no_child_installer_or_runtime_crate() {
+    let g = load_graph();
+    // Every name is a package of the graph, and the walk sees the edge it guards: the
+    // installer's closure reaches the proxy. A renamed crate, or a walk that cannot see the
+    // proxy, would otherwise pass the check below with nothing in it.
+    for name in PROXY_MUST_NOT_REACH {
+        assert!(
+            g.names.values().any(|n| n == *name),
+            "{name} is not a package of the workspace's graph"
+        );
+    }
+    let (_, root) = g
+        .members
+        .get("kbf-proxy")
+        .expect("kbf-proxy is a workspace member");
+    assert!(root.is_some(), "kbf-proxy must have a library target");
+    assert!(
+        !reaches(&g, "kbf-installer", &["kbf-proxy"]).is_empty(),
+        "the installer's closure must reach kbf-proxy, or this walk proves nothing"
+    );
+    let violations = reaches(&g, "kbf-proxy", PROXY_MUST_NOT_REACH);
+    assert!(
+        violations.is_empty(),
+        "kbf-proxy reaches a child, installer or runtime crate:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// The files of `kbf-installer/src` that may name the proxy: the verb that hosts it, and the
+/// settings file whose `[proxy]` table the verb reads. Everything else, the root helper
+/// (`helper/`, `run.rs`) first of all, runs as root and links a network stack it never runs
+/// if it names a proxy type.
+const MAY_NAME_THE_PROXY: &[&str] = &["proxy_verb.rs", "installer_toml.rs"];
+
+/// Source files under `dir`, as paths relative to `base`, with `/` as the separator.
+fn rust_files(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+    for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+        let path = entry.expect("a directory entry").path();
+        if path.is_dir() {
+            rust_files(base, &path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            let relative = path.strip_prefix(base).expect("under base");
+            out.push(relative.to_string_lossy().into_owned());
+        }
+    }
+}
+
+#[test]
+fn the_root_half_of_the_installer_names_nothing_of_the_proxy() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kbf-installer/src");
+    let mut files = Vec::new();
+    rust_files(&src, &src, &mut files);
+    // The scan sees the root helper, and the allowed files still name the proxy: a moved
+    // directory or a renamed verb would otherwise make the check pass with nothing in it.
+    assert!(
+        files.iter().any(|f| f.starts_with("helper/")) && files.iter().any(|f| f == "run.rs"),
+        "the root helper's files were not found under {}",
+        src.display()
+    );
+    for allowed in MAY_NAME_THE_PROXY {
+        let text = std::fs::read_to_string(src.join(allowed))
+            .unwrap_or_else(|e| panic!("read {allowed}: {e}"));
+        assert!(
+            text.contains("kbf_proxy"),
+            "{allowed} no longer names kbf_proxy"
+        );
+    }
+    let violations: Vec<&str> = files
+        .iter()
+        .map(String::as_str)
+        .filter(|f| !MAY_NAME_THE_PROXY.contains(f))
+        .filter(|f| {
+            std::fs::read_to_string(src.join(f))
+                .unwrap_or_else(|e| panic!("read {f}: {e}"))
+                .contains("kbf_proxy")
+        })
+        .collect();
+    assert!(
+        violations.is_empty(),
+        "these installer files name kbf_proxy, but only {MAY_NAME_THE_PROXY:?} may (the root \
+         half shares the binary and nothing else): {violations:?}"
     );
 }

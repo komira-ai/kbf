@@ -159,6 +159,7 @@ pub fn installer_toml_url() -> InstallerToml {
         min_activation_interval_s: 120,
         node_cert: None,
         node_key: None,
+        proxy: None,
     }
 }
 

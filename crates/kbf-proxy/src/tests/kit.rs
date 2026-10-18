@@ -98,7 +98,7 @@ pub(super) struct MemNet {
 const PIPE_BYTES: usize = 1 << 20;
 
 impl MemNet {
-    fn listen(&self, addr: SocketAddr) -> mpsc::UnboundedReceiver<DuplexStream> {
+    pub(super) fn listen(&self, addr: SocketAddr) -> mpsc::UnboundedReceiver<DuplexStream> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.listeners
             .lock()

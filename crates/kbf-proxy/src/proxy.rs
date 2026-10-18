@@ -17,6 +17,7 @@ use crate::config::ProxyConfig;
 use crate::control::{ProxySnapshot, UpdateHandler};
 use crate::core::{Core, now};
 use crate::pool::tcp_connector;
+use crate::probe::poll;
 use crate::serve::serve;
 use crate::slot::{ActiveSlot, HoldGuard};
 
@@ -98,6 +99,7 @@ impl ProxyRunner {
         runtime.block_on(async move {
             let abandon = Arc::clone(&core);
             tokio::spawn(async move { abandon.abandon_startup_after(hold_max).await });
+            tokio::spawn(poll(Arc::clone(&core)));
             serve(core, updates, listener, stopped).await;
         });
         Ok(())

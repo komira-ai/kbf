@@ -19,7 +19,9 @@ publish.workspace = true
 # `boot-check`) are the root half of the pull-based updates: they poll the inbox the
 # unprivileged `kbf` writes, stage and swap releases through this crate, restart the one
 # configured service and write the world-readable status.json the node reads. There is no
-# socket and no network, and a staged binary is never run as root.
+# socket and no network, and a staged binary is never run as root. The one exception is the
+# `proxy` verb (the `kbf-proxy` runtime: the frontend host's public port), which runs as the
+# unprivileged service user and shares nothing with the root half (tests/layering.rs in kbf-it).
 
 [features]
 # `testkit`: the scratch host and state helpers other crates' tests of the `host` verbs use.
@@ -33,20 +35,27 @@ clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
 kbf-host.workspace = true
+kbf-proxy.workspace = true
 libc.workspace = true
-rustix = { workspace = true, features = ["fs", "process"] }
+rustix = { workspace = true, features = ["fs", "net", "process"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tar.workspace = true
 thiserror.workspace = true
+# The proxy verb's signal handlers run on kbf-proxy's runtime.
+tokio = { workspace = true, features = ["signal"] }
 toml.workspace = true
 
 [dev-dependencies]
+# The proxy verb's process test is an h2c client of the real binary.
+bytes.workspace = true
+h2.workspace = true
+http.workspace = true
 kbf-host = { workspace = true, features = ["testkit"] }
 kbf-installer = { workspace = true, features = ["testkit", "test-sandbox"] }
 kbf-update.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
 
 [lints]
 workspace = true

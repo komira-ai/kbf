@@ -10,6 +10,7 @@ use crate::control::{ProxySnapshot, SlotStats};
 use crate::hold::{HoldLimits, HoldQueue};
 use crate::metrics::Metrics;
 use crate::pool::{Connector, Pool};
+use crate::probe::Readiness;
 use crate::slot::{ActiveSlot, Slot};
 
 /// The streams one downstream connection may have open at once. The connection window is this
@@ -28,6 +29,9 @@ pub(crate) struct Core {
     pub(crate) pool: Pool,
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) limits: Limits,
+    /// What `/readyz` says: the poll of the active child writes it (`crate::probe`).
+    pub(crate) ready: Readiness,
+    table: UpstreamTable,
     streams: AtomicUsize,
 }
 
@@ -42,11 +46,23 @@ impl Core {
         Arc::new(Self {
             slots,
             queue: HoldQueue::new(HoldLimits::default()),
+            ready: Readiness::new(connector.clone()),
             pool: Pool::new(table, Arc::clone(&metrics), connector),
             metrics,
             limits,
+            table,
             streams: AtomicUsize::new(0),
         })
+    }
+
+    /// The children's ports.
+    pub(crate) const fn table(&self) -> UpstreamTable {
+        self.table
+    }
+
+    /// Whether `/readyz` answers 200 now.
+    pub(crate) fn is_ready(&self) -> bool {
+        self.ready.is_ready(&self.slots, now())
     }
 
     /// Counts a stream going to a backend (held, dialing or bound) against `max_streams`.
@@ -70,8 +86,7 @@ impl Core {
             holding: self.slots.holding(),
             held: self.queue.held(),
             per_slot: [stats(Slot::A), stats(Slot::B)],
-            // Readiness has one writer, the proxy's own poll of the active child (U4b-3).
-            ready: false,
+            ready: self.is_ready(),
             holds_abandoned: self.slots.abandoned_holds(),
         }
     }

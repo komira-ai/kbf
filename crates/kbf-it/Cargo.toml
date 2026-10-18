@@ -42,12 +42,19 @@ tracing-subscriber.workspace = true
 xtask.workspace = true
 
 [dev-dependencies]
+bytes.workspace = true
 futures.workspace = true
+# The proxy soak (tests/proxy_soak.rs) is an h2 client of the proxy library, and runs this
+# crate's test binary as the real `kbf` through a link of that name.
+h2.workspace = true
 hex.workspace = true
+http.workspace = true
+kbf-cli.workspace = true
 kbf-front.workspace = true
 # The Envoy render the real-Envoy tests (tests/envoy_box, tests/envoy_check.rs) run.
 kbf-installer.workspace = true
 kbf-proto.workspace = true
+kbf-proxy.workspace = true
 kbf-server.workspace = true
 kbf-threads.workspace = true
 proc-macro2.workspace = true

@@ -33,6 +33,8 @@
 //!   `--version --json`, and on macOS the quarantine attribute and the code signature.
 //! - [`envoy`]: the Envoy of a frontend host, rendered from settings and checked (a library
 //!   for the frontend-update path, with no command line).
+//! - [`proxy_verb`]: `kbf-installer proxy`, the host of the `kbf-proxy` runtime (the one
+//!   public port of a frontend host); it shares nothing with the root helper above.
 //! - [`run`]: the one place a process is started, behind a trait a test plays.
 //! - [`refusal`]: every way a stage is refused, one enum with a stable code per case.
 //!
@@ -59,6 +61,7 @@ pub mod inbox;
 pub mod installer_toml;
 pub mod layout;
 pub mod offer;
+pub mod proxy_verb;
 pub mod record;
 pub mod refusal;
 pub mod release;
