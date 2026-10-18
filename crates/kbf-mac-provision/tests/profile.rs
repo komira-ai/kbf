@@ -799,13 +799,14 @@ fn args_without_node_label(p: &Profile) -> Vec<String> {
         .collect()
 }
 
-/// Catches: the job not running `kbf node` with the config file and the labels (a plist
-/// that still names `kbf-daemon` and the profile's server and certificates would skip
-/// enrollment), the profile's server, certificates, node id and data directory still
-/// rendered as arguments (`kbf node` takes them from `kbf.toml` and the frontend), or the
-/// removed `--scratch` and `--cache-dir` flags.
+/// Catches: the job not running `kbf daemon` (a plist that still says `kbf node`, a mode
+/// that is going away, or `kbf-daemon`, a binary that is not in the package), the flags
+/// not in the Mac kit's order (driver, server, cas, ca-cert, cert, key, node-id, data-dir,
+/// labels), two words in one argument,
+/// the profile's `kbf_data_dir` not rendered as `--data-dir`, or the removed `--scratch`
+/// and `--cache-dir` flags.
 #[test]
-fn the_job_runs_kbf_node_with_its_config_and_the_labels() {
+fn the_job_runs_kbf_daemon_with_the_kits_flags() {
     let p = Profile::parse(edited(|_| {}).as_bytes()).unwrap();
     assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     let args = kbf_mac_provision::launchd::daemon_args(&p);
@@ -814,9 +815,23 @@ fn the_job_runs_kbf_node_with_its_config_and_the_labels() {
         args,
         [
             "/usr/local/kbf/current/kbf",
-            "node",
-            "--config",
-            "/usr/local/etc/kbf/kbf.toml",
+            "daemon",
+            "--driver",
+            "native",
+            "--server",
+            "https://farm.example.net:8981",
+            "--cas",
+            "https://farm.example.net:8981",
+            "--ca-cert",
+            "/usr/local/kbf/etc/ca.pem",
+            "--cert",
+            "/usr/local/kbf/etc/node.pem",
+            "--key",
+            "/usr/local/kbf/etc/node.key",
+            "--node-id",
+            p.get("hostname"),
+            "--data-dir",
+            "/Volumes/kbf/data",
             "--label",
             label.as_str(),
             "--label",
@@ -827,14 +842,12 @@ fn the_job_runs_kbf_node_with_its_config_and_the_labels() {
     );
     let plist = kbf_mac_provision::launchd::render_plist(&p);
     for absent in [
+        "<string>node</string>",
+        "--config",
         "--scratch",
         "--cache-dir",
         "--cache-",
         "--tree-",
-        "--server",
-        "--cert",
-        "--data-dir",
-        "--node-id",
         "current/kbf-daemon",
     ] {
         assert!(!plist.contains(absent), "{absent} in\n{plist}");
