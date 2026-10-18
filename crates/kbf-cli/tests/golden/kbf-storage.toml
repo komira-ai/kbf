@@ -67,6 +67,12 @@ write-bytes-in-flight = 2147483648
 write-linger = 2
 # Blobs of this many bytes or more are written as a segment of their own, past the group, so they neither wait for the linger nor hold up small writes
 write-own-segment-bytes = 16777216
+# The most blobs waiting for a write-pool writer. A blob that finds the queue full goes straight to the object store, as one does when the write tier has no room. At least 1
+write-pool-queue = 4096
+# How long, in seconds, a streamed blob may go without sending a chunk before its write-pool writer is taken back and the upload fails UNAVAILABLE (the client sends it again). Without it, a stalled but connected large upload would hold a writer for ever, and with all writers held every other blob would wait. It limits stalls only: an upload that sends a chunk more often than this (a trickle) can still hold a writer. At least 1
+write-pool-stream-idle = 30
+# The writers of the write pool: the ByteStream and storage `Write`s of a node with a write tier are appended to shared segment files by this many writers, each holding one range open, so the node keeps at most this many block files (plus the open grouped block) open for writing for those blobs, however many uploads are in flight. At least 1
+write-pool-writers = 8
 # The most segment PUTs, each with its footer read-back, in flight at once. A segment sealed while all are busy waits; new blobs go to a new open segment
 write-puts-in-flight = 4
 
