@@ -34,6 +34,8 @@ test = false
 [dependencies]
 clap.workspace = true
 kbf-all-in-one.workspace = true
+# `kbf ca init|import` (src/ca.rs): the CA directory.
+kbf-ca.workspace = true
 kbf-node.workspace = true
 kbf-server.workspace = true
 # The stand-in `podman`'s (kbf-cli-fake-podman).

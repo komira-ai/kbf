@@ -48,6 +48,7 @@
 //!
 //! The `kbf-server`, `kbf-daemon` and `kbf-all-in-one` binaries are unchanged.
 
+pub mod ca;
 pub mod cluster;
 pub mod handover;
 pub mod names;
@@ -394,6 +395,12 @@ pub fn main() -> ExitCode {
     {
         return match parse_handover(&args) {
             Ok(h) => handover::run(&h),
+            Err(e) => e.exit(),
+        };
+    }
+    if args.get(1).is_some_and(|word| word == ca::WORD) {
+        return match ca::parse(&args) {
+            Ok(parsed) => ca::run(&parsed),
             Err(e) => e.exit(),
         };
     }
