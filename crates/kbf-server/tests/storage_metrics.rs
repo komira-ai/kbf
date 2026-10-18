@@ -6,8 +6,11 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use bytes::Bytes;
 use kbf_server::storage_half;
 use kbf_server::storage_node::{StorageFlags, command, parse, start_storage};
+use kbf_storage::Storage as _;
+use kbf_storage::service::RemoteStorage;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
@@ -124,4 +127,62 @@ async fn the_storage_half_serves_the_same_series() {
     let off = self::flags(&dir("half-off"), &[]);
     let half = storage_half::start(&off, never).await.expect("starts");
     assert_eq!(half.metrics, None);
+}
+
+/// The value of the sample `name` in a scrape.
+fn sample(body: &str, name: &str) -> Option<f64> {
+    body.lines()
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+}
+
+/// Catches a `/metrics` route that renders another cache than the node's, or a fresh one
+/// (the series present, always 0): a blob written to the node's write tier, whose tier is
+/// then abandoned at the next start (the loss the cache records itself), must show in
+/// that node's scrape as a lost blob and a loss. The first life writes one blob to the
+/// hot store, which seals after thirty seconds and so is still unflushed when the life
+/// ends; the second start abandons that tier. Mutant: the route renders `Losses::default()`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blob_the_nodes_cache_lost_is_scraped_from_its_metrics_listener() {
+    let d = dir("loss");
+    let hot = format!("--hot-store=file://{}", d.join("hot").display());
+
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let first = start_storage(&flags(&d, &[&hot]), || {
+        Ok(async move {
+            let _ = stopped.await;
+        })
+    })
+    .await
+    .expect("starts");
+    let addr = first.addr;
+    let serving = tokio::spawn(first.serve());
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    RemoteStorage::new(channel, 0)
+        .put(Bytes::from_static(b"staged on the tier, never flushed"))
+        .await
+        .expect("put");
+    stop.send(()).expect("stop");
+    serving.await.expect("task").expect("serves to the end");
+
+    let tier = std::fs::read_to_string(d.join("hot/TIER")).expect("the tier file");
+    let second = flags(
+        &d,
+        &[
+            &hot,
+            &format!("--hot-store-abandon={}", tier.trim()),
+            "--metrics-listen=127.0.0.1:0",
+        ],
+    );
+    let node = start_storage(&second, never).await.expect("restarts");
+    let body = get(node.metrics.expect("a metrics address"), "/metrics")
+        .await
+        .2;
+    let gauge = sample(&body, "kbf_cache_lost_blobs");
+    let counter = sample(&body, "kbf_cache_blob_losses_total");
+    assert!(gauge >= Some(1.0), "{body}");
+    assert!(counter >= Some(1.0), "{body}");
 }

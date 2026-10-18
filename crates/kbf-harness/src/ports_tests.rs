@@ -194,8 +194,15 @@ fn the_search_wraps_round_the_blocks_once_and_gives_up() {
 #[should_panic(expected = "all 199 blocks of ports are held or busy")]
 fn a_host_with_no_block_to_spare_is_told_so() {
     // Catches: a farm that starts with a block somebody else holds, or a failure that does
-    // not say how many blocks there were.
-    exhausted(199);
+    // not say how many blocks there were. The search that finds nothing is the one that
+    // ends in the panic.
+    first_block(199, 7, |_| None::<u32>);
+}
+
+#[test]
+fn the_first_block_found_is_the_one_claimed() {
+    // Catches: the end of the search taken when a block was found.
+    assert_eq!(first_block(5, 3, |i| (i == 1).then_some(i)), 1);
 }
 
 #[test]
@@ -221,4 +228,49 @@ fn the_lock_directory_and_files_are_open_to_every_user_whatever_the_umask() {
     assert_eq!(mode(&lock_dir()) & 0o1777, 0o1777);
     assert_eq!(mode(&file) & 0o666, 0o666);
     drop(claim);
+}
+
+/// Not a test: the process the one below runs again with another `TMPDIR`. Without
+/// `KBF_PORTS_BLOCK` it does nothing; with it, it reports whether block `n` is held.
+#[test]
+fn block_probe_helper() {
+    let (Ok(block), Ok(report)) = (
+        std::env::var("KBF_PORTS_BLOCK"),
+        std::env::var("KBF_PORTS_REPORT"),
+    ) else {
+        return;
+    };
+    let index: u32 = block.parse().expect("a block number");
+    make_lock_dir();
+    let word = if Claim::try_block(index).is_some() {
+        "free"
+    } else {
+        "held"
+    };
+    std::fs::write(report, word).expect("report");
+}
+
+#[test]
+fn a_harness_with_another_tmpdir_sees_the_lock() {
+    // Catches: the lock directory following `TMPDIR`: two harnesses of one host with
+    // different temporary directories lock different files and claim one block (the second
+    // farm's roles then die with "address in use"). A second process, the test binary run
+    // again with another `TMPDIR`, asks for the block this one holds. Mutant: `lock_dir`
+    // is `std::env::temp_dir().join(..)` again (the other process finds the block free).
+    let claim = Claim::starting_at(150);
+    let dir = crate::scratch("ports-tmpdir");
+    let (tmp, report) = (dir.join("other-tmp"), dir.join("report"));
+    std::fs::create_dir_all(&tmp).expect("tmp");
+    assert_ne!(std::env::temp_dir(), tmp);
+    let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", "ports::tests::block_probe_helper", "--nocapture"])
+        .env("TMPDIR", &tmp)
+        .env("KBF_PORTS_BLOCK", claim.index().to_string())
+        .env("KBF_PORTS_REPORT", &report)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("the helper");
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&report).expect("report"), "held");
+    assert_eq!(lock_dir(), PathBuf::from(LOCK_DIR));
 }

@@ -3,10 +3,12 @@
 //! `a_harness_killed_by_sigkill_leaves_no_buck2_daemon_running`, which needs a process to kill.
 
 use std::io::Cursor;
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use super::*;
 use crate::alive;
+use crate::load::isolation;
 use crate::stand_in::{FAKE_BUCK2, sibling_bin};
 
 /// The kbf-beta binary, which answers `reap`.
@@ -29,15 +31,21 @@ fn reap(name: &str, lanes: usize) -> Reap {
             project,
             lanes,
             kill_timeout: Duration::from_secs(30),
+            // Starts with `-`, as an empty CI run id and the pid make one: it must reach the sentinel.
+            run_id: "-7".to_owned(),
         },
         Some(socket),
+        Some(dir),
     )
 }
 
 /// How many times the stand-in `buck2` was told to `kill` the daemon of loop `lane`.
 fn kills(reap: &Reap, lane: usize) -> usize {
-    std::fs::read_to_string(reap.project.join(format!(".fake-buck2-killed-beta-{lane}")))
-        .map_or(0, |text| text.lines().count())
+    std::fs::read_to_string(reap.project.join(format!(
+        ".fake-buck2-killed-{}",
+        isolation(&reap.run_id, lane)
+    )))
+    .map_or(0, |text| text.lines().count())
 }
 
 /// Calls `found` until it gives something; a bound that ends a hang only.
@@ -127,17 +135,25 @@ fn the_cleanup_is_the_daemons_it_was_made_from() {
         project: PathBuf::from("/p"),
         lanes: 4,
         kill_timeout: Duration::from_millis(2500),
+        run_id: "-9-1".to_owned(),
     };
-    let r = Reap::new(&daemons, None);
+    let r = Reap::new(&daemons, None, None);
     assert_eq!(r.kill_timeout_ms, 2500);
     let back = r.daemons();
     assert_eq!(
-        (back.buck2, back.project, back.lanes, back.kill_timeout),
+        (
+            back.buck2,
+            back.project,
+            back.lanes,
+            back.kill_timeout,
+            back.run_id
+        ),
         (
             daemons.buck2,
             daemons.project,
             4,
-            Duration::from_millis(2500)
+            Duration::from_millis(2500),
+            "-9-1".to_owned()
         )
     );
     // A bound too long for a u64 of milliseconds is as long as there is.
@@ -145,7 +161,7 @@ fn the_cleanup_is_the_daemons_it_was_made_from() {
         kill_timeout: Duration::MAX,
         ..r.daemons()
     };
-    assert_eq!(Reap::new(&huge, None).kill_timeout_ms, u64::MAX);
+    assert_eq!(Reap::new(&huge, None, None).kill_timeout_ms, u64::MAX);
 }
 
 #[test]
@@ -215,4 +231,57 @@ fn a_sentinel_that_cannot_be_started_says_so() {
     assert!(gone.is_err());
     let no_log = Sentinel::start(&kbf_beta(), &r, &r.project.join("no/such/dir/reaper.err"));
     assert!(no_log.is_err());
+}
+
+/// A `sleep` leading a group of its own: the group id it has.
+fn grouped_sleeper() -> Child {
+    Command::new("sleep")
+        .arg("300")
+        .process_group(0)
+        .spawn()
+        .expect("sleep")
+}
+
+#[test]
+fn the_groups_the_files_name_are_killed_and_nothing_else_is() {
+    // Catches: a sentinel that leaves the grandchildren of a killed harness's roles running
+    // (the kernel kills a role, not what it started), and one that signals what a file
+    // should not make it signal: a number that is not a group (0 and 1), text, a file that
+    // is not a `.pgid` (the `leave.txt` names a live group that must survive). Mutants:
+    // `kill_groups` does nothing (the named group survives); the extension filter removed
+    // (`leave.txt` is killed).
+    let dir = crate::scratch("kill-groups");
+    let (mut named, mut other) = (grouped_sleeper(), grouped_sleeper());
+    std::fs::write(dir.join("a.pgid"), format!("{}\n", named.id())).expect("pgid");
+    std::fs::write(dir.join("b.pgid"), "0\n").expect("pgid");
+    std::fs::write(dir.join("c.pgid"), "1\n").expect("pgid");
+    std::fs::write(dir.join("d.pgid"), "not a number").expect("pgid");
+    std::fs::write(dir.join("leave.txt"), format!("{}\n", other.id())).expect("txt");
+    kill_groups(&dir);
+    let status = until("the named group to end", || named.try_wait().expect("wait"));
+    assert!(!status.success());
+    assert!(other.try_wait().expect("wait").is_none());
+    other.kill().expect("kill");
+    other.wait().expect("reaped");
+    // A directory that is not there is no error.
+    kill_groups(&dir.join("absent"));
+}
+
+#[test]
+fn the_command_line_names_the_group_directory_only_when_there_is_one() {
+    // Catches: `--pgids` lost on the way to the sentinel (a killed harness's grandchildren
+    // survive again), or given with no value. Mutant: `args` leaves it out.
+    let mut r = reap("reap-pgids-args", 1);
+    let args: Vec<String> = r
+        .args()
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let at = args.iter().position(|a| a == "--pgids").expect("--pgids");
+    assert_eq!(
+        args[at + 1],
+        r.pgids.as_ref().expect("a directory").display().to_string()
+    );
+    r.pgids = None;
+    assert!(!r.args().iter().any(|a| a == "--pgids"));
 }

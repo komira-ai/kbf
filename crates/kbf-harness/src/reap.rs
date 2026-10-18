@@ -11,7 +11,9 @@
 //! the harness holds the write end of. When the harness ends well it writes `done` and
 //! closes the pipe, and the sentinel exits having done nothing. When the harness dies by any
 //! means, the kernel closes the pipe, the sentinel reads the end of its input with no `done`,
-//! and it kills the daemons of the loops and removes the control socket.
+//! and it kills the process groups the roles recorded ([`crate::procs::pgid_file`]: the kernel
+//! kills a role itself with the harness but not what the role started), the daemons of the
+//! loops, and removes the control socket.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -40,15 +42,21 @@ pub struct Reap {
     /// The project the daemons were started in.
     #[arg(long)]
     pub project: PathBuf,
-    /// The number of build loops: the daemons are `beta-0` to `beta-<lanes - 1>`.
+    /// The number of build loops: the daemons are `beta-<run>-0` to `beta-<run>-<lanes - 1>`.
     #[arg(long)]
     pub lanes: usize,
+    /// The run's id, which names its daemons.
+    #[arg(long)]
+    pub run_id: String,
     /// The longest one `buck2 kill` may take, in milliseconds.
     #[arg(long)]
     pub kill_timeout_ms: u64,
     /// The frontend's control socket, which a killed frontend leaves behind.
     #[arg(long)]
     pub socket: Option<PathBuf>,
+    /// The directory the roles record their process groups in (the run's logs).
+    #[arg(long)]
+    pub pgids: Option<PathBuf>,
 }
 
 /// What the sentinel read from the harness.
@@ -63,13 +71,15 @@ pub enum Word {
 impl Reap {
     /// The cleanup of `daemons` and, if there is one, `socket`.
     #[must_use]
-    pub fn new(daemons: &Daemons, socket: Option<PathBuf>) -> Self {
+    pub fn new(daemons: &Daemons, socket: Option<PathBuf>, pgids: Option<PathBuf>) -> Self {
         Self {
             buck2: daemons.buck2.clone(),
             project: daemons.project.clone(),
             lanes: daemons.lanes,
+            run_id: daemons.run_id.clone(),
             kill_timeout_ms: u64::try_from(daemons.kill_timeout.as_millis()).unwrap_or(u64::MAX),
             socket,
+            pgids,
         }
     }
 
@@ -80,6 +90,7 @@ impl Reap {
             buck2: self.buck2.clone(),
             project: self.project.clone(),
             lanes: self.lanes,
+            run_id: self.run_id.clone(),
             kill_timeout: Duration::from_millis(self.kill_timeout_ms),
         }
     }
@@ -95,12 +106,18 @@ impl Reap {
             self.project.clone().into(),
             "--lanes".into(),
             self.lanes.to_string().into(),
+            // One word: an id that starts with `-` (an empty CI run id) is not another option.
+            format!("--run-id={}", self.run_id).into(),
             "--kill-timeout-ms".into(),
             self.kill_timeout_ms.to_string().into(),
         ];
         if let Some(socket) = &self.socket {
             args.push("--socket".into());
             args.push(socket.clone().into());
+        }
+        if let Some(pgids) = &self.pgids {
+            args.push("--pgids".into());
+            args.push(pgids.clone().into());
         }
         args
     }
@@ -112,12 +129,39 @@ impl Reap {
         match word(input) {
             Word::Done => 0,
             Word::Lost => {
+                if let Some(pgids) = &self.pgids {
+                    kill_groups(pgids);
+                }
                 self.daemons().kill_all();
                 if let Some(socket) = &self.socket {
                     let _ = std::fs::remove_file(socket);
                 }
                 1
             }
+        }
+    }
+}
+
+/// SIGKILL to every process group a `*.pgid` file of `dir` names. The files are the roles'
+/// ([`crate::procs::pgid_file`]), removed when a role's group is swept, so a group named here
+/// belongs to a role that was running when the harness died. A name that is not a group id
+/// the sentinel may signal (not a number, 0, 1) is skipped.
+pub fn kill_groups(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "pgid") {
+            continue;
+        }
+        let pgid = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+            .filter(|n| *n > 1)
+            .and_then(rustix::process::Pid::from_raw);
+        if let Some(pgid) = pgid {
+            let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
         }
     }
 }

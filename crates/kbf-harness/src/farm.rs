@@ -327,9 +327,7 @@ impl Farm {
             farm.launch_spec(Role::Envoy, &eroot, spec);
             farm.envoy_ports = Some(*ports);
             let admin = ports.admin;
-            farm.try_wait("Envoy's admin /ready", |_| {
-                (api::get(admin, "/ready")?.0 == 200).then_some(())
-            })?;
+            farm.try_wait("Envoy's admin /ready", |_| answers_200(admin, "/ready"))?;
         }
 
         // The storage nodes, then the plain daemons.
@@ -536,37 +534,51 @@ impl Farm {
     ) -> Result<T, FarmError> {
         let deadline = after(self.hang);
         loop {
-            if self.interrupt.is_set() {
-                return Err(FarmError {
-                    what: format!("interrupted by a signal while waiting for {what}"),
-                    report: self.logs(),
-                });
-            }
-            let ended = self.members.iter_mut().find_map(|m| {
-                if m.killed {
-                    return None;
-                }
-                m.proc
-                    .exited()
-                    .map(|s| format!("{} exited ({s}) while waiting for {what}", m.role))
-            });
-            if let Some(ended) = ended {
-                return Err(FarmError {
-                    what: ended,
-                    report: self.logs(),
-                });
-            }
+            self.nothing_ended(what)?;
             if let Some(found) = ready(self) {
                 return Ok(found);
             }
-            if Instant::now() >= deadline {
-                return Err(FarmError {
-                    what: format!("timed out waiting for {what}"),
-                    report: self.logs(),
-                });
-            }
+            self.not_out_of_time(what, deadline)?;
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Whether the wait for `what` may go on: not when the run was asked to stop, and not
+    /// when a process that is not one the harness killed has ended. Not generic: one copy
+    /// for every wait, whatever the closure it waits on.
+    fn nothing_ended(&mut self, what: &str) -> Result<(), FarmError> {
+        if self.interrupt.is_set() {
+            return Err(FarmError {
+                what: format!("interrupted by a signal while waiting for {what}"),
+                report: self.logs(),
+            });
+        }
+        let ended = self.members.iter_mut().find_map(|m| {
+            if m.killed {
+                return None;
+            }
+            m.proc
+                .exited()
+                .map(|s| format!("{} exited ({s}) while waiting for {what}", m.role))
+        });
+        match ended {
+            Some(what) => Err(FarmError {
+                what,
+                report: self.logs(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether the wait for `what` may go on: not after `deadline`.
+    fn not_out_of_time(&self, what: &str, deadline: Instant) -> Result<(), FarmError> {
+        if Instant::now() >= deadline {
+            return Err(FarmError {
+                what: format!("timed out waiting for {what}"),
+                report: self.logs(),
+            });
+        }
+        Ok(())
     }
 
     /// [`Farm::try_wait`], panicking with the same text: for a test.
@@ -590,22 +602,13 @@ impl Farm {
     /// # Errors
     /// As [`Farm::try_wait`].
     pub fn wait_ready(&mut self) -> Result<(), FarmError> {
-        self.try_wait("the frontend's /readyz", |f| {
-            (api::get(f.api, "/readyz")?.0 == 200).then_some(())
-        })?;
-        self.try_wait("every node connected to the frontend", |f| {
-            (api::connected(f.api)? == f.node_ids).then_some(())
-        })?;
-        self.try_wait("every storage member active", |f| {
-            (api::members_active(f.api)? == (f.storage_nodes, true)).then_some(())
-        })?;
+        self.try_wait("the frontend's /readyz", |f| answers_200(f.api, "/readyz"))?;
+        self.try_wait("every node connected to the frontend", Farm::all_connected)?;
+        self.try_wait("every storage member active", Farm::all_active)?;
         // Envoy sends nothing to the frontend until its health checks pass: builds start
         // only when it does.
         if let Some(ports) = self.envoy_ports {
-            self.try_wait("Envoy to route to the frontend", |_| {
-                let (code, text) = api::get(ports.admin, "/clusters")?;
-                (code == 200 && envoy::healthy(&text, &ports)).then_some(())
-            })?;
+            self.try_wait("Envoy to route to the frontend", |_| envoy_routes(&ports))?;
         }
         Ok(())
     }
@@ -634,6 +637,16 @@ impl Farm {
             ));
         }
         Ok(())
+    }
+
+    /// Every node connected to the frontend; `None` while the frontend does not say so.
+    fn all_connected(&self) -> Option<()> {
+        (api::connected(self.api)? == self.node_ids).then_some(())
+    }
+
+    /// Every storage member active; `None` while the frontend does not say so.
+    fn all_active(&self) -> Option<()> {
+        (api::members_active(self.api)? == (self.storage_nodes, true)).then_some(())
     }
 
     /// SIGKILL to `role`, as a host losing power would take it.
@@ -870,6 +883,17 @@ impl Drop for Farm {
     fn drop(&mut self) {
         self.remove_socket();
     }
+}
+
+/// `Some` once `path` on `port` answers 200.
+fn answers_200(port: u16, path: &str) -> Option<()> {
+    (api::get(port, path)?.0 == 200).then_some(())
+}
+
+/// `Some` once Envoy's admin page lists both of the box's clusters healthy.
+fn envoy_routes(ports: &BoxPorts) -> Option<()> {
+    let (code, text) = api::get(ports.admin, "/clusters")?;
+    (code == 200 && envoy::healthy(&text, ports)).then_some(())
 }
 
 /// How a process ended, as the process table says it.

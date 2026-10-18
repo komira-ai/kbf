@@ -5,6 +5,7 @@
 //! and 2 for a command line it refuses or a run directory it cannot make.
 
 use std::ffi::OsString;
+use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -130,6 +131,26 @@ pub fn status(
     args: impl IntoIterator<Item = OsString>,
     env: impl Fn(&str) -> Option<String>,
 ) -> u8 {
+    status_of(
+        args.into_iter().collect(),
+        &env,
+        &mut std::io::stdin().lock(),
+    )
+}
+
+/// The environment variable `key`, if it is set to text: what the binary gives [`run`].
+#[must_use]
+pub fn env_var(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
+/// [`status`] over trait objects: one copy of the logic, whatever the caller's types, so
+/// that the tests that run it cover it for the binary too. `stdin` is what the sentinel reads.
+fn status_of(
+    args: Vec<OsString>,
+    env: &dyn Fn(&str) -> Option<String>,
+    stdin: &mut dyn BufRead,
+) -> u8 {
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(e) => {
@@ -140,7 +161,7 @@ pub fn status(
     };
     let flags = match cli.scenario {
         Scenario::B0(flags) => flags,
-        Scenario::Reap(reap) => return reap.run(&mut std::io::stdin().lock()),
+        Scenario::Reap(reap) => return reap.run(stdin),
     };
     let B0Flags {
         bin_dir,

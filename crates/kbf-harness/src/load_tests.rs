@@ -100,8 +100,31 @@ fn each_loop_has_a_daemon_of_its_own() {
     // Catches: loops sharing one Buck2 daemon, which serializes their builds (the load
     // would be one build at a time whatever the concurrency says).
     let (a, b) = (args(0, 0, Kind::Compile), args(1, 0, Kind::Compile));
-    assert_eq!(a[..2], ["--isolation-dir", "beta-0"]);
-    assert_eq!(b[..2], ["--isolation-dir", "beta-1"]);
+    assert_eq!(a[..2], ["--isolation-dir", "beta-r1-0"]);
+    assert_eq!(b[..2], ["--isolation-dir", "beta-r1-1"]);
+}
+
+#[test]
+fn two_runs_in_one_project_have_daemons_of_their_own() {
+    // Catches: concurrent runs (two jobs on one runner, in one project) sharing the daemons
+    // `beta-<loop>`: the cleanup of one run, at its end or after its death, would kill the
+    // other's daemons in the middle of its builds. The same loop of two runs has two
+    // isolation directories, and the kill of one run's loop names the same one as its builds.
+    // Mutant: `isolation` ignores the run id (the old fixed `beta-<loop>`).
+    let other = LoadConfig {
+        run_id: "r2".to_owned(),
+        ..cfg()
+    };
+    let first = build_args(&cfg(), 0, 0, Kind::Compile, Path::new("/logs/e"));
+    let second = build_args(&other, 0, 0, Kind::Compile, Path::new("/logs/e"));
+    assert_ne!(first[1], second[1]);
+    assert_eq!(isolation("r1", 0), first[1]);
+    assert_eq!(isolation("r2", 0), second[1]);
+    // A run id that is not fit for a directory name still gives one name per id.
+    assert_eq!(isolation("a/b c", 3), "beta-a-b-c-3");
+    // `_` is kept, as a letter or digit is.
+    assert_eq!(isolation("a_b9", 3), "beta-a_b9-3");
+    assert_ne!(isolation("", 0), isolation("x", 0));
 }
 
 #[test]
@@ -280,8 +303,11 @@ fn stand_in_load(name: &str, mode: &str, concurrency: usize, secs: u64) -> LoadC
 
 /// How many times the stand-in `buck2` was told to `kill` the daemon of loop `lane`.
 fn kills(c: &LoadConfig, lane: usize) -> usize {
-    std::fs::read_to_string(c.project.join(format!(".fake-buck2-killed-beta-{lane}")))
-        .map_or(0, |text| text.lines().count())
+    std::fs::read_to_string(
+        c.project
+            .join(format!(".fake-buck2-killed-{}", isolation(&c.run_id, lane))),
+    )
+    .map_or(0, |text| text.lines().count())
 }
 
 #[test]

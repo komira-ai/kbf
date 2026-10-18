@@ -63,10 +63,10 @@ fn a_run_that_is_asked_to_stop_ends_failed_with_nothing_left_running() {
         );
     }
     for lane in 0..2 {
-        let marker = args
-            .work
-            .join(format!("project/.fake-buck2-killed-beta-{lane}"));
-        assert!(marker.exists(), "loop {lane}'s daemon was not killed");
+        assert!(
+            !kill_markers(&args.work, lane).is_empty(),
+            "loop {lane}'s daemon was not killed"
+        );
     }
     assert!(
         doc["duration_secs"].as_f64().expect("duration") < 90.0,
@@ -86,11 +86,8 @@ fn a_run_asked_to_stop_while_it_settles_ends_failed() {
     args.settle = Duration::from_secs(120);
     let (work, interrupt) = (args.work.clone(), args.interrupt.clone());
     let asker = std::thread::spawn(move || {
-        let markers: Vec<PathBuf> = (0..2)
-            .map(|lane| work.join(format!("project/.fake-buck2-killed-beta-{lane}")))
-            .collect();
         let until = std::time::Instant::now() + Duration::from_secs(120);
-        while !markers.iter().all(|m| m.exists()) {
+        while !(0..2).all(|lane| !kill_markers(&work, lane).is_empty()) {
             assert!(std::time::Instant::now() < until, "the loops never ended");
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -206,10 +203,7 @@ fn a_frontend_that_stops_answering_fails_the_scrape_coverage_gate() {
     assert_eq!(run(&args).expect("a run"), Ended::Failed);
     wedger.join().expect("the wedger");
     let doc = document(&args);
-    assert!(
-        failed(&doc).contains(&"scrape_coverage".to_owned()),
-        "{doc}"
-    );
+    assert_eq!(failed(&doc), ["scrape_coverage"], "{doc}");
 }
 
 /// Catches: `builds_run` that cannot go red: a load of no time runs no builds.
@@ -218,7 +212,8 @@ fn a_load_that_runs_no_build_fails_the_builds_run_gate() {
     let args = b0("no-builds", "ok", 0);
     assert_eq!(run(&args).expect("a run"), Ended::Failed);
     let doc = document(&args);
-    assert!(failed(&doc).contains(&"builds_run".to_owned()), "{doc}");
+    // A load of no time also scrapes nothing, so the coverage of the scrapes is red with it.
+    assert_eq!(failed(&doc), ["builds_run", "scrape_coverage"], "{doc}");
 }
 
 /// Catches: two farms started together in one process (parallel tests, a harness running two

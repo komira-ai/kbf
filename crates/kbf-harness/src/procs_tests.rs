@@ -78,7 +78,7 @@ fn helper() {
                 fill_kib: 1,
                 run_id: "reaped".to_owned(),
             };
-            let reap = crate::reap::Reap::new(&crate::load::Daemons::of(&cfg), None);
+            let reap = crate::reap::Reap::new(&crate::load::Daemons::of(&cfg), None, None);
             let sentinel = crate::reap::Sentinel::start(
                 &crate::stand_in::sibling_bin("kbf-beta"),
                 &reap,
@@ -89,6 +89,41 @@ fn helper() {
             say(format!("project {}", cfg.project.display()));
             // Held until the process is killed.
             let _held = (sentinel, load);
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        "grouped" => {
+            // A role whose process starts another (`find` starts `sleep`), and a sentinel that
+            // knows the role's group from its file, over the stand-in `buck2`.
+            let project = dir.join("project");
+            std::fs::create_dir_all(&project).expect("project");
+            let daemons = crate::load::Daemons {
+                buck2: crate::stand_in::sibling_bin(crate::stand_in::FAKE_BUCK2),
+                project,
+                lanes: 1,
+                kill_timeout: Duration::from_secs(30),
+                run_id: "grouped".to_owned(),
+            };
+            let reap = crate::reap::Reap::new(&daemons, None, Some(dir.clone()));
+            let sentinel = crate::reap::Sentinel::start(
+                &crate::stand_in::sibling_bin("kbf-beta"),
+                &reap,
+                &dir.join("reaper.err"),
+            )
+            .expect("a sentinel");
+            let proc = Proc::start(
+                &spec(
+                    "find",
+                    "find",
+                    &["/dev/null", "-exec", "sleep", "300", ";"],
+                    &dir,
+                ),
+                &dir,
+                0,
+            );
+            say(format!("child {}", proc.pid()));
+            let _held = (sentinel, proc);
             loop {
                 std::thread::sleep(Duration::from_secs(1));
             }
@@ -390,7 +425,12 @@ fn a_harness_killed_by_sigkill_leaves_no_buck2_daemon_running() {
         text.lines()
             .find_map(|l| l.strip_prefix("project ").map(PathBuf::from))
     });
-    let marker = |lane: usize| project.join(format!(".fake-buck2-killed-beta-{lane}"));
+    let marker = |lane: usize| {
+        project.join(format!(
+            ".fake-buck2-killed-{}",
+            crate::load::isolation("reaped", lane)
+        ))
+    };
     std::thread::sleep(Duration::from_millis(500));
     assert!(
         !marker(0).exists() && !marker(1).exists(),
@@ -401,4 +441,81 @@ fn a_harness_killed_by_sigkill_leaves_no_buck2_daemon_running() {
     until("both daemons to be killed", || {
         (marker(0).exists() && marker(1).exists()).then_some(())
     });
+}
+
+/// The `sleep` that `leader` started (its child), once there is one.
+fn child_sleep_of(leader: u32) -> u32 {
+    until("the leader to start sleep", || {
+        std::fs::read_dir("/proc").ok()?.flatten().find_map(|e| {
+            let pid: u32 = e.file_name().to_str()?.parse().ok()?;
+            let stat = std::fs::read_to_string(e.path().join("stat")).ok()?;
+            let ppid: u32 = stat
+                .rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()?;
+            (ppid == leader && stat.contains("(sleep)")).then_some(pid)
+        })
+    })
+}
+
+#[test]
+fn a_harness_killed_by_sigkill_takes_what_its_roles_started_with_it() {
+    // Catches: the grandchildren of a role (the actions of a native driver, in the role's
+    // process group) surviving a SIGKILL of the harness: the kernel's parent-death signal
+    // reaches the role only, and without the sentinel's kill of the recorded groups the
+    // `sleep` that `find` started runs on, holding the runner. The helper is a harness with
+    // a sentinel and a role (`find`) that started `sleep`; the harness is killed with no
+    // chance to run anything. Mutant: the sentinel does not kill the recorded groups
+    // (`kill_groups` is not called).
+    let d = crate::scratch("grouped");
+    let report = d.join("report");
+    let mut harness = Killed(
+        helper_process("grouped", &report)
+            .spawn()
+            .expect("the helper"),
+    );
+    let find = children(&report, 1)[0];
+    let sleeper = child_sleep_of(find);
+    let _cleanup = Cleanup(vec![find, sleeper]);
+    assert!(alive(sleeper));
+    harness.0.kill().expect("kill the harness");
+    harness.0.wait().expect("reaped");
+    until("the grandchild to die with the harness", || {
+        (!alive(sleeper)).then_some(())
+    });
+}
+
+#[test]
+fn a_process_records_its_group_while_it_runs_and_not_after() {
+    // Catches: a role with no record (the sentinel cannot find its group), and a record left
+    // after the group was swept (a recycled group id the sentinel would then kill).
+    // Mutants: no file written; `sweep` leaves the file.
+    let d = crate::scratch("pgid-file");
+    let mut proc = Proc::start(&spec("rec", "sleep", &["300"], &d), &d, 0);
+    let file = pgid_file(&d, "rec", 0);
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("recorded").trim(),
+        proc.pid().to_string()
+    );
+    assert_ne!(
+        pgid_file(&d, "rec", 1),
+        file,
+        "a restart has a file of its own"
+    );
+    proc.kill();
+    assert!(!file.exists());
+}
+
+#[test]
+fn a_group_that_cannot_be_recorded_is_said_and_the_process_still_starts() {
+    // Catches: a role that cannot write its record (a full or read-only logs directory)
+    // failing silently, or taking the harness down: the record is best effort, because the
+    // parent-death signal still kills the role, and the failure goes to stderr. Mutant: the
+    // `eprintln!` removed; the error `unwrap`ped.
+    let file = Path::new("/proc/no/such/dir/x.pgid");
+    write_pgid(file, 7);
+    assert!(!file.exists());
 }

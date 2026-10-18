@@ -1,7 +1,7 @@
 //! The metrics reader over the Prometheus text the frontend writes, and the scraper's
 //! thread over a listener that answers as the operator API does.
 
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::net::TcpListener;
 
 use super::*;

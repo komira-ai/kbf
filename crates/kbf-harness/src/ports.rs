@@ -8,8 +8,9 @@
 //! connections, by holding an exclusive lock on a file named for the block, and takes
 //! every port of the farm from it. The lock is held as long as the [`Claim`] lives, and the
 //! kernel drops it when the holder dies (a harness killed with SIGKILL leaves nothing
-//! stale). Two farms of one process, of two processes, or of two users sharing a temporary
-//! directory never hold one block (the directory and its files are open to every user, whatever
+//! stale). Two farms of one process, of two processes, or of two users never hold one block,
+//! whatever `TMPDIR` each has: the locks are in [`LOCK_DIR`], not in the temporary directory,
+//! which a host's jobs may each set differently (the directory and its files are open to every user, whatever
 //! the umask; a file a user cannot open is a block that user skips, never one it shares); a block
 //! with any port in use now (by a program outside the harness) is skipped.
 //!
@@ -81,8 +82,18 @@ fn search<T>(count: u32, start: u32, try_block: impl Fn(u32) -> Option<T>) -> Op
     (0..count).find_map(|i| try_block((start % count + i) % count))
 }
 
+/// [`search`], and the end of it when it finds nothing.
+fn first_block<T>(count: u32, start: u32, try_block: impl Fn(u32) -> Option<T>) -> T {
+    search(count, start, try_block).unwrap_or_else(|| exhausted(count))
+}
+
+/// Where the block locks are: one directory for the host. It is not `std::env::temp_dir()`,
+/// which follows `TMPDIR`: two harnesses with different `TMPDIR`s would lock files in
+/// different directories and claim one block twice.
+pub(crate) const LOCK_DIR: &str = "/tmp/kbf-harness-ports";
+
 fn lock_dir() -> PathBuf {
-    std::env::temp_dir().join("kbf-harness-ports")
+    PathBuf::from(LOCK_DIR)
 }
 
 /// Makes the lock directory, open to every user like the temporary directory it is in (sticky:
@@ -92,6 +103,16 @@ fn make_lock_dir() {
     let dir = lock_dir();
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777));
+}
+
+/// The lock file of block `index`, made if it is not there.
+fn open_lock(index: u32) -> std::io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o666)
+        .open(lock_dir().join(format!("block-{index}.lock")))
 }
 
 impl Claim {
@@ -116,18 +137,12 @@ impl Claim {
         let count = blocks(floor);
         assert!(count > 0, "no room for a block of ports below {floor}");
         make_lock_dir();
-        search(count, start, Self::try_block).unwrap_or_else(|| exhausted(count))
+        first_block(count, start, Self::try_block)
     }
 
     /// Block `index` if nobody holds it and every port of it can be bound now.
     fn try_block(index: u32) -> Option<Self> {
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o666)
-            .open(lock_dir().join(format!("block-{index}.lock")))
-            .ok()?;
+        let lock = open_lock(index).ok()?;
         // `mode` is cut by the umask; another user must be able to open the file to lock it.
         let _ = lock.set_permissions(std::fs::Permissions::from_mode(0o666));
         flock(&lock, FlockOperation::NonBlockingLockExclusive).ok()?;

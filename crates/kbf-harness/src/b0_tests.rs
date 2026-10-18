@@ -311,13 +311,13 @@ fn the_sentinel_is_started_only_where_there_is_a_program_for_it() {
     std::fs::create_dir_all(&project).expect("project");
     let mut a = args();
     assert!(
-        start_sentinel(&a, &project, &dir.join("farm"), &logs)
+        start_sentinel(&a, &project, &dir.join("farm"), &logs, "r1")
             .expect("none")
             .is_none()
     );
     a.reaper = Some(PathBuf::from("/nonexistent/kbf-beta"));
     std::fs::create_dir_all(&logs).expect("logs");
-    assert!(start_sentinel(&a, &project, &dir.join("farm"), &logs).is_err());
+    assert!(start_sentinel(&a, &project, &dir.join("farm"), &logs, "r1").is_err());
     a.reaper = Some(PathBuf::from("kbf-beta"));
     assert!(
         a.absolute()
@@ -327,6 +327,6 @@ fn the_sentinel_is_started_only_where_there_is_a_program_for_it() {
             .is_absolute()
     );
     a.reaper = Some(crate::stand_in::sibling_bin("kbf-beta"));
-    let sentinel = start_sentinel(&a, &project, &dir.join("farm"), &logs).expect("started");
+    let sentinel = start_sentinel(&a, &project, &dir.join("farm"), &logs, "r1").expect("started");
     assert!(sentinel.is_some());
 }

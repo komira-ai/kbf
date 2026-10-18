@@ -168,6 +168,7 @@ fn start_sentinel(
     project: &Path,
     farm_dir: &Path,
     logs: &Path,
+    run_id: &str,
 ) -> std::io::Result<Option<Sentinel>> {
     let Some(program) = &args.reaper else {
         return Ok(None);
@@ -177,8 +178,13 @@ fn start_sentinel(
         project: project.to_owned(),
         lanes: args.concurrency,
         kill_timeout: args.kill_timeout,
+        run_id: run_id.to_owned(),
     };
-    let reap = Reap::new(&daemons, Some(crate::farm::control_socket(farm_dir)));
+    let reap = Reap::new(
+        &daemons,
+        Some(crate::farm::control_socket(farm_dir)),
+        Some(logs.to_owned()),
+    );
     Sentinel::start(program, &reap, &logs.join("reaper.err")).map(Some)
 }
 
@@ -319,7 +325,8 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
     let farm_dir = args.work.join("farm");
     // Before the farm, so a run killed while it starts leaves nothing either. Dropped after
     // the farm and the load (locals drop in reverse), which have then cleaned up themselves.
-    let _sentinel = match start_sentinel(args, &project, &farm_dir, logs) {
+    let run_id = format!("{}-{}", result.doc.run_id, std::process::id());
+    let _sentinel = match start_sentinel(args, &project, &farm_dir, logs, &run_id) {
         Ok(sentinel) => sentinel,
         Err(e) => return fail(result, Status::Failed, format!("the sentinel: {e}")),
     };
@@ -346,7 +353,7 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
         kill_timeout: args.kill_timeout,
         pause_secs: args.pause_secs,
         fill_kib: args.fill_kib,
-        run_id: format!("{}-{}", result.doc.run_id, std::process::id()),
+        run_id,
     };
 
     if let Err(e) = load::write_buckconfig(&cfg) {

@@ -20,8 +20,11 @@ use support::*;
 /// How many times the stand-in `buck2` was told to `kill` the daemon of loop `lane` of the
 /// run in `work`.
 fn kills(work: &Path, lane: usize) -> usize {
-    std::fs::read_to_string(work.join(format!("project/.fake-buck2-killed-beta-{lane}")))
-        .map_or(0, |text| text.lines().count())
+    kill_markers(work, lane)
+        .iter()
+        .filter_map(|marker| std::fs::read_to_string(marker).ok())
+        .map(|text| text.lines().count())
+        .sum()
 }
 
 /// Calls `found` until it gives something; a bound that ends a hang only.

@@ -112,8 +112,10 @@ fn the_sentinels_command_line_is_the_one_the_harness_writes() {
         buck2: PathBuf::from("/b/buck2"),
         project: PathBuf::from("/p q"),
         lanes: 3,
+        run_id: "-7".to_owned(),
         kill_timeout_ms: 1500,
         socket: socket.map(PathBuf::from),
+        pgids: socket.map(|_| PathBuf::from("/l o/gs")),
     };
     for r in [reap(Some("/tmp/s.sock")), reap(None)] {
         let words = std::iter::once(OsString::from("kbf-beta")).chain(r.args());

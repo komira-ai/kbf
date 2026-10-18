@@ -258,10 +258,13 @@ pub struct Daemons {
     pub buck2: PathBuf,
     /// The project the daemons were started in.
     pub project: PathBuf,
-    /// The number of loops: the daemons are `beta-0` to `beta-<lanes - 1>`.
+    /// The number of loops: the daemons are `beta-<run>-0` to `beta-<run>-<lanes - 1>`
+    /// ([`isolation`]).
     pub lanes: usize,
     /// The longest one `buck2 kill` may take ([`LoadConfig::kill_timeout`]).
     pub kill_timeout: Duration,
+    /// The run's id ([`LoadConfig::run_id`]), which names the run's daemons.
+    pub run_id: String,
 }
 
 impl Daemons {
@@ -273,6 +276,7 @@ impl Daemons {
             project: cfg.project.clone(),
             lanes: cfg.concurrency,
             kill_timeout: cfg.kill_timeout,
+            run_id: cfg.run_id.clone(),
         }
     }
 
@@ -294,7 +298,7 @@ impl Daemons {
     /// [`Daemons::kill_timeout`].
     pub(crate) fn kill_lane(&self, lane: usize) {
         let spawned = Command::new(&self.buck2)
-            .args(["--isolation-dir", &isolation(lane), "kill"])
+            .args(["--isolation-dir", &isolation(&self.run_id, lane), "kill"])
             .current_dir(&self.project)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -338,8 +342,23 @@ fn lane_loop(cfg: &LoadConfig, lane: usize, end: Instant, stop: &AtomicBool) -> 
     outcomes
 }
 
-fn isolation(lane: usize) -> String {
-    format!("beta-{lane}")
+/// The Buck2 isolation directory of loop `lane` of run `run_id`. It names the run as well as
+/// the loop: two runs in one project (two jobs on one runner) have daemons of their own, and
+/// one's cleanup does not kill the other's. Characters a directory name should not have
+/// become `-`.
+#[must_use]
+pub(crate) fn isolation(run_id: &str, lane: usize) -> String {
+    let run: String = run_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("beta-{run}-{lane}")
 }
 
 /// The command line of one build (without the program): the loop's own daemon, the salt,
@@ -356,7 +375,7 @@ pub fn build_args(
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "--isolation-dir".into(),
-        isolation(lane),
+        isolation(&cfg.run_id, lane),
         "build".into(),
         "--console".into(),
         "simple".into(),

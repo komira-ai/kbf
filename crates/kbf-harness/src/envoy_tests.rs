@@ -29,6 +29,33 @@ fn the_box_render_passes_the_box_check() {
 }
 
 #[test]
+fn a_render_into_a_directory_that_is_not_there_is_refused_with_the_reason() {
+    // Catches: a settings file that cannot be written ending in a panic or a pass: the
+    // reason is the error's text.
+    let err = render(
+        &ports(),
+        Path::new("/etc/farm"),
+        Path::new("/proc/no/such/dir"),
+    )
+    .expect_err("refused");
+    assert!(err.contains("No such file"), "{err}");
+}
+
+#[test]
+#[should_panic(expected = "No such file")]
+fn a_launch_whose_render_is_refused_panics_with_the_reason() {
+    // Catches: a launch that goes on with no render (Envoy then fails to start, and the farm
+    // times out with nothing said of the render).
+    let _ = launch(
+        Path::new("/opt/envoy"),
+        Path::new("/proc/no/such/dir"),
+        Path::new("/etc/farm"),
+        &ports(),
+        7,
+    );
+}
+
+#[test]
 fn a_port_used_twice_is_refused() {
     // Catches: a farm whose Envoy port is also an instance's, which the render would
     // accept as two listeners on one port and fail at bind.

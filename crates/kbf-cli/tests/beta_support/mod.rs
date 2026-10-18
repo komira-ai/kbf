@@ -136,6 +136,23 @@ pub(crate) fn document(args: &B0) -> serde_json::Value {
     serde_json::from_str(&text).expect("JSON")
 }
 
+/// The marker files the stand-in `buck2` left for the kills of loop `lane`'s daemon in the run
+/// in `work`: the daemon is `beta-<run id>-<lane>`, and the run id carries the harness's pid.
+pub(crate) fn kill_markers(work: &Path, lane: usize) -> Vec<PathBuf> {
+    let suffix = format!("-{lane}");
+    std::fs::read_dir(work.join("project"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(".fake-buck2-killed-beta-") && n.ends_with(&suffix))
+        })
+        .collect()
+}
+
 /// The verdict of gate `name` in `doc`.
 pub(crate) fn verdict<'a>(doc: &'a serde_json::Value, name: &str) -> &'a str {
     let gate = doc["gates"]
