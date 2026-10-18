@@ -34,6 +34,8 @@ enum Verb {
     /// Run before each start of the service: count the start of a release on trial, and
     /// revert one that has used its starts. Exits 0 unless the host's state is unreadable.
     BootCheck(BootArgs),
+    /// First configuration of a host: kbf.toml, the enrollment token, accounts and units. Root.
+    Setup(kbf_installer::setup::SetupArgs),
 }
 
 #[derive(clap::Args)]
@@ -146,6 +148,7 @@ fn main() -> ExitCode {
     let result = match cli.verb {
         Verb::Run(args) => run(cli.root, args),
         Verb::BootCheck(args) => boot_check(cli.root, &args),
+        Verb::Setup(args) => kbf_installer::setup::cli(cli.root, &args).map_err(|e| e.to_string()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
