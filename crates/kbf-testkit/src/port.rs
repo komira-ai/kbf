@@ -124,8 +124,8 @@ pub fn dead_addr() -> SocketAddr {
 ///
 /// A port number probed on `127.0.0.1` is free only until a test binding
 /// `127.0.0.1:0`, or a connection's source port, takes it. So on Linux the address is
-/// a loopback address of this call's own (127 and three more bytes: the whole
-/// `127.0.0.0/8` block is the host's own there) that nothing else binds, with a port
+/// a loopback address of this call's own (127 and three more bytes: the
+/// whole loopback block is the host's own there) that nothing else binds, with a port
 /// probed on it; the one thing that could take the port is a process that chose the
 /// same address. Elsewhere (macOS has only `127.0.0.1`) this is a probed port on
 /// `127.0.0.1` and the window stays; there, prefer [`Reserved::listen`].
