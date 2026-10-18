@@ -78,7 +78,12 @@ fn the_flags_say_what_the_daemon_asks_of_its_host() {
     assert_eq!((n.container, n.data_dir.as_path()), (None, Path::new("/d")));
 
     let n = cli(&["--driver=container"]).host_needs();
-    assert_eq!(n.container, Some(ContainerNeeds { oci_runtime: None }));
+    assert_eq!(
+        n.container,
+        Some(ContainerNeeds {
+            oci_runtime: PathBuf::from("/usr/bin/crun")
+        })
+    );
 
     let n = cli(&[
         "--driver=container",
@@ -89,7 +94,7 @@ fn the_flags_say_what_the_daemon_asks_of_its_host() {
     assert_eq!(
         n.container,
         Some(ContainerNeeds {
-            oci_runtime: Some(PathBuf::from("/opt/crun"))
+            oci_runtime: PathBuf::from("/opt/crun")
         })
     );
 }
