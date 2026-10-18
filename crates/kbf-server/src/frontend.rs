@@ -763,7 +763,6 @@ impl<'a> Prepared<'a> {
         log_state(durable, farm.term(), farm.lease_epoch());
 
         let sockets = sockets(adopted, &listeners, api.as_ref(), flags.handover.is_some())?;
-        let peers_certified = listeners.worker_tls.is_some();
         let (mut worker_server, peers, worker_tls) = worker_peers(
             keepalive(
                 flow_control(Server::builder(), listeners.stream_limits.worker),
@@ -815,13 +814,19 @@ impl<'a> Prepared<'a> {
         .merge(metrics_route(
             backend.clone(),
             history.as_ref().map(crate::history::History::stats),
+            members.clone(),
             tls_sources,
         ));
+        // The storage health, if there are members.
+        let api_routes = members.iter().fold(api_routes, |routes, members| {
+            routes.merge(crate::storage_health::router(Arc::clone(members)))
+        });
 
         let mut reapi_server = keepalive(
             flow_control(Server::builder(), listeners.stream_limits.reapi),
             listeners.streams,
         );
+        let membership = membership(members.clone(), &peers);
         let sessions = WorkerService::new(
             Arc::clone(&farm),
             peers,
@@ -834,7 +839,6 @@ impl<'a> Prepared<'a> {
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
 
-        let membership = membership(members.clone(), peers_certified);
         let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
         let authorizers = Arc::new(policy.authorizers);
         let bootstrap = Owner::new(&flags.storage.uri().to_string(), channel);
@@ -990,21 +994,24 @@ fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Stor
 }
 
 /// `GET /metrics`: what the service counts, in the Prometheus text format, history's
-/// counters when it keeps history, and the reloads of the listeners' `tls` files.
+/// counters when it keeps history, the storage health of `members` when there are any, and
+/// the reloads of the listeners' `tls` files.
 fn metrics_route(
     backend: Backend,
     history: Option<Arc<crate::history::Stats>>,
+    members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
 ) -> axum::Router {
     let tls = Arc::new(tls);
     let render = move || {
-        let (backend, tls) = (backend.clone(), Arc::clone(&tls));
+        let (backend, members, tls) = (backend.clone(), members.clone(), Arc::clone(&tls));
         let history = history.clone();
         async move {
             let mut text = backend.render_metrics();
             if let Some(history) = history {
                 history.render(&mut text);
             }
+            crate::metrics::scrape_health(&mut text, members.as_ref()).await;
             kbf_tls::render_metrics(tls.iter(), &mut text);
             ([(CONTENT_TYPE, crate::metrics::TEXT_FORMAT)], text)
         }
