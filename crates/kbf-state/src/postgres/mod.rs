@@ -617,3 +617,33 @@ impl Store for PostgresStore {
         .unwrap_or(StoreTime::ZERO)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use postgres::config::Host;
+
+    use super::{ConfigError, PostgresConfig};
+
+    // Catches a Unix-socket URI that parses to a TCP host (or not at all): the frontend
+    // reaches Postgres over a socket directory, and `host=/dir` must be that directory.
+    #[test]
+    fn a_socket_uri_parses_to_a_unix_host() {
+        let config = PostgresConfig::parse("postgres:///kbf?host=/run/postgresql")
+            .expect("a socket directory is a host");
+        assert_eq!(
+            config.pg.get_hosts(),
+            [Host::Unix("/run/postgresql".into())]
+        );
+        assert_eq!(config.pg.get_dbname(), Some("kbf"));
+    }
+
+    // Catches a URI with no host being accepted (it would connect to a default socket the
+    // operator never chose).
+    #[test]
+    fn a_uri_with_no_host_is_refused() {
+        assert_eq!(
+            PostgresConfig::parse("postgres:///kbf").unwrap_err(),
+            ConfigError::NoHost
+        );
+    }
+}
