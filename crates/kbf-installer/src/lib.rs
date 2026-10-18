@@ -28,6 +28,8 @@
 //!   (`gh`, the trusted root, the host's settings) and the root-ownership check on it.
 //! - [`archive`], [`binary`] and [`darwin`]: the tarball, the kind of executable and its
 //!   `--version --json`, and on macOS the quarantine attribute and the code signature.
+//! - [`envoy`]: the Envoy of a frontend host, rendered from settings and checked (a library
+//!   for the frontend-update path, with no command line).
 //! - [`run`]: the one place a process is started, behind a trait a test plays.
 //! - [`refusal`]: every way a stage is refused, one enum with a stable code per case.
 //!
@@ -41,6 +43,7 @@ pub mod archive;
 pub mod attest;
 pub mod binary;
 pub mod darwin;
+pub mod envoy;
 #[cfg(test)]
 mod fixtures;
 pub mod inbox;
