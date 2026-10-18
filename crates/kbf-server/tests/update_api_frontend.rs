@@ -4,6 +4,8 @@
 
 #[path = "support/hooked.rs"]
 mod hooked;
+#[path = "update_support/stores.rs"]
+mod stores;
 mod support;
 
 use std::net::SocketAddr;
@@ -309,8 +311,21 @@ impl Host {
 
 /// A frontend host on `platform`, with whichever of the three flags' halves are asked for.
 fn host_with(releases: bool, state: bool, installer: bool, platform: ReleasePlatform) -> Host {
+    host_full(releases, state, installer, Some(platform), |store| store)
+}
+
+/// [`host_with`] on a host with no platform to name (`None`), and the state store the server
+/// holds wrapped by `wrap` (the test reads the unwrapped one).
+fn host_full(
+    releases: bool,
+    state: bool,
+    installer: bool,
+    platform: Option<ReleasePlatform>,
+    wrap: impl FnOnce(Arc<dyn Store>) -> Arc<dyn Store>,
+) -> Host {
     let dir = Dir::new();
-    let (state_store, store) = state_and_store();
+    let (mut state_store, store) = state_and_store();
+    state_store.store = wrap(Arc::clone(&store));
     let clock = Arc::new(AtomicU64::new(T0));
     let releases = releases.then(|| {
         Arc::new(ReleaseStore::open(&dir.0.join("releases"), Limits::default()).expect("open"))
@@ -321,7 +336,7 @@ fn host_with(releases: bool, state: bool, installer: bool, platform: ReleasePlat
             Some(&dir.0.join("installer").join("status.json")),
         )
         .expect("the installer's spool");
-        installer.platform = Some(platform);
+        installer.platform = platform;
         let now = Arc::clone(&clock);
         installer.now_ms = Box::new(move || now.load(Ordering::Relaxed));
         Arc::new(installer)
@@ -525,6 +540,55 @@ async fn an_unwritable_spool_is_500_and_the_row_is_closed() {
     assert_eq!(code, 202, "{again}");
     assert_eq!(again["generation"], 2);
     assert_eq!(h.records().len(), 1);
+}
+
+/// Catches a host with no platform its releases are built for being sent an update anyway: the
+/// route is 503 naming the platform, writes no row and no record.
+///
+/// Mutant planted: the missing platform read as the first one (an order is written).
+#[tokio::test]
+async fn a_host_with_no_platform_of_its_own_is_503_and_orders_nothing() {
+    let h = host_full(true, true, true, None, |store| store);
+    h.put(A, X86, true).await;
+    let (code, body) = h.post(A).await;
+    assert_eq!(code, 503, "{body}");
+    assert!(
+        body["error"].as_str().expect("text").contains("platform"),
+        "{body}"
+    );
+    assert_eq!(h.row(), None, "no row");
+    assert!(h.records().is_empty(), "no record");
+}
+
+/// Catches a failed order whose row is then reported closed: the spool cannot be written and
+/// the row cannot be closed either (the state store fails the second write of the row), so the
+/// answer is still 500 "nothing was ordered", and the row is left open for the deadline to
+/// close, not shown closed.
+///
+/// Mutant planted: the failure of the close dropped from the answer path (the route answers
+/// 202 or panics).
+#[tokio::test]
+async fn an_order_that_fails_to_write_and_to_close_its_row_is_500_and_leaves_it_open() {
+    let h = host_full(
+        true,
+        true,
+        true,
+        Some(ReleasePlatform::LinuxX86_64),
+        |store| stores::Meddle::failing_writes_to_after(store, "update/frontend", 1),
+    );
+    h.put(A, X86, true).await;
+    std::fs::remove_dir_all(h.orders()).expect("remove the spool");
+    std::fs::write(h.orders(), b"not a directory").expect("a file in its place");
+    let (code, body) = h.post(A).await;
+    assert_eq!(code, 500, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .expect("text")
+            .contains("nothing was ordered"),
+        "{body}"
+    );
+    assert_eq!(h.row().expect("the row").state, FrontendState::Open);
 }
 
 /// Catches an answer made up for a server that cannot keep the row, hold the release or reach

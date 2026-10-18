@@ -25,9 +25,19 @@ pub struct Meddle {
     before: Mutex<Option<Hook>>,
     strip_counters: bool,
     failing: Option<&'static str>,
+    /// Batches writing `failing` that go through before it starts to fail.
+    allow: Mutex<usize>,
 }
 
 impl Meddle {
+    /// Whether this failing batch is one of the `ok` that go through first (and uses it up).
+    fn spare(&self) -> bool {
+        let mut allow = self.allow.lock().unwrap_or_else(PoisonError::into_inner);
+        let go = *allow > 0;
+        *allow = allow.saturating_sub(1);
+        go
+    }
+
     /// `inner`, with `hook` called for every transaction before it is applied.
     pub fn before_each(
         inner: Arc<dyn Store>,
@@ -38,6 +48,7 @@ impl Meddle {
             before: Mutex::new(Some(Box::new(hook))),
             strip_counters: false,
             failing: None,
+            allow: Mutex::new(0),
         })
     }
 
@@ -48,6 +59,7 @@ impl Meddle {
             before: Mutex::new(None),
             strip_counters: true,
             failing: None,
+            allow: Mutex::new(0),
         })
     }
 
@@ -58,6 +70,23 @@ impl Meddle {
             before: Mutex::new(None),
             strip_counters: false,
             failing: Some(key),
+            allow: Mutex::new(0),
+        })
+    }
+
+    /// `inner`, failing every batch with a transaction that writes `key` after the first
+    /// `ok` of them went through.
+    pub fn failing_writes_to_after(
+        inner: Arc<dyn Store>,
+        key: &'static str,
+        ok: usize,
+    ) -> Arc<dyn Store> {
+        Arc::new(Self {
+            inner,
+            before: Mutex::new(None),
+            strip_counters: false,
+            failing: Some(key),
+            allow: Mutex::new(ok),
         })
     }
 }
@@ -74,6 +103,7 @@ impl Store for Meddle {
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
         if let Some(key) = self.failing
             && batch.iter().any(|txn| writes(txn, key))
+            && !self.spare()
         {
             return Err(StoreError::Failed(format!(
                 "the disk holding {key} is gone"
