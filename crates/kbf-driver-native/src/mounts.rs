@@ -2,10 +2,13 @@
 //! is removed.
 //!
 //! A system service can mount a volume on an action's behalf, below a path the action
-//! named, without a write the sandbox profile checks: `xcodebuild` run with
-//! `CFFIXED_USER_HOME` set to a directory of its lease has the asset service mount the
-//! Metal toolchain below `<home>/Library/Developer/DVTDownloads/MetalToolchain/mounts`
-//! (issue #178). The mounted volume is read-only, so removing the lease directory
+//! named, without a write the sandbox profile checks: a volume attached with
+//! `hdiutil attach -mountpoint` in the lease's home is the case the tests make. The
+//! asset service was first seen doing it for the Metal toolchain below
+//! `<home>/Library/Developer/DVTDownloads/MetalToolchain/mounts` (issue #178); on the
+//! current Xcode (26.5) that toolchain is a system cryptex mounted outside the lease,
+//! so this is kept for any volume that does land below a lease. The mounted volume is
+//! read-only, so removing the lease directory
 //! fails (`EROFS`) and the lease is quarantined with an image still mounted. The
 //! volume is mounted for the action's user, which may unmount it, so the driver
 //! unmounts every volume at or below the lease directory first, deepest first.

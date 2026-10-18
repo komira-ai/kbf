@@ -1732,15 +1732,22 @@ async fn a_denied_certificate_is_refused_by_a_real_storage_node_when_the_generat
         async move { remote.find_missing(&[digest]).await }
     };
     // A node that has just started answers "catching up" while it rebuilds its index
-    // (slow under coverage); only that answer is waited out, any other refusal fails.
-    until_async("the node to answer the listed certificate", || async {
+    // (slow under coverage); only that answer is waited out, until a deadline, then the
+    // test fails with the last answer. Any other refusal fails at once.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
         match ask(&listed).await {
-            Ok(_) => Some(()),
-            Err(kbf_storage::StorageError::Unavailable(_)) => None,
+            Ok(_) => break,
+            Err(kbf_storage::StorageError::Unavailable(why)) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the node still answers unavailable after 30s: {why:?}"
+                );
+                tokio::time::sleep(5 * MS).await;
+            }
             Err(other) => panic!("not admitted before the entry: {other:?}"),
         }
-    })
-    .await;
+    }
     ask(&other).await.expect("admitted");
 
     let entry = kbf_map::DenyEntry::SpkiSha256(spki);

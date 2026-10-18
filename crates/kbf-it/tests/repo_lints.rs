@@ -25,7 +25,8 @@
 //!   job packages (module `attested_assets`);
 //! - the artifacts workflow no longer building the pinned release set (`kbf` for
 //!   three platforms, `kbf-deploy` for macOS too), signing and attesting only on pushes
-//!   to `main` and `feature/arch-v2`, checking `kbf --version --json`, signing and
+//!   to `main` and `feature/arch-v2`, checking `kbf --version --json` (on the binary
+//!   built, and again on the packaged tarball with `build-commit check-asset`), signing and
 //!   `darwin-asset`-checking every macOS binary, or docs/artifacts.md describing
 //!   another set (module `release_artifacts`);
 //! - the coverage job's `kbf-coverage --run-id/--repo/--artifact` flags drifting from

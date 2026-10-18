@@ -1,0 +1,63 @@
+# kbf build farm storage node: `kbf --mode=storage`.
+# Static unit: shipped by the kbf-installer package (installed under /usr/lib/systemd/system/),
+# disabled, with no rendering and no @PLACEHOLDER@ in it. It starts only once
+# /etc/kbf/kbf.toml exists (ConditionPathExists=), after kbf-installer's `boot-check` (which
+# counts the starts of a release on trial and reverts a release that spends its budget) and
+# `kbf --mode=<mode> --check` (which prints every missing prerequisite and exits 2). The checks
+# are ExecStartPre=, not ExecCondition=: ExecCondition= skips the start silently on exit 1
+# to 254, and a unit that cannot start must fail where an operator sees it. kbf reads
+# /etc/kbf/kbf.toml itself: no --config. The binary is the release kbf-installer flipped
+# to; only kbf-installer replaces it. Per-host values (MemoryMin=, ports, certificates,
+# the cold store) are kbf.toml's, or a drop-in kbf-installer writes from it.
+# kbf docs/design/architecture-v2.md, sections 1 and 11. No state store: a storage node
+# reaches it only through a frontend (section 6).
+[Unit]
+Description=kbf build farm storage node
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/kbf/kbf.toml
+
+# A failure that repeats quickly (the cold store or a disk not ready) must not use up
+# systemd's start limit of 5 starts in 10 s and leave the unit down (check-units rule
+# `restart`).
+StartLimitIntervalSec=0
+
+[Service]
+# Not the daemon's user: a storage node holds the cold store's key, which the user builds
+# run as (kbf) must not be able to read.
+User=kbf-server
+Slice=kbf.slice
+# kbf's own state, created for the unit's user by systemd; kbf-installer never touches it.
+# /var/lib/kbf-server, not /var/lib/kbf: this unit runs as kbf-server, and systemd chowns a
+# StateDirectory= to the unit's user, so sharing kbf's would hand it back and forth on a
+# host that runs a kbf unit too. kbf.toml's paths name this directory.
+StateDirectory=kbf-server
+StateDirectoryMode=0750
+# A storage node answering from swap would slow every build at once.
+MemorySwapMax=0
+OOMScoreAdjust=-925
+# systemd starts a unit at a soft open-file limit of 1024; a build burst passes that (EMFILE).
+LimitNOFILE=1048576
+CPUWeight=300
+# The cold store's key is in kbf.toml's reach, not here: no EnvironmentFile= and no key on
+# the command line (check-units rule `credential`).
+ExecStartPre=+/usr/bin/kbf-installer boot-check
+# `--check` validates kbf.toml and what a restart cannot change (a file, a user, a flag)
+# and exits 2 for those. Anything that can become ready later (a listen address, a peer,
+# a DNS name, a mount) is not refused here: it exits 75 (not ready, restarted), so a check
+# that runs before the bind retry never leaves the unit down for good (kbf#998, #1000).
+ExecStartPre=/var/lib/kbf-installer/current/kbf --mode=storage --check
+ExecStart=/var/lib/kbf-installer/current/kbf --mode=storage
+# kbf drains on SIGTERM: a Write in flight is finished and acknowledged before the node
+# exits, and a large one takes longer than systemd's 90 s default stop timeout, which
+# would SIGKILL it and fail the upload (check-units rule `stop`).
+KillSignal=SIGTERM
+TimeoutStopSec=infinity
+Restart=on-failure
+RestartSec=5
+# Exit 2 is a command line kbf refused (or a config it refused): a restart cannot fix it.
+# Exit 75 (a retryable failure) is restarted.
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

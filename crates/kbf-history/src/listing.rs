@@ -312,31 +312,67 @@ impl<O> Reader<O> {
             return Ok(ShapePage::default());
         }
         let owned = self.index.root().shape_prefix(instance);
-        let prefix = owned.as_str();
         let walk = Walk {
             prefix: owned.clone(),
             lower: Bound::Unbounded,
             upper: Bound::Unbounded,
             direction: Direction::Forward,
         };
-        let resolve = |key: String| async move {
-            let stored = self.index.get(key.clone()).await?;
-            let tail = key
-                .strip_prefix(prefix)
-                .and_then(IndexRoot::parse_shape_tail);
-            let (Some(stored), Some((shape, cfg))) = (stored, tail) else {
-                return Ok(None);
-            };
-            let row = decode_row::<ShapeRow>(&key, &stored.value)?;
-            Ok(Some(ShapeEntry {
-                instance: instance.to_owned(),
-                shape,
-                cfg,
-                row,
-            }))
-        };
+        let resolve = |key: String| self.shape_entry(instance, &owned, key);
         let (items, next) = self.scan_matches(walk.after(after), limit, resolve).await?;
         Ok(ShapePage { items, next })
+    }
+
+    /// A page of the catalog rows of `shape` under `instance`, one per configuration in
+    /// configuration order, if `allow` accepts the instance.
+    ///
+    /// # Errors
+    /// [`ReadError`] when the index fails or a row does not decode.
+    pub async fn shape_cfgs(
+        &self,
+        instance: &str,
+        shape: u64,
+        after: Option<&PageCursor>,
+        limit: usize,
+        allow: Allow<'_>,
+    ) -> Result<ShapePage, ReadError> {
+        if !allow(instance) {
+            return Ok(ShapePage::default());
+        }
+        let instance_prefix = self.index.root().shape_prefix(instance);
+        let walk = Walk {
+            prefix: format!("{instance_prefix}{shape:016x}/"),
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+            direction: Direction::Forward,
+        };
+        let resolve = |key: String| self.shape_entry(instance, &instance_prefix, key);
+        let (items, next) = self.scan_matches(walk.after(after), limit, resolve).await?;
+        Ok(ShapePage { items, next })
+    }
+
+    /// The catalog row at `key`, which lies under `prefix` (`instance`'s shape prefix);
+    /// `None` when the row is gone or the key is not a shape row's.
+    async fn shape_entry(
+        &self,
+        instance: &str,
+        prefix: &str,
+        key: String,
+    ) -> Result<Option<ShapeEntry>, ReadError> {
+        let stored = self.index.get(key.clone()).await?;
+        let tail = key
+            .strip_prefix(prefix)
+            .and_then(IndexRoot::parse_shape_tail);
+        let (Some(stored), Some((shape, cfg))) = (stored, tail) else {
+            return Ok(None);
+        };
+        let row = decode_row::<ShapeRow>(&key, &stored.value)?;
+        Ok(Some(ShapeEntry {
+            instance: instance.to_owned(),
+            shape,
+            cfg,
+            row,
+        }))
     }
 
     /// The catalog row of (`instance`, `shape`, `cfg`), if there is one and `allow`

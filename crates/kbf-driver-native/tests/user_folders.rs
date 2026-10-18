@@ -858,7 +858,9 @@ async fn a_volume_mounted_in_the_leases_home_does_not_keep_the_lease() {
     // of the machine's mounts before and after must not span a Metal compile that has
     // the asset service mount the toolchain meanwhile.
     let _tools = DEVELOPER_TOOLS.write().await;
-    let dir = scratch("volume-mount");
+    // `mount` lists real paths, and the scratch directory may sit under a symlink
+    // (`/var`, `/tmp`): without this `below(&after, &dir)` is empty and checks nothing.
+    let dir = std::fs::canonicalize(scratch("volume-mount")).expect("real");
     let config: NativeConfig = config(&dir);
     let scratch_root = config.clone();
     let cas = Arc::new(MemoryCas::default());

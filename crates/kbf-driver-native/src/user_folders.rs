@@ -122,7 +122,9 @@ const PLUGIN_CACHE: &str = "PlugInCache-xcodebuild.xcplugincache";
 /// - `TemporaryDirectory.`: SwiftPM's (and `xcodebuild`'s package resolution's)
 ///   temporary directories, made with `confstr`'s temporary folder, not `TMPDIR`;
 /// - `cryptex.personalize.`: the asset service's staging while it mounts the Metal
-///   toolchain below the lease's home;
+///   toolchain. On the current Xcode that toolchain is a system cryptex outside the
+///   lease's home; the sandbox log of the macOS runner (Xcode 26.5) still named this
+///   path as denied, which is the only reason the allowance stays;
 /// - `ResultBundle_`: the `.xcresult` `xcodebuild` writes for an error (without the
 ///   rule it prints "Failed saving result bundle" over the error it meant to report).
 const MKDTEMP_PREFIXES: [&str; 4] = [
