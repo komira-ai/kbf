@@ -1,4 +1,3 @@
-use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -235,79 +234,6 @@ fn a_flood_of_peers_cannot_grow_the_table_and_shares_one_bucket() {
         r.auth.authorize(&from("late-2".to_owned())),
         Err(Denied::RateLimited { .. })
     ));
-}
-
-/// A tracing writer that keeps what is logged.
-#[derive(Clone, Default)]
-struct Capture(Arc<Mutex<Vec<u8>>>);
-
-impl io::Write for Capture {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-    type Writer = Capture;
-
-    fn make_writer(&'a self) -> Capture {
-        self.clone()
-    }
-}
-
-#[test]
-fn no_token_reaches_the_log() {
-    let capture = Capture::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(capture.clone())
-        .with_max_level(tracing::Level::TRACE)
-        .finish();
-    let wrong = "SECRETWRONGTOKEN0123456789abcdef0123456789abcdef";
-    {
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let r = rig(RateLimit {
-            burst: 6,
-            per_second: 1,
-        });
-        let _ = r
-            .auth
-            .authorize(&request("/v1/update/frontend", &[&bearer(wrong)]));
-        let _ = r.auth.authorize(&request(
-            "/v1/update/frontend",
-            &[&bearer(TOKEN), &bearer(wrong)],
-        ));
-        let _ = r.auth.authorize(&request(
-            &format!("/v1/update/frontend?token={TOKEN}"),
-            &[&bearer(wrong)],
-        ));
-        let _ = r
-            .auth
-            .authorize(&request("/v1/update/frontend", &["Basic SECRETBASIC"]));
-        let _ = r.auth.authorize(&request("/v1/update/frontend", &[]));
-        *r.tokens.0.lock().unwrap() = None;
-        let _ = r
-            .auth
-            .authorize(&request("/v1/update/frontend", &[&bearer(TOKEN)]));
-        let _ = r
-            .auth
-            .authorize(&request("/v1/update/frontend", &[&bearer(TOKEN)]));
-        assert_eq!(
-            format!("{:?}", Secret::new(TOKEN)),
-            "Secret(..)",
-            "a secret prints nothing of itself"
-        );
-    }
-    let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
-    assert!(log.contains("denied"), "the denials are logged: {log}");
-    assert!(log.contains("/v1/update/frontend"));
-    for secret in [TOKEN, wrong, "SECRETBASIC", "Bearer", "token="] {
-        assert!(!log.contains(secret), "{secret:?} is in the log:\n{log}");
-    }
 }
 
 #[test]

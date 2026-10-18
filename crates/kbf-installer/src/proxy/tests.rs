@@ -392,6 +392,35 @@ fn every_refusal_word_fails_the_update_and_starts_no_child() {
 }
 
 #[test]
+fn each_refusal_word_has_its_step() {
+    let table = [
+        ("trust_chain", "verify"),
+        ("hash", "verify"),
+        ("attestation", "verify"),
+        ("commit_or_ref", "verify"),
+        ("facts", "verify"),
+        ("installer_too_old", "verify"),
+        ("platform", "verify"),
+        ("size", "verify"),
+        ("disk", "fetch"),
+        ("fetch", "fetch"),
+        ("replay", "order"),
+        ("generation", "order"),
+        ("floor", "order"),
+        ("denied", "order"),
+        ("pending", "host"),
+        ("lease", "host"),
+        ("envoy_range", "host"),
+        ("frontend_busy", "host"),
+    ];
+    assert_eq!(table.len(), refusal::WORDS.len());
+    for (word, step) in table {
+        assert!(refusal::WORDS.contains(&word), "{word}");
+        assert_eq!(refusal::step(word), step, "{word}");
+    }
+}
+
+#[test]
 fn an_unknown_refusal_word_fails_closed() {
     let rig = Rig::new("u8a-refusal-unknown");
     let (mut core, _) = started(&rig);

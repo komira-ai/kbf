@@ -563,8 +563,10 @@ async fn tick_moves_a_staging_update_without_anyone_asking() {
     api.post(super::fakes::req(B, "r1")).await.unwrap();
     rig.set_status(staged(B));
     api.tick();
-    // The next command is handled after the tick.
-    api.status().await.unwrap();
+    // Let the actor take the tick. No command that reads the status has been sent.
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
     assert_eq!(rig.sup.starts(), 1);
     drop(api);
 }
