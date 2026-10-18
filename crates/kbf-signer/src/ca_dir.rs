@@ -49,5 +49,13 @@ pub fn ensure(
     if names.len() == 2 && has(FileSigner::KEY_FILE) && has(Authority::CERT_FILE) {
         return Ok((Authority::load_dir(dir, policy)?, Started::Loaded));
     }
-    Err(SignerError::CaDirState)
+    let mut found: Vec<_> = names
+        .iter()
+        .map(|n| n.to_string_lossy().into_owned())
+        .collect();
+    found.sort();
+    Err(SignerError::CaDirState {
+        dir: dir.to_path_buf(),
+        found,
+    })
 }

@@ -4,12 +4,15 @@ use std::convert::Infallible;
 use std::fmt;
 use std::fs::{self, DirBuilder};
 use std::io::{self, ErrorKind};
+use std::ops::Deref;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use kbf_ca::{Algorithm, Authority, FileSigner, Policy, Signer};
+use rustix::fs::{FlockOperation, Mode, OFlags};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::error::SignerError;
@@ -69,24 +72,66 @@ fn prepare_dir(dir: &Path) -> Result<(), SignerError> {
 
 /// Removes the socket at `path` unless a signer answers on it: a connection that is
 /// accepted means one is serving, and a second must not take its place; only a refused
-/// connection (nobody listens) marks a stale socket.
+/// connection (nobody listens) marks a stale socket. Any other answer (the socket
+/// vanished, permission denied) is an error: the caller holds the lock, so nothing else
+/// removes it, and what cannot be judged is not removed.
 fn remove_if_stale(path: &Path) -> Result<(), SignerError> {
     match UnixStream::connect(path) {
         Ok(_) => Err(SignerError::AlreadyServing(path.to_path_buf())),
         Err(e) if e.kind() == ErrorKind::ConnectionRefused => Ok(fs::remove_file(path)?),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
 }
 
+/// Takes the exclusive lock of `path`'s starters: `flock` on `<path>.lock` (mode 0600,
+/// never through a symlink) in the socket's directory. Two starters that both found a
+/// stale socket would otherwise both remove it and both bind; the one that cannot take
+/// the lock fails without touching the socket. The lock is the returned descriptor: it
+/// lasts as long as that is open.
+fn lock_starters(path: &Path) -> Result<OwnedFd, SignerError> {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    let fd = rustix::fs::open(
+        Path::new(&name),
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(io::Error::from)?;
+    // Whatever the reason the lock is refused (on a local file system: another starter
+    // or a serving signer holds it), nothing is touched.
+    rustix::fs::flock(&fd, FlockOperation::NonBlockingLockExclusive)
+        .map_err(|_| SignerError::AlreadyServing(path.to_path_buf()))?;
+    Ok(fd)
+}
+
+/// A socket bound by [`bind`], and the lock that keeps a second signer off its path. It
+/// derefs to the [`UnixListener`]; dropping it closes the listener and frees the lock
+/// (the socket file stays, stale, for the next start to replace).
+#[derive(Debug)]
+pub struct Bound {
+    listener: UnixListener,
+    _lock: OwnedFd,
+}
+
+impl Deref for Bound {
+    type Target = UnixListener;
+
+    fn deref(&self) -> &UnixListener {
+        &self.listener
+    }
+}
+
 /// Binds the socket at `path`: in a directory of mode 0700 (made if missing), with mode
-/// 0600. A socket left by a previous run (nobody listens on it) is replaced; one a signer
-/// is serving, or anything else at `path`, is an error.
+/// 0600. Starters are serialised by a lock held for the life of the result; a socket left
+/// by a previous run (nobody listens on it) is replaced; one a signer is serving, or
+/// anything else at `path`, is an error.
 ///
 /// # Errors
-/// [`SignerError::AlreadyServing`] for a live socket; otherwise other [`SignerError`]s.
-pub fn bind(path: &Path) -> Result<UnixListener, SignerError> {
+/// [`SignerError::AlreadyServing`] for a live socket or a starter holding the lock;
+/// otherwise other [`SignerError`]s.
+pub fn bind(path: &Path) -> Result<Bound, SignerError> {
     prepare_dir(path.parent().ok_or(SignerError::SocketPath)?)?;
+    let lock = lock_starters(path)?;
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => remove_if_stale(path)?,
         Ok(_) => return Err(SignerError::SocketPath),
@@ -95,19 +140,19 @@ pub fn bind(path: &Path) -> Result<UnixListener, SignerError> {
     }
     let listener = UnixListener::bind(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(listener)
+    Ok(Bound {
+        listener,
+        _lock: lock,
+    })
 }
 
 /// The signer's clock: Unix seconds.
 type Clock = Box<dyn Fn() -> i64 + Send + Sync>;
 
-/// The system clock in Unix seconds (0 for a clock set before 1970, which refuses all).
-fn system_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_secs()).ok())
-        .unwrap_or(0)
+/// The system clock in Unix seconds (negative before 1970, which every certificate's
+/// validity is past, so all are refused).
+pub(crate) fn system_now() -> i64 {
+    rustix::time::clock_gettime(rustix::time::ClockId::Realtime).tv_sec
 }
 
 /// The CA key and the rules it signs by.

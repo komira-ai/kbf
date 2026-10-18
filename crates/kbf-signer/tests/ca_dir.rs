@@ -47,16 +47,35 @@ fn a_half_or_foreign_directory_is_refused_and_nothing_is_written() {
     std::fs::remove_file(ca.dir.join("ca.pem")).expect("rm");
     let before = std::fs::read(ca.dir.join("ca.key")).expect("key");
     let err = ensure(&ca.dir, Policy::default(), NOW, &mut Stream(4)).expect_err("half");
-    assert!(matches!(err, SignerError::CaDirState));
+    assert!(matches!(err, SignerError::CaDirState { .. }), "{err}");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "the CA directory {} has only ca.key: remove it if no certificate was ever issued, \
+             or restore ca.pem",
+            ca.dir.display()
+        )
+    );
     assert_eq!(std::fs::read(ca.dir.join("ca.key")).expect("key"), before);
     assert!(!ca.dir.join("ca.pem").exists());
 
     let other = make_ca("ensure_stray");
     std::fs::write(other.dir.join("notes"), b"x").expect("write");
-    assert!(matches!(
-        ensure(&other.dir, Policy::default(), NOW, &mut Stream(5)),
-        Err(SignerError::CaDirState)
-    ));
+    let err = ensure(&other.dir, Policy::default(), NOW, &mut Stream(5)).expect_err("stray");
+    assert!(
+        err.to_string()
+            .contains("holds ca.key, ca.pem, notes: it must be empty or exactly"),
+        "{err}"
+    );
+
+    // A lone ca.pem: the advice is to restore the key, not to delete the certificate.
+    let pem_only = make_ca("ensure_pem_only");
+    std::fs::remove_file(pem_only.dir.join("ca.key")).expect("rm");
+    let err = ensure(&pem_only.dir, Policy::default(), NOW, &mut Stream(9)).expect_err("pem");
+    assert!(
+        err.to_string().contains("has only ca.pem: restore ca.key"),
+        "{err}"
+    );
 
     let file = scratch("ensure_file").join("f");
     std::fs::write(&file, b"x").expect("write");

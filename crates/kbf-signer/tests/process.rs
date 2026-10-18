@@ -235,7 +235,8 @@ fn the_binary_refuses_a_half_filled_directory_and_writes_nothing() {
         .expect("run");
         assert!(!out.status.success(), "{name}");
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("neither empty"), "{name}: {stderr}");
+        let said = format!("has only {keep}: ");
+        assert!(stderr.contains(&said), "{name}: {stderr}");
         assert_eq!(names(&dir), [keep], "{name}: nothing written");
         assert!(!socket.parent().expect("dir").exists(), "{name}");
     }

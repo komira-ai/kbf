@@ -74,9 +74,14 @@ pub struct Ca {
 }
 
 pub fn make_ca(name: &str) -> Ca {
+    make_ca_at(name, NOW)
+}
+
+/// A CA whose root was made at the clock reading `now`.
+pub fn make_ca_at(name: &str, now: i64) -> Ca {
     let scratch = scratch(name);
     let dir = scratch.join("ca");
-    let ca = Authority::init_dir(&dir, Policy::default(), NOW, &mut SystemEntropy).expect("init");
+    let ca = Authority::init_dir(&dir, Policy::default(), now, &mut SystemEntropy).expect("init");
     let root = ca.root_der().to_vec();
     let (_, cert) = X509Certificate::from_der(&root).expect("root");
     Ca {

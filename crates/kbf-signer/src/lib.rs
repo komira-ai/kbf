@@ -26,8 +26,9 @@
 //! every start: a missing or empty directory gets a new CA, one holding exactly `ca.key`
 //! and `ca.pem` is loaded, and anything else is refused with nothing written.
 //!
-//! [`bind`] replaces a stale socket (nobody listens) but refuses one a signer is
-//! serving. [`check_tbs`] also reads the signer's clock: a validity that starts more
+//! [`bind`] takes a lock (`<socket>.lock`, held as long as the [`Bound`] lives) so two
+//! starters cannot both replace a stale socket, replaces a stale socket (nobody listens)
+//! and refuses one a signer is serving. [`check_tbs`] also reads the signer's clock: a validity that starts more
 //! than the backdate allowance ahead of it, or has ended, is refused.
 //!
 //! # Wire
@@ -52,5 +53,5 @@ pub use ca_dir::{Started, ensure};
 pub use cli::{Flags, main, run};
 pub use client::SocketSigner;
 pub use error::SignerError;
-pub use server::{SignerServer, bind, harden};
+pub use server::{Bound, SignerServer, bind, harden};
 pub use validate::{Refusal, Route, check_tbs};
