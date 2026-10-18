@@ -5,12 +5,15 @@
 //!
 //! Catches: the enroll service built over the wrong store or CA (the token the API made
 //! is unknown to the listener, or its pin is not the listener's CA), the listener or the
-//! API routes left out of the frontend's start, and the listener not stopping with the
-//! frontend's drain.
+//! API routes left out of the frontend's start, the listener not closing when the
+//! frontend's shutdown begins (the first test connects again after `serve` returns), and
+//! the listener's own certificate never being replaced (the second test: the frontend's
+//! background tasks must run `keep_fresh`).
 
 use std::future::pending;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use kbf_enroll::client::{Enrollment, connect, enroll};
 use kbf_enroll::config::{Config, Host};
@@ -78,10 +81,16 @@ async fn a_frontend_with_enroll_listen_enrolls_a_node_with_a_token_from_its_api(
         "--enroll-allow-unenforced-deny".to_owned(),
         "--frontend-name=localhost".to_owned(),
     ]);
-    let handle = start_frontend(&f, || Ok(pending::<()>())).expect("starts");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let handle = start_frontend(&f, || {
+        Ok(async move {
+            let _ = stopped.await;
+        })
+    })
+    .expect("starts");
     let api = handle.api.expect("the operator API");
     let enroll_at = handle.enroll.expect("the enroll listener");
-    tokio::spawn(handle.serve());
+    let serving = tokio::spawn(handle.serve());
 
     let created = tokio::task::spawn_blocking(move || {
         let client = OperatorClient::new(api, Some(API_TOKEN.to_owned()));
@@ -151,4 +160,54 @@ async fn a_frontend_with_enroll_listen_enrolls_a_node_with_a_token_from_its_api(
     let ids: Vec<&str> = listed.nodes.iter().map(|n| n.id.as_str()).collect();
     assert_eq!(ids, ["node-07"]);
     assert_eq!(listed.nodes[0].state, "active");
+
+    // The frontend stops: serve returns and the enroll listener's socket is closed.
+    stop.send(()).expect("the frontend is still running");
+    tokio::time::timeout(Duration::from_secs(30), serving)
+        .await
+        .expect("the frontend stops within its drain")
+        .expect("join")
+        .expect("served");
+    let again = tokio::net::TcpStream::connect(enroll_at).await;
+    assert!(
+        again.is_err(),
+        "the enroll listener still accepts: {again:?}"
+    );
+}
+
+/// The frontend runs the task that replaces the enroll listener's certificate: with the
+/// interval cut to 100 ms (the flag's minimum is an hour, so the test sets the field the
+/// flags leave `None`), the served configuration is replaced again and again within a
+/// bounded time of the frontend serving.
+///
+/// Catches: the renewal future built but never spawned (`background.extend` replaced by
+/// dropping it): the listener's certificate would expire after its lifetime and every node
+/// would fail to connect; nothing else in the tests waits that long.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_serving_frontend_replaces_the_enroll_listeners_certificate() {
+    let dir = scratch("renewal");
+    let mut f = flags(&[
+        format!("--state-store=sqlite://{}", dir.join("state.db").display()),
+        "--enroll-listen=127.0.0.1:0".to_owned(),
+        format!("--ca-dir={}", dir.join("ca").display()),
+        "--ca-dev-file-signer".to_owned(),
+        "--enroll-allow-unenforced-deny".to_owned(),
+        "--frontend-name=localhost".to_owned(),
+    ]);
+    f.enroll.as_mut().expect("enroll flags").renew_every = Some(Duration::from_millis(100));
+    let handle = start_frontend(&f, || Ok(pending::<()>())).expect("starts");
+    let tls = handle.enroll_tls().expect("the enroll listener's TLS");
+    assert_eq!(tls.reloads().applied, 0, "nothing replaced before serving");
+    let serving = tokio::spawn(handle.serve());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tls.reloads().applied < 3 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the certificate was replaced {} times in 30 s",
+            tls.reloads().applied
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(tls.reloads().rejected, 0);
+    serving.abort();
 }

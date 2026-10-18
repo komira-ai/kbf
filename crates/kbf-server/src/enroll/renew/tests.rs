@@ -249,3 +249,78 @@ fn a_node_expired_beyond_the_grace_must_enroll_again() {
         .renew_now(&renew_request("node-01", &ROLES, &keys, farm.now()));
     assert_eq!(refused(result), RefusalReason::RenewalExpired);
 }
+
+/// The same store and CA served by a frontend whose names are `names`.
+fn service_naming(farm: &Farm, names: &[&str]) -> crate::enroll::service::EnrollService {
+    let names: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
+    crate::enroll::service::EnrollService::new(
+        std::sync::Arc::clone(&farm.store),
+        std::sync::Arc::clone(&farm.ca),
+        &names,
+        crate::enroll::service::NodeSettings::default(),
+    )
+}
+
+/// A storage node enrolled before a `--frontend-name` was added to the frontend is refused
+/// `AdvertiseInvalid` at its renewal, for the name itself and for a name above its host,
+/// and no certificate is issued or recorded; a frontend that does not serve the name still
+/// renews it, and a caller without the node's key is told `WrongKey`, not the verdict.
+///
+/// Catches: `renew` reissuing a certificate from the stored host without judging it again
+/// (the node would keep a certificate naming a name the frontend serves, for ever, and
+/// impersonate the frontend to any client that trusts the CA); the verdict leaking to a
+/// caller who has not proved the key.
+#[test]
+fn a_renewal_of_a_host_the_frontend_now_serves_is_advertise_invalid() {
+    for (case, names) in [
+        ("exact", ["s1.nodes.test"]),
+        ("above", ["nodes.test"]),
+        ("cased", ["S1.Nodes.Test"]),
+    ] {
+        let (farm, keys) = enrolled(&format!("renew-served-{case}"));
+        farm.advance(120);
+        let before = list_nodes(&*farm.store).expect("nodes");
+        let serving = service_naming(&farm, &names);
+        let request = renew_request("node-01", &ROLES, &keys, farm.now());
+        assert_eq!(
+            refused(serving.renew_now(&request)),
+            RefusalReason::AdvertiseInvalid,
+            "{case}"
+        );
+        assert_eq!(
+            list_nodes(&*farm.store).expect("nodes"),
+            before,
+            "{case}: no certificate was recorded"
+        );
+        // The refusal came from the names: the frontend that does not serve it renews.
+        farm.service.renew_now(&request).expect("still renewable");
+
+        let (farm, mut keys) = enrolled(&format!("renew-served-key-{case}"));
+        farm.advance(120);
+        keys[1] = key();
+        let serving = service_naming(&farm, &names);
+        let request = renew_request("node-01", &ROLES, &keys, farm.now());
+        assert_eq!(
+            refused(serving.renew_now(&request)),
+            RefusalReason::WrongKey
+        );
+    }
+}
+
+/// The refusal a node receives is one its client recognises (by code and message) and does
+/// not retry.
+///
+/// Catches: a renewal refusal told in a form the #980 client treats as an unknown status.
+#[test]
+fn the_node_client_recognises_the_renewal_refusal_and_does_not_retry_it() {
+    let status = crate::enroll::service::status_of(RefusalReason::AdvertiseInvalid);
+    let error = kbf_enroll::client::CallError::from(status);
+    assert!(
+        matches!(
+            &error,
+            kbf_enroll::client::CallError::Refused(RefusalReason::AdvertiseInvalid)
+        ),
+        "{error:?}"
+    );
+    assert!(!error.retryable());
+}

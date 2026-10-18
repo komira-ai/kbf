@@ -133,7 +133,7 @@ pub(super) fn csrs_of(csrs: &[pb::RoleCsr]) -> Result<Vec<(Role, &[u8])>, Refusa
 /// An address is judged as an address: any spelling of it (zero-compressed or padded IPv6,
 /// the IPv4-mapped form of an IPv4 address) is the same host, so it is compared
 /// and classified in its canonical form. Other names are compared as lower-case text.
-fn advertise_refused(host: &str, frontend_names: &[String]) -> bool {
+pub(super) fn advertise_refused(host: &str, frontend_names: &[String]) -> bool {
     let address = |text: &str| text.parse::<IpAddr>().ok().map(|ip| ip.to_canonical());
     if let Some(ip) = address(host) {
         let link_local = match ip {

@@ -10,6 +10,7 @@ use futures::future::BoxFuture;
 use kbf_ca::{Policy, SystemEntropy};
 use kbf_signer::Started;
 use kbf_state::Store;
+use kbf_tls::TlsSource;
 
 use super::OsRandom;
 use super::api::EnrollApi;
@@ -44,6 +45,10 @@ pub struct Serving {
     pub(crate) latch: Latch,
     /// Replaces the listener's certificate at half its life.
     pub renewal: BoxFuture<'static, ()>,
+    /// The listener's TLS configuration, shared with the listener: its
+    /// [`TlsSource::reloads`] count `applied` once for each certificate put in place by
+    /// [`Self::renewal`].
+    pub tls: TlsSource,
 }
 
 impl Prepared {
@@ -123,7 +128,8 @@ impl Prepared {
             api,
             listener,
             latch,
-            renewal: tls.keep_fresh(ca).boxed(),
+            tls: tls.source(),
+            renewal: Arc::clone(&tls).keep_fresh(ca, flags.renew_every).boxed(),
         })
     }
 }

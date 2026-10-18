@@ -657,10 +657,10 @@ operator API and the hosts' sessions. The CLI and the UI are its clients. The ma
 `kbf frontend handover`) stays as the fallback; it calls the same installer code.
 
 State in `kbf-state` (one CAS row each; works on SQLite and Postgres):
-- `update/desired {serial, track, paused}`;
+- `update/desired {serial, track}`;
 - `update/slot {holder, order_id, epoch, state}`: no TTL; if the holder dies the slot stays held and the run is `Held`;
 - `update/host/<id> {phase, order_id, serial, since}`: what the controller resumes from;
-- `update/policy {auto_nodes, auto_frontend, idle_wait, min_serving, new_work_only_to_updated, mac_force_after, accept_failing_builds}`;
+- `update/policy {auto_nodes, auto_frontend, paused, idle_wait, min_serving, new_work_only_to_updated, mac_force_after, accept_failing_builds}`;
 - `update/available/<commit>` from the poller.
 
 The controller that runs is the new release's. In A the old frontend's controller is fenced with the rest of the farm; the new
@@ -713,7 +713,7 @@ A server-rendered `kbf-ui` page (**[F]** today read-only, no script, over the re
 | Update | `update/desired` + the whole sequence per policy | `update` | blockers; run active; nothing available |
 | Update frontend only | E0 to E8 | `update` | blockers; old instance still draining |
 | Update nodes only | node steps | `update` | frontend not new; blockers |
-| Pause, Resume | `update/desired.paused` | `update` | no run |
+| Pause, Resume | `update/policy.paused` | `update` | never (a pause needs no run; it holds the next one offered) |
 | Skip host | marks a `Held` host failed, frees the slot | `admin` | not `Held`; says the host stays cordoned |
 | Roll back | a release naming the previous one | `update` | not reversible (2.11), with the reason |
 | Accept failing builds | the cold path | `admin` | never a default; a typed reason |

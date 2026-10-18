@@ -508,6 +508,93 @@ fn a_frontend_ip_name_is_refused_in_every_spelling_of_it() {
     }
 }
 
+/// The frontend NAME is judged as an address too: a name written in a non-canonical
+/// spelling (padded or compressed IPv6, an IPv4-mapped IPv6 address) refuses the canonical
+/// advertise, and the reverse.
+///
+/// Catches: `to_canonical()` dropped on the name side of `advertise_refused` (a name set as
+/// `::ffff:192.0.2.5` or `2001:0db8::1` then compares unequal to the canonical advertise,
+/// and a node is certified for an address the frontend serves).
+#[test]
+fn a_frontend_ip_name_in_any_spelling_refuses_the_canonical_advertise_and_the_reverse() {
+    let v4 = std::net::Ipv4Addr::new(192, 0, 2, 5);
+    let mapped = format!("::ffff:{v4}");
+    for (name, advertise) in [
+        (mapped.as_str(), v4.to_string()),
+        ("::ffff:c000:205", v4.to_string()),
+        ("2001:0db8::1", "2001:db8::1".to_owned()),
+        ("2001:db8:0:0:0:0:0:1", "2001:db8::1".to_owned()),
+        (
+            "2001:0db8:0000:0000:0000:0000:0000:0001",
+            "2001:db8::1".to_owned(),
+        ),
+        (v4.to_string().as_str(), mapped.clone()),
+        ("2001:db8::1", "2001:0db8::1".to_owned()),
+    ] {
+        let names = vec![name.to_owned()];
+        assert!(
+            advertise_refused(&advertise, &names),
+            "{name} vs {advertise}"
+        );
+    }
+    // Neither spelling matches a different address.
+    for (name, advertise) in [
+        (mapped.as_str(), "192.0.2.6"),
+        ("2001:0db8::1", "2001:db8::2"),
+    ] {
+        let names = vec![name.to_owned()];
+        assert!(
+            !advertise_refused(advertise, &names),
+            "{name} vs {advertise}"
+        );
+    }
+    // End to end through the service: a node cannot enroll under the other spelling.
+    let farm = crate::enroll::testkit::farm("enroll-name-spelling");
+    let service = EnrollService::new(
+        Arc::clone(&farm.store),
+        Arc::clone(&farm.ca),
+        &[mapped],
+        NodeSettings::default(),
+    );
+    let tok = token(&farm, 1, &spec(&[Role::Storage]));
+    let (request, _) = enroll_request(&tok, "node-01", &[Role::Storage], "192.0.2.5:8983");
+    assert_eq!(
+        service.enroll_now(&request),
+        Err(RefusalReason::AdvertiseInvalid)
+    );
+    assert!(list_nodes(&*farm.store).expect("nodes").is_empty());
+}
+
+/// An advertise longer than 260 bytes is refused `MalformedRequest` by the service's own
+/// cap, on a request every other layer accepts: a storage token, a host of 253 characters
+/// (the longest DNS name) and a port written with leading zeros (a `u16` that parses). The
+/// 260-byte request at the cap is not refused for its length.
+///
+/// Catches: the cap removed (the request is then enrolled: the registry's `is_host`, the
+/// port parse and the CA all accept it); an off-by-one in the cap. The case in
+/// `a_malformed_request_is_refused_before_the_store_is_read` is a daemon token with an
+/// advertise, which the registry refuses first, so it cannot pin the cap.
+#[tokio::test]
+async fn an_advertise_over_the_cap_is_refused_by_the_cap_and_one_at_it_is_not() {
+    let host = [63, 63, 63, 61].map(|n| "a".repeat(n)).join(".");
+    assert_eq!(host.len(), 253);
+    let farm = farm("enroll-advertise-cap");
+    let at_cap = format!("{host}:008983");
+    let over = format!("{host}:0008983");
+    assert_eq!((at_cap.len(), over.len()), (260, 261));
+
+    let tok = token(&farm, 1, &spec(&[Role::Storage]));
+    let (request, _) = enroll_request(&tok, "node-01", &[Role::Storage], &over);
+    let status = refused(call(&farm, request).await);
+    assert_is(&status, RefusalReason::MalformedRequest);
+    assert_eq!(uses(&farm), 0);
+    assert!(list_nodes(&*farm.store).expect("nodes").is_empty());
+
+    let (request, _) = enroll_request(&tok, "node-01", &[Role::Storage], &at_cap);
+    let answer = call(&farm, request).await;
+    assert!(answer.is_ok(), "{answer:?}");
+}
+
 /// The service has a `Debug` form that names the type and holds nothing of the CA or the
 /// store.
 ///

@@ -67,6 +67,7 @@ fn flags(ca_dir: PathBuf, limits: Limits, allow_unenforced_deny: bool) -> Enroll
             cas_endpoint: String::new(),
             storage_port: 8983,
         },
+        renew_every: None,
     }
 }
 

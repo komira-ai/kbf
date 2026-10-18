@@ -115,9 +115,11 @@ async fn the_certificate_is_renewed_at_half_life_and_a_failure_is_retried_in_a_m
             1 => 1_000,
             _ => now(),
         });
-    let looping = tokio::spawn(
-        std::sync::Arc::clone(&tls).keep_fresh_by(std::sync::Arc::clone(&farm.ca), clock),
-    );
+    let looping = tokio::spawn(std::sync::Arc::clone(&tls).keep_fresh_by(
+        std::sync::Arc::clone(&farm.ca),
+        clock,
+        None,
+    ));
     let tried = || attempts.load(Ordering::SeqCst);
     let applied = || tls.source().reloads().applied;
     let_it_sleep().await;
