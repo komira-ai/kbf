@@ -7,6 +7,11 @@ Description=kbf build farm node daemon
 Wants=network-online.target
 After=network-online.target
 
+# A failure that repeats quickly (the cold store or a disk not ready) must not use up
+# systemd's start limit of 5 starts in 10 s and leave the unit down (check-units rule
+# `restart`).
+StartLimitIntervalSec=0
+
 [Service]
 User=@KBF_USER@
 Slice=kbf.slice
@@ -18,6 +23,8 @@ Delegate=yes
 MemoryMin=@DAEMON_MEMORY_MIN@
 # Build containers get 0 back from the driver.
 OOMScoreAdjust=-900
+# systemd starts a unit at a soft open-file limit of 1024; a build burst passes that (EMFILE).
+LimitNOFILE=1048576
 CPUWeight=200
 # No MemorySwapMax=: leases may swap (the host's swapfile is for them); the
 # daemon's swap watch kills a lease that swaps at its own cap.
@@ -41,6 +48,7 @@ ExecStart=@KBF_BIN_DIR@/kbf daemon \
     --actions-memory-max-gib=@ACTIONS_MEMORY_MAX_GIB@ \
     --supervisor-memory-min-mib=@KBF_DAEMON_MEMORY_MIN_MIB@
 Restart=on-failure
+RestartSec=5
 # Exit 2 is a command line kbf refused (or an image it cannot parse): a restart cannot
 # fix it.
 RestartPreventExitStatus=2

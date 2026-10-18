@@ -24,7 +24,7 @@ reports again after its next `Welcome`.
 
 ## Who may write
 
-A write (cordon, drain, uncordon, a member's state) can take every node in the fleet out of service, so
+A write (cordon, drain, uncordon, a member's state, a deny list entry) can take every node in the fleet out of service, so
 it must come from an operator. Where a request comes from does not show that:
 
 - **Every server host is also a worker.** Build actions run on it, and they can reach
@@ -224,6 +224,78 @@ rebuild (a new cluster, a cache), or have it hold the slice first; and promote o
 member at a time. `draining` is the reverse: the member takes no new writes, its
 successor takes its slot at once, and it is read first.
 
+## `POST /v1/denied` and `DELETE /v1/denied`
+
+An operator adds an entry to the storage deny list, or takes one off. A denied
+certificate is refused by every storage node on every method, and by the membership
+service ([architecture-v2.md](design/architecture-v2.md) section 9 and section 6,
+Admission). An entry names:
+
+| Entry | Names |
+|---|---|
+| `serial <hex>` | the certificate with that serial (colons, case and leading zeros ignored) |
+| `spki-sha256 <64 hex>` | every certificate with that public key, whatever its serial (`openssl x509 -noout -pubkey \| openssl pkey -pubin -outform DER \| sha256sum`) |
+| `node <id>` | every certificate that carries `<id>` as a DNS name, compared up to ASCII case |
+
+A `node` entry names DNS names only. A certificate's IP names are never compared with it,
+nor is a name with a trailing dot or a port, so a `node` entry that holds an IP address or a
+colon (an IPv6 address, or a member's `host:port`) is `400`: list that certificate by
+`serial` or `spki-sha256`, which also name a certificate that has no DNS name.
+
+`POST /v1/denied` takes `{"entry": "node mac-07", "reason": "retired"}`. Both fields are
+required (an empty reason is `400`: a deny is never anonymous), and any other field is `400`. The
+entry is spelled as a line of the deny list file is; it is stored in its canonical form (a
+serial in lower case without colons or leading zeros, a node id in lower case), so one entry
+is one row whatever it was typed as (`node Mac-07` and `node mac-07` are one entry, and
+either spelling takes it off). The reason is at most 512 bytes and the entry's value at most
+253, with no control character in it; the list
+holds at most 4096 entries (`400` past any of them: take one off first). The answer is
+`{"entry": "serial a1b", "generation": G}`: the entry as stored, and the generation of the
+map that holds it, which the call builds before it answers (`0` before any member has
+registered; the entry is in the first map then). An entry that is listed already answers
+`200` and keeps its first reason.
+
+`DELETE /v1/denied?entry=<entry>` takes the entry off (percent-encode it, or use `+` for the
+space): `200` with the same answer, `404` if it is not listed, `400` with no `entry` or one
+that is not an entry.
+
+Both need a token, a loopback peer, no `Origin` and `Content-Type: application/json` (a
+`DELETE` sends the header and no body), as every write does ([Who may
+write](#who-may-write)); `404` on a server without a state store; `503` when the state
+store cannot be written. A `503` that comes after the row was written leaves the row, and
+the map follows at the next beat.
+
+**When it takes effect.** On the storage nodes, from the first call after a node holds the
+generation the answer names: a node learns a new generation with its next heartbeat
+(a third of the member time to live, 5 s by default). A node that has no map enforces
+nothing: one that takes a map from a frontend (`--frontend`) serves nothing until it has one,
+but a standalone storage node, which has no map source, serves every call and enforces no
+entry. At the membership service, a `Register` counts the entry at once, and a
+`Heartbeat` from the first call after the map holds it; a denied node's row is not renewed,
+so the member is `down` after the time to live and leaves the map after the dwell. Until
+then the frontends still route to it, and the other nodes already refuse its copies, so a
+write it is the primary for fails in that window. The entries are in the map every node
+receives, which `GET /v1/members` does not show.
+
+**What it does not cut.** The entry is applied to the storage nodes and to the membership
+service, not to the worker listener: a daemon whose certificate is denied here loses its
+storage access but keeps its work stream, and goes on receiving actions (their commands,
+environments and input digests), and its blob calls on that listener are served, until it
+is listed in `--worker-deny-list`, the file that listener reads
+([worker-protocol.md](design/worker-protocol.md)). To take a daemon off the farm, list it in
+both. There is no `GET /v1/denied` either: the reasons are kept in the store, and the list
+itself is in the map.
+
+**Locking yourself out.** An entry that names the frontend's own certificate (by serial or
+key, or a `node` that is the name in it) makes every storage node refuse the frontend. The
+way back is `DELETE /v1/denied`, which goes through this API and not through a certificate.
+
+**Upgrading.** Upgrade every storage node and every frontend before relying on an entry. A
+storage node that predates the list ignores it, and the checks at `Register` and `Heartbeat`
+are the frontend's, so a denied storage node can still register and beat through a frontend
+that predates them. A frontend that predates the list copies it forward in the map
+unchanged.
+
 ## `GET /v1/frontend/drain` and `POST /v1/frontend/drain`
 
 Draining the frontend itself, for a rollout that restarts it (the nodes are drained
@@ -350,6 +422,44 @@ curl -X DELETE -H "Authorization: Bearer $T" -H 'Content-Type: application/json'
 
 A UI comes later.
 
+## `GET /v1/storage`
+
+Whether every blob is known to have its copies elsewhere: the number a rollout asks
+before it takes a storage node down. A read, open like `GET /v1/nodes`, served by a
+frontend with a state store (without one there are no storage members, and the route is
+`404`). The definition, which is also the help text of the metric below:
+
+`under_replicated_blobs` is the sum, over all registered storage members, of the blobs
+each owes a second copy (the open records of the member's repair journal, which each
+storage heartbeat reports). It is **known** only when every registered member is `ACTIVE`
+and has reported within the freshness window (two heartbeat intervals); otherwise it is
+**unknown**, because a member that is down, joining, catching up, draining or silent may
+hold blobs that nobody counts. A member that has not read its journal since it started, or
+has none, reports that it cannot say; that is unknown too, never zero. So is a farm with
+no registered member.
+
+```json
+{ "members_total": 3, "members_active": 3, "not_active": [], "silent": [],
+  "unreported": [], "debts_total": 3, "under_replicated_blobs": 3,
+  "reasons": ["3 blobs owed"] }
+```
+
+- `under_replicated_blobs`: the number, or `null` while unknown. A gate treats `null` as
+  not zero.
+- `debts_total`: the debts of the `ACTIVE` members that reported within the window and
+  said, summed even when the total is unknown.
+- `not_active`, `silent`, `unreported`: member ids that make the number unknown: members
+  that are not `ACTIVE`; `ACTIVE` members with no report within the window; `ACTIVE`
+  members whose report says they cannot say.
+- `reasons`: why the number is not zero, in that order, as a rollout would say it
+  (`member 3 not active`, `member 2 silent`, `5 blobs owed`); empty when it is known to be
+  zero.
+
+The number is as old as the newest heartbeat. A copy owed since then is not in it, so
+whoever acts on a zero keeps new writes away from the node first (drains it), then reads
+again. A member that left the map (a `DOWN` member leaves after the dwell) is not counted.
+`503` with `{"error": ...}` when the membership cannot be read.
+
 ## `GET /healthz` and `GET /readyz`
 
 For the health check of a front or proxy (a TLS-terminating ingress, Envoy) in front
@@ -444,6 +554,8 @@ caller goes away before the answer counts as an error.
 | `kbf_find_missing_requests_total`, `_errors_total`, `_in_flight`, `_seconds` | as above | FindMissingBlobs calls; `kbf_find_missing_digests_total` the digests asked about, `kbf_find_missing_missing_total` those answered missing |
 | `kbf_execute_requests_total`, `_errors_total` | counter | Execute calls ended, and those that ended in an error status or were dropped by their caller before the done operation (an operation that finished with a failed `ExecuteResponse` is not one) |
 | `kbf_execute_in_flight` | gauge | Execute and WaitExecution streams open |
+| `kbf_under_replicated_blobs` | gauge | the sum over all registered storage members of the blobs each owes a second copy, exported **only while it is known** (every registered member `ACTIVE` and reporting within the window); absent otherwise, never 0. Frontends with a state store. [`GET /v1/storage`](#get-v1storage) says why it is unknown |
+| `kbf_storage_health_known` | gauge | 1 when `kbf_under_replicated_blobs` is exported, 0 when it is unknown (including a membership that cannot be read). Frontends with a state store |
 | `kbf_front_open_executions` | gauge | Execute and WaitExecution operation streams alive: raised when the stream is made (before its first item is read), lowered when it ends or its caller drops it. A call still being authorized or prepared, and one answered from the action cache, is not in it. `GET /v1/frontend/drain` reports it |
 | `kbf_front_executes_started_total` | counter | Execute calls the front took (not refused because it is draining), cache hits included |
 | `kbf_execute_queued` | gauge | Execute streams the scheduler accepted whose operation has not left `QUEUED` |
@@ -599,6 +711,49 @@ record of another caller of the same id ([invocations.md](design/invocations.md#
 It is matched as the bytes of the path: a percent-encoded character (`%3C`, `%6F`) is
 `404`, as is anything else.
 
+**With `--history-objects`** a record the in-memory records do not hold (the server
+restarted, or the record was removed at the bound) is read back from build history
+(`docs/design/ui-data.md` 5.5), and every route above answers from it as it does from a
+live record: filters, `sort=` and page tokens included. Without the flag nothing below
+applies and the routes are as described above.
+
+- **Authorized on every instance, in two steps.** The invocation's instance names are read
+  from its header and each is asked of `invocations.getAuthorizer`; the records are then
+  read and checked against exactly those names. An instance added in between is `503`
+  (send the request again). A header whose instance list is empty or was cut at its bound
+  cannot be checked whole, so the invocation answers `no_record` to every caller.
+- **What a restored record says.** `"restored": true` on the invocation, and, when history
+  has a hole (the invocation was never closed, or records were dropped), `"complete":
+  false` and `"gap_from"`: the time the last chunk that did land was written, from which
+  on records may be missing. `first_seen` and `last_seen` are those of the first and last
+  record, not of the first and last call.
+- **What it does not keep.** `tool`, `tool_version`, `correlated_invocations_id` and
+  `collisions` are empty; the counters are those the rows show (`ac_miss`, `blobs_*` and
+  `bytes_*` are 0); a row has no `target`, `mnemonic`, `configuration`, `action_id` or
+  `operation` of its own (the `shape` has the target the server read), no `usage` in its
+  action answer, an output's `executable` is `false`, and a cache hit has no listing. An
+  attempt's end and the row's outcome are read from the run's class: a failed run's gRPC
+  status code and a lost run's cause are not kept (see `restore.rs`). A cgroup counter the
+  daemon could not read is 0.
+- **Pages.** A page token made for a record the recorder held answers `no_record` once
+  the record is read back instead, and so does one made for a restored record that has
+  since left the 64 MiB cache of restored records. At most 50,000 records are read for one
+  invocation; past that the record is `rows_capped` and not complete.
+
+**`GET /v1/runs/{run_id}`** (with `--history-objects`; otherwise `404` as any unknown
+route) is one attempt: the instance, `lease` (`term.seq`), `worker`, `queued`, `granted`,
+`started` and `ended`, `class` (`ok`, `failed`, `timed_out`, `memory_killed`, `infra`,
+`lost`), `exit_code` for a run that exited, the memory kill and the booking, cap, raised
+booking, memory used and limit of a killed run, the REAPI times and cgroup `usage` the
+daemon reported, the digests of the action, command, result and logs, and the `shape`
+(its key, `cfg`, target and whether it is a test). A key the record has no value for is
+left out. The run is read from the in-memory record while it is held and from history
+after, in one rendering: the answer is the same before and after a restart. The run's one
+instance is asked of `invocations.getAuthorizer` before anything is answered. `{run_id}`
+is 24 lowercase hex digits, which the attempts of the build pages give as `run_id` and
+`run_href` (only with `--history-objects`). Not here yet: the `envelope`, `end`, tails and
+transfer counters.
+
 **The invocation:**
 
 ```json
@@ -734,8 +889,8 @@ ran out are listed with the rest, failed or not.
 | `400` | a parameter the route does not take, one given twice, a `page_size` outside 1 to 1000, a filter value not listed above, or a page token that does not decode, was made for another route or another filter, or names a position past the rows |
 | `401` | the policy's `authenticationPolicy` refuses the request |
 | `403` | `invocations.getAuthorizer` refuses one of the invocation's instance names: each one its calls used and each one a row holds, on every route |
-| `404` | the routes are off: `{"error": "<why>", "off": "invocations"}`; no such record is held (never made, removed at the memory bound, or lost at a restart), a page token's included even if a record has been made since under the same key: `{"error": "no_record", "id": "<id>", "records_since": "<time>"}` (below); no such route, `{id}` is not an id or `<id>~<n>`, or no row for the action: `{"error": "<why>"}` |
-| `503` | the record gained an instance name while it was read: send the request again |
+| `404` | the routes are off: `{"error": "<why>", "off": "invocations"}`; no such record is held (never made, removed at the memory bound, or lost at a restart; with `--history-objects`, and not in history either), a page token's included even if a record has been made since under the same key: `{"error": "no_record", "id": "<id>", "records_since": "<time>"}` (below); no such route, `{id}` is not an id or `<id>~<n>`, or no row for the action: `{"error": "<why>"}` |
+| `503` | the record gained an instance name while it was read: send the request again; with `--history-objects`, history could not be read (`{"error": "build history cannot be read right now"}`) |
 
 **A record that is not held** answers `{"error": "no_record", "id": "<id>",
 "records_since": "<time>"}` ([invocations-api.md](design/invocations-api.md#410-a-record-that-is-gone)).

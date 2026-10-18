@@ -10,9 +10,13 @@ name: ci
 
 on:
   pull_request:
+    # `labeled`: adding `macos` to an open pull request starts native-macos. Adding any
+    # label starts a whole run (the newer run replaces the older one); nothing here can
+    # tell the labels apart before the jobs start.
+    types: [opened, synchronize, reopened, labeled]
   merge_group:
   push:
-    branches: [main]
+    branches: [main, feature/arch-v2]
 
 permissions: {}
 
@@ -395,7 +399,11 @@ jobs:
   # here (the Linux jobs run the same tests against /proc, where the network is not
   # enforced); the daemon binary is built and started with each driver, which
   # detects the node through sysctl.
+  # Not run for a pull request into feature/arch-v2 (the macOS pool is small and a feature
+  # merge does not wait on it) unless the pull request carries the label `macos`; it runs
+  # on pushes to feature/arch-v2 and on all else.
   native-macos:
+    if: ${{ github.event_name != 'pull_request' || github.base_ref != 'feature/arch-v2' || contains(github.event.pull_request.labels.*.name, 'macos') }}
     runs-on: macos-latest
     timeout-minutes: 30
     permissions:
