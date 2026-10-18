@@ -55,7 +55,7 @@ fn the_real_stage_file_matches_the_real_workflows() {
     // prod jobs and at least four workflows.
     let (stages, workflows) = real();
     assert!(workflows.len() >= 4, "{} workflows read", workflows.len());
-    assert!(stages.contains("artifacts.yml#attest"));
+    assert!(stages.contains("artifacts.yml#attest-linux"));
     assert_eq!(check(&stages, &workflows), Vec::<String>::new());
 }
 
@@ -75,9 +75,9 @@ fn a_pull_request_trigger_on_the_release_workflow_is_refused() {
 
 #[test]
 fn id_token_in_a_non_signing_job_is_refused() {
-    // Catches: a push-only job that is not the attest job gaining `id-token: write`
-    // (here the verify job, also in a stage workflow), and the same in a workflow the
-    // stage file does not list. Control: attest holds both scopes in the real text.
+    // Catches: a push-only job that is not an attest job gaining `id-token: write`
+    // (here verify-linux, also in a stage workflow), and the same in a workflow the
+    // stage file does not list. Control: the attest jobs hold both scopes in the real text.
     let (stages, workflows) = real();
     let bad = planted(&workflows, "artifacts.yml", |t| {
         t.replacen(
@@ -88,7 +88,7 @@ fn id_token_in_a_non_signing_job_is_refused() {
     });
     refused(
         &check(&stages, &bad),
-        "job `verify` can write `id-token` or `attestations`",
+        "job `verify-linux` can write `id-token` or `attestations`",
     );
     let bad = planted(&workflows, "ci.yml", |t| {
         t.replacen(

@@ -89,8 +89,7 @@ async fn register_answers_with_identity_interval_and_map() {
         .heartbeat(pb::HeartbeatRequest {
             member_id: 1,
             boot: 1,
-            catching_up: false,
-            have_generation: 0,
+            ..Default::default()
         })
         .await
         .expect("beats")
@@ -105,8 +104,8 @@ async fn register_answers_with_identity_interval_and_map() {
         .heartbeat(pb::HeartbeatRequest {
             member_id: 1,
             boot: 1,
-            catching_up: false,
             have_generation: map.generation(),
+            ..Default::default()
         })
         .await
         .expect("beats")
@@ -147,8 +146,7 @@ async fn every_failure_has_its_own_code() {
     let beat = |id, boot| pb::HeartbeatRequest {
         member_id: id,
         boot,
-        catching_up: false,
-        have_generation: 0,
+        ..Default::default()
     };
     let old = client.heartbeat(beat(1, 1)).await.expect_err("old boot");
     assert_eq!(old.code(), Code::FailedPrecondition);
@@ -222,17 +220,18 @@ fn only_the_storage_role_may_register() {
     let certified = MembershipService::new(Arc::clone(&members), Admission::Certified);
     let open = MembershipService::new(members, Admission::Open);
     assert_eq!(open.admit_leaf(None).expect("open"), None);
-    let names = certified
+    let named = certified
         .admit_leaf(Some(&leaf("storage", &["node-a"])))
         .expect("admitted")
-        .expect("a certified caller has names");
+        .expect("a certified caller has a certificate");
+    let names = named.identity().names();
     assert_eq!(names.to_string(), "node-a");
     assert!(names.covers("node-a") && !names.covers("storage"));
     let nameless = certified
         .admit_leaf(Some(&leaf("storage", &[])))
         .expect("the role is all this checks")
-        .expect("names");
-    assert_eq!(nameless.to_string(), "no DNS or IP name");
+        .expect("a certificate");
+    assert_eq!(nameless.identity().names().to_string(), "no DNS or IP name");
     for role in ["daemon", "frontend"] {
         let e = certified
             .admit_leaf(Some(&leaf(role, &["node-a"])))
@@ -276,6 +275,55 @@ async fn the_sweeper_expires_members_by_itself() {
         tokio::time::sleep(10 * MS).await;
     }
     panic!("the sweeper never marked the silent member Down");
+}
+
+/// Catches: the wire's report not reaching the judgement, or reaching it wrong. A heartbeat
+/// that says it owes 4 is 4; one that says `debts_known = false` is "cannot say" whatever
+/// count rides with it; and a heartbeat from a node that sends neither field (an older
+/// one) is "cannot say" too, never zero.
+#[tokio::test]
+async fn a_heartbeat_carries_what_the_node_owes() {
+    let store = Hooked::new();
+    let (members, mut client) = serve(&store).await;
+    client.register(request(1)).await.expect("registers");
+    members
+        .set_state(kbf_map::MemberId(1), MemberState::Active)
+        .expect("promoted");
+    let beat = |repair_debts, debts_known| pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 1,
+        repair_debts,
+        debts_known,
+        ..Default::default()
+    };
+    client.heartbeat(beat(4, true)).await.expect("beats");
+    assert_eq!(
+        members
+            .storage_health()
+            .expect("health")
+            .under_replicated_blobs,
+        Some(4)
+    );
+
+    client.heartbeat(beat(9, false)).await.expect("beats");
+    let health = members.storage_health().expect("health");
+    assert_eq!(health.under_replicated_blobs, None);
+    assert_eq!(health.unreported, [kbf_map::MemberId(1)]);
+
+    client.heartbeat(beat(4, true)).await.expect("beats");
+    let older = pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 1,
+        ..Default::default()
+    };
+    client.heartbeat(older).await.expect("beats");
+    assert_eq!(
+        members
+            .storage_health()
+            .expect("health")
+            .under_replicated_blobs,
+        None
+    );
 }
 
 /// Catches: expired rows nobody frees (session rows, the results of finished operations

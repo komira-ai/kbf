@@ -46,12 +46,21 @@ jobs:
     stage: build
   - job: artifacts.yml#linux-arm64
     stage: build
+  - job: artifacts.yml#sums-linux
+    stage: build
+  - job: artifacts.yml#sums-darwin-arm64
+    stage: build
   - job: artifacts.yml#sums
     stage: build
-  - job: artifacts.yml#attest
+  - job: artifacts.yml#attest-linux
     stage: build
     signing: true
-  - job: artifacts.yml#verify
+  - job: artifacts.yml#attest-darwin-arm64
+    stage: build
+    signing: true
+  - job: artifacts.yml#verify-linux
+    stage: build
+  - job: artifacts.yml#verify-darwin-arm64
     stage: build
   - job: release.yml#verify
     stage: prod
