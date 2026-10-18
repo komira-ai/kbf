@@ -635,4 +635,33 @@ mod tests {
             )]
         );
     }
+
+    /// Catches a state shown as another, and a value this server does not know shown as
+    /// one it does (an operator would read a refusal as an idle host).
+    #[test]
+    fn every_update_state_has_its_own_name() {
+        let table = [
+            (UpdateState::Idle, "idle"),
+            (UpdateState::Fetching, "fetching"),
+            (UpdateState::Staged, "staged"),
+            (UpdateState::ActivatedUnconfirmed, "activated_unconfirmed"),
+            (UpdateState::Confirmed, "confirmed"),
+            (UpdateState::Reverted, "reverted"),
+            (UpdateState::Refused, "refused"),
+            (UpdateState::Manual, "manual"),
+            (UpdateState::Unspecified, "unknown"),
+        ];
+        for (state, name) in table {
+            let status = UpdateStatus {
+                state: state as i32,
+                ..UpdateStatus::default()
+            };
+            assert_eq!(UpdateReport::new(status).state, name);
+        }
+        let unknown = UpdateStatus {
+            state: 99,
+            ..UpdateStatus::default()
+        };
+        assert_eq!(UpdateReport::new(unknown).state, "unknown");
+    }
 }

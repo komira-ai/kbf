@@ -479,6 +479,9 @@ async fn an_unknown_or_incomplete_platform_is_offered_nothing() {
             kbf_types::FarmTime::from_millis(1),
         )
         .expect("the row");
+        // The table follows the row within a tick; a node that connects first would be
+        // sent the one before.
+        tokio::time::sleep(Duration::from_millis(300)).await;
         let mut fresh = linux_node(&front, &format!("fresh-{}", &name[..3])).await;
         assert!(offer_within(&mut fresh, QUIET).await.is_none(), "{name}");
     }

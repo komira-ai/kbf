@@ -219,6 +219,13 @@ the disk index, never the reverse. The desired release, the slot, the per-host p
 
 ### 6.4 Sessions
 
+**As built.** The frontend looks at the desired row and the release store once a farm tick and
+keeps one offer per complete platform; each session sends its node's platform offer after
+`Welcome` and whenever that offer changes (the same offer is never sent twice on a session).
+A look that fails keeps the table. The node's platform is read from its first `Hello`.
+`GET /v1/nodes` lists `update` per node (`unsupported` until a status arrives); `unavailable`
+and `up_to_date` are the fleet-view unit's.
+
 After `Welcome`, and to every connected node at every change of the desired release or of a platform's
 completeness, the frontend sends an `UpdateOffer` for that node's platform. `UpdateStatus` is kept as the newest per
 node and ignored from a replaced stream, exactly as `NodeStatus` is.

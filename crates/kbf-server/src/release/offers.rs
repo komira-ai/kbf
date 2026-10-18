@@ -188,7 +188,7 @@ async fn poll(offers: Weak<Offers>, every: Duration) {
 #[must_use]
 pub fn platform_of(caps: &NodeCaps) -> Option<ReleasePlatform> {
     let os = caps.exact.get("os").map_or("", String::as_str);
-    ReleasePlatform::from_report(os, caps.cpu.arch.name())
+    ReleasePlatform::from_report(os, caps.cpu.arch().name())
 }
 
 /// What a session sends its node of the offers: nothing for a server without offers or a
