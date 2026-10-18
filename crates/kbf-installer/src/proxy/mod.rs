@@ -6,7 +6,7 @@
 //! side) and for an all-in-one host (stop, hold, start); recovery after a proxy restart
 //! ([`Swap::adopt`]); the operator's rollback; the retire rule; and [`FileRecorder`], the
 //! fsynced `update.json`. What is not: the proxy itself, the real child control and the
-//! orders spool (U4b, U7b), the update API (U8).
+//! orders spool (U4b, U7b), the update API ([`api`], U8a).
 //!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
@@ -43,6 +43,7 @@
 //!   operator rolls back; the proxy-supervised respawn with an epoch bump is U7b.
 
 mod aio;
+pub mod api;
 pub mod model;
 pub mod ports;
 pub mod record;

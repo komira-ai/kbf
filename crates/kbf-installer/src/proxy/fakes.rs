@@ -751,7 +751,7 @@ impl RootOrders for World {
             protocol: 7,
             min_protocol: 5,
             state_schema: 3,
-            profile: "frontend".into(),
+            profile: Some("frontend".into()),
         }))
     }
 

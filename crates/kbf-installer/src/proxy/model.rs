@@ -28,10 +28,14 @@ impl Slot {
 
 /// Where an update is (FP section 4). The order of the variants is the order of a
 /// successful update, so `phase <= Phase::Baking` reads "not past bake". The phases before
-/// `Staged` (accepted, fetching, verifying) belong to the API and the root half (U8).
+/// `Staged` (accepted, fetching, verifying) belong to the API and the root half (U8): the
+/// swap never records them, the update API reports them from `status.json`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
+    Accepted,
+    Fetching,
+    Verifying,
     Staged,
     Preflight,
     Starting,
@@ -58,6 +62,12 @@ impl Phase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Step {
+    /// The API's own steps: where the root half refused or the compatibility gate failed.
+    Verify,
+    Fetch,
+    Order,
+    Host,
+    Compat,
     Stage,
     Migrate,
     Start,
@@ -170,7 +180,9 @@ pub struct StagedFacts {
     pub protocol: u32,
     pub min_protocol: u32,
     pub state_schema: u32,
-    pub profile: String,
+    /// Not in `status.json` today; absent reads as `None`.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 /// The verb of an order record in `orders/` (Q1). The proxy sends the last three.
