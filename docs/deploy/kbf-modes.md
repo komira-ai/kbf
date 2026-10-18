@@ -49,6 +49,7 @@ It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/sy
 | `state-store` | a `--state-store` that is not `sqlite:///<absolute path>`: a Postgres URI (`postgres://` or `postgresql://`; postgres is not wired yet), any other scheme, an empty or relative SQLite path, or a value that names a variable (below) |
 | `traverse` | on the node, a `file://` `--hot-store` with an existing directory above it that the unit's `User=` cannot enter (no execute bit for it as owner, group member or other); the message names the directory, its mode and owner, and the user. `install-units --mode` refuses it too, before any step |
 | `ports` | two of a unit's listeners (`--listen`, `--worker-listen`, `--api-listen`, `--storage-listen`) on one port |
+| `restart` | a node unit (`storage`, `daemon`, `storage-and-daemon`) without `RestartSec=5` and, in `[Unit]`, `StartLimitIntervalSec=0`: systemd's defaults (100 ms, 5 starts in 10 s) end a quickly repeating failure in `start-limit-hit` with the unit down. The frontend keeps `Restart=on-failure` without them: an old frontend that drained after a handover exits 0 and must stay down |
 | `stop` | a mode that drains on SIGTERM (every mode but `daemon`) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
 | `parse` | flags that `kbf <mode>` refuses |
 
@@ -220,7 +221,7 @@ does not exist does nothing. On a host with a local MinIO, add `minio.service` t
 ### Exit 2 and exit 75: what systemd restarts
 
 A start that fails exits 2 or 75. The `storage`, `storage-and-daemon` and `all-in-one`
-units carry `RestartPreventExitStatus=2` and (with #1005) `RestartSec=5`, so exit 2 stays down and exit 75
+units carry `RestartPreventExitStatus=2` and `RestartSec=5`, so exit 2 stays down and exit 75
 (`EX_TEMPFAIL`) is started again five seconds later, below systemd's default start limit
 (five starts in ten seconds).
 

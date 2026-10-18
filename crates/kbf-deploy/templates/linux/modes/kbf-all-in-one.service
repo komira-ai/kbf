@@ -25,6 +25,8 @@ Delegate=yes
 # kbf-server's peak use (KBF_SERVER_RESERVATION_GIB).
 MemoryMin=@SERVER_MEMORY_MIN@
 OOMScoreAdjust=-925
+# systemd starts a unit at a soft open-file limit of 1024; a build burst passes that (EMFILE).
+LimitNOFILE=1048576
 CPUWeight=300
 # No MemorySwapMax=: leases may swap, and they live in this unit's cgroup.
 Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@
@@ -70,7 +72,7 @@ TimeoutStopSec=infinity
 Restart=on-failure
 # Exit 2 is a start kbf refused (a flag, a file, a directory that is not a log): a
 # restart cannot fix it. Exit 75 is a start that can pass on a later try (the data
-# directory still held by the process that is stopping): restarted after the unit's RestartSec (#1005).
+# directory still held by the process that is stopping): restarted after RestartSec.
 RestartPreventExitStatus=2
 
 [Install]

@@ -11,6 +11,11 @@ After=network-online.target
 # adds the units this one starts after: a local MinIO's, the frontend name's resolver (a
 # VPN or overlay service), the listen address's interface.
 
+# A failure that repeats quickly (the cold store or a disk not ready) must not use up
+# systemd's start limit of 5 starts in 10 s and leave the unit down (check-units rule
+# `restart`).
+StartLimitIntervalSec=0
+
 [Service]
 # Not the daemon's user: a storage node holds the cold store's key.
 User=kbf-server
@@ -20,6 +25,8 @@ MemoryMin=16G
 # A storage node answering from swap would slow every build at once.
 MemorySwapMax=0
 OOMScoreAdjust=-925
+# systemd starts a unit at a soft open-file limit of 1024; a build burst passes that (EMFILE).
+LimitNOFILE=1048576
 CPUWeight=300
 # AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY of the bucket's MinIO service account:
 # a secret never goes on the command line. The file is the server user's, mode 0600, so
@@ -50,10 +57,11 @@ ExecStart=/usr/local/bin/kbf storage \
 KillSignal=SIGTERM
 TimeoutStopSec=infinity
 Restart=on-failure
+RestartSec=5
 # Exit 2 is a start kbf refused (a flag, a file, a directory that is not a log): a
 # restart cannot fix it. Exit 75 is a start that can pass on a later try (the data
 # directory still held by the process that is stopping, a boot the frontend handed out
-# again after its state store was restored): restarted after the unit's RestartSec (#1005).
+# again after its state store was restored): restarted after RestartSec.
 RestartPreventExitStatus=2
 
 [Install]
