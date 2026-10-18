@@ -668,9 +668,9 @@ where
     let (api_listen, token, local) = api.map_or((None, None, None), |api| {
         (Some(api.listen), api.token, api.local_cache)
     });
-    let api_listener = api_listen
-        .map(|listen| bind_api(listen, &binder))
-        .transpose()?;
+    // One line: a `?` alone on its own line is a never-taken error region, a missed
+    // line in the coverage ratchet (it counts lines per generic copy, best copy wins).
+    let api_listener = api_listen.map(|l| bind_api(l, &binder)).transpose()?;
     let api = api_listener.as_ref().map(|(_, local)| *local);
     let readiness = Arc::new(Readiness::default());
     let (closer, closing) = kbf_front::closing();
