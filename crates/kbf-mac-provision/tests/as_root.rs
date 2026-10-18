@@ -27,7 +27,7 @@
 //!   `time_server`, `time_max_offset_ms` (Remote Login needs Full Disk Access; the clock
 //!   and the runner's own login are left alone).
 //!
-//! No kbf-daemon is built for these tests: they assert that the job is loaded, never
+//! No kbf is built for these tests: they assert that the job is loaded, never
 //! that the daemon runs. When nothing is installed at the daemon's path, a copy of
 //! `/usr/bin/true` stands there, so `launchctl bootstrap` has a program to start.
 //!

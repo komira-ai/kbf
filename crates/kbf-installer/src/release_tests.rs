@@ -578,6 +578,20 @@ fn every_verb_refuses_while_a_deploy_is_pending() {
     }
 }
 
+/// Catches a unit name that is not UTF-8 being used (it could not be named in a plan
+/// line): the check refuses it, whatever the filesystem can hold.
+#[test]
+fn a_name_that_is_not_utf8_is_refused() {
+    let full = Path::new("/src/units").join(OsStr::from_bytes(b"bad\xff.service"));
+    let name = full.file_name().expect("a name");
+    let err = utf8(name, &full).expect_err("not utf-8");
+    assert_eq!(err.to_string(), format!("{full:?} is not a UTF-8 name"));
+    assert_eq!(
+        utf8(OsStr::new("a.service"), &full).expect("utf-8"),
+        "a.service"
+    );
+}
+
 /// Catches errors passed over or misnamed: a source without `kbf`, with `units` a file,
 /// with a unit whose name is not UTF-8 (it could not be named in a plan line), a state
 /// file that cannot be parsed, a `current` that is a directory, and a layout directory
@@ -598,14 +612,18 @@ fn errors_name_what_is_wrong() {
         "cannot read {}",
         units_file.join("units").display()
     )));
-    let odd = source("errors-odd", "A", Some(&[]));
-    let name = OsStr::from_bytes(b"bad\xff.service");
-    fs::write(odd.join("units").join(name), "x").expect("seed");
-    let err = install_on(&mut exec, &root, A, &odd, Mode::DryRun).expect_err("not utf-8");
-    assert_eq!(
-        err.to_string(),
-        format!("{:?} is not a UTF-8 name", odd.join("units").join(name))
-    );
+    // APFS refuses to create a name that is not UTF-8 (EILSEQ), so only Linux can seed one;
+    // `a_name_that_is_not_utf8_is_refused` pins the check itself on every platform.
+    if cfg!(target_os = "linux") {
+        let odd = source("errors-odd", "A", Some(&[]));
+        let name = OsStr::from_bytes(b"bad\xff.service");
+        fs::write(odd.join("units").join(name), "x").expect("seed");
+        let err = install_on(&mut exec, &root, A, &odd, Mode::DryRun).expect_err("not utf-8");
+        assert_eq!(
+            err.to_string(),
+            format!("{:?} is not a UTF-8 name", odd.join("units").join(name))
+        );
+    }
 
     let ok = source("errors-ok", "A", None);
     fs::create_dir_all(exec.at("/usr/local/kbf/current")).expect("a directory");
@@ -652,10 +670,10 @@ fn mac(name: &str) -> (ScratchHost, Layout) {
     (exec, layout)
 }
 
-/// A release for a Mac: `kbf-daemon` holding `binary`.
+/// A release for a Mac: `kbf` holding `binary`.
 fn mac_source(name: &str, binary: &str) -> PathBuf {
     let dir = scratch(&format!("deploy-release-src-{name}"));
-    fs::write(dir.join("kbf-daemon"), binary).expect("binary");
+    fs::write(dir.join("kbf"), binary).expect("binary");
     dir
 }
 
@@ -695,12 +713,16 @@ fn a_release_of_two_binaries_is_installed_whole_and_reported() {
     );
 }
 
-/// Catches a source with only `kbf-daemon` being refused (a Mac release has no `kbf`), and
-/// a source with neither being refused naming `kbf` as before.
+/// Catches a source with only `kbf` (all a Mac release has) or only `kbf-daemon` being
+/// refused, and a source with neither being refused naming `kbf` as before.
 #[test]
-fn a_source_needs_one_binary_and_a_daemon_alone_will_do() {
-    let only = mac_source("daemon-only", "daemon A");
+fn a_source_needs_one_binary_and_either_will_do() {
+    let only = mac_source("kbf-only", "kbf A");
     let s = Source::read(&only).expect("reads");
+    assert_eq!(s.binaries, [("kbf", b"kbf A".to_vec())]);
+    let daemon = scratch("deploy-release-src-daemon-only");
+    fs::write(daemon.join("kbf-daemon"), "daemon A").expect("daemon");
+    let s = Source::read(&daemon).expect("reads");
     assert_eq!(s.binaries, [("kbf-daemon", b"daemon A".to_vec())]);
     let none = scratch("deploy-release-src-none");
     let err = Source::read(&none).expect_err("nothing");
@@ -736,7 +758,7 @@ fn a_mac_install_uses_the_mac_layout_and_makes_its_missing_parents() {
         "{out}"
     );
     assert!(
-        out.contains("restart the units that run /usr/local/kbf/current/kbf-daemon (launchctl kickstart -k system/<label>)"),
+        out.contains("restart the units that run /usr/local/kbf/current/kbf (launchctl kickstart -k system/<label>)"),
         "{out}"
     );
     assert!(exec.at("/var/db/kbf-deploy/state.json").is_file());
@@ -750,7 +772,7 @@ fn a_mac_install_uses_the_mac_layout_and_makes_its_missing_parents() {
     assert_eq!(state_of(&layout).current, Some(c(B)));
     assert!(
         !exec
-            .at(&format!("/usr/local/kbf/releases/{A}/kbf"))
+            .at(&format!("/usr/local/kbf/releases/{A}/kbf-daemon"))
             .exists()
     );
 

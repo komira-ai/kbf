@@ -19,7 +19,8 @@
 //!   named by.
 //!
 //! The root helper of the pull-based updates is [`helper`], run by the `kbf-installer`
-//! binary (`run`, `boot-check`).
+//! binary (`run`, `boot-check`). The binary says what it is in [`version`]: `--version`
+//! and `--version --json` name the commit and the profile it was built with.
 //!
 //! The offline check ([`stage::stage_from_inbox`] runs them in the order that matters,
 //! documented there):
@@ -33,6 +34,9 @@
 //!   `--version --json`, and on macOS the quarantine attribute and the code signature.
 //! - [`envoy`]: the Envoy of a frontend host, rendered from settings and checked (a library
 //!   for the frontend-update path, with no command line).
+//! - [`proxy`]: the frontend proxy's update machinery, against traits (no socket, no child):
+//!   the swap orchestrator, and in `proxy::api` the update API (routes, bearer-token check,
+//!   the actor that owns one update, idempotent request ids).
 //! - [`run`]: the one place a process is started, behind a trait a test plays.
 //! - [`refusal`]: every way a stage is refused, one enum with a stable code per case.
 //!
@@ -42,26 +46,37 @@
 //! source ref (docs/deploy/host-releases.md, "What is trusted").
 
 pub mod activate;
+pub mod app;
 pub mod archive;
 pub mod attest;
 pub mod binary;
+pub mod cli;
 pub mod darwin;
 pub mod envoy;
+pub mod exit;
 #[cfg(test)]
 mod fixtures;
+#[cfg(any(test, feature = "testkit"))]
+pub mod golden;
 pub mod helper;
 pub mod inbox;
+pub mod installer_toml;
 pub mod layout;
 pub mod offer;
+pub mod proxy;
+pub mod record;
 pub mod refusal;
 pub mod release;
 pub mod run;
 pub mod settings;
 pub mod stage;
 pub mod state;
+pub mod state_v2;
+pub mod status_v2;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod trust;
+pub mod version;
 
 use std::fmt;
 

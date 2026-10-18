@@ -178,7 +178,7 @@ async fn a_digest_named_many_times_is_fetched_once() {
 /// the failure, whatever the order the blocking pool creates their files in. Exactly
 /// the root and those `BOUND` blobs are read: no other blob may start. Without the hold
 /// a sibling could finish before the missing blob's file was created and let one more
-/// start before the failure (komira-build-farm#676). Mutants seen red: the check that
+/// start before the failure (kbf#676). Mutants seen red: the check that
 /// a blob failed removed (201 reads); the hold replaced by the missing read waiting for
 /// `BOUND + 1` present reads, the schedule of #676 (more than `1 + BOUND` reads).
 #[tokio::test]
