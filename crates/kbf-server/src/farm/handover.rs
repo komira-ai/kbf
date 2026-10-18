@@ -310,11 +310,7 @@ fn note(
         let looks = untraced.entry(operation).or_default();
         *looks = looks.saturating_add(1);
         if *looks == UNTRACED_LOOKS {
-            tracing::warn!(
-                %operation,
-                "the state store has no trace of an operation its callers wait on: \
-                 they keep waiting until it appears, they cancel, or this process stops"
-            );
+            tracing::warn!(%operation, "no trace in the state store: callers keep waiting");
         }
     } else {
         untraced.remove(&operation);
