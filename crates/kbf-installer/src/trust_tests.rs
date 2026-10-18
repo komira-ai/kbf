@@ -7,7 +7,7 @@ use crate::fixtures::trusted_host;
 use crate::layout;
 
 fn gh() -> HostPath {
-    layout::path(layout::GH)
+    layout::path(crate::fixtures::GH_PATH)
 }
 
 fn dir(mode: u32, uid: u32) -> Entry {
@@ -31,7 +31,12 @@ fn refused(exec: &FakeExec) -> (String, &'static str) {
 fn a_root_owned_chain_closed_to_writes_is_trusted() {
     let exec = trusted_host();
     trusted_chain(&exec, &gh(), Kind::File).expect("trusted");
-    trusted_chain(&exec, &layout::path(layout::INSTALLER_DIR), Kind::Dir).expect("a directory");
+    trusted_chain(
+        &exec,
+        &crate::layout::path(crate::fixtures::TRUST_DIR),
+        Kind::Dir,
+    )
+    .expect("a directory");
 }
 
 /// Catches each way a path on the trust list can be replaced by someone else, named by
@@ -44,10 +49,10 @@ fn a_root_owned_chain_closed_to_writes_is_trusted() {
 #[test]
 fn a_path_or_directory_others_could_replace_is_refused_naming_it() {
     let path = [
-        (layout::GH, true),
-        (layout::INSTALLER_DIR, false),
-        ("/usr/local/libexec", false),
-        ("/usr/local", false),
+        (crate::fixtures::GH_PATH, true),
+        (crate::fixtures::TRUST_DIR, false),
+        ("/usr/share/kbf-installer", false),
+        ("/usr/share", false),
         ("/usr", false),
     ];
     for (p, is_file) in path {
@@ -86,20 +91,26 @@ fn a_link_the_wrong_kind_a_missing_path_and_a_failed_stat_are_refused() {
             target: "gh-2.102.0".into(),
         },
     );
-    assert_eq!(refused(&exec), (layout::GH.to_owned(), "untrusted-link"));
+    assert_eq!(
+        refused(&exec),
+        (crate::fixtures::GH_PATH.to_owned(), "untrusted-link")
+    );
 
     let mut exec = trusted_host();
     exec.entries.insert(
-        HostPath::new("/usr/local").expect("path"),
+        HostPath::new("/usr/share").expect("path"),
         Entry::Link {
-            target: "private/usr/local".into(),
+            target: "private/usr/share".into(),
         },
     );
-    assert_eq!(refused(&exec), ("/usr/local".to_owned(), "untrusted-link"));
+    assert_eq!(refused(&exec), ("/usr/share".to_owned(), "untrusted-link"));
 
     let mut exec = trusted_host();
     exec.entries.insert(gh(), dir(0o755, 0));
-    assert_eq!(refused(&exec), (layout::GH.to_owned(), "untrusted-kind"));
+    assert_eq!(
+        refused(&exec),
+        (crate::fixtures::GH_PATH.to_owned(), "untrusted-kind")
+    );
     let message = trusted_chain(&exec, &gh(), Kind::File)
         .expect_err("wrong kind")
         .to_string();
@@ -107,13 +118,16 @@ fn a_link_the_wrong_kind_a_missing_path_and_a_failed_stat_are_refused() {
         message,
         format!(
             "{} is not trusted: it is a directory, not a file",
-            layout::GH
+            crate::fixtures::GH_PATH
         )
     );
 
     let mut exec = trusted_host();
     exec.entries.remove(&gh());
-    assert_eq!(refused(&exec), (layout::GH.to_owned(), "untrusted-missing"));
+    assert_eq!(
+        refused(&exec),
+        (crate::fixtures::GH_PATH.to_owned(), "untrusted-missing")
+    );
     let mut exec = trusted_host();
     exec.entries.remove(&HostPath::new("/usr").expect("path"));
     assert_eq!(refused(&exec), ("/usr".to_owned(), "untrusted-missing"));

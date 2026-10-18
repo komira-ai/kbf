@@ -14,13 +14,57 @@ use kbf_host::{HostExec, Root};
 use crate::activate;
 use crate::cli::{BootArgs, Cli, RunArgs, Verb};
 use crate::exit::Exit;
-use crate::helper::cycle::{Config, Helper};
+use crate::helper::cycle::{Config, Helper, HelperError};
 use crate::helper::restart::Restart;
 use crate::layout::{Layout, Platform};
-use crate::release;
+use crate::release::{self, ReleaseError};
 use crate::run::SystemRunner;
 use crate::settings::Settings;
 use crate::stage::{Context, Limits, stage_from_inbox};
+
+/// Why a verb failed and the exit it ends with: `Failed`, or `NeedsOperator` when only an
+/// operator can go on (the state files are both unusable).
+struct Failure {
+    exit: Exit,
+    why: String,
+}
+
+impl From<String> for Failure {
+    fn from(why: String) -> Failure {
+        Failure {
+            exit: Exit::Failed,
+            why,
+        }
+    }
+}
+
+impl From<HelperError> for Failure {
+    fn from(e: HelperError) -> Failure {
+        let operator = matches!(&e, HelperError::State(s) if s.needs_operator());
+        Failure {
+            exit: if operator {
+                Exit::NeedsOperator
+            } else {
+                Exit::Failed
+            },
+            why: e.to_string(),
+        }
+    }
+}
+
+impl From<ReleaseError> for Failure {
+    fn from(e: ReleaseError) -> Failure {
+        let operator = matches!(&e, ReleaseError::State(s) if s.needs_operator());
+        Failure {
+            exit: if operator {
+                Exit::NeedsOperator
+            } else {
+                Exit::Failed
+            },
+            why: e.to_string(),
+        }
+    }
+}
 
 fn now() -> u64 {
     SystemTime::now()
@@ -36,7 +80,7 @@ fn host(root: PathBuf) -> Result<(Layout, HostExec), String> {
     ))
 }
 
-fn run(root: PathBuf, args: &RunArgs) -> Result<(), String> {
+fn run(root: PathBuf, args: &RunArgs) -> Result<(), Failure> {
     let (layout, exec) = host(root)?;
     // clap makes exactly one of the two flags present (`required_unless_present`,
     // `conflicts_with`), so the label is there whenever the unit is not.
@@ -65,12 +109,10 @@ fn run(root: PathBuf, args: &RunArgs) -> Result<(), String> {
         };
         stage_from_inbox(&mut ctx, entry)
     };
-    helper.recover().map_err(|e| e.to_string())?;
+    helper.recover()?;
     let mut left = args.passes;
     while left != Some(0) {
-        helper
-            .cycle(now(), &mut stager)
-            .map_err(|e| e.to_string())?;
+        helper.cycle(now(), &mut stager)?;
         helper.drain_log(&mut std::io::stderr());
         left = left.map(|n| n - 1);
         sleep(Duration::from_secs(args.interval_secs));
@@ -78,7 +120,7 @@ fn run(root: PathBuf, args: &RunArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), String> {
+fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), Failure> {
     let (layout, mut exec) = host(root)?;
     let mut out = Vec::new();
     let result = activate::boot_check(&mut exec, &layout, now(), args.window_secs, &mut out);
@@ -88,7 +130,7 @@ fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), String> {
             eprintln!("kbf-installer: boot check: {decision:?}");
             Ok(())
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -145,8 +187,8 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
     };
     match result {
         Ok(()) => Exit::Ok,
-        Err(why) => say(
-            Exit::Failed,
+        Err(Failure { exit, why }) => say(
+            exit,
             format!("kbf-installer: {why}"),
             serde_json::json!({"verb": name, "error": "failed", "message": why}),
         ),

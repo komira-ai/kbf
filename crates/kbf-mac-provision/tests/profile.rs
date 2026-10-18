@@ -814,7 +814,7 @@ fn the_job_runs_kbf_daemon_with_the_kits_flags() {
     assert_eq!(
         args,
         [
-            "/usr/local/kbf/current/kbf",
+            "/usr/local/kbf-installer/releases/current/kbf",
             "daemon",
             "--driver",
             "native",

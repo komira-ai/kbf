@@ -1,6 +1,6 @@
 //! The host's settings: what only root may decide about how a release is checked.
 //!
-//! `/usr/local/libexec/kbf-deploy/installer.conf` ([`crate::layout::SETTINGS`]) holds
+//! `installer.conf` in the trust directory (`/usr/share/kbf-installer/trust/` on Linux, [`crate::layout::Layout::settings`]) holds
 //! `KEY=VALUE` lines (blank lines and `#` comments are skipped; every key at most once;
 //! a key this build does not know is refused):
 //!
@@ -25,7 +25,7 @@ use kbf_host::path::HostPath;
 
 use crate::attest::SourceRef;
 use crate::binary::Arch;
-use crate::layout::{self, Layout};
+use crate::layout::Layout;
 use crate::refusal::{Refusal, SettingsFault, TrustFault};
 use crate::run::{RunAs, nobody};
 use crate::trust::trusted_chain;
@@ -65,7 +65,7 @@ impl Settings {
     /// else the defaults. `trust` answers who owns what and reads the file: the host's
     /// own [`kbf_host::HostExec`], or a test's.
     pub fn load(trust: &dyn Exec, host: &Layout) -> Result<Settings, Refusal> {
-        Settings::load_from(trust, host, &layout::path(layout::SETTINGS))
+        Settings::load_from(trust, host, &host.settings())
     }
 
     /// [`Settings::load`] for the settings file at `file`.

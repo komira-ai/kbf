@@ -18,7 +18,7 @@ use crate::pool::{self, ROOT_DIR};
 use crate::profile::{DaemonUser, Profile};
 
 const LAUNCHCTL: &str = "/bin/launchctl";
-pub const KBF_BIN: &str = "/usr/local/kbf/current/kbf";
+pub const KBF_BIN: &str = "/usr/local/kbf-installer/releases/current/kbf";
 pub const LOG_DIR: &str = "/Library/Logs/kbf";
 pub const ERR_LOG: &str = "/Library/Logs/kbf/kbf-daemon.err.log";
 const ROOT_FILE: &str = "-rw-r--r-- 0 0";

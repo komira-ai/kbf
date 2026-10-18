@@ -6,12 +6,12 @@
 //!
 //! - [`layout`]: the paths ([`layout::Layout`], a directory tree and its
 //!   [`layout::Platform`]): each release in its own directory under
-//!   `/usr/local/kbf/releases/<commit>/`, the `current` and `previous` links beside them,
-//!   the state under `/var/lib/kbf-deploy/` (Linux) or `/var/db/kbf-deploy/` (macOS) and
-//!   its settings under `/etc/kbf-deploy/`.
-//! - [`state`]: `state.json` (the current, previous and staged commits, the one waiting
-//!   to be confirmed, and the order floor), read and written under an exclusive lock and
-//!   replaced whole by a rename.
+//!   `/var/lib/kbf-installer/releases/<commit>/`, the `current` and `previous` links beside them,
+//!   the state under `/var/lib/kbf-installer/` (Linux) or `/var/db/kbf-installer/` (macOS) and
+//!   its trust files under `/usr/share/kbf-installer/trust/`.
+//! - [`state`]: `state.json` (schema 2: the current, previous and staged commits, the one
+//!   waiting to be confirmed, the order floor and the rest), with `state.json.bak` as the last
+//!   good copy, read and written under an exclusive lock and replaced whole by a rename.
 //! - [`release`]: the `install`, `stage`, `rollback` and `gc` verbs.
 //! - [`activate`]: the swap on trial: `activate`, `confirm`, `revert`, the start check
 //!   and the expiry, and the repair of the links after an interrupted verb.

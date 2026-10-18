@@ -50,14 +50,14 @@ impl Rig {
         for sub in [
             "run",
             "var/run",
-            "var/db/kbf-deploy",
-            "var/lib/kbf-deploy",
+            "var/db/kbf-installer",
+            "var/lib/kbf-installer",
             "var/lib/kbf-updater/inbox/orders",
-            "usr/local/kbf/releases",
+            "var/lib/kbf-installer/releases",
         ] {
             fs::create_dir_all(root.join(sub)).expect("seed");
         }
-        let dir = root.join("usr/local/kbf/releases").join(A);
+        let dir = root.join("var/lib/kbf-installer/releases").join(A);
         fs::create_dir_all(&dir).expect("release");
         fs::write(dir.join("kbf"), b"binary").expect("binary");
         host.answer = Box::new(|_| Ok(reply(0, "", "")));
@@ -151,7 +151,7 @@ fn stage_b(
     layout: Layout,
 ) -> impl FnMut(&mut ScratchHost, &std::path::Path) -> Result<Staged, Refusal> {
     move |_, _| {
-        let dir = layout.join(&crate::layout::release_dir(&c(B)));
+        let dir = layout.join(&layout.release_dir(&c(B)));
         fs::create_dir_all(&dir).expect("release");
         fs::write(dir.join("kbf"), b"binary").expect("binary");
         let lock = Locked::acquire(&layout).expect("lock");
@@ -233,16 +233,10 @@ fn an_activate_order_swaps_restarts_once_and_is_not_replayed() {
     rig.put_order(5, &order_json(5, "activate", B));
     rig.cycle(T0 + 3);
     let links = |rig: &Rig, name: &str| {
-        fs::read_link(rig.root.join("usr/local/kbf").join(name)).expect("link")
+        fs::read_link(rig.root.join("var/lib/kbf-installer/releases").join(name)).expect("link")
     };
-    assert_eq!(
-        links(&rig, "current"),
-        PathBuf::from(format!("releases/{B}"))
-    );
-    assert_eq!(
-        links(&rig, "previous"),
-        PathBuf::from(format!("releases/{A}"))
-    );
+    assert_eq!(links(&rig, "current"), PathBuf::from(B));
+    assert_eq!(links(&rig, "previous"), PathBuf::from(A));
     assert_eq!(rig.restarts(), 1);
     assert_eq!(rig.status()["state"], "activated_unconfirmed");
     assert_eq!(rig.status()["installed_commit"], B);
@@ -474,7 +468,7 @@ fn the_window_an_order_asks_for_is_clamped_on_macos() {
         rig.put_order(5, &body);
         rig.cycle(T0 + 3);
         let pending = rig.state().pending_confirm.expect("on trial");
-        assert_eq!(pending.deadline, Some(T0 + 3 + kept), "asked {asked}");
+        assert_eq!(pending.deadline_wall, Some(T0 + 3 + kept), "asked {asked}");
     }
 }
 
@@ -568,7 +562,7 @@ fn the_helpers_files_have_their_modes() {
             .mode()
             & 0o777
     };
-    assert_eq!(mode("var/lib/kbf-deploy/helper.json"), 0o600);
+    assert_eq!(mode("var/lib/kbf-installer/helper.json"), 0o600);
     assert_eq!(mode("var/lib/kbf-updater/status.json"), 0o644);
 }
 
@@ -731,7 +725,11 @@ fn unreadable_state_is_reported_and_unreadable_memory_stops_the_pass() {
     let mut rig = Rig::new("unreadable");
     // Links already as the state says: nothing moved, nothing owed.
     rig.helper.recover().expect("recovers");
-    fs::write(rig.root.join("var/lib/kbf-deploy/state.json"), b"not json").expect("ruin");
+    fs::write(
+        rig.root.join("var/lib/kbf-installer/state.json"),
+        b"not json",
+    )
+    .expect("ruin");
     // A pass over a state it cannot read stops with the error (it acts on nothing).
     let error = rig
         .helper
@@ -740,9 +738,9 @@ fn unreadable_state_is_reported_and_unreadable_memory_stops_the_pass() {
     assert!(error.to_string().contains("host state"), "{error}");
     rig.helper.recover().expect("recovers into a refusal");
     let memory =
-        fs::read_to_string(rig.root.join("var/lib/kbf-deploy/helper.json")).expect("memory");
+        fs::read_to_string(rig.root.join("var/lib/kbf-installer/helper.json")).expect("memory");
     assert!(memory.contains("refused"), "{memory}");
-    let path = rig.root.join("var/lib/kbf-deploy/helper.json");
+    let path = rig.root.join("var/lib/kbf-installer/helper.json");
     fs::write(&path, b"not json").expect("ruin");
     let error = rig
         .helper
@@ -801,7 +799,13 @@ fn an_expiry_that_cannot_revert_is_reported() {
         &mut Vec::new(),
     )
     .expect("starts");
-    fs::remove_file(rig.root.join("usr/local/kbf/releases").join(A).join("kbf")).expect("gone");
+    fs::remove_file(
+        rig.root
+            .join("var/lib/kbf-installer/releases")
+            .join(A)
+            .join("kbf"),
+    )
+    .expect("gone");
     let before = rig.restarts();
     rig.cycle(T0 + 10 + 601);
     assert_eq!(rig.state().current, Some(c(B)));
@@ -873,7 +877,7 @@ fn the_same_id_in_two_epochs_is_two_activations() {
     rig.cycle(T0 + 3);
     assert_eq!(rig.restarts(), 1);
     let pending = rig.state().pending_confirm.expect("on trial");
-    assert_eq!(pending.order_id.as_deref(), Some("7-5"));
+    assert_eq!(pending.activation, "7-5");
     rig.put_order(5, &order_in_epoch(5, 8, "activate", B));
     rig.cycle(T0 + 6);
     assert_eq!(rig.restarts(), 1, "not the first one's repeat");
