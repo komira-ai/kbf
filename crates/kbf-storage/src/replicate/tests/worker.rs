@@ -370,6 +370,7 @@ async fn an_owner_that_cannot_be_dialled_is_waited_for() {
             zone: String::new(),
             weight: 1,
             state: MemberState::Active,
+            boot: 0,
         })
         .collect();
     let map = Arc::new(

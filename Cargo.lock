@@ -1449,12 +1449,14 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
+ "futures",
  "kbf-all-in-one",
  "kbf-cas-conformance",
  "kbf-daemon",
  "kbf-deploy",
  "kbf-driver-container",
  "kbf-enroll",
+ "kbf-front",
  "kbf-host",
  "kbf-node",
  "kbf-peer",
@@ -1468,6 +1470,7 @@ dependencies = [
  "prost",
  "rcgen",
  "rustix",
+ "rustls",
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
@@ -2046,6 +2049,7 @@ dependencies = [
  "hex",
  "kbf-auth",
  "kbf-caps",
+ "kbf-enroll-registry",
  "kbf-front",
  "kbf-history",
  "kbf-invocation",
@@ -2235,6 +2239,8 @@ dependencies = [
 name = "kbf-types"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
