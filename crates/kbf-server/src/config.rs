@@ -22,7 +22,8 @@ use kbf_meta::ServerId;
 use kbf_threads::disk::FreeSpace;
 
 use crate::identity::{DenyList, DenyListError};
-use crate::serve::{Api, Listeners, StreamTiming, WorkerTls};
+use crate::proxy_auth::{ProxySecret, ProxySecretError};
+use crate::serve::{Api, Behind, Listeners, StreamTiming, WorkerTls};
 use crate::stores::{S3Uri, StoreFlags, StoreUri, Stores, StoresError};
 use crate::token::{ApiToken, TokenFileError};
 
@@ -244,9 +245,21 @@ pub struct Args {
     /// calls, a storage node's `Register` and `Heartbeat`), so an edit takes effect
     /// without a restart. A `node` entry also refuses a storage certificate with that DNS
     /// name. A list that cannot be read after start refuses all of those calls. Needs
-    /// mutual TLS.
-    #[arg(long, requires_all = ["worker_tls_cert", "worker_tls_key", "worker_client_ca"])]
+    /// mutual TLS, or `--proxy-auth-file` (then only `node` entries can name a caller: the
+    /// proxy forwards a node id, not a certificate).
+    #[arg(long)]
     pub worker_deny_list: Option<PathBuf>,
+    /// A file holding the per-boot secret of the TLS-terminating proxy in front of this
+    /// server (`docs/design/frontend-proxy.md`, section 3): exactly 32 bytes, owned by the
+    /// server's user with mode 0600 or 0400, read at start. The proxy presents them as 64
+    /// lower-case hex digits in `x-kbf-proxy-auth`. With it, every listener takes calls from
+    /// loopback only, and believes `x-kbf-node-id` and `x-kbf-role` only from a call that
+    /// presents the secret; every other `x-kbf-*` header is dropped. The worker listener then
+    /// takes the proxy's identity in place of a client certificate (it needs no TLS flags),
+    /// and the operator API's writes must come through the proxy as well as carry the token.
+    /// Without it, behavior is as before.
+    #[arg(long, value_name = "PATH")]
+    pub proxy_auth_file: Option<PathBuf>,
     /// How often, in seconds, a TLS listener looks at its certificate, key and client CA
     /// files (the `--*-tls-cert`, `--*-tls-key` and `--*-client-ca` flags). A change is
     /// applied to the next TLS handshake, with no restart and without ending a connection
@@ -516,6 +529,15 @@ pub enum ConfigError {
     /// The operator API token file is refused.
     #[error("--api-token-file: {0}")]
     ApiToken(#[from] TokenFileError),
+    /// The proxy's secret file is refused.
+    #[error("--proxy-auth-file: {0}")]
+    ProxyAuth(#[from] ProxySecretError),
+    /// `--worker-deny-list` with neither mutual TLS nor a proxy: nothing would read it.
+    #[error(
+        "--worker-deny-list needs mutual TLS (--worker-tls-cert, --worker-tls-key, \
+         --worker-client-ca) or --proxy-auth-file"
+    )]
+    DenyListWithoutIdentity,
     /// The release store's directory cannot be made.
     #[error("--releases-dir {dir}: {source}", dir = dir.display())]
     Releases {
@@ -599,6 +621,20 @@ impl Args {
     pub fn listeners(&self) -> Result<Listeners, ConfigError> {
         self.segment_upload_fits_write_bound()?;
         let reload = Duration::from_secs(self.tls_reload_interval_secs);
+        let deny_list = self
+            .worker_deny_list
+            .as_deref()
+            .map(DenyList::open)
+            .transpose()?;
+        let proxy = self
+            .proxy_auth_file
+            .as_deref()
+            .map(ProxySecret::from_file)
+            .transpose()?
+            .map(|secret| Behind {
+                secret: Arc::new(secret),
+                deny_list: deny_list.clone(),
+            });
         let worker_tls = match (
             &self.worker_tls_cert,
             &self.worker_tls_key,
@@ -614,14 +650,13 @@ impl Args {
                     },
                     reload,
                 )?,
-                deny_list: self
-                    .worker_deny_list
-                    .as_deref()
-                    .map(DenyList::open)
-                    .transpose()?,
+                deny_list: deny_list.clone(),
             }),
             _ => None,
         };
+        if deny_list.is_some() && worker_tls.is_none() && proxy.is_none() {
+            return Err(ConfigError::DenyListWithoutIdentity);
+        }
         let reapi_tls = match (&self.reapi_tls_cert, &self.reapi_tls_key) {
             (Some(cert), Some(key)) => Some(TlsSource::files(
                 "reapi",
@@ -639,6 +674,7 @@ impl Args {
             reapi_tls,
             worker: self.worker_listen,
             worker_tls,
+            proxy,
             heartbeat_interval: Duration::from_millis(self.heartbeat_interval_ms),
             hello_wait: Duration::from_secs(10),
             tick: Duration::from_secs(1),

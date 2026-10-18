@@ -1173,6 +1173,7 @@ mod wiring {
             "--worker-deny-list=/c/deny",
             "--api-listen=127.0.0.1:8990",
             "--api-token-file=/c/token",
+            "--proxy-auth-file=/c/proxy-secret",
             "--storage-client-cert=/c/fe.pem",
             "--storage-client-key=/c/fe.key",
             "--storage-ca=/c/ca.pem",
@@ -1189,6 +1190,7 @@ mod wiring {
             [
                 "--reapi-tls-key",
                 "--api-token-file",
+                "--proxy-auth-file",
                 "--worker-tls-key",
                 "--storage-client-key"
             ]

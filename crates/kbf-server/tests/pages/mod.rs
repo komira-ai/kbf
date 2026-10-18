@@ -67,6 +67,7 @@ impl Server {
             worker: loopback(),
             reapi_tls: None,
             worker_tls: None,
+            proxy: None,
             heartbeat_interval: Duration::from_millis(200),
             hello_wait: Duration::from_secs(5),
             tick: Duration::from_millis(50),

@@ -70,6 +70,7 @@ const GROUPS: &[(&str, &[&str])] = &[
         "tls",
         &[
             "api-token-file",
+            "proxy-auth-file",
             "reapi-auth-policy",
             "reapi-tls-cert",
             "reapi-tls-key",

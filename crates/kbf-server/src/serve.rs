@@ -40,6 +40,7 @@ use crate::identity::{DenyList, Peers};
 use crate::listen::Binder;
 use crate::members::{Members, MembershipError};
 use crate::members_rpc::MembershipService;
+use crate::proxy_auth::{ProxyAuthLayer, ProxySecret, gate_requests};
 use crate::state_store::StateStore;
 use crate::streams::{StreamLimits, flow_windows};
 use crate::token::ApiToken;
@@ -65,6 +66,9 @@ pub struct Listeners {
     /// Mutual TLS for the worker listener; `None` serves it in plain text, where no
     /// node is bound to a certificate and every blob call is refused.
     pub worker_tls: Option<WorkerTls>,
+    /// A TLS-terminating proxy in front of every listener (`--proxy-auth-file`,
+    /// [`crate::proxy_auth`]); `None`: the server is reached directly.
+    pub proxy: Option<Behind>,
     /// The heartbeat interval `Welcome` names.
     pub heartbeat_interval: Duration,
     /// How long a new worker stream may take to send its `Hello`.
@@ -143,6 +147,18 @@ pub struct WorkerTls {
     /// re-read from their files as they change.
     pub server: TlsSource,
     /// The certificates and nodes refused, read again at every check.
+    pub deny_list: Option<DenyList>,
+}
+
+/// A server that sits behind a TLS-terminating proxy ([`crate::proxy_auth`]). It takes calls
+/// from loopback only, and believes the identity the proxy forwards under `secret`.
+#[derive(Clone, Debug)]
+pub struct Behind {
+    /// The per-boot secret the proxy presents.
+    pub secret: Arc<ProxySecret>,
+    /// The worker listener's deny list, applied to the nodes the proxy names when the
+    /// listener has no TLS of its own to carry one ([`WorkerTls::deny_list`]); that has
+    /// no certificate to compare, so only a `node` entry can name a caller.
     pub deny_list: Option<DenyList>,
 }
 
@@ -246,7 +262,10 @@ pub(crate) fn serve_api(
     listener: Option<tokio::net::TcpListener>,
     routes: axum::Router,
     stop: impl Future<Output = ()> + Send + 'static,
+    proxy: Option<Arc<ProxySecret>>,
 ) -> impl Future<Output = std::io::Result<()>> {
+    // Every route, the fallback too, sees only a call that passed the proxy check.
+    let routes = routes.layer(axum::middleware::from_fn_with_state(proxy, gate_requests));
     match listener {
         Some(listener) => Either::Left(
             axum::serve(
@@ -284,28 +303,48 @@ pub(crate) fn bind_api(
     bound.map_err(|source| ServeError::Bind { addr, source })
 }
 
-/// The worker listener's server: every call goes through the per-method role table
-/// ([`crate::worker_roles`]) before it is routed.
-pub(crate) type WorkerListener = Server<Stack<WorkerRolesLayer, Identity>>;
+/// The worker listener's server: every call goes through the proxy check
+/// ([`crate::proxy_auth`]), then the per-method role table ([`crate::worker_roles`]), before
+/// it is routed. (`Server::layer` makes the first layer added the outermost.)
+pub(crate) type WorkerListener = Server<Stack<WorkerRolesLayer, Stack<ProxyAuthLayer, Identity>>>;
 
 /// The worker listener's role table, its TLS source, and the way its peers are told
 /// apart. Every worker listener is made here, so none serves a call the table does not
 /// list. Not generic, so both arms are one set of lines whatever the cache types (a
 /// per-instantiation copy that misses one arm would count as missed lines).
+///
+/// Behind a proxy without TLS of its own the listener is still `Certified`: the identity is
+/// the proxy's, and the proxy terminates the TLS that carried the certificate.
 pub(crate) fn worker_peers(
     server: Server,
     tls: Option<WorkerTls>,
+    behind: Option<&Behind>,
 ) -> (WorkerListener, Peers, Option<TlsSource>) {
-    match tls {
-        Some(tls) => (
-            server.layer(WorkerRolesLayer::new(Admission::Certified)),
+    let secret = behind.map(|behind| Arc::clone(&behind.secret));
+    let proxy = ProxyAuthLayer::new(secret);
+    match (tls, behind) {
+        (Some(tls), _) => (
+            server
+                .layer(proxy)
+                .layer(WorkerRolesLayer::new(Admission::Certified)),
             Peers::Certified {
                 deny_list: tls.deny_list,
             },
             Some(tls.server),
         ),
-        None => (
-            server.layer(WorkerRolesLayer::new(Admission::Open)),
+        (None, Some(behind)) => (
+            server
+                .layer(proxy)
+                .layer(WorkerRolesLayer::new(Admission::Certified)),
+            Peers::Certified {
+                deny_list: behind.deny_list.clone(),
+            },
+            None,
+        ),
+        (None, None) => (
+            server
+                .layer(proxy)
+                .layer(WorkerRolesLayer::new(Admission::Open)),
             Peers::Unauthenticated,
             None,
         ),
@@ -669,6 +708,7 @@ where
             listeners.streams,
         ),
         listeners.worker_tls,
+        listeners.proxy.as_ref(),
     );
     let tls_sources: Vec<TlsSource> = listeners
         .reapi_tls
@@ -743,10 +783,15 @@ where
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     log_state(durable, term, epoch);
 
+    let proxy_secret = listeners
+        .proxy
+        .as_ref()
+        .map(|behind| Arc::clone(&behind.secret));
     let mut reapi_server = keepalive(
         flow_control(Server::builder(), listeners.stream_limits.reapi),
         listeners.streams,
-    );
+    )
+    .layer(ProxyAuthLayer::new(proxy_secret.clone()));
     let worker_blobs = ByteStreamServer::new(WorkerBlobs::new(
         ByteStreamService::new(Arc::clone(&cache)),
         peers.clone(),
@@ -855,6 +900,7 @@ where
             async {
                 let _ = api_stopped.await;
             },
+            proxy_secret,
         );
         tokio::pin!(api_serve);
         let sweeping = sweeping(members);

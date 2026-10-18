@@ -110,7 +110,7 @@ fn s3(args: &Args) -> bool {
 }
 
 /// The files the frontend half of `kbf-server` reads: the REAPI listener's pair, the auth
-/// policy, the operator API's token, the worker listener's certificate, key, client CA
+/// policy, the operator API's token, the proxy's secret, the worker listener's certificate, key, client CA
 /// and deny list.
 fn server_files(n: &mut Needs, a: &Args) {
     if let Some(cert) = &a.reapi_tls_cert {
@@ -125,6 +125,9 @@ fn server_files(n: &mut Needs, a: &Args) {
     }
     if let Some(token) = &a.api_token_file {
         n.secret("--api-token-file", token);
+    }
+    if let Some(secret) = &a.proxy_auth_file {
+        n.secret("--proxy-auth-file", secret);
     }
     if let Some(cert) = &a.worker_tls_cert {
         let ca = a.worker_client_ca.as_deref();
