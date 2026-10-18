@@ -23,13 +23,16 @@ route stays local, and the last column says why.
 - **policy**: the REAPI authentication policy and `invocations.getAuthorizer`; off (404) without
   them.
 - **none**: health and metrics, which need no credentials.
+- **admin**: the admin port (`--admin-listen`), a separate listener that binds loopback only
+  and carries no credential; the calls move the scheduler's role ([../api.md](../api.md), "The
+  admin calls").
 
 ## 1. Routes, one row each
 
 Every row is one method and one path. A router `.route(` call that serves two methods has a row
 per method; a custom method (`:cordon`) has a row per verb. The sources of the router are
 `crates/kbf-server/src/{api,release/http,storage_health,health,metrics,http_blobs,
-http_invocations,http_history,enroll/api}.rs` and `frontend.rs`, where they are merged.
+http_invocations,http_history,enroll/api,managed/http}.rs` and `frontend.rs`, where they are merged.
 
 ### Cluster
 
@@ -50,6 +53,16 @@ http_invocations,http_history,enroll/api}.rs` and `frontend.rs`, where they are 
 
 There is no rebalance verb: handoff of data between members is not built, and none is invented
 here **[D]**.
+
+### Admin port (a separate loopback listener, `--admin-listen`)
+
+| Verb | Method and route | Status | Gate |
+|---|---|---|---|
+| the role of this process (candidate, active, quiesced, stood-down) | `GET /v1/admin/role` | [F] | admin |
+| stop scheduling, assigning and requeueing | `POST /v1/admin/quiesce` | [F] | admin |
+| undo a quiesce | `POST /v1/admin/resume` | [F] | admin |
+| a candidate takes the generation | `POST /v1/admin/takeover` | [F] | admin |
+| end worker streams after a takeover elsewhere | `POST /v1/admin/stand-down` | [F] | admin |
 
 ### Enrollment
 

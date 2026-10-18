@@ -252,7 +252,7 @@ fn expand_verbs(routes: Vec<Route>, verbs: &[String]) -> Vec<Route> {
 }
 
 /// The exact number of `(method, path)` routes, verbs expanded. A new route moves it.
-const ROUTES: usize = 39;
+const ROUTES: usize = 44;
 
 fn server_routes() -> Vec<Route> {
     let mut files = Vec::new();
