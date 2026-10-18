@@ -34,9 +34,10 @@ use std::io::Write;
 
 use super::LinuxConfig;
 use super::host::{self, HostError, binary, inspect, note, parents, stat, under, unit_is};
-use super::install::{READY, ROOT, UNITS, rootless, systemctl};
 use super::modes::{self, Mode, UnitText};
-use super::render::{SLICE, Templates, render};
+use super::render::{Templates, render};
+use super::shared::SLICE;
+use super::shared::{READY, ROOT, UNITS, rootless, systemctl};
 use crate::unit::UnitFile;
 use kbf_host::exec::{Entry, Exec, Kind};
 use kbf_host::path::HostPath;

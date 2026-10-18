@@ -58,6 +58,7 @@ pub mod modes;
 pub mod render;
 pub mod restart;
 mod runtime;
+pub mod shared;
 pub mod stop;
 pub mod stores;
 pub mod swap;
@@ -69,11 +70,11 @@ mod tests;
 
 use std::path::{Path, PathBuf};
 
-pub use check::{CheckError, Failure, Report};
 pub use config::{LinuxConfig, LinuxError};
 pub use host::HostError;
 pub use modes::Mode;
 pub use render::{Templates, Units};
+pub use shared::{CheckError, Failure, Report};
 
 use crate::template::TemplateError;
 
@@ -141,13 +142,13 @@ pub fn render_mode_unit(
         source,
     })?;
     let name = mode.unit_name();
-    for (file, text) in [(render::SLICE, &slice), (name.as_str(), &unit)] {
+    for (file, text) in [(shared::SLICE, &slice), (name.as_str(), &unit)] {
         let path = out.join(file);
         std::fs::write(&path, text).map_err(|source| Refusal::Write { path, source })?;
     }
     Ok(format!(
         "rendered {} {name} into {} (kbf {mode})",
-        render::SLICE,
+        shared::SLICE,
         out.display()
     ))
 }
@@ -166,7 +167,7 @@ pub fn check_mode_unit<E: kbf_host::exec::Exec>(
 ) -> Result<Report, Refusal> {
     let c = LinuxConfig::load(config)?;
     let unit = read_unit(dir, &mode.unit_name())?;
-    let slice = read_unit(dir, render::SLICE)?;
+    let slice = read_unit(dir, shared::SLICE)?;
     let bin = kbf_bin
         .map(|p| kbf_host::path::HostPath::new(&p.to_string_lossy()))
         .transpose()?;

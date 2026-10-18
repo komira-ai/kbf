@@ -8,8 +8,8 @@ use std::fmt;
 use std::io::{self, Write};
 use std::process::Output;
 
-use crate::linux::check::Failure;
 use crate::linux::config::LinuxError;
+use crate::linux::shared::Failure;
 use crate::template::TemplateError;
 use crate::unit::UnitError;
 use kbf_host::exec::{Entry, Exec, Meta, succeeded};
@@ -18,7 +18,7 @@ use kbf_host::plan::Planner;
 use kbf_host::step::{Cmd, Owner, Perms, Step, UrlError};
 use kbf_host::user::{self, RunUser, UserError};
 
-use super::check::CheckError;
+use super::shared::CheckError;
 
 /// The tools the verbs run, where Debian and Ubuntu put them.
 pub const SYSTEMCTL: &str = "/usr/bin/systemctl";

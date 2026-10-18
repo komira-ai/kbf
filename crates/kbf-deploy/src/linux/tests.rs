@@ -2,9 +2,10 @@
 //! planted defect in a template turns the rule meant for it red, and each bad
 //! setting is refused before anything is rendered.
 
-use super::check::{Report, check_texts};
+use super::check::check_texts;
 use super::config::{LinuxConfig, LinuxError};
 use super::render::{Templates, Units, render};
+use super::shared::Report;
 use super::{Refusal, check_units, render_units};
 
 const EXAMPLE: &str = include_str!("../../templates/linux/config.example");

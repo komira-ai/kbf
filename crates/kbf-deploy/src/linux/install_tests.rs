@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::rc::Rc;
 
 use super::*;
-use crate::linux::host::SWAPON;
+use crate::linux::host::{SWAPON, SYSTEMCTL};
 use kbf_host::step::Step;
 use kbf_host::testkit::{FakeExec, ScratchHost, reply};
 use kbf_host::user::{GETENT, ID};

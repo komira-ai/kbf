@@ -28,51 +28,17 @@
 //!
 //! Each rule reads a key's last assignment in its section, the one systemd uses.
 
-use std::fmt;
 use std::path::Path;
 
 use kbf_types::ImageRef;
 
 use super::config::LinuxConfig;
-use super::render::{DAEMON, DROP_IN, SERVER, SLICE};
+use super::render::{DAEMON, DROP_IN, SERVER};
 use super::runtime;
+use super::shared::SLICE;
+use super::shared::{CheckError, Failure, Report, angle_placeholder};
 use crate::template::leftovers;
-use crate::unit::{UnitError, UnitFile};
-
-/// One broken rule.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Failure {
-    pub rule: &'static str,
-    pub message: String,
-}
-
-impl fmt::Display for Failure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "FAIL {}: {}", self.rule, self.message)
-    }
-}
-
-/// Why the units could not be checked at all.
-#[derive(Debug, thiserror::Error)]
-pub enum CheckError {
-    #[error("cannot read {path}: {source}")]
-    Read {
-        path: String,
-        source: std::io::Error,
-    },
-    #[error("{name}: {source}")]
-    Unit { name: String, source: UnitError },
-}
-
-/// What the check found.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Report {
-    pub failures: Vec<Failure>,
-    /// Lines about a rule not checked, such as `SKIP parse: ...`; not failures.
-    pub notes: Vec<String>,
-    /// The summary line: `UNITS OK: ...` or `UNITS BROKEN: ...`.
-    pub summary: String,
-}
+use crate::unit::UnitFile;
 
 /// One rendered file: its name under the units directory, its text and its directives.
 struct File {
@@ -448,23 +414,6 @@ fn check(c: &LinuxConfig, files: [&File; 4], installable: bool) -> Report {
     }
 }
 
-/// The first `<lower case words>` placeholder in `text`, such as `<kbf uid>`.
-pub(super) fn angle_placeholder(text: &str) -> Option<&str> {
-    let mut rest = text;
-    while let Some(open) = rest.find('<') {
-        let after = &rest[open + 1..];
-        let words = after.split_once('>').map(|(w, _)| w).filter(|w| {
-            w.starts_with(|c: char| c.is_ascii_lowercase())
-                && w.chars().all(|c| c.is_ascii_lowercase() || c == ' ')
-        });
-        if let Some(w) = words {
-            return Some(&rest[open..open + w.len() + 2]);
-        }
-        rest = after;
-    }
-    None
-}
-
 /// A systemd size in MiB: a number with a `K`, `M`, `G` or `T` suffix, or bytes.
 fn mib(value: &str) -> Option<u64> {
     let (n, mul, div) = match value.as_bytes().last()? {
@@ -483,18 +432,6 @@ fn mib(value: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Catches a `<...>` placeholder missed when another `<` comes first (an XML-ish
-    /// comment, `<B>`, `<x1>`), and a `<` with no `>` read as one.
-    #[test]
-    fn angle_placeholders_are_lower_case_words_in_brackets() {
-        assert_eq!(
-            angle_placeholder("a <B> <x1> < y> <kbf uid> <z>"),
-            Some("<kbf uid>")
-        );
-        assert_eq!(angle_placeholder("a < b"), None);
-        assert_eq!(angle_placeholder("<>"), None);
-    }
 
     /// Catches a size read in the wrong unit (a slice minimum given in bytes or KiB
     /// compared as MiB), and a malformed size read as some number instead of refused.

@@ -94,9 +94,8 @@ use kbf_host::exec::Exec;
 use kbf_host::path::HostPath;
 use kbf_host::step::Cmd;
 
-use super::check::{Failure, Report, angle_placeholder};
 use super::config::{LinuxConfig, LinuxError};
-use super::render::{SLICE, values};
+use super::shared::{Failure, Report, SLICE, angle_placeholder, values};
 use super::{cpuset, credential, handover, restart, runtime, stop, stores, traverse};
 use crate::template::{self, TemplateError, leftovers};
 use crate::unit::{UnitError, UnitFile, comments_in_continuations};

@@ -31,15 +31,14 @@
 //! The binaries, the Raft log, the scratch, the bucket and the swapfile stay.
 
 use std::io::Write;
-use std::time::Duration;
 
 use super::check::check_texts;
 use super::config::LinuxConfig;
 use super::host::{
-    self, CRUN, HostError, NEWGIDMAP, NEWUIDMAP, SS, SYSTEMCTL, binary, inspect, note, parents,
-    stat, tool, under, unit_is,
+    self, HostError, SS, binary, inspect, note, parents, stat, tool, under, unit_is,
 };
-use super::render::{DAEMON, DROP_IN, SERVER, SLICE, Templates, render};
+use super::render::{DAEMON, DROP_IN, SERVER, Templates, render};
+use super::shared::{READY, ROOT, SLICE, UNITS, rootless, systemctl, text_of};
 use crate::unit::UnitFile;
 use kbf_host::exec::{Entry, Exec, Kind};
 use kbf_host::path::HostPath;
@@ -47,20 +46,12 @@ use kbf_host::plan::{Mode, Plan, Planner, RunAs, execute};
 use kbf_host::step::{Cmd, HttpUrl, Owner, Perms};
 use kbf_host::user::RunUser;
 
-pub(super) const UNITS: &str = "/etc/systemd/system";
 const REMOVED: &str = "/var/lib/kbf-linux/removed";
 const CONTROLLERS: &str = "/sys/fs/cgroup/cgroup.controllers";
-const LINGER: &str = "/var/lib/systemd/linger";
 const SERVICES: [&str; 2] = [SERVER, DAEMON];
 const BINARIES: [&str; 2] = ["kbf-server", "kbf-daemon"];
 /// Certificates and the deny list: they must exist.
 const PUBLIC: [&str; 5] = ["ca.pem", "reapi.pem", "worker.pem", "node.pem", "deny-list"];
-/// How long kbf-server has to answer `/readyz` after a start.
-pub const READY: Duration = Duration::from_secs(60);
-/// Who owns each binary, `.previous` copy and unit install-units writes: root, user and
-/// group. The in-place check compares it too, so a right file another user owns (and so
-/// could rewrite what systemd runs as root) is replaced.
-pub(super) const ROOT: Owner = Owner { uid: 0, gid: 0 };
 
 /// What `install-units` was asked for.
 pub struct Install {
@@ -269,54 +260,6 @@ fn preflight<E: Exec>(
     Ok((kbf, server))
 }
 
-/// `kbf` can run rootless containers with `crun`: it has subuid and subgid ranges (which
-/// `newuidmap` and `newgidmap` map), the runtime and those two tools are installed, and
-/// it lingers (the unit's `XDG_RUNTIME_DIR`).
-///
-/// Whether the two tools are setuid or hold file capabilities is the daemon's start-up
-/// check: a capability is not something this kit reads.
-pub(super) fn rootless<E: Exec>(exec: &E, kbf: &RunUser) -> Result<(), HostError> {
-    // A range line is `<user>:<first id>:<count>`, the user named or given by uid
-    // (subuid(5); newuidmap takes either).
-    let uid = kbf.uid.to_string();
-    for file in ["/etc/subuid", "/etc/subgid"] {
-        let file = HostPath::new(file)?;
-        let ranged = text_of(exec, &file)?.is_some_and(|t| {
-            t.lines().any(|l| {
-                l.split_once(':')
-                    .is_some_and(|(who, _)| who == kbf.name || who == uid)
-            })
-        });
-        if !ranged {
-            return Err(HostError::NoSubIds {
-                user: kbf.name.clone(),
-                file,
-            });
-        }
-    }
-    for (path, package) in [(CRUN, "crun"), (NEWUIDMAP, "uidmap"), (NEWGIDMAP, "uidmap")] {
-        let path = HostPath::new(path)?;
-        if stat(exec, &path)?.is_none_or(|m| m.kind == Kind::Dir) {
-            return Err(HostError::NoTool { path, package });
-        }
-    }
-    if stat(exec, &under(&HostPath::new(LINGER)?, &kbf.name)?)?.is_none() {
-        return Err(HostError::NoLinger {
-            user: kbf.name.clone(),
-            uid: kbf.uid,
-        });
-    }
-    Ok(())
-}
-
-/// A file's text, `None` when there is no regular file at `path`.
-fn text_of<E: Exec>(exec: &E, path: &HostPath) -> Result<Option<String>, HostError> {
-    Ok(match inspect(exec, path)? {
-        Some(Entry::File { bytes, .. }) => Some(String::from_utf8_lossy(&bytes).into_owned()),
-        _ => None,
-    })
-}
-
 /// The binary at `bin` is an executable whose `--help` lists every `--flag` its unit's
 /// `ExecStart=` passes; its bytes.
 fn supports<E: Exec>(exec: &E, bin: &HostPath, unit: &str) -> Result<Vec<u8>, HostError> {
@@ -422,11 +365,6 @@ pub fn run_uninstall<E: Exec>(
 ) -> Result<(), HostError> {
     let p = plan_uninstall(&*exec, c, stamp, &mut *out)?;
     Ok(execute(&p, RunAs::Root, mode, exec, &mut out)?)
-}
-
-pub(super) fn systemctl(args: &[&str]) -> Cmd {
-    args.iter()
-        .fold(Cmd::new(tool(SYSTEMCTL)), |cmd, arg| cmd.arg(*arg))
 }
 
 #[cfg(test)]
