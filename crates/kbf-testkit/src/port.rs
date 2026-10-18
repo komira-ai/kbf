@@ -198,6 +198,17 @@ mod tests {
         TcpStream::connect(addr).expect("accepted");
     }
 
+    /// Catches a `Default` that does not hold a port (the same as `new`): the default
+    /// value owns a port nobody else can bind and that refuses connections.
+    #[test]
+    fn the_default_value_holds_a_port() {
+        let held = Reserved::default();
+        assert_ne!(held.port(), 0);
+        assert!(TcpListener::bind(held.addr()).is_err(), "a thief took it");
+        let err = TcpStream::connect(held.addr()).expect_err("refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused, "{err}");
+    }
+
     /// Catches `dead_addr` handing out a number it did not keep: it stays taken after
     /// the call returns, and two calls differ.
     #[test]
