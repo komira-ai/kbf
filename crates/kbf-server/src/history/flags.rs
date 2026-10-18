@@ -11,7 +11,7 @@ use crate::config::{ConfigError, s3_store};
 use crate::stores::{FILE_PREFIX_ROOT, StoreUri};
 
 /// Display order of the history flags: after every other flag of the server and of the
-/// daemon that shares its help (`kbf-all-in-one`), before `--help` (999).
+/// daemon that shares its help (`kbf all-in-one`), before `--help` (999).
 const AFTER_ALL: usize = 900;
 
 // The flags that turn build history on. With neither, nothing is recorded and the server
@@ -19,7 +19,7 @@ const AFTER_ALL: usize = 900;
 // on a flattened struct for the program's description.
 //
 // `--history-objects` needs a state store, which `HistoryFlags::open` checks when the
-// server starts rather than clap when it parses: `kbf-all-in-one` always has one, though
+// server starts rather than clap when it parses: `kbf all-in-one` always has one, though
 // its command line may not name it.
 #[derive(Clone, Debug, Default, clap::Args)]
 pub struct HistoryFlags {

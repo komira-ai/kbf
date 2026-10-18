@@ -267,6 +267,20 @@ the disk index, never the reverse. The desired release, the slot, the per-host p
 
 ### 6.4 Sessions
 
+**As built.** The frontend looks at the desired row and the release store once a farm tick and
+keeps one offer per complete platform; each session sends its node's platform offer after
+`Welcome` and whenever that offer changes (the same offer is never sent twice on a session).
+A look that fails keeps the table. The node's platform is read from its first `Hello`.
+The rollout controller (`kbf-server/src/update`) runs on the frontend with a state store, once a
+farm tick, and starts no host unless `update/policy.auto_nodes` is true (hosts already in a step
+are always moved). Its orders go out as `UpdateOrder` on the host's stream with the `Welcome`
+epoch (an order of another epoch is refused before it is sent); a confirmation carries an id
+of its own, drawn from the order counter, because a node drops a repeated id. Its facts come
+from the farm and each node's `UpdateStatus` of its current stream. **Not yet:** hosts with a
+storage half are never started (the planned-down mark and the member join are U3, #914, in
+`feature/arch-v2`), and no operator action starts a run with `auto_nodes` off.
+`GET /v1/nodes` lists `update` per node and `GET /v1/update/hosts` its detail (`docs/api.md`).
+
 After `Welcome`, and to every connected node at every change of the desired release or of a platform's
 completeness, the frontend sends an `UpdateOffer` for that node's platform. `UpdateStatus` is kept as the newest per
 node and ignored from a replaced stream, exactly as `NodeStatus` is.
