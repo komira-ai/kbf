@@ -163,6 +163,8 @@ type Ymd = (i32, u8, u8);
 
 struct Leaf {
     role: Option<&'static str>,
+    /// Further roles, so the certificate names more than one.
+    more_roles: Vec<&'static str>,
     ekus: Vec<Eku>,
     dns: Vec<&'static str>,
     /// (year, month, day) of not-before and not-after.
@@ -174,6 +176,7 @@ impl Leaf {
     fn daemon() -> Self {
         Self {
             role: Some("daemon"),
+            more_roles: vec![],
             ekus: vec![Eku::ClientAuth],
             dns: vec!["node-1"],
             validity: None,
@@ -186,7 +189,7 @@ impl Leaf {
             self.dns.iter().map(|d| (*d).to_owned()).collect::<Vec<_>>(),
         )
         .expect("params");
-        if let Some(role) = self.role {
+        for role in self.role.iter().chain(&self.more_roles) {
             params.subject_alt_names.push(SanType::URI(
                 format!("urn:kbf:role:{role}").try_into().expect("IA5"),
             ));
@@ -448,6 +451,21 @@ fn a_daemon_certificate_that_also_serves_is_refused_for_its_key_usage() {
 }
 
 #[test]
+fn a_certificate_with_an_unnamed_key_usage_is_refused_showing_its_oid() {
+    let mut leaf = Leaf::daemon();
+    leaf.ekus = vec![
+        Eku::ClientAuth,
+        Eku::Other(vec![1, 3, 6, 1, 4, 1, 99999, 1]),
+    ];
+    let (needs, host) = with_cert(&leaf);
+    only(
+        &check(&needs, &host),
+        Class::Refused,
+        &["clientAuth,1.3.6.1.4.1.99999.1", "not clientAuth"],
+    );
+}
+
+#[test]
 fn a_certificate_without_key_usage_is_refused() {
     let mut leaf = Leaf::daemon();
     leaf.ekus = vec![];
@@ -464,6 +482,7 @@ fn a_storage_certificate_must_carry_both_server_and_client_auth() {
     let ca = ca();
     let mut leaf = Leaf {
         role: Some("storage"),
+        more_roles: vec![],
         ekus: vec![Eku::ServerAuth, Eku::ClientAuth],
         dns: vec!["store.farm.example"],
         validity: None,
@@ -620,6 +639,75 @@ fn a_certificate_without_a_ca_to_chain_to_is_checked_for_role_and_key_usage_only
         &check(&needs, &host),
         Class::Refused,
         &["urn:kbf:role:storage"],
+    );
+}
+
+#[test]
+fn a_certificate_block_that_is_not_a_certificate_is_refused_once() {
+    let (needs, host) = healthy();
+    let bogus = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+    let host = host.file(CERT, 0o644, bogus.as_bytes());
+    only(
+        &check(&needs, &host),
+        Class::Refused,
+        &["--cert", "does not parse as a certificate"],
+    );
+}
+
+#[test]
+fn a_certificate_naming_two_roles_is_refused() {
+    let mut leaf = Leaf::daemon();
+    leaf.more_roles = vec!["storage"];
+    let (needs, host) = with_cert(&leaf);
+    only(
+        &check(&needs, &host),
+        Class::Refused,
+        &["--cert", CERT, "role"],
+    );
+}
+
+#[test]
+fn a_daemon_certificate_with_no_name_is_refused_for_the_node_id() {
+    let mut leaf = Leaf::daemon();
+    leaf.dns = vec![];
+    let (needs, host) = with_cert(&leaf);
+    only(
+        &check(&needs, &host),
+        Class::Refused,
+        &["no DNS name or address", "node-1"],
+    );
+}
+
+#[test]
+fn a_serving_certificate_with_no_name_is_refused_as_a_server_certificate() {
+    let ca = ca();
+    let leaf = Leaf {
+        role: Some("storage"),
+        more_roles: vec![],
+        ekus: vec![Eku::ServerAuth, Eku::ClientAuth],
+        dns: vec![],
+        validity: None,
+    };
+    let mut needs = daemon_needs();
+    needs.certs[0].row = Row::Storage;
+    needs.certs[0].node_id = None;
+    let (cert, key) = leaf.issue(&ca);
+    let host = Fake::healthy(&cert, &key, &ca.pem());
+    only(
+        &check(&needs, &host),
+        Class::Refused,
+        &["--cert", "names no DNS name or address", "no TLS client"],
+    );
+}
+
+#[test]
+fn a_ca_file_with_no_certificate_in_it_is_refused() {
+    let (needs, host) = healthy();
+    let host = host.file(CA, 0o644, b"not a CA");
+    only(
+        &check(&needs, &host),
+        Class::Refused,
+        &["--ca-cert", CA, "no usable CA certificate"],
     );
 }
 
@@ -869,6 +957,98 @@ fn podman_as_the_runtime_asks_nothing_of_crun() {
 }
 
 #[test]
+fn an_unset_path_is_said_so_when_podman_is_looked_for() {
+    let mut host = container_host();
+    host.vars.remove("PATH");
+    only(
+        &check(&container_needs(None), &host),
+        Class::Refused,
+        &["podman", "PATH is not set"],
+    );
+}
+
+#[test]
+fn an_empty_path_entry_is_the_current_directory() {
+    let host = container_host()
+        .without("/usr/bin/podman")
+        .file("./podman", 0o755, b"")
+        .var("PATH", "/nowhere:");
+    assert_eq!(check(&container_needs(None), &host), Report::default());
+}
+
+#[test]
+fn a_directory_called_podman_on_the_path_is_not_podman() {
+    let host = container_host().without("/usr/bin/podman").put(
+        "/usr/bin/podman",
+        Kind::Dir,
+        ME,
+        0o755,
+        b"",
+    );
+    only(
+        &check(&container_needs(None), &host),
+        Class::Refused,
+        &["podman", "PATH"],
+    );
+}
+
+#[test]
+fn a_runtime_directory_that_cannot_be_statted_is_classed_by_the_error() {
+    for (kind, class) in [
+        (io::ErrorKind::PermissionDenied, Class::Refused),
+        (io::ErrorKind::TimedOut, Class::NotReady),
+    ] {
+        let mut host = container_host();
+        host.stat_errors
+            .insert(PathBuf::from("/run/user/1000"), kind);
+        only(
+            &check(&container_needs(None), &host),
+            class,
+            &[
+                "XDG_RUNTIME_DIR /run/user/1000 cannot be read",
+                "enable-linger",
+            ],
+        );
+    }
+}
+
+#[test]
+fn a_runtime_directory_that_is_a_file_is_refused() {
+    let host = container_host().file("/run/user/1000", 0o700, b"");
+    only(
+        &check(&container_needs(None), &host),
+        Class::Refused,
+        &["/run/user/1000", "not a directory"],
+    );
+}
+
+#[test]
+fn a_crun_that_cannot_be_statted_is_classed_by_the_error() {
+    for (kind, class) in [
+        (io::ErrorKind::PermissionDenied, Class::Refused),
+        (io::ErrorKind::TimedOut, Class::NotReady),
+    ] {
+        let mut host = container_host();
+        host.stat_errors.insert(PathBuf::from(CRUN), kind);
+        only(
+            &check(&container_needs(Some(CRUN)), &host),
+            class,
+            &[CRUN, "(--oci-runtime) cannot be read"],
+        );
+    }
+}
+
+#[test]
+fn a_crun_that_is_a_directory_is_refused() {
+    let host = container_host().put(CRUN, Kind::Dir, ME, 0o755, b"");
+    only(
+        &check(&container_needs(Some(CRUN)), &host),
+        Class::Refused,
+        &[CRUN, "not a regular file"],
+    );
+}
+
+#[test]
 fn a_low_open_file_limit_warns_with_the_number_and_does_not_stop_the_start() {
     let mut host = Fake::empty();
     host.nofile = 1024;
@@ -952,6 +1132,50 @@ fn the_exit_statuses_are_the_ones_the_units_and_the_storage_classifier_use() {
 }
 
 // ---- the flags of each mode reach the checks ----------------------------------------------
+
+mod system {
+    use std::path::Path;
+
+    use super::super::Host as _;
+    use super::super::host::{Kind, System};
+
+    #[test]
+    fn stat_tells_a_file_a_directory_and_a_device_apart() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let d = System.stat(dir).expect("dir");
+        assert_eq!(d.kind, Kind::Dir);
+        let f = System.stat(&dir.join("Cargo.toml")).expect("file");
+        assert_eq!(f.kind, Kind::File);
+        assert_eq!(f.mode & !0o7777, 0, "no file-type bits");
+        assert_eq!(
+            System.stat(Path::new("/dev/null")).expect("dev").kind,
+            Kind::Other
+        );
+        assert_eq!(
+            System
+                .stat(&dir.join("no-such-file"))
+                .expect_err("absent")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn run_collects_stdout_and_the_exit_status() {
+        let sh = Path::new("/bin/sh");
+        let ok = System.run(sh, &["-c", "echo hi"]).expect("runs");
+        assert!(ok.success);
+        assert_eq!(ok.stdout, "hi\n");
+        let bad = System.run(sh, &["-c", "echo no; exit 3"]).expect("runs");
+        assert!(!bad.success);
+        assert_eq!(bad.stdout, "no\n");
+        let gone = System.run(Path::new("/no/such/program"), &[]);
+        assert_eq!(
+            gone.expect_err("absent").kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+}
 
 mod wiring {
     use std::path::PathBuf;
@@ -1158,6 +1382,31 @@ mod wiring {
         assert!(n.certs.iter().all(|c| c.flag != "--reapi-tls-cert"));
         assert!(n.files.iter().any(|f| f.flag == "--reapi-tls-cert"));
         assert!(!n.s3 && n.container.is_none());
+    }
+
+    #[test]
+    fn all_in_one_compares_its_meta_dir_with_the_data_dir_and_needs_the_auth_policy() {
+        let n = with(
+            "all-in-one",
+            &DAEMON,
+            &[
+                "--meta-dir=/var/lib/kbf/meta",
+                "--reapi-auth-policy=/c/policy",
+            ],
+        );
+        assert_eq!(n.mode, "all-in-one");
+        assert_eq!(
+            n.meta_and_data,
+            Some((
+                PathBuf::from("/var/lib/kbf/meta"),
+                PathBuf::from("/var/lib/kbf")
+            ))
+        );
+        assert!(
+            n.files
+                .iter()
+                .any(|f| f.flag == "--reapi-auth-policy" && !f.secret)
+        );
     }
 
     #[test]
