@@ -27,8 +27,8 @@ fn layout(root: &Path) -> Layout {
     )
 }
 
-/// A file in the state directory of this platform (`var/lib/kbf-deploy` on Linux,
-/// `var/db/kbf-deploy` on macOS), under `root`.
+/// A file in the state directory of this platform (`var/lib/kbf-installer` on Linux,
+/// `var/db/kbf-installer` on macOS), under `root`.
 fn in_state_dir(root: &Path, name: &str) -> PathBuf {
     let layout = layout(root);
     layout.join(&layout.state_dir()).join(name)
@@ -63,9 +63,11 @@ fn one_pass_reports_the_host_and_a_refused_entry() {
             ..State::default()
         })
         .expect("state");
-    fs::create_dir_all(root.join("usr/local/kbf/releases").join(A)).expect("release");
+    fs::create_dir_all(root.join("var/lib/kbf-installer/releases").join(A)).expect("release");
     fs::write(
-        root.join("usr/local/kbf/releases").join(A).join("kbf"),
+        root.join("var/lib/kbf-installer/releases")
+            .join(A)
+            .join("kbf"),
         b"x",
     )
     .expect("binary");
@@ -129,7 +131,7 @@ fn the_boot_check_counts_the_starts_and_reverts_the_last() {
     let root = root("boot");
     let host = layout(&root);
     for commit in [A, B] {
-        let dir = root.join("usr/local/kbf/releases").join(commit);
+        let dir = root.join("var/lib/kbf-installer/releases").join(commit);
         fs::create_dir_all(&dir).expect("release");
         fs::write(dir.join("kbf"), b"x").expect("binary");
     }
@@ -140,8 +142,9 @@ fn the_boot_check_counts_the_starts_and_reverts_the_last() {
         pending_confirm: Some(PendingConfirm {
             commit: c(B),
             previous: Some(c(A)),
-            deadline: None,
-            order_id: Some("5".to_owned()),
+            activation: "5".to_owned(),
+            deadline_wall: None,
+            deadline_mono_s: None,
             starts_left: Some(1),
         }),
         ..State::default()
@@ -172,10 +175,34 @@ fn the_boot_check_counts_the_starts_and_reverts_the_last() {
     // already back on A in the state.
     assert_eq!(left(&root).current, Some(c(A)));
 
+    // A damaged state.json is read from the backup: the pass goes on (it is not exit 5).
     fs::write(in_state_dir(&root, "state.json"), b"not json").expect("ruin");
     let out = helper(&root, &["boot-check"]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("kbf-installer:"));
+    assert_ne!(
+        out.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // With the backup damaged too, nobody can say what the host runs: exit 5, needs an
+    // operator, and nothing is written.
+    fs::write(root.join("var/lib/kbf-installer/state.json"), b"not json").expect("ruin");
+    fs::write(
+        root.join("var/lib/kbf-installer/state.json.bak"),
+        b"not json",
+    )
+    .expect("ruin");
+    let out = helper(&root, &["boot-check"]);
+    assert_eq!(out.status.code(), Some(5));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("kbf-installer:") && err.contains("unusable"),
+        "{err}"
+    );
+    assert_eq!(
+        fs::read(root.join("var/lib/kbf-installer/state.json")).expect("kept"),
+        b"not json"
+    );
 }
 
 /// Catches a helper that starts without being told what to restart: neither flag is a
@@ -260,9 +287,9 @@ fn passes_end_the_run_and_an_unreadable_memory_stops_it() {
 #[test]
 fn settings_that_are_not_roots_refuse_the_stage() {
     let root = root("settings");
-    fs::create_dir_all(root.join("usr/local/libexec/kbf-deploy")).expect("dir");
+    fs::create_dir_all(root.join("usr/share/kbf-installer/trust")).expect("dir");
     fs::write(
-        root.join("usr/local/libexec/kbf-deploy/installer.conf"),
+        root.join("usr/share/kbf-installer/trust/installer.conf"),
         "SOURCE_REFS=refs/heads/main\n",
     )
     .expect("settings");

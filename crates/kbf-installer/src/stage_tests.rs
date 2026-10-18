@@ -59,7 +59,7 @@ impl Rig {
             exec,
             host,
             settings,
-            trust: trusted_host(),
+            trust: trusted_host_on(platform),
             entry,
             outside,
         }
@@ -108,7 +108,7 @@ impl Rig {
     }
 
     fn releases(&self) -> Vec<String> {
-        fs::read_dir(self.at("/usr/local/kbf/releases"))
+        fs::read_dir(self.at("/var/lib/kbf-installer/releases"))
             .map(|d| {
                 d.map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
                     .collect()
@@ -162,7 +162,7 @@ fn a_verified_release_is_staged_and_nothing_is_activated() {
     );
     assert!(staged.log.contains(&format!("state: {COMMIT} staged")));
 
-    let binary = rig.at(&format!("/usr/local/kbf/releases/{COMMIT}/kbf"));
+    let binary = rig.at(&format!("/var/lib/kbf-installer/releases/{COMMIT}/kbf"));
     assert_eq!(
         fs::read(&binary).expect("installed"),
         elf(ELF_X86, "kbf build")
@@ -177,8 +177,8 @@ fn a_verified_release_is_staged_and_nothing_is_activated() {
         (state.current, state.previous, state.pending_confirm),
         (None, None, None)
     );
-    assert!(fs::symlink_metadata(rig.at("/usr/local/kbf/current")).is_err());
-    assert!(fs::symlink_metadata(rig.at("/usr/local/kbf/previous")).is_err());
+    assert!(fs::symlink_metadata(rig.at("/var/lib/kbf-installer/releases/current")).is_err());
+    assert!(fs::symlink_metadata(rig.at("/var/lib/kbf-installer/releases/previous")).is_err());
     assert_eq!(rig.work_leftovers(), Vec::<String>::new());
 
     let calls = runner.calls();
@@ -640,7 +640,7 @@ fn a_commit_staged_again_with_other_bytes_is_refused_never_replaced() {
         err.to_string().contains(&format!("releases/{COMMIT}/kbf")),
         "{err}"
     );
-    let binary = rig.at(&format!("/usr/local/kbf/releases/{COMMIT}/kbf"));
+    let binary = rig.at(&format!("/var/lib/kbf-installer/releases/{COMMIT}/kbf"));
     assert_eq!(fs::read(binary).expect("kept"), elf(ELF_X86, "first build"));
 }
 
@@ -653,7 +653,7 @@ fn an_untrusted_gh_stops_the_stage_before_the_inbox_is_read() {
     let mut rig = Rig::new("stage-untrusted", Platform::Linux);
     rig.kbf(&elf(ELF_X86, "kbf build"));
     rig.trust.entries.insert(
-        HostPath::new("/usr/local/libexec").expect("path"),
+        HostPath::new("/usr/share/kbf-installer").expect("path"),
         kbf_host::exec::Entry::Dir {
             perms: Perms::new(0o775),
             owner: Owner { uid: 0, gid: 0 },
@@ -664,7 +664,7 @@ fn an_untrusted_gh_stops_the_stage_before_the_inbox_is_read() {
     assert_eq!(err.code(), "untrusted-writable");
     assert!(
         err.to_string()
-            .starts_with("/usr/local/libexec is not trusted"),
+            .starts_with("/usr/share/kbf-installer is not trusted"),
         "{err}"
     );
     assert!(runner.calls().is_empty());
@@ -690,7 +690,7 @@ fn a_release_of_two_binaries_is_checked_and_installed_whole() {
     let calls = runner.calls();
     assert_eq!(calls.iter().filter(|c| is_gh(c)).count(), 2);
     assert_eq!(calls.iter().filter(|c| is_staged_binary(c)).count(), 2);
-    let dir = format!("/usr/local/kbf/releases/{COMMIT}");
+    let dir = format!("/var/lib/kbf-installer/releases/{COMMIT}");
     assert_eq!(
         fs::read(rig.at(&format!("{dir}/kbf-daemon"))).expect("daemon"),
         elf(ELF_X86, "daemon build")
@@ -698,8 +698,8 @@ fn a_release_of_two_binaries_is_checked_and_installed_whole() {
     assert!(staged.log.contains("also kbf-daemon ("), "{}", staged.log);
 }
 
-/// Catches the macOS layout: a stage on a Mac uses `/var/db/kbf-deploy` for the state and
-/// scratch directory and `/var/run/kbf-deploy.lock` for the lock, and never `/var/lib` or
+/// Catches the macOS layout: a stage on a Mac uses `/var/db/kbf-installer` for the state and
+/// scratch directory and `/var/run/kbf-installer/lock` for the lock, and never `/var/lib` or
 /// `/run`; the missing parents are made (`/usr/local`, the state directory) 0755 and the
 /// owner the stage was given; the release holds `kbf`.
 ///
@@ -713,21 +713,21 @@ fn a_mac_stage_uses_the_mac_layout_and_makes_its_missing_parents() {
         COMMIT,
         &[part("kbf", &macho(MACHO_ARM, "daemon"))],
     );
-    assert!(!rig.at("/usr/local").exists() && !rig.at("/var/db/kbf-deploy").exists());
+    assert!(!rig.at("/usr/local").exists() && !rig.at("/var/db/kbf-installer").exists());
     let runner = FakeRunner::ok(COMMIT);
     let staged = rig.stage(&runner).expect("staged");
     assert_eq!(staged.components, ["kbf"]);
 
-    assert!(rig.at("/var/db/kbf-deploy/state.json").is_file());
-    assert!(rig.at("/var/run/kbf-deploy.lock").is_file());
+    assert!(rig.at("/var/db/kbf-installer/state.json").is_file());
+    assert!(rig.at("/var/run/kbf-installer/lock").is_file());
     assert!(!rig.at("/var/lib").exists());
     assert!(!rig.at("/run").exists());
     let me = me_owner();
     for dir in [
         "/usr/local",
-        "/var/db/kbf-deploy",
-        "/usr/local/kbf",
-        "/usr/local/kbf/releases",
+        "/var/db/kbf-installer",
+        "/usr/local/kbf-installer",
+        "/usr/local/kbf-installer/releases",
     ] {
         let meta = fs::metadata(rig.at(dir)).expect(dir);
         assert_eq!(meta.permissions().mode() & 0o7777, 0o755, "{dir}");
@@ -737,14 +737,16 @@ fn a_mac_stage_uses_the_mac_layout_and_makes_its_missing_parents() {
             "{dir} is the stage's owner's"
         );
     }
-    let binary = rig.at(&format!("/usr/local/kbf/releases/{COMMIT}/kbf"));
+    let binary = rig.at(&format!("/usr/local/kbf-installer/releases/{COMMIT}/kbf"));
     assert_eq!(
         fs::read(binary).expect("installed"),
         macho(MACHO_ARM, "daemon")
     );
     assert!(
-        !rig.at(&format!("/usr/local/kbf/releases/{COMMIT}/kbf-daemon"))
-            .exists()
+        !rig.at(&format!(
+            "/usr/local/kbf-installer/releases/{COMMIT}/kbf-daemon"
+        ))
+        .exists()
     );
     assert_eq!(
         rig.state()
@@ -912,7 +914,7 @@ fn the_scratch_directory_is_fresh_removed_and_its_failure_a_refusal() {
     // A file where the state directory should be: not even the parent can be made.
     let mut rig = Rig::new("stage-work-file", Platform::Linux);
     rig.kbf(&elf(ELF_X86, "kbf build"));
-    fs::write(rig.at("/var/lib/kbf-deploy"), b"a file").expect("seed");
+    fs::write(rig.at("/var/lib/kbf-installer"), b"a file").expect("seed");
     assert_eq!(code(rig.stage(&FakeRunner::ok(COMMIT))), "work-dir");
 }
 
@@ -923,7 +925,8 @@ fn the_scratch_directory_is_fresh_removed_and_its_failure_a_refusal() {
 fn a_failing_install_is_reported_and_records_nothing() {
     let mut rig = Rig::new("stage-install-fails", Platform::Linux);
     rig.kbf(&elf(ELF_X86, "kbf build"));
-    fs::write(rig.at("/usr/local/kbf"), b"a file").expect("seed");
+    fs::create_dir_all(rig.at("/var/lib/kbf-installer")).expect("seed");
+    fs::write(rig.at("/var/lib/kbf-installer/releases"), b"a file").expect("seed");
     let err = rig
         .stage(&FakeRunner::ok(COMMIT))
         .expect_err("cannot install");

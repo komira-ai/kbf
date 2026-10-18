@@ -67,7 +67,7 @@ kbf-mac-provision revert                                # root: put back the rec
   passed to `kbf --mode=daemon` as a `--label`.
 - `--keys` limits `check` and `apply` to the named items. `--root DIR` runs everything
   under DIR; only the tests use it.
-- The job runs `/usr/local/kbf/current/kbf --mode=daemon --config /usr/local/etc/kbf/kbf.toml`
+- The job runs `/usr/local/kbf-installer/releases/current/kbf --mode=daemon --config /usr/local/etc/kbf/kbf.toml`
   and nothing after `--config`: `kbf.toml` is the one source of the daemon's settings. The
   `launchd_label` item renders it from the profile at that path (root's, mode 644, in a
   root's 755 directory, so the daemon account reads it and cannot replace it), and checks and

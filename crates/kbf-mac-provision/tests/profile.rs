@@ -808,7 +808,7 @@ fn the_job_runs_the_daemon_mode_with_its_config_and_nothing_else() {
     assert_eq!(
         args,
         [
-            "/usr/local/kbf/current/kbf",
+            "/usr/local/kbf-installer/releases/current/kbf",
             "--mode=daemon",
             "--config",
             "/usr/local/etc/kbf/kbf.toml",

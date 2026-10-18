@@ -1,5 +1,5 @@
 //! The LaunchDaemon that runs `kbf --mode=daemon` (docs/design/mac-node-provisioning.md,
-//! section 5.3; docs/design/install-and-enrollment.md, section 4.4): the node's `kbf.toml`
+//! section 5.3): the node's `kbf.toml`
 //! (every setting of the daemon) and its property list (which names that file and nothing
 //! else), both rendered from the profile; the check that the
 //! installed one is that file, root's, with a safe error log and the job loaded; the
@@ -19,7 +19,7 @@ use crate::pool::{self, ROOT_DIR};
 use crate::profile::{DaemonUser, Profile};
 
 const LAUNCHCTL: &str = "/bin/launchctl";
-pub const KBF_BIN: &str = "/usr/local/kbf/current/kbf";
+pub const KBF_BIN: &str = "/usr/local/kbf-installer/releases/current/kbf";
 /// The node's config file, where the macOS package puts it (the default `--config` of
 /// a `kbf` start on macOS). This tool writes it from the profile ([`render_config`]): it
 /// is the one source of the daemon's settings, and the job's arguments name only it.
