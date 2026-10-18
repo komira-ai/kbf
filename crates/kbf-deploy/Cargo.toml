@@ -57,6 +57,8 @@ x509-parser.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
+# Loopback ports nothing can take (kbf_testkit::port).
+kbf-testkit.workspace = true
 kbf-host = { workspace = true, features = ["testkit"] }
 # Security-key signatures made in software, for `mdm erase-request`'s tests.
 kbf-mdm = { workspace = true, features = ["testkit"] }

@@ -18,16 +18,35 @@ use futures::future::BoxFuture;
 use kbf_daemon::config::ConfigError;
 use kbf_daemon::connect::Resolve;
 use kbf_daemon::{Daemon, DaemonConfig, Event, FakeRuntime, NodeReport};
+use kbf_testkit::port::Reserved;
 use support::{PROMPT, Peer, Pki, pki, serve_unavailable, serve_worker};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 
-/// A loopback port that nothing listens on (bound, then released).
+/// A loopback port on which connecting is refused, held for the life of the test
+/// binary so that no other test can take it (see [`kbf_testkit::port`]).
 fn dead_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("addr").port()
+    kbf_testkit::port::dead_addr().port()
+}
+
+/// The held `port`, listening now: the very socket that refused until this call, so no
+/// other listener could have come between.
+fn serve_on(held: Reserved) -> TcpListener {
+    let listener = held.listen();
+    listener.set_nonblocking(true).expect("non-blocking");
+    TcpListener::from_std(listener).expect("listener")
+}
+
+/// Catches `dead_port` and `Reserved` ports being free to take: a thief binding the
+/// number succeeds (the old bind-and-drop helper), and the daemon would dial it.
+#[test]
+fn a_dead_or_held_port_cannot_be_taken_by_another_listener() {
+    let dead = dead_port();
+    assert!(std::net::TcpListener::bind(("127.0.0.1", dead)).is_err());
+    let held = Reserved::new();
+    assert!(std::net::TcpListener::bind(held.addr()).is_err());
 }
 
 async fn listener() -> (TcpListener, SocketAddr) {
@@ -172,8 +191,8 @@ async fn welcomed(sessions: &mut mpsc::UnboundedReceiver<Peer>, within: Duration
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_daemon_keeps_trying_until_a_server_comes_up() {
     let pki = pki("reconnect-forever");
-    let port = dead_port();
-    let url = format!("https://127.0.0.1:{port}");
+    let held = Reserved::new();
+    let url = format!("https://127.0.0.1:{}", held.port());
     let max = Duration::from_millis(40);
     let mut d = Running::start(&pki, &[url], Duration::from_millis(5), max, None, true);
 
@@ -190,10 +209,7 @@ async fn the_daemon_keeps_trying_until_a_server_comes_up() {
     assert!(waits[0] <= Duration::from_millis(5), "{waits:?}");
     assert!(waits[39] >= max / 2, "the wait grew: {waits:?}");
 
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .await
-        .expect("rebind");
-    let (mut sessions, server) = serve_worker(pki.server_tls(), listener);
+    let (mut sessions, server) = serve_worker(pki.server_tls(), serve_on(held));
     welcomed(&mut sessions, PROMPT).await;
     server.abort();
 }
@@ -318,17 +334,14 @@ async fn a_list_of_servers_is_tried_in_turn() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_resets_the_wait() {
     let pki = pki("reconnect-reset");
-    let port = dead_port();
-    let url = format!("https://127.0.0.1:{port}");
+    let held = Reserved::new();
+    let url = format!("https://127.0.0.1:{}", held.port());
     let ms = Duration::from_millis;
     let mut d = Running::start(&pki, &[url], ms(10), ms(3000), None, true);
     let waits = d.retried(9, Duration::from_secs(10)).await;
     assert!(waits[8] >= ms(1280), "{waits:?}");
 
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .await
-        .expect("rebind");
-    let (mut sessions, server) = serve_worker(pki.server_tls(), listener);
+    let (mut sessions, server) = serve_worker(pki.server_tls(), serve_on(held));
     let first = welcomed(&mut sessions, Duration::from_secs(10)).await;
     first.close();
     d.event(PROMPT, |e| {
