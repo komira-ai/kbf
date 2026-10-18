@@ -94,8 +94,35 @@ pub struct UpdateReport {
     pub staged_state_schema: u32,
 }
 
+/// The longest refusal text kept, in bytes. `GET /v1/nodes` is open and a node's text is its own.
+pub const MAX_REFUSAL_BYTES: usize = 512;
+
+/// `text` if it is `len` lowercase hex digits (or `allowed`), else `fallback`.
+fn hex_or(text: String, len: usize, allowed: &str, fallback: &str) -> String {
+    let hex = text.len() == len && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if hex || text == allowed {
+        text
+    } else {
+        fallback.to_owned()
+    }
+}
+
+/// `text` cut to at most `max` bytes at a character boundary.
+fn capped(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
 impl UpdateReport {
-    /// `status` as shown.
+    /// `status` as shown. The commits are shown only if they are what the wire says they are
+    /// (12 lowercase hex digits or `unknown` for the running one, 40 or none for the helper's)
+    /// and the refusal is cut at [`MAX_REFUSAL_BYTES`]: the node chose the bytes.
     #[must_use]
     pub fn new(status: UpdateStatus) -> Self {
         let state = match UpdateState::try_from(status.state) {
@@ -111,12 +138,12 @@ impl UpdateReport {
         };
         Self {
             state,
-            running_commit: status.running_commit,
-            installed_commit: status.installed_commit,
-            staged_commit: status.staged_commit,
+            running_commit: hex_or(status.running_commit, 12, "unknown", "unknown"),
+            installed_commit: hex_or(status.installed_commit, 40, "", ""),
+            staged_commit: hex_or(status.staged_commit, 40, "", ""),
             offered_generation: status.offered_generation,
             acked_order_id: status.acked_order_id,
-            refusal: status.refusal,
+            refusal: capped(status.refusal, MAX_REFUSAL_BYTES),
             helper_present: status.helper_present,
             staged_protocol: status.staged_protocol,
             staged_min_protocol: status.staged_min_protocol,
@@ -663,5 +690,40 @@ mod tests {
             ..UpdateStatus::default()
         };
         assert_eq!(UpdateReport::new(unknown).state, "unknown");
+    }
+
+    /// Catches a commit shown that is not a commit (a node's text on the open listing), and
+    /// a refusal that is not cut: at a character boundary, not inside one.
+    #[test]
+    fn a_status_is_shown_only_in_the_shape_the_wire_gives_it() {
+        let status = UpdateStatus {
+            running_commit: "0123456789ab".to_owned(),
+            installed_commit: "a".repeat(40),
+            staged_commit: String::new(),
+            refusal: "é".repeat(MAX_REFUSAL_BYTES),
+            ..UpdateStatus::default()
+        };
+        let shown = UpdateReport::new(status);
+        assert_eq!(shown.running_commit, "0123456789ab");
+        assert_eq!(shown.installed_commit, "a".repeat(40));
+        assert_eq!(shown.staged_commit, "");
+        assert_eq!(shown.refusal.len(), MAX_REFUSAL_BYTES);
+        let bad = UpdateStatus {
+            running_commit: "<script>".to_owned(),
+            installed_commit: "A".repeat(40),
+            staged_commit: "a".repeat(39),
+            refusal: "x".repeat(MAX_REFUSAL_BYTES + 1),
+            ..UpdateStatus::default()
+        };
+        let shown = UpdateReport::new(bad);
+        assert_eq!(shown.running_commit, "unknown");
+        assert_eq!(
+            (
+                shown.installed_commit.as_str(),
+                shown.staged_commit.as_str()
+            ),
+            ("", "")
+        );
+        assert_eq!(shown.refusal.len(), MAX_REFUSAL_BYTES);
     }
 }

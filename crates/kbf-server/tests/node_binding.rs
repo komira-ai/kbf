@@ -696,3 +696,58 @@ async fn a_revoked_daemon_cannot_report_its_status() {
     assert_eq!(got["nodes"][0]["node_id"], "mac-07", "{got}");
     assert_eq!(got["nodes"][0]["software"]["os_version"], "15.1", "{got}");
 }
+
+fn update_status(state: kbf_proto::update::update_status::State) -> daemon_message::Message {
+    daemon_message::Message::UpdateStatus(kbf_proto::update::UpdateStatus {
+        running_commit: "0123456789ab".to_owned(),
+        state: state as i32,
+        ..kbf_proto::update::UpdateStatus::default()
+    })
+}
+
+/// Catches an `UpdateStatus` not checked against the deny list, so a node revoked while its
+/// stream is open goes on writing the update state the open operator API shows for it. The
+/// control: the same stream's status before the revocation is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_daemon_cannot_report_its_update_status() {
+    use kbf_proto::update::update_status::State;
+    let pki = Pki::new("deny-update-status");
+    let list = pki.write("deny.list", "");
+    let listeners = pki
+        .args(&["--worker-deny-list", &list])
+        .listeners()
+        .expect("listeners");
+    let api = Api {
+        listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        token: None,
+        local_cache: None,
+        releases: None,
+    };
+    let bound = bind_server_with_api(Arc::new(Cache::memory()), listeners, Some(api), pending())
+        .expect("bind");
+    let (worker, api) = (bound.worker, bound.api.expect("an API address"));
+    tokio::spawn(async move { bound.serving.await.expect("serve") });
+    let mut open = Session::open(worker, &pki, pki.client(&["mac-08"], 9), "mac-08")
+        .await
+        .expect("welcomed");
+
+    open.send(update_status(State::Confirmed));
+    let deadline = tokio::time::Instant::now() + PROMPT;
+    while nodes(api).await["nodes"][0]["update"]["state"] != "confirmed" {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the status never arrived"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    pki.write("deny.list", "node mac-08\n");
+    open.send(update_status(State::Refused));
+    let ended = open
+        .next()
+        .await
+        .expect_err("the UpdateStatus ended the stream");
+    assert_eq!(ended.code(), Code::PermissionDenied, "{ended:?}");
+    let got = nodes(api).await;
+    assert_eq!(got["nodes"][0]["update"]["state"], "confirmed", "{got}");
+}

@@ -571,6 +571,9 @@ async fn a_look_that_fails_keeps_the_table() {
     linux(&front, B).await;
     front.state.fail_gets.store(1_000_000, Ordering::SeqCst);
     tokio::time::sleep(QUIET).await;
+    // A node that connects during the outage is sent the table that was kept.
+    let mut during = linux_node(&front, "n2").await;
+    assert_eq!(offer(&mut during).await.generation, 1);
     front.state.fail_gets.store(0, Ordering::SeqCst);
     assert_eq!(front.desire(B).await, 2);
     assert_eq!(offer(&mut node).await.commit, B);
@@ -585,4 +588,41 @@ async fn a_frontend_without_a_release_store_or_a_state_store_offers_nothing() {
         let mut node = linux_node(&front, "n1").await;
         assert!(offer_within(&mut node, QUIET).await.is_none());
     }
+}
+
+/// Catches a status shown after the stream that sent it is gone: a daemon that restarts onto
+/// a build that sends no `UpdateStatus` is `unsupported` again, not listed with the last
+/// state its old build reported.
+#[tokio::test]
+async fn a_new_stream_starts_without_a_status() {
+    let front = start();
+    let old = linux_node(&front, "n1").await;
+    old.send(status("0123456789ab", State::Confirmed, 1));
+    front
+        .update_until("n1", |u| u["state"] == "confirmed")
+        .await;
+    let _new = linux_node(&front, "n1").await;
+    let after = front
+        .update_until("n1", |u| u["availability"] == "unsupported")
+        .await;
+    assert_eq!(after, json!({ "availability": "unsupported" }));
+}
+
+/// Catches text a node chose served as it came on the open listing: a commit that is not hex
+/// is shown as unknown or empty, and a long refusal is cut.
+#[tokio::test]
+async fn what_a_node_says_is_cut_to_its_shape() {
+    let front = start();
+    let node = linux_node(&front, "n1").await;
+    node.send(daemon_message::Message::UpdateStatus(UpdateStatus {
+        running_commit: "<b>".to_owned(),
+        installed_commit: "x".repeat(40),
+        refusal: "r".repeat(100_000),
+        state: State::Refused as i32,
+        ..UpdateStatus::default()
+    }));
+    let shown = front.update_until("n1", |u| u["state"] == "refused").await;
+    assert_eq!(shown["running_commit"], "unknown");
+    assert_eq!(shown["installed_commit"], "");
+    assert_eq!(shown["refusal"].as_str().map(str::len), Some(512));
 }
