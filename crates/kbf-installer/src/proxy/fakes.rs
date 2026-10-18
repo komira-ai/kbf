@@ -96,6 +96,10 @@ pub struct State {
     /// One of the three readiness checks (0 readyz, 1 health, 2 capabilities) stays false.
     pub ready_gap: Option<u8>,
     pub staged: Option<CommitId>,
+    /// The root's `current` (`installed_commit` in `status.json`); a landed confirm sets it.
+    pub installed: Option<CommitId>,
+    /// `status.json` cannot be read for `installed_commit`.
+    pub installed_err: bool,
     /// `status.json` cannot be read.
     pub staged_err: bool,
     /// How long a resumed child takes to report `Active`.
@@ -160,6 +164,8 @@ impl World {
                 holds: 0,
                 ready_gap: None,
                 staged: Some(c(B)),
+                installed: Some(c(A)),
+                installed_err: false,
                 staged_err: false,
                 resume_lag: Duration::ZERO,
                 terminate_err: false,
@@ -769,6 +775,13 @@ impl RootOrders for World {
         }))
     }
 
+    fn installed(&self) -> Result<Option<CommitId>, PortError> {
+        if self.st.borrow().installed_err {
+            return Err(PortError("status.json unreadable".into()));
+        }
+        Ok(self.st.borrow().installed.clone())
+    }
+
     fn confirm(&self, commit: &CommitId) -> Result<(), PortError> {
         self.log_event(format!("order confirm {}", &commit.as_str()[..4]));
         let mut st = self.st.borrow_mut();
@@ -776,6 +789,7 @@ impl RootOrders for World {
             st.confirm_fails = st.confirm_fails.saturating_sub(1);
             return Err(PortError("confirm refused".into()));
         }
+        st.installed = Some(commit.clone());
         Ok(())
     }
 

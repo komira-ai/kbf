@@ -119,12 +119,50 @@ impl<'a> Swap<'a> {
         }
     }
 
-    /// The root's `confirm` landed: `current` names the new release (phase `nodes` or
-    /// later; with `nodes` false the phase moves from `baking` to `draining`, and a failed
-    /// confirm is not a landed one). After it the store's answer is final: a restart
-    /// never rolls back, it starts the recorded-active release again if it died.
+    /// The root's `confirm` landed: its `current` names the new release, as
+    /// [`Swap::read_root`] found at the restart. After it the store's answer is final: a
+    /// restart never rolls back, it starts the recorded-active release again if it died.
     fn confirmed(&self) -> bool {
-        self.intent.phase >= Phase::Nodes && !self.confirm_failed()
+        self.root_confirmed
+    }
+
+    /// Ask the root whether the confirm landed, for an update that stopped at `baking` or
+    /// later (before that no confirm was sent). The store wins over `update.json`, which is
+    /// written after the confirm and so can lag it (a crash between them leaves `baking`
+    /// or `nodes` unrecorded) or, if it disagrees the other way, is simply wrong. The
+    /// disagreement is noted. A `confirm` failure recorded earlier is cleared when the root
+    /// holds the release: a later try landed. If the root cannot be read nothing is guessed:
+    /// the update ends `failed` at `restart` with both children as they are.
+    pub(super) fn read_root(&mut self) -> Result<Flow, Halt> {
+        if self.intent.phase < Phase::Baking || self.intent.rolling_back {
+            return Ok(Flow::Go);
+        }
+        let current = match self.ports.orders.installed() {
+            Ok(c) => c,
+            Err(e) => {
+                return self.fail(
+                    Step::Restart,
+                    format!(
+                        "the proxy restarted and the root half's status could not be read ({e}); \
+                         whether the confirm landed is unknown, so both children were left as they are"
+                    ),
+                );
+            }
+        };
+        self.root_confirmed = current.as_ref() == Some(&self.plan.to);
+        let recorded = self.intent.phase >= Phase::Nodes && !self.confirm_failed();
+        if recorded != self.root_confirmed {
+            self.note(format!(
+                "update.json says the confirm {} but the root's current is {}: the root wins",
+                if recorded { "landed" } else { "did not land" },
+                current.as_ref().map_or("unset", |c| c.as_str()),
+            ));
+        }
+        if self.root_confirmed && self.confirm_failed() {
+            self.intent.failure = None;
+            self.save()?;
+        }
+        Ok(Flow::Go)
     }
 
     /// Tell a live old child to stand down; a refusal changes nothing, the fence holds.

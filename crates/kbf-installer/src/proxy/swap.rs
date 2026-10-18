@@ -51,6 +51,9 @@ pub struct Swap<'a> {
     /// signals only a process it holds this for, so a recycled pid is never touched.
     pub(super) old_alive: bool,
     pub(super) new_alive: bool,
+    /// The root's `current` names the new release (read at a restart; see
+    /// [`Swap::read_root`]). False on a swap that was not adopted after the bake began.
+    pub(super) root_confirmed: bool,
     notes: Vec<String>,
 }
 
@@ -73,6 +76,7 @@ impl<'a> Swap<'a> {
             active,
             old_alive,
             new_alive: false,
+            root_confirmed: false,
             notes: Vec::new(),
         })
     }
@@ -92,6 +96,7 @@ impl<'a> Swap<'a> {
             active,
             old_alive,
             new_alive,
+            root_confirmed: false,
             notes: Vec::new(),
         }
     }
@@ -127,6 +132,7 @@ impl<'a> Swap<'a> {
         } else if phase < Phase::Switched {
             go_end!(self.recover_pre_switch());
         } else {
+            go_end!(self.read_root());
             go_end!(self.recover_post_switch());
         }
         self.settle()
@@ -134,7 +140,8 @@ impl<'a> Swap<'a> {
 
     /// Bake, confirm, nodes, and (on a frontend) drain and retire the old child.
     pub(super) fn settle(&mut self) -> Result<Phase, Halt> {
-        if self.intent.phase <= Phase::Baking {
+        // A confirm the root already holds is not asked for again.
+        if self.intent.phase <= Phase::Baking && !self.root_confirmed {
             go_end!(self.bake());
         }
         // Nodes follow a confirmed release only: with the confirm failed the host still
@@ -547,6 +554,9 @@ impl<'a> Swap<'a> {
         for attempt in 1..=t.confirm_attempts {
             match self.ports.orders.confirm(&self.plan.to) {
                 Ok(()) => {
+                    self.ports
+                        .recorder
+                        .crash_point(super::model::CrashPoint::AfterConfirmLanded)?;
                     if self.confirm_failed() {
                         self.intent.failure = None;
                         self.save()?;

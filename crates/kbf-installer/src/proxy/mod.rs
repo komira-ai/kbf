@@ -65,6 +65,8 @@ mod swap;
 #[cfg(test)]
 mod aio_tests;
 #[cfg(test)]
+mod confirm_boundary_tests;
+#[cfg(test)]
 mod fakes;
 #[cfg(test)]
 mod fault_tests;
