@@ -85,17 +85,18 @@ pub fn router(farm: Arc<Farm>, rows: Option<Rows>, readers: Option<FarmReaders>)
         }))
 }
 
-/// Whether the farm is paused, for a reader that must not call a paused farm running:
-/// `policy.paused` only when the policy object has that key (whatever its value: a key
-/// that is not a boolean is unknown, never "running"), else `desired.paused`; `None`
-/// when neither is there. `policy` is the policy as `GET /v1/update` shows it (`null`
-/// before a policy row exists).
+/// Whether the farm is paused, as a reader that must not call a paused farm running
+/// takes it: `policy.paused` when the policy object has that key as a boolean; `None`
+/// (unknown, never "running") when the object has not, or the key is not a boolean; and
+/// `false` without a policy row, as `GET /v1/update` says (the pause lives in the policy
+/// row alone, and without one the defaults hold). `policy` is the policy as that route
+/// shows it (`null` before a policy row exists).
 #[must_use]
-pub fn effective_paused(desired: &Value, policy: &Value) -> Option<bool> {
-    let paused = |object: &Value| object.get("paused").and_then(Value::as_bool);
-    policy
-        .get("paused")
-        .map_or_else(|| paused(desired), Value::as_bool)
+pub fn effective_paused(policy: &Value) -> Option<bool> {
+    if policy.is_null() {
+        return Some(false);
+    }
+    policy.get("paused").and_then(Value::as_bool)
 }
 
 /// A request's page: how many hosts, and after which node.
@@ -185,7 +186,7 @@ async fn hosts(State(state): State<Arc<Hosts>>, parts: Parts) -> Response {
         StatusCode::OK,
         &json!({
             "desired": desired_json,
-            "paused": effective_paused(&desired_json, &policy_json),
+            "paused": effective_paused(&policy_json),
             "hosts": all,
             "next_page_token": next,
         }),

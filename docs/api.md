@@ -831,11 +831,12 @@ The desired release (`docs/design/pull-updates.md` section 6.3), kept in the `up
 row of the state store. Without `--state-store` every answer is `503` naming it; without
 `--releases-dir`, naming that.
 
-- `GET /v1/update` is open: `{"desired": null | {"generation", "commit", "set_at_ms",
-  "paused"}, "policy": null | {...}, "releases": <the body of GET /v1/releases>}`. `policy`
-  is the `update/policy` row when the operator wrote one (`auto_nodes`, `auto_frontend`,
-  `new_work_only_to_updated`, `accept_failing_builds`, `max_hosts_out`, `min_serving` and the
-  limits in seconds), else `null`.
+- `GET /v1/update` is open: `{"desired": null | {"generation", "commit", "set_at_ms"},
+  "paused": bool, "policy": null | {...}, "releases": <the body of GET /v1/releases>}`. `policy`
+  is the `update/policy` row when the operator wrote one (`paused`, `auto_nodes`,
+  `auto_frontend`, `new_work_only_to_updated`, `accept_failing_builds`, `max_hosts_out`,
+  `min_serving` and the limits in seconds), else `null`; `paused` is its flag (false without
+  a row).
 - `POST /v1/update/desired` with `{"commit": "<40 lowercase hex>"}` and, optionally,
   `"expect_generation": N` (JSON content type, the write gates) offers the commit. With
   `expect_generation` it is a compare-and-set: it writes only if the desired release is at
@@ -844,8 +845,9 @@ row of the state store. Without `--state-store` every answer is `503` naming it;
   The generation moves only when the commit differs from the desired one, so a repeated click is
   not a new run; a rollback is the older commit offered the same way and gets a higher
   generation.
-- `POST /v1/update/pause` and `/resume` (the write gates, no body) answer `{"paused": bool}`,
-  or `409` before anything was offered.
+- `POST /v1/update/pause` and `/resume` (the write gates, no body) set `paused` of the policy
+  row, by compare-and-set of that field alone, and answer `{"paused": bool}`. No run is
+  needed, and an offer leaves the flag as it is: while set, no host is started.
 
 ## `GET /v1/update/hosts`
 
@@ -857,7 +859,7 @@ request is `404` with `"off": "farm"`. It carries what the open `GET /v1/nodes` 
 commits a host runs, staged and installed, and its refusal text.
 
 ```json
-{ "desired": { "generation": 3, "commit": "<40 hex>", "set_at_ms": 1791370000000, "paused": false },
+{ "desired": { "generation": 3, "commit": "<40 hex>", "set_at_ms": 1791370000000 },
   "paused": false,
   "hosts": [
     { "node_id": "linux-1", "connected": true, "availability": "ok", "state": "refused",
@@ -868,9 +870,9 @@ commits a host runs, staged and installed, and its refusal text.
 ```
 
 - `desired` is the row of `GET /v1/update` (`null` before any offer, and without `--state-store`).
-  `paused` is `policy.paused` only when the policy object has that key, else `desired.paused`;
-  `null` when neither is there. It is never `false` merely because a policy row exists without
-  the key.
+  `paused` is the policy row's `paused` (the pause lives there alone), `false` without a policy
+  row (as on `GET /v1/update`), and `null` (unknown, never `false`) if the policy object has no
+  boolean `paused`.
 - Each host has `availability`, `state` and `up_to_date` as on `GET /v1/nodes`. The rest is as
   the host last reported, even if it is no longer `ok` (`null` for a host that never sent an
   `UpdateStatus`): `running_commit` (12 hex digits or `unknown`), `installed_commit` and

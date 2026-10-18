@@ -8,13 +8,15 @@
 //! of section 3.4: a row is frozen across one step). `tests/update_rows.rs` holds the bytes
 //! of one value of each row, and fails if they move.
 //!
-//! The fields are the agreed ones, numbered in the order the design lists them, and a few
-//! beyond them, each said where it is declared: `update/desired.paused` (the pause button
-//! writes it), `update/host.reason` (the reason of a `Held` phase), `update/host.order_epoch`
-//! (the epoch an order id was drawn under) and `update/host.commit` (the release the host's
-//! run drives it to), and the node step's limits in `update/policy`, each optional and absent
-//! when it is the default, so that a writer that knows only the eight agreed fields leaves
-//! them at the default instead of at zero.
+//! The fields are the agreed ones, numbered in the order the design listed them when the rows
+//! were first written, and a few beyond them, each said where it is declared:
+//! `update/host.reason` (the reason of a `Held` phase), `update/host.order_epoch` (the epoch
+//! an order id was drawn under) and `update/host.commit` (the release the host's run drives
+//! it to), and the node step's limits in `update/policy`, each optional and absent when it is
+//! the default, so that a writer that knows only the agreed fields leaves them at the default
+//! instead of at zero. `paused` is an agreed field of `update/policy` (it was once
+//! `update/desired`'s); it took the next free number there, 18, because no field changes its
+//! number.
 //!
 //! The enums are numbered here, not by their Rust order, from 1: a zero (an absent field) is
 //! no phase and no reason, and a row that holds one is [`Corrupt`], never read as the first
@@ -51,9 +53,6 @@ pub struct Desired {
     pub commit: Release,
     /// When the release was set: where the idle wait counts from until a host finishes.
     pub set_at: FarmTime,
-    /// Whether no host may be started (hosts in a step finish). Beyond the agreed fields:
-    /// the pause button writes it.
-    pub paused: bool,
 }
 
 /// `update/host/<id>`: a host's record, and the commit its run drives it to. A host started
@@ -80,6 +79,8 @@ impl HostRow {
     }
 }
 
+/// Tag 4 was `paused` in an earlier draft of this row, which no release wrote (the pause is
+/// `update/policy`'s); the number is not reused.
 #[derive(Clone, PartialEq, prost::Message)]
 struct DesiredMsg {
     #[prost(uint64, tag = "1")]
@@ -88,8 +89,6 @@ struct DesiredMsg {
     commit: String,
     #[prost(uint64, tag = "3")]
     set_at_ms: u64,
-    #[prost(bool, tag = "4")]
-    paused: bool,
 }
 
 /// The agreed fields are `phase`, `order_id`, `generation`, `since` and `boot_before`;
@@ -134,10 +133,11 @@ struct SlotMsg {
     hosts: Vec<HolderMsg>,
 }
 
-/// Fields 1 to 8 are the agreed ones, in the design's order; 9 to 17 are the node step's
-/// limits. `idle_wait`, `max_hosts_out` and every limit are optional: absent is the default
-/// of [`Policy::default`] (so `max_hosts_out` absent is 1, not the invalid 0), and an
-/// explicit zero is a zero.
+/// Fields 1 to 8 are the agreed ones, in the design's order of the time; 9 to 17 are the node
+/// step's limits; 18 is `paused`, an agreed field that came later (absent is not paused).
+/// `idle_wait`, `max_hosts_out` and every limit are optional: absent is the default of
+/// [`Policy::default`] (so `max_hosts_out` absent is 1, not the invalid 0), and an explicit
+/// zero is a zero.
 #[derive(Clone, PartialEq, prost::Message)]
 struct PolicyMsg {
     #[prost(bool, tag = "1")]
@@ -174,6 +174,8 @@ struct PolicyMsg {
     rebuild_limit_ms: Option<u64>,
     #[prost(uint64, optional, tag = "17")]
     repair_wait_ms: Option<u64>,
+    #[prost(bool, tag = "18")]
+    paused: bool,
 }
 
 const fn phase_code(phase: &HostPhase) -> (u32, u32) {
@@ -267,7 +269,11 @@ fn count(n: usize) -> u64 {
 }
 
 fn size(n: u64, field: &str) -> Result<usize, Corrupt> {
-    usize::try_from(n).or_else(|_| corrupt(format!("{field} {n} does not fit")))
+    // Only a 32-bit build fails here (and then the count is refused, not cut down), so no
+    // test reaches the error; it is built with the call and not in a closure that is never run.
+    usize::try_from(n)
+        .ok()
+        .ok_or(Corrupt(format!("{field} {n} does not fit")))
 }
 
 /// The bytes of `update/desired`.
@@ -277,7 +283,6 @@ pub(super) fn encode_desired(desired: &Desired) -> Vec<u8> {
         generation: desired.generation.0,
         commit: desired.commit.as_str().to_owned(),
         set_at_ms: desired.set_at.as_millis(),
-        paused: desired.paused,
     }
     .encode_to_vec()
 }
@@ -298,7 +303,6 @@ pub(super) fn decode_desired(bytes: &[u8]) -> Result<Desired, Corrupt> {
         generation: Generation(msg.generation),
         commit: Release::new(msg.commit),
         set_at: FarmTime::from_millis(msg.set_at_ms),
-        paused: msg.paused,
     })
 }
 
@@ -406,6 +410,7 @@ pub(super) fn encode_policy(policy: &Policy) -> Vec<u8> {
     PolicyMsg {
         auto_nodes: policy.auto_nodes,
         auto_frontend: policy.auto_frontend,
+        paused: policy.paused,
         idle_wait_ms: unless_default(policy.idle_wait, default.idle_wait),
         min_serving: count(policy.min_serving),
         max_hosts_out: (policy.max_hosts_out != default.max_hosts_out)
@@ -434,6 +439,7 @@ pub(super) fn decode_policy(bytes: &[u8]) -> Result<Policy, Corrupt> {
     Ok(Policy {
         auto_nodes: msg.auto_nodes,
         auto_frontend: msg.auto_frontend,
+        paused: msg.paused,
         new_work_only_to_updated: msg.new_work_only_to_updated,
         accept_failing_builds: msg.accept_failing_builds,
         ttl: or_default(msg.ttl_ms, default.ttl),

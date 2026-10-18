@@ -63,7 +63,7 @@ use kbf_types::{FarmTime, WorkerId};
 
 use super::codec::{Desired, HostRow};
 use super::command::{Alert, Command, SlotOp};
-use super::facts::{Facts, OrderId};
+use super::facts::{Facts, HostFacts, OrderId};
 use super::moves::{acts_on_the_farm, decide, next_row, split};
 use super::node_step::{HostPhase, Transition};
 use super::pick::{Pick, pick};
@@ -99,16 +99,17 @@ impl Pass {
         self.facts.host(host).and_then(|h| h.member)
     }
 
-    /// Records a row the controller wrote.
+    /// Records a row the controller wrote: a move from `from` to the row's phase. A row
+    /// written differs from the one read only in its phase (a move sets its other fields
+    /// only on entering a phase: `next_row`), so every row written is a move.
     fn wrote(&mut self, host: &WorkerId, from: HostPhase, row: HostRow) {
-        if from != row.record.phase {
-            self.report.moved.push(Moved {
-                host: host.clone(),
-                from,
-                to: row.record.phase.clone(),
-            });
-        }
-        if let Some(facts) = self.facts.hosts.iter_mut().find(|h| h.id == *host) {
+        self.report.moved.push(Moved {
+            host: host.clone(),
+            from,
+            to: row.record.phase.clone(),
+        });
+        // A host is moved only if the look shows it, so this updates exactly one.
+        for facts in self.facts.hosts.iter_mut().filter(|h| h.id == *host) {
             facts.record = row.record.clone();
         }
         self.rows.insert(
@@ -145,17 +146,25 @@ impl std::fmt::Debug for Controller {
 }
 
 impl Controller {
-    /// A controller over `store`. `epoch` is the store's epoch: **it must be greater than
-    /// every epoch an earlier controller of this store, or of a store this one was restored
-    /// over, drew orders under.** Order ids are `(epoch, number)` and the number comes from a
-    /// counter that a restore sets back, so the epoch is what keeps a restored store from
-    /// issuing an id a host's helper has already seen. The SQLite store moves its epoch past
-    /// both files' on a restore (`kbf_state::sqlite::SqliteStore::epoch`); a store that is
-    /// never restored may keep one epoch, because the counter then goes on where it was.
-    /// Every look checks the rows against it: an order in the slot or in a host's row of a
-    /// later epoch stops the controller. That catches an epoch that is too low for the rows
-    /// as they stand; it cannot know of a restore that dropped the rows which carried the
-    /// higher epoch, so the epoch must come from a store that moves it on a restore.
+    /// A controller over `store`. `epoch` **must be the state store's epoch**: the value a
+    /// worker session's `Welcome` carries, which a restore of the store moves forward along
+    /// with the store's own. It must be greater than every epoch an earlier controller of this
+    /// store, or of a store this one was restored over, drew orders under. Order ids are
+    /// `(epoch, number)` and the number comes from a counter that a restore sets back, so the
+    /// epoch is what keeps a restored store from issuing an id a host's helper has already
+    /// seen. The SQLite store moves its epoch past both files' on a restore
+    /// (`kbf_state::sqlite::SqliteStore::epoch`); a store that is never restored may keep one
+    /// epoch, because the counter then goes on where it was.
+    ///
+    /// Every id the controller draws carries this epoch: the activation orders given to a
+    /// helper (`Transport::activate` and the `Transport::confirm` of the same id) and the
+    /// claims in `update/slot`. An order read back from a row keeps the epoch it was drawn
+    /// under, and is given again with it.
+    ///
+    /// Every look checks the rows against the epoch: an order in the slot or in a host's row
+    /// of a later epoch stops the controller. That catches an epoch that is too low for the
+    /// rows as they stand; it cannot know of a restore that dropped the rows which carried
+    /// the higher epoch, so the epoch must come from a store that moves it on a restore.
     #[must_use]
     pub fn new(
         store: Arc<dyn Store>,
@@ -176,8 +185,8 @@ impl Controller {
 
     /// One look: reads the rows and the farm; gives again the orders of the rows a restart
     /// found (the first tick) and of hosts an order did not reach; frees places nobody holds;
-    /// moves every host in a step; and, unless the run is paused, starts the hosts the
-    /// picker names.
+    /// moves every host in a step; and, unless `update/policy` says paused, starts the hosts
+    /// the picker names.
     ///
     /// Nothing is done without a run (`update/desired`).
     ///
@@ -218,7 +227,7 @@ impl Controller {
                 return Ok(pass.report);
             }
         }
-        if !pass.desired.paused && pass.report.missing.is_empty() {
+        if !pass.policy.paused && pass.report.missing.is_empty() {
             self.start(&mut pass)?;
         }
         Ok(pass.report)
@@ -387,16 +396,11 @@ impl Controller {
         facts.target = stored.value.commit.clone();
         let mut moved = decide(&facts, id, &pass.policy, pass.now)?;
         if moved.order.is_some() {
-            // The step asked for an order id: draw one, and ask again with it.
-            let order = self.rows.mint_order(self.epoch)?;
-            facts.next_order = order;
+            // The step asked for an order id: draw one, and ask again with it. The step is
+            // pure and the id is all that changed, so the second answer is the first with
+            // the id drawn in place of the placeholder (`Facts::next_order`).
+            facts.next_order = self.rows.mint_order(self.epoch)?;
             moved = decide(&facts, id, &pass.policy, pass.now)?;
-            if moved.order != Some(order) {
-                return Err(ControllerError::Invariant(format!(
-                    "{id}: the step named {:?}, not the order drawn for it",
-                    moved.order
-                )));
-            }
         }
         self.apply(pass, id, &stored, &moved)
     }
@@ -453,9 +457,8 @@ impl Controller {
                 }
                 Err(other) => return Err(other.into()),
             }
-            if row.record.phase != stored.value.record.phase {
-                self.told.remove(id);
-            }
+            // A new phase: its alerts have not been sent.
+            self.told.remove(id);
             pass.wrote(id, stored.value.record.phase.clone(), row.clone());
         }
         self.run(pass, id, &after, &row)?;
@@ -489,7 +492,7 @@ impl Controller {
                     None => Err(no_member(id)),
                 },
                 Command::Activate { order } => self.transport.activate(id, *order, &row.commit),
-                Command::Confirm { order } => self.transport.confirm(id, *order),
+                Command::Confirm { order } => self.transport.confirm(id, *order, &row.commit),
                 Command::Alert(alert) => self.tell(id, alert),
             };
             if let Err(error) = given {
@@ -510,15 +513,18 @@ impl Controller {
     /// claim that could succeed: a host waiting for a place does not spend the counter at
     /// every look.
     fn claim(&self, pass: &mut Pass, id: &WorkerId) -> Result<(), ControllerError> {
-        if pass.facts.slot.holds(id) {
-            return Ok(());
-        }
-        let Some(class) = pass.facts.host(id).map(|h| h.slot_class()) else {
+        // The host is in the facts (every caller took it from them), so only the place decides.
+        let room = pass
+            .facts
+            .host(id)
+            .map(HostFacts::slot_class)
+            .filter(|class| {
+                !pass.facts.slot.holds(id)
+                    && pass.facts.slot.has_room(*class, pass.policy.max_hosts_out)
+            });
+        let Some(class) = room else {
             return Ok(());
         };
-        if !pass.facts.slot.has_room(class, pass.policy.max_hosts_out) {
-            return Ok(());
-        }
         let order = self.rows.mint_order(self.epoch)?;
         if let Some(slot) = self
             .rows
