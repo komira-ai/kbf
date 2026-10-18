@@ -17,6 +17,9 @@ pub enum SignerError {
     /// The socket's directory is not a real directory of mode 0700 owned by the account.
     #[error("the socket's directory must be a directory of mode 0700 owned by this account")]
     SocketDir,
+    /// The CA directory is neither empty nor exactly `ca.key` and `ca.pem`.
+    #[error("the CA directory is neither empty nor exactly ca.key and ca.pem")]
+    CaDirState,
     /// Something other than a stale socket is at the socket's path.
     #[error("something other than a socket is at the socket's path")]
     SocketPath,

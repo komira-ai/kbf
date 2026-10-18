@@ -20,8 +20,9 @@
 //! - [`SocketSigner`] is the frontend's side: a [`kbf_ca::Signer`] whose custody is
 //!   [`kbf_ca::Custody::External`], so `Authority::require_external` accepts it.
 //!
-//! Creating the root (and so signing a CA certificate) is not a socket request: `kbf ca
-//! init` does it once, in the account that will own the key.
+//! Creating the root (and so signing a CA certificate) is not a socket request:
+//! [`ensure`] makes the CA directory once at first start, in the account that will own
+//! the key, and loads one the operator placed there.
 //!
 //! # Wire
 //!
@@ -33,6 +34,7 @@
 //! text) or 2 (the signer failed: text). A frame that does not parse closes the
 //! connection without an answer.
 
+mod ca_dir;
 mod cli;
 mod client;
 mod error;
@@ -40,6 +42,7 @@ mod server;
 mod validate;
 mod wire;
 
+pub use ca_dir::{Started, ensure};
 pub use cli::{Flags, main, run};
 pub use client::SocketSigner;
 pub use error::SignerError;

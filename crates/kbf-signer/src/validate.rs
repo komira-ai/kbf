@@ -87,6 +87,9 @@ pub fn check_tbs(
         return Err(Refusal::SignatureAlgorithm);
     }
     PublicKey::from_spki(t.subject_pki.raw).map_err(|_| Refusal::KeyType)?;
+    if !matches!(t.basic_constraints(), Ok(Some(b)) if !b.value.ca) {
+        return Err(Refusal::CaCertificate);
+    }
     if t.issuer.as_raw() != root_subject {
         return Err(Refusal::Issuer);
     }
@@ -94,14 +97,8 @@ pub fn check_tbs(
     if !(1..=policy.lifetime_s() + Policy::BACKDATE_S).contains(&span) {
         return Err(Refusal::Lifetime);
     }
-    if t.extensions()
-        .iter()
-        .any(|e| !ALLOWED.iter().any(|o| *o == e.oid))
-    {
+    if t.extensions().iter().any(|e| !ALLOWED.contains(&e.oid)) {
         return Err(Refusal::Extension);
-    }
-    if !matches!(t.basic_constraints(), Ok(Some(b)) if !b.value.ca) {
-        return Err(Refusal::CaCertificate);
     }
     let usage = t.key_usage().ok().flatten().ok_or(Refusal::KeyUsage)?;
     if usage.value.flags != DIGITAL_SIGNATURE {

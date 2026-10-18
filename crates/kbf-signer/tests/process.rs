@@ -3,7 +3,6 @@
 mod support;
 
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -66,13 +65,14 @@ fn the_binary_serves_and_is_not_dumpable() {
         .expect("signed by the process");
     assert!(!signature.is_empty());
 
+    // The kernel refuses a same-account reader of a process that is not dumpable; as root
+    // the read is allowed anyway, so the check is skipped there (the in-process test of
+    // `harden` covers the flag).
     if euid() != 0 {
-        let owner = std::fs::metadata(format!("/proc/{pid}"))
-            .expect("proc")
-            .uid();
-        assert_eq!(
-            owner, 0,
-            "a dumpable process's /proc entry belongs to its account"
+        let read = std::fs::read(format!("/proc/{pid}/environ"));
+        assert!(
+            read.is_err(),
+            "a not-dumpable process's environ was readable"
         );
     }
 }
