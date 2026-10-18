@@ -38,22 +38,17 @@ const TREE: &str = "/var/lib/kbf-installer/";
 const CURRENT: &str = "/var/lib/kbf-installer/current/";
 /// A frontend instance's slot: the release it runs, until a confirm flips `current`.
 const SLOT: &str = "/var/lib/kbf-installer/slots/%i/";
-/// The pinned Envoy of instance `%i`.
-const ENVOY_BIN: &str = "/usr/bin/envoy";
 /// The installer binary the units call.
 const INSTALLER: &str = "/usr/bin/kbf-installer";
 /// The configuration every runtime unit is gated on and every mode reads.
 const CONFIG: &str = "/etc/kbf/kbf.toml";
 /// The installer's own configuration, which `setup` writes.
 const INSTALLER_CONFIG: &str = "/etc/kbf/installer.toml";
-/// Envoy's rendered bootstrap.
-const ENVOY_CONFIG: &str = "/etc/kbf/envoy/envoy.json";
 
 /// The files of the package, and nothing else.
-const FILES: [&str; 8] = [
+const FILES: [&str; 7] = [
     "kbf-all-in-one.service",
     "kbf-daemon.service",
-    "kbf-envoy.service",
     "kbf-frontend@.service",
     "kbf-installer.service",
     "kbf-storage-and-daemon.service",
@@ -62,17 +57,16 @@ const FILES: [&str; 8] = [
 ];
 
 /// The runtime units kbf-installer starts before (`Before=` of its unit).
-const RUNTIME: [&str; 6] = [
+const RUNTIME: [&str; 5] = [
     "kbf-all-in-one.service",
     "kbf-daemon.service",
-    "kbf-envoy.service",
     "kbf-frontend@.service",
     "kbf-storage-and-daemon.service",
     "kbf-storage.service",
 ];
 
 /// The rules, by the tag a violation starts with.
-const RULES: [&str; 30] = [
+const RULES: [&str; 29] = [
     "install",
     "network",
     "positional",
@@ -98,7 +92,6 @@ const RULES: [&str; 30] = [
     "handover",
     "conflicts",
     "swap",
-    "envoy",
     "memory",
     "reload",
     "installer",
@@ -114,12 +107,12 @@ fn read(name: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
-/// The mode a unit file starts: the word after `kbf`. Envoy's and the installer's units
-/// start no mode.
+/// The mode a unit file starts: the word after `kbf`. The installer's unit starts no
+/// mode.
 fn mode_of(name: &str) -> Option<&str> {
     let stem = name.strip_suffix(".service")?;
     let mode = stem.strip_prefix("kbf-")?.trim_end_matches('@');
-    (!["envoy", "installer"].contains(&mode)).then_some(mode)
+    (mode != "installer").then_some(mode)
 }
 
 fn trim(v: &str) -> &str {
@@ -213,7 +206,6 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         return out;
     }
     let unit = UnitFile::parse(text).unwrap_or_else(|e| panic!("{name}: {e}"));
-    let is_envoy = name == "kbf-envoy.service";
     let is_installer = name == "kbf-installer.service";
     let mode = mode_of(name);
 
@@ -229,10 +221,6 @@ fn violations(name: &str, text: &str) -> Vec<String> {
             "gate-file",
             format!("no ConditionPathExists={own_config} in [Unit]"),
         );
-    }
-    // Catches an Envoy unit that starts before its configuration is rendered.
-    if is_envoy && !conditions.contains(&ENVOY_CONFIG) {
-        v("envoy", format!("no ConditionPathExists={ENVOY_CONFIG}"));
     }
     // Catches a gate that skips silently: ExecCondition= treats exit 1 to 254 as "do not
     // start, no failure", so a unit that cannot start would look healthy.
@@ -286,11 +274,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
             .split_whitespace()
             .next()
             .unwrap_or("");
-        // Envoy is the host's prerequisite (installed by the host's packages, not part of a
-        // kbf release), so its unit alone runs a binary outside the installer's tree; the
-        // `envoy` rule pins which one.
-        let allowed =
-            program.starts_with(TREE) || program == INSTALLER || (is_envoy && program == ENVOY_BIN);
+        let allowed = program.starts_with(TREE) || program == INSTALLER;
         if !allowed || program.contains("..") {
             v(
                 "exec",
@@ -298,9 +282,9 @@ fn violations(name: &str, text: &str) -> Vec<String> {
             );
         }
     }
-    // Catches a reload that restarts: Envoy's hot restart is kbf-installer's, and
-    // `systemctl restart` closes every stream the old Envoy holds. No unit has a reload
-    // until the hot restart exists.
+    // Catches a reload that restarts: `systemctl restart` (or a reload that runs one) cuts
+    // every open stream of the process it restarts, and an update of kbf never reloads or
+    // restarts a unit: it starts the other instance and hands over.
     for (key, value) in &execs {
         if *key == "ExecReload" || value.contains("systemctl") {
             v("reload", format!("{key}={value}"));
@@ -365,32 +349,6 @@ fn violations(name: &str, text: &str) -> Vec<String> {
             "restart-exit",
             format!("RestartPreventExitStatus= is {prevent:?}, not 2"),
         );
-    }
-
-    if is_envoy {
-        // Catches an Envoy that is not the host's prerequisite one (a binary of kbf's or the
-        // installer's tree: Envoy is not part of a kbf release), or another configuration,
-        // or a start that runs something before it.
-        if !pre.is_empty() {
-            v("envoy", format!("ExecStartPre= is {pre:?}, not none"));
-        }
-        if start.first() != Some(&ENVOY_BIN) || !start.windows(2).any(|w| w == ["-c", ENVOY_CONFIG])
-        {
-            v(
-                "envoy",
-                format!("ExecStart= is {start:?}, not {ENVOY_BIN} -c {ENVOY_CONFIG}"),
-            );
-        }
-        if unit.get_in("Service", "RestartSec").map(trim) != Some("5") {
-            v("restart", "no RestartSec=5".into());
-        }
-        if unit.get_in("Unit", "StartLimitIntervalSec").map(trim) != Some("0") {
-            v(
-                "restart-limit",
-                "no StartLimitIntervalSec=0 in [Unit]".into(),
-            );
-        }
-        return out;
     }
 
     let mode = mode.expect("a mode unit");
@@ -744,17 +702,13 @@ fn every_service_is_gated_on_its_config_and_its_checks() {
             all(&unit, "Unit", "ConditionPathExists").contains(&config),
             "{name}: no ConditionPathExists={config}"
         );
-        // Envoy is the host's own (no kbf check of it at start yet: the supported version
-        // range is checked by host preparation); every kbf unit runs its checks first.
-        if *name != "kbf-envoy.service" {
-            assert!(
-                !all(&unit, "Service", "ExecStartPre").is_empty(),
-                "{name}: no ExecStartPre= check"
-            );
-        }
+        assert!(
+            !all(&unit, "Service", "ExecStartPre").is_empty(),
+            "{name}: no ExecStartPre= check"
+        );
         n += 1;
     }
-    assert_eq!(n, 7, "a unit was not checked");
+    assert_eq!(n, 6, "a unit was not checked");
 }
 
 /// The modes whose units `files` hold, sorted.
@@ -924,12 +878,6 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "notify",
     ),
     (
-        "kbf-envoy.service",
-        "StartLimitIntervalSec=0\n",
-        "",
-        "restart-limit",
-    ),
-    (
         "kbf-daemon.service",
         "\nDelegate=yes\n",
         "\nDelegate=yes\nEnvironmentFile=/etc/kbf/s3.env\n",
@@ -996,27 +944,15 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "conflicts",
     ),
     (
-        "kbf-envoy.service",
-        "ConditionPathExists=/etc/kbf/envoy/envoy.json\n",
-        "",
-        "envoy",
-    ),
-    (
-        "kbf-envoy.service",
-        "ExecStart=/usr/bin/envoy ",
-        "ExecStart=/var/lib/kbf-installer/current/envoy ",
-        "envoy",
-    ),
-    (
         "kbf.slice",
         "[Slice]\n",
         "[Slice]\nMemoryMin=8G\n",
         "memory",
     ),
     (
-        "kbf-envoy.service",
+        "kbf-frontend@.service",
         "\nRestart=on-failure\n",
-        "\nRestart=on-failure\nExecReload=/usr/bin/systemctl restart kbf-envoy\n",
+        "\nRestart=on-failure\nExecReload=/usr/bin/systemctl restart kbf-frontend@%i\n",
         "reload",
     ),
     (
