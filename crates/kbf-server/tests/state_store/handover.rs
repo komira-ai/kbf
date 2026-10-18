@@ -2,7 +2,7 @@
 //! callers it kept, and the operator's cordon across the change.
 
 use kbf_front::{Backend, Handed};
-use kbf_server::farm::LOST_LOOKS;
+use kbf_server::farm::UNTRACED_LOOKS;
 use kbf_server::farm::NodeAction;
 use kbf_server::fleet::PlacementView;
 use kbf_state::{Cond, Txn};
@@ -138,19 +138,24 @@ async fn a_farm_is_quiet_when_no_call_is_between_its_request_and_its_queueing() 
     assert!(farm.quiet());
 }
 
-/// Catches: the callers a fenced farm kept left to wait for ever, or answered wrongly,
-/// whatever the successor does: it finishes an operation (its `done/` row is the answer),
-/// leaves one queued (nothing changes), or leaves no trace of one (answered UNAVAILABLE at
-/// the third look in a row, counted in `kbf_frontend_relay_lost_total`; a look that finds
-/// the operation again starts the count over, so a successor between the two transactions
-/// of a finish is not taken for one that lost the operation). Each follow returns how many
-/// callers still wait. Mutants: a vanished operation answered at the first look; the look
-/// count not reset by a look that finds the operation; the `done/` row ignored.
+/// Catches: the callers a fenced farm kept answered wrongly, whatever the successor does:
+/// it finishes an operation (its `done/` row is the answer), leaves one queued (nothing
+/// changes), or leaves no trace of one. A caller whose operation has no trace is NEVER
+/// answered by a look count or a timer: it waits through any number of looks (an owner
+/// ruling: relay until the operation finishes or the client cancels, no timeout), and the
+/// operation is only reported, in `kbf_frontend_relay_untraced`, once
+/// [`UNTRACED_LOOKS`] looks in a row found it so; a look that finds it again takes it off
+/// the report, and a caller that cancels (drops its stream) is no longer counted waiting.
+/// Each follow returns how many callers still wait. Mutants: a vanished operation answered
+/// (UNAVAILABLE) after some number of looks; the report not cleared by a look that finds
+/// the operation; a cancelled caller still counted; the report raised at the first look;
+/// the `done/` row ignored.
 #[tokio::test(start_paused = true)]
 async fn a_fenced_farm_answers_its_callers_from_what_the_successor_wrote() {
-    assert_eq!(LOST_LOOKS, 3, "this test counts looks");
+    assert_eq!(UNTRACED_LOOKS, 2, "this test counts looks");
     let disk = Disk::new();
     let (old, backend) = farm_over_disk(&disk, kbf_sched::UNSERVABLE_WAIT);
+    let untraced = || backend.metrics().frontend_relay_untraced.get();
     let (_, mut inbox) = register(&old);
     let ran = queue(&old, request(1));
     let queued = queue(&old, unplaceable(2));
@@ -178,8 +183,10 @@ async fn a_fenced_farm_answers_its_callers_from_what_the_successor_wrote() {
         (Code::InvalidArgument as i32, "test".to_owned())
     );
     assert!(done(&queued).is_none() && done(&vanishes).is_none());
+    assert_eq!(untraced(), 0);
 
-    // Two operations lose their rows: one for good, one for two looks.
+    // Two operations lose their rows and stay lost, through many looks: nothing answers
+    // them, and the report is raised at the second look.
     let key = |prefix: &str, op: u64| format!("{prefix}{op:016x}");
     let flicker_row = disk
         .store
@@ -194,29 +201,35 @@ async fn a_fenced_farm_answers_its_callers_from_what_the_successor_wrote() {
     };
     erase(2);
     erase(3);
-    for _ in 0..2 {
-        assert_eq!(old.follow().expect("follow"), 3);
+    assert_eq!(old.follow().expect("follow"), 3);
+    assert_eq!(untraced(), 0, "one look can fall between two transactions");
+    for _ in 0..200 {
+        assert_eq!(old.follow().expect("follow"), 3, "nobody is answered");
     }
-    assert_eq!(backend.metrics().frontend_relay_lost.get(), 0);
+    assert!(done(&queued).is_none() && done(&vanishes).is_none() && done(&flickers).is_none());
+    assert_eq!(untraced(), 2, "both are reported");
+
+    // One shows up again (leased: shown executing); it leaves the report.
     let back = Txn::new().put(key("op/", 3), flicker_row.value, Cond::Any);
     disk.store.txn(back).expect("store").expect("back");
-    assert_eq!(
-        old.follow().expect("follow"),
-        2,
-        "the vanished one is answered"
-    );
-    assert_eq!(backend.metrics().frontend_relay_lost.get(), 1);
-    let (code, why) = status(&done(&vanishes).expect("answered"));
-    assert_eq!(code, Code::Unavailable as i32);
-    assert!(why.contains("lost in a frontend handover"), "{why}");
+    assert_eq!(old.follow().expect("follow"), 3);
+    assert_eq!(untraced(), 1);
+    assert!(matches!(&*vanishes.stage.borrow(), Stage::Executing));
 
-    // It vanishes again: two looks do not answer it, the earlier ones do not count.
+    // The caller of the other one cancels: it is no longer waiting, nor reported.
+    drop(queued);
+    assert_eq!(old.follow().expect("follow"), 2);
+    assert_eq!(untraced(), 0);
+
+    // Lost again, and the callers still wait; the last two cancel and nothing is held.
     erase(3);
-    for _ in 0..2 {
+    for _ in 0..200 {
         assert_eq!(old.follow().expect("follow"), 2);
     }
-    assert!(done(&flickers).is_none());
-    assert_eq!(backend.metrics().frontend_relay_lost.get(), 1);
+    assert_eq!(untraced(), 1);
+    drop(vanishes);
+    assert_eq!(old.follow().expect("follow"), 1);
+    assert_eq!(untraced(), 0);
 }
 
 /// Catches: a farm with no state store that panics or claims callers waiting when told
@@ -287,9 +300,10 @@ async fn an_operation_is_found_by_its_action_among_the_unfinished_rows() {
 /// Catches: the fallback of a relayed call answering wrongly from the rows of an operation
 /// this farm's scheduler never held: a queued one shows nothing, a leased one is shown
 /// executing, a finished one is answered from its `done/` row, and one with no trace is
-/// answered UNAVAILABLE at the third look in a row and counted in
-/// `kbf_frontend_relay_lost_total`, as the follower does for the callers it kept. Mutants:
-/// the lost rule not applied to a relayed operation; the lost count not added.
+/// never answered, however many looks find it so (it shows nothing, is reported in
+/// `kbf_frontend_relay_untraced` from the second look, and leaves the report when the
+/// relay stops following it). Mutants: a look count that answers a relayed operation lost;
+/// the report not made, or not cleared by `release`.
 #[tokio::test(start_paused = true)]
 async fn a_relayed_operation_is_followed_from_the_rows_as_a_kept_caller_is() {
     let disk = Disk::new();
@@ -325,17 +339,15 @@ async fn a_relayed_operation_is_followed_from_the_rows_as_a_kept_caller_is() {
         .delete(format!("op/{:016x}", waits.0), Cond::Any)
         .delete(format!("queue/{:016x}", waits.0), Cond::Any);
     disk.store.txn(txn).expect("store").expect("erased");
-    for _ in 0..2 {
-        assert_eq!(old.look(waits), Ok(None));
+    let untraced = || backend.metrics().frontend_relay_untraced.get();
+    assert_eq!(old.look(waits), Ok(None));
+    assert_eq!(untraced(), 0, "one look is not a report");
+    for _ in 0..200 {
+        assert_eq!(old.look(waits), Ok(None), "never answered lost");
     }
-    assert_eq!(backend.metrics().frontend_relay_lost.get(), 0);
-    let Ok(Some(Stage::Done(lost))) = old.look(waits) else {
-        panic!("answered lost");
-    };
-    let (code, why) = status(&lost);
-    assert_eq!(code, Code::Unavailable as i32);
-    assert!(why.contains("lost in a frontend handover"), "{why}");
-    assert_eq!(backend.metrics().frontend_relay_lost.get(), 1);
+    assert_eq!(untraced(), 1);
+    old.release(waits);
+    assert_eq!(untraced(), 0, "no longer followed, no longer reported");
 }
 
 /// Catches: rows the relay's fallback cannot read taken for "no such operation": a relayed
