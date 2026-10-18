@@ -17,6 +17,9 @@ path = "src/bin/xtask-fake.rs"
 test = false
 
 [dependencies]
+# The statement a provenance bundle's DSSE envelope carries (`bundles`): its subject is
+# compared with the tarball's digest. Already in the tree through other crates.
+base64.workspace = true
 clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
