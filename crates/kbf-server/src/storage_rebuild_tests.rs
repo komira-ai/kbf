@@ -27,6 +27,7 @@ use tonic::transport::Endpoint;
 
 use super::{assemble, command, parse};
 use crate::RaftMetaLog;
+use crate::cold_apply::Fixed;
 use crate::replication::REPAIR_DIR;
 
 /// The fake frontend: every registration is member 1 at the next boot, answered with a
@@ -344,7 +345,7 @@ async fn start<O: ObjectStore>(
         &flags,
         flags.listener().expect("a listener"),
         None,
-        (log, store, prefix, id),
+        (log, Fixed(store), prefix, id),
         (|| Ok(pending::<()>()), &repair_dir),
         None,
         rebuild,

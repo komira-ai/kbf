@@ -5,7 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::hooked::Hooked;
@@ -56,6 +56,10 @@ pub struct Source {
     generation: Mutex<u64>,
     broken: AtomicBool,
     mute: AtomicBool,
+    /// The registration served instead of [`config`], whatever its secret.
+    custom: Mutex<Option<StoreConfig>>,
+    /// While true a snapshot waits (a node's fetch is held half way).
+    held: (Mutex<bool>, Condvar),
 }
 
 impl Source {
@@ -64,7 +68,24 @@ impl Source {
             generation: Mutex::new(generation),
             broken: AtomicBool::new(false),
             mute: AtomicBool::new(false),
+            custom: Mutex::new(None),
+            held: (Mutex::new(false), Condvar::new()),
         })
+    }
+
+    /// Serves `config` (its `secret_version` and generation follow the source's) from now on.
+    pub fn serve(&self, config: StoreConfig) {
+        *self.custom.lock().unwrap_or_else(PoisonError::into_inner) = Some(config);
+    }
+
+    /// Makes every snapshot wait until [`Source::release`].
+    pub fn hold(&self) {
+        *self.held.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+    }
+
+    pub fn release(&self) {
+        *self.held.0.lock().unwrap_or_else(PoisonError::into_inner) = false;
+        self.held.1.notify_all();
     }
 
     pub fn set(&self, generation: u64) {
@@ -100,13 +121,35 @@ impl StoreConfigSource for Source {
     }
 
     fn snapshot(&self) -> Result<Snapshot, SourceError> {
+        let mut held = self.held.0.lock().unwrap_or_else(PoisonError::into_inner);
+        while *held {
+            held = self
+                .held
+                .1
+                .wait(held)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(held);
         if self.broken.load(Ordering::SeqCst) {
             return Err(SourceError::SecretUnavailable);
         }
         let generation = self.read();
+        let custom = self
+            .custom
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         Ok(Snapshot {
             generation,
-            config: (generation > 0).then(|| config(generation)),
+            config: (generation > 0).then(|| {
+                custom.map_or_else(
+                    || config(generation),
+                    |mut custom| {
+                        custom.secret_version = generation;
+                        custom
+                    },
+                )
+            }),
         })
     }
 }
@@ -143,8 +186,19 @@ impl Pki {
             .client_ca_root(Certificate::from_pem(self.ca.pem()))
     }
 
+    /// The CA certificate, PEM.
+    pub fn ca_pem(&self) -> String {
+        self.ca.pem()
+    }
+
     /// A client certificate for the node `names` with `role` (none: no role name at all).
     pub fn client(&self, role: Option<&str>, names: &[&str]) -> Identity {
+        let (cert, key) = self.client_pem(role, names);
+        Identity::from_pem(cert, key)
+    }
+
+    /// [`Pki::client`]'s certificate and key, PEM, for a node that reads them from files.
+    pub fn client_pem(&self, role: Option<&str>, names: &[&str]) -> (String, String) {
         let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
         params.subject_alt_names = names.iter().map(|n| dns(n)).collect();
         if let Some(role) = role {
@@ -152,10 +206,13 @@ impl Pki {
                 format!("{ROLE_URI_PREFIX}{role}").try_into().expect("IA5"),
             ));
         }
-        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ClientAuth,
+            ExtendedKeyUsagePurpose::ServerAuth,
+        ];
         let key = KeyPair::generate().expect("key");
         let cert = params.signed_by(&key, &self.ca).expect("sign");
-        Identity::from_pem(cert.pem(), key.serialize_pem())
+        (cert.pem(), key.serialize_pem())
     }
 
     pub async fn channel(&self, addr: SocketAddr, identity: Identity) -> Channel {
@@ -197,11 +254,22 @@ pub async fn farm_denying(
     registry: bool,
     deny_list: Option<kbf_server::DenyList>,
 ) -> Farm {
+    farm_beating(source, registry, deny_list, Duration::from_secs(600)).await
+}
+
+/// [`farm_denying`] with members that must beat every `ttl / 3`, for a test with a real
+/// storage node (the state store's clock is manual, so no member lapses).
+pub async fn farm_beating(
+    source: Arc<Source>,
+    registry: bool,
+    deny_list: Option<kbf_server::DenyList>,
+    ttl: Duration,
+) -> Farm {
     let store = Hooked::new();
     let members = Arc::new(Members::new(
         Arc::clone(&store) as Arc<dyn Store>,
         MembershipConfig {
-            ttl: Duration::from_secs(600),
+            ttl,
             dwell: Duration::from_secs(600),
             replication: 1,
         },

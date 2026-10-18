@@ -57,6 +57,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# An S3 service on loopback that refuses any other key pair (tests/cold_apply.rs).
+kbf-objstore = { workspace = true, features = ["testkit"] }
 # A connector that fails its first lookups, under a lazy channel (tests/storage_register.rs).
 hyper-util = { workspace = true, features = ["tokio"] }
 # A test certificate's public-key hash and names, read independently of kbf-peer.

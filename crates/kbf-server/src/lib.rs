@@ -73,6 +73,7 @@ pub mod api_client;
 pub mod blobs;
 #[cfg(test)]
 mod build_commit;
+pub mod cold_apply;
 pub mod config;
 pub mod drain;
 pub mod enroll;

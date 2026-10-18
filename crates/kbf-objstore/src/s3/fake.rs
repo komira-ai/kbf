@@ -1,7 +1,7 @@
 //! An S3 service on loopback, for tests (feature `testkit`): PUT, ranged GET, and
 //! multipart upload (create, parts, complete, abort), with S3's rules on
 //! part sizes enforced at completion and conditional writes (`If-None-Match: *`) on a
-//! PUT and a completion.
+//! PUT and a completion, and DELETE of a plain object.
 //!
 //! It keeps what a test asks about: the uploads begun and not yet completed or aborted
 //! ([`FakeS3::incomplete_uploads`]), how many single PUTs and parts it took and the
@@ -9,7 +9,9 @@
 //! once ([`FakeS3::fail`]).
 //!
 //! Bytes are kept compactly: a run of zeros is counted, not stored, so an object of
-//! many GiB of zeros costs the test nothing to hold. It does not check signatures.
+//! many GiB of zeros costs the test nothing to hold. It checks no signature unless a test
+//! asks ([`FakeS3::require_credentials`]): then a request not signed with that key pair
+//! is refused 403, as a real store refuses a wrong key.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -19,6 +21,7 @@ use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use super::sigv4::{Request as Signed, Signer};
 use super::{Credentials, S3Config, S3Store};
 use crate::{Capabilities, ObjectKey};
 
@@ -148,6 +151,8 @@ struct State {
     failures: Vec<Failure>,
     stats: FakeStats,
     requests: Vec<String>,
+    /// The only key pair a request may be signed with, when a test set one.
+    credentials: Option<(String, String)>,
 }
 
 /// An S3 service on loopback (module docs). It serves until the runtime it was
@@ -207,6 +212,19 @@ impl FakeS3 {
 
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// From now on refuses (403) every request not signed with this key pair: the access
+    /// key id must be `access_key_id` and the signature must be the one `secret_access_key`
+    /// makes, recomputed here over the request as received.
+    pub fn require_credentials(&self, access_key_id: &str, secret_access_key: &str) {
+        self.lock().credentials = Some((access_key_id.to_owned(), secret_access_key.to_owned()));
+    }
+
+    /// Every object key held, in order.
+    #[must_use]
+    pub fn keys(&self) -> Vec<String> {
+        self.lock().objects.keys().cloned().collect()
     }
 
     /// Fails the next request `failure` names, once.
@@ -348,6 +366,11 @@ fn handle(state: &mut State, request: &Request) -> Vec<u8> {
     let q = |name: &str| request.query.get(name).cloned();
     let conditional = request.headers.get("if-none-match").map(String::as_str) == Some("*");
     let method = request.method.as_str();
+    if let Some((id, secret)) = &state.credentials
+        && !signed_with(request, id, secret)
+    {
+        return error("403 Forbidden", "SignatureDoesNotMatch");
+    }
     match (method, q("uploads"), q("uploadId"), q("partNumber")) {
         ("POST", Some(_), None, None) => {
             if state.take(Failure::Create) {
@@ -400,9 +423,95 @@ fn handle(state: &mut State, request: &Request) -> Vec<u8> {
             state.stats.single_puts += 1;
             answer("200 OK", &[], b"")
         }
+        ("DELETE", None, None, None) => {
+            state.objects.remove(&key);
+            answer("204 No Content", &[], b"")
+        }
         ("GET", None, None, None) => get(state, &key, request.headers.get("range")),
         _ => error("501 Not Implemented", "NotImplemented"),
     }
+}
+
+/// Whether `request` carries the `Authorization` that `access_key_id` and
+/// `secret_access_key` make for it: the signature is computed again from the request as
+/// received, with the signer the store signs with.
+fn signed_with(request: &Request, access_key_id: &str, secret_access_key: &str) -> bool {
+    let header = |name: &str| request.headers.get(name).map(String::as_str);
+    let Some(authorization) = header("authorization") else {
+        return false;
+    };
+    // `AWS4-HMAC-SHA256 Credential=<id>/<date>/<region>/s3/aws4_request, SignedHeaders=..`
+    let region = authorization
+        .split("Credential=")
+        .nth(1)
+        .and_then(|rest| rest.split('/').nth(2));
+    let signed_names = authorization
+        .split("SignedHeaders=")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next());
+    let (Some(region), Some(names), Some(host), Some(date), Some(payload)) = (
+        region,
+        signed_names,
+        header("host"),
+        header("x-amz-date"),
+        header("x-amz-content-sha256"),
+    ) else {
+        return false;
+    };
+    let headers: Vec<(&str, String)> = names
+        .split(';')
+        .filter(|name| *name != "host")
+        .filter_map(|name| Some((name, header(name)?.to_owned())))
+        .collect();
+    // The signer encodes; what arrived is encoded already.
+    let query: Vec<(String, String)> = request
+        .query
+        .iter()
+        .map(|(k, v)| (unescape(k), unescape(v)))
+        .collect();
+    let query: Vec<(&str, String)> = query.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    let expected = Signer {
+        access_key_id,
+        secret_access_key,
+        region,
+    }
+    .authorization(
+        &Signed {
+            method: &request.method,
+            host,
+            path: &request.path,
+            query: &query,
+            headers: &headers,
+            payload_sha256: payload,
+        },
+        date,
+    );
+    expected == authorization
+}
+
+/// `text` with its `%XX` escapes decoded (an escape that is not one stays as it is).
+fn unescape(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let escaped = bytes
+            .get(at + 1..at + 3)
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .filter(|_| bytes[at] == b'%')
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escaped {
+            Some(byte) => {
+                out.push(byte);
+                at += 3;
+            }
+            None => {
+                out.push(bytes[at]);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The object an upload's completion names: its parts, in the order the body lists
@@ -487,6 +596,16 @@ fn get(state: &State, key: &str, range: Option<&String>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Catches: a request signed over an escaped query (mutant: `unescape` leaves `%2F`
+    /// alone, so the fake signs the escape again and refuses a request it should take).
+    #[test]
+    fn escapes_are_decoded_and_what_is_not_one_stays() {
+        assert_eq!(unescape("a%2Fb%41"), "a/bA");
+        assert_eq!(unescape("100%"), "100%");
+        assert_eq!(unescape("%zz%4"), "%zz%4");
+        assert_eq!(unescape(""), "");
+    }
 
     /// Catches: kept bytes that read back other than written (a zero run merged with
     /// its neighbour's length wrong, a range cut at the wrong run).
