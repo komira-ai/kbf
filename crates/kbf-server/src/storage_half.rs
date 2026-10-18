@@ -47,6 +47,7 @@ use kbf_storage::repair::Repairs;
 use kbf_storage::service::InProcess;
 use kbf_threads::disk::Statvfs;
 
+use crate::metrics::NodeMetrics;
 use crate::rebuild::Background;
 use crate::replication::{REPAIR_DIR, bind_node};
 use crate::serve::{ServeError, StorageListener, bind_storage_socket};
@@ -62,6 +63,8 @@ use crate::{RaftMetaLog, SERVER_VERSION, s3_store};
 pub struct StorageHalf {
     /// Where the listener is.
     pub addr: SocketAddr,
+    /// Where it serves `/metrics`, when `--metrics-listen` is given.
+    pub metrics: Option<SocketAddr>,
     storage: Arc<dyn Storage>,
     in_process: InProcess,
     start_line: String,
@@ -72,6 +75,7 @@ pub struct StorageHalf {
     _background: Background,
     _joiner: Option<AbortOnDrop>,
     _repair: Option<AbortOnDrop>,
+    _metrics: Option<AbortOnDrop>,
 }
 
 impl StorageHalf {
@@ -124,6 +128,7 @@ impl StorageHalf {
             _background,
             _joiner,
             _repair,
+            _metrics,
             ..
         } = self;
         serving.await
@@ -193,12 +198,23 @@ where
     // frontend if there is one, and only then open the cache, as the registration's member
     // and boot.
     let socket = bind_storage_socket(listener.listen)?;
+    let metrics = flags.metrics.map(NodeMetrics::bind).transpose()?;
     let (cache, registered) = open_cache(flags, socket, (meta, store, prefix, log)).await?;
     let cache = cache.with_writes(args.write_config());
     let local = args.local_cache.as_ref();
     let hot = stores.hot.as_ref();
     let (cache, tier) = crate::write_tier::attach_with(cache, hot, local.is_none()).await?;
     let cache = Arc::new(cache);
+    // With the one cache, its fill is on the scrape too.
+    let (metrics, _metrics) = metrics
+        .map(|m| {
+            m.serve(
+                Arc::clone(&cache),
+                args.local_cache.clone(),
+                listener.tls.clone(),
+            )
+        })
+        .unzip();
     share_storage(local, tier_bytes(Arc::downgrade(&cache)));
     let _flusher = tier.map(|_| {
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
@@ -219,6 +235,7 @@ where
     let addr = node.addr;
     Ok(StorageHalf {
         addr,
+        metrics,
         storage,
         in_process: node.in_process,
         start_line: format!("kbf-storage {SERVER_VERSION} storage={addr} log={log}"),
@@ -229,5 +246,6 @@ where
         _background,
         _joiner: node.joiner,
         _repair: node.repair,
+        _metrics,
     })
 }

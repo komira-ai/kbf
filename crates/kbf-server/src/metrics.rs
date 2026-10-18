@@ -11,6 +11,7 @@
 //! daemons' worker listener) counts into the same families.
 
 use std::fmt::Write as _;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
@@ -18,12 +19,16 @@ use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use futures::FutureExt as _;
 use kbf_front::{Cache, MetaLog};
 use kbf_objstore::ObjectStore;
 use kbf_storage::local_cache::{Fill, LocalCache};
 use kbf_tls::TlsSource;
 
+use crate::listen::Socket;
 use crate::members::Members;
+use crate::serve::ServeError;
+use crate::start::AbortOnDrop;
 
 /// The media type of the answer: the Prometheus text exposition format.
 pub const TEXT_FORMAT: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -106,6 +111,49 @@ where
     scrape_health(&mut text, sources.members.as_ref()).await;
     kbf_tls::render_metrics(sources.tls.iter(), &mut text);
     ([(CONTENT_TYPE, TEXT_FORMAT)], text).into_response()
+}
+
+/// A storage node's `/metrics` listener (`--metrics-listen`): the same route, over the
+/// node's cache, on a listener of its own, since the node has no operator API. Plain
+/// HTTP on any address, as the frontend's operator API is, and for the same reason: it
+/// names no blob, build or node, only counts and latencies. Bound with the node's
+/// storage socket ([`NodeMetrics::bind`]) so a taken address fails the start, and served
+/// once the cache is open ([`NodeMetrics::serve`]).
+pub(crate) struct NodeMetrics {
+    listener: tokio::net::TcpListener,
+    addr: SocketAddr,
+}
+
+impl NodeMetrics {
+    /// Binds `addr`, on the runtime that will serve it.
+    ///
+    /// # Errors
+    /// The address cannot be bound, or the runtime cannot register the socket.
+    pub fn bind(addr: SocketAddr) -> Result<Self, ServeError> {
+        let socket = Socket::bind(addr)?;
+        let addr = socket.local;
+        socket.http().map(|listener| Self { listener, addr })
+    }
+
+    /// Serves `/metrics` over `cache` (and `local`'s fill, when the process has one
+    /// cache for the daemon half and the store; and the reloads of the listener's
+    /// `tls`) until the returned task is dropped: where it listens, and the task.
+    pub fn serve<M, O>(
+        self,
+        cache: Arc<Cache<M, O>>,
+        local: Option<Arc<LocalCache>>,
+        tls: Option<TlsSource>,
+    ) -> (SocketAddr, AbortOnDrop)
+    where
+        M: MetaLog,
+        O: ObjectStore + 'static,
+    {
+        let routes = router(cache, local, None, None, tls.into_iter().collect());
+        // `pending` is its stop, so it ends only when the task is aborted; an error of
+        // the accept loop has nothing to be reported to.
+        let serving = crate::serve::serve_api(Some(self.listener), routes, std::future::pending());
+        (self.addr, AbortOnDrop(tokio::spawn(serving.map(drop))))
+    }
 }
 
 /// Appends the storage health of `members`, when there are any; not generic, so every

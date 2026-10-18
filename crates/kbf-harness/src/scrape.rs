@@ -1,9 +1,10 @@
 //! The frontend's `/metrics`, read every second for the whole scenario into a file of
 //! samples (one JSON line each) and kept in memory for the gates.
 //!
-//! Only the frontend exposes metrics today (the storage and daemon sources have no
-//! route), so these are the frontend's series; the other roles are covered by the
-//! process table. The reader takes the Prometheus text format as the frontend writes it.
+//! The frontend's `/metrics` is on its operator API and each storage node's on its
+//! `--metrics-listen` (one scraper, one file each); the daemons serve none, so they are
+//! covered by the process table. The reader takes the Prometheus text format as the
+//! kbf server writes it.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -111,7 +112,7 @@ pub struct Scraper {
 }
 
 impl Scraper {
-    /// Scrapes `GET /metrics` of the operator API at `127.0.0.1:api` every `every`,
+    /// Scrapes `GET /metrics` at `127.0.0.1:api` every `every`,
     /// appending each sample to `file` as a JSON line.
     ///
     /// # Panics
@@ -168,7 +169,7 @@ impl Scraper {
     }
 }
 
-/// One scrape of the frontend.
+/// One scrape of the `/metrics` at `127.0.0.1:api`.
 ///
 /// # Errors
 /// No answer, a status other than 200, or a page that is not metrics.
@@ -180,7 +181,13 @@ pub fn scrape_once(api: u16) -> Result<BTreeMap<String, f64>, String> {
     parse(&body)
 }
 
-/// The path of the series file in `logs`.
+/// The path of the series file of storage node `node` in `logs`.
+#[must_use]
+pub fn node_series_file(logs: &Path, node: &str) -> PathBuf {
+    logs.join(format!("metrics-{node}.jsonl"))
+}
+
+/// The path of the frontend's series file in `logs`.
 #[must_use]
 pub fn series_file(logs: &Path) -> PathBuf {
     logs.join("metrics.jsonl")

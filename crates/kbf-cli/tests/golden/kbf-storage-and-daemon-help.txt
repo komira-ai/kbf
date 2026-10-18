@@ -359,6 +359,9 @@ Options:
           
           [default: 127.0.0.1:8982]
 
+      --metrics-listen <ADDR>
+          Serves GET /metrics (Prometheus text) over plain HTTP here. Off unless given. Reads are open to whoever reaches it: bind it where only operators do.
+
       --storage-tls-cert <PATH>
           The node's server certificate (PEM).
 

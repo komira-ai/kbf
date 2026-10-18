@@ -1,8 +1,8 @@
 //! `kbf storage`: the storage node (`docs/design/architecture-v2.md`, sections 3 and 13
 //! P2). The cache the server has, the same stores and the same write tier, served over
 //! gRPC by [`kbf_storage::service`] and nothing else: no REAPI, no scheduler, no
-//! worker streams, no operator API, and no state store (the node reaches that only
-//! through a frontend, section 6).
+//! worker streams, no operator API (only `GET /metrics`, on `--metrics-listen` when
+//! given), and no state store (the node reaches that only through a frontend, section 6).
 //!
 //! **The flags** are `kbf-server`'s own for what a storage node keeps (the object
 //! stores, the metadata log, the write tier and its bounds, the logs, the thread pools,
@@ -65,6 +65,7 @@ use kbf_tls::{TlsFiles, TlsSource};
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 use crate::join::{self, Joined, Joiner};
+use crate::metrics::NodeMetrics;
 use crate::node_map::NodeMap;
 use crate::rebuild::Background;
 use crate::replication::{REPAIR_DIR, Registered, bind_node};
@@ -108,6 +109,8 @@ const REGISTRATION: [&str; 4] = [
     "storage_zone",
     "storage_weight",
 ];
+/// The id of `--metrics-listen`.
+const METRICS: &str = "metrics_listen";
 /// The ids of the three TLS flags, in the order [`StorageFlags::tls`] reads them.
 const TLS: [&str; 3] = ["storage_tls_cert", "storage_tls_key", "storage_client_ca"];
 
@@ -119,6 +122,8 @@ pub struct StorageFlags {
     pub server: Args,
     /// Where the node listens.
     pub listen: SocketAddr,
+    /// Where the node serves `GET /metrics` over plain HTTP, if anywhere.
+    pub metrics: Option<SocketAddr>,
     /// The server certificate, its key and the client CA, all three or none.
     pub tls: Option<[PathBuf; 3]>,
     /// The frontend to register with (`http://` or `https://`), if any.
@@ -160,6 +165,16 @@ pub fn command() -> Command {
             .help(
                 "Where the node serves gRPC. Without the TLS flags it serves plain text, and \
                  the address must be loopback.",
+            ),
+    )
+    .arg(
+        Arg::new(METRICS)
+            .long("metrics-listen")
+            .value_name("ADDR")
+            .value_parser(clap::value_parser!(SocketAddr))
+            .help(
+                "Serves GET /metrics (Prometheus text) over plain HTTP here. Off unless given. \
+                 Reads are open to whoever reaches it: bind it where only operators do.",
             ),
     )
     .arg(path(
@@ -264,6 +279,7 @@ pub fn parse(m: &ArgMatches) -> Result<StorageFlags, clap::Error> {
     Ok(StorageFlags {
         server,
         listen,
+        metrics: m.get_one::<SocketAddr>(METRICS).copied(),
         tls,
         frontend,
         advertise,
@@ -375,6 +391,8 @@ impl StorageFlags {
 pub struct StorageHandle {
     /// Where the node listens.
     pub addr: SocketAddr,
+    /// Where it serves `/metrics`, when `--metrics-listen` is given.
+    pub metrics: Option<SocketAddr>,
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
@@ -384,6 +402,7 @@ pub struct StorageHandle {
     repairs: Option<Arc<Repairs>>,
     _joiner: Option<AbortOnDrop>,
     _repair: Option<AbortOnDrop>,
+    _metrics: Option<AbortOnDrop>,
 }
 
 impl StorageHandle {
@@ -429,6 +448,7 @@ impl StorageHandle {
             _background,
             _joiner,
             _repair,
+            _metrics,
             ..
         } = self;
         serving.await
@@ -535,10 +555,14 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let socket = bind_storage_socket(listener.listen)?;
+    let metrics = flags.metrics.map(NodeMetrics::bind).transpose()?;
     let (cache, registered) = open_cache(flags, socket, (meta, store, prefix, log)).await?;
     let cache = cache.with_writes(flags.server.write_config());
     let (cache, tier) = crate::write_tier::attach(cache, hot).await?;
     let cache = Arc::new(cache);
+    let (metrics, _metrics) = metrics
+        .map(|m| m.serve(Arc::clone(&cache), None, listener.tls.clone()))
+        .unzip();
     let _flusher = tier.map(|_| {
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
         AbortOnDrop(tokio::spawn(flusher))
@@ -550,6 +574,7 @@ where
     let node = bind_node(flags, listener, registered, storage, repair_dir, stop)?;
     Ok(StorageHandle {
         addr: node.addr,
+        metrics,
         start_line: format!(
             "kbf-storage {SERVER_VERSION} storage={} log={log}",
             node.addr
@@ -562,6 +587,7 @@ where
         repairs: node.repairs,
         _joiner: node.joiner,
         _repair: node.repair,
+        _metrics,
     })
 }
 

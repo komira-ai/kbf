@@ -6,9 +6,15 @@ use std::collections::BTreeMap;
 use super::*;
 use crate::scrape::Scrapes;
 
-fn sample(at: f64, execute_errors: f64, lost: f64, losses: f64) -> Sample {
+/// A scrape of the frontend: it holds no cache, so it carries no lost-blob series.
+fn sample(at: f64, execute_errors: f64) -> Sample {
+    let series = BTreeMap::from([(EXECUTE_ERRORS.to_owned(), execute_errors)]);
+    Sample { at, series }
+}
+
+/// A scrape of a storage node.
+fn node_sample(at: f64, lost: f64, losses: f64) -> Sample {
     let series = BTreeMap::from([
-        (EXECUTE_ERRORS.to_owned(), execute_errors),
         (LOST_BLOBS.to_owned(), lost),
         (BLOB_LOSSES.to_owned(), losses),
     ]);
@@ -31,10 +37,12 @@ fn build(ok: bool, failed: Result<u64, String>) -> BuildResult {
     }
 }
 
-/// What a healthy ten-second run measured: two builds, eleven scrapes, nothing lost.
+/// What a healthy ten-second run measured: two builds, eleven scrapes of the frontend and
+/// of each of three storage nodes, nothing lost.
 struct Run {
     builds: Vec<BuildResult>,
     scrapes: Scrapes,
+    nodes: Vec<(String, Scrapes)>,
     exited: Vec<(String, String)>,
     whole: Result<(), String>,
     stopped: Vec<(String, String)>,
@@ -44,11 +52,15 @@ struct Run {
 fn pass() -> Run {
     Run {
         builds: vec![build(true, Ok(0)), build(true, Ok(0))],
-        scrapes: scrapes(
-            (0..11)
-                .map(|i| sample(f64::from(i), 0.0, 0.0, 0.0))
-                .collect(),
-        ),
+        scrapes: scrapes((0..11).map(|i| sample(f64::from(i), 0.0)).collect()),
+        nodes: (1..=3)
+            .map(|n| {
+                let samples = (0..11)
+                    .map(|i| node_sample(f64::from(i), 0.0, 0.0))
+                    .collect();
+                (format!("node-{n}"), scrapes(samples))
+            })
+            .collect(),
         exited: Vec::new(),
         whole: Ok(()),
         stopped: vec![("frontend".to_owned(), "exit 0".to_owned())],
@@ -60,6 +72,7 @@ fn gates(run: &Run) -> Vec<Gate> {
     Evidence {
         builds: &run.builds,
         scrapes: &run.scrapes,
+        nodes: &run.nodes,
         exited_during_load: &run.exited,
         farm_whole: &run.whole,
         stopped: &run.stopped,
@@ -171,8 +184,45 @@ fn a_lost_blob_in_any_scrape_is_red_even_if_the_last_is_zero() {
     // (the blob uploaded again) hid the loss; and the counter, which never falls, being
     // the only evidence.
     let mut run = pass();
-    run.scrapes.samples[5] = sample(5.0, 0.0, 1.0, 0.0);
+    run.nodes[1].1.samples[5] = node_sample(5.0, 1.0, 0.0);
     assert_eq!(failed(&run), ["lost_blobs_gauge"]);
+}
+
+#[test]
+fn the_lost_blob_gates_sum_the_storage_nodes() {
+    // Catches: one node's reading taken for the farm's (the first, the last or the
+    // largest), so that a loss on the other nodes is not counted: two nodes that each
+    // lost one blob read 2.
+    let mut run = pass();
+    for node in [0, 2] {
+        run.nodes[node].1.samples[3] = node_sample(3.0, 1.0, 0.0);
+        run.nodes[node].1.samples[10] = node_sample(10.0, 0.0, 1.0);
+    }
+    let gates = gates(&run);
+    for name in ["lost_blobs_gauge", "blob_losses"] {
+        let gate = gates.iter().find(|g| g.name == name).expect("gate");
+        assert_eq!(gate.verdict, Verdict::Fail, "{name}");
+        assert_eq!(gate.measured, json!(2.0), "{name}");
+    }
+}
+
+#[test]
+fn the_frontends_series_are_not_the_lost_blob_evidence() {
+    // Catches: the gates reading the frontend's scrapes (which a frontend that grows the
+    // series would satisfy) instead of the storage nodes', and a farm with no storage
+    // node scraped passing on nothing.
+    let mut run = pass();
+    run.nodes.clear();
+    for s in &mut run.scrapes.samples {
+        s.series.insert(LOST_BLOBS.to_owned(), 0.0);
+        s.series.insert(BLOB_LOSSES.to_owned(), 0.0);
+    }
+    assert_eq!(failed(&run), ["lost_blobs_gauge", "blob_losses"]);
+    let gate = gates(&run)
+        .into_iter()
+        .find(|g| g.name == "blob_losses")
+        .expect("gate");
+    assert!(gate.detail.expect("detail").contains("no storage node"));
 }
 
 #[test]
@@ -181,11 +231,11 @@ fn the_loss_counter_is_a_delta() {
     // that restarted over a store that already lost blobs is not this run's loss), and
     // a loss the gauge missed.
     let mut run = pass();
-    for s in &mut run.scrapes.samples {
+    for s in &mut run.nodes[2].1.samples {
         s.series.insert(BLOB_LOSSES.to_owned(), 7.0);
     }
     assert_eq!(failed(&run), Vec::<String>::new());
-    run.scrapes.samples[10]
+    run.nodes[2].1.samples[10]
         .series
         .insert(BLOB_LOSSES.to_owned(), 8.0);
     assert_eq!(failed(&run), ["blob_losses"]);
@@ -211,15 +261,39 @@ fn an_absent_metric_fails_its_gate_in_the_first_scrape_and_in_a_later_one() {
     // Catches: an absent series read as zero, so a metric the frontend stops exporting
     // turns its gate green.
     for scrape in [0, 7] {
-        for name in [EXECUTE_ERRORS, LOST_BLOBS, BLOB_LOSSES] {
-            let mut run = pass();
-            run.scrapes.samples[scrape].series.remove(name);
-            let failed = failed(&run);
-            assert_eq!(
-                failed.len(),
-                1,
-                "{name} absent from scrape {scrape}: {failed:?}"
-            );
+        let mut run = pass();
+        run.scrapes.samples[scrape].series.remove(EXECUTE_ERRORS);
+        assert_eq!(failed(&run), ["execute_errors"], "scrape {scrape}");
+    }
+}
+
+#[test]
+fn one_storage_nodes_missing_series_fails_the_gate_whatever_the_others_read() {
+    // Catches: the lost-blob gates summing what is there (a node that stopped exporting,
+    // or whose node never answered, adding nothing to a sum of zeros), so that the one
+    // node that lost a blob is the one the gate cannot see; and a detail that does not say
+    // which node.
+    for node in 0..3 {
+        for scrape in [0, 7] {
+            for (name, gate) in [
+                (LOST_BLOBS, "lost_blobs_gauge"),
+                (BLOB_LOSSES, "blob_losses"),
+            ] {
+                let mut run = pass();
+                run.nodes[node].1.samples[scrape].series.remove(name);
+                assert_eq!(
+                    failed(&run),
+                    [gate],
+                    "{name} from node {node}, scrape {scrape}"
+                );
+                let detail = gates(&run)
+                    .into_iter()
+                    .find(|g| g.name == gate)
+                    .and_then(|g| g.detail)
+                    .expect("detail");
+                let who = format!("node-{}: {name} is absent from scrape {scrape}", node + 1);
+                assert!(detail.contains(&who), "{detail}");
+            }
         }
     }
 }
@@ -229,6 +303,7 @@ fn fewer_than_two_scrapes_pass_no_series_gate() {
     // Catches: a run whose scraper never got a page passing on a difference of nothing.
     let mut run = pass();
     run.scrapes.samples.truncate(1);
+    run.nodes[0].1.samples.truncate(1);
     let failed = failed(&run);
     for gate in [
         "execute_errors",
@@ -244,7 +319,7 @@ fn fewer_than_two_scrapes_pass_no_series_gate() {
 fn a_family_with_labels_is_summed() {
     // Catches: a labelled series (`name{class="x"}`, which a by-class counter will be)
     // read as absent, or only its first label counted.
-    let mut s = sample(0.0, 0.0, 0.0, 0.0);
+    let mut s = sample(0.0, 0.0);
     s.series.remove(EXECUTE_ERRORS);
     s.series
         .insert(format!("{EXECUTE_ERRORS}{{class=\"a\"}}"), 2.0);
@@ -344,6 +419,7 @@ fn a_load_of_no_time_has_no_scrape_coverage() {
     let g = Evidence {
         builds: &run.builds,
         scrapes: &run.scrapes,
+        nodes: &run.nodes,
         exited_during_load: &run.exited,
         farm_whole: &run.whole,
         stopped: &run.stopped,

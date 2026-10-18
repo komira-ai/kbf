@@ -1,6 +1,3 @@
-//! Scenario B0 over a real farm, as it stands today: the farm exports no lost-blob series, so
-//! `lost_blobs_gauge` and `blob_losses` fail closed on every run (see [`NOT_EXPORTED`]).
-//!
 //! Scenario B0 over a real farm: `kbf` processes (a frontend, three storage nodes, two
 //! native daemons, started from the units `kbf-deploy` renders), the harness's supervisor,
 //! scraper, gates and result document, with a stand-in `buck2` for the load (the beta
@@ -21,16 +18,6 @@ use std::time::Duration;
 
 use kbf_harness::b0::{B0, Ended, Mutant, run};
 use kbf_harness::farm::Role;
-
-/// The gates no run of today's farm can pass: B0 reads `kbf_cache_lost_blobs` and
-/// `kbf_cache_blob_losses_total`, which only a process that holds a cache writes
-/// (`kbf_front::Cache::render_metrics`, the lost-blob families of `Cache::losses`). In a farm
-/// of `kbf` processes the frontend holds none (`Backend::remote` keeps its own counters) and
-/// a storage node, which does, serves no `/metrics` (it has no operator API listener). The
-/// gates fail closed on an absent series, so they are red until a storage node exports
-/// them; `the_loss_gates_are_red_until_storage_nodes_export_their_series` pins that, and
-/// fails the day it stops being true, so this list is then emptied.
-const NOT_EXPORTED: [&str; 2] = ["lost_blobs_gauge", "blob_losses"];
 
 /// How many farms these tests run at once. Each is seven processes, and a test runs as many
 /// at a time as the machine has CPUs: on a big machine, under coverage, a farm that is starved
@@ -152,14 +139,6 @@ fn verdict<'a>(doc: &'a serde_json::Value, name: &str) -> &'a str {
         .expect("verdict")
 }
 
-/// The failed gates other than [`NOT_EXPORTED`].
-fn other_failures(doc: &serde_json::Value) -> Vec<String> {
-    failed(doc)
-        .into_iter()
-        .filter(|g| !NOT_EXPORTED.contains(&g.as_str()))
-        .collect()
-}
-
 /// The names of the gates that failed.
 fn failed(doc: &serde_json::Value) -> Vec<String> {
     doc["gates"]
@@ -175,18 +154,18 @@ fn failed(doc: &serde_json::Value) -> Vec<String> {
 /// reports using. A frontend, three storage nodes and two daemons start from their rendered
 /// units behind the stand-in Envoy (the nodes register with the frontend, the daemons dial
 /// it through Envoy), the farm is ready, builds run in two loops, the scraper reads the
-/// frontend's metrics, every process stops with exit 0, and the document says what ran:
-/// every gate passes but the two the farm cannot satisfy ([`NOT_EXPORTED`]), the native
+/// frontend's and each storage node's metrics, every process stops with exit 0, and the
+/// document says what ran: every gate passes, the native
 /// driver and no container, the Envoy named, one process-table row per role, the
 /// unattested note, and the log files of every role and of every build.
 #[test]
-fn a_healthy_farm_passes_every_gate_it_can_behind_envoy() {
+fn a_healthy_farm_passes_every_gate_behind_envoy() {
     let mut args = b0("healthy", "ok", 6);
     args.envoy = Some(PathBuf::from(env!("CARGO_BIN_EXE_kbf-cli-fake-envoy")));
-    assert_eq!(run(&args).expect("a run"), Ended::Failed);
+    assert_eq!(run(&args).expect("a run"), Ended::Passed);
     let doc = document(&args);
-    assert_eq!(failed(&doc), NOT_EXPORTED, "{doc}");
-    assert_eq!(doc["status"], "FAILED");
+    assert_eq!(failed(&doc), Vec::<String>::new(), "{doc}");
+    assert_eq!(doc["status"], "PASSED");
     assert_eq!(doc["gates"].as_array().expect("gates").len(), 11);
     assert_eq!(doc["attested"], false);
     assert_eq!(doc["runtime"]["driver"], "native");
@@ -234,40 +213,57 @@ fn a_healthy_farm_passes_every_gate_it_can_behind_envoy() {
     assert!(summary.contains("| builds_run |"), "{summary}");
 }
 
-/// Catches: a lost-blob gate that passes on a farm that exports no lost-blob series (a
-/// metric that is not there read as zero), and the day this stops being true: a storage node
-/// that serves `kbf_cache_lost_blobs` and `kbf_cache_blob_losses_total` makes this fail, and
-/// [`NOT_EXPORTED`] is then emptied and every test here asserts a passing run.
+/// Catches: the lost-blob gates reading a series no storage node serves (the frontend holds
+/// no cache), or a node scraped but not read: on a healthy farm both pass on the three
+/// storage nodes' own series, summed over all three, and each node has a series file with
+/// both families in every line, while the frontend's file has neither.
 #[test]
-fn the_loss_gates_are_red_until_storage_nodes_export_their_series() {
-    let args = b0("no-loss-series", "ok", 3);
-    assert_eq!(run(&args).expect("a run"), Ended::Failed);
+fn the_loss_gates_read_every_storage_nodes_series() {
+    let args = b0("loss-series", "ok", 3);
+    assert_eq!(run(&args).expect("a run"), Ended::Passed);
     let doc = document(&args);
-    for name in NOT_EXPORTED {
+    for name in ["lost_blobs_gauge", "blob_losses"] {
+        assert_eq!(verdict(&doc, name), "PASS", "{doc}");
         let gate = doc["gates"]
             .as_array()
             .expect("gates")
             .iter()
-            .find(|g| g["name"] == name);
-        let gate = gate.unwrap_or_else(|| panic!("no gate {name}"));
-        assert_eq!(gate["verdict"], "FAIL", "{gate}");
-        assert!(gate["measured"].is_null(), "{gate}");
+            .find(|g| g["name"] == name)
+            .expect("gate");
+        assert_eq!(gate["measured"], 0.0, "{gate}");
         assert!(
             gate["detail"]
                 .as_str()
                 .expect("detail")
-                .contains("is absent from scrape 0"),
+                .contains("summed over 3 storage nodes"),
             "{gate}"
         );
     }
-    let series = std::fs::read_to_string(args.work.join("logs/metrics.jsonl")).expect("series");
+    let logs = args.work.join("logs");
+    for node in ["node-1", "node-2", "node-3"] {
+        let series = std::fs::read_to_string(logs.join(format!("metrics-{node}.jsonl")))
+            .unwrap_or_else(|e| panic!("{node}: {e}"));
+        let lines: Vec<&str> = series.lines().collect();
+        assert!(lines.len() >= 2, "{node}: {series}");
+        for line in lines {
+            assert!(
+                line.contains("\"kbf_cache_lost_blobs\":0.0"),
+                "{node}: {line}"
+            );
+            assert!(
+                line.contains("\"kbf_cache_blob_losses_total\":0.0"),
+                "{node}: {line}"
+            );
+        }
+    }
+    let series = std::fs::read_to_string(logs.join("metrics.jsonl")).expect("series");
     assert!(
         series.contains("kbf_execute_errors_total"),
         "the frontend's own series are read"
     );
     assert!(
         !series.contains("kbf_cache_lost_blobs"),
-        "a series the farm now exports"
+        "the frontend holds no cache"
     );
 }
 
@@ -286,7 +282,7 @@ fn each_kind_of_bad_build_fails_its_gate() {
         let args = b0(&format!("bad-{mode}"), mode, 3);
         assert_eq!(run(&args).expect("a run"), Ended::Failed, "{mode}");
         let doc = document(&args);
-        assert_eq!(other_failures(&doc), gates, "{mode}: {doc}");
+        assert_eq!(failed(&doc), gates, "{mode}: {doc}");
         assert_eq!(doc["status"], "FAILED", "{mode}");
     }
 }
@@ -301,11 +297,7 @@ fn a_build_that_never_ends_is_killed_and_the_run_is_red() {
     args.concurrency = 1;
     assert_eq!(run(&args).expect("a run"), Ended::Failed);
     let doc = document(&args);
-    assert_eq!(
-        other_failures(&doc),
-        ["builds_failed", "actions_failed"],
-        "{doc}"
-    );
+    assert_eq!(failed(&doc), ["builds_failed", "actions_failed"], "{doc}");
     assert_eq!(verdict(&doc, "clean_stop"), "PASS");
 }
 
@@ -348,9 +340,9 @@ fn a_kill_that_never_returns_is_given_up_on_at_the_end_of_a_loop() {
     let mut args = b0("kill-hangs", "kill-hangs", 2);
     args.concurrency = 1;
     args.kill_timeout = Duration::from_secs(1);
-    assert_eq!(run(&args).expect("a run"), Ended::Failed);
+    assert_eq!(run(&args).expect("a run"), Ended::Passed);
     let doc = document(&args);
-    assert_eq!(other_failures(&doc), Vec::<String>::new(), "{doc}");
+    assert_eq!(failed(&doc), Vec::<String>::new(), "{doc}");
     assert!(!kill_survived(&args), "the kill ran to its end");
 }
 
@@ -473,13 +465,13 @@ fn a_required_envoy_that_is_absent_fails_the_run() {
 #[test]
 fn an_absent_envoy_is_recorded_when_it_is_not_required() {
     let args = b0("no-envoy-ok", "ok", 3);
-    assert_eq!(run(&args).expect("a run"), Ended::Failed);
+    assert_eq!(run(&args).expect("a run"), Ended::Passed);
     let doc = document(&args);
     assert_eq!(
         doc["runtime"]["envoy"],
         "absent: KBF_TEST_NO_SUCH_ENVOY is not set"
     );
-    assert_eq!(other_failures(&doc), Vec::<String>::new(), "{doc}");
+    assert_eq!(failed(&doc), Vec::<String>::new(), "{doc}");
 }
 
 /// Catches: a farm that cannot start (a `kbf` that exits at once) being reported as a pass,

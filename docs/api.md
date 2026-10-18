@@ -463,6 +463,13 @@ families: the REAPI listener (clients) and the worker listener (daemons' uploads
 outputs and reads of inputs). The counts are in memory and start at 0 with the
 process.
 
+A storage node (`kbf storage`, and the storage half of `kbf storage-and-daemon`) has no
+operator API and serves this one route, plain HTTP, on `--metrics-listen <addr>`
+(off unless given; the same open read as above, so bind it where only operators do). It
+answers the families of its own cache, among them `kbf_cache_lost_blobs` and
+`kbf_cache_blob_losses_total`, the node's TLS reloads, and, in
+`kbf storage-and-daemon`, the one cache's fill.
+
 Each request family counts from the start of its handler to its answer. A call whose
 caller goes away before the answer counts as an error.
 

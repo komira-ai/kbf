@@ -14,13 +14,11 @@
 //! The gate that is never seen red is not a gate, so the scenario carries two mutants
 //! ([`Mutant`]), each a way to make the farm worse that the gates must catch.
 //!
-//! **Known limit.** The two lost-blob gates (`lost_blobs_gauge`, `blob_losses`) read series
-//! that no process of a farm of `kbf` processes exports today: `kbf_cache_lost_blobs` and
-//! `kbf_cache_blob_losses_total` are written by a process that holds a cache (the
-//! all-in-one server does), the frontend holds none, and a storage node, which does, has no
-//! operator API to serve `/metrics` on. A gate fails closed on an absent series, so B0 is
-//! red on those two until storage nodes export them; every other gate is measured. Reading
-//! each storage node's metrics as well as the frontend's is the change that follows.
+//! **The lost-blob gates** (`lost_blobs_gauge`, `blob_losses`) read `kbf_cache_lost_blobs`
+//! and `kbf_cache_blob_losses_total`, which a process that holds a cache writes: the
+//! frontend holds none, so they are read from each storage node's `/metrics`
+//! (`--metrics-listen`), summed over the nodes; a node that does not answer, or whose
+//! scrapes lack a series, fails them.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -305,6 +303,16 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
         args.scrape_every,
         &scrape::series_file(logs),
     );
+    let node_scrapers: Vec<(String, Scraper)> = farm
+        .metrics_ports()
+        .iter()
+        .enumerate()
+        .map(|(i, port)| {
+            let name = crate::farm::node_id(i + 1);
+            let file = scrape::node_series_file(logs, &name);
+            (name, Scraper::start(*port, args.scrape_every, &file))
+        })
+        .collect();
     let load_started = now();
     let load = Load::start(&cfg);
     let mut exited: Vec<(String, String)> = Vec::new();
@@ -346,6 +354,10 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
     // Alive is not whole: a node that lost its place in the farm keeps running.
     let farm_whole = farm.whole();
     let scrapes = scraper.stop();
+    let node_scrapes: Vec<(String, scrape::Scrapes)> = node_scrapers
+        .into_iter()
+        .map(|(name, scraper)| (name, scraper.stop()))
+        .collect();
     let stop_started = now();
     let stopped = stop_farm(&mut farm, &mut exited);
     let stop_finished = now();
@@ -386,6 +398,7 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
     let evidence = Evidence {
         builds: &builds,
         scrapes: &scrapes,
+        nodes: &node_scrapes,
         exited_during_load: &exited,
         farm_whole: &farm_whole,
         stopped: &stopped,

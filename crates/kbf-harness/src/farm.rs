@@ -228,6 +228,9 @@ pub struct Farm {
     /// The image the actions name: what the stand-in `podman` serves.
     image: String,
     storage_nodes: usize,
+    /// The port of each storage node's `/metrics` (`--metrics-listen`, on loopback), node 1
+    /// first.
+    metrics_ports: Vec<u16>,
     /// The ids the frontend must list as connected, sorted.
     node_ids: Vec<String>,
     /// Envoy's ports, when it runs.
@@ -380,8 +383,8 @@ impl Farm {
         );
         let uid = rustix::process::getuid().as_raw();
         let nodes = topo.storage_nodes;
-        let p = ports(nodes + 1);
-        let (storage, spare) = (&p[..nodes], p[nodes]);
+        let p = ports(2 * nodes + 1);
+        let (storage, spare, metrics) = (&p[..nodes], p[nodes], &p[nodes + 1..]);
         let box_ports = topo.envoy.is_some().then(|| {
             let p = ports(3);
             BoxPorts {
@@ -422,6 +425,7 @@ impl Farm {
             ca: Vec::new(),
             image: String::new(),
             storage_nodes: nodes,
+            metrics_ports: metrics.to_vec(),
             node_ids,
             envoy_ports: None,
             hang: HANG,
@@ -527,7 +531,10 @@ impl Farm {
                 NodeMode::Storage => Mode::Storage,
                 NodeMode::StorageAndDaemon => Mode::StorageAndDaemon,
             };
-            let unit = rendered(&cfg, uid, mode).replace(&[cold]);
+            // No unit renders `--metrics-listen`: the storage node's route for the
+            // scraper, on a port of the harness's own.
+            let scrape = format!("--metrics-listen=127.0.0.1:{}", metrics[i]);
+            let unit = rendered(&cfg, uid, mode).replace(&[cold]).append(&[scrape]);
             let unit = if native {
                 // The `kbf storage` unit renders no registration flags (only the
                 // storage-and-daemon unit does), so a storage node of it is a farm of one
@@ -594,6 +601,7 @@ impl Farm {
             ca: Vec::new(),
             image: String::new(),
             storage_nodes: 0,
+            metrics_ports: Vec::new(),
             node_ids: Vec::new(),
             envoy_ports: None,
             hang: HANG,
@@ -920,6 +928,12 @@ impl Farm {
     #[must_use]
     pub fn storage_nodes(&self) -> usize {
         self.storage_nodes
+    }
+
+    /// The port of each storage node's `/metrics` on loopback, node 1 first.
+    #[must_use]
+    pub fn metrics_ports(&self) -> &[u16] {
+        &self.metrics_ports
     }
 
     /// The ids the frontend lists as connected when the farm is whole, sorted.

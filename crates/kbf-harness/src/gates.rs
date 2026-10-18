@@ -59,6 +59,9 @@ pub struct BuildResult {
 pub struct Evidence<'a> {
     pub builds: &'a [BuildResult],
     pub scrapes: &'a Scrapes,
+    /// Each storage node's `/metrics`, by node name: the lost-blob series are the nodes',
+    /// the frontend holds no cache.
+    pub nodes: &'a [(String, Scrapes)],
     /// Roles that ended during the load without being ended: role and how.
     pub exited_during_load: &'a [(String, String)],
     /// Roles' ends when the farm was stopped: role and how (`exit 0` is clean).
@@ -148,6 +151,50 @@ impl Evidence<'_> {
         }
     }
 
+    /// A gate on how a series of the storage nodes moved over the run: `reduce` of each
+    /// node's scrapes, summed over the nodes. Fails closed on no node at all, and on a
+    /// node whose series is absent from any of its scrapes, whatever the others read.
+    fn nodes_gate(
+        &self,
+        name: &str,
+        metric: &str,
+        threshold: &str,
+        reduce: impl Fn(&[f64]) -> f64,
+    ) -> Gate {
+        let reads: Vec<(&str, Result<Vec<f64>, String>)> = self
+            .nodes
+            .iter()
+            .map(|(node, scrapes)| (node.as_str(), series(scrapes, metric)))
+            .collect();
+        let why: Vec<String> = reads
+            .iter()
+            .filter_map(|(node, read)| read.as_ref().err().map(|e| format!("{node}: {e}")))
+            .collect();
+        if reads.is_empty() || !why.is_empty() {
+            let why = if reads.is_empty() {
+                "no storage node was scraped".to_owned()
+            } else {
+                why.join("; ")
+            };
+            return self.row(name, Value::Null, threshold, false, Some(why));
+        }
+        let measured: f64 = reads
+            .iter()
+            .filter_map(|(_, read)| read.as_ref().ok())
+            .map(|values| reduce(values))
+            .sum();
+        self.row(
+            name,
+            json!(measured),
+            threshold,
+            measured == 0.0,
+            Some(format!(
+                "{metric} summed over {} storage nodes",
+                reads.len()
+            )),
+        )
+    }
+
     /// Every gate, in the order of the design.
     #[must_use]
     pub fn gates(&self) -> Vec<Gate> {
@@ -207,15 +254,18 @@ impl Evidence<'_> {
             self.series_gate("execute_errors", EXECUTE_ERRORS, "delta 0", |v| {
                 v[v.len() - 1] - v[0]
             }),
-            self.series_gate(
+            self.nodes_gate(
                 "lost_blobs_gauge",
                 LOST_BLOBS,
-                "max 0 in every scrape",
+                "max 0 in every scrape of every storage node",
                 |v| v.iter().copied().fold(f64::MIN, f64::max),
             ),
-            self.series_gate("blob_losses", BLOB_LOSSES, "delta 0", |v| {
-                v[v.len() - 1] - v[0]
-            }),
+            self.nodes_gate(
+                "blob_losses",
+                BLOB_LOSSES,
+                "delta 0 on every storage node",
+                |v| v[v.len() - 1] - v[0],
+            ),
             self.row(
                 "scrape_coverage",
                 json!(coverage),

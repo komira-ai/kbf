@@ -264,9 +264,10 @@ the design did not know:
   nodes with the frontend itself and not through Envoy: a node serves nothing until it has registered, the frontend is not
   ready until a node serves, and Envoy (panic threshold 0) sends nothing to an unready frontend, so through Envoy no node
   can register at a cold start.
-- No process of a farm exports `kbf_cache_lost_blobs` or `kbf_cache_blob_losses_total`: the frontend holds no cache, and a
-  storage node, which does, serves no `/metrics`. The two loss gates fail closed on an absent series, so B0 is red until
-  storage nodes export them (the frontend's series, `kbf_execute_errors_total` among them, are read).
+- The frontend holds no cache, so `kbf_cache_lost_blobs` and `kbf_cache_blob_losses_total` are the storage nodes': a
+  storage node serves `/metrics` on `--metrics-listen` (plain HTTP, off unless given; no unit renders it, so the harness
+  adds it on a port of its own). B0 scrapes each node as well as the frontend, and the two loss gates sum the nodes and
+  fail closed when any node's series is absent or the node does not answer.
 - Buck2 reads the remote execution client's address and CA when its daemon starts and ignores them on a command line, and
   refuses a `grpcs://` address: the harness appends them to the copy of the project's `.buckconfig`.
 
