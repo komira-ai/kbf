@@ -57,6 +57,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# A connector that fails its first lookups, under a lazy channel (tests/storage_register.rs).
+hyper-util = { workspace = true, features = ["tokio"] }
 # A test certificate's public-key hash and names, read independently of kbf-peer.
 x509-parser.workspace = true
 # The connector of the TLS reload tests' client attempts, which dials once (tests/tls_reload.rs).

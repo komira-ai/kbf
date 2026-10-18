@@ -18,8 +18,8 @@
 //! - `continuation`: no comment line inside a continued directive. systemd 241 and
 //!   later skip one (systemd.syntax(7)); 240 skips one only at the start of the line,
 //!   and 239 and older join it into the value, so its words become arguments.
-//! - `runtime`: a mode that runs builds passes `--container-runtime=oci` and
-//!   `--oci-runtime=`, and no file of its unit names Podman ([`super::runtime`]).
+//! - `runtime`: a mode that runs builds passes `--oci-runtime=` and no
+//!   `--container-runtime` ([`super::runtime`]).
 //! - `exec`: `ExecStart=` is `<KBF_BIN_DIR>/kbf <mode>`, this unit's mode (a unit
 //!   that starts another mode, or an old binary, under this mode's name).
 //! - `slice`: the unit is in `kbf.slice`.
@@ -150,13 +150,17 @@ impl Mode {
         }
     }
 
-    /// Whether the mode is a node unit (rule `restart`): `storage`, `daemon` and
-    /// `storage-and-daemon` retry a repeating failure for as long as it lasts. The
-    /// frontend and `all-in-one` (which runs one) keep their own restart policy: an old
-    /// frontend that drained after a handover exits 0 and stays down.
+    /// Whether the mode's unit retries a repeating failure for as long as it lasts (rule
+    /// `restart`): `storage`, `daemon`, `storage-and-daemon` and `all-in-one`, whose
+    /// starts can fail with exit 75 until the environment is ready. The frontend keeps
+    /// its own policy. (`Restart=on-failure` never restarts a clean exit, so an old
+    /// process that drained after a handover and exited 0 stays down either way.)
     #[must_use]
     pub fn is_node(self) -> bool {
-        matches!(self, Mode::Storage | Mode::Daemon | Mode::StorageAndDaemon)
+        matches!(
+            self,
+            Mode::Storage | Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne
+        )
     }
 
     /// Whether the mode runs builds, and so manages its own cgroup (rule `delegate`).
@@ -661,12 +665,7 @@ fn rules(
 
     // runtime
     if mode.runs_builds() {
-        let texts: Vec<(&str, &str)> = files
-            .files
-            .iter()
-            .map(|(name, text)| (name.as_str(), text.as_str()))
-            .collect();
-        for how in runtime::check(&name, unit, &texts) {
+        for how in runtime::check(&name, unit) {
             fail("runtime", how);
         }
     }

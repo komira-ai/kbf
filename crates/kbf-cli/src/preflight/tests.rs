@@ -232,7 +232,6 @@ fn daemon_needs() -> Needs {
             node_id: Some("node-1".to_owned()),
         }],
         s3: false,
-        meta_and_data: None,
         container: Some(ContainerNeed {
             oci_runtime: PathBuf::from(CRUN),
         }),
@@ -716,7 +715,6 @@ fn s3_needs() -> Needs {
         files: vec![],
         certs: vec![],
         s3: true,
-        meta_and_data: None,
         container: None,
     }
 }
@@ -754,34 +752,6 @@ fn no_s3_cold_store_needs_no_key_pair() {
     let mut needs = s3_needs();
     needs.s3 = false;
     assert_eq!(check(&needs, &Fake::empty()), Report::default());
-}
-
-fn meta_needs(meta: &str, data: &str) -> Needs {
-    let mut needs = s3_needs();
-    needs.s3 = false;
-    needs.meta_and_data = Some((PathBuf::from(meta), PathBuf::from(data)));
-    needs
-}
-
-#[test]
-fn a_meta_dir_inside_the_data_dir_is_refused() {
-    for meta in ["/var/lib/kbf/meta", "/var/lib/kbf", "/var/lib/kbf/a/b"] {
-        let report = check(&meta_needs(meta, "/var/lib/kbf"), &Fake::empty());
-        only(
-            &report,
-            Class::Refused,
-            &["--meta-dir", meta, "--data-dir /var/lib/kbf"],
-        );
-    }
-}
-
-#[test]
-fn a_meta_dir_beside_the_data_dir_passes() {
-    // A shared name prefix is not a shared directory.
-    for meta in ["/var/lib/kbf-meta", "/srv/meta", "/var/lib"] {
-        let report = check(&meta_needs(meta, "/var/lib/kbf"), &Fake::empty());
-        assert_eq!(report, Report::default(), "{meta}");
-    }
 }
 
 fn container_needs() -> Needs {
@@ -953,16 +923,12 @@ fn s3_needs_without_s3() -> Needs {
 fn every_failure_is_reported_together_one_line_each_and_the_start_is_refused() {
     let (mut needs, host) = healthy();
     needs.s3 = true;
-    needs.meta_and_data = Some((
-        PathBuf::from("/var/lib/kbf/meta"),
-        PathBuf::from("/var/lib/kbf"),
-    ));
     let host = host.chmod(KEY, ME, 0o644).without(CA).without(CRUN);
     let report = check(&needs, &host);
     let text = report.render("daemon");
-    // The CA file, the key's mode, the S3 pair (2), the meta dir, crun.
-    assert_eq!(report.problems.len(), 6, "{text}");
-    assert_eq!(text.lines().count(), 6, "{text}");
+    // The CA file, the key's mode, the S3 pair (2), crun.
+    assert_eq!(report.problems.len(), 5, "{text}");
+    assert_eq!(text.lines().count(), 5, "{text}");
     for line in text.lines() {
         assert!(line.starts_with("kbf daemon: "), "{line}");
     }
@@ -971,7 +937,6 @@ fn every_failure_is_reported_together_one_line_each_and_the_start_is_refused() {
         "0644",
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
-        "--meta-dir",
         CRUN,
     ] {
         assert!(text.contains(word), "{word} not in {text}");
@@ -1065,14 +1030,13 @@ mod wiring {
             .unwrap_or_else(|| panic!("no certificate {flag} in {:?}", n.certs))
     }
 
-    const DAEMON: [&str; 9] = [
+    const DAEMON: [&str; 8] = [
         "--server=https://front:7070",
         "--ca-cert=/c/ca.pem",
         "--cert=/c/node.pem",
         "--key=/c/node.key",
         "--node-id=node-1",
         "--driver=container",
-        "--container-runtime=oci",
         "--oci-runtime=/opt/crun",
         "--data-dir=/var/lib/kbf",
     ];
@@ -1102,7 +1066,7 @@ mod wiring {
             n.container.expect("container").oci_runtime,
             PathBuf::from("/opt/crun")
         );
-        assert!(!n.s3 && n.meta_and_data.is_none());
+        assert!(!n.s3);
     }
 
     #[test]
@@ -1148,7 +1112,7 @@ mod wiring {
                 .any(|f| f.flag == "--storage-tls-key" && f.secret)
         );
         assert!(n.s3);
-        assert!(n.container.is_none() && n.meta_and_data.is_none());
+        assert!(n.container.is_none());
     }
 
     #[test]
@@ -1167,19 +1131,33 @@ mod wiring {
     }
 
     #[test]
-    fn storage_and_daemon_needs_both_halves_and_compares_the_meta_dir_with_the_data_dir() {
+    fn storage_and_daemon_needs_both_halves() {
         let n = with("storage-and-daemon", &STORAGE, &DAEMON);
         assert_eq!(cert(&n, "--storage-tls-cert").row, Row::Storage);
         assert_eq!(cert(&n, "--cert").row, Row::Daemon);
         assert!(n.s3);
         assert!(n.container.is_some());
-        assert_eq!(
-            n.meta_and_data,
-            Some((
-                PathBuf::from("/var/lib/kbf/meta"),
-                PathBuf::from("/var/lib/kbf")
-            ))
-        );
+    }
+
+    /// Catches the preflight refusing the layout `kbf-deploy install-units` renders for a
+    /// test-farm node: one data root, the metadata log under it. `kbf-deploy` compares the
+    /// two only for the separate server unit, whose log is another process's.
+    #[test]
+    fn a_storage_and_daemon_node_with_its_meta_dir_under_its_data_dir_passes() {
+        let storage: Vec<&str> = STORAGE
+            .iter()
+            .map(|a| {
+                if a.starts_with("--meta-dir=") {
+                    "--meta-dir=/var/lib/kbf/av2-meta"
+                } else {
+                    *a
+                }
+            })
+            .collect();
+        let n = with("storage-and-daemon", &storage, &DAEMON);
+        let report = super::super::check(&n, &super::Fake::empty());
+        let text = report.render(n.mode);
+        assert!(!text.contains("--meta-dir"), "{text}");
     }
 
     #[test]
@@ -1244,7 +1222,7 @@ mod wiring {
     }
 
     #[test]
-    fn all_in_one_compares_its_meta_dir_with_the_data_dir_and_needs_the_auth_policy() {
+    fn all_in_one_needs_the_auth_policy() {
         let n = with(
             "all-in-one",
             &DAEMON,
@@ -1254,13 +1232,6 @@ mod wiring {
             ],
         );
         assert_eq!(n.mode, "all-in-one");
-        assert_eq!(
-            n.meta_and_data,
-            Some((
-                PathBuf::from("/var/lib/kbf/meta"),
-                PathBuf::from("/var/lib/kbf")
-            ))
-        );
         assert!(
             n.files
                 .iter()

@@ -33,6 +33,7 @@ kbf-guest                15      6
 kbf-history               0      0
 kbf-host                  0      0
 kbf-image                 0      0
+kbf-installer             0      0
 kbf-invocation            0      0
 kbf-it                    2      1
 kbf-log                   3      0
@@ -44,7 +45,7 @@ kbf-mdm                   0      0
 kbf-mdm-api               0      0
 kbf-meta                  7      1
 kbf-node                  0      0
-kbf-objstore             59     19
+kbf-objstore             51     18
 kbf-outputs               0      0
 kbf-peer                  0      0
 kbf-proto                 0      0
@@ -53,6 +54,7 @@ kbf-route                 0      0
 kbf-sched                 1      1
 kbf-segments              7      5
 kbf-server                0      0
+kbf-signer                0      0
 kbf-sim                   6      3
 kbf-sim-cell              4     12
 kbf-state                 2     13
@@ -65,6 +67,7 @@ kbf-tls                   0      0
 kbf-transfer              0      0
 kbf-types                 3      2
 kbf-ui                    0      0
+kbf-update                0      0
 kbf-updater               0      0
 kbf-vmm                   0      0
 xtask                     0      0

@@ -17,6 +17,9 @@
 //! - `package --binary <path> --sbom <path> --platform <platform> --commit <sha> --out
 //!   <dir>` ([`package`]): one binary as a release asset, a tarball that is the same
 //!   bytes on every runner, and its SBOM, with their lines in `SHA256SUMS.<platform>`.
+//! - `pkg-config`, `pkg-build`, `pkg-install-test` ([`pkg_linux`], [`pkg_install`]): the
+//!   `kbf-installer` deb and rpm: the nfpm configuration from the inputs, the packages
+//!   built twice to prove the bytes, and an install, remove and purge in a container.
 //! - `pkg build --binary <path> --launchd-plist <path> [--trust <path>]... --version <v>
 //!   --out <dir>` and `pkg cask` ([`pkg`]): kbf-installer for a Mac, a `.pkg` that is
 //!   the same bytes on every host and installs a root-owned tree and a LaunchDaemon that
@@ -33,9 +36,9 @@
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
-//! - `podman-tests [--sudo <path>]` ([`podman_tests`]): the container driver's real-`crun`
+//! - `crun-tests [--sudo <path>]` ([`crun_tests`]): the container driver's real-`crun`
 //!   tests on a hosted Linux runner, each test target in its own `Delegate=yes` system
-//!   unit (the name stays until the workflows that call it are renamed).
+//!   unit.
 //! - `sudo-test -p <package> --test <name> [--sudo <path>] [-- <test args>]`
 //!   ([`sudo_test`]): one integration test target built as this user, then its
 //!   `#[ignore]` tests run as root through `sudo -n`.
@@ -52,12 +55,14 @@ use clap::{Parser, Subcommand};
 pub mod budget;
 pub mod build_commit;
 pub mod bundles;
+pub mod crun_tests;
 pub mod darwin;
 pub mod entitlements;
 pub mod fetch;
 pub mod package;
 pub mod pkg;
-pub mod podman_tests;
+pub mod pkg_install;
+pub mod pkg_linux;
 pub mod release;
 pub mod sudo_test;
 pub mod sums;
@@ -132,8 +137,8 @@ enum Verb {
         /// How the download is packed (default: it is the file).
         #[arg(long, value_enum)]
         extract: Option<fetch::Format>,
-        /// The file to take out of a tar (`--extract tar.gz` or `tar.xz`): its path
-        /// inside the archive.
+        /// The file to take out of a tar or zip (`--extract tar.gz`, `tar.xz` or `zip`): its
+        /// path inside the archive.
         #[arg(long)]
         member: Option<PathBuf>,
     },
@@ -154,6 +159,69 @@ enum Verb {
         /// The directory the assets go in; created when missing.
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Write the nfpm configuration and the file listing of the kbf-installer packages.
+    PkgConfig {
+        /// The kbf-installer binary.
+        #[arg(long)]
+        binary: PathBuf,
+        /// The directory of `kbf-*.service` files.
+        #[arg(long)]
+        units: PathBuf,
+        /// The directory of the three trust files.
+        #[arg(long)]
+        trust: PathBuf,
+        /// The sysusers.d file.
+        #[arg(long)]
+        sysusers: PathBuf,
+        /// The tmpfiles.d file.
+        #[arg(long)]
+        tmpfiles: PathBuf,
+        /// The platform the binary was built for (`linux-x86_64`, `linux-arm64`).
+        #[arg(long, value_enum)]
+        platform: package::Platform,
+        /// The package version.
+        #[arg(long)]
+        version: String,
+        /// The directory `nfpm.yaml` and `listing.txt` go in; created when missing.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Build the deb and the rpm with nfpm, and prove a second build is the same bytes.
+    PkgBuild {
+        /// The pinned nfpm program.
+        #[arg(long)]
+        nfpm: PathBuf,
+        /// The `nfpm.yaml` of `pkg-config`.
+        #[arg(long)]
+        config: PathBuf,
+        /// The directory the packages go in; created when missing.
+        #[arg(long)]
+        out: PathBuf,
+        /// The time the packages carry, in seconds since the epoch.
+        #[arg(long, default_value_t = pkg_linux::SOURCE_DATE_EPOCH)]
+        source_date_epoch: u64,
+    },
+    /// Install a package into a fresh container and check it never starts or enables.
+    PkgInstallTest {
+        /// The package.
+        #[arg(long)]
+        package: PathBuf,
+        /// Its format.
+        #[arg(long, value_enum)]
+        format: pkg_install::Format,
+        /// The `listing.txt` of `pkg-config`.
+        #[arg(long)]
+        listing: PathBuf,
+        /// The directory holding the Dockerfile of the container.
+        #[arg(long)]
+        image_dir: PathBuf,
+        /// A packaged unit and the file it needs to start: `<unit>=<file>`.
+        #[arg(long)]
+        gate: Vec<pkg_install::Gate>,
+        /// The docker program.
+        #[arg(long, default_value = "docker")]
+        docker: PathBuf,
     },
     /// kbf-installer for a Mac: its `.pkg`, and the Homebrew cask.
     #[command(subcommand)]
@@ -183,7 +251,7 @@ enum Verb {
     Release(ReleaseVerb),
     /// Run the container driver's real-crun tests on a hosted Linux runner, each
     /// test target in its own Delegate=yes system unit as this user.
-    PodmanTests {
+    CrunTests {
         /// The sudo program; it is run with `-n`, so it never prompts.
         #[arg(long, default_value = "sudo")]
         sudo: PathBuf,
@@ -460,7 +528,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             test: &test,
             args: &args,
         }),
-        Verb::PodmanTests { sudo } => podman_tests::run(&podman_tests::PodmanTests {
+        Verb::CrunTests { sudo } => crun_tests::run(&crun_tests::CrunTests {
             cargo: &cargo_program(),
             sudo: &sudo,
             root: &root,
@@ -484,6 +552,58 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             commit,
             out,
         } => package::package(&binary, &sbom, platform, &commit, &out),
+        Verb::PkgConfig {
+            binary,
+            units,
+            trust,
+            sysusers,
+            tmpfiles,
+            platform,
+            version,
+            out,
+        } => pkg_linux::write_config(
+            &pkg_linux::Inputs {
+                binary: &binary,
+                units: &units,
+                trust: &trust,
+                sysusers: &sysusers,
+                tmpfiles: &tmpfiles,
+                platform,
+                version: &version,
+            },
+            &out,
+        ),
+        Verb::PkgBuild {
+            nfpm,
+            config,
+            out,
+            source_date_epoch,
+        } => pkg_linux::build(
+            &mut pkg_linux::nfpm_process(&nfpm),
+            &pkg_linux::Build {
+                config: &config,
+                out: &out,
+                epoch: source_date_epoch,
+            },
+        ),
+        Verb::PkgInstallTest {
+            package,
+            format,
+            listing,
+            image_dir,
+            gate,
+            docker,
+        } => pkg_install::run(
+            &mut pkg_install::process(&docker),
+            &pkg_install::InstallTest {
+                package: &package,
+                format,
+                listing: &listing,
+                image_dir: &image_dir,
+                gates: &gate,
+                container: &format!("kbf-pkg-test-{}", std::process::id()),
+            },
+        ),
         Verb::Pkg(PkgVerb::Build {
             binary,
             launchd_plist,

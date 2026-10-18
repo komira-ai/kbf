@@ -50,8 +50,6 @@ use kbf_daemon::{
     Args, Capacity, DAEMON_VERSION, Daemon, DaemonConfig, DriverWatch, FakeRuntime, FarmCas,
     Liveness, MapHolder, NodeReport, Runtime, Runtimes,
 };
-#[cfg(target_os = "linux")]
-use kbf_driver_container::ContainerRuntime;
 use kbf_driver_native::slots::Pool;
 use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode, xcode_watch};
 use kbf_outputs::OutputLimits;
@@ -127,6 +125,12 @@ pub struct Cli {
     /// one connection, within the `--transfer-*` limits.
     #[arg(long)]
     cas: Option<String>,
+    /// The update directory: the daemon fetches the release the frontend offers into
+    /// its `inbox/`, over the connection `--cas` names, and reads the root helper's
+    /// `status.json` there. Left out, the node updates by hand: it says so and touches
+    /// no directory. Not taken by the all-in-one binary yet.
+    #[arg(long, value_name = "DIR")]
+    update_dir: Option<PathBuf>,
     #[command(flatten)]
     data: data_dir::DataArgs,
     #[command(flatten)]
@@ -257,22 +261,6 @@ pub struct Cli {
     /// name another image.
     #[arg(long = "image", value_name = "IMAGE")]
     images: Vec<String>,
-    /// The runtime that runs each action's container (container): `oci`, the only one and
-    /// the default, runs each action in a fresh rootless sandbox through `--oci-runtime`
-    /// (`crun`) directly. Podman is not supported. It needs the daemon user's
-    /// subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on
-    /// `PATH`, and every directory down to `--data-dir` searchable by others.
-    #[cfg(target_os = "linux")]
-    #[arg(long, default_value = "oci", value_name = "oci")]
-    container_runtime: ContainerRuntime,
-    /// The runtime that runs each action's container (container): `oci`, the only one and
-    /// the default, runs each action in a fresh rootless sandbox through `--oci-runtime`
-    /// (`crun`) directly. Podman is not supported. It needs the daemon user's
-    /// subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on
-    /// `PATH`, and every directory down to `--data-dir` searchable by others.
-    #[cfg(not(target_os = "linux"))]
-    #[arg(long, default_value = "oci", value_name = "oci")]
-    container_runtime: String,
     /// Where each lease runs among the node's CPUs (container, Linux): `none`, the
     /// default, lets a lease use any CPU the daemon may; `numa-node` puts each lease on
     /// one NUMA node, its CPUs (`cpuset.cpus`) and memory (`cpuset.mems`), the node with
@@ -287,7 +275,10 @@ pub struct Cli {
     /// Where the kernel lists NUMA nodes (container). For tests of the placement only.
     #[arg(long, hide = true, default_value = "/sys/devices/system/node")]
     numa_dir: PathBuf,
-    /// The OCI runtime that runs actions (container): `crun`.
+    /// The OCI runtime that runs each action's container (container): `crun`, run
+    /// directly. Each action gets a fresh rootless sandbox. It needs the daemon user's
+    /// subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on
+    /// `PATH`, and every directory down to `--data-dir` searchable by others.
     #[arg(long, default_value = "/usr/bin/crun")]
     oci_runtime: PathBuf,
     /// A directory holding `passwd`, `subuid` and `subgid` that the container
@@ -404,8 +395,8 @@ pub fn dispatch_helpers() -> Option<ExitCode> {
     if let Some(code) = kbf_driver_native::slots::dispatch() {
         return Some(code);
     }
-    // So is the container driver's `__chown-dirs` helper, which it runs inside Podman's
-    // user namespace with the input cache.
+    // So is the container driver's `__chown-dirs` helper, which it runs in a helper
+    // container.
     #[cfg(target_os = "linux")]
     if let Some(code) = kbf_driver_container::chown_dirs::dispatch() {
         return Some(ExitCode::from(code));
@@ -535,6 +526,16 @@ fn start_over<C: Cas>(
         // The CAS channel is made lazily, which needs the runtime's context.
         let _context = tokio.enter();
         let xcrun = Path::new(xcode::XCRUN);
+        // The update client is the frontend's daemon's alone: the in-process daemon of
+        // the all-in-one binary keeps none (its flags may not name one, so that none is
+        // silently ignored).
+        let update = match &maps {
+            Some(_) => Some(update::link(cli)?),
+            None if cli.update_dir.is_some() => {
+                return Err("--update-dir is not taken by the in-process daemon yet".into());
+            }
+            None => None,
+        };
         let (daemon, _) = node_over(
             cli,
             || native_config(cli),
@@ -542,6 +543,7 @@ fn start_over<C: Cas>(
             maps,
             Box::new(move |cli| plane(cli, liveness)),
         )?;
+        let daemon = update.into_iter().fold(daemon, Daemon::with_update);
         backstop(cli, daemon)
     };
     Ok(NodeHandle { tokio, daemon })
@@ -950,8 +952,8 @@ mod container {
     use std::time::Duration;
 
     use kbf_driver_container::{
-        ContainerLimits, IdFiles, ImageRef, LeasePlacement, OutputLimits, PodmanConfig,
-        PodmanRuntime, SwapKill,
+        ContainerConfig, ContainerLimits, ContainerRuntime, IdFiles, ImageRef, LeasePlacement,
+        OutputLimits, SwapKill,
     };
 
     use super::{Cli, Error, ImageUnusable, Node, scratch};
@@ -1030,9 +1032,8 @@ mod container {
                 kbf_driver_container::numa::start(&cli.numa_dir, mount, &parent, whole_host)?
             }
         };
-        let mut config = PodmanConfig::new(scratch, parent, cli.daemon.node_id.clone());
+        let mut config = ContainerConfig::new(scratch, parent);
         config.placer = placer;
-        config.container_runtime = cli.container_runtime;
         config.oci.runtime = cli.oci_runtime.clone();
         config.oci.id_files = files;
         config.cgroup_root = mount.clone();
@@ -1047,7 +1048,7 @@ mod container {
         config.limits = limits(cli);
         config.swap_kill = swap_kill(cli);
         config.cache = crate::data_dir::given(plan.as_ref(), &cli.data);
-        let runtime = PodmanRuntime::new(config, cas)?;
+        let runtime = ContainerRuntime::new(config, cas)?;
         // From `start`, in the runtime's context but outside any task.
         tokio::runtime::Handle::current().block_on(check_images(&runtime, &cli.images))?;
         node.add(Arc::new(runtime))?;
@@ -1059,7 +1060,7 @@ mod container {
     /// node's image store, one architecture's manifest. The first that is not stops the
     /// start, with its fix.
     async fn check_images<C: Cas>(
-        runtime: &PodmanRuntime<C>,
+        runtime: &ContainerRuntime<C>,
         images: &[String],
     ) -> Result<(), ImageUnusable> {
         for value in images {
@@ -1116,6 +1117,7 @@ mod data_dir;
 mod instance;
 mod run;
 mod transfer;
+mod update;
 mod whole_machine;
 
 #[cfg(test)]
@@ -1854,6 +1856,60 @@ mod tests {
         .expect("start");
         drop(handle);
         assert_eq!(*seen.lock().expect("lock"), Some(asked()));
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
+    /// The plane factory the update-dir test hands `start_over` three times: one function
+    /// item, so the three starts are one instantiation (the coverage ratchet counts the
+    /// best instantiation, which must run every arm of the match on the map and the flag).
+    fn plane(cli: &Cli, _: Liveness) -> Result<Arc<kbf_transfer::Transfers>, Error> {
+        remote(cli)
+    }
+
+    /// Catches a flag taken and ignored, and an update client left off: with a storage map
+    /// and `--update-dir` the daemon gets its update client; without a map (the in-process
+    /// daemon of the all-in-one binary) `--update-dir` is refused instead of silently doing
+    /// nothing; with neither, nothing is asked.
+    ///
+    /// Mutants seen red: the refusing arm dropped (the second start succeeds); the link
+    /// made whatever the flag says (the third start fails on the missing directory).
+    #[test]
+    fn the_update_dir_is_for_a_daemon_with_a_map_and_refused_without_one() {
+        let dir = scratch("update-dir");
+        tls_files(&dir);
+        let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
+        let base = vec![
+            "kbf-daemon".to_owned(),
+            "--server=https://127.0.0.1:1".to_owned(),
+            flag("ca-cert", &dir.join("ca.pem")),
+            flag("cert", &dir.join("node.pem")),
+            flag("key", &dir.join("node.key")),
+            "--node-id=mac-1".to_owned(),
+            "--driver=native".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
+            flag("data-dir", &dir),
+            flag("xcode-apps", &dir.join("Applications")),
+        ];
+        let mut asked = base.clone();
+        asked.push(flag("update-dir", &dir.join("update")));
+        let with_dir = Cli::try_parse_from(asked).expect("flags");
+        let base_flags = base.clone();
+        let without = Cli::try_parse_from(base).expect("flags");
+        let started = start_over(&with_dir, Some(Arc::new(MapHolder::new())), plane);
+        drop(started.expect("a daemon with a map takes an update directory"));
+        let why = start_over(&with_dir, None, plane).err().expect("refused");
+        assert!(
+            why.to_string().contains("--update-dir is not taken"),
+            "{why}"
+        );
+        drop(start_over(&without, None, plane).expect("no flag, no client"));
+        // The fourth start fails inside `node_over`: this instantiation also takes the
+        // error return of that call, so it is the one the ratchet counts as fully run.
+        let mut broken = base_flags.clone();
+        broken.push("--lease-placement=numa-node".to_owned());
+        let broken = Cli::try_parse_from(broken).expect("flags");
+        let why = start_over(&broken, None, plane).err().expect("refused");
+        assert!(why.to_string().contains("only --driver container"), "{why}");
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 

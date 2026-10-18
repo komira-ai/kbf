@@ -16,7 +16,9 @@
 //! `kbf-server`; the daemon half stops once the server half has, abandoning the leases
 //! still running, and the process exits 0. A server half that fails while serving stops
 //! the daemon too, and the process exits 1. A start the server half refuses exits 2; one
-//! the daemon half refuses exits as `kbf-daemon` would.
+//! that can pass on a later try (a directory the stopping process still holds) exits 75,
+//! `EX_TEMPFAIL` (`kbf_server::StartFailure`); one the daemon half refuses exits as
+//! `kbf-daemon` would.
 //!
 //! Linux only, the container driver only: elsewhere [`main`] exits 2 saying so.
 //!

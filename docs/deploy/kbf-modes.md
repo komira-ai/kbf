@@ -181,6 +181,75 @@ bucket, `a/b` or `a/b/`; a fresh prefix is a fresh cold store beside the old.
 `KBF_RESERVE_CPUS` (a whole number) and `KBF_LEASE_PLACEMENT` (`none` or `numa-node`) are
 left to kbf's defaults when empty.
 
+### A listen address that appears late
+
+`network-online.target` does not wait for a VPN or overlay interface, so a listen address
+on one (`KBF_LISTEN_ADDRESS`) can be missing for a few seconds after boot, and the bind
+fails with "address not available". kbf retries that one error, and only that one, for up
+to 90 seconds (250 ms, doubling to 2 s between attempts, each wait logged with the
+address), below the units' `TimeoutStartSec=120`; every other bind error (address in use,
+permission) is at once fatal. This covers every listener of `frontend`, `storage`,
+`storage-and-daemon` and `all-in-one`. To order a unit after the service that brings the
+address up (`tailscaled.service`, say), put `After=` and `Wants=` in a systemd drop-in on
+the host, `/etc/systemd/system/<unit>.d/after.conf`; kbf-deploy has no option for it.
+
+### A frontend name that does not resolve yet
+
+`KBF_FRONTEND_NAME` can be a name that a VPN or overlay network's resolver answers, and
+that resolver may start after `network-online.target`. A failed lookup at start does not end
+either half of `storage-and-daemon`: the storage half's channel to `--frontend` is lazy, so
+the lookup is part of its first registration, and a failed registration waits (1 s, doubling
+to 30 s, each wait cut by a random share of up to half, as the daemon's is, so nodes that lost
+one frontend do not return in step) and tries again until the frontend answers, before it opens its
+cache; the daemon half resolves `--server` at every connection round, reports a failed
+lookup as a failed attempt, waits and resolves again, and never stops trying. (`daemon`
+does the same.) A node that cannot find its frontend therefore stays up and logs each
+failure; it is not restarted by systemd, and needs no restart when the resolver comes up.
+To order the unit after the resolver's service anyway, so the first tries are not
+wasted, use a drop-in on the host (`/etc/systemd/system/<unit>.d/after.conf` with
+`After=tailscaled.service` and `Wants=tailscaled.service`, say).
+
+`storage` and `storage-and-daemon` units are not ordered after a MinIO unit: their cold
+store is an `s3://` endpoint that need not be on the host, and `After=` on a unit that
+does not exist does nothing. On a host with a local MinIO, order the unit after it in a drop-in
+(`/etc/systemd/system/<unit>.d/after.conf` with `After=` and `Wants=`). (The converged `kbf-server.service` still starts after `MINIO_UNIT`.)
+
+### Exit 2 and exit 75: what systemd restarts
+
+A start that fails exits 2 or 75. The `storage`, `storage-and-daemon` and `all-in-one`
+units carry `RestartPreventExitStatus=2` and `RestartSec=5`, so exit 2 stays down and exit 75
+(`EX_TEMPFAIL`) is started again five seconds later, below systemd's default start limit
+(five starts in ten seconds).
+
+- **Exit 2, refused.** The default for any failure kbf does not name below: a flag, a
+  certificate or key path that cannot be read, a metadata directory that is not a log, a
+  log of several voters, a path or permission that is wrong. A restart reads the same
+  bytes and fails the same way.
+- **Exit 75, not ready.** Named by the failure's type, never by its text: the metadata
+  or cold-store directory held by a process that is still stopping (its `LOCK`), a file
+  system call that failed because the device was busy, read-only or full, and a
+  registration whose boot the node's metadata log has set already (`StaleWriter`, below).
+  A frontend or daemon that fails to start is not covered: `frontend` and `kbf-server`
+  exit 2 for every start error, and the daemon half's own codes are unchanged.
+
+**After restoring the frontend's state store from an older copy.** The frontend hands each
+node its member id and a boot counter from the store (`boot/<id>`, one more at every
+registration); a node's metadata log remembers the latest boot it wrote as. A restored
+store's counters are behind the nodes' logs, so a node registers, is given a boot its log
+has set already, refuses to open ("member M boot B is not after boot C, the latest set",
+no object is written), says on stderr that the state store is older than its log and to
+wait, and exits 75. systemd starts it again; that start registers again
+and takes the next boot, and the node opens as soon as its boot is past its log's. A gap
+of N boots therefore takes N restarts, about N times five seconds plus the start, each
+node on its own counter and all in parallel; nothing needs to be done but wait, and a node
+is not up before that. Restarting the unit by hand only spends one boot sooner. A node's
+boot rises at every registration (each restart, each lapsed heartbeat row), so a node
+that has run for months can have a gap of hundreds. Do not wipe a node's `--meta-dir` to
+skip the wait: that throws its index away. The frontend cannot refuse to start from a
+store older than its nodes' boots, because it learns a node's boot only when the node
+registers, after the frontend is up. Until a node has opened it serves nothing, though
+its registration put it in the frontend's map; calls routed to it fail.
+
 ### The state store: SQLite only
 
 The only state store kbf opens today is a SQLite file; Postgres is a later backend. Rule

@@ -579,6 +579,7 @@ caller goes away before the answer counts as an error.
 | `kbf_execute_submit_seconds`, `kbf_sched_lock_wait_seconds` | histogram | the scheduler's submit called from an Execute, and the part of it spent waiting for the scheduler's lock |
 | `kbf_sched_queued`, `kbf_sched_leases` | gauge | operations waiting for a lease, and leases granted or running on all nodes, as of the last submit or scheduler tick (at most a tick old) |
 | `kbf_tier_in_flight`, `kbf_tier_wait_seconds`, `kbf_tier_call_seconds` | gauge, histogram | write-tier file calls queued on or running on the blocking pool; the wait of one for a pool thread; and one whole, hand-over to answer. Always printed, 0 without a write tier; a wait near the call time says the pool is full |
+| `kbf_storage_open_write_fds`, `kbf_storage_write_pool_queue`, `kbf_storage_write_pool_direct_total` | gauge, gauge, counter | block files the write tier holds open for writing, as of the last write-pool step (at most `--write-pool-writers` plus one, for the blobs the pool writes); blobs waiting for a pool writer; and blobs the pool sent straight to the object store because its queue (`--write-pool-queue`) was full or the tier did not take them. Always printed, 0 without a write tier |
 | `kbf_input_directories_cached_total` | counter | Directories the input check took from the decoded-directory cache: the blob is touched and its presence checked, nothing is read |
 | `kbf_input_directories_skipped_total` | counter | Directories skipped with everything under them: an earlier check verified them and the retention guarantee of that check still runs |
 | `kbf_input_directories_joined_total` | counter | Directories found being checked for another request, and waited for |
@@ -1076,6 +1077,35 @@ runs the call again, once. A second `STALE_MAP`, or a fetch that brings no newer
 treated as `UNAVAILABLE`. `UNAVAILABLE` for a caller ahead of the node is the node's
 lost push: the caller's map may be the right one, so the caller tries again, and the
 node's next push makes the call succeed.
+
+## `PUT /v1/releases/{commit}/{platform}/{name}` and `GET /v1/releases`
+
+The frontend's release store (`docs/design/pull-updates.md` section 6.3): the tarballs of a
+release and their build attestations, kept as uploaded. Not served by any listener until the
+frontend mounts `kbf_server::release::router`; without a store both answer `503` naming
+`--releases-dir`.
+
+- `commit` is 40 lowercase hex digits, `platform` is `linux-x86_64`, `linux-arm64` or
+  `darwin-arm64`, `name` is `kbf` or `kbf-daemon` (the tarball) or either with the suffix
+  `.attestation` (its build attestation bundle). Anything else is `400`; no segment is ever joined
+  into a path as it arrived.
+- `PUT` takes the file as the body, with the write gates of the section "Who may write" except
+  the JSON content type (loopback peer, no `Origin`, the bearer token). A tarball is at most
+  512 MiB (`413` past it), a bundle at most 256 KiB; an empty body is `400`. The body is written to
+  a `.partial` file, synced, and renamed into place, so an interrupted upload leaves nothing
+  visible.
+- `201` `{"sha256", "size"}` for a new key. A release is immutable: the same bytes again are
+  `200` with the same answer, other bytes are `409` and change nothing.
+- `GET` is open and lists `{"releases": [{"commit", "platforms": [{"platform", "complete",
+  "components": [{"name", "sha256", "size", "attested"}]}]}]}`: commits sorted, platforms in the
+  order above, a platform `complete` when both tarballs have their attestation. A component is
+  listed when its tarball is stored.
+- `GET /v1/releases` and the gRPC `ReleaseService.Fetch` are unauthenticated at the router and
+  the service. `Fetch` is mounted on the worker listener behind its mutual TLS and the role
+  table (the daemon role alone may call it). `GET /v1/releases` is open to whoever reaches the
+  operator API, like `GET /v1/nodes`: it lists commits, platforms and digests, no bytes. The
+  store is mounted by `--releases-dir`, which needs `--api-listen`; without the flag every
+  update endpoint answers `503`.
 
 ## `UNAVAILABLE` from a storage node that is catching up
 
