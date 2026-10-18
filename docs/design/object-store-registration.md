@@ -2,8 +2,9 @@
 
 Status: proposed; accepted when merged. Every decision in section 4 is an **engineering default**
 that stands until the owner answers the question beside it (section 14). Nothing here is built:
-this page and [operator-verbs.md](operator-verbs.md) are the whole of the first change. The
-drift guard of section 17 is deferred to its own change, not part of this one.
+this page, [operator-verbs.md](operator-verbs.md) and the drift guard
+`crates/kbf-server/tests/route_docs.rs` (section 17) make up the whole first change. Only the
+guard's check of the gate column is deferred.
 
 Labels, as in the other design pages: **[F]** read in code on this branch, **[D]** a decision
 this page makes, **[V]** verify before building on it. A claim with none of them is a
@@ -438,7 +439,8 @@ The drift guard (every route of the operator router appears in `docs/api.md` and
 [operator-verbs.md](operator-verbs.md), method and path) is the test
 `crates/kbf-server/tests/route_docs.rs`. It reads the `.route(` calls of the sources of
 `kbf-server`, which are the merged routers, not a test router, and a planted undocumented
-route or method turns it red. It does not check the gate column of the verbs table, which
+route, method or node verb (`:cordon`, `:drain`, `:uncordon`, each needs its own row) turns it
+red. It is a textual scan, with the limits its header names. It does not check the gate column of the verbs table, which
 lives in the handlers.
 
 ## 18. CEO ruling on the frontend architecture (overrides earlier text of this page)

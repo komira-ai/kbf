@@ -3,10 +3,23 @@
 //!
 //! The routes are read from the `.route(` calls of this crate's sources, constants resolved
 //! within their own file, so a route added to any of the merged routers goes red here until the
-//! two documents name it. Proven by:
+//! two documents name it. The custom-method route `/v1/nodes/{target}` is expanded into one key
+//! per verb that `write_request` in `api.rs` accepts (`:cordon`, `:drain`, `:uncordon`), and the
+//! `:verb` stays in the key on the document side, so each verb needs its own row. Proven by:
 //! - `an_undocumented_route_is_reported` (a planted route, a planted method),
-//! - deleting the `GET /healthz` row of `operator-verbs.md`, which turns
-//!   `every_route_is_in_the_verbs_table` red (see the pull request for the run).
+//! - `a_custom_verb_needs_its_own_row` (a document naming only `:cordon`),
+//! - deleting the `GET /healthz` row of `operator-verbs.md`, or one of its three `/v1/nodes/`
+//!   verb rows, which turns `every_route_is_in_the_verbs_table` red (see the pull request for
+//!   the runs).
+//!
+//! **The scan is textual**, not a parse of the router. It sees only `get`, `post`, `put` and
+//! `delete` handlers inside a `.route(` call; it does not see `patch`, `head`, `any`, `.nest`,
+//! `.fallback` or `.merge` of a router built elsewhere, so a route added that way is invisible
+//! to it. A `.route(` whose path is neither a literal nor a `const &str` of the same file
+//! panics. The document side is textual too: any `METHOD /path` in the file counts, prose
+//! included, so a sentence that mentions a route satisfies the guard whether or not a table row
+//! exists. The route count is pinned exactly (`ROUTES`), so a new route also asks for that
+//! number to move.
 //!
 //! What it does not check: the gate column of the verbs table (that lives in the handlers) and
 //! the reverse direction (a documented row with no route, which `[V]` and `[N]` rows are by
@@ -43,8 +56,8 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// `{name}` becomes `{}` and a trailing `:verb` goes, so `/v1/nodes/{target}` and
-/// `/v1/nodes/{node}:cordon` compare equal.
+/// `{name}` becomes `{}`; a trailing `:verb` stays, so `/v1/nodes/{node}:cordon` and
+/// `/v1/nodes/{node}:drain` are different keys.
 fn normalise(path: &str) -> String {
     let mut out = String::new();
     let mut in_brace = false;
@@ -62,12 +75,6 @@ fn normalise(path: &str) -> String {
             '}' => in_brace = false,
             _ if in_brace => {}
             _ => out.push(c),
-        }
-    }
-    if let Some(colon) = out.rfind(':') {
-        let tail = &out[colon + 1..];
-        if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_lowercase()) {
-            out.truncate(colon);
         }
     }
     out
@@ -176,7 +183,7 @@ fn doc_routes(text: &str) -> BTreeSet<Route> {
                 .chars()
                 .take_while(|c| !c.is_whitespace() && !"`?,)\"'".contains(*c))
                 .collect();
-            out.insert((method.to_string(), normalise(path.trim_end_matches('.'))));
+            out.insert((method.to_string(), normalise(path.trim_end_matches(['.', ':']))));
         }
     }
     out
@@ -196,6 +203,54 @@ fn missing(code: &[Route], doc: &BTreeSet<Route>) -> Vec<Route> {
         .collect()
 }
 
+/// The path whose last segment is `{node}:{verb}`, served by one `.route(` and one handler.
+const VERB_ROUTE: &str = "/v1/nodes/{}";
+
+/// The verbs `write_request` matches: the string literals that start a `match` arm in that
+/// function.
+fn node_verbs(api_src: &str) -> Vec<String> {
+    let start = api_src
+        .find("pub fn write_request(")
+        .expect("api.rs has write_request");
+    let body = &api_src[start..];
+    let body = &body[..body.find("\n}\n").expect("write_request ends")];
+    let mut verbs: Vec<String> = body
+        .lines()
+        .map(str::trim_start)
+        .filter_map(|l| l.strip_prefix('"'))
+        .filter(|l| l.contains("=>"))
+        .filter_map(|l| l.split_once('"').map(|(v, _)| v.to_string()))
+        .collect();
+    verbs.sort();
+    verbs.dedup();
+    verbs
+}
+
+/// Replaces the `POST /v1/nodes/{}` of `routes` by one `POST /v1/nodes/{}:verb` per verb.
+fn expand_verbs(routes: Vec<Route>, verbs: &[String]) -> Vec<Route> {
+    let post_verb = ("POST".to_string(), VERB_ROUTE.to_string());
+    assert!(
+        routes.contains(&post_verb),
+        "the router has no `POST {VERB_ROUTE}` any more: update this guard"
+    );
+    routes
+        .into_iter()
+        .flat_map(|r| {
+            if r == post_verb {
+                verbs
+                    .iter()
+                    .map(|v| ("POST".to_string(), format!("{VERB_ROUTE}:{v}")))
+                    .collect()
+            } else {
+                vec![r]
+            }
+        })
+        .collect()
+}
+
+/// The exact number of `(method, path)` routes, verbs expanded. A new route moves it.
+const ROUTES: usize = 0;
+
 fn server_routes() -> Vec<Route> {
     let mut files = Vec::new();
     rust_files(&root().join("crates/kbf-server/src"), &mut files);
@@ -205,15 +260,25 @@ fn server_routes() -> Vec<Route> {
         .collect();
     routes.sort();
     routes.dedup();
+    let verbs = node_verbs(&fs::read_to_string(root().join("crates/kbf-server/src/api.rs")).unwrap());
+    assert_eq!(
+        verbs,
+        ["cordon", "drain", "uncordon"],
+        "write_request accepts other verbs: the guard and the documents need a row each"
+    );
+    let mut routes = expand_verbs(routes, &verbs);
+    routes.sort();
+    routes.dedup();
     routes
 }
 
 fn check(doc_path: &str) {
     let doc = doc_routes(&fs::read_to_string(root().join(doc_path)).unwrap());
     let routes = server_routes();
-    assert!(
-        routes.len() > 25,
-        "the scan found only {} routes: it is not reading the sources",
+    assert_eq!(
+        routes.len(),
+        ROUTES,
+        "the router has {} routes, the guard pins {ROUTES}: update `ROUTES` with the documents",
         routes.len()
     );
     let missing = missing(&routes, &doc);
@@ -266,12 +331,30 @@ fn an_undocumented_route_is_reported() {
 }
 
 #[test]
-fn the_doc_reader_strips_verbs_queries_and_punctuation() {
+fn a_custom_verb_needs_its_own_row() {
+    let verbs: Vec<String> = ["cordon", "drain"].map(String::from).into();
+    let code = expand_verbs(code_routes(r#"Router::new().route("/v1/nodes/{target}", post(act))"#), &verbs);
+    assert_eq!(code.len(), 2);
+    let doc = doc_routes("`POST /v1/nodes/{node}:cordon` and `:drain`");
+    assert_eq!(
+        missing(&code, &doc),
+        [("POST".to_string(), "/v1/nodes/{}:drain".to_string())]
+    );
+}
+
+#[test]
+fn the_verbs_come_from_the_handler() {
+    let src = "pub fn write_request() {\n    let a = match verb {\n        \"x\" => 1,\n        \"y\" if z => 2,\n        _ => 3,\n    };\n}\nfn other() { \"w\" => 0 }\n";
+    assert_eq!(node_verbs(src), ["x", "y"]);
+}
+
+#[test]
+fn the_doc_reader_keeps_verbs_and_strips_queries_and_punctuation() {
     let doc = doc_routes(
         "`POST /v1/nodes/{node}:cordon`, `GET /v1/shapes/{key}?instance=&cfg=` and GET /healthz.",
     );
     let want: BTreeSet<Route> = [
-        ("POST", "/v1/nodes/{}"),
+        ("POST", "/v1/nodes/{}:cordon"),
         ("GET", "/v1/shapes/{}"),
         ("GET", "/healthz"),
     ]

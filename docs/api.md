@@ -150,15 +150,15 @@ store that cannot be read answers `503`.
 An operator takes a node out of placement, drains it, or returns it
 ([fleet-updates.md](design/fleet-updates.md) sections 3.3 and 4.2):
 
-- `:cordon`: the scheduler offers the node no new lease; its leases run on. A drain
+- `:cordon` (`POST /v1/nodes/{node}:cordon`): the scheduler offers the node no new lease; its leases run on. A drain
   already under way is kept.
-- `:drain`: cordons the node and waits for its leases to end. The body may be
+- `:drain` (`POST /v1/nodes/{node}:drain`): cordons the node and waits for its leases to end. The body may be
   `{"deadline_secs": N}`; without a body the deadline is 30 minutes. With no lease
   left the node is `drained`. If the deadline comes first the drain **pauses**: the
   leases run on, nothing is killed or given up, and the node stays `drain_paused`
   even after they end, until an operator drains it again (a new deadline) or
   uncordons it.
-- `:uncordon`: returns the node to placement and ends any drain.
+- `:uncordon` (`POST /v1/nodes/{node}:uncordon`): returns the node to placement and ends any drain.
 
 The answer is the node, as `GET /v1/nodes` lists it, after the action. `404` for a
 node that never registered or an unknown verb, `400` for a drain body of another

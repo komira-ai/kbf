@@ -1,8 +1,8 @@
 # Operator verbs: every verb, the route that does it, or why it stays local
 
 Status: a reference table. Every route of `kbf-server` must have a row here by method and
-path: `crates/kbf-server/tests/route_docs.rs` fails otherwise (it does not check the gate
-column). The authority for
+path, and the node verbs (`:cordon`, `:drain`, `:uncordon`) one row each:
+`crates/kbf-server/tests/route_docs.rs` fails otherwise (it does not check the gate column). The authority for
 a built route is [../api.md](../api.md); for an open pull request, that pull request. This page
 is the index: the verb an operator means, the one route that does it, and the gate it passes.
 
