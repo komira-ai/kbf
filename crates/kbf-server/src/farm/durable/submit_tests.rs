@@ -28,9 +28,9 @@ struct LostAck {
     armed: AtomicBool,
     down: AtomicBool,
     fenced: AtomicBool,
-    /// Applied just before the next transaction that names an `op/` row: a write landing
-    /// between the farm's look at the store and its own write.
-    before_submit: std::sync::Mutex<Option<Txn>>,
+    /// One applied just before each transaction that names an `op/` row, oldest first: a
+    /// write landing between the farm's look at the store and its own write.
+    before_submit: std::sync::Mutex<std::collections::VecDeque<Txn>>,
 }
 
 impl LostAck {
@@ -40,7 +40,7 @@ impl LostAck {
             armed: AtomicBool::new(false),
             down: AtomicBool::new(false),
             fenced: AtomicBool::new(false),
-            before_submit: std::sync::Mutex::new(None),
+            before_submit: std::sync::Mutex::new(std::collections::VecDeque::new()),
         })
     }
 
@@ -61,7 +61,7 @@ impl Store for LostAck {
             kbf_state::Op::Put { key, .. } => key.starts_with("op/"),
             _ => false,
         });
-        if submits && let Some(landing) = self.before_submit.lock().expect("lock").take() {
+        if submits && let Some(landing) = self.before_submit.lock().expect("lock").pop_front() {
             self.inner.txn(landing)?.expect("the landing write");
         }
         let applied = self.inner.apply_batch(batch)?;
@@ -437,7 +437,7 @@ fn a_pin_that_lands_after_the_look_is_not_written_over() {
             5_u64.to_be_bytes(),
             Cond::Absent,
         );
-    *store.before_submit.lock().expect("lock") = Some(landing);
+    store.before_submit.lock().expect("lock").push_back(landing);
 
     assert!(submit(&farm, 1).is_ok());
 
@@ -609,4 +609,43 @@ fn a_twin_in_memory_joins_without_a_write_and_a_fenced_farm_refuses_for_good() {
         Code::FailedPrecondition
     );
     assert_eq!(rows(&store, "op/"), 1);
+}
+
+/// Catches: a submit whose looks are not exactly `LOOKS` (3): one that gives up after the
+/// first conflict (a busy store refuses work it could take), or one that looks without
+/// end or once too often. Each of `landed` writers takes the id this submit tried just
+/// before its write, so every try conflicts and the next takes the id after. Three
+/// conflicts and the fourth try is taken, under the fourth id; four conflicts and the
+/// submit is refused with the conflict, having written nothing of its own.
+#[test]
+fn a_submit_takes_three_conflicts_and_is_refused_at_the_fourth() {
+    for (landed, taken) in [(3_u64, true), (4, false)] {
+        let store = LostAck::new();
+        let durable = durable_over(&store);
+        let other = durable_over(&store);
+        for id in 0..landed {
+            let tag = 10 + u8::try_from(id).expect("a small id");
+            let landing = other
+                .submission(OperationId(id), &request(tag), &subject())
+                .expect("encode");
+            store.before_submit.lock().expect("lock").push_back(landing);
+        }
+
+        let submitted = durable.submit(OperationId(0), &request(1), &subject());
+
+        if taken {
+            assert!(
+                matches!(submitted, Ok(Submitted::Queued(OperationId(3)))),
+                "{landed} conflicts: {submitted:?}"
+            );
+            assert_eq!(rows(&store, "inflight/"), 1);
+        } else {
+            assert!(
+                matches!(submitted, Err(StateError::Conflict(_))),
+                "{landed} conflicts: {submitted:?}"
+            );
+            assert_eq!(rows(&store, "inflight/"), 0, "a refused submit pinned");
+        }
+        assert_eq!(rows(&store, "op/"), landed as usize + usize::from(taken));
+    }
 }

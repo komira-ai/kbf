@@ -155,13 +155,14 @@ Open streams of the old process end when it exits; Execute clients retry and att
 | Key family | Old child (after takeover) | New child | Why no conflict |
 |---|---|---|---|
 | `lease/`, `op/` (queue, claim, requeue, assignment state), `epoch`, generation row | none (fenced) | writes | Every write checks the generation in its transaction; the old child's sticky flag stops it after the first `Fenced`. |
+| `inflight/<hex instance>/<action digest>` (the pin of the operation that runs an action) | none (fenced) | writes | Scheduler-owned and fenced like `op/`: written in the transaction that queues the operation, removed in the one that finishes it. The `<hex instance>` is the instance name of the request (the action's cache instance, any name a client sends), not the writing child's own instance id, so the own-instance-key rule below does not apply to it and a write-recording test must classify it with `op/`, not with the own-instance families. |
 | Member map, cordons, `update/*`, `desired`, release index, reconciler and controller state | none (fenced) | writes | Same fence. |
 | Run history and log rows for the streams the old child still serves (`history/<instance_id>/...`, `log/<instance_id>/...`) | appends | never writes under the old instance id | Keys are prefixed by the writing child's own instance id (a UUID per process). The new child never owns an old instance id, so the key sets are disjoint and each row has one writer. Appends are insert-only with a unique key, so a retry cannot clash. |
 | Its own heartbeat row (`frontend/<instance_id>`) | writes | writes its own | Keyed by instance id, as above. |
 | `done/` rows | reads only | writes | The old child follows them to finish its streams. |
 | CAS blob ownership, ByteStream metadata | idempotent inserts | idempotent inserts | Content-keyed, the same value from either writer. |
 
-The rule in code: a child after `Fenced` or `stand-down` may write only keys carrying its own instance id, plus the content-keyed data path. A test asserts this by running a write-recording store wrapper through a swap and failing on any other key from the old child.
+The rule in code: a child after `Fenced` or `stand-down` may write only keys carrying its own instance id, plus the content-keyed data path (`inflight/` carries the request's instance, not the child's, and is fenced with the scheduler rows). A test asserts this by running a write-recording store wrapper through a swap and failing on any other key from the old child.
 
 **Fence scope.** Scheduler, lease, requeue, reconcile, controller, `update/*` and `desired` writes are fenced. The rows above marked "appends"/"idempotent inserts" are exempt so streams on A do not fail mid-flight after takeover. A `QueryWriteStatus` for an upload that B does not know returns `committed_size = 0` so the client restarts cleanly.
 
